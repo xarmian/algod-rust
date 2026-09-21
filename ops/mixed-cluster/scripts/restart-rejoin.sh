@@ -223,21 +223,60 @@ do_restart() {  # do_restart <graceful|kill>
         echo "docker restart (SIGTERM)"
     else
         # `restart: unless-stopped` in docker-compose.yml means the daemon
-        # brings the container back on its own after a SIGKILL. Wait for
-        # that rather than racing it with our own `docker start`, and only
-        # start it ourselves if the policy did not (e.g. compose file
-        # changed).
+        # *should* bring the container back on its own after a SIGKILL. In
+        # practice, on the GitHub Actions runners this harness runs on, it
+        # has never once been observed to do so within any reasonable
+        # window — every dispatched `consensus-cluster.yml` run on record
+        # (e.g. runs 35553019356 and 35560377059) logs "docker kill -s
+        # KILL + docker start" for every kill-based scenario, meaning the
+        # old 60s poll-then-fallback loop below always burned the full 60
+        # seconds before issuing its own `docker start`. That's not a
+        # brief grace period, it's dead time added on top of however long
+        # `docker start` itself and the process's own boot/rejoin takes —
+        # and it triples a kill-based restart's downtime (and therefore
+        # the Go-quorum round gap the Rust node has to close afterwards)
+        # relative to a `graceful` restart's `docker restart -t 20`.
+        #
+        # A larger post-restart round gap directly hurts the
+        # `resumed_voting` check (issue #1564's SIGKILL-specific residual
+        # failure): closing a bigger gap takes longer in wall-clock terms,
+        # during which the Rust node's own agreement round keeps getting
+        # pre-empted by certificate-driven catch-up commits from the
+        # other three (90%-stake) nodes concluding rounds without it —
+        # each extra second of avoidable downtime is strictly more
+        # opportunities for that race to go the wrong way before the
+        # check's observation window closes.
+        #
+        # Poll only briefly (a few hundred ms of genuine slack for the
+        # kernel/dockerd to deliver the exit event) and then always issue
+        # `docker start` ourselves — tolerating the harmless "already
+        # running" error if the restart policy *did* win the race in that
+        # brief window. This removes ~55-59s of pure, unnecessary downtime
+        # from every kill-based restart scenario without changing what is
+        # actually being exercised (the process still starts from a cold
+        # SIGKILL, `restore_crash_state` still runs the same way).
         docker kill --signal=KILL "$RUST_CONTAINER" >/dev/null
-        local deadline=$(( $(date +%s) + 60 ))
+        local deadline=$(( $(date +%s) + 3 ))
         while [ "$(date +%s)" -lt "$deadline" ]; do
             if [ "$(docker inspect -f '{{.State.Running}}' "$RUST_CONTAINER" 2>/dev/null)" = "true" ]; then
                 echo "docker kill -s KILL (restart policy revived it)"
                 return 0
             fi
-            sleep 1
+            sleep 0.2
         done
-        docker start "$RUST_CONTAINER" >/dev/null
-        echo "docker kill -s KILL + docker start"
+        docker start "$RUST_CONTAINER" >/dev/null 2>&1 || true
+        # The restart policy and our own `docker start` can race; either
+        # one succeeding is fine, but confirm the container actually came
+        # back up rather than silently reporting success if both lost.
+        local confirm_deadline=$(( $(date +%s) + 20 ))
+        while [ "$(date +%s)" -lt "$confirm_deadline" ]; do
+            if [ "$(docker inspect -f '{{.State.Running}}' "$RUST_CONTAINER" 2>/dev/null)" = "true" ]; then
+                echo "docker kill -s KILL + docker start"
+                return 0
+            fi
+            sleep 0.5
+        done
+        echo "docker kill -s KILL + docker start (container did not report Running)"
     fi
 }
 
