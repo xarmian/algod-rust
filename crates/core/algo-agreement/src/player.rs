@@ -1608,7 +1608,9 @@ mod tests {
 
         let bytes = rmp_serde::to_vec_named(&pt).expect("msgpack serialize");
         let mut decoded: ProposalTableImpl = rmp_serde::from_slice(&bytes).expect("msgpack decode");
-        let popped = decoded.pop(seq1).expect("pending entry should survive roundtrip");
+        let popped = decoded
+            .pop(seq1)
+            .expect("pending entry should survive roundtrip");
         assert_eq!(popped.t, crate::events::EventType::PayloadPresent);
         // next_seq must survive so future pushes keep Go-matching sequence numbers.
         let seq3 = decoded.push(None);

@@ -712,9 +712,16 @@ mod tests {
         assert_eq!(decoded.filled, ba.filled);
         assert_eq!(decoded.assembled, ba.assembled);
         assert_eq!(decoded.authenticators.len(), 1);
-        assert_eq!(decoded.authenticators[0].raw_vote.sender, Address([7u8; 32]));
         assert_eq!(
-            decoded.payload.unwrap().unauthenticated_proposal.original_period,
+            decoded.authenticators[0].raw_vote.sender,
+            Address([7u8; 32])
+        );
+        assert_eq!(
+            decoded
+                .payload
+                .unwrap()
+                .unauthenticated_proposal
+                .original_period,
             Period(4)
         );
     }
@@ -729,9 +736,7 @@ mod tests {
         store.relevant.insert(Period(0), pv);
         store.pinned = make_proposal_value(0xbb);
         store.assemblers.insert(pv, BlockAssembler::default());
-        store
-            .trackers
-            .insert(Period(1), ProposalTracker::default());
+        store.trackers.insert(Period(1), ProposalTracker::default());
 
         let bytes = rmp_serde::to_vec_named(&store).expect("msgpack serialize");
         let decoded: ProposalStore = rmp_serde::from_slice(&bytes).expect("msgpack decode");
