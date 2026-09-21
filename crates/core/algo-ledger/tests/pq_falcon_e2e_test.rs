@@ -112,7 +112,24 @@ fn minimal_block(genesis_hash: [u8; 32], fee_sink: Address, round: u64) -> Block
 /// panic with the collected errors otherwise — every scenario below wants
 /// crypto-clean blocks except the one that specifically expects
 /// `apply_block_validating` (ledger-state authorizer check) to reject.
-fn assert_block_validates(block: &Block, genesis_hash: &[u8; 32]) {
+///
+/// Recomputes `block.load` first (V42's `LoadTracking`/"bad load" check —
+/// see `algo_validate::block`'s own `set_expected_load` test helper): this
+/// file's blocks are built directly via `make_next_block_header`, which
+/// deliberately leaves `load: 0` and defers the real computation to
+/// production code (`participate.rs`), so a non-empty payset here would
+/// otherwise fail validation on the unrelated Load field rather than the
+/// signature/fee/wellformedness behavior each scenario actually exercises.
+fn assert_block_validates(block: &mut Block, genesis_hash: &[u8; 32]) {
+    let total_bytes: usize = block
+        .payset
+        .iter()
+        .map(|stx| algo_codec::canonical_encode_signed_txn_in_block(stx).len())
+        .sum();
+    if let Ok(max_bytes) = algo_validate::rules::max_txn_bytes_per_block(&block.current_protocol) {
+        block.load = algo_validate::rules::compute_expected_load(total_bytes, max_bytes);
+    }
+
     let result = validate_block(block, None, "", genesis_hash, None);
     assert!(
         result.is_valid,
@@ -184,7 +201,7 @@ fn pq_rekeyed_address_authorization_full_e2e_succeeds() {
 
     let mut block1 = minimal_block(genesis_hash, fee_sink, 1);
     block1.payset = vec![rekey_stx];
-    assert_block_validates(&block1, &genesis_hash);
+    assert_block_validates(&mut block1, &genesis_hash);
     apply_block_validating(&mut state, &block1).expect("rekey block must apply");
     assert_eq!(
         state.get_account(&ed_addr).unwrap().auth_addr,
@@ -235,7 +252,7 @@ fn pq_rekeyed_address_authorization_full_e2e_succeeds() {
 
     let mut block2 = minimal_block(genesis_hash, fee_sink, 2);
     block2.payset = vec![spend_stx];
-    assert_block_validates(&block2, &genesis_hash);
+    assert_block_validates(&mut block2, &genesis_hash);
     apply_block_validating(&mut state, &block2).expect("Falcon-authorized spend must apply");
 
     assert_eq!(
@@ -296,7 +313,7 @@ fn pq_rekeyed_address_stale_ed25519_authorizer_rejected_full_e2e() {
     };
     let mut block1 = minimal_block(genesis_hash, fee_sink, 1);
     block1.payset = vec![rekey_stx];
-    assert_block_validates(&block1, &genesis_hash);
+    assert_block_validates(&mut block1, &genesis_hash);
     apply_block_validating(&mut state, &block1).expect("rekey block must apply");
 
     // Block 2: a spend signed by the STALE ed25519 key, not declaring
@@ -328,7 +345,7 @@ fn pq_rekeyed_address_stale_ed25519_authorizer_rejected_full_e2e() {
     // is genuinely valid for its declared authorizer (the sender itself,
     // since no auth_addr is set). This is exactly the gap PR #850 closed:
     // signature validity alone does not prove authorization correctness.
-    assert_block_validates(&block2, &genesis_hash);
+    assert_block_validates(&mut block2, &genesis_hash);
 
     let err = apply_block_validating(&mut state, &block2)
         .expect_err("a stale-key spend after rekey must be rejected at ledger-apply time");
@@ -458,7 +475,7 @@ fn pq_challenged_falcon_address_can_heartbeat_for_zero_fee_full_e2e() {
 
     let mut block = minimal_block(genesis_hash, fee_sink, apply_round);
     block.payset = vec![stx];
-    assert_block_validates(&block, &genesis_hash);
+    assert_block_validates(&mut block, &genesis_hash);
     apply_block_validating(&mut state, &block).expect(
         "zero-fee discounted heartbeat for a challenged Falcon-addressed account must apply",
     );
