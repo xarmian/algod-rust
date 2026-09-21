@@ -169,6 +169,31 @@ const BOOTSTRAP_REDIAL_BASE_BACKOFF: Duration = Duration::from_secs(5);
 /// than the base and never further apart than this cap either).
 const BOOTSTRAP_REDIAL_MAX_BACKOFF: Duration = Duration::from_secs(120);
 
+/// Bound on the `/algorand-ws` application-level handshake
+/// (`handshake_inbound`/`handshake_outbound`/`handshake_v1_inbound`/
+/// `handshake_v1_outbound`, `algo_p2p::wsproto`), which otherwise reads off
+/// the raw stream with no timeout at all. Issue #1570's live P2P soak
+/// investigation found this: after a hard (`SIGKILL`) restart, go-node-1's
+/// own log confirmed it opened a `/algorand-ws/2.2.0` stream to the
+/// newly-reconnected rust-node-4 (multistream-select succeeded), but
+/// rust-node-4 never logged another single P2P event afterward — no
+/// handshake failure, no stream install, no redial (this transport's own
+/// `SwarmEvent::ConnectionClosed` never fired either, so the raw libp2p
+/// connection itself apparently stayed "established" from the Swarm's
+/// point of view). A handshake stuck forever mid-read (the peer is slow,
+/// or — go-node-1 was already 20+ rounds ahead and mid-soak-traffic at the
+/// time — busy) previously left that connection in exactly this
+/// unrecoverable "connected but silent forever" state: no stream ever
+/// installs (so it can't be torn down by the normal stream-generation
+/// cleanup either), and nothing ever calls `disconnect_peer`/
+/// `close_connection` on it, so `redial_disconnected_bootstrap_peers`
+/// never sees it as needing a retry. Bounding the handshake and
+/// disconnecting the peer on timeout (see the `Err`/timeout arms of
+/// `handle_inbound_ws_stream`/`handle_outbound_ws_stream`/
+/// `handle_inbound_ws_v1_stream`/`handle_outbound_ws_v1_stream`) turns this
+/// into an ordinary, redial-eligible disconnect instead.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// One outbound `(tag, payload)` pair queued for a stream peer's writer
 /// task, plus the `Instant` it was enqueued at (issue #1220) — the P2P
 /// stream's counterpart of `ws_peer.rs`'s `SendMessage::enqueued`, used to
@@ -637,6 +662,7 @@ fn spawn_ws_peer(
 /// Complete the inbound (listener) side of the `/algorand-ws/2.2.0`
 /// handshake (go: the `incoming` branch of `wsStreamHandlerV22`) and, on
 /// success, start this peer's read/write loop.
+#[allow(clippy::too_many_arguments)]
 async fn handle_inbound_ws_stream(
     peer_id: PeerId,
     mut stream: P2pRawStream,
@@ -645,9 +671,19 @@ async fn handle_inbound_ws_stream(
     mux: Arc<Multiplexer>,
     stream_manager: StreamPeers,
     stream_generation: Arc<AtomicU64>,
+    cmd_tx: mpsc::UnboundedSender<P2pCommand>,
 ) {
-    match handshake_inbound(&mut stream, &our_headers, ALGORAND_WS_SUPPORTED_VERSIONS).await {
-        Ok(meta) => {
+    // Issue #1570: bounded by `HANDSHAKE_TIMEOUT` (see its doc comment) —
+    // an inbound handshake that never completes previously left this
+    // connection "established but silent forever", invisible to both the
+    // redial sweep and `connected_peer_count()`.
+    match tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        handshake_inbound(&mut stream, &our_headers, ALGORAND_WS_SUPPORTED_VERSIONS),
+    )
+    .await
+    {
+        Ok(Ok(meta)) => {
             let negotiated =
                 decode_peer_features(&meta.version, &meta.features).intersection(our_features);
             spawn_ws_peer(
@@ -660,7 +696,7 @@ async fn handle_inbound_ws_stream(
                 false,
             )
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             // A failed dispatch still ends the in-flight attempt
             // `begin_peer_attempt` (called by this handler's caller, the
             // accept-loop) started — go's `streamHandler` does the same via
@@ -686,12 +722,29 @@ async fn handle_inbound_ws_stream(
                 DispatchError::with_level(format!("inbound handshake failed: {e}"), LogLevel::Warn);
             log_dispatch_error(&peer_id, &dispatch_err);
         }
+        Err(_elapsed) => {
+            stream_manager
+                .lock()
+                .expect("stream_peers mutex poisoned")
+                .end_peer_attempt(peer_id);
+            let dispatch_err = DispatchError::with_level(
+                format!("inbound handshake timed out after {HANDSHAKE_TIMEOUT:?}"),
+                LogLevel::Warn,
+            );
+            log_dispatch_error(&peer_id, &dispatch_err);
+            // Issue #1570: the raw libp2p connection otherwise stays
+            // "established" forever with no stream ever installing on it —
+            // tear it down so `SwarmEvent::ConnectionClosed` fires and this
+            // peer becomes redial-eligible again.
+            let _ = cmd_tx.send(P2pCommand::DisconnectPeer(peer_id));
+        }
     }
 }
 
 /// Complete the outbound (dialer) side of the `/algorand-ws/2.2.0`
 /// handshake (go: the `!incoming` branch of `wsStreamHandlerV22`) and, on
 /// success, start this peer's read/write loop.
+#[allow(clippy::too_many_arguments)]
 async fn handle_outbound_ws_stream(
     peer_id: PeerId,
     mut stream: P2pRawStream,
@@ -700,9 +753,17 @@ async fn handle_outbound_ws_stream(
     mux: Arc<Multiplexer>,
     stream_manager: StreamPeers,
     stream_generation: Arc<AtomicU64>,
+    cmd_tx: mpsc::UnboundedSender<P2pCommand>,
 ) {
-    match handshake_outbound(&mut stream, &our_headers, ALGORAND_WS_SUPPORTED_VERSIONS).await {
-        Ok(meta) => {
+    // Issue #1570: see `handle_inbound_ws_stream`'s matching comment and
+    // `HANDSHAKE_TIMEOUT`'s doc comment.
+    match tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        handshake_outbound(&mut stream, &our_headers, ALGORAND_WS_SUPPORTED_VERSIONS),
+    )
+    .await
+    {
+        Ok(Ok(meta)) => {
             let negotiated =
                 decode_peer_features(&meta.version, &meta.features).intersection(our_features);
             spawn_ws_peer(
@@ -715,7 +776,7 @@ async fn handle_outbound_ws_stream(
                 true,
             )
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             // See `handle_inbound_ws_stream`'s matching comment: ends the
             // in-flight attempt `begin_peer_attempt` (called by this
             // handler's caller, the swarm event loop's outbound-dial arm)
@@ -729,6 +790,18 @@ async fn handle_outbound_ws_stream(
                 LogLevel::Warn,
             );
             log_dispatch_error(&peer_id, &dispatch_err);
+        }
+        Err(_elapsed) => {
+            stream_manager
+                .lock()
+                .expect("stream_peers mutex poisoned")
+                .end_peer_attempt(peer_id);
+            let dispatch_err = DispatchError::with_level(
+                format!("outbound handshake timed out after {HANDSHAKE_TIMEOUT:?}"),
+                LogLevel::Warn,
+            );
+            log_dispatch_error(&peer_id, &dispatch_err);
+            let _ = cmd_tx.send(P2pCommand::DisconnectPeer(peer_id));
         }
     }
 }
@@ -745,9 +818,12 @@ async fn handle_inbound_ws_v1_stream(
     mux: Arc<Multiplexer>,
     stream_manager: StreamPeers,
     stream_generation: Arc<AtomicU64>,
+    cmd_tx: mpsc::UnboundedSender<P2pCommand>,
 ) {
-    match handshake_v1_inbound(&mut stream).await {
-        Ok(()) => spawn_ws_peer(
+    // Issue #1570: see `handle_inbound_ws_stream`'s matching comment and
+    // `HANDSHAKE_TIMEOUT`'s doc comment.
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake_v1_inbound(&mut stream)).await {
+        Ok(Ok(())) => spawn_ws_peer(
             peer_id,
             stream,
             mux,
@@ -756,7 +832,7 @@ async fn handle_inbound_ws_v1_stream(
             PeerFeatureFlags::empty(),
             false,
         ),
-        Err(e) => {
+        Ok(Err(e)) => {
             // See `handle_inbound_ws_stream`'s matching comment: ends the
             // in-flight attempt the accept-loop caller started, without
             // installing a stream.
@@ -769,6 +845,18 @@ async fn handle_inbound_ws_v1_stream(
                 LogLevel::Warn,
             );
             log_dispatch_error(&peer_id, &dispatch_err);
+        }
+        Err(_elapsed) => {
+            stream_manager
+                .lock()
+                .expect("stream_peers mutex poisoned")
+                .end_peer_attempt(peer_id);
+            let dispatch_err = DispatchError::with_level(
+                format!("inbound V1 handshake timed out after {HANDSHAKE_TIMEOUT:?}"),
+                LogLevel::Warn,
+            );
+            log_dispatch_error(&peer_id, &dispatch_err);
+            let _ = cmd_tx.send(P2pCommand::DisconnectPeer(peer_id));
         }
     }
 }
@@ -783,9 +871,12 @@ async fn handle_outbound_ws_v1_stream(
     mux: Arc<Multiplexer>,
     stream_manager: StreamPeers,
     stream_generation: Arc<AtomicU64>,
+    cmd_tx: mpsc::UnboundedSender<P2pCommand>,
 ) {
-    match handshake_v1_outbound(&mut stream).await {
-        Ok(()) => spawn_ws_peer(
+    // Issue #1570: see `handle_inbound_ws_stream`'s matching comment and
+    // `HANDSHAKE_TIMEOUT`'s doc comment.
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake_v1_outbound(&mut stream)).await {
+        Ok(Ok(())) => spawn_ws_peer(
             peer_id,
             stream,
             mux,
@@ -794,7 +885,7 @@ async fn handle_outbound_ws_v1_stream(
             PeerFeatureFlags::empty(),
             true,
         ),
-        Err(e) => {
+        Ok(Err(e)) => {
             stream_manager
                 .lock()
                 .expect("stream_peers mutex poisoned")
@@ -804,6 +895,18 @@ async fn handle_outbound_ws_v1_stream(
                 LogLevel::Warn,
             );
             log_dispatch_error(&peer_id, &dispatch_err);
+        }
+        Err(_elapsed) => {
+            stream_manager
+                .lock()
+                .expect("stream_peers mutex poisoned")
+                .end_peer_attempt(peer_id);
+            let dispatch_err = DispatchError::with_level(
+                format!("outbound V1 handshake timed out after {HANDSHAKE_TIMEOUT:?}"),
+                LogLevel::Warn,
+            );
+            log_dispatch_error(&peer_id, &dispatch_err);
+            let _ = cmd_tx.send(P2pCommand::DisconnectPeer(peer_id));
         }
     }
 }
@@ -836,6 +939,7 @@ async fn dial_ws_stream(
     mux: Arc<Multiplexer>,
     sp: StreamPeers,
     gen_counter: Arc<AtomicU64>,
+    cmd_tx: mpsc::UnboundedSender<P2pCommand>,
 ) {
     if !disable_v22_protocol {
         match control.open_stream(peer_id, ALGORAND_WS_PROTOCOL_V22).await {
@@ -848,6 +952,7 @@ async fn dial_ws_stream(
                     mux,
                     sp,
                     gen_counter,
+                    cmd_tx,
                 )
                 .await;
                 return;
@@ -874,7 +979,7 @@ async fn dial_ws_stream(
 
     match control.open_stream(peer_id, ALGORAND_WS_PROTOCOL_V1).await {
         Ok(stream) => {
-            handle_outbound_ws_v1_stream(peer_id, stream, mux, sp, gen_counter).await;
+            handle_outbound_ws_v1_stream(peer_id, stream, mux, sp, gen_counter, cmd_tx).await;
         }
         Err(e) => {
             sp.lock()
@@ -1573,13 +1678,19 @@ enum P2pCommand {
     /// behind [`GossipNode::request_connect_outgoing`], which previously
     /// had no effect at all.
     ReconnectBootstrapPeers,
-    /// Test-only: force-close this transport's connection to a specific
-    /// peer, so a test can simulate "handshake succeeded, then the
-    /// connection was lost" (issue #1570's actual failure mode) without
-    /// needing a real network-level drop — exercises the exact same
-    /// `SwarmEvent::ConnectionClosed` path a genuine disconnect would.
-    #[cfg(test)]
-    ForceDisconnect(PeerId),
+    /// Force-close this transport's connection to a specific peer.
+    /// Production use: a `/algorand-ws` handshake that hits
+    /// [`HANDSHAKE_TIMEOUT`] sends this for the peer it was handshaking
+    /// with — the raw libp2p connection otherwise stays "established"
+    /// forever with a stream that will never install, which is invisible
+    /// to both `connected_peer_count()` and
+    /// `redial_disconnected_bootstrap_peers` (see [`HANDSHAKE_TIMEOUT`]'s
+    /// doc comment for the live failure this was found from). Test use: a
+    /// test can send this directly to simulate "handshake succeeded, then
+    /// the connection was lost" without needing a real network-level drop
+    /// — exercises the exact same `SwarmEvent::ConnectionClosed` path a
+    /// genuine disconnect (or a handshake-timeout disconnect) would.
+    DisconnectPeer(PeerId),
 }
 
 impl P2pTransport {
@@ -1845,6 +1956,7 @@ impl P2pTransport {
             let gen_counter = Arc::clone(&stream_generation);
             let headers = our_ws_headers.clone();
             let blocked = Arc::clone(&blocked_inbound_gossip_peers);
+            let cmd_tx = cmd_tx.clone();
             tokio::spawn(async move {
                 while let Some((peer_id, stream)) = incoming_ws_streams.next().await {
                     // `EnableGossipService` (issue #1442): mirrors go's
@@ -1880,6 +1992,7 @@ impl P2pTransport {
                         Arc::clone(&mux),
                         Arc::clone(&sp),
                         Arc::clone(&gen_counter),
+                        cmd_tx.clone(),
                     ));
                 }
             });
@@ -1894,6 +2007,7 @@ impl P2pTransport {
             let sp = Arc::clone(&stream_peers);
             let gen_counter = Arc::clone(&stream_generation);
             let blocked = Arc::clone(&blocked_inbound_gossip_peers);
+            let cmd_tx = cmd_tx.clone();
             tokio::spawn(async move {
                 while let Some((peer_id, stream)) = incoming_ws_v1_streams.next().await {
                     if blocked
@@ -1917,6 +2031,7 @@ impl P2pTransport {
                         Arc::clone(&mux),
                         Arc::clone(&sp),
                         Arc::clone(&gen_counter),
+                        cmd_tx.clone(),
                     ));
                 }
             });
@@ -1954,6 +2069,12 @@ impl P2pTransport {
         // Issue #1570: bootstrap-peer redial state/counter, captured for
         // the task the same way as the other `_for_task` clones above.
         let bootstrap_redial_attempts_for_task = Arc::clone(&bootstrap_redial_attempts);
+        // Issue #1570: cloned in so the outbound-dial arm below can hand a
+        // sender to `dial_ws_stream` (which threads it into
+        // `handle_outbound_ws_stream`/`handle_outbound_ws_v1_stream` for
+        // `HANDSHAKE_TIMEOUT` handling) — the original `cmd_tx` itself is
+        // still needed, unmoved, for `Self { cmd_tx, .. }` below.
+        let cmd_tx_for_task = cmd_tx.clone();
         // Periodic DHT-driven mesh discovery (issue #1073): captured before
         // `cfg` is otherwise consumed below (`cfg.network_id` moves into
         // `Self` at the end of this function).
@@ -2280,6 +2401,7 @@ impl P2pTransport {
                                         let sp = Arc::clone(&sp_for_task);
                                         let gen_counter = Arc::clone(&gen_counter_for_task);
                                         let headers = our_ws_headers.clone();
+                                        let cmd_tx = cmd_tx_for_task.clone();
                                         tokio::spawn(dial_ws_stream(
                                             peer_id,
                                             control,
@@ -2289,6 +2411,7 @@ impl P2pTransport {
                                             mux,
                                             sp,
                                             gen_counter,
+                                            cmd_tx,
                                         ));
                                     }
                                 }
@@ -2474,8 +2597,7 @@ impl P2pTransport {
                                     &bootstrap_redial_attempts_for_task,
                                 );
                             }
-                            #[cfg(test)]
-                            Some(P2pCommand::ForceDisconnect(peer_id)) => {
+                            Some(P2pCommand::DisconnectPeer(peer_id)) => {
                                 host.disconnect_peer(peer_id);
                             }
                             None => break,
@@ -2530,7 +2652,7 @@ impl P2pTransport {
     /// TCP connection.
     #[cfg(test)]
     pub fn test_force_disconnect(&self, peer: PeerId) {
-        let _ = self.cmd_tx.send(P2pCommand::ForceDisconnect(peer));
+        let _ = self.cmd_tx.send(P2pCommand::DisconnectPeer(peer));
     }
 
     /// This transport's Ed25519 identity-signing key — the same key
