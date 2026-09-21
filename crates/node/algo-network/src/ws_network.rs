@@ -1335,6 +1335,30 @@ impl WebsocketNetwork {
             hex = %crate::handler::hex_dump(&data),
             "wire message"
         );
+        // Issue #1565: register this node's own dedup-safe (AV/TX) broadcast
+        // in its own incoming-message filter before fanning it out. Pure
+        // flood-fill relay (each hop excludes only the peer it heard the
+        // message from, per `except`/`exclude_peer` above) gives no hard
+        // guarantee that a message can't reach the origin back around a
+        // long way — e.g. a restricted-connectivity ring topology, where
+        // the two counter-rotating flood waves both eventually try to
+        // route past the origin's immediate neighbors. In a normal,
+        // richly-connected relay mesh the direct one-hop copies always
+        // populate every neighbor's own filter long before any multi-hop
+        // copy could arrive, so this returns nothing to the origin; on a
+        // bare, low-degree topology (or under scheduling jitter that
+        // delays the direct hop) that ordering isn't guaranteed. Without
+        // this, an echoed copy looks brand new to the origin's own
+        // `incoming_filter` (which a purely local `broadcast()` never
+        // touches) and gets handed back to the local handler as if it
+        // were freshly received. Registering the digest here closes that
+        // gap locally without changing wire behavior for any peer.
+        if dedup_safe_tag(&tag) && !data.is_empty() {
+            if let Some(ref filter) = self.incoming_message_filter {
+                filter.check_incoming_message(&tag, &data, true, true);
+            }
+        }
+
         let peers = self.peers.read().await;
         let msg = OutgoingMessage::new(tag, data);
 
@@ -3463,6 +3487,81 @@ mod tests {
             .broadcast(Tag::Transaction, vec![1, 2, 3], false, None)
             .await;
         assert!(result.is_ok());
+    }
+
+    /// Issue #1565: `ring_relay_propagates_agreement_votes_around_a_five_node_ring`
+    /// (`crates/node/algo-network/tests/relay_integration.rs`) flaked in CI's
+    /// `--release` Coverage run with "origin node 0 should never receive its
+    /// own broadcast back". Root cause: pure flood-fill relay (each hop
+    /// excludes only the peer it heard the message from) gives no hard
+    /// guarantee that a message can never route back to its origin — on a
+    /// restricted-connectivity ring, the two counter-rotating flood waves
+    /// both eventually try to route past the origin's immediate neighbors,
+    /// and whichever copy reaches a neighbor first determines which
+    /// direction actually gets forwarded onward. `broadcast()` never touched
+    /// the node's own `incoming_filter`, so an echoed copy looked brand new
+    /// to the origin and got handed back to the local handler as if freshly
+    /// received. This test proves the fix directly and deterministically
+    /// (no ring, no timing dependency): a node's own dedup-safe broadcast
+    /// must already be present in its own incoming filter immediately after
+    /// `broadcast()` returns.
+    #[tokio::test]
+    async fn broadcast_registers_dedup_safe_message_in_own_incoming_filter() {
+        let config = WebsocketNetworkConfig {
+            genesis_id: "test".to_string(),
+            enable_incoming_message_filter: true,
+            ..Default::default()
+        };
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        let net = WebsocketNetwork::new(config, phonebook);
+
+        let payload = b"self-originated-vote".to_vec();
+        net.broadcast(Tag::AgreementVote, payload.clone(), false, None)
+            .await
+            .expect("broadcast should succeed even with no peers connected");
+
+        let filter = net
+            .incoming_message_filter()
+            .expect("incoming filter should be constructed when enabled");
+        // `add=false, promote=false` so this check is read-only -- it must
+        // already report the message as seen from the `broadcast()` call
+        // above, not from this check inserting it.
+        assert!(
+            filter.check_incoming_message(&Tag::AgreementVote, &payload, false, false),
+            "a node's own broadcast of a dedup-safe (AV/TX) message must be \
+             pre-registered in its own incoming filter, so that if flood-fill \
+             relay ever routes it back around to this node, the read loop \
+             recognizes the echo as an already-seen duplicate and drops it"
+        );
+    }
+
+    /// Non-dedup-safe tags (e.g. `ProposalPayload`) are never deduplicated at
+    /// all (`dedup_safe_tag`), so `broadcast()` must not touch the incoming
+    /// filter for them -- confirms the fix above is scoped to AV/TX only,
+    /// matching `dedup_safe_tag`'s existing contract used everywhere else in
+    /// this module.
+    #[tokio::test]
+    async fn broadcast_does_not_register_non_dedup_safe_tag() {
+        let config = WebsocketNetworkConfig {
+            genesis_id: "test".to_string(),
+            enable_incoming_message_filter: true,
+            ..Default::default()
+        };
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        let net = WebsocketNetwork::new(config, phonebook);
+
+        let payload = b"a-proposal-payload".to_vec();
+        net.broadcast(Tag::ProposalPayload, payload.clone(), false, None)
+            .await
+            .expect("broadcast should succeed even with no peers connected");
+
+        let filter = net
+            .incoming_message_filter()
+            .expect("incoming filter should be constructed when enabled");
+        assert!(
+            !filter.check_incoming_message(&Tag::ProposalPayload, &payload, false, false),
+            "non-dedup-safe tags must not be inserted into the incoming filter"
+        );
     }
 
     #[tokio::test]
