@@ -43,19 +43,29 @@ name: Docker Image
 #   ghcr.io/xarmian/algod-rust:<tag>-localnet   — `localnet` target (single
 #                                                  node dev-mode network)
 #
+# The same two images are **also** mirrored to Docker Hub, at
+# `docker.io/<DOCKERHUB_USERNAME>/algod-rust[:<tag>[-localnet]]` — same
+# tags, same digests (built once, pushed to both registries) — but only if
+# the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets are
+# configured. Without them, every Docker Hub step is skipped automatically
+# and only GHCR is published (this is the default state for a fresh fork).
+# See docs/DOCKER_CI.md for exactly what to set up and why.
+#
 # ## Pipeline shape
 #
 # `prepare` computes the release channel (nightly / stable / beta / plain
-# main build) and shared tag inputs once. `build` then builds+pushes each
-# (target x platform) image **by digest only, one platform per job, on that
-# platform's own native runner** (`ubuntu-24.04-arm` for arm64) — no QEMU
-# emulation, which previously made multi-arch `main`-branch pushes exceed
-# the job timeout entirely (see git history / issue tracker: both push-to-
-# main builds since this workflow's introduction were killed at 45min).
-# `merge` then combines each target's two per-platform digests into one
-# multi-arch manifest list and applies the real tag set from `prepare`.
-# `pr-check` replaces all of the above on pull_request: a single amd64,
-# no-push build per target, just to catch a broken Dockerfile before merge.
+# main build), shared tag inputs, and whether Docker Hub is configured,
+# once. `build` then builds+pushes each (target x platform) image **by
+# digest only, one platform per job, on that platform's own native runner**
+# (`ubuntu-24.04-arm` for arm64) — no QEMU emulation, which previously made
+# multi-arch `main`-branch pushes exceed the job timeout entirely (see git
+# history / issue tracker: both push-to-main builds since this workflow's
+# introduction were killed at 45min) — pushing by digest to GHCR and (if
+# configured) Docker Hub in the same build. `merge` then combines each
+# target's two per-platform digests into one multi-arch manifest list per
+# registry and applies the real tag set from `prepare`. `pr-check` replaces
+# all of the above on pull_request: a single amd64, no-push build per
+# target, just to catch a broken Dockerfile before merge.
 #
 # ## Triggers
 #
@@ -112,6 +122,9 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  # Docker Hub repo name (the namespace is DOCKERHUB_USERNAME, a secret —
+  # see docs/DOCKER_CI.md). Only used when that secret is configured.
+  DOCKERHUB_IMAGE: algod-rust
   # Same pin as consensus-cluster.yml / algokey-e2e.yml (see CLAUDE.md).
   # Published as a bare version tag (no "v" prefix) to match the
   # `algorand/algod:5.0.2-stable` Docker Hub tag naming this image is
@@ -131,6 +144,7 @@ jobs:
       is_main_push: ${{ steps.channel.outputs.is_main_push }}
       is_stable_tag: ${{ steps.channel.outputs.is_stable_tag }}
       is_beta_tag: ${{ steps.channel.outputs.is_beta_tag }}
+      has_dockerhub: ${{ steps.dockerhub.outputs.has_dockerhub }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -186,6 +200,19 @@ jobs:
             echo "short_sha=${GITHUB_SHA:0:7}"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Check for Docker Hub credentials
+        id: dockerhub
+        # Docker Hub publishing is entirely opt-in: if DOCKERHUB_USERNAME /
+        # DOCKERHUB_TOKEN aren't set (the default for a fresh fork), every
+        # Docker Hub step downstream is skipped and only GHCR is published.
+        # See docs/DOCKER_CI.md for what to configure.
+        run: |
+          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+            echo "has_dockerhub=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_dockerhub=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: Build ${{ matrix.target }} (${{ matrix.platform }})
     needs: prepare
@@ -231,6 +258,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Log in to Docker Hub
+        if: needs.prepare.outputs.has_dockerhub == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Determine target image names
+        id: image_names
+        # A single build below pushes the same digest to every registry
+        # named here — buildx pushes identical manifest bytes to each, so
+        # the resulting digest is the same across registries (content-
+        # addressed), which is what lets `merge` reference it per-registry
+        # without any cross-registry blob copy.
+        run: |
+          names="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          if [ "${{ needs.prepare.outputs.has_dockerhub }}" = "true" ]; then
+            names="$names,docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_IMAGE }}"
+          fi
+          echo "list=$names" >> "$GITHUB_OUTPUT"
+
       - name: Extract labels
         id: meta
         uses: docker/metadata-action@v5
@@ -258,7 +306,7 @@ jobs:
           build-args: |
             GIT_TAG=${{ needs.prepare.outputs.build_ref }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ steps.image_names.outputs.list }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=docker-image-${{ matrix.target }}-${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=docker-image-${{ matrix.target }}-${{ matrix.platform }}
           provenance: true
@@ -313,7 +361,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
+      - name: Log in to Docker Hub
+        if: needs.prepare.outputs.has_dockerhub == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # NOTE: the `tags:` list below is intentionally duplicated between the
+      # GHCR and Docker Hub metadata steps (only `images:` differs) — keep
+      # both in sync when the channel/tag scheme changes.
+
+      - name: Extract GHCR metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -337,16 +396,50 @@ jobs:
           # already carry through into the merged manifest list; this step
           # only needs `.tags` for `imagetools create` below.
 
-      - name: Create manifest list and push
+      - name: Create GHCR manifest list and push
         working-directory: /tmp/digests
         run: |
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
 
-      - name: Inspect image
+      - name: Inspect GHCR image
         run: |
           docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+
+      - name: Extract Docker Hub metadata
+        if: needs.prepare.outputs.has_dockerhub == 'true'
+        id: meta_dockerhub
+        uses: docker/metadata-action@v5
+        with:
+          images: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_IMAGE }}
+          flavor: |
+            latest=false
+            suffix=${{ matrix.suffix }}
+          tags: |
+            type=ref,event=branch,enable=${{ needs.prepare.outputs.is_main_push == 'true' }}
+            type=raw,value=latest,enable=${{ needs.prepare.outputs.is_main_push == 'true' }}
+            type=raw,value=stable,enable=${{ needs.prepare.outputs.is_stable_tag == 'true' }}
+            type=raw,value=beta,enable=${{ needs.prepare.outputs.is_beta_tag == 'true' }}
+            type=raw,value=nightly,enable=${{ needs.prepare.outputs.is_nightly == 'true' }}
+            type=raw,value=${{ needs.prepare.outputs.short_sha }}-nightly,enable=${{ needs.prepare.outputs.is_nightly == 'true' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ needs.prepare.outputs.pin_tag }},enable=${{ needs.prepare.outputs.is_main_push == 'true' || needs.prepare.outputs.is_stable_tag == 'true' }}
+            type=sha,format=short,prefix=sha-
+
+      - name: Create Docker Hub manifest list and push
+        if: needs.prepare.outputs.has_dockerhub == 'true'
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_IMAGE }}@sha256:%s ' *)
+
+      - name: Inspect Docker Hub image
+        if: needs.prepare.outputs.has_dockerhub == 'true'
+        run: |
+          docker buildx imagetools inspect docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_IMAGE }}:${{ steps.meta_dockerhub.outputs.version }}
 
   pr-check:
     name: PR build check (${{ matrix.target }})
@@ -383,7 +476,7 @@ jobs:
 
   smoke-test:
     name: Smoke test published image
-    needs: merge
+    needs: [prepare, merge]
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
     timeout-minutes: 10
@@ -395,8 +488,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Pull and run --version
+      - name: Pull and run --version (GHCR)
         run: |
           IMAGE="ghcr.io/${{ env.IMAGE_NAME }}:sha-$(echo "${{ github.sha }}" | cut -c1-7)"
+          docker pull "$IMAGE"
+          docker run --rm "$IMAGE" --version
+
+      - name: Log in to Docker Hub
+        if: needs.prepare.outputs.has_dockerhub == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Pull and run --version (Docker Hub)
+        if: needs.prepare.outputs.has_dockerhub == 'true'
+        run: |
+          IMAGE="docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_IMAGE }}:sha-$(echo "${{ github.sha }}" | cut -c1-7)"
           docker pull "$IMAGE"
           docker run --rm "$IMAGE" --version
