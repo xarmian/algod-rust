@@ -26,9 +26,9 @@ secret:
 Two one-time, non-secret settings gate whether the workflow can actually
 push:
 
-1. **Workflow permissions.** The workflow declares
-   `permissions: packages: write` itself, which is sufficient regardless of
-   the repo-wide default under *Settings → Actions → General → Workflow
+1. **Workflow permissions.** The `build` and `merge` jobs each declare
+   `permissions: packages: write` themselves, which is sufficient regardless
+   of the repo-wide default under *Settings → Actions → General → Workflow
    permissions* — an explicit `permissions:` block in a workflow always
    takes precedence over that default (it can only be *restricted* further
    by an org-level policy, not loosened). No change needed unless your org
@@ -60,6 +60,16 @@ push:
 publishes to `ghcr.io/<your-username>/algod-rust` automatically — no
 workflow edit or secret needed, since `GITHUB_TOKEN` is scoped to whichever
 repository the workflow runs in.
+
+One caveat: the `build` job's arm64 leg runs on `ubuntu-24.04-arm`, GitHub's
+native ARM64 hosted runner. That label is free only for **public**
+repositories (GitHub Changelog, 2025-01-16). If you fork to a **private**
+repo, that job either fails to find a runner or bills against your paid
+minutes depending on your plan — drop the `arm64` entry from the `build`
+job's `platform`/`include` matrix to publish amd64-only instead. `merge`'s
+`imagetools create` step needs no edit: it globs whatever digest files
+`download-artifact` fetched, so it already adapts to however many platforms
+`build` actually produced.
 
 ## If you later want to also push to Docker Hub
 
