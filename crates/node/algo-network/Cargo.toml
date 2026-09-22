@@ -64,6 +64,9 @@ flate2.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+[build-dependencies]
+algo-build-info.workspace = true
+
 [dev-dependencies]
 serde_json.workspace = true
 rmpv.workspace = true

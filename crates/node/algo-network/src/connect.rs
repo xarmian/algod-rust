@@ -73,8 +73,14 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(45);
 /// `0` disables the check entirely, mirroring Go's `TestMaxHeaderSize`.
 pub const DEFAULT_MAX_HEADER_BYTES: usize = 4096;
 
-/// User-Agent header value identifying this client.
-const USER_AGENT: &str = "algod-rust/0.1.0";
+/// User-Agent header value identifying this client: the app name, the
+/// go-algorand parity version this build targets (kept in sync with
+/// `CLAUDE.md`'s "reference pin" — update it as part of the pin sweep, see
+/// the `algod-version-upgrade` skill's Stage 5 hot-spot list; also update
+/// `crates/node/algo-rest-client/src/http_block_fetcher.rs`'s
+/// `USER_AGENT_VALUE`, which uses the same scheme), and the short git ref
+/// this binary was built from (`ALGO_BUILD_GIT_TAG`, set by `build.rs`).
+const USER_AGENT: &str = concat!("algod-rust/5.0.2 (", env!("ALGO_BUILD_GIT_TAG"), ")");
 
 /// Sets the `User-Agent` header on `headers`. Mirrors go's
 /// `SetUserAgentHeader` (`network/wsNetwork.go`), a small standalone helper
@@ -1057,6 +1063,25 @@ mod tests {
             headers.get(HeaderName::from_static("user-agent")).unwrap(),
             USER_AGENT
         );
+    }
+
+    #[test]
+    fn user_agent_has_app_version_and_build_ref() {
+        // "algod-rust/<go-algorand parity version> (<short git ref>)" — same
+        // scheme as algo-rest-client's USER_AGENT_VALUE.
+        assert!(
+            USER_AGENT.starts_with("algod-rust/5.0.2 ("),
+            "unexpected USER_AGENT: {USER_AGENT}"
+        );
+        assert!(
+            USER_AGENT.ends_with(')'),
+            "unexpected USER_AGENT: {USER_AGENT}"
+        );
+        let git_ref = USER_AGENT
+            .strip_prefix("algod-rust/5.0.2 (")
+            .and_then(|s| s.strip_suffix(')'))
+            .unwrap();
+        assert!(!git_ref.is_empty(), "git ref must not be empty");
     }
 
     // -----------------------------------------------------------------------

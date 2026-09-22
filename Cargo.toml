@@ -25,6 +25,7 @@ members = [
     "crates/node/algo-kmd-client",
     "crates/node/algo-txn-pipeline",
     "crates/tools/algo-bench",
+    "crates/tools/algo-build-info",
     "crates/tools/algo-fork-detector",
     "crates/tools/algo-cert-crossverify",
     "crates/tools/algo-agreement-fuzz",
@@ -136,6 +137,7 @@ algo-kmd-api-types = { path = "crates/node/algo-kmd-api-types" }
 algo-kmd-client = { path = "crates/node/algo-kmd-client" }
 algo-txn-pipeline = { path = "crates/node/algo-txn-pipeline" }
 algo-bench = { path = "crates/tools/algo-bench" }
+algo-build-info = { path = "crates/tools/algo-build-info" }
 num-bigint = "0.4"
 num-traits = "0.2"
 statrs = "0.18"

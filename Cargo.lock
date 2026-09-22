@@ -179,6 +179,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "algo-build-info"
+version = "0.1.0"
+
+[[package]]
 name = "algo-cert-crossverify"
 version = "0.1.0"
 dependencies = [
@@ -438,6 +442,7 @@ name = "algo-network"
 version = "0.1.0"
 dependencies = [
  "algo-agreement",
+ "algo-build-info",
  "algo-codec",
  "algo-config",
  "algo-consensus-crypto",
@@ -531,6 +536,7 @@ version = "0.1.0"
 dependencies = [
  "algo-abi",
  "algo-avm",
+ "algo-build-info",
  "algo-codec",
  "algo-consensus-crypto",
  "algo-error",
@@ -570,6 +576,7 @@ dependencies = [
 name = "algo-rest-client"
 version = "0.1.0"
 dependencies = [
+ "algo-build-info",
  "algo-codec",
  "algo-error",
  "algo-network",

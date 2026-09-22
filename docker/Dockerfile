@@ -4,18 +4,22 @@
 
 # Stage 1: Build
 FROM rust:1.93-bookworm AS builder
-# Short git ref this image is built from. `.git` isn't copied into the build
-# context below, so a plain `git describe` inside the container always falls
-# back to "unknown" (see crates/node/algo-rest-client/build.rs); the CI
-# workflow (.github/workflows/docker-image.yml) computes this from the real
-# checkout and passes it in, so `algod-rust`'s User-Agent header identifies
-# the exact build a peer is talking to.
-ARG GIT_TAG=unknown
-ENV ALGO_BUILD_GIT_TAG=${GIT_TAG}
 WORKDIR /build
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
 COPY bin/ bin/
+# Short git ref this image is built from. `.git` isn't copied into the build
+# context above, so a plain `git describe` inside the container always falls
+# back to "unknown" (see crates/node/algo-rest-client/build.rs); the CI
+# workflow (.github/workflows/docker-image.yml) computes this from the real
+# checkout and passes it in, so `algod-rust`'s User-Agent header identifies
+# the exact build a peer is talking to. Declared after the COPY layers above
+# (rather than at the top of the stage) so a rebuild of the same source with
+# a different GIT_TAG (e.g. a release tag pushed for an already-built main
+# commit) only busts the compile layer below, not the — otherwise
+# content-addressed and cacheable — COPY layers.
+ARG GIT_TAG=unknown
+ENV ALGO_BUILD_GIT_TAG=${GIT_TAG}
 RUN cargo build --release --bin algod-rust
 
 # Stage 2: Runtime (conformance / follow / relay / observe — the default)

@@ -38,6 +38,9 @@ num-bigint.workspace = true
 serde_bytes.workspace = true
 sysinfo.workspace = true
 
+[build-dependencies]
+algo-build-info.workspace = true
+
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

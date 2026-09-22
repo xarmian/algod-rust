@@ -63,6 +63,9 @@ const MAX_BLOCK_BYTES: usize = 10 << 20;
 ///
 /// Mirrors go-algorand's own `SetUserAgentHeader` (`network/wsNetwork.go`),
 /// which likewise identifies itself with the running version plus commit.
+/// `crates/node/algo-network/src/connect.rs`'s `USER_AGENT` (the P2P/gossip
+/// WebSocket handshake's equivalent header) uses the same scheme — update
+/// both together.
 const USER_AGENT_VALUE: &str = concat!("algod-rust/5.0.2 (", env!("ALGO_BUILD_GIT_TAG"), ")");
 
 // ---------------------------------------------------------------------------

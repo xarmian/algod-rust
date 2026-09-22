@@ -18,11 +18,11 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Build script for algo-rest-client.
+//! Build script for algo-network.
 //!
 //! Exposes the short git ref this build was made from as
-//! `ALGO_BUILD_GIT_TAG`, consumed by `http_block_fetcher`'s `USER_AGENT_VALUE`.
-//! See `algo_build_info::emit_git_ref_env` for how it's resolved (Docker
+//! `ALGO_BUILD_GIT_TAG`, consumed by `connect`'s `USER_AGENT`. See
+//! `algo_build_info::emit_git_ref_env` for how it's resolved (Docker
 //! override vs. local `git describe`).
 
 fn main() {
