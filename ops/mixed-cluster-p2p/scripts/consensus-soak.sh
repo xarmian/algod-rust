@@ -42,6 +42,17 @@
 #      REJECTION_PATTERN consensus-round-trip.sh already scans for).
 #   4. Machine-readable      — a single summary JSON is written and
 #      echoed, and the exit code is 0 only if every check passed.
+#
+#   NOTE (issue #1580, 4th round): Go-side "did it accept Rust's votes"
+#   telemetry is logged here (summary.json's `go_accepted_rust_votes`) but
+#   NOT a gating check on this harness — at 90/10 stake (3 Go nodes @ 30%
+#   each = 90%, above go-algorand's 72% CertCommitteeThreshold) the 3 Go
+#   nodes can close quorum without Rust's vote, so a zero count some runs
+#   is an expected topology artifact, not a P2P defect. The gating proof
+#   of this property lives in ops/mixed-cluster-p2p-1v1/ (1 Go + 1 Rust,
+#   50/50 stake, where a closed round is impossible without Rust's vote)
+#   — see its README and .github/workflows/p2p-consensus-soak.yml's 1-1
+#   vote-acceptance gate step.
 #   5. (opt-in) Fork-freedom + bidirectional cert authentication —
 #      VERIFY_STAGE=1: algo-fork-detector across the 3 Go REST nodes,
 #      plus algo-cert-crossverify (Go certs authenticate under Rust) and
@@ -456,10 +467,25 @@ print(__import__('json').dumps({'total': steps['seen']}))
 " "$RUST_ACCOUNT" "$OUT_DIR"/p2pinterop-go-node-*.log)"
 echo "    Go-accepted Rust votes: $VOTE_STATS"
 VOTE_TOTAL="$(printf '%s' "$VOTE_STATS" | python3 -c "import json,sys; print(json.load(sys.stdin)['total'])")"
+# Issue #1580 (4th investigation round): informational only, NOT a gating
+# check, as of this harness. At this topology's 90/10 stake split (3 Go
+# nodes @ 30% each = 90%, well above go-algorand's 72%
+# CertCommitteeThreshold), the 3 Go nodes can close quorum without ever
+# needing Rust's vote — so "0 VoteAccepted this run" is an expected
+# artifact of that stake shape and a sub-millisecond same-host Docker
+# vote-arrival race on rounds where Rust's vote isn't actually needed for
+# quorum, not evidence of a P2P networking/consensus defect. The property
+# this check used to gate on is now proven unambiguously by
+# ops/mixed-cluster-p2p-1v1/ (a 1 Go + 1 Rust, 50/50-stake topology where
+# the lone Go node's 50% stake can NEVER reach 72% alone, so a closed
+# round is only possible if Rust's vote was accepted) — see that
+# harness's README and .github/workflows/p2p-consensus-soak.yml's "1-1
+# vote-acceptance gate" step, which IS gating. See issue #1580's 4-round
+# investigation (comments on the issue) for the full evidence trail.
 if [ "$VOTE_TOTAL" -gt 0 ]; then
-    record "go_accepts_rust_votes" pass "$VOTE_TOTAL VoteAccepted record(s) with the Rust account as sender"
+    echo "    [INFO] go_accepts_rust_votes: $VOTE_TOTAL VoteAccepted record(s) with the Rust account as sender"
 else
-    record "go_accepts_rust_votes" fail "no Go node logged VoteAccepted for the Rust account"
+    echo "    [INFO] go_accepts_rust_votes: no Go node logged VoteAccepted for the Rust account this run (non-blocking — see the comment above; the gating proof lives in ops/mixed-cluster-p2p-1v1/)"
 fi
 
 # -- 5. Machine-readable summary -----------------------------------------

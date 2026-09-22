@@ -9,6 +9,7 @@ COMPOSE_VFUTURE := docker compose -f docker/docker-compose.vfuture.yml
 PHASE6_CLUSTER := ops/mixed-cluster
 PHASE7_CLUSTER := ops/mixed-cluster-3rust
 P2P_INTEROP_CLUSTER := ops/mixed-cluster-p2p
+P2P_INTEROP_1V1_CLUSTER := ops/mixed-cluster-p2p-1v1
 
 .PHONY: build test fmt fmt-check clippy lint deny ci clean coverage coverage-lcov
 .PHONY: validate-api-up validate-api-down validate-api-status validate-api-logs validate-api
@@ -31,6 +32,7 @@ P2P_INTEROP_CLUSTER := ops/mixed-cluster-p2p
 .PHONY: p2p-interop-up p2p-interop-down p2p-interop-test p2p-interop-status
 .PHONY: p2p-interop-consensus-test p2p-interop-soak p2p-interop-soak-test
 .PHONY: p2p-interop-verify p2p-interop-restart p2p-interop-negative
+.PHONY: p2p-interop-1v1-up p2p-interop-1v1-down p2p-interop-1v1-status p2p-interop-1v1-soak-test
 .PHONY: phase6-cluster-up phase6-cluster-down phase6-cluster-status
 .PHONY: consensus-analyzer-test consensus-negative-test
 
@@ -878,6 +880,30 @@ p2p-interop-negative: ## Run the #597 negative conformance suite against a RUNNI
 	KEEP_CLUSTER=$(or $(KEEP_CLUSTER),1) \
 		$(P2P_INTEROP_CLUSTER)/scripts/negative-conformance.sh
 
+## Issue #1580 (4th investigation round) — the minimal 1 Go + 1 Rust,
+## 50/50-online-stake analogue of the p2p-interop-* targets above. Because
+## the lone Go node's 50% stake can never alone reach go-algorand's 72%
+## CertCommitteeThreshold, a closed round in this topology is unambiguous
+## proof Rust's P2P votes were accepted — the property the 90/10
+## harness's own `go_accepts_rust_votes` check could only gesture at. See
+## ops/mixed-cluster-p2p-1v1/README.md.
+p2p-interop-1v1-up: ## Bring up the 2-node 1v1 P2P interop target (1 Go + 1 stake-holding Rust, 50/50 stake)
+	$(P2P_INTEROP_1V1_CLUSTER)/scripts/start.sh
+
+p2p-interop-1v1-down: ## Tear down the 1v1 P2P interop target (pass PURGE=1 to wipe netroot/)
+	@if [ "$(PURGE)" = "1" ]; then \
+		$(P2P_INTEROP_1V1_CLUSTER)/scripts/stop.sh --purge; \
+	else \
+		$(P2P_INTEROP_1V1_CLUSTER)/scripts/stop.sh; \
+	fi
+
+p2p-interop-1v1-status: ## Per-node round snapshot for the 1v1 P2P interop cluster (both nodes via REST)
+	$(P2P_INTEROP_1V1_CLUSTER)/scripts/status.sh
+
+p2p-interop-1v1-soak-test: ## Run the #1580 1v1 vote-acceptance gate (up + soak + vote-acceptance check + down)
+	ROUNDS=$(or $(ROUNDS),100) \
+		$(P2P_INTEROP_1V1_CLUSTER)/scripts/consensus-soak.sh
+
 ## Deprecated aliases.
 ##
 ## `phase6-cluster-*` was the TASK-86 name for the same harness back when
@@ -1101,6 +1127,13 @@ help:
 	@echo "  make p2p-interop-negative       #597 negative suite (inject 4 faulted messages over /algorand-ws/2.2.0)"
 	@echo "  Runbook: ops/mixed-cluster-p2p/README.md;"
 	@echo "  soak methodology: docs/P2P_SOAK_METHODOLOGY.md"
+	@echo ""
+	@echo "P2P 1v1 Mixed-Cluster (1 Go P2P + 1 Rust P2pOnly, 50/50 stake — #1580):"
+	@echo "  make p2p-interop-1v1-up         Bring up the 2-node 1v1 P2P cluster"
+	@echo "  make p2p-interop-1v1-status     Per-node round snapshot (both nodes via REST)"
+	@echo "  make p2p-interop-1v1-down       Tear down (append PURGE=1 to wipe netroot/)"
+	@echo "  make p2p-interop-1v1-soak-test  #1580 vote-acceptance gate (up + soak + check + down), ROUNDS=N"
+	@echo "  Runbook: ops/mixed-cluster-p2p-1v1/README.md"
 	@echo ""
 	@echo "Benchmarks (fair comparison):"
 	@echo "  make bench-micro      Run Rust criterion microbenchmarks (fixture-based)"
