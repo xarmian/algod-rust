@@ -125,6 +125,7 @@ The old tag string is referenced in **40+ files**. Sweep it deliberately — `gr
 - `tools/cert-authenticate/run-in-docker.sh` — `GO_ALGORAND_PIN="OLD"`; also `tools/cert-authenticate/go.mod`'s go-algorand requirement.
 - `Makefile` help text, `ops/mixed-cluster/**` (compose images, scripts, README — the Go node containers must run NEW), `docker/docker-compose.*.yml`, `docker/scripts/*.sh`.
 - Code comments citing "@ OLD" in `crates/**` and `bin/**` — update the ones that state the pin; leave historical ones ("was measured on OLD") alone.
+- `crates/node/algo-rest-client/src/http_block_fetcher.rs` — `USER_AGENT_VALUE`'s hardcoded `"algod-rust/OLD "` prefix (the HTTP block-fetch client's User-Agent header); update its test's `starts_with("algod-rust/OLD (")` assertion in the same file alongside it.
 
 **Do not** blind sed the whole repo: each hit is either "the pin" (update), "history" (leave), or "a doc explaining a version-specific behavior" (update the reference AND re-verify the described behavior still holds under NEW — if it changed, that's a stage-2/3 issue, make sure one exists).
 

@@ -4,6 +4,14 @@
 
 # Stage 1: Build
 FROM rust:1.93-bookworm AS builder
+# Short git ref this image is built from. `.git` isn't copied into the build
+# context below, so a plain `git describe` inside the container always falls
+# back to "unknown" (see crates/node/algo-rest-client/build.rs); the CI
+# workflow (.github/workflows/docker-image.yml) computes this from the real
+# checkout and passes it in, so `algod-rust`'s User-Agent header identifies
+# the exact build a peer is talking to.
+ARG GIT_TAG=unknown
+ENV ALGO_BUILD_GIT_TAG=${GIT_TAG}
 WORKDIR /build
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
