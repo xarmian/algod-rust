@@ -34,6 +34,15 @@ name: Nightly P2P Consensus Soak
 #   Tier 1 (always) — `p2p-interop-up` -> `p2p-interop-status` (lockstep
 #     gate, retried) -> `p2p-interop-consensus-test` (issue #589's
 #     30-round consensus round-trip smoke) -> `p2p-interop-down`.
+#   Tier 1.5 (always) — `p2p-interop-1v1-soak-test` (issue #1580's 1 Go +
+#     1 Rust, 50/50-stake vote-acceptance gate — see
+#     ops/mixed-cluster-p2p-1v1/README.md). Runs unconditionally (not just
+#     on tier=full) since it's only 2 containers and reuses the image
+#     already built for Tier 1/2. This is the ACTUAL gate for "does Go
+#     accept Rust's P2P votes" — the Tier-2 90/10 harness's own
+#     `go_accepts_rust_votes` check is informational-only as of #1580's
+#     4th round, precisely because this tier proves the property
+#     unambiguously and that one can't.
 #   Tier 2 (nightly / dispatch with tier=full) —
 #     `p2p-interop-soak-test ROUNDS=<input, default 200>
 #     VERIFY_STAGE=1 RESTART_SCENARIOS=1 NEGATIVE_CASES=1` (issue #594 soak
@@ -188,6 +197,48 @@ jobs:
 
       - name: Tier 1 — cluster down
         run: make p2p-interop-down
+
+      # ── Tier 1.5 — 1-1 (50/50 stake) vote-acceptance gate (#1580) ─────
+      #
+      # Issue #1580's 4th investigation round: the 90/10 topology above
+      # (3 Go nodes @ 30% each = 90% stake) can close quorum without ever
+      # needing the Rust node's vote, which made its own
+      # `go_accepts_rust_votes` check an ambiguous signal — see that
+      # check's "informational only" comment in
+      # ops/mixed-cluster-p2p/scripts/consensus-soak.sh. This 1 Go + 1
+      # Rust, 50/50-stake harness (ops/mixed-cluster-p2p-1v1/) removes the
+      # ambiguity: the lone Go node's 50% stake can NEVER alone reach
+      # go-algorand's 72% CertCommitteeThreshold, so a closed round here
+      # is unambiguous proof Rust's P2P votes were accepted, and a stall
+      # is unambiguous proof they were not. THIS is the gating check for
+      # that property. Only 2 containers (vs. 4 above), so it's cheap
+      # enough to run on every Tier-1 invocation, not just nightly/full.
+      #
+      # Reuses the image built above rather than rebuilding: tag it under
+      # the name this harness's docker-compose.yml expects and set
+      # P2PINTEROP1V1_SKIP_BUILD=1 (see start.sh).
+      - name: Tier 1.5 — tag algod-rust image for the 1v1 harness
+        run: docker tag algod-rust-p2pinterop:local algod-rust-p2pinterop1v1:local
+
+      - name: Tier 1.5 — 1-1 (50/50 stake) vote-acceptance gate (#1580)
+        env:
+          P2PINTEROP1V1_SKIP_BUILD: "1"
+          ROUNDS: "100"
+          OUT_DIR: ${{ github.workspace }}/p2p-1v1-soak-artifacts
+        run: make p2p-interop-1v1-soak-test
+
+      - name: Upload 1v1 soak artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2p-1v1-consensus-soak-${{ github.run_id }}
+          path: p2p-1v1-soak-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Tier 1.5 — 1v1 cluster tear down (safety net)
+        if: always()
+        run: make p2p-interop-1v1-down PURGE=1 || true
 
       # ── Tier 2 prerequisites — go-algorand + libsodium caches ─────────
       # Same rationale as consensus-cluster.yml's own copy of these
