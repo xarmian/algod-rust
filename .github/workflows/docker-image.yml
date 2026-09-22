@@ -322,7 +322,7 @@ jobs:
             latest=false
             suffix=${{ matrix.suffix }}
           tags: |
-            type=ref,event=branch
+            type=ref,event=branch,enable=${{ needs.prepare.outputs.is_main_push == 'true' }}
             type=raw,value=latest,enable=${{ needs.prepare.outputs.is_main_push == 'true' }}
             type=raw,value=stable,enable=${{ needs.prepare.outputs.is_stable_tag == 'true' }}
             type=raw,value=beta,enable=${{ needs.prepare.outputs.is_beta_tag == 'true' }}
@@ -332,13 +332,10 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=${{ needs.prepare.outputs.pin_tag }},enable=${{ needs.prepare.outputs.is_main_push == 'true' || needs.prepare.outputs.is_stable_tag == 'true' }}
             type=sha,format=short,prefix=sha-
-          labels: |
-            org.opencontainers.image.title=algod-rust
-            org.opencontainers.image.description=Rust reimplementation of go-algorand (algod)
-            org.opencontainers.image.vendor=Algod DAO
-            org.opencontainers.image.licenses=AGPL-3.0-or-later
-            io.algod-rust.go-algorand-pin=${{ env.GO_ALGORAND_REV }}
-            io.algod-rust.image-target=${{ matrix.target }}
+          # No `labels:` here — OCI labels live in each per-platform image's
+          # own config (set by the `build` job's "Extract labels" step) and
+          # already carry through into the merged manifest list; this step
+          # only needs `.tags` for `imagetools create` below.
 
       - name: Create manifest list and push
         working-directory: /tmp/digests

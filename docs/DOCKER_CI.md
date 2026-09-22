@@ -66,8 +66,10 @@ native ARM64 hosted runner. That label is free only for **public**
 repositories (GitHub Changelog, 2025-01-16). If you fork to a **private**
 repo, that job either fails to find a runner or bills against your paid
 minutes depending on your plan — drop the `arm64` entry from the `build`
-job's `platform`/`include` matrix (and the corresponding digest in `merge`'s
-`imagetools create` invocation) to publish amd64-only instead.
+job's `platform`/`include` matrix to publish amd64-only instead. `merge`'s
+`imagetools create` step needs no edit: it globs whatever digest files
+`download-artifact` fetched, so it already adapts to however many platforms
+`build` actually produced.
 
 ## If you later want to also push to Docker Hub
 
