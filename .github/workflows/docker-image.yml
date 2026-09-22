@@ -4,25 +4,36 @@
 
 name: Docker Image
 
-# Builds and (on main / version tags) publishes the algod-rust container
-# image from docker/Dockerfile.
+# Builds and (on main / version tags / a nightly schedule) publishes the
+# algod-rust container image from docker/Dockerfile.
 #
 # ## go-algorand compatibility
 #
 # The community `algorand/algod` Docker Hub image (the one
 # docker/docker-compose.yml's `algod-go` service pulls) is the de-facto
 # reference this repo's own image follows: port 8080 for the REST API, an
-# `/algod/data` data directory, and version-string tags such as
-# `5.0.2-stable` (bare go-algorand release tag, no `v` prefix). We mirror
-# that surface here so `ghcr.io/xarmian/algod-rust` is a drop-in substitute
-# in a compose file that already expects `algorand/algod`:
-#   - same port (8080) and data-dir convention (see docker/Dockerfile)
-#   - a tag equal to the pinned go-algorand parity version (env
-#     GO_ALGORAND_REV below, e.g. "5.0.2-stable" — kept in sync with
-#     consensus-cluster.yml / algokey-e2e.yml's pin) in addition to our own
-#     semver/branch/sha tags
-#   - multi-arch (linux/amd64, linux/arm64), matching what the Go image
-#     ships
+# `/algod/data` data directory, multi-arch (linux/amd64, linux/arm64), and a
+# `stable`/`beta`/`nightly`/`latest` channel-tag scheme mirroring
+# https://hub.docker.com/r/algorand/algod/tags. We mirror that surface here
+# so `ghcr.io/xarmian/algod-rust` is a drop-in substitute in a compose file
+# that already expects `algorand/algod`.
+#
+# ## Tags published (per `runtime`/`localnet` target — see below)
+#
+#   latest              — most recent build of `main`
+#   main                — same, tracks the branch name
+#   stable              — most recent non-prerelease `vX.Y.Z` release tag
+#   X.Y.Z / X.Y         — that same release, pinned
+#   beta                — most recent prerelease tag (`vX.Y.Z-beta.N` /
+#                          `-rc.N` / `-alpha.N`); full prerelease string
+#                          also published as its own tag
+#   nightly             — latest scheduled build of `main` (daily)
+#   <short-sha>-nightly — that same nightly build, pinned
+#   <go-algorand-pin>   — e.g. `5.0.2-stable`, published alongside `latest`
+#                          and `stable` (the pinned go-algorand parity
+#                          version — env GO_ALGORAND_REV below, kept in sync
+#                          with consensus-cluster.yml / algokey-e2e.yml)
+#   sha-<short>         — every push/schedule/dispatch build, unconditional
 #
 # ## Images published
 #
@@ -32,14 +43,33 @@ name: Docker Image
 #   ghcr.io/xarmian/algod-rust:<tag>-localnet   — `localnet` target (single
 #                                                  node dev-mode network)
 #
+# ## Pipeline shape
+#
+# `prepare` computes the release channel (nightly / stable / beta / plain
+# main build) and shared tag inputs once. `build` then builds+pushes each
+# (target x platform) image **by digest only, one platform per job, on that
+# platform's own native runner** (`ubuntu-24.04-arm` for arm64) — no QEMU
+# emulation, which previously made multi-arch `main`-branch pushes exceed
+# the job timeout entirely (see git history / issue tracker: both push-to-
+# main builds since this workflow's introduction were killed at 45min).
+# `merge` then combines each target's two per-platform digests into one
+# multi-arch manifest list and applies the real tag set from `prepare`.
+# `pr-check` replaces all of the above on pull_request: a single amd64,
+# no-push build per target, just to catch a broken Dockerfile before merge.
+#
 # ## Triggers
 #
 #   - push to main touching the Dockerfile or anything it COPYs in: build
-#     AND push (both targets, multi-arch).
-#   - push of a `v*.*.*` tag: same, plus semver-derived tags.
+#     AND push (both targets, multi-arch) — channel: main/latest.
+#   - push of a `v*.*.*` tag: same, plus semver-derived tags — channel:
+#     stable (no prerelease suffix) or beta (`-beta`/`-rc`/`-alpha` suffix).
+#   - schedule (daily): build AND push off `main` regardless of path
+#     changes — channel: nightly.
 #   - pull_request touching the same paths: build only (single-arch, no
 #     push) so a broken Dockerfile fails CI before merge.
-#   - workflow_dispatch: manual build+push from any ref.
+#   - workflow_dispatch: manual build+push from any ref; channel is derived
+#     from that ref exactly as a push would be (main -> latest, a `v*.*.*`
+#     ref -> stable/beta).
 
 on:
   push:
@@ -62,10 +92,18 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".github/workflows/docker-image.yml"
+  schedule:
+    # 06:00 UTC daily nightly build off `main` (see algorand/algod's own
+    # `nightly` channel). Schedule triggers ignore the `paths:` filters
+    # above by design — a nightly build should refresh even if nothing
+    # merged today.
+    - cron: "0 6 * * *"
   workflow_dispatch:
 
 concurrency:
-  group: docker-image-${{ github.ref }}
+  # Keyed by event type too, not just ref: a scheduled nightly run and a
+  # push both targeting `main` must not cancel each other.
+  group: docker-image-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -81,25 +119,18 @@ env:
   GO_ALGORAND_REV: "v5.0.2-stable"
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }} image
+  prepare:
+    name: Prepare release channel + tag metadata
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [runtime, localnet]
-        include:
-          - target: runtime
-            suffix: ""
-          - target: localnet
-            suffix: "-localnet"
-
-    permissions:
-      contents: read
-      # Only needed to push; harmless (unused) on the read-only PR path.
-      packages: write
-
+    outputs:
+      pin_tag: ${{ steps.pin.outputs.tag }}
+      build_ref: ${{ steps.build_ref.outputs.tag }}
+      short_sha: ${{ steps.channel.outputs.short_sha }}
+      is_nightly: ${{ steps.channel.outputs.is_nightly }}
+      is_main_push: ${{ steps.channel.outputs.is_main_push }}
+      is_stable_tag: ${{ steps.channel.outputs.is_stable_tag }}
+      is_beta_tag: ${{ steps.channel.outputs.is_beta_tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -108,23 +139,6 @@ jobs:
           # ref this image is built from (a shallow/tagless checkout would
           # only ever produce a bare commit sha).
           fetch-depth: 0
-
-      - name: Set up QEMU (arm64 cross-build)
-        uses: docker/setup-qemu-action@v3
-        # PRs only build/verify the runner's native arch — arm64 emulation
-        # is the slow part and isn't needed to catch a broken Dockerfile.
-        if: github.event_name != 'pull_request'
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Compute go-algorand pin tag (strip leading "v")
         id: pin
@@ -140,6 +154,165 @@ jobs:
         # picks those up automatically.
         run: echo "tag=$(git describe --tags --always --dirty)" >> "$GITHUB_OUTPUT"
 
+      - name: Determine release channel
+        id: channel
+        # Ref-based (not event-based, beyond the schedule check) so a
+        # manual workflow_dispatch off `main` or off a `v*.*.*` ref gets the
+        # same channel a push to that same ref would have.
+        run: |
+          is_nightly=false
+          is_main_push=false
+          is_stable_tag=false
+          is_beta_tag=false
+
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            is_nightly=true
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            is_main_push=true
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            tag_name="${GITHUB_REF#refs/tags/}"
+            if [[ "$tag_name" =~ -(beta|rc|alpha)([.-][0-9]+)?$ ]]; then
+              is_beta_tag=true
+            else
+              is_stable_tag=true
+            fi
+          fi
+
+          {
+            echo "is_nightly=$is_nightly"
+            echo "is_main_push=$is_main_push"
+            echo "is_stable_tag=$is_stable_tag"
+            echo "is_beta_tag=$is_beta_tag"
+            echo "short_sha=${GITHUB_SHA:0:7}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }} (${{ matrix.platform }})
+    needs: prepare
+    if: github.event_name != 'pull_request'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [runtime, localnet]
+        platform: [amd64, arm64]
+        include:
+          # Native runners, not QEMU emulation: an emulated arm64 release
+          # build of the whole workspace routinely exceeded this job's
+          # 45-minute timeout. Building each platform on its own native
+          # runner and merging the resulting digests (see the `merge` job)
+          # is the standard pattern for this — see Docker's own multi-
+          # platform-images docs.
+          - platform: amd64
+            runner: ubuntu-latest
+            docker_platform: linux/amd64
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            docker_platform: linux/arm64
+          - target: runtime
+            suffix: ""
+          - target: localnet
+            suffix: "-localnet"
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
+            suffix=${{ matrix.suffix }}
+          labels: |
+            org.opencontainers.image.title=algod-rust
+            org.opencontainers.image.description=Rust reimplementation of go-algorand (algod)
+            org.opencontainers.image.vendor=Algod DAO
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            io.algod-rust.go-algorand-pin=${{ env.GO_ALGORAND_REV }}
+            io.algod-rust.image-target=${{ matrix.target }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: ${{ matrix.target }}
+          platforms: ${{ matrix.docker_platform }}
+          build-args: |
+            GIT_TAG=${{ needs.prepare.outputs.build_ref }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=docker-image-${{ matrix.target }}-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=docker-image-${{ matrix.target }}-${{ matrix.platform }}
+          provenance: true
+          sbom: true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.target }}-${{ matrix.platform }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge ${{ matrix.target }} manifest
+    needs: [prepare, build]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [runtime, localnet]
+        include:
+          - target: runtime
+            suffix: ""
+          - target: localnet
+            suffix: "-localnet"
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-${{ matrix.target }}-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -150,10 +323,14 @@ jobs:
             suffix=${{ matrix.suffix }}
           tags: |
             type=ref,event=branch
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ needs.prepare.outputs.is_main_push == 'true' }}
+            type=raw,value=stable,enable=${{ needs.prepare.outputs.is_stable_tag == 'true' }}
+            type=raw,value=beta,enable=${{ needs.prepare.outputs.is_beta_tag == 'true' }}
+            type=raw,value=nightly,enable=${{ needs.prepare.outputs.is_nightly == 'true' }}
+            type=raw,value=${{ needs.prepare.outputs.short_sha }}-nightly,enable=${{ needs.prepare.outputs.is_nightly == 'true' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=${{ steps.pin.outputs.tag }},enable={{is_default_branch}}
+            type=raw,value=${{ needs.prepare.outputs.pin_tag }},enable=${{ needs.prepare.outputs.is_main_push == 'true' || needs.prepare.outputs.is_stable_tag == 'true' }}
             type=sha,format=short,prefix=sha-
           labels: |
             org.opencontainers.image.title=algod-rust
@@ -163,28 +340,53 @@ jobs:
             io.algod-rust.go-algorand-pin=${{ env.GO_ALGORAND_REV }}
             io.algod-rust.image-target=${{ matrix.target }}
 
-      - name: Build and push
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+
+  pr-check:
+    name: PR build check (${{ matrix.target }})
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [runtime, localnet]
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build (no push, amd64 only — verifies the Dockerfile builds)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/Dockerfile
           target: ${{ matrix.target }}
+          platforms: linux/amd64
+          push: false
           build-args: |
-            GIT_TAG=${{ steps.build_ref.outputs.tag }}
-          # Multi-arch only when actually publishing; PR verification builds
-          # the runner's native arch to keep the check fast.
-          platforms: ${{ github.event_name != 'pull_request' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=docker-image-${{ matrix.target }}
-          cache-to: type=gha,mode=max,scope=docker-image-${{ matrix.target }}
-          provenance: true
-          sbom: true
+            GIT_TAG=pr-check
+          # Same cache scope as the amd64 leg of the real `build` job, so PR
+          # checks and push builds warm each other's cache.
+          cache-from: type=gha,scope=docker-image-${{ matrix.target }}-amd64
+          cache-to: type=gha,mode=max,scope=docker-image-${{ matrix.target }}-amd64
 
   smoke-test:
     name: Smoke test published image
-    needs: build
+    needs: merge
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
     timeout-minutes: 10
