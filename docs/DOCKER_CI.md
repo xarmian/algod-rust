@@ -1,25 +1,66 @@
 # Docker Image CI/CD
 
 `.github/workflows/docker-image.yml` builds `docker/Dockerfile` and, on
-`main` / version tags, publishes it to GHCR
-(`ghcr.io/xarmian/algod-rust`). See that workflow's header comment for the
-full trigger/tagging rationale (mirroring the `algorand/algod` Docker Hub
-image's port/data-dir/tag-naming conventions for drop-in compatibility).
+`main` / version tags / a daily schedule, publishes it to GHCR
+(`ghcr.io/xarmian/algod-rust`) and, optionally, to Docker Hub
+(`docker.io/<DOCKERHUB_USERNAME>/algod-rust`). See that workflow's header
+comment for the full trigger/tagging rationale (mirroring the
+`algorand/algod` Docker Hub image's port/data-dir/tag-naming conventions for
+drop-in compatibility).
 
 ## Required GitHub repository secrets
 
-**None.** The workflow authenticates to GHCR with the automatically
-provisioned `secrets.GITHUB_TOKEN` — nothing needs to be created or
-rotated under *Settings → Secrets and variables → Actions*.
+| Secret               | Required?   | Used by                | Required for                                                             |
+| --------------------- | ----------- | ----------------------- | -------------------------------------------------------------------------- |
+| *(none)*               | —           | `docker-image.yml`      | GHCR publishing — authenticates with the automatically provisioned `secrets.GITHUB_TOKEN`, nothing to create |
+| `DOCKERHUB_USERNAME`   | Optional    | `docker-image.yml`      | Docker Hub publishing — the namespace images are pushed under            |
+| `DOCKERHUB_TOKEN`      | Optional    | `docker-image.yml`      | Docker Hub publishing — the access token used to authenticate            |
+| `CODECOV_TOKEN`        | Required    | `coverage.yml`          | Uploading LCOV reports to Codecov (unrelated to this workflow)           |
 
-This differs from `coverage.yml`, which **does** need a manually configured
-secret:
+GHCR publishing needs **no secret setup at all** — it always runs. Docker
+Hub publishing is **entirely opt-in**: the workflow's `prepare` job checks
+whether both `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` are set and, if
+either is missing, every Docker Hub step (login, build output, manifest
+push, smoke test) is skipped automatically and only GHCR gets published —
+this is the default state for a fresh fork or clone, and is not an error.
 
-| Secret            | Used by         | Required for                                    |
-| ------------------ | --------------- | ------------------------------------------------ |
-| `CODECOV_TOKEN`    | `coverage.yml`  | Uploading LCOV reports to Codecov                 |
+### Setting up Docker Hub publishing
 
-`docker-image.yml` needs no equivalent entry.
+1. **Create a Docker Hub access token** (not your account password — Docker
+   Hub deprecated password-based API auth):
+   - Log in to [hub.docker.com](https://hub.docker.com) as the account/org
+     that should own the `algod-rust` repository.
+   - *Account Settings → Personal access tokens → Generate new token.*
+   - Give it a description (e.g. `algod-rust GitHub Actions`) and the
+     **Read & Write** permission scope (Read-only can't push; Admin is more
+     than this workflow needs).
+   - Copy the token immediately — Docker Hub only shows it once.
+2. **Add both secrets to the GitHub repository**
+   (*Settings → Secrets and variables → Actions → New repository secret*,
+   or `gh secret set NAME` from the CLI):
+
+   ```bash
+   gh secret set DOCKERHUB_USERNAME --body "<your-dockerhub-username-or-org>"
+   gh secret set DOCKERHUB_TOKEN    --body "<the-access-token-from-step-1>"
+   ```
+
+   `DOCKERHUB_USERNAME` is the Docker Hub namespace images publish under
+   (`docker.io/<DOCKERHUB_USERNAME>/algod-rust`) — it does not need to match
+   the GitHub org/user (`xarmian`).
+3. **Create the Docker Hub repository once**, if it doesn't already exist:
+   either push manually once (`docker login`, then let the first workflow
+   run create it — Docker Hub auto-creates a repo on first push from a
+   token with Write access) or create `<DOCKERHUB_USERNAME>/algod-rust`
+   ahead of time via the Docker Hub UI (*Create Repository*). Either way,
+   set its visibility (public/private) directly on Docker Hub — this
+   workflow doesn't manage that.
+4. **That's it.** The next `main`/tag/scheduled push publishes to both
+   registries with identical tags and digests — no workflow edit needed.
+
+To stop publishing to Docker Hub again, delete either secret
+(*Settings → Secrets and variables → Actions*, or
+`gh secret delete DOCKERHUB_USERNAME`) — the workflow falls back to
+GHCR-only on the next run, same as a fork that never configured them.
 
 ## Required repository *settings* (not secrets)
 
@@ -70,13 +111,3 @@ job's `platform`/`include` matrix to publish amd64-only instead. `merge`'s
 `imagetools create` step needs no edit: it globs whatever digest files
 `download-artifact` fetched, so it already adapts to however many platforms
 `build` actually produced.
-
-## If you later want to also push to Docker Hub
-
-Not currently done (GHCR only, to match how `docker/docker-compose.yml`
-already pulls `algorand/algod` from Docker Hub for the *Go* side while
-staying registry-agnostic for the *Rust* side). If this is added later, it
-would need two new secrets — `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (a
-Docker Hub access token, not the account password) — plus an additional
-`docker/login-action` step. Skipped for now to keep the required-secrets
-list empty.
