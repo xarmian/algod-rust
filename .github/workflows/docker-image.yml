@@ -103,6 +103,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Full history + tags so `git describe` below identifies the exact
+          # ref this image is built from (a shallow/tagless checkout would
+          # only ever produce a bare commit sha).
+          fetch-depth: 0
 
       - name: Set up QEMU (arm64 cross-build)
         uses: docker/setup-qemu-action@v3
@@ -124,6 +129,16 @@ jobs:
       - name: Compute go-algorand pin tag (strip leading "v")
         id: pin
         run: echo "tag=${GO_ALGORAND_REV#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute algod-rust build ref
+        id: build_ref
+        # Baked into the image's User-Agent header (see
+        # crates/node/algo-rest-client/src/http_block_fetcher.rs) via
+        # docker/Dockerfile's ARG GIT_TAG. algod-rust has no version-tag
+        # scheme of its own yet, so this is the closest git-describable ref
+        # for the exact build; once tag-based releases exist, `git describe`
+        # picks those up automatically.
+        run: echo "tag=$(git describe --tags --always --dirty)" >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata
         id: meta
@@ -154,6 +169,8 @@ jobs:
           context: .
           file: docker/Dockerfile
           target: ${{ matrix.target }}
+          build-args: |
+            GIT_TAG=${{ steps.build_ref.outputs.tag }}
           # Multi-arch only when actually publishing; PR verification builds
           # the runner's native arch to keep the check fast.
           platforms: ${{ github.event_name != 'pull_request' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}

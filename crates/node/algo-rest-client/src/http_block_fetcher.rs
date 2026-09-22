@@ -53,8 +53,20 @@ const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum response body size (10 MB, matching Go's `fetcherMaxBlockBytes`).
 const MAX_BLOCK_BYTES: usize = 10 << 20;
 
-/// User-Agent string identifying this implementation.
-const USER_AGENT_VALUE: &str = "algod-rust/0.1";
+/// User-Agent string identifying this implementation: the app name, the
+/// go-algorand parity version this build targets (kept in sync with
+/// `CLAUDE.md`'s "reference pin" — update it as part of the pin sweep, see
+/// the `algod-version-upgrade` skill's Stage 5 hot-spot list), and the short
+/// git ref this binary was built from (`ALGO_BUILD_GIT_TAG`, set by
+/// `build.rs`; overridable at Docker build time since `.git` isn't in the
+/// image's build context — see `docker/Dockerfile`).
+///
+/// Mirrors go-algorand's own `SetUserAgentHeader` (`network/wsNetwork.go`),
+/// which likewise identifies itself with the running version plus commit.
+/// `crates/node/algo-network/src/connect.rs`'s `USER_AGENT` (the P2P/gossip
+/// WebSocket handshake's equivalent header) uses the same scheme — update
+/// both together.
+const USER_AGENT_VALUE: &str = concat!("algod-rust/5.0.2 (", env!("ALGO_BUILD_GIT_TAG"), ")");
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -389,6 +401,51 @@ mod tests {
         let fetcher = HttpBlockFetcher::with_client(client, "http://peer:4160", "mainnet-v1.0");
         assert_eq!(fetcher.base_url(), "http://peer:4160");
         assert_eq!(fetcher.genesis_id(), "mainnet-v1.0");
+    }
+
+    // -- User-Agent header (issue: replace hardcoded "algod-rust/0.1") --
+
+    #[test]
+    fn user_agent_value_has_app_version_and_build_ref() {
+        // "algod-rust/<go-algorand parity version> (<short git ref>)".
+        assert!(
+            USER_AGENT_VALUE.starts_with("algod-rust/5.0.2 ("),
+            "unexpected USER_AGENT_VALUE: {USER_AGENT_VALUE}"
+        );
+        assert!(
+            USER_AGENT_VALUE.ends_with(')'),
+            "unexpected USER_AGENT_VALUE: {USER_AGENT_VALUE}"
+        );
+        let git_ref = USER_AGENT_VALUE
+            .strip_prefix("algod-rust/5.0.2 (")
+            .and_then(|s| s.strip_suffix(')'))
+            .unwrap();
+        assert!(!git_ref.is_empty(), "git ref must not be empty");
+    }
+
+    #[tokio::test]
+    async fn fetch_block_sends_user_agent_header() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/test-genesisID/block/1"))
+            .and(header("User-Agent", USER_AGENT_VALUE))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", BLOCK_RESPONSE_CONTENT_TYPE)
+                    .set_body_bytes(b"body".as_slice()),
+            )
+            .mount(&server)
+            .await;
+
+        let fetcher = HttpBlockFetcher::new(server.uri(), "test-genesisID").unwrap();
+        // wiremock returns a 404 (no matching mock) if the header sent by
+        // `fetch_block` doesn't match `USER_AGENT_VALUE` exactly.
+        let body = fetcher.fetch_block(1).await.unwrap();
+        assert_eq!(body, b"body");
     }
 
     // -- Content-type validation --

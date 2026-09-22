@@ -18,23 +18,13 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Build script for algo-rest-api.
+//! Build script for algo-network.
 //!
-//! Extracts git metadata (commit hash, branch) and Cargo package version
-//! at compile time, making them available via environment variables for
-//! the `/versions` endpoint. Git plumbing lives in `algo-build-info`,
-//! shared with `algo-rest-client`'s and `algo-network`'s `build.rs`.
+//! Exposes the short git ref this build was made from as
+//! `ALGO_BUILD_GIT_TAG`, consumed by `connect`'s `USER_AGENT`. See
+//! `algo_build_info::emit_git_ref_env` for how it's resolved (Docker
+//! override vs. local `git describe`).
 
 fn main() {
-    // Re-run if git HEAD changes (new commits, branch switches).
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    algo_build_info::track_git_head(&manifest_dir);
-
-    // Git commit hash
-    let commit_hash = algo_build_info::git_output(&["rev-parse", "--short=12", "HEAD"]);
-    println!("cargo:rustc-env=ALGO_BUILD_COMMIT_HASH={commit_hash}");
-
-    // Git branch name
-    let branch = algo_build_info::git_output(&["rev-parse", "--abbrev-ref", "HEAD"]);
-    println!("cargo:rustc-env=ALGO_BUILD_BRANCH={branch}");
+    algo_build_info::emit_git_ref_env("ALGO_BUILD_GIT_TAG", "ALGO_BUILD_GIT_TAG");
 }
