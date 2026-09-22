@@ -1,0 +1,186 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: Docker Image
+
+# Builds and (on main / version tags) publishes the algod-rust container
+# image from docker/Dockerfile.
+#
+# ## go-algorand compatibility
+#
+# The community `algorand/algod` Docker Hub image (the one
+# docker/docker-compose.yml's `algod-go` service pulls) is the de-facto
+# reference this repo's own image follows: port 8080 for the REST API, an
+# `/algod/data` data directory, and version-string tags such as
+# `5.0.2-stable` (bare go-algorand release tag, no `v` prefix). We mirror
+# that surface here so `ghcr.io/xarmian/algod-rust` is a drop-in substitute
+# in a compose file that already expects `algorand/algod`:
+#   - same port (8080) and data-dir convention (see docker/Dockerfile)
+#   - a tag equal to the pinned go-algorand parity version (env
+#     GO_ALGORAND_REV below, e.g. "5.0.2-stable" — kept in sync with
+#     consensus-cluster.yml / algokey-e2e.yml's pin) in addition to our own
+#     semver/branch/sha tags
+#   - multi-arch (linux/amd64, linux/arm64), matching what the Go image
+#     ships
+#
+# ## Images published
+#
+#   ghcr.io/xarmian/algod-rust:<tag>            — `runtime` target (the
+#                                                  `follow`-by-default image;
+#                                                  see docker/Dockerfile)
+#   ghcr.io/xarmian/algod-rust:<tag>-localnet   — `localnet` target (single
+#                                                  node dev-mode network)
+#
+# ## Triggers
+#
+#   - push to main touching the Dockerfile or anything it COPYs in: build
+#     AND push (both targets, multi-arch).
+#   - push of a `v*.*.*` tag: same, plus semver-derived tags.
+#   - pull_request touching the same paths: build only (single-arch, no
+#     push) so a broken Dockerfile fails CI before merge.
+#   - workflow_dispatch: manual build+push from any ref.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+    paths:
+      - "docker/Dockerfile"
+      - "crates/**"
+      - "bin/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/docker-image.yml"
+  pull_request:
+    paths:
+      - "docker/Dockerfile"
+      - "crates/**"
+      - "bin/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/docker-image.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: docker-image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  # Same pin as consensus-cluster.yml / algokey-e2e.yml (see CLAUDE.md).
+  # Published as a bare version tag (no "v" prefix) to match the
+  # `algorand/algod:5.0.2-stable` Docker Hub tag naming this image is
+  # meant to be substitutable for.
+  GO_ALGORAND_REV: "v5.0.2-stable"
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }} image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [runtime, localnet]
+        include:
+          - target: runtime
+            suffix: ""
+          - target: localnet
+            suffix: "-localnet"
+
+    permissions:
+      contents: read
+      # Only needed to push; harmless (unused) on the read-only PR path.
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (arm64 cross-build)
+        uses: docker/setup-qemu-action@v3
+        # PRs only build/verify the runner's native arch — arm64 emulation
+        # is the slow part and isn't needed to catch a broken Dockerfile.
+        if: github.event_name != 'pull_request'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute go-algorand pin tag (strip leading "v")
+        id: pin
+        run: echo "tag=${GO_ALGORAND_REV#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
+            suffix=${{ matrix.suffix }}
+          tags: |
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ steps.pin.outputs.tag }},enable={{is_default_branch}}
+            type=sha,format=short,prefix=sha-
+          labels: |
+            org.opencontainers.image.title=algod-rust
+            org.opencontainers.image.description=Rust reimplementation of go-algorand (algod)
+            org.opencontainers.image.vendor=Algod DAO
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            io.algod-rust.go-algorand-pin=${{ env.GO_ALGORAND_REV }}
+            io.algod-rust.image-target=${{ matrix.target }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: ${{ matrix.target }}
+          # Multi-arch only when actually publishing; PR verification builds
+          # the runner's native arch to keep the check fast.
+          platforms: ${{ github.event_name != 'pull_request' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=docker-image-${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=docker-image-${{ matrix.target }}
+          provenance: true
+          sbom: true
+
+  smoke-test:
+    name: Smoke test published image
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    timeout-minutes: 10
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull and run --version
+        run: |
+          IMAGE="ghcr.io/${{ env.IMAGE_NAME }}:sha-$(echo "${{ github.sha }}" | cut -c1-7)"
+          docker pull "$IMAGE"
+          docker run --rm "$IMAGE" --version
