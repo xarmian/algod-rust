@@ -111,8 +111,3 @@ job's `platform`/`include` matrix to publish amd64-only instead. `merge`'s
 `imagetools create` step needs no edit: it globs whatever digest files
 `download-artifact` fetched, so it already adapts to however many platforms
 `build` actually produced.
-
-## Pushing to Docker Hub
-
-See "Setting up Docker Hub publishing" above — it's optional and
-secret-gated, not a separate mode to enable in the workflow itself.
