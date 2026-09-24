@@ -2251,6 +2251,25 @@ pub struct SqliteLedger {
     /// [`crate::store_trait::RetentionConfig`], which reproduces the
     /// pre-existing consensus-only pruning window (issue #1350) exactly.
     retention: crate::store_trait::RetentionConfig,
+
+    /// Wall-clock instant of the most recent successful [`Self::commit_block`]
+    /// (issue #1592). Mirrors go-algorand's `AlgorandFullNode.lastRoundTimestamp`,
+    /// set by `OnNewBlock` (`node/node.go`) -- a `BlockListener` callback the
+    /// ledger invokes after *every* locally-written block, whatever its
+    /// source (agreement commit, catchup/sync replay, dev-mode production).
+    /// `commit_block` is the single low-level function every one of those
+    /// paths in this codebase funnels through (`AgreementLedgerBridge`,
+    /// `commands::sync`, `commands::replay`, `dev_producer`), so stamping it
+    /// there is the direct analog of go's listener without needing a
+    /// separate notification channel. `None` until the first successful
+    /// commit this process has made (matches go's zero-valued
+    /// `lastRoundTimestamp` before any block, and both are process-lifetime
+    /// only -- neither is persisted across a restart). Process-local
+    /// `Instant`, not a wall-clock `SystemTime`: only ever compared against
+    /// a later `Instant::now()` in the same process (see
+    /// `time_since_last_round` in `bin/algod-rust/src/node_interface_impl.rs`),
+    /// so it needs no serialization and is immune to system-clock jumps.
+    last_commit_wall_time: Option<std::time::Instant>,
 }
 
 /// In-memory accumulator for the per-round change to the `accounttotals`
@@ -2686,6 +2705,7 @@ impl SqliteLedger {
             acctupdates_stats: None,
             acctupdates_stats_gate: crate::acctupdates_stats::AccountUpdatesStatsGate::default(),
             retention: crate::store_trait::RetentionConfig::default(),
+            last_commit_wall_time: None,
         })
     }
 
@@ -3535,8 +3555,36 @@ impl SqliteLedger {
         let result = self.commit_block_uncleaned();
         if result.is_err() {
             self.reset_after_failed_commit();
+        } else if self.current_round.0 > 0 {
+            // Issue #1592: stamp the commit instant here, not on some
+            // later REST poll -- see `last_commit_wall_time`'s doc comment.
+            //
+            // Guard on round > 0: go-algorand's `OnNewBlock` listener is
+            // never invoked for the genesis block -- genesis is installed
+            // as the ledger's synthetic initial state, not delivered as "a
+            // new block" through the same path a real committed round
+            // takes (`ledger/ledger.go`'s genesis-init path never calls
+            // `notifyCommit`/the `BlockListener`s the way `AddBlock` does).
+            // `StatusReport.LastRoundTimestamp` therefore stays zero-valued
+            // until the first real round-1+ commit, and `/v2/status` at
+            // round 0 reports `time-since-last-round: 0` on both sides --
+            // without this guard, committing genesis here would stamp the
+            // instant genesis was written (node startup), not "no blocks
+            // seen yet", diverging from go the moment any REST client
+            // polls status more than an instant after startup (caught live
+            // by `bin/algod-rust/tests/live_go_parity.rs`'s
+            // `status_at_genesis_is_byte_identical`).
+            self.last_commit_wall_time = Some(std::time::Instant::now());
         }
         result
+    }
+
+    /// The wall-clock instant of the most recent successful [`Self::commit_block`]
+    /// in this process, or `None` if none has happened yet. See
+    /// `last_commit_wall_time`'s doc comment for the go-algorand parity this
+    /// backs (`StatusReport.LastRoundTimestamp` / `TimeSinceLastRound`).
+    pub fn last_commit_wall_time(&self) -> Option<std::time::Instant> {
+        self.last_commit_wall_time
     }
 
     /// Undo whatever `commit_block_uncleaned` left behind when it failed
@@ -8996,6 +9044,84 @@ mod tests {
             ledger.online_circulation_at_round(200, 200).unwrap(),
             5_500_000,
             "no snapshot recorded for round 200 -> fall back to the current aggregate",
+        );
+    }
+
+    /// Issue #1592: `commit_block` stamps a wall-clock commit instant that a
+    /// caller polling far apart from the commit can still see as "elapsed
+    /// since the commit", not "elapsed since I happened to poll". Mirrors
+    /// go's `OnNewBlock` setting `lastRoundTimestamp = time.Now()` at write
+    /// time, independent of any later status read.
+    #[test]
+    fn commit_block_stamps_wall_time_independent_of_later_polling() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        assert_eq!(
+            ledger.last_commit_wall_time(),
+            None,
+            "no commit yet -- matches go's zero-valued lastRoundTimestamp"
+        );
+
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(1));
+        ledger.commit_block().unwrap();
+        let stamped_at = ledger
+            .last_commit_wall_time()
+            .expect("commit_block must stamp on success");
+
+        // The stamp must not move just because something "polls" it later --
+        // a poll-based tracker (the pre-#1592 behavior) would instead reset
+        // the timestamp to the moment of this read.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(
+            ledger.last_commit_wall_time(),
+            Some(stamped_at),
+            "reading the stamp must not itself update it"
+        );
+        assert!(
+            stamped_at.elapsed() >= std::time::Duration::from_millis(30),
+            "elapsed time since the real commit must already include the sleep"
+        );
+    }
+
+    /// A failed commit (e.g. the caller never called `begin_block`) must not
+    /// stamp `last_commit_wall_time` -- only a round that actually advanced.
+    #[test]
+    fn commit_block_does_not_stamp_on_failure() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        assert!(
+            ledger.commit_block().is_err(),
+            "commit without begin_block must fail"
+        );
+        assert_eq!(ledger.last_commit_wall_time(), None);
+    }
+
+    /// Issue #1592 (found live by `bin/algod-rust/tests/live_go_parity.rs`'s
+    /// `status_at_genesis_is_byte_identical`): committing the genesis block
+    /// (round 0) must NOT stamp `last_commit_wall_time` -- go-algorand's
+    /// `OnNewBlock` `BlockListener` is never invoked for genesis, so
+    /// `/v2/status` at round 0 reports `time-since-last-round: 0` on both
+    /// sides no matter how long the node has been running. Only the first
+    /// real round-1+ commit may set the stamp.
+    #[test]
+    fn commit_block_does_not_stamp_for_genesis_round_zero() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        assert_eq!(ledger.current_round(), Round(0));
+
+        ledger.begin_block().unwrap();
+        ledger.commit_block().unwrap();
+        assert_eq!(
+            ledger.last_commit_wall_time(),
+            None,
+            "committing genesis (round 0) must not stamp -- go never calls              OnNewBlock for it"
+        );
+
+        // The very next commit (round 1, a real block) must stamp.
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(1));
+        ledger.commit_block().unwrap();
+        assert!(
+            ledger.last_commit_wall_time().is_some(),
+            "round 1 is a real block and must stamp"
         );
     }
 
