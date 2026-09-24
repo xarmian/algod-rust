@@ -226,7 +226,7 @@ if [ "$SKIP_START" != "1" ]; then
     # timestamps that far behind wall clock — and go-algorand's
     # MaxTimestampIncrement (config/consensus.go, 25 s) lets every
     # proposer, Go or Rust, advance `ts` by at most 25 s per block until
-    # they catch up. The nightly's Tier 1 smoke -> Tier 1.5 -> Tier 2
+    # they catch up. The P2P nightly's Tier 1 smoke -> Tier 1.5 -> Tier 2
     # sequence produced ~105 such rounds and a "13.6 s mean block time"
     # on a 2.7 s/round cluster. Purge unless the caller explicitly wants
     # to iterate on an existing netroot/.
