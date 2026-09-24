@@ -496,25 +496,61 @@ def step_coverage_check(parsed: dict, required_steps):
     }
 
 
-def cadence_check(block_time_summary: dict, max_mean: float, max_p95: float):
+# go-algorand `config/consensus.go` `MaxTimestampIncrement` (25 s, set in v7,
+# unchanged since): `bookkeeping.MakeBlock` clamps every new block's `ts` to
+# `prev.ts + MaxTimestampIncrement`, and algod-rust's
+# `algo_ledger::block_header` does the same. A chain whose header timestamps
+# trail wall-clock time (e.g. a ledger resumed from a genesis created long
+# before the soak started) can therefore only catch up at 25 s per round no
+# matter how fast rounds actually close — which is what issue #1590's
+# "13.6 s mean block time" on a 2.7 s/round cluster turned out to be.
+MAX_TIMESTAMP_INCREMENT_S = 25
+
+# How far behind wall clock a block's header `ts` may be captured before the
+# run is called a *resumed* chain rather than a freshly bootstrapped one.
+# Even a fresh `goal network create` -> start.sh cluster shows a few 25 s
+# deltas: the genesis is stamped at creation, and partkey generation,
+# config patching and node boot put the first block ~2 minutes later (the
+# post-#1590 live run: block 1 captured 115 s behind wall clock, 5
+# saturated deltas, caught up by round 6). A chain resumed after an
+# earlier cluster run is minutes to hours behind (2182 s in the failing
+# nightly).
+RESUMED_CHAIN_HEADER_LAG_S = 300
+
+
+def cadence_check(block_time_summary: dict, max_mean: float, max_p95: float,
+                  wall_block_time_summary: dict = None):
     """Fail when block production is slower than the configured bound.
 
     Both bounds are opt-in (0 disables). `analyze.py` historically only
     *reported* the block-time distribution; issue #470 §4 wants a real
     gate, but the acceptable value depends on the harness (a 4-node
     docker cluster on a laptop is slower than CI), so the caller picks.
+
+    Issue #1590: the gate measures *wall-clock* cadence (consecutive
+    rounds' earliest `commit_ts_utc`, `wall_block_time_summary`) whenever
+    the collector recorded it, and only falls back to block-header `ts`
+    deltas (`block_time_summary`) for JSONL that has no commit timestamps.
+    Header deltas are bounded by `MaxTimestampIncrement` (see above) and
+    so measure the chain's timestamp catch-up, not how fast rounds close.
     """
     failures = []
-    if block_time_summary.get("n"):
-        if max_mean > 0 and block_time_summary["mean"] > max_mean:
+    if wall_block_time_summary and wall_block_time_summary.get("n"):
+        source = "wall_clock"
+        dist = wall_block_time_summary
+    else:
+        source = "block_header"
+        dist = block_time_summary
+    if dist.get("n"):
+        if max_mean > 0 and dist["mean"] > max_mean:
             failures.append(
-                f"mean block time {block_time_summary['mean']:.2f}s > "
-                f"{max_mean:.2f}s"
+                f"mean block time {dist['mean']:.2f}s > "
+                f"{max_mean:.2f}s ({source})"
             )
-        if max_p95 > 0 and block_time_summary["p95"] > max_p95:
+        if max_p95 > 0 and dist["p95"] > max_p95:
             failures.append(
-                f"p95 block time {block_time_summary['p95']:.2f}s > "
-                f"{max_p95:.2f}s"
+                f"p95 block time {dist['p95']:.2f}s > "
+                f"{max_p95:.2f}s ({source})"
             )
     elif max_mean > 0 or max_p95 > 0:
         failures.append(
@@ -524,8 +560,38 @@ def cadence_check(block_time_summary: dict, max_mean: float, max_p95: float):
     return {
         "max_mean_block_time_s": max_mean,
         "max_p95_block_time_s": max_p95,
+        "source": source,
         "ok": not failures,
         "failures": failures,
+    }
+
+
+def block_ts_catch_up_check(block_times: list, header_lags_s: list = ()) -> dict:
+    """Detect a chain whose header timestamps are catching up to wall clock.
+
+    Under go-algorand's `MaxTimestampIncrement` clamp every proposer (Go or
+    Rust) emits `ts = prev.ts + 25` until the header timestamps reach real
+    time, so a run of 25 s header deltas on a cluster that is otherwise
+    closing rounds in seconds means the chain's timestamps started behind
+    wall clock (issue #1590). `header_lags_s` is, per captured block,
+    `capture wall time - header ts`; its maximum says *how far* behind:
+    a couple of minutes is the genesis-to-first-block boot latency of a
+    fresh cluster (reported, not flagged), anything beyond
+    `RESUMED_CHAIN_HEADER_LAG_S` means the soak resumed a stale
+    genesis/ledger (`detected`). One saturated delta can also be a genuine
+    stall; two or more is the catch-up signature.
+    """
+    saturated = sum(1 for dt in block_times if dt >= MAX_TIMESTAMP_INCREMENT_S)
+    max_lag = max(header_lags_s) if header_lags_s else None
+    return {
+        "max_timestamp_increment_s": MAX_TIMESTAMP_INCREMENT_S,
+        "saturated_pairs": saturated,
+        "block_pairs": len(block_times),
+        "max_header_lag_s": max_lag,
+        "resumed_chain_lag_threshold_s": RESUMED_CHAIN_HEADER_LAG_S,
+        "detected": saturated >= 2 and (
+            max_lag is None or max_lag > RESUMED_CHAIN_HEADER_LAG_S
+        ),
     }
 
 
@@ -628,6 +694,34 @@ def summarize(records, lag_tolerance: int):
                 if dt >= 0:
                     block_times.append(dt)
 
+    # How far behind wall clock each captured block's header ts was (issue
+    # #1590): distinguishes a fresh chain's ~2 min boot catch-up from a
+    # chain resumed minutes/hours after its genesis was stamped.
+    header_lags_s = []
+    for r in sorted_block_rounds:
+        b = block_by_round[r]
+        ts = b.get("block_ts_unix")
+        captured = parse_iso(b.get("wall_ts"))
+        if isinstance(ts, (int, float)) and captured is not None:
+            header_lags_s.append(captured.timestamp() - float(ts))
+
+    # Wall-clock block time (issue #1590): the earliest commit_ts any REST
+    # node reported for round r, minus the same for round r-1. This is what
+    # "cadence" means; header `ts` deltas above are clamped by
+    # MaxTimestampIncrement and only agree with it once the chain's
+    # timestamps have caught up with real time.
+    earliest_commit_by_round = {
+        r: min(per_node.values())
+        for r, per_node in commit_ts_by_round.items() if per_node
+    }
+    wall_block_times = []
+    for r in sorted(earliest_commit_by_round):
+        if (r - 1) in earliest_commit_by_round:
+            dt = (earliest_commit_by_round[r]
+                  - earliest_commit_by_round[r - 1]).total_seconds()
+            if dt >= 0:
+                wall_block_times.append(dt)
+
     # Commit-latency distribution (max-min commit_ts across nodes, per round)
     commit_spreads_ms = []
     partial_observations = 0
@@ -715,6 +809,16 @@ def summarize(records, lag_tolerance: int):
             "min": min(block_times) if block_times else None,
             "max": max(block_times) if block_times else None,
         },
+        "wall_block_time_s": {
+            "n": len(wall_block_times),
+            "mean": statistics.mean(wall_block_times) if wall_block_times else None,
+            "p50": percentile(wall_block_times, 50),
+            "p95": percentile(wall_block_times, 95),
+            "p99": percentile(wall_block_times, 99),
+            "min": min(wall_block_times) if wall_block_times else None,
+            "max": max(wall_block_times) if wall_block_times else None,
+        },
+        "block_ts_catch_up": block_ts_catch_up_check(block_times, header_lags_s),
         "commit_spread_ms": {
             "n": len(commit_spreads_ms),
             "mean": statistics.mean(commit_spreads_ms) if commit_spreads_ms else None,
@@ -739,6 +843,7 @@ def summarize(records, lag_tolerance: int):
         # keep them out of the printed report but expose in the JSON.
         "_samples": {
             "block_times_s": block_times,
+            "wall_block_times_s": wall_block_times,
             "commit_spreads_ms": commit_spreads_ms,
         },
     }
@@ -775,11 +880,37 @@ def print_report(summary, source_paths):  # noqa: C901 — one linear report
 
     bt = summary["block_time_s"]
     if bt["n"]:
-        print(f"Block time (s): n={bt['n']} mean={bt['mean']:.3f} "
+        print(f"Block time (s, header ts): n={bt['n']} mean={bt['mean']:.3f} "
               f"p50={bt['p50']:.3f} p95={bt['p95']:.3f} p99={bt['p99']:.3f} "
               f"min={bt['min']:.3f} max={bt['max']:.3f}")
     else:
-        print("Block time: no consecutive block pairs captured.")
+        print("Block time (header ts): no consecutive block pairs captured.")
+    wbt = summary.get("wall_block_time_s") or {}
+    if wbt.get("n"):
+        print(f"Block time (s, wall clock): n={wbt['n']} mean={wbt['mean']:.3f} "
+              f"p50={wbt['p50']:.3f} p95={wbt['p95']:.3f} p99={wbt['p99']:.3f} "
+              f"min={wbt['min']:.3f} max={wbt['max']:.3f}")
+    else:
+        print("Block time (wall clock): no consecutive commit_ts pairs captured.")
+    cu = summary.get("block_ts_catch_up") or {}
+    lag = cu.get("max_header_lag_s")
+    lag_txt = f"{lag:.0f}s" if isinstance(lag, (int, float)) else "n/a"
+    if cu.get("detected"):
+        print(f"  NOTE: {cu['saturated_pairs']}/{cu['block_pairs']} header-ts "
+              f"deltas saturated at MaxTimestampIncrement "
+              f"({cu['max_timestamp_increment_s']}s), header ts up to "
+              f"{lag_txt} behind wall clock — the chain was resumed from a "
+              f"stale genesis/ledger and its header timestamps were catching "
+              f"up; header block time is NOT a cadence measure for this run "
+              f"(issue #1590). Start the soak from a freshly generated "
+              f"netroot/ (stop.sh --purge).")
+    elif cu.get("saturated_pairs"):
+        print(f"  note: {cu['saturated_pairs']}/{cu['block_pairs']} header-ts "
+              f"deltas at the MaxTimestampIncrement clamp "
+              f"({cu['max_timestamp_increment_s']}s), header ts up to "
+              f"{lag_txt} behind wall clock — genesis-to-first-block boot "
+              f"latency of a fresh chain (or a stall); the wall-clock "
+              f"distribution above is the cadence measure (issue #1590).")
 
     cs = summary["commit_spread_ms"]
     if cs["n"]:
@@ -872,7 +1003,8 @@ def print_report(summary, source_paths):  # noqa: C901 — one linear report
     cad = summary.get("cadence")
     if cad and (cad["max_mean_block_time_s"] or cad["max_p95_block_time_s"]):
         print(
-            f"Cadence gate: max_mean={cad['max_mean_block_time_s']}s "
+            f"Cadence gate ({cad.get('source', 'block_header')}): "
+            f"max_mean={cad['max_mean_block_time_s']}s "
             f"max_p95={cad['max_p95_block_time_s']}s — "
             + ("OK" if cad["ok"] else "FAIL")
         )
@@ -1009,10 +1141,13 @@ def main() -> int:
                              "this many ms (0 = disabled).")
     parser.add_argument("--max-mean-block-time", type=float, default=0.0,
                         help="Fail if mean inter-block time exceeds this many "
-                             "seconds (0 = disabled).")
+                             "seconds (0 = disabled). Measured on wall-clock "
+                             "commit_ts_utc deltas when present, else on "
+                             "block-header ts deltas (issue #1590).")
     parser.add_argument("--max-p95-block-time", type=float, default=0.0,
                         help="Fail if p95 inter-block time exceeds this many "
-                             "seconds (0 = disabled).")
+                             "seconds (0 = disabled). Same source rule as "
+                             "--max-mean-block-time.")
     args = parser.parse_args()
 
     if not os.path.exists(args.input):
@@ -1057,6 +1192,7 @@ def main() -> int:
         summary["block_time_s"],
         args.max_mean_block_time,
         args.max_p95_block_time,
+        summary.get("wall_block_time_s"),
     )
 
     clean = print_report(summary, [args.input])

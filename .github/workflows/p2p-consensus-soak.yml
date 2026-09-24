@@ -195,8 +195,15 @@ jobs:
           ROUNDS: "30"
         run: make p2p-interop-consensus-test
 
+      # PURGE=1 (issue #1590): Tier 2's consensus-soak.sh purges netroot/
+      # itself before starting, but say it here too so the Tier 1 chain
+      # (genesis stamped at Tier 1 start, ledgers bind-mounted under
+      # netroot/NodeN) can never be resumed by a later stage. A resumed
+      # chain's header timestamps only catch up to wall clock at
+      # MaxTimestampIncrement (25 s) per round, which analyze.py used to
+      # misread as a 13.6 s mean block time.
       - name: Tier 1 — cluster down
-        run: make p2p-interop-down
+        run: make p2p-interop-down PURGE=1
 
       # ── Tier 1.5 — 1-1 (50/50 stake) vote-acceptance gate (#1580) ─────
       #

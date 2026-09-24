@@ -92,9 +92,35 @@ gives us zero nodes).
 
 ## Derived metrics (in analyze.py)
 
-- **Block time (s)** — `block_ts[r] − block_ts[r−1]` over consecutive
-  rounds where both have a block record. Reported as mean / p50 / p95 /
-  p99 / min / max.
+- **Block time, wall clock (s)** (`wall_block_time_s`, issue #1590) —
+  `min_nodes(commit_ts[r]) − min_nodes(commit_ts[r−1])` over consecutive
+  rounds that at least one REST node reported a `commit_ts_utc` for,
+  i.e. the real time between the cluster closing round `r−1` and round
+  `r`. Reported as mean / p50 / p95 / p99 / min / max. **This is the
+  distribution the `--max-mean-block-time` / `--max-p95-block-time`
+  cadence gate judges** (`cadence.source == "wall_clock"`).
+- **Block time, header ts (s)** (`block_time_s`) — `block_ts[r] −
+  block_ts[r−1]` over consecutive rounds where both have a block
+  record. Kept for reporting and for JSONL with no `commit_ts_utc`
+  (the gate falls back to it then, `cadence.source ==
+  "block_header"`). It is **not** a cadence measure on its own: both
+  go-algorand (`data/bookkeeping/block.go` `MakeBlock`) and algod-rust
+  clamp a block's `ts` to `prev.ts + MaxTimestampIncrement`
+  (`config/consensus.go`, 25 s), so a chain whose header timestamps
+  trail wall clock — a ledger resumed from a genesis created long
+  before the soak — advances `ts` by exactly 25 s per block, whoever
+  proposes, until it catches up. `analyze.py` reports that signature
+  as `block_ts_catch_up` (`saturated_pairs` = header deltas at the
+  clamp; `max_header_lag_s` = how far behind capture wall time the
+  header `ts` got; `detected` when there are two or more saturated
+  deltas *and* the lag exceeds 300 s) and prints a
+  `MaxTimestampIncrement` note; a run showing `detected` was not
+  started from a fresh netroot/. A fresh cluster still shows a handful
+  of saturated deltas in its first rounds — the genesis is stamped at
+  `goal network create` and partkey generation, config patching and
+  node boot put the first block ~2 minutes later — which is reported
+  as boot latency, not flagged. The soak scripts purge `netroot/` before `start.sh`
+  for exactly this reason (`REUSE_NETROOT=1` opts out).
 - **Commit spread (ms)** — for each round with observations from ≥ 2
   REST nodes, `max(commit_ts) − min(commit_ts)` across nodes. A proxy
   for round convergence time. Rounds with only one observation are
@@ -124,6 +150,13 @@ A soak run is **clean** if `analyze.py` reports "all criteria satisfied"
    on transient fetch failures, parse errors, stalls, and any
    collector-side anomalies, so a clean run should have none.
 4. Every captured block has a `block_ts_unix` and a `proposer`.
+
+The cadence gate (`--max-mean-block-time` / `--max-p95-block-time`,
+opt-in) is judged on the wall-clock distribution, so a
+`block_ts_catch_up.detected` note never fails a run by itself — but it
+does mean the header-timestamp numbers in that report describe a
+resumed chain, not the cluster's cadence. Treat it as a harness bug
+(stale `netroot/`), not a node finding.
 
 ### Issue #470 additions (opt-in)
 

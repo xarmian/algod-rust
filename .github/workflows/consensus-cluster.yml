@@ -160,8 +160,13 @@ jobs:
           SMOKE_ROUNDS: "30"
         run: make consensus-cluster-smoke
 
+      # PURGE=1 (issue #1590): Tier 2's consensus-conformance.sh purges
+      # netroot/ itself before starting, but say it here too so the Tier 1
+      # chain can never be resumed by a later stage — see
+      # p2p-consensus-soak.yml's Tier 1 teardown for the
+      # MaxTimestampIncrement catch-up this prevents.
       - name: Tier 1 — cluster down
-        run: make consensus-cluster-down
+        run: make consensus-cluster-down PURGE=1
 
       # ── Tier 2 prerequisites — go-algorand + libsodium caches ─────
       # run-in-docker.sh needs a real go-algorand git checkout to clone
