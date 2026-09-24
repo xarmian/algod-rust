@@ -1841,12 +1841,34 @@ fn suspended_block_validator_stalls_verification_and_resume_unblocks_it_five_nod
     // the other 4 nodes, so the cluster never reaches quiescence — exactly
     // the condition `wait_for_quiet`'s doc comment says to poll
     // `pending_proposal_validations()` directly for instead.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // Issue #1594: this used a hard 10s wall-clock deadline, which flaked
+    // under `cargo test --workspace`'s CPU contention -- the OS scheduler
+    // can starve this test's threads (including the crypto-verifier thread
+    // that has to run before `pending_proposal_validations()` ever ticks
+    // above zero) for longer than 10s when ~1500 other tests, including many
+    // other real-thread 5-node clusters from this same file, are competing
+    // for the same cores. Repeated local runs of just this file (which
+    // alone already saturates every core with concurrent 5-node clusters)
+    // are the cheaper stand-in for a full `--workspace` stress loop. There
+    // is no incremental-progress signal to bound this by retry COUNT
+    // instead (unlike `pump_until_new_round`'s bounded retries, nothing
+    // needs to be re-triggered here -- the verification is already in
+    // flight from cluster setup; we are purely waiting for the OS to
+    // schedule the thread that ticks the counter), so the fix widens the
+    // budget rather than changing its shape -- matching this file's own
+    // existing convention for a genuinely async, non-retriggerable wait
+    // (`arm_and_catch_next_proposal_broadcast`'s `Duration::from_secs(300)`
+    // budget, used elsewhere in this file for the same class of wait). A
+    // node that never reports a pending validation is still a hard
+    // `assert!` failure, not a silently-swallowed timeout -- this only
+    // widens how long a slow-but-working scheduler is given before that
+    // assertion fires.
+    const PENDING_VALIDATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + PENDING_VALIDATION_DEADLINE;
     while cluster.pending_proposal_validations() == 0 {
         assert!(
             std::time::Instant::now() < deadline,
-            "no node ever reported a pending (suspended) proposal validation \
-             within 10s of cluster startup"
+            "no node ever reported a pending (suspended) proposal validation within {PENDING_VALIDATION_DEADLINE:?} of cluster startup"
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
