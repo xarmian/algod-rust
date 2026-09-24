@@ -96,14 +96,40 @@ const POLL_INTERVAL: Duration = Duration::from_millis(2);
 /// while." `MAX_TOTAL_TIMEOUT` below remains as a hard backstop against a
 /// pathological signature that oscillates forever without ever truly
 /// settling.
-const QUIET_TIMEOUT: Duration = Duration::from_secs(10);
+const QUIET_TIMEOUT: Duration = Duration::from_secs(90);
 /// Absolute backstop regardless of observed progress, so a wait_for_quiet
 /// call cannot hang a test suite indefinitely even in a pathological case
 /// (e.g. a signature that keeps oscillating without ever reaching true
 /// quiescence). Generous enough to comfortably outlast one settle point
 /// under heavy contention (see `QUIET_TIMEOUT`'s doc comment) while still
 /// bounding worst-case test run time.
-const MAX_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
+///
+/// Issue #1595: widened from 10s/120s in two steps. A first attempt at
+/// 30s/180s (6x) was validated against two clean, contention-saturated
+/// runs of just `service_multi_node_test.rs` alone (47 tests, default
+/// parallelism, ~600-620s each) -- both passed -- but STILL flaked on a
+/// real `cargo test --workspace` run, at the exact same test
+/// (`regression_wrong_period_payload_verification_cancellation_8ba23942_
+/// five_node`) and the exact same diagnostic signature
+/// (`reported_pending=0 network_pending=0 all_idle=true` -- i.e. the
+/// cluster HAD reached quiescence, just not within the stall window).
+/// That proved "just this file alone at full parallelism" understates
+/// real `--workspace` contention: dozens of OTHER heavy multi-threaded
+/// tests from unrelated crates compete for the same cores too. That
+/// specific test already carries its own signal that it is unusually
+/// contention-sensitive -- an internal `HEAVY_PROPOSE_GATE_TEST_LOCK` to
+/// serialize it against self-interference, and its own
+/// `arm_and_catch_next_proposal_broadcast` call already budgets 300s for
+/// a single async wait. `QUIET_TIMEOUT`/`MAX_TOTAL_TIMEOUT` now match
+/// that same 300s precedent (90s/300s) rather than the more conservative
+/// 30s/180s, re-validated the same way: a real `cargo test --workspace`
+/// run passing with this specific test green. `wait_for_quiet` is still
+/// this crate's shared helper (used well over a dozen times across that
+/// file, some tests calling it many times via `pump_until_new_round`'s
+/// retry loop) -- this is a real, not empirically-minimal, safety
+/// margin, not a claim that no flake rate remains under arbitrarily
+/// worse contention; see issue #1595 for the reproduction history.
+const MAX_TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Per-cluster quiescence tracker. One instance shared by every simulated
 /// node's `Parameters::monitor` (via [`ActivityMonitor::listener`]).
