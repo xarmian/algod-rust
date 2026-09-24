@@ -40,6 +40,14 @@ GO3 = "C" * 58
 RUST = "GACNGSR26F4WW5CDFQ2MOFWEUN2BVAVNBI5OCOV7LRHIE2KSWIV22PKQC4"
 
 ANALYZE_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "analyze.py")
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+# Rounds 35-95 of Nightly P2P Consensus Soak run 35977230012's real
+# soak.jsonl (issue #1590): every block-header ts delta is exactly
+# MaxTimestampIncrement (25 s) because Tier 2 resumed Tier 1's 40-minute-old
+# chain, while the per-node commit_ts_utc show the cluster closing rounds
+# every ~2.7 s.
+STALE_GENESIS_FIXTURE = os.path.join(
+    FIXTURES, "issue-1590-stale-genesis-catchup.jsonl")
 
 
 class ProposerShareTest(unittest.TestCase):
@@ -235,6 +243,100 @@ class CadenceTest(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertIn("no consecutive block pairs", res["failures"][0])
 
+    # ── issue #1590: wall-clock cadence vs header-timestamp catch-up ────
+
+    def test_wall_clock_distribution_is_preferred_over_header_ts(self):
+        """The failing nightly's shape: header ts saturated at 25 s/round
+        (MaxTimestampIncrement catch-up) while rounds actually closed
+        every ~2.7 s. The gate must judge the wall-clock number."""
+        header = {"n": 199, "mean": 13.64, "p95": 25.0}
+        wall = {"n": 199, "mean": 2.69, "p95": 3.2}
+        res = analyze.cadence_check(header, 10.0, 20.0, wall)
+        self.assertTrue(res["ok"], res["failures"])
+        self.assertEqual(res["source"], "wall_clock")
+        # ... and it still gates for real when the wall clock is slow.
+        slow = analyze.cadence_check(header, 10.0, 20.0,
+                                     {"n": 199, "mean": 12.0, "p95": 30.0})
+        self.assertFalse(slow["ok"])
+        self.assertIn("wall_clock", slow["failures"][0])
+
+    def test_falls_back_to_header_ts_without_commit_timestamps(self):
+        """Pre-#1590 JSONL (no commit_ts_utc) keeps analyzing on header ts."""
+        header = {"n": 50, "mean": 13.64, "p95": 25.0}
+        for wall in (None, {"n": 0, "mean": None, "p95": None}):
+            res = analyze.cadence_check(header, 10.0, 20.0, wall)
+            self.assertFalse(res["ok"])
+            self.assertEqual(res["source"], "block_header")
+
+    def test_header_ts_catch_up_detection(self):
+        # Steady 2/3 s header deltas after catch-up: nothing to flag.
+        steady = analyze.block_ts_catch_up_check([2, 3, 3, 2, 3] * 20)
+        self.assertFalse(steady["detected"])
+        self.assertEqual(steady["saturated_pairs"], 0)
+        # One 25 s delta could be a genuine stall — not the signature.
+        one = analyze.block_ts_catch_up_check([2, 3, 25, 3, 2])
+        self.assertFalse(one["detected"])
+        # A run of MaxTimestampIncrement deltas is the stale-genesis signature.
+        catching_up = analyze.block_ts_catch_up_check([25] * 105 + [2, 3] * 47)
+        self.assertTrue(catching_up["detected"])
+        self.assertEqual(catching_up["saturated_pairs"], 105)
+        self.assertEqual(catching_up["max_timestamp_increment_s"], 25)
+
+
+class StaleGenesisRegressionTest(unittest.TestCase):
+    """Issue #1590 — analyze the real failing nightly's JSONL (trimmed)."""
+
+    def _summary(self):
+        records = list(analyze.load_jsonl([STALE_GENESIS_FIXTURE]))
+        self.assertTrue(records)
+        return analyze.summarize(records, 5)
+
+    def test_real_run_header_ts_saturated_but_wall_clock_fast(self):
+        summary = self._summary()
+        header = summary["block_time_s"]
+        wall = summary["wall_block_time_s"]
+        # Every consecutive header pair in the window is exactly +25 s.
+        self.assertEqual(header["n"], 60)
+        self.assertEqual(header["min"], 25.0)
+        self.assertEqual(header["max"], 25.0)
+        # ... while the cluster was closing rounds every ~3 s in real time.
+        self.assertEqual(wall["n"], 60)
+        self.assertLess(wall["mean"], 4.0)
+        self.assertLess(wall["p95"], 5.0)
+        self.assertGreater(wall["min"], 1.0)
+        cu = summary["block_ts_catch_up"]
+        self.assertTrue(cu["detected"])
+        self.assertEqual(cu["saturated_pairs"], 60)
+
+    def test_real_run_old_gate_failed_new_gate_passes(self):
+        summary = self._summary()
+        # What the nightly used to compute (header ts only): FAIL.
+        old = analyze.cadence_check(summary["block_time_s"], 10.0, 20.0)
+        self.assertFalse(old["ok"])
+        # What it computes now (wall clock): PASS at the same bounds.
+        new = analyze.cadence_check(summary["block_time_s"], 10.0, 20.0,
+                                    summary["wall_block_time_s"])
+        self.assertTrue(new["ok"], new["failures"])
+        self.assertEqual(new["source"], "wall_clock")
+
+    def test_cli_reports_catch_up_and_passes_cadence(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "summary.json")
+            res = subprocess.run(
+                [sys.executable, ANALYZE_PY, STALE_GENESIS_FIXTURE,
+                 "--max-mean-block-time", "10", "--max-p95-block-time", "20",
+                 "--json-out", out],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            self.assertIn("MaxTimestampIncrement", res.stdout)
+            self.assertIn("Cadence gate (wall_clock)", res.stdout)
+            with open(out) as f:
+                sidecar = json.load(f)
+            self.assertTrue(sidecar["cadence"]["ok"])
+            self.assertEqual(sidecar["cadence"]["source"], "wall_clock")
+            self.assertTrue(sidecar["block_ts_catch_up"]["detected"])
+
 
 class EndToEndCliTest(unittest.TestCase):
     """Drive analyze.py as a subprocess over a synthetic JSONL soak."""
@@ -316,11 +418,13 @@ class EndToEndCliTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "s.jsonl")
             self._write_soak(path, rust_proposals=4)
-            # Blocks are 3s apart by construction.
-            ok = self._run(path, ["--max-mean-block-time", "5"])
+            # Header ts are 3s apart and commit_ts_utc 1s apart by
+            # construction; the gate judges the wall-clock (1s) number.
+            ok = self._run(path, ["--max-mean-block-time", "2"])
             self.assertEqual(ok.returncode, 0, ok.stdout)
-            bad = self._run(path, ["--max-mean-block-time", "2"])
+            bad = self._run(path, ["--max-mean-block-time", "0.5"])
             self.assertEqual(bad.returncode, 1, bad.stdout)
+            self.assertIn("(wall_clock)", bad.stdout)
 
     def test_cli_participation_endpoint_gate(self):
         """#473 — the endpoint gate is opt-in and actually gates."""

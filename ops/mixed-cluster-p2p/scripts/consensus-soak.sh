@@ -94,6 +94,13 @@
 #                         message injection)                     (default 0)
 #   SKIP_START=1          use an already-running cluster
 #   KEEP_CLUSTER=1        leave the cluster up on exit
+#   REUSE_NETROOT=1       keep an existing netroot/ (keys, genesis, Go
+#                         ledgers) instead of purging it before start.sh.
+#                         Default is to purge: a resumed chain's header
+#                         timestamps catch up to wall clock at
+#                         MaxTimestampIncrement (25 s) per round, which
+#                         issue #1590 traced the nightly's bogus 13.6 s
+#                         "mean block time" to. Ignored with SKIP_START=1.
 #   OUT_DIR               artifact directory (default: a timestamped
 #                         directory under ops/mixed-cluster-p2p/)
 #   SUMMARY_JSON          summary path (default: $OUT_DIR/summary.json)
@@ -222,6 +229,23 @@ fi
 
 # -- 1. Cluster up ------------------------------------------------------
 if [ "$SKIP_START" != "1" ]; then
+    # Issue #1590: measure cadence on a chain whose genesis was created
+    # *now*. start.sh reuses an existing netroot/ (keys, genesis AND the
+    # Go nodes' bind-mounted ledgers), so a soak started minutes or hours
+    # after an earlier cluster run resumes that chain with header
+    # timestamps that far behind wall clock — and go-algorand's
+    # MaxTimestampIncrement (config/consensus.go, 25 s) lets every
+    # proposer, Go or Rust, advance `ts` by at most 25 s per block until
+    # they catch up. The nightly's Tier 1 smoke -> Tier 1.5 -> Tier 2
+    # sequence produced ~105 such rounds and a "13.6 s mean block time"
+    # on a 2.7 s/round cluster. Purge unless the caller explicitly wants
+    # to iterate on an existing netroot/.
+    if [ "${REUSE_NETROOT:-0}" != "1" ]; then
+        echo "==> purging any previous netroot/ so the soak starts from a fresh genesis (REUSE_NETROOT=1 to keep it)"
+        "$HERE/stop.sh" --purge > "$OUT_DIR/purge.log" 2>&1 || {
+            echo "warning: stop.sh --purge failed — see $OUT_DIR/purge.log; continuing" >&2
+        }
+    fi
     echo "==> starting the 4-node P2P cluster"
     "$HERE/start.sh" > "$OUT_DIR/start.log" 2>&1 || {
         record "cluster_start" fail "start.sh failed — see $OUT_DIR/start.log"

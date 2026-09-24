@@ -102,6 +102,24 @@ Full Rust reimplementation of go-algorand — a production-grade Algorand node. 
   a signal to check more often — it is exactly the case this script was
   built to sit through unattended.
 
+## Mixed-cluster soaks must start from a fresh genesis (issue #1590)
+
+- `goal network create` stamps the genesis with its creation time, and
+  both go-algorand (`data/bookkeeping/block.go` `MakeBlock`) and
+  algod-rust clamp each block's `ts` to `prev.ts + MaxTimestampIncrement`
+  (25 s). A cluster resumed from an older `netroot/` (the Go nodes'
+  ledgers live in the bind-mounted `netroot/NodeN`) therefore emits
+  `+25 s` header timestamps from **every** proposer until it catches up,
+  and any "block time" derived from header `ts` reads as 13+ s on a
+  2.7 s/round cluster. That is a harness artefact, not a node finding.
+- `consensus-soak.sh` / `consensus-conformance.sh` purge `netroot/`
+  before `start.sh` (`REUSE_NETROOT=1` opts out), the nightly workflows'
+  Tier 1 teardown passes `PURGE=1`, and `analyze.py`'s cadence gate
+  judges wall-clock `commit_ts_utc` deltas, printing a
+  `MaxTimestampIncrement` catch-up note when header deltas saturate.
+  Keep all three when touching the harnesses; don't "fix" the
+  timestamp clamp in either node.
+
 ## Golden Fixtures
 
 - Fixture files under `crates/**/fixtures/` are compared byte-for-byte against
