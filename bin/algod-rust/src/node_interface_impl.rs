@@ -430,11 +430,6 @@ pub struct AlgodNodeInterface {
     /// `AlgorandFollowerNode` being a distinct node type from
     /// `AlgorandFullNode` rather than a runtime flag on one type.
     follower_sync_round: Option<Arc<FollowerSyncRoundState>>,
-    /// Polling-based approximation of go's `StatusReport.LastRoundTimestamp`
-    /// (`node/node.go`), backing `time_since_last_round` in
-    /// [`NodeInterface::status`]. See [`RoundTimestampTracker`]'s doc
-    /// comment for why this is poll-based rather than commit-notified.
-    round_timestamp_tracker: Mutex<RoundTimestampTracker>,
 }
 
 impl AlgodNodeInterface {
@@ -476,7 +471,6 @@ impl AlgodNodeInterface {
             archival_cfg: false,
             catchup_manager: None,
             follower_sync_round: None,
-            round_timestamp_tracker: Mutex::new(RoundTimestampTracker::new()),
         }
     }
 
@@ -941,11 +935,13 @@ impl AlgodNodeInterface {
         let last_catchpoint_label = ledger
             .last_catchpoint_label()
             .map_err(|e| NodeError::Internal(format!("last_catchpoint_label: {e}")))?;
+        let last_commit_wall_time = ledger.last_commit_wall_time();
         Ok(StatusSnapshot {
             last_round,
             protocol,
             latest_header,
             last_catchpoint_label,
+            last_commit_wall_time,
         })
     }
 
@@ -994,50 +990,11 @@ struct StatusSnapshot {
     protocol: String,
     latest_header: Option<BlockHeader>,
     last_catchpoint_label: String,
-}
-
-/// Tracks the wall-clock instant the locally-observed last-committed round
-/// last advanced, so [`time_since_last_round`] can report a real elapsed
-/// duration instead of the hardcoded zero this adapter used to report.
-///
-/// Mirrors go's `AlgorandFullNode` setting `StatusReport.LastRoundTimestamp
-/// = time.Now()` whenever a new block is written
-/// (`node/node.go`'s `OnNewBlock`) — but since this adapter has no
-/// commit-time notification channel wired to it yet (`TASK-79`), it instead
-/// detects the round advancing by comparing against the previous
-/// [`AlgodNodeInterface::status`] poll. This is not byte-identical to go's
-/// push-based timestamp (a round that advances between two widely-spaced
-/// polls is timestamped at the *later* poll, not the moment of commit), but
-/// it is a real, monotonically-sane signal rather than a permanent zero, and
-/// converges to the same value under status polling faster than the block
-/// interval (the common case — go-algorand's own `statusDelayCPUUsage`
-/// mechanism assumes sub-second polling).
-struct RoundTimestampTracker {
-    last_round: u64,
-    last_round_timestamp: Option<std::time::Instant>,
-}
-
-impl RoundTimestampTracker {
-    fn new() -> Self {
-        Self {
-            last_round: 0,
-            last_round_timestamp: None,
-        }
-    }
-
-    /// Record an observation of the current last-committed round, updating
-    /// the tracked timestamp when the round has advanced (including the
-    /// very first observation, so long as at least one round has been
-    /// committed — round 0 alone, before any real block, leaves the
-    /// timestamp unset just like go's zero-valued `LastRoundTimestamp`).
-    /// Returns the timestamp to report for this observation.
-    fn observe(&mut self, round: u64) -> Option<std::time::Instant> {
-        if round > 0 && (round != self.last_round || self.last_round_timestamp.is_none()) {
-            self.last_round = round;
-            self.last_round_timestamp = Some(std::time::Instant::now());
-        }
-        self.last_round_timestamp
-    }
+    /// Issue #1592: the ledger's own commit-time stamp
+    /// (`SqliteLedger::last_commit_wall_time`), captured under the same
+    /// lock as the rest of this snapshot so it can never disagree with
+    /// `last_round` about which commit it belongs to.
+    last_commit_wall_time: Option<std::time::Instant>,
 }
 
 /// Port of go's `StatusReport.TimeSinceLastRound` (`node/node.go`):
@@ -1135,19 +1092,12 @@ impl NodeInterface for AlgodNodeInterface {
                 ),
             };
 
-        // Poll-based `LastRoundTimestamp` tracking (see
-        // `RoundTimestampTracker`'s doc comment) — not a commit-time
-        // notification channel (TASK-79 still pending for that), but no
-        // longer a hardcoded zero either.
-        let last_round_timestamp = self
-            .round_timestamp_tracker
-            .lock()
-            .map_err(|_| NodeError::Internal("status: round timestamp tracker poisoned".into()))?
-            .observe(snap.last_round);
-
+        // Issue #1592: the ledger stamped this at commit time (see
+        // `SqliteLedger::last_commit_wall_time`'s doc comment), not at
+        // whatever moment this status poll happens to land.
         Ok(NodeStatus {
             last_round: snap.last_round,
-            time_since_last_round: time_since_last_round(last_round_timestamp)
+            time_since_last_round: time_since_last_round(snap.last_commit_wall_time)
                 .as_nanos()
                 .try_into()
                 .unwrap_or(i64::MAX),
@@ -3282,32 +3232,34 @@ mod tests {
         assert!(elapsed >= Duration::from_millis(5));
     }
 
-    #[test]
-    fn round_timestamp_tracker_stays_unset_until_first_nonzero_round() {
-        let mut tracker = RoundTimestampTracker::new();
-        // Round 0 (no real block yet) mirrors go's zero-valued
-        // `LastRoundTimestamp` — never observed as "advanced".
-        assert_eq!(tracker.observe(0), None);
-        assert_eq!(tracker.observe(0), None);
-    }
+    /// Issue #1592: `status()` must report elapsed time since the block's
+    /// *actual commit*, not since some later poll noticed it. Two polls
+    /// straddle a real commit here: the first (pre-commit) is zero, the
+    /// second (post-commit, after a real sleep) must already reflect that
+    /// sleep on its very first call -- the pre-#1592 poll-based tracker
+    /// would instead report ~0 on this exact call, since it stamped
+    /// `Instant::now()` at the moment *this* poll first noticed the round
+    /// had advanced.
+    #[tokio::test]
+    async fn status_time_since_last_round_reflects_commit_time_not_poll_time() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let adapter = make_adapter_with_ledger(ledger.clone());
 
-    #[test]
-    fn round_timestamp_tracker_sets_timestamp_on_first_and_advancing_round() {
-        let mut tracker = RoundTimestampTracker::new();
-        let first = tracker.observe(1).expect("round 1 sets a timestamp");
-        // Observing the same round again must not reset the timestamp —
-        // only an actual round advance should.
-        std::thread::sleep(Duration::from_millis(5));
-        let still_first = tracker
-            .observe(1)
-            .expect("re-observing the same round keeps the timestamp");
-        assert_eq!(first, still_first);
+        let before = adapter.status().await.unwrap();
+        assert_eq!(
+            before.time_since_last_round, 0,
+            "no committed blocks yet -- matches go's zero-valued LastRoundTimestamp"
+        );
 
-        std::thread::sleep(Duration::from_millis(5));
-        let second = tracker.observe(2).expect("round 2 advances the timestamp");
+        apply_one_trivial_block(&ledger, 1);
+        std::thread::sleep(Duration::from_millis(50));
+
+        let after = adapter.status().await.unwrap();
+        assert_eq!(after.last_round, 1);
         assert!(
-            second > first,
-            "advancing the round must bump the timestamp"
+            after.time_since_last_round >= Duration::from_millis(50).as_nanos() as i64,
+            "expected >= 50ms since the real commit, got {}ns (a poll-based tracker would report ~0 here)",
+            after.time_since_last_round
         );
     }
 
