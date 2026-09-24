@@ -111,9 +111,15 @@ gives us zero nodes).
   before the soak — advances `ts` by exactly 25 s per block, whoever
   proposes, until it catches up. `analyze.py` reports that signature
   as `block_ts_catch_up` (`saturated_pairs` = header deltas at the
-  clamp, `detected` when there are two or more) and prints a
-  `MaxTimestampIncrement` note; a run showing it was not started from a
-  fresh netroot/. The soak scripts purge `netroot/` before `start.sh`
+  clamp; `max_header_lag_s` = how far behind capture wall time the
+  header `ts` got; `detected` when there are two or more saturated
+  deltas *and* the lag exceeds 300 s) and prints a
+  `MaxTimestampIncrement` note; a run showing `detected` was not
+  started from a fresh netroot/. A fresh cluster still shows a handful
+  of saturated deltas in its first rounds — the genesis is stamped at
+  `goal network create` and partkey generation, config patching and
+  node boot put the first block ~2 minutes later — which is reported
+  as boot latency, not flagged. The soak scripts purge `netroot/` before `start.sh`
   for exactly this reason (`REUSE_NETROOT=1` opts out).
 - **Commit spread (ms)** — for each round with observations from ≥ 2
   REST nodes, `max(commit_ts) − min(commit_ts)` across nodes. A proxy

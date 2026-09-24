@@ -281,6 +281,19 @@ class CadenceTest(unittest.TestCase):
         self.assertTrue(catching_up["detected"])
         self.assertEqual(catching_up["saturated_pairs"], 105)
         self.assertEqual(catching_up["max_timestamp_increment_s"], 25)
+        # ... when the header ts were far behind wall clock (resumed chain).
+        resumed = analyze.block_ts_catch_up_check(
+            [25] * 105 + [2, 3] * 47, [2182.0 - 22.3 * i for i in range(199)])
+        self.assertTrue(resumed["detected"])
+        self.assertAlmostEqual(resumed["max_header_lag_s"], 2182.0)
+        # A fresh chain's boot catch-up (the post-fix live run: block 1
+        # captured 115 s behind wall clock, 5 saturated deltas, caught up
+        # by round 6) is reported but NOT flagged as a resumed chain.
+        boot = analyze.block_ts_catch_up_check(
+            [25] * 5 + [2, 3] * 97, [114.7, 91.7, 69.7, 47.7, 25.7, 3.7] + [3.0] * 193)
+        self.assertFalse(boot["detected"])
+        self.assertEqual(boot["saturated_pairs"], 5)
+        self.assertAlmostEqual(boot["max_header_lag_s"], 114.7)
 
 
 class StaleGenesisRegressionTest(unittest.TestCase):
@@ -307,6 +320,8 @@ class StaleGenesisRegressionTest(unittest.TestCase):
         cu = summary["block_ts_catch_up"]
         self.assertTrue(cu["detected"])
         self.assertEqual(cu["saturated_pairs"], 60)
+        # Round 35 was captured ~36 minutes behind wall clock.
+        self.assertGreater(cu["max_header_lag_s"], 2000)
 
     def test_real_run_old_gate_failed_new_gate_passes(self):
         summary = self._summary()

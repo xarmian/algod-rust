@@ -506,6 +506,17 @@ def step_coverage_check(parsed: dict, required_steps):
 # "13.6 s mean block time" on a 2.7 s/round cluster turned out to be.
 MAX_TIMESTAMP_INCREMENT_S = 25
 
+# How far behind wall clock a block's header `ts` may be captured before the
+# run is called a *resumed* chain rather than a freshly bootstrapped one.
+# Even a fresh `goal network create` -> start.sh cluster shows a few 25 s
+# deltas: the genesis is stamped at creation, and partkey generation,
+# config patching and node boot put the first block ~2 minutes later (the
+# post-#1590 live run: block 1 captured 115 s behind wall clock, 5
+# saturated deltas, caught up by round 6). A chain resumed after an
+# earlier cluster run is minutes to hours behind (2182 s in the failing
+# nightly).
+RESUMED_CHAIN_HEADER_LAG_S = 300
+
 
 def cadence_check(block_time_summary: dict, max_mean: float, max_p95: float,
                   wall_block_time_summary: dict = None):
@@ -555,22 +566,32 @@ def cadence_check(block_time_summary: dict, max_mean: float, max_p95: float,
     }
 
 
-def block_ts_catch_up_check(block_times: list) -> dict:
+def block_ts_catch_up_check(block_times: list, header_lags_s: list = ()) -> dict:
     """Detect a chain whose header timestamps are catching up to wall clock.
 
     Under go-algorand's `MaxTimestampIncrement` clamp every proposer (Go or
     Rust) emits `ts = prev.ts + 25` until the header timestamps reach real
     time, so a run of 25 s header deltas on a cluster that is otherwise
-    closing rounds in seconds means the soak resumed a stale genesis/ledger
-    (issue #1590). One saturated delta can be a genuine stall; two or more
-    in a soak with no stall warnings is the catch-up signature.
+    closing rounds in seconds means the chain's timestamps started behind
+    wall clock (issue #1590). `header_lags_s` is, per captured block,
+    `capture wall time - header ts`; its maximum says *how far* behind:
+    a couple of minutes is the genesis-to-first-block boot latency of a
+    fresh cluster (reported, not flagged), anything beyond
+    `RESUMED_CHAIN_HEADER_LAG_S` means the soak resumed a stale
+    genesis/ledger (`detected`). One saturated delta can also be a genuine
+    stall; two or more is the catch-up signature.
     """
     saturated = sum(1 for dt in block_times if dt >= MAX_TIMESTAMP_INCREMENT_S)
+    max_lag = max(header_lags_s) if header_lags_s else None
     return {
         "max_timestamp_increment_s": MAX_TIMESTAMP_INCREMENT_S,
         "saturated_pairs": saturated,
         "block_pairs": len(block_times),
-        "detected": saturated >= 2,
+        "max_header_lag_s": max_lag,
+        "resumed_chain_lag_threshold_s": RESUMED_CHAIN_HEADER_LAG_S,
+        "detected": saturated >= 2 and (
+            max_lag is None or max_lag > RESUMED_CHAIN_HEADER_LAG_S
+        ),
     }
 
 
@@ -672,6 +693,17 @@ def summarize(records, lag_tolerance: int):
                 dt = float(ts) - float(prev)
                 if dt >= 0:
                     block_times.append(dt)
+
+    # How far behind wall clock each captured block's header ts was (issue
+    # #1590): distinguishes a fresh chain's ~2 min boot catch-up from a
+    # chain resumed minutes/hours after its genesis was stamped.
+    header_lags_s = []
+    for r in sorted_block_rounds:
+        b = block_by_round[r]
+        ts = b.get("block_ts_unix")
+        captured = parse_iso(b.get("wall_ts"))
+        if isinstance(ts, (int, float)) and captured is not None:
+            header_lags_s.append(captured.timestamp() - float(ts))
 
     # Wall-clock block time (issue #1590): the earliest commit_ts any REST
     # node reported for round r, minus the same for round r-1. This is what
@@ -786,7 +818,7 @@ def summarize(records, lag_tolerance: int):
             "min": min(wall_block_times) if wall_block_times else None,
             "max": max(wall_block_times) if wall_block_times else None,
         },
-        "block_ts_catch_up": block_ts_catch_up_check(block_times),
+        "block_ts_catch_up": block_ts_catch_up_check(block_times, header_lags_s),
         "commit_spread_ms": {
             "n": len(commit_spreads_ms),
             "mean": statistics.mean(commit_spreads_ms) if commit_spreads_ms else None,
@@ -861,14 +893,24 @@ def print_report(summary, source_paths):  # noqa: C901 — one linear report
     else:
         print("Block time (wall clock): no consecutive commit_ts pairs captured.")
     cu = summary.get("block_ts_catch_up") or {}
+    lag = cu.get("max_header_lag_s")
+    lag_txt = f"{lag:.0f}s" if isinstance(lag, (int, float)) else "n/a"
     if cu.get("detected"):
         print(f"  NOTE: {cu['saturated_pairs']}/{cu['block_pairs']} header-ts "
               f"deltas saturated at MaxTimestampIncrement "
-              f"({cu['max_timestamp_increment_s']}s) — the chain was resumed "
-              f"from a stale genesis/ledger and its header timestamps were "
-              f"catching up to wall clock; header block time is NOT a cadence "
-              f"measure for this run (issue #1590). Start the soak from a "
-              f"freshly generated netroot/ (stop.sh --purge).")
+              f"({cu['max_timestamp_increment_s']}s), header ts up to "
+              f"{lag_txt} behind wall clock — the chain was resumed from a "
+              f"stale genesis/ledger and its header timestamps were catching "
+              f"up; header block time is NOT a cadence measure for this run "
+              f"(issue #1590). Start the soak from a freshly generated "
+              f"netroot/ (stop.sh --purge).")
+    elif cu.get("saturated_pairs"):
+        print(f"  note: {cu['saturated_pairs']}/{cu['block_pairs']} header-ts "
+              f"deltas at the MaxTimestampIncrement clamp "
+              f"({cu['max_timestamp_increment_s']}s), header ts up to "
+              f"{lag_txt} behind wall clock — genesis-to-first-block boot "
+              f"latency of a fresh chain (or a stall); the wall-clock "
+              f"distribution above is the cadence measure (issue #1590).")
 
     cs = summary["commit_spread_ms"]
     if cs["n"]:
