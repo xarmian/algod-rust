@@ -1,0 +1,333 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: Nightly Mainnet Node Soak
+
+# Issue #1598 — a single algod-rust node, configured exactly as an
+# operator would run it (`participate --network mainnet`), bootstrapped
+# with fast catchup against a real mainnet relay/archival endpoint, run
+# directly on the GitHub-hosted runner (no cluster, no Docker harness).
+# Measures how long fast catchup actually takes on a CI runner, and
+# detects the node halting — either mid-catchup or after it reaches the
+# tip — auto-filing a GitHub issue when it does.
+#
+# This is a NEW, STANDALONE workflow. It does not modify, extend, or
+# share state with any existing workflow (consensus-cluster.yml,
+# p2p-consensus-soak.yml, validate-api.yml, nightly-fuzz.yml, …) — see
+# issue #1598's "Scope" section.
+#
+# ## Why this is NOT on the PR path
+#
+# A release build plus up to an hour of real mainnet fast catchup is far
+# too much per PR, and it depends on a live, third-party public endpoint
+# a PR run should never be gated on. `schedule` + `workflow_dispatch`
+# ONLY: no `pull_request`, no `push`.
+#
+# ## What runs
+#
+#   1. Release-build `algod-rust`.
+#   2. Self-test `ops/mainnet-soak/monitor.py` and `file_issue.py` — the
+#      verdict logic is trusted only once its own tests pass, same
+#      discipline `ops/mixed-cluster/scripts/consensus-soak.sh` applies to
+#      `analyze.py`.
+#   3. Start `algod-rust participate --network mainnet` as a fresh,
+#      zero-stake, outbound-only participation node (real mainnet DNS
+#      relay discovery, no inbound listener needed for this soak).
+#   4. Discover the latest mainnet catchpoint from the catchup peer's own
+#      `/v2/status` `last-catchpoint`, then `POST /v2/catchup/{label}` on
+#      the node — the same fast-catchup path `goal node catchup` drives.
+#   5. Poll both the node's and the peer's `/v2/status` every 10s for the
+#      run's time budget, via `monitor.py collect` (which also stops the
+#      run early the moment a halt is detected, rather than burning the
+#      rest of the budget).
+#   6. Tear the node down, print the step-summary table, upload
+#      artifacts, and — only on a verdict of `stuck`/`node_failure` — file
+#      (or comment on, if a dedup match exists) a GitHub issue via
+#      `file_issue.py`.
+#
+# A `source_outage` verdict (the catchup peer itself unreachable or not
+# advancing) is a warning only and never files an issue — see
+# `ops/mainnet-soak/monitor.py`'s module doc comment for the full verdict
+# taxonomy and why.
+
+on:
+  schedule:
+    # 04:20 UTC daily — after the other three nightly Docker-heavy jobs
+    # (consensus-cluster.yml 02:41, p2p-interop.yml 03:05,
+    # p2p-consensus-soak.yml 03:50) so this doesn't contend with them for
+    # a runner slot, though it needs none of their Docker/cluster state.
+    - cron: "20 4 * * *"
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "Total run budget in minutes"
+        default: "60"
+        required: false
+      algod_url:
+        description: "Catchup peer REST URL override (default: the mainnet preset / MAINNET_ALGOD_URL variable)"
+        required: false
+      halt_minutes:
+        description: "Minutes of no progress before a halt is declared"
+        default: "5"
+        required: false
+      dry_run_issues:
+        description: "Print the would-be issue instead of filing it"
+        type: boolean
+        default: true
+
+concurrency:
+  # One mainnet soak node at a time — no reason to ever run two, and it
+  # keeps the auto-issue dedup search meaningful within a single run.
+  group: mainnet-node-soak
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  ALGOD_TOKEN: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+jobs:
+  mainnet-node-soak:
+    name: Mainnet participation-node soak (fast catchup + halt detection)
+    runs-on: ubuntu-latest
+    # duration_minutes (default 60) plus build/catchup-discovery/teardown
+    # overhead — a hard stop so a wedged node can't hold a runner all day.
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mainnet-node-soak
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Self-test the monitor/issue-filer before trusting them
+        run: python3 ops/mainnet-soak/monitor.py self-test
+
+      - name: Build algod-rust (release)
+        run: cargo build --release --bin algod-rust
+
+      - name: Resolve run parameters
+        id: params
+        run: |
+          DURATION_MINUTES="${{ github.event.inputs.duration_minutes || '60' }}"
+          HALT_MINUTES="${{ github.event.inputs.halt_minutes || '5' }}"
+          DRY_RUN="${{ github.event.inputs.dry_run_issues }}"
+          # workflow_dispatch's boolean input renders as the string "true"/
+          # "false"; a schedule run has no inputs at all (empty string) and
+          # must default to a REAL (non-dry-run) filing — dry-run is only
+          # ever the manual-testing default, never the nightly behavior.
+          if [ -z "$DRY_RUN" ]; then DRY_RUN="false"; fi
+          ALGOD_URL="${{ github.event.inputs.algod_url }}"
+          if [ -z "$ALGOD_URL" ]; then
+            ALGOD_URL="${{ vars.MAINNET_ALGOD_URL || 'https://mainnet-api.4160.nodely.dev' }}"
+          fi
+          echo "duration_minutes=$DURATION_MINUTES" >> "$GITHUB_OUTPUT"
+          echo "halt_minutes=$HALT_MINUTES" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$DRY_RUN" >> "$GITHUB_OUTPUT"
+          echo "algod_url=$ALGOD_URL" >> "$GITHUB_OUTPUT"
+          echo "Run parameters: duration=${DURATION_MINUTES}m halt=${HALT_MINUTES}m dry_run=${DRY_RUN} peer=${ALGOD_URL}"
+
+      - name: Start the mainnet participation node
+        id: start_node
+        env:
+          ALGOD_URL: ${{ steps.params.outputs.algod_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p mainnet-soak-artifacts
+          mkdir -p /tmp/mainnet-soak-ledger /tmp/mainnet-soak-partkeys /tmp/mainnet-soak-data
+
+          # Without --data-dir the REST server generates a random ephemeral
+          # token we'd never see, and every curl call below would 401 --
+          # seed known algod.token/algod.admin.token files instead, the
+          # same pattern ops/mixed-cluster-p2p/scripts/start.sh uses.
+          printf '%s' "$ALGOD_TOKEN" > /tmp/mainnet-soak-data/algod.token
+          printf '%s' "$ALGOD_TOKEN" > /tmp/mainnet-soak-data/algod.admin.token
+
+          # Real mainnet genesis — the same fixture `make replay-mainnet*`
+          # already uses against a live archival node. A fresh, empty
+          # participation-key store is intentional: this soak proves the
+          # node runs, gossips, and catches up, not that it votes (zero
+          # stake, matching every other read-only/observer node this repo
+          # already runs in CI).
+          ./target/release/algod-rust participate \
+            --network mainnet \
+            --genesis-id mainnet-v1.0 \
+            --genesis-json crates/core/algo-ledger/tests/fixtures/mainnet-genesis.json \
+            --genesis-path crates/core/algo-ledger/tests/fixtures/mainnet-genesis.json \
+            --ledger-path /tmp/mainnet-soak-ledger/ledger \
+            --partkey-path /tmp/mainnet-soak-partkeys/partkeys.sqlite \
+            --data-dir /tmp/mainnet-soak-data \
+            --rest-listen 127.0.0.1:8180 \
+            --catchup-peer "$ALGOD_URL" \
+            --catchup-peer-token "" \
+            > mainnet-soak-artifacts/node.log 2>&1 &
+          echo "node_pid=$!" >> "$GITHUB_OUTPUT"
+
+          echo "==> waiting for the node's REST API"
+          for _ in $(seq 1 60); do
+            if curl -sf -H "X-Algo-API-Token: $ALGOD_TOKEN" http://127.0.0.1:8180/v2/status >/dev/null 2>&1; then
+              echo "node is serving /v2/status"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "fatal: node never answered /v2/status" >&2
+          tail -n 200 mainnet-soak-artifacts/node.log >&2 || true
+          exit 1
+
+      - name: Start fast catchup
+        id: catchup
+        env:
+          ALGOD_URL: ${{ steps.params.outputs.algod_url }}
+        run: |
+          set -euo pipefail
+          echo "==> discovering the latest mainnet catchpoint from $ALGOD_URL"
+          LABEL="$(curl -sf "$ALGOD_URL/v2/status" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("last-catchpoint",""))')"
+          if [ -z "$LABEL" ]; then
+            echo "fatal: catchup peer reported no last-catchpoint" >&2
+            exit 1
+          fi
+          echo "==> catchpoint label: $LABEL"
+          echo "label=$LABEL" >> "$GITHUB_OUTPUT"
+          curl -sf -X POST -H "X-Algo-API-Token: $ALGOD_TOKEN" \
+            "http://127.0.0.1:8180/v2/catchup/$LABEL"
+          echo ""
+          echo "==> fast catchup requested; the clock starts now"
+
+      - name: Poll node + peer status and detect a halt
+        id: monitor
+        env:
+          ALGOD_URL: ${{ steps.params.outputs.algod_url }}
+        run: |
+          set +e
+          python3 ops/mainnet-soak/monitor.py collect \
+            --node-url http://127.0.0.1:8180 \
+            --node-token "$ALGOD_TOKEN" \
+            --peer-url "$ALGOD_URL" \
+            --duration-minutes "${{ steps.params.outputs.duration_minutes }}" \
+            --halt-minutes "${{ steps.params.outputs.halt_minutes }}" \
+            --out mainnet-soak-artifacts/status.jsonl \
+            --json-out mainnet-soak-artifacts/summary.json
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          set -e
+
+      - name: Tear down the node
+        if: always()
+        run: |
+          PID="${{ steps.start_node.outputs.node_pid }}"
+          if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+            kill "$PID" 2>/dev/null || true
+            sleep 2
+            kill -9 "$PID" 2>/dev/null || true
+          fi
+
+      - name: Capture the halted block (if any) for offline reproduction
+        if: always() && fromJSON(steps.monitor.outputs.exit_code || '0') == 1
+        env:
+          ALGOD_URL: ${{ steps.params.outputs.algod_url }}
+        run: |
+          ROUND="$(python3 -c 'import json; print(json.load(open("mainnet-soak-artifacts/summary.json")).get("round") or "")')"
+          if [ -n "$ROUND" ]; then
+            echo "==> fetching round $ROUND from $ALGOD_URL for offline repro"
+            curl -sf -H "X-Algo-API-Token: $ALGOD_TOKEN" "$ALGOD_URL/v2/blocks/$ROUND" \
+              -o "mainnet-soak-artifacts/block-$ROUND.msgpack" || true
+            curl -sf -H "X-Algo-API-Token: $ALGOD_TOKEN" "$ALGOD_URL/v2/blocks/$ROUND?format=json" \
+              -o "mainnet-soak-artifacts/block-$ROUND.json" || true
+          fi
+
+      - name: Write the step summary
+        if: always()
+        run: |
+          python3 - <<'PYEOF'
+          import json, os
+
+          path = "mainnet-soak-artifacts/summary.json"
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if not os.path.exists(path):
+              lines = ["# Mainnet node soak", "", "No summary.json was produced (the run failed before monitoring started)."]
+          else:
+              with open(path) as f:
+                  r = json.load(f)
+              lag = r.get("lag_rounds") or {}
+              phase_s = r.get("phase_seconds") or {}
+              lines = [
+                  "# Mainnet node soak",
+                  "",
+                  f"**Verdict:** `{r.get('status')}` — {r.get('message') or ''}",
+                  "",
+                  "| metric | value |",
+                  "| --- | --- |",
+                  f"| Catchpoint label | `{r.get('catchpoint_label') or 'n/a'}` |",
+                  f"| Fast-catchup time | {r.get('fast_catchup_seconds')} s |",
+                  f"| Reached tip | {r.get('reached_tip')} |",
+                  f"| Phase durations (s) | {phase_s} |",
+                  f"| Lag at tip (rounds): mean/p95/max (n) | {lag.get('mean')}/{lag.get('p95')}/{lag.get('max')} (n={lag.get('n')}) |",
+                  f"| Node last-round | {r.get('node_last_round')} |",
+                  f"| Peer last-round | {r.get('peer_last_round')} |",
+              ]
+          text = "\n".join(lines) + "\n"
+          print(text)
+          if summary_path:
+              with open(summary_path, "a") as f:
+                  f.write(text)
+          PYEOF
+
+      - name: File (or comment on) an issue for a halt
+        if: always() && fromJSON(steps.monitor.outputs.exit_code || '0') == 1
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ALGOD_URL: ${{ steps.params.outputs.algod_url }}
+        run: |
+          DRY_RUN_FLAG=""
+          if [ "${{ steps.params.outputs.dry_run }}" = "true" ]; then
+            DRY_RUN_FLAG="--dry-run"
+          fi
+          tail -n 100 mainnet-soak-artifacts/node.log > mainnet-soak-artifacts/log-excerpt.txt || true
+          python3 ops/mainnet-soak/file_issue.py \
+            --repo "${{ github.repository }}" \
+            --verdict-json mainnet-soak-artifacts/summary.json \
+            --template ops/mainnet-soak/issue_template.md \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --artifacts-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --log-excerpt-file mainnet-soak-artifacts/log-excerpt.txt \
+            --peer-url "$ALGOD_URL" \
+            $DRY_RUN_FLAG
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mainnet-node-soak-${{ github.run_id }}
+          path: mainnet-soak-artifacts/
+          if-no-files-found: warn
+
+      - name: Fail the job on a halt or a monitor/self-test error
+        if: always()
+        run: |
+          CODE="${{ steps.monitor.outputs.exit_code }}"
+          if [ -z "$CODE" ]; then
+            echo "monitor step never ran (an earlier step failed) — job already failed" >&2
+            exit 1
+          fi
+          if [ "$CODE" -eq 0 ]; then
+            echo "verdict: ok"
+            exit 0
+          elif [ "$CODE" -eq 2 ]; then
+            echo "verdict: source_outage — warning only, not a job failure"
+            exit 0
+          else
+            echo "verdict: halt (exit $CODE) — see the filed/commented issue"
+            exit 1
+          fi
