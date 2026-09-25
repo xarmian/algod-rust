@@ -294,9 +294,18 @@ jobs:
           echo "==> catchpoint label: $LABEL"
           echo "label=$LABEL" >> "$GITHUB_OUTPUT"
 
+          # Found live (fifth dispatch attempt): a raw `#` in a URL is a
+          # fragment delimiter, and curl (like any URL-aware client)
+          # silently strips it and everything after it before the request
+          # ever goes over the wire -- the node's REST endpoint only ever
+          # saw "/v2/catchup/65370000", never the hash half of the label,
+          # and correctly 400'd it as unparseable. Percent-encode the
+          # catchpoint label's only special character (a label is always
+          # <digits>#<base32 hash>, so this is the one and only `#`).
+          LABEL_URLENC="${LABEL//#/%23}"
           CATCHUP_HTTP_CODE="$(curl -s -o /tmp/catchup-response.json -w '%{http_code}' -X POST \
             -H "X-Algo-API-Token: $ALGOD_TOKEN" \
-            "http://127.0.0.1:8180/v2/catchup/$LABEL")"
+            "http://127.0.0.1:8180/v2/catchup/$LABEL_URLENC")"
           if [ "$CATCHUP_HTTP_CODE" != "200" ] && [ "$CATCHUP_HTTP_CODE" != "201" ]; then
             echo "fatal: POST /v2/catchup/$LABEL on the node returned HTTP $CATCHUP_HTTP_CODE" >&2
             cat /tmp/catchup-response.json >&2 2>/dev/null || true
