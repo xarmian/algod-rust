@@ -61,6 +61,19 @@ pub struct DownloadProgress {
 #[derive(Debug, Clone)]
 pub struct CatchpointDownloadConfig {
     /// Overall request timeout (default: 30 minutes — catchpoint files can be 500MB+).
+    ///
+    /// For the plain-TCP `reqwest` path this is `reqwest::Client`'s own
+    /// end-to-end request timeout (connect through full body). For the
+    /// P2P-transport path (issue #1618) it also bounds the "connect" stage
+    /// — opening the stream, writing the request, and reading back the
+    /// response head — which has no other timeout of its own (unlike the
+    /// P2P body-streaming stage, bounded separately by
+    /// [`Self::stall_window`]): before this issue, that stage had **no**
+    /// timeout at all on the P2P path, so a peer that accepted the stream
+    /// but never answered hung the whole
+    /// `RankedCatchpointSource::download`/`check_ledger_download` call
+    /// forever, with zero progress and no error — exactly the live hang
+    /// observed in #1618's `mainnet-node-soak.yml` run.
     pub timeout: Duration,
     /// Read buffer size hint in bytes (default: 64 KiB).
     ///
@@ -498,6 +511,64 @@ impl CatchpointDownloader {
         })
     }
 
+    /// Open a fresh P2P stream to `self.base_url`, write `request` onto it,
+    /// and read back the response head — the shared "connect" stage used by
+    /// both [`Self::p2p_probe_availability`] and
+    /// [`Self::p2p_download_attempt`], bounded by `self.config.timeout`
+    /// (issue #1618, see [`CatchpointDownloadConfig::timeout`]'s doc
+    /// comment) so a peer that opens the stream but never answers (or never
+    /// finishes sending headers) fails after a bounded wait instead of
+    /// hanging the caller — and, critically, this crate's caller — forever.
+    /// A timeout here is surfaced as [`AlgoError::RestClient`], the same
+    /// error variant a connection failure or malformed response already
+    /// produces, so [`RankedCatchpointSource::download`]/
+    /// `check_ledger_download`'s existing retry/peer-fail-over logic (rank
+    /// the peer down, try the next one) applies unchanged — no separate
+    /// "timeout" handling needed at the call sites.
+    async fn p2p_connect_and_read_head(
+        &self,
+        transport: &dyn HttpPeerTransport,
+        path: &str,
+        request: &[u8],
+    ) -> Result<(
+        BoxedDuplexStream,
+        crate::http_over_stream::RawHttpResponseHead,
+    )> {
+        let base_url = self.base_url.clone();
+        let connect = async {
+            let mut stream = transport
+                .open_stream(&base_url)
+                .await
+                .map_err(|e| p2p_open_error(&base_url, e))?;
+            write_request(&mut stream, request).await?;
+            let head = read_http_response_head(&mut stream).await?;
+            Ok::<_, AlgoError>((stream, head))
+        };
+
+        match tokio::time::timeout(self.config.timeout, connect).await {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(
+                    path,
+                    peer = %base_url,
+                    connect_timeout_secs = self.config.timeout.as_secs(),
+                    "catchpoint download (P2P): no response head received within the connect \
+                     timeout, treating as a recoverable interruption"
+                );
+                Err(AlgoError::RestClient {
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "no response received within {}s while connecting",
+                            self.config.timeout.as_secs()
+                        ),
+                    )),
+                    context: format!("catchpoint connect {path} (P2P peer {base_url})"),
+                })
+            }
+        }
+    }
+
     /// [`Self::probe_availability`]'s P2P-transport path: builds and sends a
     /// raw `HEAD` request over `transport` and classifies the response the
     /// same way the `reqwest` path above does.
@@ -507,12 +578,9 @@ impl CatchpointDownloader {
         path: &str,
     ) -> Result<()> {
         let request = build_head_request(path, &self.base_url);
-        let mut stream = transport
-            .open_stream(&self.base_url)
-            .await
-            .map_err(|e| p2p_open_error(&self.base_url, e))?;
-        write_request(&mut stream, &request).await?;
-        let head = read_http_response_head(&mut stream).await?;
+        let (_stream, head) = self
+            .p2p_connect_and_read_head(transport, path, &request)
+            .await?;
 
         if (200..300).contains(&head.status) {
             return Ok(());
@@ -628,12 +696,9 @@ impl CatchpointDownloader {
         F: Fn(DownloadProgress),
     {
         let request = build_get_request(path, &self.base_url, true);
-        let mut stream = transport
-            .open_stream(&self.base_url)
-            .await
-            .map_err(|e| p2p_open_error(&self.base_url, e))?;
-        write_request(&mut stream, &request).await?;
-        let head = read_http_response_head(&mut stream).await?;
+        let (stream, head) = self
+            .p2p_connect_and_read_head(transport, path, &request)
+            .await?;
 
         if head.status == 404 {
             return Err(AlgoError::NotFound(format!(
@@ -1923,6 +1988,135 @@ mod tests {
 
         let result = dl.probe_availability("test-v1.0", 7).await;
         assert!(result.is_ok(), "expected success, got {result:?}");
+    }
+
+    /// An [`HttpPeerTransport`](crate::http_over_stream::HttpPeerTransport)
+    /// that opens the stream successfully (so `open_stream` itself never
+    /// errors) but then never writes anything back — a peer that accepted
+    /// the connection and silently sat on it, exactly the live #1618
+    /// mainnet-soak symptom (`node.log` showed "downloading catchpoint
+    /// file" and then no further log line at all, `catchpoint_*` progress
+    /// counters pinned at zero, no error, until the soak's own outer
+    /// halt-detector eventually killed the job).
+    struct HangingP2pTransport;
+
+    impl HangingP2pTransport {
+        fn new() -> Self {
+            Self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::http_over_stream::HttpPeerTransport for HangingP2pTransport {
+        async fn open_stream(
+            &self,
+            _peer: &str,
+        ) -> Result<crate::http_over_stream::BoxedDuplexStream> {
+            // Half of an in-memory duplex pipe, with the other half simply
+            // leaked (never read from, never written to) — the stream stays
+            // open but produces no bytes and no EOF, ever, mirroring a P2P
+            // peer that accepted the stream and then never answered.
+            let (client, server) = tokio::io::duplex(4 * 1024);
+            std::mem::forget(server);
+            Ok(Box::new(client))
+        }
+    }
+
+    /// TDD regression for issue #1618: before this fix,
+    /// `p2p_probe_availability` (`RankedCatchpointSource::download`'s /
+    /// `check_ledger_download`'s very first network call on a live
+    /// re-catchup) had no timeout at all on `open_stream`/`write_request`/
+    /// `read_http_response_head` — a peer that opened the stream but never
+    /// answered hung the caller forever, with zero progress and no error,
+    /// exactly matching the live hang observed in #1618's `node.log`
+    /// (`"downloading catchpoint file"` logged, then nothing — not even the
+    /// crate's own `debug!("starting catchpoint download")`, since that
+    /// line is only reached after `check_ledger_download`'s probe already
+    /// hung). Uses a short `config.timeout` (rather than the real 12h
+    /// default, or `start_paused` virtual time) so the fix is proven in
+    /// real wall-clock time in well under a second.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn p2p_probe_availability_times_out_instead_of_hanging_forever() {
+        let transport: Arc<dyn crate::http_over_stream::HttpPeerTransport> =
+            Arc::new(HangingP2pTransport::new());
+        let dl = CatchpointDownloader::with_p2p_transport(
+            "12D3KooWhangingpeer",
+            transport,
+            CatchpointDownloadConfig {
+                timeout: Duration::from_millis(200),
+                ..CatchpointDownloadConfig::default()
+            },
+        );
+
+        // A generous outer bound relative to the 200ms `config.timeout`
+        // above — exists only so a future regression that removes the
+        // timeout entirely fails this test cleanly instead of hanging the
+        // test binary.
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            dl.probe_availability("test-v1.0", 7),
+        )
+        .await;
+
+        let probe_result = result.expect(
+            "probe_availability must fail via config.timeout rather than hanging past a \
+             generous outer test bound",
+        );
+        assert!(
+            matches!(probe_result, Err(AlgoError::RestClient { .. })),
+            "expected a RestClient timeout error, got: {probe_result:?}"
+        );
+    }
+
+    /// Same regression as
+    /// [`p2p_probe_availability_times_out_instead_of_hanging_forever`], for
+    /// the real-transfer stage (`p2p_download_attempt`, reached once
+    /// `check_ledger_download`'s probe has already succeeded against some
+    /// peer) rather than the pre-flight HEAD probe — both call sites shared
+    /// the same pre-#1618 bug (no timeout on `open_stream`/`write_request`/
+    /// `read_http_response_head`) and both must be fixed by
+    /// `p2p_connect_and_read_head`'s shared timeout.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn p2p_download_times_out_instead_of_hanging_forever() {
+        let transport: Arc<dyn crate::http_over_stream::HttpPeerTransport> =
+            Arc::new(HangingP2pTransport::new());
+        let hanging = Arc::clone(&transport) as Arc<dyn crate::http_over_stream::HttpPeerTransport>;
+        let dl = CatchpointDownloader::with_p2p_transport(
+            "12D3KooWhangingpeer",
+            hanging,
+            CatchpointDownloadConfig {
+                timeout: Duration::from_millis(200),
+                max_retries: 0,
+                min_bytes_per_second: 0,
+                ..CatchpointDownloadConfig::default()
+            },
+        );
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-catchpoint-p2p-hanging-{}",
+            std::process::id()
+        ));
+        let dest = tmp_dir.join("catchpoint-hanging.tar.gz");
+
+        // See the outer-bound comment in
+        // `p2p_probe_availability_times_out_instead_of_hanging_forever`.
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            dl.download::<fn(DownloadProgress)>("test-v1.0", 1, &dest, None),
+        )
+        .await;
+
+        let download_result = result.expect(
+            "download() must fail via config.timeout rather than hanging past a generous \
+             outer test bound",
+        );
+        assert!(
+            matches!(download_result, Err(AlgoError::RestClient { .. })),
+            "expected a RestClient timeout error, got: {download_result:?}"
+        );
+        assert!(!dest.exists());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     #[tokio::test(flavor = "multi_thread")]

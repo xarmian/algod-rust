@@ -942,4 +942,111 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
+
+    /// An [`HttpPeerTransport`](crate::http_over_stream::HttpPeerTransport)
+    /// that opens a stream successfully but then never writes anything back
+    /// — a peer that accepted the connection and silently sat on it. Mirrors
+    /// `catchpoint_download.rs`'s own `HangingP2pTransport` test double
+    /// (issue #1618), kept as a separate copy here for the same reason
+    /// `MockP2pTransport` above is: this module's tests only need to prove
+    /// its own module's peer-selection wiring.
+    struct HangingP2pTransport;
+
+    #[async_trait::async_trait]
+    impl crate::http_over_stream::HttpPeerTransport for HangingP2pTransport {
+        async fn open_stream(
+            &self,
+            _peer: &str,
+        ) -> algo_error::Result<crate::http_over_stream::BoxedDuplexStream> {
+            let (client, server) = tokio::io::duplex(4 * 1024);
+            std::mem::forget(server);
+            Ok(Box::new(client))
+        }
+    }
+
+    /// TDD regression for issue #1618's own acceptance criterion ("timeout +
+    /// peer-failover"): a `RankedCatchpointSource` pool containing a P2P
+    /// peer that hangs forever (never answers `open_stream`'s resulting
+    /// request) must not block a reliable HTTP peer in the same pool from
+    /// *eventually* completing downloads — before `catchpoint_download.rs`'s
+    /// `p2p_connect_and_read_head` timeout fix, the very first attempt
+    /// landing on the hanging peer (`check_ledger_download`'s probe stage,
+    /// or the real download stage) blocked `RankedCatchpointSource::download`
+    /// forever, so `get_next_peer()` never even got the chance to try the
+    /// good peer next — exactly the live #1618 mainnet-soak symptom (zero
+    /// progress, no error, no fail-over).
+    ///
+    /// Mirrors `ranked_source_prefers_the_reliable_peer_after_the_unreliable_one_fails`
+    /// above: the peer ranker's moving-average smoothing (`historicStats::push`,
+    /// `algo_network::peer_ranker`) deliberately gives a freshly-failed peer
+    /// a few more chances before its rank definitively drops below an
+    /// untried peer's, so deprioritization is proven across several
+    /// `download()` calls (rounds), not asserted on the very first one —
+    /// what this test pins is that the hanging peer's cost per bad pick is
+    /// now bounded by `config.timeout` (finite) rather than infinite, and
+    /// that ranking still converges onto the reliable peer as it does for a
+    /// fast-failing one.
+    ///
+    /// Uses a short `config.timeout` (rather than `start_paused` virtual
+    /// time, which races unpredictably against the real localhost TCP I/O
+    /// the good HTTP peer also needs) so the whole multi-round test still
+    /// runs in well under a second of real wall-clock time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hanging_p2p_peer_fails_over_to_a_reliable_http_peer_instead_of_blocking_forever() {
+        const BODY: &[u8] = b"catchpoint-file-bytes-failover-0123456789";
+        let (good_url, good_requests) = spawn_always_succeeding_server(BODY).await;
+
+        let config = CatchpointDownloadConfig {
+            timeout: std::time::Duration::from_millis(200),
+            ..fast_retry_config()
+        };
+        let src = RankedCatchpointSource::new(&[(good_url, String::new())], config);
+
+        let hanging = Arc::new(HangingP2pTransport);
+        src.push_p2p_peer(
+            "12D3KooWhangingpeer".to_string(),
+            hanging as Arc<dyn crate::http_over_stream::HttpPeerTransport>,
+        );
+        assert_eq!(src.peer_count(), 2);
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-ranked-catchpoint-p2p-hanging-failover-{}",
+            std::process::id()
+        ));
+
+        // A generous outer bound per round relative to the 200ms
+        // `config.timeout` above — exists only so a future regression that
+        // reintroduces an unbounded wait fails this test cleanly instead of
+        // hanging the test binary.
+        const ROUNDS: u64 = 8;
+        let mut successes = 0usize;
+        for round in 1..=ROUNDS {
+            let dest = tmp_dir.join(format!("catchpoint-{round}.tar.gz"));
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                src.download("test-v1.0", round, &dest, None),
+            )
+            .await
+            .expect(
+                "download() must fail over past the hanging P2P peer rather than blocking \
+                 forever",
+            );
+            if result.is_ok() {
+                successes += 1;
+                assert_eq!(std::fs::read(&dest).unwrap(), BODY);
+            }
+        }
+
+        assert!(
+            successes >= ROUNDS as usize - 2,
+            "expected the reliable HTTP peer to serve almost every round despite a hanging P2P \
+             peer in the same pool, got {successes} of {ROUNDS} successes"
+        );
+        assert!(
+            good_requests.load(Ordering::SeqCst) >= 1,
+            "the reliable HTTP peer should have been tried at least once"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
 }
