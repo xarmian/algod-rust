@@ -165,8 +165,25 @@ jobs:
           # mirroring go's DNSSecuritySRVEnforced()) for THIS soak node
           # only -- go-algorand's own real default (enforced) is untouched,
           # and this is data (config.json), not a code change to the node.
+          #
+          # "Version" must be pinned to algo_config::LATEST_VERSION (found
+          # live, second dispatch attempt): Local::migrate() walks a config
+          # with no "Version" field (defaults to 0) forward through every
+          # versioned-default table, and DNS_SECURITY_FLAGS's own table
+          # (VersionedDefault::new(&[(6, || 1), (34, || 9)])) defaults to 0
+          # below version 6 -- migrate_field() only preserves a field whose
+          # CURRENT value differs from "the default AT THE VERSION IT'S
+          # CURRENTLY AT", so an explicit 0 with no Version looks identical
+          # to "never touched, still at the version-0 default" and gets
+          # silently migrated all the way back up to the enforced default.
+          # Pinning Version to LATEST_VERSION short-circuits the migration
+          # loop (`while self.version < LATEST_VERSION`) entirely, so this
+          # explicit override survives. LATEST_VERSION is 38 as of this
+          # comment (crates/node/algo-config/src/lib.rs) -- update this if
+          # that constant changes, though by the time it does #1600 should
+          # have removed this whole workaround anyway.
           # Revert once #1600 lands a real fix.
-          echo '{"DNSSecurityFlags": 0}' > /tmp/mainnet-soak-data/config.json
+          echo '{"Version": 38, "DNSSecurityFlags": 0}' > /tmp/mainnet-soak-data/config.json
 
           # Real mainnet genesis — the same fixture `make replay-mainnet*`
           # already uses against a live archival node. A fresh, empty

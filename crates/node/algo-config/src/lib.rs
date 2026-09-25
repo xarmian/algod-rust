@@ -5108,6 +5108,51 @@ mod tests {
         assert_eq!(cfg.dns_security_flags, 3);
     }
 
+    /// Found live (issue #1600's soak workaround, first attempt): a
+    /// hand-written `config.json` with `"DNSSecurityFlags": 0` and no
+    /// `"Version"` field does NOT disable SRV-DNSSEC enforcement --
+    /// `migrate_field`'s "still equal to the default at the CURRENT
+    /// version" guard cannot tell an explicit `0` apart from "untouched,
+    /// still at the pre-version-6 default of 0" (`DNS_SECURITY_FLAGS`'s
+    /// table has no tag before 6), so a config with no `Version` (defaults
+    /// to 0) walks the override through every migration step and ends up
+    /// re-stamped to the enforced default (9) at `LATEST_VERSION`, exactly
+    /// as if the override had never been written. This is the general
+    /// shape of the trap, not specific to this one field: ANY field whose
+    /// explicit override happens to equal an EARLIER version's default
+    /// (not necessarily the field's own `Default::default()`) is
+    /// indistinguishable from "never touched" unless `Version` pins where
+    /// migration should stop.
+    #[test]
+    fn dns_security_flags_zero_override_without_version_is_silently_migrated_away() {
+        let cfg = Local::load_from_str(r#"{"DNSSecurityFlags": 0}"#).expect("parses");
+        assert_eq!(
+            cfg.version, LATEST_VERSION,
+            "no Version -> migrates to latest"
+        );
+        assert_eq!(
+            cfg.dns_security_flags, 9,
+            "the 0 override collided with the pre-v6 default and got migrated away"
+        );
+        assert!(
+            cfg.dns_security_srv_enforced(),
+            "the intended override was lost -- DNSSEC SRV enforcement is back on"
+        );
+    }
+
+    /// The fix for the trap above: pinning `Version` to `LATEST_VERSION`
+    /// short-circuits `migrate()`'s `while self.version < LATEST_VERSION`
+    /// loop entirely, so the explicit override is never touched.
+    #[test]
+    fn dns_security_flags_zero_override_survives_when_version_is_pinned_to_latest() {
+        let cfg = Local::load_from_str(&format!(
+            r#"{{"Version": {LATEST_VERSION}, "DNSSecurityFlags": 0}}"#
+        ))
+        .expect("parses");
+        assert_eq!(cfg.dns_security_flags, 0);
+        assert!(!cfg.dns_security_srv_enforced());
+    }
+
     // --- `dns_security_srv_enforced` (issue #1314) --------------------------
 
     /// The stock default (`DNSSecurityFlags == 9`, SRV + TXT bits set)
