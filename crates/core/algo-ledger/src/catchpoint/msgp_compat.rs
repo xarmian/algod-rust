@@ -850,9 +850,13 @@ pub fn decode_resources_data(raw: &[u8]) -> Result<CatchpointResourcesData, Catc
                     "a" => result.total = read_u64(&mut rd)?,
                     "b" => result.decimals = read_u64(&mut rd)? as u32,
                     "c" => result.default_frozen = read_bool(&mut rd)?,
-                    "d" => result.unit_name = read_string(&mut rd)?,
-                    "e" => result.asset_name = read_string(&mut rd)?,
-                    "f" => result.url = read_string(&mut rd)?,
+                    // Issue #1608: raw bytes, not `read_string` -- go's
+                    // `string`-typed UnitName/AssetName/URL are not
+                    // UTF-8-validated on the wire, and real mainnet catchpoints
+                    // contain non-UTF-8 bytes in these fields.
+                    "d" => result.unit_name = read_bytes_vec(&mut rd)?,
+                    "e" => result.asset_name = read_bytes_vec(&mut rd)?,
+                    "f" => result.url = read_bytes_vec(&mut rd)?,
                     "g" => result.metadata_hash = read_bytes_fixed::<32>(&mut rd)?,
                     "h" => result.manager = read_bytes_fixed::<32>(&mut rd)?,
                     "i" => result.reserve = read_bytes_fixed::<32>(&mut rd)?,
@@ -934,15 +938,25 @@ pub fn decode_resources_data(raw: &[u8]) -> Result<CatchpointResourcesData, Catc
                         $field = read_raw_value(&mut rd)?;
                     }
                 };
+                // Issue #1608: like `bytes_vec`, but documents that the
+                // source field is a go `string` msgpack-encoded as "str"
+                // (not "bin") -- used for UnitName/AssetName/URL, which are
+                // not UTF-8-validated on the wire.
+                ($field:expr, bytes_str) => {
+                    if idx < len {
+                        idx += 1;
+                        $field = read_bytes_vec(&mut rd)?;
+                    }
+                };
             }
 
             // Go struct declaration order:
             next_field!(result.total, u64);
             next_field!(result.decimals, u32);
             next_field!(result.default_frozen, bool);
-            next_field!(result.unit_name, string);
-            next_field!(result.asset_name, string);
-            next_field!(result.url, string);
+            next_field!(result.unit_name, bytes_str);
+            next_field!(result.asset_name, bytes_str);
+            next_field!(result.url, bytes_str);
             next_field!(result.metadata_hash, bytes32);
             next_field!(result.manager, bytes32);
             next_field!(result.reserve, bytes32);
@@ -1375,11 +1389,58 @@ mod tests {
         assert_eq!(result.total, 1_000_000);
         assert_eq!(result.decimals, 6);
         assert!(result.default_frozen);
-        assert_eq!(result.unit_name, "ALGO");
-        assert_eq!(result.asset_name, "Algorand");
-        assert_eq!(result.url, "https://algo.org");
+        assert_eq!(result.unit_name, b"ALGO");
+        assert_eq!(result.asset_name, b"Algorand");
+        assert_eq!(result.url, b"https://algo.org");
         assert_eq!(result.manager, manager);
         assert_eq!(result.resource_flags, 2);
+    }
+
+    /// Issue #1608: go-algorand's `AssetParams.UnitName`/`AssetName`/`URL`
+    /// are Go `string`s, which are arbitrary byte sequences -- NOT
+    /// guaranteed to be valid UTF-8 (only length-bounded). A real mainnet
+    /// catchpoint (round 65370000, see the nightly soak in issue #1598) was
+    /// observed to contain exactly this: a msgpack "str"-marker value whose
+    /// payload is not valid UTF-8. `decode_resources_data` must decode it
+    /// successfully and preserve the exact original bytes, not hard-error
+    /// the way `String::from_utf8` would.
+    #[test]
+    fn decode_resources_data_non_utf8_asset_fields_preserved_byte_exact() {
+        // 0xFF is never a valid UTF-8 lead byte -- these are deliberately
+        // invalid UTF-8 sequences, still valid as msgpack "str" payloads
+        // (msgpack's str format marker carries no UTF-8 requirement).
+        let non_utf8_unit: &[u8] = &[0xFF, 0xFE, b'x'];
+        let non_utf8_name: &[u8] = &[b'A', 0xFF, b'B', 0x80];
+        let non_utf8_url: &[u8] = &[0xC0, 0xC1, b'?'];
+
+        // Hand-encode msgpack "str" values directly (rmpv's `Value::String`
+        // cannot represent invalid UTF-8 in this crate's rmpv version), the
+        // same way `algo_codec::canonical`'s `add_str_bytes` does, so this
+        // fixture is a faithful stand-in for go-algorand's own
+        // never-UTF-8-validated msgp-generated encoder output.
+        fn str_bytes(b: &[u8]) -> Vec<u8> {
+            let mut buf = Vec::new();
+            rmp::encode::write_str_len(&mut buf, b.len() as u32).unwrap();
+            buf.extend_from_slice(b);
+            buf
+        }
+
+        let mut raw = Vec::new();
+        rmp::encode::write_map_len(&mut raw, 3).unwrap();
+        rmp::encode::write_str(&mut raw, "d").unwrap();
+        raw.extend_from_slice(&str_bytes(non_utf8_unit));
+        rmp::encode::write_str(&mut raw, "e").unwrap();
+        raw.extend_from_slice(&str_bytes(non_utf8_name));
+        rmp::encode::write_str(&mut raw, "f").unwrap();
+        raw.extend_from_slice(&str_bytes(non_utf8_url));
+
+        let result = decode_resources_data(&raw).expect(
+            "decode_resources_data must accept non-UTF-8 unit_name/asset_name/url bytes, \
+             matching go-algorand's unvalidated Go `string` fields",
+        );
+        assert_eq!(result.unit_name, non_utf8_unit);
+        assert_eq!(result.asset_name, non_utf8_name);
+        assert_eq!(result.url, non_utf8_url);
     }
 
     #[test]
@@ -1473,9 +1534,9 @@ mod tests {
         assert_eq!(result.total, 1_000_000);
         assert_eq!(result.decimals, 6);
         assert!(!result.default_frozen);
-        assert_eq!(result.unit_name, "TST");
-        assert_eq!(result.asset_name, "Test");
-        assert_eq!(result.url, "https://test.com");
+        assert_eq!(result.unit_name, b"TST");
+        assert_eq!(result.asset_name, b"Test");
+        assert_eq!(result.url, b"https://test.com");
         assert_eq!(result.amount, 500);
         assert!(result.frozen);
         assert_eq!(result.update_round, 42);

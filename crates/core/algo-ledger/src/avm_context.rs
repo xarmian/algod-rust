@@ -759,27 +759,42 @@ impl InnerTxnBuilder {
                     }
                 }
                 // ConfigAssetUnitName
+                //
+                // Issue #1608: preserve the exact bytes an AVM program sets
+                // via `itxn_field ConfigAssetUnitName` -- go's
+                // `AssetParams.UnitName` is a `string` but is never
+                // UTF-8-validated (`data/basics/userBalance.go`), and
+                // go-algorand's own `opItxnField`
+                // (`data/transactions/logic/eval.go`) just assigns the raw
+                // opcode bytes with no validation either. A prior
+                // `String::from_utf8_lossy` conversion here would silently
+                // replace invalid bytes with U+FFFD before this value is
+                // canonically re-encoded for signing/hashing -- corrupting
+                // the exact on-chain bytes go-algorand would produce for an
+                // identical inner transaction.
                 37 => {
                     if let TealValue::Bytes(b) = value {
                         txn.asset_params
                             .get_or_insert_with(algo_types::AssetParams::default)
-                            .unit_name = String::from_utf8_lossy(b).to_string();
+                            .unit_name = b.clone();
                     }
                 }
-                // ConfigAssetName
+                // ConfigAssetName. Same non-lossy byte preservation as
+                // ConfigAssetUnitName above (issue #1608).
                 38 => {
                     if let TealValue::Bytes(b) = value {
                         txn.asset_params
                             .get_or_insert_with(algo_types::AssetParams::default)
-                            .asset_name = String::from_utf8_lossy(b).to_string();
+                            .asset_name = b.clone();
                     }
                 }
-                // ConfigAssetURL
+                // ConfigAssetURL. Same non-lossy byte preservation as
+                // ConfigAssetUnitName above (issue #1608).
                 39 => {
                     if let TealValue::Bytes(b) = value {
                         txn.asset_params
                             .get_or_insert_with(algo_types::AssetParams::default)
-                            .url = String::from_utf8_lossy(b).to_string();
+                            .url = b.clone();
                     }
                 }
                 // ConfigAssetMetadataHash
@@ -5647,11 +5662,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     // AssetDefaultFrozen
                     2 => TealValue::Uint(p.default_frozen as u64),
                     // AssetUnitName
-                    3 => TealValue::Bytes(p.unit_name.as_bytes().to_vec()),
+                    3 => TealValue::Bytes(p.unit_name.clone()),
                     // AssetName
-                    4 => TealValue::Bytes(p.asset_name.as_bytes().to_vec()),
+                    4 => TealValue::Bytes(p.asset_name.clone()),
                     // AssetURL
-                    5 => TealValue::Bytes(p.url.as_bytes().to_vec()),
+                    5 => TealValue::Bytes(p.url.clone()),
                     // AssetMetadataHash
                     6 => TealValue::Bytes(
                         p.metadata_hash
@@ -9861,8 +9876,8 @@ mod tests {
                 params: TxnAssetParams {
                     total: 1_000_000,
                     decimals: 6,
-                    unit_name: "ALGO".to_string(),
-                    asset_name: "Algorand".to_string(),
+                    unit_name: b"ALGO".to_vec(),
+                    asset_name: b"Algorand".to_vec(),
                     ..Default::default()
                 },
                 creator: Address([50u8; 32]),

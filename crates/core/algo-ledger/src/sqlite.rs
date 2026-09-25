@@ -982,19 +982,25 @@ fn decode_asset_params(data: &[u8]) -> Result<AssetParams, AlgoError> {
                 })?;
             }
             "c" => p.default_frozen = v.as_bool().unwrap_or(false),
+            // Issue #1608: `Value::as_slice()`, not `as_str()` -- go's
+            // `string`-typed unit_name/asset_name/url are not
+            // UTF-8-validated on the wire, and `as_str()` returns `None`
+            // for a msgpack "str" whose payload is invalid UTF-8 (unlike
+            // `as_slice()`, which returns the raw bytes for both `String`
+            // and `Binary` values regardless of validity).
             "d" => {
-                if let Some(s) = v.as_str() {
-                    p.unit_name = s.to_string();
+                if let Some(bytes) = v.as_slice() {
+                    p.unit_name = bytes.to_vec();
                 }
             }
             "e" => {
-                if let Some(s) = v.as_str() {
-                    p.asset_name = s.to_string();
+                if let Some(bytes) = v.as_slice() {
+                    p.asset_name = bytes.to_vec();
                 }
             }
             "f" => {
-                if let Some(s) = v.as_str() {
-                    p.url = s.to_string();
+                if let Some(bytes) = v.as_slice() {
+                    p.url = bytes.to_vec();
                 }
             }
             "g" => {
@@ -8090,9 +8096,9 @@ mod tests {
             total: 1_000_000,
             decimals: 6,
             default_frozen: false,
-            unit_name: "TST".to_string(),
-            asset_name: "TestAsset".to_string(),
-            url: "https://example".to_string(),
+            unit_name: b"TST".to_vec(),
+            asset_name: b"TestAsset".to_vec(),
+            url: b"https://example".to_vec(),
             metadata_hash: Some([9u8; 32]),
             manager: Some(Address([1u8; 32])),
             reserve: Some(Address([2u8; 32])),
@@ -8105,9 +8111,9 @@ mod tests {
             total: 1_000_000,
             decimals: 6,
             default_frozen: false,
-            unit_name: "TST".to_string(),
-            asset_name: "TestAsset".to_string(),
-            url: "https://example".to_string(),
+            unit_name: b"TST".to_vec(),
+            asset_name: b"TestAsset".to_vec(),
+            url: b"https://example".to_vec(),
             metadata_hash: [9u8; 32],
             manager: [1u8; 32],
             reserve: [2u8; 32],
@@ -8129,9 +8135,9 @@ mod tests {
             total: 5_000,
             decimals: 2,
             default_frozen: true,
-            unit_name: "U".to_string(),
-            asset_name: "A".to_string(),
-            url: "".to_string(),
+            unit_name: b"U".to_vec(),
+            asset_name: b"A".to_vec(),
+            url: Vec::new(),
             metadata_hash: None,
             manager: Some(Address([3u8; 32])),
             reserve: None,
@@ -8724,8 +8730,8 @@ mod tests {
         let params = AssetParams {
             total: 1_000_000,
             decimals: 6,
-            unit_name: "ALGO".into(),
-            asset_name: "Algorand".into(),
+            unit_name: b"ALGO".to_vec(),
+            asset_name: b"Algorand".to_vec(),
             ..Default::default()
         };
 
@@ -8741,7 +8747,7 @@ mod tests {
         let loaded = ledger.get_asset_params(10).unwrap();
         assert_eq!(loaded.params.total, 1_000_000);
         assert_eq!(loaded.params.decimals, 6);
-        assert_eq!(loaded.params.unit_name, "ALGO");
+        assert_eq!(loaded.params.unit_name, b"ALGO");
         assert_eq!(loaded.creator, creator);
 
         ledger.remove_asset_params(10);
@@ -8872,8 +8878,8 @@ mod tests {
                         params: AssetParams {
                             total: 1_000 * (i as u64 + 1),
                             decimals: i as u32,
-                            unit_name: format!("U{i}"),
-                            asset_name: format!("Asset{i}"),
+                            unit_name: format!("U{i}").into_bytes(),
+                            asset_name: format!("Asset{i}").into_bytes(),
                             ..Default::default()
                         },
                         creator: addr,
@@ -10926,8 +10932,8 @@ mod tests {
         let params = AssetParams {
             total: 1_000_000,
             decimals: 6,
-            unit_name: "TEST".into(),
-            asset_name: "TestAsset".into(),
+            unit_name: b"TEST".to_vec(),
+            asset_name: b"TestAsset".to_vec(),
             manager: Some(addr),
             ..Default::default()
         };
@@ -10951,8 +10957,8 @@ mod tests {
         let loaded_params = ledger.get_asset_params(70).unwrap();
         assert_eq!(loaded_params.params.total, 1_000_000);
         assert_eq!(loaded_params.params.decimals, 6);
-        assert_eq!(loaded_params.params.unit_name, "TEST");
-        assert_eq!(loaded_params.params.asset_name, "TestAsset");
+        assert_eq!(loaded_params.params.unit_name, b"TEST");
+        assert_eq!(loaded_params.params.asset_name, b"TestAsset");
         assert_eq!(loaded_params.params.manager, Some(addr));
         assert_eq!(loaded_params.creator, addr);
 
@@ -10971,7 +10977,7 @@ mod tests {
 
         let loaded_params2 = ledger.get_asset_params(70).unwrap();
         assert_eq!(loaded_params2.params.total, 1_000_000);
-        assert_eq!(loaded_params2.params.unit_name, "TEST");
+        assert_eq!(loaded_params2.params.unit_name, b"TEST");
     }
 
     #[test]
@@ -10989,8 +10995,8 @@ mod tests {
         let params = AssetParams {
             total: 10_000,
             decimals: 2,
-            unit_name: "REV".into(),
-            asset_name: "Reverse".into(),
+            unit_name: b"REV".to_vec(),
+            asset_name: b"Reverse".to_vec(),
             ..Default::default()
         };
 
@@ -11010,7 +11016,7 @@ mod tests {
         let loaded_params = ledger.get_asset_params(80).unwrap();
         assert_eq!(loaded_params.params.total, 10_000);
         assert_eq!(loaded_params.params.decimals, 2);
-        assert_eq!(loaded_params.params.unit_name, "REV");
+        assert_eq!(loaded_params.params.unit_name, b"REV");
 
         let loaded_holding = ledger.get_asset_holding(&addr, 80).unwrap();
         assert_eq!(loaded_holding.amount, 999);
@@ -13621,7 +13627,7 @@ mod tests {
                 AssetParamsRecord {
                     params: AssetParams {
                         total: 42,
-                        unit_name: "ARC".into(),
+                        unit_name: b"ARC".to_vec(),
                         ..Default::default()
                     },
                     creator,
@@ -13646,7 +13652,7 @@ mod tests {
             .expect("asset creatable index must survive close/reopen");
         assert_eq!(asset.creator, creator);
         assert_eq!(asset.params.total, 42);
-        assert_eq!(asset.params.unit_name, "ARC");
+        assert_eq!(asset.params.unit_name, b"ARC");
 
         let apps_by_creator = ledger.app_params_created_by(&creator);
         assert_eq!(

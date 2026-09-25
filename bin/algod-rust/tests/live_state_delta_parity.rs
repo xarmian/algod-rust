@@ -977,9 +977,9 @@ async fn deploy_and_mutate_asset(
         total: ASSET_TOTAL,
         decimals: 2,
         default_frozen: false,
-        unit_name: ASSET_UNIT_NAME.to_string(),
-        asset_name: ASSET_NAME.to_string(),
-        url: ASSET_URL.to_string(),
+        unit_name: ASSET_UNIT_NAME.as_bytes().to_vec(),
+        asset_name: ASSET_NAME.as_bytes().to_vec(),
+        url: ASSET_URL.as_bytes().to_vec(),
         manager: Some(addr),
         reserve: Some(addr),
         freeze: Some(addr),
@@ -1242,8 +1242,8 @@ async fn state_delta_asset_resources_matches_go_for_optin_closeout() {
         create.txn_type = TxnType::Acfg;
         create.asset_params = Some(AssetParams {
             total: ASSET_TOTAL,
-            unit_name: ASSET_UNIT_NAME.to_string(),
-            asset_name: ASSET_NAME.to_string(),
+            unit_name: ASSET_UNIT_NAME.as_bytes().to_vec(),
+            asset_name: ASSET_NAME.as_bytes().to_vec(),
             manager: Some(dev_addr),
             reserve: Some(dev_addr),
             freeze: Some(dev_addr),
@@ -1825,8 +1825,8 @@ async fn state_delta_asset_holding_force_emit_matches_go_for_value_identical_axf
         create.txn_type = TxnType::Acfg;
         create.asset_params = Some(AssetParams {
             total: ASSET_TOTAL,
-            unit_name: ASSET_UNIT_NAME.to_string(),
-            asset_name: ASSET_NAME.to_string(),
+            unit_name: ASSET_UNIT_NAME.as_bytes().to_vec(),
+            asset_name: ASSET_NAME.as_bytes().to_vec(),
             manager: Some(dev_addr),
             reserve: Some(dev_addr),
             freeze: Some(dev_addr),

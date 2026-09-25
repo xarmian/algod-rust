@@ -5582,7 +5582,7 @@ mod tests {
     fn asset_params_named(name: &str, total: u64) -> AssetParams {
         AssetParams {
             total,
-            unit_name: name.to_string(),
+            unit_name: name.as_bytes().to_vec(),
             ..AssetParams::default()
         }
     }
@@ -5719,7 +5719,7 @@ mod tests {
 
         let asset = adapter.lookup_asset_by_id(456).await.expect("asset lookup");
         assert_eq!(asset.creator, asset_creator);
-        assert_eq!(asset.asset_params.expect("params").unit_name, "ZZZ");
+        assert_eq!(asset.asset_params.expect("params").unit_name, b"ZZZ");
 
         // Missing app/asset → None params and zero-address creator (handler
         // maps that to 404).
@@ -5787,7 +5787,7 @@ mod tests {
         assert_eq!(other.creator, other_creator);
         assert_eq!(
             other.asset_params.as_ref().expect("params").unit_name,
-            "OTH"
+            b"OTH"
         );
         // Asset 10 (no creator / deleted): zero creator, params omitted.
         let first = all.iter().find(|r| r.asset_id == 10).expect("asset 10");
@@ -6364,7 +6364,7 @@ mod tests {
                 .as_ref()
                 .expect("asset params must be present before commit_block")
                 .unit_name,
-            "NEW",
+            b"NEW",
             "asset params must be correct before commit_block, not empty/stale"
         );
 

@@ -6165,8 +6165,8 @@ mod tests {
             total: 1_000_000,
             decimals: 6,
             default_frozen: false,
-            unit_name: "TST".to_string(),
-            asset_name: "Test Asset".to_string(),
+            unit_name: b"TST".to_vec(),
+            asset_name: b"Test Asset".to_vec(),
             manager: Some(sender),
             reserve: Some(sender),
             freeze: Some(sender),
@@ -6183,7 +6183,7 @@ mod tests {
         assert_eq!(record.creator, sender);
         assert_eq!(record.params.total, 1_000_000);
         assert_eq!(record.params.decimals, 6);
-        assert_eq!(record.params.unit_name, "TST");
+        assert_eq!(record.params.unit_name, b"TST");
 
         // Creator holds full supply.
         let holding = state.get_asset_holding(&sender, 42).unwrap();
@@ -11170,8 +11170,8 @@ mod tests {
         stx.txn.fee = 1_000;
         stx.txn.asset_params = Some(algo_types::AssetParams {
             total: 1_000_000,
-            unit_name: "UNIT".to_string(),
-            asset_name: "Asset".to_string(),
+            unit_name: b"UNIT".to_vec(),
+            asset_name: b"Asset".to_vec(),
             ..Default::default()
         });
 
@@ -11198,7 +11198,7 @@ mod tests {
         assert!(!rec.params.deleted);
         let params = rec.params.params.as_ref().expect("params delta present");
         assert_eq!(params.total, 1_000_000);
-        assert_eq!(params.unit_name, "UNIT");
+        assert_eq!(params.unit_name, b"UNIT");
         assert!(!rec.holding.deleted);
         let holding = rec.holding.holding.as_ref().expect("holding delta present");
         assert_eq!(
@@ -11244,8 +11244,8 @@ mod tests {
         create.txn.fee = 1_000;
         create.txn.asset_params = Some(algo_types::AssetParams {
             total: 1_000_000,
-            unit_name: "UNIT".to_string(),
-            asset_name: "Asset".to_string(),
+            unit_name: b"UNIT".to_vec(),
+            asset_name: b"Asset".to_vec(),
             manager: Some(creator),
             ..Default::default()
         });
@@ -11328,8 +11328,8 @@ mod tests {
         create.txn.fee = 1_000;
         create.txn.asset_params = Some(algo_types::AssetParams {
             total: 1_000_000,
-            unit_name: "UNIT".to_string(),
-            asset_name: "Asset".to_string(),
+            unit_name: b"UNIT".to_vec(),
+            asset_name: b"Asset".to_vec(),
             manager: Some(creator),
             reserve: Some(creator),
             freeze: Some(creator),
@@ -11639,7 +11639,7 @@ mod tests {
         assert!(!rec.params.deleted);
         let params = rec.params.params.as_ref().expect("params delta present");
         assert_eq!(params.total, 1_000_000);
-        assert_eq!(params.unit_name, "UNIT");
+        assert_eq!(params.unit_name, b"UNIT");
         assert!(!rec.holding.deleted);
         let holding = rec.holding.holding.as_ref().expect("holding delta present");
         assert_eq!(
@@ -11750,8 +11750,8 @@ mod tests {
         asset_create.txn.fee = 1_000;
         asset_create.txn.asset_params = Some(algo_types::AssetParams {
             total: 500_000,
-            unit_name: "OLD".to_string(),
-            asset_name: "Asset2".to_string(),
+            unit_name: b"OLD".to_vec(),
+            asset_name: b"Asset2".to_vec(),
             manager: Some(app_addr),
             ..Default::default()
         });
@@ -11807,7 +11807,7 @@ mod tests {
             "the inner acfg's manager reassignment must have applied"
         );
         assert_eq!(
-            params.unit_name, "OLD",
+            params.unit_name, b"OLD",
             "unit_name is immutable after creation -- reconfigure must not have touched it"
         );
         // Issue #603 force-emit semantics: the creator's holding record is

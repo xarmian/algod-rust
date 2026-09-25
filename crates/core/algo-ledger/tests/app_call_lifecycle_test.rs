@@ -262,7 +262,7 @@ fn test_gtxn_effects_created_asset_id_visible_to_sibling_appl() {
     createasa.txn.fee = 1_000;
     createasa.txn.asset_params = Some(algo_types::AssetParams {
         total: 2,
-        unit_name: "$".into(),
+        unit_name: b"$".to_vec(),
         ..Default::default()
     });
     // Real apply_acfg derives the created ID from `ctx.txn_counter + 1`; set
@@ -352,8 +352,8 @@ fn test_self_check_holding_new_app_not_opted_in() {
     acfg.txn.asset_params = Some(algo_types::AssetParams {
         total: 10,
         decimals: 1,
-        unit_name: "X".into(),
-        asset_name: "TEN".into(),
+        unit_name: b"X".to_vec(),
+        asset_name: b"TEN".to_vec(),
         ..Default::default()
     });
     ctx.txn_counter.set(asset_id - 1);
@@ -421,8 +421,8 @@ fn test_check_holding_new_app_via_gaid_and_app_params_get() {
     acfg.txn.asset_params = Some(algo_types::AssetParams {
         total: 10,
         decimals: 1,
-        unit_name: "X".into(),
-        asset_name: "TEN".into(),
+        unit_name: b"X".to_vec(),
+        asset_name: b"TEN".to_vec(),
         ..Default::default()
     });
     ctx.txn_counter.set(asset_id - 1);
@@ -878,7 +878,7 @@ fn test_gtxn_effects_via_apply_block_capturing_apply_data() {
     createasa.txn.group = [0xBB; 32];
     createasa.txn.asset_params = Some(algo_types::AssetParams {
         total: 5,
-        unit_name: "$".into(),
+        unit_name: b"$".to_vec(),
         ..Default::default()
     });
     createasa.apply_data_config_asset = EXPECTED_ASSET_ID;
@@ -963,7 +963,7 @@ fn test_inner_app_create_and_optin_composite_rekey_create_axfer() {
         algo_types::AssetParamsRecord {
             params: algo_types::AssetParams {
                 total: 2,
-                unit_name: "$".into(),
+                unit_name: b"$".to_vec(),
                 ..Default::default()
             },
             creator,

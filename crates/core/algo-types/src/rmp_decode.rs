@@ -518,6 +518,32 @@ pub fn read_string(rd: &mut &[u8]) -> Result<String> {
     Ok(s)
 }
 
+/// Read a msgpack `str`-format value as raw bytes, without requiring UTF-8
+/// validity.
+///
+/// go's `string`-typed fields (e.g. `basics.AssetParams.UnitName`/
+/// `AssetName`/`URL`, `data/basics/userBalance.go`) are arbitrary byte
+/// sequences on the wire -- only length-bounded, never UTF-8-validated
+/// (issue #1608). msgpack's "str" format marker itself carries no UTF-8
+/// requirement either; it is purely a type tag chosen by the writer. Use
+/// this instead of [`read_string`] for any field go declares `string` but
+/// that must round-trip byte-for-byte (consensus-critical fields such as
+/// `AssetParams` unit_name/asset_name/url).
+#[inline]
+pub fn read_str_bytes(rd: &mut &[u8]) -> Result<Vec<u8>> {
+    let len = rmp::decode::read_str_len(rd)
+        .map_err(|e| codec_err(format!("read_str_bytes str_len: {e}")))? as usize;
+    if rd.len() < len {
+        return Err(codec_err(format!(
+            "read_str_bytes: need {len} bytes, have {}",
+            rd.len()
+        )));
+    }
+    let v = rd[..len].to_vec();
+    *rd = &rd[len..];
+    Ok(v)
+}
+
 /// Read a msgpack bin as owned Vec<u8>.
 #[inline]
 pub fn read_bytes(rd: &mut &[u8]) -> Result<Vec<u8>> {

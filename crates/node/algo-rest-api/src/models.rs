@@ -1117,6 +1117,21 @@ fn printable_utf8_or_empty(s: &str) -> String {
     s.to_string()
 }
 
+/// Byte-slice variant of [`printable_utf8_or_empty`], for fields that go
+/// stores as an un-validated `string` (issue #1608) -- `unit_name`/
+/// `asset_name`/`url` are `Vec<u8>` in algod-rust, not `String`, precisely
+/// because go never requires them to be valid UTF-8
+/// (`data/basics/userBalance.go`). Mirrors go's own REST handler
+/// (`daemon/algod/api/server/v2/account.go`'s `AssetParamsToAsset`), which
+/// first checks `utf8.ValidString` before emitting the plain-text field,
+/// falling back to the `_b64`-suffixed sibling field for the exact bytes.
+fn printable_utf8_or_empty_bytes(b: &[u8]) -> String {
+    match std::str::from_utf8(b) {
+        Ok(s) => printable_utf8_or_empty(s),
+        Err(_) => String::new(),
+    }
+}
+
 /// Check if a character is printable (matching Go's `unicode.IsPrint`).
 ///
 /// Go's `unicode.IsPrint` returns true for graphic characters (Letters, Marks,
@@ -1145,7 +1160,7 @@ pub fn asset_params_to_api(asset_id: u64, creator: &str, params: &AssetParams) -
     let frozen = params.default_frozen;
 
     let name = {
-        let s = printable_utf8_or_empty(&params.asset_name);
+        let s = printable_utf8_or_empty_bytes(&params.asset_name);
         if s.is_empty() {
             None
         } else {
@@ -1155,11 +1170,11 @@ pub fn asset_params_to_api(asset_id: u64, creator: &str, params: &AssetParams) -
     let name_b64 = if params.asset_name.is_empty() {
         None
     } else {
-        Some(params.asset_name.as_bytes().to_vec())
+        Some(params.asset_name.clone())
     };
 
     let unit_name = {
-        let s = printable_utf8_or_empty(&params.unit_name);
+        let s = printable_utf8_or_empty_bytes(&params.unit_name);
         if s.is_empty() {
             None
         } else {
@@ -1169,11 +1184,11 @@ pub fn asset_params_to_api(asset_id: u64, creator: &str, params: &AssetParams) -
     let unit_name_b64 = if params.unit_name.is_empty() {
         None
     } else {
-        Some(params.unit_name.as_bytes().to_vec())
+        Some(params.unit_name.clone())
     };
 
     let url = {
-        let s = printable_utf8_or_empty(&params.url);
+        let s = printable_utf8_or_empty_bytes(&params.url);
         if s.is_empty() {
             None
         } else {
@@ -1183,7 +1198,7 @@ pub fn asset_params_to_api(asset_id: u64, creator: &str, params: &AssetParams) -
     let url_b64 = if params.url.is_empty() {
         None
     } else {
-        Some(params.url.as_bytes().to_vec())
+        Some(params.url.clone())
     };
 
     let metadata_hash = params

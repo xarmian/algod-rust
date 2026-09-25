@@ -634,16 +634,40 @@ pub struct AssetParams {
     pub default_frozen: bool,
 
     /// Unit name.
-    #[serde(rename = "un", default, skip_serializing_if = "String::is_empty")]
-    pub unit_name: String,
+    ///
+    /// Go: `UnitName string` (`data/basics/userBalance.go`) -- a Go string
+    /// is an arbitrary byte sequence, only length-bounded
+    /// (`MaxAssetUnitNameBytes`), never UTF-8-validated. Stored as raw
+    /// bytes, not `String`, to preserve non-UTF-8 content byte-for-byte
+    /// (issue #1608); see [`crate::serde_bytes_array::serde_raw_str`] for
+    /// the encode/decode contract.
+    #[serde(
+        rename = "un",
+        default,
+        skip_serializing_if = "crate::serde_bytes_array::serde_raw_str::is_empty",
+        with = "crate::serde_bytes_array::serde_raw_str"
+    )]
+    pub unit_name: Vec<u8>,
 
-    /// Asset name.
-    #[serde(rename = "an", default, skip_serializing_if = "String::is_empty")]
-    pub asset_name: String,
+    /// Asset name. Same non-UTF-8-safe byte representation as
+    /// [`AssetParams::unit_name`]; see that field's doc comment.
+    #[serde(
+        rename = "an",
+        default,
+        skip_serializing_if = "crate::serde_bytes_array::serde_raw_str::is_empty",
+        with = "crate::serde_bytes_array::serde_raw_str"
+    )]
+    pub asset_name: Vec<u8>,
 
-    /// URL.
-    #[serde(rename = "au", default, skip_serializing_if = "String::is_empty")]
-    pub url: String,
+    /// URL. Same non-UTF-8-safe byte representation as
+    /// [`AssetParams::unit_name`]; see that field's doc comment.
+    #[serde(
+        rename = "au",
+        default,
+        skip_serializing_if = "crate::serde_bytes_array::serde_raw_str::is_empty",
+        with = "crate::serde_bytes_array::serde_raw_str"
+    )]
+    pub url: Vec<u8>,
 
     /// Metadata hash ([32]byte in Go).
     #[serde(
@@ -1220,9 +1244,12 @@ impl AssetParams {
                 b"t" => s.total = rmp_decode::read_u64(rd)?,
                 b"dc" => s.decimals = rmp_decode::read_u32(rd)?,
                 b"df" => s.default_frozen = rmp_decode::read_bool(rd)?,
-                b"un" => s.unit_name = rmp_decode::read_string(rd)?,
-                b"an" => s.asset_name = rmp_decode::read_string(rd)?,
-                b"au" => s.url = rmp_decode::read_string(rd)?,
+                // Issue #1608: raw bytes, not `read_string` -- go's
+                // `string`-typed unit_name/asset_name/url are not
+                // UTF-8-validated on the wire.
+                b"un" => s.unit_name = rmp_decode::read_str_bytes(rd)?,
+                b"an" => s.asset_name = rmp_decode::read_str_bytes(rd)?,
+                b"au" => s.url = rmp_decode::read_str_bytes(rd)?,
                 b"am" => {
                     s.metadata_hash =
                         rmp_decode::read_optional(rd, rmp_decode::read_fixed_bytes::<32>)?

@@ -287,14 +287,39 @@ fn encode_test_resources_data(data: &CatchpointResourcesData) -> Vec<u8> {
     if data.default_frozen {
         fields.push((Value::from("c"), Value::Boolean(true)));
     }
+    // Issue #1608: unit_name/asset_name/url are raw bytes now (go's
+    // `string`-typed fields are not UTF-8-validated), so this helper only
+    // supports valid-UTF-8 test fixtures via `rmpv::Value::String` (existing
+    // callers all pass ASCII). A dedicated non-UTF-8 test constructs the
+    // msgpack bytes directly instead of through this rmpv-based helper --
+    // `rmpv::Utf8String` (this crate's version) has no public constructor
+    // for an intentionally-invalid-UTF-8 string.
     if !data.unit_name.is_empty() {
-        fields.push((Value::from("d"), Value::from(data.unit_name.as_str())));
+        fields.push((
+            Value::from("d"),
+            Value::from(
+                std::str::from_utf8(&data.unit_name).expect(
+                    "encode_test_resources_data only supports valid-UTF-8 unit_name fixtures",
+                ),
+            ),
+        ));
     }
     if !data.asset_name.is_empty() {
-        fields.push((Value::from("e"), Value::from(data.asset_name.as_str())));
+        fields.push((
+            Value::from("e"),
+            Value::from(std::str::from_utf8(&data.asset_name).expect(
+                "encode_test_resources_data only supports valid-UTF-8 asset_name fixtures",
+            )),
+        ));
     }
     if !data.url.is_empty() {
-        fields.push((Value::from("f"), Value::from(data.url.as_str())));
+        fields.push((
+            Value::from("f"),
+            Value::from(
+                std::str::from_utf8(&data.url)
+                    .expect("encode_test_resources_data only supports valid-UTF-8 url fixtures"),
+            ),
+        ));
     }
     if data.metadata_hash != [0u8; 32] {
         fields.push((Value::from("g"), Value::Binary(data.metadata_hash.to_vec())));
@@ -802,9 +827,9 @@ fn test_decode_resources_from_chunk() {
         total: 1_000_000_000,
         decimals: 6,
         default_frozen: false,
-        unit_name: "ALGO".to_string(),
-        asset_name: "Algorand".to_string(),
-        url: "https://algorand.foundation".to_string(),
+        unit_name: b"ALGO".to_vec(),
+        asset_name: b"Algorand".to_vec(),
+        url: b"https://algorand.foundation".to_vec(),
         amount: 500_000_000,
         resource_flags: 2, // OWNERSHIP
         update_round: 41_000_000,
@@ -856,9 +881,9 @@ fn test_decode_resources_from_chunk() {
             assert_eq!(decoded.total, 1_000_000_000);
             assert_eq!(decoded.decimals, 6);
             assert!(!decoded.default_frozen);
-            assert_eq!(decoded.unit_name, "ALGO");
-            assert_eq!(decoded.asset_name, "Algorand");
-            assert_eq!(decoded.url, "https://algorand.foundation");
+            assert_eq!(decoded.unit_name, b"ALGO");
+            assert_eq!(decoded.asset_name, b"Algorand");
+            assert_eq!(decoded.url, b"https://algorand.foundation");
             assert_eq!(decoded.amount, 500_000_000);
             assert_eq!(decoded.resource_flags, 2);
             assert_eq!(decoded.update_round, 41_000_000);
@@ -1091,9 +1116,9 @@ fn test_full_pipeline_account_data_end_to_end() {
     let resource_data = CatchpointResourcesData {
         total: 10_000_000_000,
         decimals: 8,
-        unit_name: "TEST".to_string(),
-        asset_name: "Test Token".to_string(),
-        url: "https://example.com".to_string(),
+        unit_name: b"TEST".to_vec(),
+        asset_name: b"Test Token".to_vec(),
+        url: b"https://example.com".to_vec(),
         amount: 1_000_000,
         resource_flags: 2,
         update_round: 41_000_000,
@@ -1204,9 +1229,9 @@ fn test_full_pipeline_account_data_end_to_end() {
                     decode_resources_data(&br.resources[&999]).expect("inner resource decode");
                 assert_eq!(res.total, 10_000_000_000);
                 assert_eq!(res.decimals, 8);
-                assert_eq!(res.unit_name, "TEST");
-                assert_eq!(res.asset_name, "Test Token");
-                assert_eq!(res.url, "https://example.com");
+                assert_eq!(res.unit_name, b"TEST");
+                assert_eq!(res.asset_name, b"Test Token");
+                assert_eq!(res.url, b"https://example.com");
                 assert_eq!(res.amount, 1_000_000);
                 assert_eq!(res.resource_flags, 2);
                 assert_eq!(res.update_round, 41_000_000);
@@ -1264,9 +1289,9 @@ fn test_decode_resources_data_roundtrip() {
     let original = CatchpointResourcesData {
         total: 1_000_000,
         decimals: 6,
-        unit_name: "USDC".to_string(),
-        asset_name: "USD Coin".to_string(),
-        url: "https://centre.io".to_string(),
+        unit_name: b"USDC".to_vec(),
+        asset_name: b"USD Coin".to_vec(),
+        url: b"https://centre.io".to_vec(),
         amount: 500_000,
         frozen: true,
         resource_flags: 2,
@@ -1437,7 +1462,7 @@ fn test_balance_record_with_multiple_resources() {
     let res1 = CatchpointResourcesData {
         total: 1_000,
         decimals: 0,
-        unit_name: "NFT".to_string(),
+        unit_name: b"NFT".to_vec(),
         resource_flags: 2,
         ..Default::default()
     };
@@ -1487,7 +1512,7 @@ fn test_balance_record_with_multiple_resources() {
 
             let r1 = decode_resources_data(&br.resources[&100]).unwrap();
             assert_eq!(r1.total, 1_000);
-            assert_eq!(r1.unit_name, "NFT");
+            assert_eq!(r1.unit_name, b"NFT");
             assert_eq!(r1.resource_flags, 2);
 
             let r2 = decode_resources_data(&br.resources[&200]).unwrap();

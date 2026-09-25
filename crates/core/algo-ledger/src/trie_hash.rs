@@ -428,7 +428,7 @@ mod tests {
         let asset_rd = ResourcesData {
             amount: 1000,
             decimals: 3,
-            asset_name: "test".to_string(),
+            asset_name: b"test".to_vec(),
             manager: addr.0,
             ..Default::default()
         };
