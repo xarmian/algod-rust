@@ -1158,6 +1158,60 @@ mod tests {
         assert_eq!(stored_addr, addr.to_vec());
     }
 
+    /// Regression test for issue #1620: a real go-algorand catchpoint chunk
+    /// for an all-zero-address account omits the `"a"` map key entirely
+    /// (`BalanceRecordV6`'s struct-level `omitempty` tag,
+    /// `../go-algorand/ledger/encoded/recordsV6.go` +
+    /// `msgp_gen.go`'s `Address.MsgIsZero()` check). Decoding that chunk
+    /// through the real `CatchpointSnapshotChunkV6` msgpack path (not the
+    /// `make_balance_record` test helper, which always sets an explicit
+    /// address) must still produce a 32-byte all-zero address, and the
+    /// import must succeed instead of failing with "bad address length 0
+    /// (expected 32) in accountbase".
+    #[test]
+    fn import_balance_record_decoded_from_go_shaped_chunk_with_omitted_zero_address() {
+        // Build the raw msgpack bytes for a CatchpointSnapshotChunkV6
+        // containing one balance record with only "b" set (account_data),
+        // mirroring go's on-wire omission of "a" for the zero address.
+        let balance_map = rmpv::Value::Map(vec![(
+            rmpv::Value::String("b".into()),
+            rmpv::Value::Binary(empty_account_data_blob()),
+        )]);
+        let chunk_map = rmpv::Value::Map(vec![(
+            rmpv::Value::String("bl".into()),
+            rmpv::Value::Array(vec![balance_map]),
+        )]);
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &chunk_map).expect("encode chunk");
+
+        let chunk: CatchpointSnapshotChunkV6 =
+            rmp_serde::from_slice(&bytes).expect("decode go-shaped chunk");
+        assert_eq!(chunk.balances.len(), 1);
+        assert_eq!(
+            chunk.balances[0].address.as_ref(),
+            [0u8; 32].as_slice(),
+            "omitted address must decode to 32 zero bytes"
+        );
+
+        let conn = mem_conn();
+        let mut importer = CatchpointImporter::new(&conn, "test#label".to_string(), REWARD_UNITS);
+        importer.prepare_staging().unwrap();
+
+        let mut stats = ImportStats::default();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        importer
+            .import_chunk(1, &chunk, &mut stats)
+            .expect("import of a go-shaped zero-address chunk must succeed");
+        conn.execute_batch("COMMIT").unwrap();
+
+        let stored_addr: Vec<u8> = conn
+            .query_row("SELECT address FROM catchpointbalances", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored_addr, vec![0u8; 32]);
+    }
+
     #[test]
     fn import_balance_with_owned_asset_resource() {
         let conn = mem_conn();

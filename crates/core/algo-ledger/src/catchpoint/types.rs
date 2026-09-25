@@ -102,6 +102,26 @@ where
     Ok(out)
 }
 
+/// `#[serde(default = ...)]` value for an omitted go `basics.Address`
+/// (`[32]byte`) field.
+///
+/// go's `BalanceRecordV6`/`OnlineAccountRecordV6` carry a struct-level
+/// `omitempty` codec tag (`../go-algorand/ledger/encoded/recordsV6.go`), and
+/// their generated `MarshalMsg` (`../go-algorand/ledger/encoded/msgp_gen.go`)
+/// omits the address map key entirely whenever `Address.MsgIsZero()` — i.e.
+/// whenever the account's real 32-byte address is the all-zero address. That
+/// address is a real, legitimate Algorand account (`AAAA...Y5HFKQ`) that can
+/// hold a balance; go's zero-initialized `[32]byte` fills the field back in
+/// as 32 zero bytes on decode, not as "absent".
+///
+/// A bare `ByteBuf::default()` is an *empty* buffer, not 32 zero bytes, so a
+/// plain `#[serde(default)]` on these fields silently turns a real all-zero
+/// address into a 0-length one — this produced the "bad address length 0
+/// (expected 32) in accountbase" catchpoint-import failure (issue #1620).
+fn default_zero_address() -> ByteBuf {
+    ByteBuf::from(vec![0u8; 32])
+}
+
 // ---------------------------------------------------------------------------
 // Catchpoint file format version constants
 // From go-algorand/ledger/catchpointtracker.go
@@ -320,7 +340,7 @@ pub struct CatchpointSnapshotChunkV6 {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BalanceRecordV6 {
     /// 32-byte account address.
-    #[serde(rename = "a", default)]
+    #[serde(rename = "a", default = "default_zero_address")]
     pub address: ByteBuf,
 
     /// Raw msgp-encoded `baseAccountData` blob (decoded separately in Wave 2).
@@ -360,7 +380,7 @@ pub struct KVRecordV6 {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OnlineAccountRecordV6 {
     /// 32-byte account address.
-    #[serde(rename = "addr", default)]
+    #[serde(rename = "addr", default = "default_zero_address")]
     pub address: ByteBuf,
 
     /// Round at which this online account was last updated.
@@ -748,6 +768,19 @@ pub const RESOURCE_FLAGS_EMPTY_APP: u8 = algo_codec::resource_flags::EMPTY_APP;
 mod tests {
     use super::*;
 
+    /// Build a msgpack map manually using rmpv for known values, mirroring
+    /// go's map-encoded (non-array) `codec` output for these record types.
+    fn encode_map(pairs: &[(&str, rmpv::Value)]) -> Vec<u8> {
+        let map_pairs: Vec<(rmpv::Value, rmpv::Value)> = pairs
+            .iter()
+            .map(|(k, v)| (rmpv::Value::String((*k).into()), v.clone()))
+            .collect();
+        let val = rmpv::Value::Map(map_pairs);
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &val).expect("encode");
+        buf
+    }
+
     #[test]
     fn version_constants_are_correct() {
         // Go uses octal literals: 0200, 0201, 0202, 0203
@@ -1021,6 +1054,50 @@ mod tests {
         let bytes = rmp_serde::to_vec_named(&populated).expect("msgpack serialize");
         let round_tripped: BalanceRecordV6 = rmp_serde::from_slice(&bytes).expect("msgpack decode");
         assert_eq!(round_tripped, populated);
+    }
+
+    /// Regression test for issue #1620: go's `BalanceRecordV6` carries a
+    /// struct-level `omitempty` tag (`../go-algorand/ledger/encoded/recordsV6.go`),
+    /// and its generated `MarshalMsg`
+    /// (`../go-algorand/ledger/encoded/msgp_gen.go`) omits the `"a"` (Address)
+    /// map key entirely whenever `Address.MsgIsZero()` — i.e. whenever the
+    /// account's real 32-byte address happens to be the all-zero address
+    /// (`AAAA...Y5HFKQ`, a legitimate real account that can hold a balance).
+    /// On decode, Go's zero-initialized `[32]byte` array fills back in as 32
+    /// zero bytes, not as "no address".
+    ///
+    /// A plain `#[serde(default)]` on a `ByteBuf` field defaults to an EMPTY
+    /// buffer when the key is absent, not 32 zero bytes -- that mismatch is
+    /// exactly what produced live mainnet failures during catchpoint import
+    /// (`bad address length 0 (expected 32) in accountbase`,
+    /// `crates/core/algo-ledger/src/catchpoint/verify.rs:698` /
+    /// `writer.rs:557`): a real, well-formed catchpoint chunk for an
+    /// all-zero-address account decoded to a 0-length address instead of 32
+    /// zero bytes.
+    #[test]
+    fn balance_record_v6_decodes_omitted_zero_address_as_32_zero_bytes() {
+        // Mimic go's actual on-wire encoding for an all-zero-address account:
+        // the "a" key is entirely absent (omitempty), only "b" is present.
+        let bytes = encode_map(&[("b", rmpv::Value::Binary(vec![1u8, 2, 3]))]);
+        let record: BalanceRecordV6 = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(
+            record.address.as_ref(),
+            [0u8; 32].as_slice(),
+            "a BalanceRecordV6 with an omitted (all-zero) address must decode to \
+             32 zero bytes, matching go's zero-valued [32]byte Address, not an \
+             empty buffer"
+        );
+    }
+
+    #[test]
+    fn online_account_record_v6_decodes_omitted_zero_address_as_32_zero_bytes() {
+        // Same omitempty behavior applies to OnlineAccountRecordV6's "addr" key
+        // (`../go-algorand/ledger/encoded/recordsV6.go`'s struct-level
+        // `omitempty` tag covers every field, not just BalanceRecordV6.Address).
+        let bytes = encode_map(&[("upd", rmpv::Value::Integer(100.into()))]);
+        let record: OnlineAccountRecordV6 = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(record.address.as_ref(), [0u8; 32].as_slice());
+        assert_eq!(record.updated_round, 100);
     }
 
     #[test]
