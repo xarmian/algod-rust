@@ -32,7 +32,7 @@ use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
 
-use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig};
+use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::{ResolveError, TokioResolver};
 use thiserror::Error;
@@ -136,6 +136,63 @@ pub trait SrvResolver: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// Resolver options
+// ---------------------------------------------------------------------------
+
+/// Apply the `ResolverOpts` every [`HickorySrvResolver`]-built `TokioResolver`
+/// must use, setting `validate` per the caller's DNSSEC-enforcement setting.
+///
+/// Split out from the resolver-builder methods so a test can assert on the
+/// resulting `ResolverOpts` directly (mirrors [`Self::default_resolver_config`]
+/// / [`Self::fallback_resolver_config`]'s testability split).
+///
+/// # `edns0` (issue #1600 root cause)
+///
+/// `hickory_resolver::config::ResolverOpts::edns0` defaults to `false`, and
+/// none of this module's resolver builders used to override it. That default
+/// only matters for the *initial* query hickory-resolver constructs
+/// (`resolver.rs`'s `Resolver::lookup` sets `DnsRequestOptions::use_edns =
+/// self.options.edns0`) — but that same `DnsRequestOptions` is threaded
+/// through to every DNSKEY/DS sub-query hickory-proto's
+/// `dnssec_dns_handle::verify_dnskey_rrset`/`find_ds_records` issue while
+/// walking the chain of trust (`hickory_proto::xfer::dns_handle::build_request`
+/// only attaches an EDNS OPT record — and only then sizes it to the
+/// recommended 1232-byte payload — when `options.use_edns` is set).
+///
+/// With `edns0` left `false`, every one of those queries goes out with no
+/// EDNS OPT record at all; `DnssecDnsHandle::send` (which unconditionally
+/// needs DNSSEC-OK set to receive RRSIG/DNSKEY data) then has to insert one
+/// itself via `Edns::default()`, whose `max_payload` is the bare legacy
+/// non-EDNS minimum of 512 bytes (RFC 6891) — nowhere near enough for a
+/// zone like `mainnet.algorand.network`, whose real SRV response carries
+/// ~70 relay records plus RRSIGs and additional-section glue. Every UDP
+/// response for that zone gets truncated (`TC=1`), forcing a TCP-fallback
+/// retry for essentially every query the DNSSEC chain-of-trust walk makes;
+/// each retry re-enters `DnssecDnsHandle::send` through a freshly cloned
+/// handle (`clone_with_context`, which increments `request_depth`), and
+/// enough of those compounding retries across the ~70 additional-section
+/// names eventually exceed hickory-proto's fixed `max_request_depth = 26`
+/// backstop (`dnssec_dns_handle/mod.rs`), surfacing as "exceeded max
+/// validation depth" — even though the actual delegation chain (root ->
+/// `.network` -> `algorand.network`) is only a few levels deep.
+///
+/// Setting `edns0 = true` makes hickory's own `build_request` attach an
+/// EDNS OPT record sized to the recommended 1232-byte payload *before* the
+/// DNSSEC handle ever touches it; `Edns::enable_dnssec` only flips the
+/// DNSSEC-OK flag and never shrinks an existing `max_payload`, so every
+/// query in the chain — not just the top-level SRV lookup — keeps the
+/// larger buffer and stops triggering truncation-driven retries. This
+/// mirrors what every production DNS resolver (including go-algorand's own
+/// `tools/network/dnssec` resolver) does unconditionally; leaving `edns0`
+/// at hickory's bare default was algod-rust's own configuration gap, not an
+/// upstream hickory-dns defect.
+fn apply_resolver_opts(opts: &mut ResolverOpts, validate: bool) {
+    opts.validate = validate;
+    opts.try_tcp_on_error = true;
+    opts.edns0 = true;
+}
+
+// ---------------------------------------------------------------------------
 // HickorySrvResolver
 // ---------------------------------------------------------------------------
 
@@ -194,9 +251,7 @@ impl HickorySrvResolver {
     fn build_resolver(config: ResolverConfig, validate: bool) -> TokioResolver {
         let provider = TokioConnectionProvider::default();
         let mut builder = TokioResolver::builder_with_config(config, provider);
-        let opts = builder.options_mut();
-        opts.validate = validate;
-        opts.try_tcp_on_error = true;
+        apply_resolver_opts(builder.options_mut(), validate);
         builder.build()
     }
 
@@ -209,9 +264,7 @@ impl HickorySrvResolver {
             warn!("failed to read system DNS config: {e}");
             e
         })?;
-        let opts = builder.options_mut();
-        opts.validate = validate;
-        opts.try_tcp_on_error = true;
+        apply_resolver_opts(builder.options_mut(), validate);
         Ok(builder.build())
     }
 
@@ -901,6 +954,71 @@ mod tests {
         assert!(
             HickorySrvResolver::system_resolver(true).is_ok(),
             "system resolver must build with DNSSEC validation on"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // EDNS0 configuration tests (issue #1600)
+    //
+    // Root cause: none of this module's resolver builders set
+    // `ResolverOpts::edns0`, so it stayed at hickory-resolver's own default
+    // of `false`. Every DNSSEC-validating query (the top-level SRV lookup
+    // *and* every DNSKEY/DS sub-query hickory-proto issues while walking the
+    // chain of trust) then went out with only a 512-byte EDNS payload
+    // (`Edns::default().max_payload`) instead of the recommended 1232
+    // bytes, chronically truncating responses for zones with large record
+    // sets (mainnet.algorand.network's real SRV response carries ~70
+    // relays) and driving hickory-proto's internal retry/depth accounting
+    // past its `max_request_depth = 26` backstop — "exceeded max validation
+    // depth" — even though the real delegation chain is only a few levels
+    // deep. See `apply_resolver_opts`'s doc comment for the full mechanism.
+    // -----------------------------------------------------------------------
+
+    /// `apply_resolver_opts` must always enable EDNS0, regardless of the
+    /// `validate` setting — this is what lets hickory attach a
+    /// properly-sized (1232-byte) EDNS payload to every query, which
+    /// `DnssecDnsHandle::send`'s own EDNS insertion (512-byte default)
+    /// would otherwise leave undersized for large, DNSSEC-signed zones.
+    #[test]
+    fn apply_resolver_opts_enables_edns0_with_dnssec_validation() {
+        let mut opts = ResolverOpts::default();
+        apply_resolver_opts(&mut opts, true);
+        assert!(opts.validate, "validate must be threaded through as given");
+        assert!(
+            opts.edns0,
+            "edns0 must be enabled so DNSSEC queries get a properly-sized \
+             EDNS payload instead of the 512-byte non-EDNS default \
+             (issue #1600: undersized payload -> truncation -> retries -> \
+             'exceeded max validation depth')"
+        );
+        assert!(opts.try_tcp_on_error, "TCP fallback must stay enabled");
+    }
+
+    /// The same EDNS0 fix must apply even when DNSSEC validation itself is
+    /// off (an operator's explicit `DNSSecurityFlags` override, issue
+    /// #1314) — EDNS0 is a general prerequisite for reliable large-response
+    /// resolution, not something that should regress when validation is
+    /// disabled.
+    #[test]
+    fn apply_resolver_opts_enables_edns0_without_dnssec_validation() {
+        let mut opts = ResolverOpts::default();
+        apply_resolver_opts(&mut opts, false);
+        assert!(!opts.validate);
+        assert!(opts.edns0, "edns0 must stay enabled regardless of validate");
+    }
+
+    /// Every resolver stage this module builds (`system`, `fallback`,
+    /// `default`) must route through `apply_resolver_opts`, so a fallback
+    /// resolver built for a concrete address also gets EDNS0. This can only
+    /// be asserted indirectly here (the built `TokioResolver` doesn't expose
+    /// its `ResolverOpts` back out), so it exercises `build_resolver`'s
+    /// config-construction path via `fallback_resolver` and just confirms
+    /// it still builds successfully with the fix in place.
+    #[test]
+    fn fallback_resolver_builds_with_edns0_fix_in_place() {
+        assert!(
+            HickorySrvResolver::fallback_resolver("8.8.8.8", true).is_some(),
+            "fallback resolver must still build after routing through apply_resolver_opts"
         );
     }
 
