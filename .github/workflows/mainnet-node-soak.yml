@@ -155,6 +155,19 @@ jobs:
           printf '%s' "$ALGOD_TOKEN" > /tmp/mainnet-soak-data/algod.token
           printf '%s' "$ALGOD_TOKEN" > /tmp/mainnet-soak-data/algod.admin.token
 
+          # Issue #1600: real mainnet DNS-SRV bootstrap discovery hits
+          # hickory-resolver's DNSSEC validator ("exceeded max validation
+          # depth") against mainnet.algorand.network's real DNSSEC chain,
+          # found live by this workflow's own first dispatch run --
+          # unrelated to this soak's actual purpose and not yet root-caused
+          # (tracked separately, see #1600). DNSSecurityFlags=0 clears the
+          # DNS_SECURITY_SRV bit (config/algo_config's dns_security_flags,
+          # mirroring go's DNSSecuritySRVEnforced()) for THIS soak node
+          # only -- go-algorand's own real default (enforced) is untouched,
+          # and this is data (config.json), not a code change to the node.
+          # Revert once #1600 lands a real fix.
+          echo '{"DNSSecurityFlags": 0}' > /tmp/mainnet-soak-data/config.json
+
           # Real mainnet genesis — the same fixture `make replay-mainnet*`
           # already uses against a live archival node. A fresh, empty
           # participation-key store is intentional: this soak proves the
