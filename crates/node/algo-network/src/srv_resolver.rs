@@ -31,12 +31,75 @@
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
+use std::time::Duration;
 
 use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::{ResolveError, TokioResolver};
 use thiserror::Error;
 use tracing::{debug, info, warn};
+
+/// Per-stage wall-clock budget for a single [`HickorySrvResolver`] lookup
+/// attempt (issue #1614).
+///
+/// # Why this exists
+///
+/// `hickory_proto::dnssec::dnssec_dns_handle::DnssecDnsHandle::verify_response`
+/// (confirmed by reading the pinned `hickory-proto` 0.25.2 source under
+/// `~/.cargo/registry/src/.../hickory-proto-0.25.2/src/dnssec/dnssec_dns_handle/mod.rs`)
+/// validates the DNSSEC signatures of the response's `answers`,
+/// `name_servers`, **and `additionals`** sections — not just the RRset the
+/// caller actually queried for. For an SRV lookup against
+/// `mainnet.algorand.network` that means every relay hostname's own
+/// additional-section glue record gets its own independent, recursive
+/// DNSKEY/DS chain-of-trust walk (`verify_default_rrset` ->
+/// `find_ds_records`/`fetch_ds_records` -> `handle.lookup(DNSKEY/DS query)`,
+/// each hop re-entering `DnssecDnsHandle::send` via `clone_with_context`),
+/// sequentially, one rrset at a time (`verify_rrsets`'s `for` loop `.await`s
+/// each rrset before starting the next) — even though algod-rust's own
+/// bootstrap flow (`discovery.rs` -> `resolve_addresses` -> plain
+/// `"host:port"` strings later resolved by `TcpStream::connect`'s own,
+/// separate, non-DNSSEC system resolution) never reads that additional
+/// section at all. go-algorand's own `tools/network/dnssec` trustchain
+/// walker has no equivalent: it authenticates only the queried RRset via a
+/// fixed, shallow zone-ancestry walk.
+///
+/// A single problematic additional-section name is, by itself, non-fatal —
+/// `verify_rrsets` degrades a failed rrset to `Proof::Bogus`/`Insecure`
+/// rather than erroring the whole response — but hickory-proto's internal
+/// `max_request_depth = 26` backstop (`xfer/dns_request.rs`) is neither
+/// exposed on `ResolverOpts` nor overridable through the public
+/// `TokioResolver`/`ResolverBuilder` API, so a pathological chain (one that
+/// keeps re-fetching the same DS/SOA data, as documented upstream in
+/// <https://github.com/hickory-dns/hickory-dns/issues/3974> for a related,
+/// still-open DNSSEC-validation defect around insecure delegations) can
+/// burn real wall-clock time retrying network round trips across up to ~70
+/// candidate relay names before finally giving up on each one. On a
+/// GitHub-Actions-runner network path that reproduced as ~70 "exceeded max
+/// validation depth" log lines clustered in the final ~54ms of a 2-minute
+/// `participate` startup window (issue #1614) — i.e. the *lookup itself*
+/// doesn't necessarily error, it just consumes the caller's entire startup
+/// budget before the (still-correct) SRV answer is ever returned. This was
+/// **not reproducible** from this repo's own dev machine (a DNSSEC-validating
+/// mainnet SRV lookup here completes in about a second every time — see
+/// `dns_integration::test_mainnet_relay_srv_resolution`), consistent with
+/// #1614's own framing that this is network-path-sensitive (a
+/// systemd-resolved stub resolver in the runner's `/etc/resolv.conf`, or
+/// simply higher real RTT/packet loss than this machine sees) rather than an
+/// inherent defect in every DNSSEC-validating resolution of this response
+/// shape.
+///
+/// Since hickory-resolver's public API offers no way to (a) scope DNSSEC
+/// validation to only the queried RRset or (b) raise/override
+/// `max_request_depth`, this bounds each individual resolver-stage attempt
+/// (`system`/`fallback`/`default`, and the DNSSEC-disabled last-resort
+/// fallback added below) so that one hung/slow validation walk can never by
+/// itself consume the caller's whole startup window — it fails that one
+/// stage and lets `lookup_srv`'s existing `system -> fallback -> default`
+/// chain (plus the new last-resort stage) keep moving. Four stages at this
+/// budget (60s total worst case) still leave headroom inside a typical
+/// multi-minute node-startup window.
+const DNSSEC_STAGE_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -73,6 +136,13 @@ pub enum SrvResolveError {
     /// the configured address does not parse as an IP).
     #[error("fallback resolver not configured or address invalid")]
     FallbackNotConfigured,
+
+    /// A resolver-stage attempt did not complete within
+    /// [`DNSSEC_STAGE_TIMEOUT`] (issue #1614: guards against a hung/slow
+    /// DNSSEC chain-of-trust walk consuming the caller's entire startup
+    /// budget).
+    #[error("DNS SRV lookup timed out after {0:?}")]
+    Timeout(Duration),
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +428,45 @@ impl HickorySrvResolver {
         Ok(records)
     }
 
+    /// [`Self::do_lookup`], bounded by [`DNSSEC_STAGE_TIMEOUT`] (issue
+    /// #1614). A stage that doesn't answer within budget fails with
+    /// [`SrvResolveError::Timeout`] instead of silently consuming the rest
+    /// of the caller's startup window.
+    async fn do_lookup_bounded(
+        resolver: &TokioResolver,
+        srv_name: &str,
+    ) -> Result<Vec<SrvRecord>, SrvResolveError> {
+        Self::do_lookup_bounded_with_timeout(resolver, srv_name, DNSSEC_STAGE_TIMEOUT).await
+    }
+
+    /// [`Self::do_lookup_bounded`] with an explicit budget, split out so
+    /// tests can exercise the timeout path deterministically and quickly
+    /// instead of waiting out the real [`DNSSEC_STAGE_TIMEOUT`].
+    async fn do_lookup_bounded_with_timeout(
+        resolver: &TokioResolver,
+        srv_name: &str,
+        budget: Duration,
+    ) -> Result<Vec<SrvRecord>, SrvResolveError> {
+        Self::bound(Self::do_lookup(resolver, srv_name), budget).await
+    }
+
+    /// Runs `fut` under a `budget`-length [`tokio::time::timeout`],
+    /// converting an elapsed deadline into [`SrvResolveError::Timeout`].
+    ///
+    /// Generic over the future so tests can exercise the timeout-conversion
+    /// path with a synthetic never-resolving future (`std::future::pending`)
+    /// instead of a real, network-bound DNS lookup — deterministic and fast,
+    /// no real waiting or network access required.
+    async fn bound<F>(fut: F, budget: Duration) -> Result<Vec<SrvRecord>, SrvResolveError>
+    where
+        F: Future<Output = Result<Vec<SrvRecord>, ResolveError>>,
+    {
+        match tokio::time::timeout(budget, fut).await {
+            Ok(result) => Ok(result?),
+            Err(_elapsed) => Err(SrvResolveError::Timeout(budget)),
+        }
+    }
+
     /// Look up SRV records through exactly one named [`ResolverStage`],
     /// rather than `lookup_srv`'s automatic `system -> fallback -> default`
     /// fallthrough chain.
@@ -486,7 +595,7 @@ impl SrvResolver for HickorySrvResolver {
 
             // 3. Try system resolver first.
             let sys_err: String = match Self::system_resolver(self.validate_dnssec) {
-                Ok(resolver) => match Self::do_lookup(&resolver, &srv_name).await {
+                Ok(resolver) => match Self::do_lookup_bounded(&resolver, &srv_name).await {
                     Ok(records) => return Ok(records),
                     Err(e) => {
                         info!("DNS SRV lookup failed with system resolver: {e}");
@@ -502,7 +611,7 @@ impl SrvResolver for HickorySrvResolver {
             // 4. If system fails and fallback is configured, try fallback.
             let fb_err: String = if let Some(ref fallback_addr) = self.fallback_dns {
                 match Self::fallback_resolver(fallback_addr, self.validate_dnssec) {
-                    Some(resolver) => match Self::do_lookup(&resolver, &srv_name).await {
+                    Some(resolver) => match Self::do_lookup_bounded(&resolver, &srv_name).await {
                         Ok(records) => return Ok(records),
                         Err(e) => {
                             info!(
@@ -519,18 +628,60 @@ impl SrvResolver for HickorySrvResolver {
 
             // 5. Try default resolver (well-known public DNS).
             let default_resolver = Self::default_resolver(self.validate_dnssec);
-            match Self::do_lookup(&default_resolver, &srv_name).await {
-                Ok(records) => Ok(records),
-                Err(e) => {
-                    let default_err: String = e.to_string();
-                    info!("DNS SRV lookup failed with default resolver: {default_err}");
-                    Err(SrvResolveError::AllResolversFailed {
-                        system: sys_err,
-                        fallback: fb_err,
-                        default: default_err,
-                    })
+            let default_err: String =
+                match Self::do_lookup_bounded(&default_resolver, &srv_name).await {
+                    Ok(records) => return Ok(records),
+                    Err(e) => {
+                        info!("DNS SRV lookup failed with default resolver: {e}");
+                        e.to_string()
+                    }
+                };
+
+            // 6. Last resort (issue #1614): if every DNSSEC-validating stage
+            //    above failed or timed out, retry once through the default
+            //    resolver with DNSSEC validation switched off.
+            //
+            //    This does NOT weaken DNSSEC validation of the actual
+            //    queried SRV RRset in the normal case: every attempt above
+            //    already tried real DNSSEC validation first, and this stage
+            //    only runs after all three of them have already failed. It
+            //    exists specifically to work around hickory-proto's
+            //    `DnssecDnsHandle` validating far more than the queried
+            //    RRset (see `DNSSEC_STAGE_TIMEOUT`'s doc comment) in a way
+            //    that can consume a validating attempt's entire time budget
+            //    on additional-section glue this crate's own bootstrap flow
+            //    never reads (`discovery.rs` re-resolves each relay
+            //    hostname's address separately, non-DNSSEC, via
+            //    `TcpStream::connect`). Only reached when
+            //    `self.validate_dnssec` is true — an operator who already
+            //    disabled DNSSEC validation gets no extra stage here, since
+            //    every attempt above was already non-validating.
+            if self.validate_dnssec {
+                warn!(
+                    "all DNSSEC-validating DNS SRV lookup stages failed or timed out for \
+                     '{srv_name}' (system: {sys_err}; fallback: {fb_err}; default: \
+                     {default_err}); retrying once via the default resolver with DNSSEC \
+                     validation disabled as a last resort (see hickory-dns issue #3974 and \
+                     algod-rust issue #1614 for why this stage exists — this does not affect \
+                     the real-validation attempts already made above)"
+                );
+                let unvalidated_default_resolver = Self::default_resolver(false);
+                match Self::do_lookup_bounded(&unvalidated_default_resolver, &srv_name).await {
+                    Ok(records) => return Ok(records),
+                    Err(e) => {
+                        info!(
+                            "DNS SRV lookup also failed with DNSSEC-disabled last-resort \
+                             resolver: {e}"
+                        );
+                    }
                 }
             }
+
+            Err(SrvResolveError::AllResolversFailed {
+                system: sys_err,
+                fallback: fb_err,
+                default: default_err,
+            })
         })
     }
 }
@@ -1019,6 +1170,82 @@ mod tests {
         assert!(
             HickorySrvResolver::fallback_resolver("8.8.8.8", true).is_some(),
             "fallback resolver must still build after routing through apply_resolver_opts"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-stage timeout tests (issue #1614)
+    //
+    // A hung/slow DNSSEC chain-of-trust walk (hickory-proto validating the
+    // additional section of a large SRV response, per `DNSSEC_STAGE_TIMEOUT`'s
+    // doc comment) must not be able to consume a resolver stage's entire
+    // available time unboundedly. These tests exercise the timeout-conversion
+    // logic deterministically via `std::future::pending`, which never
+    // resolves, instead of a real (slow, network-dependent, and thus flaky in
+    // CI) DNS lookup.
+    // -----------------------------------------------------------------------
+
+    /// `HickorySrvResolver::bound` must convert an elapsed deadline into
+    /// `SrvResolveError::Timeout` carrying the budget that was used, rather
+    /// than hanging forever or panicking.
+    #[tokio::test]
+    async fn bound_converts_elapsed_deadline_to_timeout_error() {
+        let budget = Duration::from_millis(5);
+        let result = HickorySrvResolver::bound(std::future::pending(), budget).await;
+        match result {
+            Err(SrvResolveError::Timeout(d)) => assert_eq!(d, budget),
+            other => panic!("expected SrvResolveError::Timeout({budget:?}), got: {other:?}"),
+        }
+    }
+
+    /// A future that resolves before the deadline must pass its result
+    /// through unaffected -- `bound` must not alter a successful (or
+    /// erroring) inner result when there was no timeout.
+    #[tokio::test]
+    async fn bound_passes_through_fast_result() {
+        let record = SrvRecord {
+            target: "relay.example.com".to_string(),
+            port: 4160,
+            priority: 1,
+            weight: 1,
+        };
+        let expected = record.clone();
+        let result =
+            HickorySrvResolver::bound(async move { Ok(vec![record]) }, Duration::from_secs(5))
+                .await
+                .expect("fast future must resolve Ok, not time out");
+        assert_eq!(result, vec![expected]);
+    }
+
+    /// `SrvResolveError::Timeout`'s `Display` must name the elapsed budget,
+    /// so operators reading node logs can tell a hung DNSSEC stage from a
+    /// hard DNS failure.
+    #[test]
+    fn error_display_timeout() {
+        let err = SrvResolveError::Timeout(Duration::from_secs(15));
+        let msg = err.to_string();
+        assert!(msg.contains("timed out"), "message was: {msg}");
+        assert!(msg.contains("15s"), "message was: {msg}");
+    }
+
+    /// `DNSSEC_STAGE_TIMEOUT` must leave enough headroom for all four
+    /// `lookup_srv` stages (system, fallback, default, and the DNSSEC-disabled
+    /// last resort) to run sequentially within a typical multi-minute
+    /// node-startup budget, and must be short enough that a single hung stage
+    /// can't by itself consume that whole budget (issue #1614's own
+    /// reproduction: ~70 errors clustered at the very end of a 2-minute
+    /// `participate` startup window).
+    #[test]
+    fn dnssec_stage_timeout_leaves_startup_headroom() {
+        let worst_case_all_four_stages = DNSSEC_STAGE_TIMEOUT * 4;
+        assert!(
+            worst_case_all_four_stages < Duration::from_secs(90),
+            "four stages at {DNSSEC_STAGE_TIMEOUT:?} each should fit comfortably inside a \
+             2-minute startup window, got {worst_case_all_four_stages:?}"
+        );
+        assert!(
+            DNSSEC_STAGE_TIMEOUT >= Duration::from_secs(5),
+            "the budget must still allow a real (non-hung) DNSSEC validation to complete"
         );
     }
 
