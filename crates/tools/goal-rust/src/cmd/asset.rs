@@ -378,9 +378,9 @@ fn run_create_inner(args: CreateArgs, wallet: Option<String>) -> Result<ExitCode
         total: args.total,
         decimals: args.decimals,
         default_frozen: args.default_frozen,
-        unit_name: args.unit_name.clone(),
-        asset_name: args.name.clone(),
-        url: args.asset_url.clone(),
+        unit_name: args.unit_name.clone().into_bytes(),
+        asset_name: args.name.clone().into_bytes(),
+        url: args.asset_url.clone().into_bytes(),
         metadata_hash,
         manager: opt_addr(&manager)?,
         reserve: opt_addr(&reserve)?,
@@ -588,9 +588,14 @@ fn run_config_inner(args: ConfigArgs, wallet: Option<String>) -> Result<ExitCode
         total: current.params.total,
         decimals: current.params.decimals as u32,
         default_frozen: current.params.default_frozen,
-        unit_name: current.params.unit_name.clone().unwrap_or_default(),
-        asset_name: current.params.name.clone().unwrap_or_default(),
-        url: current.params.url.clone().unwrap_or_default(),
+        unit_name: current
+            .params
+            .unit_name
+            .clone()
+            .unwrap_or_default()
+            .into_bytes(),
+        asset_name: current.params.name.clone().unwrap_or_default().into_bytes(),
+        url: current.params.url.clone().unwrap_or_default().into_bytes(),
         metadata_hash: current
             .params
             .metadata_hash

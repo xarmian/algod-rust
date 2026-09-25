@@ -144,9 +144,9 @@ fn fixtures() -> Vec<Fixture> {
                     AssetParams {
                         total: 1_000_000,
                         decimals: 6,
-                        unit_name: "TST".into(),
-                        asset_name: "Test Asset".into(),
-                        url: "https://x.io".into(),
+                        unit_name: b"TST".to_vec(),
+                        asset_name: b"Test Asset".to_vec(),
+                        url: b"https://x.io".to_vec(),
                         metadata_hash: Some(d32(0xAB)),
                         manager: Some(addr(0x33)),
                         reserve: Some(addr(0x44)),
@@ -269,9 +269,9 @@ fn standalone_asset_json_matches_go() {
     let params = AssetParams {
         total: 1_000_000,
         decimals: 6,
-        unit_name: "TST".into(),
-        asset_name: "Test Asset".into(),
-        url: "https://x.io".into(),
+        unit_name: b"TST".to_vec(),
+        asset_name: b"Test Asset".to_vec(),
+        url: b"https://x.io".to_vec(),
         metadata_hash: Some(d32(0xAB)),
         manager: Some(addr(0x33)),
         reserve: Some(addr(0x44)),
@@ -465,9 +465,9 @@ fn random_account_data(rng: &mut impl Rng) -> AccountData {
             AssetParams {
                 total: rng.gen_range(1..1_000_000_000u64),
                 decimals: rng.gen_range(0..19u32),
-                unit_name: format!("U{i}"),
-                asset_name: format!("Asset {i}"),
-                url: format!("https://example.com/{i}"),
+                unit_name: format!("U{i}").into_bytes(),
+                asset_name: format!("Asset {i}").into_bytes(),
+                url: format!("https://example.com/{i}").into_bytes(),
                 metadata_hash: if rng.gen_bool(0.5) {
                     Some(random_32(rng))
                 } else {

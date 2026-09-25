@@ -491,6 +491,26 @@ fn compare_opt_fixed_bytes_hex<const N: usize>(
     }
 }
 
+/// Compare raw byte-vector fields that go declares `string` but does not
+/// UTF-8-validate (issue #1608, e.g. `AssetParams.unit_name`/`asset_name`/
+/// `url`) -- hex-encoded for display since the bytes may not be valid
+/// UTF-8, mirroring [`compare_opt_fixed_bytes_hex`]'s approach for other
+/// non-textual byte fields.
+fn compare_raw_str_bytes_hex(
+    mismatches: &mut Vec<Mismatch>,
+    path: &str,
+    expected: &[u8],
+    actual: &[u8],
+) {
+    if expected != actual {
+        mismatches.push(Mismatch::FieldMismatch {
+            path: path.into(),
+            expected: hex::encode(expected),
+            actual: hex::encode(actual),
+        });
+    }
+}
+
 /// Compare optional Vec elements using a formatter function.
 /// First compares lengths, then compares each element via `fmt`.
 fn compare_opt_vec_elements<T>(
@@ -607,19 +627,24 @@ fn compare_txn_type_fields(
                         &ep.default_frozen,
                         &ap.default_frozen,
                     );
-                    compare_field(
+                    compare_raw_str_bytes_hex(
                         mismatches,
                         &format!("{prefix}.apar.unit_name"),
                         &ep.unit_name,
                         &ap.unit_name,
                     );
-                    compare_field(
+                    compare_raw_str_bytes_hex(
                         mismatches,
                         &format!("{prefix}.apar.asset_name"),
                         &ep.asset_name,
                         &ap.asset_name,
                     );
-                    compare_field(mismatches, &format!("{prefix}.apar.url"), &ep.url, &ap.url);
+                    compare_raw_str_bytes_hex(
+                        mismatches,
+                        &format!("{prefix}.apar.url"),
+                        &ep.url,
+                        &ap.url,
+                    );
                     compare_opt_fixed_bytes_hex(
                         mismatches,
                         &format!("{prefix}.apar.metadata_hash"),

@@ -911,15 +911,32 @@ pub struct AssetParamsRecord {
     /// Go codec tag: `"df"`.
     #[serde(rename = "df", default, skip_serializing_if = "is_false")]
     pub default_frozen: bool,
-    /// Go codec tag: `"un"`.
-    #[serde(rename = "un", default, skip_serializing_if = "String::is_empty")]
-    pub unit_name: String,
-    /// Go codec tag: `"an"`.
-    #[serde(rename = "an", default, skip_serializing_if = "String::is_empty")]
-    pub asset_name: String,
-    /// Go codec tag: `"au"`.
-    #[serde(rename = "au", default, skip_serializing_if = "String::is_empty")]
-    pub url: String,
+    /// Go codec tag: `"un"`. Raw bytes, not `String` -- go's `string`-typed
+    /// `UnitName` is not UTF-8-validated on the wire (issue #1608); see
+    /// `algo_types::serde_bytes_array::serde_raw_str`.
+    #[serde(
+        rename = "un",
+        default,
+        skip_serializing_if = "algo_types::serde_bytes_array::serde_raw_str::is_empty",
+        with = "algo_types::serde_bytes_array::serde_raw_str"
+    )]
+    pub unit_name: Vec<u8>,
+    /// Go codec tag: `"an"`. Raw bytes; see `unit_name` (issue #1608).
+    #[serde(
+        rename = "an",
+        default,
+        skip_serializing_if = "algo_types::serde_bytes_array::serde_raw_str::is_empty",
+        with = "algo_types::serde_bytes_array::serde_raw_str"
+    )]
+    pub asset_name: Vec<u8>,
+    /// Go codec tag: `"au"`. Raw bytes; see `unit_name` (issue #1608).
+    #[serde(
+        rename = "au",
+        default,
+        skip_serializing_if = "algo_types::serde_bytes_array::serde_raw_str::is_empty",
+        with = "algo_types::serde_bytes_array::serde_raw_str"
+    )]
+    pub url: Vec<u8>,
     /// Go codec tag: `"am"`.
     #[serde(rename = "am", default, skip_serializing_if = "Option::is_none")]
     pub metadata_hash: Option<[u8; 32]>,
@@ -1096,9 +1113,9 @@ mod issue_579_short_codec_tag_wire_format_tests {
             total: 1_000_000,
             decimals: 2,
             default_frozen: true,
-            unit_name: "UNIT".to_string(),
-            asset_name: "Asset".to_string(),
-            url: "https://example.com".to_string(),
+            unit_name: b"UNIT".to_vec(),
+            asset_name: b"Asset".to_vec(),
+            url: b"https://example.com".to_vec(),
             metadata_hash: Some([7u8; 32]),
             manager: Address([1u8; 32]),
             reserve: Address([2u8; 32]),

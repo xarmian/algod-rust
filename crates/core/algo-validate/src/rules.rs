@@ -2990,7 +2990,7 @@ mod tests {
         txn.txn_type = "axfer".into();
         txn.xaid = 1;
         txn.asset_params = Some(algo_types::AssetParams {
-            asset_name: "smuggled".to_string(),
+            asset_name: b"smuggled".to_vec(),
             ..Default::default()
         });
         let params = v42_params();
@@ -4446,7 +4446,7 @@ mod tests {
         let mut txn = make_acfg_txn();
         let params = v42_params();
         txn.asset_params = Some(algo_types::AssetParams {
-            asset_name: "x".repeat(params.max_asset_name_bytes + 1),
+            asset_name: "x".repeat(params.max_asset_name_bytes + 1).into_bytes(),
             ..Default::default()
         });
         let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
@@ -4476,9 +4476,9 @@ mod tests {
         let mut txn = make_acfg_txn();
         let params = v42_params();
         txn.asset_params = Some(algo_types::AssetParams {
-            asset_name: "x".repeat(params.max_asset_name_bytes),
-            unit_name: "u".repeat(params.max_asset_unit_name_bytes),
-            url: "h".repeat(params.max_asset_url_bytes),
+            asset_name: "x".repeat(params.max_asset_name_bytes).into_bytes(),
+            unit_name: "u".repeat(params.max_asset_unit_name_bytes).into_bytes(),
+            url: "h".repeat(params.max_asset_url_bytes).into_bytes(),
             decimals: params.max_asset_decimals,
             ..Default::default()
         });

@@ -1084,9 +1084,14 @@ pub struct ResourcesData {
     pub total: u64,
     pub decimals: u32,
     pub default_frozen: bool,
-    pub unit_name: String,
-    pub asset_name: String,
-    pub url: String,
+    /// Raw bytes, not `String` -- go's `string`-typed `UnitName` is not
+    /// UTF-8-validated on the wire (issue #1608). See
+    /// `algo_types::AssetParams::unit_name`'s doc comment.
+    pub unit_name: Vec<u8>,
+    /// Raw bytes; see [`ResourcesData::unit_name`] (issue #1608).
+    pub asset_name: Vec<u8>,
+    /// Raw bytes; see [`ResourcesData::unit_name`] (issue #1608).
+    pub url: Vec<u8>,
     pub metadata_hash: [u8; 32],
     pub manager: [u8; 32],
     pub reserve: [u8; 32],
@@ -1154,9 +1159,10 @@ pub fn canonical_encode_resources_data(d: &ResourcesData) -> Vec<u8> {
     m.add_u64("a", d.total);
     m.add_u64("b", d.decimals as u64);
     m.add_bool("c", d.default_frozen);
-    m.add_string("d", &d.unit_name);
-    m.add_string("e", &d.asset_name);
-    m.add_string("f", &d.url);
+    // Issue #1608: raw bytes, not `String` -- see `ResourcesData::unit_name`.
+    m.add_str_bytes("d", &d.unit_name);
+    m.add_str_bytes("e", &d.asset_name);
+    m.add_str_bytes("f", &d.url);
     m.add_bytes("g", &d.metadata_hash);
     m.add_bytes("h", &d.manager);
     m.add_bytes("i", &d.reserve);
@@ -1361,8 +1367,12 @@ pub fn canonical_encode_asset_params(apar: &AssetParams) -> Vec<u8> {
     let mut m = CanonicalMap::new();
 
     m.add_option_fixed_bytes("am", &apar.metadata_hash);
-    m.add_string("an", &apar.asset_name);
-    m.add_string("au", &apar.url);
+    // Issue #1608: unit_name/asset_name/url are raw bytes, not `String` --
+    // go's `string`-typed fields are not UTF-8-validated, so encode via
+    // `add_str_bytes` (msgpack "str" format, no validity requirement) rather
+    // than `add_string` (which requires a Rust `&str`).
+    m.add_str_bytes("an", &apar.asset_name);
+    m.add_str_bytes("au", &apar.url);
     m.add_option_address("c", &apar.clawback);
     m.add_u64("dc", apar.decimals as u64);
     m.add_bool("df", apar.default_frozen);
@@ -1370,7 +1380,7 @@ pub fn canonical_encode_asset_params(apar: &AssetParams) -> Vec<u8> {
     m.add_option_address("m", &apar.manager);
     m.add_option_address("r", &apar.reserve);
     m.add_u64("t", apar.total);
-    m.add_string("un", &apar.unit_name);
+    m.add_str_bytes("un", &apar.unit_name);
 
     m.encode()
 }
@@ -4035,9 +4045,9 @@ mod tests {
             total: rng.gen_range(1..=u64::MAX),
             decimals: rng.gen::<u32>(),
             default_frozen: rng.gen_bool(0.5),
-            unit_name: gen_alnum_string(rng, 0, 8),
-            asset_name: gen_alnum_string(rng, 0, 32),
-            url: gen_alnum_string(rng, 0, 32),
+            unit_name: gen_alnum_string(rng, 0, 8).into_bytes(),
+            asset_name: gen_alnum_string(rng, 0, 32).into_bytes(),
+            url: gen_alnum_string(rng, 0, 32).into_bytes(),
             metadata_hash: gen_option_fixed32_nonzero(rng, 0.5),
             manager: gen_option_address_nonzero(rng, 0.5),
             reserve: gen_option_address_nonzero(rng, 0.5),

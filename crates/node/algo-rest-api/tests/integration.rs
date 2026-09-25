@@ -3587,8 +3587,8 @@ async fn account_info_returns_populated_created_assets() {
         AssetParams {
             total: 1_000_000,
             decimals: 6,
-            asset_name: "TestCoin".to_string(),
-            unit_name: "TC".to_string(),
+            asset_name: b"TestCoin".to_vec(),
+            unit_name: b"TC".to_vec(),
             ..AssetParams::default()
         },
     );
@@ -4240,9 +4240,9 @@ async fn get_asset_returns_200_with_correct_json() {
             total: 1_000_000,
             decimals: 6,
             default_frozen: false,
-            asset_name: "TestCoin".to_string(),
-            unit_name: "TC".to_string(),
-            url: "https://example.com".to_string(),
+            asset_name: b"TestCoin".to_vec(),
+            unit_name: b"TC".to_vec(),
+            url: b"https://example.com".to_vec(),
             metadata_hash: None,
             manager: None,
             reserve: None,
@@ -4298,9 +4298,9 @@ async fn get_asset_matches_account_created_assets_entry() {
         total: 5_000_000,
         decimals: 2,
         default_frozen: false,
-        asset_name: "testname0".to_string(),
-        unit_name: "test0".to_string(),
-        url: "foo://bar".to_string(),
+        asset_name: b"testname0".to_vec(),
+        unit_name: b"test0".to_vec(),
+        url: b"foo://bar".to_vec(),
         metadata_hash: None,
         manager: Some(creator),
         reserve: Some(creator),
@@ -5822,8 +5822,8 @@ async fn account_asset_msgpack_uses_protocol_codec_tags() {
         }),
         asset_params: Some(AssetParams {
             total: 1_000_000,
-            unit_name: "TST".to_string(),
-            asset_name: "TestAsset".to_string(),
+            unit_name: b"TST".to_vec(),
+            asset_name: b"TestAsset".to_vec(),
             ..AssetParams::default()
         }),
         last_round: 1000,

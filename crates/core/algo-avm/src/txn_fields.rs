@@ -247,21 +247,21 @@ pub fn read_txn_field(
         37 => Ok(TealValue::Bytes(
             txn.asset_params
                 .as_ref()
-                .map(|p| p.unit_name.as_bytes().to_vec())
+                .map(|p| p.unit_name.clone())
                 .unwrap_or_default(),
         )),
         // ConfigAssetName
         38 => Ok(TealValue::Bytes(
             txn.asset_params
                 .as_ref()
-                .map(|p| p.asset_name.as_bytes().to_vec())
+                .map(|p| p.asset_name.clone())
                 .unwrap_or_default(),
         )),
         // ConfigAssetURL
         39 => Ok(TealValue::Bytes(
             txn.asset_params
                 .as_ref()
-                .map(|p| p.url.as_bytes().to_vec())
+                .map(|p| p.url.clone())
                 .unwrap_or_default(),
         )),
         // ConfigAssetMetadataHash

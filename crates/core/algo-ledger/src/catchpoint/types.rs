@@ -567,12 +567,13 @@ pub struct CatchpointResourcesData {
     pub decimals: u32,
     /// Default frozen. Codec: "c"
     pub default_frozen: bool,
-    /// Unit name. Codec: "d"
-    pub unit_name: String,
-    /// Asset name. Codec: "e"
-    pub asset_name: String,
-    /// URL. Codec: "f"
-    pub url: String,
+    /// Unit name. Codec: "d". Raw bytes, not `String` -- go's `string`-typed
+    /// `UnitName` is not UTF-8-validated on the wire (issue #1608).
+    pub unit_name: Vec<u8>,
+    /// Asset name. Codec: "e". Raw bytes; see `unit_name` (issue #1608).
+    pub asset_name: Vec<u8>,
+    /// URL. Codec: "f". Raw bytes; see `unit_name` (issue #1608).
+    pub url: Vec<u8>,
     /// Metadata hash (32 bytes). Codec: "g"
     pub metadata_hash: [u8; 32],
     /// Manager address (32 bytes). Codec: "h"
