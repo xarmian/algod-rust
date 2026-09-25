@@ -222,19 +222,59 @@ jobs:
         env:
           ALGOD_URL: ${{ steps.params.outputs.algod_url }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           echo "==> discovering the latest mainnet catchpoint from $ALGOD_URL"
-          LABEL="$(curl -sf "$ALGOD_URL/v2/status" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("last-catchpoint",""))')"
-          if [ -z "$LABEL" ]; then
-            echo "fatal: catchup peer reported no last-catchpoint" >&2
+
+          # A silent `curl | python3` pipeline under `set -e` gives no
+          # diagnostic at all when either side fails (found live, third
+          # dispatch attempt: the step died with no message right after
+          # this echo). Split into explicit stages, each with its own
+          # error output, so a repeat is actually debuggable from the log
+          # alone -- retry a few times first, since a public third-party
+          # endpoint returning a transient 429/5xx is not the same class
+          # of problem as it being genuinely unreachable.
+          PEER_STATUS=""
+          PEER_HTTP_CODE=""
+          for attempt in 1 2 3 4 5; do
+            PEER_HTTP_CODE="$(curl -s -o /tmp/peer-status.json -w '%{http_code}' "$ALGOD_URL/v2/status" || echo "000")"
+            if [ "$PEER_HTTP_CODE" = "200" ]; then
+              PEER_STATUS="$(cat /tmp/peer-status.json)"
+              break
+            fi
+            echo "==> attempt $attempt: catchup peer /v2/status returned HTTP $PEER_HTTP_CODE, retrying in 5s"
+            sleep 5
+          done
+          if [ "$PEER_HTTP_CODE" != "200" ]; then
+            echo "fatal: catchup peer never returned HTTP 200 for /v2/status (last: $PEER_HTTP_CODE)" >&2
+            echo "response body (if any):" >&2
+            cat /tmp/peer-status.json >&2 2>/dev/null || true
+            exit 1
+          fi
+
+          LABEL="$(printf '%s' "$PEER_STATUS" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("last-catchpoint",""))' 2>/tmp/label-parse-error.txt)"
+          PARSE_RC=$?
+          if [ "$PARSE_RC" -ne 0 ] || [ -z "$LABEL" ]; then
+            echo "fatal: could not extract last-catchpoint from the peer's /v2/status response" >&2
+            echo "parse error (if any):" >&2
+            cat /tmp/label-parse-error.txt >&2 2>/dev/null || true
+            echo "raw response:" >&2
+            printf '%s\n' "$PEER_STATUS" >&2
             exit 1
           fi
           echo "==> catchpoint label: $LABEL"
           echo "label=$LABEL" >> "$GITHUB_OUTPUT"
-          curl -sf -X POST -H "X-Algo-API-Token: $ALGOD_TOKEN" \
-            "http://127.0.0.1:8180/v2/catchup/$LABEL"
+
+          CATCHUP_HTTP_CODE="$(curl -s -o /tmp/catchup-response.json -w '%{http_code}' -X POST \
+            -H "X-Algo-API-Token: $ALGOD_TOKEN" \
+            "http://127.0.0.1:8180/v2/catchup/$LABEL" || echo "000")"
+          if [ "$CATCHUP_HTTP_CODE" != "200" ] && [ "$CATCHUP_HTTP_CODE" != "201" ]; then
+            echo "fatal: POST /v2/catchup/$LABEL on the node returned HTTP $CATCHUP_HTTP_CODE" >&2
+            cat /tmp/catchup-response.json >&2 2>/dev/null || true
+            exit 1
+          fi
+          cat /tmp/catchup-response.json
           echo ""
-          echo "==> fast catchup requested; the clock starts now"
+          echo "==> fast catchup requested (HTTP $CATCHUP_HTTP_CODE); the clock starts now"
 
       - name: Poll node + peer status and detect a halt
         id: monitor
