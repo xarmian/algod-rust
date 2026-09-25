@@ -64,6 +64,12 @@ struct AlgodSyncBackend {
     algod_url: String,
     /// Stored token for constructing parallel fetchers.
     algod_token: String,
+    /// The network preset name (e.g. "mainnet"), if recognized -- issue
+    /// #1604. `None` for a custom/unrecognized network, in which case
+    /// `discover_catchpoint` keeps its pre-#1604 behavior (peer
+    /// `/v2/status` only, no static-index fallback -- there is no such
+    /// index for a custom network).
+    network: Option<String>,
 }
 
 impl AlgodSyncBackend {
@@ -88,6 +94,7 @@ impl AlgodSyncBackend {
         extra_catchpoint_peer_urls: &[String],
         download_config: algo_rest_client::CatchpointDownloadConfig,
         ledger_download_retry_attempts: usize,
+        network: Option<&str>,
     ) -> Self {
         let client = AlgodClient::new(algod_url, algod_token);
         let mut peers = vec![(algod_url.to_string(), algod_token.to_string())];
@@ -105,6 +112,7 @@ impl AlgodSyncBackend {
             rt,
             algod_url: algod_url.to_string(),
             algod_token: algod_token.to_string(),
+            network: network.map(str::to_string),
         }
     }
 
@@ -156,6 +164,7 @@ impl AlgodSyncBackend {
         p2p_transport: Option<&Arc<P2pTransport>>,
         download_config: algo_rest_client::CatchpointDownloadConfig,
         ledger_download_retry_attempts: usize,
+        network: Option<&str>,
     ) -> Self {
         let backend = Self::with_catchpoint_peers(
             algod_url,
@@ -163,6 +172,7 @@ impl AlgodSyncBackend {
             extra_catchpoint_peer_urls,
             download_config,
             ledger_download_retry_attempts,
+            network,
         );
         if let Some(transport) = p2p_transport {
             let http_transport: Arc<dyn HttpPeerTransport> =
@@ -243,10 +253,10 @@ impl SyncBackend for AlgodSyncBackend {
 
     fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
         tokio::task::block_in_place(|| {
-            self.rt.block_on(async {
-                let status = self.client.get_status().await?;
-                Ok(status.last_catchpoint)
-            })
+            self.rt.block_on(discover_catchpoint_with_fallback(
+                &self.client,
+                self.network.as_deref(),
+            ))
         })
     }
 
@@ -303,6 +313,7 @@ pub(crate) fn build_algod_sync_backend(
     p2p_transport: Option<&Arc<P2pTransport>>,
     download_config: algo_rest_client::CatchpointDownloadConfig,
     ledger_download_retry_attempts: usize,
+    network: Option<&str>,
 ) -> impl SyncBackend {
     AlgodSyncBackend::with_catchpoint_peers_and_p2p(
         algod_url,
@@ -311,6 +322,7 @@ pub(crate) fn build_algod_sync_backend(
         p2p_transport,
         download_config,
         ledger_download_retry_attempts,
+        network,
     )
 }
 
@@ -483,6 +495,9 @@ pub struct GossipSyncBackend {
     policy: BlockSourcePolicy,
     /// Concurrency for batch fetches.
     concurrency: usize,
+    /// The network preset name -- see `AlgodSyncBackend`'s `network` field
+    /// doc comment (issue #1604).
+    network: Option<String>,
 }
 
 impl GossipSyncBackend {
@@ -500,7 +515,12 @@ impl GossipSyncBackend {
     ///   `MinCatchpointFileDownloadBytesPerSecond` (`config.Local`, issue
     ///   #1289), sourced from a loaded `config.json` by the caller rather
     ///   than left at [`algo_rest_client::CatchpointDownloadConfig::default`].
-    pub fn new(
+    /// * `network` — the network preset name (e.g. `"mainnet"`), if
+    ///   recognized (issue #1604), for [`Self::discover_catchpoint`]'s
+    ///   static-index fallback. `None` keeps the pre-#1604 REST-only
+    ///   discovery behavior.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_network(
         gossip: Arc<GossipBlockSource>,
         http_fetcher: HttpBlockFetcher,
         algod_url: &str,
@@ -508,6 +528,7 @@ impl GossipSyncBackend {
         policy: BlockSourcePolicy,
         concurrency: usize,
         download_config: algo_rest_client::CatchpointDownloadConfig,
+        network: Option<&str>,
     ) -> Self {
         let rest_client = AlgodClient::new(algod_url, algod_token);
         let downloader = CatchpointDownloader::with_config(algod_url, algod_token, download_config);
@@ -520,6 +541,7 @@ impl GossipSyncBackend {
             rt,
             policy,
             concurrency,
+            network: network.map(str::to_string),
         }
     }
 
@@ -644,10 +666,10 @@ impl SyncBackend for GossipSyncBackend {
     fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
         // Catchpoint discovery is always via REST.
         tokio::task::block_in_place(|| {
-            self.rt.block_on(async {
-                let status = self.rest_client.get_status().await?;
-                Ok(status.last_catchpoint)
-            })
+            self.rt.block_on(discover_catchpoint_with_fallback(
+                &self.rest_client,
+                self.network.as_deref(),
+            ))
         })
     }
 
@@ -842,6 +864,7 @@ fn build_catchpoint_backend(
                 catchpoint_peer_urls,
                 download_config,
                 ledger_download_retry_attempts,
+                network_name_for_genesis_id(genesis_id),
             ),
         ));
     }
@@ -881,7 +904,7 @@ fn build_catchpoint_backend(
             |e| anyhow::anyhow!("failed to build HTTP block fetcher for gossip sync: {e}"),
         )?;
 
-    Ok(CatchpointBackend::Gossip(GossipSyncBackend::new(
+    Ok(CatchpointBackend::Gossip(GossipSyncBackend::with_network(
         gossip_source,
         http_fetcher,
         algod_url,
@@ -889,6 +912,7 @@ fn build_catchpoint_backend(
         policy,
         concurrency,
         download_config,
+        network_name_for_genesis_id(genesis_id),
     )))
 }
 
@@ -901,8 +925,119 @@ fn genesis_id_for_network(network: &str) -> Option<&'static str> {
     match network {
         "mainnet" => Some("mainnet-v1.0"),
         "testnet" => Some("testnet-v1.0"),
+        "betanet" => Some("betanet-v1.0"),
         _ => None,
     }
+}
+
+/// The reverse of [`genesis_id_for_network`] -- the network preset name a
+/// resolved `genesis_id` corresponds to, or `None` for a custom genesis_id
+/// with no known preset. Issue #1604: needed so
+/// [`AlgodSyncBackend::discover_catchpoint`] knows which
+/// `algorand-catchpoints.s3` channel to fall back to, at call sites that
+/// only have `genesis_id` in hand (not the original `--network` string).
+pub(crate) fn network_name_for_genesis_id(genesis_id: &str) -> Option<&'static str> {
+    for network in ["mainnet", "testnet", "betanet"] {
+        if genesis_id_for_network(network) == Some(genesis_id) {
+            return Some(match network {
+                "mainnet" => "mainnet",
+                "testnet" => "testnet",
+                "betanet" => "betanet",
+                _ => unreachable!(),
+            });
+        }
+    }
+    None
+}
+
+/// go-algorand's own static, Algorand-maintained catchpoint index
+/// (`cmd/goal/node.go`'s `catchpointURL` template: `"https://algorand-
+/// catchpoints.s3.us-east-2.amazonaws.com/channel/%s/latest.catchpoint"`)
+/// -- what `goal node catchup NETWORK` (no explicit label) actually
+/// fetches when auto-discovering. Issue #1604: `discover_catchpoint`'s
+/// pre-existing behavior (reading `last-catchpoint` off `--algod-url`'s
+/// own `/v2/status`) assumes that peer runs local catchpoint generation,
+/// which a pure REST gateway (e.g. this repo's own documented mainnet
+/// preset) does not -- confirmed live against
+/// `https://mainnet-api.4160.nodely.dev`, whose `/v2/status` is healthy
+/// but always reports an empty `last-catchpoint`.
+fn static_catchpoint_index_url(network: &str) -> String {
+    format!("https://algorand-catchpoints.s3.us-east-2.amazonaws.com/channel/{network}/latest.catchpoint")
+}
+
+/// Validate (and trim) a catchpoint label fetched from the static index --
+/// `<round>#<base32-no-pad, 32-byte hash>`, matching
+/// `crates/node/algo-rest-api/src/handlers.rs`'s `parse_catchpoint` (the
+/// same format the REST `/v2/catchup/{catchpoint}` endpoint itself
+/// validates), so a malformed or unexpected response body is caught here
+/// rather than surfacing as a confusing failure deeper in the sync
+/// orchestrator.
+fn validate_catchpoint_label(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let (round_str, hash_str) = trimmed.split_once('#')?;
+    if round_str.is_empty() || !round_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let hash_bytes = data_encoding::BASE32_NOPAD
+        .decode(hash_str.as_bytes())
+        .ok()?;
+    if hash_bytes.len() != 32 {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Shared implementation of catchpoint auto-discovery (issue #1604), used
+/// by both [`AlgodSyncBackend::discover_catchpoint`] and
+/// [`GossipSyncBackend::discover_catchpoint`]: prefer the peer's own
+/// `/v2/status.last-catchpoint` (unchanged pre-#1604 behavior -- some
+/// archival peers genuinely do run local catchpoint generation and this
+/// is the more direct, single-round-trip source when they do), and fall
+/// back to go's real `goal node catchup NETWORK` mechanism (the
+/// Algorand-maintained static index) only when that's empty and the
+/// network is a recognized preset. A fetch/parse failure on the fallback
+/// is a real, surfaced error (`AlgoError::Network`) -- not silently
+/// treated the same as "no catchpoint available anywhere", which would
+/// hide a genuine connectivity/service problem behind a confusing
+/// "nothing to auto-discover" message.
+async fn discover_catchpoint_with_fallback(
+    client: &AlgodClient,
+    network: Option<&str>,
+) -> Result<Option<String>, AlgoError> {
+    let status = client.get_status().await?;
+    if let Some(label) = status.last_catchpoint {
+        if !label.is_empty() {
+            return Ok(Some(label));
+        }
+    }
+    let Some(network) = network else {
+        return Ok(None);
+    };
+    fetch_static_catchpoint_label(&static_catchpoint_index_url(network)).await
+}
+
+/// Fetch and validate a catchpoint label from a static-index URL (the tail
+/// of [`discover_catchpoint_with_fallback`]'s fallback path, split out so it
+/// can be tested directly against a mock server without redirecting
+/// [`static_catchpoint_index_url`]'s hardcoded real Algorand-maintained
+/// endpoint).
+async fn fetch_static_catchpoint_label(url: &str) -> Result<Option<String>, AlgoError> {
+    let response = reqwest::get(url).await.map_err(|e| AlgoError::Network {
+        message: format!("fetching catchpoint index {url}: {e}"),
+    })?;
+    if !response.status().is_success() {
+        return Err(AlgoError::Network {
+            message: format!("catchpoint index {url} returned HTTP {}", response.status()),
+        });
+    }
+    let body = response.text().await.map_err(|e| AlgoError::Network {
+        message: format!("reading catchpoint index {url} response: {e}"),
+    })?;
+    validate_catchpoint_label(&body)
+        .map(Some)
+        .ok_or_else(|| AlgoError::Network {
+            message: format!("catchpoint index {url} returned an unparseable label: {body:?}"),
+        })
 }
 
 /// Resolve genesis_id and genesis_hash by fetching block info from the node.
@@ -1314,7 +1449,7 @@ mod tests {
         let gossip = Arc::new(GossipBlockSource::new(vec![]));
         let http = HttpBlockFetcher::new("http://localhost:4001", "test-v1.0").unwrap();
 
-        let backend = GossipSyncBackend::new(
+        let backend = GossipSyncBackend::with_network(
             gossip,
             http,
             "http://localhost:4001",
@@ -1322,6 +1457,7 @@ mod tests {
             BlockSourcePolicy::GossipFirst,
             4,
             algo_rest_client::CatchpointDownloadConfig::default(),
+            None,
         );
 
         assert!(!backend.is_noop());
@@ -1333,7 +1469,7 @@ mod tests {
         let gossip = Arc::new(GossipBlockSource::new(vec![]));
         let http = HttpBlockFetcher::new("http://localhost:4001", "test-v1.0").unwrap();
 
-        let backend = GossipSyncBackend::new(
+        let backend = GossipSyncBackend::with_network(
             gossip,
             http,
             "http://localhost:4001",
@@ -1341,6 +1477,7 @@ mod tests {
             BlockSourcePolicy::GossipFirst,
             4,
             algo_rest_client::CatchpointDownloadConfig::default(),
+            None,
         );
 
         let result = backend.fetch_blocks_batch(10, 5, 4);
@@ -1356,7 +1493,7 @@ mod tests {
         let gossip = Arc::new(GossipBlockSource::new(vec![]));
         let http = HttpBlockFetcher::new("http://localhost:19999", "test-v1.0").unwrap();
 
-        let backend = GossipSyncBackend::new(
+        let backend = GossipSyncBackend::with_network(
             gossip,
             http,
             "http://localhost:19999",
@@ -1364,6 +1501,7 @@ mod tests {
             BlockSourcePolicy::GossipFirst,
             4,
             algo_rest_client::CatchpointDownloadConfig::default(),
+            None,
         );
 
         let result = backend.fetch_block(1);
@@ -1376,7 +1514,7 @@ mod tests {
         let gossip = Arc::new(GossipBlockSource::new(vec![]));
         let http = HttpBlockFetcher::new("http://localhost:19999", "test-v1.0").unwrap();
 
-        let backend = GossipSyncBackend::new(
+        let backend = GossipSyncBackend::with_network(
             gossip,
             http,
             "http://localhost:19999",
@@ -1384,6 +1522,7 @@ mod tests {
             BlockSourcePolicy::HttpOnly,
             4,
             algo_rest_client::CatchpointDownloadConfig::default(),
+            None,
         );
 
         let result = backend.fetch_block(1);
@@ -1396,7 +1535,7 @@ mod tests {
         let gossip = Arc::new(GossipBlockSource::new(vec![]));
         let http = HttpBlockFetcher::new("http://localhost:19999", "test-v1.0").unwrap();
 
-        let backend = GossipSyncBackend::new(
+        let backend = GossipSyncBackend::with_network(
             gossip,
             http,
             "http://localhost:19999",
@@ -1404,6 +1543,7 @@ mod tests {
             BlockSourcePolicy::GossipOnly,
             4,
             algo_rest_client::CatchpointDownloadConfig::default(),
+            None,
         );
 
         let result = backend.fetch_block(1);
@@ -1419,7 +1559,7 @@ mod tests {
         let gossip = Arc::new(GossipBlockSource::new(vec![]));
         let http = HttpBlockFetcher::new("http://localhost:19999", "test-v1.0").unwrap();
 
-        let backend = GossipSyncBackend::new(
+        let backend = GossipSyncBackend::with_network(
             gossip,
             http,
             "http://localhost:19999",
@@ -1427,6 +1567,7 @@ mod tests {
             BlockSourcePolicy::GossipFirst,
             4,
             algo_rest_client::CatchpointDownloadConfig::default(),
+            None,
         );
 
         let err = backend.fetch_block(42).unwrap_err();
@@ -1445,7 +1586,7 @@ mod tests {
         let gossip = Arc::new(GossipBlockSource::new(vec![]));
         let http = HttpBlockFetcher::new("http://localhost:19999", "test-v1.0").unwrap();
 
-        let backend = GossipSyncBackend::new(
+        let backend = GossipSyncBackend::with_network(
             gossip,
             http,
             "http://localhost:19999",
@@ -1453,6 +1594,7 @@ mod tests {
             BlockSourcePolicy::HttpOnly,
             4,
             algo_rest_client::CatchpointDownloadConfig::default(),
+            None,
         );
 
         let result = backend.fetch_block_raw(1);
@@ -1741,6 +1883,7 @@ mod tests {
             None,
             algo_rest_client::CatchpointDownloadConfig::default(),
             algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
+            None,
         );
         assert_eq!(backend_no_p2p.catchpoint_source.peer_count(), 1);
 
@@ -1753,6 +1896,7 @@ mod tests {
             Some(&dialer),
             algo_rest_client::CatchpointDownloadConfig::default(),
             algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
+            None,
         );
         assert_eq!(
             backend_with_p2p.catchpoint_source.peer_count(),
@@ -1765,5 +1909,207 @@ mod tests {
         // (not built here, but the code path `None` exercises above) stays
         // completely unaffected by anything `dialer`'s connection did.
         assert_eq!(listener.connected_peer_count(), 1);
+    }
+
+    // -- Issue #1604: --catchpoint-auto discovery static-index fallback ----
+
+    #[test]
+    fn network_name_for_genesis_id_recognizes_known_presets() {
+        assert_eq!(network_name_for_genesis_id("mainnet-v1.0"), Some("mainnet"));
+        assert_eq!(network_name_for_genesis_id("testnet-v1.0"), Some("testnet"));
+        assert_eq!(network_name_for_genesis_id("betanet-v1.0"), Some("betanet"));
+    }
+
+    #[test]
+    fn network_name_for_genesis_id_returns_none_for_unrecognized_genesis_id() {
+        assert_eq!(network_name_for_genesis_id("my-custom-network-v1"), None);
+        assert_eq!(network_name_for_genesis_id(""), None);
+    }
+
+    #[test]
+    fn static_catchpoint_index_url_matches_go_algorand_template() {
+        // `cmd/goal/node.go`'s `catchpointURL` template.
+        assert_eq!(
+            static_catchpoint_index_url("mainnet"),
+            "https://algorand-catchpoints.s3.us-east-2.amazonaws.com/channel/mainnet/latest.catchpoint"
+        );
+        assert_eq!(
+            static_catchpoint_index_url("testnet"),
+            "https://algorand-catchpoints.s3.us-east-2.amazonaws.com/channel/testnet/latest.catchpoint"
+        );
+        assert_eq!(
+            static_catchpoint_index_url("betanet"),
+            "https://algorand-catchpoints.s3.us-east-2.amazonaws.com/channel/betanet/latest.catchpoint"
+        );
+    }
+
+    #[test]
+    fn validate_catchpoint_label_accepts_well_formed_label() {
+        // 32-byte hash, base32-no-pad encoded (52 chars).
+        let hash = data_encoding::BASE32_NOPAD.encode(&[7u8; 32]);
+        let label = format!("12345#{hash}");
+        assert_eq!(validate_catchpoint_label(&label), Some(label.clone()));
+        // Trims surrounding whitespace (a trailing newline from an S3 object body).
+        assert_eq!(
+            validate_catchpoint_label(&format!("{label}\n")),
+            Some(label)
+        );
+    }
+
+    #[test]
+    fn validate_catchpoint_label_rejects_malformed_input() {
+        let hash = data_encoding::BASE32_NOPAD.encode(&[7u8; 32]);
+        // No '#' delimiter.
+        assert_eq!(validate_catchpoint_label(&hash), None);
+        // Non-numeric round.
+        assert_eq!(validate_catchpoint_label(&format!("abc#{hash}")), None);
+        // Empty round.
+        assert_eq!(validate_catchpoint_label(&format!("#{hash}")), None);
+        // Hash isn't valid base32.
+        assert_eq!(validate_catchpoint_label("12345#not-valid-base32!!!"), None);
+        // Hash decodes to the wrong length.
+        let short_hash = data_encoding::BASE32_NOPAD.encode(&[7u8; 16]);
+        assert_eq!(
+            validate_catchpoint_label(&format!("12345#{short_hash}")),
+            None
+        );
+        // Empty body (e.g. an S3 404 rendered as an empty response).
+        assert_eq!(validate_catchpoint_label(""), None);
+    }
+
+    /// Builds an [`AlgodClient`] pointed at `server`, matching the pattern
+    /// `crates/node/algo-rest-client/tests/participation.rs` uses -- zero
+    /// retries so a deliberate error-status test doesn't spend real wall
+    /// time retrying against the mock server.
+    fn algod_client_for(server: &wiremock::MockServer) -> AlgodClient {
+        let cfg = algo_rest_client::ClientConfig {
+            timeout: std::time::Duration::from_secs(5),
+            long_poll_timeout: std::time::Duration::from_secs(5),
+            max_retries: 0,
+            initial_backoff: std::time::Duration::from_millis(1),
+        };
+        AlgodClient::with_config(server.uri(), "test-token", cfg)
+    }
+
+    #[tokio::test]
+    async fn discover_catchpoint_with_fallback_prefers_peers_own_status() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let hash = data_encoding::BASE32_NOPAD.encode(&[1u8; 32]);
+        let peer_label = format!("999#{hash}");
+        Mock::given(method("GET"))
+            .and(path("/v2/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "last-round": 999,
+                "last-catchpoint": peer_label,
+            })))
+            .mount(&server)
+            .await;
+        let client = algod_client_for(&server);
+
+        // A known network preset is passed, but since the peer's own
+        // status already has a non-empty label, the static-index fallback
+        // must never be consulted (there's no mock registered for it, so
+        // a real attempt would fail this test with an unexpected-request
+        // panic in strict wiremock configurations, or a real network call
+        // in a loose one -- either way, this test only passes if the
+        // fallback path is correctly skipped).
+        let result = discover_catchpoint_with_fallback(&client, Some("mainnet"))
+            .await
+            .expect("peer status lookup should succeed");
+        assert_eq!(result, Some(peer_label));
+    }
+
+    #[tokio::test]
+    async fn discover_catchpoint_with_fallback_returns_none_without_a_network_preset() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "last-round": 100,
+                "last-catchpoint": "",
+            })))
+            .mount(&server)
+            .await;
+        let client = algod_client_for(&server);
+
+        // Peer's own status has no catchpoint, and no network preset was
+        // given (custom/unrecognized network) -- there is no static index
+        // to fall back to, so this must return `Ok(None)`, not an error.
+        let result = discover_catchpoint_with_fallback(&client, None)
+            .await
+            .expect("should succeed with no catchpoint found");
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn fetch_static_catchpoint_label_returns_label_on_success() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let hash = data_encoding::BASE32_NOPAD.encode(&[2u8; 32]);
+        let label = format!("55000#{hash}");
+        Mock::given(method("GET"))
+            .and(path("/channel/mainnet/latest.catchpoint"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(&label))
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/channel/mainnet/latest.catchpoint", server.uri());
+        let result = fetch_static_catchpoint_label(&url)
+            .await
+            .expect("fetch should succeed");
+        assert_eq!(result, Some(label));
+    }
+
+    /// Pins issue #1604's acceptance criteria: a genuine static-index
+    /// fetch/parse failure must surface as a real `AlgoError::Network`, not
+    /// be silently swallowed into `Ok(None)` (which would look
+    /// indistinguishable from "no catchpoint available anywhere" and hide
+    /// an actual connectivity/service problem).
+    #[tokio::test]
+    async fn fetch_static_catchpoint_label_errors_on_http_failure() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/channel/mainnet/latest.catchpoint"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/channel/mainnet/latest.catchpoint", server.uri());
+        let err = fetch_static_catchpoint_label(&url)
+            .await
+            .expect_err("a 404 must be a hard error, not a silent Ok(None)");
+        assert!(matches!(err, AlgoError::Network { .. }));
+    }
+
+    #[tokio::test]
+    async fn fetch_static_catchpoint_label_errors_on_unparseable_body() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/channel/mainnet/latest.catchpoint"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("not a valid catchpoint label"),
+            )
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/channel/mainnet/latest.catchpoint", server.uri());
+        let err = fetch_static_catchpoint_label(&url)
+            .await
+            .expect_err("an unparseable body must be a hard error, not a silent Ok(None)");
+        assert!(matches!(err, AlgoError::Network { .. }));
     }
 }

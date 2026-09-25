@@ -506,6 +506,7 @@ impl CatchupRunner for OrchestratorCatchupRunner {
             // this is still real, bounded behavior rather than a no-op.
             algo_rest_client::CatchpointDownloadConfig::default(),
             algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
+            crate::commands::catchpoint_sync::network_name_for_genesis_id(&self.params.genesis_id),
         );
 
         let config = SyncConfig {
