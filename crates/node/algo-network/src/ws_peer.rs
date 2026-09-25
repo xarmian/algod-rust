@@ -103,8 +103,43 @@ use crate::NetworkError;
 const SEND_BUFFER_LENGTH: usize = 2500;
 
 /// Maximum number of messages from a single peer that can be queued in the
-/// incoming read buffer at a time (matches `msgsInReadBufferPerPeer` in Go).
-const MSGS_IN_READ_BUFFER_PER_PEER: usize = 10;
+/// per-peer incoming read buffer at a time before `read_loop` starts
+/// silently dropping (`try_send`) rather than blocking.
+///
+/// This constant used to be `10`, copied directly from Go's
+/// `msgsInReadBufferPerPeer` (`network/wsPeer.go`). That copy conflated two
+/// different things: in Go, `msgsInReadBufferPerPeer` is *not* a buffer
+/// capacity at all — it is a per-peer *fairness* limit (via a semaphore,
+/// `wp.processed`) on how many of that peer's messages may sit
+/// **unprocessed** in `wsNetwork`'s single **shared, global** `readBuffer`
+/// channel at once, so one noisy peer can't starve the others. That shared
+/// buffer's real capacity is
+/// `min(max(IncomingConnectionsLimit+GossipFanout, 100), 10000)`
+/// (`network/wsNetwork.go`'s `readBufferLen`, ~2400+ at this project's
+/// default config), and it is drained by a pool of 20 concurrent
+/// `messageHandlerThread` goroutines (`incomingThreads`,
+/// `network/wsNetwork.go`). Crucially, Go's `select` on that channel never
+/// drops a protocol message for capacity reasons — it blocks the one
+/// offending peer's `readLoop` (real TCP backpressure to the sender), not
+/// the message.
+///
+/// This crate's architecture is per-peer (`ws_network.rs`'s `add_peer`
+/// spawns one `recv_task` per peer, serially draining *this* channel and
+/// re-dispatching through the real multiplexer — see that function's doc
+/// comment), so a literal copy of Go's `10` as a *capacity* left every
+/// real peer connection (every peer built through `WsPeerConfig::default()`
+/// takes `read_loop`'s "no multiplexer" fallback into this very channel)
+/// able to buffer only 10 in-flight messages of *any* tag, including
+/// agreement votes (`tag=AV`), before permanently discarding the rest —
+/// see issue #1616, where a burst of real mainnet relay traffic overflowed
+/// this buffer within a ~3-second window on several peers at once and
+/// silently dropped agreement traffic, unlike Go which never drops here.
+/// Sized in the same order of magnitude as [`SEND_BUFFER_LENGTH`] (Go's
+/// shared buffer is comparable in scale to its own outgoing buffer sizing)
+/// to give real bursts realistic headroom while keeping `try_send`'s
+/// non-blocking property (blocking here would stall keepalive/ping
+/// processing — see the `read_loop` comment at the `try_send` call site).
+const MSGS_IN_READ_BUFFER_PER_PEER: usize = 2000;
 
 /// Maximum time a message can sit in the send queue before being considered
 /// stale and causing the connection to be torn down.
@@ -4530,7 +4565,48 @@ mod tests {
         assert_eq!(CONNECTIVITY_CHECK_INTERVAL, Duration::from_secs(180));
         assert_eq!(PING_LENGTH, 8);
         assert_eq!(SEND_BUFFER_LENGTH, 2500);
-        assert_eq!(MSGS_IN_READ_BUFFER_PER_PEER, 10);
+        // Issue #1616: this used to be `10`, a literal (and semantically
+        // mismatched — see the constant's doc comment) copy of Go's
+        // `msgsInReadBufferPerPeer` fairness limit, which silently dropped
+        // real mainnet agreement-vote traffic under burst load. Pin the
+        // exact fixed value (not just a floor) so a future change to it is
+        // a deliberate, reviewed edit rather than a silent regression back
+        // toward the too-small pre-#1616 capacity.
+        assert_eq!(MSGS_IN_READ_BUFFER_PER_PEER, 2000);
+    }
+
+    /// Issue #1616: a burst of unpaced messages that would have overflowed
+    /// the old 10-slot per-peer incoming buffer (and been silently dropped
+    /// by `read_loop`'s `try_send`/backpressure path) must now fit inside
+    /// [`MSGS_IN_READ_BUFFER_PER_PEER`] without any `TrySendError::Full`.
+    /// This mirrors the real production channel construction at
+    /// `WsPeerHandle::new`/`PeerHandle::from_split` (`mpsc::channel(
+    /// MSGS_IN_READ_BUFFER_PER_PEER)`), just driven directly rather than
+    /// through the full WebSocket handshake harness.
+    #[test]
+    fn incoming_buffer_absorbs_realistic_mainnet_burst_without_dropping() {
+        let (tx, mut rx) = mpsc::channel::<IncomingMessage>(MSGS_IN_READ_BUFFER_PER_PEER);
+
+        // A burst representative of the dozens-of-messages-in-~3-seconds
+        // pattern observed in issue #1616's log excerpt, scaled up to
+        // confirm real headroom rather than just clearing a low bar.
+        const BURST_SIZE: usize = 200;
+        for i in 0..BURST_SIZE {
+            let msg = IncomingMessage::new(
+                Tag::AgreementVote,
+                vec![0u8; 8],
+                "peer:1234".to_string(),
+                i as i64,
+            );
+            tx.try_send(msg)
+                .expect("burst within MSGS_IN_READ_BUFFER_PER_PEER must not be dropped");
+        }
+
+        // All BURST_SIZE messages are still there to be drained — nothing
+        // was silently discarded.
+        for _ in 0..BURST_SIZE {
+            assert!(rx.try_recv().is_ok());
+        }
     }
 
     // -----------------------------------------------------------------------
