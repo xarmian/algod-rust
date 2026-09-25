@@ -925,6 +925,7 @@ fn genesis_id_for_network(network: &str) -> Option<&'static str> {
     match network {
         "mainnet" => Some("mainnet-v1.0"),
         "testnet" => Some("testnet-v1.0"),
+        "betanet" => Some("betanet-v1.0"),
         _ => None,
     }
 }
@@ -936,11 +937,12 @@ fn genesis_id_for_network(network: &str) -> Option<&'static str> {
 /// `algorand-catchpoints.s3` channel to fall back to, at call sites that
 /// only have `genesis_id` in hand (not the original `--network` string).
 pub(crate) fn network_name_for_genesis_id(genesis_id: &str) -> Option<&'static str> {
-    for network in ["mainnet", "testnet"] {
+    for network in ["mainnet", "testnet", "betanet"] {
         if genesis_id_for_network(network) == Some(genesis_id) {
             return Some(match network {
                 "mainnet" => "mainnet",
                 "testnet" => "testnet",
+                "betanet" => "betanet",
                 _ => unreachable!(),
             });
         }
@@ -1915,6 +1917,7 @@ mod tests {
     fn network_name_for_genesis_id_recognizes_known_presets() {
         assert_eq!(network_name_for_genesis_id("mainnet-v1.0"), Some("mainnet"));
         assert_eq!(network_name_for_genesis_id("testnet-v1.0"), Some("testnet"));
+        assert_eq!(network_name_for_genesis_id("betanet-v1.0"), Some("betanet"));
     }
 
     #[test]
@@ -1933,6 +1936,10 @@ mod tests {
         assert_eq!(
             static_catchpoint_index_url("testnet"),
             "https://algorand-catchpoints.s3.us-east-2.amazonaws.com/channel/testnet/latest.catchpoint"
+        );
+        assert_eq!(
+            static_catchpoint_index_url("betanet"),
+            "https://algorand-catchpoints.s3.us-east-2.amazonaws.com/channel/betanet/latest.catchpoint"
         );
     }
 
