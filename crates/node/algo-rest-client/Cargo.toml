@@ -29,4 +29,4 @@ algo-build-info.workspace = true
 [dev-dependencies]
 base64 = { workspace = true }
 wiremock = "0.6"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
