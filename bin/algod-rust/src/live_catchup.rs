@@ -123,6 +123,27 @@ pub trait NormalSyncControl: Send + Sync {
 
     /// Resume the normal sync loop. A no-op if it's already running.
     async fn resume(&self);
+
+    /// Reload any ledger handle this control owns from disk, after a live
+    /// catchpoint catchup has finished importing (issue #1616).
+    ///
+    /// A live catchup writes through its own, separate database connection
+    /// (see [`OrchestratorCatchupRunner::run`]'s `SyncOrchestrator`) --
+    /// entirely independent of whatever long-lived `SqliteLedger` handle
+    /// this control's `resume()` reads from. That handle's in-memory
+    /// caches (current round, rewards state, account/trie/lease caches)
+    /// are populated once at open time and never automatically notice a
+    /// different connection's writes, so without an explicit reload here
+    /// `resume()` would rebuild the normal sync loop against pre-catchup
+    /// state forever -- the node made no further progress despite the
+    /// ledger file on disk actually sitting at the new round (the
+    /// round-65379680 mainnet soak halt).
+    ///
+    /// Called by [`LiveCatchupManager::drive`] after a successful run and
+    /// before [`Self::resume`]. Default no-op for controls with nothing to
+    /// reload (e.g. [`NoopSyncControl`], or test fakes with no real
+    /// ledger).
+    async fn reload_ledger(&self) {}
 }
 
 /// Resets a follower node's sync round when a live catchpoint catchup
@@ -376,6 +397,14 @@ impl LiveCatchupManager {
                 if let Ok(mut last) = self.last_catchpoint.lock() {
                     *last = catchpoint.clone();
                 }
+                // Issue #1616: the catchup wrote through its own DB
+                // connection, so the normal sync loop's ledger handle must
+                // be explicitly reloaded before `resume()` rebuilds
+                // anything against it -- see `NormalSyncControl::
+                // reload_ledger`'s doc comment for why this can't be
+                // skipped even though both connections point at the same
+                // on-disk file.
+                self.control.reload_ledger().await;
             }
             Err(e) => {
                 warn!(catchpoint = %catchpoint, error = %e, "live catchpoint catchup failed");
@@ -572,13 +601,20 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
-    /// A [`NormalSyncControl`] fake that counts pause/resume calls and
-    /// tracks whether it's currently "paused", so tests can assert the
-    /// manager pauses before starting and resumes after finishing.
+    /// A [`NormalSyncControl`] fake that counts pause/resume/reload calls
+    /// and tracks whether it's currently "paused", so tests can assert the
+    /// manager pauses before starting and resumes after finishing, and
+    /// (issue #1616) reloads the ledger exactly when a run actually
+    /// completed successfully.
     #[derive(Default)]
     struct CountingControl {
         pauses: AtomicU32,
         resumes: AtomicU32,
+        reloads: AtomicU32,
+        /// Records the reload/resume call order (`"reload"`/`"resume"`)
+        /// so a test can assert `reload_ledger` runs strictly before
+        /// `resume`, not merely "also gets called somewhere".
+        order: StdMutex<Vec<&'static str>>,
     }
 
     #[async_trait]
@@ -588,6 +624,15 @@ mod tests {
         }
         async fn resume(&self) {
             self.resumes.fetch_add(1, Ordering::SeqCst);
+            if let Ok(mut order) = self.order.lock() {
+                order.push("resume");
+            }
+        }
+        async fn reload_ledger(&self) {
+            self.reloads.fetch_add(1, Ordering::SeqCst);
+            if let Ok(mut order) = self.order.lock() {
+                order.push("reload");
+            }
         }
     }
 
@@ -688,6 +733,33 @@ mod tests {
         );
     }
 
+    /// Pins issue #1616's fix: a successful live catchup must reload the
+    /// ledger from disk before resuming normal operation, or every
+    /// subsystem sharing that ledger handle (agreement, pool,
+    /// pool-block-follower) keeps operating against pre-catchup state
+    /// forever, even though the ledger file on disk is already at the new
+    /// round -- the round-65379680 mainnet soak halt. `reload_ledger` must
+    /// fire exactly once, strictly before `resume`.
+    #[tokio::test]
+    async fn start_catchup_reloads_ledger_before_resuming_on_success() {
+        let control = Arc::new(CountingControl::default());
+        let manager = LiveCatchupManager::new(ImmediateRunner::ok(), control.clone());
+
+        let result = manager
+            .start_catchup("1000#abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnop")
+            .await;
+        assert_eq!(result, CatchupStartResult::Created);
+
+        wait_idle(&manager).await;
+
+        assert_eq!(control.reloads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            control.order.lock().unwrap().as_slice(),
+            &["reload", "resume"],
+            "reload_ledger must run before resume, not merely also get called"
+        );
+    }
+
     #[tokio::test]
     async fn start_catchup_resumes_control_even_on_runner_error() {
         // Mirrors go's `abort()` still calling `updateNodeCatchupMode(false)`
@@ -706,6 +778,10 @@ mod tests {
         // A failed run must not be recorded as the last *completed*
         // catchpoint.
         assert_eq!(manager.last_catchpoint(), "");
+        // A failed run has nothing new on disk to reload -- reload_ledger
+        // must not fire (mirrors go never calling the equivalent of a
+        // ledger reopen for an aborted/failed catchup).
+        assert_eq!(control.reloads.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
