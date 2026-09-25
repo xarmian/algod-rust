@@ -2947,10 +2947,55 @@ fn run_pool_block_follower<S: CommittedBlockSource>(
         while last_seen < latest {
             let round = last_seen + 1;
             let Some(block) = ledger.get_block(round) else {
-                // Not readable yet (or a transient error) — stop draining
-                // this tick; we'll retry `round` on the next wakeup instead
-                // of silently skipping it.
-                break;
+                // `round` isn't readable. Two distinct situations produce
+                // this: (a) `round` just hasn't been flushed to disk yet
+                // (transient — normal steady-state follow, `round` is at or
+                // just behind `latest`), or (b) `round`'s history was never
+                // written at all because a live catchpoint catchup (issue
+                // #1616) jumped the ledger straight from `last_seen` to a
+                // much higher `latest` without ever committing the
+                // intermediate blocks — a `SqliteLedger` only keeps recent
+                // history plus the catchpoint round, so rounds strictly
+                // between the old tip and the new one are permanently
+                // absent, not just "not yet written".
+                //
+                // Stepping one round at a time can never recover from (b):
+                // `get_block(round)` fails forever, `last_seen` never
+                // advances, and the pool's evaluator stays pinned at its
+                // pre-catchup round — exactly the observed symptom
+                // (`"transaction round window [1, ...] does not cover
+                // block round 1"` spamming long after the ledger itself
+                // sits at round 65379680+). Distinguish the two cases by
+                // checking whether the actual tip block *is* readable: if
+                // it is and it's past `round`, this is case (b) — skip
+                // straight to it, mirroring how the pool is first primed
+                // at node startup (`pool.on_new_block` with a synthetic
+                // block; `recompute_block_evaluator` reads
+                // `ledger.latest()`/`block_hdr(latest)` directly and
+                // ignores the passed block's own fields). If the tip is
+                // also unreadable, this is genuinely case (a); keep the
+                // original behavior of breaking and retrying next wakeup.
+                match ledger.get_block(latest) {
+                    Some(tip_block) if latest > round => {
+                        let committed_txids: HashSet<algo_types::Digest> = tip_block
+                            .payset
+                            .iter()
+                            .map(|stx| crate::dev_producer::block_txn_id(stx, &tip_block))
+                            .collect();
+                        warn!(
+                            gap_start = round,
+                            latest,
+                            "pool follower: history gap detected (likely a live \
+                             catchpoint catchup) — skipping the pool evaluator \
+                             directly to the ledger tip instead of stepping \
+                             round by round"
+                        );
+                        pool.on_new_block(&tip_block, &committed_txids);
+                        last_seen = latest;
+                        continue;
+                    }
+                    _ => break,
+                }
             };
             let committed_txids: HashSet<algo_types::Digest> = block
                 .payset
@@ -6536,6 +6581,121 @@ mod tests {
             "pool must retry round {} after a transient read failure instead of \
              silently skipping past it",
             new_hdr.round.0
+        );
+    }
+
+    /// Pins the fix for issue #1616's transaction-pool clue: after a live
+    /// catchpoint catchup jumps the ledger from a low round straight to a
+    /// much higher tip (skipping every intermediate block), the pool's
+    /// evaluator must catch up to the real tip instead of getting stuck
+    /// forever re-requesting `last_seen + 1`, which never becomes readable.
+    /// Before the fix this test hangs until the deadline and `accepted` is
+    /// false — the follower spins on `get_block(2)` (always `None`) without
+    /// ever advancing `last_seen` past genesis, reproducing the observed
+    /// `"transaction round window [1, ...] does not cover block round 1"`
+    /// log spam long after the real ledger sits at round 65379680+.
+    #[test]
+    fn pool_block_follower_skips_straight_to_tip_across_a_catchpoint_gap() {
+        let ledger = test_ledger();
+
+        let genesis_hdr = BlockHeader {
+            round: Round(0),
+            current_protocol: algo_types::CONSENSUS_V41.to_string(),
+            fee_sink: Address([1u8; 32]),
+            rewards_pool: Address([2u8; 32]),
+            genesis_id: "net-x".to_string(),
+            genesis_hash: PROBE_GENESIS_HASH,
+            timestamp: 1_000,
+            ..BlockHeader::default()
+        };
+        let genesis_block = algo_types::Block {
+            round: genesis_hdr.round,
+            current_protocol: genesis_hdr.current_protocol.clone(),
+            fee_sink: genesis_hdr.fee_sink,
+            rewards_pool: genesis_hdr.rewards_pool,
+            genesis_id: genesis_hdr.genesis_id.clone(),
+            genesis_hash: genesis_hdr.genesis_hash,
+            timestamp: genesis_hdr.timestamp,
+            ..algo_types::Block::default()
+        };
+        commit_block_for_test(&ledger, &genesis_block);
+        fund_probe_sender(&ledger);
+
+        let pool_ledger_adapter = Arc::new(PoolLedgerAdapter::new(ledger.clone()));
+        let pool = Arc::new(TransactionPool::new(
+            PoolConfig::default(),
+            pool_ledger_adapter as Arc<dyn algo_pool::traits::PoolLedger>,
+        ));
+        pool.ensure_evaluator_primed();
+
+        // `initial_round` is captured BEFORE the catchpoint-style jump below,
+        // mirroring how production primes the follower from the pre-import
+        // round.
+        let initial_round = ledger.lock().unwrap().current_round().0;
+
+        // Simulate a live catchpoint catchup jumping the REAL ledger
+        // straight to round 65379680 (mirroring the exact round the live
+        // soak halted at) via `commit_block_for_test`, which -- like a
+        // catchpoint import -- writes only the tip round's block data and
+        // advances `current_round`, without ever writing rounds 1..65379679.
+        // Using the real ledger (not a fake `CommittedBlockSource`) matters:
+        // `recompute_block_evaluator` reads `PoolLedger::latest()`/
+        // `block_hdr(latest)` from the pool's own ledger handle, so the
+        // real ledger's round must actually be at the tip for the fix to be
+        // exercised faithfully, exactly as it is in production after a real
+        // catchpoint import.
+        const TIP_ROUND: u64 = 65_379_680;
+        let tip_block = algo_types::Block {
+            round: Round(TIP_ROUND),
+            current_protocol: genesis_hdr.current_protocol.clone(),
+            fee_sink: genesis_hdr.fee_sink,
+            rewards_pool: genesis_hdr.rewards_pool,
+            genesis_id: genesis_hdr.genesis_id.clone(),
+            genesis_hash: genesis_hdr.genesis_hash,
+            timestamp: genesis_hdr.timestamp + TIP_ROUND as i64,
+            ..algo_types::Block::default()
+        };
+        commit_block_for_test(&ledger, &tip_block);
+
+        let round_advanced = Arc::new(std::sync::Condvar::new());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let follower = {
+            let pool = pool.clone();
+            let ledger = ledger.clone();
+            let round_advanced = round_advanced.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                run_pool_block_follower(
+                    &pool,
+                    &ledger,
+                    &round_advanced,
+                    &stop,
+                    Duration::from_millis(50),
+                    initial_round,
+                );
+            })
+        };
+
+        round_advanced.notify_all();
+
+        // The evaluator's target after skipping to the tip is
+        // `TIP_ROUND + 1` -- pin the probe txn's window there so acceptance
+        // proves the evaluator actually reached the real tip, not merely
+        // "some round" (e.g. still stuck at genesis+1).
+        let txn = window_pinned_txn(Round(TIP_ROUND + 1), &genesis_hdr.genesis_id);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let accepted = wait_for_acceptance(&pool, &txn, &round_advanced, deadline);
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        round_advanced.notify_all();
+        follower.join().expect("follower thread panicked");
+
+        assert!(
+            accepted,
+            "pool evaluator must skip straight to the ledger tip (round {TIP_ROUND}) \
+             across a catchpoint-induced history gap instead of getting stuck \
+             re-requesting unreadable intermediate rounds forever"
         );
     }
 
