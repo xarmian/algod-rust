@@ -469,6 +469,7 @@ mod tests {
     fn fast_retry_config() -> CatchpointDownloadConfig {
         CatchpointDownloadConfig {
             timeout: std::time::Duration::from_secs(5),
+            connect_timeout: std::time::Duration::from_secs(5),
             chunk_size: 16,
             max_retries: 0,
             retry_delay: std::time::Duration::from_millis(1),
@@ -997,7 +998,7 @@ mod tests {
         let (good_url, good_requests) = spawn_always_succeeding_server(BODY).await;
 
         let config = CatchpointDownloadConfig {
-            timeout: std::time::Duration::from_millis(200),
+            connect_timeout: std::time::Duration::from_millis(200),
             ..fast_retry_config()
         };
         let src = RankedCatchpointSource::new(&[(good_url, String::new())], config);

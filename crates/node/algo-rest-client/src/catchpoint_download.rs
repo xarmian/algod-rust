@@ -48,6 +48,19 @@ const DEFAULT_MIN_BYTES_PER_SECOND: u64 = 20 * 1024;
 /// peer over a real network shouldn't be killed by an overly tight window.
 const STALL_WINDOW_FLOOR: Duration = Duration::from_secs(120);
 
+/// Default "connect" timeout (issue #1618) — how long a fresh catchpoint
+/// request may wait for the *first* sign of a response (HTTP response
+/// headers, for both the `reqwest` and P2P-transport paths) before being
+/// treated as a stalled/unresponsive peer. Reuses [`STALL_WINDOW_FLOOR`]'s
+/// 2-minute value: a live peer that will ever answer a `HEAD`/`GET` at all
+/// does so in milliseconds, so 2 minutes is already generous slack for a
+/// slow-but-live peer, while remaining far shorter than
+/// [`CatchpointDownloadConfig::timeout`]'s 12-hour default (appropriate for
+/// the full body transfer of a 500MB+ file, wildly inappropriate as a
+/// "how long to wait before assuming a peer will never respond at all"
+/// bound).
+const DEFAULT_CONNECT_TIMEOUT: Duration = STALL_WINDOW_FLOOR;
+
 /// Progress information reported during a catchpoint file download.
 #[derive(Debug, Clone)]
 pub struct DownloadProgress {
@@ -60,21 +73,35 @@ pub struct DownloadProgress {
 /// Configuration for catchpoint file downloads.
 #[derive(Debug, Clone)]
 pub struct CatchpointDownloadConfig {
-    /// Overall request timeout (default: 30 minutes — catchpoint files can be 500MB+).
+    /// Overall request timeout (default: 12 hours — catchpoint files can be
+    /// 500MB+, and this is go's real `MaxCatchpointDownloadDuration`
+    /// default from version 28 onward, issue #749).
     ///
     /// For the plain-TCP `reqwest` path this is `reqwest::Client`'s own
-    /// end-to-end request timeout (connect through full body). For the
-    /// P2P-transport path (issue #1618) it also bounds the "connect" stage
-    /// — opening the stream, writing the request, and reading back the
-    /// response head — which has no other timeout of its own (unlike the
-    /// P2P body-streaming stage, bounded separately by
-    /// [`Self::stall_window`]): before this issue, that stage had **no**
-    /// timeout at all on the P2P path, so a peer that accepted the stream
-    /// but never answered hung the whole
-    /// `RankedCatchpointSource::download`/`check_ledger_download` call
-    /// forever, with zero progress and no error — exactly the live hang
-    /// observed in #1618's `mainnet-node-soak.yml` run.
+    /// end-to-end request timeout (connect through full body) — the outer
+    /// ceiling appropriate for a large, possibly slow-but-progressing
+    /// transfer. It is deliberately *not* used to bound how long a request
+    /// may wait for its first response byte — see [`Self::connect_timeout`]
+    /// for that.
     pub timeout: Duration,
+    /// How long a fresh request may wait for the *first* sign of a response
+    /// — HTTP response headers, for both the `reqwest` path's
+    /// `request.send()`/`probe_availability`'s `HEAD` and the P2P-transport
+    /// path's `open_stream`/`write_request`/`read_http_response_head` —
+    /// before being treated as a stalled/unresponsive peer (issue #1618;
+    /// default: 2 minutes, see [`DEFAULT_CONNECT_TIMEOUT`]).
+    ///
+    /// Before this issue, neither path had *any* timeout on this "waiting
+    /// for the response to even start" phase shorter than the full
+    /// [`Self::timeout`] (12h by default): a peer that accepted a TCP/P2P
+    /// connection but then never answered at the HTTP layer hung the whole
+    /// `RankedCatchpointSource::download`/`check_ledger_download` call for
+    /// (effectively) ever, with zero progress and no error — exactly the
+    /// live hang observed in #1618's `mainnet-node-soak.yml` run. A timeout
+    /// here is surfaced as a normal recoverable/retryable error, so
+    /// `RankedCatchpointSource`'s existing peer-ranking and retry logic
+    /// fails over to the next candidate peer instead of stalling.
+    pub connect_timeout: Duration,
     /// Read buffer size hint in bytes (default: 64 KiB).
     ///
     /// Note: the actual chunk sizes returned by `reqwest` may differ from this
@@ -102,6 +129,7 @@ impl Default for CatchpointDownloadConfig {
             // matched neither of go's real defaults (2h pre-28, 12h from
             // 28 onward), issue #749.
             timeout: Duration::from_secs(12 * 60 * 60),
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             chunk_size: DEFAULT_CHUNK_SIZE,
             max_retries: 3,
             retry_delay: Duration::from_secs(1),
@@ -493,10 +521,14 @@ impl CatchpointDownloader {
             request = request.header("X-Algo-API-Token", &self.token);
         }
 
-        let response = request.send().await.map_err(|e| AlgoError::RestClient {
-            source: Box::new(e),
-            context: format!("catchpoint HEAD {path}"),
-        })?;
+        let response = match tokio::time::timeout(self.config.connect_timeout, request.send()).await
+        {
+            Ok(result) => result.map_err(|e| AlgoError::RestClient {
+                source: Box::new(e),
+                context: format!("catchpoint HEAD {path}"),
+            })?,
+            Err(_) => return Err(self.connect_timeout_error(&path)),
+        };
 
         let status = response.status();
         if status.is_success() {
@@ -514,8 +546,8 @@ impl CatchpointDownloader {
     /// Open a fresh P2P stream to `self.base_url`, write `request` onto it,
     /// and read back the response head — the shared "connect" stage used by
     /// both [`Self::p2p_probe_availability`] and
-    /// [`Self::p2p_download_attempt`], bounded by `self.config.timeout`
-    /// (issue #1618, see [`CatchpointDownloadConfig::timeout`]'s doc
+    /// [`Self::p2p_download_attempt`], bounded by `self.config.connect_timeout`
+    /// (issue #1618, see [`CatchpointDownloadConfig::connect_timeout`]'s doc
     /// comment) so a peer that opens the stream but never answers (or never
     /// finishes sending headers) fails after a bounded wait instead of
     /// hanging the caller — and, critically, this crate's caller — forever.
@@ -545,13 +577,13 @@ impl CatchpointDownloader {
             Ok::<_, AlgoError>((stream, head))
         };
 
-        match tokio::time::timeout(self.config.timeout, connect).await {
+        match tokio::time::timeout(self.config.connect_timeout, connect).await {
             Ok(result) => result,
             Err(_) => {
                 warn!(
                     path,
                     peer = %base_url,
-                    connect_timeout_secs = self.config.timeout.as_secs(),
+                    connect_timeout_secs = self.config.connect_timeout.as_secs(),
                     "catchpoint download (P2P): no response head received within the connect \
                      timeout, treating as a recoverable interruption"
                 );
@@ -560,7 +592,7 @@ impl CatchpointDownloader {
                         std::io::ErrorKind::TimedOut,
                         format!(
                             "no response received within {}s while connecting",
-                            self.config.timeout.as_secs()
+                            self.config.connect_timeout.as_secs()
                         ),
                     )),
                     context: format!("catchpoint connect {path} (P2P peer {base_url})"),
@@ -874,7 +906,34 @@ impl CatchpointDownloader {
             // the Go client behaviour.
             request = request.header("Accept-Encoding", "gzip");
 
-            let result = request.send().await;
+            // Bound how long this attempt may wait for a response to even
+            // start (issue #1618) — distinct from `self.config.timeout`,
+            // which bounds the *whole* request including a large body
+            // transfer and is deliberately much longer. A peer that never
+            // answers at all is treated the same as any other transient
+            // failure: retried against the next attempt (which, through
+            // `RankedCatchpointSource`, may land on a different peer)
+            // rather than left to exhaust the full `self.config.timeout`
+            // before anything happens.
+            let Ok(result) =
+                tokio::time::timeout(self.config.connect_timeout, request.send()).await
+            else {
+                if attempt < self.config.max_retries {
+                    warn!(
+                        attempt = attempt + 1,
+                        max = self.config.max_retries,
+                        path,
+                        connect_timeout_secs = self.config.connect_timeout.as_secs(),
+                        backoff_ms = backoff.as_millis() as u64,
+                        "catchpoint download: no response received within the connect \
+                         timeout, retrying rather than waiting out the full request timeout"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                    continue;
+                }
+                return Err(self.connect_timeout_error(path));
+            };
 
             match result {
                 Ok(resp) => {
@@ -930,6 +989,31 @@ impl CatchpointDownloader {
         }
 
         unreachable!("retry loop should always return")
+    }
+
+    /// Build the [`AlgoError::RestClient`] returned when a `reqwest`-path
+    /// request (`HEAD` or `GET`) doesn't receive a response within
+    /// `self.config.connect_timeout` — the plain-TCP counterpart of
+    /// [`Self::p2p_connect_and_read_head`]'s equivalent timeout error
+    /// (issue #1618).
+    fn connect_timeout_error(&self, path: &str) -> AlgoError {
+        warn!(
+            path,
+            peer = %self.base_url,
+            connect_timeout_secs = self.config.connect_timeout.as_secs(),
+            "catchpoint download: no response received within the connect timeout, treating \
+             as a recoverable interruption"
+        );
+        AlgoError::RestClient {
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "no response received within {}s while connecting",
+                    self.config.connect_timeout.as_secs()
+                ),
+            )),
+            context: format!("catchpoint connect {path} (peer {})", self.base_url),
+        }
     }
 }
 
@@ -1172,6 +1256,7 @@ mod tests {
             "",
             CatchpointDownloadConfig {
                 timeout: Duration::from_secs(5),
+                connect_timeout: Duration::from_secs(5),
                 chunk_size: 16,
                 max_retries: 3,
                 retry_delay: Duration::from_millis(10),
@@ -1255,6 +1340,7 @@ mod tests {
             "",
             CatchpointDownloadConfig {
                 timeout: Duration::from_secs(5),
+                connect_timeout: Duration::from_secs(5),
                 chunk_size: 16,
                 max_retries: 3,
                 retry_delay: Duration::from_millis(10),
@@ -1295,6 +1381,7 @@ mod tests {
             "",
             CatchpointDownloadConfig {
                 timeout: Duration::from_secs(5),
+                connect_timeout: Duration::from_secs(5),
                 chunk_size: 16,
                 max_retries: 1,
                 retry_delay: Duration::from_millis(5),
@@ -1372,6 +1459,7 @@ mod tests {
             "",
             CatchpointDownloadConfig {
                 timeout: Duration::from_secs(5),
+                connect_timeout: Duration::from_secs(5),
                 chunk_size: 16,
                 max_retries: 0,
                 retry_delay: Duration::from_millis(5),
@@ -1419,6 +1507,7 @@ mod tests {
             "",
             CatchpointDownloadConfig {
                 timeout: Duration::from_secs(5),
+                connect_timeout: Duration::from_secs(5),
                 chunk_size: 16,
                 max_retries: 0,
                 retry_delay: Duration::from_millis(5),
@@ -1465,6 +1554,7 @@ mod tests {
             "",
             CatchpointDownloadConfig {
                 timeout: Duration::from_secs(5),
+                connect_timeout: Duration::from_secs(5),
                 chunk_size: 16,
                 max_retries: 0,
                 retry_delay: Duration::from_millis(5),
@@ -1511,6 +1601,7 @@ mod tests {
             "",
             CatchpointDownloadConfig {
                 timeout: Duration::from_secs(5),
+                connect_timeout: Duration::from_secs(5),
                 chunk_size: 16,
                 max_retries: 0,
                 retry_delay: Duration::from_millis(5),
@@ -1884,6 +1975,107 @@ mod tests {
         assert!(matches!(result, Err(AlgoError::RestClient { .. })));
     }
 
+    /// TDD regression for issue #1618, the plain-TCP `reqwest`-path
+    /// counterpart of the P2P `p2p_probe_availability`/`p2p_download_attempt`
+    /// regressions below. Live evidence from an actual `mainnet-node-soak.yml`
+    /// dispatch on this fix's own branch showed the *reported* hang's own
+    /// workflow runs with P2P disabled (`NetworkMode::WsOnly`, the soak's
+    /// default) — so the original #1618 hang most likely went through this
+    /// `reqwest` path, not the P2P one, even though the P2P path had the
+    /// more obviously-missing timeout. A peer that accepts the TCP
+    /// connection (so `request.send()` isn't a fast connection-refused
+    /// error like the test above) but then never writes any HTTP response
+    /// at all must fail via `connect_timeout` rather than only via
+    /// `config.timeout` (12h by default — indistinguishable from "hangs
+    /// forever" from any soak's short observation window).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_availability_times_out_against_a_peer_that_accepts_but_never_answers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Accept the connection and then do nothing at all — never read
+            // the request, never write a response, never close the socket.
+            if let Ok((socket, _)) = listener.accept().await {
+                std::mem::forget(socket);
+            }
+        });
+
+        let dl = CatchpointDownloader::with_config(
+            &format!("http://{addr}"),
+            "",
+            CatchpointDownloadConfig {
+                connect_timeout: Duration::from_millis(200),
+                ..CatchpointDownloadConfig::default()
+            },
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            dl.probe_availability("test-v1.0", 1),
+        )
+        .await
+        .expect(
+            "probe_availability must fail via connect_timeout rather than hanging past a \
+             generous outer test bound",
+        );
+
+        assert!(
+            matches!(result, Err(AlgoError::RestClient { .. })),
+            "expected a RestClient timeout error, got: {result:?}"
+        );
+    }
+
+    /// Same regression as
+    /// [`probe_availability_times_out_against_a_peer_that_accepts_but_never_answers`],
+    /// for the real GET-transfer path (`get_with_retry`, reached once
+    /// `check_ledger_download`'s probe has already succeeded against some
+    /// peer).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn download_times_out_against_a_peer_that_accepts_but_never_answers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((socket, _)) = listener.accept().await {
+                std::mem::forget(socket);
+            }
+        });
+
+        let dl = CatchpointDownloader::with_config(
+            &format!("http://{addr}"),
+            "",
+            CatchpointDownloadConfig {
+                connect_timeout: Duration::from_millis(200),
+                max_retries: 0,
+                min_bytes_per_second: 0,
+                ..CatchpointDownloadConfig::default()
+            },
+        );
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-catchpoint-reqwest-hanging-{}",
+            std::process::id()
+        ));
+        let dest = tmp_dir.join("catchpoint-hanging.tar.gz");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            dl.download::<fn(DownloadProgress)>("test-v1.0", 1, &dest, None),
+        )
+        .await
+        .expect(
+            "download() must fail via connect_timeout rather than hanging past a generous \
+             outer test bound",
+        );
+
+        assert!(
+            matches!(result, Err(AlgoError::RestClient { .. })),
+            "expected a RestClient timeout error, got: {result:?}"
+        );
+        assert!(!dest.exists());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
     // -- P2P transport (issue #1127) --
     //
     // Mirrors go-algorand's `TestLedgerFetcherP2P` (`catchup/ledgerFetcher_test.go`):
@@ -2043,7 +2235,7 @@ mod tests {
             "12D3KooWhangingpeer",
             transport,
             CatchpointDownloadConfig {
-                timeout: Duration::from_millis(200),
+                connect_timeout: Duration::from_millis(200),
                 ..CatchpointDownloadConfig::default()
             },
         );
@@ -2085,7 +2277,7 @@ mod tests {
             "12D3KooWhangingpeer",
             hanging,
             CatchpointDownloadConfig {
-                timeout: Duration::from_millis(200),
+                connect_timeout: Duration::from_millis(200),
                 max_retries: 0,
                 min_bytes_per_second: 0,
                 ..CatchpointDownloadConfig::default()
