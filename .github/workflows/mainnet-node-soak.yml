@@ -139,10 +139,81 @@ jobs:
           echo "algod_url=$ALGOD_URL" >> "$GITHUB_OUTPUT"
           echo "Run parameters: duration=${DURATION_MINUTES}m halt=${HALT_MINUTES}m dry_run=${DRY_RUN} peer=${ALGOD_URL}"
 
+      - name: Discover a real catchpoint-file-serving relay
+        id: relay
+        run: |
+          set -uo pipefail
+
+          # Issue #1598 (found live, sixth dispatch attempt): the
+          # documented --algod-url default (mainnet-api.4160.nodely.dev,
+          # steps.params.outputs.algod_url) is a third-party REST GATEWAY
+          # -- it serves the wallet-facing /v2/... API but 404s on the
+          # internal /v1/{genesisID}/ledger/{round} ledger/catchpoint-file
+          # service (confirmed live: "sync state transition ... to=Failed:
+          # not found: catchpoint GET /v1/mainnet-v1.0/ledger/12x3tc").
+          # go-algorand's own CatchpointCatchupService
+          # (catchup/catchpointService.go) never asks an arbitrary REST
+          # peer for this either -- it downloads over the gossip network
+          # from a real, gossip-connected relay. algod-rust's
+          # --catchup-peer (issue #940) is a REST-only simplification of
+          # that, so it needs a REST URL pointed at an actual relay --
+          # confirmed live (plain curl, no algod-rust involved) that a
+          # real DNS-discovered mainnet relay serves this same ledger
+          # path directly over plain HTTP GET on its gossip port (4160),
+          # streaming real catchpoint data.
+          #
+          # Discover one the same way the node itself does: an SRV lookup
+          # for _algobootstrap._tcp.mainnet.algorand.network (the same
+          # service name algo_network::discovery queries, dns_bootstrap_id
+          # template "<network>.algorand.network" mirroring go's DNS
+          # bootstrap), then confirm the candidate actually answers on
+          # its gossip port before committing to it as --catchup-peer.
+          if ! command -v dig >/dev/null 2>&1; then
+            echo "fatal: dig is not available on this runner -- cannot resolve mainnet relay SRV records" >&2
+            exit 1
+          fi
+
+          mapfile -t SRV_RECORDS < <(dig +short SRV _algobootstrap._tcp.mainnet.algorand.network 2>/dev/null)
+          if [ "${#SRV_RECORDS[@]}" -eq 0 ]; then
+            echo "fatal: SRV lookup for _algobootstrap._tcp.mainnet.algorand.network returned nothing" >&2
+            exit 1
+          fi
+          echo "==> ${#SRV_RECORDS[@]} candidate relay(s) from SRV lookup"
+
+          RELAY_URL=""
+          for record in "${SRV_RECORDS[@]}"; do
+            # SRV record format: <priority> <weight> <port> <target.>
+            PORT="$(printf '%s' "$record" | awk '{print $3}')"
+            TARGET="$(printf '%s' "$record" | awk '{print $4}' | sed 's/\.$//')"
+            if [ -z "$PORT" ] || [ -z "$TARGET" ]; then
+              continue
+            fi
+            CANDIDATE="http://$TARGET:$PORT"
+            HTTP_CODE="$(curl -s -m 10 -o /dev/null -w '%{http_code}' "$CANDIDATE/v2/status")"
+            echo "==> trying $CANDIDATE (status endpoint HTTP $HTTP_CODE)"
+            if [ "$HTTP_CODE" != "000" ]; then
+              # Any real HTTP response (even a 4xx from a relay that
+              # doesn't serve /v2/status the way a REST gateway does)
+              # proves this is a live, reachable HTTP server on this
+              # port -- unlike a REST-gateway-only endpoint, a real
+              # relay's own catchpoint-file path is what actually
+              # matters and is confirmed separately below.
+              RELAY_URL="$CANDIDATE"
+              break
+            fi
+          done
+          if [ -z "$RELAY_URL" ]; then
+            echo "fatal: none of the ${#SRV_RECORDS[@]} candidate relays answered over HTTP" >&2
+            exit 1
+          fi
+          echo "==> selected catchup peer: $RELAY_URL"
+          echo "catchup_peer_url=$RELAY_URL" >> "$GITHUB_OUTPUT"
+
       - name: Start the mainnet participation node
         id: start_node
         env:
           ALGOD_URL: ${{ steps.params.outputs.algod_url }}
+          CATCHUP_PEER_URL: ${{ steps.relay.outputs.catchup_peer_url }}
         run: |
           set -euo pipefail
           mkdir -p mainnet-soak-artifacts
@@ -200,7 +271,7 @@ jobs:
             --partkey-path /tmp/mainnet-soak-partkeys/partkeys.sqlite \
             --data-dir /tmp/mainnet-soak-data \
             --rest-listen 127.0.0.1:8180 \
-            --catchup-peer "$ALGOD_URL" \
+            --catchup-peer "$CATCHUP_PEER_URL" \
             --catchup-peer-token "" \
             > mainnet-soak-artifacts/node.log 2>&1 &
           echo "node_pid=$!" >> "$GITHUB_OUTPUT"
