@@ -6060,15 +6060,19 @@ mod tests {
         /// Broadcasts `tag` from `net_a` and yields briefly afterward.
         ///
         /// This crate's inbound read loop drains incoming frames into a
-        /// small (10-slot, [`crate::ws_peer::MSGS_IN_READ_BUFFER_PER_PEER`]
-        /// is private but this mirrors its size) per-peer channel and
-        /// drops on backpressure rather than blocking — a deliberate
-        /// bounded-buffer choice, not a bug this issue is about. A tight
-        /// loop of 20 unpaced broadcasts can fill that buffer faster than
-        /// the consumer task drains it; go's equivalent test does not hit
-        /// this because go's channel is far larger. Pacing sends keeps
-        /// this test about `wantTXGossip` narrowing, not about buffer
-        /// sizing.
+        /// per-peer channel ([`crate::ws_peer::MSGS_IN_READ_BUFFER_PER_PEER`]
+        /// is private but this mirrors its size) and drops on backpressure
+        /// rather than blocking — a deliberate bounded-buffer choice. That
+        /// buffer used to be only 10 slots (a literal, semantically
+        /// mismatched copy of Go's per-peer *fairness* limit, not a real
+        /// capacity — see the constant's doc comment) and a tight loop of
+        /// 20 unpaced broadcasts could fill it faster than the consumer
+        /// task drains it; that undersizing is exactly what issue #1616
+        /// diagnosed as the root cause of a real mainnet consensus halt
+        /// (agreement-vote traffic silently dropped under burst load), and
+        /// the buffer is now sized with real headroom. Sends here stay
+        /// paced regardless, since that keeps this test about
+        /// `wantTXGossip` narrowing rather than buffer sizing either way.
         async fn broadcast_paced(net_a: &Arc<WebsocketNetwork>, tag: Tag) {
             net_a
                 .broadcast(tag, vec![0, 1, 2, 3, 4], false, None)
