@@ -359,12 +359,14 @@ impl OwnedSqliteCommitter {
 
     /// Commit the transaction opened by [`OwnedSqliteCommitter::begin_immediate`].
     pub fn commit_txn(&self) -> Result<(), AlgoError> {
-        self.conn.execute_batch("COMMIT").map_err(|e| AlgoError::Ledger {
-            message: format!(
-                "OwnedSqliteCommitter::commit_txn({}): {e}",
-                self.path.display()
-            ),
-        })
+        self.conn
+            .execute_batch("COMMIT")
+            .map_err(|e| AlgoError::Ledger {
+                message: format!(
+                    "OwnedSqliteCommitter::commit_txn({}): {e}",
+                    self.path.display()
+                ),
+            })
     }
 
     /// Roll back the transaction opened by [`OwnedSqliteCommitter::begin_immediate`].
@@ -373,6 +375,30 @@ impl OwnedSqliteCommitter {
     /// existing rollback pattern.
     pub fn rollback_txn(&self) {
         let _ = self.conn.execute_batch("ROLLBACK");
+    }
+
+    /// Best-effort `PRAGMA wal_checkpoint(PASSIVE)` on this committer's
+    /// connection. A PASSIVE checkpoint copies whatever WAL frames no
+    /// other connection's read snapshot still needs back into the main
+    /// database file and truncates the WAL by that much — it never
+    /// blocks on a busy reader/writer, it just does less work if one is
+    /// present. Issue #1631: `build_and_persist_trie_chunked` calls this
+    /// after every periodic chunk commit specifically to give SQLite as
+    /// many opportunities as possible to reclaim WAL space as soon as
+    /// the caller's own long streaming read (over `accountbase`/
+    /// `resources`/`kvstore`) releases its snapshot between batches,
+    /// instead of relying solely on SQLite's own default
+    /// `wal_autocheckpoint` threshold (1000 pages) to eventually trigger
+    /// one. Errors are swallowed — a missed checkpoint opportunity is a
+    /// performance concern, never a correctness one.
+    pub fn checkpoint_passive(&self) {
+        if let Err(e) = self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);") {
+            tracing::debug!(
+                path = %self.path.display(),
+                error = %e,
+                "OwnedSqliteCommitter: passive wal_checkpoint failed (non-fatal)"
+            );
+        }
     }
 }
 
