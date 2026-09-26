@@ -24,7 +24,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import monitor  # noqa: E402
 
 
-def node_catchup(ts, acquired=0, processed_accts=0, processed_kvs=0, verified_accts=0, verified_kvs=0):
+def node_catchup(
+    ts,
+    acquired=0,
+    processed_accts=0,
+    processed_kvs=0,
+    verified_accts=0,
+    verified_kvs=0,
+    total_blocks=None,
+    total_accts=None,
+    total_kvs=None,
+):
     return {
         "ts": ts,
         "node": {
@@ -35,10 +45,30 @@ def node_catchup(ts, acquired=0, processed_accts=0, processed_kvs=0, verified_ac
             "catchpoint_processed_kvs": processed_kvs,
             "catchpoint_verified_accounts": verified_accts,
             "catchpoint_verified_kvs": verified_kvs,
+            "catchpoint_total_blocks": total_blocks,
+            "catchpoint_total_accounts": total_accts,
+            "catchpoint_total_kvs": total_kvs,
             "last_round": 0,
         },
         "peer": {"ok": True, "last_round": 40000000 + int(ts)},
     }
+
+
+def node_verifying(ts, total_blocks=100, total_accts=1000, total_kvs=200, verified_accts=0, verified_kvs=0):
+    """A sample shaped like the real `run_verify_ledger` window (issue
+    #1623): import counters fully caught up to their totals, verify
+    counters not yet (or just-frozen partway)."""
+    return node_catchup(
+        ts,
+        acquired=total_blocks,
+        processed_accts=total_accts,
+        processed_kvs=total_kvs,
+        verified_accts=verified_accts,
+        verified_kvs=verified_kvs,
+        total_blocks=total_blocks,
+        total_accts=total_accts,
+        total_kvs=total_kvs,
+    )
 
 
 def node_follow(ts, round_, peer_round=None):
@@ -74,6 +104,92 @@ class ClassifyStuckDuringCatchupTest(unittest.TestCase):
         verdict = monitor.classify(samples, halt_minutes=5.0)
         self.assertEqual(verdict.status, "ok")
         self.assertEqual(verdict.phase, "catchup")
+
+
+class IsVerifyingSignatureTest(unittest.TestCase):
+    def test_import_done_verify_not_done_is_verifying(self):
+        s = node_verifying(0, verified_accts=0, verified_kvs=0)
+        self.assertTrue(monitor.is_verifying_signature(s))
+
+    def test_still_importing_is_not_verifying(self):
+        s = node_catchup(0, acquired=50, processed_accts=500, processed_kvs=100, total_blocks=100, total_accts=1000, total_kvs=200)
+        self.assertFalse(monitor.is_verifying_signature(s))
+
+    def test_verify_also_done_is_not_verifying(self):
+        s = node_verifying(0, verified_accts=1000, verified_kvs=200)
+        self.assertFalse(monitor.is_verifying_signature(s))
+
+    def test_no_catchpoint_is_not_verifying(self):
+        s = node_follow(0, round_=50_000_000)
+        self.assertFalse(monitor.is_verifying_signature(s))
+
+    def test_missing_totals_is_not_verifying(self):
+        # No total_* fields known -- can't tell import is actually done, so
+        # this must not get the longer allowance.
+        s = node_catchup(0, acquired=100, processed_accts=1000, processed_kvs=200)
+        self.assertFalse(monitor.is_verifying_signature(s))
+
+
+class ClassifyVerifyPhaseAllowanceTest(unittest.TestCase):
+    """Issue #1623: a frozen catchpoint signature that looks like the
+    single-shot `run_verify_ledger` window must NOT be classified as a
+    halt within the default 5-minute `halt_minutes`, but must still be
+    classified as `stuck` once it exceeds the longer, finite
+    `verify_halt_minutes` allowance."""
+
+    def test_frozen_verify_counters_within_verify_allowance_is_ok(self):
+        # Import fully done, verify counters frozen at 0 for 400s -- past
+        # the default 5-minute halt_minutes, but well inside the default
+        # 45-minute verify_halt_minutes.
+        samples = [node_verifying(0)]
+        for t in range(1, 400, 10):
+            samples.append(node_verifying(t))
+        verdict = monitor.classify(samples, halt_minutes=5.0, verify_halt_minutes=45.0)
+        self.assertEqual(verdict.status, "ok")
+        self.assertEqual(verdict.phase, "catchup")
+
+    def test_frozen_verify_counters_past_verify_allowance_is_stuck(self):
+        samples = [node_verifying(0)]
+        for t in range(1, 3000, 10):
+            samples.append(node_verifying(t))
+        verdict = monitor.classify(samples, halt_minutes=5.0, verify_halt_minutes=45.0)
+        self.assertEqual(verdict.status, "stuck")
+        self.assertEqual(verdict.phase, "catchup")
+        self.assertIn("verify-phase allowance", verdict.message)
+
+    def test_verify_phase_then_final_jump_and_follow_is_ok(self):
+        # Realistic shape: import completes, verify counters sit frozen at
+        # 0 for a while (< verify_halt_minutes), then jump straight to the
+        # final counts (the actual non-incremental behavior), then follow
+        # mode proceeds normally.
+        samples = [node_verifying(t) for t in range(0, 400, 10)]
+        samples.append(node_verifying(400, verified_accts=1000, verified_kvs=200))
+        samples.append(
+            {
+                "ts": 410,
+                "node": {"ok": True, "catchpoint": None, "last_round": 50_000_000},
+                "peer": {"ok": True, "last_round": 50_000_000},
+            }
+        )
+        for t in range(420, 500, 10):
+            samples.append(node_follow(t, round_=50_000_000 + (t - 410), peer_round=50_000_000 + (t - 410)))
+        verdict = monitor.classify(samples, halt_minutes=5.0, verify_halt_minutes=45.0)
+        self.assertEqual(verdict.status, "ok")
+
+    def test_verify_looking_freeze_still_needs_advancing_peer_to_be_stuck_not_outage(self):
+        # Past the verify allowance, but the peer itself never proves the
+        # network was alive -> source_outage, not stuck (same priority
+        # rule as every other phase).
+        samples = [
+            {
+                "ts": t,
+                "node": node_verifying(t)["node"],
+                "peer": {"ok": False, "error": "connection refused", "last_round": None},
+            }
+            for t in range(0, 3000, 10)
+        ]
+        verdict = monitor.classify(samples, halt_minutes=5.0, verify_halt_minutes=45.0)
+        self.assertEqual(verdict.status, "source_outage")
 
 
 class ClassifyStuckDuringFollowTest(unittest.TestCase):
