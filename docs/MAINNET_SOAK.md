@@ -137,10 +137,139 @@ node kept making progress.
 
 ## Baseline
 
-_First live baseline recorded here once `workflow_dispatch` runs (a short
-budget, then a full 60-minute run) complete — see issue #1598's
-acceptance criteria._
+First live full-budget baseline, recorded per issue #1598's acceptance
+criteria. Every dispatch below ran a real `algod-rust participate
+--network mainnet` node against real mainnet — no simulated data.
+
+[Run 36246996407](https://github.com/xarmian/algod-rust/actions/runs/36246996407)
+(60-minute poll budget, `dry_run_issues=true`, default `halt_minutes=5`)
+was the first fully clean end-to-end dispatch of this workflow: catchpoint
+`65410000` (~22.47M accounts/resources/kvs) downloaded, imported, and
+Merkle-trie-verified with zero errors, reaching `balances_round`
+`65409680`. Verdict `ok — no stall observed` — the halt detector
+correctly stayed silent through the whole run. Per-phase timing from that
+run's `summary.json` (`phase_seconds`): **import-accounts 910.5s**
+(~15.2 min), **import-kvs 5.1s**, and **2684.5s (~44.7 min) unattributed**
+(covers the download step, the non-incremental verify-trie rebuild —
+issue #1623 documents this as a legitimate 900s+ single step — and the
+start of post-verify block replay). That totals almost exactly the full
+60-minute poll budget, which is why `reached_tip` was `false` and
+`fast_catchup_seconds` was not recorded: the import+verify pipeline alone
+consumes the entire default budget on this catchpoint's real size, before
+the node has caught up the ~65,410,000→tip block gap that remains after
+verify finishes.
+
+To get a genuine `fast_catchup_seconds` measurement, a second dispatch
+raised the poll budget past the ~60 minutes import+verify alone consumes:
+[run 36251668578](https://github.com/xarmian/algod-rust/actions/runs/36251668578)
+(`duration_minutes=75`, chosen to stay under the job's 90-minute hard
+`timeout-minutes` once ~8 minutes of build/setup and ~2 minutes of
+teardown are accounted for). This run processed the **same** catchpoint
+(round `65410000`) — `catchpoint_processed_accounts`/`_kvs` both reached
+their totals (import phase: **accounts 743.4s, kvs 5.1s** this time) —
+but `catchpoint_verified_accounts`/`_kvs` never moved off `0` for the
+entire remaining 2822.6s (~47 min), so `monitor.py` classified it
+`stuck` (past `DEFAULT_VERIFY_HALT_MINUTES = 45.0`) and correctly did
+**not** file a real issue (`dry_run_issues` defaulted `true`). Since the
+*prior* run completed verify for the identical catchpoint well inside a
+similar window, this looks like either CI-runner timing variance in the
+non-incremental trie rebuild or a real, run-dependent regression in the
+chunked rebuild path — filed for its own investigation as
+[issue #1631](https://github.com/xarmian/algod-rust/issues/1631) rather
+than guessed at here.
 
 | run | catchpoint round | fast-catchup time | reached tip | lag at tip (mean/p95/max) |
 | --- | --- | --- | --- | --- |
-| _pending_ | | | | |
+| [36246996407](https://github.com/xarmian/algod-rust/actions/runs/36246996407) (60 min budget) | 65410000 | not recorded — import (915.6s) + verify consumed the full budget; verify itself completed (node reached `balances_round` 65409680 with zero errors) but the run ended before catching up to the live tip | false | n/a (0 follow samples) |
+| [36251668578](https://github.com/xarmian/algod-rust/actions/runs/36251668578) (75 min budget) | 65410000 | not recorded — verify (Merkle trie rebuild) had not completed after 47+ minutes; classified `stuck`, see issue #1631 | false | n/a (0 follow samples) |
+
+**A confirmed, completed `fast_catchup_seconds` number is still not
+available** — both live attempts in this close-out session got real,
+meaningful distance into the pipeline (one completed verify but ran out
+of poll budget before reaching the tip; the other's verify did not finish
+within an even larger budget) without ever landing in the
+`catchpoint empty AND last-round within 2 rounds of peer` state
+`monitor.py`'s `summarize()` requires to compute it. Getting that number
+requires resolving issue #1631's investigation first — either widening
+`verify_halt_minutes` with justified data, or fixing a genuine
+verify-path regression — then a dispatch with a budget sized to that
+confirmed verify duration plus enough follow time to reach the tip.
+
+### On the issue's original "≈15 min short budget" criterion
+
+Issue #1598 originally asked for one short (~15 min) dispatch reaching the
+tip plus a few minutes of live follow, alongside the full 60-minute run.
+At mainnet's current real scale (~22.47M accounts in the live catchpoint),
+that is no longer achievable: the measured import-accounts phase alone
+(910.5s ≈ 15.2 min) already exceeds a 15-minute total budget before the
+download step, the verify-trie rebuild, or any post-verify block replay
+even start. A 15-minute dispatch today can only ever exercise
+startup/discovery/download-start, never "reach the tip" — that part of
+the original criterion was written before this workflow had ever
+completed an import against full mainnet-scale data, and is now
+superseded by the real, measured phase breakdown above. See the
+"Known constraint: runner disk/bandwidth" section above, which already
+anticipated exactly this outcome.
+
+## Dry-run demonstrations (issue #1598 acceptance criteria)
+
+Both of these use `monitor.py analyze` — a pure function over an
+already-collected JSONL (`_cmd_analyze`, see the module's own doc
+comment: "verdict over an existing JSONL (dry runs, tests)") — the
+mechanism this repo already ships for exercising `classify()`'s verdict
+logic without needing a live node. No node code changes were involved.
+
+**Halt path + title/labels/body template match + dedup**: a synthetic
+JSONL with the node's `last_round` frozen at `65409680` for 390s (peer
+advancing from the same round) produces:
+
+```
+{
+  "status": "stuck", "phase": "follow", "round": 65409680,
+  "message": "node made no progress for 390s during follow while the peer kept advancing",
+  ...
+}
+```
+
+exit code `1`. Feeding that verdict through `file_issue.py --dry-run`
+with no pre-existing issue printed the exact would-be title
+(`sync: mainnet participation node halted at round 65409680 — nightly
+mainnet soak 2026-09-26`), the full label set
+(`bug, sync, conformance, mainnet-soak, algod:v5.0.2-stable,
+effort:medium`), and a body rendered from `issue_template.md` with the
+round/phase/stalled-minutes/log-excerpt fields correctly substituted —
+`{"action": "dry_run_create", ...}`.
+
+A real, throwaway issue
+([#1630](https://github.com/xarmian/algod-rust/issues/1630), closed
+immediately after) was then created with the same
+`<!-- mainnet-soak:round=65409680 -->` marker `file_issue.py` searches
+for. Re-running the identical `file_issue.py --dry-run` call against that
+now-open issue correctly found it via `gh issue list --search` and
+switched to `{"action": "dry_run_comment", "number": 1630, ...}` instead
+of creating a duplicate — dedup confirmed working end to end.
+
+**Source-outage classification**: a synthetic JSONL with the node's
+`last_round` frozen and the peer reporting `"ok": false` throughout
+produces:
+
+```
+{"status": "source_outage", "phase": "follow", "round": 65409680, ...}
+```
+
+exit code `2`. `source_outage` is one of only two verdicts (`ok` is the
+other) that `mainnet-node-soak.yml` never passes to `file_issue.py` at
+all (only `stuck`/`node_failure`, exit code `1`, reach that step) — so an
+unreachable `algod_url` in a real dispatch structurally cannot file or
+comment on an issue, by construction of the workflow, not just by
+`file_issue.py`'s own logic.
+
+This same real-dispatch behavior was independently confirmed live in
+[run 36251668578](https://github.com/xarmian/algod-rust/actions/runs/36251668578)
+(see the Baseline section above): its verdict was `stuck` (not
+`source_outage` — the peer was reachable and advancing throughout), and
+with `dry_run_issues` at its default `true`, the "File (or comment on) an
+issue for a halt" step ran `file_issue.py --dry-run` and printed the
+would-be issue to the log rather than calling `gh issue create` — the
+exact same dry-run path demonstrated synthetically above, now also
+proven against a genuine live halt.
