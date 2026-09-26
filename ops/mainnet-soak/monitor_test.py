@@ -17,6 +17,7 @@ running it against a real 60-minute mainnet soak.
 
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -24,7 +25,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import monitor  # noqa: E402
 
 
-def node_catchup(ts, acquired=0, processed_accts=0, processed_kvs=0, verified_accts=0, verified_kvs=0):
+def node_catchup(
+    ts,
+    acquired=0,
+    processed_accts=0,
+    processed_kvs=0,
+    verified_accts=0,
+    verified_kvs=0,
+    total_blocks=None,
+    total_accts=None,
+    total_kvs=None,
+):
     return {
         "ts": ts,
         "node": {
@@ -35,10 +46,30 @@ def node_catchup(ts, acquired=0, processed_accts=0, processed_kvs=0, verified_ac
             "catchpoint_processed_kvs": processed_kvs,
             "catchpoint_verified_accounts": verified_accts,
             "catchpoint_verified_kvs": verified_kvs,
+            "catchpoint_total_blocks": total_blocks,
+            "catchpoint_total_accounts": total_accts,
+            "catchpoint_total_kvs": total_kvs,
             "last_round": 0,
         },
         "peer": {"ok": True, "last_round": 40000000 + int(ts)},
     }
+
+
+def node_verifying(ts, total_blocks=100, total_accts=1000, total_kvs=200, verified_accts=0, verified_kvs=0):
+    """A sample shaped like the real `run_verify_ledger` window (issue
+    #1623): import counters fully caught up to their totals, verify
+    counters not yet (or just-frozen partway)."""
+    return node_catchup(
+        ts,
+        acquired=total_blocks,
+        processed_accts=total_accts,
+        processed_kvs=total_kvs,
+        verified_accts=verified_accts,
+        verified_kvs=verified_kvs,
+        total_blocks=total_blocks,
+        total_accts=total_accts,
+        total_kvs=total_kvs,
+    )
 
 
 def node_follow(ts, round_, peer_round=None):
@@ -74,6 +105,92 @@ class ClassifyStuckDuringCatchupTest(unittest.TestCase):
         verdict = monitor.classify(samples, halt_minutes=5.0)
         self.assertEqual(verdict.status, "ok")
         self.assertEqual(verdict.phase, "catchup")
+
+
+class IsVerifyingSignatureTest(unittest.TestCase):
+    def test_import_done_verify_not_done_is_verifying(self):
+        s = node_verifying(0, verified_accts=0, verified_kvs=0)
+        self.assertTrue(monitor.is_verifying_signature(s))
+
+    def test_still_importing_is_not_verifying(self):
+        s = node_catchup(0, acquired=50, processed_accts=500, processed_kvs=100, total_blocks=100, total_accts=1000, total_kvs=200)
+        self.assertFalse(monitor.is_verifying_signature(s))
+
+    def test_verify_also_done_is_not_verifying(self):
+        s = node_verifying(0, verified_accts=1000, verified_kvs=200)
+        self.assertFalse(monitor.is_verifying_signature(s))
+
+    def test_no_catchpoint_is_not_verifying(self):
+        s = node_follow(0, round_=50_000_000)
+        self.assertFalse(monitor.is_verifying_signature(s))
+
+    def test_missing_totals_is_not_verifying(self):
+        # No total_* fields known -- can't tell import is actually done, so
+        # this must not get the longer allowance.
+        s = node_catchup(0, acquired=100, processed_accts=1000, processed_kvs=200)
+        self.assertFalse(monitor.is_verifying_signature(s))
+
+
+class ClassifyVerifyPhaseAllowanceTest(unittest.TestCase):
+    """Issue #1623: a frozen catchpoint signature that looks like the
+    single-shot `run_verify_ledger` window must NOT be classified as a
+    halt within the default 5-minute `halt_minutes`, but must still be
+    classified as `stuck` once it exceeds the longer, finite
+    `verify_halt_minutes` allowance."""
+
+    def test_frozen_verify_counters_within_verify_allowance_is_ok(self):
+        # Import fully done, verify counters frozen at 0 for 400s -- past
+        # the default 5-minute halt_minutes, but well inside the default
+        # 45-minute verify_halt_minutes.
+        samples = [node_verifying(0)]
+        for t in range(1, 400, 10):
+            samples.append(node_verifying(t))
+        verdict = monitor.classify(samples, halt_minutes=5.0, verify_halt_minutes=45.0)
+        self.assertEqual(verdict.status, "ok")
+        self.assertEqual(verdict.phase, "catchup")
+
+    def test_frozen_verify_counters_past_verify_allowance_is_stuck(self):
+        samples = [node_verifying(0)]
+        for t in range(1, 3000, 10):
+            samples.append(node_verifying(t))
+        verdict = monitor.classify(samples, halt_minutes=5.0, verify_halt_minutes=45.0)
+        self.assertEqual(verdict.status, "stuck")
+        self.assertEqual(verdict.phase, "catchup")
+        self.assertIn("verify-phase allowance", verdict.message)
+
+    def test_verify_phase_then_final_jump_and_follow_is_ok(self):
+        # Realistic shape: import completes, verify counters sit frozen at
+        # 0 for a while (< verify_halt_minutes), then jump straight to the
+        # final counts (the actual non-incremental behavior), then follow
+        # mode proceeds normally.
+        samples = [node_verifying(t) for t in range(0, 400, 10)]
+        samples.append(node_verifying(400, verified_accts=1000, verified_kvs=200))
+        samples.append(
+            {
+                "ts": 410,
+                "node": {"ok": True, "catchpoint": None, "last_round": 50_000_000},
+                "peer": {"ok": True, "last_round": 50_000_000},
+            }
+        )
+        for t in range(420, 500, 10):
+            samples.append(node_follow(t, round_=50_000_000 + (t - 410), peer_round=50_000_000 + (t - 410)))
+        verdict = monitor.classify(samples, halt_minutes=5.0, verify_halt_minutes=45.0)
+        self.assertEqual(verdict.status, "ok")
+
+    def test_verify_looking_freeze_still_needs_advancing_peer_to_be_stuck_not_outage(self):
+        # Past the verify allowance, but the peer itself never proves the
+        # network was alive -> source_outage, not stuck (same priority
+        # rule as every other phase).
+        samples = [
+            {
+                "ts": t,
+                "node": node_verifying(t)["node"],
+                "peer": {"ok": False, "error": "connection refused", "last_round": None},
+            }
+            for t in range(0, 3000, 10)
+        ]
+        verdict = monitor.classify(samples, halt_minutes=5.0, verify_halt_minutes=45.0)
+        self.assertEqual(verdict.status, "source_outage")
 
 
 class ClassifyStuckDuringFollowTest(unittest.TestCase):
@@ -258,6 +375,141 @@ class CollectEarlyStopTest(unittest.TestCase):
                 self.assertLess(len(lines), 20)
         finally:
             monitor.fetch_status = orig_fetch
+
+
+class CollectUnreachableGraceTest(unittest.TestCase):
+    """Issue #1623 live dispatch (run 36204923591): the node's REST
+    endpoint went genuinely unreachable (timed out) during/after the
+    non-incremental verify pass under CI-runner CPU contention. A live
+    `collect()` loop must not treat a single unreachable poll (process
+    still alive) as an immediate NODE_FAILURE -- it needs a grace window
+    to reconnect, longer if the last known-good sample looked like the
+    verify window."""
+
+    def _run_collect(self, scripted, **kwargs):
+        import itertools
+        import tempfile
+
+        it = iter(scripted)
+        tail = scripted[-1]
+
+        def fake_take_sample(*_a, **_kw):
+            nonlocal it
+            try:
+                s = next(it)
+            except StopIteration:
+                s = tail
+            return {"ts": time.time(), "node": s["node"], "peer": s["peer"]}
+
+        orig = monitor.take_sample
+        monitor.take_sample = fake_take_sample
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                out = os.path.join(d, "out.jsonl")
+                return monitor.collect(
+                    node_url="http://node",
+                    node_token="",
+                    peer_url="http://peer",
+                    peer_token="",
+                    out_path=out,
+                    process_alive=lambda: True,
+                    **kwargs,
+                )
+        finally:
+            monitor.take_sample = orig
+
+    def test_transient_unreachable_poll_recovering_within_grace_is_not_failure(self):
+        unreachable = {"node": {"ok": False, "error": "timeout"}, "peer": {"ok": True, "last_round": 101}}
+        scripted = (
+            [{"node": {"ok": True, "catchpoint": None, "last_round": 100}, "peer": {"ok": True, "last_round": 100}}]
+            + [unreachable] * 3
+            + [{"node": {"ok": True, "catchpoint": None, "last_round": 105}, "peer": {"ok": True, "last_round": 105}}]
+        )
+        verdict = self._run_collect(
+            scripted,
+            duration_s=0.4,
+            halt_minutes=5.0,
+            verify_halt_minutes=0.05,
+            unreachable_grace_minutes=0.05,
+            poll_interval_s=0.02,
+        )
+        self.assertEqual(verdict.status, "ok")
+
+    def test_unreachable_past_generic_grace_is_node_failure(self):
+        scripted = [
+            {"node": {"ok": True, "catchpoint": None, "last_round": 100}, "peer": {"ok": True, "last_round": 100}},
+            {"node": {"ok": False, "error": "timeout"}, "peer": {"ok": True, "last_round": 200}},
+        ]
+        verdict = self._run_collect(
+            scripted,
+            duration_s=1.0,
+            halt_minutes=5.0,
+            verify_halt_minutes=0.05,
+            unreachable_grace_minutes=0.01,
+            poll_interval_s=0.02,
+        )
+        self.assertEqual(verdict.status, "node_failure")
+
+    def test_unreachable_after_verify_signature_gets_the_longer_verify_allowance(self):
+        verifying_ok = {
+            "node": {
+                "ok": True,
+                "catchpoint": "40000000#AAAA",
+                "catchpoint_acquired_blocks": 100,
+                "catchpoint_processed_accounts": 1000,
+                "catchpoint_processed_kvs": 200,
+                "catchpoint_verified_accounts": 0,
+                "catchpoint_verified_kvs": 0,
+                "catchpoint_total_blocks": 100,
+                "catchpoint_total_accounts": 1000,
+                "catchpoint_total_kvs": 200,
+                "last_round": 0,
+            },
+            "peer": {"ok": True, "last_round": 40000100},
+        }
+        unreachable = {"node": {"ok": False, "error": "timeout"}, "peer": {"ok": True, "last_round": 40000200}}
+        scripted = [verifying_ok, unreachable]
+        # Past the short generic grace, but well inside the longer verify
+        # allowance -- must still be tolerated, not classified as a halt.
+        verdict = self._run_collect(
+            scripted,
+            duration_s=0.3,
+            halt_minutes=5.0,
+            verify_halt_minutes=10.0,
+            unreachable_grace_minutes=0.001,
+            poll_interval_s=0.02,
+        )
+        self.assertEqual(verdict.status, "ok")
+
+    def test_confirmed_dead_process_is_never_given_the_grace_window(self):
+        # Sanity: process_alive() -> False must still fail immediately,
+        # exactly as before this change (covered directly in
+        # CollectEarlyStopTest, re-asserted here against the new grace
+        # bookkeeping too).
+        import tempfile
+
+        calls = {"n": 0}
+        monitor_fetch_orig = monitor.fetch_status
+        monitor.fetch_status = lambda *a, **kw: {"ok": True, "catchpoint": None, "last_round": 1}
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                out = os.path.join(d, "out.jsonl")
+                verdict = monitor.collect(
+                    node_url="http://node",
+                    node_token="",
+                    peer_url="http://peer",
+                    peer_token="",
+                    duration_s=10.0,
+                    halt_minutes=5.0,
+                    verify_halt_minutes=45.0,
+                    unreachable_grace_minutes=45.0,
+                    poll_interval_s=0.01,
+                    out_path=out,
+                    process_alive=lambda: (calls.__setitem__("n", calls["n"] + 1), calls["n"] < 2)[1],
+                )
+                self.assertEqual(verdict.status, "node_failure")
+        finally:
+            monitor.fetch_status = monitor_fetch_orig
 
 
 if __name__ == "__main__":

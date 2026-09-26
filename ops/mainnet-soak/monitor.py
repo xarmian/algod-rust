@@ -30,6 +30,22 @@
 #     moving, even though `last-round` isn't expected to advance yet.
 #   - "follow" phase (no `catchpoint`): the node's `last-round`.
 #
+# Verify-phase allowance (issue #1623): algod-rust's `run_verify_ledger`
+# (`crates/core/algo-ledger/src/sync/mod.rs`) rebuilds the Merkle trie and
+# compares the catchpoint label in one single, non-incremental step -- it
+# jumps straight from "importing" to the final verified-accounts/kvs count
+# rather than reporting progress mid-trie-build the way go-algorand's own
+# `updateVerifiedCounts` does. For a mainnet-sized catchpoint (~22.47M
+# accounts) that single step has been observed to legitimately take 900+
+# seconds with the catchup counters completely frozen the whole time --
+# well past the default 5-minute `halt_minutes` used for genuine stalls.
+# `is_verifying_signature()` recognizes this specific, already-visible-in-
+# the-existing-fields window (import counters all fully caught up to their
+# totals, verify counters not yet) and `classify()` gives it its own,
+# longer-but-still-finite `verify_halt_minutes` allowance instead of the
+# steady-state one -- so a real deadlock inside the trie rebuild is still
+# eventually caught, just not mistaken for a stall at 5 minutes in.
+#
 # Verdict, in priority order:
 #   1. NODE_FAILURE -- the node process exited or its REST stopped
 #      answering. Exit 1 (issue-worthy): the round is the last one
@@ -57,6 +73,22 @@ import unittest
 from collections import namedtuple
 
 DEFAULT_HALT_MINUTES = 5.0
+# Generous-but-finite allowance for the single-shot, non-incremental
+# `VerifyingLedger` window (issue #1623) -- observed real duration on
+# mainnet is 900s+ (15min); this leaves wide margin above that while still
+# catching a genuine deadlock inside the trie rebuild eventually, rather
+# than exempting the phase from stall detection forever.
+DEFAULT_VERIFY_HALT_MINUTES = 45.0
+# Grace window (issue #1623 live dispatch, run 36204923591): the
+# non-incremental verify pass has been observed to starve the node's REST
+# responder under CI-runner CPU contention badly enough that individual
+# `/v2/status` polls time out -- a genuine-but-transient unresponsiveness,
+# not a dead process -- so a single failed poll must not immediately be
+# treated as NODE_FAILURE by the live collector. A generic transient blip
+# (not known to be verify-related) gets this shorter allowance; one whose
+# last known-good sample was mid-verify gets the longer
+# `verify_halt_minutes` allowance instead (see `collect()`).
+DEFAULT_UNREACHABLE_GRACE_MINUTES = 3.0
 DEFAULT_POLL_INTERVAL_S = 10.0
 # How close the node's last-round must be to the peer's to call the node
 # "at the tip" and end the catchup-phase clock. Matches the two-round
@@ -96,6 +128,37 @@ def node_signature(sample: dict):
     return ("follow", node.get("last_round"))
 
 
+def is_verifying_signature(sample: dict) -> bool:
+    """True if `sample` shows the node genuinely inside the non-incremental
+    `VerifyingLedger` window (issue #1623): every import-phase counter
+    (acquired blocks, processed accounts, processed kvs) has fully caught
+    up to its known total, but the verify-phase counters (verified
+    accounts/kvs) have not yet -- the exact frozen state
+    `run_verify_ledger` produces for the whole duration of its single-shot
+    Merkle-trie rebuild + label comparison, before it jumps straight to
+    the final verified counts. `False` for a node that isn't in a
+    catchpoint catchup at all, or is still mid-import (a real stall there
+    is not given this longer allowance)."""
+    node = sample.get("node") or {}
+    if not node.get("ok", False) or not (node.get("catchpoint") or ""):
+        return False
+
+    def done(total_key, val_key):
+        total = node.get(total_key)
+        val = node.get(val_key)
+        return isinstance(total, int) and isinstance(val, int) and val >= total
+
+    import_done = (
+        done("catchpoint_total_blocks", "catchpoint_acquired_blocks")
+        and done("catchpoint_total_accounts", "catchpoint_processed_accounts")
+        and done("catchpoint_total_kvs", "catchpoint_processed_kvs")
+    )
+    verify_done = done("catchpoint_total_accounts", "catchpoint_verified_accounts") and done(
+        "catchpoint_total_kvs", "catchpoint_verified_kvs"
+    )
+    return import_done and not verify_done
+
+
 def peer_advancing_between(samples, start_idx, end_idx):
     """True if the peer's own reported `last_round` increased anywhere in
     samples[start_idx..=end_idx], or the peer was simply unreachable for
@@ -111,7 +174,11 @@ def peer_advancing_between(samples, start_idx, end_idx):
     return max(seen) > min(seen)
 
 
-def classify(samples: list, halt_minutes: float = DEFAULT_HALT_MINUTES) -> Verdict:
+def classify(
+    samples: list,
+    halt_minutes: float = DEFAULT_HALT_MINUTES,
+    verify_halt_minutes: float = DEFAULT_VERIFY_HALT_MINUTES,
+) -> Verdict:
     """Walk `samples` (ordered by `ts`, ascending) and return the verdict.
 
     `samples[i]` shape:
@@ -122,6 +189,12 @@ def classify(samples: list, halt_minutes: float = DEFAULT_HALT_MINUTES) -> Verdi
                     "last_round": int|None},
           "peer": {"ok": bool, "error": str|None, "last_round": int|None},
         }
+
+    A frozen signature whose most recent sample looks like the node is
+    genuinely inside the non-incremental verify window
+    (`is_verifying_signature()`, issue #1623) is judged against
+    `verify_halt_minutes` instead of `halt_minutes` -- longer, but still
+    finite, so a real deadlock in that phase is still eventually caught.
     """
     if not samples:
         return Verdict("ok", None, None, "no samples collected", None)
@@ -169,27 +242,32 @@ def classify(samples: list, halt_minutes: float = DEFAULT_HALT_MINUTES) -> Verdi
             last_change_ts = s["ts"]
 
     stalled_for = samples[-1]["ts"] - last_change_ts
-    if stalled_for < halt_s:
+    verifying = last_sig is not None and last_sig[0] == "catchup" and is_verifying_signature(samples[-1])
+    effective_halt_s = (verify_halt_minutes * 60.0) if verifying else halt_s
+
+    if stalled_for < effective_halt_s:
         phase = last_sig[0] if last_sig else None
         return Verdict("ok", phase, None, "no stall observed", None)
 
     phase, sig = last_sig
     round_ = sig if phase == "follow" else (sig[0] if sig and sig[0] is not None else None)
 
+    verify_note = " (past the verify-phase allowance)" if verifying else ""
+
     if peer_advancing_between(samples, last_change_idx, len(samples) - 1):
         return Verdict(
             "stuck",
             phase,
             round_,
-            f"node made no progress for {stalled_for:.0f}s during {phase} "
-            f"while the peer kept advancing",
+            f"node made no progress for {stalled_for:.0f}s during {phase}"
+            f"{verify_note} while the peer kept advancing",
             stalled_for,
         )
     return Verdict(
         "source_outage",
         phase,
         round_,
-        f"node made no progress for {stalled_for:.0f}s, but the peer did not "
+        f"node made no progress for {stalled_for:.0f}s{verify_note}, but the peer did not "
         f"prove the network was advancing either (unreachable or also stalled)",
         stalled_for,
     )
@@ -382,6 +460,8 @@ def collect(
     poll_interval_s,
     out_path,
     process_alive=lambda: True,
+    verify_halt_minutes=DEFAULT_VERIFY_HALT_MINUTES,
+    unreachable_grace_minutes=DEFAULT_UNREACHABLE_GRACE_MINUTES,
 ):
     """Poll both endpoints every `poll_interval_s` for up to `duration_s`,
     appending each sample to `out_path` as it's taken (so a killed/timed-out
@@ -391,15 +471,33 @@ def collect(
     is worth ending the run for early rather than burning the rest of the
     CI budget waiting it out). `process_alive` lets the caller report a
     known-dead child process immediately as a node_failure sample rather
-    than waiting for the next failed poll.
+    than waiting for the next failed poll -- that case is never given the
+    unreachable grace window below, since it's a confirmed death, not a
+    slow poll.
+
+    Unreachable-poll grace (issue #1623 live dispatch, run 36204923591): a
+    single unreachable `/v2/status` poll (the node process itself still
+    alive per `process_alive()`) is not immediately treated as
+    NODE_FAILURE -- `classify()`'s tail-based check would otherwise fire
+    on the very first bad poll of a live, growing stream, with no chance
+    to observe a recovery the way post-hoc analysis of a complete log can.
+    The node is given `unreachable_grace_minutes` (or the longer
+    `verify_halt_minutes`, if the last known-good sample looked like the
+    non-incremental verify window -- that pass has been observed to starve
+    the REST responder under CI-runner CPU contention badly enough to time
+    out polls without the node actually being dead) to become reachable
+    again before the failure is treated as real.
 
     Returns the final `Verdict`.
     """
     start = time.time()
     samples = []
+    unreachable_since = None
+    last_ok_was_verifying = False
     with open(out_path, "a", encoding="utf-8") as f:
         while True:
-            if not process_alive():
+            died = not process_alive()
+            if died:
                 samples.append(
                     {
                         "ts": time.time(),
@@ -412,10 +510,43 @@ def collect(
             f.write(json.dumps(samples[-1]) + "\n")
             f.flush()
 
-            verdict = classify(samples, halt_minutes)
+            now = time.time()
+            node = samples[-1].get("node") or {}
+            if died:
+                # A confirmed-dead process is never given the grace window.
+                unreachable_since = None
+            elif node.get("ok", False):
+                unreachable_since = None
+                last_ok_was_verifying = is_verifying_signature(samples[-1])
+            else:
+                if unreachable_since is None:
+                    unreachable_since = now
+                grace_s = (
+                    verify_halt_minutes if last_ok_was_verifying else unreachable_grace_minutes
+                ) * 60.0
+                if now - unreachable_since < grace_s:
+                    if now - start >= duration_s:
+                        # The run budget ended while still inside an active
+                        # grace window -- report "ok" rather than calling
+                        # classify() (whose tail-based NODE_FAILURE check
+                        # would fire on the still-in-progress transient
+                        # blip we're deliberately tolerating), matching the
+                        # existing "still catching up at budget end is not
+                        # the same claim as stuck" policy for this case.
+                        return Verdict(
+                            "ok",
+                            None,
+                            None,
+                            "run budget ended within an active unreachable-grace window",
+                            None,
+                        )
+                    time.sleep(poll_interval_s)
+                    continue
+
+            verdict = classify(samples, halt_minutes, verify_halt_minutes)
             if verdict.status != "ok":
                 return verdict
-            if time.time() - start >= duration_s:
+            if now - start >= duration_s:
                 return verdict
             time.sleep(poll_interval_s)
 
@@ -457,7 +588,7 @@ def _emit(result: dict, json_out: str | None):
 
 def _cmd_analyze(args):
     samples = _load_jsonl(args.jsonl)
-    verdict = classify(samples, args.halt_minutes)
+    verdict = classify(samples, args.halt_minutes, args.verify_halt_minutes)
     _emit(build_result(samples, verdict), args.json_out)
     return exit_code_for(verdict)
 
@@ -470,6 +601,8 @@ def _cmd_collect(args):
         peer_token=args.peer_token,
         duration_s=args.duration_minutes * 60.0,
         halt_minutes=args.halt_minutes,
+        verify_halt_minutes=args.verify_halt_minutes,
+        unreachable_grace_minutes=args.unreachable_grace_minutes,
         poll_interval_s=args.poll_interval_s,
         out_path=args.out,
     )
@@ -508,6 +641,10 @@ def main(argv=None) -> int:
     p_collect.add_argument("--peer-token", default="")
     p_collect.add_argument("--duration-minutes", type=float, default=60.0)
     p_collect.add_argument("--halt-minutes", type=float, default=DEFAULT_HALT_MINUTES)
+    p_collect.add_argument("--verify-halt-minutes", type=float, default=DEFAULT_VERIFY_HALT_MINUTES)
+    p_collect.add_argument(
+        "--unreachable-grace-minutes", type=float, default=DEFAULT_UNREACHABLE_GRACE_MINUTES
+    )
     p_collect.add_argument("--poll-interval-s", type=float, default=DEFAULT_POLL_INTERVAL_S)
     p_collect.add_argument("--out", required=True, help="JSONL output path")
     p_collect.add_argument("--json-out", default=None, help="verdict+summary JSON path")
@@ -516,6 +653,7 @@ def main(argv=None) -> int:
     p_analyze = sub.add_parser("analyze", help="verdict over an existing JSONL (dry runs, tests)")
     p_analyze.add_argument("jsonl")
     p_analyze.add_argument("--halt-minutes", type=float, default=DEFAULT_HALT_MINUTES)
+    p_analyze.add_argument("--verify-halt-minutes", type=float, default=DEFAULT_VERIFY_HALT_MINUTES)
     p_analyze.add_argument("--json-out", default=None)
     p_analyze.set_defaults(func=_cmd_analyze)
 

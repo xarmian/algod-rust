@@ -49,12 +49,40 @@ The node reports a **progress signature** every poll:
 
 If that signature is unchanged for `halt_minutes` (default 5) **and** the
 catchup peer's own `last-round` kept advancing during the same window, the
-node is genuinely stuck — a real halt, worth an issue. If the peer was
+node is genuinely stuck — a real halt, worth an issue.
+
+**Exception — the verify phase (issue #1623):** algod-rust's
+`run_verify_ledger` (`crates/core/algo-ledger/src/sync/mod.rs`) rebuilds
+the Merkle trie and compares the catchpoint label in one single,
+non-incremental step, unlike go-algorand's incremental
+`updateVerifiedCounts`. That step has been observed to take 900+ seconds
+on a real mainnet-sized catchpoint (~22.47M accounts) with the catchup
+counters completely frozen the whole time — legitimate work, not a stall.
+`monitor.py`'s `is_verifying_signature()` recognizes this specific window
+(import counters fully caught up to their totals, verify counters not
+yet) from fields already in `/v2/status`, and gives it its own, longer
+`verify_halt_minutes` allowance (default 45) instead of the steady-state
+`halt_minutes` — still finite, so a genuine deadlock in the trie rebuild
+is caught eventually, just not mistaken for a stall at 5 minutes in.
+
+If the peer was
 *also* frozen, or unreachable, there's no way to tell node staleness from
 network staleness, so it's classified a **source outage** — a warning,
 never an issue. If the node process exits or its REST stops answering
 (and never recovers before the stream ends), that's a **node failure**,
 reported at the last round observed.
+
+**Exception — a still-alive node's REST going briefly unreachable (issue
+#1623, live-dispatch follow-up):** a live run (36204923591) showed the
+verify phase can starve the node's REST responder under CI-runner CPU
+contention badly enough that individual `/v2/status` polls time out
+outright, not just return frozen counters. `collect()`'s live loop gives
+a single unreachable poll (the child process still running per
+`process_alive()`) a grace window before treating it as a real
+`node_failure` — `unreachable_grace_minutes` (default 3) normally, or the
+longer `verify_halt_minutes` if the last known-good sample looked like
+the verify window. A confirmed-dead process (`process_alive()` returns
+`False`) is never given this grace — that failure is real and immediate.
 
 A node that's still catching up when the time budget runs out, having
 made continuous progress the whole time, is **not** a halt — "didn't
