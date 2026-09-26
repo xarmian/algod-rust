@@ -17,6 +17,7 @@ running it against a real 60-minute mainnet soak.
 
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -374,6 +375,141 @@ class CollectEarlyStopTest(unittest.TestCase):
                 self.assertLess(len(lines), 20)
         finally:
             monitor.fetch_status = orig_fetch
+
+
+class CollectUnreachableGraceTest(unittest.TestCase):
+    """Issue #1623 live dispatch (run 36204923591): the node's REST
+    endpoint went genuinely unreachable (timed out) during/after the
+    non-incremental verify pass under CI-runner CPU contention. A live
+    `collect()` loop must not treat a single unreachable poll (process
+    still alive) as an immediate NODE_FAILURE -- it needs a grace window
+    to reconnect, longer if the last known-good sample looked like the
+    verify window."""
+
+    def _run_collect(self, scripted, **kwargs):
+        import itertools
+        import tempfile
+
+        it = iter(scripted)
+        tail = scripted[-1]
+
+        def fake_take_sample(*_a, **_kw):
+            nonlocal it
+            try:
+                s = next(it)
+            except StopIteration:
+                s = tail
+            return {"ts": time.time(), "node": s["node"], "peer": s["peer"]}
+
+        orig = monitor.take_sample
+        monitor.take_sample = fake_take_sample
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                out = os.path.join(d, "out.jsonl")
+                return monitor.collect(
+                    node_url="http://node",
+                    node_token="",
+                    peer_url="http://peer",
+                    peer_token="",
+                    out_path=out,
+                    process_alive=lambda: True,
+                    **kwargs,
+                )
+        finally:
+            monitor.take_sample = orig
+
+    def test_transient_unreachable_poll_recovering_within_grace_is_not_failure(self):
+        unreachable = {"node": {"ok": False, "error": "timeout"}, "peer": {"ok": True, "last_round": 101}}
+        scripted = (
+            [{"node": {"ok": True, "catchpoint": None, "last_round": 100}, "peer": {"ok": True, "last_round": 100}}]
+            + [unreachable] * 3
+            + [{"node": {"ok": True, "catchpoint": None, "last_round": 105}, "peer": {"ok": True, "last_round": 105}}]
+        )
+        verdict = self._run_collect(
+            scripted,
+            duration_s=0.4,
+            halt_minutes=5.0,
+            verify_halt_minutes=0.05,
+            unreachable_grace_minutes=0.05,
+            poll_interval_s=0.02,
+        )
+        self.assertEqual(verdict.status, "ok")
+
+    def test_unreachable_past_generic_grace_is_node_failure(self):
+        scripted = [
+            {"node": {"ok": True, "catchpoint": None, "last_round": 100}, "peer": {"ok": True, "last_round": 100}},
+            {"node": {"ok": False, "error": "timeout"}, "peer": {"ok": True, "last_round": 200}},
+        ]
+        verdict = self._run_collect(
+            scripted,
+            duration_s=1.0,
+            halt_minutes=5.0,
+            verify_halt_minutes=0.05,
+            unreachable_grace_minutes=0.01,
+            poll_interval_s=0.02,
+        )
+        self.assertEqual(verdict.status, "node_failure")
+
+    def test_unreachable_after_verify_signature_gets_the_longer_verify_allowance(self):
+        verifying_ok = {
+            "node": {
+                "ok": True,
+                "catchpoint": "40000000#AAAA",
+                "catchpoint_acquired_blocks": 100,
+                "catchpoint_processed_accounts": 1000,
+                "catchpoint_processed_kvs": 200,
+                "catchpoint_verified_accounts": 0,
+                "catchpoint_verified_kvs": 0,
+                "catchpoint_total_blocks": 100,
+                "catchpoint_total_accounts": 1000,
+                "catchpoint_total_kvs": 200,
+                "last_round": 0,
+            },
+            "peer": {"ok": True, "last_round": 40000100},
+        }
+        unreachable = {"node": {"ok": False, "error": "timeout"}, "peer": {"ok": True, "last_round": 40000200}}
+        scripted = [verifying_ok, unreachable]
+        # Past the short generic grace, but well inside the longer verify
+        # allowance -- must still be tolerated, not classified as a halt.
+        verdict = self._run_collect(
+            scripted,
+            duration_s=0.3,
+            halt_minutes=5.0,
+            verify_halt_minutes=10.0,
+            unreachable_grace_minutes=0.001,
+            poll_interval_s=0.02,
+        )
+        self.assertEqual(verdict.status, "ok")
+
+    def test_confirmed_dead_process_is_never_given_the_grace_window(self):
+        # Sanity: process_alive() -> False must still fail immediately,
+        # exactly as before this change (covered directly in
+        # CollectEarlyStopTest, re-asserted here against the new grace
+        # bookkeeping too).
+        import tempfile
+
+        calls = {"n": 0}
+        monitor_fetch_orig = monitor.fetch_status
+        monitor.fetch_status = lambda *a, **kw: {"ok": True, "catchpoint": None, "last_round": 1}
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                out = os.path.join(d, "out.jsonl")
+                verdict = monitor.collect(
+                    node_url="http://node",
+                    node_token="",
+                    peer_url="http://peer",
+                    peer_token="",
+                    duration_s=10.0,
+                    halt_minutes=5.0,
+                    verify_halt_minutes=45.0,
+                    unreachable_grace_minutes=45.0,
+                    poll_interval_s=0.01,
+                    out_path=out,
+                    process_alive=lambda: (calls.__setitem__("n", calls["n"] + 1), calls["n"] < 2)[1],
+                )
+                self.assertEqual(verdict.status, "node_failure")
+        finally:
+            monitor.fetch_status = monitor_fetch_orig
 
 
 if __name__ == "__main__":

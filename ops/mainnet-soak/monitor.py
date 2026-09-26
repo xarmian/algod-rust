@@ -79,6 +79,16 @@ DEFAULT_HALT_MINUTES = 5.0
 # catching a genuine deadlock inside the trie rebuild eventually, rather
 # than exempting the phase from stall detection forever.
 DEFAULT_VERIFY_HALT_MINUTES = 45.0
+# Grace window (issue #1623 live dispatch, run 36204923591): the
+# non-incremental verify pass has been observed to starve the node's REST
+# responder under CI-runner CPU contention badly enough that individual
+# `/v2/status` polls time out -- a genuine-but-transient unresponsiveness,
+# not a dead process -- so a single failed poll must not immediately be
+# treated as NODE_FAILURE by the live collector. A generic transient blip
+# (not known to be verify-related) gets this shorter allowance; one whose
+# last known-good sample was mid-verify gets the longer
+# `verify_halt_minutes` allowance instead (see `collect()`).
+DEFAULT_UNREACHABLE_GRACE_MINUTES = 3.0
 DEFAULT_POLL_INTERVAL_S = 10.0
 # How close the node's last-round must be to the peer's to call the node
 # "at the tip" and end the catchup-phase clock. Matches the two-round
@@ -451,6 +461,7 @@ def collect(
     out_path,
     process_alive=lambda: True,
     verify_halt_minutes=DEFAULT_VERIFY_HALT_MINUTES,
+    unreachable_grace_minutes=DEFAULT_UNREACHABLE_GRACE_MINUTES,
 ):
     """Poll both endpoints every `poll_interval_s` for up to `duration_s`,
     appending each sample to `out_path` as it's taken (so a killed/timed-out
@@ -460,15 +471,33 @@ def collect(
     is worth ending the run for early rather than burning the rest of the
     CI budget waiting it out). `process_alive` lets the caller report a
     known-dead child process immediately as a node_failure sample rather
-    than waiting for the next failed poll.
+    than waiting for the next failed poll -- that case is never given the
+    unreachable grace window below, since it's a confirmed death, not a
+    slow poll.
+
+    Unreachable-poll grace (issue #1623 live dispatch, run 36204923591): a
+    single unreachable `/v2/status` poll (the node process itself still
+    alive per `process_alive()`) is not immediately treated as
+    NODE_FAILURE -- `classify()`'s tail-based check would otherwise fire
+    on the very first bad poll of a live, growing stream, with no chance
+    to observe a recovery the way post-hoc analysis of a complete log can.
+    The node is given `unreachable_grace_minutes` (or the longer
+    `verify_halt_minutes`, if the last known-good sample looked like the
+    non-incremental verify window -- that pass has been observed to starve
+    the REST responder under CI-runner CPU contention badly enough to time
+    out polls without the node actually being dead) to become reachable
+    again before the failure is treated as real.
 
     Returns the final `Verdict`.
     """
     start = time.time()
     samples = []
+    unreachable_since = None
+    last_ok_was_verifying = False
     with open(out_path, "a", encoding="utf-8") as f:
         while True:
-            if not process_alive():
+            died = not process_alive()
+            if died:
                 samples.append(
                     {
                         "ts": time.time(),
@@ -481,10 +510,43 @@ def collect(
             f.write(json.dumps(samples[-1]) + "\n")
             f.flush()
 
+            now = time.time()
+            node = samples[-1].get("node") or {}
+            if died:
+                # A confirmed-dead process is never given the grace window.
+                unreachable_since = None
+            elif node.get("ok", False):
+                unreachable_since = None
+                last_ok_was_verifying = is_verifying_signature(samples[-1])
+            else:
+                if unreachable_since is None:
+                    unreachable_since = now
+                grace_s = (
+                    verify_halt_minutes if last_ok_was_verifying else unreachable_grace_minutes
+                ) * 60.0
+                if now - unreachable_since < grace_s:
+                    if now - start >= duration_s:
+                        # The run budget ended while still inside an active
+                        # grace window -- report "ok" rather than calling
+                        # classify() (whose tail-based NODE_FAILURE check
+                        # would fire on the still-in-progress transient
+                        # blip we're deliberately tolerating), matching the
+                        # existing "still catching up at budget end is not
+                        # the same claim as stuck" policy for this case.
+                        return Verdict(
+                            "ok",
+                            None,
+                            None,
+                            "run budget ended within an active unreachable-grace window",
+                            None,
+                        )
+                    time.sleep(poll_interval_s)
+                    continue
+
             verdict = classify(samples, halt_minutes, verify_halt_minutes)
             if verdict.status != "ok":
                 return verdict
-            if time.time() - start >= duration_s:
+            if now - start >= duration_s:
                 return verdict
             time.sleep(poll_interval_s)
 
@@ -540,6 +602,7 @@ def _cmd_collect(args):
         duration_s=args.duration_minutes * 60.0,
         halt_minutes=args.halt_minutes,
         verify_halt_minutes=args.verify_halt_minutes,
+        unreachable_grace_minutes=args.unreachable_grace_minutes,
         poll_interval_s=args.poll_interval_s,
         out_path=args.out,
     )
@@ -579,6 +642,9 @@ def main(argv=None) -> int:
     p_collect.add_argument("--duration-minutes", type=float, default=60.0)
     p_collect.add_argument("--halt-minutes", type=float, default=DEFAULT_HALT_MINUTES)
     p_collect.add_argument("--verify-halt-minutes", type=float, default=DEFAULT_VERIFY_HALT_MINUTES)
+    p_collect.add_argument(
+        "--unreachable-grace-minutes", type=float, default=DEFAULT_UNREACHABLE_GRACE_MINUTES
+    )
     p_collect.add_argument("--poll-interval-s", type=float, default=DEFAULT_POLL_INTERVAL_S)
     p_collect.add_argument("--out", required=True, help="JSONL output path")
     p_collect.add_argument("--json-out", default=None, help="verdict+summary JSON path")

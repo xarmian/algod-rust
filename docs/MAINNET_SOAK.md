@@ -72,6 +72,18 @@ never an issue. If the node process exits or its REST stops answering
 (and never recovers before the stream ends), that's a **node failure**,
 reported at the last round observed.
 
+**Exception — a still-alive node's REST going briefly unreachable (issue
+#1623, live-dispatch follow-up):** a live run (36204923591) showed the
+verify phase can starve the node's REST responder under CI-runner CPU
+contention badly enough that individual `/v2/status` polls time out
+outright, not just return frozen counters. `collect()`'s live loop gives
+a single unreachable poll (the child process still running per
+`process_alive()`) a grace window before treating it as a real
+`node_failure` — `unreachable_grace_minutes` (default 3) normally, or the
+longer `verify_halt_minutes` if the last known-good sample looked like
+the verify window. A confirmed-dead process (`process_alive()` returns
+`False`) is never given this grace — that failure is real and immediate.
+
 A node that's still catching up when the time budget runs out, having
 made continuous progress the whole time, is **not** a halt — "didn't
 finish within the budget" and "got stuck" are different claims, and
