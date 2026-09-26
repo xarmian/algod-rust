@@ -651,6 +651,23 @@ impl MerkleTrieCache {
         );
     }
 
+    /// True iff `id` was allocated or refurbished since the last
+    /// [`MerkleTrieCache::commit`] (i.e. it is a structurally new node
+    /// whose subtree may contain hash-stale internal nodes).
+    ///
+    /// Used by [`crate::merkle_trie::MerkleTrie::recompute_hash_at`] to
+    /// prune hash recomputation to only the nodes actually touched since
+    /// the last commit, instead of a full from-root traversal every
+    /// call. Every structural mutation (`add`/`delete`/CoW-refurbish)
+    /// always allocates a *new* id for every node on the modified path
+    /// (see `allocate` / `refurbish` above) — a node id absent from this
+    /// set is therefore guaranteed unchanged since the last commit, and
+    /// its already-computed `hash` field is still correct. See issue
+    /// #1626 (bounded-memory chunked catchpoint-verify trie rebuild).
+    pub(crate) fn is_pending_created(&self, id: u64) -> bool {
+        self.pending_created.contains(&id)
+    }
+
     /// True iff node `id` is in memory **right now** (no lazy load).
     /// Used by tests + diagnostics; the trie's algorithms always go
     /// through `get` / `get_mut` so they see lazy-loaded pages.

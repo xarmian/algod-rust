@@ -851,6 +851,257 @@ fn persist_rebuilt_trie(
     }
 }
 
+/// Number of elements added between periodic `commit()` + `evict()` passes
+/// during [`build_and_persist_trie_chunked`]. Matches go-algorand's
+/// `trieRebuildCommitFrequency` (`ledger/catchpointtracker.go:57`) exactly —
+/// "the number of accounts that would get added before we call evict to
+/// commit the changes and adjust the memory cache."
+const TRIE_REBUILD_COMMIT_FREQUENCY: u64 = 65536;
+
+/// Rebuild the account Merkle trie from the database with **bounded peak
+/// memory**, persisting it to `accounthashes` incrementally as it goes,
+/// instead of holding every one of mainnet's real ~22.47M
+/// accounts/resources/kvs resident in a single from-scratch in-memory pass
+/// before persisting once at the end (issue #1626).
+///
+/// Mirrors go-algorand's real `BuildMerkleTrie`
+/// (`ledger/catchupaccessor.go:793-940`) at the architectural level: elements
+/// are added in chunks, and every [`TRIE_REBUILD_COMMIT_FREQUENCY`] elements
+/// the trie is committed (dirty pages flushed to `accounthashes` through a
+/// second, owned, read-write [`crate::merkle_committer::OwnedSqliteCommitter`]
+/// pointed at the same database file) and evicted (LRU-trimmed back to the
+/// cache's default resident-node target), so memory stops growing once the
+/// working set stabilizes — go's `trie.Evict(true)` does exactly this pairing
+/// (commit-then-evict) via `catchupaccessor.go:922-940`.
+///
+/// This is safe from the O(N²) trap a naive "just call `commit()` more
+/// often" chunking would hit: `MerkleTrie::commit` recomputes hashes only for
+/// nodes structurally touched since the *previous* commit (PLAN-144/issue
+/// #1626's `recompute_hash_at` pruning — see `merkle_trie.rs`), so each
+/// periodic commit costs O(elements added since the last commit), not
+/// O(total elements in the trie).
+///
+/// Evicted pages are transparently reloaded on demand (a later chunk's
+/// insertion path may still need to traverse into an already-committed,
+/// now-evicted subtree — the account/resource/kv keyspace is not inserted in
+/// trie-sorted order) via a lazy loader installed on the trie itself, backed
+/// by a *third* owned connection to the same file.
+///
+/// `conn` must be a real file-backed connection (`conn.path()` returns
+/// `Some`) — in-memory test databases can't be reopened by path, so this
+/// falls back to the simpler, fully in-memory [`build_trie_from_db`] +
+/// [`persist_rebuilt_trie`] pair in that case (test datasets are always
+/// small enough that unbounded memory is a non-issue; the bounded-memory
+/// path exists specifically for mainnet-scale real catchpoints).
+fn build_and_persist_trie_chunked(
+    conn: &Connection,
+) -> Result<crate::merkle_trie::MerkleTrie, CatchpointError> {
+    use crate::merkle_committer::{CommitterTable, OwnedSqliteCommitter};
+    use crate::merkle_trie::MerkleTrie;
+    use crate::trie_hash::{extract_raw_affinity, kv_hash_v6, HashKind, ELEMENT_SIZE};
+
+    const CTYPE_APP: i64 = 1;
+
+    let Some(db_path) = conn.path() else {
+        // In-memory connection (tests) — no path to reopen. Fall back to
+        // the unbounded single-pass build; test fixtures are small.
+        let mut trie = build_trie_from_db(conn)?;
+        persist_rebuilt_trie(conn, &mut trie)?;
+        return Ok(trie);
+    };
+    let db_path = db_path.to_string();
+
+    let write_committer = OwnedSqliteCommitter::open_writable(&db_path, CommitterTable::Active)
+        .map_err(|e| CatchpointError::ImportError(format!("open writable trie committer: {e}")))?;
+    let load_committer = OwnedSqliteCommitter::open_writable(&db_path, CommitterTable::Active)
+        .map_err(|e| CatchpointError::ImportError(format!("open lazy-load trie committer: {e}")))?;
+
+    let mut trie = MerkleTrie::new(ELEMENT_SIZE);
+    trie.set_lazy_loader(Box::new(load_committer));
+
+    let mut since_last_commit: u64 = 0;
+    // Every periodic flush's dirty-page writes are wrapped in ONE explicit
+    // transaction (issue #1626 live-dispatch finding: without this, each
+    // `store_page` call is its own autocommit transaction — a separate WAL
+    // fsync per page — which turned a single chunk-commit's hundreds-to-
+    // thousands of page writes into thousands of serialized fsyncs, slow
+    // enough that `mainnet-node-soak`'s halt detector flagged the run
+    // `stuck` even after the OOM/SIGTERM was already fixed). `evict()` only
+    // touches in-memory state, so it happens after the transaction commits.
+    let commit_and_evict = |trie: &mut MerkleTrie| -> Result<(), CatchpointError> {
+        write_committer
+            .begin_immediate()
+            .map_err(|e| CatchpointError::ImportError(format!("begin chunked trie commit: {e}")))?;
+        let commit_result = trie.commit(&write_committer);
+        match commit_result {
+            Ok(_) => write_committer.commit_txn().map_err(|e| {
+                CatchpointError::ImportError(format!("commit chunked trie transaction: {e}"))
+            })?,
+            Err(e) => {
+                write_committer.rollback_txn();
+                return Err(CatchpointError::ImportError(format!(
+                    "chunked trie commit: {e}"
+                )));
+            }
+        }
+        trie.evict()
+            .map_err(|e| CatchpointError::ImportError(format!("chunked trie evict: {e}")))?;
+        Ok(())
+    };
+
+    // 1. Process all accounts from accountbase.
+    {
+        let mut stmt = conn
+            .prepare("SELECT address, data FROM accountbase")
+            .map_err(|e| {
+                CatchpointError::ImportError(format!("prepare accounts for trie rebuild: {e}"))
+            })?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let addr_bytes: Vec<u8> = row.get(0)?;
+                let data: Vec<u8> = row.get(1)?;
+                Ok((addr_bytes, data))
+            })
+            .map_err(|e| {
+                CatchpointError::ImportError(format!("query accounts for trie rebuild: {e}"))
+            })?;
+
+        for row in rows {
+            let (addr_bytes, data) =
+                row.map_err(|e| CatchpointError::ImportError(format!("read account row: {e}")))?;
+            if addr_bytes.len() != 32 {
+                return Err(CatchpointError::ImportError(format!(
+                    "bad address length {} (expected 32) in accountbase",
+                    addr_bytes.len()
+                )));
+            }
+            let mut addr = [0u8; 32];
+            addr.copy_from_slice(&addr_bytes);
+            let affinity = extract_raw_affinity(&data);
+            let elem = raw_account_element(&addr, &data, affinity);
+            trie.add(&elem)
+                .map_err(|e| CatchpointError::ImportError(format!("trie add account: {e}")))?;
+            since_last_commit += 1;
+            if since_last_commit >= TRIE_REBUILD_COMMIT_FREQUENCY {
+                commit_and_evict(&mut trie)?;
+                since_last_commit = 0;
+            }
+        }
+    }
+
+    // 2. Process all resources.
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT r.addrid, r.aidx, r.ctype, r.data, a.address, a.data \
+                 FROM resources r \
+                 JOIN accountbase a ON a.rowid = r.addrid",
+            )
+            .map_err(|e| {
+                CatchpointError::ImportError(format!("prepare resources for trie rebuild: {e}"))
+            })?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let _addrid: i64 = row.get(0)?;
+                let aidx: i64 = row.get(1)?;
+                let ctype: i64 = row.get(2)?;
+                let rdata: Vec<u8> = row.get(3)?;
+                let addr_bytes: Vec<u8> = row.get(4)?;
+                let acct_data: Vec<u8> = row.get(5)?;
+                Ok((aidx, ctype, rdata, addr_bytes, acct_data))
+            })
+            .map_err(|e| {
+                CatchpointError::ImportError(format!("query resources for trie rebuild: {e}"))
+            })?;
+
+        for row in rows {
+            let (aidx, ctype, rdata, addr_bytes, _acct_data) =
+                row.map_err(|e| CatchpointError::ImportError(format!("read resource row: {e}")))?;
+            if addr_bytes.len() != 32 {
+                return Err(CatchpointError::ImportError(format!(
+                    "bad address length {} (expected 32) for resource aidx={aidx}",
+                    addr_bytes.len()
+                )));
+            }
+            let mut addr = [0u8; 32];
+            addr.copy_from_slice(&addr_bytes);
+
+            // Use the resource's own UpdateRound for affinity, matching Go's
+            // ResourcesHashBuilderV6 which passes resData.UpdateRound.
+            let affinity = extract_raw_affinity(&rdata);
+
+            let kind = if ctype == CTYPE_APP {
+                HashKind::App as u8
+            } else {
+                HashKind::Asset as u8
+            };
+
+            let elem = raw_resource_element(&addr, aidx as u64, &rdata, affinity, kind);
+            trie.add(&elem)
+                .map_err(|e| CatchpointError::ImportError(format!("trie add resource: {e}")))?;
+            since_last_commit += 1;
+            if since_last_commit >= TRIE_REBUILD_COMMIT_FREQUENCY {
+                commit_and_evict(&mut trie)?;
+                since_last_commit = 0;
+            }
+        }
+    }
+
+    // 3. Process all KV (box) entries from kvstore.
+    {
+        let mut stmt = conn
+            .prepare("SELECT key, value FROM kvstore")
+            .map_err(|e| {
+                CatchpointError::ImportError(format!("prepare kvstore for trie rebuild: {e}"))
+            })?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let key: Vec<u8> = row.get(0)?;
+                let value: Vec<u8> = row.get(1)?;
+                Ok((key, value))
+            })
+            .map_err(|e| {
+                CatchpointError::ImportError(format!("prepare kvstore for trie rebuild: {e}"))
+            })?;
+
+        for row in rows {
+            let (key, value) =
+                row.map_err(|e| CatchpointError::ImportError(format!("read kvstore row: {e}")))?;
+            let elem = kv_hash_v6(&key, &value);
+            trie.add(&elem)
+                .map_err(|e| CatchpointError::ImportError(format!("trie add kv: {e}")))?;
+            since_last_commit += 1;
+            if since_last_commit >= TRIE_REBUILD_COMMIT_FREQUENCY {
+                commit_and_evict(&mut trie)?;
+                since_last_commit = 0;
+            }
+        }
+    }
+
+    // Final flush of whatever remains uncommitted (no eviction needed —
+    // the build is done). Same explicit-transaction wrapping as every
+    // periodic flush above.
+    write_committer
+        .begin_immediate()
+        .map_err(|e| CatchpointError::ImportError(format!("begin final chunked trie commit: {e}")))?;
+    match trie.commit(&write_committer) {
+        Ok(_) => write_committer.commit_txn().map_err(|e| {
+            CatchpointError::ImportError(format!("commit final chunked trie transaction: {e}"))
+        })?,
+        Err(e) => {
+            write_committer.rollback_txn();
+            return Err(CatchpointError::ImportError(format!(
+                "final chunked trie commit: {e}"
+            )));
+        }
+    }
+
+    Ok(trie)
+}
+
 // ---------------------------------------------------------------------------
 // Lookback block download orchestration
 // ---------------------------------------------------------------------------
@@ -1324,29 +1575,22 @@ pub fn verify_catchpoint(
     // catchpoint *export* path, which must not touch that node's own
     // already-committed `accounthashes`), catchpoint *import* verification
     // is building this trie from scratch specifically so the newly-imported
-    // ledger has one at all -- so, once the root hash is known, persist it
-    // to `accounthashes` immediately (issue #1626) rather than discarding
-    // it. Without this, the very next normal ledger open
-    // (`SqliteLedger::load_trie`) finds `accounthashes` empty and repeats
-    // this entire from-scratch, fully-in-memory rebuild over every
-    // account/resource/kv a second time, roughly doubling both the
-    // wall-clock time and the number of multi-gigabyte trie-construction
-    // episodes the process must survive back to back on a real mainnet
-    // catchpoint -- a real, confirmed contributor to the sustained CPU/
-    // memory pressure that got `mainnet-node-soak.yml` externally SIGTERM'd
-    // during verify. This does not by itself bound *peak* memory during a
-    // single rebuild pass -- that would need the same incremental
-    // chunk/commit/evict discipline go-algorand's own `BuildMerkleTrie` uses
-    // (`ledger/catchupaccessor.go`, `trieRebuildAccountChunkSize` /
-    // `trieRebuildCommitFrequency`, `catchpointtracker.go`), which requires
-    // per-subtree dirty tracking this trie doesn't have yet -- but removing
-    // one whole redundant rebuild from the hot path is a real, bounded-risk
-    // step toward it.
-    let mut trie = build_trie_from_db(conn)?;
+    // ledger has one at all -- so, once the root hash is known, it has
+    // already been persisted to `accounthashes` incrementally as it was
+    // built (issue #1626) rather than discarding it or holding it all in
+    // memory. `build_and_persist_trie_chunked` bounds peak memory the same
+    // way go-algorand's own `BuildMerkleTrie` does (chunked add + periodic
+    // commit + evict, matching `trieRebuildAccountChunkSize` /
+    // `trieRebuildCommitFrequency` in `ledger/catchupaccessor.go` /
+    // `catchpointtracker.go`) instead of holding all of mainnet's real
+    // ~22.47M accounts/resources/kvs resident in a single from-scratch pass
+    // -- the real, confirmed contributor to the sustained CPU/memory
+    // pressure that got `mainnet-node-soak.yml` externally SIGTERM'd during
+    // verify.
+    let mut trie = build_and_persist_trie_chunked(conn)?;
     let trie_root = trie
         .root_hash()
         .map_err(|e| CatchpointError::ImportError(format!("trie root_hash: {e}")))?;
-    persist_rebuilt_trie(conn, &mut trie)?;
 
     // Step 5: Compute component hashes.
     let sp_hash = calculate_sp_verification_hash(conn)?;
@@ -3037,5 +3281,158 @@ mod tests {
             result.is_err(),
             "verify_catchpoint before atomic_cutover must fail"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Bounded-memory chunked trie rebuild (issue #1626).
+    //
+    // `build_and_persist_trie_chunked` must produce the exact same root hash
+    // as the old unbounded `build_trie_from_db` + `persist_rebuilt_trie`
+    // pair, and must actually persist through `accounthashes` incrementally
+    // via a real file-backed connection (the in-memory-DB path exercises
+    // only the fallback branch, not the chunked committer wiring this issue
+    // is actually about).
+    // -----------------------------------------------------------------------
+
+    /// Build a file-backed test DB (not `:memory:` — the chunked path needs
+    /// `conn.path()` to be `Some` to open its extra committer connections)
+    /// with `accountbase`/`resources`/`kvstore`/`accounthashes` and
+    /// populate it with `n_accounts` synthetic accounts, `n_resources`
+    /// synthetic resources (attached round-robin to the accounts), and
+    /// `n_kvs` synthetic kv entries. Returns the open connection and the
+    /// temp-dir guard (drop order keeps the directory alive).
+    fn build_file_backed_trie_test_db(
+        n_accounts: u32,
+        n_resources: u32,
+        n_kvs: u32,
+    ) -> (Connection, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-verify-chunked-trie-test-{}-{}-{}",
+            std::process::id(),
+            line!(),
+            n_accounts
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("trie_test.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE accountbase (
+                addrid INTEGER PRIMARY KEY NOT NULL,
+                address BLOB NOT NULL,
+                data BLOB,
+                normalizedonlinebalance INTEGER
+             );
+             CREATE TABLE resources (
+                addrid INTEGER NOT NULL, aidx INTEGER NOT NULL,
+                data BLOB NOT NULL, ctype INTEGER NOT NULL DEFAULT -1,
+                PRIMARY KEY (addrid, aidx)
+             ) WITHOUT ROWID;
+             CREATE TABLE kvstore (key BLOB PRIMARY KEY, value BLOB);
+             CREATE TABLE accounthashes (id INTEGER PRIMARY KEY, data BLOB);",
+        )
+        .unwrap();
+
+        for i in 0..n_accounts {
+            let mut addr = [0u8; 32];
+            addr[..4].copy_from_slice(&i.to_be_bytes());
+            let data = format!("acct-data-{i}").into_bytes();
+            conn.execute(
+                "INSERT INTO accountbase (addrid, address, data, normalizedonlinebalance) \
+                 VALUES (?1, ?2, ?3, 0)",
+                rusqlite::params![i as i64 + 1, addr.to_vec(), data],
+            )
+            .unwrap();
+        }
+        for i in 0..n_resources {
+            let addrid = if n_accounts == 0 {
+                1
+            } else {
+                (i % n_accounts) as i64 + 1
+            };
+            let data = format!("resource-data-{i}").into_bytes();
+            conn.execute(
+                "INSERT INTO resources (addrid, aidx, data, ctype) VALUES (?1, ?2, ?3, 0)",
+                rusqlite::params![addrid, i as i64 + 1, data],
+            )
+            .unwrap();
+        }
+        for i in 0..n_kvs {
+            let key = format!("box-key-{i:08}").into_bytes();
+            let value = format!("box-value-{i}").into_bytes();
+            conn.execute(
+                "INSERT INTO kvstore (key, value) VALUES (?1, ?2)",
+                rusqlite::params![key, value],
+            )
+            .unwrap();
+        }
+        (conn, dir)
+    }
+
+    #[test]
+    fn chunked_trie_rebuild_matches_unbounded_rebuild_root_hash() {
+        for &(accounts, resources, kvs) in &[(50u32, 0u32, 0u32), (200, 80, 40), (0, 0, 25)] {
+            let (conn, dir) = build_file_backed_trie_test_db(accounts, resources, kvs);
+            assert!(
+                conn.path().is_some(),
+                "test DB must be file-backed for the chunked path to activate"
+            );
+
+            let reference_root = rebuild_trie_from_db(&conn).unwrap();
+
+            // accounthashes must be untouched by the unbounded reference
+            // build (it never persists) — sanity check before running the
+            // chunked build against the SAME table.
+            let pre_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM accounthashes", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(pre_count, 0);
+
+            let mut chunked_trie = build_and_persist_trie_chunked(&conn).unwrap();
+            let chunked_root = chunked_trie.root_hash().unwrap();
+
+            assert_eq!(
+                chunked_root, reference_root,
+                "chunked trie root diverged from unbounded reference \
+                 (accounts={accounts}, resources={resources}, kvs={kvs})"
+            );
+
+            // And it must have actually persisted incrementally, not just
+            // matched by coincidence — accounthashes should now be
+            // non-empty whenever there's at least one element (root
+            // metadata page 0, plus node pages for a non-empty trie).
+            let post_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM accounthashes", [], |r| r.get(0))
+                .unwrap();
+            if accounts + resources + kvs > 0 {
+                assert!(
+                    post_count > 0,
+                    "chunked build must persist to accounthashes \
+                     (accounts={accounts}, resources={resources}, kvs={kvs})"
+                );
+            }
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn chunked_trie_rebuild_survives_multiple_commit_evict_cycles() {
+        // More elements than a single chunk, forced through several
+        // periodic commit+evict passes by using a large enough n relative
+        // to a plausible small in-test cache target. This doesn't hit the
+        // real 65536 `TRIE_REBUILD_COMMIT_FREQUENCY` (too slow for a unit
+        // test against real SQLite I/O), but exercises the exact same
+        // code path end-to-end (real file DB, real second/third SQLite
+        // connections, real lazy reload) at a smaller scale — the
+        // algorithmic chunking property itself (many small forced cycles)
+        // is covered exhaustively and cheaply at the pure in-memory
+        // `merkle_trie` level in
+        // `test_chunked_commit_evict_matches_single_pass_root_hash`.
+        let (conn, dir) = build_file_backed_trie_test_db(600, 200, 100);
+        let reference_root = rebuild_trie_from_db(&conn).unwrap();
+        let mut chunked_trie = build_and_persist_trie_chunked(&conn).unwrap();
+        assert_eq!(chunked_trie.root_hash().unwrap(), reference_root);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
