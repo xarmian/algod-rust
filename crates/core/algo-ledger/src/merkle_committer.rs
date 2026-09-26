@@ -245,6 +245,16 @@ pub struct OwnedSqliteCommitter {
     /// Retained for diagnostics — included in error messages so a
     /// failing lazy-load points at the actual DB file.
     path: PathBuf,
+    /// When `true`, `store_page` performs real writes instead of
+    /// returning the read-only error. Set by
+    /// [`OwnedSqliteCommitter::open_writable`] — see issue #1626's
+    /// bounded-memory chunked catchpoint-verify trie rebuild, which
+    /// needs an owned (`Send`) committer that can both persist dirty
+    /// pages periodically (`MerkleTrie::commit`) and lazily reload
+    /// evicted ones (`MerkleTrie`'s `lazy_loader`), all from a single
+    /// second connection to the same WAL-mode database file the
+    /// original borrowed [`Connection`] is already using.
+    writable: bool,
 }
 
 impl std::fmt::Debug for OwnedSqliteCommitter {
@@ -274,6 +284,7 @@ impl OwnedSqliteCommitter {
             conn,
             table,
             path: path_ref.to_path_buf(),
+            writable: false,
         })
     }
 
@@ -281,6 +292,39 @@ impl OwnedSqliteCommitter {
     /// active runtime table).
     pub fn open_active(path: impl AsRef<Path>) -> Result<Self, AlgoError> {
         Self::open(path, CommitterTable::Active)
+    }
+
+    /// Open a fresh **read-write** connection to `path`, bound to
+    /// `table`, with `store_page` fully functional (unlike the default
+    /// [`OwnedSqliteCommitter::open`], which is read-only-by-design for
+    /// the live-ledger lazy-load path). Used specifically by the
+    /// bounded-memory chunked catchpoint-verify trie rebuild (issue
+    /// #1626), which needs one owned, `Send`-able committer that can
+    /// both write (periodic `MerkleTrie::commit` flushes) and read
+    /// (evicted-page reload via the trie's `lazy_loader`) against the
+    /// same file, entirely separately from the caller's own borrowed
+    /// `Connection`. Safe under WAL because the two connections never
+    /// write concurrently — the rebuild loop is single-threaded and
+    /// always `commit()`s (flushing this connection's writes) before
+    /// any subsequent `evict()`/reload can observe them.
+    pub fn open_writable(path: impl AsRef<Path>, table: CommitterTable) -> Result<Self, AlgoError> {
+        let path_ref = path.as_ref();
+        let conn = Connection::open_with_flags(
+            path_ref,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| AlgoError::Ledger {
+            message: format!(
+                "OwnedSqliteCommitter::open_writable({}): {e}",
+                path_ref.display()
+            ),
+        })?;
+        Ok(Self {
+            conn,
+            table,
+            path: path_ref.to_path_buf(),
+            writable: true,
+        })
     }
 }
 
@@ -299,16 +343,51 @@ impl PageCommitter for OwnedSqliteCommitter {
             })
     }
 
-    fn store_page(&self, _id: u64, _content: &[u8]) -> Result<(), AlgoError> {
-        // The owned committer is the lazy LOAD path only. Writes go
-        // through the ledger's main connection via [`SqliteMerkleCommitter`]
-        // inside the block-apply transaction; routing them here would
-        // bypass that transaction and risk consistency violations.
-        Err(AlgoError::Ledger {
-            message: "OwnedSqliteCommitter is read-only; writes must go through \
-                      SqliteMerkleCommitter inside a transaction"
-                .into(),
-        })
+    fn store_page(&self, id: u64, content: &[u8]) -> Result<(), AlgoError> {
+        if !self.writable {
+            // The default owned committer is the lazy LOAD path only.
+            // Writes go through the ledger's main connection via
+            // [`SqliteMerkleCommitter`] inside the block-apply
+            // transaction; routing them here would bypass that
+            // transaction and risk consistency violations.
+            return Err(AlgoError::Ledger {
+                message: "OwnedSqliteCommitter is read-only; writes must go through \
+                          SqliteMerkleCommitter inside a transaction, or use \
+                          OwnedSqliteCommitter::open_writable"
+                    .into(),
+            });
+        }
+        // `open_writable` path (issue #1626): mirrors
+        // `SqliteMerkleCommitter::store_page_bytes` exactly (upsert on
+        // non-empty content, delete on empty).
+        if content.is_empty() {
+            let sql = format!("DELETE FROM {} WHERE id = ?1", self.table.table_name());
+            self.conn
+                .execute(&sql, params![id as i64])
+                .map(|_| ())
+                .map_err(|e| AlgoError::Ledger {
+                    message: format!(
+                        "OwnedSqliteCommitter::store_page delete {} id={id}: {e}",
+                        self.table.unqualified()
+                    ),
+                })
+        } else {
+            let sql = format!(
+                "INSERT INTO {} (id, data) VALUES (?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET data = excluded.data",
+                self.table.table_name()
+            );
+            self.conn
+                .execute(&sql, params![id as i64, content])
+                .map(|_| ())
+                .map_err(|e| AlgoError::Ledger {
+                    message: format!(
+                        "OwnedSqliteCommitter::store_page upsert {} id={id} ({} bytes): {e}",
+                        self.table.unqualified(),
+                        content.len()
+                    ),
+                })
+        }
     }
 }
 

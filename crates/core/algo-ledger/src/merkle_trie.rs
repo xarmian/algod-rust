@@ -641,6 +641,29 @@ impl MerkleTrie {
         self.recompute_hash_at(root_id, &mut path)
     }
 
+    /// Recompute `node_id`'s hash (and, recursively, any hash-stale
+    /// descendant's), then write it back.
+    ///
+    /// PLAN-144/issue #1626: pruned to only descend into children that
+    /// are "pending created" — i.e. structurally new (allocated or
+    /// CoW-refurbished) since the last [`MerkleTrieCache::commit`]. A
+    /// child absent from that set is guaranteed byte-for-byte unchanged
+    /// since it was last hashed (every mutating trie operation always
+    /// allocates a fresh id for every node on the touched path — see
+    /// `MerkleTrieCache::allocate`/`refurbish`), so its resident `hash`
+    /// field is still correct and revisiting it would be redundant work.
+    ///
+    /// This is what makes periodic `commit()` + `evict()` calls during a
+    /// long from-scratch rebuild (bounded-memory catchpoint-verify trie
+    /// construction) cheap: each call now costs O(elements added since
+    /// the last commit), not O(total elements in the trie) — avoiding
+    /// the O(N²)-ish blowup a naive "just call commit() more often"
+    /// chunking would otherwise hit. The very first build of a trie
+    /// (every node pending-created, nothing committed yet) still costs
+    /// the same O(N) this always did — the pruning is a strict subset,
+    /// never a superset, of the unpruned traversal, so it cannot change
+    /// which nodes get hashed, only how many redundant re-visits are
+    /// skipped once some prefix of the trie has already been committed.
     fn recompute_hash_at(&mut self, node_id: u64, path: &mut Vec<u8>) -> Result<(), AlgoError> {
         let is_leaf = self
             .cache
@@ -665,6 +688,12 @@ impl MerkleTrie {
             .map(|c| (c.hash_index, c.child_id))
             .collect();
         for (hi, cid) in &child_descriptors {
+            if !self.cache.is_pending_created(*cid) {
+                // Unchanged since the last commit — its hash is already
+                // correct; don't recurse (this is the O(N²)-avoidance
+                // pruning described above).
+                continue;
+            }
             path.push(*hi);
             self.recompute_hash_at(*cid, path)?;
             path.pop();
@@ -1632,6 +1661,173 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(restored.root_hash().unwrap(), expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // Bounded-memory chunked rebuild (issue #1626).
+    //
+    // These tests exercise the exact pattern
+    // `catchpoint::verify::build_and_persist_trie_chunked` uses on real
+    // mainnet-scale data: add a batch of elements, `commit()` (flush dirty
+    // pages), `evict()` (drop pages below an LRU target), repeat — with a
+    // lazy loader installed so a later batch's insertion path can
+    // transparently reload an already-evicted subtree. Consensus-critical:
+    // the resulting root hash MUST be byte-identical to a plain single-pass
+    // build with no intermediate commit/evict at all.
+    // -----------------------------------------------------------------------
+
+    /// Build `n` distinct 8-byte elements. `i.to_be_bytes()` is unique for
+    /// every `i`, so this scales cleanly well past the `u8`-domain 256-value
+    /// ceiling the file's other small tests use.
+    fn distinct_elements(n: u64) -> Vec<[u8; 8]> {
+        (0..n).map(|i| i.to_be_bytes()).collect()
+    }
+
+    #[test]
+    fn test_chunked_commit_evict_matches_single_pass_root_hash() {
+        // A range of sizes: a handful, a couple hundred, and (within a
+        // normal test-run time budget) a few thousand — enough to force
+        // many real evict+reload cycles at a small cache target, without
+        // needing mainnet-scale data to prove the algorithmic property.
+        for &n in &[1u64, 2, 5, 50, 500, 4000] {
+            let elements = distinct_elements(n);
+
+            // Reference: single uninterrupted build, no intermediate
+            // commit/evict at all (today's pre-#1626 behavior for a trie
+            // that's never persisted mid-build).
+            let mut reference = MerkleTrie::new(8);
+            for e in &elements {
+                reference.add(e).unwrap();
+            }
+            let expected = reference.root_hash().unwrap();
+
+            // Chunked build: tiny cache target (forces real eviction) +
+            // commit+evict every few elements + a shared committer so
+            // evicted pages are genuinely reloadable, not just discarded.
+            let committer = InMemoryPageCommitter::new();
+            let mut trie = MerkleTrie::with_cache_target(8, 8);
+            trie.set_lazy_loader(Box::new(committer.clone()));
+            let chunk_size = 3u64;
+            for (i, e) in elements.iter().enumerate() {
+                trie.add(e).unwrap();
+                if (i as u64 + 1) % chunk_size == 0 {
+                    trie.commit(&committer).unwrap();
+                    trie.evict().unwrap();
+                }
+            }
+            // Final flush of whatever remains uncommitted, matching
+            // `build_and_persist_trie_chunked`'s trailing commit.
+            trie.commit(&committer).unwrap();
+            let got = trie.root_hash().unwrap();
+
+            assert_eq!(
+                got, expected,
+                "chunked root hash diverged from single-pass root hash at n={n}"
+            );
+
+            // Every element must still be findable after the full
+            // chunked build + evictions (exercises the lazy-reload path
+            // for `contains`, not just `root_hash`).
+            for e in &elements {
+                assert!(
+                    trie.contains(e).unwrap(),
+                    "element {e:?} missing after chunked build at n={n}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_chunked_commit_evict_matches_single_pass_with_deletes() {
+        // Same property, but the chunked side also deletes and re-adds a
+        // subset partway through — exercises `node_remove`'s refurbish/
+        // collapse paths through the same evict+reload cycle, not just
+        // `node_add`.
+        let elements = distinct_elements(300);
+        let (to_delete, to_keep): (Vec<_>, Vec<_>) =
+            elements.iter().enumerate().partition(|(i, _)| i % 5 == 0);
+        let to_delete: Vec<[u8; 8]> = to_delete.into_iter().map(|(_, e)| *e).collect();
+        let to_keep: Vec<[u8; 8]> = to_keep.into_iter().map(|(_, e)| *e).collect();
+
+        let mut reference = MerkleTrie::new(8);
+        for e in &to_keep {
+            reference.add(e).unwrap();
+        }
+        let expected = reference.root_hash().unwrap();
+
+        let committer = InMemoryPageCommitter::new();
+        let mut trie = MerkleTrie::with_cache_target(8, 8);
+        trie.set_lazy_loader(Box::new(committer.clone()));
+        for (i, e) in elements.iter().enumerate() {
+            trie.add(e).unwrap();
+            if (i + 1) % 4 == 0 {
+                trie.commit(&committer).unwrap();
+                trie.evict().unwrap();
+            }
+        }
+        trie.commit(&committer).unwrap();
+        trie.evict().unwrap();
+        for (i, e) in to_delete.iter().enumerate() {
+            trie.delete(e).unwrap();
+            if (i + 1) % 4 == 0 {
+                trie.commit(&committer).unwrap();
+                trie.evict().unwrap();
+            }
+        }
+        trie.commit(&committer).unwrap();
+
+        assert_eq!(trie.root_hash().unwrap(), expected);
+        for e in &to_keep {
+            assert!(trie.contains(e).unwrap());
+        }
+        for e in &to_delete {
+            assert!(!trie.contains(e).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_chunked_rebuild_bounds_resident_node_count() {
+        // Peak-memory proxy: with a small cache target and periodic
+        // commit+evict, the number of nodes actually resident in memory
+        // must stay bounded regardless of how many total elements have
+        // been added — it must NOT grow linearly with the running total,
+        // which is exactly the property an unbounded from-scratch build
+        // (issue #1626) lacks.
+        const CACHE_TARGET: usize = 32;
+        let committer = InMemoryPageCommitter::new();
+        let mut trie = MerkleTrie::with_cache_target(8, CACHE_TARGET);
+        trie.set_lazy_loader(Box::new(committer.clone()));
+
+        let elements = distinct_elements(6000);
+        let mut max_resident_after_evict = 0usize;
+        for (i, e) in elements.iter().enumerate() {
+            trie.add(e).unwrap();
+            if (i + 1) % 50 == 0 {
+                trie.commit(&committer).unwrap();
+                trie.evict().unwrap();
+                max_resident_after_evict = max_resident_after_evict.max(trie.cached_node_count());
+            }
+        }
+        trie.commit(&committer).unwrap();
+
+        // A node's containing PAGE (not the node itself) is the eviction
+        // unit, and the root page is always pinned resident, so the
+        // resident count can exceed `CACHE_TARGET` by a bounded per-page
+        // slack — but it must stay small and, critically, independent of
+        // the total element count (6000 elements, vs. a resident count
+        // that would be in the thousands if nothing were ever evicted).
+        assert!(
+            max_resident_after_evict < 500,
+            "resident node count grew unbounded: {max_resident_after_evict} \
+             (target was {CACHE_TARGET}) — eviction is not bounding memory"
+        );
+
+        // Correctness wasn't sacrificed for the bound.
+        let mut reference = MerkleTrie::new(8);
+        for e in &elements {
+            reference.add(e).unwrap();
+        }
+        assert_eq!(trie.root_hash().unwrap(), reference.root_hash().unwrap());
     }
 
     // -----------------------------------------------------------------------
