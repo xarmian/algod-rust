@@ -234,6 +234,18 @@ jobs:
           # of exactly what the runner's CPU/memory looked like right up to
           # the point of death (the "Upload artifacts" step runs with
           # `if: always()`, so this file is captured even on a killed job).
+          #
+          # IMPORTANT: the backgrounded subshell must not inherit this
+          # step's stdout/stderr. A backgrounded child that keeps those
+          # file descriptors open is a well-known GitHub Actions runner
+          # hang: the runner's log-streaming pipe for the step never sees
+          # EOF, and later `if: always()` steps can be marked "skipped"
+          # while the job hangs at its own final "Complete job" bookkeeping
+          # until the job-level `timeout-minutes` forcibly cancels it. Every
+          # stream (stdin/stdout/stderr) is explicitly redirected away from
+          # the parent shell's descriptors below (`</dev/null`, and stdout/
+          # stderr into the CSV file / `/dev/null` respectively) specifically
+          # to avoid that trap.
           (
             echo "timestamp,free_h,algod_rss_kb,algod_cpu_pct,load_avg" > mainnet-soak-artifacts/resource-log.csv
             while true; do
@@ -245,7 +257,8 @@ jobs:
               echo "${TS},\"${FREE_LINE}\",${ALGOD_STATS},\"${LOADAVG}\"" >> mainnet-soak-artifacts/resource-log.csv
               sleep 10
             done
-          ) &
+          ) </dev/null >/dev/null 2>&1 &
+          disown
           echo "profiling_pid=$!" >> "$GITHUB_OUTPUT"
 
       - name: Start the mainnet participation node
