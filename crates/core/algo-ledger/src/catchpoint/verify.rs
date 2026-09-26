@@ -920,6 +920,18 @@ fn build_and_persist_trie_chunked(
     trie.set_lazy_loader(Box::new(load_committer));
 
     let mut since_last_commit: u64 = 0;
+    // Issue #1631: fine-grained chunk-boundary timing, to distinguish a
+    // uniform per-run slowdown (external/CI variance) from a pattern that
+    // grows or spikes as the rebuild progresses (an algorithmic issue in
+    // the eviction/reload path that only shows up at mainnet scale/access
+    // patterns, not in the smaller synthetic test suite). Cheap relative to
+    // a chunk commit (one syscall + one log line per 65536 elements), so
+    // this stays on permanently rather than being a throwaway debug patch.
+    // `total_elements_added` is tracked by the caller (not captured inside
+    // the closure) so it stays readable between chunk commits for the
+    // phase-boundary log lines below.
+    let rebuild_start = std::time::Instant::now();
+    let mut total_elements_added: u64 = 0;
     // Every periodic flush's dirty-page writes are wrapped in ONE explicit
     // transaction (issue #1626 live-dispatch finding: without this, each
     // `store_page` call is its own autocommit transaction — a separate WAL
@@ -928,7 +940,12 @@ fn build_and_persist_trie_chunked(
     // enough that `mainnet-node-soak`'s halt detector flagged the run
     // `stuck` even after the OOM/SIGTERM was already fixed). `evict()` only
     // touches in-memory state, so it happens after the transaction commits.
-    let commit_and_evict = |trie: &mut MerkleTrie| -> Result<(), CatchpointError> {
+    let mut chunk_index: u64 = 0;
+    let mut last_chunk_at = rebuild_start;
+    let mut commit_and_evict = |trie: &mut MerkleTrie,
+                                elements_in_chunk: u64,
+                                total_so_far: u64|
+     -> Result<(), CatchpointError> {
         write_committer
             .begin_immediate()
             .map_err(|e| CatchpointError::ImportError(format!("begin chunked trie commit: {e}")))?;
@@ -946,6 +963,20 @@ fn build_and_persist_trie_chunked(
         }
         trie.evict()
             .map_err(|e| CatchpointError::ImportError(format!("chunked trie evict: {e}")))?;
+        chunk_index += 1;
+        let now = std::time::Instant::now();
+        let chunk_elapsed = now.duration_since(last_chunk_at);
+        let total_elapsed = now.duration_since(rebuild_start);
+        last_chunk_at = now;
+        tracing::info!(
+            chunk_index,
+            elements_in_chunk,
+            total_elements_added = total_so_far,
+            resident_nodes = trie.cached_node_count(),
+            chunk_elapsed_ms = chunk_elapsed.as_millis() as u64,
+            total_elapsed_s = total_elapsed.as_secs_f64(),
+            "catchpoint verify: trie rebuild chunk committed"
+        );
         Ok(())
     };
 
@@ -984,11 +1015,17 @@ fn build_and_persist_trie_chunked(
                 .map_err(|e| CatchpointError::ImportError(format!("trie add account: {e}")))?;
             since_last_commit += 1;
             if since_last_commit >= TRIE_REBUILD_COMMIT_FREQUENCY {
-                commit_and_evict(&mut trie)?;
+                total_elements_added += since_last_commit;
+                commit_and_evict(&mut trie, since_last_commit, total_elements_added)?;
                 since_last_commit = 0;
             }
         }
     }
+    tracing::info!(
+        total_elements_added = total_elements_added + since_last_commit,
+        elapsed_s = rebuild_start.elapsed().as_secs_f64(),
+        "catchpoint verify: trie rebuild accounts phase done"
+    );
 
     // 2. Process all resources.
     {
@@ -1043,11 +1080,17 @@ fn build_and_persist_trie_chunked(
                 .map_err(|e| CatchpointError::ImportError(format!("trie add resource: {e}")))?;
             since_last_commit += 1;
             if since_last_commit >= TRIE_REBUILD_COMMIT_FREQUENCY {
-                commit_and_evict(&mut trie)?;
+                total_elements_added += since_last_commit;
+                commit_and_evict(&mut trie, since_last_commit, total_elements_added)?;
                 since_last_commit = 0;
             }
         }
     }
+    tracing::info!(
+        total_elements_added = total_elements_added + since_last_commit,
+        elapsed_s = rebuild_start.elapsed().as_secs_f64(),
+        "catchpoint verify: trie rebuild resources phase done"
+    );
 
     // 3. Process all KV (box) entries from kvstore.
     {
@@ -1075,18 +1118,24 @@ fn build_and_persist_trie_chunked(
                 .map_err(|e| CatchpointError::ImportError(format!("trie add kv: {e}")))?;
             since_last_commit += 1;
             if since_last_commit >= TRIE_REBUILD_COMMIT_FREQUENCY {
-                commit_and_evict(&mut trie)?;
+                total_elements_added += since_last_commit;
+                commit_and_evict(&mut trie, since_last_commit, total_elements_added)?;
                 since_last_commit = 0;
             }
         }
     }
+    tracing::info!(
+        total_elements_added = total_elements_added + since_last_commit,
+        elapsed_s = rebuild_start.elapsed().as_secs_f64(),
+        "catchpoint verify: trie rebuild kv phase done"
+    );
 
     // Final flush of whatever remains uncommitted (no eviction needed —
     // the build is done). Same explicit-transaction wrapping as every
     // periodic flush above.
-    write_committer
-        .begin_immediate()
-        .map_err(|e| CatchpointError::ImportError(format!("begin final chunked trie commit: {e}")))?;
+    write_committer.begin_immediate().map_err(|e| {
+        CatchpointError::ImportError(format!("begin final chunked trie commit: {e}"))
+    })?;
     match trie.commit(&write_committer) {
         Ok(_) => write_committer.commit_txn().map_err(|e| {
             CatchpointError::ImportError(format!("commit final chunked trie transaction: {e}"))
@@ -1098,6 +1147,11 @@ fn build_and_persist_trie_chunked(
             )));
         }
     }
+    tracing::info!(
+        total_elements_added = total_elements_added + since_last_commit,
+        total_elapsed_s = rebuild_start.elapsed().as_secs_f64(),
+        "catchpoint verify: trie rebuild complete (final commit done)"
+    );
 
     Ok(trie)
 }
