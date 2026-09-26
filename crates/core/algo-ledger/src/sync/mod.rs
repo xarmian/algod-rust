@@ -1500,7 +1500,38 @@ impl SyncOrchestrator {
             }
         }
 
-        let mut result = self.run_phases(resume_state);
+        // Issue #1625: `run_phases` (download -> import -> verify ->
+        // lookback -> replay) is a plain synchronous fn with no `.await`
+        // points of its own — the catchpoint-verify phase in particular
+        // rebuilds the whole Merkle trie and hashes every account/kv
+        // in-line (`run_verify_ledger` -> `verify_catchpoint`), which took
+        // 30-50+ minutes against a real ~22.47M-account mainnet catchpoint
+        // in live soak runs. Calling it directly here would run that
+        // entire CPU/IO-bound pass on whichever tokio worker thread polled
+        // this task, and — because tokio's scheduler is cooperative, not
+        // preemptive — a task that never yields monopolizes that worker
+        // thread for its whole duration. On the constrained vCPU counts
+        // GitHub Actions runners provide, this starved the REST server's
+        // own request-handling tasks badly enough that `/v2/status`
+        // stopped answering at all (not just frozen progress counters) for
+        // the entire verify duration, confirmed live in issue #1625.
+        //
+        // `block_in_place` hands this worker thread's *other* queued tasks
+        // (including the REST server's) off to another worker thread (or a
+        // freshly spun-up one) for the duration of the blocking closure, so
+        // they keep making progress regardless of how long `run_phases`
+        // takes or how few workers the runtime has. It requires the
+        // multi-threaded runtime `#[tokio::main]` always builds in
+        // production; skip it for the `NoopBackend` stub path so the many
+        // `#[tokio::test]` (default current-thread flavor) unit tests that
+        // exercise the trivial stub transitions keep working unchanged —
+        // `block_in_place` panics outside a multi-threaded runtime, and the
+        // stub path does no blocking work worth protecting against anyway.
+        let mut result = if self.backend.is_noop() {
+            self.run_phases(resume_state)
+        } else {
+            tokio::task::block_in_place(|| self.run_phases(resume_state))
+        };
 
         match &result {
             Ok(_) => {
