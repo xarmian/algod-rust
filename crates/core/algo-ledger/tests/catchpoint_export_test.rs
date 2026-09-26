@@ -414,6 +414,56 @@ fn export_then_import_round_trips_state_and_label() {
     assert_eq!(verified.kvs_count, 4);
 }
 
+/// TDD for issue #1626: `verify_catchpoint`'s Merkle-trie rebuild must
+/// persist the trie it builds to `accounthashes` instead of discarding it.
+///
+/// Before this fix, catchpoint import left `accounthashes` completely
+/// empty after a successful verify (only the *staging* table gets renamed
+/// by `CatchpointImporter::atomic_cutover`; nothing ever wrote trie pages
+/// into it), so the very next normal ledger open
+/// (`SqliteLedger::load_trie`) found no persisted trie and repeated the
+/// entire from-scratch, fully-in-memory rebuild over every account/
+/// resource/kv a SECOND time — on a real ~22M-account mainnet catchpoint,
+/// this doubled both the wall-clock time and the number of multi-gigabyte
+/// trie-construction episodes the process had to survive back to back,
+/// a real contributor to `mainnet-node-soak.yml` dying under sustained
+/// CPU/memory pressure during verify (issue #1626).
+#[test]
+fn verify_catchpoint_persists_the_rebuilt_trie_to_accounthashes() {
+    let src = build_source_db();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catchpoint.tar.gz");
+    export_catchpoint_file(&src, &path, &export_options()).unwrap();
+
+    let dst = Connection::open_in_memory().unwrap();
+    import_catchpoint_file(&dst, &path, REWARD_UNITS).unwrap();
+
+    // Before verify: import alone must not have populated accounthashes
+    // (it only renames the empty staging table) — otherwise this test
+    // would pass trivially without exercising the fix.
+    let before: i64 = dst
+        .query_row("SELECT COUNT(*) FROM accounthashes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        before, 0,
+        "accounthashes should still be empty immediately after import, before verify"
+    );
+
+    let verified = verify_catchpoint(&dst, &BLOCK_DIGEST).unwrap();
+    assert!(verified.success);
+
+    // After verify: the rebuilt trie must now be persisted as real paged
+    // rows in accounthashes (at minimum the page-0 metadata row, plus at
+    // least one node page for 5 accounts + 4 kvs).
+    let after: i64 = dst
+        .query_row("SELECT COUNT(*) FROM accounthashes", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        after > 0,
+        "verify_catchpoint must persist the rebuilt trie to accounthashes, found {after} rows"
+    );
+}
+
 /// TDD for issue #1056: `verify_catchpoint` must accept a real-world
 /// catchpoint whose `blocks_round` (the label's round, used to anchor the
 /// block header digest) differs from `balances_round` (the account
