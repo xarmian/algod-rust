@@ -326,6 +326,54 @@ impl OwnedSqliteCommitter {
             writable: true,
         })
     }
+
+    /// Begin an explicit `BEGIN IMMEDIATE` transaction on this committer's
+    /// connection. Pairs with [`OwnedSqliteCommitter::commit_txn`] /
+    /// [`OwnedSqliteCommitter::rollback_txn`].
+    ///
+    /// **Why this matters (issue #1626):** every [`PageCommitter::store_page`]
+    /// call is a single `INSERT ... ON CONFLICT` or `DELETE` statement.
+    /// Without an explicit surrounding transaction, rusqlite/SQLite runs
+    /// each one as its own autocommit transaction — a separate WAL fsync
+    /// per page. A single periodic chunk-commit during
+    /// `build_and_persist_trie_chunked` can dirty hundreds to thousands of
+    /// pages; at that granularity, per-statement autocommit turns what
+    /// should be one fast batched write into thousands of serialized
+    /// fsyncs, which is exactly what made the first live-dispatch attempt
+    /// of the chunked rebuild get flagged `stuck` by `mainnet-node-soak`'s
+    /// halt detector (no progress for 2708s) even though it no longer OOM
+    /// / got externally SIGTERM'd. Batching every chunk's dirty-page
+    /// writes into one transaction restores the original
+    /// `persist_rebuilt_trie` behavior's single-fsync-per-flush shape,
+    /// just repeated once per chunk instead of once for the whole trie.
+    pub fn begin_immediate(&self) -> Result<(), AlgoError> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| AlgoError::Ledger {
+                message: format!(
+                    "OwnedSqliteCommitter::begin_immediate({}): {e}",
+                    self.path.display()
+                ),
+            })
+    }
+
+    /// Commit the transaction opened by [`OwnedSqliteCommitter::begin_immediate`].
+    pub fn commit_txn(&self) -> Result<(), AlgoError> {
+        self.conn.execute_batch("COMMIT").map_err(|e| AlgoError::Ledger {
+            message: format!(
+                "OwnedSqliteCommitter::commit_txn({}): {e}",
+                self.path.display()
+            ),
+        })
+    }
+
+    /// Roll back the transaction opened by [`OwnedSqliteCommitter::begin_immediate`].
+    /// Errors are swallowed (best-effort cleanup on an already-failed path)
+    /// — mirrors [`persist_rebuilt_trie`](crate::catchpoint::verify)'s
+    /// existing rollback pattern.
+    pub fn rollback_txn(&self) {
+        let _ = self.conn.execute_batch("ROLLBACK");
+    }
 }
 
 impl PageCommitter for OwnedSqliteCommitter {

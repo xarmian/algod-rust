@@ -920,9 +920,30 @@ fn build_and_persist_trie_chunked(
     trie.set_lazy_loader(Box::new(load_committer));
 
     let mut since_last_commit: u64 = 0;
+    // Every periodic flush's dirty-page writes are wrapped in ONE explicit
+    // transaction (issue #1626 live-dispatch finding: without this, each
+    // `store_page` call is its own autocommit transaction — a separate WAL
+    // fsync per page — which turned a single chunk-commit's hundreds-to-
+    // thousands of page writes into thousands of serialized fsyncs, slow
+    // enough that `mainnet-node-soak`'s halt detector flagged the run
+    // `stuck` even after the OOM/SIGTERM was already fixed). `evict()` only
+    // touches in-memory state, so it happens after the transaction commits.
     let commit_and_evict = |trie: &mut MerkleTrie| -> Result<(), CatchpointError> {
-        trie.commit(&write_committer)
-            .map_err(|e| CatchpointError::ImportError(format!("chunked trie commit: {e}")))?;
+        write_committer
+            .begin_immediate()
+            .map_err(|e| CatchpointError::ImportError(format!("begin chunked trie commit: {e}")))?;
+        let commit_result = trie.commit(&write_committer);
+        match commit_result {
+            Ok(_) => write_committer.commit_txn().map_err(|e| {
+                CatchpointError::ImportError(format!("commit chunked trie transaction: {e}"))
+            })?,
+            Err(e) => {
+                write_committer.rollback_txn();
+                return Err(CatchpointError::ImportError(format!(
+                    "chunked trie commit: {e}"
+                )));
+            }
+        }
         trie.evict()
             .map_err(|e| CatchpointError::ImportError(format!("chunked trie evict: {e}")))?;
         Ok(())
@@ -1061,9 +1082,22 @@ fn build_and_persist_trie_chunked(
     }
 
     // Final flush of whatever remains uncommitted (no eviction needed —
-    // the build is done).
-    trie.commit(&write_committer)
-        .map_err(|e| CatchpointError::ImportError(format!("final chunked trie commit: {e}")))?;
+    // the build is done). Same explicit-transaction wrapping as every
+    // periodic flush above.
+    write_committer
+        .begin_immediate()
+        .map_err(|e| CatchpointError::ImportError(format!("begin final chunked trie commit: {e}")))?;
+    match trie.commit(&write_committer) {
+        Ok(_) => write_committer.commit_txn().map_err(|e| {
+            CatchpointError::ImportError(format!("commit final chunked trie transaction: {e}"))
+        })?,
+        Err(e) => {
+            write_committer.rollback_txn();
+            return Err(CatchpointError::ImportError(format!(
+                "final chunked trie commit: {e}"
+            )));
+        }
+    }
 
     Ok(trie)
 }
