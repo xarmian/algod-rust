@@ -664,7 +664,29 @@ fn raw_resource_element(
 /// This is the standalone equivalent of `SqliteLedger::rebuild_trie_from_db`,
 /// designed for use during catchpoint import where a full `SqliteLedger` is not
 /// available.
+///
+/// This does **not** persist the rebuilt trie anywhere — it is also used by
+/// [`crate::catchpoint::writer::export_catchpoint_file`] against a *live*
+/// node's own tracker DB (which already has its own independently-committed
+/// `accounthashes` state that must not be clobbered with a differently-IDed
+/// from-scratch trie). Callers that specifically want the rebuilt trie
+/// persisted to `accounthashes` for later reuse (currently only
+/// [`verify_catchpoint`], for the reasons in issue #1626) must do so
+/// themselves via [`build_trie_from_db`] + [`persist_rebuilt_trie`].
 pub fn rebuild_trie_from_db(conn: &Connection) -> Result<[u8; 32], CatchpointError> {
+    let mut trie = build_trie_from_db(conn)?;
+    trie.root_hash()
+        .map_err(|e| CatchpointError::ImportError(format!("trie root_hash: {e}")))
+}
+
+/// Rebuild the account Merkle trie from the database and return the
+/// in-memory [`crate::merkle_trie::MerkleTrie`] itself (not just its root
+/// hash), so a caller can additionally persist it. See
+/// [`rebuild_trie_from_db`] for the element-construction details this
+/// shares.
+fn build_trie_from_db(
+    conn: &Connection,
+) -> Result<crate::merkle_trie::MerkleTrie, CatchpointError> {
     use crate::merkle_trie::MerkleTrie;
     use crate::trie_hash::{extract_raw_affinity, kv_hash_v6, HashKind, ELEMENT_SIZE};
 
@@ -789,8 +811,44 @@ pub fn rebuild_trie_from_db(conn: &Connection) -> Result<[u8; 32], CatchpointErr
         }
     }
 
-    trie.root_hash()
-        .map_err(|e| CatchpointError::ImportError(format!("trie root_hash: {e}")))
+    Ok(trie)
+}
+
+/// Persist a freshly-built (never-before-committed) [`MerkleTrie`] to the
+/// `accounthashes` table so it can be lazily reloaded by
+/// [`crate::merkle_committer::SqliteMerkleCommitter::active`] /
+/// `MerkleTrie::load` afterward, instead of being silently discarded (see
+/// [`rebuild_trie_from_db`]'s doc comment on issue #1626 for why this
+/// matters).
+///
+/// Wrapped in its own transaction: `conn` is not assumed to already be
+/// inside one (catchpoint verify runs against a plain autocommit
+/// connection), and writing on the order of hundreds of thousands of page
+/// rows one autocommit at a time would be far slower than the rebuild it's
+/// trying to avoid repeating.
+fn persist_rebuilt_trie(
+    conn: &Connection,
+    trie: &mut crate::merkle_trie::MerkleTrie,
+) -> Result<(), CatchpointError> {
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|e| CatchpointError::ImportError(format!("begin accounthashes commit: {e}")))?;
+
+    let result = (|| -> Result<(), CatchpointError> {
+        let committer = crate::merkle_committer::SqliteMerkleCommitter::active(conn);
+        trie.commit(&committer)
+            .map_err(|e| CatchpointError::ImportError(format!("persist rebuilt trie: {e}")))?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT").map_err(|e| {
+            CatchpointError::ImportError(format!("commit accounthashes transaction: {e}"))
+        }),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1261,7 +1319,34 @@ pub fn verify_catchpoint(
     }
 
     // Step 4: Rebuild Merkle trie.
-    let trie_root = rebuild_trie_from_db(conn)?;
+    //
+    // Unlike the plain `rebuild_trie_from_db` (shared with the live-node
+    // catchpoint *export* path, which must not touch that node's own
+    // already-committed `accounthashes`), catchpoint *import* verification
+    // is building this trie from scratch specifically so the newly-imported
+    // ledger has one at all -- so, once the root hash is known, persist it
+    // to `accounthashes` immediately (issue #1626) rather than discarding
+    // it. Without this, the very next normal ledger open
+    // (`SqliteLedger::load_trie`) finds `accounthashes` empty and repeats
+    // this entire from-scratch, fully-in-memory rebuild over every
+    // account/resource/kv a second time, roughly doubling both the
+    // wall-clock time and the number of multi-gigabyte trie-construction
+    // episodes the process must survive back to back on a real mainnet
+    // catchpoint -- a real, confirmed contributor to the sustained CPU/
+    // memory pressure that got `mainnet-node-soak.yml` externally SIGTERM'd
+    // during verify. This does not by itself bound *peak* memory during a
+    // single rebuild pass -- that would need the same incremental
+    // chunk/commit/evict discipline go-algorand's own `BuildMerkleTrie` uses
+    // (`ledger/catchupaccessor.go`, `trieRebuildAccountChunkSize` /
+    // `trieRebuildCommitFrequency`, `catchpointtracker.go`), which requires
+    // per-subtree dirty tracking this trie doesn't have yet -- but removing
+    // one whole redundant rebuild from the hot path is a real, bounded-risk
+    // step toward it.
+    let mut trie = build_trie_from_db(conn)?;
+    let trie_root = trie
+        .root_hash()
+        .map_err(|e| CatchpointError::ImportError(format!("trie root_hash: {e}")))?;
+    persist_rebuilt_trie(conn, &mut trie)?;
 
     // Step 5: Compute component hashes.
     let sp_hash = calculate_sp_verification_hash(conn)?;

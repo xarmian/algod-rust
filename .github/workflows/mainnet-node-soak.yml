@@ -209,6 +209,58 @@ jobs:
           echo "==> selected catchup peer: $RELAY_URL"
           echo "catchup_peer_url=$RELAY_URL" >> "$GITHUB_OUTPUT"
 
+      - name: Log runner spec (issue #1626 profiling baseline)
+        run: |
+          mkdir -p mainnet-soak-artifacts
+          {
+            echo "=== nproc ==="
+            nproc || true
+            echo "=== free -h ==="
+            free -h || true
+            echo "=== df -h ==="
+            df -h || true
+            echo "=== /proc/cpuinfo (model name) ==="
+            grep -m1 'model name' /proc/cpuinfo || true
+          } | tee mainnet-soak-artifacts/runner-spec.txt
+
+      - name: Start resource profiling (issue #1626)
+        id: profiling
+        run: |
+          # Issue #1626: mainnet-node-soak dies (external SIGTERM) during
+          # catchpoint verify with no direct CPU/memory evidence from the
+          # failing run, because the process died before any artifact
+          # upload. Sample system + node-process resource usage every 10s
+          # for the whole job so a future dying run still uploads a trace
+          # of exactly what the runner's CPU/memory looked like right up to
+          # the point of death (the "Upload artifacts" step runs with
+          # `if: always()`, so this file is captured even on a killed job).
+          #
+          # IMPORTANT: the backgrounded subshell must not inherit this
+          # step's stdout/stderr. A backgrounded child that keeps those
+          # file descriptors open is a well-known GitHub Actions runner
+          # hang: the runner's log-streaming pipe for the step never sees
+          # EOF, and later `if: always()` steps can be marked "skipped"
+          # while the job hangs at its own final "Complete job" bookkeeping
+          # until the job-level `timeout-minutes` forcibly cancels it. Every
+          # stream (stdin/stdout/stderr) is explicitly redirected away from
+          # the parent shell's descriptors below (`</dev/null`, and stdout/
+          # stderr into the CSV file / `/dev/null` respectively) specifically
+          # to avoid that trap.
+          (
+            echo "timestamp,free_h,algod_rss_kb,algod_cpu_pct,load_avg" > mainnet-soak-artifacts/resource-log.csv
+            while true; do
+              TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              FREE_LINE="$(free -m | awk '/^Mem:/ {printf "used=%sMiB/avail=%sMiB", $3, $7}')"
+              LOADAVG="$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo n/a)"
+              # RSS + %CPU of the algod-rust node process specifically, if running.
+              ALGOD_STATS="$(ps -C algod-rust -o rss=,pcpu= 2>/dev/null | awk '{rss+=$1; cpu+=$2} END {if (NR>0) printf "%d,%.1f", rss, cpu; else print "n/a,n/a"}')"
+              echo "${TS},\"${FREE_LINE}\",${ALGOD_STATS},\"${LOADAVG}\"" >> mainnet-soak-artifacts/resource-log.csv
+              sleep 10
+            done
+          ) </dev/null >/dev/null 2>&1 &
+          disown
+          echo "profiling_pid=$!" >> "$GITHUB_OUTPUT"
+
       - name: Start the mainnet participation node
         id: start_node
         env:
@@ -423,6 +475,15 @@ jobs:
             kill "$PID" 2>/dev/null || true
             sleep 2
             kill -9 "$PID" 2>/dev/null || true
+          fi
+
+          # Issue #1626: stop the resource-profiling loop so it doesn't
+          # outlive the job; the log it wrote is already on disk and gets
+          # picked up by the "Upload artifacts" step below regardless of
+          # how this job ends.
+          PROFILING_PID="${{ steps.profiling.outputs.profiling_pid }}"
+          if [ -n "$PROFILING_PID" ] && kill -0 "$PROFILING_PID" 2>/dev/null; then
+            kill "$PROFILING_PID" 2>/dev/null || true
           fi
 
       - name: Capture the halted block (if any) for offline reproduction
