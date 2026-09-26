@@ -963,6 +963,10 @@ fn build_and_persist_trie_chunked(
         }
         trie.evict()
             .map_err(|e| CatchpointError::ImportError(format!("chunked trie evict: {e}")))?;
+        // Issue #1631: give SQLite a chance to reclaim WAL space now,
+        // right after this chunk's writes landed — see
+        // `OwnedSqliteCommitter::checkpoint_passive`'s doc comment.
+        write_committer.checkpoint_passive();
         chunk_index += 1;
         let now = std::time::Instant::now();
         let chunk_elapsed = now.duration_since(last_chunk_at);
@@ -980,44 +984,89 @@ fn build_and_persist_trie_chunked(
         Ok(())
     };
 
-    // 1. Process all accounts from accountbase.
+    // 1. Process all accounts from accountbase, paginated by `rowid` in
+    // batches of TRIE_REBUILD_COMMIT_FREQUENCY rows (issue #1631).
+    //
+    // **Why paginate the read, not just the write side:** a single
+    // `SELECT ... FROM accountbase` with no `LIMIT` executed once and
+    // driven row-by-row across the *entire* 900+-second accounts phase
+    // holds one `rusqlite::Rows` cursor — and therefore one SQLite
+    // implicit read transaction / WAL snapshot — open for that whole
+    // span. Under WAL, a passive checkpoint can only reclaim WAL frames
+    // that no live reader's snapshot still needs, so as long as that one
+    // read snapshot stays pinned at "before any of this rebuild's
+    // writes", `write_committer`'s periodic chunk commits can *never*
+    // be checkpointed — the WAL file (and everything that scales with
+    // its size: fsync cost, the wal-index scan on every read/write) grows
+    // for as long as the phase runs. Live-dispatch evidence (issue
+    // #1631, mainnet-node-soak runs 36256977265 and 36261425064) showed
+    // exactly this signature: `chunk_elapsed_ms` climbing smoothly by
+    // 20-40x over a single run while `resident_nodes` (the in-process
+    // trie-node LRU target from issue #1626) stayed flat — ruling out an
+    // in-memory cache leak and pointing at something whose cost tracks
+    // *cumulative* elements processed, not currently-resident state.
+    // Re-preparing and re-executing the query every
+    // TRIE_REBUILD_COMMIT_FREQUENCY rows drops the previous `Rows`/
+    // `Statement` (ending that snapshot) right before the paired
+    // `commit_and_evict` call, giving `OwnedSqliteCommitter::checkpoint_passive`
+    // a real chance to reclaim WAL space between chunks instead of only
+    // once, at the very end of a whole (multi-hundred-second) phase.
+    // `rowid > ?` is a direct primary-key-index seek (O(log n) per
+    // batch), not an O(n) `OFFSET` skip, so this doesn't trade one
+    // O(total²)-shaped cost for another.
     {
-        let mut stmt = conn
-            .prepare("SELECT address, data FROM accountbase")
-            .map_err(|e| {
-                CatchpointError::ImportError(format!("prepare accounts for trie rebuild: {e}"))
-            })?;
+        let mut last_rowid: i64 = 0;
+        loop {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT rowid, address, data FROM accountbase \
+                     WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+                )
+                .map_err(|e| {
+                    CatchpointError::ImportError(format!("prepare accounts for trie rebuild: {e}"))
+                })?;
 
-        let rows = stmt
-            .query_map([], |row| {
-                let addr_bytes: Vec<u8> = row.get(0)?;
-                let data: Vec<u8> = row.get(1)?;
-                Ok((addr_bytes, data))
-            })
-            .map_err(|e| {
-                CatchpointError::ImportError(format!("query accounts for trie rebuild: {e}"))
-            })?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::params![last_rowid, TRIE_REBUILD_COMMIT_FREQUENCY as i64],
+                    |row| {
+                        let rowid: i64 = row.get(0)?;
+                        let addr_bytes: Vec<u8> = row.get(1)?;
+                        let data: Vec<u8> = row.get(2)?;
+                        Ok((rowid, addr_bytes, data))
+                    },
+                )
+                .map_err(|e| {
+                    CatchpointError::ImportError(format!("query accounts for trie rebuild: {e}"))
+                })?;
 
-        for row in rows {
-            let (addr_bytes, data) =
-                row.map_err(|e| CatchpointError::ImportError(format!("read account row: {e}")))?;
-            if addr_bytes.len() != 32 {
-                return Err(CatchpointError::ImportError(format!(
-                    "bad address length {} (expected 32) in accountbase",
-                    addr_bytes.len()
-                )));
+            let mut got_any = false;
+            for row in rows {
+                let (rowid, addr_bytes, data) = row
+                    .map_err(|e| CatchpointError::ImportError(format!("read account row: {e}")))?;
+                got_any = true;
+                last_rowid = rowid;
+                if addr_bytes.len() != 32 {
+                    return Err(CatchpointError::ImportError(format!(
+                        "bad address length {} (expected 32) in accountbase",
+                        addr_bytes.len()
+                    )));
+                }
+                let mut addr = [0u8; 32];
+                addr.copy_from_slice(&addr_bytes);
+                let affinity = extract_raw_affinity(&data);
+                let elem = raw_account_element(&addr, &data, affinity);
+                trie.add(&elem)
+                    .map_err(|e| CatchpointError::ImportError(format!("trie add account: {e}")))?;
+                since_last_commit += 1;
+                if since_last_commit >= TRIE_REBUILD_COMMIT_FREQUENCY {
+                    total_elements_added += since_last_commit;
+                    commit_and_evict(&mut trie, since_last_commit, total_elements_added)?;
+                    since_last_commit = 0;
+                }
             }
-            let mut addr = [0u8; 32];
-            addr.copy_from_slice(&addr_bytes);
-            let affinity = extract_raw_affinity(&data);
-            let elem = raw_account_element(&addr, &data, affinity);
-            trie.add(&elem)
-                .map_err(|e| CatchpointError::ImportError(format!("trie add account: {e}")))?;
-            since_last_commit += 1;
-            if since_last_commit >= TRIE_REBUILD_COMMIT_FREQUENCY {
-                total_elements_added += since_last_commit;
-                commit_and_evict(&mut trie, since_last_commit, total_elements_added)?;
-                since_last_commit = 0;
+            if !got_any {
+                break;
             }
         }
     }
@@ -1027,62 +1076,84 @@ fn build_and_persist_trie_chunked(
         "catchpoint verify: trie rebuild accounts phase done"
     );
 
-    // 2. Process all resources.
+    // 2. Process all resources, paginated by the table's real primary
+    // key `(addrid, aidx)` — same rationale as the accounts loop above
+    // (issue #1631). `resources` is declared `WITHOUT ROWID` (composite
+    // primary key), so unlike `accountbase`/`kvstore` it has no `rowid`
+    // to page on; SQLite's row-value comparison (`WHERE (a, b) > (?, ?)`)
+    // gives an equivalent O(log n)-per-batch keyset seek against the
+    // same `(addrid, aidx)` index that backs the primary key.
     {
-        let mut stmt = conn
-            .prepare(
-                "SELECT r.addrid, r.aidx, r.ctype, r.data, a.address, a.data \
-                 FROM resources r \
-                 JOIN accountbase a ON a.rowid = r.addrid",
-            )
-            .map_err(|e| {
-                CatchpointError::ImportError(format!("prepare resources for trie rebuild: {e}"))
-            })?;
+        let mut last_addrid: i64 = i64::MIN;
+        let mut last_aidx: i64 = i64::MIN;
+        loop {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT r.addrid, r.aidx, r.ctype, r.data, a.address, a.data \
+                     FROM resources r \
+                     JOIN accountbase a ON a.rowid = r.addrid \
+                     WHERE (r.addrid, r.aidx) > (?1, ?2) \
+                     ORDER BY r.addrid, r.aidx LIMIT ?3",
+                )
+                .map_err(|e| {
+                    CatchpointError::ImportError(format!("prepare resources for trie rebuild: {e}"))
+                })?;
 
-        let rows = stmt
-            .query_map([], |row| {
-                let _addrid: i64 = row.get(0)?;
-                let aidx: i64 = row.get(1)?;
-                let ctype: i64 = row.get(2)?;
-                let rdata: Vec<u8> = row.get(3)?;
-                let addr_bytes: Vec<u8> = row.get(4)?;
-                let acct_data: Vec<u8> = row.get(5)?;
-                Ok((aidx, ctype, rdata, addr_bytes, acct_data))
-            })
-            .map_err(|e| {
-                CatchpointError::ImportError(format!("query resources for trie rebuild: {e}"))
-            })?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::params![last_addrid, last_aidx, TRIE_REBUILD_COMMIT_FREQUENCY as i64],
+                    |row| {
+                        let addrid: i64 = row.get(0)?;
+                        let aidx: i64 = row.get(1)?;
+                        let ctype: i64 = row.get(2)?;
+                        let rdata: Vec<u8> = row.get(3)?;
+                        let addr_bytes: Vec<u8> = row.get(4)?;
+                        let acct_data: Vec<u8> = row.get(5)?;
+                        Ok((addrid, aidx, ctype, rdata, addr_bytes, acct_data))
+                    },
+                )
+                .map_err(|e| {
+                    CatchpointError::ImportError(format!("query resources for trie rebuild: {e}"))
+                })?;
 
-        for row in rows {
-            let (aidx, ctype, rdata, addr_bytes, _acct_data) =
-                row.map_err(|e| CatchpointError::ImportError(format!("read resource row: {e}")))?;
-            if addr_bytes.len() != 32 {
-                return Err(CatchpointError::ImportError(format!(
-                    "bad address length {} (expected 32) for resource aidx={aidx}",
-                    addr_bytes.len()
-                )));
+            let mut got_any = false;
+            for row in rows {
+                let (addrid, aidx, ctype, rdata, addr_bytes, _acct_data) = row
+                    .map_err(|e| CatchpointError::ImportError(format!("read resource row: {e}")))?;
+                got_any = true;
+                last_addrid = addrid;
+                last_aidx = aidx;
+                if addr_bytes.len() != 32 {
+                    return Err(CatchpointError::ImportError(format!(
+                        "bad address length {} (expected 32) for resource aidx={aidx}",
+                        addr_bytes.len()
+                    )));
+                }
+                let mut addr = [0u8; 32];
+                addr.copy_from_slice(&addr_bytes);
+
+                // Use the resource's own UpdateRound for affinity, matching Go's
+                // ResourcesHashBuilderV6 which passes resData.UpdateRound.
+                let affinity = extract_raw_affinity(&rdata);
+
+                let kind = if ctype == CTYPE_APP {
+                    HashKind::App as u8
+                } else {
+                    HashKind::Asset as u8
+                };
+
+                let elem = raw_resource_element(&addr, aidx as u64, &rdata, affinity, kind);
+                trie.add(&elem)
+                    .map_err(|e| CatchpointError::ImportError(format!("trie add resource: {e}")))?;
+                since_last_commit += 1;
+                if since_last_commit >= TRIE_REBUILD_COMMIT_FREQUENCY {
+                    total_elements_added += since_last_commit;
+                    commit_and_evict(&mut trie, since_last_commit, total_elements_added)?;
+                    since_last_commit = 0;
+                }
             }
-            let mut addr = [0u8; 32];
-            addr.copy_from_slice(&addr_bytes);
-
-            // Use the resource's own UpdateRound for affinity, matching Go's
-            // ResourcesHashBuilderV6 which passes resData.UpdateRound.
-            let affinity = extract_raw_affinity(&rdata);
-
-            let kind = if ctype == CTYPE_APP {
-                HashKind::App as u8
-            } else {
-                HashKind::Asset as u8
-            };
-
-            let elem = raw_resource_element(&addr, aidx as u64, &rdata, affinity, kind);
-            trie.add(&elem)
-                .map_err(|e| CatchpointError::ImportError(format!("trie add resource: {e}")))?;
-            since_last_commit += 1;
-            if since_last_commit >= TRIE_REBUILD_COMMIT_FREQUENCY {
-                total_elements_added += since_last_commit;
-                commit_and_evict(&mut trie, since_last_commit, total_elements_added)?;
-                since_last_commit = 0;
+            if !got_any {
+                break;
             }
         }
     }
@@ -1092,35 +1163,52 @@ fn build_and_persist_trie_chunked(
         "catchpoint verify: trie rebuild resources phase done"
     );
 
-    // 3. Process all KV (box) entries from kvstore.
+    // 3. Process all KV (box) entries from kvstore, paginated by `rowid`
+    // — same rationale as the accounts loop above (issue #1631).
     {
-        let mut stmt = conn
-            .prepare("SELECT key, value FROM kvstore")
-            .map_err(|e| {
-                CatchpointError::ImportError(format!("prepare kvstore for trie rebuild: {e}"))
-            })?;
+        let mut last_rowid: i64 = 0;
+        loop {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT rowid, key, value FROM kvstore \
+                     WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+                )
+                .map_err(|e| {
+                    CatchpointError::ImportError(format!("prepare kvstore for trie rebuild: {e}"))
+                })?;
 
-        let rows = stmt
-            .query_map([], |row| {
-                let key: Vec<u8> = row.get(0)?;
-                let value: Vec<u8> = row.get(1)?;
-                Ok((key, value))
-            })
-            .map_err(|e| {
-                CatchpointError::ImportError(format!("prepare kvstore for trie rebuild: {e}"))
-            })?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::params![last_rowid, TRIE_REBUILD_COMMIT_FREQUENCY as i64],
+                    |row| {
+                        let rowid: i64 = row.get(0)?;
+                        let key: Vec<u8> = row.get(1)?;
+                        let value: Vec<u8> = row.get(2)?;
+                        Ok((rowid, key, value))
+                    },
+                )
+                .map_err(|e| {
+                    CatchpointError::ImportError(format!("query kvstore for trie rebuild: {e}"))
+                })?;
 
-        for row in rows {
-            let (key, value) =
-                row.map_err(|e| CatchpointError::ImportError(format!("read kvstore row: {e}")))?;
-            let elem = kv_hash_v6(&key, &value);
-            trie.add(&elem)
-                .map_err(|e| CatchpointError::ImportError(format!("trie add kv: {e}")))?;
-            since_last_commit += 1;
-            if since_last_commit >= TRIE_REBUILD_COMMIT_FREQUENCY {
-                total_elements_added += since_last_commit;
-                commit_and_evict(&mut trie, since_last_commit, total_elements_added)?;
-                since_last_commit = 0;
+            let mut got_any = false;
+            for row in rows {
+                let (rowid, key, value) = row
+                    .map_err(|e| CatchpointError::ImportError(format!("read kvstore row: {e}")))?;
+                got_any = true;
+                last_rowid = rowid;
+                let elem = kv_hash_v6(&key, &value);
+                trie.add(&elem)
+                    .map_err(|e| CatchpointError::ImportError(format!("trie add kv: {e}")))?;
+                since_last_commit += 1;
+                if since_last_commit >= TRIE_REBUILD_COMMIT_FREQUENCY {
+                    total_elements_added += since_last_commit;
+                    commit_and_evict(&mut trie, since_last_commit, total_elements_added)?;
+                    since_last_commit = 0;
+                }
+            }
+            if !got_any {
+                break;
             }
         }
     }
