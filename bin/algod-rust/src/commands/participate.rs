@@ -387,6 +387,11 @@ struct RunningAgreementCycle {
 struct ParticipateAgreementControl {
     ledger: Arc<Mutex<SqliteLedger>>,
     ledger_path: PathBuf,
+    /// Resolved tracker/block/crash-DB paths and the loaded `config.json`
+    /// storage settings, kept so [`Self::reload_ledger`] (issue #1616) can
+    /// reopen `ledger` identically to how `run` opened it at startup.
+    resolved_paths: ResolvedResourcePaths,
+    node_config: algo_config::Local,
     /// Resolved crash-recovery DB path (issue #953) — see
     /// [`resolve_resource_paths`]. Computed once at startup from
     /// `ledger_path` and the loaded `config.json`'s `HotDataDir`/
@@ -662,6 +667,64 @@ impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
             }
         }
     }
+
+    /// Reopen `self.ledger` in place after a live catchpoint catchup
+    /// completes (issue #1616). See `NormalSyncControl::reload_ledger`'s
+    /// doc comment for why a reopen -- not a partial in-place field patch
+    /// -- is required: the catchup wrote through a separate connection, so
+    /// every cache this `SqliteLedger` instance holds (current round,
+    /// rewards state, account/trie/lease caches) is stale until it's
+    /// rebuilt the same way `open_and_configure_participate_ledger` builds
+    /// it at node startup.
+    ///
+    /// Called only while `pause()` already holds no running agreement
+    /// cycle (`LiveCatchupManager::drive` always calls `reload_ledger`
+    /// before `resume`, and `start_catchup` always calls `pause` before
+    /// starting the run), so nothing else is reading through `self.ledger`
+    /// concurrently with the swap below other than the pool-block-follower
+    /// thread, which only ever calls the read-only `CommittedBlockSource`
+    /// methods and tolerates a momentarily-locked ledger the same way it
+    /// already tolerates lock contention from a normal `commit_block`.
+    async fn reload_ledger(&self) {
+        let ledger_path = self.ledger_path.clone();
+        let resolved_paths = self.resolved_paths.clone();
+        let node_config = self.node_config.clone();
+        let reopened = tokio::task::spawn_blocking(move || {
+            open_and_configure_participate_ledger(&ledger_path, &resolved_paths, &node_config)
+        })
+        .await;
+        match reopened {
+            Ok(Ok(fresh)) => {
+                let round = fresh.current_round().0;
+                match self.ledger.lock() {
+                    Ok(mut guard) => {
+                        *guard = fresh;
+                        info!(
+                            round,
+                            "reloaded ledger from disk after live catchpoint catchup"
+                        );
+                        // Wake the pool-block-follower (and anything else
+                        // waiting on this condvar) immediately rather than
+                        // leaving it to discover the new round on its next
+                        // poll-interval timeout.
+                        self.round_advanced.notify_all();
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "ledger reload: lock poisoned, could not install reopened ledger"
+                        );
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "failed to reload ledger after live catchpoint catchup");
+            }
+            Err(e) => {
+                warn!(error = %e, "ledger reload: reopen task panicked");
+            }
+        }
+    }
 }
 
 impl ParticipateAgreementControl {
@@ -673,6 +736,8 @@ impl ParticipateAgreementControl {
         Self {
             ledger: self.ledger.clone(),
             ledger_path: self.ledger_path.clone(),
+            resolved_paths: self.resolved_paths.clone(),
+            node_config: self.node_config.clone(),
             crash_db_path: self.crash_db_path.clone(),
             p2p_active_gossip_node: self.p2p_active_gossip_node.clone(),
             gossip_node: self.gossip_node.clone(),
@@ -2947,10 +3012,55 @@ fn run_pool_block_follower<S: CommittedBlockSource>(
         while last_seen < latest {
             let round = last_seen + 1;
             let Some(block) = ledger.get_block(round) else {
-                // Not readable yet (or a transient error) — stop draining
-                // this tick; we'll retry `round` on the next wakeup instead
-                // of silently skipping it.
-                break;
+                // `round` isn't readable. Two distinct situations produce
+                // this: (a) `round` just hasn't been flushed to disk yet
+                // (transient — normal steady-state follow, `round` is at or
+                // just behind `latest`), or (b) `round`'s history was never
+                // written at all because a live catchpoint catchup (issue
+                // #1616) jumped the ledger straight from `last_seen` to a
+                // much higher `latest` without ever committing the
+                // intermediate blocks — a `SqliteLedger` only keeps recent
+                // history plus the catchpoint round, so rounds strictly
+                // between the old tip and the new one are permanently
+                // absent, not just "not yet written".
+                //
+                // Stepping one round at a time can never recover from (b):
+                // `get_block(round)` fails forever, `last_seen` never
+                // advances, and the pool's evaluator stays pinned at its
+                // pre-catchup round — exactly the observed symptom
+                // (`"transaction round window [1, ...] does not cover
+                // block round 1"` spamming long after the ledger itself
+                // sits at round 65379680+). Distinguish the two cases by
+                // checking whether the actual tip block *is* readable: if
+                // it is and it's past `round`, this is case (b) — skip
+                // straight to it, mirroring how the pool is first primed
+                // at node startup (`pool.on_new_block` with a synthetic
+                // block; `recompute_block_evaluator` reads
+                // `ledger.latest()`/`block_hdr(latest)` directly and
+                // ignores the passed block's own fields). If the tip is
+                // also unreadable, this is genuinely case (a); keep the
+                // original behavior of breaking and retrying next wakeup.
+                match ledger.get_block(latest) {
+                    Some(tip_block) if latest > round => {
+                        let committed_txids: HashSet<algo_types::Digest> = tip_block
+                            .payset
+                            .iter()
+                            .map(|stx| crate::dev_producer::block_txn_id(stx, &tip_block))
+                            .collect();
+                        warn!(
+                            gap_start = round,
+                            latest,
+                            "pool follower: history gap detected (likely a live \
+                             catchpoint catchup) — skipping the pool evaluator \
+                             directly to the ledger tip instead of stepping \
+                             round by round"
+                        );
+                        pool.on_new_block(&tip_block, &committed_txids);
+                        last_seen = latest;
+                        continue;
+                    }
+                    _ => break,
+                }
             };
             let committed_txids: HashSet<algo_types::Digest> = block
                 .payset
@@ -3158,6 +3268,145 @@ pub(crate) fn resolve_resource_paths(
         block_path: algo_ledger::sqlite::block_path_for_prefix(&prefix_in(&block_dir)),
         crash_path: crash_dir.join("crash.sqlite"),
     }
+}
+
+/// Open the participate node's ledger and apply every `config.json`-driven
+/// storage setting, exactly the way `run` does at startup. Factored out
+/// (issue #1616) so [`ParticipateAgreementControl::reload_ledger`] can
+/// reopen the SAME ledger identically after a live catchpoint catchup
+/// completes, rather than duplicating (and risking drift from) this
+/// sequence.
+///
+/// # Why a reopen, not an in-place field patch
+///
+/// A live catchpoint catchup (`LiveCatchupManager`/`SyncOrchestrator`)
+/// imports into the ledger's on-disk tables through its **own** SQLite
+/// connection (`algo_ledger::sqlite::initialize_meta_from_catchpoint`'s doc
+/// comment: "the catchpoint flow opens a bare connection via
+/// `open_ledger_connection`"), entirely separate from the long-lived
+/// `SqliteLedger` this node's agreement/pool/pool-follower already share
+/// via `Arc<Mutex<SqliteLedger>>`. `SqliteLedger::current_round` (and every
+/// other chain-meta/account/trie cache) is an in-memory field populated
+/// once at `open`/`open_split` time -- WAL mode lets the *other*
+/// connection's committed writes be visible to a fresh query, but nothing
+/// makes the already-open `SqliteLedger` instance re-read them on its own.
+/// Patching just `current_round` back in would still leave every other
+/// cache (accounts, merkle trie pages, delta-cache window, lease table)
+/// pointed at pre-catchpoint state -- a correctness hazard for a
+/// participation node signing votes, not just a liveness one. A full
+/// close-and-reopen rebuilds every cache the same way node startup does,
+/// which is the only way already proven not to leave stale state behind.
+fn open_and_configure_participate_ledger(
+    ledger_path: &Path,
+    resolved_paths: &ResolvedResourcePaths,
+    node_config: &algo_config::Local,
+) -> anyhow::Result<SqliteLedger> {
+    let mut sqlite_ledger = SqliteLedger::open_split(
+        &resolved_paths.tracker_path,
+        &resolved_paths.block_path,
+        Some(algo_ledger::sqlite::derive_ledger_prefix(ledger_path)),
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "failed to open ledger (tracker={}, block={}): {}",
+            resolved_paths.tracker_path.display(),
+            resolved_paths.block_path.display(),
+            e
+        )
+    })?;
+
+    // Apply config-driven storage settings (issue #749):
+    // `LedgerSynchronousMode` (SQLite `synchronous` pragma on the main
+    // ledger connection) and `DisableLedgerLRUCache` (merkle trie page
+    // cache eviction). `open` already applied
+    // `algo_ledger::sqlite::DEFAULT_LEDGER_SYNCHRONOUS_MODE`, so this is a
+    // no-op unless the operator's `config.json` overrides it.
+    sqlite_ledger
+        .set_synchronous_mode(node_config.ledger_synchronous_mode)
+        .map_err(|e| anyhow::anyhow!("set ledger synchronous mode: {e}"))?;
+    sqlite_ledger.set_lru_cache_disabled(node_config.disable_ledger_lru_cache);
+    // `MaxAcctLookback` (issue #755): applied as a *floor* on top of
+    // `algo_ledger::delta_cache::DEFAULT_WINDOW_SIZE` (320 rounds), never
+    // below it -- go's own default (4) would be an unsafe ceiling for
+    // algod-rust's hard-window `DeltaCache` (see `set_delta_cache_window`'s
+    // doc comment), so this is a no-op at go's default and only extends
+    // the window when the operator explicitly asks for more than 320.
+    sqlite_ledger.set_delta_cache_window(node_config.max_acct_lookback as usize);
+
+    // `OptimizeAccountsDatabaseOnStartup` (issue #749): run SQLite `VACUUM`
+    // on the accounts DB once, mirroring go's
+    // `Ledger.reloadLedger` -> `accountUpdates.vacuumDatabase`
+    // (`../go-algorand/ledger/ledger.go:268-272`). Opt-in and potentially
+    // slow on a large accounts DB, matching go's own "not a typical
+    // operational use-case" framing.
+    if node_config.optimize_accounts_database_on_startup {
+        info!("OptimizeAccountsDatabaseOnStartup: vacuuming accounts database");
+        sqlite_ledger
+            .vacuum_accounts_database()
+            .map_err(|e| anyhow::anyhow!("vacuum accounts database: {e}"))?;
+    }
+
+    // Issue #770: automatic interval-driven catchpoint generation, wired
+    // into the live block-apply loop via `commit_block`. A no-op unless
+    // `config.json` resolves `CatchpointTracking`/`CatchpointInterval`/
+    // `CatchpointDir` to an enabled state (see
+    // `resolve_automatic_catchpoint_config`).
+    if let Some(auto_cfg) = resolve_automatic_catchpoint_config(node_config) {
+        info!(
+            interval = auto_cfg.interval,
+            file_history_length = auto_cfg.file_history_length,
+            dir = %auto_cfg.dir.display(),
+            "automatic catchpoint generation enabled"
+        );
+        sqlite_ledger.configure_automatic_catchpoints(Some(auto_cfg));
+    }
+
+    // Issue #1187: periodic AccountUpdates telemetry-equivalent `tracing`
+    // event, wired into the live block-apply loop via `commit_block`. A
+    // no-op unless `config.json` resolves `EnableAccountUpdatesStats` to
+    // `true` (see `resolve_account_updates_stats_config`).
+    if let Some(stats_cfg) = resolve_account_updates_stats_config(node_config) {
+        info!(
+            interval = ?stats_cfg.interval,
+            "AccountUpdates telemetry event enabled"
+        );
+        sqlite_ledger.configure_account_updates_stats(Some(stats_cfg));
+    }
+
+    // Issue #1354: node-level block/txtail retention overrides
+    // (`MaxBlockHistoryLookback`/`Archival`/catchpoint-interval floor),
+    // consulted by the live block-apply loop's per-block pruning
+    // (`algo_ledger::apply`). A no-op (identical to pre-#1354 behavior)
+    // when `config.json` leaves all three at their stock defaults.
+    sqlite_ledger.configure_retention(resolve_retention_config(node_config));
+
+    // Reject anything but a fully populated block archive before
+    // booting agreement. Participating with a missing tail block — or
+    // with the catchpoint-only "blockdb empty" shape — would risk
+    // producing votes against state that the block archive can't
+    // reproduce on the next restart.
+    match sqlite_ledger.reconcile_cross_file().map_err(|e| {
+        anyhow::anyhow!("reconcile cross-file consistency for participate ledger: {e}")
+    })? {
+        algo_ledger::CrossFileState::Empty | algo_ledger::CrossFileState::Consistent { .. } => {}
+        algo_ledger::CrossFileState::CatchpointOnly { tracker_round } => {
+            anyhow::bail!(
+                "participate requires blocks on disk; the ledger is catchpoint-only at round \
+                 {tracker_round}. Run `algod-rust sync` first to populate the block archive."
+            );
+        }
+        algo_ledger::CrossFileState::BlockBehind {
+            tracker_round,
+            block_max_round,
+        } => {
+            anyhow::bail!(
+                "ledger inconsistency: tracker at round {tracker_round} but blockdb.blocks max \
+                 is {block_max_round}. Recover from a catchpoint or delete the DB."
+            );
+        }
+    }
+
+    Ok(sqlite_ledger)
 }
 
 /// Open (or create) the agreement crash recovery database at an explicit,
@@ -4041,110 +4290,8 @@ pub async fn run(
             )
         })?;
     }
-    let mut sqlite_ledger = SqliteLedger::open_split(
-        &resolved_paths.tracker_path,
-        &resolved_paths.block_path,
-        Some(algo_ledger::sqlite::derive_ledger_prefix(ledger_path)),
-    )
-    .map_err(|e| {
-        anyhow::anyhow!(
-            "failed to open ledger (tracker={}, block={}): {}",
-            resolved_paths.tracker_path.display(),
-            resolved_paths.block_path.display(),
-            e
-        )
-    })?;
-
-    // Apply config-driven storage settings (issue #749):
-    // `LedgerSynchronousMode` (SQLite `synchronous` pragma on the main
-    // ledger connection) and `DisableLedgerLRUCache` (merkle trie page
-    // cache eviction). `open` already applied
-    // `algo_ledger::sqlite::DEFAULT_LEDGER_SYNCHRONOUS_MODE`, so this is a
-    // no-op unless the operator's `config.json` overrides it.
-    sqlite_ledger
-        .set_synchronous_mode(node_config.ledger_synchronous_mode)
-        .map_err(|e| anyhow::anyhow!("set ledger synchronous mode: {e}"))?;
-    sqlite_ledger.set_lru_cache_disabled(node_config.disable_ledger_lru_cache);
-    // `MaxAcctLookback` (issue #755): applied as a *floor* on top of
-    // `algo_ledger::delta_cache::DEFAULT_WINDOW_SIZE` (320 rounds), never
-    // below it -- go's own default (4) would be an unsafe ceiling for
-    // algod-rust's hard-window `DeltaCache` (see `set_delta_cache_window`'s
-    // doc comment), so this is a no-op at go's default and only extends
-    // the window when the operator explicitly asks for more than 320.
-    sqlite_ledger.set_delta_cache_window(node_config.max_acct_lookback as usize);
-
-    // `OptimizeAccountsDatabaseOnStartup` (issue #749): run SQLite `VACUUM`
-    // on the accounts DB once, mirroring go's
-    // `Ledger.reloadLedger` -> `accountUpdates.vacuumDatabase`
-    // (`../go-algorand/ledger/ledger.go:268-272`). Opt-in and potentially
-    // slow on a large accounts DB, matching go's own "not a typical
-    // operational use-case" framing.
-    if node_config.optimize_accounts_database_on_startup {
-        info!("OptimizeAccountsDatabaseOnStartup: vacuuming accounts database");
-        sqlite_ledger
-            .vacuum_accounts_database()
-            .map_err(|e| anyhow::anyhow!("vacuum accounts database: {e}"))?;
-    }
-
-    // Issue #770: automatic interval-driven catchpoint generation, wired
-    // into the live block-apply loop via `commit_block`. A no-op unless
-    // `config.json` resolves `CatchpointTracking`/`CatchpointInterval`/
-    // `CatchpointDir` to an enabled state (see
-    // `resolve_automatic_catchpoint_config`).
-    if let Some(auto_cfg) = resolve_automatic_catchpoint_config(&node_config) {
-        info!(
-            interval = auto_cfg.interval,
-            file_history_length = auto_cfg.file_history_length,
-            dir = %auto_cfg.dir.display(),
-            "automatic catchpoint generation enabled"
-        );
-        sqlite_ledger.configure_automatic_catchpoints(Some(auto_cfg));
-    }
-
-    // Issue #1187: periodic AccountUpdates telemetry-equivalent `tracing`
-    // event, wired into the live block-apply loop via `commit_block`. A
-    // no-op unless `config.json` resolves `EnableAccountUpdatesStats` to
-    // `true` (see `resolve_account_updates_stats_config`).
-    if let Some(stats_cfg) = resolve_account_updates_stats_config(&node_config) {
-        info!(
-            interval = ?stats_cfg.interval,
-            "AccountUpdates telemetry event enabled"
-        );
-        sqlite_ledger.configure_account_updates_stats(Some(stats_cfg));
-    }
-
-    // Issue #1354: node-level block/txtail retention overrides
-    // (`MaxBlockHistoryLookback`/`Archival`/catchpoint-interval floor),
-    // consulted by the live block-apply loop's per-block pruning
-    // (`algo_ledger::apply`). A no-op (identical to pre-#1354 behavior)
-    // when `config.json` leaves all three at their stock defaults.
-    sqlite_ledger.configure_retention(resolve_retention_config(&node_config));
-
-    // Reject anything but a fully populated block archive before
-    // booting agreement. Participating with a missing tail block — or
-    // with the catchpoint-only "blockdb empty" shape — would risk
-    // producing votes against state that the block archive can't
-    // reproduce on the next restart.
-    match sqlite_ledger.reconcile_cross_file().map_err(|e| {
-        anyhow::anyhow!("reconcile cross-file consistency for participate ledger: {e}")
-    })? {
-        algo_ledger::CrossFileState::Empty | algo_ledger::CrossFileState::Consistent { .. } => {}
-        algo_ledger::CrossFileState::CatchpointOnly { tracker_round } => {
-            anyhow::bail!(
-                "participate requires blocks on disk; the ledger is catchpoint-only at round \
-                 {tracker_round}. Run `algod-rust sync` first to populate the block archive."
-            );
-        }
-        algo_ledger::CrossFileState::BlockBehind {
-            tracker_round,
-            block_max_round,
-        } => {
-            anyhow::bail!(
-                "ledger inconsistency: tracker at round {tracker_round} but blockdb.blocks max \
-                 is {block_max_round}. Recover from a catchpoint or delete the DB."
-            );
-        }
-    }
+    let mut sqlite_ledger =
+        open_and_configure_participate_ledger(ledger_path, &resolved_paths, &node_config)?;
 
     let latest = sqlite_ledger.current_round().0;
     info!(path = %ledger_path.display(), latest_round = latest, "opened ledger database");
@@ -5184,6 +5331,8 @@ pub async fn run(
     let agreement_control = Arc::new(ParticipateAgreementControl {
         ledger: ledger.clone(),
         ledger_path: ledger_path.to_path_buf(),
+        resolved_paths: resolved_paths.clone(),
+        node_config: node_config.clone(),
         crash_db_path: resolved_paths.crash_path.clone(),
         p2p_active_gossip_node: p2p_active_gossip_node.clone(),
         gossip_node: gossip_node.clone(),
@@ -6536,6 +6685,121 @@ mod tests {
             "pool must retry round {} after a transient read failure instead of \
              silently skipping past it",
             new_hdr.round.0
+        );
+    }
+
+    /// Pins the fix for issue #1616's transaction-pool clue: after a live
+    /// catchpoint catchup jumps the ledger from a low round straight to a
+    /// much higher tip (skipping every intermediate block), the pool's
+    /// evaluator must catch up to the real tip instead of getting stuck
+    /// forever re-requesting `last_seen + 1`, which never becomes readable.
+    /// Before the fix this test hangs until the deadline and `accepted` is
+    /// false — the follower spins on `get_block(2)` (always `None`) without
+    /// ever advancing `last_seen` past genesis, reproducing the observed
+    /// `"transaction round window [1, ...] does not cover block round 1"`
+    /// log spam long after the real ledger sits at round 65379680+.
+    #[test]
+    fn pool_block_follower_skips_straight_to_tip_across_a_catchpoint_gap() {
+        let ledger = test_ledger();
+
+        let genesis_hdr = BlockHeader {
+            round: Round(0),
+            current_protocol: algo_types::CONSENSUS_V41.to_string(),
+            fee_sink: Address([1u8; 32]),
+            rewards_pool: Address([2u8; 32]),
+            genesis_id: "net-x".to_string(),
+            genesis_hash: PROBE_GENESIS_HASH,
+            timestamp: 1_000,
+            ..BlockHeader::default()
+        };
+        let genesis_block = algo_types::Block {
+            round: genesis_hdr.round,
+            current_protocol: genesis_hdr.current_protocol.clone(),
+            fee_sink: genesis_hdr.fee_sink,
+            rewards_pool: genesis_hdr.rewards_pool,
+            genesis_id: genesis_hdr.genesis_id.clone(),
+            genesis_hash: genesis_hdr.genesis_hash,
+            timestamp: genesis_hdr.timestamp,
+            ..algo_types::Block::default()
+        };
+        commit_block_for_test(&ledger, &genesis_block);
+        fund_probe_sender(&ledger);
+
+        let pool_ledger_adapter = Arc::new(PoolLedgerAdapter::new(ledger.clone()));
+        let pool = Arc::new(TransactionPool::new(
+            PoolConfig::default(),
+            pool_ledger_adapter as Arc<dyn algo_pool::traits::PoolLedger>,
+        ));
+        pool.ensure_evaluator_primed();
+
+        // `initial_round` is captured BEFORE the catchpoint-style jump below,
+        // mirroring how production primes the follower from the pre-import
+        // round.
+        let initial_round = ledger.lock().unwrap().current_round().0;
+
+        // Simulate a live catchpoint catchup jumping the REAL ledger
+        // straight to round 65379680 (mirroring the exact round the live
+        // soak halted at) via `commit_block_for_test`, which -- like a
+        // catchpoint import -- writes only the tip round's block data and
+        // advances `current_round`, without ever writing rounds 1..65379679.
+        // Using the real ledger (not a fake `CommittedBlockSource`) matters:
+        // `recompute_block_evaluator` reads `PoolLedger::latest()`/
+        // `block_hdr(latest)` from the pool's own ledger handle, so the
+        // real ledger's round must actually be at the tip for the fix to be
+        // exercised faithfully, exactly as it is in production after a real
+        // catchpoint import.
+        const TIP_ROUND: u64 = 65_379_680;
+        let tip_block = algo_types::Block {
+            round: Round(TIP_ROUND),
+            current_protocol: genesis_hdr.current_protocol.clone(),
+            fee_sink: genesis_hdr.fee_sink,
+            rewards_pool: genesis_hdr.rewards_pool,
+            genesis_id: genesis_hdr.genesis_id.clone(),
+            genesis_hash: genesis_hdr.genesis_hash,
+            timestamp: genesis_hdr.timestamp + TIP_ROUND as i64,
+            ..algo_types::Block::default()
+        };
+        commit_block_for_test(&ledger, &tip_block);
+
+        let round_advanced = Arc::new(std::sync::Condvar::new());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let follower = {
+            let pool = pool.clone();
+            let ledger = ledger.clone();
+            let round_advanced = round_advanced.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                run_pool_block_follower(
+                    &pool,
+                    &ledger,
+                    &round_advanced,
+                    &stop,
+                    Duration::from_millis(50),
+                    initial_round,
+                );
+            })
+        };
+
+        round_advanced.notify_all();
+
+        // The evaluator's target after skipping to the tip is
+        // `TIP_ROUND + 1` -- pin the probe txn's window there so acceptance
+        // proves the evaluator actually reached the real tip, not merely
+        // "some round" (e.g. still stuck at genesis+1).
+        let txn = window_pinned_txn(Round(TIP_ROUND + 1), &genesis_hdr.genesis_id);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let accepted = wait_for_acceptance(&pool, &txn, &round_advanced, deadline);
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        round_advanced.notify_all();
+        follower.join().expect("follower thread panicked");
+
+        assert!(
+            accepted,
+            "pool evaluator must skip straight to the ledger tip (round {TIP_ROUND}) \
+             across a catchpoint-induced history gap instead of getting stuck \
+             re-requesting unreadable intermediate rounds forever"
         );
     }
 
@@ -11013,6 +11277,12 @@ mod tests {
         let control = ParticipateAgreementControl {
             ledger,
             ledger_path: ledger_path.clone(),
+            resolved_paths: ResolvedResourcePaths {
+                tracker_path: algo_ledger::sqlite::tracker_path_for_prefix(&ledger_path),
+                block_path: algo_ledger::sqlite::block_path_for_prefix(&ledger_path),
+                crash_path: tmp_dir.join("crash.sqlite"),
+            },
+            node_config: algo_config::Local::default(),
             crash_db_path: tmp_dir.join("crash.sqlite"),
             p2p_active_gossip_node: gossip_node.clone() as Arc<dyn GossipNode>,
             gossip_node,
