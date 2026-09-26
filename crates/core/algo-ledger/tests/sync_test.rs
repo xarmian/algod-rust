@@ -1149,3 +1149,164 @@ fn test_validate_invariants_multiple_account_statuses() {
             .collect::<Vec<_>>()
     );
 }
+
+// ===========================================================================
+// Issue #1625: `SyncOrchestrator::run` must not starve other tokio tasks
+// ===========================================================================
+
+/// A [`SyncBackend`] whose `download_catchpoint` blocks the calling thread
+/// synchronously (`std::thread::sleep`, no `.await` point) before failing —
+/// standing in, at test scale, for the real CPU-bound Merkle-trie rebuild
+/// `run_verify_ledger` performs in-line against a real catchpoint (30-50+
+/// minutes against ~22.47M mainnet accounts, per issue #1625's live
+/// evidence). Failing right after the blocking sleep keeps the test fast
+/// while still exercising the exact "long synchronous span inside
+/// `SyncOrchestrator::run`" shape that starved the REST server.
+struct SlowBlockingBackend {
+    blocking_span: Duration,
+}
+
+impl algo_ledger::sync::SyncBackend for SlowBlockingBackend {
+    fn download_catchpoint(
+        &self,
+        _genesis_id: &str,
+        _round: u64,
+        _dest_path: &std::path::Path,
+    ) -> Result<(), algo_error::AlgoError> {
+        std::thread::sleep(self.blocking_span);
+        Err(algo_error::AlgoError::Ledger {
+            message: "SlowBlockingBackend: stopping after the simulated blocking phase".to_string(),
+        })
+    }
+
+    fn fetch_block_raw(
+        &self,
+        _round: u64,
+    ) -> Result<(String, Vec<u8>, Vec<u8>), algo_error::AlgoError> {
+        unimplemented!("not exercised by this test")
+    }
+
+    fn fetch_block(&self, _round: u64) -> Result<algo_types::Block, algo_error::AlgoError> {
+        unimplemented!("not exercised by this test")
+    }
+
+    fn get_current_round(&self) -> Result<u64, algo_error::AlgoError> {
+        unimplemented!("not exercised by this test")
+    }
+
+    fn discover_catchpoint(&self) -> Result<Option<String>, algo_error::AlgoError> {
+        Ok(None)
+    }
+}
+
+/// TDD for issue #1625: before the fix, `SyncOrchestrator::run` called the
+/// fully-synchronous `run_phases` directly on whatever tokio worker thread
+/// polled it. On a runtime with exactly one worker thread — standing in
+/// for the low vCPU counts real GitHub Actions runners provide — a long
+/// blocking span inside `run_phases` had nowhere else to run: it
+/// monopolized the sole worker thread, and a concurrent task (standing in
+/// for the REST server's `/v2/status` handler) could make zero progress
+/// until the blocking span finished. `tokio::task::block_in_place` fixes
+/// this by handing the worker thread's other queued tasks off to a
+/// spun-up thread for the blocking span's duration.
+///
+/// Both `orch.run()` and the "REST-like" ticker are `tokio::spawn`ed as
+/// pool tasks on a manually-built `worker_threads(1)` runtime (rather than
+/// using `#[tokio::test]`'s implicit `block_on`, whose calling thread can
+/// itself assist as an extra de facto worker and mask starvation) so they
+/// are forced to genuinely compete for the one available pool thread.
+///
+/// This test fails against the pre-fix code: the ticker task cannot run
+/// at all while `run_phases` blocks the sole worker thread, so its
+/// increment count stays at (or near) zero instead of racing ahead during
+/// the 600ms blocking span.
+#[test]
+fn run_does_not_starve_concurrent_tasks_during_blocking_phase_issue_1625() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("failed to build single-worker tokio runtime");
+
+    rt.block_on(async {
+        let dir = std::env::temp_dir().join(format!(
+            "algod-rust-sync-starve-test-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let mut config = test_config();
+        config.db_path = dir.join("ledger");
+        config.catchpoint_label =
+            Some("100#KURJLS6EWBEVXTMLC7NP3NABTUMQP32QUJOBBW2TT23376L6RWJA".to_string());
+        config.genesis_id = "mainnet-v1.0".to_string();
+
+        let blocking_span = Duration::from_millis(600);
+        let mut orch =
+            SyncOrchestrator::with_backend(config, SlowBlockingBackend { blocking_span });
+
+        // Stand-in for the REST server's own request-handling tasks: a
+        // task that does the minimum possible unit of work (an atomic
+        // increment) between cooperative yield points, as fast as the
+        // scheduler will let it run. Unlike a timer-based ticker (whose
+        // wakeups can be driven by reactor machinery independent of
+        // whether *this* worker thread is free), this task can only make
+        // progress when the scheduler actually dispatches it on the one
+        // available pool thread — which is exactly what's at stake here:
+        // with that thread wholly occupied running the synchronous,
+        // non-yielding `run_phases` call, this task has nowhere to run at
+        // all until `run_phases` returns control to the executor.
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticks_task = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                ticks_task.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // Spawn `orch.run()` as a pool task too (rather than `.await`ing
+        // it inline on the `block_on` caller thread), so it and the
+        // ticker both depend solely on the runtime's one pool worker
+        // thread for scheduling.
+        let run_started = Instant::now();
+        let run_task = tokio::spawn(async move { orch.run().await });
+        let result = run_task.await.expect("run task should not panic");
+        let run_elapsed = run_started.elapsed();
+        assert!(
+            result.is_err(),
+            "SlowBlockingBackend deliberately fails after its blocking span, got: {result:?}"
+        );
+
+        // Sample immediately — before giving the ticker any further
+        // chance to run past this point — so this reflects concurrent
+        // progress made *during* `orch.run()`'s blocking span, not
+        // progress made afterward.
+        let count = ticks.load(Ordering::SeqCst);
+        ticker.abort();
+
+        // `run_elapsed` is at least `blocking_span` either way; the
+        // signal is whether the ticker made progress *concurrently* with
+        // it. Starved (pre-fix): the sole worker thread is wholly
+        // occupied inside the synchronous, never-yielding `run_phases`
+        // call for the entire blocking span, so this task has no thread
+        // to run on and cannot record a single increment until `run()`
+        // returns control to the executor. Fixed: `block_in_place` hands
+        // this worker thread's other ready tasks off to a freshly
+        // spun-up thread for the blocking span's duration, so the ticker
+        // races ahead there, racking up a large count (a tight
+        // increment+yield loop with no other work) well before `run()`
+        // returns.
+        assert!(
+            count >= 1_000,
+            "a concurrent tokio task (standing in for the REST server) should keep making \
+             progress throughout the {blocking_span:?} blocking phase inside \
+             SyncOrchestrator::run (issue #1625) — only {count} increments had completed by \
+             the time run() returned (after {run_elapsed:?}), indicating the sole worker \
+             thread was starved rather than handed off to run other ready tasks"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
