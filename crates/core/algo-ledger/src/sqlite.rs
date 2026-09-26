@@ -2663,19 +2663,89 @@ impl SqliteLedger {
                 m.protocol,
                 m.txn_counter,
             ),
-            None => (
-                Round(0),
-                0,
-                0,
-                0,
-                0,
-                Address::ZERO,
-                Address::ZERO,
-                String::new(),
-                [0u8; 32],
-                String::new(),
-                0,
-            ),
+            None => {
+                // `derive_chain_meta_from_latest_block` also returns `None`
+                // for a DB whose tracker (`acctrounds.acctbase`) is already
+                // at a committed, non-zero round but whose matching block
+                // header row is entirely missing in `blockdb.blocks` -- not
+                // just for a genuinely fresh/uninitialized DB (no
+                // `acctrounds` row at all, which legitimately zero-defaults
+                // before genesis/catchpoint init populates it).
+                //
+                // `migrate_off_algod_rust_meta`'s own "Step 3" comment
+                // already identifies this exact hazard for the one-time
+                // legacy-table retirement: silently zero-defaulting here
+                // would make every consumer of this `SqliteLedger` instance
+                // (this connection's own `current_round`, and therefore
+                // every reader such as `CatchupService`/agreement) believe
+                // the ledger is back at round 1, while any OTHER reader of
+                // the same on-disk files that queries `acctrounds`/blockdb
+                // directly (or a `SqliteLedger` instance that never lost
+                // its own in-memory cache) still correctly reports the real
+                // committed round -- exactly the split-brain symptom behind
+                // issue #1633 (a live catchpoint-catchup reopen landing the
+                // participate ledger's `current_round` back at ~1 while the
+                // REST-reported round stays correct, so the catchup service
+                // spins forever re-fetching low rounds nothing can ever
+                // supply instead of erroring loudly). Fail the open instead
+                // of guessing.
+                //
+                // Deliberately scoped to "no header row at all", not "header
+                // present but undecodable": a handful of existing tests
+                // seed a placeholder (non-msgpack) header byte string on
+                // purpose to exercise unrelated round-tracking paths without
+                // needing a full `BlockHeader` fixture, and that decode
+                // failure already warns loudly (`derive_chain_meta_from_latest_block`'s
+                // "failed to decode BlockHeader" branch) without this guard's
+                // help. The dangerous, silent case issue #1633 hit is a
+                // genuinely absent row, not a malformed one.
+                let acctrounds_rnd: Option<i64> = conn
+                    .query_row(
+                        "SELECT rnd FROM acctrounds WHERE id = 'acctbase'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| AlgoError::Ledger {
+                        message: format!("open: acctrounds recheck: {e}"),
+                    })?;
+                if let Some(rnd) = acctrounds_rnd.filter(|rnd| *rnd > 0) {
+                    let header_row_exists: bool = conn
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM blockdb.blocks WHERE rnd = ?1)",
+                            params![rnd],
+                            |row| row.get(0),
+                        )
+                        .map_err(|e| AlgoError::Ledger {
+                            message: format!("open: blockdb row recheck: {e}"),
+                        })?;
+                    if !header_row_exists {
+                        return Err(AlgoError::Ledger {
+                            message: format!(
+                                "ledger inconsistency: acctrounds.acctbase reports round {rnd} \
+                                 already committed, but blockdb.blocks has no row for it at \
+                                 all. Opening this ledger would silently reset the runtime's \
+                                 current round to 0 instead of {rnd}. Recover by re-syncing \
+                                 this ledger from a catchpoint rather than trusting a \
+                                 zero-defaulted round."
+                            ),
+                        });
+                    }
+                }
+                (
+                    Round(0),
+                    0,
+                    0,
+                    0,
+                    0,
+                    Address::ZERO,
+                    Address::ZERO,
+                    String::new(),
+                    [0u8; 32],
+                    String::new(),
+                    0,
+                )
+            }
         };
 
         Ok(Self {
@@ -12946,6 +13016,58 @@ mod tests {
             .expect("derivation must succeed with a real header");
         assert_eq!(derived.current_round, Round(7));
         assert_eq!(derived.genesis_id, "test-net-v1");
+    }
+
+    /// TDD regression for issue #1633: a `SqliteLedger` reopen must never
+    /// silently reset an already-committed, non-zero tracker round back to
+    /// `Round(0)` just because the matching block header can't be found in
+    /// `blockdb.blocks`. Before this fix, `open`/`open_split` treated that
+    /// exact condition identically to a genuinely fresh/uninitialized DB
+    /// (no `acctrounds` row at all) and zero-defaulted `current_round` --
+    /// which is precisely the shape a live catchpoint-catchup reopen (or
+    /// any other "acctrounds says N, blockdb.blocks has no row for N"
+    /// inconsistency) hit live: the participate ledger's own
+    /// `current_round` cache silently landed back at 1 while every other
+    /// reader of the same on-disk state (the REST-reported round, in
+    /// particular) still correctly reported the real committed round, and
+    /// the catchup service then spun forever re-fetching low rounds no
+    /// peer could ever supply instead of failing loudly.
+    #[test]
+    fn open_refuses_to_silently_zero_default_a_committed_nonzero_round_with_missing_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+
+        {
+            let ledger = SqliteLedger::open_with_prefix(&prefix).expect("open");
+            // Tell the tracker it has already committed round 65_409_680
+            // (mirrors a catchpoint import's `initialize_meta_from_catchpoint`
+            // seeding `acctrounds.acctbase`), but deliberately never write
+            // the matching header into `blockdb.blocks` -- reproducing the
+            // exact "tracker round committed, blockdb has no row for it"
+            // inconsistency.
+            ledger
+                .conn
+                .execute(
+                    "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', 65409680)",
+                    [],
+                )
+                .unwrap();
+        }
+
+        // Before the fix: this reopen would succeed with
+        // `ledger.current_round == Round(0)`, silently losing the
+        // already-committed round. After the fix: it must fail loudly
+        // instead of guessing.
+        let result = SqliteLedger::open_with_prefix(&prefix);
+        let err = result.err().expect(
+            "reopening a ledger whose tracker round has no matching blockdb header must \
+             error instead of silently zero-defaulting current_round",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("65409680") && msg.contains("inconsistency"),
+            "expected an error naming the stranded committed round, got: {msg}"
+        );
     }
 
     #[test]
