@@ -266,6 +266,67 @@ impl std::fmt::Debug for OwnedSqliteCommitter {
     }
 }
 
+/// SQLite page cache to grant each [`OwnedSqliteCommitter`] connection, in
+/// KiB (negative `cache_size` argument = KiB, not page count — see
+/// SQLite's `PRAGMA cache_size` docs). SQLite's built-in default is
+/// `-2000` (2 MiB) — trivial for the small synthetic datasets this
+/// module's own unit tests use, but catastrophically small against the
+/// real `accounthashes` table at mainnet scale (tens of millions of
+/// trie-node pages keyed by an ever-growing `INTEGER PRIMARY KEY id`):
+/// with a 2 MiB cache, nearly every one of `build_and_persist_trie_chunked`'s
+/// per-chunk page reads/writes (issue #1626) misses SQLite's cache and
+/// costs a real disk read once the on-disk table exceeds a couple
+/// hundred pages, and that miss rate — and therefore each chunk's wall
+/// time — grows smoothly with the table's on-disk size for the rest of
+/// the rebuild. Issue #1631's live mainnet dispatch
+/// (`mainnet-node-soak` run 36256977265) captured exactly this pattern
+/// with per-chunk timing instrumentation: `chunk_elapsed_ms` climbed
+/// from ~800ms in the first ~20 chunks to 17–29 SECONDS per chunk by
+/// chunk ~400/448 (a ~20-35x slowdown), while `resident_nodes` (the
+/// **in-process** LRU-bounded trie-node cache target from issue #1626)
+/// stayed flat at ~8,900-9,000 the entire time — proving the slowdown is
+/// not the in-memory trie cache growing unbounded (#1626 already fixed
+/// that), but a *separate*, previously-untuned SQLite-level page-cache
+/// bottleneck that only manifests once the on-disk table is far larger
+/// than SQLite's 2 MiB default, which none of this module's small
+/// synthetic-scale tests ever exercise. 256 MiB comfortably covers a
+/// working set on the order of the resident-node target above without
+/// meaningfully increasing peak process memory relative to everything
+/// else `build_and_persist_trie_chunked` already holds resident.
+const COMMITTER_CACHE_SIZE_KIB: i64 = -262_144;
+
+/// `PRAGMA mmap_size` (bytes) applied alongside [`COMMITTER_CACHE_SIZE_KIB`].
+/// Memory-mapping the database file lets the OS page cache (already warm
+/// from earlier passes over the same growing file) serve read misses
+/// without an extra copy through SQLite's own page cache, on top of the
+/// larger `cache_size` above. 1 GiB is generous headroom for a real
+/// mainnet-scale `accounthashes` table without pinning the whole file.
+const COMMITTER_MMAP_SIZE_BYTES: i64 = 1 << 30;
+
+/// Apply the performance pragmas above to a freshly opened committer
+/// connection. Best-effort: `PRAGMA mmap_size` can be refused by some
+/// platforms/builds (e.g. no mmap support), and a refusal here must never
+/// fail the whole open — the committer still works correctly, just
+/// slower, with SQLite's own default cache sizing.
+fn apply_perf_pragmas(conn: &Connection, path: &Path) {
+    if let Err(e) = conn.execute_batch(&format!("PRAGMA cache_size = {COMMITTER_CACHE_SIZE_KIB};"))
+    {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "OwnedSqliteCommitter: failed to raise cache_size (continuing with SQLite's default)"
+        );
+    }
+    if let Err(e) = conn.execute_batch(&format!("PRAGMA mmap_size = {COMMITTER_MMAP_SIZE_BYTES};"))
+    {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "OwnedSqliteCommitter: failed to enable mmap_size (continuing without it)"
+        );
+    }
+}
+
 impl OwnedSqliteCommitter {
     /// Open a fresh read-only connection to `path` and bind it to
     /// `table`. The connection is independent of any other connection
@@ -280,6 +341,7 @@ impl OwnedSqliteCommitter {
         .map_err(|e| AlgoError::Ledger {
             message: format!("OwnedSqliteCommitter::open({}): {e}", path_ref.display()),
         })?;
+        apply_perf_pragmas(&conn, path_ref);
         Ok(Self {
             conn,
             table,
@@ -319,6 +381,7 @@ impl OwnedSqliteCommitter {
                 path_ref.display()
             ),
         })?;
+        apply_perf_pragmas(&conn, path_ref);
         Ok(Self {
             conn,
             table,
@@ -359,12 +422,14 @@ impl OwnedSqliteCommitter {
 
     /// Commit the transaction opened by [`OwnedSqliteCommitter::begin_immediate`].
     pub fn commit_txn(&self) -> Result<(), AlgoError> {
-        self.conn.execute_batch("COMMIT").map_err(|e| AlgoError::Ledger {
-            message: format!(
-                "OwnedSqliteCommitter::commit_txn({}): {e}",
-                self.path.display()
-            ),
-        })
+        self.conn
+            .execute_batch("COMMIT")
+            .map_err(|e| AlgoError::Ledger {
+                message: format!(
+                    "OwnedSqliteCommitter::commit_txn({}): {e}",
+                    self.path.display()
+                ),
+            })
     }
 
     /// Roll back the transaction opened by [`OwnedSqliteCommitter::begin_immediate`].
@@ -595,5 +660,57 @@ mod tests {
         }
         committer.store_page(1, &page).unwrap();
         assert_eq!(committer.load_page(1).unwrap().unwrap(), page);
+    }
+
+    /// Issue #1631 regression: `OwnedSqliteCommitter::open`/`open_writable`
+    /// must raise the SQLite page cache well past the 2 MiB built-in
+    /// default, or every chunked-rebuild page access at real mainnet
+    /// scale degrades into a disk read (see `COMMITTER_CACHE_SIZE_KIB`'s
+    /// doc comment for the live-dispatch evidence). Pins the exact
+    /// pragma values so a future edit can't silently drop this back to
+    /// SQLite's default without a test failure.
+    #[test]
+    fn open_writable_raises_cache_size_and_mmap_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("committer_pragmas.sqlite");
+        // OwnedSqliteCommitter::open{,_writable} require a real,
+        // already-existing on-disk file (SQLITE_OPEN_READ_WRITE /
+        // SQLITE_OPEN_READ_ONLY, no SQLITE_OPEN_CREATE) — create the
+        // schema with a normal connection first, matching how the real
+        // ledger DB always exists before any lazy-load/rebuild committer
+        // opens it.
+        {
+            let setup = Connection::open(&path).unwrap();
+            setup
+                .execute_batch(
+                    "PRAGMA journal_mode=WAL;
+                     CREATE TABLE accounthashes (id INTEGER PRIMARY KEY, data BLOB);
+                     CREATE TABLE catchpointaccounthashes (id INTEGER PRIMARY KEY, data BLOB);",
+                )
+                .unwrap();
+        }
+
+        let read_only = OwnedSqliteCommitter::open(&path, CommitterTable::Active).unwrap();
+        let writable = OwnedSqliteCommitter::open_writable(&path, CommitterTable::Active).unwrap();
+
+        for committer in [&read_only, &writable] {
+            let cache_size: i64 = committer
+                .conn
+                .query_row("PRAGMA cache_size", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                cache_size, COMMITTER_CACHE_SIZE_KIB,
+                "cache_size must be raised past SQLite's 2 MiB default"
+            );
+
+            let mmap_size: i64 = committer
+                .conn
+                .query_row("PRAGMA mmap_size", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                mmap_size, COMMITTER_MMAP_SIZE_BYTES,
+                "mmap_size must be enabled to avoid an extra SQLite-page-cache copy"
+            );
+        }
     }
 }
