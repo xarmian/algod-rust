@@ -60,7 +60,8 @@ use algo_error::{AlgoError, Result};
 
 use algo_network::peer_ranker::{
     make_catchpoint_peer_selector, ClassBasedPeerSelector, PeerClassKind, PeerSelector,
-    PeersRetriever, PEER_RANK_DOWNLOAD_FAILED, PEER_RANK_NO_CATCHPOINT_FOR_ROUND,
+    PeerSelectorPeer, PeersRetriever, PEER_RANK_DOWNLOAD_FAILED, PEER_RANK_INVALID_DOWNLOAD,
+    PEER_RANK_NO_CATCHPOINT_FOR_ROUND,
 };
 
 use crate::http_over_stream::HttpPeerTransport;
@@ -106,6 +107,14 @@ pub struct RankedCatchpointSource {
     config: CatchpointDownloadConfig,
     selector: StdMutex<ClassBasedPeerSelector>,
     ledger_download_retry_attempts: usize,
+    /// The peer that served the most recent successful [`Self::download`],
+    /// if any. Lets a caller whose *later* validation of the downloaded
+    /// data fails (e.g. catchpoint verification — issue #1636) retroactively
+    /// penalize that peer via [`Self::rank_last_peer_down`] before retrying,
+    /// even though the transfer itself reported success. `download()` has
+    /// no way to know at transfer time whether the bytes it received will
+    /// turn out to fail a much later, much more expensive integrity check.
+    last_download_peer: StdMutex<Option<PeerSelectorPeer>>,
 }
 
 impl RankedCatchpointSource {
@@ -144,6 +153,7 @@ impl RankedCatchpointSource {
             retriever,
             config,
             ledger_download_retry_attempts: Self::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
+            last_download_peer: StdMutex::new(None),
         }
     }
 
@@ -186,6 +196,41 @@ impl RankedCatchpointSource {
             .lock()
             .expect("peer url list lock poisoned")
             .push(peer_id);
+    }
+
+    /// Retroactively penalize the peer that served the most recent
+    /// successful [`Self::download`], so a subsequent `download()` call on
+    /// this same instance prefers a different candidate (issue #1636).
+    ///
+    /// For use when a caller's validation of the downloaded data *after*
+    /// the transfer completed — e.g. catchpoint label/Merkle-trie
+    /// verification, which can take tens of minutes for a real mainnet
+    /// snapshot — finds the data unusable. `download()` itself has no way
+    /// to know that at transfer time, so it cannot rank the peer down on
+    /// its own; this lets the caller close that gap without re-implementing
+    /// peer bookkeeping. A no-op if no download has succeeded yet, or if
+    /// [`Self::rank_last_peer_down`]/another `download()` call already
+    /// consumed the record.
+    ///
+    /// Mirrors go's `CatchpointCatchupService.processStageLedgerDownload`
+    /// ranking the peer `peerRankInvalidDownload` when `BuildMerkleTrie`
+    /// fails for that peer's data (`catchup/catchpointService.go`) — the
+    /// same peer-selector call, just made from outside `download()` here
+    /// since algod-rust's verification runs as a separate later phase
+    /// rather than inline within the download call.
+    pub fn rank_last_peer_down(&self) {
+        let psp = self
+            .last_download_peer
+            .lock()
+            .expect("last download peer lock poisoned")
+            .take();
+        if let Some(psp) = psp {
+            let mut selector = self
+                .selector
+                .lock()
+                .expect("catchpoint peer selector lock poisoned");
+            selector.rank_peer(&psp, PEER_RANK_INVALID_DOWNLOAD);
+        }
     }
 
     /// Number of candidate peers configured.
@@ -376,6 +421,11 @@ impl RankedCatchpointSource {
                         .expect("catchpoint peer selector lock poisoned");
                     let rank = selector.peer_download_duration_to_rank(&psp, elapsed);
                     selector.rank_peer(&psp, rank);
+                    drop(selector);
+                    *self
+                        .last_download_peer
+                        .lock()
+                        .expect("last download peer lock poisoned") = Some(psp.clone());
                     return Ok(());
                 }
                 Err(e) => {
@@ -542,6 +592,76 @@ mod tests {
     //    when there is exactly one (already-local-equivalent) source and
     //    it fails, mirroring go's assertion that ranking a peer never
     //    crashes the catchpoint service even in a degenerate case. --
+
+    /// TDD for issue #1636/#1633's Part 2 defensive mitigation: a caller
+    /// whose validation of already-downloaded catchpoint data fails *after*
+    /// the transfer itself succeeded (e.g. catchpoint verification, which
+    /// runs long after `download()` has already returned `Ok`) needs a way
+    /// to retroactively penalize the peer that served that data, so a retry
+    /// prefers a different one. `download()` itself has no way to know this
+    /// at transfer time.
+    ///
+    /// This asserts the two things `rank_last_peer_down` promises without
+    /// relying on the underlying `ClassBasedPeerSelector`'s exact
+    /// peer-vs-peer selection odds across many rounds (a multi-peer,
+    /// many-round version of this test was flaky under load: the class-level
+    /// tolerance/reset bookkeeping in `peer_ranker.rs` interacts with
+    /// real-TCP-timing-based ranks in ways that don't guarantee a strictly
+    /// monotonic preference on every draw, even though the peer's rank is
+    /// genuinely moved to `PEER_RANK_INVALID_DOWNLOAD` each time):
+    /// 1. It only affects the most recent successful download, not peers in
+    ///    general (calling it before anything succeeded is a safe no-op).
+    /// 2. It's a one-shot consumption: calling it twice in a row after a
+    ///    single success doesn't double-penalize or panic.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rank_last_peer_down_is_a_safe_one_shot_no_op_without_a_prior_success() {
+        let src = RankedCatchpointSource::new(&[], CatchpointDownloadConfig::default());
+        // No download has ever succeeded (there are no peers at all) —
+        // must not panic.
+        src.rank_last_peer_down();
+        src.rank_last_peer_down();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rank_last_peer_down_penalizes_only_the_peer_that_served_the_last_success() {
+        const BODY: &[u8] = b"catchpoint-file-bytes-0123456789";
+        let (url, requests) = spawn_always_succeeding_server(BODY).await;
+        let src = RankedCatchpointSource::new(&[(url, String::new())], fast_retry_config());
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-ranked-catchpoint-rank-last-{}",
+            std::process::id()
+        ));
+        let dest = tmp_dir.join("catchpoint-1.tar.gz");
+        let result = src.download("test-v1.0", 1, &dest, None).await;
+        assert!(result.is_ok());
+        assert!(requests.load(Ordering::SeqCst) >= 1);
+
+        // The caller's later verification of that downloaded data (outside
+        // this module's view — e.g. catchpoint label/trie verification,
+        // issue #1636) fails: penalize the peer that served it. Ranking a
+        // peer down deprioritizes it in *future* selection among multiple
+        // candidates (covered qualitatively by
+        // `ranked_source_prefers_the_reliable_peer_after_the_unreliable_one_fails`
+        // above for a failure-based rank); with only one peer configured,
+        // it remains the only candidate, so a retry must still be able to
+        // reach it rather than treating "ranked down" as "blacklisted" —
+        // matching go's own model, where a bad rank changes selection order,
+        // never peer availability.
+        src.rank_last_peer_down();
+        let dest2 = tmp_dir.join("catchpoint-2.tar.gz");
+        let result2 = src.download("test-v1.0", 2, &dest2, None).await;
+        assert!(
+            result2.is_ok(),
+            "a deprioritized peer must still be usable when it's the only candidate"
+        );
+
+        // Calling it again with nothing new to penalize must be a no-op,
+        // not a panic or a re-penalization of an arbitrary stale peer.
+        src.rank_last_peer_down();
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn single_peer_failure_is_ranked_without_panicking() {
