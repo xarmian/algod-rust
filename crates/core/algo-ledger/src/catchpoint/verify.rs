@@ -688,7 +688,9 @@ fn build_trie_from_db(
     conn: &Connection,
 ) -> Result<crate::merkle_trie::MerkleTrie, CatchpointError> {
     use crate::merkle_trie::MerkleTrie;
-    use crate::trie_hash::{extract_raw_affinity, kv_hash_v6, HashKind, ELEMENT_SIZE};
+    use crate::trie_hash::{
+        extract_raw_affinity, extract_raw_resource_affinity, kv_hash_v6, HashKind, ELEMENT_SIZE,
+    };
 
     const CTYPE_APP: i64 = 1;
 
@@ -769,8 +771,12 @@ fn build_trie_from_db(
             addr.copy_from_slice(&addr_bytes);
 
             // Use the resource's own UpdateRound for affinity, matching Go's
-            // ResourcesHashBuilderV6 which passes resData.UpdateRound.
-            let affinity = extract_raw_affinity(&rdata);
+            // ResourcesHashBuilderV6 which passes resData.UpdateRound
+            // directly with no fallback (issue #1636 sixth round —
+            // extract_raw_resource_affinity, unlike extract_raw_affinity,
+            // never treats resources' `"c"` = AssetParams.DefaultFrozen as
+            // a RewardsBase-style fallback).
+            let affinity = extract_raw_resource_affinity(&rdata);
 
             let kind = if ctype == CTYPE_APP {
                 HashKind::App as u8
@@ -899,7 +905,8 @@ fn build_and_persist_trie_chunked(
     use crate::merkle_committer::{CommitterTable, OwnedSqliteCommitter};
     use crate::merkle_trie::MerkleTrie;
     use crate::trie_hash::{
-        extract_raw_affinity_tracked, kv_hash_v6, AffinityAnomalyTracker, HashKind, ELEMENT_SIZE,
+        extract_raw_affinity_tracked, extract_raw_resource_affinity_tracked, kv_hash_v6,
+        AffinityAnomalyTracker, HashKind, ELEMENT_SIZE,
     };
 
     const CTYPE_APP: i64 = 1;
@@ -1168,8 +1175,10 @@ fn build_and_persist_trie_chunked(
                     }
                 }
                 // Use the resource's own UpdateRound for affinity, matching Go's
-                // ResourcesHashBuilderV6 which passes resData.UpdateRound.
-                let affinity = extract_raw_affinity_tracked(
+                // ResourcesHashBuilderV6 which passes resData.UpdateRound
+                // directly with no fallback (issue #1636 sixth round — see
+                // extract_raw_resource_affinity's doc comment).
+                let affinity = extract_raw_resource_affinity_tracked(
                     &rdata,
                     format!("resource aidx={aidx} ctype={ctype}"),
                     &mut affinity_tracker,
@@ -1341,14 +1350,25 @@ fn build_and_persist_trie_chunked(
     // case of two elements hashing identically) in batches of
     // TRIE_REBUILD_COMMIT_FREQUENCY rows, exactly like every earlier
     // version of this loop.
-    // Issue #1636 real-data bisection: one running SHA-256 per bucket
-    // (bucket = `data[0]`, i.e. the top byte of the 36-byte trie key —
-    // the same byte the pagination `ORDER BY data, rowid` already sorts
-    // by first), fed every element's bytes in the exact sorted order
-    // they're inserted into the trie. Cheap (one hash update per element,
-    // no extra I/O or allocation beyond what's already happening) and
-    // gives a permanent, compact fingerprint of this run's real staged
-    // data, logged unconditionally below.
+    // Issue #1636 real-data bisection: one running SHA-256 per bucket,
+    // fed every element's bytes in the exact sorted order they're
+    // inserted into the trie. Cheap (one hash update per element, no
+    // extra I/O or allocation beyond what's already happening) and gives
+    // a permanent, compact fingerprint of this run's real staged data,
+    // logged unconditionally below.
+    //
+    // Bucket key: `data[5]` (the first byte of the SHA512/256 hash tail,
+    // not `data[0..4]`'s affinity prefix). A first attempt at this
+    // bucketing (this round's initial live dispatch, run 36319500480)
+    // used `data[0]` — the affinity's own top byte — on the theory that
+    // it's "the same byte the pagination sort already orders by first",
+    // but affinity is a *round number*, not a hash: at this pin's real
+    // mainnet round range (~65.4M, fitting in 27 bits), `data[0]` only
+    // ever takes the values 0-3, so 252 of 256 buckets were always
+    // empty and the other 4 held 5M-36M elements apiece — useless for
+    // narrowing anything down to "thousands, not millions" of elements
+    // as intended. The hash tail is what's actually uniformly
+    // distributed across real data, so bucket on that instead.
     let mut bucket_hashers: Vec<Sha256> = (0..N_BUCKETS).map(|_| Sha256::new()).collect();
     let mut bucket_counts: Vec<u64> = vec![0; N_BUCKETS];
     {
@@ -1396,8 +1416,8 @@ fn build_and_persist_trie_chunked(
                         data.len()
                     ))
                 })?;
-                let bucket = elem[0] as usize;
-                bucket_hashers[bucket].update(&elem);
+                let bucket = elem[5] as usize;
+                bucket_hashers[bucket].update(elem);
                 bucket_counts[bucket] += 1;
                 trie.add(&elem)
                     .map_err(|e| CatchpointError::ImportError(format!("trie add element: {e}")))?;
@@ -1434,7 +1454,10 @@ fn build_and_persist_trie_chunked(
             .enumerate()
             .map(|(bucket, (hasher, count))| {
                 let digest = hasher.finalize();
-                let hex = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                let hex = digest
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>();
                 format!("{bucket}:{count}:{hex}")
             })
             .collect::<Vec<_>>()

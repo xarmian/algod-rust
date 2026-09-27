@@ -127,15 +127,21 @@ pub fn account_hash_v6(address: &Address, account_data: &AccountData) -> [u8; EL
     finish_v6(compute_affinity(account_data), HashKind::Account, &prehash)
 }
 
-/// Extract the affinity value from a raw msgpack-encoded data blob.
+/// Extract the affinity value from a raw msgpack-encoded **account**
+/// (`accountbase.data`) blob.
 ///
-/// Scans the msgpack map for keys `"z"` (update_round) and `"c"` (rewards_base).
-/// Returns `update_round` if non-zero, otherwise `rewards_base`, truncated to u32.
-/// This works for both account data (which has both `"z"` and `"c"`) and resource
-/// data (which has `"z"` but not `"c"`).
+/// Scans the msgpack map for keys `"z"` (`BaseAccountData.UpdateRound`) and
+/// `"c"` (`BaseAccountData.RewardsBase`). Returns `update_round` if
+/// non-zero, otherwise `rewards_base`, truncated to u32.
 ///
-/// Matches Go's `AccountHashBuilderV6` (for accounts) and
-/// `ResourcesHashBuilderV6` (for resources, which passes `resData.UpdateRound`).
+/// Matches Go's `AccountHashBuilderV6` (`hashing.go:64-78`):
+/// `hashIntPrefix := accountData.UpdateRound; if hashIntPrefix == 0 {
+/// hashIntPrefix = accountData.RewardsBase }`.
+///
+/// **Do not use this for resource data** — see
+/// [`extract_raw_resource_affinity`]'s doc comment for why the `"z"`/`"c"`
+/// fallback pattern does not carry over to resources (issue #1636, sixth
+/// investigation round).
 pub fn extract_raw_affinity(data: &[u8]) -> u32 {
     let val = match rmpv::decode::read_value(&mut &data[..]) {
         Ok(v) => v,
@@ -170,6 +176,68 @@ pub fn extract_raw_affinity(data: &[u8]) -> u32 {
         rewards_base
     };
     val as u32
+}
+
+/// Extract the affinity value from a raw msgpack-encoded **resource**
+/// (`resources.data`, a `ResourcesData`) blob.
+///
+/// Scans the msgpack map for key `"z"` (`ResourcesData.UpdateRound`) only,
+/// truncated to u32, with **no fallback** — unlike accounts.
+///
+/// Matches go-algorand's real call sites exactly
+/// (`ledger/acctdeltas.go:178`, `ledger/catchpointtracker.go:1121,1137`,
+/// `ledger/store/trackerdb/sqlitedriver/orderedAccountsIter.go:157`), which
+/// all pass `resData.UpdateRound` straight through to
+/// `ResourcesHashBuilderV6` (`hashing.go:81-95`) with **no** "fall back to
+/// some other field when zero" logic at all — `UpdateRound` is used as-is
+/// even when it's 0.
+///
+/// Issue #1636 (sixth investigation round): an earlier version of this
+/// function reused [`extract_raw_affinity`]'s account-shaped `"z"`-then-
+/// `"c"`-fallback logic for resources too, on the mistaken assumption
+/// (recorded in that function's old doc comment) that resource data simply
+/// "doesn't have a `'c'` key". That's false: `ResourcesData`'s single
+/// combined struct (`ledger/store/trackerdb/data.go:88-139`, covering
+/// asset params + holding + app local/global state in one msgp-tagged
+/// struct) assigns codec tag `"c"` to `AssetParams.DefaultFrozen`, a
+/// **bool** — a real key collision with `BaseAccountData.RewardsBase`'s
+/// own `"c"` tag. A live `mainnet-node-soak.yml` dispatch against real
+/// mainnet data confirmed this collision fires on ~1.8M real resource
+/// records (every asset with `DefaultFrozen: true`). It happened to be
+/// harmless purely because a msgpack `bool` never parses as `u64`
+/// (`rmpv::Value::as_u64()` returns `None` for `Boolean`), so the old
+/// code's fallback always evaluated to 0 regardless — coincidentally
+/// identical to go's real "just use `UpdateRound`, even if 0" behavior.
+/// That was luck, not correctness: nothing in the old code's logic
+/// *required* `"c"` to be non-numeric for resources, and a future
+/// resource-shaped struct field reusing tag `"c"` with a genuinely numeric
+/// type would have silently produced a wrong affinity. Splitting this into
+/// its own function removes the coincidence entirely by mirroring go's
+/// real per-record-type semantics instead of a single blended
+/// approximation.
+pub fn extract_raw_resource_affinity(data: &[u8]) -> u32 {
+    let val = match rmpv::decode::read_value(&mut &data[..]) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    let map = match &val {
+        rmpv::Value::Map(m) => m,
+        _ => return 0,
+    };
+
+    for (k, v) in map {
+        let key_str = match k {
+            rmpv::Value::String(s) => match s.as_str() {
+                Some(s) => s,
+                None => continue,
+            },
+            _ => continue,
+        };
+        if key_str == "z" {
+            return v.as_u64().unwrap_or(0) as u32;
+        }
+    }
+    0
 }
 
 /// Issue #1636 (sixth investigation round): counts and samples every case
@@ -231,8 +299,9 @@ impl AffinityAnomalyTracker {
     }
 }
 
-/// Same computation as [`extract_raw_affinity`], but records every
-/// silent-fallback branch taken into `tracker` instead of only ever
+/// Same computation as [`extract_raw_affinity`] (accounts only — see
+/// [`extract_raw_resource_affinity_tracked`] for resources), but records
+/// every silent-fallback branch taken into `tracker` instead of only ever
 /// returning `0`. See [`AffinityAnomalyTracker`] for why this exists
 /// (issue #1636). Behaviorally identical to `extract_raw_affinity` on
 /// well-formed input — this must never change the *value* returned,
@@ -296,6 +365,58 @@ pub fn extract_raw_affinity_tracked(
         rewards_base
     };
     val as u32
+}
+
+/// Same computation as [`extract_raw_resource_affinity`], but records
+/// every silent-fallback branch taken into `tracker`. See
+/// [`AffinityAnomalyTracker`] (issue #1636) — note that unlike the account
+/// variant, this never touches `tracker.c_present_not_u64`: resources have
+/// no `"c"`-keyed fallback to begin with (see
+/// [`extract_raw_resource_affinity`]'s doc comment for why an earlier
+/// version incorrectly checked one).
+pub fn extract_raw_resource_affinity_tracked(
+    data: &[u8],
+    context: impl Into<String>,
+    tracker: &mut AffinityAnomalyTracker,
+) -> u32 {
+    let context = context.into();
+    let val = match rmpv::decode::read_value(&mut &data[..]) {
+        Ok(v) => v,
+        Err(_) => {
+            tracker.decode_failures += 1;
+            tracker.record_sample(format!("{context} decode_failure"), data);
+            return 0;
+        }
+    };
+    let map = match &val {
+        rmpv::Value::Map(m) => m,
+        _ => {
+            tracker.non_map_values += 1;
+            tracker.record_sample(format!("{context} non_map_value"), data);
+            return 0;
+        }
+    };
+
+    for (k, v) in map {
+        let key_str = match k {
+            rmpv::Value::String(s) => match s.as_str() {
+                Some(s) => s,
+                None => continue,
+            },
+            _ => continue,
+        };
+        if key_str == "z" {
+            return match v.as_u64() {
+                Some(u) => u as u32,
+                None => {
+                    tracker.z_present_not_u64 += 1;
+                    tracker.record_sample(format!("{context} z_present_not_u64"), data);
+                    0
+                }
+            };
+        }
+    }
+    0
 }
 
 /// Compute the 36-byte trie element for a resource with an explicit HashKind.
@@ -435,6 +556,72 @@ mod tests {
         assert_eq!(tracked, 0);
         assert_eq!(tracker.z_present_not_u64, 1);
         assert!(tracker.any_anomaly());
+    }
+
+    /// Issue #1636 (sixth investigation round) regression test: a real
+    /// mainnet `ResourcesData` record shape (Asset resource, minimized
+    /// from a live `mainnet-node-soak.yml` dispatch's captured sample —
+    /// see the sixth-round issue comment for the exact original bytes),
+    /// where `"c"` (`AssetParams.DefaultFrozen`, tag collision with
+    /// accounts' `"c"` = `RewardsBase`) is `true` and `"z"`
+    /// (`UpdateRound`) is a genuine nonzero round. Locks in that
+    /// `extract_raw_resource_affinity` uses `"z"` only — never
+    /// mis-reading `"c"`'s boolean as a numeric fallback — matching
+    /// go-algorand's real `ResourcesHashBuilderV6` callers, which always
+    /// pass `resData.UpdateRound` directly with no fallback.
+    #[test]
+    fn extract_raw_resource_affinity_ignores_default_frozen_c_key_uses_z_only() {
+        let map = rmpv::Value::Map(vec![
+            (
+                rmpv::Value::String("a".into()),
+                rmpv::Value::Integer(1u64.into()),
+            ),
+            (rmpv::Value::String("c".into()), rmpv::Value::Boolean(true)),
+            (
+                rmpv::Value::String("d".into()),
+                rmpv::Value::String("CHORAL".into()),
+            ),
+            (
+                rmpv::Value::String("z".into()),
+                rmpv::Value::Integer(65_123_456u64.into()),
+            ),
+        ]);
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &map).unwrap();
+
+        assert_eq!(extract_raw_resource_affinity(&buf), 65_123_456);
+
+        let mut tracker = AffinityAnomalyTracker::default();
+        let tracked =
+            extract_raw_resource_affinity_tracked(&buf, "test-default-frozen", &mut tracker);
+        assert_eq!(tracked, 65_123_456);
+        // The boolean "c" must never even be inspected for resources, so
+        // it must not be recorded as a `c_present_not_u64` anomaly (that
+        // counter only exists on the account-shaped tracker path).
+        assert_eq!(tracker.c_present_not_u64, 0);
+        assert!(!tracker.any_anomaly());
+    }
+
+    /// The same real shape, but with `UpdateRound` (`"z"`) entirely
+    /// absent (as go's `omitempty` codec tag does for a zero value) —
+    /// `extract_raw_resource_affinity` must return 0 directly, with no
+    /// fallback to the boolean `"c"` value at all. This is the behavior
+    /// that an account-shaped `"z"`-then-`"c"`-fallback implementation
+    /// would get subtly wrong if `"c"` ever *did* parse as a number; this
+    /// test pins the resource-correct "just use 0" behavior explicitly.
+    #[test]
+    fn extract_raw_resource_affinity_defaults_to_zero_when_z_absent() {
+        let map = rmpv::Value::Map(vec![
+            (
+                rmpv::Value::String("a".into()),
+                rmpv::Value::Integer(1u64.into()),
+            ),
+            (rmpv::Value::String("c".into()), rmpv::Value::Boolean(true)),
+        ]);
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &map).unwrap();
+
+        assert_eq!(extract_raw_resource_affinity(&buf), 0);
     }
 
     /// Regression test: assert basic layout invariants.
