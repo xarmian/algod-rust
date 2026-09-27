@@ -215,6 +215,10 @@ impl SyncBackend for AlgodSyncBackend {
         })
     }
 
+    fn rank_last_catchpoint_peer_down(&self) {
+        self.catchpoint_source.rank_last_peer_down();
+    }
+
     fn fetch_block_raw(&self, round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
         tokio::task::block_in_place(|| {
             self.rt.block_on(async {

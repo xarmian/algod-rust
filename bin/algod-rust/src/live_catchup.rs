@@ -504,6 +504,85 @@ pub struct OrchestratorCatchupRunner {
     params: LiveCatchupParams,
 }
 
+/// Bounded retry budget for a catchup attempt that fails specifically at
+/// the verification phase (issue #1636): the first attempt plus this many
+/// extra retries, each against a peer the previous failure's data came
+/// from having just been deprioritized (via
+/// [`SyncBackend::rank_last_catchpoint_peer_down`]).
+///
+/// Deliberately small and fixed — this is a defensive mitigation for a
+/// bad/corrupted download from one specific peer, not a general-purpose
+/// unbounded retry loop, and it does not touch the verification logic
+/// itself. go-algorand's equivalent (`catchup/catchpointService.go`'s
+/// `processStageLedgerDownload`) retries `BuildMerkleTrie` failures up to
+/// `Config.CatchupLedgerDownloadRetryAttempts` (default 50) times, ranking
+/// the failing peer down each time; algod-rust's verification pass is a
+/// single, much more expensive (tens-of-minutes, whole-mainnet-scale)
+/// operation rather than go's incremental per-chunk trie build, so retrying
+/// anywhere near that many times is impractical here — a small fixed cap
+/// is the pragmatic analogue.
+const MAX_VERIFY_FAILURE_RETRIES: u32 = 2;
+
+/// A thin [`SyncBackend`] wrapper that delegates every call to a shared,
+/// reference-counted inner backend.
+///
+/// [`SyncOrchestrator::with_backend`] takes ownership of the backend it's
+/// given, so a fresh [`SyncOrchestrator`] has to be constructed per retry
+/// attempt — but the whole point of a verify-failure retry is for the
+/// *same* peer-ranking state (in particular,
+/// [`SyncBackend::rank_last_catchpoint_peer_down`]'s effect) to carry over
+/// from one attempt to the next. Wrapping the backend in an `Arc` and handing
+/// out cheap clones of this wrapper lets each attempt get its own
+/// orchestrator while all attempts still share one backend instance.
+struct SharedSyncBackend(Arc<dyn algo_ledger::sync::SyncBackend>);
+
+impl algo_ledger::sync::SyncBackend for SharedSyncBackend {
+    fn is_noop(&self) -> bool {
+        self.0.is_noop()
+    }
+
+    fn download_catchpoint(
+        &self,
+        genesis_id: &str,
+        round: u64,
+        dest_path: &std::path::Path,
+    ) -> anyhow::Result<(), algo_error::AlgoError> {
+        self.0.download_catchpoint(genesis_id, round, dest_path)
+    }
+
+    fn rank_last_catchpoint_peer_down(&self) {
+        self.0.rank_last_catchpoint_peer_down();
+    }
+
+    fn fetch_block_raw(
+        &self,
+        round: u64,
+    ) -> anyhow::Result<(String, Vec<u8>, Vec<u8>), algo_error::AlgoError> {
+        self.0.fetch_block_raw(round)
+    }
+
+    fn fetch_block(&self, round: u64) -> anyhow::Result<algo_types::Block, algo_error::AlgoError> {
+        self.0.fetch_block(round)
+    }
+
+    fn get_current_round(&self) -> anyhow::Result<u64, algo_error::AlgoError> {
+        self.0.get_current_round()
+    }
+
+    fn discover_catchpoint(&self) -> anyhow::Result<Option<String>, algo_error::AlgoError> {
+        self.0.discover_catchpoint()
+    }
+
+    fn fetch_blocks_batch(
+        &self,
+        start: u64,
+        end: u64,
+        concurrency: usize,
+    ) -> anyhow::Result<Vec<(u64, algo_types::Block)>, algo_error::AlgoError> {
+        self.0.fetch_blocks_batch(start, end, concurrency)
+    }
+}
+
 impl OrchestratorCatchupRunner {
     pub fn new(params: LiveCatchupParams) -> Self {
         Self { params }
@@ -518,25 +597,28 @@ impl CatchupRunner for OrchestratorCatchupRunner {
         cancel: CancellationToken,
         counters: Arc<StdMutex<CatchpointCounters>>,
     ) -> anyhow::Result<()> {
-        use algo_ledger::sync::{SyncConfig, SyncOrchestrator};
+        use algo_ledger::sync::{SyncConfig, SyncOrchestrator, SyncState};
 
-        let backend = crate::commands::catchpoint_sync::build_algod_sync_backend(
-            &self.params.algod_url,
-            &self.params.algod_token,
-            &self.params.catchpoint_peer_urls,
-            self.params.p2p_transport.as_ref(),
-            // Live catchup has no `config.json`-carrying params struct of
-            // its own to source real `MaxCatchpointDownloadDuration`/
-            // `MinCatchpointFileDownloadBytesPerSecond`/
-            // `CatchupLedgerDownloadRetryAttempts` values from yet (mirrors
-            // `accounts_rebuild_synchronous_mode: 0` and
-            // `DEFAULT_CATCHUP_BLOCK_DOWNLOAD_RETRY_ATTEMPTS` below, issue
-            // #1289) — these defaults already match go's own defaults, so
-            // this is still real, bounded behavior rather than a no-op.
-            algo_rest_client::CatchpointDownloadConfig::default(),
-            algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
-            crate::commands::catchpoint_sync::network_name_for_genesis_id(&self.params.genesis_id),
-        );
+        let backend: Arc<dyn algo_ledger::sync::SyncBackend> =
+            Arc::new(crate::commands::catchpoint_sync::build_algod_sync_backend(
+                &self.params.algod_url,
+                &self.params.algod_token,
+                &self.params.catchpoint_peer_urls,
+                self.params.p2p_transport.as_ref(),
+                // Live catchup has no `config.json`-carrying params struct of
+                // its own to source real `MaxCatchpointDownloadDuration`/
+                // `MinCatchpointFileDownloadBytesPerSecond`/
+                // `CatchupLedgerDownloadRetryAttempts` values from yet (mirrors
+                // `accounts_rebuild_synchronous_mode: 0` and
+                // `DEFAULT_CATCHUP_BLOCK_DOWNLOAD_RETRY_ATTEMPTS` below, issue
+                // #1289) — these defaults already match go's own defaults, so
+                // this is still real, bounded behavior rather than a no-op.
+                algo_rest_client::CatchpointDownloadConfig::default(),
+                algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
+                crate::commands::catchpoint_sync::network_name_for_genesis_id(
+                    &self.params.genesis_id,
+                ),
+            ));
 
         let config = SyncConfig {
             catchpoint_label: Some(catchpoint.to_string()),
@@ -566,28 +648,62 @@ impl CatchupRunner for OrchestratorCatchupRunner {
                 algo_ledger::catchpoint::DEFAULT_CATCHUP_BLOCK_DOWNLOAD_RETRY_ATTEMPTS,
         };
 
-        let mut orchestrator = SyncOrchestrator::with_backend(config, backend);
-        orchestrator.set_cancel(cancel);
-        // Mirror the eight `catchpoint_*` counters from `SyncProgress` into
-        // the shared sink `LiveCatchupManager::catchpoint_counters()` reads
-        // (issue #941), on every progress notification (state transitions
-        // and periodic within-phase updates).
-        orchestrator.set_progress_callback(Box::new(move |progress| {
-            if let Ok(mut c) = counters.lock() {
-                *c = CatchpointCounters {
-                    total_accounts: progress.catchpoint_total_accounts,
-                    processed_accounts: progress.catchpoint_processed_accounts,
-                    verified_accounts: progress.catchpoint_verified_accounts,
-                    total_kvs: progress.catchpoint_total_kvs,
-                    processed_kvs: progress.catchpoint_processed_kvs,
-                    verified_kvs: progress.catchpoint_verified_kvs,
-                    total_blocks: progress.catchpoint_total_blocks,
-                    acquired_blocks: progress.catchpoint_acquired_blocks,
-                };
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            let mut orchestrator = SyncOrchestrator::with_backend(
+                config.clone(),
+                SharedSyncBackend(Arc::clone(&backend)),
+            );
+            orchestrator.set_cancel(cancel.clone());
+            // Mirror the eight `catchpoint_*` counters from `SyncProgress` into
+            // the shared sink `LiveCatchupManager::catchpoint_counters()` reads
+            // (issue #941), on every progress notification (state transitions
+            // and periodic within-phase updates).
+            let counters_for_callback = Arc::clone(&counters);
+            orchestrator.set_progress_callback(Box::new(move |progress| {
+                if let Ok(mut c) = counters_for_callback.lock() {
+                    *c = CatchpointCounters {
+                        total_accounts: progress.catchpoint_total_accounts,
+                        processed_accounts: progress.catchpoint_processed_accounts,
+                        verified_accounts: progress.catchpoint_verified_accounts,
+                        total_kvs: progress.catchpoint_total_kvs,
+                        processed_kvs: progress.catchpoint_processed_kvs,
+                        verified_kvs: progress.catchpoint_verified_kvs,
+                        total_blocks: progress.catchpoint_total_blocks,
+                        acquired_blocks: progress.catchpoint_acquired_blocks,
+                    };
+                }
+            }));
+
+            match orchestrator.run().await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    // A failure whose last-reached state is `VerifyingLedger`
+                    // is specifically a verification failure (issue #1636):
+                    // `SyncOrchestrator::transition` sets the state to
+                    // `VerifyingLedger` before the verify phase's own logic
+                    // runs, and no later phase's transition ever runs to move
+                    // it past that on this error path. Any other failure
+                    // (download, import, lookback, replay) is left exactly
+                    // as before — no retry, no peer-ranking change.
+                    let is_verify_failure = *orchestrator.state() == SyncState::VerifyingLedger;
+                    if is_verify_failure && attempt < MAX_VERIFY_FAILURE_RETRIES {
+                        warn!(
+                            catchpoint,
+                            attempt,
+                            max_attempts = MAX_VERIFY_FAILURE_RETRIES,
+                            error = %e,
+                            "catchpoint verification failed — deprioritizing the serving peer \
+                             and retrying with a fresh download"
+                        );
+                        backend.rank_last_catchpoint_peer_down();
+                        continue;
+                    }
+                    return Err(e.into());
+                }
             }
-        }));
-        orchestrator.run().await?;
-        Ok(())
+        }
     }
 }
 

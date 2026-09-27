@@ -40,7 +40,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use algo_types::AccountStatus;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use super::checkpoint::ImportCheckpoint;
 use super::msgp_compat::{decode_base_account_data, decode_resources_data};
@@ -93,6 +93,65 @@ pub struct ImportResult {
     pub stats: ImportStats,
     /// Wall-clock duration of the entire import (staging + cutover).
     pub duration: std::time::Duration,
+    /// Everything [`CatchpointImporter::atomic_cutover`] preserved of the
+    /// pre-import live state, needed to reverse the cutover if the caller's
+    /// subsequent verification of the newly-imported data fails (issue
+    /// #1633). See [`CutoverBackup`] and
+    /// [`CatchpointImporter::rollback_cutover`]/
+    /// [`CatchpointImporter::finalize_cutover`].
+    pub cutover_backup: CutoverBackup,
+}
+
+// ---------------------------------------------------------------------------
+// CutoverBackup
+// ---------------------------------------------------------------------------
+
+/// The live table names `atomic_cutover` renames staging tables onto.
+///
+/// Order matters for `rollback_cutover`/`finalize_cutover`'s cleanup, but
+/// not for correctness — each rename/drop is independent.
+const LIVE_TABLE_NAMES: [&str; 8] = [
+    "accountbase",
+    "assetcreators",
+    "resources",
+    "kvstore",
+    "stateproofverification",
+    "accounthashes",
+    "onlineaccounts",
+    "onlineroundparamstail",
+];
+
+/// Suffix applied to a pre-existing live table's name when `atomic_cutover`
+/// preserves it instead of dropping it outright, so a later
+/// `rollback_cutover` can restore it verbatim.
+const PRECATCHUP_BACKUP_SUFFIX: &str = "__precatchup_backup";
+
+/// Snapshot of whatever [`CatchpointImporter::atomic_cutover`] overwrote,
+/// sufficient to put the database back exactly the way it was before the
+/// cutover ran.
+///
+/// Populated by `atomic_cutover` itself and consumed by exactly one of
+/// [`CatchpointImporter::finalize_cutover`] (verification of the new data
+/// succeeded — drop the backups) or
+/// [`CatchpointImporter::rollback_cutover`] (verification failed — restore
+/// them). Addresses issue #1633: previously `atomic_cutover` unconditionally
+/// dropped the old live tables and stamped `acctrounds`/`accounttotals`
+/// with the new round *before* verification ever ran, so a failed
+/// verification left the on-disk ledger observably at the new,
+/// as-yet-unverified round with no way back to the old one.
+#[derive(Debug, Default, Clone)]
+pub struct CutoverBackup {
+    /// Which of [`LIVE_TABLE_NAMES`] existed pre-cutover and were renamed to
+    /// `<name>__precatchup_backup` instead of dropped.
+    backed_up_tables: Vec<&'static str>,
+    /// Prior `acctrounds` row values, keyed `(id, rnd)`. Empty if the table
+    /// didn't exist or had no rows for these ids.
+    old_acctrounds: Vec<(String, i64)>,
+    /// Prior `accounttotals` row (all columns), if one existed.
+    old_totals: Option<(i64, i64, i64, i64, i64, i64, i64)>,
+    /// Prior `catchpointstate` rows for the keys this cutover overwrites,
+    /// as `(id, intval, strval)`.
+    old_catchpointstate: Vec<(String, Option<i64>, Option<String>)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -325,18 +384,35 @@ impl<'a> CatchpointImporter<'a> {
     /// Atomically replace live tables with staging tables.
     ///
     /// This performs the full cutover in a single transaction:
-    /// 1. DROP live tables that are being replaced.
+    /// 1. Preserve any pre-existing live tables under a `__precatchup_backup`
+    ///    name instead of dropping them (issue #1633 — see [`CutoverBackup`]).
     /// 2. RENAME staging tables to live table names.
-    /// 3. Reconstruct `acctrounds` and `accounttotals` from the header.
-    /// 4. DROP remaining staging tables.
+    /// 3. Reconstruct `acctrounds` and `accounttotals` from the header,
+    ///    after capturing their prior values into the returned backup.
+    /// 4. DROP remaining staging tables (these have no live counterpart, so
+    ///    nothing to preserve).
     ///
     /// If the transaction fails, nothing changes (atomic rollback).
     ///
     /// This matches go-algorand's `ApplyCatchpointStagingBalances` +
-    /// `ApplyCatchpointStagingTablesV7` + cleanup sequence.
-    pub fn atomic_cutover(&self, header: &CatchpointFileHeader) -> Result<(), CatchpointError> {
+    /// `ApplyCatchpointStagingTablesV7` + cleanup sequence, except that go
+    /// runs the equivalent of this cutover only in its final `Switch` stage
+    /// — after `BuildMerkleTrie` (verification) has already succeeded
+    /// (`catchup/catchpointService.go`'s `processStageLedgerDownload` runs
+    /// `BuildMerkleTrie` against the staging tables directly, well before
+    /// `processStageSwitch`'s `CompleteCatchup` performs the live-table
+    /// swap). algod-rust's verification instead reads from the live table
+    /// names (see `crate::catchpoint::verify::verify_catchpoint`), so this
+    /// cutover has to run first — [`Self::rollback_cutover`] is what
+    /// restores the "verify before you're committed" property on the
+    /// failure path instead.
+    pub fn atomic_cutover(
+        &self,
+        header: &CatchpointFileHeader,
+    ) -> Result<CutoverBackup, CatchpointError> {
         let round = header.balances_round as i64;
         let totals = &header.totals;
+        let mut backup = CutoverBackup::default();
 
         let tx = self
             .conn
@@ -362,38 +438,63 @@ impl<'a> CatchpointImporter<'a> {
             );",
         )?;
 
-        // Step 1+2: DROP live tables, RENAME staging → live.
-        // Matches Go's ApplyCatchpointStagingBalances.
-        tx.execute_batch(
-            "DROP TABLE IF EXISTS accountbase;
-            ALTER TABLE catchpointbalances RENAME TO accountbase;
+        // Step 1: preserve pre-existing live tables instead of dropping
+        // them, so a later rollback can restore them verbatim.
+        //
+        // Maps each live table name to the staging table that will be
+        // renamed onto it.
+        let staging_for_live = |live: &str| -> &'static str {
+            match live {
+                "accountbase" => "catchpointbalances",
+                "assetcreators" => "catchpointassetcreators",
+                "resources" => "catchpointresources",
+                "kvstore" => "catchpointkvstore",
+                "stateproofverification" => "catchpointstateproofverification",
+                "accounthashes" => "catchpointaccounthashes",
+                "onlineaccounts" => "catchpointonlineaccounts",
+                "onlineroundparamstail" => "catchpointonlineroundparamstail",
+                other => unreachable!("unexpected live table name: {other}"),
+            }
+        };
 
-            DROP TABLE IF EXISTS assetcreators;
-            ALTER TABLE catchpointassetcreators RENAME TO assetcreators;
+        for &live in LIVE_TABLE_NAMES.iter() {
+            let exists: bool = tx
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                    rusqlite::params![live],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
 
-            DROP TABLE IF EXISTS resources;
-            ALTER TABLE catchpointresources RENAME TO resources;
+            if exists {
+                // Drop any stale backup left over from a previous cutover
+                // whose rollback/finalize never ran (crash mid-cutover) —
+                // defensive, should not happen in normal operation.
+                tx.execute_batch(&format!(
+                    "DROP TABLE IF EXISTS {live}{PRECATCHUP_BACKUP_SUFFIX};"
+                ))?;
+                tx.execute_batch(&format!(
+                    "ALTER TABLE {live} RENAME TO {live}{PRECATCHUP_BACKUP_SUFFIX};"
+                ))?;
+                backup.backed_up_tables.push(live);
+            }
 
-            DROP TABLE IF EXISTS kvstore;
-            ALTER TABLE catchpointkvstore RENAME TO kvstore;
+            let staging = staging_for_live(live);
+            tx.execute_batch(&format!("ALTER TABLE {staging} RENAME TO {live};"))?;
+        }
 
-            DROP TABLE IF EXISTS stateproofverification;
-            ALTER TABLE catchpointstateproofverification RENAME TO stateproofverification;
-
-            DROP TABLE IF EXISTS accounthashes;
-            ALTER TABLE catchpointaccounthashes RENAME TO accounthashes;",
-        )?;
-
-        // Matches Go's ApplyCatchpointStagingTablesV7.
-        tx.execute_batch(
-            "DROP TABLE IF EXISTS onlineaccounts;
-            ALTER TABLE catchpointonlineaccounts RENAME TO onlineaccounts;
-
-            DROP TABLE IF EXISTS onlineroundparamstail;
-            ALTER TABLE catchpointonlineroundparamstail RENAME TO onlineroundparamstail;",
-        )?;
-
-        // Step 3: Reconstruct acctrounds.
+        // Step 2: capture prior acctrounds rows, then reconstruct.
+        {
+            let mut stmt =
+                tx.prepare("SELECT id, rnd FROM acctrounds WHERE id IN ('acctbase', 'hashbase')")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let id: String = row.get(0)?;
+                let rnd: i64 = row.get(1)?;
+                backup.old_acctrounds.push((id, rnd));
+            }
+        }
         tx.execute(
             "INSERT OR REPLACE INTO acctrounds(id, rnd) VALUES('acctbase', ?1)",
             rusqlite::params![round],
@@ -403,7 +504,27 @@ impl<'a> CatchpointImporter<'a> {
             rusqlite::params![round],
         )?;
 
-        // Step 4: Write account totals (matches Go's AccountsPutTotals).
+        // Step 3: capture prior account totals, then write the new ones
+        // (matches Go's AccountsPutTotals).
+        backup.old_totals = tx
+            .query_row(
+                "SELECT online, onlinerewardunits, offline, offlinerewardunits, \
+                 notparticipating, notparticipatingrewardunits, rewardslevel \
+                 FROM accounttotals WHERE id = ''",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
         tx.execute(
             "INSERT OR REPLACE INTO accounttotals(id, online, onlinerewardunits, offline, offlinerewardunits, notparticipating, notparticipatingrewardunits, rewardslevel) VALUES('', ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
@@ -417,7 +538,7 @@ impl<'a> CatchpointImporter<'a> {
             ],
         )?;
 
-        // Step 5: Write catchpointstate entries (matches Go's processStagingContent).
+        // Step 4: write catchpointstate entries (matches Go's processStagingContent).
         // Ensure the catchpointstate table exists.
         tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS catchpointstate (
@@ -431,6 +552,32 @@ impl<'a> CatchpointImporter<'a> {
         // (centralized in `crate::catchpoint::state_keys`). Routing
         // through the constants avoids drift if Go ever renames one.
         use crate::catchpoint::state_keys;
+
+        let catchpointstate_keys = [
+            state_keys::CATCHUP_LABEL,
+            state_keys::CATCHUP_VERSION,
+            state_keys::CATCHUP_BLOCK_ROUND,
+            state_keys::CATCHUP_BALANCES_ROUND,
+            state_keys::CATCHUP_HASH_ROUND,
+        ];
+        {
+            let mut stmt =
+                tx.prepare("SELECT id, intval, strval FROM catchpointstate WHERE id = ?1")?;
+            for key in catchpointstate_keys {
+                if let Some(row) = stmt
+                    .query_row(rusqlite::params![key], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    })
+                    .optional()?
+                {
+                    backup.old_catchpointstate.push(row);
+                }
+            }
+        }
 
         // catchpointCatchupLabel — the label string
         tx.execute(
@@ -465,7 +612,7 @@ impl<'a> CatchpointImporter<'a> {
             rusqlite::params![state_keys::CATCHUP_HASH_ROUND, header.blocks_round as i64],
         )?;
 
-        // Step 6: Clean up remaining staging tables.
+        // Step 5: Clean up remaining staging tables.
         //
         // `catchpoint_import_state` is dropped here as a transitional
         // cleanup — Phase B (TASK-117) no longer creates the table, but
@@ -473,6 +620,9 @@ impl<'a> CatchpointImporter<'a> {
         // from a prior interrupted import. Dropping at cutover ensures
         // such legacy artifacts can never persist into a fully imported
         // (and thus Go-openable) tracker DB.
+        //
+        // These have no live-table counterpart to preserve, so they are
+        // simply dropped on both the finalize and rollback paths.
         tx.execute_batch(
             "DROP TABLE IF EXISTS catchpointpendinghashes;
             DROP TABLE IF EXISTS catchpoint_import_state;",
@@ -481,8 +631,119 @@ impl<'a> CatchpointImporter<'a> {
         tx.commit().map_err(CatchpointError::SqliteError)?;
 
         tracing::info!(
-            "catchpoint cutover complete: live tables replaced at round {}",
-            header.balances_round
+            "catchpoint cutover complete: live tables replaced at round {} \
+             (pending verification; {} pre-existing live table(s) preserved for rollback)",
+            header.balances_round,
+            backup.backed_up_tables.len(),
+        );
+
+        Ok(backup)
+    }
+
+    /// Finalize a cutover after verification of the newly-imported data has
+    /// succeeded: drop the preserved pre-cutover backup tables.
+    ///
+    /// Cheap and idempotent — safe to call even if `backup` has nothing to
+    /// clean up (a fresh database with no pre-existing live tables).
+    pub fn finalize_cutover(&self, backup: &CutoverBackup) -> Result<(), CatchpointError> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(CatchpointError::SqliteError)?;
+        for &live in &backup.backed_up_tables {
+            tx.execute_batch(&format!(
+                "DROP TABLE IF EXISTS {live}{PRECATCHUP_BACKUP_SUFFIX};"
+            ))?;
+        }
+        tx.commit().map_err(CatchpointError::SqliteError)?;
+        tracing::info!("catchpoint cutover finalized: pre-cutover backups dropped");
+        Ok(())
+    }
+
+    /// Reverse a cutover after verification of the newly-imported data has
+    /// failed: drop the new (unverified) live tables, restore the preserved
+    /// pre-cutover tables, and restore `acctrounds`/`accounttotals`/
+    /// `catchpointstate` to their prior values.
+    ///
+    /// After this returns, the database is observably back at its
+    /// pre-catchup state — in particular, `acctrounds.acctbase` (what
+    /// `SqliteLedger::last_committed_round`, and therefore `GET /v2/status`,
+    /// reads) reports the old round again rather than the new,
+    /// as-it-turns-out-unverified one. Addresses issue #1633's split-brain
+    /// symptom: a failed catchpoint verification no longer leaves the
+    /// on-disk ledger pointed at a round the participation path never
+    /// adopted.
+    pub fn rollback_cutover(&self, backup: &CutoverBackup) -> Result<(), CatchpointError> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(CatchpointError::SqliteError)?;
+
+        // Drop the new live tables and restore whichever ones had a
+        // pre-cutover backup; tables with no backup simply cease to exist,
+        // matching the pre-catchup state (nothing there before either).
+        for &live in LIVE_TABLE_NAMES.iter() {
+            tx.execute_batch(&format!("DROP TABLE IF EXISTS {live};"))?;
+        }
+        for &live in &backup.backed_up_tables {
+            tx.execute_batch(&format!(
+                "ALTER TABLE {live}{PRECATCHUP_BACKUP_SUFFIX} RENAME TO {live};"
+            ))?;
+        }
+
+        // Restore acctrounds: delete the rows this cutover wrote, then
+        // reinstate whatever was captured (nothing, if the row didn't
+        // exist before — i.e. a fresh, never-synced database).
+        tx.execute(
+            "DELETE FROM acctrounds WHERE id IN ('acctbase', 'hashbase')",
+            [],
+        )?;
+        for (id, rnd) in &backup.old_acctrounds {
+            tx.execute(
+                "INSERT OR REPLACE INTO acctrounds(id, rnd) VALUES(?1, ?2)",
+                rusqlite::params![id, rnd],
+            )?;
+        }
+
+        // Restore accounttotals.
+        tx.execute("DELETE FROM accounttotals WHERE id = ''", [])?;
+        if let Some((online, online_ru, offline, offline_ru, nopart, nopart_ru, rwdlvl)) =
+            backup.old_totals
+        {
+            tx.execute(
+                "INSERT OR REPLACE INTO accounttotals(id, online, onlinerewardunits, offline, offlinerewardunits, notparticipating, notparticipatingrewardunits, rewardslevel) VALUES('', ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![online, online_ru, offline, offline_ru, nopart, nopart_ru, rwdlvl],
+            )?;
+        }
+
+        // Restore catchpointstate keys this cutover overwrote.
+        use crate::catchpoint::state_keys;
+        let catchpointstate_keys = [
+            state_keys::CATCHUP_LABEL,
+            state_keys::CATCHUP_VERSION,
+            state_keys::CATCHUP_BLOCK_ROUND,
+            state_keys::CATCHUP_BALANCES_ROUND,
+            state_keys::CATCHUP_HASH_ROUND,
+        ];
+        for key in catchpointstate_keys {
+            tx.execute(
+                "DELETE FROM catchpointstate WHERE id = ?1",
+                rusqlite::params![key],
+            )?;
+        }
+        for (id, intval, strval) in &backup.old_catchpointstate {
+            tx.execute(
+                "INSERT OR REPLACE INTO catchpointstate(id, intval, strval) VALUES(?1, ?2, ?3)",
+                rusqlite::params![id, intval, strval],
+            )?;
+        }
+
+        tx.commit().map_err(CatchpointError::SqliteError)?;
+
+        tracing::warn!(
+            "catchpoint cutover rolled back: {} pre-existing live table(s) restored, \
+             acctrounds/accounttotals/catchpointstate reverted to pre-catchup values",
+            backup.backed_up_tables.len(),
         );
 
         Ok(())
@@ -902,8 +1163,15 @@ pub fn import_catchpoint_file_with_progress(
         )));
     }
 
-    // Atomic cutover: replace live tables with staging tables.
-    importer.atomic_cutover(&header)?;
+    // Atomic cutover: replace live tables with staging tables. The returned
+    // backup is NOT yet finalized here — the caller (whose verification
+    // pass, if any, runs after this returns) decides whether to call
+    // `CatchpointImporter::finalize_cutover` (success) or
+    // `CatchpointImporter::rollback_cutover` (failure) with it. A caller
+    // with no verification step of its own (e.g. this function's own
+    // callers that treat import as complete on return) is expected to
+    // finalize immediately — see [`ImportResult::cutover_backup`].
+    let cutover_backup = importer.atomic_cutover(&header)?;
 
     let duration = start.elapsed();
     tracing::info!(
@@ -919,6 +1187,7 @@ pub fn import_catchpoint_file_with_progress(
         round,
         stats,
         duration,
+        cutover_backup,
     })
 }
 
@@ -1958,5 +2227,157 @@ mod tests {
             })
             .unwrap();
         assert_eq!(value, vec![0xCC, 0xDD]);
+    }
+
+    // -------------------------------------------------------------------
+    // rollback_cutover / finalize_cutover tests (issue #1633)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn rollback_cutover_restores_pre_existing_live_tables_and_acctrounds() {
+        let conn = mem_conn();
+
+        // Pre-existing live state, as if this were an already-synced node.
+        conn.execute_batch(
+            "CREATE TABLE acctrounds (id TEXT PRIMARY KEY, rnd INTEGER);
+            INSERT INTO acctrounds VALUES('acctbase', 42);
+            INSERT INTO acctrounds VALUES('hashbase', 42);
+            CREATE TABLE accountbase (address BLOB PRIMARY KEY, normalizedonlinebalance INTEGER, data BLOB);
+            INSERT INTO accountbase VALUES(X'0101', 0, X'00');
+            CREATE TABLE accounttotals (id TEXT PRIMARY KEY, online INTEGER, onlinerewardunits INTEGER, offline INTEGER, offlinerewardunits INTEGER, notparticipating INTEGER, notparticipatingrewardunits INTEGER, rewardslevel INTEGER);
+            INSERT INTO accounttotals VALUES('', 9, 9, 9, 9, 9, 9, 9);",
+        )
+        .unwrap();
+
+        let mut importer = CatchpointImporter::new(&conn, "test#label".to_string(), REWARD_UNITS);
+        importer.prepare_staging().unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        conn.execute(
+            "INSERT INTO catchpointkvstore(key, value) VALUES(X'0202', X'CCDD')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+
+        let header = make_test_header(100);
+        let backup = importer.atomic_cutover(&header).unwrap();
+
+        // The cutover took effect: acctrounds now says the new round.
+        let rnd: i64 = conn
+            .query_row(
+                "SELECT rnd FROM acctrounds WHERE id = 'acctbase'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rnd, 100);
+
+        importer.rollback_cutover(&backup).unwrap();
+
+        // acctrounds is back at the pre-cutover round.
+        let rnd: i64 = conn
+            .query_row(
+                "SELECT rnd FROM acctrounds WHERE id = 'acctbase'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rnd, 42);
+
+        // The pre-existing accountbase row is restored verbatim.
+        let data: Vec<u8> = conn
+            .query_row(
+                "SELECT data FROM accountbase WHERE address = X'0101'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(data, vec![0x00]);
+
+        // accounttotals restored.
+        let online: i64 = conn
+            .query_row(
+                "SELECT online FROM accounttotals WHERE id = ''",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(online, 9);
+
+        // The backup tables are cleaned up by rollback too (nothing left
+        // behind under the `__precatchup_backup` suffix).
+        let leftover: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE '%__precatchup_backup'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftover, 0);
+    }
+
+    #[test]
+    fn rollback_cutover_on_a_fresh_database_leaves_no_live_tables() {
+        // No pre-existing live tables at all — mirrors a brand-new
+        // never-synced database. Rollback after a failed verify should
+        // leave the database exactly as empty as it was before the import.
+        let conn = mem_conn();
+        let mut importer = CatchpointImporter::new(&conn, "test#label".to_string(), REWARD_UNITS);
+        importer.prepare_staging().unwrap();
+
+        let header = make_test_header(100);
+        let backup = importer.atomic_cutover(&header).unwrap();
+        assert!(backup.backed_up_tables.is_empty());
+
+        importer.rollback_cutover(&backup).unwrap();
+
+        let live_table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'accountbase'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_table_count, 0);
+
+        let acctrounds_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM acctrounds", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(acctrounds_rows, 0);
+    }
+
+    #[test]
+    fn finalize_cutover_drops_backup_tables_and_keeps_new_live_data() {
+        let conn = mem_conn();
+        conn.execute_batch(
+            "CREATE TABLE accountbase (address BLOB PRIMARY KEY, normalizedonlinebalance INTEGER, data BLOB);
+            INSERT INTO accountbase VALUES(X'0101', 0, X'00');",
+        )
+        .unwrap();
+
+        let mut importer = CatchpointImporter::new(&conn, "test#label".to_string(), REWARD_UNITS);
+        importer.prepare_staging().unwrap();
+
+        let header = make_test_header(100);
+        let backup = importer.atomic_cutover(&header).unwrap();
+        assert_eq!(backup.backed_up_tables, vec!["accountbase"]);
+
+        importer.finalize_cutover(&backup).unwrap();
+
+        // Old data is gone for good (backup table dropped).
+        let leftover: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE '%__precatchup_backup'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftover, 0);
+
+        // New (empty, staging-derived) accountbase is still the live one.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM accountbase", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

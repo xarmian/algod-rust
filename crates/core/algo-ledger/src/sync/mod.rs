@@ -102,6 +102,18 @@ pub trait SyncBackend: Send + Sync {
         dest_path: &std::path::Path,
     ) -> Result<(), AlgoError>;
 
+    /// Retroactively penalize whichever peer served the most recent
+    /// successful [`Self::download_catchpoint`] call, so a caller that
+    /// retries after this backend's own downloaded data later fails a
+    /// validation step outside this trait's view (catchpoint verification —
+    /// issue #1636) can steer the retry toward a different candidate.
+    ///
+    /// Default no-op: only backends with real peer-ranking machinery (e.g.
+    /// `AlgodSyncBackend`, whose `RankedCatchpointSource` already ranks
+    /// peers by download outcome — issue #901/#1618) have anything useful
+    /// to do here; `NoopBackend` and test fakes have no peers to rank.
+    fn rank_last_catchpoint_peer_down(&self) {}
+
     /// Fetch a single block by round. Returns `(proto, header_data, block_data)`.
     ///
     /// Used for lookback block downloads.
@@ -455,6 +467,14 @@ pub struct SyncOrchestrator {
     block_header_digest: Option<[u8; 32]>,
     /// Accounts imported during the import phase.
     accounts_imported: u64,
+    /// Everything the import phase's `atomic_cutover` preserved of the
+    /// pre-catchup live tables/`acctrounds`/`accounttotals`/`catchpointstate`
+    /// values, so a subsequent verification failure can roll the cutover
+    /// back rather than leaving the on-disk ledger observably at the new,
+    /// unverified round (issue #1633). Set by [`Self::run_import_ledger`];
+    /// consumed by [`Self::run_verify_ledger`] on either its success path
+    /// (`finalize_cutover`) or its failure path (`rollback_cutover`).
+    cutover_backup: Option<crate::catchpoint::CutoverBackup>,
     /// Blocks replayed during the replay phase.
     blocks_replayed: u64,
     /// The final round reached after replay.
@@ -490,6 +510,7 @@ impl SyncOrchestrator {
             resolved_label: None,
             block_header_digest: None,
             accounts_imported: 0,
+            cutover_backup: None,
             blocks_replayed: 0,
             final_round: 0,
             cancel: CancellationToken::new(),
@@ -842,6 +863,10 @@ impl SyncOrchestrator {
 
         self.accounts_imported = import_result.stats.accounts;
         let round = import_result.round;
+        // Stash the pre-cutover backup so `run_verify_ledger` can finalize
+        // (verify succeeded) or roll it back (verify failed) — see
+        // `Self::cutover_backup`'s docs and issue #1633.
+        self.cutover_backup = Some(import_result.cutover_backup);
 
         tracing::info!(
             round,
@@ -893,6 +918,77 @@ impl SyncOrchestrator {
         Ok(())
     }
 
+    /// Reverse a catchpoint import's cutover after its verification failed.
+    ///
+    /// Restores `acctrounds`/`accounttotals`/`catchpointstate` and any
+    /// preserved pre-existing live tables to their pre-catchup values (see
+    /// [`crate::catchpoint::CatchpointImporter::rollback_cutover`]), and
+    /// removes the synthesized block-header row
+    /// [`crate::sqlite::initialize_meta_from_catchpoint`] wrote at the new
+    /// round, so `SqliteLedger::last_committed_round()` (what `GET
+    /// /v2/status` reads) and the block database agree again on the old,
+    /// still-consistent round instead of the new, as-it-turns-out-unverified
+    /// one.
+    ///
+    /// A no-op (with a warning) if there is no in-memory backup to work
+    /// with — the only way that happens is resuming a sync from a prior,
+    /// separate process's `VerifyingLedger` checkpoint, where the backup
+    /// (kept only in memory) did not survive the process restart. That is
+    /// an existing, narrow gap this fix does not attempt to close: the
+    /// live-catchup path this issue is about (`LiveCatchupManager::drive`)
+    /// always runs import and verify within the same orchestrator
+    /// instance, so the backup is present.
+    ///
+    /// Addresses issue #1633's split-brain symptom.
+    fn rollback_cutover_on_failure(&mut self, conn: &Connection, reason: &str) {
+        let Some(backup) = self.cutover_backup.take() else {
+            tracing::warn!(
+                reason,
+                "catchpoint verification failed but no in-memory cutover backup is available \
+                 to roll back (likely resumed from a prior process's VerifyingLedger checkpoint) \
+                 — the ledger may still be observably at the new, unverified round"
+            );
+            return;
+        };
+
+        let importer = crate::catchpoint::CatchpointImporter::new(
+            conn,
+            String::new(),
+            crate::rewards::REWARD_UNITS,
+        );
+        if let Err(e) = importer.rollback_cutover(&backup) {
+            tracing::error!(
+                error = %e,
+                reason,
+                "failed to roll back catchpoint cutover after verification failure — \
+                 ledger may be left in an inconsistent state"
+            );
+            return;
+        }
+
+        // The synthesized header row `initialize_meta_from_catchpoint` wrote
+        // is specific to this import attempt (its own `ON CONFLICT DO
+        // UPDATE` would otherwise have overwritten a real archived block
+        // only if one already existed at this exact round, which cannot
+        // happen for a genuine fast-forward catchup) — remove it so
+        // `max_block_round_in_blockdb()` agrees with the just-restored
+        // `acctrounds`.
+        if let Some(round) = self.balances_round {
+            if let Err(e) = conn.execute(
+                "DELETE FROM blockdb.blocks WHERE rnd = ?1 AND blkdata IS NOT NULL AND length(blkdata) = 0",
+                rusqlite::params![round as i64],
+            ) {
+                tracing::warn!(error = %e, round, "failed to remove synthesized block header row during cutover rollback");
+            }
+        }
+
+        tracing::warn!(
+            reason,
+            "catchpoint cutover rolled back after verification failure — \
+             ledger reverted to its pre-catchup round"
+        );
+    }
+
     /// Phase 3: Verify the imported ledger (Merkle trie, account totals).
     ///
     /// Rebuilds the Merkle trie from the database, computes component hashes,
@@ -914,18 +1010,42 @@ impl SyncOrchestrator {
         let conn = self.open_db()?;
 
         // Step 1: Full label verification.
-        let verify_result =
-            verify_catchpoint(&conn, &block_header_digest).map_err(|e| AlgoError::Ledger {
-                message: format!("catchpoint verification failed: {e}"),
-            })?;
+        let verify_result = match verify_catchpoint(&conn, &block_header_digest) {
+            Ok(r) => r,
+            Err(e) => {
+                self.rollback_cutover_on_failure(&conn, "verify_catchpoint returned an error");
+                return Err(AlgoError::Ledger {
+                    message: format!("catchpoint verification failed: {e}"),
+                });
+            }
+        };
 
         if !verify_result.success {
+            self.rollback_cutover_on_failure(&conn, "catchpoint label mismatch");
             return Err(AlgoError::Ledger {
                 message: format!(
                     "catchpoint label mismatch: expected '{}', computed '{}'",
                     verify_result.expected_label, verify_result.computed_label
                 ),
             });
+        }
+
+        // Verification passed: the cutover the import phase performed is
+        // now committed. Finalize it (drop the preserved pre-cutover backup
+        // tables) rather than leaving them around indefinitely — issue
+        // #1633.
+        if let Some(backup) = self.cutover_backup.take() {
+            let importer = crate::catchpoint::CatchpointImporter::new(
+                &conn,
+                String::new(),
+                crate::rewards::REWARD_UNITS,
+            );
+            if let Err(e) = importer.finalize_cutover(&backup) {
+                // Non-fatal: the verified data is live and correct either
+                // way, this only fails to reclaim the backup tables' disk
+                // space.
+                tracing::warn!(error = %e, "failed to finalize catchpoint cutover backup cleanup");
+            }
         }
 
         tracing::info!(
@@ -2690,6 +2810,175 @@ mod tests {
         // (blocks_round threaded into validate_post_import's expected_round
         // instead of balances_round).
         orchestrator.run_verify_ledger().unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TDD for issue #1633: a catchpoint import's cutover must not leave the
+    /// on-disk ledger observably at the new round when the subsequent
+    /// verification of that same data fails.
+    ///
+    /// Before the fix, `run_import_ledger`'s `atomic_cutover` unconditionally
+    /// dropped whatever live tables existed and stamped `acctrounds` with
+    /// the new round; if `run_verify_ledger` then failed (as it did against
+    /// real mainnet data — issue #1636), that stamp was never reverted, so
+    /// `SqliteLedger::last_committed_round()` (what `GET /v2/status` reads)
+    /// permanently reported the new, as-it-turns-out-unverified round even
+    /// though the live-catchup caller's cached `current_round` correctly
+    /// never adopted it — the exact split-brain #1633 describes.
+    ///
+    /// This test deliberately corrupts `block_header_digest` between import
+    /// and verify (the simplest deterministic way to make an otherwise-valid
+    /// import fail label verification without needing genuinely corrupted
+    /// catchpoint bytes) and asserts that after the failed verify:
+    /// 1. `run_verify_ledger` returns `Err`.
+    /// 2. `acctrounds('acctbase')` is back at the pre-catchup round, not the
+    ///    new one.
+    /// 3. The pre-catchup `accountbase` row is restored verbatim.
+    #[test]
+    fn failed_verify_rolls_back_cutover_to_pre_catchup_round() {
+        use crate::catchpoint::writer::{export_catchpoint_file, ExportOptions};
+
+        const OLD_ROUND: i64 = 42;
+        const NEW_BALANCES_ROUND: u64 = 500;
+        const BLOCK_DIGEST: [u8; 32] = [7u8; 32];
+
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-verify-rollback-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Build a minimal source ledger to export as the "new" catchpoint.
+        let src = Connection::open_in_memory().unwrap();
+        src.execute_batch(
+            "CREATE TABLE accountbase (
+                addrid INTEGER PRIMARY KEY NOT NULL,
+                address BLOB NOT NULL,
+                data BLOB,
+                normalizedonlinebalance INTEGER
+            );
+            CREATE TABLE resources (
+                addrid INTEGER NOT NULL, aidx INTEGER NOT NULL,
+                data BLOB NOT NULL, ctype INTEGER NOT NULL DEFAULT -1,
+                PRIMARY KEY (addrid, aidx)
+            ) WITHOUT ROWID;
+            CREATE TABLE kvstore (key BLOB PRIMARY KEY, value BLOB);
+            CREATE TABLE onlineaccounts (
+                address BLOB NOT NULL, updround INTEGER NOT NULL,
+                normalizedonlinebalance INTEGER NOT NULL, votelastvalid INTEGER NOT NULL,
+                data BLOB NOT NULL, PRIMARY KEY (address, updround)
+            );
+            CREATE TABLE onlineroundparamstail (rnd INTEGER PRIMARY KEY NOT NULL, data BLOB NOT NULL);
+            CREATE TABLE stateproofverification (
+                lastattestedround INTEGER PRIMARY KEY NOT NULL,
+                verificationcontext BLOB NOT NULL
+            );
+            CREATE TABLE accounttotals (
+                id TEXT PRIMARY KEY, online INTEGER, onlinerewardunits INTEGER,
+                offline INTEGER, offlinerewardunits INTEGER,
+                notparticipating INTEGER, notparticipatingrewardunits INTEGER,
+                rewardslevel INTEGER
+            );",
+        )
+        .unwrap();
+        src.execute(
+            "INSERT INTO accounttotals VALUES('', 0, 0, 0, 0, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+
+        let catchpoint_path = dir.join("source-catchpoint.tar.gz");
+        let export_options = ExportOptions {
+            balances_round: NEW_BALANCES_ROUND,
+            blocks_round: NEW_BALANCES_ROUND,
+            block_header_digest: BLOCK_DIGEST,
+            ..Default::default()
+        };
+        let export_result =
+            export_catchpoint_file(&src, &catchpoint_path, &export_options).unwrap();
+
+        let db_path = dir.join("ledger");
+        let mut config = test_config(db_path, 1);
+        config.catchpoint_label = Some(export_result.label.clone());
+
+        let mut orchestrator = SyncOrchestrator::with_backend(
+            config,
+            FakeFileCopyBackend {
+                source_file: catchpoint_path,
+            },
+        );
+
+        // Seed the destination ledger with pre-existing, already-committed
+        // state at OLD_ROUND — simulating a live participate node that has
+        // real state before a catchpoint catchup attempt is ever made.
+        {
+            let conn = orchestrator.open_db().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS acctrounds (id TEXT PRIMARY KEY, rnd INTEGER);
+                 CREATE TABLE IF NOT EXISTS accountbase (
+                     addrid INTEGER PRIMARY KEY NOT NULL,
+                     address BLOB NOT NULL,
+                     data BLOB,
+                     normalizedonlinebalance INTEGER
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO acctrounds(id, rnd) VALUES('acctbase', ?1)",
+                rusqlite::params![OLD_ROUND],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO accountbase(addrid, address, data, normalizedonlinebalance) \
+                 VALUES(1, X'AA', X'BB', 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        orchestrator.run_download_ledger().unwrap();
+        orchestrator.run_import_ledger().unwrap();
+        assert_eq!(orchestrator.balances_round, Some(NEW_BALANCES_ROUND));
+
+        // Deliberately corrupt the digest verify will reconstruct the label
+        // against, so the otherwise-valid imported data fails verification —
+        // the simplest deterministic stand-in for issue #1636's real
+        // corrupted-download/wrong-hash failure mode.
+        orchestrator.block_header_digest = Some([0xffu8; 32]);
+
+        let verify_err = orchestrator.run_verify_ledger();
+        assert!(
+            verify_err.is_err(),
+            "verify must fail after the digest was corrupted"
+        );
+
+        // The externally-observable round must be back at OLD_ROUND, not
+        // NEW_BALANCES_ROUND — this is the split-brain #1633 describes.
+        let conn = orchestrator.open_db().unwrap();
+        let rnd: i64 = conn
+            .query_row(
+                "SELECT rnd FROM acctrounds WHERE id = 'acctbase'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rnd, OLD_ROUND,
+            "acctrounds must be rolled back to the pre-catchup round after a failed verify"
+        );
+
+        // The pre-catchup accountbase row must be restored verbatim.
+        let (addr, data): (Vec<u8>, Vec<u8>) = conn
+            .query_row(
+                "SELECT address, data FROM accountbase WHERE addrid = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(addr, vec![0xAA]);
+        assert_eq!(data, vec![0xBB]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

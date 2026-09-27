@@ -24,7 +24,7 @@ use std::time::Instant;
 
 use algo_ledger::catchpoint::{
     export_catchpoint_file, import_catchpoint_file, parse_catchpoint_label, validate_post_import,
-    verify_catchpoint, ExportOptions,
+    verify_catchpoint, CatchpointImporter, ExportOptions,
 };
 use algo_ledger::open_ledger_connection_with_sync_mode;
 use algo_rest_client::{CatchpointDownloadConfig, CatchpointDownloader, DownloadProgress};
@@ -173,14 +173,34 @@ pub async fn run_import(
     );
 
     // Step 5: Verify (if requested).
+    //
+    // A verify failure rolls the cutover back (issue #1633) rather than
+    // leaving the freshly-imported, as-it-turns-out-unverified tables live
+    // on disk: the same guard `SyncOrchestrator` applies for the
+    // participate-node live-catchup path (`crates/core/algo-ledger/src/sync/mod.rs`).
+    let importer_for_cutover = CatchpointImporter::new(&conn, String::new(), reward_unit);
     if verify {
         println!("\nVerifying...");
         let verify_timer = Instant::now();
         let result = verify_catchpoint(&conn, &block_header_digest)
-            .map_err(|e| anyhow::anyhow!("verification failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("verification failed: {e}"));
 
         let verify_elapsed = verify_timer.elapsed();
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => {
+                if let Err(rollback_err) =
+                    importer_for_cutover.rollback_cutover(&import_result.cutover_backup)
+                {
+                    error!(error = %rollback_err, "failed to roll back cutover after verification error");
+                }
+                return Err(e);
+            }
+        };
         if result.success {
+            importer_for_cutover
+                .finalize_cutover(&import_result.cutover_backup)
+                .map_err(|e| anyhow::anyhow!("failed to finalize cutover: {e}"))?;
             println!("Verification PASSED ({:.1}s)", verify_elapsed.as_secs_f64());
             println!("  Label:    {}", result.computed_label);
             println!("  Accounts: {}", result.accounts_count);
@@ -195,8 +215,18 @@ pub async fn run_import(
             error!("Verification FAILED");
             println!("  Expected: {}", result.expected_label);
             println!("  Computed: {}", result.computed_label);
+            if let Err(rollback_err) =
+                importer_for_cutover.rollback_cutover(&import_result.cutover_backup)
+            {
+                error!(error = %rollback_err, "failed to roll back cutover after label mismatch");
+            }
             anyhow::bail!("catchpoint verification failed");
         }
+    } else {
+        // No verification requested — treat the cutover as final immediately.
+        importer_for_cutover
+            .finalize_cutover(&import_result.cutover_backup)
+            .map_err(|e| anyhow::anyhow!("failed to finalize cutover: {e}"))?;
     }
 
     // Step 6: Post-import validation.
