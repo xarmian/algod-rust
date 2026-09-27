@@ -3768,6 +3768,185 @@ mod tests {
         }
     }
 
+    /// Bulk-insert variant of [`build_file_backed_trie_test_db`] for
+    /// multi-million-element scale. The helper above issues one autocommit
+    /// `INSERT` per row, which is fine at hundreds-of-elements scale but
+    /// far too slow (one WAL fsync per row) at the scale this test needs.
+    /// This wraps every insert in a single transaction and reuses prepared
+    /// statements, matching the real `build_and_persist_trie_chunked`
+    /// pass-1 staging loop's own bulk-transaction shape.
+    fn build_file_backed_trie_test_db_bulk(
+        dir: &std::path::Path,
+        n_accounts: u64,
+        n_resources: u64,
+        n_kvs: u64,
+    ) -> Connection {
+        let db_path = dir.join("trie_large_scale_test.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=OFF;
+             CREATE TABLE accountbase (
+                addrid INTEGER PRIMARY KEY NOT NULL,
+                address BLOB NOT NULL,
+                data BLOB,
+                normalizedonlinebalance INTEGER
+             );
+             CREATE TABLE resources (
+                addrid INTEGER NOT NULL, aidx INTEGER NOT NULL,
+                data BLOB NOT NULL, ctype INTEGER NOT NULL DEFAULT -1,
+                PRIMARY KEY (addrid, aidx)
+             ) WITHOUT ROWID;
+             CREATE TABLE kvstore (key BLOB PRIMARY KEY, value BLOB);
+             CREATE TABLE accounthashes (id INTEGER PRIMARY KEY, data BLOB);",
+        )
+        .unwrap();
+
+        conn.execute_batch("BEGIN;").unwrap();
+        {
+            let mut acct_stmt = conn
+                .prepare(
+                    "INSERT INTO accountbase (addrid, address, data, normalizedonlinebalance) \
+                     VALUES (?1, ?2, ?3, 0)",
+                )
+                .unwrap();
+            for i in 0..n_accounts {
+                // Varied, non-sequential-looking address bytes across the
+                // full 32 bytes (real addresses are effectively random —
+                // affinity/trie-key ordering must not correlate with
+                // insertion/table order), plus skewed high/low byte runs.
+                let mut addr = [0u8; 32];
+                addr[..8].copy_from_slice(&i.to_be_bytes());
+                addr[8..16].copy_from_slice(&(!i).to_be_bytes());
+                addr[16] = (i % 251) as u8;
+                addr[31] = ((i / 251) % 251) as u8;
+                let mut data = format!("acct-data-{i}-").into_bytes();
+                data.extend(std::iter::repeat((i % 256) as u8).take((i % 64) as usize));
+                acct_stmt
+                    .execute(rusqlite::params![i as i64 + 1, addr.to_vec(), data])
+                    .unwrap();
+            }
+        }
+        {
+            let mut rsrc_stmt = conn
+                .prepare(
+                    "INSERT INTO resources (addrid, aidx, data, ctype) VALUES (?1, ?2, ?3, ?4)",
+                )
+                .unwrap();
+            for i in 0..n_resources {
+                let addrid = if n_accounts == 0 {
+                    1
+                } else {
+                    (i % n_accounts) as i64 + 1
+                };
+                let ctype = (i % 2) as i64;
+                let mut data = format!("resource-data-{i}-").into_bytes();
+                data.extend(std::iter::repeat((i % 128) as u8).take((i % 48) as usize));
+                rsrc_stmt
+                    .execute(rusqlite::params![addrid, i as i64 + 1, data, ctype])
+                    .unwrap();
+            }
+        }
+        {
+            let mut kv_stmt = conn
+                .prepare("INSERT INTO kvstore (key, value) VALUES (?1, ?2)")
+                .unwrap();
+            for i in 0..n_kvs {
+                let mut key = b"bx:".to_vec();
+                key.extend_from_slice(&i.to_be_bytes());
+                key.extend_from_slice(format!("box-{i}").as_bytes());
+                let mut value = format!("box-value-{i}-").into_bytes();
+                value.extend(std::iter::repeat((i % 200) as u8).take((i % 32) as usize));
+                kv_stmt.execute(rusqlite::params![key, value]).unwrap();
+            }
+        }
+        conn.execute_batch("COMMIT;").unwrap();
+        conn
+    }
+
+    /// Issue #1636, fifth investigation round: the largest prior synthetic
+    /// stress test (`..._across_multiple_pagination_batches`, 240,000
+    /// elements / ~4 `TRIE_REBUILD_COMMIT_FREQUENCY` batches) matched the
+    /// unbounded reference exactly, but the real live-dispatch failure
+    /// processed 76,932,430 elements across 1,174 batches — roughly 320x
+    /// more elements / ~390x more batches than anything tested so far. This
+    /// test closes that scale gap directly: it drives millions of synthetic
+    /// elements (mixed account/resource/kv, mirroring real mainnet's
+    /// ~29%/70%/1% split) through the exact same `build_and_persist_trie_chunked`
+    /// code path against a real file-backed SQLite DB, and compares against
+    /// the unbounded single-pass reference.
+    ///
+    /// `#[ignore]`d: this is a many-minutes, multi-GB stress test, not a
+    /// normal `cargo test` case. Run explicitly:
+    /// `cargo test --release -p algo-ledger --lib \
+    ///   catchpoint::verify::tests::chunked_trie_rebuild_matches_unbounded_rebuild_at_large_scale \
+    ///   -- --ignored --nocapture`
+    ///
+    /// Scale is controlled by the `ALGOD_TRIE_STRESS_N` env var (total
+    /// element count; default 5,000,000) so the same binary can be
+    /// re-invoked at different scales for bisection without recompiling.
+    #[test]
+    #[ignore]
+    fn chunked_trie_rebuild_matches_unbounded_rebuild_at_large_scale() {
+        let total_n: u64 = std::env::var("ALGOD_TRIE_STRESS_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5_000_000);
+
+        // Mirror the real mainnet ratio observed in issue #1636's live
+        // dispatch: accounts=22,489,231 resources=53,704,294 kvs=738,905
+        // out of 76,932,430 total (~29.23% / ~69.81% / ~0.96%).
+        let n_accounts = (total_n as f64 * 0.2923) as u64;
+        let n_resources = (total_n as f64 * 0.6981) as u64;
+        let n_kvs = total_n.saturating_sub(n_accounts).saturating_sub(n_resources);
+
+        eprintln!(
+            "chunked_trie_rebuild_matches_unbounded_rebuild_at_large_scale: \
+             total_n={total_n} accounts={n_accounts} resources={n_resources} kvs={n_kvs} \
+             (~{:.1} TRIE_REBUILD_COMMIT_FREQUENCY batches)",
+            total_n as f64 / TRIE_REBUILD_COMMIT_FREQUENCY as f64
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-verify-chunked-trie-large-scale-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let insert_start = std::time::Instant::now();
+        let conn = build_file_backed_trie_test_db_bulk(&dir, n_accounts, n_resources, n_kvs);
+        eprintln!(
+            "  insert phase complete in {:.1}s",
+            insert_start.elapsed().as_secs_f64()
+        );
+
+        let ref_start = std::time::Instant::now();
+        let reference_root = rebuild_trie_from_db(&conn).unwrap();
+        eprintln!(
+            "  unbounded reference build complete in {:.1}s",
+            ref_start.elapsed().as_secs_f64()
+        );
+
+        let chunked_start = std::time::Instant::now();
+        let mut chunked_trie = build_and_persist_trie_chunked(&conn).unwrap();
+        let chunked_root = chunked_trie.root_hash().unwrap();
+        eprintln!(
+            "  chunked build complete in {:.1}s",
+            chunked_start.elapsed().as_secs_f64()
+        );
+
+        eprintln!("  reference_root = {reference_root:x?}");
+        eprintln!("  chunked_root   = {chunked_root:x?}");
+
+        assert_eq!(
+            chunked_root, reference_root,
+            "chunked trie root diverged from unbounded reference at large scale \
+             (total_n={total_n}, accounts={n_accounts}, resources={n_resources}, kvs={n_kvs})"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn chunked_trie_rebuild_survives_multiple_commit_evict_cycles() {
         // More elements than a single chunk, forced through several
