@@ -30,7 +30,7 @@
 
 use data_encoding::BASE32_NOPAD;
 use rusqlite::Connection;
-use sha2::{Digest, Sha512_256};
+use sha2::{Digest, Sha256, Sha512_256};
 
 use super::types::{
     AccountTotals, AlgoCount, CatchpointError, CatchpointLabel, CATCHPOINT_FILE_VERSION_V6,
@@ -898,9 +898,25 @@ fn build_and_persist_trie_chunked(
 ) -> Result<crate::merkle_trie::MerkleTrie, CatchpointError> {
     use crate::merkle_committer::{CommitterTable, OwnedSqliteCommitter};
     use crate::merkle_trie::MerkleTrie;
-    use crate::trie_hash::{extract_raw_affinity, kv_hash_v6, HashKind, ELEMENT_SIZE};
+    use crate::trie_hash::{
+        extract_raw_affinity_tracked, kv_hash_v6, AffinityAnomalyTracker, HashKind, ELEMENT_SIZE,
+    };
 
     const CTYPE_APP: i64 = 1;
+    const CTYPE_ASSET: i64 = 0;
+    // Issue #1636 (sixth investigation round): real-data bisection. Every
+    // element inserted in pass 2 is bucketed by the high byte of its
+    // 36-byte trie-key (`data[0]`, the top byte of `affinity` — the same
+    // byte the `(data, rowid)` pagination sort already orders by), and a
+    // running SHA-256 is kept per bucket over the sorted-order
+    // concatenation of every element's bytes landing in it. This gives a
+    // compact (256-entry), permanently-cheap fingerprint of exactly what
+    // real data this run's trie was built from, logged unconditionally so
+    // a future comparison run (or a captured real catchpoint tarball) has
+    // something concrete to diff against, without needing to persist the
+    // full 76.9M-row scratch table as a workflow artifact.
+    const N_BUCKETS: usize = 256;
+    const AFFINITY_CTYPE_SAMPLE_CAP: usize = 32;
 
     let Some(db_path) = conn.path() else {
         // In-memory connection (tests) — no path to reopen. Fall back to
@@ -1050,6 +1066,9 @@ fn build_and_persist_trie_chunked(
     conn.execute_batch("BEGIN;").map_err(|e| {
         CatchpointError::ImportError(format!("begin trie-rebuild pending-hashes staging: {e}"))
     })?;
+    let mut affinity_tracker = AffinityAnomalyTracker::default();
+    let mut unexpected_ctype_count: u64 = 0;
+    let mut unexpected_ctype_samples: Vec<(i64, i64)> = Vec::new();
     let stage_result = (|| -> Result<(), CatchpointError> {
         let mut insert_stmt = conn
             .prepare(&format!(
@@ -1062,21 +1081,22 @@ fn build_and_persist_trie_chunked(
         // 1a. Accounts.
         {
             let mut stmt = conn
-                .prepare("SELECT address, data FROM accountbase")
+                .prepare("SELECT rowid, address, data FROM accountbase")
                 .map_err(|e| {
                     CatchpointError::ImportError(format!("prepare accounts for trie rebuild: {e}"))
                 })?;
             let rows = stmt
                 .query_map([], |row| {
-                    let addr_bytes: Vec<u8> = row.get(0)?;
-                    let data: Vec<u8> = row.get(1)?;
-                    Ok((addr_bytes, data))
+                    let rowid: i64 = row.get(0)?;
+                    let addr_bytes: Vec<u8> = row.get(1)?;
+                    let data: Vec<u8> = row.get(2)?;
+                    Ok((rowid, addr_bytes, data))
                 })
                 .map_err(|e| {
                     CatchpointError::ImportError(format!("query accounts for trie rebuild: {e}"))
                 })?;
             for row in rows {
-                let (addr_bytes, data) = row
+                let (rowid, addr_bytes, data) = row
                     .map_err(|e| CatchpointError::ImportError(format!("read account row: {e}")))?;
                 if addr_bytes.len() != 32 {
                     return Err(CatchpointError::ImportError(format!(
@@ -1086,7 +1106,11 @@ fn build_and_persist_trie_chunked(
                 }
                 let mut addr = [0u8; 32];
                 addr.copy_from_slice(&addr_bytes);
-                let affinity = extract_raw_affinity(&data);
+                let affinity = extract_raw_affinity_tracked(
+                    &data,
+                    format!("account rowid={rowid}"),
+                    &mut affinity_tracker,
+                );
                 let elem = raw_account_element(&addr, &data, affinity);
                 insert_stmt
                     .execute(rusqlite::params![elem.as_slice()])
@@ -1129,9 +1153,27 @@ fn build_and_persist_trie_chunked(
                 }
                 let mut addr = [0u8; 32];
                 addr.copy_from_slice(&addr_bytes);
+                // Issue #1636: log (don't just silently bucket-as-Asset) any
+                // ctype outside the two values go-algorand's resources table
+                // actually uses. `raw_resource_element`'s HashKind mapping
+                // was audited against go's `rdGetCreatableHashKind` in the
+                // third round, but never instrumented to check whether real
+                // mainnet data ever contains a ctype value neither branch
+                // expects (which the `else` arm below would silently fold
+                // into Asset).
+                if ctype != CTYPE_APP && ctype != CTYPE_ASSET {
+                    unexpected_ctype_count += 1;
+                    if unexpected_ctype_samples.len() < AFFINITY_CTYPE_SAMPLE_CAP {
+                        unexpected_ctype_samples.push((aidx, ctype));
+                    }
+                }
                 // Use the resource's own UpdateRound for affinity, matching Go's
                 // ResourcesHashBuilderV6 which passes resData.UpdateRound.
-                let affinity = extract_raw_affinity(&rdata);
+                let affinity = extract_raw_affinity_tracked(
+                    &rdata,
+                    format!("resource aidx={aidx} ctype={ctype}"),
+                    &mut affinity_tracker,
+                );
                 let kind = if ctype == CTYPE_APP {
                     HashKind::App as u8
                 } else {
@@ -1231,6 +1273,53 @@ fn build_and_persist_trie_chunked(
         }
     }
 
+    // Issue #1636 (sixth investigation round) diagnostic: report the
+    // affinity-decode anomaly tracker and any unexpected `ctype` values
+    // seen while staging *real* data. Logged unconditionally (not just on
+    // mismatch) so this data point exists for every run regardless of
+    // outcome, same discipline as the staged-row-count check above.
+    {
+        tracing::info!(
+            decode_failures = affinity_tracker.decode_failures,
+            non_map_values = affinity_tracker.non_map_values,
+            z_present_not_u64 = affinity_tracker.z_present_not_u64,
+            c_present_not_u64 = affinity_tracker.c_present_not_u64,
+            unexpected_ctype_count,
+            "catchpoint verify (issue #1636 diagnostic): affinity-decode + ctype anomaly counters"
+        );
+        if affinity_tracker.any_anomaly() {
+            tracing::error!(
+                decode_failures = affinity_tracker.decode_failures,
+                non_map_values = affinity_tracker.non_map_values,
+                z_present_not_u64 = affinity_tracker.z_present_not_u64,
+                c_present_not_u64 = affinity_tracker.c_present_not_u64,
+                "catchpoint verify (issue #1636 diagnostic): AFFINITY DECODE ANOMALY DETECTED on \
+                 real data — see per-sample lines below for exact raw bytes"
+            );
+            for (context, hex) in &affinity_tracker.samples {
+                tracing::error!(
+                    context = %context,
+                    data_hex = %hex,
+                    "catchpoint verify (issue #1636 diagnostic): affinity anomaly sample"
+                );
+            }
+        }
+        if unexpected_ctype_count > 0 {
+            tracing::error!(
+                unexpected_ctype_count,
+                "catchpoint verify (issue #1636 diagnostic): UNEXPECTED CTYPE VALUE(S) DETECTED \
+                 on real data (neither Asset=0 nor App=1) — see per-sample lines below"
+            );
+            for (aidx, ctype) in &unexpected_ctype_samples {
+                tracing::error!(
+                    aidx,
+                    ctype,
+                    "catchpoint verify (issue #1636 diagnostic): unexpected ctype sample"
+                );
+            }
+        }
+    }
+
     // Index the scratch table on `data` — mirrors go's
     // `CreateCatchpointStagingHashesIndex` ("creating the index can take
     // a while" per its own comment; same tradeoff here).
@@ -1252,6 +1341,16 @@ fn build_and_persist_trie_chunked(
     // case of two elements hashing identically) in batches of
     // TRIE_REBUILD_COMMIT_FREQUENCY rows, exactly like every earlier
     // version of this loop.
+    // Issue #1636 real-data bisection: one running SHA-256 per bucket
+    // (bucket = `data[0]`, i.e. the top byte of the 36-byte trie key —
+    // the same byte the pagination `ORDER BY data, rowid` already sorts
+    // by first), fed every element's bytes in the exact sorted order
+    // they're inserted into the trie. Cheap (one hash update per element,
+    // no extra I/O or allocation beyond what's already happening) and
+    // gives a permanent, compact fingerprint of this run's real staged
+    // data, logged unconditionally below.
+    let mut bucket_hashers: Vec<Sha256> = (0..N_BUCKETS).map(|_| Sha256::new()).collect();
+    let mut bucket_counts: Vec<u64> = vec![0; N_BUCKETS];
     {
         let mut last_data: Vec<u8> = Vec::new();
         let mut last_rowid: i64 = i64::MIN;
@@ -1297,6 +1396,9 @@ fn build_and_persist_trie_chunked(
                         data.len()
                     ))
                 })?;
+                let bucket = elem[0] as usize;
+                bucket_hashers[bucket].update(&elem);
+                bucket_counts[bucket] += 1;
                 trie.add(&elem)
                     .map_err(|e| CatchpointError::ImportError(format!("trie add element: {e}")))?;
                 since_last_commit += 1;
@@ -1316,6 +1418,33 @@ fn build_and_persist_trie_chunked(
         elapsed_s = rebuild_start.elapsed().as_secs_f64(),
         "catchpoint verify: trie rebuild hash-sorted insertion pass done"
     );
+    // Issue #1636: log the full 256-bucket fingerprint as one compact
+    // line — each bucket's finalized SHA-256 (hex) plus its element
+    // count, concatenated `bucket:count:hexdigest` entries separated by
+    // `;`. This is small (256 * ~72 bytes ≈ 18KB) even at real mainnet
+    // scale and is captured in the workflow's `node.log` artifact
+    // unconditionally, so a future run (or a captured real catchpoint
+    // tarball processed independently) has something concrete to diff
+    // hash-range by hash-range against, without needing to persist the
+    // full pending-hashes scratch table.
+    {
+        let fingerprint = bucket_hashers
+            .into_iter()
+            .zip(bucket_counts.iter())
+            .enumerate()
+            .map(|(bucket, (hasher, count))| {
+                let digest = hasher.finalize();
+                let hex = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                format!("{bucket}:{count}:{hex}")
+            })
+            .collect::<Vec<_>>()
+            .join(";");
+        tracing::info!(
+            n_buckets = N_BUCKETS,
+            fingerprint = %fingerprint,
+            "catchpoint verify (issue #1636 diagnostic): per-bucket real-data fingerprint"
+        );
+    }
     // Scratch table cleanup — best-effort; a stale scratch table left
     // behind by a failed run is harmless (it's dropped at the start of
     // the next attempt) and must never fail an otherwise-successful
