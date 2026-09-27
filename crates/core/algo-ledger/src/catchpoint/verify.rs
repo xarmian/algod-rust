@@ -3642,4 +3642,149 @@ mod tests {
         assert_eq!(chunked_trie.root_hash().unwrap(), reference_root);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Issue #1636: the multi-batch **hash-sorted keyset pagination** in
+    /// `build_and_persist_trie_chunked`'s pass 2
+    /// (`WHERE (data, rowid) > (?1, ?2) ORDER BY data, rowid LIMIT
+    /// TRIE_REBUILD_COMMIT_FREQUENCY`) had never actually been exercised by
+    /// any test with more than one `TRIE_REBUILD_COMMIT_FREQUENCY` (65536)
+    /// batch of *real* mixed account/resource/kv elements read back through
+    /// SQL. Every prior stress test either used synthetic hash-shaped keys
+    /// fed straight into an in-memory `MerkleTrie` (bypassing the SQL
+    /// staging/pagination entirely — see `merkle_trie.rs`'s
+    /// `test_chunked_commit_evict_matches_single_pass_root_hash`), or used
+    /// this file's own `build_file_backed_trie_test_db` helper at a scale
+    /// (<=900 elements) far below one page of the real pagination query, so
+    /// the outer `loop { ... }` here only ever ran a single iteration and
+    /// the `WHERE (data, rowid) > (?1, ?2)` seek was never actually
+    /// re-invoked with a non-trivial `(last_data, last_rowid)` cursor.
+    ///
+    /// This builds >3 full `TRIE_REBUILD_COMMIT_FREQUENCY` batches
+    /// (accounts + resources + kvs, matching the real three-source shape)
+    /// and asserts the chunked, multi-batch, hash-sorted-pagination build
+    /// produces byte-identical output to the unbounded single-pass
+    /// reference — the same invariant `chunked_trie_rebuild_matches_unbounded_rebuild_root_hash`
+    /// checks at toy scale, but now actually forcing the pagination seek to
+    /// cross page boundaries repeatedly, including across the
+    /// account/resource/kv "type" boundary within the shared hash-sorted
+    /// keyspace.
+    #[test]
+    fn chunked_trie_rebuild_matches_unbounded_rebuild_across_multiple_pagination_batches() {
+        // 100_000 accounts + 80_000 resources + 60_000 kvs = 240_000
+        // elements, comfortably more than 3 * TRIE_REBUILD_COMMIT_FREQUENCY
+        // (196_608), forcing the pass-2 keyset-seek loop through at least 4
+        // full LIMIT batches with intervening commit+evict cycles.
+        let n_accounts: u32 = 100_000;
+        let n_resources: u32 = 80_000;
+        let n_kvs: u32 = 60_000;
+        assert!(
+            (n_accounts + n_resources + n_kvs) as u64 > 3 * TRIE_REBUILD_COMMIT_FREQUENCY,
+            "test scale must force multiple pagination batches"
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-verify-chunked-trie-pagination-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("trie_pagination_test.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE accountbase (
+                addrid INTEGER PRIMARY KEY NOT NULL,
+                address BLOB NOT NULL,
+                data BLOB,
+                normalizedonlinebalance INTEGER
+             );
+             CREATE TABLE resources (
+                addrid INTEGER NOT NULL, aidx INTEGER NOT NULL,
+                data BLOB NOT NULL, ctype INTEGER NOT NULL DEFAULT -1,
+                PRIMARY KEY (addrid, aidx)
+             ) WITHOUT ROWID;
+             CREATE TABLE kvstore (key BLOB PRIMARY KEY, value BLOB);
+             CREATE TABLE accounthashes (id INTEGER PRIMARY KEY, data BLOB);",
+        )
+        .unwrap();
+
+        // Bulk-insert inside one transaction (individual autocommit inserts
+        // at this scale would make the test impractically slow).
+        conn.execute_batch("BEGIN;").unwrap();
+        {
+            let mut acct_stmt = conn
+                .prepare(
+                    "INSERT INTO accountbase (addrid, address, data, normalizedonlinebalance) \
+                     VALUES (?1, ?2, ?3, 0)",
+                )
+                .unwrap();
+            for i in 0..n_accounts {
+                // Real-ish address bytes: varied across the full 32 bytes,
+                // not just a zero-padded counter, so trie-key affinity
+                // (derived from the hash, not the address) is realistically
+                // spread — but also exercise skewed/edge byte patterns
+                // (0x00 and 0xFF runs) the way real mainnet balances do.
+                let mut addr = [0u8; 32];
+                addr[..4].copy_from_slice(&i.to_be_bytes());
+                addr[4..8].copy_from_slice(&(!i).to_be_bytes());
+                addr[31] = (i % 251) as u8;
+                // Vary payload length/content to mimic real msgpack-encoded
+                // account blobs of differing size (small vs. large
+                // balances/asset counts), not a uniform tiny string.
+                let mut data = format!("acct-data-{i}-").into_bytes();
+                data.extend(std::iter::repeat((i % 256) as u8).take((i % 64) as usize));
+                acct_stmt
+                    .execute(rusqlite::params![i as i64 + 1, addr.to_vec(), data])
+                    .unwrap();
+            }
+        }
+        {
+            let mut rsrc_stmt = conn
+                .prepare(
+                    "INSERT INTO resources (addrid, aidx, data, ctype) VALUES (?1, ?2, ?3, ?4)",
+                )
+                .unwrap();
+            for i in 0..n_resources {
+                let addrid = (i % n_accounts) as i64 + 1;
+                let ctype = (i % 2) as i64; // alternate asset(0)/app(1)
+                let mut data = format!("resource-data-{i}-").into_bytes();
+                data.extend(std::iter::repeat((i % 128) as u8).take((i % 48) as usize));
+                rsrc_stmt
+                    .execute(rusqlite::params![addrid, i as i64 + 1, data, ctype])
+                    .unwrap();
+            }
+        }
+        {
+            let mut kv_stmt = conn
+                .prepare("INSERT INTO kvstore (key, value) VALUES (?1, ?2)")
+                .unwrap();
+            for i in 0..n_kvs {
+                // Real box keys are "bx:" + big-endian app id (8 bytes) + name.
+                let mut key = b"bx:".to_vec();
+                key.extend_from_slice(&(i as u64).to_be_bytes());
+                key.extend_from_slice(format!("box-{i}").as_bytes());
+                let mut value = format!("box-value-{i}-").into_bytes();
+                value.extend(std::iter::repeat((i % 200) as u8).take((i % 32) as usize));
+                kv_stmt.execute(rusqlite::params![key, value]).unwrap();
+            }
+        }
+        conn.execute_batch("COMMIT;").unwrap();
+
+        let reference_root = rebuild_trie_from_db(&conn).unwrap();
+
+        let pre_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM accounthashes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pre_count, 0);
+
+        let mut chunked_trie = build_and_persist_trie_chunked(&conn).unwrap();
+        let chunked_root = chunked_trie.root_hash().unwrap();
+
+        assert_eq!(
+            chunked_root, reference_root,
+            "chunked trie root diverged from unbounded reference across multiple \
+             pagination batches (accounts={n_accounts}, resources={n_resources}, kvs={n_kvs})"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
