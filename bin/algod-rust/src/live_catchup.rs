@@ -523,6 +523,27 @@ pub struct OrchestratorCatchupRunner {
 /// is the pragmatic analogue.
 const MAX_VERIFY_FAILURE_RETRIES: u32 = 2;
 
+/// Classify a [`algo_ledger::sync::SyncOrchestrator::run`] error message as
+/// specifically a catchpoint-verification failure (issue #1636), as opposed
+/// to a download/import/lookback/replay failure.
+///
+/// `SyncOrchestrator::run` always transitions its *state* to
+/// `SyncState::Failed(msg)` on any phase error — every state can transition
+/// to `Failed` (`crates/core/algo-ledger/src/sync/state_machine.rs`) — so by
+/// the time `run()` returns `Err`, `orchestrator.state()` is never left at
+/// `SyncState::VerifyingLedger` itself; checking the state enum variant
+/// alone (an earlier version of this function did exactly that) therefore
+/// never matches a real failure and silently disables the retry entirely.
+/// Live-dispatch evidence (`mainnet-node-soak.yml` run 36295601322, PR
+/// #1638) confirmed this: the rollback in `run_verify_ledger` fired
+/// correctly, but no second download/verify attempt was ever made. The
+/// error *message* `run_verify_ledger` produces
+/// (`crates/core/algo-ledger/src/sync/mod.rs`) is the only reliable signal
+/// left, so match on that instead.
+fn is_verify_failure_message(msg: &str) -> bool {
+    msg.contains("catchpoint label mismatch") || msg.contains("catchpoint verification failed")
+}
+
 /// A thin [`SyncBackend`] wrapper that delegates every call to a shared,
 /// reference-counted inner backend.
 ///
@@ -597,7 +618,7 @@ impl CatchupRunner for OrchestratorCatchupRunner {
         cancel: CancellationToken,
         counters: Arc<StdMutex<CatchpointCounters>>,
     ) -> anyhow::Result<()> {
-        use algo_ledger::sync::{SyncConfig, SyncOrchestrator, SyncState};
+        use algo_ledger::sync::{SyncConfig, SyncOrchestrator};
 
         let backend: Arc<dyn algo_ledger::sync::SyncBackend> =
             Arc::new(crate::commands::catchpoint_sync::build_algod_sync_backend(
@@ -679,15 +700,20 @@ impl CatchupRunner for OrchestratorCatchupRunner {
             match orchestrator.run().await {
                 Ok(_) => return Ok(()),
                 Err(e) => {
-                    // A failure whose last-reached state is `VerifyingLedger`
-                    // is specifically a verification failure (issue #1636):
-                    // `SyncOrchestrator::transition` sets the state to
-                    // `VerifyingLedger` before the verify phase's own logic
-                    // runs, and no later phase's transition ever runs to move
-                    // it past that on this error path. Any other failure
-                    // (download, import, lookback, replay) is left exactly
-                    // as before — no retry, no peer-ranking change.
-                    let is_verify_failure = *orchestrator.state() == SyncState::VerifyingLedger;
+                    // `SyncOrchestrator::run` always transitions to
+                    // `SyncState::Failed(msg)` on any phase error (any state
+                    // can transition to `Failed` — `state_machine.rs`), so
+                    // `orchestrator.state()` is never left at
+                    // `VerifyingLedger` itself by the time `run()` returns;
+                    // the only way to tell a verify-specific failure apart
+                    // from a download/import/lookback/replay one is the
+                    // error message `run_verify_ledger` produces
+                    // (`"catchpoint label mismatch: ..."` or
+                    // `"catchpoint verification failed: ..."`, both from
+                    // `crates/core/algo-ledger/src/sync/mod.rs`). Any other
+                    // failure kind is left exactly as before — no retry, no
+                    // peer-ranking change.
+                    let is_verify_failure = is_verify_failure_message(&e.to_string());
                     if is_verify_failure && attempt < MAX_VERIFY_FAILURE_RETRIES {
                         warn!(
                             catchpoint,
@@ -716,6 +742,41 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
+
+    // -----------------------------------------------------------------------
+    // is_verify_failure_message
+    // -----------------------------------------------------------------------
+
+    /// Regression pin for the classification bug live-dispatch found (PR
+    /// #1638, run 36295601322): the retry must actually fire for the real
+    /// error messages `run_verify_ledger` produces, not just an
+    /// SyncState-based check that never matches by the time `run()` returns.
+    #[test]
+    fn is_verify_failure_message_matches_label_mismatch() {
+        let msg = "ledger error: catchpoint label mismatch: expected \
+                    '65420000#JX3S4TJ3BM656U7ZF7ATZSA7M2LTIY75BNH3GXIWENDNEPG5WHFQ', computed \
+                    '65420000#5GSVZ5PS3XKT5SQHGDCRTCR3O3JYLVGPIBN7NOJN6GLDU24T6SFQ'";
+        assert!(is_verify_failure_message(msg));
+    }
+
+    #[test]
+    fn is_verify_failure_message_matches_verification_error() {
+        let msg = "ledger error: catchpoint verification failed: some inner error";
+        assert!(is_verify_failure_message(msg));
+    }
+
+    #[test]
+    fn is_verify_failure_message_rejects_other_failure_kinds() {
+        assert!(!is_verify_failure_message(
+            "ledger error: catchpoint import failed: truncated file"
+        ));
+        assert!(!is_verify_failure_message(
+            "network error: connection refused"
+        ));
+        assert!(!is_verify_failure_message(
+            "ledger error: block header digest not available — import phase did not complete"
+        ));
+    }
 
     /// A [`NormalSyncControl`] fake that counts pause/resume/reload calls
     /// and tracks whether it's currently "paused", so tests can assert the
