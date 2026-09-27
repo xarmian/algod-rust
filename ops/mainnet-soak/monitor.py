@@ -78,7 +78,33 @@ DEFAULT_HALT_MINUTES = 5.0
 # mainnet is 900s+ (15min); this leaves wide margin above that while still
 # catching a genuine deadlock inside the trie rebuild eventually, rather
 # than exempting the phase from stall detection forever.
-DEFAULT_VERIFY_HALT_MINUTES = 45.0
+#
+# Widened from 45 to 100 minutes (issue #1640, a real nightly-scheduled
+# dispatch's false-positive "stuck" report): a single verify *attempt*
+# taking ~15-20 minutes was never the whole story once two other, later
+# mechanisms started compounding within the same window --
+# (a) issue #1636's own in-process diagnostic (`verify_catchpoint`,
+#     merged in #1639/#1641) reruns the *entire* trie rebuild a second
+#     time in-process whenever the first pass's computed label mismatches,
+#     roughly doubling that attempt's wall-clock cost on its own; and
+# (b) issue #1638's defensive retry-on-verify-failure mitigation can then
+#     trigger a full second download+import+verify cycle after that.
+# A genuinely bad run (mismatch on both the primary and retried attempt,
+# which issue #1636 shows is common against a still-not-root-caused real
+# mainnet catchpoint) can therefore need import + verify + diagnostic
+# rerun + a second full cycle -- comfortably over 60 real minutes -- before
+# the node either succeeds or genuinely gives up. 100 minutes clears that
+# real-world worst case with margin while remaining safely below this
+# workflow's own 90-minute job `timeout-minutes` plus its default 60-minute
+# `duration_minutes` collection window combined is not a hard ceiling here
+# (a longer manual dispatch, as several of this issue's own live-dispatch
+# investigation rounds used, can still exceed 100 minutes and get a real
+# stuck verdict if genuinely deadlocked) -- but within the default 60-
+# minute budget, this now means "the run legitimately couldn't finish in
+# the time available" reads as `reached_tip: false` with no verdict, not a
+# misleading `stuck` classification layered on top of an already-known,
+# separately-tracked root cause (issue #1636).
+DEFAULT_VERIFY_HALT_MINUTES = 100.0
 # Grace window (issue #1623 live dispatch, run 36204923591): the
 # non-incremental verify pass has been observed to starve the node's REST
 # responder under CI-runner CPU contention badly enough that individual
