@@ -1187,6 +1187,50 @@ fn build_and_persist_trie_chunked(
         "catchpoint verify: trie rebuild pending-hashes staged"
     );
 
+    // Issue #1636 diagnostic: directly check for silent row loss during
+    // staging by comparing the staged row count against the sum of the
+    // three source tables' row counts. Logged on every run (not just on
+    // mismatch) so this data point exists regardless of outcome — one of
+    // the lower-probability hypotheses flagged in the second investigation
+    // round but never directly asserted against real data.
+    {
+        let staged_count: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {PENDING_HASHES_TABLE}"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        let accounts_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM accountbase", [], |row| row.get(0))
+            .unwrap_or(-1);
+        let resources_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM resources", [], |row| row.get(0))
+            .unwrap_or(-1);
+        let kvs_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM kvstore", [], |row| row.get(0))
+            .unwrap_or(-1);
+        let expected_total = accounts_count + resources_count + kvs_count;
+        let matches = staged_count == expected_total;
+        tracing::info!(
+            staged_count,
+            accounts_count,
+            resources_count,
+            kvs_count,
+            expected_total,
+            staged_count_matches_source_tables = matches,
+            "catchpoint verify (issue #1636 diagnostic): staged pending-hash row count vs source tables"
+        );
+        if !matches {
+            tracing::error!(
+                staged_count,
+                expected_total,
+                "catchpoint verify (issue #1636 diagnostic): STAGED ROW COUNT MISMATCH — \
+                 possible silent row loss during trie-rebuild hash staging"
+            );
+        }
+    }
+
     // Index the scratch table on `data` — mirrors go's
     // `CreateCatchpointStagingHashesIndex` ("creating the index can take
     // a while" per its own comment; same tradeoff here).
@@ -1597,6 +1641,20 @@ pub struct CatchpointVerifyResult {
     pub accounts_count: u64,
     /// Number of key-value ("box") entries found in the `kvstore` table.
     pub kvs_count: u64,
+    /// Diagnostic only (issue #1636): when the label comparison failed,
+    /// whether a *second*, independent in-process rerun of
+    /// `build_and_persist_trie_chunked` against the exact same
+    /// already-imported tables (before any rollback) reproduced the same
+    /// wrong trie root/label as the first run.
+    ///
+    /// `Some(true)` — deterministic: the second run computed the identical
+    /// (wrong) root, pointing at a bug specific to this data's actual
+    /// characteristics rather than a race/non-determinism.
+    /// `Some(false)` — non-deterministic: the two in-run recomputations
+    /// disagree, pointing at a race condition, unstable iteration order, or
+    /// a flaky read somewhere in the rebuild path.
+    /// `None` — verification succeeded, so no rerun was performed.
+    pub diagnostic_rerun_matched: Option<bool>,
 }
 
 /// A non-critical warning found during post-import validation.
@@ -1838,6 +1896,92 @@ pub fn verify_catchpoint(
     // Step 9: Compare.
     let success = computed_label == stored_label;
 
+    // Issue #1636 diagnostic: on a label mismatch, immediately rerun the
+    // trie rebuild + label reconstruction a SECOND time against the exact
+    // same already-imported (live, cut-over) tables — before any rollback
+    // happens — to determine whether the wrong hash is deterministic
+    // (same wrong answer both times, pointing at a real bug in how this
+    // data's actual characteristics are processed) or non-deterministic
+    // (different answer, pointing at a race/iteration-order/flaky-read
+    // issue). This doubles verify's cost on the failure path only, which
+    // is already about to error out and roll back, so the extra work is
+    // free in every case that matters.
+    let diagnostic_rerun_matched = if success {
+        None
+    } else {
+        tracing::warn!(
+            round,
+            %stored_label,
+            %computed_label,
+            "catchpoint verify (issue #1636 diagnostic): label mismatch detected — \
+             rerunning trie rebuild a second time against the same imported tables"
+        );
+        match build_and_persist_trie_chunked(conn) {
+            Ok(mut trie2) => match trie2.root_hash() {
+                Ok(trie_root2) => {
+                    let computed_label2 = match version {
+                        CATCHPOINT_FILE_VERSION_V6 => make_catchpoint_label_v6(
+                            round,
+                            block_header_digest,
+                            &trie_root2,
+                            &totals,
+                        ),
+                        CATCHPOINT_FILE_VERSION_V7 => make_catchpoint_label_v7(
+                            round,
+                            block_header_digest,
+                            &trie_root2,
+                            &totals,
+                            &sp_hash,
+                        ),
+                        CATCHPOINT_FILE_VERSION_V8 => make_catchpoint_label_v8(
+                            round,
+                            block_header_digest,
+                            &trie_root2,
+                            &totals,
+                            &sp_hash,
+                            &online_accts_hash,
+                            &online_round_params_hash,
+                        ),
+                        _ => computed_label.clone(),
+                    };
+                    let rerun_matched = computed_label2 == computed_label;
+                    let verdict = if rerun_matched {
+                        "DETERMINISTIC: second run reproduced the identical wrong hash"
+                    } else {
+                        "NON-DETERMINISTIC: second run computed a DIFFERENT hash than the first"
+                    };
+                    tracing::error!(
+                        round,
+                        %stored_label,
+                        first_computed_label = %computed_label,
+                        second_computed_label = %computed_label2,
+                        first_trie_root = ?trie_root,
+                        second_trie_root = ?trie_root2,
+                        rerun_matched,
+                        verdict,
+                        "catchpoint verify (issue #1636 diagnostic): second in-process rerun result"
+                    );
+                    Some(rerun_matched)
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "catchpoint verify (issue #1636 diagnostic): second rerun's root_hash() failed"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "catchpoint verify (issue #1636 diagnostic): second rerun of \
+                     build_and_persist_trie_chunked failed"
+                );
+                None
+            }
+        }
+    };
+
     Ok(CatchpointVerifyResult {
         success,
         expected_label: stored_label,
@@ -1845,6 +1989,7 @@ pub fn verify_catchpoint(
         trie_root,
         accounts_count,
         kvs_count,
+        diagnostic_rerun_matched,
     })
 }
 

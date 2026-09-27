@@ -1021,6 +1021,11 @@ impl SyncOrchestrator {
         };
 
         if !verify_result.success {
+            tracing::error!(
+                diagnostic_rerun_matched = ?verify_result.diagnostic_rerun_matched,
+                "issue #1636 diagnostic: see build_and_persist_trie_chunked's second-rerun \
+                 result above for whether this mismatch is deterministic or not"
+            );
             self.rollback_cutover_on_failure(&conn, "catchpoint label mismatch");
             return Err(AlgoError::Ledger {
                 message: format!(
