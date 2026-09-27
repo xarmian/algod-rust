@@ -1738,6 +1738,92 @@ mod tests {
     }
 
     #[test]
+    fn test_chunked_commit_evict_matches_single_pass_root_hash_at_scale_with_hash_shaped_keys() {
+        // Issue #1636: the existing chunked-vs-single-pass tests above only
+        // used strictly ascending, tightly-clustered small integers
+        // (`i.to_be_bytes()`), which share a long common byte prefix for
+        // any `n` under a few million and therefore exercise a much
+        // narrower set of trie shapes/branch depths than 36-byte elements
+        // whose low 31 bytes are a real hash (uniformly distributed, no
+        // shared prefix across elements) and whose top 5 bytes carry a
+        // small, repeating "affinity+kind" clump (real accounts/resources
+        // sharing the same UpdateRound + kind byte) — i.e. the actual key
+        // shape `build_and_persist_trie_chunked` feeds the trie from a
+        // real mainnet catchpoint's hash-sorted scratch table. Use a much
+        // larger element count (well past the 9000-node default cache
+        // target and past several `TRIE_REBUILD_COMMIT_FREQUENCY`-scale
+        // chunk boundaries at a proportionally smaller chunk size) with
+        // real SHA512-256-derived 31-byte tails, clustered into a handful
+        // of 5-byte affinity+kind prefixes, inserted in ascending
+        // (hash-sorted) order exactly like the real rebuild.
+        let n: u64 = 60_000;
+        let mut elements: Vec<[u8; 36]> = (0..n)
+            .map(|i| {
+                let mut hasher = Sha512_256::new();
+                hasher.update(i.to_be_bytes());
+                let digest = hasher.finalize();
+                let mut elem = [0u8; 36];
+                // Affinity clumped into 8 distinct values (real accounts
+                // sharing an UpdateRound), kind clumped into 2 values —
+                // both far coarser-grained than the fully-random 31-byte
+                // tail, mirroring go's actual account/resource element
+                // shape (`trie_hash.rs::finish_v6`).
+                let affinity = (i % 8) as u32;
+                elem[0..4].copy_from_slice(&affinity.to_be_bytes());
+                elem[4] = (i % 2) as u8;
+                elem[5..36].copy_from_slice(&digest[..31]);
+                elem
+            })
+            .collect();
+        elements.sort_unstable();
+        elements.dedup();
+        assert!(
+            elements.len() as u64 > n - 10,
+            "expected near-zero hash collisions at n={n}, got {} distinct",
+            elements.len()
+        );
+
+        // Reference: single uninterrupted build, no intermediate commit/evict.
+        let mut reference = MerkleTrie::new(36);
+        for e in &elements {
+            reference.add(e).unwrap();
+        }
+        let expected = reference.root_hash().unwrap();
+
+        // Chunked build: real default cache target (9000) and a chunk
+        // size proportionally similar to
+        // `TRIE_REBUILD_COMMIT_FREQUENCY`'s ratio to a mainnet-scale
+        // account count, inserted in the same ascending (hash-sorted)
+        // order the real rebuild uses.
+        let committer = InMemoryPageCommitter::new();
+        let mut trie = MerkleTrie::new(36);
+        trie.set_lazy_loader(Box::new(committer.clone()));
+        let chunk_size: u64 = 6_000;
+        for (i, e) in elements.iter().enumerate() {
+            trie.add(e).unwrap();
+            if (i as u64 + 1) % chunk_size == 0 {
+                trie.commit(&committer).unwrap();
+                trie.evict().unwrap();
+            }
+        }
+        trie.commit(&committer).unwrap();
+        let got = trie.root_hash().unwrap();
+
+        assert_eq!(
+            got, expected,
+            "chunked root hash diverged from single-pass root hash at n={n} \
+             with hash-shaped (affinity-clumped, hash-tailed) keys"
+        );
+
+        for e in &elements {
+            assert!(
+                trie.contains(e).unwrap(),
+                "element {e:?} missing after chunked build at n={n}"
+            );
+        }
+    }
+
+    #[test]
     fn test_chunked_commit_evict_matches_single_pass_with_deletes() {
         // Same property, but the chunked side also deletes and re-adds a
         // subset partway through — exercises `node_remove`'s refurbish/
