@@ -896,6 +896,27 @@ const TRIE_REBUILD_COMMIT_FREQUENCY: u64 = 65536;
 fn build_and_persist_trie_chunked(
     conn: &Connection,
 ) -> Result<crate::merkle_trie::MerkleTrie, CatchpointError> {
+    build_and_persist_trie_chunked_with_frequency(conn, TRIE_REBUILD_COMMIT_FREQUENCY)
+}
+
+/// Same as [`build_and_persist_trie_chunked`], but with the commit/evict
+/// cadence exposed as a parameter instead of hardcoded to
+/// [`TRIE_REBUILD_COMMIT_FREQUENCY`].
+///
+/// Issue #1636: this lets tests decouple "many pagination
+/// batches/commit+evict cycles" from "huge element count" — the real
+/// mainnet failure hit 1,174 batches over 76,932,430 elements, but the
+/// naive unbounded reference builder used to check correctness scales
+/// roughly quadratically in element count, making a 76M-element test
+/// impractical (~40+ hours). Using a small `commit_frequency` lets a test
+/// force 1,000+ commit/evict cycles with only a few million elements,
+/// where the reference build stays fast, directly testing whether the
+/// bug is a function of *cycle count* rather than raw scale.
+#[cfg_attr(not(test), allow(dead_code))]
+fn build_and_persist_trie_chunked_with_frequency(
+    conn: &Connection,
+    commit_frequency: u64,
+) -> Result<crate::merkle_trie::MerkleTrie, CatchpointError> {
     use crate::merkle_committer::{CommitterTable, OwnedSqliteCommitter};
     use crate::merkle_trie::MerkleTrie;
     use crate::trie_hash::{extract_raw_affinity, kv_hash_v6, HashKind, ELEMENT_SIZE};
@@ -1270,7 +1291,7 @@ fn build_and_persist_trie_chunked(
 
             let rows = stmt
                 .query_map(
-                    rusqlite::params![last_data, last_rowid, TRIE_REBUILD_COMMIT_FREQUENCY as i64],
+                    rusqlite::params![last_data, last_rowid, commit_frequency as i64],
                     |row| {
                         let rowid: i64 = row.get(0)?;
                         let data: Vec<u8> = row.get(1)?;
@@ -1300,7 +1321,7 @@ fn build_and_persist_trie_chunked(
                 trie.add(&elem)
                     .map_err(|e| CatchpointError::ImportError(format!("trie add element: {e}")))?;
                 since_last_commit += 1;
-                if since_last_commit >= TRIE_REBUILD_COMMIT_FREQUENCY {
+                if since_last_commit >= commit_frequency {
                     total_elements_added += since_last_commit;
                     commit_and_evict(&mut trie, since_last_commit, total_elements_added)?;
                     since_last_commit = 0;
@@ -3898,7 +3919,9 @@ mod tests {
         // out of 76,932,430 total (~29.23% / ~69.81% / ~0.96%).
         let n_accounts = (total_n as f64 * 0.2923) as u64;
         let n_resources = (total_n as f64 * 0.6981) as u64;
-        let n_kvs = total_n.saturating_sub(n_accounts).saturating_sub(n_resources);
+        let n_kvs = total_n
+            .saturating_sub(n_accounts)
+            .saturating_sub(n_resources);
 
         eprintln!(
             "chunked_trie_rebuild_matches_unbounded_rebuild_at_large_scale: \
@@ -3942,6 +3965,98 @@ mod tests {
             chunked_root, reference_root,
             "chunked trie root diverged from unbounded reference at large scale \
              (total_n={total_n}, accounts={n_accounts}, resources={n_resources}, kvs={n_kvs})"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #1636: decouple "many commit/evict cycles" from "huge element
+    /// count". The naive unbounded reference builder scales roughly
+    /// quadratically in element count (measured: 547s at 5,000,000
+    /// elements vs 9,659s at 20,000,000 — see
+    /// `chunked_trie_rebuild_matches_unbounded_rebuild_at_large_scale`'s
+    /// doc comment), which makes reaching the real live dispatch's 1,174
+    /// batches via raw element count alone (~76.9M elements) impractical
+    /// as a correctness-checked test (an estimated 40+ hours). But batch
+    /// *count* is controlled by `commit_frequency`, not element count —
+    /// [`build_and_persist_trie_chunked_with_frequency`] lets this test
+    /// force 1,200+ commit/evict cycles with only ~2,000,000 elements,
+    /// where the reference build stays fast (~2M is well below the 5M
+    /// point that already took 547s, so this should complete in well
+    /// under two minutes), directly testing whether the bug is a function
+    /// of *cycle count* rather than raw scale.
+    ///
+    /// `#[ignore]`d for the same reason as the large-scale test: not a
+    /// normal fast `cargo test` case, even though it's much cheaper than
+    /// the large-N variant. Run explicitly:
+    /// `cargo test --release -p algo-ledger --lib \
+    ///   catchpoint::verify::tests::chunked_trie_rebuild_matches_unbounded_rebuild_at_high_batch_count \
+    ///   -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn chunked_trie_rebuild_matches_unbounded_rebuild_at_high_batch_count() {
+        let total_n: u64 = std::env::var("ALGOD_TRIE_STRESS_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2_000_000);
+        // Small commit frequency forces many batches at low N. 1,650 was
+        // picked so 2,000,000 / 1,650 ≈ 1,212 batches — comfortably past
+        // the real live dispatch's 1,174.
+        let commit_frequency: u64 = std::env::var("ALGOD_TRIE_STRESS_FREQ")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1_650);
+
+        let n_accounts = (total_n as f64 * 0.2923) as u64;
+        let n_resources = (total_n as f64 * 0.6981) as u64;
+        let n_kvs = total_n
+            .saturating_sub(n_accounts)
+            .saturating_sub(n_resources);
+
+        eprintln!(
+            "chunked_trie_rebuild_matches_unbounded_rebuild_at_high_batch_count: \
+             total_n={total_n} accounts={n_accounts} resources={n_resources} kvs={n_kvs} \
+             commit_frequency={commit_frequency} (~{:.1} batches)",
+            total_n as f64 / commit_frequency as f64
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-verify-chunked-trie-high-batch-count-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let insert_start = std::time::Instant::now();
+        let conn = build_file_backed_trie_test_db_bulk(&dir, n_accounts, n_resources, n_kvs);
+        eprintln!(
+            "  insert phase complete in {:.1}s",
+            insert_start.elapsed().as_secs_f64()
+        );
+
+        let ref_start = std::time::Instant::now();
+        let reference_root = rebuild_trie_from_db(&conn).unwrap();
+        eprintln!(
+            "  unbounded reference build complete in {:.1}s",
+            ref_start.elapsed().as_secs_f64()
+        );
+
+        let chunked_start = std::time::Instant::now();
+        let mut chunked_trie =
+            build_and_persist_trie_chunked_with_frequency(&conn, commit_frequency).unwrap();
+        let chunked_root = chunked_trie.root_hash().unwrap();
+        eprintln!(
+            "  chunked build complete in {:.1}s",
+            chunked_start.elapsed().as_secs_f64()
+        );
+
+        eprintln!("  reference_root = {reference_root:x?}");
+        eprintln!("  chunked_root   = {chunked_root:x?}");
+
+        assert_eq!(
+            chunked_root, reference_root,
+            "chunked trie root diverged from unbounded reference at high batch count \
+             (total_n={total_n}, accounts={n_accounts}, resources={n_resources}, kvs={n_kvs}, \
+             commit_frequency={commit_frequency})"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
