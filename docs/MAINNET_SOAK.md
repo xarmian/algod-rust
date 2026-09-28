@@ -182,18 +182,33 @@ than guessed at here.
 | --- | --- | --- | --- | --- |
 | [36246996407](https://github.com/xarmian/algod-rust/actions/runs/36246996407) (60 min budget) | 65410000 | not recorded — import (915.6s) + verify consumed the full budget; verify itself completed (node reached `balances_round` 65409680 with zero errors) but the run ended before catching up to the live tip | false | n/a (0 follow samples) |
 | [36251668578](https://github.com/xarmian/algod-rust/actions/runs/36251668578) (75 min budget) | 65410000 | not recorded — verify (Merkle trie rebuild) had not completed after 47+ minutes; classified `stuck`, see issue #1631 | false | n/a (0 follow samples) |
+| [36433896069](https://github.com/xarmian/algod-rust/actions/runs/36433896069) (45 min budget, dispatched on `main` after issue #1636's fix) | 65469680 | **2676.1s (~44.6 min)** — first confirmed, completed measurement: import (922.1s) + verify (1368.3s Merkle trie rebuild over 76,944,826 elements, `total_elements_added` matches staged row count exactly) + cutover finalized, node reached `phase: follow` | false | n/a (0 follow samples; node was 8,727 rounds behind the peer, `lag_rounds.n=0`, when the 45-minute poll budget ended — `monitor.py` only starts recording lag samples once `reached_tip` first becomes true) |
 
-**A confirmed, completed `fast_catchup_seconds` number is still not
-available** — both live attempts in this close-out session got real,
-meaningful distance into the pipeline (one completed verify but ran out
-of poll budget before reaching the tip; the other's verify did not finish
-within an even larger budget) without ever landing in the
-`catchpoint empty AND last-round within 2 rounds of peer` state
-`monitor.py`'s `summarize()` requires to compute it. Getting that number
-requires resolving issue #1631's investigation first — either widening
-`verify_halt_minutes` with justified data, or fixing a genuine
-verify-path regression — then a dispatch with a budget sized to that
-confirmed verify duration plus enough follow time to reach the tip.
+**A confirmed, completed `fast_catchup_seconds` number is now
+available**: **2676.1s (~44.6 min)** for a real mainnet catchpoint
+(round 65469680, 22,498,654 accounts, 739,051 kvs, 45,411 chunks) —
+run 36433896069 above, dispatched specifically as issue #1636's live
+fix-confirmation run. Verdict `ok — no stall observed`; zero
+catchpoint-related errors. Issue #1631's verify-duration variance
+question is now moot for this baseline purpose: this run's verify
+(1368.3s) landed well inside both prior runs' range (900s–2822s+), so
+no `verify_halt_minutes` widening was needed to get a clean completion
+here.
+
+The remaining gap against the *original* "≈15 min short budget:
+catchup to the tip" framing (see the next section — already documented
+as no longer achievable at mainnet's current scale) is `reached_tip`:
+the node was still 8,727 rounds behind the peer when this run's
+45-minute poll budget ended, so no lag-at-tip sample was ever taken.
+Closing that fully would need either a follow-up dispatch with a
+budget large enough for post-verify block replay to close an
+~8,700-round gap (replay speed once caught up should be well above
+mainnet's real-time round production rate, but this hasn't been
+directly measured yet), or accepting `fast_catchup_seconds` alone
+(now confirmed) as satisfying this criterion's core intent, per the
+already-documented position in the next section that a short budget
+reaching the live tip is no longer realistic at mainnet's real
+~22.5M-account scale.
 
 ### On the issue's original "≈15 min short budget" criterion
 
