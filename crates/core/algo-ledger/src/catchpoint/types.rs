@@ -56,9 +56,24 @@ use algo_types::AccountData;
 /// Re-encode a decoded msgpack value back into its raw byte form.
 ///
 /// `Value::Binary` is treated as an already-unwrapped raw blob (the `bin`
-/// shape described above); every other value is re-encoded. `rmpv` preserves
-/// map entry order and the str/bin distinction, and writes integers in their
-/// shortest form.
+/// shape described above); every other value is re-encoded via
+/// [`write_value_str_preserving`], which mirrors `rmpv::encode::write_value`
+/// but fixes issue #1636's root cause (see that function's doc comment):
+/// `rmpv::encode::write_value`'s own handling of `Value::String` silently
+/// downgrades a msgpack `str` whose bytes aren't valid UTF-8 to a `bin` on
+/// re-encode, changing the wire *type marker* byte (`str8`/`0xd9` ->
+/// `bin8`/`0xc4`, etc.) even though the payload bytes are unchanged. Since
+/// Algorand app local-state and box keys are arbitrary smart-contract-chosen
+/// bytes with no UTF-8 guarantee, and go-algorand's own encoder always uses
+/// the `str` marker for Go `string`-typed fields regardless of UTF-8
+/// validity, this previously corrupted the raw bytes fed into
+/// `ResourcesHashBuilderV6`'s SHA512/256 for any resource containing such a
+/// key — silently, deterministically, and only for the ~1-2% of real
+/// mainnet resources whose encoded blob happens to contain a non-UTF8-safe
+/// string somewhere in it (see the `write_value_str_preserving` doc comment
+/// and issue #1636's seventh investigation round for the byte-level
+/// evidence that pinned this down against go-algorand's own reference
+/// implementation on identical real mainnet catchpoint bytes).
 ///
 /// **Caveat:** the embedded-map path is byte-exact only for *canonically*
 /// encoded input — i.e. integers already in shortest form. go-codec (and this
@@ -73,10 +88,77 @@ fn msgp_raw_bytes<E: serde::de::Error>(value: rmpv::Value) -> Result<Vec<u8>, E>
         rmpv::Value::Nil => Ok(Vec::new()),
         other => {
             let mut buf = Vec::new();
-            rmpv::encode::write_value(&mut buf, &other)
+            write_value_str_preserving(&mut buf, &other)
                 .map_err(|e| E::custom(format!("re-encode msgp.Raw field: {e}")))?;
             Ok(buf)
         }
+    }
+}
+
+/// Write the msgpack `str` length-marker + raw bytes for a string field,
+/// unconditionally (regardless of whether `bytes` happens to be valid
+/// UTF-8) — matching go-algorand's own msgpack encoder, which never
+/// validates a Go `string`'s bytes before writing it with a `str` type
+/// marker. This mirrors `rmp::encode::write_str_len` + raw payload but is
+/// hand-rolled here (msgpack's `str` format family is small and stable) to
+/// avoid adding `rmp` as a direct dependency solely for this one helper.
+pub(crate) fn write_str_marker_and_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
+    let len = bytes.len();
+    if len < 32 {
+        buf.push(0xa0 | (len as u8));
+    } else if len < 256 {
+        buf.push(0xd9);
+        buf.push(len as u8);
+    } else if len < 65536 {
+        buf.push(0xda);
+        buf.extend_from_slice(&(len as u16).to_be_bytes());
+    } else {
+        buf.push(0xdb);
+        buf.extend_from_slice(&(len as u32).to_be_bytes());
+    }
+    buf.extend_from_slice(bytes);
+}
+
+/// Re-encode an `rmpv::Value` to its msgpack bytes, recursing into
+/// `Array`/`Map` (whose entries may themselves contain a `String`), but with
+/// one deliberate deviation from `rmpv::encode::write_value`: a
+/// [`rmpv::Value::String`] is **always** written using the `str` type
+/// marker with its raw bytes (via [`write_str_marker_and_bytes`]), even when
+/// those bytes aren't valid UTF-8.
+///
+/// `rmpv::encode::write_value` (see `rmpv-1.3.1/src/encode/value.rs`)
+/// writes `Value::String(Utf8String { s: Err(err) })` — i.e. a decoded
+/// `str` whose bytes failed UTF-8 validation — as a `bin` instead of a
+/// `str`, changing the wire type-marker byte from what go-algorand's own
+/// encoder actually wrote (go never validates a Go `string`'s bytes before
+/// encoding, so it always emits `str`, valid UTF-8 or not). Every other
+/// `rmpv::Value` variant delegates straight to `rmpv::encode::write_value`,
+/// which has no equivalent hazard for them.
+pub(crate) fn write_value_str_preserving(
+    buf: &mut Vec<u8>,
+    value: &rmpv::Value,
+) -> Result<(), rmpv::encode::Error> {
+    match value {
+        rmpv::Value::String(s) => {
+            write_str_marker_and_bytes(buf, s.as_bytes());
+            Ok(())
+        }
+        rmpv::Value::Array(items) => {
+            rmp::encode::write_array_len(buf, items.len() as u32)?;
+            for item in items {
+                write_value_str_preserving(buf, item)?;
+            }
+            Ok(())
+        }
+        rmpv::Value::Map(entries) => {
+            rmp::encode::write_map_len(buf, entries.len() as u32)?;
+            for (k, v) in entries {
+                write_value_str_preserving(buf, k)?;
+                write_value_str_preserving(buf, v)?;
+            }
+            Ok(())
+        }
+        other => rmpv::encode::write_value(buf, other),
     }
 }
 
@@ -779,6 +861,115 @@ mod tests {
         let mut buf = Vec::new();
         rmpv::encode::write_value(&mut buf, &val).expect("encode");
         buf
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #1636 (seventh investigation round): `msgp.Raw` embedded-map
+    // re-encoding must preserve a `str` type marker even for non-UTF8
+    // bytes, not silently rewrite it to `bin`.
+    // -----------------------------------------------------------------
+    //
+    // Root cause, pinned down against go-algorand's own reference
+    // implementation on identical real mainnet catchpoint bytes (round
+    // 65440000): a real resource's raw encoded blob contained a local-state
+    // key that was not valid UTF-8 (Algorand app local-state/box keys are
+    // arbitrary smart-contract-chosen bytes with no UTF-8 guarantee).
+    // go-algorand's encoder always writes a Go `string` field using the
+    // msgpack `str` type marker, valid UTF-8 or not. `rmpv::encode::write_value`
+    // (`rmpv-1.3.1/src/encode/value.rs`), used by the old `msgp_raw_bytes`
+    // to re-encode a decoded `rmpv::Value::String` whose bytes fail UTF-8
+    // validation, rewrites it as a `bin` instead — changing only the
+    // wire *type marker* byte (`str8`/`0xd9` -> `bin8`/`0xc4`, etc.), with
+    // the payload bytes otherwise identical. That single-byte type-marker
+    // change altered the raw bytes fed into `ResourcesHashBuilderV6`'s
+    // SHA512/256, corrupting that resource's trie element and, through it,
+    // the whole catchpoint trie root/label — deterministically, for any
+    // resource whose blob contains a non-UTF8-safe string anywhere in it
+    // (observed on real mainnet data: ~875K of 53.7M resources, ~236K
+    // distinct app/asset IDs, overwhelmingly app local-state).
+
+    /// Manually build raw msgpack bytes for a 1-entry fixmap
+    /// `{"k": <str8-or-shorter marker><raw bytes>}`, choosing the shortest
+    /// `str` length form exactly as go's encoder would (fixstr for <32
+    /// bytes, str8 for <256), regardless of whether `payload` is valid
+    /// UTF-8. This is what a real go-algorand-encoded blob looks like for a
+    /// string field holding non-UTF8-safe bytes — `payload` is never
+    /// interpreted, only its length matters for marker selection.
+    fn encode_map_with_raw_str_value(key: &str, payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // fixmap with 1 entry.
+        buf.push(0x80 | 1u8);
+        write_str_marker_and_bytes(&mut buf, key.as_bytes());
+        write_str_marker_and_bytes(&mut buf, payload);
+        buf
+    }
+
+    #[test]
+    fn msgp_raw_bytes_preserves_str_marker_for_invalid_utf8_payload() {
+        // A real Algorand local-state/box key with invalid UTF-8 bytes
+        // (0xFF/0xFE are never valid UTF-8 lead bytes).
+        // 0xFF and 0xFE are never valid UTF-8 lead bytes.
+        let invalid_utf8_key: &[u8] = &[0xFF, 0xFE, 0x00, 0x01, 0x02];
+
+        let original_bytes = encode_map_with_raw_str_value("v", invalid_utf8_key);
+        // Sanity: the hand-built bytes really do use a `str` marker for the
+        // 5-byte invalid-UTF8 payload (fixstr, since 5 < 32): 0xa5.
+        assert_eq!(
+            original_bytes[original_bytes.len() - 6],
+            0xa0 | 5u8,
+            "test fixture must itself use a str (not bin) marker"
+        );
+
+        let decoded: rmpv::Value =
+            rmpv::decode::read_value(&mut &original_bytes[..]).expect("decode as rmpv");
+        let re_encoded = msgp_raw_bytes::<rmp_serde::decode::Error>(decoded).expect("re-encode");
+
+        assert_eq!(
+            re_encoded, original_bytes,
+            "re-encoding a msgpack map containing a non-UTF8 `str` field must reproduce the \
+             exact original bytes (including the `str` type-marker byte), not silently \
+             rewrite it to `bin` — issue #1636"
+        );
+    }
+
+    #[test]
+    fn msgp_raw_bytes_preserves_str_marker_for_valid_utf8_payload() {
+        // Non-regression: the common (valid UTF-8) case must still work
+        // exactly as before.
+        let original_bytes = encode_map_with_raw_str_value("v", b"hello");
+        let decoded: rmpv::Value =
+            rmpv::decode::read_value(&mut &original_bytes[..]).expect("decode as rmpv");
+        let re_encoded = msgp_raw_bytes::<rmp_serde::decode::Error>(decoded).expect("re-encode");
+        assert_eq!(re_encoded, original_bytes);
+    }
+
+    #[test]
+    fn msgp_raw_bytes_preserves_str_marker_nested_in_array_and_map() {
+        // The bug's fix (`write_value_str_preserving`) must recurse into
+        // Array/Map, not just handle a top-level String — hand-build raw
+        // msgpack bytes shaped like a real nested resource blob: a map
+        // whose value is a 1-element array containing a map with a
+        // non-UTF8 string value, matching how a real go-algorand-encoded
+        // ResourcesData's nested TealKeyValue-style structures look.
+        let invalid_utf8: &[u8] = &[0xC0, 0xC1, 0xF5, 0xFF];
+        let mut original_bytes = Vec::new();
+        original_bytes.push(0x80 | 1u8); // outer fixmap, 1 entry
+        write_str_marker_and_bytes(&mut original_bytes, b"outer");
+        original_bytes.push(0x90 | 1u8); // fixarray, 1 element
+        original_bytes.push(0x80 | 1u8); // inner fixmap, 1 entry
+        write_str_marker_and_bytes(&mut original_bytes, b"k");
+        write_str_marker_and_bytes(&mut original_bytes, invalid_utf8);
+
+        let decoded: rmpv::Value =
+            rmpv::decode::read_value(&mut &original_bytes[..]).expect("decode as rmpv");
+        let mut re_encoded = Vec::new();
+        write_value_str_preserving(&mut re_encoded, &decoded).expect("re-encode");
+
+        assert_eq!(
+            re_encoded, original_bytes,
+            "nested non-UTF8 string inside an array-within-a-map must survive a \
+             decode -> re-encode round trip byte-for-byte"
+        );
     }
 
     #[test]

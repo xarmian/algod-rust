@@ -1066,6 +1066,29 @@ fn build_and_persist_trie_chunked(
         CatchpointError::ImportError(format!("create trie-rebuild pending-hashes table: {e}"))
     })?;
 
+    // Issue #1636 (seventh investigation round): optional raw per-element
+    // hash+locator dump for cross-implementation bisection against
+    // go-algorand's own real reference hash computation
+    // (`AccountHashBuilderV6`/`ResourcesHashBuilderV6`/`KvHashBuilderV6`),
+    // gated behind an env var so it costs nothing on the normal path. Each
+    // line is `<72-hex-char 36-byte element> <locator>\n`, using a locator
+    // format matched by the equivalent temporary go-algorand instrumentation
+    // (`A <addr_hex>` for accounts, `R <addr_hex>:<aidx>` for resources,
+    // `K <key_hex>` for kv/box entries) so a divergent hash value found by
+    // sorting-and-diffing both sides' dumps can be traced straight back to
+    // its source record without any further lookup.
+    let mut hash_dump: Option<std::io::BufWriter<std::fs::File>> =
+        std::env::var_os("ALGOD_CATCHPOINT_DUMP_HASHES")
+            .map(|path| -> Result<_, CatchpointError> {
+                let f = std::fs::File::create(&path).map_err(|e| {
+                    CatchpointError::ImportError(format!(
+                        "open ALGOD_CATCHPOINT_DUMP_HASHES file: {e}"
+                    ))
+                })?;
+                Ok(std::io::BufWriter::with_capacity(8 * 1024 * 1024, f))
+            })
+            .transpose()?;
+
     // Pass 1: compute every element's raw hash bytes and stage them,
     // wrapped in one transaction (a straight bulk INSERT — no trie
     // activity happens during this pass, so there is no periodic-commit
@@ -1119,6 +1142,12 @@ fn build_and_persist_trie_chunked(
                     &mut affinity_tracker,
                 );
                 let elem = raw_account_element(&addr, &data, affinity);
+                if let Some(w) = hash_dump.as_mut() {
+                    use std::io::Write;
+                    writeln!(w, "{} A {}", hex::encode(elem), hex::encode(addr)).map_err(|e| {
+                        CatchpointError::ImportError(format!("hash dump write: {e}"))
+                    })?;
+                }
                 insert_stmt
                     .execute(rusqlite::params![elem.as_slice()])
                     .map_err(|e| {
@@ -1189,6 +1218,12 @@ fn build_and_persist_trie_chunked(
                     HashKind::Asset as u8
                 };
                 let elem = raw_resource_element(&addr, aidx as u64, &rdata, affinity, kind);
+                if let Some(w) = hash_dump.as_mut() {
+                    use std::io::Write;
+                    writeln!(w, "{} R {}:{}", hex::encode(elem), hex::encode(addr), aidx).map_err(
+                        |e| CatchpointError::ImportError(format!("hash dump write: {e}")),
+                    )?;
+                }
                 insert_stmt
                     .execute(rusqlite::params![elem.as_slice()])
                     .map_err(|e| {
@@ -1217,10 +1252,21 @@ fn build_and_persist_trie_chunked(
                 let (key, value) = row
                     .map_err(|e| CatchpointError::ImportError(format!("read kvstore row: {e}")))?;
                 let elem = kv_hash_v6(&key, &value);
+                if let Some(w) = hash_dump.as_mut() {
+                    use std::io::Write;
+                    writeln!(w, "{} K {}", hex::encode(elem), hex::encode(&key)).map_err(|e| {
+                        CatchpointError::ImportError(format!("hash dump write: {e}"))
+                    })?;
+                }
                 insert_stmt
                     .execute(rusqlite::params![elem.as_slice()])
                     .map_err(|e| CatchpointError::ImportError(format!("stage kv hash: {e}")))?;
             }
+        }
+        if let Some(w) = hash_dump.as_mut() {
+            use std::io::Write;
+            w.flush()
+                .map_err(|e| CatchpointError::ImportError(format!("hash dump flush: {e}")))?;
         }
         Ok(())
     })();
