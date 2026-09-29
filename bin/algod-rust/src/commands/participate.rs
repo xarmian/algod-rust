@@ -4865,6 +4865,16 @@ pub async fn run(
             .with_batch_verifier(batch_verifier.clone())
             .with_remember_counter(tx_pool_remember_counter.clone())
             .with_check_counter(tx_pool_check_counter.clone())
+            // Issue #1645: deliberately does NOT call
+            // `.with_strict_canonical_reencode_check()` here -- go's
+            // WS-gossip entry point (`processIncomingTxn`) never performs
+            // the non-canonical-raw-encoding disconnect check (only the
+            // P2P/libp2p entry point, `validateIncomingTxMessage`, does).
+            // See `TxTagHandler::with_strict_canonical_reencode_check`'s
+            // doc comment for the live mainnet-soak evidence this split
+            // is based on, and the P2P handler registration below (which
+            // does opt in) for the other side of the split.
+            //
             // Phase 17 network-parity deep pass (`TestLineNetwork` row,
             // `docs/phase17/parity_network.md`): relay an inbound gossip
             // group to this node's *other* WS-gossip peers (excluding the
@@ -5104,6 +5114,16 @@ pub async fn run(
                 .with_batch_verifier(batch_verifier.clone())
                 .with_remember_counter(tx_pool_remember_counter.clone())
                 .with_check_counter(tx_pool_check_counter.clone())
+                // Issue #1645: the non-canonical-raw-encoding disconnect
+                // gate mirrors go's `validateIncomingTxMessage`, which is
+                // wired into the P2P/libp2p entry point *only* -- go's
+                // WS-gossip entry point (`processIncomingTxn`) never
+                // performs it. Only this P2P-transport handler opts in;
+                // the WS-gossip handler below leaves it at its
+                // default-off state. See `with_strict_canonical_reencode_check`'s
+                // doc comment for the live mainnet-soak evidence that
+                // motivated this split.
+                .with_strict_canonical_reencode_check()
                 // Same relay wiring as the WS-gossip handler above, over
                 // the P2P transport's own `GossipNode` impl (which fans a
                 // relayed `TX` message out over gossipsub, go's real P2P
