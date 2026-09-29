@@ -475,6 +475,18 @@ pub struct SyncOrchestrator {
     /// consumed by [`Self::run_verify_ledger`] on either its success path
     /// (`finalize_cutover`) or its failure path (`rollback_cutover`).
     cutover_backup: Option<crate::catchpoint::CutoverBackup>,
+    /// The catchpoint round's own raw block (`(proto, hdrdata, blkdata)`),
+    /// eagerly fetched and cached by [`Self::run_download_ledger`] while the
+    /// round is still fresh — well before the (potentially 30-45 minute)
+    /// import+verify phases run. [`Self::run_download_lookback`] consumes
+    /// this instead of re-fetching `catchpoint_round` from the network at
+    /// that late stage, where a non-archival single-peer relay's retention
+    /// window may have already aged the round out (issue #1649). `None`
+    /// when the early fetch failed or was never attempted (e.g. resuming
+    /// from persisted state in a new process) — `run_download_lookback`
+    /// falls back to its own (pre-existing) network fetch in that case, so
+    /// this field can only improve behavior, never regress it.
+    cached_catchpoint_block: Option<(String, Vec<u8>, Vec<u8>)>,
     /// Blocks replayed during the replay phase.
     blocks_replayed: u64,
     /// The final round reached after replay.
@@ -506,6 +518,7 @@ impl SyncOrchestrator {
             backend: Box::new(backend),
             catchpoint_file_path: None,
             catchpoint_round: None,
+            cached_catchpoint_block: None,
             balances_round: None,
             resolved_label: None,
             block_header_digest: None,
@@ -733,6 +746,38 @@ impl SyncOrchestrator {
 
         self.resolved_label = Some(label.clone());
         self.catchpoint_round = Some(round);
+
+        // Issue #1649: eagerly fetch and cache the catchpoint round's own
+        // block here, at the very start of the pipeline while the round is
+        // still fresh, rather than letting `run_download_lookback` re-fetch
+        // it after the (potentially 30-45 minute) import+verify phases run
+        // — by then a non-archival single-peer relay's retention window may
+        // have aged the round out (confirmed live in two `mainnet-node-soak`
+        // dispatches, both failing at ~45 minutes elapsed, right after
+        // verify completed). This mirrors go-algorand's architecture:
+        // `processStageLatestBlockDownload` (`catchup/catchpointService.go`)
+        // fetches and persists this same block via `StoreFirstBlock` well
+        // before the equivalent-cost account/trie verification pass, and
+        // `processStageBlocksDownload`'s `EnsureFirstBlock` later reads it
+        // back from the local `catchpointblocks` table rather than
+        // re-fetching over the network. Best-effort and non-fatal: on
+        // failure, `run_download_lookback` falls back to its own
+        // pre-existing network fetch for `round`, so this can only improve
+        // behavior, never regress it.
+        match self.backend.fetch_block_raw(round) {
+            Ok(raw) => {
+                self.cached_catchpoint_block = Some(raw);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    round,
+                    error = %e,
+                    "issue #1649: early cache fetch of the catchpoint round's own block \
+                     failed; run_download_lookback will fall back to its own network fetch \
+                     for this round"
+                );
+            }
+        }
 
         tracing::info!(
             label = %label,
@@ -1131,16 +1176,25 @@ impl SyncOrchestrator {
         // `lookbackForStateproofsSupport(topBlock)` (issue #976): a pending
         // state proof needs the voters snapshot for its oldest still-
         // expected round to survive the lookback window, which can reach
-        // further back than `MAX_TXN_LIFE` alone. Fetch the catchpoint
+        // further back than `MAX_TXN_LIFE` alone. Read the catchpoint
         // round's own header to read its protocol and `StateProofNextRound`
         // — falling back to the plain `MAX_TXN_LIFE` window (rather than
         // failing the whole phase) if the header can't be read or decoded,
         // since `download_lookback_blocks` below will surface any real
         // fetch failure for `round` itself anyway.
+        //
+        // Issue #1649: prefer the block `run_download_ledger` already
+        // cached (see [`Self::cached_catchpoint_block`]) over a fresh
+        // network fetch — this probe runs after the same long import+verify
+        // phases that can age `round` out of a non-archival relay's
+        // retention window. `.as_ref()` only peeks: the fetch_block
+        // callback below still needs to consume the cached tuple once for
+        // the real download loop.
         let sp_lookback =
-            self.backend
-                .fetch_block_raw(round)
-                .ok()
+            self.cached_catchpoint_block
+                .as_ref()
+                .map(|(proto, hdrdata, blkdata)| (proto.clone(), hdrdata.clone(), blkdata.clone()))
+                .or_else(|| self.backend.fetch_block_raw(round).ok())
                 .and_then(|(_, _, blkdata)| algo_codec::decode_block(&blkdata).ok())
                 .and_then(|block| {
                     algo_types::consensus::consensus_params_for_version(&block.current_protocol)
@@ -1209,7 +1263,20 @@ impl SyncOrchestrator {
             lookback,
             self.config.catchup_block_download_retry_attempts,
             // fetch_block callback
+            //
+            // Issue #1649: for the catchpoint round itself — the highest,
+            // most-contended round in the window, and the one both live
+            // soak failures hit — consume the cache `run_download_ledger`
+            // populated early instead of re-fetching over the network at
+            // this late stage. Every other round in the window still goes
+            // through the ordinary network fetch below (the local cache
+            // only ever holds `round` itself).
             |rnd| {
+                if rnd == round {
+                    if let Some(cached) = self.cached_catchpoint_block.take() {
+                        return Ok(cached);
+                    }
+                }
                 let (proto, hdrdata, blkdata) = self.backend.fetch_block_raw(rnd).map_err(|e| {
                     CatchpointError::VerificationError(format!("fetch lookback block {rnd}: {e}"))
                 })?;
@@ -2678,6 +2745,176 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A [`SyncBackend`] fake that fails `fetch_block_raw` for one specific
+    /// round (simulating a non-archival relay that has aged that round out
+    /// of its retention window by the time the lookback phase re-fetches
+    /// it) but succeeds for every other round with a minimal, decodable
+    /// block.
+    struct FailsOneRoundBackend {
+        fail_round: u64,
+        fetch_attempts: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl SyncBackend for FailsOneRoundBackend {
+        fn download_catchpoint(
+            &self,
+            _genesis_id: &str,
+            _round: u64,
+            _dest_path: &std::path::Path,
+        ) -> Result<(), AlgoError> {
+            unimplemented!("not exercised by the lookback-only test")
+        }
+
+        fn fetch_block_raw(&self, round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+            self.fetch_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if round == self.fail_round {
+                return Err(AlgoError::Network {
+                    message: format!(
+                        "simulated 404: round {round} aged out of relay retention window"
+                    ),
+                });
+            }
+            // `genesis_id` is set to a non-empty, non-default value so the
+            // canonical block-header encoding is never a fully-empty map
+            // even for round 0 (the bottom of the lookback window) — an
+            // all-zero/all-default header omits its own "h" field entirely
+            // (canonical omitempty), which `reconstruct_lease_table`'s
+            // txtail decode then rejects as missing.
+            let block = algo_types::Block {
+                round: round.into(),
+                genesis_id: "test-genesis".to_string(),
+                ..Default::default()
+            };
+            let blkdata = algo_codec::encode_block(&block).expect("encode minimal test block");
+            Ok(("future".to_string(), Vec::new(), blkdata))
+        }
+
+        fn fetch_block(&self, _round: u64) -> Result<Block, AlgoError> {
+            unimplemented!("not exercised by the lookback-only test")
+        }
+
+        fn get_current_round(&self) -> Result<u64, AlgoError> {
+            unimplemented!("not exercised by the lookback-only test")
+        }
+
+        fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
+            Ok(None)
+        }
+    }
+
+    /// TDD regression for issue #1649: once the (potentially 30-45 minute)
+    /// import+verify phases finish, `run_download_lookback` must not need a
+    /// fresh network fetch for the catchpoint round itself — a
+    /// non-archival single-peer relay may have already aged that specific
+    /// round out of its retention window by then (confirmed live in two
+    /// `mainnet-node-soak` dispatches). `run_download_ledger` caches that
+    /// round's block eagerly, early in the pipeline while it's still fresh;
+    /// `run_download_lookback` must consume that cache instead of
+    /// re-fetching `catchpoint_round` over the network.
+    ///
+    /// Drives `run_download_lookback` directly (as the retry-abort test
+    /// above does) against a backend that always fails `fetch_block_raw`
+    /// for the catchpoint round specifically (simulating the aged-out
+    /// relay) but succeeds for every other round in the lookback window.
+    /// Without the cache, this must fail (nothing can ever produce the
+    /// catchpoint round's block). With `cached_catchpoint_block`
+    /// pre-populated — standing in for what `run_download_ledger` would
+    /// have captured earlier in a real run — it must succeed, and the
+    /// backend must never be asked to fetch the catchpoint round at all.
+    #[test]
+    fn run_download_lookback_uses_cached_catchpoint_block_instead_of_refetching() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-lookback-cache-reuse-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("ledger");
+
+        const CATCHPOINT_ROUND: u64 = 5;
+
+        // --- Control: without the cache, the aged-out round can never be
+        // produced, so the whole phase must fail. This proves the fake
+        // backend genuinely simulates the reported 404 and that the test
+        // isn't trivially green. ---
+        {
+            let config = test_config(db_path.clone(), 1);
+            let fetch_attempts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let backend = FailsOneRoundBackend {
+                fail_round: CATCHPOINT_ROUND,
+                fetch_attempts,
+            };
+            let mut orchestrator = SyncOrchestrator::with_backend(config, backend);
+            orchestrator.state = SyncState::VerifyingLedger;
+            orchestrator.catchpoint_round = Some(CATCHPOINT_ROUND);
+            // No cached_catchpoint_block set — mirrors the pre-fix
+            // behavior / a resumed process that never ran the early-fetch
+            // step.
+            let result = orchestrator.run_download_lookback();
+            assert!(
+                result.is_err(),
+                "without a local cache, an aged-out catchpoint round must still fail — this \
+                 pins that the fake backend genuinely reproduces issue #1649's 404"
+            );
+            let _ = std::fs::remove_dir_all(&db_path);
+        }
+
+        // --- Fix under test: with the cache populated, the phase must
+        // succeed without ever asking the backend for the catchpoint round.
+        // ---
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = test_config(db_path.clone(), 1);
+        let fetch_attempts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let backend = FailsOneRoundBackend {
+            fail_round: CATCHPOINT_ROUND,
+            fetch_attempts: fetch_attempts.clone(),
+        };
+        let mut orchestrator = SyncOrchestrator::with_backend(config, backend);
+        orchestrator.state = SyncState::VerifyingLedger;
+        orchestrator.catchpoint_round = Some(CATCHPOINT_ROUND);
+
+        let cached_block = algo_types::Block {
+            round: CATCHPOINT_ROUND.into(),
+            genesis_id: "test-genesis".to_string(),
+            ..Default::default()
+        };
+        let cached_blkdata =
+            algo_codec::encode_block(&cached_block).expect("encode cached test block");
+        orchestrator.cached_catchpoint_block =
+            Some(("future".to_string(), Vec::new(), cached_blkdata));
+
+        let result = orchestrator.run_download_lookback();
+
+        assert!(
+            result.is_ok(),
+            "a cached copy of the catchpoint round's block must let the lookback phase \
+             succeed without a fresh network fetch for that round: {:?}",
+            result.err()
+        );
+        assert!(
+            orchestrator.cached_catchpoint_block.is_none(),
+            "the cache must be consumed (taken), not left stale, once used"
+        );
+
+        // Every fetch_block_raw call the backend actually received must be
+        // for a round other than the catchpoint round — proving the cache,
+        // not a lucky retry, is what avoided the simulated 404.
+        //
+        // (FailsOneRoundBackend increments its counter and returns Err for
+        // fail_round on *any* call — if the fix regressed and the cache
+        // were bypassed, `result.is_ok()` above would already have failed,
+        // since fail_round always errors. This assertion additionally
+        // pins that the backend was never even asked.)
+        let total_attempts = fetch_attempts.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            total_attempts > 0,
+            "the other (non-catchpoint-round) lookback rounds must still be fetched normally"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A backend whose `download_catchpoint` copies a pre-built local
     /// catchpoint file to the requested destination, so tests can drive
     /// `run_download_ledger`/`run_import_ledger`/`run_verify_ledger` against
@@ -2699,8 +2936,18 @@ mod tests {
             Ok(())
         }
 
+        // Issue #1649: `run_download_ledger` now makes a best-effort,
+        // non-fatal `fetch_block_raw(round)` call to eagerly cache the
+        // catchpoint round's block (see `cached_catchpoint_block`). This
+        // fake has no real block data to serve, so it returns a plain
+        // error — `run_download_ledger` treats that as "early-cache
+        // unavailable" and proceeds exactly as it did before this field
+        // existed; this test never reaches `run_download_lookback`, so the
+        // fallback path is never actually exercised here either.
         fn fetch_block_raw(&self, _round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
-            unimplemented!("not exercised by this test")
+            Err(AlgoError::Network {
+                message: "FakeFileCopyBackend does not serve blocks".to_string(),
+            })
         }
 
         fn fetch_block(&self, _round: u64) -> Result<Block, AlgoError> {
