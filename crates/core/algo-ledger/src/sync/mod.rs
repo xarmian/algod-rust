@@ -39,7 +39,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use algo_error::AlgoError;
-use algo_types::Block;
+use algo_types::{Block, BlockHeader};
 use rusqlite::Connection;
 use tokio_util::sync::CancellationToken;
 
@@ -944,85 +944,16 @@ impl SyncOrchestrator {
             "chain meta initialized from catchpoint"
         );
 
-        // Issue #1650: fast-forward `acctrounds` (and store the matching
-        // header row) to `catchpoint_round` right here, immediately after
-        // cutover, instead of waiting for `run_replay_blocks` (phase 5) to
-        // do it once `run_download_lookback` (phase 4) has *also*
-        // succeeded. `initialize_meta_from_catchpoint` just stamped
-        // `acctrounds('acctbase')` with `round` (`balances_round`), which
-        // is `catchpoint_round`-equivalent account data but a lower round
-        // number (issue #1463's own comment on the phase-5 fast-forward
-        // below explains why). Phase 4 exists purely to backfill ~320
-        // additional blocks for lease reconstruction over the network —
-        // exactly the kind of fragile, retriable, retention-window-bound
-        // operation that can fail on a non-archival single-peer relay
-        // (confirmed live: issue #1650, "failed to fetch lookback block at
-        // round <catchpoint_round> after 1000 retries: ... 404", *after*
-        // cutover had already completed and finalized). Previously, a
-        // failure there left `acctrounds` pinned at `balances_round`
-        // forever — `derive_chain_meta_from_latest_block` (and therefore
-        // every reopen of this ledger, including `reload_ledger` in the
-        // live participate node) then reported the ledger as being back at
-        // `balances_round` (observed as `latest_round=0`) even though the
-        // account state was already fully, correctly cut over to
-        // `catchpoint_round`. Doing the fast-forward here — using the
-        // block `run_download_ledger` (phase 1) already cached — makes
-        // cutover leave the ledger self-consistent (round-tracker and its
-        // own header row land together) independent of whether the
-        // lease-reconstruction phase that follows ever completes. This is
-        // purely additive: `run_replay_blocks`'s own fast-forward (below)
-        // still runs afterward and is now normally a no-op (its `current <
-        // catchpoint_round` guard already makes it safe either way).
-        if let Some(catchpoint_round) = self.catchpoint_round {
-            if catchpoint_round > round {
-                match self.cached_catchpoint_block.clone() {
-                    Some((cp_proto, cp_hdrdata, cp_blkdata)) => {
-                        conn.execute(
-                            "INSERT OR REPLACE INTO blockdb.blocks \
-                             (rnd, proto, hdrdata, blkdata) VALUES (?1, ?2, ?3, ?4)",
-                            rusqlite::params![
-                                catchpoint_round as i64,
-                                cp_proto,
-                                cp_hdrdata,
-                                cp_blkdata
-                            ],
-                        )
-                        .map_err(|e| AlgoError::Ledger {
-                            message: format!(
-                                "store catchpoint round header immediately after cutover: {e}"
-                            ),
-                        })?;
-                        conn.execute(
-                            "UPDATE acctrounds SET rnd = ?1 WHERE id IN ('acctbase', 'hashbase')",
-                            rusqlite::params![catchpoint_round as i64],
-                        )
-                        .map_err(|e| AlgoError::Ledger {
-                            message: format!(
-                                "fast-forward acctrounds to catchpoint_round immediately after \
-                                 cutover: {e}"
-                            ),
-                        })?;
-                        tracing::info!(
-                            from = round,
-                            to = catchpoint_round,
-                            "fast-forwarded acctrounds to catchpoint_round immediately after \
-                             cutover (issue #1650), independent of the lookback/replay phases \
-                             that follow"
-                        );
-                    }
-                    None => {
-                        tracing::warn!(
-                            catchpoint_round,
-                            balances_round = round,
-                            "issue #1650: no cached catchpoint-round block available to \
-                             fast-forward acctrounds immediately after cutover; the ledger \
-                             stays at balances_round until run_replay_blocks's later \
-                             fast-forward runs (requires run_download_lookback to succeed first)"
-                        );
-                    }
-                }
-            }
-        }
+        // Note: the acctrounds/header fast-forward to `catchpoint_round`
+        // (issue #1650) happens in `run_verify_ledger`, *after* verification
+        // succeeds — not here. `verify_catchpoint` requires
+        // `acctrounds('acctbase') == balances_round` (the value just
+        // stamped above) to still hold at verify time; fast-forwarding it
+        // here would make every catchpoint whose `blocks_round` differs
+        // from `balances_round` (i.e. every real-world catchpoint above the
+        // `CatchpointLookback` floor) fail verification outright with
+        // "acctrounds mismatch". See `run_verify_ledger`'s own comment for
+        // the full rationale.
 
         // Persist state.
         if let Err(e) = persist_sync_state(
@@ -1248,6 +1179,139 @@ impl SyncOrchestrator {
                     category = %w.category,
                     message = %w.message,
                     "post-import validation warning"
+                );
+            }
+        }
+
+        // Issue #1650: fast-forward `acctrounds` (and store a matching
+        // header row) to `catchpoint_round` right here, now that
+        // verification has succeeded — instead of waiting for
+        // `run_replay_blocks` (phase 5) to do it once `run_download_lookback`
+        // (phase 4) has *also* succeeded. `verify_catchpoint` above required
+        // `acctrounds('acctbase') == balances_round`, so this must run
+        // *after* it, not in `run_import_ledger` (see that function's own
+        // comment on this — moving it earlier broke that check for every
+        // real-world catchpoint above the `CatchpointLookback` floor).
+        //
+        // Phase 4 exists purely to backfill ~320 additional blocks for
+        // lease reconstruction over the network — exactly the kind of
+        // fragile, retriable, retention-window-bound operation that can
+        // fail on a non-archival single-peer relay (confirmed live twice:
+        // issue #1650's original report, and again live-verifying this fix
+        // — "failed to fetch lookback block at round <catchpoint_round>
+        // after 1000 retries: ... 404" — *after* cutover had already
+        // completed and finalized). Previously, a failure there left
+        // `acctrounds` pinned at `balances_round` forever —
+        // `derive_chain_meta_from_latest_block` (and therefore every reopen
+        // of this ledger, including `reload_ledger` in the live participate
+        // node) then reported the ledger as being back at `balances_round`
+        // (observed as `latest_round=0`) even though the account state was
+        // already fully, correctly verified at `catchpoint_round`. Doing
+        // the fast-forward here makes verification leave the ledger
+        // self-consistent (round-tracker and its own header row land
+        // together) independent of whether the lease-reconstruction phase
+        // that follows ever completes. This is purely additive:
+        // `run_replay_blocks`'s own fast-forward is now normally a no-op
+        // (its `current < catchpoint_round` guard already makes it safe
+        // either way).
+        //
+        // Prefer the real block `run_download_ledger` (phase 1) cached
+        // (issue #1649) when available — it carries the genuine header. But
+        // that cache is a *best-effort* early network fetch, and the
+        // live-verify dispatch for this fix found it can legitimately be
+        // `None` from the very start of the pipeline (not just after aging
+        // out during this long verify phase): the catchpoint label's round
+        // can already sit outside a non-archival relay's recent-blocks REST
+        // retention window the moment sync begins, if that window is
+        // narrower than the label-round/current-tip gap. Falling back to a
+        // *synthesized* minimal header — reusing the protocol/txn_counter/
+        // rewards_level already written into the `balances_round` header
+        // row by `initialize_meta_from_catchpoint`, exactly the same
+        // technique that function uses, rather than any live network fetch
+        // — means this fast-forward never depends on a peer serving that
+        // specific round at all. A real header written later by a
+        // successful `run_download_lookback`/`run_replay_blocks` overwrites
+        // this synthesized row via `put_block`'s `ON CONFLICT DO UPDATE`,
+        // same as the existing `balances_round` row already does.
+        if let Some(catchpoint_round) = self.catchpoint_round {
+            if catchpoint_round > balances_round {
+                let wrote_real_header = match self.cached_catchpoint_block.clone() {
+                    Some((cp_proto, cp_hdrdata, cp_blkdata)) => conn
+                        .execute(
+                            "INSERT OR REPLACE INTO blockdb.blocks \
+                             (rnd, proto, hdrdata, blkdata) VALUES (?1, ?2, ?3, ?4)",
+                            rusqlite::params![
+                                catchpoint_round as i64,
+                                cp_proto,
+                                cp_hdrdata,
+                                cp_blkdata
+                            ],
+                        )
+                        .map(|_| true)
+                        .map_err(|e| AlgoError::Ledger {
+                            message: format!("store catchpoint round header after verify: {e}"),
+                        })?,
+                    None => false,
+                };
+                if !wrote_real_header {
+                    // Reuse the protocol/txn_counter/rewards_level already
+                    // persisted into the `balances_round` header row by
+                    // `initialize_meta_from_catchpoint`, rather than
+                    // depending on a live peer fetch for this round.
+                    use rusqlite::OptionalExtension;
+                    let synth_hdrdata: Option<Vec<u8>> = conn
+                        .query_row(
+                            "SELECT hdrdata FROM blockdb.blocks WHERE rnd = ?1",
+                            rusqlite::params![balances_round as i64],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(|e| AlgoError::Ledger {
+                            message: format!(
+                                "read balances_round header for catchpoint_round synthesis: {e}"
+                            ),
+                        })?;
+                    let (proto_for_synth, txn_counter_for_synth, rewards_level_for_synth) =
+                        match synth_hdrdata
+                            .as_deref()
+                            .and_then(|b| BlockHeader::decode_from_bytes(b).ok())
+                        {
+                            Some(hdr) => (hdr.current_protocol, hdr.txn_counter, hdr.rewards_level),
+                            None => (String::new(), 0, 0),
+                        };
+                    tracing::warn!(
+                        catchpoint_round,
+                        balances_round,
+                        "issue #1650: no cached catchpoint-round block available to fast-forward \
+                         acctrounds with a real header; synthesizing a minimal one from the \
+                         balances_round header's own metadata instead, exactly as \
+                         initialize_meta_from_catchpoint already does for balances_round"
+                    );
+                    crate::sqlite::initialize_meta_from_catchpoint(
+                        &conn,
+                        catchpoint_round,
+                        &self.config.genesis_id,
+                        &self.config.genesis_hash,
+                        &proto_for_synth,
+                        txn_counter_for_synth,
+                        rewards_level_for_synth,
+                    )?;
+                }
+                conn.execute(
+                    "UPDATE acctrounds SET rnd = ?1 WHERE id IN ('acctbase', 'hashbase')",
+                    rusqlite::params![catchpoint_round as i64],
+                )
+                .map_err(|e| AlgoError::Ledger {
+                    message: format!(
+                        "fast-forward acctrounds to catchpoint_round after verify: {e}"
+                    ),
+                })?;
+                tracing::info!(
+                    from = balances_round,
+                    to = catchpoint_round,
+                    real_header = wrote_real_header,
+                    "fast-forwarded acctrounds to catchpoint_round immediately after verify \
+                     (issue #1650), independent of the lookback/replay phases that follow"
                 );
             }
         }
@@ -3084,23 +3148,28 @@ mod tests {
 
     /// TDD regression for issue #1650: a live catchpoint catchup that fails
     /// during `run_download_lookback` (phase 4 — a fragile, purely
-    /// lease-reconstruction network backfill) *after* cutover has already
-    /// completed in `run_import_ledger` (phase 3) must not leave the
+    /// lease-reconstruction network backfill) *after* verification has
+    /// already succeeded (`run_verify_ledger`, phase 3) must not leave the
     /// on-disk ledger's round-tracker (`acctrounds('acctbase')`) pinned at
     /// `balances_round`. Before the fix, that split-brain state was only
     /// resolved by `run_replay_blocks` (phase 5) — which never runs when
     /// phase 4 fails — so `reload_ledger`/`derive_chain_meta_from_latest_block`
     /// picked the ledger back up at `balances_round` (observed live as
     /// `latest_round=0`) even though the account state was already fully,
-    /// correctly cut over to `catchpoint_round`.
+    /// correctly verified at `catchpoint_round`.
     ///
-    /// This drives only `run_download_ledger` + `run_import_ledger` —
-    /// deliberately never `run_download_lookback` or `run_replay_blocks` —
-    /// against a backend that serves the catchpoint round's own block (so
-    /// the issue #1649 cache populates) but nothing else, and asserts that
-    /// `acctrounds('acctbase')` and the matching header row in
-    /// `blockdb.blocks` both already reflect `catchpoint_round` right after
-    /// import, with no later phase required.
+    /// This drives `run_download_ledger` + `run_import_ledger` +
+    /// `run_verify_ledger` — deliberately never `run_download_lookback` or
+    /// `run_replay_blocks` — against a backend that serves the catchpoint
+    /// round's own block (so the issue #1649 cache populates) but nothing
+    /// else, and asserts that `acctrounds('acctbase')` and the matching
+    /// header row in `blockdb.blocks` both already reflect
+    /// `catchpoint_round` right after verify, with no later phase required.
+    /// (The fast-forward deliberately cannot run any earlier than this:
+    /// `verify_catchpoint` requires `acctrounds == balances_round` to still
+    /// hold at verify time, pinned by
+    /// `full_sync_round_trip_verifies_when_blocks_round_differs_from_balances_round`
+    /// above.)
     #[test]
     fn import_fast_forwards_acctrounds_to_catchpoint_round_before_lookback_runs() {
         use crate::catchpoint::writer::{export_catchpoint_file, ExportOptions};
@@ -3186,6 +3255,8 @@ mod tests {
 
         orchestrator.run_import_ledger().unwrap();
         assert_eq!(orchestrator.balances_round, Some(BALANCES_ROUND));
+
+        orchestrator.run_verify_ledger().unwrap();
 
         // The fix under test: even though `run_download_lookback` (phase 4)
         // and `run_replay_blocks` (phase 5) never ran, `acctrounds` must
