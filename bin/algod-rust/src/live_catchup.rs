@@ -397,19 +397,34 @@ impl LiveCatchupManager {
                 if let Ok(mut last) = self.last_catchpoint.lock() {
                     *last = catchpoint.clone();
                 }
-                // Issue #1616: the catchup wrote through its own DB
-                // connection, so the normal sync loop's ledger handle must
-                // be explicitly reloaded before `resume()` rebuilds
-                // anything against it -- see `NormalSyncControl::
-                // reload_ledger`'s doc comment for why this can't be
-                // skipped even though both connections point at the same
-                // on-disk file.
-                self.control.reload_ledger().await;
             }
             Err(e) => {
                 warn!(catchpoint = %catchpoint, error = %e, "live catchpoint catchup failed");
             }
         }
+
+        // Issue #1616 established that the catchup wrote through its own
+        // DB connection, so the normal sync loop's ledger handle must be
+        // explicitly reloaded before `resume()` rebuilds anything against
+        // it. Issue #1647's evidence (mainnet-node-soak run 36539158300)
+        // showed that reload must happen unconditionally, not only on
+        // `Ok(())`: `SyncOrchestrator::run` can return `Err` *after* its
+        // catchpoint import has already cutover and been finalized on
+        // disk (`catchpoint cutover finalized: pre-cutover backups
+        // dropped` in the log) -- e.g. a later, independent phase like
+        // "download lookback blocks for lease reconstruction" failing
+        // against a peer that no longer serves an old-enough block. When
+        // that happens the on-disk ledger genuinely is at the new round,
+        // but skipping the reload left the in-process ledger handle
+        // (and therefore the rebuilt agreement/catchup cycle) stuck at
+        // its stale pre-catchup round -- observed live as the node
+        // resuming consensus participation at `latest_round=0` and
+        // retrying round-by-round genesis catchup forever, i.e. exactly
+        // the "zero follow-mode progress after a clean catchpoint
+        // import" symptom #1647 reported. Reloading is safe even when
+        // nothing was actually committed (download/verify failed before
+        // any cutover): it just reopens the same, unchanged ledger file.
+        self.control.reload_ledger().await;
 
         {
             let mut guard = self.running.lock().await;
@@ -955,10 +970,34 @@ mod tests {
         // A failed run must not be recorded as the last *completed*
         // catchpoint.
         assert_eq!(manager.last_catchpoint(), "");
-        // A failed run has nothing new on disk to reload -- reload_ledger
-        // must not fire (mirrors go never calling the equivalent of a
-        // ledger reopen for an aborted/failed catchup).
-        assert_eq!(control.reloads.load(Ordering::SeqCst), 0);
+    }
+
+    /// Pins issue #1647's fix: `SyncOrchestrator::run` can return `Err`
+    /// *after* it has already finalized a catchpoint cutover on disk (a
+    /// later, independent phase failing, e.g. the post-cutover lookback
+    /// block download) -- so a failed run is not proof "nothing new on
+    /// disk to reload". `reload_ledger` must fire unconditionally, before
+    /// `resume`, exactly as it does on success, or the resumed
+    /// agreement/catchup cycle keeps operating against the stale
+    /// pre-catchup ledger handle forever even though the ledger file on
+    /// disk genuinely advanced -- the mainnet-node-soak run 36539158300
+    /// "zero follow-mode progress" symptom.
+    #[tokio::test]
+    async fn start_catchup_reloads_ledger_before_resuming_even_on_runner_error() {
+        let control = Arc::new(CountingControl::default());
+        let manager = LiveCatchupManager::new(ImmediateRunner::err("boom"), control.clone());
+
+        let result = manager.start_catchup("1000#deadbeef").await;
+        assert_eq!(result, CatchupStartResult::Created);
+
+        wait_idle(&manager).await;
+
+        assert_eq!(control.reloads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            control.order.lock().unwrap().as_slice(),
+            &["reload", "resume"],
+            "reload_ledger must run before resume even when the run failed"
+        );
     }
 
     #[tokio::test]
