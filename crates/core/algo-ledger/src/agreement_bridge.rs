@@ -509,7 +509,7 @@ impl LedgerReader for AgreementLedgerBridge {
         let ledger = Arc::clone(&self.ledger);
         let condvar = Arc::clone(&self.round_advanced);
 
-        std::thread::Builder::new()
+        let spawn_result = std::thread::Builder::new()
             .name(format!("round-notify-{}", round.0))
             .spawn(move || {
                 const TIMEOUT: Duration = Duration::from_secs(300);
@@ -536,8 +536,30 @@ impl LedgerReader for AgreementLedgerBridge {
                 }
 
                 let _ = tx.send(round);
-            })
-            .expect("failed to spawn round-notify thread");
+            });
+
+        // Issue #1650 (live-dispatch evidence): a real mainnet soak hit
+        // `thread::Builder::spawn` failing with `Os { code: 11, kind:
+        // WouldBlock, "Resource temporarily unavailable" }` (EAGAIN — the
+        // process/OS thread budget was exhausted) from this call, spawned
+        // fresh on every single round. The previous `.expect(...)` here
+        // turned that transient OS-level resource pressure into a hard
+        // panic on the `agreement-demux` thread, which killed the whole
+        // agreement main loop outright — a resource hiccup should degrade
+        // this one round's notification, not crash consensus
+        // participation. Mirror the existing lock-poisoned branch above:
+        // log loudly and return a receiver that will simply never fire:
+        // `round_notify`'s callers all treat that identically to "still
+        // waiting" and fall back to their own polling/timeout paths rather
+        // than assuming the sender side is infallible.
+        if let Err(e) = spawn_result {
+            tracing::error!(
+                round = round.0,
+                error = %e,
+                "failed to spawn round-notify thread; returning a receiver that will never \
+                 fire for this round instead of panicking (issue #1650)"
+            );
+        }
 
         rx
     }
