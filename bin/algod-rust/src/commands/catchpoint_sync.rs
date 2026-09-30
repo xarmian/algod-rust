@@ -70,9 +70,49 @@ struct AlgodSyncBackend {
     /// `/v2/status` only, no static-index fallback -- there is no such
     /// index for a custom network).
     network: Option<String>,
+    /// Block-service (`/v1/{genesis}/block/{round}`) fetcher against
+    /// `algod_url`, used as a fallback when the REST `/v2/blocks/{round}`
+    /// endpoint is unavailable (issue #1650): the live catchup peer is
+    /// commonly a relay's gossip port (`:4160`), which serves the catchpoint
+    /// file and the block service but has no `/v2/*` REST routes at all, so
+    /// every REST block fetch against it 404s ("404 page not found") no
+    /// matter how recent the round is. `None` when no genesis ID was
+    /// supplied (pre-#1650 behavior: REST only).
+    http_block_fetcher: Option<HttpBlockFetcher>,
 }
 
 impl AlgodSyncBackend {
+    /// Enables the block-service fallback for [`Self::get_block_raw_bytes`]
+    /// (issue #1650). Best-effort: a fetcher that cannot be built leaves the
+    /// REST-only behavior in place.
+    fn with_http_block_fetcher(mut self, genesis_id: &str) -> Self {
+        if !genesis_id.is_empty() {
+            self.http_block_fetcher =
+                HttpBlockFetcher::new(self.algod_url.clone(), genesis_id).ok();
+        }
+        self
+    }
+
+    /// Fetches the raw msgpack block(+cert) for `round`: REST
+    /// `/v2/blocks/{round}` first, then the peer's `/v1` block service if
+    /// the REST call fails (issue #1650). Both return the same
+    /// `{block, cert}` msgpack wrapper `decode_block_response` accepts.
+    async fn get_block_raw_bytes(&self, round: u64) -> Result<Vec<u8>, AlgoError> {
+        match self.client.get_block_raw(Round(round)).await {
+            Ok(raw) => Ok(raw),
+            Err(rest_err) => match &self.http_block_fetcher {
+                Some(fetcher) => fetcher.fetch_block(round).await.map_err(|http_err| {
+                    AlgoError::Network {
+                        message: format!(
+                            "block {round}: REST /v2/blocks failed ({rest_err});                              /v1 block-service fallback failed ({http_err})"
+                        ),
+                    }
+                }),
+                None => Err(rest_err),
+            },
+        }
+    }
+
     /// Ranks the catchpoint file download across `algod_url` plus
     /// `extra_catchpoint_peer_urls` instead of using `algod_url` alone
     /// (issue #901's peer-ranked catchpoint source selection).
@@ -113,6 +153,7 @@ impl AlgodSyncBackend {
             algod_url: algod_url.to_string(),
             algod_token: algod_token.to_string(),
             network: network.map(str::to_string),
+            http_block_fetcher: None,
         }
     }
 
@@ -222,7 +263,7 @@ impl SyncBackend for AlgodSyncBackend {
     fn fetch_block_raw(&self, round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
         tokio::task::block_in_place(|| {
             self.rt.block_on(async {
-                let raw = self.client.get_block_raw(Round(round)).await?;
+                let raw = self.get_block_raw_bytes(round).await?;
                 let br = decode_block_response(&raw)?;
                 let proto = br.block.current_protocol.clone();
                 // Encode in the same format that apply_block uses:
@@ -239,7 +280,7 @@ impl SyncBackend for AlgodSyncBackend {
     fn fetch_block(&self, round: u64) -> Result<Block, AlgoError> {
         tokio::task::block_in_place(|| {
             self.rt.block_on(async {
-                let raw = self.client.get_block_raw(Round(round)).await?;
+                let raw = self.get_block_raw_bytes(round).await?;
                 let br = decode_block_response(&raw)?;
                 Ok(br.block)
             })
@@ -310,6 +351,7 @@ impl SyncBackend for AlgodSyncBackend {
 /// `pub(crate)` wrapper rather than making [`AlgodSyncBackend`] itself
 /// public, since its type is otherwise an internal implementation detail
 /// of this module.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_algod_sync_backend(
     algod_url: &str,
     algod_token: &str,
@@ -318,6 +360,7 @@ pub(crate) fn build_algod_sync_backend(
     download_config: algo_rest_client::CatchpointDownloadConfig,
     ledger_download_retry_attempts: usize,
     network: Option<&str>,
+    genesis_id: &str,
 ) -> impl SyncBackend {
     AlgodSyncBackend::with_catchpoint_peers_and_p2p(
         algod_url,
@@ -328,6 +371,7 @@ pub(crate) fn build_algod_sync_backend(
         ledger_download_retry_attempts,
         network,
     )
+    .with_http_block_fetcher(genesis_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -1913,6 +1957,62 @@ mod tests {
         // (not built here, but the code path `None` exercises above) stays
         // completely unaffected by anything `dialer`'s connection did.
         assert_eq!(listener.connected_peer_count(), 1);
+    }
+
+    /// Issue #1650: the live catchup peer is commonly a relay's gossip port,
+    /// which serves the catchpoint file and `/v1/{genesis}/block/{round}` but
+    /// has no `/v2/*` REST routes ("404 page not found" for every round). The
+    /// lookback phase must still be able to fetch blocks from it.
+    #[tokio::test]
+    async fn get_block_raw_bytes_falls_back_to_v1_block_service_when_rest_404s() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/blocks/1"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("404 page not found"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/test-genesis/block/1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/x-algorand-block-v1")
+                    .set_body_bytes(vec![1u8, 2, 3]),
+            )
+            .mount(&server)
+            .await;
+
+        let without_fallback = AlgodSyncBackend::with_catchpoint_peers_and_p2p(
+            &server.uri(),
+            "",
+            &[],
+            None,
+            algo_rest_client::CatchpointDownloadConfig::default(),
+            algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
+            None,
+        );
+        assert!(
+            without_fallback.get_block_raw_bytes(1).await.is_err(),
+            "REST-only backend must fail against a peer with no /v2 routes (pins the bug)"
+        );
+
+        let with_fallback = AlgodSyncBackend::with_catchpoint_peers_and_p2p(
+            &server.uri(),
+            "",
+            &[],
+            None,
+            algo_rest_client::CatchpointDownloadConfig::default(),
+            algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
+            None,
+        )
+        .with_http_block_fetcher("test-genesis");
+        let raw = with_fallback
+            .get_block_raw_bytes(1)
+            .await
+            .expect("v1 block-service fallback must serve the block");
+        assert_eq!(raw, vec![1u8, 2, 3]);
     }
 
     // -- Issue #1604: --catchpoint-auto discovery static-index fallback ----

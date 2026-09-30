@@ -849,27 +849,44 @@ impl CatchupService {
             let tx = result_tx.clone();
             let ledger = Arc::clone(ledger);
             let fetcher = Arc::clone(fetcher);
-            workers.push(thread::spawn(move || loop {
-                if stop.load(Ordering::SeqCst) {
-                    return;
+            // Issue #1650: a live soak died with `thread::spawn` panicking
+            // (`Os { code: 11, WouldBlock }`, EAGAIN) once OS thread budget
+            // ran out. Spawn via `Builder` and degrade to fewer workers
+            // instead of panicking the catchup thread.
+            let spawned = thread::Builder::new()
+                .name("catchup-fetch".to_string())
+                .spawn(move || loop {
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let round = next_to_fetch.fetch_add(1, Ordering::SeqCst);
+                    if round >= limit_round {
+                        return;
+                    }
+                    let r = Round(round);
+                    if ledger.round_is_not_supported(r) {
+                        let _ = tx.send((round, FetchOutcome::Unsupported));
+                        return;
+                    }
+                    let outcome = fetcher.fetch_block(r);
+                    if tx
+                        .send((round, FetchOutcome::Fetch(Box::new(outcome))))
+                        .is_err()
+                    {
+                        return;
+                    }
+                });
+            match spawned {
+                Ok(handle) => workers.push(handle),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        workers = workers.len(),
+                        "catchup service: could not spawn a fetch worker thread;                          continuing with the workers already started"
+                    );
+                    break;
                 }
-                let round = next_to_fetch.fetch_add(1, Ordering::SeqCst);
-                if round >= limit_round {
-                    return;
-                }
-                let r = Round(round);
-                if ledger.round_is_not_supported(r) {
-                    let _ = tx.send((round, FetchOutcome::Unsupported));
-                    return;
-                }
-                let outcome = fetcher.fetch_block(r);
-                if tx
-                    .send((round, FetchOutcome::Fetch(Box::new(outcome))))
-                    .is_err()
-                {
-                    return;
-                }
-            }));
+            }
         }
         // Drop this thread's sender clone so the channel closes once every
         // worker has exited (each worker holds its own clone until then).

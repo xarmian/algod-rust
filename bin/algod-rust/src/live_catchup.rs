@@ -654,6 +654,7 @@ impl CatchupRunner for OrchestratorCatchupRunner {
                 crate::commands::catchpoint_sync::network_name_for_genesis_id(
                     &self.params.genesis_id,
                 ),
+                &self.params.genesis_id,
             ));
 
         let config = SyncConfig {
