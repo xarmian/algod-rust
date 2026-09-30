@@ -223,6 +223,12 @@ jobs:
             grep -m1 'model name' /proc/cpuinfo || true
           } | tee mainnet-soak-artifacts/runner-spec.txt
 
+      - name: Install gdb (thread-stack dump if the node wedges, issue #1650)
+        run: |
+          sudo apt-get update -qq >/dev/null 2>&1 || true
+          sudo apt-get install -y -qq gdb >/dev/null 2>&1 || echo "gdb unavailable; wedge stack dumps disabled"
+          command -v gdb || true
+
       - name: Start resource profiling (issue #1626)
         id: profiling
         run: |
@@ -489,6 +495,8 @@ jobs:
             </dev/null > mainnet-soak-artifacts/monitor.out 2>&1 &
           MON_PID=$!
           CAPPED=0
+          WEDGE_POLLS=0
+          DUMPED=0
           NODE_PID="${{ steps.start_node.outputs.node_pid }}"
           while kill -0 "$MON_PID" 2>/dev/null; do
             if [ "$(date +%s)" -ge "$DEADLINE" ]; then
@@ -501,6 +509,22 @@ jobs:
             TOTAL_THREADS="$(ps -eLf 2>/dev/null | wc -l)"
             LAST="$(tail -n 1 mainnet-soak-artifacts/status.jsonl 2>/dev/null | python3 ops/mainnet-soak/heartbeat.py 2>&1)"
             echo "heartbeat $(date -u +%H:%M:%SZ) node_threads=$THREADS all_threads=$TOTAL_THREADS $LAST"
+            # Issue #1650: a node that is alive but stops answering /v2/status
+            # (observed live right after resuming participation) needs a
+            # thread-stack dump to diagnose; take one, once, per wedge.
+            case "$LAST" in
+              *node_ok=False*)
+                WEDGE_POLLS=$((WEDGE_POLLS + 1))
+                if [ "$WEDGE_POLLS" -ge 2 ] && [ "$DUMPED" -eq 0 ] && command -v gdb >/dev/null 2>&1 && kill -0 "$NODE_PID" 2>/dev/null; then
+                  DUMPED=1
+                  echo "==> node wedged; dumping thread stacks to mainnet-soak-artifacts/wedge-stacks.txt"
+                  sudo timeout 240 gdb -p "$NODE_PID" -batch -ex "set pagination off" -ex "thread apply all bt 30"                     > mainnet-soak-artifacts/wedge-stacks.txt 2>&1 </dev/null || true
+                  top -H -b -n 1 -p "$NODE_PID" 2>/dev/null | head -n 25 >> mainnet-soak-artifacts/wedge-stacks.txt
+                  tail -n 5 mainnet-soak-artifacts/wedge-stacks.txt | cut -c1-200
+                fi
+                ;;
+              *) WEDGE_POLLS=0 ;;
+            esac
             # Milestones from the node's own log (sync phases, the issue
             # #1650 fast-forward, participation restarts) as they happen.
             grep -a -E 'sync state transition|cutover (complete|finalized)|fast-forwarded acctrounds|issue #1650|consensus participation [(]re[)]started|reloaded ledger|live catchpoint catchup (completed|failed)|panicked' \
