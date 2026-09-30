@@ -3116,9 +3116,19 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
             // transaction's sender pays `txn.fee`, possibly zero under fee
             // pooling); other reward_addrs roles keep the unconditional
             // write.
+            //
+            // Issue #1654: the same `Move` guard applies to the payment
+            // receiver -- a zero-amount `pay` to a zero-balance account must
+            // not write it (live mainnet block 65539696 paid 0 to a
+            // non-existent account; the rewards write made it non-default
+            // and tripped the min-balance check).
+            let unwritten_sender = *addr == txn.sender && txn.fee == 0;
+            let unwritten_pay_receiver = *addr != txn.sender
+                && *addr == txn.receiver
+                && txn.txn_type == "pay"
+                && txn.amount == 0;
             let skip_write = ctx.consensus.unfunded_senders
-                && *addr == txn.sender
-                && txn.fee == 0
+                && (unwritten_sender || unwritten_pay_receiver)
                 && account_before.micro_algos == 0
                 && reward == 0;
             if !skip_write {
@@ -9639,6 +9649,35 @@ mod tests {
             store_post.get_account(&sender).is_none(),
             "v34+ must leave a zero-balance, zero-fee sender fully unwritten"
         );
+    }
+
+    /// Issue #1654 (live mainnet block 65539696): a zero-amount payment to a
+    /// non-existent account must leave the receiver non-existent. go's
+    /// `roundCowState.Move` only writes the receiver when
+    /// `!amt.IsZero() || rewardUnits > 0 || !UnfundedSenders`; writing the
+    /// rewards-bookkeeping update instead made the empty receiver non-default
+    /// (`rewards_base` = current level) and tripped the min-balance check
+    /// ("balance 0 below minimum balance 100000").
+    #[test]
+    fn unfunded_senders_zero_amount_payment_leaves_empty_receiver_unwritten() {
+        let sender = Address([7u8; 32]);
+        let receiver = Address([8u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut store = make_state_with_accounts(&[(sender, 900_000), (fee_sink, 0)], fee_sink);
+        let mut ctx = apply_context_for_version(fee_sink, 1, algo_types::consensus::CONSENSUS_V34);
+        ctx.rewards_level = 12_345;
+        assert!(ctx.consensus.unfunded_senders);
+        let txn = pay_txn(sender, receiver, 0, 1_000);
+        apply_transaction(&mut store, &txn, &ctx, 0)
+            .expect("zero-amount pay to an empty account must apply");
+        // (Only an `update_round` stamp may remain; no rewards bookkeeping.)
+        if let Some(acct) = store.get_account(&receiver) {
+            assert_eq!(acct.micro_algos, 0);
+            assert_eq!(
+                acct.rewards_base, 0,
+                "an untouched empty receiver must not get a rewards_base write"
+            );
+        }
     }
 
     #[test]
