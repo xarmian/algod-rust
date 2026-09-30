@@ -131,6 +131,27 @@ class IsVerifyingSignatureTest(unittest.TestCase):
         self.assertFalse(monitor.is_verifying_signature(s))
 
 
+class ClassifyDownloadPhaseAllowanceTest(unittest.TestCase):
+    """Issue #1650 live dispatch: the catchpoint *file download* leaves every
+    counter at zero; a slow relay must not trip the 5-minute stuck rule."""
+
+    def test_all_zero_counters_with_catchpoint_is_downloading(self):
+        s = node_catchup(0, acquired=0, processed_accts=0, processed_kvs=0, total_blocks=0, total_accts=0, total_kvs=0)
+        self.assertTrue(monitor.is_downloading_signature(s))
+
+    def test_nonzero_total_is_not_downloading(self):
+        s = node_catchup(0, acquired=0, processed_accts=10, processed_kvs=0, total_blocks=0, total_accts=1000, total_kvs=0)
+        self.assertFalse(monitor.is_downloading_signature(s))
+
+    def test_frozen_download_for_ten_minutes_is_not_stuck(self):
+        samples = [
+            node_catchup(t, acquired=0, processed_accts=0, processed_kvs=0, total_blocks=0, total_accts=0, total_kvs=0)
+            for t in range(0, 600, 10)
+        ]
+        verdict = monitor.classify(samples, halt_minutes=5.0)
+        self.assertEqual(verdict.status, "ok")
+
+
 class ClassifyVerifyPhaseAllowanceTest(unittest.TestCase):
     """Issue #1623: a frozen catchpoint signature that looks like the
     single-shot `run_verify_ledger` window must NOT be classified as a
