@@ -60,6 +60,14 @@ const SP_VERIFICATION_FILENAME: &str = "stateProofVerificationContext.msgpack";
 /// Prefix for balance chunk entries (`balances.N.msgpack`).
 const BALANCES_PREFIX: &str = "balances.";
 
+/// Name of the algod-rust-only tar entry that records the round the embedded
+/// account state actually reflects (issue #1654). Written by
+/// [`super::writer::export_catchpoint_file`] only when
+/// [`super::writer::ExportOptions::state_round`] is set; go-algorand's
+/// catchpoint accessor ignores unknown sections, so go-produced files never
+/// contain it and go consumers are unaffected by it.
+pub const STATE_ROUND_MARKER_FILENAME: &str = "algod-rust.state-round";
+
 /// Suffix for balance chunk entries.
 const BALANCES_SUFFIX: &str = ".msgpack";
 
@@ -193,6 +201,19 @@ pub struct CatchpointReaderFile {
 }
 
 impl CatchpointReaderFile {
+    /// Read the [`STATE_ROUND_MARKER_FILENAME`] entry, if the file has one.
+    ///
+    /// The writer places the marker directly after `content.msgpack`, ahead
+    /// of every `balances.N.msgpack` chunk, so the scan stops at the first
+    /// chunk and never streams the bulk of the file.
+    pub fn state_round_marker(mut self) -> Result<Option<u64>, CatchpointError> {
+        match &mut self.inner {
+            FileInner::Raw(archive) => scan_state_round_marker(archive),
+            FileInner::Gzip(archive) => scan_state_round_marker(archive),
+            FileInner::Snappy(archive) => scan_state_round_marker(archive),
+        }
+    }
+
     /// Returns the cached header if `content.msgpack` has already been read.
     pub fn header(&self) -> Option<&CatchpointFileHeader> {
         self.cached_header.as_ref()
@@ -298,6 +319,34 @@ where
     }
 
     Ok(())
+}
+
+/// Scan the leading tar entries for [`STATE_ROUND_MARKER_FILENAME`].
+fn scan_state_round_marker<R: Read>(
+    archive: &mut tar::Archive<R>,
+) -> Result<Option<u64>, CatchpointError> {
+    for entry_result in archive.entries().map_err(CatchpointError::Io)? {
+        let mut entry = entry_result.map_err(CatchpointError::Io)?;
+        let path = entry
+            .path()
+            .map_err(CatchpointError::Io)?
+            .to_string_lossy()
+            .into_owned();
+        if path == STATE_ROUND_MARKER_FILENAME {
+            let data = read_entry_bytes(&mut entry)?;
+            let text = std::str::from_utf8(&data).map_err(|e| {
+                CatchpointError::DecodeError(format!("state-round marker is not UTF-8: {e}"))
+            })?;
+            let round = text.trim().parse::<u64>().map_err(|e| {
+                CatchpointError::DecodeError(format!("state-round marker {text:?}: {e}"))
+            })?;
+            return Ok(Some(round));
+        }
+        if path.starts_with(BALANCES_PREFIX) {
+            return Ok(None);
+        }
+    }
+    Ok(None)
 }
 
 /// Maximum allowed size for a single tar entry (2 GiB).

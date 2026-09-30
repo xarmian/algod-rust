@@ -221,6 +221,24 @@ pub struct ExportOptions {
 
     /// Gzip the resulting tar archive (go always does for the published file).
     pub gzip: bool,
+
+    /// Round the embedded account state actually reflects, when that is
+    /// *not* [`Self::balances_round`] (issue #1654).
+    ///
+    /// A go-produced catchpoint holds state at `balances_round`, and a
+    /// consumer reaches `blocks_round` by replaying the stored blocks
+    /// `(balances_round, blocks_round]`. algod-rust's own exporter
+    /// (`SqliteLedger::maybe_spawn_automatic_catchpoint`, issue #1463) has
+    /// no historical account source, so it embeds the *live* snapshot --
+    /// already at `blocks_round` -- while stamping go's round numbers
+    /// (issue #1054). The two shapes are indistinguishable from
+    /// `content.msgpack` (go's strict decoder rejects unknown header
+    /// fields, so none can be added), so `Some(round)` writes an extra
+    /// [`super::parser::STATE_ROUND_MARKER_FILENAME`] tar entry (go's
+    /// catchpoint accessor ignores unknown sections) that tells an
+    /// algod-rust importer not to replay the window. `None` (the default)
+    /// writes go's exact entry set.
+    pub state_round: Option<u64>,
 }
 
 impl Default for ExportOptions {
@@ -235,6 +253,7 @@ impl Default for ExportOptions {
             accounts_per_chunk: BALANCES_PER_CATCHPOINT_FILE_CHUNK,
             max_resources_per_chunk: RESOURCES_PER_CATCHPOINT_FILE_CHUNK,
             gzip: true,
+            state_round: None,
         }
     }
 }
@@ -417,7 +436,13 @@ pub fn export_catchpoint_file(
     };
     let header_bytes = encode_catchpoint_file_header(&header);
 
-    let repack = repack(&stage1_path, out_path, &header_bytes, opts.gzip);
+    let repack = repack(
+        &stage1_path,
+        out_path,
+        &header_bytes,
+        opts.gzip,
+        opts.state_round,
+    );
     let _ = std::fs::remove_file(&stage1_path);
     repack?;
 
@@ -697,6 +722,7 @@ fn repack(
     out_path: &Path,
     header_bytes: &[u8],
     gzip: bool,
+    state_round: Option<u64>,
 ) -> Result<(), CatchpointError> {
     let temp_path = write_temp_path_for(out_path);
 
@@ -705,13 +731,13 @@ fn repack(
         if gzip {
             // go uses gzip.BestSpeed for the published catchpoint file.
             let mut encoder = GzEncoder::new(BufWriter::new(out), Compression::fast());
-            repack_into(stage1_path, &mut encoder, header_bytes)?;
+            repack_into(stage1_path, &mut encoder, header_bytes, state_round)?;
             let mut inner = encoder.finish()?;
             inner.flush()?;
             inner.get_ref().sync_all()?;
         } else {
             let mut writer = BufWriter::new(out);
-            repack_into(stage1_path, &mut writer, header_bytes)?;
+            repack_into(stage1_path, &mut writer, header_bytes, state_round)?;
             writer.flush()?;
             writer.get_ref().sync_all()?;
         }
@@ -738,9 +764,17 @@ fn repack_into<W: Write>(
     stage1_path: &Path,
     out: &mut W,
     header_bytes: &[u8],
+    state_round: Option<u64>,
 ) -> Result<(), CatchpointError> {
     let mut builder = tar::Builder::new(out);
     append_entry(&mut builder, CONTENT_FILENAME, header_bytes)?;
+    if let Some(round) = state_round {
+        append_entry(
+            &mut builder,
+            super::parser::STATE_ROUND_MARKER_FILENAME,
+            round.to_string().as_bytes(),
+        )?;
+    }
 
     let stage1 = File::open(stage1_path)?;
     let mut archive = tar::Archive::new(BufReader::new(stage1));
@@ -1072,7 +1106,7 @@ mod atomic_write_tests {
         std::fs::write(&out_path, b"old catchpoint bytes must survive").unwrap();
         let missing_stage1 = dir.path().join("does-not-exist.stage1.tmp");
 
-        let result = repack(&missing_stage1, &out_path, b"header", true);
+        let result = repack(&missing_stage1, &out_path, b"header", true, None);
         assert!(
             result.is_err(),
             "repack must report the stage1-open failure"
@@ -1106,7 +1140,7 @@ mod atomic_write_tests {
             builder.into_inner().unwrap().flush().unwrap();
         }
 
-        repack(&stage1_path, &out_path, b"header-bytes", false).unwrap();
+        repack(&stage1_path, &out_path, b"header-bytes", false, None).unwrap();
 
         let contents = std::fs::read(&out_path).unwrap();
         assert_ne!(

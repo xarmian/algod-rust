@@ -4260,6 +4260,10 @@ impl SqliteLedger {
             block_header_digest: digest,
             include_online_data,
             enable_sp_contexts,
+            // Issue #1654: the snapshot above is the live state at `round`,
+            // not go's `balances_round` state -- tell algod-rust importers
+            // not to replay `(balances_round, round]` over it.
+            state_round: Some(round),
             ..Default::default()
         };
 
