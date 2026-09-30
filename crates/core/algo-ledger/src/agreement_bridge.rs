@@ -24,6 +24,7 @@
 //! Mirrors go-algorand's `node/impls.go` `agreementLedger` struct which wraps
 //! a `*data.Ledger` and implements the `agreement.Ledger` interface.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -91,9 +92,38 @@ pub struct AgreementLedgerBridge {
     ///
     /// Mirrors Go's `agreementLedger.n.OnNetworkAdvance()`.
     network_advancer: Arc<dyn NetworkAdvancer>,
+    /// Number of `round-notify-*` OS threads ever spawned by
+    /// [`LedgerReader::round_notify`] (issue #1650 regression metric).
+    notify_threads_spawned: AtomicU64,
+    /// The live waiter for the most recently requested round, so repeated
+    /// `round_notify` calls for the same round share one thread (issue #1650).
+    notify_cache: Mutex<Option<PendingNotify>>,
+}
+
+/// A still-running `round_notify` waiter thread and the channel it feeds.
+struct PendingNotify {
+    round: u64,
+    rx: crossbeam_channel::Receiver<Round>,
+    /// Cleared by the waiter thread when it exits (delivered, timed out, or
+    /// lock poisoned), so a dead waiter is never handed out again.
+    alive: Arc<AtomicBool>,
+}
+
+/// Clears the flag when the waiter thread exits, however it exits.
+struct AliveGuard(Arc<AtomicBool>);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 impl AgreementLedgerBridge {
+    /// How many `round-notify-*` threads this bridge has ever spawned.
+    pub fn notify_threads_spawned(&self) -> u64 {
+        self.notify_threads_spawned.load(Ordering::SeqCst)
+    }
+
     /// Create a new bridge wrapping the given ledger.
     ///
     /// Uses a no-op network advancer and no pending certificate channel.
@@ -105,6 +135,8 @@ impl AgreementLedgerBridge {
             pending_cert_tx: None,
             pending_cert_rx: None,
             network_advancer: Arc::new(NoOpNetworkAdvancer),
+            notify_threads_spawned: AtomicU64::new(0),
+            notify_cache: Mutex::new(None),
         }
     }
 
@@ -125,6 +157,8 @@ impl AgreementLedgerBridge {
             pending_cert_tx: None,
             pending_cert_rx: None,
             network_advancer,
+            notify_threads_spawned: AtomicU64::new(0),
+            notify_cache: Mutex::new(None),
         }
     }
 
@@ -186,6 +220,8 @@ impl AgreementLedgerBridge {
             pending_cert_tx: Some(tx),
             pending_cert_rx: Some(rx.clone()),
             network_advancer,
+            notify_threads_spawned: AtomicU64::new(0),
+            notify_cache: Mutex::new(None),
         };
         (bridge, rx)
     }
@@ -503,15 +539,38 @@ impl LedgerReader for AgreementLedgerBridge {
             }
         }
 
+        // Issue #1650: the demux calls this on every event it handles, so a
+        // thread per call exhausts the OS thread budget within a minute of
+        // live mainnet gossip. Share one waiter per pending round: a repeat
+        // call for the same round gets a clone of the live waiter's channel
+        // (the demux only ever holds the newest receiver, so the single
+        // one-shot message reaches it).
+        let mut cache = match self.notify_cache.lock() {
+            Ok(c) => c,
+            Err(_) => {
+                let (_tx, rx) = crossbeam_channel::bounded(1);
+                return rx;
+            }
+        };
+        if let Some(pending) = cache.as_ref() {
+            if pending.round == round.0 && pending.alive.load(Ordering::SeqCst) {
+                return pending.rx.clone();
+            }
+        }
+
         // Spawn a short-lived thread that waits on the Condvar for the round
         // to be reached, then sends a single notification on the channel.
         let (tx, rx) = crossbeam_channel::bounded(1);
         let ledger = Arc::clone(&self.ledger);
         let condvar = Arc::clone(&self.round_advanced);
+        let alive = Arc::new(AtomicBool::new(true));
+        let alive_for_thread = Arc::clone(&alive);
 
+        self.notify_threads_spawned.fetch_add(1, Ordering::SeqCst);
         let spawn_result = std::thread::Builder::new()
             .name(format!("round-notify-{}", round.0))
             .spawn(move || {
+                let _alive = AliveGuard(alive_for_thread);
                 const TIMEOUT: Duration = Duration::from_secs(300);
                 let deadline = std::time::Instant::now() + TIMEOUT;
 
@@ -538,27 +597,25 @@ impl LedgerReader for AgreementLedgerBridge {
                 let _ = tx.send(round);
             });
 
-        // Issue #1650 (live-dispatch evidence): a real mainnet soak hit
-        // `thread::Builder::spawn` failing with `Os { code: 11, kind:
-        // WouldBlock, "Resource temporarily unavailable" }` (EAGAIN — the
-        // process/OS thread budget was exhausted) from this call, spawned
-        // fresh on every single round. The previous `.expect(...)` here
-        // turned that transient OS-level resource pressure into a hard
-        // panic on the `agreement-demux` thread, which killed the whole
-        // agreement main loop outright — a resource hiccup should degrade
-        // this one round's notification, not crash consensus
-        // participation. Mirror the existing lock-poisoned branch above:
-        // log loudly and return a receiver that will simply never fire:
-        // `round_notify`'s callers all treat that identically to "still
-        // waiting" and fall back to their own polling/timeout paths rather
-        // than assuming the sender side is infallible.
-        if let Err(e) = spawn_result {
-            tracing::error!(
-                round = round.0,
-                error = %e,
-                "failed to spawn round-notify thread; returning a receiver that will never \
-                 fire for this round instead of panicking (issue #1650)"
-            );
+        // A thread-spawn failure (EAGAIN under OS thread pressure) must
+        // degrade this round's notification, not panic the demux thread:
+        // log and return a receiver that never fires (mirrors the
+        // lock-poisoned branch above).
+        match spawn_result {
+            Ok(_) => {
+                *cache = Some(PendingNotify {
+                    round: round.0,
+                    rx: rx.clone(),
+                    alive,
+                });
+            }
+            Err(e) => {
+                tracing::error!(
+                    round = round.0,
+                    error = %e,
+                    "failed to spawn round-notify thread; returning a receiver that will never                      fire for this round instead of panicking (issue #1650)"
+                );
+            }
         }
 
         rx
@@ -835,6 +892,36 @@ mod tests {
     #[test]
     fn extract_seed_from_empty_returns_none() {
         assert!(extract_seed_from_header(&[]).is_none());
+    }
+
+    /// Issue #1650: the agreement demux calls `round_notify` on every event it
+    /// handles (go's `ledger.Wait` per `demux.next`). Spawning an OS thread per
+    /// call exhausted the thread budget within a minute against live mainnet
+    /// gossip (`fork: Resource temporarily unavailable`, then thread-spawn
+    /// panics). Repeated calls for the same pending round must share one waiter.
+    #[test]
+    fn round_notify_shares_one_waiter_thread_for_repeated_calls_on_the_same_round() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+
+        let mut receivers = Vec::new();
+        for _ in 0..500 {
+            receivers.push(bridge.round_notify(Round(1_000)));
+        }
+        assert_eq!(
+            bridge.notify_threads_spawned(),
+            1,
+            "500 round_notify calls for the same pending round must spawn exactly one thread"
+        );
+
+        // A different round gets its own waiter (rounds advance monotonically,
+        // so this is bounded by rounds, not by events).
+        let _ = bridge.round_notify(Round(1_001));
+        assert_eq!(bridge.notify_threads_spawned(), 2);
+
+        // An already-available round never needs a thread.
+        let _ = bridge.round_notify(Round(0));
+        assert_eq!(bridge.notify_threads_spawned(), 2);
     }
 
     // -- LookupAgreement (issue #824 theme 6 — go's `TestLookupAgreement`) --
