@@ -31,3 +31,6 @@ docker/.stress-template.rendered.json
 # it as a workflow artifact; a local run with the same OUT_DIR lands here
 # too. See .github/workflows/consensus-cluster.yml.
 /consensus-artifacts/
+
+__pycache__/
+*.pyc

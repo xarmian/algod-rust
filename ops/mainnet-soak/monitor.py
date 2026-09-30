@@ -185,6 +185,28 @@ def is_verifying_signature(sample: dict) -> bool:
     return import_done and not verify_done
 
 
+def is_downloading_signature(sample: dict) -> bool:
+    """True if `sample` shows a catchpoint catchup whose every progress
+    counter and total is still zero: the catchpoint *file download*, before
+    the importer has read the header (issue #1650 live dispatch: a slow relay
+    took ~5 minutes to serve the file, tripping the 5-minute stuck rule with
+    the node perfectly healthy). Given the same longer allowance as verify."""
+    node = sample.get("node") or {}
+    if not node.get("ok", False) or not (node.get("catchpoint") or ""):
+        return False
+    keys = (
+        "catchpoint_total_blocks",
+        "catchpoint_total_accounts",
+        "catchpoint_total_kvs",
+        "catchpoint_acquired_blocks",
+        "catchpoint_processed_accounts",
+        "catchpoint_processed_kvs",
+        "catchpoint_verified_accounts",
+        "catchpoint_verified_kvs",
+    )
+    return all(node.get(k) == 0 for k in keys)
+
+
 def peer_advancing_between(samples, start_idx, end_idx):
     """True if the peer's own reported `last_round` increased anywhere in
     samples[start_idx..=end_idx], or the peer was simply unreachable for
@@ -268,7 +290,11 @@ def classify(
             last_change_ts = s["ts"]
 
     stalled_for = samples[-1]["ts"] - last_change_ts
-    verifying = last_sig is not None and last_sig[0] == "catchup" and is_verifying_signature(samples[-1])
+    verifying = (
+        last_sig is not None
+        and last_sig[0] == "catchup"
+        and (is_verifying_signature(samples[-1]) or is_downloading_signature(samples[-1]))
+    )
     effective_halt_s = (verify_halt_minutes * 60.0) if verifying else halt_s
 
     if stalled_for < effective_halt_s:
@@ -543,7 +569,9 @@ def collect(
                 unreachable_since = None
             elif node.get("ok", False):
                 unreachable_since = None
-                last_ok_was_verifying = is_verifying_signature(samples[-1])
+                last_ok_was_verifying = is_verifying_signature(samples[-1]) or is_downloading_signature(
+                    samples[-1]
+                )
             else:
                 if unreachable_since is None:
                     unreachable_since = now
