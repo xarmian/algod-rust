@@ -1413,6 +1413,21 @@ pub(crate) fn inspect_resource_blob(data: &[u8]) -> ResourceMeta {
             meta.has_ownership = true;
             meta.has_holding = false;
         }
+        // Issue #1654: go sets EmptyAsset (4) / EmptyApp (8) whenever the
+        // asset / app fields are all zero (`ResourcesData.SetAssetHolding`
+        // and friends, trackerdb/data.go) -- so a zero-balance, unfrozen
+        // asset opt-in, or an app opt-in with empty local state, arrives in
+        // a go catchpoint as a blob with *no* field keys and `y` = 4 / 8
+        // (plus 2 when it also owns the resource). Holding is the absence of
+        // NotHolding (1), ownership is bit 2. Without this those holdings
+        // were invisible and e.g. the first transfer into a freshly opted-in
+        // account failed with "receiver has no holding ... (not opted in)".
+        f if f & (4 | 8) != 0 => {
+            if f & 2 != 0 {
+                meta.has_ownership = true;
+            }
+            meta.has_holding = f & 1 == 0;
+        }
         _ => {}
     }
 
@@ -13129,6 +13144,27 @@ mod tests {
         assert_eq!(ledger.current_round, Round(3), "must use tracker round");
         assert_eq!(ledger.protocol, "vCommitted");
         assert_eq!(ledger.txn_counter, 33);
+    }
+
+    /// Issue #1654: go encodes a zero-balance, unfrozen asset holding (and an
+    /// app opt-in with empty local state) as a resource blob with only the
+    /// `y` flags (4 = EmptyAsset, 8 = EmptyApp) -- it must still read back as
+    /// a holding, otherwise the first transfer into a freshly opted-in
+    /// account is rejected ("receiver has no holding ... not opted in").
+    #[test]
+    fn inspect_resource_blob_treats_empty_asset_and_app_flags_as_holdings() {
+        // {"y": 4}
+        let empty_asset = [0x81, 0xa1, b'y', 0x04];
+        let meta = inspect_resource_blob(&empty_asset);
+        assert!(meta.has_holding && !meta.has_ownership);
+        assert_eq!(decode_asset_holding(&empty_asset).unwrap().amount, 0);
+        // {"y": 8}
+        assert!(inspect_resource_blob(&[0x81, 0xa1, b'y', 0x08]).has_holding);
+        // {"y": 6}: owns an (all-zero-params) asset and holds it.
+        let m = inspect_resource_blob(&[0x81, 0xa1, b'y', 0x06]);
+        assert!(m.has_holding && m.has_ownership);
+        // {"y": 5}: EmptyAsset marker but NotHolding -> no holding.
+        assert!(!inspect_resource_blob(&[0x81, 0xa1, b'y', 0x05]).has_holding);
     }
 
     #[test]
