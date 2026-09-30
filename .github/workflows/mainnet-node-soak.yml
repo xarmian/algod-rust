@@ -247,14 +247,18 @@ jobs:
           # stderr into the CSV file / `/dev/null` respectively) specifically
           # to avoid that trap.
           (
-            echo "timestamp,free_h,algod_rss_kb,algod_cpu_pct,load_avg" > mainnet-soak-artifacts/resource-log.csv
+            echo "timestamp,free_h,algod_rss_kb,algod_cpu_pct,load_avg,algod_threads,all_threads,open_fds" > mainnet-soak-artifacts/resource-log.csv
             while true; do
               TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
               FREE_LINE="$(free -m | awk '/^Mem:/ {printf "used=%sMiB/avail=%sMiB", $3, $7}')"
               LOADAVG="$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo n/a)"
               # RSS + %CPU of the algod-rust node process specifically, if running.
               ALGOD_STATS="$(ps -C algod-rust -o rss=,pcpu= 2>/dev/null | awk '{rss+=$1; cpu+=$2} END {if (NR>0) printf "%d,%.1f", rss, cpu; else print "n/a,n/a"}')"
-              echo "${TS},\"${FREE_LINE}\",${ALGOD_STATS},\"${LOADAVG}\"" >> mainnet-soak-artifacts/resource-log.csv
+              APID="$(pgrep -x algod-rust 2>/dev/null | head -n 1)"
+              ATHREADS="$( [ -n "$APID" ] && ls /proc/$APID/task 2>/dev/null | wc -l || echo n/a )"
+              AFDS="$( [ -n "$APID" ] && ls /proc/$APID/fd 2>/dev/null | wc -l || echo n/a )"
+              ALLTHREADS="$(ps -eLf 2>/dev/null | wc -l)"
+              echo "${TS},\"${FREE_LINE}\",${ALGOD_STATS},\"${LOADAVG}\",${ATHREADS},${ALLTHREADS},${AFDS}" >> mainnet-soak-artifacts/resource-log.csv
               sleep 10
             done
           ) </dev/null >/dev/null 2>&1 &
@@ -452,19 +456,69 @@ jobs:
 
       - name: Poll node + peer status and detect a halt
         id: monitor
+        # Hard step-level cap so a wedged monitor/node can never hold the job
+        # until the 90-minute job timeout (which cancels the job and skips the
+        # artifact-upload steps -- issue #1650's live verification lost two
+        # whole dispatches' evidence that way). Must leave the later
+        # `if: always()` steps (teardown, summary, upload) time to run.
+        timeout-minutes: 80
         env:
           ALGOD_URL: ${{ steps.params.outputs.algod_url }}
         run: |
           set +e
+          # Owned by this shell, not by python: monitor.py enforces
+          # --duration-minutes itself, but a python process blocked in a
+          # syscall (DNS, a wedged node) never gets to check its own clock.
+          # Run it in the background and enforce a wall-clock deadline from
+          # here, while emitting a heartbeat line every 60s so a run that
+          # dies mid-way still leaves live evidence in the job log
+          # (not only in artifacts that may never upload).
+          # stdin/stdout/stderr of the child are redirected away from this
+          # step's streams (see the profiling step's note on the runner-hang
+          # trap); its output is replayed below.
+          DURATION_MIN="${{ steps.params.outputs.duration_minutes }}"
+          DEADLINE=$(( $(date +%s) + DURATION_MIN * 60 + 180 ))
           python3 ops/mainnet-soak/monitor.py collect \
             --node-url http://127.0.0.1:8180 \
             --node-token "$ALGOD_TOKEN" \
             --peer-url "$ALGOD_URL" \
-            --duration-minutes "${{ steps.params.outputs.duration_minutes }}" \
+            --duration-minutes "$DURATION_MIN" \
             --halt-minutes "${{ steps.params.outputs.halt_minutes }}" \
             --out mainnet-soak-artifacts/status.jsonl \
-            --json-out mainnet-soak-artifacts/summary.json
-          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+            --json-out mainnet-soak-artifacts/summary.json \
+            </dev/null > mainnet-soak-artifacts/monitor.out 2>&1 &
+          MON_PID=$!
+          CAPPED=0
+          NODE_PID="${{ steps.start_node.outputs.node_pid }}"
+          while kill -0 "$MON_PID" 2>/dev/null; do
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "::warning::hard wall-clock cap hit (${DURATION_MIN}m + 3m); killing monitor.py"
+              kill -TERM "$MON_PID" 2>/dev/null; sleep 5; kill -KILL "$MON_PID" 2>/dev/null
+              CAPPED=1
+              break
+            fi
+            THREADS="$(ls /proc/$NODE_PID/task 2>/dev/null | wc -l)"
+            TOTAL_THREADS="$(ps -eLf 2>/dev/null | wc -l)"
+            LAST="$(tail -n 1 mainnet-soak-artifacts/status.jsonl 2>/dev/null | python3 ops/mainnet-soak/heartbeat.py 2>&1)"
+            echo "heartbeat $(date -u +%H:%M:%SZ) node_threads=$THREADS all_threads=$TOTAL_THREADS $LAST"
+            # Milestones from the node's own log (sync phases, the issue
+            # #1650 fast-forward, participation restarts) as they happen.
+            grep -a -E 'sync state transition|cutover (complete|finalized)|fast-forwarded acctrounds|issue #1650|consensus participation [(]re[)]started|reloaded ledger|live catchpoint catchup (completed|failed)|panicked' \
+              mainnet-soak-artifacts/node.log 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g' | tail -n 3 | cut -c1-300
+            sleep 60
+          done
+          wait "$MON_PID" 2>/dev/null
+          RC=$?
+          cat mainnet-soak-artifacts/monitor.out 2>/dev/null
+          if [ "$CAPPED" -eq 1 ]; then
+            # monitor.py never got to write its verdict; derive one from the
+            # partial JSONL it flushed sample-by-sample, so a capped run
+            # still yields a verdict + summary instead of a silent hang.
+            python3 ops/mainnet-soak/monitor.py analyze mainnet-soak-artifacts/status.jsonl \
+              --json-out mainnet-soak-artifacts/summary.json
+            RC=$?
+          fi
+          echo "exit_code=$RC" >> "$GITHUB_OUTPUT"
           set -e
 
       - name: Tear down the node
