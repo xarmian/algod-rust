@@ -904,8 +904,20 @@ impl CatchupService {
         // sender clone drops and the channel closes, or `join` below would
         // deadlock waiting on a worker that is waiting on us.
         let mut stopped = false;
+        let recv_started = std::time::Instant::now();
+        let mut first_result_logged = false;
 
         for (round, outcome) in result_rx.iter() {
+            if !first_result_logged {
+                first_result_logged = true;
+                if recv_started.elapsed() > Duration::from_secs(5) {
+                    warn!(
+                        round,
+                        elapsed_ms = recv_started.elapsed().as_millis() as u64,
+                        "catchup service: first fetch result of this pass arrived slowly"
+                    );
+                }
+            }
             if stopped {
                 continue;
             }
@@ -978,7 +990,20 @@ impl CatchupService {
                             break 'apply;
                         };
 
-                        if let Err(reason) = ledger.authenticate_block(&block, &cert) {
+                        // Issue #1654 diagnostics: a freshly caught-up node was
+                        // unresponsive for minutes on its first sync pass;
+                        // log any step of the apply path that is slow so the
+                        // next live run names the culprit.
+                        let step_started = std::time::Instant::now();
+                        let auth_result = ledger.authenticate_block(&block, &cert);
+                        if step_started.elapsed() > Duration::from_secs(1) {
+                            warn!(
+                                round = %expected_round,
+                                elapsed_ms = step_started.elapsed().as_millis() as u64,
+                                "catchup service: slow authenticate_block"
+                            );
+                        }
+                        if let Err(reason) = auth_result {
                             warn!(
                                 round = %expected_round,
                                 reason = %reason,
@@ -991,10 +1016,19 @@ impl CatchupService {
                             break 'apply;
                         }
 
-                        match algo_validate::contents_match_header(
+                        let step_started = std::time::Instant::now();
+                        let contents_result = algo_validate::contents_match_header(
                             &block,
                             fetched_block.raw_payset_blobs.as_deref(),
-                        ) {
+                        );
+                        if step_started.elapsed() > Duration::from_secs(1) {
+                            warn!(
+                                round = %expected_round,
+                                elapsed_ms = step_started.elapsed().as_millis() as u64,
+                                "catchup service: slow contents_match_header"
+                            );
+                        }
+                        match contents_result {
                             Ok(true) => {}
                             Ok(false) => {
                                 warn!(
@@ -1021,7 +1055,15 @@ impl CatchupService {
                             }
                         }
 
+                        let step_started = std::time::Instant::now();
                         ledger.ensure_block(&block, &cert);
+                        if step_started.elapsed() > Duration::from_secs(1) {
+                            warn!(
+                                round = %expected_round,
+                                elapsed_ms = step_started.elapsed().as_millis() as u64,
+                                "catchup service: slow ensure_block"
+                            );
+                        }
                         fetched += 1;
 
                         // `ensure_block` is best-effort; if the ledger did
