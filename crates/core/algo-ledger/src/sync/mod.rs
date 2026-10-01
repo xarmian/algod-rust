@@ -1725,7 +1725,26 @@ impl SyncOrchestrator {
         let window_applied = self.replay_lookback_window(catchpoint_round)?;
 
         // Determine target: current network round, capped by end_round if set.
-        let network_round = self.backend.get_current_round()?;
+        //
+        // Issue #1654 (live soak 36812812222): the live-catchup peer is
+        // commonly a relay's gossip port, which has no `/v2/*` routes, so
+        // `/v2/status` answers 404 even though the catchpoint file and block
+        // service work. That used to fail the whole catchup *after* the
+        // lookback window had already been replayed. A 404 here only means
+        // "this peer cannot tell us the tip": stop at the catchpoint round
+        // and let the node's normal catchup service continue from there.
+        let network_round = match self.backend.get_current_round() {
+            Ok(r) => r,
+            Err(AlgoError::NotFound(msg)) => {
+                tracing::warn!(
+                    error = %msg,
+                    catchpoint_round,
+                    "peer cannot report the network round (no /v2/status); ending catchpoint                      replay at the catchpoint round"
+                );
+                catchpoint_round
+            }
+            Err(e) => return Err(e),
+        };
         let target_round = match self.config.end_round {
             Some(end) => std::cmp::min(network_round, end),
             None => network_round,
@@ -3704,6 +3723,8 @@ mod tests {
         receiver: [u8; 32],
         window_round: u64,
         spend_round: u64,
+        /// Emulate a relay gossip port: `/v2/status` answers 404.
+        status_not_found: bool,
     }
 
     impl WindowBackend {
@@ -3761,6 +3782,11 @@ mod tests {
         }
 
         fn get_current_round(&self) -> Result<u64, AlgoError> {
+            if self.status_not_found {
+                return Err(AlgoError::NotFound(
+                    "GET /v2/status: 404 page not found".to_string(),
+                ));
+            }
             Ok(self.spend_round)
         }
 
@@ -3822,6 +3848,7 @@ mod tests {
                 receiver: RECEIVER,
                 window_round: BALANCES_ROUND + 1,
                 spend_round: BLOCKS_ROUND + 1,
+                status_not_found: false,
             },
         );
 
@@ -3842,6 +3869,63 @@ mod tests {
             .expect("receiver funded inside the window must exist");
         assert_eq!(receiver.micro_algos, 5_000_000 - 1_000 - 1_000);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #1654 (live soak 36812812222): a relay-gossip catchup peer has
+    /// no `/v2/status`; after the window replay the missing network round
+    /// must end the replay at the catchpoint round, not fail the catchup.
+    #[test]
+    fn replay_ends_at_catchpoint_round_when_peer_has_no_v2_status() {
+        use crate::catchpoint::writer::{export_catchpoint_file, ExportOptions};
+
+        const BALANCES_ROUND: u64 = 1000;
+        const BLOCKS_ROUND: u64 = BALANCES_ROUND + 320;
+        const PAYER: [u8; 32] = [1u8; 32];
+
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-no-v2-status-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = window_source_db(PAYER, 10_000_000);
+        let path = dir.join("go-shaped.tar.gz");
+        let export_result = export_catchpoint_file(
+            &src,
+            &path,
+            &ExportOptions {
+                balances_round: BALANCES_ROUND,
+                blocks_round: BLOCKS_ROUND,
+                block_header_digest: [7u8; 32],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut config = test_config(dir.join("ledger"), 1);
+        config.catchpoint_label = Some(export_result.label.clone());
+        let mut orchestrator = SyncOrchestrator::with_backend(
+            config,
+            WindowBackend {
+                source_file: path,
+                payer: PAYER,
+                receiver: [2u8; 32],
+                window_round: BALANCES_ROUND + 1,
+                spend_round: BLOCKS_ROUND + 1,
+                status_not_found: true,
+            },
+        );
+        orchestrator.run_download_ledger().unwrap();
+        orchestrator.run_import_ledger().unwrap();
+        orchestrator.run_verify_ledger().unwrap();
+        orchestrator.run_download_lookback().unwrap();
+        orchestrator
+            .run_replay_blocks()
+            .expect("a peer without /v2/status must not fail the replay");
+        assert_eq!(orchestrator.final_round, BLOCKS_ROUND);
+        let ledger =
+            crate::sqlite::SqliteLedger::open_with_prefix(&orchestrator.config.db_path).unwrap();
+        assert_eq!(ledger.current_round().0, BLOCKS_ROUND);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3917,6 +4001,7 @@ mod tests {
                 receiver: [2u8; 32],
                 window_round: BALANCES_ROUND + 1,
                 spend_round: BLOCKS_ROUND + 1,
+                status_not_found: false,
             },
         );
         orchestrator.run_download_ledger().unwrap();
