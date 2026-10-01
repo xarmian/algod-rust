@@ -3337,8 +3337,19 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
             // `update_round`. Mirrors go's real update-round tracking,
             // which only ever touches an account that some other write
             // path actually persisted (`putAccount`) this round.
+            //
+            // Issue #1654: likewise for the receiver of a zero-amount `pay`
+            // (go's `Move` never writes it), otherwise this stamp leaves a
+            // zero-balance stub with a non-zero `update_round`, which is not
+            // `AccountData::default()` and trips the min-balance check on
+            // the next zero-amount pay to the same account (live mainnet
+            // block 65539712, after 65539696 created the stub).
+            let is_unwritten_pay_receiver = *addr == txn.receiver
+                && txn.txn_type == "pay"
+                && txn.amount == 0
+                && txn.close_remainder_to.is_zero();
             if ctx.consensus.unfunded_senders
-                && *addr == txn.sender
+                && (*addr == txn.sender || is_unwritten_pay_receiver)
                 && store.get_account(addr).is_none()
             {
                 continue;
@@ -9670,14 +9681,21 @@ mod tests {
         let txn = pay_txn(sender, receiver, 0, 1_000);
         apply_transaction(&mut store, &txn, &ctx, 0)
             .expect("zero-amount pay to an empty account must apply");
-        // (Only an `update_round` stamp may remain; no rewards bookkeeping.)
-        if let Some(acct) = store.get_account(&receiver) {
-            assert_eq!(acct.micro_algos, 0);
-            assert_eq!(
-                acct.rewards_base, 0,
-                "an untouched empty receiver must not get a rewards_base write"
-            );
-        }
+        assert!(
+            store.get_account(&receiver).is_none(),
+            "an untouched empty receiver must stay non-existent"
+        );
+        // A second zero-amount pay to the same account (live block 65539712)
+        // must apply as well.
+        let ctx2 = {
+            let mut c =
+                apply_context_for_version(fee_sink, 2, algo_types::consensus::CONSENSUS_V34);
+            c.rewards_level = 12_345;
+            c
+        };
+        apply_transaction(&mut store, &pay_txn(sender, receiver, 0, 1_000), &ctx2, 0)
+            .expect("second zero-amount pay to the same empty account must apply");
+        assert!(store.get_account(&receiver).is_none());
     }
 
     #[test]
