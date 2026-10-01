@@ -3277,7 +3277,16 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
         // Check min balance for all touched accounts after the transaction.
         // Go checks all modified accounts per-transaction (skipping FeeSink,
         // RewardsPool, StateProofSender, and zeroed-out accounts).
-        {
+        //
+        // Issue #1654: go runs `checkMinBalance` once per *top-level*
+        // transaction (`BlockEvaluator.transaction`), never between the
+        // inner transactions of an app call, so an inner payment may
+        // transiently take an account below its minimum as long as a later
+        // inner transaction (closing a holding, closing the account) restores
+        // it (live mainnet block 65549710: pay 200000 out, then asset
+        // opt-out, then close-out). Replaying an already-validated block
+        // must therefore only check at depth 0.
+        if !(ctx.mode == ApplyMode::Replay && depth > 0) {
             let rewards_pool_addr = store.rewards_pool();
             for addr in snapshot_addrs {
                 // Skip special accounts that are exempt from min balance checks.
@@ -9696,6 +9705,27 @@ mod tests {
         apply_transaction(&mut store, &pay_txn(sender, receiver, 0, 1_000), &ctx2, 0)
             .expect("second zero-amount pay to the same empty account must apply");
         assert!(store.get_account(&receiver).is_none());
+    }
+
+    /// Issue #1654 (live mainnet block 65549710): go checks minimum balances
+    /// once per top-level transaction, so an inner transaction (depth > 0)
+    /// may transiently leave an account below its minimum while replaying.
+    #[test]
+    fn replay_defers_min_balance_check_for_inner_transactions() {
+        let sender = Address([7u8; 32]);
+        let receiver = Address([8u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let ctx = apply_context_for_version(fee_sink, 1, algo_types::consensus::CONSENSUS_V34);
+        let txn = pay_txn(sender, receiver, 100_000, 0);
+
+        let mut top = make_state_with_accounts(&[(sender, 150_000), (fee_sink, 0)], fee_sink);
+        let err = apply_transaction(&mut top, &txn, &ctx, 0)
+            .expect_err("top-level payment below min balance must be rejected");
+        assert!(format!("{err}").contains("below minimum balance"), "{err}");
+
+        let mut inner = make_state_with_accounts(&[(sender, 150_000), (fee_sink, 0)], fee_sink);
+        apply_transaction(&mut inner, &txn, &ctx, 1)
+            .expect("an inner transaction may transiently dip below the minimum");
     }
 
     #[test]
