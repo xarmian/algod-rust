@@ -3464,7 +3464,16 @@ pub fn apply_pay<L: crate::store_trait::LedgerStore>(
             });
         }
         sender.micro_algos -= txn.amount;
-        store.set_account(&txn.sender, sender);
+        // Issue #1654 (live mainnet block 65561121, zero-fee zero-amount
+        // self-payments from a non-existent account): go's `Move` writes the
+        // sender only when `!amt.IsZero() || rewardUnits > 0 ||
+        // !UnfundedSenders`. Writing an account that does not exist
+        // materialises a stub that the update-round pass then stamps,
+        // leaving a non-default zero-balance account that fails the
+        // min-balance check of the next transaction touching it.
+        if txn.amount > 0 || store.get_account(&txn.sender).is_some() {
+            store.set_account(&txn.sender, sender);
+        }
 
         if txn.amount > 0 {
             let mut receiver = store.get_or_default_account(&txn.receiver);
@@ -6245,6 +6254,23 @@ mod tests {
             state.get_account(&ghost).is_none(),
             "an account nothing wrote must not be created"
         );
+    }
+
+    /// Issue #1654 (live mainnet block 65561121): repeated zero-fee,
+    /// zero-amount self-payments from a non-existent account must all apply
+    /// and leave the account non-existent.
+    #[test]
+    fn unfunded_zero_fee_self_payments_do_not_materialise_the_account() {
+        let ghost = Address([9u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut state = make_state_with_accounts(&[(fee_sink, 0)], fee_sink);
+        let mut ctx = apply_context_for_version(fee_sink, 5, algo_types::consensus::CONSENSUS_V34);
+        ctx.rewards_level = 12_345;
+        for _ in 0..3 {
+            apply_transaction(&mut state, &pay_txn(ghost, ghost, 0, 0), &ctx, 0)
+                .expect("zero-fee zero-amount self payment from an unfunded sender");
+        }
+        assert!(state.get_account(&ghost).is_none());
     }
 
     #[test]
