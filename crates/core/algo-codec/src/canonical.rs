@@ -181,9 +181,13 @@ impl CanonicalMap {
         }
     }
 
+    /// Variable-length `[]byte` (box names, programs): Go's omitempty is
+    /// length-only, so a non-empty all-zero value must still be encoded
+    /// (issue #1654: a box reference named with eight zero bytes was dropped,
+    /// changing the txid and every block commitment of the enclosing block).
     fn add_option_bytes(&mut self, key: &'static str, val: &Option<ByteBuf>) {
         if let Some(b) = val {
-            self.add_bytes(key, b);
+            self.add_var_bytes(key, b);
         }
     }
 
@@ -4249,6 +4253,38 @@ mod tests {
     }
 
     /// Matches go's `TestMarshalUnmarshalBoxRef`/`TestRandomizedEncodingBoxRef`.
+    /// Issue #1654 (live mainnet block 65560513): a box reference whose name
+    /// is non-empty but all zero bytes must keep its `n` field. It was
+    /// dropped (fixed-size-digest omit rule applied to a variable-length
+    /// `[]byte`), so the txid and every payset commitment of the block
+    /// mismatched the header and the node refused the block.
+    #[test]
+    fn box_ref_all_zero_name_is_encoded() {
+        let bref = BoxRef {
+            index: 2,
+            name: Some(ByteBuf::from(vec![0u8; 8])),
+        };
+        let enc = canonical_encode_box_ref(&bref);
+        let v: rmpv::Value = rmpv::decode::read_value(&mut &enc[..]).unwrap();
+        let m = v.as_map().unwrap();
+        let n = m
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("n"))
+            .expect("n present");
+        assert_eq!(n.1.as_slice().unwrap(), &[0u8; 8]);
+        // And the empty name is still omitted.
+        let empty = canonical_encode_box_ref(&BoxRef {
+            index: 2,
+            name: Some(ByteBuf::from(vec![])),
+        });
+        let ev: rmpv::Value = rmpv::decode::read_value(&mut &empty[..]).unwrap();
+        assert!(ev
+            .as_map()
+            .unwrap()
+            .iter()
+            .all(|(k, _)| k.as_str() != Some("n")));
+    }
+
     #[test]
     fn box_ref_randomized_roundtrip() {
         assert_state_proof_roundtrip(0x1740_0011, gen_box_ref_nonempty, canonical_encode_box_ref);
