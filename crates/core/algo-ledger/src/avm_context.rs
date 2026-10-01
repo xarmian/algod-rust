@@ -14341,7 +14341,11 @@ mod tests {
     }
 
     #[test]
-    fn inner_appl_delete_by_non_creator_fails() {
+    fn inner_appl_delete_by_non_creator_succeeds_when_program_approves() {
+        // Issue #1654: go's `deleteApplication` has no creator check -- who
+        // may delete is decided solely by the approval program (here: always
+        // approve). The previous Rust-only creator check failed live mainnet
+        // block 65549861 (sender YJR4... deleting an app it did not create).
         // App 100 created by [1u8;32], inner sender is app 42's address.
         let mut store = LedgerState::new();
         setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
@@ -14373,15 +14377,9 @@ mod tests {
         ctx.itxn_field(25, TealValue::Uint(5)).unwrap(); // OnCompletion = DeleteApplication
         let result = ctx.itxn_submit();
 
-        assert!(result.is_err(), "non-creator delete should fail");
-        let msg = format!("{}", result.unwrap_err());
-        assert!(
-            msg.contains("not the creator"),
-            "expected creator check error, got: {msg}"
-        );
+        assert!(result.is_ok(), "approved non-creator delete: {result:?}");
         drop(ctx);
-        // App should still exist.
-        assert!(store.has_app_params(100));
+        assert!(!store.has_app_params(100), "app must be deleted");
     }
 
     #[test]

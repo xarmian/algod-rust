@@ -4213,14 +4213,10 @@ pub(crate) fn apply_appl_on_completion<L: crate::store_trait::LedgerStore>(
         }
         ON_COMPLETION_DELETE => {
             if let Some(existing) = store.get_app_params(app_id) {
-                if txn.sender != existing.creator {
-                    return Err(err_ctx.error(format!(
-                        "{} delete: sender {} is not the creator of app {}",
-                        err_ctx.prefix(),
-                        txn.sender,
-                        app_id,
-                    )));
-                }
+                // go-algorand's `ApplicationCall` -> `deleteApplication`
+                // (`ledger/apply/application.go`) has no sender-is-creator
+                // check: who may delete is decided solely by the approval
+                // program (issue #1654, live mainnet block 65549861).
                 let creator = existing.creator;
                 let global_schema = existing.global_state_schema.clone();
                 let extra_program_pages = existing.extra_program_pages;
