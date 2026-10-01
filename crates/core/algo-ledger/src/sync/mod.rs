@@ -1575,6 +1575,39 @@ impl SyncOrchestrator {
         Ok(())
     }
 
+    /// Fold the write-ahead logs left behind by the bulk import/verify/replay
+    /// phases back into the database files, here, in the (already blocking)
+    /// catchup thread.
+    ///
+    /// Issue #1654 (live soaks 36840159580 / 36847896268): right after a
+    /// catchup the node was completely unresponsive for 150-200 s -- REST
+    /// timed out and the first block-sync pass took ~160 s, while every
+    /// later pass took under a second per block -- consistent with the first
+    /// ordinary commit paying for checkpointing a multi-GB WAL while holding
+    /// the ledger lock. Best-effort: failure only costs that latency.
+    fn checkpoint_wal_after_sync(&self) {
+        let started = Instant::now();
+        let conn = match self.open_db() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "post-sync WAL checkpoint: could not open database");
+                return;
+            }
+        };
+        for pragma in [
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+            "PRAGMA blockdb.wal_checkpoint(TRUNCATE)",
+        ] {
+            if let Err(e) = conn.query_row(pragma, [], |_| Ok(())) {
+                tracing::warn!(error = %e, pragma, "post-sync WAL checkpoint failed");
+            }
+        }
+        tracing::info!(
+            elapsed_secs = started.elapsed().as_secs_f64(),
+            "post-sync WAL checkpoint complete"
+        );
+    }
+
     /// Apply the lookback-window blocks `(tracker_round, catchpoint_round]`
     /// stored by [`Self::run_download_lookback`] when the tracker
     /// (`acctrounds('acctbase')`) is still behind `catchpoint_round` -- the
@@ -2416,6 +2449,7 @@ impl SyncOrchestrator {
 
         // Phase 5: ReplayingBlocks (ordinal 5)
         self.run_replay_blocks()?;
+        self.checkpoint_wal_after_sync();
 
         Ok(SyncResult {
             final_round: self.final_round,
