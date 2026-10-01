@@ -3174,7 +3174,20 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
             }
             "acfg" => {
                 apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink, &ctx.consensus)?;
-                let ad = apply_acfg(store, &stx.txn, ctx.txn_counter.get(), &ctx.consensus)?;
+                // Replaying a committed block: the block records the created
+                // asset id (`caid`), which is authoritative. Deriving it from
+                // the running counter is off by one for an inner create (the
+                // enclosing app call has not been counted yet) -- issue
+                // #1654.
+                let counter = if ctx.mode == ApplyMode::Replay
+                    && txn.config_asset == 0
+                    && stx.apply_data_config_asset != 0
+                {
+                    stx.apply_data_config_asset - 1
+                } else {
+                    ctx.txn_counter.get()
+                };
+                let ad = apply_acfg(store, &stx.txn, counter, &ctx.consensus)?;
                 apply_data.config_asset = ad.config_asset;
             }
             "axfer" => {
@@ -6177,6 +6190,27 @@ mod tests {
         ctx.txn_counter.set(asset_id - 1);
         let stx = acfg_create_txn(creator, 1_000, params);
         apply_transaction(state, &stx, ctx, 0).unwrap();
+    }
+
+    /// Issue #1654 (live mainnet, asset 3727639599): when replaying a block,
+    /// the asset id created by an acfg must be the one the block recorded
+    /// (`caid`), not `ctx.txn_counter + 1`. For an inner create the counter
+    /// has not yet been advanced past the enclosing app call, so deriving it
+    /// is off by one and a later destroy of the real id found no asset.
+    #[test]
+    fn replay_acfg_create_uses_block_recorded_asset_id() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut state = make_state_with_accounts(&[(sender, 10_000_000), (fee_sink, 0)], fee_sink);
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
+        ctx.txn_counter.set(100);
+
+        let mut stx = acfg_create_txn(sender, 1_000, AssetParams::default());
+        stx.apply_data_config_asset = 102;
+        apply_transaction(&mut state, &stx, &ctx, 1).unwrap();
+
+        assert!(state.get_asset_params(102).is_some(), "recorded id used");
+        assert!(state.get_asset_params(101).is_none(), "no derived id");
     }
 
     #[test]
