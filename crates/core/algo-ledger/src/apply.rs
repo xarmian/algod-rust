@@ -3376,6 +3376,15 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
             {
                 continue;
             }
+            // Issue #1654 (live mainnet block 65560235): an address that is
+            // merely *referenced* (foreign accounts, app-call accounts) and
+            // that nothing wrote does not exist, and must not be created by
+            // this bookkeeping pass -- the resulting zero-balance stub has a
+            // non-zero `update_round`, is not `AccountData::default()`, and
+            // trips the min-balance check of the next transaction touching it.
+            if store.get_account(addr).is_none() {
+                continue;
+            }
             let mut account = store.get_or_default_account(addr);
             if account.update_round < ctx.round {
                 account.update_round = ctx.round;
@@ -6211,6 +6220,31 @@ mod tests {
 
         assert!(state.get_asset_params(102).is_some(), "recorded id used");
         assert!(state.get_asset_params(101).is_none(), "no derived id");
+    }
+
+    /// Issue #1654: a referenced-but-never-written account must not be
+    /// materialised (as a zero-balance `update_round` stub) by a transaction
+    /// that merely touches it in its account list.
+    #[test]
+    fn referenced_nonexistent_account_is_not_created_by_update_round_stamp() {
+        let sender = Address([1u8; 32]);
+        let other = Address([2u8; 32]);
+        let ghost = Address([9u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(sender, 900_000), (other, 500_000), (fee_sink, 0)],
+            fee_sink,
+        );
+        let ctx = apply_context_for_version(fee_sink, 5, algo_types::consensus::CONSENSUS_V34);
+        // Zero-amount pay to `ghost` that also closes the sender out to
+        // `other`: `ghost` is only referenced, nothing writes it.
+        let mut pay = pay_txn(sender, ghost, 0, 1_000);
+        pay.txn.close_remainder_to = other;
+        apply_transaction(&mut state, &pay, &ctx, 0).unwrap();
+        assert!(
+            state.get_account(&ghost).is_none(),
+            "an account nothing wrote must not be created"
+        );
     }
 
     #[test]
