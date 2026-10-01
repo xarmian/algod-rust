@@ -381,6 +381,24 @@ impl LedgerReader for AgreementLedgerBridge {
             return Ok(OnlineAccountData::default());
         }
 
+        // Issue #1654 (live soak 36926581071, block 65574392: certificate
+        // weight 1111 < threshold 1112): go's `LookupAgreement` returns
+        // `MicroAlgosWithRewards` -- the account's balance with the rewards
+        // pending at the *lookup round's* rewards level folded in
+        // (`BaseOnlineAccountData.GetOnlineAccountData`,
+        // `ledger/store/trackerdb/data.go`) -- because that is the stake
+        // sortition weighs. The raw stored balance understates it by the
+        // pending rewards, shifting committee-membership weights by a vote
+        // here and there and eventually failing a certificate quorum.
+        let rewards_level = ledger
+            .get_block_header_data(round.0)
+            .ok()
+            .flatten()
+            .and_then(|hdr| algo_types::BlockHeader::decode_from_bytes(&hdr).ok())
+            .map(|hdr| hdr.rewards_level)
+            .unwrap_or_else(|| ledger.rewards_level());
+        let acct = with_pending_rewards(acct, rewards_level);
+
         Ok(OnlineAccountData {
             micro_algos: acct.micro_algos,
             vote_id: acct.vote_id.unwrap_or([0u8; 32]),
@@ -835,6 +853,20 @@ impl crate::catchup_service::CatchupLedger for AgreementLedgerBridge {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// `acct` with the rewards pending at `rewards_level` folded into its
+/// balance (go's `basics.WithUpdatedRewards`). A level below the account's
+/// `rewards_base` (a lookup at a round older than the stored record) adds
+/// nothing rather than wrapping.
+fn with_pending_rewards(
+    mut acct: algo_types::AccountData,
+    rewards_level: u64,
+) -> algo_types::AccountData {
+    if rewards_level >= acct.rewards_base {
+        crate::rewards::apply_rewards(&mut acct, rewards_level);
+    }
+    acct
+}
+
 /// Extract the committee seed from a msgpack-encoded block header.
 ///
 /// The seed is stored under codec key `"seed"` as a 32-byte binary value.
@@ -953,6 +985,30 @@ mod tests {
         assert_eq!(oad.vote_id, [7u8; 32]);
         assert_eq!(oad.selection_id, [8u8; 32]);
         assert_eq!(oad.vote_key_dilution, 100);
+    }
+
+    /// Issue #1654: the voting stake includes the rewards pending at the
+    /// lookup round's level (go's `MicroAlgosWithRewards`).
+    #[test]
+    fn with_pending_rewards_folds_in_rewards_like_go() {
+        let acct = algo_types::AccountData {
+            micro_algos: 10_000_000_000, // 10_000 reward units
+            rewards_base: 100,
+            status: algo_types::AccountStatus::Online,
+            ..Default::default()
+        };
+        // (level - base) * units = 25 * 10_000
+        assert_eq!(
+            with_pending_rewards(acct.clone(), 125).micro_algos,
+            10_000_250_000
+        );
+        // No change at the account's own level, and no wrap-around for an
+        // older lookup level.
+        assert_eq!(
+            with_pending_rewards(acct.clone(), 100).micro_algos,
+            10_000_000_000
+        );
+        assert_eq!(with_pending_rewards(acct, 50).micro_algos, 10_000_000_000);
     }
 
     #[test]
