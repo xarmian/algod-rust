@@ -1462,6 +1462,13 @@ impl SyncOrchestrator {
             message: format!("create blocks/txtail tables for lookback: {e}"),
         })?;
 
+        // Issue #1654 (live soak 36802941564): the retry loop in
+        // `download_lookback_blocks_with_lookback` retries a failed fetch
+        // immediately, so 1000 attempts against a rate-limiting relay
+        // (HTTP 429) burned the whole budget in ~18 seconds and aborted the
+        // catchup. Back off between *failed* fetches (reset on success) so
+        // the budget spans minutes, not seconds.
+        let mut consecutive_fetch_failures: u32 = 0;
         // Use download_lookback_blocks_with_lookback with callbacks that
         // bridge to the backend, passing the (possibly state-proof-extended)
         // `lookback` computed above.
@@ -1484,10 +1491,22 @@ impl SyncOrchestrator {
                         return Ok(cached);
                     }
                 }
-                let (proto, hdrdata, blkdata) = self.backend.fetch_block_raw(rnd).map_err(|e| {
-                    CatchpointError::VerificationError(format!("fetch lookback block {rnd}: {e}"))
-                })?;
-                Ok((proto, hdrdata, blkdata))
+                match self.backend.fetch_block_raw(rnd) {
+                    Ok(block) => {
+                        consecutive_fetch_failures = 0;
+                        Ok(block)
+                    }
+                    Err(e) => {
+                        let delay_ms = lookback_retry_backoff_ms(consecutive_fetch_failures);
+                        consecutive_fetch_failures = consecutive_fetch_failures.saturating_add(1);
+                        if delay_ms > 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        }
+                        Err(CatchpointError::VerificationError(format!(
+                            "fetch lookback block {rnd}: {e}"
+                        )))
+                    }
+                }
             },
             // store_block callback
             |rnd, proto, hdrdata, blkdata| {
@@ -2386,6 +2405,16 @@ impl SyncOrchestrator {
             duration: start.elapsed(),
         })
     }
+}
+
+/// Delay before retrying a failed lookback block fetch: 250 ms doubling per
+/// consecutive failure, capped at 5 s (zero under `cfg(test)` so the retry
+/// accounting tests stay instantaneous).
+fn lookback_retry_backoff_ms(consecutive_failures: u32) -> u64 {
+    if cfg!(test) {
+        return 0;
+    }
+    (250u64 << consecutive_failures.min(5)).min(5_000)
 }
 
 /// Map a `SyncState` to a numeric ordinal for resume ordering.
