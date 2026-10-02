@@ -3319,7 +3319,15 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
         // validation and simulate through the same evaluator.
         if depth == 0 {
             let rewards_pool_addr = store.rewards_pool();
-            for addr in snapshot_addrs {
+            // Issue #1660: go's `checkMinBalance` covers every account the
+            // top-level transaction modified, including accounts touched only
+            // by inner transactions, so extend the address set with every
+            // participant of the recorded inner transactions.
+            let mut check_addrs: Vec<Address> = snapshot_addrs.to_vec();
+            if let Some(dt) = apply_data.eval_delta.as_ref() {
+                collect_inner_participants(dt, &mut check_addrs, 0);
+            }
+            for addr in &check_addrs {
                 // Skip special accounts that are exempt from min balance checks.
                 if *addr == ctx.fee_sink || *addr == rewards_pool_addr {
                     continue;
@@ -3411,6 +3419,40 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
         }
 
         Ok(apply_data)
+    }
+}
+
+/// Append every account participating in the inner transactions recorded in
+/// `eval_delta` (recursively) to `out`, skipping duplicates and the zero
+/// address. Used by the once-per-top-level-transaction minimum-balance check
+/// (issue #1660), which in go covers all modified accounts.
+fn collect_inner_participants(eval_delta: &rmpv::Value, out: &mut Vec<Address>, nesting: u32) {
+    // Inner transactions nest at most a few levels; bound recursion defensively.
+    if nesting > 16 {
+        return;
+    }
+    let Ok(delta) = parse_eval_delta(eval_delta) else {
+        return;
+    };
+    for inner in delta.inner_txns.iter().flatten() {
+        let t = &inner.txn;
+        let candidates = [
+            Some(t.sender),
+            Some(t.receiver),
+            Some(t.close_remainder_to),
+            t.asset_receiver,
+            t.asset_sender,
+            t.asset_close_to,
+            t.freeze_account,
+        ];
+        for a in candidates.into_iter().flatten() {
+            if !a.is_zero() && !out.contains(&a) {
+                out.push(a);
+            }
+        }
+        if let Some(dt) = inner.eval_delta.as_ref() {
+            collect_inner_participants(dt, out, nesting + 1);
+        }
     }
 }
 
@@ -10028,6 +10070,87 @@ return
                 .unwrap_or(true),
             "app account must have been closed out"
         );
+    }
+
+    /// Issue #1660: go's `BlockEvaluator.transaction` (`ledger/eval/eval.go`)
+    /// runs `checkMinBalance` once after each top-level transaction over
+    /// every account the transaction modified, including accounts touched
+    /// only by inner transactions. An app account paid below its minimum by
+    /// an inner payment, with nothing restoring it, must reject the call.
+    #[test]
+    fn execute_app_call_inner_pay_leaving_app_account_below_min_is_rejected() {
+        let creator = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([9u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(creator, 20_000_000), (fee_sink, 0), (rewards_pool, 0)],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+
+        // Pays 250_000 from the app account to the caller and stops.
+        let approval_src = "#pragma version 8
+            txn ApplicationID
+            bz approve
+            itxn_begin
+            int pay
+            itxn_field TypeEnum
+            txn Sender
+            itxn_field Receiver
+            int 250000
+            itxn_field Amount
+            itxn_submit
+            approve:
+            int 1
+            return
+";
+        let approval = algo_avm::assembler::assemble_string(approval_src)
+            .expect("approval program must assemble")
+            .program;
+        let clear = algo_avm::assembler::assemble_string(
+            "#pragma version 8
+int 1
+return
+",
+        )
+        .expect("clear program must assemble")
+        .program;
+
+        let mk_block = |round: u64, payset: Vec<SignedTransaction>| Block {
+            round: Round(round),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset,
+            ..Block::default()
+        };
+
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = creator;
+        create.txn.fee = 1_000;
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        let delta1 =
+            apply_block_with_delta_mode(&mut state, &mk_block(1, vec![create]), ApplyMode::Execute)
+                .unwrap();
+        let (&app_id, _) = delta1.creatables.iter().next().unwrap();
+        let app_addr = Address(crate::avm_context::app_address(app_id));
+
+        // 300_000 -> 50_000 after the inner pay: below the 100_000 minimum.
+        let fund = pay_txn(creator, app_addr, 300_000, 1_000);
+        apply_block_with_delta_mode(&mut state, &mk_block(2, vec![fund]), ApplyMode::Execute)
+            .unwrap();
+
+        let mut call = SignedTransaction::default();
+        call.txn.txn_type = "appl".into();
+        call.txn.sender = creator;
+        call.txn.fee = 2_000;
+        call.txn.application_id = app_id;
+        let err =
+            apply_block_with_delta_mode(&mut state, &mk_block(3, vec![call]), ApplyMode::Execute)
+                .expect_err("inner pay leaving the app account below its minimum must be rejected");
+        assert!(format!("{err}").contains("below minimum balance"), "{err}");
     }
 
     #[test]
