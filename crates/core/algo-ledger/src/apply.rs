@@ -3122,15 +3122,31 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
             // not write it (live mainnet block 65539696 paid 0 to a
             // non-existent account; the rewards write made it non-default
             // and tripped the min-balance check).
+            //
+            // Issue #1654 (live mainnet block 65582745: an axfer closing a
+            // holding of a destroyed asset out to its long-closed creator
+            // account): the non-sender participants of non-payment
+            // transactions (asset receiver/close-to/clawback source, freeze
+            // target) are never `Move`d in go, so an address of that kind
+            // that does not exist must not be materialised here either --
+            // the stub (rewards_base = current level) is not
+            // `AccountData::default()` and fails the min-balance check. (A
+            // payment receiver with amount > 0 *is* written by go's `Move`,
+            // with its rewards_base brought up to the current level, so it
+            // keeps the write.)
             let unwritten_sender = *addr == txn.sender && txn.fee == 0;
             let unwritten_pay_receiver = *addr != txn.sender
                 && *addr == txn.receiver
                 && txn.txn_type == "pay"
                 && txn.amount == 0;
+            let unwritten_non_pay_participant = *addr != txn.sender && txn.txn_type != "pay";
             let skip_write = ctx.consensus.unfunded_senders
-                && (unwritten_sender || unwritten_pay_receiver)
+                && (unwritten_sender || unwritten_pay_receiver || unwritten_non_pay_participant)
                 && account_before.micro_algos == 0
-                && reward == 0;
+                && reward == 0
+                && (unwritten_sender
+                    || unwritten_pay_receiver
+                    || store.get_account(addr).is_none());
             if !skip_write {
                 store.set_account(addr, account);
             }
@@ -6270,6 +6286,36 @@ mod tests {
             apply_transaction(&mut state, &pay_txn(ghost, ghost, 0, 0), &ctx, 0)
                 .expect("zero-fee zero-amount self payment from an unfunded sender");
         }
+        assert!(state.get_account(&ghost).is_none());
+    }
+
+    /// Issue #1654 (live mainnet block 65582745): an asset opt-out whose
+    /// close-to is an account that does not exist must not materialise it.
+    #[test]
+    fn axfer_close_to_nonexistent_account_does_not_create_it() {
+        let creator = Address([1u8; 32]);
+        let holder = Address([2u8; 32]);
+        let ghost = Address([9u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(creator, 900_000), (holder, 900_000), (fee_sink, 0)],
+            fee_sink,
+        );
+        let ctx = apply_context_for_version(fee_sink, 5, algo_types::consensus::CONSENSUS_V34);
+        create_asset_in_state(&mut state, &ctx, creator, 7, AssetParams::default());
+
+        let axfer = |close_to: Option<Address>| {
+            let mut stx = SignedTransaction::default();
+            stx.txn.txn_type = "axfer".into();
+            stx.txn.sender = holder;
+            stx.txn.fee = 1_000;
+            stx.txn.xaid = 7;
+            stx.txn.asset_receiver = Some(holder);
+            stx.txn.asset_close_to = close_to;
+            stx
+        };
+        apply_transaction(&mut state, &axfer(None), &ctx, 0).unwrap(); // opt in
+        apply_transaction(&mut state, &axfer(Some(ghost)), &ctx, 0).unwrap(); // opt out
         assert!(state.get_account(&ghost).is_none());
     }
 
