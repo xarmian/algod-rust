@@ -3116,11 +3116,37 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
             // transaction's sender pays `txn.fee`, possibly zero under fee
             // pooling); other reward_addrs roles keep the unconditional
             // write.
+            //
+            // Issue #1654: the same `Move` guard applies to the payment
+            // receiver -- a zero-amount `pay` to a zero-balance account must
+            // not write it (live mainnet block 65539696 paid 0 to a
+            // non-existent account; the rewards write made it non-default
+            // and tripped the min-balance check).
+            //
+            // Issue #1654 (live mainnet block 65582745: an axfer closing a
+            // holding of a destroyed asset out to its long-closed creator
+            // account): the non-sender participants of non-payment
+            // transactions (asset receiver/close-to/clawback source, freeze
+            // target) are never `Move`d in go, so an address of that kind
+            // that does not exist must not be materialised here either --
+            // the stub (rewards_base = current level) is not
+            // `AccountData::default()` and fails the min-balance check. (A
+            // payment receiver with amount > 0 *is* written by go's `Move`,
+            // with its rewards_base brought up to the current level, so it
+            // keeps the write.)
+            let unwritten_sender = *addr == txn.sender && txn.fee == 0;
+            let unwritten_pay_receiver = *addr != txn.sender
+                && *addr == txn.receiver
+                && txn.txn_type == "pay"
+                && txn.amount == 0;
+            let unwritten_non_pay_participant = *addr != txn.sender && txn.txn_type != "pay";
             let skip_write = ctx.consensus.unfunded_senders
-                && *addr == txn.sender
-                && txn.fee == 0
+                && (unwritten_sender || unwritten_pay_receiver || unwritten_non_pay_participant)
                 && account_before.micro_algos == 0
-                && reward == 0;
+                && reward == 0
+                && (unwritten_sender
+                    || unwritten_pay_receiver
+                    || store.get_account(addr).is_none());
             if !skip_write {
                 store.set_account(addr, account);
             }
@@ -3164,7 +3190,20 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
             }
             "acfg" => {
                 apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink, &ctx.consensus)?;
-                let ad = apply_acfg(store, &stx.txn, ctx.txn_counter.get(), &ctx.consensus)?;
+                // Replaying a committed block: the block records the created
+                // asset id (`caid`), which is authoritative. Deriving it from
+                // the running counter is off by one for an inner create (the
+                // enclosing app call has not been counted yet) -- issue
+                // #1654.
+                let counter = if ctx.mode == ApplyMode::Replay
+                    && txn.config_asset == 0
+                    && stx.apply_data_config_asset != 0
+                {
+                    stx.apply_data_config_asset - 1
+                } else {
+                    ctx.txn_counter.get()
+                };
+                let ad = apply_acfg(store, &stx.txn, counter, &ctx.consensus)?;
                 apply_data.config_asset = ad.config_asset;
             }
             "axfer" => {
@@ -3267,7 +3306,16 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
         // Check min balance for all touched accounts after the transaction.
         // Go checks all modified accounts per-transaction (skipping FeeSink,
         // RewardsPool, StateProofSender, and zeroed-out accounts).
-        {
+        //
+        // Issue #1654: go runs `checkMinBalance` once per *top-level*
+        // transaction (`BlockEvaluator.transaction`), never between the
+        // inner transactions of an app call, so an inner payment may
+        // transiently take an account below its minimum as long as a later
+        // inner transaction (closing a holding, closing the account) restores
+        // it (live mainnet block 65549710: pay 200000 out, then asset
+        // opt-out, then close-out). Replaying an already-validated block
+        // must therefore only check at depth 0.
+        if !(ctx.mode == ApplyMode::Replay && depth > 0) {
             let rewards_pool_addr = store.rewards_pool();
             for addr in snapshot_addrs {
                 // Skip special accounts that are exempt from min balance checks.
@@ -3327,10 +3375,30 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
             // `update_round`. Mirrors go's real update-round tracking,
             // which only ever touches an account that some other write
             // path actually persisted (`putAccount`) this round.
+            //
+            // Issue #1654: likewise for the receiver of a zero-amount `pay`
+            // (go's `Move` never writes it), otherwise this stamp leaves a
+            // zero-balance stub with a non-zero `update_round`, which is not
+            // `AccountData::default()` and trips the min-balance check on
+            // the next zero-amount pay to the same account (live mainnet
+            // block 65539712, after 65539696 created the stub).
+            let is_unwritten_pay_receiver = *addr == txn.receiver
+                && txn.txn_type == "pay"
+                && txn.amount == 0
+                && txn.close_remainder_to.is_zero();
             if ctx.consensus.unfunded_senders
-                && *addr == txn.sender
+                && (*addr == txn.sender || is_unwritten_pay_receiver)
                 && store.get_account(addr).is_none()
             {
+                continue;
+            }
+            // Issue #1654 (live mainnet block 65560235): an address that is
+            // merely *referenced* (foreign accounts, app-call accounts) and
+            // that nothing wrote does not exist, and must not be created by
+            // this bookkeeping pass -- the resulting zero-balance stub has a
+            // non-zero `update_round`, is not `AccountData::default()`, and
+            // trips the min-balance check of the next transaction touching it.
+            if store.get_account(addr).is_none() {
                 continue;
             }
             let mut account = store.get_or_default_account(addr);
@@ -3412,7 +3480,16 @@ pub fn apply_pay<L: crate::store_trait::LedgerStore>(
             });
         }
         sender.micro_algos -= txn.amount;
-        store.set_account(&txn.sender, sender);
+        // Issue #1654 (live mainnet block 65561121, zero-fee zero-amount
+        // self-payments from a non-existent account): go's `Move` writes the
+        // sender only when `!amt.IsZero() || rewardUnits > 0 ||
+        // !UnfundedSenders`. Writing an account that does not exist
+        // materialises a stub that the update-round pass then stamps,
+        // leaving a non-default zero-balance account that fails the
+        // min-balance check of the next transaction touching it.
+        if txn.amount > 0 || store.get_account(&txn.sender).is_some() {
+            store.set_account(&txn.sender, sender);
+        }
 
         if txn.amount > 0 {
             let mut receiver = store.get_or_default_account(&txn.receiver);
@@ -3844,8 +3921,14 @@ pub fn apply_axfer<L: crate::store_trait::LedgerStore>(
                 ad.asset_closing_amount = remaining;
             }
 
-            // Check frozen on the sender's holding (unless bypassed).
-            if from_holding.frozen && !bypass_freeze {
+            // Check frozen on the sender's holding (unless bypassed). go's
+            // `takeOut` short-circuits on a zero amount before looking at
+            // the holding ("If we are closing out 0 units of the asset, then
+            // takeOut and putIn will short circuit (so bypassFreeze doesn't
+            // matter)"), so a frozen holding with nothing left in it can
+            // always be closed out (issue #1654, live mainnet block
+            // 65596480).
+            if remaining > 0 && from_holding.frozen && !bypass_freeze {
                 return Err(AlgoError::Ledger {
                     message: format!(
                         "axfer close: {} holding for asset {} is frozen",
@@ -4183,14 +4266,10 @@ pub(crate) fn apply_appl_on_completion<L: crate::store_trait::LedgerStore>(
         }
         ON_COMPLETION_DELETE => {
             if let Some(existing) = store.get_app_params(app_id) {
-                if txn.sender != existing.creator {
-                    return Err(err_ctx.error(format!(
-                        "{} delete: sender {} is not the creator of app {}",
-                        err_ctx.prefix(),
-                        txn.sender,
-                        app_id,
-                    )));
-                }
+                // go-algorand's `ApplicationCall` -> `deleteApplication`
+                // (`ledger/apply/application.go`) has no sender-is-creator
+                // check: who may delete is decided solely by the approval
+                // program (issue #1654, live mainnet block 65549861).
                 let creator = existing.creator;
                 let global_schema = existing.global_state_schema.clone();
                 let extra_program_pages = existing.extra_program_pages;
@@ -6151,6 +6230,138 @@ mod tests {
         ctx.txn_counter.set(asset_id - 1);
         let stx = acfg_create_txn(creator, 1_000, params);
         apply_transaction(state, &stx, ctx, 0).unwrap();
+    }
+
+    /// Issue #1654 (live mainnet, asset 3727639599): when replaying a block,
+    /// the asset id created by an acfg must be the one the block recorded
+    /// (`caid`), not `ctx.txn_counter + 1`. For an inner create the counter
+    /// has not yet been advanced past the enclosing app call, so deriving it
+    /// is off by one and a later destroy of the real id found no asset.
+    #[test]
+    fn replay_acfg_create_uses_block_recorded_asset_id() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut state = make_state_with_accounts(&[(sender, 10_000_000), (fee_sink, 0)], fee_sink);
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
+        ctx.txn_counter.set(100);
+
+        let mut stx = acfg_create_txn(sender, 1_000, AssetParams::default());
+        stx.apply_data_config_asset = 102;
+        apply_transaction(&mut state, &stx, &ctx, 1).unwrap();
+
+        assert!(state.get_asset_params(102).is_some(), "recorded id used");
+        assert!(state.get_asset_params(101).is_none(), "no derived id");
+    }
+
+    /// Issue #1654: a referenced-but-never-written account must not be
+    /// materialised (as a zero-balance `update_round` stub) by a transaction
+    /// that merely touches it in its account list.
+    #[test]
+    fn referenced_nonexistent_account_is_not_created_by_update_round_stamp() {
+        let sender = Address([1u8; 32]);
+        let other = Address([2u8; 32]);
+        let ghost = Address([9u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(sender, 900_000), (other, 500_000), (fee_sink, 0)],
+            fee_sink,
+        );
+        let ctx = apply_context_for_version(fee_sink, 5, algo_types::consensus::CONSENSUS_V34);
+        // Zero-amount pay to `ghost` that also closes the sender out to
+        // `other`: `ghost` is only referenced, nothing writes it.
+        let mut pay = pay_txn(sender, ghost, 0, 1_000);
+        pay.txn.close_remainder_to = other;
+        apply_transaction(&mut state, &pay, &ctx, 0).unwrap();
+        assert!(
+            state.get_account(&ghost).is_none(),
+            "an account nothing wrote must not be created"
+        );
+    }
+
+    /// Issue #1654 (live mainnet block 65561121): repeated zero-fee,
+    /// zero-amount self-payments from a non-existent account must all apply
+    /// and leave the account non-existent.
+    #[test]
+    fn unfunded_zero_fee_self_payments_do_not_materialise_the_account() {
+        let ghost = Address([9u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut state = make_state_with_accounts(&[(fee_sink, 0)], fee_sink);
+        let mut ctx = apply_context_for_version(fee_sink, 5, algo_types::consensus::CONSENSUS_V34);
+        ctx.rewards_level = 12_345;
+        for _ in 0..3 {
+            apply_transaction(&mut state, &pay_txn(ghost, ghost, 0, 0), &ctx, 0)
+                .expect("zero-fee zero-amount self payment from an unfunded sender");
+        }
+        assert!(state.get_account(&ghost).is_none());
+    }
+
+    /// Issue #1654 (live mainnet block 65582745): an asset opt-out whose
+    /// close-to is an account that does not exist must not materialise it.
+    #[test]
+    fn axfer_close_to_nonexistent_account_does_not_create_it() {
+        let creator = Address([1u8; 32]);
+        let holder = Address([2u8; 32]);
+        let ghost = Address([9u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(creator, 900_000), (holder, 900_000), (fee_sink, 0)],
+            fee_sink,
+        );
+        let ctx = apply_context_for_version(fee_sink, 5, algo_types::consensus::CONSENSUS_V34);
+        create_asset_in_state(&mut state, &ctx, creator, 7, AssetParams::default());
+
+        let axfer = |close_to: Option<Address>| {
+            let mut stx = SignedTransaction::default();
+            stx.txn.txn_type = "axfer".into();
+            stx.txn.sender = holder;
+            stx.txn.fee = 1_000;
+            stx.txn.xaid = 7;
+            stx.txn.asset_receiver = Some(holder);
+            stx.txn.asset_close_to = close_to;
+            stx
+        };
+        apply_transaction(&mut state, &axfer(None), &ctx, 0).unwrap(); // opt in
+        apply_transaction(&mut state, &axfer(Some(ghost)), &ctx, 0).unwrap(); // opt out
+        assert!(state.get_account(&ghost).is_none());
+    }
+
+    /// Issue #1654 (live mainnet block 65596480): closing out a *frozen*
+    /// holding that holds zero units must succeed (go's `takeOut` returns
+    /// early on a zero amount).
+    #[test]
+    fn axfer_close_out_of_frozen_zero_holding_succeeds() {
+        let creator = Address([1u8; 32]);
+        let holder = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(creator, 900_000), (holder, 900_000), (fee_sink, 0)],
+            fee_sink,
+        );
+        let ctx = apply_context_for_version(fee_sink, 5, algo_types::consensus::CONSENSUS_V34);
+        create_asset_in_state(&mut state, &ctx, creator, 7, AssetParams::default());
+
+        let mut optin = SignedTransaction::default();
+        optin.txn.txn_type = "axfer".into();
+        optin.txn.sender = holder;
+        optin.txn.fee = 1_000;
+        optin.txn.xaid = 7;
+        optin.txn.asset_receiver = Some(holder);
+        apply_transaction(&mut state, &optin, &ctx, 0).unwrap();
+        crate::store_trait::LedgerStore::set_asset_holding(
+            &mut state,
+            &holder,
+            7,
+            AssetHolding {
+                amount: 0,
+                frozen: true,
+            },
+        );
+
+        let mut close = optin.clone();
+        close.txn.asset_close_to = Some(Address([9u8; 32]));
+        apply_transaction(&mut state, &close, &ctx, 0)
+            .expect("a frozen holding with zero units can be closed out");
+        assert!(state.get_asset_holding(&holder, 7).is_none());
     }
 
     #[test]
@@ -9639,6 +9850,63 @@ mod tests {
             store_post.get_account(&sender).is_none(),
             "v34+ must leave a zero-balance, zero-fee sender fully unwritten"
         );
+    }
+
+    /// Issue #1654 (live mainnet block 65539696): a zero-amount payment to a
+    /// non-existent account must leave the receiver non-existent. go's
+    /// `roundCowState.Move` only writes the receiver when
+    /// `!amt.IsZero() || rewardUnits > 0 || !UnfundedSenders`; writing the
+    /// rewards-bookkeeping update instead made the empty receiver non-default
+    /// (`rewards_base` = current level) and tripped the min-balance check
+    /// ("balance 0 below minimum balance 100000").
+    #[test]
+    fn unfunded_senders_zero_amount_payment_leaves_empty_receiver_unwritten() {
+        let sender = Address([7u8; 32]);
+        let receiver = Address([8u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut store = make_state_with_accounts(&[(sender, 900_000), (fee_sink, 0)], fee_sink);
+        let mut ctx = apply_context_for_version(fee_sink, 1, algo_types::consensus::CONSENSUS_V34);
+        ctx.rewards_level = 12_345;
+        assert!(ctx.consensus.unfunded_senders);
+        let txn = pay_txn(sender, receiver, 0, 1_000);
+        apply_transaction(&mut store, &txn, &ctx, 0)
+            .expect("zero-amount pay to an empty account must apply");
+        assert!(
+            store.get_account(&receiver).is_none(),
+            "an untouched empty receiver must stay non-existent"
+        );
+        // A second zero-amount pay to the same account (live block 65539712)
+        // must apply as well.
+        let ctx2 = {
+            let mut c =
+                apply_context_for_version(fee_sink, 2, algo_types::consensus::CONSENSUS_V34);
+            c.rewards_level = 12_345;
+            c
+        };
+        apply_transaction(&mut store, &pay_txn(sender, receiver, 0, 1_000), &ctx2, 0)
+            .expect("second zero-amount pay to the same empty account must apply");
+        assert!(store.get_account(&receiver).is_none());
+    }
+
+    /// Issue #1654 (live mainnet block 65549710): go checks minimum balances
+    /// once per top-level transaction, so an inner transaction (depth > 0)
+    /// may transiently leave an account below its minimum while replaying.
+    #[test]
+    fn replay_defers_min_balance_check_for_inner_transactions() {
+        let sender = Address([7u8; 32]);
+        let receiver = Address([8u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let ctx = apply_context_for_version(fee_sink, 1, algo_types::consensus::CONSENSUS_V34);
+        let txn = pay_txn(sender, receiver, 100_000, 0);
+
+        let mut top = make_state_with_accounts(&[(sender, 150_000), (fee_sink, 0)], fee_sink);
+        let err = apply_transaction(&mut top, &txn, &ctx, 0)
+            .expect_err("top-level payment below min balance must be rejected");
+        assert!(format!("{err}").contains("below minimum balance"), "{err}");
+
+        let mut inner = make_state_with_accounts(&[(sender, 150_000), (fee_sink, 0)], fee_sink);
+        apply_transaction(&mut inner, &txn, &ctx, 1)
+            .expect("an inner transaction may transiently dip below the minimum");
     }
 
     #[test]

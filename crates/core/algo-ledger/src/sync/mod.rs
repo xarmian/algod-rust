@@ -461,6 +461,17 @@ pub struct SyncOrchestrator {
     /// from this value, so post-import validation must check against it —
     /// not against [`Self::catchpoint_round`] (issue #1056).
     balances_round: Option<u64>,
+    /// `Some(round)` when the catchpoint file carries algod-rust's
+    /// [`crate::catchpoint::parser::STATE_ROUND_MARKER_FILENAME`] marker,
+    /// i.e. it was produced by algod-rust's own exporter and its account
+    /// data already reflects `round` (== `catchpoint_round`) even though the
+    /// header says `balances_round` (issue #1463 / #1654). `None` for every
+    /// go-produced catchpoint, whose account data is the state at
+    /// `balances_round`: the ledger is then only at `balances_round`, and
+    /// `run_replay_blocks` must apply the stored lookback blocks
+    /// `(balances_round, catchpoint_round]` to reach `catchpoint_round`,
+    /// exactly as go's trackers do when they load such a ledger.
+    embedded_state_round: Option<u64>,
     /// The catchpoint label string in use.
     resolved_label: Option<String>,
     /// Block header digest extracted from the catchpoint file header.
@@ -520,6 +531,7 @@ impl SyncOrchestrator {
             catchpoint_round: None,
             cached_catchpoint_block: None,
             balances_round: None,
+            embedded_state_round: None,
             resolved_label: None,
             block_header_digest: None,
             accounts_imported: 0,
@@ -688,6 +700,16 @@ impl SyncOrchestrator {
 
         tracing::info!(label = %label, "discovered catchpoint label");
         Ok(label)
+    }
+
+    /// Read algod-rust's state-round marker (issue #1654) from a catchpoint
+    /// file, if present. See [`Self::embedded_state_round`].
+    fn read_state_round_marker(file_path: &std::path::Path) -> Result<Option<u64>, AlgoError> {
+        crate::catchpoint::parser::open(file_path)
+            .and_then(|reader| reader.state_round_marker())
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("read catchpoint state-round marker: {e}"),
+            })
     }
 
     /// Extract the catchpoint file header from a downloaded file.
@@ -866,6 +888,7 @@ impl SyncOrchestrator {
         // (issue #1056) — this is what acctrounds('acctbase') gets stamped
         // with, not self.catchpoint_round (the label's blocks_round).
         self.balances_round = Some(header.balances_round);
+        self.embedded_state_round = Self::read_state_round_marker(&file_path)?;
 
         // Store block header digest for the verify phase.
         if header.block_header_digest.len() == 32 {
@@ -1183,7 +1206,22 @@ impl SyncOrchestrator {
             }
         }
 
-        // Issue #1650: fast-forward `acctrounds` (and store a matching
+        // Issue #1654: only an algod-rust-exported catchpoint (marker
+        // present, `embedded_state_round`) actually holds state at
+        // `catchpoint_round`. A go-produced catchpoint holds state at
+        // `balances_round`; relabeling `acctrounds` to `catchpoint_round`
+        // for it (what this step did before #1654) claims a round the
+        // account data has not reached -- ~320 blocks of balance changes
+        // missing, so the first post-window block spending from an account
+        // funded inside that window failed with "insufficient balance 0".
+        // For go-shaped catchpoints the ledger therefore stays honestly at
+        // `balances_round` here and `run_replay_blocks` applies the stored
+        // window `(balances_round, catchpoint_round]` to reach
+        // `catchpoint_round`; if the lookback phase fails, the ledger is
+        // simply still (correctly) at `balances_round`.
+        //
+        // Issue #1650: for an algod-rust-exported catchpoint, fast-forward
+        // `acctrounds` (and store a matching
         // header row) to `catchpoint_round` right here, now that
         // verification has succeeded — instead of waiting for
         // `run_replay_blocks` (phase 5) to do it once `run_download_lookback`
@@ -1234,7 +1272,9 @@ impl SyncOrchestrator {
         // this synthesized row via `put_block`'s `ON CONFLICT DO UPDATE`,
         // same as the existing `balances_round` row already does.
         if let Some(catchpoint_round) = self.catchpoint_round {
-            if catchpoint_round > balances_round {
+            if catchpoint_round > balances_round
+                && self.embedded_state_round == Some(catchpoint_round)
+            {
                 let wrote_real_header = match self.cached_catchpoint_block.clone() {
                     Some((cp_proto, cp_hdrdata, cp_blkdata)) => conn
                         .execute(
@@ -1422,6 +1462,13 @@ impl SyncOrchestrator {
             message: format!("create blocks/txtail tables for lookback: {e}"),
         })?;
 
+        // Issue #1654 (live soak 36802941564): the retry loop in
+        // `download_lookback_blocks_with_lookback` retries a failed fetch
+        // immediately, so 1000 attempts against a rate-limiting relay
+        // (HTTP 429) burned the whole budget in ~18 seconds and aborted the
+        // catchup. Back off between *failed* fetches (reset on success) so
+        // the budget spans minutes, not seconds.
+        let mut consecutive_fetch_failures: u32 = 0;
         // Use download_lookback_blocks_with_lookback with callbacks that
         // bridge to the backend, passing the (possibly state-proof-extended)
         // `lookback` computed above.
@@ -1444,10 +1491,22 @@ impl SyncOrchestrator {
                         return Ok(cached);
                     }
                 }
-                let (proto, hdrdata, blkdata) = self.backend.fetch_block_raw(rnd).map_err(|e| {
-                    CatchpointError::VerificationError(format!("fetch lookback block {rnd}: {e}"))
-                })?;
-                Ok((proto, hdrdata, blkdata))
+                match self.backend.fetch_block_raw(rnd) {
+                    Ok(block) => {
+                        consecutive_fetch_failures = 0;
+                        Ok(block)
+                    }
+                    Err(e) => {
+                        let delay_ms = lookback_retry_backoff_ms(consecutive_fetch_failures);
+                        consecutive_fetch_failures = consecutive_fetch_failures.saturating_add(1);
+                        if delay_ms > 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        }
+                        Err(CatchpointError::VerificationError(format!(
+                            "fetch lookback block {rnd}: {e}"
+                        )))
+                    }
+                }
             },
             // store_block callback
             |rnd, proto, hdrdata, blkdata| {
@@ -1516,6 +1575,273 @@ impl SyncOrchestrator {
         Ok(())
     }
 
+    /// Fold the (potentially tens of GB) write-ahead logs left behind by the
+    /// bulk import/verify/replay phases back into the database files, here,
+    /// in the already-blocking catchup thread, instead of letting the live
+    /// node pay for it.
+    ///
+    /// Issue #1654: a thread dump of a wedged node (soak 36943905593,
+    /// `wedge-stacks.txt`) showed the catchup service's first `commit_block`
+    /// after the catchup sitting in `sqlite3WalDefaultHook` ->
+    /// `walCheckpoint` -> `pread` at a ~22 GB WAL offset, holding the ledger
+    /// lock for 2.5-3.5 minutes (REST, agreement and every other thread
+    /// blocked behind it). An earlier attempt at this (soak 36870450959)
+    /// ignored the pragma's `busy` result and so could not tell it had
+    /// checkpointed nothing; this one logs `(busy, log, checkpointed)`,
+    /// runs a PASSIVE checkpoint first (copies every frame no reader still
+    /// needs) and then retries TRUNCATE until the WAL is actually reset.
+    /// Best-effort: failure only costs that latency.
+    fn checkpoint_wal_after_sync(&self) {
+        let conn = match self.open_db() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "post-sync WAL checkpoint: could not open database");
+                return;
+            }
+        };
+        let run = |pragma: &str| -> Option<(i64, i64, i64)> {
+            match conn.query_row(pragma, [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            }) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    tracing::warn!(error = %e, pragma, "post-sync WAL checkpoint failed");
+                    None
+                }
+            }
+        };
+        for (schema, label) in [("main", "tracker"), ("blockdb", "block")] {
+            let started = Instant::now();
+            let passive = run(&format!("PRAGMA {schema}.wal_checkpoint(PASSIVE)"));
+            tracing::info!(
+                db = label,
+                elapsed_secs = started.elapsed().as_secs_f64(),
+                result = ?passive,
+                "post-sync WAL checkpoint (PASSIVE): (busy, wal frames, checkpointed frames)"
+            );
+            for attempt in 1..=2u32 {
+                let started = Instant::now();
+                let truncated = run(&format!("PRAGMA {schema}.wal_checkpoint(TRUNCATE)"));
+                tracing::info!(
+                    db = label,
+                    attempt,
+                    elapsed_secs = started.elapsed().as_secs_f64(),
+                    result = ?truncated,
+                    "post-sync WAL checkpoint (TRUNCATE)"
+                );
+                if matches!(truncated, Some((0, _, _)) | None) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(3));
+            }
+        }
+    }
+
+    /// Issue #1654 diagnostics: why can't the WAL be checkpointed? Log how
+    /// many file descriptors this process still has open on the database
+    /// (each SQLite connection holds one) and the WAL index's checkpoint
+    /// state (`nBackfill` and the five `aReadMark` slots -- a reader pins
+    /// the WAL at its slot's frame number). Linux only; silent elsewhere.
+    fn log_wal_pin_diagnostics(path: &std::path::Path, label: &str) {
+        Self::log_wal_pin_diagnostics_inner(path, label)
+    }
+
+    /// [`Self::log_wal_pin_diagnostics`] for this orchestrator's own tracker
+    /// database, tagged with the pipeline `stage` (to see *when* a WAL pin
+    /// first appears).
+    fn log_tracker_wal_diag(&self, stage: &str) {
+        let tracker = crate::sqlite::tracker_path_for_prefix(&crate::sqlite::derive_ledger_prefix(
+            &self.config.db_path,
+        ));
+        Self::log_wal_pin_diagnostics_inner(&tracker, stage);
+    }
+
+    fn log_wal_pin_diagnostics_inner(path: &std::path::Path, label: &str) {
+        let open_fds = std::fs::read_dir("/proc/self/fd")
+            .map(|dir| {
+                dir.filter_map(|e| e.ok())
+                    .filter_map(|e| std::fs::read_link(e.path()).ok())
+                    .filter(|target| target.as_path() == path)
+                    .count()
+            })
+            .ok();
+        let mut shm_path = path.as_os_str().to_owned();
+        shm_path.push("-shm");
+        let shm = std::fs::read(&shm_path).ok().and_then(|bytes| {
+            if bytes.len() < 136 {
+                return None;
+            }
+            let word = |off: usize| u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+            Some((
+                word(96),
+                [word(100), word(104), word(108), word(112), word(116)],
+            ))
+        });
+        tracing::info!(
+            db = label,
+            open_fds_on_db = ?open_fds,
+            wal_index_nbackfill_and_readmarks = ?shm,
+            "WAL pin diagnostics"
+        );
+    }
+
+    /// Best-effort full checkpoint of one SQLite database file's WAL over a
+    /// fresh, private connection (no ledger lock involved): `PASSIVE` first,
+    /// then one `TRUNCATE`. Logs the `(busy, log, checkpointed)` results.
+    ///
+    /// Issue #1654: the live node calls this for its tracker and block
+    /// databases right after it has swapped in the reopened ledger -- i.e.
+    /// after the pre-catchup ledger handle, whose old read snapshot pinned the
+    /// ~9.5M-frame WAL (only 74 frames were checkpointable while it lived), is
+    /// gone -- so the multi-GB checkpoint happens off the ledger lock instead
+    /// of inside the first block commit.
+    pub fn checkpoint_wal_file(path: &std::path::Path, label: &str) {
+        let conn = match Connection::open(path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, db = label, "WAL checkpoint: could not open database");
+                return;
+            }
+        };
+        Self::log_wal_pin_diagnostics(path, label);
+        for pragma in [
+            "PRAGMA wal_checkpoint(PASSIVE)",
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+        ] {
+            let started = Instant::now();
+            let result = conn.query_row(pragma, [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            });
+            tracing::info!(
+                db = label,
+                pragma,
+                elapsed_secs = started.elapsed().as_secs_f64(),
+                result = ?result.as_ref().ok(),
+                "WAL checkpoint: (busy, wal frames, checkpointed frames)"
+            );
+        }
+    }
+
+    /// Apply the lookback-window blocks `(tracker_round, catchpoint_round]`
+    /// stored by [`Self::run_download_lookback`] when the tracker
+    /// (`acctrounds('acctbase')`) is still behind `catchpoint_round` -- the
+    /// go-produced catchpoint shape (issue #1654, see the comment in
+    /// [`Self::run_replay_blocks`]). Returns the number of blocks applied
+    /// (0 when the tracker is already at or past `catchpoint_round`).
+    fn replay_lookback_window(&mut self, catchpoint_round: u64) -> Result<u64, AlgoError> {
+        use rusqlite::OptionalExtension;
+
+        let conn = self.open_db()?;
+        let tracker_round: u64 = conn
+            .query_row(
+                "SELECT rnd FROM acctrounds WHERE id = 'acctbase'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("read acctrounds before lookback-window replay: {e}"),
+            })?
+            .map(|r| r.max(0) as u64)
+            .unwrap_or(0);
+        if tracker_round >= catchpoint_round {
+            return Ok(0);
+        }
+
+        // `run_download_lookback` also wrote txtail rows for the window
+        // (lease reconstruction). Re-applying those blocks through the
+        // normal path re-creates them, and leaving the originals would make
+        // every window transaction look like a duplicate of itself, so drop
+        // everything beyond the tracker round before the ledger is opened.
+        conn.execute(
+            "DELETE FROM txtail WHERE rnd > ?1",
+            rusqlite::params![tracker_round as i64],
+        )
+        .map_err(|e| AlgoError::Ledger {
+            message: format!("clear window txtail before lookback-window replay: {e}"),
+        })?;
+        drop(conn);
+
+        let first = tracker_round + 1;
+        let count = catchpoint_round - tracker_round;
+        tracing::info!(
+            tracker_round,
+            catchpoint_round,
+            count,
+            "go-shaped catchpoint: replaying stored lookback blocks to reach the catchpoint round"
+        );
+        self.progress.phase_detail =
+            format!("replaying lookback window {first} to {catchpoint_round}");
+        self.notify_progress();
+
+        let mut store =
+            crate::SqliteLedger::open(&self.config.db_path).map_err(|e| AlgoError::Ledger {
+                message: format!("open ledger for lookback-window replay: {e}"),
+            })?;
+        if self.config.trie_path.is_some() {
+            store.enable_trie();
+        }
+
+        let mut applied = 0u64;
+        for round in first..=catchpoint_round {
+            self.check_cancelled()?;
+
+            let blkdata: Option<Vec<u8>> = {
+                let conn = self.open_db()?;
+                conn.query_row(
+                    "SELECT blkdata FROM blockdb.blocks WHERE rnd = ?1",
+                    rusqlite::params![round as i64],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| AlgoError::Ledger {
+                    message: format!("read stored lookback block {round}: {e}"),
+                })?
+            };
+            let Some(blkdata) = blkdata.filter(|b| !b.is_empty()) else {
+                return Err(AlgoError::Ledger {
+                    message: format!(
+                        "lookback window incomplete: block {round} is not stored, cannot                          advance the ledger from round {tracker_round} to the catchpoint                          round {catchpoint_round}"
+                    ),
+                });
+            };
+            let block = algo_codec::decode_block(&blkdata).map_err(|e| AlgoError::Ledger {
+                message: format!("decode stored lookback block {round}: {e}"),
+            })?;
+
+            store.begin_block()?;
+            let apply_result = if self.config.avm_execute || self.config.compare_mode {
+                let (result, block_stats) = crate::apply_block_with_comparison(&mut store, &block);
+                self.eval_delta_stats += block_stats;
+                result
+            } else {
+                crate::apply_block(&mut store, &block)
+            };
+            match apply_result {
+                Ok(()) => {
+                    if self.config.trie_path.is_some() {
+                        store.finalize_trie_updates();
+                    }
+                    store.commit_block()?;
+                    applied += 1;
+                    self.final_round = round;
+                }
+                Err(e) => {
+                    tracing::warn!(round, error = %e, "apply_block failed during lookback-window replay");
+                    let _ = store.rollback_block();
+                    return Err(AlgoError::Ledger {
+                        message: format!("lookback-window replay failed at round {round}: {e}"),
+                    });
+                }
+            }
+        }
+        Ok(applied)
+    }
+
     /// Phase 5: Replay blocks from the catchpoint round to the current round.
     ///
     /// Fetches blocks one at a time from catchpoint_round+1 to the current
@@ -1528,64 +1854,48 @@ impl SyncOrchestrator {
             message: "catchpoint round not known — earlier phases did not complete".to_string(),
         })?;
 
-        // Issue #1463: algod-rust's own catchpoint exporter
-        // (`SqliteLedger::maybe_spawn_automatic_catchpoint`) embeds the
-        // *live* account snapshot into every catchpoint whose label round
-        // is above `CatchpointLookback` -- there's no separate historical
-        // account-state source in this synchronous architecture to draw a
-        // genuine balances_round-only snapshot from (see that function's
-        // doc comment) -- even though `atomic_cutover` stamps
-        // `acctrounds('acctbase')` with `balances_round` to match go's
-        // wire-format shape (issue #1056/`validate_post_import`). That
-        // means the account content imported by `run_import_ledger` is
-        // already `catchpoint_round`-equivalent by the time this phase
-        // runs, and `start_round` below deliberately begins applying real
-        // blocks at `catchpoint_round + 1` rather than `balances_round +
-        // 1` (see the `_ => catchpoint_round + 1` fallback just below) --
-        // re-applying that gap via `apply_block` would double-count state
-        // already baked into the import, which is exactly what produced
-        // "expected round balances_round+1, got catchpoint_round+1"
-        // failures before this fix. Bump `acctrounds` (both `acctbase` and
-        // `hashbase`) forward to `catchpoint_round` here so `apply_block`'s
-        // round-monotonicity check agrees with that choice, using the real
-        // header `run_download_lookback` (phase 4) already downloaded for
-        // `catchpoint_round` -- not synthesized data. Guarded so a resumed
-        // run that's already past `catchpoint_round` (or one where
-        // balances_round == catchpoint_round, i.e. below the
-        // `CatchpointLookback` floor) is left untouched.
-        {
-            use rusqlite::OptionalExtension;
-            let conn = self.open_db()?;
-            let current: Option<i64> = conn
-                .query_row(
-                    "SELECT rnd FROM acctrounds WHERE id = 'acctbase'",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| AlgoError::Ledger {
-                    message: format!("read acctrounds before replay fast-forward: {e}"),
-                })?;
-            if let Some(current) = current {
-                if (current as u64) < catchpoint_round {
-                    conn.execute(
-                        "UPDATE acctrounds SET rnd = ?1 WHERE id IN ('acctbase', 'hashbase')",
-                        rusqlite::params![catchpoint_round as i64],
-                    )
-                    .map_err(|e| AlgoError::Ledger {
-                        message: format!("fast-forward acctrounds to catchpoint_round: {e}"),
-                    })?;
-                    tracing::info!(
-                        from = current,
-                        to = catchpoint_round,
-                        "fast-forwarded acctrounds past the balances_round/catchpoint_round gap"
-                    );
-                }
-            }
-        }
+        // Issue #1654: bring the ledger from wherever the tracker is to
+        // `catchpoint_round` *by applying blocks*, never by relabeling.
+        //
+        // A go-produced catchpoint holds account state at `balances_round`;
+        // go's ledger reaches `blocks_round` by replaying the stored blocks
+        // `(balances_round, blocks_round]` through its trackers on load
+        // (`catchpointtracker`/`accountUpdates.initializeFromDisk` -- the
+        // catchup accessor's `StoreBalancesRound` records `balances_round`
+        // and `FinishBlocks` keeps the downloaded blocks in the block DB).
+        // `run_download_lookback` already stored that window, so replay it
+        // here through the normal apply path.
+        //
+        // algod-rust's own exporter (issue #1463) embeds the *live* state,
+        // and `run_verify_ledger` has already fast-forwarded `acctrounds`
+        // to `catchpoint_round` for those (marker-identified, see
+        // `embedded_state_round`), so the tracker is at `catchpoint_round`
+        // and this is a no-op -- re-applying the window would double-count
+        // state already baked into the import. A resumed run already past
+        // `catchpoint_round` is likewise untouched.
+        let window_applied = self.replay_lookback_window(catchpoint_round)?;
 
         // Determine target: current network round, capped by end_round if set.
-        let network_round = self.backend.get_current_round()?;
+        //
+        // Issue #1654 (live soak 36812812222): the live-catchup peer is
+        // commonly a relay's gossip port, which has no `/v2/*` routes, so
+        // `/v2/status` answers 404 even though the catchpoint file and block
+        // service work. That used to fail the whole catchup *after* the
+        // lookback window had already been replayed. A 404 here only means
+        // "this peer cannot tell us the tip": stop at the catchpoint round
+        // and let the node's normal catchup service continue from there.
+        let network_round = match self.backend.get_current_round() {
+            Ok(r) => r,
+            Err(AlgoError::NotFound(msg)) => {
+                tracing::warn!(
+                    error = %msg,
+                    catchpoint_round,
+                    "peer cannot report the network round (no /v2/status); ending catchpoint                      replay at the catchpoint round"
+                );
+                catchpoint_round
+            }
+            Err(e) => return Err(e),
+        };
         let target_round = match self.config.end_round {
             Some(end) => std::cmp::min(network_round, end),
             None => network_round,
@@ -1660,6 +1970,7 @@ impl SyncOrchestrator {
                 "already at or past target round, no blocks to replay"
             );
             self.final_round = catchpoint_round;
+            self.blocks_replayed = window_applied;
             self.progress.phase_progress = 1.0;
             self.notify_progress();
             return Ok(());
@@ -1797,10 +2108,11 @@ impl SyncOrchestrator {
             batch_start = batch_end + 1;
         }
 
-        self.blocks_replayed = blocks_applied;
+        self.blocks_replayed = window_applied + blocks_applied;
 
         tracing::info!(
             blocks_applied,
+            window_applied,
             final_round = self.final_round,
             elapsed = ?timer.elapsed(),
             "block replay complete"
@@ -2220,6 +2532,7 @@ impl SyncOrchestrator {
         // Phase 2: ImportingLedger (ordinal 2)
         if resume_ord <= 2 {
             self.run_import_ledger()?;
+            self.log_tracker_wal_diag("after_import");
         } else {
             // When resuming past import, we still need the block_header_digest
             // and balances_round for verification. Extract them from the
@@ -2235,6 +2548,9 @@ impl SyncOrchestrator {
                             }
                             self.balances_round = Some(header.balances_round);
                         }
+                        if let Ok(marker) = Self::read_state_round_marker(file_path) {
+                            self.embedded_state_round = marker;
+                        }
                     }
                 }
             }
@@ -2243,15 +2559,19 @@ impl SyncOrchestrator {
         // Phase 3: VerifyingLedger (ordinal 3)
         if resume_ord <= 3 {
             self.run_verify_ledger()?;
+            self.log_tracker_wal_diag("after_verify");
         }
 
         // Phase 4: DownloadingLookback (ordinal 4)
         if resume_ord <= 4 {
             self.run_download_lookback()?;
+            self.log_tracker_wal_diag("after_lookback");
         }
 
         // Phase 5: ReplayingBlocks (ordinal 5)
         self.run_replay_blocks()?;
+        self.log_tracker_wal_diag("after_replay");
+        self.checkpoint_wal_after_sync();
 
         Ok(SyncResult {
             final_round: self.final_round,
@@ -2260,6 +2580,16 @@ impl SyncOrchestrator {
             duration: start.elapsed(),
         })
     }
+}
+
+/// Delay before retrying a failed lookback block fetch: 250 ms doubling per
+/// consecutive failure, capped at 5 s (zero under `cfg(test)` so the retry
+/// accounting tests stay instantaneous).
+fn lookback_retry_backoff_ms(consecutive_failures: u32) -> u64 {
+    if cfg!(test) {
+        return 0;
+    }
+    (250u64 << consecutive_failures.min(5)).min(5_000)
 }
 
 /// Map a `SyncState` to a numeric ordinal for resume ordering.
@@ -3225,10 +3555,16 @@ mod tests {
         .unwrap();
 
         let catchpoint_path = dir.join("source-catchpoint.tar.gz");
+        // Issue #1654: only an algod-rust-exported catchpoint (state-round
+        // marker, like `maybe_spawn_automatic_catchpoint` writes) holds
+        // state at `catchpoint_round` and may be fast-forwarded; a
+        // go-produced one (no marker) must not be -- see
+        // `go_shaped_catchpoint_is_not_relabeled_when_lookback_never_runs`.
         let export_options = ExportOptions {
             balances_round: BALANCES_ROUND,
             blocks_round: CATCHPOINT_ROUND,
             block_header_digest: BLOCK_DIGEST,
+            state_round: Some(CATCHPOINT_ROUND),
             ..Default::default()
         };
         let export_result =
@@ -3457,6 +3793,416 @@ mod tests {
         // (blocks_round threaded into validate_post_import's expected_round
         // instead of balances_round).
         orchestrator.run_verify_ledger().unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ----- Issue #1654: go-produced catchpoints hold state at `balances_round` -----
+
+    /// Source tracker DB for [`WindowBackend`] tests: one funded payer
+    /// account (`{"b": micro_algos}` baseAccountData) and empty totals.
+    fn window_source_db(payer: [u8; 32], payer_balance: u64) -> Connection {
+        let src = Connection::open_in_memory().unwrap();
+        src.execute_batch(
+            "CREATE TABLE accountbase (
+                addrid INTEGER PRIMARY KEY NOT NULL,
+                address BLOB NOT NULL,
+                data BLOB,
+                normalizedonlinebalance INTEGER
+            );
+            CREATE TABLE resources (
+                addrid INTEGER NOT NULL, aidx INTEGER NOT NULL,
+                data BLOB NOT NULL, ctype INTEGER NOT NULL DEFAULT -1,
+                PRIMARY KEY (addrid, aidx)
+            ) WITHOUT ROWID;
+            CREATE TABLE kvstore (key BLOB PRIMARY KEY, value BLOB);
+            CREATE TABLE onlineaccounts (
+                address BLOB NOT NULL, updround INTEGER NOT NULL,
+                normalizedonlinebalance INTEGER NOT NULL, votelastvalid INTEGER NOT NULL,
+                data BLOB NOT NULL, PRIMARY KEY (address, updround)
+            );
+            CREATE TABLE onlineroundparamstail (rnd INTEGER PRIMARY KEY NOT NULL, data BLOB NOT NULL);
+            CREATE TABLE stateproofverification (
+                lastattestedround INTEGER PRIMARY KEY NOT NULL,
+                verificationcontext BLOB NOT NULL
+            );
+            CREATE TABLE accounttotals (
+                id TEXT PRIMARY KEY, online INTEGER, onlinerewardunits INTEGER,
+                offline INTEGER, offlinerewardunits INTEGER,
+                notparticipating INTEGER, notparticipatingrewardunits INTEGER,
+                rewardslevel INTEGER
+            );",
+        )
+        .unwrap();
+        src.execute(
+            "INSERT INTO accounttotals VALUES('', 0, 0, ?1, 0, 0, 0, 0)",
+            rusqlite::params![payer_balance as i64],
+        )
+        .unwrap();
+        // baseAccountData `{"b": payer_balance}` with the canonical (minimal
+        // width) msgpack uint encoding, so the exporter's and importer's
+        // account hashes agree.
+        let mut blob = vec![0x81, 0xa1, b'b'];
+        match payer_balance {
+            0..=0x7f => blob.push(payer_balance as u8),
+            0x80..=0xff => blob.extend_from_slice(&[0xcc, payer_balance as u8]),
+            0x100..=0xffff => {
+                blob.push(0xcd);
+                blob.extend_from_slice(&(payer_balance as u16).to_be_bytes());
+            }
+            0x1_0000..=0xffff_ffff => {
+                blob.push(0xce);
+                blob.extend_from_slice(&(payer_balance as u32).to_be_bytes());
+            }
+            _ => {
+                blob.push(0xcf);
+                blob.extend_from_slice(&payer_balance.to_be_bytes());
+            }
+        }
+        src.execute(
+            "INSERT INTO accountbase(addrid, address, data, normalizedonlinebalance) \
+             VALUES(1, ?1, ?2, 0)",
+            rusqlite::params![payer.to_vec(), blob],
+        )
+        .unwrap();
+        src
+    }
+
+    /// Serves synthetic blocks for the go-shaped-window tests: every round
+    /// is an empty block except `window_round` (payer funds `receiver`) and
+    /// `spend_round` (`receiver` spends part of it back) -- the second is
+    /// only applicable if the first was replayed on top of the catchpoint's
+    /// `balances_round` state.
+    struct WindowBackend {
+        source_file: std::path::PathBuf,
+        payer: [u8; 32],
+        receiver: [u8; 32],
+        window_round: u64,
+        spend_round: u64,
+        /// Emulate a relay gossip port: `/v2/status` answers 404.
+        status_not_found: bool,
+    }
+
+    impl WindowBackend {
+        fn block(&self, round: u64) -> Block {
+            let mut block = Block {
+                round: round.into(),
+                genesis_id: "test".to_string(),
+                current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+                ..Default::default()
+            };
+            let pay = |from: [u8; 32], to: [u8; 32], amount: u64| {
+                let mut stx = algo_types::SignedTransaction::default();
+                stx.txn.txn_type = "pay".into();
+                stx.txn.sender = algo_types::Address(from);
+                stx.txn.receiver = algo_types::Address(to);
+                stx.txn.amount = amount;
+                stx.txn.fee = 1_000;
+                stx.txn.first_valid = round.into();
+                stx.txn.last_valid = (round + 1_000).into();
+                stx
+            };
+            if round == self.window_round {
+                block.payset.push(pay(self.payer, self.receiver, 5_000_000));
+            } else if round == self.spend_round {
+                block.payset.push(pay(self.receiver, self.payer, 1_000));
+            }
+            block
+        }
+    }
+
+    impl SyncBackend for WindowBackend {
+        fn download_catchpoint(
+            &self,
+            _genesis_id: &str,
+            _round: u64,
+            dest_path: &std::path::Path,
+        ) -> Result<(), AlgoError> {
+            std::fs::copy(&self.source_file, dest_path).map_err(|e| AlgoError::Ledger {
+                message: format!("fake copy failed: {e}"),
+            })?;
+            Ok(())
+        }
+
+        fn fetch_block_raw(&self, round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+            let block = self.block(round);
+            Ok((
+                algo_types::consensus::CONSENSUS_V41.to_string(),
+                algo_codec::canonical_encode_block_header_from_block(&block),
+                algo_codec::encode_block(&block).expect("encode test block"),
+            ))
+        }
+
+        fn fetch_block(&self, round: u64) -> Result<Block, AlgoError> {
+            Ok(self.block(round))
+        }
+
+        fn get_current_round(&self) -> Result<u64, AlgoError> {
+            if self.status_not_found {
+                return Err(AlgoError::NotFound(
+                    "GET /v2/status: 404 page not found".to_string(),
+                ));
+            }
+            Ok(self.spend_round)
+        }
+
+        fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
+            Ok(None)
+        }
+    }
+
+    /// TDD for issue #1654: a go-produced catchpoint's account data is the
+    /// state at `balances_round`; go's ledger reaches `blocks_round` by
+    /// replaying the stored blocks `(balances_round, blocks_round]` through
+    /// its trackers on load. The orchestrator used to relabel `acctrounds`
+    /// to `blocks_round` without applying those blocks, so an account funded
+    /// inside the window had balance 0 and the first post-window block that
+    /// spent from it failed with `insufficient balance 0 for fee 1000`
+    /// (observed live on mainnet at block 65530002).
+    ///
+    /// Here the payer is funded in the snapshot, the window block at
+    /// `balances_round + 1` pays a receiver that does not exist in the
+    /// snapshot, and the block at `blocks_round + 1` spends from that
+    /// receiver.
+    #[test]
+    fn go_shaped_catchpoint_replays_lookback_window_before_following() {
+        use crate::catchpoint::writer::{export_catchpoint_file, ExportOptions};
+
+        const BALANCES_ROUND: u64 = 1000;
+        const BLOCKS_ROUND: u64 = BALANCES_ROUND + 320;
+        const PAYER: [u8; 32] = [1u8; 32];
+        const RECEIVER: [u8; 32] = [2u8; 32];
+
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-go-window-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let src = window_source_db(PAYER, 10_000_000);
+        let catchpoint_path = dir.join("source-catchpoint.tar.gz");
+        let export_result = export_catchpoint_file(
+            &src,
+            &catchpoint_path,
+            &ExportOptions {
+                balances_round: BALANCES_ROUND,
+                blocks_round: BLOCKS_ROUND,
+                block_header_digest: [7u8; 32],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut config = test_config(dir.join("ledger"), 1);
+        config.catchpoint_label = Some(export_result.label.clone());
+        let mut orchestrator = SyncOrchestrator::with_backend(
+            config,
+            WindowBackend {
+                source_file: catchpoint_path,
+                payer: PAYER,
+                receiver: RECEIVER,
+                window_round: BALANCES_ROUND + 1,
+                spend_round: BLOCKS_ROUND + 1,
+                status_not_found: false,
+            },
+        );
+
+        orchestrator.run_download_ledger().unwrap();
+        orchestrator.run_import_ledger().unwrap();
+        orchestrator.run_verify_ledger().unwrap();
+        orchestrator.run_download_lookback().unwrap();
+        orchestrator
+            .run_replay_blocks()
+            .expect("the block after the window must apply once the window is replayed");
+
+        assert_eq!(orchestrator.final_round, BLOCKS_ROUND + 1);
+        let ledger = crate::sqlite::SqliteLedger::open_with_prefix(&orchestrator.config.db_path)
+            .expect("reopen ledger");
+        assert_eq!(ledger.current_round().0, BLOCKS_ROUND + 1);
+        let receiver = ledger
+            .get_account(&algo_types::Address(RECEIVER))
+            .expect("receiver funded inside the window must exist");
+        assert_eq!(receiver.micro_algos, 5_000_000 - 1_000 - 1_000);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #1654 (live soak 36812812222): a relay-gossip catchup peer has
+    /// no `/v2/status`; after the window replay the missing network round
+    /// must end the replay at the catchpoint round, not fail the catchup.
+    #[test]
+    fn replay_ends_at_catchpoint_round_when_peer_has_no_v2_status() {
+        use crate::catchpoint::writer::{export_catchpoint_file, ExportOptions};
+
+        const BALANCES_ROUND: u64 = 1000;
+        const BLOCKS_ROUND: u64 = BALANCES_ROUND + 320;
+        const PAYER: [u8; 32] = [1u8; 32];
+
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-no-v2-status-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = window_source_db(PAYER, 10_000_000);
+        let path = dir.join("go-shaped.tar.gz");
+        let export_result = export_catchpoint_file(
+            &src,
+            &path,
+            &ExportOptions {
+                balances_round: BALANCES_ROUND,
+                blocks_round: BLOCKS_ROUND,
+                block_header_digest: [7u8; 32],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut config = test_config(dir.join("ledger"), 1);
+        config.catchpoint_label = Some(export_result.label.clone());
+        let mut orchestrator = SyncOrchestrator::with_backend(
+            config,
+            WindowBackend {
+                source_file: path,
+                payer: PAYER,
+                receiver: [2u8; 32],
+                window_round: BALANCES_ROUND + 1,
+                spend_round: BLOCKS_ROUND + 1,
+                status_not_found: true,
+            },
+        );
+        orchestrator.run_download_ledger().unwrap();
+        orchestrator.run_import_ledger().unwrap();
+        orchestrator.run_verify_ledger().unwrap();
+        orchestrator.run_download_lookback().unwrap();
+        orchestrator
+            .run_replay_blocks()
+            .expect("a peer without /v2/status must not fail the replay");
+        assert_eq!(orchestrator.final_round, BLOCKS_ROUND);
+        let ledger =
+            crate::sqlite::SqliteLedger::open_with_prefix(&orchestrator.config.db_path).unwrap();
+        assert_eq!(ledger.current_round().0, BLOCKS_ROUND);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #1654: the post-sync WAL checkpoint must run cleanly against a
+    /// real tracker + block database pair (both pragmas return three
+    /// columns) and leave the WALs reset.
+    #[test]
+    fn post_sync_wal_checkpoint_runs_and_truncates_the_wal() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-wal-checkpoint-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let orchestrator = SyncOrchestrator::new(test_config(dir.join("ledger"), 1));
+        {
+            let conn = orchestrator.open_db().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS t (x INTEGER); INSERT INTO t VALUES (1);
+                 CREATE TABLE IF NOT EXISTS blockdb.u (x INTEGER); INSERT INTO blockdb.u VALUES (1);",
+            )
+            .unwrap();
+        }
+        orchestrator.checkpoint_wal_after_sync();
+        let conn = orchestrator.open_db().unwrap();
+        let (busy, log, _): (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!((busy, log), (0, 0), "WAL must already be reset");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #1654 (the failure-path half): if the lookback phase never
+    /// runs or fails after verify, a go-shaped catchpoint's ledger must not
+    /// claim `catchpoint_round` -- its account state is at `balances_round`.
+    /// Also pins the state-round marker: present only for algod-rust-exported
+    /// files that ask for it.
+    #[test]
+    fn go_shaped_catchpoint_is_not_relabeled_when_lookback_never_runs() {
+        use crate::catchpoint::writer::{export_catchpoint_file, ExportOptions};
+
+        const BALANCES_ROUND: u64 = 1000;
+        const BLOCKS_ROUND: u64 = BALANCES_ROUND + 320;
+        const PAYER: [u8; 32] = [1u8; 32];
+
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-go-no-relabel-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let src = window_source_db(PAYER, 10_000_000);
+        let go_path = dir.join("go-shaped.tar.gz");
+        let export_result = export_catchpoint_file(
+            &src,
+            &go_path,
+            &ExportOptions {
+                balances_round: BALANCES_ROUND,
+                blocks_round: BLOCKS_ROUND,
+                block_header_digest: [7u8; 32],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let rust_path = dir.join("rust-exported.tar.gz");
+        export_catchpoint_file(
+            &src,
+            &rust_path,
+            &ExportOptions {
+                balances_round: BALANCES_ROUND,
+                blocks_round: BLOCKS_ROUND,
+                block_header_digest: [7u8; 32],
+                state_round: Some(BLOCKS_ROUND),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            crate::catchpoint::parser::open(&go_path)
+                .unwrap()
+                .state_round_marker()
+                .unwrap(),
+            None,
+            "a file written with go's exact entry set has no marker"
+        );
+        assert_eq!(
+            crate::catchpoint::parser::open(&rust_path)
+                .unwrap()
+                .state_round_marker()
+                .unwrap(),
+            Some(BLOCKS_ROUND)
+        );
+
+        let mut config = test_config(dir.join("ledger"), 1);
+        config.catchpoint_label = Some(export_result.label.clone());
+        let mut orchestrator = SyncOrchestrator::with_backend(
+            config,
+            WindowBackend {
+                source_file: go_path,
+                payer: PAYER,
+                receiver: [2u8; 32],
+                window_round: BALANCES_ROUND + 1,
+                spend_round: BLOCKS_ROUND + 1,
+                status_not_found: false,
+            },
+        );
+        orchestrator.run_download_ledger().unwrap();
+        orchestrator.run_import_ledger().unwrap();
+        assert_eq!(orchestrator.embedded_state_round, None);
+        orchestrator.run_verify_ledger().unwrap();
+
+        let reopened = crate::sqlite::SqliteLedger::open_with_prefix(&orchestrator.config.db_path)
+            .expect("reopen the ledger exactly as reload_ledger does");
+        assert_eq!(
+            reopened.current_round().0,
+            BALANCES_ROUND,
+            "without the lookback window replayed the ledger must still report              balances_round, not claim catchpoint_round"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

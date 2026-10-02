@@ -1183,7 +1183,13 @@ impl algo_ledger::sync::SyncBackend for SlowBlockingBackend {
         &self,
         _round: u64,
     ) -> Result<(String, Vec<u8>, Vec<u8>), algo_error::AlgoError> {
-        unimplemented!("not exercised by this test")
+        // `run_download_ledger` makes a best-effort early fetch of the
+        // catchpoint round's block (issue #1649) before downloading; an
+        // error there is non-fatal ("early cache unavailable"), whereas
+        // `unimplemented!()` panicked the run task.
+        Err(algo_error::AlgoError::Network {
+            message: "SlowBlockingBackend does not serve blocks".to_string(),
+        })
     }
 
     fn fetch_block(&self, _round: u64) -> Result<algo_types::Block, algo_error::AlgoError> {

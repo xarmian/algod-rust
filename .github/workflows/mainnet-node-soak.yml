@@ -97,7 +97,10 @@ jobs:
     runs-on: ubuntu-latest
     # duration_minutes (default 60) plus build/catchup-discovery/teardown
     # overhead — a hard stop so a wedged node can't hold a runner all day.
-    timeout-minutes: 90
+    # (190 so a manual dispatch with duration_minutes up to ~165 -- long
+    # enough for fast catchup plus catching up to the tip -- fits; the
+    # scheduled default stays 60.)
+    timeout-minutes: 190
 
     steps:
       - name: Checkout
@@ -463,11 +466,11 @@ jobs:
       - name: Poll node + peer status and detect a halt
         id: monitor
         # Hard step-level cap so a wedged monitor/node can never hold the job
-        # until the 90-minute job timeout (which cancels the job and skips the
+        # until the job-level timeout (which cancels the job and skips the
         # artifact-upload steps -- issue #1650's live verification lost two
         # whole dispatches' evidence that way). Must leave the later
         # `if: always()` steps (teardown, summary, upload) time to run.
-        timeout-minutes: 80
+        timeout-minutes: 175
         env:
           ALGOD_URL: ${{ steps.params.outputs.algod_url }}
         run: |

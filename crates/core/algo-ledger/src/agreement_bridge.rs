@@ -264,12 +264,32 @@ impl AgreementLedgerBridge {
         // Begin a transaction so that block storage and state application
         // are atomic. If begin_block fails (e.g., already in a transaction),
         // fall back to non-transactional mode.
+        // Issue #1654 diagnostics: time each stage so a slow first commit
+        // after a catchup names its stage in the log.
+        let slow = |stage: &str, since: std::time::Instant| {
+            if since.elapsed() > Duration::from_secs(1) {
+                warn!(
+                    round = %block.round,
+                    stage,
+                    elapsed_ms = since.elapsed().as_millis() as u64,
+                    "try_commit_block: slow stage"
+                );
+            }
+        };
+        let t = std::time::Instant::now();
         let in_txn = ledger.begin_block().is_ok();
+        slow("begin_block", t);
 
         let result = (|| -> Result<(), AlgoError> {
+            let t = std::time::Instant::now();
             ledger.put_block(block.round.0, proto, hdr_data, blk_data)?;
+            slow("put_block", t);
+            let t = std::time::Instant::now();
             ledger.put_block_cert(block.round.0, cert_bytes)?;
+            slow("put_block_cert", t);
+            let t = std::time::Instant::now();
             crate::apply::apply_block(ledger, block)?;
+            slow("apply_block", t);
             Ok(())
         })();
 
@@ -281,7 +301,9 @@ impl AgreementLedgerBridge {
         }
 
         if in_txn {
+            let t = std::time::Instant::now();
             ledger.commit_block()?;
+            slow("commit_block", t);
         }
 
         Ok(())
@@ -380,6 +402,24 @@ impl LedgerReader for AgreementLedgerBridge {
         if acct.status != algo_types::AccountStatus::Online {
             return Ok(OnlineAccountData::default());
         }
+
+        // Issue #1654 (live soak 36926581071, block 65574392: certificate
+        // weight 1111 < threshold 1112): go's `LookupAgreement` returns
+        // `MicroAlgosWithRewards` -- the account's balance with the rewards
+        // pending at the *lookup round's* rewards level folded in
+        // (`BaseOnlineAccountData.GetOnlineAccountData`,
+        // `ledger/store/trackerdb/data.go`) -- because that is the stake
+        // sortition weighs. The raw stored balance understates it by the
+        // pending rewards, shifting committee-membership weights by a vote
+        // here and there and eventually failing a certificate quorum.
+        let rewards_level = ledger
+            .get_block_header_data(round.0)
+            .ok()
+            .flatten()
+            .and_then(|hdr| algo_types::BlockHeader::decode_from_bytes(&hdr).ok())
+            .map(|hdr| hdr.rewards_level)
+            .unwrap_or_else(|| ledger.rewards_level());
+        let acct = with_pending_rewards(acct, rewards_level);
 
         Ok(OnlineAccountData {
             micro_algos: acct.micro_algos,
@@ -650,6 +690,7 @@ impl LedgerWriter for AgreementLedgerBridge {
         let cert_bytes = algo_agreement::codec::encode_bundle(&bundle);
 
         for attempt in 0..=MAX_RETRIES {
+            let lock_wait_started = std::time::Instant::now();
             let mut ledger = match self.ledger.lock() {
                 Ok(l) => l,
                 Err(e) => {
@@ -657,6 +698,16 @@ impl LedgerWriter for AgreementLedgerBridge {
                     return;
                 }
             };
+            // Issue #1654 diagnostics: separate waiting for the ledger lock
+            // (held by someone else) from the commit itself.
+            if lock_wait_started.elapsed() > Duration::from_secs(1) {
+                warn!(
+                    round = %block.round,
+                    waited_ms = lock_wait_started.elapsed().as_millis() as u64,
+                    "ensure_block: waited a long time for the ledger lock"
+                );
+            }
+            let commit_started = std::time::Instant::now();
 
             // Check if this block's round has already been committed.
             let next_round = ledger.current_round().0 + 1;
@@ -689,6 +740,13 @@ impl LedgerWriter for AgreementLedgerBridge {
                 &cert_bytes,
             ) {
                 Ok(()) => {
+                    if commit_started.elapsed() > Duration::from_secs(1) {
+                        warn!(
+                            round = %block.round,
+                            commit_ms = commit_started.elapsed().as_millis() as u64,
+                            "ensure_block: slow commit"
+                        );
+                    }
                     // Success — release the lock before notifying waiters.
                     drop(ledger);
 
@@ -835,6 +893,20 @@ impl crate::catchup_service::CatchupLedger for AgreementLedgerBridge {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// `acct` with the rewards pending at `rewards_level` folded into its
+/// balance (go's `basics.WithUpdatedRewards`). A level below the account's
+/// `rewards_base` (a lookup at a round older than the stored record) adds
+/// nothing rather than wrapping.
+fn with_pending_rewards(
+    mut acct: algo_types::AccountData,
+    rewards_level: u64,
+) -> algo_types::AccountData {
+    if rewards_level >= acct.rewards_base {
+        crate::rewards::apply_rewards(&mut acct, rewards_level);
+    }
+    acct
+}
+
 /// Extract the committee seed from a msgpack-encoded block header.
 ///
 /// The seed is stored under codec key `"seed"` as a 32-byte binary value.
@@ -953,6 +1025,30 @@ mod tests {
         assert_eq!(oad.vote_id, [7u8; 32]);
         assert_eq!(oad.selection_id, [8u8; 32]);
         assert_eq!(oad.vote_key_dilution, 100);
+    }
+
+    /// Issue #1654: the voting stake includes the rewards pending at the
+    /// lookup round's level (go's `MicroAlgosWithRewards`).
+    #[test]
+    fn with_pending_rewards_folds_in_rewards_like_go() {
+        let acct = algo_types::AccountData {
+            micro_algos: 10_000_000_000, // 10_000 reward units
+            rewards_base: 100,
+            status: algo_types::AccountStatus::Online,
+            ..Default::default()
+        };
+        // (level - base) * units = 25 * 10_000
+        assert_eq!(
+            with_pending_rewards(acct.clone(), 125).micro_algos,
+            10_000_250_000
+        );
+        // No change at the account's own level, and no wrap-around for an
+        // older lookup level.
+        assert_eq!(
+            with_pending_rewards(acct.clone(), 100).micro_algos,
+            10_000_000_000
+        );
+        assert_eq!(with_pending_rewards(acct, 50).micro_algos, 10_000_000_000);
     }
 
     #[test]
