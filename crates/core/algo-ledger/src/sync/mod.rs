@@ -1575,6 +1575,68 @@ impl SyncOrchestrator {
         Ok(())
     }
 
+    /// Fold the (potentially tens of GB) write-ahead logs left behind by the
+    /// bulk import/verify/replay phases back into the database files, here,
+    /// in the already-blocking catchup thread, instead of letting the live
+    /// node pay for it.
+    ///
+    /// Issue #1654: a thread dump of a wedged node (soak 36943905593,
+    /// `wedge-stacks.txt`) showed the catchup service's first `commit_block`
+    /// after the catchup sitting in `sqlite3WalDefaultHook` ->
+    /// `walCheckpoint` -> `pread` at a ~22 GB WAL offset, holding the ledger
+    /// lock for 2.5-3.5 minutes (REST, agreement and every other thread
+    /// blocked behind it). An earlier attempt at this (soak 36870450959)
+    /// ignored the pragma's `busy` result and so could not tell it had
+    /// checkpointed nothing; this one logs `(busy, log, checkpointed)`,
+    /// runs a PASSIVE checkpoint first (copies every frame no reader still
+    /// needs) and then retries TRUNCATE until the WAL is actually reset.
+    /// Best-effort: failure only costs that latency.
+    fn checkpoint_wal_after_sync(&self) {
+        let conn = match self.open_db() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "post-sync WAL checkpoint: could not open database");
+                return;
+            }
+        };
+        let run = |pragma: &str| -> Option<(i64, i64, i64)> {
+            match conn.query_row(pragma, [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            }) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    tracing::warn!(error = %e, pragma, "post-sync WAL checkpoint failed");
+                    None
+                }
+            }
+        };
+        for (schema, label) in [("main", "tracker"), ("blockdb", "block")] {
+            let started = Instant::now();
+            let passive = run(&format!("PRAGMA {schema}.wal_checkpoint(PASSIVE)"));
+            tracing::info!(
+                db = label,
+                elapsed_secs = started.elapsed().as_secs_f64(),
+                result = ?passive,
+                "post-sync WAL checkpoint (PASSIVE): (busy, wal frames, checkpointed frames)"
+            );
+            for attempt in 1..=10u32 {
+                let started = Instant::now();
+                let truncated = run(&format!("PRAGMA {schema}.wal_checkpoint(TRUNCATE)"));
+                tracing::info!(
+                    db = label,
+                    attempt,
+                    elapsed_secs = started.elapsed().as_secs_f64(),
+                    result = ?truncated,
+                    "post-sync WAL checkpoint (TRUNCATE)"
+                );
+                if matches!(truncated, Some((0, _, _)) | None) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(3));
+            }
+        }
+    }
+
     /// Apply the lookback-window blocks `(tracker_round, catchpoint_round]`
     /// stored by [`Self::run_download_lookback`] when the tracker
     /// (`acctrounds('acctbase')`) is still behind `catchpoint_round` -- the
@@ -2416,6 +2478,7 @@ impl SyncOrchestrator {
 
         // Phase 5: ReplayingBlocks (ordinal 5)
         self.run_replay_blocks()?;
+        self.checkpoint_wal_after_sync();
 
         Ok(SyncResult {
             final_round: self.final_round,
@@ -3926,6 +3989,37 @@ mod tests {
         let ledger =
             crate::sqlite::SqliteLedger::open_with_prefix(&orchestrator.config.db_path).unwrap();
         assert_eq!(ledger.current_round().0, BLOCKS_ROUND);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #1654: the post-sync WAL checkpoint must run cleanly against a
+    /// real tracker + block database pair (both pragmas return three
+    /// columns) and leave the WALs reset.
+    #[test]
+    fn post_sync_wal_checkpoint_runs_and_truncates_the_wal() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-wal-checkpoint-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let orchestrator = SyncOrchestrator::new(test_config(dir.join("ledger"), 1));
+        {
+            let conn = orchestrator.open_db().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS t (x INTEGER); INSERT INTO t VALUES (1);
+                 CREATE TABLE IF NOT EXISTS blockdb.u (x INTEGER); INSERT INTO blockdb.u VALUES (1);",
+            )
+            .unwrap();
+        }
+        orchestrator.checkpoint_wal_after_sync();
+        let conn = orchestrator.open_db().unwrap();
+        let (busy, log, _): (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!((busy, log), (0, 0), "WAL must already be reset");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
