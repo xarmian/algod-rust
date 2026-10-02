@@ -5086,8 +5086,83 @@ impl SqliteLedger {
             return Ok(total);
         }
 
-        let expired = self.expired_online_stake(vote_rnd)?;
+        // Issue #1654: go's `expiredOnlineCirculation(rnd, voteRnd)` sums the
+        // stake (rewards applied at `rnd`'s level) of the accounts that were
+        // online *at round `rnd`* and whose keys are expired by `voteRnd` --
+        // historical, not today's accountbase. Using the current state made
+        // the circulation (and so every sortition weight) drift from go's by
+        // a few accounts' stake, failing a catchup certificate quorum by one
+        // vote (live soaks 36926581071 / 36961924125). Fall back to the
+        // current-state scan only if the history query fails.
+        let expired = match self.expired_online_stake_at_round(round, vote_rnd) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    round,
+                    "expired_online_stake_at_round failed; falling back to the current-state scan"
+                );
+                self.expired_online_stake(vote_rnd)?
+            }
+        };
         Ok(total.saturating_sub(expired))
+    }
+
+    /// Sum the stake -- with the rewards pending at `round`'s rewards level
+    /// folded in (go's `MicroAlgosWithRewards`) -- of every account whose
+    /// latest `onlineaccounts` row at or before `round` is a real online row
+    /// with a nonzero `VoteLastValid` strictly below `vote_rnd`.
+    ///
+    /// Mirrors go's `onlineAccounts.expiredOnlineCirculation(rnd, voteRnd)` /
+    /// `onlineAcctsExpiredByRound` (`ledger/acctonline.go`).
+    fn expired_online_stake_at_round(&self, round: u64, vote_rnd: u64) -> Result<u64, AlgoError> {
+        let rewards_level = self
+            .get_block_header_data(round)
+            .ok()
+            .flatten()
+            .and_then(|hdr| BlockHeader::decode_from_bytes(&hdr).ok())
+            .map(|hdr| hdr.rewards_level)
+            .unwrap_or_else(|| self.rewards_level());
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT o.data FROM onlineaccounts o                  WHERE o.votelastvalid != 0 AND o.votelastvalid < ?2                    AND o.updround = (SELECT MAX(i.updround) FROM onlineaccounts i                                      WHERE i.address = o.address AND i.updround <= ?1)",
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("prepare expired_online_stake_at_round query error: {e}"),
+            })?;
+        let rows = stmt
+            .query_map(params![round as i64, vote_rnd as i64], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("query expired_online_stake_at_round error: {e}"),
+            })?;
+
+        let mut expired_stake: u64 = 0;
+        for row in rows {
+            let data = row.map_err(|e| AlgoError::Ledger {
+                message: format!("read expired_online_stake_at_round row error: {e}"),
+            })?;
+            let mut account = decode_online_account_data(&data).map_err(|e| AlgoError::Ledger {
+                message: format!("decode expired_online_stake_at_round account error: {e}"),
+            })?;
+            // A zero marker row (account went offline) has no stake.
+            if account.vote_last_valid == 0 || vote_rnd <= account.vote_last_valid {
+                continue;
+            }
+            if rewards_level >= account.rewards_base {
+                crate::rewards::apply_rewards(&mut account, rewards_level);
+            }
+            expired_stake = expired_stake
+                .checked_add(account.micro_algos)
+                .ok_or_else(|| AlgoError::Ledger {
+                    message: "expired_online_stake_at_round: overflow totaling expired stake"
+                        .to_string(),
+                })?;
+        }
+        Ok(expired_stake)
     }
 
     /// Sum the stake held by currently-online accounts (`accountbase`,
@@ -9544,27 +9619,31 @@ mod tests {
             .put_account_totals_seed(5_000_000, 0, 0, 0, 0, 0)
             .unwrap();
 
+        // Issue #1654: the exclusion is historical (as of `round`), so the
+        // accounts' online history rows must exist, not just accountbase.
         let expired_addr = Address([21u8; 32]);
-        ledger.set_account(
-            &expired_addr,
-            AccountData {
-                micro_algos: 1_000_000,
-                status: AccountStatus::Online,
-                vote_last_valid: 100,
-                ..Default::default()
-            },
-        );
+        let expired_acct = AccountData {
+            micro_algos: 1_000_000,
+            status: AccountStatus::Online,
+            vote_last_valid: 100,
+            ..Default::default()
+        };
+        ledger.set_account(&expired_addr, expired_acct.clone());
+        ledger
+            .insert_online_account_row(&expired_addr, 10, &expired_acct)
+            .unwrap();
 
         let valid_addr = Address([22u8; 32]);
-        ledger.set_account(
-            &valid_addr,
-            AccountData {
-                micro_algos: 4_000_000,
-                status: AccountStatus::Online,
-                vote_last_valid: 1_000,
-                ..Default::default()
-            },
-        );
+        let valid_acct = AccountData {
+            micro_algos: 4_000_000,
+            status: AccountStatus::Online,
+            vote_last_valid: 1_000,
+            ..Default::default()
+        };
+        ledger.set_account(&valid_addr, valid_acct.clone());
+        ledger
+            .insert_online_account_row(&valid_addr, 10, &valid_acct)
+            .unwrap();
 
         // vote_rnd = 200: expired_addr's VoteLastValid (100) < 200, so its
         // 1,000,000 stake must be excluded. valid_addr's VoteLastValid
@@ -9573,6 +9652,36 @@ mod tests {
             ledger.online_circulation_at_round(50, 200).unwrap(),
             4_000_000,
             "expired participation-key stake must be excluded from circulation"
+        );
+    }
+
+    /// Issue #1654: the exclusion is evaluated as of `round`: an account that
+    /// was online and expired at `round` counts, one that only went online
+    /// (or only had its key expire) *after* `round` does not.
+    #[test]
+    fn online_circulation_at_round_uses_online_state_as_of_the_round() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.set_protocol(algo_types::consensus::CONSENSUS_V41.to_string());
+        ledger
+            .put_account_totals_seed(5_000_000, 0, 0, 0, 0, 0)
+            .unwrap();
+        let acct = AccountData {
+            micro_algos: 1_000_000,
+            status: AccountStatus::Online,
+            vote_last_valid: 100,
+            ..Default::default()
+        };
+        let addr = Address([25u8; 32]);
+        // Registered at round 60 only: not online yet as of round 50.
+        ledger.insert_online_account_row(&addr, 60, &acct).unwrap();
+        assert_eq!(
+            ledger.online_circulation_at_round(50, 200).unwrap(),
+            5_000_000
+        );
+        // As of round 70 it is online with an expired key: excluded.
+        assert_eq!(
+            ledger.online_circulation_at_round(70, 200).unwrap(),
+            4_000_000
         );
     }
 
@@ -9637,15 +9746,16 @@ mod tests {
             .put_account_totals_seed(1_000_000, 0, 0, 0, 0, 0)
             .unwrap();
         let expired_addr = Address([24u8; 32]);
-        ledger.set_account(
-            &expired_addr,
-            AccountData {
-                micro_algos: 4_000_000, // > the 1,000,000 aggregate total above
-                status: AccountStatus::Online,
-                vote_last_valid: 100,
-                ..Default::default()
-            },
-        );
+        let expired_acct = AccountData {
+            micro_algos: 4_000_000, // > the 1,000,000 aggregate total above
+            status: AccountStatus::Online,
+            vote_last_valid: 100,
+            ..Default::default()
+        };
+        ledger.set_account(&expired_addr, expired_acct.clone());
+        ledger
+            .insert_online_account_row(&expired_addr, 10, &expired_acct)
+            .unwrap();
 
         let result = ledger.online_circulation_at_round(50, 200);
         assert_eq!(
