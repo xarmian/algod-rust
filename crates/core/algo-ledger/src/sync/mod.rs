@@ -1637,6 +1637,54 @@ impl SyncOrchestrator {
         }
     }
 
+    /// Issue #1654 diagnostics: why can't the WAL be checkpointed? Log how
+    /// many file descriptors this process still has open on the database
+    /// (each SQLite connection holds one) and the WAL index's checkpoint
+    /// state (`nBackfill` and the five `aReadMark` slots -- a reader pins
+    /// the WAL at its slot's frame number). Linux only; silent elsewhere.
+    fn log_wal_pin_diagnostics(path: &std::path::Path, label: &str) {
+        Self::log_wal_pin_diagnostics_inner(path, label)
+    }
+
+    /// [`Self::log_wal_pin_diagnostics`] for this orchestrator's own tracker
+    /// database, tagged with the pipeline `stage` (to see *when* a WAL pin
+    /// first appears).
+    fn log_tracker_wal_diag(&self, stage: &str) {
+        let tracker = crate::sqlite::tracker_path_for_prefix(&crate::sqlite::derive_ledger_prefix(
+            &self.config.db_path,
+        ));
+        Self::log_wal_pin_diagnostics_inner(&tracker, stage);
+    }
+
+    fn log_wal_pin_diagnostics_inner(path: &std::path::Path, label: &str) {
+        let open_fds = std::fs::read_dir("/proc/self/fd")
+            .map(|dir| {
+                dir.filter_map(|e| e.ok())
+                    .filter_map(|e| std::fs::read_link(e.path()).ok())
+                    .filter(|target| target.as_path() == path)
+                    .count()
+            })
+            .ok();
+        let mut shm_path = path.as_os_str().to_owned();
+        shm_path.push("-shm");
+        let shm = std::fs::read(&shm_path).ok().and_then(|bytes| {
+            if bytes.len() < 136 {
+                return None;
+            }
+            let word = |off: usize| u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+            Some((
+                word(96),
+                [word(100), word(104), word(108), word(112), word(116)],
+            ))
+        });
+        tracing::info!(
+            db = label,
+            open_fds_on_db = ?open_fds,
+            wal_index_nbackfill_and_readmarks = ?shm,
+            "WAL pin diagnostics"
+        );
+    }
+
     /// Best-effort full checkpoint of one SQLite database file's WAL over a
     /// fresh, private connection (no ledger lock involved): `PASSIVE` first,
     /// then one `TRUNCATE`. Logs the `(busy, log, checkpointed)` results.
@@ -1655,6 +1703,7 @@ impl SyncOrchestrator {
                 return;
             }
         };
+        Self::log_wal_pin_diagnostics(path, label);
         for pragma in [
             "PRAGMA wal_checkpoint(PASSIVE)",
             "PRAGMA wal_checkpoint(TRUNCATE)",
@@ -2483,6 +2532,7 @@ impl SyncOrchestrator {
         // Phase 2: ImportingLedger (ordinal 2)
         if resume_ord <= 2 {
             self.run_import_ledger()?;
+            self.log_tracker_wal_diag("after_import");
         } else {
             // When resuming past import, we still need the block_header_digest
             // and balances_round for verification. Extract them from the
@@ -2509,15 +2559,18 @@ impl SyncOrchestrator {
         // Phase 3: VerifyingLedger (ordinal 3)
         if resume_ord <= 3 {
             self.run_verify_ledger()?;
+            self.log_tracker_wal_diag("after_verify");
         }
 
         // Phase 4: DownloadingLookback (ordinal 4)
         if resume_ord <= 4 {
             self.run_download_lookback()?;
+            self.log_tracker_wal_diag("after_lookback");
         }
 
         // Phase 5: ReplayingBlocks (ordinal 5)
         self.run_replay_blocks()?;
+        self.log_tracker_wal_diag("after_replay");
         self.checkpoint_wal_after_sync();
 
         Ok(SyncResult {
