@@ -264,12 +264,32 @@ impl AgreementLedgerBridge {
         // Begin a transaction so that block storage and state application
         // are atomic. If begin_block fails (e.g., already in a transaction),
         // fall back to non-transactional mode.
+        // Issue #1654 diagnostics: time each stage so a slow first commit
+        // after a catchup names its stage in the log.
+        let slow = |stage: &str, since: std::time::Instant| {
+            if since.elapsed() > Duration::from_secs(1) {
+                warn!(
+                    round = %block.round,
+                    stage,
+                    elapsed_ms = since.elapsed().as_millis() as u64,
+                    "try_commit_block: slow stage"
+                );
+            }
+        };
+        let t = std::time::Instant::now();
         let in_txn = ledger.begin_block().is_ok();
+        slow("begin_block", t);
 
         let result = (|| -> Result<(), AlgoError> {
+            let t = std::time::Instant::now();
             ledger.put_block(block.round.0, proto, hdr_data, blk_data)?;
+            slow("put_block", t);
+            let t = std::time::Instant::now();
             ledger.put_block_cert(block.round.0, cert_bytes)?;
+            slow("put_block_cert", t);
+            let t = std::time::Instant::now();
             crate::apply::apply_block(ledger, block)?;
+            slow("apply_block", t);
             Ok(())
         })();
 
@@ -281,7 +301,9 @@ impl AgreementLedgerBridge {
         }
 
         if in_txn {
+            let t = std::time::Instant::now();
             ledger.commit_block()?;
+            slow("commit_block", t);
         }
 
         Ok(())
@@ -668,6 +690,7 @@ impl LedgerWriter for AgreementLedgerBridge {
         let cert_bytes = algo_agreement::codec::encode_bundle(&bundle);
 
         for attempt in 0..=MAX_RETRIES {
+            let lock_wait_started = std::time::Instant::now();
             let mut ledger = match self.ledger.lock() {
                 Ok(l) => l,
                 Err(e) => {
@@ -675,6 +698,16 @@ impl LedgerWriter for AgreementLedgerBridge {
                     return;
                 }
             };
+            // Issue #1654 diagnostics: separate waiting for the ledger lock
+            // (held by someone else) from the commit itself.
+            if lock_wait_started.elapsed() > Duration::from_secs(1) {
+                warn!(
+                    round = %block.round,
+                    waited_ms = lock_wait_started.elapsed().as_millis() as u64,
+                    "ensure_block: waited a long time for the ledger lock"
+                );
+            }
+            let commit_started = std::time::Instant::now();
 
             // Check if this block's round has already been committed.
             let next_round = ledger.current_round().0 + 1;
@@ -707,6 +740,13 @@ impl LedgerWriter for AgreementLedgerBridge {
                 &cert_bytes,
             ) {
                 Ok(()) => {
+                    if commit_started.elapsed() > Duration::from_secs(1) {
+                        warn!(
+                            round = %block.round,
+                            commit_ms = commit_started.elapsed().as_millis() as u64,
+                            "ensure_block: slow commit"
+                        );
+                    }
                     // Success — release the lock before notifying waiters.
                     drop(ledger);
 
