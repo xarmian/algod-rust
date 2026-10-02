@@ -3921,8 +3921,14 @@ pub fn apply_axfer<L: crate::store_trait::LedgerStore>(
                 ad.asset_closing_amount = remaining;
             }
 
-            // Check frozen on the sender's holding (unless bypassed).
-            if from_holding.frozen && !bypass_freeze {
+            // Check frozen on the sender's holding (unless bypassed). go's
+            // `takeOut` short-circuits on a zero amount before looking at
+            // the holding ("If we are closing out 0 units of the asset, then
+            // takeOut and putIn will short circuit (so bypassFreeze doesn't
+            // matter)"), so a frozen holding with nothing left in it can
+            // always be closed out (issue #1654, live mainnet block
+            // 65596480).
+            if remaining > 0 && from_holding.frozen && !bypass_freeze {
                 return Err(AlgoError::Ledger {
                     message: format!(
                         "axfer close: {} holding for asset {} is frozen",
@@ -6317,6 +6323,45 @@ mod tests {
         apply_transaction(&mut state, &axfer(None), &ctx, 0).unwrap(); // opt in
         apply_transaction(&mut state, &axfer(Some(ghost)), &ctx, 0).unwrap(); // opt out
         assert!(state.get_account(&ghost).is_none());
+    }
+
+    /// Issue #1654 (live mainnet block 65596480): closing out a *frozen*
+    /// holding that holds zero units must succeed (go's `takeOut` returns
+    /// early on a zero amount).
+    #[test]
+    fn axfer_close_out_of_frozen_zero_holding_succeeds() {
+        let creator = Address([1u8; 32]);
+        let holder = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(creator, 900_000), (holder, 900_000), (fee_sink, 0)],
+            fee_sink,
+        );
+        let ctx = apply_context_for_version(fee_sink, 5, algo_types::consensus::CONSENSUS_V34);
+        create_asset_in_state(&mut state, &ctx, creator, 7, AssetParams::default());
+
+        let mut optin = SignedTransaction::default();
+        optin.txn.txn_type = "axfer".into();
+        optin.txn.sender = holder;
+        optin.txn.fee = 1_000;
+        optin.txn.xaid = 7;
+        optin.txn.asset_receiver = Some(holder);
+        apply_transaction(&mut state, &optin, &ctx, 0).unwrap();
+        crate::store_trait::LedgerStore::set_asset_holding(
+            &mut state,
+            &holder,
+            7,
+            AssetHolding {
+                amount: 0,
+                frozen: true,
+            },
+        );
+
+        let mut close = optin.clone();
+        close.txn.asset_close_to = Some(Address([9u8; 32]));
+        apply_transaction(&mut state, &close, &ctx, 0)
+            .expect("a frozen holding with zero units can be closed out");
+        assert!(state.get_asset_holding(&holder, 7).is_none());
     }
 
     #[test]
