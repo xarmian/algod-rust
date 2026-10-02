@@ -5345,8 +5345,29 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     fn app_global_get(&self, app_id: u64, key: &[u8]) -> Result<Option<TealValue>, AlgoError> {
         self.note_app_access(app_id);
         let value = match self.store.get_app_params(app_id) {
-            Some(params) => params.global_state.get(key).cloned(),
-            None => None,
+            Some(params) => {
+                if app_id == 971323141 {
+                    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+                    let found = params.global_state.get(key);
+                    if !matches!(found, Some(TealValue::Bytes(_))) {
+                        tracing::warn!(
+                            target: "diag1664",
+                            key = %hex(key),
+                            found = ?found.map(|v| match v { TealValue::Bytes(b) => format!("bytes{}", b.len()), TealValue::Uint(u) => format!("uint{u}") }),
+                            nkeys = params.global_state.len(),
+                            keys = %params.global_state.keys().map(|k| hex(k)).collect::<Vec<_>>().join(","),
+                            "diag1664 app_global_get non-bytes/missing"
+                        );
+                    }
+                }
+                params.global_state.get(key).cloned()
+            }
+            None => {
+                if app_id == 971323141 {
+                    tracing::warn!(target: "diag1664", "diag1664 app params missing");
+                }
+                None
+            }
         };
         self.record_app_state_access(
             app_id,
