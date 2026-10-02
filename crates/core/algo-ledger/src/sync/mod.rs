@@ -1819,7 +1819,7 @@ impl SyncOrchestrator {
                 self.eval_delta_stats += block_stats;
                 result
             } else {
-                crate::apply_block(&mut store, &block)
+                crate::apply::apply_block_executing_app_calls(&mut store, &block)
             };
             match apply_result {
                 Ok(()) => {
@@ -2051,7 +2051,7 @@ impl SyncOrchestrator {
                     self.eval_delta_stats += block_stats;
                     result
                 } else {
-                    crate::apply_block(&mut store, block)
+                    crate::apply::apply_block_executing_app_calls(&mut store, block)
                 };
 
                 match apply_result {
@@ -2419,7 +2419,7 @@ impl SyncOrchestrator {
                     self.eval_delta_stats += block_stats;
                     result
                 } else {
-                    crate::apply_block(&mut store, &block)
+                    crate::apply::apply_block_executing_app_calls(&mut store, &block)
                 };
 
                 match apply_result {

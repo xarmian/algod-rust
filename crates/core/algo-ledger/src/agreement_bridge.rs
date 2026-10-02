@@ -288,7 +288,7 @@ impl AgreementLedgerBridge {
             ledger.put_block_cert(block.round.0, cert_bytes)?;
             slow("put_block_cert", t);
             let t = std::time::Instant::now();
-            crate::apply::apply_block(ledger, block)?;
+            crate::apply::apply_block_executing_app_calls(ledger, block)?;
             slow("apply_block", t);
             Ok(())
         })();
@@ -1424,5 +1424,134 @@ mod tests {
                 panic!("expected LedgerError::Other with 'no certificate stored', got: {other:?}")
             }
         }
+    }
+
+    /// Issue #1664: the node's follow path (`ensure_block` ->
+    /// `try_commit_block`) committed blocks with `ApplyMode::Replay`, which
+    /// never runs the AVM and therefore never reaches the box create/delete
+    /// call sites. An app account's `total_boxes`/`total_box_bytes` (and the
+    /// box store itself) froze at their catchpoint values, so the account's
+    /// minimum balance diverged from go-algorand's (mainnet block 65595332,
+    /// app account N7NYG...: balance 100000 < computed minimum 162600).
+    /// go always evaluates app calls, so a committed block containing an
+    /// `appl` transaction must update box accounting.
+    #[test]
+    fn ensure_block_applies_box_create_and_delete_to_app_account_totals() {
+        use algo_types::{AccountData, AppParams, Block, BoxRef, SignedTransaction, Transaction};
+        use serde_bytes::ByteBuf;
+        use std::collections::BTreeMap;
+
+        let creator = Address([1u8; 32]);
+        let sender = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let app_id = 950u64;
+        let app_addr = Address(crate::avm_context::app_address(app_id));
+
+        let assemble = |src: &str| {
+            algo_avm::assembler::assemble_string(src)
+                .expect("program must assemble")
+                .program
+        };
+        // First call puts a box; second call deletes it.
+        let put = assemble(concat!(
+            "#pragma version 8\n",
+            "byte \"mybox\"\n",
+            "byte \"hello\"\n",
+            "box_put\n",
+            "int 1\n",
+            "return\n",
+        ));
+        let del = assemble(concat!(
+            "#pragma version 8\n",
+            "byte \"mybox\"\n",
+            "box_del\n",
+            "pop\n",
+            "int 1\n",
+            "return\n",
+        ));
+
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        {
+            let mut l = ledger.lock().unwrap();
+            for (addr, bal) in [
+                (creator, 50_000_000u64),
+                (sender, 50_000_000),
+                (app_addr, 10_000_000),
+            ] {
+                l.set_account(
+                    &addr,
+                    AccountData {
+                        micro_algos: bal,
+                        ..Default::default()
+                    },
+                );
+            }
+            l.set_account(&fee_sink, AccountData::default());
+            l.set_app_params(
+                app_id,
+                AppParams {
+                    creator,
+                    approval_program: put,
+                    clear_state_program: vec![0x08, 0x81, 0x01],
+                    global_state: BTreeMap::new(),
+                    ..Default::default()
+                },
+            );
+        }
+        let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+
+        let call_block = |round: u64| {
+            let stx = SignedTransaction {
+                txn: Transaction {
+                    txn_type: "appl".into(),
+                    sender,
+                    fee: 1_000,
+                    first_valid: Round(1),
+                    last_valid: Round(1000),
+                    application_id: app_id,
+                    boxes: Some(vec![BoxRef {
+                        index: 0,
+                        name: Some(ByteBuf::from(b"mybox".to_vec())),
+                    }]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            Block {
+                round: Round(round),
+                fee_sink,
+                current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+                payset: vec![stx],
+                ..Block::default()
+            }
+        };
+
+        bridge.ensure_block(&call_block(1), &make_cert_with_proposal(1));
+        {
+            let l = ledger.lock().unwrap();
+            assert_eq!(l.current_round(), Round(1), "round 1 must commit");
+            let acct = l.get_account(&app_addr).unwrap();
+            assert_eq!(acct.total_boxes, 1, "box_put must be counted");
+            assert_eq!(
+                acct.total_box_bytes,
+                (b"mybox".len() + b"hello".len()) as u64
+            );
+            assert_eq!(l.get_box(app_id, b"mybox"), Some(b"hello".to_vec()));
+        }
+
+        // Swap in the deleting program, then call again.
+        {
+            let mut l = ledger.lock().unwrap();
+            let mut params = l.get_app_params(app_id).unwrap();
+            params.approval_program = del;
+            l.set_app_params(app_id, params);
+        }
+        bridge.ensure_block(&call_block(2), &make_cert_with_proposal(2));
+        let l = ledger.lock().unwrap();
+        assert_eq!(l.current_round(), Round(2), "round 2 must commit");
+        let acct = l.get_account(&app_addr).unwrap();
+        assert_eq!(acct.total_boxes, 0, "box_del must be counted");
+        assert_eq!(acct.total_box_bytes, 0);
+        assert_eq!(l.get_box(app_id, b"mybox"), None);
     }
 }
