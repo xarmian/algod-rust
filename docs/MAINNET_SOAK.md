@@ -183,6 +183,8 @@ than guessed at here.
 | [36246996407](https://github.com/xarmian/algod-rust/actions/runs/36246996407) (60 min budget) | 65410000 | not recorded — import (915.6s) + verify consumed the full budget; verify itself completed (node reached `balances_round` 65409680 with zero errors) but the run ended before catching up to the live tip | false | n/a (0 follow samples) |
 | [36251668578](https://github.com/xarmian/algod-rust/actions/runs/36251668578) (75 min budget) | 65410000 | not recorded — verify (Merkle trie rebuild) had not completed after 47+ minutes; classified `stuck`, see issue #1631 | false | n/a (0 follow samples) |
 | [36433896069](https://github.com/xarmian/algod-rust/actions/runs/36433896069) (45 min budget, dispatched on `main` after issue #1636's fix) | 65469680 | **2676.1s (~44.6 min)** — first confirmed, completed measurement: import (922.1s) + verify (1368.3s Merkle trie rebuild over 76,944,826 elements, `total_elements_added` matches staged row count exactly) + cutover finalized, node reached `phase: follow` | false | n/a (0 follow samples; node was 8,727 rounds behind the peer, `lag_rounds.n=0`, when the 45-minute poll budget ended — `monitor.py` only starts recording lag samples once `reached_tip` first becomes true) |
+| [36975813534](https://github.com/xarmian/algod-rust/actions/runs/36975813534) (dispatched on the #1655 branch) | 65590000 | **2948.7s (~49.1 min)** | **true** | n=544, mean 1.72, p95 3, max 69 rounds (stopped later at block 65596480 on a frozen zero-unit holding close-out, fixed in the same PR) |
+| [36990771406](https://github.com/xarmian/algod-rust/actions/runs/36990771406) (150 min budget, #1655 head) | 65590000 | **3141.3s (~52.4 min)** | **true** | n=482, mean 0.37, p95 2, max 3 rounds; node 65600081 == peer 65600081, verdict `ok` |
 
 **A confirmed, completed `fast_catchup_seconds` number is now
 available**: **2676.1s (~44.6 min)** for a real mainnet catchpoint
@@ -209,6 +211,8 @@ directly measured yet), or accepting `fast_catchup_seconds` alone
 already-documented position in the next section that a short budget
 reaching the live tip is no longer realistic at mainnet's real
 ~22.5M-account scale.
+
+**`reached_tip: true` is now confirmed (issue #1598's remaining bar).** Runs 36975813534 and 36990771406, dispatched on the branch merged as PR #1655, reached the live tip and stayed there: the second followed 65590000 -> 65600081 with a mean lag of 0.37 rounds. Getting there took the stale-catchpoint-state fix (#1654: a go-produced catchpoint holds state at `balances_round` and the stored window up to `blocks_round` must be replayed), a series of replay-parity fixes each found from a real mainnet block, a thread-per-round fix (#1652) and a WAL checkpoint moved off the ledger lock. Use a 150-minute dispatch budget to see tip-following; the default 60-minute budget cannot reach the tip at mainnet's current scale.
 
 ### On the issue's original "≈15 min short budget" criterion
 
