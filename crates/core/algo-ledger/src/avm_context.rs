@@ -3810,6 +3810,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     }
 
     fn box_put_impl(&mut self, app_id: u64, name: &[u8], value: &[u8]) -> Result<(), AlgoError> {
+        if app_id == 3625140217 || app_id == 3539450791 { tracing::warn!(target: "diag1664", op = "put", app_id, name_len = name.len(), "diag1664 box op"); }
         self.box_length_checks(name, value.len() as u64)?;
 
         let pre = self.box_pre_value(app_id, name);
@@ -3857,6 +3858,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     }
 
     fn box_del_impl(&mut self, app_id: u64, name: &[u8]) -> Result<bool, AlgoError> {
+        if app_id == 3625140217 || app_id == 3539450791 { tracing::warn!(target: "diag1664", op = "del", app_id, name_len = name.len(), "diag1664 box op"); }
         self.box_length_checks(name, 0)?;
         let pre = self.box_pre_value(app_id, name);
         self.record_app_state_access(
@@ -3909,6 +3911,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     }
 
     fn box_create_impl(&mut self, app_id: u64, name: &[u8], size: u64) -> Result<bool, AlgoError> {
+        if app_id == 3625140217 || app_id == 3539450791 { tracing::warn!(target: "diag1664", op = "create", app_id, name_len = name.len(), "diag1664 box op"); }
         self.box_length_checks(name, size)?;
         let pre = self.box_pre_value(app_id, name);
         self.record_app_state_access(
@@ -4019,6 +4022,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         name: &[u8],
         new_size: u64,
     ) -> Result<(), AlgoError> {
+        if app_id == 3625140217 || app_id == 3539450791 { tracing::warn!(target: "diag1664", op = "resize", app_id, name_len = name.len(), "diag1664 box op"); }
         self.box_length_checks(name, new_size)?;
         let pre = self.box_pre_value(app_id, name);
         self.record_app_state_access(

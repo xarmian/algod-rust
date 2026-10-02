@@ -5916,6 +5916,20 @@ impl LedgerStore for SqliteLedger {
 
     fn set_account(&mut self, addr: &Address, account: AccountData) {
         let old = self.get_account(addr);
+        // TEMP DIAG issue #1664: trace the suspect app account.
+        if addr.to_string() == "N7NYG47JFE3TUFKQZDKNXK2ZSQLAJTPBZFII3T7NZU6Q6JQAQ7PUYNDLCM" {
+            tracing::warn!(
+                target: "diag1664",
+                round = self.current_round.0,
+                old_boxes = old.as_ref().map(|a| a.total_boxes),
+                old_bytes = old.as_ref().map(|a| a.total_box_bytes),
+                old_bal = old.as_ref().map(|a| a.micro_algos),
+                new_boxes = account.total_boxes,
+                new_bytes = account.total_box_bytes,
+                new_bal = account.micro_algos,
+                "diag1664 set_account"
+            );
+        }
         // Issue #960: record this address as touched this block so
         // `record_online_account_history` (called from `commit_block`)
         // considers it for a new `onlineaccounts` history row.
