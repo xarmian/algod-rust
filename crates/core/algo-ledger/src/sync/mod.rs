@@ -1619,7 +1619,7 @@ impl SyncOrchestrator {
                 result = ?passive,
                 "post-sync WAL checkpoint (PASSIVE): (busy, wal frames, checkpointed frames)"
             );
-            for attempt in 1..=10u32 {
+            for attempt in 1..=2u32 {
                 let started = Instant::now();
                 let truncated = run(&format!("PRAGMA {schema}.wal_checkpoint(TRUNCATE)"));
                 tracing::info!(
@@ -1634,6 +1634,46 @@ impl SyncOrchestrator {
                 }
                 std::thread::sleep(std::time::Duration::from_secs(3));
             }
+        }
+    }
+
+    /// Best-effort full checkpoint of one SQLite database file's WAL over a
+    /// fresh, private connection (no ledger lock involved): `PASSIVE` first,
+    /// then one `TRUNCATE`. Logs the `(busy, log, checkpointed)` results.
+    ///
+    /// Issue #1654: the live node calls this for its tracker and block
+    /// databases right after it has swapped in the reopened ledger -- i.e.
+    /// after the pre-catchup ledger handle, whose old read snapshot pinned the
+    /// ~9.5M-frame WAL (only 74 frames were checkpointable while it lived), is
+    /// gone -- so the multi-GB checkpoint happens off the ledger lock instead
+    /// of inside the first block commit.
+    pub fn checkpoint_wal_file(path: &std::path::Path, label: &str) {
+        let conn = match Connection::open(path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, db = label, "WAL checkpoint: could not open database");
+                return;
+            }
+        };
+        for pragma in [
+            "PRAGMA wal_checkpoint(PASSIVE)",
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+        ] {
+            let started = Instant::now();
+            let result = conn.query_row(pragma, [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            });
+            tracing::info!(
+                db = label,
+                pragma,
+                elapsed_secs = started.elapsed().as_secs_f64(),
+                result = ?result.as_ref().ok(),
+                "WAL checkpoint: (busy, wal frames, checkpointed frames)"
+            );
         }
     }
 

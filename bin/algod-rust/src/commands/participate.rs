@@ -724,6 +724,21 @@ impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
                 warn!(error = %e, "ledger reload: reopen task panicked");
             }
         }
+
+        // Issue #1654: now that the pre-catchup ledger handle (whose old read
+        // snapshot pinned a multi-GB WAL) has been replaced, fold the WAL back
+        // into the database files over a private connection, *here* -- while
+        // participation is still paused and without holding the ledger lock --
+        // instead of inside the first block commit after the catchup, which
+        // held the ledger lock (and so blocked REST, agreement and everything
+        // else) for 2.5-3.5 minutes (thread dump: soak 36943905593).
+        let tracker_path = self.resolved_paths.tracker_path.clone();
+        let block_path = self.resolved_paths.block_path.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            algo_ledger::sync::SyncOrchestrator::checkpoint_wal_file(&tracker_path, "tracker");
+            algo_ledger::sync::SyncOrchestrator::checkpoint_wal_file(&block_path, "block");
+        })
+        .await;
     }
 }
 
