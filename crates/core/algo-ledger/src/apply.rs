@@ -1657,7 +1657,12 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
                     // single top-level call's own inner-txn tree (which the
                     // existing `BoxBudgetState` propagation already
                     // handled).
-                    let mut group_box_budget = BoxBudgetState::default();
+                    let mut group_box_budget = BoxBudgetState {
+                        pooled_inners: ctx.consensus.enable_inner_transaction_pooling.then(|| {
+                            ctx.consensus.max_tx_group_size * ctx.consensus.max_inner_transactions
+                        }),
+                        ..BoxBudgetState::default()
+                    };
 
                     // Compute per-group fee credit and residue (matches go-algorand feeCredit).
                     let (group_fee_credit, group_fee_residue) =
@@ -5611,6 +5616,15 @@ pub struct BoxBudgetState {
     /// go-algorand's merge-back condition
     /// (`data/transactions/logic/eval.go:1373-1384`).
     pub touched_family_shared: bool,
+    /// Group-wide pool of inner transactions still allowed (issue #1664).
+    ///
+    /// Mirrors go-algorand's `EvalParams.pooledAllowedInners`
+    /// (`data/transactions/logic/eval.go:489-505`): one counter shared by
+    /// every app call in the atomic group and every nested inner call,
+    /// seeded with `MaxTxGroupSize * MaxInnerTransactions` when
+    /// `EnableInnerTransactionPooling` is set, and decremented at each
+    /// `itxn_submit`. `None` leaves the legacy per-context budget in place.
+    pub pooled_inners: Option<usize>,
 }
 
 #[cfg(test)]

@@ -1264,6 +1264,10 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     /// newly created apps to access boxes not named in box refs.
     /// Matches go-algorand's `resources.unnamedAccess`.
     unnamed_access: i64,
+    /// Group-wide pooled inner-transaction allowance (see
+    /// [`crate::apply::BoxBudgetState::pooled_inners`]); `None` = legacy
+    /// per-context budget.
+    pub(crate) pooled_inners: Option<usize>,
 
     // ---- Family-shared box access (foreign box opcodes, issue #662) ----
     /// Records that this frame has read or written a family-shared box (one
@@ -2416,6 +2420,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             update_bytes: HashMap::new(),
             read_budget_checked: false,
             unnamed_access: 0,
+            pooled_inners: None,
             touched_family_shared: false,
             family_reentrancy_checked: false,
             family_chain: Vec::new(),
@@ -3025,6 +3030,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         self.read_budget_checked = state.read_budget_checked;
         self.boxes_initialized = state.boxes_initialized;
         self.unnamed_access = state.unnamed_access;
+        self.pooled_inners = state.pooled_inners;
     }
 
     /// Export this context's box I/O budget state back into a group-scoped
@@ -3044,6 +3050,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         state.read_budget_checked = self.read_budget_checked;
         state.boxes_initialized = self.boxes_initialized;
         state.unnamed_access = self.unnamed_access;
+        state.pooled_inners = self.pooled_inners;
     }
 
     /// Lazily initialize the available-boxes map and I/O budget from the
@@ -4153,6 +4160,13 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// group.  Because our context is per-app-call we scope the budget to
     /// the actual outer group size so a single-txn group gets 16, not 256.
     fn remaining_inners(&self) -> usize {
+        // go's `remainingInners`: with inner-transaction pooling the whole
+        // atomic group (and every nested inner call) shares one counter.
+        if self.consensus.enable_inner_transaction_pooling {
+            if let Some(left) = self.pooled_inners {
+                return left;
+            }
+        }
         let total_budget = self.consensus.max_inner_transactions * self.group.len();
         let used: usize = self.inner_txns.iter().map(|g| g.len()).sum();
         total_budget.saturating_sub(used)
@@ -4433,6 +4447,7 @@ fn execute_inner_appl<L: LedgerStore>(
     inner_ctx.read_budget_checked = true; // inner calls skip the read check (go-algorand line 556)
     inner_ctx.boxes_initialized = box_state.boxes_initialized;
     inner_ctx.unnamed_access = box_state.unnamed_access;
+    inner_ctx.pooled_inners = box_state.pooled_inners;
     // Inherit created_apps so newAppAccess fallback works for apps created earlier.
     inner_ctx.created_apps = created_apps_snapshot;
     // Issue #1322: inherit the TOP-LEVEL group's resource-sharing catalog
@@ -4589,6 +4604,7 @@ fn execute_inner_appl<L: LedgerStore>(
         read_budget_checked: inner_ctx.read_budget_checked,
         boxes_initialized: inner_ctx.boxes_initialized,
         unnamed_access: inner_ctx.unnamed_access,
+        pooled_inners: inner_ctx.pooled_inners,
         touched_family_shared: inner_ctx.touched_family_shared && creator == caller_creator,
     };
 
@@ -6107,6 +6123,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
 
         // ── Build inner transactions from the accumulated fields ──
         let builders = std::mem::take(&mut self.inner_building);
+        // go decrements the pooled allowance *before* executing the inner
+        // group (`eval.go:6064-6068`), so runaway recursion is noticed.
+        if let Some(left) = self.pooled_inners.as_mut() {
+            *left = left.saturating_sub(builders.len());
+        }
         let default_sender = Address(app_address(self.app_id));
         let mut txns: Vec<SignedTransaction> = builders
             .iter()
@@ -6633,6 +6654,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     read_budget_checked: self.read_budget_checked,
                     boxes_initialized: self.boxes_initialized,
                     unnamed_access: self.unnamed_access,
+                    pooled_inners: self.pooled_inners,
                     // Not read on the way in -- `execute_inner_appl` starts
                     // the child's own `touched_family_shared` at `false`
                     // (a fresh frame begins untouched) and only *sets* this
@@ -6741,6 +6763,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                             self.read_budget_checked = bs.read_budget_checked;
                             self.boxes_initialized = bs.boxes_initialized;
                             self.unnamed_access = bs.unnamed_access;
+                            self.pooled_inners = bs.pooled_inners;
                             // Family-shared touch-mark propagation
                             // (go-algorand eval.go:1373-1384): `bs`'s flag is
                             // already resolved to "the child touched
@@ -16045,6 +16068,47 @@ mod tests {
         ctx.itxn_submit().unwrap();
 
         assert_eq!(ctx.num_inner_txns(), 17);
+    }
+
+    /// Issue #1664: go pools the inner-transaction allowance across the
+    /// whole atomic group and every nested inner call
+    /// (`pooledAllowedInners`, seeded with `MaxTxGroupSize *
+    /// MaxInnerTransactions`), so a call may submit more than
+    /// `MaxInnerTransactions` inner transactions in total. Mainnet block
+    /// 65599766 (app 1439234347, 18 direct inner calls plus nested ones) was
+    /// rejected by the per-frame budget.
+    #[test]
+    fn pooled_inner_budget_allows_more_than_16_inners_in_one_frame() {
+        let txn1 = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        store.set_account(
+            &Address(app_address(42)),
+            AccountData {
+                micro_algos: 100_000_000,
+                ..Default::default()
+            },
+        );
+        let mut ctx = make_context(&mut store, vec![txn1]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 100_000;
+        ctx.consensus.enable_inner_transaction_pooling = true;
+        ctx.pooled_inners =
+            Some(ctx.consensus.max_tx_group_size * ctx.consensus.max_inner_transactions);
+
+        for i in 0..20u8 {
+            ctx.itxn_begin().unwrap();
+            ctx.itxn_field(16, TealValue::Uint(1)).unwrap();
+            ctx.itxn_field(7, TealValue::Bytes([i + 1; 32].to_vec()))
+                .unwrap();
+            ctx.itxn_field(8, TealValue::Uint(100)).unwrap();
+            ctx.itxn_submit()
+                .unwrap_or_else(|e| panic!("inner txn {i} must fit the pooled budget: {e}"));
+        }
+        assert_eq!(ctx.num_inner_txns(), 20);
+        assert_eq!(
+            ctx.pooled_inners,
+            Some(ctx.consensus.max_tx_group_size * ctx.consensus.max_inner_transactions - 20)
+        );
     }
 
     // ---- issue #570: kv_mods recorder ----
