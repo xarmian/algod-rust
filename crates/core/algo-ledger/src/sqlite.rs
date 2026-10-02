@@ -2431,11 +2431,7 @@ pub(crate) fn block_state_delta_is_complete(block: &algo_types::Block) -> bool {
 /// `Acfg`/`Axfer`/`Afrz`/`Stpf`/`Hb`, none of which can touch box storage)
 /// keep using the cheap Replay path.
 fn block_has_app_call(block: &algo_types::Block) -> bool {
-    use algo_types::TxnType;
-    block
-        .payset
-        .iter()
-        .any(|stx| stx.txn.txn_type == TxnType::Appl)
+    crate::apply::block_has_app_call(block)
 }
 
 impl SqliteLedger {

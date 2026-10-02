@@ -254,6 +254,41 @@ pub fn apply_block<L: crate::store_trait::LedgerStore>(
     )
 }
 
+/// Whether `block` contains any top-level `appl` transaction.
+///
+/// Box create/put/replace/resize/splice/delete -- and with them every app
+/// account's `total_boxes`/`total_box_bytes` -- only ever change inside AVM
+/// execution. go-algorand's `ApplyData`/`EvalDelta` carries no box field, so
+/// a block applied purely from its recorded deltas ([`ApplyMode::Replay`])
+/// can never observe them.
+pub fn block_has_app_call(block: &Block) -> bool {
+    block
+        .payset
+        .iter()
+        .any(|stx| stx.txn.txn_type.as_str() == "appl")
+}
+
+/// Apply a committed block the way go-algorand's evaluator does for a block
+/// received from the network: run the AVM for every block that contains an
+/// application call ([`ApplyMode::Execute`]) so box storage and the owner
+/// app account's box totals (the input of its minimum balance) stay in
+/// step with go, and use the cheaper recorded-delta [`ApplyMode::Replay`]
+/// path for blocks that cannot touch boxes (issue #1664).
+///
+/// Plain [`apply_block`] is `Replay`-only and silently freezes box state;
+/// node follow/catch-up paths must use this instead.
+pub fn apply_block_executing_app_calls<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+) -> Result<(), AlgoError> {
+    let mode = if block_has_app_call(block) {
+        ApplyMode::Execute
+    } else {
+        ApplyMode::Replay
+    };
+    apply_block_impl(store, block, mode, false, None, None, None, None)
+}
+
 /// Apply a full block to the ledger state with the specified mode.
 ///
 /// Convenience wrapper with `validate=false` (replay/catchup behavior).
