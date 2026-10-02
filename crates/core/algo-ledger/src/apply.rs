@@ -3314,8 +3314,10 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
         // inner transaction (closing a holding, closing the account) restores
         // it (live mainnet block 65549710: pay 200000 out, then asset
         // opt-out, then close-out). Replaying an already-validated block
-        // must therefore only check at depth 0.
-        if !(ctx.mode == ApplyMode::Replay && depth > 0) {
+        // must therefore only check at depth 0 -- in every apply mode
+        // (issue #1657), not just replay: go evaluates txpool, proposal,
+        // validation and simulate through the same evaluator.
+        if depth == 0 {
             let rewards_pool_addr = store.rewards_pool();
             for addr in snapshot_addrs {
                 // Skip special accounts that are exempt from min balance checks.
@@ -9907,6 +9909,125 @@ mod tests {
         let mut inner = make_state_with_accounts(&[(sender, 150_000), (fee_sink, 0)], fee_sink);
         apply_transaction(&mut inner, &txn, &ctx, 1)
             .expect("an inner transaction may transiently dip below the minimum");
+    }
+
+    /// Issue #1657: the once-per-top-level-transaction minimum-balance rule
+    /// is not a replay-only relaxation. go's `BlockEvaluator.transaction`
+    /// (`ledger/eval/eval.go`) checks minimum balances after the whole
+    /// top-level transaction in every evaluation path (txpool, proposal,
+    /// validation, simulate), so a non-replay inner transaction (depth > 0)
+    /// must not be rejected for transiently dipping below the minimum, while
+    /// the top-level (depth 0) check is unchanged.
+    #[test]
+    fn execute_defers_min_balance_check_for_inner_transactions() {
+        let sender = Address([7u8; 32]);
+        let receiver = Address([8u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut ctx = apply_context_for_version(fee_sink, 1, algo_types::consensus::CONSENSUS_V34);
+        ctx.mode = ApplyMode::Execute;
+        let txn = pay_txn(sender, receiver, 100_000, 0);
+
+        let mut top = make_state_with_accounts(&[(sender, 150_000), (fee_sink, 0)], fee_sink);
+        let err = apply_transaction(&mut top, &txn, &ctx, 0)
+            .expect_err("top-level payment below min balance must be rejected");
+        assert!(format!("{err}").contains("below minimum balance"), "{err}");
+
+        let mut inner = make_state_with_accounts(&[(sender, 150_000), (fee_sink, 0)], fee_sink);
+        apply_transaction(&mut inner, &txn, &ctx, 1)
+            .expect("a non-replay inner transaction may transiently dip below the minimum");
+    }
+
+    /// Issue #1657, end to end in `ApplyMode::Execute`: an app call whose
+    /// first inner payment takes the app account below its minimum balance
+    /// and whose second inner payment (close-out) empties it must apply --
+    /// go checks minimum balances once, after the whole top-level
+    /// transaction, and a fully-emptied account is exempt.
+    #[test]
+    fn execute_app_call_inner_pay_may_dip_below_min_then_close_out() {
+        let creator = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([9u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(creator, 20_000_000), (fee_sink, 0), (rewards_pool, 0)],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+
+        let approval_src = "#pragma version 8
+            txn ApplicationID
+            bz approve
+            itxn_begin
+            int pay
+            itxn_field TypeEnum
+            txn Sender
+            itxn_field Receiver
+            int 250000
+            itxn_field Amount
+            itxn_next
+            int pay
+            itxn_field TypeEnum
+            txn Sender
+            itxn_field Receiver
+            txn Sender
+            itxn_field CloseRemainderTo
+            itxn_submit
+            approve:
+            int 1
+            return
+";
+        let approval = algo_avm::assembler::assemble_string(approval_src)
+            .expect("approval program must assemble")
+            .program;
+        let clear = algo_avm::assembler::assemble_string(
+            "#pragma version 8
+int 1
+return
+",
+        )
+        .expect("clear program must assemble")
+        .program;
+
+        let mk_block = |round: u64, payset: Vec<SignedTransaction>| Block {
+            round: Round(round),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset,
+            ..Block::default()
+        };
+
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = creator;
+        create.txn.fee = 1_000;
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        let delta1 =
+            apply_block_with_delta_mode(&mut state, &mk_block(1, vec![create]), ApplyMode::Execute)
+                .unwrap();
+        let (&app_id, _) = delta1.creatables.iter().next().unwrap();
+        let app_addr = Address(crate::avm_context::app_address(app_id));
+
+        // 300_000 -> 50_000 after the first inner pay (below the 100_000
+        // minimum), then 0 after the close-out.
+        let fund = pay_txn(creator, app_addr, 300_000, 1_000);
+        apply_block_with_delta_mode(&mut state, &mk_block(2, vec![fund]), ApplyMode::Execute)
+            .unwrap();
+
+        let mut call = SignedTransaction::default();
+        call.txn.txn_type = "appl".into();
+        call.txn.sender = creator;
+        call.txn.fee = 3_000;
+        call.txn.application_id = app_id;
+        apply_block_with_delta_mode(&mut state, &mk_block(3, vec![call]), ApplyMode::Execute)
+            .expect("inner dip below min followed by close-out must apply in Execute mode");
+        assert!(
+            state
+                .get_account(&app_addr)
+                .map(|a| a.micro_algos == 0)
+                .unwrap_or(true),
+            "app account must have been closed out"
+        );
     }
 
     #[test]
