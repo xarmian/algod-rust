@@ -6270,6 +6270,13 @@ impl LedgerStore for SqliteLedger {
             return None;
         }
 
+        if app_id == 971323141 {
+            static ONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if ONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2 {
+                let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
+                tracing::warn!(target: "diag1664", len = data.len(), hex = %hex, "diag1664 raw app blob");
+            }
+        }
         decode_app_params(&data, creator).ok()
     }
 
@@ -8477,6 +8484,43 @@ mod tests {
         let decoded = decode_app_params(&bytes, p.creator).expect("decode");
         assert!(!decoded.foreign_box_reads);
         assert!(!decoded.family_box_access);
+    }
+
+    /// Issue #1664: mainnet app 971323141's global state has 8-byte binary
+    /// keys (e.g. 00 00 00 00 29 64 33 81); a store round trip must keep
+    /// every key, not only the valid-UTF-8 ones.
+    #[test]
+    fn app_params_round_trip_preserves_non_utf8_global_keys() {
+        let creator = Address([7u8; 32]);
+        let mut gs = BTreeMap::new();
+        let keys: [&[u8]; 4] = [
+            &[0, 0, 0, 0, 0x29, 0x64, 0x33, 0x81],
+            &[0, 0, 0, 0, 0x2f, 0x46, 0x1f, 0x17],
+            &[0, 0, 0, 0, 0x01, 0xe1, 0xab, 0x70],
+            &[0, 0, 0, 0, 0x35, 0x3e, 0xd2, 0xad],
+        ];
+        for (i, k) in keys.iter().enumerate() {
+            gs.insert(k.to_vec(), TealValue::Bytes(vec![i as u8; 24]));
+        }
+        let p = AppParams {
+            creator,
+            approval_program: vec![0x08, 0x81, 0x01],
+            clear_state_program: vec![0x08, 0x81, 0x01],
+            global_state: gs.clone(),
+            ..Default::default()
+        };
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.set_account(
+            &creator,
+            AccountData {
+                micro_algos: 10_000_000,
+                total_created_apps: 1,
+                ..Default::default()
+            },
+        );
+        ledger.set_app_params(971323141, p);
+        let got = ledger.get_app_params(971323141).unwrap();
+        assert_eq!(got.global_state, gs, "every global key must survive");
     }
 
     #[test]
