@@ -3412,6 +3412,17 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
                 continue;
             }
             let mut account = store.get_or_default_account(addr);
+            // Issue #1660: an inner transaction that closed its sender out
+            // (go's `CloseAccount` zeroes the whole record) leaves a zeroed
+            // account that go deletes and that its once-per-top-level
+            // `checkMinBalance` skips. Stamping `update_round` here would
+            // turn it into a non-default balance-0 record, which the
+            // post-top-level minimum-balance sweep over inner participants
+            // then rejects (live mainnet block 65589704). Left alone at
+            // depth 0 to keep the existing top-level behaviour untouched.
+            if depth > 0 && account == algo_types::AccountData::default() {
+                continue;
+            }
             if account.update_round < ctx.round {
                 account.update_round = ctx.round;
                 store.set_account(addr, account);
@@ -10151,6 +10162,39 @@ return
             apply_block_with_delta_mode(&mut state, &mk_block(3, vec![call]), ApplyMode::Execute)
                 .expect_err("inner pay leaving the app account below its minimum must be rejected");
         assert!(format!("{err}").contains("below minimum balance"), "{err}");
+    }
+
+    /// Issue #1660 regression (live mainnet block 65589704, replayed from
+    /// catchpoint 65590000): an inner app call deletes an app whose account
+    /// closes its assets and then closes its algos out. go's `CloseAccount`
+    /// zeroes the whole record, and go's once-per-top-level `checkMinBalance`
+    /// skips zeroed accounts. algod-rust's per-transaction `update_round`
+    /// bookkeeping must therefore not re-stamp a zeroed account at depth > 0:
+    /// the stamp turned it into a non-default balance-0 record that the
+    /// post-top-level minimum-balance check (which now also covers inner
+    /// participants) rejected.
+    #[test]
+    fn inner_pay_closeout_leaves_zeroed_account_unstamped() {
+        let app_acct = Address([7u8; 32]);
+        let creator = Address([8u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut ctx = apply_context_for_version(fee_sink, 5, algo_types::consensus::CONSENSUS_V41);
+        ctx.mode = ApplyMode::Replay;
+        ctx.rewards_level = 0;
+        let mut close = pay_txn(app_acct, creator, 0, 0);
+        close.txn.close_remainder_to = creator;
+
+        let mut state = make_state_with_accounts(
+            &[(app_acct, 400_000), (creator, 1_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+        apply_transaction(&mut state, &close, &ctx, 1).unwrap();
+        let after = state.get_account(&app_acct).cloned().unwrap_or_default();
+        assert_eq!(
+            after,
+            algo_types::AccountData::default(),
+            "a closed-out inner sender must stay zeroed, got {after:?}"
+        );
     }
 
     #[test]
