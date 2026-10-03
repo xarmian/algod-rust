@@ -3617,6 +3617,10 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             }
         };
 
+        if app_id == 2714516089 && self.round >= 65623400 {
+            let hx = |b: &[u8]| b.iter().take(100).map(|x| format!("{x:02x}")).collect::<String>();
+            tracing::warn!(target: "diag1664", op = ?operation, round = self.round, name = %hx(name), exists, len = content.len(), content = %hx(&content), caller = self.app_id, "diag1664 reti box access");
+        }
         // Track dirtiness and enforce write budget. `verb` mirrors
         // go-algorand's local `verb` variable, used only in the write-budget
         // error message below.
