@@ -3569,7 +3569,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         }
 
         if !ok {
-            tracing::warn!(
+            tracing::debug!(
                 app_id = self.app_id,
                 owner_app_id = app_id,
                 name = %box_name_hex(name),
@@ -3577,13 +3577,6 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
                 depth = self.depth,
                 group_len = self.group.len(),
                 available = self.available_boxes.len(),
-                program_version = self.program_version,
-                created_apps = ?self.created_apps,
-                program_hex = %self
-                    .store
-                    .get_app_params(self.app_id)
-                    .map(|p| p.approval_program.iter().map(|b| format!("{b:02x}")).collect::<String>())
-                    .unwrap_or_default(),
                 "invalid Box reference"
             );
             // Matches go-algorand's exact text (`data/transactions/logic/
