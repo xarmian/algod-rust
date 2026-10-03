@@ -1554,4 +1554,99 @@ mod tests {
         assert_eq!(acct.total_box_bytes, 0);
         assert_eq!(l.get_box(app_id, b"mybox"), None);
     }
+
+    /// Issue #1664: `global LatestTimestamp` is the previous block's
+    /// timestamp in go; executing app calls on the follow path used the
+    /// block's own timestamp, so any program logging or storing it diverged
+    /// (mainnet round 65609682: logged ...792 where go recorded ...78f).
+    #[test]
+    fn ensure_block_runs_app_calls_with_previous_block_timestamp() {
+        use algo_types::{AccountData, AppParams, Block, BoxRef, SignedTransaction, Transaction};
+        use serde_bytes::ByteBuf;
+
+        let creator = Address([1u8; 32]);
+        let sender = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let app_id = 951u64;
+        let program = algo_avm::assembler::assemble_string(concat!(
+            "#pragma version 8
+",
+            "byte \"ts\"
+",
+            "global LatestTimestamp
+",
+            "itob
+",
+            "box_put
+",
+            "int 1
+",
+            "return
+",
+        ))
+        .expect("program must assemble")
+        .program;
+
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        {
+            let mut l = ledger.lock().unwrap();
+            for (addr, bal) in [
+                (creator, 50_000_000u64),
+                (sender, 50_000_000),
+                (Address(crate::avm_context::app_address(app_id)), 10_000_000),
+            ] {
+                l.set_account(
+                    &addr,
+                    AccountData {
+                        micro_algos: bal,
+                        ..Default::default()
+                    },
+                );
+            }
+            l.set_account(&fee_sink, AccountData::default());
+            l.set_app_params(
+                app_id,
+                AppParams {
+                    creator,
+                    approval_program: program,
+                    clear_state_program: vec![0x08, 0x81, 0x01],
+                    ..Default::default()
+                },
+            );
+        }
+        let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+        let block = |round: u64, timestamp: i64, payset: Vec<SignedTransaction>| Block {
+            round: Round(round),
+            timestamp,
+            fee_sink,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset,
+            ..Block::default()
+        };
+        bridge.ensure_block(&block(1, 1000, vec![]), &make_cert_with_proposal(1));
+        let call = SignedTransaction {
+            txn: Transaction {
+                txn_type: "appl".into(),
+                sender,
+                fee: 1_000,
+                first_valid: Round(1),
+                last_valid: Round(1000),
+                application_id: app_id,
+                boxes: Some(vec![BoxRef {
+                    index: 0,
+                    name: Some(ByteBuf::from(b"ts".to_vec())),
+                }]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        bridge.ensure_block(&block(2, 1003, vec![call]), &make_cert_with_proposal(2));
+        let l = ledger.lock().unwrap();
+        assert_eq!(l.current_round(), Round(2));
+        assert_eq!(
+            l.get_box(app_id, b"ts"),
+            Some(1000u64.to_be_bytes().to_vec()),
+            "LatestTimestamp must be the previous block's timestamp"
+        );
+    }
 }

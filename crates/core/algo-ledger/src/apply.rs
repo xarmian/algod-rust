@@ -1592,7 +1592,17 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
         round: block.round.0,
         mode,
         validate,
-        latest_timestamp: block.timestamp as u64,
+        // `global LatestTimestamp` is the *previous* block's timestamp in go
+        // (`roundCowState.PrevTimestamp`, `ledger/eval/cow.go`), never the
+        // block being applied. Fall back to the block's own timestamp only
+        // when the previous header is unavailable (fresh test stores).
+        latest_timestamp: block
+            .round
+            .0
+            .checked_sub(1)
+            .and_then(|r| store.get_block_header(r).ok().flatten())
+            .map(|h| h.timestamp as u64)
+            .unwrap_or(block.timestamp as u64),
         genesis_hash: gh,
         txn_counter: Cell::new(base_txn_counter),
         fee_credit: Cell::new(0),
