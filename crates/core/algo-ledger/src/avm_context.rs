@@ -5417,6 +5417,17 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             Some(params) => params.global_state.get(key).cloned(),
             None => None,
         };
+        if self.app_id == 3729360595 {
+            tracing::warn!(
+                target: "diag1664",
+                cur_app = self.app_id,
+                read_app = app_id,
+                key = %String::from_utf8_lossy(key),
+                found = value.is_some(),
+                foreign_apps = ?self.group[self.group_index].txn.foreign_apps,
+                "diag1664 3729360595 global read"
+            );
+        }
         self.record_app_state_access(
             app_id,
             AppStateType::Global,
