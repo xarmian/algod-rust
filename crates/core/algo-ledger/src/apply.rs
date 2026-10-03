@@ -282,27 +282,20 @@ pub fn apply_block_executing_app_calls<L: crate::store_trait::LedgerStore>(
     block: &Block,
 ) -> Result<(), AlgoError> {
     if !block_has_app_call(block) {
-        return apply_block_impl(
-            store,
-            block,
-            ApplyMode::Replay,
-            false,
-            None,
-            None,
-            None,
-            None,
-        );
+        return apply_block_impl(store, block, ApplyMode::Replay, false, None, None, None, None);
     }
-    apply_block_impl(
-        store,
-        block,
-        ApplyMode::Execute,
-        false,
-        None,
-        None,
-        None,
-        None,
-    )
+    let (result, stats) = apply_block_with_comparison(store, block);
+    for d in &stats.mismatch_details {
+        let real: Vec<_> = d
+            .mismatches
+            .iter()
+            .filter(|m| m.field.starts_with("logs") || m.field.starts_with("inner_txns"))
+            .collect();
+        if !real.is_empty() {
+            tracing::warn!(target: "diag1664", round = d.round, txn_index = d.txn_index, app_id = d.app_id, mismatches = ?real, "diag1664 real EvalDelta mismatch");
+        }
+    }
+    result
 }
 
 /// Apply a full block to the ledger state with the specified mode.
