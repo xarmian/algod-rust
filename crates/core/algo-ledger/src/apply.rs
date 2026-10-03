@@ -5164,6 +5164,28 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                             .map(|e| format!(": {}", e))
                             .unwrap_or_default()
                     );
+                    if let Some(d) = &result.error_detail {
+                        let gs = store
+                            .get_app_params(app_id)
+                            .map(|p| {
+                                p.global_state
+                                    .iter()
+                                    .map(|(k, v)| {
+                                        format!(
+                                            "{}={}",
+                                            String::from_utf8_lossy(k),
+                                            match v {
+                                                algo_types::TealValue::Uint(u) => u.to_string(),
+                                                algo_types::TealValue::Bytes(b) => b.iter().take(40).map(|x| format!("{x:02x}")).collect::<String>(),
+                                            }
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            })
+                            .unwrap_or_default();
+                        tracing::warn!(target: "diag1664", app_id, pc = d.pc, round = ctx.round, ts = ctx.latest_timestamp, sender = %txn.sender, global_state = %gs, "diag1664 approval error detail");
+                    }
                     // When the approval program actually errored (as opposed
                     // to a clean reject), preserve the structured
                     // pc/group-index/app-index/eval-states diagnostics
