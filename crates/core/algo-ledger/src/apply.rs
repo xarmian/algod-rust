@@ -281,12 +281,34 @@ pub fn apply_block_executing_app_calls<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     block: &Block,
 ) -> Result<(), AlgoError> {
-    let mode = if block_has_app_call(block) {
-        ApplyMode::Execute
-    } else {
-        ApplyMode::Replay
-    };
-    apply_block_impl(store, block, mode, false, None, None, None, None)
+    if !block_has_app_call(block) {
+        return apply_block_impl(
+            store,
+            block,
+            ApplyMode::Replay,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+    // Execute the AVM and compare each call's result with the EvalDelta
+    // recorded in the (already agreed) block. A mismatch does not fail the
+    // block here -- it means algod-rust's AVM/ledger state diverged from
+    // go's -- but it is logged so the divergence is found at the call that
+    // introduced it, not later where it happens to be observed.
+    let (result, stats) = apply_block_with_comparison(store, block);
+    for d in &stats.mismatch_details {
+        tracing::warn!(
+            round = d.round,
+            txn_index = d.txn_index,
+            app_id = d.app_id,
+            mismatches = ?d.mismatches,
+            "app call EvalDelta differs from the block's recorded EvalDelta"
+        );
+    }
+    result
 }
 
 /// Apply a full block to the ledger state with the specified mode.
