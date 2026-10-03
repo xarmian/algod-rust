@@ -3850,6 +3850,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     // (`data/transactions/logic/box.go:284-600`).
 
     fn box_get_impl(&mut self, app_id: u64, name: &[u8]) -> Result<(Vec<u8>, bool), AlgoError> {
+        if app_id == 3729063730 { let hx = |b: &[u8]| b.iter().take(48).map(|x| format!("{x:02x}")).collect::<String>(); tracing::warn!(target: "diag1664", op = "get", round = self.round, name = %hx(name),  "diag1664 3729 box op"); }
         self.box_length_checks(name, 0)?;
         let pre = self.box_pre_value(app_id, name);
         self.record_app_state_access(
@@ -3870,6 +3871,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     }
 
     fn box_put_impl(&mut self, app_id: u64, name: &[u8], value: &[u8]) -> Result<(), AlgoError> {
+        if app_id == 3729063730 { let hx = |b: &[u8]| b.iter().take(48).map(|x| format!("{x:02x}")).collect::<String>(); tracing::warn!(target: "diag1664", op = "put", round = self.round, name = %hx(name), value = %hx(value), "diag1664 3729 box op"); }
         self.box_length_checks(name, value.len() as u64)?;
 
         let pre = self.box_pre_value(app_id, name);
@@ -3917,6 +3919,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     }
 
     fn box_del_impl(&mut self, app_id: u64, name: &[u8]) -> Result<bool, AlgoError> {
+        if app_id == 3729063730 { let hx = |b: &[u8]| b.iter().take(48).map(|x| format!("{x:02x}")).collect::<String>(); tracing::warn!(target: "diag1664", op = "del", round = self.round, name = %hx(name),  "diag1664 3729 box op"); }
         self.box_length_checks(name, 0)?;
         let pre = self.box_pre_value(app_id, name);
         self.record_app_state_access(
@@ -4007,6 +4010,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         offset: u64,
         length: u64,
     ) -> Result<Vec<u8>, AlgoError> {
+        if app_id == 3729063730 { let hx = |b: &[u8]| b.iter().take(48).map(|x| format!("{x:02x}")).collect::<String>(); tracing::warn!(target: "diag1664", op = "extract", round = self.round, name = %hx(name), offset, length, "diag1664 3729 box op"); }
         self.box_length_checks(name, offset.saturating_add(length))?;
         let pre = self.box_pre_value(app_id, name);
         self.record_app_state_access(
@@ -4041,6 +4045,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         offset: u64,
         value: &[u8],
     ) -> Result<(), AlgoError> {
+        if app_id == 3729063730 { let hx = |b: &[u8]| b.iter().take(48).map(|x| format!("{x:02x}")).collect::<String>(); tracing::warn!(target: "diag1664", op = "replace", round = self.round, name = %hx(name), offset, value = %hx(value), "diag1664 3729 box op"); }
         self.box_length_checks(name, offset.saturating_add(value.len() as u64))?;
         let pre = self.box_pre_value(app_id, name);
         self.record_app_state_access(
