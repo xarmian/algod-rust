@@ -3569,7 +3569,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         }
 
         if !ok {
-            tracing::warn!(
+            tracing::debug!(
                 app_id = self.app_id,
                 owner_app_id = app_id,
                 name = %box_name_hex(name),
@@ -3577,13 +3577,6 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
                 depth = self.depth,
                 group_len = self.group.len(),
                 available = self.available_boxes.len(),
-                program_version = self.program_version,
-                created_apps = ?self.created_apps,
-                program_hex = %self
-                    .store
-                    .get_app_params(self.app_id)
-                    .map(|p| p.approval_program.iter().map(|b| format!("{b:02x}")).collect::<String>())
-                    .unwrap_or_default(),
                 "invalid Box reference"
             );
             // Matches go-algorand's exact text (`data/transactions/logic/
@@ -5898,9 +5891,9 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                             .unwrap_or_else(|| vec![0u8; 32]),
                     ),
                     // AcctTotalNumUint
-                    3 => TealValue::Uint(0), // requires per-app schema aggregation
+                    3 => TealValue::Uint(acct.total_app_schema.num_uint),
                     // AcctTotalNumByteSlice
-                    4 => TealValue::Uint(0), // requires per-app schema aggregation
+                    4 => TealValue::Uint(acct.total_app_schema.num_byte_slice),
                     // AcctTotalExtraAppPages
                     5 => TealValue::Uint(acct.total_extra_app_pages as u64),
                     // AcctTotalAppsCreated
@@ -5916,11 +5909,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     // AcctTotalBoxBytes
                     11 => TealValue::Uint(acct.total_box_bytes),
                     // AcctIncentiveEligible
-                    12 => TealValue::Uint(0), // not yet tracked
+                    12 => TealValue::Uint(acct.incentive_eligible as u64),
                     // AcctLastProposed
-                    13 => TealValue::Uint(0), // not yet tracked
+                    13 => TealValue::Uint(acct.last_proposed),
                     // AcctLastHeartbeat
-                    14 => TealValue::Uint(0), // not yet tracked
+                    14 => TealValue::Uint(acct.last_heartbeat),
                     _ => {
                         return Err(AlgoError::Avm {
                             message: format!("unknown AcctParamsField index: {field}"),
@@ -10177,6 +10170,37 @@ mod tests {
         // AcctTotalBoxes
         let (val, _) = ctx.acct_params_get(&addr, 10).unwrap();
         assert_eq!(val, TealValue::Uint(10));
+    }
+
+    /// Issue #1664: `acct_params_get` returned 0 for AcctTotalNumUint,
+    /// AcctTotalNumByteSlice, AcctIncentiveEligible, AcctLastProposed and
+    /// AcctLastHeartbeat ("not yet tracked"). A mainnet staking-pool app
+    /// decides whether a go-online fee is due from AcctIncentiveEligible, so
+    /// executing it on the follow path asserted where go did not.
+    #[test]
+    fn acct_params_get_reports_schema_incentive_and_activity_fields() {
+        let mut store = LedgerState::new();
+        let addr = Address([77u8; 32]);
+        store.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 1_000_000,
+                incentive_eligible: true,
+                last_proposed: 123,
+                last_heartbeat: 456,
+                total_app_schema: algo_types::StateSchema {
+                    num_uint: 7,
+                    num_byte_slice: 9,
+                },
+                ..Default::default()
+            },
+        );
+        let ctx = make_context(&mut store, vec![make_pay_txn([1u8; 32], [2u8; 32], 1)]);
+        for (field, want) in [(3u8, 7u64), (4, 9), (12, 1), (13, 123), (14, 456)] {
+            let (v, found) = ctx.acct_params_get(&addr.0, field).unwrap();
+            assert!(found);
+            assert_eq!(v, TealValue::Uint(want), "field {field}");
+        }
     }
 
     #[test]
