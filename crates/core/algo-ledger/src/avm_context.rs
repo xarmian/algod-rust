@@ -3135,6 +3135,42 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
                     self.available_boxes.entry((app_id, name)).or_insert(false);
                 }
             }
+
+            // Access-list (`tx.Access`) box refs: go's
+            // `fillApplicationCallAccess` (`data/transactions/logic/
+            // resources.go:305-340`) shares each non-empty box entry, an
+            // entirely empty entry is a spare unnamed ref, and a box or an
+            // empty entry is an I/O quota bump
+            // (`data/transactions/logic/eval.go:1275-1283`). A box entry's
+            // `i` is a 1-based index into the access list itself and must
+            // name an App entry; 0 means the txn's own app. (Issue #1664:
+            // mainnet 1134695678 reads box "pr" through such an entry.)
+            if let Some(ref access) = txn.access {
+                for rr in access {
+                    let box_ref = rr.box_ref.as_ref().filter(|b| !b.is_empty());
+                    if box_ref.is_some() || rr.is_empty() {
+                        num_box_refs += 1;
+                    }
+                    if rr.is_empty() {
+                        self.unnamed_access += 1;
+                        continue;
+                    }
+                    let Some(b) = box_ref else { continue };
+                    let name = match &b.name {
+                        Some(n) if !n.is_empty() => n.to_vec(),
+                        _ => continue,
+                    };
+                    let app_id = if b.index == 0 {
+                        txn_app_id
+                    } else {
+                        match access.get((b.index - 1) as usize) {
+                            Some(r) if r.app != 0 => r.app,
+                            _ => continue,
+                        }
+                    };
+                    self.available_boxes.entry((app_id, name)).or_insert(false);
+                }
+            }
         }
 
         self.io_budget = num_box_refs.saturating_mul(self.consensus.bytes_per_box_reference);
@@ -16657,7 +16693,34 @@ mod tests {
                 index: 1,
                 name: Some(serde_bytes::ByteBuf::from(b"B".to_vec())),
             }]);
-            let err = run(&mut store, txn, app_id, consensus, &program);
+            let err = run(&mut store, txn, app_id, consensus.clone(), &program);
+            assert!(err.contains("no such box"), "got: {err}");
+        }
+
+        // Case 4 (issue #1664): "B" referenced through the transaction's
+        // access list -- a box entry whose 1-based `i` points at an App
+        // entry of the same list. go shares it (`fillApplicationCallAccess`),
+        // so it is available (mainnet 1134695678's box "pr").
+        {
+            let mut store = LedgerState::new();
+            let mut txn = make_appl_txn([9u8; 32], app_id, vec![], vec![], vec![]);
+            txn.txn.access = Some(vec![
+                algo_types::ResourceRef {
+                    app: app_id,
+                    ..Default::default()
+                },
+                algo_types::ResourceRef {
+                    box_ref: Some(algo_types::BoxRef {
+                        index: 1,
+                        name: Some(serde_bytes::ByteBuf::from(b"B".to_vec())),
+                    }),
+                    ..Default::default()
+                },
+            ]);
+            // tx.Access needs a sharedResources (v9+) program.
+            let mut program9 = program.clone();
+            program9[0] = 9;
+            let err = run(&mut store, txn, app_id, consensus, &program9);
             assert!(err.contains("no such box"), "got: {err}");
         }
     }
