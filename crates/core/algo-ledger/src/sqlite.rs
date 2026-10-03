@@ -1660,7 +1660,11 @@ pub(crate) fn set_blob_update_round(blob: &[u8], update_round: u64) -> Vec<u8> {
     ));
     let out = rmpv::Value::Map(pairs);
     let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, &out).expect("msgpack encode");
+    // `write_value_str_preserving`, not `rmpv::encode::write_value`: the
+    // latter re-encodes a `str` whose bytes are not valid UTF-8 (e.g. a Go
+    // `TealKeyValue` global-state key) as `bin`, and the app-params reader
+    // then drops that key (issue #1664).
+    crate::catchpoint::types::write_value_str_preserving(&mut buf, &out).expect("msgpack encode");
     buf
 }
 
@@ -2431,11 +2435,7 @@ pub(crate) fn block_state_delta_is_complete(block: &algo_types::Block) -> bool {
 /// `Acfg`/`Axfer`/`Afrz`/`Stpf`/`Hb`, none of which can touch box storage)
 /// keep using the cheap Replay path.
 fn block_has_app_call(block: &algo_types::Block) -> bool {
-    use algo_types::TxnType;
-    block
-        .payset
-        .iter()
-        .any(|stx| stx.txn.txn_type == TxnType::Appl)
+    crate::apply::block_has_app_call(block)
 }
 
 impl SqliteLedger {
@@ -8481,6 +8481,49 @@ mod tests {
         let decoded = decode_app_params(&bytes, p.creator).expect("decode");
         assert!(!decoded.foreign_box_reads);
         assert!(!decoded.family_box_access);
+    }
+
+    /// Issue #1664: mainnet app 971323141's global state has 8-byte binary
+    /// keys (e.g. 00 00 00 00 29 64 33 81, go writes them as msgpack `str`
+    /// regardless of UTF-8 validity). Storing app params at a non-zero
+    /// round stamps the blob's `z` update round through
+    /// `set_blob_update_round`; that rewrite must keep every global key
+    /// byte-exact (the `rmpv` re-encoder turns invalid-UTF-8 `str` keys into
+    /// `bin`, which the reader then drops, so only valid-UTF-8 keys survived
+    /// and the app's next execution read a missing key).
+    #[test]
+    fn app_params_stored_at_nonzero_round_preserve_non_utf8_global_keys() {
+        let creator = Address([7u8; 32]);
+        let mut gs = BTreeMap::new();
+        let keys: [&[u8]; 4] = [
+            &[0, 0, 0, 0, 0x29, 0x64, 0x33, 0x81],
+            &[0, 0, 0, 0, 0x2f, 0x46, 0x1f, 0x17],
+            &[0, 0, 0, 0, 0x01, 0xe1, 0xab, 0x70],
+            &[0, 0, 0, 0, 0x35, 0x3e, 0xd2, 0xad],
+        ];
+        for (i, k) in keys.iter().enumerate() {
+            gs.insert(k.to_vec(), TealValue::Bytes(vec![i as u8; 24]));
+        }
+        let p = AppParams {
+            creator,
+            approval_program: vec![0x08, 0x81, 0x01],
+            clear_state_program: vec![0x08, 0x81, 0x01],
+            global_state: gs.clone(),
+            ..Default::default()
+        };
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.set_current_round(Round(65_599_681));
+        ledger.set_account(
+            &creator,
+            AccountData {
+                micro_algos: 10_000_000,
+                total_created_apps: 1,
+                ..Default::default()
+            },
+        );
+        ledger.set_app_params(971323141, p);
+        let got = ledger.get_app_params(971323141).unwrap();
+        assert_eq!(got.global_state, gs, "every global key must survive");
     }
 
     #[test]

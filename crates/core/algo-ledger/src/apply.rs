@@ -254,6 +254,57 @@ pub fn apply_block<L: crate::store_trait::LedgerStore>(
     )
 }
 
+/// Whether `block` contains any top-level `appl` transaction.
+///
+/// Box create/put/replace/resize/splice/delete -- and with them every app
+/// account's `total_boxes`/`total_box_bytes` -- only ever change inside AVM
+/// execution. go-algorand's `ApplyData`/`EvalDelta` carries no box field, so
+/// a block applied purely from its recorded deltas ([`ApplyMode::Replay`])
+/// can never observe them.
+pub fn block_has_app_call(block: &Block) -> bool {
+    block
+        .payset
+        .iter()
+        .any(|stx| stx.txn.txn_type.as_str() == "appl")
+}
+
+/// Apply a committed block the way go-algorand's evaluator does for a block
+/// received from the network: run the AVM for every block that contains an
+/// application call ([`ApplyMode::Execute`]) so box storage and the owner
+/// app account's box totals (the input of its minimum balance) stay in
+/// step with go, and use the cheaper recorded-delta [`ApplyMode::Replay`]
+/// path for blocks that cannot touch boxes (issue #1664).
+///
+/// Plain [`apply_block`] is `Replay`-only and silently freezes box state;
+/// node follow/catch-up paths must use this instead.
+pub fn apply_block_executing_app_calls<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+) -> Result<(), AlgoError> {
+    if !block_has_app_call(block) {
+        return apply_block_impl(
+            store,
+            block,
+            ApplyMode::Replay,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+    apply_block_impl(
+        store,
+        block,
+        ApplyMode::Execute,
+        false,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
 /// Apply a full block to the ledger state with the specified mode.
 ///
 /// Convenience wrapper with `validate=false` (replay/catchup behavior).
@@ -1455,6 +1506,30 @@ fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
     Ok(())
 }
 
+/// Copy of `block` whose payset transactions carry the genesis id/hash the
+/// block stores only once in its header, or `None` if nothing needs
+/// restoring. Mirrors `algo_validate::merkle::compute_payset_merkle_root`'s
+/// restoration (and go's `DecodeSignedTxn`).
+fn block_with_restored_genesis_fields(block: &Block) -> Option<Block> {
+    let needs = block.payset.iter().any(|stx| {
+        (stx.has_genesis_id && stx.txn.genesis_id.is_empty() && !block.genesis_id.is_empty())
+            || (stx.txn.genesis_hash == [0u8; 32] && block.genesis_hash != [0u8; 32])
+    });
+    if !needs {
+        return None;
+    }
+    let mut b = block.clone();
+    for stx in &mut b.payset {
+        if stx.has_genesis_id && stx.txn.genesis_id.is_empty() {
+            stx.txn.genesis_id.clone_from(&block.genesis_id);
+        }
+        if stx.txn.genesis_hash == [0u8; 32] {
+            stx.txn.genesis_hash = block.genesis_hash;
+        }
+    }
+    Some(b)
+}
+
 /// Apply a full block to the ledger state (internal implementation).
 ///
 /// Updates rewards parameters from the block header, then applies each
@@ -1483,6 +1558,25 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
     mut apply_data_out: Option<&mut Vec<ApplyData>>,
     kv_mods_out: Option<&mut KvModsMap>,
 ) -> Result<(), AlgoError> {
+    // A block's payset stores each transaction without the genesis id/hash
+    // (the header carries them; `hgi` marks whether the id was elided).
+    // go decodes them back in (`DecodeSignedTxn`), so a program reading
+    // `txn TxID` -- or an inner transaction deriving its id from its
+    // parent's -- sees the id of the *full* transaction. Executing the AVM
+    // on the stored form made every `TxID` differ from go's (issue #1664:
+    // a shuffle app hashing `TxID` picked different NFTs).
+    let restored_block;
+    let block = if mode == ApplyMode::Execute {
+        match block_with_restored_genesis_fields(block) {
+            Some(b) => {
+                restored_block = b;
+                &restored_block
+            }
+            None => block,
+        }
+    } else {
+        block
+    };
     // Issue #570: only allocate the shared box-delta recorder when a caller
     // actually wants `kv_mods` back (Execute mode, via
     // `apply_block_with_delta_mode`) — this keeps the hot Replay-mode sync
@@ -1535,7 +1629,17 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
         round: block.round.0,
         mode,
         validate,
-        latest_timestamp: block.timestamp as u64,
+        // `global LatestTimestamp` is the *previous* block's timestamp in go
+        // (`roundCowState.PrevTimestamp`, `ledger/eval/cow.go`), never the
+        // block being applied. Fall back to the block's own timestamp only
+        // when the previous header is unavailable (fresh test stores).
+        latest_timestamp: block
+            .round
+            .0
+            .checked_sub(1)
+            .and_then(|r| store.get_block_header(r).ok().flatten())
+            .map(|h| h.timestamp as u64)
+            .unwrap_or(block.timestamp as u64),
         genesis_hash: gh,
         txn_counter: Cell::new(base_txn_counter),
         fee_credit: Cell::new(0),
@@ -1622,7 +1726,12 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
                     // single top-level call's own inner-txn tree (which the
                     // existing `BoxBudgetState` propagation already
                     // handled).
-                    let mut group_box_budget = BoxBudgetState::default();
+                    let mut group_box_budget = BoxBudgetState {
+                        pooled_inners: ctx.consensus.enable_inner_transaction_pooling.then(|| {
+                            ctx.consensus.max_tx_group_size * ctx.consensus.max_inner_transactions
+                        }),
+                        ..BoxBudgetState::default()
+                    };
 
                     // Compute per-group fee credit and residue (matches go-algorand feeCredit).
                     let (group_fee_credit, group_fee_residue) =
@@ -3319,7 +3428,15 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
         // validation and simulate through the same evaluator.
         if depth == 0 {
             let rewards_pool_addr = store.rewards_pool();
-            for addr in snapshot_addrs {
+            // Issue #1660: go's `checkMinBalance` covers every account the
+            // top-level transaction modified, including accounts touched only
+            // by inner transactions, so extend the address set with every
+            // participant of the recorded inner transactions.
+            let mut check_addrs: Vec<Address> = snapshot_addrs.to_vec();
+            if let Some(dt) = apply_data.eval_delta.as_ref() {
+                collect_inner_participants(dt, &mut check_addrs, 0);
+            }
+            for addr in &check_addrs {
                 // Skip special accounts that are exempt from min balance checks.
                 if *addr == ctx.fee_sink || *addr == rewards_pool_addr {
                     continue;
@@ -3404,6 +3521,17 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
                 continue;
             }
             let mut account = store.get_or_default_account(addr);
+            // Issue #1660: an inner transaction that closed its sender out
+            // (go's `CloseAccount` zeroes the whole record) leaves a zeroed
+            // account that go deletes and that its once-per-top-level
+            // `checkMinBalance` skips. Stamping `update_round` here would
+            // turn it into a non-default balance-0 record, which the
+            // post-top-level minimum-balance sweep over inner participants
+            // then rejects (live mainnet block 65589704). Left alone at
+            // depth 0 to keep the existing top-level behaviour untouched.
+            if depth > 0 && account == algo_types::AccountData::default() {
+                continue;
+            }
             if account.update_round < ctx.round {
                 account.update_round = ctx.round;
                 store.set_account(addr, account);
@@ -3411,6 +3539,40 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
         }
 
         Ok(apply_data)
+    }
+}
+
+/// Append every account participating in the inner transactions recorded in
+/// `eval_delta` (recursively) to `out`, skipping duplicates and the zero
+/// address. Used by the once-per-top-level-transaction minimum-balance check
+/// (issue #1660), which in go covers all modified accounts.
+fn collect_inner_participants(eval_delta: &rmpv::Value, out: &mut Vec<Address>, nesting: u32) {
+    // Inner transactions nest at most a few levels; bound recursion defensively.
+    if nesting > 16 {
+        return;
+    }
+    let Ok(delta) = parse_eval_delta(eval_delta) else {
+        return;
+    };
+    for inner in delta.inner_txns.iter().flatten() {
+        let t = &inner.txn;
+        let candidates = [
+            Some(t.sender),
+            Some(t.receiver),
+            Some(t.close_remainder_to),
+            t.asset_receiver,
+            t.asset_sender,
+            t.asset_close_to,
+            t.freeze_account,
+        ];
+        for a in candidates.into_iter().flatten() {
+            if !a.is_zero() && !out.contains(&a) {
+                out.push(a);
+            }
+        }
+        if let Some(dt) = inner.eval_delta.as_ref() {
+            collect_inner_participants(dt, out, nesting + 1);
+        }
     }
 }
 
@@ -5523,6 +5685,15 @@ pub struct BoxBudgetState {
     /// go-algorand's merge-back condition
     /// (`data/transactions/logic/eval.go:1373-1384`).
     pub touched_family_shared: bool,
+    /// Group-wide pool of inner transactions still allowed (issue #1664).
+    ///
+    /// Mirrors go-algorand's `EvalParams.pooledAllowedInners`
+    /// (`data/transactions/logic/eval.go:489-505`): one counter shared by
+    /// every app call in the atomic group and every nested inner call,
+    /// seeded with `MaxTxGroupSize * MaxInnerTransactions` when
+    /// `EnableInnerTransactionPooling` is set, and decremented at each
+    /// `itxn_submit`. `None` leaves the legacy per-context budget in place.
+    pub pooled_inners: Option<usize>,
 }
 
 #[cfg(test)]
@@ -10027,6 +10198,120 @@ return
                 .map(|a| a.micro_algos == 0)
                 .unwrap_or(true),
             "app account must have been closed out"
+        );
+    }
+
+    /// Issue #1660: go's `BlockEvaluator.transaction` (`ledger/eval/eval.go`)
+    /// runs `checkMinBalance` once after each top-level transaction over
+    /// every account the transaction modified, including accounts touched
+    /// only by inner transactions. An app account paid below its minimum by
+    /// an inner payment, with nothing restoring it, must reject the call.
+    #[test]
+    fn execute_app_call_inner_pay_leaving_app_account_below_min_is_rejected() {
+        let creator = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([9u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(creator, 20_000_000), (fee_sink, 0), (rewards_pool, 0)],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+
+        // Pays 250_000 from the app account to the caller and stops.
+        let approval_src = "#pragma version 8
+            txn ApplicationID
+            bz approve
+            itxn_begin
+            int pay
+            itxn_field TypeEnum
+            txn Sender
+            itxn_field Receiver
+            int 250000
+            itxn_field Amount
+            itxn_submit
+            approve:
+            int 1
+            return
+";
+        let approval = algo_avm::assembler::assemble_string(approval_src)
+            .expect("approval program must assemble")
+            .program;
+        let clear = algo_avm::assembler::assemble_string(
+            "#pragma version 8
+int 1
+return
+",
+        )
+        .expect("clear program must assemble")
+        .program;
+
+        let mk_block = |round: u64, payset: Vec<SignedTransaction>| Block {
+            round: Round(round),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset,
+            ..Block::default()
+        };
+
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = creator;
+        create.txn.fee = 1_000;
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        let delta1 =
+            apply_block_with_delta_mode(&mut state, &mk_block(1, vec![create]), ApplyMode::Execute)
+                .unwrap();
+        let (&app_id, _) = delta1.creatables.iter().next().unwrap();
+        let app_addr = Address(crate::avm_context::app_address(app_id));
+
+        // 300_000 -> 50_000 after the inner pay: below the 100_000 minimum.
+        let fund = pay_txn(creator, app_addr, 300_000, 1_000);
+        apply_block_with_delta_mode(&mut state, &mk_block(2, vec![fund]), ApplyMode::Execute)
+            .unwrap();
+
+        let mut call = SignedTransaction::default();
+        call.txn.txn_type = "appl".into();
+        call.txn.sender = creator;
+        call.txn.fee = 2_000;
+        call.txn.application_id = app_id;
+        let err =
+            apply_block_with_delta_mode(&mut state, &mk_block(3, vec![call]), ApplyMode::Execute)
+                .expect_err("inner pay leaving the app account below its minimum must be rejected");
+        assert!(format!("{err}").contains("below minimum balance"), "{err}");
+    }
+
+    /// Issue #1660 regression (live mainnet block 65589704, replayed from
+    /// catchpoint 65590000): an inner app call deletes an app whose account
+    /// closes its assets and then closes its algos out. go's `CloseAccount`
+    /// zeroes the whole record, and go's once-per-top-level `checkMinBalance`
+    /// skips zeroed accounts. algod-rust's per-transaction `update_round`
+    /// bookkeeping must therefore not re-stamp a zeroed account at depth > 0:
+    /// the stamp turned it into a non-default balance-0 record that the
+    /// post-top-level minimum-balance check (which now also covers inner
+    /// participants) rejected.
+    #[test]
+    fn inner_pay_closeout_leaves_zeroed_account_unstamped() {
+        let app_acct = Address([7u8; 32]);
+        let creator = Address([8u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut ctx = apply_context_for_version(fee_sink, 5, algo_types::consensus::CONSENSUS_V41);
+        ctx.mode = ApplyMode::Replay;
+        ctx.rewards_level = 0;
+        let mut close = pay_txn(app_acct, creator, 0, 0);
+        close.txn.close_remainder_to = creator;
+
+        let mut state = make_state_with_accounts(
+            &[(app_acct, 400_000), (creator, 1_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+        apply_transaction(&mut state, &close, &ctx, 1).unwrap();
+        let after = state.get_account(&app_acct).cloned().unwrap_or_default();
+        assert_eq!(
+            after,
+            algo_types::AccountData::default(),
+            "a closed-out inner sender must stay zeroed, got {after:?}"
         );
     }
 

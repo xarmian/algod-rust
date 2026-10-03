@@ -174,7 +174,7 @@ fn simulate_reports_fee_usage_recursively_over_nested_inner_txns() {
 
     // App B: inner pay to receiver, then approve.
     let mut b_code = vec![0x06]; // version 6
-    b_code.extend(build_inner_pay(&receiver, 5000));
+    b_code.extend(build_inner_pay(&receiver, 100_000));
     b_code.extend(pushint(1));
     b_code.push(0x43); // return
     register_app(&mut state, Address([2u8; 32]), app_b, b_code);
