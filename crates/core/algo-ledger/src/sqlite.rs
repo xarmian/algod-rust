@@ -5952,6 +5952,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn remove_account(&mut self, addr: &Address) {
+        if addr.to_string() == "QCDTEY3DF3NFNLMN4KUWEDTQR4GTPVMMA2GZRDXGH2TEDFEDZSEPQWGA4I" { tracing::warn!(target: "diag1664", round = self.current_round.0, "diag1664 QCDTEY remove_account"); }
         let old = self.get_account(addr);
         // Issue #960: same reasoning as `set_account` — a closed account
         // that was previously online must still get an offline marker row.
@@ -6006,6 +6007,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn set_asset_holding(&mut self, addr: &Address, asset_id: u64, holding: AssetHolding) {
+        if addr.to_string() == "QCDTEY3DF3NFNLMN4KUWEDTQR4GTPVMMA2GZRDXGH2TEDFEDZSEPQWGA4I" { tracing::warn!(target: "diag1664", round = self.current_round.0, asset_id, amount = holding.amount, "diag1664 QCDTEY set_asset_holding"); }
         self.record_resource_pre_mutation(addr, asset_id, CTYPE_ASSET);
         let rowid = self.get_or_insert_rowid(addr).expect("get_or_insert_rowid");
         let update_round = self.current_round.0;
@@ -6034,6 +6036,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn remove_asset_holding(&mut self, addr: &Address, asset_id: u64) {
+        if addr.to_string() == "QCDTEY3DF3NFNLMN4KUWEDTQR4GTPVMMA2GZRDXGH2TEDFEDZSEPQWGA4I" { tracing::warn!(target: "diag1664", round = self.current_round.0, asset_id, "diag1664 QCDTEY remove_asset_holding"); }
         self.record_resource_pre_mutation(addr, asset_id, CTYPE_ASSET);
         let update_round = self.current_round.0;
         if let Some(rowid) = self.get_rowid(addr) {
@@ -6966,6 +6969,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn restore_snapshot(&mut self, snapshot: SqliteSnapshot) {
+        if self.current_round.0 >= 65640327 && self.current_round.0 <= 65640332 { tracing::warn!(target: "diag1664", round = self.current_round.0, "diag1664 restore_snapshot"); }
         // `ROLLBACK TO SAVEPOINT` reverts the changes made since the savepoint
         // but does NOT remove the savepoint from the transaction stack — the
         // savepoint (and, when it is the outermost one with no enclosing
