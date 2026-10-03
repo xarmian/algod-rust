@@ -1512,6 +1512,30 @@ fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
     Ok(())
 }
 
+/// Copy of `block` whose payset transactions carry the genesis id/hash the
+/// block stores only once in its header, or `None` if nothing needs
+/// restoring. Mirrors `algo_validate::merkle::compute_payset_merkle_root`'s
+/// restoration (and go's `DecodeSignedTxn`).
+fn block_with_restored_genesis_fields(block: &Block) -> Option<Block> {
+    let needs = block.payset.iter().any(|stx| {
+        (stx.has_genesis_id && stx.txn.genesis_id.is_empty() && !block.genesis_id.is_empty())
+            || (stx.txn.genesis_hash == [0u8; 32] && block.genesis_hash != [0u8; 32])
+    });
+    if !needs {
+        return None;
+    }
+    let mut b = block.clone();
+    for stx in &mut b.payset {
+        if stx.has_genesis_id && stx.txn.genesis_id.is_empty() {
+            stx.txn.genesis_id.clone_from(&block.genesis_id);
+        }
+        if stx.txn.genesis_hash == [0u8; 32] {
+            stx.txn.genesis_hash = block.genesis_hash;
+        }
+    }
+    Some(b)
+}
+
 /// Apply a full block to the ledger state (internal implementation).
 ///
 /// Updates rewards parameters from the block header, then applies each
@@ -1540,6 +1564,25 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
     mut apply_data_out: Option<&mut Vec<ApplyData>>,
     kv_mods_out: Option<&mut KvModsMap>,
 ) -> Result<(), AlgoError> {
+    // A block's payset stores each transaction without the genesis id/hash
+    // (the header carries them; `hgi` marks whether the id was elided).
+    // go decodes them back in (`DecodeSignedTxn`), so a program reading
+    // `txn TxID` -- or an inner transaction deriving its id from its
+    // parent's -- sees the id of the *full* transaction. Executing the AVM
+    // on the stored form made every `TxID` differ from go's (issue #1664:
+    // a shuffle app hashing `TxID` picked different NFTs).
+    let restored_block;
+    let block = if mode == ApplyMode::Execute {
+        match block_with_restored_genesis_fields(block) {
+            Some(b) => {
+                restored_block = b;
+                &restored_block
+            }
+            None => block,
+        }
+    } else {
+        block
+    };
     // Issue #570: only allocate the shared box-delta recorder when a caller
     // actually wants `kv_mods` back (Execute mode, via
     // `apply_block_with_delta_mode`) — this keeps the hot Replay-mode sync

@@ -1649,4 +1649,100 @@ mod tests {
             "LatestTimestamp must be the previous block's timestamp"
         );
     }
+
+    /// Issue #1664: a block's payset omits each transaction's genesis
+    /// id/hash; go restores them on decode, so `txn TxID` is the id of the
+    /// full transaction. Executing app calls on the stored form hashed a
+    /// different id (mainnet shuffle app 3729063730 picked other NFTs).
+    #[test]
+    fn ensure_block_runs_app_calls_with_the_full_transaction_id() {
+        use algo_types::{AccountData, AppParams, Block, BoxRef, SignedTransaction, Transaction};
+        use serde_bytes::ByteBuf;
+
+        let creator = Address([1u8; 32]);
+        let sender = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let app_id = 952u64;
+        let program = algo_avm::assembler::assemble_string(concat!(
+            "#pragma version 8
+",
+            "byte \"id\"
+",
+            "txn TxID
+",
+            "box_put
+",
+            "int 1
+",
+            "return
+",
+        ))
+        .expect("program must assemble")
+        .program;
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        {
+            let mut l = ledger.lock().unwrap();
+            for (addr, bal) in [
+                (creator, 50_000_000u64),
+                (sender, 50_000_000),
+                (Address(crate::avm_context::app_address(app_id)), 10_000_000),
+            ] {
+                l.set_account(
+                    &addr,
+                    AccountData {
+                        micro_algos: bal,
+                        ..Default::default()
+                    },
+                );
+            }
+            l.set_account(&fee_sink, AccountData::default());
+            l.set_app_params(
+                app_id,
+                AppParams {
+                    creator,
+                    approval_program: program,
+                    clear_state_program: vec![0x08, 0x81, 0x01],
+                    ..Default::default()
+                },
+            );
+        }
+        let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+        let stored = SignedTransaction {
+            txn: Transaction {
+                txn_type: "appl".into(),
+                sender,
+                fee: 1_000,
+                first_valid: Round(1),
+                last_valid: Round(1000),
+                application_id: app_id,
+                boxes: Some(vec![BoxRef {
+                    index: 0,
+                    name: Some(ByteBuf::from(b"id".to_vec())),
+                }]),
+                ..Default::default()
+            },
+            has_genesis_id: true,
+            ..Default::default()
+        };
+        let mut full = stored.txn.clone();
+        full.genesis_id = "test-v1".into();
+        full.genesis_hash = [7u8; 32];
+        let block = Block {
+            round: Round(1),
+            fee_sink,
+            genesis_id: "test-v1".into(),
+            genesis_hash: [7u8; 32],
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![stored],
+            ..Block::default()
+        };
+        bridge.ensure_block(&block, &make_cert_with_proposal(1));
+        let l = ledger.lock().unwrap();
+        assert_eq!(l.current_round(), Round(1));
+        assert_eq!(
+            l.get_box(app_id, b"id"),
+            Some(algo_codec::compute_txn_id(&full).0.to_vec()),
+            "TxID must be the id of the transaction with its genesis fields"
+        );
+    }
 }
