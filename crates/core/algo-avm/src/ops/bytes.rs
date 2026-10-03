@@ -50,7 +50,15 @@ fn avm_err(msg: impl Into<String>) -> AlgoError {
 /// Convert a BigUint to big-endian bytes. Zero produces empty bytes,
 /// matching Go's `big.Int.Bytes()` semantics used by the AVM.
 fn biguint_to_bytes(v: &BigUint) -> Vec<u8> {
-    v.to_bytes_be()
+    // `BigUint::to_bytes_be` yields `[0]` for zero, but go's
+    // `big.Int.Bytes()` yields an empty slice; programs observe the
+    // difference through `len` (issue #1664: a ceiling-division helper
+    // testing `len(b% ...) > 0` rounded up exact quotients).
+    if v.bits() == 0 {
+        Vec::new()
+    } else {
+        v.to_bytes_be()
+    }
 }
 
 /// Check that a byte result does not exceed `max_len`.
@@ -792,8 +800,8 @@ mod tests {
         let mut m = machine_with_stack(vec![bytes_val(&[0x05]), bytes_val(&[0x05])]);
         let instr = dummy_instr(0xa1, Immediates::None);
         op_bsub(&mut m, &instr).unwrap();
-        // BigUint zero → [0]
-        assert_eq!(m.pop_bytes().unwrap(), vec![0x00]);
+        // go: `big.Int.Bytes()` of zero is empty.
+        assert_eq!(m.pop_bytes().unwrap(), Vec::<u8>::new());
     }
 
     // ---- b/ ----
@@ -828,6 +836,14 @@ mod tests {
         let instr = dummy_instr(0xaa, Immediates::None);
         op_bmod(&mut m, &instr).unwrap();
         assert_eq!(m.pop_bytes().unwrap(), vec![0x01]);
+    }
+
+    #[test]
+    fn test_bmod_zero_remainder_is_empty_bytes() {
+        let mut m = machine_with_stack(vec![bytes_val(&[0x0a]), bytes_val(&[0x05])]);
+        let instr = dummy_instr(0xaa, Immediates::None);
+        op_bmod(&mut m, &instr).unwrap();
+        assert_eq!(m.pop_bytes().unwrap(), Vec::<u8>::new());
     }
 
     #[test]
@@ -961,7 +977,8 @@ mod tests {
         let mut m = machine_with_stack(vec![bytes_val(&[0x00])]);
         let instr = dummy_instr(0x96, Immediates::None);
         op_bsqrt(&mut m, &instr).unwrap();
-        assert_eq!(m.pop_bytes().unwrap(), vec![0x00]);
+        // go's eval_test: `byte 0x00; bsqrt; byte 0x; ==`
+        assert_eq!(m.pop_bytes().unwrap(), Vec::<u8>::new());
     }
 
     #[test]
