@@ -2993,7 +2993,12 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
     // unconditional no-op that accepted any state proof with zero
     // cryptographic verification.
     if txn.txn_type == "stpf" {
-        return crate::apply_stateproof::apply_state_proof(store, ctx, txn);
+        let ad = crate::apply_stateproof::apply_state_proof(store, ctx, txn)?;
+        // go's `roundCowState.addTx` counts a state proof like any other
+        // top-level transaction; ids derived from the running counter later
+        // in the block (inner app/asset creates) depend on it (issue #1664).
+        ctx.txn_counter.set(ctx.txn_counter.get() + 1);
+        return Ok(ad);
     }
 
     // Convert lease bytes to [u8; 32] for lease table operations.

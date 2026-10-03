@@ -129,3 +129,48 @@ fn accepts_genuine_captured_state_proof_from_live_cluster() {
         panic!("genuine, live-cluster-produced state proof must be accepted: {e}")
     });
 }
+
+/// Issue #1664: go counts a state proof transaction like any other top-level
+/// transaction (`roundCowState.addTx` -> `incTxnCount`), so ids derived from
+/// the running counter after it (an inner app create in the same block)
+/// shift by one. algod-rust's `stpf` early return skipped the increment, so
+/// mainnet block 65640327 (a `stpf` first in the payset) created app
+/// ...802 where go created ...803.
+#[test]
+fn applying_a_genuine_state_proof_advances_the_transaction_counter() {
+    let voters_block = algo_codec::decode_block(&fixture("block_256_voters.bin")).unwrap();
+    let prev_block = algo_codec::decode_block(&fixture("block_660_prev.bin")).unwrap();
+    let stpf_block = algo_codec::decode_block(&fixture("block_661_stpf.bin")).unwrap();
+    let mut store = LedgerState::new();
+    for b in [&voters_block, &prev_block] {
+        store
+            .put_block(
+                b.round.0,
+                &b.current_protocol,
+                &algo_codec::canonical_encode_block_header_from_block(b),
+                &[],
+            )
+            .unwrap();
+    }
+    let consensus =
+        algo_types::consensus::consensus_params_for_version(&voters_block.current_protocol)
+            .unwrap();
+    algo_ledger::apply_stateproof::record_state_proof_verification_context(
+        &mut store,
+        voters_block.round.0,
+        &voters_block.current_protocol,
+        &voters_block.state_proof_tracking,
+        consensus.state_proof_interval,
+    )
+    .unwrap();
+    let mut ctx = ApplyContext::new_replay(0, Address::ZERO, stpf_block.round.0);
+    ctx.validate = true;
+    ctx.txn_counter.set(1000);
+    algo_ledger::apply::apply_transaction(&mut store, &stpf_block.payset[0], &ctx, 0)
+        .expect("genuine state proof must apply");
+    assert_eq!(
+        ctx.txn_counter.get(),
+        1001,
+        "a state proof transaction must advance the running transaction counter"
+    );
+}
