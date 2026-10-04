@@ -3260,7 +3260,12 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
                 && reward == 0
                 && (unwritten_sender
                     || unwritten_pay_receiver
-                    || store.get_account(addr).is_none());
+                    // Issue #1669 (live mainnet block 65668288): an account
+                    // that was zeroed earlier may linger as a default
+                    // record; go treats it exactly like a missing one.
+                    || store
+                        .get_account(addr)
+                        .is_none_or(|a| a == algo_types::AccountData::default()));
             if !skip_write {
                 store.set_account(addr, account);
             }
@@ -3532,9 +3537,11 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
             // `checkMinBalance` skips. Stamping `update_round` here would
             // turn it into a non-default balance-0 record, which the
             // post-top-level minimum-balance sweep over inner participants
-            // then rejects (live mainnet block 65589704). Left alone at
-            // depth 0 to keep the existing top-level behaviour untouched.
-            if depth > 0 && account == algo_types::AccountData::default() {
+            // then rejects (live mainnet block 65589704). Issue #1669 (block
+            // 65668288): the same holds at depth 0 for an account that is only
+            // a participant (an `aclose` target that was zeroed earlier) or
+            // that this transaction closed out: go deletes a zeroed record.
+            if account == algo_types::AccountData::default() {
                 continue;
             }
             if account.update_round < ctx.round {
@@ -6501,6 +6508,46 @@ mod tests {
         apply_transaction(&mut state, &axfer(None), &ctx, 0).unwrap(); // opt in
         apply_transaction(&mut state, &axfer(Some(ghost)), &ctx, 0).unwrap(); // opt out
         assert!(state.get_account(&ghost).is_none());
+    }
+
+    /// Issue #1669 (live mainnet block 65668288): an asset opt-out whose
+    /// close-to is a previously zeroed account (an app account that was
+    /// deleted earlier) must leave that account zeroed. go never writes the
+    /// close-to account for a zero-unit close, and its minimum-balance check
+    /// skips zeroed accounts; stamping `update_round` onto it at depth 0
+    /// turned it into a non-default balance-0 record that was rejected.
+    #[test]
+    fn axfer_close_to_zeroed_account_leaves_it_zeroed() {
+        let creator = Address([1u8; 32]);
+        let holder = Address([2u8; 32]);
+        let zeroed = Address([9u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(creator, 900_000), (holder, 900_000), (fee_sink, 0)],
+            fee_sink,
+        );
+        let ctx = apply_context_for_version(fee_sink, 5, algo_types::consensus::CONSENSUS_V41);
+        create_asset_in_state(&mut state, &ctx, creator, 7, AssetParams::default());
+        crate::store_trait::LedgerStore::set_account(
+            &mut state,
+            &zeroed,
+            algo_types::AccountData::default(),
+        );
+
+        let axfer = |close_to: Option<Address>| {
+            let mut stx = SignedTransaction::default();
+            stx.txn.txn_type = "axfer".into();
+            stx.txn.sender = holder;
+            stx.txn.fee = 1_000;
+            stx.txn.xaid = 7;
+            stx.txn.asset_receiver = Some(holder);
+            stx.txn.asset_close_to = close_to;
+            stx
+        };
+        apply_transaction(&mut state, &axfer(None), &ctx, 0).unwrap(); // opt in
+        apply_transaction(&mut state, &axfer(Some(zeroed)), &ctx, 0).unwrap(); // opt out
+        let after = state.get_account(&zeroed).cloned().unwrap_or_default();
+        assert_eq!(after, algo_types::AccountData::default(), "{after:?}");
     }
 
     /// Issue #1654 (live mainnet block 65596480): closing out a *frozen*
