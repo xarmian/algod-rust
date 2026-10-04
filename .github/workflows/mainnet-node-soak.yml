@@ -61,8 +61,12 @@ on:
   workflow_dispatch:
     inputs:
       duration_minutes:
-        description: "Total run budget in minutes"
-        default: "60"
+        description: "Hard cap on total poll time in minutes (catchup + follow window; max 315)"
+        default: "240"
+        required: false
+      follow_minutes:
+        description: "Minutes to keep following the tip after it is first reached (0 = stop at the duration cap only)"
+        default: "120"
         required: false
       algod_url:
         description: "Catchup peer REST URL override (default: the mainnet preset / MAINNET_ALGOD_URL variable)"
@@ -95,12 +99,13 @@ jobs:
   mainnet-node-soak:
     name: Mainnet participation-node soak (fast catchup + halt detection)
     runs-on: ubuntu-latest
-    # duration_minutes (default 60) plus build/catchup-discovery/teardown
-    # overhead — a hard stop so a wedged node can't hold a runner all day.
-    # (190 so a manual dispatch with duration_minutes up to ~165 -- long
-    # enough for fast catchup plus catching up to the tip -- fits; the
-    # scheduled default stays 60.)
-    timeout-minutes: 190
+    # duration_minutes (default 240 = ~60-75 min catchup + 120 min follow
+    # window + margin) plus build/catchup-discovery/teardown/scan overhead --
+    # a hard stop so a wedged node can't hold a runner all day. 350 is just
+    # under GitHub-hosted's 360 min limit; the "Resolve run parameters" step
+    # clamps duration_minutes to 315 so the monitor step's 320 min timeout
+    # (duration + 3 min shell cap, see below) always fits inside it.
+    timeout-minutes: 350
 
     steps:
       - name: Checkout
@@ -124,7 +129,15 @@ jobs:
       - name: Resolve run parameters
         id: params
         run: |
-          DURATION_MINUTES="${{ github.event.inputs.duration_minutes || '60' }}"
+          DURATION_MINUTES="${{ github.event.inputs.duration_minutes || '240' }}"
+          FOLLOW_MINUTES="${{ github.event.inputs.follow_minutes || '120' }}"
+          # The job (350 min) and monitor step (320 min) timeouts only fit a
+          # poll budget up to 315 min; clamp rather than get the whole job
+          # (and its artifacts) killed by the runner.
+          if [ "$DURATION_MINUTES" -gt 315 ]; then
+            echo "::warning::duration_minutes=$DURATION_MINUTES exceeds the 315 minute ceiling; clamping"
+            DURATION_MINUTES=315
+          fi
           HALT_MINUTES="${{ github.event.inputs.halt_minutes || '5' }}"
           DRY_RUN="${{ github.event.inputs.dry_run_issues }}"
           # workflow_dispatch's boolean input renders as the string "true"/
@@ -138,9 +151,10 @@ jobs:
           fi
           echo "duration_minutes=$DURATION_MINUTES" >> "$GITHUB_OUTPUT"
           echo "halt_minutes=$HALT_MINUTES" >> "$GITHUB_OUTPUT"
+          echo "follow_minutes=$FOLLOW_MINUTES" >> "$GITHUB_OUTPUT"
           echo "dry_run=$DRY_RUN" >> "$GITHUB_OUTPUT"
           echo "algod_url=$ALGOD_URL" >> "$GITHUB_OUTPUT"
-          echo "Run parameters: duration=${DURATION_MINUTES}m halt=${HALT_MINUTES}m dry_run=${DRY_RUN} peer=${ALGOD_URL}"
+          echo "Run parameters: duration=${DURATION_MINUTES}m follow=${FOLLOW_MINUTES}m halt=${HALT_MINUTES}m dry_run=${DRY_RUN} peer=${ALGOD_URL}"
 
       - name: Discover a real catchpoint-file-serving relay
         id: relay
@@ -470,7 +484,9 @@ jobs:
         # artifact-upload steps -- issue #1650's live verification lost two
         # whole dispatches' evidence that way). Must leave the later
         # `if: always()` steps (teardown, summary, upload) time to run.
-        timeout-minutes: 175
+        # duration_minutes is clamped to 315, so the shell cap below is at
+        # most 318 min; 320 leaves room for the final cat/analyze.
+        timeout-minutes: 320
         env:
           ALGOD_URL: ${{ steps.params.outputs.algod_url }}
         run: |
@@ -492,6 +508,8 @@ jobs:
             --node-token "$ALGOD_TOKEN" \
             --peer-url "$ALGOD_URL" \
             --duration-minutes "$DURATION_MIN" \
+            --follow-minutes "${{ steps.params.outputs.follow_minutes }}" \
+            --node-log mainnet-soak-artifacts/node.log \
             --halt-minutes "${{ steps.params.outputs.halt_minutes }}" \
             --out mainnet-soak-artifacts/status.jsonl \
             --json-out mainnet-soak-artifacts/summary.json \
@@ -542,6 +560,7 @@ jobs:
             # partial JSONL it flushed sample-by-sample, so a capped run
             # still yields a verdict + summary instead of a silent hang.
             python3 ops/mainnet-soak/monitor.py analyze mainnet-soak-artifacts/status.jsonl \
+              --node-log mainnet-soak-artifacts/node.log \
               --json-out mainnet-soak-artifacts/summary.json
             RC=$?
           fi
@@ -581,11 +600,32 @@ jobs:
               -o "mainnet-soak-artifacts/block-$ROUND.json" || true
           fi
 
+      - name: Scan node.log for broken-state signatures
+        id: scan
+        if: always()
+        run: |
+          # Hard signatures (permanent block-write errors, apply_block
+          # failures, panics, ledger invariant errors, block-apply balance
+          # errors outside the gossip tx handlers, EAGAIN, repeated
+          # ensure_block no-advance) fail the job in the last step; warn and
+          # noise tiers are only counted. Results are merged into
+          # summary.json under "log_scan". See ops/mainnet-soak/nodelog.py.
+          mkdir -p mainnet-soak-artifacts
+          set +e
+          python3 ops/mainnet-soak/monitor.py scan-log mainnet-soak-artifacts/node.log \
+            --summary mainnet-soak-artifacts/summary.json
+          RC=$?
+          set -e
+          echo "scan_exit_code=$RC" >> "$GITHUB_OUTPUT"
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::node.log contains hard broken-state signatures (see the job summary)"
+          fi
+
       - name: Write the step summary
         if: always()
         run: |
           python3 - <<'PYEOF'
-          import json, os
+          import json, os, sys
 
           path = "mainnet-soak-artifacts/summary.json"
           summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -596,6 +636,8 @@ jobs:
                   r = json.load(f)
               lag = r.get("lag_rounds") or {}
               phase_s = r.get("phase_seconds") or {}
+              sys.path.insert(0, "ops/mainnet-soak")
+              import nodelog
               lines = [
                   "# Mainnet node soak",
                   "",
@@ -611,6 +653,7 @@ jobs:
                   f"| Node last-round | {r.get('node_last_round')} |",
                   f"| Peer last-round | {r.get('peer_last_round')} |",
               ]
+              lines += nodelog.render_markdown(r).splitlines()
           text = "\n".join(lines) + "\n"
           print(text)
           if summary_path:
@@ -651,6 +694,16 @@ jobs:
         if: always()
         run: |
           CODE="${{ steps.monitor.outputs.exit_code }}"
+          SCAN="${{ steps.scan.outputs.scan_exit_code }}"
+          # A hard log-scan hit fails the job regardless of the monitor
+          # verdict. It does NOT file an issue: file_issue.py is built
+          # around halt verdicts (round/phase dedup keys), and a scan hit
+          # has neither, so the evidence lives in the job summary and the
+          # uploaded node.log/summary.json instead.
+          if [ -n "$SCAN" ] && [ "$SCAN" -ne 0 ]; then
+            echo "::error::broken-state scan failed (exit $SCAN) -- see 'node.log broken-state scan' in the job summary" >&2
+            exit 1
+          fi
           if [ -z "$CODE" ]; then
             echo "monitor step never ran (an earlier step failed) — job already failed" >&2
             exit 1
