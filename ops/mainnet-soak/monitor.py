@@ -105,6 +105,13 @@ DEFAULT_HALT_MINUTES = 5.0
 # misleading `stuck` classification layered on top of an already-known,
 # separately-tracked root cause (issue #1636).
 DEFAULT_VERIFY_HALT_MINUTES = 100.0
+# Post-verify allowance (issue #1663): once import and verify counters are
+# both complete, the node still does the lookback block download (~4 min on
+# mainnet), the go-catchpoint 320-block window replay (~4 min) and WAL
+# checkpointing, none of which advance any `catchpoint-*` counter. The 5
+# minute steady-state rule killed healthy nightlies there. This window is
+# bounded (not the 100 minute verify one): a wedge here is still caught.
+DEFAULT_POST_VERIFY_HALT_MINUTES = 30.0
 # Grace window (issue #1623 live dispatch, run 36204923591): the
 # non-incremental verify pass has been observed to starve the node's REST
 # responder under CI-runner CPU contention badly enough that individual
@@ -185,6 +192,33 @@ def is_verifying_signature(sample: dict) -> bool:
     return import_done and not verify_done
 
 
+def is_post_verify_signature(sample: dict) -> bool:
+    """True if `sample` shows a catchpoint catchup whose import AND verify
+    counters are all complete (issue #1663): the remaining work (lookback
+    download, window replay, WAL checkpoint) does not move any counter."""
+    node = sample.get("node") or {}
+    if not node.get("ok", False) or not (node.get("catchpoint") or ""):
+        return False
+
+    def done(total_key, val_key):
+        total = node.get(total_key)
+        val = node.get(val_key)
+        return isinstance(total, int) and isinstance(val, int) and val >= total
+
+    # total_blocks must be positive so the all-zero download state is not
+    # mistaken for "complete".
+    blocks = node.get("catchpoint_total_blocks")
+    return (
+        isinstance(blocks, int)
+        and blocks > 0
+        and done("catchpoint_total_blocks", "catchpoint_acquired_blocks")
+        and done("catchpoint_total_accounts", "catchpoint_processed_accounts")
+        and done("catchpoint_total_kvs", "catchpoint_processed_kvs")
+        and done("catchpoint_total_accounts", "catchpoint_verified_accounts")
+        and done("catchpoint_total_kvs", "catchpoint_verified_kvs")
+    )
+
+
 def is_downloading_signature(sample: dict) -> bool:
     """True if `sample` shows a catchpoint catchup whose every progress
     counter and total is still zero: the catchpoint *file download*, before
@@ -226,6 +260,7 @@ def classify(
     samples: list,
     halt_minutes: float = DEFAULT_HALT_MINUTES,
     verify_halt_minutes: float = DEFAULT_VERIFY_HALT_MINUTES,
+    post_verify_halt_minutes: float = DEFAULT_POST_VERIFY_HALT_MINUTES,
 ) -> Verdict:
     """Walk `samples` (ordered by `ts`, ascending) and return the verdict.
 
@@ -295,7 +330,18 @@ def classify(
         and last_sig[0] == "catchup"
         and (is_verifying_signature(samples[-1]) or is_downloading_signature(samples[-1]))
     )
-    effective_halt_s = (verify_halt_minutes * 60.0) if verifying else halt_s
+    post_verify = (
+        not verifying
+        and last_sig is not None
+        and last_sig[0] == "catchup"
+        and is_post_verify_signature(samples[-1])
+    )
+    if verifying:
+        effective_halt_s = verify_halt_minutes * 60.0
+    elif post_verify:
+        effective_halt_s = max(post_verify_halt_minutes, halt_minutes) * 60.0
+    else:
+        effective_halt_s = halt_s
 
     if stalled_for < effective_halt_s:
         phase = last_sig[0] if last_sig else None
@@ -305,6 +351,8 @@ def classify(
     round_ = sig if phase == "follow" else (sig[0] if sig and sig[0] is not None else None)
 
     verify_note = " (past the verify-phase allowance)" if verifying else ""
+    if post_verify:
+        verify_note = " (past the post-verify allowance)"
 
     if peer_advancing_between(samples, last_change_idx, len(samples) - 1):
         return Verdict(
@@ -514,6 +562,7 @@ def collect(
     process_alive=lambda: True,
     verify_halt_minutes=DEFAULT_VERIFY_HALT_MINUTES,
     unreachable_grace_minutes=DEFAULT_UNREACHABLE_GRACE_MINUTES,
+    post_verify_halt_minutes=DEFAULT_POST_VERIFY_HALT_MINUTES,
 ):
     """Poll both endpoints every `poll_interval_s` for up to `duration_s`,
     appending each sample to `out_path` as it's taken (so a killed/timed-out
@@ -569,8 +618,10 @@ def collect(
                 unreachable_since = None
             elif node.get("ok", False):
                 unreachable_since = None
-                last_ok_was_verifying = is_verifying_signature(samples[-1]) or is_downloading_signature(
-                    samples[-1]
+                last_ok_was_verifying = (
+                    is_verifying_signature(samples[-1])
+                    or is_downloading_signature(samples[-1])
+                    or is_post_verify_signature(samples[-1])
                 )
             else:
                 if unreachable_since is None:
@@ -597,7 +648,7 @@ def collect(
                     time.sleep(poll_interval_s)
                     continue
 
-            verdict = classify(samples, halt_minutes, verify_halt_minutes)
+            verdict = classify(samples, halt_minutes, verify_halt_minutes, post_verify_halt_minutes)
             if verdict.status != "ok":
                 return verdict
             if now - start >= duration_s:
@@ -642,7 +693,9 @@ def _emit(result: dict, json_out: str | None):
 
 def _cmd_analyze(args):
     samples = _load_jsonl(args.jsonl)
-    verdict = classify(samples, args.halt_minutes, args.verify_halt_minutes)
+    verdict = classify(
+        samples, args.halt_minutes, args.verify_halt_minutes, args.post_verify_halt_minutes
+    )
     _emit(build_result(samples, verdict), args.json_out)
     return exit_code_for(verdict)
 
@@ -656,6 +709,7 @@ def _cmd_collect(args):
         duration_s=args.duration_minutes * 60.0,
         halt_minutes=args.halt_minutes,
         verify_halt_minutes=args.verify_halt_minutes,
+        post_verify_halt_minutes=args.post_verify_halt_minutes,
         unreachable_grace_minutes=args.unreachable_grace_minutes,
         poll_interval_s=args.poll_interval_s,
         out_path=args.out,
@@ -697,6 +751,9 @@ def main(argv=None) -> int:
     p_collect.add_argument("--halt-minutes", type=float, default=DEFAULT_HALT_MINUTES)
     p_collect.add_argument("--verify-halt-minutes", type=float, default=DEFAULT_VERIFY_HALT_MINUTES)
     p_collect.add_argument(
+        "--post-verify-halt-minutes", type=float, default=DEFAULT_POST_VERIFY_HALT_MINUTES
+    )
+    p_collect.add_argument(
         "--unreachable-grace-minutes", type=float, default=DEFAULT_UNREACHABLE_GRACE_MINUTES
     )
     p_collect.add_argument("--poll-interval-s", type=float, default=DEFAULT_POLL_INTERVAL_S)
@@ -708,6 +765,9 @@ def main(argv=None) -> int:
     p_analyze.add_argument("jsonl")
     p_analyze.add_argument("--halt-minutes", type=float, default=DEFAULT_HALT_MINUTES)
     p_analyze.add_argument("--verify-halt-minutes", type=float, default=DEFAULT_VERIFY_HALT_MINUTES)
+    p_analyze.add_argument(
+        "--post-verify-halt-minutes", type=float, default=DEFAULT_POST_VERIFY_HALT_MINUTES
+    )
     p_analyze.add_argument("--json-out", default=None)
     p_analyze.set_defaults(func=_cmd_analyze)
 

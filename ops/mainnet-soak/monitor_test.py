@@ -214,6 +214,53 @@ class ClassifyVerifyPhaseAllowanceTest(unittest.TestCase):
         self.assertEqual(verdict.status, "source_outage")
 
 
+class ClassifyPostVerifyAllowanceTest(unittest.TestCase):
+    """Issue #1663: once import AND verify counters are complete, the node
+    still has the lookback block download, the go-catchpoint window replay
+    and WAL checkpointing to do (~4 min each on mainnet) with every
+    `catchpoint-*` counter frozen. A healthy nightly was killed at ~303s."""
+
+    def _done(self, ts):
+        return node_verifying(ts, verified_accts=1000, verified_kvs=200)
+
+    def test_all_counters_complete_is_post_verify(self):
+        self.assertTrue(monitor.is_post_verify_signature(self._done(0)))
+        self.assertFalse(monitor.is_post_verify_signature(node_verifying(0)))
+        self.assertFalse(monitor.is_post_verify_signature(node_catchup(0, total_blocks=0)))
+        self.assertFalse(monitor.is_post_verify_signature(node_follow(0, 5)))
+
+    def test_frozen_post_verify_for_eight_minutes_then_follow_is_ok(self):
+        samples = [self._done(t) for t in range(0, 480, 10)]
+        samples.append(node_follow(480, 50_000_000, peer_round=50_000_010))
+        for t in range(490, 560, 10):
+            samples.append(node_follow(t, 50_000_000 + (t - 480), peer_round=50_000_100 + t))
+        self.assertEqual(monitor.classify(samples).status, "ok")
+
+    def test_frozen_post_verify_eight_minutes_still_catching_up_is_ok(self):
+        samples = [self._done(t) for t in range(0, 480, 10)]
+        verdict = monitor.classify(samples, halt_minutes=5.0, post_verify_halt_minutes=30.0)
+        self.assertEqual(verdict.status, "ok")
+
+    def test_frozen_post_verify_past_allowance_is_stuck(self):
+        samples = [self._done(t) for t in range(0, 2000, 10)]
+        verdict = monitor.classify(samples, halt_minutes=5.0, post_verify_halt_minutes=30.0)
+        self.assertEqual(verdict.status, "stuck")
+        self.assertEqual(verdict.phase, "catchup")
+        self.assertIn("post-verify", verdict.message)
+
+    def test_frozen_before_verify_completes_keeps_short_threshold(self):
+        # Mid-import freeze: not verifying, not post-verify -> 5 min rule.
+        samples = [node_catchup(t, acquired=5, processed_accts=10, total_blocks=100,
+                                total_accts=1000, total_kvs=200)
+                   for t in range(0, 400, 10)]
+        verdict = monitor.classify(samples, halt_minutes=5.0, post_verify_halt_minutes=30.0)
+        self.assertEqual(verdict.status, "stuck")
+
+    def test_frozen_follow_phase_still_stuck(self):
+        samples = [node_follow(t, 100, peer_round=100 + t) for t in range(0, 400, 10)]
+        self.assertEqual(monitor.classify(samples).status, "stuck")
+
+
 class ClassifyStuckDuringFollowTest(unittest.TestCase):
     """(b) Frozen last-round after catch-up while the peer advances ->
     stuck, phase=follow."""

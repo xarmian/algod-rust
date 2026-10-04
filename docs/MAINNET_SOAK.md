@@ -65,6 +65,17 @@ yet) from fields already in `/v2/status`, and gives it its own, longer
 `halt_minutes` — still finite, so a genuine deadlock in the trie rebuild
 is caught eventually, just not mistaken for a stall at 5 minutes in.
 
+**Post-verify window (issue #1663).** Once import *and* verify counters are
+both complete, the node still downloads the lookback blocks (~4 min on
+mainnet), replays the go-catchpoint 320-block window (~4 min) and
+checkpoints the WAL, and none of that moves a `catchpoint-*` counter.
+`is_post_verify_signature()` recognizes that state and gives it a
+`post_verify_halt_minutes` allowance (default 30, `--post-verify-halt-minutes`)
+instead of the 5-minute rule, so a healthy nightly is no longer classified
+`stuck` ~303 s into the replay. It is still finite: a node wedged there is
+caught after 30 minutes, and the workflow's `halt_minutes` default (5) is
+unchanged for every other phase (mid-import freezes, the follow phase).
+
 If the peer was
 *also* frozen, or unreachable, there's no way to tell node staleness from
 network staleness, so it's classified a **source outage** — a warning,
