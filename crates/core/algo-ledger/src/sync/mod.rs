@@ -31,6 +31,7 @@
 // status) are abstracted behind the `SyncBackend` trait so that algo-ledger
 // remains independent of algo-rest-client.
 
+pub(crate) mod lookback_prefetch;
 pub mod state_machine;
 
 pub use state_machine::{SyncProgress, SyncState};
@@ -1469,85 +1470,109 @@ impl SyncOrchestrator {
         // catchup. Back off between *failed* fetches (reset on success) so
         // the budget spans minutes, not seconds.
         let mut consecutive_fetch_failures: u32 = 0;
+        // Best-effort concurrent prefetch of the window ahead of the
+        // sequential download loop (see `lookback_prefetch`): the loop below
+        // keeps its exact store / retry / backoff behaviour and just finds
+        // most blocks already fetched.
+        let prefetch_first = round.saturating_sub(1);
+        let prefetch =
+            lookback_prefetch::LookbackPrefetch::new(prefetch_first, lookback_start_round);
+        let backend = &self.backend;
         // Use download_lookback_blocks_with_lookback with callbacks that
         // bridge to the backend, passing the (possibly state-proof-extended)
         // `lookback` computed above.
-        let blocks_downloaded = crate::catchpoint::download_lookback_blocks_with_lookback(
-            round,
-            lookback,
-            self.config.catchup_block_download_retry_attempts,
-            // fetch_block callback
-            //
-            // Issue #1649: for the catchpoint round itself — the highest,
-            // most-contended round in the window, and the one both live
-            // soak failures hit — consume the cache `run_download_ledger`
-            // populated early instead of re-fetching over the network at
-            // this late stage. Every other round in the window still goes
-            // through the ordinary network fetch below (the local cache
-            // only ever holds `round` itself).
-            |rnd| {
-                if rnd == round {
-                    if let Some(cached) = self.cached_catchpoint_block.take() {
-                        return Ok(cached);
-                    }
-                }
-                match self.backend.fetch_block_raw(rnd) {
-                    Ok(block) => {
-                        consecutive_fetch_failures = 0;
-                        Ok(block)
-                    }
-                    Err(e) => {
-                        let delay_ms = lookback_retry_backoff_ms(consecutive_fetch_failures);
-                        consecutive_fetch_failures = consecutive_fetch_failures.saturating_add(1);
-                        if delay_ms > 0 {
-                            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        let prefetch_fetch = |rnd: u64| backend.fetch_block_raw(rnd);
+        let download_result = std::thread::scope(|scope| {
+            for _ in 0..lookback_prefetch::PREFETCH_WORKERS {
+                scope.spawn(|| prefetch.run_worker(&prefetch_fetch));
+            }
+            let result = crate::catchpoint::download_lookback_blocks_with_lookback(
+                round,
+                lookback,
+                self.config.catchup_block_download_retry_attempts,
+                // fetch_block callback
+                //
+                // Issue #1649: for the catchpoint round itself — the highest,
+                // most-contended round in the window, and the one both live
+                // soak failures hit — consume the cache `run_download_ledger`
+                // populated early instead of re-fetching over the network at
+                // this late stage. Every other round in the window still goes
+                // through the ordinary network fetch below (the local cache
+                // only ever holds `round` itself).
+                |rnd| {
+                    if rnd == round {
+                        if let Some(cached) = self.cached_catchpoint_block.take() {
+                            return Ok(cached);
                         }
-                        Err(CatchpointError::VerificationError(format!(
-                            "fetch lookback block {rnd}: {e}"
-                        )))
                     }
-                }
-            },
-            // store_block callback
-            |rnd, proto, hdrdata, blkdata| {
-                // Store block in the blocks table.
-                conn.execute(
-                    "INSERT OR REPLACE INTO blockdb.blocks (rnd, proto, hdrdata, blkdata) \
+                    if let Some(prefetched) = prefetch.take(rnd) {
+                        consecutive_fetch_failures = 0;
+                        return Ok(prefetched);
+                    }
+                    match backend.fetch_block_raw(rnd) {
+                        Ok(block) => {
+                            consecutive_fetch_failures = 0;
+                            Ok(block)
+                        }
+                        Err(e) => {
+                            let delay_ms = lookback_retry_backoff_ms(consecutive_fetch_failures);
+                            consecutive_fetch_failures =
+                                consecutive_fetch_failures.saturating_add(1);
+                            if delay_ms > 0 {
+                                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                            }
+                            Err(CatchpointError::VerificationError(format!(
+                                "fetch lookback block {rnd}: {e}"
+                            )))
+                        }
+                    }
+                },
+                // store_block callback
+                |rnd, proto, hdrdata, blkdata| {
+                    // Store block in the blocks table.
+                    conn.execute(
+                        "INSERT OR REPLACE INTO blockdb.blocks (rnd, proto, hdrdata, blkdata) \
                      VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![rnd as i64, proto, hdrdata, blkdata],
-                )
-                .map_err(|e| {
-                    CatchpointError::VerificationError(format!("store lookback block {rnd}: {e}"))
-                })?;
+                        rusqlite::params![rnd as i64, proto, hdrdata, blkdata],
+                    )
+                    .map_err(|e| {
+                        CatchpointError::VerificationError(format!(
+                            "store lookback block {rnd}: {e}"
+                        ))
+                    })?;
 
-                // Decode the block to extract txtail data for lease reconstruction.
-                // blkdata is canonical block encoding (not a response wrapper).
-                if let Ok(block) = algo_codec::decode_block(blkdata) {
-                    let block = &block;
-                    // Build and store txtail entry.
-                    if let Ok(txtail_data) = build_txtail_entry(block) {
-                        conn.execute(
-                            "INSERT OR REPLACE INTO txtail (rnd, data) VALUES (?1, ?2)",
-                            rusqlite::params![rnd as i64, txtail_data],
-                        )
-                        .map_err(|e| {
-                            CatchpointError::VerificationError(format!(
-                                "store txtail for round {rnd}: {e}"
-                            ))
-                        })?;
+                    // Decode the block to extract txtail data for lease reconstruction.
+                    // blkdata is canonical block encoding (not a response wrapper).
+                    if let Ok(block) = algo_codec::decode_block(blkdata) {
+                        let block = &block;
+                        // Build and store txtail entry.
+                        if let Ok(txtail_data) = build_txtail_entry(block) {
+                            conn.execute(
+                                "INSERT OR REPLACE INTO txtail (rnd, data) VALUES (?1, ?2)",
+                                rusqlite::params![rnd as i64, txtail_data],
+                            )
+                            .map_err(|e| {
+                                CatchpointError::VerificationError(format!(
+                                    "store txtail for round {rnd}: {e}"
+                                ))
+                            })?;
+                        }
                     }
-                }
 
-                // Mirrors go's `updateBlockRetrievalStatistics(1, 0)` /
-                // `(0, 1)` net effect on `stats.AcquiredBlocks` for each
-                // successfully-stored lookback block (issue #941).
-                self.progress.catchpoint_acquired_blocks += 1;
-                notify_progress_fields(&mut self.progress, &self.on_progress);
+                    // Mirrors go's `updateBlockRetrievalStatistics(1, 0)` /
+                    // `(0, 1)` net effect on `stats.AcquiredBlocks` for each
+                    // successfully-stored lookback block (issue #941).
+                    self.progress.catchpoint_acquired_blocks += 1;
+                    notify_progress_fields(&mut self.progress, &self.on_progress);
 
-                Ok(())
-            },
-        )
-        .map_err(|e| AlgoError::Ledger {
+                    Ok(())
+                },
+            );
+            // Stop (and let the scope join) the workers on every exit path.
+            prefetch.shutdown();
+            result
+        });
+        let blocks_downloaded = download_result.map_err(|e| AlgoError::Ledger {
             message: format!("lookback block download failed: {e}"),
         })?;
 
@@ -2710,6 +2735,110 @@ pub struct InvariantWarning {
     pub severity: WarningSeverity,
 }
 
+/// Sum `accountbase` micro-algos per status `(online, offline,
+/// notparticipating)`.
+///
+/// Decoding 22.5M account blobs serially took ~96 s on the mainnet soak, so
+/// a file-backed database is scanned by up to 4 threads, each over a disjoint
+/// `rowid` range through its own read-only connection. The three sums are
+/// plain integer additions, so the result does not depend on the split.
+fn sum_account_balances_by_status(conn: &Connection) -> rusqlite::Result<(i64, i64, i64)> {
+    use rusqlite::OpenFlags;
+
+    fn sum_range(
+        conn: &Connection,
+        lo: i64,
+        hi: i64,
+        inclusive_hi: bool,
+    ) -> rusqlite::Result<(i64, i64, i64)> {
+        let cmp = if inclusive_hi { "<=" } else { "<" };
+        let mut stmt = conn.prepare(&format!(
+            "SELECT data FROM accountbase WHERE data IS NOT NULL              AND rowid >= ?1 AND rowid {cmp} ?2"
+        ))?;
+        let mut rows = stmt.query(rusqlite::params![lo, hi])?;
+        let (mut online_sum, mut offline_sum, mut nopart_sum) = (0i64, 0i64, 0i64);
+        while let Some(row) = rows.next()? {
+            let rusqlite::types::ValueRef::Blob(data) = row.get_ref(0)? else {
+                continue;
+            };
+            // Decode minimal fields from the msgpack blob:
+            // "a" = status (u8), "b" = micro_algos (u64)
+            if let Ok(rmpv::Value::Map(map)) = rmpv::decode::read_value(&mut &data[..]) {
+                let mut status: u8 = 0;
+                let mut micro_algos: u64 = 0;
+                for (k, v) in &map {
+                    match k.as_str().unwrap_or("") {
+                        "a" => status = v.as_u64().unwrap_or(0) as u8,
+                        "b" => micro_algos = v.as_u64().unwrap_or(0),
+                        _ => {}
+                    }
+                }
+                match status {
+                    0 => offline_sum = offline_sum.saturating_add(micro_algos as i64),
+                    1 => online_sum = online_sum.saturating_add(micro_algos as i64),
+                    2 => nopart_sum = nopart_sum.saturating_add(micro_algos as i64),
+                    _ => {}
+                }
+            }
+        }
+        Ok((online_sum, offline_sum, nopart_sum))
+    }
+
+    let path = if conn.is_autocommit() {
+        conn.path().filter(|p| !p.is_empty()).map(str::to_owned)
+    } else {
+        None
+    };
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 4) as i128;
+    let bounds = conn.query_row("SELECT MIN(rowid), MAX(rowid) FROM accountbase", [], |r| {
+        Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?))
+    })?;
+    let (Some(path), (Some(min), Some(max)), true) = (path, bounds, workers > 1) else {
+        return sum_range(conn, i64::MIN, i64::MAX, true);
+    };
+
+    let span = max as i128 - min as i128 + 1;
+    let results: Vec<rusqlite::Result<(i64, i64, i64)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|w| {
+                let start = if w == 0 {
+                    i64::MIN
+                } else {
+                    (min as i128 + span * w / workers) as i64
+                };
+                let (end, inclusive) = if w == workers - 1 {
+                    (i64::MAX, true)
+                } else {
+                    ((min as i128 + span * (w + 1) / workers) as i64, false)
+                };
+                let path = &path;
+                scope.spawn(move || {
+                    let c = Connection::open_with_flags(
+                        path,
+                        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                    )?;
+                    sum_range(&c, start, end, inclusive)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or(Err(rusqlite::Error::InvalidQuery)))
+            .collect()
+    });
+    let (mut on, mut off, mut np) = (0i64, 0i64, 0i64);
+    for r in results {
+        let (a, b, c) = r?;
+        on = on.saturating_add(a);
+        off = off.saturating_add(b);
+        np = np.saturating_add(c);
+    }
+    Ok((on, off, np))
+}
+
 /// Validate ledger invariants on the given database connection.
 ///
 /// This is intended to be called after sync completes (after block replay)
@@ -2769,43 +2898,7 @@ pub fn validate_invariants(conn: &Connection) -> Vec<InvariantWarning> {
         Ok((stored_online, stored_offline, stored_nopart)) => {
             // Sum actual micro-algos from the account blobs grouped by status.
             // Status: 0 = Offline, 1 = Online, 2 = NotParticipating
-            let actual_sums = conn
-                .prepare("SELECT data FROM accountbase WHERE data IS NOT NULL")
-                .and_then(|mut stmt| {
-                    let rows = stmt.query_map([], |row| {
-                        let data: Vec<u8> = row.get(0)?;
-                        Ok(data)
-                    })?;
-
-                    let mut online_sum: i64 = 0;
-                    let mut offline_sum: i64 = 0;
-                    let mut nopart_sum: i64 = 0;
-
-                    for data in rows.flatten() {
-                        // Decode minimal fields from the msgpack blob:
-                        // "a" = status (u8), "b" = micro_algos (u64)
-                        if let Ok(rmpv::Value::Map(map)) = rmpv::decode::read_value(&mut &data[..])
-                        {
-                            let mut status: u8 = 0;
-                            let mut micro_algos: u64 = 0;
-                            for (k, v) in &map {
-                                match k.as_str().unwrap_or("") {
-                                    "a" => status = v.as_u64().unwrap_or(0) as u8,
-                                    "b" => micro_algos = v.as_u64().unwrap_or(0),
-                                    _ => {}
-                                }
-                            }
-                            match status {
-                                0 => offline_sum = offline_sum.saturating_add(micro_algos as i64),
-                                1 => online_sum = online_sum.saturating_add(micro_algos as i64),
-                                2 => nopart_sum = nopart_sum.saturating_add(micro_algos as i64),
-                                _ => {}
-                            }
-                        }
-                    }
-
-                    Ok((online_sum, offline_sum, nopart_sum))
-                });
+            let actual_sums = sum_account_balances_by_status(conn);
 
             match actual_sums {
                 Ok((actual_online, actual_offline, actual_nopart)) => {
@@ -4374,5 +4467,52 @@ mod tests {
         assert_eq!(data, vec![0xBB]);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn account_balance_sums_by_status_match_a_serial_scan_on_file_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("t.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE accountbase (addrid INTEGER PRIMARY KEY, address BLOB, data BLOB);",
+        )
+        .unwrap();
+        let (mut on, mut off, mut np) = (0i64, 0i64, 0i64);
+        for i in 0..2000i64 {
+            let status = (i % 3) as u64;
+            let micro = (i as u64) * 1_000 + 7;
+            match status {
+                0 => off += micro as i64,
+                1 => on += micro as i64,
+                _ => np += micro as i64,
+            }
+            let v = rmpv::Value::Map(vec![
+                (rmpv::Value::from("a"), rmpv::Value::from(status)),
+                (rmpv::Value::from("b"), rmpv::Value::from(micro)),
+            ]);
+            let mut buf = Vec::new();
+            rmpv::encode::write_value(&mut buf, &v).unwrap();
+            // Sparse rowids exercise the range split.
+            conn.execute(
+                "INSERT INTO accountbase(addrid, address, data) VALUES (?1, x'00', ?2)",
+                rusqlite::params![i * 7 + 3, buf],
+            )
+            .unwrap();
+        }
+        // One NULL-data row and one non-map blob must be ignored.
+        conn.execute(
+            "INSERT INTO accountbase(addrid, address, data) VALUES (-5, x'00', NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO accountbase(addrid, address, data) VALUES (99999, x'00', x'c0')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            sum_account_balances_by_status(&conn).unwrap(),
+            (on, off, np)
+        );
     }
 }

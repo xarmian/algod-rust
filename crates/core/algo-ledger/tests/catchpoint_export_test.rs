@@ -414,6 +414,54 @@ fn export_then_import_round_trips_state_and_label() {
     assert_eq!(verified.kvs_count, 4);
 }
 
+/// Issue #1681: the same export -> import -> verify round trip, but into a
+/// FILE-backed database so `verify_catchpoint` takes the production path
+/// (parallel hashing workers, sorted-run spill, k-way merge, chunked trie
+/// commit) instead of the in-memory fallback. The label go would compute is
+/// the exporter's, so a successful verify proves the sorted-merge trie root
+/// is the same as the reference root.
+#[test]
+fn file_backed_import_verifies_with_parallel_sorted_trie_rebuild() {
+    let src = build_source_db();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catchpoint.tar.gz");
+    let result = export_catchpoint_file(&src, &path, &export_options()).unwrap();
+
+    let dst = Connection::open(dir.path().join("dst.sqlite")).unwrap();
+    dst.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+    import_catchpoint_file(&dst, &path, REWARD_UNITS).unwrap();
+
+    let verified = verify_catchpoint(&dst, &BLOCK_DIGEST).unwrap();
+    assert!(
+        verified.success,
+        "expected {} computed {}",
+        verified.expected_label, verified.computed_label
+    );
+    assert_eq!(verified.computed_label, result.label);
+    assert_eq!(verified.accounts_count, 5);
+    assert_eq!(verified.kvs_count, 4);
+    assert_eq!(
+        verified.trie_root,
+        rebuild_trie_from_db(&src).unwrap(),
+        "persisted-trie root must equal the reference in-memory root"
+    );
+    let persisted: i64 = dst
+        .query_row("SELECT COUNT(*) FROM accounthashes", [], |r| r.get(0))
+        .unwrap();
+    assert!(persisted > 0);
+    // No spill directory left next to the database.
+    let leftovers = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".catchpoint-verify-sort-")
+        })
+        .count();
+    assert_eq!(leftovers, 0);
+}
+
 /// TDD for issue #1626: `verify_catchpoint`'s Merkle-trie rebuild must
 /// persist the trie it builds to `accounthashes` instead of discarding it.
 ///
