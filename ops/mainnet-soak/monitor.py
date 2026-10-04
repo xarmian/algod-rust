@@ -63,6 +63,14 @@
 #      making progress the whole time -- "didn't finish in the budget" is
 #      not the same claim as "got stuck," and conflating them would turn a
 #      slow-but-working run into a false-positive issue.
+#
+# Follow window (`--follow-minutes`): once the node is first seen at the tip,
+# `collect()` keeps polling for that many more minutes and then ends "ok";
+# `--duration-minutes` stays the hard cap on total poll time, so the run ends
+# at min(cap, first_tip + follow). `0` (default) disables it. The stall rules
+# above keep applying throughout, so a halt inside the follow window is still
+# a halt. Detailed catchup phases and the broken-state scan live in
+# `nodelog.py` (`--node-log`, `scan-log`).
 
 import argparse
 import json
@@ -71,6 +79,8 @@ import sys
 import time
 import unittest
 from collections import namedtuple
+
+import nodelog
 
 DEFAULT_HALT_MINUTES = 5.0
 # Generous-but-finite allowance for the single-shot, non-incremental
@@ -426,6 +436,9 @@ def summarize(samples: list) -> dict:
             "phase_seconds": {},
             "reached_tip": False,
             "lag_rounds": {"n": 0, "mean": None, "p95": None, "max": None},
+            "first_tip_ts": None,
+            "time_to_tip_seconds": None,
+            "observed_seconds": 0.0,
         }
 
     t0 = samples[0]["ts"]
@@ -433,6 +446,7 @@ def summarize(samples: list) -> dict:
     phase_seconds = {"blocks": 0.0, "accounts": 0.0, "kvs": 0.0}
     lag_samples = []
     reached_tip = False
+    first_tip_ts = None
 
     prev_ts = t0
     prev_node = {}
@@ -479,6 +493,8 @@ def summarize(samples: list) -> dict:
                 lag = peer_round - node_round
                 if lag <= TIP_SLACK_ROUNDS:
                     reached_tip = True
+                    if first_tip_ts is None:
+                        first_tip_ts = s["ts"]
                 if reached_tip:
                     lag_samples.append(max(lag, 0))
 
@@ -501,6 +517,9 @@ def summarize(samples: list) -> dict:
         "phase_seconds": {k: round(v, 1) for k, v in phase_seconds.items() if v > 0},
         "reached_tip": reached_tip,
         "lag_rounds": lag_stats,
+        "first_tip_ts": first_tip_ts,
+        "time_to_tip_seconds": (first_tip_ts - t0) if first_tip_ts is not None else None,
+        "observed_seconds": samples[-1]["ts"] - t0,
     }
 
 
@@ -550,6 +569,19 @@ def take_sample(node_url, node_token, peer_url, peer_token) -> dict:
     }
 
 
+def at_tip(sample: dict) -> bool:
+    """True if `sample` shows the node in follow mode within
+    `TIP_SLACK_ROUNDS` of the peer (same rule `summarize()` uses)."""
+    node = sample.get("node") or {}
+    peer = sample.get("peer") or {}
+    if not node.get("ok") or (node.get("catchpoint") or ""):
+        return False
+    if not peer.get("ok"):
+        return False
+    pr, nr = peer.get("last_round"), node.get("last_round")
+    return isinstance(pr, int) and isinstance(nr, int) and pr - nr <= TIP_SLACK_ROUNDS
+
+
 def collect(
     node_url,
     node_token,
@@ -563,6 +595,7 @@ def collect(
     verify_halt_minutes=DEFAULT_VERIFY_HALT_MINUTES,
     unreachable_grace_minutes=DEFAULT_UNREACHABLE_GRACE_MINUTES,
     post_verify_halt_minutes=DEFAULT_POST_VERIFY_HALT_MINUTES,
+    follow_s=0.0,
 ):
     """Poll both endpoints every `poll_interval_s` for up to `duration_s`,
     appending each sample to `out_path` as it's taken (so a killed/timed-out
@@ -589,9 +622,16 @@ def collect(
     out polls without the node actually being dead) to become reachable
     again before the failure is treated as real.
 
+    Follow window: when `follow_s > 0`, the run ends (verdict from
+    `classify()`, normally "ok") `follow_s` seconds after the node is first
+    seen at the tip, or at `duration_s`, whichever comes first -- `duration_s`
+    remains the hard cap on total poll time. `follow_s == 0` is the original
+    behaviour.
+
     Returns the final `Verdict`.
     """
     start = time.time()
+    follow_end = None
     samples = []
     unreachable_since = None
     last_ok_was_verifying = False
@@ -612,6 +652,8 @@ def collect(
             f.flush()
 
             now = time.time()
+            if follow_s > 0 and follow_end is None and at_tip(samples[-1]):
+                follow_end = samples[-1]["ts"] + follow_s
             node = samples[-1].get("node") or {}
             if died:
                 # A confirmed-dead process is never given the grace window.
@@ -653,6 +695,8 @@ def collect(
                 return verdict
             if now - start >= duration_s:
                 return verdict
+            if follow_end is not None and now >= follow_end:
+                return verdict
             time.sleep(poll_interval_s)
 
 
@@ -669,11 +713,15 @@ def _load_jsonl(path: str) -> list:
     return samples
 
 
-def build_result(samples: list, verdict: Verdict) -> dict:
+def build_result(
+    samples: list, verdict: Verdict, follow_minutes: float = 0.0, node_log: str | None = None
+) -> dict:
     """The full JSON result both `analyze` and `collect` emit: the verdict,
     `verdict_context`'s halt-moment fields (consumed by `file_issue.py`'s
-    template), and `summarize`'s healthy-run timing/lag metrics."""
-    return {
+    template), `summarize`'s healthy-run timing/lag metrics, the follow
+    window (if requested) and, given `node_log`, the log-derived
+    `phase_seconds_detailed`."""
+    result = {
         "status": verdict.status,
         "phase": verdict.phase,
         "round": verdict.round,
@@ -682,6 +730,32 @@ def build_result(samples: list, verdict: Verdict) -> dict:
         **verdict_context(samples, verdict),
         **summarize(samples),
     }
+    if follow_minutes and follow_minutes > 0:
+        first_tip = result.get("first_tip_ts")
+        last_ts = samples[-1]["ts"] if samples else None
+        observed = (last_ts - first_tip) if first_tip is not None and last_ts is not None else None
+        result["follow"] = {
+            "requested_s": round(follow_minutes * 60.0, 1),
+            "observed_s": None if observed is None else round(observed, 1),
+            "time_to_tip_s": None
+            if result.get("time_to_tip_seconds") is None
+            else round(result["time_to_tip_seconds"], 1),
+            "completed": observed is not None
+            and observed >= follow_minutes * 60.0 - 2 * DEFAULT_POLL_INTERVAL_S,
+        }
+    if node_log:
+        try:
+            detailed = nodelog.parse_phase_file(node_log)
+            wall = result.get("fast_catchup_seconds")
+            detailed["catchup_wall_s"] = None if wall is None else round(wall, 1)
+            total = detailed.get("catchup_log_total_s")
+            detailed["unaccounted_s"] = (
+                round(wall - total, 1) if wall is not None and total is not None else None
+            )
+            result["phase_seconds_detailed"] = detailed
+        except Exception as e:  # never fail a run over reporting
+            result["phase_seconds_detailed"] = {"error": str(e)}
+    return result
 
 
 def _emit(result: dict, json_out: str | None):
@@ -696,7 +770,7 @@ def _cmd_analyze(args):
     verdict = classify(
         samples, args.halt_minutes, args.verify_halt_minutes, args.post_verify_halt_minutes
     )
-    _emit(build_result(samples, verdict), args.json_out)
+    _emit(build_result(samples, verdict, 0.0, args.node_log), args.json_out)
     return exit_code_for(verdict)
 
 
@@ -713,10 +787,29 @@ def _cmd_collect(args):
         unreachable_grace_minutes=args.unreachable_grace_minutes,
         poll_interval_s=args.poll_interval_s,
         out_path=args.out,
+        follow_s=args.follow_minutes * 60.0,
     )
     samples = _load_jsonl(args.out)
-    _emit(build_result(samples, verdict), args.json_out)
+    _emit(build_result(samples, verdict, args.follow_minutes, args.node_log), args.json_out)
     return exit_code_for(verdict)
+
+
+def _cmd_scan_log(args):
+    """Scan node.log for broken-state signatures, merge the result into the
+    summary JSON (created if absent) and print the markdown. Exit 1 if any
+    hard signature fired, else 0."""
+    scan = nodelog.scan_file(args.node_log)
+    if args.summary:
+        try:
+            with open(args.summary, encoding="utf-8") as f:
+                summary = json.load(f)
+        except (OSError, ValueError):
+            summary = {}
+        summary["log_scan"] = scan
+        with open(args.summary, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+    print(nodelog.render_markdown({"log_scan": scan}))
+    return 1 if scan["hard_total"] > 0 else 0
 
 
 def _cmd_self_test(args):
@@ -757,6 +850,14 @@ def main(argv=None) -> int:
         "--unreachable-grace-minutes", type=float, default=DEFAULT_UNREACHABLE_GRACE_MINUTES
     )
     p_collect.add_argument("--poll-interval-s", type=float, default=DEFAULT_POLL_INTERVAL_S)
+    p_collect.add_argument(
+        "--follow-minutes",
+        type=float,
+        default=0.0,
+        help="keep polling this long after first reaching the tip (0 = off); "
+        "--duration-minutes stays the hard cap",
+    )
+    p_collect.add_argument("--node-log", default=None, help="node.log for phase_seconds_detailed")
     p_collect.add_argument("--out", required=True, help="JSONL output path")
     p_collect.add_argument("--json-out", default=None, help="verdict+summary JSON path")
     p_collect.set_defaults(func=_cmd_collect)
@@ -769,7 +870,13 @@ def main(argv=None) -> int:
         "--post-verify-halt-minutes", type=float, default=DEFAULT_POST_VERIFY_HALT_MINUTES
     )
     p_analyze.add_argument("--json-out", default=None)
+    p_analyze.add_argument("--node-log", default=None, help="node.log for phase_seconds_detailed")
     p_analyze.set_defaults(func=_cmd_analyze)
+
+    p_scan = sub.add_parser("scan-log", help="scan node.log for broken-state signatures")
+    p_scan.add_argument("node_log")
+    p_scan.add_argument("--summary", default=None, help="summary.json to merge log_scan into")
+    p_scan.set_defaults(func=_cmd_scan_log)
 
     args = parser.parse_args(argv)
     return args.func(args)

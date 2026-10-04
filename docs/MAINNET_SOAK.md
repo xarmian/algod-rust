@@ -32,7 +32,7 @@ or `nightly-fuzz.yml`.
 3. Read the catchup peer's `/v2/status` `last-catchpoint` and `POST
    /v2/catchup/{label}` on the node — the fast-catchup clock starts here.
 4. Poll both `/v2/status` endpoints every 10s for the run's budget
-   (default 60 minutes) via `monitor.py collect`.
+   (default 240 minutes cap, ending 120 minutes after the tip is first reached; see below) via `monitor.py collect`.
 5. Tear down, write the job summary, upload artifacts, and — only on a
    halt — file or comment on a GitHub issue.
 
@@ -104,6 +104,77 @@ Five minutes was chosen because it comfortably exceeds this repo's own
 `ActivityMonitor`-class stall budgets (see issue #1595) while still being
 short enough that a genuine per-block/import stall is caught the same
 night, not days later.
+
+## Detailed catchup phases (`phase_seconds_detailed`)
+
+`summary.json`'s `phase_seconds` only attributes time while a `/v2/status`
+catchup counter moves, which left ~2500 s of a ~3850 s catchup as
+`unattributed`. Those keys are unchanged; `phase_seconds_detailed` adds a
+timeline derived from `node.log` (ANSI stripped) by
+`ops/mainnet-soak/nodelog.py` (`parse_phase_log`). Every segment is the
+difference of two adjacent log timestamps (or an `elapsed_s=` the node
+logged itself), so the segments sum to `catchup_log_total_s`:
+
+| key | from -> to |
+| --- | --- |
+| `startup_s` | node's first log line -> catchup request (outside the catchup clock) |
+| `earlier_attempts_s` | first request -> start of the final sync attempt (0 unless it restarted) |
+| `download_s` | `Downloading ledger snapshot` -> `Importing ledger into database` |
+| `import_s` | import -> `Verifying ledger integrity` (includes the catchpoint cutover) |
+| `verify_s` | verify -> `Downloading lookback blocks`, split into `verify_staging_s`, `verify_indexing_s`, `verify_trie_build_s` (the node's `trie rebuild ... elapsed_s=` markers) and `verify_tail_s` (the rest) |
+| `lookback_download_s` | lookback download -> `Replaying blocks` |
+| `replay_s` | replay start -> first post-sync WAL checkpoint |
+| `post_sync_wal_checkpoint_s` | first -> last post-sync WAL checkpoint |
+| `invariant_validation_s` | last post-sync checkpoint -> `Sync complete` (ledger invariant validation) |
+| `final_wal_checkpoint_s` | `Sync complete` -> end of the contiguous `WAL checkpoint:` chain (the ~270 s checkpoint) |
+
+`catchup_wall_s` is the status-polling `fast_catchup_seconds`;
+`unaccounted_s` is the difference (poll latency, a few seconds). A line the
+log did not contain yields `null` for the affected segments; it never fails
+the run. Run 37217724082 for reference: download 95, import 1059, verify
+1722 (staging 547, indexing 355, trie build 739, tail 81), lookback 379,
+replay 214, post-sync WAL 16, invariant validation 97, final WAL checkpoint
+272 -> 3852 s of 3857 s wall.
+
+## Follow window and broken-state scan
+
+`follow_minutes` (dispatch input; scheduled default 120): once the monitor
+first sees the node at the tip it keeps collecting for `follow_minutes`,
+then ends `ok`. `duration_minutes` (scheduled default 240 = catchup 60-75
+min + 120 min follow + margin) stays the **hard cap** on total poll time, so
+the monitor ends at `min(duration, first_tip + follow)`; `follow_minutes=0`
+is the previous behaviour exactly. `duration_minutes` is clamped to 315 so
+the 320-minute monitor-step and 350-minute job timeouts (GitHub-hosted
+limit: 360) always fit. The stall rules keep applying during the follow
+window, and `summary.json` gains `follow` (`requested_s`, `observed_s`,
+`time_to_tip_s`, `completed`) alongside the unchanged `lag_rounds`, which
+covers every sample from the first tip sighting, i.e. the follow window.
+
+After teardown the job scans `node.log` (`monitor.py scan-log`, merged into
+`summary.json` as `log_scan`, rendered in the step summary):
+
+- **hard** (fail the job): `permanent error writing block`,
+  `apply_block failed`, `panicked`, `invariant check: error`,
+  `Resource temporarily unavailable`, three or more
+  `ensure_block ... did not advance`, and `below minimum balance` /
+  `insufficient balance` on any line that is not from the gossip tx path
+  (`tx_tag_handler`, `tx_syncer`, `tx_sync_pool_adapter`,
+  `PoolSolicitedTxHandler`, `TxSyncer`, `TransactionPool`).
+- **warn** (counted, shown, not failing): invariant-check warnings,
+  `group ID mismatch` proposal drops (with the number of distinct
+  proposals), agreement persistence write failures/timeouts, slow
+  `ensure_block`.
+- **noise** (counted only): the `hickory_proto` DNSSEC `exceeded max
+  validation depth` ERROR flood (issue #1676), gossip tx rejections, `WS
+  block fetch failed`.
+
+`group ID mismatch` is kept at warn rather than excluded: on run
+37217724082 it fired for 1740 distinct proposals in 86 minutes, i.e. about
+every round, while mainnet proposals are valid, so it is not normal noise;
+it is not yet a hard failure so the nightly is not red for a known open
+defect. A scan failure does not file an issue: `file_issue.py` is keyed on
+halt verdicts (round/phase), a scan hit has neither, and the evidence is in
+the job summary, `summary.json` and `node.log`.
 
 ## Auto-filed issues
 
