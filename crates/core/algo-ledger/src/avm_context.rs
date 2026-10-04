@@ -1264,6 +1264,10 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     /// newly created apps to access boxes not named in box refs.
     /// Matches go-algorand's `resources.unnamedAccess`.
     unnamed_access: i64,
+    /// Group-wide pooled inner-transaction allowance (see
+    /// [`crate::apply::BoxBudgetState::pooled_inners`]); `None` = legacy
+    /// per-context budget.
+    pub(crate) pooled_inners: Option<usize>,
 
     // ---- Family-shared box access (foreign box opcodes, issue #662) ----
     /// Records that this frame has read or written a family-shared box (one
@@ -2416,6 +2420,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             update_bytes: HashMap::new(),
             read_budget_checked: false,
             unnamed_access: 0,
+            pooled_inners: None,
             touched_family_shared: false,
             family_reentrancy_checked: false,
             family_chain: Vec::new(),
@@ -3025,6 +3030,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         self.read_budget_checked = state.read_budget_checked;
         self.boxes_initialized = state.boxes_initialized;
         self.unnamed_access = state.unnamed_access;
+        self.pooled_inners = state.pooled_inners;
     }
 
     /// Export this context's box I/O budget state back into a group-scoped
@@ -3044,6 +3050,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         state.read_budget_checked = self.read_budget_checked;
         state.boxes_initialized = self.boxes_initialized;
         state.unnamed_access = self.unnamed_access;
+        state.pooled_inners = self.pooled_inners;
     }
 
     /// Lazily initialize the available-boxes map and I/O budget from the
@@ -3125,6 +3132,42 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
                     };
 
                     // Mark as available, not dirty.
+                    self.available_boxes.entry((app_id, name)).or_insert(false);
+                }
+            }
+
+            // Access-list (`tx.Access`) box refs: go's
+            // `fillApplicationCallAccess` (`data/transactions/logic/
+            // resources.go:305-340`) shares each non-empty box entry, an
+            // entirely empty entry is a spare unnamed ref, and a box or an
+            // empty entry is an I/O quota bump
+            // (`data/transactions/logic/eval.go:1275-1283`). A box entry's
+            // `i` is a 1-based index into the access list itself and must
+            // name an App entry; 0 means the txn's own app. (Issue #1664:
+            // mainnet 1134695678 reads box "pr" through such an entry.)
+            if let Some(ref access) = txn.access {
+                for rr in access {
+                    let box_ref = rr.box_ref.as_ref().filter(|b| !b.is_empty());
+                    if box_ref.is_some() || rr.is_empty() {
+                        num_box_refs += 1;
+                    }
+                    if rr.is_empty() {
+                        self.unnamed_access += 1;
+                        continue;
+                    }
+                    let Some(b) = box_ref else { continue };
+                    let name = match &b.name {
+                        Some(n) if !n.is_empty() => n.to_vec(),
+                        _ => continue,
+                    };
+                    let app_id = if b.index == 0 {
+                        txn_app_id
+                    } else {
+                        match access.get((b.index - 1) as usize) {
+                            Some(r) if r.app != 0 => r.app,
+                            _ => continue,
+                        }
+                    };
                     self.available_boxes.entry((app_id, name)).or_insert(false);
                 }
             }
@@ -3526,6 +3569,16 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         }
 
         if !ok {
+            tracing::debug!(
+                app_id = self.app_id,
+                owner_app_id = app_id,
+                name = %box_name_hex(name),
+                op = ?operation,
+                depth = self.depth,
+                group_len = self.group.len(),
+                available = self.available_boxes.len(),
+                "invalid Box reference"
+            );
             // Matches go-algorand's exact text (`data/transactions/logic/
             // box.go`): `fmt.Errorf("invalid Box reference %#x", name)`.
             return Err(AlgoError::Avm {
@@ -4153,6 +4206,13 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// group.  Because our context is per-app-call we scope the budget to
     /// the actual outer group size so a single-txn group gets 16, not 256.
     fn remaining_inners(&self) -> usize {
+        // go's `remainingInners`: with inner-transaction pooling the whole
+        // atomic group (and every nested inner call) shares one counter.
+        if self.consensus.enable_inner_transaction_pooling {
+            if let Some(left) = self.pooled_inners {
+                return left;
+            }
+        }
         let total_budget = self.consensus.max_inner_transactions * self.group.len();
         let used: usize = self.inner_txns.iter().map(|g| g.len()).sum();
         total_budget.saturating_sub(used)
@@ -4433,6 +4493,7 @@ fn execute_inner_appl<L: LedgerStore>(
     inner_ctx.read_budget_checked = true; // inner calls skip the read check (go-algorand line 556)
     inner_ctx.boxes_initialized = box_state.boxes_initialized;
     inner_ctx.unnamed_access = box_state.unnamed_access;
+    inner_ctx.pooled_inners = box_state.pooled_inners;
     // Inherit created_apps so newAppAccess fallback works for apps created earlier.
     inner_ctx.created_apps = created_apps_snapshot;
     // Issue #1322: inherit the TOP-LEVEL group's resource-sharing catalog
@@ -4589,6 +4650,7 @@ fn execute_inner_appl<L: LedgerStore>(
         read_budget_checked: inner_ctx.read_budget_checked,
         boxes_initialized: inner_ctx.boxes_initialized,
         unnamed_access: inner_ctx.unnamed_access,
+        pooled_inners: inner_ctx.pooled_inners,
         touched_family_shared: inner_ctx.touched_family_shared && creator == caller_creator,
     };
 
@@ -5814,9 +5876,9 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                             .unwrap_or_else(|| vec![0u8; 32]),
                     ),
                     // AcctTotalNumUint
-                    3 => TealValue::Uint(0), // requires per-app schema aggregation
+                    3 => TealValue::Uint(acct.total_app_schema.num_uint),
                     // AcctTotalNumByteSlice
-                    4 => TealValue::Uint(0), // requires per-app schema aggregation
+                    4 => TealValue::Uint(acct.total_app_schema.num_byte_slice),
                     // AcctTotalExtraAppPages
                     5 => TealValue::Uint(acct.total_extra_app_pages as u64),
                     // AcctTotalAppsCreated
@@ -5832,11 +5894,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     // AcctTotalBoxBytes
                     11 => TealValue::Uint(acct.total_box_bytes),
                     // AcctIncentiveEligible
-                    12 => TealValue::Uint(0), // not yet tracked
+                    12 => TealValue::Uint(acct.incentive_eligible as u64),
                     // AcctLastProposed
-                    13 => TealValue::Uint(0), // not yet tracked
+                    13 => TealValue::Uint(acct.last_proposed),
                     // AcctLastHeartbeat
-                    14 => TealValue::Uint(0), // not yet tracked
+                    14 => TealValue::Uint(acct.last_heartbeat),
                     _ => {
                         return Err(AlgoError::Avm {
                             message: format!("unknown AcctParamsField index: {field}"),
@@ -6107,6 +6169,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
 
         // ── Build inner transactions from the accumulated fields ──
         let builders = std::mem::take(&mut self.inner_building);
+        // go decrements the pooled allowance *before* executing the inner
+        // group (`eval.go:6064-6068`), so runaway recursion is noticed.
+        if let Some(left) = self.pooled_inners.as_mut() {
+            *left = left.saturating_sub(builders.len());
+        }
         let default_sender = Address(app_address(self.app_id));
         let mut txns: Vec<SignedTransaction> = builders
             .iter()
@@ -6633,6 +6700,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     read_budget_checked: self.read_budget_checked,
                     boxes_initialized: self.boxes_initialized,
                     unnamed_access: self.unnamed_access,
+                    pooled_inners: self.pooled_inners,
                     // Not read on the way in -- `execute_inner_appl` starts
                     // the child's own `touched_family_shared` at `false`
                     // (a fresh frame begins untouched) and only *sets* this
@@ -6741,6 +6809,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                             self.read_budget_checked = bs.read_budget_checked;
                             self.boxes_initialized = bs.boxes_initialized;
                             self.unnamed_access = bs.unnamed_access;
+                            self.pooled_inners = bs.pooled_inners;
                             // Family-shared touch-mark propagation
                             // (go-algorand eval.go:1373-1384): `bs`'s flag is
                             // already resolved to "the child touched
@@ -10086,6 +10155,37 @@ mod tests {
         // AcctTotalBoxes
         let (val, _) = ctx.acct_params_get(&addr, 10).unwrap();
         assert_eq!(val, TealValue::Uint(10));
+    }
+
+    /// Issue #1664: `acct_params_get` returned 0 for AcctTotalNumUint,
+    /// AcctTotalNumByteSlice, AcctIncentiveEligible, AcctLastProposed and
+    /// AcctLastHeartbeat ("not yet tracked"). A mainnet staking-pool app
+    /// decides whether a go-online fee is due from AcctIncentiveEligible, so
+    /// executing it on the follow path asserted where go did not.
+    #[test]
+    fn acct_params_get_reports_schema_incentive_and_activity_fields() {
+        let mut store = LedgerState::new();
+        let addr = Address([77u8; 32]);
+        store.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 1_000_000,
+                incentive_eligible: true,
+                last_proposed: 123,
+                last_heartbeat: 456,
+                total_app_schema: algo_types::StateSchema {
+                    num_uint: 7,
+                    num_byte_slice: 9,
+                },
+                ..Default::default()
+            },
+        );
+        let ctx = make_context(&mut store, vec![make_pay_txn([1u8; 32], [2u8; 32], 1)]);
+        for (field, want) in [(3u8, 7u64), (4, 9), (12, 1), (13, 123), (14, 456)] {
+            let (v, found) = ctx.acct_params_get(&addr.0, field).unwrap();
+            assert!(found);
+            assert_eq!(v, TealValue::Uint(want), "field {field}");
+        }
     }
 
     #[test]
@@ -16047,6 +16147,47 @@ mod tests {
         assert_eq!(ctx.num_inner_txns(), 17);
     }
 
+    /// Issue #1664: go pools the inner-transaction allowance across the
+    /// whole atomic group and every nested inner call
+    /// (`pooledAllowedInners`, seeded with `MaxTxGroupSize *
+    /// MaxInnerTransactions`), so a call may submit more than
+    /// `MaxInnerTransactions` inner transactions in total. Mainnet block
+    /// 65599766 (app 1439234347, 18 direct inner calls plus nested ones) was
+    /// rejected by the per-frame budget.
+    #[test]
+    fn pooled_inner_budget_allows_more_than_16_inners_in_one_frame() {
+        let txn1 = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        store.set_account(
+            &Address(app_address(42)),
+            AccountData {
+                micro_algos: 100_000_000,
+                ..Default::default()
+            },
+        );
+        let mut ctx = make_context(&mut store, vec![txn1]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 100_000;
+        ctx.consensus.enable_inner_transaction_pooling = true;
+        ctx.pooled_inners =
+            Some(ctx.consensus.max_tx_group_size * ctx.consensus.max_inner_transactions);
+
+        for i in 0..20u8 {
+            ctx.itxn_begin().unwrap();
+            ctx.itxn_field(16, TealValue::Uint(1)).unwrap();
+            ctx.itxn_field(7, TealValue::Bytes([i + 1; 32].to_vec()))
+                .unwrap();
+            ctx.itxn_field(8, TealValue::Uint(100)).unwrap();
+            ctx.itxn_submit()
+                .unwrap_or_else(|e| panic!("inner txn {i} must fit the pooled budget: {e}"));
+        }
+        assert_eq!(ctx.num_inner_txns(), 20);
+        assert_eq!(
+            ctx.pooled_inners,
+            Some(ctx.consensus.max_tx_group_size * ctx.consensus.max_inner_transactions - 20)
+        );
+    }
+
     // ---- issue #570: kv_mods recorder ----
 
     /// Build a `LedgerAvmContext` with V41 consensus (real box budget/size
@@ -16576,7 +16717,34 @@ mod tests {
                 index: 1,
                 name: Some(serde_bytes::ByteBuf::from(b"B".to_vec())),
             }]);
-            let err = run(&mut store, txn, app_id, consensus, &program);
+            let err = run(&mut store, txn, app_id, consensus.clone(), &program);
+            assert!(err.contains("no such box"), "got: {err}");
+        }
+
+        // Case 4 (issue #1664): "B" referenced through the transaction's
+        // access list -- a box entry whose 1-based `i` points at an App
+        // entry of the same list. go shares it (`fillApplicationCallAccess`),
+        // so it is available (mainnet 1134695678's box "pr").
+        {
+            let mut store = LedgerState::new();
+            let mut txn = make_appl_txn([9u8; 32], app_id, vec![], vec![], vec![]);
+            txn.txn.access = Some(vec![
+                algo_types::ResourceRef {
+                    app: app_id,
+                    ..Default::default()
+                },
+                algo_types::ResourceRef {
+                    box_ref: Some(algo_types::BoxRef {
+                        index: 1,
+                        name: Some(serde_bytes::ByteBuf::from(b"B".to_vec())),
+                    }),
+                    ..Default::default()
+                },
+            ]);
+            // tx.Access needs a sharedResources (v9+) program.
+            let mut program9 = program.clone();
+            program9[0] = 9;
+            let err = run(&mut store, txn, app_id, consensus, &program9);
             assert!(err.contains("no such box"), "got: {err}");
         }
     }
