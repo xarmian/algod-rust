@@ -137,6 +137,11 @@ pub enum SrvResolveError {
     #[error("fallback resolver not configured or address invalid")]
     FallbackNotConfigured,
 
+    /// The configured fallback DNS address does not parse as an IP address
+    /// (carries the offending value).
+    #[error("fallback address '{0}' could not be parsed as an IP address")]
+    InvalidFallbackAddress(String),
+
     /// A resolver-stage attempt did not complete within
     /// [`DNSSEC_STAGE_TIMEOUT`] (issue #1614: guards against a hung/slow
     /// DNSSEC chain-of-trust walk consuming the caller's entire startup
@@ -158,16 +163,20 @@ pub enum SrvResolveError {
 /// `SystemResolver()`/`FallbackResolver()`/`DefaultResolver()` as separately
 /// callable methods) without changing `lookup_srv`'s own default behaviour,
 /// which always tries all three stages in order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResolverStage {
     /// The OS-configured system resolver.
     System,
     /// The configured fallback DNS server (errors with
-    /// [`SrvResolveError::FallbackNotConfigured`] if none is set or it fails
-    /// to parse as an IP address).
+    /// [`SrvResolveError::FallbackNotConfigured`] if none is set, or
+    /// [`SrvResolveError::InvalidFallbackAddress`] if it fails to parse as
+    /// an IP address).
     Fallback,
     /// The well-known public default resolver (Cloudflare + Google).
     Default,
+    /// The default resolver with DNSSEC validation switched off (issue
+    /// #1614): the final attempt after every validating stage failed.
+    LastResort,
 }
 
 // ---------------------------------------------------------------------------
@@ -270,24 +279,14 @@ fn apply_resolver_opts(opts: &mut ResolverOpts, validate: bool) {
 /// that burns [`DNSSEC_STAGE_TIMEOUT`] (see [`run_stage_chain`]).
 const SYSTEM_STAGE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 
-/// One step of the `system -> fallback -> default -> last-resort` chain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Stage {
-    System,
-    Fallback,
-    Default,
-    /// Default resolver with DNSSEC validation off (issue #1614).
-    LastResort,
-}
-
 type StageFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<SrvRecord>, SrvResolveError>> + Send + 'a>>;
 
-/// Runs a single [`Stage`]; the production impl builds a hickory resolver,
-/// tests substitute a scripted fake.
+/// Runs a single [`ResolverStage`]; the production impl builds a hickory
+/// resolver, tests substitute a scripted fake.
 trait StageRunner: Sync {
     fn has_fallback(&self) -> bool;
-    fn run(&self, stage: Stage) -> StageFuture<'_>;
+    fn run(&self, stage: ResolverStage) -> StageFuture<'_>;
 }
 
 /// Deadline until which the system stage is skipped, if any.
@@ -306,28 +305,49 @@ type SystemSkip = std::sync::Mutex<Option<std::time::Instant>>;
 /// `validate_dnssec` is on, the system stage timed out, **and** a later
 /// fallback/default stage then answered the same lookup (evidence the system
 /// stage was the culprit rather than the network being down), the system
-/// stage is skipped for [`SYSTEM_STAGE_COOLDOWN`]. After the cool-down it is
-/// tried again, and a success clears the skip. Nothing trips when every stage
-/// fails (an unreachable host must keep trying its only resolver), when
-/// validation is off, on a non-timeout error, or when only the unvalidated
-/// last-resort stage answered.
+/// stage is skipped for [`SYSTEM_STAGE_COOLDOWN`], measured from the moment
+/// of the trip (`clock` is read once at the start and once at trip time).
+/// After the cool-down it is tried again, and a success clears the skip.
+/// Nothing trips when every stage fails (an unreachable host must keep
+/// trying its only resolver), when validation is off, on a non-timeout
+/// error, or when only the unvalidated last-resort stage answered.
+///
+/// # Limit
+///
+/// A single transient system-resolver timeout followed by a fallback/default
+/// success is indistinguishable from the DNSSEC spin, so it also disables
+/// the system resolver for the cool-down. On a host with split-horizon DNS
+/// (names only the system resolver can answer) that means those names
+/// resolve through the other stages meanwhile; both the trip and the end of
+/// the cool-down are logged at INFO so the cause is visible.
 async fn run_stage_chain(
     runner: &dyn StageRunner,
     skip: &SystemSkip,
     validate: bool,
-    now: std::time::Instant,
+    clock: &(dyn Fn() -> std::time::Instant + Sync),
     cooldown: Duration,
     srv_name: &str,
 ) -> Result<Vec<SrvRecord>, SrvResolveError> {
-    let skipping = validate
-        && matches!(*skip.lock().unwrap_or_else(|p| p.into_inner()), Some(until) if now < until);
+    let now = clock();
+    let skipping = validate && {
+        let mut guard = skip.lock().unwrap_or_else(|p| p.into_inner());
+        match *guard {
+            Some(until) if now < until => true,
+            Some(_) => {
+                *guard = None;
+                info!("system DNS resolver cool-down ended; trying it again (issue #1676)");
+                false
+            }
+            None => false,
+        }
+    };
 
     let mut system_timed_out = false;
     let sys_err = if skipping {
         debug!("skipping the system resolver stage during its cool-down (issue #1676)");
         "skipped after an earlier timeout".to_string()
     } else {
-        match runner.run(Stage::System).await {
+        match runner.run(ResolverStage::System).await {
             Ok(records) => {
                 *skip.lock().unwrap_or_else(|p| p.into_inner()) = None;
                 return Ok(records);
@@ -344,12 +364,21 @@ async fn run_stage_chain(
     // evidence that arms the cool-down.
     let trip = || {
         if validate && system_timed_out {
-            *skip.lock().unwrap_or_else(|p| p.into_inner()) = Some(now + cooldown);
+            let mut guard = skip.lock().unwrap_or_else(|p| p.into_inner());
+            if guard.is_none() {
+                info!(
+                    "system DNS resolver timed out after {} s; skipping it for {} min \
+                     (issue #1676)",
+                    DNSSEC_STAGE_TIMEOUT.as_secs(),
+                    cooldown.as_secs() / 60
+                );
+            }
+            *guard = Some(clock() + cooldown);
         }
     };
 
     let fb_err = if runner.has_fallback() {
-        match runner.run(Stage::Fallback).await {
+        match runner.run(ResolverStage::Fallback).await {
             Ok(records) => {
                 trip();
                 return Ok(records);
@@ -363,7 +392,7 @@ async fn run_stage_chain(
         "not configured".to_string()
     };
 
-    let default_err = match runner.run(Stage::Default).await {
+    let default_err = match runner.run(ResolverStage::Default).await {
         Ok(records) => {
             trip();
             return Ok(records);
@@ -385,7 +414,7 @@ async fn run_stage_chain(
              retrying once via the default resolver with DNSSEC validation disabled as a \
              last resort (see hickory-dns issue #3974 and algod-rust issue #1614)"
         );
-        match runner.run(Stage::LastResort).await {
+        match runner.run(ResolverStage::LastResort).await {
             Ok(records) => return Ok(records),
             Err(e) => {
                 info!("DNS SRV lookup also failed with DNSSEC-disabled last-resort resolver: {e}")
@@ -400,7 +429,9 @@ async fn run_stage_chain(
     })
 }
 
-/// Production [`StageRunner`] backed by hickory resolvers.
+/// Production [`StageRunner`] backed by hickory resolvers: the single place
+/// that turns a [`ResolverStage`] into a resolver and runs a bounded lookup
+/// (shared by `lookup_srv` and `lookup_srv_via_stage`).
 struct HickoryStageRunner<'a> {
     fallback_dns: Option<&'a str>,
     validate: bool,
@@ -412,19 +443,19 @@ impl StageRunner for HickoryStageRunner<'_> {
         self.fallback_dns.is_some()
     }
 
-    fn run(&self, stage: Stage) -> StageFuture<'_> {
+    fn run(&self, stage: ResolverStage) -> StageFuture<'_> {
         Box::pin(async move {
             let resolver = match stage {
-                Stage::System => HickorySrvResolver::system_resolver(self.validate)?,
-                Stage::Fallback => {
+                ResolverStage::System => HickorySrvResolver::system_resolver(self.validate)?,
+                ResolverStage::Fallback => {
                     let addr = self
                         .fallback_dns
                         .ok_or(SrvResolveError::FallbackNotConfigured)?;
                     HickorySrvResolver::fallback_resolver(addr, self.validate)
-                        .ok_or(SrvResolveError::FallbackNotConfigured)?
+                        .ok_or_else(|| SrvResolveError::InvalidFallbackAddress(addr.to_string()))?
                 }
-                Stage::Default => HickorySrvResolver::default_resolver(self.validate),
-                Stage::LastResort => HickorySrvResolver::default_resolver(false),
+                ResolverStage::Default => HickorySrvResolver::default_resolver(self.validate),
+                ResolverStage::LastResort => HickorySrvResolver::default_resolver(false),
             };
             HickorySrvResolver::do_lookup_bounded(&resolver, self.srv_name).await
         })
@@ -670,25 +701,13 @@ impl HickorySrvResolver {
         }
         let srv_name = format!("_{service}._{protocol}.{name}");
 
-        match stage {
-            ResolverStage::System => {
-                let resolver = Self::system_resolver(self.validate_dnssec)?;
-                Ok(Self::do_lookup(&resolver, &srv_name).await?)
-            }
-            ResolverStage::Fallback => {
-                let addr = self
-                    .fallback_dns
-                    .as_ref()
-                    .ok_or(SrvResolveError::FallbackNotConfigured)?;
-                let resolver = Self::fallback_resolver(addr, self.validate_dnssec)
-                    .ok_or(SrvResolveError::FallbackNotConfigured)?;
-                Ok(Self::do_lookup(&resolver, &srv_name).await?)
-            }
-            ResolverStage::Default => {
-                let resolver = Self::default_resolver(self.validate_dnssec);
-                Ok(Self::do_lookup(&resolver, &srv_name).await?)
-            }
+        HickoryStageRunner {
+            fallback_dns: self.fallback_dns.as_deref(),
+            validate: self.validate_dnssec,
+            srv_name: &srv_name,
         }
+        .run(stage)
+        .await
     }
 }
 
@@ -777,7 +796,7 @@ impl SrvResolver for HickorySrvResolver {
                 &runner,
                 &self.system_skip,
                 self.validate_dnssec,
-                std::time::Instant::now(),
+                &std::time::Instant::now,
                 SYSTEM_STAGE_COOLDOWN,
                 &srv_name,
             )
@@ -824,6 +843,8 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::time::Instant;
+
+    type Stage = ResolverStage;
 
     #[derive(Clone, Copy)]
     enum Outcome {
@@ -895,7 +916,73 @@ mod tests {
         validate: bool,
         now: Instant,
     ) -> Result<Vec<SrvRecord>, SrvResolveError> {
-        run_stage_chain(r, skip, validate, now, COOLDOWN, "_x._tcp.example").await
+        let clock = move || now;
+        run_stage_chain(r, skip, validate, &clock, COOLDOWN, "_x._tcp.example").await
+    }
+
+    /// The cool-down is measured from the instant of the trip, not from the
+    /// instant the lookup started (the failed system stage itself burns the
+    /// whole stage timeout first).
+    #[tokio::test]
+    async fn cooldown_is_measured_from_trip_time_not_lookup_start() {
+        let t0 = Instant::now();
+        let skip = SystemSkip::default();
+        let r = FakeRunner::new(
+            false,
+            &[
+                (Stage::System, Outcome::Timeout),
+                (Stage::Default, Outcome::Ok),
+            ],
+        );
+        // First clock read (lookup start) = t0; second (trip) = t0 + 100 s.
+        let n = std::sync::atomic::AtomicU32::new(0);
+        let clock = move || {
+            if n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                t0
+            } else {
+                t0 + Duration::from_secs(100)
+            }
+        };
+        run_stage_chain(&r, &skip, true, &clock, COOLDOWN, "_x._tcp.example")
+            .await
+            .unwrap();
+        r.take_calls();
+        let deadline = t0 + Duration::from_secs(100) + COOLDOWN;
+        chain(&r, &skip, true, deadline - Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(r.take_calls(), vec![Stage::Default], "still cooling down");
+        chain(&r, &skip, true, deadline + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(r.take_calls()[0], Stage::System, "cool-down over");
+    }
+
+    /// A malformed fallback address keeps its own diagnostic (with the
+    /// offending value) instead of collapsing into "not configured".
+    #[tokio::test]
+    async fn malformed_fallback_address_reports_parse_error_with_value() {
+        let runner = HickoryStageRunner {
+            fallback_dns: Some("not-an-ip"),
+            validate: true,
+            srv_name: "_x._tcp.example",
+        };
+        let err = runner.run(Stage::Fallback).await.unwrap_err();
+        match &err {
+            SrvResolveError::InvalidFallbackAddress(a) => assert_eq!(a, "not-an-ip"),
+            other => panic!("expected InvalidFallbackAddress, got {other}"),
+        }
+        assert!(err.to_string().contains("not-an-ip"), "{err}");
+
+        let none = HickoryStageRunner {
+            fallback_dns: None,
+            validate: true,
+            srv_name: "_x._tcp.example",
+        };
+        assert!(matches!(
+            none.run(Stage::Fallback).await.unwrap_err(),
+            SrvResolveError::FallbackNotConfigured
+        ));
     }
 
     #[tokio::test]
@@ -1782,8 +1869,8 @@ mod tests {
     }
 
     /// Requesting [`ResolverStage::Fallback`] with an unparseable fallback
-    /// address must also fail with [`SrvResolveError::FallbackNotConfigured`]
-    /// rather than falling through.
+    /// address must fail with [`SrvResolveError::InvalidFallbackAddress`]
+    /// (naming the value) rather than falling through.
     #[tokio::test]
     async fn lookup_srv_via_stage_fallback_invalid_address() {
         let resolver = HickorySrvResolver::new(Some("not-an-ip".to_string()));
@@ -1792,8 +1879,8 @@ mod tests {
             .await
             .expect_err("fallback stage with an invalid address must error");
         assert!(
-            matches!(err, SrvResolveError::FallbackNotConfigured),
-            "expected FallbackNotConfigured, got: {err}"
+            matches!(&err, SrvResolveError::InvalidFallbackAddress(a) if a == "not-an-ip"),
+            "expected InvalidFallbackAddress, got: {err}"
         );
     }
 
