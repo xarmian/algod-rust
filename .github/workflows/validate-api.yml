@@ -10,8 +10,10 @@ name: Dual-Node REST Conformance
 # docker/docker-compose.validate-api.yml's header comment), and diffs live
 # HTTP responses byte-for-byte where a shared genesis makes that meaningful.
 #
-# Runs only when paths the suite actually exercises change, so most PRs
-# don't pay the dual-node-boot cost. No go-algorand-from-source build is
+# Runs for every consensus- or REST-relevant crate (crates/core, crates/node,
+# bin, docker, Cargo.lock): the 2026-10 regression where a produced block's
+# payset carried gen/gh (issue #1703) merged unnoticed because the filter
+# only covered the REST crate. Also dispatchable manually. No go-algorand-from-source build is
 # needed here (unlike algokey-e2e.yml) -- the go side uses the prebuilt
 # `algorand/algod` image directly, and algod-rust runs natively (a single
 # `cargo build --release`, reused by the test binary) rather than as a
@@ -21,25 +23,23 @@ name: Dual-Node REST Conformance
 on:
   pull_request:
     paths:
-      - "crates/node/algo-rest-api/**"
-      - "crates/core/algo-ledger/src/genesis.rs"
-      - "crates/core/algo-types/src/account.rs"
-      - "bin/algod-rust/**"
-      - "docker/docker-compose.validate-api.yml"
-      - "docker/localnet-rust/**"
-      - "docker/Dockerfile"
+      - "crates/core/**"
+      - "crates/node/**"
+      - "bin/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "docker/**"
       - "Makefile"
       - ".github/workflows/validate-api.yml"
   push:
     branches: [main]
     paths:
-      - "crates/node/algo-rest-api/**"
-      - "crates/core/algo-ledger/src/genesis.rs"
-      - "crates/core/algo-types/src/account.rs"
-      - "bin/algod-rust/**"
-      - "docker/docker-compose.validate-api.yml"
-      - "docker/localnet-rust/**"
-      - "docker/Dockerfile"
+      - "crates/core/**"
+      - "crates/node/**"
+      - "bin/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "docker/**"
       - "Makefile"
       - ".github/workflows/validate-api.yml"
   workflow_dispatch:
