@@ -7317,8 +7317,13 @@ async fn pending_transaction_info_with_bytes_state_delta() {
 
 /// Issue #1698: the REST `action` field must carry go's `basics.DeltaAction`
 /// numbers (`data/basics/teal.go`: SetBytesAction = 1, SetUintAction = 2).
-/// The `gd` entries are taken verbatim from mainnet round 65703970 (txn 12):
-/// `block` is a uint (`at=2`) and `current_miner` is a 32-byte value (`at=1`).
+/// The entry shapes follow mainnet round 65703970 (txn 12). Real mainnet
+/// values: `block` (`at=2`, `ui=65703970`). Synthetic: the 32-byte
+/// `current_miner` value (`at=1`) is a made-up pattern, not the mainnet bytes.
+/// For byte-exact mainnet evidence (the real `at`/`ui`/`bs` of `block`,
+/// `current_miner` and `last_miner_effort`) see
+/// `parse_real_mainnet_eval_delta_round_65703970` in
+/// `crates/core/algo-ledger/src/eval_delta.rs`.
 /// The wire map is built from literal go numbers (not `DeltaAction`), so an
 /// independent remap in the handler path would be caught.
 #[tokio::test]

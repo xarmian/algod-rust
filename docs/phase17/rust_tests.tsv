@@ -5634,6 +5634,7 @@ crates/node/algo-rest-api	pending_transaction_info_with_local_state_delta	crates
 crates/node/algo-rest-api	pending_transaction_info_with_logs_from_eval_delta	crates/node/algo-rest-api/tests/integration.rs	6237
 crates/node/algo-rest-api	pending_transaction_info_with_bytes_state_delta	crates/node/algo-rest-api/tests/integration.rs	6289
 crates/node/algo-rest-api	pending_transaction_info_no_eval_delta_when_unconfirmed	crates/node/algo-rest-api/tests/integration.rs	6361
+crates/node/algo-rest-api	pending_transaction_info_state_delta_action_numbers_match_go_mainnet_entries	crates/node/algo-rest-api/tests/integration.rs	7330
 crates/node/algo-rest-api	simulate_requires_auth	crates/node/algo-rest-api/tests/integration.rs	6430
 crates/node/algo-rest-api	simulate_empty_body_returns_400	crates/node/algo-rest-api/tests/integration.rs	6453
 crates/node/algo-rest-api	simulate_empty_txn_groups_returns_400	crates/node/algo-rest-api/tests/integration.rs	6470
