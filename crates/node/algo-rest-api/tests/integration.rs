@@ -7315,17 +7315,22 @@ async fn pending_transaction_info_with_bytes_state_delta() {
     assert!(entry["value"].get("uint").is_none());
 }
 
-/// Issue #1698: the REST `action` field must carry go's `basics.DeltaAction`
-/// numbers (`data/basics/teal.go`: SetBytesAction = 1, SetUintAction = 2).
-/// The entry shapes follow mainnet round 65703970 (txn 12). Real mainnet
-/// values: `block` (`at=2`, `ui=65703970`). Synthetic: the 32-byte
-/// `current_miner` value (`at=1`) is a made-up pattern, not the mainnet bytes.
-/// For byte-exact mainnet evidence (the real `at`/`ui`/`bs` of `block`,
-/// `current_miner` and `last_miner_effort`) see
-/// `parse_real_mainnet_eval_delta_round_65703970` in
-/// `crates/core/algo-ledger/src/eval_delta.rs`.
-/// The wire map is built from literal go numbers (not `DeltaAction`), so an
-/// independent remap in the handler path would be caught.
+/// Issue #1698: conformance pin of the REST pass-through. The handler reports
+/// the raw wire `at` integer as JSON `action`, and go's numbers are
+/// `basics.DeltaAction` (`data/basics/teal.go`: SetBytesAction = 1,
+/// SetUintAction = 2). The wire map here is built from literal go numbers.
+/// This test does NOT exercise the `DeltaAction` enum and would have passed
+/// before the ledger renumbering; the ledger numbering is guarded by the
+/// pin tests in `crates/core/algo-ledger/src/eval_delta.rs`
+/// (`delta_action_numbers_match_go`, `parse_go_numbered_eval_delta`,
+/// `encode_eval_delta_emits_go_action_numbers`,
+/// `parse_real_mainnet_eval_delta_round_65703970`). It only catches a future
+/// independent remap inside the handler.
+///
+/// The entry shapes follow mainnet round 65703970 (txn 12). Real value:
+/// `block` (`at=2`, `ui=65703970`). Synthetic: the 32-byte `current_miner`
+/// value (`at=1`) is a made-up pattern, not the mainnet bytes; the byte-exact
+/// mainnet entries are in `parse_real_mainnet_eval_delta_round_65703970`.
 #[tokio::test]
 async fn pending_transaction_info_state_delta_action_numbers_match_go_mainnet_entries() {
     use base64::engine::general_purpose::STANDARD;

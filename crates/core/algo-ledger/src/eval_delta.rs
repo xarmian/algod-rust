@@ -30,6 +30,15 @@ use crate::apply::{apply_transaction, ApplyContext};
 // NOTE: LedgerStore is referenced via full path in function bounds rather
 // than imported at module level. See apply.rs for rationale.
 
+// The wire/REST numbers of go-algorand's `basics.DeltaAction`
+// (`data/basics/teal.go` lines 30-37: `SetBytesAction = 1`,
+// `SetUintAction = 2`, `DeleteAction = 3`). This is the single place the
+// numbers are defined: the enum discriminants, `From<DeltaAction> for u64`
+// (used by `encode_eval_delta`) and `TryFrom<u64>` all derive from these.
+const SET_BYTES_ACTION: u64 = 1;
+const SET_UINT_ACTION: u64 = 2;
+const DELETE_ACTION: u64 = 3;
+
 /// Action types for state delta changes.
 ///
 /// Numbering matches go-algorand's `basics.DeltaAction`
@@ -39,9 +48,19 @@ use crate::apply::{apply_transaction, ApplyContext};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 pub enum DeltaAction {
-    SetBytes = 1,
-    SetUint = 2,
-    Delete = 3,
+    SetBytes = SET_BYTES_ACTION,
+    SetUint = SET_UINT_ACTION,
+    Delete = DELETE_ACTION,
+}
+
+impl From<DeltaAction> for u64 {
+    fn from(a: DeltaAction) -> u64 {
+        match a {
+            DeltaAction::SetBytes => SET_BYTES_ACTION,
+            DeltaAction::SetUint => SET_UINT_ACTION,
+            DeltaAction::Delete => DELETE_ACTION,
+        }
+    }
 }
 
 impl TryFrom<u64> for DeltaAction {
@@ -49,9 +68,9 @@ impl TryFrom<u64> for DeltaAction {
 
     fn try_from(v: u64) -> Result<Self, Self::Error> {
         match v {
-            1 => Ok(DeltaAction::SetBytes),
-            2 => Ok(DeltaAction::SetUint),
-            3 => Ok(DeltaAction::Delete),
+            SET_BYTES_ACTION => Ok(DeltaAction::SetBytes),
+            SET_UINT_ACTION => Ok(DeltaAction::SetUint),
+            DELETE_ACTION => Ok(DeltaAction::Delete),
             _ => Err(AlgoError::Ledger {
                 message: format!("invalid DeltaAction: {}", v),
             }),
@@ -188,16 +207,22 @@ pub fn encode_eval_delta(
     fn value_delta(v: &Option<TealValue>) -> Value {
         match v {
             Some(TealValue::Uint(u)) => Value::Map(vec![
-                (Value::from("at"), Value::from(DeltaAction::SetUint as u64)),
+                (
+                    Value::from("at"),
+                    Value::from(u64::from(DeltaAction::SetUint)),
+                ),
                 (Value::from("ui"), Value::from(*u)),
             ]),
             Some(TealValue::Bytes(b)) => Value::Map(vec![
-                (Value::from("at"), Value::from(DeltaAction::SetBytes as u64)),
+                (
+                    Value::from("at"),
+                    Value::from(u64::from(DeltaAction::SetBytes)),
+                ),
                 (Value::from("bs"), Value::Binary(b.clone())),
             ]),
             None => Value::Map(vec![(
                 Value::from("at"),
-                Value::from(DeltaAction::Delete as u64),
+                Value::from(u64::from(DeltaAction::Delete)),
             )]),
         }
     }
@@ -654,9 +679,9 @@ mod tests {
     /// `SetUintAction = 2`, `DeleteAction = 3` (`data/basics/teal.go`).
     #[test]
     fn delta_action_numbers_match_go() {
-        assert_eq!(DeltaAction::SetBytes as u64, 1);
-        assert_eq!(DeltaAction::SetUint as u64, 2);
-        assert_eq!(DeltaAction::Delete as u64, 3);
+        assert_eq!(u64::from(DeltaAction::SetBytes), 1);
+        assert_eq!(u64::from(DeltaAction::SetUint), 2);
+        assert_eq!(u64::from(DeltaAction::Delete), 3);
         assert_eq!(DeltaAction::try_from(1).unwrap(), DeltaAction::SetBytes);
         assert_eq!(DeltaAction::try_from(2).unwrap(), DeltaAction::SetUint);
         assert_eq!(DeltaAction::try_from(3).unwrap(), DeltaAction::Delete);
@@ -740,12 +765,20 @@ mod tests {
         assert_eq!(at_of(b"d"), 3, "delete => DeleteAction = 3");
     }
 
-    /// Real mainnet evidence (issue #1698): the `dt` of round 65703970, txn
-    /// index 12 (an app call), fetched from
-    /// `/v2/blocks/65703970?format=msgpack`, trimmed to three global-delta
-    /// keys with the entries byte-for-byte as go produced them. `block` and
-    /// `last_miner_effort` are uints (`at=2`), `current_miner` is a 32-byte
-    /// value (`at=1`).
+    /// Real mainnet evidence (issue #1698).
+    ///
+    /// Provenance: the `dt` of mainnet round 65703970, txn index 12 (an app
+    /// call), from
+    /// `https://mainnet-api.4160.nodely.dev/v2/blocks/65703970?format=msgpack`.
+    /// Only three global-delta keys were kept (`block`, `last_miner_effort`,
+    /// `current_miner`; their entries are byte-for-byte as go produced them)
+    /// and the rest of the txn was trimmed. The trimming was done by hand and
+    /// verified by decoding; method (python `msgpack`): fetch the block,
+    /// `msgpack.unpackb(body, raw=True, strict_map_key=False)`, take
+    /// `[b"block"][b"txns"][12][b"dt"][b"gd"]`, keep the three keys, re-pack
+    /// as `{"gd": {...}}` with str `at`/`ui`/`bs` keys and print the hex.
+    /// Expected: `block` and `last_miner_effort` are uints (`at=2`),
+    /// `current_miner` is a 32-byte value (`at=1`).
     #[test]
     fn parse_real_mainnet_eval_delta_round_65703970() {
         let hex = "81a2676483c405626c6f636b82a2617402a27569ce03ea9022c40d63757272656e745f6d696e657282a2617401a26273c4208802144c5021e7246b08068ada102b27c26f0142e5417830210e024c259aca62c4116c6173745f6d696e65725f6566666f727482a2617402a27569cda028";
