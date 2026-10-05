@@ -64,7 +64,7 @@ jobs:
       # heavier integration/proptest suites inside the job budget.
       - name: Run workspace tests with coverage
         run: >-
-          cargo llvm-cov --workspace --release
+          cargo llvm-cov --workspace --release --no-fail-fast
           --ignore-filename-regex '(^|[/\\])(tests|benches)[/\\]'
           --lcov --output-path lcov.info
 

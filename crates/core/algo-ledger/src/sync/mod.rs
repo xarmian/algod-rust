@@ -3244,7 +3244,14 @@ mod tests {
     /// unreachable peer source without a network. `fetch_attempts` is an
     /// `Arc` so the test can keep observing the counter after the backend
     /// is moved into the (trait-object-erasing) `SyncOrchestrator`.
+    ///
+    /// Only fetches of `counted_round` are counted: that is the catchpoint
+    /// round, which only the sequential bounded-retry loop ever requests
+    /// (the concurrent prefetch covers rounds strictly below it, and how
+    /// many of those it fetches before its first failure disables it is
+    /// timing-dependent, so they must not enter the assertion).
     struct AlwaysFailingLookbackBackend {
+        counted_round: u64,
         fetch_attempts: std::sync::Arc<std::sync::atomic::AtomicU64>,
     }
 
@@ -3259,8 +3266,10 @@ mod tests {
         }
 
         fn fetch_block_raw(&self, round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
-            self.fetch_attempts
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if round == self.counted_round {
+                self.fetch_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             Err(AlgoError::Network {
                 message: format!("simulated unreachable peer for round {round}"),
             })
@@ -3303,6 +3312,7 @@ mod tests {
 
         let fetch_attempts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let backend = AlwaysFailingLookbackBackend {
+            counted_round: 5,
             fetch_attempts: fetch_attempts.clone(),
         };
         let mut orchestrator = SyncOrchestrator::with_backend(config, backend);
