@@ -5124,6 +5124,58 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     }
 }
 
+/// Which go-algorand formula an inner-transaction offset feeds.
+///
+/// go-algorand uses two different offsets for the same sibling, and they
+/// diverge before `UnifyInnerTxIDs` (v34):
+/// - `ChildId`: the sibling's own `InnerID(parent, offset)` (`getTxID` /
+///   `getTxIDNotUnified`, `data/transactions/logic/eval.go`): always
+///   `len(prior inner txns) + groupIndex`, in both consensus modes.
+/// - `GroupHash`: the digest folded into the group ID by `opItxnSubmit`:
+///   `len(prior inner txns)`, plus the sibling index only when
+///   `UnifyInnerTxIDs` is set (so before v34 every sibling hashes at the
+///   same offset).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InnerOffsetKind {
+    ChildId,
+    GroupHash { unify: bool },
+}
+
+/// The single place the inner-transaction offset formula lives; see
+/// [`InnerOffsetKind`]. `base` is the number of inner transactions the
+/// calling transaction has already submitted, `idx` the sibling index.
+pub(crate) fn inner_txn_offset(base: usize, idx: usize, kind: InnerOffsetKind) -> usize {
+    match kind {
+        InnerOffsetKind::ChildId | InnerOffsetKind::GroupHash { unify: true } => base + idx,
+        InnerOffsetKind::GroupHash { unify: false } => base,
+    }
+}
+
+/// Group ID of an inner transaction group, exactly as go's `opItxnSubmit`:
+/// `crypto.HashObj(TxGroup{TxGroupHashes})` over each sibling's
+/// `InnerID(parent, innerOffset)`, hashed with `Group` cleared.
+pub(crate) fn compute_inner_group_id<'t>(
+    parent: &algo_types::Digest,
+    base: usize,
+    unify: bool,
+    txns: impl Iterator<Item = &'t Transaction>,
+) -> algo_types::Digest {
+    let hashes: Vec<algo_types::Digest> = txns
+        .enumerate()
+        .map(|(itx, t)| {
+            let offset = inner_txn_offset(base, itx, InnerOffsetKind::GroupHash { unify });
+            if t.group == [0u8; 32] {
+                algo_avm::itxn::compute_inner_txn_id(parent, offset, t)
+            } else {
+                let mut cleared = t.clone();
+                cleared.group = [0u8; 32];
+                algo_avm::itxn::compute_inner_txn_id(parent, offset, &cleared)
+            }
+        })
+        .collect();
+    algo_codec::compute_group_id_from_hashes(&hashes)
+}
+
 // ---------------------------------------------------------------------------
 // AvmContext implementation
 // ---------------------------------------------------------------------------
@@ -6511,40 +6563,6 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         // The offset base for inner ID computation: number of already-submitted inner txns.
         let id_offset_base: usize = self.inner_txns.iter().map(|g| g.len()).sum();
 
-        // -- Inner group ID (go `opItxnSubmit`, eval.go `isGroup`) --
-        //
-        // A submit of more than one sub-transaction forms a group: each
-        // sibling's `InnerID(parent, innerOffset)` (computed with a still-zero
-        // Group; the AVM cannot set Group itself) is hashed as
-        // `crypto.HashObj(TxGroup{TxGroupHashes})` and the result is set on
-        // every sibling *before* execution, so each sibling's own InnerID /
-        // recorded ApplyData include it. `innerOffset` is the count of prior
-        // inner txns, plus the sibling index only under UnifyInnerTxIDs.
-        // Single-sub-transaction submits stay ungrouped.
-        if txns.len() > 1 {
-            let hashes: Vec<algo_types::Digest> = txns
-                .iter()
-                .enumerate()
-                .map(|(itx, s)| {
-                    let offset = id_offset_base
-                        + if self.consensus.unify_inner_tx_ids {
-                            itx
-                        } else {
-                            0
-                        };
-                    algo_avm::itxn::compute_inner_txn_id(&effective_parent_txid, offset, &s.txn)
-                })
-                .collect();
-            let encoded = algo_codec::canonical_encode_tx_group(&hashes);
-            let mut hasher = sha2::Sha512_256::new();
-            sha2::Digest::update(&mut hasher, b"TG");
-            sha2::Digest::update(&mut hasher, &encoded);
-            let group_id: [u8; 32] = sha2::Digest::finalize(hasher).into();
-            for s in txns.iter_mut() {
-                s.txn.group = group_id;
-            }
-        }
-
         // Use a running counter that accumulates across sibling inner txns.
         // This is critical when an earlier inner appl creates nested inner
         // txns that consume counter slots — the next sibling must see the
@@ -6685,6 +6703,29 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 self.store.set_account(&rekey_sender, rekey_account);
             }
 
+            // -- Inner group ID (go `opItxnSubmit`, eval.go `isGroup`) --
+            //
+            // A submit of more than one sub-transaction forms a group: every
+            // sibling gets the same `Group`, set *before* any sibling executes
+            // so each one's own InnerID, `global GroupID`, nested parent ID
+            // and recorded ApplyData include it. Single-sub-transaction
+            // submits stay ungrouped. Computed here (after the first
+            // sibling's authorization / fee / balance rejections) rather than
+            // up front so a submit that fails those cheap checks never pays
+            // for hashing the whole group; nothing before this point reads
+            // `Group`.
+            if i == 0 && txns.len() > 1 {
+                let group_id = compute_inner_group_id(
+                    &effective_parent_txid,
+                    id_offset_base,
+                    self.consensus.unify_inner_tx_ids,
+                    txns.iter().map(|s| &s.txn),
+                );
+                for s in txns.iter_mut() {
+                    s.txn.group = group_id.0;
+                }
+            }
+
             // Increment txn counter before execution (matches go-algorand incTxnCount).
             current_counter += 1;
             self.txn_counter = current_counter;
@@ -6701,7 +6742,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 // parent_txn_id for any nested inner txns it may create.
                 let appl_inner_id = algo_avm::itxn::compute_inner_txn_id(
                     &effective_parent_txid,
-                    id_offset_base + i,
+                    inner_txn_offset(id_offset_base, i, InnerOffsetKind::ChildId),
                     &txns[i].txn,
                 );
                 // H1: Snapshot box state to pass to inner context.
@@ -6962,11 +7003,25 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         for (i, stxn) in txns.iter().enumerate() {
             let id = algo_avm::itxn::compute_inner_txn_id(
                 &effective_parent_txid,
-                id_offset_base + i,
+                inner_txn_offset(id_offset_base, i, InnerOffsetKind::ChildId),
                 &stxn.txn,
             );
             ids.push(id);
         }
+        // The stored group id must be the hash recomputed over the FINAL
+        // siblings, so a later mutation of a sibling cannot silently drift.
+        debug_assert!(
+            txns.len() < 2
+                || txns[0].txn.group
+                    == compute_inner_group_id(
+                        &effective_parent_txid,
+                        id_offset_base,
+                        self.consensus.unify_inner_tx_ids,
+                        txns.iter().map(|s| &s.txn),
+                    )
+                    .0,
+            "inner group id drifted from the final siblings"
+        );
 
         // ── Track created resources (assets and apps) ──
         //
@@ -19483,5 +19538,403 @@ mod tests {
         );
         assert!(tracker.borrow().app_read_budget.is_empty());
         assert_eq!(num_empty_box_refs(&tracker), 0);
+    }
+}
+
+/// Inner-group `Group` ID parity with go-algorand's `opItxnSubmit`
+/// (`data/transactions/logic/eval.go`, issue #1699). The expected values here
+/// are derived by a hand-rolled, independent encoding of go's formula
+/// (`TX`/`TG` hashing) rather than by the production helpers.
+#[cfg(test)]
+mod inner_group_id_tests {
+    use super::*;
+    use crate::state::LedgerState;
+    use algo_avm::{parse, AvmMachine, ExecMode};
+    use algo_types::{AppParams, StateSchema};
+    use sha2::Sha512_256;
+    use std::collections::BTreeMap;
+
+    const A: u64 = 100;
+    const B: u64 = 200;
+
+    fn h(parts: &[&[u8]]) -> [u8; 32] {
+        let mut s = Sha512_256::new();
+        for p in parts {
+            s.update(p);
+        }
+        s.finalize().into()
+    }
+
+    /// go `Transaction.InnerID(parent, index)` over the txn exactly as given.
+    fn inner_id_as_is(parent: &[u8; 32], index: u64, t: &Transaction) -> [u8; 32] {
+        let enc = algo_codec::canonical_encode_transaction(t);
+        h(&[b"TX", parent, &index.to_be_bytes(), &enc])
+    }
+
+    /// `InnerID` with Group cleared (what go hashes into the group id).
+    fn inner_id_ungrouped(parent: &[u8; 32], index: u64, t: &Transaction) -> [u8; 32] {
+        let mut t = t.clone();
+        t.group = [0u8; 32];
+        inner_id_as_is(parent, index, &t)
+    }
+
+    /// go `opItxnSubmit`: group hash over `InnerID(parent, innerOffset)` where
+    /// `innerOffset = len(prior inner txns) (+ itx only if UnifyInnerTxIDs)`.
+    fn indep_group_id(
+        parent: &[u8; 32],
+        base: u64,
+        unify: bool,
+        txns: &[&Transaction],
+    ) -> [u8; 32] {
+        let mut enc = vec![0x81, 0xa6];
+        enc.extend_from_slice(b"txlist");
+        enc.push(0x90 | txns.len() as u8);
+        for (itx, t) in txns.iter().enumerate() {
+            let off = base + if unify { itx as u64 } else { 0 };
+            enc.extend_from_slice(&[0xc4, 0x20]);
+            enc.extend_from_slice(&inner_id_ungrouped(parent, off, t));
+        }
+        h(&[b"TG", &enc])
+    }
+
+    fn pushint(v: u8) -> Vec<u8> {
+        assert!(v < 128);
+        vec![0x81, v]
+    }
+    fn pushbytes(b: &[u8]) -> Vec<u8> {
+        let mut o = vec![0x80, b.len() as u8];
+        o.extend_from_slice(b);
+        o
+    }
+    fn prog(code: Vec<u8>) -> Vec<u8> {
+        let mut p = vec![6u8];
+        p.extend(code);
+        p
+    }
+    /// `itxn_field <f>` with the value already pushed.
+    fn field(f: u8) -> Vec<u8> {
+        vec![0xb2, f]
+    }
+    fn pay_fields(recv: u8, amt: u8) -> Vec<u8> {
+        let mut c = pushint(1);
+        c.extend(field(16));
+        c.extend(pushbytes(&[recv; 32]));
+        c.extend(field(7));
+        c.extend(pushint(amt));
+        c.extend(field(8));
+        c
+    }
+    fn appl_fields(app: u64) -> Vec<u8> {
+        let mut c = pushint(6);
+        c.extend(field(16));
+        c.push(0x81);
+        let mut x = app;
+        loop {
+            let b = (x & 0x7f) as u8;
+            x >>= 7;
+            if x == 0 {
+                c.push(b);
+                break;
+            }
+            c.push(b | 0x80);
+        }
+        c.extend(field(24));
+        c
+    }
+    /// One `itxn_submit` per entry; each entry is a list of per-txn fragments.
+    fn submit_groups(groups: &[Vec<Vec<u8>>]) -> Vec<u8> {
+        let mut c = Vec::new();
+        for g in groups {
+            c.push(0xb1);
+            for (i, t) in g.iter().enumerate() {
+                if i > 0 {
+                    c.push(0xb6);
+                }
+                c.extend(t);
+            }
+            c.push(0xb3);
+        }
+        c.extend(pushint(1));
+        c.push(0x43);
+        c
+    }
+
+    fn seed(store: &mut LedgerState, id: u64, approval: Vec<u8>) {
+        store.set_app_params(
+            id,
+            AppParams {
+                creator: Address([1u8; 32]),
+                approval_program: approval,
+                clear_state_program: prog(vec![0x81, 1]),
+                global_state: BTreeMap::new(),
+                local_state_schema: StateSchema {
+                    num_uint: 4,
+                    num_byte_slice: 4,
+                },
+                global_state_schema: StateSchema {
+                    num_uint: 4,
+                    num_byte_slice: 4,
+                },
+                extra_program_pages: 0,
+                ..Default::default()
+            },
+        );
+        let acct = store.get_or_default_account_mut(&Address(app_address(id)));
+        acct.micro_algos = 10_000_000;
+    }
+
+    fn outer_txn() -> SignedTransaction {
+        SignedTransaction {
+            txn: Transaction {
+                txn_type: "appl".into(),
+                sender: Address([0xAA; 32]),
+                fee: 1000,
+                first_valid: 100.into(),
+                last_valid: 200.into(),
+                application_id: A,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    type RunOut = (
+        Vec<Vec<SignedTransaction>>,
+        Vec<Vec<algo_types::Digest>>,
+        [u8; 32],
+    );
+
+    /// Run app A's `a_code` as the outer app call; returns recorded inner
+    /// groups, their ids and the outer txid.
+    fn run(store: &mut LedgerState, a_code: Vec<u8>, unify: bool) -> RunOut {
+        let outer = outer_txn();
+        let outer_id = algo_codec::compute_txn_id(&outer.txn).0;
+        let mut ctx = LedgerAvmContext::new(
+            store,
+            vec![outer],
+            0,
+            100,
+            50000,
+            A,
+            [1u8; 32],
+            true,
+            [0u8; 32],
+            [0u8; 32],
+            ConsensusParams::default(),
+        );
+        ctx.set_program_version(6);
+        ctx.consensus.unify_inner_tx_ids = unify;
+        ctx.fee_sink = Address([0xFE; 32]);
+        ctx.store.get_or_default_account_mut(&Address([0xFE; 32]));
+        ctx.fee_credit = 1_000_000;
+        ctx.txn_counter = 300;
+        let program = parse(&prog(a_code)).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20_000);
+        assert!(m.run(&mut ctx).unwrap(), "app A must approve");
+        (
+            ctx.inner_txns().to_vec(),
+            ctx.inner_txn_ids().to_vec(),
+            outer_id,
+        )
+    }
+
+    fn fresh_store() -> LedgerState {
+        let mut s = LedgerState::new();
+        seed(&mut s, A, prog(vec![0x81, 1]));
+        s
+    }
+
+    #[test]
+    fn second_submit_in_same_call_uses_prior_inner_count_as_offset() {
+        for unify in [true, false] {
+            let mut store = fresh_store();
+            let g = vec![pay_fields(0xB1, 1), pay_fields(0xB2, 2)];
+            let (groups, _, outer_id) =
+                run(&mut store, submit_groups(&[g.clone(), g.clone()]), unify);
+            assert_eq!(groups.len(), 2);
+            for (gi, grp) in groups.iter().enumerate() {
+                // len(EvalDelta.InnerTxns) before this submit
+                let base = (gi * 2) as u64;
+                let refs: Vec<&Transaction> = grp.iter().map(|s| &s.txn).collect();
+                let want = indep_group_id(&outer_id, base, unify, &refs);
+                for s in grp {
+                    assert_eq!(s.txn.group, want, "group {gi} unify={unify}");
+                }
+            }
+            assert_ne!(groups[0][0].txn.group, groups[1][0].txn.group);
+        }
+    }
+
+    #[test]
+    fn child_ids_use_prior_count_plus_index_in_both_modes() {
+        // go `getTxID` / `getTxIDNotUnified`: a child's own TxID offset is
+        // always `len(prior inner txns) + groupIndex`, over the txn WITH its
+        // Group set; only the group-hash offset drops the sibling index
+        // before UnifyInnerTxIDs.
+        for unify in [true, false] {
+            let mut store = fresh_store();
+            let g = vec![pay_fields(0xB1, 1), pay_fields(0xB2, 2)];
+            let (groups, ids, outer_id) =
+                run(&mut store, submit_groups(&[g.clone(), g.clone()]), unify);
+            for gi in 0..2 {
+                for i in 0..2 {
+                    let t = &groups[gi][i].txn;
+                    assert_ne!(t.group, [0u8; 32]);
+                    let want = inner_id_as_is(&outer_id, (gi * 2 + i) as u64, t);
+                    assert_eq!(ids[gi][i].0, want, "gi={gi} i={i} unify={unify}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_inner_appl_group_uses_parent_per_consensus_mode() {
+        for unify in [true, false] {
+            let mut store = fresh_store();
+            // B submits a 2-pay group.
+            let b = submit_groups(&[vec![pay_fields(0xC1, 1), pay_fields(0xC2, 2)]]);
+            seed(&mut store, B, prog(b));
+            let (groups, ids, outer_id) =
+                run(&mut store, submit_groups(&[vec![appl_fields(B)]]), unify);
+            let call = &groups[0][0];
+            assert_eq!(call.txn.group, [0u8; 32], "single inner call is ungrouped");
+            let ed =
+                crate::eval_delta::parse_eval_delta(call.eval_delta.as_ref().unwrap()).unwrap();
+            let nested = ed.inner_txns.expect("nested inner txns recorded");
+            assert_eq!(nested.len(), 2);
+            // go: parent = currentTxID() of the inner appl: its InnerID under
+            // UnifyInnerTxIDs, the raw hash of the txn before v34.
+            let parent = if unify {
+                inner_id_as_is(&outer_id, 0, &call.txn)
+            } else {
+                algo_codec::compute_txn_id(&call.txn).0
+            };
+            assert_eq!(ids[0][0].0, inner_id_as_is(&outer_id, 0, &call.txn));
+            let refs: Vec<&Transaction> = nested.iter().map(|s| &s.txn).collect();
+            let want = indep_group_id(&parent, 0, unify, &refs);
+            assert_ne!(want, [0u8; 32]);
+            for s in &nested {
+                assert_eq!(s.txn.group, want, "unify={unify}");
+            }
+        }
+    }
+
+    #[test]
+    fn global_group_id_and_txid_inside_grouped_inner_appl() {
+        for unify in [true, false] {
+            let mut store = fresh_store();
+            // B: global["g"] = global GroupID.
+            let mut bc = pushbytes(b"g");
+            bc.extend([0x32, 11, 0x67]); // global GroupID; app_global_put
+            bc.extend(pushint(1));
+            bc.push(0x43);
+            seed(&mut store, B, prog(bc));
+            let (groups, ids, outer_id) = run(
+                &mut store,
+                submit_groups(&[vec![appl_fields(B), pay_fields(0xB1, 1)]]),
+                unify,
+            );
+            let grp = &groups[0];
+            let refs: Vec<&Transaction> = grp.iter().map(|s| &s.txn).collect();
+            let want_group = indep_group_id(&outer_id, 0, unify, &refs);
+            assert_eq!(grp[0].txn.group, want_group);
+            // The inner appl's own TxID reflects the grouped transaction.
+            let own = inner_id_as_is(&outer_id, 0, &grp[0].txn);
+            assert_eq!(ids[0][0].0, own);
+            assert_ne!(
+                own,
+                inner_id_ungrouped(&outer_id, 0, &grp[0].txn),
+                "Group must be part of the hashed transaction"
+            );
+            let gs = &store.get_app_params(B).unwrap().global_state;
+            assert_eq!(
+                gs.get(b"g".as_slice()),
+                Some(&TealValue::Bytes(want_group.to_vec())),
+                "global GroupID inside the inner appl = the group id (unify={unify})"
+            );
+        }
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Golden vector from real mainnet data: round 65689687, payset txn 7
+    /// (an axfer + appl inner group, the first submit so base == 0). The
+    /// inner transactions are the msgpack go recorded (Group removed); the
+    /// parent is the top-level txid; the expected value is the recorded `grp`.
+    #[test]
+    fn golden_mainnet_round_65689687_inner_group_id() {
+        let parent = algo_types::Digest(
+            unhex("dc7cc32546f3a54eda488a7580dc1670a599592d089d4231ef42390896d5a404")
+                .try_into()
+                .unwrap(),
+        );
+        let t0 = unhex(
+            "87a461616d74ce00989680a461726376c420d3d05cdbbb89c522cb0c11681b72ee15dcc0feeec4250f28d3daaa64cd7c3b3ca26676ce03ea5854a26c76ce03ea58b8a3736e64c420b4169e69cc515d8312c87b08adbf907fb638a1c9e8062faf6b439e92bebf09b5a474797065a56178666572a478616964ce01e1ab70",
+        );
+        let t1 = unhex(
+            "88a46170616193c40473776170c40b66697865642d696e707574c4080000000000000000a46170617392ce01e1ab7000a46170617491c420d3d05cdbbb89c522cb0c11681b72ee15dcc0feeec4250f28d3daaa64cd7c3b3ca461706964ce3bc1931da26676ce03ea5854a26c76ce03ea58b8a3736e64c420b4169e69cc515d8312c87b08adbf907fb638a1c9e8062faf6b439e92bebf09b5a474797065a46170706c",
+        );
+        let txns: Vec<Transaction> = [t0, t1]
+            .iter()
+            .map(|b| rmp_serde::from_slice::<Transaction>(b).expect("decode inner txn"))
+            .collect();
+        let want = unhex("b3d7dd39669097e4e8dbe8c3965451104b36ee1482b11af6e93656a2e96d0f89");
+        // Mainnet is post-v34 (UnifyInnerTxIDs).
+        let got = compute_inner_group_id(&parent, 0, true, txns.iter());
+        assert_eq!(got.0.to_vec(), want);
+        // Clearing is idempotent: a sibling already carrying the group hashes
+        // identically (go hashes with Group cleared).
+        let mut grouped = txns.clone();
+        for t in &mut grouped {
+            t.group = got.0;
+        }
+        assert_eq!(
+            compute_inner_group_id(&parent, 0, true, grouped.iter())
+                .0
+                .to_vec(),
+            want
+        );
+    }
+
+    #[test]
+    fn offset_helper_pins_go_formulas_for_both_modes() {
+        use InnerOffsetKind::*;
+        for idx in 0..3 {
+            // Child ids: prior count + index in both consensus modes.
+            assert_eq!(inner_txn_offset(4, idx, ChildId), 4 + idx);
+            // Group hash: sibling index only under UnifyInnerTxIDs.
+            assert_eq!(inner_txn_offset(4, idx, GroupHash { unify: true }), 4 + idx);
+            assert_eq!(inner_txn_offset(4, idx, GroupHash { unify: false }), 4);
+        }
+    }
+
+    #[test]
+    fn stored_group_id_equals_hash_over_final_siblings() {
+        for unify in [true, false] {
+            let mut store = fresh_store();
+            let g = vec![
+                pay_fields(0xB1, 1),
+                pay_fields(0xB2, 2),
+                pay_fields(0xB3, 3),
+            ];
+            let (groups, _, outer_id) =
+                run(&mut store, submit_groups(&[g.clone(), g.clone()]), unify);
+            for (gi, grp) in groups.iter().enumerate() {
+                let recomputed = compute_inner_group_id(
+                    &algo_types::Digest(outer_id),
+                    gi * 3,
+                    unify,
+                    grp.iter().map(|s| &s.txn),
+                );
+                for s in grp {
+                    assert_eq!(s.txn.group, recomputed.0, "gi={gi} unify={unify}");
+                }
+            }
+        }
     }
 }
