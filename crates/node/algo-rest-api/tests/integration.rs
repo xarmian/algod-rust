@@ -7315,6 +7315,109 @@ async fn pending_transaction_info_with_bytes_state_delta() {
     assert!(entry["value"].get("uint").is_none());
 }
 
+/// Issue #1698: the REST `action` field must carry go's `basics.DeltaAction`
+/// numbers (`data/basics/teal.go`: SetBytesAction = 1, SetUintAction = 2).
+/// The `gd` entries are taken verbatim from mainnet round 65703970 (txn 12):
+/// `block` is a uint (`at=2`) and `current_miner` is a 32-byte value (`at=1`).
+/// The wire map is built from literal go numbers (not `DeltaAction`), so an
+/// independent remap in the handler path would be caught.
+#[tokio::test]
+async fn pending_transaction_info_state_delta_action_numbers_match_go_mainnet_entries() {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    let mut node = MockNode::synced();
+    let stxn = make_test_signed_txn();
+    let txid = algo_codec::compute_txn_id(&stxn.txn);
+    let txid_str = txid.to_string();
+
+    let miner: Vec<u8> = (0..32u8)
+        .map(|i| i.wrapping_mul(7).wrapping_add(3))
+        .collect();
+    let eval_delta = rmpv::Value::Map(vec![(
+        rmpv::Value::String("gd".into()),
+        rmpv::Value::Map(vec![
+            (
+                rmpv::Value::Binary(b"block".to_vec()),
+                rmpv::Value::Map(vec![
+                    (
+                        rmpv::Value::String("at".into()),
+                        rmpv::Value::Integer(2.into()),
+                    ),
+                    (
+                        rmpv::Value::String("ui".into()),
+                        rmpv::Value::Integer(65_703_970u64.into()),
+                    ),
+                ]),
+            ),
+            (
+                rmpv::Value::Binary(b"current_miner".to_vec()),
+                rmpv::Value::Map(vec![
+                    (
+                        rmpv::Value::String("at".into()),
+                        rmpv::Value::Integer(1.into()),
+                    ),
+                    (
+                        rmpv::Value::String("bs".into()),
+                        rmpv::Value::Binary(miner.clone()),
+                    ),
+                ]),
+            ),
+        ]),
+    )]);
+
+    node.pending_txn_lookup.insert(
+        txid.0,
+        TxnWithStatus {
+            txn: stxn,
+            confirmed_round: 100,
+            pool_error: String::new(),
+            closing_amount: 0,
+            asset_closing_amount: 0,
+            sender_rewards: 0,
+            receiver_rewards: 0,
+            close_rewards: 0,
+            asset_index: None,
+            application_index: None,
+            eval_delta: Some(eval_delta),
+            logs: None,
+            inner_txns: None,
+        },
+    );
+    let server = TestServer::start(node).await;
+
+    let url = format!("/v2/transactions/pending/{}", txid_str);
+    let resp = server
+        .client
+        .get(server.url(&url))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    let gsd = json["global-state-delta"]
+        .as_array()
+        .expect("global-state-delta");
+    assert_eq!(gsd.len(), 2);
+    let find = |key: &[u8]| {
+        let k = STANDARD.encode(key);
+        gsd.iter()
+            .find(|e| e["key"].as_str() == Some(k.as_str()))
+            .unwrap()
+    };
+    let uint_entry = find(b"block");
+    assert_eq!(uint_entry["value"]["action"].as_u64().unwrap(), 2);
+    assert_eq!(uint_entry["value"]["uint"].as_u64().unwrap(), 65_703_970);
+    let bytes_entry = find(b"current_miner");
+    assert_eq!(bytes_entry["value"]["action"].as_u64().unwrap(), 1);
+    assert_eq!(
+        bytes_entry["value"]["bytes"].as_str().unwrap(),
+        STANDARD.encode(&miner)
+    );
+}
+
 #[tokio::test]
 async fn pending_transaction_info_no_eval_delta_when_unconfirmed() {
     let mut node = MockNode::synced();
@@ -7327,10 +7430,16 @@ async fn pending_transaction_info_no_eval_delta_when_unconfirmed() {
         rmpv::Value::String("gd".into()),
         rmpv::Value::Map(vec![(
             rmpv::Value::Binary(b"counter".to_vec()),
-            rmpv::Value::Map(vec![(
-                rmpv::Value::String("at".into()),
-                rmpv::Value::Integer(3.into()),
-            )]),
+            rmpv::Value::Map(vec![
+                (
+                    rmpv::Value::String("at".into()),
+                    rmpv::Value::Integer(2.into()), // SetUintAction
+                ),
+                (
+                    rmpv::Value::String("ui".into()),
+                    rmpv::Value::Integer(5.into()),
+                ),
+            ]),
         )]),
     )]);
 
