@@ -3436,3 +3436,97 @@ fn fee_credit_mixed_fees_in_group() {
     let result = run_with_context(6, &code, &mut ctx).unwrap();
     assert!(result, "mixed fee group should succeed with credit pooling");
 }
+
+// ===========================================================================
+// Inner group IDs (issue #1699)
+// ===========================================================================
+
+/// Hand-rolled go `crypto.HashObj(transactions.TxGroup{TxGroupHashes: ids})`:
+/// `SHA512/256("TG" || msgpack({"txlist": [bin32, ...]}))`.
+fn go_group_id_of(ids: &[[u8; 32]]) -> [u8; 32] {
+    use sha2::{Digest as _, Sha512_256};
+    let mut enc = vec![0x81, 0xa6];
+    enc.extend_from_slice(b"txlist");
+    assert!(ids.len() < 16);
+    enc.push(0x90 | ids.len() as u8);
+    for id in ids {
+        enc.extend_from_slice(&[0xc4, 0x20]);
+        enc.extend_from_slice(id);
+    }
+    let mut h = Sha512_256::new();
+    h.update(b"TG");
+    h.update(&enc);
+    h.finalize().into()
+}
+
+/// Run an app that submits `n_group` pays as ONE inner group.
+fn run_inner_group_of(n_group: usize, unify: bool) -> (Vec<SignedTransaction>, [u8; 32]) {
+    let app_id = 42u64;
+    let mut store = LedgerState::new();
+    seed_app_approve(&mut store, app_id, Address([1u8; 32]));
+    fund_account(&mut store, Address(app_address(app_id)), 10_000_000);
+    let txn = make_appl_txn([0xAA; 32], app_id);
+    let parent_id = algo_codec::compute_txn_id(&txn.txn).0;
+    let mut ctx = make_context(&mut store, vec![txn], app_id);
+    ctx.consensus.unify_inner_tx_ids = unify;
+    ctx.fee_sink = Address([0xFE; 32]);
+    fund_account(ctx.store, Address([0xFE; 32]), 0);
+    ctx.fee_credit = 100_000;
+
+    let mut code = Vec::new();
+    code.push(0xb1);
+    for i in 0..n_group {
+        if i > 0 {
+            code.push(0xb6);
+        }
+        code.extend(pushint(1));
+        code.extend([0xb2, 16]);
+        code.extend(pushbytes(&[0xB0 + i as u8; 32]));
+        code.extend([0xb2, 7]);
+        code.extend(pushint(100 + i as u64));
+        code.extend([0xb2, 8]);
+    }
+    code.push(0xb3);
+    code.extend(pushint(1));
+    code.push(0x43);
+    assert!(run_with_context(6, &code, &mut ctx).unwrap());
+    (ctx.inner_txns()[0].clone(), parent_id)
+}
+
+fn expected_inner_group_id(group: &[SignedTransaction], parent: [u8; 32], unify: bool) -> [u8; 32] {
+    // go: Digest(txn.InnerID(parent, innerOffset)) with Group still zero;
+    // innerOffset = len(prior inner txns) (+ itx under UnifyInnerTxIDs).
+    let ids: Vec<[u8; 32]> = group
+        .iter()
+        .enumerate()
+        .map(|(itx, s)| {
+            let mut t = s.txn.clone();
+            t.group = [0u8; 32];
+            let off = if unify { itx } else { 0 };
+            algo_avm::itxn::compute_inner_txn_id(&algo_types::Digest(parent), off, &t).0
+        })
+        .collect();
+    go_group_id_of(&ids)
+}
+
+#[test]
+fn inner_group_gets_shared_go_group_id_two_and_three() {
+    for unify in [true, false] {
+        for n in [2usize, 3] {
+            let (group, parent) = run_inner_group_of(n, unify);
+            assert_eq!(group.len(), n);
+            let want = expected_inner_group_id(&group, parent, unify);
+            assert_ne!(want, [0u8; 32]);
+            for s in &group {
+                assert_eq!(s.txn.group, want, "n={n} unify={unify}");
+            }
+        }
+    }
+}
+
+#[test]
+fn single_inner_txn_keeps_zero_group() {
+    let (group, _) = run_inner_group_of(1, true);
+    assert_eq!(group.len(), 1);
+    assert_eq!(group[0].txn.group, [0u8; 32]);
+}

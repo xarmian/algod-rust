@@ -6511,6 +6511,40 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         // The offset base for inner ID computation: number of already-submitted inner txns.
         let id_offset_base: usize = self.inner_txns.iter().map(|g| g.len()).sum();
 
+        // -- Inner group ID (go `opItxnSubmit`, eval.go `isGroup`) --
+        //
+        // A submit of more than one sub-transaction forms a group: each
+        // sibling's `InnerID(parent, innerOffset)` (computed with a still-zero
+        // Group; the AVM cannot set Group itself) is hashed as
+        // `crypto.HashObj(TxGroup{TxGroupHashes})` and the result is set on
+        // every sibling *before* execution, so each sibling's own InnerID /
+        // recorded ApplyData include it. `innerOffset` is the count of prior
+        // inner txns, plus the sibling index only under UnifyInnerTxIDs.
+        // Single-sub-transaction submits stay ungrouped.
+        if txns.len() > 1 {
+            let hashes: Vec<algo_types::Digest> = txns
+                .iter()
+                .enumerate()
+                .map(|(itx, s)| {
+                    let offset = id_offset_base
+                        + if self.consensus.unify_inner_tx_ids {
+                            itx
+                        } else {
+                            0
+                        };
+                    algo_avm::itxn::compute_inner_txn_id(&effective_parent_txid, offset, &s.txn)
+                })
+                .collect();
+            let encoded = algo_codec::canonical_encode_tx_group(&hashes);
+            let mut hasher = sha2::Sha512_256::new();
+            sha2::Digest::update(&mut hasher, b"TG");
+            sha2::Digest::update(&mut hasher, &encoded);
+            let group_id: [u8; 32] = sha2::Digest::finalize(hasher).into();
+            for s in txns.iter_mut() {
+                s.txn.group = group_id;
+            }
+        }
+
         // Use a running counter that accumulates across sibling inner txns.
         // This is critical when an earlier inner appl creates nested inner
         // txns that consume counter slots — the next sibling must see the
