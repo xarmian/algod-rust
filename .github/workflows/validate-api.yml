@@ -10,15 +10,13 @@ name: Dual-Node REST Conformance
 # docker/docker-compose.validate-api.yml's header comment), and diffs live
 # HTTP responses byte-for-byte where a shared genesis makes that meaningful.
 #
-# Invariant: this job must run for any change that can alter block
-# production, storage encoding or REST output. The filters therefore cover
-# the source, manifests and build scripts of every consensus and REST crate
-# (crates/**/Cargo.toml, build.rs, src/**) and everything in the REST crate
-# (including its resources), plus bin/** (which holds this job's own tests,
-# bin/algod-rust/tests), docker/**, the root manifests and the Makefile. It
-# deliberately skips the unit/integration tests and benches of the other
-# crates, which cannot change what a node produces or serves. Also
-# dispatchable manually.
+# Invariant: this job runs unless the change is docs/tooling only. Every
+# other input (crate sources, manifests, build scripts, C sources, toolchain
+# and cargo config, bundled resources, docker, tests) can change what a node
+# produces, stores or serves, so the filter is "everything except" an
+# allow-list of inert paths rather than an include-list that can go stale.
+# The pull_request and push lists below are duplicated: keep them in sync.
+# Also dispatchable manually.
 #
 # No go-algorand-from-source build is needed here (unlike algokey-e2e.yml)
 # -- the go side uses the prebuilt `algorand/algod` image directly, and
@@ -30,31 +28,25 @@ name: Dual-Node REST Conformance
 on:
   pull_request:
     paths:
-      - "crates/**/Cargo.toml"
-      - "crates/**/build.rs"
-      - "crates/core/**/src/**"
-      - "crates/node/**/src/**"
-      - "crates/node/algo-rest-api/**"
-      - "bin/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "docker/**"
-      - "Makefile"
-      - ".github/workflows/validate-api.yml"
+      - "**"
+      - "!docs/**"
+      - "!**/*.md"
+      - "!.claude/**"
+      - "!ops/**"
+      - "!scripts/**"
+      - "!.github/ISSUE_TEMPLATE/**"
+      - "!crates/**/benches/**"
   push:
     branches: [main]
     paths:
-      - "crates/**/Cargo.toml"
-      - "crates/**/build.rs"
-      - "crates/core/**/src/**"
-      - "crates/node/**/src/**"
-      - "crates/node/algo-rest-api/**"
-      - "bin/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "docker/**"
-      - "Makefile"
-      - ".github/workflows/validate-api.yml"
+      - "**"
+      - "!docs/**"
+      - "!**/*.md"
+      - "!.claude/**"
+      - "!ops/**"
+      - "!scripts/**"
+      - "!.github/ISSUE_TEMPLATE/**"
+      - "!crates/**/benches/**"
   workflow_dispatch:
 
 concurrency:

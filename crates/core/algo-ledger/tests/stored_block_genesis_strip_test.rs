@@ -23,10 +23,12 @@
 //! *stored* must stay in go's stripped `SignedTxnInBlock` form: `hgi` set,
 //! empty `gen`, zero `gh`, `hgh` unset when the protocol requires the hash
 //! (and set when it is optional and the submitter included it).
+//! The pay-only Execute tests and the app-call test cover the Execute path
+//! (where the restored copy exists); one test covers the real dispatch.
 //! The app-call test pins both halves: evaluation sees the full transaction
 //! (`txn TxID`), the stored bytes stay stripped.
 
-use algo_ledger::apply::apply_block_executing_app_calls;
+use algo_ledger::apply::{apply_block_executing_app_calls, apply_block_with_mode, ApplyMode};
 use algo_ledger::{LedgerState, LedgerStore};
 use algo_types::consensus::{consensus_params_for_version, CONSENSUS_V15, CONSENSUS_V41};
 use algo_types::{Address, Block, BoxRef, Round, SignedTransaction};
@@ -87,20 +89,33 @@ fn stored_block(state: &LedgerState, expected_txns: usize) -> Block {
     stored
 }
 
-#[test]
-fn pay_only_block_is_stored_stripped_on_hash_requiring_protocol() {
-    assert!(
-        consensus_params_for_version(CONSENSUS_V41)
-            .unwrap()
-            .require_genesis_hash,
-        "this case is about a protocol that requires the genesis hash"
-    );
+fn pay_block(proto: &str, hgh: bool) -> (LedgerState, Block) {
     let sender = Address([1u8; 32]);
-    let mut state = funded_state(sender);
+    let state = funded_state(sender);
     let mut stx = stripped_stx("pay", sender);
     stx.txn.receiver = Address([2u8; 32]);
     stx.txn.amount = 1_000_000;
-    apply_block_executing_app_calls(&mut state, &stripped_block(CONSENSUS_V41, vec![stx])).unwrap();
+    stx.has_genesis_hash = hgh;
+    (state, stripped_block(proto, vec![stx]))
+}
+
+fn assert_requires_hash(proto: &str, required: bool) {
+    assert_eq!(
+        consensus_params_for_version(proto)
+            .unwrap()
+            .require_genesis_hash,
+        required,
+        "unexpected require_genesis_hash for {proto}"
+    );
+}
+
+/// Execute is the mode where the evaluation copy has its genesis fields
+/// restored, i.e. where the #1703 regression lived: call it explicitly.
+#[test]
+fn execute_pay_block_is_stored_stripped_on_hash_requiring_protocol() {
+    assert_requires_hash(CONSENSUS_V41, true);
+    let (mut state, block) = pay_block(CONSENSUS_V41, false);
+    apply_block_with_mode(&mut state, &block, ApplyMode::Execute).unwrap();
     let stored = stored_block(&state, 1);
     assert!(
         !stored.payset[0].has_genesis_hash,
@@ -109,22 +124,24 @@ fn pay_only_block_is_stored_stripped_on_hash_requiring_protocol() {
 }
 
 #[test]
-fn pay_only_block_keeps_hgh_on_hash_optional_protocol() {
-    assert!(
-        !consensus_params_for_version(CONSENSUS_V15)
-            .unwrap()
-            .require_genesis_hash,
-        "this case is about a protocol where the genesis hash is optional"
-    );
-    let sender = Address([1u8; 32]);
-    let mut state = funded_state(sender);
-    let mut stx = stripped_stx("pay", sender);
-    stx.txn.receiver = Address([2u8; 32]);
-    stx.txn.amount = 1_000_000;
-    stx.has_genesis_hash = true; // submitter included gh; stripped on store
-    apply_block_executing_app_calls(&mut state, &stripped_block(CONSENSUS_V15, vec![stx])).unwrap();
+fn execute_pay_block_keeps_hgh_on_hash_optional_protocol() {
+    assert_requires_hash(CONSENSUS_V15, false);
+    // The submitter included gh; it is stripped on store and hgh records it.
+    let (mut state, block) = pay_block(CONSENSUS_V15, true);
+    apply_block_with_mode(&mut state, &block, ApplyMode::Execute).unwrap();
     let stored = stored_block(&state, 1);
     assert!(stored.payset[0].has_genesis_hash, "hgh must be preserved");
+}
+
+/// The real follow-path dispatch: a pay-only block takes the Replay path
+/// there (no Execute), and must be stored stripped as well.
+#[test]
+fn dispatch_pay_only_block_is_stored_stripped() {
+    assert_requires_hash(CONSENSUS_V41, true);
+    let (mut state, block) = pay_block(CONSENSUS_V41, false);
+    apply_block_executing_app_calls(&mut state, &block).unwrap();
+    let stored = stored_block(&state, 1);
+    assert!(!stored.payset[0].has_genesis_hash);
 }
 
 /// Both halves of the invariant in one test: the AVM sees the id of the FULL
