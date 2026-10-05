@@ -756,6 +756,31 @@ fn main_loop<L, K, BF, R>(
     info!("agreement main loop exited");
 }
 
+/// Upper bound on one persisted agreement snapshot. Go's snapshot is a few
+/// blocks at most; SQLite's default blob limit is 1 GB.
+const MAX_PERSIST_BYTES: usize = 128 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+enum PersistFailure {
+    TooLarge = 1,
+    WriteFailed = 2,
+    TimedOut = 3,
+}
+
+/// Cause of the most recent persistence failure still "active" (0 = none).
+static PERSIST_LAST_FAILURE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Log a persistence failure at WARN once per cause; repeats of the same
+/// cause drop to DEBUG until a write succeeds or the cause changes.
+fn warn_persist_once(cause: PersistFailure, msg: &str) {
+    let prev = PERSIST_LAST_FAILURE.swap(cause as u8, Ordering::Relaxed);
+    if prev == cause as u8 {
+        tracing::debug!("{msg}");
+    } else {
+        warn!("{msg}");
+    }
+}
+
 /// Execute a single pseudonode action and collect resulting events.
 ///
 /// Mirrors Go's `pseudonodeAction.do(ctx, s)`. Results are converted to
@@ -923,8 +948,25 @@ fn execute_pseudonode_action(
                 // Mirrors go-algorand's encode-fresh-each-checkpoint
                 // pattern in `agreement/service.go:282`.
                 let clock_state = ClockState::with_zero(SystemTime::now());
+                let persist_started = std::time::Instant::now();
                 match persistence::encode(p_router, p_player, &clock_state, p_actions) {
+                    Ok(raw) if raw.len() > MAX_PERSIST_BYTES => {
+                        // Far above anything Go persists (a few blocks at
+                        // most); SQLite would reject it past 1 GB. Skip this
+                        // attest without touching the stored snapshot so the
+                        // previous, valid crash-recovery record survives.
+                        warn_persist_once(
+                            PersistFailure::TooLarge,
+                            &format!(
+                                "persistence snapshot of {} bytes exceeds the {} byte cap, skipping attest",
+                                raw.len(),
+                                MAX_PERSIST_BYTES
+                            ),
+                        );
+                        false
+                    }
                     Ok(raw) if !raw.is_empty() => {
+                        let raw_len = raw.len();
                         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
                         let (events_tx, _events_rx) = crossbeam_channel::bounded(1);
 
@@ -945,15 +987,32 @@ fn execute_pseudonode_action(
                         // just block here until it signals completion.
                         const PERSIST_TIMEOUT: Duration = Duration::from_secs(5);
                         match done_rx.recv_timeout(PERSIST_TIMEOUT) {
-                            Ok(Ok(())) => true,
+                            Ok(Ok(())) => {
+                                PERSIST_LAST_FAILURE.store(0, Ordering::Relaxed);
+                                tracing::debug!(
+                                    event = "agreement_persist",
+                                    bytes = raw_len,
+                                    elapsed_ms = persist_started.elapsed().as_millis() as u64,
+                                    round = pa.round.0,
+                                    "persisted agreement state"
+                                );
+                                true
+                            }
                             Ok(Err(e)) => {
-                                warn!("persistence write failed, skipping attest: {}", e);
+                                warn_persist_once(
+                                    PersistFailure::WriteFailed,
+                                    &format!(
+                                        "persistence write failed ({raw_len} bytes), skipping attest: {e}"
+                                    ),
+                                );
                                 false
                             }
                             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                                warn!(
-                                    "persistence write timed out after {:?}, skipping attest",
-                                    PERSIST_TIMEOUT
+                                warn_persist_once(
+                                    PersistFailure::TimedOut,
+                                    &format!(
+                                        "persistence write ({raw_len} bytes) timed out after {PERSIST_TIMEOUT:?}, skipping attest"
+                                    ),
                                 );
                                 false
                             }

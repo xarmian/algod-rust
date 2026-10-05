@@ -65,6 +65,22 @@ pub struct ProposalManager {
 }
 
 impl ProposalManager {
+    /// Drop per-round proposal stores older than `keep_from`.
+    ///
+    /// In Go each `roundRouter` owns its `proposalStore`, so the root
+    /// router's round GC (`rootRouter.update`) frees it together with the
+    /// round. Here the stores are hoisted into this map, so the same GC must
+    /// be applied explicitly or the map (and the persisted crash snapshot)
+    /// grows by one block-carrying store per round.
+    pub fn retain_rounds_from(&mut self, keep_from: Round) {
+        self.stores.retain(|&r, _| r >= keep_from);
+    }
+
+    /// Number of rounds currently holding a proposal store.
+    pub fn round_count(&self) -> usize {
+        self.stores.len()
+    }
+
     /// Get or create a ProposalStore for the given round.
     fn store_for(&mut self, round: Round) -> &mut ProposalStore {
         self.stores.entry(round).or_default()
