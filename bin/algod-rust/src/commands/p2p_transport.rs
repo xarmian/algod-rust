@@ -597,21 +597,18 @@ fn spawn_ws_peer(
                 // frames share this same per-peer write queue/task with
                 // time-critical agreement votes, so a large uncompressed
                 // proposal write can delay a vote queued right behind it.
-                let proposal_compressed = match compress_outgoing_proposal(
-                    tag,
-                    &payload,
-                    negotiated_features,
-                ) {
-                    Ok(frame) => frame,
-                    Err(e) => {
-                        tracing::warn!(
-                            %peer_id,
-                            error = %e,
-                            "P2P algorand-ws stream: PP compression failed, sending uncompressed"
-                        );
-                        None
-                    }
-                };
+                let proposal_compressed =
+                    match compress_outgoing_proposal(tag, &payload, negotiated_features) {
+                        Ok(frame) => frame,
+                        Err(e) => {
+                            tracing::warn!(
+                                %peer_id,
+                                error = %e,
+                                "P2P algorand-ws stream: PP compression failed, sending uncompressed"
+                            );
+                            None
+                        }
+                    };
 
                 let frame = if let Some(frame) = vote_compressed {
                     frame
