@@ -580,5 +580,285 @@ class CollectUnreachableGraceTest(unittest.TestCase):
             monitor.fetch_status = monitor_fetch_orig
 
 
+# --- nodelog: detailed phases, scan, follow window ---------------------------
+
+import nodelog  # noqa: E402
+
+ANSI = "\x1b[2m"
+RST = "\x1b[0m"
+
+
+def L(ts, level, msg, ansi=False):
+    t = f"2026-10-04T{ts}Z"
+    if ansi:
+        return f"{ANSI}{t}{RST} {level} {msg}\n"
+    return f"{t} {level:>5} {msg}\n"
+
+
+PHASE_LOG = [
+    L("16:48:42.000000", "INFO", "algod_rust::commands::participate: starting"),
+    L("16:49:47.000000", "INFO", "algo_ledger::sync: sync state transition from=Idle to=Downloading ledger snapshot", True),
+    L("16:51:20.000000", "INFO", "algo_ledger::sync: sync state transition from=Downloading ledger snapshot to=Importing ledger into database"),
+    L("17:09:00.000000", "INFO", "algo_ledger::sync: sync state transition from=Importing ledger into database to=Verifying ledger integrity"),
+    L("17:18:00.000000", "INFO", "algo_ledger::catchpoint::verify: catchpoint verify: trie rebuild pending-hashes staged elapsed_s=540.5"),
+    L("17:24:00.000000", "INFO", "algo_ledger::catchpoint::verify: catchpoint verify: trie rebuild pending-hashes indexed elapsed_s=900.0"),
+    L("17:36:00.000000", "INFO", "algo_ledger::catchpoint::verify: catchpoint verify: trie rebuild complete (final commit done) total_elements_added=1 total_elapsed_s=1620.0"),
+    L("17:37:00.000000", "INFO", "algo_ledger::sync: sync state transition from=Verifying ledger integrity to=Downloading lookback blocks"),
+    L("17:43:00.000000", "INFO", "algo_ledger::sync: sync state transition from=Downloading lookback blocks to=Replaying blocks"),
+    L("17:46:00.000000", "INFO", 'algo_ledger::sync: post-sync WAL checkpoint (PASSIVE): x db="tracker" elapsed_secs=2.8022e-5 result=Some((0, 1, 1))'),
+    L("17:46:10.000000", "INFO", 'algo_ledger::sync: post-sync WAL checkpoint (TRUNCATE) db="block" attempt=1 elapsed_secs=0.001 result=None'),
+    L("17:48:00.000000", "INFO", "algo_ledger::sync: ledger invariant validation: all checks passed"),
+    L("17:48:00.000000", "INFO", "algo_ledger::sync: sync state transition from=Replaying blocks to=Sync complete"),
+    L("17:48:00.000100", "INFO", "algo_ledger::sync: catchpoint sync completed elapsed=3493.5s"),
+    L("17:52:30.000000", "INFO", 'algo_ledger::sync: WAL checkpoint: (busy, wal frames, checkpointed frames) db="tracker" pragma="PRAGMA wal_checkpoint(PASSIVE)" elapsed_secs=270.0 result=None'),
+    L("17:52:35.000000", "INFO", 'algo_ledger::sync: WAL checkpoint: x db="tracker" pragma="TRUNCATE" elapsed_secs=5.0 result=None'),
+    # A later, unrelated periodic checkpoint must not extend the chain.
+    L("19:00:00.000000", "INFO", 'algo_ledger::sync: WAL checkpoint: x db="tracker" pragma="PASSIVE" elapsed_secs=1.0 result=None'),
+]
+
+
+class PhaseLogTest(unittest.TestCase):
+    def test_full_timeline_sums_to_the_covered_window(self):
+        d = nodelog.parse_phase_log(PHASE_LOG)
+        self.assertEqual(d["startup_s"], 65.0)
+        self.assertEqual(d["download_s"], 93.0)
+        self.assertEqual(d["import_s"], 1060.0)
+        self.assertEqual(d["verify_s"], 1680.0)
+        self.assertEqual(d["verify_staging_s"], 540.5)
+        self.assertEqual(d["verify_indexing_s"], 359.5)
+        self.assertEqual(d["verify_trie_build_s"], 720.0)
+        self.assertEqual(d["verify_tail_s"], 60.0)
+        self.assertEqual(d["lookback_download_s"], 360.0)
+        self.assertEqual(d["replay_s"], 180.0)
+        self.assertEqual(d["post_sync_wal_checkpoint_s"], 10.0)
+        self.assertEqual(d["invariant_validation_s"], 110.0)
+        self.assertEqual(d["final_wal_checkpoint_s"], 275.0)
+        self.assertEqual(d["sync_reported_elapsed_s"], 3493.5)
+        parts = [
+            d[k]
+            for k in (
+                "download_s",
+                "import_s",
+                "verify_s",
+                "lookback_download_s",
+                "replay_s",
+                "post_sync_wal_checkpoint_s",
+                "invariant_validation_s",
+                "final_wal_checkpoint_s",
+            )
+        ]
+        self.assertAlmostEqual(sum(parts), d["catchup_log_total_s"], places=1)
+        self.assertEqual(d["sync_attempts"], 1)
+
+    def test_empty_and_garbage_logs_degrade_to_null(self):
+        for lines in ([], ["not a log line\n", "\n"]):
+            d = nodelog.parse_phase_log(lines)
+            self.assertIsNone(d["download_s"])
+            self.assertIsNone(d["catchup_log_total_s"])
+            self.assertEqual(d["sync_attempts"], 0)
+
+    def test_truncated_log_only_fills_what_it_saw(self):
+        d = nodelog.parse_phase_log(PHASE_LOG[:3])
+        self.assertEqual(d["download_s"], 93.0)
+        self.assertIsNone(d["import_s"])
+        self.assertIsNone(d["verify_s"])
+        self.assertIsNone(d["final_wal_checkpoint_s"])
+
+    def test_missing_verify_markers_leave_substeps_null(self):
+        log = [x for x in PHASE_LOG if "pending-hashes" not in x and "trie rebuild" not in x]
+        d = nodelog.parse_phase_log(log)
+        self.assertEqual(d["verify_s"], 1680.0)
+        self.assertIsNone(d["verify_staging_s"])
+        self.assertIsNone(d["verify_tail_s"])
+
+    def test_restarted_sync_uses_final_attempt_and_reports_earlier_time(self):
+        second = L("16:50:30.000000", "INFO", "algo_ledger::sync: sync state transition from=Failed to=Downloading ledger snapshot")
+        d = nodelog.parse_phase_log(PHASE_LOG[:2] + [second] + PHASE_LOG[2:])
+        self.assertEqual(d["sync_attempts"], 2)
+        self.assertEqual(d["earlier_attempts_s"], 43.0)
+        self.assertEqual(d["download_s"], 50.0)
+
+    def test_build_result_adds_detailed_phases_and_residual(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as dd:
+            path = os.path.join(dd, "node.log")
+            with open(path, "w", encoding="utf-8") as f:
+                f.writelines(PHASE_LOG)
+            samples = [node_catchup(1000.0), node_follow(1000.0 + 3500.0, 100, 100)]
+            samples[0]["node"]["catchpoint"] = "x#y"
+            r = monitor.build_result(samples, monitor.classify(samples), 0.0, path)
+            d = r["phase_seconds_detailed"]
+            self.assertEqual(d["catchup_wall_s"], 3500.0)
+            self.assertAlmostEqual(d["unaccounted_s"], 3500.0 - d["catchup_log_total_s"], places=1)
+            self.assertEqual(d["download_s"], 93.0)
+            missing = monitor.build_result(samples, monitor.classify(samples), 0.0, path + ".nope")
+            self.assertIsNone(missing["phase_seconds_detailed"]["download_s"])
+            self.assertIsNone(missing["phase_seconds_detailed"]["unaccounted_s"])
+            self.assertIn("blocks", r["phase_seconds"] or {"blocks": 0})
+
+
+NOISE_LINES = [
+    L("01:00:00.000000", "WARN", "algo_network::tx_tag_handler: TxTagHandler: pool rejected inbound TX group sender=r-1 error=TransactionPool.Remember: validation error: account X balance 5 below minimum balance 100000"),
+    L("01:00:00.000000", "WARN", "algo_network::tx_syncer: TxSyncer sync round failed error=handler rejected transaction group: insufficient balance"),
+    L("01:00:00.000000", "WARN", "algo_network::tx_sync_pool_adapter: PoolSolicitedTxHandler: pool rejected pulled TX group error=TransactionPool.ingest: insufficient balance"),
+    L("01:00:00.000000", "ERROR", "hickory_proto::dnssec::dnssec_dns_handle: exceeded max validation depth"),
+]
+
+
+class ScanLogTest(unittest.TestCase):
+    def test_noise_lines_never_fail_the_job(self):
+        scan = nodelog.scan_lines(NOISE_LINES * 5)
+        self.assertEqual(scan["hard_total"], 0)
+        self.assertEqual(scan["hard"], {})
+        self.assertEqual(scan["noise"]["dnssec_max_validation_depth"], 5)
+        self.assertEqual(scan["noise"]["gossip_tx_rejections"], 15)
+
+    def _hard(self, lines):
+        return nodelog.scan_lines(lines)["hard_failures"]
+
+    def test_each_hard_signature_is_detected(self):
+        cases = {
+            "permanent_error_writing_block": L("01:00:00.000000", "ERROR", "algo_ledger::agreement_bridge: ensure_block: permanent error writing block 5 to ledger: boom"),
+            "apply_block_failed": L("01:00:00.000000", "WARN", "algod_rust::commands::node: follow: apply_block failed round=5"),
+            "panic": L("01:00:00.000000", "ERROR", "thread 'tokio-runtime-worker' panicked at src/x.rs:1:1:"),
+            "invariant_check_error": L("01:00:00.000000", "ERROR", "algo_ledger::sync: invariant check: error name=x detail=y"),
+            "resource_temporarily_unavailable": L("01:00:00.000000", "ERROR", "io: Resource temporarily unavailable (os error 11)"),
+            "block_apply_balance_error": L("01:00:00.000000", "WARN", "algo_ledger::apply: account Z balance 3 below minimum balance 100000 while applying block 9"),
+        }
+        for key, line in cases.items():
+            self.assertEqual(self._hard([line]), {key: 1}, key)
+
+    def test_ansi_coloured_lines_match(self):
+        line = L("01:00:00.000000", "ERROR", "algo_ledger::agreement_bridge: ensure_block: permanent error writing block 1", True)
+        self.assertIn("permanent_error_writing_block", self._hard([line]))
+
+    def test_ensure_block_not_advancing_needs_repetition(self):
+        line = L("01:00:00.000000", "WARN", "catchup: ensure_block round=9 did not advance")
+        self.assertEqual(self._hard([line]), {})
+        self.assertEqual(self._hard([line] * 3), {"ensure_block_not_advancing": 3})
+
+    def test_invariant_info_and_passed_lines_are_not_hard(self):
+        scan = nodelog.scan_lines(
+            [
+                L("01:00:00.000000", "INFO", "algo_ledger::sync: ledger invariant validation: all checks passed"),
+                L("01:00:00.000000", "INFO", "algo_ledger::sync: invariant check: info name=x"),
+                L("01:00:00.000000", "WARN", "algo_ledger::sync: invariant check: warning name=x"),
+            ]
+        )
+        self.assertEqual(scan["hard_total"], 0)
+        self.assertEqual(scan["warn"], {"invariant_check_warning": 1})
+
+    def test_group_id_mismatch_is_a_counted_warning_with_distinct_proposals(self):
+        def gid(stored):
+            return L(
+                "01:00:00.000000",
+                "WARN",
+                "algo_agreement::demux: dropping proposal with a transaction group that fails "
+                f"group-ID verification: validation error: group ID mismatch: stored {stored} != computed {'f' * 64} len=1",
+            )
+
+        scan = nodelog.scan_lines([gid("a" * 64), gid("a" * 64), gid("b" * 64)])
+        self.assertEqual(scan["hard_total"], 0)
+        self.assertEqual(scan["warn"]["proposal_group_id_mismatch"], 3)
+        self.assertEqual(scan["proposal_group_id_mismatch_distinct"], 2)
+
+    def test_missing_log_file_is_not_an_error(self):
+        scan = nodelog.scan_file("/definitely/not/here.log")
+        self.assertFalse(scan["log_found"])
+        self.assertEqual(scan["hard_total"], 0)
+
+    def test_scan_log_cli_merges_into_summary_and_sets_exit_code(self):
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as dd:
+            log = os.path.join(dd, "node.log")
+            summ = os.path.join(dd, "summary.json")
+            with open(summ, "w") as f:
+                json.dump({"status": "ok"}, f)
+            with open(log, "w", encoding="utf-8") as f:
+                f.writelines(NOISE_LINES)
+            self.assertEqual(monitor.main(["scan-log", log, "--summary", summ]), 0)
+            with open(summ) as f:
+                self.assertEqual(json.load(f)["log_scan"]["hard_total"], 0)
+            with open(log, "a", encoding="utf-8") as f:
+                f.write("thread 'x' panicked at y\n")
+            self.assertEqual(monitor.main(["scan-log", log, "--summary", summ]), 1)
+            with open(summ) as f:
+                d = json.load(f)
+            self.assertEqual(d["status"], "ok")
+            self.assertEqual(d["log_scan"]["hard_failures"], {"panic": 1})
+
+    def test_render_markdown_lists_hits(self):
+        scan = nodelog.scan_lines(NOISE_LINES + ["thread 'x' panicked at y\n"])
+        md = nodelog.render_markdown({"log_scan": scan})
+        self.assertIn("1 hard signature", md)
+        self.assertIn("`panic`", md)
+
+
+class FollowWindowTest(unittest.TestCase):
+    def _collect(self, node, peer, **kw):
+        import tempfile
+
+        orig = monitor.take_sample
+        monitor.take_sample = lambda *a, **k: {"ts": time.time(), "node": dict(node), "peer": dict(peer)}
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                t0 = time.time()
+                v = monitor.collect(
+                    node_url="n",
+                    node_token="",
+                    peer_url="p",
+                    peer_token="",
+                    halt_minutes=5.0,
+                    poll_interval_s=0.02,
+                    out_path=os.path.join(d, "o.jsonl"),
+                    **kw,
+                )
+                return v, time.time() - t0
+        finally:
+            monitor.take_sample = orig
+
+    def test_follow_window_ends_the_run_after_first_tip(self):
+        node = {"ok": True, "catchpoint": None, "last_round": 100}
+        peer = {"ok": True, "last_round": 100}
+        v, took = self._collect(node, peer, duration_s=30.0, follow_s=0.3)
+        self.assertEqual(v.status, "ok")
+        self.assertGreaterEqual(took, 0.3)
+        self.assertLess(took, 3.0)
+
+    def test_follow_zero_runs_until_the_duration_cap(self):
+        node = {"ok": True, "catchpoint": None, "last_round": 100}
+        peer = {"ok": True, "last_round": 100}
+        _v, took = self._collect(node, peer, duration_s=0.5, follow_s=0.0)
+        self.assertGreaterEqual(took, 0.5)
+
+    def test_duration_is_the_hard_cap_when_the_tip_is_never_reached(self):
+        node = {"ok": True, "catchpoint": None, "last_round": 10}
+        peer = {"ok": True, "last_round": 100}
+        _v, took = self._collect(node, peer, duration_s=0.4, follow_s=0.05)
+        self.assertGreaterEqual(took, 0.4)
+
+    def test_duration_cap_wins_over_a_longer_follow_window(self):
+        node = {"ok": True, "catchpoint": None, "last_round": 100}
+        peer = {"ok": True, "last_round": 100}
+        _v, took = self._collect(node, peer, duration_s=0.4, follow_s=60.0)
+        self.assertLess(took, 3.0)
+
+    def test_build_result_reports_follow_window_and_lag(self):
+        t0 = 1000.0
+        samples = [node_catchup(t0)]
+        samples[0]["node"]["catchpoint"] = "x#y"
+        samples += [node_follow(t0 + 100 + i * 10, 500 + i, 500 + i) for i in range(31)]
+        r = monitor.build_result(samples, monitor.classify(samples), 5.0)
+        self.assertEqual(r["follow"]["requested_s"], 300.0)
+        self.assertEqual(r["follow"]["observed_s"], 300.0)
+        self.assertEqual(r["follow"]["time_to_tip_s"], 100.0)
+        self.assertTrue(r["follow"]["completed"])
+        self.assertEqual(r["lag_rounds"]["n"], 31)
+        self.assertNotIn("follow", monitor.build_result(samples, monitor.classify(samples)))
+
+
 if __name__ == "__main__":
     unittest.main()
