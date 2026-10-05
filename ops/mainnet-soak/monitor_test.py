@@ -724,10 +724,19 @@ class ScanLogTest(unittest.TestCase):
             "panic": L("01:00:00.000000", "ERROR", "thread 'tokio-runtime-worker' panicked at src/x.rs:1:1:"),
             "invariant_check_error": L("01:00:00.000000", "ERROR", "algo_ledger::sync: invariant check: error name=x detail=y"),
             "resource_temporarily_unavailable": L("01:00:00.000000", "ERROR", "io: Resource temporarily unavailable (os error 11)"),
+            "shadow_execute_mismatch": L("01:00:00.000000", "WARN", "algo_ledger::shadow_execute: shadow_execute_mismatch round=7 diffs=1 [account txn=0 field=micro_algos replay=1 execute=2]"),
             "block_apply_balance_error": L("01:00:00.000000", "WARN", "algo_ledger::apply: account Z balance 3 below minimum balance 100000 while applying block 9"),
         }
         for key, line in cases.items():
             self.assertEqual(self._hard([line]), {key: 1}, key)
+
+    def test_shadow_mismatch_with_balance_text_counts_once(self):
+        line = L("01:00:00.000000", "WARN", "algo_ledger::shadow_execute: shadow_execute_mismatch round=7 diffs=1 [execute_error execute=below minimum balance]")
+        self.assertEqual(self._hard([line]), {"shadow_execute_mismatch": 1})
+
+    def test_shadow_progress_line_is_not_hard(self):
+        line = L("01:00:00.000000", "INFO", "algo_ledger::shadow_execute: shadow_execute_progress checked=1000 mismatched_blocks=0")
+        self.assertEqual(self._hard([line]), {})
 
     def test_ansi_coloured_lines_match(self):
         line = L("01:00:00.000000", "ERROR", "algo_ledger::agreement_bridge: ensure_block: permanent error writing block 1", True)

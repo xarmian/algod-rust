@@ -412,6 +412,14 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
         self.inner.restore_snapshot(snapshot);
     }
 
+    fn save_scratch_state(&self) -> Option<Box<dyn std::any::Any>> {
+        self.inner.save_scratch_state()
+    }
+
+    fn restore_scratch_state(&mut self, saved: Box<dyn std::any::Any>) {
+        self.inner.restore_scratch_state(saved);
+    }
+
     // ---- Min balance ----
 
     fn min_balance_with_state(&self, addr: &Address, account: &AccountData) -> u64 {

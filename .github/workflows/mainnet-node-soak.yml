@@ -79,6 +79,10 @@ on:
         description: "Print the would-be issue instead of filing it"
         type: boolean
         default: true
+      shadow_execute:
+        description: "Set ALGOD_SHADOW_EXECUTE=1: re-evaluate every Replay-applied block in Execute mode on a rolled-back scratch apply and log shadow_execute_mismatch (issue #1673; hard tier, costs follow-path CPU)"
+        type: boolean
+        default: false
 
 concurrency:
   # One mainnet soak node at a time — no reason to ever run two, and it
@@ -153,6 +157,9 @@ jobs:
           echo "halt_minutes=$HALT_MINUTES" >> "$GITHUB_OUTPUT"
           echo "follow_minutes=$FOLLOW_MINUTES" >> "$GITHUB_OUTPUT"
           echo "dry_run=$DRY_RUN" >> "$GITHUB_OUTPUT"
+          SHADOW_EXECUTE="${{ github.event.inputs.shadow_execute }}"
+          if [ "$SHADOW_EXECUTE" = "true" ]; then SHADOW_EXECUTE=1; else SHADOW_EXECUTE=0; fi
+          echo "shadow_execute=$SHADOW_EXECUTE" >> "$GITHUB_OUTPUT"
           echo "algod_url=$ALGOD_URL" >> "$GITHUB_OUTPUT"
           echo "Run parameters: duration=${DURATION_MINUTES}m follow=${FOLLOW_MINUTES}m halt=${HALT_MINUTES}m dry_run=${DRY_RUN} peer=${ALGOD_URL}"
 
@@ -293,6 +300,8 @@ jobs:
         env:
           ALGOD_URL: ${{ steps.params.outputs.algod_url }}
           CATCHUP_PEER_URL: ${{ steps.relay.outputs.catchup_peer_url }}
+          # Issue #1673: opt-in Replay-vs-Execute differential check.
+          ALGOD_SHADOW_EXECUTE: ${{ steps.params.outputs.shadow_execute }}
         run: |
           set -euo pipefail
           mkdir -p mainnet-soak-artifacts

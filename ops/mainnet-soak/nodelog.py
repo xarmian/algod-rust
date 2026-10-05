@@ -269,6 +269,9 @@ HARD_RULES = [
     ("invariant_check_error", re.compile(r"invariant check: error"), 1, "post-catchup ledger invariant validation reported an error"),
     ("resource_temporarily_unavailable", re.compile(r"Resource temporarily unavailable"), 1, "EAGAIN from the OS (fd/thread/memory exhaustion)"),
     ("ensure_block_not_advancing", NO_ADVANCE_RE, 3, "ensure_block repeatedly failed to advance the ledger"),
+    # Issue #1673: ALGOD_SHADOW_EXECUTE=1 re-evaluates every Replay-applied
+    # block in Execute mode; a differing result is a Replay-path parity bug.
+    ("shadow_execute_mismatch", re.compile(r"shadow_execute_mismatch"), 1, "shadow Execute evaluation of a Replay-applied block differs from the Replay result (parity bug)"),
 ]
 # Special hard rule needing the noise exclusion (handled in scan_line).
 BALANCE_KEY = "block_apply_balance_error"
@@ -305,6 +308,7 @@ _PREFILTER = (
     "group ID mismatch",
     "persistence write",
     "slow ensure_block",
+    "shadow_execute_mismatch",
     "validation depth",
     "pool rejected",
     "TxSyncer",
@@ -339,7 +343,11 @@ def scan_lines(lines) -> dict:
         for key, rx, _thr, _d in HARD_RULES:
             if rx.search(line):
                 bump("hard", key)
-        if BALANCE_RE.search(line) and not GOSSIP_NOISE_RE.search(line):
+        if (
+            BALANCE_RE.search(line)
+            and not GOSSIP_NOISE_RE.search(line)
+            and "shadow_execute_mismatch" not in line
+        ):
             bump("hard", BALANCE_KEY)
         for key, rx, _d in WARN_RULES:
             if rx.search(line):

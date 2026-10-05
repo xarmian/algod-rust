@@ -7015,6 +7015,25 @@ impl LedgerStore for SqliteLedger {
         self.pending_online_touched = snapshot.online_touched;
     }
 
+    fn save_scratch_state(&self) -> Option<Box<dyn std::any::Any>> {
+        // The SAVEPOINT covers the SQL tables and `snapshot` the totals
+        // delta; the lease table and the append-only trie pre-mutation log
+        // are in-memory only (same pair `apply_block_caching_delta`'s
+        // group-delta scratch apply restores by hand).
+        Some(Box::new((
+            self.lease_table.clone(),
+            self.pre_mutations.len(),
+        )))
+    }
+
+    fn restore_scratch_state(&mut self, saved: Box<dyn std::any::Any>) {
+        if let Ok(saved) = saved.downcast::<(LeaseTable, usize)>() {
+            let (leases, pre_mutations_len) = *saved;
+            self.lease_table = leases;
+            self.pre_mutations.truncate(pre_mutations_len);
+        }
+    }
+
     // ---- Min balance ----
 
     fn min_balance_with_state(&self, _addr: &Address, account: &AccountData) -> u64 {

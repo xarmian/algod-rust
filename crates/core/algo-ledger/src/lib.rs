@@ -45,6 +45,7 @@ pub mod params;
 pub mod participation;
 pub(crate) mod recording_store;
 pub mod rewards;
+pub mod shadow_execute;
 pub mod simulation;
 pub mod sqlite;
 pub mod state;
