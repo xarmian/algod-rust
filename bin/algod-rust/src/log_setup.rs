@@ -36,6 +36,8 @@
 //! (`RUST_LOG=debug`) does not: debugging everything must not bring back the
 //! flood from this one target. Everything else about `RUST_LOG` handling is
 //! unchanged from the previous `EnvFilter::try_from_default_env` initializer.
+//! The summary's target (`algod_rust::log_setup`) is subject to the
+//! operator's filter like any other: filtering out `algod_rust` also hides it.
 
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -46,12 +48,6 @@ use tracing_subscriber::layer::{Context, Filter, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
-/// Module paths of the validator's per-recursion ERROR (the lockfile carries
-/// both hickory generations).
-const NOISY_TARGET_PATHS: [&str; 2] = [
-    "hickory_proto::dnssec::dnssec_dns_handle",
-    "hickory_proto::xfer::dnssec_dns_handle",
-];
 /// Events of the noisy target allowed through per window.
 const BURST: u32 = 5;
 /// Rate-limit window.
@@ -59,11 +55,20 @@ const WINDOW: Duration = Duration::from_secs(60);
 /// How often the summary thread checks for an ended window.
 const SUMMARY_TICK: Duration = Duration::from_secs(1);
 
-/// True for an event target emitted by the validator handle, whichever
-/// hickory generation's module path it carries.
+/// The noisy target is defined by this predicate: an event target emitted by
+/// the validator handle, whichever hickory generation's module path it
+/// carries (the lockfile has both). Limiting uses it directly.
 fn is_noisy_target(target: &str) -> bool {
     target.starts_with("hickory_proto") && target.ends_with("dnssec_dns_handle")
 }
+
+/// The known module paths satisfying [`is_noisy_target`], used only to
+/// evaluate `RUST_LOG` prefix overrides (a test checks every path here
+/// satisfies the predicate, so the two cannot drift apart).
+const NOISY_TARGET_PATHS: [&str; 2] = [
+    "hickory_proto::dnssec::dnssec_dns_handle",
+    "hickory_proto::xfer::dnssec_dns_handle",
+];
 
 /// Split a `RUST_LOG`-style spec on commas that are not nested inside
 /// `[...]` / `{...}` span and field filters.
@@ -154,10 +159,9 @@ fn names_noisy_target(spec: &str) -> bool {
 }
 
 /// Result of interpreting `RUST_LOG`.
-#[derive(Debug)]
 struct LogSetup {
-    /// Filter directives to install.
-    filter_spec: String,
+    /// The filter to install (parsed once).
+    filter: EnvFilter,
     /// Whether the noisy target is rate-limited.
     rate_limit: bool,
 }
@@ -170,14 +174,13 @@ impl LogSetup {
     /// `info`. The limiter applies unless the operator explicitly asked for
     /// verbose output on the noisy target.
     fn resolve(raw: Option<&str>) -> Self {
-        let filter_spec = match raw {
-            Some(v) if EnvFilter::try_new(v).is_ok() => v.to_string(),
-            _ => "info".to_string(),
+        let (filter, spec) = match raw.and_then(|v| EnvFilter::try_new(v).ok().map(|f| (f, v))) {
+            Some(parsed) => parsed,
+            None => (EnvFilter::new("info"), "info"),
         };
-        let rate_limit = !names_noisy_target(&filter_spec);
         Self {
-            filter_spec,
-            rate_limit,
+            filter,
+            rate_limit: !names_noisy_target(spec),
         }
     }
 }
@@ -274,15 +277,24 @@ fn spawn_summary_ticker(
         .map(drop)
 }
 
+/// Text of the suppression notice. The hint keeps `info` first: the bare
+/// `RUST_LOG=hickory_proto=debug` would drop every other target to the
+/// default level. The count covers every ended window not yet reported.
+fn summary_message(dropped: u64) -> String {
+    format!(
+        "rate-limited hickory dnssec_dns_handle errors: suppressed {dropped} events since the \
+         last report (set RUST_LOG=info,hickory_proto=debug to see all)"
+    )
+}
+
 /// The suppression notice. ERROR, like the events it summarizes, so it
 /// survives any filter that lets those events through (`RUST_LOG=error`).
 fn emit_summary(dropped: u64) {
     tracing::error!(
         target: "algod_rust::log_setup",
         suppressed = dropped,
-        window_secs = WINDOW.as_secs(),
-        "rate-limited hickory dnssec_dns_handle errors: suppressed {dropped} events in the \
-         last window (set RUST_LOG=hickory_proto=debug to see all)"
+        "{}",
+        summary_message(dropped)
     );
 }
 
@@ -336,12 +348,11 @@ impl<S: Subscriber> Filter<S> for NoisyTargetLimiter {
 pub fn init() {
     let raw = std::env::var("RUST_LOG").ok();
     let setup = LogSetup::resolve(raw.as_deref());
-    let env = EnvFilter::try_new(&setup.filter_spec).unwrap_or_else(|_| EnvFilter::new("info"));
     let limiter = build_limiter(setup.rate_limit, |l| {
         spawn_summary_ticker(l, SUMMARY_TICK, emit_summary)
     });
-    let layer =
-        tracing_subscriber::fmt::layer().with_filter(env.and(NoisyTargetLimiter { limiter }));
+    let layer = tracing_subscriber::fmt::layer()
+        .with_filter(setup.filter.and(NoisyTargetLimiter { limiter }));
     tracing_subscriber::registry().with(layer).init();
 }
 
@@ -450,20 +461,29 @@ mod tests {
         seen.load(Ordering::SeqCst) == 1
     }
 
+    /// The previous initializer's semantics, from its input string
+    /// (`EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))`:
+    /// `try_from_default_env` is `try_new(var)` when the variable is set).
+    fn old_initializer(var: Option<&str>) -> EnvFilter {
+        match var {
+            Some(v) => EnvFilter::try_new(v).unwrap_or_else(|_| EnvFilter::new("info")),
+            None => EnvFilter::new("info"),
+        }
+    }
+
     #[test]
     fn unset_rust_log_gets_info_and_the_policy() {
         let s = LogSetup::resolve(None);
-        assert_eq!(s.filter_spec, "info");
         assert!(s.rate_limit);
+        assert!(passes(s.filter, false), "info passes");
     }
 
     #[test]
     fn explicit_filter_is_kept_and_override_disables_limit() {
         let s = LogSetup::resolve(Some("warn"));
-        assert_eq!(s.filter_spec, "warn");
         assert!(s.rate_limit);
+        assert!(!passes(s.filter, false), "warn drops info");
         let s = LogSetup::resolve(Some("info,hickory_proto=trace"));
-        assert_eq!(s.filter_spec, "info,hickory_proto=trace");
         assert!(!s.rate_limit);
         let s = LogSetup::resolve(Some("debug"));
         assert!(s.rate_limit, "global debug keeps the limiter");
@@ -472,40 +492,50 @@ mod tests {
     }
 
     /// Blank and invalid `RUST_LOG` behave exactly as the previous
-    /// initializer (`EnvFilter::try_from_default_env()`, falling back to
-    /// `info`), checked against that very call.
+    /// initializer. No process environment is touched: the old semantics are
+    /// reimplemented from the input string above.
     #[test]
     fn blank_and_invalid_rust_log_behave_as_before() {
-        fn old_filter() -> EnvFilter {
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
-        }
-        // Only this test touches RUST_LOG.
-        let saved = std::env::var("RUST_LOG").ok();
         for raw in ["", "   ", "info,foo[bar=trace", "==="] {
-            std::env::set_var("RUST_LOG", raw);
-            let setup = LogSetup::resolve(Some(raw));
-            let new =
-                EnvFilter::try_new(&setup.filter_spec).unwrap_or_else(|_| EnvFilter::new("info"));
-            let old = old_filter();
             for level_error in [false, true] {
-                let o = passes(old_filter(), level_error);
-                let n = passes(
-                    EnvFilter::try_new(&setup.filter_spec)
-                        .unwrap_or_else(|_| EnvFilter::new("info")),
-                    level_error,
+                assert_eq!(
+                    passes(LogSetup::resolve(Some(raw)).filter, level_error),
+                    passes(old_initializer(Some(raw)), level_error),
+                    "RUST_LOG={raw:?} error={level_error}"
                 );
-                assert_eq!(n, o, "RUST_LOG={raw:?} error={level_error}");
             }
-            assert_eq!(new.to_string(), old.to_string(), "RUST_LOG={raw:?}");
-        }
-        match saved {
-            Some(v) => std::env::set_var("RUST_LOG", v),
-            None => std::env::remove_var("RUST_LOG"),
+            assert_eq!(
+                LogSetup::resolve(Some(raw)).filter.to_string(),
+                old_initializer(Some(raw)).to_string(),
+                "RUST_LOG={raw:?}"
+            );
         }
         // Invalid falls back silently to info with the policy applied.
         let s = LogSetup::resolve(Some("info,foo[bar=trace"));
-        assert_eq!(s.filter_spec, "info");
         assert!(s.rate_limit);
+        assert!(passes(s.filter, false));
+    }
+
+    /// One definition of the noisy target: every known module path used for
+    /// override matching satisfies the limiting predicate.
+    #[test]
+    fn every_known_noisy_path_satisfies_the_predicate() {
+        for p in NOISY_TARGET_PATHS {
+            assert!(is_noisy_target(p), "{p}");
+        }
+    }
+
+    /// The notice's hint must be safe to copy: the bare `hickory_proto=debug`
+    /// form would drop every other target to the default level.
+    #[test]
+    fn summary_message_has_a_safe_hint_and_honest_wording() {
+        let m = summary_message(42);
+        assert!(m.contains("RUST_LOG=info,hickory_proto=debug"), "{m}");
+        assert!(
+            m.contains("suppressed 42 events since the last report"),
+            "{m}"
+        );
+        assert!(!m.contains("window"), "{m}");
     }
 
     // The limiter is driven by explicit instants (a fake clock): no real
