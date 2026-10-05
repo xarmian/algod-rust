@@ -4261,6 +4261,93 @@ mod tests {
         assert_eq!(status.confirmed_round, 1, "confirmed in round 1");
     }
 
+    /// Issue #1703: the block a dev-mode node produces and stores must carry
+    /// each payset transaction in go's `SignedTxnInBlock` form -- genesis
+    /// id/hash stripped (`hgi` set), restored only transiently while
+    /// evaluating -- and its `txn_commitment` payset commitment must match the one
+    /// computed over that stripped form. Clients submit transactions with
+    /// `gen`/`gh` set; go's block payset never stores them.
+    #[tokio::test]
+    async fn dev_mode_produced_block_payset_strips_genesis_fields() {
+        use algo_types::{Round, Transaction, TxnType};
+        use ed25519_dalek::SigningKey;
+
+        let sender_key = SigningKey::from_bytes(&[0x55u8; 32]);
+        let sender = Address(sender_key.verifying_key().to_bytes());
+        let (adapter, ledger, gh) = seed_dev_adapter(sender, 10_000_000);
+        // The network's genesis id, as recorded by the seeded genesis block.
+        let genesis_id = ledger
+            .lock()
+            .unwrap()
+            .get_block_header(0)
+            .unwrap()
+            .expect("genesis header")
+            .genesis_id;
+        assert!(!genesis_id.is_empty(), "seeded genesis has an id");
+
+        let txn = Transaction {
+            txn_type: TxnType::Pay,
+            sender,
+            receiver: Address([0x66u8; 32]),
+            amount: 1_000_000,
+            fee: 1000,
+            first_valid: Round(1),
+            last_valid: Round(1000),
+            genesis_id: genesis_id.clone(),
+            genesis_hash: gh,
+            ..Default::default()
+        };
+        let stx = sign_txn(&txn, &sender_key);
+        let txid = compute_txn_id(&txn);
+
+        adapter
+            .broadcast_signed_tx_group(vec![stx])
+            .await
+            .expect("dev-mode broadcast should produce a block");
+
+        let raw = ledger
+            .lock()
+            .unwrap()
+            .get_block_data(1)
+            .unwrap()
+            .expect("round 1 block stored");
+        let block = algo_codec::decode_block(&raw).expect("decode stored block");
+        assert_eq!(block.payset.len(), 1);
+        let stib = &block.payset[0];
+        assert!(
+            stib.txn.genesis_id.is_empty(),
+            "stored payset txn must not carry gen, got {:?}",
+            stib.txn.genesis_id
+        );
+        assert_eq!(
+            stib.txn.genesis_hash, [0u8; 32],
+            "stored payset txn must not carry gh"
+        );
+        assert!(stib.has_genesis_id, "hgi must be set");
+        // The protocol requires the genesis hash, so go leaves hgh unset.
+        assert!(
+            algo_types::consensus::consensus_params_for_version(&block.current_protocol)
+                .expect("known protocol")
+                .require_genesis_hash,
+            "this test runs on a protocol that requires the genesis hash"
+        );
+        assert!(
+            !stib.has_genesis_hash,
+            "hgh must stay unset when the protocol requires the genesis hash"
+        );
+
+        // The commitment is over the full (restored) transaction ids, so it
+        // must equal the root computed from the stripped stored form.
+        assert_eq!(
+            block.txn_commitment.as_slice(),
+            algo_validate::merkle::compute_payset_merkle_root(&block).as_slice(),
+            "txn_commitment must match the stripped-form payset commitment"
+        );
+        let restored = algo_validate::restore_payset_genesis_fields(&block);
+        assert_eq!(restored[0].txn.genesis_id, genesis_id);
+        assert_eq!(compute_txn_id(&restored[0].txn), txid);
+    }
+
     /// Issue #581: the dev-mode block producer's `StateDelta` cache (what
     /// `GET /v2/deltas/{round}` serves) must be populated from the same
     /// apply pass as the committed block, not just `KvMods`. A plain

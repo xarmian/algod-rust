@@ -1565,6 +1565,13 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
     // parent's -- sees the id of the *full* transaction. Executing the AVM
     // on the stored form made every `TxID` differ from go's (issue #1664:
     // a shuffle app hashing `TxID` picked different NFTs).
+    //
+    // The restored copy is evaluation-local: the block that is *stored* must
+    // stay in its stripped (`SignedTxnInBlock`) form, or a node-produced
+    // block would carry `gen`/`gh` where go records only `hgi` (issue #1703).
+    // Callers hand in stripped blocks by convention; storage does not
+    // re-normalise.
+    let stored_block = block;
     let restored_block;
     let block = if mode == ApplyMode::Execute {
         match block_with_restored_genesis_fields(block) {
@@ -1967,7 +1974,7 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
     // These are auxiliary tracker writes — failures are logged but do not
     // fail block application (matches go-algorand's tracker persistence pattern).
     let hdrdata = algo_codec::canonical_encode_block_header_from_block(block);
-    let blkdata = algo_codec::canonical_encode_block(block);
+    let blkdata = algo_codec::canonical_encode_block(stored_block);
     let proto = &block.current_protocol;
     if let Err(e) = store.put_block(block.round.0, proto, &hdrdata, &blkdata) {
         tracing::warn!("put_block failed for round {}: {e}", block.round.0);
