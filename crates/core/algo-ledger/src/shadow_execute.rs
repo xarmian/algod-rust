@@ -58,8 +58,12 @@ pub const MISMATCH_LOG_TOKEN: &str = "shadow_execute_mismatch";
 const MAX_VALUE_CHARS: usize = 160;
 /// How many diffs one WARN line spells out.
 const MAX_DIFFS_LOGGED: usize = 8;
-/// Cap on per-field WARNs for one block's ApplyData mismatches.
-const MAX_APPLY_DATA_WARNS_PER_BLOCK: usize = 16;
+/// Per-window budget of repeated (already-seen pattern) mismatch lines.
+const MAX_MISMATCH_LINES_PER_WINDOW: u32 = 60;
+/// Length of that window in seconds.
+const MISMATCH_WINDOW_SECS: u64 = 60;
+/// Distinct field patterns tracked (first occurrence of each is never dropped).
+const MAX_TRACKED_PATTERNS: usize = 512;
 /// Emit a `shadow_execute_progress` INFO line every this many checked blocks
 /// (and every 5x this many app-call blocks that bypass the check).
 const PROGRESS_EVERY: u64 = 100;
@@ -73,6 +77,8 @@ static APPLY_DATA_TXNS: AtomicU64 = AtomicU64::new(0);
 static APPLY_DATA_MISMATCH_BLOCKS: AtomicU64 = AtomicU64::new(0);
 static APPLY_DATA_MISMATCH_TXNS: AtomicU64 = AtomicU64::new(0);
 static APPLY_DATA_US: AtomicU64 = AtomicU64::new(0);
+static APPLY_DATA_MISMATCH_LINES: AtomicU64 = AtomicU64::new(0);
+static APPLY_DATA_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
 
 fn log_progress(last_round: u64) {
     let (c, m, k) = shadow_execute_counters();
@@ -83,10 +89,12 @@ fn log_progress(last_round: u64) {
         .checked_div(ab)
         .unwrap_or(0);
     tracing::info!(
-        "shadow_execute_progress state_checked_blocks={c} state_mismatched_blocks={m} state_skipped_unsupported_store={k} state_avg_check_us={avg_us} apply_data_compared_blocks={ab} apply_data_compared_txns={} apply_data_mismatched_blocks={} apply_data_mismatched_txns={} apply_data_avg_compare_us={ad_avg_us} last_round={last_round}",
+        "shadow_execute_progress state_checked_blocks={c} state_mismatched_blocks={m} state_skipped_unsupported_store={k} state_avg_check_us={avg_us} apply_data_compared_blocks={ab} apply_data_compared_txns={} apply_data_mismatched_blocks={} apply_data_mismatched_txns={} apply_data_avg_compare_us={ad_avg_us} apply_data_mismatch_diffs={} apply_data_mismatch_lines_suppressed={} last_round={last_round}",
         APPLY_DATA_TXNS.load(Ordering::Relaxed),
         APPLY_DATA_MISMATCH_BLOCKS.load(Ordering::Relaxed),
         APPLY_DATA_MISMATCH_TXNS.load(Ordering::Relaxed),
+        APPLY_DATA_MISMATCH_LINES.load(Ordering::Relaxed),
+        APPLY_DATA_SUPPRESSED.load(Ordering::Relaxed),
     );
 }
 
@@ -727,25 +735,48 @@ fn diff_state_delta(
     }
 }
 
-/// First few pretty-`Debug` lines present on one side only; pinpoints the
-/// differing field of a large struct without a hand-written field list.
-fn debug_line_diff(rec: &str, comp: &str) -> (String, String) {
-    let r: Vec<&str> = rec.lines().collect();
-    let c: Vec<&str> = comp.lines().collect();
-    let pick = |a: &[&str], b: &[&str]| {
-        let only: Vec<&str> = a
-            .iter()
-            .filter(|l| !b.contains(l))
-            .take(3)
-            .map(|l| l.trim())
-            .collect();
-        if only.is_empty() {
-            "<none>".to_string()
-        } else {
-            clip(only.join(" | "))
+/// Split a pretty-`Debug` struct dump into its top-level `(field, body)` pairs.
+fn top_level_fields(dbg: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in dbg.lines().skip(1) {
+        if line == "}" {
+            continue;
         }
-    };
-    (pick(&r, &c), pick(&c, &r))
+        if line.starts_with("    ") && !line.starts_with("     ") {
+            if let Some((name, rest)) = line.trim().split_once(": ") {
+                out.push((name.to_string(), rest.to_string()));
+                continue;
+            }
+        }
+        if let Some(last) = out.last_mut() {
+            last.1.push(' ');
+            last.1.push_str(line.trim());
+        }
+    }
+    out
+}
+
+/// One diff per top-level transaction field whose pretty-`Debug` body differs,
+/// named `<path>.txn.<field>`.
+fn txn_field_diffs(path: &str, rec: &str, comp: &str, out: &mut Vec<FieldDiff>) {
+    let (r, c) = (top_level_fields(rec), top_level_fields(comp));
+    let mut names: Vec<&String> = Vec::new();
+    for (n, _) in r.iter().chain(c.iter()) {
+        if !names.contains(&n) {
+            names.push(n);
+        }
+    }
+    for n in names {
+        let rb = r.iter().find(|(m, _)| m == n).map(|(_, b)| b.as_str());
+        let cb = c.iter().find(|(m, _)| m == n).map(|(_, b)| b.as_str());
+        if rb != cb {
+            out.push((
+                format!("{path}.txn.{n}"),
+                clip(rb.unwrap_or("<absent>").to_string()),
+                clip(cb.unwrap_or("<absent>").to_string()),
+            ));
+        }
+    }
 }
 
 /// Compare one pair of recorded/computed `dt` values with `EvalDelta.Equal`
@@ -857,8 +888,7 @@ fn diff_eval_delta(
             algo_codec::canonical_encode_transaction(&b.txn),
         );
         if ea != eb {
-            let (x, y) = debug_line_diff(&format!("{:#?}", a.txn), &format!("{:#?}", b.txn));
-            out.push((format!("{p}.txn"), x, y));
+            txn_field_diffs(&p, &format!("{:#?}", a.txn), &format!("{:#?}", b.txn), out);
         }
         macro_rules! scalar {
             ($($f:ident),*) => {$(
@@ -957,6 +987,149 @@ pub fn compare_recorded_apply_data(block: &Block, computed: &[ApplyData]) -> Vec
     out
 }
 
+/// Collapse the variable parts of a mismatch field path (state keys, wire
+/// indices, inner-txn positions, log counts) so occurrences of the same root
+/// cause share one pattern, e.g. `eval_delta.inner_txns[N].eval_delta.global_delta[K]`.
+pub fn field_pattern(field: &str) -> String {
+    let mut out = String::new();
+    let mut rest = field;
+    while let Some(i) = rest.find('[') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        let Some(j) = after.find(']') else {
+            out.push_str(&rest[i..]);
+            return out;
+        };
+        let inner = &after[..j];
+        out.push_str(if inner.is_empty() {
+            "[]"
+        } else if inner.len() <= 3 && inner.chars().all(|c| c.is_ascii_digit()) {
+            "[N]"
+        } else {
+            "[K]"
+        });
+        rest = &after[j + 1..];
+        if rest.starts_with(" (") {
+            if let Some(k) = rest.find(')') {
+                rest = &rest[k + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Keeps a systematic mismatch from flooding the log: the first occurrence of
+/// every distinct [`field_pattern`] is always emitted (so every kind stays
+/// visible); repeats share a per-window line budget.
+#[derive(Debug)]
+pub struct MismatchLimiter {
+    max_per_window: u32,
+    window_secs: u64,
+    window_start: u64,
+    emitted: u32,
+    suppressed: u64,
+    seen: std::collections::HashSet<String>,
+    counts: HashMap<String, u64>,
+}
+
+impl MismatchLimiter {
+    pub fn new(max_per_window: u32, window_secs: u64) -> Self {
+        Self {
+            max_per_window,
+            window_secs,
+            window_start: 0,
+            emitted: 0,
+            suppressed: 0,
+            seen: Default::default(),
+            counts: Default::default(),
+        }
+    }
+
+    /// Returns `(emit, suppressed_in_previous_window)`; the second value is
+    /// non-zero once, when a window rolls over, so the caller can log it.
+    pub fn admit(&mut self, pattern: &str, now_secs: u64) -> (bool, u64) {
+        let mut flushed = 0;
+        if now_secs >= self.window_start + self.window_secs {
+            flushed = self.suppressed;
+            self.suppressed = 0;
+            self.emitted = 0;
+            self.window_start = now_secs;
+        }
+        if self.counts.len() < MAX_TRACKED_PATTERNS || self.counts.contains_key(pattern) {
+            *self.counts.entry(pattern.to_string()).or_insert(0) += 1;
+        }
+        let new = !self.seen.contains(pattern) && self.seen.len() < MAX_TRACKED_PATTERNS;
+        if new {
+            self.seen.insert(pattern.to_string());
+        }
+        if new || self.emitted < self.max_per_window {
+            self.emitted += 1;
+            (true, flushed)
+        } else {
+            self.suppressed += 1;
+            (false, flushed)
+        }
+    }
+
+    /// Most frequent patterns, for the periodic summary line.
+    pub fn top_patterns(&self, n: usize) -> Vec<(String, u64)> {
+        let mut v: Vec<(String, u64)> = self.counts.iter().map(|(k, c)| (k.clone(), *c)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v.truncate(n);
+        v
+    }
+}
+
+fn limiter() -> &'static std::sync::Mutex<MismatchLimiter> {
+    static L: OnceLock<std::sync::Mutex<MismatchLimiter>> = OnceLock::new();
+    L.get_or_init(|| {
+        std::sync::Mutex::new(MismatchLimiter::new(
+            MAX_MISMATCH_LINES_PER_WINDOW,
+            MISMATCH_WINDOW_SECS,
+        ))
+    })
+}
+
+fn log_apply_data_diffs(round: u64, diffs: &[ShadowDiff]) {
+    // One line per (transaction, field pattern) with an occurrence count.
+    let mut groups: Vec<(Option<usize>, String, usize, usize)> = Vec::new();
+    for (i, d) in diffs.iter().enumerate() {
+        let pat = field_pattern(&d.field);
+        match groups.iter_mut().find(|g| g.0 == d.txn_index && g.1 == pat) {
+            Some(g) => g.2 += 1,
+            None => groups.push((d.txn_index, pat, 1, i)),
+        }
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for (txn, pat, count, idx) in groups {
+        let (emit, flushed) = match limiter().lock() {
+            Ok(mut l) => l.admit(&pat, now),
+            Err(_) => (true, 0),
+        };
+        if flushed > 0 {
+            tracing::warn!(
+                "{MISMATCH_LOG_TOKEN} kind=apply_data field=<rate-limited> suppressed_lines={flushed}"
+            );
+        }
+        if !emit {
+            APPLY_DATA_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let d = &diffs[idx];
+        tracing::warn!(
+            "{MISMATCH_LOG_TOKEN} kind=apply_data round={round} txn={} field={} recorded={} computed={} pattern={pat} count={count}",
+            txn.map(|i| i.to_string()).unwrap_or_else(|| "-".into()),
+            d.field,
+            d.replay,
+            d.execute
+        );
+    }
+}
+
 /// Follow-path entry point for blocks that contain app calls when
 /// [`shadow_execute_enabled`]: apply the block in [`ApplyMode::Execute`] (as
 /// the plain path does), then compare the ApplyData it computed per
@@ -990,28 +1163,21 @@ pub fn apply_execute_block_with_apply_data_check<L: LedgerStore>(
         APPLY_DATA_MISMATCH_BLOCKS.fetch_add(1, Ordering::Relaxed);
         let txns: BTreeSet<Option<usize>> = diffs.iter().map(|d| d.txn_index).collect();
         APPLY_DATA_MISMATCH_TXNS.fetch_add(txns.len() as u64, Ordering::Relaxed);
-        for d in diffs.iter().take(MAX_APPLY_DATA_WARNS_PER_BLOCK) {
-            tracing::warn!(
-                "{MISMATCH_LOG_TOKEN} kind=apply_data round={} txn={} field={} recorded={} computed={}",
-                d.round,
-                d.txn_index
-                    .map(|i| i.to_string())
-                    .unwrap_or_else(|| "-".into()),
-                d.field,
-                d.replay,
-                d.execute
-            );
-        }
-        if diffs.len() > MAX_APPLY_DATA_WARNS_PER_BLOCK {
-            tracing::warn!(
-                "{MISMATCH_LOG_TOKEN} kind=apply_data round={} field=<truncated> total_diffs={}",
-                block.round.0,
-                diffs.len()
-            );
-        }
+        APPLY_DATA_MISMATCH_LINES.fetch_add(diffs.len() as u64, Ordering::Relaxed);
+        log_apply_data_diffs(block.round.0, &diffs);
     }
     if n == 1 || n % PROGRESS_EVERY == 0 {
         log_progress(block.round.0);
+    }
+    if n % (PROGRESS_EVERY * 10) == 0 {
+        if let Ok(l) = limiter().lock() {
+            let top: Vec<String> = l
+                .top_patterns(12)
+                .into_iter()
+                .map(|(p, c)| format!("{p}={c}"))
+                .collect();
+            tracing::info!("shadow_execute_patterns top=[{}]", top.join("; "));
+        }
     }
     Ok(())
 }
@@ -1414,12 +1580,8 @@ mod tests {
             },
         );
         assert_eq!(d.len(), 1, "{d:#?}");
-        assert_eq!(d[0].field, "eval_delta.inner_txns[0].txn");
-        assert!(
-            d[0].replay.contains("10") && d[0].execute.contains("11"),
-            "{:?}",
-            d[0]
-        );
+        assert_eq!(d[0].field, "eval_delta.inner_txns[0].txn.amount");
+        assert!(d[0].replay == "10," && d[0].execute == "11,", "{:?}", d[0]);
         assert!(cmp_one(
             |s| s.eval_delta = itx(10),
             ApplyData {
@@ -1477,5 +1639,62 @@ mod tests {
         let d = compare_recorded_apply_data(&recorded, &ads);
         assert_eq!(d.len(), 1, "{d:#?}");
         assert_eq!(d[0].field, "application_id");
+    }
+
+    #[test]
+    fn inner_group_id_difference_names_the_txn_field() {
+        let inner = |group: [u8; 32]| {
+            let mut stx = SignedTransaction::default();
+            stx.txn.txn_type = "pay".into();
+            stx.txn.sender = SENDER;
+            stx.txn.group = group;
+            let bytes = rmp_serde::to_vec_named(&stx).unwrap();
+            rmpv::decode::read_value(&mut &bytes[..]).unwrap()
+        };
+        let itx = |g: [u8; 32]| dt(vec![(Value::from("itx"), Value::Array(vec![inner(g)]))]);
+        let d = cmp_one(
+            |s| s.eval_delta = itx([7u8; 32]),
+            ApplyData {
+                eval_delta: itx([0u8; 32]),
+                ..Default::default()
+            },
+        );
+        assert_eq!(d.len(), 1, "{d:#?}");
+        assert_eq!(d[0].field, "eval_delta.inner_txns[0].txn.group");
+    }
+
+    #[test]
+    fn field_patterns_collapse_keys_indices_and_counts() {
+        assert_eq!(
+            field_pattern("eval_delta.inner_txns[3].eval_delta.global_delta[6b6579]"),
+            "eval_delta.inner_txns[N].eval_delta.global_delta[K]"
+        );
+        assert_eq!(
+            field_pattern("eval_delta.global_delta[]"),
+            "eval_delta.global_delta[]"
+        );
+        assert_eq!(
+            field_pattern("eval_delta.local_delta[1][6362]"),
+            "eval_delta.local_delta[N][K]"
+        );
+        assert_eq!(
+            field_pattern("eval_delta.logs[2] (counts 3/4)"),
+            "eval_delta.logs[N]"
+        );
+        assert_eq!(field_pattern("closing_amount"), "closing_amount");
+    }
+
+    #[test]
+    fn limiter_always_emits_a_new_pattern_and_rate_limits_repeats() {
+        let mut l = MismatchLimiter::new(2, 60);
+        assert_eq!(l.admit("a", 100), (true, 0));
+        assert_eq!(l.admit("a", 101), (true, 0));
+        assert_eq!(l.admit("a", 102), (false, 0));
+        // A different, never-seen pattern is emitted even over budget.
+        assert_eq!(l.admit("b", 103), (true, 0));
+        assert_eq!(l.admit("a", 104), (false, 0));
+        // Window rollover reports what was suppressed and refills the budget.
+        assert_eq!(l.admit("a", 170), (true, 2));
+        assert_eq!(l.top_patterns(1)[0], ("a".to_string(), 5));
     }
 }
