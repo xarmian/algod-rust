@@ -10,17 +10,13 @@ name: MSRV
 # automatically what CI verifies; clippy.toml's `msrv` must agree with it.
 # `--locked` checks the committed Cargo.lock, whose dependency versions are
 # what set the floor (see "Minimum supported Rust version" in
-# docs/DEV_WORKFLOW.md).
+# docs/DEV_WORKFLOW.md). Deliberately not path-filtered, so it could be made a
+# required check without docs-only PRs waiting on a workflow that never starts.
+# `--all-features` is intentionally not used: the `fuzzing` feature of
+# algo-types (for the excluded fuzz crate) does not compile even on stable.
 
 on:
   pull_request:
-    # Docs-only PRs cannot change what compiles; skip the full workspace
-    # check for them. The push-to-main trigger below is deliberately NOT
-    # path-filtered so every main commit refreshes the rust-cache (PRs only
-    # restore it).
-    paths-ignore:
-      - "docs/**"
-      - "**/*.md"
   push:
     branches: [main]
   workflow_dispatch:
@@ -54,7 +50,10 @@ jobs:
           # Source of truth: the `rust_version` of every workspace package
           # (cargo metadata), so a crate overriding or omitting the workspace
           # value is noticed. All packages must declare one identical value.
-          versions=$(cargo metadata --no-deps --format-version 1 \
+          # `+stable` is explicit (like the check step below) because no
+          # toolchain has been installed yet and rustup does not
+          # auto-install the one rust-toolchain.toml names.
+          versions=$(cargo +stable metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | .rust_version // "MISSING"' | sort -u)
           echo "workspace package rust-version values: ${versions}"
           if [ "$(printf '%s\n' "$versions" | wc -l)" -ne 1 ] || [ "$versions" = "MISSING" ]; then
