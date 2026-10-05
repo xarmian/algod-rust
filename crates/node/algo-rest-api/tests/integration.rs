@@ -7327,16 +7327,10 @@ async fn pending_transaction_info_no_eval_delta_when_unconfirmed() {
         rmpv::Value::String("gd".into()),
         rmpv::Value::Map(vec![(
             rmpv::Value::Binary(b"counter".to_vec()),
-            rmpv::Value::Map(vec![
-                (
-                    rmpv::Value::String("at".into()),
-                    rmpv::Value::Integer(2.into()), // SetUintAction
-                ),
-                (
-                    rmpv::Value::String("ui".into()),
-                    rmpv::Value::Integer(5.into()),
-                ),
-            ]),
+            rmpv::Value::Map(vec![(
+                rmpv::Value::String("at".into()),
+                rmpv::Value::Integer(1.into()),
+            )]),
         )]),
     )]);
 
