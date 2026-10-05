@@ -2236,34 +2236,23 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
                 return Ok(index);
             }
         }
-        if index == 0 {
-            // Index 0 = the "implied" asset: xfer_asset, config_asset, or freeze_asset
-            let id = if txn.xaid != 0 {
-                txn.xaid
-            } else if txn.config_asset != 0 {
-                txn.config_asset
-            } else {
-                txn.freeze_asset
-            };
-            if id == 0 {
-                return Err(AlgoError::Avm {
-                    message: "resolve_asset: index 0 but no implied asset".to_string(),
-                });
-            }
-            return Ok(id);
-        }
+        // Matches go's `resolveAsset` slot lookup: `ForeignAssets` is indexed
+        // 0-based (`ForeignAssets[ref]`), unlike `ForeignApps`/`Accounts`/
+        // `Access`, which reserve 0 for the current app/sender. There is no
+        // "implied asset" for index 0 (issue #1691).
         let assets = txn.foreign_assets.as_deref().unwrap_or(&[]);
-        let i = (index - 1) as usize;
-        if i < assets.len() {
-            return Ok(assets[i]);
+        if let Some(&id) = assets.get(index as usize) {
+            return Ok(id);
         }
         // Matches go-algorand's `resolveAsset` fallback slot lookup into
         // `tx.Access` (`Access[ref-1].Asset != 0`), tried after the legacy
         // `ForeignAssets` slot lookup.
         if let Some(access) = &txn.access {
-            if let Some(rr) = access.get(i) {
-                if rr.asset != 0 {
-                    return Ok(rr.asset);
+            if index > 0 {
+                if let Some(rr) = access.get((index - 1) as usize) {
+                    if rr.asset != 0 {
+                        return Ok(rr.asset);
+                    }
                 }
             }
         }
@@ -9129,29 +9118,54 @@ mod tests {
     }
 
     #[test]
-    fn resolve_asset_implied_and_foreign() {
+    fn resolve_asset_foreign_slots_are_zero_based() {
         // Realistic (> 255) ids: under the default (modern) consensus,
         // AppForbidLowResources forbids resolving low asset/app ids (see
         // `low_resource_ids_forbidden_under_app_forbid_low_resources` below),
         // so ordinary resolution-mechanics tests must use ids a real
         // AppForbidLowResources-era chain (first id 1001) would actually
-        // hand out.
+        // hand out. go's `resolveAsset` indexes `ForeignAssets[ref]`
+        // 0-based and has no "implied asset" for 0.
         let sender = [10u8; 32];
-        let mut txn = make_appl_txn(sender, 1042, vec![], vec![], vec![1050, 1060]);
-        txn.txn.xaid = 1099; // implied asset
+        let txn = make_appl_txn(sender, 1042, vec![], vec![], vec![1050, 1060]);
         let mut store = LedgerState::new();
         let ctx = make_context(&mut store, vec![txn]);
 
-        assert_eq!(ctx.resolve_asset(0).unwrap(), 1099);
-        assert_eq!(ctx.resolve_asset(1).unwrap(), 1050);
-        assert_eq!(ctx.resolve_asset(2).unwrap(), 1060);
-        assert!(ctx.resolve_asset(3).is_err());
+        assert_eq!(ctx.resolve_asset(0).unwrap(), 1050);
+        assert_eq!(ctx.resolve_asset(1).unwrap(), 1060);
+        assert!(ctx.resolve_asset(2).is_err());
+    }
+
+    /// Issue #1691: mainnet block 65684499, app 3471862384 called with
+    /// `ForeignAssets = [3471862598, 1023305054, 1186915166]` and no
+    /// xfer/config/freeze asset on the app call; the approval program
+    /// resolves asset slot 0, which go maps to `ForeignAssets[0]`.
+    #[test]
+    fn resolve_asset_slot_zero_is_first_foreign_asset_issue_1691() {
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(
+            sender,
+            3471862384,
+            vec![],
+            vec![],
+            vec![3471862598, 1023305054, 1186915166],
+        );
+        let mut store = LedgerState::new();
+        let ctx = make_context(&mut store, vec![txn]);
+        assert_eq!(ctx.resolve_asset(0).unwrap(), 3471862598);
+        assert_eq!(ctx.resolve_asset(2).unwrap(), 1186915166);
+        // No foreign assets: slot 0 is unavailable (go: "unavailable Asset 0").
+        let txn = make_appl_txn(sender, 3471862384, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let ctx = make_context(&mut store, vec![txn]);
+        let err = ctx.resolve_asset(0).unwrap_err();
+        assert!(err.to_string().contains("unavailable Asset 0"), "{err}");
     }
 
     #[test]
     fn resolve_app_current_and_foreign() {
         // Realistic (> 255) ids -- see comment on
-        // `resolve_asset_implied_and_foreign` above.
+        // `resolve_asset_foreign_slots_are_zero_based` above.
         let sender = [10u8; 32];
         let txn = make_appl_txn(sender, 1042, vec![], vec![1100, 1200], vec![]);
         let mut store = LedgerState::new();
@@ -9168,12 +9182,12 @@ mod tests {
     /// (`data/transactions/logic/evalStateful_test.go:1433`): a low integer
     /// naming an asset reference is interpreted as a direct asset ID when
     /// that ID is itself available (named in `ForeignAssets`/etc), and only
-    /// falls back to 1-based slot-index interpretation when it is not.
+    /// falls back to slot-index interpretation when it is not.
     #[test]
     fn resolve_asset_disambiguates_low_value_as_id_or_slot_index() {
         let sender = [10u8; 32];
         // ForeignAssets = [255, 256]: id 1 is not itself available, so `1`
-        // means slot 1 (1-based) -> ForeignAssets[0] = 255.
+        // means slot 1 (0-based, go `ForeignAssets[ref]`) -> 256.
         let mut txn = make_appl_txn(sender, 42, vec![], vec![], vec![255, 256]);
         let mut store = LedgerState::new();
         let mut ctx = make_context(&mut store, vec![txn.clone()]);
@@ -9184,8 +9198,8 @@ mod tests {
         .expect("v37 params");
         assert_eq!(
             ctx.resolve_asset(1).unwrap(),
-            255,
-            "1 is not a directly-available id, so it must resolve to slot 1 (ForeignAssets[0])"
+            256,
+            "1 is not a directly-available id, so it must resolve to slot 1 (ForeignAssets[1])"
         );
 
         // ForeignAssets = [1, 256]: id 1 IS itself available (named
@@ -9292,7 +9306,7 @@ mod tests {
         .expect("v37 params");
         assert!(!ctx.consensus.app_forbid_low_resources);
 
-        assert_eq!(ctx.resolve_asset(1).unwrap(), 50);
+        assert_eq!(ctx.resolve_asset(0).unwrap(), 50);
         assert_eq!(ctx.resolve_app(1).unwrap(), 100);
         assert_eq!(ctx.resolve_app(0).unwrap(), 42);
     }
