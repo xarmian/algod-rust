@@ -221,6 +221,18 @@ cp fixtures/block_{1,2,3,4,5}.msgpack crates/core/algo-codec/tests/fixtures/
 make canonical-extract
 ```
 
+## Resyncing after the DeltaAction numbering change (issue #1698)
+
+Before the `DeltaAction` renumbering (PR #1708), `ApplyMode::Replay` applied the
+`dt` recorded in go blocks with SetBytes/SetUint swapped, so app global/local
+state written by an `appl` transaction was stored with the wrong type or value.
+Nodes that follow with Execute mode (the node follow path since #1665, and
+`apply_block_caching_delta`) re-run the AVM and are unaffected. A ledger
+database built by Replay of `appl` blocks before this change (the pre-#1665
+follow path, `relay`, `replay` without `--avm-execute`) should be resynced from
+a catchpoint. Dev-mode data is not affected: the old encoder's output was never
+persisted.
+
 ## Running Tests
 
 ```bash

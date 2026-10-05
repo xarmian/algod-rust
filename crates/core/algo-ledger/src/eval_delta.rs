@@ -765,20 +765,28 @@ mod tests {
         assert_eq!(at_of(b"d"), 3, "delete => DeleteAction = 3");
     }
 
-    /// Real mainnet evidence (issue #1698).
+    /// Real mainnet evidence (issue #1698); every value below is real.
     ///
-    /// Provenance: the `dt` of mainnet round 65703970, txn index 12 (an app
-    /// call), from
-    /// `https://mainnet-api.4160.nodely.dev/v2/blocks/65703970?format=msgpack`.
-    /// Only three global-delta keys were kept (`block`, `last_miner_effort`,
-    /// `current_miner`; their entries are byte-for-byte as go produced them)
-    /// and the rest of the txn was trimmed. The trimming was done by hand and
-    /// verified by decoding; method (python `msgpack`): fetch the block,
-    /// `msgpack.unpackb(body, raw=True, strict_map_key=False)`, take
-    /// `[b"block"][b"txns"][12][b"dt"][b"gd"]`, keep the three keys, re-pack
-    /// as `{"gd": {...}}` with str `at`/`ui`/`bs` keys and print the hex.
-    /// Expected: `block` and `last_miner_effort` are uints (`at=2`),
-    /// `current_miner` is a 32-byte value (`at=1`).
+    /// Source: mainnet round 65703970, txn index 12 (txid
+    /// `PIKRXQRYL7D7APUYCEZ2DOUXLREDUJBSYKCXOGEI72FRJ6DUPC4A`, an app call to
+    /// app 1284326447), fetched with
+    /// `curl https://mainnet-api.4160.nodely.dev/v2/blocks/65703970?format=msgpack`.
+    /// Verbatim: the `at`/`ui`/`bs` of three global-delta keys, `block`
+    /// (`at=2`), `last_miner_effort` (`at=2`) and `current_miner` (`at=1`,
+    /// 32-byte `bs`). Trimmed (by hand, then checked by decoding): the other
+    /// global-delta keys and the rest of the txn were dropped, and the result
+    /// was re-packed as `{"gd": {...}}` with str keys. Method (python
+    /// `msgpack`): `unpackb(body, raw=True, strict_map_key=False)`, take
+    /// `[b"block"][b"txns"][12][b"dt"][b"gd"]`, keep the three keys, pack, hex.
+    ///
+    /// Cross-checks of the `at` values: the indexer's JSON for the same txn
+    /// (`https://mainnet-idx.4160.nodely.dev/v2/blocks/65703970`) reports
+    /// `block` action 2, `current_miner` action 1 (with bytes) and
+    /// `last_miner_effort` action 2; and the go-generated fixture
+    /// `crates/node/algo-rest-api/tests/fixtures/block_json/synthetic_appl.json`
+    /// (built by `gen_synthetic.go` with `basics.SetBytesAction` /
+    /// `SetUintAction`) uses `at=1` for bytes (`gkey`) and `at=2` for uints
+    /// (`cnt`).
     #[test]
     fn parse_real_mainnet_eval_delta_round_65703970() {
         let hex = "81a2676483c405626c6f636b82a2617402a27569ce03ea9022c40d63757272656e745f6d696e657282a2617401a26273c4208802144c5021e7246b08068ada102b27c26f0142e5417830210e024c259aca62c4116c6173745f6d696e65725f6566666f727482a2617402a27569cda028";
