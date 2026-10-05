@@ -6564,6 +6564,9 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             for s in txns.iter_mut() {
                 s.txn.group = group_id.0;
             }
+            // NOTE: the nested-context sibling snapshot (`siblings_snapshot`) and
+            // `effective_parent_txid` of a grouped inner appl must be taken
+            // AFTER this assignment: go's cx.txn.ID() includes the caller's Group.
         }
 
         // Each sibling's own InnerID (go `getTxID`/`getTxIDNotUnified`: offset
@@ -19785,6 +19788,63 @@ mod inner_group_id_tests {
             assert_ne!(want, [0u8; 32]);
             for s in &nested {
                 assert_eq!(s.txn.group, want, "unify={unify}");
+            }
+        }
+    }
+
+    /// A GROUPED inner appl (its own Group set because it was submitted in a
+    /// 2+ sibling inner group) that itself submits a 2-pay group. go's
+    /// `currentTxID()` / `cx.txn.ID()` for the nested parent covers the
+    /// caller's own Group, so the grandchild group id depends on the caller
+    /// carrying its Group at nested-execution time.
+    #[test]
+    fn grouped_inner_appl_submitting_a_group_uses_its_grouped_id_as_parent() {
+        for unify in [true, false] {
+            let mut store = fresh_store();
+            // B: submit a 2-pay group, then store `itxn TxID` (last sibling).
+            let mut b = submit_groups(&[vec![pay_fields(0xC1, 1), pay_fields(0xC2, 2)]]);
+            b.truncate(b.len() - 3); // drop "pushint 1; return"
+            b.extend(pushbytes(b"t"));
+            b.extend([0xb4, 23, 0x67]); // itxn TxID; app_global_put
+            b.extend(pushint(1));
+            b.push(0x43);
+            seed(&mut store, B, prog(b));
+            let (groups, ids, outer_id) = run(
+                &mut store,
+                submit_groups(&[vec![appl_fields(B), pay_fields(0xB1, 1)]]),
+                unify,
+            );
+            let call = &groups[0][0];
+            assert_ne!(call.txn.group, [0u8; 32], "B's call is itself grouped");
+            let ed =
+                crate::eval_delta::parse_eval_delta(call.eval_delta.as_ref().unwrap()).unwrap();
+            let nested = ed.inner_txns.expect("nested inner txns recorded");
+            assert_eq!(nested.len(), 2);
+            // Parent of B's inner group: B's InnerID over its GROUPED txn
+            // (unify) or the raw hash of its grouped txn (pre-v34).
+            let parent = if unify {
+                inner_id_as_is(&outer_id, 0, &call.txn)
+            } else {
+                algo_codec::compute_txn_id(&call.txn).0
+            };
+            assert_eq!(ids[0][0].0, inner_id_as_is(&outer_id, 0, &call.txn));
+            let refs: Vec<&Transaction> = nested.iter().map(|s| &s.txn).collect();
+            let want = indep_group_id(&parent, 0, unify, &refs);
+            for s in &nested {
+                assert_eq!(s.txn.group, want, "grandchild group, unify={unify}");
+            }
+            // Grandchild InnerIDs (offset base + index over the grouped txn).
+            // Pre-v34 `itxn TxID` read at depth > 0 goes through go's quirky
+            // getTxIDNotUnified cache, so only the unified read is pinned.
+            if unify {
+                let gs = &store.get_app_params(B).unwrap().global_state;
+                assert_eq!(
+                    gs.get(b"t".as_slice()),
+                    Some(&TealValue::Bytes(
+                        inner_id_as_is(&parent, 1, &nested[1].txn).to_vec()
+                    )),
+                    "grandchild InnerID"
+                );
             }
         }
     }
