@@ -103,38 +103,56 @@ fn directive_target_and_level(directive: &str) -> (&str, Option<&str>) {
     (target, eq.map(|i| directive[i + 1..].trim()))
 }
 
-/// A directive level that asks for more than the default `info`-and-above
-/// output on the target. No level means trace.
+/// Whether a directive level is a bare level word (or number).
+fn is_level_word(t: &str) -> bool {
+    const LEVELS: [&str; 6] = ["off", "error", "warn", "info", "debug", "trace"];
+    LEVELS.iter().any(|l| l.eq_ignore_ascii_case(t)) || t.chars().all(|c| c.is_ascii_digit())
+}
+
+/// A directive level that asks for more than the default output on the
+/// target: only trace/debug (5/4). `info` is the default and the flood is
+/// ERROR level, so `info` (3) keeps the limiter on. No level means trace.
 fn level_is_verbose(level: Option<&str>) -> bool {
     match level {
         None => true,
         Some(l) => matches!(
             l.to_ascii_lowercase().as_str(),
-            "trace" | "debug" | "info" | "5" | "4" | "3"
+            "trace" | "debug" | "5" | "4"
         ),
     }
 }
 
-/// True when a `RUST_LOG`-style `spec` has a verbose directive whose target
-/// is the noisy target or one of its ancestors (`hickory_proto`,
-/// `hickory_proto::dnssec`, ...), i.e. the operator asked for that output.
-/// Quieting directives (`warn`, `error`, `off`) do not count: the flood is
-/// ERROR level and would pass them, so the limiter must stay on.
+/// True when the operator's `RUST_LOG`-style `spec` asks for verbose
+/// (trace/debug) output on the noisy target: the most specific directive
+/// naming the target or one of its ancestors (`hickory_proto`,
+/// `hickory_proto::dnssec`, ...) decides, falling back to a bare global
+/// level directive (`debug`), as `EnvFilter` itself resolves directives.
+/// Quieting or default-level (`info`, `warn`, `error`, `off`) winners keep
+/// the limiter on: the flood is ERROR level and would pass them.
 fn names_noisy_target(spec: &str) -> bool {
-    const LEVELS: [&str; 6] = ["off", "error", "warn", "info", "debug", "trace"];
-    split_directives(spec).into_iter().any(|directive| {
+    // (specificity, verbose) of the best directive so far; later wins ties.
+    let mut best: Option<(usize, bool)> = None;
+    for directive in split_directives(spec) {
         let (target, level) = directive_target_and_level(directive);
-        if target.is_empty()
-            || LEVELS.iter().any(|l| l.eq_ignore_ascii_case(target))
-            || target.chars().all(|c| c.is_ascii_digit())
-        {
-            return false;
-        }
-        let ancestor = NOISY_TARGET_PATHS
+        let (specificity, verbose) = if target.is_empty() {
+            continue;
+        } else if is_level_word(target) && level.is_none() {
+            // Bare global level directive.
+            (0, level_is_verbose(Some(target)))
+        } else if NOISY_TARGET_PATHS
             .iter()
-            .any(|p| *p == target || p.starts_with(&format!("{target}::")));
-        ancestor && level_is_verbose(level)
-    })
+            .any(|p| *p == target || p.starts_with(&format!("{target}::")))
+        {
+            (target.len() + 1, level_is_verbose(level))
+        } else {
+            continue;
+        };
+        match best {
+            Some((sp, _)) if specificity < sp => {}
+            _ => best = Some((specificity, verbose)),
+        }
+    }
+    best.is_some_and(|(_, verbose)| verbose)
 }
 
 /// Result of interpreting `RUST_LOG`.
@@ -177,11 +195,27 @@ impl LogSetup {
     }
 }
 
-/// Fixed-window limiter: at most `burst` events per `window`.
+/// Limiter state: all mutated under one lock.
+#[derive(Default)]
+struct LimiterState {
+    /// Start of the current window, if one is open.
+    start: Option<Instant>,
+    /// Events passed in the current window.
+    passed: u32,
+    /// Events dropped in the current window.
+    dropped: u64,
+    /// Drops of already-ended windows not yet reported.
+    pending: u64,
+}
+
+/// Fixed-window limiter: at most `burst` events per `window`. The window
+/// boundary does not depend on events: whichever of `admit`/`flush` first
+/// observes the ended window rolls it, moving its drop count to `pending`
+/// (reported by `flush`) and resetting before anything else is counted.
 struct RateLimiter {
     burst: u32,
     window: Duration,
-    state: Mutex<(Option<Instant>, u32, u64)>, // (window start, passed, dropped)
+    state: Mutex<LimiterState>,
 }
 
 impl RateLimiter {
@@ -189,43 +223,43 @@ impl RateLimiter {
         Self {
             burst,
             window,
-            state: Mutex::new((None, 0, 0)),
+            state: Mutex::new(LimiterState::default()),
         }
     }
 
-    /// True when the event may pass. Events dropped in an earlier window that
-    /// was never flushed stay counted.
+    fn roll(&self, st: &mut LimiterState, now: Instant) {
+        if let Some(start) = st.start {
+            if now >= start + self.window {
+                st.pending += st.dropped;
+                st.dropped = 0;
+                st.passed = 0;
+                st.start = None;
+            }
+        }
+    }
+
+    /// True when the event may pass.
     fn admit(&self, now: Instant) -> bool {
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        match st.0 {
-            Some(start) if now < start + self.window => {
-                if st.1 < self.burst {
-                    st.1 += 1;
-                    true
-                } else {
-                    st.2 += 1;
-                    false
-                }
-            }
-            _ => {
-                *st = (Some(now), 1, st.2);
-                true
-            }
+        self.roll(&mut st, now);
+        if st.start.is_none() {
+            st.start = Some(now);
+        }
+        if st.passed < self.burst {
+            st.passed += 1;
+            true
+        } else {
+            st.dropped += 1;
+            false
         }
     }
 
-    /// If the current window has ended with dropped events, return (and
-    /// reset) their count so it is reported exactly once.
+    /// Return (and reset) the drop count of ended windows, so each is
+    /// reported once, with no further event required.
     fn flush(&self, now: Instant) -> Option<u64> {
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        match st.0 {
-            Some(start) if now >= start + self.window && st.2 > 0 => {
-                let dropped = st.2;
-                *st = (None, 0, 0);
-                Some(dropped)
-            }
-            _ => None,
-        }
+        self.roll(&mut st, now);
+        (st.pending > 0).then(|| std::mem::take(&mut st.pending))
     }
 }
 
@@ -236,7 +270,7 @@ fn spawn_summary_ticker(
     limiter: &Arc<RateLimiter>,
     tick: Duration,
     report: impl Fn(u64) + Send + 'static,
-) -> std::thread::JoinHandle<()> {
+) -> std::io::Result<std::thread::JoinHandle<()>> {
     let weak: Weak<RateLimiter> = Arc::downgrade(limiter);
     std::thread::Builder::new()
         .name("log-rate-summary".into())
@@ -249,13 +283,12 @@ fn spawn_summary_ticker(
                 report(n);
             }
         })
-        .expect("spawn log rate-limit summary thread")
 }
 
-/// Per-layer filter applying [`RateLimiter`] to noisy-target events.
+/// Per-layer filter applying [`RateLimiter`] to noisy-target events; `None`
+/// (operator override) lets everything through.
 struct NoisyTargetLimiter {
-    enabled: bool,
-    limiter: Arc<RateLimiter>,
+    limiter: Option<Arc<RateLimiter>>,
 }
 
 impl<S: Subscriber> Filter<S> for NoisyTargetLimiter {
@@ -264,10 +297,12 @@ impl<S: Subscriber> Filter<S> for NoisyTargetLimiter {
     }
 
     fn event_enabled(&self, event: &Event<'_>, _: &Context<'_, S>) -> bool {
-        if !self.enabled || !is_noisy_target(event.metadata().target()) {
-            return true;
+        match &self.limiter {
+            Some(limiter) if is_noisy_target(event.metadata().target()) => {
+                limiter.admit(Instant::now())
+            }
+            _ => true,
         }
-        self.limiter.admit(Instant::now())
     }
 }
 
@@ -284,10 +319,13 @@ pub fn init() {
         eprintln!("algod-rust: {w}");
     }
     let env = EnvFilter::try_new(&setup.filter_spec).unwrap_or_else(|_| EnvFilter::new("info"));
-    let limiter = Arc::new(RateLimiter::new(BURST, WINDOW));
-    if setup.rate_limit {
-        // Detached on purpose: it lives as long as the process.
-        drop(spawn_summary_ticker(&limiter, SUMMARY_TICK, |n| {
+    let limiter = setup
+        .rate_limit
+        .then(|| Arc::new(RateLimiter::new(BURST, WINDOW)));
+    if let Some(limiter) = &limiter {
+        // Detached on purpose: it lives as long as the process. A failed
+        // spawn (e.g. a container pids limit) only loses the summary line.
+        match spawn_summary_ticker(limiter, SUMMARY_TICK, |n| {
             tracing::warn!(
                 target: "algod_rust::log_setup",
                 suppressed = n,
@@ -295,13 +333,16 @@ pub fn init() {
                 "rate-limited hickory dnssec_dns_handle errors: suppressed {n} events in the \
                  last window (set RUST_LOG=hickory_proto=debug to see all)"
             );
-        }));
+        }) {
+            Ok(handle) => drop(handle),
+            Err(e) => eprintln!(
+                "algod-rust: could not start the log rate-limit summary thread ({e}); \
+                 suppressed-event summaries are disabled"
+            ),
+        }
     }
-    let filter = NoisyTargetLimiter {
-        enabled: setup.rate_limit,
-        limiter,
-    };
-    let layer = tracing_subscriber::fmt::layer().with_filter(env.and(filter));
+    let layer =
+        tracing_subscriber::fmt::layer().with_filter(env.and(NoisyTargetLimiter { limiter }));
     tracing_subscriber::registry().with(layer).init();
 }
 
@@ -311,16 +352,16 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn override_matrix_only_verbose_directives_disable_the_limiter() {
+    fn override_matrix_only_trace_or_debug_disables_the_limiter() {
         for spec in [
-            // verbose levels on the target or an ancestor
+            // trace/debug (or numeric 5/4) on the target or an ancestor
             "hickory_proto=trace",
             "hickory_proto=debug",
-            "hickory_proto=info",
-            "hickory_proto=INFO",
+            "hickory_proto=DEBUG",
             "hickory_proto=5",
+            "hickory_proto=4",
             "hickory_proto::dnssec=trace",
-            "hickory_proto::dnssec::dnssec_dns_handle=info",
+            "hickory_proto::dnssec::dnssec_dns_handle=debug",
             "hickory_proto::xfer::dnssec_dns_handle=debug",
             // no level means trace
             "hickory_proto",
@@ -328,22 +369,42 @@ mod tests {
             " info , hickory_proto::dnssec=debug ",
             // commas inside span/field filters must not confuse the parse
             "info,foo[span{a=1,b=2}]=debug,hickory_proto=debug",
+            // a global verbose default (operator debugging everything)
+            "debug",
+            "trace",
+            "5",
+            "TRACE",
+            "warn,debug",
+            "debug,algod_rust=info",
+            // the most specific directive wins
+            "warn,hickory_proto=debug",
+            "info,hickory_proto::dnssec=debug,hickory_proto=warn",
         ] {
             assert!(names_noisy_target(spec), "{spec} must disable the limiter");
         }
         for spec in [
-            // quieting directives keep the limiter: the flood is ERROR and
-            // would otherwise return in full
+            // info is the default and the flood is ERROR: the limiter stays on
+            "hickory_proto=info",
+            "hickory_proto=INFO",
+            "hickory_proto=3",
+            "hickory_proto::dnssec::dnssec_dns_handle=info",
+            // quieting directives keep the limiter
             "hickory_proto=warn",
-            "hickory_proto=WARN",
             "hickory_proto=error",
             "hickory_proto=off",
             "hickory_proto=1",
             "hickory_proto::dnssec::dnssec_dns_handle=error",
             " info , hickory_proto::dnssec=warn ",
-            // unrelated targets
+            // the specific directive beats a verbose global default
+            "debug,hickory_proto=info",
+            "trace,hickory_proto=warn",
+            "debug,hickory_proto::dnssec=error",
+            // non-verbose globals
             "info",
-            "DEBUG",
+            "warn",
+            "off",
+            "3",
+            // unrelated targets
             "algod_rust=debug",
             "hickory_resolver=debug",
             "hickory_proto::dnssec_other=trace",
@@ -391,8 +452,10 @@ mod tests {
         let s = LogSetup::resolve(Some("info,hickory_proto=trace"));
         assert_eq!(s.filter_spec, "info,hickory_proto=trace");
         assert!(!s.rate_limit);
-        let s = LogSetup::resolve(Some("info,hickory_proto=warn"));
-        assert!(s.rate_limit, "a quieting directive keeps the limiter");
+        let s = LogSetup::resolve(Some("debug"));
+        assert!(!s.rate_limit, "global debug disables the limiter");
+        let s = LogSetup::resolve(Some("debug,hickory_proto=info"));
+        assert!(s.rate_limit, "a specific info directive keeps the limiter");
     }
 
     #[test]
@@ -403,6 +466,9 @@ mod tests {
         let w = s.warning.expect("a warning naming the bad value");
         assert!(w.contains("info,foo[bar=trace"), "{w}");
     }
+
+    // The limiter is driven by explicit instants (a fake clock): no real
+    // time is involved in these tests.
 
     #[test]
     fn limiter_passes_burst_and_drops_the_rest() {
@@ -435,8 +501,30 @@ mod tests {
         assert_eq!(quiet.flush(t0 + w + Duration::from_secs(1)), None);
     }
 
+    /// Under a continuous flood the window boundary does not depend on
+    /// events: each window's drops are reported on their own, right after
+    /// that window ends, not merged into a later one.
     #[test]
-    fn drops_carried_into_a_new_window_are_not_lost() {
+    fn continuous_flood_reports_each_window_separately_and_promptly() {
+        let t0 = Instant::now();
+        let w = Duration::from_secs(60);
+        let l = RateLimiter::new(5, w);
+        let mut reports = Vec::new();
+        // One event per second for 130 s; the ticker flushes every second.
+        for sec in 0..130u64 {
+            let now = t0 + Duration::from_secs(sec);
+            l.admit(now);
+            if let Some(n) = l.flush(now) {
+                reports.push((sec, n));
+            }
+        }
+        // Window 1 is [0, 60): 60 events, 5 passed, 55 dropped, reported at
+        // the boundary (second 60). Window 2 is [60, 120): same, at 120.
+        assert_eq!(reports, vec![(60, 55), (120, 55)]);
+    }
+
+    #[test]
+    fn drops_of_an_unflushed_window_are_not_lost() {
         let t0 = Instant::now();
         let w = Duration::from_secs(60);
         let l = RateLimiter::new(1, w);
@@ -446,23 +534,26 @@ mod tests {
         assert_eq!(l.flush(t0 + w * 3), Some(1));
     }
 
+    /// Real-thread smoke test: asserts only that a summary is eventually
+    /// emitted and that the thread exits once the limiter is dropped. Exact
+    /// counts and timing are covered by the fake-clock tests above.
     #[test]
-    fn ticker_reports_a_burst_without_further_events_and_exits_on_drop() {
+    fn ticker_smoke_emits_a_summary_and_exits_on_drop() {
         let l = Arc::new(RateLimiter::new(2, Duration::from_millis(50)));
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
         let handle = spawn_summary_ticker(&l, Duration::from_millis(10), move |n| {
             sink.lock().unwrap().push(n)
-        });
+        })
+        .expect("spawn ticker");
         for _ in 0..10 {
             l.admit(Instant::now());
         }
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while seen.lock().unwrap().is_empty() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(*seen.lock().unwrap(), vec![8], "exactly one summary");
+        assert!(!seen.lock().unwrap().is_empty(), "a summary was emitted");
         drop(l);
         handle
             .join()
@@ -477,17 +568,12 @@ mod tests {
         }
     }
 
-    /// The filter, composed as `init` composes it, really drops the noisy
-    /// target after the burst while leaving other targets untouched.
-    #[test]
-    fn composed_filter_limits_only_the_noisy_target() {
+    fn count_events(limiter: Option<Arc<RateLimiter>>) -> usize {
         let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let limiter = NoisyTargetLimiter {
-            enabled: true,
-            limiter: Arc::new(RateLimiter::new(2, Duration::from_secs(3600))),
-        };
-        let sub = tracing_subscriber::registry()
-            .with(Count(seen.clone()).with_filter(EnvFilter::new("info").and(limiter)));
+        let sub = tracing_subscriber::registry().with(
+            Count(seen.clone())
+                .with_filter(EnvFilter::new("info").and(NoisyTargetLimiter { limiter })),
+        );
         tracing::subscriber::with_default(sub, || {
             for _ in 0..10 {
                 tracing::error!(target: "hickory_proto::dnssec::dnssec_dns_handle", "depth");
@@ -499,7 +585,17 @@ mod tests {
                 tracing::error!(target: "algo_network::srv_resolver", "other");
             }
         });
-        // 2 from the burst (the 0.24-style path shares the same budget) + 3.
-        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2 + 3);
+        seen.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The filter, composed as `init` composes it, really drops the noisy
+    /// target after the burst while leaving other targets untouched; with no
+    /// limiter (override, or no summary thread) everything passes.
+    #[test]
+    fn composed_filter_limits_only_the_noisy_target() {
+        let limiter = Some(Arc::new(RateLimiter::new(2, Duration::from_secs(3600))));
+        // 2 from the burst (both hickory paths share the budget) + 3 others.
+        assert_eq!(count_events(limiter), 2 + 3);
+        assert_eq!(count_events(None), 10 + 4 + 3);
     }
 }
