@@ -4275,6 +4275,15 @@ mod tests {
         let sender_key = SigningKey::from_bytes(&[0x55u8; 32]);
         let sender = Address(sender_key.verifying_key().to_bytes());
         let (adapter, ledger, gh) = seed_dev_adapter(sender, 10_000_000);
+        // The network's genesis id, as recorded by the seeded genesis block.
+        let genesis_id = ledger
+            .lock()
+            .unwrap()
+            .get_block_header(0)
+            .unwrap()
+            .expect("genesis header")
+            .genesis_id;
+        assert!(!genesis_id.is_empty(), "seeded genesis has an id");
 
         let txn = Transaction {
             txn_type: TxnType::Pay,
@@ -4284,7 +4293,7 @@ mod tests {
             fee: 1000,
             first_valid: Round(1),
             last_valid: Round(1000),
-            genesis_id: "localnet-v1".into(),
+            genesis_id: genesis_id.clone(),
             genesis_hash: gh,
             ..Default::default()
         };
@@ -4335,7 +4344,7 @@ mod tests {
             "txn_commitment must match the stripped-form payset commitment"
         );
         let restored = algo_validate::restore_payset_genesis_fields(&block);
-        assert_eq!(restored[0].txn.genesis_id, "localnet-v1");
+        assert_eq!(restored[0].txn.genesis_id, genesis_id);
         assert_eq!(compute_txn_id(&restored[0].txn), txid);
     }
 

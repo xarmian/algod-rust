@@ -18,15 +18,25 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Issue #1703: a block applied in `ApplyMode::Execute` evaluates a copy with
-//! the genesis id/hash restored (for `txn TxID`), but the block that is
-//! *stored* must stay in go's stripped `SignedTxnInBlock` form: `hgi` set,
-//! empty `gen`, zero `gh`, `hgh` unset when the protocol requires the hash
-//! (and set when it is optional and the submitter included it).
-//! The pay-only Execute tests and the app-call test cover the Execute path
-//! (where the restored copy exists); one test covers the real dispatch.
-//! The app-call test pins both halves: evaluation sees the full transaction
-//! (`txn TxID`), the stored bytes stay stripped.
+//! Issue #1703: a block applied in `ApplyMode::Execute` evaluates a copy
+//! with the genesis id/hash restored (so `txn TxID` is the id of the full
+//! transaction), but the block that is *stored* must stay in go's stripped
+//! `SignedTxnInBlock` form: `hgi` set, empty `gen`, zero `gh`, and `hgh`
+//! unset when the protocol requires the genesis hash (set when it is
+//! optional and the submitter included it).
+//!
+//! Paths taken:
+//! - `execute_pay_block_*` call `apply_block_with_mode(.., Execute)`
+//!   explicitly; they pin the stored form on a hash-requiring (v41) and a
+//!   hash-optional (v15) protocol.
+//! - `app_call_block_evaluates_full_txid_and_is_stored_stripped` goes through
+//!   `apply_block_executing_app_calls`, which Executes blocks containing an
+//!   app call; it pins both halves (evaluation sees the full id, storage
+//!   stays stripped).
+//! - `dispatch_pay_only_block_is_stored_stripped` goes through
+//!   `apply_block_executing_app_calls` with a pay-only block, which that
+//!   dispatcher applies in Replay mode (no restored copy exists there), so it
+//!   guards the dispatcher's stored form but cannot catch the regression.
 
 use algo_ledger::apply::{apply_block_executing_app_calls, apply_block_with_mode, ApplyMode};
 use algo_ledger::{LedgerState, LedgerStore};
@@ -109,8 +119,10 @@ fn assert_requires_hash(proto: &str, required: bool) {
     );
 }
 
-/// Execute is the mode where the evaluation copy has its genesis fields
-/// restored, i.e. where the #1703 regression lived: call it explicitly.
+/// Pins: Execute-mode apply of a stripped pay block stores it stripped
+/// (hgi set, no gen/gh) and leaves hgh unset because v41 requires the hash.
+/// Path: `apply_block_with_mode(.., ApplyMode::Execute)` (where the restored
+/// evaluation copy exists, i.e. where the regression lived).
 #[test]
 fn execute_pay_block_is_stored_stripped_on_hash_requiring_protocol() {
     assert_requires_hash(CONSENSUS_V41, true);
@@ -123,6 +135,9 @@ fn execute_pay_block_is_stored_stripped_on_hash_requiring_protocol() {
     );
 }
 
+/// Pins: Execute-mode apply on a protocol with an optional genesis hash
+/// (v15) stores the block stripped while keeping `hgh` set, as the submitter
+/// included the hash. Path: `apply_block_with_mode(.., ApplyMode::Execute)`.
 #[test]
 fn execute_pay_block_keeps_hgh_on_hash_optional_protocol() {
     assert_requires_hash(CONSENSUS_V15, false);
@@ -133,8 +148,10 @@ fn execute_pay_block_keeps_hgh_on_hash_optional_protocol() {
     assert!(stored.payset[0].has_genesis_hash, "hgh must be preserved");
 }
 
-/// The real follow-path dispatch: a pay-only block takes the Replay path
-/// there (no Execute), and must be stored stripped as well.
+/// Pins: the follow-path dispatcher stores a pay-only block stripped. Path:
+/// `apply_block_executing_app_calls`, which applies a block without app
+/// calls in Replay mode, so this does not exercise the Execute-mode restored
+/// copy and passes even without the #1703 fix.
 #[test]
 fn dispatch_pay_only_block_is_stored_stripped() {
     assert_requires_hash(CONSENSUS_V41, true);
@@ -144,8 +161,10 @@ fn dispatch_pay_only_block_is_stored_stripped() {
     assert!(!stored.payset[0].has_genesis_hash);
 }
 
-/// Both halves of the invariant in one test: the AVM sees the id of the FULL
-/// transaction (issue #1664), while the stored block stays stripped (#1703).
+/// Pins both halves of the invariant: the AVM sees the id of the FULL
+/// transaction (`txn TxID`, issue #1664) while the stored block stays
+/// stripped (#1703). Path: `apply_block_executing_app_calls` with an app-call
+/// block, which Executes it.
 #[test]
 fn app_call_block_evaluates_full_txid_and_is_stored_stripped() {
     let sender = Address([1u8; 32]);
