@@ -181,8 +181,8 @@ fn create_genesis_ledger_dir(
     // closest Rust match: purely lexical (prepends the cwd, collapses `.`/
     // `..` components) with no filesystem access, unlike `canonicalize()`
     // which would also resolve symlinks and require the path to exist. (Not
-    // `std::path::absolute`: it was only stabilised in Rust 1.79, after
-    // this lexical helper was written against the then-1.75 MSRV.)
+    // `std::path::absolute`: it does NOT collapse `..` components, which
+    // `filepath.Abs` and `TestEnsureAbsDir` require.)
     let abs_data_dir = lexical_absolute(data_dir)
         .with_context(|| format!("resolving absolute path for {}", data_dir.display()))?;
     let ledger_dir = abs_data_dir.join(genesis_id);
@@ -195,8 +195,8 @@ fn create_genesis_ledger_dir(
 /// join onto the current working directory if relative, then lexically
 /// clean `.`/`..` components -- no filesystem access, no symlink
 /// resolution, and no requirement that the path exist (unlike
-/// `Path::canonicalize`). MSRV-safe stand-in for `std::path::absolute`
-/// (stabilised in Rust 1.79, after the original 1.75 MSRV).
+/// `Path::canonicalize`). Not `std::path::absolute`, which leaves `..`
+/// components in place.
 fn lexical_absolute(path: &Path) -> std::io::Result<std::path::PathBuf> {
     let joined = if path.is_absolute() {
         path.to_path_buf()

@@ -380,8 +380,8 @@ mod tests {
             let _lock = env_lock().lock().unwrap_or_else(|p| p.into_inner());
             let prev = std::env::var(key).ok();
             // SAFETY: env mutation is racy across threads; we serialize
-            // via the process-wide mutex above. No `unsafe` needed on
-            // current stable Rust (1.75+).
+            // via the process-wide mutex above. No `unsafe` needed under
+            // edition 2021.
             std::env::set_var(key, value);
             Self {
                 key: key.to_string(),
