@@ -5785,6 +5785,24 @@ pub fn initialize_meta_from_catchpoint(
     Ok(())
 }
 
+/// The two secondary indexes of `catchpointbalances`, identical to the ones
+/// declared inside [`CATCHPOINT_STAGING_TABLES_SQL`].
+///
+/// The catchpoint importer drops them right after creating the staging
+/// tables and builds them once with this SQL after the last chunk is
+/// inserted: chunks arrive in `accountbase` rowid order, so the addresses are
+/// effectively random and maintaining a UNIQUE address B-tree while
+/// inserting rewrites nearly every index leaf page on every commit (a 30 GB
+/// WAL for the mainnet catchpoint). A single sorted `CREATE INDEX` over the
+/// finished table yields the byte-identical final index.
+pub(crate) const CATCHPOINT_BALANCES_INDEXES_SQL: &str = "
+CREATE UNIQUE INDEX IF NOT EXISTS catchpointbalances_address_idx
+    ON catchpointbalances (address);
+
+CREATE INDEX IF NOT EXISTS catchpointbalances_nob_idx
+    ON catchpointbalances ( normalizedonlinebalance, address, data ) WHERE normalizedonlinebalance>0;
+";
+
 /// DDL for catchpoint staging tables (matches go-algorand exactly).
 ///
 /// This is the single source of truth for staging table schemas. The

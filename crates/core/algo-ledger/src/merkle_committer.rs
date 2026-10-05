@@ -116,8 +116,11 @@ impl<'c> SqliteMerkleCommitter<'c> {
     pub fn load_page_bytes(&self, id: u64) -> Result<Option<Vec<u8>>, AlgoError> {
         let sql = format!("SELECT data FROM {} WHERE id = ?1", self.table.table_name());
         self.conn
-            .query_row(&sql, params![id as i64], |row| row.get(0))
-            .optional()
+            .prepare_cached(&sql)
+            .and_then(|mut stmt| {
+                stmt.query_row(params![id as i64], |row| row.get(0))
+                    .optional()
+            })
             .map_err(|e| AlgoError::Ledger {
                 message: format!("LoadPage {} id={id}: {e}", self.table.unqualified()),
             })
@@ -156,7 +159,8 @@ impl<'c> SqliteMerkleCommitter<'c> {
                 self.table.table_name()
             );
             self.conn
-                .execute(&sql, params![id as i64, content])
+                .prepare_cached(&sql)
+                .and_then(|mut stmt| stmt.execute(params![id as i64, content]))
                 .map(|_| ())
                 .map_err(|e| AlgoError::Ledger {
                     message: format!(
@@ -178,7 +182,8 @@ impl<'c> SqliteMerkleCommitter<'c> {
     pub fn delete_page(&self, id: u64) -> Result<(), AlgoError> {
         let sql = format!("DELETE FROM {} WHERE id = ?1", self.table.table_name());
         self.conn
-            .execute(&sql, params![id as i64])
+            .prepare_cached(&sql)
+            .and_then(|mut stmt| stmt.execute(params![id as i64]))
             .map(|_| ())
             .map_err(|e| AlgoError::Ledger {
                 message: format!("DeletePage {} id={id}: {e}", self.table.unqualified()),
@@ -406,8 +411,11 @@ impl PageCommitter for OwnedSqliteCommitter {
     fn load_page(&self, id: u64) -> Result<Option<Vec<u8>>, AlgoError> {
         let sql = format!("SELECT data FROM {} WHERE id = ?1", self.table.table_name());
         self.conn
-            .query_row(&sql, params![id as i64], |row| row.get(0))
-            .optional()
+            .prepare_cached(&sql)
+            .and_then(|mut stmt| {
+                stmt.query_row(params![id as i64], |row| row.get(0))
+                    .optional()
+            })
             .map_err(|e| AlgoError::Ledger {
                 message: format!(
                     "OwnedSqliteCommitter::load_page({}, id={id}) [{}]: {e}",
@@ -437,7 +445,8 @@ impl PageCommitter for OwnedSqliteCommitter {
         if content.is_empty() {
             let sql = format!("DELETE FROM {} WHERE id = ?1", self.table.table_name());
             self.conn
-                .execute(&sql, params![id as i64])
+                .prepare_cached(&sql)
+                .and_then(|mut stmt| stmt.execute(params![id as i64]))
                 .map(|_| ())
                 .map_err(|e| AlgoError::Ledger {
                     message: format!(
@@ -452,7 +461,8 @@ impl PageCommitter for OwnedSqliteCommitter {
                 self.table.table_name()
             );
             self.conn
-                .execute(&sql, params![id as i64, content])
+                .prepare_cached(&sql)
+                .and_then(|mut stmt| stmt.execute(params![id as i64, content]))
                 .map(|_| ())
                 .map_err(|e| AlgoError::Ledger {
                     message: format!(

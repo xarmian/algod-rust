@@ -214,6 +214,22 @@ impl CatchpointReaderFile {
         }
     }
 
+    /// Read only the [`CatchpointFileHeader`], without decoding any chunk.
+    ///
+    /// go writes `content.msgpack` as the first tar entry, so this stops as
+    /// soon as it is found and never inflates or decodes the bulk of the
+    /// file (a full pass over a mainnet catchpoint cost ~119 s). If some
+    /// other writer put the header after chunk entries, the remaining
+    /// entries are still scanned by name only (no chunk decoding), so the
+    /// result is identical to a full [`Self::for_each`] pass.
+    pub fn read_header(mut self) -> Result<CatchpointFileHeader, CatchpointError> {
+        match &mut self.inner {
+            FileInner::Raw(archive) => scan_header(archive, &mut self.cached_header),
+            FileInner::Gzip(archive) => scan_header(archive, &mut self.cached_header),
+            FileInner::Snappy(archive) => scan_header(archive, &mut self.cached_header),
+        }
+    }
+
     /// Returns the cached header if `content.msgpack` has already been read.
     pub fn header(&self) -> Option<&CatchpointFileHeader> {
         self.cached_header.as_ref()
@@ -319,6 +335,30 @@ where
     }
 
     Ok(())
+}
+
+/// Find and decode the `content.msgpack` entry, skipping every other entry
+/// without reading its body.
+fn scan_header<R: Read>(
+    archive: &mut tar::Archive<R>,
+    cached_header: &mut Option<CatchpointFileHeader>,
+) -> Result<CatchpointFileHeader, CatchpointError> {
+    for entry_result in archive.entries().map_err(CatchpointError::Io)? {
+        let mut entry = entry_result.map_err(CatchpointError::Io)?;
+        let is_header = entry
+            .path()
+            .map_err(CatchpointError::Io)?
+            .to_str()
+            .map(|p| p == CONTENT_FILENAME)
+            .unwrap_or(false);
+        if !is_header {
+            continue;
+        }
+        if let Some(CatchpointEntry::Header(h)) = process_entry(&mut entry, cached_header)? {
+            return Ok(h);
+        }
+    }
+    Err(CatchpointError::MissingHeader)
 }
 
 /// Scan the leading tar entries for [`STATE_ROUND_MARKER_FILENAME`].

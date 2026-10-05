@@ -28,6 +28,7 @@
 //! Reference: `go-algorand/ledger/ledgercore/catchpointlabel.go` —
 //! `ParseCatchpointLabel`, `MakeLabel`, `CatchpointLabelMakerV6/V7/Current`.
 
+use super::element_sort::{ElementSortDir, SortedRunMerger};
 use data_encoding::BASE32_NOPAD;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256, Sha512_256};
@@ -857,6 +858,376 @@ fn persist_rebuilt_trie(
     }
 }
 
+/// Elements held in memory per worker before a sorted run is spilled to disk
+/// (36 B each: 1M elements = 36 MiB per worker).
+const TRIE_REBUILD_RUN_CAPACITY: usize = 1 << 20;
+
+/// Upper bound on parallel hashing workers for the verify rebuild.
+const TRIE_REBUILD_MAX_WORKERS: usize = 4;
+
+/// Whether the opt-in #1636 diagnostics (source-table `COUNT(*)` cross-check,
+/// 256-bucket fingerprint) are enabled.
+fn verify_diagnostics_enabled() -> bool {
+    std::env::var_os("ALGOD_CATCHPOINT_VERIFY_DIAGNOSTICS")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+}
+
+/// Number of hashing workers: the machine's parallelism, capped. The trie
+/// root does not depend on this value.
+fn default_trie_rebuild_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, TRIE_REBUILD_MAX_WORKERS)
+}
+
+/// Result of [`stage_sorted_elements`].
+struct StagedElements {
+    runs: Vec<std::path::PathBuf>,
+    total_elements: u64,
+    accounts: u64,
+    resources: u64,
+    kvs: u64,
+    affinity_tracker: crate::trie_hash::AffinityAnomalyTracker,
+    unexpected_ctype_count: u64,
+    unexpected_ctype_samples: Vec<(i64, i64)>,
+}
+
+#[derive(Default)]
+struct WorkerStats {
+    runs: Vec<std::path::PathBuf>,
+    total_elements: u64,
+    accounts: u64,
+    resources: u64,
+    kvs: u64,
+    affinity_tracker: crate::trie_hash::AffinityAnomalyTracker,
+    unexpected_ctype_count: u64,
+    unexpected_ctype_samples: Vec<(i64, i64)>,
+}
+
+fn import_err(what: &str, e: impl std::fmt::Display) -> CatchpointError {
+    CatchpointError::ImportError(format!("{what}: {e}"))
+}
+
+/// Compute every trie element (accounts, resources, kvs) of the database at
+/// `db_path` and spill them as sorted runs under `dir`.
+///
+/// `accountbase` is split into `workers` disjoint rowid ranges; resources
+/// follow their owning account's range (`resources.addrid`), kv entries go to
+/// worker 0. Each worker reads through its own read-only connection.
+fn stage_sorted_elements(
+    db_path: &str,
+    workers: usize,
+    run_capacity: usize,
+    dir: &std::path::Path,
+    dump_path: Option<&std::ffi::OsStr>,
+) -> Result<StagedElements, CatchpointError> {
+    use rusqlite::OpenFlags;
+
+    let workers = if dump_path.is_some() {
+        1
+    } else {
+        workers.max(1)
+    };
+
+    // Split points over the accountbase rowid space.
+    let bounds: Option<(i64, i64)> = {
+        let c = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| import_err("open trie-rebuild bounds connection", e))?;
+        c.query_row("SELECT MIN(rowid), MAX(rowid) FROM accountbase", [], |r| {
+            Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?))
+        })
+        .map_err(|e| import_err("query accountbase rowid bounds", e))
+        .map(|(lo, hi)| lo.zip(hi))?
+    };
+    let mut ranges: Vec<(i64, i64)> = Vec::with_capacity(workers);
+    match bounds {
+        Some((lo, hi)) if workers > 1 => {
+            let span = (hi as i128 - lo as i128 + 1).max(1);
+            for w in 0..workers as i128 {
+                let start = lo as i128 + span * w / workers as i128;
+                let end = lo as i128 + span * (w + 1) / workers as i128;
+                let start = if w == 0 { i64::MIN as i128 } else { start };
+                let end = if w == workers as i128 - 1 {
+                    i64::MAX as i128
+                } else {
+                    end
+                };
+                ranges.push((start as i64, end as i64));
+            }
+        }
+        _ => ranges.push((i64::MIN, i64::MAX)),
+    }
+    let last_range = ranges.len() - 1;
+
+    let outputs: Vec<Result<WorkerStats, CatchpointError>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = ranges
+            .iter()
+            .enumerate()
+            .map(|(w, &(lo, hi))| {
+                let include_end = w == last_range;
+                scope.spawn(move || {
+                    stage_worker(
+                        db_path,
+                        w,
+                        lo,
+                        hi,
+                        include_end,
+                        w == 0,
+                        run_capacity,
+                        dir,
+                        dump_path.filter(|_| w == 0),
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join().unwrap_or_else(|_| {
+                    Err(CatchpointError::ImportError(
+                        "trie rebuild hashing worker panicked".to_string(),
+                    ))
+                })
+            })
+            .collect()
+    });
+
+    // Merge in worker order so the aggregate (diagnostic) state is
+    // deterministic too.
+    let mut out = StagedElements {
+        runs: Vec::new(),
+        total_elements: 0,
+        accounts: 0,
+        resources: 0,
+        kvs: 0,
+        affinity_tracker: Default::default(),
+        unexpected_ctype_count: 0,
+        unexpected_ctype_samples: Vec::new(),
+    };
+    for r in outputs {
+        let w = r?;
+        out.runs.extend(w.runs);
+        out.total_elements += w.total_elements;
+        out.accounts += w.accounts;
+        out.resources += w.resources;
+        out.kvs += w.kvs;
+        let t = &mut out.affinity_tracker;
+        t.decode_failures += w.affinity_tracker.decode_failures;
+        t.non_map_values += w.affinity_tracker.non_map_values;
+        t.z_present_not_u64 += w.affinity_tracker.z_present_not_u64;
+        t.c_present_not_u64 += w.affinity_tracker.c_present_not_u64;
+        for s in w.affinity_tracker.samples {
+            if t.samples.len() < 32 {
+                t.samples.push(s);
+            }
+        }
+        out.unexpected_ctype_count += w.unexpected_ctype_count;
+        for s in w.unexpected_ctype_samples {
+            if out.unexpected_ctype_samples.len() < 32 {
+                out.unexpected_ctype_samples.push(s);
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_worker(
+    db_path: &str,
+    worker: usize,
+    lo: i64,
+    hi: i64,
+    include_hi: bool,
+    do_kvs: bool,
+    run_capacity: usize,
+    dir: &std::path::Path,
+    dump_path: Option<&std::ffi::OsStr>,
+) -> Result<WorkerStats, CatchpointError> {
+    use crate::trie_hash::{
+        extract_raw_affinity_tracked, extract_raw_resource_affinity_tracked, kv_hash_v6, HashKind,
+    };
+    use rusqlite::OpenFlags;
+    use std::io::Write;
+
+    const CTYPE_APP: i64 = 1;
+    const CTYPE_ASSET: i64 = 0;
+    const CTYPE_SAMPLE_CAP: usize = 32;
+
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| import_err("open trie-rebuild worker connection", e))?;
+
+    // Issue #1636 (seventh round): optional raw per-element hash+locator
+    // dump (`<72-hex 36-byte element> <locator>`), single-worker only.
+    let mut hash_dump = dump_path
+        .map(|path| -> Result<_, CatchpointError> {
+            let f = std::fs::File::create(path)
+                .map_err(|e| import_err("open ALGOD_CATCHPOINT_DUMP_HASHES file", e))?;
+            Ok(std::io::BufWriter::with_capacity(8 * 1024 * 1024, f))
+        })
+        .transpose()?;
+
+    let mut stats = WorkerStats::default();
+    let mut buf = super::element_sort::RunBuffer::new(dir, worker, run_capacity);
+
+    // `hi` is exclusive except for the last range (i64::MAX, inclusive).
+    let hi_sql = if include_hi { "<=" } else { "<" };
+
+    // Accounts.
+    {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT rowid, address, data FROM accountbase \
+                 WHERE rowid >= ?1 AND rowid {hi_sql} ?2 ORDER BY rowid"
+            ))
+            .map_err(|e| import_err("prepare accounts for trie rebuild", e))?;
+        let mut rows = stmt
+            .query(rusqlite::params![lo, hi])
+            .map_err(|e| import_err("query accounts for trie rebuild", e))?;
+        while let Some(row) = rows.next().map_err(|e| import_err("read account row", e))? {
+            let rowid: i64 = row
+                .get(0)
+                .map_err(|e| import_err("read account rowid", e))?;
+            let addr_bytes = row
+                .get_ref(1)
+                .and_then(|v| v.as_blob().map_err(Into::into))
+                .map_err(|e| import_err("read account address", e))?;
+            let data = row
+                .get_ref(2)
+                .and_then(|v| v.as_blob().map_err(Into::into))
+                .map_err(|e| import_err("read account data", e))?;
+            if addr_bytes.len() != 32 {
+                return Err(CatchpointError::ImportError(format!(
+                    "bad address length {} (expected 32) in accountbase",
+                    addr_bytes.len()
+                )));
+            }
+            let mut addr = [0u8; 32];
+            addr.copy_from_slice(addr_bytes);
+            let affinity = extract_raw_affinity_tracked(
+                data,
+                format!("account rowid={rowid}"),
+                &mut stats.affinity_tracker,
+            );
+            let elem = raw_account_element(&addr, data, affinity);
+            if let Some(w) = hash_dump.as_mut() {
+                writeln!(w, "{} A {}", hex::encode(elem), hex::encode(addr))
+                    .map_err(|e| import_err("hash dump write", e))?;
+            }
+            buf.push(elem)?;
+            stats.accounts += 1;
+        }
+    }
+
+    // Resources (inner join: a resource without an account row is dropped,
+    // exactly as before).
+    {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT r.aidx, r.ctype, r.data, a.address \
+                 FROM resources r JOIN accountbase a ON a.rowid = r.addrid \
+                 WHERE r.addrid >= ?1 AND r.addrid {hi_sql} ?2"
+            ))
+            .map_err(|e| import_err("prepare resources for trie rebuild", e))?;
+        let mut rows = stmt
+            .query(rusqlite::params![lo, hi])
+            .map_err(|e| import_err("query resources for trie rebuild", e))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| import_err("read resource row", e))?
+        {
+            let aidx: i64 = row
+                .get(0)
+                .map_err(|e| import_err("read resource aidx", e))?;
+            let ctype: i64 = row
+                .get(1)
+                .map_err(|e| import_err("read resource ctype", e))?;
+            let rdata = row
+                .get_ref(2)
+                .and_then(|v| v.as_blob().map_err(Into::into))
+                .map_err(|e| import_err("read resource data", e))?;
+            let addr_bytes = row
+                .get_ref(3)
+                .and_then(|v| v.as_blob().map_err(Into::into))
+                .map_err(|e| import_err("read resource address", e))?;
+            if addr_bytes.len() != 32 {
+                return Err(CatchpointError::ImportError(format!(
+                    "bad address length {} (expected 32) for resource aidx={aidx}",
+                    addr_bytes.len()
+                )));
+            }
+            let mut addr = [0u8; 32];
+            addr.copy_from_slice(addr_bytes);
+            // Issue #1636: count (don't silently fold into Asset) any ctype
+            // outside the two values go's resources table uses.
+            if ctype != CTYPE_APP && ctype != CTYPE_ASSET {
+                stats.unexpected_ctype_count += 1;
+                if stats.unexpected_ctype_samples.len() < CTYPE_SAMPLE_CAP {
+                    stats.unexpected_ctype_samples.push((aidx, ctype));
+                }
+            }
+            // The resource's own UpdateRound, no fallback (matches go's
+            // ResourcesHashBuilderV6; issue #1636 sixth round).
+            let affinity = extract_raw_resource_affinity_tracked(
+                rdata,
+                format!("resource aidx={aidx} ctype={ctype}"),
+                &mut stats.affinity_tracker,
+            );
+            let kind = if ctype == CTYPE_APP {
+                HashKind::App as u8
+            } else {
+                HashKind::Asset as u8
+            };
+            let elem = raw_resource_element(&addr, aidx as u64, rdata, affinity, kind);
+            if let Some(w) = hash_dump.as_mut() {
+                writeln!(w, "{} R {}:{}", hex::encode(elem), hex::encode(addr), aidx)
+                    .map_err(|e| import_err("hash dump write", e))?;
+            }
+            buf.push(elem)?;
+            stats.resources += 1;
+        }
+    }
+
+    // KV (box) entries.
+    if do_kvs {
+        let mut stmt = conn
+            .prepare("SELECT key, value FROM kvstore")
+            .map_err(|e| import_err("prepare kvstore for trie rebuild", e))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| import_err("query kvstore for trie rebuild", e))?;
+        while let Some(row) = rows.next().map_err(|e| import_err("read kvstore row", e))? {
+            let key = row
+                .get_ref(0)
+                .and_then(|v| v.as_blob().map_err(Into::into))
+                .map_err(|e| import_err("read kvstore key", e))?;
+            let value = row
+                .get_ref(1)
+                .and_then(|v| v.as_blob().map_err(Into::into))
+                .map_err(|e| import_err("read kvstore value", e))?;
+            let elem = kv_hash_v6(key, value);
+            if let Some(w) = hash_dump.as_mut() {
+                writeln!(w, "{} K {}", hex::encode(elem), hex::encode(key))
+                    .map_err(|e| import_err("hash dump write", e))?;
+            }
+            buf.push(elem)?;
+            stats.kvs += 1;
+        }
+    }
+    if let Some(w) = hash_dump.as_mut() {
+        w.flush().map_err(|e| import_err("hash dump flush", e))?;
+    }
+
+    let (runs, total) = buf.finish()?;
+    stats.runs = runs;
+    stats.total_elements = total;
+    Ok(stats)
+}
+
 /// Number of elements added between periodic `commit()` + `evict()` passes
 /// during [`build_and_persist_trie_chunked`]. Matches go-algorand's
 /// `trieRebuildCommitFrequency` (`ledger/catchpointtracker.go:57`) exactly —
@@ -902,15 +1273,25 @@ const TRIE_REBUILD_COMMIT_FREQUENCY: u64 = 65536;
 fn build_and_persist_trie_chunked(
     conn: &Connection,
 ) -> Result<crate::merkle_trie::MerkleTrie, CatchpointError> {
+    build_and_persist_trie_chunked_with(
+        conn,
+        default_trie_rebuild_workers(),
+        TRIE_REBUILD_RUN_CAPACITY,
+    )
+}
+
+/// [`build_and_persist_trie_chunked`] with an explicit hashing worker count
+/// and per-worker sorted-run capacity (tests use tiny values to force many
+/// runs and several workers; the resulting trie never depends on them).
+fn build_and_persist_trie_chunked_with(
+    conn: &Connection,
+    workers: usize,
+    run_capacity: usize,
+) -> Result<crate::merkle_trie::MerkleTrie, CatchpointError> {
     use crate::merkle_committer::{CommitterTable, OwnedSqliteCommitter};
     use crate::merkle_trie::MerkleTrie;
-    use crate::trie_hash::{
-        extract_raw_affinity_tracked, extract_raw_resource_affinity_tracked, kv_hash_v6,
-        AffinityAnomalyTracker, HashKind, ELEMENT_SIZE,
-    };
+    use crate::trie_hash::ELEMENT_SIZE;
 
-    const CTYPE_APP: i64 = 1;
-    const CTYPE_ASSET: i64 = 0;
     // Issue #1636 (sixth investigation round): real-data bisection. Every
     // element inserted in pass 2 is bucketed by the high byte of its
     // 36-byte trie-key (`data[0]`, the top byte of `affinity` — the same
@@ -923,9 +1304,17 @@ fn build_and_persist_trie_chunked(
     // something concrete to diff against, without needing to persist the
     // full 76.9M-row scratch table as a workflow artifact.
     const N_BUCKETS: usize = 256;
-    const AFFINITY_CTYPE_SAMPLE_CAP: usize = 32;
 
-    let Some(db_path) = conn.path() else {
+    // Workers read through their own connections, so they can only see
+    // committed data; with an open transaction on `conn` (or no file path)
+    // use the simple in-memory build instead.
+    // An in-memory / temp database reports an empty path.
+    let db_path_opt = if conn.is_autocommit() {
+        conn.path().filter(|p| !p.is_empty())
+    } else {
+        None
+    };
+    let Some(db_path) = db_path_opt else {
         // In-memory connection (tests) — no path to reopen. Fall back to
         // the unbounded single-pass build; test fixtures are small.
         let mut trie = build_trie_from_db(conn)?;
@@ -933,6 +1322,7 @@ fn build_and_persist_trie_chunked(
         return Ok(trie);
     };
     let db_path = db_path.to_string();
+    let dump_path = std::env::var_os("ALGOD_CATCHPOINT_DUMP_HASHES");
 
     let write_committer = OwnedSqliteCommitter::open_writable(&db_path, CommitterTable::Active)
         .map_err(|e| CatchpointError::ImportError(format!("open writable trie committer: {e}")))?;
@@ -1057,247 +1447,46 @@ fn build_and_persist_trie_chunked(
     // commit/evict is unchanged from before. The scratch table is
     // process-local (created and dropped inside this function) and never
     // touches `accountbase`/`resources`/`kvstore`/`accounthashes`.
-    const PENDING_HASHES_TABLE: &str = "catchpoint_verify_pending_hashes";
-    conn.execute_batch(&format!(
-        "DROP TABLE IF EXISTS {PENDING_HASHES_TABLE};
-         CREATE TABLE {PENDING_HASHES_TABLE} (data BLOB NOT NULL);"
-    ))
-    .map_err(|e| {
-        CatchpointError::ImportError(format!("create trie-rebuild pending-hashes table: {e}"))
-    })?;
-
-    // Issue #1636 (seventh investigation round): optional raw per-element
-    // hash+locator dump for cross-implementation bisection against
-    // go-algorand's own real reference hash computation
-    // (`AccountHashBuilderV6`/`ResourcesHashBuilderV6`/`KvHashBuilderV6`),
-    // gated behind an env var so it costs nothing on the normal path. Each
-    // line is `<72-hex-char 36-byte element> <locator>\n`, using a locator
-    // format matched by the equivalent temporary go-algorand instrumentation
-    // (`A <addr_hex>` for accounts, `R <addr_hex>:<aidx>` for resources,
-    // `K <key_hex>` for kv/box entries) so a divergent hash value found by
-    // sorting-and-diffing both sides' dumps can be traced straight back to
-    // its source record without any further lookup.
-    let mut hash_dump: Option<std::io::BufWriter<std::fs::File>> =
-        std::env::var_os("ALGOD_CATCHPOINT_DUMP_HASHES")
-            .map(|path| -> Result<_, CatchpointError> {
-                let f = std::fs::File::create(&path).map_err(|e| {
-                    CatchpointError::ImportError(format!(
-                        "open ALGOD_CATCHPOINT_DUMP_HASHES file: {e}"
-                    ))
-                })?;
-                Ok(std::io::BufWriter::with_capacity(8 * 1024 * 1024, f))
-            })
-            .transpose()?;
-
-    // Pass 1: compute every element's raw hash bytes and stage them,
-    // wrapped in one transaction (a straight bulk INSERT — no trie
-    // activity happens during this pass, so there is no periodic-commit
-    // interaction to worry about here).
-    conn.execute_batch("BEGIN;").map_err(|e| {
-        CatchpointError::ImportError(format!("begin trie-rebuild pending-hashes staging: {e}"))
-    })?;
-    let mut affinity_tracker = AffinityAnomalyTracker::default();
-    let mut unexpected_ctype_count: u64 = 0;
-    let mut unexpected_ctype_samples: Vec<(i64, i64)> = Vec::new();
-    let stage_result = (|| -> Result<(), CatchpointError> {
-        let mut insert_stmt = conn
-            .prepare(&format!(
-                "INSERT INTO {PENDING_HASHES_TABLE}(data) VALUES (?1)"
-            ))
-            .map_err(|e| {
-                CatchpointError::ImportError(format!("prepare pending-hashes insert: {e}"))
-            })?;
-
-        // 1a. Accounts.
-        {
-            let mut stmt = conn
-                .prepare("SELECT rowid, address, data FROM accountbase")
-                .map_err(|e| {
-                    CatchpointError::ImportError(format!("prepare accounts for trie rebuild: {e}"))
-                })?;
-            let rows = stmt
-                .query_map([], |row| {
-                    let rowid: i64 = row.get(0)?;
-                    let addr_bytes: Vec<u8> = row.get(1)?;
-                    let data: Vec<u8> = row.get(2)?;
-                    Ok((rowid, addr_bytes, data))
-                })
-                .map_err(|e| {
-                    CatchpointError::ImportError(format!("query accounts for trie rebuild: {e}"))
-                })?;
-            for row in rows {
-                let (rowid, addr_bytes, data) = row
-                    .map_err(|e| CatchpointError::ImportError(format!("read account row: {e}")))?;
-                if addr_bytes.len() != 32 {
-                    return Err(CatchpointError::ImportError(format!(
-                        "bad address length {} (expected 32) in accountbase",
-                        addr_bytes.len()
-                    )));
-                }
-                let mut addr = [0u8; 32];
-                addr.copy_from_slice(&addr_bytes);
-                let affinity = extract_raw_affinity_tracked(
-                    &data,
-                    format!("account rowid={rowid}"),
-                    &mut affinity_tracker,
-                );
-                let elem = raw_account_element(&addr, &data, affinity);
-                if let Some(w) = hash_dump.as_mut() {
-                    use std::io::Write;
-                    writeln!(w, "{} A {}", hex::encode(elem), hex::encode(addr)).map_err(|e| {
-                        CatchpointError::ImportError(format!("hash dump write: {e}"))
-                    })?;
-                }
-                insert_stmt
-                    .execute(rusqlite::params![elem.as_slice()])
-                    .map_err(|e| {
-                        CatchpointError::ImportError(format!("stage account hash: {e}"))
-                    })?;
-            }
-        }
-
-        // 1b. Resources.
-        {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT r.aidx, r.ctype, r.data, a.address \
-                     FROM resources r \
-                     JOIN accountbase a ON a.rowid = r.addrid",
-                )
-                .map_err(|e| {
-                    CatchpointError::ImportError(format!("prepare resources for trie rebuild: {e}"))
-                })?;
-            let rows = stmt
-                .query_map([], |row| {
-                    let aidx: i64 = row.get(0)?;
-                    let ctype: i64 = row.get(1)?;
-                    let rdata: Vec<u8> = row.get(2)?;
-                    let addr_bytes: Vec<u8> = row.get(3)?;
-                    Ok((aidx, ctype, rdata, addr_bytes))
-                })
-                .map_err(|e| {
-                    CatchpointError::ImportError(format!("query resources for trie rebuild: {e}"))
-                })?;
-            for row in rows {
-                let (aidx, ctype, rdata, addr_bytes) = row
-                    .map_err(|e| CatchpointError::ImportError(format!("read resource row: {e}")))?;
-                if addr_bytes.len() != 32 {
-                    return Err(CatchpointError::ImportError(format!(
-                        "bad address length {} (expected 32) for resource aidx={aidx}",
-                        addr_bytes.len()
-                    )));
-                }
-                let mut addr = [0u8; 32];
-                addr.copy_from_slice(&addr_bytes);
-                // Issue #1636: log (don't just silently bucket-as-Asset) any
-                // ctype outside the two values go-algorand's resources table
-                // actually uses. `raw_resource_element`'s HashKind mapping
-                // was audited against go's `rdGetCreatableHashKind` in the
-                // third round, but never instrumented to check whether real
-                // mainnet data ever contains a ctype value neither branch
-                // expects (which the `else` arm below would silently fold
-                // into Asset).
-                if ctype != CTYPE_APP && ctype != CTYPE_ASSET {
-                    unexpected_ctype_count += 1;
-                    if unexpected_ctype_samples.len() < AFFINITY_CTYPE_SAMPLE_CAP {
-                        unexpected_ctype_samples.push((aidx, ctype));
-                    }
-                }
-                // Use the resource's own UpdateRound for affinity, matching Go's
-                // ResourcesHashBuilderV6 which passes resData.UpdateRound
-                // directly with no fallback (issue #1636 sixth round — see
-                // extract_raw_resource_affinity's doc comment).
-                let affinity = extract_raw_resource_affinity_tracked(
-                    &rdata,
-                    format!("resource aidx={aidx} ctype={ctype}"),
-                    &mut affinity_tracker,
-                );
-                let kind = if ctype == CTYPE_APP {
-                    HashKind::App as u8
-                } else {
-                    HashKind::Asset as u8
-                };
-                let elem = raw_resource_element(&addr, aidx as u64, &rdata, affinity, kind);
-                if let Some(w) = hash_dump.as_mut() {
-                    use std::io::Write;
-                    writeln!(w, "{} R {}:{}", hex::encode(elem), hex::encode(addr), aidx).map_err(
-                        |e| CatchpointError::ImportError(format!("hash dump write: {e}")),
-                    )?;
-                }
-                insert_stmt
-                    .execute(rusqlite::params![elem.as_slice()])
-                    .map_err(|e| {
-                        CatchpointError::ImportError(format!("stage resource hash: {e}"))
-                    })?;
-            }
-        }
-
-        // 1c. KV (box) entries.
-        {
-            let mut stmt = conn
-                .prepare("SELECT key, value FROM kvstore")
-                .map_err(|e| {
-                    CatchpointError::ImportError(format!("prepare kvstore for trie rebuild: {e}"))
-                })?;
-            let rows = stmt
-                .query_map([], |row| {
-                    let key: Vec<u8> = row.get(0)?;
-                    let value: Vec<u8> = row.get(1)?;
-                    Ok((key, value))
-                })
-                .map_err(|e| {
-                    CatchpointError::ImportError(format!("query kvstore for trie rebuild: {e}"))
-                })?;
-            for row in rows {
-                let (key, value) = row
-                    .map_err(|e| CatchpointError::ImportError(format!("read kvstore row: {e}")))?;
-                let elem = kv_hash_v6(&key, &value);
-                if let Some(w) = hash_dump.as_mut() {
-                    use std::io::Write;
-                    writeln!(w, "{} K {}", hex::encode(elem), hex::encode(&key)).map_err(|e| {
-                        CatchpointError::ImportError(format!("hash dump write: {e}"))
-                    })?;
-                }
-                insert_stmt
-                    .execute(rusqlite::params![elem.as_slice()])
-                    .map_err(|e| CatchpointError::ImportError(format!("stage kv hash: {e}")))?;
-            }
-        }
-        if let Some(w) = hash_dump.as_mut() {
-            use std::io::Write;
-            w.flush()
-                .map_err(|e| CatchpointError::ImportError(format!("hash dump flush: {e}")))?;
-        }
-        Ok(())
-    })();
-    match stage_result {
-        Ok(()) => conn.execute_batch("COMMIT;").map_err(|e| {
-            CatchpointError::ImportError(format!("commit trie-rebuild pending-hashes staging: {e}"))
-        })?,
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK;");
-            return Err(e);
-        }
-    }
+    // Pass 1 (parallel, deterministic): hash every account / resource / kv
+    // element on `workers` threads, each over a disjoint `accountbase` rowid
+    // range (workers read through their own read-only connections), and
+    // spill sorted runs of raw 36-byte elements to temp files. Pass 2
+    // k-way-merges the runs back into one globally sorted stream, which is
+    // exactly the order `SELECT data FROM catchpointpendinghashes ORDER BY
+    // data` yields in go -- the merged order depends only on the multiset of
+    // elements, never on the thread count or scheduling.
+    //
+    // This replaces a 77M-row SQLite scratch table + `CREATE INDEX` + keyset
+    // read-back (~900 s on the mainnet catchpoint, plus tens of GB of WAL)
+    // with the same hash-sorted insertion order (see the long comment above
+    // on why that order matters for the trie's resident-page working set).
+    let sort_dir = ElementSortDir::create(&db_path)?;
+    let stage_start = std::time::Instant::now();
+    let staged = stage_sorted_elements(
+        &db_path,
+        workers,
+        run_capacity,
+        sort_dir.path(),
+        dump_path.as_deref(),
+    )?;
     tracing::info!(
         elapsed_s = rebuild_start.elapsed().as_secs_f64(),
-        "catchpoint verify: trie rebuild pending-hashes staged"
+        stage_s = stage_start.elapsed().as_secs_f64(),
+        workers,
+        runs = staged.runs.len(),
+        staged_count = staged.total_elements,
+        accounts = staged.accounts,
+        resources = staged.resources,
+        kvs = staged.kvs,
+        "catchpoint verify: trie rebuild sorted element runs staged"
     );
 
-    // Issue #1636 diagnostic: directly check for silent row loss during
-    // staging by comparing the staged row count against the sum of the
-    // three source tables' row counts. Logged on every run (not just on
-    // mismatch) so this data point exists regardless of outcome — one of
-    // the lower-probability hypotheses flagged in the second investigation
-    // round but never directly asserted against real data.
-    {
-        let staged_count: i64 = conn
-            .query_row(
-                &format!("SELECT COUNT(*) FROM {PENDING_HASHES_TABLE}"),
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(-1);
+    // Issue #1636 diagnostics. The cheap in-process counters are always
+    // logged; the `COUNT(*)` cross-check of the source tables (which cost
+    // ~149 s of full-table scans on mainnet) and the 256-bucket fingerprint
+    // only run when ALGOD_CATCHPOINT_VERIFY_DIAGNOSTICS is set.
+    let diagnostics = verify_diagnostics_enabled();
+    if diagnostics {
         let accounts_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM accountbase", [], |row| row.get(0))
             .unwrap_or(-1);
@@ -1308,175 +1497,104 @@ fn build_and_persist_trie_chunked(
             .query_row("SELECT COUNT(*) FROM kvstore", [], |row| row.get(0))
             .unwrap_or(-1);
         let expected_total = accounts_count + resources_count + kvs_count;
-        let matches = staged_count == expected_total;
+        let matches = staged.total_elements as i64 == expected_total;
         tracing::info!(
-            staged_count,
+            staged_count = staged.total_elements,
             accounts_count,
             resources_count,
             kvs_count,
             expected_total,
             staged_count_matches_source_tables = matches,
-            "catchpoint verify (issue #1636 diagnostic): staged pending-hash row count vs source tables"
+            "catchpoint verify (issue #1636 diagnostic): staged element count vs source tables"
         );
         if !matches {
             tracing::error!(
-                staged_count,
+                staged_count = staged.total_elements,
                 expected_total,
-                "catchpoint verify (issue #1636 diagnostic): STAGED ROW COUNT MISMATCH — \
+                "catchpoint verify (issue #1636 diagnostic): STAGED ROW COUNT MISMATCH -- \
                  possible silent row loss during trie-rebuild hash staging"
             );
         }
     }
-
-    // Issue #1636 (sixth investigation round) diagnostic: report the
-    // affinity-decode anomaly tracker and any unexpected `ctype` values
-    // seen while staging *real* data. Logged unconditionally (not just on
-    // mismatch) so this data point exists for every run regardless of
-    // outcome, same discipline as the staged-row-count check above.
-    {
-        tracing::info!(
+    let affinity_tracker = &staged.affinity_tracker;
+    let unexpected_ctype_count = staged.unexpected_ctype_count;
+    tracing::info!(
+        decode_failures = affinity_tracker.decode_failures,
+        non_map_values = affinity_tracker.non_map_values,
+        z_present_not_u64 = affinity_tracker.z_present_not_u64,
+        c_present_not_u64 = affinity_tracker.c_present_not_u64,
+        unexpected_ctype_count,
+        "catchpoint verify (issue #1636 diagnostic): affinity-decode + ctype anomaly counters"
+    );
+    if affinity_tracker.any_anomaly() {
+        tracing::error!(
             decode_failures = affinity_tracker.decode_failures,
             non_map_values = affinity_tracker.non_map_values,
             z_present_not_u64 = affinity_tracker.z_present_not_u64,
             c_present_not_u64 = affinity_tracker.c_present_not_u64,
-            unexpected_ctype_count,
-            "catchpoint verify (issue #1636 diagnostic): affinity-decode + ctype anomaly counters"
+            "catchpoint verify (issue #1636 diagnostic): AFFINITY DECODE ANOMALY DETECTED on \
+             real data -- see per-sample lines below for exact raw bytes"
         );
-        if affinity_tracker.any_anomaly() {
+        for (context, hex) in &affinity_tracker.samples {
             tracing::error!(
-                decode_failures = affinity_tracker.decode_failures,
-                non_map_values = affinity_tracker.non_map_values,
-                z_present_not_u64 = affinity_tracker.z_present_not_u64,
-                c_present_not_u64 = affinity_tracker.c_present_not_u64,
-                "catchpoint verify (issue #1636 diagnostic): AFFINITY DECODE ANOMALY DETECTED on \
-                 real data — see per-sample lines below for exact raw bytes"
+                context = %context,
+                data_hex = %hex,
+                "catchpoint verify (issue #1636 diagnostic): affinity anomaly sample"
             );
-            for (context, hex) in &affinity_tracker.samples {
-                tracing::error!(
-                    context = %context,
-                    data_hex = %hex,
-                    "catchpoint verify (issue #1636 diagnostic): affinity anomaly sample"
-                );
-            }
         }
-        if unexpected_ctype_count > 0 {
+    }
+    if unexpected_ctype_count > 0 {
+        tracing::error!(
+            unexpected_ctype_count,
+            "catchpoint verify (issue #1636 diagnostic): UNEXPECTED CTYPE VALUE(S) DETECTED \
+             on real data (neither Asset=0 nor App=1) -- see per-sample lines below"
+        );
+        for (aidx, ctype) in &staged.unexpected_ctype_samples {
             tracing::error!(
-                unexpected_ctype_count,
-                "catchpoint verify (issue #1636 diagnostic): UNEXPECTED CTYPE VALUE(S) DETECTED \
-                 on real data (neither Asset=0 nor App=1) — see per-sample lines below"
+                aidx,
+                ctype,
+                "catchpoint verify (issue #1636 diagnostic): unexpected ctype sample"
             );
-            for (aidx, ctype) in &unexpected_ctype_samples {
-                tracing::error!(
-                    aidx,
-                    ctype,
-                    "catchpoint verify (issue #1636 diagnostic): unexpected ctype sample"
-                );
-            }
         }
     }
 
-    // Index the scratch table on `data` — mirrors go's
-    // `CreateCatchpointStagingHashesIndex` ("creating the index can take
-    // a while" per its own comment; same tradeoff here).
-    conn.execute_batch(&format!(
-        "CREATE INDEX {PENDING_HASHES_TABLE}_idx ON {PENDING_HASHES_TABLE}(data)"
-    ))
-    .map_err(|e| {
-        CatchpointError::ImportError(format!("index trie-rebuild pending-hashes table: {e}"))
-    })?;
-    tracing::info!(
-        elapsed_s = rebuild_start.elapsed().as_secs_f64(),
-        "catchpoint verify: trie rebuild pending-hashes indexed"
-    );
-
-    // Pass 2: drive the trie from the scratch table in hash-sorted
-    // order, paginated by `(data, rowid)` (a compound keyset seek
-    // against the index just created, with `rowid` as a tiebreaker for
-    // the — practically impossible, but not structurally excluded —
-    // case of two elements hashing identically) in batches of
-    // TRIE_REBUILD_COMMIT_FREQUENCY rows, exactly like every earlier
-    // version of this loop.
-    // Issue #1636 real-data bisection: one running SHA-256 per bucket,
-    // fed every element's bytes in the exact sorted order they're
-    // inserted into the trie. Cheap (one hash update per element, no
-    // extra I/O or allocation beyond what's already happening) and gives
-    // a permanent, compact fingerprint of this run's real staged data,
-    // logged unconditionally below.
+    // Pass 2: drive the trie from the merged, globally sorted stream.
     //
-    // Bucket key: `data[5]` (the first byte of the SHA512/256 hash tail,
-    // not `data[0..4]`'s affinity prefix). A first attempt at this
-    // bucketing (this round's initial live dispatch, run 36319500480)
-    // used `data[0]` — the affinity's own top byte — on the theory that
-    // it's "the same byte the pagination sort already orders by first",
-    // but affinity is a *round number*, not a hash: at this pin's real
-    // mainnet round range (~65.4M, fitting in 27 bits), `data[0]` only
-    // ever takes the values 0-3, so 252 of 256 buckets were always
-    // empty and the other 4 held 5M-36M elements apiece — useless for
-    // narrowing anything down to "thousands, not millions" of elements
-    // as intended. The hash tail is what's actually uniformly
-    // distributed across real data, so bucket on that instead.
-    let mut bucket_hashers: Vec<Sha256> = (0..N_BUCKETS).map(|_| Sha256::new()).collect();
-    let mut bucket_counts: Vec<u64> = vec![0; N_BUCKETS];
+    // Issue #1636 real-data bisection (opt-in, see above): one running
+    // SHA-256 per bucket (`data[5]`, the first byte of the SHA512/256 hash
+    // tail) fed every element in the exact sorted order it is inserted.
+    let mut bucket_hashers: Vec<Sha256> = if diagnostics {
+        (0..N_BUCKETS).map(|_| Sha256::new()).collect()
+    } else {
+        Vec::new()
+    };
+    let mut bucket_counts: Vec<u64> = vec![0; if diagnostics { N_BUCKETS } else { 0 }];
     {
-        let mut last_data: Vec<u8> = Vec::new();
-        let mut last_rowid: i64 = i64::MIN;
-        loop {
-            let mut stmt = conn
-                .prepare(&format!(
-                    "SELECT rowid, data FROM {PENDING_HASHES_TABLE} \
-                     WHERE (data, rowid) > (?1, ?2) \
-                     ORDER BY data, rowid LIMIT ?3"
-                ))
-                .map_err(|e| {
-                    CatchpointError::ImportError(format!(
-                        "prepare pending-hashes trie rebuild query: {e}"
-                    ))
-                })?;
-
-            let rows = stmt
-                .query_map(
-                    rusqlite::params![last_data, last_rowid, TRIE_REBUILD_COMMIT_FREQUENCY as i64],
-                    |row| {
-                        let rowid: i64 = row.get(0)?;
-                        let data: Vec<u8> = row.get(1)?;
-                        Ok((rowid, data))
-                    },
-                )
-                .map_err(|e| {
-                    CatchpointError::ImportError(format!(
-                        "query pending-hashes for trie rebuild: {e}"
-                    ))
-                })?;
-
-            let mut got_any = false;
-            for row in rows {
-                let (rowid, data) = row.map_err(|e| {
-                    CatchpointError::ImportError(format!("read pending-hash row: {e}"))
-                })?;
-                got_any = true;
-                last_rowid = rowid;
-                last_data = data.clone();
-                let elem: [u8; ELEMENT_SIZE] = data.as_slice().try_into().map_err(|_| {
-                    CatchpointError::ImportError(format!(
-                        "pending-hash element has wrong length {} (expected {ELEMENT_SIZE})",
-                        data.len()
-                    ))
-                })?;
+        let mut merger = SortedRunMerger::open(&staged.runs)?;
+        let mut merged: u64 = 0;
+        while let Some(elem) = merger.next_element()? {
+            merged += 1;
+            if diagnostics {
                 let bucket = elem[5] as usize;
                 bucket_hashers[bucket].update(elem);
                 bucket_counts[bucket] += 1;
-                trie.add(&elem)
-                    .map_err(|e| CatchpointError::ImportError(format!("trie add element: {e}")))?;
-                since_last_commit += 1;
-                if since_last_commit >= TRIE_REBUILD_COMMIT_FREQUENCY {
-                    total_elements_added += since_last_commit;
-                    commit_and_evict(&mut trie, since_last_commit, total_elements_added)?;
-                    since_last_commit = 0;
-                }
             }
-            if !got_any {
-                break;
+            trie.add(&elem)
+                .map_err(|e| CatchpointError::ImportError(format!("trie add element: {e}")))?;
+            since_last_commit += 1;
+            if since_last_commit >= TRIE_REBUILD_COMMIT_FREQUENCY {
+                total_elements_added += since_last_commit;
+                commit_and_evict(&mut trie, since_last_commit, total_elements_added)?;
+                since_last_commit = 0;
             }
+        }
+        // Integrity guard (always on, O(1)): every staged element must have
+        // come back out of the sorted runs.
+        if merged != staged.total_elements {
+            return Err(CatchpointError::ImportError(format!(
+                "trie rebuild merged {merged} elements but staged {}",
+                staged.total_elements
+            )));
         }
     }
     tracing::info!(
@@ -1484,16 +1602,7 @@ fn build_and_persist_trie_chunked(
         elapsed_s = rebuild_start.elapsed().as_secs_f64(),
         "catchpoint verify: trie rebuild hash-sorted insertion pass done"
     );
-    // Issue #1636: log the full 256-bucket fingerprint as one compact
-    // line — each bucket's finalized SHA-256 (hex) plus its element
-    // count, concatenated `bucket:count:hexdigest` entries separated by
-    // `;`. This is small (256 * ~72 bytes ≈ 18KB) even at real mainnet
-    // scale and is captured in the workflow's `node.log` artifact
-    // unconditionally, so a future run (or a captured real catchpoint
-    // tarball processed independently) has something concrete to diff
-    // hash-range by hash-range against, without needing to persist the
-    // full pending-hashes scratch table.
-    {
+    if diagnostics {
         let fingerprint = bucket_hashers
             .into_iter()
             .zip(bucket_counts.iter())
@@ -1514,16 +1623,8 @@ fn build_and_persist_trie_chunked(
             "catchpoint verify (issue #1636 diagnostic): per-bucket real-data fingerprint"
         );
     }
-    // Scratch table cleanup — best-effort; a stale scratch table left
-    // behind by a failed run is harmless (it's dropped at the start of
-    // the next attempt) and must never fail an otherwise-successful
-    // verify.
-    if let Err(e) = conn.execute_batch(&format!("DROP TABLE IF EXISTS {PENDING_HASHES_TABLE};")) {
-        tracing::warn!(
-            error = %e,
-            "catchpoint verify: failed to drop trie-rebuild pending-hashes scratch table (non-fatal)"
-        );
-    }
+    // Remove the temp run files now (also done on drop for error paths).
+    drop(sort_dir);
 
     // Final flush of whatever remains uncommitted (no eviction needed —
     // the build is done). Same explicit-transaction wrapping as every
@@ -3857,10 +3958,12 @@ mod tests {
         n_kvs: u32,
     ) -> (Connection, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
-            "algo-ledger-verify-chunked-trie-test-{}-{}-{}",
+            "algo-ledger-verify-chunked-trie-test-{}-{}-{}-{}-{}",
             std::process::id(),
             line!(),
-            n_accounts
+            n_accounts,
+            n_resources,
+            n_kvs
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("trie_test.sqlite");
@@ -3983,6 +4086,68 @@ mod tests {
         let reference_root = rebuild_trie_from_db(&conn).unwrap();
         let mut chunked_trie = build_and_persist_trie_chunked(&conn).unwrap();
         assert_eq!(chunked_trie.root_hash().unwrap(), reference_root);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chunked_trie_rebuild_is_independent_of_worker_count_and_run_size() {
+        // The hashing pass is parallel and spills sorted runs; the trie root
+        // must equal the single-pass in-memory reference for every worker
+        // count / run size, and the temp run files must be cleaned up.
+        let (conn, dir) = build_file_backed_trie_test_db(500, 300, 60);
+        let reference_root = rebuild_trie_from_db(&conn).unwrap();
+        let mut first_pages: Option<Vec<(i64, Vec<u8>)>> = None;
+        for &(workers, cap) in &[
+            (1usize, 1usize << 20),
+            (1, 5),
+            (2, 7),
+            (3, 64),
+            (4, 1),
+            (8, 100),
+        ] {
+            conn.execute_batch("DELETE FROM accounthashes").unwrap();
+            let mut trie = build_and_persist_trie_chunked_with(&conn, workers, cap).unwrap();
+            assert_eq!(
+                trie.root_hash().unwrap(),
+                reference_root,
+                "workers={workers} run_capacity={cap}"
+            );
+            // The persisted pages must be byte-identical across settings.
+            let mut stmt = conn
+                .prepare("SELECT id, data FROM accounthashes ORDER BY id")
+                .unwrap();
+            let pages: Vec<(i64, Vec<u8>)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            match &first_pages {
+                None => first_pages = Some(pages),
+                Some(first) => assert_eq!(
+                    &pages, first,
+                    "accounthashes pages differ for workers={workers} run_capacity={cap}"
+                ),
+            }
+            let leftovers: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with(".catchpoint-verify-sort-")
+                })
+                .collect();
+            assert!(leftovers.is_empty(), "temp sort dir not cleaned up");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chunked_trie_rebuild_handles_empty_database_with_many_workers() {
+        let (conn, dir) = build_file_backed_trie_test_db(0, 0, 0);
+        let reference_root = rebuild_trie_from_db(&conn).unwrap();
+        let mut trie = build_and_persist_trie_chunked_with(&conn, 4, 8).unwrap();
+        assert_eq!(trie.root_hash().unwrap(), reference_root);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

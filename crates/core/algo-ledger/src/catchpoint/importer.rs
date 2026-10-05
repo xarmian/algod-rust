@@ -57,6 +57,10 @@ use crate::rewards::normalized_online_balance;
 // Constants
 // ---------------------------------------------------------------------------
 
+/// Decoded entries buffered between the catchpoint-file reader thread and
+/// the SQLite insert thread (each is a whole decoded chunk, ~1-2 MiB).
+const IMPORT_PIPELINE_DEPTH: usize = 4;
+
 /// Default number of chunks per batch before committing and checkpointing.
 const DEFAULT_BATCH_SIZE: usize = 1000;
 
@@ -208,6 +212,12 @@ pub struct CatchpointImporter<'a> {
     /// Mirrors go-algorand's `catchpointAccountResourceCounter` in
     /// `ledger/catchupaccessor.go`.
     acct_res_cnt: AcctResourceCounter,
+    /// `(address, addrid)` of the account whose record had
+    /// `expecting_more_entries` set, so the continuation record(s) that
+    /// follow can reuse its `addrid` without an address lookup (the address
+    /// index is only built after the last chunk, see
+    /// [`Self::build_deferred_indexes`]).
+    pending_overflow: Option<([u8; 32], i64)>,
     /// In-memory progress checkpoint. Updated after every batch commit;
     /// reset to default on every new importer instance. Not persisted.
     checkpoint: ImportCheckpoint,
@@ -248,6 +258,7 @@ impl<'a> CatchpointImporter<'a> {
             total_online_round_params: 0,
             reward_unit,
             acct_res_cnt: AcctResourceCounter::default(),
+            pending_overflow: None,
             checkpoint,
         }
     }
@@ -303,16 +314,42 @@ impl<'a> CatchpointImporter<'a> {
 
         self.conn
             .execute_batch(crate::sqlite::CATCHPOINT_STAGING_TABLES_SQL)?;
+        // Build the catchpointbalances secondary indexes after the bulk
+        // insert instead (see `build_deferred_indexes`).
+        self.conn.execute_batch(
+            "DROP INDEX IF EXISTS catchpointbalances_address_idx;
+             DROP INDEX IF EXISTS catchpointbalances_nob_idx;",
+        )?;
 
         // Reset in-memory progress in case this importer is being reused.
         self.chunk_ordinal = 0;
         self.acct_res_cnt = AcctResourceCounter::default();
+        self.pending_overflow = None;
         self.checkpoint = ImportCheckpoint {
             last_chunk_ordinal: 0,
             total_chunks: 0,
             catchpoint_label: self.catchpoint_label.clone(),
         };
 
+        Ok(())
+    }
+
+    /// Create the `catchpointbalances` secondary indexes (idempotent).
+    ///
+    /// Called once after the last chunk is inserted. The UNIQUE address
+    /// index also turns a duplicated, non-continuation account record into
+    /// an import error here (it used to be silently merged).
+    pub fn build_deferred_indexes(&self) -> Result<(), CatchpointError> {
+        let start = Instant::now();
+        self.conn
+            .execute_batch(crate::sqlite::CATCHPOINT_BALANCES_INDEXES_SQL)
+            .map_err(|e| {
+                CatchpointError::ImportError(format!("build catchpointbalances indexes: {e}"))
+            })?;
+        tracing::info!(
+            elapsed_s = start.elapsed().as_secs_f64(),
+            "catchpoint import: catchpointbalances indexes built"
+        );
         Ok(())
     }
 
@@ -364,6 +401,7 @@ impl<'a> CatchpointImporter<'a> {
                 self.checkpoint.total_chunks = total_chunks;
                 in_txn = false;
             }
+            self.build_deferred_indexes()?;
 
             Ok(stats)
         })();
@@ -418,6 +456,9 @@ impl<'a> CatchpointImporter<'a> {
             .conn
             .unchecked_transaction()
             .map_err(CatchpointError::SqliteError)?;
+
+        // Idempotent: a no-op when `build_deferred_indexes` already ran.
+        tx.execute_batch(crate::sqlite::CATCHPOINT_BALANCES_INDEXES_SQL)?;
 
         // Ensure acctrounds and accounttotals exist (they may not if the
         // database was freshly created for catchpoint import only).
@@ -811,32 +852,36 @@ impl<'a> CatchpointImporter<'a> {
         );
 
         // INSERT into catchpointbalances. addrid is auto-assigned by INTEGER
-        // PRIMARY KEY autoincrement.
-        self.conn.execute(
-            "INSERT INTO catchpointbalances(address, normalizedonlinebalance, data) VALUES(?1, ?2, ?3)",
-            rusqlite::params![
-                record.address.as_ref(),
-                nob as i64,
-                record.account_data.as_ref(),
-            ],
-        ).or_else(|err| {
-            // Handle overflowed account records (expecting_more_entries):
-            // if the address already exists, we need to look up its rowid.
-            if record.expecting_more_entries || is_unique_constraint_violation(&err) {
-                // The account already exists — this is an overflowed record.
-                // We don't re-insert the account row; we just use the existing rowid.
-                Ok(0)
-            } else {
-                Err(err)
-            }
+        // PRIMARY KEY. An overflowed account (`expecting_more_entries`) is
+        // spread over consecutive records; continuation records reuse the
+        // first record's addrid. The address is tracked in memory (rather
+        // than looked up) because the address index is built after import.
+        let addr_key: [u8; 32] = record.address.as_ref().try_into().map_err(|_| {
+            CatchpointError::ImportError(format!(
+                "balance record address has length {}, expected 32",
+                record.address.as_ref().len()
+            ))
         })?;
-
-        // Get the rowid for this account (whether just inserted or pre-existing).
-        let addrid: i64 = self.conn.query_row(
-            "SELECT rowid FROM catchpointbalances WHERE address = ?1",
-            rusqlite::params![record.address.as_ref()],
-            |row| row.get(0),
-        )?;
+        let addrid: i64 = match self.pending_overflow {
+            Some((addr, id)) if addr == addr_key => id,
+            _ => {
+                self.conn
+                    .prepare_cached(
+                        "INSERT INTO catchpointbalances(address, normalizedonlinebalance, data) VALUES(?1, ?2, ?3)",
+                    )?
+                    .execute(rusqlite::params![
+                        record.address.as_ref(),
+                        nob as i64,
+                        record.account_data.as_ref(),
+                    ])?;
+                self.conn.last_insert_rowid()
+            }
+        };
+        self.pending_overflow = if record.expecting_more_entries {
+            Some((addr_key, addrid))
+        } else {
+            None
+        };
 
         // Insert resources.
         for (&aidx, resource_data) in &record.resources {
@@ -859,24 +904,32 @@ impl<'a> CatchpointImporter<'a> {
                 -1
             };
 
-            self.conn.execute(
-                "INSERT INTO catchpointresources(addrid, aidx, data, ctype) VALUES(?1, ?2, ?3, ?4)",
-                rusqlite::params![addrid, aidx as i64, resource_data.as_ref(), ctype],
-            )?;
+            self.conn
+                .prepare_cached(
+                    "INSERT INTO catchpointresources(addrid, aidx, data, ctype) VALUES(?1, ?2, ?3, ?4)",
+                )?
+                .execute(rusqlite::params![
+                    addrid,
+                    aidx as i64,
+                    resource_data.as_ref(),
+                    ctype
+                ])?;
 
             let owning = is_owning(rd.resource_flags);
             if owning {
                 if resource_is_asset {
-                    self.conn.execute(
-                        "INSERT INTO catchpointassetcreators(asset, creator, ctype) VALUES(?1, ?2, ?3)",
-                        rusqlite::params![aidx as i64, record.address.as_ref(), CTYPE_ASSET],
-                    )?;
+                    self.conn
+                        .prepare_cached(
+                            "INSERT INTO catchpointassetcreators(asset, creator, ctype) VALUES(?1, ?2, ?3)",
+                        )?
+                        .execute(rusqlite::params![aidx as i64, record.address.as_ref(), CTYPE_ASSET])?;
                 }
                 if resource_is_app {
-                    self.conn.execute(
-                        "INSERT INTO catchpointassetcreators(asset, creator, ctype) VALUES(?1, ?2, ?3)",
-                        rusqlite::params![aidx as i64, record.address.as_ref(), CTYPE_APP],
-                    )?;
+                    self.conn
+                        .prepare_cached(
+                            "INSERT INTO catchpointassetcreators(asset, creator, ctype) VALUES(?1, ?2, ?3)",
+                        )?
+                        .execute(rusqlite::params![aidx as i64, record.address.as_ref(), CTYPE_APP])?;
                 }
             }
 
@@ -934,10 +987,12 @@ impl<'a> CatchpointImporter<'a> {
 
     /// Insert a key-value record into `catchpointkvstore`.
     fn import_kv_record(&self, record: &KVRecordV6) -> Result<(), CatchpointError> {
-        self.conn.execute(
-            "INSERT INTO catchpointkvstore(key, value) VALUES(?1, ?2)",
-            rusqlite::params![record.key.as_ref(), record.value.as_ref()],
-        )?;
+        self.conn
+            .prepare_cached("INSERT INTO catchpointkvstore(key, value) VALUES(?1, ?2)")?
+            .execute(rusqlite::params![
+                record.key.as_ref(),
+                record.value.as_ref()
+            ])?;
         Ok(())
     }
 
@@ -1052,19 +1107,7 @@ pub fn import_catchpoint_file_with_progress(
     let start = Instant::now();
 
     // --- Pass 1: extract header only ---
-    let header = {
-        let reader = parser::open(path)?;
-        let mut header: Option<CatchpointFileHeader> = None;
-        reader.for_each(|entry| {
-            if header.is_none() {
-                if let CatchpointEntry::Header(h) = entry {
-                    header = Some(h);
-                }
-            }
-            Ok(())
-        })?;
-        header.ok_or(CatchpointError::MissingHeader)?
-    };
+    let header = parser::open(path)?.read_header()?;
 
     let total_chunks = header.total_chunks;
     let catchpoint_label = header.catchpoint.clone();
@@ -1083,8 +1126,17 @@ pub fn import_catchpoint_file_with_progress(
     importer.prepare_staging()?;
 
     // --- Pass 2: stream chunks directly into the importer ---
+    //
+    // The file is inflated / untarred / snappy- and msgpack-decoded on a
+    // producer thread; this thread only performs the SQLite inserts. Entries
+    // cross a bounded channel in file order, so the resulting database is
+    // identical to the single-threaded import.
+    //
+    // A larger page cache than SQLite's 2 MiB default keeps the staging
+    // tables' hot pages resident during the bulk insert; it is a per-
+    // connection setting and is restored afterwards.
+    let _ = conn.execute_batch("PRAGMA cache_size = -262144");
     let stats = {
-        let reader = parser::open(path)?;
         let mut chunk_ordinal: u64 = 0;
         let mut stats = ImportStats::default();
 
@@ -1092,48 +1144,76 @@ pub fn import_catchpoint_file_with_progress(
         let mut batch_count: usize = 0;
         let mut in_txn = false;
 
-        let stream_result: Result<(), CatchpointError> = reader.for_each(|entry| {
-            match entry {
-                CatchpointEntry::Header(_) => { /* already extracted */ }
-                CatchpointEntry::Chunk(chunk) => {
-                    chunk_ordinal += 1;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<CatchpointEntry, CatchpointError>>(
+            IMPORT_PIPELINE_DEPTH,
+        );
 
-                    if !in_txn {
-                        conn.execute_batch("BEGIN IMMEDIATE")?;
-                        in_txn = true;
-                    }
+        let stream_result: Result<(), CatchpointError> = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let outcome = parser::open(path).and_then(|reader| {
+                    reader.for_each(|entry| {
+                        tx.send(Ok(entry)).map_err(|_| {
+                            CatchpointError::IntegrityError(
+                                "catchpoint import consumer stopped".to_string(),
+                            )
+                        })
+                    })
+                });
+                if let Err(e) = outcome {
+                    let _ = tx.send(Err(e));
+                }
+            });
 
-                    importer.import_chunk(chunk_ordinal, &chunk, &mut stats)?;
-                    batch_count += 1;
+            let mut consume = || -> Result<(), CatchpointError> {
+                for item in rx.iter() {
+                    match item? {
+                        CatchpointEntry::Header(_) => { /* already extracted */ }
+                        CatchpointEntry::Chunk(chunk) => {
+                            chunk_ordinal += 1;
 
-                    if let Some(cb) = on_progress.as_deref_mut() {
-                        cb(&ImportProgressUpdate {
-                            total_accounts: header.total_accounts,
-                            processed_accounts: stats.accounts,
-                            total_kvs: header.total_kvs,
-                            processed_kvs: stats.kvs,
-                        });
-                    }
+                            if !in_txn {
+                                conn.execute_batch("BEGIN IMMEDIATE")?;
+                                in_txn = true;
+                            }
 
-                    if batch_count >= batch_size {
-                        conn.execute_batch("COMMIT")?;
-                        importer.checkpoint.last_chunk_ordinal = chunk_ordinal;
-                        importer.checkpoint.total_chunks = total_chunks;
-                        in_txn = false;
-                        batch_count = 0;
+                            importer.import_chunk(chunk_ordinal, &chunk, &mut stats)?;
+                            batch_count += 1;
+
+                            if let Some(cb) = on_progress.as_deref_mut() {
+                                cb(&ImportProgressUpdate {
+                                    total_accounts: header.total_accounts,
+                                    processed_accounts: stats.accounts,
+                                    total_kvs: header.total_kvs,
+                                    processed_kvs: stats.kvs,
+                                });
+                            }
+
+                            if batch_count >= batch_size {
+                                conn.execute_batch("COMMIT")?;
+                                importer.checkpoint.last_chunk_ordinal = chunk_ordinal;
+                                importer.checkpoint.total_chunks = total_chunks;
+                                in_txn = false;
+                                batch_count = 0;
+                            }
+                        }
+                        CatchpointEntry::StateProofVerification(ref sp_data) => {
+                            // Import state proof verification contexts into the
+                            // staging table so they survive the atomic cutover.
+                            if !in_txn {
+                                conn.execute_batch("BEGIN IMMEDIATE")?;
+                                in_txn = true;
+                            }
+                            importer.import_state_proof_verification(sp_data)?;
+                        }
                     }
                 }
-                CatchpointEntry::StateProofVerification(ref sp_data) => {
-                    // Import state proof verification contexts into the
-                    // staging table so they survive the atomic cutover.
-                    if !in_txn {
-                        conn.execute_batch("BEGIN IMMEDIATE")?;
-                        in_txn = true;
-                    }
-                    importer.import_state_proof_verification(sp_data)?;
-                }
-            }
-            Ok(())
+                Ok(())
+            };
+            let result = consume();
+            // Unblock a producer parked on a full channel before the scope
+            // joins it (only matters on the error path).
+            drop(rx);
+            result
         });
 
         // Roll back any open transaction on error so the connection is left
@@ -1142,6 +1222,7 @@ pub fn import_catchpoint_file_with_progress(
             if in_txn {
                 let _ = conn.execute_batch("ROLLBACK");
             }
+            let _ = conn.execute_batch("PRAGMA cache_size = -2000");
             return Err(e);
         }
 
@@ -1162,6 +1243,13 @@ pub fn import_catchpoint_file_with_progress(
             total_chunks, stats.chunks_processed
         )));
     }
+
+    // Build the deferred catchpointbalances indexes once, from the finished
+    // table (atomic_cutover would also do it, but timing it separately keeps
+    // it visible in the logs).
+    let indexed = importer.build_deferred_indexes();
+    let _ = conn.execute_batch("PRAGMA cache_size = -2000");
+    indexed?;
 
     // Atomic cutover: replace live tables with staging tables. The returned
     // backup is NOT yet finalized here — the caller (whose verification
@@ -1260,20 +1348,6 @@ fn is_empty_app_fields(rd: &super::types::CatchpointResourcesData) -> bool {
         && rd.size_sponsor == [0u8; 32]
         && !rd.foreign_box_reads
         && !rd.family_box_access
-}
-
-/// Check if a rusqlite error is a UNIQUE constraint violation.
-fn is_unique_constraint_violation(err: &rusqlite::Error) -> bool {
-    matches!(
-        err,
-        rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ffi::ErrorCode::ConstraintViolation,
-                ..
-            },
-            _
-        )
-    )
 }
 
 // Staging table DDL is defined once in crate::sqlite::CATCHPOINT_STAGING_TABLES_SQL.
@@ -2379,5 +2453,284 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM accountbase", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // File-level import: header-only first pass, decode pipeline thread,
+    // deferred catchpointbalances indexes (issue #1681).
+    // -----------------------------------------------------------------
+
+    fn write_test_catchpoint(
+        path: &std::path::Path,
+        header: &CatchpointFileHeader,
+        chunks: &[CatchpointSnapshotChunkV6],
+        garbage_chunk_at: Option<usize>,
+    ) {
+        use flate2::write::GzEncoder;
+        let file = std::fs::File::create(path).unwrap();
+        let gz = GzEncoder::new(file, flate2::Compression::fast());
+        let mut b = tar::Builder::new(gz);
+        let mut append = |name: &str, data: &[u8]| {
+            let mut h = tar::Header::new_gnu();
+            h.set_path(name).unwrap();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o600);
+            h.set_cksum();
+            b.append(&h, data).unwrap();
+        };
+        append(
+            "content.msgpack",
+            &crate::catchpoint::writer::encode_catchpoint_file_header(header),
+        );
+        for (i, c) in chunks.iter().enumerate() {
+            let bytes = if garbage_chunk_at == Some(i) {
+                vec![0xc1, 0xc1, 0xc1]
+            } else {
+                encode_test_chunk(c)
+            };
+            append(&format!("balances.{}.msgpack", i + 1), &bytes);
+        }
+        b.into_inner().unwrap().finish().unwrap();
+    }
+
+    fn encode_test_chunk(c: &CatchpointSnapshotChunkV6) -> Vec<u8> {
+        use crate::catchpoint::writer::{encode_balance_record, encode_chunk, encode_kv_record};
+        let bl: Vec<Vec<u8>> = c
+            .balances
+            .iter()
+            .map(|b| {
+                let mut res: Vec<(u64, Vec<u8>)> =
+                    b.resources.iter().map(|(k, v)| (*k, v.to_vec())).collect();
+                res.sort();
+                encode_balance_record(
+                    b.address.as_ref(),
+                    b.account_data.as_ref(),
+                    &res,
+                    b.expecting_more_entries,
+                )
+            })
+            .collect();
+        let kv: Vec<Vec<u8>> = c
+            .kvs
+            .iter()
+            .map(|k| encode_kv_record(k.key.as_ref(), k.value.as_ref()))
+            .collect();
+        let bl_refs: Vec<&[u8]> = bl.iter().map(|v| v.as_slice()).collect();
+        let kv_refs: Vec<&[u8]> = kv.iter().map(|v| v.as_slice()).collect();
+        encode_chunk(&bl_refs, &kv_refs, &[], &[])
+    }
+
+    /// `n_chunks` chunks of `per_chunk` plain accounts, plus one overflowed
+    /// account (asset + app resource split over two records) straddling the
+    /// chunk 0 / chunk 1 boundary. Addresses are deliberately not in sorted
+    /// order.
+    fn synthetic_chunks(n_chunks: usize, per_chunk: usize) -> Vec<CatchpointSnapshotChunkV6> {
+        let mut chunks = Vec::new();
+        for c in 0..n_chunks {
+            let mut balances = Vec::new();
+            if c == 1 {
+                let mut r = HashMap::new();
+                r.insert(61u64, ByteBuf::from(owned_app_resource_blob()));
+                balances.push(BalanceRecordV6 {
+                    address: ByteBuf::from(vec![0xEE; 32]),
+                    account_data: ByteBuf::from(account_data_totals_blob(1, 1, 1, 1)),
+                    resources: r,
+                    expecting_more_entries: false,
+                });
+            }
+            for k in 0..per_chunk {
+                let n = (c * per_chunk + k) as u32;
+                let mut addr = [0u8; 32];
+                // multiplicative scramble: unsorted but unique
+                addr[..4].copy_from_slice(&n.wrapping_mul(2_654_435_761).to_be_bytes());
+                addr[4] = 1;
+                let mut resources = HashMap::new();
+                let totals = if k % 5 == 0 {
+                    resources.insert(1000 + n as u64, ByteBuf::from(owned_asset_resource_blob()));
+                    account_data_totals_blob(1, 1, 0, 0)
+                } else {
+                    empty_account_data_blob()
+                };
+                balances.push(BalanceRecordV6 {
+                    address: ByteBuf::from(addr.to_vec()),
+                    account_data: ByteBuf::from(totals),
+                    resources,
+                    expecting_more_entries: false,
+                });
+            }
+            if c == 0 {
+                let mut r = HashMap::new();
+                r.insert(60u64, ByteBuf::from(owned_asset_resource_blob()));
+                balances.push(BalanceRecordV6 {
+                    address: ByteBuf::from(vec![0xEE; 32]),
+                    account_data: ByteBuf::from(account_data_totals_blob(1, 1, 1, 1)),
+                    resources: r,
+                    expecting_more_entries: true,
+                });
+            }
+            chunks.push(CatchpointSnapshotChunkV6 {
+                balances,
+                kvs: vec![KVRecordV6 {
+                    key: ByteBuf::from(format!("k{c}").into_bytes()),
+                    value: ByteBuf::from(vec![c as u8]),
+                }],
+                ..Default::default()
+            });
+        }
+        chunks
+    }
+
+    fn dump_live_tables(conn: &Connection) -> Vec<Vec<String>> {
+        let mut out = Vec::new();
+        for q in [
+            "SELECT addrid, hex(address), hex(data), normalizedonlinebalance FROM accountbase ORDER BY addrid",
+            "SELECT addrid, aidx, hex(data), ctype FROM resources ORDER BY addrid, aidx",
+            "SELECT asset, hex(creator), ctype FROM assetcreators ORDER BY asset",
+            "SELECT hex(key), hex(value) FROM kvstore ORDER BY key",
+            "SELECT name, sql FROM sqlite_master WHERE type='index' AND name LIKE 'catchpointbalances%' ORDER BY name",
+        ] {
+            let mut stmt = conn.prepare(q).unwrap();
+            let n = stmt.column_count();
+            let rows = stmt
+                .query_map([], |r| {
+                    (0..n)
+                        .map(|i| r.get::<_, rusqlite::types::Value>(i).map(|v| format!("{v:?}")))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .unwrap();
+            for r in rows {
+                out.push(r.unwrap());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn file_import_matches_chunk_import_and_builds_indexes_after_insert() {
+        let dir = tempfile::tempdir().unwrap();
+        let chunks = synthetic_chunks(30, 40);
+        let mut header = make_test_header(1234);
+        header.total_chunks = chunks.len() as u64;
+        header.total_accounts = (30 * 40 + 2) as u64;
+        let file = dir.path().join("cp.tar.gz");
+        write_test_catchpoint(&file, &header, &chunks, None);
+
+        // Pipeline path (producer thread + deferred indexes).
+        let conn_a = Connection::open(dir.path().join("a.sqlite")).unwrap();
+        let res = import_catchpoint_file(&conn_a, &file, REWARD_UNITS).unwrap();
+        assert_eq!(res.stats.chunks_processed, 30);
+        assert_eq!(res.stats.accounts, 30 * 40 + 2);
+
+        // Reference path: the same chunks through the in-process importer.
+        let conn_b = Connection::open(dir.path().join("b.sqlite")).unwrap();
+        let mut imp = CatchpointImporter::new(&conn_b, header.catchpoint.clone(), REWARD_UNITS);
+        imp.prepare_staging().unwrap();
+        imp.import_chunks(
+            chunks
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(i, c)| Ok((i as u64 + 1, c))),
+            30,
+        )
+        .unwrap();
+        imp.atomic_cutover(&header).unwrap();
+
+        let a = dump_live_tables(&conn_a);
+        let b = dump_live_tables(&conn_b);
+        assert_eq!(a, b);
+
+        // Independent expectations: the overflowed account is ONE row whose
+        // resources from both records are attached; both indexes exist.
+        let overflow_rows: i64 = conn_a
+            .query_row(
+                "SELECT COUNT(*) FROM accountbase WHERE address = ?1",
+                [vec![0xEEu8; 32]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(overflow_rows, 1);
+        let total_accounts: i64 = conn_a
+            .query_row("SELECT COUNT(*) FROM accountbase", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total_accounts, 30 * 40 + 1);
+        let idx: Vec<String> = conn_a
+            .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'catchpointbalances%' ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            idx,
+            vec![
+                "catchpointbalances_address_idx",
+                "catchpointbalances_nob_idx"
+            ]
+        );
+        // The unique address index still rejects a duplicate address.
+        assert!(conn_a
+            .execute(
+                "INSERT INTO accountbase(address, data) VALUES (?1, x'80')",
+                [vec![0xEEu8; 32]]
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn file_import_fails_cleanly_on_undecodable_chunk_with_full_pipeline() {
+        // More chunks than the pipeline depth so the producer is parked on a
+        // full channel when the consumer gives up / the producer errors.
+        let dir = tempfile::tempdir().unwrap();
+        let chunks = synthetic_chunks(40, 5);
+        let mut header = make_test_header(9);
+        header.total_chunks = chunks.len() as u64;
+        let file = dir.path().join("bad.tar.gz");
+        write_test_catchpoint(&file, &header, &chunks, Some(3));
+        let conn = Connection::open(dir.path().join("c.sqlite")).unwrap();
+        assert!(import_catchpoint_file(&conn, &file, REWARD_UNITS).is_err());
+        assert!(conn.is_autocommit(), "no transaction left open on error");
+
+        // Consumer-side failure: chunk 2 declares more resources than it has.
+        let mut chunks = synthetic_chunks(40, 5);
+        chunks[2].balances[1].account_data = ByteBuf::from(account_data_totals_blob(9, 9, 9, 9));
+        let file2 = dir.path().join("bad2.tar.gz");
+        write_test_catchpoint(&file2, &header, &chunks, None);
+        let conn2 = Connection::open(dir.path().join("d.sqlite")).unwrap();
+        assert!(import_catchpoint_file(&conn2, &file2, REWARD_UNITS).is_err());
+        assert!(conn2.is_autocommit());
+    }
+
+    #[test]
+    fn read_header_does_not_decode_chunks_and_requires_a_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let chunks = synthetic_chunks(3, 2);
+        let mut header = make_test_header(77);
+        header.total_chunks = 3;
+        let file = dir.path().join("h.tar.gz");
+        // Chunk 1 is undecodable garbage: a full pass would fail on it.
+        write_test_catchpoint(&file, &header, &chunks, Some(0));
+        let got = parser::open(&file).unwrap().read_header().unwrap();
+        assert_eq!(got, header);
+        assert!(parser::open(&file).unwrap().collect_entries().is_err());
+
+        // No header at all.
+        use flate2::write::GzEncoder;
+        let nohdr = dir.path().join("n.tar.gz");
+        let gz = GzEncoder::new(
+            std::fs::File::create(&nohdr).unwrap(),
+            flate2::Compression::fast(),
+        );
+        let mut b = tar::Builder::new(gz);
+        let mut h = tar::Header::new_gnu();
+        h.set_path("balances.1.msgpack").unwrap();
+        h.set_size(0);
+        h.set_cksum();
+        b.append(&h, &[][..]).unwrap();
+        b.into_inner().unwrap().finish().unwrap();
+        assert!(matches!(
+            parser::open(&nohdr).unwrap().read_header(),
+            Err(CatchpointError::MissingHeader)
+        ));
     }
 }

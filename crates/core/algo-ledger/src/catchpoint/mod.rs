@@ -20,6 +20,7 @@
 
 pub mod auto;
 pub mod checkpoint;
+pub(crate) mod element_sort;
 pub mod fsutil;
 pub mod importer;
 pub mod msgp_compat;

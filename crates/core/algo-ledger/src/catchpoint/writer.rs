@@ -905,7 +905,7 @@ fn hash_records(prefix: &[u8], records: &[Vec<u8>]) -> [u8; 32] {
 /// Codec tags (already in sorted order): `a` address, `b` account data
 /// (`msgp.Raw`), `c` resources (`map[uint64]msgp.Raw`), `e`
 /// `ExpectingMoreEntries`. Go's `omitempty` drops zero/empty fields.
-fn encode_balance_record(
+pub(crate) fn encode_balance_record(
     address: &[u8],
     account_data: &[u8],
     resources: &[(u64, Vec<u8>)],
@@ -942,7 +942,7 @@ fn encode_uint_keyed_raw_map(entries: &[(u64, Vec<u8>)]) -> Vec<u8> {
 }
 
 /// Encode `encoded.KVRecordV6` (tags `k`, `v`; both plain `[]byte`).
-fn encode_kv_record(key: &[u8], value: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_kv_record(key: &[u8], value: &[u8]) -> Vec<u8> {
     let mut entries: Vec<(&str, Vec<u8>)> = Vec::new();
     if !key.is_empty() {
         entries.push(("k", encode_msgpack_bin(key)));
@@ -954,7 +954,7 @@ fn encode_kv_record(key: &[u8], value: &[u8]) -> Vec<u8> {
 }
 
 /// Encode `CatchpointSnapshotChunkV6` (tags `bl`, `kv`, `oa`, `orp`).
-fn encode_chunk(
+pub(crate) fn encode_chunk(
     balances: &[&[u8]],
     kvs: &[&[u8]],
     online_accounts: &[&[u8]],
@@ -981,7 +981,7 @@ fn encode_chunk(
 /// Codec tags sorted: `accountTotals`, `accountsCount`, `balancesRound`,
 /// `blockHeaderDigest`, `blocksRound`, `catchpoint`, `chunksCount`,
 /// `kvsCount`, `onlineAccountsCount`, `onlineRoundParamsCount`, `version`.
-fn encode_catchpoint_file_header(header: &CatchpointFileHeader) -> Vec<u8> {
+pub(crate) fn encode_catchpoint_file_header(header: &CatchpointFileHeader) -> Vec<u8> {
     let mut entries: Vec<(&str, Vec<u8>)> = Vec::new();
 
     let totals = encode_account_totals(&header.totals);
