@@ -367,6 +367,10 @@ pub struct AlgodNodeInterface {
     /// `Some` only for the `participate` command, mirroring
     /// `participation_metrics` — `None` everywhere else.
     agreement_message_counters: Option<Arc<algo_network::AgreementMessageCounters>>,
+    /// Stalled-on-invalid-block tracker (issue #1677), shared with the
+    /// ledger bridges that record block-apply failures. `Some` only for the
+    /// `participate` command; `None` elsewhere (no stall is ever reported).
+    apply_stall_tracker: Option<Arc<algo_ledger::ApplyStallTracker>>,
     /// Per-tag inbound-gossip `pool.remember()` failure counters (issue
     /// #1134). `Some` only when a [`Self::with_pool`]-attached node also
     /// registers a `TxTagHandler` for inbound TX traffic (the `participate`
@@ -458,6 +462,7 @@ impl AlgodNodeInterface {
             debug_settings_prof: Arc::new(Mutex::new((0, 0))),
             participation_metrics: None,
             agreement_message_counters: None,
+            apply_stall_tracker: None,
             tx_pool_remember_counter: None,
             tx_pool_check_counter: None,
             ws_network: None,
@@ -492,6 +497,17 @@ impl AlgodNodeInterface {
         counters: Arc<algo_network::AgreementMessageCounters>,
     ) -> Self {
         self.agreement_message_counters = Some(counters);
+        self
+    }
+
+    /// Attach the block-apply stall tracker (issue #1677) so `/v2/status`
+    /// and `/metrics` report a node stalled on an invalid block.
+    #[must_use]
+    pub fn with_apply_stall_tracker(
+        mut self,
+        tracker: Arc<algo_ledger::ApplyStallTracker>,
+    ) -> Self {
+        self.apply_stall_tracker = Some(tracker);
         self
     }
 
@@ -2294,6 +2310,10 @@ impl NodeInterface for AlgodNodeInterface {
     /// process-wide, not consensus-participation-specific, matching
     /// go-algorand's own `/metrics` (its registrations are independent of
     /// whether the node holds a participation key).
+    fn apply_stall(&self) -> Option<algo_ledger::ApplyStall> {
+        self.apply_stall_tracker.as_ref()?.stall()
+    }
+
     fn metrics_exposition(&self) -> Option<String> {
         let mut text = String::new();
         if let Some(metrics) = self.participation_metrics.as_ref() {
@@ -2305,6 +2325,11 @@ impl NodeInterface for AlgodNodeInterface {
         // sections above.
         if let Some(counters) = self.agreement_message_counters.as_ref() {
             text.push_str(&counters.to_prometheus_text());
+        }
+        // Issue #1677: block-apply failure counter and stalled-on-invalid-
+        // block gauges, so monitoring can alert without log parsing.
+        if let Some(tracker) = self.apply_stall_tracker.as_ref() {
+            text.push_str(&tracker.to_prometheus_text());
         }
         if let Some(pool) = self.pool.as_ref() {
             text.push_str(&pool.reeval_counter().to_prometheus_text());
@@ -3624,6 +3649,26 @@ mod tests {
         let adapter = make_adapter();
         assert!(adapter.participation_status().is_none());
         assert!(adapter.metrics_exposition().is_none());
+    }
+
+    /// Issue #1677: a stall recorded on the shared tracker reaches both
+    /// `apply_stall()` (status) and the Prometheus exposition.
+    #[test]
+    fn apply_stall_tracker_surfaces_in_status_and_metrics() {
+        let tracker = Arc::new(algo_ledger::ApplyStallTracker::new());
+        let adapter = make_adapter().with_apply_stall_tracker(tracker.clone());
+        assert!(adapter.apply_stall().is_none());
+        let idle = adapter.metrics_exposition().expect("exposition");
+        assert!(idle.contains("algod_rust_sync_stalled_on_invalid_block 0"));
+
+        tracker.record_failure(42, "bad block");
+        tracker.record_failure(42, "bad block");
+        let stall = adapter.apply_stall().expect("stalled");
+        assert_eq!(stall.round, 42);
+        let text = adapter.metrics_exposition().expect("exposition");
+        assert!(text.contains("algod_rust_sync_stalled_on_invalid_block 1"));
+        assert!(text.contains("algod_rust_sync_stalled_block_round 42"));
+        assert!(text.contains("algod_rust_ledger_apply_failures_total 2"));
     }
 
     /// An attached but never-updated collector must still answer — with

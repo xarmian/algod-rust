@@ -412,6 +412,9 @@ struct ParticipateAgreementControl {
     /// Held here (rather than solely inside `AgreementNetworkBridge`) so
     /// counts survive across `build_cycle` rebuilding the bridge.
     agreement_message_counters: Arc<algo_network::AgreementMessageCounters>,
+    /// Block-apply stall tracker (issue #1677), shared by every ledger
+    /// bridge rebuilt by `build_cycle` and the REST adapter.
+    apply_stall_tracker: Arc<algo_ledger::ApplyStallTracker>,
     enable_agreement_reporting: bool,
     enable_agreement_time_metrics: bool,
     network_mode: NetworkMode,
@@ -459,6 +462,8 @@ impl ParticipateAgreementControl {
             network_advancer.clone(),
             self.round_advanced.clone(),
         );
+        let agreement_ledger =
+            agreement_ledger.with_apply_stall_tracker(self.apply_stall_tracker.clone());
 
         let latest = {
             let l = self.ledger.lock().expect("ledger lock poisoned");
@@ -547,11 +552,14 @@ impl ParticipateAgreementControl {
         let crypto =
             AsyncCryptoVerifier::new_with_validator(crypto_ledger, Arc::clone(&block_validator));
 
-        let catchup_bridge = Arc::new(AgreementLedgerBridge::new_with_advancer_and_condvar(
-            self.ledger.clone(),
-            network_advancer,
-            agreement_ledger.round_advanced_condvar(),
-        ));
+        let catchup_bridge = Arc::new(
+            AgreementLedgerBridge::new_with_advancer_and_condvar(
+                self.ledger.clone(),
+                network_advancer,
+                agreement_ledger.round_advanced_condvar(),
+            )
+            .with_apply_stall_tracker(self.apply_stall_tracker.clone()),
+        );
 
         let ws_block_fetcher: Arc<dyn BlockFetcher> = Arc::new(GossipBlockFetcher {
             ws_network: self.gossip_node.clone(),
@@ -765,6 +773,7 @@ impl ParticipateAgreementControl {
             round_advanced: self.round_advanced.clone(),
             participation_metrics: self.participation_metrics.clone(),
             agreement_message_counters: self.agreement_message_counters.clone(),
+            apply_stall_tracker: self.apply_stall_tracker.clone(),
             enable_agreement_reporting: self.enable_agreement_reporting,
             enable_agreement_time_metrics: self.enable_agreement_time_metrics,
             network_mode: self.network_mode,
@@ -5340,6 +5349,9 @@ pub async fn run(
     // (which threads it into every `AgreementNetworkBridge` rebuild) must
     // share this exact collector.
     let agreement_message_counters = Arc::new(algo_network::AgreementMessageCounters::new());
+    // Issue #1677: shared by the REST adapter (status/metrics) and every
+    // ledger bridge the agreement control rebuilds.
+    let apply_stall_tracker = Arc::new(algo_ledger::ApplyStallTracker::new());
 
     // -----------------------------------------------------------------------
     // 3d. Build the `ParticipateAgreementControl` (issue #940) — the
@@ -5380,6 +5392,7 @@ pub async fn run(
         round_advanced: round_advanced.clone(),
         participation_metrics: participation_metrics.clone(),
         agreement_message_counters: agreement_message_counters.clone(),
+        apply_stall_tracker: apply_stall_tracker.clone(),
         enable_agreement_reporting: node_config.enable_agreement_reporting,
         enable_agreement_time_metrics: node_config.enable_agreement_time_metrics,
         network_mode,
@@ -5461,6 +5474,7 @@ pub async fn run(
             // gossip txpool remember-error counters, alongside the
             // participation metrics above.
             .with_agreement_message_counters(agreement_message_counters.clone())
+            .with_apply_stall_tracker(apply_stall_tracker.clone())
             .with_tx_pool_remember_counter(tx_pool_remember_counter.clone())
             // Issue #1251: inbound-gossip pool.test() rejection counters.
             .with_tx_pool_check_counter(tx_pool_check_counter.clone())
@@ -11330,6 +11344,7 @@ mod tests {
             round_advanced: Arc::new(std::sync::Condvar::new()),
             participation_metrics: Arc::new(algo_agreement::ParticipationMetrics::new()),
             agreement_message_counters: Arc::new(algo_network::AgreementMessageCounters::new()),
+            apply_stall_tracker: Arc::new(algo_ledger::ApplyStallTracker::new()),
             enable_agreement_reporting: false,
             enable_agreement_time_metrics: false,
             network_mode: NetworkMode::WsOnly,

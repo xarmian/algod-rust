@@ -198,6 +198,7 @@ struct MockNode {
     participation_status: Option<serde_json::Value>,
     /// Prometheus exposition text (None = not participating).
     metrics_exposition: Option<String>,
+    apply_stall: Option<algo_ledger::ApplyStall>,
     /// Peers result: `(inbound, outbound)`. `None` = use default
     /// `NotImplemented`.
     peers_result: Option<(
@@ -270,6 +271,7 @@ impl Clone for MockNode {
             set_sync_round_result: self.set_sync_round_result.clone(),
             participation_status: self.participation_status.clone(),
             metrics_exposition: self.metrics_exposition.clone(),
+            apply_stall: self.apply_stall.clone(),
             peers_result: self.peers_result.clone(),
         }
     }
@@ -387,6 +389,7 @@ impl MockNode {
             // endpoints answer 404 unless a test opts in.
             participation_status: None,
             metrics_exposition: None,
+            apply_stall: None,
             peers_result: None,
         }
     }
@@ -1211,6 +1214,10 @@ impl NodeInterface for MockNode {
 
     fn metrics_exposition(&self) -> Option<String> {
         self.metrics_exposition.clone()
+    }
+
+    fn apply_stall(&self) -> Option<algo_ledger::ApplyStall> {
+        self.apply_stall.clone()
     }
 
     async fn get_block_timestamp_offset(&self) -> Result<Option<u64>, NodeError> {
@@ -2534,6 +2541,54 @@ async fn wait_for_block_returns_200_immediately_when_round_passed() {
     assert!(body.get("last-version").is_some());
     assert!(body.get("next-version").is_some());
     assert!(body.get("catchup-time").is_some());
+}
+
+/// Issue #1677: `/v2/status` carries no extra field for a healthy node.
+#[tokio::test]
+async fn status_has_no_stall_field_when_healthy() {
+    let server = TestServer::start(MockNode::synced()).await;
+    let resp = server
+        .client
+        .get(server.url("/v2/status"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body.get("stalled-on-invalid-block").is_none());
+}
+
+/// Issue #1677: a node stalled on a deterministically invalid block says so
+/// on `/v2/status` without log parsing.
+#[tokio::test]
+async fn status_reports_stalled_on_invalid_block() {
+    let mut node = MockNode::synced();
+    node.apply_stall = Some(algo_ledger::ApplyStall {
+        round: 65_668_288,
+        error: "account balance below minimum".to_string(),
+        consecutive_failures: 7,
+        since_unix_secs: 1_700_000_000,
+    });
+    let server = TestServer::start(node).await;
+    let resp = server
+        .client
+        .get(server.url("/v2/status"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let stall = &body["stalled-on-invalid-block"];
+    assert_eq!(stall["round"].as_u64(), Some(65_668_288));
+    assert_eq!(
+        stall["error"].as_str(),
+        Some("account balance below minimum")
+    );
+    assert_eq!(stall["consecutive-failures"].as_u64(), Some(7));
+    assert_eq!(stall["since-unix-secs"].as_u64(), Some(1_700_000_000));
+    // The regular fields are untouched.
+    assert_eq!(body["last-round"].as_u64(), Some(1000));
 }
 
 #[tokio::test]

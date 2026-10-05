@@ -146,6 +146,17 @@ pub trait CatchupLedger: Send + Sync {
     fn authenticate_block(&self, _block: &Block, _cert: &Certificate) -> Result<(), String> {
         Err("this ledger cannot authenticate certificates".to_string())
     }
+
+    /// While the ledger is stalled on a block that deterministically fails
+    /// to apply (issue #1677), how long the periodic sync must still wait
+    /// before retrying it; `None` when not stalled (the normal cadence).
+    ///
+    /// [`crate::AgreementLedgerBridge`] answers from its shared
+    /// [`crate::ApplyStallTracker`]. The default (`None`) keeps every other
+    /// implementation on the unchanged ~8 s retry.
+    fn apply_stall_retry_in(&self) -> Option<Duration> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -565,6 +576,20 @@ impl CatchupService {
                         // (see `stuck_once`'s definition above for why this
                         // hysteresis is required — issue #1564).
                         stuck_once = true;
+                        continue;
+                    }
+                    // Issue #1677: the ledger is stalled on a block that
+                    // deterministically fails to apply. Re-fetching and
+                    // re-applying it every ~8 s only floods the log, so wait
+                    // out the exponential backoff (the tick keeps firing;
+                    // `stuck_once` stays set so the pass runs the first tick
+                    // after the backoff elapses). An explicit `sync_now` is
+                    // never gated.
+                    if let Some(wait) = ledger.apply_stall_retry_in() {
+                        trace!(
+                            retry_in_ms = wait.as_millis() as u64,
+                            "catchup service: stalled on an invalid block, backing off"
+                        );
                         continue;
                     }
                     Self::sync_pass(
@@ -1674,6 +1699,171 @@ mod tests {
                 raw_payset_blobs: None,
             })
         }
+    }
+
+    /// A ledger whose every `ensure_block` fails to apply, modelling the
+    /// real bridge: it records the failure in a shared
+    /// [`crate::ApplyStallTracker`] and does not advance. `errors` picks the
+    /// error text per attempt (same text = deterministic).
+    struct FailingApplyLedger {
+        round: Mutex<Round>,
+        tracker: Arc<crate::ApplyStallTracker>,
+        attempts: AtomicU64,
+        deterministic: AtomicBool,
+        succeed: AtomicBool,
+    }
+
+    impl FailingApplyLedger {
+        fn new(deterministic: bool) -> Arc<Self> {
+            Arc::new(Self {
+                round: Mutex::new(Round(0)),
+                tracker: Arc::new(crate::ApplyStallTracker::new()),
+                attempts: AtomicU64::new(0),
+                deterministic: AtomicBool::new(deterministic),
+                succeed: AtomicBool::new(false),
+            })
+        }
+    }
+
+    impl CatchupLedger for FailingApplyLedger {
+        fn next_round(&self) -> Round {
+            Round(self.round.lock().unwrap().0 + 1)
+        }
+        fn ensure_block(&self, block: &Block, _cert: &Certificate) {
+            let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if self.succeed.load(Ordering::SeqCst) {
+                *self.round.lock().unwrap() = block.round;
+                self.tracker.record_commit();
+                return;
+            }
+            let err = if self.deterministic.load(Ordering::SeqCst) {
+                "tx 0xabc: balance below minimum".to_string()
+            } else {
+                format!("transient io error #{n}")
+            };
+            self.tracker.record_failure(block.round.0, &err);
+        }
+        fn authenticate_block(&self, _block: &Block, _cert: &Certificate) -> Result<(), String> {
+            Ok(())
+        }
+        fn apply_stall_retry_in(&self) -> Option<Duration> {
+            self.tracker.retry_in()
+        }
+    }
+
+    fn bounded_fetcher() -> Arc<BoundedBlockFetcher> {
+        Arc::new(BoundedBlockFetcher {
+            up_to: 5,
+            calls: AtomicU64::new(0),
+        })
+    }
+
+    /// Issue #1677: a block that fails to apply with the same error twice
+    /// puts the ledger in the stalled state, with a growing backoff; a
+    /// success clears it.
+    #[test]
+    fn deterministic_apply_failure_stalls_then_recovers() {
+        let ledger = FailingApplyLedger::new(true);
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        let fetcher: Arc<dyn BlockFetcher> = bounded_fetcher();
+        let (_stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
+
+        CatchupService::sync_range(&ledger_dyn, &fetcher, &stop_rx, 1);
+        assert!(
+            ledger.tracker.stall().is_none(),
+            "one failure is not a stall"
+        );
+        assert!(ledger_dyn.apply_stall_retry_in().is_none());
+
+        CatchupService::sync_range(&ledger_dyn, &fetcher, &stop_rx, 1);
+        let stall = ledger
+            .tracker
+            .stall()
+            .expect("second identical failure stalls");
+        assert_eq!(stall.round, 1);
+        assert_eq!(stall.consecutive_failures, 2);
+        let first = ledger_dyn.apply_stall_retry_in().expect("must back off");
+
+        CatchupService::sync_range(&ledger_dyn, &fetcher, &stop_rx, 1);
+        assert_eq!(ledger.tracker.stall().unwrap().consecutive_failures, 3);
+        let second = ledger_dyn.apply_stall_retry_in().expect("must back off");
+        assert!(second > first, "backoff must grow: {first:?} -> {second:?}");
+
+        ledger.succeed.store(true, Ordering::SeqCst);
+        CatchupService::sync_range(&ledger_dyn, &fetcher, &stop_rx, 1);
+        assert!(ledger.tracker.stall().is_none(), "commit clears the stall");
+        assert!(ledger_dyn.apply_stall_retry_in().is_none());
+    }
+
+    /// Issue #1677: differing (transient-looking) errors never stall nor
+    /// delay the retry: the old ~8 s behaviour is kept.
+    #[test]
+    fn non_repeating_apply_errors_do_not_stall() {
+        let ledger = FailingApplyLedger::new(false);
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        let fetcher: Arc<dyn BlockFetcher> = bounded_fetcher();
+        let (_stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
+        for _ in 0..4 {
+            CatchupService::sync_range(&ledger_dyn, &fetcher, &stop_rx, 1);
+        }
+        assert!(ledger.tracker.stall().is_none());
+        assert!(ledger_dyn.apply_stall_retry_in().is_none());
+        assert_eq!(ledger.tracker.failures_total(), 4);
+    }
+
+    /// Issue #1677: while the stalled backoff is pending, the periodic loop
+    /// does not re-run the fetch+apply pass at its 8 s cadence. The
+    /// non-stalled control (below) proves the same wait does re-run it.
+    #[test]
+    fn periodic_loop_waits_out_the_stall_backoff() {
+        let ledger = FailingApplyLedger::new(true);
+        // Two identical failures put it in the stalled state; the backoff
+        // (>= 8 s since the last failure) now covers the whole test window
+        // only if the loop honours it, so push the failure time forward by
+        // recording a long streak (cap 300 s).
+        for _ in 0..10 {
+            ledger
+                .tracker
+                .record_failure(1, "tx 0xabc: balance below minimum");
+        }
+        assert!(ledger.tracker.stall().is_some());
+        let (_tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
+        let fetcher = bounded_fetcher();
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        let fetcher_dyn: Arc<dyn BlockFetcher> = fetcher.clone();
+        let mut svc = CatchupService::start(rx, ledger_dyn, fetcher_dyn);
+        poll_until(
+            || ledger.attempts.load(Ordering::SeqCst) >= 1,
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+            "the startup pass runs immediately",
+        );
+        let after_startup = ledger.attempts.load(Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(9_500));
+        assert_eq!(
+            ledger.attempts.load(Ordering::SeqCst),
+            after_startup,
+            "no retry while the stall backoff is pending"
+        );
+        svc.stop();
+    }
+
+    /// Control for [`periodic_loop_waits_out_the_stall_backoff`]: without a
+    /// stall the loop retries after two idle ticks (~8 s).
+    #[test]
+    fn periodic_loop_retries_at_normal_cadence_without_a_stall() {
+        let ledger = FailingApplyLedger::new(false);
+        let (_tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        let fetcher_dyn: Arc<dyn BlockFetcher> = bounded_fetcher();
+        let mut svc = CatchupService::start(rx, ledger_dyn, fetcher_dyn);
+        poll_until(
+            || ledger.attempts.load(Ordering::SeqCst) >= 2,
+            Duration::from_millis(100),
+            Duration::from_secs(15),
+            "an unstalled loop retries the failing block after ~8 s",
+        );
+        svc.stop();
     }
 
     /// Regression test for issue #478.

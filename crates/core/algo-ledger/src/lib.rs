@@ -21,6 +21,7 @@
 pub mod account_manager;
 pub mod acctupdates_stats;
 pub mod agreement_bridge;
+pub mod apply_stall;
 pub mod agreement_key_manager;
 pub mod apply;
 pub mod apply_stateproof;
@@ -113,6 +114,7 @@ pub use delta_cache::{DeltaCache, DEFAULT_WINDOW_SIZE};
 
 pub use account_manager::AccountManager;
 pub use agreement_bridge::AgreementLedgerBridge;
+pub use apply_stall::{ApplyStall, ApplyStallTracker, StallTransition};
 pub use agreement_key_manager::AgreementKeyManagerBridge;
 pub use catchup_service::{
     BlockFetcher, CatchupLedger, CatchupService, FetchError, FetchedBlockCert,

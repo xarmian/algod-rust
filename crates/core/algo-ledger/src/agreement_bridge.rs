@@ -28,9 +28,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use crate::apply_stall::{StallTransition, STALL_BACKOFF_MAX};
+
 use crossbeam_channel;
 
-use tracing::{debug, warn};
+use tracing::{debug, error, info, warn};
 
 use algo_agreement::{
     AsyncVoteVerifier, Certificate, LedgerError, LedgerReader, LedgerWriter, NetworkAdvancer,
@@ -98,6 +100,10 @@ pub struct AgreementLedgerBridge {
     /// The live waiter for the most recently requested round, so repeated
     /// `round_notify` calls for the same round share one thread (issue #1650).
     notify_cache: Mutex<Option<PendingNotify>>,
+    /// Deterministic block-apply failure tracking (issue #1677). Shared via
+    /// [`Self::with_apply_stall_tracker`] across bridge rebuilds and with the
+    /// REST/metrics adapter.
+    apply_stall: Arc<crate::ApplyStallTracker>,
 }
 
 /// A still-running `round_notify` waiter thread and the channel it feeds.
@@ -124,6 +130,18 @@ impl AgreementLedgerBridge {
         self.notify_threads_spawned.load(Ordering::SeqCst)
     }
 
+    /// Share `tracker` instead of this bridge's private one, so the stall
+    /// state survives bridge rebuilds and is visible to the REST adapter.
+    pub fn with_apply_stall_tracker(mut self, tracker: Arc<crate::ApplyStallTracker>) -> Self {
+        self.apply_stall = tracker;
+        self
+    }
+
+    /// The block-apply failure tracker (issue #1677).
+    pub fn apply_stall_tracker(&self) -> &Arc<crate::ApplyStallTracker> {
+        &self.apply_stall
+    }
+
     /// Create a new bridge wrapping the given ledger.
     ///
     /// Uses a no-op network advancer and no pending certificate channel.
@@ -137,6 +155,7 @@ impl AgreementLedgerBridge {
             network_advancer: Arc::new(NoOpNetworkAdvancer),
             notify_threads_spawned: AtomicU64::new(0),
             notify_cache: Mutex::new(None),
+            apply_stall: Arc::new(crate::ApplyStallTracker::new()),
         }
     }
 
@@ -159,6 +178,7 @@ impl AgreementLedgerBridge {
             network_advancer,
             notify_threads_spawned: AtomicU64::new(0),
             notify_cache: Mutex::new(None),
+            apply_stall: Arc::new(crate::ApplyStallTracker::new()),
         }
     }
 
@@ -222,6 +242,7 @@ impl AgreementLedgerBridge {
             network_advancer,
             notify_threads_spawned: AtomicU64::new(0),
             notify_cache: Mutex::new(None),
+            apply_stall: Arc::new(crate::ApplyStallTracker::new()),
         };
         (bridge, rx)
     }
@@ -750,6 +771,19 @@ impl LedgerWriter for AgreementLedgerBridge {
                     // Success — release the lock before notifying waiters.
                     drop(ledger);
 
+                    // Issue #1677: a commit ends any stalled-on-invalid-block
+                    // state (e.g. a different, valid block for the round).
+                    if let StallTransition::Left { round, failures } =
+                        self.apply_stall.record_commit()
+                    {
+                        info!(
+                            stalled_round = round,
+                            failures,
+                            committed_round = %block.round,
+                            "ensure_block: no longer stalled on an invalid block"
+                        );
+                    }
+
                     // Notify any threads waiting in wait_for_round.
                     self.round_advanced.notify_all();
 
@@ -768,11 +802,33 @@ impl LedgerWriter for AgreementLedgerBridge {
                 || err_msg.contains("busy");
 
             if !is_transient {
-                // Permanent error — no point retrying.
-                warn!(
-                    "ensure_block: permanent error writing block {} to ledger: {err}",
-                    block.round
-                );
+                // Permanent error — no point retrying inside this call.
+                //
+                // Issue #1677: the catchup service re-submits the same block
+                // every sync pass, so log by transition: the original
+                // `permanent error writing block` line the first time a
+                // (block, error) pair is seen (the soak log scan keys on it),
+                // one ERROR when the repeat makes it a deterministic stall,
+                // and only debug lines for further repeats.
+                drop(ledger);
+                match self.apply_stall.record_failure(block.round.0, &err_msg) {
+                    StallTransition::NewFailure => warn!(
+                        "ensure_block: permanent error writing block {} to ledger: {err}",
+                        block.round
+                    ),
+                    StallTransition::Entered => {
+                        error!(
+                            round = %block.round,
+                            "ensure_block: stalled on invalid block {}: the same permanent                              error twice in a row; retries now back off exponentially (cap                              {}s): {err}",
+                            block.round,
+                            STALL_BACKOFF_MAX.as_secs()
+                        );
+                    }
+                    _ => debug!(
+                        "ensure_block: permanent error writing block {} to ledger                          (repeat): {err}",
+                        block.round
+                    ),
+                }
                 return;
             }
 
@@ -863,6 +919,10 @@ impl LedgerWriter for AgreementLedgerBridge {
 }
 
 impl crate::catchup_service::CatchupLedger for AgreementLedgerBridge {
+    fn apply_stall_retry_in(&self) -> Option<Duration> {
+        self.apply_stall.retry_in()
+    }
+
     fn next_round(&self) -> Round {
         // Delegate to the LedgerReader implementation which already
         // locks the inner SqliteLedger and returns current_round + 1.
@@ -1277,6 +1337,73 @@ mod tests {
         bridge.ensure_digest(&make_cert(7), &verifier);
         let pending = rx.try_recv().expect("receiver should have a value");
         assert_eq!(pending.cert.round, Round(7));
+    }
+
+    // -- Deterministic apply failure tracking (issue #1677) --
+
+    /// A round-1 block whose only payment is from an unfunded account: it
+    /// fails to apply, identically, every time.
+    fn make_unapplyable_round1_block() -> algo_types::Block {
+        let mut stx = algo_types::SignedTransaction::default();
+        stx.txn.txn_type = "pay".into();
+        stx.txn.sender = Address([1u8; 32]);
+        stx.txn.receiver = Address([2u8; 32]);
+        stx.txn.amount = 1_000_000;
+        stx.txn.fee = 1_000;
+        stx.txn.last_valid = Round(1_000_000);
+        algo_types::Block {
+            payset: vec![stx],
+            ..make_round1_block()
+        }
+    }
+
+    #[test]
+    fn repeated_deterministic_apply_failure_stalls_and_backs_off() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+        let block = make_unapplyable_round1_block();
+        let cert = make_cert_with_proposal(1);
+
+        bridge.ensure_block(&block, &cert);
+        assert!(bridge.apply_stall_tracker().stall().is_none());
+        assert!(crate::catchup_service::CatchupLedger::apply_stall_retry_in(&bridge).is_none());
+
+        bridge.ensure_block(&block, &cert);
+        let stall = bridge.apply_stall_tracker().stall().expect("stalled");
+        assert_eq!(stall.round, 1);
+        assert_eq!(stall.consecutive_failures, 2);
+        assert!(crate::catchup_service::CatchupLedger::apply_stall_retry_in(&bridge).is_some());
+        assert_eq!(bridge.apply_stall_tracker().failures_total(), 2);
+        // The ledger never advanced.
+        assert_eq!(ledger.lock().unwrap().current_round().0, 0);
+    }
+
+    #[test]
+    fn committing_a_valid_block_clears_the_stall() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+        let bad = make_unapplyable_round1_block();
+        let cert = make_cert_with_proposal(1);
+        bridge.ensure_block(&bad, &cert);
+        bridge.ensure_block(&bad, &cert);
+        assert!(bridge.apply_stall_tracker().stall().is_some());
+
+        bridge.ensure_block(&make_round1_block(), &cert);
+        assert_eq!(ledger.lock().unwrap().current_round().0, 1);
+        assert!(bridge.apply_stall_tracker().stall().is_none());
+    }
+
+    #[test]
+    fn shared_tracker_is_visible_across_bridges() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let tracker = Arc::new(crate::ApplyStallTracker::new());
+        let a = AgreementLedgerBridge::new(Arc::clone(&ledger))
+            .with_apply_stall_tracker(Arc::clone(&tracker));
+        let bad = make_unapplyable_round1_block();
+        let cert = make_cert_with_proposal(1);
+        a.ensure_block(&bad, &cert);
+        a.ensure_block(&bad, &cert);
+        assert!(tracker.stall().is_some());
     }
 
     // -- Certificate storage tests --
