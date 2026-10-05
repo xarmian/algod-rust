@@ -23,36 +23,17 @@ mod commands;
 mod config;
 mod dev_producer;
 mod live_catchup;
+mod log_setup;
 mod node_interface_impl;
 
 use clap::Parser;
-use tracing_subscriber::{fmt, EnvFilter};
 
 use cli::{AlgocfgAction, AlgocfgProfileAction, BenchAction, CatchpointAction, Cli, Commands};
-
-/// Target of the hickory DNSSEC validator's per-recursion
-/// `exceeded max validation depth` ERROR (issue #1676).
-const DNSSEC_DEPTH_NOISE_TARGET: &str = "hickory_proto::dnssec::dnssec_dns_handle";
-
-/// Append a directive silencing [`DNSSEC_DEPTH_NOISE_TARGET`] unless the
-/// operator's filter already names it. The line is emitted once per
-/// validation recursion (tens of thousands per second while a lookup spins);
-/// the lookup's real outcome is reported by `algo_network::srv_resolver`.
-fn with_dnssec_noise_suppressed(spec: &str) -> String {
-    if spec.contains(DNSSEC_DEPTH_NOISE_TARGET) {
-        spec.to_string()
-    } else {
-        format!("{spec},{DNSSEC_DEPTH_NOISE_TARGET}=off")
-    }
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize structured logging (JSON in prod, pretty for dev).
-    let spec = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
-    let filter = EnvFilter::try_new(with_dnssec_noise_suppressed(&spec))
-        .unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt().with_env_filter(filter).init();
+    log_setup::init();
 
     let cli = Cli::parse();
 
@@ -743,19 +724,5 @@ fn rebalance_fd_pressure(
             // its current soft limit.
             tracing::error!(error = %e, "failed to read/raise the process file-descriptor limit");
         }
-    }
-}
-
-#[cfg(test)]
-mod log_filter_tests {
-    use super::with_dnssec_noise_suppressed;
-
-    #[test]
-    fn suppresses_by_default_and_respects_explicit_override() {
-        let f = with_dnssec_noise_suppressed("info");
-        assert_eq!(f, "info,hickory_proto::dnssec::dnssec_dns_handle=off");
-        assert!(tracing_subscriber::EnvFilter::try_new(&f).is_ok());
-        let explicit = "info,hickory_proto::dnssec::dnssec_dns_handle=error";
-        assert_eq!(with_dnssec_noise_suppressed(explicit), explicit);
     }
 }

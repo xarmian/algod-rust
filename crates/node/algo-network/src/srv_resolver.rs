@@ -263,46 +263,171 @@ fn apply_resolver_opts(opts: &mut ResolverOpts, validate: bool) {
 }
 
 // ---------------------------------------------------------------------------
-// System-stage circuit breaker (issue #1676)
+// Stage chain with a system-stage cool-down (issue #1676)
 // ---------------------------------------------------------------------------
 
-/// Remembers that the system-resolver stage timed out, so later lookups on
-/// the same [`HickorySrvResolver`] skip it (issue #1676).
-///
-/// Mainnet soak logs showed 232k `exceeded max validation depth` ERROR lines
-/// inside a 60 s startup window: `Discovery::refresh_phonebook_addresses`
-/// performs four SRV lookups (primary/backup x relay/archive), and on a
-/// runner whose stub system resolver cannot serve the DNSSEC chain each of
-/// them spun inside hickory's validating walk for the entire
-/// [`DNSSEC_STAGE_TIMEOUT`] (about 58k log lines and 15 s each) before falling
-/// through to the default resolver, which answered immediately. The system
-/// resolver's inability to serve DNSSEC data is a property of the host, not
-/// of the queried name, so after one timeout the remaining lookups go
-/// straight to the fallback/default stages (go keeps the same stage order;
-/// it simply has no hot-spinning validator to short-circuit).
-#[derive(Debug, Default)]
-struct SystemStageBreaker {
-    tripped: std::sync::atomic::AtomicBool,
+/// How long the system stage is skipped after it is shown to be the stage
+/// that burns [`DNSSEC_STAGE_TIMEOUT`] (see [`run_stage_chain`]).
+const SYSTEM_STAGE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+
+/// One step of the `system -> fallback -> default -> last-resort` chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Stage {
+    System,
+    Fallback,
+    Default,
+    /// Default resolver with DNSSEC validation off (issue #1614).
+    LastResort,
 }
 
-impl SystemStageBreaker {
-    /// True when the system stage should be skipped.
-    fn should_skip(&self) -> bool {
-        self.tripped.load(std::sync::atomic::Ordering::Relaxed)
-    }
+type StageFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<SrvRecord>, SrvResolveError>> + Send + 'a>>;
 
-    /// Record a failed system-stage attempt; only a timeout trips the breaker.
-    fn record(&self, err: &SrvResolveError) {
-        if matches!(err, SrvResolveError::Timeout(_)) {
-            self.tripped
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+/// Runs a single [`Stage`]; the production impl builds a hickory resolver,
+/// tests substitute a scripted fake.
+trait StageRunner: Sync {
+    fn has_fallback(&self) -> bool;
+    fn run(&self, stage: Stage) -> StageFuture<'_>;
+}
+
+/// Deadline until which the system stage is skipped, if any.
+type SystemSkip = std::sync::Mutex<Option<std::time::Instant>>;
+
+/// Drives the stage chain, mirroring go's `readFromSRV` order plus the
+/// #1614 last-resort stage.
+///
+/// # System-stage cool-down (issue #1676)
+///
+/// On a host whose stub system resolver cannot serve the DNSSEC chain,
+/// hickory's validating walk spins (about 4k `exceeded max validation depth`
+/// ERROR lines/s) until [`DNSSEC_STAGE_TIMEOUT`] expires, and
+/// `Discovery::refresh_phonebook_addresses` does four SRV lookups, so one
+/// mainnet soak start logged 232k such lines and lost 60 s. When
+/// `validate_dnssec` is on, the system stage timed out, **and** a later
+/// fallback/default stage then answered the same lookup (evidence the system
+/// stage was the culprit rather than the network being down), the system
+/// stage is skipped for [`SYSTEM_STAGE_COOLDOWN`]. After the cool-down it is
+/// tried again, and a success clears the skip. Nothing trips when every stage
+/// fails (an unreachable host must keep trying its only resolver), when
+/// validation is off, on a non-timeout error, or when only the unvalidated
+/// last-resort stage answered.
+async fn run_stage_chain(
+    runner: &dyn StageRunner,
+    skip: &SystemSkip,
+    validate: bool,
+    now: std::time::Instant,
+    cooldown: Duration,
+    srv_name: &str,
+) -> Result<Vec<SrvRecord>, SrvResolveError> {
+    let skipping = validate
+        && matches!(*skip.lock().unwrap_or_else(|p| p.into_inner()), Some(until) if now < until);
+
+    let mut system_timed_out = false;
+    let sys_err = if skipping {
+        debug!("skipping the system resolver stage during its cool-down (issue #1676)");
+        "skipped after an earlier timeout".to_string()
+    } else {
+        match runner.run(Stage::System).await {
+            Ok(records) => {
+                *skip.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                return Ok(records);
+            }
+            Err(e) => {
+                system_timed_out = matches!(e, SrvResolveError::Timeout(_));
+                info!("DNS SRV lookup failed with system resolver: {e}");
+                e.to_string()
+            }
+        }
+    };
+
+    // A later validated stage answering after a system-stage timeout is the
+    // evidence that arms the cool-down.
+    let trip = || {
+        if validate && system_timed_out {
+            *skip.lock().unwrap_or_else(|p| p.into_inner()) = Some(now + cooldown);
+        }
+    };
+
+    let fb_err = if runner.has_fallback() {
+        match runner.run(Stage::Fallback).await {
+            Ok(records) => {
+                trip();
+                return Ok(records);
+            }
+            Err(e) => {
+                info!("DNS SRV lookup failed with fallback resolver: {e}");
+                e.to_string()
+            }
+        }
+    } else {
+        "not configured".to_string()
+    };
+
+    let default_err = match runner.run(Stage::Default).await {
+        Ok(records) => {
+            trip();
+            return Ok(records);
+        }
+        Err(e) => {
+            info!("DNS SRV lookup failed with default resolver: {e}");
+            e.to_string()
+        }
+    };
+
+    // Last resort (issue #1614): every DNSSEC-validating stage failed, so
+    // retry once through the default resolver with validation off. This
+    // never arms the cool-down: an unvalidated answer proves nothing about
+    // which validating stage was at fault.
+    if validate {
+        warn!(
+            "all DNSSEC-validating DNS SRV lookup stages failed or timed out for \
+             '{srv_name}' (system: {sys_err}; fallback: {fb_err}; default: {default_err}); \
+             retrying once via the default resolver with DNSSEC validation disabled as a \
+             last resort (see hickory-dns issue #3974 and algod-rust issue #1614)"
+        );
+        match runner.run(Stage::LastResort).await {
+            Ok(records) => return Ok(records),
+            Err(e) => {
+                info!("DNS SRV lookup also failed with DNSSEC-disabled last-resort resolver: {e}")
+            }
         }
     }
 
-    /// Record a successful system-stage attempt (re-arms the stage).
-    fn record_success(&self) {
-        self.tripped
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+    Err(SrvResolveError::AllResolversFailed {
+        system: sys_err,
+        fallback: fb_err,
+        default: default_err,
+    })
+}
+
+/// Production [`StageRunner`] backed by hickory resolvers.
+struct HickoryStageRunner<'a> {
+    fallback_dns: Option<&'a str>,
+    validate: bool,
+    srv_name: &'a str,
+}
+
+impl StageRunner for HickoryStageRunner<'_> {
+    fn has_fallback(&self) -> bool {
+        self.fallback_dns.is_some()
+    }
+
+    fn run(&self, stage: Stage) -> StageFuture<'_> {
+        Box::pin(async move {
+            let resolver = match stage {
+                Stage::System => HickorySrvResolver::system_resolver(self.validate)?,
+                Stage::Fallback => {
+                    let addr = self
+                        .fallback_dns
+                        .ok_or(SrvResolveError::FallbackNotConfigured)?;
+                    HickorySrvResolver::fallback_resolver(addr, self.validate)
+                        .ok_or(SrvResolveError::FallbackNotConfigured)?
+                }
+                Stage::Default => HickorySrvResolver::default_resolver(self.validate),
+                Stage::LastResort => HickorySrvResolver::default_resolver(false),
+            };
+            HickorySrvResolver::do_lookup_bounded(&resolver, self.srv_name).await
+        })
     }
 }
 
@@ -333,8 +458,8 @@ pub struct HickorySrvResolver {
     /// to be hardcoded `true` unconditionally with no way to disable it.
     validate_dnssec: bool,
 
-    /// Skips the system stage after it has timed out once (issue #1676).
-    system_breaker: SystemStageBreaker,
+    /// System-stage skip deadline (issue #1676); see [`run_stage_chain`].
+    system_skip: SystemSkip,
 }
 
 impl HickorySrvResolver {
@@ -348,7 +473,7 @@ impl HickorySrvResolver {
         Self {
             fallback_dns,
             validate_dnssec: true,
-            system_breaker: SystemStageBreaker::default(),
+            system_skip: SystemSkip::default(),
         }
     }
 
@@ -361,7 +486,7 @@ impl HickorySrvResolver {
         Self {
             fallback_dns,
             validate_dnssec,
-            system_breaker: SystemStageBreaker::default(),
+            system_skip: SystemSkip::default(),
         }
     }
 
@@ -642,106 +767,21 @@ impl SrvResolver for HickorySrvResolver {
             // 2. Construct the SRV query name: _<service>._<protocol>.<name>
             let srv_name = format!("_{service}._{protocol}.{name}");
 
-            // 3. Try system resolver first (unless it already timed out once).
-            let sys_err: String = if self.system_breaker.should_skip() {
-                debug!(
-                    "skipping system resolver: it timed out earlier on this resolver (issue #1676)"
-                );
-                "skipped after earlier timeout".to_string()
-            } else {
-                match Self::system_resolver(self.validate_dnssec) {
-                    Ok(resolver) => match Self::do_lookup_bounded(&resolver, &srv_name).await {
-                        Ok(records) => {
-                            self.system_breaker.record_success();
-                            return Ok(records);
-                        }
-                        Err(e) => {
-                            self.system_breaker.record(&e);
-                            info!("DNS SRV lookup failed with system resolver: {e}");
-                            e.to_string()
-                        }
-                    },
-                    Err(e) => {
-                        info!("failed to create system resolver: {e}");
-                        e.to_string()
-                    }
-                }
+            // 3. Run the stage chain (system -> fallback -> default -> last resort).
+            let runner = HickoryStageRunner {
+                fallback_dns: self.fallback_dns.as_deref(),
+                validate: self.validate_dnssec,
+                srv_name: &srv_name,
             };
-
-            // 4. If system fails and fallback is configured, try fallback.
-            let fb_err: String = if let Some(ref fallback_addr) = self.fallback_dns {
-                match Self::fallback_resolver(fallback_addr, self.validate_dnssec) {
-                    Some(resolver) => match Self::do_lookup_bounded(&resolver, &srv_name).await {
-                        Ok(records) => return Ok(records),
-                        Err(e) => {
-                            info!(
-                                "DNS SRV lookup failed with fallback '{fallback_addr}' resolver: {e}"
-                            );
-                            e.to_string()
-                        }
-                    },
-                    None => "fallback address could not be parsed".to_string(),
-                }
-            } else {
-                "not configured".to_string()
-            };
-
-            // 5. Try default resolver (well-known public DNS).
-            let default_resolver = Self::default_resolver(self.validate_dnssec);
-            let default_err: String =
-                match Self::do_lookup_bounded(&default_resolver, &srv_name).await {
-                    Ok(records) => return Ok(records),
-                    Err(e) => {
-                        info!("DNS SRV lookup failed with default resolver: {e}");
-                        e.to_string()
-                    }
-                };
-
-            // 6. Last resort (issue #1614): if every DNSSEC-validating stage
-            //    above failed or timed out, retry once through the default
-            //    resolver with DNSSEC validation switched off.
-            //
-            //    This does NOT weaken DNSSEC validation of the actual
-            //    queried SRV RRset in the normal case: every attempt above
-            //    already tried real DNSSEC validation first, and this stage
-            //    only runs after all three of them have already failed. It
-            //    exists specifically to work around hickory-proto's
-            //    `DnssecDnsHandle` validating far more than the queried
-            //    RRset (see `DNSSEC_STAGE_TIMEOUT`'s doc comment) in a way
-            //    that can consume a validating attempt's entire time budget
-            //    on additional-section glue this crate's own bootstrap flow
-            //    never reads (`discovery.rs` re-resolves each relay
-            //    hostname's address separately, non-DNSSEC, via
-            //    `TcpStream::connect`). Only reached when
-            //    `self.validate_dnssec` is true — an operator who already
-            //    disabled DNSSEC validation gets no extra stage here, since
-            //    every attempt above was already non-validating.
-            if self.validate_dnssec {
-                warn!(
-                    "all DNSSEC-validating DNS SRV lookup stages failed or timed out for \
-                     '{srv_name}' (system: {sys_err}; fallback: {fb_err}; default: \
-                     {default_err}); retrying once via the default resolver with DNSSEC \
-                     validation disabled as a last resort (see hickory-dns issue #3974 and \
-                     algod-rust issue #1614 for why this stage exists — this does not affect \
-                     the real-validation attempts already made above)"
-                );
-                let unvalidated_default_resolver = Self::default_resolver(false);
-                match Self::do_lookup_bounded(&unvalidated_default_resolver, &srv_name).await {
-                    Ok(records) => return Ok(records),
-                    Err(e) => {
-                        info!(
-                            "DNS SRV lookup also failed with DNSSEC-disabled last-resort \
-                             resolver: {e}"
-                        );
-                    }
-                }
-            }
-
-            Err(SrvResolveError::AllResolversFailed {
-                system: sys_err,
-                fallback: fb_err,
-                default: default_err,
-            })
+            run_stage_chain(
+                &runner,
+                &self.system_skip,
+                self.validate_dnssec,
+                std::time::Instant::now(),
+                SYSTEM_STAGE_COOLDOWN,
+                &srv_name,
+            )
+            .await
         })
     }
 }
@@ -778,32 +818,235 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------------
-    // System-stage circuit breaker (issue #1676)
+    // Stage-chain policy with a system-stage cool-down (issue #1676)
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn system_stage_breaker_trips_only_on_timeout() {
-        let b = SystemStageBreaker::default();
-        assert!(!b.should_skip(), "fresh breaker must try the system stage");
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Instant;
 
-        // An ordinary resolution failure (e.g. NXDOMAIN) says nothing about
-        // whether the system resolver can serve DNSSEC data.
-        b.record(&SrvResolveError::EmptyName);
-        assert!(!b.should_skip());
-
-        // A timeout means the validating walk spun until the stage budget
-        // expired: later lookups must not pay that cost again.
-        b.record(&SrvResolveError::Timeout(Duration::from_secs(15)));
-        assert!(b.should_skip());
+    #[derive(Clone, Copy)]
+    enum Outcome {
+        Ok,
+        Timeout,
+        Fail,
     }
 
-    #[test]
-    fn system_stage_breaker_success_resets() {
-        let b = SystemStageBreaker::default();
-        b.record(&SrvResolveError::Timeout(Duration::from_secs(15)));
-        assert!(b.should_skip());
-        b.record_success();
-        assert!(!b.should_skip());
+    /// Scripted [`StageRunner`] recording which stages were attempted.
+    struct FakeRunner {
+        has_fallback: bool,
+        outcomes: Mutex<HashMap<Stage, Outcome>>,
+        calls: Mutex<Vec<Stage>>,
+    }
+
+    impl FakeRunner {
+        fn new(has_fallback: bool, script: &[(Stage, Outcome)]) -> Self {
+            Self {
+                has_fallback,
+                outcomes: Mutex::new(script.iter().copied().collect()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+        fn set(&self, stage: Stage, o: Outcome) {
+            self.outcomes.lock().unwrap().insert(stage, o);
+        }
+        fn take_calls(&self) -> Vec<Stage> {
+            std::mem::take(&mut *self.calls.lock().unwrap())
+        }
+    }
+
+    impl StageRunner for FakeRunner {
+        fn has_fallback(&self) -> bool {
+            self.has_fallback
+        }
+        fn run(
+            &self,
+            stage: Stage,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<SrvRecord>, SrvResolveError>> + Send + '_>>
+        {
+            self.calls.lock().unwrap().push(stage);
+            let o = self
+                .outcomes
+                .lock()
+                .unwrap()
+                .get(&stage)
+                .copied()
+                .unwrap_or(Outcome::Fail);
+            Box::pin(async move {
+                match o {
+                    Outcome::Ok => Ok(vec![SrvRecord {
+                        target: "r.example".into(),
+                        port: 4160,
+                        priority: 1,
+                        weight: 1,
+                    }]),
+                    Outcome::Timeout => Err(SrvResolveError::Timeout(Duration::from_secs(15))),
+                    Outcome::Fail => Err(SrvResolveError::EmptyName),
+                }
+            })
+        }
+    }
+
+    const COOLDOWN: Duration = Duration::from_secs(600);
+
+    async fn chain(
+        r: &FakeRunner,
+        skip: &SystemSkip,
+        validate: bool,
+        now: Instant,
+    ) -> Result<Vec<SrvRecord>, SrvResolveError> {
+        run_stage_chain(r, skip, validate, now, COOLDOWN, "_x._tcp.example").await
+    }
+
+    #[tokio::test]
+    async fn system_timeout_followed_by_fallback_success_trips_then_skips() {
+        let t0 = Instant::now();
+        let skip = SystemSkip::default();
+        let r = FakeRunner::new(
+            true,
+            &[
+                (Stage::System, Outcome::Timeout),
+                (Stage::Fallback, Outcome::Ok),
+            ],
+        );
+        assert!(chain(&r, &skip, true, t0).await.is_ok());
+        assert_eq!(r.take_calls(), vec![Stage::System, Stage::Fallback]);
+
+        // Second lookup inside the cool-down skips the system stage.
+        assert!(chain(&r, &skip, true, t0 + Duration::from_secs(1))
+            .await
+            .is_ok());
+        assert_eq!(r.take_calls(), vec![Stage::Fallback]);
+    }
+
+    #[tokio::test]
+    async fn system_stage_is_retried_after_cooldown_and_success_rearms() {
+        let t0 = Instant::now();
+        let skip = SystemSkip::default();
+        let r = FakeRunner::new(
+            false,
+            &[
+                (Stage::System, Outcome::Timeout),
+                (Stage::Default, Outcome::Ok),
+            ],
+        );
+        assert!(chain(&r, &skip, true, t0).await.is_ok());
+        assert_eq!(r.take_calls(), vec![Stage::System, Stage::Default]);
+
+        // Cool-down elapsed: system is tried again, and now succeeds.
+        r.set(Stage::System, Outcome::Ok);
+        let later = t0 + COOLDOWN + Duration::from_secs(1);
+        assert!(chain(&r, &skip, true, later).await.is_ok());
+        assert_eq!(r.take_calls(), vec![Stage::System]);
+
+        // The success cleared the skip window: next lookup tries system too.
+        assert!(chain(&r, &skip, true, later + Duration::from_secs(1))
+            .await
+            .is_ok());
+        assert_eq!(r.take_calls(), vec![Stage::System]);
+    }
+
+    #[tokio::test]
+    async fn retripped_when_system_still_times_out_after_cooldown() {
+        let t0 = Instant::now();
+        let skip = SystemSkip::default();
+        let r = FakeRunner::new(
+            false,
+            &[
+                (Stage::System, Outcome::Timeout),
+                (Stage::Default, Outcome::Ok),
+            ],
+        );
+        chain(&r, &skip, true, t0).await.unwrap();
+        r.take_calls();
+        let later = t0 + COOLDOWN + Duration::from_secs(1);
+        chain(&r, &skip, true, later).await.unwrap();
+        assert_eq!(r.take_calls(), vec![Stage::System, Stage::Default]);
+        chain(&r, &skip, true, later + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(r.take_calls(), vec![Stage::Default]);
+    }
+
+    #[tokio::test]
+    async fn all_stages_failing_does_not_trip() {
+        let t0 = Instant::now();
+        let skip = SystemSkip::default();
+        // Unreachable system + unreachable fallback + unreachable default
+        // (e.g. a firewalled host): nothing proves the system stage is the
+        // culprit, so it must keep being tried.
+        let r = FakeRunner::new(
+            true,
+            &[
+                (Stage::System, Outcome::Timeout),
+                (Stage::Fallback, Outcome::Timeout),
+                (Stage::Default, Outcome::Timeout),
+                (Stage::LastResort, Outcome::Timeout),
+            ],
+        );
+        assert!(chain(&r, &skip, true, t0).await.is_err());
+        r.take_calls();
+        assert!(chain(&r, &skip, true, t0 + Duration::from_secs(1))
+            .await
+            .is_err());
+        assert_eq!(r.take_calls()[0], Stage::System);
+    }
+
+    #[tokio::test]
+    async fn no_trip_without_validation_or_on_non_timeout_or_last_resort() {
+        let t0 = Instant::now();
+
+        // validate=false: the DNSSEC spin is not involved.
+        let skip = SystemSkip::default();
+        let r = FakeRunner::new(
+            false,
+            &[
+                (Stage::System, Outcome::Timeout),
+                (Stage::Default, Outcome::Ok),
+            ],
+        );
+        chain(&r, &skip, false, t0).await.unwrap();
+        r.take_calls();
+        chain(&r, &skip, false, t0 + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(r.take_calls()[0], Stage::System);
+
+        // A non-timeout system error is not evidence of a DNSSEC spin.
+        let skip = SystemSkip::default();
+        let r = FakeRunner::new(
+            false,
+            &[
+                (Stage::System, Outcome::Fail),
+                (Stage::Default, Outcome::Ok),
+            ],
+        );
+        chain(&r, &skip, true, t0).await.unwrap();
+        r.take_calls();
+        chain(&r, &skip, true, t0 + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(r.take_calls()[0], Stage::System);
+
+        // Only the unvalidated last-resort answered: not a trip.
+        let skip = SystemSkip::default();
+        let r = FakeRunner::new(
+            false,
+            &[
+                (Stage::System, Outcome::Timeout),
+                (Stage::Default, Outcome::Timeout),
+                (Stage::LastResort, Outcome::Ok),
+            ],
+        );
+        chain(&r, &skip, true, t0).await.unwrap();
+        assert_eq!(
+            r.take_calls(),
+            vec![Stage::System, Stage::Default, Stage::LastResort]
+        );
+        chain(&r, &skip, true, t0 + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(r.take_calls()[0], Stage::System);
     }
 
     // -----------------------------------------------------------------------
