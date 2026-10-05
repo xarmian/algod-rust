@@ -44,6 +44,7 @@ use algo_error::AlgoError;
 use algo_types::{AccountData, Address, Block};
 
 use crate::apply::{apply_block_impl_ex, ApplyData, ApplyMode, KvModsMap};
+use crate::eval_delta::{parse_eval_delta, EvalDelta, ValueDelta};
 use crate::recording_store::{RecordingStore, ResourceTouches};
 use crate::store_trait::LedgerStore;
 
@@ -57,6 +58,8 @@ pub const MISMATCH_LOG_TOKEN: &str = "shadow_execute_mismatch";
 const MAX_VALUE_CHARS: usize = 160;
 /// How many diffs one WARN line spells out.
 const MAX_DIFFS_LOGGED: usize = 8;
+/// Cap on per-field WARNs for one block's ApplyData mismatches.
+const MAX_APPLY_DATA_WARNS_PER_BLOCK: usize = 16;
 /// Emit a `shadow_execute_progress` INFO line every this many checked blocks
 /// (and every 5x this many app-call blocks that bypass the check).
 const PROGRESS_EVERY: u64 = 100;
@@ -64,26 +67,27 @@ const PROGRESS_EVERY: u64 = 100;
 static CHECKED: AtomicU64 = AtomicU64::new(0);
 static MISMATCHED: AtomicU64 = AtomicU64::new(0);
 static SKIPPED: AtomicU64 = AtomicU64::new(0);
-static APP_CALL_BLOCKS: AtomicU64 = AtomicU64::new(0);
 static CHECK_US: AtomicU64 = AtomicU64::new(0);
+static APPLY_DATA_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static APPLY_DATA_TXNS: AtomicU64 = AtomicU64::new(0);
+static APPLY_DATA_MISMATCH_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static APPLY_DATA_MISMATCH_TXNS: AtomicU64 = AtomicU64::new(0);
+static APPLY_DATA_US: AtomicU64 = AtomicU64::new(0);
 
 fn log_progress(last_round: u64) {
     let (c, m, k) = shadow_execute_counters();
-    let app = APP_CALL_BLOCKS.load(Ordering::Relaxed);
     let avg_us = CHECK_US.load(Ordering::Relaxed).checked_div(c).unwrap_or(0);
+    let ab = APPLY_DATA_BLOCKS.load(Ordering::Relaxed);
+    let ad_avg_us = APPLY_DATA_US
+        .load(Ordering::Relaxed)
+        .checked_div(ab)
+        .unwrap_or(0);
     tracing::info!(
-        "shadow_execute_progress checked={c} mismatched_blocks={m} skipped_unsupported_store={k} app_call_blocks_not_checked={app} avg_check_us={avg_us} last_round={last_round}"
+        "shadow_execute_progress state_checked_blocks={c} state_mismatched_blocks={m} state_skipped_unsupported_store={k} state_avg_check_us={avg_us} apply_data_compared_blocks={ab} apply_data_compared_txns={} apply_data_mismatched_blocks={} apply_data_mismatched_txns={} apply_data_avg_compare_us={ad_avg_us} last_round={last_round}",
+        APPLY_DATA_TXNS.load(Ordering::Relaxed),
+        APPLY_DATA_MISMATCH_BLOCKS.load(Ordering::Relaxed),
+        APPLY_DATA_MISMATCH_TXNS.load(Ordering::Relaxed),
     );
-}
-
-/// Record that a block with app calls (applied in Execute mode already, so
-/// not shadow-checked) went by; keeps the progress line meaningful on a chain
-/// where almost every block carries an `appl` transaction.
-pub fn note_app_call_block(round: u64) {
-    let n = APP_CALL_BLOCKS.fetch_add(1, Ordering::Relaxed) + 1;
-    if n == 1 || n % (PROGRESS_EVERY * 5) == 0 {
-        log_progress(round);
-    }
 }
 
 /// Whether `ALGOD_SHADOW_EXECUTE` is set to a truthy value (read once).
@@ -135,9 +139,14 @@ impl std::fmt::Display for ShadowDiff {
         if let Some(id) = self.id {
             write!(f, " id={id}")?;
         }
+        let (l, r) = if self.kind == "apply_data" {
+            ("recorded", "computed")
+        } else {
+            ("replay", "execute")
+        };
         write!(
             f,
-            " field={} replay={} execute={}",
+            " field={} {l}={} {r}={}",
             self.field, self.replay, self.execute
         )
     }
@@ -684,6 +693,329 @@ pub fn apply_replay_block_with_shadow<L: LedgerStore>(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Recorded-vs-computed ApplyData check (go: BlockEvaluator.transaction's
+// `ad.Equal(applyData)`, ledger/eval/eval.go).
+// ---------------------------------------------------------------------------
+
+type FieldDiff = (String, String, String);
+
+fn show_value_delta(v: Option<&ValueDelta>) -> String {
+    match v {
+        None => "<absent>".to_string(),
+        Some(v) => clip(format!("{v:?}")),
+    }
+}
+
+/// `basics.StateDelta.Equal`: same keys, same `ValueDelta`s.
+fn diff_state_delta(
+    path: &str,
+    rec: &HashMap<Vec<u8>, ValueDelta>,
+    comp: &HashMap<Vec<u8>, ValueDelta>,
+    out: &mut Vec<FieldDiff>,
+) {
+    let keys: BTreeSet<&Vec<u8>> = rec.keys().chain(comp.keys()).collect();
+    for k in keys {
+        let (r, c) = (rec.get(k), comp.get(k));
+        if r != c {
+            out.push((
+                format!("{path}[{}]", hex_prefix(k)),
+                show_value_delta(r),
+                show_value_delta(c),
+            ));
+        }
+    }
+}
+
+/// First few pretty-`Debug` lines present on one side only; pinpoints the
+/// differing field of a large struct without a hand-written field list.
+fn debug_line_diff(rec: &str, comp: &str) -> (String, String) {
+    let r: Vec<&str> = rec.lines().collect();
+    let c: Vec<&str> = comp.lines().collect();
+    let pick = |a: &[&str], b: &[&str]| {
+        let only: Vec<&str> = a
+            .iter()
+            .filter(|l| !b.contains(l))
+            .take(3)
+            .map(|l| l.trim())
+            .collect();
+        if only.is_empty() {
+            "<none>".to_string()
+        } else {
+            clip(only.join(" | "))
+        }
+    };
+    (pick(&r, &c), pick(&c, &r))
+}
+
+/// Compare one pair of recorded/computed `dt` values with `EvalDelta.Equal`
+/// semantics: nil and empty deltas are equal, local deltas are keyed by wire
+/// index, logs and shared accounts compare element-wise, inner transactions
+/// compare their `txn` and (recursively) their own ApplyData.
+fn diff_eval_delta(
+    path: &str,
+    rec: Option<&rmpv::Value>,
+    comp: Option<&rmpv::Value>,
+    out: &mut Vec<FieldDiff>,
+) {
+    let parse = |v: Option<&rmpv::Value>| match v {
+        None => Ok(EvalDelta::default()),
+        Some(v) => parse_eval_delta(v),
+    };
+    let (r, c) = match (parse(rec), parse(comp)) {
+        (Ok(r), Ok(c)) => (r, c),
+        (r, c) => {
+            out.push((
+                format!("{path}.parse"),
+                r.err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "ok".into()),
+                c.err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "ok".into()),
+            ));
+            return;
+        }
+    };
+
+    let empty_sd: HashMap<Vec<u8>, ValueDelta> = HashMap::new();
+    diff_state_delta(
+        &format!("{path}.global_delta"),
+        r.global_delta.as_ref().unwrap_or(&empty_sd),
+        c.global_delta.as_ref().unwrap_or(&empty_sd),
+        out,
+    );
+
+    let empty_ld: HashMap<u64, HashMap<Vec<u8>, ValueDelta>> = HashMap::new();
+    let (rl, cl) = (
+        r.local_deltas.as_ref().unwrap_or(&empty_ld),
+        c.local_deltas.as_ref().unwrap_or(&empty_ld),
+    );
+    let idxs: BTreeSet<&u64> = rl.keys().chain(cl.keys()).collect();
+    for i in idxs {
+        match (rl.get(i), cl.get(i)) {
+            (Some(a), Some(b)) => diff_state_delta(&format!("{path}.local_delta[{i}]"), a, b, out),
+            (a, b) => out.push((
+                format!("{path}.local_delta[{i}]"),
+                a.map(|m| format!("{} keys", m.len()))
+                    .unwrap_or_else(|| "<absent>".into()),
+                b.map(|m| format!("{} keys", m.len()))
+                    .unwrap_or_else(|| "<absent>".into()),
+            )),
+        }
+    }
+
+    let (rs, cs) = (
+        r.shared_accts.clone().unwrap_or_default(),
+        c.shared_accts.clone().unwrap_or_default(),
+    );
+    if rs != cs {
+        out.push((
+            format!("{path}.shared_accts"),
+            clip(format!("{rs:?}")),
+            clip(format!("{cs:?}")),
+        ));
+    }
+
+    let (rg, cg) = (
+        r.logs.clone().unwrap_or_default(),
+        c.logs.clone().unwrap_or_default(),
+    );
+    if rg != cg {
+        let first = rg
+            .iter()
+            .zip(&cg)
+            .position(|(a, b)| a != b)
+            .unwrap_or(rg.len().min(cg.len()));
+        out.push((
+            format!("{path}.logs[{first}] (counts {}/{})", rg.len(), cg.len()),
+            rg.get(first)
+                .map(|l| hex_prefix(l))
+                .unwrap_or_else(|| "<absent>".into()),
+            cg.get(first)
+                .map(|l| hex_prefix(l))
+                .unwrap_or_else(|| "<absent>".into()),
+        ));
+    }
+
+    let (ri, ci) = (
+        r.inner_txns.as_deref().unwrap_or(&[]),
+        c.inner_txns.as_deref().unwrap_or(&[]),
+    );
+    if ri.len() != ci.len() {
+        out.push((
+            format!("{path}.inner_txns.len"),
+            ri.len().to_string(),
+            ci.len().to_string(),
+        ));
+        return;
+    }
+    for (i, (a, b)) in ri.iter().zip(ci).enumerate() {
+        let p = format!("{path}.inner_txns[{i}]");
+        let (ea, eb) = (
+            algo_codec::canonical_encode_transaction(&a.txn),
+            algo_codec::canonical_encode_transaction(&b.txn),
+        );
+        if ea != eb {
+            let (x, y) = debug_line_diff(&format!("{:#?}", a.txn), &format!("{:#?}", b.txn));
+            out.push((format!("{p}.txn"), x, y));
+        }
+        macro_rules! scalar {
+            ($($f:ident),*) => {$(
+                if a.$f != b.$f {
+                    out.push((format!("{p}.{}", stringify!($f)), a.$f.to_string(), b.$f.to_string()));
+                }
+            )*};
+        }
+        scalar!(
+            closing_amount,
+            asset_closing_amount,
+            sender_rewards,
+            receiver_rewards,
+            close_rewards,
+            apply_data_config_asset,
+            apply_data_application_id
+        );
+        diff_eval_delta(
+            &format!("{p}.eval_delta"),
+            a.eval_delta.as_ref(),
+            b.eval_delta.as_ref(),
+            out,
+        );
+    }
+}
+
+/// Compare the ApplyData `Execute` computed for each payset transaction with
+/// the ApplyData recorded in the block (`SignedTxnInBlock` fields), using
+/// go's `ApplyData.Equal` semantics.
+pub fn compare_recorded_apply_data(block: &Block, computed: &[ApplyData]) -> Vec<ShadowDiff> {
+    let mut out = Vec::new();
+    if computed.len() != block.payset.len() {
+        out.push(ShadowDiff {
+            round: block.round.0,
+            txn_index: None,
+            kind: "apply_data",
+            account: None,
+            id: None,
+            field: "len".into(),
+            replay: block.payset.len().to_string(),
+            execute: computed.len().to_string(),
+        });
+        return out;
+    }
+    for (i, (stx, c)) in block.payset.iter().zip(computed).enumerate() {
+        let mut fields: Vec<FieldDiff> = Vec::new();
+        macro_rules! scalar {
+            ($($rec:expr, $comp:expr, $name:literal);* $(;)?) => {$(
+                if $rec != $comp {
+                    fields.push(($name.to_string(), $rec.to_string(), $comp.to_string()));
+                }
+            )*};
+        }
+        scalar!(
+            stx.closing_amount, c.closing_amount, "closing_amount";
+            stx.asset_closing_amount, c.asset_closing_amount, "asset_closing_amount";
+            stx.sender_rewards, c.sender_rewards, "sender_rewards";
+            stx.receiver_rewards, c.receiver_rewards, "receiver_rewards";
+            stx.close_rewards, c.close_rewards, "close_rewards";
+            stx.apply_data_config_asset, c.config_asset, "config_asset";
+        );
+        // `application_id` prefers the recorded apid when replaying; the
+        // counter-derived value is what go's evaluator would produce.
+        if stx.txn.txn_type == "appl" && stx.txn.application_id == 0 {
+            scalar!(
+                stx.apply_data_application_id,
+                c.derived_application_id,
+                "application_id"
+            );
+        } else {
+            scalar!(
+                stx.apply_data_application_id,
+                c.application_id,
+                "application_id"
+            );
+        }
+        diff_eval_delta(
+            "eval_delta",
+            stx.eval_delta.as_ref(),
+            c.eval_delta.as_ref(),
+            &mut fields,
+        );
+        for (field, rec, comp) in fields {
+            out.push(ShadowDiff {
+                round: block.round.0,
+                txn_index: Some(i),
+                kind: "apply_data",
+                account: None,
+                id: None,
+                field,
+                replay: clip(rec),
+                execute: clip(comp),
+            });
+        }
+    }
+    out
+}
+
+/// Follow-path entry point for blocks that contain app calls when
+/// [`shadow_execute_enabled`]: apply the block in [`ApplyMode::Execute`] (as
+/// the plain path does), then compare the ApplyData it computed per
+/// transaction with the block's recorded ApplyData and log one
+/// `shadow_execute_mismatch kind=apply_data` WARN per differing field.
+/// Reads only what Execute already computed; never changes what is committed
+/// and never fails on a mismatch.
+pub fn apply_execute_block_with_apply_data_check<L: LedgerStore>(
+    store: &mut L,
+    block: &Block,
+) -> Result<(), AlgoError> {
+    let mut computed: Vec<ApplyData> = Vec::with_capacity(block.payset.len());
+    apply_block_impl_ex(
+        store,
+        block,
+        ApplyMode::Execute,
+        false,
+        None,
+        None,
+        Some(&mut computed),
+        None,
+        false,
+    )?;
+    let started = std::time::Instant::now();
+    let diffs = compare_recorded_apply_data(block, &computed);
+    let elapsed_us = started.elapsed().as_micros() as u64;
+    let n = APPLY_DATA_BLOCKS.fetch_add(1, Ordering::Relaxed) + 1;
+    APPLY_DATA_TXNS.fetch_add(block.payset.len() as u64, Ordering::Relaxed);
+    APPLY_DATA_US.fetch_add(elapsed_us, Ordering::Relaxed);
+    if !diffs.is_empty() {
+        APPLY_DATA_MISMATCH_BLOCKS.fetch_add(1, Ordering::Relaxed);
+        let txns: BTreeSet<Option<usize>> = diffs.iter().map(|d| d.txn_index).collect();
+        APPLY_DATA_MISMATCH_TXNS.fetch_add(txns.len() as u64, Ordering::Relaxed);
+        for d in diffs.iter().take(MAX_APPLY_DATA_WARNS_PER_BLOCK) {
+            tracing::warn!(
+                "{MISMATCH_LOG_TOKEN} kind=apply_data round={} txn={} field={} recorded={} computed={}",
+                d.round,
+                d.txn_index
+                    .map(|i| i.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                d.field,
+                d.replay,
+                d.execute
+            );
+        }
+        if diffs.len() > MAX_APPLY_DATA_WARNS_PER_BLOCK {
+            tracing::warn!(
+                "{MISMATCH_LOG_TOKEN} kind=apply_data round={} field=<truncated> total_diffs={}",
+                block.round.0,
+                diffs.len()
+            );
+        }
+    }
+    if n == 1 || n % PROGRESS_EVERY == 0 {
+        log_progress(block.round.0);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -879,5 +1211,271 @@ mod tests {
         // Applying the same round again must be refused (round advanced once).
         assert_eq!(l.current_round(), Round(before.3 .0 + 1));
         assert_eq!(l.txn_counter(), 1);
+    }
+
+    // ---- recorded-vs-computed ApplyData (go: ApplyData.Equal) ----
+
+    use rmpv::Value;
+
+    fn vd_uint(u: u64) -> Value {
+        Value::Map(vec![
+            (Value::from("at"), Value::from(1u64)),
+            (Value::from("ui"), Value::from(u)),
+        ])
+    }
+
+    fn gd(key: &[u8], v: Value) -> (Value, Value) {
+        (
+            Value::from("gd"),
+            Value::Map(vec![(Value::Binary(key.to_vec()), v)]),
+        )
+    }
+
+    fn dt(entries: Vec<(Value, Value)>) -> Option<Value> {
+        Some(Value::Map(entries))
+    }
+
+    /// Block with one transaction carrying `recorded` ApplyData-ish fields,
+    /// compared against `computed`.
+    fn cmp_one(
+        recorded: impl FnOnce(&mut SignedTransaction),
+        computed: ApplyData,
+    ) -> Vec<ShadowDiff> {
+        let mut stx = pay();
+        recorded(&mut stx);
+        let b = block(vec![stx]);
+        compare_recorded_apply_data(&b, &[computed])
+    }
+
+    #[test]
+    fn identical_apply_data_has_no_diff() {
+        assert!(cmp_one(|_| {}, ApplyData::default()).is_empty());
+    }
+
+    #[test]
+    fn nil_and_empty_eval_deltas_are_equal() {
+        // Recorded carries an explicit-but-empty dt; computed has none.
+        let d = cmp_one(
+            |s| s.eval_delta = dt(vec![(Value::from("gd"), Value::Map(vec![]))]),
+            ApplyData::default(),
+        );
+        assert!(d.is_empty(), "{d:#?}");
+        // And the reverse: computed carries an empty dt.
+        let d = cmp_one(
+            |_| {},
+            ApplyData {
+                eval_delta: dt(vec![]),
+                ..Default::default()
+            },
+        );
+        assert!(d.is_empty(), "{d:#?}");
+    }
+
+    #[test]
+    fn local_delta_entry_order_is_irrelevant() {
+        let ld = |order: &[u64]| {
+            Value::Map(
+                order
+                    .iter()
+                    .map(|i| {
+                        (
+                            Value::from(*i),
+                            Value::Map(vec![(Value::Binary(b"k".to_vec()), vd_uint(*i))]),
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let d = cmp_one(
+            |s| s.eval_delta = dt(vec![(Value::from("ld"), ld(&[2, 1]))]),
+            ApplyData {
+                eval_delta: dt(vec![(Value::from("ld"), ld(&[1, 2]))]),
+                ..Default::default()
+            },
+        );
+        assert!(d.is_empty(), "{d:#?}");
+    }
+
+    #[test]
+    fn rewards_fields_compare_equal_when_both_sides_omit_them() {
+        // Protocols without RewardsInApplyData record (and compute) zero.
+        let d = cmp_one(
+            |s| s.sender_rewards = 0,
+            ApplyData {
+                sender_rewards: 0,
+                ..Default::default()
+            },
+        );
+        assert!(d.is_empty());
+        // When present on only one side it is a real mismatch.
+        let d = cmp_one(|s| s.sender_rewards = 7, ApplyData::default());
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].field, "sender_rewards");
+        assert_eq!((d[0].replay.as_str(), d[0].execute.as_str()), ("7", "0"));
+    }
+
+    #[test]
+    fn global_delta_value_mismatch_is_reported_per_key() {
+        let d = cmp_one(
+            |s| s.eval_delta = dt(vec![gd(b"cnt", vd_uint(5))]),
+            ApplyData {
+                eval_delta: dt(vec![gd(b"cnt", vd_uint(6))]),
+                ..Default::default()
+            },
+        );
+        assert_eq!(d.len(), 1, "{d:#?}");
+        assert_eq!(d[0].kind, "apply_data");
+        assert_eq!(d[0].txn_index, Some(0));
+        assert_eq!(d[0].field, "eval_delta.global_delta[636e74]");
+        assert!(d[0].replay.contains("uint: 5") && d[0].execute.contains("uint: 6"));
+        let line = d[0].to_string();
+        assert!(
+            line.contains("recorded=") && line.contains("computed="),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn logs_and_missing_local_delta_entry_are_reported() {
+        let d = cmp_one(
+            |s| {
+                s.eval_delta = dt(vec![
+                    (
+                        Value::from("lg"),
+                        Value::Array(vec![Value::Binary(vec![1, 2])]),
+                    ),
+                    (
+                        Value::from("ld"),
+                        Value::Map(vec![(Value::from(1u64), Value::Map(vec![]))]),
+                    ),
+                ])
+            },
+            ApplyData {
+                eval_delta: dt(vec![(
+                    Value::from("lg"),
+                    Value::Array(vec![Value::Binary(vec![1, 3])]),
+                )]),
+                ..Default::default()
+            },
+        );
+        let fields: Vec<&str> = d.iter().map(|x| x.field.as_str()).collect();
+        assert!(
+            fields.iter().any(|f| f.starts_with("eval_delta.logs[0]")),
+            "{fields:?}"
+        );
+        assert!(fields.contains(&"eval_delta.local_delta[1]"), "{fields:?}");
+    }
+
+    #[test]
+    fn created_app_id_uses_the_counter_derived_value_not_the_recorded_one() {
+        let mk = |derived: u64| {
+            let mut stx = SignedTransaction::default();
+            stx.txn.txn_type = "appl".into();
+            stx.txn.sender = SENDER;
+            stx.apply_data_application_id = 42;
+            let b = block(vec![stx]);
+            compare_recorded_apply_data(
+                &b,
+                &[ApplyData {
+                    application_id: 42,
+                    derived_application_id: derived,
+                    ..Default::default()
+                }],
+            )
+        };
+        assert!(mk(42).is_empty());
+        let d = mk(43);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].field, "application_id");
+    }
+
+    #[test]
+    fn inner_transaction_difference_is_reported_with_path() {
+        let inner = |amount: u64| {
+            let mut stx = SignedTransaction::default();
+            stx.txn.txn_type = "pay".into();
+            stx.txn.sender = SENDER;
+            stx.txn.receiver = RECEIVER;
+            stx.txn.amount = amount;
+            let bytes = rmp_serde::to_vec_named(&stx).unwrap();
+            rmpv::decode::read_value(&mut &bytes[..]).unwrap()
+        };
+        let itx = |amount: u64| {
+            dt(vec![(
+                Value::from("itx"),
+                Value::Array(vec![inner(amount)]),
+            )])
+        };
+        let d = cmp_one(
+            |s| s.eval_delta = itx(10),
+            ApplyData {
+                eval_delta: itx(11),
+                ..Default::default()
+            },
+        );
+        assert_eq!(d.len(), 1, "{d:#?}");
+        assert_eq!(d[0].field, "eval_delta.inner_txns[0].txn");
+        assert!(
+            d[0].replay.contains("10") && d[0].execute.contains("11"),
+            "{:?}",
+            d[0]
+        );
+        assert!(cmp_one(
+            |s| s.eval_delta = itx(10),
+            ApplyData {
+                eval_delta: itx(10),
+                ..Default::default()
+            }
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn executed_app_create_round_trips_against_its_own_recorded_apply_data() {
+        let approval = algo_avm::assembler::assemble_string(
+            "#pragma version 8\nbyte \"k\"\nint 7\napp_global_put\nbyte \"hi\"\nlog\nint 1\nreturn\n",
+        )
+        .unwrap()
+        .program;
+        let clear = algo_avm::assembler::assemble_string("#pragma version 8\nint 1\nreturn\n")
+            .unwrap()
+            .program;
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = SENDER;
+        create.txn.fee = 1_000;
+        create.txn.last_valid = Round(1_000_000);
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        create.txn.global_state_schema = Some(algo_types::StateSchema {
+            num_uint: 1,
+            num_byte_slice: 0,
+        });
+        let b = block(vec![create]);
+
+        // Execute once to obtain the computed ApplyData.
+        let mut l = ledger();
+        let ads =
+            crate::apply::apply_block_capturing_apply_data(&mut l, &b, ApplyMode::Execute).unwrap();
+        assert_eq!(ads.len(), 1);
+        assert_eq!(ads[0].derived_application_id, 1);
+        assert!(ads[0].eval_delta.is_some());
+
+        // Record those values the way a committed block carries them.
+        let mut recorded = b.clone();
+        recorded.payset[0].apply_data_application_id = 1;
+        recorded.payset[0].eval_delta = ads[0].eval_delta.clone();
+        assert!(compare_recorded_apply_data(&recorded, &ads).is_empty());
+
+        // The follow-path wrapper applies it and agrees.
+        let mut l2 = ledger();
+        apply_execute_block_with_apply_data_check(&mut l2, &recorded).unwrap();
+        assert!(l2.get_app_params(1).is_some());
+
+        // A recorded apid that disagrees with the counter is reported.
+        recorded.payset[0].apply_data_application_id = 9;
+        let d = compare_recorded_apply_data(&recorded, &ads);
+        assert_eq!(d.len(), 1, "{d:#?}");
+        assert_eq!(d[0].field, "application_id");
     }
 }

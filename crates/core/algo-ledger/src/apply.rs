@@ -68,6 +68,12 @@ pub struct ApplyData {
     pub config_asset: u64,
     /// Created application ID (from appl creates).
     pub application_id: u64,
+    /// The application ID the transaction counter derives for an `appl`
+    /// create (`counter + 1`), independent of the block's recorded `apid`
+    /// that [`Self::application_id`] prefers when replaying. Only set in
+    /// [`ApplyMode::Execute`]; read by the shadow-execute diagnostic so a
+    /// recorded-vs-derived disagreement is not hidden.
+    pub derived_application_id: u64,
     /// Eval delta (opaque msgpack, contains state changes, logs, inner txns).
     pub eval_delta: Option<rmpv::Value>,
 }
@@ -297,7 +303,7 @@ pub fn apply_block_executing_app_calls<L: crate::store_trait::LedgerStore>(
         );
     }
     if crate::shadow_execute::shadow_execute_enabled() {
-        crate::shadow_execute::note_app_call_block(block.round.0);
+        return crate::shadow_execute::apply_execute_block_with_apply_data_check(store, block);
     }
     apply_block_impl(
         store,
@@ -3404,6 +3410,9 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
                 )?;
                 // For appl creates, capture the created application ID.
                 if txn.application_id == 0 {
+                    if ctx.mode == ApplyMode::Execute {
+                        apply_data.derived_application_id = pre_apply_counter + 1;
+                    }
                     apply_data.application_id = if stx.apply_data_application_id != 0 {
                         stx.apply_data_application_id // Replay: from block data
                     } else {
