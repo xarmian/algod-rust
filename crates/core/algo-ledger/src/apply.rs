@@ -296,6 +296,9 @@ pub fn apply_block_executing_app_calls<L: crate::store_trait::LedgerStore>(
             None,
         );
     }
+    if crate::shadow_execute::shadow_execute_enabled() {
+        crate::shadow_execute::note_app_call_block(block.round.0);
+    }
     apply_block_impl(
         store,
         block,

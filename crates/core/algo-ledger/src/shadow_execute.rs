@@ -57,12 +57,34 @@ pub const MISMATCH_LOG_TOKEN: &str = "shadow_execute_mismatch";
 const MAX_VALUE_CHARS: usize = 160;
 /// How many diffs one WARN line spells out.
 const MAX_DIFFS_LOGGED: usize = 8;
-/// Emit a `shadow_execute_progress` INFO line every this many checked blocks.
-const PROGRESS_EVERY: u64 = 1000;
+/// Emit a `shadow_execute_progress` INFO line every this many checked blocks
+/// (and every 5x this many app-call blocks that bypass the check).
+const PROGRESS_EVERY: u64 = 100;
 
 static CHECKED: AtomicU64 = AtomicU64::new(0);
 static MISMATCHED: AtomicU64 = AtomicU64::new(0);
 static SKIPPED: AtomicU64 = AtomicU64::new(0);
+static APP_CALL_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static CHECK_US: AtomicU64 = AtomicU64::new(0);
+
+fn log_progress(last_round: u64) {
+    let (c, m, k) = shadow_execute_counters();
+    let app = APP_CALL_BLOCKS.load(Ordering::Relaxed);
+    let avg_us = CHECK_US.load(Ordering::Relaxed).checked_div(c).unwrap_or(0);
+    tracing::info!(
+        "shadow_execute_progress checked={c} mismatched_blocks={m} skipped_unsupported_store={k} app_call_blocks_not_checked={app} avg_check_us={avg_us} last_round={last_round}"
+    );
+}
+
+/// Record that a block with app calls (applied in Execute mode already, so
+/// not shadow-checked) went by; keeps the progress line meaningful on a chain
+/// where almost every block carries an `appl` transaction.
+pub fn note_app_call_block(round: u64) {
+    let n = APP_CALL_BLOCKS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n % (PROGRESS_EVERY * 5) == 0 {
+        log_progress(round);
+    }
+}
 
 /// Whether `ALGOD_SHADOW_EXECUTE` is set to a truthy value (read once).
 pub fn shadow_execute_enabled() -> bool {
@@ -637,6 +659,7 @@ pub fn apply_replay_block_with_shadow<L: LedgerStore>(
         return Ok(());
     }
     let checked = CHECKED.fetch_add(1, Ordering::Relaxed) + 1;
+    CHECK_US.fetch_add(elapsed_us, Ordering::Relaxed);
     if !report.diffs.is_empty() {
         MISMATCHED.fetch_add(1, Ordering::Relaxed);
         let first: Vec<String> = report
@@ -655,12 +678,8 @@ pub fn apply_replay_block_with_shadow<L: LedgerStore>(
             first.join("; ")
         );
     }
-    if checked % PROGRESS_EVERY == 0 {
-        let (c, m, _) = shadow_execute_counters();
-        tracing::info!(
-            "shadow_execute_progress checked={c} mismatched_blocks={m} last_round={} last_check_us={elapsed_us}",
-            block.round.0
-        );
+    if checked == 1 || checked % PROGRESS_EVERY == 0 {
+        log_progress(block.round.0);
     }
     Ok(())
 }
