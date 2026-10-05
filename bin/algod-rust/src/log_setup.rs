@@ -26,10 +26,16 @@
 //! target would also hide genuine DNSSEC failures, so instead the target is
 //! rate-limited: the first few events per window pass and the rest are
 //! dropped. A small background thread reports the number of dropped events
-//! through `tracing` once the window has ended, even if no further event
-//! arrives (a single burst followed by silence is the real case). An operator
-//! whose `RUST_LOG` asks for more than the default on that target (or an
-//! ancestor of it) gets unfiltered output.
+//! (at ERROR, like the events themselves) once the window has ended, even if
+//! no further event arrives. Drops of a window still open when the process
+//! exits are not reported.
+//!
+//! Only an explicit `RUST_LOG` directive whose target is the noisy target or
+//! a string prefix of it (`hickory_proto=debug`, `hickory=trace`) at
+//! trace/debug (or with no level) disables the limiter. A bare global level
+//! (`RUST_LOG=debug`) does not: debugging everything must not bring back the
+//! flood from this one target. Everything else about `RUST_LOG` handling is
+//! unchanged from the previous `EnvFilter::try_from_default_env` initializer.
 
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -103,7 +109,8 @@ fn directive_target_and_level(directive: &str) -> (&str, Option<&str>) {
     (target, eq.map(|i| directive[i + 1..].trim()))
 }
 
-/// Whether a directive level is a bare level word (or number).
+/// Whether a directive target is really a bare level word (or number), i.e.
+/// a global level directive such as `debug`.
 fn is_level_word(t: &str) -> bool {
     const LEVELS: [&str; 6] = ["off", "error", "warn", "info", "debug", "trace"];
     LEVELS.iter().any(|l| l.eq_ignore_ascii_case(t)) || t.chars().all(|c| c.is_ascii_digit())
@@ -122,34 +129,25 @@ fn level_is_verbose(level: Option<&str>) -> bool {
     }
 }
 
-/// True when the operator's `RUST_LOG`-style `spec` asks for verbose
-/// (trace/debug) output on the noisy target: the most specific directive
-/// naming the target or one of its ancestors (`hickory_proto`,
-/// `hickory_proto::dnssec`, ...) decides, falling back to a bare global
-/// level directive (`debug`), as `EnvFilter` itself resolves directives.
-/// Quieting or default-level (`info`, `warn`, `error`, `off`) winners keep
-/// the limiter on: the flood is ERROR level and would pass them.
+/// True when `spec` has an explicit directive asking for verbose (trace or
+/// debug) output on the noisy target. Targets match like `EnvFilter` matches
+/// them, by plain string prefix (`hickory`, `hickory_p`, `hickory_proto::dnssec`
+/// all cover it); the most specific (longest) such directive decides, later
+/// winning ties. Bare global levels are ignored (see the module docs).
 fn names_noisy_target(spec: &str) -> bool {
-    // (specificity, verbose) of the best directive so far; later wins ties.
     let mut best: Option<(usize, bool)> = None;
     for directive in split_directives(spec) {
         let (target, level) = directive_target_and_level(directive);
-        let (specificity, verbose) = if target.is_empty() {
+        if target.is_empty() || (is_level_word(target) && level.is_none()) {
             continue;
-        } else if is_level_word(target) && level.is_none() {
-            // Bare global level directive.
-            (0, level_is_verbose(Some(target)))
-        } else if NOISY_TARGET_PATHS
-            .iter()
-            .any(|p| *p == target || p.starts_with(&format!("{target}::")))
-        {
-            (target.len() + 1, level_is_verbose(level))
-        } else {
+        }
+        if !NOISY_TARGET_PATHS.iter().any(|p| p.starts_with(target)) {
             continue;
-        };
+        }
+        let verbose = level_is_verbose(level);
         match best {
-            Some((sp, _)) if specificity < sp => {}
-            _ => best = Some((specificity, verbose)),
+            Some((len, _)) if target.len() < len => {}
+            _ => best = Some((target.len(), verbose)),
         }
     }
     best.is_some_and(|(_, verbose)| verbose)
@@ -162,35 +160,24 @@ struct LogSetup {
     filter_spec: String,
     /// Whether the noisy target is rate-limited.
     rate_limit: bool,
-    /// One-time warning to print (bad `RUST_LOG`).
-    warning: Option<String>,
 }
 
 impl LogSetup {
-    /// Unset or blank `RUST_LOG` means `info` (the previous initializer,
-    /// `EnvFilter::try_from_default_env`, turned a blank value into an empty
-    /// filter); an unparsable one warns and falls back to `info`. The rate
-    /// limit applies unless the operator asked for verbose output on the
-    /// noisy target.
+    /// Same semantics as the previous
+    /// `EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))`:
+    /// unset is `info`, a value is parsed as given (so blank stays whatever
+    /// `EnvFilter` makes of it), an unparsable one silently falls back to
+    /// `info`. The limiter applies unless the operator explicitly asked for
+    /// verbose output on the noisy target.
     fn resolve(raw: Option<&str>) -> Self {
-        let raw = raw.map(str::trim).filter(|v| !v.is_empty());
-        let (filter_spec, warning) = match raw {
-            None => ("info".to_string(), None),
-            Some(v) => match EnvFilter::try_new(v) {
-                Ok(_) => (v.to_string(), None),
-                Err(e) => (
-                    "info".to_string(),
-                    Some(format!(
-                        "ignoring invalid RUST_LOG value {v:?} ({e}); using \"info\""
-                    )),
-                ),
-            },
+        let filter_spec = match raw {
+            Some(v) if EnvFilter::try_new(v).is_ok() => v.to_string(),
+            _ => "info".to_string(),
         };
         let rate_limit = !names_noisy_target(&filter_spec);
         Self {
             filter_spec,
             rate_limit,
-            warning,
         }
     }
 }
@@ -263,14 +250,15 @@ impl RateLimiter {
     }
 }
 
-/// Background thread that calls `report(dropped)` once a window with drops
-/// has ended, with no further event required. It holds only a weak
-/// reference, so it exits once the limiter is dropped.
+/// Daemon thread that calls `report(dropped)` once a window with drops has
+/// ended, with no further event required. It holds only a weak reference so
+/// that tests' limiters let it go; in production the global subscriber keeps
+/// the limiter for the life of the process.
 fn spawn_summary_ticker(
     limiter: &Arc<RateLimiter>,
     tick: Duration,
     report: impl Fn(u64) + Send + 'static,
-) -> std::io::Result<std::thread::JoinHandle<()>> {
+) -> std::io::Result<()> {
     let weak: Weak<RateLimiter> = Arc::downgrade(limiter);
     std::thread::Builder::new()
         .name("log-rate-summary".into())
@@ -283,6 +271,43 @@ fn spawn_summary_ticker(
                 report(n);
             }
         })
+        .map(drop)
+}
+
+/// The suppression notice. ERROR, like the events it summarizes, so it
+/// survives any filter that lets those events through (`RUST_LOG=error`).
+fn emit_summary(dropped: u64) {
+    tracing::error!(
+        target: "algod_rust::log_setup",
+        suppressed = dropped,
+        window_secs = WINDOW.as_secs(),
+        "rate-limited hickory dnssec_dns_handle errors: suppressed {dropped} events in the \
+         last window (set RUST_LOG=hickory_proto=debug to see all)"
+    );
+}
+
+/// Build the limiter when `rate_limit` is on, starting its summary thread
+/// through `spawn`. If the thread cannot start (e.g. a container pids
+/// limit) no limiter is installed at all: events then pass unlimited rather
+/// than being dropped with no summary ever; one stderr line says so.
+fn build_limiter(
+    rate_limit: bool,
+    spawn: impl FnOnce(&Arc<RateLimiter>) -> std::io::Result<()>,
+) -> Option<Arc<RateLimiter>> {
+    if !rate_limit {
+        return None;
+    }
+    let limiter = Arc::new(RateLimiter::new(BURST, WINDOW));
+    match spawn(&limiter) {
+        Ok(()) => Some(limiter),
+        Err(e) => {
+            eprintln!(
+                "algod-rust: could not start the log rate-limit summary thread ({e}); \
+                 hickory dnssec_dns_handle errors will not be rate-limited"
+            );
+            None
+        }
+    }
 }
 
 /// Per-layer filter applying [`RateLimiter`] to noisy-target events; `None`
@@ -306,41 +331,15 @@ impl<S: Subscriber> Filter<S> for NoisyTargetLimiter {
     }
 }
 
-/// Install the global subscriber from `RUST_LOG`.
-///
-/// A blank `RUST_LOG` is treated as unset (`info`), unlike the earlier
-/// `EnvFilter::try_from_default_env` initializer, which produced an empty
-/// filter; `kmd-rust` still uses that pattern and is unchanged. An invalid
-/// value prints one warning to stderr and falls back to `info`.
+/// Install the global subscriber from `RUST_LOG`, with the same
+/// `RUST_LOG` semantics as before plus the noisy-target rate limit.
 pub fn init() {
     let raw = std::env::var("RUST_LOG").ok();
     let setup = LogSetup::resolve(raw.as_deref());
-    if let Some(w) = &setup.warning {
-        eprintln!("algod-rust: {w}");
-    }
     let env = EnvFilter::try_new(&setup.filter_spec).unwrap_or_else(|_| EnvFilter::new("info"));
-    let limiter = setup
-        .rate_limit
-        .then(|| Arc::new(RateLimiter::new(BURST, WINDOW)));
-    if let Some(limiter) = &limiter {
-        // Detached on purpose: it lives as long as the process. A failed
-        // spawn (e.g. a container pids limit) only loses the summary line.
-        match spawn_summary_ticker(limiter, SUMMARY_TICK, |n| {
-            tracing::warn!(
-                target: "algod_rust::log_setup",
-                suppressed = n,
-                window_secs = WINDOW.as_secs(),
-                "rate-limited hickory dnssec_dns_handle errors: suppressed {n} events in the \
-                 last window (set RUST_LOG=hickory_proto=debug to see all)"
-            );
-        }) {
-            Ok(handle) => drop(handle),
-            Err(e) => eprintln!(
-                "algod-rust: could not start the log rate-limit summary thread ({e}); \
-                 suppressed-event summaries are disabled"
-            ),
-        }
-    }
+    let limiter = build_limiter(setup.rate_limit, |l| {
+        spawn_summary_ticker(l, SUMMARY_TICK, emit_summary)
+    });
     let layer =
         tracing_subscriber::fmt::layer().with_filter(env.and(NoisyTargetLimiter { limiter }));
     tracing_subscriber::registry().with(layer).init();
@@ -349,12 +348,13 @@ pub fn init() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     #[test]
-    fn override_matrix_only_trace_or_debug_disables_the_limiter() {
+    fn override_matrix_only_explicit_trace_debug_directives_disable_the_limiter() {
         for spec in [
-            // trace/debug (or numeric 5/4) on the target or an ancestor
+            // trace/debug (or numeric 5/4) on the target or any string prefix
             "hickory_proto=trace",
             "hickory_proto=debug",
             "hickory_proto=DEBUG",
@@ -363,26 +363,30 @@ mod tests {
             "hickory_proto::dnssec=trace",
             "hickory_proto::dnssec::dnssec_dns_handle=debug",
             "hickory_proto::xfer::dnssec_dns_handle=debug",
+            // EnvFilter matches targets by plain string prefix
+            "hickory=debug",
+            "hickory_p=trace",
             // no level means trace
             "hickory_proto",
             "info,hickory_proto=debug",
             " info , hickory_proto::dnssec=debug ",
             // commas inside span/field filters must not confuse the parse
             "info,foo[span{a=1,b=2}]=debug,hickory_proto=debug",
-            // a global verbose default (operator debugging everything)
-            "debug",
-            "trace",
-            "5",
-            "TRACE",
-            "warn,debug",
-            "debug,algod_rust=info",
-            // the most specific directive wins
+            // the most specific explicit directive wins
             "warn,hickory_proto=debug",
             "info,hickory_proto::dnssec=debug,hickory_proto=warn",
         ] {
             assert!(names_noisy_target(spec), "{spec} must disable the limiter");
         }
         for spec in [
+            // a bare global level does NOT disable it: debugging everything
+            // must not bring back the 4k/s flood from this one target
+            "debug",
+            "trace",
+            "5",
+            "TRACE",
+            "warn,debug",
+            "debug,algod_rust=info",
             // info is the default and the flood is ERROR: the limiter stays on
             "hickory_proto=info",
             "hickory_proto=INFO",
@@ -393,12 +397,10 @@ mod tests {
             "hickory_proto=error",
             "hickory_proto=off",
             "hickory_proto=1",
-            "hickory_proto::dnssec::dnssec_dns_handle=error",
             " info , hickory_proto::dnssec=warn ",
-            // the specific directive beats a verbose global default
+            // the more specific directive beats a verbose less specific one
+            "hickory_proto=debug,hickory_proto::dnssec=error",
             "debug,hickory_proto=info",
-            "trace,hickory_proto=warn",
-            "debug,hickory_proto::dnssec=error",
             // non-verbose globals
             "info",
             "warn",
@@ -434,18 +436,29 @@ mod tests {
         assert!(!is_noisy_target("algo_network::srv_resolver"));
     }
 
-    #[test]
-    fn empty_or_unset_rust_log_gets_info_and_the_policy() {
-        for raw in [None, Some(""), Some("   ")] {
-            let s = LogSetup::resolve(raw);
-            assert_eq!(s.filter_spec, "info");
-            assert!(s.rate_limit);
-            assert!(s.warning.is_none());
-        }
+    /// Whether one event (error or info level) passes `filter`.
+    fn passes(filter: EnvFilter, level_error: bool) -> bool {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let sub = tracing_subscriber::registry().with(Count(seen.clone()).with_filter(filter));
+        tracing::subscriber::with_default(sub, || {
+            if level_error {
+                tracing::error!(target: "x", "e");
+            } else {
+                tracing::info!(target: "x", "i");
+            }
+        });
+        seen.load(Ordering::SeqCst) == 1
     }
 
     #[test]
-    fn explicit_filter_is_kept_and_verbose_override_disables_limit() {
+    fn unset_rust_log_gets_info_and_the_policy() {
+        let s = LogSetup::resolve(None);
+        assert_eq!(s.filter_spec, "info");
+        assert!(s.rate_limit);
+    }
+
+    #[test]
+    fn explicit_filter_is_kept_and_override_disables_limit() {
         let s = LogSetup::resolve(Some("warn"));
         assert_eq!(s.filter_spec, "warn");
         assert!(s.rate_limit);
@@ -453,18 +466,46 @@ mod tests {
         assert_eq!(s.filter_spec, "info,hickory_proto=trace");
         assert!(!s.rate_limit);
         let s = LogSetup::resolve(Some("debug"));
-        assert!(!s.rate_limit, "global debug disables the limiter");
-        let s = LogSetup::resolve(Some("debug,hickory_proto=info"));
-        assert!(s.rate_limit, "a specific info directive keeps the limiter");
+        assert!(s.rate_limit, "global debug keeps the limiter");
+        let s = LogSetup::resolve(Some("hickory=debug"));
+        assert!(!s.rate_limit);
     }
 
+    /// Blank and invalid `RUST_LOG` behave exactly as the previous
+    /// initializer (`EnvFilter::try_from_default_env()`, falling back to
+    /// `info`), checked against that very call.
     #[test]
-    fn invalid_rust_log_warns_and_falls_back_to_info_with_policy() {
+    fn blank_and_invalid_rust_log_behave_as_before() {
+        fn old_filter() -> EnvFilter {
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+        }
+        // Only this test touches RUST_LOG.
+        let saved = std::env::var("RUST_LOG").ok();
+        for raw in ["", "   ", "info,foo[bar=trace", "==="] {
+            std::env::set_var("RUST_LOG", raw);
+            let setup = LogSetup::resolve(Some(raw));
+            let new =
+                EnvFilter::try_new(&setup.filter_spec).unwrap_or_else(|_| EnvFilter::new("info"));
+            let old = old_filter();
+            for level_error in [false, true] {
+                let o = passes(old_filter(), level_error);
+                let n = passes(
+                    EnvFilter::try_new(&setup.filter_spec)
+                        .unwrap_or_else(|_| EnvFilter::new("info")),
+                    level_error,
+                );
+                assert_eq!(n, o, "RUST_LOG={raw:?} error={level_error}");
+            }
+            assert_eq!(new.to_string(), old.to_string(), "RUST_LOG={raw:?}");
+        }
+        match saved {
+            Some(v) => std::env::set_var("RUST_LOG", v),
+            None => std::env::remove_var("RUST_LOG"),
+        }
+        // Invalid falls back silently to info with the policy applied.
         let s = LogSetup::resolve(Some("info,foo[bar=trace"));
         assert_eq!(s.filter_spec, "info");
         assert!(s.rate_limit);
-        let w = s.warning.expect("a warning naming the bad value");
-        assert!(w.contains("info,foo[bar=trace"), "{w}");
     }
 
     // The limiter is driven by explicit instants (a fake clock): no real
@@ -490,27 +531,22 @@ mod tests {
         for i in 0..15 {
             l.admit(t0 + Duration::from_millis(i));
         }
-        // Still inside the window: nothing to report yet.
         assert_eq!(l.flush(t0 + w - Duration::from_secs(1)), None);
-        // Window over and no further events: the drops are reported once.
         assert_eq!(l.flush(t0 + w + Duration::from_secs(1)), Some(10));
         assert_eq!(l.flush(t0 + w + Duration::from_secs(2)), None);
-        // Nothing dropped, nothing to report.
         let quiet = RateLimiter::new(5, w);
         quiet.admit(t0);
         assert_eq!(quiet.flush(t0 + w + Duration::from_secs(1)), None);
     }
 
-    /// Under a continuous flood the window boundary does not depend on
-    /// events: each window's drops are reported on their own, right after
-    /// that window ends, not merged into a later one.
+    /// Under a continuous flood each window's drops are reported on their
+    /// own, right after that window ends.
     #[test]
     fn continuous_flood_reports_each_window_separately_and_promptly() {
         let t0 = Instant::now();
         let w = Duration::from_secs(60);
         let l = RateLimiter::new(5, w);
         let mut reports = Vec::new();
-        // One event per second for 130 s; the ticker flushes every second.
         for sec in 0..130u64 {
             let now = t0 + Duration::from_secs(sec);
             l.admit(now);
@@ -518,8 +554,6 @@ mod tests {
                 reports.push((sec, n));
             }
         }
-        // Window 1 is [0, 60): 60 events, 5 passed, 55 dropped, reported at
-        // the boundary (second 60). Window 2 is [60, 120): same, at 120.
         assert_eq!(reports, vec![(60, 55), (120, 55)]);
     }
 
@@ -530,19 +564,18 @@ mod tests {
         let l = RateLimiter::new(1, w);
         l.admit(t0);
         l.admit(t0); // dropped
-        assert!(l.admit(t0 + w + Duration::from_secs(1))); // new window, no flush ran
+        assert!(l.admit(t0 + w + Duration::from_secs(1)));
         assert_eq!(l.flush(t0 + w * 3), Some(1));
     }
 
-    /// Real-thread smoke test: asserts only that a summary is eventually
-    /// emitted and that the thread exits once the limiter is dropped. Exact
-    /// counts and timing are covered by the fake-clock tests above.
+    /// Real-thread smoke test: only that a summary is eventually emitted
+    /// (no exact counts or timings; those are covered with the fake clock).
     #[test]
-    fn ticker_smoke_emits_a_summary_and_exits_on_drop() {
+    fn ticker_smoke_eventually_emits_a_summary() {
         let l = Arc::new(RateLimiter::new(2, Duration::from_millis(50)));
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
-        let handle = spawn_summary_ticker(&l, Duration::from_millis(10), move |n| {
+        spawn_summary_ticker(&l, Duration::from_millis(10), move |n| {
             sink.lock().unwrap().push(n)
         })
         .expect("spawn ticker");
@@ -554,22 +587,43 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!seen.lock().unwrap().is_empty(), "a summary was emitted");
-        drop(l);
-        handle
-            .join()
-            .expect("ticker exits once the limiter is gone");
+    }
+
+    /// The summary is an error-volume notice: it must survive a filter that
+    /// only lets ERROR through (`RUST_LOG=error`, `hickory_proto=error`).
+    #[test]
+    fn summary_passes_an_error_only_filter() {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let sub = tracing_subscriber::registry()
+            .with(Count(seen.clone()).with_filter(EnvFilter::new("error")));
+        tracing::subscriber::with_default(sub, || emit_summary(42));
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
+
+    /// If the summary thread cannot start, the limiter is not installed at
+    /// all (otherwise events would be dropped with no summary ever).
+    #[test]
+    fn spawn_failure_means_no_limiter() {
+        let fail = |_: &Arc<RateLimiter>| Err(std::io::Error::other("no threads"));
+        assert!(build_limiter(true, fail).is_none());
+        let ok = |_: &Arc<RateLimiter>| Ok(());
+        assert!(build_limiter(true, ok).is_some());
+        let never = |_: &Arc<RateLimiter>| -> std::io::Result<()> {
+            panic!("must not spawn when the limiter is off")
+        };
+        assert!(build_limiter(false, never).is_none());
     }
 
     /// Counts events reaching it.
-    struct Count(Arc<std::sync::atomic::AtomicUsize>);
+    struct Count(Arc<AtomicUsize>);
     impl<S: Subscriber> Layer<S> for Count {
         fn on_event(&self, _: &Event<'_>, _: Context<'_, S>) {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
 
     fn count_events(limiter: Option<Arc<RateLimiter>>) -> usize {
-        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::new(AtomicUsize::new(0));
         let sub = tracing_subscriber::registry().with(
             Count(seen.clone())
                 .with_filter(EnvFilter::new("info").and(NoisyTargetLimiter { limiter })),
@@ -585,16 +639,12 @@ mod tests {
                 tracing::error!(target: "algo_network::srv_resolver", "other");
             }
         });
-        seen.load(std::sync::atomic::Ordering::SeqCst)
+        seen.load(Ordering::SeqCst)
     }
 
-    /// The filter, composed as `init` composes it, really drops the noisy
-    /// target after the burst while leaving other targets untouched; with no
-    /// limiter (override, or no summary thread) everything passes.
     #[test]
     fn composed_filter_limits_only_the_noisy_target() {
         let limiter = Some(Arc::new(RateLimiter::new(2, Duration::from_secs(3600))));
-        // 2 from the burst (both hickory paths share the budget) + 3 others.
         assert_eq!(count_events(limiter), 2 + 3);
         assert_eq!(count_events(None), 10 + 4 + 3);
     }
