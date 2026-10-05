@@ -263,6 +263,50 @@ fn apply_resolver_opts(opts: &mut ResolverOpts, validate: bool) {
 }
 
 // ---------------------------------------------------------------------------
+// System-stage circuit breaker (issue #1676)
+// ---------------------------------------------------------------------------
+
+/// Remembers that the system-resolver stage timed out, so later lookups on
+/// the same [`HickorySrvResolver`] skip it (issue #1676).
+///
+/// Mainnet soak logs showed 232k `exceeded max validation depth` ERROR lines
+/// inside a 60 s startup window: `Discovery::refresh_phonebook_addresses`
+/// performs four SRV lookups (primary/backup x relay/archive), and on a
+/// runner whose stub system resolver cannot serve the DNSSEC chain each of
+/// them spun inside hickory's validating walk for the entire
+/// [`DNSSEC_STAGE_TIMEOUT`] (about 58k log lines and 15 s each) before falling
+/// through to the default resolver, which answered immediately. The system
+/// resolver's inability to serve DNSSEC data is a property of the host, not
+/// of the queried name, so after one timeout the remaining lookups go
+/// straight to the fallback/default stages (go keeps the same stage order;
+/// it simply has no hot-spinning validator to short-circuit).
+#[derive(Debug, Default)]
+struct SystemStageBreaker {
+    tripped: std::sync::atomic::AtomicBool,
+}
+
+impl SystemStageBreaker {
+    /// True when the system stage should be skipped.
+    fn should_skip(&self) -> bool {
+        self.tripped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record a failed system-stage attempt; only a timeout trips the breaker.
+    fn record(&self, err: &SrvResolveError) {
+        if matches!(err, SrvResolveError::Timeout(_)) {
+            self.tripped
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Record a successful system-stage attempt (re-arms the stage).
+    fn record_success(&self) {
+        self.tripped
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HickorySrvResolver
 // ---------------------------------------------------------------------------
 
@@ -288,6 +332,9 @@ pub struct HickorySrvResolver {
     /// `dnssec.MakeDnssecResolver(...)`-backed one. Issue #1314: this used
     /// to be hardcoded `true` unconditionally with no way to disable it.
     validate_dnssec: bool,
+
+    /// Skips the system stage after it has timed out once (issue #1676).
+    system_breaker: SystemStageBreaker,
 }
 
 impl HickorySrvResolver {
@@ -301,6 +348,7 @@ impl HickorySrvResolver {
         Self {
             fallback_dns,
             validate_dnssec: true,
+            system_breaker: SystemStageBreaker::default(),
         }
     }
 
@@ -313,6 +361,7 @@ impl HickorySrvResolver {
         Self {
             fallback_dns,
             validate_dnssec,
+            system_breaker: SystemStageBreaker::default(),
         }
     }
 
@@ -593,18 +642,29 @@ impl SrvResolver for HickorySrvResolver {
             // 2. Construct the SRV query name: _<service>._<protocol>.<name>
             let srv_name = format!("_{service}._{protocol}.{name}");
 
-            // 3. Try system resolver first.
-            let sys_err: String = match Self::system_resolver(self.validate_dnssec) {
-                Ok(resolver) => match Self::do_lookup_bounded(&resolver, &srv_name).await {
-                    Ok(records) => return Ok(records),
+            // 3. Try system resolver first (unless it already timed out once).
+            let sys_err: String = if self.system_breaker.should_skip() {
+                debug!(
+                    "skipping system resolver: it timed out earlier on this resolver (issue #1676)"
+                );
+                "skipped after earlier timeout".to_string()
+            } else {
+                match Self::system_resolver(self.validate_dnssec) {
+                    Ok(resolver) => match Self::do_lookup_bounded(&resolver, &srv_name).await {
+                        Ok(records) => {
+                            self.system_breaker.record_success();
+                            return Ok(records);
+                        }
+                        Err(e) => {
+                            self.system_breaker.record(&e);
+                            info!("DNS SRV lookup failed with system resolver: {e}");
+                            e.to_string()
+                        }
+                    },
                     Err(e) => {
-                        info!("DNS SRV lookup failed with system resolver: {e}");
+                        info!("failed to create system resolver: {e}");
                         e.to_string()
                     }
-                },
-                Err(e) => {
-                    info!("failed to create system resolver: {e}");
-                    e.to_string()
                 }
             };
 
@@ -716,6 +776,35 @@ pub async fn resolve_addresses(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // System-stage circuit breaker (issue #1676)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn system_stage_breaker_trips_only_on_timeout() {
+        let b = SystemStageBreaker::default();
+        assert!(!b.should_skip(), "fresh breaker must try the system stage");
+
+        // An ordinary resolution failure (e.g. NXDOMAIN) says nothing about
+        // whether the system resolver can serve DNSSEC data.
+        b.record(&SrvResolveError::EmptyName);
+        assert!(!b.should_skip());
+
+        // A timeout means the validating walk spun until the stage budget
+        // expired: later lookups must not pay that cost again.
+        b.record(&SrvResolveError::Timeout(Duration::from_secs(15)));
+        assert!(b.should_skip());
+    }
+
+    #[test]
+    fn system_stage_breaker_success_resets() {
+        let b = SystemStageBreaker::default();
+        b.record(&SrvResolveError::Timeout(Duration::from_secs(15)));
+        assert!(b.should_skip());
+        b.record_success();
+        assert!(!b.should_skip());
+    }
 
     // -----------------------------------------------------------------------
     // Mock resolver for unit tests
