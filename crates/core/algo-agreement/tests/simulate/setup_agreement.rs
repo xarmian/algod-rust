@@ -151,6 +151,7 @@ impl<BV: algo_agreement::BlockValidator + Send + Sync + 'static> AgreementCluste
                             + v.verified(PROPOSAL_PAYLOAD_TAG).len()
                             + v.verified(VOTE_BUNDLE_TAG).len()
                             + v.pending_proposal_validations()
+                            + v.in_flight_verifications()
                             + (v.channel_full(AGREEMENT_VOTE_TAG)
                                 || v.channel_full(PROPOSAL_PAYLOAD_TAG)
                                 || v.channel_full(VOTE_BUNDLE_TAG))

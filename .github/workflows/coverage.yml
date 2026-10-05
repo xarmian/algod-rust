@@ -53,6 +53,9 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
         with:
@@ -62,9 +65,23 @@ jobs:
       # Instrumented release build: source-based LLVM coverage keeps accurate
       # region counters under optimization, and release runtime keeps the
       # heavier integration/proptest suites inside the job budget.
+      #
+      # Runs under cargo-nextest (`cargo llvm-cov nextest`) with `--retries 2`
+      # and `--no-fail-fast`: the real-thread multi-node agreement suites
+      # (`crates/core/algo-agreement/tests/service_multi_node_test.rs`) and
+      # a few timing-based sync tests are inherently sensitive to CPU
+      # contention on a shared 4-core runner (a different test of that
+      # suite flaked intermittently; issue #1693), so a test that
+      # fails once is retried and only fails the job if it
+      # fails every attempt. nextest lists such tests as FLAKY in the log,
+      # so they stay visible. `--no-fail-fast` makes one log show every
+      # failing test instead of stopping at the first failing binary.
+      # nextest does not run doctests, matching the previous
+      # `cargo test --tests` scope.
       - name: Run workspace tests with coverage
         run: >-
-          cargo llvm-cov --workspace --release --no-fail-fast
+          cargo llvm-cov nextest --workspace --release
+          --no-fail-fast --retries 2
           --ignore-filename-regex '(^|[/\\])(tests|benches)[/\\]'
           --lcov --output-path lcov.info
 

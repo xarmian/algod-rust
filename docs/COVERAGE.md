@@ -47,9 +47,13 @@ checkout fails `block_json_test` regardless of coverage tooling.
 
 `.github/workflows/coverage.yml` runs on every PR and push to `main`:
 
-1. `cargo llvm-cov --workspace --release` produces `lcov.info` (test/bench
-   source files are excluded from the report — they are scaffolding, not
-   shipped code).
+1. `cargo llvm-cov nextest --workspace --release --no-fail-fast --retries 2`
+   produces `lcov.info` (test/bench source files are excluded from the
+   report — they are scaffolding, not shipped code). Tests run under
+   cargo-nextest so a timing-sensitive test (the real-thread multi-node
+   agreement suites on a CPU-contended runner) is retried before it fails
+   the job; retried-then-passing tests are reported as FLAKY in the log.
+   Doctests are not part of this run.
 2. The LCOV file and a browsable HTML report are attached as workflow
    artifacts (14-day retention), so coverage is inspectable even without
    Codecov.

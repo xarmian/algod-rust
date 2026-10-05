@@ -389,6 +389,10 @@ pub struct AsyncCryptoVerifier<
     /// `pending_proposal_validations`'s doc comment.
     pending_proposal_validations: Arc<AtomicUsize>,
 
+    /// Count of vote and bundle requests a worker has dequeued but not yet
+    /// handed to its output channel. See `in_flight_verifications`.
+    in_flight_verifications: Arc<AtomicUsize>,
+
     /// Marker for the validator type parameter.
     _validator: std::marker::PhantomData<BV>,
 }
@@ -396,6 +400,26 @@ pub struct AsyncCryptoVerifier<
 // ---------------------------------------------------------------------------
 // Worker functions
 // ---------------------------------------------------------------------------
+
+/// RAII marker for "a vote/bundle request has been dequeued but its result
+/// has not yet been handed to the output channel". Dropped at the end of a
+/// worker-loop iteration (after the result send, on `continue`, or on
+/// `break`), so the count can never leak. See
+/// `AsyncCryptoVerifier::in_flight_verifications`.
+struct InFlightGuard(Arc<AtomicUsize>);
+
+impl InFlightGuard {
+    fn new(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(counter))
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// Vote worker loop: receives votes, verifies them, sends results.
 ///
@@ -408,6 +432,7 @@ fn vote_worker<L: LedgerReader + Send + Sync + 'static>(
     tx: crossbeam_channel::Sender<CryptoVoteVerifyResult>,
     quit_rx: crossbeam_channel::Receiver<()>,
     ledger: Arc<L>,
+    in_flight: Arc<AtomicUsize>,
 ) {
     loop {
         // Wait for either a new request or a quit signal.
@@ -419,6 +444,7 @@ fn vote_worker<L: LedgerReader + Send + Sync + 'static>(
             recv(quit_rx) -> _ => break,
         };
 
+        let _in_flight = InFlightGuard::new(&in_flight);
         let request = &internal.request;
 
         // Check cancellation before doing expensive work.
@@ -562,6 +588,7 @@ fn bundle_worker<L: LedgerReader + Send + Sync + 'static>(
     tx: crossbeam_channel::Sender<CryptoResult>,
     quit_rx: crossbeam_channel::Receiver<()>,
     ledger: Arc<L>,
+    in_flight: Arc<AtomicUsize>,
 ) {
     loop {
         let internal = crossbeam_channel::select! {
@@ -572,6 +599,7 @@ fn bundle_worker<L: LedgerReader + Send + Sync + 'static>(
             recv(quit_rx) -> _ => break,
         };
 
+        let _in_flight = InFlightGuard::new(&in_flight);
         let request = &internal.request;
 
         // Check cancellation before doing expensive work.
@@ -1064,16 +1092,18 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
         let mut handles =
             Vec::with_capacity(VOTE_PARALLELISM + PROPOSAL_PARALLELISM + BUNDLE_PARALLELISM);
         let pending_proposal_validations = Arc::new(AtomicUsize::new(0));
+        let in_flight_verifications = Arc::new(AtomicUsize::new(0));
 
         for i in 0..VOTE_PARALLELISM {
             let rx = vote_in_rx.clone();
             let tx = vote_out_tx.clone();
             let qrx = quit_signal_rx.clone();
             let l = ledger.clone();
+            let inf = Arc::clone(&in_flight_verifications);
             handles.push(
                 thread::Builder::new()
                     .name(format!("vote-worker-{i}"))
-                    .spawn(move || vote_worker(rx, tx, qrx, l))
+                    .spawn(move || vote_worker(rx, tx, qrx, l, inf))
                     .expect("failed to spawn vote worker thread"),
             );
         }
@@ -1097,10 +1127,11 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
             let tx = bundle_out_tx.clone();
             let qrx = quit_signal_rx.clone();
             let l = ledger.clone();
+            let inf = Arc::clone(&in_flight_verifications);
             handles.push(
                 thread::Builder::new()
                     .name(format!("bundle-worker-{i}"))
-                    .spawn(move || bundle_worker(rx, tx, qrx, l))
+                    .spawn(move || bundle_worker(rx, tx, qrx, l, inf))
                     .expect("failed to spawn bundle worker thread"),
             );
         }
@@ -1124,6 +1155,7 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
             worker_handles: Mutex::new(Some(handles)),
             cancellation: Mutex::new(PendingRequestsContext::new()),
             pending_proposal_validations,
+            in_flight_verifications,
             _validator: std::marker::PhantomData,
         }
     }
@@ -1145,6 +1177,20 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
     /// transient value.
     pub fn pending_proposal_validations(&self) -> usize {
         self.pending_proposal_validations.load(Ordering::SeqCst)
+    }
+
+    /// Number of vote and bundle requests a worker thread has dequeued but
+    /// not yet delivered to the output channel (i.e. currently being
+    /// verified, or blocked handing the result over).
+    ///
+    /// A request in this state is visible neither in the input channel's
+    /// length (already dequeued) nor in the output channel's length (not
+    /// yet sent), so a quiescence detector that only samples channel
+    /// lengths can wrongly conclude the cluster is idle while a starved
+    /// worker is still mid-verification — the late result then lands after
+    /// the caller has already asserted on state.
+    pub fn in_flight_verifications(&self) -> usize {
+        self.in_flight_verifications.load(Ordering::SeqCst)
     }
 }
 
