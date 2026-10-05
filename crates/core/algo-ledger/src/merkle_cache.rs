@@ -899,7 +899,7 @@ impl MerkleTrieCache {
         // since the last commit). Mirrors cache.go:430-433.
         let nodes_per_page = self.nodes_per_page;
         let mut new_page_threshold = self.last_committed_node_id / nodes_per_page;
-        if self.last_committed_node_id % nodes_per_page > 0 {
+        if !self.last_committed_node_id.is_multiple_of(nodes_per_page) {
             new_page_threshold += 1;
         }
 

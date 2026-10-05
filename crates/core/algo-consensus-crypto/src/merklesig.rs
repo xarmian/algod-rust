@@ -992,7 +992,7 @@ impl Secrets {
         }
         let local_idx = idx - self.first_key_offset;
         if local_idx >= self.ephemeral_keys.len() as u64
-            || (key_round % self.signer_context.key_lifetime) != 0
+            || !key_round.is_multiple_of(self.signer_context.key_lifetime)
             || key_round < self.signer_context.first_valid
         {
             return None;

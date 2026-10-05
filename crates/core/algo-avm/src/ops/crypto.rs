@@ -1653,7 +1653,7 @@ mod tests {
     fn hash_opcode_cost(version: u8, opcode: u8, size: usize) -> u64 {
         let mut code = vec![0x80]; // pushbytes
         code.extend_from_slice(&varuint(size as u64));
-        code.extend(std::iter::repeat(0u8).take(size));
+        code.extend(std::iter::repeat_n(0u8, size));
         code.push(opcode);
         let raw = prog(version, &code);
         let program = parse(&raw).unwrap();

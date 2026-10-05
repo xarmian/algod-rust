@@ -2458,7 +2458,7 @@ fn oversized_create_txn(
     padding_len: u8,
 ) -> SignedTransaction {
     let mut approval = vec![0x06, 0x80, padding_len]; // version 6; pushbytes <len>
-    approval.extend(std::iter::repeat(0u8).take(padding_len as usize));
+    approval.extend(std::iter::repeat_n(0u8, padding_len as usize));
     approval.push(0x48); // pop
     approval.push(0x81); // pushint
     approval.push(0x01); // ...1 (approve)

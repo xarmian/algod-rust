@@ -1080,7 +1080,7 @@ fn apply_stack_effect(
         // fresh literal is only ever tracked via the `literal_push_type`
         // path in `track_instruction`, not through a `trackStack` return.
         ops.type_stack_const
-            .extend(std::iter::repeat(None).take(return_types.len()));
+            .extend(std::iter::repeat_n(None, return_types.len()));
     }
 }
 

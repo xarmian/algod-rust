@@ -380,7 +380,7 @@ fn is_rmpv_empty(v: &rmpv::Value) -> bool {
         rmpv::Value::Map(m) => m.is_empty(),
         rmpv::Value::Array(a) => a.is_empty(),
         rmpv::Value::Binary(b) => b.is_empty(),
-        rmpv::Value::String(s) => s.as_str().map_or(true, |s| s.is_empty()),
+        rmpv::Value::String(s) => s.as_str().is_none_or(|s| s.is_empty()),
         _ => false,
     }
 }

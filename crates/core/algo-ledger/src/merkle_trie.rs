@@ -1710,7 +1710,7 @@ mod tests {
             let chunk_size = 3u64;
             for (i, e) in elements.iter().enumerate() {
                 trie.add(e).unwrap();
-                if (i as u64 + 1) % chunk_size == 0 {
+                if (i as u64 + 1).is_multiple_of(chunk_size) {
                     trie.commit(&committer).unwrap();
                     trie.evict().unwrap();
                 }
@@ -1801,7 +1801,7 @@ mod tests {
         let chunk_size: u64 = 6_000;
         for (i, e) in elements.iter().enumerate() {
             trie.add(e).unwrap();
-            if (i as u64 + 1) % chunk_size == 0 {
+            if (i as u64 + 1).is_multiple_of(chunk_size) {
                 trie.commit(&committer).unwrap();
                 trie.evict().unwrap();
             }
@@ -2203,14 +2203,14 @@ mod tests {
             for i in 10..hashes.len() - 10 {
                 let k_bound = (hashes[i - 2][0] % 5) as usize;
                 for k in 0..k_bound {
-                    if hashes[i + k][0] % 7 == 0 {
+                    if hashes[i + k][0].is_multiple_of(7) {
                         let del_idx = i + k - (hashes[i][0] % 7) as usize;
                         trie.delete(&hashes[del_idx]).unwrap();
                     }
                     let add_idx = i + k + 3 - (hashes[i + k - 1][0] % 7) as usize;
                     trie.add(&hashes[add_idx]).unwrap();
                 }
-                if hashes[i][0] % 5 == 0 {
+                if hashes[i][0].is_multiple_of(5) {
                     trie.cache.debug_verify_invariants();
                     trie.commit(&committer).unwrap();
                     trie.evict().unwrap();

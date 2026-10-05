@@ -320,7 +320,7 @@ pub fn record_state_proof_verification_context<L: LedgerStore>(
     state_proof_tracking: &Option<rmpv::Value>,
     state_proof_interval: u64,
 ) -> Result<(), AlgoError> {
-    if state_proof_interval == 0 || round % state_proof_interval != 0 {
+    if state_proof_interval == 0 || !round.is_multiple_of(state_proof_interval) {
         return Ok(());
     }
     let last_attested_round = round + state_proof_interval;

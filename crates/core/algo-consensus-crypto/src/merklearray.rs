@@ -411,7 +411,7 @@ pub fn proof_data_to_single_leaf_proof(
     let hash_factory = HashFactory::new(hash_type);
     let digest_size = hash_factory.digest_size();
 
-    if proof_bytes.len() % digest_size != 0 {
+    if !proof_bytes.len().is_multiple_of(digest_size) {
         return Err(MerkleError::ProofLengthDigestSizeMismatch);
     }
 

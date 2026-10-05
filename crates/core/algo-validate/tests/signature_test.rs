@@ -455,7 +455,7 @@ fn logicsig_size_pooling_allows_large_lsig_in_group() {
             break;
         }
     }
-    program.extend(std::iter::repeat(0u8).take(blob_len));
+    program.extend(std::iter::repeat_n(0u8, blob_len));
     program.push(0x48); // pop
     program.push(0x81); // pushint
     program.push(0x01); // 1
@@ -567,7 +567,7 @@ fn valid_program_of_size(total_len: usize) -> Vec<u8> {
     program.push(0x01); // num constants = 1
     program.push(((blob_len & 0x7f) | 0x80) as u8);
     program.push((blob_len >> 7) as u8);
-    program.extend(std::iter::repeat(0u8).take(blob_len));
+    program.extend(std::iter::repeat_n(0u8, blob_len));
     program.push(0x28); // bytec_0
     program.push(0x48); // pop
     program.push(0x20); // intcblock

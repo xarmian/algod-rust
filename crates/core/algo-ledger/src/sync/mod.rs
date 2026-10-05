@@ -2105,7 +2105,7 @@ impl SyncOrchestrator {
                 self.final_round = round;
 
                 // Progress logging.
-                if blocks_applied % progress_interval == 0 || round == target_round {
+                if blocks_applied.is_multiple_of(progress_interval) || round == target_round {
                     let elapsed = timer.elapsed().as_secs_f64();
                     let rate = if elapsed > 0.0 {
                         blocks_applied as f64 / elapsed

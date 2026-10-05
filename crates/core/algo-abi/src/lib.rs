@@ -209,7 +209,7 @@ fn type_of_inner(s: &str, depth: usize) -> Result<AbiType, String> {
         let bits: u16 = rest
             .parse()
             .map_err(|_| format!("ill formed uint type: \"{s}\""))?;
-        if !(8..=512).contains(&bits) || bits % 8 != 0 {
+        if !(8..=512).contains(&bits) || !bits.is_multiple_of(8) {
             return Err(format!("unsupported uint type bitSize: {bits}"));
         }
         return Ok(AbiType::Uint(bits));
@@ -309,7 +309,7 @@ fn parse_ufixed(rest: &str, original: &str) -> Result<AbiType, String> {
         .parse()
         .map_err(|_| format!("ill formed ufixed type: \"{original}\""))?;
 
-    if !(8..=512).contains(&bits) || bits % 8 != 0 {
+    if !(8..=512).contains(&bits) || !bits.is_multiple_of(8) {
         return Err(format!("unsupported ufixed type bitSize: {bits}"));
     }
     if !(1..=160).contains(&precision) {
@@ -705,7 +705,7 @@ fn encode_tuple_with_types(
             // Count consecutive bools from position i looking forward
             let mut after = find_bool_lr(child_types, i, 1);
 
-            if before % 8 != 0 {
+            if !before.is_multiple_of(8) {
                 return Err(
                     "cannot encode abi tuple: expected before has number of bool mod 8 == 0".into(),
                 );
@@ -932,7 +932,7 @@ fn decode_tuple_types(children: &[AbiType], data: &[u8]) -> Result<Vec<AbiValue>
     while i < n {
         if children[i] == AbiType::Bool {
             let before = find_bool_lr(children, i, -1);
-            if before % 8 != 0 {
+            if !before.is_multiple_of(8) {
                 return Err(
                     "cannot decode abi tuple: expected before has number of bool mod 8 == 0".into(),
                 );

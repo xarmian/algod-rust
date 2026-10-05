@@ -344,7 +344,7 @@ async fn test_sustained_throughput() {
                 // Use a moderate payload size (1KB-4KB) for sustained throughput.
                 // Only use tags with large max_message_size to avoid encode errors.
                 let payload_size = 1024 + (msg_idx % 4) * 1024;
-                let tag = if msg_idx % 3 == 0 {
+                let tag = if msg_idx.is_multiple_of(3) {
                     Tag::ProposalPayload // ~5MB max
                 } else {
                     Tag::Transaction // 5MB max
@@ -379,7 +379,7 @@ async fn test_sustained_throughput() {
 
                 // Small yield to avoid starving the runtime.  Send in
                 // micro-batches of 50 messages.
-                if msg_idx % 50 == 0 {
+                if msg_idx.is_multiple_of(50) {
                     tokio::task::yield_now().await;
                 }
             }

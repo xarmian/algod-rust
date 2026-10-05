@@ -561,7 +561,7 @@ mod tests {
                 }
             }
             msg_index += 1;
-            if msg_index % msg_per_second == 0 {
+            if msg_index.is_multiple_of(msg_per_second) {
                 timer += 3_000_000_000;
             }
             timer += msg_interval + 123;

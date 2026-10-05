@@ -806,7 +806,7 @@ fn decompress_vote_inner(src: &[u8]) -> Result<Vec<u8>, VpackError> {
     dst.extend_from_slice(FIXSTR_PS);
     dst.push(MSGP_BIN8);
     dst.push(64);
-    dst.extend(std::iter::repeat(0u8).take(64));
+    dst.extend(std::iter::repeat_n(0u8, 64));
 
     dst.extend_from_slice(FIXSTR_S);
     dst.push(MSGP_BIN8);
@@ -1378,9 +1378,7 @@ impl StatefulDecoder {
         let mut r = StatefulReader { src, pos: 0 };
 
         if src.len() < 2 {
-            return Err(VpackError::Decompress(
-                "input shorter than header".into(),
-            ));
+            return Err(VpackError::Decompress("input shorter than header".into()));
         }
         let hdr0 = src[0];
         let hdr1 = src[1];
@@ -2413,7 +2411,11 @@ mod tests {
                 let pb = make_test_prop_bundle(i as u8);
                 w.insert_new(pb);
                 assert_eq!(w.size, i + 1);
-                assert_eq!(w.lookup(&pb), 1, "newly inserted entry must be HPACK index 1");
+                assert_eq!(
+                    w.lookup(&pb),
+                    1,
+                    "newly inserted entry must be HPACK index 1"
+                );
             }
 
             for idx in 1..=PROPOSAL_WINDOW_SIZE {
@@ -2430,7 +2432,10 @@ mod tests {
             assert_eq!(w.lookup(&new_entry), 1);
 
             assert_eq!(w.by_ref(1).unwrap(), new_entry);
-            assert_eq!(w.by_ref(PROPOSAL_WINDOW_SIZE).unwrap(), make_test_prop_bundle(1));
+            assert_eq!(
+                w.by_ref(PROPOSAL_WINDOW_SIZE).unwrap(),
+                make_test_prop_bundle(1)
+            );
         }
 
         // ── header-bit sync + reference-id size (mirrors
@@ -2466,7 +2471,7 @@ mod tests {
             v.p2s = seq(64, 0x50u8.wrapping_add(i as u8));
             v.s = seq(64, 0x60u8.wrapping_add(i as u8));
             v.rnd = 1000 + i as u64;
-            if i % 3 == 0 {
+            if i.is_multiple_of(3) {
                 v.dig = Some(seq(32, 0x70));
             } else if i % 3 == 1 {
                 v.dig = Some(seq(32, 0x71));
@@ -2474,7 +2479,7 @@ mod tests {
                 v.dig = None;
                 v.encdig = Some(seq(32, 0x72));
             }
-            if i % 2 == 0 {
+            if i.is_multiple_of(2) {
                 v.step = Some(i as u64);
             }
             v
@@ -2625,10 +2630,7 @@ mod tests {
                 let mut dec = StatefulDecoder::new(1024).unwrap();
                 let err = dec.decompress(&buf).unwrap_err();
                 let msg = err.to_string();
-                assert!(
-                    msg.contains(want),
-                    "case {want:?}: got error {msg:?}"
-                );
+                assert!(msg.contains(want), "case {want:?}: got error {msg:?}");
             }
         }
 
@@ -2652,9 +2654,7 @@ mod tests {
             assert!(!compressed.is_empty());
 
             let cases: Vec<(&str, Vec<u8>)> = vec![
-                ("truncated pf", {
-                    vec![0x00, 0x00]
-                }),
+                ("truncated pf", { vec![0x00, 0x00] }),
                 ("truncated r.per marker", {
                     let mut b = vec![BIT_PER, 0x00];
                     b.extend(zeros(PF_SIZE));
@@ -2803,11 +2803,7 @@ mod tests {
             /// pair (persistent across the sequence, matching how a real
             /// connection would use them), and checks vote `pin_at[i]`'s
             /// stateful-compressed bytes against `expected_hex[i]`.
-            fn check_sequence(
-                table_size: u32,
-                votes: &[VoteSpec],
-                pins: &[(usize, &str)],
-            ) {
+            fn check_sequence(table_size: u32, votes: &[VoteSpec], pins: &[(usize, &str)]) {
                 let mut enc = StatefulEncoder::new(table_size).unwrap();
                 let mut dec = StatefulDecoder::new(table_size).unwrap();
 

@@ -2623,7 +2623,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
                     || self
                         .unnamed_capacity
                         .as_ref()
-                        .map_or(true, |cap| cap.borrow().local_txn.is_empty())
+                        .is_none_or(|cap| cap.borrow().local_txn.is_empty())
             }
             UnnamedResourceAccess::AssetHolding(..)
             | UnnamedResourceAccess::AppLocal(..)
@@ -2667,7 +2667,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// via `groupResourceTracker.addAccount`, dispatched by this call's
     /// `global_sharing`/`txn_root_index` (issue #1128).
     fn capacity_allows_account(&self, account: [u8; 32]) -> bool {
-        self.unnamed_capacity.as_ref().map_or(true, |cap| {
+        self.unnamed_capacity.as_ref().is_none_or(|cap| {
             cap.borrow_mut()
                 .try_add_account_at(account, self.global_sharing, self.txn_root_index)
         })
@@ -2676,7 +2676,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// See [`Self::capacity_allows_account`]; mirrors go's `addAsset` via
     /// `groupResourceTracker.addAsset`.
     fn capacity_allows_asset(&self, asset_id: u64) -> bool {
-        self.unnamed_capacity.as_ref().map_or(true, |cap| {
+        self.unnamed_capacity.as_ref().is_none_or(|cap| {
             cap.borrow_mut()
                 .try_add_asset_at(asset_id, self.global_sharing, self.txn_root_index)
         })
@@ -2722,16 +2722,16 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
 
     /// See [`Self::capacity_allows_account`]; mirrors go's `addHolding`.
     fn capacity_allows_holding(&self, account: [u8; 32], asset_id: u64) -> bool {
-        self.unnamed_capacity.as_ref().map_or(true, |cap| {
-            cap.borrow_mut().try_add_holding((account, asset_id))
-        })
+        self.unnamed_capacity
+            .as_ref()
+            .is_none_or(|cap| cap.borrow_mut().try_add_holding((account, asset_id)))
     }
 
     /// See [`Self::capacity_allows_account`]; mirrors go's `addLocal`.
     fn capacity_allows_local(&self, account: [u8; 32], app_id: u64) -> bool {
-        self.unnamed_capacity.as_ref().map_or(true, |cap| {
-            cap.borrow_mut().try_add_local((account, app_id))
-        })
+        self.unnamed_capacity
+            .as_ref()
+            .is_none_or(|cap| cap.borrow_mut().try_add_local((account, app_id)))
     }
 
     // --- Opcode-failure enforcement (issue #1005) ---
@@ -3071,7 +3071,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
 
                     // Empty box ref (index=0, no name) bumps unnamed access
                     // and I/O budget but doesn't add availability.
-                    let is_empty = br.index == 0 && br.name.as_ref().map_or(true, |n| n.is_empty());
+                    let is_empty = br.index == 0 && br.name.as_ref().is_none_or(|n| n.is_empty());
                     if is_empty {
                         self.unnamed_access += 1;
                         continue;

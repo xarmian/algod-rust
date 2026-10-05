@@ -1,0 +1,73 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: MSRV
+
+# Issue #1672 (epic #1680): enforce the workspace's declared minimum supported
+# Rust version. The toolchain under test is read from `rust-version` in the
+# root Cargo.toml (single source of truth), so raising the MSRV there is
+# automatically what CI verifies; clippy.toml's `msrv` must agree with it.
+# `--locked` checks the committed Cargo.lock, whose dependency versions are
+# what set the floor (see "Minimum supported Rust version" in
+# docs/DEV_WORKFLOW.md).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: msrv-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  msrv-check:
+    name: cargo check on declared MSRV
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read declared MSRV and verify clippy.toml agrees
+        id: msrv
+        run: |
+          msrv=$(sed -n 's/^rust-version *= *"\([0-9][0-9.]*\)".*/\1/p' Cargo.toml | head -n1)
+          clippy_msrv=$(sed -n 's/^msrv *= *"\([0-9][0-9.]*\)".*/\1/p' clippy.toml | head -n1)
+          echo "Cargo.toml rust-version=${msrv} clippy.toml msrv=${clippy_msrv}"
+          if [ -z "$msrv" ] || [ "$msrv" != "$clippy_msrv" ]; then
+            echo "::error::Cargo.toml rust-version ('${msrv}') and clippy.toml msrv ('${clippy_msrv}') must match"
+            exit 1
+          fi
+          echo "version=${msrv}" >> "$GITHUB_OUTPUT"
+
+      - name: Install MSRV Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The repo's rust-toolchain.toml pins `stable`, which rustup would
+      # otherwise prefer over the default toolchain installed above; the
+      # explicit `+<version>` makes the MSRV toolchain win.
+      - name: cargo check (workspace, all targets, locked)
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: |
+          cargo "+${MSRV}" --version
+          cargo "+${MSRV}" check --workspace --all-targets --locked
