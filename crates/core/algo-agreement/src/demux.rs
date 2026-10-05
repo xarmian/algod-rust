@@ -698,9 +698,12 @@ impl Demux {
                 // a proposal whose `Group` field doesn't commit to its
                 // transactions would pass this early screen and only be
                 // caught later, in full block validation.
-                if let Err(e) =
-                    algo_validate::validate_transaction_group(&compound.proposal.block.payset)
-                {
+                // The payset strips genesis ID/hash; the group ID commits to
+                // the full transaction, so restore them from the block
+                // header first (issue #1686).
+                let restored =
+                    algo_validate::restore_payset_genesis_fields(&compound.proposal.block);
+                if let Err(e) = algo_validate::validate_transaction_group(&restored) {
                     warn!(
                         len = msg.data.len(),
                         prefix = %hex_prefix(&msg.data, 96),
@@ -1564,6 +1567,69 @@ mod tests {
         assert!(
             stub.disconnected.lock().unwrap().is_empty(),
             "a group-ID-mismatch proposal must be dropped, not disconnect the peer"
+        );
+    }
+
+    /// Issue #1686: a block payset strips each transaction's genesis ID
+    /// (`hgi` flag) and genesis hash (go `DecodeSignedTxn` restores them
+    /// from the block header), but the group ID commits to the *full*
+    /// transaction including those fields. The early group-ID screen must
+    /// therefore restore them before recomputing, or every valid mainnet
+    /// proposal containing a group is dropped.
+    #[test]
+    fn demux_raw_proposal_with_valid_group_over_stripped_genesis_fields_is_accepted() {
+        use algo_types::{SignedTransaction, Transaction, TxnType};
+
+        let (demux, ..) = make_test_demux();
+
+        let genesis_id = "mainnet-v1.0".to_string();
+        let genesis_hash = [7u8; 32];
+        let full = |n: u8| Transaction {
+            txn_type: TxnType::from("pay"),
+            sender: Address([n; 32]),
+            genesis_id: genesis_id.clone(),
+            genesis_hash,
+            ..Transaction::default()
+        };
+        let group = algo_validate::compute_group_id(&[full(1), full(2)]);
+        let stripped = |n: u8| {
+            let mut t = full(n);
+            t.genesis_id = String::new();
+            t.genesis_hash = [0u8; 32];
+            t.group = group.0;
+            SignedTransaction {
+                txn: t,
+                has_genesis_id: true,
+                ..SignedTransaction::default()
+            }
+        };
+        let compound = CompoundMessage {
+            vote: UnauthenticatedVote::default(),
+            proposal: crate::proposal::UnauthenticatedProposal {
+                block: algo_types::Block {
+                    round: Round(1),
+                    genesis_id: genesis_id.clone(),
+                    genesis_hash,
+                    payset: vec![stripped(1), stripped(2)],
+                    ..algo_types::Block::default()
+                },
+                seed_proof: [0u8; crate::VRF_PROOF_SIZE],
+                original_period: crate::step::Period(0),
+                original_proposer: Address([0u8; 32]),
+                ..crate::proposal::UnauthenticatedProposal::default()
+            },
+        };
+        let encoded = codec::encode_compound_message(&compound);
+        let result = demux.handle_raw_proposal(
+            Message {
+                data: encoded,
+                handle: None,
+            },
+            &ConsensusVersionView::default(),
+        );
+        assert!(
+            result.is_some(),
+            "a valid group whose genesis fields are stripped by the block encoding must pass"
         );
     }
 

@@ -29,7 +29,8 @@ pub mod verified_txn_cache;
 
 pub use batch_verify::{BatchVerifier, BatchVerifierConfig, BatchVerifyRequest};
 pub use block::{
-    contents_match_header, validate_block, BlockValidationError, BlockValidationResult,
+    contents_match_header, restore_payset_genesis_fields, validate_block, BlockValidationError,
+    BlockValidationResult,
 };
 pub use checks::{check_payset, check_txn_group};
 pub use fee::{

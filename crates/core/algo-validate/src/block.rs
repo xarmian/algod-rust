@@ -204,6 +204,26 @@ impl fmt::Display for BlockValidationError {
     }
 }
 
+/// Return a copy of `block.payset` with each transaction's genesis ID and
+/// genesis hash restored from the block header (go: `BlockHeader.DecodeSignedTxn`).
+///
+/// A block's payset strips these fields for space, but signatures and group
+/// IDs commit to the full transaction, so any hash recomputation over a
+/// payset (including the early proposal group-ID screen) must restore them
+/// first (issue #1686).
+pub fn restore_payset_genesis_fields(block: &Block) -> Vec<SignedTransaction> {
+    let mut restored = block.payset.clone();
+    for stx in &mut restored {
+        if stx.has_genesis_id && stx.txn.genesis_id.is_empty() {
+            stx.txn.genesis_id.clone_from(&block.genesis_id);
+        }
+        if stx.txn.genesis_hash == [0u8; 32] {
+            stx.txn.genesis_hash.clone_from(&block.genesis_hash);
+        }
+    }
+    restored
+}
+
 /// Validate a complete block.
 ///
 /// # Arguments
@@ -318,15 +338,7 @@ pub fn validate_block_with_cache(
         rewards_pool: block.rewards_pool,
     };
 
-    let mut restored_payset = block.payset.clone();
-    for stx in &mut restored_payset {
-        if stx.has_genesis_id && stx.txn.genesis_id.is_empty() {
-            stx.txn.genesis_id.clone_from(&block.genesis_id);
-        }
-        if stx.txn.genesis_hash == [0u8; 32] {
-            stx.txn.genesis_hash.clone_from(&block.genesis_hash);
-        }
-    }
+    let restored_payset = restore_payset_genesis_fields(block);
 
     let mut total_txn_bytes: usize = 0;
 
