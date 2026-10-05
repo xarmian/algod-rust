@@ -21,22 +21,26 @@
 //! Issue #1703: a block applied in `ApplyMode::Execute` evaluates a copy with
 //! the genesis id/hash restored (for `txn TxID`), but the block that is
 //! *stored* must stay in go's stripped `SignedTxnInBlock` form: `hgi` set,
-//! empty `gen`, zero `gh`, `hgh` unset (the protocol requires the hash).
+//! empty `gen`, zero `gh`, `hgh` unset when the protocol requires the hash
+//! (and set when it is optional and the submitter included it).
+//! The app-call test pins both halves: evaluation sees the full transaction
+//! (`txn TxID`), the stored bytes stay stripped.
 
 use algo_ledger::apply::apply_block_executing_app_calls;
 use algo_ledger::{LedgerState, LedgerStore};
-use algo_types::{Address, Block, Round, SignedTransaction};
+use algo_types::consensus::{consensus_params_for_version, CONSENSUS_V15, CONSENSUS_V41};
+use algo_types::{Address, Block, BoxRef, Round, SignedTransaction};
 
 const GENESIS_ID: &str = "test-net-v1";
 const GENESIS_HASH: [u8; 32] = [7u8; 32];
 
-fn stripped_block(payset: Vec<SignedTransaction>) -> Block {
+fn stripped_block(proto: &str, payset: Vec<SignedTransaction>) -> Block {
     Block {
         round: Round(1),
         genesis_id: GENESIS_ID.to_string(),
         genesis_hash: GENESIS_HASH,
         fee_sink: Address([0xFE; 32]),
-        current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+        current_protocol: proto.to_string(),
         txn_counter: 1001,
         payset,
         ..Block::default()
@@ -48,6 +52,8 @@ fn stripped_stx(txn_type: &str, sender: Address) -> SignedTransaction {
     stx.txn.txn_type = txn_type.into();
     stx.txn.sender = sender;
     stx.txn.fee = 1000;
+    stx.txn.first_valid = Round(1);
+    stx.txn.last_valid = Round(1000);
     stx.has_genesis_id = true; // stripped: genesis_id empty, genesis_hash zero
     stx
 }
@@ -59,7 +65,7 @@ fn funded_state(sender: Address) -> LedgerState {
     state
 }
 
-fn assert_stored_block_stripped(state: &LedgerState, expected_txns: usize) {
+fn stored_block(state: &LedgerState, expected_txns: usize) -> Block {
     let raw = state
         .get_block_data(1)
         .unwrap()
@@ -77,32 +83,100 @@ fn assert_stored_block_stripped(state: &LedgerState, expected_txns: usize) {
             stx.txn.genesis_hash, [0u8; 32],
             "stored txn must not carry gh"
         );
-        assert!(!stx.has_genesis_hash, "hgh must stay unset");
     }
+    stored
 }
 
 #[test]
-fn pay_only_block_is_stored_stripped() {
+fn pay_only_block_is_stored_stripped_on_hash_requiring_protocol() {
+    assert!(
+        consensus_params_for_version(CONSENSUS_V41)
+            .unwrap()
+            .require_genesis_hash,
+        "this case is about a protocol that requires the genesis hash"
+    );
     let sender = Address([1u8; 32]);
     let mut state = funded_state(sender);
     let mut stx = stripped_stx("pay", sender);
     stx.txn.receiver = Address([2u8; 32]);
     stx.txn.amount = 1_000_000;
-    apply_block_executing_app_calls(&mut state, &stripped_block(vec![stx])).unwrap();
-    assert_stored_block_stripped(&state, 1);
+    apply_block_executing_app_calls(&mut state, &stripped_block(CONSENSUS_V41, vec![stx])).unwrap();
+    let stored = stored_block(&state, 1);
+    assert!(
+        !stored.payset[0].has_genesis_hash,
+        "hgh stays unset when the protocol requires the genesis hash"
+    );
 }
 
 #[test]
-fn app_call_block_executed_is_stored_stripped() {
+fn pay_only_block_keeps_hgh_on_hash_optional_protocol() {
+    assert!(
+        !consensus_params_for_version(CONSENSUS_V15)
+            .unwrap()
+            .require_genesis_hash,
+        "this case is about a protocol where the genesis hash is optional"
+    );
     let sender = Address([1u8; 32]);
     let mut state = funded_state(sender);
+    let mut stx = stripped_stx("pay", sender);
+    stx.txn.receiver = Address([2u8; 32]);
+    stx.txn.amount = 1_000_000;
+    stx.has_genesis_hash = true; // submitter included gh; stripped on store
+    apply_block_executing_app_calls(&mut state, &stripped_block(CONSENSUS_V15, vec![stx])).unwrap();
+    let stored = stored_block(&state, 1);
+    assert!(stored.payset[0].has_genesis_hash, "hgh must be preserved");
+}
+
+/// Both halves of the invariant in one test: the AVM sees the id of the FULL
+/// transaction (issue #1664), while the stored block stays stripped (#1703).
+#[test]
+fn app_call_block_evaluates_full_txid_and_is_stored_stripped() {
+    let sender = Address([1u8; 32]);
+    let app_id = 1001u64;
+    let mut state = funded_state(sender);
+    let program = algo_avm::assembler::assemble_string(concat!(
+        "#pragma version 8
+",
+        "byte \"id\"
+",
+        "txn TxID
+",
+        "box_put
+",
+        "int 1
+",
+    ))
+    .expect("assemble")
+    .program;
+    state
+        .get_or_default_account_mut(&Address(algo_ledger::avm_context::app_address(app_id)))
+        .micro_algos = 10_000_000;
+    state.set_app_params(
+        app_id,
+        algo_types::AppParams {
+            creator: sender,
+            approval_program: program,
+            clear_state_program: vec![0x08, 0x81, 0x01],
+            ..Default::default()
+        },
+    );
     let mut stx = stripped_stx("appl", sender);
-    let program = algo_avm::assembler::assemble_string("#pragma version 8\nint 1\n")
-        .expect("assemble")
-        .program;
-    stx.txn.approval_program = Some(serde_bytes::ByteBuf::from(program.clone()));
-    stx.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(program));
-    stx.apply_data_application_id = 1001;
-    apply_block_executing_app_calls(&mut state, &stripped_block(vec![stx])).unwrap();
-    assert_stored_block_stripped(&state, 1);
+    stx.txn.application_id = app_id;
+    stx.txn.boxes = Some(vec![BoxRef {
+        index: 0,
+        name: Some(serde_bytes::ByteBuf::from(b"id".to_vec())),
+    }]);
+    let mut full = stx.txn.clone();
+    full.genesis_id = GENESIS_ID.to_string();
+    full.genesis_hash = GENESIS_HASH;
+
+    apply_block_executing_app_calls(&mut state, &stripped_block(CONSENSUS_V41, vec![stx])).unwrap();
+
+    assert_eq!(
+        state.get_box(app_id, b"id"),
+        Some(algo_codec::compute_txn_id(&full).0.to_vec()),
+        "txn TxID must be the id of the full (restored) transaction"
+    );
+    let stored = stored_block(&state, 1);
+    assert!(!stored.payset[0].has_genesis_hash);
 }

@@ -1569,6 +1569,8 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
     // The restored copy is evaluation-local: the block that is *stored* must
     // stay in its stripped (`SignedTxnInBlock`) form, or a node-produced
     // block would carry `gen`/`gh` where go records only `hgi` (issue #1703).
+    // Callers hand in stripped blocks by convention; storage does not
+    // re-normalise.
     let stored_block = block;
     let restored_block;
     let block = if mode == ApplyMode::Execute {

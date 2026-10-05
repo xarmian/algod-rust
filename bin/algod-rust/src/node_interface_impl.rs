@@ -4317,6 +4317,12 @@ mod tests {
         assert!(stib.has_genesis_id, "hgi must be set");
         // The protocol requires the genesis hash, so go leaves hgh unset.
         assert!(
+            algo_types::consensus::consensus_params_for_version(&block.current_protocol)
+                .expect("known protocol")
+                .require_genesis_hash,
+            "this test runs on a protocol that requires the genesis hash"
+        );
+        assert!(
             !stib.has_genesis_hash,
             "hgh must stay unset when the protocol requires the genesis hash"
         );
