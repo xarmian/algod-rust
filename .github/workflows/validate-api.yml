@@ -10,12 +10,16 @@ name: Dual-Node REST Conformance
 # docker/docker-compose.validate-api.yml's header comment), and diffs live
 # HTTP responses byte-for-byte where a shared genesis makes that meaningful.
 #
-# Runs for every consensus- or REST-relevant crate (crates/core, crates/node,
-# bin, docker, Cargo.lock): the 2026-10 regression where a produced block's
-# payset carried gen/gh (issue #1703) merged unnoticed because the filter
-# only covered the REST crate. Also dispatchable manually. No go-algorand-from-source build is
-# needed here (unlike algokey-e2e.yml) -- the go side uses the prebuilt
-# `algorand/algod` image directly, and algod-rust runs natively (a single
+# Invariant: this job must run for any change that can alter block
+# production, storage encoding or REST output, so the filters cover the
+# source of every consensus and REST crate (but not their unit/integration
+# tests or benches, which cannot change what a node produces or serves).
+# Tests that belong to this job live under bin/algod-rust/tests and so stay
+# covered by "bin/**". Also dispatchable manually.
+#
+# No go-algorand-from-source build is needed here (unlike algokey-e2e.yml)
+# -- the go side uses the prebuilt `algorand/algod` image directly, and
+# algod-rust runs natively (a single
 # `cargo build --release`, reused by the test binary) rather than as a
 # second Docker image -- see docker-compose.validate-api.yml's header
 # comment for why building it twice blew the original timeout.
@@ -23,8 +27,8 @@ name: Dual-Node REST Conformance
 on:
   pull_request:
     paths:
-      - "crates/core/**"
-      - "crates/node/**"
+      - "crates/core/**/src/**"
+      - "crates/node/**/src/**"
       - "bin/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -34,8 +38,8 @@ on:
   push:
     branches: [main]
     paths:
-      - "crates/core/**"
-      - "crates/node/**"
+      - "crates/core/**/src/**"
+      - "crates/node/**/src/**"
       - "bin/**"
       - "Cargo.toml"
       - "Cargo.lock"

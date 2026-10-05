@@ -4315,6 +4315,11 @@ mod tests {
             "stored payset txn must not carry gh"
         );
         assert!(stib.has_genesis_id, "hgi must be set");
+        // The protocol requires the genesis hash, so go leaves hgh unset.
+        assert!(
+            !stib.has_genesis_hash,
+            "hgh must stay unset when the protocol requires the genesis hash"
+        );
 
         // The commitment is over the full (restored) transaction ids, so it
         // must equal the root computed from the stripped stored form.
@@ -4323,16 +4328,9 @@ mod tests {
             algo_validate::merkle::compute_payset_merkle_root(&block).as_slice(),
             "txn_commitment must match the stripped-form payset commitment"
         );
-        assert_eq!(
-            algo_validate::restore_payset_genesis_fields(&block)[0]
-                .txn
-                .genesis_id,
-            "localnet-v1"
-        );
-        assert_eq!(
-            compute_txn_id(&algo_validate::restore_payset_genesis_fields(&block)[0].txn),
-            txid
-        );
+        let restored = algo_validate::restore_payset_genesis_fields(&block);
+        assert_eq!(restored[0].txn.genesis_id, "localnet-v1");
+        assert_eq!(compute_txn_id(&restored[0].txn), txid);
     }
 
     /// Issue #581: the dev-mode block producer's `StateDelta` cache (what
