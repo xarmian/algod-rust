@@ -52,8 +52,8 @@ use crate::vote_auxiliary::VoteTrackerRound;
 /// Mirrors Go's `voteAggregator` in agreement/voteAggregator.go.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VoteAggregator {
-    /// Per-round vote tracking. Typically contains at most 2 entries (current
-    /// round and next round for pipelining).
+    /// Per-round vote tracking. Pruned by `RootRouter::update` (GC) and
+    /// `persistence::encode` to the rounds a Go `roundRouter` would retain.
     rounds: std::collections::HashMap<algo_types::Round, VoteTrackerRound>,
 }
 
@@ -354,6 +354,11 @@ impl VoteAggregator {
     /// Useful for queries like freshest bundle or next-threshold status.
     pub fn round_tracker(&mut self, round: algo_types::Round) -> &mut VoteTrackerRound {
         self.tracker_for_round(round)
+    }
+
+    /// Number of rounds currently holding a vote tracker.
+    pub fn round_count(&self) -> usize {
+        self.rounds.len()
     }
 
     /// Trim old round state. Called when the player advances to a new round.

@@ -270,6 +270,13 @@ pub fn encode(
     filtered_router
         .children
         .retain(|&round, _| round.0 >= player.round.0);
+    // The proposal stores (which carry whole blocks) and vote trackers are
+    // per-round state that Go keeps inside the pruned `roundRouter`; apply the
+    // same `>= player.round` cut so the snapshot stays bounded (issue #1687).
+    filtered_router
+        .proposal_manager
+        .retain_rounds_from(player.round);
+    filtered_router.vote_aggregator.trim(player.round);
 
     let router_bytes = rmp_serde::to_vec_named(&filtered_router)
         .map_err(|e| PersistenceError::Encode(e.to_string()))?;
@@ -574,11 +581,55 @@ mod tests {
     use crate::player::Player;
     use crate::router::RootRouter;
     use crate::step::{Period, Step};
+    use crate::types::credential_round_lag;
     use crate::vote::BOTTOM;
 
     /// Helper: create an in-memory SQLite connection.
     fn mem_db() -> rusqlite::Connection {
         rusqlite::Connection::open_in_memory().expect("open in-memory db")
+    }
+
+    /// Issue #1687: the persisted snapshot must stay bounded as rounds advance.
+    /// Per-round proposal stores and vote trackers used to accumulate forever
+    /// (never GC'd, not filtered by `encode`), growing the crash-recovery blob
+    /// until SQLite rejected it as "string or blob too big".
+    #[test]
+    fn test_persisted_snapshot_bounded_over_many_rounds() {
+        let mut router = RootRouter::default();
+        let mut player = Player::default();
+        let mut max_len = 0usize;
+        let mut max_rounds = 0usize;
+        let mut first_len = 0usize;
+        for r in 1..=500u64 {
+            player.round = Round(r);
+            router.update(&player, Round(r), true);
+            // What message handling does each round: touch the per-round
+            // proposal store and vote tracker.
+            router.proposal_manager.store_for_round(Round(r));
+            router.vote_aggregator.round_tracker(Round(r));
+            max_rounds = max_rounds
+                .max(router.proposal_manager.round_count())
+                .max(router.vote_aggregator.round_count());
+            let raw = encode(&router, &player, &ClockState::default(), &[]).unwrap();
+            if r == 50 {
+                first_len = raw.len();
+            }
+            max_len = max_len.max(raw.len());
+        }
+        let lag = credential_round_lag() as usize;
+        assert!(
+            max_rounds <= lag + 2,
+            "per-round state must be GC'd: {max_rounds} rounds retained"
+        );
+        assert!(
+            max_len <= first_len * 2,
+            "snapshot grew with rounds: {first_len} -> {max_len} bytes"
+        );
+        // encode itself keeps only rounds >= player.round.
+        let (decoded, _, _, _) =
+            decode(&encode(&router, &player, &ClockState::default(), &[]).unwrap()).unwrap();
+        assert!(decoded.proposal_manager.round_count() <= 1);
+        assert!(decoded.vote_aggregator.round_count() <= 1);
     }
 
     #[test]

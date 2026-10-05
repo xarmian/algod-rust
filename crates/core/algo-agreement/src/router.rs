@@ -163,6 +163,12 @@ impl RootRouter {
                 }
             }
             self.children = children;
+            // Go keeps the proposal store and vote tracker inside the
+            // roundRouter, so they are freed with it. They live at the root
+            // here, so prune them with the same retention window.
+            let keep_from = Round(state.round.0.saturating_sub(cred_lag));
+            self.proposal_manager.retain_rounds_from(keep_from);
+            self.vote_aggregator.trim(keep_from);
         }
     }
 
