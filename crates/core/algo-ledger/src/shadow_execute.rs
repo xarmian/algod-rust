@@ -97,15 +97,49 @@ thread_local! {
     /// returns an error, 3 = scratch Execute panics.
     static TEST_HOOK: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
+#[cfg(test)]
 fn test_hook() -> u8 {
+    TEST_HOOK.with(|h| h.get())
+}
+
+/// `save_scratch_state` with the test-only "unsupported store" injection
+/// compiled out of production builds.
+fn scratch_state<L: LedgerStore>(store: &L) -> Option<Box<dyn std::any::Any>> {
     #[cfg(test)]
-    {
-        TEST_HOOK.with(|h| h.get())
+    if test_hook() == 1 {
+        return None;
     }
-    #[cfg(not(test))]
-    {
-        0
+    store.save_scratch_state()
+}
+
+/// The scratch Execute evaluation; test builds can inject an error/panic.
+fn run_scratch_execute<L: LedgerStore>(
+    rec: &mut RecordingStore<'_, L>,
+    block: &Block,
+    exec_ad: &mut Vec<ApplyData>,
+    exec_kv: &mut KvModsMap,
+) -> Result<(), AlgoError> {
+    #[cfg(test)]
+    match test_hook() {
+        2 => {
+            return Err(AlgoError::Ledger {
+                message: "injected scratch error".into(),
+            })
+        }
+        3 => panic!("injected scratch panic"),
+        _ => {}
     }
+    apply_block_impl_ex(
+        rec,
+        block,
+        ApplyMode::Execute,
+        false,
+        None,
+        None,
+        Some(exec_ad),
+        Some(exec_kv),
+        true,
+    )
 }
 
 fn log_progress(last_round: u64) {
@@ -632,12 +666,7 @@ pub fn shadow_check_replay_block<L: LedgerStore>(
     store: &mut L,
     block: &Block,
 ) -> Result<ShadowReport, AlgoError> {
-    let saved = if test_hook() == 1 {
-        None
-    } else {
-        store.save_scratch_state()
-    };
-    let Some(aux) = saved else {
+    let Some(aux) = scratch_state(store) else {
         apply_block_impl_ex(
             store,
             block,
@@ -659,25 +688,7 @@ pub fn shadow_check_replay_block<L: LedgerStore>(
     let mut exec_kv = KvModsMap::new();
     let scratch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut rec = RecordingStore::new(store);
-        let res = if test_hook() == 3 {
-            panic!("injected scratch panic");
-        } else if test_hook() == 2 {
-            Err(AlgoError::Ledger {
-                message: "injected scratch error".into(),
-            })
-        } else {
-            apply_block_impl_ex(
-                &mut rec,
-                block,
-                ApplyMode::Execute,
-                false,
-                None,
-                None,
-                Some(&mut exec_ad),
-                Some(&mut exec_kv),
-                true,
-            )
-        };
+        let res = run_scratch_execute(&mut rec, block, &mut exec_ad, &mut exec_kv);
         let view = read_exec_view(&rec, &rec.touches);
         (res, view, std::mem::take(&mut rec.touches))
     }));
@@ -1108,6 +1119,11 @@ pub fn compare_recorded_apply_data(block: &Block, computed: &[ApplyData]) -> Vec
 /// indices, inner-txn positions, log counts) so occurrences of the same root
 /// cause share one pattern, e.g. `eval_delta.inner_txns[N].eval_delta.global_delta[K]`.
 pub fn field_pattern(field: &str) -> String {
+    // Box diffs name the key as `kv_key=<hex>`: unique per key, so collapse it
+    // or every box would bypass the limiter as a "new pattern".
+    if let Some(i) = field.find("kv_key=") {
+        return format!("{}kv_key=[K]", &field[..i]);
+    }
     let mut out = String::new();
     let mut rest = field;
     while let Some(i) = rest.find('[') {
@@ -1823,6 +1839,11 @@ mod tests {
             "eval_delta.logs[N]"
         );
         assert_eq!(field_pattern("closing_amount"), "closing_amount");
+        assert_eq!(
+            field_pattern("kv_key=0102ab..."),
+            field_pattern("kv_key=ffee")
+        );
+        assert_eq!(field_pattern("kv_key=0102ab"), "kv_key=[K]");
     }
 
     #[test]

@@ -734,6 +734,22 @@ class ScanLogTest(unittest.TestCase):
         line = L("01:00:00.000000", "WARN", "algo_ledger::shadow_execute: shadow_execute_mismatch round=7 diffs=1 [execute_error execute=below minimum balance]")
         self.assertEqual(self._hard([line]), {"shadow_execute_mismatch": 1})
 
+    def test_shadow_rate_limited_summary_is_not_a_hard_mismatch(self):
+        line = L("01:00:00.000000", "WARN", "algo_ledger::shadow_execute: shadow_execute_mismatch kind=rate_limited suppressed_lines=12")
+        scan = nodelog.scan_lines([line])
+        self.assertEqual(scan["hard_failures"], {})
+        self.assertEqual(scan["warn"], {"shadow_execute_rate_limited": 1})
+
+    def test_shadow_execute_error_with_panic_text_counts_once(self):
+        line = L("01:00:00.000000", "WARN", "algo_ledger::shadow_execute: shadow_execute_mismatch round=7 diffs=1 [execute_error field=error replay=ok execute=shadow Execute evaluation panicked; apply_block failed]")
+        self.assertEqual(self._hard([line]), {"shadow_execute_mismatch": 1})
+
+    def test_shadow_unsupported_store_is_a_warning_only(self):
+        line = L("01:00:00.000000", "WARN", "algo_ledger::shadow_execute: shadow_execute_unsupported_store: this store cannot roll back")
+        scan = nodelog.scan_lines([line])
+        self.assertEqual(scan["hard_failures"], {})
+        self.assertEqual(scan["warn"], {"shadow_execute_unsupported_store": 1})
+
     def test_shadow_progress_line_is_not_hard(self):
         line = L("01:00:00.000000", "INFO", "algo_ledger::shadow_execute: shadow_execute_progress checked=1000 mismatched_blocks=0")
         self.assertEqual(self._hard([line]), {})

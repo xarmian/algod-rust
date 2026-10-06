@@ -309,6 +309,7 @@ _PREFILTER = (
     "persistence write",
     "slow ensure_block",
     "shadow_execute_mismatch",
+    "shadow_execute_unsupported_store",
     "validation depth",
     "pool rejected",
     "TxSyncer",
@@ -340,14 +341,24 @@ def scan_lines(lines) -> dict:
             scan[tier][key] = scan[tier].get(key, 0) + 1
             scan["samples"].setdefault(key, line[:300])
 
+        # Shadow-execute lines quote arbitrary error text (balance, panic, ...)
+        # from the diagnostic evaluation, so they are classified exclusively
+        # here and never fall through to the other hard rules. A
+        # `kind=rate_limited` line is only a summary of suppressed repeats of
+        # mismatches already counted, so it is a warning, not another hard hit.
+        if "shadow_execute_mismatch" in line:
+            if "kind=rate_limited" in line:
+                bump("warn", "shadow_execute_rate_limited")
+            else:
+                bump("hard", "shadow_execute_mismatch")
+            continue
+        if "shadow_execute_unsupported_store" in line:
+            bump("warn", "shadow_execute_unsupported_store")
+            continue
         for key, rx, _thr, _d in HARD_RULES:
             if rx.search(line):
                 bump("hard", key)
-        if (
-            BALANCE_RE.search(line)
-            and not GOSSIP_NOISE_RE.search(line)
-            and "shadow_execute_mismatch" not in line
-        ):
+        if BALANCE_RE.search(line) and not GOSSIP_NOISE_RE.search(line):
             bump("hard", BALANCE_KEY)
         for key, rx, _d in WARN_RULES:
             if rx.search(line):

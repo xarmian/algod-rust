@@ -7031,10 +7031,20 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn restore_scratch_state(&mut self, saved: Box<dyn std::any::Any>) {
-        if let Ok(saved) = saved.downcast::<(LeaseTable, usize)>() {
-            let (leases, pre_mutations_len) = *saved;
-            self.lease_table = leases;
-            self.pre_mutations.truncate(pre_mutations_len);
+        match saved.downcast::<(LeaseTable, usize)>() {
+            Ok(saved) => {
+                let (leases, pre_mutations_len) = *saved;
+                self.lease_table = leases;
+                self.pre_mutations.truncate(pre_mutations_len);
+            }
+            Err(_) => {
+                // The state was produced by a different store type: the
+                // scratch apply was NOT rolled back for leases/trie log.
+                tracing::error!(
+                    "restore_scratch_state: saved scratch state has an unexpected type; lease table and trie pre-mutation log were not restored"
+                );
+                debug_assert!(false, "restore_scratch_state: unexpected saved state type");
+            }
         }
     }
 
