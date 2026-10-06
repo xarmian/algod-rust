@@ -770,11 +770,12 @@ impl AlgodNodeInterface {
             };
             let block = decode_block(&bytes)
                 .map_err(|e| NodeError::Internal(format!("decode_block({round}): {e}")))?;
+            let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(&block);
             for stx in &block.payset {
                 // Restore the genesis fields the block's STIB encoding strips so
                 // the id matches the submitter's and the response carries the
                 // transaction as signed.
-                let restored = crate::dev_producer::restore_block_genesis_fields(stx, &block);
+                let restored = crate::dev_producer::restore_with_rule(stx, &rule);
                 if compute_txn_id(&restored.txn) == *txid {
                     // Surface ApplyData (created asset/app id, eval delta) from
                     // the dev-mode side cache, if captured at commit time.
@@ -842,9 +843,9 @@ impl AlgodNodeInterface {
             };
             let block = decode_block(&bytes)
                 .map_err(|e| NodeError::Internal(format!("decode_block({round}): {e}")))?;
+            let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(&block);
             for stx in &block.payset {
-                let restored = crate::dev_producer::restore_block_genesis_fields(stx, &block);
-                if compute_txn_id(&restored.txn) == txid {
+                if compute_txn_id(&rule.restored_txn(stx)) == txid {
                     return Ok(true);
                 }
             }
@@ -1870,13 +1871,15 @@ impl NodeInterface for AlgodNodeInterface {
                         // Cache per-txn ApplyData (created ids / eval delta) for
                         // get_pending_transaction to report on confirmation.
                         if let Ok(mut cache) = apply_data_cache.lock() {
+                            let rule =
+                                algo_types::genesis_restore::GenesisRestoreRule::for_block(&block);
                             for (stx, ad) in block.payset.iter().zip(apply_data.iter()) {
                                 if ad.config_asset != 0
                                     || ad.application_id != 0
                                     || ad.eval_delta.is_some()
                                 {
                                     cache.insert(
-                                        crate::dev_producer::block_txn_id(stx, &block),
+                                        compute_txn_id(&rule.restored_txn(stx)),
                                         ad.clone(),
                                     );
                                 }

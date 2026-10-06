@@ -212,16 +212,7 @@ impl fmt::Display for BlockValidationError {
 /// payset (including the early proposal group-ID screen) must restore them
 /// first (issue #1686).
 pub fn restore_payset_genesis_fields(block: &Block) -> Vec<SignedTransaction> {
-    let mut restored = block.payset.clone();
-    for stx in &mut restored {
-        if stx.has_genesis_id && stx.txn.genesis_id.is_empty() {
-            stx.txn.genesis_id.clone_from(&block.genesis_id);
-        }
-        if stx.txn.genesis_hash == [0u8; 32] {
-            stx.txn.genesis_hash.clone_from(&block.genesis_hash);
-        }
-    }
-    restored
+    algo_types::genesis_restore::restore_payset_genesis_fields(block)
 }
 
 /// Validate a complete block.
@@ -332,6 +323,10 @@ pub fn validate_block_with_cache(
     // what the block actually claims, and the separate genesis consistency check
     // (step 5) can detect if the block's genesis fields differ from expected.
     // Resolve version-aware consensus params for this block's protocol.
+    // An unknown protocol was already reported as `UnknownProtocolVersion` in
+    // step 1 (go: "consensus protocol not found"), so the block is rejected
+    // regardless; the default params only keep the remaining checks running.
+    // Genesis restoration treats an unknown protocol as hash-requiring.
     let params = consensus_params_for_version(&block.current_protocol).unwrap_or_default();
     let spec = SpecialAddresses {
         fee_sink: block.fee_sink,

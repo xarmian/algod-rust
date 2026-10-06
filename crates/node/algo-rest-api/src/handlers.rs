@@ -1575,24 +1575,10 @@ pub async fn get_block_hash<N: NodeInterface>(
 // Shared genesis field restoration helper
 // ---------------------------------------------------------------------------
 
-/// Restore genesis fields on a transaction, matching go-algorand's
-/// `DecodeSignedTxn` behavior.
-///
-/// When `has_genesis_id` is true, the block's genesis ID is copied into the
-/// transaction. When `has_genesis_hash` is true or the transaction's genesis
-/// hash is all-zeros, the block's genesis hash is copied in.
-fn restore_genesis_fields(
-    stxn: &algo_types::SignedTransaction,
-    block: &algo_types::Block,
-) -> algo_types::Transaction {
-    let mut txn = stxn.txn.clone();
-    if stxn.has_genesis_id {
-        txn.genesis_id.clone_from(&block.genesis_id);
-    }
-    if stxn.has_genesis_hash || txn.genesis_hash == [0u8; 32] {
-        txn.genesis_hash = block.genesis_hash;
-    }
-    txn
+/// The block's genesis-restoration rule (go `DecodeSignedTxn`), resolved once
+/// per block: the protocol lookup is not repeated per transaction.
+fn genesis_rule(block: &algo_types::Block) -> algo_types::genesis_restore::GenesisRestoreRule<'_> {
+    algo_types::genesis_restore::GenesisRestoreRule::for_block(block)
 }
 
 // ---------------------------------------------------------------------------
@@ -1622,11 +1608,12 @@ pub async fn get_block_txids<N: NodeInterface>(
 
     // Compute transaction IDs, restoring genesis fields as go-algorand's
     // DecodeSignedTxn does before computing the ID.
+    let rule = genesis_rule(&block);
     let txids: Vec<String> = block
         .payset
         .iter()
         .map(|stxn| {
-            let txn = restore_genesis_fields(stxn, &block);
+            let txn = rule.restored_txn(stxn);
             algo_codec::compute_txn_id(&txn).to_string()
         })
         .collect();
@@ -1665,9 +1652,10 @@ pub async fn get_block_logs<N: NodeInterface>(
 
     let mut block_logs: Vec<models::AppCallLogs> = Vec::new();
 
+    let rule = genesis_rule(&block);
     for stxn in &block.payset {
         // Compute the outer txn ID (restoring genesis fields as in get_block_txids).
-        let txn = restore_genesis_fields(stxn, &block);
+        let txn = rule.restored_txn(stxn);
         let outer_txid = algo_codec::compute_txn_id(&txn).to_string();
 
         // Walk the eval_delta rmpv tree to collect logs.
@@ -1772,8 +1760,9 @@ pub async fn get_transaction_proof<N: NodeInterface>(
     // We must restore genesis fields before computing the ID (matching
     // go-algorand's DecodePaysetFlat → DecodeSignedTxn).
     let mut found_idx = None;
+    let rule = genesis_rule(&block);
     for (i, stxn) in block.payset.iter().enumerate() {
-        let txn = restore_genesis_fields(stxn, &block);
+        let txn = rule.restored_txn(stxn);
         let computed_id = algo_codec::compute_txn_id(&txn);
         if computed_id.0 == txid_bytes {
             found_idx = Some(i);
@@ -1795,6 +1784,7 @@ pub async fn get_transaction_proof<N: NodeInterface>(
     let payset_array = TxnMerkleArray {
         block: &block,
         hash_type: hashtype,
+        rule,
     };
 
     let (tree, stibhash) = match hashtype {
@@ -2260,6 +2250,7 @@ pub async fn get_light_block_header_proof<N: NodeInterface>(
 struct TxnMerkleArray<'a> {
     block: &'a algo_types::Block,
     hash_type: &'a str,
+    rule: algo_types::genesis_restore::GenesisRestoreRule<'a>,
 }
 
 /// A single element of the txn Merkle tree, representing the leaf data.
@@ -2308,7 +2299,7 @@ impl algo_consensus_crypto::merklearray::Array for TxnMerkleArray<'_> {
 
         // Restore genesis fields for txid computation (matching go-algorand's
         // DecodeSignedTxn behavior).
-        let restored_txn = restore_genesis_fields(stxn, self.block);
+        let restored_txn = self.rule.restored_txn(stxn);
 
         let (txid, stib_hash) = match self.hash_type {
             "sha256" => {
