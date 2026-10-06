@@ -106,6 +106,18 @@ pub fn compute_pending_rewards(account: &AccountData, rewards_level: u64) -> u64
 /// a 64-bit value... this rewardAlgos counter could potentially roll
 /// over") — that half keeps `wrapping_add`.
 pub fn apply_rewards(account: &mut AccountData, rewards_level: u64) -> u64 {
+    // go's `WithUpdatedRewards` (`data/basics/userBalance.go` L453-458)
+    // returns a NotParticipating account unchanged -- RewardsBase included
+    // (issue #1732).
+    if account.status == AccountStatus::NotParticipating {
+        return 0;
+    }
+    // Fast path: already at this level -> nothing pending, nothing to stamp.
+    // Hit by the second `apply_rewards` of the same account within one
+    // transaction (rewards pass, then `apply_pay`'s credit).
+    if account.rewards_base == rewards_level {
+        return 0;
+    }
     let pending = compute_pending_rewards(account, rewards_level);
     if pending > 0 {
         account.micro_algos = account.micro_algos.checked_add(pending).unwrap_or_else(|| {
@@ -241,6 +253,23 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(compute_pending_rewards(&account, 100), 0);
+    }
+
+    /// Issue #1732: go's `WithUpdatedRewards` (`data/basics/userBalance.go`
+    /// L453-458) returns a NotParticipating account unchanged, including its
+    /// `RewardsBase`.
+    #[test]
+    fn test_not_participating_keeps_rewards_base_and_balance() {
+        let mut account = AccountData {
+            micro_algos: 10_000_000,
+            rewards_base: 5,
+            status: AccountStatus::NotParticipating,
+            ..Default::default()
+        };
+        assert_eq!(apply_rewards(&mut account, 100), 0);
+        assert_eq!(account.rewards_base, 5);
+        assert_eq!(account.micro_algos, 10_000_000);
+        assert_eq!(account.rewarded_micro_algos, 0);
     }
 
     #[test]

@@ -94,6 +94,7 @@ fn make_context<'a>(
         [0u8; 32], // program_hash
         [0u8; 32], // genesis_hash
         algo_types::ConsensusParams::default(),
+        0, // rewards_level (test default)
     );
     // See the identical comment on algo-ledger's own `avm_context.rs` test
     // `make_context`: `LedgerAvmContext::new` leaves `program_version` at

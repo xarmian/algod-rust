@@ -1196,6 +1196,12 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     pub txn_counter: u64,
     /// Fee sink address for inner transaction fee deduction.
     pub fee_sink: Address,
+    /// Block rewards level that inner transactions' rewards pass brings every
+    /// participant up to (go's `roundCowState.rewardsLevel()`, used by `Move`
+    /// for inner transactions exactly as for top-level ones; issue #1731).
+    /// Callers constructing a context for real execution must set it from the
+    /// block/apply context; it is inherited by nested inner app calls.
+    pub rewards_level: u64,
     /// Opcode budget shared between the AVM machine and inner app call
     /// execution. Updated by `set_opcode_budget` / `get_opcode_budget`
     /// before and after `itxn_submit`.
@@ -2369,6 +2375,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         program_hash: [u8; 32],
         genesis_hash: [u8; 32],
         consensus: ConsensusParams,
+        rewards_level: u64,
     ) -> Self {
         let group_len = group.len();
         let group_resources = fill_group_resources(&group);
@@ -2395,6 +2402,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             fee_residue: 0,
             txn_counter: 0,
             fee_sink: Address::ZERO,
+            rewards_level,
             opcode_budget: 0,
             inner_txn_ids: Vec::new(),
             txid_cache: RefCell::new(HashMap::new()),
@@ -4242,9 +4250,50 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     }
 }
 
+impl<L: LedgerStore> LedgerAvmContext<'_, L> {
+    /// Roll the store back to `snapshot` after an inner group failed, and
+    /// drop every asset/app the group created that the snapshot could not
+    /// know about (`restore_snapshot` only covers pre-computed ids). The
+    /// snapshot includes the rewards pool, so rewards distributed by earlier
+    /// siblings' rewards passes are returned too (issue #1731).
+    fn rollback_inner_group(
+        &mut self,
+        snapshot: L::Snapshot,
+        extra_created_asset_ids: &[u64],
+        extra_created_app_ids: &[u64],
+    ) {
+        self.store.restore_snapshot(snapshot);
+        for &id in extra_created_asset_ids {
+            self.store.remove_asset_params(id);
+            self.store.remove_all_asset_holdings_for_asset(id);
+        }
+        for &id in extra_created_app_ids {
+            self.store.remove_app_params(id);
+            self.store.remove_all_app_local_states_for_app(id);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // execute_inner_appl — free function for recursive inner app call execution
 // ---------------------------------------------------------------------------
+
+/// Block-level scalars an inner app call inherits from its calling context.
+/// Grouped (rather than positional `u64`s) so a new field such as
+/// `rewards_level` (issue #1731) cannot be silently transposed or forgotten.
+#[derive(Clone, Copy)]
+struct InnerCallEnv {
+    round: u64,
+    latest_timestamp: u64,
+    genesis_hash: [u8; 32],
+    fee_credit: u64,
+    fee_residue: u64,
+    txn_counter: u64,
+    fee_sink: Address,
+    /// Block rewards level every participant of an inner transaction is
+    /// brought up to (go's `roundCowState.rewardsLevel()`).
+    rewards_level: u64,
+}
 
 /// Execute an inner `appl` (application call) transaction by running the
 /// called app's program in a child `LedgerAvmContext`.
@@ -4262,13 +4311,7 @@ fn execute_inner_appl<L: LedgerStore>(
     caller_depth: u32,
     caller_app_id: u64,
     caller_creator: [u8; 32],
-    round: u64,
-    latest_timestamp: u64,
-    genesis_hash: [u8; 32],
-    fee_credit: u64,
-    fee_residue: u64,
-    txn_counter: u64,
-    fee_sink: Address,
+    env: InnerCallEnv,
     opcode_budget: &mut i64,
     inner_txn_id: algo_types::Digest,
     box_state: crate::apply::BoxBudgetState,
@@ -4314,6 +4357,16 @@ fn execute_inner_appl<L: LedgerStore>(
     };
     use algo_avm::group::GroupBudget;
 
+    let InnerCallEnv {
+        round,
+        latest_timestamp,
+        genesis_hash,
+        fee_credit,
+        fee_residue,
+        txn_counter,
+        fee_sink,
+        rewards_level,
+    } = env;
     let mut ad = crate::apply::InnerApplyData::default();
     let called_app_id = stxn.txn.application_id;
     let on_completion = stxn.txn.on_completion;
@@ -4438,6 +4491,7 @@ fn execute_inner_appl<L: LedgerStore>(
         ph,
         genesis_hash,
         consensus.clone(),
+        rewards_level,
     );
     inner_ctx.set_program_version(
         algo_avm::bytecode::parse(&program)
@@ -6420,6 +6474,9 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         // Collect all addresses involved so the snapshot covers their state.
         let mut snapshot_addrs: Vec<Address> = Vec::new();
         snapshot_addrs.push(self.fee_sink);
+        // Inner transactions debit the rewards pool for the rewards they
+        // distribute (issue #1731); a failing sibling must restore it.
+        snapshot_addrs.push(self.store.rewards_pool());
         let txn_counter_base = self.txn_counter;
         for (i, stxn) in txns.iter().enumerate() {
             snapshot_addrs.push(stxn.txn.sender);
@@ -6652,15 +6709,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 let acct = self.store.get_or_default_account(&sender);
                 let authorizer = acct.auth_addr.as_ref().map(|a| a.0).unwrap_or(sender.0);
                 if authorizer != app_addr {
-                    self.store.restore_snapshot(snapshot);
-                    for &id in &extra_created_asset_ids {
-                        self.store.remove_asset_params(id);
-                        self.store.remove_all_asset_holdings_for_asset(id);
-                    }
-                    for &id in &extra_created_app_ids {
-                        self.store.remove_app_params(id);
-                        self.store.remove_all_app_local_states_for_app(id);
-                    }
+                    self.rollback_inner_group(
+                        snapshot,
+                        &extra_created_asset_ids,
+                        &extra_created_app_ids,
+                    );
                     let err_msg = format!(
                         "app {} (addr {}) unauthorized {}",
                         self.app_id,
@@ -6674,19 +6727,48 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 }
             }
 
+            // Rewards pass (issue #1731). go's `roundCowState.Perform`
+            // (`ledger/eval/applications.go`) runs `takeFee` -> `Move`
+            // (`ledger/eval/eval.go` L567-618) and `apply.Payment` -> `Move`
+            // for inner transactions exactly as for top-level ones, so every
+            // participant is brought up to the block's rewards level and the
+            // inner ApplyData records Sender/Receiver/CloseRewards. Runs
+            // before the fee, like the top-level pass.
+            {
+                let participants = crate::apply::reward_participants(&txns[i].txn);
+                let pass = crate::apply::apply_rewards_pass(
+                    self.store,
+                    &txns[i].txn,
+                    &participants,
+                    self.rewards_level,
+                    &self.consensus,
+                );
+                txns[i].sender_rewards = pass.sender_rewards;
+                txns[i].receiver_rewards = pass.receiver_rewards;
+                txns[i].close_rewards = pass.close_rewards;
+                if let Err(e) = crate::apply::debit_rewards_pool(self.store, pass.total) {
+                    self.rollback_inner_group(
+                        snapshot,
+                        &extra_created_asset_ids,
+                        &extra_created_app_ids,
+                    );
+                    let err_msg = format!("inner tx {}: {}", i, e);
+                    if let Some(p) = self.tracer_ptr {
+                        unsafe { &mut *p }.after_txn_group(Some(&err_msg));
+                    }
+                    return Err(AlgoError::Avm { message: err_msg });
+                }
+            }
+
             // Deduct fee from sender to fee_sink (matches go-algorand takeFee).
             let fee = txns[i].txn.fee;
             if fee > 0 {
                 if fee_sink.is_zero() {
-                    self.store.restore_snapshot(snapshot);
-                    for &id in &extra_created_asset_ids {
-                        self.store.remove_asset_params(id);
-                        self.store.remove_all_asset_holdings_for_asset(id);
-                    }
-                    for &id in &extra_created_app_ids {
-                        self.store.remove_app_params(id);
-                        self.store.remove_all_app_local_states_for_app(id);
-                    }
+                    self.rollback_inner_group(
+                        snapshot,
+                        &extra_created_asset_ids,
+                        &extra_created_app_ids,
+                    );
                     let err_msg = format!("inner tx {}: fee_sink not configured (zero address)", i);
                     if let Some(p) = self.tracer_ptr {
                         unsafe { &mut *p }.after_txn_group(Some(&err_msg));
@@ -6696,15 +6778,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 let sender = txns[i].txn.sender;
                 let mut sender_acct = self.store.get_or_default_account(&sender);
                 if sender_acct.micro_algos < fee {
-                    self.store.restore_snapshot(snapshot);
-                    for &id in &extra_created_asset_ids {
-                        self.store.remove_asset_params(id);
-                        self.store.remove_all_asset_holdings_for_asset(id);
-                    }
-                    for &id in &extra_created_app_ids {
-                        self.store.remove_app_params(id);
-                        self.store.remove_all_app_local_states_for_app(id);
-                    }
+                    self.rollback_inner_group(
+                        snapshot,
+                        &extra_created_asset_ids,
+                        &extra_created_app_ids,
+                    );
                     let err_msg = format!(
                         "inner tx {}: sender {} has insufficient balance {} for fee {}",
                         i, sender, sender_acct.micro_algos, fee,
@@ -6816,13 +6894,16 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     self.depth,
                     self.app_id,
                     self.creator,
-                    self.round,
-                    self.latest_timestamp,
-                    self.genesis_hash,
-                    self.fee_credit,
-                    self.fee_residue,
-                    self.txn_counter,
-                    self.fee_sink,
+                    InnerCallEnv {
+                        round: self.round,
+                        latest_timestamp: self.latest_timestamp,
+                        genesis_hash: self.genesis_hash,
+                        fee_credit: self.fee_credit,
+                        fee_residue: self.fee_residue,
+                        txn_counter: self.txn_counter,
+                        fee_sink: self.fee_sink,
+                        rewards_level: self.rewards_level,
+                    },
                     &mut self.opcode_budget,
                     appl_inner_id,
                     caller_box_state,
@@ -6910,15 +6991,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                         if let Some(p) = self.tracer_ptr {
                             unsafe { &mut *p }.after_txn(i, Some(&err_msg));
                         }
-                        self.store.restore_snapshot(snapshot);
-                        for &id in &extra_created_asset_ids {
-                            self.store.remove_asset_params(id);
-                            self.store.remove_all_asset_holdings_for_asset(id);
-                        }
-                        for &id in &extra_created_app_ids {
-                            self.store.remove_app_params(id);
-                            self.store.remove_all_app_local_states_for_app(id);
-                        }
+                        self.rollback_inner_group(
+                            snapshot,
+                            &extra_created_asset_ids,
+                            &extra_created_app_ids,
+                        );
                         // Notify tracer of group failure.
                         if let Some(p) = self.tracer_ptr {
                             unsafe { &mut *p }.after_txn_group(Some(&err_msg));
@@ -6929,7 +7006,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             } else {
                 let stxn = &mut txns[i];
                 let result = match stxn.txn.txn_type.as_str() {
-                    "pay" => apply_pay(self.store, &stxn.txn),
+                    "pay" => apply_pay(self.store, &stxn.txn, self.rewards_level),
                     "axfer" => apply_axfer(self.store, &stxn.txn, &self.consensus),
                     "acfg" => apply_acfg(self.store, &stxn.txn, self.txn_counter, &self.consensus),
                     "afrz" => apply_afrz(self.store, &stxn.txn),
@@ -6941,15 +7018,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                         if let Some(p) = self.tracer_ptr {
                             unsafe { &mut *p }.after_txn(i, Some(&err_msg));
                         }
-                        self.store.restore_snapshot(snapshot);
-                        for &id in &extra_created_asset_ids {
-                            self.store.remove_asset_params(id);
-                            self.store.remove_all_asset_holdings_for_asset(id);
-                        }
-                        for &id in &extra_created_app_ids {
-                            self.store.remove_app_params(id);
-                            self.store.remove_all_app_local_states_for_app(id);
-                        }
+                        self.rollback_inner_group(
+                            snapshot,
+                            &extra_created_asset_ids,
+                            &extra_created_app_ids,
+                        );
                         if let Some(p) = self.tracer_ptr {
                             unsafe { &mut *p }.after_txn_group(Some(&err_msg));
                         }
@@ -6983,15 +7056,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                         if let Some(p) = self.tracer_ptr {
                             unsafe { &mut *p }.after_txn(i, Some(&err_msg));
                         }
-                        self.store.restore_snapshot(snapshot);
-                        for &id in &extra_created_asset_ids {
-                            self.store.remove_asset_params(id);
-                            self.store.remove_all_asset_holdings_for_asset(id);
-                        }
-                        for &id in &extra_created_app_ids {
-                            self.store.remove_app_params(id);
-                            self.store.remove_all_app_local_states_for_app(id);
-                        }
+                        self.rollback_inner_group(
+                            snapshot,
+                            &extra_created_asset_ids,
+                            &extra_created_app_ids,
+                        );
                         if let Some(p) = self.tracer_ptr {
                             unsafe { &mut *p }.after_txn_group(Some(&err_msg));
                         }
@@ -7811,6 +7880,7 @@ mod tests {
             [2u8; 32],
             [3u8; 32],
             ConsensusParams::default(),
+            0, // rewards_level (test default)
         );
         // `LedgerAvmContext::new` leaves `program_version` at its
         // placeholder `0` (real callers always call `set_program_version`
@@ -7876,6 +7946,7 @@ mod tests {
             [2u8; 32],
             [3u8; 32],
             ConsensusParams::default(),
+            0, // rewards_level (test default)
         );
         let err = ctx.created_id(2).unwrap_err();
         assert!(
@@ -7903,6 +7974,7 @@ mod tests {
             [2u8; 32],
             [3u8; 32],
             ConsensusParams::default(),
+            0, // rewards_level (test default)
         );
         let err = ctx.created_id(1).unwrap_err();
         assert!(
@@ -7932,6 +8004,7 @@ mod tests {
             [2u8; 32],
             [3u8; 32],
             ConsensusParams::default(),
+            0, // rewards_level (test default)
         );
         let err = ctx.created_id(0).unwrap_err();
         assert!(
@@ -8838,6 +8911,7 @@ mod tests {
             [2u8; 32],
             [3u8; 32],
             ConsensusParams::default(),
+            0, // rewards_level (test default)
         );
         ctx.group_resources = resources;
 
@@ -8894,6 +8968,7 @@ mod tests {
             [2u8; 32],
             [3u8; 32],
             ConsensusParams::default(),
+            0, // rewards_level (test default)
         );
         ctx.group_resources = resources;
         ctx.program_version = 9;
@@ -8936,6 +9011,7 @@ mod tests {
             [2u8; 32],
             [3u8; 32],
             ConsensusParams::default(),
+            0, // rewards_level (test default)
         );
         ctx.group_resources = resources;
 
@@ -9030,6 +9106,7 @@ mod tests {
             [2u8; 32],
             [3u8; 32],
             ConsensusParams::default(),
+            0, // rewards_level (test default)
         );
         ctx.group_resources = resources;
 
@@ -9093,6 +9170,7 @@ mod tests {
             [2u8; 32],
             [3u8; 32],
             ConsensusParams::default(),
+            0, // rewards_level (test default)
         );
         ctx.group_resources = resources;
         ctx.program_version = 9;
@@ -10512,6 +10590,7 @@ mod tests {
             [2u8; 32],
             [3u8; 32],
             ConsensusParams::default(),
+            0, // rewards_level (test default)
         );
         let (val, exists) = ctx_early.voter_params_get(&addr.0, 0).unwrap();
         assert!(
@@ -10538,6 +10617,7 @@ mod tests {
             [2u8; 32],
             [3u8; 32],
             ConsensusParams::default(),
+            0, // rewards_level (test default)
         );
         let (val, exists) = ctx_late.voter_params_get(&addr.0, 0).unwrap();
         assert!(
@@ -14409,6 +14489,109 @@ mod tests {
         );
     }
 
+    // ---- Issue #1731: inner transactions run go's rewards pass ----
+
+    fn rewards_unit_setup(store: &mut LedgerState) -> (Address, Address, Address, Address) {
+        let app_addr = Address(app_address(42));
+        let pool = Address([0xA0u8; 32]);
+        let fee_sink = Address([0xFEu8; 32]);
+        let target = Address([30u8; 32]);
+        store.rewards_pool = pool;
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 5_000_000,
+                ..Default::default()
+            },
+        );
+        store.set_account(
+            &pool,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+        store.set_account(
+            &target,
+            AccountData {
+                micro_algos: 3_000_000,
+                ..Default::default()
+            },
+        );
+        (app_addr, pool, fee_sink, target)
+    }
+
+    /// The inner ApplyData records Sender/Receiver/CloseRewards exactly as
+    /// go's `Move` does (`ledger/eval/eval.go` L567-618).
+    #[test]
+    fn inner_pay_records_rewards_in_inner_apply_data() {
+        let mut store = LedgerState::new();
+        let (_app_addr, _pool, fee_sink, target) = rewards_unit_setup(&mut store);
+        let close_to = Address([31u8; 32]);
+        store.set_account(
+            &close_to,
+            AccountData {
+                micro_algos: 2_000_000,
+                ..Default::default()
+            },
+        );
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = fee_sink;
+        ctx.fee_credit = 100_000;
+        ctx.rewards_level = 100;
+        ctx.consensus.rewards_in_apply_data = true;
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(1)).unwrap();
+        ctx.itxn_field(7, TealValue::Bytes(target.0.to_vec()))
+            .unwrap();
+        ctx.itxn_field(8, TealValue::Uint(1000)).unwrap();
+        ctx.itxn_field(9, TealValue::Bytes(close_to.0.to_vec()))
+            .unwrap();
+        ctx.itxn_submit().unwrap();
+        let inner = &ctx.inner_txns.last().unwrap()[0];
+        assert_eq!(inner.sender_rewards, 500, "5 Algo * level 100");
+        assert_eq!(inner.receiver_rewards, 300, "3 Algo * level 100");
+        assert_eq!(inner.close_rewards, 200, "2 Algo * level 100");
+    }
+
+    /// A later sibling failing rolls the whole inner group back, including
+    /// the rewards pool the first sibling's rewards were debited from.
+    #[test]
+    fn inner_group_failure_rolls_back_rewards_pool_and_rewards() {
+        let mut store = LedgerState::new();
+        let (app_addr, pool, fee_sink, target) = rewards_unit_setup(&mut store);
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = fee_sink;
+        ctx.fee_credit = 100_000;
+        ctx.rewards_level = 100;
+        ctx.consensus.rewards_in_apply_data = true;
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(1)).unwrap();
+        ctx.itxn_field(7, TealValue::Bytes(target.0.to_vec()))
+            .unwrap();
+        ctx.itxn_field(8, TealValue::Uint(1000)).unwrap();
+        ctx.itxn_next().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(1)).unwrap();
+        ctx.itxn_field(7, TealValue::Bytes(target.0.to_vec()))
+            .unwrap();
+        ctx.itxn_field(8, TealValue::Uint(u64::MAX)).unwrap();
+        assert!(ctx.itxn_submit().is_err(), "second sibling overspends");
+        let app = store.get_account(&app_addr).unwrap();
+        assert_eq!(app.micro_algos, 5_000_000);
+        assert_eq!(app.rewards_base, 0);
+        assert_eq!(app.rewarded_micro_algos, 0);
+        let t = store.get_account(&target).unwrap();
+        assert_eq!(t.micro_algos, 3_000_000);
+        assert_eq!(t.rewards_base, 0);
+        assert_eq!(
+            store.get_account(&pool).unwrap().micro_algos,
+            10_000_000,
+            "rewards pool must be restored"
+        );
+    }
+
     // ---- P1-1: Inner delete creator check; inner update has none ----
 
     #[test]
@@ -16327,6 +16510,7 @@ mod tests {
             [2u8; 32],
             [3u8; 32],
             consensus,
+            0, // rewards_level (test default)
         );
         ctx.available_boxes.insert((app_id, name.to_vec()), false);
         ctx.boxes_initialized = true;
@@ -16773,6 +16957,7 @@ mod tests {
                 [2u8; 32],
                 [3u8; 32],
                 consensus,
+                0, // rewards_level (test default)
             );
             let mut budget = GroupBudget::new(1);
             let result = run_approval_program(program, &mut ctx, &mut budget)
@@ -17182,6 +17367,7 @@ mod tests {
             [2u8; 32],
             [3u8; 32],
             consensus,
+            0, // rewards_level (test default)
         )
     }
 
@@ -17364,6 +17550,7 @@ mod tests {
             [2u8; 32],
             [3u8; 32],
             consensus,
+            0, // rewards_level (test default)
         );
         ctx.available_boxes
             .insert((OWNER_APP, name.to_vec()), false);
@@ -17567,6 +17754,7 @@ mod tests {
             [2u8; 32],
             [3u8; 32],
             consensus,
+            0, // rewards_level (test default)
         );
         ctx.available_boxes.insert((999, b"mybox".to_vec()), false);
         ctx.boxes_initialized = true;
@@ -17611,6 +17799,7 @@ mod tests {
             [2u8; 32],
             [3u8; 32],
             consensus,
+            0, // rewards_level (test default)
         );
         ctx.available_boxes
             .insert((CALLER_APP, b"mybox".to_vec()), false);
@@ -19064,6 +19253,7 @@ mod tests {
             [2u8; 32],
             [3u8; 32],
             consensus,
+            0, // rewards_level (test default)
         );
         ctx.app_id = app_id;
         let tracker = Rc::new(RefCell::new(tracker_with(capacity)));
@@ -19717,6 +19907,7 @@ mod inner_group_id_tests {
             [0u8; 32],
             [0u8; 32],
             ConsensusParams::default(),
+            0, // rewards_level (test default)
         );
         ctx.set_program_version(6);
         ctx.consensus.unify_inner_tx_ids = unify;
@@ -20002,6 +20193,7 @@ mod inner_group_id_tests {
                 [0u8; 32],
                 [0u8; 32],
                 ConsensusParams::default(),
+                0, // rewards_level (test default)
             );
             ctx.set_program_version(6);
             ctx.consensus.unify_inner_tx_ids = unify;

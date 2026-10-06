@@ -3073,45 +3073,14 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
     // Check lease before any state changes.
     store.check_lease(&txn.sender, &lease_arr, ctx.round)?;
 
-    // Collect addresses for reward application (only actual transaction participants
-    // per go-algorand: sender, receiver, close-to, asset participants, freeze target).
-    let mut reward_addrs = Vec::with_capacity(6);
-    reward_addrs.push(txn.sender);
-    if !txn.receiver.is_zero() && txn.receiver != txn.sender {
-        reward_addrs.push(txn.receiver);
-    }
-    if !txn.close_remainder_to.is_zero()
-        && txn.close_remainder_to != txn.sender
-        && txn.close_remainder_to != txn.receiver
-    {
-        reward_addrs.push(txn.close_remainder_to);
-    }
-    // Asset transfer: receiver, sender (clawback source), close-to.
-    if let Some(ar) = txn.asset_receiver {
-        if !ar.is_zero() && !reward_addrs.contains(&ar) {
-            reward_addrs.push(ar);
-        }
-    }
-    if let Some(asnd) = txn.asset_sender {
-        if !asnd.is_zero() && !reward_addrs.contains(&asnd) {
-            reward_addrs.push(asnd);
-        }
-    }
-    if let Some(ac) = txn.asset_close_to {
-        if !ac.is_zero() && !reward_addrs.contains(&ac) {
-            reward_addrs.push(ac);
-        }
-    }
-    // Asset freeze: target account.
-    if let Some(fa) = txn.freeze_account {
-        if !fa.is_zero() && !reward_addrs.contains(&fa) {
-            reward_addrs.push(fa);
-        }
-    }
+    // Addresses go's `Move` brings up to the rewards level (see
+    // `reward_participants`: strictly narrower than the touched set).
+    let reward_addrs = reward_participants(txn);
 
-    // Extend with additional addresses needed for snapshot/rollback only
-    // (these do NOT receive rewards — only transaction participants do).
-    let mut touched = reward_addrs.clone();
+    // Every account the transaction may mutate (sender, receiver, close-to,
+    // asset participants, freeze target) is snapshotted for rollback, plus
+    // the additional addresses below. Only `reward_addrs` receive rewards.
+    let mut touched = txn_participants(txn);
     // Application accounts array: EvalDelta local deltas can mutate these.
     if let Some(ref accounts) = txn.accounts {
         for acct in accounts {
@@ -3245,6 +3214,214 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
     result
 }
 
+/// Accounts a transaction directly names (sender, pay receiver/close-to,
+/// asset receiver/sender/close-to, freeze target): the set that must be
+/// snapshotted for rollback and min-balance checked. This is NOT the set that
+/// receives rewards -- see [`reward_participants`].
+pub(crate) fn txn_participants(txn: &algo_types::Transaction) -> Vec<Address> {
+    let mut addrs = Vec::with_capacity(6);
+    addrs.push(txn.sender);
+    if !txn.receiver.is_zero() && txn.receiver != txn.sender {
+        addrs.push(txn.receiver);
+    }
+    if !txn.close_remainder_to.is_zero()
+        && txn.close_remainder_to != txn.sender
+        && txn.close_remainder_to != txn.receiver
+    {
+        addrs.push(txn.close_remainder_to);
+    }
+    // Asset transfer: receiver, sender (clawback source), close-to.
+    for a in [txn.asset_receiver, txn.asset_sender, txn.asset_close_to]
+        .into_iter()
+        .flatten()
+    {
+        if !a.is_zero() && !addrs.contains(&a) {
+            addrs.push(a);
+        }
+    }
+    // Asset freeze: target account.
+    if let Some(fa) = txn.freeze_account {
+        if !fa.is_zero() && !addrs.contains(&fa) {
+            addrs.push(fa);
+        }
+    }
+    addrs
+}
+
+/// The addresses go runs `WithUpdatedRewards` on for `txn`, and nothing else.
+/// Shared by the top-level pass and the inner-transaction pass (issue #1731).
+///
+/// go brings an account up to the rewards level only through
+/// `roundCowState.Move` (`ledger/eval/eval.go` L567-618), which is called
+/// for (a) the fee payer, `takeFee` -> `Move(tx.Sender, FeeSink, ...)`
+/// (L1330) -- every transaction type, inner transactions included
+/// (`Perform`, `ledger/eval/applications.go` L308) -- and (b) `pay`
+/// receiver and `CloseRemainderTo`
+/// (`ledger/apply/payment.go` L36/L50). Asset and application operations
+/// read their other accounts with `balances.Get(addr, false)`
+/// (`ledger/apply/asset.go` L59/L124/L294/L344,
+/// `ledger/apply/application.go`), i.e. WITHOUT pending rewards, and write
+/// them back unchanged, so an asset receiver / clawback source / asset
+/// close-to / freeze target keeps its stale `rewards_base` and balance.
+pub(crate) fn reward_participants(txn: &algo_types::Transaction) -> Vec<Address> {
+    let mut addrs = vec![txn.sender];
+    if txn.txn_type == "pay" {
+        if !txn.receiver.is_zero() && txn.receiver != txn.sender {
+            addrs.push(txn.receiver);
+        }
+        if !txn.close_remainder_to.is_zero()
+            && txn.close_remainder_to != txn.sender
+            && txn.close_remainder_to != txn.receiver
+        {
+            addrs.push(txn.close_remainder_to);
+        }
+    }
+    addrs
+}
+
+/// Whether `addr` is credited by a `pay` through `apply_pay` (receiver or
+/// close-to) rather than being the sender.
+///
+/// This is the one place the two halves of go's `Move` meet: the rewards
+/// pass brings a credited account up to the rewards level *when it exists*,
+/// but skips the write for an empty/absent one (go's
+/// `!amt.IsZero() || units > 0 || !UnfundedSenders` write guard), and
+/// `apply_pay` then stamps the account it actually credits via
+/// `apply_rewards`. For an account the pass already updated that second call
+/// is a no-op (`rewards_base == level`); for a skipped account its balance is
+/// 0, so it earns nothing -- the two halves never both pay out.
+fn is_pay_credit_role(txn: &algo_types::Transaction, addr: &Address) -> bool {
+    txn.txn_type == "pay"
+        && *addr != txn.sender
+        && (*addr == txn.receiver || *addr == txn.close_remainder_to)
+}
+
+/// Debit the rewards pool for rewards just distributed.
+pub(crate) fn debit_rewards_pool<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    total_rewards: u64,
+) -> Result<(), AlgoError> {
+    if total_rewards > 0 {
+        let rewards_pool_addr = store.rewards_pool();
+        let mut pool = store.get_or_default_account(&rewards_pool_addr);
+        if pool.micro_algos < total_rewards {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "rewards pool balance {} insufficient for {} in rewards",
+                    pool.micro_algos, total_rewards,
+                ),
+            });
+        }
+        pool.micro_algos -= total_rewards;
+        store.set_account(&rewards_pool_addr, pool);
+    }
+    Ok(())
+}
+
+/// Rewards earned per role by one rewards pass.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct RewardsPassOutcome {
+    pub total: u64,
+    pub sender_rewards: u64,
+    pub receiver_rewards: u64,
+    pub close_rewards: u64,
+}
+
+/// go's per-transaction `WithUpdatedRewards` pass over the transaction's
+/// participants (`roundCowState.Move`, `ledger/eval/eval.go` L567-618),
+/// shared by top-level transactions and inner transactions (go's
+/// `roundCowState.Perform`, `ledger/eval/applications.go`, runs the very same
+/// `takeFee`/`apply.Payment` -> `Move` path). `rewards_level` is required so a
+/// caller cannot silently skip the pass (issue #1731).
+pub(crate) fn apply_rewards_pass<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    txn: &algo_types::Transaction,
+    reward_addrs: &[Address],
+    rewards_level: u64,
+    consensus: &ConsensusParams,
+) -> RewardsPassOutcome {
+    let mut out = RewardsPassOutcome::default();
+    for addr in reward_addrs {
+        let account_before = store.get_or_default_account(addr);
+        let mut account = account_before.clone();
+        let reward = apply_rewards(&mut account, rewards_level);
+        out.total += reward;
+
+        // UnfundedSenders (go-algorand v34+, `config/consensus.go`):
+        // don't force a zero-balance account into on-disk existence
+        // merely by bumping its RewardsBase, when this transaction
+        // doesn't otherwise move algos through it. Mirrors go's
+        // `roundCowState.Move` (`ledger/eval/eval.go`), whose
+        // fee-payment call site (`cs.Move(tx.Sender, ep.Specials.FeeSink,
+        // tx.Fee, ...)`, `ledger/eval/eval.go`) writes the sender's
+        // updated account only if
+        // `!amt.IsZero() || fromBal.RewardUnits(...) > 0 ||
+        // !proto.UnfundedSenders`. Scoped here to the sender/fee case,
+        // the one universally-applicable across every txn type (every
+        // transaction's sender pays `txn.fee`, possibly zero under fee
+        // pooling); other reward_addrs roles keep the unconditional
+        // write.
+        //
+        // Issue #1654: the same `Move` guard applies to the payment
+        // receiver -- a zero-amount `pay` to a zero-balance account must
+        // not write it (live mainnet block 65539696 paid 0 to a
+        // non-existent account; the rewards write made it non-default
+        // and tripped the min-balance check).
+        //
+        // The pass only visits `reward_participants` (fee payer, pay receiver
+        // and close-to), so the asset-participant cases of issue #1654
+        // (live mainnet block 65582745) cannot arise here any more: go never
+        // runs `Move` on them (see `reward_participants`).
+        let unwritten_sender = *addr == txn.sender && txn.fee == 0;
+        let unwritten_pay_receiver = *addr != txn.sender
+            && *addr == txn.receiver
+            && txn.txn_type == "pay"
+            && txn.amount == 0;
+        // Issue #1729: the receiver and close-to target of a `pay` are
+        // written by go's `Move` only when it actually credits them
+        // (`!amt.IsZero() || units > 0 || !UnfundedSenders`), each time
+        // after `WithUpdatedRewards`. `apply_pay` performs that
+        // credit and brings both up to the current level via
+        // `apply_rewards`, so an empty (absent/default) receiver or
+        // close-to target is left untouched by this pass and stamped there.
+        let pay_credit_role = is_pay_credit_role(txn, addr);
+        let unwritten_role = unwritten_sender || pay_credit_role;
+        let skip_write = consensus.unfunded_senders
+            && unwritten_role
+            && account_before.micro_algos == 0
+            && reward == 0
+            && (unwritten_sender
+                || unwritten_pay_receiver
+                // Issue #1669 (live mainnet block 65668288): an account
+                // that was zeroed earlier may linger as a default
+                // record; go treats it exactly like a missing one.
+                || store
+                    .get_account(addr)
+                    .is_none_or(|a| a == algo_types::AccountData::default()));
+        if !skip_write {
+            store.set_account(addr, account);
+        }
+
+        // Track per-address rewards.
+        // go-algorand's block evaluator (`ledger/eval/eval.go`): "If the
+        // protocol does not support rewards in ApplyData, clear them
+        // out" -- `if !params.RewardsInApplyData { ad.SenderRewards =
+        // ...; ad.ReceiverRewards = ...; ad.CloseRewards = ... }`.
+        // Before v15, ApplyData never carries these fields even though
+        // the account's actual reward accrual above is unaffected.
+        if consensus.rewards_in_apply_data {
+            if *addr == txn.sender {
+                out.sender_rewards += reward;
+            } else if *addr == txn.receiver {
+                out.receiver_rewards += reward;
+            } else if *addr == txn.close_remainder_to {
+                out.close_rewards += reward;
+            }
+        }
+    }
+    out
+}
+
 /// Body of `apply_transaction_inner` extracted into a helper so the
 /// `?`-based control flow doesn't have to live inside an IIFE that
 /// captured `tracer` and `store` simultaneously. The outer
@@ -3268,97 +3445,11 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
     {
         let mut apply_data = ApplyData::default();
 
-        // Apply rewards to transaction participants only (not snapshot-only addresses).
-        let mut total_rewards: u64 = 0;
-        for addr in reward_addrs {
-            let account_before = store.get_or_default_account(addr);
-            let mut account = account_before.clone();
-            let reward = apply_rewards(&mut account, ctx.rewards_level);
-            total_rewards += reward;
-
-            // UnfundedSenders (go-algorand v34+, `config/consensus.go`):
-            // don't force a zero-balance account into on-disk existence
-            // merely by bumping its RewardsBase, when this transaction
-            // doesn't otherwise move algos through it. Mirrors go's
-            // `roundCowState.Move` (`ledger/eval/eval.go`), whose
-            // fee-payment call site (`cs.Move(tx.Sender, ep.Specials.FeeSink,
-            // tx.Fee, ...)`, `ledger/eval/eval.go`) writes the sender's
-            // updated account only if
-            // `!amt.IsZero() || fromBal.RewardUnits(...) > 0 ||
-            // !proto.UnfundedSenders`. Scoped here to the sender/fee case,
-            // the one universally-applicable across every txn type (every
-            // transaction's sender pays `txn.fee`, possibly zero under fee
-            // pooling); other reward_addrs roles keep the unconditional
-            // write.
-            //
-            // Issue #1654: the same `Move` guard applies to the payment
-            // receiver -- a zero-amount `pay` to a zero-balance account must
-            // not write it (live mainnet block 65539696 paid 0 to a
-            // non-existent account; the rewards write made it non-default
-            // and tripped the min-balance check).
-            //
-            // Issue #1654 (live mainnet block 65582745: an axfer closing a
-            // holding of a destroyed asset out to its long-closed creator
-            // account): the non-sender participants of non-payment
-            // transactions (asset receiver/close-to/clawback source, freeze
-            // target) are never `Move`d in go, so an address of that kind
-            // that does not exist must not be materialised here either --
-            // the stub (rewards_base = current level) is not
-            // `AccountData::default()` and fails the min-balance check. (A
-            // payment receiver with amount > 0 *is* written by go's `Move`,
-            // with its rewards_base brought up to the current level, so it
-            // keeps the write.)
-            let unwritten_sender = *addr == txn.sender && txn.fee == 0;
-            let unwritten_pay_receiver = *addr != txn.sender
-                && *addr == txn.receiver
-                && txn.txn_type == "pay"
-                && txn.amount == 0;
-            let unwritten_non_pay_participant = *addr != txn.sender && txn.txn_type != "pay";
-            // Issue #1729: the receiver and close-to target of a `pay` are
-            // written by go's `Move` only when it actually credits them
-            // (`!amt.IsZero() || units > 0 || !UnfundedSenders`), each time
-            // after `WithUpdatedRewards`. `apply_pay_at_level` performs that
-            // credit and brings both up to the current level via
-            // `apply_rewards`, so an empty (absent/default) receiver or
-            // close-to target is left untouched by this pass and stamped there.
-            let pay_credit_role = txn.txn_type == "pay"
-                && *addr != txn.sender
-                && (*addr == txn.receiver || *addr == txn.close_remainder_to);
-            let unwritten_role =
-                unwritten_sender || unwritten_non_pay_participant || pay_credit_role;
-            let skip_write = ctx.consensus.unfunded_senders
-                && unwritten_role
-                && account_before.micro_algos == 0
-                && reward == 0
-                && (unwritten_sender
-                    || unwritten_pay_receiver
-                    // Issue #1669 (live mainnet block 65668288): an account
-                    // that was zeroed earlier may linger as a default
-                    // record; go treats it exactly like a missing one.
-                    || store
-                        .get_account(addr)
-                        .is_none_or(|a| a == algo_types::AccountData::default()));
-            if !skip_write {
-                store.set_account(addr, account);
-            }
-
-            // Track per-address rewards.
-            // go-algorand's block evaluator (`ledger/eval/eval.go`): "If the
-            // protocol does not support rewards in ApplyData, clear them
-            // out" -- `if !params.RewardsInApplyData { ad.SenderRewards =
-            // ...; ad.ReceiverRewards = ...; ad.CloseRewards = ... }`.
-            // Before v15, ApplyData never carries these fields even though
-            // the account's actual reward accrual above is unaffected.
-            if ctx.consensus.rewards_in_apply_data {
-                if *addr == txn.sender {
-                    apply_data.sender_rewards += reward;
-                } else if *addr == txn.receiver {
-                    apply_data.receiver_rewards += reward;
-                } else if *addr == txn.close_remainder_to {
-                    apply_data.close_rewards += reward;
-                }
-            }
-        }
+        let pass = apply_rewards_pass(store, txn, reward_addrs, ctx.rewards_level, &ctx.consensus);
+        let total_rewards = pass.total;
+        apply_data.sender_rewards += pass.sender_rewards;
+        apply_data.receiver_rewards += pass.receiver_rewards;
+        apply_data.close_rewards += pass.close_rewards;
 
         // Handle rekey_to BEFORE type-specific apply (matching Go's ordering:
         // rewards -> rekey -> type-specific dispatch).
@@ -3376,7 +3467,7 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
         match txn.txn_type.as_str() {
             "pay" => {
                 apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink, &ctx.consensus)?;
-                let ad = apply_pay_at_level(store, &stx.txn, Some(ctx.rewards_level))?;
+                let ad = apply_pay(store, &stx.txn, ctx.rewards_level)?;
                 apply_data.closing_amount = ad.closing_amount;
             }
             "acfg" => {
@@ -3482,20 +3573,7 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
         }
 
         // Debit rewards pool for distributed rewards.
-        if total_rewards > 0 {
-            let rewards_pool_addr = store.rewards_pool();
-            let mut pool = store.get_or_default_account(&rewards_pool_addr);
-            if pool.micro_algos < total_rewards {
-                return Err(AlgoError::Ledger {
-                    message: format!(
-                        "rewards pool balance {} insufficient for {} in rewards",
-                        pool.micro_algos, total_rewards,
-                    ),
-                });
-            }
-            pool.micro_algos -= total_rewards;
-            store.set_account(&rewards_pool_addr, pool);
-        }
+        debit_rewards_pool(store, total_rewards)?;
 
         // Check min balance for all touched accounts after the transaction.
         // Go checks all modified accounts per-transaction (skipping FeeSink,
@@ -3713,29 +3791,19 @@ fn apply_fee<L: crate::store_trait::LedgerStore>(
 /// Returns `InnerApplyData` with `closing_amount` populated when applicable.
 ///
 /// Used by both outer dispatch (after `apply_fee`) and inner transaction dispatch.
+///
+/// The receiver and close-to account are brought up to `rewards_level` when
+/// credited (issues #1729, #1731): go's `Move` (`ledger/eval/eval.go`
+/// ~L567-618) runs `WithUpdatedRewards` (`data/basics/userBalance.go`
+/// L453-473) on the target before crediting it, so an account the earlier
+/// rewards pass left untouched (empty, `UnfundedSenders`) ends up with
+/// `rewards_base` = the current level. When the pass already updated it the
+/// call is a no-op. The level is a required parameter so no caller (inner
+/// transactions included) can skip it.
 pub fn apply_pay<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     txn: &algo_types::Transaction,
-) -> Result<InnerApplyData, AlgoError> {
-    apply_pay_at_level(store, txn, None)
-}
-
-/// [`apply_pay`] that also brings the close-to account's rewards up to
-/// `rewards_level` when it is credited (issue #1729).
-///
-/// go's close `Move(sender, CloseRemainderTo, closeAmount)`
-/// (`ledger/apply/payment.go` L47-52; `ledger/eval/eval.go` `Move`
-/// ~L568-618) runs `WithUpdatedRewards` (`data/basics/userBalance.go`
-/// L453-473) on the target before crediting it, so an account the earlier
-/// rewards pass left untouched (empty, `UnfundedSenders`) ends up with
-/// `rewards_base` = the current level. `apply_rewards` is that helper; the
-/// target holds 0 µAlgo at this point in the skipped case, so no reward accrues,
-/// and when the pass already updated it, the call is a no-op. `None` (inner
-/// transactions, whose context carries no level) keeps the old behaviour.
-pub fn apply_pay_at_level<L: crate::store_trait::LedgerStore>(
-    store: &mut L,
-    txn: &algo_types::Transaction,
-    rewards_level: Option<u64>,
+    rewards_level: u64,
 ) -> Result<InnerApplyData, AlgoError> {
     let mut ad = InnerApplyData::default();
 
@@ -3764,9 +3832,7 @@ pub fn apply_pay_at_level<L: crate::store_trait::LedgerStore>(
 
         if txn.amount > 0 {
             let mut receiver = store.get_or_default_account(&txn.receiver);
-            if let Some(level) = rewards_level {
-                crate::rewards::apply_rewards(&mut receiver, level);
-            }
+            crate::rewards::apply_rewards(&mut receiver, rewards_level);
             receiver.micro_algos += txn.amount;
             store.set_account(&txn.receiver, receiver);
         }
@@ -3836,9 +3902,7 @@ pub fn apply_pay_at_level<L: crate::store_trait::LedgerStore>(
         // Credit close-to address.
         if close_amount > 0 {
             let mut close_to = store.get_or_default_account(&txn.close_remainder_to);
-            if let Some(level) = rewards_level {
-                crate::rewards::apply_rewards(&mut close_to, level);
-            }
+            crate::rewards::apply_rewards(&mut close_to, rewards_level);
             close_to.micro_algos += close_amount;
             store.set_account(&txn.close_remainder_to, close_to);
         }
@@ -4972,6 +5036,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                         ph,
                         ctx.genesis_hash,
                         ctx.consensus.clone(),
+                        ctx.rewards_level,
                     );
                     avm_ctx.set_program_version(
                         algo_avm::bytecode::parse(&clear_program)
@@ -5146,6 +5211,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     ph,
                     ctx.genesis_hash,
                     ctx.consensus.clone(),
+                    ctx.rewards_level,
                 );
                 avm_ctx.set_program_version(
                     algo_avm::bytecode::parse(&approval_program)
@@ -10596,13 +10662,12 @@ return
         );
     }
 
-    /// (e) KNOWN GAP, tracked in #1731 and NOT covered by the #1729 fix:
-    /// inner transactions apply no rewards, so this test is ignored. An app account closed out by an inner
-    /// `pay` (amount 0, receiver == close_remainder_to == a fresh account)
-    /// must leave the target stamped at the block's rewards level, as go's
-    /// close `Move` does for inner transactions too.
+    /// (e) Issue #1731: an app account closed out by an inner `pay` (amount 0,
+    /// receiver == close_remainder_to == a fresh account) must leave the
+    /// target stamped at the block's rewards level, as go's close `Move`
+    /// does for inner transactions too (`Perform` -> `apply.Payment` ->
+    /// `roundCowState.Move`, `ledger/eval/applications.go`/`eval.go`).
     #[test]
-    #[ignore = "known gap tracked in #1731: inner transactions apply no rewards"]
     fn issue_1729_execute_inner_pay_close_to_new_account_gets_rewards_base() {
         let creator = Address([1u8; 32]);
         let target = Address([5u8; 32]);
@@ -10678,6 +10743,575 @@ return
             .expect("close-to account written");
         assert_eq!(t.micro_algos, 300_000);
         assert_eq!(t.rewards_base, 218_288);
+    }
+
+    /// Issue #1732: a NotParticipating pay receiver/sender keeps its
+    /// `rewards_base` through the top-level rewards pass (go's
+    /// `WithUpdatedRewards` returns it unchanged).
+    #[test]
+    fn issue_1732_not_participating_accounts_keep_rewards_base_through_pay() {
+        let sender = Address([1u8; 32]);
+        let receiver = Address([5u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([9u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[
+                (sender, 20_000_000),
+                (receiver, 5_000_000),
+                (fee_sink, 0),
+                (rewards_pool, 10_000_000),
+            ],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+        for a in [sender, receiver] {
+            let mut acct = state.get_account(&a).unwrap().clone();
+            acct.rewards_base = 5;
+            acct.status = algo_types::AccountStatus::NotParticipating;
+            crate::store_trait::LedgerStore::set_account(&mut state, &a, acct);
+        }
+        let block = Block {
+            round: Round(1),
+            fee_sink,
+            rewards_pool,
+            rewards_level: 218_288,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![pay_txn(sender, receiver, 1_000, 1_000)],
+            ..Block::default()
+        };
+        apply_block_with_delta_mode(&mut state, &block, ApplyMode::Execute).unwrap();
+        for a in [sender, receiver] {
+            let acct = state.get_account(&a).unwrap();
+            assert_eq!(acct.rewards_base, 5, "NotParticipating base must not move");
+            assert_eq!(acct.rewarded_micro_algos, 0);
+        }
+        assert_eq!(state.get_account(&receiver).unwrap().micro_algos, 5_001_000);
+    }
+
+    /// Issue #1731: an inner `pay` to an existing account with pending rewards
+    /// must bring BOTH sides up to the block's rewards level exactly like go's
+    /// `Move` (`WithUpdatedRewards` on sender and receiver,
+    /// `ledger/eval/eval.go` ~L567-618), and record the inner
+    /// `SenderRewards`/`ReceiverRewards` in the inner ApplyData.
+    #[test]
+    fn issue_1731_execute_inner_pay_applies_rewards_to_sender_and_receiver() {
+        let creator = Address([1u8; 32]);
+        let target = Address([5u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([9u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[
+                (creator, 20_000_000),
+                (target, 5_000_000),
+                (fee_sink, 0),
+                (rewards_pool, 10_000_000),
+            ],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+        issue_1729_set_base(&mut state, creator, 218_288);
+        issue_1729_set_base(&mut state, target, 218_000);
+        let target_hex: String = target.0.iter().map(|b| format!("{b:02x}")).collect();
+        let approval_src = format!(
+            "#pragma version 8
+            txn ApplicationID
+            bz approve
+            itxn_begin
+            int pay
+            itxn_field TypeEnum
+            byte 0x{target_hex}
+            itxn_field Receiver
+            int 1000
+            itxn_field Amount
+            itxn_submit
+            approve:
+            int 1
+            return
+"
+        );
+        let approval = algo_avm::assembler::assemble_string(&approval_src)
+            .expect("approval program must assemble")
+            .program;
+        let clear = algo_avm::assembler::assemble_string(
+            "#pragma version 8
+int 1
+return
+",
+        )
+        .unwrap()
+        .program;
+        let mk_block = |round: u64, payset: Vec<SignedTransaction>| Block {
+            round: Round(round),
+            fee_sink,
+            rewards_pool,
+            rewards_level: 218_288,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset,
+            ..Block::default()
+        };
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = creator;
+        create.txn.fee = 1_000;
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        let d1 =
+            apply_block_with_delta_mode(&mut state, &mk_block(1, vec![create]), ApplyMode::Execute)
+                .unwrap();
+        let (&app_id, _) = d1.creatables.iter().next().unwrap();
+        let app_addr = Address(crate::avm_context::app_address(app_id));
+        // 2.5 Algo: 2 whole reward units; the app account has never been
+        // touched by a rewards pass, so its base is 0.
+        let fund = pay_txn(creator, app_addr, 2_500_000, 1_000);
+        apply_block_with_delta_mode(&mut state, &mk_block(2, vec![fund]), ApplyMode::Execute)
+            .unwrap();
+        let app_before = state.get_account(&app_addr).unwrap().clone();
+        assert_eq!(
+            app_before.rewards_base, 218_288,
+            "outer fund pass stamps it"
+        );
+        // Re-open the pending gap on the app account so the inner Move has
+        // something to pay out.
+        issue_1729_set_base(&mut state, app_addr, 218_000);
+        let mut call = SignedTransaction::default();
+        call.txn.txn_type = "appl".into();
+        call.txn.sender = creator;
+        call.txn.fee = 2_000;
+        call.txn.application_id = app_id;
+        apply_block_with_delta_mode(&mut state, &mk_block(3, vec![call]), ApplyMode::Execute)
+            .expect("inner pay must apply");
+        let t = state.get_account(&target).unwrap();
+        // 5 whole units * (218_288 - 218_000) = 1_440 pending, plus the 1_000.
+        assert_eq!(t.micro_algos, 5_000_000 + 1_440 + 1_000);
+        assert_eq!(t.rewards_base, 218_288);
+        assert_eq!(t.rewarded_micro_algos, 1_440);
+        let a = state.get_account(&app_addr).unwrap();
+        // 2 whole units * 288 = 576 pending on the sender side.
+        assert_eq!(a.rewards_base, 218_288);
+        assert_eq!(a.rewarded_micro_algos, 576);
+        assert_eq!(a.micro_algos, 2_500_000 + 576 - 1_000);
+    }
+
+    /// `(micro_algos, rewards_base, rewarded_micro_algos)`; `update_round`
+    /// bookkeeping legitimately changes when a holding is touched.
+    fn issue_1731_rewards_view(a: &algo_types::AccountData) -> (u64, u64, u64) {
+        (a.micro_algos, a.rewards_base, a.rewarded_micro_algos)
+    }
+
+    fn issue_1731_hex(a: &Address) -> String {
+        a.0.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn issue_1731_block(
+        round: u64,
+        fee_sink: Address,
+        rewards_pool: Address,
+        payset: Vec<SignedTransaction>,
+        txn_counter: u64,
+    ) -> Block {
+        Block {
+            txn_counter,
+            round: Round(round),
+            fee_sink,
+            rewards_pool,
+            rewards_level: 218_288,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset,
+            ..Block::default()
+        }
+    }
+
+    fn issue_1731_app_create(creator: Address, approval_src: &str) -> SignedTransaction {
+        let approval = algo_avm::assembler::assemble_string(approval_src)
+            .expect("approval program must assemble")
+            .program;
+        let clear = algo_avm::assembler::assemble_string("#pragma version 8\nint 1\nreturn\n")
+            .unwrap()
+            .program;
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = creator;
+        create.txn.fee = 1_000;
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        create
+    }
+
+    fn issue_1731_app_call(creator: Address, app_id: u64, fee: u64) -> SignedTransaction {
+        let mut call = SignedTransaction::default();
+        call.txn.txn_type = "appl".into();
+        call.txn.sender = creator;
+        call.txn.fee = fee;
+        call.txn.application_id = app_id;
+        call
+    }
+
+    /// Creates an app from `approval_src`, funds its account with `fund`
+    /// and re-opens its pending-rewards gap to `base`; returns
+    /// `(app_id, app_addr)`. Uses block rounds 1 and 2.
+    fn issue_1731_deploy(
+        state: &mut LedgerState,
+        creator: Address,
+        fee_sink: Address,
+        rewards_pool: Address,
+        approval_src: &str,
+        fund: u64,
+        base: u64,
+    ) -> (u64, Address) {
+        let round = 1;
+        let d = apply_block_with_delta_mode(
+            state,
+            &issue_1731_block(
+                round,
+                fee_sink,
+                rewards_pool,
+                vec![issue_1731_app_create(creator, approval_src)],
+                1,
+            ),
+            ApplyMode::Execute,
+        )
+        .unwrap();
+        let (&app_id, _) = d.creatables.iter().next().unwrap();
+        let app_addr = Address(crate::avm_context::app_address(app_id));
+        let fund_txn = pay_txn(creator, app_addr, fund, 1_000);
+        apply_block_with_delta_mode(
+            state,
+            &issue_1731_block(round + 1, fee_sink, rewards_pool, vec![fund_txn], 2),
+            ApplyMode::Execute,
+        )
+        .unwrap();
+        issue_1729_set_base(state, app_addr, base);
+        (app_id, app_addr)
+    }
+
+    fn issue_1731_pay_program(target: &Address) -> String {
+        format!(
+            "#pragma version 8
+            txn ApplicationID
+            bz approve
+            itxn_begin
+            int pay
+            itxn_field TypeEnum
+            byte 0x{}
+            itxn_field Receiver
+            int 1000
+            itxn_field Amount
+            itxn_submit
+            approve:
+            int 1
+            return
+",
+            issue_1731_hex(target)
+        )
+    }
+
+    /// Pool insufficiency during the inner rewards pass fails the call with
+    /// the same error as the top-level pass (go never lets the pool go
+    /// negative), instead of minting rewards from nothing.
+    #[test]
+    fn issue_1731_inner_pass_fails_when_rewards_pool_cannot_cover_rewards() {
+        let creator = Address([1u8; 32]);
+        let target = Address([5u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([9u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[
+                (creator, 20_000_000),
+                (target, 5_000_000),
+                (fee_sink, 0),
+                (rewards_pool, 0),
+            ],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+        issue_1729_set_base(&mut state, creator, 218_288);
+        issue_1729_set_base(&mut state, target, 218_000);
+        let (app_id, _) = issue_1731_deploy(
+            &mut state,
+            creator,
+            fee_sink,
+            rewards_pool,
+            &issue_1731_pay_program(&target),
+            2_500_000,
+            218_000,
+        );
+        let before_target = state.get_account(&target).unwrap().clone();
+        let err = apply_block_with_delta_mode(
+            &mut state,
+            &issue_1731_block(
+                3,
+                fee_sink,
+                rewards_pool,
+                vec![issue_1731_app_call(creator, app_id, 2_000)],
+                0,
+            ),
+            ApplyMode::Execute,
+        )
+        .expect_err("inner pass must fail with an empty rewards pool");
+        assert!(
+            err.to_string().contains("rewards pool balance"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(state.get_account(&target).unwrap(), &before_target);
+    }
+
+    /// A depth-2 inner payment (outer app -> inner app call -> inner pay)
+    /// inherits the block's rewards level (`execute_inner_appl` propagation).
+    #[test]
+    fn issue_1731_nested_inner_app_call_inherits_rewards_level() {
+        let creator = Address([1u8; 32]);
+        let target = Address([5u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([9u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[
+                (creator, 20_000_000),
+                (target, 5_000_000),
+                (fee_sink, 0),
+                (rewards_pool, 10_000_000),
+            ],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+        issue_1729_set_base(&mut state, creator, 218_288);
+        issue_1729_set_base(&mut state, target, 218_000);
+        // App B (inner-inner) pays the target.
+        let (b_id, b_addr) = issue_1731_deploy(
+            &mut state,
+            creator,
+            fee_sink,
+            rewards_pool,
+            &issue_1731_pay_program(&target),
+            2_500_000,
+            218_000,
+        );
+        // App A calls B.
+        let a_src = format!(
+            "#pragma version 8
+            txn ApplicationID
+            bz approve
+            itxn_begin
+            int appl
+            itxn_field TypeEnum
+            int {b_id}
+            itxn_field ApplicationID
+            itxn_submit
+            approve:
+            int 1
+            return
+"
+        );
+        let d = apply_block_with_delta_mode(
+            &mut state,
+            &issue_1731_block(
+                3,
+                fee_sink,
+                rewards_pool,
+                vec![issue_1731_app_create(creator, &a_src)],
+                3,
+            ),
+            ApplyMode::Execute,
+        )
+        .unwrap();
+        let a_id = *d.creatables.keys().find(|k| **k != b_id).unwrap();
+        let mut call = issue_1731_app_call(creator, a_id, 3_000);
+        call.txn.foreign_apps = Some(vec![b_id]);
+        apply_block_with_delta_mode(
+            &mut state,
+            &issue_1731_block(4, fee_sink, rewards_pool, vec![call], 6),
+            ApplyMode::Execute,
+        )
+        .expect("nested inner pay must apply");
+        let t = state.get_account(&target).unwrap();
+        assert_eq!(t.rewards_base, 218_288);
+        assert_eq!(t.rewarded_micro_algos, 1_440);
+        assert_eq!(t.micro_algos, 5_000_000 + 1_440 + 1_000);
+        let b = state.get_account(&b_addr).unwrap();
+        assert_eq!(b.rewards_base, 218_288);
+        assert_eq!(b.rewarded_micro_algos, 576);
+    }
+
+    /// go runs `WithUpdatedRewards` only through `Move` (fee payer, pay
+    /// receiver, pay close-to): asset operations read their accounts with
+    /// `balances.Get(addr, false)` (`ledger/apply/asset.go` L59/L124/L294/
+    /// L344) and never bring a clawback source, asset receiver, asset
+    /// close-to or freeze target up to the rewards level.
+    #[test]
+    fn issue_1731_asset_participants_are_not_rewarded_top_level() {
+        let creator = Address([1u8; 32]);
+        let user = Address([2u8; 32]);
+        let clawback_addr = Address([5u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([9u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[
+                (creator, 10_000_000),
+                (user, 10_000_000),
+                (clawback_addr, 10_000_000),
+                (fee_sink, 0),
+                (rewards_pool, 10_000_000),
+            ],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+        let setup_ctx = ApplyContext::new_replay(0, fee_sink, 1);
+        let params = AssetParams {
+            total: 1_000,
+            manager: Some(creator),
+            clawback: Some(clawback_addr),
+            freeze: Some(creator),
+            ..Default::default()
+        };
+        create_asset_in_state(&mut state, &setup_ctx, creator, 42, params);
+        state.asset_holdings.insert(
+            (user, 42),
+            AssetHolding {
+                amount: 500,
+                frozen: false,
+            },
+        );
+        state
+            .get_or_default_account_mut(&user)
+            .total_assets_opted_in += 1;
+        state.asset_holdings.get_mut(&(creator, 42)).unwrap().amount = 500;
+        for a in [creator, user, clawback_addr] {
+            issue_1729_set_base(&mut state, a, 0);
+        }
+        let pool_before = state.get_account(&rewards_pool).unwrap().micro_algos;
+        let creator_before = state.get_account(&creator).unwrap().clone();
+        let user_before = state.get_account(&user).unwrap().clone();
+
+        let ctx = ApplyContext::new_replay(100, fee_sink, 2);
+        // Clawback: sender = clawback (fee payer, rewarded); source = user,
+        // receiver = creator (not rewarded).
+        let mut claw = SignedTransaction::default();
+        claw.txn.txn_type = "axfer".into();
+        claw.txn.sender = clawback_addr;
+        claw.txn.fee = 1_000;
+        claw.txn.xaid = 42;
+        claw.txn.asset_amount = 200;
+        claw.txn.asset_sender = Some(user);
+        claw.txn.asset_receiver = Some(creator);
+        apply_transaction(&mut state, &claw, &ctx, 0).unwrap();
+        let cb = state.get_account(&clawback_addr).unwrap();
+        assert_eq!(cb.rewards_base, 100, "fee payer is rewarded");
+        assert_eq!(cb.rewarded_micro_algos, 1_000);
+        assert_eq!(
+            state.get_account(&rewards_pool).unwrap().micro_algos,
+            pool_before - 1_000,
+            "only the fee payer's reward leaves the pool"
+        );
+        assert_eq!(
+            issue_1731_rewards_view(state.get_account(&user).unwrap()),
+            issue_1731_rewards_view(&user_before)
+        );
+        assert_eq!(
+            issue_1731_rewards_view(state.get_account(&creator).unwrap()),
+            issue_1731_rewards_view(&creator_before)
+        );
+
+        // Freeze: sender = creator (rewarded); target = user (not).
+        let mut frz = SignedTransaction::default();
+        frz.txn.txn_type = "afrz".into();
+        frz.txn.sender = creator;
+        frz.txn.fee = 1_000;
+        frz.txn.freeze_asset = 42;
+        frz.txn.freeze_account = Some(user);
+        frz.txn.asset_frozen = true;
+        apply_transaction(&mut state, &frz, &ctx, 0).unwrap();
+        assert_eq!(
+            issue_1731_rewards_view(state.get_account(&user).unwrap()),
+            issue_1731_rewards_view(&user_before)
+        );
+        assert!(state.get_asset_holding(&user, 42).unwrap().frozen);
+        assert_eq!(state.get_account(&creator).unwrap().rewards_base, 100);
+    }
+
+    /// Same rule for inner transactions: an inner `afrz` rewards the app
+    /// account (fee payer) but not the freeze target.
+    #[test]
+    fn issue_1731_inner_afrz_target_is_not_rewarded() {
+        let creator = Address([1u8; 32]);
+        let user = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([9u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[
+                (creator, 20_000_000),
+                (user, 5_000_000),
+                (fee_sink, 0),
+                (rewards_pool, 10_000_000),
+            ],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+        issue_1729_set_base(&mut state, creator, 218_288);
+        let src = format!(
+            "#pragma version 8
+            txn ApplicationID
+            bz approve
+            itxn_begin
+            int afrz
+            itxn_field TypeEnum
+            int 42
+            itxn_field FreezeAsset
+            byte 0x{}
+            itxn_field FreezeAssetAccount
+            int 1
+            itxn_field FreezeAssetFrozen
+            itxn_submit
+            approve:
+            int 1
+            return
+",
+            issue_1731_hex(&user)
+        );
+        let (app_id, app_addr) = issue_1731_deploy(
+            &mut state,
+            creator,
+            fee_sink,
+            rewards_pool,
+            &src,
+            2_500_000,
+            218_000,
+        );
+        let setup_ctx = ApplyContext::new_replay(218_288, fee_sink, 1);
+        let params = AssetParams {
+            total: 1_000,
+            manager: Some(creator),
+            freeze: Some(app_addr),
+            ..Default::default()
+        };
+        create_asset_in_state(&mut state, &setup_ctx, creator, 42, params);
+        state.asset_holdings.insert(
+            (user, 42),
+            AssetHolding {
+                amount: 100,
+                frozen: false,
+            },
+        );
+        state
+            .get_or_default_account_mut(&user)
+            .total_assets_opted_in += 1;
+        issue_1729_set_base(&mut state, user, 218_000);
+        let user_before = state.get_account(&user).unwrap().clone();
+        let mut call = issue_1731_app_call(creator, app_id, 2_000);
+        call.txn.foreign_assets = Some(vec![42]);
+        call.txn.accounts = Some(vec![user]);
+        apply_block_with_delta_mode(
+            &mut state,
+            &issue_1731_block(3, fee_sink, rewards_pool, vec![call], 0),
+            ApplyMode::Execute,
+        )
+        .expect("inner afrz must apply");
+        assert!(state.get_asset_holding(&user, 42).unwrap().frozen);
+        assert_eq!(
+            issue_1731_rewards_view(state.get_account(&user).unwrap()),
+            issue_1731_rewards_view(&user_before)
+        );
+        let a = state.get_account(&app_addr).unwrap();
+        assert_eq!(a.rewards_base, 218_288, "inner fee payer is rewarded");
+        assert_eq!(a.rewarded_micro_algos, 576);
     }
 
     /// Issue #1660: go's `BlockEvaluator.transaction` (`ledger/eval/eval.go`)
