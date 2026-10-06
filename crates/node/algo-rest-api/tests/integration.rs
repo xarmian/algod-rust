@@ -6968,7 +6968,7 @@ async fn pending_transaction_info_with_global_state_delta() {
     let txid = algo_codec::compute_txn_id(&stxn.txn);
     let txid_str = txid.to_string();
 
-    // Build an eval_delta with a global state delta: key="counter", action=1 (SetUint), ui=42
+    // Build an eval_delta with a global state delta: key="counter", action=2 (SetUintAction, go data/basics/teal.go), ui=42
     let eval_delta = rmpv::Value::Map(vec![(
         rmpv::Value::String("gd".into()),
         rmpv::Value::Map(vec![(
@@ -6976,7 +6976,7 @@ async fn pending_transaction_info_with_global_state_delta() {
             rmpv::Value::Map(vec![
                 (
                     rmpv::Value::String("at".into()),
-                    rmpv::Value::Integer(1.into()),
+                    rmpv::Value::Integer(2.into()),
                 ),
                 (
                     rmpv::Value::String("ui".into()),
@@ -7025,7 +7025,7 @@ async fn pending_transaction_info_with_global_state_delta() {
 
     let entry = &gsd_arr[0];
     assert_eq!(entry["key"].as_str().unwrap(), STANDARD.encode(b"counter"));
-    assert_eq!(entry["value"]["action"].as_u64().unwrap(), 1);
+    assert_eq!(entry["value"]["action"].as_u64().unwrap(), 2);
     assert_eq!(entry["value"]["uint"].as_u64().unwrap(), 42);
     // bytes should be omitted when empty
     assert!(entry["value"].get("bytes").is_none());
@@ -7045,7 +7045,7 @@ async fn pending_transaction_info_with_local_state_delta() {
     let txid = algo_codec::compute_txn_id(&stxn.txn);
     let txid_str = txid.to_string();
 
-    // Build an eval_delta with local state delta: index=1 (first account), key="balance", action=1, ui=100
+    // Build an eval_delta with local state delta: index=1 (first account), key="balance", action=2 (SetUintAction), ui=100
     let eval_delta = rmpv::Value::Map(vec![(
         rmpv::Value::String("ld".into()),
         rmpv::Value::Map(vec![(
@@ -7055,7 +7055,7 @@ async fn pending_transaction_info_with_local_state_delta() {
                 rmpv::Value::Map(vec![
                     (
                         rmpv::Value::String("at".into()),
-                        rmpv::Value::Integer(1.into()),
+                        rmpv::Value::Integer(2.into()),
                     ),
                     (
                         rmpv::Value::String("ui".into()),
@@ -7112,7 +7112,7 @@ async fn pending_transaction_info_with_local_state_delta() {
         delta[0]["key"].as_str().unwrap(),
         STANDARD.encode(b"balance")
     );
-    assert_eq!(delta[0]["value"]["action"].as_u64().unwrap(), 1);
+    assert_eq!(delta[0]["value"]["action"].as_u64().unwrap(), 2);
     assert_eq!(delta[0]["value"]["uint"].as_u64().unwrap(), 100);
 }
 
@@ -7253,7 +7253,7 @@ async fn pending_transaction_info_with_bytes_state_delta() {
     let txid = algo_codec::compute_txn_id(&stxn.txn);
     let txid_str = txid.to_string();
 
-    // Build an eval_delta with a global state delta: action=2 (SetBytes), bs=b"data"
+    // Build an eval_delta with a global state delta: action=1 (SetBytesAction, go data/basics/teal.go), bs=b"data"
     let eval_delta = rmpv::Value::Map(vec![(
         rmpv::Value::String("gd".into()),
         rmpv::Value::Map(vec![(
@@ -7261,7 +7261,7 @@ async fn pending_transaction_info_with_bytes_state_delta() {
             rmpv::Value::Map(vec![
                 (
                     rmpv::Value::String("at".into()),
-                    rmpv::Value::Integer(2.into()),
+                    rmpv::Value::Integer(1.into()),
                 ),
                 (
                     rmpv::Value::String("bs".into()),
@@ -7306,7 +7306,7 @@ async fn pending_transaction_info_with_bytes_state_delta() {
         .get("global-state-delta")
         .expect("should have global-state-delta");
     let entry = &gsd.as_array().unwrap()[0];
-    assert_eq!(entry["value"]["action"].as_u64().unwrap(), 2);
+    assert_eq!(entry["value"]["action"].as_u64().unwrap(), 1);
     assert_eq!(
         entry["value"]["bytes"].as_str().unwrap(),
         STANDARD.encode(b"data")

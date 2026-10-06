@@ -30,13 +30,37 @@ use crate::apply::{apply_transaction, ApplyContext};
 // NOTE: LedgerStore is referenced via full path in function bounds rather
 // than imported at module level. See apply.rs for rationale.
 
+// The wire/REST numbers of go-algorand's `basics.DeltaAction`
+// (`data/basics/teal.go` lines 30-37: `SetBytesAction = 1`,
+// `SetUintAction = 2`, `DeleteAction = 3`). This is the single place the
+// numbers are defined: the enum discriminants, `From<DeltaAction> for u64`
+// (used by `encode_eval_delta`) and `TryFrom<u64>` all derive from these.
+const SET_BYTES_ACTION: u64 = 1;
+const SET_UINT_ACTION: u64 = 2;
+const DELETE_ACTION: u64 = 3;
+
 /// Action types for state delta changes.
+///
+/// Numbering matches go-algorand's `basics.DeltaAction`
+/// (`data/basics/teal.go`): `SetBytesAction = 1`, `SetUintAction = 2`,
+/// `DeleteAction = 3`. This is the `at` field on the wire and `action` in
+/// the REST JSON.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 pub enum DeltaAction {
-    SetUint = 1,
-    SetBytes = 2,
-    Delete = 3,
+    SetBytes = SET_BYTES_ACTION,
+    SetUint = SET_UINT_ACTION,
+    Delete = DELETE_ACTION,
+}
+
+impl From<DeltaAction> for u64 {
+    fn from(a: DeltaAction) -> u64 {
+        match a {
+            DeltaAction::SetBytes => SET_BYTES_ACTION,
+            DeltaAction::SetUint => SET_UINT_ACTION,
+            DeltaAction::Delete => DELETE_ACTION,
+        }
+    }
 }
 
 impl TryFrom<u64> for DeltaAction {
@@ -44,9 +68,9 @@ impl TryFrom<u64> for DeltaAction {
 
     fn try_from(v: u64) -> Result<Self, Self::Error> {
         match v {
-            1 => Ok(DeltaAction::SetUint),
-            2 => Ok(DeltaAction::SetBytes),
-            3 => Ok(DeltaAction::Delete),
+            SET_BYTES_ACTION => Ok(DeltaAction::SetBytes),
+            SET_UINT_ACTION => Ok(DeltaAction::SetUint),
+            DELETE_ACTION => Ok(DeltaAction::Delete),
             _ => Err(AlgoError::Ledger {
                 message: format!("invalid DeltaAction: {}", v),
             }),
@@ -183,16 +207,22 @@ pub fn encode_eval_delta(
     fn value_delta(v: &Option<TealValue>) -> Value {
         match v {
             Some(TealValue::Uint(u)) => Value::Map(vec![
-                (Value::from("at"), Value::from(DeltaAction::SetUint as u64)),
+                (
+                    Value::from("at"),
+                    Value::from(u64::from(DeltaAction::SetUint)),
+                ),
                 (Value::from("ui"), Value::from(*u)),
             ]),
             Some(TealValue::Bytes(b)) => Value::Map(vec![
-                (Value::from("at"), Value::from(DeltaAction::SetBytes as u64)),
+                (
+                    Value::from("at"),
+                    Value::from(u64::from(DeltaAction::SetBytes)),
+                ),
                 (Value::from("bs"), Value::Binary(b.clone())),
             ]),
             None => Value::Map(vec![(
                 Value::from("at"),
-                Value::from(DeltaAction::Delete as u64),
+                Value::from(u64::from(DeltaAction::Delete)),
             )]),
         }
     }
@@ -645,6 +675,137 @@ mod tests {
     use super::*;
     use rmpv::Value;
 
+    /// Issue #1698: go-algorand numbers the actions `SetBytesAction = 1`,
+    /// `SetUintAction = 2`, `DeleteAction = 3` (`data/basics/teal.go`).
+    #[test]
+    fn delta_action_numbers_match_go() {
+        assert_eq!(u64::from(DeltaAction::SetBytes), 1);
+        assert_eq!(u64::from(DeltaAction::SetUint), 2);
+        assert_eq!(u64::from(DeltaAction::Delete), 3);
+        assert_eq!(DeltaAction::try_from(1).unwrap(), DeltaAction::SetBytes);
+        assert_eq!(DeltaAction::try_from(2).unwrap(), DeltaAction::SetUint);
+        assert_eq!(DeltaAction::try_from(3).unwrap(), DeltaAction::Delete);
+    }
+
+    /// Decode a go-style EvalDelta (`at=1`+`bs`, `at=2`+`ui`, `at=3`).
+    #[test]
+    fn parse_go_numbered_eval_delta() {
+        let vd = |pairs: Vec<(&str, Value)>| {
+            Value::Map(
+                pairs
+                    .into_iter()
+                    .map(|(k, v)| (Value::from(k), v))
+                    .collect(),
+            )
+        };
+        let val = Value::Map(vec![(
+            Value::from("gd"),
+            Value::Map(vec![
+                (
+                    Value::Binary(b"b".to_vec()),
+                    vd(vec![
+                        ("at", 1.into()),
+                        ("bs", Value::Binary(b"xy".to_vec())),
+                    ]),
+                ),
+                (
+                    Value::Binary(b"u".to_vec()),
+                    vd(vec![("at", 2.into()), ("ui", 7.into())]),
+                ),
+                (Value::Binary(b"d".to_vec()), vd(vec![("at", 3.into())])),
+            ]),
+        )]);
+        let gd = parse_eval_delta(&val).unwrap().global_delta.unwrap();
+        let b = &gd[b"b".as_slice()];
+        assert_eq!(
+            (b.action, b.bytes.as_slice()),
+            (DeltaAction::SetBytes, b"xy".as_slice())
+        );
+        let u = &gd[b"u".as_slice()];
+        assert_eq!((u.action, u.uint), (DeltaAction::SetUint, 7));
+        assert_eq!(gd[b"d".as_slice()].action, DeltaAction::Delete);
+    }
+
+    /// The encoded `dt` must carry go's numbers on the wire.
+    #[test]
+    fn encode_eval_delta_emits_go_action_numbers() {
+        let mut result = algo_avm::eval::AvmResult::empty();
+        result
+            .global_delta
+            .insert(b"b".to_vec(), Some(TealValue::Bytes(b"xy".to_vec())));
+        result
+            .global_delta
+            .insert(b"u".to_vec(), Some(TealValue::Uint(7)));
+        result.global_delta.insert(b"d".to_vec(), None);
+        let dt = encode_eval_delta(&result, &Transaction::default(), true).unwrap();
+        let Value::Map(top) = dt else { panic!("map") };
+        let Value::Map(gd) = &top
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("gd"))
+            .unwrap()
+            .1
+        else {
+            panic!("gd map")
+        };
+        let at_of = |key: &[u8]| -> u64 {
+            let (_, v) = gd
+                .iter()
+                .find(|(k, _)| matches!(k, Value::Binary(b) if b == key))
+                .unwrap();
+            let Value::Map(m) = v else { panic!("vd map") };
+            m.iter()
+                .find(|(k, _)| k.as_str() == Some("at"))
+                .unwrap()
+                .1
+                .as_u64()
+                .unwrap()
+        };
+        assert_eq!(at_of(b"b"), 1, "bytes => SetBytesAction = 1");
+        assert_eq!(at_of(b"u"), 2, "uint => SetUintAction = 2");
+        assert_eq!(at_of(b"d"), 3, "delete => DeleteAction = 3");
+    }
+
+    /// Real mainnet evidence (issue #1698); every value below is real.
+    ///
+    /// Source: mainnet round 65703970, txn index 12 (txid
+    /// `PIKRXQRYL7D7APUYCEZ2DOUXLREDUJBSYKCXOGEI72FRJ6DUPC4A`, an app call to
+    /// app 1284326447), fetched with
+    /// `curl https://mainnet-api.4160.nodely.dev/v2/blocks/65703970?format=msgpack`.
+    /// Verbatim: the `at`/`ui`/`bs` of three global-delta keys, `block`
+    /// (`at=2`), `last_miner_effort` (`at=2`) and `current_miner` (`at=1`,
+    /// 32-byte `bs`). Trimmed (by hand, then checked by decoding): the other
+    /// global-delta keys and the rest of the txn were dropped, and the result
+    /// was re-packed as `{"gd": {...}}` with str keys. Method (python
+    /// `msgpack`): `unpackb(body, raw=True, strict_map_key=False)`, take
+    /// `[b"block"][b"txns"][12][b"dt"][b"gd"]`, keep the three keys, pack, hex.
+    ///
+    /// Cross-checks of the `at` values: the indexer's JSON for the same txn
+    /// (`https://mainnet-idx.4160.nodely.dev/v2/blocks/65703970`) reports
+    /// `block` action 2, `current_miner` action 1 (with bytes) and
+    /// `last_miner_effort` action 2; and the go-generated fixture
+    /// `crates/node/algo-rest-api/tests/fixtures/block_json/synthetic_appl.json`
+    /// (built by `gen_synthetic.go` with `basics.SetBytesAction` /
+    /// `SetUintAction`) uses `at=1` for bytes (`gkey`) and `at=2` for uints
+    /// (`cnt`).
+    #[test]
+    fn parse_real_mainnet_eval_delta_round_65703970() {
+        let hex = "81a2676483c405626c6f636b82a2617402a27569ce03ea9022c40d63757272656e745f6d696e657282a2617401a26273c4208802144c5021e7246b08068ada102b27c26f0142e5417830210e024c259aca62c4116c6173745f6d696e65725f6566666f727482a2617402a27569cda028";
+        let bytes: Vec<u8> = (0..hex.len() / 2)
+            .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
+            .collect();
+        let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+        let gd = parse_eval_delta(&val).unwrap().global_delta.unwrap();
+        assert_eq!(gd.len(), 3);
+        let blk = &gd[b"block".as_slice()];
+        assert_eq!((blk.action, blk.uint), (DeltaAction::SetUint, 65703970));
+        let eff = &gd[b"last_miner_effort".as_slice()];
+        assert_eq!((eff.action, eff.uint), (DeltaAction::SetUint, 41000));
+        let miner = &gd[b"current_miner".as_slice()];
+        assert_eq!(miner.action, DeltaAction::SetBytes);
+        assert_eq!(miner.bytes.len(), 32);
+        assert_eq!(miner.uint, 0);
+    }
+
     #[test]
     fn test_parse_empty_eval_delta() {
         let val = Value::Map(vec![]);
@@ -662,7 +823,7 @@ mod tests {
             Value::Map(vec![(
                 Value::String("counter".into()),
                 Value::Map(vec![
-                    (Value::String("at".into()), Value::Integer(1.into())),
+                    (Value::String("at".into()), Value::Integer(2.into())),
                     (Value::String("ui".into()), Value::Integer(42.into())),
                 ]),
             )]),
@@ -684,7 +845,7 @@ mod tests {
             Value::Map(vec![(
                 Value::String("name".into()),
                 Value::Map(vec![
-                    (Value::String("at".into()), Value::Integer(2.into())),
+                    (Value::String("at".into()), Value::Integer(1.into())),
                     (Value::String("bs".into()), Value::Binary(b"hello".to_vec())),
                 ]),
             )]),
@@ -722,7 +883,7 @@ mod tests {
                 Value::Map(vec![(
                     Value::String("opted_in".into()),
                     Value::Map(vec![
-                        (Value::String("at".into()), Value::Integer(1.into())),
+                        (Value::String("at".into()), Value::Integer(2.into())),
                         (Value::String("ui".into()), Value::Integer(1.into())),
                     ]),
                 )]),
@@ -807,8 +968,8 @@ mod tests {
 
     #[test]
     fn test_delta_action_try_from() {
-        assert_eq!(DeltaAction::try_from(1).unwrap(), DeltaAction::SetUint);
-        assert_eq!(DeltaAction::try_from(2).unwrap(), DeltaAction::SetBytes);
+        assert_eq!(DeltaAction::try_from(1).unwrap(), DeltaAction::SetBytes);
+        assert_eq!(DeltaAction::try_from(2).unwrap(), DeltaAction::SetUint);
         assert_eq!(DeltaAction::try_from(3).unwrap(), DeltaAction::Delete);
         assert!(DeltaAction::try_from(0).is_err());
         assert!(DeltaAction::try_from(4).is_err());
@@ -822,7 +983,7 @@ mod tests {
                 Value::Map(vec![(
                     Value::String("k".into()),
                     Value::Map(vec![
-                        (Value::String("at".into()), Value::Integer(1.into())),
+                        (Value::String("at".into()), Value::Integer(2.into())),
                         (Value::String("ui".into()), Value::Integer(5.into())),
                         // Unknown field in ValueDelta
                         (Value::String("zz".into()), Value::String("ignored".into())),

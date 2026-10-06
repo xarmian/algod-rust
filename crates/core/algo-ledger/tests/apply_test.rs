@@ -1066,7 +1066,7 @@ fn test_eval_delta_global_state() {
             rmpv::Value::Map(vec![
                 (
                     rmpv::Value::String("at".into()),
-                    rmpv::Value::Integer(1.into()),
+                    rmpv::Value::Integer(2.into()),
                 ),
                 (
                     rmpv::Value::String("ui".into()),
@@ -1183,7 +1183,7 @@ fn test_app_global_and_local_state_persist_across_round_gaps() {
             rmpv::Value::Map(vec![
                 (
                     rmpv::Value::String("at".into()),
-                    rmpv::Value::Integer(1.into()),
+                    rmpv::Value::Integer(2.into()),
                 ),
                 (
                     rmpv::Value::String("ui".into()),
@@ -1232,7 +1232,7 @@ fn test_app_global_and_local_state_persist_across_round_gaps() {
                 rmpv::Value::Map(vec![
                     (
                         rmpv::Value::String("at".into()),
-                        rmpv::Value::Integer(1.into()),
+                        rmpv::Value::Integer(2.into()),
                     ),
                     (
                         rmpv::Value::String("ui".into()),
@@ -1250,7 +1250,7 @@ fn test_app_global_and_local_state_persist_across_round_gaps() {
                     rmpv::Value::Map(vec![
                         (
                             rmpv::Value::String("at".into()),
-                            rmpv::Value::Integer(1.into()),
+                            rmpv::Value::Integer(2.into()),
                         ),
                         (
                             rmpv::Value::String("ui".into()),
@@ -1328,7 +1328,7 @@ fn test_app_global_state_two_senders_same_block_sequential_deltas() {
                 rmpv::Value::Map(vec![
                     (
                         rmpv::Value::String("at".into()),
-                        rmpv::Value::Integer(1.into()),
+                        rmpv::Value::Integer(2.into()),
                     ),
                     (
                         rmpv::Value::String("ui".into()),
@@ -1351,7 +1351,7 @@ fn test_app_global_state_two_senders_same_block_sequential_deltas() {
             rmpv::Value::Map(vec![
                 (
                     rmpv::Value::String("at".into()),
-                    rmpv::Value::Integer(1.into()),
+                    rmpv::Value::Integer(2.into()),
                 ),
                 (
                     rmpv::Value::String("ui".into()),
