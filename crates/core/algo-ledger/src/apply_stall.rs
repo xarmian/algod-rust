@@ -29,8 +29,9 @@
 //!
 //! algod-rust retried the same block every ~8 s forever, logging one
 //! `permanent error writing block` line per attempt. This tracker adds the
-//! missing piece: when the *same* error is produced for the *same* block
-//! twice in a row the node is "stalled on an invalid block". The state is
+//! missing piece: after two failed attempts for the *same* round (restricted
+//! by the caller to block-content failures) the node is "stalled on an
+//! invalid block". The state is
 //! entered once (one ERROR log), the retry cadence backs off exponentially,
 //! the state and a failure counter are exposed through `/v2/status` and
 //! `/metrics`, and it is cleared (one INFO log) when a block commits.
@@ -39,26 +40,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use algo_types::Digest;
+
 /// Smallest retry delay once stalled; matches the periodic-sync cadence
-/// (two 4 s ticks), doubled for every further identical failure.
+/// (two 4 s ticks), doubled for every further failed attempt.
 pub const STALL_BACKOFF_BASE: Duration = Duration::from_secs(8);
 /// Cap on the stalled retry delay: a stuck node still re-checks every 5 min
 /// (a peer may serve a different, valid block for the round).
 pub const STALL_BACKOFF_MAX: Duration = Duration::from_secs(300);
 
-/// Consecutive identical failures of one block before the node is reported
-/// stalled. One failure may be a transient fault; two identical ones are
-/// treated as deterministic.
+/// Failed attempts for one round before the node is reported stalled. One
+/// failure may be a fluke; two for the same round are treated as
+/// deterministic.
 pub const STALL_THRESHOLD: u64 = 2;
 
-/// What a call to [`ApplyStallTracker::record_failure`] / `record_commit`
-/// changed, so the caller can emit exactly one log per transition.
+/// What a call to [`ApplyStallTracker::record_failure`] /
+/// `observe_ledger_round` changed, so the caller can emit exactly one log per transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StallTransition {
-    /// First time this (round, error) pair was seen.
+    /// First failure seen for this round.
     NewFailure,
-    /// Same (round, error) seen again, below the stall threshold.
-    Repeat,
     /// The threshold was just crossed: log the ERROR now.
     Entered,
     /// Already stalled; the failure repeated (log at debug only).
@@ -74,9 +75,9 @@ pub enum StallTransition {
 pub struct ApplyStall {
     /// The block round that fails to apply.
     pub round: u64,
-    /// The (identical) error produced on each attempt.
+    /// The error of the latest counted failed attempt.
     pub error: String,
-    /// Consecutive identical failures of this block.
+    /// Counted failed attempts for this round.
     pub consecutive_failures: u64,
     /// Unix time (seconds) of the first failure of this block.
     pub since_unix_secs: u64,
@@ -90,6 +91,10 @@ struct Inner {
     since_unix_secs: u64,
     last_failure: Instant,
     stalled: bool,
+    /// Digest of the latest block that failed to apply for this round, so
+    /// the certificate path can tell "the same bad block again" from a
+    /// different block (the recovery path).
+    block_digest: Option<Digest>,
 }
 
 /// Shared (via `Arc`) between the ledger bridge that records failures, the
@@ -113,10 +118,31 @@ impl ApplyStallTracker {
     /// [`Self::record_failure`] with an explicit failure time, so the backoff
     /// can be tested without wall-clock sleeps.
     pub fn record_failure_at(&self, round: u64, error: &str, now: Instant) -> StallTransition {
+        self.record_failure_at_with_digest(round, error, now, None)
+    }
+
+    /// Count an apply failure that is a local fault (storage, I/O): it is an
+    /// apply failure for the metric but never enters the stalled state.
+    pub fn count_local_failure(&self) {
+        self.failures_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// [`Self::record_failure_at`] that also remembers the digest of the
+    /// failing block.
+    pub fn record_failure_at_with_digest(
+        &self,
+        round: u64,
+        error: &str,
+        now: Instant,
+        block_digest: Option<Digest>,
+    ) -> StallTransition {
         self.failures_total.fetch_add(1, Ordering::Relaxed);
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_mut() {
             Some(s) if s.round == round => {
+                if block_digest.is_some() {
+                    s.block_digest = block_digest;
+                }
                 // Same block: detection is keyed on the round only (messages
                 // may embed varying detail). The exposed `error` is the text
                 // of the latest *counted* failure, so it stays consistent
@@ -139,11 +165,12 @@ impl ApplyStallTracker {
                 }
                 if s.stalled {
                     StallTransition::StillStalled
-                } else if s.consecutive >= STALL_THRESHOLD {
+                } else {
+                    // A previous failure existed (consecutive >= 1), so this
+                    // is the second counted attempt: STALL_THRESHOLD.
+                    debug_assert!(s.consecutive >= STALL_THRESHOLD);
                     s.stalled = true;
                     StallTransition::Entered
-                } else {
-                    StallTransition::Repeat
                 }
             }
             _ => {
@@ -159,6 +186,7 @@ impl ApplyStallTracker {
                         .unwrap_or(0),
                     last_failure: now,
                     stalled: false,
+                    block_digest,
                 });
                 StallTransition::NewFailure
             }
@@ -184,14 +212,6 @@ impl ApplyStallTracker {
         StallTransition::None
     }
 
-    /// Record that `committed_round` committed. Failure history for that
-    /// round or an earlier one is obsolete; a commit of an earlier round than
-    /// the failing one leaves it untouched (same rule as
-    /// [`Self::observe_ledger_round`]).
-    pub fn record_commit(&self, committed_round: u64) -> StallTransition {
-        self.observe_ledger_round(committed_round)
-    }
-
     /// The stall, if the node is currently stalled on an invalid block.
     pub fn stall(&self) -> Option<ApplyStall> {
         let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -203,12 +223,21 @@ impl ApplyStallTracker {
         })
     }
 
+    /// Digest of the block that failed to apply, while stalled.
+    pub fn failed_block_digest(&self) -> Option<Digest> {
+        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .filter(|s| s.stalled)
+            .and_then(|s| s.block_digest)
+    }
+
     /// Total apply failures ever recorded (monotonic).
     pub fn failures_total(&self) -> u64 {
         self.failures_total.load(Ordering::Relaxed)
     }
 
-    /// Retry delay for the `consecutive`-th identical failure:
+    /// Retry delay for the `consecutive`-th failed attempt:
     /// `STALL_BACKOFF_BASE * 2^(consecutive - STALL_THRESHOLD)`, capped.
     pub fn backoff_for(consecutive: u64) -> Duration {
         let exp = consecutive.saturating_sub(STALL_THRESHOLD).min(16) as u32;
@@ -361,14 +390,14 @@ mod tests {
         t.record_failure(10, "boom");
         t.record_failure(10, "boom");
         assert_eq!(
-            t.record_commit(10),
+            t.observe_ledger_round(10),
             StallTransition::Left {
                 round: 10,
                 failures: 2
             }
         );
         assert!(t.stall().is_none());
-        assert_eq!(t.record_commit(10), StallTransition::None);
+        assert_eq!(t.observe_ledger_round(10), StallTransition::None);
     }
 
     #[test]
@@ -376,7 +405,7 @@ mod tests {
         let t = ApplyStallTracker::new();
         t.record_failure(10, "boom");
         t.record_failure(10, "boom");
-        assert_eq!(t.record_commit(9), StallTransition::None);
+        assert_eq!(t.observe_ledger_round(9), StallTransition::None);
         assert!(
             t.stall().is_some(),
             "round 9 commit must not clear round 10"
@@ -384,7 +413,7 @@ mod tests {
         // Unstalled history of a later round survives an earlier commit too.
         let u = ApplyStallTracker::new();
         u.record_failure(10, "boom");
-        u.record_commit(9);
+        u.observe_ledger_round(9);
         assert_eq!(u.record_failure(10, "boom"), StallTransition::Entered);
     }
 
@@ -403,10 +432,32 @@ mod tests {
     }
 
     #[test]
+    fn failed_block_digest_is_remembered_while_stalled() {
+        let t = ApplyStallTracker::new();
+        let t0 = Instant::now();
+        let (d1, d2) = (Digest([1; 32]), Digest([2; 32]));
+        t.record_failure_at_with_digest(10, "e", t0, Some(d1));
+        assert_eq!(t.failed_block_digest(), None, "not stalled yet");
+        t.record_failure_at_with_digest(10, "e", t0, Some(d1));
+        assert_eq!(t.failed_block_digest(), Some(d1));
+        t.record_failure_at_with_digest(10, "e", t0, Some(d2));
+        assert_eq!(t.failed_block_digest(), Some(d2), "latest failing block");
+    }
+
+    #[test]
+    fn local_failures_count_in_the_total_without_stalling() {
+        let t = ApplyStallTracker::new();
+        t.count_local_failure();
+        t.count_local_failure();
+        assert_eq!(t.failures_total(), 2);
+        assert!(t.stall().is_none());
+    }
+
+    #[test]
     fn commit_clears_unstalled_history_silently() {
         let t = ApplyStallTracker::new();
         t.record_failure(10, "boom");
-        assert_eq!(t.record_commit(10), StallTransition::None);
+        assert_eq!(t.observe_ledger_round(10), StallTransition::None);
         // history gone: the next failure of the same block starts over.
         assert_eq!(t.record_failure(10, "boom"), StallTransition::NewFailure);
     }
@@ -433,7 +484,7 @@ mod tests {
         );
         // Backoff elapsed: the retry is due.
         assert_eq!(t.retry_in_at(t0 + Duration::from_secs(8)), None);
-        // Third identical failure doubles the wait, measured from it.
+        // Third counted failure doubles the wait, measured from it.
         let t1 = t0 + Duration::from_secs(8);
         t.record_failure_at(10, "boom", t1);
         assert_eq!(t.retry_in_at(t1), Some(Duration::from_secs(16)));

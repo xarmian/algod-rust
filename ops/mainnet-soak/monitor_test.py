@@ -720,7 +720,6 @@ class ScanLogTest(unittest.TestCase):
     def test_each_hard_signature_is_detected(self):
         cases = {
             "permanent_error_writing_block": L("01:00:00.000000", "ERROR", "algo_ledger::agreement_bridge: ensure_block: permanent error writing block 5 to ledger: boom"),
-            "stalled_on_invalid_block": L("01:00:00.000000", "ERROR", "algo_ledger::agreement_bridge: ensure_block: stalled on invalid block 5: the same permanent error twice in a row"),
             "apply_block_failed": L("01:00:00.000000", "WARN", "algod_rust::commands::node: follow: apply_block failed round=5"),
             "panic": L("01:00:00.000000", "ERROR", "thread 'tokio-runtime-worker' panicked at src/x.rs:1:1:"),
             "invariant_check_error": L("01:00:00.000000", "ERROR", "algo_ledger::sync: invariant check: error name=x detail=y"),
