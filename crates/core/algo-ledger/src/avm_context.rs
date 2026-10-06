@@ -1196,6 +1196,12 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     pub txn_counter: u64,
     /// Fee sink address for inner transaction fee deduction.
     pub fee_sink: Address,
+    /// Block rewards level that inner transactions' rewards pass brings every
+    /// participant up to (go's `roundCowState.rewardsLevel()`, used by `Move`
+    /// for inner transactions exactly as for top-level ones; issue #1731).
+    /// Callers constructing a context for real execution must set it from the
+    /// block/apply context; it is inherited by nested inner app calls.
+    pub rewards_level: u64,
     /// Opcode budget shared between the AVM machine and inner app call
     /// execution. Updated by `set_opcode_budget` / `get_opcode_budget`
     /// before and after `itxn_submit`.
@@ -2395,6 +2401,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             fee_residue: 0,
             txn_counter: 0,
             fee_sink: Address::ZERO,
+            rewards_level: 0,
             opcode_budget: 0,
             inner_txn_ids: Vec::new(),
             txid_cache: RefCell::new(HashMap::new()),
@@ -4269,6 +4276,7 @@ fn execute_inner_appl<L: LedgerStore>(
     fee_residue: u64,
     txn_counter: u64,
     fee_sink: Address,
+    rewards_level: u64,
     opcode_budget: &mut i64,
     inner_txn_id: algo_types::Digest,
     box_state: crate::apply::BoxBudgetState,
@@ -4467,6 +4475,7 @@ fn execute_inner_appl<L: LedgerStore>(
     inner_ctx.fee_residue = fee_residue;
     inner_ctx.txn_counter = txn_counter;
     inner_ctx.fee_sink = fee_sink;
+    inner_ctx.rewards_level = rewards_level;
     // P1-3: Set parent_txn_id to the InnerID of this appl txn so that
     // any nested inner transactions derive their IDs from the correct
     // parent (the immediate parent inner txn, not the original outer txn).
@@ -6674,6 +6683,43 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 }
             }
 
+            // Rewards pass (issue #1731). go's `roundCowState.Perform`
+            // (`ledger/eval/applications.go`) runs `takeFee` -> `Move`
+            // (`ledger/eval/eval.go` L567-618) and `apply.Payment` -> `Move`
+            // for inner transactions exactly as for top-level ones, so every
+            // participant is brought up to the block's rewards level and the
+            // inner ApplyData records Sender/Receiver/CloseRewards. Runs
+            // before the fee, like the top-level pass.
+            {
+                let participants = crate::apply::reward_participants(&txns[i].txn);
+                let pass = crate::apply::apply_rewards_pass(
+                    self.store,
+                    &txns[i].txn,
+                    &participants,
+                    self.rewards_level,
+                    &self.consensus,
+                );
+                txns[i].sender_rewards = pass.sender_rewards;
+                txns[i].receiver_rewards = pass.receiver_rewards;
+                txns[i].close_rewards = pass.close_rewards;
+                if let Err(e) = crate::apply::debit_rewards_pool(self.store, pass.total) {
+                    self.store.restore_snapshot(snapshot);
+                    for &id in &extra_created_asset_ids {
+                        self.store.remove_asset_params(id);
+                        self.store.remove_all_asset_holdings_for_asset(id);
+                    }
+                    for &id in &extra_created_app_ids {
+                        self.store.remove_app_params(id);
+                        self.store.remove_all_app_local_states_for_app(id);
+                    }
+                    let err_msg = format!("inner tx {}: {}", i, e);
+                    if let Some(p) = self.tracer_ptr {
+                        unsafe { &mut *p }.after_txn_group(Some(&err_msg));
+                    }
+                    return Err(AlgoError::Avm { message: err_msg });
+                }
+            }
+
             // Deduct fee from sender to fee_sink (matches go-algorand takeFee).
             let fee = txns[i].txn.fee;
             if fee > 0 {
@@ -6823,6 +6869,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     self.fee_residue,
                     self.txn_counter,
                     self.fee_sink,
+                    self.rewards_level,
                     &mut self.opcode_budget,
                     appl_inner_id,
                     caller_box_state,
@@ -6929,7 +6976,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             } else {
                 let stxn = &mut txns[i];
                 let result = match stxn.txn.txn_type.as_str() {
-                    "pay" => apply_pay(self.store, &stxn.txn),
+                    "pay" => apply_pay(self.store, &stxn.txn, self.rewards_level),
                     "axfer" => apply_axfer(self.store, &stxn.txn, &self.consensus),
                     "acfg" => apply_acfg(self.store, &stxn.txn, self.txn_counter, &self.consensus),
                     "afrz" => apply_afrz(self.store, &stxn.txn),
