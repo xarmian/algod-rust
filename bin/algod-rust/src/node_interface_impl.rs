@@ -502,7 +502,11 @@ impl AlgodNodeInterface {
 
     /// Drop a stall the ledger has already moved past by some other path.
     fn observe_ledger_round_for_stall(&self, tracker: &algo_ledger::ApplyStallTracker) {
-        if let Ok(l) = self.ledger.lock() {
+        // Never block a status/metrics scrape on the ledger mutex (a long
+        // commit holds it): when busy, skip the staleness lookup. The bridge
+        // (`ensure_block` / `apply_stall_retry_in`) is the primary path that
+        // drops a stale stall.
+        if let Ok(l) = self.ledger.try_lock() {
             tracker.observe_ledger_round(l.current_round().0);
         }
     }

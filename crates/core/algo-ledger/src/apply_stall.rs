@@ -117,12 +117,11 @@ impl ApplyStallTracker {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_mut() {
             Some(s) if s.round == round => {
-                // Same block: keep the newest error text for display, but
-                // key detection on the round only (messages may embed
-                // varying detail).
-                if s.error != error {
-                    s.error = error.to_string();
-                }
+                // Same block: detection is keyed on the round only (messages
+                // may embed varying detail). The exposed `error` is the text
+                // of the latest *counted* failure, so it stays consistent
+                // with `consecutive_failures`; `failures_total` counts every
+                // attempt.
                 if s.stalled {
                     // One failure per backoff window: a failure arriving
                     // while the wait is still pending (e.g. the agreement
@@ -135,6 +134,9 @@ impl ApplyStallTracker {
                 }
                 s.consecutive += 1;
                 s.last_failure = now;
+                if s.error != error {
+                    s.error = error.to_string();
+                }
                 if s.stalled {
                     StallTransition::StillStalled
                 } else if s.consecutive >= STALL_THRESHOLD {
@@ -182,16 +184,12 @@ impl ApplyStallTracker {
         StallTransition::None
     }
 
-    /// Record that a block committed: any failure history is obsolete.
-    pub fn record_commit(&self) -> StallTransition {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.take() {
-            Some(s) if s.stalled => StallTransition::Left {
-                round: s.round,
-                failures: s.consecutive,
-            },
-            _ => StallTransition::None,
-        }
+    /// Record that `committed_round` committed. Failure history for that
+    /// round or an earlier one is obsolete; a commit of an earlier round than
+    /// the failing one leaves it untouched (same rule as
+    /// [`Self::observe_ledger_round`]).
+    pub fn record_commit(&self, committed_round: u64) -> StallTransition {
+        self.observe_ledger_round(committed_round)
     }
 
     /// The stall, if the node is currently stalled on an invalid block.
@@ -363,21 +361,52 @@ mod tests {
         t.record_failure(10, "boom");
         t.record_failure(10, "boom");
         assert_eq!(
-            t.record_commit(),
+            t.record_commit(10),
             StallTransition::Left {
                 round: 10,
                 failures: 2
             }
         );
         assert!(t.stall().is_none());
-        assert_eq!(t.record_commit(), StallTransition::None);
+        assert_eq!(t.record_commit(10), StallTransition::None);
+    }
+
+    #[test]
+    fn earlier_round_commit_does_not_clear_the_stall() {
+        let t = ApplyStallTracker::new();
+        t.record_failure(10, "boom");
+        t.record_failure(10, "boom");
+        assert_eq!(t.record_commit(9), StallTransition::None);
+        assert!(
+            t.stall().is_some(),
+            "round 9 commit must not clear round 10"
+        );
+        // Unstalled history of a later round survives an earlier commit too.
+        let u = ApplyStallTracker::new();
+        u.record_failure(10, "boom");
+        u.record_commit(9);
+        assert_eq!(u.record_failure(10, "boom"), StallTransition::Entered);
+    }
+
+    #[test]
+    fn exposed_error_follows_the_counted_failures_only() {
+        let t = ApplyStallTracker::new();
+        let t0 = Instant::now();
+        t.record_failure_at(10, "first", t0);
+        t.record_failure_at(10, "second", t0);
+        // Inside the window: not counted, so the text is not replaced.
+        t.record_failure_at(10, "ignored", t0 + Duration::from_secs(1));
+        assert_eq!(t.stall().unwrap().error, "second");
+        t.record_failure_at(10, "third", t0 + Duration::from_secs(8));
+        let s = t.stall().unwrap();
+        assert_eq!((s.error.as_str(), s.consecutive_failures), ("third", 3));
     }
 
     #[test]
     fn commit_clears_unstalled_history_silently() {
         let t = ApplyStallTracker::new();
         t.record_failure(10, "boom");
-        assert_eq!(t.record_commit(), StallTransition::None);
+        assert_eq!(t.record_commit(10), StallTransition::None);
         // history gone: the next failure of the same block starts over.
         assert_eq!(t.record_failure(10, "boom"), StallTransition::NewFailure);
     }

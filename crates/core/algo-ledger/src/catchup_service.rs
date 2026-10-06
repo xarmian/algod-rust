@@ -347,6 +347,13 @@ enum PeriodicTick {
 }
 
 impl CatchupService {
+    /// Whether the certificate-driven path must skip its fetch: the ledger
+    /// is stalled on an invalid block and the backoff window is pending
+    /// (issue #1677). Pure, so the gate is testable without sleeping.
+    fn cert_sync_gated(stall_wait: Option<Duration>) -> bool {
+        stall_wait.is_some()
+    }
+
     /// Pure decision for a periodic-sync timeout tick, kept separate from
     /// the loop so the issue #1677 backoff gate is testable without sleeping.
     fn periodic_tick_action(
@@ -1299,6 +1306,18 @@ impl CatchupService {
                 return SyncExitReason::Stopping;
             }
 
+            // Issue #1677: a certificate for the round the ledger is stalled
+            // on (it deterministically fails to apply) must not re-fetch and
+            // re-apply it on every gossip of that certificate; wait out the
+            // same exponential backoff as the periodic path.
+            if Self::cert_sync_gated(ledger.apply_stall_retry_in()) {
+                debug!(
+                    round = %target_round,
+                    "catchup service: stalled on an invalid block, skipping certificate-driven fetch"
+                );
+                return SyncExitReason::Done;
+            }
+
             attempt = attempt.saturating_add(1);
 
             // Stop retrying after a while. Mirrors go's
@@ -1774,7 +1793,7 @@ mod tests {
             let n = self.attempts.fetch_add(1, Ordering::SeqCst);
             if self.succeed.load(Ordering::SeqCst) {
                 *self.round.lock().unwrap() = block.round;
-                self.tracker.record_commit();
+                self.tracker.record_commit(block.round.0);
                 return;
             }
             let err = if self.deterministic.load(Ordering::SeqCst) {
@@ -1866,6 +1885,44 @@ mod tests {
         assert_eq!(
             CatchupService::periodic_tick_action(Round(4), same, true, wait),
             PeriodicTick::Advanced
+        );
+    }
+
+    /// Issue #1677: certificate-driven sync is gated by the same backoff.
+    #[test]
+    fn cert_sync_is_gated_only_while_the_backoff_is_pending() {
+        assert!(CatchupService::cert_sync_gated(Some(Duration::from_secs(
+            3
+        ))));
+        assert!(!CatchupService::cert_sync_gated(None));
+    }
+
+    /// Issue #1677: a stalled ledger makes sync_cert skip the fetch entirely.
+    #[test]
+    fn sync_cert_skips_the_fetch_while_stalled() {
+        let ledger = FailingApplyLedger::new(true);
+        let err = "tx 0xabc: balance below minimum";
+        // Fake time: failures at base, so the wait is the full 8 s.
+        ledger.tracker.record_failure_at(1, err, ledger.base);
+        ledger.tracker.record_failure_at(1, err, ledger.base);
+        ledger.attempts.store(1, Ordering::SeqCst);
+        let fetcher = bounded_fetcher();
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        let fetcher_dyn: Arc<dyn BlockFetcher> = fetcher.clone();
+        let (_stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
+        let pending = make_pending_cert(1);
+        let reason = CatchupService::sync_cert(
+            &pending,
+            &ledger_dyn,
+            &fetcher_dyn,
+            &stop_rx,
+            &Arc::new(AtomicU64::new(0)),
+        );
+        assert_eq!(reason, SyncExitReason::Done);
+        assert_eq!(
+            fetcher.calls.load(Ordering::SeqCst),
+            0,
+            "no fetch while stalled"
         );
     }
 
