@@ -3455,7 +3455,10 @@ fn go_group_id_of(ids: &[[u8; 32]]) -> [u8; 32] {
 }
 
 /// Run an app that submits `n_group` pays as ONE inner group.
-fn run_inner_group_of(n_group: usize, unify: bool) -> (Vec<SignedTransaction>, [u8; 32]) {
+fn run_inner_group_of(
+    n_group: usize,
+    unify: bool,
+) -> (Vec<SignedTransaction>, [u8; 32], Vec<[u8; 32]>) {
     let app_id = 42u64;
     let mut store = LedgerState::new();
     seed_app_approve(&mut store, app_id, Address([1u8; 32]));
@@ -3485,7 +3488,8 @@ fn run_inner_group_of(n_group: usize, unify: bool) -> (Vec<SignedTransaction>, [
     code.extend(pushint(1));
     code.push(0x43);
     assert!(run_with_context(6, &code, &mut ctx).unwrap());
-    (ctx.inner_txns()[0].clone(), parent_id)
+    let ids = ctx.inner_txn_ids()[0].iter().map(|d| d.0).collect();
+    (ctx.inner_txns()[0].clone(), parent_id, ids)
 }
 
 fn expected_inner_group_id(group: &[SignedTransaction], parent: [u8; 32], unify: bool) -> [u8; 32] {
@@ -3508,7 +3512,7 @@ fn expected_inner_group_id(group: &[SignedTransaction], parent: [u8; 32], unify:
 fn inner_group_gets_shared_go_group_id_two_and_three() {
     for unify in [true, false] {
         for n in [2usize, 3] {
-            let (group, parent) = run_inner_group_of(n, unify);
+            let (group, parent, _) = run_inner_group_of(n, unify);
             assert_eq!(group.len(), n);
             let want = expected_inner_group_id(&group, parent, unify);
             assert_ne!(want, [0u8; 32]);
@@ -3524,7 +3528,7 @@ fn inner_group_gets_shared_go_group_id_two_and_three() {
 #[test]
 fn sixteen_sibling_inner_group_id_and_child_offsets() {
     for unify in [true, false] {
-        let (group, parent) = run_inner_group_of(16, unify);
+        let (group, parent, ids) = run_inner_group_of(16, unify);
         assert_eq!(group.len(), 16);
         let want = expected_inner_group_id(&group, parent, unify);
         // Independently pin the array16 header the hash is taken over.
@@ -3538,22 +3542,28 @@ fn sixteen_sibling_inner_group_id_and_child_offsets() {
         for s in &group {
             assert_eq!(s.txn.group, want, "unify={unify}");
         }
-        // Every child's recorded InnerID is over the txn WITH Group set, at
-        // offset prior-count (0) + index.
-        let distinct: std::collections::HashSet<[u8; 32]> = group
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                algo_avm::itxn::compute_inner_txn_id(&algo_types::Digest(parent), i, &s.txn).0
-            })
-            .collect();
-        assert_eq!(distinct.len(), 16);
+        // Every child's recorded id (production `inner_txn_ids`) equals
+        // SHA512/256("TX" || parent || be64(prior count 0 + i) || encode(txn
+        // WITH Group set)), computed independently here. Pins current
+        // behaviour for unify=false (see issue #1712), go's `getTxID` for
+        // unify=true.
+        use sha2::{Digest as _, Sha512_256};
+        assert_eq!(ids.len(), 16);
+        for (i, s) in group.iter().enumerate() {
+            let mut h = Sha512_256::new();
+            h.update(b"TX");
+            h.update(parent);
+            h.update((i as u64).to_be_bytes());
+            h.update(algo_codec::canonical_encode_transaction(&s.txn));
+            let want_id: [u8; 32] = h.finalize().into();
+            assert_eq!(ids[i], want_id, "child {i} unify={unify}");
+        }
     }
 }
 
 #[test]
 fn single_inner_txn_keeps_zero_group() {
-    let (group, _) = run_inner_group_of(1, true);
+    let (group, _, _) = run_inner_group_of(1, true);
     assert_eq!(group.len(), 1);
     assert_eq!(group[0].txn.group, [0u8; 32]);
 }
