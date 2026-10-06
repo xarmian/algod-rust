@@ -3270,6 +3270,12 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
 
         // Apply rewards to transaction participants only (not snapshot-only addresses).
         let mut total_rewards: u64 = 0;
+        // Issue #1729: a zero-amount `pay` receiver that is also the
+        // `close_remainder_to` is skipped by the rewards pass below, but go's
+        // close `Move` (closing amount > 0) writes it with its `rewards_base`
+        // brought up to the current level. Remember to stamp it after
+        // `apply_pay` credits the closing amount.
+        let mut close_to_base_pending = false;
         for addr in reward_addrs {
             let account_before = store.get_or_default_account(addr);
             let mut account = account_before.clone();
@@ -3328,6 +3334,8 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
                         .is_none_or(|a| a == algo_types::AccountData::default()));
             if !skip_write {
                 store.set_account(addr, account);
+            } else if unwritten_pay_receiver && *addr == txn.close_remainder_to {
+                close_to_base_pending = true;
             }
 
             // Track per-address rewards.
@@ -3366,6 +3374,13 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
                 apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink, &ctx.consensus)?;
                 let ad = apply_pay(store, &stx.txn)?;
                 apply_data.closing_amount = ad.closing_amount;
+                if close_to_base_pending && ad.closing_amount > 0 {
+                    // The account was empty (so no rewards accrue); only its
+                    // `rewards_base` needs the go `WithUpdatedRewards` stamp.
+                    let mut close_to = store.get_or_default_account(&txn.close_remainder_to);
+                    close_to.rewards_base = ctx.rewards_level;
+                    store.set_account(&txn.close_remainder_to, close_to);
+                }
             }
             "acfg" => {
                 apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink, &ctx.consensus)?;
@@ -10174,6 +10189,53 @@ mod tests {
         apply_transaction(&mut store, &pay_txn(sender, receiver, 0, 1_000), &ctx2, 0)
             .expect("second zero-amount pay to the same empty account must apply");
         assert!(store.get_account(&receiver).is_none());
+    }
+
+    /// Issue #1729 (live mainnet round 65723764 -> 65723784, shadow-execute
+    /// finding): a `pay` of amount 0 whose receiver is also its
+    /// `close_remainder_to` into a non-existent account. go's `Move` skips the
+    /// zero-amount receiver write, but the following close `Move` (closing
+    /// amount > 0) writes the account with `WithUpdatedRewards`, i.e.
+    /// `rewards_base` = current level. algod-rust skipped the receiver in the
+    /// rewards pass and `apply_pay` then credited the close-to account with
+    /// `rewards_base` still 0, so its next transaction computed a bogus
+    /// `sender_rewards` (go recorded 0).
+    #[test]
+    fn issue_1729_close_to_new_receiver_gets_rewards_base_stamped() {
+        let closer = Address([7u8; 32]);
+        let target = Address([8u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut store = make_state_with_accounts(&[(closer, 2_000_000), (fee_sink, 0)], fee_sink);
+        let mut ctx = apply_context_for_version(fee_sink, 1, algo_types::consensus::CONSENSUS_V34);
+        ctx.rewards_level = 218_288;
+        assert!(ctx.consensus.unfunded_senders);
+        let mut closer_acct = store.get_account(&closer).unwrap().clone();
+        closer_acct.rewards_base = 218_288;
+        crate::store_trait::LedgerStore::set_account(&mut store, &closer, closer_acct);
+
+        let mut close = pay_txn(closer, target, 0, 1_000);
+        close.txn.close_remainder_to = target;
+        let ad = apply_transaction(&mut store, &close, &ctx, 0).expect("close must apply");
+        assert_eq!(ad.closing_amount, 1_999_000);
+        let t = store
+            .get_account(&target)
+            .expect("close-to account written");
+        assert_eq!(t.micro_algos, 1_999_000);
+        assert_eq!(
+            t.rewards_base, 218_288,
+            "go's close Move stamps rewards_base at the current level"
+        );
+
+        // The target's next transaction must record zero SenderRewards.
+        let other = Address([9u8; 32]);
+        let ad2 = apply_transaction(
+            &mut store,
+            &pay_txn(target, other, 1_000_000, 1_000),
+            &ctx,
+            0,
+        )
+        .expect("follow-up pay must apply");
+        assert_eq!(ad2.sender_rewards, 0);
     }
 
     /// Issue #1654 (live mainnet block 65549710): go checks minimum balances
