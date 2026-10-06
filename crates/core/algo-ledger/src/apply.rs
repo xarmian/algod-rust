@@ -3314,21 +3314,20 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
                 && txn.txn_type == "pay"
                 && txn.amount == 0;
             let unwritten_non_pay_participant = *addr != txn.sender && txn.txn_type != "pay";
-            // Issue #1729: the close-to target of a `pay` is likewise written
-            // only by go's close `Move` (`ledger/apply/payment.go`), and only
-            // when the closing amount is > 0 (or the account already holds
-            // reward units); `apply_pay_at_level` does that write -- stamping
-            // `rewards_base` via `apply_rewards` -- so an empty target is left
-            // untouched here. This covers both the zero-amount receiver that
-            // is also the close-to target and a distinct close-to account
-            // whose closing amount turns out to be 0.
-            let unwritten_close_to =
-                *addr != txn.sender && *addr == txn.close_remainder_to && txn.txn_type == "pay";
+            // Issue #1729: the receiver and close-to target of a `pay` are
+            // written by go's `Move` only when it actually credits them
+            // (`!amt.IsZero() || units > 0 || !UnfundedSenders`), each time
+            // after `WithUpdatedRewards`. `apply_pay_at_level` performs that
+            // credit and brings both up to the current level via
+            // `apply_rewards`, so an empty (absent/default) receiver or
+            // close-to target is left untouched by this pass and stamped there.
+            let pay_credit_role = txn.txn_type == "pay"
+                && *addr != txn.sender
+                && (*addr == txn.receiver || *addr == txn.close_remainder_to);
+            let unwritten_role =
+                unwritten_sender || unwritten_non_pay_participant || pay_credit_role;
             let skip_write = ctx.consensus.unfunded_senders
-                && (unwritten_sender
-                    || unwritten_pay_receiver
-                    || unwritten_non_pay_participant
-                    || unwritten_close_to)
+                && unwritten_role
                 && account_before.micro_algos == 0
                 && reward == 0
                 && (unwritten_sender
@@ -3765,6 +3764,9 @@ pub fn apply_pay_at_level<L: crate::store_trait::LedgerStore>(
 
         if txn.amount > 0 {
             let mut receiver = store.get_or_default_account(&txn.receiver);
+            if let Some(level) = rewards_level {
+                crate::rewards::apply_rewards(&mut receiver, level);
+            }
             receiver.micro_algos += txn.amount;
             store.set_account(&txn.receiver, receiver);
         }
@@ -10331,6 +10333,65 @@ mod tests {
         assert_eq!(ad.close_rewards, 0);
     }
 
+    /// Review regression guard: amount > 0 paid to a fresh receiver that is
+    /// also the close-to target. go's `Move` credits the receiver with
+    /// `WithUpdatedRewards` at the current level before adding the amount,
+    /// then the close `Move` repeats it for the closer; neither accrues a
+    /// reward on an empty account and both leave `rewards_base` = level.
+    fn issue_1729_run_receiver_is_close_to(closer_balance: u64) -> (ApplyData, LedgerState) {
+        let closer = Address([7u8; 32]);
+        let target = Address([8u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut store =
+            make_state_with_accounts(&[(closer, closer_balance), (fee_sink, 0)], fee_sink);
+        let ctx = issue_1729_ctx(fee_sink, algo_types::consensus::CONSENSUS_V34);
+        issue_1729_set_base(&mut store, closer, 218_288);
+        let mut close = pay_txn(closer, target, 5_000_000, 1_000);
+        close.txn.close_remainder_to = target;
+        let ad = apply_transaction(&mut store, &close, &ctx, 0).expect("close must apply");
+        (ad, store)
+    }
+
+    #[test]
+    fn issue_1729_receiver_is_close_to_amount_and_closing_amount_positive() {
+        let (ad, store) = issue_1729_run_receiver_is_close_to(8_000_000);
+        assert_eq!(ad.closing_amount, 2_999_000);
+        let t = store.get_account(&Address([8u8; 32])).unwrap();
+        assert_eq!((t.micro_algos, t.rewards_base), (7_999_000, 218_288));
+        assert_eq!((ad.receiver_rewards, ad.close_rewards), (0, 0));
+        assert_eq!(t.rewarded_micro_algos, 0);
+    }
+
+    #[test]
+    fn issue_1729_receiver_is_close_to_amount_positive_closing_amount_zero() {
+        let (ad, store) = issue_1729_run_receiver_is_close_to(5_001_000);
+        assert_eq!(ad.closing_amount, 0);
+        let t = store.get_account(&Address([8u8; 32])).unwrap();
+        assert_eq!((t.micro_algos, t.rewards_base), (5_000_000, 218_288));
+        assert_eq!((ad.receiver_rewards, ad.close_rewards), (0, 0));
+    }
+
+    /// Original behaviour: amount > 0 to a fresh receiver distinct from the
+    /// close-to target is stamped (by the rewards pass) as before.
+    #[test]
+    fn issue_1729_fresh_receiver_amount_positive_distinct_close_to() {
+        let closer = Address([7u8; 32]);
+        let receiver = Address([8u8; 32]);
+        let target = Address([6u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut store = make_state_with_accounts(&[(closer, 8_000_000), (fee_sink, 0)], fee_sink);
+        let ctx = issue_1729_ctx(fee_sink, algo_types::consensus::CONSENSUS_V34);
+        issue_1729_set_base(&mut store, closer, 218_288);
+        let mut close = pay_txn(closer, receiver, 5_000_000, 1_000);
+        close.txn.close_remainder_to = target;
+        let ad = apply_transaction(&mut store, &close, &ctx, 0).unwrap();
+        let r = store.get_account(&receiver).unwrap();
+        assert_eq!((r.micro_algos, r.rewards_base), (5_000_000, 218_288));
+        let t = store.get_account(&target).unwrap();
+        assert_eq!((t.micro_algos, t.rewards_base), (2_999_000, 218_288));
+        assert_eq!((ad.receiver_rewards, ad.close_rewards), (0, 0));
+    }
+
     /// (b) pre-UnfundedSenders protocol: the rewards pass writes everything,
     /// and the close-to target ends up stamped exactly once.
     #[test]
@@ -10535,12 +10596,13 @@ return
         );
     }
 
-    /// (e) Issue #1729, inner path: an app account closed out by an inner
+    /// (e) KNOWN GAP, tracked in #1731 and NOT covered by the #1729 fix:
+    /// inner transactions apply no rewards, so this test is ignored. An app account closed out by an inner
     /// `pay` (amount 0, receiver == close_remainder_to == a fresh account)
     /// must leave the target stamped at the block's rewards level, as go's
     /// close `Move` does for inner transactions too.
     #[test]
-    #[ignore = "known gap: inner transactions apply no rewards (#1731)"]
+    #[ignore = "known gap tracked in #1731: inner transactions apply no rewards"]
     fn issue_1729_execute_inner_pay_close_to_new_account_gets_rewards_base() {
         let creator = Address([1u8; 32]);
         let target = Address([5u8; 32]);
