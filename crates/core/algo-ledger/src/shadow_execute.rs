@@ -51,6 +51,10 @@ use crate::store_trait::LedgerStore;
 /// Environment variable that turns the diagnostic on (`1`/`true`).
 pub const SHADOW_EXECUTE_ENV: &str = "ALGOD_SHADOW_EXECUTE";
 
+/// Optional sampling knob: shadow-check only every Nth Replay-applied block
+/// (default 1 = every block). Bounds the extra CPU of the scratch Execute pass.
+pub const SHADOW_SAMPLE_ENV: &str = "ALGOD_SHADOW_EXECUTE_SAMPLE_EVERY";
+
 /// Log token the soak log scan counts under the hard tier.
 pub const MISMATCH_LOG_TOKEN: &str = "shadow_execute_mismatch";
 
@@ -106,6 +110,23 @@ pub fn shadow_execute_enabled() -> bool {
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false)
     })
+}
+
+/// Sampling period from [`SHADOW_SAMPLE_ENV`] (read once; invalid/zero -> 1).
+fn sample_every() -> u64 {
+    static N: OnceLock<u64> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var(SHADOW_SAMPLE_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(1)
+    })
+}
+
+/// Whether the `seen`-th (0-based) eligible block is sampled for period `every`.
+fn sample_hit(seen: u64, every: u64) -> bool {
+    every <= 1 || seen.is_multiple_of(every)
 }
 
 /// `(checked, mismatched, skipped)` block counters since process start.
@@ -594,7 +615,7 @@ pub fn shadow_check_replay_block<L: LedgerStore>(
     let sp = store.snapshot(&[]);
     let mut exec_ad: Vec<ApplyData> = Vec::with_capacity(block.payset.len());
     let mut exec_kv = KvModsMap::new();
-    let (exec_res, exec_view, exec_touches) = {
+    let scratch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut rec = RecordingStore::new(store);
         let res = apply_block_impl_ex(
             &mut rec,
@@ -609,7 +630,18 @@ pub fn shadow_check_replay_block<L: LedgerStore>(
         );
         let view = read_exec_view(&rec, &rec.touches);
         (res, view, std::mem::take(&mut rec.touches))
-    };
+    }));
+    // A panic inside the diagnostic evaluation must not take the node down
+    // (or leave scratch state behind): report it as an execute error.
+    let (exec_res, exec_view, exec_touches) = scratch.unwrap_or_else(|_| {
+        (
+            Err(AlgoError::Ledger {
+                message: "shadow Execute evaluation panicked".into(),
+            }),
+            ExecView::default(),
+            ResourceTouches::default(),
+        )
+    });
     store.restore_snapshot(sp);
     chain.restore(store);
     store.restore_scratch_state(aux);
@@ -668,6 +700,20 @@ pub fn apply_replay_block_with_shadow<L: LedgerStore>(
     store: &mut L,
     block: &Block,
 ) -> Result<(), AlgoError> {
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    if !sample_hit(SEEN.fetch_add(1, Ordering::Relaxed), sample_every()) {
+        return apply_block_impl_ex(
+            store,
+            block,
+            ApplyMode::Replay,
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+    }
     let started = std::time::Instant::now();
     let report = shadow_check_replay_block(store, block)?;
     let elapsed_us = started.elapsed().as_micros() as u64;
@@ -685,17 +731,28 @@ pub fn apply_replay_block_with_shadow<L: LedgerStore>(
             .take(MAX_DIFFS_LOGGED)
             .map(|d| d.to_string())
             .collect();
-        tracing::warn!(
-            round = block.round.0,
-            diffs = report.diffs.len(),
-            elapsed_us,
-            "{MISMATCH_LOG_TOKEN} round={} diffs={} [{}]",
-            block.round.0,
-            report.diffs.len(),
-            first.join("; ")
+        // A systematic mismatch repeats on every block: dedupe by the first
+        // diff's (kind, field pattern) with the shared per-window budget.
+        let pat = format!(
+            "state:{}:{}",
+            report.diffs[0].kind,
+            field_pattern(&report.diffs[0].field)
         );
+        if admit_line(&pat) {
+            tracing::warn!(
+                round = block.round.0,
+                diffs = report.diffs.len(),
+                elapsed_us,
+                "{MISMATCH_LOG_TOKEN} round={} diffs={} [{}]",
+                block.round.0,
+                report.diffs.len(),
+                first.join("; ")
+            );
+        } else {
+            APPLY_DATA_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        }
     }
-    if checked == 1 || checked % PROGRESS_EVERY == 0 {
+    if checked == 1 || checked.is_multiple_of(PROGRESS_EVERY) {
         log_progress(block.round.0);
     }
     Ok(())
@@ -1091,6 +1148,23 @@ fn limiter() -> &'static std::sync::Mutex<MismatchLimiter> {
     })
 }
 
+/// Admit one mismatch line through the shared limiter, logging a rollover
+/// summary of previously suppressed lines.
+fn admit_line(pattern: &str) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (emit, flushed) = match limiter().lock() {
+        Ok(mut l) => l.admit(pattern, now),
+        Err(_) => (true, 0),
+    };
+    if flushed > 0 {
+        tracing::warn!("{MISMATCH_LOG_TOKEN} kind=rate_limited suppressed_lines={flushed}");
+    }
+    emit
+}
+
 fn log_apply_data_diffs(round: u64, diffs: &[ShadowDiff]) {
     // One line per (transaction, field pattern) with an occurrence count.
     let mut groups: Vec<(Option<usize>, String, usize, usize)> = Vec::new();
@@ -1166,10 +1240,10 @@ pub fn apply_execute_block_with_apply_data_check<L: LedgerStore>(
         APPLY_DATA_MISMATCH_LINES.fetch_add(diffs.len() as u64, Ordering::Relaxed);
         log_apply_data_diffs(block.round.0, &diffs);
     }
-    if n == 1 || n % PROGRESS_EVERY == 0 {
+    if n == 1 || n.is_multiple_of(PROGRESS_EVERY) {
         log_progress(block.round.0);
     }
-    if n % (PROGRESS_EVERY * 10) == 0 {
+    if n.is_multiple_of(PROGRESS_EVERY * 10) {
         if let Ok(l) = limiter().lock() {
             let top: Vec<String> = l
                 .top_patterns(12)
@@ -1696,5 +1770,25 @@ mod tests {
         // Window rollover reports what was suppressed and refills the budget.
         assert_eq!(l.admit("a", 170), (true, 2));
         assert_eq!(l.top_patterns(1)[0], ("a".to_string(), 5));
+    }
+
+    #[test]
+    fn sampling_period_selects_every_nth() {
+        assert!((0..5).all(|i| sample_hit(i, 1)));
+        assert!((0..5).all(|i| sample_hit(i, 0)));
+        let hits: Vec<u64> = (0..10).filter(|i| sample_hit(*i, 4)).collect();
+        assert_eq!(hits, vec![0, 4, 8]);
+    }
+
+    #[test]
+    fn limiter_dedupes_state_pattern_repeats() {
+        let mut l = MismatchLimiter::new(2, 60);
+        assert!(l.admit("state:account:micro_algos", 100).0); // new
+        assert!(l.admit("state:account:micro_algos", 100).0); // budget (new line counts)
+        assert!(!l.admit("state:account:micro_algos", 100).0); // suppressed
+        assert!(l.admit("state:box:kv_key=[K]", 100).0); // new pattern always passes
+        let (emit, flushed) = l.admit("state:account:micro_algos", 161);
+        assert!(emit);
+        assert_eq!(flushed, 1);
     }
 }
