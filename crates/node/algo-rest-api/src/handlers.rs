@@ -1585,14 +1585,7 @@ fn restore_genesis_fields(
     stxn: &algo_types::SignedTransaction,
     block: &algo_types::Block,
 ) -> algo_types::Transaction {
-    let mut txn = stxn.txn.clone();
-    if stxn.has_genesis_id {
-        txn.genesis_id.clone_from(&block.genesis_id);
-    }
-    if stxn.has_genesis_hash || txn.genesis_hash == [0u8; 32] {
-        txn.genesis_hash = block.genesis_hash;
-    }
-    txn
+    algo_types::genesis_restore::restored_block_txn(stxn, block)
 }
 
 // ---------------------------------------------------------------------------

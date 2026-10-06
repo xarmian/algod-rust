@@ -216,3 +216,58 @@ fn app_call_block_evaluates_full_txid_and_is_stored_stripped() {
     let stored = stored_block(&state, 1);
     assert!(!stored.payset[0].has_genesis_hash);
 }
+
+/// Runs an app call that stores `txn TxID` in a box on `proto`, with the
+/// submitter's `hgh` flag as given, and returns `(box value, full txn)`.
+fn run_txid_app(proto: &str, hgh: bool) -> (Option<Vec<u8>>, algo_types::Transaction) {
+    let sender = Address([1u8; 32]);
+    let app_id = 1001u64;
+    let mut state = funded_state(sender);
+    let program = algo_avm::assembler::assemble_string(
+        "#pragma version 8\nbyte \"id\"\ntxn TxID\nbox_put\nint 1\n",
+    )
+    .expect("assemble")
+    .program;
+    state
+        .get_or_default_account_mut(&Address(algo_ledger::avm_context::app_address(app_id)))
+        .micro_algos = 10_000_000;
+    state.set_app_params(
+        app_id,
+        algo_types::AppParams {
+            creator: sender,
+            approval_program: program,
+            clear_state_program: vec![0x08, 0x81, 0x01],
+            ..Default::default()
+        },
+    );
+    let mut stx = stripped_stx("appl", sender);
+    stx.txn.application_id = app_id;
+    stx.has_genesis_hash = hgh;
+    stx.txn.boxes = Some(vec![BoxRef {
+        index: 0,
+        name: Some(serde_bytes::ByteBuf::from(b"id".to_vec())),
+    }]);
+    let mut full = stx.txn.clone();
+    full.genesis_id = GENESIS_ID.to_string(); // hgi set in every case
+    if hgh
+        || consensus_params_for_version(proto)
+            .unwrap()
+            .require_genesis_hash
+    {
+        full.genesis_hash = GENESIS_HASH;
+    }
+    apply_block_executing_app_calls(&mut state, &stripped_block(proto, vec![stx])).unwrap();
+    (state.get_box(app_id, b"id"), full)
+}
+
+/// Hash-required protocol: gh is restored with `hgh` unset (unchanged).
+#[test]
+fn hash_required_protocol_restores_gh_for_txid() {
+    assert_requires_hash(CONSENSUS_V41, true);
+    // (Hash-optional protocols predate apps/boxes, so the optional-hash rule
+    // is pinned by unit tests on the shared restore helper and on
+    // `block_with_restored_genesis_fields` instead.)
+    let (got, full) = run_txid_app(CONSENSUS_V41, false);
+    assert_eq!(full.genesis_hash, GENESIS_HASH);
+    assert_eq!(got, Some(algo_codec::compute_txn_id(&full).0.to_vec()));
+}

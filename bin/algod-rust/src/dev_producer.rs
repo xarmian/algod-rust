@@ -84,18 +84,7 @@ use algo_types::{Block, Digest, SignedTransaction};
 /// state the flag distinguishes from "stripped because it matched the network".
 pub fn restore_block_genesis_fields(stx: &SignedTransaction, block: &Block) -> SignedTransaction {
     let mut out = stx.clone();
-    if out.has_genesis_id && out.txn.genesis_id.is_empty() {
-        out.txn.genesis_id.clone_from(&block.genesis_id);
-    }
-    let requires_genesis_hash =
-        algo_types::consensus::consensus_params_for_version(&block.current_protocol)
-            .is_some_and(|p| p.require_genesis_hash);
-    if out.txn.genesis_hash == [0u8; 32]
-        && block.genesis_hash != [0u8; 32]
-        && (requires_genesis_hash || out.has_genesis_hash)
-    {
-        out.txn.genesis_hash = block.genesis_hash;
-    }
+    algo_types::genesis_restore::restore_genesis_fields(&mut out, block);
     out
 }
 
@@ -365,8 +354,8 @@ mod tests {
             has_genesis_hash: false,
             ..Default::default()
         };
-        // Unknown protocol → require_genesis_hash treated as false.
-        let block = block_with_genesis("legacy-optional-gh", "net-x", [7u8; 32]);
+        // V15 is a real legacy protocol with an optional genesis hash.
+        let block = block_with_genesis(algo_types::consensus::CONSENSUS_V15, "net-x", [7u8; 32]);
         let restored = restore_block_genesis_fields(&stx, &block);
         assert_eq!(
             restored.txn.genesis_hash, [0u8; 32],

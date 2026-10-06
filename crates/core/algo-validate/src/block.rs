@@ -212,16 +212,7 @@ impl fmt::Display for BlockValidationError {
 /// payset (including the early proposal group-ID screen) must restore them
 /// first (issue #1686).
 pub fn restore_payset_genesis_fields(block: &Block) -> Vec<SignedTransaction> {
-    let mut restored = block.payset.clone();
-    for stx in &mut restored {
-        if stx.has_genesis_id && stx.txn.genesis_id.is_empty() {
-            stx.txn.genesis_id.clone_from(&block.genesis_id);
-        }
-        if stx.txn.genesis_hash == [0u8; 32] {
-            stx.txn.genesis_hash.clone_from(&block.genesis_hash);
-        }
-    }
-    restored
+    algo_types::genesis_restore::restore_payset_genesis_fields(block)
 }
 
 /// Validate a complete block.

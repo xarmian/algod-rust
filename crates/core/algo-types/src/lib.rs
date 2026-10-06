@@ -23,6 +23,7 @@ mod address;
 mod block;
 pub mod consensus;
 mod digest;
+pub mod genesis_restore;
 mod header;
 pub mod networks;
 pub mod pq;

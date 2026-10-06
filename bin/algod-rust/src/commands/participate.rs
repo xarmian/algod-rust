@@ -1373,19 +1373,13 @@ impl SimpleBlockEvaluator {
     /// it from the block header. This is needed for signature verification
     /// and txid computation.
     fn restore_genesis_fields(&self, stx: &mut algo_types::SignedTransaction) {
-        if stx.has_genesis_id && stx.txn.genesis_id.is_empty() {
-            stx.txn.genesis_id.clone_from(&self.hdr.genesis_id);
-        }
-        // Restore genesis_hash when the protocol requires it (modern protocols)
-        // or when the STIB flag indicates the hash was stripped. On old protocols
-        // where genesis_hash is optional, only restore if has_genesis_hash is set
-        // to avoid mutating transactions that were legitimately signed without a
-        // genesis hash. Mirrors Go's DecodeSignedTxn logic.
-        if stx.txn.genesis_hash == [0u8; 32]
-            && (self.consensus_params.require_genesis_hash || stx.has_genesis_hash)
-        {
-            stx.txn.genesis_hash.clone_from(&self.hdr.genesis_hash);
-        }
+        // Single shared, protocol-aware rule (go's DecodeSignedTxn; #1704).
+        algo_types::genesis_restore::restore_genesis_fields_with(
+            stx,
+            &self.hdr.genesis_id,
+            &self.hdr.genesis_hash,
+            self.consensus_params.require_genesis_hash,
+        );
     }
 
     /// Perform stateless validation only (well-formedness, group ID, fees,

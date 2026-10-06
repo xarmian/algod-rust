@@ -160,13 +160,7 @@ pub fn compute_payset_merkle_root(block: &Block) -> Hash {
         .map(|stx| {
             // Restore genesis fields for txid computation (matching go-algorand's
             // DecodeSignedTxn behavior).
-            let mut restored_txn = stx.txn.clone();
-            if stx.has_genesis_id && restored_txn.genesis_id.is_empty() {
-                restored_txn.genesis_id.clone_from(&block.genesis_id);
-            }
-            if restored_txn.genesis_hash == [0u8; 32] {
-                restored_txn.genesis_hash = block.genesis_hash;
-            }
+            let restored_txn = algo_types::genesis_restore::restored_block_txn(stx, block);
 
             let txid = compute_txid(&restored_txn);
             // STIB hash uses the payset entry as stored in the block
@@ -362,13 +356,7 @@ pub fn compute_vector_commitment(block: &Block, algo: HashAlgo) -> Vec<u8> {
         .iter()
         .map(|stx| {
             // Restore genesis fields for txid (same as primary Merkle tree).
-            let mut restored_txn = stx.txn.clone();
-            if stx.has_genesis_id && restored_txn.genesis_id.is_empty() {
-                restored_txn.genesis_id.clone_from(&block.genesis_id);
-            }
-            if restored_txn.genesis_hash == [0u8; 32] {
-                restored_txn.genesis_hash = block.genesis_hash;
-            }
+            let restored_txn = algo_types::genesis_restore::restored_block_txn(stx, block);
 
             let txn_canonical = canonical_encode_transaction(&restored_txn);
             // Leaf data (txid, stib_hash) always uses SHA-256 for both
@@ -449,13 +437,7 @@ pub fn compute_payset_merkle_root_raw(block: &Block, raw_blobs: &[Vec<u8>]) -> H
         .zip(raw_blobs.iter())
         .map(|(stx, raw_blob)| {
             // Restore genesis fields for txid computation (same as typed path).
-            let mut restored_txn = stx.txn.clone();
-            if stx.has_genesis_id && restored_txn.genesis_id.is_empty() {
-                restored_txn.genesis_id.clone_from(&block.genesis_id);
-            }
-            if restored_txn.genesis_hash == [0u8; 32] {
-                restored_txn.genesis_hash = block.genesis_hash;
-            }
+            let restored_txn = algo_types::genesis_restore::restored_block_txn(stx, block);
 
             let txid = compute_txid(&restored_txn);
             let stib_hash = compute_stib_hash_raw(raw_blob);
@@ -529,13 +511,7 @@ pub fn compute_vector_commitment_raw(
         .zip(raw_blobs.iter())
         .map(|(stx, raw_blob)| {
             // Restore genesis fields for txid (same as typed path).
-            let mut restored_txn = stx.txn.clone();
-            if stx.has_genesis_id && restored_txn.genesis_id.is_empty() {
-                restored_txn.genesis_id.clone_from(&block.genesis_id);
-            }
-            if restored_txn.genesis_hash == [0u8; 32] {
-                restored_txn.genesis_hash = block.genesis_hash;
-            }
+            let restored_txn = algo_types::genesis_restore::restored_block_txn(stx, block);
 
             let txn_canonical = canonical_encode_transaction(&restored_txn);
             // Leaf data always uses SHA-256 for vector commitments.

@@ -1520,25 +1520,15 @@ fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
 
 /// Copy of `block` whose payset transactions carry the genesis id/hash the
 /// block stores only once in its header, or `None` if nothing needs
-/// restoring. Mirrors `algo_validate::merkle::compute_payset_merkle_root`'s
-/// restoration (and go's `DecodeSignedTxn`).
+/// restoring. Uses the single shared, protocol-aware rule
+/// ([`algo_types::genesis_restore`], go's `DecodeSignedTxn`; issue #1704).
 fn block_with_restored_genesis_fields(block: &Block) -> Option<Block> {
-    let needs = block.payset.iter().any(|stx| {
-        (stx.has_genesis_id && stx.txn.genesis_id.is_empty() && !block.genesis_id.is_empty())
-            || (stx.txn.genesis_hash == [0u8; 32] && block.genesis_hash != [0u8; 32])
-    });
-    if !needs {
+    let restored = algo_types::genesis_restore::restore_payset_genesis_fields(block);
+    if restored == block.payset {
         return None;
     }
     let mut b = block.clone();
-    for stx in &mut b.payset {
-        if stx.has_genesis_id && stx.txn.genesis_id.is_empty() {
-            stx.txn.genesis_id.clone_from(&block.genesis_id);
-        }
-        if stx.txn.genesis_hash == [0u8; 32] {
-            stx.txn.genesis_hash = block.genesis_hash;
-        }
-    }
+    b.payset = restored;
     Some(b)
 }
 
@@ -14319,5 +14309,51 @@ return
 
         assert!(ad.sender_rewards > 0, "v15+ must record SenderRewards");
         assert!(ad.receiver_rewards > 0, "v15+ must record ReceiverRewards");
+    }
+
+    // ── payset genesis-field restoration is protocol-aware (issue #1704) ──
+    // go: `BlockHeader.DecodeSignedTxn` (data/bookkeeping/block.go:983).
+
+    fn genesis_restore_block(proto: &str, hgi: bool, hgh: bool) -> Block {
+        let stx = SignedTransaction {
+            has_genesis_id: hgi,
+            has_genesis_hash: hgh,
+            ..SignedTransaction::default()
+        };
+        Block {
+            genesis_id: "gid".into(),
+            genesis_hash: [9u8; 32],
+            current_protocol: proto.into(),
+            payset: vec![stx],
+            ..Block::default()
+        }
+    }
+
+    #[test]
+    fn restore_hash_optional_protocol_without_hgh_keeps_gh_omitted() {
+        use algo_types::consensus::CONSENSUS_V15;
+        let b = genesis_restore_block(CONSENSUS_V15, false, false);
+        assert!(block_with_restored_genesis_fields(&b).is_none());
+        let b = genesis_restore_block(CONSENSUS_V15, true, false);
+        let r = block_with_restored_genesis_fields(&b).expect("gen restored via hgi");
+        assert_eq!(r.payset[0].txn.genesis_id, "gid");
+        assert_eq!(r.payset[0].txn.genesis_hash, [0u8; 32]);
+    }
+
+    #[test]
+    fn restore_hash_optional_protocol_with_hgh_restores_gh() {
+        use algo_types::consensus::CONSENSUS_V15;
+        let b = genesis_restore_block(CONSENSUS_V15, false, true);
+        let r = block_with_restored_genesis_fields(&b).expect("gh restored via hgh");
+        assert_eq!(r.payset[0].txn.genesis_hash, [9u8; 32]);
+        assert_eq!(r.payset[0].txn.genesis_id, "", "gen needs hgi");
+    }
+
+    #[test]
+    fn restore_hash_required_protocol_restores_gh_without_hgh() {
+        use algo_types::consensus::CONSENSUS_V41;
+        let b = genesis_restore_block(CONSENSUS_V41, false, false);
+        let r = block_with_restored_genesis_fields(&b).expect("gh restored");
+        assert_eq!(r.payset[0].txn.genesis_hash, [9u8; 32]);
     }
 }
