@@ -3314,8 +3314,20 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
                 && txn.txn_type == "pay"
                 && txn.amount == 0;
             let unwritten_non_pay_participant = *addr != txn.sender && txn.txn_type != "pay";
+            // Issue #1729: the receiver and close-to target of a `pay` are
+            // written by go's `Move` only when it actually credits them
+            // (`!amt.IsZero() || units > 0 || !UnfundedSenders`), each time
+            // after `WithUpdatedRewards`. `apply_pay_at_level` performs that
+            // credit and brings both up to the current level via
+            // `apply_rewards`, so an empty (absent/default) receiver or
+            // close-to target is left untouched by this pass and stamped there.
+            let pay_credit_role = txn.txn_type == "pay"
+                && *addr != txn.sender
+                && (*addr == txn.receiver || *addr == txn.close_remainder_to);
+            let unwritten_role =
+                unwritten_sender || unwritten_non_pay_participant || pay_credit_role;
             let skip_write = ctx.consensus.unfunded_senders
-                && (unwritten_sender || unwritten_pay_receiver || unwritten_non_pay_participant)
+                && unwritten_role
                 && account_before.micro_algos == 0
                 && reward == 0
                 && (unwritten_sender
@@ -3364,7 +3376,7 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
         match txn.txn_type.as_str() {
             "pay" => {
                 apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink, &ctx.consensus)?;
-                let ad = apply_pay(store, &stx.txn)?;
+                let ad = apply_pay_at_level(store, &stx.txn, Some(ctx.rewards_level))?;
                 apply_data.closing_amount = ad.closing_amount;
             }
             "acfg" => {
@@ -3705,6 +3717,26 @@ pub fn apply_pay<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     txn: &algo_types::Transaction,
 ) -> Result<InnerApplyData, AlgoError> {
+    apply_pay_at_level(store, txn, None)
+}
+
+/// [`apply_pay`] that also brings the close-to account's rewards up to
+/// `rewards_level` when it is credited (issue #1729).
+///
+/// go's close `Move(sender, CloseRemainderTo, closeAmount)`
+/// (`ledger/apply/payment.go` L47-52; `ledger/eval/eval.go` `Move`
+/// ~L568-618) runs `WithUpdatedRewards` (`data/basics/userBalance.go`
+/// L453-473) on the target before crediting it, so an account the earlier
+/// rewards pass left untouched (empty, `UnfundedSenders`) ends up with
+/// `rewards_base` = the current level. `apply_rewards` is that helper; the
+/// target holds 0 µAlgo at this point in the skipped case, so no reward accrues,
+/// and when the pass already updated it, the call is a no-op. `None` (inner
+/// transactions, whose context carries no level) keeps the old behaviour.
+pub fn apply_pay_at_level<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    txn: &algo_types::Transaction,
+    rewards_level: Option<u64>,
+) -> Result<InnerApplyData, AlgoError> {
     let mut ad = InnerApplyData::default();
 
     // Transfer amount from sender to receiver.
@@ -3732,6 +3764,9 @@ pub fn apply_pay<L: crate::store_trait::LedgerStore>(
 
         if txn.amount > 0 {
             let mut receiver = store.get_or_default_account(&txn.receiver);
+            if let Some(level) = rewards_level {
+                crate::rewards::apply_rewards(&mut receiver, level);
+            }
             receiver.micro_algos += txn.amount;
             store.set_account(&txn.receiver, receiver);
         }
@@ -3801,6 +3836,9 @@ pub fn apply_pay<L: crate::store_trait::LedgerStore>(
         // Credit close-to address.
         if close_amount > 0 {
             let mut close_to = store.get_or_default_account(&txn.close_remainder_to);
+            if let Some(level) = rewards_level {
+                crate::rewards::apply_rewards(&mut close_to, level);
+            }
             close_to.micro_algos += close_amount;
             store.set_account(&txn.close_remainder_to, close_to);
         }
@@ -10176,6 +10214,248 @@ mod tests {
         assert!(store.get_account(&receiver).is_none());
     }
 
+    /// Issue #1729 (live mainnet round 65723764 -> 65723784, shadow-execute
+    /// finding): a `pay` of amount 0 whose receiver is also its
+    /// `close_remainder_to` into a non-existent account. go's `Move` skips the
+    /// zero-amount receiver write, but the following close `Move` (closing
+    /// amount > 0) writes the account with `WithUpdatedRewards`, i.e.
+    /// `rewards_base` = current level. algod-rust skipped the receiver in the
+    /// rewards pass and `apply_pay` then credited the close-to account with
+    /// `rewards_base` still 0, so its next transaction computed a bogus
+    /// `sender_rewards` (go recorded 0).
+    #[test]
+    fn issue_1729_close_to_new_receiver_gets_rewards_base_stamped() {
+        let closer = Address([7u8; 32]);
+        let target = Address([8u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut store = make_state_with_accounts(&[(closer, 2_000_000), (fee_sink, 0)], fee_sink);
+        let mut ctx = apply_context_for_version(fee_sink, 1, algo_types::consensus::CONSENSUS_V34);
+        ctx.rewards_level = 218_288;
+        assert!(ctx.consensus.unfunded_senders);
+        let mut closer_acct = store.get_account(&closer).unwrap().clone();
+        closer_acct.rewards_base = 218_288;
+        crate::store_trait::LedgerStore::set_account(&mut store, &closer, closer_acct);
+
+        let mut close = pay_txn(closer, target, 0, 1_000);
+        close.txn.close_remainder_to = target;
+        let ad = apply_transaction(&mut store, &close, &ctx, 0).expect("close must apply");
+        assert_eq!(ad.closing_amount, 1_999_000);
+        let t = store
+            .get_account(&target)
+            .expect("close-to account written");
+        assert_eq!(t.micro_algos, 1_999_000);
+        assert_eq!(
+            t.rewards_base, 218_288,
+            "go's close Move stamps rewards_base at the current level"
+        );
+
+        // The target's next transaction must record zero SenderRewards.
+        let other = Address([9u8; 32]);
+        let ad2 = apply_transaction(
+            &mut store,
+            &pay_txn(target, other, 1_000_000, 1_000),
+            &ctx,
+            0,
+        )
+        .expect("follow-up pay must apply");
+        assert_eq!(ad2.sender_rewards, 0);
+    }
+
+    fn issue_1729_ctx(fee_sink: Address, version: &str) -> ApplyContext {
+        let mut ctx = apply_context_for_version(fee_sink, 1, version);
+        ctx.rewards_level = 218_288;
+        ctx
+    }
+
+    fn issue_1729_set_base(store: &mut LedgerState, addr: Address, base: u64) {
+        let mut a = store.get_account(&addr).unwrap().clone();
+        a.rewards_base = base;
+        crate::store_trait::LedgerStore::set_account(store, &addr, a);
+    }
+
+    /// (a) closing amount 0: go's close `Move` skips the write, so a
+    /// zero-amount receiver that is also the close-to target stays absent.
+    #[test]
+    fn issue_1729_zero_closing_amount_does_not_materialise_close_to() {
+        let closer = Address([7u8; 32]);
+        let target = Address([8u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut store = make_state_with_accounts(&[(closer, 1_000), (fee_sink, 0)], fee_sink);
+        let ctx = issue_1729_ctx(fee_sink, algo_types::consensus::CONSENSUS_V34);
+        issue_1729_set_base(&mut store, closer, 218_288);
+        let mut close = pay_txn(closer, target, 0, 1_000);
+        close.txn.close_remainder_to = target;
+        let ad = apply_transaction(&mut store, &close, &ctx, 0).expect("close must apply");
+        assert_eq!(ad.closing_amount, 0);
+        assert!(store.get_account(&target).is_none());
+    }
+
+    /// Sibling (issue #1729 audit): a close-to account distinct from the
+    /// receiver, with closing amount 0, must not be materialised either
+    /// (go `Move`: `!amt.IsZero() || units > 0 || !UnfundedSenders`).
+    #[test]
+    fn issue_1729_distinct_close_to_with_zero_closing_amount_stays_absent() {
+        let closer = Address([7u8; 32]);
+        let receiver = Address([8u8; 32]);
+        let target = Address([6u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut store =
+            make_state_with_accounts(&[(closer, 1_000 + 500_000), (fee_sink, 0)], fee_sink);
+        let ctx = issue_1729_ctx(fee_sink, algo_types::consensus::CONSENSUS_V34);
+        issue_1729_set_base(&mut store, closer, 218_288);
+        let mut close = pay_txn(closer, receiver, 500_000, 1_000);
+        close.txn.close_remainder_to = target;
+        let ad = apply_transaction(&mut store, &close, &ctx, 0).expect("close must apply");
+        assert_eq!(ad.closing_amount, 0);
+        assert!(
+            store.get_account(&target).is_none(),
+            "an untouched empty close-to account must stay non-existent"
+        );
+    }
+
+    /// Distinct close-to account with closing amount > 0 is stamped and
+    /// credited.
+    #[test]
+    fn issue_1729_distinct_close_to_with_funds_is_stamped() {
+        let closer = Address([7u8; 32]);
+        let receiver = Address([8u8; 32]);
+        let target = Address([6u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut store = make_state_with_accounts(&[(closer, 2_000_000), (fee_sink, 0)], fee_sink);
+        let ctx = issue_1729_ctx(fee_sink, algo_types::consensus::CONSENSUS_V34);
+        issue_1729_set_base(&mut store, closer, 218_288);
+        let mut close = pay_txn(closer, receiver, 500_000, 1_000);
+        close.txn.close_remainder_to = target;
+        let ad = apply_transaction(&mut store, &close, &ctx, 0).expect("close must apply");
+        assert_eq!(ad.closing_amount, 1_499_000);
+        let t = store.get_account(&target).unwrap();
+        assert_eq!((t.micro_algos, t.rewards_base), (1_499_000, 218_288));
+        assert_eq!(ad.close_rewards, 0);
+    }
+
+    /// Review regression guard: amount > 0 paid to a fresh receiver that is
+    /// also the close-to target. go's `Move` credits the receiver with
+    /// `WithUpdatedRewards` at the current level before adding the amount,
+    /// then the close `Move` repeats it for the closer; neither accrues a
+    /// reward on an empty account and both leave `rewards_base` = level.
+    fn issue_1729_run_receiver_is_close_to(closer_balance: u64) -> (ApplyData, LedgerState) {
+        let closer = Address([7u8; 32]);
+        let target = Address([8u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut store =
+            make_state_with_accounts(&[(closer, closer_balance), (fee_sink, 0)], fee_sink);
+        let ctx = issue_1729_ctx(fee_sink, algo_types::consensus::CONSENSUS_V34);
+        issue_1729_set_base(&mut store, closer, 218_288);
+        let mut close = pay_txn(closer, target, 5_000_000, 1_000);
+        close.txn.close_remainder_to = target;
+        let ad = apply_transaction(&mut store, &close, &ctx, 0).expect("close must apply");
+        (ad, store)
+    }
+
+    #[test]
+    fn issue_1729_receiver_is_close_to_amount_and_closing_amount_positive() {
+        let (ad, store) = issue_1729_run_receiver_is_close_to(8_000_000);
+        assert_eq!(ad.closing_amount, 2_999_000);
+        let t = store.get_account(&Address([8u8; 32])).unwrap();
+        assert_eq!((t.micro_algos, t.rewards_base), (7_999_000, 218_288));
+        assert_eq!((ad.receiver_rewards, ad.close_rewards), (0, 0));
+        assert_eq!(t.rewarded_micro_algos, 0);
+    }
+
+    #[test]
+    fn issue_1729_receiver_is_close_to_amount_positive_closing_amount_zero() {
+        let (ad, store) = issue_1729_run_receiver_is_close_to(5_001_000);
+        assert_eq!(ad.closing_amount, 0);
+        let t = store.get_account(&Address([8u8; 32])).unwrap();
+        assert_eq!((t.micro_algos, t.rewards_base), (5_000_000, 218_288));
+        assert_eq!((ad.receiver_rewards, ad.close_rewards), (0, 0));
+    }
+
+    /// Original behaviour: amount > 0 to a fresh receiver distinct from the
+    /// close-to target is stamped (by the rewards pass) as before.
+    #[test]
+    fn issue_1729_fresh_receiver_amount_positive_distinct_close_to() {
+        let closer = Address([7u8; 32]);
+        let receiver = Address([8u8; 32]);
+        let target = Address([6u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut store = make_state_with_accounts(&[(closer, 8_000_000), (fee_sink, 0)], fee_sink);
+        let ctx = issue_1729_ctx(fee_sink, algo_types::consensus::CONSENSUS_V34);
+        issue_1729_set_base(&mut store, closer, 218_288);
+        let mut close = pay_txn(closer, receiver, 5_000_000, 1_000);
+        close.txn.close_remainder_to = target;
+        let ad = apply_transaction(&mut store, &close, &ctx, 0).unwrap();
+        let r = store.get_account(&receiver).unwrap();
+        assert_eq!((r.micro_algos, r.rewards_base), (5_000_000, 218_288));
+        let t = store.get_account(&target).unwrap();
+        assert_eq!((t.micro_algos, t.rewards_base), (2_999_000, 218_288));
+        assert_eq!((ad.receiver_rewards, ad.close_rewards), (0, 0));
+    }
+
+    /// (b) pre-UnfundedSenders protocol: the rewards pass writes everything,
+    /// and the close-to target ends up stamped exactly once.
+    #[test]
+    fn issue_1729_pre_unfunded_senders_protocol_stamps_close_to() {
+        let closer = Address([7u8; 32]);
+        let target = Address([8u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut store = make_state_with_accounts(&[(closer, 2_000_000), (fee_sink, 0)], fee_sink);
+        let ctx = issue_1729_ctx(fee_sink, algo_types::consensus::CONSENSUS_V33);
+        assert!(!ctx.consensus.unfunded_senders);
+        issue_1729_set_base(&mut store, closer, 218_288);
+        let mut close = pay_txn(closer, target, 0, 1_000);
+        close.txn.close_remainder_to = target;
+        apply_transaction(&mut store, &close, &ctx, 0).expect("close must apply");
+        let t = store.get_account(&target).unwrap();
+        assert_eq!((t.micro_algos, t.rewards_base), (1_999_000, 218_288));
+    }
+
+    /// (c) an existing zero-balance close-to account that still holds an
+    /// asset (stale `rewards_base`) is brought to the current level.
+    #[test]
+    fn issue_1729_existing_zero_balance_close_to_with_assets_is_stamped() {
+        let closer = Address([7u8; 32]);
+        let target = Address([8u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut store = make_state_with_accounts(&[(closer, 2_000_000), (fee_sink, 0)], fee_sink);
+        let ctx = issue_1729_ctx(fee_sink, algo_types::consensus::CONSENSUS_V34);
+        issue_1729_set_base(&mut store, closer, 218_288);
+        let stale = algo_types::AccountData {
+            total_assets_opted_in: 1,
+            rewards_base: 5,
+            ..Default::default()
+        };
+        crate::store_trait::LedgerStore::set_account(&mut store, &target, stale);
+        let mut close = pay_txn(closer, target, 0, 1_000);
+        close.txn.close_remainder_to = target;
+        apply_transaction(&mut store, &close, &ctx, 0).expect("close must apply");
+        let t = store.get_account(&target).unwrap();
+        assert_eq!((t.micro_algos, t.rewards_base), (1_999_000, 218_288));
+        assert_eq!(t.rewards_base, ctx.rewards_level);
+        assert_eq!(t.rewarded_micro_algos, 0);
+    }
+
+    /// (d) a close that fails after the rewards pass (sender holds an asset)
+    /// leaves no stamp/materialisation of the target and no change to the sender.
+    #[test]
+    fn issue_1729_failed_close_leaves_target_untouched() {
+        let closer = Address([7u8; 32]);
+        let target = Address([8u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut store = make_state_with_accounts(&[(closer, 2_000_000), (fee_sink, 0)], fee_sink);
+        let ctx = issue_1729_ctx(fee_sink, algo_types::consensus::CONSENSUS_V34);
+        let mut a = store.get_account(&closer).unwrap().clone();
+        a.rewards_base = 218_288;
+        a.total_assets_opted_in = 1;
+        crate::store_trait::LedgerStore::set_account(&mut store, &closer, a);
+        let before = store.get_account(&closer).unwrap().clone();
+        let mut close = pay_txn(closer, target, 0, 1_000);
+        close.txn.close_remainder_to = target;
+        apply_transaction(&mut store, &close, &ctx, 0).expect_err("close with assets must fail");
+        assert!(store.get_account(&target).is_none());
+        assert_eq!(store.get_account(&closer).unwrap(), &before);
+    }
+
     /// Issue #1654 (live mainnet block 65549710): go checks minimum balances
     /// once per top-level transaction, so an inner transaction (depth > 0)
     /// may transiently leave an account below its minimum while replaying.
@@ -10314,6 +10594,90 @@ return
                 .unwrap_or(true),
             "app account must have been closed out"
         );
+    }
+
+    /// (e) KNOWN GAP, tracked in #1731 and NOT covered by the #1729 fix:
+    /// inner transactions apply no rewards, so this test is ignored. An app account closed out by an inner
+    /// `pay` (amount 0, receiver == close_remainder_to == a fresh account)
+    /// must leave the target stamped at the block's rewards level, as go's
+    /// close `Move` does for inner transactions too.
+    #[test]
+    #[ignore = "known gap tracked in #1731: inner transactions apply no rewards"]
+    fn issue_1729_execute_inner_pay_close_to_new_account_gets_rewards_base() {
+        let creator = Address([1u8; 32]);
+        let target = Address([5u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([9u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(creator, 20_000_000), (fee_sink, 0), (rewards_pool, 0)],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+        issue_1729_set_base(&mut state, creator, 218_288);
+        let target_hex: String = target.0.iter().map(|b| format!("{b:02x}")).collect();
+        let approval_src = format!(
+            "#pragma version 8
+            txn ApplicationID
+            bz approve
+            itxn_begin
+            int pay
+            itxn_field TypeEnum
+            byte 0x{target_hex}
+            itxn_field Receiver
+            byte 0x{target_hex}
+            itxn_field CloseRemainderTo
+            itxn_submit
+            approve:
+            int 1
+            return
+"
+        );
+        let approval = algo_avm::assembler::assemble_string(&approval_src)
+            .expect("approval program must assemble")
+            .program;
+        let clear = algo_avm::assembler::assemble_string(
+            "#pragma version 8
+int 1
+return
+",
+        )
+        .unwrap()
+        .program;
+        let mk_block = |round: u64, payset: Vec<SignedTransaction>| Block {
+            round: Round(round),
+            fee_sink,
+            rewards_pool,
+            rewards_level: 218_288,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset,
+            ..Block::default()
+        };
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = creator;
+        create.txn.fee = 1_000;
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        let d1 =
+            apply_block_with_delta_mode(&mut state, &mk_block(1, vec![create]), ApplyMode::Execute)
+                .unwrap();
+        let (&app_id, _) = d1.creatables.iter().next().unwrap();
+        let app_addr = Address(crate::avm_context::app_address(app_id));
+        let fund = pay_txn(creator, app_addr, 300_000, 1_000);
+        apply_block_with_delta_mode(&mut state, &mk_block(2, vec![fund]), ApplyMode::Execute)
+            .unwrap();
+        let mut call = SignedTransaction::default();
+        call.txn.txn_type = "appl".into();
+        call.txn.sender = creator;
+        call.txn.fee = 2_000;
+        call.txn.application_id = app_id;
+        apply_block_with_delta_mode(&mut state, &mk_block(3, vec![call]), ApplyMode::Execute)
+            .expect("inner close-out must apply");
+        let t = state
+            .get_account(&target)
+            .expect("close-to account written");
+        assert_eq!(t.micro_algos, 300_000);
+        assert_eq!(t.rewards_base, 218_288);
     }
 
     /// Issue #1660: go's `BlockEvaluator.transaction` (`ledger/eval/eval.go`)
