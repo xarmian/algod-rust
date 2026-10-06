@@ -329,31 +329,51 @@ impl SyncBackend for AlgodSyncBackend {
 
 /// Fetch the inclusive range `[start, end]` through `fetcher`, failing unless
 /// every block arrived. Shared by the REST and gossip [`SyncBackend`]s
-/// (issue #1719 unified their two identical copies). The orchestrator's
-/// replay phase treats this error as "peer cannot serve that range" and
-/// hands off to normal catchup rather than failing the catchpoint catchup.
+/// (issue #1719 unified their two identical copies).
+///
+/// `ParallelBlockFetcher` swallows per-round fetch errors and simply closes
+/// the channel, so the only signal available here is how many blocks came
+/// back:
+/// - none at all -> [`AlgoError::NotFound`] ("the peer cannot serve this
+///   range", e.g. a non-archival relay asked for rounds past its retention);
+///   the orchestrator's replay phase hands off to normal catchup on this.
+/// - some but not all -> [`AlgoError::Ledger`] (a transient/partial failure
+///   that must keep failing loudly).
+///
+/// An inverted range (`end < start`) is empty. The fetcher is always
+/// cancelled on exit so no background fetch task outlives the call.
 async fn collect_block_range(
     fetcher: &ParallelBlockFetcher,
     start: u64,
     end: u64,
     cancel: CancellationToken,
 ) -> Result<Vec<(u64, Block)>, AlgoError> {
+    if end < start {
+        return Ok(Vec::new());
+    }
+    let expected = (end - start).saturating_add(1);
+    let _stop_fetcher = cancel.clone().drop_guard();
     // fetch_range uses half-open [start, end), so add 1 to include `end`.
-    let mut rx = fetcher.fetch_range(Round(start), Round(end + 1), cancel);
-    let mut blocks = Vec::with_capacity((end - start + 1) as usize);
+    let mut rx = fetcher.fetch_range(Round(start), Round(end.saturating_add(1)), cancel);
+    let mut blocks = Vec::with_capacity(expected.min(4096) as usize);
     while let Some((round, block_resp)) = rx.recv().await {
         blocks.push((round.0, block_resp.block));
     }
-    if blocks.len() != (end - start + 1) as usize {
-        return Err(AlgoError::Ledger {
-            message: format!(
-                "parallel fetch incomplete: expected {} blocks, got {}",
-                end - start + 1,
-                blocks.len()
-            ),
-        });
+    if blocks.len() as u64 == expected {
+        return Ok(blocks);
     }
-    Ok(blocks)
+    if blocks.is_empty() {
+        return Err(AlgoError::NotFound(format!(
+            "parallel fetch incomplete: expected {expected} blocks, got 0 \
+             (peer served none of rounds {start}..={end})"
+        )));
+    }
+    Err(AlgoError::Ledger {
+        message: format!(
+            "parallel fetch incomplete: expected {expected} blocks, got {}",
+            blocks.len()
+        ),
+    })
 }
 
 /// Build the same [`SyncBackend`] the standalone `algod-rust sync`
@@ -1392,6 +1412,9 @@ pub async fn run(
     println!("Accounts imported:  {}", result.accounts_imported);
     println!("Blocks replayed:    {}", result.blocks_replayed);
     println!("Duration:           {:.1}s", result.duration.as_secs_f64());
+    if let Some(stop) = &result.stopped_early {
+        println!("Stopped early:      {stop}");
+    }
 
     Ok(())
 }
@@ -1403,6 +1426,89 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- collect_block_range (issue #1719) ----------------------------------
+
+    /// `BlockSource` serving rounds `< serve_below`; everything else errors
+    /// (which `ParallelBlockFetcher` turns into a closed channel).
+    struct PartialSource {
+        serve_below: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl BlockSource for PartialSource {
+        async fn get_block_raw(&self, _round: Round) -> algo_error::Result<Vec<u8>> {
+            unimplemented!()
+        }
+        async fn get_block(&self, round: Round) -> algo_error::Result<algo_types::BlockResponse> {
+            if round.0 >= self.serve_below {
+                return Err(AlgoError::NotFound("past retention".into()));
+            }
+            Ok(serde_json::from_value(serde_json::json!({"block": {"rnd": round.0}})).unwrap())
+        }
+        async fn get_status(&self) -> algo_error::Result<algo_rest_client::NodeStatus> {
+            unimplemented!()
+        }
+        async fn wait_for_round(
+            &self,
+            _round: Round,
+        ) -> algo_error::Result<algo_rest_client::NodeStatus> {
+            unimplemented!()
+        }
+    }
+
+    fn partial_fetcher(serve_below: u64) -> ParallelBlockFetcher {
+        ParallelBlockFetcher::new(Arc::new(PartialSource { serve_below }), 4)
+    }
+
+    #[tokio::test]
+    async fn collect_block_range_returns_every_block_when_served() {
+        let cancel = CancellationToken::new();
+        let blocks = collect_block_range(&partial_fetcher(u64::MAX), 10, 15, cancel.clone())
+            .await
+            .unwrap();
+        assert_eq!(blocks.len(), 6);
+        assert!(
+            cancel.is_cancelled(),
+            "fetcher token must be cancelled on exit"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_block_range_reports_not_found_when_nothing_is_served() {
+        let cancel = CancellationToken::new();
+        let err = collect_block_range(&partial_fetcher(0), 10, 25, cancel.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AlgoError::NotFound(_)), "{err:?}");
+        assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn collect_block_range_partial_result_is_a_hard_error_not_not_found() {
+        let err = collect_block_range(&partial_fetcher(12), 10, 15, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AlgoError::Ledger { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn collect_block_range_inverted_or_extreme_range_does_not_overflow() {
+        let blocks = collect_block_range(&partial_fetcher(0), 9, 3, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(blocks.is_empty());
+        // end == u64::MAX must not wrap `end + 1` to 0.
+        let err = collect_block_range(
+            &partial_fetcher(0),
+            u64::MAX - 1,
+            u64::MAX,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AlgoError::NotFound(_)), "{err:?}");
+    }
 
     // -- Fake UnicastPeer (for gossip-peer-snapshot tests) -----------------
 

@@ -220,6 +220,30 @@ pub struct SyncResult {
     pub blocks_replayed: u64,
     /// Total wall-clock duration of the sync.
     pub duration: Duration,
+    /// `Some` when block replay ended before the network tip because the
+    /// peer could not serve the remaining blocks (issue #1719). The ledger
+    /// is consistent at [`ReplayStoppedEarly::stopped_at_round`]; the
+    /// caller's normal catchup/follow service must continue from there.
+    pub stopped_early: Option<ReplayStoppedEarly>,
+}
+
+/// Replay ended short of its target because the peer served no more blocks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayStoppedEarly {
+    /// Last round applied to the ledger.
+    pub stopped_at_round: u64,
+    /// Round replay was trying to reach.
+    pub target_round: u64,
+}
+
+impl std::fmt::Display for ReplayStoppedEarly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "stopped at round {}: peer cannot serve blocks beyond (target {})",
+            self.stopped_at_round, self.target_round
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +527,8 @@ pub struct SyncOrchestrator {
     blocks_replayed: u64,
     /// The final round reached after replay.
     final_round: u64,
+    /// Set when replay handed off before reaching its target (issue #1719).
+    replay_stopped_early: Option<ReplayStoppedEarly>,
     /// Cancellation token — checked between phases and during long operations.
     cancel: CancellationToken,
     /// Optional progress callback — invoked on state transitions and periodic updates.
@@ -539,6 +565,7 @@ impl SyncOrchestrator {
             cutover_backup: None,
             blocks_replayed: 0,
             final_round: 0,
+            replay_stopped_early: None,
             cancel: CancellationToken::new(),
             on_progress: None,
             eval_delta_stats: EvalDeltaStats::default(),
@@ -1915,7 +1942,8 @@ impl SyncOrchestrator {
                 tracing::warn!(
                     error = %msg,
                     catchpoint_round,
-                    "peer cannot report the network round (no /v2/status); ending catchpoint                      replay at the catchpoint round"
+                    "peer cannot report the network round (no /v2/status); ending catchpoint \
+                     replay at the catchpoint round"
                 );
                 catchpoint_round
             }
@@ -1994,7 +2022,9 @@ impl SyncOrchestrator {
                 target_round,
                 "already at or past target round, no blocks to replay"
             );
-            self.final_round = catchpoint_round;
+            // Last APPLIED round: on a resumed run that is past the
+            // catchpoint round (`start_round - 1`), not the catchpoint itself.
+            self.final_round = start_round - 1;
             self.blocks_replayed = window_applied;
             self.progress.phase_progress = 1.0;
             self.notify_progress();
@@ -2025,6 +2055,11 @@ impl SyncOrchestrator {
 
         let timer = Instant::now();
         let mut blocks_applied: u64 = 0;
+        // Last applied round; advanced per block below. Starting from
+        // `start_round - 1` keeps it right on resumed runs and when the very
+        // first batch cannot be served.
+        self.final_round = start_round - 1;
+        let mut stopped_early: Option<ReplayStoppedEarly> = None;
         let progress_interval: u64 = 1000;
 
         // Fetch blocks in batches to overlap network I/O with block application.
@@ -2055,24 +2090,36 @@ impl SyncOrchestrator {
                 self.config.concurrency,
             ) {
                 Ok(batch) => batch,
+                // Shutdown arrived while the fetch was in flight.
+                Err(_) if self.cancel.is_cancelled() => {
+                    self.blocks_replayed = blocks_applied;
+                    return Err(self.handle_cancellation());
+                }
                 // Issue #1719 (soak 37455478923): the ledger is verified and
                 // consistent at `batch_start - 1` (>= the catchpoint round),
                 // but the live-catchup peer is commonly a non-archival relay
-                // that no longer serves rounds this far behind the tip
-                // (`expected 16 blocks, got 0`). go-algorand's
+                // that no longer serves rounds this far behind the tip -- the
+                // backends report "peer served none of the requested blocks"
+                // as `NotFound` (like the `/v2/status` 404 above). go-algorand's
                 // `CatchpointCatchupService` ends at the catchpoint round and
                 // its normal catchup service closes the gap with archival
-                // peer selection and retries. Do the same: hand off instead
-                // of failing a catchup whose state is already good. An
-                // explicit `end_round` is a promise to reach that round, so
-                // it still fails.
-                Err(e) if self.config.end_round.is_none() && !self.cancel.is_cancelled() => {
+                // peer selection and retries. Do the same: end replay here
+                // and report it in the result. Every other error (transient
+                // network, auth, decode, partial batch) still fails loudly,
+                // and an explicit `end_round` is a promise to reach that
+                // round, so it fails too.
+                Err(AlgoError::NotFound(msg)) if self.config.end_round.is_none() => {
                     tracing::warn!(
-                        error = %e,
+                        error = %msg,
                         batch_start,
                         target_round,
-                        "peer cannot serve post-cutover blocks; ending catchpoint replay and                          handing off to normal catchup"
+                        "peer cannot serve post-cutover blocks; ending catchpoint replay and \
+                         handing off to normal catchup"
                     );
+                    stopped_early = Some(ReplayStoppedEarly {
+                        stopped_at_round: batch_start - 1,
+                        target_round,
+                    });
                     break;
                 }
                 Err(e) => return Err(e),
@@ -2158,8 +2205,26 @@ impl SyncOrchestrator {
             batch_start = batch_end + 1;
         }
 
-        self.final_round = self.final_round.max(catchpoint_round);
         self.blocks_replayed = window_applied + blocks_applied;
+
+        if let Some(stop) = stopped_early {
+            tracing::warn!(
+                stopped_at_round = stop.stopped_at_round,
+                target_round = stop.target_round,
+                blocks_applied,
+                "replay ended early at round {} (target {})",
+                stop.stopped_at_round,
+                stop.target_round
+            );
+            self.progress.phase_detail = format!(
+                "replay ended early at round {} (target {})",
+                stop.stopped_at_round, stop.target_round
+            );
+            self.replay_stopped_early = Some(stop);
+            // Deliberately no phase_progress = 1.0 / "block replay complete".
+            self.notify_progress();
+            return Ok(());
+        }
 
         tracing::info!(
             blocks_applied,
@@ -2259,7 +2324,19 @@ impl SyncOrchestrator {
             Ok(_) => {
                 // If follow mode is enabled, enter it before transitioning to Complete.
                 // Follow mode runs until cancellation; a cancellation exit is not an error.
-                if self.config.follow_after_sync && !self.backend.is_noop() {
+                // Issue #1719: if replay stopped because the peer cannot serve
+                // blocks, follow mode would poll that same peer forever
+                // ("failed to fetch block, retrying" every 500 ms). Skip it and
+                // report the stop in the result; the caller's normal catchup
+                // service owns the rest of the gap.
+                if let Some(stop) = result.as_ref().ok().and_then(|r| r.stopped_early.clone()) {
+                    if self.config.follow_after_sync {
+                        tracing::warn!(
+                            %stop,
+                            "skipping follow mode: the peer cannot serve blocks beyond the replay stop"
+                        );
+                    }
+                } else if self.config.follow_after_sync && !self.backend.is_noop() {
                     if let Err(e) = self.run_follow_mode().await {
                         if self.cancel.is_cancelled() {
                             tracing::info!("follow mode stopped: sync cancelled");
@@ -2549,6 +2626,7 @@ impl SyncOrchestrator {
                 accounts_imported: 0,
                 blocks_replayed: 0,
                 duration: start.elapsed(),
+                stopped_early: None,
             });
         }
 
@@ -2629,6 +2707,7 @@ impl SyncOrchestrator {
             accounts_imported: self.accounts_imported,
             blocks_replayed: self.blocks_replayed,
             duration: start.elapsed(),
+            stopped_early: self.replay_stopped_early.clone(),
         })
     }
 }
@@ -4002,6 +4081,23 @@ mod tests {
     /// `spend_round` (`receiver` spends part of it back) -- the second is
     /// only applicable if the first was replayed on top of the catchpoint's
     /// `balances_round` state.
+    #[derive(Clone, Copy)]
+    enum BatchMode {
+        Serve,
+        /// Every batch fails with the error this builds (arg: blocks asked).
+        Fail(fn(u64) -> AlgoError),
+        /// Batches starting at or below this round are served, later ones
+        /// come back empty.
+        ServeUpTo(u64),
+    }
+
+    /// What the parallel fetcher reports when the peer serves nothing.
+    fn not_served(expected: u64) -> AlgoError {
+        AlgoError::NotFound(format!(
+            "peer served none of the {expected} requested blocks"
+        ))
+    }
+
     struct WindowBackend {
         source_file: std::path::PathBuf,
         payer: [u8; 32],
@@ -4010,9 +4106,13 @@ mod tests {
         spend_round: u64,
         /// Emulate a relay gossip port: `/v2/status` answers 404.
         status_not_found: bool,
-        /// Emulate a non-archival peer: every post-cutover block fetch comes
-        /// back empty (`parallel fetch incomplete: expected N blocks, got 0`).
-        batch_fetch_fails: bool,
+        /// How `fetch_blocks_batch` behaves for post-cutover rounds.
+        batch_mode: BatchMode,
+        /// `get_current_round` reports `spend_round + tip_extra`.
+        tip_extra: u64,
+        /// Cancel this token from inside `fetch_blocks_batch` (shutdown
+        /// arriving mid-fetch).
+        cancel_on_fetch: Option<CancellationToken>,
     }
 
     impl WindowBackend {
@@ -4075,13 +4175,15 @@ mod tests {
             end: u64,
             _concurrency: usize,
         ) -> Result<Vec<(u64, Block)>, AlgoError> {
-            if self.batch_fetch_fails {
-                return Err(AlgoError::Ledger {
-                    message: format!(
-                        "parallel fetch incomplete: expected {} blocks, got 0",
-                        end - start + 1
-                    ),
-                });
+            if let Some(token) = &self.cancel_on_fetch {
+                token.cancel();
+            }
+            match self.batch_mode {
+                BatchMode::Fail(make) => return Err(make(end - start + 1)),
+                BatchMode::ServeUpTo(last) if start > last => {
+                    return Err(not_served(end - start + 1));
+                }
+                _ => {}
             }
             Ok((start..=end).map(|r| (r, self.block(r))).collect())
         }
@@ -4092,7 +4194,7 @@ mod tests {
                     "GET /v2/status: 404 page not found".to_string(),
                 ));
             }
-            Ok(self.spend_round)
+            Ok(self.spend_round + self.tip_extra)
         }
 
         fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
@@ -4154,7 +4256,9 @@ mod tests {
                 window_round: BALANCES_ROUND + 1,
                 spend_round: BLOCKS_ROUND + 1,
                 status_not_found: false,
-                batch_fetch_fails: false,
+                batch_mode: BatchMode::Serve,
+                tip_extra: 0,
+                cancel_on_fetch: None,
             },
         );
 
@@ -4219,7 +4323,9 @@ mod tests {
                 window_round: BALANCES_ROUND + 1,
                 spend_round: BLOCKS_ROUND + 1,
                 status_not_found: true,
-                batch_fetch_fails: false,
+                batch_mode: BatchMode::Serve,
+                tip_extra: 0,
+                cancel_on_fetch: None,
             },
         );
         orchestrator.run_download_ledger().unwrap();
@@ -4282,7 +4388,9 @@ mod tests {
                 window_round: BALANCES_ROUND + 1,
                 spend_round: BLOCKS_ROUND + 1,
                 status_not_found: false,
-                batch_fetch_fails: true,
+                batch_mode: BatchMode::Fail(not_served),
+                tip_extra: 0,
+                cancel_on_fetch: None,
             },
         );
         orchestrator.run_download_ledger().unwrap();
@@ -4293,9 +4401,254 @@ mod tests {
             .run_replay_blocks()
             .expect("an unservable post-cutover range must hand off, not fail the catchup");
         assert_eq!(orchestrator.final_round, BLOCKS_ROUND);
+        assert_eq!(
+            orchestrator.replay_stopped_early,
+            Some(ReplayStoppedEarly {
+                stopped_at_round: BLOCKS_ROUND,
+                target_round: BLOCKS_ROUND + 1,
+            })
+        );
         let ledger =
             crate::sqlite::SqliteLedger::open_with_prefix(&orchestrator.config.db_path).unwrap();
         assert_eq!(ledger.current_round().0, BLOCKS_ROUND);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Builds a go-shaped window catchpoint, runs every phase up to (not
+    /// including) replay against a [`WindowBackend`] with the given batch
+    /// behaviour, and returns the orchestrator ready for `run_replay_blocks`.
+    /// `tip_extra` rounds are reported beyond the post-window block.
+    fn window_orchestrator(
+        tag: &str,
+        batch_mode: BatchMode,
+        tip_extra: u64,
+        cancel_on_fetch: Option<CancellationToken>,
+        configure: impl FnOnce(&mut SyncConfig),
+    ) -> (SyncOrchestrator, std::path::PathBuf) {
+        use crate::catchpoint::writer::{export_catchpoint_file, ExportOptions};
+
+        const BALANCES_ROUND: u64 = 1000;
+        const BLOCKS_ROUND: u64 = BALANCES_ROUND + 320;
+        const PAYER: [u8; 32] = [1u8; 32];
+
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-{tag}-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = window_source_db(PAYER, 10_000_000);
+        let path = dir.join("go-shaped.tar.gz");
+        let export_result = export_catchpoint_file(
+            &src,
+            &path,
+            &ExportOptions {
+                balances_round: BALANCES_ROUND,
+                blocks_round: BLOCKS_ROUND,
+                block_header_digest: [7u8; 32],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut config = test_config(dir.join("ledger"), 1);
+        config.catchpoint_label = Some(export_result.label.clone());
+        configure(&mut config);
+        let mut orchestrator = SyncOrchestrator::with_backend(
+            config,
+            WindowBackend {
+                source_file: path,
+                payer: PAYER,
+                receiver: [2u8; 32],
+                window_round: BALANCES_ROUND + 1,
+                spend_round: BLOCKS_ROUND + 1,
+                status_not_found: false,
+                batch_mode,
+                tip_extra,
+                cancel_on_fetch,
+            },
+        );
+        orchestrator.run_download_ledger().unwrap();
+        orchestrator.run_import_ledger().unwrap();
+        orchestrator.run_verify_ledger().unwrap();
+        orchestrator.run_download_lookback().unwrap();
+        (orchestrator, dir)
+    }
+
+    const WINDOW_BLOCKS_ROUND: u64 = 1320;
+
+    /// Review of #1722: only "the peer cannot serve the range" may hand
+    /// off. Transient network, auth and decode failures must still fail the
+    /// replay loudly exactly as before.
+    #[test]
+    fn replay_handoff_does_not_swallow_transient_auth_or_decode_errors() {
+        fn transient(_: u64) -> AlgoError {
+            AlgoError::RestClient {
+                source: "connection reset by peer".into(),
+                context: "GET /v2/blocks".into(),
+            }
+        }
+        fn auth(_: u64) -> AlgoError {
+            AlgoError::RestClient {
+                source: "401 Unauthorized".into(),
+                context: "GET /v2/blocks".into(),
+            }
+        }
+        fn decode(_: u64) -> AlgoError {
+            AlgoError::Codec {
+                source: "bad msgpack".into(),
+                context: "decode block".into(),
+            }
+        }
+        fn partial(expected: u64) -> AlgoError {
+            AlgoError::Ledger {
+                message: format!("parallel fetch incomplete: expected {expected} blocks, got 1"),
+            }
+        }
+        for (name, make) in [
+            ("transient", transient as fn(u64) -> AlgoError),
+            ("auth", auth),
+            ("decode", decode),
+            ("partial", partial),
+        ] {
+            let (mut o, dir) = window_orchestrator(
+                &format!("no-swallow-{name}"),
+                BatchMode::Fail(make),
+                10,
+                None,
+                |_| {},
+            );
+            let err = o
+                .run_replay_blocks()
+                .expect_err(&format!("{name} fetch error must fail the replay"));
+            assert!(
+                !matches!(err, AlgoError::NotFound(_)),
+                "{name}: unexpected {err:?}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// An explicit `end_round` is a promise to reach it: an unservable range
+    /// still fails.
+    #[test]
+    fn replay_with_explicit_end_round_still_fails_when_peer_cannot_serve() {
+        let (mut o, dir) = window_orchestrator(
+            "end-round-fails",
+            BatchMode::Fail(not_served),
+            10,
+            None,
+            |c| c.end_round = Some(WINDOW_BLOCKS_ROUND + 5),
+        );
+        let err = o
+            .run_replay_blocks()
+            .expect_err("end_round must still fail");
+        assert!(matches!(err, AlgoError::NotFound(_)), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A shutdown arriving while the failing fetch is in flight is reported
+    /// as a cancellation, not as a hand-off.
+    #[test]
+    fn replay_reports_cancellation_when_cancelled_during_failing_fetch() {
+        let token = CancellationToken::new();
+        let (mut o, dir) = window_orchestrator(
+            "cancel-during-fetch",
+            BatchMode::Fail(not_served),
+            10,
+            Some(token.clone()),
+            |_| {},
+        );
+        o.set_cancel(token);
+        let err = o
+            .run_replay_blocks()
+            .expect_err("cancellation must surface");
+        assert!(err.to_string().contains("cancelled"), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review of #1722: a hand-off after some batches were applied must leave
+    /// `final_round` at the last APPLIED round, report the shortfall (no
+    /// 100% progress), and a resumed run past the catchpoint must also report
+    /// its own last applied round rather than the catchpoint round.
+    #[test]
+    fn replay_stopped_early_reports_last_applied_round_and_shortfall() {
+        // concurrency 1 => batches of 2: [1321,1322] served, [1323,..] not.
+        let (mut o, dir) = window_orchestrator(
+            "stopped-early-partial",
+            BatchMode::ServeUpTo(WINDOW_BLOCKS_ROUND + 1),
+            10,
+            None,
+            |_| {},
+        );
+        o.run_replay_blocks().expect("hand-off, not failure");
+        assert_eq!(o.final_round, WINDOW_BLOCKS_ROUND + 2);
+        assert_eq!(
+            o.replay_stopped_early,
+            Some(ReplayStoppedEarly {
+                stopped_at_round: WINDOW_BLOCKS_ROUND + 2,
+                target_round: WINDOW_BLOCKS_ROUND + 11,
+            })
+        );
+        assert!(
+            o.progress.phase_progress < 1.0,
+            "a shortfall must not report a finished replay"
+        );
+        assert!(
+            o.progress.phase_detail.contains("ended early"),
+            "{}",
+            o.progress.phase_detail
+        );
+        let ledger = crate::sqlite::SqliteLedger::open_with_prefix(&o.config.db_path).unwrap();
+        assert_eq!(ledger.current_round().0, WINDOW_BLOCKS_ROUND + 2);
+        drop(ledger);
+
+        // Resume: the tracker is already past the catchpoint and the target
+        // (explicit end_round) is behind it -> the early-return path, whose
+        // final_round must be the tracker round, not the catchpoint round.
+        o.state = SyncState::DownloadingLookback;
+        o.config.end_round = Some(WINDOW_BLOCKS_ROUND + 2);
+        o.run_replay_blocks().expect("nothing left to replay");
+        assert_eq!(o.final_round, WINDOW_BLOCKS_ROUND + 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review of #1722: standalone `sync --follow` must not enter follow mode
+    /// against the very peer that just failed to serve blocks (it would warn
+    /// and retry every 500 ms forever); the result states where it stopped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_skips_follow_mode_and_reports_stop_when_peer_cannot_serve_blocks() {
+        let (o, dir) =
+            window_orchestrator("skip-follow", BatchMode::Fail(not_served), 10, None, |c| {
+                c.follow_after_sync = true
+            });
+        // `window_orchestrator` already ran the early phases; a fresh
+        // orchestrator over the same config drives the whole `run()`.
+        let config = o.config.clone();
+        let (backend_file, ..) = (config.db_path.parent().unwrap().join("go-shaped.tar.gz"),);
+        let mut fresh = config.clone();
+        fresh.db_path = dir.join("ledger-run");
+        let mut run = SyncOrchestrator::with_backend(
+            fresh,
+            WindowBackend {
+                source_file: backend_file,
+                payer: [1u8; 32],
+                receiver: [2u8; 32],
+                window_round: 1001,
+                spend_round: WINDOW_BLOCKS_ROUND + 1,
+                status_not_found: false,
+                batch_mode: BatchMode::Fail(not_served),
+                tip_extra: 10,
+                cancel_on_fetch: None,
+            },
+        );
+        let result = tokio::time::timeout(Duration::from_secs(120), run.run())
+            .await
+            .expect("follow mode must be skipped, not loop forever")
+            .expect("hand-off is not a failure");
+        assert_eq!(result.final_round, WINDOW_BLOCKS_ROUND);
+        let stop = result.stopped_early.expect("result must report the stop");
+        assert_eq!(stop.stopped_at_round, WINDOW_BLOCKS_ROUND);
+        assert!(stop.to_string().contains("peer cannot serve blocks beyond"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4403,7 +4756,9 @@ mod tests {
                 window_round: BALANCES_ROUND + 1,
                 spend_round: BLOCKS_ROUND + 1,
                 status_not_found: false,
-                batch_fetch_fails: false,
+                batch_mode: BatchMode::Serve,
+                tip_extra: 0,
+                cancel_on_fetch: None,
             },
         );
         orchestrator.run_download_ledger().unwrap();
