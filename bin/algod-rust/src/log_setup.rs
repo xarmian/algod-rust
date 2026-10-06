@@ -28,7 +28,11 @@
 //! dropped. A small background thread reports the number of dropped events
 //! (at ERROR, like the events themselves) once the window has ended, even if
 //! no further event arrives. Drops of a window still open when the process
-//! exits are not reported.
+//! exits are not reported (there is no graceful-shutdown hook to flush from,
+//! and a hard crash loses the last partial window too: acceptable, as the
+//! first events of every window still pass and are logged).
+//! Only ERROR events of the noisy target are limited; its warn/info/debug
+//! events pass untouched.
 //!
 //! Only an explicit `RUST_LOG` directive whose target is the noisy target or
 //! a string prefix of it (`hickory_proto=debug`, `hickory=trace`) at
@@ -42,7 +46,9 @@
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use tracing::{Event, Metadata, Subscriber};
+use tracing::level_filters::LevelFilter;
+use tracing::subscriber::Interest;
+use tracing::{Event, Level, Metadata, Subscriber};
 use tracing_subscriber::filter::FilterExt;
 use tracing_subscriber::layer::{Context, Filter, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
@@ -55,20 +61,21 @@ const WINDOW: Duration = Duration::from_secs(60);
 /// How often the summary thread checks for an ended window.
 const SUMMARY_TICK: Duration = Duration::from_secs(1);
 
-/// The noisy target is defined by this predicate: an event target emitted by
-/// the validator handle, whichever hickory generation's module path it
-/// carries (the lockfile has both). Limiting uses it directly.
-fn is_noisy_target(target: &str) -> bool {
-    target.starts_with("hickory_proto") && target.ends_with("dnssec_dns_handle")
-}
-
-/// The known module paths satisfying [`is_noisy_target`], used only to
-/// evaluate `RUST_LOG` prefix overrides (a test checks every path here
-/// satisfies the predicate, so the two cannot drift apart).
+/// The module paths of the validator handle, one per hickory generation in
+/// the lockfile. This list is the single definition of the noisy target:
+/// both limiting ([`is_noisy_target`]) and `RUST_LOG` prefix overrides
+/// ([`names_noisy_target`]) are derived from it, so a path can never be
+/// limited yet impossible to override (an unlisted new path is simply not
+/// limited).
 const NOISY_TARGET_PATHS: [&str; 2] = [
     "hickory_proto::dnssec::dnssec_dns_handle",
     "hickory_proto::xfer::dnssec_dns_handle",
 ];
+
+/// Whether an event target is the noisy target.
+fn is_noisy_target(target: &str) -> bool {
+    NOISY_TARGET_PATHS.contains(&target)
+}
 
 /// Split a `RUST_LOG`-style spec on commas that are not nested inside
 /// `[...]` / `{...}` span and field filters.
@@ -260,6 +267,7 @@ impl RateLimiter {
 fn spawn_summary_ticker(
     limiter: &Arc<RateLimiter>,
     tick: Duration,
+    clock: impl Fn() -> Instant + Send + 'static,
     report: impl Fn(u64) + Send + 'static,
 ) -> std::io::Result<()> {
     let weak: Weak<RateLimiter> = Arc::downgrade(limiter);
@@ -270,7 +278,7 @@ fn spawn_summary_ticker(
             let Some(limiter) = weak.upgrade() else {
                 break;
             };
-            if let Some(n) = limiter.flush(Instant::now()) {
+            if let Some(n) = limiter.flush(clock()) {
                 report(n);
             }
         })
@@ -322,6 +330,12 @@ fn build_limiter(
     }
 }
 
+/// Whether events of this callsite are subject to the limiter: ERROR level
+/// on the noisy target only.
+fn is_limited(meta: &Metadata<'_>) -> bool {
+    *meta.level() == Level::ERROR && is_noisy_target(meta.target())
+}
+
 /// Per-layer filter applying [`RateLimiter`] to noisy-target events; `None`
 /// (operator override) lets everything through.
 struct NoisyTargetLimiter {
@@ -333,11 +347,34 @@ impl<S: Subscriber> Filter<S> for NoisyTargetLimiter {
         true
     }
 
+    /// Never narrows what the other half of an `And` decides: `always` makes
+    /// the combined interest follow the `EnvFilter`'s, so statically
+    /// disabled callsites stay cached as disabled. The one exception is a
+    /// callsite this filter may veto per event (a limited ERROR of the noisy
+    /// target): it must be `sometimes`, because with `always` tracing skips
+    /// the per-event `enabled` call and tracing-subscriber's per-layer
+    /// filter state is then left stale after an `event_enabled` veto (a
+    /// debug assertion in debug builds, silently dropped events otherwise).
+    fn callsite_enabled(&self, meta: &'static Metadata<'static>) -> Interest {
+        if self.limiter.is_some() && is_limited(meta) {
+            Interest::sometimes()
+        } else {
+            Interest::always()
+        }
+    }
+
+    /// No opinion of its own: with `TRACE` the combined hint (the minimum of
+    /// both halves) equals the `EnvFilter`'s.
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        Some(LevelFilter::TRACE)
+    }
+
+    /// Only ERROR events of the noisy target are limited (the flood is
+    /// ERROR); everything else, including that target's warn/info/debug,
+    /// passes untouched.
     fn event_enabled(&self, event: &Event<'_>, _: &Context<'_, S>) -> bool {
         match &self.limiter {
-            Some(limiter) if is_noisy_target(event.metadata().target()) => {
-                limiter.admit(Instant::now())
-            }
+            Some(limiter) if is_limited(event.metadata()) => limiter.admit(Instant::now()),
             _ => true,
         }
     }
@@ -349,7 +386,7 @@ pub fn init() {
     let raw = std::env::var("RUST_LOG").ok();
     let setup = LogSetup::resolve(raw.as_deref());
     let limiter = build_limiter(setup.rate_limit, |l| {
-        spawn_summary_ticker(l, SUMMARY_TICK, emit_summary)
+        spawn_summary_ticker(l, SUMMARY_TICK, Instant::now, emit_summary)
     });
     let layer = tracing_subscriber::fmt::layer()
         .with_filter(setup.filter.and(NoisyTargetLimiter { limiter }));
@@ -359,8 +396,7 @@ pub fn init() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     #[test]
     fn override_matrix_only_explicit_trace_debug_directives_disable_the_limiter() {
@@ -602,21 +638,34 @@ mod tests {
     /// (no exact counts or timings; those are covered with the fake clock).
     #[test]
     fn ticker_smoke_eventually_emits_a_summary() {
-        let l = Arc::new(RateLimiter::new(2, Duration::from_millis(50)));
+        // The ticker reads an injected clock, so the window end is a store
+        // to an atomic, not a wait: only the deadline poll is real time.
+        let base = Instant::now();
+        let offset_secs = Arc::new(AtomicU64::new(0));
+        let off = offset_secs.clone();
+        let l = Arc::new(RateLimiter::new(2, Duration::from_secs(60)));
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
-        spawn_summary_ticker(&l, Duration::from_millis(10), move |n| {
-            sink.lock().unwrap().push(n)
-        })
+        spawn_summary_ticker(
+            &l,
+            Duration::from_millis(5),
+            move || base + Duration::from_secs(off.load(Ordering::SeqCst)),
+            move |n| sink.lock().unwrap().push(n),
+        )
         .expect("spawn ticker");
         for _ in 0..10 {
-            l.admit(Instant::now());
+            l.admit(base);
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
+        offset_secs.store(61, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while seen.lock().unwrap().is_empty() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(!seen.lock().unwrap().is_empty(), "a summary was emitted");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![8],
+            "8 of 10 admits were dropped"
+        );
     }
 
     /// The summary is an error-volume notice: it must survive a filter that
@@ -677,5 +726,113 @@ mod tests {
         let limiter = Some(Arc::new(RateLimiter::new(2, Duration::from_secs(3600))));
         assert_eq!(count_events(limiter), 2 + 3);
         assert_eq!(count_events(None), 10 + 4 + 3);
+    }
+
+    /// Reverse of the override matrix: every limited path is overridable by
+    /// its own full path and by every proper `::`/string prefix, so nothing
+    /// can be limited yet un-overridable.
+    #[test]
+    fn every_limited_path_is_overridable_by_it_and_its_prefixes() {
+        for p in NOISY_TARGET_PATHS {
+            assert!(is_noisy_target(p));
+            for end in 1..=p.len() {
+                if !p.is_char_boundary(end) {
+                    continue;
+                }
+                let spec = format!("info,{}=debug", &p[..end]);
+                assert!(names_noisy_target(&spec), "{spec} must override {p}");
+            }
+        }
+    }
+
+    /// Only ERROR events of the noisy target are limited.
+    #[test]
+    fn only_error_level_events_are_limited() {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let limiter = Arc::new(RateLimiter::new(1, Duration::from_secs(3600)));
+        let sub = tracing_subscriber::registry().with(Count(seen.clone()).with_filter(
+            EnvFilter::new("trace").and(NoisyTargetLimiter {
+                limiter: Some(limiter.clone()),
+            }),
+        ));
+        tracing::subscriber::with_default(sub, || {
+            for _ in 0..4 {
+                tracing::warn!(target: "hickory_proto::dnssec::dnssec_dns_handle", "w");
+                tracing::info!(target: "hickory_proto::dnssec::dnssec_dns_handle", "i");
+                tracing::debug!(target: "hickory_proto::dnssec::dnssec_dns_handle", "d");
+            }
+            for _ in 0..4 {
+                tracing::error!(target: "hickory_proto::dnssec::dnssec_dns_handle", "e");
+            }
+        });
+        // 12 untouched non-errors + 1 admitted error; 3 errors dropped.
+        assert_eq!(seen.load(Ordering::SeqCst), 12 + 1);
+        assert_eq!(
+            limiter.flush(Instant::now() + Duration::from_secs(7200)),
+            Some(3)
+        );
+    }
+
+    /// The limiter must not defeat the EnvFilter's static max level or
+    /// callsite interest (a performance property): the combined layer filter
+    /// hints exactly what the EnvFilter alone does, and a disabled-level
+    /// callsite stays statically disabled.
+    #[test]
+    fn limiter_preserves_envfilter_static_interest() {
+        let env_hint = EnvFilter::new("info").max_level_hint();
+        let combined = EnvFilter::new("info").and(NoisyTargetLimiter { limiter: None });
+        assert_eq!(
+            <_ as Filter<tracing_subscriber::Registry>>::max_level_hint(&combined),
+            env_hint
+        );
+        assert_eq!(env_hint, Some(LevelFilter::INFO));
+
+        // A debug callsite under "info" stays statically never-enabled in
+        // the combined filter, while the limiter alone says `always`.
+        struct Capture(Mutex<Option<&'static Metadata<'static>>>);
+        impl<S: Subscriber> Layer<S> for Capture {
+            fn on_event(&self, e: &Event<'_>, _: Context<'_, S>) {
+                *self.0.lock().unwrap() = Some(e.metadata());
+            }
+        }
+        let cap = Arc::new(Capture(Mutex::new(None)));
+        struct Share(Arc<Capture>);
+        impl<S: Subscriber> Layer<S> for Share {
+            fn on_event(&self, e: &Event<'_>, c: Context<'_, S>) {
+                self.0.on_event(e, c)
+            }
+        }
+        let sub = tracing_subscriber::registry().with(Share(cap.clone()));
+        tracing::subscriber::with_default(sub, || tracing::debug!("capture"));
+        let meta = cap.0.lock().unwrap().expect("captured metadata");
+        assert_eq!(*meta.level(), Level::DEBUG);
+        let l = NoisyTargetLimiter { limiter: None };
+        assert!(
+            <_ as Filter<tracing_subscriber::Registry>>::callsite_enabled(&l, meta).is_always()
+        );
+        assert_eq!(
+            <_ as Filter<tracing_subscriber::Registry>>::max_level_hint(&l),
+            Some(LevelFilter::TRACE)
+        );
+        // A limited callsite (noisy-target ERROR) must stay `sometimes` while
+        // the limiter is active (see `callsite_enabled`), `always` without.
+        let sub = tracing_subscriber::registry().with(Share(cap.clone()));
+        tracing::subscriber::with_default(
+            sub,
+            || tracing::error!(target: "hickory_proto::dnssec::dnssec_dns_handle", "capture"),
+        );
+        let noisy = cap.0.lock().unwrap().expect("captured metadata");
+        let active = NoisyTargetLimiter {
+            limiter: Some(Arc::new(RateLimiter::new(1, Duration::from_secs(60)))),
+        };
+        type R = tracing_subscriber::Registry;
+        assert!(<_ as Filter<R>>::callsite_enabled(&active, noisy).is_sometimes());
+        assert!(<_ as Filter<R>>::callsite_enabled(&active, meta).is_always());
+        assert!(<_ as Filter<R>>::callsite_enabled(&l, noisy).is_always());
+        assert!(
+            <_ as Filter<tracing_subscriber::Registry>>::callsite_enabled(&combined, meta)
+                .is_never(),
+            "combined interest follows the EnvFilter's never"
+        );
     }
 }

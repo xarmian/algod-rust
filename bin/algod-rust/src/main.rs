@@ -32,7 +32,7 @@ use cli::{AlgocfgAction, AlgocfgProfileAction, BenchAction, CatchpointAction, Cl
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize structured logging (JSON in prod, pretty for dev).
+    // Initialize logging: RUST_LOG-driven fmt output plus the hickory DNSSEC error rate limit.
     log_setup::init();
 
     let cli = Cli::parse();
