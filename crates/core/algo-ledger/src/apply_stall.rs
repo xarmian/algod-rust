@@ -116,7 +116,23 @@ impl ApplyStallTracker {
         self.failures_total.fetch_add(1, Ordering::Relaxed);
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_mut() {
-            Some(s) if s.round == round && s.error == error => {
+            Some(s) if s.round == round => {
+                // Same block: keep the newest error text for display, but
+                // key detection on the round only (messages may embed
+                // varying detail).
+                if s.error != error {
+                    s.error = error.to_string();
+                }
+                if s.stalled {
+                    // One failure per backoff window: a failure arriving
+                    // while the wait is still pending (e.g. the agreement
+                    // path re-submitting the same block) neither advances
+                    // the backoff nor extends the wait.
+                    let window = Self::backoff_for(s.consecutive);
+                    if now.saturating_duration_since(s.last_failure) < window {
+                        return StallTransition::StillStalled;
+                    }
+                }
                 s.consecutive += 1;
                 s.last_failure = now;
                 if s.stalled {
@@ -129,8 +145,8 @@ impl ApplyStallTracker {
                 }
             }
             _ => {
-                // A different block or a different error: not (yet) a
-                // deterministic repeat. Start over.
+                // A different block: not (yet) a deterministic repeat.
+                // Start over.
                 *guard = Some(Inner {
                     round,
                     error: error.to_string(),
@@ -145,6 +161,25 @@ impl ApplyStallTracker {
                 StallTransition::NewFailure
             }
         }
+    }
+
+    /// Tell the tracker the ledger's last committed round. A stall on a
+    /// round the ledger has reached or passed (catchpoint jump, follow
+    /// apply, another bridge) is obsolete and is dropped. Returns
+    /// [`StallTransition::Left`] when that ended a stall.
+    pub fn observe_ledger_round(&self, ledger_round: u64) -> StallTransition {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.as_ref().is_some_and(|s| s.round <= ledger_round) {
+            if let Some(s) = guard.take() {
+                if s.stalled {
+                    return StallTransition::Left {
+                        round: s.round,
+                        failures: s.consecutive,
+                    };
+                }
+            }
+        }
+        StallTransition::None
     }
 
     /// Record that a block committed: any failure history is obsolete.
@@ -244,9 +279,16 @@ mod tests {
     #[test]
     fn identical_repeat_enters_stall_once() {
         let t = ApplyStallTracker::new();
-        t.record_failure(10, "boom");
-        assert_eq!(t.record_failure(10, "boom"), StallTransition::Entered);
-        assert_eq!(t.record_failure(10, "boom"), StallTransition::StillStalled);
+        let t0 = Instant::now();
+        t.record_failure_at(10, "boom", t0);
+        assert_eq!(
+            t.record_failure_at(10, "boom", t0),
+            StallTransition::Entered
+        );
+        assert_eq!(
+            t.record_failure_at(10, "boom", t0 + Duration::from_secs(8)),
+            StallTransition::StillStalled
+        );
         let s = t.stall().expect("stalled");
         assert_eq!((s.round, s.consecutive_failures), (10, 3));
         assert_eq!(s.error, "boom");
@@ -254,12 +296,65 @@ mod tests {
     }
 
     #[test]
-    fn different_error_or_block_restarts_the_count() {
+    fn different_block_restarts_the_count() {
         let t = ApplyStallTracker::new();
         t.record_failure(10, "a");
-        assert_eq!(t.record_failure(10, "b"), StallTransition::NewFailure);
         assert_eq!(t.record_failure(11, "b"), StallTransition::NewFailure);
         assert!(t.stall().is_none());
+    }
+
+    #[test]
+    fn varying_error_text_for_the_same_round_still_stalls() {
+        let t = ApplyStallTracker::new();
+        assert_eq!(
+            t.record_failure(10, "tx 0xaa: bad"),
+            StallTransition::NewFailure
+        );
+        assert_eq!(
+            t.record_failure(10, "tx 0xbb: bad"),
+            StallTransition::Entered
+        );
+        let s = t.stall().expect("stalled");
+        assert_eq!(s.consecutive_failures, 2);
+        assert_eq!(s.error, "tx 0xbb: bad", "latest error is kept for display");
+    }
+
+    #[test]
+    fn failures_inside_the_backoff_window_are_not_counted() {
+        let t = ApplyStallTracker::new();
+        let t0 = Instant::now();
+        t.record_failure_at(10, "e", t0);
+        t.record_failure_at(10, "e", t0);
+        // Agreement-side repeats while the 8 s wait is pending.
+        for i in 1..=20 {
+            t.record_failure_at(10, "e", t0 + Duration::from_millis(100 * i));
+        }
+        assert_eq!(t.stall().unwrap().consecutive_failures, 2);
+        // The wait was not extended by the repeats.
+        assert_eq!(t.retry_in_at(t0 + Duration::from_secs(8)), None);
+        // Every attempt still counts in the monotonic total.
+        assert_eq!(t.failures_total(), 22);
+        // A failure after the window advances the backoff.
+        t.record_failure_at(10, "e", t0 + Duration::from_secs(8));
+        assert_eq!(t.stall().unwrap().consecutive_failures, 3);
+    }
+
+    #[test]
+    fn ledger_passing_the_stalled_round_clears_the_stall() {
+        let t = ApplyStallTracker::new();
+        t.record_failure(10, "e");
+        t.record_failure(10, "e");
+        assert_eq!(t.observe_ledger_round(9), StallTransition::None);
+        assert!(t.stall().is_some());
+        assert_eq!(
+            t.observe_ledger_round(10),
+            StallTransition::Left {
+                round: 10,
+                failures: 2
+            }
+        );
+        assert!(t.stall().is_none());
+        assert!(t.retry_in().is_none());
     }
 
     #[test]

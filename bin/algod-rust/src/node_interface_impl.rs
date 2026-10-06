@@ -500,6 +500,13 @@ impl AlgodNodeInterface {
         self
     }
 
+    /// Drop a stall the ledger has already moved past by some other path.
+    fn observe_ledger_round_for_stall(&self, tracker: &algo_ledger::ApplyStallTracker) {
+        if let Ok(l) = self.ledger.lock() {
+            tracker.observe_ledger_round(l.current_round().0);
+        }
+    }
+
     /// Attach the block-apply stall tracker (issue #1677) so `/v2/status`
     /// and `/metrics` report a node stalled on an invalid block.
     #[must_use]
@@ -2296,6 +2303,12 @@ impl NodeInterface for AlgodNodeInterface {
         serde_json::to_value(metrics.snapshot()).ok()
     }
 
+    fn apply_stall(&self) -> Option<algo_ledger::ApplyStall> {
+        let tracker = self.apply_stall_tracker.as_ref()?;
+        self.observe_ledger_round_for_stall(tracker);
+        tracker.stall()
+    }
+
     /// The same participation counters, plus (issue #776) the Go-runtime-
     /// equivalent process counters and network-interface counters when
     /// their respective `config.json` flags are set, all in Prometheus text
@@ -2310,10 +2323,6 @@ impl NodeInterface for AlgodNodeInterface {
     /// process-wide, not consensus-participation-specific, matching
     /// go-algorand's own `/metrics` (its registrations are independent of
     /// whether the node holds a participation key).
-    fn apply_stall(&self) -> Option<algo_ledger::ApplyStall> {
-        self.apply_stall_tracker.as_ref()?.stall()
-    }
-
     fn metrics_exposition(&self) -> Option<String> {
         let mut text = String::new();
         if let Some(metrics) = self.participation_metrics.as_ref() {
@@ -2329,6 +2338,7 @@ impl NodeInterface for AlgodNodeInterface {
         // Issue #1677: block-apply failure counter and stalled-on-invalid-
         // block gauges, so monitoring can alert without log parsing.
         if let Some(tracker) = self.apply_stall_tracker.as_ref() {
+            self.observe_ledger_round_for_stall(tracker);
             text.push_str(&tracker.to_prometheus_text());
         }
         if let Some(pool) = self.pool.as_ref() {

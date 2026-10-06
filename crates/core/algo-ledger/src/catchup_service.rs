@@ -1746,6 +1746,9 @@ mod tests {
         round: Mutex<Round>,
         tracker: Arc<crate::ApplyStallTracker>,
         attempts: AtomicU64,
+        /// Fake clock origin: failure `n` happens at `base + 9 s * n`, i.e.
+        /// each attempt lands just after the previous backoff window.
+        base: std::time::Instant,
         deterministic: AtomicBool,
         succeed: AtomicBool,
     }
@@ -1756,6 +1759,7 @@ mod tests {
                 round: Mutex::new(Round(0)),
                 tracker: Arc::new(crate::ApplyStallTracker::new()),
                 attempts: AtomicU64::new(0),
+                base: std::time::Instant::now(),
                 deterministic: AtomicBool::new(deterministic),
                 succeed: AtomicBool::new(false),
             })
@@ -1778,13 +1782,16 @@ mod tests {
             } else {
                 format!("transient io error #{n}")
             };
-            self.tracker.record_failure(block.round.0, &err);
+            let at = self.base + Duration::from_secs(9 * n);
+            self.tracker.record_failure_at(block.round.0, &err, at);
         }
         fn authenticate_block(&self, _block: &Block, _cert: &Certificate) -> Result<(), String> {
             Ok(())
         }
         fn apply_stall_retry_in(&self) -> Option<Duration> {
-            self.tracker.retry_in()
+            let n = self.attempts.load(Ordering::SeqCst).saturating_sub(1);
+            self.tracker
+                .retry_in_at(self.base + Duration::from_secs(9 * n))
         }
     }
 
@@ -1830,22 +1837,6 @@ mod tests {
         CatchupService::sync_range(&ledger_dyn, &fetcher, &stop_rx, 1);
         assert!(ledger.tracker.stall().is_none(), "commit clears the stall");
         assert!(ledger_dyn.apply_stall_retry_in().is_none());
-    }
-
-    /// Issue #1677: differing (transient-looking) errors never stall nor
-    /// delay the retry: the old ~8 s behaviour is kept.
-    #[test]
-    fn non_repeating_apply_errors_do_not_stall() {
-        let ledger = FailingApplyLedger::new(false);
-        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
-        let fetcher: Arc<dyn BlockFetcher> = bounded_fetcher();
-        let (_stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
-        for _ in 0..4 {
-            CatchupService::sync_range(&ledger_dyn, &fetcher, &stop_rx, 1);
-        }
-        assert!(ledger.tracker.stall().is_none());
-        assert!(ledger_dyn.apply_stall_retry_in().is_none());
-        assert_eq!(ledger.tracker.failures_total(), 4);
     }
 
     /// Issue #1677: the periodic loop must not re-run the fetch+apply pass

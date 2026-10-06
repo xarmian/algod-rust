@@ -739,6 +739,8 @@ impl LedgerWriter for AgreementLedgerBridge {
                     block.round.0,
                     next_round - 1
                 );
+                // Any stall on this round or an earlier one is obsolete.
+                self.apply_stall.observe_ledger_round(next_round - 1);
                 return;
             }
 
@@ -920,6 +922,11 @@ impl LedgerWriter for AgreementLedgerBridge {
 
 impl crate::catchup_service::CatchupLedger for AgreementLedgerBridge {
     fn apply_stall_retry_in(&self) -> Option<Duration> {
+        // A stall on a round the ledger already reached (catchpoint jump,
+        // follow apply, another bridge) is stale.
+        if let Ok(l) = self.ledger.lock() {
+            self.apply_stall.observe_ledger_round(l.current_round().0);
+        }
         self.apply_stall.retry_in()
     }
 
@@ -1390,6 +1397,24 @@ mod tests {
 
         bridge.ensure_block(&make_round1_block(), &cert);
         assert_eq!(ledger.lock().unwrap().current_round().0, 1);
+        assert!(bridge.apply_stall_tracker().stall().is_none());
+    }
+
+    #[test]
+    fn stall_is_dropped_when_the_ledger_advances_by_another_path() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+        let bad = make_unapplyable_round1_block();
+        let cert = make_cert_with_proposal(1);
+        bridge.ensure_block(&bad, &cert);
+        bridge.ensure_block(&bad, &cert);
+        assert!(crate::catchup_service::CatchupLedger::apply_stall_retry_in(&bridge).is_some());
+        // Another bridge / catchpoint jump commits round 1: no record_commit here.
+        let other = AgreementLedgerBridge::new(Arc::clone(&ledger));
+        other.ensure_block(&make_round1_block(), &cert);
+        assert_eq!(ledger.lock().unwrap().current_round().0, 1);
+        assert!(bridge.apply_stall_tracker().stall().is_some());
+        assert!(crate::catchup_service::CatchupLedger::apply_stall_retry_in(&bridge).is_none());
         assert!(bridge.apply_stall_tracker().stall().is_none());
     }
 
