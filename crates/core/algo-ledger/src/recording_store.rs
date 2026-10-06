@@ -412,6 +412,83 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
         self.inner.restore_snapshot(snapshot);
     }
 
+    // ---- Trait methods with default impls ----
+    //
+    // INVARIANT: every `LedgerStore` method that has a default body MUST be
+    // forwarded here when the inner store may override it. The wrapper sits on
+    // the REAL committed apply under ALGOD_SHADOW_EXECUTE, so a missing
+    // forward silently swaps the inner store's behaviour for the no-op
+    // default (e.g. retention pruning, voters-participant persistence).
+    // `get_or_insert_app_params` / `get_or_insert_app_local_state` are left to
+    // their defaults on purpose: they call `get_*`/`set_*` on `self`, which
+    // records the touches.
+
+    fn get_or_default_account(&self, addr: &Address) -> AccountData {
+        self.inner.get_or_default_account(addr)
+    }
+
+    fn has_asset_holding(&self, addr: &Address, asset_id: u64) -> bool {
+        self.inner.has_asset_holding(addr, asset_id)
+    }
+
+    fn has_asset_params(&self, asset_id: u64) -> bool {
+        self.inner.has_asset_params(asset_id)
+    }
+
+    fn has_app_params(&self, app_id: u64) -> bool {
+        self.inner.has_app_params(app_id)
+    }
+
+    fn has_app_local_state(&self, addr: &Address, app_id: u64) -> bool {
+        self.inner.has_app_local_state(addr, app_id)
+    }
+
+    fn box_len(&self, app_id: u64, key: &[u8]) -> Option<usize> {
+        self.inner.box_len(app_id, key)
+    }
+
+    fn retention_config(&self) -> crate::store_trait::RetentionConfig {
+        self.inner.retention_config()
+    }
+
+    fn put_voters_participants(
+        &mut self,
+        round: u64,
+        participants: &[(
+            algo_types::Address,
+            algo_consensus_crypto::stateproof::Participant,
+        )],
+    ) -> Result<(), AlgoError> {
+        self.inner.put_voters_participants(round, participants)
+    }
+
+    fn get_voters_participants(
+        &self,
+        round: u64,
+    ) -> Result<
+        Option<
+            Vec<(
+                algo_types::Address,
+                algo_consensus_crypto::stateproof::Participant,
+            )>,
+        >,
+        AlgoError,
+    > {
+        self.inner.get_voters_participants(round)
+    }
+
+    fn delete_voters_participants(&mut self, round: u64) -> Result<(), AlgoError> {
+        self.inner.delete_voters_participants(round)
+    }
+
+    fn save_scratch_state(&self) -> Option<Box<dyn std::any::Any>> {
+        self.inner.save_scratch_state()
+    }
+
+    fn restore_scratch_state(&mut self, saved: Box<dyn std::any::Any>) {
+        self.inner.restore_scratch_state(saved);
+    }
+
     // ---- Min balance ----
 
     fn min_balance_with_state(&self, addr: &Address, account: &AccountData) -> u64 {
@@ -551,5 +628,54 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
 
     fn online_stake_at_round(&self, round: u64, vote_rnd: u64) -> Result<u64, AlgoError> {
         self.inner.online_stake_at_round(round, vote_rnd)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sqlite::SqliteLedger;
+    use crate::store_trait::RetentionConfig;
+
+    #[test]
+    fn retention_config_is_forwarded_from_the_inner_store() {
+        let mut inner = SqliteLedger::open_in_memory().unwrap();
+        let cfg = RetentionConfig {
+            max_block_history_lookback: 12_345,
+            catchpoint_min_rounds_lookback: 678,
+            archival: true,
+        };
+        inner.configure_retention(cfg);
+        let rec = RecordingStore::new(&mut inner);
+        assert_eq!(rec.retention_config(), cfg);
+        assert_ne!(rec.retention_config(), RetentionConfig::default());
+    }
+
+    #[test]
+    fn voters_participants_round_trip_through_the_wrapper() {
+        let mut inner = SqliteLedger::open_in_memory().unwrap();
+        let part = algo_consensus_crypto::stateproof::Participant {
+            pk: algo_consensus_crypto::merklesig::Verifier {
+                commitment: [7u8; 64],
+                key_lifetime: 256,
+            },
+            weight: 99,
+        };
+        let rows = vec![(Address([4u8; 32]), part)];
+        let mut rec = RecordingStore::new(&mut inner);
+        rec.put_voters_participants(100, &rows).unwrap();
+        assert_eq!(
+            rec.get_voters_participants(100).unwrap(),
+            Some(rows.clone())
+        );
+        drop(rec);
+        // Persisted in the inner store, not swallowed by the wrapper.
+        assert_eq!(
+            inner.get_voters_participants(100).unwrap(),
+            Some(rows.clone())
+        );
+        let mut rec = RecordingStore::new(&mut inner);
+        rec.delete_voters_participants(100).unwrap();
+        assert_eq!(rec.get_voters_participants(100).unwrap(), None);
     }
 }

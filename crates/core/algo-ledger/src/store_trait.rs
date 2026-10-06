@@ -430,6 +430,21 @@ pub trait LedgerStore {
     /// since the snapshot was taken.
     fn restore_snapshot(&mut self, snapshot: Self::Snapshot);
 
+    // ---- Scratch-apply support (shadow-execute diagnostic) ----
+
+    /// Capture the in-memory ledger state that [`Self::snapshot`] /
+    /// [`Self::restore_snapshot`] do not cover (lease table, trie
+    /// pre-mutation log, ...), for a scratch apply that is rolled back.
+    ///
+    /// `None` (the default) means this store cannot faithfully roll back a
+    /// scratch block apply, so [`crate::shadow_execute`] skips it.
+    fn save_scratch_state(&self) -> Option<Box<dyn std::any::Any>> {
+        None
+    }
+
+    /// Restore state captured by [`Self::save_scratch_state`].
+    fn restore_scratch_state(&mut self, _saved: Box<dyn std::any::Any>) {}
+
     // ---- Min balance ----
 
     /// Compute the minimum balance for an account, including schema-based

@@ -68,6 +68,12 @@ pub struct ApplyData {
     pub config_asset: u64,
     /// Created application ID (from appl creates).
     pub application_id: u64,
+    /// The application ID the transaction counter derives for an `appl`
+    /// create (`counter + 1`), independent of the block's recorded `apid`
+    /// that [`Self::application_id`] prefers when replaying. Only set in
+    /// [`ApplyMode::Execute`]; read by the shadow-execute diagnostic so a
+    /// recorded-vs-derived disagreement is not hidden.
+    pub derived_application_id: u64,
     /// Eval delta (opaque msgpack, contains state changes, logs, inner txns).
     pub eval_delta: Option<rmpv::Value>,
 }
@@ -282,6 +288,9 @@ pub fn apply_block_executing_app_calls<L: crate::store_trait::LedgerStore>(
     block: &Block,
 ) -> Result<(), AlgoError> {
     if !block_has_app_call(block) {
+        if crate::shadow_execute::shadow_execute_enabled() {
+            return crate::shadow_execute::apply_replay_block_with_shadow(store, block);
+        }
         return apply_block_impl(
             store,
             block,
@@ -292,6 +301,9 @@ pub fn apply_block_executing_app_calls<L: crate::store_trait::LedgerStore>(
             None,
             None,
         );
+    }
+    if crate::shadow_execute::shadow_execute_enabled() {
+        return crate::shadow_execute::apply_execute_block_with_apply_data_check(store, block);
     }
     apply_block_impl(
         store,
@@ -1311,7 +1323,7 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
 /// transactions is merged into the group's pre-image map from the
 /// wrapper's `touches.accounts`, using each address's actual first-touch
 /// pre-mutation value.
-fn collect_txn_addresses(
+pub(crate) fn collect_txn_addresses(
     txn: &algo_types::Transaction,
     addrs: &mut std::collections::HashSet<Address>,
 ) {
@@ -1553,10 +1565,41 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
     block: &Block,
     mode: ApplyMode,
     validate: bool,
+    tracer: Option<&mut dyn EvalTracer>,
+    group_deltas: Option<&mut crate::txn_group_delta_tracer::TxnGroupDeltaTracer>,
+    apply_data_out: Option<&mut Vec<ApplyData>>,
+    kv_mods_out: Option<&mut KvModsMap>,
+) -> Result<(), AlgoError> {
+    apply_block_impl_ex(
+        store,
+        block,
+        mode,
+        validate,
+        tracer,
+        group_deltas,
+        apply_data_out,
+        kv_mods_out,
+        false,
+    )
+}
+
+/// [`apply_block_impl`] with a `scratch` switch used by the shadow-execute
+/// diagnostic ([`crate::shadow_execute`]): a scratch apply stops after the
+/// consensus-relevant state transitions (transactions, end-of-block
+/// participation, round/protocol/txn-counter bookkeeping) and skips the
+/// auxiliary tracker writes (block/txtail rows, retention pruning, state
+/// proof and voters caches) that the caller's real apply performs next.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_block_impl_ex<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+    mode: ApplyMode,
+    validate: bool,
     mut tracer: Option<&mut dyn EvalTracer>,
     mut group_deltas: Option<&mut crate::txn_group_delta_tracer::TxnGroupDeltaTracer>,
     mut apply_data_out: Option<&mut Vec<ApplyData>>,
     kv_mods_out: Option<&mut KvModsMap>,
+    scratch: bool,
 ) -> Result<(), AlgoError> {
     // A block's payset stores each transaction without the genesis id/hash
     // (the header carries them; `hgi` marks whether the id was elided).
@@ -1969,6 +2012,20 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
     // Persist the block's txn_counter so the next block's ID generation
     // starts from the right base (matches go-algorand endOfBlock).
     store.set_txn_counter(block.txn_counter);
+
+    // KEEP IN SYNC: a scratch apply (shadow-execute) skips exactly the
+    // auxiliary tracker writes below -- put_block, put_txtail, retention
+    // pruning, and the state-proof/voters cache updates. Any persistent write
+    // the real apply gains must stay below this early return (a scratch pass
+    // must never persist anything).
+    if scratch {
+        if let (Some(out), Some(recorder)) = (kv_mods_out, kv_mods_recorder) {
+            *out = Rc::try_unwrap(recorder)
+                .map(RefCell::into_inner)
+                .unwrap_or_else(|rc| rc.borrow().clone());
+        }
+        return Ok(());
+    }
 
     // Store block header data, full block data, and txtail for history.
     // These are auxiliary tracker writes — failures are logged but do not
@@ -3365,6 +3422,9 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
                 )?;
                 // For appl creates, capture the created application ID.
                 if txn.application_id == 0 {
+                    if ctx.mode == ApplyMode::Execute {
+                        apply_data.derived_application_id = pre_apply_counter + 1;
+                    }
                     apply_data.application_id = if stx.apply_data_application_id != 0 {
                         stx.apply_data_application_id // Replay: from block data
                     } else {

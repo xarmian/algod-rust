@@ -7015,6 +7015,39 @@ impl LedgerStore for SqliteLedger {
         self.pending_online_touched = snapshot.online_touched;
     }
 
+    fn save_scratch_state(&self) -> Option<Box<dyn std::any::Any>> {
+        // The lease table is cloned here rather than reusing `lease_snapshot`:
+        // that snapshot is taken at `begin_block` (before any earlier mutation
+        // in the same open block) and is consumed by `rollback_block`, so it
+        // is not the state at scratch-apply time and must stay untouched.
+        // The SAVEPOINT covers the SQL tables and `snapshot` the totals
+        // delta; the lease table and the append-only trie pre-mutation log
+        // are in-memory only (same pair `apply_block_caching_delta`'s
+        // group-delta scratch apply restores by hand).
+        Some(Box::new((
+            self.lease_table.clone(),
+            self.pre_mutations.len(),
+        )))
+    }
+
+    fn restore_scratch_state(&mut self, saved: Box<dyn std::any::Any>) {
+        match saved.downcast::<(LeaseTable, usize)>() {
+            Ok(saved) => {
+                let (leases, pre_mutations_len) = *saved;
+                self.lease_table = leases;
+                self.pre_mutations.truncate(pre_mutations_len);
+            }
+            Err(_) => {
+                // The state was produced by a different store type: the
+                // scratch apply was NOT rolled back for leases/trie log.
+                tracing::error!(
+                    "restore_scratch_state: saved scratch state has an unexpected type; lease table and trie pre-mutation log were not restored"
+                );
+                debug_assert!(false, "restore_scratch_state: unexpected saved state type");
+            }
+        }
+    }
+
     // ---- Min balance ----
 
     fn min_balance_with_state(&self, _addr: &Address, account: &AccountData) -> u64 {
