@@ -7016,6 +7016,10 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn save_scratch_state(&self) -> Option<Box<dyn std::any::Any>> {
+        // The lease table is cloned here rather than reusing `lease_snapshot`:
+        // that snapshot is taken at `begin_block` (before any earlier mutation
+        // in the same open block) and is consumed by `rollback_block`, so it
+        // is not the state at scratch-apply time and must stay untouched.
         // The SAVEPOINT covers the SQL tables and `snapshot` the totals
         // delta; the lease table and the append-only trie pre-mutation log
         // are in-memory only (same pair `apply_block_caching_delta`'s

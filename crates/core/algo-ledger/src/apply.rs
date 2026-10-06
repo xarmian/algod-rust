@@ -2013,6 +2013,11 @@ pub(crate) fn apply_block_impl_ex<L: crate::store_trait::LedgerStore>(
     // starts from the right base (matches go-algorand endOfBlock).
     store.set_txn_counter(block.txn_counter);
 
+    // KEEP IN SYNC: a scratch apply (shadow-execute) skips exactly the
+    // auxiliary tracker writes below -- put_block, put_txtail, retention
+    // pruning, and the state-proof/voters cache updates. Any persistent write
+    // the real apply gains must stay below this early return (a scratch pass
+    // must never persist anything).
     if scratch {
         if let (Some(out), Some(recorder)) = (kv_mods_out, kv_mods_recorder) {
             *out = Rc::try_unwrap(recorder)

@@ -37,7 +37,7 @@
 //! result is always the plain Replay result; the check never fails a block.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use algo_error::AlgoError;
@@ -83,6 +83,30 @@ static APPLY_DATA_MISMATCH_TXNS: AtomicU64 = AtomicU64::new(0);
 static APPLY_DATA_US: AtomicU64 = AtomicU64::new(0);
 static APPLY_DATA_MISMATCH_LINES: AtomicU64 = AtomicU64::new(0);
 static APPLY_DATA_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+/// State-mismatch WARN lines dropped by the limiter (distinct from the
+/// ApplyData flavour's [`APPLY_DATA_SUPPRESSED`]).
+static STATE_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+/// Limiter-suppressed lines already reported by a progress/rollover summary.
+static SUPPRESSED_REPORTED: AtomicU64 = AtomicU64::new(0);
+static SKIP_WARNED: AtomicBool = AtomicBool::new(false);
+
+// Test-only fault injection into the scratch pass.
+#[cfg(test)]
+thread_local! {
+    /// 0 = none, 1 = pretend the store cannot roll back, 2 = scratch Execute
+    /// returns an error, 3 = scratch Execute panics.
+    static TEST_HOOK: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+fn test_hook() -> u8 {
+    #[cfg(test)]
+    {
+        TEST_HOOK.with(|h| h.get())
+    }
+    #[cfg(not(test))]
+    {
+        0
+    }
+}
 
 fn log_progress(last_round: u64) {
     let (c, m, k) = shadow_execute_counters();
@@ -92,13 +116,26 @@ fn log_progress(last_round: u64) {
         .load(Ordering::Relaxed)
         .checked_div(ab)
         .unwrap_or(0);
+    // Report limiter-suppressed lines even when mismatches have stopped.
+    let pending = limiter()
+        .lock()
+        .map(|mut l| l.take_suppressed())
+        .unwrap_or(0);
+    if pending > 0 {
+        SUPPRESSED_REPORTED.fetch_add(pending, Ordering::Relaxed);
+        tracing::warn!(
+            "{MISMATCH_LOG_TOKEN} kind=rate_limited suppressed_lines={pending} (pending at progress tick)"
+        );
+    }
     tracing::info!(
-        "shadow_execute_progress state_checked_blocks={c} state_mismatched_blocks={m} state_skipped_unsupported_store={k} state_avg_check_us={avg_us} apply_data_compared_blocks={ab} apply_data_compared_txns={} apply_data_mismatched_blocks={} apply_data_mismatched_txns={} apply_data_avg_compare_us={ad_avg_us} apply_data_mismatch_diffs={} apply_data_mismatch_lines_suppressed={} last_round={last_round}",
+        "shadow_execute_progress state_checked_blocks={c} state_mismatched_blocks={m} state_skipped_unsupported_store={k} state_avg_check_us={avg_us} apply_data_compared_blocks={ab} apply_data_compared_txns={} apply_data_mismatched_blocks={} apply_data_mismatched_txns={} apply_data_avg_compare_us={ad_avg_us} apply_data_mismatch_diffs={} apply_data_mismatch_lines_suppressed={} state_mismatch_lines_suppressed={} limiter_suppressed_reported={} last_round={last_round}",
         APPLY_DATA_TXNS.load(Ordering::Relaxed),
         APPLY_DATA_MISMATCH_BLOCKS.load(Ordering::Relaxed),
         APPLY_DATA_MISMATCH_TXNS.load(Ordering::Relaxed),
         APPLY_DATA_MISMATCH_LINES.load(Ordering::Relaxed),
         APPLY_DATA_SUPPRESSED.load(Ordering::Relaxed),
+        STATE_SUPPRESSED.load(Ordering::Relaxed),
+        SUPPRESSED_REPORTED.load(Ordering::Relaxed),
     );
 }
 
@@ -595,7 +632,12 @@ pub fn shadow_check_replay_block<L: LedgerStore>(
     store: &mut L,
     block: &Block,
 ) -> Result<ShadowReport, AlgoError> {
-    let Some(aux) = store.save_scratch_state() else {
+    let saved = if test_hook() == 1 {
+        None
+    } else {
+        store.save_scratch_state()
+    };
+    let Some(aux) = saved else {
         apply_block_impl_ex(
             store,
             block,
@@ -617,17 +659,25 @@ pub fn shadow_check_replay_block<L: LedgerStore>(
     let mut exec_kv = KvModsMap::new();
     let scratch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut rec = RecordingStore::new(store);
-        let res = apply_block_impl_ex(
-            &mut rec,
-            block,
-            ApplyMode::Execute,
-            false,
-            None,
-            None,
-            Some(&mut exec_ad),
-            Some(&mut exec_kv),
-            true,
-        );
+        let res = if test_hook() == 3 {
+            panic!("injected scratch panic");
+        } else if test_hook() == 2 {
+            Err(AlgoError::Ledger {
+                message: "injected scratch error".into(),
+            })
+        } else {
+            apply_block_impl_ex(
+                &mut rec,
+                block,
+                ApplyMode::Execute,
+                false,
+                None,
+                None,
+                Some(&mut exec_ad),
+                Some(&mut exec_kv),
+                true,
+            )
+        };
         let view = read_exec_view(&rec, &rec.touches);
         (res, view, std::mem::take(&mut rec.touches))
     }));
@@ -718,7 +768,17 @@ pub fn apply_replay_block_with_shadow<L: LedgerStore>(
     let report = shadow_check_replay_block(store, block)?;
     let elapsed_us = started.elapsed().as_micros() as u64;
     if !report.checked {
-        SKIPPED.fetch_add(1, Ordering::Relaxed);
+        let skipped = SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+        // Never stay silent: a soak with the flag on must not look clean
+        // while verifying nothing.
+        if !SKIP_WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "shadow_execute_unsupported_store: this store cannot roll back a scratch apply; blocks are applied without shadow verification (counted as skipped_unsupported)"
+            );
+        }
+        if skipped == 1 || skipped.is_multiple_of(PROGRESS_EVERY) {
+            log_progress(block.round.0);
+        }
         return Ok(());
     }
     let checked = CHECKED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -749,7 +809,7 @@ pub fn apply_replay_block_with_shadow<L: LedgerStore>(
                 first.join("; ")
             );
         } else {
-            APPLY_DATA_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+            STATE_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
         }
     }
     if checked == 1 || checked.is_multiple_of(PROGRESS_EVERY) {
@@ -1129,6 +1189,12 @@ impl MismatchLimiter {
         }
     }
 
+    /// Drain the suppressed-line count of the current window (for a summary
+    /// emitted outside a window rollover).
+    pub fn take_suppressed(&mut self) -> u64 {
+        std::mem::take(&mut self.suppressed)
+    }
+
     /// Most frequent patterns, for the periodic summary line.
     pub fn top_patterns(&self, n: usize) -> Vec<(String, u64)> {
         let mut v: Vec<(String, u64)> = self.counts.iter().map(|(k, c)| (k.clone(), *c)).collect();
@@ -1160,6 +1226,7 @@ fn admit_line(pattern: &str) -> bool {
         Err(_) => (true, 0),
     };
     if flushed > 0 {
+        SUPPRESSED_REPORTED.fetch_add(flushed, Ordering::Relaxed);
         tracing::warn!("{MISMATCH_LOG_TOKEN} kind=rate_limited suppressed_lines={flushed}");
     }
     emit
@@ -1790,5 +1857,84 @@ mod tests {
         let (emit, flushed) = l.admit("state:account:micro_algos", 161);
         assert!(emit);
         assert_eq!(flushed, 1);
+    }
+
+    fn with_hook<R>(h: u8, f: impl FnOnce() -> R) -> R {
+        TEST_HOOK.with(|c| c.set(h));
+        let r = f();
+        TEST_HOOK.with(|c| c.set(0));
+        r
+    }
+
+    fn leased_pay(lease: u8) -> SignedTransaction {
+        let mut stx = pay();
+        stx.txn.lease = [lease; 32];
+        stx
+    }
+
+    #[test]
+    fn scratch_leases_do_not_make_the_real_apply_reject_duplicates() {
+        let mut l = ledger();
+        let b = block(vec![leased_pay(5)]);
+        let r = shadow_check_replay_block(&mut l, &b).unwrap();
+        assert!(r.checked && r.diffs.is_empty(), "{:?}", r.diffs);
+        // The lease is recorded by the real apply: it must now be active.
+        assert!(l.check_lease(&SENDER, &[5u8; 32], 1).is_err());
+    }
+
+    #[test]
+    fn failed_scratch_execute_is_reported_and_real_apply_still_commits() {
+        let mut l = ledger();
+        let b = block(vec![leased_pay(6)]);
+        let r = with_hook(2, || shadow_check_replay_block(&mut l, &b)).unwrap();
+        assert_eq!(r.diffs.len(), 1);
+        assert_eq!(r.diffs[0].kind, "execute_error");
+        assert_eq!(l.current_round(), Round(1));
+        assert_eq!(l.txn_counter(), 1);
+        assert!(l.get_account(&RECEIVER).is_some());
+    }
+
+    #[test]
+    fn panicking_scratch_is_contained_and_node_continues() {
+        let mut l = ledger();
+        let b = block(vec![leased_pay(7)]);
+        let r = with_hook(3, || shadow_check_replay_block(&mut l, &b)).unwrap();
+        assert_eq!(r.diffs.len(), 1);
+        assert_eq!(r.diffs[0].kind, "execute_error");
+        assert!(r.diffs[0].execute.contains("panicked"));
+        assert_eq!(l.current_round(), Round(1));
+        // A following block applies normally on the same store.
+        let mut b2 = block(vec![pay()]);
+        b2.round = Round(2);
+        b2.txn_counter = 2;
+        let r2 = shadow_check_replay_block(&mut l, &b2).unwrap();
+        assert!(r2.checked && r2.diffs.is_empty());
+        assert_eq!(l.current_round(), Round(2));
+    }
+
+    #[test]
+    fn unsupported_store_is_applied_counted_and_not_silent() {
+        let mut l = ledger();
+        let before = shadow_execute_counters().2;
+        let b = block(vec![pay()]);
+        with_hook(1, || apply_replay_block_with_shadow(&mut l, &b)).unwrap();
+        assert_eq!(l.current_round(), Round(1));
+        assert!(shadow_execute_counters().2 > before);
+        assert!(SKIP_WARNED.load(Ordering::Relaxed));
+        let r = with_hook(1, || {
+            shadow_check_replay_block(&mut ledger(), &block(vec![pay()]))
+        })
+        .unwrap();
+        assert!(!r.checked);
+    }
+
+    #[test]
+    fn limiter_take_suppressed_reports_pending_after_mismatches_stop() {
+        let mut l = MismatchLimiter::new(1, 60);
+        assert!(l.admit("p", 10).0);
+        assert!(!l.admit("p", 10).0);
+        assert!(!l.admit("p", 10).0);
+        assert_eq!(l.take_suppressed(), 2);
+        assert_eq!(l.take_suppressed(), 0);
     }
 }

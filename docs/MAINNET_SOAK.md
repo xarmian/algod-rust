@@ -176,6 +176,20 @@ defect. A scan failure does not file an issue: `file_issue.py` is keyed on
 halt verdicts (round/phase), a scan hit has neither, and the evidence is in
 the job summary, `summary.json` and `node.log`.
 
+## Shadow-execute differential check (issue #1673)
+
+Dispatch with `-f shadow_execute=true` to set `ALGOD_SHADOW_EXECUTE=1` on the
+soak node. While it follows the chain, every Replay-applied block is also
+evaluated in Execute mode on a rolled-back scratch apply and the results are
+compared, and every app-call block's computed ApplyData/EvalDelta is compared
+with the recorded one. Any difference is logged as `shadow_execute_mismatch`
+(a hard-tier finding). The check costs follow-path CPU: use
+`-f shadow_execute_sample_every=N` (`ALGOD_SHADOW_EXECUTE_SAMPLE_EVERY`,
+default 1) to check only every Nth Replay-applied block. Watch the
+`shadow_execute_progress` log line (checked / mismatched /
+`state_skipped_unsupported_store` / suppressed-line counters); a non-zero
+skipped count means the store could not roll back and nothing was verified.
+
 ## Auto-filed issues
 
 Only a `stuck` or `node_failure` verdict files anything
