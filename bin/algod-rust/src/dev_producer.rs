@@ -82,17 +82,45 @@ use algo_types::{Block, Digest, SignedTransaction};
 /// optional-genesis-hash protocol is left untouched, keeping its txid stable.
 /// `genesis_id` is flag-gated because an empty `genesis_id` is a legal, common
 /// state the flag distinguishes from "stripped because it matched the network".
+#[cfg(test)]
 pub fn restore_block_genesis_fields(stx: &SignedTransaction, block: &Block) -> SignedTransaction {
+    restore_with_rule(
+        stx,
+        &algo_types::genesis_restore::GenesisRestoreRule::for_block(block),
+    )
+}
+
+/// [`restore_block_genesis_fields`] with the block's rule resolved once by the
+/// caller (hoist out of per-transaction loops: the protocol lookup is not
+/// free).
+pub fn restore_with_rule(
+    stx: &SignedTransaction,
+    rule: &algo_types::genesis_restore::GenesisRestoreRule<'_>,
+) -> SignedTransaction {
     let mut out = stx.clone();
-    algo_types::genesis_restore::restore_genesis_fields(&mut out, block);
+    rule.restore(&mut out);
     out
 }
 
 /// Canonical txid of a transaction *as committed in a block* — the id the
 /// submitter computed, with the block's stripped genesis fields restored (see
 /// [`restore_block_genesis_fields`]).
+#[cfg(test)]
 pub fn block_txn_id(stx: &SignedTransaction, block: &Block) -> Digest {
-    compute_txn_id(&restore_block_genesis_fields(stx, block).txn)
+    compute_txn_id(
+        &algo_types::genesis_restore::GenesisRestoreRule::for_block(block).restored_txn(stx),
+    )
+}
+
+/// Canonical txids of every transaction in `block`'s payset (the rule is
+/// resolved once, not per transaction).
+pub fn block_txn_ids(block: &Block) -> HashSet<Digest> {
+    let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(block);
+    block
+        .payset
+        .iter()
+        .map(|stx| compute_txn_id(&rule.restored_txn(stx)))
+        .collect()
 }
 
 /// Assemble, finish, commit, and announce one dev-mode block built from the
@@ -199,11 +227,7 @@ pub fn produce_dev_block(
     // never the empty map here — `get_block_raw_msgpack` already supplies
     // that fallback for rounds with no stored certificate.
     let cert_data = canonical_encode_dev_mode_certificate(block.round.0);
-    let committed_txids: HashSet<Digest> = block
-        .payset
-        .iter()
-        .map(|stx| block_txn_id(stx, &block))
-        .collect();
+    let committed_txids: HashSet<Digest> = block_txn_ids(&block);
 
     let apply_data = {
         let mut l = ledger

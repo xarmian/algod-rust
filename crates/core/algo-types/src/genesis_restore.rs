@@ -45,6 +45,8 @@
 //! occur on a supported network; it is treated as hash-requiring (modern),
 //! the behaviour every pre-#1704 caller but one already had.
 
+use std::borrow::Cow;
+
 use crate::consensus::consensus_params_for_version;
 use crate::{Block, SignedTransaction, Transaction};
 
@@ -54,57 +56,115 @@ pub fn protocol_requires_genesis_hash(proto: &str) -> bool {
     consensus_params_for_version(proto).is_none_or(|p| p.require_genesis_hash)
 }
 
+/// The pure per-transaction decision: which stripped fields must be
+/// restored. This is the one place the go rule lives; every other helper in
+/// this module is built on it so they cannot drift.
+#[inline]
+fn decide(stx: &SignedTransaction, require_genesis_hash: bool) -> (bool, bool) {
+    let restore_id = stx.has_genesis_id && stx.txn.genesis_id.is_empty();
+    let restore_hash =
+        stx.txn.genesis_hash == [0u8; 32] && (require_genesis_hash || stx.has_genesis_hash);
+    (restore_id, restore_hash)
+}
+
+/// A block header's genesis-restoration rule, resolved ONCE per payset (the
+/// protocol lookup rebuilds `ConsensusParams`, so it must not run per
+/// transaction).
+#[derive(Clone, Copy, Debug)]
+pub struct GenesisRestoreRule<'a> {
+    genesis_id: &'a str,
+    genesis_hash: &'a [u8; 32],
+    require_genesis_hash: bool,
+}
+
+impl<'a> GenesisRestoreRule<'a> {
+    /// Rule from explicit header fields and the protocol's
+    /// `RequireGenesisHash`.
+    pub fn new(
+        genesis_id: &'a str,
+        genesis_hash: &'a [u8; 32],
+        require_genesis_hash: bool,
+    ) -> Self {
+        Self {
+            genesis_id,
+            genesis_hash,
+            require_genesis_hash,
+        }
+    }
+
+    /// Rule for `block`'s header and `current_protocol` (one protocol lookup).
+    pub fn for_block(block: &'a Block) -> Self {
+        Self::new(
+            &block.genesis_id,
+            &block.genesis_hash,
+            protocol_requires_genesis_hash(&block.current_protocol),
+        )
+    }
+
+    /// Whether `stx` has any stripped field this rule would fill in. Pure
+    /// compares only: no allocation, no protocol lookup.
+    #[inline]
+    pub fn needs_restore(&self, stx: &SignedTransaction) -> bool {
+        let (id, hash) = decide(stx, self.require_genesis_hash);
+        id || hash
+    }
+
+    /// Fill the stripped genesis fields of `stx` in place.
+    pub fn restore(&self, stx: &mut SignedTransaction) {
+        let (id, hash) = decide(stx, self.require_genesis_hash);
+        if id {
+            stx.txn.genesis_id = self.genesis_id.to_string();
+        }
+        if hash {
+            stx.txn.genesis_hash = *self.genesis_hash;
+        }
+    }
+
+    /// The restored inner [`Transaction`] (what TxID, group id and the
+    /// payset merkle leaf are computed over). Borrowed (no clone) when
+    /// nothing needs restoring.
+    pub fn restored_txn<'t>(&self, stx: &'t SignedTransaction) -> Cow<'t, Transaction> {
+        let (id, hash) = decide(stx, self.require_genesis_hash);
+        if !id && !hash {
+            return Cow::Borrowed(&stx.txn);
+        }
+        let mut t = stx.txn.clone();
+        if id {
+            t.genesis_id = self.genesis_id.to_string();
+        }
+        if hash {
+            t.genesis_hash = *self.genesis_hash;
+        }
+        Cow::Owned(t)
+    }
+}
+
 /// Fill the genesis fields `stx` had stripped, from the header's
 /// `genesis_id` / `genesis_hash`. `require_genesis_hash` is the block
-/// protocol's `RequireGenesisHash`. This is the one place the rule lives.
+/// protocol's `RequireGenesisHash`.
 pub fn restore_genesis_fields_with(
     stx: &mut SignedTransaction,
     genesis_id: &str,
     genesis_hash: &[u8; 32],
     require_genesis_hash: bool,
 ) {
-    if stx.has_genesis_id && stx.txn.genesis_id.is_empty() {
-        stx.txn.genesis_id = genesis_id.to_string();
-    }
-    if stx.txn.genesis_hash == [0u8; 32] && (require_genesis_hash || stx.has_genesis_hash) {
-        stx.txn.genesis_hash = *genesis_hash;
-    }
+    GenesisRestoreRule::new(genesis_id, genesis_hash, require_genesis_hash).restore(stx);
 }
 
 /// [`restore_genesis_fields_with`] using `block`'s header and protocol.
 pub fn restore_genesis_fields(stx: &mut SignedTransaction, block: &Block) {
-    restore_genesis_fields_with(
-        stx,
-        &block.genesis_id,
-        &block.genesis_hash,
-        protocol_requires_genesis_hash(&block.current_protocol),
-    );
+    GenesisRestoreRule::for_block(block).restore(stx);
 }
 
 /// Copy of the payset with every transaction's genesis fields restored
 /// (go: `Block.DecodePaysetFlat`).
 pub fn restore_payset_genesis_fields(block: &Block) -> Vec<SignedTransaction> {
-    let req = protocol_requires_genesis_hash(&block.current_protocol);
+    let rule = GenesisRestoreRule::for_block(block);
     let mut out = block.payset.clone();
     for stx in &mut out {
-        restore_genesis_fields_with(stx, &block.genesis_id, &block.genesis_hash, req);
+        rule.restore(stx);
     }
     out
-}
-
-/// The restored inner [`Transaction`] of one payset entry (what TxID, group
-/// id and the payset merkle leaf are computed over).
-pub fn restored_block_txn(stx: &SignedTransaction, block: &Block) -> Transaction {
-    let mut t = stx.txn.clone();
-    if stx.has_genesis_id && t.genesis_id.is_empty() {
-        t.genesis_id.clone_from(&block.genesis_id);
-    }
-    if t.genesis_hash == [0u8; 32]
-        && (stx.has_genesis_hash || protocol_requires_genesis_hash(&block.current_protocol))
-    {
-        t.genesis_hash = block.genesis_hash;
-    }
-    t
 }
 
 #[cfg(test)]
@@ -137,7 +197,10 @@ mod tests {
             let b = block(CONSENSUS_V15, hgi, false);
             let r = restore_payset_genesis_fields(&b);
             assert_eq!(r[0].txn.genesis_hash, [0u8; 32]);
-            assert_eq!(restored_block_txn(&b.payset[0], &b), r[0].txn);
+            assert_eq!(
+                *GenesisRestoreRule::for_block(&b).restored_txn(&b.payset[0]),
+                r[0].txn
+            );
             assert_eq!(r[0].txn.genesis_id, if hgi { GID } else { "" });
         }
     }
@@ -148,7 +211,10 @@ mod tests {
         let r = restore_payset_genesis_fields(&b);
         assert_eq!(r[0].txn.genesis_hash, GH);
         assert_eq!(r[0].txn.genesis_id, "", "gen is gated on hgi only");
-        assert_eq!(restored_block_txn(&b.payset[0], &b), r[0].txn);
+        assert_eq!(
+            *GenesisRestoreRule::for_block(&b).restored_txn(&b.payset[0]),
+            r[0].txn
+        );
     }
 
     #[test]
@@ -159,7 +225,10 @@ mod tests {
             let r = restore_payset_genesis_fields(&b);
             assert_eq!(r[0].txn.genesis_hash, GH);
             assert_eq!(r[0].txn.genesis_id, GID);
-            assert_eq!(restored_block_txn(&b.payset[0], &b), r[0].txn);
+            assert_eq!(
+                *GenesisRestoreRule::for_block(&b).restored_txn(&b.payset[0]),
+                r[0].txn
+            );
         }
     }
 
@@ -175,5 +244,47 @@ mod tests {
         let mut twice = once.clone();
         restore_genesis_fields(&mut twice[0], &b);
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn restored_txn_and_restore_agree_over_the_full_matrix() {
+        let gh = [9u8; 32];
+        for hgi in [false, true] {
+            for hgh in [false, true] {
+                for gen in ["", "own"] {
+                    for stx_gh in [[0u8; 32], [5u8; 32]] {
+                        for req in [false, true] {
+                            let mut stx = SignedTransaction {
+                                has_genesis_id: hgi,
+                                has_genesis_hash: hgh,
+                                ..SignedTransaction::default()
+                            };
+                            stx.txn.genesis_id = gen.into();
+                            stx.txn.genesis_hash = stx_gh;
+                            let rule = GenesisRestoreRule::new(GID, &gh, req);
+                            let mut inplace = stx.clone();
+                            rule.restore(&mut inplace);
+                            let cow = rule.restored_txn(&stx);
+                            assert_eq!(*cow, inplace.txn);
+                            assert_eq!(rule.needs_restore(&stx), inplace != stx);
+                            assert_eq!(
+                                matches!(cow, Cow::Borrowed(_)),
+                                !rule.needs_restore(&stx),
+                                "borrowed iff nothing to restore"
+                            );
+                            // go matrix.
+                            let want_id = if hgi && gen.is_empty() { GID } else { gen };
+                            let want_gh = if stx_gh == [0u8; 32] && (req || hgh) {
+                                gh
+                            } else {
+                                stx_gh
+                            };
+                            assert_eq!(inplace.txn.genesis_id, want_id);
+                            assert_eq!(inplace.txn.genesis_hash, want_gh);
+                        }
+                    }
+                }
+            }
+        }
     }
 }

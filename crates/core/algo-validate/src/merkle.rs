@@ -154,13 +154,14 @@ pub fn compute_payset_merkle_root(block: &Block) -> Hash {
     }
 
     // Build leaf layer.
+    let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(block);
     let mut layer: Vec<Hash> = block
         .payset
         .iter()
         .map(|stx| {
             // Restore genesis fields for txid computation (matching go-algorand's
             // DecodeSignedTxn behavior).
-            let restored_txn = algo_types::genesis_restore::restored_block_txn(stx, block);
+            let restored_txn = rule.restored_txn(stx);
 
             let txid = compute_txid(&restored_txn);
             // STIB hash uses the payset entry as stored in the block
@@ -351,12 +352,13 @@ pub fn compute_vector_commitment(block: &Block, algo: HashAlgo) -> Vec<u8> {
     // The TREE construction (TL leaf wrapping, MA internal nodes) always uses
     // the tree's own hash algorithm. So for Sha512 vector commitments, leaf
     // data is SHA-256 but tree hashing is SHA-512.
+    let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(block);
     let leaf_hashes: Vec<Vec<u8>> = block
         .payset
         .iter()
         .map(|stx| {
             // Restore genesis fields for txid (same as primary Merkle tree).
-            let restored_txn = algo_types::genesis_restore::restored_block_txn(stx, block);
+            let restored_txn = rule.restored_txn(stx);
 
             let txn_canonical = canonical_encode_transaction(&restored_txn);
             // Leaf data (txid, stib_hash) always uses SHA-256 for both
@@ -431,13 +433,14 @@ pub fn compute_payset_merkle_root_raw(block: &Block, raw_blobs: &[Vec<u8>]) -> H
         return ZERO_HASH;
     }
 
+    let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(block);
     let mut layer: Vec<Hash> = block
         .payset
         .iter()
         .zip(raw_blobs.iter())
         .map(|(stx, raw_blob)| {
             // Restore genesis fields for txid computation (same as typed path).
-            let restored_txn = algo_types::genesis_restore::restored_block_txn(stx, block);
+            let restored_txn = rule.restored_txn(stx);
 
             let txid = compute_txid(&restored_txn);
             let stib_hash = compute_stib_hash_raw(raw_blob);
@@ -505,13 +508,14 @@ pub fn compute_vector_commitment_raw(
     // go-algorand's RawLeaf() uses SHA-256 for leaf data (txid, stib_hash)
     // when the tree hash type is Sha256 or Sha512. Only Sha512_256 uses
     // SHA-512/256 for leaf data. See data/bookkeeping/txn_merkle.go.
+    let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(block);
     let leaf_hashes: Vec<Vec<u8>> = block
         .payset
         .iter()
         .zip(raw_blobs.iter())
         .map(|(stx, raw_blob)| {
             // Restore genesis fields for txid (same as typed path).
-            let restored_txn = algo_types::genesis_restore::restored_block_txn(stx, block);
+            let restored_txn = rule.restored_txn(stx);
 
             let txn_canonical = canonical_encode_transaction(&restored_txn);
             // Leaf data always uses SHA-256 for vector commitments.

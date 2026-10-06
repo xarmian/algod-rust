@@ -86,3 +86,20 @@ fn hash_required_protocol_restores_gh_without_hgh() {
         [9u8; 32]
     );
 }
+
+/// Unknown protocol: validate_block reports it explicitly (go: "consensus
+/// protocol not found") and restoration agrees by treating it as
+/// hash-requiring (never silently hash-optional).
+#[test]
+fn unknown_protocol_is_rejected_and_restored_as_hash_requiring() {
+    let b = block("no-such-protocol", false, [9u8; 32]);
+    assert_eq!(
+        restore_payset_genesis_fields(&b)[0].txn.genesis_hash,
+        [9u8; 32]
+    );
+    let res = algo_validate::validate_block(&b, None, "gid", &[9u8; 32], None);
+    assert!(res.errors.iter().any(|e| matches!(
+        e,
+        algo_validate::BlockValidationError::UnknownProtocolVersion { .. }
+    )));
+}

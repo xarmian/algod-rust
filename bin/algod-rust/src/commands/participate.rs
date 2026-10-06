@@ -3060,11 +3060,7 @@ fn run_pool_block_follower<S: CommittedBlockSource>(
                 // original behavior of breaking and retrying next wakeup.
                 match ledger.get_block(latest) {
                     Some(tip_block) if latest > round => {
-                        let committed_txids: HashSet<algo_types::Digest> = tip_block
-                            .payset
-                            .iter()
-                            .map(|stx| crate::dev_producer::block_txn_id(stx, &tip_block))
-                            .collect();
+                        let committed_txids = crate::dev_producer::block_txn_ids(&tip_block);
                         warn!(
                             gap_start = round,
                             latest,
@@ -3080,11 +3076,7 @@ fn run_pool_block_follower<S: CommittedBlockSource>(
                     _ => break,
                 }
             };
-            let committed_txids: HashSet<algo_types::Digest> = block
-                .payset
-                .iter()
-                .map(|stx| crate::dev_producer::block_txn_id(stx, &block))
-                .collect();
+            let committed_txids = crate::dev_producer::block_txn_ids(&block);
             pool.on_new_block(&block, &committed_txids);
             last_seen = round;
         }

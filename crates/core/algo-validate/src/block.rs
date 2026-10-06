@@ -323,6 +323,10 @@ pub fn validate_block_with_cache(
     // what the block actually claims, and the separate genesis consistency check
     // (step 5) can detect if the block's genesis fields differ from expected.
     // Resolve version-aware consensus params for this block's protocol.
+    // An unknown protocol was already reported as `UnknownProtocolVersion` in
+    // step 1 (go: "consensus protocol not found"), so the block is rejected
+    // regardless; the default params only keep the remaining checks running.
+    // Genesis restoration treats an unknown protocol as hash-requiring.
     let params = consensus_params_for_version(&block.current_protocol).unwrap_or_default();
     let spec = SpecialAddresses {
         fee_sink: block.fee_sink,

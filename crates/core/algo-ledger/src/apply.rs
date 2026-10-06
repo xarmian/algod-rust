@@ -1520,15 +1520,21 @@ fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
 
 /// Copy of `block` whose payset transactions carry the genesis id/hash the
 /// block stores only once in its header, or `None` if nothing needs
-/// restoring. Uses the single shared, protocol-aware rule
+/// restoring. Built on the single shared, protocol-aware rule
 /// ([`algo_types::genesis_restore`], go's `DecodeSignedTxn`; issue #1704).
+///
+/// The pre-check is an allocation-free `any()` of pure compares (one
+/// protocol lookup per block); when restoration is needed the block is
+/// cloned exactly once and restored in place.
 fn block_with_restored_genesis_fields(block: &Block) -> Option<Block> {
-    let restored = algo_types::genesis_restore::restore_payset_genesis_fields(block);
-    if restored == block.payset {
+    let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(block);
+    if !block.payset.iter().any(|stx| rule.needs_restore(stx)) {
         return None;
     }
     let mut b = block.clone();
-    b.payset = restored;
+    for stx in &mut b.payset {
+        rule.restore(stx);
+    }
     Some(b)
 }
 
@@ -14347,6 +14353,24 @@ return
         let r = block_with_restored_genesis_fields(&b).expect("gh restored via hgh");
         assert_eq!(r.payset[0].txn.genesis_hash, [9u8; 32]);
         assert_eq!(r.payset[0].txn.genesis_id, "", "gen needs hgi");
+    }
+
+    #[test]
+    fn restore_returns_none_for_complete_payset_and_clones_once_otherwise() {
+        use algo_types::consensus::CONSENSUS_V41;
+        // Already-complete payset (gen/gh present): nothing to restore, None
+        // (no clone is made on this path: the pre-check only compares).
+        let mut b = genesis_restore_block(CONSENSUS_V41, true, false);
+        b.payset[0].txn.genesis_id = "gid".into();
+        b.payset[0].txn.genesis_hash = [9u8; 32];
+        assert!(block_with_restored_genesis_fields(&b).is_none());
+        // Needs restoring: exactly one restored clone comes back, the input
+        // block is untouched, and a second pass over the result is a no-op.
+        let b = genesis_restore_block(CONSENSUS_V41, true, false);
+        let r = block_with_restored_genesis_fields(&b).expect("restored");
+        assert_eq!(b.payset[0].txn.genesis_hash, [0u8; 32], "input unchanged");
+        assert_eq!(r.payset[0].txn.genesis_hash, [9u8; 32]);
+        assert!(block_with_restored_genesis_fields(&r).is_none());
     }
 
     #[test]

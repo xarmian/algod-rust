@@ -5304,6 +5304,55 @@ async fn get_block_txids_happy_path() {
     );
 }
 
+/// Issue #1704: the block-txids handler restores genesis fields exactly like
+/// go's `DecodeSignedTxn`: on a hash-optional (V15) block a stripped txn with
+/// hgh unset keeps gh absent in its id; on V41 (hash required) gh is restored.
+#[tokio::test]
+async fn get_block_txids_restores_genesis_hash_per_protocol() {
+    let stripped = SignedTransaction {
+        txn: Transaction {
+            txn_type: TxnType::Pay,
+            sender: Address([1u8; 32]),
+            fee: 1000,
+            first_valid: Round(1),
+            last_valid: Round(1000),
+            ..Transaction::default()
+        },
+        has_genesis_id: true,
+        has_genesis_hash: false,
+        ..SignedTransaction::default()
+    };
+    for (proto, expect_gh) in [
+        (algo_types::consensus::CONSENSUS_V15, false),
+        (algo_types::CONSENSUS_V41, true),
+    ] {
+        let mut full = stripped.txn.clone();
+        full.genesis_id = "testnet-v1.0".to_string();
+        if expect_gh {
+            full.genesis_hash = [0xAB; 32];
+        }
+        let mut block = make_test_block(1, vec![stripped.clone()]);
+        block.current_protocol = proto.to_string();
+        let mut node = MockNode::synced();
+        node.blocks.insert(1, block);
+        let server = TestServer::start(node).await;
+        let resp = server
+            .client
+            .get(server.url("/v2/blocks/1/txids"))
+            .header("X-Algo-API-Token", &server.api_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["blockTxids"][0].as_str().unwrap(),
+            algo_codec::compute_txn_id(&full).to_string(),
+            "txid mismatch on {proto} (gh restored: {expect_gh})"
+        );
+    }
+}
+
 #[tokio::test]
 async fn get_block_txids_empty_block() {
     let mut node = MockNode::synced();
