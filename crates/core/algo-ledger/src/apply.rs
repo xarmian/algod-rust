@@ -10706,6 +10706,49 @@ return
         assert_eq!(t.rewards_base, 218_288);
     }
 
+    /// Issue #1732: a NotParticipating pay receiver/sender keeps its
+    /// `rewards_base` through the top-level rewards pass (go's
+    /// `WithUpdatedRewards` returns it unchanged).
+    #[test]
+    fn issue_1732_not_participating_accounts_keep_rewards_base_through_pay() {
+        let sender = Address([1u8; 32]);
+        let receiver = Address([5u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([9u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[
+                (sender, 20_000_000),
+                (receiver, 5_000_000),
+                (fee_sink, 0),
+                (rewards_pool, 10_000_000),
+            ],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+        for a in [sender, receiver] {
+            let mut acct = state.get_account(&a).unwrap().clone();
+            acct.rewards_base = 5;
+            acct.status = algo_types::AccountStatus::NotParticipating;
+            crate::store_trait::LedgerStore::set_account(&mut state, &a, acct);
+        }
+        let block = Block {
+            round: Round(1),
+            fee_sink,
+            rewards_pool,
+            rewards_level: 218_288,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![pay_txn(sender, receiver, 1_000, 1_000)],
+            ..Block::default()
+        };
+        apply_block_with_delta_mode(&mut state, &block, ApplyMode::Execute).unwrap();
+        for a in [sender, receiver] {
+            let acct = state.get_account(&a).unwrap();
+            assert_eq!(acct.rewards_base, 5, "NotParticipating base must not move");
+            assert_eq!(acct.rewarded_micro_algos, 0);
+        }
+        assert_eq!(state.get_account(&receiver).unwrap().micro_algos, 5_001_000);
+    }
+
     /// Issue #1731: an inner `pay` to an existing account with pending rewards
     /// must bring BOTH sides up to the block's rewards level exactly like go's
     /// `Move` (`WithUpdatedRewards` on sender and receiver,
