@@ -2049,9 +2049,34 @@ impl SyncOrchestrator {
             let batch_end = std::cmp::min(batch_start + batch_size - 1, target_round);
 
             // Fetch the batch (parallel if the backend supports it).
-            let batch =
-                self.backend
-                    .fetch_blocks_batch(batch_start, batch_end, self.config.concurrency)?;
+            let batch = match self.backend.fetch_blocks_batch(
+                batch_start,
+                batch_end,
+                self.config.concurrency,
+            ) {
+                Ok(batch) => batch,
+                // Issue #1719 (soak 37455478923): the ledger is verified and
+                // consistent at `batch_start - 1` (>= the catchpoint round),
+                // but the live-catchup peer is commonly a non-archival relay
+                // that no longer serves rounds this far behind the tip
+                // (`expected 16 blocks, got 0`). go-algorand's
+                // `CatchpointCatchupService` ends at the catchpoint round and
+                // its normal catchup service closes the gap with archival
+                // peer selection and retries. Do the same: hand off instead
+                // of failing a catchup whose state is already good. An
+                // explicit `end_round` is a promise to reach that round, so
+                // it still fails.
+                Err(e) if self.config.end_round.is_none() && !self.cancel.is_cancelled() => {
+                    tracing::warn!(
+                        error = %e,
+                        batch_start,
+                        target_round,
+                        "peer cannot serve post-cutover blocks; ending catchpoint replay and                          handing off to normal catchup"
+                    );
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
 
             // Apply each block in the batch sequentially.
             for (round, block) in &batch {
@@ -2133,6 +2158,7 @@ impl SyncOrchestrator {
             batch_start = batch_end + 1;
         }
 
+        self.final_round = self.final_round.max(catchpoint_round);
         self.blocks_replayed = window_applied + blocks_applied;
 
         tracing::info!(
@@ -3984,6 +4010,9 @@ mod tests {
         spend_round: u64,
         /// Emulate a relay gossip port: `/v2/status` answers 404.
         status_not_found: bool,
+        /// Emulate a non-archival peer: every post-cutover block fetch comes
+        /// back empty (`parallel fetch incomplete: expected N blocks, got 0`).
+        batch_fetch_fails: bool,
     }
 
     impl WindowBackend {
@@ -4038,6 +4067,23 @@ mod tests {
 
         fn fetch_block(&self, round: u64) -> Result<Block, AlgoError> {
             Ok(self.block(round))
+        }
+
+        fn fetch_blocks_batch(
+            &self,
+            start: u64,
+            end: u64,
+            _concurrency: usize,
+        ) -> Result<Vec<(u64, Block)>, AlgoError> {
+            if self.batch_fetch_fails {
+                return Err(AlgoError::Ledger {
+                    message: format!(
+                        "parallel fetch incomplete: expected {} blocks, got 0",
+                        end - start + 1
+                    ),
+                });
+            }
+            Ok((start..=end).map(|r| (r, self.block(r))).collect())
         }
 
         fn get_current_round(&self) -> Result<u64, AlgoError> {
@@ -4108,6 +4154,7 @@ mod tests {
                 window_round: BALANCES_ROUND + 1,
                 spend_round: BLOCKS_ROUND + 1,
                 status_not_found: false,
+                batch_fetch_fails: false,
             },
         );
 
@@ -4172,6 +4219,7 @@ mod tests {
                 window_round: BALANCES_ROUND + 1,
                 spend_round: BLOCKS_ROUND + 1,
                 status_not_found: true,
+                batch_fetch_fails: false,
             },
         );
         orchestrator.run_download_ledger().unwrap();
@@ -4181,6 +4229,69 @@ mod tests {
         orchestrator
             .run_replay_blocks()
             .expect("a peer without /v2/status must not fail the replay");
+        assert_eq!(orchestrator.final_round, BLOCKS_ROUND);
+        let ledger =
+            crate::sqlite::SqliteLedger::open_with_prefix(&orchestrator.config.db_path).unwrap();
+        assert_eq!(ledger.current_round().0, BLOCKS_ROUND);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #1719 (nightly soak 37455478923): after a verified cutover and
+    /// lookback-window replay the ledger sits consistently at the catchpoint
+    /// round, but the tip is thousands of rounds away and the non-archival
+    /// live-catchup peer no longer serves those old blocks, so the first
+    /// replay batch came back `expected 16 blocks, got 0` and the whole
+    /// catchup was reported Failed. go-algorand's catchpoint service ends at
+    /// the catchpoint round and lets the normal catchup service (with archival
+    /// peer selection and retries) close the gap -- so must we.
+    #[test]
+    fn replay_hands_off_to_normal_catchup_when_peer_cannot_serve_post_cutover_blocks() {
+        use crate::catchpoint::writer::{export_catchpoint_file, ExportOptions};
+
+        const BALANCES_ROUND: u64 = 1000;
+        const BLOCKS_ROUND: u64 = BALANCES_ROUND + 320;
+        const PAYER: [u8; 32] = [1u8; 32];
+
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-replay-fetch-handoff-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = window_source_db(PAYER, 10_000_000);
+        let path = dir.join("go-shaped.tar.gz");
+        let export_result = export_catchpoint_file(
+            &src,
+            &path,
+            &ExportOptions {
+                balances_round: BALANCES_ROUND,
+                blocks_round: BLOCKS_ROUND,
+                block_header_digest: [7u8; 32],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut config = test_config(dir.join("ledger"), 1);
+        config.catchpoint_label = Some(export_result.label.clone());
+        let mut orchestrator = SyncOrchestrator::with_backend(
+            config,
+            WindowBackend {
+                source_file: path,
+                payer: PAYER,
+                receiver: [2u8; 32],
+                window_round: BALANCES_ROUND + 1,
+                spend_round: BLOCKS_ROUND + 1,
+                status_not_found: false,
+                batch_fetch_fails: true,
+            },
+        );
+        orchestrator.run_download_ledger().unwrap();
+        orchestrator.run_import_ledger().unwrap();
+        orchestrator.run_verify_ledger().unwrap();
+        orchestrator.run_download_lookback().unwrap();
+        orchestrator
+            .run_replay_blocks()
+            .expect("an unservable post-cutover range must hand off, not fail the catchup");
         assert_eq!(orchestrator.final_round, BLOCKS_ROUND);
         let ledger =
             crate::sqlite::SqliteLedger::open_with_prefix(&orchestrator.config.db_path).unwrap();
@@ -4292,6 +4403,7 @@ mod tests {
                 window_round: BALANCES_ROUND + 1,
                 spend_round: BLOCKS_ROUND + 1,
                 status_not_found: false,
+                batch_fetch_fails: false,
             },
         );
         orchestrator.run_download_ledger().unwrap();

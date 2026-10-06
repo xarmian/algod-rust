@@ -321,28 +321,39 @@ impl SyncBackend for AlgodSyncBackend {
                     Arc::new(AlgodClient::new(&self.algod_url, &self.algod_token));
                 let fetcher = ParallelBlockFetcher::new(source, concurrency);
                 let cancel = CancellationToken::new();
-                // fetch_range uses half-open [start, end), so add 1 to include `end`.
-                let mut rx = fetcher.fetch_range(Round(start), Round(end + 1), cancel);
-
-                let mut blocks = Vec::with_capacity((end - start + 1) as usize);
-                while let Some((round, block_resp)) = rx.recv().await {
-                    blocks.push((round.0, block_resp.block));
-                }
-
-                if blocks.len() != (end - start + 1) as usize {
-                    return Err(AlgoError::Ledger {
-                        message: format!(
-                            "parallel fetch incomplete: expected {} blocks, got {}",
-                            end - start + 1,
-                            blocks.len()
-                        ),
-                    });
-                }
-
-                Ok(blocks)
+                collect_block_range(&fetcher, start, end, cancel).await
             })
         })
     }
+}
+
+/// Fetch the inclusive range `[start, end]` through `fetcher`, failing unless
+/// every block arrived. Shared by the REST and gossip [`SyncBackend`]s
+/// (issue #1719 unified their two identical copies). The orchestrator's
+/// replay phase treats this error as "peer cannot serve that range" and
+/// hands off to normal catchup rather than failing the catchpoint catchup.
+async fn collect_block_range(
+    fetcher: &ParallelBlockFetcher,
+    start: u64,
+    end: u64,
+    cancel: CancellationToken,
+) -> Result<Vec<(u64, Block)>, AlgoError> {
+    // fetch_range uses half-open [start, end), so add 1 to include `end`.
+    let mut rx = fetcher.fetch_range(Round(start), Round(end + 1), cancel);
+    let mut blocks = Vec::with_capacity((end - start + 1) as usize);
+    while let Some((round, block_resp)) = rx.recv().await {
+        blocks.push((round.0, block_resp.block));
+    }
+    if blocks.len() != (end - start + 1) as usize {
+        return Err(AlgoError::Ledger {
+            message: format!(
+                "parallel fetch incomplete: expected {} blocks, got {}",
+                end - start + 1,
+                blocks.len()
+            ),
+        });
+    }
+    Ok(blocks)
 }
 
 /// Build the same [`SyncBackend`] the standalone `algod-rust sync`
@@ -768,25 +779,7 @@ impl SyncBackend for GossipSyncBackend {
                 };
                 let fetcher = ParallelBlockFetcher::new(source, effective_concurrency);
                 let cancel = CancellationToken::new();
-                // fetch_range uses half-open [start, end), so add 1 to include `end`.
-                let mut rx = fetcher.fetch_range(Round(start), Round(end + 1), cancel);
-
-                let mut blocks = Vec::with_capacity((end - start + 1) as usize);
-                while let Some((round, block_resp)) = rx.recv().await {
-                    blocks.push((round.0, block_resp.block));
-                }
-
-                if blocks.len() != (end - start + 1) as usize {
-                    return Err(AlgoError::Ledger {
-                        message: format!(
-                            "parallel fetch incomplete: expected {} blocks, got {}",
-                            end - start + 1,
-                            blocks.len()
-                        ),
-                    });
-                }
-
-                Ok(blocks)
+                collect_block_range(&fetcher, start, end, cancel).await
             })
         })
     }
