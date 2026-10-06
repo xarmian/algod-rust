@@ -5141,8 +5141,9 @@ pub(crate) fn group_hash_offset(base: usize, idx: usize, unify: bool) -> usize {
 /// `crypto.HashObj(TxGroup{TxGroupHashes})` over each sibling's
 /// `InnerID(parent, group_hash_offset)`.
 ///
-/// Precondition: the siblings still have `Group` zero (the AVM cannot set it,
-/// and go hashes before assigning it), so each is hashed as given.
+/// Like `algo_codec::compute_group_id`, each sibling is hashed with `Group`
+/// cleared (go hashes before assigning `Group`), so the result does not depend
+/// on whether the caller already assigned one.
 pub(crate) fn compute_inner_group_id<'t>(
     parent: &algo_types::Digest,
     base: usize,
@@ -5152,8 +5153,13 @@ pub(crate) fn compute_inner_group_id<'t>(
     let hashes: Vec<algo_types::Digest> = txns
         .enumerate()
         .map(|(itx, t)| {
-            debug_assert_eq!(t.group, [0u8; 32], "siblings must be ungrouped");
-            algo_avm::itxn::compute_inner_txn_id(parent, group_hash_offset(base, itx, unify), t)
+            let mut ungrouped = t.clone();
+            ungrouped.group = [0u8; 32];
+            algo_avm::itxn::compute_inner_txn_id(
+                parent,
+                group_hash_offset(base, itx, unify),
+                &ungrouped,
+            )
         })
         .collect();
     algo_codec::compute_group_id_from_hashes(&hashes)
@@ -6564,15 +6570,21 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             for s in txns.iter_mut() {
                 s.txn.group = group_id.0;
             }
-            // NOTE: the nested-context sibling snapshot (`siblings_snapshot`) and
-            // `effective_parent_txid` of a grouped inner appl must be taken
-            // AFTER this assignment: go's cx.txn.ID() includes the caller's Group.
+            // NOTE: only the nested-context `siblings_snapshot` depends on this
+            // ordering -- it must be taken AFTER this assignment so a grouped
+            // inner appl's peers/own txn carry the Group (go reads them from
+            // the already-grouped last inner group).
         }
 
-        // Each sibling's own InnerID (go `getTxID`/`getTxIDNotUnified`: offset
-        // is always len(prior inner txns) + groupIndex, over the txn WITH its
-        // Group set), computed once and reused for the nested parent id and
-        // the recorded id list.
+        // Each sibling's own InnerID, over the txn WITH its Group set. Under
+        // UnifyInnerTxIDs go's `getTxID(inner=true)` (eval.go:3341-3361) uses
+        // InnerID(currentTxID, len(InnerTxns) - lastGroupLen + groupIndex);
+        // the pre-unify path (`getTxIDNotUnified`, eval.go:3315-3333) uses
+        // InnerID(caller.txn.ID(), len(caller InnerTxns) + groupIndex). Only
+        // when there is no caller (a top-level txn) does go fall back to the
+        // plain `txn.ID()` (eval.go:3326, 3379) -- that case is a peer read at
+        // depth 0 and never applies to the children computed here. Computed
+        // once and reused for the nested parent id and the recorded id list.
         let child_ids: Vec<algo_types::Digest> = txns
             .iter()
             .enumerate()
@@ -19559,15 +19571,17 @@ mod inner_group_id_tests {
         unify: bool,
         txns: &[&Transaction],
     ) -> [u8; 32] {
-        let mut enc = vec![0x81, 0xa6];
-        enc.extend_from_slice(b"txlist");
-        enc.push(0x90 | txns.len() as u8);
-        for (itx, t) in txns.iter().enumerate() {
-            let off = base + if unify { itx as u64 } else { 0 };
-            enc.extend_from_slice(&[0xc4, 0x20]);
-            enc.extend_from_slice(&inner_id_ungrouped(parent, off, t));
-        }
-        h(&[b"TG", &enc])
+        // TxGroup msgpack via the codec encoder (rmp array header: fixarray up
+        // to 15 entries, array16 beyond), pinned against go in algo-codec.
+        let ids: Vec<algo_types::Digest> = txns
+            .iter()
+            .enumerate()
+            .map(|(itx, t)| {
+                let off = base + if unify { itx as u64 } else { 0 };
+                algo_types::Digest(inner_id_ungrouped(parent, off, t))
+            })
+            .collect();
+        h(&[b"TG", &algo_codec::canonical_encode_tx_group(&ids)])
     }
 
     fn pushint(v: u8) -> Vec<u8> {
@@ -19917,6 +19931,35 @@ mod inner_group_id_tests {
         // Mainnet is post-v34 (UnifyInnerTxIDs).
         let got = compute_inner_group_id(&parent, 0, true, txns.iter());
         assert_eq!(got.0.to_vec(), want);
+    }
+
+    /// `compute_inner_group_id` must not depend on its caller having left
+    /// `Group` zero: like `algo_codec::compute_group_id` it hashes each sibling
+    /// with `Group` cleared, so already-grouped siblings give the same id.
+    #[test]
+    fn compute_inner_group_id_ignores_existing_group_on_siblings() {
+        for unify in [true, false] {
+            let mut store = fresh_store();
+            let (groups, _, outer_id) = run(
+                &mut store,
+                submit_groups(&[vec![pay_fields(0xB1, 1), pay_fields(0xB2, 2)]]),
+                unify,
+            );
+            let grouped: Vec<Transaction> = groups[0].iter().map(|s| s.txn.clone()).collect();
+            assert_ne!(grouped[0].group, [0u8; 32]);
+            let ungrouped: Vec<Transaction> = grouped
+                .iter()
+                .map(|t| Transaction {
+                    group: [0u8; 32],
+                    ..t.clone()
+                })
+                .collect();
+            let parent = algo_types::Digest(outer_id);
+            let from_grouped = compute_inner_group_id(&parent, 0, unify, grouped.iter());
+            let from_ungrouped = compute_inner_group_id(&parent, 0, unify, ungrouped.iter());
+            assert_eq!(from_grouped, from_ungrouped);
+            assert_eq!(from_grouped.0, grouped[0].group);
+        }
     }
 
     #[test]

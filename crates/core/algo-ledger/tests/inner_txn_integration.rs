@@ -3441,18 +3441,13 @@ fn fee_credit_mixed_fees_in_group() {
 // Inner group IDs (issue #1699)
 // ===========================================================================
 
-/// Hand-rolled go `crypto.HashObj(transactions.TxGroup{TxGroupHashes: ids})`:
-/// `SHA512/256("TG" || msgpack({"txlist": [bin32, ...]}))`.
+/// go `crypto.HashObj(transactions.TxGroup{TxGroupHashes: ids})`:
+/// `SHA512/256("TG" || msgpack({"txlist": [bin32, ...]}))`, with the msgpack
+/// encoded by the codec (correct array16 header for 16 entries).
 fn go_group_id_of(ids: &[[u8; 32]]) -> [u8; 32] {
     use sha2::{Digest as _, Sha512_256};
-    let mut enc = vec![0x81, 0xa6];
-    enc.extend_from_slice(b"txlist");
-    assert!(ids.len() < 16);
-    enc.push(0x90 | ids.len() as u8);
-    for id in ids {
-        enc.extend_from_slice(&[0xc4, 0x20]);
-        enc.extend_from_slice(id);
-    }
+    let digests: Vec<algo_types::Digest> = ids.iter().map(|i| algo_types::Digest(*i)).collect();
+    let enc = algo_codec::canonical_encode_tx_group(&digests);
     let mut h = Sha512_256::new();
     h.update(b"TG");
     h.update(&enc);
@@ -3521,6 +3516,38 @@ fn inner_group_gets_shared_go_group_id_two_and_three() {
                 assert_eq!(s.txn.group, want, "n={n} unify={unify}");
             }
         }
+    }
+}
+
+/// Max inner group size (16): the TxGroup `txlist` array header is array16
+/// (`0xdc`) rather than fixarray, and child InnerIDs use offsets 0..16.
+#[test]
+fn sixteen_sibling_inner_group_id_and_child_offsets() {
+    for unify in [true, false] {
+        let (group, parent) = run_inner_group_of(16, unify);
+        assert_eq!(group.len(), 16);
+        let want = expected_inner_group_id(&group, parent, unify);
+        // Independently pin the array16 header the hash is taken over.
+        let digests: Vec<algo_types::Digest> = vec![algo_types::Digest([7u8; 32]); 16];
+        let enc = algo_codec::canonical_encode_tx_group(&digests);
+        assert_eq!(
+            &enc[..10],
+            &[0x81, 0xa6, b't', b'x', b'l', b'i', b's', b't', 0xdc, 0x00]
+        );
+        assert_eq!(enc[10], 0x10);
+        for s in &group {
+            assert_eq!(s.txn.group, want, "unify={unify}");
+        }
+        // Every child's recorded InnerID is over the txn WITH Group set, at
+        // offset prior-count (0) + index.
+        let distinct: std::collections::HashSet<[u8; 32]> = group
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                algo_avm::itxn::compute_inner_txn_id(&algo_types::Digest(parent), i, &s.txn).0
+            })
+            .collect();
+        assert_eq!(distinct.len(), 16);
     }
 }
 
