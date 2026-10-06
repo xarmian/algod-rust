@@ -28,9 +28,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use crate::apply_stall::{StallTransition, STALL_BACKOFF_MAX};
+
 use crossbeam_channel;
 
-use tracing::{debug, warn};
+use tracing::{debug, error, info, warn};
 
 use algo_agreement::{
     AsyncVoteVerifier, Certificate, LedgerError, LedgerReader, LedgerWriter, NetworkAdvancer,
@@ -98,6 +100,91 @@ pub struct AgreementLedgerBridge {
     /// The live waiter for the most recently requested round, so repeated
     /// `round_notify` calls for the same round share one thread (issue #1650).
     notify_cache: Mutex<Option<PendingNotify>>,
+    /// Deterministic block-apply failure tracking (issue #1677). Shared via
+    /// [`Self::with_apply_stall_tracker`] across bridge rebuilds and with the
+    /// REST/metrics adapter.
+    apply_stall: Arc<crate::ApplyStallTracker>,
+}
+
+/// SQLite messages that mean "try again": a locked/busy database. One shared
+/// marker set drives both the in-call retry ([`is_transient_store_message`])
+/// and the local-fault filter ([`is_local_store_fault_message`]).
+const TRANSIENT_STORE_MARKERS: [&str; 3] = ["database is locked", "sqlite_busy", "busy"];
+/// Other SQLite/store faults that are local to this node (not evidence
+/// against a block).
+const LOCAL_STORE_FAULT_MARKERS: [&str; 8] = [
+    "disk i/o",
+    "disk is full",
+    "readonly",
+    "database is",
+    "unable to open",
+    "cannot start a transaction",
+    "out of memory",
+    "locked",
+];
+
+fn is_transient_store_message(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    TRANSIENT_STORE_MARKERS.iter().any(|k| m.contains(k))
+}
+
+/// Whether `msg` looks like a local SQLite/store fault. Filtered by message
+/// because the store reports these as untyped `AlgoError::Ledger`.
+fn is_local_store_fault_message(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    TRANSIENT_STORE_MARKERS
+        .iter()
+        .chain(LOCAL_STORE_FAULT_MARKERS.iter())
+        .any(|k| m.contains(k))
+}
+
+/// Where in `try_commit_block` a commit failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitStage {
+    /// Writing the block / certificate rows or committing the SQLite
+    /// transaction: local storage, never a verdict on the block content.
+    Store,
+    /// Applying the block's content to the ledger state.
+    Apply,
+}
+
+/// A failed `try_commit_block`, tagged with the stage that produced it.
+#[derive(Debug)]
+pub(crate) struct CommitFailure {
+    pub(crate) stage: CommitStage,
+    pub(crate) error: AlgoError,
+}
+
+impl CommitFailure {
+    fn new(stage: CommitStage, error: AlgoError) -> Self {
+        Self { stage, error }
+    }
+
+    /// Whether this failure is evidence the *block content* cannot be
+    /// applied (so repeats are a deterministic invalid-block stall, issue
+    /// #1677), as opposed to a local fault (SQLite I/O, disk full, ...),
+    /// which keeps the normal retry cadence and never enters the stalled
+    /// state.
+    ///
+    /// Stage and error variant form an allow-list: only the apply stage can
+    /// condemn a block, and only through the variants the apply/AVM layers
+    /// use for content verdicts. Because the store reports its own faults as
+    /// the untyped `AlgoError::Ledger`, local faults inside the apply stage
+    /// are filtered by message ([`is_local_store_fault_message`]); a store
+    /// fault with an unrecognised message is still treated as a content
+    /// failure.
+    pub(crate) fn is_block_content_failure(&self) -> bool {
+        self.stage == CommitStage::Apply
+            && !is_local_store_fault_message(&self.error.to_string())
+            && matches!(
+                self.error,
+                AlgoError::Ledger { .. }
+                    | AlgoError::Validation { .. }
+                    | AlgoError::Avm { .. }
+                    | AlgoError::AvmLogicSig { .. }
+                    | AlgoError::Codec { .. }
+            )
+    }
 }
 
 /// A still-running `round_notify` waiter thread and the channel it feeds.
@@ -124,6 +211,18 @@ impl AgreementLedgerBridge {
         self.notify_threads_spawned.load(Ordering::SeqCst)
     }
 
+    /// Share `tracker` instead of this bridge's private one, so the stall
+    /// state survives bridge rebuilds and is visible to the REST adapter.
+    pub fn with_apply_stall_tracker(mut self, tracker: Arc<crate::ApplyStallTracker>) -> Self {
+        self.apply_stall = tracker;
+        self
+    }
+
+    /// The block-apply failure tracker (issue #1677).
+    pub fn apply_stall_tracker(&self) -> &Arc<crate::ApplyStallTracker> {
+        &self.apply_stall
+    }
+
     /// Create a new bridge wrapping the given ledger.
     ///
     /// Uses a no-op network advancer and no pending certificate channel.
@@ -137,6 +236,7 @@ impl AgreementLedgerBridge {
             network_advancer: Arc::new(NoOpNetworkAdvancer),
             notify_threads_spawned: AtomicU64::new(0),
             notify_cache: Mutex::new(None),
+            apply_stall: Arc::new(crate::ApplyStallTracker::new()),
         }
     }
 
@@ -159,6 +259,7 @@ impl AgreementLedgerBridge {
             network_advancer,
             notify_threads_spawned: AtomicU64::new(0),
             notify_cache: Mutex::new(None),
+            apply_stall: Arc::new(crate::ApplyStallTracker::new()),
         }
     }
 
@@ -222,6 +323,7 @@ impl AgreementLedgerBridge {
             network_advancer,
             notify_threads_spawned: AtomicU64::new(0),
             notify_cache: Mutex::new(None),
+            apply_stall: Arc::new(crate::ApplyStallTracker::new()),
         };
         (bridge, rx)
     }
@@ -260,7 +362,7 @@ impl AgreementLedgerBridge {
         hdr_data: &[u8],
         blk_data: &[u8],
         cert_bytes: &[u8],
-    ) -> Result<(), AlgoError> {
+    ) -> Result<(), CommitFailure> {
         // Begin a transaction so that block storage and state application
         // are atomic. If begin_block fails (e.g., already in a transaction),
         // fall back to non-transactional mode.
@@ -280,15 +382,20 @@ impl AgreementLedgerBridge {
         let in_txn = ledger.begin_block().is_ok();
         slow("begin_block", t);
 
-        let result = (|| -> Result<(), AlgoError> {
+        let result = (|| -> Result<(), CommitFailure> {
             let t = std::time::Instant::now();
-            ledger.put_block(block.round.0, proto, hdr_data, blk_data)?;
+            ledger
+                .put_block(block.round.0, proto, hdr_data, blk_data)
+                .map_err(|e| CommitFailure::new(CommitStage::Store, e))?;
             slow("put_block", t);
             let t = std::time::Instant::now();
-            ledger.put_block_cert(block.round.0, cert_bytes)?;
+            ledger
+                .put_block_cert(block.round.0, cert_bytes)
+                .map_err(|e| CommitFailure::new(CommitStage::Store, e))?;
             slow("put_block_cert", t);
             let t = std::time::Instant::now();
-            crate::apply::apply_block_executing_app_calls(ledger, block)?;
+            crate::apply::apply_block_executing_app_calls(ledger, block)
+                .map_err(|e| CommitFailure::new(CommitStage::Apply, e))?;
             slow("apply_block", t);
             Ok(())
         })();
@@ -302,7 +409,9 @@ impl AgreementLedgerBridge {
 
         if in_txn {
             let t = std::time::Instant::now();
-            ledger.commit_block()?;
+            ledger
+                .commit_block()
+                .map_err(|e| CommitFailure::new(CommitStage::Store, e))?;
             slow("commit_block", t);
         }
 
@@ -718,6 +827,8 @@ impl LedgerWriter for AgreementLedgerBridge {
                     block.round.0,
                     next_round - 1
                 );
+                // Any stall on this round or an earlier one is obsolete.
+                self.apply_stall.observe_ledger_round(next_round - 1);
                 return;
             }
 
@@ -750,6 +861,19 @@ impl LedgerWriter for AgreementLedgerBridge {
                     // Success — release the lock before notifying waiters.
                     drop(ledger);
 
+                    // Issue #1677: a commit ends any stalled-on-invalid-block
+                    // state (e.g. a different, valid block for the round).
+                    if let StallTransition::Left { round, failures } =
+                        self.apply_stall.observe_ledger_round(block.round.0)
+                    {
+                        info!(
+                            stalled_round = round,
+                            failures,
+                            committed_round = %block.round,
+                            "ensure_block: no longer stalled on an invalid block"
+                        );
+                    }
+
                     // Notify any threads waiting in wait_for_round.
                     self.round_advanced.notify_all();
 
@@ -760,19 +884,58 @@ impl LedgerWriter for AgreementLedgerBridge {
                 }
                 Err(e) => e,
             };
+            let content_failure = err.is_block_content_failure();
+            let err = err.error;
 
             // Determine if the error is transient (retryable).
             let err_msg = format!("{err}");
-            let is_transient = err_msg.contains("database is locked")
-                || err_msg.contains("SQLITE_BUSY")
-                || err_msg.contains("busy");
+            let is_transient = is_transient_store_message(&err_msg);
 
             if !is_transient {
-                // Permanent error — no point retrying.
-                warn!(
-                    "ensure_block: permanent error writing block {} to ledger: {err}",
-                    block.round
-                );
+                // Permanent error — no point retrying inside this call.
+                //
+                // Issue #1677: the catchup service re-submits the same block
+                // every sync pass, so log by transition: the original
+                // `permanent error writing block` line the first time a
+                // (block, error) pair is seen (the soak log scan keys on it),
+                // one ERROR when the repeat makes it a deterministic stall,
+                // and only debug lines for further repeats.
+                drop(ledger);
+                if !content_failure {
+                    // A local fault (storage stage, I/O, ...): not evidence
+                    // against the block, so no stalled state; today's
+                    // behaviour (WARN per attempt, normal retry cadence).
+                    self.apply_stall.count_local_failure();
+                    warn!(
+                        "ensure_block: permanent error writing block {} to ledger: {err}",
+                        block.round
+                    );
+                    return;
+                }
+                let failed_digest = algo_codec::compute_block_digest(block);
+                match self.apply_stall.record_failure_at_with_digest(
+                    block.round.0,
+                    &err_msg,
+                    std::time::Instant::now(),
+                    Some(failed_digest),
+                ) {
+                    StallTransition::NewFailure => warn!(
+                        "ensure_block: permanent error writing block {} to ledger: {err}",
+                        block.round
+                    ),
+                    StallTransition::Entered => {
+                        error!(
+                            round = %block.round,
+                            "ensure_block: stalled on invalid block {}: two failed attempts for the same round; retries now back off exponentially (cap {}s): {err}",
+                            block.round,
+                            STALL_BACKOFF_MAX.as_secs()
+                        );
+                    }
+                    _ => debug!(
+                        "ensure_block: permanent error writing block {} to ledger (repeat): {err}",
+                        block.round
+                    ),
+                }
                 return;
             }
 
@@ -863,6 +1026,19 @@ impl LedgerWriter for AgreementLedgerBridge {
 }
 
 impl crate::catchup_service::CatchupLedger for AgreementLedgerBridge {
+    fn apply_stall_retry_in(&self, next_round: Round) -> Option<Duration> {
+        // A stall on a round the ledger already reached (catchpoint jump,
+        // follow apply, another bridge) is stale. The caller already holds
+        // the ledger's next round, so no second ledger lock is taken.
+        self.apply_stall
+            .observe_ledger_round(next_round.0.saturating_sub(1));
+        self.apply_stall.retry_in()
+    }
+
+    fn apply_stall_failed_digest(&self) -> Option<algo_types::Digest> {
+        self.apply_stall.failed_block_digest()
+    }
+
     fn next_round(&self) -> Round {
         // Delegate to the LedgerReader implementation which already
         // locks the inner SqliteLedger and returns current_round + 1.
@@ -1277,6 +1453,169 @@ mod tests {
         bridge.ensure_digest(&make_cert(7), &verifier);
         let pending = rx.try_recv().expect("receiver should have a value");
         assert_eq!(pending.cert.round, Round(7));
+    }
+
+    // -- Deterministic apply failure tracking (issue #1677) --
+
+    /// A round-1 block whose only payment is from an unfunded account: it
+    /// fails to apply, identically, every time.
+    fn make_unapplyable_round1_block() -> algo_types::Block {
+        let mut stx = algo_types::SignedTransaction::default();
+        stx.txn.txn_type = "pay".into();
+        stx.txn.sender = Address([1u8; 32]);
+        stx.txn.receiver = Address([2u8; 32]);
+        stx.txn.amount = 1_000_000;
+        stx.txn.fee = 1_000;
+        stx.txn.last_valid = Round(1_000_000);
+        algo_types::Block {
+            payset: vec![stx],
+            ..make_round1_block()
+        }
+    }
+
+    #[test]
+    fn repeated_deterministic_apply_failure_stalls_and_backs_off() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+        let block = make_unapplyable_round1_block();
+        let cert = make_cert_with_proposal(1);
+
+        bridge.ensure_block(&block, &cert);
+        assert!(bridge.apply_stall_tracker().stall().is_none());
+        assert!(
+            crate::catchup_service::CatchupLedger::apply_stall_retry_in(&bridge, Round(1))
+                .is_none()
+        );
+
+        bridge.ensure_block(&block, &cert);
+        let stall = bridge.apply_stall_tracker().stall().expect("stalled");
+        assert_eq!(stall.round, 1);
+        assert_eq!(stall.consecutive_failures, 2);
+        assert!(
+            crate::catchup_service::CatchupLedger::apply_stall_retry_in(&bridge, Round(1))
+                .is_some()
+        );
+        assert_eq!(bridge.apply_stall_tracker().failures_total(), 2);
+        // The ledger never advanced.
+        assert_eq!(ledger.lock().unwrap().current_round().0, 0);
+    }
+
+    #[test]
+    fn committing_a_valid_block_clears_the_stall() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+        let bad = make_unapplyable_round1_block();
+        let cert = make_cert_with_proposal(1);
+        bridge.ensure_block(&bad, &cert);
+        bridge.ensure_block(&bad, &cert);
+        assert!(bridge.apply_stall_tracker().stall().is_some());
+
+        bridge.ensure_block(&make_round1_block(), &cert);
+        assert_eq!(ledger.lock().unwrap().current_round().0, 1);
+        assert!(bridge.apply_stall_tracker().stall().is_none());
+    }
+
+    #[test]
+    fn only_apply_stage_content_errors_count_as_block_failures() {
+        let ledger_err = || AlgoError::Ledger {
+            message: "x".into(),
+        };
+        let f = |stage, e| CommitFailure::new(stage, e).is_block_content_failure();
+        // Storage-stage failures (put_block / cert / commit) never condemn.
+        assert!(!f(CommitStage::Store, ledger_err()));
+        // Local faults even in the apply stage.
+        assert!(!f(
+            CommitStage::Apply,
+            AlgoError::Io(std::io::Error::other("disk full"))
+        ));
+        assert!(!f(
+            CommitStage::Apply,
+            AlgoError::Network {
+                message: "n".into()
+            }
+        ));
+        // Content verdicts.
+        assert!(f(CommitStage::Apply, ledger_err()));
+        assert!(f(
+            CommitStage::Apply,
+            AlgoError::Avm {
+                message: "a".into()
+            }
+        ));
+        assert!(f(
+            CommitStage::Apply,
+            AlgoError::Validation {
+                message: "v".into()
+            }
+        ));
+    }
+
+    #[test]
+    fn local_store_fault_messages_are_never_block_content_failures() {
+        // Real rusqlite/SQLite message strings, as the store wraps them.
+        for m in [
+            "apply error: disk I/O error",
+            "apply error: database or disk is full",
+            "apply error: attempt to write a readonly database",
+            "apply error: unable to open database file",
+            "apply error: cannot start a transaction within a transaction",
+            "apply error: out of memory",
+            "apply error: database table is locked",
+            "apply error: database is locked",
+            "apply error: SQLITE_BUSY",
+        ] {
+            let f = CommitFailure::new(CommitStage::Apply, AlgoError::Ledger { message: m.into() });
+            assert!(!f.is_block_content_failure(), "{m}");
+            assert!(is_local_store_fault_message(m), "{m}");
+        }
+        // The transient subset (in-call retry) is shared, not a second list.
+        assert!(is_transient_store_message("database is locked"));
+        assert!(!is_transient_store_message("disk I/O error"));
+        // A content verdict is not a local fault.
+        let content = CommitFailure::new(
+            CommitStage::Apply,
+            AlgoError::Ledger {
+                message: "tx 0xabc: balance below minimum".into(),
+            },
+        );
+        assert!(content.is_block_content_failure());
+    }
+
+    #[test]
+    fn stall_is_dropped_when_the_ledger_advances_by_another_path() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+        let bad = make_unapplyable_round1_block();
+        let cert = make_cert_with_proposal(1);
+        bridge.ensure_block(&bad, &cert);
+        bridge.ensure_block(&bad, &cert);
+        assert!(
+            crate::catchup_service::CatchupLedger::apply_stall_retry_in(&bridge, Round(1))
+                .is_some()
+        );
+        // Another bridge / catchpoint jump commits round 1: no commit through this bridge.
+        let other = AgreementLedgerBridge::new(Arc::clone(&ledger));
+        other.ensure_block(&make_round1_block(), &cert);
+        assert_eq!(ledger.lock().unwrap().current_round().0, 1);
+        assert!(bridge.apply_stall_tracker().stall().is_some());
+        assert!(
+            crate::catchup_service::CatchupLedger::apply_stall_retry_in(&bridge, Round(2))
+                .is_none()
+        );
+        assert!(bridge.apply_stall_tracker().stall().is_none());
+    }
+
+    #[test]
+    fn shared_tracker_is_visible_across_bridges() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let tracker = Arc::new(crate::ApplyStallTracker::new());
+        let a = AgreementLedgerBridge::new(Arc::clone(&ledger))
+            .with_apply_stall_tracker(Arc::clone(&tracker));
+        let bad = make_unapplyable_round1_block();
+        let cert = make_cert_with_proposal(1);
+        a.ensure_block(&bad, &cert);
+        a.ensure_block(&bad, &cert);
+        assert!(tracker.stall().is_some());
     }
 
     // -- Certificate storage tests --
