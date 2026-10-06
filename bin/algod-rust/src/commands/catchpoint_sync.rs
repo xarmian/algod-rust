@@ -327,23 +327,29 @@ impl SyncBackend for AlgodSyncBackend {
     }
 }
 
-/// Fetch the inclusive range `[start, end]` through `fetcher`, failing unless
-/// every block arrived. Shared by the REST and gossip [`SyncBackend`]s
+/// Fetch the inclusive range `[start, end]` through `fetcher`.
+///
+/// Returns every block, or -- when the peer genuinely cannot serve part of
+/// the range -- the in-order PREFIX that arrived (see
+/// [`SyncBackend::fetch_blocks_batch`]'s contract), so the caller can apply
+/// it and then hand off. Shared by the REST and gossip [`SyncBackend`]s
 /// (issue #1719 unified their two identical copies).
 ///
-/// When the pipeline closes early, the first failed round's own error (via
-/// [`ParallelBlockFetcher::fetch_range_tracked`]) decides the result:
-/// - nothing arrived and that error is [`AlgoError::NotFound`] (a genuine
-///   404 / "round not available") -> `NotFound`: the peer cannot serve this
-///   range, and the orchestrator's replay phase may hand off to normal
-///   catchup;
-/// - any other first error (transport, 401, 5xx, decode, ...) is returned
-///   unchanged so it keeps failing loudly / retrying as before;
-/// - some blocks arrived but not all, or the pipeline was cancelled without
-///   a recorded error -> [`AlgoError::Ledger`] (a hard, non-hand-off error).
+/// When the pipeline closes early, the error recorded for the LOWEST failed
+/// round (via [`ParallelBlockFetcher::fetch_range_tracked`]) decides, but only
+/// if it is for the very next round the consumer needed (`start + prefix
+/// length`); an earlier round with no recorded outcome (still slow, or
+/// cancelled) means the real cause is unknown and is treated as a hard error:
+/// - that error is [`AlgoError::NotFound`] (a genuine 404 / "round not
+///   available"): a non-empty prefix is returned as `Ok`; an empty one is
+///   `Err(NotFound)` ("peer cannot serve this range");
+/// - any other error (transport, 401, 5xx, decode, ...) is returned
+///   unchanged (empty prefix) or wrapped in [`AlgoError::Ledger`] (non-empty
+///   prefix), so it keeps failing loudly / retrying as before.
 ///
-/// An inverted range (`end < start`) is empty. The fetcher is always
-/// cancelled on exit so no background fetch task outlives the call.
+/// An inverted range (`end < start`) is empty and `end == u64::MAX` is
+/// rejected (the half-open fetch range cannot express it). The fetcher is
+/// always cancelled on exit so no background fetch task outlives the call.
 async fn collect_block_range(
     fetcher: &ParallelBlockFetcher,
     start: u64,
@@ -353,11 +359,15 @@ async fn collect_block_range(
     if end < start {
         return Ok(Vec::new());
     }
-    let expected = (end - start).saturating_add(1);
+    if end == u64::MAX {
+        return Err(AlgoError::Ledger {
+            message: "block range end u64::MAX is not supported".to_string(),
+        });
+    }
+    let expected = end - start + 1;
     let _stop_fetcher = cancel.clone().drop_guard();
     // fetch_range uses half-open [start, end), so add 1 to include `end`.
-    let (mut rx, first_error) =
-        fetcher.fetch_range_tracked(Round(start), Round(end.saturating_add(1)), cancel);
+    let (mut rx, first_error) = fetcher.fetch_range_tracked(Round(start), Round(end + 1), cancel);
     let mut blocks = Vec::with_capacity(expected.min(4096) as usize);
     while let Some((round, block_resp)) = rx.recv().await {
         blocks.push((round.0, block_resp.block));
@@ -365,18 +375,26 @@ async fn collect_block_range(
     if blocks.len() as u64 == expected {
         return Ok(blocks);
     }
+    let next_needed = start + blocks.len() as u64;
     let cause = first_error.lock().ok().and_then(|mut slot| slot.take());
     match cause {
-        Some(e) if blocks.is_empty() => Err(e),
-        Some(e) => Err(AlgoError::Ledger {
+        // The lowest failed round is exactly the one we are stuck on.
+        Some((round, e)) if round.0 == next_needed => match e {
+            AlgoError::NotFound(_) if !blocks.is_empty() => Ok(blocks),
+            e if blocks.is_empty() => Err(e),
+            e => Err(AlgoError::Ledger {
+                message: format!(
+                    "parallel fetch incomplete: expected {expected} blocks, got {} ({e})",
+                    blocks.len()
+                ),
+            }),
+        },
+        // The round we need has no recorded outcome (a later round failed
+        // first, or the pipeline was cancelled): the cause is unknown, so do
+        // not classify it as "peer cannot serve".
+        _ => Err(AlgoError::Ledger {
             message: format!(
-                "parallel fetch incomplete: expected {expected} blocks, got {} ({e})",
-                blocks.len()
-            ),
-        }),
-        None => Err(AlgoError::Ledger {
-            message: format!(
-                "parallel fetch incomplete: expected {expected} blocks, got {} (cancelled)",
+                "parallel fetch incomplete: expected {expected} blocks, got {}                  (round {next_needed} has no recorded outcome)",
                 blocks.len()
             ),
         }),
@@ -1563,11 +1581,101 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collect_block_range_partial_result_is_a_hard_error_not_not_found() {
-        let err = collect_block_range(&partial_fetcher(12), 10, 15, CancellationToken::new())
+    async fn collect_block_range_returns_the_prefix_before_a_404_but_not_before_other_errors() {
+        // 404 after rounds 10 and 11: the prefix is returned for the caller to
+        // apply before handing off.
+        let blocks = collect_block_range(&partial_fetcher(12), 10, 15, CancellationToken::new())
             .await
-            .unwrap_err();
+            .unwrap();
+        assert_eq!(blocks.iter().map(|(r, _)| *r).collect::<Vec<_>>(), [10, 11]);
+        // The same shortfall caused by a transport error is a hard error.
+        fn transport() -> AlgoError {
+            AlgoError::Network {
+                message: "connection reset".into(),
+            }
+        }
+        let err = collect_block_range(
+            &failing_fetcher(12, transport),
+            10,
+            15,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, AlgoError::Ledger { .. }), "{err:?}");
+    }
+
+    /// `(delay_ms, error)` per round.
+    struct ScriptedSource(fn(u64) -> (u64, Option<AlgoError>));
+
+    #[async_trait::async_trait]
+    impl BlockSource for ScriptedSource {
+        async fn get_block_raw(&self, _round: Round) -> algo_error::Result<Vec<u8>> {
+            unimplemented!()
+        }
+        async fn get_block(&self, round: Round) -> algo_error::Result<algo_types::BlockResponse> {
+            let (delay, err) = (self.0)(round.0);
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            match err {
+                Some(e) => Err(e),
+                None => Ok(
+                    serde_json::from_value(serde_json::json!({"block": {"rnd": round.0}})).unwrap(),
+                ),
+            }
+        }
+        async fn get_status(&self) -> algo_error::Result<algo_rest_client::NodeStatus> {
+            unimplemented!()
+        }
+        async fn wait_for_round(
+            &self,
+            _round: Round,
+        ) -> algo_error::Result<algo_rest_client::NodeStatus> {
+            unimplemented!()
+        }
+    }
+
+    /// Both orderings (review of #1722): a fast 404 on a later round must not
+    /// become a hand-off while the round we need is merely slow/transient, but
+    /// a slow-yet-successful first round followed by a 404 yields its prefix.
+    #[tokio::test]
+    async fn collect_block_range_decides_on_the_lowest_failed_round_in_both_orderings() {
+        let slow_transient_then_fast_404 = ParallelBlockFetcher::new(
+            Arc::new(ScriptedSource(|r| match r {
+                10 => (
+                    80,
+                    Some(AlgoError::Network {
+                        message: "reset".into(),
+                    }),
+                ),
+                11.. => (0, Some(AlgoError::NotFound("404".into()))),
+                _ => (0, None),
+            })),
+            4,
+        );
+        let err = collect_block_range(
+            &slow_transient_then_fast_404,
+            10,
+            15,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AlgoError::Network { .. }),
+            "must not hand off: {err:?}"
+        );
+
+        let slow_ok_then_404 = ParallelBlockFetcher::new(
+            Arc::new(ScriptedSource(|r| match r {
+                10 => (60, None),
+                _ => (0, Some(AlgoError::NotFound("404".into()))),
+            })),
+            4,
+        );
+        let blocks = collect_block_range(&slow_ok_then_404, 10, 15, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(blocks.len(), 1);
     }
 
     #[tokio::test]
@@ -1576,7 +1684,7 @@ mod tests {
             .await
             .unwrap();
         assert!(blocks.is_empty());
-        // end == u64::MAX must not wrap `end + 1` to 0.
+        // end == u64::MAX is rejected cleanly (no wrap of `end + 1`).
         let err = collect_block_range(
             &partial_fetcher(0),
             u64::MAX - 1,
@@ -1585,7 +1693,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, AlgoError::NotFound(_)), "{err:?}");
+        assert!(matches!(err, AlgoError::Ledger { .. }), "{err:?}");
     }
 
     // -- Fake UnicastPeer (for gossip-peer-snapshot tests) -----------------

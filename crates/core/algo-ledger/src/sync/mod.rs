@@ -136,6 +136,14 @@ pub trait SyncBackend: Send + Sync {
     /// parallel.  The default implementation fetches blocks sequentially;
     /// backends backed by an async runtime can override this to use
     /// [`ParallelBlockFetcher`] for higher throughput.
+    ///
+    /// Contract (issue #1719): the result is either the whole range, an `Err`,
+    /// or -- only when the peer genuinely does not have the next round (a 404,
+    /// reported as [`AlgoError::NotFound`] when nothing at all was served) --
+    /// the in-order PREFIX of the range that was served (`start..start+n`).
+    /// Callers apply the prefix and then treat the shortfall as "peer cannot
+    /// serve the rest". Transient, auth and decode failures are never turned
+    /// into a short `Ok`.
     fn fetch_blocks_batch(
         &self,
         start: u64,
@@ -257,6 +265,15 @@ impl std::fmt::Display for ReplayStoppedEarly {
 // The id prefix `algod_rust_sync_` keeps these rows visibly
 // Rust-private; `migrate_off_algod_rust_meta` (sqlite.rs) copies
 // pre-existing rows across on first open.
+/// A replay fetch failure with "the peer does not have that round" semantics
+/// only hands off to normal catchup when the missing round is at least this
+/// many rounds behind `target_round` (issue #1719). Closer than that, the
+/// target came from the status endpoint and the block peer is merely lagging
+/// it, which is a retryable error. A fixed round count, not a function of the
+/// batch size/concurrency: it states how far behind the tip a peer must be
+/// before "cannot serve old rounds" is the credible reading.
+const HANDOFF_MIN_LAG_ROUNDS: u64 = 64;
+
 const SYNC_STATE_KEY: &str = "algod_rust_sync_state";
 const SYNC_CATCHPOINT_LABEL_KEY: &str = "algod_rust_sync_catchpoint_label";
 const SYNC_CATCHPOINT_ROUND_KEY: &str = "algod_rust_sync_catchpoint_round";
@@ -2109,15 +2126,15 @@ impl SyncOrchestrator {
                 // and an explicit `end_round` is a promise to reach that
                 // round, so it fails too.
                 //
-                // A `NotFound` within the last two batches of `target_round`
-                // is NOT a hand-off: `target_round` came from the status
-                // endpoint, and the block peer commonly lags it by a few
-                // rounds, so that is retryable exactly as before. Only a
+                // A `NotFound` fewer than `HANDOFF_MIN_LAG_ROUNDS` behind
+                // `target_round` is NOT a hand-off: `target_round` came from
+                // the status endpoint, and the block peer commonly lags it by
+                // a few rounds, so that is retryable exactly as before. Only a
                 // missing round farther than that from the target means the
                 // peer genuinely cannot serve old rounds.
                 Err(AlgoError::NotFound(msg))
                     if self.config.end_round.is_none()
-                        && batch_start.saturating_add(2 * batch_size) <= target_round =>
+                        && batch_start.saturating_add(HANDOFF_MIN_LAG_ROUNDS) <= target_round =>
                 {
                     tracing::warn!(
                         error = %msg,
@@ -2212,6 +2229,37 @@ impl SyncOrchestrator {
                 }
             }
 
+            // A short `Ok` batch is the in-order prefix of a peer that does
+            // not have the next round (see `fetch_blocks_batch`'s contract).
+            // The prefix is applied above; now apply the same lag rule as for
+            // an empty batch.
+            let served = batch.len() as u64;
+            if served < batch_end - batch_start + 1 {
+                let next_missing = batch_start + served;
+                if self.config.end_round.is_none()
+                    && next_missing.saturating_add(HANDOFF_MIN_LAG_ROUNDS) <= target_round
+                {
+                    tracing::warn!(
+                        next_missing,
+                        target_round,
+                        served,
+                        "peer served only a prefix of the batch; ending catchpoint replay and \
+                         handing off to normal catchup"
+                    );
+                    stopped_early = Some(ReplayStoppedEarly {
+                        stopped_at_round: next_missing - 1,
+                        target_round,
+                    });
+                    break;
+                }
+                self.blocks_replayed = blocks_applied;
+                return Err(AlgoError::NotFound(format!(
+                    "peer served only {served} of the {} blocks requested from round \
+                     {batch_start} (target {target_round})",
+                    batch_end - batch_start + 1
+                )));
+            }
+
             batch_start = batch_end + 1;
         }
 
@@ -2231,7 +2279,10 @@ impl SyncOrchestrator {
                 stop.stopped_at_round, stop.target_round
             );
             self.replay_stopped_early = Some(stop);
-            // Deliberately no phase_progress = 1.0 / "block replay complete".
+            // Honest progress: the fraction actually replayed, never 1.0, and
+            // no "block replay complete" log.
+            self.progress.phase_progress =
+                blocks_applied as f64 / (target_round - start_round + 1) as f64;
             self.notify_progress();
             return Ok(());
         }
@@ -2343,6 +2394,9 @@ impl SyncOrchestrator {
                 let stopped_early = result.as_ref().ok().and_then(|r| r.stopped_early.clone());
                 if let (Some(stop), true) = (&stopped_early, self.config.follow_after_sync) {
                     let msg = stop.to_string();
+                    // Like every other post-import `Err` return, this leaves
+                    // the persisted resume marker untouched (it is only
+                    // cleared on success): a rerun resumes from that marker.
                     tracing::error!(%stop, "follow requested but replay stopped early; not following");
                     let _ = self.transition(SyncState::Failed(msg.clone()));
                     return Err(AlgoError::Ledger { message: msg });
@@ -2401,6 +2455,10 @@ impl SyncOrchestrator {
                     }
                 }
 
+                // `Complete` means only "catchpoint cutover done": the ledger
+                // is verified and consistent at `final_round`. It does NOT
+                // mean caught up to the tip -- `SyncResult::stopped_early`
+                // says whether replay ended short of its target.
                 self.transition(SyncState::Complete)?;
                 if let Some(stop) = &stopped_early {
                     tracing::warn!(
@@ -4106,6 +4164,9 @@ mod tests {
         /// Batches starting at or below this round are served, later ones
         /// come back empty.
         ServeUpTo(u64),
+        /// Like `ServeUpTo`, but a batch that straddles the limit returns its
+        /// served in-order prefix (a short `Ok`) instead of failing.
+        ServePrefix(u64),
     }
 
     /// What the parallel fetcher reports when the peer serves nothing.
@@ -4202,8 +4263,11 @@ mod tests {
             }
             match self.batch_mode {
                 BatchMode::Fail(make) => return Err(make(end - start + 1)),
-                BatchMode::ServeUpTo(last) if start > last => {
+                BatchMode::ServeUpTo(last) | BatchMode::ServePrefix(last) if start > last => {
                     return Err(not_served(end - start + 1));
+                }
+                BatchMode::ServePrefix(last) if end > last => {
+                    return Ok((start..=last).map(|r| (r, self.block(r))).collect());
                 }
                 _ => {}
             }
@@ -4411,7 +4475,7 @@ mod tests {
                 spend_round: BLOCKS_ROUND + 1,
                 status_not_found: false,
                 batch_mode: BatchMode::Fail(not_served),
-                tip_extra: 10,
+                tip_extra: 100,
                 cancel_on_fetch: None,
             },
         );
@@ -4427,7 +4491,7 @@ mod tests {
             orchestrator.replay_stopped_early,
             Some(ReplayStoppedEarly {
                 stopped_at_round: BLOCKS_ROUND,
-                target_round: BLOCKS_ROUND + 11,
+                target_round: BLOCKS_ROUND + 101,
             })
         );
         let ledger =
@@ -4570,7 +4634,7 @@ mod tests {
         let (mut o, dir) = window_orchestrator(
             "end-round-fails",
             BatchMode::Fail(not_served),
-            10,
+            100,
             None,
             |c| c.end_round = Some(WINDOW_BLOCKS_ROUND + 5),
         );
@@ -4589,7 +4653,7 @@ mod tests {
         let (mut o, dir) = window_orchestrator(
             "cancel-during-fetch",
             BatchMode::Fail(not_served),
-            10,
+            100,
             Some(token.clone()),
             |_| {},
         );
@@ -4611,7 +4675,7 @@ mod tests {
         let (mut o, dir) = window_orchestrator(
             "stopped-early-partial",
             BatchMode::ServeUpTo(WINDOW_BLOCKS_ROUND + 1),
-            10,
+            100,
             None,
             |_| {},
         );
@@ -4621,7 +4685,7 @@ mod tests {
             o.replay_stopped_early,
             Some(ReplayStoppedEarly {
                 stopped_at_round: WINDOW_BLOCKS_ROUND + 2,
-                target_round: WINDOW_BLOCKS_ROUND + 11,
+                target_round: WINDOW_BLOCKS_ROUND + 101,
             })
         );
         assert!(
@@ -4647,16 +4711,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Review of #1722: when the peer serves an in-order PREFIX of a batch
+    /// before a 404 far from the target, the prefix is applied and replay
+    /// hands off at the last applied round (not discarded). 5 of 16 served.
+    #[test]
+    fn replay_applies_a_served_prefix_then_hands_off() {
+        let (mut o, dir) = window_orchestrator(
+            "prefix-handoff",
+            BatchMode::ServePrefix(WINDOW_BLOCKS_ROUND + 5),
+            100,
+            None,
+            |c| c.concurrency = 8,
+        );
+        o.run_replay_blocks().expect("prefix then hand-off");
+        assert_eq!(o.final_round, WINDOW_BLOCKS_ROUND + 5);
+        assert_eq!(
+            o.replay_stopped_early,
+            Some(ReplayStoppedEarly {
+                stopped_at_round: WINDOW_BLOCKS_ROUND + 5,
+                target_round: WINDOW_BLOCKS_ROUND + 101,
+            })
+        );
+        assert!(o.progress.phase_progress > 0.0 && o.progress.phase_progress < 1.0);
+        let ledger = crate::sqlite::SqliteLedger::open_with_prefix(&o.config.db_path).unwrap();
+        assert_eq!(ledger.current_round().0, WINDOW_BLOCKS_ROUND + 5);
+        drop(ledger);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Same prefix but the missing round is near the target (a lagging
+        // peer): the prefix is still applied, but it is a retryable error.
+        let (mut o, dir) = window_orchestrator(
+            "prefix-near-target",
+            BatchMode::ServePrefix(WINDOW_BLOCKS_ROUND + 5),
+            10,
+            None,
+            |c| c.concurrency = 8,
+        );
+        let e = o
+            .run_replay_blocks()
+            .expect_err("near the target: not a hand-off");
+        assert!(matches!(e, AlgoError::NotFound(_)), "{e:?}");
+        assert!(o.replay_stopped_early.is_none());
+        let ledger = crate::sqlite::SqliteLedger::open_with_prefix(&o.config.db_path).unwrap();
+        assert_eq!(ledger.current_round().0, WINDOW_BLOCKS_ROUND + 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Review of #1722: standalone `sync` with follow requested must not enter
     /// follow mode against the peer that just failed to serve blocks (it
     /// would retry every 500 ms forever) and must not exit success either:
     /// scripts would mistake it for caught up.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_with_follow_fails_loudly_when_peer_cannot_serve_blocks() {
-        let (mut o, dir) =
-            window_fixture("follow-fails", BatchMode::Fail(not_served), 10, None, |c| {
-                c.follow_after_sync = true
-            });
+        let (mut o, dir) = window_fixture(
+            "follow-fails",
+            BatchMode::Fail(not_served),
+            100,
+            None,
+            |c| c.follow_after_sync = true,
+        );
         let err = tokio::time::timeout(Duration::from_secs(120), o.run())
             .await
             .expect("follow mode must be skipped, not loop forever")
@@ -4667,6 +4780,13 @@ mod tests {
             "{msg}"
         );
         assert!(matches!(o.state, SyncState::Failed(_)), "{:?}", o.state);
+        // Like every other post-import Err, the persisted resume marker is
+        // left as is (not cleared, not terminal).
+        let conn = o.open_db().unwrap();
+        let persisted = restore_sync_state(&conn)
+            .unwrap()
+            .expect("resume marker must remain, as for other Err returns");
+        assert!(!persisted.state.is_terminal(), "{:?}", persisted.state);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4677,7 +4797,7 @@ mod tests {
         let (mut o, dir) = window_fixture(
             "no-follow-handoff",
             BatchMode::Fail(not_served),
-            10,
+            100,
             None,
             |_| {},
         );
@@ -4685,19 +4805,20 @@ mod tests {
         assert_eq!(result.final_round, WINDOW_BLOCKS_ROUND);
         let stop = result.stopped_early.expect("result must report the stop");
         assert_eq!(stop.stopped_at_round, WINDOW_BLOCKS_ROUND);
-        assert_eq!(stop.target_round, WINDOW_BLOCKS_ROUND + 11);
+        assert_eq!(stop.target_round, WINDOW_BLOCKS_ROUND + 101);
         assert!(stop.to_string().contains("peer cannot serve blocks beyond"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Review of #1722: `target_round` comes from the status endpoint and the
-    /// block peer can lag it by a few rounds. A `NotFound` within the last two
-    /// batches of the target stays a (retryable) error; farther away it is a
-    /// genuine "cannot serve old rounds" hand-off. Batch size here is 2.
+    /// block peer can lag it by a few rounds. A `NotFound` fewer than
+    /// `HANDOFF_MIN_LAG_ROUNDS` behind the target stays a (retryable) error; farther away it is a
+    /// genuine "cannot serve old rounds" hand-off, by a fixed round count.
     #[test]
     fn replay_not_found_near_the_target_is_an_error_but_far_from_it_hands_off() {
-        // batch_start = 1321: 1321 + 2*2 = 1325 <= target ?
-        for (tip_extra, hands_off) in [(2u64, false), (3, false), (4, true), (10, true)] {
+        // batch_start = 1321, target = 1321 + tip_extra: hand off iff
+        // tip_extra >= HANDOFF_MIN_LAG_ROUNDS (64), independent of concurrency.
+        for (tip_extra, hands_off) in [(2u64, false), (63, false), (64, true), (200, true)] {
             let (mut o, dir) = window_orchestrator(
                 &format!("lag-{tip_extra}"),
                 BatchMode::Fail(not_served),

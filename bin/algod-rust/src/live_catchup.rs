@@ -714,7 +714,22 @@ impl CatchupRunner for OrchestratorCatchupRunner {
             }));
 
             match orchestrator.run().await {
-                Ok(_) => return Ok(()),
+                Ok(result) => {
+                    // Issue #1719: `Ok` means the catchpoint cutover is done
+                    // and the ledger is consistent -- not that it reached the
+                    // tip. If the peer could not serve the rest, say so
+                    // explicitly: the node's normal catchup continues from
+                    // `stopped_at_round`.
+                    if let Some(msg) = stopped_early_message(&result) {
+                        warn!(
+                            catchpoint,
+                            stopped_at = result.stopped_early.as_ref().map(|s| s.stopped_at_round),
+                            target = result.stopped_early.as_ref().map(|s| s.target_round),
+                            "live catchpoint catchup handed off: {msg}; normal catchup continues"
+                        );
+                    }
+                    return Ok(());
+                }
                 Err(e) => {
                     // `SyncOrchestrator::run` always transitions to
                     // `SyncState::Failed(msg)` on any phase error (any state
@@ -749,6 +764,12 @@ impl CatchupRunner for OrchestratorCatchupRunner {
     }
 }
 
+/// Status text for a catchup whose replay stopped short of the tip
+/// (issue #1719); `None` when it reached its target.
+fn stopped_early_message(result: &algo_ledger::sync::SyncResult) -> Option<String> {
+    result.stopped_early.as_ref().map(ToString::to_string)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -758,6 +779,25 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn stopped_early_message_reports_the_hand_off_only_when_replay_stopped() {
+        use algo_ledger::sync::{ReplayStoppedEarly, SyncResult};
+        let mut result = SyncResult {
+            final_round: 100,
+            accounts_imported: 0,
+            blocks_replayed: 0,
+            duration: Duration::ZERO,
+            stopped_early: None,
+        };
+        assert_eq!(stopped_early_message(&result), None);
+        result.stopped_early = Some(ReplayStoppedEarly {
+            stopped_at_round: 100,
+            target_round: 900,
+        });
+        let msg = stopped_early_message(&result).unwrap();
+        assert!(msg.contains("stopped at round 100: peer cannot serve blocks beyond"));
+    }
 
     // -----------------------------------------------------------------------
     // is_verify_failure_message
