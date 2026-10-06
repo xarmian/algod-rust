@@ -331,14 +331,16 @@ impl SyncBackend for AlgodSyncBackend {
 /// every block arrived. Shared by the REST and gossip [`SyncBackend`]s
 /// (issue #1719 unified their two identical copies).
 ///
-/// `ParallelBlockFetcher` swallows per-round fetch errors and simply closes
-/// the channel, so the only signal available here is how many blocks came
-/// back:
-/// - none at all -> [`AlgoError::NotFound`] ("the peer cannot serve this
-///   range", e.g. a non-archival relay asked for rounds past its retention);
-///   the orchestrator's replay phase hands off to normal catchup on this.
-/// - some but not all -> [`AlgoError::Ledger`] (a transient/partial failure
-///   that must keep failing loudly).
+/// When the pipeline closes early, the first failed round's own error (via
+/// [`ParallelBlockFetcher::fetch_range_tracked`]) decides the result:
+/// - nothing arrived and that error is [`AlgoError::NotFound`] (a genuine
+///   404 / "round not available") -> `NotFound`: the peer cannot serve this
+///   range, and the orchestrator's replay phase may hand off to normal
+///   catchup;
+/// - any other first error (transport, 401, 5xx, decode, ...) is returned
+///   unchanged so it keeps failing loudly / retrying as before;
+/// - some blocks arrived but not all, or the pipeline was cancelled without
+///   a recorded error -> [`AlgoError::Ledger`] (a hard, non-hand-off error).
 ///
 /// An inverted range (`end < start`) is empty. The fetcher is always
 /// cancelled on exit so no background fetch task outlives the call.
@@ -354,7 +356,8 @@ async fn collect_block_range(
     let expected = (end - start).saturating_add(1);
     let _stop_fetcher = cancel.clone().drop_guard();
     // fetch_range uses half-open [start, end), so add 1 to include `end`.
-    let mut rx = fetcher.fetch_range(Round(start), Round(end.saturating_add(1)), cancel);
+    let (mut rx, first_error) =
+        fetcher.fetch_range_tracked(Round(start), Round(end.saturating_add(1)), cancel);
     let mut blocks = Vec::with_capacity(expected.min(4096) as usize);
     while let Some((round, block_resp)) = rx.recv().await {
         blocks.push((round.0, block_resp.block));
@@ -362,18 +365,22 @@ async fn collect_block_range(
     if blocks.len() as u64 == expected {
         return Ok(blocks);
     }
-    if blocks.is_empty() {
-        return Err(AlgoError::NotFound(format!(
-            "parallel fetch incomplete: expected {expected} blocks, got 0 \
-             (peer served none of rounds {start}..={end})"
-        )));
+    let cause = first_error.lock().ok().and_then(|mut slot| slot.take());
+    match cause {
+        Some(e) if blocks.is_empty() => Err(e),
+        Some(e) => Err(AlgoError::Ledger {
+            message: format!(
+                "parallel fetch incomplete: expected {expected} blocks, got {} ({e})",
+                blocks.len()
+            ),
+        }),
+        None => Err(AlgoError::Ledger {
+            message: format!(
+                "parallel fetch incomplete: expected {expected} blocks, got {} (cancelled)",
+                blocks.len()
+            ),
+        }),
     }
-    Err(AlgoError::Ledger {
-        message: format!(
-            "parallel fetch incomplete: expected {expected} blocks, got {}",
-            blocks.len()
-        ),
-    })
 }
 
 /// Build the same [`SyncBackend`] the standalone `algod-rust sync`
@@ -453,8 +460,16 @@ impl BlockSource for HttpBlockFetcherSource {
         self.fetcher
             .fetch_block(round.0)
             .await
-            .map_err(|e| AlgoError::Network {
-                message: format!("HTTP block fetch failed for round {}: {e}", round.0),
+            .map_err(|e| match e {
+                // The peer answered 404: it does not have that round (e.g. a
+                // non-archival relay past its retention window). Keep that
+                // class so replay can tell it from a transport failure.
+                algo_rest_client::HttpBlockFetchError::BlockNotAvailable { .. } => {
+                    AlgoError::NotFound(format!("HTTP block fetch for round {}: {e}", round.0))
+                }
+                e => AlgoError::Network {
+                    message: format!("HTTP block fetch failed for round {}: {e}", round.0),
+                },
             })
     }
 
@@ -1433,6 +1448,8 @@ mod tests {
     /// (which `ParallelBlockFetcher` turns into a closed channel).
     struct PartialSource {
         serve_below: u64,
+        /// Error for rounds not served.
+        fail_with: fn() -> AlgoError,
     }
 
     #[async_trait::async_trait]
@@ -1442,7 +1459,7 @@ mod tests {
         }
         async fn get_block(&self, round: Round) -> algo_error::Result<algo_types::BlockResponse> {
             if round.0 >= self.serve_below {
-                return Err(AlgoError::NotFound("past retention".into()));
+                return Err((self.fail_with)());
             }
             Ok(serde_json::from_value(serde_json::json!({"block": {"rnd": round.0}})).unwrap())
         }
@@ -1457,8 +1474,69 @@ mod tests {
         }
     }
 
+    fn past_retention() -> AlgoError {
+        AlgoError::NotFound("GET block: 404 past retention".into())
+    }
+
     fn partial_fetcher(serve_below: u64) -> ParallelBlockFetcher {
-        ParallelBlockFetcher::new(Arc::new(PartialSource { serve_below }), 4)
+        failing_fetcher(serve_below, past_retention)
+    }
+
+    fn failing_fetcher(serve_below: u64, fail_with: fn() -> AlgoError) -> ParallelBlockFetcher {
+        ParallelBlockFetcher::new(
+            Arc::new(PartialSource {
+                serve_below,
+                fail_with,
+            }),
+            4,
+        )
+    }
+
+    /// Only a genuine 404 may be reported as "peer cannot serve" (`NotFound`);
+    /// transport and 401 failures on the first round must stay hard errors
+    /// through the real `collect_block_range` mapping, not become a hand-off.
+    #[tokio::test]
+    async fn collect_block_range_maps_only_a_404_to_not_found() {
+        fn transport() -> AlgoError {
+            AlgoError::Network {
+                message: "connection reset by peer".into(),
+            }
+        }
+        fn unauthorized() -> AlgoError {
+            AlgoError::Conformance {
+                message: "GET /v2/blocks/10 returned 401 Unauthorized".into(),
+            }
+        }
+        let err = collect_block_range(
+            &failing_fetcher(0, past_retention),
+            10,
+            15,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AlgoError::NotFound(_)), "404: {err:?}");
+        let err = collect_block_range(
+            &failing_fetcher(0, transport),
+            10,
+            15,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AlgoError::Network { .. }),
+            "transport: {err:?}"
+        );
+        let err = collect_block_range(
+            &failing_fetcher(0, unauthorized),
+            10,
+            15,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AlgoError::Conformance { .. }), "401: {err:?}");
     }
 
     #[tokio::test]

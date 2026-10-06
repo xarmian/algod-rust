@@ -36,7 +36,7 @@ pub use http_over_stream::{
     build_get_request, build_head_request, read_http_response_head, write_request,
     AsyncDuplexStream, BoxedDuplexStream, HttpPeerTransport, RawHttpResponseHead,
 };
-pub use parallel_fetch::{ParallelBlockFetcher, DEFAULT_CONCURRENCY};
+pub use parallel_fetch::{FirstFetchError, ParallelBlockFetcher, DEFAULT_CONCURRENCY};
 pub use ranked_catchpoint_source::RankedCatchpointSource;
 pub use traits::BlockSource;
 pub use types::{

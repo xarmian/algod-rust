@@ -18,8 +18,9 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use algo_error::AlgoError;
 use algo_types::{BlockResponse, Round};
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -29,6 +30,12 @@ use crate::BlockSource;
 
 /// Default number of concurrent block fetches, matching Go's `CatchupParallelBlocks`.
 pub const DEFAULT_CONCURRENCY: usize = 16;
+
+/// Slot holding the error of the first round whose fetch failed (after the
+/// [`BlockSource`]'s own retries). The pipeline closes its channel on a
+/// failure; this is how a caller learns *why* (issue #1719), so it can tell
+/// "the peer does not have that round" (404) from a transient or auth failure.
+pub type FirstFetchError = Arc<Mutex<Option<AlgoError>>>;
 
 /// Fetches blocks in parallel while delivering them in strict round order.
 ///
@@ -74,15 +81,30 @@ impl ParallelBlockFetcher {
         end: Round,
         cancel: CancellationToken,
     ) -> mpsc::Receiver<(Round, BlockResponse)> {
+        self.fetch_range_tracked(start, end, cancel).0
+    }
+
+    /// Like [`Self::fetch_range`], but also returns a [`FirstFetchError`]
+    /// slot that is filled with the first failed round's error before the
+    /// channel closes. A closed channel with an empty slot means the range
+    /// was cancelled externally (or finished).
+    pub fn fetch_range_tracked(
+        &self,
+        start: Round,
+        end: Round,
+        cancel: CancellationToken,
+    ) -> (mpsc::Receiver<(Round, BlockResponse)>, FirstFetchError) {
         let (tx, rx) = mpsc::channel(self.concurrency);
         let source = Arc::clone(&self.source);
         let concurrency = self.concurrency;
+        let first_error: FirstFetchError = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&first_error);
 
         tokio::spawn(async move {
-            Self::run_pipeline(source, concurrency, start, end, tx, cancel).await;
+            Self::run_pipeline(source, concurrency, start, end, tx, cancel, slot).await;
         });
 
-        rx
+        (rx, first_error)
     }
 
     /// Core pipeline loop. Spawns fetch tasks with bounded concurrency via a
@@ -94,6 +116,7 @@ impl ParallelBlockFetcher {
         end: Round,
         tx: mpsc::Sender<(Round, BlockResponse)>,
         cancel: CancellationToken,
+        first_error: FirstFetchError,
     ) {
         use std::collections::BTreeMap;
 
@@ -105,7 +128,7 @@ impl ParallelBlockFetcher {
 
         // Channel for individual fetch results (unbounded so tasks don't block).
         let (result_tx, mut result_rx) =
-            mpsc::unbounded_channel::<(Round, Result<BlockResponse, ()>)>();
+            mpsc::unbounded_channel::<(Round, Result<BlockResponse, AlgoError>)>();
 
         let total = end.0 - start.0;
         let mut spawned: u64 = 0;
@@ -140,7 +163,7 @@ impl ParallelBlockFetcher {
                         }
                         Err(e) => {
                             warn!(round = %round, error = %e, "block fetch failed, cancelling pipeline");
-                            let _ = rtx.send((round, Err(())));
+                            let _ = rtx.send((round, Err(e)));
                         }
                     }
                 });
@@ -168,7 +191,11 @@ impl ParallelBlockFetcher {
             received += 1;
 
             match result {
-                Err(()) => {
+                Err(e) => {
+                    // Record why before the channel closes (first error wins).
+                    if let Ok(mut slot) = first_error.lock() {
+                        slot.get_or_insert(e);
+                    }
                     // A fetch failed. Cancel everything.
                     cancel.cancel();
                     return;
@@ -207,6 +234,27 @@ mod tests {
     use std::time::Duration;
 
     use crate::NodeStatus;
+
+    /// The first failed round's own error is retrievable once the channel
+    /// closes (issue #1719), and a clean fetch leaves the slot empty.
+    #[tokio::test]
+    async fn tracked_fetch_surfaces_the_first_failed_rounds_error() {
+        let fetcher = ParallelBlockFetcher::new(Arc::new(MockBlockSource::with_fail_round(3)), 4);
+        let (mut rx, first_error) =
+            fetcher.fetch_range_tracked(Round(1), Round(8), CancellationToken::new());
+        while rx.recv().await.is_some() {}
+        assert!(first_error.lock().unwrap().take().is_some());
+
+        let fetcher = ParallelBlockFetcher::new(Arc::new(MockBlockSource::new()), 4);
+        let (mut rx, first_error) =
+            fetcher.fetch_range_tracked(Round(1), Round(5), CancellationToken::new());
+        let mut n = 0;
+        while rx.recv().await.is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 4);
+        assert!(first_error.lock().unwrap().is_none());
+    }
 
     /// A mock block source that returns blocks after a variable delay.
     /// If `fail_round` is set, fetching that round returns an error.

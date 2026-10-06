@@ -2108,7 +2108,17 @@ impl SyncOrchestrator {
                 // network, auth, decode, partial batch) still fails loudly,
                 // and an explicit `end_round` is a promise to reach that
                 // round, so it fails too.
-                Err(AlgoError::NotFound(msg)) if self.config.end_round.is_none() => {
+                //
+                // A `NotFound` within the last two batches of `target_round`
+                // is NOT a hand-off: `target_round` came from the status
+                // endpoint, and the block peer commonly lags it by a few
+                // rounds, so that is retryable exactly as before. Only a
+                // missing round farther than that from the target means the
+                // peer genuinely cannot serve old rounds.
+                Err(AlgoError::NotFound(msg))
+                    if self.config.end_round.is_none()
+                        && batch_start.saturating_add(2 * batch_size) <= target_round =>
+                {
                     tracing::warn!(
                         error = %msg,
                         batch_start,
@@ -2322,21 +2332,25 @@ impl SyncOrchestrator {
 
         match &result {
             Ok(_) => {
+                // Issue #1719: replay stopped early because the peer cannot
+                // serve blocks. Follow mode would poll that same peer forever
+                // ("failed to fetch block, retrying" every 500 ms), and a
+                // caller that asked to follow expects to be caught up, so
+                // fail loudly with where we stopped instead of reporting
+                // success. Without `follow_after_sync` (the live-catchup
+                // path) this is an Ok hand-off carrying `stopped_early`; the
+                // node's normal catchup service owns the rest of the gap.
+                let stopped_early = result.as_ref().ok().and_then(|r| r.stopped_early.clone());
+                if let (Some(stop), true) = (&stopped_early, self.config.follow_after_sync) {
+                    let msg = stop.to_string();
+                    tracing::error!(%stop, "follow requested but replay stopped early; not following");
+                    let _ = self.transition(SyncState::Failed(msg.clone()));
+                    return Err(AlgoError::Ledger { message: msg });
+                }
+
                 // If follow mode is enabled, enter it before transitioning to Complete.
                 // Follow mode runs until cancellation; a cancellation exit is not an error.
-                // Issue #1719: if replay stopped because the peer cannot serve
-                // blocks, follow mode would poll that same peer forever
-                // ("failed to fetch block, retrying" every 500 ms). Skip it and
-                // report the stop in the result; the caller's normal catchup
-                // service owns the rest of the gap.
-                if let Some(stop) = result.as_ref().ok().and_then(|r| r.stopped_early.clone()) {
-                    if self.config.follow_after_sync {
-                        tracing::warn!(
-                            %stop,
-                            "skipping follow mode: the peer cannot serve blocks beyond the replay stop"
-                        );
-                    }
-                } else if self.config.follow_after_sync && !self.backend.is_noop() {
+                if self.config.follow_after_sync && !self.backend.is_noop() {
                     if let Err(e) = self.run_follow_mode().await {
                         if self.cancel.is_cancelled() {
                             tracing::info!("follow mode stopped: sync cancelled");
@@ -2388,10 +2402,18 @@ impl SyncOrchestrator {
                 }
 
                 self.transition(SyncState::Complete)?;
-                tracing::info!(
-                    elapsed = ?start.elapsed(),
-                    "catchpoint sync completed"
-                );
+                if let Some(stop) = &stopped_early {
+                    tracing::warn!(
+                        elapsed = ?start.elapsed(),
+                        %stop,
+                        "catchpoint sync stopped early (handing off to normal catchup)"
+                    );
+                } else {
+                    tracing::info!(
+                        elapsed = ?start.elapsed(),
+                        "catchpoint sync completed"
+                    );
+                }
                 // Clear persisted state on success.
                 if let Ok(conn) = self.open_db() {
                     let _ = clear_sync_state(&conn);
@@ -4076,11 +4098,6 @@ mod tests {
         src
     }
 
-    /// Serves synthetic blocks for the go-shaped-window tests: every round
-    /// is an empty block except `window_round` (payer funds `receiver`) and
-    /// `spend_round` (`receiver` spends part of it back) -- the second is
-    /// only applicable if the first was replayed on top of the catchpoint's
-    /// `balances_round` state.
     #[derive(Clone, Copy)]
     enum BatchMode {
         Serve,
@@ -4098,6 +4115,11 @@ mod tests {
         ))
     }
 
+    /// Serves synthetic blocks for the go-shaped-window tests: every round
+    /// is an empty block except `window_round` (payer funds `receiver`) and
+    /// `spend_round` (`receiver` spends part of it back) -- the second is
+    /// only applicable if the first was replayed on top of the catchpoint's
+    /// `balances_round` state.
     struct WindowBackend {
         source_file: std::path::PathBuf,
         payer: [u8; 32],
@@ -4389,7 +4411,7 @@ mod tests {
                 spend_round: BLOCKS_ROUND + 1,
                 status_not_found: false,
                 batch_mode: BatchMode::Fail(not_served),
-                tip_extra: 0,
+                tip_extra: 10,
                 cancel_on_fetch: None,
             },
         );
@@ -4405,7 +4427,7 @@ mod tests {
             orchestrator.replay_stopped_early,
             Some(ReplayStoppedEarly {
                 stopped_at_round: BLOCKS_ROUND,
-                target_round: BLOCKS_ROUND + 1,
+                target_round: BLOCKS_ROUND + 11,
             })
         );
         let ledger =
@@ -4414,11 +4436,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Builds a go-shaped window catchpoint, runs every phase up to (not
-    /// including) replay against a [`WindowBackend`] with the given batch
-    /// behaviour, and returns the orchestrator ready for `run_replay_blocks`.
-    /// `tip_extra` rounds are reported beyond the post-window block.
-    fn window_orchestrator(
+    /// Builds a go-shaped window catchpoint and an unstarted orchestrator over
+    /// a [`WindowBackend`] with the given batch behaviour. `tip_extra` rounds
+    /// are reported beyond the post-window block.
+    fn window_fixture(
         tag: &str,
         batch_mode: BatchMode,
         tip_extra: u64,
@@ -4453,7 +4474,7 @@ mod tests {
         let mut config = test_config(dir.join("ledger"), 1);
         config.catchpoint_label = Some(export_result.label.clone());
         configure(&mut config);
-        let mut orchestrator = SyncOrchestrator::with_backend(
+        let orchestrator = SyncOrchestrator::with_backend(
             config,
             WindowBackend {
                 source_file: path,
@@ -4467,6 +4488,20 @@ mod tests {
                 cancel_on_fetch,
             },
         );
+        (orchestrator, dir)
+    }
+
+    /// [`window_fixture`] plus every phase up to (not including) replay, ready
+    /// for `run_replay_blocks`.
+    fn window_orchestrator(
+        tag: &str,
+        batch_mode: BatchMode,
+        tip_extra: u64,
+        cancel_on_fetch: Option<CancellationToken>,
+        configure: impl FnOnce(&mut SyncConfig),
+    ) -> (SyncOrchestrator, std::path::PathBuf) {
+        let (mut orchestrator, dir) =
+            window_fixture(tag, batch_mode, tip_extra, cancel_on_fetch, configure);
         orchestrator.run_download_ledger().unwrap();
         orchestrator.run_import_ledger().unwrap();
         orchestrator.run_verify_ledger().unwrap();
@@ -4612,44 +4647,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Review of #1722: standalone `sync --follow` must not enter follow mode
-    /// against the very peer that just failed to serve blocks (it would warn
-    /// and retry every 500 ms forever); the result states where it stopped.
+    /// Review of #1722: standalone `sync` with follow requested must not enter
+    /// follow mode against the peer that just failed to serve blocks (it
+    /// would retry every 500 ms forever) and must not exit success either:
+    /// scripts would mistake it for caught up.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn run_skips_follow_mode_and_reports_stop_when_peer_cannot_serve_blocks() {
-        let (o, dir) =
-            window_orchestrator("skip-follow", BatchMode::Fail(not_served), 10, None, |c| {
+    async fn run_with_follow_fails_loudly_when_peer_cannot_serve_blocks() {
+        let (mut o, dir) =
+            window_fixture("follow-fails", BatchMode::Fail(not_served), 10, None, |c| {
                 c.follow_after_sync = true
             });
-        // `window_orchestrator` already ran the early phases; a fresh
-        // orchestrator over the same config drives the whole `run()`.
-        let config = o.config.clone();
-        let (backend_file, ..) = (config.db_path.parent().unwrap().join("go-shaped.tar.gz"),);
-        let mut fresh = config.clone();
-        fresh.db_path = dir.join("ledger-run");
-        let mut run = SyncOrchestrator::with_backend(
-            fresh,
-            WindowBackend {
-                source_file: backend_file,
-                payer: [1u8; 32],
-                receiver: [2u8; 32],
-                window_round: 1001,
-                spend_round: WINDOW_BLOCKS_ROUND + 1,
-                status_not_found: false,
-                batch_mode: BatchMode::Fail(not_served),
-                tip_extra: 10,
-                cancel_on_fetch: None,
-            },
-        );
-        let result = tokio::time::timeout(Duration::from_secs(120), run.run())
+        let err = tokio::time::timeout(Duration::from_secs(120), o.run())
             .await
             .expect("follow mode must be skipped, not loop forever")
-            .expect("hand-off is not a failure");
+            .expect_err("a follow request that stopped early must be an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stopped at round 1320: peer cannot serve blocks beyond"),
+            "{msg}"
+        );
+        assert!(matches!(o.state, SyncState::Failed(_)), "{:?}", o.state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The live-catchup path (`follow_after_sync == false`) keeps the Ok
+    /// hand-off and carries the stop in the result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_without_follow_hands_off_ok_and_reports_stop() {
+        let (mut o, dir) = window_fixture(
+            "no-follow-handoff",
+            BatchMode::Fail(not_served),
+            10,
+            None,
+            |_| {},
+        );
+        let result = o.run().await.expect("hand-off is not a failure");
         assert_eq!(result.final_round, WINDOW_BLOCKS_ROUND);
         let stop = result.stopped_early.expect("result must report the stop");
         assert_eq!(stop.stopped_at_round, WINDOW_BLOCKS_ROUND);
+        assert_eq!(stop.target_round, WINDOW_BLOCKS_ROUND + 11);
         assert!(stop.to_string().contains("peer cannot serve blocks beyond"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review of #1722: `target_round` comes from the status endpoint and the
+    /// block peer can lag it by a few rounds. A `NotFound` within the last two
+    /// batches of the target stays a (retryable) error; farther away it is a
+    /// genuine "cannot serve old rounds" hand-off. Batch size here is 2.
+    #[test]
+    fn replay_not_found_near_the_target_is_an_error_but_far_from_it_hands_off() {
+        // batch_start = 1321: 1321 + 2*2 = 1325 <= target ?
+        for (tip_extra, hands_off) in [(2u64, false), (3, false), (4, true), (10, true)] {
+            let (mut o, dir) = window_orchestrator(
+                &format!("lag-{tip_extra}"),
+                BatchMode::Fail(not_served),
+                tip_extra,
+                None,
+                |_| {},
+            );
+            let r = o.run_replay_blocks();
+            if hands_off {
+                r.unwrap_or_else(|e| panic!("tip_extra {tip_extra} must hand off: {e:?}"));
+                assert!(o.replay_stopped_early.is_some());
+            } else {
+                let e = r.expect_err(&format!("tip_extra {tip_extra} must stay an error"));
+                assert!(matches!(e, AlgoError::NotFound(_)), "{e:?}");
+                assert!(o.replay_stopped_early.is_none());
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// Issue #1654: the post-sync WAL checkpoint must run cleanly against a
