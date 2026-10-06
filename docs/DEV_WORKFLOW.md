@@ -1383,3 +1383,19 @@ Sequence:
   Rust CLI. The rest of the `clerk` group (rawsend / sign / group /
   split / compile / simulate / inspect / multisig / tealsign)
   remains stubbed.
+
+## REST API extensions beyond go-algorand
+
+algod-rust adds a few fields that go-algorand does not have. They are
+**omitted when not applicable**, so a healthy node's response stays
+byte-identical to go-algorand's and the conformance harness (which does
+not compare `/v2/status` field-by-field) and `algod.oas2.json` comparisons
+are unaffected.
+
+- `GET /v2/status` -> `stalled-on-invalid-block`
+  (`{round, error, consecutive-failures, since-unix-secs}`): present only
+  while the node is stalled on a block that deterministically fails to
+  apply (issue #1677). Companion Prometheus metrics on `/metrics`:
+  `algod_rust_sync_stalled_on_invalid_block`,
+  `algod_rust_sync_stalled_block_round`,
+  `algod_rust_ledger_apply_failures_total`.

@@ -452,6 +452,30 @@ pub struct NodeStatusResponse {
     /// Yes votes cast for consensus upgrade.
     #[serde(rename = "upgrade-yes-votes", skip_serializing_if = "Option::is_none")]
     pub upgrade_yes_votes: Option<u64>,
+
+    /// Present only while the node is stalled on a block that
+    /// deterministically fails to apply (issue #1677). algod-rust
+    /// extension: go-algorand has no such field.
+    #[serde(
+        rename = "stalled-on-invalid-block",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stalled_on_invalid_block: Option<StalledOnInvalidBlock>,
+}
+
+/// Details of the block a stalled node cannot apply (`/v2/status`).
+#[derive(Debug, Clone, Serialize)]
+pub struct StalledOnInvalidBlock {
+    /// The round of the block that fails to apply.
+    pub round: u64,
+    /// The error produced by every attempt.
+    pub error: String,
+    /// Consecutive identical failures of this block.
+    #[serde(rename = "consecutive-failures")]
+    pub consecutive_failures: u64,
+    /// Unix time (seconds) of this block's first failure.
+    #[serde(rename = "since-unix-secs")]
+    pub since_unix_secs: u64,
 }
 
 /// Returns the full node status.
@@ -495,6 +519,12 @@ pub async fn get_status<N: NodeInterface>(State(node): State<AppState<N>>) -> Re
         upgrade_votes: None,
         upgrade_votes_required: None,
         upgrade_yes_votes: None,
+        stalled_on_invalid_block: node.apply_stall().map(|s| StalledOnInvalidBlock {
+            round: s.round,
+            error: s.error,
+            consecutive_failures: s.consecutive_failures,
+            since_unix_secs: s.since_unix_secs,
+        }),
     };
 
     // Set upgrade fields only when a vote is happening
