@@ -105,7 +105,7 @@ pub fn next_state_proof_round(state_proof_next_round: u64, latest: u64) -> u64 {
 /// (`signer.go:90-97`): `proto.StateProofInterval == 0` (disabled) or
 /// `round % interval != 0` both skip signing.
 pub fn is_eligible_signing_round(round: u64, interval: u64) -> bool {
-    interval != 0 && round % interval == 0
+    interval != 0 && round.is_multiple_of(interval)
 }
 
 /// Soft limit on how many provers are kept in memory at once — the rest are
@@ -911,7 +911,7 @@ impl StateProofRuntime {
                 }
                 if let Some(params) = consensus_params_for_version(&latest_hdr.current_protocol) {
                     if params.state_proof_interval == 0
-                        || sfa.round % params.state_proof_interval != 0
+                        || !sfa.round.is_multiple_of(params.state_proof_interval)
                         || sfa.round > latest_round
                     {
                         return Ok(SigOutcome::Ignore);

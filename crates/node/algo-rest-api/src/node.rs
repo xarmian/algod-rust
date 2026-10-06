@@ -1090,6 +1090,14 @@ pub trait NodeInterface: Send + Sync + 'static {
         None
     }
 
+    /// The block this node is stalled on because it deterministically
+    /// fails to apply (issue #1677), or `None` when the node is not
+    /// stalled. Surfaced as the additive `stalled-on-invalid-block` object
+    /// on `GET /v2/status` (go-algorand has no equivalent field).
+    fn apply_stall(&self) -> Option<algo_ledger::ApplyStall> {
+        None
+    }
+
     /// Get the block timestamp offset (dev mode only).
     ///
     /// Returns `Err` if not in dev mode, `Ok(None)` if never set,

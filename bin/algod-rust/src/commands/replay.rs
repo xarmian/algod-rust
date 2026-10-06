@@ -220,7 +220,7 @@ pub async fn run(
 
         // Progress logging every 10 blocks
         let blocks_done = round - start + 1;
-        if blocks_done % 10 == 0 || round == end {
+        if blocks_done.is_multiple_of(10) || round == end {
             let elapsed = timer.elapsed().as_secs_f64();
             let rate = blocks_done as f64 / elapsed;
             info!("Block {round}/{end} ({elapsed:.1}s, {rate:.1} blocks/sec)");

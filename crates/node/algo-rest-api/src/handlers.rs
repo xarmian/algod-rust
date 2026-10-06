@@ -452,6 +452,30 @@ pub struct NodeStatusResponse {
     /// Yes votes cast for consensus upgrade.
     #[serde(rename = "upgrade-yes-votes", skip_serializing_if = "Option::is_none")]
     pub upgrade_yes_votes: Option<u64>,
+
+    /// Present only while the node is stalled on a block that
+    /// deterministically fails to apply (issue #1677). algod-rust
+    /// extension: go-algorand has no such field.
+    #[serde(
+        rename = "stalled-on-invalid-block",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stalled_on_invalid_block: Option<StalledOnInvalidBlock>,
+}
+
+/// Details of the block a stalled node cannot apply (`/v2/status`).
+#[derive(Debug, Clone, Serialize)]
+pub struct StalledOnInvalidBlock {
+    /// The round of the block that fails to apply.
+    pub round: u64,
+    /// The error produced by every attempt.
+    pub error: String,
+    /// Consecutive identical failures of this block.
+    #[serde(rename = "consecutive-failures")]
+    pub consecutive_failures: u64,
+    /// Unix time (seconds) of this block's first failure.
+    #[serde(rename = "since-unix-secs")]
+    pub since_unix_secs: u64,
 }
 
 /// Returns the full node status.
@@ -495,6 +519,12 @@ pub async fn get_status<N: NodeInterface>(State(node): State<AppState<N>>) -> Re
         upgrade_votes: None,
         upgrade_votes_required: None,
         upgrade_yes_votes: None,
+        stalled_on_invalid_block: node.apply_stall().map(|s| StalledOnInvalidBlock {
+            round: s.round,
+            error: s.error,
+            consecutive_failures: s.consecutive_failures,
+            since_unix_secs: s.since_unix_secs,
+        }),
     };
 
     // Set upgrade fields only when a vote is happening
@@ -4788,6 +4818,40 @@ pub async fn raw_transaction_async<N: NodeInterface>(
 #[cfg(test)]
 mod handlers_pure_fn_tests {
     use super::*;
+
+    /// Issue #1698: the REST `action` field reports the raw wire `at` integer.
+    /// go's numbers are `basics.DeltaAction` (`data/basics/teal.go`:
+    /// SetBytesAction = 1, SetUintAction = 2, DeleteAction = 3). The wire
+    /// values here are literal go numbers, and each is also checked against
+    /// the ledger's `DeltaAction`, so the REST and ledger numbering cannot
+    /// diverge or be remapped independently.
+    #[test]
+    fn parse_value_delta_action_matches_go_and_ledger_numbers() {
+        use algo_ledger::DeltaAction;
+        let cases = [
+            (1u64, DeltaAction::SetBytes, Some(vec![0xABu8; 4]), None),
+            (2u64, DeltaAction::SetUint, None, Some(7u64)),
+            (3u64, DeltaAction::Delete, None, None),
+        ];
+        for (at, action, bs, ui) in cases {
+            let mut m = vec![(rmpv::Value::from("at"), rmpv::Value::from(at))];
+            if let Some(b) = &bs {
+                m.push((rmpv::Value::from("bs"), rmpv::Value::Binary(b.clone())));
+            }
+            if let Some(u) = ui {
+                m.push((rmpv::Value::from("ui"), rmpv::Value::from(u)));
+            }
+            let vd = parse_value_delta(&rmpv::Value::Map(m)).expect("value delta");
+            assert_eq!(vd.action, at);
+            assert_eq!(vd.action, u64::from(action));
+            assert_eq!(vd.uint, ui);
+            assert_eq!(
+                vd.bytes,
+                bs.map(|b| BASE64_STANDARD.encode(b)),
+                "bytes for at={at}"
+            );
+        }
+    }
 
     /// Port of go's `TestApplicationBoxesMaxKeys`
     /// (`daemon/algod/api/server/v2/handlers_test.go#L33`): direct unit

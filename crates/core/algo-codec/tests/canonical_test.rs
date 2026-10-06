@@ -183,7 +183,7 @@ fn canonical_no_zero_fields_in_fixture_txns() {
                         }
                         rmpv::Value::String(s) => {
                             assert!(
-                                !s.as_str().map_or(true, |s| s.is_empty()),
+                                !s.as_str().is_none_or(|s| s.is_empty()),
                                 "block {round} txn {i}: key '{key}' has empty string"
                             );
                         }

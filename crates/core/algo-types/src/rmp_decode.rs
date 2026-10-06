@@ -908,7 +908,7 @@ mod tests {
     fn read_u64_truncated_after_marker_does_not_panic() {
         for len in 0..8 {
             let mut data = vec![0xcfu8];
-            data.extend(std::iter::repeat(0u8).take(len));
+            data.extend(std::iter::repeat_n(0u8, len));
             let mut rd = &data[..];
             let result = read_u64(&mut rd);
             assert!(
@@ -922,7 +922,7 @@ mod tests {
     fn read_i64_truncated_after_marker_does_not_panic() {
         for len in 0..8 {
             let mut data = vec![0xd3u8];
-            data.extend(std::iter::repeat(0u8).take(len));
+            data.extend(std::iter::repeat_n(0u8, len));
             let mut rd = &data[..];
             let result = read_i64(&mut rd);
             assert!(

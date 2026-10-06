@@ -1,0 +1,96 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: MSRV
+
+# Issue #1672 (epic #1680): enforce the workspace's declared minimum supported
+# Rust version. The toolchain under test is read from the `rust_version` of
+# the workspace packages via `cargo metadata` (single source of truth), so raising the MSRV there is
+# automatically what CI verifies; clippy.toml's `msrv` must agree with it.
+# `--locked` checks the committed Cargo.lock, whose dependency versions are
+# what set the floor (see "Minimum supported Rust version" in
+# docs/DEV_WORKFLOW.md). Deliberately not path-filtered, so it could be made a
+# required check without docs-only PRs waiting on a workflow that never starts.
+# `--all-features` is intentionally not used: the `fuzzing` feature of
+# algo-types (for the excluded fuzz crate) does not compile even on stable.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: msrv-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  msrv-check:
+    name: cargo check on declared MSRV
+    runs-on: ubuntu-latest
+    # Cold-cache `cargo check --workspace --all-targets` takes roughly 5-10
+    # minutes on a hosted runner (about 3 minutes warm); 30 leaves headroom.
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read declared MSRV and verify every crate and clippy.toml agree
+        id: msrv
+        run: |
+          # Source of truth: the `rust_version` of every workspace package
+          # (cargo metadata), so a crate overriding or omitting the workspace
+          # value is noticed. All packages must declare one identical value.
+          # `stable` is installed explicitly (and named with `+stable`)
+          # rather than relying on whatever the runner image preinstalls;
+          # rustup does not auto-install the one rust-toolchain.toml names.
+          rustup toolchain install stable --profile minimal --no-self-update
+          versions=$(cargo +stable metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | .rust_version // "MISSING"' | sort -u)
+          echo "workspace package rust-version values: ${versions}"
+          if [ "$(printf '%s\n' "$versions" | wc -l)" -ne 1 ] || [ "$versions" = "MISSING" ]; then
+            echo "::error::workspace packages must all declare one identical rust-version (got: ${versions//$'\n'/, })"
+            exit 1
+          fi
+          msrv="$versions"
+          clippy_msrv=$(sed -n 's/^msrv *= *"\([0-9][0-9.]*\)".*/\1/p' clippy.toml | head -n1)
+          echo "rust-version=${msrv} clippy.toml msrv=${clippy_msrv}"
+          if [ "$msrv" != "$clippy_msrv" ]; then
+            echo "::error::workspace rust-version ('${msrv}') and clippy.toml msrv ('${clippy_msrv}') must match"
+            exit 1
+          fi
+          echo "version=${msrv}" >> "$GITHUB_OUTPUT"
+
+      # Plain rustup instead of a third-party action: dtolnay/rust-toolchain
+      # only publishes the floating `master`/`v1` refs for arbitrary
+      # `toolchain:` inputs (there is no immutable tag), so installing with
+      # the rustup the runner already ships avoids an unpinned dependency.
+      - name: Install MSRV Rust toolchain
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: rustup toolchain install "${MSRV}" --profile minimal --no-self-update
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The repo's rust-toolchain.toml pins `stable`, which rustup would
+      # otherwise prefer over the default toolchain installed above; the
+      # explicit `+<version>` makes the MSRV toolchain win.
+      - name: cargo check (workspace, all targets, locked)
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: |
+          cargo "+${MSRV}" --version
+          cargo "+${MSRV}" check --workspace --all-targets --locked

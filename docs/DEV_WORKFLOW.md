@@ -221,6 +221,39 @@ cp fixtures/block_{1,2,3,4,5}.msgpack crates/core/algo-codec/tests/fixtures/
 make canonical-extract
 ```
 
+## Minimum supported Rust version (MSRV)
+
+The workspace declares `rust-version = "1.88"` in the root `Cargo.toml` (inherited by every crate), and `clippy.toml`'s `msrv` carries the same value so clippy rejects newer-than-MSRV APIs (e.g. `Duration::from_mins`, stabilised in 1.91). 1.88 is the *measured* minimum for the committed `Cargo.lock`, not a guess: the limiting crates are `time`/`time-core`/`time-macros` (declare 1.88; `time-core` also needs Cargo's edition-2024 support, so nothing below 1.85 can even parse the lockfile's manifests) with `uuid`, `deranged` and several others at 1.85. `cargo +1.75.0 check --workspace --locked` fails at manifest parsing; `cargo +1.88.0 check --workspace --all-targets --locked` passes. List dependency floors with `cargo metadata --format-version 1 --locked` (the `rust_version` field).
+
+To check locally that every workspace crate declares one identical `rust-version` (a new crate must set `rust-version.workspace = true`; CI enforces this) and that it matches `clippy.toml`:
+
+```bash
+cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | "\(.name) \(.rust_version // "MISSING")"'
+grep '^msrv' clippy.toml
+```
+
+Policy: the MSRV is whatever the locked dependency graph requires (we do not rewrite code to support an older compiler and do not pin old dependencies); it is raised by editing `rust-version` and `clippy.toml` together, in the same PR that needs it (typically a dependency bump), and never lowered without re-measuring. The `MSRV` workflow (`.github/workflows/msrv.yml`) is the verifier: it reads `rust_version` from every workspace package via `cargo metadata` (all must declare the same value), requires `clippy.toml` to match, installs exactly that toolchain and runs `cargo +<msrv> check --workspace --all-targets --locked` on every PR and push to `main` (no path filter, so it can be a required check), so a PR that needs a newer compiler fails there until it consciously raises the MSRV. Day-to-day development and all other CI use `stable` (`rust-toolchain.toml`). Moving to edition 2024 is a separate decision and is not covered by this policy. The `fuzz/` crate is excluded from the workspace (it needs nightly `cargo-fuzz` anyway) and is outside the MSRV guarantee; the check also omits `--all-features` because the `fuzzing` feature of `algo-types` does not compile even on stable.
+
+## Resyncing after the DeltaAction numbering change (issue #1698)
+
+Before the `DeltaAction` renumbering (PR #1708), `ApplyMode::Replay` applied the
+`dt` recorded in go blocks with SetBytes/SetUint swapped, so app global/local
+state written by an `appl` transaction was stored with the wrong type or value.
+Nodes that follow with Execute mode (the node follow path since #1665, and
+`apply_block_caching_delta`) re-run the AVM and are unaffected. A ledger
+database built by Replay of `appl` blocks before this change (the pre-#1665
+follow path, `relay`, `replay` without `--avm-execute`) should be resynced from
+a catchpoint. Dev-mode ledgers are not affected, verified in code:
+`encode_eval_delta` results (outer `dt` and inner `itx[*].dt`) only land in the
+in-memory `ApplyData` returned by the Execute apply
+(`apply.rs`, `captured_eval_delta`; `avm_context.rs` inner `stxn.eval_delta`) and
+in the `dev_apply_data` map in `node_interface_impl.rs`. `dev_producer.rs` calls
+`put_block` with the block bytes assembled before the apply, so the stored block
+never carries them, and no code path writes `ApplyData` into a block, catchpoint
+or sqlite row (the delta cache holds the ledger `StateDelta`, which has no
+action numbers). The old numbering was only visible in-process, via the dev-mode
+REST lookups and simulate.
+
 ## Running Tests
 
 ```bash
@@ -1363,3 +1396,19 @@ Sequence:
   Rust CLI. The rest of the `clerk` group (rawsend / sign / group /
   split / compile / simulate / inspect / multisig / tealsign)
   remains stubbed.
+
+## REST API extensions beyond go-algorand
+
+algod-rust adds a few fields that go-algorand does not have. They are
+**omitted when not applicable**, so a healthy node's response stays
+byte-identical to go-algorand's and the conformance harness (which does
+not compare `/v2/status` field-by-field) and `algod.oas2.json` comparisons
+are unaffected.
+
+- `GET /v2/status` -> `stalled-on-invalid-block`
+  (`{round, error, consecutive-failures, since-unix-secs}`): present only
+  while the node is stalled on a block that deterministically fails to
+  apply (issue #1677). Companion Prometheus metrics on `/metrics`:
+  `algod_rust_sync_stalled_on_invalid_block`,
+  `algod_rust_sync_stalled_block_round`,
+  `algod_rust_ledger_apply_failures_total`.

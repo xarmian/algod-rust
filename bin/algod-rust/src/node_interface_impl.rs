@@ -367,6 +367,10 @@ pub struct AlgodNodeInterface {
     /// `Some` only for the `participate` command, mirroring
     /// `participation_metrics` — `None` everywhere else.
     agreement_message_counters: Option<Arc<algo_network::AgreementMessageCounters>>,
+    /// Stalled-on-invalid-block tracker (issue #1677), shared with the
+    /// ledger bridges that record block-apply failures. `Some` only for the
+    /// `participate` command; `None` elsewhere (no stall is ever reported).
+    apply_stall_tracker: Option<Arc<algo_ledger::ApplyStallTracker>>,
     /// Per-tag inbound-gossip `pool.remember()` failure counters (issue
     /// #1134). `Some` only when a [`Self::with_pool`]-attached node also
     /// registers a `TxTagHandler` for inbound TX traffic (the `participate`
@@ -458,6 +462,7 @@ impl AlgodNodeInterface {
             debug_settings_prof: Arc::new(Mutex::new((0, 0))),
             participation_metrics: None,
             agreement_message_counters: None,
+            apply_stall_tracker: None,
             tx_pool_remember_counter: None,
             tx_pool_check_counter: None,
             ws_network: None,
@@ -492,6 +497,28 @@ impl AlgodNodeInterface {
         counters: Arc<algo_network::AgreementMessageCounters>,
     ) -> Self {
         self.agreement_message_counters = Some(counters);
+        self
+    }
+
+    /// Drop a stall the ledger has already moved past by some other path.
+    fn observe_ledger_round_for_stall(&self, tracker: &algo_ledger::ApplyStallTracker) {
+        // Never block a status/metrics scrape on the ledger mutex (a long
+        // commit holds it): when busy, skip the staleness lookup. The bridge
+        // (`ensure_block` / `apply_stall_retry_in`) is the primary path that
+        // drops a stale stall.
+        if let Ok(l) = self.ledger.try_lock() {
+            tracker.observe_ledger_round(l.current_round().0);
+        }
+    }
+
+    /// Attach the block-apply stall tracker (issue #1677) so `/v2/status`
+    /// and `/metrics` report a node stalled on an invalid block.
+    #[must_use]
+    pub fn with_apply_stall_tracker(
+        mut self,
+        tracker: Arc<algo_ledger::ApplyStallTracker>,
+    ) -> Self {
+        self.apply_stall_tracker = Some(tracker);
         self
     }
 
@@ -2280,6 +2307,12 @@ impl NodeInterface for AlgodNodeInterface {
         serde_json::to_value(metrics.snapshot()).ok()
     }
 
+    fn apply_stall(&self) -> Option<algo_ledger::ApplyStall> {
+        let tracker = self.apply_stall_tracker.as_ref()?;
+        self.observe_ledger_round_for_stall(tracker);
+        tracker.stall()
+    }
+
     /// The same participation counters, plus (issue #776) the Go-runtime-
     /// equivalent process counters and network-interface counters when
     /// their respective `config.json` flags are set, all in Prometheus text
@@ -2305,6 +2338,12 @@ impl NodeInterface for AlgodNodeInterface {
         // sections above.
         if let Some(counters) = self.agreement_message_counters.as_ref() {
             text.push_str(&counters.to_prometheus_text());
+        }
+        // Issue #1677: block-apply failure counter and stalled-on-invalid-
+        // block gauges, so monitoring can alert without log parsing.
+        if let Some(tracker) = self.apply_stall_tracker.as_ref() {
+            self.observe_ledger_round_for_stall(tracker);
+            text.push_str(&tracker.to_prometheus_text());
         }
         if let Some(pool) = self.pool.as_ref() {
             text.push_str(&pool.reeval_counter().to_prometheus_text());
@@ -3626,6 +3665,26 @@ mod tests {
         assert!(adapter.metrics_exposition().is_none());
     }
 
+    /// Issue #1677: a stall recorded on the shared tracker reaches both
+    /// `apply_stall()` (status) and the Prometheus exposition.
+    #[test]
+    fn apply_stall_tracker_surfaces_in_status_and_metrics() {
+        let tracker = Arc::new(algo_ledger::ApplyStallTracker::new());
+        let adapter = make_adapter().with_apply_stall_tracker(tracker.clone());
+        assert!(adapter.apply_stall().is_none());
+        let idle = adapter.metrics_exposition().expect("exposition");
+        assert!(idle.contains("algod_rust_sync_stalled_on_invalid_block 0"));
+
+        tracker.record_failure(42, "bad block");
+        tracker.record_failure(42, "bad block");
+        let stall = adapter.apply_stall().expect("stalled");
+        assert_eq!(stall.round, 42);
+        let text = adapter.metrics_exposition().expect("exposition");
+        assert!(text.contains("algod_rust_sync_stalled_on_invalid_block 1"));
+        assert!(text.contains("algod_rust_sync_stalled_block_round 42"));
+        assert!(text.contains("algod_rust_ledger_apply_failures_total 2"));
+    }
+
     /// An attached but never-updated collector must still answer — with
     /// zeroed counters — so a scraper can tell "participating, no votes yet"
     /// apart from "not participating".
@@ -4259,6 +4318,93 @@ mod tests {
             .expect("lookup ok")
             .expect("transaction should be found as confirmed");
         assert_eq!(status.confirmed_round, 1, "confirmed in round 1");
+    }
+
+    /// Issue #1703: the block a dev-mode node produces and stores must carry
+    /// each payset transaction in go's `SignedTxnInBlock` form -- genesis
+    /// id/hash stripped (`hgi` set), restored only transiently while
+    /// evaluating -- and its `txn_commitment` payset commitment must match the one
+    /// computed over that stripped form. Clients submit transactions with
+    /// `gen`/`gh` set; go's block payset never stores them.
+    #[tokio::test]
+    async fn dev_mode_produced_block_payset_strips_genesis_fields() {
+        use algo_types::{Round, Transaction, TxnType};
+        use ed25519_dalek::SigningKey;
+
+        let sender_key = SigningKey::from_bytes(&[0x55u8; 32]);
+        let sender = Address(sender_key.verifying_key().to_bytes());
+        let (adapter, ledger, gh) = seed_dev_adapter(sender, 10_000_000);
+        // The network's genesis id, as recorded by the seeded genesis block.
+        let genesis_id = ledger
+            .lock()
+            .unwrap()
+            .get_block_header(0)
+            .unwrap()
+            .expect("genesis header")
+            .genesis_id;
+        assert!(!genesis_id.is_empty(), "seeded genesis has an id");
+
+        let txn = Transaction {
+            txn_type: TxnType::Pay,
+            sender,
+            receiver: Address([0x66u8; 32]),
+            amount: 1_000_000,
+            fee: 1000,
+            first_valid: Round(1),
+            last_valid: Round(1000),
+            genesis_id: genesis_id.clone(),
+            genesis_hash: gh,
+            ..Default::default()
+        };
+        let stx = sign_txn(&txn, &sender_key);
+        let txid = compute_txn_id(&txn);
+
+        adapter
+            .broadcast_signed_tx_group(vec![stx])
+            .await
+            .expect("dev-mode broadcast should produce a block");
+
+        let raw = ledger
+            .lock()
+            .unwrap()
+            .get_block_data(1)
+            .unwrap()
+            .expect("round 1 block stored");
+        let block = algo_codec::decode_block(&raw).expect("decode stored block");
+        assert_eq!(block.payset.len(), 1);
+        let stib = &block.payset[0];
+        assert!(
+            stib.txn.genesis_id.is_empty(),
+            "stored payset txn must not carry gen, got {:?}",
+            stib.txn.genesis_id
+        );
+        assert_eq!(
+            stib.txn.genesis_hash, [0u8; 32],
+            "stored payset txn must not carry gh"
+        );
+        assert!(stib.has_genesis_id, "hgi must be set");
+        // The protocol requires the genesis hash, so go leaves hgh unset.
+        assert!(
+            algo_types::consensus::consensus_params_for_version(&block.current_protocol)
+                .expect("known protocol")
+                .require_genesis_hash,
+            "this test runs on a protocol that requires the genesis hash"
+        );
+        assert!(
+            !stib.has_genesis_hash,
+            "hgh must stay unset when the protocol requires the genesis hash"
+        );
+
+        // The commitment is over the full (restored) transaction ids, so it
+        // must equal the root computed from the stripped stored form.
+        assert_eq!(
+            block.txn_commitment.as_slice(),
+            algo_validate::merkle::compute_payset_merkle_root(&block).as_slice(),
+            "txn_commitment must match the stripped-form payset commitment"
+        );
+        let restored = algo_validate::restore_payset_genesis_fields(&block);
+        assert_eq!(restored[0].txn.genesis_id, genesis_id);
+        assert_eq!(compute_txn_id(&restored[0].txn), txid);
     }
 
     /// Issue #581: the dev-mode block producer's `StateDelta` cache (what

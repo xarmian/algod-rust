@@ -4136,7 +4136,7 @@ impl SqliteLedger {
         // (`calculateCatchpointRounds` operates on `[oldBase+1, ..]`), and
         // guards against `0 % interval == 0` trivially firing on genesis
         // seeding.
-        if round == 0 || round % cfg.interval != 0 {
+        if round == 0 || !round.is_multiple_of(cfg.interval) {
             return;
         }
         let Some(prefix) = self.db_prefix.clone() else {

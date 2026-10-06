@@ -206,9 +206,7 @@ impl HistoricStats {
     fn new(window_size: usize, class: PeerClass) -> Self {
         Self {
             window_size,
-            rank_samples: std::iter::repeat(class.initial_rank)
-                .take(window_size)
-                .collect(),
+            rank_samples: std::iter::repeat_n(class.initial_rank, window_size).collect(),
             rank_sum: class.initial_rank as u64 * window_size as u64,
             request_gaps: VecDeque::with_capacity(window_size),
             gap_sum: 0.0,

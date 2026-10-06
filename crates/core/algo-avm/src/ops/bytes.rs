@@ -212,7 +212,7 @@ pub fn op_extract_uint16(
 ) -> Result<(), AlgoError> {
     let s = machine.pop_uint()? as usize;
     let a = machine.pop_bytes()?;
-    if s.checked_add(2).map_or(true, |end| end > a.len()) {
+    if s.checked_add(2).is_none_or(|end| end > a.len()) {
         return Err(avm_err(format!(
             "extract_uint16: offset {s} + 2 > length {}",
             a.len()
@@ -229,7 +229,7 @@ pub fn op_extract_uint32(
 ) -> Result<(), AlgoError> {
     let s = machine.pop_uint()? as usize;
     let a = machine.pop_bytes()?;
-    if s.checked_add(4).map_or(true, |end| end > a.len()) {
+    if s.checked_add(4).is_none_or(|end| end > a.len()) {
         return Err(avm_err(format!(
             "extract_uint32: offset {s} + 4 > length {}",
             a.len()
@@ -246,7 +246,7 @@ pub fn op_extract_uint64(
 ) -> Result<(), AlgoError> {
     let s = machine.pop_uint()? as usize;
     let a = machine.pop_bytes()?;
-    if s.checked_add(8).map_or(true, |end| end > a.len()) {
+    if s.checked_add(8).is_none_or(|end| end > a.len()) {
         return Err(avm_err(format!(
             "extract_uint64: offset {s} + 8 > length {}",
             a.len()

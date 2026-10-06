@@ -50,7 +50,7 @@ pub async fn compare_accounts(
     round: u64,
     sample_rate: u64,
 ) -> CompareResult {
-    if sample_rate > 0 && round % sample_rate != 0 {
+    if sample_rate > 0 && !round.is_multiple_of(sample_rate) {
         return CompareResult {
             mismatches: Vec::new(),
             skipped: 0,
