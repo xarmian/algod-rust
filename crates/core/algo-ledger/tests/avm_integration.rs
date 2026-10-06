@@ -138,6 +138,7 @@ fn make_context<'a>(
         [0u8; 32], // program_hash
         [0u8; 32], // genesis_hash
         algo_types::ConsensusParams::default(),
+        0, // rewards_level (test default)
     );
     // See the identical comment in `inner_txn_integration.rs`'s
     // `make_context` / algo-ledger's own `avm_context.rs` test helper:
@@ -166,6 +167,7 @@ fn make_lsig_context<'a>(
         [0u8; 32], // program_hash
         [0u8; 32], // genesis_hash
         algo_types::ConsensusParams::default(),
+        0, // rewards_level (test default)
     )
 }
 

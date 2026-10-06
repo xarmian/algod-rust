@@ -112,6 +112,12 @@ pub fn apply_rewards(account: &mut AccountData, rewards_level: u64) -> u64 {
     if account.status == AccountStatus::NotParticipating {
         return 0;
     }
+    // Fast path: already at this level -> nothing pending, nothing to stamp.
+    // Hit by the second `apply_rewards` of the same account within one
+    // transaction (rewards pass, then `apply_pay`'s credit).
+    if account.rewards_base == rewards_level {
+        return 0;
+    }
     let pending = compute_pending_rewards(account, rewards_level);
     if pending > 0 {
         account.micro_algos = account.micro_algos.checked_add(pending).unwrap_or_else(|| {
