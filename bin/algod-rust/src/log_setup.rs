@@ -61,16 +61,20 @@ const WINDOW: Duration = Duration::from_secs(60);
 /// How often the summary thread checks for an ended window.
 const SUMMARY_TICK: Duration = Duration::from_secs(1);
 
-/// The module paths of the validator handle, one per hickory generation in
-/// the lockfile. This list is the single definition of the noisy target:
+/// The module path of the validator handle that logs the flood. This list
+/// is the single definition of the noisy target:
 /// both limiting ([`is_noisy_target`]) and `RUST_LOG` prefix overrides
 /// ([`names_noisy_target`]) are derived from it, so a path can never be
 /// limited yet impossible to override (an unlisted new path is simply not
 /// limited).
-const NOISY_TARGET_PATHS: [&str; 2] = [
-    "hickory_proto::dnssec::dnssec_dns_handle",
-    "hickory_proto::xfer::dnssec_dns_handle",
-];
+///
+/// Only hickory-proto 0.25.x logs `exceeded max validation depth` (via
+/// `error!` in `src/dnssec/dnssec_dns_handle/mod.rs`). The 0.24.4 copy in
+/// the lockfile (`xfer::dnssec_dns_handle`) returns it as a `ProtoError`
+/// and never logs it, so it has no entry here. The test
+/// `locked_hickory_versions_match_the_pinned_noisy_path` fails when the
+/// locked hickory-proto versions change, to force re-checking this path.
+const NOISY_TARGET_PATHS: [&str; 1] = ["hickory_proto::dnssec::dnssec_dns_handle"];
 
 /// Whether an event target is the noisy target.
 fn is_noisy_target(target: &str) -> bool {
@@ -285,13 +289,14 @@ fn spawn_summary_ticker(
         .map(drop)
 }
 
-/// Text of the suppression notice. The hint keeps `info` first: the bare
+/// Text of the suppression notice. The hint tells operators to append the
+/// directive to their current `RUST_LOG` rather than replace it: a bare
 /// `RUST_LOG=hickory_proto=debug` would drop every other target to the
 /// default level. The count covers every ended window not yet reported.
 fn summary_message(dropped: u64) -> String {
     format!(
         "rate-limited hickory dnssec_dns_handle errors: suppressed {dropped} events since the \
-         last report (set RUST_LOG=info,hickory_proto=debug to see all)"
+         last report (append ,hickory_proto=debug to your current RUST_LOG to see all)"
     )
 }
 
@@ -409,7 +414,6 @@ mod tests {
             "hickory_proto=4",
             "hickory_proto::dnssec=trace",
             "hickory_proto::dnssec::dnssec_dns_handle=debug",
-            "hickory_proto::xfer::dnssec_dns_handle=debug",
             // EnvFilter matches targets by plain string prefix
             "hickory=debug",
             "hickory_p=trace",
@@ -475,9 +479,10 @@ mod tests {
     }
 
     #[test]
-    fn noisy_target_predicate_covers_both_hickory_versions() {
+    fn noisy_target_predicate_matches_the_logging_hickory_path_only() {
         assert!(is_noisy_target("hickory_proto::dnssec::dnssec_dns_handle"));
-        assert!(is_noisy_target("hickory_proto::xfer::dnssec_dns_handle"));
+        // 0.24.4 never logs this error, so its path is not limited.
+        assert!(!is_noisy_target("hickory_proto::xfer::dnssec_dns_handle"));
         assert!(!is_noisy_target("hickory_proto::dnssec::verifier"));
         assert!(!is_noisy_target("hickory_resolver::dnssec_dns_handle"));
         assert!(!is_noisy_target("algo_network::srv_resolver"));
@@ -561,12 +566,40 @@ mod tests {
         }
     }
 
+    /// Pins the noisy path to the locked hickory-proto versions: 0.25.2 logs
+    /// the error at `hickory_proto::dnssec::dnssec_dns_handle`, 0.24.4 does
+    /// not log it. A bump changes the set and fails here, prompting a
+    /// re-check of `NOISY_TARGET_PATHS`.
+    #[test]
+    fn locked_hickory_versions_match_the_pinned_noisy_path() {
+        let lock =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))
+                .expect("read Cargo.lock");
+        let lock = lock.replace("\r\n", "\n");
+        let mut versions: Vec<&str> = lock
+            .split("[[package]]")
+            .filter(|b| b.lines().any(|l| l == "name = \"hickory-proto\""))
+            .filter_map(|b| b.lines().find_map(|l| l.strip_prefix("version = \"")))
+            .map(|v| v.trim_end_matches('"'))
+            .collect();
+        versions.sort_unstable();
+        assert_eq!(
+            versions,
+            ["0.24.4", "0.25.2"],
+            "locked hickory-proto versions changed: re-check where `exceeded max validation              depth` is logged and update NOISY_TARGET_PATHS"
+        );
+    }
+
     /// The notice's hint must be safe to copy: the bare `hickory_proto=debug`
     /// form would drop every other target to the default level.
     #[test]
     fn summary_message_has_a_safe_hint_and_honest_wording() {
         let m = summary_message(42);
-        assert!(m.contains("RUST_LOG=info,hickory_proto=debug"), "{m}");
+        assert!(
+            m.contains("append ,hickory_proto=debug to your current RUST_LOG"),
+            "{m}"
+        );
+        assert!(!m.contains("RUST_LOG=info"), "{m}");
         assert!(
             m.contains("suppressed 42 events since the last report"),
             "{m}"
@@ -711,9 +744,6 @@ mod tests {
             for _ in 0..10 {
                 tracing::error!(target: "hickory_proto::dnssec::dnssec_dns_handle", "depth");
             }
-            for _ in 0..4 {
-                tracing::error!(target: "hickory_proto::xfer::dnssec_dns_handle", "depth");
-            }
             for _ in 0..3 {
                 tracing::error!(target: "algo_network::srv_resolver", "other");
             }
@@ -725,7 +755,7 @@ mod tests {
     fn composed_filter_limits_only_the_noisy_target() {
         let limiter = Some(Arc::new(RateLimiter::new(2, Duration::from_secs(3600))));
         assert_eq!(count_events(limiter), 2 + 3);
-        assert_eq!(count_events(None), 10 + 4 + 3);
+        assert_eq!(count_events(None), 10 + 3);
     }
 
     /// Reverse of the override matrix: every limited path is overridable by
