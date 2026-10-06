@@ -188,7 +188,14 @@ with the recorded one. Any difference is logged as `shadow_execute_mismatch`
 default 1) to check only every Nth Replay-applied block. Watch the
 `shadow_execute_progress` log line (checked / mismatched /
 `state_skipped_unsupported_store` / suppressed-line counters); a non-zero
-skipped count means the store could not roll back and nothing was verified.
+skipped count means the store could not roll back and nothing was verified:
+the log scan treats `shadow_execute_unsupported_store`, and a progress line
+that shows zero checked blocks and zero app-call compares, as hard failures so
+such a soak never reports clean. `shadow_execute_sample_every` accepts at most
+9 digits (longer values are clamped to 999999999 with a workflow warning;
+non-numeric or 0 means 1). The workflow passes every dispatch input to the
+run-parameters script through `env:` rather than interpolating it into the
+shell text.
 
 ## Auto-filed issues
 

@@ -273,6 +273,9 @@ HARD_RULES = [
     # block in Execute mode; a differing result is a Replay-path parity bug.
     ("shadow_execute_mismatch", re.compile(r"shadow_execute_mismatch"), 1, "shadow Execute evaluation of a Replay-applied block differs from the Replay result (parity bug)"),
 ]
+SHADOW_NOTHING_VERIFIED_RE = re.compile(
+    r"shadow_execute_progress state_checked_blocks=0 .*apply_data_compared_blocks=0\b"
+)
 # Special hard rule needing the noise exclusion (handled in scan_line).
 BALANCE_KEY = "block_apply_balance_error"
 BALANCE_DESC = "block apply hit 'below minimum balance' / 'insufficient balance' outside the gossip tx handlers"
@@ -310,6 +313,7 @@ _PREFILTER = (
     "slow ensure_block",
     "shadow_execute_mismatch",
     "shadow_execute_unsupported_store",
+    "shadow_execute_progress",
     "validation depth",
     "pool rejected",
     "TxSyncer",
@@ -352,8 +356,16 @@ def scan_lines(lines) -> dict:
             else:
                 bump("hard", "shadow_execute_mismatch")
             continue
+        # The flag was on but the store could not roll back a scratch apply (or
+        # a progress line shows nothing was ever compared): the soak verified
+        # nothing, so it must not report clean.
         if "shadow_execute_unsupported_store" in line:
-            bump("warn", "shadow_execute_unsupported_store")
+            bump("hard", "shadow_execute_unsupported_store")
+            continue
+        if SHADOW_NOTHING_VERIFIED_RE.search(line):
+            bump("hard", "shadow_execute_nothing_verified")
+            continue
+        if "shadow_execute_progress" in line:
             continue
         for key, rx, _thr, _d in HARD_RULES:
             if rx.search(line):

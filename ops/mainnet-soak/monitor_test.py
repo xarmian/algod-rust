@@ -744,11 +744,19 @@ class ScanLogTest(unittest.TestCase):
         line = L("01:00:00.000000", "WARN", "algo_ledger::shadow_execute: shadow_execute_mismatch round=7 diffs=1 [execute_error field=error replay=ok execute=shadow Execute evaluation panicked; apply_block failed]")
         self.assertEqual(self._hard([line]), {"shadow_execute_mismatch": 1})
 
-    def test_shadow_unsupported_store_is_a_warning_only(self):
+    def test_shadow_unsupported_store_is_hard(self):
         line = L("01:00:00.000000", "WARN", "algo_ledger::shadow_execute: shadow_execute_unsupported_store: this store cannot roll back")
-        scan = nodelog.scan_lines([line])
-        self.assertEqual(scan["hard_failures"], {})
-        self.assertEqual(scan["warn"], {"shadow_execute_unsupported_store": 1})
+        self.assertEqual(self._hard([line]), {"shadow_execute_unsupported_store": 1})
+
+    def test_shadow_progress_with_nothing_checked_is_hard(self):
+        line = L("01:00:00.000000", "INFO", "algo_ledger::shadow_execute: shadow_execute_progress state_checked_blocks=0 state_mismatched_blocks=0 state_skipped_unsupported_store=100 state_avg_check_us=0 apply_data_compared_blocks=0 apply_data_compared_txns=0")
+        self.assertEqual(self._hard([line]), {"shadow_execute_nothing_verified": 1})
+
+    def test_shadow_progress_with_checked_blocks_is_clean(self):
+        for tail in ("state_checked_blocks=5 state_mismatched_blocks=0 apply_data_compared_blocks=0 x=1",
+                     "state_checked_blocks=0 state_mismatched_blocks=0 apply_data_compared_blocks=7 x=1"):
+            line = L("01:00:00.000000", "INFO", "algo_ledger::shadow_execute: shadow_execute_progress " + tail)
+            self.assertEqual(self._hard([line]), {}, tail)
 
     def test_shadow_progress_line_is_not_hard(self):
         line = L("01:00:00.000000", "INFO", "algo_ledger::shadow_execute: shadow_execute_progress checked=1000 mismatched_blocks=0")
