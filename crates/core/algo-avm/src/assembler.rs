@@ -3311,7 +3311,7 @@ mod hex {
     }
 
     pub fn decode(s: &str) -> Result<Vec<u8>, String> {
-        if s.len() % 2 != 0 {
+        if !s.len().is_multiple_of(2) {
             return Err("odd-length hex string".into());
         }
         (0..s.len())
@@ -6062,7 +6062,7 @@ dup
     fn generate_unsalted_program_of_size(size: usize, pragma: u8) -> Vec<u8> {
         assert!(size >= 5, "size must be at least 5 bytes; got {size}");
         let mut src = format!("#pragma version {pragma}\n#pragma autosalt false\n");
-        if size % 2 == 0 {
+        if size.is_multiple_of(2) {
             src.push_str("intcblock 1 1\n");
         } else {
             src.push_str("intcblock 1\n");

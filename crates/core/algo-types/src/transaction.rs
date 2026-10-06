@@ -1178,9 +1178,9 @@ impl ResourceRef {
         self.address.is_zero()
             && self.asset == 0
             && self.app == 0
-            && self.holding.as_ref().map_or(true, |h| h.is_empty())
-            && self.locals.as_ref().map_or(true, |l| l.is_empty())
-            && self.box_ref.as_ref().map_or(true, |b| b.is_empty())
+            && self.holding.as_ref().is_none_or(|h| h.is_empty())
+            && self.locals.as_ref().is_none_or(|l| l.is_empty())
+            && self.box_ref.as_ref().is_none_or(|b| b.is_empty())
     }
 }
 
@@ -1570,7 +1570,7 @@ impl Participant {
         // so also reject an explicit-but-all-zero verifier, not just an absent "p" key.
         if s.pk
             .as_ref()
-            .map_or(true, |pk| *pk == MerkleSignatureVerifier::default())
+            .is_none_or(|pk| *pk == MerkleSignatureVerifier::default())
         {
             return Err(algo_error::AlgoError::Codec {
                 source: "missing required field 'p'".into(),
@@ -2434,11 +2434,11 @@ mod logicsig_blank_tests {
     /// LMsig.Blank() && PQsig.Blank()`.
     fn logicsig_blank(lsig: &LogicSig) -> bool {
         lsig.logic.is_empty()
-            && lsig.args.as_ref().map_or(true, |a| a.is_empty())
+            && lsig.args.as_ref().is_none_or(|a| a.is_empty())
             && crate::serde_bytes_array::is_zero_64(&lsig.sig)
             && lsig.msig.is_none()
             && lsig.lmsig.is_none()
-            && lsig.pqsig.as_ref().map_or(true, |p| p.blank())
+            && lsig.pqsig.as_ref().is_none_or(|p| p.blank())
     }
 
     /// Mirrors go's `LogicSig.HasProgram()`: `len(Logic) != 0`.
@@ -2551,11 +2551,11 @@ mod signed_txn_has_signature_tests {
 
     fn logicsig_blank(lsig: &LogicSig) -> bool {
         lsig.logic.is_empty()
-            && lsig.args.as_ref().map_or(true, |a| a.is_empty())
+            && lsig.args.as_ref().is_none_or(|a| a.is_empty())
             && crate::serde_bytes_array::is_zero_64(&lsig.sig)
-            && lsig.msig.as_ref().map_or(true, multisig_blank)
-            && lsig.lmsig.as_ref().map_or(true, multisig_blank)
-            && lsig.pqsig.as_ref().map_or(true, |p| p.blank())
+            && lsig.msig.as_ref().is_none_or(multisig_blank)
+            && lsig.lmsig.as_ref().is_none_or(multisig_blank)
+            && lsig.pqsig.as_ref().is_none_or(|p| p.blank())
     }
 
     /// Mirrors go's `SignedTxn.HasSignature()`.

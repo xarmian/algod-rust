@@ -482,7 +482,7 @@ pub async fn run(
 
         // Progress logging.
         let blocks_done = blocks_applied + blocks_failed;
-        if blocks_done % progress_interval == 0 || round.0 == target {
+        if blocks_done.is_multiple_of(progress_interval) || round.0 == target {
             let elapsed = timer.elapsed().as_secs_f64();
             let rate = if elapsed > 0.0 {
                 blocks_done as f64 / elapsed

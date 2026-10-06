@@ -768,7 +768,7 @@ async fn submit_once(shared: &Arc<Shared>, widx: usize) {
         Ok(txid) => {
             shared.accepted_groups.fetch_add(1, Ordering::Relaxed);
             shared.record_endpoint(endpoint, true);
-            if cfg.confirm_sample > 0 && seq % cfg.confirm_sample == 0 {
+            if cfg.confirm_sample > 0 && seq.is_multiple_of(cfg.confirm_sample) {
                 spawn_confirm_probe(shared.clone(), endpoint_idx, txid, submitted_at);
             }
         }

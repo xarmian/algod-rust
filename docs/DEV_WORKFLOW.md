@@ -221,6 +221,19 @@ cp fixtures/block_{1,2,3,4,5}.msgpack crates/core/algo-codec/tests/fixtures/
 make canonical-extract
 ```
 
+## Minimum supported Rust version (MSRV)
+
+The workspace declares `rust-version = "1.88"` in the root `Cargo.toml` (inherited by every crate), and `clippy.toml`'s `msrv` carries the same value so clippy rejects newer-than-MSRV APIs (e.g. `Duration::from_mins`, stabilised in 1.91). 1.88 is the *measured* minimum for the committed `Cargo.lock`, not a guess: the limiting crates are `time`/`time-core`/`time-macros` (declare 1.88; `time-core` also needs Cargo's edition-2024 support, so nothing below 1.85 can even parse the lockfile's manifests) with `uuid`, `deranged` and several others at 1.85. `cargo +1.75.0 check --workspace --locked` fails at manifest parsing; `cargo +1.88.0 check --workspace --all-targets --locked` passes. List dependency floors with `cargo metadata --format-version 1 --locked` (the `rust_version` field).
+
+To check locally that every workspace crate declares one identical `rust-version` (a new crate must set `rust-version.workspace = true`; CI enforces this) and that it matches `clippy.toml`:
+
+```bash
+cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | "\(.name) \(.rust_version // "MISSING")"'
+grep '^msrv' clippy.toml
+```
+
+Policy: the MSRV is whatever the locked dependency graph requires (we do not rewrite code to support an older compiler and do not pin old dependencies); it is raised by editing `rust-version` and `clippy.toml` together, in the same PR that needs it (typically a dependency bump), and never lowered without re-measuring. The `MSRV` workflow (`.github/workflows/msrv.yml`) is the verifier: it reads `rust_version` from every workspace package via `cargo metadata` (all must declare the same value), requires `clippy.toml` to match, installs exactly that toolchain and runs `cargo +<msrv> check --workspace --all-targets --locked` on every PR and push to `main` (no path filter, so it can be a required check), so a PR that needs a newer compiler fails there until it consciously raises the MSRV. Day-to-day development and all other CI use `stable` (`rust-toolchain.toml`). Moving to edition 2024 is a separate decision and is not covered by this policy. The `fuzz/` crate is excluded from the workspace (it needs nightly `cargo-fuzz` anyway) and is outside the MSRV guarantee; the check also omits `--all-features` because the `fuzzing` feature of `algo-types` does not compile even on stable.
+
 ## Resyncing after the DeltaAction numbering change (issue #1698)
 
 Before the `DeltaAction` renumbering (PR #1708), `ApplyMode::Replay` applied the

@@ -132,7 +132,7 @@ fn decide(counter: u64, rate: Option<u64>, extra_copies: u32) -> FilterDecision 
         (None, _) | (_, 0) => FilterDecision::Keep,
         (Some(0), _) => FilterDecision::Keep, // 0-rate is a no-op (matches Go).
         (Some(rate), extra) => {
-            if counter % rate == 0 {
+            if counter.is_multiple_of(rate) {
                 FilterDecision::Duplicate {
                     extra_copies: extra,
                 }

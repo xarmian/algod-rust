@@ -127,7 +127,7 @@ fn decide(counter: u64, rate: Option<u64>) -> FilterDecision {
         // `counter % 1 == 0` is always true.
         Some(0) => FilterDecision::Keep,
         Some(rate) => {
-            if counter % rate == 0 {
+            if counter.is_multiple_of(rate) {
                 FilterDecision::Drop
             } else {
                 FilterDecision::Keep

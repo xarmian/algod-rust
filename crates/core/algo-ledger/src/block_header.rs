@@ -307,7 +307,7 @@ fn compute_bonus(
         }
     }
 
-    if decay_interval != 0 && current % decay_interval == 0 {
+    if decay_interval != 0 && current.is_multiple_of(decay_interval) {
         // Decay by 1%: go's `basics.NewPercent(99).DivvyAlgos(prevBonus)`,
         // i.e. floor(prevBonus * 99 / 100) (`data/basics/fraction.go`).
         return ((prev_bonus as u128 * 99) / 100) as u64;

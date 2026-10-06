@@ -137,7 +137,7 @@ pub fn voters_round_for_state_proof_round(
 /// (`ledger/voters.go:207`): `(round + lookback) % interval == 0`.
 /// `interval == 0` (state proofs disabled) is never a voters round.
 pub fn is_voters_round(round: u64, lookback: u64, interval: u64) -> bool {
-    interval != 0 && round.saturating_add(lookback) % interval == 0
+    interval != 0 && round.saturating_add(lookback).is_multiple_of(interval)
 }
 
 /// Port of go's `stateproof.GetOldestExpectedStateProof`
@@ -476,7 +476,7 @@ pub fn expected_voters_tracking<L: LedgerStore>(
     params: &ConsensusParams,
 ) -> Result<(Vec<u8>, u64), AlgoError> {
     let interval = params.state_proof_interval;
-    if interval == 0 || next_round % interval != 0 {
+    if interval == 0 || !next_round.is_multiple_of(interval) {
         return Ok((Vec::new(), 0));
     }
     let lookback_round = sub_saturate(next_round, params.state_proof_voters_lookback);

@@ -121,7 +121,7 @@ pub async fn run_replay(
         blocks_processed += 1;
 
         // Progress logging every 10 blocks.
-        if blocks_processed % 10 == 0 || round == end_round {
+        if blocks_processed.is_multiple_of(10) || round == end_round {
             info!("Block {round}/{end_round} ({blocks_processed}/{count} done)");
         }
     }
@@ -226,7 +226,7 @@ pub async fn run_decode(
         blocks_processed += 1;
 
         // Progress logging every 10 blocks.
-        if blocks_processed % 10 == 0 || round == end_round {
+        if blocks_processed.is_multiple_of(10) || round == end_round {
             info!("Block {round}/{end_round} ({blocks_processed}/{count} done)");
         }
     }

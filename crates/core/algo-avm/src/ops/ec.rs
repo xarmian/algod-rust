@@ -119,7 +119,7 @@ fn bytes_to_bn254_g1(b: &[u8]) -> Result<BN254G1Affine, AlgoError> {
 
 /// Decode multiple concatenated G1 points.
 fn bytes_to_bn254_g1s(b: &[u8], check_subgroup: bool) -> Result<Vec<BN254G1Affine>, AlgoError> {
-    if b.len() % BN254_G1_SIZE != 0 {
+    if !b.len().is_multiple_of(BN254_G1_SIZE) {
         return Err(avm_err(format!(
             "bad length {}. Expected {} multiple",
             b.len(),
@@ -184,7 +184,7 @@ fn bytes_to_bn254_g2(b: &[u8]) -> Result<BN254G2Affine, AlgoError> {
 
 /// Decode multiple concatenated G2 points.
 fn bytes_to_bn254_g2s(b: &[u8], check_subgroup: bool) -> Result<Vec<BN254G2Affine>, AlgoError> {
-    if b.len() % BN254_G2_SIZE != 0 {
+    if !b.len().is_multiple_of(BN254_G2_SIZE) {
         return Err(avm_err(format!(
             "bad length {}. Expected {} multiple",
             b.len(),
@@ -260,7 +260,7 @@ fn bytes_to_bls12_g1(b: &[u8]) -> Result<BLS12G1Affine, AlgoError> {
 }
 
 fn bytes_to_bls12_g1s(b: &[u8], check_subgroup: bool) -> Result<Vec<BLS12G1Affine>, AlgoError> {
-    if b.len() % BLS12_G1_SIZE != 0 {
+    if !b.len().is_multiple_of(BLS12_G1_SIZE) {
         return Err(avm_err(format!(
             "bad length {}. Expected {} multiple",
             b.len(),
@@ -321,7 +321,7 @@ fn bytes_to_bls12_g2(b: &[u8]) -> Result<BLS12G2Affine, AlgoError> {
 }
 
 fn bytes_to_bls12_g2s(b: &[u8], check_subgroup: bool) -> Result<Vec<BLS12G2Affine>, AlgoError> {
-    if b.len() % BLS12_G2_SIZE != 0 {
+    if !b.len().is_multiple_of(BLS12_G2_SIZE) {
         return Err(avm_err(format!(
             "bad length {}. Expected {} multiple",
             b.len(),

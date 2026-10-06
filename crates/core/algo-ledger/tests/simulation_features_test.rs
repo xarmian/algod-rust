@@ -149,7 +149,7 @@ fn logging_program_sized(count: usize, size: usize) -> Vec<u8> {
                 break;
             }
         }
-        p.extend(std::iter::repeat(0xAB).take(size));
+        p.extend(std::iter::repeat_n(0xAB, size));
         p.push(0xb0); // log
     }
     p.extend_from_slice(&[0x81, 0x01, 0x43]);

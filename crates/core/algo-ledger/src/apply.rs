@@ -3272,7 +3272,7 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
                     // record; go treats it exactly like a missing one.
                     || store
                         .get_account(addr)
-                        .map_or(true, |a| a == algo_types::AccountData::default()));
+                        .is_none_or(|a| a == algo_types::AccountData::default()));
             if !skip_write {
                 store.set_account(addr, account);
             }
