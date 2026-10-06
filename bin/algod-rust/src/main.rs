@@ -23,18 +23,17 @@ mod commands;
 mod config;
 mod dev_producer;
 mod live_catchup;
+mod log_setup;
 mod node_interface_impl;
 
 use clap::Parser;
-use tracing_subscriber::{fmt, EnvFilter};
 
 use cli::{AlgocfgAction, AlgocfgProfileAction, BenchAction, CatchpointAction, Cli, Commands};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize structured logging (JSON in prod, pretty for dev).
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt().with_env_filter(filter).init();
+    // Initialize logging: RUST_LOG-driven fmt output plus the hickory DNSSEC error rate limit.
+    log_setup::init();
 
     let cli = Cli::parse();
 

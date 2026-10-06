@@ -4819,6 +4819,40 @@ pub async fn raw_transaction_async<N: NodeInterface>(
 mod handlers_pure_fn_tests {
     use super::*;
 
+    /// Issue #1698: the REST `action` field reports the raw wire `at` integer.
+    /// go's numbers are `basics.DeltaAction` (`data/basics/teal.go`:
+    /// SetBytesAction = 1, SetUintAction = 2, DeleteAction = 3). The wire
+    /// values here are literal go numbers, and each is also checked against
+    /// the ledger's `DeltaAction`, so the REST and ledger numbering cannot
+    /// diverge or be remapped independently.
+    #[test]
+    fn parse_value_delta_action_matches_go_and_ledger_numbers() {
+        use algo_ledger::DeltaAction;
+        let cases = [
+            (1u64, DeltaAction::SetBytes, Some(vec![0xABu8; 4]), None),
+            (2u64, DeltaAction::SetUint, None, Some(7u64)),
+            (3u64, DeltaAction::Delete, None, None),
+        ];
+        for (at, action, bs, ui) in cases {
+            let mut m = vec![(rmpv::Value::from("at"), rmpv::Value::from(at))];
+            if let Some(b) = &bs {
+                m.push((rmpv::Value::from("bs"), rmpv::Value::Binary(b.clone())));
+            }
+            if let Some(u) = ui {
+                m.push((rmpv::Value::from("ui"), rmpv::Value::from(u)));
+            }
+            let vd = parse_value_delta(&rmpv::Value::Map(m)).expect("value delta");
+            assert_eq!(vd.action, at);
+            assert_eq!(vd.action, u64::from(action));
+            assert_eq!(vd.uint, ui);
+            assert_eq!(
+                vd.bytes,
+                bs.map(|b| BASE64_STANDARD.encode(b)),
+                "bytes for at={at}"
+            );
+        }
+    }
+
     /// Port of go's `TestApplicationBoxesMaxKeys`
     /// (`daemon/algod/api/server/v2/handlers_test.go#L33`): direct unit
     /// coverage of the pure `applicationBoxesMaxKeys` function, matching

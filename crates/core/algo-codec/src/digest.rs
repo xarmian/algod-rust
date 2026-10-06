@@ -59,7 +59,18 @@ pub fn compute_group_id(txns: &[Transaction]) -> Digest {
             compute_txn_id(&zeroed)
         })
         .collect();
-    let encoded = canonical_encode_tx_group(&hashes);
+    compute_group_id_from_hashes(&hashes)
+}
+
+/// Hash an ordered list of per-transaction digests into a group ID:
+/// `SHA512/256("TG" || canonical_encode(TxGroup{TxGroupHashes: hashes}))`,
+/// i.e. go's `crypto.HashObj(transactions.TxGroup{TxGroupHashes: hashes})`.
+///
+/// The caller decides what each digest is: a plain `TxID` for top-level
+/// groups ([`compute_group_id`]), or `InnerID(parent, offset)` for inner
+/// groups (go's `opItxnSubmit`, `data/transactions/logic/eval.go`).
+pub fn compute_group_id_from_hashes(hashes: &[Digest]) -> Digest {
+    let encoded = canonical_encode_tx_group(hashes);
     hash_with_prefix(TG_HASH_PREFIX, &encoded)
 }
 
