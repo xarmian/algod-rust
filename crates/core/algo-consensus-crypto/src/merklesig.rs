@@ -992,6 +992,8 @@ impl Secrets {
         }
         let local_idx = idx - self.first_key_offset;
         if local_idx >= self.ephemeral_keys.len() as u64
+            // key_lifetime != 0: `first_round_in_key_lifetime` above would have
+            // panicked on `% 0`, so is_multiple_of's zero case is unreachable.
             || !key_round.is_multiple_of(self.signer_context.key_lifetime)
             || key_round < self.signer_context.first_valid
         {

@@ -2466,13 +2466,13 @@ mod tests {
             v.p2s = seq(64, 0x50u8.wrapping_add(i as u8));
             v.s = seq(64, 0x60u8.wrapping_add(i as u8));
             v.rnd = 1000 + i as u64;
-            if i.is_multiple_of(3) {
-                v.dig = Some(seq(32, 0x70));
-            } else if i % 3 == 1 {
-                v.dig = Some(seq(32, 0x71));
-            } else {
-                v.dig = None;
-                v.encdig = Some(seq(32, 0x72));
+            match i % 3 {
+                0 => v.dig = Some(seq(32, 0x70)),
+                1 => v.dig = Some(seq(32, 0x71)),
+                _ => {
+                    v.dig = None;
+                    v.encdig = Some(seq(32, 0x72));
+                }
             }
             if i.is_multiple_of(2) {
                 v.step = Some(i as u64);

@@ -50,9 +50,10 @@ jobs:
           # Source of truth: the `rust_version` of every workspace package
           # (cargo metadata), so a crate overriding or omitting the workspace
           # value is noticed. All packages must declare one identical value.
-          # `+stable` is explicit (like the check step below) because no
-          # toolchain has been installed yet and rustup does not
-          # auto-install the one rust-toolchain.toml names.
+          # `stable` is installed explicitly (and named with `+stable`)
+          # rather than relying on whatever the runner image preinstalls;
+          # rustup does not auto-install the one rust-toolchain.toml names.
+          rustup toolchain install stable --profile minimal --no-self-update
           versions=$(cargo +stable metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | .rust_version // "MISSING"' | sort -u)
           echo "workspace package rust-version values: ${versions}"
@@ -69,10 +70,14 @@ jobs:
           fi
           echo "version=${msrv}" >> "$GITHUB_OUTPUT"
 
+      # Plain rustup instead of a third-party action: dtolnay/rust-toolchain
+      # only publishes the floating `master`/`v1` refs for arbitrary
+      # `toolchain:` inputs (there is no immutable tag), so installing with
+      # the rustup the runner already ships avoids an unpinned dependency.
       - name: Install MSRV Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ steps.msrv.outputs.version }}
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: rustup toolchain install "${MSRV}" --profile minimal --no-self-update
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
