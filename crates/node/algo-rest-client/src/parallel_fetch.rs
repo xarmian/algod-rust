@@ -18,8 +18,9 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use algo_error::AlgoError;
 use algo_types::{BlockResponse, Round};
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -29,6 +30,16 @@ use crate::BlockSource;
 
 /// Default number of concurrent block fetches, matching Go's `CatchupParallelBlocks`.
 pub const DEFAULT_CONCURRENCY: usize = 16;
+
+/// Slot holding the error of the LOWEST round whose fetch failed (after the
+/// [`BlockSource`]'s own retries), with that round. The pipeline closes its
+/// channel on a failure; this is how a caller learns *why* (issue #1719), so
+/// it can tell "the peer does not have that round" (404) from a transient or
+/// auth failure. The lowest failed round is what matters: blocks are
+/// delivered in order, so it is the round the consumer is stuck on, and a
+/// fast 404 on a later round must not mask a slow/transient failure on an
+/// earlier one.
+pub type FirstFetchError = Arc<Mutex<Option<(Round, AlgoError)>>>;
 
 /// Fetches blocks in parallel while delivering them in strict round order.
 ///
@@ -74,15 +85,33 @@ impl ParallelBlockFetcher {
         end: Round,
         cancel: CancellationToken,
     ) -> mpsc::Receiver<(Round, BlockResponse)> {
+        self.fetch_range_tracked(start, end, cancel).0
+    }
+
+    /// Like [`Self::fetch_range`], but also returns a [`FirstFetchError`]
+    /// slot that is filled with the lowest failed round's error before the
+    /// channel closes. A closed channel with an empty slot means the range
+    /// was cancelled externally (or finished). After the first failure no new
+    /// rounds are started, but fetches already in flight are drained so the
+    /// in-order prefix below the failure is still delivered and every
+    /// already-started round gets a recorded outcome.
+    pub fn fetch_range_tracked(
+        &self,
+        start: Round,
+        end: Round,
+        cancel: CancellationToken,
+    ) -> (mpsc::Receiver<(Round, BlockResponse)>, FirstFetchError) {
         let (tx, rx) = mpsc::channel(self.concurrency);
         let source = Arc::clone(&self.source);
         let concurrency = self.concurrency;
+        let first_error: FirstFetchError = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&first_error);
 
         tokio::spawn(async move {
-            Self::run_pipeline(source, concurrency, start, end, tx, cancel).await;
+            Self::run_pipeline(source, concurrency, start, end, tx, cancel, slot).await;
         });
 
-        rx
+        (rx, first_error)
     }
 
     /// Core pipeline loop. Spawns fetch tasks with bounded concurrency via a
@@ -94,6 +123,7 @@ impl ParallelBlockFetcher {
         end: Round,
         tx: mpsc::Sender<(Round, BlockResponse)>,
         cancel: CancellationToken,
+        first_error: FirstFetchError,
     ) {
         use std::collections::BTreeMap;
 
@@ -105,18 +135,20 @@ impl ParallelBlockFetcher {
 
         // Channel for individual fetch results (unbounded so tasks don't block).
         let (result_tx, mut result_rx) =
-            mpsc::unbounded_channel::<(Round, Result<BlockResponse, ()>)>();
+            mpsc::unbounded_channel::<(Round, Result<BlockResponse, AlgoError>)>();
 
         let total = end.0 - start.0;
         let mut spawned: u64 = 0;
         let mut next_to_deliver = start.0;
         let mut reorder_buf: BTreeMap<u64, BlockResponse> = BTreeMap::new();
         let mut received: u64 = 0;
+        // Set on the first failed fetch: stop starting rounds, drain the rest.
+        let mut failed = false;
 
         loop {
             // Spawn new tasks up to the semaphore limit, as long as we haven't
             // spawned everything yet and aren't cancelled.
-            while spawned < total && !cancel.is_cancelled() {
+            while spawned < total && !failed && !cancel.is_cancelled() {
                 // Try to acquire the semaphore without blocking.
                 let permit = match semaphore.clone().try_acquire_owned() {
                     Ok(p) => p,
@@ -139,8 +171,8 @@ impl ParallelBlockFetcher {
                             let _ = rtx.send((round, Ok(block)));
                         }
                         Err(e) => {
-                            warn!(round = %round, error = %e, "block fetch failed, cancelling pipeline");
-                            let _ = rtx.send((round, Err(())));
+                            warn!(round = %round, error = %e, "block fetch failed, draining pipeline");
+                            let _ = rtx.send((round, Err(e)));
                         }
                     }
                 });
@@ -168,10 +200,15 @@ impl ParallelBlockFetcher {
             received += 1;
 
             match result {
-                Err(()) => {
-                    // A fetch failed. Cancel everything.
-                    cancel.cancel();
-                    return;
+                Err(e) => {
+                    // Record why before the channel closes; the lowest
+                    // failed round wins.
+                    if let Ok(mut slot) = first_error.lock() {
+                        if slot.as_ref().is_none_or(|(r, _)| round.0 < r.0) {
+                            *slot = Some((round, e));
+                        }
+                    }
+                    failed = true;
                 }
                 Ok(block) => {
                     reorder_buf.insert(round.0, block);
@@ -190,8 +227,15 @@ impl ParallelBlockFetcher {
                 next_to_deliver += 1;
             }
 
-            // All done?
+            // All done? (After a failure: once every started round reported.)
             if received == total {
+                return;
+            }
+            if failed && received == spawned {
+                // Everything started has reported; the prefix below the
+                // lowest failure is delivered. Cancel like a failure always
+                // has, so a shared token observes it.
+                cancel.cancel();
                 return;
             }
         }
@@ -207,6 +251,90 @@ mod tests {
     use std::time::Duration;
 
     use crate::NodeStatus;
+
+    /// Per-round scripted source: `(delay_ms, error)` per round.
+    struct Scripted(fn(u64) -> (u64, Option<AlgoError>));
+
+    #[async_trait]
+    impl BlockSource for Scripted {
+        async fn get_block_raw(&self, _round: Round) -> Result<Vec<u8>> {
+            unimplemented!()
+        }
+        async fn get_block(&self, round: Round) -> Result<BlockResponse> {
+            let (delay, err) = (self.0)(round.0);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            match err {
+                Some(e) => Err(e),
+                None => Ok(MockBlockSource::make_block(round.0)),
+            }
+        }
+        async fn get_status(&self) -> Result<NodeStatus> {
+            unimplemented!()
+        }
+        async fn wait_for_round(&self, _round: Round) -> Result<NodeStatus> {
+            unimplemented!()
+        }
+    }
+
+    async fn run_scripted(
+        script: fn(u64) -> (u64, Option<AlgoError>),
+    ) -> (Vec<u64>, Option<(u64, AlgoError)>) {
+        let fetcher = ParallelBlockFetcher::new(Arc::new(Scripted(script)), 8);
+        let (mut rx, slot) =
+            fetcher.fetch_range_tracked(Round(1), Round(9), CancellationToken::new());
+        let mut got = Vec::new();
+        while let Some((r, _)) = rx.recv().await {
+            got.push(r.0);
+        }
+        let err = slot.lock().unwrap().take().map(|(r, e)| (r.0, e));
+        (got, err)
+    }
+
+    /// A fast failure on a later round must not mask the lowest failed round:
+    /// round 1 is slow and fails transiently, round 2 fails fast with a 404.
+    #[tokio::test]
+    async fn tracked_fetch_records_the_lowest_failed_round_not_the_first_to_arrive() {
+        let (got, err) = run_scripted(|r| match r {
+            1 => (
+                80,
+                Some(AlgoError::Network {
+                    message: "reset".into(),
+                }),
+            ),
+            2 => (0, Some(AlgoError::NotFound("404".into()))),
+            _ => (0, None),
+        })
+        .await;
+        assert!(got.is_empty());
+        let (round, e) = err.expect("an error must be recorded");
+        assert_eq!(round, 1);
+        assert!(matches!(e, AlgoError::Network { .. }), "{e:?}");
+    }
+
+    /// The other ordering: round 1 is merely slow but succeeds, round 2 is a
+    /// 404. The prefix `[1]` is delivered and the 404 is recorded for round 2.
+    #[tokio::test]
+    async fn tracked_fetch_delivers_the_prefix_then_records_the_404() {
+        let (got, err) = run_scripted(|r| match r {
+            1 => (60, None),
+            2 => (0, Some(AlgoError::NotFound("404".into()))),
+            3.. => (0, Some(AlgoError::NotFound("404".into()))),
+            _ => (0, None),
+        })
+        .await;
+        assert_eq!(got, vec![1]);
+        let (round, e) = err.expect("an error must be recorded");
+        assert_eq!(round, 2);
+        assert!(matches!(e, AlgoError::NotFound(_)), "{e:?}");
+    }
+
+    /// A clean fetch leaves the slot empty.
+    #[tokio::test]
+    async fn tracked_fetch_leaves_the_slot_empty_on_success() {
+        let (got, err) = run_scripted(|_| (0, None)).await;
+        assert_eq!(got.len(), 8);
+        assert!(err.is_none());
+    }
 
     /// A mock block source that returns blocks after a variable delay.
     /// If `fail_round` is set, fetching that round returns an error.
