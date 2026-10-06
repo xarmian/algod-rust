@@ -107,12 +107,18 @@ impl ApplyStallTracker {
 
     /// Record that `round` failed to apply with `error`.
     pub fn record_failure(&self, round: u64, error: &str) -> StallTransition {
+        self.record_failure_at(round, error, Instant::now())
+    }
+
+    /// [`Self::record_failure`] with an explicit failure time, so the backoff
+    /// can be tested without wall-clock sleeps.
+    pub fn record_failure_at(&self, round: u64, error: &str, now: Instant) -> StallTransition {
         self.failures_total.fetch_add(1, Ordering::Relaxed);
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_mut() {
             Some(s) if s.round == round && s.error == error => {
                 s.consecutive += 1;
-                s.last_failure = Instant::now();
+                s.last_failure = now;
                 if s.stalled {
                     StallTransition::StillStalled
                 } else if s.consecutive >= STALL_THRESHOLD {
@@ -133,7 +139,7 @@ impl ApplyStallTracker {
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0),
-                    last_failure: Instant::now(),
+                    last_failure: now,
                     stalled: false,
                 });
                 StallTransition::NewFailure
@@ -179,9 +185,15 @@ impl ApplyStallTracker {
     /// While stalled, how long the catchup service must still wait before
     /// retrying the failing block; `None` when not stalled or the wait is over.
     pub fn retry_in(&self) -> Option<Duration> {
+        self.retry_in_at(Instant::now())
+    }
+
+    /// [`Self::retry_in`] evaluated at an explicit time.
+    pub fn retry_in_at(&self, now: Instant) -> Option<Duration> {
         let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let s = guard.as_ref().filter(|s| s.stalled)?;
-        let wait = Self::backoff_for(s.consecutive).checked_sub(s.last_failure.elapsed())?;
+        let wait = Self::backoff_for(s.consecutive)
+            .checked_sub(now.saturating_duration_since(s.last_failure))?;
         (!wait.is_zero()).then_some(wait)
     }
 
@@ -288,10 +300,20 @@ mod tests {
     #[test]
     fn retry_in_reflects_backoff_while_stalled() {
         let t = ApplyStallTracker::new();
-        t.record_failure(10, "boom");
-        t.record_failure(10, "boom");
-        let w = t.retry_in().expect("must wait");
-        assert!(w <= Duration::from_secs(8) && w > Duration::from_secs(6));
+        let t0 = Instant::now();
+        t.record_failure_at(10, "boom", t0);
+        t.record_failure_at(10, "boom", t0);
+        assert_eq!(
+            t.retry_in_at(t0 + Duration::from_secs(3)),
+            Some(Duration::from_secs(5))
+        );
+        // Backoff elapsed: the retry is due.
+        assert_eq!(t.retry_in_at(t0 + Duration::from_secs(8)), None);
+        // Third identical failure doubles the wait, measured from it.
+        let t1 = t0 + Duration::from_secs(8);
+        t.record_failure_at(10, "boom", t1);
+        assert_eq!(t.retry_in_at(t1), Some(Duration::from_secs(16)));
+        assert_eq!(t.retry_in_at(t1 + Duration::from_secs(16)), None);
     }
 
     #[test]

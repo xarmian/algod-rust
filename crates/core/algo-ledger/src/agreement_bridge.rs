@@ -819,13 +819,13 @@ impl LedgerWriter for AgreementLedgerBridge {
                     StallTransition::Entered => {
                         error!(
                             round = %block.round,
-                            "ensure_block: stalled on invalid block {}: the same permanent                              error twice in a row; retries now back off exponentially (cap                              {}s): {err}",
+                            "ensure_block: stalled on invalid block {}: the same permanent error twice in a row; retries now back off exponentially (cap {}s): {err}",
                             block.round,
                             STALL_BACKOFF_MAX.as_secs()
                         );
                     }
                     _ => debug!(
-                        "ensure_block: permanent error writing block {} to ledger                          (repeat): {err}",
+                        "ensure_block: permanent error writing block {} to ledger (repeat): {err}",
                         block.round
                     ),
                 }

@@ -331,7 +331,41 @@ pub enum SyncExitReason {
     Unsupported,
 }
 
+/// What one periodic-sync timeout tick should do (see
+/// [`CatchupService::periodic_tick_action`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeriodicTick {
+    /// The ledger advanced since the last tick: reset the stuck counter.
+    Advanced,
+    /// First tick without progress: re-arm for one more interval.
+    Rearm,
+    /// Stuck, but the ledger is stalled on an invalid block and its
+    /// exponential backoff has not elapsed (issue #1677): do nothing.
+    BackOff,
+    /// Stuck: run a sync pass.
+    Sync,
+}
+
 impl CatchupService {
+    /// Pure decision for a periodic-sync timeout tick, kept separate from
+    /// the loop so the issue #1677 backoff gate is testable without sleeping.
+    fn periodic_tick_action(
+        next_round: Round,
+        last_round: Round,
+        stuck_once: bool,
+        stall_wait: Option<Duration>,
+    ) -> PeriodicTick {
+        if next_round != last_round {
+            PeriodicTick::Advanced
+        } else if !stuck_once {
+            PeriodicTick::Rearm
+        } else if stall_wait.is_some() {
+            PeriodicTick::BackOff
+        } else {
+            PeriodicTick::Sync
+        }
+    }
+
     /// Create and start a new `CatchupService`.
     ///
     /// # Parameters
@@ -560,37 +594,40 @@ impl CatchupService {
                     // `Self::cert_loop`, on its own thread) never fires in
                     // that situation (issue #478).
                     let now = ledger.next_round();
-                    if now != last_round {
-                        // Agreement is making progress on its own. Reset
-                        // the stall counter too — go's `WaitMem(currBlock+1)`
-                        // branch resets `stuckInARow` the same way on every
-                        // genuine advance.
-                        last_round = now;
-                        stuck_once = false;
-                        continue;
-                    }
-                    if !stuck_once {
-                        // First tick with no progress since the last check:
-                        // give the local agreement service one more full
-                        // interval before assuming it has actually stalled
-                        // (see `stuck_once`'s definition above for why this
-                        // hysteresis is required — issue #1564).
-                        stuck_once = true;
-                        continue;
-                    }
-                    // Issue #1677: the ledger is stalled on a block that
-                    // deterministically fails to apply. Re-fetching and
-                    // re-applying it every ~8 s only floods the log, so wait
-                    // out the exponential backoff (the tick keeps firing;
-                    // `stuck_once` stays set so the pass runs the first tick
-                    // after the backoff elapses). An explicit `sync_now` is
+                    // Issue #1677: while the ledger is stalled on a block
+                    // that deterministically fails to apply, wait out the
+                    // exponential backoff instead of re-fetching and
+                    // re-applying it every ~8 s. An explicit `sync_now` is
                     // never gated.
-                    if let Some(wait) = ledger.apply_stall_retry_in() {
-                        trace!(
-                            retry_in_ms = wait.as_millis() as u64,
-                            "catchup service: stalled on an invalid block, backing off"
-                        );
-                        continue;
+                    let stall_wait = ledger.apply_stall_retry_in();
+                    match Self::periodic_tick_action(now, last_round, stuck_once, stall_wait) {
+                        PeriodicTick::Advanced => {
+                            // Agreement is making progress on its own. Reset
+                            // the stall counter too — go's
+                            // `WaitMem(currBlock+1)` branch resets
+                            // `stuckInARow` the same way on every genuine
+                            // advance.
+                            last_round = now;
+                            stuck_once = false;
+                            continue;
+                        }
+                        PeriodicTick::Rearm => {
+                            // First tick with no progress since the last
+                            // check: give the local agreement service one
+                            // more full interval before assuming it has
+                            // actually stalled (see `stuck_once`'s
+                            // definition above — issue #1564).
+                            stuck_once = true;
+                            continue;
+                        }
+                        PeriodicTick::BackOff => {
+                            trace!(
+                                retry_in_ms = stall_wait.map_or(0, |w| w.as_millis() as u64),
+                                "catchup service: stalled on an invalid block, backing off"
+                            );
+                            continue;
+                        }
+                        PeriodicTick::Sync => {}
                     }
                     Self::sync_pass(
                         &ledger,
@@ -1811,59 +1848,54 @@ mod tests {
         assert_eq!(ledger.tracker.failures_total(), 4);
     }
 
-    /// Issue #1677: while the stalled backoff is pending, the periodic loop
-    /// does not re-run the fetch+apply pass at its 8 s cadence. The
-    /// non-stalled control (below) proves the same wait does re-run it.
+    /// Issue #1677: the periodic loop must not re-run the fetch+apply pass
+    /// while the stall backoff is pending, but still runs it normally
+    /// otherwise (transient behaviour unchanged) and never gates progress.
     #[test]
-    fn periodic_loop_waits_out_the_stall_backoff() {
-        let ledger = FailingApplyLedger::new(true);
-        // Two identical failures put it in the stalled state; the backoff
-        // (>= 8 s since the last failure) now covers the whole test window
-        // only if the loop honours it, so push the failure time forward by
-        // recording a long streak (cap 300 s).
-        for _ in 0..10 {
-            ledger
-                .tracker
-                .record_failure(1, "tx 0xabc: balance below minimum");
-        }
-        assert!(ledger.tracker.stall().is_some());
-        let (_tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
-        let fetcher = bounded_fetcher();
-        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
-        let fetcher_dyn: Arc<dyn BlockFetcher> = fetcher.clone();
-        let mut svc = CatchupService::start(rx, ledger_dyn, fetcher_dyn);
-        poll_until(
-            || ledger.attempts.load(Ordering::SeqCst) >= 1,
-            Duration::from_millis(20),
-            Duration::from_secs(5),
-            "the startup pass runs immediately",
-        );
-        let after_startup = ledger.attempts.load(Ordering::SeqCst);
-        thread::sleep(Duration::from_millis(9_500));
+    fn periodic_tick_honours_the_stall_backoff() {
+        let wait = Some(Duration::from_secs(5));
+        let (r, same) = (Round(3), Round(3));
+        // Stuck + stalled + backoff pending: no pass.
         assert_eq!(
-            ledger.attempts.load(Ordering::SeqCst),
-            after_startup,
-            "no retry while the stall backoff is pending"
+            CatchupService::periodic_tick_action(r, same, true, wait),
+            PeriodicTick::BackOff
         );
-        svc.stop();
+        // Backoff elapsed (or never stalled): the pass runs, as before.
+        assert_eq!(
+            CatchupService::periodic_tick_action(r, same, true, None),
+            PeriodicTick::Sync
+        );
+        // The first idle tick only re-arms, stalled or not.
+        assert_eq!(
+            CatchupService::periodic_tick_action(r, same, false, wait),
+            PeriodicTick::Rearm
+        );
+        // Ledger progress (e.g. agreement committed a different block) is
+        // never held back by a stale stall.
+        assert_eq!(
+            CatchupService::periodic_tick_action(Round(4), same, true, wait),
+            PeriodicTick::Advanced
+        );
     }
 
-    /// Control for [`periodic_loop_waits_out_the_stall_backoff`]: without a
-    /// stall the loop retries after two idle ticks (~8 s).
+    /// Issue #1677: the bridge-facing stall wait feeds the tick decision.
     #[test]
-    fn periodic_loop_retries_at_normal_cadence_without_a_stall() {
-        let ledger = FailingApplyLedger::new(false);
-        let (_tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
-        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
-        let fetcher_dyn: Arc<dyn BlockFetcher> = bounded_fetcher();
-        let mut svc = CatchupService::start(rx, ledger_dyn, fetcher_dyn);
-        poll_until(
-            || ledger.attempts.load(Ordering::SeqCst) >= 2,
-            Duration::from_millis(100),
-            Duration::from_secs(15),
-            "an unstalled loop retries the failing block after ~8 s",
+    fn stalled_ledger_wait_gates_the_tick() {
+        let ledger = FailingApplyLedger::new(true);
+        let t0 = std::time::Instant::now();
+        let err = "tx 0xabc: balance below minimum";
+        ledger.tracker.record_failure_at(1, err, t0);
+        ledger.tracker.record_failure_at(1, err, t0);
+        let wait = ledger.tracker.retry_in_at(t0 + Duration::from_secs(1));
+        assert_eq!(
+            CatchupService::periodic_tick_action(Round(1), Round(1), true, wait),
+            PeriodicTick::BackOff
         );
-        svc.stop();
+        let wait = ledger.tracker.retry_in_at(t0 + Duration::from_secs(9));
+        assert_eq!(
+            CatchupService::periodic_tick_action(Round(1), Round(1), true, wait),
+            PeriodicTick::Sync
+        );
     }
 
     /// Regression test for issue #478.
