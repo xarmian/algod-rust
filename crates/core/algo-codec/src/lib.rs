@@ -22,26 +22,26 @@ mod canonical;
 mod digest;
 
 pub use canonical::{
-    build_txtail_from_block, canonical_encode_account_application_model,
-    canonical_encode_account_asset_model, canonical_encode_account_data,
-    canonical_encode_app_local_state, canonical_encode_app_params, canonical_encode_asset_holding,
-    canonical_encode_base_account_data, canonical_encode_base_online_account_data,
-    canonical_encode_block, canonical_encode_block_header,
-    canonical_encode_block_header_from_block, canonical_encode_block_header_response,
-    canonical_encode_ledgercore_account_data, canonical_encode_logicsig, canonical_encode_multisig,
-    canonical_encode_multisig_subsig, canonical_encode_online_round_params_data,
-    canonical_encode_resources_data, canonical_encode_signed_transaction,
-    canonical_encode_signed_txn_in_block, canonical_encode_state_proof_message,
-    canonical_encode_state_proof_verification_context, canonical_encode_state_schema,
-    canonical_encode_teal_key_value, canonical_encode_transaction, canonical_encode_tx_group,
-    canonical_encode_txtail_round, canonical_encode_txtail_round_lease,
+    build_txtail_from_block, build_txtail_from_block_with_rule,
+    canonical_encode_account_application_model, canonical_encode_account_asset_model,
+    canonical_encode_account_data, canonical_encode_app_local_state, canonical_encode_app_params,
+    canonical_encode_asset_holding, canonical_encode_base_account_data,
+    canonical_encode_base_online_account_data, canonical_encode_block,
+    canonical_encode_block_header, canonical_encode_block_header_from_block,
+    canonical_encode_block_header_response, canonical_encode_ledgercore_account_data,
+    canonical_encode_logicsig, canonical_encode_multisig, canonical_encode_multisig_subsig,
+    canonical_encode_online_round_params_data, canonical_encode_resources_data,
+    canonical_encode_signed_transaction, canonical_encode_signed_txn_in_block,
+    canonical_encode_state_proof_message, canonical_encode_state_proof_verification_context,
+    canonical_encode_state_schema, canonical_encode_teal_key_value, canonical_encode_transaction,
+    canonical_encode_tx_group, canonical_encode_txtail_round, canonical_encode_txtail_round_lease,
     canonical_encode_unauthenticated_proposal, decode_state_proof_verification_context,
     resource_flags, BaseOnlineAccountData, OnlineRoundParamsData, ResourcesData,
     StateProofVerificationContext,
 };
 pub use digest::{
     compute_block_digest, compute_block_header_digest, compute_block_header_digest_512,
-    compute_group_id, compute_group_id_from_hashes, compute_txn_id,
+    compute_group_id, compute_group_id_from_hashes, compute_txn_id, compute_txn_id_with_genesis,
 };
 
 use algo_error::{AlgoError, Result};

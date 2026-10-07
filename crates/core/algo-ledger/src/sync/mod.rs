@@ -3251,6 +3251,82 @@ impl SyncBackend for NoopBackend {
 mod tests {
     use super::*;
 
+    /// Issue #1707: the catchpoint lookback path decodes `blkdata` as stored
+    /// (`decode_block`) before building the entry; the decoded `hgi`/`hgh`
+    /// flags must drive the restore, giving the full txid.
+    #[test]
+    fn lookback_blkdata_roundtrip_records_full_txid() {
+        for (proto, hgh) in [
+            (algo_types::consensus::CONSENSUS_V41, false),
+            (algo_types::consensus::CONSENSUS_V15, true),
+            (algo_types::consensus::CONSENSUS_V15, false),
+        ] {
+            let mut stx = algo_types::SignedTransaction::default();
+            stx.txn.txn_type = "pay".into();
+            stx.txn.sender = algo_types::Address([1u8; 32]);
+            stx.txn.fee = 1000;
+            stx.txn.last_valid = algo_types::Round(9);
+            stx.has_genesis_id = true;
+            stx.has_genesis_hash = hgh;
+            let block = Block {
+                round: algo_types::Round(3),
+                genesis_id: "gid".into(),
+                genesis_hash: [5u8; 32],
+                current_protocol: proto.into(),
+                payset: vec![stx.clone()],
+                ..Block::default()
+            };
+            let blkdata = algo_codec::canonical_encode_block(&block);
+            let decoded = algo_codec::decode_block(&blkdata).unwrap();
+            let mut full = stx.txn.clone();
+            full.genesis_id = "gid".into();
+            if hgh || proto == algo_types::consensus::CONSENSUS_V41 {
+                full.genesis_hash = [5u8; 32];
+            }
+            let tail: algo_types::TxTailRound =
+                rmp_serde::from_slice(&build_txtail_entry(&decoded).unwrap()).unwrap();
+            assert_eq!(
+                tail.txn_ids[0].as_ref(),
+                algo_codec::compute_txn_id(&full).0.as_slice(),
+                "{proto} hgh={hgh}"
+            );
+        }
+    }
+
+    /// Issue #1707: the sync (catchpoint lookback) txtail entry must carry
+    /// the txid of the FULL (genesis-restored) transaction, like go's
+    /// `TxTailRoundFromBlock`, not the stripped stored form.
+    #[test]
+    fn build_txtail_entry_records_restored_txid() {
+        let mut stx = algo_types::SignedTransaction::default();
+        stx.txn.txn_type = "pay".into();
+        stx.txn.fee = 1000;
+        stx.txn.last_valid = algo_types::Round(9);
+        stx.has_genesis_id = true;
+        let block = Block {
+            round: algo_types::Round(3),
+            genesis_id: "gid".into(),
+            genesis_hash: [5u8; 32],
+            current_protocol: algo_types::consensus::CONSENSUS_V41.into(),
+            payset: vec![stx.clone()],
+            ..Block::default()
+        };
+        let mut full = stx.txn.clone();
+        full.genesis_id = "gid".into();
+        full.genesis_hash = [5u8; 32];
+        let bytes = build_txtail_entry(&block).unwrap();
+        let tail: algo_types::TxTailRound = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(tail.txn_ids.len(), 1);
+        assert_eq!(
+            tail.txn_ids[0].as_ref(),
+            algo_codec::compute_txn_id(&full).0.as_slice()
+        );
+        assert_ne!(
+            tail.txn_ids[0].as_ref(),
+            algo_codec::compute_txn_id(&stx.txn).0.as_slice()
+        );
+    }
+
     /// Build a minimal [`SyncConfig`] pointed at a fresh temp-dir ledger
     /// prefix, for exercising [`SyncOrchestrator::open_db`] directly.
     fn test_config(db_path: PathBuf, accounts_rebuild_synchronous_mode: i64) -> SyncConfig {

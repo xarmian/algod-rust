@@ -31,6 +31,7 @@
 
 use std::collections::BTreeMap;
 
+use algo_types::genesis_restore::GenesisRestoreRule;
 use algo_types::{
     AccountData, Address, AppLocalState, AppParams, AssetHolding, AssetParams, Block, BlockHeader,
     BoxRef, Digest, FalconVerifier, HashFactory, HeartbeatProof, HeartbeatTxnFields, HoldingRef,
@@ -393,6 +394,18 @@ fn is_rmpv_empty(v: &rmpv::Value) -> bool {
 /// for payment transactions. The encoding uses sorted keys, omitempty,
 /// and compact integer representation.
 pub fn canonical_encode_transaction(tx: &Transaction) -> Vec<u8> {
+    canonical_encode_transaction_with_genesis(tx, &tx.genesis_id, &tx.genesis_hash)
+}
+
+/// [`canonical_encode_transaction`] with the `gen` / `gh` fields taken from
+/// the given values instead of `tx`'s own. Lets callers hash a stripped
+/// transaction as if its genesis fields were restored WITHOUT cloning it
+/// (issue #1707).
+pub fn canonical_encode_transaction_with_genesis(
+    tx: &Transaction,
+    genesis_id: &str,
+    genesis_hash: &[u8; 32],
+) -> Vec<u8> {
     let mut m = CanonicalMap::new();
 
     // All fields go into the SAME map so they sort correctly in a single
@@ -469,8 +482,8 @@ pub fn canonical_encode_transaction(tx: &Transaction) -> Vec<u8> {
     // Header fields
     m.add_u64("fee", tx.fee);
     m.add_u64("fv", tx.first_valid.0);
-    m.add_string("gen", &tx.genesis_id);
-    m.add_bytes("gh", &tx.genesis_hash);
+    m.add_string("gen", genesis_id);
+    m.add_bytes("gh", genesis_hash);
     m.add_bytes("grp", &tx.group);
     if let Some(ref hb) = tx.heartbeat {
         m.add_map("hb", canonical_encode_heartbeat(hb));
@@ -1779,8 +1792,16 @@ pub fn canonical_encode_txtail_round(tail: &TxTailRound) -> Vec<u8> {
 /// Iterates the block's payset to collect transaction IDs, last-valid rounds,
 /// and lease entries. The block header is copied into the result.
 pub fn build_txtail_from_block(block: &Block) -> TxTailRound {
-    use crate::compute_txn_id;
+    build_txtail_from_block_with_rule(block, &GenesisRestoreRule::for_block(block))
+}
 
+/// [`build_txtail_from_block`] with the genesis-restore rule resolved by the
+/// caller (one protocol lookup per block at the apply boundary). `block`
+/// may be stripped or already restored.
+pub fn build_txtail_from_block_with_rule(
+    block: &Block,
+    rule: &GenesisRestoreRule<'_>,
+) -> TxTailRound {
     let hdr = BlockHeader {
         round: block.round,
         branch: block.branch,
@@ -1822,8 +1843,16 @@ pub fn build_txtail_from_block(block: &Block) -> TxTailRound {
     let mut last_valid = Vec::with_capacity(block.payset.len());
     let mut leases = Vec::new();
 
+    // go's `TxTailRoundFromBlock` iterates the payset decoded through
+    // `BlockHeader.DecodeSignedTxn`, i.e. with the stripped genesis id/hash
+    // restored (issue #1707). The txid is hashed over the BORROWED stripped
+    // transaction with the restored `gen`/`gh` supplied as encoding overrides,
+    // so no `Transaction` (possibly a large appl) is ever cloned. `last_valid`
+    // and `lease` are not stripped fields and are read straight from `stx`.
+    // Idempotent: an already-restored txn keeps its own genesis fields.
     for (idx, stx) in block.payset.iter().enumerate() {
-        let txid = compute_txn_id(&stx.txn);
+        let (gen, gh) = rule.restored_genesis(stx);
+        let txid = crate::compute_txn_id_with_genesis(&stx.txn, gen, gh);
         txn_ids.push(ByteBuf::from(txid.0.to_vec()));
         last_valid.push(stx.txn.last_valid.0);
 
@@ -2758,6 +2787,33 @@ mod tests {
             load: 0,
             congestion_tax: 0,
             payset,
+        }
+    }
+
+    #[test]
+    fn compute_txn_id_with_genesis_matches_clone_based_id() {
+        for (gen, gh) in [
+            ("", [0u8; 32]),
+            ("gid", [0u8; 32]),
+            ("", [3u8; 32]),
+            ("gid", [3u8; 32]),
+        ] {
+            for txn_type in ["pay", "appl", "axfer"] {
+                let base = Transaction {
+                    txn_type: txn_type.into(),
+                    fee: 1000,
+                    amount: 5,
+                    approval_program: Some(vec![1, 2, 3].into()),
+                    ..Default::default()
+                };
+                let mut cloned = base.clone();
+                cloned.genesis_id = gen.into();
+                cloned.genesis_hash = gh;
+                assert_eq!(
+                    crate::compute_txn_id_with_genesis(&base, gen, &gh),
+                    crate::compute_txn_id(&cloned)
+                );
+            }
         }
     }
 

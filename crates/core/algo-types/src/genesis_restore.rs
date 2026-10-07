@@ -121,6 +121,27 @@ impl<'a> GenesisRestoreRule<'a> {
         }
     }
 
+    /// The genesis id / hash `stx`'s transaction has once restored,
+    /// borrowed (from `stx` or from the rule): hashing the stripped txn
+    /// with these as overrides yields the TxID of the restored txn with no
+    /// clone and no allocation.
+    #[inline]
+    pub fn restored_genesis<'s>(&'s self, stx: &'s SignedTransaction) -> (&'s str, &'s [u8; 32]) {
+        let (id, hash) = decide(stx, self.require_genesis_hash);
+        (
+            if id {
+                self.genesis_id
+            } else {
+                &stx.txn.genesis_id
+            },
+            if hash {
+                self.genesis_hash
+            } else {
+                &stx.txn.genesis_hash
+            },
+        )
+    }
+
     /// The restored inner [`Transaction`] (what TxID, group id and the
     /// payset merkle leaf are computed over). Borrowed (no clone) when
     /// nothing needs restoring.

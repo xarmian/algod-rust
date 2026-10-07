@@ -1412,3 +1412,24 @@ are unaffected.
   `algod_rust_sync_stalled_on_invalid_block`,
   `algod_rust_sync_stalled_block_round`,
   `algod_rust_ledger_apply_failures_total`.
+
+## Upgrading across the txtail restored-txid fix (issue #1707)
+
+Txtail rows (`txtail` table, serialized `TxTailRound`) now record the txids
+of the genesis-field-restored transactions, as go's `TxTailRoundFromBlock`
+does. Older builds wrote stripped-form ids for blocks applied in
+`ApplyMode::Replay` and for the catchpoint lookback path. On the first open
+after the upgrade, `SqliteLedger::init` runs a one-shot repair
+(`repair_txtail_restored_txids`, guarded by the `catchpointstate` marker
+`algod_rust_txtail_restored_txid_v1`) that rebuilds the existing txtail rows
+of the last `LOOKBACK_ROUNDS` (1000) rounds from the stored blocks, so
+duplicate-txid detection is correct immediately. It costs at most ~1000 block
+decodes once, runs in one transaction with the marker, and leaves older rows
+(outside the dup-check window) alone. No operator action is needed.
+
+The repair covers the dup cache's inclusive window (`max - 1000 ..= max`) and
+processes one block at a time. If a stored block in the window cannot be
+decoded it is logged (`warn!`) and its row left as is; the marker is then NOT
+written, so the repair retries on the next open. Downgrade-then-upgrade is an
+unsupported flow: rows written by the older build after the marker was set are
+not repaired again.
