@@ -4867,6 +4867,36 @@ mod handlers_pure_fn_tests {
         }
     }
 
+    /// Issue #1705 review: go writes `gd` keys / `bs` / `lg` as msgpack str,
+    /// whatever the bytes. Decode a delta carrying non-UTF-8 str values (as
+    /// read from a go block) and check REST reads the raw bytes back.
+    #[test]
+    fn rest_reads_non_utf8_str_keys_bs_and_logs_as_raw_bytes() {
+        // {"gd": {str[ff]: {"at":1, "bs": str[fe]}}, "lg": [str[fe]]}
+        let wire: Vec<u8> = vec![
+            0x82, 0xa2, b'g', b'd', 0x81, 0xa1, 0xff, 0x82, 0xa2, b'a', b't', 0x01, 0xa2, b'b',
+            b's', 0xa1, 0xfe, 0xa2, b'l', b'g', 0x91, 0xa1, 0xfe,
+        ];
+        let v = rmpv::decode::read_value(&mut &wire[..]).unwrap();
+        let rmpv::Value::Map(top) = &v else {
+            panic!("map")
+        };
+        let gd = &top
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("gd"))
+            .unwrap()
+            .1;
+        let delta = parse_state_delta(gd);
+        assert_eq!(delta.len(), 1);
+        assert_eq!(delta[0].key, BASE64_STANDARD.encode([0xffu8]));
+        assert_eq!(delta[0].value.action, 1);
+        assert_eq!(
+            delta[0].value.bytes.as_deref(),
+            Some(BASE64_STANDARD.encode([0xfeu8]).as_str())
+        );
+        assert_eq!(convert_logs(&v), Some(vec![vec![0xfeu8]]));
+    }
+
     /// Port of go's `TestApplicationBoxesMaxKeys`
     /// (`daemon/algod/api/server/v2/handlers_test.go#L33`): direct unit
     /// coverage of the pure `applicationBoxesMaxKeys` function, matching

@@ -207,6 +207,9 @@ pub fn encode_eval_delta(
     // the bytes may be non-UTF-8: build the str via the wire so rmpv keeps
     // the raw bytes (`Utf8String`'s invalid-UTF-8 variant).
     fn raw_str(b: &[u8]) -> Value {
+        if let Ok(s) = std::str::from_utf8(b) {
+            return Value::from(s);
+        }
         let mut buf = Vec::with_capacity(b.len() + 5);
         rmp::encode::write_str_len(&mut buf, b.len() as u32).expect("vec write");
         buf.extend_from_slice(b);
@@ -314,7 +317,16 @@ pub fn encode_eval_delta(
             .iter()
             .filter_map(|stx| {
                 let bytes = rmp_serde::to_vec_named(stx).ok()?;
-                rmpv::decode::read_value(&mut &bytes[..]).ok()
+                let mut item = rmpv::decode::read_value(&mut &bytes[..]).ok()?;
+                // serde writes a non-UTF-8 `Utf8String` as bin, so the
+                // inner `dt` that round-tripped through it lost go's str
+                // typing. Re-attach the original (str-preserving) value.
+                if let (Value::Map(fields), Some(dt)) = (&mut item, &stx.eval_delta) {
+                    if let Some(slot) = fields.iter_mut().find(|(k, _)| k.as_str() == Some("dt")) {
+                        slot.1 = dt.clone();
+                    }
+                }
+                Some(item)
             })
             .collect();
         if !itx.is_empty() {
@@ -1476,27 +1488,28 @@ mod tests {
     // `[]Address` (bin32), `ld` keys are sorted uint64.
 
     /// The `dt` bytes exactly as the block encoder writes them: place the
-    /// value in a `SignedTransaction` and run the canonical STIB encoder
-    /// (`add_option_rmpv("dt")`), then cut the `dt` value out of the map.
+    /// value in a `SignedTransaction`, run the canonical STIB encoder
+    /// (`add_option_rmpv("dt")`), decode that map structurally with rmpv and
+    /// re-encode only its `dt` value through the str-preserving writer (no
+    /// byte-pattern scanning, so key/log bytes cannot mis-slice).
     fn wire(v: &Value) -> Vec<u8> {
         let stx = SignedTransaction {
             eval_delta: Some(v.clone()),
             ..SignedTransaction::default()
         };
         let bytes = algo_codec::canonical_encode_signed_txn_in_block(&stx);
-        let key = [0xa2, b'd', b't'];
-        let start = bytes
-            .windows(3)
-            .position(|w| w == key)
-            .expect("dt key present")
-            + 3;
-        let txn_key = [0xa3, b't', b'x', b'n'];
-        let end = bytes
-            .windows(4)
-            .rposition(|w| w == txn_key)
-            .filter(|e| *e > start)
-            .unwrap_or(bytes.len());
-        bytes[start..end].to_vec()
+        let Value::Map(top) = rmpv::decode::read_value(&mut &bytes[..]).unwrap() else {
+            panic!("stib map")
+        };
+        let dt = top
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("dt"))
+            .expect("dt present")
+            .1
+            .clone();
+        let mut out = Vec::new();
+        algo_codec::write_value_str_preserving(&mut out, &dt).unwrap();
+        out
     }
 
     fn gd_only(entries: Vec<(&[u8], Option<TealValue>)>) -> Vec<u8> {
@@ -1579,8 +1592,7 @@ mod tests {
             0xa2, b'z', b'z', 0x81, 0xa2, b'a', b't', 0x02, //
             0xa1, 0xff, 0x82, 0xa2, b'a', b't', 0x02, 0xa2, b'u', b'i', 0x01,
         ];
-        // 0xff sorts after every ASCII key (go `SortString` is bytewise), so
-        // it comes last; reorder `want` accordingly (already last above).
+        // 0xff sorts after every ASCII key (go `SortString` is bytewise).
         assert_eq!(got, want);
     }
 
@@ -1670,5 +1682,36 @@ mod tests {
         let vd = &gd[&vec![0xffu8, 0x00]];
         assert_eq!(vd.bytes, vec![0xfe, 0x80]);
         assert_eq!(wire(&v), bytes, "re-encoding the decoded value is stable");
+    }
+
+    /// Issue #1705 review: a nested `itx` entry's own `dt` must keep str
+    /// typing for non-UTF-8 keys/logs at every depth (rmp_serde + read_value
+    /// of the inner stx turned them into bin).
+    #[test]
+    fn inner_txn_dt_keeps_str_for_non_utf8_at_depth() {
+        let mut child = algo_avm::eval::AvmResult::empty();
+        child
+            .global_delta
+            .insert(vec![0xff], Some(TealValue::Bytes(vec![0x80])));
+        child.logs = vec![vec![0xfe]];
+        let child_dt = encode_eval_delta(&child, &Transaction::default(), true);
+        let inner = SignedTransaction {
+            eval_delta: child_dt,
+            ..SignedTransaction::default()
+        };
+        let mut parent = algo_avm::eval::AvmResult::empty();
+        parent.inner_transactions = vec![inner];
+        let dt = encode_eval_delta(&parent, &Transaction::default(), true).unwrap();
+        let bytes = wire(&dt);
+        let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+        assert!(has(&[0xa1, 0xff]), "inner gd key must be str");
+        assert!(has(&[0xa2, b'b', b's', 0xa1, 0x80]), "inner bs must be str");
+        assert!(
+            has(&[0xa2, b'l', b'g', 0x91, 0xa1, 0xfe]),
+            "inner lg must be str"
+        );
+        assert!(
+            !has(&[0xc4, 0x01, 0xff]) && !has(&[0xc4, 0x01, 0xfe]) && !has(&[0xc4, 0x01, 0x80])
+        );
     }
 }
