@@ -5885,6 +5885,14 @@ pub struct BoxBudgetState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `block_with_restored_genesis_fields` with the rule resolved from `b`.
+    fn restored_copy(b: &Block) -> Option<Block> {
+        block_with_restored_genesis_fields(
+            b,
+            &algo_types::genesis_restore::GenesisRestoreRule::for_block(b),
+        )
+    }
     use crate::state::LedgerState;
 
     // ── isAbsent (issue #833) ───────────────────────────────────────
@@ -15344,9 +15352,9 @@ return
     fn restore_hash_optional_protocol_without_hgh_keeps_gh_omitted() {
         use algo_types::consensus::CONSENSUS_V15;
         let b = genesis_restore_block(CONSENSUS_V15, false, false);
-        assert!(block_with_restored_genesis_fields(&b, &algo_types::genesis_restore::GenesisRestoreRule::for_block(&b)).is_none());
+        assert!(restored_copy(&b).is_none());
         let b = genesis_restore_block(CONSENSUS_V15, true, false);
-        let r = block_with_restored_genesis_fields(&b, &algo_types::genesis_restore::GenesisRestoreRule::for_block(&b)).expect("gen restored via hgi");
+        let r = restored_copy(&b).expect("gen restored via hgi");
         assert_eq!(r.payset[0].txn.genesis_id, "gid");
         assert_eq!(r.payset[0].txn.genesis_hash, [0u8; 32]);
     }
@@ -15355,7 +15363,7 @@ return
     fn restore_hash_optional_protocol_with_hgh_restores_gh() {
         use algo_types::consensus::CONSENSUS_V15;
         let b = genesis_restore_block(CONSENSUS_V15, false, true);
-        let r = block_with_restored_genesis_fields(&b, &algo_types::genesis_restore::GenesisRestoreRule::for_block(&b)).expect("gh restored via hgh");
+        let r = restored_copy(&b).expect("gh restored via hgh");
         assert_eq!(r.payset[0].txn.genesis_hash, [9u8; 32]);
         assert_eq!(r.payset[0].txn.genesis_id, "", "gen needs hgi");
     }
@@ -15368,21 +15376,21 @@ return
         let mut b = genesis_restore_block(CONSENSUS_V41, true, false);
         b.payset[0].txn.genesis_id = "gid".into();
         b.payset[0].txn.genesis_hash = [9u8; 32];
-        assert!(block_with_restored_genesis_fields(&b, &algo_types::genesis_restore::GenesisRestoreRule::for_block(&b)).is_none());
+        assert!(restored_copy(&b).is_none());
         // Needs restoring: exactly one restored clone comes back, the input
         // block is untouched, and a second pass over the result is a no-op.
         let b = genesis_restore_block(CONSENSUS_V41, true, false);
-        let r = block_with_restored_genesis_fields(&b, &algo_types::genesis_restore::GenesisRestoreRule::for_block(&b)).expect("restored");
+        let r = restored_copy(&b).expect("restored");
         assert_eq!(b.payset[0].txn.genesis_hash, [0u8; 32], "input unchanged");
         assert_eq!(r.payset[0].txn.genesis_hash, [9u8; 32]);
-        assert!(block_with_restored_genesis_fields(&r, &algo_types::genesis_restore::GenesisRestoreRule::for_block(&r)).is_none());
+        assert!(restored_copy(&r).is_none());
     }
 
     #[test]
     fn restore_hash_required_protocol_restores_gh_without_hgh() {
         use algo_types::consensus::CONSENSUS_V41;
         let b = genesis_restore_block(CONSENSUS_V41, false, false);
-        let r = block_with_restored_genesis_fields(&b, &algo_types::genesis_restore::GenesisRestoreRule::for_block(&b)).expect("gh restored");
+        let r = restored_copy(&b).expect("gh restored");
         assert_eq!(r.payset[0].txn.genesis_hash, [9u8; 32]);
     }
 }

@@ -39,6 +39,12 @@ const TG_HASH_PREFIX: &[u8] = b"TG";
 const BH_HASH_PREFIX: &[u8] = b"BH";
 
 /// Compute a transaction ID: SHA512/256("TX" || canonical_encode(txn)).
+///
+/// The id is over the transaction exactly as given. A transaction taken from
+/// a block payset is stored with its genesis id/hash stripped, so it must be
+/// restored first (`algo_types::genesis_restore::GenesisRestoreRule`) or hashed
+/// via [`compute_txn_id_with_genesis`], otherwise the id differs from the real
+/// TxID.
 pub fn compute_txn_id(tx: &Transaction) -> Digest {
     let canonical = canonical_encode_transaction(tx);
     hash_with_prefix(TX_HASH_PREFIX, &canonical)

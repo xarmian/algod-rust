@@ -1426,3 +1426,10 @@ of the last `LOOKBACK_ROUNDS` (1000) rounds from the stored blocks, so
 duplicate-txid detection is correct immediately. It costs at most ~1000 block
 decodes once, runs in one transaction with the marker, and leaves older rows
 (outside the dup-check window) alone. No operator action is needed.
+
+The repair covers the dup cache's inclusive window (`max - 1000 ..= max`) and
+processes one block at a time. If a stored block in the window cannot be
+decoded it is logged (`warn!`) and its row left as is; the marker is then NOT
+written, so the repair retries on the next open. Downgrade-then-upgrade is an
+unsupported flow: rows written by the older build after the marker was set are
+not repaired again.

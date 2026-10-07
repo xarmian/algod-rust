@@ -576,20 +576,38 @@ fn repair_txtail_restored_txids(conn: &Connection) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
     let max_rnd: Option<i64> =
         tx.query_row("SELECT MAX(rnd) FROM blockdb.blocks", [], |r| r.get(0))?;
+    // Same inclusive window `TxTailDupCache::sync` reads:
+    // `current - LOOKBACK_ROUNDS ..= current`.
+    let mut all_repaired = true;
     if let Some(max_rnd) = max_rnd {
         let lo = max_rnd.saturating_sub(crate::txtail_cache::LOOKBACK_ROUNDS as i64);
-        let rows: Vec<(i64, Vec<u8>)> = {
+        // Only the round numbers are collected; each block is fetched,
+        // decoded and rebuilt one at a time (no blob accumulation).
+        let rounds: Vec<i64> = {
             let mut stmt = tx.prepare(
-                "SELECT b.rnd, b.blkdata FROM blockdb.blocks b
+                "SELECT b.rnd FROM blockdb.blocks b
                  JOIN txtail t ON t.rnd = b.rnd
-                 WHERE b.rnd > ?1 AND b.blkdata IS NOT NULL",
+                 WHERE b.rnd >= ?1 AND b.blkdata IS NOT NULL
+                 ORDER BY b.rnd",
             )?;
-            let it = stmt.query_map([lo], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let it = stmt.query_map([lo], |r| r.get(0))?;
             it.collect::<rusqlite::Result<_>>()?
         };
-        for (rnd, blkdata) in rows {
-            let Ok(block) = algo_codec::decode_block(&blkdata) else {
-                continue;
+        for rnd in rounds {
+            let blkdata: Vec<u8> = tx.query_row(
+                "SELECT blkdata FROM blockdb.blocks WHERE rnd = ?1",
+                [rnd],
+                |r| r.get(0),
+            )?;
+            let block = match algo_codec::decode_block(&blkdata) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        "txtail repair: cannot decode stored block {rnd}: {e};                          leaving its row as is and retrying on next open"
+                    );
+                    all_repaired = false;
+                    continue;
+                }
             };
             let data = algo_codec::canonical_encode_txtail_round(
                 &algo_codec::build_txtail_from_block(&block),
@@ -600,10 +618,14 @@ fn repair_txtail_restored_txids(conn: &Connection) -> rusqlite::Result<()> {
             )?;
         }
     }
-    tx.execute(
-        "INSERT OR REPLACE INTO catchpointstate (id, intval) VALUES (?1, 1)",
-        [TXTAIL_RESTORED_TXID_MARKER],
-    )?;
+    // The marker is only written when every row in the window was repaired,
+    // so a skipped (undecodable) block is retried on the next open.
+    if all_repaired {
+        tx.execute(
+            "INSERT OR REPLACE INTO catchpointstate (id, intval) VALUES (?1, 1)",
+            [TXTAIL_RESTORED_TXID_MARKER],
+        )?;
+    }
     tx.commit()
 }
 
@@ -12543,6 +12565,126 @@ mod tests {
         // The one round that *is* stored still resolves correctly -- the
         // "no entry" result above is round-specific, not a wholesale outage.
         assert!(ledger.get_block_header_data(10).unwrap().is_some());
+    }
+
+    type SeededIds = Vec<(Vec<u8>, Vec<u8>)>;
+
+    /// Seeds a file ledger with, for each round, a stored block and an
+    /// old-style (stripped-id) txtail row; clears the repair marker.
+    /// Returns `(prefix, per-round (full_id, stripped_id))`.
+    fn seed_old_txtail(dir: &std::path::Path, rounds: &[u64]) -> (std::path::PathBuf, SeededIds) {
+        use algo_types::consensus::CONSENSUS_V41;
+        let prefix = dir.join("ledger");
+        let mut ids = Vec::new();
+        let mut l = SqliteLedger::open_with_prefix(&prefix).unwrap();
+        for &r in rounds {
+            let mut stx = algo_types::SignedTransaction::default();
+            stx.txn.txn_type = "pay".into();
+            stx.txn.sender = algo_types::Address([1u8; 32]);
+            stx.txn.fee = 1000 + r;
+            stx.txn.last_valid = Round(5000);
+            stx.has_genesis_id = true;
+            let block = algo_types::Block {
+                round: Round(r),
+                genesis_id: "gid".into(),
+                genesis_hash: [5u8; 32],
+                current_protocol: CONSENSUS_V41.into(),
+                payset: vec![stx.clone()],
+                ..Default::default()
+            };
+            let mut full = stx.txn.clone();
+            full.genesis_id = "gid".into();
+            full.genesis_hash = [5u8; 32];
+            let full_id = algo_codec::compute_txn_id(&full).0.to_vec();
+            let stripped_id = algo_codec::compute_txn_id(&stx.txn).0.to_vec();
+            let mut old = algo_codec::build_txtail_from_block(&block);
+            old.txn_ids[0] = serde_bytes::ByteBuf::from(stripped_id.clone());
+            l.put_block(
+                r,
+                CONSENSUS_V41,
+                &algo_codec::canonical_encode_block_header_from_block(&block),
+                &algo_codec::canonical_encode_block(&block),
+            )
+            .unwrap();
+            l.put_txtail(r, &algo_codec::canonical_encode_txtail_round(&old))
+                .unwrap();
+            ids.push((full_id, stripped_id));
+        }
+        drop(l);
+        rusqlite::Connection::open(tracker_path_for_prefix(&prefix))
+            .unwrap()
+            .execute(
+                "DELETE FROM catchpointstate WHERE id = ?1",
+                [TXTAIL_RESTORED_TXID_MARKER],
+            )
+            .unwrap();
+        (prefix, ids)
+    }
+
+    fn txtail_first_id(l: &SqliteLedger, r: u64) -> Vec<u8> {
+        let row = l.get_txtail(r).unwrap().unwrap();
+        let t: algo_types::TxTailRound = rmp_serde::from_slice(&row).unwrap();
+        t.txn_ids[0].to_vec()
+    }
+
+    fn txtail_marker_set(prefix: &std::path::Path) -> bool {
+        rusqlite::Connection::open(tracker_path_for_prefix(prefix))
+            .unwrap()
+            .query_row(
+                "SELECT intval FROM catchpointstate WHERE id = ?1",
+                [TXTAIL_RESTORED_TXID_MARKER],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .unwrap()
+            == Some(1)
+    }
+
+    /// The repair covers exactly the dup cache's inclusive window
+    /// `max - LOOKBACK_ROUNDS ..= max`: the boundary round is repaired and
+    /// the round just below it is left alone.
+    #[test]
+    fn txtail_repair_window_is_inclusive_like_the_dup_cache() {
+        let max = 1002u64;
+        let lo = max - crate::txtail_cache::LOOKBACK_ROUNDS;
+        let dir = tempfile::tempdir().unwrap();
+        let (prefix, ids) = seed_old_txtail(dir.path(), &[lo - 1, lo, max]);
+        let l = SqliteLedger::open_with_prefix(&prefix).unwrap();
+        assert_eq!(txtail_first_id(&l, lo - 1), ids[0].1, "below window");
+        assert_eq!(txtail_first_id(&l, lo), ids[1].0, "boundary round");
+        assert_eq!(txtail_first_id(&l, max), ids[2].0, "newest round");
+        assert!(txtail_marker_set(&prefix));
+    }
+
+    /// An undecodable stored block is not silently skipped under a committed
+    /// marker: the other rows are repaired, the marker stays unset, and the
+    /// next open retries.
+    #[test]
+    fn txtail_repair_with_corrupt_block_leaves_marker_unset_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let (prefix, ids) = seed_old_txtail(dir.path(), &[7, 8]);
+        let tracker = tracker_path_for_prefix(&prefix);
+        let block_conn = rusqlite::Connection::open(block_path_for_prefix(&prefix)).unwrap();
+        let good: Vec<u8> = block_conn
+            .query_row("SELECT blkdata FROM blocks WHERE rnd = 7", [], |r| r.get(0))
+            .unwrap();
+        block_conn
+            .execute("UPDATE blocks SET blkdata = x'c1' WHERE rnd = 7", [])
+            .unwrap();
+        let _ = tracker;
+
+        let l = SqliteLedger::open_with_prefix(&prefix).unwrap();
+        assert_eq!(txtail_first_id(&l, 7), ids[0].1, "corrupt block row kept");
+        assert_eq!(txtail_first_id(&l, 8), ids[1].0, "good row repaired");
+        assert!(!txtail_marker_set(&prefix), "marker must not be written");
+        drop(l);
+
+        block_conn
+            .execute("UPDATE blocks SET blkdata = ?1 WHERE rnd = 7", [good])
+            .unwrap();
+        let l = SqliteLedger::open_with_prefix(&prefix).unwrap();
+        assert_eq!(txtail_first_id(&l, 7), ids[0].0, "retried and repaired");
+        assert!(txtail_marker_set(&prefix));
     }
 
     /// Issue #1707: a ledger holding txtail rows written with stripped-form
