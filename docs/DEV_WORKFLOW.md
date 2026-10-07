@@ -241,9 +241,12 @@ Before the `DeltaAction` renumbering (PR #1708), `ApplyMode::Replay` applied the
 state written by an `appl` transaction was stored with the wrong type or value.
 Nodes that follow with Execute mode (the node follow path since #1665, and
 `apply_block_caching_delta`) re-run the AVM and are unaffected. A ledger
-database built by Replay of `appl` blocks before this change (the pre-#1665
-follow path, `relay`, `replay` without `--avm-execute`; `relay` and `replay` now Execute `appl` blocks, issue #1709) should be resynced from
-a catchpoint. Dev-mode ledgers are not affected, verified in code:
+database built by Replay of `appl` blocks should be resynced from
+a catchpoint: that is every ledger built before #1665 by the follow path, and
+every ledger built by `relay` or by `replay` without `--avm-execute` before
+issue #1709. After #1709 those two commands Execute `appl` blocks (like the
+follow path) and are no longer affected; the opt-in shadow-execute diagnostic
+(`algo_ledger::shadow_execute`) also applies to them. Dev-mode ledgers are not affected, verified in code:
 `encode_eval_delta` results (outer `dt` and inner `itx[*].dt`) only land in the
 in-memory `ApplyData` returned by the Execute apply
 (`apply.rs`, `captured_eval_delta`; `avm_context.rs` inner `stxn.eval_delta`) and

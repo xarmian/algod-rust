@@ -166,9 +166,10 @@ pub enum Commands {
         #[arg(long)]
         compare_trie_db: Option<PathBuf>,
 
-        /// Also compare the AVM-evaluated EvalDeltas against the recorded ones and report
-        /// mismatch statistics. Blocks containing an application call are always executed
-        /// (like go-algorand), with or without this flag (issue #1709).
+        /// Compare AVM-evaluated EvalDeltas against the recorded ones and report mismatch
+        /// statistics. With this flag EVERY block is evaluated and compared; without it only
+        /// blocks containing an application call are executed (like go-algorand) and the rest
+        /// take the cheap recorded-delta path (issue #1709). `sync` behaves the same way.
         #[arg(long)]
         avm_execute: bool,
     },
@@ -215,7 +216,10 @@ pub enum Commands {
         #[arg(long, default_value = "16")]
         concurrency: usize,
 
-        /// Enable AVM execution mode.
+        /// Compare AVM-evaluated EvalDeltas against the recorded ones and report mismatch
+        /// statistics. With this flag EVERY block is evaluated and compared; without it only
+        /// blocks containing an application call are executed (like go-algorand) and the rest
+        /// take the cheap recorded-delta path.
         #[arg(long)]
         avm_execute: bool,
 
