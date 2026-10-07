@@ -755,6 +755,10 @@ pub fn decode_tx_message(data: &[u8]) -> Result<Vec<SignedTransaction>, TxTagErr
         return Err(TxTagError::EmptyGroup);
     }
 
+    // go decodes gossip txns as `SignedTxn`, which has no hgi/hgh: the
+    // in-block-only flags a peer may have set are ignored (issue #1727).
+    algo_types::genesis_restore::clear_in_block_flags(&mut group);
+
     Ok(group)
 }
 

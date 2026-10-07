@@ -2632,6 +2632,9 @@ pub async fn raw_transaction<N: NodeInterface>(
     if txgroup.is_empty() {
         return error::bad_request("empty txgroup");
     }
+    // go `SignedTxn` has no hgi/hgh (in-block-only flags): ignore any a
+    // client supplied (issue #1727).
+    algo_types::genesis_restore::clear_in_block_flags(&mut txgroup);
 
     if let Err(e) =
         crate::pq_compliance::enforce_pq_compliance(&txgroup, params.skip_pq_address_check)
@@ -4792,6 +4795,9 @@ pub async fn raw_transaction_async<N: NodeInterface>(
     if txgroup.is_empty() {
         return error::bad_request("empty txgroup");
     }
+    // go `SignedTxn` has no hgi/hgh (in-block-only flags): ignore any a
+    // client supplied (issue #1727).
+    algo_types::genesis_restore::clear_in_block_flags(&mut txgroup);
 
     if let Err(e) =
         crate::pq_compliance::enforce_pq_compliance(&txgroup, params.skip_pq_address_check)

@@ -65,12 +65,22 @@ pub fn protocol_requires_genesis_hash(proto: &str) -> bool {
     consensus_params_for_version(proto).is_none_or(|p| p.require_genesis_hash)
 }
 
-/// go's `SupportSignedTxnInBlock` (`config/consensus.go`, first set by the
-/// v11 params: "v11 introduces SignedTxnInBlock"). algod-rust has no
-/// dedicated field; `PaysetCommit` (also first set in v11) is the same
-/// boundary, so it models the flag.
-pub fn params_support_signed_txn_in_block(params: &ConsensusParams) -> bool {
-    params.payset_commit != 0
+/// go's `SignedTxn` (`data/transactions/signedtxn.go`) has no `hgi`/`hgh`:
+/// only `SignedTxnInBlock` carries them. algod-rust decodes both shapes
+/// into [`SignedTransaction`], so a client (REST submit, gossip `TX`) can
+/// set the in-block-only flags on a transaction it submits. Call this on
+/// every externally decoded group before pool admission so such flags are
+/// ignored exactly as go ignores them (it has nowhere to decode them to):
+/// otherwise a txn signed over `gen` but submitted with `gen` omitted and
+/// `hgi` set would have `gen` restored from the header, verify, and be
+/// proposed in a stripped form (`gen=""`, `hgi=false`) that no longer
+/// verifies. Never call it on a block payset, whose flags are genuine.
+#[inline]
+pub fn clear_in_block_flags(txgroup: &mut [SignedTransaction]) {
+    for stx in txgroup {
+        stx.has_genesis_id = false;
+        stx.has_genesis_hash = false;
+    }
 }
 
 /// Why a payset entry is malformed for go's `BlockHeader.DecodeSignedTxn`
@@ -163,7 +173,7 @@ impl<'a> GenesisRestoreRule<'a> {
             &block.genesis_hash,
             params.is_none_or(|p| p.require_genesis_hash),
         );
-        rule.supports_stripped = params.is_none_or(params_support_signed_txn_in_block);
+        rule.supports_stripped = params.is_none_or(|p| p.support_signed_txn_in_block);
         rule
     }
 
@@ -176,6 +186,13 @@ impl<'a> GenesisRestoreRule<'a> {
         out
     }
 
+    /// Every txn of `payset` turned into its in-block form, see [`Self::strip`].
+    pub fn strip_payset(&self, payset: &mut [SignedTransaction]) {
+        for stx in payset {
+            self.strip(stx);
+        }
+    }
+
     /// go's `EncodeSignedTxn` genesis handling: turn `stx` into its in-block
     /// form FROM SCRATCH. `gen`/`gh` equal to the header's are stripped and
     /// `hgi` is set iff a `gen` was stripped; `hgh` is set iff a `gh` was
@@ -184,13 +201,15 @@ impl<'a> GenesisRestoreRule<'a> {
     /// `SignedTransaction`; go's `SignedTxn` has no such fields) is
     /// discarded so it can never leak into a produced block. A `gen`/`gh`
     /// that differs from the header is left in place for the caller to
-    /// reject (go: "GenesisID mismatch"). No-op for pre-v11 protocols.
+    /// reject (go: "GenesisID mismatch"). On a pre-v11 protocol go copies
+    /// the txn into a fresh (flag-less) `SignedTxnInBlock`: flags cleared,
+    /// fields untouched.
     pub fn strip(&self, stx: &mut SignedTransaction) {
+        stx.has_genesis_id = false;
+        stx.has_genesis_hash = false;
         if !self.supports_stripped {
             return;
         }
-        stx.has_genesis_id = false;
-        stx.has_genesis_hash = false;
         if !stx.txn.genesis_id.is_empty() && stx.txn.genesis_id == self.genesis_id {
             stx.txn.genesis_id.clear();
             stx.has_genesis_id = true;
@@ -502,9 +521,52 @@ mod tests {
         assert!(!rule.needs_restore(&s));
         rule.restore(&mut s);
         assert_eq!(s.txn.genesis_id, "");
-        let mut f = stripped(GID, GH, false, false);
+        // go's EncodeSignedTxn builds a fresh STIB (flags false) and copies
+        // the txn untouched: leaked flags are cleared, fields are kept.
+        let mut f = stripped(GID, GH, true, true);
         rule.strip(&mut f);
         assert_eq!(f, stripped(GID, GH, false, false));
+    }
+
+    #[test]
+    fn strip_payset_and_clear_in_block_flags_cover_every_entry() {
+        let gh = GH;
+        let rule = GenesisRestoreRule::new(GID, &gh, true);
+        let mut payset = vec![
+            stripped(GID, GH, false, false),
+            stripped(GID, GH, true, true),
+        ];
+        rule.strip_payset(&mut payset);
+        for stx in &payset {
+            assert_eq!(*stx, stripped("", [0; 32], true, false));
+        }
+        let mut group = vec![
+            stripped(GID, GH, true, true),
+            stripped("", [0; 32], true, false),
+        ];
+        clear_in_block_flags(&mut group);
+        assert_eq!(group[0], stripped(GID, GH, false, false));
+        assert_eq!(group[1], stripped("", [0; 32], false, false));
+    }
+
+    /// `SupportSignedTxnInBlock` is modelled on its own: a modern protocol
+    /// whose override zeroes `PaysetCommit` still restores and still rejects.
+    #[test]
+    fn support_signed_txn_in_block_is_independent_of_payset_commit() {
+        let mut params = consensus_params_for_version(CONSENSUS_V41).unwrap();
+        params.payset_commit = 0;
+        let b = block(CONSENSUS_V41, true, false);
+        let rule = GenesisRestoreRule::for_params(Some(&params), &b);
+        assert_eq!(rule.restored_txn(&b.payset[0]).genesis_id, GID);
+        assert_eq!(rule.restored_txn(&b.payset[0]).genesis_hash, GH);
+        assert_eq!(
+            rule.check_stripped(&stripped(GID, [0; 32], true, false)),
+            Err(GenesisFieldError::GenesisIdNotEmpty(GID.into()))
+        );
+        assert_eq!(
+            rule.check_stripped(&stripped("", [0; 32], false, true)),
+            Err(GenesisFieldError::HasGenesisHashObviated)
+        );
     }
 
     #[test]

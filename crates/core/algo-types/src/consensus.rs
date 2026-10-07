@@ -470,6 +470,11 @@ pub struct ConsensusParams {
     pub max_timestamp_increment: i64,
     /// How payset is committed: 0=unsupported, 1=flat, 2=merkle (Go: `PaysetCommit`).
     pub payset_commit: u8,
+    /// Payset entries are `SignedTxnInBlock` with the genesis fields
+    /// stripped into `hgi`/`hgh` (Go: `SupportSignedTxnInBlock`, v11+:
+    /// "v11 introduces SignedTxnInBlock"). Before it, go's
+    /// `EncodeSignedTxn`/`DecodeSignedTxn` copy the txn untouched.
+    pub support_signed_txn_in_block: bool,
     /// SHA-256 txn commitment header (Go: `EnableSHA256TxnCommitmentHeader`, v34+).
     pub enable_sha256_txn_commitment_header: bool,
     /// SHA-512 block hash header (Go: `EnableSha512BlockHash`, v41+).
@@ -1019,6 +1024,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         rewards_rate_refresh_interval: 500_000,
         max_timestamp_increment: 25,
         payset_commit: PAYSET_COMMIT_UNSUPPORTED,
+        support_signed_txn_in_block: false,
         enable_sha256_txn_commitment_header: false,
         enable_sha512_block_hash: false,
         require_genesis_hash: false,
@@ -1164,6 +1170,8 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
 
     // ── v11 ─────────────────────────────────────────────────────
     let mut v11 = v10.clone();
+    // Go: "v11 introduces SignedTxnInBlock" (config/consensus.go).
+    v11.support_signed_txn_in_block = true;
     v11.payset_commit = PAYSET_COMMIT_FLAT;
     if version == CONSENSUS_V11 {
         return Some(v11);
@@ -1843,6 +1851,12 @@ pub struct ConsensusParamsOverride {
     pub rewards_rate_refresh_interval: u64,
     pub max_timestamp_increment: i64,
     pub payset_commit: u8,
+    /// Every protocol this repo can run is v11+ (`SignedTxnInBlock`
+    /// paysets), so an override entry that omits the key keeps modern
+    /// stripped-payset semantics rather than reverting to pre-v11 "copy the
+    /// txn untouched" behaviour.
+    #[serde(default = "default_true")]
+    pub support_signed_txn_in_block: bool,
     #[serde(rename = "EnableSHA256TxnCommitmentHeader")]
     pub enable_sha256_txn_commitment_header: bool,
     pub enable_sha512_block_hash: bool,
@@ -2041,6 +2055,7 @@ impl ConsensusParamsOverride {
             rewards_rate_refresh_interval: self.rewards_rate_refresh_interval,
             max_timestamp_increment: self.max_timestamp_increment,
             payset_commit: self.payset_commit,
+            support_signed_txn_in_block: self.support_signed_txn_in_block,
             enable_sha256_txn_commitment_header: self.enable_sha256_txn_commitment_header,
             enable_sha512_block_hash: self.enable_sha512_block_hash,
             require_genesis_hash: self.require_genesis_hash,
@@ -3567,6 +3582,28 @@ mod tests {
         assert!(entry.state_proof_exclude_total_weight_with_rewards);
         let params = entry.to_consensus_params();
         assert!(params.state_proof_exclude_total_weight_with_rewards);
+    }
+
+    /// Issue #1727: `SupportSignedTxnInBlock` is its own field, defaulting
+    /// to `true` when an override entry omits it (every runnable protocol is
+    /// v11+), and honoured when set.
+    #[test]
+    fn consensus_json_override_support_signed_txn_in_block_defaults_true() {
+        let json = r#"{"vOmit": {"PaysetCommit": 2}, "vOff": {"SupportSignedTxnInBlock": false}}"#;
+        let overrides: ConsensusOverrides = serde_json::from_str(json).unwrap();
+        assert!(overrides.get("vOmit").unwrap().support_signed_txn_in_block);
+        assert!(!overrides.get("vOff").unwrap().support_signed_txn_in_block);
+        assert!(
+            overrides
+                .get("vOmit")
+                .unwrap()
+                .to_consensus_params()
+                .support_signed_txn_in_block
+        );
+        let table = consensus_params_for_version;
+        assert!(!table(CONSENSUS_V10).unwrap().support_signed_txn_in_block);
+        assert!(table(CONSENSUS_V11).unwrap().support_signed_txn_in_block);
+        assert!(table(CONSENSUS_V41).unwrap().support_signed_txn_in_block);
     }
 
     #[test]

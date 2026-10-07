@@ -1506,7 +1506,14 @@ impl SimpleBlockEvaluator {
         // transactions the genesis fields should already be populated, but we
         // ensure they're set matching the block header, mirroring the pattern
         // from block.rs.
+        //
+        // Pool/client transactions are go `SignedTxn`s, which carry no
+        // `hgi`/`hgh` (`data/transactions/signedtxn.go`): the flags only
+        // exist on `SignedTxnInBlock`. Whatever a client set is dropped here
+        // (issue #1727 review), so `gen` is restored only when the protocol
+        // requires it, never because a submitter asked for it.
         let mut restored: Vec<algo_types::SignedTransaction> = txgroup.to_vec();
+        algo_types::genesis_restore::clear_in_block_flags(&mut restored);
         for stx in &mut restored {
             self.restore_genesis_fields(stx);
         }
@@ -8800,16 +8807,52 @@ mod tests {
             "hgh must be cleared on RequireGenesisHash protocols"
         );
         assert!(block.payset[0].has_genesis_id);
-        let result =
-            algo_validate::block::validate_block(&block, None, "test-v1", &[0xAA; 32], None);
-        assert!(
-            !result.errors.iter().any(|e| matches!(
-                e,
-                algo_validate::block::BlockValidationError::PaysetGenesisFields { .. }
-            )),
-            "{:?}",
-            result.errors
-        );
+        let result = validate_proposal(&block);
+        assert!(result.is_valid, "{:?}", result.errors);
+    }
+
+    /// `validate_block` over a block this evaluator proposed, with the
+    /// evaluator's own header genesis id/hash as the expected network.
+    fn validate_proposal(block: &algo_types::Block) -> algo_validate::block::BlockValidationResult {
+        algo_validate::block::validate_block(block, None, "test-v1", &[0xAA; 32], None)
+    }
+
+    /// Round-2 review of #1727: go's `SignedTxn` has no `hgi`/`hgh`
+    /// (`data/transactions/signedtxn.go`: only `SignedTxnInBlock` carries
+    /// them), so a client-supplied flag must be ignored at admission. A txn
+    /// signed over gen="test-v1" but submitted with gen omitted and hgi=true
+    /// must fail its signature check here, not get its gen restored from the
+    /// header, admitted, and then proposed in a block whose stripped form
+    /// (gen="", hgi=false) no longer verifies.
+    #[test]
+    fn admission_rejects_gen_omitted_with_leaked_hgi() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(128);
+        let (receiver, _) = test_keypair(129);
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+        let mut stx = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100);
+        stx.txn.genesis_id = String::new();
+        stx.has_genesis_id = true;
+        assert!(eval
+            .test_transaction_group(std::slice::from_ref(&stx))
+            .is_err());
+        assert!(eval.transaction_group(&[stx]).is_err());
+        assert_eq!(eval.pay_set_size(), 0, "must never reach a proposal");
+    }
+
+    #[test]
+    fn correct_submission_proposes_block_that_validates() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(130);
+        let (receiver, _) = test_keypair(131);
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+        let stx = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100);
+        eval.transaction_group(&[stx]).unwrap();
+        let block = eval.generate_block(&[]).unwrap();
+        let result = validate_proposal(&block);
+        assert!(result.is_valid, "{:?}", result.errors);
     }
 
     /// An empty-`gen` txn must not be proposed with a leaked `hgi`.
@@ -8820,12 +8863,22 @@ mod tests {
         let (sender, key) = test_keypair(126);
         let (receiver, _) = test_keypair(127);
         let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
-        let mut stx = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100);
-        stx.txn.genesis_id = String::new();
-        stx.has_genesis_id = true;
+        // Legitimately signed over an empty gen; the leaked hgi must be
+        // ignored at admission and absent from the proposal.
+        let mut txn = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100).txn;
+        txn.genesis_id = String::new();
+        let sig = sign_txn(&txn, &key);
+        let stx = SignedTransaction {
+            txn,
+            sig,
+            has_genesis_id: true,
+            ..Default::default()
+        };
         eval.transaction_group(&[stx]).unwrap();
         let block = eval.generate_block(&[]).unwrap();
         assert!(!block.payset[0].has_genesis_id);
+        let result = validate_proposal(&block);
+        assert!(result.is_valid, "{:?}", result.errors);
     }
 
     /// Mirrors go-algorand's `TestEncodeDecodeSignedTxn`

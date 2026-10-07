@@ -111,16 +111,9 @@ fn minimal_block(genesis_hash: [u8; 32], fee_sink: Address, round: u64) -> Block
 /// Install `txns` as the block's payset in the stored in-block form (go
 /// `EncodeSignedTxn`): gen/gh stripped, the header supplies them back. go's
 /// `DecodeSignedTxn` rejects a txn still carrying them (issue #1727).
-fn set_payset(block: &mut Block, txns: Vec<algo_types::SignedTransaction>) {
-    let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(block);
-    let stripped: Vec<_> = txns
-        .into_iter()
-        .map(|mut stx| {
-            rule.strip(&mut stx);
-            stx
-        })
-        .collect();
-    block.payset = stripped;
+fn set_payset(block: &mut Block, mut txns: Vec<algo_types::SignedTransaction>) {
+    algo_types::genesis_restore::GenesisRestoreRule::for_block(block).strip_payset(&mut txns);
+    block.payset = txns;
 }
 
 /// Assert a block validates cleanly (real signature/fee/proof checks) and

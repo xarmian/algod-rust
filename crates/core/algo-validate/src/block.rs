@@ -1230,17 +1230,9 @@ mod tests {
     /// Put the payset in its stored in-block form (go `EncodeSignedTxn`): the
     /// header supplies gen/gh, `validate_block` rejects txns still carrying them.
     fn strip_payset_genesis(block: &mut Block) {
-        let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(block);
-        let stripped: Vec<_> = block
-            .payset
-            .iter()
-            .cloned()
-            .map(|mut stx| {
-                rule.strip(&mut stx);
-                stx
-            })
-            .collect();
-        block.payset = stripped;
+        let mut payset = std::mem::take(&mut block.payset);
+        algo_types::genesis_restore::GenesisRestoreRule::for_block(block).strip_payset(&mut payset);
+        block.payset = payset;
     }
 
     fn has_genesis_field_error(result: &BlockValidationResult) -> bool {

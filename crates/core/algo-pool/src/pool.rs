@@ -723,7 +723,9 @@ impl TransactionPool {
     /// 6. Feed to evaluator
     /// 7. Store in remembered
     /// 8. Flush remembered to pending
-    pub fn remember(&self, tx_group: Vec<SignedTransaction>) -> Result<(), PoolError> {
+    pub fn remember(&self, mut tx_group: Vec<SignedTransaction>) -> Result<(), PoolError> {
+        // Client txns are go `SignedTxn`s: no hgi/hgh (issue #1727).
+        algo_types::genesis_restore::clear_in_block_flags(&mut tx_group);
         // Capacity check (before acquiring mu, matching Go).
         self.check_pending_queue_size(&tx_group)?;
 
