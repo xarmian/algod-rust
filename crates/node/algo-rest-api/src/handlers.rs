@@ -3279,6 +3279,15 @@ pub async fn simulate_transaction<N: NodeInterface>(
                 }
             }
         }
+        // go decodes each entry as a `SignedTxn` (`PreEncodedSimulateRequest`,
+        // handlers.go:1562-1567), whose decoder rejects the in-block-only
+        // hgi/hgh as unknown fields (issue #1727).
+        if let Err(e) = algo_types::genesis_restore::reject_in_block_flags(&decoded_txns) {
+            return error::bad_request(format!(
+                "could not decode transaction {} in group {i}: Unknown field: {}",
+                e.index, e.field
+            ));
+        }
         decoded_groups.push(decoded_txns);
     }
     request.decoded_txn_groups = decoded_groups;

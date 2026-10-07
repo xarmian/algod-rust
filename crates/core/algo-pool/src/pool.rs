@@ -769,6 +769,13 @@ impl TransactionPool {
     /// Mirrors `Test()` in go-algorand: checks capacity, then uses the
     /// evaluator's `test_transaction_group` for validation.
     pub fn test(&self, tx_group: &[SignedTransaction]) -> Result<(), PoolError> {
+        // Same in-block-only flag rejection as `remember` (issue #1727).
+        if let Err(e) = algo_types::genesis_restore::reject_in_block_flags(tx_group) {
+            return Err(PoolError::InBlockOnlyField {
+                index: e.index,
+                field: e.field,
+            });
+        }
         self.check_pending_queue_size(tx_group)?;
 
         let inner = self.mu.lock();
@@ -1357,6 +1364,30 @@ mod tests {
         }
         pool.remember(vec![make_test_txn(3)]).unwrap();
         assert_eq!(pool.pending_count(), 1);
+    }
+
+    /// go's `Test()` and `Remember()` decode the same `SignedTxn`, so a
+    /// flagged group gets the same "Unknown field" answer from both.
+    #[test]
+    fn test_and_remember_agree_on_in_block_only_flags() {
+        let pool = make_pool_with_evaluator(10);
+        let mut stx = make_test_txn(1);
+        stx.has_genesis_hash = true;
+        let group = vec![stx];
+        let from_test = pool.test(&group).unwrap_err();
+        let from_remember = pool.remember(group).unwrap_err();
+        assert!(
+            matches!(
+                from_test,
+                PoolError::InBlockOnlyField {
+                    index: 0,
+                    field: "hgh"
+                }
+            ),
+            "{from_test:?}"
+        );
+        assert_eq!(from_test.to_string(), from_remember.to_string());
+        assert_eq!(pool.pending_count(), 0);
     }
 
     fn make_test_txn(note_byte: u8) -> SignedTransaction {

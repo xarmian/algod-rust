@@ -8930,6 +8930,7 @@ mod tests {
         let (sender, key) = test_keypair(134);
         let (receiver, _) = test_keypair(135);
         let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+        eval.hdr.current_protocol = algo_types::consensus::CONSENSUS_V10.to_string();
         let mut txn = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100).txn;
         txn.genesis_hash = [0u8; 32]; // v10: no genesis hash support
         let sig = sign_txn(&txn, &key);
@@ -8947,6 +8948,10 @@ mod tests {
         );
         assert!(!stib.has_genesis_id);
         assert!(!stib.has_genesis_hash);
+        // The validator builds its rule from the same V10 params (for_params)
+        // and so accepts the untouched txn: proposer and validator agree.
+        let result = validate_proposal(&block);
+        assert!(result.is_valid, "{:?}", result.errors);
     }
 
     /// Mirrors go-algorand's `TestEncodeDecodeSignedTxn`

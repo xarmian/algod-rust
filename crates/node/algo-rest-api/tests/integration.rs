@@ -7913,6 +7913,46 @@ async fn simulate_format_msgpack() {
     );
 }
 
+/// Round-4 review of #1727: simulate decodes each txn as a go `SignedTxn`
+/// (`PreEncodedSimulateRequest`, `daemon/algod/api/server/v2/handlers.go:
+/// 1562-1567`, strict msgp/JSON decode -> 400), so the in-block-only
+/// `hgi`/`hgh` are an "Unknown field" 400 here too.
+#[tokio::test]
+async fn simulate_in_block_only_field_returns_400() {
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    // A fully-formed txn (the default serialises every required field),
+    // followed by the same txn carrying the in-block-only `hgi`.
+    let ok_val = serde_json::to_value(SignedTransaction::default()).unwrap();
+    let mut flagged_val = ok_val.clone();
+    flagged_val["hgi"] = serde_json::json!(true);
+    let request_json = serde_json::json!({
+        "txn-groups": [{
+            "txns": [ok_val, flagged_val]
+        }]
+    });
+    let body = serde_json::to_vec(&request_json).unwrap();
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions/simulate"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    let msg = json["message"].as_str().unwrap();
+    assert!(
+        msg.contains("could not decode transaction 1 in group 0")
+            && msg.contains("Unknown field: hgi"),
+        "{msg}"
+    );
+}
+
 #[tokio::test]
 async fn simulate_invalid_format_returns_400() {
     let node = MockNode::synced();

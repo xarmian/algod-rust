@@ -257,6 +257,17 @@ or sqlite row (the delta cache holds the ledger `StateDelta`, which has no
 action numbers). The old numbering was only visible in-process, via the dev-mode
 REST lookups and simulate.
 
+## Resyncing after the payset genesis-field strip fix (issues #1703, #1727)
+
+Between #1665 and #1703 the algod-rust proposer stored `gen`/`gh` in the payset
+instead of stripping them into `hgi`/`hgh` (go's `EncodeSignedTxn`). Since
+#1727 the apply boundary rejects such a block like go's `DecodePaysetGroups`
+would, with an error that says so (`payset txn N: ... carries gen/gh: blocks
+produced by algod-rust between #1665 and #1703 are affected; resync from
+genesis/catchpoint`). A Rust-only localnet ledger from that window cannot be
+replayed: delete it and resync from genesis or a catchpoint. Ledgers synced
+from go-algorand nodes (mainnet/testnet/mixed clusters) are not affected.
+
 ## Running Tests
 
 ```bash

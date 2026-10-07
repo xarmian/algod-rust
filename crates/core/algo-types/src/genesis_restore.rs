@@ -50,10 +50,15 @@
 //! (`algo_ledger`'s `apply_block_impl_ex`, every apply mode, like go's
 //! `DecodePaysetGroups` failing the whole block). Blocks a node stored
 //! before this check existed were validated by their certificate at store
-//! time and only re-enter through apply; go's own node would have refused
-//! to decode a violating block, so none of them can violate the rule --
-//! a mainnet participation soak with the apply-side check (run
+//! time and only re-enter through apply; every block that went through a
+//! go node's decoder satisfies the rule (go refuses to decode a violating
+//! one), and a mainnet participation soak with the apply-side check (run
 //! 37573102169) replayed 11,500 app-call proposals with zero rejections.
+//! The one known source of violating blocks is a Rust-only localnet that
+//! produced blocks between #1665 and #1703, when the proposer stored
+//! `gen`/`gh` in the payset: such a ledger is rejected at apply with an
+//! error naming that cause, and must be resynced from genesis or a
+//! catchpoint (see `docs/DEV_WORKFLOW.md`).
 //! [`GenesisRestoreRule::restore`] itself is tolerant and only fills fields
 //! that are empty/zero, which makes it idempotent. The inverse, go's
 //! `EncodeSignedTxn`, is [`GenesisRestoreRule::strip`].
@@ -111,10 +116,11 @@ impl std::error::Error for InBlockOnlyFieldError {}
 #[inline]
 pub fn reject_in_block_flags(txgroup: &[SignedTransaction]) -> Result<(), InBlockOnlyFieldError> {
     for (index, stx) in txgroup.iter().enumerate() {
-        let field = if stx.has_genesis_id {
-            "hgi"
-        } else if stx.has_genesis_hash {
+        // go's canonical (sorted) key order reaches `hgh` before `hgi`.
+        let field = if stx.has_genesis_hash {
             "hgh"
+        } else if stx.has_genesis_id {
+            "hgi"
         } else {
             continue;
         };
@@ -378,19 +384,9 @@ impl<'a> GenesisRestoreRule<'a> {
     }
 }
 
-/// Fill the genesis fields `stx` had stripped, from the header's
-/// `genesis_id` / `genesis_hash`. `require_genesis_hash` is the block
-/// protocol's `RequireGenesisHash`.
-pub fn restore_genesis_fields_with(
-    stx: &mut SignedTransaction,
-    genesis_id: &str,
-    genesis_hash: &[u8; 32],
-    require_genesis_hash: bool,
-) {
-    GenesisRestoreRule::new(genesis_id, genesis_hash, require_genesis_hash).restore(stx);
-}
-
-/// [`restore_genesis_fields_with`] using `block`'s header and protocol.
+/// Fill the genesis fields `stx` had stripped, from `block`'s header and
+/// protocol ([`GenesisRestoreRule::for_block`], so the
+/// `SupportSignedTxnInBlock` gate applies).
 pub fn restore_genesis_fields(stx: &mut SignedTransaction, block: &Block) {
     GenesisRestoreRule::for_block(block).restore(stx);
 }
@@ -612,7 +608,7 @@ mod tests {
             reject_in_block_flags(&group),
             Err(InBlockOnlyFieldError {
                 index: 0,
-                field: "hgi"
+                field: "hgh" // both set: go's sorted keys hit hgh first
             })
         );
         clear_in_block_flags(&mut group);
@@ -630,6 +626,14 @@ mod tests {
         let err = reject_in_block_flags(&group).unwrap_err();
         assert_eq!(err.index, 1);
         assert_eq!(err.to_string(), "txn 1: Unknown field: hgh");
+    }
+
+    /// go's canonical (sorted) key order reaches `hgh` before `hgi`, so
+    /// `msgp.ErrNoField` names `hgh` when both are present.
+    #[test]
+    fn reject_in_block_flags_reports_hgh_before_hgi_when_both_set() {
+        let err = reject_in_block_flags(&[stripped("", [0; 32], true, true)]).unwrap_err();
+        assert_eq!(err.field, "hgh");
     }
 
     #[test]
