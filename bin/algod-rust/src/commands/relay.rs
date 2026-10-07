@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use algo_ledger::catchpoint::{get_catchpoint_stream, CatchpointError};
 use algo_ledger::{
-    apply::apply_block, parse_genesis_json, populate_store, seed_account_totals_from_genesis,
-    LedgerStore, SqliteLedger,
+    apply::apply_block_executing_app_calls, parse_genesis_json, populate_store,
+    seed_account_totals_from_genesis, LedgerStore, SqliteLedger,
 };
 use algo_network::{
     BlockService, BlockServiceError, CatchpointService, CatchpointServiceError, ForwardingPolicy,
@@ -71,7 +71,7 @@ impl LedgerBlockService {
     /// ledger's accountbase stays current.
     ///
     /// History: before PLAN-32 / TASK-95 this function passed an empty
-    /// `proto` + empty `hdrdata` to `put_block` and skipped `apply_block`
+    /// `proto` + empty `hdrdata` to `put_block` and skipped block application
     /// entirely — fine for a pure block archive but left the
     /// `accountbase` / `accounttotals` / per-round header fields empty,
     /// which in turn broke `algo_agreement::Certificate::authenticate`
@@ -85,7 +85,7 @@ impl LedgerBlockService {
     /// 2. Call `put_block` with the real `proto` (from
     ///    `Block::current_protocol`) and canonical `hdrdata` so
     ///    `LedgerReader::{consensus_version, seed, lookup_digest}` work.
-    /// 3. For every round > 0, call `apply_block` to mutate `accountbase`.
+    /// 3. For every round > 0, call `apply_block_executing_app_calls` to mutate `accountbase`.
     ///    Round 0 (genesis) is stored without apply since the opening
     ///    state should come from `populate_store`. If apply fails we
     ///    log + continue — still better than silently dropping the
@@ -121,13 +121,16 @@ impl LedgerBlockService {
                     let _ = ledger.rollback_block();
                     return Err(format!("put_block_cert: {e}"));
                 }
-                // Apply state transitions for non-genesis rounds. apply_block
-                // on round 0 would re-run the genesis transactions (which
+                // Apply state transitions for non-genesis rounds. Applying
+                // round 0 would re-run the genesis transactions (which
                 // is both redundant and sometimes incorrect — the genesis
                 // state has already been loaded via populate_store).
                 if round > 0 {
-                    if let Err(e) = apply_block(&mut *ledger, &block) {
-                        // Apply failure is fatal: apply_block only rolls
+                    // go re-evaluates every app call on every path; blocks with
+                    // an `appl` run the AVM (Execute) like the follow path
+                    // (issue #1709), the rest keep the cheap Replay path.
+                    if let Err(e) = apply_block_executing_app_calls(&mut *ledger, &block) {
+                        // Apply failure is fatal: the apply only rolls
                         // back rewards on error, not earlier per-txn
                         // accountbase mutations within the same block.
                         // Committing would leave corrupted state that
@@ -137,10 +140,12 @@ impl LedgerBlockService {
                         warn!(
                             round = round,
                             error = %e,
-                            "apply_block failed; rolling back this round"
+                            "apply_block failed (apply_block_executing_app_calls); rolling back this round"
                         );
                         let _ = ledger.rollback_block();
-                        return Err(format!("apply_block: {e}"));
+                        return Err(format!(
+                            "apply_block failed (apply_block_executing_app_calls): {e}"
+                        ));
                     }
                 }
                 ledger.set_current_round(Round(round));
@@ -1085,5 +1090,63 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    fn relay_service(ledger: SqliteLedger) -> LedgerBlockService {
+        LedgerBlockService {
+            ledger: Mutex::new(ledger),
+        }
+    }
+
+    /// Issue #1709: the relay's block-ingest path applies an `appl` block by
+    /// running the AVM (like the follow path), so the box the program writes
+    /// exists afterwards; Replay mode would never create it.
+    #[test]
+    fn store_block_and_cert_executes_appl_blocks() {
+        use crate::commands::test_support as fx;
+        let bytes = algo_codec::encode_block(&fx::block()).expect("encode");
+        let svc = relay_service(fx::ledger());
+        svc.store_block_and_cert(1, &bytes, b"cert").expect("store");
+        let ledger = svc.ledger.lock().unwrap();
+        assert_eq!(
+            ledger.get_box(fx::APP_ID, fx::BOX_NAME),
+            Some(b"hello".to_vec()),
+            "relay must Execute appl blocks, not Replay them"
+        );
+    }
+
+    /// A pay-only block keeps the cheap Replay path through the relay and
+    /// still applies as before.
+    #[test]
+    fn store_block_and_cert_applies_pay_only_blocks() {
+        use crate::commands::test_support as fx;
+        let block = fx::pay_block();
+        assert!(!algo_ledger::apply::block_has_app_call(&block));
+        let bytes = algo_codec::encode_block(&block).expect("encode");
+        let svc = relay_service(fx::ledger());
+        svc.store_block_and_cert(1, &bytes, b"cert").expect("store");
+        let ledger = svc.ledger.lock().unwrap();
+        assert_eq!(
+            ledger.get_or_default_account(&fx::receiver()).micro_algos,
+            1_000_000
+        );
+    }
+
+    /// An `appl` block whose approval program rejects fails the apply: the
+    /// relay returns Err and rolls the round back (no box, no stored block,
+    /// round not advanced).
+    #[test]
+    fn store_block_and_cert_rolls_back_a_failing_appl_block() {
+        use crate::commands::test_support as fx;
+        let bytes = algo_codec::encode_block(&fx::block()).expect("encode");
+        let svc = relay_service(fx::rejecting_ledger());
+        let err = svc
+            .store_block_and_cert(1, &bytes, b"cert")
+            .expect_err("a rejecting appl block must fail the round");
+        assert!(err.contains("apply_block failed"), "{err}");
+        let ledger = svc.ledger.lock().unwrap();
+        assert_eq!(ledger.get_box(fx::APP_ID, fx::BOX_NAME), None);
+        assert!(ledger.get_block_data(1).unwrap().is_none());
+        assert_eq!(ledger.current_round(), Round(0));
     }
 }

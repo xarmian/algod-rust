@@ -608,7 +608,10 @@ pub async fn run_stateful(
             eval_delta_stats += block_stats;
             result
         } else {
-            algo_ledger::apply_block(&mut store, block)
+            // go re-evaluates every app call on every path, so blocks with an
+            // `appl` run the AVM (Execute) like the follow path; blocks without
+            // one keep the cheap recorded-delta Replay path (issue #1709).
+            algo_ledger::apply::apply_block_executing_app_calls(&mut store, block)
         };
         match apply_result {
             Ok(()) => {
@@ -967,5 +970,45 @@ fn build_avm_report_stats(stats: &algo_ledger::EvalDeltaStats) -> AvmReportStats
         logicsig_failed: stats.logicsig_failed,
         opcode_coverage,
         mismatch_categories,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::commands::test_support as fx;
+    use algo_ledger::LedgerStore;
+
+    /// Issue #1709: the default (non `--avm-execute`) replay applies an
+    /// `appl` block by running the AVM, so the box the program writes
+    /// exists afterwards (Replay mode would never create it). Uses the exact
+    /// entry `run_stateful` calls.
+    #[test]
+    fn default_replay_executes_appl_blocks() {
+        let mut store = fx::ledger();
+        store.begin_block().unwrap();
+        algo_ledger::apply::apply_block_executing_app_calls(&mut store, &fx::block())
+            .expect("apply");
+        store.commit_block().unwrap();
+        assert_eq!(
+            store.get_box(fx::APP_ID, fx::BOX_NAME),
+            Some(b"hello".to_vec()),
+            "appl block must be Executed, not Replayed"
+        );
+    }
+
+    /// A pay-only block has no appl, so it keeps the cheap Replay path and
+    /// still applies as before (balances move).
+    #[test]
+    fn default_replay_applies_pay_only_blocks_on_the_replay_path() {
+        let block = fx::pay_block();
+        assert!(!algo_ledger::apply::block_has_app_call(&block));
+        let mut store = fx::ledger();
+        store.begin_block().unwrap();
+        algo_ledger::apply::apply_block_executing_app_calls(&mut store, &block).expect("apply");
+        store.commit_block().unwrap();
+        assert_eq!(
+            store.get_or_default_account(&fx::receiver()).micro_algos,
+            1_000_000
+        );
     }
 }

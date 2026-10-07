@@ -40,6 +40,8 @@ pub mod relay;
 pub mod replay;
 pub mod stateproof_service;
 pub mod sync;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod validate;
 
 /// Resolve a network name to an (algod_url, algod_token, network_name) tuple.
