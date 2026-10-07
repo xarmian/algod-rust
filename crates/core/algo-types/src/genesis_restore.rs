@@ -43,12 +43,27 @@
 //!
 //! go rejects a stripped txn that still carries a non-empty `gen`/`gh`, or
 //! `hgh` where `RequireGenesisHash` obviates it
-//! ([`GenesisRestoreRule::check_stripped`], enforced by
-//! `algo_validate::validate_block`, i.e. where proposals and certified blocks
-//! enter; blocks applied via catchup/sync are certificate-verified).
+//! ([`GenesisRestoreRule::check_stripped`] / `check_payset`, issue #1727).
+//! algod-rust enforces it at both places a payset is consumed: in
+//! `algo_validate::validate_block` (proposals and certified blocks, early
+//! return like go failing at decode) and at the ledger apply boundary
+//! (`algo_ledger`'s `apply_block_impl_ex`, every apply mode, like go's
+//! `DecodePaysetGroups` failing the whole block). Blocks a node stored
+//! before this check existed were validated by their certificate at store
+//! time and only re-enter through apply; go's own node would have refused
+//! to decode a violating block, so none of them can violate the rule --
+//! a mainnet participation soak with the apply-side check (run
+//! 37573102169) replayed 11,500 app-call proposals with zero rejections.
 //! [`GenesisRestoreRule::restore`] itself is tolerant and only fills fields
 //! that are empty/zero, which makes it idempotent. The inverse, go's
 //! `EncodeSignedTxn`, is [`GenesisRestoreRule::strip`].
+//!
+//! Client-submitted transactions are go `SignedTxn`s, which have no
+//! `hgi`/`hgh` at all (`data/transactions/signedtxn.go`); go's msgp decoder
+//! rejects the unknown field (`data/transactions/msgp_gen.go:5644-5647`,
+//! `msgp.ErrNoField`), so REST submit answers 400 and the gossip `TX`
+//! handler drops the message. [`reject_in_block_flags`] is that check for
+//! the decoders here, which accept both shapes into one struct.
 //!
 //! A block whose `current_protocol` is not in the consensus table cannot
 //! occur on a supported network; it is treated as hash-requiring (modern),
@@ -65,16 +80,54 @@ pub fn protocol_requires_genesis_hash(proto: &str) -> bool {
     consensus_params_for_version(proto).is_none_or(|p| p.require_genesis_hash)
 }
 
-/// go's `SignedTxn` (`data/transactions/signedtxn.go`) has no `hgi`/`hgh`:
-/// only `SignedTxnInBlock` carries them. algod-rust decodes both shapes
-/// into [`SignedTransaction`], so a client (REST submit, gossip `TX`) can
-/// set the in-block-only flags on a transaction it submits. Call this on
-/// every externally decoded group before pool admission so such flags are
-/// ignored exactly as go ignores them (it has nowhere to decode them to):
-/// otherwise a txn signed over `gen` but submitted with `gen` omitted and
-/// `hgi` set would have `gen` restored from the header, verify, and be
-/// proposed in a stripped form (`gen=""`, `hgi=false`) that no longer
-/// verifies. Never call it on a block payset, whose flags are genuine.
+/// A client-submitted transaction carried an in-block-only field. go's
+/// `SignedTxn` (`data/transactions/signedtxn.go`) has no `hgi`/`hgh`, so its
+/// msgp decoder fails the whole decode with `msgp.ErrNoField`
+/// (`data/transactions/msgp_gen.go:5644-5647`; message
+/// `"Unknown field: <name>"`, msgp `errors.go:22-26`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InBlockOnlyFieldError {
+    /// Position of the offending transaction in the submitted group.
+    pub index: usize,
+    /// The msgpack key: `"hgi"` or `"hgh"`.
+    pub field: &'static str,
+}
+
+impl std::fmt::Display for InBlockOnlyFieldError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "txn {}: Unknown field: {}", self.index, self.field)
+    }
+}
+
+impl std::error::Error for InBlockOnlyFieldError {}
+
+/// go's `SignedTxn` has no `hgi`/`hgh` (only `SignedTxnInBlock` does) and
+/// its decoder rejects them as unknown fields. algod-rust decodes both
+/// shapes into [`SignedTransaction`], so every client decode boundary (REST
+/// submit, gossip `TX`, pool admission) runs this instead: the first
+/// transaction carrying either flag fails the group, matching go's 400 /
+/// dropped message. Never call it on a block payset, whose flags are
+/// genuine.
+#[inline]
+pub fn reject_in_block_flags(txgroup: &[SignedTransaction]) -> Result<(), InBlockOnlyFieldError> {
+    for (index, stx) in txgroup.iter().enumerate() {
+        let field = if stx.has_genesis_id {
+            "hgi"
+        } else if stx.has_genesis_hash {
+            "hgh"
+        } else {
+            continue;
+        };
+        return Err(InBlockOnlyFieldError { index, field });
+    }
+    Ok(())
+}
+
+/// Normalise a group for txid/signature work: drop the in-block-only
+/// flags so the restored form equals what the stripped STIB form restores
+/// to (strip then restore sets `hgi`/`hgh` from scratch). Admission policy
+/// is [`reject_in_block_flags`]; this only keeps the two txid computations
+/// of a block proposer in agreement. Never call it on a block payset.
 #[inline]
 pub fn clear_in_block_flags(txgroup: &mut [SignedTransaction]) {
     for stx in txgroup {
@@ -155,6 +208,20 @@ impl<'a> GenesisRestoreRule<'a> {
         }
     }
 
+    /// Rule for a header's genesis id/hash from already-resolved protocol
+    /// params (`RequireGenesisHash` and `SupportSignedTxnInBlock`): the
+    /// proposer's `EncodeSignedTxn` side and the validator's
+    /// `DecodeSignedTxn` side build from the same params and so agree.
+    pub fn with_params(
+        genesis_id: &'a str,
+        genesis_hash: &'a [u8; 32],
+        params: &ConsensusParams,
+    ) -> Self {
+        let mut rule = Self::new(genesis_id, genesis_hash, params.require_genesis_hash);
+        rule.supports_stripped = params.support_signed_txn_in_block;
+        rule
+    }
+
     /// Rule for `block`'s header and `current_protocol` (one protocol lookup).
     pub fn for_block(block: &'a Block) -> Self {
         Self::for_params(
@@ -168,13 +235,10 @@ impl<'a> GenesisRestoreRule<'a> {
     /// stripped-supporting, see the module docs), so a caller that needs the
     /// params anyway does ONE lookup per block.
     pub fn for_params(params: Option<&ConsensusParams>, block: &'a Block) -> Self {
-        let mut rule = Self::new(
-            &block.genesis_id,
-            &block.genesis_hash,
-            params.is_none_or(|p| p.require_genesis_hash),
-        );
-        rule.supports_stripped = params.is_none_or(|p| p.support_signed_txn_in_block);
-        rule
+        match params {
+            Some(p) => Self::with_params(&block.genesis_id, &block.genesis_hash, p),
+            None => Self::new(&block.genesis_id, &block.genesis_hash, true),
+        }
     }
 
     /// Copy of `payset` with every txn's genesis fields restored.
@@ -544,9 +608,49 @@ mod tests {
             stripped(GID, GH, true, true),
             stripped("", [0; 32], true, false),
         ];
+        assert_eq!(
+            reject_in_block_flags(&group),
+            Err(InBlockOnlyFieldError {
+                index: 0,
+                field: "hgi"
+            })
+        );
         clear_in_block_flags(&mut group);
         assert_eq!(group[0], stripped(GID, GH, false, false));
         assert_eq!(group[1], stripped("", [0; 32], false, false));
+        assert_eq!(reject_in_block_flags(&group), Ok(()));
+    }
+
+    #[test]
+    fn reject_in_block_flags_names_first_offender_like_msgp_err_no_field() {
+        let group = vec![
+            stripped(GID, GH, false, false),
+            stripped("", [0; 32], false, true),
+        ];
+        let err = reject_in_block_flags(&group).unwrap_err();
+        assert_eq!(err.index, 1);
+        assert_eq!(err.to_string(), "txn 1: Unknown field: hgh");
+    }
+
+    #[test]
+    fn with_params_and_for_params_agree() {
+        let gh = GH;
+        for proto in [CONSENSUS_V10, CONSENSUS_V15, CONSENSUS_V41] {
+            let params = consensus_params_for_version(proto).unwrap();
+            let b = block(proto, true, false);
+            let a = GenesisRestoreRule::with_params(GID, &gh, &params);
+            let c = GenesisRestoreRule::for_params(Some(&params), &b);
+            for stx in [
+                stripped("", [0; 32], true, false),
+                stripped(GID, GH, false, false),
+            ] {
+                assert_eq!(*a.restored_txn(&stx), *c.restored_txn(&stx), "{proto}");
+                let (mut x, mut y) = (stx.clone(), stx);
+                a.strip(&mut x);
+                c.strip(&mut y);
+                assert_eq!(x, y, "{proto}");
+            }
+        }
     }
 
     /// `SupportSignedTxnInBlock` is modelled on its own: a modern protocol

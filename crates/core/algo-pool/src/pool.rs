@@ -723,9 +723,15 @@ impl TransactionPool {
     /// 6. Feed to evaluator
     /// 7. Store in remembered
     /// 8. Flush remembered to pending
-    pub fn remember(&self, mut tx_group: Vec<SignedTransaction>) -> Result<(), PoolError> {
-        // Client txns are go `SignedTxn`s: no hgi/hgh (issue #1727).
-        algo_types::genesis_restore::clear_in_block_flags(&mut tx_group);
+    pub fn remember(&self, tx_group: Vec<SignedTransaction>) -> Result<(), PoolError> {
+        // Client txns are go `SignedTxn`s, which have no hgi/hgh: the single
+        // internal choke point for the in-block-only flags (issue #1727).
+        if let Err(e) = algo_types::genesis_restore::reject_in_block_flags(&tx_group) {
+            return Err(PoolError::InBlockOnlyField {
+                index: e.index,
+                field: e.field,
+            });
+        }
         // Capacity check (before acquiring mu, matching Go).
         self.check_pending_queue_size(&tx_group)?;
 
@@ -1331,6 +1337,28 @@ mod tests {
     }
 
     /// Create a test transaction with a unique note (to produce distinct txn IDs).
+    /// Round-3 review of #1727: the pool is the single internal choke point
+    /// for the in-block-only `hgi`/`hgh` flags (go's `SignedTxn` has none,
+    /// `data/transactions/signedtxn.go`): a group carrying one is rejected,
+    /// never admitted with the flag cleared.
+    #[test]
+    fn remember_rejects_in_block_only_flags() {
+        let pool = make_pool_with_evaluator(10);
+        for (hgi, hgh) in [(true, false), (false, true)] {
+            let mut stx = make_test_txn(1);
+            stx.has_genesis_id = hgi;
+            stx.has_genesis_hash = hgh;
+            let err = pool.remember(vec![make_test_txn(2), stx]).unwrap_err();
+            assert!(
+                matches!(err, PoolError::InBlockOnlyField { index: 1, .. }),
+                "{err:?}"
+            );
+            assert_eq!(pool.pending_count(), 0);
+        }
+        pool.remember(vec![make_test_txn(3)]).unwrap();
+        assert_eq!(pool.pending_count(), 1);
+    }
+
     fn make_test_txn(note_byte: u8) -> SignedTransaction {
         let mut txn = SignedTransaction::default();
         txn.txn.txn_type = TxnType::Pay;

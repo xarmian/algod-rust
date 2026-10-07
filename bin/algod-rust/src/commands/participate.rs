@@ -1374,12 +1374,19 @@ impl SimpleBlockEvaluator {
     /// and txid computation.
     fn restore_genesis_fields(&self, stx: &mut algo_types::SignedTransaction) {
         // Single shared, protocol-aware rule (go's DecodeSignedTxn; #1704).
-        algo_types::genesis_restore::restore_genesis_fields_with(
-            stx,
+        self.genesis_rule().restore(stx);
+    }
+
+    /// This block's genesis strip/restore rule, from the evaluator's
+    /// already-resolved consensus params (no protocol lookup) so the
+    /// proposer's `EncodeSignedTxn` side agrees with the validator's
+    /// `for_params` rule, pre-v11 included (issue #1727).
+    fn genesis_rule(&self) -> algo_types::genesis_restore::GenesisRestoreRule<'_> {
+        algo_types::genesis_restore::GenesisRestoreRule::with_params(
             &self.hdr.genesis_id,
             &self.hdr.genesis_hash,
-            self.consensus_params.require_genesis_hash,
-        );
+            &self.consensus_params,
+        )
     }
 
     /// Perform stateless validation only (well-formedness, group ID, fees,
@@ -1508,10 +1515,11 @@ impl SimpleBlockEvaluator {
         // from block.rs.
         //
         // Pool/client transactions are go `SignedTxn`s, which carry no
-        // `hgi`/`hgh` (`data/transactions/signedtxn.go`): the flags only
-        // exist on `SignedTxnInBlock`. Whatever a client set is dropped here
-        // (issue #1727 review), so `gen` is restored only when the protocol
-        // requires it, never because a submitter asked for it.
+        // `hgi`/`hgh` (`data/transactions/signedtxn.go`); the pool rejects
+        // any that arrive flagged. Normalising here as well keeps this
+        // restored copy -- the one `validate_group` checks txids on and
+        // `transaction_group` records them from -- identical to what the
+        // block's stripped STIB form restores to (issue #1727).
         let mut restored: Vec<algo_types::SignedTransaction> = txgroup.to_vec();
         algo_types::genesis_restore::clear_in_block_flags(&mut restored);
         for stx in &mut restored {
@@ -1574,10 +1582,14 @@ impl SimpleBlockEvaluator {
     /// 7. Lease uniqueness check (in-block overlay + ledger snapshot)
     /// 8. Rekey/auth-addr validation (authorizer matches ledger's auth_addr)
     /// 9. Sender balance precheck (fee + amount against overlay/snapshot)
+    ///
+    /// Returns the group with genesis fields restored -- the exact
+    /// transactions whose txids were checked -- so `transaction_group`
+    /// records those same txids.
     fn validate_group(
         &mut self,
         txgroup: &[algo_types::SignedTransaction],
-    ) -> Result<(), algo_error::AlgoError> {
+    ) -> Result<Vec<algo_types::SignedTransaction>, algo_error::AlgoError> {
         // Run all stateless checks first; reuse the restored (genesis fields
         // populated) copies rather than cloning + restoring the group again.
         let restored = self.validate_group_stateless_inner(txgroup)?;
@@ -1705,7 +1717,7 @@ impl SimpleBlockEvaluator {
             }
         }
 
-        Ok(())
+        Ok(restored)
     }
 }
 
@@ -1842,7 +1854,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         &mut self,
         txgroup: &[algo_types::SignedTransaction],
     ) -> Result<(), algo_error::AlgoError> {
-        self.validate_group(txgroup)?;
+        let restored = self.validate_group(txgroup)?;
 
         // Convert each transaction to STIB (SignedTxnInBlock) format:
         // strip genesis fields and set has_genesis_id / has_genesis_hash flags.
@@ -1851,6 +1863,8 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         // Before stripping, validate that genesis fields match the block
         // header. Go returns an error on mismatch — we do the same.
         let mut stibs: Vec<algo_types::SignedTransaction> = Vec::with_capacity(txgroup.len());
+        // Resolved once per group from the evaluator's consensus params.
+        let genesis_rule = self.genesis_rule();
         for stx in txgroup {
             let mut stib = stx.clone();
 
@@ -1880,14 +1894,10 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             }
 
             // Build the in-block form from scratch (go `EncodeSignedTxn`):
-            // discards leaked client-supplied hgi/hgh, strips the matched
-            // fields (verified above) and sets the flags per the rule.
-            algo_types::genesis_restore::GenesisRestoreRule::new(
-                &self.hdr.genesis_id,
-                &self.hdr.genesis_hash,
-                self.consensus_params.require_genesis_hash,
-            )
-            .strip(&mut stib);
+            // discards any hgi/hgh, strips the matched fields (verified
+            // above) and sets the flags per the rule; a no-op copy on a
+            // pre-v11 protocol.
+            genesis_rule.strip(&mut stib);
 
             stibs.push(stib);
         }
@@ -1932,13 +1942,11 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         //
         // All mutations use the `_tracked` variants so the checkpoint
         // records what to undo on rollback.
-        for stx in txgroup {
-            // Restore genesis fields for txid computation.
-            let mut restored = stx.clone();
-            self.restore_genesis_fields(&mut restored);
-
-            // Record transaction ID.
-            let txid = compute_txid(&restored.txn);
+        for (stx, restored_stx) in txgroup.iter().zip(&restored) {
+            // Record the transaction ID `validate_group` checked: computed
+            // over the restored copy, i.e. what the block's STIB form
+            // restores to (issue #1727).
+            let txid = compute_txid(&restored_stx.txn);
             self.overlay.record_txid_tracked(txid, &mut checkpoint);
 
             // Record lease if non-zero.
@@ -8879,6 +8887,66 @@ mod tests {
         assert!(!block.payset[0].has_genesis_id);
         let result = validate_proposal(&block);
         assert!(result.is_valid, "{:?}", result.errors);
+    }
+
+    /// Round-3 review of #1727: the overlay must record the txid the block
+    /// will carry (restored from the stripped STIB form), not one computed
+    /// from the raw submission with a leaked `hgi`; otherwise the second
+    /// copy of the same txn passes `check_txid` and bypasses the txtail.
+    #[test]
+    fn duplicate_txn_with_leaked_flag_is_rejected_across_groups() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(132);
+        let (receiver, _) = test_keypair(133);
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+        let mut txn = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100).txn;
+        txn.genesis_id = String::new();
+        let sig = sign_txn(&txn, &key);
+        let stx = SignedTransaction {
+            txn,
+            sig,
+            has_genesis_id: true, // leaked in-block-only flag
+            ..Default::default()
+        };
+        eval.transaction_group(std::slice::from_ref(&stx)).unwrap();
+        let err = eval.transaction_group(&[stx]).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate transaction ID"),
+            "{err}"
+        );
+        assert_eq!(eval.pay_set_size(), 1);
+    }
+
+    /// Round-3 review of #1727: the proposer's strip rule is derived from the
+    /// resolved consensus params, so on a pre-v11 protocol (no
+    /// `SupportSignedTxnInBlock`) it copies the txn untouched like go's
+    /// `EncodeSignedTxn`, agreeing with the validator's `for_params` rule.
+    #[test]
+    fn proposer_does_not_strip_on_pre_v11_protocol() {
+        let ledger = test_ledger();
+        let params = consensus_params_for_version(algo_types::consensus::CONSENSUS_V10).unwrap();
+        assert!(!params.support_signed_txn_in_block);
+        let (sender, key) = test_keypair(134);
+        let (receiver, _) = test_keypair(135);
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+        let mut txn = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100).txn;
+        txn.genesis_hash = [0u8; 32]; // v10: no genesis hash support
+        let sig = sign_txn(&txn, &key);
+        let stx = SignedTransaction {
+            txn,
+            sig,
+            ..Default::default()
+        };
+        eval.transaction_group(&[stx]).unwrap();
+        let block = eval.generate_block(&[]).unwrap();
+        let stib = &block.payset[0];
+        assert_eq!(
+            stib.txn.genesis_id, "test-v1",
+            "pre-v11: txn copied untouched"
+        );
+        assert!(!stib.has_genesis_id);
+        assert!(!stib.has_genesis_hash);
     }
 
     /// Mirrors go-algorand's `TestEncodeDecodeSignedTxn`

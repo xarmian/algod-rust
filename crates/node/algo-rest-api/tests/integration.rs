@@ -6387,6 +6387,69 @@ async fn raw_transaction_returns_txid() {
     assert_eq!(json["txId"].as_str().unwrap(), expected_txid);
 }
 
+/// Round-3 review of #1727: go's `SignedTxn` msgp decoder rejects unknown
+/// fields (`data/transactions/msgp_gen.go:5644-5647`, `msgp.ErrNoField` =>
+/// "Unknown field: hgi"), and `decodeTxGroup` returns that error straight
+/// to `badRequest` (`daemon/algod/api/server/v2/handlers.go:1172-1183`,
+/// `:1259-1262`). The in-block-only `hgi`/`hgh` are therefore a 400 on
+/// submit, not silently ignored.
+#[tokio::test]
+async fn raw_transaction_in_block_only_field_returns_400() {
+    for (hgi, hgh, field) in [(true, false, "hgi"), (false, true, "hgh")] {
+        let node = MockNode::synced();
+        let server = TestServer::start(node).await;
+
+        let mut stxn = make_test_signed_txn();
+        stxn.has_genesis_id = hgi;
+        stxn.has_genesis_hash = hgh;
+        // The client (`SignedTxn`) encoder never emits the flags; a
+        // misbehaving client would send the in-block (STIB) shape.
+        let body = algo_codec::canonical_encode_signed_txn_in_block(&stxn);
+
+        let resp = server
+            .client
+            .post(server.url("/v2/transactions"))
+            .header("X-Algo-API-Token", &server.api_token)
+            .header("Content-Type", "application/x-binary")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "{field}");
+        let json: serde_json::Value = resp.json().await.unwrap();
+        let msg = json["message"].as_str().unwrap();
+        assert!(
+            msg.contains("could not decode transaction")
+                && msg.contains(&format!("Unknown field: {field}")),
+            "{msg}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn raw_transaction_async_in_block_only_field_returns_400() {
+    let node = mock_with_experimental_and_developer_api();
+    let server = TestServer::start(node).await;
+
+    let mut stxn = make_test_signed_txn();
+    stxn.has_genesis_id = true;
+    let body = algo_codec::canonical_encode_signed_txn_in_block(&stxn);
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions/async"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/x-binary")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    let msg = json["message"].as_str().unwrap();
+    assert!(msg.contains("Unknown field: hgi"), "{msg}");
+}
+
 #[tokio::test]
 async fn raw_transaction_requires_auth() {
     let node = MockNode::synced();
