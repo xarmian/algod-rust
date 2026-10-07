@@ -242,7 +242,7 @@ state written by an `appl` transaction was stored with the wrong type or value.
 Nodes that follow with Execute mode (the node follow path since #1665, and
 `apply_block_caching_delta`) re-run the AVM and are unaffected. A ledger
 database built by Replay of `appl` blocks before this change (the pre-#1665
-follow path, `relay`, `replay` without `--avm-execute`) should be resynced from
+follow path, `relay`, `replay` without `--avm-execute`; `relay` and `replay` now Execute `appl` blocks, issue #1709) should be resynced from
 a catchpoint. Dev-mode ledgers are not affected, verified in code:
 `encode_eval_delta` results (outer `dt` and inner `itx[*].dt`) only land in the
 in-memory `ApplyData` returned by the Execute apply

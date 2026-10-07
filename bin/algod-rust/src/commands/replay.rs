@@ -389,6 +389,23 @@ fn collect_eval_delta_addresses(ed: &algo_ledger::EvalDelta, addrs: &mut HashSet
     }
 }
 
+/// Apply one stored block for the default (non `--avm-execute`) replay.
+///
+/// go-algorand has no recorded-delta fast path: `ledger/eval` re-runs every
+/// application call for every block it applies. Plain `apply_block` is
+/// `ApplyMode::Replay` (trusts the recorded `dt`), which can never observe
+/// box mutations and is only as good as the delta parser, so blocks with an
+/// `appl` go through [`algo_ledger::apply::apply_block_executing_app_calls`] (Execute),
+/// exactly like the follow/catch-up paths. Blocks without an `appl` keep the
+/// cheap Replay path. `--avm-execute` additionally compares the evaluated
+/// deltas with the recorded ones (issue #1709).
+fn apply_replay_block<L: algo_ledger::LedgerStore>(
+    store: &mut L,
+    block: &algo_types::Block,
+) -> Result<(), algo_error::AlgoError> {
+    algo_ledger::apply::apply_block_executing_app_calls(store, block)
+}
+
 /// Stateful replay: applies blocks to a ledger and optionally compares against
 /// a Go node for conformance.
 #[allow(clippy::too_many_arguments)]
@@ -608,7 +625,7 @@ pub async fn run_stateful(
             eval_delta_stats += block_stats;
             result
         } else {
-            algo_ledger::apply_block(&mut store, block)
+            apply_replay_block(&mut store, block)
         };
         match apply_result {
             Ok(()) => {
@@ -967,5 +984,106 @@ fn build_avm_report_stats(stats: &algo_ledger::EvalDeltaStats) -> AvmReportStats
         logicsig_failed: stats.logicsig_failed,
         opcode_coverage,
         mismatch_categories,
+    }
+}
+
+/// Shared fixture for the issue #1709 tests (also used by `relay.rs`): a
+/// block whose only transaction is an app call that writes a box. The
+/// recorded `dt` (EvalDelta) is empty and carries no box field, so a block
+/// applied purely from recorded deltas (`ApplyMode::Replay`) can never
+/// create the box; only AVM execution does.
+#[cfg(test)]
+pub(crate) mod appl_block_fixture {
+    use algo_ledger::{LedgerStore, SqliteLedger};
+    use algo_types::consensus::CONSENSUS_V41;
+    use algo_types::{AccountData, Address, Block, BoxRef, Round, SignedTransaction};
+
+    pub const APP_ID: u64 = 1001;
+    pub const BOX_NAME: &[u8] = b"bx";
+
+    pub fn sender() -> Address {
+        Address([1u8; 32])
+    }
+
+    /// In-memory ledger with a funded sender and a deployed box-writing app.
+    pub fn ledger() -> SqliteLedger {
+        let mut l = SqliteLedger::open_in_memory().expect("in-memory ledger");
+        l.set_fee_sink(Address([0xFE; 32]));
+        l.set_account(
+            &sender(),
+            AccountData {
+                micro_algos: 100_000_000,
+                ..Default::default()
+            },
+        );
+        l.set_account(
+            &Address(algo_ledger::avm_context::app_address(APP_ID)),
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+        let program = algo_avm::assembler::assemble_string(
+            "#pragma version 8\nbyte \"bx\"\nbyte \"hello\"\nbox_put\nint 1\n",
+        )
+        .expect("assemble")
+        .program;
+        l.set_app_params(
+            APP_ID,
+            algo_types::AppParams {
+                creator: sender(),
+                approval_program: program,
+                clear_state_program: vec![0x08, 0x81, 0x01],
+                ..Default::default()
+            },
+        );
+        l
+    }
+
+    pub fn block() -> Block {
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = "appl".into();
+        stx.txn.sender = sender();
+        stx.txn.fee = 1000;
+        stx.txn.first_valid = Round(1);
+        stx.txn.last_valid = Round(1000);
+        stx.txn.application_id = APP_ID;
+        stx.txn.boxes = Some(vec![BoxRef {
+            index: 0,
+            name: Some(serde_bytes::ByteBuf::from(BOX_NAME.to_vec())),
+        }]);
+        stx.has_genesis_id = true;
+        Block {
+            round: Round(1),
+            genesis_id: "test-net-v1".to_string(),
+            genesis_hash: [7u8; 32],
+            fee_sink: Address([0xFE; 32]),
+            current_protocol: CONSENSUS_V41.to_string(),
+            txn_counter: 1001,
+            payset: vec![stx],
+            ..Block::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::appl_block_fixture as fx;
+    use super::*;
+
+    /// Issue #1709: the default (non `--avm-execute`) replay applies an
+    /// `appl` block by running the AVM, so the box the program writes
+    /// exists afterwards (Replay mode would never create it).
+    #[test]
+    fn default_replay_executes_appl_blocks() {
+        let mut store = fx::ledger();
+        store.begin_block().unwrap();
+        apply_replay_block(&mut store, &fx::block()).expect("apply");
+        store.commit_block().unwrap();
+        assert_eq!(
+            store.get_box(fx::APP_ID, fx::BOX_NAME),
+            Some(b"hello".to_vec()),
+            "appl block must be Executed, not Replayed"
+        );
     }
 }

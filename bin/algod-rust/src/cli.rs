@@ -166,7 +166,9 @@ pub enum Commands {
         #[arg(long)]
         compare_trie_db: Option<PathBuf>,
 
-        /// Enable AVM execution mode (run TEAL programs instead of replaying EvalDeltas).
+        /// Also compare the AVM-evaluated EvalDeltas against the recorded ones and report
+        /// mismatch statistics. Blocks containing an application call are always executed
+        /// (like go-algorand), with or without this flag (issue #1709).
         #[arg(long)]
         avm_execute: bool,
     },
