@@ -1613,11 +1613,37 @@ pub(crate) fn apply_block_impl_ex<L: crate::store_trait::LedgerStore>(
     // Callers hand in stripped blocks by convention; storage does not
     // re-normalise.
     let stored_block = block;
-    // The genesis-restore rule is resolved ONCE per block (one protocol
+    // Look up consensus parameters from the block's protocol version: the
+    // ONE lookup per block, shared by the genesis-restore rule, the apply
+    // context below and the txtail builder at the end.
+    let consensus =
+        consensus_params_for_version(&block.current_protocol).ok_or_else(|| AlgoError::Ledger {
+            message: format!("unknown protocol version: {}", block.current_protocol),
+        })?;
+    // The genesis-restore rule is built from those params (no second
     // lookup) and shared by the Execute-mode evaluation copy below and the
     // txtail builder at the end (issue #1707), which hashes the stripped
     // `stored_block` with the restored genesis fields as overrides.
-    let genesis_rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(stored_block);
+    let genesis_rule =
+        algo_types::genesis_restore::GenesisRestoreRule::for_params(Some(&consensus), stored_block);
+    // go's `DecodePaysetGroups` fails the whole block on a payset entry that
+    // violates `DecodeSignedTxn`'s stripped-form rules (issue #1727): one
+    // pass of pure compares on the rule just resolved. A payset still
+    // carrying gen/gh is what a Rust-only localnet produced between #1665
+    // and #1703 (issue #1703): name that cause and the remedy.
+    if let Err((index, error)) = genesis_rule.check_payset(&stored_block.payset) {
+        use algo_types::genesis_restore::GenesisFieldError;
+        let hint = match error {
+            GenesisFieldError::GenesisIdNotEmpty(_) | GenesisFieldError::GenesisHashNotEmpty => {
+                " (payset txn carries gen/gh: blocks produced by algod-rust between #1665 and \
+                 #1703 are affected; resync from genesis/catchpoint)"
+            }
+            GenesisFieldError::HasGenesisHashObviated => "",
+        };
+        return Err(AlgoError::Ledger {
+            message: format!("payset txn {index}: {error}{hint}"),
+        });
+    }
     let restored_block;
     let block = if mode == ApplyMode::Execute {
         match block_with_restored_genesis_fields(block, &genesis_rule) {
@@ -1665,12 +1691,6 @@ pub(crate) fn apply_block_impl_ex<L: crate::store_trait::LedgerStore>(
     if block.genesis_hash.len() == 32 {
         gh.copy_from_slice(&block.genesis_hash);
     }
-
-    // Look up consensus parameters from the block's protocol version.
-    let consensus =
-        consensus_params_for_version(&block.current_protocol).ok_or_else(|| AlgoError::Ledger {
-            message: format!("unknown protocol version: {}", block.current_protocol),
-        })?;
 
     // Initialize txn_counter from the store's current value (= previous block's
     // TxnCounter). This is the base for creatable ID generation.
@@ -8604,6 +8624,42 @@ mod tests {
             congestion_tax: 0,
             payset: vec![stx],
         }
+    }
+
+    /// Issue #1727: go's `DecodePaysetGroups` fails the whole block on a
+    /// payset entry that violates `DecodeSignedTxn`'s stripped-form rules,
+    /// so the apply boundary rejects it too (same single pass of compares
+    /// as `validate_block`, on the rule already resolved once per block).
+    #[test]
+    fn apply_rejects_payset_txn_violating_decode_signed_txn_rules() {
+        let fee_sink = Address([3u8; 32]);
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let accounts = [(sender, 10_000_000), (receiver, 1_000_000), (fee_sink, 0)];
+
+        let mut state = make_state_with_accounts(&accounts, fee_sink);
+        let mut block = make_test_block(fee_sink);
+        block.payset[0].txn.genesis_hash = [9u8; 32];
+        let err = apply_block(&mut state, &block).unwrap_err().to_string();
+        assert!(err.contains("GenesisHash not empty"), "{err}");
+        // A block produced by algod-rust between #1665 and #1703 carried
+        // gen/gh in its payset: the error names that cause and the remedy.
+        assert!(
+            err.contains("between #1665 and #1703") && err.contains("resync"),
+            "{err}"
+        );
+
+        let mut state = make_state_with_accounts(&accounts, fee_sink);
+        let mut block = make_test_block(fee_sink);
+        block.payset[0].has_genesis_hash = true; // obviated on V41
+        let err = apply_block(&mut state, &block).unwrap_err().to_string();
+        assert!(err.contains("HasGenesisHash"), "{err}");
+
+        let mut state = make_state_with_accounts(&accounts, fee_sink);
+        let mut block = make_test_block(fee_sink);
+        block.payset[0].txn.genesis_id = "gid".into();
+        let err = apply_block(&mut state, &block).unwrap_err().to_string();
+        assert!(err.contains("GenesisID <gid> not empty"), "{err}");
     }
 
     #[test]

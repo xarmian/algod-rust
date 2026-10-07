@@ -693,6 +693,19 @@ pub enum TxTagError {
     #[error("trailing bytes after TX group")]
     TrailingBytes,
 
+    /// A transaction carried an in-block-only field (`hgi`/`hgh`), which
+    /// go's `SignedTxn` decoder rejects as unknown (`msgp.ErrNoField`,
+    /// `data/transactions/msgp_gen.go:5644-5647`); `decodeMsg` flags the
+    /// message invalid (`data/txHandler.go:674-679`) and the peer is
+    /// disconnected (`:772-776`).
+    #[error("txn {index}: Unknown field: {field}")]
+    InBlockOnlyField {
+        /// Position within the decoded group.
+        index: usize,
+        /// `"hgi"` or `"hgh"`.
+        field: &'static str,
+    },
+
     /// msgpack decode failed.
     #[error("msgpack decode failed at offset {offset}: {source}")]
     Decode {
@@ -753,6 +766,15 @@ pub fn decode_tx_message(data: &[u8]) -> Result<Vec<SignedTransaction>, TxTagErr
 
     if group.is_empty() {
         return Err(TxTagError::EmptyGroup);
+    }
+
+    // go decodes gossip txns as `SignedTxn`, whose decoder rejects the
+    // in-block-only hgi/hgh as unknown fields (issue #1727).
+    if let Err(e) = algo_types::genesis_restore::reject_in_block_flags(&group) {
+        return Err(TxTagError::InBlockOnlyField {
+            index: e.index,
+            field: e.field,
+        });
     }
 
     Ok(group)
@@ -1769,6 +1791,31 @@ mod tests {
             matches!(err, TxTagError::TrailingBytes),
             "expected TrailingBytes, got {err:?}",
         );
+    }
+
+    /// Round-3 review of #1727: go decodes gossip txns as `SignedTxn`,
+    /// whose msgp decoder rejects unknown fields
+    /// (`data/transactions/msgp_gen.go:5644-5647`); `decodeMsg` then flags
+    /// the message invalid (`data/txHandler.go:674-679`) and
+    /// `processIncomingTxn` disconnects the peer (`:772-776`). The
+    /// in-block-only `hgi`/`hgh` must be a decode error here too.
+    #[test]
+    fn decode_in_block_only_field_is_error() {
+        for (hgi, hgh) in [(true, false), (false, true)] {
+            let mut stx = make_signed_txn(7);
+            stx.has_genesis_id = hgi;
+            stx.has_genesis_hash = hgh;
+            // `encode_group` uses the client (`SignedTxn`) encoder, which
+            // never emits the flags; a misbehaving peer sends the in-block
+            // (STIB) shape.
+            let mut encoded = encode_group(&[make_signed_txn(1)]);
+            encoded.extend_from_slice(&algo_codec::canonical_encode_signed_txn_in_block(&stx));
+            let err = decode_tx_message(&encoded).unwrap_err();
+            assert!(
+                matches!(err, TxTagError::InBlockOnlyField { index: 1, .. }),
+                "expected InBlockOnlyField, got {err:?}",
+            );
+        }
     }
 
     #[test]

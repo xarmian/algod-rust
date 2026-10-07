@@ -2632,6 +2632,12 @@ pub async fn raw_transaction<N: NodeInterface>(
     if txgroup.is_empty() {
         return error::bad_request("empty txgroup");
     }
+    // go's `SignedTxn` has no hgi/hgh; its decoder rejects them as unknown
+    // fields and `decodeTxGroup` returns that straight to `badRequest`
+    // (handlers.go:1172-1183, :1259-1262; issue #1727).
+    if let Err(e) = algo_types::genesis_restore::reject_in_block_flags(&txgroup) {
+        return error::bad_request(format!("could not decode transaction: {e}"));
+    }
 
     if let Err(e) =
         crate::pq_compliance::enforce_pq_compliance(&txgroup, params.skip_pq_address_check)
@@ -3272,6 +3278,15 @@ pub async fn simulate_transaction<N: NodeInterface>(
                     ));
                 }
             }
+        }
+        // go decodes each entry as a `SignedTxn` (`PreEncodedSimulateRequest`,
+        // handlers.go:1562-1567), whose decoder rejects the in-block-only
+        // hgi/hgh as unknown fields (issue #1727).
+        if let Err(e) = algo_types::genesis_restore::reject_in_block_flags(&decoded_txns) {
+            return error::bad_request(format!(
+                "could not decode transaction {} in group {i}: Unknown field: {}",
+                e.index, e.field
+            ));
         }
         decoded_groups.push(decoded_txns);
     }
@@ -4791,6 +4806,12 @@ pub async fn raw_transaction_async<N: NodeInterface>(
 
     if txgroup.is_empty() {
         return error::bad_request("empty txgroup");
+    }
+    // go's `SignedTxn` has no hgi/hgh; its decoder rejects them as unknown
+    // fields and `decodeTxGroup` returns that straight to `badRequest`
+    // (handlers.go:1172-1183, :1259-1262; issue #1727).
+    if let Err(e) = algo_types::genesis_restore::reject_in_block_flags(&txgroup) {
+        return error::bad_request(format!("could not decode transaction: {e}"));
     }
 
     if let Err(e) =

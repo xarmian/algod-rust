@@ -65,6 +65,15 @@ pub enum PoolError {
     #[error("transaction pool is shutting down")]
     PoolShutdown,
 
+    /// A submitted transaction carried an in-block-only field (`hgi`/`hgh`).
+    ///
+    /// go has no pool-level counterpart: its `SignedTxn` decoder already
+    /// rejected the unknown field (`msgp.ErrNoField`, "Unknown field: hgi"),
+    /// so nothing flagged ever reaches `Remember`. The pool is algod-rust's
+    /// single internal choke point for this (issue #1727).
+    #[error("TransactionPool.Remember: txn {index}: Unknown field: {field}")]
+    InBlockOnlyField { index: usize, field: &'static str },
+
     /// A transaction with the same ID is already in the pool.
     ///
     /// In go-algorand this is detected by the evaluator's `TransactionGroup`
@@ -255,6 +264,10 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
         PoolError::FeeBelowThreshold { .. } => PoolErrorTag::Fee,
         PoolError::StaleBlockAssemblyRequest => PoolErrorTag::EvalGeneric,
         PoolError::PoolShutdown => PoolErrorTag::EvalGeneric,
+        // go never sees this in the pool (its `SignedTxn` decoder already
+        // failed the submission as malformed), so it classifies with the
+        // other not-well-formed rejections.
+        PoolError::InBlockOnlyField { .. } => PoolErrorTag::NotWell,
         PoolError::DuplicateTxn(_) => PoolErrorTag::TxId,
         PoolError::AlreadyInLedger(_) => PoolErrorTag::TxId,
         PoolError::Evaluator(msg) => classify_evaluator_message(msg),
