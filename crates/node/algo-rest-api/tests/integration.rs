@@ -5074,7 +5074,7 @@ fn make_test_signed_txn() -> SignedTransaction {
     SignedTransaction {
         txn,
         has_genesis_id: true,
-        has_genesis_hash: true,
+        has_genesis_hash: false,
         ..SignedTransaction::default()
     }
 }

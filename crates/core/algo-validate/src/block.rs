@@ -337,7 +337,12 @@ pub fn validate_block_with_cache(
     // step 1 (go: "consensus protocol not found"), so the block is rejected
     // regardless; the default params only keep the remaining checks running.
     // Genesis restoration treats an unknown protocol as hash-requiring.
-    let params = consensus_params_for_version(&block.current_protocol).unwrap_or_default();
+    // ONE protocol lookup per block: the same resolved params feed the
+    // genesis-field rule, the restore pass and the per-txn rules below.
+    let params_opt = consensus_params_for_version(&block.current_protocol);
+    let genesis_rule =
+        algo_types::genesis_restore::GenesisRestoreRule::for_params(params_opt.as_ref(), block);
+    let params = params_opt.unwrap_or_default();
     let spec = SpecialAddresses {
         fee_sink: block.fee_sink,
         rewards_pool: block.rewards_pool,
@@ -345,14 +350,20 @@ pub fn validate_block_with_cache(
 
     // go `DecodeSignedTxn` rejects a stripped txn carrying gen/gh, or hgh on
     // a RequireGenesisHash protocol (issue #1727). Checked on the raw payset,
-    // before restoration masks the fields.
-    if let Err((index, error)) = algo_types::genesis_restore::GenesisRestoreRule::for_block(block)
-        .check_payset(&block.payset)
-    {
+    // before restoration masks the fields. go fails the block at decode, so
+    // return at once: no signature/logic work on a block that cannot decode.
+    if let Err((index, error)) = genesis_rule.check_payset(&block.payset) {
         errors.push(BlockValidationError::PaysetGenesisFields { index, error });
+        return BlockValidationResult {
+            round,
+            is_valid: false,
+            errors,
+            txn_count,
+            total_txn_bytes: 0,
+        };
     }
 
-    let restored_payset = restore_payset_genesis_fields(block);
+    let restored_payset = genesis_rule.restore_payset(&block.payset);
 
     let mut total_txn_bytes: usize = 0;
 
@@ -1216,6 +1227,22 @@ mod tests {
     // ── Strict stripped-genesis-field rules (issue #1727; go
     // `BlockHeader.DecodeSignedTxn`, data/bookkeeping/block.go:983-1020) ──
 
+    /// Put the payset in its stored in-block form (go `EncodeSignedTxn`): the
+    /// header supplies gen/gh, `validate_block` rejects txns still carrying them.
+    fn strip_payset_genesis(block: &mut Block) {
+        let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(block);
+        let stripped: Vec<_> = block
+            .payset
+            .iter()
+            .cloned()
+            .map(|mut stx| {
+                rule.strip(&mut stx);
+                stx
+            })
+            .collect();
+        block.payset = stripped;
+    }
+
     fn has_genesis_field_error(result: &BlockValidationResult) -> bool {
         result
             .errors
@@ -1277,6 +1304,19 @@ mod tests {
             let r = run_strict(&b);
             assert!(!r.is_valid && has_genesis_field_error(&r), "{proto}");
         }
+    }
+
+    #[test]
+    fn strict_genesis_violation_returns_early_without_per_txn_work() {
+        let mut b = genesis_strict_block(algo_types::consensus::CONSENSUS_V41);
+        // Also breaks the signature, which would add a per-txn error if the
+        // per-txn work still ran.
+        b.payset[0].txn.genesis_hash = test_genesis_hash();
+        let r = run_strict(&b);
+        assert!(!r.is_valid);
+        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+        assert!(has_genesis_field_error(&r));
+        assert_eq!(r.total_txn_bytes, 0);
     }
 
     #[test]
@@ -1755,6 +1795,7 @@ mod tests {
         stx.sig = sig.to_bytes();
 
         block.payset = vec![stx];
+        strip_payset_genesis(&mut block);
 
         let result = validate_block(&block, Some(99), "test-v1", &test_genesis_hash(), None);
         let hb_errors: Vec<_> = result
@@ -1812,6 +1853,7 @@ mod tests {
         stx.sig = sig.to_bytes();
 
         block.payset = vec![stx];
+        strip_payset_genesis(&mut block);
 
         let result = validate_block(&block, Some(99), "test-v1", &test_genesis_hash(), None);
         let hb_errors: Vec<_> = result
@@ -2030,6 +2072,7 @@ mod tests {
             mk(&block_cheap_lsig_program(), 0x42),
             mk(&block_expensive_lsig_program(), 0x43),
         ];
+        strip_payset_genesis(&mut block);
         block.txn_commitment = compute_payset_merkle_root(&block);
         block
     }

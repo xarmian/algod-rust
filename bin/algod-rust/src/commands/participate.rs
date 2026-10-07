@@ -1872,21 +1872,15 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                 });
             }
 
-            // Strip genesis_id if present (it matched above).
-            if !stib.txn.genesis_id.is_empty() {
-                stib.txn.genesis_id = String::new();
-                stib.has_genesis_id = true;
-            }
-
-            // Strip genesis_hash if present (it matched above).
-            if stib.txn.genesis_hash != [0u8; 32] {
-                stib.txn.genesis_hash = [0u8; 32];
-                // Only set has_genesis_hash if the protocol doesn't
-                // require it (matching go-algorand behavior).
-                if !self.consensus_params.require_genesis_hash {
-                    stib.has_genesis_hash = true;
-                }
-            }
+            // Build the in-block form from scratch (go `EncodeSignedTxn`):
+            // discards leaked client-supplied hgi/hgh, strips the matched
+            // fields (verified above) and sets the flags per the rule.
+            algo_types::genesis_restore::GenesisRestoreRule::new(
+                &self.hdr.genesis_id,
+                &self.hdr.genesis_hash,
+                self.consensus_params.require_genesis_hash,
+            )
+            .strip(&mut stib);
 
             stibs.push(stib);
         }
@@ -8779,6 +8773,59 @@ mod tests {
             "STIB should have genesis_hash zeroed"
         );
         assert!(stib.has_genesis_id, "STIB should set has_genesis_id flag");
+    }
+
+    /// Issue #1727 review: a pool txn that arrived with the in-block-only
+    /// `hgi`/`hgh` flags set (the msgpack decoder accepts them on any
+    /// `SignedTransaction`) must still be proposed in the canonical stripped
+    /// form (go `EncodeSignedTxn` builds the in-block form from scratch), so
+    /// the proposal passes our own `validate_block` instead of failing the
+    /// strict `DecodeSignedTxn` genesis-field rules.
+    #[test]
+    fn proposer_resets_leaked_in_block_flags_and_block_validates() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(124);
+        let (receiver, _) = test_keypair(125);
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+
+        let mut stx = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100);
+        assert_eq!(stx.txn.genesis_id, "test-v1");
+        stx.has_genesis_hash = true; // leaked: obviated on V41
+        stx.has_genesis_id = true;
+        eval.transaction_group(&[stx]).unwrap();
+        let block = eval.generate_block(&[]).unwrap();
+        assert!(
+            !block.payset[0].has_genesis_hash,
+            "hgh must be cleared on RequireGenesisHash protocols"
+        );
+        assert!(block.payset[0].has_genesis_id);
+        let result =
+            algo_validate::block::validate_block(&block, None, "test-v1", &[0xAA; 32], None);
+        assert!(
+            !result.errors.iter().any(|e| matches!(
+                e,
+                algo_validate::block::BlockValidationError::PaysetGenesisFields { .. }
+            )),
+            "{:?}",
+            result.errors
+        );
+    }
+
+    /// An empty-`gen` txn must not be proposed with a leaked `hgi`.
+    #[test]
+    fn proposer_clears_hgi_when_txn_has_no_genesis_id() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(126);
+        let (receiver, _) = test_keypair(127);
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+        let mut stx = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100);
+        stx.txn.genesis_id = String::new();
+        stx.has_genesis_id = true;
+        eval.transaction_group(&[stx]).unwrap();
+        let block = eval.generate_block(&[]).unwrap();
+        assert!(!block.payset[0].has_genesis_id);
     }
 
     /// Mirrors go-algorand's `TestEncodeDecodeSignedTxn`

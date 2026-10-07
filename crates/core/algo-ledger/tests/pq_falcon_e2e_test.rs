@@ -108,6 +108,21 @@ fn minimal_block(genesis_hash: [u8; 32], fee_sink: Address, round: u64) -> Block
     }
 }
 
+/// Install `txns` as the block's payset in the stored in-block form (go
+/// `EncodeSignedTxn`): gen/gh stripped, the header supplies them back. go's
+/// `DecodeSignedTxn` rejects a txn still carrying them (issue #1727).
+fn set_payset(block: &mut Block, txns: Vec<algo_types::SignedTransaction>) {
+    let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(block);
+    let stripped: Vec<_> = txns
+        .into_iter()
+        .map(|mut stx| {
+            rule.strip(&mut stx);
+            stx
+        })
+        .collect();
+    block.payset = stripped;
+}
+
 /// Assert a block validates cleanly (real signature/fee/proof checks) and
 /// panic with the collected errors otherwise — every scenario below wants
 /// crypto-clean blocks except the one that specifically expects
@@ -121,16 +136,6 @@ fn minimal_block(genesis_hash: [u8; 32], fee_sink: Address, round: u64) -> Block
 /// otherwise fail validation on the unrelated Load field rather than the
 /// signature/fee/wellformedness behavior each scenario actually exercises.
 fn assert_block_validates(block: &mut Block, genesis_hash: &[u8; 32]) {
-    // Blocks store payset txns stripped (go `DecodeSignedTxn` rejects a txn
-    // still carrying gen/gh, issue #1727); the header supplies them back.
-    for stx in &mut block.payset {
-        if !stx.txn.genesis_id.is_empty() {
-            stx.has_genesis_id = true;
-            stx.txn.genesis_id.clear();
-        }
-        stx.txn.genesis_hash = [0u8; 32];
-        stx.has_genesis_hash = false;
-    }
     let total_bytes: usize = block
         .payset
         .iter()
@@ -210,7 +215,7 @@ fn pq_rekeyed_address_authorization_full_e2e_succeeds() {
     };
 
     let mut block1 = minimal_block(genesis_hash, fee_sink, 1);
-    block1.payset = vec![rekey_stx];
+    set_payset(&mut block1, vec![rekey_stx]);
     assert_block_validates(&mut block1, &genesis_hash);
     apply_block_validating(&mut state, &block1).expect("rekey block must apply");
     assert_eq!(
@@ -261,7 +266,7 @@ fn pq_rekeyed_address_authorization_full_e2e_succeeds() {
     };
 
     let mut block2 = minimal_block(genesis_hash, fee_sink, 2);
-    block2.payset = vec![spend_stx];
+    set_payset(&mut block2, vec![spend_stx]);
     assert_block_validates(&mut block2, &genesis_hash);
     apply_block_validating(&mut state, &block2).expect("Falcon-authorized spend must apply");
 
@@ -322,7 +327,7 @@ fn pq_rekeyed_address_stale_ed25519_authorizer_rejected_full_e2e() {
         ..Default::default()
     };
     let mut block1 = minimal_block(genesis_hash, fee_sink, 1);
-    block1.payset = vec![rekey_stx];
+    set_payset(&mut block1, vec![rekey_stx]);
     assert_block_validates(&mut block1, &genesis_hash);
     apply_block_validating(&mut state, &block1).expect("rekey block must apply");
 
@@ -350,7 +355,7 @@ fn pq_rekeyed_address_stale_ed25519_authorizer_rejected_full_e2e() {
     };
 
     let mut block2 = minimal_block(genesis_hash, fee_sink, 2);
-    block2.payset = vec![stale_spend_stx];
+    set_payset(&mut block2, vec![stale_spend_stx]);
     // Real ed25519 signature verification must PASS here -- the signature
     // is genuinely valid for its declared authorizer (the sender itself,
     // since no auth_addr is set). This is exactly the gap PR #850 closed:
@@ -484,7 +489,7 @@ fn pq_challenged_falcon_address_can_heartbeat_for_zero_fee_full_e2e() {
     );
 
     let mut block = minimal_block(genesis_hash, fee_sink, apply_round);
-    block.payset = vec![stx];
+    set_payset(&mut block, vec![stx]);
     assert_block_validates(&mut block, &genesis_hash);
     apply_block_validating(&mut state, &block).expect(
         "zero-fee discounted heartbeat for a challenged Falcon-addressed account must apply",

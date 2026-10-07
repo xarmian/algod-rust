@@ -128,7 +128,7 @@ fn make_signed_txn(key: &SigningKey, amount: u64) -> SignedTransaction {
         pqsig: None,
         auth_addr: None,
         has_genesis_id: true,
-        has_genesis_hash: true,
+        has_genesis_hash: false,
         closing_amount: 0,
         asset_closing_amount: 0,
         sender_rewards: 0,
