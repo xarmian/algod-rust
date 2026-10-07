@@ -278,6 +278,16 @@ pub fn encode_eval_delta(
             .filter(|(_, kv)| !no_empty_local_deltas || !kv.is_empty())
             .collect();
         items.sort_by_key(|(addr, _)| addr.0);
+        // `sa` is appended in first-creation order (go `ensureLocalDelta`);
+        // stable sort keeps address order for any address the AVM did not
+        // report an order for.
+        items.sort_by_key(|(addr, _)| {
+            result
+                .local_delta_order
+                .iter()
+                .position(|a| a == *addr)
+                .unwrap_or(usize::MAX)
+        });
 
         if !items.is_empty() {
             let mut shared: Vec<Address> = Vec::new();
@@ -310,23 +320,17 @@ pub fn encode_eval_delta(
     }
 
     if !result.inner_transactions.is_empty() {
-        // Each inner transaction is an msgpack-encoded SignedTransaction, the
-        // same shape `parse_inner_txns` reads back.
+        // Each inner transaction is go's canonical `SignedTxnWithAD`
+        // (`EvalDelta.InnerTxns`), produced by the canonical encoder (sorted
+        // omitempty fields, nested `dt` written str-preserving) and read back
+        // with rmpv, whose decoder keeps non-UTF-8 `str` bytes. This replaces
+        // the serde named-struct encoding (issue #1739).
         let itx: Vec<Value> = result
             .inner_transactions
             .iter()
             .filter_map(|stx| {
-                let bytes = rmp_serde::to_vec_named(stx).ok()?;
-                let mut item = rmpv::decode::read_value(&mut &bytes[..]).ok()?;
-                // serde writes a non-UTF-8 `Utf8String` as bin, so the
-                // inner `dt` that round-tripped through it lost go's str
-                // typing. Re-attach the original (str-preserving) value.
-                if let (Value::Map(fields), Some(dt)) = (&mut item, &stx.eval_delta) {
-                    if let Some(slot) = fields.iter_mut().find(|(k, _)| k.as_str() == Some("dt")) {
-                        slot.1 = dt.clone();
-                    }
-                }
-                Some(item)
+                let bytes = algo_codec::canonical_encode_signed_txn_with_ad(stx);
+                rmpv::decode::read_value(&mut &bytes[..]).ok()
             })
             .collect();
         if !itx.is_empty() {
@@ -589,20 +593,43 @@ fn parse_inner_txns(val: &rmpv::Value) -> Result<Vec<SignedTransaction>, AlgoErr
 
     let mut txns = Vec::with_capacity(arr.len());
     for item in arr {
-        // Serialize the rmpv::Value to msgpack bytes, then deserialize into SignedTransaction.
-        let mut msgpack_bytes = Vec::new();
-        rmpv::encode::write_value(&mut msgpack_bytes, item).map_err(|e| AlgoError::Codec {
-            source: Box::new(e),
-            context: "inner_txn: failed to encode rmpv to msgpack".to_string(),
-        })?;
-        let stx: SignedTransaction =
-            rmp_serde::from_slice(&msgpack_bytes).map_err(|e| AlgoError::Codec {
-                source: Box::new(e),
-                context: "inner_txn: failed to decode SignedTransaction".to_string(),
-            })?;
-        txns.push(stx);
+        txns.push(parse_inner_txn(item)?);
     }
     Ok(txns)
+}
+
+/// Parse one `itx` entry (go `SignedTxnWithAD`). Accepts go's canonical
+/// omitempty form (e.g. no `txn` for an all-zero transaction) as well as the
+/// legacy serde named-struct form. The entry's own `dt` is detached before
+/// the serde decode and re-attached untouched: serde would turn a non-UTF-8
+/// `str` into `bin`, losing go's typing for the nested delta.
+fn parse_inner_txn(item: &rmpv::Value) -> Result<SignedTransaction, AlgoError> {
+    let mut item = item.clone();
+    let mut dt = None;
+    if let rmpv::Value::Map(fields) = &mut item {
+        if let Some(pos) = fields.iter().position(|(k, _)| k.as_str() == Some("dt")) {
+            let (_, v) = fields.remove(pos);
+            if !matches!(v, rmpv::Value::Nil) {
+                dt = Some(v);
+            }
+        }
+    }
+    let mut msgpack_bytes = Vec::new();
+    algo_codec::write_value_str_preserving(&mut msgpack_bytes, &item).map_err(|e| {
+        AlgoError::Codec {
+            source: Box::new(e),
+            context: "inner_txn: failed to encode rmpv to msgpack".to_string(),
+        }
+    })?;
+    let mut stx: SignedTransaction =
+        rmp_serde::from_slice(&msgpack_bytes).map_err(|e| AlgoError::Codec {
+            source: Box::new(e),
+            context: "inner_txn: failed to decode SignedTransaction".to_string(),
+        })?;
+    if dt.is_some() {
+        stx.eval_delta = dt;
+    }
+    Ok(stx)
 }
 
 /// Parse shared accounts: array of 32-byte addresses (the `sa` key).
@@ -1037,6 +1064,7 @@ mod tests {
         algo_avm::eval::AvmResult {
             global_delta,
             local_deltas,
+            local_delta_order: Vec::new(),
             inner_transactions: inner,
             logs,
             approved: true,
@@ -1713,5 +1741,287 @@ mod tests {
         assert!(
             !has(&[0xc4, 0x01, 0xff]) && !has(&[0xc4, 0x01, 0xfe]) && !has(&[0xc4, 0x01, 0x80])
         );
+    }
+
+    // ---- Issue #1739: canonical `itx` (go `SignedTxnWithAD`) --------------
+    //
+    // go `EvalDelta.InnerTxns` is `[]SignedTxnWithAD`
+    // (`data/transactions/teal.go`); `SignedTxnWithAD` embeds `SignedTxn` +
+    // `ApplyData` with `codec:",omitempty,omitemptyarray"`
+    // (`data/transactions/signedtxn.go`), so each entry is a map of the
+    // non-zero fields sorted by codec name (aca, apid, ca, caid, dt, lsig,
+    // msig, pqsig, rc, rr, rs, sgnr, sig, txn) with NO `hgi`/`hgh`
+    // (those belong to `SignedTxnInBlock` only), zero fields omitted and
+    // an all-zero struct as the one-byte empty map.
+
+    fn fixstr(b: &[u8]) -> Vec<u8> {
+        let mut v = vec![0xa0 | b.len() as u8];
+        v.extend_from_slice(b);
+        v
+    }
+
+    fn bin32(b: u8) -> Vec<u8> {
+        let mut v = vec![0xc4, 0x20];
+        v.extend_from_slice(&[b; 32]);
+        v
+    }
+
+    fn appl_child_with_non_utf8_dt() -> SignedTransaction {
+        let mut child = algo_avm::eval::AvmResult::empty();
+        child
+            .global_delta
+            .insert(vec![0xff], Some(TealValue::Bytes(vec![0x80])));
+        child.logs = vec![vec![0xfe]];
+        SignedTransaction {
+            txn: Transaction {
+                txn_type: algo_types::TxnType::Appl,
+                sender: Address([7u8; 32]),
+                application_id: 5,
+                ..Default::default()
+            },
+            apply_data_application_id: 9,
+            eval_delta: encode_eval_delta(&child, &Transaction::default(), true),
+            ..Default::default()
+        }
+    }
+
+    fn pay_child_zero_fields() -> SignedTransaction {
+        SignedTransaction {
+            txn: Transaction {
+                txn_type: algo_types::TxnType::Pay,
+                sender: Address([1u8; 32]),
+                receiver: Address([2u8; 32]),
+                amount: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn three_children() -> Vec<SignedTransaction> {
+        vec![
+            appl_child_with_non_utf8_dt(),
+            pay_child_zero_fields(),
+            SignedTransaction::default(),
+        ]
+    }
+
+    #[test]
+    fn itx_entries_are_canonical_signed_txn_with_ad_bytes() {
+        let mut parent = algo_avm::eval::AvmResult::empty();
+        parent.inner_transactions = three_children();
+        let dt = encode_eval_delta(&parent, &Transaction::default(), true).unwrap();
+
+        let child_dt = [
+            vec![0x82],
+            fixstr(b"gd"),
+            vec![0x81, 0xa1, 0xff, 0x82],
+            fixstr(b"at"),
+            vec![0x01],
+            fixstr(b"bs"),
+            vec![0xa1, 0x80],
+            fixstr(b"lg"),
+            vec![0x91, 0xa1, 0xfe],
+        ]
+        .concat();
+        let appl = [
+            vec![0x83],
+            fixstr(b"apid"),
+            vec![0x09],
+            fixstr(b"dt"),
+            child_dt,
+            fixstr(b"txn"),
+            vec![0x83],
+            fixstr(b"apid"),
+            vec![0x05],
+            fixstr(b"snd"),
+            bin32(7),
+            fixstr(b"type"),
+            fixstr(b"appl"),
+        ]
+        .concat();
+        let pay = [
+            vec![0x81],
+            fixstr(b"txn"),
+            vec![0x83],
+            fixstr(b"rcv"),
+            bin32(2),
+            fixstr(b"snd"),
+            bin32(1),
+            fixstr(b"type"),
+            fixstr(b"pay"),
+        ]
+        .concat();
+        let expected = [
+            vec![0x81],
+            fixstr(b"itx"),
+            vec![0x93],
+            appl,
+            pay,
+            vec![0x80],
+        ]
+        .concat();
+        assert_eq!(wire(&dt), expected);
+    }
+
+    #[test]
+    fn parse_inner_txns_reads_canonical_itx_and_keeps_non_utf8_str() {
+        let mut parent = algo_avm::eval::AvmResult::empty();
+        parent.inner_transactions = three_children();
+        let dt = encode_eval_delta(&parent, &Transaction::default(), true).unwrap();
+        let before = wire(&dt);
+        // Wire round trip, as a block decode would hand it to the parser.
+        let parsed_val = rmpv::decode::read_value(&mut &before[..]).unwrap();
+        let parsed = parse_eval_delta(&parsed_val).unwrap();
+        let inner = parsed.inner_txns.unwrap();
+        assert_eq!(inner.len(), 3);
+        assert_eq!(inner[0].txn.application_id, 5);
+        assert_eq!(inner[0].apply_data_application_id, 9);
+        assert_eq!(inner[1].txn.receiver, Address([2u8; 32]));
+        assert_eq!(inner[2], SignedTransaction::default());
+        // Re-encoding the parsed children must reproduce the same bytes
+        // (non-UTF-8 str typing in the nested dt survives the parse).
+        let mut again = algo_avm::eval::AvmResult::empty();
+        again.inner_transactions = inner;
+        let dt2 = encode_eval_delta(&again, &Transaction::default(), true).unwrap();
+        assert_eq!(wire(&dt2), before);
+    }
+
+    #[test]
+    fn parse_inner_txns_still_reads_legacy_named_serde_form() {
+        // Blocks stored by earlier builds carry rmp_serde named-struct
+        // entries (all fields incl. empty `txn`); they must still parse.
+        let legacy = rmp_serde::to_vec_named(&pay_child_zero_fields()).unwrap();
+        let v = rmpv::decode::read_value(&mut &legacy[..]).unwrap();
+        let list = parse_inner_txns(&Value::Array(vec![v])).unwrap();
+        assert_eq!(list[0].txn.receiver, Address([2u8; 32]));
+    }
+
+    /// Issue #1740: local deltas are keyed by a function of the address, so
+    /// two distinct addresses can never share an `ld` key; the sender that is
+    /// also in `accounts` is index 0, and an account listed twice resolves to
+    /// its first slot.
+    #[test]
+    fn ld_keys_are_unique_when_sender_and_accounts_overlap() {
+        let sender = Address([1u8; 32]);
+        let other = Address([2u8; 32]);
+        let txn = Transaction {
+            sender,
+            accounts: Some(vec![sender, other, other]),
+            ..Default::default()
+        };
+        let mut r = algo_avm::eval::AvmResult::empty();
+        for a in [sender, other] {
+            r.local_deltas.insert(
+                a,
+                HashMap::from([(b"k".to_vec(), Some(TealValue::Uint(1)))]),
+            );
+        }
+        let dt = encode_eval_delta(&r, &txn, true).unwrap();
+        let Value::Map(top) = dt else { panic!() };
+        let ld = top.iter().find(|(k, _)| k.as_str() == Some("ld")).unwrap();
+        let Value::Map(ld) = &ld.1 else { panic!() };
+        let keys: Vec<u64> = ld.iter().map(|(k, _)| k.as_u64().unwrap()).collect();
+        assert_eq!(keys, vec![0, 2]);
+    }
+
+    /// Issue #1740: `sa` is appended in the order the local deltas were first
+    /// created (go `ensureLocalDelta`), not in address order; indices follow
+    /// (`1 + len(accounts) + position`), and an account already in `accounts`
+    /// never enters `sa`.
+    #[test]
+    fn sa_follows_first_creation_order_not_address_order() {
+        let sender = Address([1u8; 32]);
+        let listed = Address([5u8; 32]);
+        let first = Address([9u8; 32]);
+        let second = Address([3u8; 32]);
+        let txn = Transaction {
+            sender,
+            accounts: Some(vec![listed]),
+            ..Default::default()
+        };
+        let mut r = algo_avm::eval::AvmResult::empty();
+        for a in [sender, listed, first, second] {
+            r.local_deltas.insert(
+                a,
+                HashMap::from([(b"k".to_vec(), Some(TealValue::Uint(1)))]),
+            );
+        }
+        r.local_delta_order = vec![first, listed, second, sender];
+        let dt = encode_eval_delta(&r, &txn, true).unwrap();
+        assert_eq!(shared_accts(&dt), vec![first.0.to_vec(), second.0.to_vec()]);
+        let Value::Map(top) = &dt else { panic!() };
+        let ld = top.iter().find(|(k, _)| k.as_str() == Some("ld")).unwrap();
+        let Value::Map(ld) = &ld.1 else { panic!() };
+        let keys: Vec<u64> = ld.iter().map(|(k, _)| k.as_u64().unwrap()).collect();
+        assert_eq!(keys, vec![0, 1, 2, 3]);
+        // `first` (idx 2) precedes `second` (idx 3) although its address is larger.
+        let parsed = parse_eval_delta(&dt).unwrap();
+        assert_eq!(parsed.shared_accts.unwrap(), vec![first, second]);
+    }
+
+    /// Byte-exact oracle from go-algorand output (issue #1739). Real mainnet
+    /// round 53000003, txn index 3 (an app call that issued four inner
+    /// transactions, one of which is itself an app call with its own `dt`
+    /// carrying `itx` and `lg`): the `itx` value of that txn's `dt`, 987 bytes,
+    /// sliced verbatim from
+    /// `https://mainnet-api.algonode.cloud/v2/blocks/53000003?format=msgpack`
+    /// (public chain data, no trimming or re-encoding). Every inner txn must
+    /// decode and re-encode through the canonical `SignedTxnWithAD` encoder to
+    /// the identical bytes.
+    const MAINNET_53000003_TXN3_ITX_HEX: &str = concat!(
+        "9282a2647482a36974789482a3616361ce026487cfa374786e87a661636c6f7365c420d41b66fe68886dea8a7a710342",
+        "3d1ca26d59cc5a31c507283b3743e194cc21d6a461726376c420d41b66fe68886dea8a7a7103423d1ca26d59cc5a31c5",
+        "07283b3743e194cc21d6a26676ce0328b741a26c76ce0328b74ba3736e64c42040582705e7d416b9d6adfefd04766748",
+        "bfbf8c7f08f311f6710e4d113431ba89a474797065a56178666572a478616964ce01e1ab7081a374786e87a661636c6f",
+        "7365c420d41b66fe68886dea8a7a7103423d1ca26d59cc5a31c507283b3743e194cc21d6a461726376c420d41b66fe68",
+        "886dea8a7a7103423d1ca26d59cc5a31c507283b3743e194cc21d6a26676ce0328b741a26c76ce0328b74ba3736e64c4",
+        "2040582705e7d416b9d6adfefd04766748bfbf8c7f08f311f6710e4d113431ba89a474797065a56178666572a4786169",
+        "64cebbcb467881a374786e87a661636c6f7365c420d41b66fe68886dea8a7a7103423d1ca26d59cc5a31c507283b3743",
+        "e194cc21d6a461726376c420d41b66fe68886dea8a7a7103423d1ca26d59cc5a31c507283b3743e194cc21d6a26676ce",
+        "0328b741a26c76ce0328b74ba3736e64c42040582705e7d416b9d6adfefd04766748bfbf8c7f08f311f6710e4d113431",
+        "ba89a474797065a56178666572a478616964cebbcb467982a26361ce00061a80a374786e86a5636c6f7365c420d41b66",
+        "fe68886dea8a7a7103423d1ca26d59cc5a31c507283b3743e194cc21d6a26676ce0328b741a26c76ce0328b74ba37263",
+        "76c420d41b66fe68886dea8a7a7103423d1ca26d59cc5a31c507283b3743e194cc21d6a3736e64c42040582705e7d416",
+        "b9d6adfefd04766748bfbf8c7f08f311f6710e4d113431ba89a474797065a3706179a26c6791a5151f7c7501a374786e",
+        "8aa46170616191c404119e3c4ba46170616e05a46170617393ce01e1ab70cebbcb4678cebbcb4679a46170617492c420",
+        "d41b66fe68886dea8a7a7103423d1ca26d59cc5a31c507283b3743e194cc21d6c420d41b66fe68886dea8a7a7103423d",
+        "1ca26d59cc5a31c507283b3743e194cc21d6a46170666191cebbcb4370a461706964cebd9c7172a26676ce0328b741a2",
+        "6c76ce0328b74ba3736e64c420a0dfb3d0fb23f8456469ea6688fa89b770291f0fb069f35e3abc1b82b4183ff3a47479",
+        "7065a46170706c81a374786e86a3616d74ce00087dd4a26676ce0328b741a26c76ce0328b74ba3726376c420d41b66fe",
+        "68886dea8a7a7103423d1ca26d59cc5a31c507283b3743e194cc21d6a3736e64c420a0dfb3d0fb23f8456469ea6688fa",
+        "89b770291f0fb069f35e3abc1b82b4183ff3a474797065a3706179"
+    );
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn mainnet_itx_round_trips_byte_exact_through_canonical_encoder() {
+        let go_bytes = unhex(MAINNET_53000003_TXN3_ITX_HEX);
+        assert_eq!(go_bytes.len(), 987);
+        let go_val = rmpv::decode::read_value(&mut &go_bytes[..]).unwrap();
+        let inner = parse_inner_txns(&go_val).unwrap();
+        assert_eq!(inner.len(), 2);
+
+        // Per-entry and whole-array byte equality with go's output.
+        let mut rebuilt = vec![0x92];
+        for stx in &inner {
+            rebuilt.extend_from_slice(&algo_codec::canonical_encode_signed_txn_with_ad(stx));
+        }
+        assert_eq!(rebuilt, go_bytes);
+
+        // And through the full producer path: the parent's `dt` is `{itx: ..}`.
+        let mut parent = algo_avm::eval::AvmResult::empty();
+        parent.inner_transactions = inner;
+        let dt = encode_eval_delta(&parent, &Transaction::default(), true).unwrap();
+        let mut expected = vec![0x81];
+        expected.extend_from_slice(&fixstr(b"itx"));
+        expected.extend_from_slice(&go_bytes);
+        assert_eq!(wire(&dt), expected);
     }
 }

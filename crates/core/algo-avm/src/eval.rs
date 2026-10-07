@@ -80,6 +80,12 @@ pub struct AvmResult {
     /// Changes to per-account local state, keyed by account address.
     /// Inner values: `Some(val)` = set, `None` = delete.
     pub local_deltas: HashMap<Address, HashMap<Vec<u8>, Option<TealValue>>>,
+    /// Addresses of `local_deltas` in the order their local delta was first
+    /// created during execution. go appends each non-`accounts` address to
+    /// `EvalDelta.SharedAccts` at that moment (`ensureLocalDelta`,
+    /// `data/transactions/logic/eval.go`), so `sa` follows this order, not an
+    /// address sort. May omit addresses (callers fall back to address order).
+    pub local_delta_order: Vec<Address>,
     /// Inner transactions emitted by the program.
     pub inner_transactions: Vec<SignedTransaction>,
     /// Log messages emitted by the program.
@@ -224,6 +230,7 @@ impl AvmResult {
         AvmResult {
             global_delta: HashMap::new(),
             local_deltas: HashMap::new(),
+            local_delta_order: Vec::new(),
             inner_transactions: Vec::new(),
             logs: Vec::new(),
             approved: false,
@@ -291,6 +298,7 @@ pub fn run_approval_program(
             let result = AvmResult {
                 global_delta: ctx.take_global_delta(),
                 local_deltas: ctx.take_local_deltas(),
+                local_delta_order: ctx.take_local_delta_order(),
                 inner_transactions: ctx.take_inner_transactions(),
                 logs: ctx.take_logs(),
                 approved: pass,
@@ -331,6 +339,7 @@ pub fn run_approval_program(
             let result = AvmResult {
                 global_delta: ctx.take_global_delta(),
                 local_deltas: ctx.take_local_deltas(),
+                local_delta_order: ctx.take_local_delta_order(),
                 inner_transactions: ctx.take_inner_transactions(),
                 logs: ctx.take_logs(),
                 approved: false,
@@ -402,6 +411,7 @@ pub fn run_clear_state_program(
             AvmResult {
                 global_delta: ctx.take_global_delta(),
                 local_deltas: ctx.take_local_deltas(),
+                local_delta_order: ctx.take_local_delta_order(),
                 inner_transactions: ctx.take_inner_transactions(),
                 logs: ctx.take_logs(),
                 approved: true,
@@ -638,6 +648,7 @@ pub fn run_approval_program_with_tracer(
             let result = AvmResult {
                 global_delta: ctx.take_global_delta(),
                 local_deltas: ctx.take_local_deltas(),
+                local_delta_order: ctx.take_local_delta_order(),
                 inner_transactions: ctx.take_inner_transactions(),
                 logs: ctx.take_logs(),
                 approved: pass,
@@ -666,6 +677,7 @@ pub fn run_approval_program_with_tracer(
             let result = AvmResult {
                 global_delta: ctx.take_global_delta(),
                 local_deltas: ctx.take_local_deltas(),
+                local_delta_order: ctx.take_local_delta_order(),
                 inner_transactions: ctx.take_inner_transactions(),
                 logs: ctx.take_logs(),
                 approved: false,
@@ -733,6 +745,7 @@ pub fn run_clear_state_program_with_tracer(
             AvmResult {
                 global_delta: ctx.take_global_delta(),
                 local_deltas: ctx.take_local_deltas(),
+                local_delta_order: ctx.take_local_delta_order(),
                 inner_transactions: ctx.take_inner_transactions(),
                 logs: ctx.take_logs(),
                 approved: true,
@@ -911,6 +924,7 @@ mod tests {
         let result = AvmResult {
             global_delta,
             local_deltas,
+            local_delta_order: Vec::new(),
             inner_transactions: vec![],
             logs: vec![b"hello".to_vec()],
             approved: true,

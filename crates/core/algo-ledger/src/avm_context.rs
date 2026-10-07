@@ -1322,6 +1322,9 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     /// delta that pre-`NoEmptyLocalDeltas` (pre-v27) `EvalDelta` encoding
     /// needs to conditionally include.
     local_delta_touched: std::collections::HashSet<Address>,
+    /// First-creation order of the local deltas (go's `ensureLocalDelta`
+    /// moment), which fixes the `sa` (SharedAccts) order.
+    local_delta_order: Vec<Address>,
 
     /// Optional execution tracer for capturing opcode-level details.
     /// Used by the simulation engine for tracing inner transactions.
@@ -2202,7 +2205,16 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// Call sites: the top-level and inner `appl` OptIn paths, right after
     /// `apply_appl_opt_in_pre_program` runs and this context exists.
     pub(crate) fn mark_local_delta_touch(&mut self, addr: Address) {
+        self.note_local_delta_order(addr);
         self.local_delta_touched.insert(addr);
+    }
+
+    /// Remember the first time `addr` gets a local delta (see
+    /// `local_delta_order`).
+    fn note_local_delta_order(&mut self, addr: Address) {
+        if !self.local_delta_order.contains(&addr) {
+            self.local_delta_order.push(addr);
+        }
     }
 
     /// Core asset-reference resolution, matching go-algorand's
@@ -2438,6 +2450,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             global_delta_tracker: HashMap::new(),
             local_delta_tracker: HashMap::new(),
             local_delta_touched: std::collections::HashSet::new(),
+            local_delta_order: Vec::new(),
             tracer_ptr: None,
             max_log_calls: MAX_LOG_CALLS,
             max_log_size: MAX_LOG_SIZE,
@@ -4305,6 +4318,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         AvmResult {
             global_delta: std::collections::HashMap::new(),
             local_deltas: std::collections::HashMap::new(),
+            local_delta_order: Vec::new(),
             inner_transactions,
             logs: self.logs.clone(),
             approved,
@@ -5690,6 +5704,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         // that merely re-asserts it is a no-op for EvalDelta purposes
         // (issue #1325).
         if app_id == self.app_id && pre.as_ref() != Some(&value) {
+            self.note_local_delta_order(addr);
             self.local_delta_tracker
                 .insert((addr, key.to_vec()), Some(value));
         }
@@ -5734,6 +5749,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         // mechanism"), only record a delete when the key actually existed
         // beforehand -- deleting a never-set key is a ledger no-op.
         if app_id == self.app_id && key_existed {
+            self.note_local_delta_order(addr);
             self.local_delta_tracker.insert((addr, key.to_vec()), None);
         }
         Ok(())
@@ -7753,6 +7769,10 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         let tracker = std::mem::take(&mut self.global_delta_tracker);
         // Preserve None entries — they represent key deletions (app_global_del).
         tracker.into_iter().collect()
+    }
+
+    fn take_local_delta_order(&mut self) -> Vec<Address> {
+        std::mem::take(&mut self.local_delta_order)
     }
 
     fn take_local_deltas(&mut self) -> HashMap<Address, HashMap<Vec<u8>, Option<TealValue>>> {

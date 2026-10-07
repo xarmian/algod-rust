@@ -143,7 +143,7 @@ impl<'de> Deserialize<'de> for TxnType {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SignedTransaction {
     /// The transaction body.
-    #[serde(rename = "txn")]
+    #[serde(rename = "txn", default)]
     pub txn: Transaction,
 
     /// Ed25519 signature (ed25519Signature = [64]byte in Go).
@@ -267,11 +267,11 @@ impl Default for SignedTransaction {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Transaction {
     /// Transaction type ("pay", "axfer", "acfg", "afrz", "appl", "keyreg", "stpf", "hb").
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub txn_type: TxnType,
 
     /// Sender address.
-    #[serde(rename = "snd")]
+    #[serde(rename = "snd", default)]
     pub sender: Address,
 
     /// Fee (in microAlgos).
