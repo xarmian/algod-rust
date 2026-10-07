@@ -95,72 +95,11 @@ fn msgp_raw_bytes<E: serde::de::Error>(value: rmpv::Value) -> Result<Vec<u8>, E>
     }
 }
 
-/// Write the msgpack `str` length-marker + raw bytes for a string field,
-/// unconditionally (regardless of whether `bytes` happens to be valid
-/// UTF-8) — matching go-algorand's own msgpack encoder, which never
-/// validates a Go `string`'s bytes before writing it with a `str` type
-/// marker. This mirrors `rmp::encode::write_str_len` + raw payload but is
-/// hand-rolled here (msgpack's `str` format family is small and stable) to
-/// avoid adding `rmp` as a direct dependency solely for this one helper.
-pub(crate) fn write_str_marker_and_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
-    let len = bytes.len();
-    if len < 32 {
-        buf.push(0xa0 | (len as u8));
-    } else if len < 256 {
-        buf.push(0xd9);
-        buf.push(len as u8);
-    } else if len < 65536 {
-        buf.push(0xda);
-        buf.extend_from_slice(&(len as u16).to_be_bytes());
-    } else {
-        buf.push(0xdb);
-        buf.extend_from_slice(&(len as u32).to_be_bytes());
-    }
-    buf.extend_from_slice(bytes);
-}
-
-/// Re-encode an `rmpv::Value` to its msgpack bytes, recursing into
-/// `Array`/`Map` (whose entries may themselves contain a `String`), but with
-/// one deliberate deviation from `rmpv::encode::write_value`: a
-/// [`rmpv::Value::String`] is **always** written using the `str` type
-/// marker with its raw bytes (via [`write_str_marker_and_bytes`]), even when
-/// those bytes aren't valid UTF-8.
-///
-/// `rmpv::encode::write_value` (see `rmpv-1.3.1/src/encode/value.rs`)
-/// writes `Value::String(Utf8String { s: Err(err) })` — i.e. a decoded
-/// `str` whose bytes failed UTF-8 validation — as a `bin` instead of a
-/// `str`, changing the wire type-marker byte from what go-algorand's own
-/// encoder actually wrote (go never validates a Go `string`'s bytes before
-/// encoding, so it always emits `str`, valid UTF-8 or not). Every other
-/// `rmpv::Value` variant delegates straight to `rmpv::encode::write_value`,
-/// which has no equivalent hazard for them.
-pub(crate) fn write_value_str_preserving(
-    buf: &mut Vec<u8>,
-    value: &rmpv::Value,
-) -> Result<(), rmpv::encode::Error> {
-    match value {
-        rmpv::Value::String(s) => {
-            write_str_marker_and_bytes(buf, s.as_bytes());
-            Ok(())
-        }
-        rmpv::Value::Array(items) => {
-            rmp::encode::write_array_len(buf, items.len() as u32)?;
-            for item in items {
-                write_value_str_preserving(buf, item)?;
-            }
-            Ok(())
-        }
-        rmpv::Value::Map(entries) => {
-            rmp::encode::write_map_len(buf, entries.len() as u32)?;
-            for (k, v) in entries {
-                write_value_str_preserving(buf, k)?;
-                write_value_str_preserving(buf, v)?;
-            }
-            Ok(())
-        }
-        other => rmpv::encode::write_value(buf, other),
-    }
-}
+// The str-preserving re-encoders live in `algo-codec` (shared with the
+// canonical `dt` writer, issue #1705); re-exported here for the catchpoint code.
+pub(crate) use algo_codec::write_value_str_preserving;
+#[cfg(test)]
+use algo_codec::write_str_marker_and_bytes;
 
 /// `serde` adapter for a Go `msgp.Raw` field.
 fn deserialize_msgp_raw<'de, D>(deserializer: D) -> Result<ByteBuf, D::Error>

@@ -203,35 +203,52 @@ pub fn encode_eval_delta(
 ) -> Option<rmpv::Value> {
     use rmpv::Value;
 
-    // A single key→value change: {at: action, ui|bs: value}.
+    // go writes `string` fields with msgpack str (`msgp.AppendString`), and
+    // the bytes may be non-UTF-8: build the str via the wire so rmpv keeps
+    // the raw bytes (`Utf8String`'s invalid-UTF-8 variant).
+    fn raw_str(b: &[u8]) -> Value {
+        if let Ok(s) = std::str::from_utf8(b) {
+            return Value::from(s);
+        }
+        let mut buf = Vec::with_capacity(b.len() + 5);
+        rmp::encode::write_str_len(&mut buf, b.len() as u32).expect("vec write");
+        buf.extend_from_slice(b);
+        rmpv::decode::read_value(&mut &buf[..]).expect("well-formed str")
+    }
+
+    // A single key→value change, go `basics.ValueDelta`
+    // (`codec:",omitempty"`): `at` always (never 0), `bs` only if non-empty,
+    // `ui` only if non-zero; fields in codec-name order (at, bs, ui).
     fn value_delta(v: &Option<TealValue>) -> Value {
+        let at = |a: DeltaAction| (Value::from("at"), Value::from(u64::from(a)));
         match v {
-            Some(TealValue::Uint(u)) => Value::Map(vec![
-                (
-                    Value::from("at"),
-                    Value::from(u64::from(DeltaAction::SetUint)),
-                ),
-                (Value::from("ui"), Value::from(*u)),
-            ]),
-            Some(TealValue::Bytes(b)) => Value::Map(vec![
-                (
-                    Value::from("at"),
-                    Value::from(u64::from(DeltaAction::SetBytes)),
-                ),
-                (Value::from("bs"), Value::Binary(b.clone())),
-            ]),
-            None => Value::Map(vec![(
-                Value::from("at"),
-                Value::from(u64::from(DeltaAction::Delete)),
-            )]),
+            Some(TealValue::Uint(u)) => {
+                let mut m = vec![at(DeltaAction::SetUint)];
+                if *u != 0 {
+                    m.push((Value::from("ui"), Value::from(*u)));
+                }
+                Value::Map(m)
+            }
+            Some(TealValue::Bytes(b)) => {
+                let mut m = vec![at(DeltaAction::SetBytes)];
+                if !b.is_empty() {
+                    m.push((Value::from("bs"), raw_str(b)));
+                }
+                Value::Map(m)
+            }
+            None => Value::Map(vec![at(DeltaAction::Delete)]),
         }
     }
 
-    // A state-delta map: state-key (binary) → value delta.
+    // A state-delta map (go `basics.StateDelta`, `map[string]ValueDelta`):
+    // str keys, sorted bytewise (go `SortString`).
     fn state_delta(m: &HashMap<Vec<u8>, Option<TealValue>>) -> Value {
+        let mut items: Vec<_> = m.iter().collect();
+        items.sort_by(|a, b| a.0.cmp(b.0));
         Value::Map(
-            m.iter()
-                .map(|(k, v)| (Value::Binary(k.clone()), value_delta(v)))
+            items
+                .into_iter()
+                .map(|(k, v)| (raw_str(k), value_delta(v)))
                 .collect(),
         )
     }
@@ -279,6 +296,8 @@ pub fn encode_eval_delta(
                 };
                 ld.push((Value::from(index), state_delta(kv)));
             }
+            // go sorts the `map[uint64]StateDelta` keys ascending.
+            ld.sort_by_key(|(k, _)| k.as_u64());
             entries.push((Value::from("ld"), Value::Map(ld)));
             if !shared.is_empty() {
                 // `sa`: addresses for the local deltas that index beyond `accounts`.
@@ -298,7 +317,16 @@ pub fn encode_eval_delta(
             .iter()
             .filter_map(|stx| {
                 let bytes = rmp_serde::to_vec_named(stx).ok()?;
-                rmpv::decode::read_value(&mut &bytes[..]).ok()
+                let mut item = rmpv::decode::read_value(&mut &bytes[..]).ok()?;
+                // serde writes a non-UTF-8 `Utf8String` as bin, so the
+                // inner `dt` that round-tripped through it lost go's str
+                // typing. Re-attach the original (str-preserving) value.
+                if let (Value::Map(fields), Some(dt)) = (&mut item, &stx.eval_delta) {
+                    if let Some(slot) = fields.iter_mut().find(|(k, _)| k.as_str() == Some("dt")) {
+                        slot.1 = dt.clone();
+                    }
+                }
+                Some(item)
             })
             .collect();
         if !itx.is_empty() {
@@ -307,17 +335,16 @@ pub fn encode_eval_delta(
     }
 
     if !result.logs.is_empty() {
-        let lg: Vec<Value> = result
-            .logs
-            .iter()
-            .map(|l| Value::Binary(l.clone()))
-            .collect();
+        let lg: Vec<Value> = result.logs.iter().map(|l| raw_str(l)).collect();
         entries.push((Value::from("lg"), Value::Array(lg)));
     }
 
     if entries.is_empty() {
         None
     } else {
+        // go's generated `EvalDelta.MarshalMsg` emits fields in codec-name
+        // order: gd, itx, ld, lg, sa.
+        entries.sort_by(|a, b| a.0.as_str().cmp(&b.0.as_str()));
         Some(Value::Map(entries))
     }
 }
@@ -750,7 +777,7 @@ mod tests {
         let at_of = |key: &[u8]| -> u64 {
             let (_, v) = gd
                 .iter()
-                .find(|(k, _)| matches!(k, Value::Binary(b) if b == key))
+                .find(|(k, _)| matches!(k, Value::String(s) if s.as_bytes() == key))
                 .unwrap();
             let Value::Map(m) = v else { panic!("vd map") };
             m.iter()
@@ -1447,5 +1474,244 @@ mod tests {
             .get_app_local_state(&shared, app_id)
             .expect("shared account should have local state written");
         assert_eq!(ls.key_value.get(b"k".as_slice()), Some(&TealValue::Uint(3)));
+    }
+
+    // ---- Issue #1705: go's canonical EvalDelta/ValueDelta bytes ----------
+    //
+    // go `basics.ValueDelta` (`data/basics/teal.go`) is `codec:",omitempty"`
+    // with `at`/`bs`/`ui`; generated `MarshalMsg` (`data/basics/msgp_gen.go`)
+    // drops `at==0`, `bs==""` and `ui==0`, and writes `bs` with
+    // `AppendString` (msgpack str, not bin). `StateDelta` sorts its string
+    // keys and writes them as str. `transactions.EvalDelta`
+    // (`data/transactions/teal.go`) fields are emitted sorted by codec name:
+    // gd, itx, ld, lg, sa; `lg` entries are `[]string` (str), `sa` is
+    // `[]Address` (bin32), `ld` keys are sorted uint64.
+
+    /// The `dt` bytes exactly as the block encoder writes them: place the
+    /// value in a `SignedTransaction`, run the canonical STIB encoder
+    /// (`add_option_rmpv("dt")`), decode that map structurally with rmpv and
+    /// re-encode only its `dt` value through the str-preserving writer (no
+    /// byte-pattern scanning, so key/log bytes cannot mis-slice).
+    fn wire(v: &Value) -> Vec<u8> {
+        let stx = SignedTransaction {
+            eval_delta: Some(v.clone()),
+            ..SignedTransaction::default()
+        };
+        let bytes = algo_codec::canonical_encode_signed_txn_in_block(&stx);
+        let Value::Map(top) = rmpv::decode::read_value(&mut &bytes[..]).unwrap() else {
+            panic!("stib map")
+        };
+        let dt = top
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("dt"))
+            .expect("dt present")
+            .1
+            .clone();
+        let mut out = Vec::new();
+        algo_codec::write_value_str_preserving(&mut out, &dt).unwrap();
+        out
+    }
+
+    fn gd_only(entries: Vec<(&[u8], Option<TealValue>)>) -> Vec<u8> {
+        let mut result = algo_avm::eval::AvmResult::empty();
+        for (k, v) in entries {
+            result.global_delta.insert(k.to_vec(), v);
+        }
+        wire(&encode_eval_delta(&result, &Transaction::default(), true).unwrap())
+    }
+
+    /// `{"gd": {"k": <vd>}}` prefix: map1, str2 "gd", map1, str1 "k".
+    const GD_K: [u8; 7] = [0x81, 0xa2, b'g', b'd', 0x81, 0xa1, b'k'];
+
+    fn with_gd_k(vd: &[u8]) -> Vec<u8> {
+        let mut e = GD_K.to_vec();
+        e.extend_from_slice(vd);
+        e
+    }
+
+    #[test]
+    fn value_delta_uint_zero_omits_ui() {
+        // {at:2}
+        assert_eq!(
+            gd_only(vec![(b"k", Some(TealValue::Uint(0)))]),
+            with_gd_k(&[0x81, 0xa2, b'a', b't', 0x02])
+        );
+    }
+
+    #[test]
+    fn value_delta_empty_bytes_omits_bs() {
+        // {at:1}
+        assert_eq!(
+            gd_only(vec![(b"k", Some(TealValue::Bytes(vec![])))]),
+            with_gd_k(&[0x81, 0xa2, b'a', b't', 0x01])
+        );
+    }
+
+    #[test]
+    fn value_delta_delete_is_only_at() {
+        assert_eq!(
+            gd_only(vec![(b"k", None)]),
+            with_gd_k(&[0x81, 0xa2, b'a', b't', 0x03])
+        );
+    }
+
+    #[test]
+    fn value_delta_nonzero_uint_and_nonempty_bytes_keep_fields() {
+        assert_eq!(
+            gd_only(vec![(b"k", Some(TealValue::Uint(7)))]),
+            with_gd_k(&[0x82, 0xa2, b'a', b't', 0x02, 0xa2, b'u', b'i', 0x07])
+        );
+        // `bs` is a msgpack str (go AppendString), not bin.
+        assert_eq!(
+            gd_only(vec![(b"k", Some(TealValue::Bytes(b"xy".to_vec())))]),
+            with_gd_k(&[0x82, 0xa2, b'a', b't', 0x01, 0xa2, b'b', b's', 0xa2, b'x', b'y'])
+        );
+        // Non-UTF-8 bytes are still written as str (raw bytes).
+        assert_eq!(
+            gd_only(vec![(b"k", Some(TealValue::Bytes(vec![0xff])))]),
+            with_gd_k(&[0x82, 0xa2, b'a', b't', 0x01, 0xa2, b'b', b's', 0xa1, 0xff])
+        );
+    }
+
+    /// A mix in one `gd`: keys sorted bytewise and written as str, each value
+    /// delta omitting its zero fields.
+    #[test]
+    fn state_delta_mix_sorted_str_keys() {
+        let got = gd_only(vec![
+            (b"zz", Some(TealValue::Uint(0))),
+            (b"a", Some(TealValue::Bytes(b"q".to_vec()))),
+            (b"m", None),
+            (&[0xff], Some(TealValue::Uint(1))),
+            (b"b", Some(TealValue::Bytes(vec![]))),
+        ]);
+        let want: Vec<u8> = vec![
+            0x81, 0xa2, b'g', b'd', 0x85, // gd: 5 entries
+            0xa1, b'a', 0x82, 0xa2, b'a', b't', 0x01, 0xa2, b'b', b's', 0xa1, b'q', //
+            0xa1, b'b', 0x81, 0xa2, b'a', b't', 0x01, //
+            0xa1, b'm', 0x81, 0xa2, b'a', b't', 0x03, //
+            0xa2, b'z', b'z', 0x81, 0xa2, b'a', b't', 0x02, //
+            0xa1, 0xff, 0x82, 0xa2, b'a', b't', 0x02, 0xa2, b'u', b'i', 0x01,
+        ];
+        // 0xff sorts after every ASCII key (go `SortString` is bytewise).
+        assert_eq!(got, want);
+    }
+
+    /// Whole EvalDelta: field order gd, ld, lg, sa (itx absent), `ld` keys
+    /// ascending, `lg` entries str, `sa` entries bin32.
+    #[test]
+    fn eval_delta_field_order_and_typing() {
+        let sender = Address([1u8; 32]);
+        let acct = Address([2u8; 32]);
+        let raw = Address([3u8; 32]);
+        let txn = Transaction {
+            sender,
+            accounts: Some(vec![acct]),
+            ..Transaction::default()
+        };
+        let mut result = algo_avm::eval::AvmResult::empty();
+        result
+            .global_delta
+            .insert(b"g".to_vec(), Some(TealValue::Uint(0)));
+        for a in [raw, acct, sender] {
+            result
+                .local_deltas
+                .entry(a)
+                .or_default()
+                .insert(b"l".to_vec(), Some(TealValue::Bytes(vec![])));
+        }
+        result.logs = vec![b"hi".to_vec(), vec![0xfe]];
+        let got = wire(&encode_eval_delta(&result, &txn, true).unwrap());
+
+        let ld_entry = |idx: u8| -> Vec<u8> {
+            vec![
+                idx, 0x81, 0xa1, b'l', 0x81, 0xa2, b'a', b't', 0x01, // idx: {l: {at:1}}
+            ]
+        };
+        let mut want: Vec<u8> = vec![0x84];
+        want.extend([
+            0xa2, b'g', b'd', 0x81, 0xa1, b'g', 0x81, 0xa2, b'a', b't', 0x02,
+        ]);
+        want.extend([0xa2, b'l', b'd', 0x83]);
+        want.extend(ld_entry(0)); // sender
+        want.extend(ld_entry(1)); // accounts[0]
+        want.extend(ld_entry(2)); // sa[0]
+        want.extend([0xa2, b'l', b'g', 0x92, 0xa2, b'h', b'i', 0xa1, 0xfe]);
+        want.extend([0xa2, b's', b'a', 0x91, 0xc4, 0x20]);
+        want.extend([3u8; 32]);
+        assert_eq!(got, want);
+    }
+
+    /// Decode accepts both the omitted and the explicit zero forms (and the
+    /// legacy bin/str spellings) and yields the same `ValueDelta`.
+    #[test]
+    fn parse_value_delta_omitted_and_explicit_zero_agree() {
+        let omitted = Value::Map(vec![(Value::from("at"), Value::from(2u64))]);
+        let explicit = Value::Map(vec![
+            (Value::from("at"), Value::from(2u64)),
+            (Value::from("ui"), Value::from(0u64)),
+            (Value::from("bs"), Value::Binary(vec![])),
+        ]);
+        assert_eq!(
+            parse_value_delta(&omitted).unwrap(),
+            parse_value_delta(&explicit).unwrap()
+        );
+        let b_omitted = Value::Map(vec![(Value::from("at"), Value::from(1u64))]);
+        let b_explicit = Value::Map(vec![
+            (Value::from("at"), Value::from(1u64)),
+            (Value::from("bs"), Value::from("")),
+            (Value::from("ui"), Value::from(0u64)),
+        ]);
+        let d = parse_value_delta(&b_omitted).unwrap();
+        assert_eq!(d, parse_value_delta(&b_explicit).unwrap());
+        assert_eq!(
+            (d.action, d.uint, d.bytes.len()),
+            (DeltaAction::SetBytes, 0, 0)
+        );
+    }
+
+    /// Encode -> wire -> decode of a str-typed non-UTF-8 key/value survives.
+    #[test]
+    fn non_utf8_str_keys_and_bs_roundtrip_through_wire() {
+        let bytes = gd_only(vec![(
+            &[0xff, 0x00],
+            Some(TealValue::Bytes(vec![0xfe, 0x80])),
+        )]);
+        let v = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+        let ed = parse_eval_delta(&v).unwrap();
+        let gd = ed.global_delta.unwrap();
+        let vd = &gd[&vec![0xffu8, 0x00]];
+        assert_eq!(vd.bytes, vec![0xfe, 0x80]);
+        assert_eq!(wire(&v), bytes, "re-encoding the decoded value is stable");
+    }
+
+    /// Issue #1705 review: a nested `itx` entry's own `dt` must keep str
+    /// typing for non-UTF-8 keys/logs at every depth (rmp_serde + read_value
+    /// of the inner stx turned them into bin).
+    #[test]
+    fn inner_txn_dt_keeps_str_for_non_utf8_at_depth() {
+        let mut child = algo_avm::eval::AvmResult::empty();
+        child
+            .global_delta
+            .insert(vec![0xff], Some(TealValue::Bytes(vec![0x80])));
+        child.logs = vec![vec![0xfe]];
+        let child_dt = encode_eval_delta(&child, &Transaction::default(), true);
+        let inner = SignedTransaction {
+            eval_delta: child_dt,
+            ..SignedTransaction::default()
+        };
+        let mut parent = algo_avm::eval::AvmResult::empty();
+        parent.inner_transactions = vec![inner];
+        let dt = encode_eval_delta(&parent, &Transaction::default(), true).unwrap();
+        let bytes = wire(&dt);
+        let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+        assert!(has(&[0xa1, 0xff]), "inner gd key must be str");
+        assert!(has(&[0xa2, b'b', b's', 0xa1, 0x80]), "inner bs must be str");
+        assert!(
+            has(&[0xa2, b'l', b'g', 0x91, 0xa1, 0xfe]),
+            "inner lg must be str"
+        );
+        assert!(
+            !has(&[0xc4, 0x01, 0xff]) && !has(&[0xc4, 0x01, 0xfe]) && !has(&[0xc4, 0x01, 0x80])
+        );
     }
 }

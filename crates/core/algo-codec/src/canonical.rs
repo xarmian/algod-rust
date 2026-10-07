@@ -176,7 +176,7 @@ impl CanonicalMap {
         if let Some(v) = val {
             if !is_rmpv_empty(v) {
                 let mut buf = Vec::new();
-                rmpv::encode::write_value(&mut buf, v).unwrap();
+                write_value_str_preserving(&mut buf, v).unwrap();
                 self.fields.push((key, buf));
             }
         }
@@ -371,6 +371,59 @@ fn write_int(buf: &mut Vec<u8>, val: i64) {
         rmp::encode::write_i32(buf, val as i32).unwrap();
     } else {
         rmp::encode::write_i64(buf, val).unwrap();
+    }
+}
+
+/// Write the msgpack `str` length-marker + raw bytes for a string field,
+/// unconditionally (regardless of whether `bytes` happens to be valid
+/// UTF-8) — matching go-algorand's own msgpack encoder, which never
+/// validates a Go `string`'s bytes before writing it with a `str` type
+/// marker. Implemented with `rmp::encode::write_str_len`.
+pub fn write_str_marker_and_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
+    rmp::encode::write_str_len(buf, bytes.len() as u32).expect("Vec write is infallible");
+    buf.extend_from_slice(bytes);
+}
+
+/// Re-encode an `rmpv::Value` to its msgpack bytes, recursing into
+/// `Array`/`Map` (whose entries may themselves contain a `String`), but with
+/// one deliberate deviation from `rmpv::encode::write_value`: a
+/// [`rmpv::Value::String`] is **always** written using the `str` type
+/// marker with its raw bytes (via [`write_str_marker_and_bytes`]), even when
+/// those bytes aren't valid UTF-8.
+///
+/// `rmpv::encode::write_value` (see `rmpv-1.3.1/src/encode/value.rs`)
+/// writes `Value::String(Utf8String { s: Err(err) })` — i.e. a decoded
+/// `str` whose bytes failed UTF-8 validation — as a `bin` instead of a
+/// `str`, changing the wire type-marker byte from what go-algorand's own
+/// encoder actually wrote (go never validates a Go `string`'s bytes before
+/// encoding, so it always emits `str`, valid UTF-8 or not). Every other
+/// `rmpv::Value` variant delegates straight to `rmpv::encode::write_value`,
+/// which has no equivalent hazard for them.
+pub fn write_value_str_preserving(
+    buf: &mut Vec<u8>,
+    value: &rmpv::Value,
+) -> Result<(), rmpv::encode::Error> {
+    match value {
+        rmpv::Value::String(s) => {
+            write_str_marker_and_bytes(buf, s.as_bytes());
+            Ok(())
+        }
+        rmpv::Value::Array(items) => {
+            rmp::encode::write_array_len(buf, items.len() as u32)?;
+            for item in items {
+                write_value_str_preserving(buf, item)?;
+            }
+            Ok(())
+        }
+        rmpv::Value::Map(entries) => {
+            rmp::encode::write_map_len(buf, entries.len() as u32)?;
+            for (k, v) in entries {
+                write_value_str_preserving(buf, k)?;
+                write_value_str_preserving(buf, v)?;
+            }
+            Ok(())
+        }
+        other => rmpv::encode::write_value(buf, other),
     }
 }
 
