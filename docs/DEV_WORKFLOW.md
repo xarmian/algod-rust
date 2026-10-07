@@ -1417,12 +1417,12 @@ are unaffected.
 
 Txtail rows (`txtail` table, serialized `TxTailRound`) now record the txids
 of the genesis-field-restored transactions, as go's `TxTailRoundFromBlock`
-does. Before the fix, blocks applied in `ApplyMode::Replay` and the
-catchpoint lookback path recorded stripped-form ids that never matched a
-real txid lookup. Rows persist on disk and there is no rebuild-on-open, so
-after upgrading, rows written by the old build keep their stripped-form ids.
-They only feed the duplicate-confirmed-txid cache, whose window is
-`LOOKBACK_ROUNDS = 1000` rounds (non-archival nodes also delete rows older
-than `MaxTxnLife + DeeperBlockHeaderHistory`), so the stale ids age out
-within about 1000 rounds of the upgrade; no action is required. Leases in
-the rows are keyed by sender and lease, not txid, and are unaffected.
+does. Older builds wrote stripped-form ids for blocks applied in
+`ApplyMode::Replay` and for the catchpoint lookback path. On the first open
+after the upgrade, `SqliteLedger::init` runs a one-shot repair
+(`repair_txtail_restored_txids`, guarded by the `catchpointstate` marker
+`algod_rust_txtail_restored_txid_v1`) that rebuilds the existing txtail rows
+of the last `LOOKBACK_ROUNDS` (1000) rounds from the stored blocks, so
+duplicate-txid detection is correct immediately. It costs at most ~1000 block
+decodes once, runs in one transaction with the marker, and leaves older rows
+(outside the dup-check window) alone. No operator action is needed.

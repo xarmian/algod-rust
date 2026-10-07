@@ -22,7 +22,7 @@ mod canonical;
 mod digest;
 
 pub use canonical::{
-    build_txtail_from_block, canonical_encode_account_application_model,
+    build_txtail_from_block, build_txtail_from_block_with_rule, canonical_encode_account_application_model,
     canonical_encode_account_asset_model, canonical_encode_account_data,
     canonical_encode_app_local_state, canonical_encode_app_params, canonical_encode_asset_holding,
     canonical_encode_base_account_data, canonical_encode_base_online_account_data,
@@ -41,7 +41,7 @@ pub use canonical::{
 };
 pub use digest::{
     compute_block_digest, compute_block_header_digest, compute_block_header_digest_512,
-    compute_group_id, compute_group_id_from_hashes, compute_txn_id,
+    compute_group_id, compute_group_id_from_hashes, compute_txn_id, compute_txn_id_with_genesis,
 };
 
 use algo_error::{AlgoError, Result};

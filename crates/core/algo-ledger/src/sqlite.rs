@@ -550,6 +550,63 @@ fn normalize_kvstore_nulls(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Marker key written to `catchpointstate` once the txtail restored-txid
+/// repair (issue #1707) has run.
+const TXTAIL_RESTORED_TXID_MARKER: &str = "algod_rust_txtail_restored_txid_v1";
+
+/// One-shot repair of txtail rows written by builds that hashed the STRIPPED
+/// payset (issue #1707). Rebuilds the rows of the retained duplicate-check
+/// window (`LOOKBACK_ROUNDS` rounds below the newest stored block) from the
+/// stored blocks with the current builder, so duplicate-txid detection is
+/// correct immediately after an upgrade. Only rounds that already have a
+/// txtail row AND a decodable stored block are touched. Runs once, guarded by
+/// a `catchpointstate` marker (Go ignores unknown keys); at most ~1000 block
+/// decodes. The marker is written in the same transaction as the rebuilt rows.
+fn repair_txtail_restored_txids(conn: &Connection) -> rusqlite::Result<()> {
+    let done: Option<i64> = conn
+        .query_row(
+            "SELECT intval FROM catchpointstate WHERE id = ?1",
+            [TXTAIL_RESTORED_TXID_MARKER],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if done == Some(1) {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    let max_rnd: Option<i64> =
+        tx.query_row("SELECT MAX(rnd) FROM blockdb.blocks", [], |r| r.get(0))?;
+    if let Some(max_rnd) = max_rnd {
+        let lo = max_rnd.saturating_sub(crate::txtail_cache::LOOKBACK_ROUNDS as i64);
+        let rows: Vec<(i64, Vec<u8>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT b.rnd, b.blkdata FROM blockdb.blocks b
+                 JOIN txtail t ON t.rnd = b.rnd
+                 WHERE b.rnd > ?1 AND b.blkdata IS NOT NULL",
+            )?;
+            let it = stmt.query_map([lo], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            it.collect::<rusqlite::Result<_>>()?
+        };
+        for (rnd, blkdata) in rows {
+            let Ok(block) = algo_codec::decode_block(&blkdata) else {
+                continue;
+            };
+            let data = algo_codec::canonical_encode_txtail_round(
+                &algo_codec::build_txtail_from_block(&block),
+            );
+            tx.execute(
+                "UPDATE txtail SET data = ?2 WHERE rnd = ?1",
+                params![rnd, data],
+            )?;
+        }
+    }
+    tx.execute(
+        "INSERT OR REPLACE INTO catchpointstate (id, intval) VALUES (?1, 1)",
+        [TXTAIL_RESTORED_TXID_MARKER],
+    )?;
+    tx.commit()
+}
+
 /// Upgrade pre-G5 Rust DBs whose `resources.ctype` was declared `INTEGER`
 /// (nullable) to Go's post-migration shape `INTEGER NOT NULL DEFAULT -1`.
 /// SQLite can't change a column's `NOT NULL` in place, so we rebuild the
@@ -2599,6 +2656,11 @@ impl SqliteLedger {
         // keys) and skip the UPDATE once the migration has run.
         normalize_kvstore_nulls(&conn).map_err(|e| AlgoError::Ledger {
             message: format!("kvstore NULL normalization error: {e}"),
+        })?;
+
+        // Issue #1707: one-shot repair of stripped-form txtail txids.
+        repair_txtail_restored_txids(&conn).map_err(|e| AlgoError::Ledger {
+            message: format!("txtail restored-txid repair error: {e}"),
         })?;
 
         // G6 part 2 (TASK-106): rename any legacy Rust-only
@@ -12481,6 +12543,77 @@ mod tests {
         // The one round that *is* stored still resolves correctly -- the
         // "no entry" result above is round-specific, not a wholesale outage.
         assert!(ledger.get_block_header_data(10).unwrap().is_some());
+    }
+
+    /// Issue #1707: a ledger holding txtail rows written with stripped-form
+    /// txids (older builds) is repaired once on open from the stored blocks.
+    #[test]
+    fn open_repairs_stripped_form_txtail_rows_once() {
+        use algo_types::consensus::CONSENSUS_V41;
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+
+        let mut stx = algo_types::SignedTransaction::default();
+        stx.txn.txn_type = "pay".into();
+        stx.txn.sender = algo_types::Address([1u8; 32]);
+        stx.txn.fee = 1000;
+        stx.txn.last_valid = Round(50);
+        stx.has_genesis_id = true;
+        let block = algo_types::Block {
+            round: Round(7),
+            genesis_id: "gid".into(),
+            genesis_hash: [5u8; 32],
+            current_protocol: CONSENSUS_V41.into(),
+            payset: vec![stx.clone()],
+            ..Default::default()
+        };
+        let mut full = stx.txn.clone();
+        full.genesis_id = "gid".into();
+        full.genesis_hash = [5u8; 32];
+        let full_id = algo_codec::compute_txn_id(&full);
+        let stripped_id = algo_codec::compute_txn_id(&stx.txn);
+
+        let mut old_tail = algo_codec::build_txtail_from_block(&block);
+        old_tail.txn_ids[0] = serde_bytes::ByteBuf::from(stripped_id.0.to_vec());
+        let old_row = algo_codec::canonical_encode_txtail_round(&old_tail);
+        let ids_of = |l: &SqliteLedger| -> Vec<u8> {
+            let row = l.get_txtail(7).unwrap().unwrap();
+            let t: algo_types::TxTailRound = rmp_serde::from_slice(&row).unwrap();
+            t.txn_ids[0].to_vec()
+        };
+
+        {
+            let mut l = SqliteLedger::open_with_prefix(&prefix).unwrap();
+            l.put_block(
+                7,
+                CONSENSUS_V41,
+                &algo_codec::canonical_encode_block_header_from_block(&block),
+                &algo_codec::canonical_encode_block(&block),
+            )
+            .unwrap();
+            l.put_txtail(7, &old_row).unwrap();
+        }
+        // The marker from the (empty-ledger) first open must not hide the
+        // old rows: clear it to model a ledger created by an older build.
+        rusqlite::Connection::open(tracker_path_for_prefix(&prefix))
+            .unwrap()
+            .execute(
+                "DELETE FROM catchpointstate WHERE id = ?1",
+                [TXTAIL_RESTORED_TXID_MARKER],
+            )
+            .unwrap();
+
+        let l = SqliteLedger::open_with_prefix(&prefix).unwrap();
+        assert_eq!(ids_of(&l), full_id.0.to_vec(), "row repaired on open");
+        drop(l);
+
+        // Marker set: a later open does not touch rows again.
+        {
+            let mut l = SqliteLedger::open_with_prefix(&prefix).unwrap();
+            l.put_txtail(7, &old_row).unwrap();
+        }
+        let l = SqliteLedger::open_with_prefix(&prefix).unwrap();
+        assert_eq!(ids_of(&l), stripped_id.0.to_vec(), "repair runs once");
     }
 
     #[test]
