@@ -800,6 +800,12 @@ pub trait AvmContext {
     fn take_local_deltas(&mut self) -> HashMap<Address, HashMap<Vec<u8>, Option<TealValue>>> {
         HashMap::new()
     }
+
+    /// Take the first-creation order of the local deltas (see
+    /// `AvmResult::local_delta_order`), leaving it empty.
+    fn take_local_delta_order(&mut self) -> Vec<Address> {
+        Vec::new()
+    }
 }
 
 // ---------------------------------------------------------------------------

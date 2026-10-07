@@ -622,9 +622,22 @@ pub fn canonical_encode_signed_transaction(stx: &SignedTransaction) -> Vec<u8> {
 /// and ApplyData fields).
 /// This is the encoding used in block payset arrays and for STIB hash computation.
 pub fn canonical_encode_signed_txn_in_block(stx: &SignedTransaction) -> Vec<u8> {
+    encode_signed_txn_apply_data(stx, true)
+}
+
+/// Canonically encode a `SignedTxnWithAD` (go `data/transactions/signedtxn.go`:
+/// `SignedTxn` + embedded `ApplyData`, `codec:",omitempty,omitemptyarray"`),
+/// the element type of `EvalDelta.InnerTxns` (`itx`). Identical to
+/// [`canonical_encode_signed_txn_in_block`] minus `hgi`/`hgh`, which belong to
+/// `SignedTxnInBlock` only. An all-zero value is the empty map `0x80`.
+pub fn canonical_encode_signed_txn_with_ad(stx: &SignedTransaction) -> Vec<u8> {
+    encode_signed_txn_apply_data(stx, false)
+}
+
+fn encode_signed_txn_apply_data(stx: &SignedTransaction, block_wrapper: bool) -> Vec<u8> {
     let mut m = CanonicalMap::new();
 
-    // ApplyData fields (flattened from SignedTxnWithAD → ApplyData)
+    // ApplyData fields (flattened from SignedTxnWithAD -> ApplyData)
     m.add_u64("aca", stx.asset_closing_amount);
     m.add_u64("apid", stx.apply_data_application_id);
     m.add_u64("ca", stx.closing_amount);
@@ -632,8 +645,10 @@ pub fn canonical_encode_signed_txn_in_block(stx: &SignedTransaction) -> Vec<u8> 
     m.add_option_rmpv("dt", &stx.eval_delta);
 
     // SignedTxnInBlock wrapper fields
-    m.add_bool("hgh", stx.has_genesis_hash);
-    m.add_bool("hgi", stx.has_genesis_id);
+    if block_wrapper {
+        m.add_bool("hgh", stx.has_genesis_hash);
+        m.add_bool("hgi", stx.has_genesis_id);
+    }
 
     // SignedTxn fields
     if let Some(ref lsig) = stx.lsig {

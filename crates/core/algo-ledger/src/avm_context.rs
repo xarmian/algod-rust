@@ -1322,6 +1322,10 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     /// delta that pre-`NoEmptyLocalDeltas` (pre-v27) `EvalDelta` encoding
     /// needs to conditionally include.
     local_delta_touched: std::collections::HashSet<Address>,
+    /// First-creation sequence number of each local-delta address (go's
+    /// `ensureLocalDelta` moment), which fixes the `sa` (SharedAccts) order.
+    /// Hash lookup, so noting an address on the write hot path is O(1).
+    local_delta_seq: HashMap<Address, usize>,
 
     /// Optional execution tracer for capturing opcode-level details.
     /// Used by the simulation engine for tracing inner transactions.
@@ -2202,7 +2206,15 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// Call sites: the top-level and inner `appl` OptIn paths, right after
     /// `apply_appl_opt_in_pre_program` runs and this context exists.
     pub(crate) fn mark_local_delta_touch(&mut self, addr: Address) {
+        self.note_local_delta_order(addr);
         self.local_delta_touched.insert(addr);
+    }
+
+    /// Remember the first time `addr` gets a local delta (see
+    /// `local_delta_seq`).
+    fn note_local_delta_order(&mut self, addr: Address) {
+        let next = self.local_delta_seq.len();
+        self.local_delta_seq.entry(addr).or_insert(next);
     }
 
     /// Core asset-reference resolution, matching go-algorand's
@@ -2438,6 +2450,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             global_delta_tracker: HashMap::new(),
             local_delta_tracker: HashMap::new(),
             local_delta_touched: std::collections::HashSet::new(),
+            local_delta_seq: HashMap::new(),
             tracer_ptr: None,
             max_log_calls: MAX_LOG_CALLS,
             max_log_size: MAX_LOG_SIZE,
@@ -4305,6 +4318,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         AvmResult {
             global_delta: std::collections::HashMap::new(),
             local_deltas: std::collections::HashMap::new(),
+            local_delta_order: Vec::new(),
             inner_transactions,
             logs: self.logs.clone(),
             approved,
@@ -5690,6 +5704,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         // that merely re-asserts it is a no-op for EvalDelta purposes
         // (issue #1325).
         if app_id == self.app_id && pre.as_ref() != Some(&value) {
+            self.note_local_delta_order(addr);
             self.local_delta_tracker
                 .insert((addr, key.to_vec()), Some(value));
         }
@@ -5734,6 +5749,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         // mechanism"), only record a delete when the key actually existed
         // beforehand -- deleting a never-set key is a ledger no-op.
         if app_id == self.app_id && key_existed {
+            self.note_local_delta_order(addr);
             self.local_delta_tracker.insert((addr, key.to_vec()), None);
         }
         Ok(())
@@ -7753,6 +7769,15 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         let tracker = std::mem::take(&mut self.global_delta_tracker);
         // Preserve None entries — they represent key deletions (app_global_del).
         tracker.into_iter().collect()
+    }
+
+    fn take_local_delta_order(&mut self) -> Vec<Address> {
+        let mut by_seq: Vec<(usize, Address)> = std::mem::take(&mut self.local_delta_seq)
+            .into_iter()
+            .map(|(a, i)| (i, a))
+            .collect();
+        by_seq.sort_unstable_by_key(|(i, _)| *i);
+        by_seq.into_iter().map(|(_, a)| a).collect()
     }
 
     fn take_local_deltas(&mut self) -> HashMap<Address, HashMap<Vec<u8>, Option<TealValue>>> {
@@ -9999,6 +10024,91 @@ mod tests {
             deltas.is_empty(),
             "re-writing a local key to its existing value must not record an EvalDelta entry, got {deltas:?}"
         );
+    }
+
+    fn opted_in_store(addrs: &[[u8; 32]]) -> LedgerState {
+        let mut store = LedgerState::new();
+        for a in addrs {
+            store.set_app_local_state(
+                &Address(*a),
+                42,
+                algo_types::AppLocalState {
+                    schema: StateSchema {
+                        num_uint: 4,
+                        num_byte_slice: 0,
+                    },
+                    key_value: BTreeMap::new(),
+                },
+            );
+        }
+        store
+    }
+
+    /// Issue #1740, end to end through the context: an app writes local
+    /// state for A (0x09..) then B (0x03..), neither in `accounts`; the
+    /// produced `dt` carries `sa == [A, B]` (first-creation order, go's
+    /// `ensureLocalDelta`), not address order [B, A].
+    #[test]
+    fn app_local_puts_to_unlisted_accounts_yield_sa_in_creation_order() {
+        let sender = [10u8; 32];
+        let (a, b) = ([9u8; 32], [3u8; 32]);
+        let txn = make_pay_txn(sender, [20u8; 32], 5000);
+        let mut store = opted_in_store(&[a, b]);
+        let mut ctx = make_context(&mut store, vec![txn.clone()]);
+        ctx.app_local_put(&a, 42, b"k", TealValue::Uint(1)).unwrap();
+        ctx.app_local_put(&b, 42, b"k", TealValue::Uint(2)).unwrap();
+        // a second write to A must not move it
+        ctx.app_local_put(&a, 42, b"k2", TealValue::Uint(3))
+            .unwrap();
+
+        let result = AvmResult {
+            local_deltas: algo_avm::context::AvmContext::take_local_deltas(&mut ctx),
+            local_delta_order: algo_avm::context::AvmContext::take_local_delta_order(&mut ctx),
+            ..AvmResult::empty()
+        };
+        assert_eq!(result.local_delta_order, vec![Address(a), Address(b)]);
+        let dt = crate::eval_delta::encode_eval_delta(&result, &txn.txn, true).unwrap();
+        let parsed = crate::eval_delta::parse_eval_delta(&dt).unwrap();
+        assert_eq!(parsed.shared_accts.unwrap(), vec![Address(a), Address(b)]);
+        let ld = parsed.local_deltas.unwrap();
+        assert!(ld.contains_key(&1) && ld.contains_key(&2));
+        assert_eq!(ld[&1][b"k".as_slice()].uint, 1, "A is sa[0] -> index 1");
+        assert_eq!(ld[&2][b"k".as_slice()].uint, 2, "B is sa[1] -> index 2");
+    }
+
+    /// Failed or no-op writes must not leave an order entry, and taking the
+    /// order drains it (nothing stale carries to the next call).
+    #[test]
+    fn local_delta_order_ignores_failed_and_noop_writes_and_drains() {
+        let sender = [10u8; 32];
+        let (a, b) = ([9u8; 32], [3u8; 32]);
+        let txn = make_pay_txn(sender, [20u8; 32], 5000);
+        let mut store = opted_in_store(&[a, b]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+
+        // rejected write (key too long) for B
+        let too_long = vec![b'v'; ctx.consensus.max_app_key_len + 1];
+        assert!(ctx
+            .app_local_put(&b, 42, &too_long, TealValue::Uint(1))
+            .is_err());
+        // write for an account that never opted in
+        assert!(ctx
+            .app_local_put(&[77u8; 32], 42, b"k", TealValue::Uint(1))
+            .is_err());
+        // no-op delete of a never-set key
+        ctx.app_local_del(&b, 42, b"none").unwrap();
+        assert!(algo_avm::context::AvmContext::take_local_delta_order(&mut ctx).is_empty());
+
+        ctx.app_local_put(&a, 42, b"k", TealValue::Uint(1)).unwrap();
+        assert_eq!(
+            algo_avm::context::AvmContext::take_local_delta_order(&mut ctx),
+            vec![Address(a)]
+        );
+        assert!(algo_avm::context::AvmContext::take_local_delta_order(&mut ctx).is_empty());
     }
 
     /// Sanity check that a genuinely new global key still records a delta --
