@@ -1822,16 +1822,24 @@ pub fn build_txtail_from_block(block: &Block) -> TxTailRound {
     let mut last_valid = Vec::with_capacity(block.payset.len());
     let mut leases = Vec::new();
 
+    // go's `TxTailRoundFromBlock` iterates the payset decoded through
+    // `BlockHeader.DecodeSignedTxn`, i.e. with the stripped genesis id/hash
+    // restored (issue #1707). The rule (one protocol lookup) is resolved once
+    // per block; transactions that need no restoring are borrowed, not cloned.
+    // Idempotent, so an already-restored block (Execute mode) is fine.
+    let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(block);
+
     for (idx, stx) in block.payset.iter().enumerate() {
-        let txid = compute_txn_id(&stx.txn);
+        let txn = rule.restored_txn(stx);
+        let txid = compute_txn_id(&txn);
         txn_ids.push(ByteBuf::from(txid.0.to_vec()));
-        last_valid.push(stx.txn.last_valid.0);
+        last_valid.push(txn.last_valid.0);
 
         // Check for non-zero lease (32-byte field)
-        if stx.txn.lease.iter().any(|&b| b != 0) {
+        if txn.lease.iter().any(|&b| b != 0) {
             leases.push(TxTailRoundLease {
-                sender: stx.txn.sender,
-                lease: ByteBuf::from(stx.txn.lease.to_vec()),
+                sender: txn.sender,
+                lease: ByteBuf::from(txn.lease.to_vec()),
                 txn_idx: idx as u64,
             });
         }

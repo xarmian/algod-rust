@@ -1412,3 +1412,17 @@ are unaffected.
   `algod_rust_sync_stalled_on_invalid_block`,
   `algod_rust_sync_stalled_block_round`,
   `algod_rust_ledger_apply_failures_total`.
+
+## Upgrading across the txtail restored-txid fix (issue #1707)
+
+Txtail rows (`txtail` table, serialized `TxTailRound`) now record the txids
+of the genesis-field-restored transactions, as go's `TxTailRoundFromBlock`
+does. Before the fix, blocks applied in `ApplyMode::Replay` and the
+catchpoint lookback path recorded stripped-form ids that never matched a
+real txid lookup. Rows persist on disk and there is no rebuild-on-open, so
+after upgrading, rows written by the old build keep their stripped-form ids.
+They only feed the duplicate-confirmed-txid cache, whose window is
+`LOOKBACK_ROUNDS = 1000` rounds (non-archival nodes also delete rows older
+than `MaxTxnLife + DeeperBlockHeaderHistory`), so the stale ids age out
+within about 1000 rounds of the upgrade; no action is required. Leases in
+the rows are keyed by sender and lease, not txid, and are unaffected.
