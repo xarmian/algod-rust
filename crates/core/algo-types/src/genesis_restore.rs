@@ -68,6 +68,34 @@ fn decide(stx: &SignedTransaction, require_genesis_hash: bool) -> (bool, bool) {
     (restore_id, restore_hash)
 }
 
+/// Why a payset entry is malformed for go's `BlockHeader.DecodeSignedTxn`
+/// (`data/bookkeeping/block.go:983-1020`, v5.0.2-stable).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GenesisFieldError {
+    /// The stripped txn still carries a non-empty `gen` (go: `GenesisID <%s> not empty`).
+    GenesisIdNotEmpty(String),
+    /// The stripped txn still carries a non-zero `gh` (go: `GenesisHash <%v> not empty`).
+    GenesisHashNotEmpty,
+    /// `hgh` is set although the protocol's `RequireGenesisHash` obviates it
+    /// (go: `HasGenesisHash set to true but RequireGenesisHash obviates the flag`).
+    HasGenesisHashObviated,
+}
+
+impl std::fmt::Display for GenesisFieldError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GenesisIdNotEmpty(g) => write!(f, "GenesisID <{g}> not empty"),
+            Self::GenesisHashNotEmpty => write!(f, "GenesisHash not empty"),
+            Self::HasGenesisHashObviated => write!(
+                f,
+                "HasGenesisHash set to true but RequireGenesisHash obviates the flag"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GenesisFieldError {}
+
 /// A block header's genesis-restoration rule, resolved ONCE per payset (the
 /// protocol lookup rebuilds `ConsensusParams`, so it must not run per
 /// transaction).
@@ -76,6 +104,9 @@ pub struct GenesisRestoreRule<'a> {
     genesis_id: &'a str,
     genesis_hash: &'a [u8; 32],
     require_genesis_hash: bool,
+    /// go's `SupportSignedTxnInBlock` (v11+): before it, go's
+    /// `DecodeSignedTxn` returns the txn untouched and performs no checks.
+    supports_stripped: bool,
 }
 
 impl<'a> GenesisRestoreRule<'a> {
@@ -90,16 +121,21 @@ impl<'a> GenesisRestoreRule<'a> {
             genesis_id,
             genesis_hash,
             require_genesis_hash,
+            supports_stripped: true,
         }
     }
 
     /// Rule for `block`'s header and `current_protocol` (one protocol lookup).
     pub fn for_block(block: &'a Block) -> Self {
-        Self::new(
+        let params = consensus_params_for_version(&block.current_protocol);
+        let mut rule = Self::new(
             &block.genesis_id,
             &block.genesis_hash,
-            protocol_requires_genesis_hash(&block.current_protocol),
-        )
+            params.as_ref().is_none_or(|p| p.require_genesis_hash),
+        );
+        // PaysetCommit is first set in v11, together with SupportSignedTxnInBlock.
+        rule.supports_stripped = params.is_none_or(|p| p.payset_commit != 0);
+        rule
     }
 
     /// Whether `stx` has any stripped field this rule would fill in. Pure
@@ -108,6 +144,41 @@ impl<'a> GenesisRestoreRule<'a> {
     pub fn needs_restore(&self, stx: &SignedTransaction) -> bool {
         let (id, hash) = decide(stx, self.require_genesis_hash);
         id || hash
+    }
+
+    /// go's `DecodeSignedTxn` rejection rules for a payset entry (pure
+    /// compares, no allocation on the success path): the stripped txn must
+    /// not carry `gen` or `gh`, and `hgh` must be unset when the protocol
+    /// has `RequireGenesisHash`. Protocols without `SupportSignedTxnInBlock`
+    /// (pre-v11) are exempt.
+    #[inline]
+    pub fn check_stripped(&self, stx: &SignedTransaction) -> Result<(), GenesisFieldError> {
+        if !self.supports_stripped {
+            return Ok(());
+        }
+        if !stx.txn.genesis_id.is_empty() {
+            return Err(GenesisFieldError::GenesisIdNotEmpty(
+                stx.txn.genesis_id.clone(),
+            ));
+        }
+        if stx.txn.genesis_hash != [0u8; 32] {
+            return Err(GenesisFieldError::GenesisHashNotEmpty);
+        }
+        if self.require_genesis_hash && stx.has_genesis_hash {
+            return Err(GenesisFieldError::HasGenesisHashObviated);
+        }
+        Ok(())
+    }
+
+    /// First violating payset index and error, in a single pass.
+    pub fn check_payset(
+        &self,
+        payset: &[SignedTransaction],
+    ) -> Result<(), (usize, GenesisFieldError)> {
+        payset
+            .iter()
+            .enumerate()
+            .try_for_each(|(i, stx)| self.check_stripped(stx).map_err(|e| (i, e)))
     }
 
     /// Fill the stripped genesis fields of `stx` in place.
@@ -192,7 +263,7 @@ pub fn restore_payset_genesis_fields(block: &Block) -> Vec<SignedTransaction> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consensus::{CONSENSUS_V15, CONSENSUS_V16, CONSENSUS_V41};
+    use crate::consensus::{CONSENSUS_V10, CONSENSUS_V15, CONSENSUS_V16, CONSENSUS_V41};
 
     const GID: &str = "gid";
     const GH: [u8; 32] = [9u8; 32];
@@ -257,6 +328,88 @@ mod tests {
     #[test]
     fn unknown_protocol_is_treated_as_hash_requiring() {
         assert!(protocol_requires_genesis_hash(""));
+    }
+
+    // go `DecodeSignedTxn` (data/bookkeeping/block.go:983-1020) rejection rules (#1727).
+    fn stripped(gen: &str, gh: [u8; 32], hgi: bool, hgh: bool) -> SignedTransaction {
+        let mut stx = SignedTransaction {
+            has_genesis_id: hgi,
+            has_genesis_hash: hgh,
+            ..SignedTransaction::default()
+        };
+        stx.txn.genesis_id = gen.into();
+        stx.txn.genesis_hash = gh;
+        stx
+    }
+
+    #[test]
+    fn strict_rejects_non_empty_gen_even_with_hgi() {
+        for proto in [CONSENSUS_V15, CONSENSUS_V41] {
+            for hgi in [false, true] {
+                let b = block(proto, hgi, false);
+                let rule = GenesisRestoreRule::for_block(&b);
+                assert_eq!(
+                    rule.check_stripped(&stripped("own", [0; 32], hgi, false)),
+                    Err(GenesisFieldError::GenesisIdNotEmpty("own".into()))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn strict_rejects_non_zero_gh_on_every_protocol() {
+        for proto in [CONSENSUS_V15, CONSENSUS_V41] {
+            for hgh in [false, true] {
+                let b = block(proto, false, hgh);
+                let rule = GenesisRestoreRule::for_block(&b);
+                let r = rule.check_stripped(&stripped("", GH, false, hgh));
+                assert_eq!(r, Err(GenesisFieldError::GenesisHashNotEmpty), "{proto}");
+            }
+        }
+    }
+
+    #[test]
+    fn strict_rejects_hgh_when_hash_required_only() {
+        let b = block(CONSENSUS_V41, false, true);
+        assert_eq!(
+            GenesisRestoreRule::for_block(&b).check_stripped(&stripped("", [0; 32], false, true)),
+            Err(GenesisFieldError::HasGenesisHashObviated)
+        );
+        let b = block(CONSENSUS_V15, false, true);
+        assert_eq!(
+            GenesisRestoreRule::for_block(&b).check_stripped(&stripped("", [0; 32], false, true)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn strict_accepts_valid_stripped_forms_and_pre_v11_full_txns() {
+        for (proto, hgi, hgh) in [
+            (CONSENSUS_V41, false, false),
+            (CONSENSUS_V41, true, false),
+            (CONSENSUS_V15, false, false),
+            (CONSENSUS_V15, true, true),
+        ] {
+            let b = block(proto, hgi, hgh);
+            let rule = GenesisRestoreRule::for_block(&b);
+            assert_eq!(
+                rule.check_stripped(&stripped("", [0; 32], hgi, hgh)),
+                Ok(()),
+                "{proto} hgi={hgi} hgh={hgh}"
+            );
+        }
+        // go: !SupportSignedTxnInBlock (pre-v11) returns the txn untouched,
+        // before any of the checks: full txns carry gen/gh.
+        let b = block(CONSENSUS_V10, false, false);
+        assert_eq!(
+            GenesisRestoreRule::for_block(&b).check_stripped(&stripped(
+                "mainnet-v1.0",
+                GH,
+                false,
+                false
+            )),
+            Ok(())
+        );
     }
 
     #[test]

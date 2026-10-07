@@ -122,6 +122,13 @@ pub enum BlockValidationError {
     /// load", `ledger/eval/eval.go`). Only checked when the block's protocol
     /// has `LoadTracking` enabled (v42+).
     BadLoad { expected: u64, actual: u64 },
+    /// A payset entry violates go's `BlockHeader.DecodeSignedTxn` rules for
+    /// stripped genesis fields (non-empty `gen`/`gh`, or `hgh` on a
+    /// `RequireGenesisHash` protocol).
+    PaysetGenesisFields {
+        index: usize,
+        error: algo_types::genesis_restore::GenesisFieldError,
+    },
 }
 
 impl fmt::Display for BlockValidationError {
@@ -199,6 +206,9 @@ impl fmt::Display for BlockValidationError {
             }
             Self::BadLoad { expected, actual } => {
                 write!(f, "bad load: {actual} != {expected}")
+            }
+            Self::PaysetGenesisFields { index, error } => {
+                write!(f, "payset txn {index}: {error}")
             }
         }
     }
@@ -332,6 +342,15 @@ pub fn validate_block_with_cache(
         fee_sink: block.fee_sink,
         rewards_pool: block.rewards_pool,
     };
+
+    // go `DecodeSignedTxn` rejects a stripped txn carrying gen/gh, or hgh on
+    // a RequireGenesisHash protocol (issue #1727). Checked on the raw payset,
+    // before restoration masks the fields.
+    if let Err((index, error)) = algo_types::genesis_restore::GenesisRestoreRule::for_block(block)
+        .check_payset(&block.payset)
+    {
+        errors.push(BlockValidationError::PaysetGenesisFields { index, error });
+    }
 
     let restored_payset = restore_payset_genesis_fields(block);
 
@@ -953,9 +972,8 @@ mod tests {
         msg.extend_from_slice(b"TX");
         msg.extend_from_slice(&canonical);
         let sig = key.sign(&msg);
-
-        // In the block, genesis fields are stripped. has_genesis_id and
-        // has_genesis_hash flags indicate they were present.
+        // In the block, genesis fields are stripped; has_genesis_id flags that gen was
+        // present (hgh stays unset on RequireGenesisHash protocols: go DecodeSignedTxn).
         let mut stripped_txn = txn;
         stripped_txn.genesis_id = String::new();
         stripped_txn.genesis_hash = [0u8; 32];
@@ -968,7 +986,7 @@ mod tests {
             pqsig: None,
             auth_addr: None,
             has_genesis_id: true,
-            has_genesis_hash: true,
+            has_genesis_hash: false,
             closing_amount: 0,
             asset_closing_amount: 0,
             sender_rewards: 0,
@@ -1195,6 +1213,80 @@ mod tests {
         assert!(result.total_txn_bytes > 0);
     }
 
+    // ── Strict stripped-genesis-field rules (issue #1727; go
+    // `BlockHeader.DecodeSignedTxn`, data/bookkeeping/block.go:983-1020) ──
+
+    fn has_genesis_field_error(result: &BlockValidationResult) -> bool {
+        result
+            .errors
+            .iter()
+            .any(|e| matches!(e, BlockValidationError::PaysetGenesisFields { .. }))
+    }
+
+    fn genesis_strict_block(proto: &str) -> Block {
+        let key = test_signing_key();
+        let mut stx = make_signed_txn(&key, 5000);
+        stx.txn.genesis_id = String::new();
+        stx.txn.genesis_hash = [0u8; 32];
+        let mut block = empty_block();
+        block.current_protocol = proto.into();
+        block.payset = vec![stx];
+        block.txn_commitment = compute_payset_merkle_root(&block);
+        set_expected_load(&mut block);
+        block
+    }
+
+    fn run_strict(block: &Block) -> BlockValidationResult {
+        validate_block(block, Some(90), "test-v1", &test_genesis_hash(), None)
+    }
+
+    #[test]
+    fn strict_genesis_valid_stripped_forms_not_flagged() {
+        for (proto, hgi, hgh) in [
+            (algo_types::consensus::CONSENSUS_V41, false, false),
+            (algo_types::consensus::CONSENSUS_V41, true, false),
+            (algo_types::consensus::CONSENSUS_V15, false, false),
+            (algo_types::consensus::CONSENSUS_V15, true, true),
+        ] {
+            let mut b = genesis_strict_block(proto);
+            b.payset[0].has_genesis_id = hgi;
+            b.payset[0].has_genesis_hash = hgh;
+            assert!(!has_genesis_field_error(&run_strict(&b)), "{proto}");
+        }
+    }
+
+    #[test]
+    fn strict_genesis_rejects_non_empty_gen() {
+        for hgi in [false, true] {
+            let mut b = genesis_strict_block(algo_types::consensus::CONSENSUS_V41);
+            b.payset[0].txn.genesis_id = "test-v1".into();
+            b.payset[0].has_genesis_id = hgi;
+            let r = run_strict(&b);
+            assert!(!r.is_valid && has_genesis_field_error(&r), "{:?}", r.errors);
+        }
+    }
+
+    #[test]
+    fn strict_genesis_rejects_non_zero_gh() {
+        for proto in [
+            algo_types::consensus::CONSENSUS_V41,
+            algo_types::consensus::CONSENSUS_V15,
+        ] {
+            let mut b = genesis_strict_block(proto);
+            b.payset[0].txn.genesis_hash = test_genesis_hash();
+            let r = run_strict(&b);
+            assert!(!r.is_valid && has_genesis_field_error(&r), "{proto}");
+        }
+    }
+
+    #[test]
+    fn strict_genesis_rejects_hgh_on_require_genesis_hash_protocol() {
+        let mut b = genesis_strict_block(algo_types::consensus::CONSENSUS_V41);
+        b.payset[0].has_genesis_hash = true;
+        let r = run_strict(&b);
+        assert!(!r.is_valid && has_genesis_field_error(&r), "{:?}", r.errors);
+    }
+
     // ── FirstValid/LastValid round liveness (issue #1152, ported from
     // go-algorand's `TestAlive`, `data/bookkeeping/block_test.go:1279`) ──
     //
@@ -1250,7 +1342,7 @@ mod tests {
             pqsig: None,
             auth_addr: None,
             has_genesis_id: true,
-            has_genesis_hash: true,
+            has_genesis_hash: false,
             closing_amount: 0,
             asset_closing_amount: 0,
             sender_rewards: 0,

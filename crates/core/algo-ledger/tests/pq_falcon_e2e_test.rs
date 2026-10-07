@@ -121,6 +121,16 @@ fn minimal_block(genesis_hash: [u8; 32], fee_sink: Address, round: u64) -> Block
 /// otherwise fail validation on the unrelated Load field rather than the
 /// signature/fee/wellformedness behavior each scenario actually exercises.
 fn assert_block_validates(block: &mut Block, genesis_hash: &[u8; 32]) {
+    // Blocks store payset txns stripped (go `DecodeSignedTxn` rejects a txn
+    // still carrying gen/gh, issue #1727); the header supplies them back.
+    for stx in &mut block.payset {
+        if !stx.txn.genesis_id.is_empty() {
+            stx.has_genesis_id = true;
+            stx.txn.genesis_id.clear();
+        }
+        stx.txn.genesis_hash = [0u8; 32];
+        stx.has_genesis_hash = false;
+    }
     let total_bytes: usize = block
         .payset
         .iter()
