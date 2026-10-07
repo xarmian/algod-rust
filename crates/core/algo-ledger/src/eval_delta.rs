@@ -277,17 +277,15 @@ pub fn encode_eval_delta(
             .iter()
             .filter(|(_, kv)| !no_empty_local_deltas || !kv.is_empty())
             .collect();
-        items.sort_by_key(|(addr, _)| addr.0);
         // `sa` is appended in first-creation order (go `ensureLocalDelta`);
-        // stable sort keeps address order for any address the AVM did not
-        // report an order for.
-        items.sort_by_key(|(addr, _)| {
-            result
-                .local_delta_order
-                .iter()
-                .position(|a| a == *addr)
-                .unwrap_or(usize::MAX)
-        });
+        // addresses the AVM reported no order for sort last, by address.
+        let order: HashMap<&Address, usize> = result
+            .local_delta_order
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (a, i))
+            .collect();
+        items.sort_by_key(|(addr, _)| (order.get(*addr).copied().unwrap_or(usize::MAX), addr.0));
 
         if !items.is_empty() {
             let mut shared: Vec<Address> = Vec::new();
@@ -328,9 +326,13 @@ pub fn encode_eval_delta(
         let itx: Vec<Value> = result
             .inner_transactions
             .iter()
-            .filter_map(|stx| {
+            .map(|stx| {
                 let bytes = algo_codec::canonical_encode_signed_txn_with_ad(stx);
-                rmpv::decode::read_value(&mut &bytes[..]).ok()
+                // The canonical encoder just produced these bytes: failing to
+                // read them back is an encoder bug, never a reason to drop an
+                // inner transaction from the block.
+                rmpv::decode::read_value(&mut &bytes[..])
+                    .expect("canonical SignedTxnWithAD bytes are well-formed msgpack")
             })
             .collect();
         if !itx.is_empty() {
@@ -612,6 +614,30 @@ fn parse_inner_txn(item: &rmpv::Value) -> Result<SignedTransaction, AlgoError> {
             if !matches!(v, rmpv::Value::Nil) {
                 dt = Some(v);
             }
+        }
+    }
+    // go omits zero-valued fields, so an inner txn may lack `txn`, `type` or
+    // `snd`. The strict `SignedTransaction` serde decode (shared with gossip /
+    // REST submit) must keep requiring them, so the leniency lives only here:
+    // fill the zero values before decoding.
+    if let rmpv::Value::Map(fields) = &mut item {
+        fn slot<'a>(
+            fields: &'a mut Vec<(rmpv::Value, rmpv::Value)>,
+            key: &str,
+            zero: rmpv::Value,
+        ) -> &'a mut rmpv::Value {
+            let pos = match fields.iter().position(|(k, _)| k.as_str() == Some(key)) {
+                Some(p) => p,
+                None => {
+                    fields.push((rmpv::Value::from(key), zero));
+                    fields.len() - 1
+                }
+            };
+            &mut fields[pos].1
+        }
+        if let rmpv::Value::Map(txn) = slot(fields, "txn", rmpv::Value::Map(Vec::new())) {
+            slot(txn, "type", rmpv::Value::from(""));
+            slot(txn, "snd", rmpv::Value::Binary(vec![0u8; 32]));
         }
     }
     let mut msgpack_bytes = Vec::new();
@@ -1966,32 +1992,12 @@ mod tests {
     /// carrying `itx` and `lg`): the `itx` value of that txn's `dt`, 987 bytes,
     /// sliced verbatim from
     /// `https://mainnet-api.algonode.cloud/v2/blocks/53000003?format=msgpack`
-    /// (public chain data, no trimming or re-encoding). Every inner txn must
+    /// (public chain data, no trimming or re-encoding); provenance and
+    /// regeneration in `fixtures/README.md`. Every inner txn must
     /// decode and re-encode through the canonical `SignedTxnWithAD` encoder to
     /// the identical bytes.
-    const MAINNET_53000003_TXN3_ITX_HEX: &str = concat!(
-        "9282a2647482a36974789482a3616361ce026487cfa374786e87a661636c6f7365c420d41b66fe68886dea8a7a710342",
-        "3d1ca26d59cc5a31c507283b3743e194cc21d6a461726376c420d41b66fe68886dea8a7a7103423d1ca26d59cc5a31c5",
-        "07283b3743e194cc21d6a26676ce0328b741a26c76ce0328b74ba3736e64c42040582705e7d416b9d6adfefd04766748",
-        "bfbf8c7f08f311f6710e4d113431ba89a474797065a56178666572a478616964ce01e1ab7081a374786e87a661636c6f",
-        "7365c420d41b66fe68886dea8a7a7103423d1ca26d59cc5a31c507283b3743e194cc21d6a461726376c420d41b66fe68",
-        "886dea8a7a7103423d1ca26d59cc5a31c507283b3743e194cc21d6a26676ce0328b741a26c76ce0328b74ba3736e64c4",
-        "2040582705e7d416b9d6adfefd04766748bfbf8c7f08f311f6710e4d113431ba89a474797065a56178666572a4786169",
-        "64cebbcb467881a374786e87a661636c6f7365c420d41b66fe68886dea8a7a7103423d1ca26d59cc5a31c507283b3743",
-        "e194cc21d6a461726376c420d41b66fe68886dea8a7a7103423d1ca26d59cc5a31c507283b3743e194cc21d6a26676ce",
-        "0328b741a26c76ce0328b74ba3736e64c42040582705e7d416b9d6adfefd04766748bfbf8c7f08f311f6710e4d113431",
-        "ba89a474797065a56178666572a478616964cebbcb467982a26361ce00061a80a374786e86a5636c6f7365c420d41b66",
-        "fe68886dea8a7a7103423d1ca26d59cc5a31c507283b3743e194cc21d6a26676ce0328b741a26c76ce0328b74ba37263",
-        "76c420d41b66fe68886dea8a7a7103423d1ca26d59cc5a31c507283b3743e194cc21d6a3736e64c42040582705e7d416",
-        "b9d6adfefd04766748bfbf8c7f08f311f6710e4d113431ba89a474797065a3706179a26c6791a5151f7c7501a374786e",
-        "8aa46170616191c404119e3c4ba46170616e05a46170617393ce01e1ab70cebbcb4678cebbcb4679a46170617492c420",
-        "d41b66fe68886dea8a7a7103423d1ca26d59cc5a31c507283b3743e194cc21d6c420d41b66fe68886dea8a7a7103423d",
-        "1ca26d59cc5a31c507283b3743e194cc21d6a46170666191cebbcb4370a461706964cebd9c7172a26676ce0328b741a2",
-        "6c76ce0328b74ba3736e64c420a0dfb3d0fb23f8456469ea6688fa89b770291f0fb069f35e3abc1b82b4183ff3a47479",
-        "7065a46170706c81a374786e86a3616d74ce00087dd4a26676ce0328b741a26c76ce0328b74ba3726376c420d41b66fe",
-        "68886dea8a7a7103423d1ca26d59cc5a31c507283b3743e194cc21d6a3736e64c420a0dfb3d0fb23f8456469ea6688fa",
-        "89b770291f0fb069f35e3abc1b82b4183ff3a474797065a3706179"
-    );
+    const MAINNET_53000003_TXN3_ITX_HEX: &str =
+        include_str!("../fixtures/mainnet_53000003_txn3_itx.hex");
 
     fn unhex(s: &str) -> Vec<u8> {
         (0..s.len())
@@ -2002,7 +2008,7 @@ mod tests {
 
     #[test]
     fn mainnet_itx_round_trips_byte_exact_through_canonical_encoder() {
-        let go_bytes = unhex(MAINNET_53000003_TXN3_ITX_HEX);
+        let go_bytes = unhex(MAINNET_53000003_TXN3_ITX_HEX.trim());
         assert_eq!(go_bytes.len(), 987);
         let go_val = rmpv::decode::read_value(&mut &go_bytes[..]).unwrap();
         let inner = parse_inner_txns(&go_val).unwrap();
