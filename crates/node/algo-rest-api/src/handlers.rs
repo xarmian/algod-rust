@@ -4844,6 +4844,29 @@ mod handlers_pure_fn_tests {
         }
     }
 
+    /// Issue #1705: go's msgpack omits zero `ui` / empty `bs`; the REST JSON
+    /// (`utils.go` `omitEmpty`) drops them too. The omitted wire form (what go
+    /// writes and `encode_eval_delta` now writes) and the legacy explicit
+    /// zero form render identically: `action` only.
+    #[test]
+    fn parse_value_delta_omitted_and_explicit_zero_render_alike() {
+        let omitted =
+            |at: u64| rmpv::Value::Map(vec![(rmpv::Value::from("at"), rmpv::Value::from(at))]);
+        let explicit = |at: u64| {
+            rmpv::Value::Map(vec![
+                (rmpv::Value::from("at"), rmpv::Value::from(at)),
+                (rmpv::Value::from("bs"), rmpv::Value::from("")),
+                (rmpv::Value::from("ui"), rmpv::Value::from(0u64)),
+            ])
+        };
+        for at in [1u64, 2, 3] {
+            let a = parse_value_delta(&omitted(at)).expect("omitted");
+            let b = parse_value_delta(&explicit(at)).expect("explicit");
+            assert_eq!((a.action, a.bytes.clone(), a.uint), (at, None, None));
+            assert_eq!((b.action, b.bytes, b.uint), (at, None, None));
+        }
+    }
+
     /// Port of go's `TestApplicationBoxesMaxKeys`
     /// (`daemon/algod/api/server/v2/handlers_test.go#L33`): direct unit
     /// coverage of the pure `applicationBoxesMaxKeys` function, matching

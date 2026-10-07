@@ -176,7 +176,7 @@ impl CanonicalMap {
         if let Some(v) = val {
             if !is_rmpv_empty(v) {
                 let mut buf = Vec::new();
-                rmpv::encode::write_value(&mut buf, v).unwrap();
+                write_rmpv_str_preserving(&mut buf, v).unwrap();
                 self.fields.push((key, buf));
             }
         }
@@ -375,6 +375,39 @@ fn write_int(buf: &mut Vec<u8>, val: i64) {
 }
 
 /// Check if an rmpv::Value is "empty" (nil, empty map, empty array, etc.)
+/// Re-encode an `rmpv::Value`, writing every `Value::String` with the msgpack
+/// `str` marker even when its bytes are not valid UTF-8. `rmpv::encode::
+/// write_value` downgrades such a (decoded) string to `bin`, but go's msgp
+/// writes Go `string` fields (`ValueDelta.bs`, `StateDelta` keys,
+/// `EvalDelta.lg`) as `str` whatever the bytes are (issue #1705; same hazard
+/// as the catchpoint re-encoder of issue #1636).
+fn write_rmpv_str_preserving(
+    buf: &mut Vec<u8>,
+    value: &rmpv::Value,
+) -> Result<(), rmpv::encode::Error> {
+    match value {
+        rmpv::Value::String(s) => {
+            rmp::encode::write_str_len(buf, s.as_bytes().len() as u32)?;
+            buf.extend_from_slice(s.as_bytes());
+            Ok(())
+        }
+        rmpv::Value::Array(items) => {
+            rmp::encode::write_array_len(buf, items.len() as u32)?;
+            items
+                .iter()
+                .try_for_each(|i| write_rmpv_str_preserving(buf, i))
+        }
+        rmpv::Value::Map(entries) => {
+            rmp::encode::write_map_len(buf, entries.len() as u32)?;
+            entries.iter().try_for_each(|(k, v)| {
+                write_rmpv_str_preserving(buf, k)?;
+                write_rmpv_str_preserving(buf, v)
+            })
+        }
+        other => rmpv::encode::write_value(buf, other),
+    }
+}
+
 fn is_rmpv_empty(v: &rmpv::Value) -> bool {
     match v {
         rmpv::Value::Nil => true,
