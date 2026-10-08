@@ -1,0 +1,95 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: Unit Tests
+
+# Issue #1750 (epic #1680): run the workspace unit/integration tests on every
+# PR and on push to main. Before this, only the daily Coverage workflow ran
+# them, so a failing algo-types unit test merged in #1747 (see #1748).
+#
+# Deliberately not path-filtered (like msrv.yml): the check always reports, so
+# it can be made a required check without docs-only PRs waiting on a workflow
+# that never starts. A warm rust-cache keeps a docs-only run to a few minutes.
+#
+# Scope matches coverage.yml: `cargo nextest run --workspace` default targets
+# (nextest does not run doctests; see the separate doctest step). Docker-backed
+# e2e suites are feature/env-gated and stay out. Flaky-test handling lives in
+# .config/nextest.toml (`ci` profile: retries, never skips).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: unit-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-D warnings"
+  # Smaller debug info = faster compile/link; backtraces still have symbols.
+  CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+
+jobs:
+  unit-tests:
+    name: Workspace unit tests (nextest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: unit-tests
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The real-thread multi-node agreement binary `service_multi_node_test`
+      # (real Service + threads + simulated network) is excluded here only:
+      # in an unoptimized (debug) build its tests take 17+ min each on a
+      # 4-core runner (a first all-in run hit the 40 min timeout), and they
+      # are load/timing-sensitive (#1693, #1695). It still runs, in release
+      # with retries, in the daily Coverage workflow (cargo llvm-cov nextest
+      # --workspace --release). Everything else, including the rest of
+      # algo-agreement (player_real_harness_test: direct Player with real
+      # VRF/OTS signing, slow but only ~4 min in debug), runs per PR.
+      # Tracked in #1750 / follow-up #1752.
+      - name: Run workspace tests
+        shell: bash
+        run: |
+          cargo nextest run --workspace --profile ci \
+            -E 'not binary(service_multi_node_test)' 2>&1 | tee nextest.log
+
+      # Retried-then-passed tests are not failures but must not be invisible:
+      # surface nextest's FLAKY lines in the job summary.
+      - name: Summarize flaky tests
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          {
+            echo "### Flaky tests (passed only after a retry)"
+            sed -E 's/\x1b\[[0-9;]*m//g' nextest.log | grep -E 'FLAKY|TRY [0-9]+ (FAIL|PASS)' | sort -u || true
+            echo "(none listed above means no test needed a retry)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # nextest skips doctests. Run them for the whole workspace; the
+      # algo-network peer_features doctest failure seen on Windows dev
+      # machines is a noexec-tmp local issue and does not occur on Linux CI.
+      - name: Run workspace doctests
+        if: ${{ !cancelled() }}
+        run: cargo test --workspace --doc
