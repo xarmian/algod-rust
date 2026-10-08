@@ -284,15 +284,25 @@ make fixtures && make test
 The `Unit Tests` workflow (`.github/workflows/unit-tests.yml`) runs on every
 pull request and on push to `main` (not path-filtered, so it always reports and
 can be a required check). Its single job is named
-**`Workspace unit tests (nextest)`**: `cargo nextest run --workspace --profile ci`
-followed by `cargo test --workspace --doc` (nextest does not run doctests).
-Reproduce locally with `cargo nextest run --workspace --profile ci`.
+**`Workspace unit tests (nextest)`**: `cargo nextest run --workspace --profile ci
+-E 'not binary(service_multi_node_test)'` followed by `cargo test --workspace
+--doc` (nextest does not run doctests); both always run so one run reports both
+kinds of failure. Reproduce locally with exactly that command.
 
-The real-thread multi-node agreement binaries (`service_multi_node_test`, `player_real_harness_test`) are filtered out of this job (too slow in a debug build; they still run in release in the daily `Coverage` workflow, see the comment in the workflow). Flaky tests are handled in `.config/nextest.toml` (`ci` profile: `retries = 2`,
-`fail-fast = false`); a test that passes on retry is logged as FLAKY, nothing is
-skipped. Known load-sensitive tests: the multi-node agreement harness (#1695)
-and `lookback_prefetch` (#1723). The scheduled `Coverage` workflow remains the
-coverage report only.
+**Excluded from this job:** the `algo-agreement` `service_multi_node_test`
+binary (real `Service` + threads + simulated network). In a debug build its
+tests take 17+ minutes each on a 4-core runner, so it would blow the job
+budget; it still runs, in release with retries, in the daily `Coverage`
+workflow (tracked in #1752). To run it yourself:
+`cargo nextest run -p algo-agreement --release --test service_multi_node_test --profile ci`.
+
+nextest settings live in `.config/nextest.toml` (`ci` profile): no retries by
+default (a real race fails loudly), `retries = 2` only for the known
+load-sensitive tests (multi-node harness #1693/#1695, `lookback_prefetch`
+#1723), and a hard kill after 20 minutes per test. Tests that pass only after
+a retry are listed under "Flaky tests" in the job summary. The first run on a
+fresh cache (until `main` populates it) compiles from scratch, about 4 extra
+minutes; a warm run is a few minutes.
 
 ## Conformance Validation
 
