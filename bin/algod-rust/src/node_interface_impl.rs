@@ -284,6 +284,11 @@ impl crate::live_catchup::SyncRoundResetHook for FollowerSyncRoundState {
 /// is absent.
 pub struct AlgodNodeInterface {
     ledger: Arc<Mutex<SqliteLedger>>,
+    /// Issue #1758: lock-free committed-tip view used by `/v2/status`, so a
+    /// status poll does not queue behind a slow block apply that holds
+    /// `ledger`. Never-published (always `None`) when the mutex was poisoned
+    /// at construction, which sends readers down the locked path.
+    committed_tip: algo_ledger::committed_tip::CommittedTipHandle,
     pool: Option<Arc<TransactionPool>>,
     broadcaster: Option<Arc<LocalTxBroadcaster>>,
     /// Bounded admission semaphore for
@@ -443,8 +448,13 @@ impl AlgodNodeInterface {
     /// `NodeError::NotImplemented` until the collaborators are attached via
     /// [`Self::with_pool`] / [`Self::with_broadcaster`].
     pub fn new(ledger: Arc<Mutex<SqliteLedger>>, config: NodeInterfaceConfig) -> Self {
+        let committed_tip = ledger
+            .lock()
+            .map(|mut l| l.committed_tip_handle())
+            .unwrap_or_default();
         Self {
             ledger,
+            committed_tip,
             pool: None,
             broadcaster: None,
             async_backlog_permits: Arc::new(Semaphore::new(DEFAULT_ASYNC_BACKLOG_SIZE)),
@@ -947,6 +957,23 @@ impl AlgodNodeInterface {
     /// would otherwise leave `last_round` and `latest_header` on different
     /// rounds (a real risk when agreement/catchup commits are concurrent).
     fn read_status_snapshot(&self) -> Result<StatusSnapshot, NodeError> {
+        // Issue #1758: the tip is published atomically after each successful
+        // commit (round, header, protocol, label and commit time together),
+        // so it cannot tear, and it never waits for an in-flight apply.
+        if let Some(tip) = self.committed_tip.get() {
+            let protocol = if tip.protocol.is_empty() {
+                self.default_protocol.clone()
+            } else {
+                tip.protocol.clone()
+            };
+            return Ok(StatusSnapshot {
+                last_round: tip.last_committed_round,
+                protocol,
+                latest_header: tip.latest_header.clone(),
+                last_catchpoint_label: tip.last_catchpoint_label.clone(),
+                last_commit_wall_time: tip.last_commit_wall_time,
+            });
+        }
         let ledger = self.lock_ledger("status")?;
         let last_round = ledger
             .last_committed_round()
@@ -3319,6 +3346,62 @@ mod tests {
             "expected >= 50ms since the real commit, got {}ns (a poll-based tracker would report ~0 here)",
             after.time_since_last_round
         );
+    }
+
+    /// Issue #1758: `/v2/status` must not queue behind a slow block apply that
+    /// holds the ledger mutex (stood in for here by a thread sleeping while
+    /// holding the lock).
+    #[tokio::test]
+    async fn status_does_not_wait_for_a_slow_apply() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let adapter = make_adapter_with_ledger(ledger.clone());
+        apply_one_trivial_block(&ledger, 1);
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let held = ledger.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(600));
+        });
+        locked_rx.recv().unwrap();
+        let started = std::time::Instant::now();
+        let status = adapter.status().await.unwrap();
+        let took = started.elapsed();
+        holder.join().unwrap();
+
+        assert_eq!(status.last_round, 1);
+        assert!(
+            took < Duration::from_millis(200),
+            "status waited {took:?} behind the ledger lock"
+        );
+    }
+
+    /// Issue #1758: the published committed tip and the locked read path must
+    /// produce the identical status snapshot after every commit.
+    #[tokio::test]
+    async fn status_snapshot_from_committed_tip_equals_locked_read() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let adapter = make_adapter_with_ledger(ledger.clone());
+        for round in 1..=4u64 {
+            apply_one_trivial_block(&ledger, round);
+            assert!(adapter.committed_tip.get().is_some(), "tip published");
+            let fast = adapter.read_status_snapshot().unwrap();
+            // Same-value set_current_round outside a block invalidates the
+            // tip, forcing the locked path.
+            {
+                let mut l = ledger.lock().unwrap();
+                let cur = l.current_round();
+                l.set_current_round(cur);
+            }
+            assert!(adapter.committed_tip.get().is_none(), "tip invalidated");
+            let slow = adapter.read_status_snapshot().unwrap();
+            assert_eq!(fast.last_round, slow.last_round);
+            assert_eq!(fast.protocol, slow.protocol);
+            assert_eq!(fast.latest_header, slow.latest_header);
+            assert_eq!(fast.last_catchpoint_label, slow.last_catchpoint_label);
+            assert_eq!(fast.last_commit_wall_time, slow.last_commit_wall_time);
+        }
     }
 
     #[test]

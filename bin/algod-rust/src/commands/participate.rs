@@ -706,7 +706,11 @@ impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
                 let round = fresh.current_round().0;
                 match self.ledger.lock() {
                     Ok(mut guard) => {
+                        // Issue #1758: keep the lock-free committed-tip
+                        // handle readers already hold valid across the swap.
+                        let tip = guard.committed_tip_handle();
                         *guard = fresh;
+                        guard.adopt_committed_tip_handle(tip);
                         info!(
                             round,
                             "reloaded ledger from disk after live catchpoint catchup"

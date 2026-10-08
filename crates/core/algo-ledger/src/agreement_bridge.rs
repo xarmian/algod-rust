@@ -60,6 +60,9 @@ use crate::store_trait::LedgerStore;
 /// (block writes, round advancement).
 pub struct AgreementLedgerBridge {
     ledger: Arc<Mutex<SqliteLedger>>,
+    /// Issue #1758: lock-free committed-tip view, so `next_round` does not
+    /// queue behind an `ensure_block` that holds `ledger` across a slow apply.
+    tip: crate::committed_tip::CommittedTipHandle,
     /// Condvar notified when a new block is committed (round advances).
     /// Paired with the `ledger` mutex.
     round_advanced: Arc<Condvar>,
@@ -229,6 +232,7 @@ impl AgreementLedgerBridge {
     /// This is suitable for tests and for callers that don't need catchup.
     pub fn new(ledger: Arc<Mutex<SqliteLedger>>) -> Self {
         Self {
+            tip: Self::tip_handle(&ledger),
             ledger,
             round_advanced: Arc::new(Condvar::new()),
             pending_cert_tx: None,
@@ -252,6 +256,7 @@ impl AgreementLedgerBridge {
         round_advanced: Arc<Condvar>,
     ) -> Self {
         Self {
+            tip: Self::tip_handle(&ledger),
             ledger,
             round_advanced,
             pending_cert_tx: None,
@@ -261,6 +266,16 @@ impl AgreementLedgerBridge {
             notify_cache: Mutex::new(None),
             apply_stall: Arc::new(crate::ApplyStallTracker::new()),
         }
+    }
+
+    /// The committed-tip handle of `ledger` (seeded under one brief lock). A
+    /// poisoned mutex yields a never-published handle, so readers take the
+    /// locked path and report the poison as before.
+    fn tip_handle(ledger: &Arc<Mutex<SqliteLedger>>) -> crate::committed_tip::CommittedTipHandle {
+        ledger
+            .lock()
+            .map(|mut l| l.committed_tip_handle())
+            .unwrap_or_default()
     }
 
     /// Returns a clone of the `round_advanced` condvar.
@@ -316,6 +331,7 @@ impl AgreementLedgerBridge {
     ) {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let bridge = Self {
+            tip: Self::tip_handle(&ledger),
             ledger,
             round_advanced,
             pending_cert_tx: Some(tx),
@@ -400,8 +416,23 @@ impl AgreementLedgerBridge {
             crate::follow_timing::reset_avm_time();
             let applied = crate::apply::apply_block_executing_app_calls(ledger, block);
             let timing = crate::follow_timing::follow_timing();
-            if let Some(avm) = crate::follow_timing::take_avm_time() {
+            let avm = crate::follow_timing::take_avm_time();
+            if let Some(avm) = avm {
                 timing.avm.observe(avm);
+            }
+            // Issue #1757: a slow apply names its own AVM/non-AVM split, so a
+            // soak log attributes each heavy round without a profiler.
+            if t.elapsed() > Duration::from_secs(1) {
+                let apply_ms = t.elapsed().as_millis() as u64;
+                let avm_ms = avm.map_or(0, |d| d.as_millis() as u64);
+                warn!(
+                    round = %block.round,
+                    apply_ms,
+                    avm_ms,
+                    non_avm_ms = apply_ms.saturating_sub(avm_ms),
+                    txns = block.payset.len(),
+                    "try_commit_block: slow apply breakdown"
+                );
             }
             match &applied {
                 Ok(()) => timing.apply.observe(t.elapsed()),
@@ -458,6 +489,11 @@ impl AgreementLedgerBridge {
 
 impl LedgerReader for AgreementLedgerBridge {
     fn next_round(&self) -> Round {
+        // Issue #1758: the last committed round is published after each
+        // successful commit; no need to wait for an in-flight apply.
+        if let Some(tip) = self.tip.get() {
+            return Round(tip.current_round.saturating_add(1));
+        }
         let ledger = match self.ledger.lock() {
             Ok(l) => l,
             Err(e) => {
@@ -2189,5 +2225,72 @@ mod tests {
             Some(algo_codec::compute_txn_id(&full).0.to_vec()),
             "TxID must be the id of the transaction with its genesis fields"
         );
+    }
+
+    // -- Issue #1758: reads must not wait for a slow apply --
+
+    /// Hold the ledger mutex on another thread for `hold` (standing in for a
+    /// slow heavy app-call apply inside `try_commit_block`) and report how long
+    /// `read` took on this thread meanwhile.
+    fn read_latency_while_ledger_locked<T>(
+        ledger: &Arc<Mutex<SqliteLedger>>,
+        hold: Duration,
+        read: impl FnOnce() -> T,
+    ) -> (T, Duration) {
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let held = Arc::clone(ledger);
+        let holder = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(hold);
+        });
+        locked_rx.recv().unwrap();
+        let started = std::time::Instant::now();
+        let out = read();
+        let took = started.elapsed();
+        holder.join().unwrap();
+        (out, took)
+    }
+
+    #[test]
+    fn next_round_does_not_wait_for_a_slow_apply() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+        bridge.ensure_block(&make_round1_block(), &make_cert_with_proposal(1));
+        let (next, took) =
+            read_latency_while_ledger_locked(&ledger, Duration::from_millis(600), || {
+                bridge.next_round()
+            });
+        assert_eq!(next, Round(2));
+        assert!(
+            took < Duration::from_millis(200),
+            "next_round waited {took:?} behind the ledger lock"
+        );
+    }
+
+    #[test]
+    fn next_round_tracks_commits_invalidation_and_ledger_swap() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+        assert_eq!(bridge.next_round(), Round(1));
+        bridge.ensure_block(&make_round1_block(), &make_cert_with_proposal(1));
+        assert_eq!(bridge.next_round(), Round(2));
+
+        // A mutation outside a block invalidates the tip: the locked path
+        // answers, with the new value.
+        ledger.lock().unwrap().set_current_round(Round(41));
+        assert_eq!(bridge.next_round(), Round(42));
+
+        // Swapping in a reopened ledger (live catchup reload) keeps the
+        // reader's handle valid and publishes the new ledger's state.
+        {
+            let mut guard = ledger.lock().unwrap();
+            let tip = guard.committed_tip_handle();
+            *guard = SqliteLedger::open_in_memory().unwrap();
+            guard.adopt_committed_tip_handle(tip);
+        }
+        assert_eq!(bridge.next_round(), Round(1));
+        bridge.ensure_block(&make_round1_block(), &make_cert_with_proposal(1));
+        assert_eq!(bridge.next_round(), Round(2));
     }
 }

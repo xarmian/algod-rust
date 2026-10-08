@@ -30,6 +30,7 @@ pub mod block_entry;
 pub mod block_header;
 pub mod catchpoint;
 pub mod catchup_service;
+pub mod committed_tip;
 pub mod delta_cache;
 pub mod erasable_db;
 pub mod eval_compare;

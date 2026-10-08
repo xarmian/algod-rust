@@ -2374,6 +2374,18 @@ pub struct SqliteLedger {
     /// `time_since_last_round` in `bin/algod-rust/src/node_interface_impl.rs`),
     /// so it needs no serialization and is immune to system-clock jumps.
     last_commit_wall_time: Option<std::time::Instant>,
+    /// Issue #1758: lock-free view of the committed tip, published after each
+    /// successful `commit_block` and invalidated by ledger mutations that do
+    /// not go through that publication. See [`crate::committed_tip`].
+    committed_tip: crate::committed_tip::CommittedTipHandle,
+}
+
+impl Drop for SqliteLedger {
+    fn drop(&mut self) {
+        // Issue #1758: a replaced ledger must not leave its published tip
+        // behind for readers that still hold the handle.
+        self.committed_tip.invalidate();
+    }
 }
 
 /// In-memory accumulator for the per-round change to the `accounttotals`
@@ -2884,6 +2896,7 @@ impl SqliteLedger {
             acctupdates_stats_gate: crate::acctupdates_stats::AccountUpdatesStatsGate::default(),
             retention: crate::store_trait::RetentionConfig::default(),
             last_commit_wall_time: None,
+            committed_tip: crate::committed_tip::CommittedTipHandle::default(),
         })
     }
 
@@ -3762,7 +3775,64 @@ impl SqliteLedger {
             // `status_at_genesis_is_byte_identical`).
             self.last_commit_wall_time = Some(std::time::Instant::now());
         }
+        if result.is_ok() {
+            // Issue #1758: publish the now-committed tip for lock-free readers.
+            self.refresh_committed_tip();
+        }
         result
+    }
+
+    /// Shared handle to the lock-free committed-tip view (issue #1758).
+    ///
+    /// Seeds the view from the current committed state if nothing has been
+    /// published yet, so a reader created at node start does not have to
+    /// wait for the first commit. Take it once (under the ledger lock) and
+    /// keep it; reading it later needs no lock.
+    pub fn committed_tip_handle(&mut self) -> crate::committed_tip::CommittedTipHandle {
+        if self.committed_tip.get().is_none() {
+            self.refresh_committed_tip();
+        }
+        self.committed_tip.clone()
+    }
+
+    /// Replace this ledger's committed-tip cell with `handle` (the one readers
+    /// already hold) and re-publish from this ledger's committed state.
+    ///
+    /// Used when a freshly reopened ledger is swapped into the shared mutex
+    /// (live catchpoint catchup reload): readers keep their handle, the old
+    /// ledger's drop invalidated it, and this publishes the new state.
+    pub fn adopt_committed_tip_handle(&mut self, handle: crate::committed_tip::CommittedTipHandle) {
+        self.committed_tip = handle;
+        self.refresh_committed_tip();
+    }
+
+    /// Re-publish the committed tip from the ledger's current committed state.
+    /// A no-op (leaves the tip invalidated) inside an open block transaction
+    /// or when any read fails: readers then fall back to the locked path.
+    fn refresh_committed_tip(&mut self) {
+        self.committed_tip.invalidate();
+        if self.in_block {
+            return;
+        }
+        let Ok(last_committed) = self.last_committed_round() else {
+            return;
+        };
+        let last_committed_round = last_committed.unwrap_or(0);
+        let Ok(latest_header) = self.get_block_header(last_committed_round) else {
+            return;
+        };
+        let Ok(last_catchpoint_label) = self.last_catchpoint_label() else {
+            return;
+        };
+        self.committed_tip
+            .publish(crate::committed_tip::CommittedTip {
+                current_round: self.current_round.0,
+                last_committed_round,
+                protocol: self.protocol.clone(),
+                latest_header,
+                last_catchpoint_label,
+                last_commit_wall_time: self.last_commit_wall_time,
+            });
     }
 
     /// The wall-clock instant of the most recent successful [`Self::commit_block`]
@@ -3984,6 +4054,9 @@ impl SqliteLedger {
     /// successful export's label without needing to re-scan for
     /// catchpoint files on disk.
     pub fn set_last_catchpoint_label(&self, label: &str) -> Result<(), AlgoError> {
+        // Issue #1758: the label is part of the published tip; the next
+        // commit re-publishes it, until then readers use the locked path.
+        self.committed_tip.invalidate();
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO catchpointstate(id, strval) VALUES(?1, ?2)",
@@ -6998,6 +7071,10 @@ impl LedgerStore for SqliteLedger {
     // ---- Chain-level state (setters) ----
 
     fn set_current_round(&mut self, round: Round) {
+        if !self.in_block {
+            // Not covered by a following commit publication (issue #1758).
+            self.committed_tip.invalidate();
+        }
         self.current_round = round;
     }
 
@@ -7038,6 +7115,9 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn set_protocol(&mut self, protocol: String) {
+        if !self.in_block {
+            self.committed_tip.invalidate();
+        }
         self.protocol = protocol;
     }
 
