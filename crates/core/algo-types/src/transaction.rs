@@ -807,25 +807,34 @@ fn is_none_or_empty_box_ref_name(v: &Option<ByteBuf>) -> bool {
 /// `canonical_encode_signed_txn_with_ad`) are the only source of block /
 /// STIB / `itx` bytes and write `str` correctly (#1738, #1742).
 ///
-/// To make the serde form lossless anyway (agreement crash persistence
-/// round-trips proposal `Block`s through serde and may later re-encode them
-/// canonically), this module re-applies go's schema typing after
-/// deserialize: every position go types as `str` (`gd`/`ld` keys, `bs`, `lg`
-/// entries, recursively `itx[*].dt`) is turned back into a `str`. That also
-/// upgrades legacy bin-typed stored forms. Serialization is the unmodified
-/// `rmpv::Value` one: no `unsafe`, no change for valid UTF-8, JSON untouched.
+/// Why the deserialize side retypes: agreement crash persistence
+/// (`algo-agreement/src/persistence.rs`) round-trips proposal `Block`s (and
+/// their payset `SignedTransaction`s with `dt`) through named `rmp_serde`
+/// (RootRouter -> ProposalStore -> BlockAssembler -> UnauthenticatedProposal
+/// -> Block). A restored proposal is later re-encoded canonically, so a
+/// bin-typed non-UTF-8 `dt` key would change the block bytes / digest. This
+/// module therefore re-applies go's schema typing after deserialize: every
+/// position go types as `str` (`gd`/`ld` keys, `bs`, `lg` entries,
+/// recursively `itx[*].dt`) becomes a `str` again. That restores
+/// **msgpack** round trips only; a JSON round trip of non-UTF-8 keys is not
+/// restored (accepted: JSON of a block / `dt` is an API model, never block
+/// bytes). It also upgrades legacy bin-typed stored forms. Serialization is
+/// the unmodified `rmpv::Value` one: no `unsafe`, no change for valid
+/// UTF-8, JSON untouched.
 ///
-/// Audited serde users of `SignedTransaction` / `Block` (none feed wire
-/// bytes): agreement crash persistence (`algo-agreement::persistence`,
-/// named rmp_serde round trip), `eval_delta::parse_inner_txn`
-/// (decode only), REST `format::encode_response` (JSON/msgpack API models),
-/// gossip tx decode (`tx_tag_handler`, decode only; no `dt` on the wire).
+/// Other serde users of `SignedTransaction` / `Block` (none feed wire
+/// bytes): `eval_delta::parse_inner_txn` and gossip `tx_tag_handler`
+/// (decode only; no `dt` on the wire), REST `format::encode_response`
+/// (API models).
 mod serde_eval_delta {
     use rmpv::Value;
     use serde::{Deserialize, Deserializer};
 
-    /// go's `config.MaxInnerTransactionsDepth` is far below this; the cap only
-    /// bounds the walker against hostile nesting.
+    /// go bounds inner-transaction depth (`MaxInnerTransactionsDepth`) far
+    /// below this, so no valid `dt` reaches it; the cap is only a stack guard
+    /// for hostile nesting. Past it the subtree is left exactly as decoded
+    /// (never an error): this deserializer is shared by gossip / REST /
+    /// persistence and must not reject input that decoded before.
     const MAX_DEPTH: u32 = 64;
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
@@ -875,10 +884,11 @@ mod serde_eval_delta {
     }
 
     /// Apply go's `EvalDelta` field typing (`gd`/`ld` keys and `bs`, `lg`
-    /// entries are `str`), recursing through `itx[*].dt` up to `MAX_DEPTH`.
+    /// entries are `str`), recursing through `itx[*].dt` up to `MAX_DEPTH` (deeper subtrees are
+    /// left untouched, not rejected).
     fn retype_eval_delta(v: &mut Value, depth: u32) -> Result<(), String> {
         if depth > MAX_DEPTH {
-            return Err("eval delta inner-transaction nesting too deep".to_string());
+            return Ok(());
         }
         let Value::Map(top) = v else { return Ok(()) };
         for (k, val) in top.iter_mut() {
@@ -1056,20 +1066,25 @@ mod serde_eval_delta {
             assert_eq!(back.eval_delta, ok.eval_delta);
         }
 
+        /// 100-deep `itx` nesting still decodes (no error from the stack
+        /// guard); the over-deep subtree is simply left as decoded.
         #[test]
-        fn nesting_is_bounded() {
-            let mut dt = Value::Map(vec![(s("lg"), Value::Array(vec![]))]);
-            for _ in 0..(MAX_DEPTH + 2) {
+        fn deep_nesting_decodes_without_error() {
+            let mut dt = Value::Map(vec![(
+                s("gd"),
+                Value::Map(vec![(raw_str(&[0xff]), Value::Map(vec![]))]),
+            )]);
+            for _ in 0..100 {
                 dt = Value::Map(vec![(
                     s("itx"),
                     Value::Array(vec![Value::Map(vec![(s("dt"), dt)])]),
                 )]);
             }
-            let err = retype_eval_delta(&mut dt, 0).unwrap_err();
-            assert!(err.contains("too deep"));
-            // Within the cap it is accepted.
-            let mut ok = sample_dt();
-            assert!(retype_eval_delta(&mut ok, 0).is_ok());
+            let mut copy = dt.clone();
+            assert!(retype_eval_delta(&mut copy, 0).is_ok());
+            let bytes = rmp_serde::to_vec_named(&stx_with(dt)).unwrap();
+            let back: SignedTransaction = rmp_serde::from_slice(&bytes).unwrap();
+            assert!(back.eval_delta.is_some());
         }
     }
 }
