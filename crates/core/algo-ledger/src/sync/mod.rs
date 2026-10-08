@@ -157,6 +157,65 @@ pub trait SyncBackend: Send + Sync {
         }
         Ok(blocks)
     }
+
+    /// Like [`Self::fetch_blocks_batch`], but reports a failure AFTER a
+    /// served prefix without discarding that prefix, and takes the
+    /// orchestrator's cancellation token (issues #1725, #1724).
+    ///
+    /// - `cancel` is the orchestrator's token: a backend running background
+    ///   fetch tasks should derive a `child_token()` from it so a shutdown
+    ///   during a long parallel fetch aborts promptly instead of waiting for
+    ///   the batch (and its per-round retries) to finish.
+    /// - The result is a [`BatchFetch`]: the in-order prefix that was served
+    ///   plus, if the fetch did not complete, the error that stopped it with
+    ///   its class preserved. The caller applies the prefix first, so a
+    ///   retry does not re-fetch it.
+    ///
+    /// The default implementation delegates to [`Self::fetch_blocks_batch`]
+    /// (all-or-error, no prefix, `cancel` unused).
+    fn fetch_block_range(
+        &self,
+        start: u64,
+        end: u64,
+        concurrency: usize,
+        _cancel: &CancellationToken,
+    ) -> BatchFetch {
+        match self.fetch_blocks_batch(start, end, concurrency) {
+            Ok(blocks) => BatchFetch::complete(blocks),
+            Err(error) => BatchFetch::failed(Vec::new(), error),
+        }
+    }
+}
+
+/// Outcome of [`SyncBackend::fetch_block_range`].
+#[derive(Debug)]
+pub struct BatchFetch {
+    /// The in-order prefix of the requested range that was served
+    /// (`start..start + blocks.len()`). Possibly empty; possibly all of it.
+    pub blocks: Vec<(u64, Block)>,
+    /// Why the fetch stopped before the end of the range, if it did and the
+    /// cause is known. `None` with a short `blocks` means the peer does not
+    /// have the next round (a 404 after a non-empty prefix), exactly like a
+    /// short `Ok` from [`SyncBackend::fetch_blocks_batch`].
+    pub error: Option<AlgoError>,
+}
+
+impl BatchFetch {
+    /// A fetch that produced `blocks` and no error.
+    pub fn complete(blocks: Vec<(u64, Block)>) -> Self {
+        Self {
+            blocks,
+            error: None,
+        }
+    }
+
+    /// A fetch that served `blocks` and then stopped with `error`.
+    pub fn failed(blocks: Vec<(u64, Block)>, error: AlgoError) -> Self {
+        Self {
+            blocks,
+            error: Some(error),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -272,7 +331,35 @@ impl std::fmt::Display for ReplayStoppedEarly {
 /// it, which is a retryable error. A fixed round count, not a function of the
 /// batch size/concurrency: it states how far behind the tip a peer must be
 /// before "cannot serve old rounds" is the credible reading.
-const HANDOFF_MIN_LAG_ROUNDS: u64 = 64;
+///
+/// This is a heuristic with no go-algorand counterpart (go's catchpoint
+/// service has no hand-off). 64 rounds is roughly three minutes of mainnet
+/// blocks: far beyond ordinary status-vs-block-peer skew, far below any
+/// archival-retention boundary. Override per orchestrator with
+/// [`SyncOrchestrator::set_handoff_min_lag_rounds`], or for a whole process
+/// with the [`HANDOFF_MIN_LAG_ROUNDS_ENV`] environment variable (issue
+/// #1725); `0` hands off on any "peer lacks the block" answer.
+pub const DEFAULT_HANDOFF_MIN_LAG_ROUNDS: u64 = 64;
+
+/// Environment variable overriding [`DEFAULT_HANDOFF_MIN_LAG_ROUNDS`]: a
+/// non-negative integer round count. Unset, empty or unparseable values use
+/// the default.
+pub const HANDOFF_MIN_LAG_ROUNDS_ENV: &str = "ALGOD_RUST_HANDOFF_MIN_LAG_ROUNDS";
+
+/// Interpret the raw value of [`HANDOFF_MIN_LAG_ROUNDS_ENV`].
+pub fn parse_handoff_min_lag_rounds(raw: Option<&str>) -> u64 {
+    match raw.map(str::trim) {
+        None | Some("") => DEFAULT_HANDOFF_MIN_LAG_ROUNDS,
+        Some(v) => v.parse().unwrap_or_else(|_| {
+            tracing::warn!(
+                value = v,
+                default = DEFAULT_HANDOFF_MIN_LAG_ROUNDS,
+                "ignoring unparseable {HANDOFF_MIN_LAG_ROUNDS_ENV}"
+            );
+            DEFAULT_HANDOFF_MIN_LAG_ROUNDS
+        }),
+    }
+}
 
 const SYNC_STATE_KEY: &str = "algod_rust_sync_state";
 const SYNC_CATCHPOINT_LABEL_KEY: &str = "algod_rust_sync_catchpoint_label";
@@ -546,6 +633,9 @@ pub struct SyncOrchestrator {
     final_round: u64,
     /// Set when replay handed off before reaching its target (issue #1719).
     replay_stopped_early: Option<ReplayStoppedEarly>,
+    /// Minimum lag behind the target for a "peer lacks the block" answer to
+    /// hand off (see [`DEFAULT_HANDOFF_MIN_LAG_ROUNDS`]).
+    handoff_min_lag_rounds: u64,
     /// Cancellation token — checked between phases and during long operations.
     cancel: CancellationToken,
     /// Optional progress callback — invoked on state transitions and periodic updates.
@@ -583,6 +673,9 @@ impl SyncOrchestrator {
             blocks_replayed: 0,
             final_round: 0,
             replay_stopped_early: None,
+            handoff_min_lag_rounds: parse_handoff_min_lag_rounds(
+                std::env::var(HANDOFF_MIN_LAG_ROUNDS_ENV).ok().as_deref(),
+            ),
             cancel: CancellationToken::new(),
             on_progress: None,
             eval_delta_stats: EvalDeltaStats::default(),
@@ -595,6 +688,12 @@ impl SyncOrchestrator {
     /// atomic operation, persist checkpoint state, and return an error.
     pub fn set_cancel(&mut self, cancel: CancellationToken) {
         self.cancel = cancel;
+    }
+
+    /// Override the minimum lag behind the target for a hand-off (see
+    /// [`DEFAULT_HANDOFF_MIN_LAG_ROUNDS`]).
+    pub fn set_handoff_min_lag_rounds(&mut self, rounds: u64) {
+        self.handoff_min_lag_rounds = rounds;
     }
 
     /// Set a progress callback that is invoked on state transitions and
@@ -2100,57 +2199,25 @@ impl SyncOrchestrator {
 
             let batch_end = std::cmp::min(batch_start + batch_size - 1, target_round);
 
-            // Fetch the batch (parallel if the backend supports it).
-            let batch = match self.backend.fetch_blocks_batch(
+            // Fetch the batch (parallel if the backend supports it). The
+            // backend gets the orchestrator's token (issue #1724) and returns
+            // the served prefix even when the fetch then failed (issue
+            // #1725), so the prefix is applied before the failure is handled.
+            let BatchFetch {
+                blocks: batch,
+                error: fetch_error,
+            } = self.backend.fetch_block_range(
                 batch_start,
                 batch_end,
                 self.config.concurrency,
-            ) {
-                Ok(batch) => batch,
-                // Shutdown arrived while the fetch was in flight.
-                Err(_) if self.cancel.is_cancelled() => {
-                    self.blocks_replayed = blocks_applied;
-                    return Err(self.handle_cancellation());
-                }
-                // Issue #1719 (soak 37455478923): the ledger is verified and
-                // consistent at `batch_start - 1` (>= the catchpoint round),
-                // but the live-catchup peer is commonly a non-archival relay
-                // that no longer serves rounds this far behind the tip -- the
-                // backends report "peer served none of the requested blocks"
-                // as `NotFound` (like the `/v2/status` 404 above). go-algorand's
-                // `CatchpointCatchupService` ends at the catchpoint round and
-                // its normal catchup service closes the gap with archival
-                // peer selection and retries. Do the same: end replay here
-                // and report it in the result. Every other error (transient
-                // network, auth, decode, partial batch) still fails loudly,
-                // and an explicit `end_round` is a promise to reach that
-                // round, so it fails too.
-                //
-                // A `NotFound` fewer than `HANDOFF_MIN_LAG_ROUNDS` behind
-                // `target_round` is NOT a hand-off: `target_round` came from
-                // the status endpoint, and the block peer commonly lags it by
-                // a few rounds, so that is retryable exactly as before. Only a
-                // missing round farther than that from the target means the
-                // peer genuinely cannot serve old rounds.
-                Err(AlgoError::NotFound(msg))
-                    if self.config.end_round.is_none()
-                        && batch_start.saturating_add(HANDOFF_MIN_LAG_ROUNDS) <= target_round =>
-                {
-                    tracing::warn!(
-                        error = %msg,
-                        batch_start,
-                        target_round,
-                        "peer cannot serve post-cutover blocks; ending catchpoint replay and \
-                         handing off to normal catchup"
-                    );
-                    stopped_early = Some(ReplayStoppedEarly {
-                        stopped_at_round: batch_start - 1,
-                        target_round,
-                    });
-                    break;
-                }
-                Err(e) => return Err(e),
-            };
+                &self.cancel,
+            );
+            // Shutdown arrived while the fetch was in flight: a cancellation,
+            // never a hand-off or the backend's own (abort-induced) error.
+            if fetch_error.is_some() && self.cancel.is_cancelled() {
+                self.blocks_replayed = blocks_applied;
+                return Err(self.handle_cancellation());
+            }
 
             // Apply each block in the batch sequentially.
             for (round, block) in &batch {
@@ -2229,38 +2296,72 @@ impl SyncOrchestrator {
                 }
             }
 
-            // A short `Ok` batch is the in-order prefix of a peer that does
-            // not have the next round (see `fetch_blocks_batch`'s contract).
-            // The prefix is applied above; now apply the same lag rule as for
-            // an empty batch.
+            // The prefix is applied above. Now decide what the shortfall
+            // means. A short batch without an error is the in-order prefix of
+            // a peer that does not have the next round (see
+            // `fetch_blocks_batch`'s contract), as is a `NotFound` error.
             let served = batch.len() as u64;
-            if served < batch_end - batch_start + 1 {
-                let next_missing = batch_start + served;
-                if self.config.end_round.is_none()
-                    && next_missing.saturating_add(HANDOFF_MIN_LAG_ROUNDS) <= target_round
-                {
-                    tracing::warn!(
-                        next_missing,
-                        target_round,
-                        served,
-                        "peer served only a prefix of the batch; ending catchpoint replay and \
-                         handing off to normal catchup"
-                    );
-                    stopped_early = Some(ReplayStoppedEarly {
-                        stopped_at_round: next_missing - 1,
-                        target_round,
-                    });
-                    break;
+            let next_missing = batch_start + served;
+            let shortfall = served < batch_end - batch_start + 1;
+            let peer_lacks_block = match &fetch_error {
+                None => shortfall,
+                Some(AlgoError::NotFound(_)) => true,
+                Some(_) => false,
+            };
+            if !peer_lacks_block {
+                if let Some(e) = fetch_error {
+                    // Issue #1725: every other failure fails loudly with its
+                    // original class (transient network, auth, decode, ...),
+                    // after the fetched prefix was applied.
+                    self.blocks_replayed = blocks_applied;
+                    return Err(e);
                 }
-                self.blocks_replayed = blocks_applied;
-                return Err(AlgoError::NotFound(format!(
+                batch_start = batch_end + 1;
+                continue;
+            }
+            // Issue #1719 (soak 37455478923): the ledger is verified and
+            // consistent at `next_missing - 1` (>= the catchpoint round), but
+            // the live-catchup peer is commonly a non-archival relay that no
+            // longer serves rounds this far behind the tip -- the backends
+            // report that as `NotFound`/a short batch (like the `/v2/status`
+            // 404 above). go-algorand's `CatchpointCatchupService` ends at
+            // the catchpoint round and its normal catchup service closes the
+            // gap with archival peer selection and retries. Do the same: end
+            // replay here and report it in the result. An explicit
+            // `end_round` is a promise to reach that round, so it fails.
+            //
+            // A "peer lacks the block" answer fewer than the lag threshold
+            // behind `target_round` is NOT a hand-off: `target_round` came
+            // from the status endpoint, and the block peer commonly lags it
+            // by a few rounds, so that is retryable. Only a missing round
+            // farther than that from the target means the peer genuinely
+            // cannot serve old rounds.
+            if self.config.end_round.is_none()
+                && next_missing.saturating_add(self.handoff_min_lag_rounds) <= target_round
+            {
+                tracing::warn!(
+                    next_missing,
+                    target_round,
+                    served,
+                    error = ?fetch_error,
+                    "peer cannot serve post-cutover blocks; ending catchpoint replay and \
+                     handing off to normal catchup"
+                );
+                stopped_early = Some(ReplayStoppedEarly {
+                    stopped_at_round: next_missing - 1,
+                    target_round,
+                });
+                break;
+            }
+            self.blocks_replayed = blocks_applied;
+            return Err(match fetch_error {
+                Some(e) => e,
+                None => AlgoError::NotFound(format!(
                     "peer served only {served} of the {} blocks requested from round \
                      {batch_start} (target {target_round})",
                     batch_end - batch_start + 1
-                )));
-            }
-
-            batch_start = batch_end + 1;
+                )),
+            });
         }
 
         self.blocks_replayed = window_applied + blocks_applied;
@@ -4232,6 +4333,14 @@ mod tests {
         src
     }
 
+    thread_local! {
+        /// Set when a `WindowBackend::fetch_block_range` on this thread saw
+        /// its `cancel` argument already cancelled (the orchestrator's token
+        /// reached the backend). Replay is synchronous, so the test thread
+        /// is the backend's thread.
+        static RANGE_SAW_CANCEL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
     #[derive(Clone, Copy)]
     enum BatchMode {
         Serve,
@@ -4243,6 +4352,10 @@ mod tests {
         /// Like `ServeUpTo`, but a batch that straddles the limit returns its
         /// served in-order prefix (a short `Ok`) instead of failing.
         ServePrefix(u64),
+        /// `fetch_block_range` serves rounds up to this one, then fails with
+        /// the error this builds (arg: blocks asked): a failure AFTER a
+        /// served prefix, which `fetch_blocks_batch` cannot express.
+        PrefixThenFail(u64, fn(u64) -> AlgoError),
     }
 
     /// What the parallel fetcher reports when the peer serves nothing.
@@ -4348,6 +4461,33 @@ mod tests {
                 _ => {}
             }
             Ok((start..=end).map(|r| (r, self.block(r))).collect())
+        }
+
+        fn fetch_block_range(
+            &self,
+            start: u64,
+            end: u64,
+            concurrency: usize,
+            cancel: &CancellationToken,
+        ) -> BatchFetch {
+            if let Some(token) = &self.cancel_on_fetch {
+                token.cancel();
+            }
+            if cancel.is_cancelled() {
+                RANGE_SAW_CANCEL.with(|c| c.set(true));
+            }
+            match self.batch_mode {
+                BatchMode::PrefixThenFail(last, make) if end > last => {
+                    let blocks: Vec<_> = (start..=last.min(end))
+                        .map(|r| (r, self.block(r)))
+                        .collect();
+                    BatchFetch::failed(blocks, make(end - start + 1))
+                }
+                _ => match self.fetch_blocks_batch(start, end, concurrency) {
+                    Ok(blocks) => BatchFetch::complete(blocks),
+                    Err(e) => BatchFetch::failed(Vec::new(), e),
+                },
+            }
         }
 
         fn get_current_round(&self) -> Result<u64, AlgoError> {
@@ -4884,6 +5024,100 @@ mod tests {
         assert_eq!(stop.target_round, WINDOW_BLOCKS_ROUND + 101);
         assert!(stop.to_string().contains("peer cannot serve blocks beyond"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #1725: a non-404 failure after a served prefix must (1) apply the
+    /// prefix, so a retry does not re-fetch it, and (2) surface with its
+    /// original error class, not be flattened into `AlgoError::Ledger`.
+    #[test]
+    fn replay_applies_the_prefix_before_a_non_404_failure_and_keeps_its_class() {
+        fn reset(_: u64) -> AlgoError {
+            AlgoError::Network {
+                message: "connection reset".into(),
+            }
+        }
+        let (mut o, dir) = window_orchestrator(
+            "prefix-then-network",
+            BatchMode::PrefixThenFail(WINDOW_BLOCKS_ROUND + 5, reset),
+            100,
+            None,
+            |c| c.concurrency = 8,
+        );
+        let e = o
+            .run_replay_blocks()
+            .expect_err("a transient failure is not a hand-off");
+        assert!(matches!(e, AlgoError::Network { .. }), "{e:?}");
+        assert!(o.replay_stopped_early.is_none());
+        assert_eq!(o.final_round, WINDOW_BLOCKS_ROUND + 5);
+        assert_eq!(o.blocks_replayed, 5);
+        let ledger = crate::sqlite::SqliteLedger::open_with_prefix(&o.config.db_path).unwrap();
+        assert_eq!(ledger.current_round().0, WINDOW_BLOCKS_ROUND + 5);
+        drop(ledger);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #1724: the orchestrator's token reaches the backend's range
+    /// fetch, and a cancellation observed there is reported as a
+    /// cancellation, never as a hand-off or the backend's own error.
+    #[test]
+    fn replay_passes_its_cancel_token_to_the_range_fetch() {
+        RANGE_SAW_CANCEL.with(|c| c.set(false));
+        let token = CancellationToken::new();
+        let (mut o, dir) = window_orchestrator(
+            "range-sees-cancel",
+            BatchMode::Fail(not_served),
+            100,
+            Some(token.clone()),
+            |_| {},
+        );
+        o.set_cancel(token);
+        let err = o.run_replay_blocks().expect_err("cancelled");
+        assert!(
+            RANGE_SAW_CANCEL.with(|c| c.get()),
+            "backend never saw the orchestrator's cancellation"
+        );
+        assert!(err.to_string().contains("cancelled"), "{err:?}");
+        assert!(o.replay_stopped_early.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #1725: the hand-off lag threshold is configurable.
+    #[test]
+    fn handoff_min_lag_rounds_is_configurable() {
+        // 10 rounds behind: an error at the default (64), a hand-off at 8.
+        let (mut o, dir) = window_orchestrator(
+            "lag-configured",
+            BatchMode::Fail(not_served),
+            10,
+            None,
+            |_| {},
+        );
+        o.set_handoff_min_lag_rounds(8);
+        o.run_replay_blocks().expect("10 >= 8 hands off");
+        assert!(o.replay_stopped_early.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (mut o, dir) = window_orchestrator(
+            "lag-configured-strict",
+            BatchMode::Fail(not_served),
+            200,
+            None,
+            |_| {},
+        );
+        o.set_handoff_min_lag_rounds(500);
+        let e = o.run_replay_blocks().expect_err("200 < 500 stays an error");
+        assert!(matches!(e, AlgoError::NotFound(_)), "{e:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_handoff_min_lag_rounds_uses_the_default_unless_overridden() {
+        assert_eq!(parse_handoff_min_lag_rounds(None), 64);
+        assert_eq!(parse_handoff_min_lag_rounds(Some("")), 64);
+        assert_eq!(parse_handoff_min_lag_rounds(Some("not a number")), 64);
+        assert_eq!(parse_handoff_min_lag_rounds(Some("-3")), 64);
+        assert_eq!(parse_handoff_min_lag_rounds(Some(" 128 ")), 128);
+        assert_eq!(parse_handoff_min_lag_rounds(Some("0")), 0);
     }
 
     /// Review of #1722: `target_round` comes from the status endpoint and the

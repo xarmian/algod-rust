@@ -19,6 +19,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use algo_error::AlgoError;
 use algo_types::{BlockResponse, Round};
@@ -30,6 +31,14 @@ use crate::BlockSource;
 
 /// Default number of concurrent block fetches, matching Go's `CatchupParallelBlocks`.
 pub const DEFAULT_CONCURRENCY: usize = 16;
+
+/// Default bound on how long the pipeline keeps draining already-started
+/// fetches after the first failure (see
+/// [`ParallelBlockFetcher::with_drain_timeout`]). Long enough for ordinary
+/// in-flight requests to report so the lowest failed round normally still
+/// gets a recorded outcome, short enough that failure reporting is not held
+/// hostage by one hung request.
+pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Slot holding the error of the LOWEST round whose fetch failed (after the
 /// [`BlockSource`]'s own retries), with that round. The pipeline closes its
@@ -52,6 +61,7 @@ pub type FirstFetchError = Arc<Mutex<Option<(Round, AlgoError)>>>;
 pub struct ParallelBlockFetcher {
     source: Arc<dyn BlockSource>,
     concurrency: usize,
+    drain_timeout: Duration,
 }
 
 impl ParallelBlockFetcher {
@@ -61,7 +71,24 @@ impl ParallelBlockFetcher {
         Self {
             source,
             concurrency,
+            drain_timeout: DEFAULT_DRAIN_TIMEOUT,
         }
+    }
+
+    /// Bound how long the pipeline keeps draining fetches that were already
+    /// in flight when the first one failed (default
+    /// [`DEFAULT_DRAIN_TIMEOUT`]).
+    ///
+    /// Draining lets the in-order prefix below the failure still be delivered
+    /// and lets every already-started round record its outcome (so the
+    /// lowest failed round's error is known). Without a bound, one hung
+    /// request would delay failure reporting for every caller. When the bound
+    /// expires the pipeline is cancelled: rounds that had not reported by
+    /// then have no recorded outcome.
+    #[must_use]
+    pub fn with_drain_timeout(mut self, drain_timeout: Duration) -> Self {
+        self.drain_timeout = drain_timeout;
+        self
     }
 
     /// Create a new fetcher with the default concurrency of 16.
@@ -92,9 +119,10 @@ impl ParallelBlockFetcher {
     /// slot that is filled with the lowest failed round's error before the
     /// channel closes. A closed channel with an empty slot means the range
     /// was cancelled externally (or finished). After the first failure no new
-    /// rounds are started, but fetches already in flight are drained so the
-    /// in-order prefix below the failure is still delivered and every
-    /// already-started round gets a recorded outcome.
+    /// rounds are started, but fetches already in flight are drained (for at
+    /// most [`Self::with_drain_timeout`]) so the in-order prefix below the
+    /// failure is still delivered and every already-started round that
+    /// reports in time gets a recorded outcome.
     pub fn fetch_range_tracked(
         &self,
         start: Round,
@@ -104,11 +132,22 @@ impl ParallelBlockFetcher {
         let (tx, rx) = mpsc::channel(self.concurrency);
         let source = Arc::clone(&self.source);
         let concurrency = self.concurrency;
+        let drain_timeout = self.drain_timeout;
         let first_error: FirstFetchError = Arc::new(Mutex::new(None));
         let slot = Arc::clone(&first_error);
 
         tokio::spawn(async move {
-            Self::run_pipeline(source, concurrency, start, end, tx, cancel, slot).await;
+            Self::run_pipeline(
+                source,
+                concurrency,
+                drain_timeout,
+                start,
+                end,
+                tx,
+                cancel,
+                slot,
+            )
+            .await;
         });
 
         (rx, first_error)
@@ -116,9 +155,11 @@ impl ParallelBlockFetcher {
 
     /// Core pipeline loop. Spawns fetch tasks with bounded concurrency via a
     /// semaphore and reorders results before sending them downstream.
+    #[allow(clippy::too_many_arguments)]
     async fn run_pipeline(
         source: Arc<dyn BlockSource>,
         concurrency: usize,
+        drain_timeout: Duration,
         start: Round,
         end: Round,
         tx: mpsc::Sender<(Round, BlockResponse)>,
@@ -144,6 +185,8 @@ impl ParallelBlockFetcher {
         let mut received: u64 = 0;
         // Set on the first failed fetch: stop starting rounds, drain the rest.
         let mut failed = false;
+        // Set with `failed`: when the bounded drain gives up on stragglers.
+        let mut drain_deadline: Option<tokio::time::Instant> = None;
 
         loop {
             // Spawn new tasks up to the semaphore limit, as long as we haven't
@@ -191,6 +234,24 @@ impl ParallelBlockFetcher {
                     debug!("pipeline cancelled while waiting for results");
                     return;
                 }
+                _ = async {
+                    match drain_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // The first failure was recorded and the prefix below it
+                    // delivered; do not let a hung in-flight fetch delay
+                    // failure reporting any longer. Rounds that have not
+                    // reported by now have no recorded outcome.
+                    warn!(
+                        in_flight = spawned - received,
+                        timeout = ?drain_timeout,
+                        "drain after block fetch failure timed out; cancelling pipeline"
+                    );
+                    cancel.cancel();
+                    return;
+                }
                 msg = result_rx.recv() => match msg {
                     Some(v) => v,
                     None => return,
@@ -207,6 +268,9 @@ impl ParallelBlockFetcher {
                         if slot.as_ref().is_none_or(|(r, _)| round.0 < r.0) {
                             *slot = Some((round, e));
                         }
+                    }
+                    if !failed {
+                        drain_deadline = Some(tokio::time::Instant::now() + drain_timeout);
                     }
                     failed = true;
                 }
@@ -326,6 +390,62 @@ mod tests {
         let (round, e) = err.expect("an error must be recorded");
         assert_eq!(round, 2);
         assert!(matches!(e, AlgoError::NotFound(_)), "{e:?}");
+    }
+
+    /// Issue #1725: after the first failure the pipeline drains in-flight
+    /// fetches, but only for a bounded time -- one hung request must not
+    /// delay failure reporting. Virtual time: round 2 would take an hour.
+    #[tokio::test(start_paused = true)]
+    async fn tracked_fetch_bounds_the_drain_after_the_first_failure() {
+        let fetcher = ParallelBlockFetcher::new(
+            Arc::new(Scripted(|r| match r {
+                1 => (
+                    0,
+                    Some(AlgoError::Network {
+                        message: "reset".into(),
+                    }),
+                ),
+                2 => (3_600_000, None),
+                _ => (0, None),
+            })),
+            8,
+        )
+        .with_drain_timeout(Duration::from_secs(30));
+        let started = tokio::time::Instant::now();
+        let (mut rx, slot) =
+            fetcher.fetch_range_tracked(Round(1), Round(9), CancellationToken::new());
+        assert!(rx.recv().await.is_none(), "nothing is deliverable");
+        let waited = started.elapsed();
+        assert!(
+            waited <= Duration::from_secs(31),
+            "failure reporting waited {waited:?} for a hung in-flight fetch"
+        );
+        let (round, e) = slot.lock().unwrap().take().expect("error recorded");
+        assert_eq!(round.0, 1);
+        assert!(matches!(e, AlgoError::Network { .. }), "{e:?}");
+    }
+
+    /// A slow in-flight round that finishes inside the drain bound is still
+    /// drained: its block is delivered (prefix) and the later 404 recorded.
+    #[tokio::test(start_paused = true)]
+    async fn tracked_fetch_still_drains_a_slow_round_within_the_bound() {
+        let fetcher = ParallelBlockFetcher::new(
+            Arc::new(Scripted(|r| match r {
+                1 => (10_000, None),
+                2 => (0, Some(AlgoError::NotFound("404".into()))),
+                _ => (0, None),
+            })),
+            8,
+        )
+        .with_drain_timeout(Duration::from_secs(30));
+        let (mut rx, slot) =
+            fetcher.fetch_range_tracked(Round(1), Round(9), CancellationToken::new());
+        let mut got = Vec::new();
+        while let Some((r, _)) = rx.recv().await {
+            got.push(r.0);
+        }
+        assert_eq!(got, vec![1]);
+        assert_eq!(slot.lock().unwrap().take().unwrap().0 .0, 2);
     }
 
     /// A clean fetch leaves the slot empty.

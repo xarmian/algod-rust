@@ -25,7 +25,7 @@ use algo_codec::{
     canonical_encode_block, canonical_encode_block_header_from_block, decode_block_response,
 };
 use algo_error::AlgoError;
-use algo_ledger::sync::{SyncBackend, SyncConfig, SyncOrchestrator};
+use algo_ledger::sync::{BatchFetch, SyncBackend, SyncConfig, SyncOrchestrator};
 use algo_network::GossipNode;
 use algo_rest_client::{
     AlgodClient, BlockSource, CatchpointDownloader, GossipBlockSource, HttpBlockFetcher,
@@ -101,13 +101,17 @@ impl AlgodSyncBackend {
         match self.client.get_block_raw(Round(round)).await {
             Ok(raw) => Ok(raw),
             Err(rest_err) => match &self.http_block_fetcher {
-                Some(fetcher) => fetcher.fetch_block(round).await.map_err(|http_err| {
-                    AlgoError::Network {
-                        message: format!(
-                            "block {round}: REST /v2/blocks failed ({rest_err});                              /v1 block-service fallback failed ({http_err})"
-                        ),
-                    }
-                }),
+                Some(fetcher) => {
+                    fetcher
+                        .fetch_block(round)
+                        .await
+                        .map_err(|http_err| AlgoError::Network {
+                            message: format!(
+                                "block {round}: REST /v2/blocks failed ({rest_err}); \
+                             /v1 block-service fallback failed ({http_err})"
+                            ),
+                        })
+                }
                 None => Err(rest_err),
             },
         }
@@ -311,8 +315,23 @@ impl SyncBackend for AlgodSyncBackend {
         end: u64,
         concurrency: usize,
     ) -> Result<Vec<(u64, Block)>, AlgoError> {
+        batch_fetch_into_result(self.fetch_block_range(
+            start,
+            end,
+            concurrency,
+            &CancellationToken::new(),
+        ))
+    }
+
+    fn fetch_block_range(
+        &self,
+        start: u64,
+        end: u64,
+        concurrency: usize,
+        cancel: &CancellationToken,
+    ) -> BatchFetch {
         if start > end {
-            return Ok(Vec::new());
+            return BatchFetch::complete(Vec::new());
         }
 
         tokio::task::block_in_place(|| {
@@ -320,7 +339,6 @@ impl SyncBackend for AlgodSyncBackend {
                 let source: Arc<dyn BlockSource> =
                     Arc::new(AlgodClient::new(&self.algod_url, &self.algod_token));
                 let fetcher = ParallelBlockFetcher::new(source, concurrency);
-                let cancel = CancellationToken::new();
                 collect_block_range(&fetcher, start, end, cancel).await
             })
         })
@@ -329,11 +347,11 @@ impl SyncBackend for AlgodSyncBackend {
 
 /// Fetch the inclusive range `[start, end]` through `fetcher`.
 ///
-/// Returns every block, or -- when the peer genuinely cannot serve part of
-/// the range -- the in-order PREFIX that arrived (see
-/// [`SyncBackend::fetch_blocks_batch`]'s contract), so the caller can apply
-/// it and then hand off. Shared by the REST and gossip [`SyncBackend`]s
-/// (issue #1719 unified their two identical copies).
+/// Returns a [`BatchFetch`] (see [`SyncBackend::fetch_block_range`]): the
+/// in-order PREFIX of the range that arrived, plus the reason the range was
+/// not completed, if any. The caller applies the prefix before acting on the
+/// shortfall, so a retry never re-fetches it. Shared by the REST and gossip
+/// [`SyncBackend`]s (issue #1719 unified their two identical copies).
 ///
 /// When the pipeline closes early, the error recorded for the LOWEST failed
 /// round (via [`ParallelBlockFetcher::fetch_range_tracked`]) decides, but only
@@ -341,63 +359,92 @@ impl SyncBackend for AlgodSyncBackend {
 /// length`); an earlier round with no recorded outcome (still slow, or
 /// cancelled) means the real cause is unknown and is treated as a hard error:
 /// - that error is [`AlgoError::NotFound`] (a genuine 404 / "round not
-///   available"): a non-empty prefix is returned as `Ok`; an empty one is
-///   `Err(NotFound)` ("peer cannot serve this range");
-/// - any other error (transport, 401, 5xx, decode, ...) is returned
-///   unchanged (empty prefix) or wrapped in [`AlgoError::Ledger`] (non-empty
-///   prefix), so it keeps failing loudly / retrying as before.
+///   available"): a non-empty prefix is `error: None` (a clean "peer lacks
+///   the next round" shortfall); an empty one keeps `Some(NotFound)` ("peer
+///   cannot serve this range");
+/// - any other error (transport, 401, 5xx, decode, ...) is returned with its
+///   class unchanged and the fetched prefix preserved (issue #1725).
+///
+/// `cancel` is the CALLER's token (the orchestrator's, issue #1724): a child
+/// token is derived for the fetcher, so cancelling the parent aborts the
+/// in-flight fetch tasks promptly (reported as a "cancelled" error, never a
+/// `NotFound` hand-off), while finishing or failing this call cancels only the
+/// child, so no background fetch task outlives the call and the parent is
+/// untouched.
 ///
 /// An inverted range (`end < start`) is empty and `end == u64::MAX` is
-/// rejected (the half-open fetch range cannot express it). The fetcher is
-/// always cancelled on exit so no background fetch task outlives the call.
+/// rejected (the half-open fetch range cannot express it).
 async fn collect_block_range(
     fetcher: &ParallelBlockFetcher,
     start: u64,
     end: u64,
-    cancel: CancellationToken,
-) -> Result<Vec<(u64, Block)>, AlgoError> {
+    cancel: &CancellationToken,
+) -> BatchFetch {
     if end < start {
-        return Ok(Vec::new());
+        return BatchFetch::complete(Vec::new());
     }
     if end == u64::MAX {
-        return Err(AlgoError::Ledger {
-            message: "block range end u64::MAX is not supported".to_string(),
-        });
+        return BatchFetch::failed(
+            Vec::new(),
+            AlgoError::Ledger {
+                message: "block range end u64::MAX is not supported".to_string(),
+            },
+        );
     }
     let expected = end - start + 1;
-    let _stop_fetcher = cancel.clone().drop_guard();
+    let child = cancel.child_token();
+    let _stop_fetcher = child.clone().drop_guard();
     // fetch_range uses half-open [start, end), so add 1 to include `end`.
-    let (mut rx, first_error) = fetcher.fetch_range_tracked(Round(start), Round(end + 1), cancel);
+    let (mut rx, first_error) = fetcher.fetch_range_tracked(Round(start), Round(end + 1), child);
     let mut blocks = Vec::with_capacity(expected.min(4096) as usize);
     while let Some((round, block_resp)) = rx.recv().await {
         blocks.push((round.0, block_resp.block));
     }
     if blocks.len() as u64 == expected {
-        return Ok(blocks);
+        return BatchFetch::complete(blocks);
+    }
+    if cancel.is_cancelled() {
+        return BatchFetch::failed(
+            blocks,
+            AlgoError::Ledger {
+                message: format!("block fetch for rounds {start}..={end} cancelled"),
+            },
+        );
     }
     let next_needed = start + blocks.len() as u64;
     let cause = first_error.lock().ok().and_then(|mut slot| slot.take());
     match cause {
         // The lowest failed round is exactly the one we are stuck on.
         Some((round, e)) if round.0 == next_needed => match e {
-            AlgoError::NotFound(_) if !blocks.is_empty() => Ok(blocks),
-            e if blocks.is_empty() => Err(e),
-            e => Err(AlgoError::Ledger {
-                message: format!(
-                    "parallel fetch incomplete: expected {expected} blocks, got {} ({e})",
-                    blocks.len()
-                ),
-            }),
+            AlgoError::NotFound(_) if !blocks.is_empty() => BatchFetch::complete(blocks),
+            e => BatchFetch::failed(blocks, e),
         },
         // The round we need has no recorded outcome (a later round failed
         // first, or the pipeline was cancelled): the cause is unknown, so do
         // not classify it as "peer cannot serve".
-        _ => Err(AlgoError::Ledger {
-            message: format!(
-                "parallel fetch incomplete: expected {expected} blocks, got {}                  (round {next_needed} has no recorded outcome)",
-                blocks.len()
-            ),
-        }),
+        _ => {
+            let got = blocks.len();
+            BatchFetch::failed(
+                blocks,
+                AlgoError::Ledger {
+                    message: format!(
+                        "parallel fetch incomplete: expected {expected} blocks, got {got} \
+                         (round {next_needed} has no recorded outcome)"
+                    ),
+                },
+            )
+        }
+    }
+}
+
+/// The legacy all-or-error view of a [`BatchFetch`]
+/// ([`SyncBackend::fetch_blocks_batch`]): the served prefix is returned only
+/// when the shortfall is a clean "peer lacks the next round"; any error
+/// discards it.
+fn batch_fetch_into_result(fetch: BatchFetch) -> Result<Vec<(u64, Block)>, AlgoError> {
+    match fetch.error {
+        None => Ok(fetch.blocks),
+        Some(e) => Err(e),
     }
 }
 
@@ -791,8 +838,23 @@ impl SyncBackend for GossipSyncBackend {
         end: u64,
         concurrency: usize,
     ) -> Result<Vec<(u64, Block)>, AlgoError> {
+        batch_fetch_into_result(self.fetch_block_range(
+            start,
+            end,
+            concurrency,
+            &CancellationToken::new(),
+        ))
+    }
+
+    fn fetch_block_range(
+        &self,
+        start: u64,
+        end: u64,
+        concurrency: usize,
+        cancel: &CancellationToken,
+    ) -> BatchFetch {
         if start > end {
-            return Ok(Vec::new());
+            return BatchFetch::complete(Vec::new());
         }
 
         // For batch fetches, use the gossip source wrapped as a BlockSource
@@ -831,7 +893,6 @@ impl SyncBackend for GossipSyncBackend {
                     self.concurrency
                 };
                 let fetcher = ParallelBlockFetcher::new(source, effective_concurrency);
-                let cancel = CancellationToken::new();
                 collect_block_range(&fetcher, start, end, cancel).await
             })
         })
@@ -922,6 +983,19 @@ impl SyncBackend for CatchpointBackend {
         match self {
             Self::Rest(b) => b.fetch_blocks_batch(start, end, concurrency),
             Self::Gossip(b) => b.fetch_blocks_batch(start, end, concurrency),
+        }
+    }
+
+    fn fetch_block_range(
+        &self,
+        start: u64,
+        end: u64,
+        concurrency: usize,
+        cancel: &CancellationToken,
+    ) -> BatchFetch {
+        match self {
+            Self::Rest(b) => b.fetch_block_range(start, end, concurrency, cancel),
+            Self::Gossip(b) => b.fetch_block_range(start, end, concurrency, cancel),
         }
     }
 }
@@ -1260,11 +1334,35 @@ fn catchup_gossip_block_fetch_timeout_from_node_config(
 // Public entry point
 // ---------------------------------------------------------------------------
 
+/// Process exit status of a `catchpoint-sync` run that did not fail (issue
+/// #1725): [`EXIT_CODE_STOPPED_SHORT`] when block replay ended before the
+/// network tip because the peer could not serve the remaining blocks (the
+/// ledger is consistent at `Stopped early`'s round, but the node is behind),
+/// `0` when the run reached its target. Failures are errors (exit status 1).
+pub(crate) fn exit_code(result: &algo_ledger::sync::SyncResult) -> i32 {
+    if result.stopped_early.is_some() {
+        EXIT_CODE_STOPPED_SHORT
+    } else {
+        0
+    }
+}
+
+/// Exit status of a successful `catchpoint-sync` whose replay stopped short
+/// of the tip (issue #1725): distinct from `0` (caught up) and `1` (failed)
+/// so scripts can tell "applied the catchpoint but still far behind; run
+/// `sync`/a normal catchup next" apart from both.
+pub(crate) const EXIT_CODE_STOPPED_SHORT: i32 = 3;
+
 /// Run the catchpoint sync path: build a SyncConfig from CLI args, construct
 /// a SyncOrchestrator, and drive it through all phases.
 ///
 /// Sets up a progress callback for phase-transition logging and a Ctrl+C
 /// handler for graceful shutdown with checkpoint persistence.
+///
+/// Returns the process exit status of a run that did not fail (issue #1725):
+/// `0` when replay reached its target, [`EXIT_CODE_STOPPED_SHORT`] (`3`) when
+/// it stopped short because the peer could not serve the remaining blocks
+/// (the summary's `Stopped early` line says where). Failures are `Err`.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     network: &str,
@@ -1292,7 +1390,7 @@ pub async fn run(
     catchup_ledger_download_retry_attempts: i64,
     catchup_http_block_fetch_timeout_sec: i64,
     catchup_gossip_block_fetch_timeout_sec: i64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<i32> {
     // Determine the catchpoint label to use.
     let label = match (catchpoint_label, catchpoint_auto) {
         (Some(label), _) => {
@@ -1447,9 +1545,13 @@ pub async fn run(
     println!("Duration:           {:.1}s", result.duration.as_secs_f64());
     if let Some(stop) = &result.stopped_early {
         println!("Stopped early:      {stop}");
+        warn!(
+            exit_code = EXIT_CODE_STOPPED_SHORT,
+            "catchpoint applied but replay stopped short of the network tip: {stop};              exiting with status {EXIT_CODE_STOPPED_SHORT} (0 means caught up)"
+        );
     }
 
-    Ok(())
+    Ok(exit_code(&result))
 }
 
 // ---------------------------------------------------------------------------
@@ -1511,7 +1613,7 @@ mod tests {
     }
 
     /// Only a genuine 404 may be reported as "peer cannot serve" (`NotFound`);
-    /// transport and 401 failures on the first round must stay hard errors
+    /// transport and 401 failures on the first round keep their error class
     /// through the real `collect_block_range` mapping, not become a hand-off.
     #[tokio::test]
     async fn collect_block_range_maps_only_a_404_to_not_found() {
@@ -1529,19 +1631,21 @@ mod tests {
             &failing_fetcher(0, past_retention),
             10,
             15,
-            CancellationToken::new(),
+            &CancellationToken::new(),
         )
         .await
-        .unwrap_err();
+        .error
+        .unwrap();
         assert!(matches!(err, AlgoError::NotFound(_)), "404: {err:?}");
         let err = collect_block_range(
             &failing_fetcher(0, transport),
             10,
             15,
-            CancellationToken::new(),
+            &CancellationToken::new(),
         )
         .await
-        .unwrap_err();
+        .error
+        .unwrap();
         assert!(
             matches!(err, AlgoError::Network { .. }),
             "transport: {err:?}"
@@ -1550,59 +1654,223 @@ mod tests {
             &failing_fetcher(0, unauthorized),
             10,
             15,
-            CancellationToken::new(),
+            &CancellationToken::new(),
         )
         .await
-        .unwrap_err();
+        .error
+        .unwrap();
         assert!(matches!(err, AlgoError::Conformance { .. }), "401: {err:?}");
     }
 
     #[tokio::test]
     async fn collect_block_range_returns_every_block_when_served() {
-        let cancel = CancellationToken::new();
-        let blocks = collect_block_range(&partial_fetcher(u64::MAX), 10, 15, cancel.clone())
-            .await
-            .unwrap();
-        assert_eq!(blocks.len(), 6);
-        assert!(
-            cancel.is_cancelled(),
-            "fetcher token must be cancelled on exit"
-        );
+        let fetch = collect_block_range(
+            &partial_fetcher(u64::MAX),
+            10,
+            15,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(fetch.blocks.len(), 6);
+        assert!(fetch.error.is_none());
     }
 
     #[tokio::test]
     async fn collect_block_range_reports_not_found_when_nothing_is_served() {
-        let cancel = CancellationToken::new();
-        let err = collect_block_range(&partial_fetcher(0), 10, 25, cancel.clone())
-            .await
-            .unwrap_err();
-        assert!(matches!(err, AlgoError::NotFound(_)), "{err:?}");
-        assert!(cancel.is_cancelled());
+        let fetch =
+            collect_block_range(&partial_fetcher(0), 10, 25, &CancellationToken::new()).await;
+        assert!(fetch.blocks.is_empty());
+        assert!(
+            matches!(fetch.error, Some(AlgoError::NotFound(_))),
+            "{:?}",
+            fetch.error
+        );
     }
 
+    /// Issue #1725: after a 404 the prefix is returned (clean shortfall); after
+    /// any other error the prefix is STILL returned (so it is applied rather
+    /// than re-fetched) and the error keeps its class instead of being
+    /// flattened into `AlgoError::Ledger`.
     #[tokio::test]
-    async fn collect_block_range_returns_the_prefix_before_a_404_but_not_before_other_errors() {
-        // 404 after rounds 10 and 11: the prefix is returned for the caller to
-        // apply before handing off.
-        let blocks = collect_block_range(&partial_fetcher(12), 10, 15, CancellationToken::new())
-            .await
-            .unwrap();
-        assert_eq!(blocks.iter().map(|(r, _)| *r).collect::<Vec<_>>(), [10, 11]);
-        // The same shortfall caused by a transport error is a hard error.
+    async fn collect_block_range_keeps_the_prefix_and_the_error_class() {
+        let fetch =
+            collect_block_range(&partial_fetcher(12), 10, 15, &CancellationToken::new()).await;
+        assert_eq!(
+            fetch.blocks.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+            [10, 11]
+        );
+        assert!(fetch.error.is_none(), "{:?}", fetch.error);
+
         fn transport() -> AlgoError {
             AlgoError::Network {
                 message: "connection reset".into(),
             }
         }
-        let err = collect_block_range(
+        let fetch = collect_block_range(
             &failing_fetcher(12, transport),
             10,
             15,
-            CancellationToken::new(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(
+            fetch.blocks.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+            [10, 11],
+            "the fetched prefix must not be discarded"
+        );
+        assert!(
+            matches!(fetch.error, Some(AlgoError::Network { .. })),
+            "{:?}",
+            fetch.error
+        );
+    }
+
+    /// Both orderings (review of #1722): a fast 404 on a later round must not
+    /// become a hand-off while the round we need is merely slow/transient, but
+    /// a slow-yet-successful first round followed by a 404 yields its prefix.
+    #[tokio::test]
+    async fn collect_block_range_decides_on_the_lowest_failed_round_in_both_orderings() {
+        let slow_transient_then_fast_404 = ParallelBlockFetcher::new(
+            Arc::new(ScriptedSource(|r| match r {
+                10 => (
+                    80,
+                    Some(AlgoError::Network {
+                        message: "reset".into(),
+                    }),
+                ),
+                11.. => (0, Some(AlgoError::NotFound("404".into()))),
+                _ => (0, None),
+            })),
+            4,
+        );
+        let fetch = collect_block_range(
+            &slow_transient_then_fast_404,
+            10,
+            15,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(fetch.blocks.is_empty());
+        assert!(
+            matches!(fetch.error, Some(AlgoError::Network { .. })),
+            "must not hand off: {:?}",
+            fetch.error
+        );
+
+        let slow_ok_then_404 = ParallelBlockFetcher::new(
+            Arc::new(ScriptedSource(|r| match r {
+                10 => (60, None),
+                _ => (0, Some(AlgoError::NotFound("404".into()))),
+            })),
+            4,
+        );
+        let fetch = collect_block_range(&slow_ok_then_404, 10, 15, &CancellationToken::new()).await;
+        assert_eq!(fetch.blocks.len(), 1);
+        assert!(fetch.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn collect_block_range_inverted_or_extreme_range_does_not_overflow() {
+        let fetch = collect_block_range(&partial_fetcher(0), 9, 3, &CancellationToken::new()).await;
+        assert!(fetch.blocks.is_empty() && fetch.error.is_none());
+        // end == u64::MAX is rejected cleanly (no wrap of `end + 1`).
+        let fetch = collect_block_range(
+            &partial_fetcher(0),
+            u64::MAX - 1,
+            u64::MAX,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(fetch.error, Some(AlgoError::Ledger { .. })),
+            "{:?}",
+            fetch.error
+        );
+    }
+
+    /// A [`BlockSource`] whose fetches never complete, recording how many
+    /// in-flight fetches were dropped (aborted).
+    struct HangingSource {
+        aborted: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct CountOnDrop(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for CountOnDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlockSource for HangingSource {
+        async fn get_block_raw(&self, _round: Round) -> algo_error::Result<Vec<u8>> {
+            unimplemented!()
+        }
+        async fn get_block(&self, _round: Round) -> algo_error::Result<algo_types::BlockResponse> {
+            let _count = CountOnDrop(Arc::clone(&self.aborted));
+            std::future::pending().await
+        }
+        async fn get_status(&self) -> algo_error::Result<algo_rest_client::NodeStatus> {
+            unimplemented!()
+        }
+        async fn wait_for_round(
+            &self,
+            _round: Round,
+        ) -> algo_error::Result<algo_rest_client::NodeStatus> {
+            unimplemented!()
+        }
+    }
+
+    /// Issue #1724: cancelling the PARENT token (the orchestrator's) while a
+    /// batch is mid-fetch against a source that never answers makes
+    /// `collect_block_range` return promptly with a cancellation result --
+    /// not a `NotFound` hand-off -- and aborts the background fetch tasks.
+    /// Virtual time: without the wiring the call would hang for an hour.
+    #[tokio::test(start_paused = true)]
+    async fn collect_block_range_returns_promptly_when_the_parent_token_is_cancelled() {
+        let aborted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetcher = ParallelBlockFetcher::new(
+            Arc::new(HangingSource {
+                aborted: Arc::clone(&aborted),
+            }),
+            4,
+        );
+        let parent = CancellationToken::new();
+        let canceller = parent.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            canceller.cancel();
+        });
+        let started = tokio::time::Instant::now();
+        let fetch = tokio::time::timeout(
+            std::time::Duration::from_secs(3600),
+            collect_block_range(&fetcher, 10, 25, &parent),
         )
         .await
-        .unwrap_err();
-        assert!(matches!(err, AlgoError::Ledger { .. }), "{err:?}");
+        .expect("a cancelled parent must abort the fetch, not wait for it");
+        assert!(started.elapsed() < std::time::Duration::from_secs(60));
+        assert!(fetch.blocks.is_empty());
+        let err = fetch.error.expect("cancellation is reported as an error");
+        assert!(
+            matches!(&err, AlgoError::Ledger { message } if message.contains("cancelled")),
+            "not a hand-off/NotFound: {err:?}"
+        );
+        // The in-flight fetch futures were dropped (aborted).
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert_eq!(aborted.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    /// The child token derived per call must not leak its cancellation to the
+    /// parent: finishing one batch cannot cancel the orchestrator.
+    #[tokio::test]
+    async fn collect_block_range_does_not_cancel_the_parent_when_it_finishes() {
+        let parent = CancellationToken::new();
+        let fetch = collect_block_range(&partial_fetcher(u64::MAX), 10, 15, &parent).await;
+        assert_eq!(fetch.blocks.len(), 6);
+        assert!(!parent.is_cancelled());
+        let fetch = collect_block_range(&partial_fetcher(0), 10, 15, &parent).await;
+        assert!(fetch.error.is_some());
+        assert!(!parent.is_cancelled());
     }
 
     /// `(delay_ms, error)` per round.
@@ -1634,66 +1902,25 @@ mod tests {
         }
     }
 
-    /// Both orderings (review of #1722): a fast 404 on a later round must not
-    /// become a hand-off while the round we need is merely slow/transient, but
-    /// a slow-yet-successful first round followed by a 404 yields its prefix.
-    #[tokio::test]
-    async fn collect_block_range_decides_on_the_lowest_failed_round_in_both_orderings() {
-        let slow_transient_then_fast_404 = ParallelBlockFetcher::new(
-            Arc::new(ScriptedSource(|r| match r {
-                10 => (
-                    80,
-                    Some(AlgoError::Network {
-                        message: "reset".into(),
-                    }),
-                ),
-                11.. => (0, Some(AlgoError::NotFound("404".into()))),
-                _ => (0, None),
-            })),
-            4,
-        );
-        let err = collect_block_range(
-            &slow_transient_then_fast_404,
-            10,
-            15,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(err, AlgoError::Network { .. }),
-            "must not hand off: {err:?}"
-        );
-
-        let slow_ok_then_404 = ParallelBlockFetcher::new(
-            Arc::new(ScriptedSource(|r| match r {
-                10 => (60, None),
-                _ => (0, Some(AlgoError::NotFound("404".into()))),
-            })),
-            4,
-        );
-        let blocks = collect_block_range(&slow_ok_then_404, 10, 15, CancellationToken::new())
-            .await
-            .unwrap();
-        assert_eq!(blocks.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn collect_block_range_inverted_or_extreme_range_does_not_overflow() {
-        let blocks = collect_block_range(&partial_fetcher(0), 9, 3, CancellationToken::new())
-            .await
-            .unwrap();
-        assert!(blocks.is_empty());
-        // end == u64::MAX is rejected cleanly (no wrap of `end + 1`).
-        let err = collect_block_range(
-            &partial_fetcher(0),
-            u64::MAX - 1,
-            u64::MAX,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, AlgoError::Ledger { .. }), "{err:?}");
+    /// Issue #1725: a hand-off after the catchpoint was applied must be
+    /// distinguishable from a fully caught-up run by the exit status.
+    #[test]
+    fn exit_code_distinguishes_a_stopped_short_run() {
+        use algo_ledger::sync::{ReplayStoppedEarly, SyncResult};
+        let mut result = SyncResult {
+            final_round: 1421,
+            accounts_imported: 0,
+            blocks_replayed: 101,
+            duration: std::time::Duration::ZERO,
+            stopped_early: None,
+        };
+        assert_eq!(exit_code(&result), 0);
+        result.stopped_early = Some(ReplayStoppedEarly {
+            stopped_at_round: 1320,
+            target_round: 1421,
+        });
+        assert_eq!(exit_code(&result), EXIT_CODE_STOPPED_SHORT);
+        assert_eq!(EXIT_CODE_STOPPED_SHORT, 3);
     }
 
     // -- Fake UnicastPeer (for gossip-peer-snapshot tests) -----------------

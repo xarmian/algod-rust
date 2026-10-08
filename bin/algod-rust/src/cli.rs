@@ -239,6 +239,14 @@ pub enum Commands {
 
         /// Auto-discover the latest catchpoint from the network.
         /// Triggers catchpoint sync mode instead of genesis sync.
+        ///
+        /// Catchpoint sync exit status: 0 = caught up to its target; 1 = failed;
+        /// 3 = the catchpoint was applied but block replay stopped short of the
+        /// network tip because the peer could not serve the remaining blocks
+        /// (the summary's "Stopped early" line says where; follow up with a
+        /// normal sync). `ALGOD_RUST_HANDOFF_MIN_LAG_ROUNDS` (default 64)
+        /// sets how far behind the tip a peer must be missing a block for
+        /// that to count as "cannot serve" rather than a retryable error.
         #[arg(long)]
         catchpoint_auto: bool,
 

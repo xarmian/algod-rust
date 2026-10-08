@@ -2361,6 +2361,11 @@ impl NodeInterface for AlgodNodeInterface {
         if let Some(counter) = self.tx_pool_check_counter.as_ref() {
             text.push_str(&counter.to_prometheus_text());
         }
+        // Issue #1725: live catchpoint catchups that completed vs. stopped
+        // short of their replay target (empty until one has finished).
+        if let Some(manager) = self.catchup_manager.as_ref() {
+            text.push_str(&manager.metrics_text());
+        }
         if self.enable_runtime_metrics_cfg {
             text.push_str(
                 &algo_rest_api::process_metrics::RuntimeMetricsSnapshot::capture()
@@ -7070,7 +7075,7 @@ mod tests {
             _catchpoint: &str,
             cancel: tokio_util::sync::CancellationToken,
             counters: Arc<Mutex<crate::live_catchup::CatchpointCounters>>,
-        ) -> anyhow::Result<()> {
+        ) -> anyhow::Result<crate::live_catchup::CatchupOutcome> {
             // Publish a partial-progress snapshot before blocking, so
             // `start_and_abort_catchup_round_trip_through_status` can prove
             // `status()` surfaces live counters while catchup is in flight
@@ -7445,8 +7450,8 @@ mod tests {
             _catchpoint: &str,
             _cancel: tokio_util::sync::CancellationToken,
             _counters: Arc<Mutex<crate::live_catchup::CatchpointCounters>>,
-        ) -> anyhow::Result<()> {
-            Ok(())
+        ) -> anyhow::Result<crate::live_catchup::CatchupOutcome> {
+            Ok(crate::live_catchup::CatchupOutcome::Complete)
         }
     }
 
@@ -7498,6 +7503,29 @@ mod tests {
         // `TestFastCatchupResume` itself makes (`assert.Zero(t,
         // node.GetSyncRound())`).
         assert_eq!(adapter.get_sync_round().await.unwrap(), 0);
+    }
+
+    /// Issue #1725: a finished live catchup shows up in `/metrics`; before
+    /// any has finished the attached manager adds nothing.
+    #[tokio::test]
+    async fn finished_live_catchup_is_exposed_in_metrics() {
+        let manager = crate::live_catchup::LiveCatchupManager::new(
+            Arc::new(ImmediateRunner),
+            Arc::new(crate::live_catchup::NoopSyncControl),
+        );
+        let adapter = make_adapter().with_catchup_manager(manager.clone());
+        assert!(adapter.metrics_exposition().is_none());
+
+        adapter.start_catchup("1000#deadbeef", 0).await.unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while manager.current_catchpoint().await.is_some() {
+            assert!(tokio::time::Instant::now() < deadline, "not idle in time");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let text = adapter
+            .metrics_exposition()
+            .expect("a finished catchup must be reported");
+        assert!(text.contains("algod_rust_catchpoint_catchup_completed_total 1"));
     }
 
     // ── get_peers (issue #673) ───────────────────────────────────────

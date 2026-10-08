@@ -45,7 +45,9 @@ use algo_types::{BlockResponse, Round};
 use async_trait::async_trait;
 use tracing::{debug, warn};
 
-use algo_network::block_fetcher::{make_block_request_topics, parse_block_response};
+use algo_network::block_fetcher::{
+    make_block_request_topics, parse_block_response, BlockFetchError,
+};
 use algo_network::gossip_node::UnicastPeer;
 use algo_network::peer_ranker::{
     create_peer_selector, ClassBasedPeerSelector, PeerClassKind, PeerSelector, PeersRetriever,
@@ -54,6 +56,10 @@ use algo_network::peer_ranker::{
 use algo_network::tag::Tag;
 
 use crate::{BlockSource, NodeStatus};
+
+/// go: `blockNotAvailableErrMsg` (`rpcs/blockService.go`), the `Error` topic
+/// text a block service answers with when it does not have the round.
+const BLOCK_NOT_AVAILABLE_MSG: &str = "requested block is not available";
 
 // ---------------------------------------------------------------------------
 // Peer-ranking wiring
@@ -247,13 +253,25 @@ impl GossipBlockSource {
             })?;
 
         // Parse the response topics to get raw block+cert bytes.
-        let data = parse_block_response(&response_topics).map_err(|e| AlgoError::Network {
-            message: format!(
+        let data = parse_block_response(&response_topics).map_err(|e| {
+            let message = format!(
                 "failed to parse block response for round {} from peer {}: {}",
                 round,
                 peer.get_address(),
                 e
-            ),
+            );
+            // go's block service answers `blockNotAvailableErrMsg` when it
+            // genuinely does not have the round (`rpcs/blockService.go`).
+            // Keep that class so catchpoint replay can tell "peer cannot
+            // serve this round" from a transport failure (issue #1725).
+            match e {
+                BlockFetchError::ServiceError { message: m, .. }
+                    if m == BLOCK_NOT_AVAILABLE_MSG =>
+                {
+                    AlgoError::NotFound(message)
+                }
+                _ => AlgoError::Network { message },
+            }
         })?;
 
         // Decode block+cert from their raw msgpack bytes. decode_block_cert
@@ -290,7 +308,11 @@ impl GossipBlockSource {
         // count — closer to go's `catchupRetryLimit`, which is likewise
         // independent of how many peers are available.
         let attempts = self.config.max_peer_attempts;
-        let mut last_err = None;
+        // A `NotFound` ("peer lacks the round") is only reported when every
+        // attempt got one: a mix with a transport failure proves nothing
+        // about the round's availability, so the other failure wins.
+        let mut last_not_found: Option<AlgoError> = None;
+        let mut last_other: Option<AlgoError> = None;
 
         for attempt in 0..attempts {
             // Ask the ranker for the next peer to try (lowest-rank
@@ -364,14 +386,20 @@ impl GossipBlockSource {
                         .expect("peer selector lock poisoned");
                     selector.rank_peer(&psp, PEER_RANK_DOWNLOAD_FAILED);
                     drop(selector);
-                    last_err = Some(e);
+                    if matches!(e, AlgoError::NotFound(_)) {
+                        last_not_found = Some(e);
+                    } else {
+                        last_other = Some(e);
+                    }
                 }
             }
         }
 
-        Err(last_err.unwrap_or_else(|| AlgoError::Network {
-            message: format!("all {attempts} peers failed for round {round}"),
-        }))
+        Err(last_other
+            .or(last_not_found)
+            .unwrap_or_else(|| AlgoError::Network {
+                message: format!("all {attempts} peers failed for round {round}"),
+            }))
     }
 
     /// Fetch a block with retry/failover, returning both the decoded response
@@ -977,6 +1005,45 @@ mod tests {
         let src = GossipBlockSource::new(vec![err_peer, ok_peer]);
         let resp = src.get_block(Round(7)).await.unwrap();
         assert_eq!(resp.block.round.0, 7);
+    }
+
+    /// Issue #1725: a peer that answers go's `blockNotAvailableErrMsg`
+    /// ("requested block is not available") genuinely lacks the round; that
+    /// must surface as `NotFound` (so catchpoint replay can hand off) rather
+    /// than be flattened into `Network` like a transport failure.
+    #[tokio::test]
+    async fn every_peer_lacking_the_round_is_not_found() {
+        let a: Arc<dyn UnicastPeer> = Arc::new(MockPeer::new("a:4160"));
+        let b: Arc<dyn UnicastPeer> = Arc::new(MockPeer::new("b:4160"));
+        let src = GossipBlockSource::new(vec![a, b]);
+        let err = src.get_block(Round(3)).await.unwrap_err();
+        assert!(matches!(err, AlgoError::NotFound(_)), "{err:?}");
+        assert!(err.to_string().contains("not available"), "{err}");
+    }
+
+    /// One peer lacking the round while another is unreachable is NOT proof
+    /// that the round is unavailable: the transport failure wins.
+    #[tokio::test]
+    async fn a_transport_failure_among_not_available_answers_stays_network() {
+        let lacks: Arc<dyn UnicastPeer> = Arc::new(MockPeer::new("a:4160"));
+        let broken: Arc<dyn UnicastPeer> = Arc::new(MockPeer::new("b:4160").always_failing());
+        let src = GossipBlockSource::new(vec![lacks, broken]);
+        let err = src.get_block(Round(3)).await.unwrap_err();
+        assert!(matches!(err, AlgoError::Network { .. }), "{err:?}");
+    }
+
+    /// Any other service error text is not a "peer lacks the block" claim.
+    #[tokio::test]
+    async fn other_service_errors_stay_network() {
+        let peer: Arc<dyn UnicastPeer> =
+            Arc::new(MockPeer::new("a:4160").with_service_error(3, "memory at capacity"));
+        let cfg = GossipBlockSourceConfig {
+            max_peer_attempts: 1,
+            ..GossipBlockSourceConfig::default()
+        };
+        let src = GossipBlockSource::with_config(vec![peer], cfg);
+        let err = src.get_block(Round(3)).await.unwrap_err();
+        assert!(matches!(err, AlgoError::Network { .. }), "{err:?}");
     }
 
     #[tokio::test]

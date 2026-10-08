@@ -163,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
                     None => algo_config::Local::default(),
                 };
                 // Catchpoint sync path.
-                commands::catchpoint_sync::run(
+                let exit_code = commands::catchpoint_sync::run(
                     net_name,
                     &resolved_url,
                     &resolved_token,
@@ -191,6 +191,11 @@ async fn main() -> anyhow::Result<()> {
                     node_config.catchup_gossip_block_fetch_timeout_sec,
                 )
                 .await?;
+                if exit_code != 0 {
+                    // Issue #1725: a catchpoint sync whose replay stopped
+                    // short of the tip exits non-zero so scripts can tell.
+                    std::process::exit(exit_code);
+                }
             } else {
                 // Genesis-based sync path.
                 commands::sync::run(
