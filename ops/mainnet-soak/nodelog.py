@@ -264,6 +264,9 @@ NO_ADVANCE_RE = re.compile(r"ensure_block.*did not advance|did not advance.*ensu
 # (key, regex, minimum count for the job to fail, description)
 HARD_RULES = [
     ("permanent_error_writing_block", re.compile(r"permanent error writing block"), 1, "ensure_block hit a permanent ledger write error"),
+    # Issue #1715: the node itself declares it is stuck on a block that
+    # deterministically fails to apply (the monitor also polls /v2/status).
+    ("stalled_on_invalid_block", re.compile(r"stalled on invalid block"), 1, "node entered the stalled-on-invalid-block state"),
     ("apply_block_failed", re.compile(r"apply_block failed"), 1, "a block failed to apply to the ledger"),
     ("panic", re.compile(r"panicked"), 1, "a thread panicked"),
     ("invariant_check_error", re.compile(r"invariant check: error"), 1, "post-catchup ledger invariant validation reported an error"),
@@ -302,6 +305,7 @@ GROUP_STORED_RE = re.compile(r"stored ([0-9a-f]{16,})")
 # A line must contain one of these to be worth running the regexes on.
 _PREFILTER = (
     "permanent error",
+    "stalled on invalid block",
     "apply_block failed",
     "panicked",
     "invariant check",

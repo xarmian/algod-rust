@@ -421,9 +421,12 @@ impl AgreementLedgerBridge {
 
         if in_txn {
             let t = std::time::Instant::now();
-            ledger
-                .commit_block()
-                .map_err(|e| CommitFailure::new(CommitStage::Store, e))?;
+            if let Err(e) = ledger.commit_block() {
+                crate::follow_timing::follow_timing()
+                    .commit_failed
+                    .observe(t.elapsed());
+                return Err(CommitFailure::new(CommitStage::Store, e));
+            }
             crate::follow_timing::follow_timing()
                 .commit
                 .observe(t.elapsed());
@@ -820,6 +823,9 @@ impl LedgerWriter for AgreementLedgerBridge {
                 Ok(l) => l,
                 Err(e) => {
                     warn!("ledger lock poisoned in ensure_block: {e}");
+                    crate::follow_timing::follow_timing()
+                        .ensure_block_failed
+                        .observe(ensure_started.elapsed());
                     return;
                 }
             };
@@ -857,6 +863,10 @@ impl LedgerWriter for AgreementLedgerBridge {
                      skipping (needs catchup)",
                     block.round.0, next_round
                 );
+                drop(ledger);
+                crate::follow_timing::follow_timing()
+                    .ensure_block_failed
+                    .observe(ensure_started.elapsed());
                 return;
             }
 
@@ -1676,6 +1686,24 @@ mod tests {
         let already = t.ensure_block_already_committed.get();
         bridge.ensure_block(&ok, &make_cert_with_proposal(1));
         assert!(t.ensure_block_already_committed.get() > already);
+    }
+
+    /// Issue #1761: an `ensure_block` that returns early without committing
+    /// (block ahead of the ledger, needing catchup) is observed in the
+    /// `ensure_block_failed` series instead of vanishing.
+    #[test]
+    fn ensure_block_ahead_of_ledger_early_return_is_observed() {
+        let t = crate::follow_timing::follow_timing();
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+        let failed = t.ensure_block_failed.count();
+        let mut ahead = make_round1_block();
+        ahead.round = Round(5);
+        bridge.ensure_block(&ahead, &make_cert_with_proposal(5));
+        assert!(
+            t.ensure_block_failed.count() > failed,
+            "ahead-of-ledger early return observed"
+        );
     }
 
     // -- Certificate storage tests --

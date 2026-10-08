@@ -12,7 +12,7 @@ See the LICENSE-MIT file in the repository root for the full license text.
   `{peer_url}`, and it **halted during `{phase}`** — no observable progress
   for {stalled_minutes} minutes — while the catchup peer's own `/v2/status`
   proved the network was alive and ahead the whole time.
-- Round: **{round}**{catchpoint_line}
+- Round: **{round}**{catchpoint_line}{invalid_block_stall_line}
 - Node `/v2/status` just before the halt: `last-round={node_last_round}`,
   `time-since-last-round={node_time_since_last_round}`
 - Peer `/v2/status` just before the halt: `last-round={peer_last_round}`

@@ -3729,8 +3729,12 @@ pub async fn get_participation_status<N: NodeInterface>(
 /// every off-the-shelf Prometheus scraper. The payload is counters only — no
 /// account, key, or transaction data.
 ///
-/// Returns 404 when the node is not participating in consensus, which is how
-/// a scraper distinguishes an un-instrumented process from a zeroed one.
+/// Returns 404 only when the node's `metrics_exposition` is `None`. The
+/// production adapter always has process-global series to report (the
+/// follow-path timing histograms and the process start time gauge, issues
+/// #1678 and #1761), so there it answers 200 even for a node that is not
+/// participating; the 404 remains for `NodeInterface` implementations with
+/// nothing to report (the trait default, test doubles).
 ///
 /// Also records this endpoint's own hit count via `algo-metrics`'s
 /// [`Registry`](algo_metrics::Registry)-backed [`Counter`] (issue #1500) —

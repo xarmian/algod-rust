@@ -51,7 +51,15 @@ def build_fields(verdict: dict, run_url: str, artifacts_url: str, log_excerpt: s
     phase = verdict.get("phase") or "unknown"
     stalled_s = verdict.get("stalled_since_s")
     catchpoint_label = verdict.get("catchpoint_label")
+    stall = verdict.get("invalid_block_stall")
     return {
+        "invalid_block_stall_line": (
+            "\n- Node `/v2/status` `stalled-on-invalid-block` payload: "
+            f"`{json.dumps(stall, sort_keys=True)}` (round {stall.get('round')}, "
+            f"error: {stall.get('error')}, consecutive failures: {stall.get('consecutive_failures')})"
+            if stall
+            else ""
+        ),
         "round": round_ if round_ is not None else "unknown",
         "phase": phase,
         "stalled_minutes": f"{(stalled_s or 0) / 60.0:.1f}",

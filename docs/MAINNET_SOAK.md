@@ -151,6 +151,31 @@ window, and `summary.json` gains `follow` (`requested_s`, `observed_s`,
 covers every sample from the first tip sighting, i.e. the follow window.
 `lag_rounds` carries `mean`/`p50`/`p95`/`p99`/`max`.
 
+**Lag versus the terminal stall window (issue #1759).** When the verdict is a
+halt (`stuck`, `source_outage` or `invalid_block_stall`) the trailing frozen-node
+window would otherwise dominate the lag numbers (run 37207786702: healthy
+part mean 0.26 / p95 1 / max 3, but 31 frozen samples lifted the headline to
+mean 4.37 / p95 34 / max 114). `summary.json` therefore carries both:
+`lag_rounds` (every sample since the first tip sighting, unchanged for
+compatibility) and `lag_rounds_before_stall` (same stats over the samples up
+to and including the one where the signature froze), plus `stall_window`
+(`start_ts`, `seconds`; `null` when there is no halt, in which case the two
+lag blocks are equal). The step summary prints both lag rows and the window.
+
+**Invalid-block stall (issue #1715).** Each poll reads the additive
+`stalled-on-invalid-block` object of `GET /v2/status` (`round`, `error`,
+`consecutive-failures`, `since-unix-secs`); when `/v2/status` does not answer
+the monitor falls back to the gauge `algod_rust_sync_stalled_on_invalid_block`
+on `/metrics` (`algod_rust_sync_stalled_block_round` gives the round). If either
+says the node is stalled, the verdict is `invalid_block_stall` (exit 1, the
+run ends at once, the issue is filed): the message carries round, error and
+consecutive failures, and `summary.json` keeps the status payload under
+`invalid_block_stall` (also in the step summary and the auto-filed issue
+body). The log scan has a matching hard signature, `stalled_on_invalid_block`
+(the node's `stalled on invalid block` ERROR line). A healthy node is
+unaffected: the field is absent from its status and the gauge is only read
+while the status is unavailable.
+
 **Per-block follow-path timing (issue #1678).** The node's `/metrics` always
 exposes fixed-bucket histograms `algod_rust_follow_block_{apply,avm,commit,
 wal_checkpoint,ensure_block}_seconds` (buckets 1 ms ... 30 s plus `+Inf`):
@@ -159,18 +184,32 @@ ran programs, so its count is smaller), the SQLite commit, each WAL checkpoint
 run on the committing thread (the ledger connection's auto-checkpoint, timed),
 and the successful `ensure_block` attempt (ledger-lock wait plus commit,
 excluding earlier failed attempts and retry sleeps). Failures are visible
-separately: `..._apply_failed_seconds`, `..._ensure_block_failed_seconds`,
+separately: `..._apply_failed_seconds`, `..._commit_failed_seconds` (a failed
+SQLite commit), `..._ensure_block_failed_seconds` (also observes the early
+returns that commit nothing: poisoned ledger lock, block ahead of the ledger),
 `..._ensure_block_retries_total` and `..._ensure_block_already_committed_total`.
 Once the node is out of catchup, `status.jsonl` samples carry the parsed
 cumulative histograms (`follow_timing`), scraped at most every 30 s with a 1 s
 timeout so the poll cadence is unaffected (a persistent scrape failure is
-logged once to stderr). `summary.json` gains `follow_block_timing`: per
+logged once to stderr; the first sample at the tip is always scraped, so the
+delta window starts exactly at the tip transition rather than up to 30 s
+later). `summary.json` gains `follow_block_timing` (all eight series above,
+failed-path ones included; the step-summary rows print `baseline` and
+`restarted` too): per
 metric `count`, `mean_s`, `p50_s`, `p95_s`, `max_s`, plus `baseline` and
 `restarted`. `baseline` is `"delta"` (last scrape minus the first scrape at
 the tip, i.e. the follow window) or `"absolute"` (no earlier scrape to subtract,
 or the node restarted between the scrapes: a counter or bucket went backwards,
 buckets are non-monotonic; then `restarted` is `true` and the post-restart
-absolute values are reported). Percentiles and `max_s` are **bucket upper
+absolute values are reported). A restart that processed more blocks than the
+baseline leaves every counter larger, so it is also detected by the node's
+`algod_rust_process_start_time_seconds` gauge (Unix seconds at process start,
+scraped with the histograms): a different value between the baseline and the
+last scrape marks the series `restarted` (older nodes without the gauge fall
+back to the counter checks). `/metrics` itself cannot 404 on the production
+adapter (the follow series and the start-time gauge are always exposed); the
+404 contract only remains for `NodeInterface` implementations with nothing to
+report. Percentiles and `max_s` are **bucket upper
 bounds** (the `+Inf` bucket reports 30, i.e. "at least 30 s"). Use these next
 to `lag_rounds` to tell a slow apply from a slow commit or checkpoint when lag
 spikes.
@@ -179,6 +218,7 @@ After teardown the job scans `node.log` (`monitor.py scan-log`, merged into
 `summary.json` as `log_scan`, rendered in the step summary):
 
 - **hard** (fail the job): `permanent error writing block`,
+  `stalled on invalid block` (issue #1715),
   `apply_block failed`, `panicked`, `invariant check: error`,
   `Resource temporarily unavailable`, three or more
   `ensure_block ... did not advance`, and `below minimum balance` /

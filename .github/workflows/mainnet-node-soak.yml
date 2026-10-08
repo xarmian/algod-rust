@@ -669,30 +669,12 @@ jobs:
           else:
               with open(path) as f:
                   r = json.load(f)
-              lag = r.get("lag_rounds") or {}
-              phase_s = r.get("phase_seconds") or {}
+              # Rendered by monitor.py (unit-tested): verdict, metrics table
+              # incl. lag before the stall window, follow timing rows with
+              # their baseline/restarted flags, node.log scan.
               sys.path.insert(0, "ops/mainnet-soak")
-              import nodelog
-              lines = [
-                  "# Mainnet node soak",
-                  "",
-                  f"**Verdict:** `{r.get('status')}` — {r.get('message') or ''}",
-                  "",
-                  "| metric | value |",
-                  "| --- | --- |",
-                  f"| Catchpoint label | `{r.get('catchpoint_label') or 'n/a'}` |",
-                  f"| Fast-catchup time | {r.get('fast_catchup_seconds')} s |",
-                  f"| Reached tip | {r.get('reached_tip')} |",
-                  f"| Phase durations (s) | {phase_s} |",
-                  f"| Lag at tip (rounds): mean/p50/p95/p99/max (n) | {lag.get('mean')}/{lag.get('p50')}/{lag.get('p95')}/{lag.get('p99')}/{lag.get('max')} (n={lag.get('n')}) |",
-                  f"| Node last-round | {r.get('node_last_round')} |",
-                  f"| Peer last-round | {r.get('peer_last_round')} |",
-              ]
-              for key, h in (r.get("follow_block_timing") or {}).items():
-                  lines.append(
-                      f"| Follow block {key} (s): p50/p95/max (n) | {h.get('p50_s')}/{h.get('p95_s')}/{h.get('max_s')} (n={h.get('count')}) |"
-                  )
-              lines += nodelog.render_markdown(r).splitlines()
+              import monitor
+              lines = monitor.render_step_summary_lines(r)
           text = "\n".join(lines) + "\n"
           print(text)
           if summary_path:
