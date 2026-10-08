@@ -128,6 +128,19 @@ pub enum PoolError {
     Remember(Box<PoolError>),
 }
 
+impl From<algo_types::genesis_restore::InBlockOnlyFieldError> for PoolError {
+    /// The decode-time rejection becomes the pool's own variant (not wrapped
+    /// in [`PoolError::Remember`]: it is raised before ingest, like go's
+    /// decoder error before `Remember`), so `?` replaces the field-by-field
+    /// mapping at each entry point.
+    fn from(e: algo_types::genesis_restore::InBlockOnlyFieldError) -> Self {
+        PoolError::InBlockOnlyField {
+            index: e.index,
+            field: e.field,
+        }
+    }
+}
+
 impl PoolError {
     /// Extract structured AVM eval diagnostics (pc/group-index/app-index/
     /// eval-states), if this error (or one it wraps via `Remember`)

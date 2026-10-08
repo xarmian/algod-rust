@@ -1571,6 +1571,23 @@ pub async fn get_block_hash<N: NodeInterface>(
     }
 }
 
+/// The 400 for a client-submitted transaction carrying an in-block-only
+/// `hgi`/`hgh` field (go's `SignedTxn` decoder: "Unknown field"; issues
+/// #1727, #1745). `group` is the position of the offending group within a
+/// multi-group request (simulate); `None` for a single txgroup body.
+fn in_block_flag_bad_request(
+    e: algo_types::genesis_restore::InBlockOnlyFieldError,
+    group: Option<usize>,
+) -> Response {
+    match group {
+        None => error::bad_request(format!("could not decode transaction: {e}")),
+        Some(g) => error::bad_request(format!(
+            "could not decode transaction {} in group {g}: Unknown field: {}",
+            e.index, e.field
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared genesis field restoration helper
 // ---------------------------------------------------------------------------
@@ -2651,7 +2668,7 @@ pub async fn raw_transaction<N: NodeInterface>(
     // fields and `decodeTxGroup` returns that straight to `badRequest`
     // (handlers.go:1172-1183, :1259-1262; issue #1727).
     if let Err(e) = algo_types::genesis_restore::reject_in_block_flags(&txgroup) {
-        return error::bad_request(format!("could not decode transaction: {e}"));
+        return in_block_flag_bad_request(e, None);
     }
 
     if let Err(e) =
@@ -3298,10 +3315,7 @@ pub async fn simulate_transaction<N: NodeInterface>(
         // handlers.go:1562-1567), whose decoder rejects the in-block-only
         // hgi/hgh as unknown fields (issue #1727).
         if let Err(e) = algo_types::genesis_restore::reject_in_block_flags(&decoded_txns) {
-            return error::bad_request(format!(
-                "could not decode transaction {} in group {i}: Unknown field: {}",
-                e.index, e.field
-            ));
+            return in_block_flag_bad_request(e, Some(i));
         }
         decoded_groups.push(decoded_txns);
     }
@@ -4826,7 +4840,7 @@ pub async fn raw_transaction_async<N: NodeInterface>(
     // fields and `decodeTxGroup` returns that straight to `badRequest`
     // (handlers.go:1172-1183, :1259-1262; issue #1727).
     if let Err(e) = algo_types::genesis_restore::reject_in_block_flags(&txgroup) {
-        return error::bad_request(format!("could not decode transaction: {e}"));
+        return in_block_flag_bad_request(e, None);
     }
 
     if let Err(e) =
@@ -4958,7 +4972,7 @@ mod handlers_pure_fn_tests {
 #[cfg(test)]
 mod txn_merkle_array_tests {
     use super::*;
-    use algo_consensus_crypto::merklearray::{Array, Hashable};
+    use algo_consensus_crypto::merklearray::Array;
     use algo_types::genesis_restore::GenesisRestoreRule;
 
     /// Issue #1728: with a hash-optional protocol (custom `consensus.json`

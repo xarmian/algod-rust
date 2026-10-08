@@ -69,6 +69,12 @@ pub struct BlockValidationResult {
     /// Number of transactions in the block's payset.
     pub txn_count: usize,
     /// Total encoded size of all transactions (canonical SignedTxnInBlock bytes).
+    ///
+    /// `0` when validation returned before accounting any payset bytes: a
+    /// payset whose entries violate go's `DecodeSignedTxn` genesis-field
+    /// rules fails at decode (`PaysetGenesisFields`), so there is no decoded
+    /// payset to size. `round` and `txn_count` are always filled and errors
+    /// collected before the early return (protocol, timestamp) are kept.
     pub total_txn_bytes: usize,
 }
 
@@ -1309,6 +1315,33 @@ mod tests {
         assert!(!r.is_valid);
         assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
         assert!(has_genesis_field_error(&r));
+        assert_eq!(r.total_txn_bytes, 0);
+    }
+
+    /// Issue #1745: the early return on a payset that cannot decode keeps the
+    /// result shape consistent -- every earlier-collected error is still
+    /// reported, `round`/`txn_count` describe the block, and
+    /// `total_txn_bytes` is 0 because no payset bytes were ever accounted
+    /// (documented on [`BlockValidationResult::total_txn_bytes`]).
+    #[test]
+    fn strict_genesis_early_return_keeps_earlier_errors_and_result_shape() {
+        let mut b = genesis_strict_block(algo_types::consensus::CONSENSUS_V41);
+        b.current_protocol = "no-such-protocol".into();
+        b.timestamp = 1_000_000;
+        b.payset[0].txn.genesis_hash = test_genesis_hash();
+        let r = validate_block(&b, Some(100), "test-v1", &test_genesis_hash(), None);
+        assert!(!r.is_valid);
+        assert!(r
+            .errors
+            .iter()
+            .any(|e| matches!(e, BlockValidationError::UnknownProtocolVersion { .. })));
+        assert!(r
+            .errors
+            .iter()
+            .any(|e| matches!(e, BlockValidationError::TimestampTooNew { .. })));
+        assert!(has_genesis_field_error(&r));
+        assert_eq!(r.round, b.round.0);
+        assert_eq!(r.txn_count, b.payset.len());
         assert_eq!(r.total_txn_bytes, 0);
     }
 

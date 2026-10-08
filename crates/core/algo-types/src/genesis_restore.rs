@@ -58,7 +58,13 @@
 //! produced blocks between #1665 and #1703, when the proposer stored
 //! `gen`/`gh` in the payset: such a ledger is rejected at apply with an
 //! error naming that cause, and must be resynced from genesis or a
-//! catchpoint (see `docs/DEV_WORKFLOW.md`).
+//! catchpoint (see `docs/DEV_WORKFLOW.md`). Decision (issue #1745): no
+//! one-time repair and no tolerance flag. The window was a pre-release
+//! localnet-only bug (no mainnet/testnet node ever stored such blocks, and a
+//! go peer refuses to decode them), a local network resyncs in seconds, and a
+//! tolerance switch would reintroduce exactly the apply/validate divergence
+//! the strict check removes -- rewriting stored blocks would also change
+//! block bytes that the stored certificates sign.
 //! [`GenesisRestoreRule::restore`] itself is tolerant and only fills fields
 //! that are empty/zero, which makes it idempotent. The inverse, go's
 //! `EncodeSignedTxn`, is [`GenesisRestoreRule::strip`].
@@ -145,31 +151,29 @@ impl std::error::Error for InBlockOnlyFieldError {}
 /// genuine.
 #[inline]
 pub fn reject_in_block_flags(txgroup: &[SignedTransaction]) -> Result<(), InBlockOnlyFieldError> {
-    for (index, stx) in txgroup.iter().enumerate() {
-        // go's canonical (sorted) key order reaches `hgh` before `hgi`.
-        let field = if stx.has_genesis_hash {
-            "hgh"
-        } else if stx.has_genesis_id {
-            "hgi"
-        } else {
-            continue;
-        };
-        return Err(InBlockOnlyFieldError { index, field });
-    }
-    Ok(())
+    txgroup
+        .iter()
+        .enumerate()
+        .try_for_each(|(index, stx)| reject_in_block_flags_one(stx, index))
 }
 
-/// Normalise a group for txid/signature work: drop the in-block-only
-/// flags so the restored form equals what the stripped STIB form restores
-/// to (strip then restore sets `hgi`/`hgh` from scratch). Admission policy
-/// is [`reject_in_block_flags`]; this only keeps the two txid computations
-/// of a block proposer in agreement. Never call it on a block payset.
+/// [`reject_in_block_flags`] for one transaction at position `index` of its
+/// group: lets a streaming decoder fail on the first offending element, as
+/// go's per-element msgp decode does, instead of after the whole group.
 #[inline]
-pub fn clear_in_block_flags(txgroup: &mut [SignedTransaction]) {
-    for stx in txgroup {
-        stx.has_genesis_id = false;
-        stx.has_genesis_hash = false;
-    }
+pub fn reject_in_block_flags_one(
+    stx: &SignedTransaction,
+    index: usize,
+) -> Result<(), InBlockOnlyFieldError> {
+    // go's canonical (sorted) key order reaches `hgh` before `hgi`.
+    let field = if stx.has_genesis_hash {
+        "hgh"
+    } else if stx.has_genesis_id {
+        "hgi"
+    } else {
+        return Ok(());
+    };
+    Err(InBlockOnlyFieldError { index, field })
 }
 
 /// Why a payset entry is malformed for go's `BlockHeader.DecodeSignedTxn`
@@ -628,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn strip_payset_and_clear_in_block_flags_cover_every_entry() {
+    fn strip_payset_and_reject_in_block_flags_cover_every_entry() {
         let gh = GH;
         let rule = GenesisRestoreRule::new(GID, &gh, true);
         let mut payset = vec![
@@ -639,7 +643,7 @@ mod tests {
         for stx in &payset {
             assert_eq!(*stx, stripped("", [0; 32], true, false));
         }
-        let mut group = vec![
+        let group = vec![
             stripped(GID, GH, true, true),
             stripped("", [0; 32], true, false),
         ];
@@ -650,10 +654,13 @@ mod tests {
                 field: "hgh" // both set: go's sorted keys hit hgh first
             })
         );
-        clear_in_block_flags(&mut group);
-        assert_eq!(group[0], stripped(GID, GH, false, false));
-        assert_eq!(group[1], stripped("", [0; 32], false, false));
-        assert_eq!(reject_in_block_flags(&group), Ok(()));
+        assert_eq!(
+            reject_in_block_flags_one(&group[1], 5),
+            Err(InBlockOnlyFieldError {
+                index: 5,
+                field: "hgi"
+            })
+        );
     }
 
     #[test]

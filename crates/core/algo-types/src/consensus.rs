@@ -1783,13 +1783,19 @@ pub struct BonusOverride {
     pub decay_interval: u64,
 }
 
-/// `serde(default = "default_true")` helper for
-/// [`ConsensusParamsOverride`]'s `enable_fee_pooling`/
-/// `enable_logicsig_size_pooling` fields -- see their doc comments and
-/// [`ConsensusParamsOverride`]'s own doc comment for why a non-zero default
-/// is required for these two fields specifically.
-fn default_true() -> bool {
-    true
+/// A `bool` whose default (absent JSON key, `Default::default()`) is `true`:
+/// the type of [`ConsensusParamsOverride`]'s `enable_fee_pooling`,
+/// `enable_logicsig_size_pooling` and `support_signed_txn_in_block` -- see
+/// that struct's doc comment for why a non-zero default is required for these
+/// fields specifically. Serializes as a plain JSON bool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct DefaultTrue(pub bool);
+
+impl Default for DefaultTrue {
+    fn default() -> Self {
+        Self(true)
+    }
 }
 
 /// JSON-deserializable mirror of go-algorand's `config.ConsensusParams`
@@ -1826,8 +1832,11 @@ fn default_true() -> bool {
 /// them to Rust's zero value (`false`) would silently disable both features
 /// for every version this repo targets whenever such a file overrides that
 /// version — found live during issue #814's mixed-cluster verification.
-/// Both carry an explicit `#[serde(default = "default_true")]` instead.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Those (and `support_signed_txn_in_block`) are typed [`DefaultTrue`], so the
+/// derived `Default` -- and therefore a struct-update `..Default::default()`
+/// -- and the container-level `serde(default)` for an absent key agree: one
+/// source of truth instead of a hand-maintained field list (issue #1745).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ConsensusParamsOverride {
     pub logic_sig_version: u64,
@@ -1853,8 +1862,7 @@ pub struct ConsensusParamsOverride {
     /// full-struct override doesn't silently disable fee pooling on every
     /// version this repo targets (all >= v28) -- see issue #814's
     /// live-verification session.
-    #[serde(default = "default_true")]
-    pub enable_fee_pooling: bool,
+    pub enable_fee_pooling: DefaultTrue,
     pub support_tx_groups: bool,
     pub support_transaction_leases: bool,
     pub fix_transaction_leases: bool,
@@ -1873,8 +1881,8 @@ pub struct ConsensusParamsOverride {
     /// `EnableLogicSigSizePooling` from its live struct once it became
     /// permanently on (v40+), so it is never present in a real
     /// go-algorand-authored `consensus.json`. Default to `true`.
-    #[serde(rename = "EnableLogicSigSizePooling", default = "default_true")]
-    pub enable_logicsig_size_pooling: bool,
+    #[serde(rename = "EnableLogicSigSizePooling")]
+    pub enable_logicsig_size_pooling: DefaultTrue,
     #[serde(rename = "EnableLogicSigCostPooling")]
     pub enable_logicsig_cost_pooling: bool,
     pub enable_app_cost_pooling: bool,
@@ -1921,8 +1929,7 @@ pub struct ConsensusParamsOverride {
     /// paysets), so an override entry that omits the key keeps modern
     /// stripped-payset semantics rather than reverting to pre-v11 "copy the
     /// txn untouched" behaviour.
-    #[serde(default = "default_true")]
-    pub support_signed_txn_in_block: bool,
+    pub support_signed_txn_in_block: DefaultTrue,
     #[serde(rename = "EnableSHA256TxnCommitmentHeader")]
     pub enable_sha256_txn_commitment_header: bool,
     pub enable_sha512_block_hash: bool,
@@ -2023,166 +2030,6 @@ pub struct ConsensusParamsOverride {
     pub enable_catchpoints_with_online_accounts: bool,
 }
 
-/// Hand-written so a struct-update `..Default::default()` agrees with
-/// deserializing an empty entry: the three `serde(default = "default_true")`
-/// fields (`enable_fee_pooling`, `enable_logicsig_size_pooling`,
-/// `support_signed_txn_in_block`) are `true` here as well -- a derived
-/// `Default` would zero them, since the serde attribute only applies when a
-/// JSON key is absent (issue #1727 review).
-impl Default for ConsensusParamsOverride {
-    fn default() -> Self {
-        Self {
-            logic_sig_version: Default::default(),
-            logic_sig_max_size: Default::default(),
-            max_absolute_logic_sig_program_size: Default::default(),
-            logic_sig_max_cost: Default::default(),
-            max_app_program_cost: Default::default(),
-            min_balance: Default::default(),
-            min_txn_fee: Default::default(),
-            max_txn_life: Default::default(),
-            max_txn_note_bytes: Default::default(),
-            max_tx_group_size: Default::default(),
-            max_txn_bytes_per_block: Default::default(),
-            max_absolute_txn_note_bytes: Default::default(),
-            max_absolute_extra_program_pages: Default::default(),
-            max_absolute_total_arg_len: Default::default(),
-            per_byte_txn_surcharge: Default::default(),
-            enable_fee_pooling: true,
-            support_tx_groups: Default::default(),
-            support_transaction_leases: Default::default(),
-            fix_transaction_leases: Default::default(),
-            support_rekeying: Default::default(),
-            enable_heartbeat: Default::default(),
-            enforce_auth_addr_sender_diff: Default::default(),
-            load_tracking: Default::default(),
-            app_size_updates: Default::default(),
-            allow_zero_local_app_ref: Default::default(),
-            enable_pq_scheme_falcon1024: Default::default(),
-            enable_select_f128: Default::default(),
-            enable_logicsig_size_pooling: true,
-            enable_logicsig_cost_pooling: Default::default(),
-            enable_app_cost_pooling: Default::default(),
-            enable_inner_transaction_pooling: Default::default(),
-            application: Default::default(),
-            asset: Default::default(),
-            max_inner_transactions: Default::default(),
-            min_inner_appl_version: Default::default(),
-            max_app_key_len: Default::default(),
-            max_app_bytes_value_len: Default::default(),
-            max_app_sum_key_value_lens: Default::default(),
-            max_extra_app_program_pages: Default::default(),
-            max_app_program_len: Default::default(),
-            max_app_total_program_len: Default::default(),
-            max_global_schema_entries: Default::default(),
-            max_local_schema_entries: Default::default(),
-            max_app_args: Default::default(),
-            max_app_total_arg_len: Default::default(),
-            max_app_txn_accounts: Default::default(),
-            max_app_txn_foreign_apps: Default::default(),
-            max_app_txn_foreign_assets: Default::default(),
-            max_app_total_txn_references: Default::default(),
-            max_app_access: Default::default(),
-            max_box_size: Default::default(),
-            bytes_per_box_reference: Default::default(),
-            max_app_box_references: Default::default(),
-            enable_box_ref_name_error: Default::default(),
-            app_flat_params_min_balance: Default::default(),
-            app_flat_opt_in_min_balance: Default::default(),
-            schema_min_balance_per_entry: Default::default(),
-            schema_uint_min_balance: Default::default(),
-            schema_bytes_min_balance: Default::default(),
-            box_flat_min_balance: Default::default(),
-            box_byte_min_balance: Default::default(),
-            maximum_minimum_balance: Default::default(),
-            max_assets_per_account: Default::default(),
-            enable_asset_close_amount: Default::default(),
-            deeper_block_header_history: Default::default(),
-            reward_unit: Default::default(),
-            rewards_rate_refresh_interval: Default::default(),
-            max_timestamp_increment: Default::default(),
-            payset_commit: Default::default(),
-            support_signed_txn_in_block: true,
-            enable_sha256_txn_commitment_header: Default::default(),
-            enable_sha512_block_hash: Default::default(),
-            require_genesis_hash: Default::default(),
-            support_genesis_hash: Default::default(),
-            max_apps_created: Default::default(),
-            max_apps_opted_in: Default::default(),
-            enable_proper_extra_page_accounting: Default::default(),
-            max_keyreg_valid_period: Default::default(),
-            enable_keyreg_coherency_check: Default::default(),
-            enable_state_proof_keyreg_check: Default::default(),
-            state_proof_interval: Default::default(),
-            state_proof_voters_lookback: Default::default(),
-            state_proof_block_hash_in_light_header: Default::default(),
-            state_proof_weight_threshold: Default::default(),
-            state_proof_strength_target: Default::default(),
-            isolate_clear_state: Default::default(),
-            max_asset_url_bytes: Default::default(),
-            max_asset_name_bytes: Default::default(),
-            max_asset_unit_name_bytes: Default::default(),
-            max_asset_decimals: Default::default(),
-            max_proposed_expired_online_accounts: Default::default(),
-            payouts: Default::default(),
-            bonus: Default::default(),
-            support_become_non_participating_transactions: Default::default(),
-            enable_app_versioning: Default::default(),
-            num_proposers: Default::default(),
-            soft_committee_size: Default::default(),
-            soft_committee_threshold: Default::default(),
-            cert_committee_size: Default::default(),
-            cert_committee_threshold: Default::default(),
-            next_committee_size: Default::default(),
-            next_committee_threshold: Default::default(),
-            late_committee_size: Default::default(),
-            late_committee_threshold: Default::default(),
-            redo_committee_size: Default::default(),
-            redo_committee_threshold: Default::default(),
-            down_committee_size: Default::default(),
-            down_committee_threshold: Default::default(),
-            agreement_filter_timeout: Default::default(),
-            agreement_filter_timeout_period0: Default::default(),
-            agreement_deadline_timeout_period0: Default::default(),
-            fast_recovery_lambda: Default::default(),
-            seed_lookback: Default::default(),
-            seed_refresh_interval: Default::default(),
-            max_bal_lookback: Default::default(),
-            default_key_dilution: Default::default(),
-            credential_domain_separation_enabled: Default::default(),
-            dynamic_filter_timeout: Default::default(),
-            exclude_expired_circulation: Default::default(),
-            state_proof_exclude_total_weight_with_rewards: Default::default(),
-            approved_upgrades: Default::default(),
-            upgrade_vote_rounds: Default::default(),
-            upgrade_threshold: Default::default(),
-            max_version_string_len: Default::default(),
-            default_upgrade_wait_rounds: Default::default(),
-            min_upgrade_wait_rounds: Default::default(),
-            max_upgrade_wait_rounds: Default::default(),
-            pending_residue_rewards: Default::default(),
-            initial_rewards_rate_calculation: Default::default(),
-            no_empty_local_deltas: Default::default(),
-            rewards_calculation_fix: Default::default(),
-            rewards_in_apply_data: Default::default(),
-            force_non_participating_fee_sink: Default::default(),
-            unify_inner_tx_ids: Default::default(),
-            unfunded_senders: Default::default(),
-            enable_precheck_ecdsa_curve: Default::default(),
-            app_forbid_low_resources: Default::default(),
-            state_proof_top_voters: Default::default(),
-            logic_sig_msig: Default::default(),
-            logic_sig_lmsig: Default::default(),
-            enable_bare_budget_error: Default::default(),
-            state_proof_max_recovery_intervals: Default::default(),
-            state_proof_use_tracker_verification: Default::default(),
-            catchpoint_lookback: Default::default(),
-            enable_ledger_data_update_round: Default::default(),
-            enable_catchpoints_with_sp_contexts: Default::default(),
-            enable_catchpoints_with_online_accounts: Default::default(),
-        }
-    }
-}
-
 impl ConsensusParamsOverride {
     /// Convert a fully-specified override entry into the internal
     /// `ConsensusParams` representation used everywhere else in the
@@ -2223,7 +2070,7 @@ impl ConsensusParamsOverride {
             max_absolute_extra_program_pages: self.max_absolute_extra_program_pages,
             max_absolute_total_arg_len: self.max_absolute_total_arg_len,
             per_byte_txn_surcharge: self.per_byte_txn_surcharge,
-            enable_fee_pooling: self.enable_fee_pooling,
+            enable_fee_pooling: self.enable_fee_pooling.0,
             support_tx_groups: self.support_tx_groups,
             support_transaction_leases: self.support_transaction_leases,
             fix_transaction_leases: self.fix_transaction_leases,
@@ -2235,7 +2082,7 @@ impl ConsensusParamsOverride {
             allow_zero_local_app_ref: self.allow_zero_local_app_ref,
             enable_pq_scheme_falcon1024: self.enable_pq_scheme_falcon1024,
             enable_select_f128: self.enable_select_f128,
-            enable_logicsig_size_pooling: self.enable_logicsig_size_pooling,
+            enable_logicsig_size_pooling: self.enable_logicsig_size_pooling.0,
             enable_logicsig_cost_pooling: self.enable_logicsig_cost_pooling,
             enable_app_cost_pooling: self.enable_app_cost_pooling,
             enable_inner_transaction_pooling: self.enable_inner_transaction_pooling,
@@ -2281,7 +2128,7 @@ impl ConsensusParamsOverride {
             rewards_rate_refresh_interval: self.rewards_rate_refresh_interval,
             max_timestamp_increment: self.max_timestamp_increment,
             payset_commit: self.payset_commit,
-            support_signed_txn_in_block: self.support_signed_txn_in_block,
+            support_signed_txn_in_block: self.support_signed_txn_in_block.0,
             enable_sha256_txn_commitment_header: self.enable_sha256_txn_commitment_header,
             enable_sha512_block_hash: self.enable_sha512_block_hash,
             require_genesis_hash: self.require_genesis_hash,
@@ -3817,8 +3664,14 @@ mod tests {
     fn consensus_json_override_support_signed_txn_in_block_defaults_true() {
         let json = r#"{"vOmit": {"PaysetCommit": 2}, "vOff": {"SupportSignedTxnInBlock": false}}"#;
         let overrides: ConsensusOverrides = serde_json::from_str(json).unwrap();
-        assert!(overrides.get("vOmit").unwrap().support_signed_txn_in_block);
-        assert!(!overrides.get("vOff").unwrap().support_signed_txn_in_block);
+        assert!(
+            overrides
+                .get("vOmit")
+                .unwrap()
+                .support_signed_txn_in_block
+                .0
+        );
+        assert!(!overrides.get("vOff").unwrap().support_signed_txn_in_block.0);
         assert!(
             overrides
                 .get("vOmit")
@@ -3832,7 +3685,25 @@ mod tests {
         assert!(table(CONSENSUS_V41).unwrap().support_signed_txn_in_block);
     }
 
-    /// Round-4 review of #1727: `serde(default = "default_true")` only
+    /// Issue #1745: the derived `Default` and deserializing an empty entry
+    /// are the same value (the single source of truth is `DefaultTrue`).
+    #[test]
+    fn override_default_equals_empty_entry_deserialization() {
+        let empty: ConsensusParamsOverride = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            serde_json::to_value(ConsensusParamsOverride::default()).unwrap(),
+            serde_json::to_value(empty).unwrap()
+        );
+        let d = ConsensusParamsOverride::default();
+        assert!(d.enable_fee_pooling.0 && d.enable_logicsig_size_pooling.0);
+        assert!(d.support_signed_txn_in_block.0);
+        // A JSON `false` still wins over the true default.
+        let off: ConsensusParamsOverride =
+            serde_json::from_str(r#"{"EnableFeePooling": false}"#).unwrap();
+        assert!(!off.enable_fee_pooling.0);
+    }
+
+    /// Round-4 review of #1727: `serde(default)` only
     /// applies on deserialize; a struct-update `..Default::default()` must
     /// give the same true-by-default fields, and survive save/load.
     #[test]
@@ -3841,9 +3712,9 @@ mod tests {
             max_txn_life: 7,
             ..Default::default()
         };
-        assert!(entry.support_signed_txn_in_block);
-        assert!(entry.enable_fee_pooling);
-        assert!(entry.enable_logicsig_size_pooling);
+        assert!(entry.support_signed_txn_in_block.0);
+        assert!(entry.enable_fee_pooling.0);
+        assert!(entry.enable_logicsig_size_pooling.0);
 
         let dir = std::env::temp_dir().join(format!(
             "algod-rust-override-default-{}-{}",
@@ -3862,9 +3733,9 @@ mod tests {
         let loaded: ConsensusOverrides = serde_json::from_str(&contents).unwrap();
         let back = loaded.get("vTestDefault").unwrap();
         assert_eq!(back.max_txn_life, 7);
-        assert!(back.support_signed_txn_in_block);
-        assert!(back.enable_fee_pooling);
-        assert!(back.enable_logicsig_size_pooling);
+        assert!(back.support_signed_txn_in_block.0);
+        assert!(back.enable_fee_pooling.0);
+        assert!(back.enable_logicsig_size_pooling.0);
         assert!(back.to_consensus_params().support_signed_txn_in_block);
         let _ = std::fs::remove_dir_all(&dir);
     }
