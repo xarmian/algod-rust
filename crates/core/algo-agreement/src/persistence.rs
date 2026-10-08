@@ -2088,6 +2088,50 @@ mod tests {
         assert!(asm.filled);
     }
 
+    /// Issue #1743: a persisted-and-restored proposal block whose payset
+    /// carries a non-UTF-8 `dt` key must re-encode canonically to the SAME
+    /// bytes as the original (go writes `dt` keys as msgpack `str`; the serde
+    /// persistence form is `bin` and is re-typed on decode).
+    #[test]
+    fn restored_proposal_block_reencodes_canonically_with_non_utf8_dt_key() {
+        use algo_types::SignedTransaction;
+
+        // dt = {gd: {"ÿ": {at: 1}}} with the key as msgpack `str`.
+        let dt_bytes = [
+            0x81, 0xa2, b'g', b'd', 0x81, 0xa1, 0xff, 0x81, 0xa2, b'a', b't', 0x01,
+        ];
+        let dt = rmpv::decode::read_value(&mut &dt_bytes[..]).unwrap();
+        let (mut router, pv) = router_with_a_real_proposal(Round(1700));
+        let asm = router
+            .children
+            .get_mut(&Round(1700))
+            .unwrap()
+            .proposal_store
+            .assemblers
+            .get_mut(&pv)
+            .unwrap();
+        asm.pipeline.block.payset = vec![SignedTransaction {
+            eval_delta: Some(dt),
+            ..SignedTransaction::default()
+        }];
+        let original = algo_codec::canonical_encode_block(&asm.pipeline.block);
+
+        let player = Player {
+            round: Round(1700),
+            ..Player::default()
+        };
+        let raw = encode(&router, &player, &ClockState::default(), &[]).expect("encode");
+        let (dec_router, _, _, _) = decode(&raw).expect("decode");
+        let restored = &dec_router.children[&Round(1700)].proposal_store.assemblers[&pv]
+            .pipeline
+            .block;
+        assert_eq!(
+            algo_codec::canonical_encode_block(restored),
+            original,
+            "restored block must re-encode byte-identically"
+        );
+    }
+
     #[test]
     fn full_persist_restore_cycle_with_a_real_block_proposal() {
         let conn = mem_db();

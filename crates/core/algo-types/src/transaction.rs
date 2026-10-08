@@ -207,7 +207,19 @@ pub struct SignedTransaction {
     /// Eval delta -- application state changes (ApplyData.dt).
     /// Opaque passthrough; uses rmpv::Value since EvalDelta contains
     /// recursive inner transactions and complex state deltas.
-    #[serde(rename = "dt", default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// The serde representation of this field is NOT wire-authoritative:
+    /// non-UTF-8 `str` content is serialized as `bin` (JSON: byte array) and
+    /// re-typed to go's `str` on deserialize (see `serde_eval_delta`). Block /
+    /// STIB / `itx` bytes come only from
+    /// `algo_codec::canonical_encode_signed_txn_in_block` /
+    /// `canonical_encode_signed_txn_with_ad`.
+    #[serde(
+        rename = "dt",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "serde_eval_delta::deserialize"
+    )]
     pub eval_delta: Option<rmpv::Value>,
 
     /// Created/configured asset ID from ApplyData (ApplyData.caid).
@@ -780,6 +792,300 @@ fn is_none_or_empty_box_ref_name(v: &Option<ByteBuf>) -> bool {
     match v {
         None => true,
         Some(b) => b.is_empty(),
+    }
+}
+
+/// Deserialize-side typing for `ApplyData.dt` (issue #1743).
+///
+/// go writes `EvalDelta` keys, `bs` and `lg` entries as msgpack `str` even
+/// when the bytes are not valid UTF-8. The serde representation of
+/// [`SignedTransaction::eval_delta`] is **not wire-authoritative**: serde
+/// cannot emit a `str` holding invalid UTF-8 without `unsafe`, so
+/// `rmpv::Value`'s default `Serialize` writes such a `Utf8String` as `bin`
+/// (JSON: a byte array). The canonical encoders
+/// (`algo_codec::canonical_encode_signed_txn_in_block` /
+/// `canonical_encode_signed_txn_with_ad`) are the only source of block /
+/// STIB / `itx` bytes and write `str` correctly (#1738, #1742).
+///
+/// Why the deserialize side retypes: agreement crash persistence
+/// (`algo-agreement/src/persistence.rs`) round-trips proposal `Block`s (and
+/// their payset `SignedTransaction`s with `dt`) through named `rmp_serde`
+/// (RootRouter -> ProposalStore -> BlockAssembler -> UnauthenticatedProposal
+/// -> Block). A restored proposal is later re-encoded canonically, so a
+/// bin-typed non-UTF-8 `dt` key would change the block bytes / digest. This
+/// module therefore re-applies go's schema typing after deserialize: every
+/// position go types as `str` (`gd`/`ld` keys, `bs`, `lg` entries,
+/// recursively `itx[*].dt`) becomes a `str` again. That restores
+/// **msgpack** round trips only; a JSON round trip of non-UTF-8 keys is not
+/// restored (accepted: JSON of a block / `dt` is an API model, never block
+/// bytes). It also upgrades legacy bin-typed stored forms. Serialization is
+/// the unmodified `rmpv::Value` one: no `unsafe`, no change for valid
+/// UTF-8, JSON untouched.
+///
+/// Other serde users of `SignedTransaction` / `Block` (none feed wire
+/// bytes): `eval_delta::parse_inner_txn` and gossip `tx_tag_handler`
+/// (decode only; no `dt` on the wire), REST `format::encode_response`
+/// (API models).
+mod serde_eval_delta {
+    use rmpv::Value;
+    use serde::{Deserialize, Deserializer};
+
+    /// go bounds inner-transaction depth (`MaxInnerTransactionsDepth`) far
+    /// below this, so no valid `dt` reaches it; the cap is only a stack guard
+    /// for hostile nesting. Past it the subtree is left exactly as decoded
+    /// (never an error): this deserializer is shared by gossip / REST /
+    /// persistence and must not reject input that decoded before.
+    const MAX_DEPTH: u32 = 64;
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+        let mut v = Option::<Value>::deserialize(d)?;
+        if let Some(v) = v.as_mut() {
+            retype_eval_delta(v, 0).map_err(serde::de::Error::custom)?;
+        }
+        Ok(v)
+    }
+
+    /// Make `v` a go `str` (bytes of a `bin` kept verbatim, even non-UTF-8).
+    /// `rmpv::Utf8String` has no public constructor for invalid UTF-8, so the
+    /// value is built by decoding a `str` header + bytes; errors are
+    /// propagated, never panicked on.
+    fn to_str(v: &mut Value) -> Result<(), String> {
+        if let Value::Binary(b) = v {
+            let b = std::mem::take(b);
+            *v = match String::from_utf8(b) {
+                Ok(s) => Value::from(s),
+                Err(e) => {
+                    let b = e.into_bytes();
+                    let len = u32::try_from(b.len()).map_err(|_| "str too long".to_string())?;
+                    let mut buf = Vec::with_capacity(b.len() + 5);
+                    rmp::encode::write_str_len(&mut buf, len).map_err(|e| e.to_string())?;
+                    buf.extend_from_slice(&b);
+                    rmpv::decode::read_value(&mut &buf[..]).map_err(|e| e.to_string())?
+                }
+            };
+        }
+        Ok(())
+    }
+
+    fn retype_state_delta(v: &mut Value) -> Result<(), String> {
+        if let Value::Map(m) = v {
+            for (k, vd) in m.iter_mut() {
+                to_str(k)?;
+                if let Value::Map(f) = vd {
+                    for (fk, fv) in f.iter_mut() {
+                        if fk.as_str() == Some("bs") {
+                            to_str(fv)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply go's `EvalDelta` field typing (`gd`/`ld` keys and `bs`, `lg`
+    /// entries are `str`), recursing through `itx[*].dt` up to `MAX_DEPTH` (deeper subtrees are
+    /// left untouched, not rejected).
+    fn retype_eval_delta(v: &mut Value, depth: u32) -> Result<(), String> {
+        if depth > MAX_DEPTH {
+            return Ok(());
+        }
+        let Value::Map(top) = v else { return Ok(()) };
+        for (k, val) in top.iter_mut() {
+            match k.as_str() {
+                Some("gd") => retype_state_delta(val)?,
+                Some("ld") => {
+                    if let Value::Map(m) = val {
+                        for (_, sd) in m.iter_mut() {
+                            retype_state_delta(sd)?;
+                        }
+                    }
+                }
+                Some("lg") => {
+                    if let Value::Array(a) = val {
+                        for e in a.iter_mut() {
+                            to_str(e)?;
+                        }
+                    }
+                }
+                Some("itx") => {
+                    if let Value::Array(items) = val {
+                        for item in items {
+                            if let Value::Map(f) = item {
+                                for (fk, fv) in f.iter_mut() {
+                                    if fk.as_str() == Some("dt") {
+                                        retype_eval_delta(fv, depth + 1)?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::SignedTransaction;
+
+        /// Build a go-typed `str` Value holding arbitrary bytes.
+        fn raw_str(b: &[u8]) -> Value {
+            let mut v = Value::Binary(b.to_vec());
+            to_str(&mut v).unwrap();
+            v
+        }
+
+        fn s(k: &str) -> Value {
+            Value::from(k)
+        }
+
+        fn sample_dt() -> Value {
+            let vd = Value::Map(vec![
+                (s("at"), Value::from(1u64)),
+                (s("bs"), raw_str(&[0x80])),
+            ]);
+            let inner = Value::Map(vec![(
+                s("gd"),
+                Value::Map(vec![(raw_str(&[0xfd]), vd.clone())]),
+            )]);
+            Value::Map(vec![
+                (s("gd"), Value::Map(vec![(raw_str(&[0xff]), vd.clone())])),
+                (
+                    s("itx"),
+                    Value::Array(vec![Value::Map(vec![
+                        (s("aca"), Value::from(1u64)),
+                        (s("dt"), inner),
+                    ])]),
+                ),
+                (
+                    s("ld"),
+                    Value::Map(vec![(
+                        Value::from(1u64),
+                        Value::Map(vec![(raw_str(&[0xfe]), vd)]),
+                    )]),
+                ),
+                (s("lg"), Value::Array(vec![raw_str(&[0xfc])])),
+            ])
+        }
+
+        fn stx_with(dt: Value) -> SignedTransaction {
+            SignedTransaction {
+                eval_delta: Some(dt),
+                ..Default::default()
+            }
+        }
+
+        fn get<'a>(v: &'a Value, k: &str) -> &'a Value {
+            let Value::Map(m) = v else { panic!("map") };
+            &m.iter().find(|(kk, _)| kk.as_str() == Some(k)).unwrap().1
+        }
+
+        fn map_of(v: &Value) -> &Vec<(Value, Value)> {
+            let Value::Map(m) = v else { panic!("map") };
+            m
+        }
+
+        /// Assert every non-UTF-8 position of `dt` is a msgpack `str`
+        /// (`Value::String` with invalid UTF-8), never `Binary`.
+        fn assert_str_typed(dt: &Value) {
+            let is_raw_str = |v: &Value, b: u8| matches!(v, Value::String(s) if s.is_err() && s.as_bytes() == [b]);
+            let gd = map_of(get(dt, "gd"));
+            assert!(is_raw_str(&gd[0].0, 0xff), "gd key");
+            assert!(is_raw_str(get(&gd[0].1, "bs"), 0x80), "gd bs");
+            let ld = map_of(get(dt, "ld"));
+            let l1 = map_of(&ld[0].1);
+            assert!(is_raw_str(&l1[0].0, 0xfe), "ld key");
+            let Value::Array(lg) = get(dt, "lg") else {
+                panic!()
+            };
+            assert!(is_raw_str(&lg[0], 0xfc), "lg entry");
+            let Value::Array(itx) = get(dt, "itx") else {
+                panic!()
+            };
+            let igd = map_of(get(get(&itx[0], "dt"), "gd"));
+            assert!(is_raw_str(&igd[0].0, 0xfd), "itx dt gd key");
+        }
+
+        /// The serde form is lossless: str-typed non-UTF-8 content survives
+        /// `to_vec_named` -> `from_slice` (the serialized form itself is bin
+        /// and is documented as not wire-authoritative).
+        #[test]
+        fn rmp_serde_round_trip_restores_str_typing() {
+            let stx = stx_with(sample_dt());
+            let bytes = rmp_serde::to_vec_named(&stx).unwrap();
+            let back: SignedTransaction = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(back.eval_delta, stx.eval_delta);
+            assert_str_typed(back.eval_delta.as_ref().unwrap());
+        }
+
+        #[test]
+        fn legacy_bin_form_decodes_and_is_retyped() {
+            // Old serde wrote the schema's str positions (keys, bs, lg) as
+            // bin; structural keys stayed valid str.
+            fn downgrade(v: &mut Value, schema_str: bool) {
+                match v {
+                    Value::String(x) if schema_str => *v = Value::Binary(x.as_bytes().to_vec()),
+                    Value::Array(a) => a.iter_mut().for_each(|e| downgrade(e, schema_str)),
+                    Value::Map(m) => m.iter_mut().for_each(|(k, x)| {
+                        let structural = matches!(
+                            k.as_str(),
+                            Some("at" | "bs" | "gd" | "ld" | "lg" | "itx" | "dt" | "aca")
+                        );
+                        if !structural {
+                            downgrade(k, true);
+                        }
+                        let is_bs = k.as_str() == Some("bs");
+                        let is_lg = k.as_str() == Some("lg");
+                        downgrade(x, schema_str || is_bs || is_lg);
+                    }),
+                    _ => {}
+                }
+            }
+            let mut legacy = sample_dt();
+            downgrade(&mut legacy, false);
+            assert!(matches!(&map_of(get(&legacy, "gd"))[0].0, Value::Binary(_)));
+            let bytes = rmp_serde::to_vec_named(&stx_with(legacy)).unwrap();
+            let back: SignedTransaction = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(back.eval_delta, Some(sample_dt()));
+        }
+
+        /// JSON is exactly the default `rmpv::Value` serialization (no lossy
+        /// string collapse), and valid content round-trips unchanged.
+        #[test]
+        fn json_is_unchanged_default_value_serialization() {
+            let dt = sample_dt();
+            let json = serde_json::to_value(stx_with(dt.clone())).unwrap();
+            assert_eq!(json["dt"], serde_json::to_value(&dt).unwrap());
+            let ok = stx_with(Value::Map(vec![(s("lg"), Value::Array(vec![s("hi")]))]));
+            let back: SignedTransaction =
+                serde_json::from_str(&serde_json::to_string(&ok).unwrap()).unwrap();
+            assert_eq!(back.eval_delta, ok.eval_delta);
+        }
+
+        /// 100-deep `itx` nesting still decodes (no error from the stack
+        /// guard); the over-deep subtree is simply left as decoded.
+        #[test]
+        fn deep_nesting_decodes_without_error() {
+            let mut dt = Value::Map(vec![(
+                s("gd"),
+                Value::Map(vec![(raw_str(&[0xff]), Value::Map(vec![]))]),
+            )]);
+            for _ in 0..100 {
+                dt = Value::Map(vec![(
+                    s("itx"),
+                    Value::Array(vec![Value::Map(vec![(s("dt"), dt)])]),
+                )]);
+            }
+            let mut copy = dt.clone();
+            assert!(retype_eval_delta(&mut copy, 0).is_ok());
+            let bytes = rmp_serde::to_vec_named(&stx_with(dt)).unwrap();
+            let back: SignedTransaction = rmp_serde::from_slice(&bytes).unwrap();
+            assert!(back.eval_delta.is_some());
+        }
     }
 }
 
