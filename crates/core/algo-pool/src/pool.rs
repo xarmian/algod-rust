@@ -726,12 +726,7 @@ impl TransactionPool {
     pub fn remember(&self, tx_group: Vec<SignedTransaction>) -> Result<(), PoolError> {
         // Client txns are go `SignedTxn`s, which have no hgi/hgh: the single
         // internal choke point for the in-block-only flags (issue #1727).
-        if let Err(e) = algo_types::genesis_restore::reject_in_block_flags(&tx_group) {
-            return Err(PoolError::InBlockOnlyField {
-                index: e.index,
-                field: e.field,
-            });
-        }
+        algo_types::genesis_restore::reject_in_block_flags(&tx_group)?;
         // Capacity check (before acquiring mu, matching Go).
         self.check_pending_queue_size(&tx_group)?;
 
@@ -770,12 +765,7 @@ impl TransactionPool {
     /// evaluator's `test_transaction_group` for validation.
     pub fn test(&self, tx_group: &[SignedTransaction]) -> Result<(), PoolError> {
         // Same in-block-only flag rejection as `remember` (issue #1727).
-        if let Err(e) = algo_types::genesis_restore::reject_in_block_flags(tx_group) {
-            return Err(PoolError::InBlockOnlyField {
-                index: e.index,
-                field: e.field,
-            });
-        }
+        algo_types::genesis_restore::reject_in_block_flags(tx_group)?;
         self.check_pending_queue_size(tx_group)?;
 
         let inner = self.mu.lock();
@@ -1343,7 +1333,6 @@ mod tests {
         pool
     }
 
-    /// Create a test transaction with a unique note (to produce distinct txn IDs).
     /// Round-3 review of #1727: the pool is the single internal choke point
     /// for the in-block-only `hgi`/`hgh` flags (go's `SignedTxn` has none,
     /// `data/transactions/signedtxn.go`): a group carrying one is rejected,
@@ -1390,6 +1379,7 @@ mod tests {
         assert_eq!(pool.pending_count(), 0);
     }
 
+    /// Create a test transaction with a unique note (to produce distinct txn IDs).
     fn make_test_txn(note_byte: u8) -> SignedTransaction {
         let mut txn = SignedTransaction::default();
         txn.txn.txn_type = TxnType::Pay;

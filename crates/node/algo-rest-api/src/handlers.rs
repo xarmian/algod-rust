@@ -1571,14 +1571,45 @@ pub async fn get_block_hash<N: NodeInterface>(
     }
 }
 
+/// The 400 for a client-submitted transaction carrying an in-block-only
+/// `hgi`/`hgh` field (go's `SignedTxn` decoder: "Unknown field"; issues
+/// #1727, #1745). `group` is the position of the offending group within a
+/// multi-group request (simulate); `None` for a single txgroup body.
+fn in_block_flag_bad_request(
+    e: algo_types::genesis_restore::InBlockOnlyFieldError,
+    group: Option<usize>,
+) -> Response {
+    match group {
+        None => error::bad_request(format!("could not decode transaction: {e}")),
+        Some(g) => error::bad_request(format!(
+            "could not decode transaction {} in group {g}: {}",
+            e.index,
+            e.cause()
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared genesis field restoration helper
 // ---------------------------------------------------------------------------
 
 /// The block's genesis-restoration rule (go `DecodeSignedTxn`), resolved once
-/// per block: the protocol lookup is not repeated per transaction.
-fn genesis_rule(block: &algo_types::Block) -> algo_types::genesis_restore::GenesisRestoreRule<'_> {
-    algo_types::genesis_restore::GenesisRestoreRule::for_block(block)
+/// per block. A block whose protocol is not in the consensus table is go's
+/// `consensus protocol %s not found` decode failure: a 500, never a silent
+/// guess at the restore rule (issue #1728).
+// `Response` is large, but this is the REST error currency everywhere here.
+#[allow(clippy::result_large_err)]
+fn genesis_rule(
+    block: &algo_types::Block,
+) -> Result<algo_types::genesis_restore::GenesisRestoreRule<'_>, Response> {
+    algo_types::genesis_restore::GenesisRestoreRule::try_for_block(block)
+        .map_err(|e| unknown_protocol_response(&e))
+}
+
+/// The 500 every block endpoint answers for a block whose protocol is not in
+/// the consensus table: go's `consensus protocol %s not found` text.
+fn unknown_protocol_response(e: &algo_types::genesis_restore::UnknownProtocolError) -> Response {
+    error::internal_error(e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1608,7 +1639,10 @@ pub async fn get_block_txids<N: NodeInterface>(
 
     // Compute transaction IDs, restoring genesis fields as go-algorand's
     // DecodeSignedTxn does before computing the ID.
-    let rule = genesis_rule(&block);
+    let rule = match genesis_rule(&block) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
     let txids: Vec<String> = block
         .payset
         .iter()
@@ -1652,7 +1686,10 @@ pub async fn get_block_logs<N: NodeInterface>(
 
     let mut block_logs: Vec<models::AppCallLogs> = Vec::new();
 
-    let rule = genesis_rule(&block);
+    let rule = match genesis_rule(&block) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
     for stxn in &block.payset {
         // Compute the outer txn ID (restoring genesis fields as in get_block_txids).
         let txn = rule.restored_txn(stxn);
@@ -1742,7 +1779,9 @@ pub async fn get_transaction_proof<N: NodeInterface>(
     let proto = match algo_types::consensus_params_for_version(&block.current_protocol) {
         Some(p) => p,
         None => {
-            return error::internal_error("could not find consensus params for block protocol");
+            return unknown_protocol_response(&algo_types::genesis_restore::UnknownProtocolError {
+                protocol: block.current_protocol.clone(),
+            });
         }
     };
 
@@ -1760,7 +1799,9 @@ pub async fn get_transaction_proof<N: NodeInterface>(
     // We must restore genesis fields before computing the ID (matching
     // go-algorand's DecodePaysetFlat → DecodeSignedTxn).
     let mut found_idx = None;
-    let rule = genesis_rule(&block);
+    // `proto` is this block's already-resolved protocol (unknown ones were
+    // rejected above), so the rule needs no second lookup.
+    let rule = algo_types::genesis_restore::GenesisRestoreRule::for_params(&proto, &block);
     for (i, stxn) in block.payset.iter().enumerate() {
         let txn = rule.restored_txn(stxn);
         let computed_id = algo_codec::compute_txn_id(&txn);
@@ -2636,7 +2677,7 @@ pub async fn raw_transaction<N: NodeInterface>(
     // fields and `decodeTxGroup` returns that straight to `badRequest`
     // (handlers.go:1172-1183, :1259-1262; issue #1727).
     if let Err(e) = algo_types::genesis_restore::reject_in_block_flags(&txgroup) {
-        return error::bad_request(format!("could not decode transaction: {e}"));
+        return in_block_flag_bad_request(e, None);
     }
 
     if let Err(e) =
@@ -3283,10 +3324,7 @@ pub async fn simulate_transaction<N: NodeInterface>(
         // handlers.go:1562-1567), whose decoder rejects the in-block-only
         // hgi/hgh as unknown fields (issue #1727).
         if let Err(e) = algo_types::genesis_restore::reject_in_block_flags(&decoded_txns) {
-            return error::bad_request(format!(
-                "could not decode transaction {} in group {i}: Unknown field: {}",
-                e.index, e.field
-            ));
+            return in_block_flag_bad_request(e, Some(i));
         }
         decoded_groups.push(decoded_txns);
     }
@@ -4811,7 +4849,7 @@ pub async fn raw_transaction_async<N: NodeInterface>(
     // fields and `decodeTxGroup` returns that straight to `badRequest`
     // (handlers.go:1172-1183, :1259-1262; issue #1727).
     if let Err(e) = algo_types::genesis_restore::reject_in_block_flags(&txgroup) {
-        return error::bad_request(format!("could not decode transaction: {e}"));
+        return in_block_flag_bad_request(e, None);
     }
 
     if let Err(e) =
@@ -4937,5 +4975,59 @@ mod handlers_pure_fn_tests {
 
         // Response size not limited at all when both are 0.
         assert_eq!(application_boxes_max_keys(0, 0), u64::MAX);
+    }
+}
+
+#[cfg(test)]
+mod txn_merkle_array_tests {
+    use super::*;
+    use algo_consensus_crypto::merklearray::Array;
+    use algo_types::genesis_restore::GenesisRestoreRule;
+
+    /// Issue #1728: with a hash-optional protocol (custom `consensus.json`
+    /// pairing merkle commitments with `RequireGenesisHash=false`) and `hgh`
+    /// unset, the proof-tree leaf is built over the gh-less txid; with `hgh`
+    /// set it is built over the restored hash.
+    #[test]
+    fn leaf_txid_follows_hgh_on_a_hash_optional_protocol() {
+        let mut params = algo_types::consensus_params_for_version(algo_types::CONSENSUS_V41)
+            .expect("v41 params");
+        params.require_genesis_hash = false;
+        let gh = [0xABu8; 32];
+        for hgh in [false, true] {
+            let stripped = algo_types::SignedTransaction {
+                txn: algo_types::Transaction {
+                    txn_type: algo_types::TxnType::Pay,
+                    fee: 1000,
+                    ..Default::default()
+                },
+                has_genesis_id: true,
+                has_genesis_hash: hgh,
+                ..Default::default()
+            };
+            let block = algo_types::Block {
+                genesis_id: "gid".into(),
+                genesis_hash: gh,
+                payset: vec![stripped.clone()],
+                ..Default::default()
+            };
+            let mut full = stripped.txn.clone();
+            full.genesis_id = "gid".into();
+            if hgh {
+                full.genesis_hash = gh;
+            }
+            let array = TxnMerkleArray {
+                block: &block,
+                hash_type: "sha512_256",
+                rule: GenesisRestoreRule::for_params(&params, &block),
+            };
+            let leaf = array.marshal(0).expect("leaf");
+            let (_, data) = leaf.to_be_hashed();
+            assert_eq!(
+                &data[..32],
+                &algo_codec::compute_txn_id(&full).0,
+                "hgh={hgh}"
+            );
+        }
     }
 }

@@ -69,6 +69,12 @@ pub struct BlockValidationResult {
     /// Number of transactions in the block's payset.
     pub txn_count: usize,
     /// Total encoded size of all transactions (canonical SignedTxnInBlock bytes).
+    ///
+    /// `0` when validation returned before accounting any payset bytes: a
+    /// payset whose entries violate go's `DecodeSignedTxn` genesis-field
+    /// rules fails at decode (`PaysetGenesisFields`), so there is no decoded
+    /// payset to size. `round` and `txn_count` are always filled and errors
+    /// collected before the early return (protocol, timestamp) are kept.
     pub total_txn_bytes: usize,
 }
 
@@ -221,7 +227,11 @@ impl fmt::Display for BlockValidationError {
 /// IDs commit to the full transaction, so any hash recomputation over a
 /// payset (including the early proposal group-ID screen) must restore them
 /// first (issue #1686).
-pub fn restore_payset_genesis_fields(block: &Block) -> Vec<SignedTransaction> {
+///
+/// An unknown `current_protocol` is go's `consensus protocol %s not found`.
+pub fn restore_payset_genesis_fields(
+    block: &Block,
+) -> Result<Vec<SignedTransaction>, algo_types::genesis_restore::UnknownProtocolError> {
     algo_types::genesis_restore::restore_payset_genesis_fields(block)
 }
 
@@ -336,13 +346,10 @@ pub fn validate_block_with_cache(
     // An unknown protocol was already reported as `UnknownProtocolVersion` in
     // step 1 (go: "consensus protocol not found"), so the block is rejected
     // regardless; the default params only keep the remaining checks running.
-    // Genesis restoration treats an unknown protocol as hash-requiring.
     // ONE protocol lookup per block: the same resolved params feed the
     // genesis-field rule, the restore pass and the per-txn rules below.
-    let params_opt = consensus_params_for_version(&block.current_protocol);
-    let genesis_rule =
-        algo_types::genesis_restore::GenesisRestoreRule::for_params(params_opt.as_ref(), block);
-    let params = params_opt.unwrap_or_default();
+    let params = consensus_params_for_version(&block.current_protocol).unwrap_or_default();
+    let genesis_rule = algo_types::genesis_restore::GenesisRestoreRule::for_params(&params, block);
     let spec = SpecialAddresses {
         fee_sink: block.fee_sink,
         rewards_pool: block.rewards_pool,
@@ -1308,6 +1315,33 @@ mod tests {
         assert!(!r.is_valid);
         assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
         assert!(has_genesis_field_error(&r));
+        assert_eq!(r.total_txn_bytes, 0);
+    }
+
+    /// Issue #1745: the early return on a payset that cannot decode keeps the
+    /// result shape consistent -- every earlier-collected error is still
+    /// reported, `round`/`txn_count` describe the block, and
+    /// `total_txn_bytes` is 0 because no payset bytes were ever accounted
+    /// (documented on [`BlockValidationResult::total_txn_bytes`]).
+    #[test]
+    fn strict_genesis_early_return_keeps_earlier_errors_and_result_shape() {
+        let mut b = genesis_strict_block(algo_types::consensus::CONSENSUS_V41);
+        b.current_protocol = "no-such-protocol".into();
+        b.timestamp = 1_000_000;
+        b.payset[0].txn.genesis_hash = test_genesis_hash();
+        let r = validate_block(&b, Some(100), "test-v1", &test_genesis_hash(), None);
+        assert!(!r.is_valid);
+        assert!(r
+            .errors
+            .iter()
+            .any(|e| matches!(e, BlockValidationError::UnknownProtocolVersion { .. })));
+        assert!(r
+            .errors
+            .iter()
+            .any(|e| matches!(e, BlockValidationError::TimestampTooNew { .. })));
+        assert!(has_genesis_field_error(&r));
+        assert_eq!(r.round, b.round.0);
+        assert_eq!(r.txn_count, b.payset.len());
         assert_eq!(r.total_txn_bytes, 0);
     }
 

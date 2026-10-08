@@ -1054,13 +1054,26 @@ mod serde_eval_delta {
         }
 
         /// JSON is exactly the default `rmpv::Value` serialization (no lossy
-        /// string collapse), and valid content round-trips unchanged.
+        /// string collapse), and valid content round-trips unchanged. JSON
+        /// object keys must be strings, so an eval delta with a non-string
+        /// key (`sample_dt`'s `ld`, keyed by the integer account index as in
+        /// go's msgpack) is simply not JSON-representable: serialization
+        /// errors rather than coercing the key.
         #[test]
         fn json_is_unchanged_default_value_serialization() {
-            let dt = sample_dt();
-            let json = serde_json::to_value(stx_with(dt.clone())).unwrap();
-            assert_eq!(json["dt"], serde_json::to_value(&dt).unwrap());
-            let ok = stx_with(Value::Map(vec![(s("lg"), Value::Array(vec![s("hi")]))]));
+            let err = serde_json::to_value(stx_with(sample_dt())).unwrap_err();
+            assert!(err.to_string().contains("key must be a string"), "{err}");
+            assert!(serde_json::to_value(sample_dt()).is_err());
+
+            let ok = stx_with(Value::Map(vec![
+                (s("lg"), Value::Array(vec![s("hi")])),
+                (s("gd"), Value::Map(vec![(s("k"), Value::from(1u64))])),
+            ]));
+            let json = serde_json::to_value(&ok).unwrap();
+            assert_eq!(
+                json["dt"],
+                serde_json::to_value(ok.eval_delta.as_ref().unwrap()).unwrap()
+            );
             let back: SignedTransaction =
                 serde_json::from_str(&serde_json::to_string(&ok).unwrap()).unwrap();
             assert_eq!(back.eval_delta, ok.eval_delta);

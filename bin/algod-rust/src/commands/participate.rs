@@ -1406,6 +1406,19 @@ impl SimpleBlockEvaluator {
             });
         }
 
+        // Client/pool transactions are go `SignedTxn`s, which carry no
+        // `hgi`/`hgh` (`data/transactions/signedtxn.go`). Every ingress
+        // boundary (REST, gossip, pool, simulate) rejects them at decode;
+        // this evaluator is the sink they all funnel into, so it fails
+        // closed with the same answer rather than silently normalising a
+        // flagged group into something the submitter never signed (issue
+        // #1745; supersedes the #1727 normalisation).
+        algo_types::genesis_restore::reject_in_block_flags(txgroup).map_err(|e| {
+            algo_error::AlgoError::Validation {
+                message: e.to_string(),
+            }
+        })?;
+
         let params = &self.consensus_params;
         let round = self.hdr.round;
 
@@ -1514,14 +1527,13 @@ impl SimpleBlockEvaluator {
         // ensure they're set matching the block header, mirroring the pattern
         // from block.rs.
         //
-        // Pool/client transactions are go `SignedTxn`s, which carry no
-        // `hgi`/`hgh` (`data/transactions/signedtxn.go`); the pool rejects
-        // any that arrive flagged. Normalising here as well keeps this
-        // restored copy -- the one `validate_group` checks txids on and
-        // `transaction_group` records them from -- identical to what the
-        // block's stripped STIB form restores to (issue #1727).
+        // The group was checked flag-free above, so restoring from the
+        // header yields exactly what the block's stripped STIB form restores
+        // to (strip then restore sets `hgi`/`hgh` from scratch).
         let mut restored: Vec<algo_types::SignedTransaction> = txgroup.to_vec();
-        algo_types::genesis_restore::clear_in_block_flags(&mut restored);
+        debug_assert!(txgroup
+            .iter()
+            .all(|s| !s.has_genesis_id && !s.has_genesis_hash));
         for stx in &mut restored {
             self.restore_genesis_fields(stx);
         }
@@ -8790,31 +8802,44 @@ mod tests {
         assert!(stib.has_genesis_id, "STIB should set has_genesis_id flag");
     }
 
-    /// Issue #1727 review: a pool txn that arrived with the in-block-only
-    /// `hgi`/`hgh` flags set (the msgpack decoder accepts them on any
-    /// `SignedTransaction`) must still be proposed in the canonical stripped
-    /// form (go `EncodeSignedTxn` builds the in-block form from scratch), so
-    /// the proposal passes our own `validate_block` instead of failing the
-    /// strict `DecodeSignedTxn` genesis-field rules.
+    /// Issue #1745 (supersedes the #1727 "reset leaked flags" tolerance): go's
+    /// `SignedTxn` has no `hgi`/`hgh`, so a flagged group is not normalised
+    /// and proposed -- the evaluator, the sink every admission path funnels
+    /// through, fails closed with the same "Unknown field" answer the
+    /// ingress boundaries give (`reject_in_block_flags`). Nothing flagged is
+    /// ever admitted, so the proposed payset can never carry a leaked flag.
     #[test]
-    fn proposer_resets_leaked_in_block_flags_and_block_validates() {
+    fn evaluator_rejects_leaked_in_block_flags_instead_of_normalising() {
         let ledger = test_ledger();
         let params = v41_params();
         let (sender, key) = test_keypair(124);
         let (receiver, _) = test_keypair(125);
         let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
-
-        let mut stx = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100);
-        assert_eq!(stx.txn.genesis_id, "test-v1");
-        stx.has_genesis_hash = true; // leaked: obviated on V41
-        stx.has_genesis_id = true;
+        for (hgi, hgh, field) in [
+            (true, true, "hgh"),
+            (true, false, "hgi"),
+            (false, true, "hgh"),
+        ] {
+            let mut stx = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100);
+            stx.has_genesis_id = hgi;
+            stx.has_genesis_hash = hgh;
+            let err = eval
+                .transaction_group(std::slice::from_ref(&stx))
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&format!("txn 0: Unknown field: {field}")),
+                "{err}"
+            );
+            assert!(eval.test_transaction_group(&[stx]).is_err());
+            assert_eq!(eval.pay_set_size(), 0, "never reaches a proposal");
+        }
+        // The same txn without flags is fine and proposes a valid block.
+        let stx = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100);
         eval.transaction_group(&[stx]).unwrap();
         let block = eval.generate_block(&[]).unwrap();
-        assert!(
-            !block.payset[0].has_genesis_hash,
-            "hgh must be cleared on RequireGenesisHash protocols"
-        );
         assert!(block.payset[0].has_genesis_id);
+        assert!(!block.payset[0].has_genesis_hash);
         let result = validate_proposal(&block);
         assert!(result.is_valid, "{:?}", result.errors);
     }
@@ -8863,23 +8888,29 @@ mod tests {
         assert!(result.is_valid, "{:?}", result.errors);
     }
 
-    /// An empty-`gen` txn must not be proposed with a leaked `hgi`.
+    /// An empty-`gen` txn is proposed without `hgi` (an empty `gen` is a
+    /// legitimate, distinct state), and the same txn carrying a leaked `hgi`
+    /// is rejected at admission (issue #1745).
     #[test]
-    fn proposer_clears_hgi_when_txn_has_no_genesis_id() {
+    fn empty_gen_txn_is_proposed_without_hgi_and_leaked_hgi_is_rejected() {
         let ledger = test_ledger();
         let params = v41_params();
         let (sender, key) = test_keypair(126);
         let (receiver, _) = test_keypair(127);
         let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
-        // Legitimately signed over an empty gen; the leaked hgi must be
-        // ignored at admission and absent from the proposal.
         let mut txn = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100).txn;
         txn.genesis_id = String::new();
         let sig = sign_txn(&txn, &key);
+        let leaked = SignedTransaction {
+            txn: txn.clone(),
+            sig,
+            has_genesis_id: true,
+            ..Default::default()
+        };
+        assert!(eval.transaction_group(&[leaked]).is_err());
         let stx = SignedTransaction {
             txn,
             sig,
-            has_genesis_id: true,
             ..Default::default()
         };
         eval.transaction_group(&[stx]).unwrap();
@@ -8889,12 +8920,11 @@ mod tests {
         assert!(result.is_valid, "{:?}", result.errors);
     }
 
-    /// Round-3 review of #1727: the overlay must record the txid the block
-    /// will carry (restored from the stripped STIB form), not one computed
-    /// from the raw submission with a leaked `hgi`; otherwise the second
-    /// copy of the same txn passes `check_txid` and bypasses the txtail.
+    /// The overlay records the txid the block will carry, so a second copy
+    /// of the same txn is a duplicate across groups; a copy carrying a leaked
+    /// flag is rejected before it can be mistaken for a distinct txn.
     #[test]
-    fn duplicate_txn_with_leaked_flag_is_rejected_across_groups() {
+    fn duplicate_txn_is_rejected_across_groups_and_flagged_copy_is_unknown_field() {
         let ledger = test_ledger();
         let params = v41_params();
         let (sender, key) = test_keypair(132);
@@ -8906,15 +8936,22 @@ mod tests {
         let stx = SignedTransaction {
             txn,
             sig,
-            has_genesis_id: true, // leaked in-block-only flag
             ..Default::default()
         };
         eval.transaction_group(std::slice::from_ref(&stx)).unwrap();
-        let err = eval.transaction_group(&[stx]).unwrap_err();
+        let err = eval
+            .transaction_group(std::slice::from_ref(&stx))
+            .unwrap_err();
         assert!(
             err.to_string().contains("duplicate transaction ID"),
             "{err}"
         );
+        let flagged = SignedTransaction {
+            has_genesis_id: true,
+            ..stx
+        };
+        let err = eval.transaction_group(&[flagged]).unwrap_err();
+        assert!(err.to_string().contains("Unknown field: hgi"), "{err}");
         assert_eq!(eval.pay_set_size(), 1);
     }
 

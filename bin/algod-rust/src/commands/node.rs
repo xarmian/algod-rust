@@ -405,11 +405,14 @@ async fn run_start(
         info!(path = %consensus_overrides_path.display(), "loaded consensus-parameter overrides");
     }
 
-    // Dev-mode block production restores the genesis hash stripped from committed
-    // transactions by treating a zero hash as "stripped" (see
-    // `dev_producer::restore_block_genesis_fields`). That is only unambiguous
-    // under protocols that require a genesis hash, so refuse dev mode on legacy
-    // optional-genesis-hash protocols rather than risk mis-derived txids.
+    // Dev-mode block production derives committed txids by restoring the
+    // genesis fields a block strips, through the shared protocol-aware
+    // `algo_types::genesis_restore::GenesisRestoreRule` (see
+    // `dev_producer::restore_with_rule`). The rule itself handles legacy
+    // optional-genesis-hash protocols, but the dev producer's pool and
+    // proposer paths are only exercised under protocols that require a
+    // genesis hash, so dev mode still refuses legacy optional-genesis-hash
+    // protocols rather than ship an untested configuration.
     if dev_mode {
         let params = consensus_protocols
             .get(&genesis.proto)

@@ -717,6 +717,15 @@ pub enum TxTagError {
     },
 }
 
+impl From<algo_types::genesis_restore::InBlockOnlyFieldError> for TxTagError {
+    fn from(e: algo_types::genesis_restore::InBlockOnlyFieldError) -> Self {
+        TxTagError::InBlockOnlyField {
+            index: e.index,
+            field: e.field,
+        }
+    }
+}
+
 /// Decode a TX-tag payload as a streaming concatenation of
 /// [`SignedTransaction`] values.
 ///
@@ -745,7 +754,14 @@ pub fn decode_tx_message(data: &[u8]) -> Result<Vec<SignedTransaction>, TxTagErr
 
         let offset = cursor.position();
         match rmp_serde::from_read::<_, SignedTransaction>(&mut cursor) {
-            Ok(tx) => group.push(tx),
+            Ok(tx) => {
+                // go decodes gossip txns as `SignedTxn`, whose decoder
+                // rejects the in-block-only hgi/hgh as unknown fields
+                // (issue #1727) -- on the element itself, before any later
+                // bytes are looked at (issue #1745).
+                algo_types::genesis_restore::reject_in_block_flags_one(&tx, group.len())?;
+                group.push(tx);
+            }
             Err(e) => {
                 // Clean end-of-stream means we *started* the read at
                 // EOF — i.e. the previous decode exactly exhausted the
@@ -766,15 +782,6 @@ pub fn decode_tx_message(data: &[u8]) -> Result<Vec<SignedTransaction>, TxTagErr
 
     if group.is_empty() {
         return Err(TxTagError::EmptyGroup);
-    }
-
-    // go decodes gossip txns as `SignedTxn`, whose decoder rejects the
-    // in-block-only hgi/hgh as unknown fields (issue #1727).
-    if let Err(e) = algo_types::genesis_restore::reject_in_block_flags(&group) {
-        return Err(TxTagError::InBlockOnlyField {
-            index: e.index,
-            field: e.field,
-        });
     }
 
     Ok(group)
@@ -1816,6 +1823,35 @@ mod tests {
                 "expected InBlockOnlyField, got {err:?}",
             );
         }
+    }
+
+    /// Issue #1745: go's per-element msgp decode fails on the FIRST element
+    /// with an unknown field, before it ever looks at what follows -- so a
+    /// flagged txn followed by garbage (or by an over-long tail) is an
+    /// in-block-only-field error, not a decode/trailing-bytes one.
+    #[test]
+    fn in_block_only_field_is_checked_per_element_while_decoding() {
+        let mut stx = make_signed_txn(7);
+        stx.has_genesis_hash = true;
+        let flagged = algo_codec::canonical_encode_signed_txn_in_block(&stx);
+
+        let mut garbage_tail = flagged.clone();
+        garbage_tail.extend_from_slice(&[0xC1, 0xC1]);
+        let err = decode_tx_message(&garbage_tail).unwrap_err();
+        assert!(
+            matches!(err, TxTagError::InBlockOnlyField { index: 0, .. }),
+            "flagged first element must win over a malformed tail, got {err:?}",
+        );
+
+        let mut overlong = flagged;
+        for i in 0..MAX_TX_GROUP_SIZE + 1 {
+            overlong.extend_from_slice(&encode_group(&[make_signed_txn(i as u64 + 20)]));
+        }
+        let err = decode_tx_message(&overlong).unwrap_err();
+        assert!(
+            matches!(err, TxTagError::InBlockOnlyField { index: 0, .. }),
+            "flagged first element must win over trailing bytes, got {err:?}",
+        );
     }
 
     #[test]

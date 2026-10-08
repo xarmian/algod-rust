@@ -51,7 +51,7 @@ fn block(proto: &str, hgh: bool, header_gh: [u8; 32]) -> Block {
 #[test]
 fn hash_optional_protocol_without_hgh_keeps_gh_omitted() {
     let b = block(CONSENSUS_V15, false, [9u8; 32]);
-    let r = restore_payset_genesis_fields(&b);
+    let r = restore_payset_genesis_fields(&b).unwrap();
     assert_eq!(r[0].txn.genesis_hash, [0u8; 32]);
     assert_eq!(r[0].txn.genesis_id, "gid");
     // Merkle leaf txid is computed over the same (gh-less) txn: identical to
@@ -68,7 +68,9 @@ fn hash_optional_protocol_without_hgh_keeps_gh_omitted() {
 fn hash_optional_protocol_with_hgh_restores_gh() {
     let b = block(CONSENSUS_V15, true, [9u8; 32]);
     assert_eq!(
-        restore_payset_genesis_fields(&b)[0].txn.genesis_hash,
+        restore_payset_genesis_fields(&b).unwrap()[0]
+            .txn
+            .genesis_hash,
         [9u8; 32]
     );
     let mut no_hash_header = b.clone();
@@ -83,20 +85,23 @@ fn hash_optional_protocol_with_hgh_restores_gh() {
 fn hash_required_protocol_restores_gh_without_hgh() {
     let b = block(CONSENSUS_V41, false, [9u8; 32]);
     assert_eq!(
-        restore_payset_genesis_fields(&b)[0].txn.genesis_hash,
+        restore_payset_genesis_fields(&b).unwrap()[0]
+            .txn
+            .genesis_hash,
         [9u8; 32]
     );
 }
 
-/// Unknown protocol: validate_block reports it explicitly (go: "consensus
-/// protocol not found") and restoration agrees by treating it as
-/// hash-requiring (never silently hash-optional).
+/// Unknown protocol: `validate_block` reports it explicitly (go: "consensus
+/// protocol not found") and so does restoration -- an error, never a silent
+/// guess (issue #1728).
 #[test]
-fn unknown_protocol_is_rejected_and_restored_as_hash_requiring() {
+fn unknown_protocol_is_rejected_by_validate_and_restore() {
     let b = block("no-such-protocol", false, [9u8; 32]);
+    let err = restore_payset_genesis_fields(&b).unwrap_err();
     assert_eq!(
-        restore_payset_genesis_fields(&b)[0].txn.genesis_hash,
-        [9u8; 32]
+        err.to_string(),
+        "consensus protocol no-such-protocol not found"
     );
     let res = algo_validate::validate_block(&b, None, "gid", &[9u8; 32], None);
     assert!(res.errors.iter().any(|e| matches!(

@@ -64,24 +64,14 @@ use algo_types::{Block, Digest, SignedTransaction};
 /// Restore the genesis fields a block's STIB encoding strips, returning the
 /// transaction in the canonical form the submitter signed and hashed.
 ///
-/// A block stores transactions in `SignedTxnInBlock` form, which omits
-/// `genesis_id` (when it matched the network, flagged by `has_genesis_id`) and
-/// `genesis_hash` (when it equals the block's — always, under modern protocols
-/// that require it). The decoded `payset` therefore carries the stripped form,
-/// so hashing it directly would differ from the submitter's txid. This mirrors
-/// the evaluator's `restore_genesis_fields`:
-/// - restore `genesis_id` from the block when `has_genesis_id` is set and the
-///   field is empty;
-/// - restore `genesis_hash` from the block when the field is zero and the hash
-///   was stripped — i.e. the block's protocol requires a genesis hash (so every
-///   committed txn carries one) or the `has_genesis_hash` flag is set.
-///
-/// This mirrors the evaluator's `restore_genesis_fields` (`require_genesis_hash
-/// || has_genesis_hash`) and is protocol-aware via the block's `current_protocol`
-/// — so a transaction that genuinely omitted its genesis hash on a legacy
-/// optional-genesis-hash protocol is left untouched, keeping its txid stable.
-/// `genesis_id` is flag-gated because an empty `genesis_id` is a legal, common
-/// state the flag distinguishes from "stripped because it matched the network".
+/// This is go's `BlockHeader.DecodeSignedTxn` as implemented once, in
+/// [`algo_types::genesis_restore::GenesisRestoreRule`] (protocol-aware via the
+/// block's `current_protocol`): `genesis_id` comes back only when
+/// `has_genesis_id` is set, and `genesis_hash` when the protocol requires it
+/// or `has_genesis_hash` is set -- so a transaction that genuinely omitted
+/// its hash on a legacy optional-hash protocol keeps a stable txid. Test-only
+/// convenience; production code resolves the rule once per block and calls
+/// [`restore_with_rule`].
 #[cfg(test)]
 pub fn restore_block_genesis_fields(stx: &SignedTransaction, block: &Block) -> SignedTransaction {
     restore_with_rule(
