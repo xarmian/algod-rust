@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use algo_error::AlgoError;
-use algo_types::{AccountData, Address, Block};
+use algo_types::{AccountData, Address, Block, Transaction};
 
 use crate::apply::{apply_block_impl_ex, ApplyData, ApplyMode, KvModsMap};
 use crate::eval_delta::{parse_eval_delta, EvalDelta, ValueDelta};
@@ -863,48 +863,37 @@ fn diff_state_delta(
     }
 }
 
-/// Split a pretty-`Debug` struct dump into its top-level `(field, body)` pairs.
-fn top_level_fields(dbg: &str) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    for line in dbg.lines().skip(1) {
-        if line == "}" {
-            continue;
-        }
-        if line.starts_with("    ") && !line.starts_with("     ") {
-            if let Some((name, rest)) = line.trim().split_once(": ") {
-                out.push((name.to_string(), rest.to_string()));
-                continue;
-            }
-        }
-        if let Some(last) = out.last_mut() {
-            last.1.push(' ');
-            last.1.push_str(line.trim());
-        }
+/// One diff per `Transaction` field whose typed value differs, named
+/// `<path>.txn.<field>` (struct declaration order). The field list is checked
+/// exhaustively at compile time: the destructuring pattern below names every
+/// `Transaction` field with no `..`, so adding a field to the struct fails to
+/// compile here until it is added to the list.
+fn txn_field_diffs(path: &str, rec: &Transaction, comp: &Transaction, out: &mut Vec<FieldDiff>) {
+    macro_rules! typed_txn_diffs {
+        ([$($f:ident),* $(,)?]) => {
+            let Transaction { $($f: _),* } = rec;
+            $(
+                if rec.$f != comp.$f {
+                    out.push((
+                        format!("{path}.txn.{}", stringify!($f)),
+                        clip(format!("{:?}", rec.$f)),
+                        clip(format!("{:?}", comp.$f)),
+                    ));
+                }
+            )*
+        };
     }
-    out
-}
-
-/// One diff per top-level transaction field whose pretty-`Debug` body differs,
-/// named `<path>.txn.<field>`.
-fn txn_field_diffs(path: &str, rec: &str, comp: &str, out: &mut Vec<FieldDiff>) {
-    let (r, c) = (top_level_fields(rec), top_level_fields(comp));
-    let mut names: Vec<&String> = Vec::new();
-    for (n, _) in r.iter().chain(c.iter()) {
-        if !names.contains(&n) {
-            names.push(n);
-        }
-    }
-    for n in names {
-        let rb = r.iter().find(|(m, _)| m == n).map(|(_, b)| b.as_str());
-        let cb = c.iter().find(|(m, _)| m == n).map(|(_, b)| b.as_str());
-        if rb != cb {
-            out.push((
-                format!("{path}.txn.{n}"),
-                clip(rb.unwrap_or("<absent>").to_string()),
-                clip(cb.unwrap_or("<absent>").to_string()),
-            ));
-        }
-    }
+    typed_txn_diffs!([
+        txn_type, sender, fee, first_valid, last_valid, note, genesis_id, genesis_hash, group,
+            lease, rekey_to, amount, receiver, close_remainder_to, xaid, asset_amount,
+            asset_sender, asset_receiver, asset_close_to, config_asset, asset_params,
+            freeze_asset, freeze_account, asset_frozen, application_id, on_completion,
+            approval_program, clear_state_program, app_arguments, accounts, foreign_apps,
+            foreign_assets, boxes, global_state_schema, local_state_schema,
+            extra_program_pages, vote_pk, selection_pk, state_proof_pk, vote_first, vote_last,
+            vote_key_dilution, non_participation, state_proof_type, state_proof,
+            state_proof_message, heartbeat, access, reject_version
+    ]);
 }
 
 /// Compare one pair of recorded/computed `dt` values with `EvalDelta.Equal`
@@ -1016,7 +1005,7 @@ fn diff_eval_delta(
             algo_codec::canonical_encode_transaction(&b.txn),
         );
         if ea != eb {
-            txn_field_diffs(&p, &format!("{:#?}", a.txn), &format!("{:#?}", b.txn), out);
+            txn_field_diffs(&p, &a.txn, &b.txn, out);
         }
         macro_rules! scalar {
             ($($f:ident),*) => {$(
@@ -1738,7 +1727,7 @@ mod tests {
         );
         assert_eq!(d.len(), 1, "{d:#?}");
         assert_eq!(d[0].field, "eval_delta.inner_txns[0].txn.amount");
-        assert!(d[0].replay == "10," && d[0].execute == "11,", "{:?}", d[0]);
+        assert!(d[0].replay == "10" && d[0].execute == "11", "{:?}", d[0]);
         assert!(cmp_one(
             |s| s.eval_delta = itx(10),
             ApplyData {
@@ -1796,6 +1785,83 @@ mod tests {
         let d = compare_recorded_apply_data(&recorded, &ads);
         assert_eq!(d.len(), 1, "{d:#?}");
         assert_eq!(d[0].field, "application_id");
+    }
+
+    /// Synthetic inner transaction differing in several typed fields, used by
+    /// the golden mismatch-output test.
+    fn golden_inner(variant: bool) -> Value {
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = "pay".into();
+        stx.txn.sender = SENDER;
+        stx.txn.receiver = RECEIVER;
+        stx.txn.amount = if variant { 11 } else { 10 };
+        stx.txn.fee = if variant { 0 } else { 1_000 };
+        stx.txn.group = if variant { [0u8; 32] } else { [7u8; 32] };
+        stx.txn.rekey_to = if variant { Some(FEE_SINK) } else { None };
+        stx.txn.genesis_id = if variant { "b-v1".into() } else { String::new() };
+        let bytes = rmp_serde::to_vec_named(&stx).unwrap();
+        rmpv::decode::read_value(&mut &bytes[..]).unwrap()
+    }
+
+    #[test]
+    fn inner_txn_mismatch_output_golden() {
+        let itx = |v: bool| {
+            dt(vec![(
+                Value::from("itx"),
+                Value::Array(vec![golden_inner(v)]),
+            )])
+        };
+        let d = cmp_one(
+            |s| s.eval_delta = itx(false),
+            ApplyData {
+                eval_delta: itx(true),
+                ..Default::default()
+            },
+        );
+        let got: Vec<(String, String, String)> = d
+            .iter()
+            .map(|x| (x.field.clone(), x.replay.clone(), x.execute.clone()))
+            .collect();
+        let s = |x: &str| x.to_string();
+        let want: Vec<(String, String, String)> = vec![
+            (s("eval_delta.inner_txns[0].txn.fee"), s("1000"), s("0")),
+            (
+                s("eval_delta.inner_txns[0].txn.genesis_id"),
+                s("\"\""),
+                s("\"b-v1\""),
+            ),
+            (
+                s("eval_delta.inner_txns[0].txn.group"),
+                clip(format!("{:?}", [7u8; 32])),
+                clip(format!("{:?}", [0u8; 32])),
+            ),
+            (
+                s("eval_delta.inner_txns[0].txn.rekey_to"),
+                s("None"),
+                clip(format!("{:?}", Some(FEE_SINK))),
+            ),
+            (s("eval_delta.inner_txns[0].txn.amount"), s("10"), s("11")),
+        ];
+        assert_eq!(got, want);
+        // Every field name still buckets to a stable limiter pattern.
+        for (f, _, _) in &got {
+            assert!(
+                field_pattern(f).starts_with("eval_delta.inner_txns[N].txn."),
+                "{f}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_code_does_not_parse_debug_text() {
+        let src = include_str!("shadow_execute.rs");
+        let src = src.replace("\r\n", "\n");
+        let prod = src.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(
+            !prod.contains("fn top_level_fields"),
+            "inner-txn diff must compare typed Transaction fields, not parse Debug text"
+        );
+        assert!(!prod.contains("{:#?}"), "no pretty-Debug text in production code");
     }
 
     #[test]
