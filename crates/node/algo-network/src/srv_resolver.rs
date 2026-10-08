@@ -1583,6 +1583,10 @@ mod tests {
     /// lookup's sub-query count grows with the additional-section size, while
     /// a non-validating one stays a single query. Asserts only the trend, not
     /// hickory's exact per-name query count.
+    ///
+    /// Diagnostic: may need updating on hickory upgrade (it documents
+    /// hickory's additional-section validation behaviour, which this crate
+    /// cannot change).
     #[tokio::test]
     async fn validated_lookup_queries_grow_with_additional_section() {
         async fn queries(targets: usize, validate: bool) -> usize {
