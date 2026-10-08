@@ -42,7 +42,7 @@ name: Nightly Mainnet Node Soak
 #      run early the moment a halt is detected, rather than burning the
 #      rest of the budget).
 #   6. Tear the node down, print the step-summary table, upload
-#      artifacts, and — only on a verdict of `stuck`/`node_failure` — file
+#      artifacts, and — only on a verdict of `stuck`/`node_failure`/`invalid_block_stall` — file
 #      (or comment on, if a dedup match exists) a GitHub issue via
 #      `file_issue.py`.
 #
@@ -639,10 +639,11 @@ jobs:
         id: scan
         if: always()
         run: |
-          # Hard signatures (permanent block-write errors, apply_block
-          # failures, panics, ledger invariant errors, block-apply balance
-          # errors outside the gossip tx handlers, EAGAIN, repeated
-          # ensure_block no-advance) fail the job in the last step; warn and
+          # Hard signatures (permanent block-write errors, stalled on
+          # invalid block, apply_block failures, panics, ledger invariant
+          # errors, shadow-execute mismatches, block-apply balance errors
+          # outside the gossip tx handlers, EAGAIN, repeated ensure_block
+          # no-advance) fail the job in the last step; warn and
           # noise tiers are only counted. Results are merged into
           # summary.json under "log_scan". See ops/mainnet-soak/nodelog.py.
           mkdir -p mainnet-soak-artifacts

@@ -863,10 +863,11 @@ impl LedgerWriter for AgreementLedgerBridge {
                      skipping (needs catchup)",
                     block.round.0, next_round
                 );
-                drop(ledger);
+                // Routine: the catchup service fetches the gap. Counted, but not
+                // a failure.
                 crate::follow_timing::follow_timing()
-                    .ensure_block_failed
-                    .observe(ensure_started.elapsed());
+                    .ensure_block_skipped_ahead
+                    .inc();
                 return;
             }
 
@@ -1688,21 +1689,21 @@ mod tests {
         assert!(t.ensure_block_already_committed.get() > already);
     }
 
-    /// Issue #1761: an `ensure_block` that returns early without committing
-    /// (block ahead of the ledger, needing catchup) is observed in the
-    /// `ensure_block_failed` series instead of vanishing.
+    /// Issue #1761: an `ensure_block` skipped because the block is ahead of
+    /// the ledger (routine, needs catchup) has its own counter and is NOT
+    /// recorded as a failure.
     #[test]
-    fn ensure_block_ahead_of_ledger_early_return_is_observed() {
+    fn ensure_block_ahead_of_ledger_is_counted_as_skipped_not_failed() {
         let t = crate::follow_timing::follow_timing();
         let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
         let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
-        let failed = t.ensure_block_failed.count();
+        let skipped = t.ensure_block_skipped_ahead.get();
         let mut ahead = make_round1_block();
         ahead.round = Round(5);
         bridge.ensure_block(&ahead, &make_cert_with_proposal(5));
         assert!(
-            t.ensure_block_failed.count() > failed,
-            "ahead-of-ledger early return observed"
+            t.ensure_block_skipped_ahead.get() > skipped,
+            "ahead-of-ledger skip counted"
         );
     }
 

@@ -266,5 +266,47 @@ class MainSkipsNonHaltVerdictsTest(unittest.TestCase):
             self.assertEqual(rc, 0)
 
 
+class MainFilesInvalidBlockStallTest(unittest.TestCase):
+    """PR #1762 review: an invalid_block_stall verdict (exit 1) must file."""
+
+    def test_invalid_block_stall_verdict_files_through_main(self):
+        import contextlib
+        import io
+
+        verdict = {
+            "status": "invalid_block_stall",
+            "phase": "follow",
+            "round": 65_668_288,
+            "message": "node stalled on invalid block 65668288",
+            "stalled_since_s": 0.0,
+            "invalid_block_stall": {
+                "round": 65_668_288,
+                "error": "boom",
+                "consecutive_failures": 4,
+                "since_unix_secs": 1,
+            },
+        }
+        with tempfile.TemporaryDirectory() as d:
+            verdict_path = os.path.join(d, "verdict.json")
+            with open(verdict_path, "w") as f:
+                json.dump(verdict, f)
+            out = io.StringIO()
+            with patch("file_issue.subprocess.run") as run, contextlib.redirect_stdout(out):
+                run.return_value = MagicMock(returncode=0, stdout="[]", stderr="")
+                rc = file_issue.main(
+                    [
+                        "--repo", "owner/repo",
+                        "--verdict-json", verdict_path,
+                        "--template", TEMPLATE_PATH,
+                        "--run-url", "https://run",
+                        "--artifacts-url", "https://artifacts",
+                        "--dry-run",
+                    ]
+                )
+        self.assertEqual(rc, 0)
+        self.assertIn("would CREATE issue", out.getvalue())
+        self.assertIn("round: 65668288", out.getvalue().replace(",", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

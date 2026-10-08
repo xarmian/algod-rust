@@ -9,8 +9,8 @@
 # the same round before ever creating a new one, exactly the same
 # discipline `algod-issue-create` requires of a human filing one by hand.
 #
-# Only called for a `stuck` or `node_failure` verdict (`monitor.py`'s exit
-# code 1) -- `source_outage` (exit 2) and `ok` (exit 0) never reach this
+# Only called for a `stuck`, `node_failure` or `invalid_block_stall` verdict
+# (`monitor.py`'s exit code 1) -- `source_outage` (exit 2) and `ok` (exit 0) never reach this
 # script; see `monitor.py`'s module doc comment for why.
 #
 # `--dry-run` prints the exact title/labels/body this would file (or the
@@ -25,6 +25,10 @@ import re
 import subprocess
 import sys
 from string import Formatter
+
+import nodelog
+
+FILED_STATUSES = ("stuck", "node_failure", "invalid_block_stall")
 
 DEDUP_LABEL = "mainnet-soak"
 ISSUE_LABELS = ["bug", "sync", "conformance", "mainnet-soak", "algod:v5.0.2-stable", "effort:medium"]
@@ -52,11 +56,23 @@ def build_fields(verdict: dict, run_url: str, artifacts_url: str, log_excerpt: s
     stalled_s = verdict.get("stalled_since_s")
     catchpoint_label = verdict.get("catchpoint_label")
     stall = verdict.get("invalid_block_stall")
+    if stall:
+        halt_intro = (
+            f"reported **`stalled-on-invalid-block`** during `{phase}`: it is stuck on a "
+            "block that deterministically fails to apply, while the catchup peer's own "
+            "`/v2/status` proved the network was alive and ahead."
+        )
+    else:
+        halt_intro = (
+            f"it **halted during `{phase}`** \u2014 no observable progress for "
+            f"{(stalled_s or 0) / 60.0:.1f} minutes \u2014 while the catchup peer's own "
+            "`/v2/status` proved the network was alive and ahead the whole time."
+        )
     return {
+        "halt_intro": halt_intro,
         "invalid_block_stall_line": (
-            "\n- Node `/v2/status` `stalled-on-invalid-block` payload: "
-            f"`{json.dumps(stall, sort_keys=True)}` (round {stall.get('round')}, "
-            f"error: {stall.get('error')}, consecutive failures: {stall.get('consecutive_failures')})"
+            "\n- Node `/v2/status` `stalled-on-invalid-block` (as reported by the node): "
+            + nodelog.format_stall(stall)
             if stall
             else ""
         ),
@@ -198,9 +214,9 @@ def main(argv=None) -> int:
     with open(args.verdict_json, encoding="utf-8") as f:
         verdict = json.load(f)
 
-    if verdict.get("status") not in ("stuck", "node_failure"):
+    if verdict.get("status") not in FILED_STATUSES:
         print(
-            f"verdict status is {verdict.get('status')!r}, not stuck/node_failure -- "
+            f"verdict status is {verdict.get('status')!r}, not one of {'/'.join(FILED_STATUSES)} -- "
             "nothing to file",
             file=sys.stderr,
         )

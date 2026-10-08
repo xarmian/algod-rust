@@ -430,6 +430,35 @@ _PHASE_ROWS = [
 ]
 
 
+def sanitize_text(value, limit: int = 500, table: bool = False) -> str:
+    """Node-supplied text made safe for a markdown issue body or a table
+    cell: backticks become apostrophes, all whitespace (newlines included)
+    collapses to single spaces, `|` becomes `/` for a table cell, and the
+    result is truncated to `limit` characters."""
+    text = re.sub(r"\s+", " ", str(value).replace("`", "'")).strip()
+    if table:
+        text = text.replace("|", "/")
+    if len(text) > limit:
+        text = text[: max(limit - 3, 0)] + "..."
+    return text
+
+
+def format_stall(stall: dict, table: bool = False) -> str:
+    """`key: value` text for a `stalled-on-invalid-block` payload (never a
+    dict repr), sanitized."""
+    parts = []
+    for key, label in (
+        ("round", "round"),
+        ("error", "error"),
+        ("consecutive_failures", "consecutive failures"),
+        ("since_unix_secs", "since (unix s)"),
+        ("source", "source"),
+    ):
+        if stall.get(key) is not None:
+            parts.append(f"{label}: {stall[key]}")
+    return sanitize_text(", ".join(parts), 500, table)
+
+
 def render_markdown(summary: dict) -> str:
     """Markdown tables for the detailed phases, follow window and scan."""
     lines = []

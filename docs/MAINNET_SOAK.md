@@ -166,12 +166,18 @@ lag blocks are equal). The step summary prints both lag rows and the window.
 `stalled-on-invalid-block` object of `GET /v2/status` (`round`, `error`,
 `consecutive-failures`, `since-unix-secs`); when `/v2/status` does not answer
 the monitor falls back to the gauge `algod_rust_sync_stalled_on_invalid_block`
-on `/metrics` (`algod_rust_sync_stalled_block_round` gives the round). If either
-says the node is stalled, the verdict is `invalid_block_stall` (exit 1, the
+on `/metrics` (`algod_rust_sync_stalled_block_round` gives the round), read at
+most once per 30 s and only while the status is unavailable. If the latest
+sample says the node is stalled, the verdict is `invalid_block_stall` (exit 1, the
 run ends at once, the issue is filed): the message carries round, error and
 consecutive failures, and `summary.json` keeps the status payload under
 `invalid_block_stall` (also in the step summary and the auto-filed issue
-body). The log scan has a matching hard signature, `stalled_on_invalid_block`
+body; node-supplied text is stripped of backticks and newlines, `|` is
+replaced in table cells, and it is truncated to 500 characters). A stall that
+cleared (a valid block committed and later samples are healthy) does not fail the
+run: it is reported as `invalid_block_stall_cleared` (round, error, first and
+last time seen) and as a warning row in the step summary; an unreachable node at
+the end of the stream stays a `node_failure`. The log scan has a matching hard signature, `stalled_on_invalid_block`
 (the node's `stalled on invalid block` ERROR line). A healthy node is
 unaffected: the field is absent from its status and the gauge is only read
 while the status is unavailable.
@@ -186,7 +192,8 @@ and the successful `ensure_block` attempt (ledger-lock wait plus commit,
 excluding earlier failed attempts and retry sleeps). Failures are visible
 separately: `..._apply_failed_seconds`, `..._commit_failed_seconds` (a failed
 SQLite commit), `..._ensure_block_failed_seconds` (also observes the early
-returns that commit nothing: poisoned ledger lock, block ahead of the ledger),
+return of a poisoned ledger lock; the routine "block ahead of the ledger, needs
+catchup" skip is only counted by `..._ensure_block_skipped_ahead_total`),
 `..._ensure_block_retries_total` and `..._ensure_block_already_committed_total`.
 Once the node is out of catchup, `status.jsonl` samples carry the parsed
 cumulative histograms (`follow_timing`), scraped at most every 30 s with a 1 s
@@ -204,8 +211,12 @@ buckets are non-monotonic; then `restarted` is `true` and the post-restart
 absolute values are reported). A restart that processed more blocks than the
 baseline leaves every counter larger, so it is also detected by the node's
 `algod_rust_process_start_time_seconds` gauge (Unix seconds at process start,
-scraped with the histograms): a different value between the baseline and the
-last scrape marks the series `restarted` (older nodes without the gauge fall
+scraped with the histograms; float Unix seconds with millisecond resolution,
+captured as the first statement of `main`, compared for exact equality): a
+different value between the baseline and the last scrape marks the series
+`restarted`. The post-restart absolute values are reported, and
+`pre_tip_included: true` flags that the first post-restart scrape was taken
+before the node was at the tip, i.e. the values include catchup-era timings (older nodes without the gauge fall
 back to the counter checks). `/metrics` itself cannot 404 on the production
 adapter (the follow series and the start-time gauge are always exposed); the
 404 contract only remains for `NodeInterface` implementations with nothing to
