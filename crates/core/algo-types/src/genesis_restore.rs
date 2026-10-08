@@ -86,8 +86,9 @@
 //! helpers that run on a block some boundary already vetted (merkle
 //! commitments, tx-tail, strip) and have no error channel: it treats an
 //! unknown protocol as the modern rule (hash-requiring, stripped payset),
-//! which is also exactly what [`ConsensusParams::default`] (the current
-//! protocol) gives -- one explicit choice, pinned by a test (issue #1745).
+//! derived directly from [`ConsensusParams::default`] (the current protocol)
+//! so the two cannot drift -- one explicit choice, pinned by a test (issue
+//! #1745).
 
 use std::borrow::Cow;
 
@@ -289,8 +290,13 @@ impl<'a> GenesisRestoreRule<'a> {
     /// a block some boundary already vetted: an unknown protocol gets the
     /// modern rule (see the module docs), the same as `ConsensusParams::default()`.
     pub fn for_block(block: &'a Block) -> Self {
-        Self::try_for_block(block)
-            .unwrap_or_else(|_| Self::new(&block.genesis_id, &block.genesis_hash, true))
+        Self::try_for_block(block).unwrap_or_else(|_| {
+            Self::with_params(
+                &block.genesis_id,
+                &block.genesis_hash,
+                &ConsensusParams::default(),
+            )
+        })
     }
 
     /// Rule for `block`'s header from protocol params the caller already

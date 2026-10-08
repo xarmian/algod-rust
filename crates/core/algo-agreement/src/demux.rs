@@ -54,6 +54,63 @@ use crate::types::{Deadline, TimeoutType};
 use crate::vote::BOTTOM;
 use algo_types::Address;
 
+/// Longest protocol string echoed into a log line.
+const MAX_LOGGED_PROTOCOL_CHARS: usize = 64;
+/// Minimum seconds between unknown-protocol drop warnings.
+const UNKNOWN_PROTOCOL_LOG_INTERVAL_SECS: u64 = 10;
+
+static UNKNOWN_PROTOCOL_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static UNKNOWN_PROTOCOL_LAST_LOG: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Proposals dropped so far for naming an unknown consensus protocol.
+pub fn unknown_protocol_drop_count() -> u64 {
+    UNKNOWN_PROTOCOL_DROPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A peer-controlled protocol string made safe for a log line: at most
+/// [`MAX_LOGGED_PROTOCOL_CHARS`] characters, `{:?}`-escaped (no newlines or
+/// control characters can forge log lines).
+fn loggable_protocol(protocol: &str) -> String {
+    let truncated: String = protocol.chars().take(MAX_LOGGED_PROTOCOL_CHARS).collect();
+    format!("{truncated:?}")
+}
+
+/// True at most once per `interval_secs`; updates `last` when it fires.
+fn rate_limit_allows(
+    now_secs: u64,
+    last: &std::sync::atomic::AtomicU64,
+    interval_secs: u64,
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let prev = last.load(Relaxed);
+    (prev == 0 || now_secs.saturating_sub(prev) >= interval_secs)
+        && last
+            .compare_exchange(prev, now_secs.max(1), Relaxed, Relaxed)
+            .is_ok()
+}
+
+/// Count one unknown-protocol proposal drop and, rate-limited, warn with the
+/// escaped/truncated protocol and the running total.
+fn note_unknown_protocol_drop(protocol: &str) {
+    let total = UNKNOWN_PROTOCOL_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if rate_limit_allows(
+        now,
+        &UNKNOWN_PROTOCOL_LAST_LOG,
+        UNKNOWN_PROTOCOL_LOG_INTERVAL_SECS,
+    ) {
+        warn!(
+            protocol = %loggable_protocol(protocol),
+            total_dropped = total,
+            "dropping proposal for unknown consensus protocol (further drops counted, logged at most every {}s)",
+            UNKNOWN_PROTOCOL_LOG_INTERVAL_SECS
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Event queue names (for monitoring)
 // ---------------------------------------------------------------------------
@@ -710,12 +767,11 @@ impl Demux {
                             // Distinct from malformed bytes (decode errors
                             // below): the proposal decoded fine but names a
                             // protocol this node does not know. No peer
-                            // penalty change.
-                            warn!(
-                                protocol = %e.protocol,
-                                "dropping proposal for unknown consensus protocol: {}",
-                                e
-                            );
+                            // penalty change. This runs before any
+                            // authentication on a peer-controlled string, so
+                            // the string is escaped + truncated and the log
+                            // is rate-limited; every drop is counted.
+                            note_unknown_protocol_drop(&e.protocol);
                             return None;
                         }
                     };
@@ -1358,6 +1414,33 @@ mod tests {
     /// Issue #1728: a proposal naming a protocol this node does not know
     /// cannot have its payset decoded (go: `consensus protocol %s not
     /// found`); it is dropped (distinct warn text), without disconnecting.
+    /// Issue #1728 review: the peer-controlled protocol string is escaped and
+    /// truncated for logs, the warn is rate-limited, and every drop counts.
+    #[test]
+    fn unknown_protocol_log_helpers_truncate_escape_and_rate_limit() {
+        let evil = format!("a\nFAKE LOG LINE\u{1b}[31m{}", "x".repeat(500));
+        let shown = loggable_protocol(&evil);
+        assert!(
+            !shown.contains('\n') && !shown.contains('\u{1b}'),
+            "{shown}"
+        );
+        assert!(shown.chars().count() <= MAX_LOGGED_PROTOCOL_CHARS * 2 + 2);
+        assert!(shown.starts_with('"') && shown.ends_with('"'));
+
+        let last = std::sync::atomic::AtomicU64::new(0);
+        assert!(rate_limit_allows(1000, &last, 10));
+        assert!(!rate_limit_allows(1005, &last, 10));
+        assert!(rate_limit_allows(1010, &last, 10));
+        let fired = (0..10_000u64)
+            .filter(|i| rate_limit_allows(1010 + i / 1000, &last, 10))
+            .count();
+        assert!(fired <= 1, "a flood must log O(1) times, logged {fired}");
+
+        let before = unknown_protocol_drop_count();
+        note_unknown_protocol_drop("junk");
+        assert!(unknown_protocol_drop_count() > before);
+    }
+
     #[test]
     fn demux_raw_proposal_with_unknown_protocol_is_dropped() {
         let (demux, ..) = make_test_demux();

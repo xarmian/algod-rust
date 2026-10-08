@@ -928,6 +928,17 @@ thread_local! {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Number of compile-time walks (`built_in_consensus_params`) on this thread.
+    static BUILT_IN_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn built_in_walk_count() -> u64 {
+    BUILT_IN_WALKS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
 pub(crate) fn consensus_params_clone_count() -> u64 {
     PARAMS_CLONES.with(std::cell::Cell::get)
 }
@@ -970,9 +981,10 @@ pub fn genesis_flags_for_version(version: &str) -> Option<GenesisProtocolFlags> 
 /// a table built before [`install_consensus_overrides`] would therefore be
 /// stale after it. Two write-once tables avoid any invalidation: one used
 /// only while no override registry is installed, one built only after it is
-/// (the registry is itself write-once). A version outside the known list, or
-/// a lookup made while a table is being built (the walk's own recursive
-/// calls), computes straight from the compile-time walk.
+/// (the registry is itself write-once). A lookup made while a table is being
+/// built (the walk's own recursive calls) computes straight from the
+/// compile-time walk; a version outside [`KNOWN_PROTOCOL_VERSIONS`] is
+/// simply unknown.
 fn with_consensus_params<R>(version: &str, f: impl FnOnce(&ConsensusParams) -> R) -> Option<R> {
     type Table = HashMap<&'static str, ConsensusParams>;
     static BUILT_IN_BEFORE_INSTALL: std::sync::OnceLock<Table> = std::sync::OnceLock::new();
@@ -994,18 +1006,30 @@ fn with_consensus_params<R>(version: &str, f: impl FnOnce(&ConsensusParams) -> R
         &BUILT_IN_BEFORE_INSTALL
     };
     let table = cell.get_or_init(|| {
-        BUILDING_TABLE.with(|b| b.set(true));
-        let table = KNOWN_PROTOCOL_VERSIONS
+        // Reset on every exit, a panicking build included, so the flag can
+        // never stay stuck on this thread.
+        struct Building;
+        impl Building {
+            fn enter() -> Self {
+                BUILDING_TABLE.with(|b| b.set(true));
+                Building
+            }
+        }
+        impl Drop for Building {
+            fn drop(&mut self) {
+                BUILDING_TABLE.with(|b| b.set(false));
+            }
+        }
+        let _guard = Building::enter();
+        KNOWN_PROTOCOL_VERSIONS
             .iter()
             .filter_map(|&v| built_in_consensus_params(v).map(|p| (v, p)))
-            .collect();
-        BUILDING_TABLE.with(|b| b.set(false));
-        table
+            .collect()
     });
-    match table.get(version) {
-        Some(p) => Some(f(p)),
-        None => built_in_consensus_params(version).as_ref().map(f),
-    }
+    // `KNOWN_PROTOCOL_VERSIONS` is the authoritative built-in set, so a miss
+    // is a hash probe, not a walk: a peer-controlled protocol string (e.g. in
+    // a gossiped proposal) cannot make every lookup rebuild the table.
+    table.get(version).map(f)
 }
 
 /// Return consensus parameters for the given protocol version string.
@@ -1042,6 +1066,8 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
 /// `consensus.json` overrides (the walk [`consensus_params_for_version`]'s
 /// doc describes).
 fn built_in_consensus_params(version: &str) -> Option<ConsensusParams> {
+    #[cfg(test)]
+    BUILT_IN_WALKS.with(|c| c.set(c.get() + 1));
     // Build the v7 base and walk forward to find the right version.
     // This mirrors go-algorand's initConsensusProtocols exactly.
 
@@ -2389,6 +2415,17 @@ static CONSENSUS_OVERRIDES: std::sync::OnceLock<HashMap<String, Option<Consensus
 /// harmless redundant call. `OnceLock` guarantees the read side
 /// ([`consensus_params_for_version`]) never observes a partially-written
 /// map from any thread, without needing a lock on the read path.
+///
+/// # Ordering assumption
+///
+/// The built-in lookup tables behind [`consensus_params_for_version`] are
+/// split into a before-install and an after-install copy (a later version's
+/// built-in definition is derived from its predecessor *through* that
+/// lookup, so it inherits an overridden ancestor). That is only coherent if
+/// the install happens at startup before concurrent lookups begin, which is
+/// the contract above. A `debug_assert` that no lookup preceded the install
+/// is deliberately not added: unit/integration tests legitimately look up
+/// first to prove pre-install behaviour.
 pub fn install_consensus_overrides(merged: &HashMap<String, ConsensusParams>) {
     // Computed before any lookup could possibly observe a partially-applied
     // registry (`CONSENSUS_OVERRIDES` is not yet set while this runs), so
@@ -2515,6 +2552,26 @@ pub fn save_configurable_consensus(
 
 #[cfg(test)]
 mod tests {
+    /// A peer-controlled, unknown protocol string must cost a hash probe,
+    /// not a rebuild of the built-in walk (issue #1728 review).
+    #[test]
+    fn unknown_version_lookups_do_not_run_the_built_in_walk() {
+        // Warm the one-time built-in table (its build walks).
+        assert!(genesis_flags_for_version(CONSENSUS_V41).is_some());
+        let walks = built_in_walk_count();
+        let clones = consensus_params_clone_count();
+        for i in 0..10_000 {
+            assert!(genesis_flags_for_version(&format!("junk-{i}")).is_none());
+        }
+        assert!(consensus_params_for_version("junk").is_none());
+        assert_eq!(
+            built_in_walk_count(),
+            walks,
+            "unknown versions must not walk"
+        );
+        assert_eq!(consensus_params_clone_count(), clones + 1);
+    }
+
     use super::*;
 
     #[test]
