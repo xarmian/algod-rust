@@ -917,6 +917,71 @@ impl Default for ConsensusParams {
     }
 }
 
+thread_local! {
+    /// Number of [`consensus_params_for_version`] calls made by this thread
+    /// (each rebuilds and clones a whole [`ConsensusParams`]). Test
+    /// instrumentation for [`consensus_params_lookup_count`].
+    static PARAMS_LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times the calling thread has run [`consensus_params_for_version`]
+/// (a full `ConsensusParams` rebuild + clone). Lets tests prove a hot path
+/// (genesis restore, issue #1728) does no per-block parameter lookup: take the
+/// count before and after and compare. Not part of any protocol behaviour.
+#[doc(hidden)]
+pub fn consensus_params_lookup_count() -> u64 {
+    PARAMS_LOOKUPS.with(std::cell::Cell::get)
+}
+
+/// The two per-protocol booleans block payset genesis-field handling needs
+/// (go `DecodeSignedTxn`, `data/bookkeeping/block.go:983-1020`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GenesisProtocolFlags {
+    /// go `RequireGenesisHash` (v16+).
+    pub require_genesis_hash: bool,
+    /// go `SupportSignedTxnInBlock` (v11+).
+    pub support_signed_txn_in_block: bool,
+}
+
+impl GenesisProtocolFlags {
+    fn of(p: &ConsensusParams) -> Self {
+        Self {
+            require_genesis_hash: p.require_genesis_hash,
+            support_signed_txn_in_block: p.support_signed_txn_in_block,
+        }
+    }
+}
+
+/// [`GenesisProtocolFlags`] for `version`, with the same answer
+/// [`consensus_params_for_version`] would give (`None`: unknown protocol) but
+/// without rebuilding or cloning a [`ConsensusParams`]: a loaded
+/// `consensus.json` override is read in place, everything else comes from a
+/// table built once from the built-in protocols (issue #1728).
+pub fn genesis_flags_for_version(version: &str) -> Option<GenesisProtocolFlags> {
+    if let Some(entry) = CONSENSUS_OVERRIDES
+        .get()
+        .and_then(|overrides| overrides.get(version))
+    {
+        return entry.as_ref().map(GenesisProtocolFlags::of);
+    }
+    static BUILT_IN: std::sync::OnceLock<HashMap<&'static str, GenesisProtocolFlags>> =
+        std::sync::OnceLock::new();
+    BUILT_IN
+        .get_or_init(|| {
+            // Only versions absent from the override registry are ever read
+            // back from here, and for those the lookup is the compile-time
+            // table whether or not overrides were installed first.
+            KNOWN_PROTOCOL_VERSIONS
+                .iter()
+                .filter_map(|&v| {
+                    consensus_params_for_version(v).map(|p| (v, GenesisProtocolFlags::of(&p)))
+                })
+                .collect()
+        })
+        .get(version)
+        .copied()
+}
+
 /// Return consensus parameters for the given protocol version string.
 ///
 /// All values match go-algorand `config/consensus.go` at tag v4.6.0-stable.
@@ -942,6 +1007,7 @@ impl Default for ConsensusParams {
 /// exact same compile-time computation below as before this feature
 /// existed -- zero behavior change.
 pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
+    PARAMS_LOOKUPS.with(|c| c.set(c.get() + 1));
     if let Some(overrides) = CONSENSUS_OVERRIDES.get() {
         if let Some(entry) = overrides.get(version) {
             return entry.clone();

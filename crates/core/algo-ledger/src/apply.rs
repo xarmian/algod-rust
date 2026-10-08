@@ -1620,14 +1620,17 @@ pub(crate) fn apply_block_impl_ex<L: crate::store_trait::LedgerStore>(
     // context below and the txtail builder at the end.
     let consensus =
         consensus_params_for_version(&block.current_protocol).ok_or_else(|| AlgoError::Ledger {
-            message: format!("unknown protocol version: {}", block.current_protocol),
+            message: algo_types::genesis_restore::UnknownProtocolError {
+                protocol: block.current_protocol.clone(),
+            }
+            .to_string(),
         })?;
     // The genesis-restore rule is built from those params (no second
     // lookup) and shared by the Execute-mode evaluation copy below and the
     // txtail builder at the end (issue #1707), which hashes the stripped
     // `stored_block` with the restored genesis fields as overrides.
     let genesis_rule =
-        algo_types::genesis_restore::GenesisRestoreRule::for_params(Some(&consensus), stored_block);
+        algo_types::genesis_restore::GenesisRestoreRule::for_params(&consensus, stored_block);
     // go's `DecodePaysetGroups` fails the whole block on a payset entry that
     // violates `DecodeSignedTxn`'s stripped-form rules (issue #1727): one
     // pass of pure compares on the rule just resolved. A payset still

@@ -770,7 +770,8 @@ impl AlgodNodeInterface {
             };
             let block = decode_block(&bytes)
                 .map_err(|e| NodeError::Internal(format!("decode_block({round}): {e}")))?;
-            let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(&block);
+            let rule = algo_types::genesis_restore::GenesisRestoreRule::try_for_block(&block)
+                .map_err(|e| NodeError::Internal(format!("block {round}: {e}")))?;
             for stx in &block.payset {
                 // Restore the genesis fields the block's STIB encoding strips so
                 // the id matches the submitter's and the response carries the
@@ -843,7 +844,8 @@ impl AlgodNodeInterface {
             };
             let block = decode_block(&bytes)
                 .map_err(|e| NodeError::Internal(format!("decode_block({round}): {e}")))?;
-            let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(&block);
+            let rule = algo_types::genesis_restore::GenesisRestoreRule::try_for_block(&block)
+                .map_err(|e| NodeError::Internal(format!("block {round}: {e}")))?;
             for stx in &block.payset {
                 if compute_txn_id(&rule.restored_txn(stx)) == txid {
                     return Ok(true);
@@ -4405,7 +4407,7 @@ mod tests {
             algo_validate::merkle::compute_payset_merkle_root(&block).as_slice(),
             "txn_commitment must match the stripped-form payset commitment"
         );
-        let restored = algo_validate::restore_payset_genesis_fields(&block);
+        let restored = algo_validate::restore_payset_genesis_fields(&block).unwrap();
         assert_eq!(restored[0].txn.genesis_id, genesis_id);
         assert_eq!(compute_txn_id(&restored[0].txn), txid);
     }

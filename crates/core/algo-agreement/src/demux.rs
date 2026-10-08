@@ -701,8 +701,21 @@ impl Demux {
                 // The payset strips genesis ID/hash; the group ID commits to
                 // the full transaction, so restore them from the block
                 // header first (issue #1686).
+                // An unknown protocol is go's `consensus protocol %s not
+                // found` decode failure (issue #1728): drop the proposal.
                 let restored =
-                    algo_validate::restore_payset_genesis_fields(&compound.proposal.block);
+                    match algo_validate::restore_payset_genesis_fields(&compound.proposal.block) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!(
+                                len = msg.data.len(),
+                                prefix = %hex_prefix(&msg.data, 96),
+                                "dropping proposal whose payset cannot be decoded: {}",
+                                e
+                            );
+                            return None;
+                        }
+                    };
                 if let Err(e) = algo_validate::validate_transaction_group(&restored) {
                     warn!(
                         len = msg.data.len(),

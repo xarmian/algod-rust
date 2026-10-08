@@ -24,7 +24,7 @@
 
 use algo_types::consensus::{CONSENSUS_V15, CONSENSUS_V41};
 use algo_types::{Block, SignedTransaction};
-use algo_validate::merkle::compute_payset_merkle_root;
+use algo_validate::merkle::{compute_payset_merkle_root, compute_payset_merkle_root_raw, HashAlgo};
 use algo_validate::restore_payset_genesis_fields;
 
 fn block(proto: &str, hgh: bool, header_gh: [u8; 32]) -> Block {
@@ -51,7 +51,7 @@ fn block(proto: &str, hgh: bool, header_gh: [u8; 32]) -> Block {
 #[test]
 fn hash_optional_protocol_without_hgh_keeps_gh_omitted() {
     let b = block(CONSENSUS_V15, false, [9u8; 32]);
-    let r = restore_payset_genesis_fields(&b);
+    let r = restore_payset_genesis_fields(&b).unwrap();
     assert_eq!(r[0].txn.genesis_hash, [0u8; 32]);
     assert_eq!(r[0].txn.genesis_id, "gid");
     // Merkle leaf txid is computed over the same (gh-less) txn: identical to
@@ -68,7 +68,9 @@ fn hash_optional_protocol_without_hgh_keeps_gh_omitted() {
 fn hash_optional_protocol_with_hgh_restores_gh() {
     let b = block(CONSENSUS_V15, true, [9u8; 32]);
     assert_eq!(
-        restore_payset_genesis_fields(&b)[0].txn.genesis_hash,
+        restore_payset_genesis_fields(&b).unwrap()[0]
+            .txn
+            .genesis_hash,
         [9u8; 32]
     );
     let mut no_hash_header = b.clone();
@@ -83,24 +85,47 @@ fn hash_optional_protocol_with_hgh_restores_gh() {
 fn hash_required_protocol_restores_gh_without_hgh() {
     let b = block(CONSENSUS_V41, false, [9u8; 32]);
     assert_eq!(
-        restore_payset_genesis_fields(&b)[0].txn.genesis_hash,
+        restore_payset_genesis_fields(&b).unwrap()[0]
+            .txn
+            .genesis_hash,
         [9u8; 32]
     );
 }
 
-/// Unknown protocol: validate_block reports it explicitly (go: "consensus
-/// protocol not found") and restoration agrees by treating it as
-/// hash-requiring (never silently hash-optional).
+/// Unknown protocol: `validate_block` reports it explicitly (go: "consensus
+/// protocol not found") and so does restoration -- an error, never a silent
+/// guess (issue #1728).
 #[test]
-fn unknown_protocol_is_rejected_and_restored_as_hash_requiring() {
+fn unknown_protocol_is_rejected_by_validate_and_restore() {
     let b = block("no-such-protocol", false, [9u8; 32]);
+    let err = restore_payset_genesis_fields(&b).unwrap_err();
     assert_eq!(
-        restore_payset_genesis_fields(&b)[0].txn.genesis_hash,
-        [9u8; 32]
+        err.to_string(),
+        "consensus protocol no-such-protocol not found"
     );
     let res = algo_validate::validate_block(&b, None, "gid", &[9u8; 32], None);
     assert!(res.errors.iter().any(|e| matches!(
         e,
         algo_validate::BlockValidationError::UnknownProtocolVersion { .. }
     )));
+}
+
+/// Issue #1728: the merkle / vector-commitment leaf builders resolve the
+/// genesis rule per block; none of them may rebuild and clone a whole
+/// `ConsensusParams` to do it.
+#[test]
+fn commitment_builders_do_no_consensus_params_lookup() {
+    use algo_types::consensus::{consensus_params_lookup_count, genesis_flags_for_version};
+    let _ = genesis_flags_for_version(CONSENSUS_V41); // warm the one-time table
+    for proto in [CONSENSUS_V15, CONSENSUS_V41] {
+        let b = block(proto, true, [9u8; 32]);
+        let blobs = vec![vec![0x80u8]];
+        let before = consensus_params_lookup_count();
+        let _ = compute_payset_merkle_root(&b);
+        let _ = compute_payset_merkle_root_raw(&b, &blobs);
+        let _ = algo_validate::merkle::compute_vector_commitment(&b, HashAlgo::Sha256);
+        let _ = algo_validate::merkle::compute_vector_commitment_raw(&b, HashAlgo::Sha512, &blobs);
+        let _ = restore_payset_genesis_fields(&b).unwrap();
+        assert_eq!(consensus_params_lookup_count(), before, "{proto}");
+    }
 }

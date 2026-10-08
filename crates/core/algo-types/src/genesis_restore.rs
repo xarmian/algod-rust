@@ -39,7 +39,7 @@
 //! go also returns the txn untouched (no restore, no checks) when the
 //! protocol lacks `SupportSignedTxnInBlock` (pre-v11); a rule built from a
 //! pre-v11 protocol ([`GenesisRestoreRule::for_params`] / `for_block`) does
-//! the same. [`GenesisRestoreRule::new`] assumes a supporting protocol.
+//! the same.
 //!
 //! go rejects a stripped txn that still carries a non-empty `gen`/`gh`, or
 //! `hgh` where `RequireGenesisHash` obviates it
@@ -71,19 +71,49 @@
 //! the decoders here, which accept both shapes into one struct.
 //!
 //! A block whose `current_protocol` is not in the consensus table cannot
-//! occur on a supported network; it is treated as hash-requiring (modern),
-//! the behaviour every pre-#1704 caller but one already had.
+//! occur on a supported network, and go fails the decode with
+//! `consensus protocol %s not found`. Boundaries that can report an error
+//! (ledger apply, `validate_block`, REST, the node interface, proposal
+//! screening) use the fallible [`GenesisRestoreRule::try_for_block`] /
+//! [`restore_payset_genesis_fields`] and surface [`UnknownProtocolError`]
+//! (issue #1728). The infallible [`GenesisRestoreRule::for_block`] is for
+//! helpers that run on a block some boundary already vetted (merkle
+//! commitments, tx-tail, strip) and have no error channel: it treats an
+//! unknown protocol as the modern rule (hash-requiring, stripped payset),
+//! which is also exactly what [`ConsensusParams::default`] (the current
+//! protocol) gives -- one explicit choice, pinned by a test (issue #1745).
 
 use std::borrow::Cow;
 
-use crate::consensus::{consensus_params_for_version, ConsensusParams};
+use crate::consensus::{genesis_flags_for_version, ConsensusParams};
 use crate::{Block, SignedTransaction, Transaction};
 
 /// Whether `proto` has go's `RequireGenesisHash` set (unknown protocol:
-/// `true`, see the module docs).
+/// `true`, see the module docs). Allocation-free: reads the two flags
+/// directly instead of rebuilding a [`ConsensusParams`] (issue #1728).
 pub fn protocol_requires_genesis_hash(proto: &str) -> bool {
-    consensus_params_for_version(proto).is_none_or(|p| p.require_genesis_hash)
+    genesis_flags_for_version(proto).is_none_or(|f| f.require_genesis_hash)
 }
+
+/// A block's `current_protocol` is not in the consensus table (go:
+/// `consensus protocol %s not found`, `BlockHeader.DecodeSignedTxn`,
+/// `data/bookkeeping/block.go`). Returned by the fallible entry points
+/// ([`GenesisRestoreRule::try_for_block`], [`restore_payset_genesis_fields`])
+/// that sit at a boundary with an error channel (apply, REST, node
+/// interface, proposal screening).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnknownProtocolError {
+    /// The unrecognised `current_protocol` string.
+    pub protocol: String,
+}
+
+impl std::fmt::Display for UnknownProtocolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "consensus protocol {} not found", self.protocol)
+    }
+}
+
+impl std::error::Error for UnknownProtocolError {}
 
 /// A client-submitted transaction carried an in-block-only field. go's
 /// `SignedTxn` (`data/transactions/signedtxn.go`) has no `hgi`/`hgh`, so its
@@ -171,7 +201,7 @@ impl std::fmt::Display for GenesisFieldError {
 impl std::error::Error for GenesisFieldError {}
 
 /// A block header's genesis-restoration rule, resolved ONCE per payset (the
-/// protocol lookup rebuilds `ConsensusParams`, so it must not run per
+/// protocol lookup is two flag reads, but still not something to repeat per
 /// transaction).
 #[derive(Clone, Copy, Debug)]
 pub struct GenesisRestoreRule<'a> {
@@ -201,11 +231,7 @@ impl<'a> GenesisRestoreRule<'a> {
     /// Rule from explicit header fields and the protocol's
     /// `RequireGenesisHash` (the protocol is assumed to support
     /// `SignedTxnInBlock`, i.e. v11+).
-    pub fn new(
-        genesis_id: &'a str,
-        genesis_hash: &'a [u8; 32],
-        require_genesis_hash: bool,
-    ) -> Self {
+    fn new(genesis_id: &'a str, genesis_hash: &'a [u8; 32], require_genesis_hash: bool) -> Self {
         Self {
             genesis_id,
             genesis_hash,
@@ -228,23 +254,38 @@ impl<'a> GenesisRestoreRule<'a> {
         rule
     }
 
-    /// Rule for `block`'s header and `current_protocol` (one protocol lookup).
-    pub fn for_block(block: &'a Block) -> Self {
-        Self::for_params(
-            consensus_params_for_version(&block.current_protocol).as_ref(),
-            block,
-        )
+    /// Rule for `block`'s header and `current_protocol`, or go's
+    /// `consensus protocol %s not found` for an unknown protocol. Two flag
+    /// reads, no `ConsensusParams` rebuild. Use this wherever an error can
+    /// be reported.
+    pub fn try_for_block(block: &'a Block) -> Result<Self, UnknownProtocolError> {
+        let flags = genesis_flags_for_version(&block.current_protocol).ok_or_else(|| {
+            UnknownProtocolError {
+                protocol: block.current_protocol.clone(),
+            }
+        })?;
+        let mut rule = Self::new(
+            &block.genesis_id,
+            &block.genesis_hash,
+            flags.require_genesis_hash,
+        );
+        rule.supports_stripped = flags.support_signed_txn_in_block;
+        Ok(rule)
     }
 
-    /// Rule for `block`'s header from the protocol params the caller already
-    /// resolved (`None`: unknown protocol, treated as hash-requiring and
-    /// stripped-supporting, see the module docs), so a caller that needs the
-    /// params anyway does ONE lookup per block.
-    pub fn for_params(params: Option<&ConsensusParams>, block: &'a Block) -> Self {
-        match params {
-            Some(p) => Self::with_params(&block.genesis_id, &block.genesis_hash, p),
-            None => Self::new(&block.genesis_id, &block.genesis_hash, true),
-        }
+    /// [`Self::try_for_block`] for helpers with no error channel that run on
+    /// a block some boundary already vetted: an unknown protocol gets the
+    /// modern rule (see the module docs), the same as `ConsensusParams::default()`.
+    pub fn for_block(block: &'a Block) -> Self {
+        Self::try_for_block(block)
+            .unwrap_or_else(|_| Self::new(&block.genesis_id, &block.genesis_hash, true))
+    }
+
+    /// Rule for `block`'s header from protocol params the caller already
+    /// resolved, so a caller that needs the params anyway does ONE lookup
+    /// per block.
+    pub fn for_params(params: &ConsensusParams, block: &'a Block) -> Self {
+        Self::with_params(&block.genesis_id, &block.genesis_hash, params)
     }
 
     /// Copy of `payset` with every txn's genesis fields restored.
@@ -384,23 +425,21 @@ impl<'a> GenesisRestoreRule<'a> {
     }
 }
 
-/// Fill the genesis fields `stx` had stripped, from `block`'s header and
-/// protocol ([`GenesisRestoreRule::for_block`], so the
-/// `SupportSignedTxnInBlock` gate applies).
-pub fn restore_genesis_fields(stx: &mut SignedTransaction, block: &Block) {
-    GenesisRestoreRule::for_block(block).restore(stx);
-}
-
 /// Copy of the payset with every transaction's genesis fields restored
-/// (go: `Block.DecodePaysetFlat`).
-pub fn restore_payset_genesis_fields(block: &Block) -> Vec<SignedTransaction> {
-    GenesisRestoreRule::for_block(block).restore_payset(&block.payset)
+/// (go: `Block.DecodePaysetFlat`), or [`UnknownProtocolError`] for a block
+/// whose protocol is not in the consensus table.
+pub fn restore_payset_genesis_fields(
+    block: &Block,
+) -> Result<Vec<SignedTransaction>, UnknownProtocolError> {
+    Ok(GenesisRestoreRule::try_for_block(block)?.restore_payset(&block.payset))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consensus::{CONSENSUS_V10, CONSENSUS_V15, CONSENSUS_V16, CONSENSUS_V41};
+    use crate::consensus::{
+        consensus_params_for_version, CONSENSUS_V10, CONSENSUS_V15, CONSENSUS_V16, CONSENSUS_V41,
+    };
 
     const GID: &str = "gid";
     const GH: [u8; 32] = [9u8; 32];
@@ -425,7 +464,7 @@ mod tests {
         assert!(!protocol_requires_genesis_hash(CONSENSUS_V15));
         for hgi in [false, true] {
             let b = block(CONSENSUS_V15, hgi, false);
-            let r = restore_payset_genesis_fields(&b);
+            let r = restore_payset_genesis_fields(&b).unwrap();
             assert_eq!(r[0].txn.genesis_hash, [0u8; 32]);
             assert_eq!(
                 *GenesisRestoreRule::for_block(&b).restored_txn(&b.payset[0]),
@@ -438,7 +477,7 @@ mod tests {
     #[test]
     fn legacy_optional_hash_with_hgh_restores() {
         let b = block(CONSENSUS_V15, false, true);
-        let r = restore_payset_genesis_fields(&b);
+        let r = restore_payset_genesis_fields(&b).unwrap();
         assert_eq!(r[0].txn.genesis_hash, GH);
         assert_eq!(r[0].txn.genesis_id, "", "gen is gated on hgi only");
         assert_eq!(
@@ -452,7 +491,7 @@ mod tests {
         for proto in [CONSENSUS_V16, CONSENSUS_V41] {
             assert!(protocol_requires_genesis_hash(proto));
             let b = block(proto, true, false);
-            let r = restore_payset_genesis_fields(&b);
+            let r = restore_payset_genesis_fields(&b).unwrap();
             assert_eq!(r[0].txn.genesis_hash, GH);
             assert_eq!(r[0].txn.genesis_id, GID);
             assert_eq!(
@@ -643,7 +682,7 @@ mod tests {
             let params = consensus_params_for_version(proto).unwrap();
             let b = block(proto, true, false);
             let a = GenesisRestoreRule::with_params(GID, &gh, &params);
-            let c = GenesisRestoreRule::for_params(Some(&params), &b);
+            let c = GenesisRestoreRule::for_params(&params, &b);
             for stx in [
                 stripped("", [0; 32], true, false),
                 stripped(GID, GH, false, false),
@@ -664,7 +703,7 @@ mod tests {
         let mut params = consensus_params_for_version(CONSENSUS_V41).unwrap();
         params.payset_commit = 0;
         let b = block(CONSENSUS_V41, true, false);
-        let rule = GenesisRestoreRule::for_params(Some(&params), &b);
+        let rule = GenesisRestoreRule::for_params(&params, &b);
         assert_eq!(rule.restored_txn(&b.payset[0]).genesis_id, GID);
         assert_eq!(rule.restored_txn(&b.payset[0]).genesis_hash, GH);
         assert_eq!(
@@ -680,9 +719,9 @@ mod tests {
     #[test]
     fn restoration_is_idempotent() {
         let b = block(CONSENSUS_V15, true, true);
-        let once = restore_payset_genesis_fields(&b);
+        let once = restore_payset_genesis_fields(&b).unwrap();
         let mut twice = once.clone();
-        restore_genesis_fields(&mut twice[0], &b);
+        GenesisRestoreRule::for_block(&b).restore(&mut twice[0]);
         assert_eq!(once, twice);
     }
 
@@ -725,6 +764,94 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    // ── Issue #1728: bool-only protocol lookup, unknown protocol ────────
+
+    /// The allocation-free lookup must agree with the full parameter table
+    /// for every protocol this node knows (and be absent for unknown ones).
+    #[test]
+    fn genesis_flags_lookup_matches_full_params_for_every_known_protocol() {
+        use crate::consensus::{genesis_flags_for_version, KNOWN_PROTOCOL_VERSIONS};
+        for &proto in KNOWN_PROTOCOL_VERSIONS {
+            let full = consensus_params_for_version(proto).expect(proto);
+            let flags = genesis_flags_for_version(proto).expect(proto);
+            assert_eq!(
+                flags.require_genesis_hash, full.require_genesis_hash,
+                "{proto}"
+            );
+            assert_eq!(
+                flags.support_signed_txn_in_block, full.support_signed_txn_in_block,
+                "{proto}"
+            );
+            assert_eq!(
+                protocol_requires_genesis_hash(proto),
+                full.require_genesis_hash
+            );
+        }
+        assert!(genesis_flags_for_version("nonsense").is_none());
+    }
+
+    /// Building a rule and restoring a payset must not rebuild/clone the
+    /// consensus parameter table (`consensus_params_for_version`) per block.
+    #[test]
+    fn rule_construction_and_restore_do_no_params_lookup() {
+        use crate::consensus::{consensus_params_lookup_count, genesis_flags_for_version};
+        // Warm the one-time built-in flag cache.
+        let _ = genesis_flags_for_version(CONSENSUS_V41);
+        let before = consensus_params_lookup_count();
+        for proto in [CONSENSUS_V10, CONSENSUS_V15, CONSENSUS_V41] {
+            let b = block(proto, true, true);
+            let rule = GenesisRestoreRule::for_block(&b);
+            let _ = rule.restore_payset(&b.payset);
+            let _ = protocol_requires_genesis_hash(proto);
+            let _ = restore_payset_genesis_fields(&b).unwrap();
+        }
+        assert_eq!(
+            consensus_params_lookup_count(),
+            before,
+            "no ConsensusParams rebuild/clone in the restore paths"
+        );
+    }
+
+    /// go: `consensus protocol %s not found` (block.go DecodeSignedTxn).
+    #[test]
+    fn try_for_block_errors_on_unknown_protocol_like_go() {
+        let b = block("future-nonsense", true, false);
+        let err = GenesisRestoreRule::try_for_block(&b).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "consensus protocol future-nonsense not found"
+        );
+        assert!(GenesisRestoreRule::try_for_block(&block(CONSENSUS_V41, true, false)).is_ok());
+        // The infallible helper keeps its documented modern fallback.
+        let lenient = GenesisRestoreRule::for_block(&b);
+        assert!(lenient.needs_restore(&b.payset[0]));
+        assert!(restore_payset_genesis_fields(&b).is_err());
+    }
+
+    /// The default-params rule and the unknown-protocol fallback are the same
+    /// (modern) rule: one explicit choice (issue #1745).
+    #[test]
+    fn default_params_rule_equals_unknown_protocol_fallback() {
+        let gh = GH;
+        let b = block("future-nonsense", true, false);
+        let fallback = GenesisRestoreRule::for_block(&b);
+        let from_default = GenesisRestoreRule::with_params(GID, &gh, &ConsensusParams::default());
+        for stx in [
+            stripped("", [0; 32], true, false),
+            stripped(GID, GH, false, false),
+            stripped("", [0; 32], false, true),
+        ] {
+            assert_eq!(
+                *fallback.restored_txn(&stx),
+                *from_default.restored_txn(&stx)
+            );
+            assert_eq!(
+                fallback.check_stripped(&stx),
+                from_default.check_stripped(&stx)
+            );
         }
     }
 }

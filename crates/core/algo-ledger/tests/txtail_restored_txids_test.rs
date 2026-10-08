@@ -130,3 +130,41 @@ fn replay_and_execute_record_identical_txtail() {
     let e = exec.get_txtail(1).unwrap().expect("execute txtail");
     assert_eq!(r, e, "Replay and Execute must record identical txtail rows");
 }
+
+/// Issue #1728: a hash-optional protocol applied end to end in EXECUTE mode
+/// (payment-only: apps predate V16 hash-optional blocks). The payment must
+/// execute, and the txtail must hold the id of the txn as signed (gh
+/// omitted) -- the same id the payset merkle leaf is built over.
+#[test]
+fn hash_optional_execute_apply_records_gh_less_txid_and_moves_funds() {
+    let b = block(CONSENSUS_V15, false);
+    let mut full = b.payset[0].txn.clone();
+    full.genesis_id = GENESIS_ID.to_string();
+    let mut s = state();
+    apply_block_with_mode(&mut s, &b, ApplyMode::Execute).unwrap();
+    assert!(dup_cache(&s).contains(&txid(&full)));
+    assert_eq!(
+        s.get_or_default_account_mut(&Address([2u8; 32]))
+            .micro_algos,
+        1_000_000,
+        "the payment executed"
+    );
+    // The stored block stays stripped (no gen/gh leaks into storage).
+    assert_eq!(b.payset[0].txn.genesis_id, "");
+}
+
+/// Issue #1728: go fails the decode with `consensus protocol %s not found`;
+/// apply reports exactly that for an unknown protocol (every apply mode).
+#[test]
+fn apply_rejects_unknown_protocol_with_go_message() {
+    let b = block("no-such-protocol", false);
+    for mode in [ApplyMode::Replay, ApplyMode::Execute] {
+        let mut s = state();
+        let err = apply_block_with_mode(&mut s, &b, mode).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("consensus protocol no-such-protocol not found"),
+            "{mode:?}: {err}"
+        );
+    }
+}

@@ -5353,6 +5353,112 @@ async fn get_block_txids_restores_genesis_hash_per_protocol() {
     }
 }
 
+/// A stripped (STIB) payment as a hash-optional (V15) block stores it: `gen`
+/// elided via `hgi`, `gh` omitted and `hgh` unset.
+fn legacy_stripped_txn(txn_type: TxnType) -> (SignedTransaction, Transaction) {
+    let stripped = SignedTransaction {
+        txn: Transaction {
+            txn_type,
+            sender: Address([1u8; 32]),
+            fee: 1000,
+            first_valid: Round(1),
+            last_valid: Round(1000),
+            application_id: 42,
+            ..Transaction::default()
+        },
+        has_genesis_id: true,
+        has_genesis_hash: false,
+        ..SignedTransaction::default()
+    };
+    let mut full = stripped.txn.clone();
+    full.genesis_id = "testnet-v1.0".to_string();
+    (stripped, full)
+}
+
+/// Issue #1728: `get_block_logs` on a hash-optional (V15) block with `hgh`
+/// unset reports the outer txid of the txn as signed (gh absent).
+#[tokio::test]
+async fn get_block_logs_on_v15_block_with_hgh_unset_uses_gh_less_txid() {
+    let (mut stripped, full) = legacy_stripped_txn(TxnType::Appl);
+    stripped.eval_delta = Some(rmpv::Value::Map(vec![(
+        rmpv::Value::String("lg".into()),
+        rmpv::Value::Array(vec![rmpv::Value::Binary(b"hi".to_vec())]),
+    )]));
+    let mut block = make_test_block(1, vec![stripped]);
+    block.current_protocol = algo_types::consensus::CONSENSUS_V15.to_string();
+    let mut node = MockNode::synced();
+    node.blocks.insert(1, block);
+    let server = TestServer::start(node).await;
+    let resp = server
+        .client
+        .get(server.url("/v2/blocks/1/logs"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["logs"][0]["txId"].as_str().unwrap(),
+        algo_codec::compute_txn_id(&full).to_string()
+    );
+}
+
+/// Issue #1728: Merkle proofs need `PaysetCommit=merkle` (v26+), which every
+/// built-in protocol pairs with `RequireGenesisHash`; a V15 block (hgh unset)
+/// is a clean 404 "protocol does not support Merkle proofs", not a 500 from
+/// the genesis-restore rule. (The hash-optional + merkle combination a custom
+/// `consensus.json` could define is covered by the `TxnMerkleArray` unit test.)
+#[tokio::test]
+async fn get_transaction_proof_on_v15_block_is_not_found_not_an_error() {
+    let (stripped, full) = legacy_stripped_txn(TxnType::Pay);
+    let txid = algo_codec::compute_txn_id(&full).to_string();
+    let mut block = make_test_block(1, vec![stripped]);
+    block.current_protocol = algo_types::consensus::CONSENSUS_V15.to_string();
+    let mut node = MockNode::synced();
+    node.blocks.insert(1, block);
+    let server = TestServer::start(node).await;
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/blocks/1/transactions/{txid}/proof")))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["message"].as_str().unwrap().contains("Merkle proofs"));
+}
+
+/// Issue #1728: a block whose protocol is not in the consensus table is go's
+/// `consensus protocol %s not found` decode failure -- a 500, not a silent
+/// hash-requiring guess.
+#[tokio::test]
+async fn block_txids_and_logs_on_unknown_protocol_are_errors() {
+    let (stripped, _) = legacy_stripped_txn(TxnType::Pay);
+    let mut block = make_test_block(1, vec![stripped]);
+    block.current_protocol = "no-such-protocol".to_string();
+    let mut node = MockNode::synced();
+    node.blocks.insert(1, block);
+    let server = TestServer::start(node).await;
+    for path in ["/v2/blocks/1/txids", "/v2/blocks/1/logs"] {
+        let resp = server
+            .client
+            .get(server.url(path))
+            .header("X-Algo-API-Token", &server.api_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 500, "{path}");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["message"].as_str().unwrap(),
+            "consensus protocol no-such-protocol not found",
+            "{path}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn get_block_txids_empty_block() {
     let mut node = MockNode::synced();
