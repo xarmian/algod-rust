@@ -72,7 +72,8 @@ jobs:
       - name: Run workspace tests
         shell: bash
         run: |
-          cargo nextest run --workspace --profile ci             -E 'not binary(service_multi_node_test)' 2>&1 | tee nextest.log
+          cargo nextest run --workspace --profile ci \
+            -E 'not binary(service_multi_node_test)' 2>&1 | tee nextest.log
 
       # Retried-then-passed tests are not failures but must not be invisible:
       # surface nextest's FLAKY lines in the job summary.
@@ -82,7 +83,7 @@ jobs:
         run: |
           {
             echo "### Flaky tests (passed only after a retry)"
-            sed 's/\[[0-9;]*m//g' nextest.log | grep -E 'FLAKY|TRY [0-9]+ (FAIL|PASS)' | sort -u || true
+            sed -E 's/\x1b\[[0-9;]*m//g' nextest.log | grep -E 'FLAKY|TRY [0-9]+ (FAIL|PASS)' | sort -u || true
             echo "(none listed above means no test needed a retry)"
           } >> "$GITHUB_STEP_SUMMARY"
 
