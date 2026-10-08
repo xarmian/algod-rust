@@ -2349,11 +2349,10 @@ impl NodeInterface for AlgodNodeInterface {
         if let Some(tracker) = self.apply_stall_tracker.as_ref() {
             self.observe_ledger_round_for_stall(tracker);
             text.push_str(&tracker.to_prometheus_text());
-            // Issue #1678: per-block follow-path timing histograms (apply,
-            // AVM, commit, WAL checkpoint, total ensure_block). Exposed
-            // wherever the block-apply path is wired (always, in production).
-            text.push_str(&algo_ledger::follow_timing::follow_timing_prometheus_text());
         }
+        // Issue #1678: per-block follow-path timing histograms and counters.
+        // They are process-global statics, so they are always exposed.
+        text.push_str(&algo_ledger::follow_timing::follow_timing_prometheus_text());
         if let Some(pool) = self.pool.as_ref() {
             text.push_str(&pool.reeval_counter().to_prometheus_text());
         }
@@ -3676,17 +3675,27 @@ mod tests {
     fn participation_metrics_absent_reports_nothing() {
         let adapter = make_adapter();
         assert!(adapter.participation_status().is_none());
-        assert!(adapter.metrics_exposition().is_none());
+        // Nothing but the always-on follow-path timing series (issue #1678).
+        let text = adapter.metrics_exposition().expect("follow timing series");
+        assert!(text.contains("algod_rust_follow_block_apply_seconds_count "));
+        assert!(!text.contains("algod_rust_agreement_votes_total"));
     }
 
     /// Issue #1678: the per-block follow-path timing histograms are part of
     /// the same `/metrics` exposition, in strictly valid text format.
     #[test]
     fn follow_block_timing_histograms_are_exposed() {
-        let adapter = make_adapter()
-            .with_apply_stall_tracker(Arc::new(algo_ledger::ApplyStallTracker::new()));
+        let adapter = make_adapter();
         let text = adapter.metrics_exposition().expect("exposition");
-        for name in ["apply", "avm", "commit", "wal_checkpoint", "ensure_block"] {
+        for name in [
+            "apply",
+            "apply_failed",
+            "avm",
+            "commit",
+            "wal_checkpoint",
+            "ensure_block",
+            "ensure_block_failed",
+        ] {
             let family = format!("algod_rust_follow_block_{name}_seconds");
             assert!(
                 text.contains(&format!("# TYPE {family} histogram\n")),
@@ -3770,7 +3779,10 @@ mod tests {
     #[test]
     fn runtime_and_netdev_metrics_absent_by_default() {
         let adapter = make_adapter();
-        assert!(adapter.metrics_exposition().is_none());
+        // Only the always-on follow-path timing series (issue #1678).
+        let text = adapter.metrics_exposition().expect("follow timing series");
+        assert!(!text.contains("algod_rust_runtime_"));
+        assert!(!text.contains("algod_rust_netdev_"));
     }
 
     /// `EnableRuntimeMetrics` alone (no participation metrics attached) must
@@ -7541,7 +7553,11 @@ mod tests {
             Arc::new(crate::live_catchup::NoopSyncControl),
         );
         let adapter = make_adapter().with_catchup_manager(manager.clone());
-        assert!(adapter.metrics_exposition().is_none());
+        // Before any catchup finished the manager adds nothing.
+        assert!(!adapter
+            .metrics_exposition()
+            .expect("follow timing series")
+            .contains("algod_rust_catchpoint_catchup_completed_total"));
 
         adapter.start_catchup("1000#deadbeef", 0).await.unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);

@@ -956,6 +956,8 @@ class FollowTimingTest(unittest.TestCase):
         samples[0]["follow_timing"] = self._timing([0, 0, 0, 0, 1], 1, 10.0)
         samples[3]["follow_timing"] = self._timing([0, 3, 4, 4, 5], 5, 10.04)
         a = monitor.summarize(samples)["follow_block_timing"]["apply"]
+        self.assertEqual(a["baseline"], "delta")
+        self.assertFalse(a["restarted"])
         self.assertEqual(a["count"], 4)
         self.assertEqual(a["max_s"], 0.1)
         self.assertEqual(a["p95_s"], 0.1)
@@ -984,13 +986,111 @@ class FollowTimingTest(unittest.TestCase):
         self.assertIn("p99", lag)
         self.assertEqual(monitor.summarize([])["lag_rounds"]["p50"], None)
 
+    def test_baseline_that_is_the_last_scrape_falls_back_to_absolute(self):
+        # Only the final scrape is at/after the tip: subtracting it from
+        # itself would give count 0 and all-None percentiles.
+        samples = [node_follow(1000.0 + i * 10, 500 + i, 500 + i) for i in range(3)]
+        samples[2]["follow_timing"] = self._timing([0, 5, 9, 9, 10], 10, 12.0)
+        a = monitor.summarize(samples)["follow_block_timing"]["apply"]
+        self.assertEqual(a["baseline"], "absolute")
+        self.assertFalse(a["restarted"])
+        self.assertEqual(a["count"], 10)
+        self.assertEqual(a["p95_s"], 10.0)
+
+    def test_single_scrape_is_absolute(self):
+        samples = [node_follow(1.0, 5, 5)]
+        samples[0]["follow_timing"] = self._timing([1, 1, 1, 1, 1], 1, 0.0005)
+        a = monitor.summarize(samples)["follow_block_timing"]["apply"]
+        self.assertEqual((a["baseline"], a["count"]), ("absolute", 1))
+
+    def _restart_case(self, first, second):
+        samples = [node_follow(1000.0 + i * 10, 500 + i, 500 + i) for i in range(3)]
+        samples[0]["follow_timing"] = first
+        samples[2]["follow_timing"] = second
+        return monitor.summarize(samples)["follow_block_timing"]["apply"]
+
+    def test_restart_detected_when_count_goes_backwards(self):
+        a = self._restart_case(
+            self._timing([0, 5, 9, 9, 10], 10, 12.0), self._timing([0, 1, 1, 1, 1], 1, 0.005)
+        )
+        self.assertTrue(a["restarted"])
+        self.assertEqual((a["baseline"], a["count"]), ("absolute", 1))
+
+    def test_restart_detected_when_a_single_bucket_goes_backwards(self):
+        # Count and sum grew, but the 0.01 s bucket shrank (5 -> 2): a
+        # restart that then outgrew the old totals must still be caught.
+        a = self._restart_case(
+            self._timing([0, 5, 6, 6, 6], 6, 1.0), self._timing([0, 2, 9, 9, 12], 12, 2.0)
+        )
+        self.assertTrue(a["restarted"])
+        self.assertEqual(a["baseline"], "absolute")
+        self.assertEqual(a["count"], 12)
+
+    def test_restart_detected_when_sum_goes_backwards(self):
+        a = self._restart_case(
+            self._timing([0, 1, 1, 1, 1], 1, 5.0), self._timing([0, 2, 2, 2, 2], 2, 0.02)
+        )
+        self.assertTrue(a["restarted"])
+
+    def test_restart_detected_when_cumulative_buckets_are_not_monotonic(self):
+        a = self._restart_case(
+            self._timing([0, 1, 1, 1, 1], 1, 0.01), self._timing([0, 3, 2, 2, 4], 4, 0.5)
+        )
+        self.assertTrue(a["restarted"])
+
+    def test_scrape_runs_at_most_once_per_interval(self):
+        orig_status, orig_fetch = monitor.fetch_status, monitor.fetch_follow_timing
+        monitor._follow_scrape_state.update(last_ts=0.0, failures=0, logged=False)
+        calls = []
+        try:
+            monitor.fetch_status = lambda *a, **kw: {"ok": True, "catchpoint": None, "last_round": 1}
+            monitor.fetch_follow_timing = lambda url, timeout=1.0: calls.append(url) or {"apply": {}}
+            first = monitor.take_sample("n", "", "p", "")
+            second = monitor.take_sample("n", "", "p", "")
+            self.assertIn("follow_timing", first)
+            self.assertNotIn("follow_timing", second)
+            self.assertEqual(len(calls), 1)
+            monitor._follow_scrape_state["last_ts"] -= monitor.FOLLOW_TIMING_SCRAPE_INTERVAL_S
+            self.assertIn("follow_timing", monitor.take_sample("n", "", "p", ""))
+            self.assertEqual(len(calls), 2)
+        finally:
+            monitor.fetch_status, monitor.fetch_follow_timing = orig_status, orig_fetch
+
+    def test_scrape_uses_a_short_timeout_and_logs_persistent_failure_once(self):
+        import contextlib
+        import io
+        import urllib.request
+
+        seen = []
+        orig_open = urllib.request.urlopen
+
+        def boom(req, timeout=None):
+            seen.append(timeout)
+            raise OSError("refused")
+
+        urllib.request.urlopen = boom
+        monitor._follow_scrape_state.update(last_ts=0.0, failures=0, logged=False)
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                for _ in range(5):
+                    self.assertIsNone(monitor.fetch_follow_timing("http://node"))
+        finally:
+            urllib.request.urlopen = orig_open
+        self.assertEqual(set(seen), {monitor.FOLLOW_TIMING_SCRAPE_TIMEOUT_S})
+        self.assertLessEqual(monitor.FOLLOW_TIMING_SCRAPE_TIMEOUT_S, 1.0)
+        self.assertEqual(err.getvalue().count("scrape"), 1, err.getvalue())
+        self.assertIn("refused", err.getvalue())
+
     def test_take_sample_attaches_scrape_only_when_out_of_catchup(self):
         orig_status, orig_fetch = monitor.fetch_status, monitor.fetch_follow_timing
+        monitor._follow_scrape_state.update(last_ts=0.0, failures=0, logged=False)
         try:
             monitor.fetch_follow_timing = lambda url, timeout=3.0: {"apply": {"count": 1}}
             monitor.fetch_status = lambda *a, **kw: {"ok": True, "catchpoint": None, "last_round": 1}
             self.assertIn("follow_timing", monitor.take_sample("n", "", "p", ""))
             monitor.fetch_status = lambda *a, **kw: {"ok": True, "catchpoint": "1#X", "last_round": 0}
+            monitor._follow_scrape_state["last_ts"] = 0.0
             self.assertNotIn("follow_timing", monitor.take_sample("n", "", "p", ""))
         finally:
             monitor.fetch_status, monitor.fetch_follow_timing = orig_status, orig_fetch

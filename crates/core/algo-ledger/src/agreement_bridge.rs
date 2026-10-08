@@ -394,15 +394,20 @@ impl AgreementLedgerBridge {
                 .map_err(|e| CommitFailure::new(CommitStage::Store, e))?;
             slow("put_block_cert", t);
             let t = std::time::Instant::now();
+            // Issue #1678: per-block follow-path timing. The AVM accumulator
+            // is reset here and taken right after the apply (the only
+            // reset/take site), on this one thread.
             crate::follow_timing::reset_avm_time();
-            crate::apply::apply_block_executing_app_calls(ledger, block)
-                .map_err(|e| CommitFailure::new(CommitStage::Apply, e))?;
-            // Issue #1678: per-block follow-path timing histograms.
+            let applied = crate::apply::apply_block_executing_app_calls(ledger, block);
             let timing = crate::follow_timing::follow_timing();
-            timing.apply.observe(t.elapsed());
             if let Some(avm) = crate::follow_timing::take_avm_time() {
                 timing.avm.observe(avm);
             }
+            match &applied {
+                Ok(()) => timing.apply.observe(t.elapsed()),
+                Err(_) => timing.apply_failed.observe(t.elapsed()),
+            }
+            applied.map_err(|e| CommitFailure::new(CommitStage::Apply, e))?;
             slow("apply_block", t);
             Ok(())
         })();
@@ -833,6 +838,9 @@ impl LedgerWriter for AgreementLedgerBridge {
             let next_round = ledger.current_round().0 + 1;
             if block.round.0 < next_round {
                 // Block already committed (by us or by catchup); idempotent.
+                crate::follow_timing::follow_timing()
+                    .ensure_block_already_committed
+                    .inc();
                 debug!(
                     "ensure_block: block round {} already committed, current round {}",
                     block.round.0,
@@ -871,9 +879,10 @@ impl LedgerWriter for AgreementLedgerBridge {
                     }
                     // Success — release the lock before notifying waiters.
                     drop(ledger);
+                    // Only the successful attempt: lock wait + commit.
                     crate::follow_timing::follow_timing()
                         .ensure_block
-                        .observe(ensure_started.elapsed());
+                        .observe(lock_wait_started.elapsed());
 
                     // Issue #1677: a commit ends any stalled-on-invalid-block
                     // state (e.g. a different, valid block for the round).
@@ -915,6 +924,9 @@ impl LedgerWriter for AgreementLedgerBridge {
                 // one ERROR when the repeat makes it a deterministic stall,
                 // and only debug lines for further repeats.
                 drop(ledger);
+                crate::follow_timing::follow_timing()
+                    .ensure_block_failed
+                    .observe(ensure_started.elapsed());
                 if !content_failure {
                     // A local fault (storage stage, I/O, ...): not evidence
                     // against the block, so no stalled state; today's
@@ -963,8 +975,14 @@ impl LedgerWriter for AgreementLedgerBridge {
                     MAX_RETRIES
                 );
                 drop(ledger);
+                crate::follow_timing::follow_timing()
+                    .ensure_block_retries
+                    .inc();
                 std::thread::sleep(RETRY_DELAY);
             } else {
+                crate::follow_timing::follow_timing()
+                    .ensure_block_failed
+                    .observe(ensure_started.elapsed());
                 warn!(
                     "ensure_block: giving up on block {} after {} retries: {err}",
                     block.round, MAX_RETRIES
@@ -1630,6 +1648,34 @@ mod tests {
         a.ensure_block(&bad, &cert);
         a.ensure_block(&bad, &cert);
         assert!(tracker.stall().is_some());
+    }
+
+    /// Issue #1678: failed applies, failed `ensure_block` calls and the
+    /// idempotent early return are visible, not silently missing.
+    #[test]
+    fn ensure_block_failure_and_idempotent_paths_are_counted() {
+        let t = crate::follow_timing::follow_timing();
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+        let (apply_failed, failed) = (t.apply_failed.count(), t.ensure_block_failed.count());
+        bridge.ensure_block(
+            &make_unapplyable_round1_block(),
+            &make_cert_with_proposal(1),
+        );
+        assert!(
+            t.apply_failed.count() > apply_failed,
+            "failed apply observed"
+        );
+        assert!(
+            t.ensure_block_failed.count() > failed,
+            "failed ensure observed"
+        );
+
+        let ok = make_round1_block();
+        bridge.ensure_block(&ok, &make_cert_with_proposal(1));
+        let already = t.ensure_block_already_committed.get();
+        bridge.ensure_block(&ok, &make_cert_with_proposal(1));
+        assert!(t.ensure_block_already_committed.get() > already);
     }
 
     // -- Certificate storage tests --

@@ -582,17 +582,49 @@ def parse_follow_timing(text: str) -> dict:
     return out
 
 
-def fetch_follow_timing(base_url: str, timeout: float = 3.0):
+# Scrape /metrics at most this often, and give up on a slow node quickly, so
+# the poll loop (and with it the stall-detection cadence) is never held up.
+FOLLOW_TIMING_SCRAPE_INTERVAL_S = 30.0
+FOLLOW_TIMING_SCRAPE_TIMEOUT_S = 1.0
+_follow_scrape_state = {"last_ts": 0.0, "failures": 0, "logged": False}
+
+
+def fetch_follow_timing(base_url: str, timeout: float = FOLLOW_TIMING_SCRAPE_TIMEOUT_S):
     """GET {base_url}/metrics and parse the follow-path histograms; None if
-    unreachable or the node predates the metrics (never raises)."""
+    unreachable or the node predates the metrics (never raises). A
+    persistent failure is logged to stderr once per process, not swallowed
+    silently."""
     import urllib.request
 
     try:
         with urllib.request.urlopen(base_url.rstrip("/") + "/metrics", timeout=timeout) as resp:
             parsed = parse_follow_timing(resp.read().decode("utf-8", "replace"))
-    except Exception:
-        return None
-    return parsed or None
+        error = None if parsed else "no algod_rust_follow_block_* series in /metrics"
+    except Exception as e:  # noqa: BLE001 -- reporting must never fail a run
+        parsed, error = None, str(e)
+    st = _follow_scrape_state
+    if error is None:
+        st["failures"] = 0
+        return parsed
+    st["failures"] += 1
+    if st["failures"] >= 3 and not st["logged"]:
+        st["logged"] = True
+        print(
+            f"monitor: follow-timing scrape of {base_url}/metrics failed "
+            f"{st['failures']} times in a row (last: {error}); "
+            "follow_block_timing will be missing from the summary",
+            file=sys.stderr,
+        )
+    return None
+
+
+def follow_timing_scrape_due(now: float) -> bool:
+    """True (and the clock is advanced) if the scrape interval has elapsed."""
+    st = _follow_scrape_state
+    if now - st["last_ts"] < FOLLOW_TIMING_SCRAPE_INTERVAL_S:
+        return False
+    st["last_ts"] = now
+    return True
 
 
 def _histogram_quantile(buckets, count, q):
@@ -623,18 +655,42 @@ def _histogram_max(buckets, count):
     return top
 
 
+def _delta_histogram(last, base):
+    """(buckets, count, sum) of `last` minus `base`, or None when the pair
+    is not a valid delta: different shapes, a count/sum/bucket that went
+    backwards, or non-monotonic cumulative buckets (all mean the node
+    restarted between the scrapes)."""
+    if len(last["buckets"]) != len(base["buckets"]):
+        return None
+    buckets = [[le, cum - c0[1]] for (le, cum), c0 in zip(last["buckets"], base["buckets"])]
+    count = last["count"] - base["count"]
+    total = last["sum"] - base["sum"]
+    cums = [c for _, c in buckets]
+    if count < 0 or total < 0 or any(c < 0 for c in cums):
+        return None
+    if any(a > b for a, b in zip(cums, cums[1:])) or (cums and cums[-1] > count):
+        return None
+    return buckets, count, total
+
+
 def summarize_follow_timing(samples: list, first_tip_ts=None) -> dict:
     """p50/p95/max (bucket upper bounds, seconds) plus count/mean per
-    follow-path histogram, over the follow window: the last scrape minus the
-    first scrape taken at/after `first_tip_ts` (absolute when only one
-    scrape exists). {} when no sample carries `follow_timing`."""
+    follow-path histogram. Each entry states its `baseline`: `"delta"` when
+    the last scrape minus an earlier scrape taken at/after `first_tip_ts`
+    (the follow window) is used, `"absolute"` when there is no earlier
+    scrape to subtract (a single scrape, or the only post-tip scrape is the
+    last one) or the pair is invalid; `restarted: true` flags the latter
+    case (counter went backwards, i.e. the node restarted between the
+    scrapes, so the post-restart absolute values are reported). {} when no
+    sample carries `follow_timing`."""
     scraped = [s for s in samples if s.get("follow_timing")]
     if not scraped:
         return {}
-    last = scraped[-1]["follow_timing"]
+    last_sample = scraped[-1]
+    last = last_sample["follow_timing"]
     base = {}
-    if first_tip_ts is not None and len(scraped) > 1:
-        for s in scraped:
+    if first_tip_ts is not None:
+        for s in scraped[:-1]:
             if s["ts"] >= first_tip_ts:
                 base = s["follow_timing"]
                 break
@@ -643,17 +699,20 @@ def summarize_follow_timing(samples: list, first_tip_ts=None) -> dict:
         h = last.get(key)
         if not h:
             continue
-        b0 = base.get(key)
         buckets = [list(b) for b in h["buckets"]]
         count, total = h["count"], h["sum"]
-        if b0 and len(b0["buckets"]) == len(buckets):
-            buckets = [[le, cum - c0[1]] for (le, cum), c0 in zip(buckets, b0["buckets"])]
-            count -= b0["count"]
-            total -= b0["sum"]
-        if count < 0:  # node restarted between scrapes: fall back to absolute
-            buckets = [list(b) for b in h["buckets"]]
-            count, total = h["count"], h["sum"]
+        baseline, restarted = "absolute", False
+        b0 = base.get(key)
+        if b0:
+            d = _delta_histogram(h, b0)
+            if d is None:
+                restarted = True
+            else:
+                buckets, count, total = d
+                baseline = "delta"
         out[key] = {
+            "baseline": baseline,
+            "restarted": restarted,
             "count": count,
             "mean_s": (total / count) if count > 0 else None,
             "p50_s": _histogram_quantile(buckets, count, 0.50),
@@ -710,7 +769,11 @@ def take_sample(node_url, node_token, peer_url, peer_token) -> dict:
     # Issue #1678: the cumulative follow-path histograms ride along once the
     # node is out of catchup (the latest scrape survives a killed run).
     node = sample["node"]
-    if node.get("ok") and not (node.get("catchpoint") or ""):
+    if (
+        node.get("ok")
+        and not (node.get("catchpoint") or "")
+        and follow_timing_scrape_due(sample["ts"])
+    ):
         timing = fetch_follow_timing(node_url)
         if timing:
             sample["follow_timing"] = timing

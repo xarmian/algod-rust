@@ -35,9 +35,28 @@
 //!   SQLite runs on the committing thread (observed through a WAL hook that
 //!   reproduces SQLite's default auto-checkpoint, see
 //!   [`install_wal_checkpoint_hook`]).
-//! - `algod_rust_follow_block_ensure_block_seconds`: total
-//!   `ensure_block` time from entry (including waiting for the ledger lock)
-//!   to a successful commit.
+//! - `algod_rust_follow_block_ensure_block_seconds`: the *successful*
+//!   `ensure_block` attempt: waiting for the ledger lock plus the commit.
+//!   Earlier transient-failure attempts and their retry sleeps are excluded;
+//!   they are counted by `..._ensure_block_retries_total`.
+//! - `algod_rust_follow_block_apply_failed_seconds` and
+//!   `algod_rust_follow_block_ensure_block_failed_seconds`: the same timings
+//!   for applies / `ensure_block` calls that *failed*, so a slow failing
+//!   apply is visible instead of silently missing from the success series.
+//!   `..._ensure_block_already_committed_total` counts the idempotent early
+//!   return (block already in the ledger).
+//!
+//! Sample populations differ: `apply`/`commit`/`ensure_block` are observed
+//! for every committed block, `avm` only for blocks that ran a top-level
+//! program (observed whether the apply then succeeded or failed).
+//!
+//! These cannot reuse `algo_metrics::Histogram`: that type keeps its series
+//! in a `Mutex<HashMap>` (a lock per observation, plus allocation for label
+//! canonicalisation), is not `const`-constructible so cannot be a plain
+//! `static`, renders `_bucket` as `counter`, and `algo-ledger` does not
+//! depend on `algo-metrics`. The follow path needs a branch-free atomic
+//! increment next to the SQLite commit; this fixed-bucket variant is the
+//! lock-free equivalent and emits the standard `histogram` text format.
 //!
 //! Recording is a handful of relaxed atomic increments; no lock is taken, so
 //! nothing here can be held across the SQLite commit.
@@ -46,6 +65,7 @@ use std::cell::Cell;
 use std::ffi::{c_char, c_int, c_void};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 /// Upper bounds (seconds) of the fixed histogram buckets; an implicit
@@ -57,6 +77,8 @@ pub const BUCKET_BOUNDS_SECS: [f64; 14] = [
 const N_BUCKETS: usize = BUCKET_BOUNDS_SECS.len();
 
 /// A lock-free histogram with the fixed [`BUCKET_BOUNDS_SECS`] buckets.
+///
+/// See the module docs for why `algo_metrics::Histogram` is not reused.
 pub struct FixedHistogram {
     name: &'static str,
     help: &'static str,
@@ -124,28 +146,76 @@ impl FixedHistogram {
     }
 }
 
-/// The five follow-path histograms.
+/// A monotonically increasing lock-free counter (`counter` text format).
+pub struct FixedCounter {
+    name: &'static str,
+    help: &'static str,
+    value: AtomicU64,
+}
+
+impl FixedCounter {
+    /// A counter named `name` starting at zero.
+    pub const fn new(name: &'static str, help: &'static str) -> Self {
+        Self {
+            name,
+            help,
+            value: AtomicU64::new(0),
+        }
+    }
+
+    /// Adds one.
+    pub fn inc(&self) {
+        self.value.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Current value.
+    pub fn get(&self) -> u64 {
+        self.value.load(Ordering::Relaxed)
+    }
+
+    /// Appends the Prometheus text exposition to `out`.
+    pub fn write_prometheus(&self, out: &mut String) {
+        let _ = writeln!(out, "# HELP {} {}", self.name, self.help);
+        let _ = writeln!(out, "# TYPE {} counter", self.name);
+        let _ = writeln!(out, "{} {}", self.name, self.get());
+    }
+}
+
+/// The follow-path histograms and counters.
 pub struct FollowTiming {
-    /// Block apply wall time.
+    /// Block apply wall time (successful applies).
     pub apply: FixedHistogram,
+    /// Block apply wall time of applies that returned an error.
+    pub apply_failed: FixedHistogram,
     /// Top-level AVM program evaluation time, per block that ran programs.
     pub avm: FixedHistogram,
     /// SQLite commit time.
     pub commit: FixedHistogram,
     /// WAL checkpoint time.
     pub wal_checkpoint: FixedHistogram,
-    /// Total `ensure_block` time.
+    /// The successful `ensure_block` attempt (lock wait + commit).
     pub ensure_block: FixedHistogram,
+    /// Total time of `ensure_block` calls that returned without committing
+    /// because of an error (permanent failure or retries exhausted).
+    pub ensure_block_failed: FixedHistogram,
+    /// Transient-error retries inside `ensure_block`.
+    pub ensure_block_retries: FixedCounter,
+    /// `ensure_block` calls for a block the ledger already had.
+    pub ensure_block_already_committed: FixedCounter,
 }
 
 static FOLLOW_TIMING: FollowTiming = FollowTiming {
     apply: FixedHistogram::new(
         "algod_rust_follow_block_apply_seconds",
-        "Wall time to apply one block on the follow path, including AVM execution.",
+        "Wall time to apply one block on the follow path, including AVM execution (successful applies).",
+    ),
+    apply_failed: FixedHistogram::new(
+        "algod_rust_follow_block_apply_failed_seconds",
+        "Wall time of block applies on the follow path that returned an error.",
     ),
     avm: FixedHistogram::new(
         "algod_rust_follow_block_avm_seconds",
-        "Time spent evaluating top-level AVM programs while applying one block (blocks with app calls only).",
+        "Time spent evaluating top-level AVM programs while applying one block (blocks with app calls only; observed for failed applies too).",
     ),
     commit: FixedHistogram::new(
         "algod_rust_follow_block_commit_seconds",
@@ -157,7 +227,19 @@ static FOLLOW_TIMING: FollowTiming = FollowTiming {
     ),
     ensure_block: FixedHistogram::new(
         "algod_rust_follow_block_ensure_block_seconds",
-        "Total ensure_block time per committed block, including ledger lock wait.",
+        "Successful ensure_block attempt per committed block: ledger lock wait plus commit, excluding earlier failed attempts and retry sleeps.",
+    ),
+    ensure_block_failed: FixedHistogram::new(
+        "algod_rust_follow_block_ensure_block_failed_seconds",
+        "Total time of ensure_block calls that failed without committing, including retries and lock waits.",
+    ),
+    ensure_block_retries: FixedCounter::new(
+        "algod_rust_follow_block_ensure_block_retries_total",
+        "Transient-error retries performed inside ensure_block.",
+    ),
+    ensure_block_already_committed: FixedCounter::new(
+        "algod_rust_follow_block_ensure_block_already_committed_total",
+        "ensure_block calls for a block the ledger had already committed (idempotent early return).",
     ),
 };
 
@@ -171,14 +253,28 @@ pub fn follow_timing_prometheus_text() -> String {
     let t = follow_timing();
     let mut out = String::new();
     t.apply.write_prometheus(&mut out);
+    t.apply_failed.write_prometheus(&mut out);
     t.avm.write_prometheus(&mut out);
     t.commit.write_prometheus(&mut out);
     t.wal_checkpoint.write_prometheus(&mut out);
     t.ensure_block.write_prometheus(&mut out);
+    t.ensure_block_failed.write_prometheus(&mut out);
+    t.ensure_block_retries.write_prometheus(&mut out);
+    t.ensure_block_already_committed.write_prometheus(&mut out);
     out
 }
 
 thread_local! {
+    /// Accumulated top-level AVM evaluation time of the block currently
+    /// being applied *on this thread*. Single-thread assumption: block
+    /// apply (and therefore every top-level program evaluation, including
+    /// the inner transactions it spawns) runs synchronously on the one
+    /// thread that holds the ledger lock, so a thread-local needs no
+    /// synchronisation. Invariant: the only reset/take site is
+    /// `try_commit_block`, which calls `reset_avm_time` immediately before
+    /// and `take_avm_time` immediately after the apply; applies from other
+    /// paths (catchup replay, simulation) merely accumulate into the
+    /// accumulator, which the next reset discards.
     static AVM_NANOS: Cell<u64> = const { Cell::new(0) };
 }
 
@@ -195,17 +291,25 @@ pub fn take_avm_time() -> Option<Duration> {
 }
 
 /// Adds the lifetime of this guard to the thread's AVM time accumulator.
-pub struct AvmTimer(Instant);
+///
+/// Must be dropped on the thread that created it (debug-asserted): the
+/// accumulator is thread-local, see the `AVM_NANOS` docs.
+pub struct AvmTimer(Instant, ThreadId);
 
 impl AvmTimer {
     /// Starts timing a top-level program evaluation.
     pub fn start() -> Self {
-        Self(Instant::now())
+        Self(Instant::now(), std::thread::current().id())
     }
 }
 
 impl Drop for AvmTimer {
     fn drop(&mut self) {
+        debug_assert_eq!(
+            self.1,
+            std::thread::current().id(),
+            "AVM evaluation must start and finish on the apply thread"
+        );
         let n = u64::try_from(self.0.elapsed().as_nanos()).unwrap_or(u64::MAX);
         AVM_NANOS.with(|c| c.set(c.get().saturating_add(n)));
     }
@@ -224,17 +328,35 @@ extern "C" fn wal_hook_cb(
         let started = Instant::now();
         // SAFETY: SQLite passes the live connection handle and the schema
         // name; this is exactly what `sqlite3WalDefaultHook` does.
-        unsafe { rusqlite::ffi::sqlite3_wal_checkpoint(db, name) };
+        let rc = unsafe { rusqlite::ffi::sqlite3_wal_checkpoint(db, name) };
         follow_timing().wal_checkpoint.observe(started.elapsed());
+        if rc != rusqlite::ffi::SQLITE_OK {
+            // SQLITE_BUSY etc. are normal for a PASSIVE checkpoint; the
+            // default hook ignores the code as well.
+            tracing::debug!(
+                rc,
+                n_frames,
+                "follow_timing: WAL checkpoint returned non-OK"
+            );
+        }
     }
     rusqlite::ffi::SQLITE_OK
 }
 
 /// Replaces SQLite's default auto-checkpoint hook with one that does the
 /// same thing (a PASSIVE `sqlite3_wal_checkpoint` once the WAL reaches 1000
-/// frames) but times it into
+/// frames, identical to `sqlite3WalDefaultHook` at the default
+/// `wal_autocheckpoint`) but times it into
 /// `algod_rust_follow_block_wal_checkpoint_seconds`. Call once per
 /// connection after `journal_mode=WAL` is set.
+///
+/// Caveats: it applies to the connection it is installed on (the main ledger
+/// connection, see `SqliteLedger::init`); other connections to the same
+/// database keep SQLite's default hook and are not timed. A later
+/// `PRAGMA wal_autocheckpoint = N` on that connection would silently replace
+/// this hook (SQLite implements that pragma as `sqlite3_wal_autocheckpoint`,
+/// which installs the default hook), so no code may issue it; the
+/// `no_code_sets_wal_autocheckpoint` test guards that.
 pub fn install_wal_checkpoint_hook(conn: &rusqlite::Connection) {
     // SAFETY: `handle()` is the live connection; the callback is a plain
     // `extern "C"` function that ignores its context pointer.
@@ -274,6 +396,10 @@ mod tests {
         t.commit.observe(Duration::from_millis(1200));
         t.wal_checkpoint.observe(Duration::from_millis(80));
         t.ensure_block.observe(Duration::from_millis(40));
+        t.apply_failed.observe(Duration::from_millis(3));
+        t.ensure_block_failed.observe(Duration::from_millis(3));
+        t.ensure_block_retries.inc();
+        t.ensure_block_already_committed.inc();
         let text = follow_timing_prometheus_text();
         assert!(text.ends_with('\n'));
         let mut families = std::collections::BTreeMap::<String, Vec<(String, f64)>>::new();
@@ -288,7 +414,10 @@ mod tests {
                 continue;
             }
             if let Some(rest) = line.strip_prefix("# TYPE ") {
-                assert!(rest.ends_with(" histogram"), "TYPE: {line:?}");
+                assert!(
+                    rest.ends_with(" histogram") || rest.ends_with(" counter"),
+                    "TYPE: {line:?}"
+                );
                 continue;
             }
             let (series, value) = line.rsplit_once(' ').expect("series value");
@@ -312,7 +441,15 @@ mod tests {
                 .or_default()
                 .push((labels.to_string(), value));
         }
-        for base in ["apply", "avm", "commit", "wal_checkpoint", "ensure_block"] {
+        for base in [
+            "apply",
+            "apply_failed",
+            "avm",
+            "commit",
+            "wal_checkpoint",
+            "ensure_block",
+            "ensure_block_failed",
+        ] {
             let b = format!("algod_rust_follow_block_{base}_seconds");
             let buckets = &families[&format!("{b}_bucket")];
             assert_eq!(buckets.len(), BUCKET_BOUNDS_SECS.len() + 1);
@@ -325,6 +462,42 @@ mod tests {
             assert_eq!(buckets.last().unwrap().1, count);
             assert!(families.contains_key(&format!("{b}_sum")));
         }
+        for c in [
+            "algod_rust_follow_block_ensure_block_retries_total",
+            "algod_rust_follow_block_ensure_block_already_committed_total",
+        ] {
+            assert!(families[c][0].1 >= 1.0, "{c}");
+        }
+    }
+
+    /// The hook replaces SQLite's default auto-checkpoint; a later
+    /// `PRAGMA wal_autocheckpoint` on the ledger connection would silently
+    /// undo it, so no production source may issue that pragma.
+    #[test]
+    fn no_code_sets_wal_autocheckpoint() {
+        fn walk(dir: &std::path::Path, hits: &mut Vec<String>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    walk(&p, hits);
+                } else if p.extension().is_some_and(|x| x == "rs")
+                    && !p.ends_with("follow_timing.rs")
+                {
+                    let text = std::fs::read_to_string(&p).unwrap().to_lowercase();
+                    for pat in ["pragma wal_autocheckpoint", "sqlite3_wal_autocheckpoint"] {
+                        if text.contains(pat) {
+                            hits.push(format!("{}: {pat}", p.display()));
+                        }
+                    }
+                }
+            }
+        }
+        let mut hits = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut hits,
+        );
+        assert!(hits.is_empty(), "{hits:?}");
     }
 
     #[test]
@@ -353,17 +526,23 @@ mod tests {
             .unwrap();
         install_wal_checkpoint_hook(&conn);
         let before = follow_timing().wal_checkpoint.count();
-        // 8 KiB rows: each commit adds a few frames; 1000+ frames trigger.
-        for _ in 0..3000 {
-            conn.execute("INSERT INTO t VALUES (zeroblob(8192))", [])
-                .unwrap();
+        // synchronous=OFF + batched inserts: fast on CI, same WAL behaviour.
+        conn.execute_batch("PRAGMA synchronous=OFF;").unwrap();
+        for _ in 0..6 {
+            // ~500 x 8 KiB rows per commit => >1000 WAL frames per commit.
+            conn.execute_batch("BEGIN;").unwrap();
+            for _ in 0..500 {
+                conn.execute("INSERT INTO t VALUES (zeroblob(8192))", [])
+                    .unwrap();
+            }
+            conn.execute_batch("COMMIT;").unwrap();
         }
         assert!(
             follow_timing().wal_checkpoint.count() > before,
             "auto-checkpoint must have been timed"
         );
         // The checkpoint really ran: the WAL is reset and reused instead of
-        // growing to the ~24 MB written.
+        // growing to the ~24 MB written (3000 rows x 8 KiB).
         let wal = std::fs::metadata(dir.join("t.sqlite-wal")).unwrap().len();
         assert!(wal < 16 * 1024 * 1024, "wal grew unbounded: {wal}");
         drop(conn);
