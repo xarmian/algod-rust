@@ -2349,6 +2349,10 @@ impl NodeInterface for AlgodNodeInterface {
         if let Some(tracker) = self.apply_stall_tracker.as_ref() {
             self.observe_ledger_round_for_stall(tracker);
             text.push_str(&tracker.to_prometheus_text());
+            // Issue #1678: per-block follow-path timing histograms (apply,
+            // AVM, commit, WAL checkpoint, total ensure_block). Exposed
+            // wherever the block-apply path is wired (always, in production).
+            text.push_str(&algo_ledger::follow_timing::follow_timing_prometheus_text());
         }
         if let Some(pool) = self.pool.as_ref() {
             text.push_str(&pool.reeval_counter().to_prometheus_text());
@@ -3673,6 +3677,29 @@ mod tests {
         let adapter = make_adapter();
         assert!(adapter.participation_status().is_none());
         assert!(adapter.metrics_exposition().is_none());
+    }
+
+    /// Issue #1678: the per-block follow-path timing histograms are part of
+    /// the same `/metrics` exposition, in strictly valid text format.
+    #[test]
+    fn follow_block_timing_histograms_are_exposed() {
+        let adapter = make_adapter()
+            .with_apply_stall_tracker(Arc::new(algo_ledger::ApplyStallTracker::new()));
+        let text = adapter.metrics_exposition().expect("exposition");
+        for name in ["apply", "avm", "commit", "wal_checkpoint", "ensure_block"] {
+            let family = format!("algod_rust_follow_block_{name}_seconds");
+            assert!(
+                text.contains(&format!("# TYPE {family} histogram\n")),
+                "{family} missing"
+            );
+            assert!(text.contains(&format!("{family}_bucket{{le=\"+Inf\"}} ")));
+            assert!(text.contains(&format!("{family}_sum ")));
+            assert!(text.contains(&format!("{family}_count ")));
+        }
+        assert!(
+            text.lines().all(|l| !l.starts_with(char::is_whitespace)),
+            "no leading whitespace in the exposition"
+        );
     }
 
     /// Issue #1677: a stall recorded on the shared tracker reaches both

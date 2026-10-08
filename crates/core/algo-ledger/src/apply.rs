@@ -5164,6 +5164,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                             empty
                         }
                         Ok(()) => {
+                            let _avm_timer = crate::follow_timing::AvmTimer::start();
                             if let Some(ref mut t) = tracer {
                                 run_clear_state_program_with_tracer(
                                     &clear_program,
@@ -5330,11 +5331,13 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 // makes every call after this one a no-op.
                 avm_ctx.ensure_boxes_initialized();
                 avm_ctx.check_read_budget()?;
+                let avm_timer = crate::follow_timing::AvmTimer::start();
                 let mut result = if let Some(ref mut t) = tracer {
                     run_approval_program_with_tracer(&approval_program, &mut avm_ctx, budget, *t)?
                 } else {
                     run_approval_program(&approval_program, &mut avm_ctx, budget)?
                 };
+                drop(avm_timer);
                 // Mirrors go-algorand's `EvalContract`
                 // (`data/transactions/logic/eval.go:1353-1358`): `err == nil
                 // && pass` gates `considerBudgetProgramWrites`, and a

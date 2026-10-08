@@ -394,8 +394,15 @@ impl AgreementLedgerBridge {
                 .map_err(|e| CommitFailure::new(CommitStage::Store, e))?;
             slow("put_block_cert", t);
             let t = std::time::Instant::now();
+            crate::follow_timing::reset_avm_time();
             crate::apply::apply_block_executing_app_calls(ledger, block)
                 .map_err(|e| CommitFailure::new(CommitStage::Apply, e))?;
+            // Issue #1678: per-block follow-path timing histograms.
+            let timing = crate::follow_timing::follow_timing();
+            timing.apply.observe(t.elapsed());
+            if let Some(avm) = crate::follow_timing::take_avm_time() {
+                timing.avm.observe(avm);
+            }
             slow("apply_block", t);
             Ok(())
         })();
@@ -412,6 +419,9 @@ impl AgreementLedgerBridge {
             ledger
                 .commit_block()
                 .map_err(|e| CommitFailure::new(CommitStage::Store, e))?;
+            crate::follow_timing::follow_timing()
+                .commit
+                .observe(t.elapsed());
             slow("commit_block", t);
         }
 
@@ -798,6 +808,7 @@ impl LedgerWriter for AgreementLedgerBridge {
         let bundle = cert.to_unauthenticated_bundle();
         let cert_bytes = algo_agreement::codec::encode_bundle(&bundle);
 
+        let ensure_started = std::time::Instant::now();
         for attempt in 0..=MAX_RETRIES {
             let lock_wait_started = std::time::Instant::now();
             let mut ledger = match self.ledger.lock() {
@@ -860,6 +871,9 @@ impl LedgerWriter for AgreementLedgerBridge {
                     }
                     // Success — release the lock before notifying waiters.
                     drop(ledger);
+                    crate::follow_timing::follow_timing()
+                        .ensure_block
+                        .observe(ensure_started.elapsed());
 
                     // Issue #1677: a commit ends any stalled-on-invalid-block
                     // state (e.g. a different, valid block for the round).
@@ -1979,7 +1993,24 @@ mod tests {
             },
             ..Default::default()
         };
+        let timing = crate::follow_timing::follow_timing();
+        let avm_before = timing.avm.count();
+        let apply_before = timing.apply.count();
+        let commit_before = timing.commit.count();
+        let total_before = timing.ensure_block.count();
         bridge.ensure_block(&block(2, 1003, vec![call]), &make_cert_with_proposal(2));
+        // Issue #1678: the follow path records its per-block timings (other
+        // tests share the process-wide histograms, hence `>=`).
+        assert!(timing.avm.count() > avm_before, "AVM time observed");
+        assert!(timing.apply.count() > apply_before, "apply time observed");
+        assert!(
+            timing.commit.count() > commit_before,
+            "commit time observed"
+        );
+        assert!(
+            timing.ensure_block.count() > total_before,
+            "total ensure_block time observed"
+        );
         let l = ledger.lock().unwrap();
         assert_eq!(l.current_round(), Round(2));
         assert_eq!(

@@ -435,7 +435,15 @@ def summarize(samples: list) -> dict:
             "fast_catchup_seconds": None,
             "phase_seconds": {},
             "reached_tip": False,
-            "lag_rounds": {"n": 0, "mean": None, "p95": None, "max": None},
+            "lag_rounds": {
+                "n": 0,
+                "mean": None,
+                "p50": None,
+                "p95": None,
+                "p99": None,
+                "max": None,
+            },
+            "follow_block_timing": {},
             "first_tip_ts": None,
             "time_to_tip_seconds": None,
             "observed_seconds": 0.0,
@@ -504,23 +512,155 @@ def summarize(samples: list) -> dict:
 
     fast_catchup_seconds = (catchup_end_ts - t0) if catchup_end_ts is not None else None
 
-    lag_stats = {"n": len(lag_samples), "mean": None, "p95": None, "max": None}
+    lag_stats = {
+        "n": len(lag_samples),
+        "mean": None,
+        "p50": None,
+        "p95": None,
+        "p99": None,
+        "max": None,
+    }
     if lag_samples:
         lag_stats["mean"] = statistics.mean(lag_samples)
         lag_stats["max"] = max(lag_samples)
         sorted_lag = sorted(lag_samples)
-        idx = min(len(sorted_lag) - 1, int(round(0.95 * (len(sorted_lag) - 1))))
-        lag_stats["p95"] = sorted_lag[idx]
+        for key, q in (("p50", 0.50), ("p95", 0.95), ("p99", 0.99)):
+            idx = min(len(sorted_lag) - 1, int(round(q * (len(sorted_lag) - 1))))
+            lag_stats[key] = sorted_lag[idx]
 
     return {
         "fast_catchup_seconds": fast_catchup_seconds,
         "phase_seconds": {k: round(v, 1) for k, v in phase_seconds.items() if v > 0},
         "reached_tip": reached_tip,
         "lag_rounds": lag_stats,
+        "follow_block_timing": summarize_follow_timing(samples, first_tip_ts),
         "first_tip_ts": first_tip_ts,
         "time_to_tip_seconds": (first_tip_ts - t0) if first_tip_ts is not None else None,
         "observed_seconds": samples[-1]["ts"] - t0,
     }
+
+
+# --- Per-block follow-path timing histograms (issue #1678) -------------
+
+FOLLOW_TIMING_PREFIX = "algod_rust_follow_block_"
+FOLLOW_TIMING_SUFFIX = "_seconds"
+FOLLOW_TIMING_KEYS = ("apply", "avm", "commit", "wal_checkpoint", "ensure_block")
+
+
+def parse_follow_timing(text: str) -> dict:
+    """Parse the `algod_rust_follow_block_*_seconds` histograms out of a
+    Prometheus text exposition. Returns {key: {"count", "sum", "buckets":
+    [[le, cumulative], ...]}} with finite `le` bounds, only for
+    keys whose full bucket/sum/count triple is present."""
+    raw = {}
+    for line in text.splitlines():
+        if not line.startswith(FOLLOW_TIMING_PREFIX):
+            continue
+        series, _, value = line.rpartition(" ")
+        try:
+            value = float(value)
+        except ValueError:
+            continue
+        name, _, labels = series.partition("{")
+        for kind in ("_bucket", "_sum", "_count"):
+            if name.endswith(FOLLOW_TIMING_SUFFIX + kind):
+                key = name[len(FOLLOW_TIMING_PREFIX) : -len(FOLLOW_TIMING_SUFFIX + kind)]
+                entry = raw.setdefault(key, {"buckets": []})
+                if kind == "_bucket":
+                    le = labels.split('le="', 1)[-1].split('"', 1)[0]
+                    if le != "+Inf":  # the +Inf bucket equals `_count`
+                        entry["buckets"].append([float(le), value])
+                else:
+                    entry[kind[1:]] = value
+                break
+    out = {}
+    for key, e in raw.items():
+        if e["buckets"] and "sum" in e and "count" in e:
+            e["buckets"].sort(key=lambda b: b[0])
+            e["count"] = int(e["count"])
+            out[key] = e
+    return out
+
+
+def fetch_follow_timing(base_url: str, timeout: float = 3.0):
+    """GET {base_url}/metrics and parse the follow-path histograms; None if
+    unreachable or the node predates the metrics (never raises)."""
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(base_url.rstrip("/") + "/metrics", timeout=timeout) as resp:
+            parsed = parse_follow_timing(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+    return parsed or None
+
+
+def _histogram_quantile(buckets, count, q):
+    """Upper bound (seconds) of the finite bucket holding quantile `q`; when
+    the quantile falls in the +Inf bucket, the last finite bound ("at
+    least")."""
+    if count <= 0 or not buckets:
+        return None
+    target = q * count
+    for le, cum in buckets:
+        if cum >= target and cum > 0:
+            return le
+    return buckets[-1][0]
+
+
+def _histogram_max(buckets, count):
+    """Upper bound of the highest populated bucket (+Inf -> last finite)."""
+    if count <= 0 or not buckets:
+        return None
+    if count > buckets[-1][1]:
+        return buckets[-1][0]
+    prev = 0
+    top = None
+    for le, cum in buckets:
+        if cum > prev:
+            top = le
+        prev = cum
+    return top
+
+
+def summarize_follow_timing(samples: list, first_tip_ts=None) -> dict:
+    """p50/p95/max (bucket upper bounds, seconds) plus count/mean per
+    follow-path histogram, over the follow window: the last scrape minus the
+    first scrape taken at/after `first_tip_ts` (absolute when only one
+    scrape exists). {} when no sample carries `follow_timing`."""
+    scraped = [s for s in samples if s.get("follow_timing")]
+    if not scraped:
+        return {}
+    last = scraped[-1]["follow_timing"]
+    base = {}
+    if first_tip_ts is not None and len(scraped) > 1:
+        for s in scraped:
+            if s["ts"] >= first_tip_ts:
+                base = s["follow_timing"]
+                break
+    out = {}
+    for key in FOLLOW_TIMING_KEYS:
+        h = last.get(key)
+        if not h:
+            continue
+        b0 = base.get(key)
+        buckets = [list(b) for b in h["buckets"]]
+        count, total = h["count"], h["sum"]
+        if b0 and len(b0["buckets"]) == len(buckets):
+            buckets = [[le, cum - c0[1]] for (le, cum), c0 in zip(buckets, b0["buckets"])]
+            count -= b0["count"]
+            total -= b0["sum"]
+        if count < 0:  # node restarted between scrapes: fall back to absolute
+            buckets = [list(b) for b in h["buckets"]]
+            count, total = h["count"], h["sum"]
+        out[key] = {
+            "count": count,
+            "mean_s": (total / count) if count > 0 else None,
+            "p50_s": _histogram_quantile(buckets, count, 0.50),
+            "p95_s": _histogram_quantile(buckets, count, 0.95),
+            "max_s": _histogram_max(buckets, count),
+        }
+    return out
 
 
 # --- Live collection ---------------------------------------------------
@@ -562,11 +702,19 @@ def fetch_status(base_url: str, token: str, timeout: float = 5.0) -> dict:
 
 
 def take_sample(node_url, node_token, peer_url, peer_token) -> dict:
-    return {
+    sample = {
         "ts": time.time(),
         "node": fetch_status(node_url, node_token),
         "peer": fetch_status(peer_url, peer_token),
     }
+    # Issue #1678: the cumulative follow-path histograms ride along once the
+    # node is out of catchup (the latest scrape survives a killed run).
+    node = sample["node"]
+    if node.get("ok") and not (node.get("catchpoint") or ""):
+        timing = fetch_follow_timing(node_url)
+        if timing:
+            sample["follow_timing"] = timing
+    return sample
 
 
 def at_tip(sample: dict) -> bool:

@@ -893,5 +893,108 @@ class FollowWindowTest(unittest.TestCase):
         self.assertNotIn("follow", monitor.build_result(samples, monitor.classify(samples)))
 
 
+def _hist_text(name, buckets, total, sum_s):
+    """Render one histogram exactly as the node's /metrics does."""
+    fam = "algod_rust_follow_block_%s_seconds" % name
+    lines = ["# HELP %s help" % fam, "# TYPE %s histogram" % fam]
+    for le, cum in buckets:
+        lines.append('%s_bucket{le="%s"} %d' % (fam, le, cum))
+    lines.append('%s_bucket{le="+Inf"} %d' % (fam, total))
+    lines.append("%s_sum %s" % (fam, sum_s))
+    lines.append("%s_count %d" % (fam, total))
+    return "\n".join(lines) + "\n"
+
+
+def _exposition(counts):
+    """counts: {key: (bucket_list, total, sum)}"""
+    return "algod_rust_other_metric 4\n" + "".join(
+        _hist_text(k, b, t, s) for k, (b, t, s) in counts.items()
+    )
+
+
+class FollowTimingTest(unittest.TestCase):
+    """Issue #1678: follow-path histograms and lag percentiles in summary.json."""
+
+    BOUNDS = [0.001, 0.01, 0.1, 1.0, 10.0]
+
+    def _timing(self, cums, total, sum_s):
+        return monitor.parse_follow_timing(
+            _exposition({"apply": (list(zip(self.BOUNDS, cums)), total, sum_s)})
+        )
+
+    def test_parse_extracts_cumulative_buckets_count_and_sum(self):
+        t = self._timing([0, 5, 9, 10, 10], 10, 0.9)
+        self.assertEqual(set(t), {"apply"})
+        self.assertEqual(t["apply"]["count"], 10)
+        self.assertAlmostEqual(t["apply"]["sum"], 0.9)
+        self.assertEqual(t["apply"]["buckets"][1], [0.01, 5.0])
+        self.assertEqual(len(t["apply"]["buckets"]), 5)  # +Inf folded into count
+
+    def test_parse_ignores_incomplete_families(self):
+        text = 'algod_rust_follow_block_avm_seconds_bucket{le="1"} 3\n'
+        self.assertEqual(monitor.parse_follow_timing(text), {})
+
+    def test_summary_reports_p50_p95_max_as_bucket_upper_bounds(self):
+        t0 = 1000.0
+        s0 = node_catchup(t0)
+        s0["node"]["catchpoint"] = "x#y"
+        samples = [s0] + [node_follow(t0 + 100 + i * 10, 500 + i, 500 + i) for i in range(5)]
+        # 10 blocks: 5 <=10ms, 4 <=100ms, 1 in (1s,10s].
+        samples[-1]["follow_timing"] = self._timing([0, 5, 9, 9, 10], 10, 12.0)
+        r = monitor.summarize(samples)
+        a = r["follow_block_timing"]["apply"]
+        self.assertEqual(a["count"], 10)
+        self.assertEqual(a["p50_s"], 0.01)
+        self.assertEqual(a["p95_s"], 10.0)
+        self.assertEqual(a["max_s"], 10.0)
+        self.assertAlmostEqual(a["mean_s"], 1.2)
+
+    def test_summary_uses_the_delta_since_the_first_tip_scrape(self):
+        t0 = 1000.0
+        samples = [node_follow(t0 + i * 10, 500 + i, 500 + i) for i in range(4)]
+        # Before the follow window: one 10 s block already counted.
+        samples[0]["follow_timing"] = self._timing([0, 0, 0, 0, 1], 1, 10.0)
+        samples[3]["follow_timing"] = self._timing([0, 3, 4, 4, 5], 5, 10.04)
+        a = monitor.summarize(samples)["follow_block_timing"]["apply"]
+        self.assertEqual(a["count"], 4)
+        self.assertEqual(a["max_s"], 0.1)
+        self.assertEqual(a["p95_s"], 0.1)
+
+    def test_overflow_bucket_reports_last_finite_bound(self):
+        samples = [node_follow(1.0, 5, 5)]
+        samples[0]["follow_timing"] = self._timing([0, 0, 0, 0, 0], 2, 90.0)
+        a = monitor.summarize(samples)["follow_block_timing"]["apply"]
+        self.assertEqual(a["max_s"], 10.0)
+
+    def test_no_scrape_yields_empty_timing_and_json_serialisable_result(self):
+        import json
+
+        r = monitor.summarize([node_follow(1.0, 5, 5)])
+        self.assertEqual(r["follow_block_timing"], {})
+        samples = [node_follow(1.0, 5, 5)]
+        samples[0]["follow_timing"] = self._timing([1, 1, 1, 1, 1], 1, 0.0005)
+        json.dumps(monitor.build_result(samples, monitor.classify(samples)))
+
+    def test_lag_rounds_gain_p50_and_p99(self):
+        samples = [node_follow(i * 10.0, 500 + i, 500 + i + (50 if i == 99 else i % 2)) for i in range(100)]
+        lag = monitor.summarize(samples)["lag_rounds"]
+        self.assertEqual(lag["n"], 100)
+        self.assertEqual(lag["p50"], 1)
+        self.assertEqual(lag["max"], 50)
+        self.assertIn("p99", lag)
+        self.assertEqual(monitor.summarize([])["lag_rounds"]["p50"], None)
+
+    def test_take_sample_attaches_scrape_only_when_out_of_catchup(self):
+        orig_status, orig_fetch = monitor.fetch_status, monitor.fetch_follow_timing
+        try:
+            monitor.fetch_follow_timing = lambda url, timeout=3.0: {"apply": {"count": 1}}
+            monitor.fetch_status = lambda *a, **kw: {"ok": True, "catchpoint": None, "last_round": 1}
+            self.assertIn("follow_timing", monitor.take_sample("n", "", "p", ""))
+            monitor.fetch_status = lambda *a, **kw: {"ok": True, "catchpoint": "1#X", "last_round": 0}
+            self.assertNotIn("follow_timing", monitor.take_sample("n", "", "p", ""))
+        finally:
+            monitor.fetch_status, monitor.fetch_follow_timing = orig_status, orig_fetch
+
+
 if __name__ == "__main__":
     unittest.main()
