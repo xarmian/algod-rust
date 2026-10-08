@@ -59,8 +59,19 @@ jobs:
           shared-key: unit-tests
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # The real-thread multi-node agreement binaries are excluded here only:
+      # in an unoptimized (debug) build they take well over 30 minutes on a
+      # 4-core runner (a first all-in run hit the 40 min timeout with
+      # service_multi_node_test tests running 17+ min each), and they are
+      # load/timing-sensitive (#1693, #1695). They still run, in release with
+      # retries, in the daily Coverage workflow (cargo llvm-cov nextest
+      # --workspace --release). Everything else, including every other
+      # algo-agreement test, runs per PR. Tracked in #1750; re-enable once a
+      # fast/deterministic harness exists (#1695).
       - name: Run workspace tests
-        run: cargo nextest run --workspace --profile ci
+        run: >-
+          cargo nextest run --workspace --profile ci
+          -E 'not (binary(service_multi_node_test) | binary(player_real_harness_test))'
 
       # nextest skips doctests. Run them for the whole workspace; the
       # algo-network peer_features doctest failure seen on Windows dev
