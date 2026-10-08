@@ -2247,6 +2247,7 @@ fn test_gload_errors_on_sibling_clear_state_txn_that_never_ran_a_program() {
     let group_refs: Vec<&SignedTransaction> = vec![&clear_state, &reader_call];
     let ran_program = RefCell::new(vec![false; group_refs.len()]);
     let scratch = RefCell::new(vec![None; group_refs.len()]);
+    let group_txid_cache = algo_ledger::GroupTxidCache::default();
     let mut budget = GroupBudget::new(1);
 
     // Index 0: ClearState against the deleted app succeeds (clearing local
@@ -2257,6 +2258,7 @@ fn test_gload_errors_on_sibling_clear_state_txn_that_never_ran_a_program() {
         index: 0,
         ran_program: &ran_program,
         scratch: &scratch,
+        txid_cache: &group_txid_cache,
     };
     apply_transaction_with_budget(
         &mut state,
@@ -2279,6 +2281,7 @@ fn test_gload_errors_on_sibling_clear_state_txn_that_never_ran_a_program() {
         index: 1,
         ran_program: &ran_program,
         scratch: &scratch,
+        txid_cache: &group_txid_cache,
     };
     let result = apply_transaction_with_budget(
         &mut state,
@@ -2385,6 +2388,7 @@ fn test_gload_returns_sibling_real_scratch_value_not_zero_placeholder() {
     let group_refs: Vec<&SignedTransaction> = vec![&writer_call, &reader_call];
     let ran_program = RefCell::new(vec![false; group_refs.len()]);
     let scratch = RefCell::new(vec![None; group_refs.len()]);
+    let group_txid_cache = algo_ledger::GroupTxidCache::default();
     let mut budget = GroupBudget::new(2);
 
     // Index 0: writer app call -- stores 42 in scratch slot 5, approves.
@@ -2393,6 +2397,7 @@ fn test_gload_returns_sibling_real_scratch_value_not_zero_placeholder() {
         index: 0,
         ran_program: &ran_program,
         scratch: &scratch,
+        txid_cache: &group_txid_cache,
     };
     apply_transaction_with_budget(
         &mut state,
@@ -2416,6 +2421,7 @@ fn test_gload_returns_sibling_real_scratch_value_not_zero_placeholder() {
         index: 1,
         ran_program: &ran_program,
         scratch: &scratch,
+        txid_cache: &group_txid_cache,
     };
     apply_transaction_with_budget(
         &mut state,
@@ -2520,6 +2526,7 @@ fn write_budget_combined_oversized_create_calls_in_one_group_rejected() {
     let group_refs: Vec<&SignedTransaction> = vec![&app_a, &app_b];
     let ran_program = RefCell::new(vec![false; group_refs.len()]);
     let scratch = RefCell::new(vec![None; group_refs.len()]);
+    let group_txid_cache = algo_ledger::GroupTxidCache::default();
     let mut budget = GroupBudget::new(2);
     let mut group_box_budget = BoxBudgetState::default();
 
@@ -2528,6 +2535,7 @@ fn write_budget_combined_oversized_create_calls_in_one_group_rejected() {
         index: 0,
         ran_program: &ran_program,
         scratch: &scratch,
+        txid_cache: &group_txid_cache,
     };
     // App A alone: its own 59 extra bytes fit comfortably under the
     // 60-byte shared io_budget.
@@ -2548,6 +2556,7 @@ fn write_budget_combined_oversized_create_calls_in_one_group_rejected() {
         index: 1,
         ran_program: &ran_program,
         scratch: &scratch,
+        txid_cache: &group_txid_cache,
     };
     // App B, sharing `group_box_budget` with app A: the COMBINED extra bytes
     // (118) must exceed the shared 60-byte io_budget and reject, even
@@ -2602,6 +2611,7 @@ fn write_budget_combined_oversized_create_calls_without_group_sharing_wrongly_ac
     let group_refs: Vec<&SignedTransaction> = vec![&app_a, &app_b];
     let ran_program = RefCell::new(vec![false; group_refs.len()]);
     let scratch = RefCell::new(vec![None; group_refs.len()]);
+    let group_txid_cache = algo_ledger::GroupTxidCache::default();
     let mut budget = GroupBudget::new(2);
 
     let gi0 = GroupInfo {
@@ -2609,6 +2619,7 @@ fn write_budget_combined_oversized_create_calls_without_group_sharing_wrongly_ac
         index: 0,
         ran_program: &ran_program,
         scratch: &scratch,
+        txid_cache: &group_txid_cache,
     };
     apply_transaction_with_budget(
         &mut state,
@@ -2627,6 +2638,7 @@ fn write_budget_combined_oversized_create_calls_without_group_sharing_wrongly_ac
         index: 1,
         ran_program: &ran_program,
         scratch: &scratch,
+        txid_cache: &group_txid_cache,
     };
     apply_transaction_with_budget(
         &mut state,

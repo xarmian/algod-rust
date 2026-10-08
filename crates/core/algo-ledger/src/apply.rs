@@ -1458,6 +1458,7 @@ fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
     // the real values it wrote (see `GroupInfo::scratch`).
     let ran_program = RefCell::new(vec![false; group.len()]);
     let scratch = RefCell::new(vec![None; group.len()]);
+    let group_txid_cache = crate::avm_context::GroupTxidCache::default();
     for (gi_idx, stx) in group.iter().enumerate() {
         ctx.txn_index.set(*global_txn_idx);
         if ctx.validate {
@@ -1469,6 +1470,7 @@ fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
             index: gi_idx,
             ran_program: &ran_program,
             scratch: &scratch,
+            txid_cache: &group_txid_cache,
         };
         if stx.txn.txn_type == "appl" {
             // App-call opcode budget is pooled across the whole atomic
@@ -2798,6 +2800,19 @@ fn build_avm_group(
     }
 }
 
+/// Point a freshly-built top-level `LedgerAvmContext` at its group's shared
+/// [`GroupInfo::txid_cache`] (go: every app call of the top-level group
+/// evaluates against the same `EvalParams`, hence the same `txidCache`;
+/// issue #1736). A no-op without group info (standalone transaction).
+fn seed_avm_txid_cache_from_group<L: crate::store_trait::LedgerStore>(
+    avm_ctx: &mut LedgerAvmContext<'_, L>,
+    group_info: Option<&GroupInfo<'_>>,
+) {
+    if let Some(gi) = group_info {
+        avm_ctx.share_group_txid_cache(gi.txid_cache.clone());
+    }
+}
+
 /// Seed a freshly-built `LedgerAvmContext`'s scratch view from the group's
 /// shared `ran_program`/`scratch` record, so `gload`/`gloads`/`gloadss` can
 /// see which earlier siblings already ran a program and read back the real
@@ -2989,6 +3004,17 @@ pub struct GroupInfo<'a> {
     /// #686). `None` until that index's program has run, matching
     /// `ran_program`.
     pub scratch: &'a RefCell<Vec<Option<[TealValue; 256]>>>,
+    /// go's top-level `EvalParams.txidCache` (eval.go:409): the pre-v34
+    /// `getTxIDNotUnified` TxID cache lives on the group's single shared
+    /// `EvalParams`, so every app call of the top-level group reads and
+    /// fills the same slots (keyed only by group index; issue #1736).
+    /// Borrowed like `ran_program`/`scratch`: the cache lives exactly as
+    /// long as ONE top-level group evaluation and is created once per group
+    /// by its driver (`apply_group_transactions` and the simulator's
+    /// per-group loop); every member's `GroupInfo` must borrow that same
+    /// instance. Seeded into each member's `LedgerAvmContext` by
+    /// `seed_avm_txid_cache_from_group`.
+    pub txid_cache: &'a crate::avm_context::GroupTxidCache,
 }
 
 /// Apply a single signed transaction with a group budget for AVM execution.
@@ -5080,6 +5106,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     avm_ctx.fee_residue = ctx.fee_residue.get();
                     ctx.configure_avm_ctx(&mut avm_ctx);
                     seed_avm_scratch_from_group(&mut avm_ctx, group_info);
+                    seed_avm_txid_cache_from_group(&mut avm_ctx, group_info);
                     seed_avm_created_resources_from_group(&mut avm_ctx, group_info);
                     if let Some(ref mut t) = tracer {
                         avm_ctx.tracer_ptr = Some(*t as *mut dyn EvalTracer);
@@ -5262,6 +5289,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 avm_ctx.fee_residue = ctx.fee_residue.get();
                 ctx.configure_avm_ctx(&mut avm_ctx);
                 seed_avm_scratch_from_group(&mut avm_ctx, group_info);
+                seed_avm_txid_cache_from_group(&mut avm_ctx, group_info);
                 seed_avm_created_resources_from_group(&mut avm_ctx, group_info);
                 if let Some(ref mut t) = tracer {
                     avm_ctx.tracer_ptr = Some(*t as *mut dyn EvalTracer);
