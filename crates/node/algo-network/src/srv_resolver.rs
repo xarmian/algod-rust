@@ -1508,4 +1508,106 @@ mod tests {
 
         assert_eq!(addrs, vec!["archival1.algorand.network:4160"]);
     }
+
+    // Issue #1702 root-cause evidence: in-process stub DNS server (no DNSSEC
+    // data, like systemd-resolved) -- a validating lookup issues a sequential
+    // DNSKEY/DS/... sub-query walk per additional-section glue name, so its
+    // wall time is (queries x RTT), while the non-validating lookup is 1 query.
+    mod fake_dns {
+        use hickory_resolver::proto::op::{Message, MessageType, ResponseCode};
+        use hickory_resolver::proto::rr::rdata::{A, SRV};
+        use hickory_resolver::proto::rr::{Name, RData, Record, RecordType};
+        use std::net::{Ipv4Addr, SocketAddr};
+        use std::str::FromStr;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        pub struct Fake {
+            pub addr: SocketAddr,
+            pub queries: Arc<AtomicUsize>,
+        }
+
+        pub async fn spawn(n_targets: usize) -> Fake {
+            let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = sock.local_addr().unwrap();
+            let queries = Arc::new(AtomicUsize::new(0));
+            let q2 = queries.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    let (n, peer) = match sock.recv_from(&mut buf).await {
+                        Ok(x) => x,
+                        Err(_) => return,
+                    };
+                    let Ok(req) = Message::from_vec(&buf[..n]) else {
+                        continue;
+                    };
+                    q2.fetch_add(1, Ordering::SeqCst);
+                    let mut resp = Message::new();
+                    resp.set_id(req.id());
+                    resp.set_message_type(MessageType::Response);
+                    resp.set_op_code(req.op_code());
+                    resp.set_recursion_desired(true);
+                    resp.set_recursion_available(true);
+                    resp.set_response_code(ResponseCode::NoError);
+                    if let Some(q) = req.queries().first() {
+                        resp.add_query(q.clone());
+                        if q.query_type() == RecordType::SRV {
+                            for i in 0..n_targets {
+                                let t = Name::from_str(&format!("r{i}.example.test.")).unwrap();
+                                resp.add_answer(Record::from_rdata(
+                                    q.name().clone(),
+                                    300,
+                                    RData::SRV(SRV::new(1, 1, 4160, t.clone())),
+                                ));
+                                resp.add_additional(Record::from_rdata(
+                                    t,
+                                    300,
+                                    RData::A(A(Ipv4Addr::new(10, 0, 0, 1))),
+                                ));
+                            }
+                        }
+                    }
+                    if let Some(edns) = req.extensions().clone() {
+                        resp.set_edns(edns);
+                    }
+                    let bytes = resp.to_vec().unwrap();
+                    let _ = sock.send_to(&bytes, peer).await;
+                }
+            });
+            Fake { addr, queries }
+        }
+    }
+
+    /// Query-count (not wall-clock) pin of the #1702 root cause: a validating
+    /// lookup's sub-query count grows with the additional-section size, while
+    /// a non-validating one stays a single query. Asserts only the trend, not
+    /// hickory's exact per-name query count.
+    ///
+    /// Diagnostic: may need updating on hickory upgrade (it documents
+    /// hickory's additional-section validation behaviour, which this crate
+    /// cannot change).
+    #[tokio::test]
+    async fn validated_lookup_queries_grow_with_additional_section() {
+        async fn queries(targets: usize, validate: bool) -> usize {
+            let fake = fake_dns::spawn(targets).await;
+            let group =
+                NameServerConfigGroup::from_ips_clear(&[fake.addr.ip()], fake.addr.port(), true);
+            let cfg = ResolverConfig::from_parts(None, vec![], group);
+            let r = HickorySrvResolver::build_resolver(cfg, validate);
+            let res = HickorySrvResolver::do_lookup_bounded(&r, "_algobootstrap._tcp.example.test")
+                .await
+                .expect("stub lookup");
+            assert_eq!(res.len(), targets);
+            fake.queries.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        assert_eq!(queries(10, false).await, 1);
+        assert_eq!(queries(20, false).await, 1);
+        let small = queries(5, true).await;
+        let large = queries(20, true).await;
+        assert!(
+            large > small && small > 1,
+            "validating sub-queries should grow with glue names: {small} -> {large}"
+        );
+    }
 }

@@ -68,6 +68,7 @@ libc.workspace = true
 algo-build-info.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 serde_json.workspace = true
 rmpv.workspace = true
 tower.workspace = true
