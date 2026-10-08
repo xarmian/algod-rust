@@ -59,22 +59,36 @@ jobs:
           shared-key: unit-tests
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # The real-thread multi-node agreement binaries are excluded here only:
-      # in an unoptimized (debug) build they take well over 30 minutes on a
-      # 4-core runner (a first all-in run hit the 40 min timeout with
-      # service_multi_node_test tests running 17+ min each), and they are
-      # load/timing-sensitive (#1693, #1695). They still run, in release with
-      # retries, in the daily Coverage workflow (cargo llvm-cov nextest
-      # --workspace --release). Everything else, including every other
-      # algo-agreement test, runs per PR. Tracked in #1750; re-enable once a
-      # fast/deterministic harness exists (#1695).
+      # The real-thread multi-node agreement binary `service_multi_node_test`
+      # (real Service + threads + simulated network) is excluded here only:
+      # in an unoptimized (debug) build its tests take 17+ min each on a
+      # 4-core runner (a first all-in run hit the 40 min timeout), and they
+      # are load/timing-sensitive (#1693, #1695). It still runs, in release
+      # with retries, in the daily Coverage workflow (cargo llvm-cov nextest
+      # --workspace --release). Everything else, including the rest of
+      # algo-agreement (player_real_harness_test: direct Player with real
+      # VRF/OTS signing, slow but only ~4 min in debug), runs per PR.
+      # Tracked in #1750 / follow-up #1752.
       - name: Run workspace tests
-        run: >-
-          cargo nextest run --workspace --profile ci
-          -E 'not (binary(service_multi_node_test) | binary(player_real_harness_test))'
+        shell: bash
+        run: |
+          cargo nextest run --workspace --profile ci             -E 'not binary(service_multi_node_test)' 2>&1 | tee nextest.log
+
+      # Retried-then-passed tests are not failures but must not be invisible:
+      # surface nextest's FLAKY lines in the job summary.
+      - name: Summarize flaky tests
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          {
+            echo "### Flaky tests (passed only after a retry)"
+            sed 's/\[[0-9;]*m//g' nextest.log | grep -E 'FLAKY|TRY [0-9]+ (FAIL|PASS)' | sort -u || true
+            echo "(none listed above means no test needed a retry)"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # nextest skips doctests. Run them for the whole workspace; the
       # algo-network peer_features doctest failure seen on Windows dev
       # machines is a noexec-tmp local issue and does not occur on Linux CI.
       - name: Run workspace doctests
+        if: ${{ !cancelled() }}
         run: cargo test --workspace --doc

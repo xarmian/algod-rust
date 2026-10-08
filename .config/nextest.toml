@@ -11,15 +11,27 @@
 # first failing binary.
 fail-fast = false
 
-# Retry a failed test up to 2 more times; it only fails the job if it fails
-# every attempt. nextest reports a test that passed on a retry as FLAKY in the
-# log, so retried tests stay visible rather than being skipped silently.
-# Known load-sensitive tests on the shared 4-core runner (no test is excluded):
+# Default: NO retries, so a genuine race in any ordinary test fails loudly.
+retries = 0
+
+# Hard-kill any single test after 20 x 60s = 20 min, so one hung test names
+# itself instead of consuming the whole job timeout. Tests running longer than
+# 60s are flagged SLOW in the log.
+slow-timeout = { period = "60s", terminate-after = 20 }
+
+# Retries (2) only for the known load-sensitive tests on the shared 4-core
+# runner. A retried pass is reported as FLAKY in the log (and surfaced in the
+# job summary by the workflow), so it stays visible.
 #   - real-thread multi-node agreement harness quiescence detection,
-#     crates/core/algo-agreement/tests/service_multi_node_test.rs (issues #1693, #1695)
+#     service_multi_node_test (issues #1693, #1695). NOTE: that binary is
+#     filtered out of the PR job by the workflow (too slow in a debug build),
+#     but the override stays so running it with `--profile ci` is sane.
 #   - lookback_prefetch bounded-lookahead timing assertion (issue #1723)
 # Same retry count as the scheduled Coverage workflow (PR #1694).
+[[profile.ci.overrides]]
+filter = 'binary(service_multi_node_test) | test(/lookback_prefetch::/)'
 retries = 2
 
-# Flag tests that run suspiciously long (they are not killed).
-slow-timeout = { period = "60s" }
+# NOTE: the PR workflow EXCLUDES the `service_multi_node_test` binary (via a
+# `-E` filter on the command line, see .github/workflows/unit-tests.yml and
+# issue #1752); it still runs in the daily Coverage workflow.
