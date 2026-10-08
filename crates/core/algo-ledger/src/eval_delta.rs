@@ -1953,22 +1953,37 @@ mod tests {
 
     /// Issue #1743: `SignedTransaction.eval_delta` must keep go's msgpack
     /// `str` typing for non-UTF-8 `dt` keys / `bs` / `lg` through the plain
-    /// serde (`rmp_serde`) path as well as the canonical encoder, and a
-    /// bin-typed legacy `dt` must still decode (and be normalised to str).
+    /// serde (`rmp_serde`) path as well as the canonical encoder.
     #[test]
     fn eval_delta_non_utf8_str_survives_rmp_serde_round_trip() {
         let stx = appl_child_with_non_utf8_dt();
         let bytes = rmp_serde::to_vec_named(&stx).unwrap();
-        let has = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
-        assert!(has(&bytes, &[0xa1, 0xff]), "gd key must be written as str");
+        // Structural check with rmpv (keeps invalid-UTF-8 `str` distinct from
+        // `bin`): the serde-written `dt` carries `Value::String`, not `Binary`.
+        let top = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+        let get = |v: &Value, k: &str| -> Value {
+            let Value::Map(m) = v else { panic!() };
+            m.iter()
+                .find(|(kk, _)| kk.as_str() == Some(k))
+                .unwrap()
+                .1
+                .clone()
+        };
+        let dt = get(&top, "dt");
+        let is_str = |v: &Value, b: u8| matches!(v, Value::String(s) if s.as_bytes() == [b]);
+        let Value::Map(gd) = get(&dt, "gd") else {
+            panic!()
+        };
         assert!(
-            has(&bytes, &[0xa2, b'b', b's', 0xa1, 0x80]),
-            "bs must be str"
+            is_str(&gd[0].0, 0xff),
+            "gd key must be str, got {:?}",
+            gd[0].0
         );
-        assert!(
-            has(&bytes, &[0xa2, b'l', b'g', 0x91, 0xa1, 0xfe]),
-            "lg must be str"
-        );
+        assert!(is_str(&get(&gd[0].1, "bs"), 0x80), "bs must be str");
+        let Value::Array(lg) = get(&dt, "lg") else {
+            panic!()
+        };
+        assert!(is_str(&lg[0], 0xfe), "lg must be str");
         let back: SignedTransaction = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(back.eval_delta, stx.eval_delta);
         assert_eq!(
@@ -1976,31 +1991,18 @@ mod tests {
             algo_codec::canonical_encode_signed_txn_in_block(&stx),
             "canonical encoding is identical after the serde round trip"
         );
-        // Legacy bin-typed form (what older serde wrote) still decodes and
-        // normalises back to go's str typing.
-        let legacy = {
-            let mut v = rmp_serde::to_vec_named(&stx).unwrap();
-            let mut at = None;
-            for i in 0..v.len().saturating_sub(1) {
-                if v[i] == 0xa1 && v[i + 1] == 0xff {
-                    at = Some(i);
-                    break;
-                }
-            }
-            let i = at.unwrap();
-            v.splice(i..i + 2, [0xc4, 0x01, 0xff]);
-            v
-        };
-        let from_legacy: SignedTransaction = rmp_serde::from_slice(&legacy).unwrap();
-        assert_eq!(from_legacy.eval_delta, stx.eval_delta);
     }
 
-    /// Issue #1743 (item 2): outside the historical protocol-V24
-    /// `compatibilityMode`, go keys `ld` by `txn.IndexByAddress`, which
-    /// "return[s] the index at the first match"
-    /// (`data/transactions/application.go`; `ledger/eval/appcow.go`
-    /// `buildEvalDelta`). So `accounts = [X, X]` addressed by slot 2 still
-    /// yields `ld` key 1.
+    /// Issue #1743 (item 2). Verifies exactly one thing: for every protocol
+    /// other than the historical `ConsensusV24` compatibility window, an
+    /// account listed twice in `accounts` and addressed by the second slot
+    /// gets the FIRST slot's `ld` key. go keys `ld` by
+    /// `txn.IndexByAddress`, "returning the index at the first match"
+    /// (`data/transactions/application.go`), in `buildEvalDelta`
+    /// (`ledger/eval/appcow.go`); the referenced `accountIdx` is used only
+    /// when `roundCowState.compatibilityMode` is set, which `ledger/eval/cow.go`
+    /// enables only for `hdr.CurrentProtocol == protocol.ConsensusV24`. The V24
+    /// compatibility mode is NOT implemented here (not covered by this test).
     #[test]
     fn ld_duplicate_account_uses_first_slot_like_go_index_by_address() {
         let x = Address([2u8; 32]);

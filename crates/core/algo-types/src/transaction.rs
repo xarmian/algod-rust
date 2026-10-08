@@ -793,26 +793,51 @@ fn is_none_or_empty_box_ref_name(v: &Option<ByteBuf>) -> bool {
 /// go writes `EvalDelta` keys, `bs` and `lg` entries as msgpack `str` even
 /// when the bytes are not valid UTF-8. `rmpv::Value`'s own `Serialize` writes
 /// such a `Utf8String` as `bin`, and `rmp_serde` hands invalid-UTF-8 `str`
-/// back as bytes, so both directions lose the typing. This module (a)
-/// serializes invalid-UTF-8 strings as `str` for non-human-readable formats
-/// and (b) re-applies go's schema typing after deserialize (also upgrading
-/// legacy bin-typed forms). Valid UTF-8 content is unchanged on the wire.
-pub mod serde_eval_delta {
+/// back as bytes, so both directions lose the typing. (`rmp_serde::Raw` does
+/// not help: its `Serialize` writes invalid UTF-8 as `bin` too.)
+///
+/// serde offers no safe way to emit a `str` holding invalid UTF-8, so the
+/// invalid-UTF-8 branch is reachable **only** when the serializer is
+/// `rmp_serde`'s own encoder (identified by `is_rmp_serializer`) and is
+/// non-human-readable; `rmp_serde::Serializer::serialize_str` only copies
+/// `len()`/`as_bytes()` onto the wire and never inspects characters, so the
+/// transient invalid `&str` is never relied upon. Every other serializer
+/// (bincode, postcard, validating wrappers, JSON) gets `serialize_bytes`
+/// (or, human-readable, a lossy string) and never sees an invalid `&str`.
+/// If the type-name probe ever stops matching, the failure mode is the old
+/// safe `bin` output, never UB.
+///
+/// On deserialize the go schema typing is re-applied by `retype_eval_delta`
+/// (also upgrading legacy bin-typed forms); valid UTF-8 content is unchanged
+/// on the wire.
+mod serde_eval_delta {
     use rmpv::Value;
     use serde::ser::{SerializeMap, SerializeSeq};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    /// True only for `rmp_serde`'s encoder (`&mut rmp_serde::encode::Serializer<..>`).
+    fn is_rmp_serializer<S>() -> bool {
+        std::any::type_name::<S>().contains("rmp_serde::encode::Serializer")
+    }
 
     struct Preserving<'a>(&'a Value);
 
     impl Serialize for Preserving<'_> {
         fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
             match self.0 {
-                Value::String(v) if v.is_err() && !s.is_human_readable() => {
-                    // SAFETY: same argument as `serde_bytes_array::serde_raw_str`:
-                    // `rmp_serde`'s `serialize_str` only copies the bytes onto
-                    // the wire and never inspects the characters.
-                    let raw = unsafe { std::str::from_utf8_unchecked(v.as_bytes()) };
-                    s.serialize_str(raw)
+                Value::String(v) if v.is_err() => {
+                    let bytes = v.as_bytes();
+                    if s.is_human_readable() {
+                        s.serialize_str(&String::from_utf8_lossy(bytes))
+                    } else if is_rmp_serializer::<S>() {
+                        debug_assert!(std::str::from_utf8(bytes).is_err());
+                        // SAFETY: see the module docs -- only `rmp_serde`'s
+                        // encoder reaches this, and it only copies the bytes.
+                        let raw = unsafe { std::str::from_utf8_unchecked(bytes) };
+                        s.serialize_str(raw)
+                    } else {
+                        s.serialize_bytes(bytes)
+                    }
                 }
                 Value::Array(a) => {
                     let mut st = s.serialize_seq(Some(a.len()))?;
@@ -843,58 +868,68 @@ pub mod serde_eval_delta {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
         let mut v = Option::<Value>::deserialize(d)?;
         if let Some(v) = v.as_mut() {
-            retype_eval_delta(v);
+            retype_eval_delta(v).map_err(serde::de::Error::custom)?;
         }
         Ok(v)
     }
 
     /// Make `v` a go `str` (bytes of a `bin` kept verbatim, even non-UTF-8).
-    fn to_str(v: &mut Value) {
+    /// `rmpv::Utf8String` has no public constructor for invalid UTF-8, so the
+    /// value is built by decoding a `str` header + bytes; this cannot fail for
+    /// a well-formed header, but an error is propagated rather than panicking.
+    fn to_str(v: &mut Value) -> Result<(), String> {
         if let Value::Binary(b) = v {
             let b = std::mem::take(b);
             *v = match String::from_utf8(b) {
                 Ok(s) => Value::from(s),
                 Err(e) => {
                     let b = e.into_bytes();
+                    let len = u32::try_from(b.len()).map_err(|_| "str too long".to_string())?;
                     let mut buf = Vec::with_capacity(b.len() + 5);
-                    rmp::encode::write_str_len(&mut buf, b.len() as u32).expect("vec write");
+                    rmp::encode::write_str_len(&mut buf, len).map_err(|e| e.to_string())?;
                     buf.extend_from_slice(&b);
-                    rmpv::decode::read_value(&mut &buf[..]).expect("well-formed str")
+                    rmpv::decode::read_value(&mut &buf[..]).map_err(|e| e.to_string())?
                 }
             };
         }
+        Ok(())
     }
 
-    fn retype_state_delta(v: &mut Value) {
+    fn retype_state_delta(v: &mut Value) -> Result<(), String> {
         if let Value::Map(m) = v {
             for (k, vd) in m.iter_mut() {
-                to_str(k);
+                to_str(k)?;
                 if let Value::Map(f) = vd {
                     for (fk, fv) in f.iter_mut() {
                         if fk.as_str() == Some("bs") {
-                            to_str(fv);
+                            to_str(fv)?;
                         }
                     }
                 }
             }
         }
+        Ok(())
     }
 
     /// Apply go's `EvalDelta` field typing (`gd`/`ld` keys and `bs`, `lg`
     /// entries are `str`), recursing through `itx[*].dt`.
-    pub fn retype_eval_delta(v: &mut Value) {
-        let Value::Map(top) = v else { return };
+    fn retype_eval_delta(v: &mut Value) -> Result<(), String> {
+        let Value::Map(top) = v else { return Ok(()) };
         for (k, val) in top.iter_mut() {
             match k.as_str() {
-                Some("gd") => retype_state_delta(val),
+                Some("gd") => retype_state_delta(val)?,
                 Some("ld") => {
                     if let Value::Map(m) = val {
-                        m.iter_mut().for_each(|(_, sd)| retype_state_delta(sd));
+                        for (_, sd) in m.iter_mut() {
+                            retype_state_delta(sd)?;
+                        }
                     }
                 }
                 Some("lg") => {
                     if let Value::Array(a) = val {
-                        a.iter_mut().for_each(to_str);
+                        for e in a.iter_mut() {
+                            to_str(e)?;
+                        }
                     }
                 }
                 Some("itx") => {
@@ -903,7 +938,7 @@ pub mod serde_eval_delta {
                             if let Value::Map(f) = item {
                                 for (fk, fv) in f.iter_mut() {
                                     if fk.as_str() == Some("dt") {
-                                        retype_eval_delta(fv);
+                                        retype_eval_delta(fv)?;
                                     }
                                 }
                             }
@@ -912,6 +947,293 @@ pub mod serde_eval_delta {
                 }
                 _ => {}
             }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::SignedTransaction;
+
+        /// Build a go-typed `str` Value holding arbitrary bytes.
+        fn raw_str(b: &[u8]) -> Value {
+            let mut v = Value::Binary(b.to_vec());
+            to_str(&mut v).unwrap();
+            v
+        }
+
+        fn s(k: &str) -> Value {
+            Value::from(k)
+        }
+
+        fn sample_dt() -> Value {
+            let vd = Value::Map(vec![
+                (s("at"), Value::from(1u64)),
+                (s("bs"), raw_str(&[0x80])),
+            ]);
+            let inner = Value::Map(vec![(
+                s("gd"),
+                Value::Map(vec![(raw_str(&[0xfd]), vd.clone())]),
+            )]);
+            Value::Map(vec![
+                (s("gd"), Value::Map(vec![(raw_str(&[0xff]), vd.clone())])),
+                (
+                    s("itx"),
+                    Value::Array(vec![Value::Map(vec![
+                        (s("aca"), Value::from(1u64)),
+                        (s("dt"), inner),
+                    ])]),
+                ),
+                (
+                    s("ld"),
+                    Value::Map(vec![(
+                        Value::from(1u64),
+                        Value::Map(vec![(raw_str(&[0xfe]), vd)]),
+                    )]),
+                ),
+                (s("lg"), Value::Array(vec![raw_str(&[0xfc])])),
+            ])
+        }
+
+        fn stx() -> SignedTransaction {
+            SignedTransaction {
+                eval_delta: Some(sample_dt()),
+                ..Default::default()
+            }
+        }
+
+        fn get<'a>(v: &'a Value, k: &str) -> &'a Value {
+            let Value::Map(m) = v else { panic!("map") };
+            &m.iter().find(|(kk, _)| kk.as_str() == Some(k)).unwrap().1
+        }
+
+        fn map_of(v: &Value) -> &Vec<(Value, Value)> {
+            let Value::Map(m) = v else { panic!("map") };
+            m
+        }
+
+        /// Assert every non-UTF-8 position of `dt` is a msgpack `str`
+        /// (`Value::String` with invalid UTF-8), never `Binary`.
+        fn assert_str_typed(dt: &Value) {
+            let is_raw_str = |v: &Value, b: u8| matches!(v, Value::String(s) if s.is_err() && s.as_bytes() == [b]);
+            let gd = map_of(get(dt, "gd"));
+            assert!(is_raw_str(&gd[0].0, 0xff), "gd key");
+            assert!(is_raw_str(get(&gd[0].1, "bs"), 0x80), "gd bs");
+            let ld = map_of(get(dt, "ld"));
+            let l1 = map_of(&ld[0].1);
+            assert!(is_raw_str(&l1[0].0, 0xfe), "ld key");
+            let Value::Array(lg) = get(dt, "lg") else {
+                panic!()
+            };
+            assert!(is_raw_str(&lg[0], 0xfc), "lg entry");
+            let Value::Array(itx) = get(dt, "itx") else {
+                panic!()
+            };
+            let igd = map_of(get(get(&itx[0], "dt"), "gd"));
+            assert!(is_raw_str(&igd[0].0, 0xfd), "itx dt gd key");
+        }
+
+        /// Decode serde-written bytes with the msgpack-faithful rmpv reader
+        /// (which keeps invalid-UTF-8 `str`, unlike rmp_serde).
+        fn read(bytes: &[u8]) -> Value {
+            rmpv::decode::read_value(&mut &bytes[..]).unwrap()
+        }
+
+        #[test]
+        fn rmp_serde_writes_str_and_round_trips() {
+            let stx = stx();
+            let bytes = rmp_serde::to_vec_named(&stx).unwrap();
+            assert_str_typed(get(&read(&bytes), "dt"));
+            let back: SignedTransaction = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(back.eval_delta, stx.eval_delta);
+            assert_str_typed(back.eval_delta.as_ref().unwrap());
+        }
+
+        #[test]
+        fn legacy_bin_form_decodes_and_is_retyped() {
+            // Old serde wrote the schema's str positions (keys, bs, lg) as
+            // bin; structural keys stayed valid str.
+            fn downgrade(v: &mut Value, schema_str: bool) {
+                match v {
+                    Value::String(x) if schema_str => *v = Value::Binary(x.as_bytes().to_vec()),
+                    Value::Array(a) => a.iter_mut().for_each(|e| downgrade(e, schema_str)),
+                    Value::Map(m) => m.iter_mut().for_each(|(k, x)| {
+                        let structural = matches!(
+                            k.as_str(),
+                            Some("at" | "bs" | "gd" | "ld" | "lg" | "itx" | "dt" | "aca")
+                        );
+                        if !structural {
+                            downgrade(k, true);
+                        }
+                        let is_bs = k.as_str() == Some("bs");
+                        let is_lg = k.as_str() == Some("lg");
+                        downgrade(x, schema_str || is_bs || is_lg);
+                    }),
+                    _ => {}
+                }
+            }
+            let mut legacy = sample_dt();
+            downgrade(&mut legacy, false);
+            assert!(matches!(&map_of(get(&legacy, "gd"))[0].0, Value::Binary(_)));
+            let bytes = rmp_serde::to_vec_named(&SignedTransaction {
+                eval_delta: Some(legacy),
+                ..Default::default()
+            })
+            .unwrap();
+            let back: SignedTransaction = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(back.eval_delta, Some(sample_dt()));
+        }
+
+        #[test]
+        fn human_readable_branch_is_lossy_and_valid_content_untouched() {
+            let json = serde_json::to_string(&stx()).unwrap();
+            assert!(json.contains('\u{fffd}'));
+            let ok = SignedTransaction {
+                eval_delta: Some(Value::Map(vec![(s("lg"), Value::Array(vec![s("hi")]))])),
+                ..Default::default()
+            };
+            let back: SignedTransaction =
+                serde_json::from_str(&serde_json::to_string(&ok).unwrap()).unwrap();
+            assert_eq!(back.eval_delta, ok.eval_delta);
+        }
+
+        /// A non-rmp, non-human-readable serializer must never be handed an
+        /// invalid `&str`: it asserts validity on every `serialize_str`.
+        #[test]
+        fn non_rmp_serializer_never_sees_invalid_str() {
+            use serde::ser::Impossible;
+            use std::cell::RefCell;
+
+            #[derive(Debug)]
+            struct E(String);
+            impl std::fmt::Display for E {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str(&self.0)
+                }
+            }
+            impl std::error::Error for E {}
+            impl serde::ser::Error for E {
+                fn custom<T: std::fmt::Display>(t: T) -> Self {
+                    E(t.to_string())
+                }
+            }
+
+            type Counts<'a> = &'a RefCell<(usize, usize)>; // (str calls, bytes calls)
+            struct V<'a>(Counts<'a>);
+
+            macro_rules! unsupported {
+                ($($f:ident($($t:ty),*) -> $r:ty;)*) => {$(
+                    fn $f(self, $(_: $t),*) -> Result<$r, E> { Err(E("unsupported".into())) }
+                )*};
+            }
+            macro_rules! scalar {
+                ($($f:ident($t:ty);)*) => {$(
+                    fn $f(self, _: $t) -> Result<(), E> { Ok(()) }
+                )*};
+            }
+
+            impl<'a> Serializer for V<'a> {
+                type Ok = ();
+                type Error = E;
+                type SerializeSeq = V<'a>;
+                type SerializeMap = V<'a>;
+                type SerializeTuple = Impossible<(), E>;
+                type SerializeTupleStruct = Impossible<(), E>;
+                type SerializeTupleVariant = Impossible<(), E>;
+                type SerializeStruct = Impossible<(), E>;
+                type SerializeStructVariant = Impossible<(), E>;
+                fn is_human_readable(&self) -> bool {
+                    false
+                }
+                scalar! {
+                    serialize_bool(bool); serialize_i8(i8); serialize_i16(i16);
+                    serialize_i32(i32); serialize_i64(i64); serialize_u8(u8);
+                    serialize_u16(u16); serialize_u32(u32); serialize_u64(u64);
+                    serialize_f32(f32); serialize_f64(f64); serialize_char(char);
+                }
+                fn serialize_str(self, v: &str) -> Result<(), E> {
+                    assert!(std::str::from_utf8(v.as_bytes()).is_ok());
+                    self.0.borrow_mut().0 += 1;
+                    Ok(())
+                }
+                fn serialize_bytes(self, _: &[u8]) -> Result<(), E> {
+                    self.0.borrow_mut().1 += 1;
+                    Ok(())
+                }
+                fn serialize_none(self) -> Result<(), E> {
+                    Ok(())
+                }
+                fn serialize_some<T: ?Sized + Serialize>(self, v: &T) -> Result<(), E> {
+                    v.serialize(self)
+                }
+                fn serialize_unit(self) -> Result<(), E> {
+                    Ok(())
+                }
+                fn serialize_seq(self, _: Option<usize>) -> Result<V<'a>, E> {
+                    Ok(self)
+                }
+                fn serialize_map(self, _: Option<usize>) -> Result<V<'a>, E> {
+                    Ok(self)
+                }
+                unsupported! {
+                    serialize_unit_struct(&'static str) -> ();
+                    serialize_unit_variant(&'static str, u32, &'static str) -> ();
+                    serialize_tuple(usize) -> Impossible<(), E>;
+                    serialize_tuple_struct(&'static str, usize) -> Impossible<(), E>;
+                    serialize_tuple_variant(&'static str, u32, &'static str, usize) -> Impossible<(), E>;
+                    serialize_struct(&'static str, usize) -> Impossible<(), E>;
+                    serialize_struct_variant(&'static str, u32, &'static str, usize) -> Impossible<(), E>;
+                }
+                fn serialize_newtype_struct<T: ?Sized + Serialize>(
+                    self,
+                    _: &'static str,
+                    _: &T,
+                ) -> Result<(), E> {
+                    Err(E("unsupported".into()))
+                }
+                fn serialize_newtype_variant<T: ?Sized + Serialize>(
+                    self,
+                    _: &'static str,
+                    _: u32,
+                    _: &'static str,
+                    _: &T,
+                ) -> Result<(), E> {
+                    Err(E("unsupported".into()))
+                }
+            }
+            impl SerializeSeq for V<'_> {
+                type Ok = ();
+                type Error = E;
+                fn serialize_element<T: ?Sized + Serialize>(&mut self, v: &T) -> Result<(), E> {
+                    v.serialize(V(self.0))
+                }
+                fn end(self) -> Result<(), E> {
+                    Ok(())
+                }
+            }
+            impl SerializeMap for V<'_> {
+                type Ok = ();
+                type Error = E;
+                fn serialize_key<T: ?Sized + Serialize>(&mut self, v: &T) -> Result<(), E> {
+                    v.serialize(V(self.0))
+                }
+                fn serialize_value<T: ?Sized + Serialize>(&mut self, v: &T) -> Result<(), E> {
+                    v.serialize(V(self.0))
+                }
+                fn end(self) -> Result<(), E> {
+                    Ok(())
+                }
+            }
+
+            let counts = RefCell::new((0, 0));
+            serialize(&Some(sample_dt()), V(&counts)).unwrap();
+            let (strs, bins) = *counts.borrow();
+            assert!(
+                bins >= 5,
+                "invalid-UTF-8 strings fall back to bytes, got {bins}"
+            );
+            assert!(strs > 0, "valid strings still go through serialize_str");
         }
     }
 }
