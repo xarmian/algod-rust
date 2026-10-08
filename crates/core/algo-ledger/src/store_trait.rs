@@ -438,7 +438,7 @@ pub trait LedgerStore {
     ///
     /// `None` (the default) means this store cannot faithfully roll back a
     /// scratch block apply, so [`crate::shadow_execute`] skips it.
-    fn save_scratch_state(&self) -> Option<Box<dyn std::any::Any>> {
+    fn save_scratch_state(&mut self) -> Option<Box<dyn std::any::Any>> {
         None
     }
 

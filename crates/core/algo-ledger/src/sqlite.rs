@@ -7102,27 +7102,27 @@ impl LedgerStore for SqliteLedger {
         self.pending_online_touched = snapshot.online_touched;
     }
 
-    fn save_scratch_state(&self) -> Option<Box<dyn std::any::Any>> {
-        // The lease table is cloned here rather than reusing `lease_snapshot`:
-        // that snapshot is taken at `begin_block` (before any earlier mutation
-        // in the same open block) and is consumed by `rollback_block`, so it
-        // is not the state at scratch-apply time and must stay untouched.
+    fn save_scratch_state(&mut self) -> Option<Box<dyn std::any::Any>> {
+        // The lease table is NOT cloned (issue #1720): an undo journal is
+        // opened instead and records only the leases the scratch apply adds,
+        // overwrites or purges, so the per-block cost is proportional to the
+        // block, not to the whole table. `lease_snapshot` is not reused: it is
+        // taken at `begin_block` (before any earlier mutation in the same open
+        // block) and is consumed by `rollback_block`, so it is not the state at
+        // scratch-apply time and must stay untouched.
         // The SAVEPOINT covers the SQL tables and `snapshot` the totals
         // delta; the lease table and the append-only trie pre-mutation log
         // are in-memory only (same pair `apply_block_caching_delta`'s
         // group-delta scratch apply restores by hand).
-        Some(Box::new((
-            self.lease_table.clone(),
-            self.pre_mutations.len(),
-        )))
+        self.lease_table.begin_undo();
+        Some(Box::new(self.pre_mutations.len()))
     }
 
     fn restore_scratch_state(&mut self, saved: Box<dyn std::any::Any>) {
-        match saved.downcast::<(LeaseTable, usize)>() {
-            Ok(saved) => {
-                let (leases, pre_mutations_len) = *saved;
-                self.lease_table = leases;
-                self.pre_mutations.truncate(pre_mutations_len);
+        match saved.downcast::<usize>() {
+            Ok(pre_mutations_len) => {
+                self.lease_table.rollback_undo();
+                self.pre_mutations.truncate(*pre_mutations_len);
             }
             Err(_) => {
                 // The state was produced by a different store type: the
@@ -11091,6 +11091,28 @@ mod tests {
         assert!(
             ledger.check_lease(&sender, &lease, 100).is_ok(),
             "rolled-back lease must not persist",
+        );
+    }
+
+    #[test]
+    fn scratch_state_round_trip_restores_leases_and_pre_mutations() {
+        use crate::store_trait::LedgerStore;
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let s = Address([5u8; 32]);
+        ledger.record_lease(&s, &[1; 32], 100); // purged by the scratch pass
+        ledger.record_lease(&s, &[2; 32], 300); // overwritten by the scratch pass
+        let before = ledger.lease_table().clone();
+
+        let saved = ledger.save_scratch_state().expect("supported");
+        ledger.record_lease(&s, &[3; 32], 500);
+        ledger.record_lease(&s, &[2; 32], 900);
+        ledger.purge_expired_leases(150);
+        ledger.restore_scratch_state(saved);
+
+        assert_eq!(*ledger.lease_table(), before);
+        assert!(
+            ledger.lease_table().undo_len().is_none(),
+            "journal must be closed after restore"
         );
     }
 

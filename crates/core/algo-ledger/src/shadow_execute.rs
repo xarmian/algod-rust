@@ -104,7 +104,7 @@ fn test_hook() -> u8 {
 
 /// `save_scratch_state` with the test-only "unsupported store" injection
 /// compiled out of production builds.
-fn scratch_state<L: LedgerStore>(store: &L) -> Option<Box<dyn std::any::Any>> {
+fn scratch_state<L: LedgerStore>(store: &mut L) -> Option<Box<dyn std::any::Any>> {
     #[cfg(test)]
     if test_hook() == 1 {
         return None;

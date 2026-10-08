@@ -481,7 +481,7 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
         self.inner.delete_voters_participants(round)
     }
 
-    fn save_scratch_state(&self) -> Option<Box<dyn std::any::Any>> {
+    fn save_scratch_state(&mut self) -> Option<Box<dyn std::any::Any>> {
         self.inner.save_scratch_state()
     }
 
