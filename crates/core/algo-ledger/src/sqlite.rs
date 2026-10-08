@@ -3573,7 +3573,9 @@ impl SqliteLedger {
                 self.set_fee_sink(saved_fee_sink);
                 self.set_rewards_pool(saved_rewards_pool);
                 self.set_txn_counter(saved_txn_counter);
-                self.lease_table = saved_leases;
+                if self.lease_table.replace_with(saved_leases) {
+                    tracing::error!("group-delta scratch apply found an open lease undo journal; rolled it back");
+                }
 
                 self.group_delta_tracer = Some(tracer);
             }
@@ -3806,7 +3808,9 @@ impl SqliteLedger {
         self.pending_totals_delta = AccountTotalsDelta::default();
         self.pending_online_touched.clear();
         if let Some(snapshot) = self.lease_snapshot.take() {
-            self.lease_table = snapshot;
+            if self.lease_table.replace_with(snapshot) {
+                tracing::error!("lease undo journal still open at block reset; rolled it back");
+            }
         }
         self.in_block = false;
         // Reload the trie from the last committed state -- any in-memory
@@ -4429,7 +4433,9 @@ impl SqliteLedger {
         // ROLLBACK below does not cover it, so leases recorded by partially-
         // applied transactions must be undone or they poison future submissions.
         if let Some(snapshot) = self.lease_snapshot.take() {
-            self.lease_table = snapshot;
+            if self.lease_table.replace_with(snapshot) {
+                tracing::error!("lease undo journal still open at rollback_block; rolled it back");
+            }
         }
 
         self.conn
@@ -7139,10 +7145,13 @@ impl LedgerStore for SqliteLedger {
                 self.pre_mutations.truncate(*pre_mutations_len);
             }
             Err(_) => {
-                // The state was produced by a different store type: the
-                // scratch apply was NOT rolled back for leases/trie log.
+                // The state was produced by a different store type. Still
+                // close the journal `save_scratch_state` opened (reverting the
+                // scratch leases) so it can never leak or grow; the trie
+                // pre-mutation log cannot be truncated without the saved length.
+                self.lease_table.rollback_undo();
                 tracing::error!(
-                    "restore_scratch_state: saved scratch state has an unexpected type; lease table and trie pre-mutation log were not restored"
+                    "restore_scratch_state: saved scratch state has an unexpected type; lease undo journal was rolled back but the trie pre-mutation log was not truncated"
                 );
                 debug_assert!(false, "restore_scratch_state: unexpected saved state type");
             }
@@ -11269,6 +11278,35 @@ mod tests {
         ledger.conn.execute_batch("DROP TABLE txtail").unwrap();
         assert!(ledger.tracker_rows_fingerprint().is_none());
         assert!(ledger.scratch_invariant_fingerprint().is_some());
+    }
+
+    #[test]
+    fn restore_scratch_state_with_wrong_type_still_closes_the_journal() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let s = Address([4u8; 32]);
+        let _ours = ledger.save_scratch_state().expect("supported");
+        ledger.record_lease(&s, &[9; 32], 100);
+        // Debug builds also debug_assert on the foreign state; either way the
+        // journal must be closed and the scratch lease reverted.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ledger.restore_scratch_state(Box::new("not a usize"));
+        }));
+        assert!(ledger.lease_table().undo_len().is_none());
+        assert!(ledger.check_lease(&s, &[9; 32], 1).is_ok());
+    }
+
+    #[test]
+    fn rollback_block_with_a_leaked_scratch_journal_restores_the_snapshot() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let s = Address([3u8; 32]);
+        ledger.record_lease(&s, &[1; 32], 100);
+        ledger.begin_block().unwrap();
+        let before = ledger.lease_table().clone();
+        let _leaked = ledger.save_scratch_state().expect("supported");
+        ledger.record_lease(&s, &[2; 32], 200);
+        ledger.rollback_block().unwrap();
+        assert_eq!(*ledger.lease_table(), before);
+        assert!(ledger.lease_table().undo_len().is_none());
     }
 
     #[test]

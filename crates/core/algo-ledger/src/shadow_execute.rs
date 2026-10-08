@@ -373,7 +373,7 @@ impl ScratchInvariant {
     fn check_scratch_pass<L: LedgerStore>(&self, store: &L) {
         if self.tracker.is_some() && self.tracker != store.tracker_rows_fingerprint() {
             invariant_violation(
-                "shadow-execute: scratch pass wrote persistent tracker rows; the real apply gained a tracker write above the scratch early return in apply_block_impl_ex",
+                "shadow-execute: scratch pass changed the newest per-round tracker rows (block store/txtail/online-params/voters; accounthashes not covered); the real apply may have gained a tracker write above the scratch early return in apply_block_impl_ex",
             );
         }
     }
@@ -384,7 +384,7 @@ impl ScratchInvariant {
             || (self.tracker.is_some() && self.tracker != store.tracker_rows_fingerprint())
         {
             invariant_violation(
-                "shadow-execute: scratch rollback left tracker/lease/trie-log state changed",
+                "shadow-execute: scratch rollback left lease/trie-log/totals state or the newest tracker rows changed",
             );
         }
         if let Some(chain) = &self.chain {
@@ -2309,7 +2309,7 @@ return
     }
 
     #[test]
-    #[should_panic(expected = "scratch pass wrote persistent tracker rows")]
+    #[should_panic(expected = "scratch pass changed the newest per-round tracker rows")]
     fn tracker_write_in_scratch_pass_trips_the_invariant() {
         let b = block(vec![pay()]);
         let _ = with_hook(4, || shadow_check_replay_block(&mut ledger(), &b));
@@ -2350,7 +2350,9 @@ return
     }
 
     #[test]
-    #[should_panic(expected = "scratch rollback left tracker/lease/trie-log state changed")]
+    #[should_panic(
+        expected = "scratch rollback left lease/trie-log/totals state or the newest tracker rows changed"
+    )]
     fn leak_surviving_rollback_trips_the_invariant() {
         let b = block(vec![pay()]);
         let _ = with_hook(5, || shadow_check_replay_block(&mut ledger(), &b));

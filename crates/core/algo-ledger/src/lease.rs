@@ -33,7 +33,7 @@ use algo_types::Address;
 pub struct LeaseTable {
     /// Maps (sender, lease) to the last_valid round of the recorded transaction.
     entries: HashMap<(Address, [u8; 32]), u64>,
-    /// Optional undo journal (see [`LeaseTable::begin_undo`]): the prior value
+    /// Optional undo journal (see [`LeaseTable::try_begin_undo`]): the prior value
     /// of every key `record`/`purge_expired` changed since it was opened, in
     /// mutation order. `None` outside a scratch apply.
     undo: Option<Vec<LeaseUndo>>,
@@ -143,17 +143,9 @@ impl LeaseTable {
     /// [`Self::rollback_undo`] without cloning the whole table (the shadow
     /// execute scratch apply runs per block; the table can hold many leases).
     ///
-    /// Journals do not nest: if one is already open this is refused (see
-    /// [`Self::try_begin_undo`]), the open journal is kept, and debug builds
-    /// assert.
-    pub fn begin_undo(&mut self) {
-        if !self.try_begin_undo() {
-            tracing::error!("LeaseTable::begin_undo: undo journal already open; nested begin refused, outer journal kept");
-            debug_assert!(false, "LeaseTable::begin_undo: undo journal already open");
-        }
-    }
-
-    /// Open the undo journal; `false` (and no change) if one is already open.
+    /// Journals do not nest: if one is already open this returns `false` and
+    /// leaves the open journal untouched (callers must treat that as "cannot
+    /// scratch-apply"). `true` = a fresh journal is now open.
     pub fn try_begin_undo(&mut self) -> bool {
         if self.undo.is_some() {
             return false;
@@ -162,7 +154,7 @@ impl LeaseTable {
         true
     }
 
-    /// Revert every mutation since [`Self::begin_undo`] (newest first, so
+    /// Revert every mutation since [`Self::try_begin_undo`] (newest first, so
     /// repeated writes to one key unwind to its original value) and close the
     /// journal. No-op when no journal is open.
     pub fn rollback_undo(&mut self) {
@@ -179,6 +171,17 @@ impl LeaseTable {
                 }
             }
         }
+    }
+
+    /// Replace the live entries with `snapshot` (a whole-table restore).
+    /// An undo journal still open here is a leaked scratch apply: it is rolled
+    /// back first (so nothing it recorded can survive) and closed. Returns
+    /// whether a journal was open, so callers can log the leak.
+    pub fn replace_with(&mut self, snapshot: LeaseTable) -> bool {
+        let leaked = self.undo.is_some();
+        self.rollback_undo();
+        self.entries = snapshot.entries;
+        leaked
     }
 
     /// Close the journal keeping the mutations.
@@ -284,7 +287,7 @@ mod tests {
         table.record(&s, &test_lease(2), 300); // overwritten while journaling
         let before = table.clone();
 
-        table.begin_undo();
+        assert!(table.try_begin_undo());
         table.record(&s, &test_lease(3), 500); // added
         table.record(&s, &test_lease(2), 900); // overwritten
         table.purge_expired(150); // lease 1 removed
@@ -302,7 +305,7 @@ mod tests {
     fn clone_never_carries_an_open_journal() {
         let mut table = LeaseTable::new();
         let s = test_address(9);
-        table.begin_undo();
+        assert!(table.try_begin_undo());
         table.record(&s, &test_lease(1), 100);
         let copy = table.clone();
         assert!(copy.undo_len().is_none(), "snapshot clone must not journal");
@@ -322,13 +325,18 @@ mod tests {
         assert!(table.check(&s, &test_lease(1), 1).is_ok());
     }
 
-    #[cfg(debug_assertions)]
     #[test]
-    #[should_panic(expected = "undo journal already open")]
-    fn nested_begin_undo_trips_the_debug_assert() {
+    fn replace_with_rolls_back_a_leaked_journal_first() {
         let mut table = LeaseTable::new();
-        table.begin_undo();
-        table.begin_undo();
+        let s = test_address(11);
+        table.record(&s, &test_lease(1), 100);
+        let snapshot = table.clone();
+        assert!(!table.replace_with(snapshot.clone()), "no journal open");
+        assert!(table.try_begin_undo());
+        table.record(&s, &test_lease(2), 200);
+        assert!(table.replace_with(snapshot.clone()), "leak reported");
+        assert_eq!(table, snapshot);
+        assert!(table.undo_len().is_none());
     }
 
     #[test]
@@ -337,7 +345,7 @@ mod tests {
         let s = test_address(8);
         table.record(&s, &test_lease(1), 100);
         assert!(table.undo_len().is_none());
-        table.begin_undo();
+        assert!(table.try_begin_undo());
         table.record(&s, &test_lease(2), 100);
         assert_eq!(table.undo_len(), Some(1));
         table.discard_undo();
