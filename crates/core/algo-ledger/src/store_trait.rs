@@ -454,10 +454,10 @@ pub trait LedgerStore {
         None
     }
 
-    /// Fingerprint of every piece of ledger state a scratch apply must leave
-    /// unchanged once rolled back: [`Self::tracker_rows_fingerprint`], the
-    /// lease table, the trie pre-mutation log and the pending totals delta.
-    /// `None` (default) = unsupported.
+    /// Fingerprint of the in-memory ledger state a scratch apply must leave
+    /// unchanged once rolled back: the lease table, the trie pre-mutation log
+    /// and the pending totals delta (the tracker rows are covered separately
+    /// by [`Self::tracker_rows_fingerprint`]). `None` (default) = unsupported.
     fn scratch_invariant_fingerprint(&self) -> Option<u64> {
         None
     }

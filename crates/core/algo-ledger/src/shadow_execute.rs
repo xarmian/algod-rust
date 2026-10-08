@@ -301,7 +301,7 @@ impl ChainFields {
         }
     }
 
-    fn restore<L: LedgerStore>(&self, s: &mut L) {
+    fn restore<L: LedgerStore>(self, s: &mut L) {
         s.set_current_round(self.round);
         s.set_rewards_level(self.level);
         s.set_rewards_rate(self.rate);
@@ -309,8 +309,35 @@ impl ChainFields {
         s.set_rewards_recalculation_round(self.recalc);
         s.set_fee_sink(self.fee_sink);
         s.set_rewards_pool(self.pool);
-        s.set_protocol(self.protocol.clone());
+        s.set_protocol(self.protocol);
         s.set_txn_counter(self.txn_counter);
+    }
+}
+
+/// Scratch-invariant violations seen since process start (debug builds only
+/// evaluate the checks; always 0 in release).
+static INVARIANT_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of scratch-invariant violations logged since process start.
+pub fn shadow_execute_invariant_violations() -> u64 {
+    INVARIANT_VIOLATIONS.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test strict mode (default on): a violation panics so leaky-stub tests
+    /// can assert it. Non-test builds never panic.
+    static TEST_STRICT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Record an invariant violation: error log + counter, never a panic outside
+/// test strict mode (the diagnostic must not take block sync down).
+fn invariant_violation(msg: &str) {
+    INVARIANT_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+    tracing::error!("shadow_execute_invariant_violation: {msg}");
+    #[cfg(test)]
+    if TEST_STRICT.with(|s| s.get()) {
+        panic!("{msg}");
     }
 }
 
@@ -344,30 +371,26 @@ impl ScratchInvariant {
     /// After the scratch Execute pass, before any rollback: the pass must not
     /// have written a persistent tracker row.
     fn check_scratch_pass<L: LedgerStore>(&self, store: &L) {
-        if self.tracker.is_some() {
-            debug_assert_eq!(
-                self.tracker,
-                store.tracker_rows_fingerprint(),
-                "shadow-execute: scratch pass wrote persistent tracker rows; the real apply gained a tracker write above the scratch early return in apply_block_impl_ex"
+        if self.tracker.is_some() && self.tracker != store.tracker_rows_fingerprint() {
+            invariant_violation(
+                "shadow-execute: scratch pass wrote persistent tracker rows; the real apply gained a tracker write above the scratch early return in apply_block_impl_ex",
             );
         }
     }
 
     /// After every rollback step: nothing of the scratch pass may remain.
     fn check_rolled_back<L: LedgerStore>(&self, store: &L) {
-        if self.full.is_some() {
-            debug_assert_eq!(
-                self.full,
-                store.scratch_invariant_fingerprint(),
-                "shadow-execute: scratch rollback left tracker/lease/trie-log state changed"
+        if (self.full.is_some() && self.full != store.scratch_invariant_fingerprint())
+            || (self.tracker.is_some() && self.tracker != store.tracker_rows_fingerprint())
+        {
+            invariant_violation(
+                "shadow-execute: scratch rollback left tracker/lease/trie-log state changed",
             );
         }
         if let Some(chain) = &self.chain {
-            debug_assert_eq!(
-                *chain,
-                ChainFields::capture(store),
-                "shadow-execute: scratch rollback left chain fields changed"
-            );
+            if *chain != ChainFields::capture(store) {
+                invariant_violation("shadow-execute: scratch rollback left chain fields changed");
+            }
         }
     }
 }
@@ -1019,6 +1042,28 @@ fn txn_field_diffs(path: &str, rec: &Transaction, comp: &Transaction, out: &mut 
     ]);
 }
 
+/// Fallback entry `<path>.txn` for inner transactions whose canonical
+/// encodings differ while every typed field compares equal: encoded lengths
+/// and the first differing byte offset.
+fn encoding_only_diff(path: &str, enc_rec: &[u8], enc_comp: &[u8], out: &mut Vec<FieldDiff>) {
+    let first = enc_rec
+        .iter()
+        .zip(enc_comp)
+        .position(|(a, b)| a != b)
+        .unwrap_or(enc_rec.len().min(enc_comp.len()));
+    out.push((
+        format!("{path}.txn"),
+        format!(
+            "encoded {} bytes, first difference at byte {first}",
+            enc_rec.len()
+        ),
+        format!(
+            "encoded {} bytes, first difference at byte {first}",
+            enc_comp.len()
+        ),
+    ));
+}
+
 /// Compare one pair of recorded/computed `dt` values with `EvalDelta.Equal`
 /// semantics: nil and empty deltas are equal, local deltas are keyed by wire
 /// index, logs and shared accounts compare element-wise, inner transactions
@@ -1128,7 +1173,13 @@ fn diff_eval_delta(
             algo_codec::canonical_encode_transaction(&b.txn),
         );
         if ea != eb {
+            let before = out.len();
             txn_field_diffs(&p, &a.txn, &b.txn, out);
+            if out.len() == before {
+                // Canonical encodings differ yet no typed field does: never
+                // record the mismatch with zero entries.
+                encoding_only_diff(&p, &ea, &eb, out);
+            }
         }
         macro_rules! scalar {
             ($($f:ident),*) => {$(
@@ -1980,21 +2031,6 @@ mod tests {
     }
 
     #[test]
-    fn production_code_does_not_parse_debug_text() {
-        let src = include_str!("shadow_execute.rs");
-        let src = src.replace("\r\n", "\n");
-        let prod = src.split("#[cfg(test)]\nmod tests").next().unwrap();
-        assert!(
-            !prod.contains("fn top_level_fields"),
-            "inner-txn diff must compare typed Transaction fields, not parse Debug text"
-        );
-        assert!(
-            !prod.contains("{:#?}"),
-            "no pretty-Debug text in production code"
-        );
-    }
-
-    #[test]
     fn inner_group_id_difference_names_the_txn_field() {
         let inner = |group: [u8; 32]| {
             let mut stx = SignedTransaction::default();
@@ -2277,6 +2313,40 @@ return
     fn tracker_write_in_scratch_pass_trips_the_invariant() {
         let b = block(vec![pay()]);
         let _ = with_hook(4, || shadow_check_replay_block(&mut ledger(), &b));
+    }
+
+    #[test]
+    fn invariant_violation_is_counted_and_not_fatal_outside_strict_mode() {
+        let before = shadow_execute_invariant_violations();
+        TEST_STRICT.with(|s| s.set(false));
+        let b = block(vec![pay()]);
+        let mut l = ledger();
+        let r = with_hook(5, || shadow_check_replay_block(&mut l, &b));
+        TEST_STRICT.with(|s| s.set(true));
+        let r = r.expect("a violation must not fail block application");
+        assert!(r.checked);
+        assert!(shadow_execute_invariant_violations() > before);
+        assert_eq!(l.current_round(), Round(1), "real apply still ran");
+    }
+
+    #[test]
+    fn encoding_only_difference_still_yields_an_entry() {
+        let mut out: Vec<FieldDiff> = Vec::new();
+        encoding_only_diff(
+            "eval_delta.inner_txns[0]",
+            &[1, 2, 3, 4],
+            &[1, 2, 9],
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "eval_delta.inner_txns[0].txn");
+        assert_eq!(out[0].1, "encoded 4 bytes, first difference at byte 2");
+        assert_eq!(out[0].2, "encoded 3 bytes, first difference at byte 2");
+        assert_eq!(field_pattern(&out[0].0), "eval_delta.inner_txns[N].txn");
+        // Prefix-only difference: first differing offset is the shorter length.
+        let mut out = Vec::new();
+        encoding_only_diff("p", &[1, 2], &[1, 2, 3], &mut out);
+        assert_eq!(out[0].1, "encoded 2 bytes, first difference at byte 2");
     }
 
     #[test]

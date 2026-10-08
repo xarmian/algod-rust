@@ -29,7 +29,7 @@ use algo_types::Address;
 /// A lease is a (sender, lease_value) pair that locks out duplicate
 /// transactions from the same sender with the same lease until the
 /// original transaction's last_valid round has passed.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct LeaseTable {
     /// Maps (sender, lease) to the last_valid round of the recorded transaction.
     entries: HashMap<(Address, [u8; 32]), u64>,
@@ -37,6 +37,18 @@ pub struct LeaseTable {
     /// of every key `record`/`purge_expired` changed since it was opened, in
     /// mutation order. `None` outside a scratch apply.
     undo: Option<Vec<LeaseUndo>>,
+}
+
+/// Cloning snapshots the live entries only: a clone never carries an open
+/// undo journal, so whole-table snapshots (`begin_block`, the group-delta
+/// scratch apply) cannot inherit a stale or ever-growing journal.
+impl Clone for LeaseTable {
+    fn clone(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+            undo: None,
+        }
+    }
 }
 
 /// Prior state of one `(sender, lease)` key: `None` = it was absent.
@@ -130,9 +142,24 @@ impl LeaseTable {
     /// Start journaling mutations so they can be reverted with
     /// [`Self::rollback_undo`] without cloning the whole table (the shadow
     /// execute scratch apply runs per block; the table can hold many leases).
-    /// Any journal already open is discarded.
+    ///
+    /// Journals do not nest: if one is already open this is refused (see
+    /// [`Self::try_begin_undo`]), the open journal is kept, and debug builds
+    /// assert.
     pub fn begin_undo(&mut self) {
+        if !self.try_begin_undo() {
+            tracing::error!("LeaseTable::begin_undo: undo journal already open; nested begin refused, outer journal kept");
+            debug_assert!(false, "LeaseTable::begin_undo: undo journal already open");
+        }
+    }
+
+    /// Open the undo journal; `false` (and no change) if one is already open.
+    pub fn try_begin_undo(&mut self) -> bool {
+        if self.undo.is_some() {
+            return false;
+        }
         self.undo = Some(Vec::new());
+        true
     }
 
     /// Revert every mutation since [`Self::begin_undo`] (newest first, so
@@ -269,6 +296,39 @@ mod tests {
         assert!(table.check(&s, &test_lease(3), 1).is_ok());
         assert!(table.check(&s, &test_lease(1), 100).is_err());
         assert!(table.check(&s, &test_lease(2), 301).is_ok());
+    }
+
+    #[test]
+    fn clone_never_carries_an_open_journal() {
+        let mut table = LeaseTable::new();
+        let s = test_address(9);
+        table.begin_undo();
+        table.record(&s, &test_lease(1), 100);
+        let copy = table.clone();
+        assert!(copy.undo_len().is_none(), "snapshot clone must not journal");
+        assert_eq!(copy, table);
+        assert_eq!(table.undo_len(), Some(1));
+    }
+
+    #[test]
+    fn nested_begin_is_refused_and_keeps_the_outer_journal() {
+        let mut table = LeaseTable::new();
+        let s = test_address(10);
+        assert!(table.try_begin_undo());
+        table.record(&s, &test_lease(1), 100);
+        assert!(!table.try_begin_undo(), "nested begin must be refused");
+        assert_eq!(table.undo_len(), Some(1), "outer journal must survive");
+        table.rollback_undo();
+        assert!(table.check(&s, &test_lease(1), 1).is_ok());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "undo journal already open")]
+    fn nested_begin_undo_trips_the_debug_assert() {
+        let mut table = LeaseTable::new();
+        table.begin_undo();
+        table.begin_undo();
     }
 
     #[test]
