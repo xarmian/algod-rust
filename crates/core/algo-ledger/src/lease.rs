@@ -116,6 +116,17 @@ impl LeaseTable {
         });
     }
 
+    /// Order-independent digest of the live entries (not the undo journal),
+    /// for debug-only rollback invariant checks.
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut entries: Vec<_> = self.entries.iter().collect();
+        entries.sort();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        entries.hash(&mut h);
+        h.finish()
+    }
+
     /// Start journaling mutations so they can be reverted with
     /// [`Self::rollback_undo`] without cloning the whole table (the shadow
     /// execute scratch apply runs per block; the table can hold many leases).

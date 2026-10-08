@@ -7135,6 +7135,50 @@ impl LedgerStore for SqliteLedger {
         }
     }
 
+    fn tracker_rows_fingerprint(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        // Highest rowid per table is O(log n) even on mainnet-sized
+        // accounthashes; the small tail tables also contribute their count.
+        // A failed query hashes as `None` so an unreadable table never
+        // masquerades as a stable one.
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for table in [
+            "blockdb.blocks",
+            "txtail",
+            "onlineroundparamstail",
+            "votersnapshot",
+            "votersparticipants",
+            "accounthashes",
+        ] {
+            let row: Option<(i64, i64)> = self
+                .conn
+                .query_row(
+                    &format!("SELECT COALESCE(MAX(rowid), 0), COUNT(*) FROM {table}"),
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok();
+            (table, row).hash(&mut h);
+        }
+        Some(h.finish())
+    }
+
+    fn scratch_invariant_fingerprint(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let mut online: Vec<_> = self.pending_online_touched.iter().collect();
+        online.sort();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (
+            self.tracker_rows_fingerprint(),
+            self.lease_table.fingerprint(),
+            self.pre_mutations.len(),
+            format!("{:?}", self.pending_totals_delta),
+            online,
+        )
+            .hash(&mut h);
+        Some(h.finish())
+    }
+
     // ---- Min balance ----
 
     fn min_balance_with_state(&self, _addr: &Address, account: &AccountData) -> u64 {

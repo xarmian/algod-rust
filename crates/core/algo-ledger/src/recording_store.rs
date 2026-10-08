@@ -489,6 +489,14 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
         self.inner.restore_scratch_state(saved);
     }
 
+    fn tracker_rows_fingerprint(&self) -> Option<u64> {
+        self.inner.tracker_rows_fingerprint()
+    }
+
+    fn scratch_invariant_fingerprint(&self) -> Option<u64> {
+        self.inner.scratch_invariant_fingerprint()
+    }
+
     // ---- Min balance ----
 
     fn min_balance_with_state(&self, addr: &Address, account: &AccountData) -> u64 {

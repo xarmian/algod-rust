@@ -94,7 +94,8 @@ static SKIP_WARNED: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 thread_local! {
     /// 0 = none, 1 = pretend the store cannot roll back, 2 = scratch Execute
-    /// returns an error, 3 = scratch Execute panics.
+    /// returns an error, 3 = scratch Execute panics, 4/5 = leaky scratch
+    /// (see `inject_leak`).
     static TEST_HOOK: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 #[cfg(test)]
@@ -272,6 +273,7 @@ fn clip(s: String) -> String {
 
 /// Chain-level in-memory fields a block apply rewrites and
 /// `restore_snapshot` does not cover.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ChainFields {
     round: algo_types::Round,
     level: u64,
@@ -299,7 +301,7 @@ impl ChainFields {
         }
     }
 
-    fn restore<L: LedgerStore>(self, s: &mut L) {
+    fn restore<L: LedgerStore>(&self, s: &mut L) {
         s.set_current_round(self.round);
         s.set_rewards_level(self.level);
         s.set_rewards_rate(self.rate);
@@ -307,8 +309,82 @@ impl ChainFields {
         s.set_rewards_recalculation_round(self.recalc);
         s.set_fee_sink(self.fee_sink);
         s.set_rewards_pool(self.pool);
-        s.set_protocol(self.protocol);
+        s.set_protocol(self.protocol.clone());
         s.set_txn_counter(self.txn_counter);
+    }
+}
+
+/// Debug-only guard (issue #1721) that a scratch Execute pass is fully
+/// invisible: it leaves the persistent tracker rows alone (the "KEEP IN SYNC"
+/// early return in `apply_block_impl_ex`) and, once rolled back, leaves the
+/// tracker/lease/chain-field/trie-log state exactly as it found it. Compiled
+/// to a no-op capture in release builds (`cfg!(debug_assertions)`).
+struct ScratchInvariant {
+    tracker: Option<u64>,
+    full: Option<u64>,
+    chain: Option<ChainFields>,
+}
+
+impl ScratchInvariant {
+    fn capture<L: LedgerStore>(store: &L, chain: &ChainFields) -> Self {
+        if !cfg!(debug_assertions) {
+            return Self {
+                tracker: None,
+                full: None,
+                chain: None,
+            };
+        }
+        Self {
+            tracker: store.tracker_rows_fingerprint(),
+            full: store.scratch_invariant_fingerprint(),
+            chain: Some(chain.clone()),
+        }
+    }
+
+    /// After the scratch Execute pass, before any rollback: the pass must not
+    /// have written a persistent tracker row.
+    fn check_scratch_pass<L: LedgerStore>(&self, store: &L) {
+        if self.tracker.is_some() {
+            debug_assert_eq!(
+                self.tracker,
+                store.tracker_rows_fingerprint(),
+                "shadow-execute: scratch pass wrote persistent tracker rows; the real apply gained a tracker write above the scratch early return in apply_block_impl_ex"
+            );
+        }
+    }
+
+    /// After every rollback step: nothing of the scratch pass may remain.
+    fn check_rolled_back<L: LedgerStore>(&self, store: &L) {
+        if self.full.is_some() {
+            debug_assert_eq!(
+                self.full,
+                store.scratch_invariant_fingerprint(),
+                "shadow-execute: scratch rollback left tracker/lease/trie-log state changed"
+            );
+        }
+        if let Some(chain) = &self.chain {
+            debug_assert_eq!(
+                *chain,
+                ChainFields::capture(store),
+                "shadow-execute: scratch rollback left chain fields changed"
+            );
+        }
+    }
+}
+
+/// Test-only leaks injected between the scratch pass and the invariant
+/// checks: 4 = persistent tracker row written by the scratch pass, 5 = state
+/// left behind after the rollback.
+#[cfg(test)]
+fn inject_leak<L: LedgerStore>(store: &mut L, phase: u8) {
+    if test_hook() != phase {
+        return;
+    }
+    match phase {
+        4 => {
+            let _ = store.put_txtail(9_999, b"leak");
+        }
+        _ => store.record_lease(&Address([0xEE; 32]), &[0xEE; 32], 9),
     }
 }
 
@@ -683,6 +759,7 @@ pub fn shadow_check_replay_block<L: LedgerStore>(
 
     // ---- scratch Execute evaluation, rolled back ----
     let chain = ChainFields::capture(store);
+    let invariant = ScratchInvariant::capture(store, &chain);
     let sp = store.snapshot(&[]);
     let mut exec_ad: Vec<ApplyData> = Vec::with_capacity(block.payset.len());
     let mut exec_kv = KvModsMap::new();
@@ -703,9 +780,15 @@ pub fn shadow_check_replay_block<L: LedgerStore>(
             ResourceTouches::default(),
         )
     });
+    #[cfg(test)]
+    inject_leak(store, 4);
+    invariant.check_scratch_pass(store);
     store.restore_snapshot(sp);
     chain.restore(store);
     store.restore_scratch_state(aux);
+    #[cfg(test)]
+    inject_leak(store, 5);
+    invariant.check_rolled_back(store);
 
     // ---- the real Replay apply ----
     let mut replay_ad: Vec<ApplyData> = Vec::with_capacity(block.payset.len());
@@ -884,15 +967,55 @@ fn txn_field_diffs(path: &str, rec: &Transaction, comp: &Transaction, out: &mut 
         };
     }
     typed_txn_diffs!([
-        txn_type, sender, fee, first_valid, last_valid, note, genesis_id, genesis_hash, group,
-            lease, rekey_to, amount, receiver, close_remainder_to, xaid, asset_amount,
-            asset_sender, asset_receiver, asset_close_to, config_asset, asset_params,
-            freeze_asset, freeze_account, asset_frozen, application_id, on_completion,
-            approval_program, clear_state_program, app_arguments, accounts, foreign_apps,
-            foreign_assets, boxes, global_state_schema, local_state_schema,
-            extra_program_pages, vote_pk, selection_pk, state_proof_pk, vote_first, vote_last,
-            vote_key_dilution, non_participation, state_proof_type, state_proof,
-            state_proof_message, heartbeat, access, reject_version
+        txn_type,
+        sender,
+        fee,
+        first_valid,
+        last_valid,
+        note,
+        genesis_id,
+        genesis_hash,
+        group,
+        lease,
+        rekey_to,
+        amount,
+        receiver,
+        close_remainder_to,
+        xaid,
+        asset_amount,
+        asset_sender,
+        asset_receiver,
+        asset_close_to,
+        config_asset,
+        asset_params,
+        freeze_asset,
+        freeze_account,
+        asset_frozen,
+        application_id,
+        on_completion,
+        approval_program,
+        clear_state_program,
+        app_arguments,
+        accounts,
+        foreign_apps,
+        foreign_assets,
+        boxes,
+        global_state_schema,
+        local_state_schema,
+        extra_program_pages,
+        vote_pk,
+        selection_pk,
+        state_proof_pk,
+        vote_first,
+        vote_last,
+        vote_key_dilution,
+        non_participation,
+        state_proof_type,
+        state_proof,
+        state_proof_message,
+        heartbeat,
+        access,
+        reject_version
     ]);
 }
 
@@ -1798,7 +1921,11 @@ mod tests {
         stx.txn.fee = if variant { 0 } else { 1_000 };
         stx.txn.group = if variant { [0u8; 32] } else { [7u8; 32] };
         stx.txn.rekey_to = if variant { Some(FEE_SINK) } else { None };
-        stx.txn.genesis_id = if variant { "b-v1".into() } else { String::new() };
+        stx.txn.genesis_id = if variant {
+            "b-v1".into()
+        } else {
+            String::new()
+        };
         let bytes = rmp_serde::to_vec_named(&stx).unwrap();
         rmpv::decode::read_value(&mut &bytes[..]).unwrap()
     }
@@ -1861,7 +1988,10 @@ mod tests {
             !prod.contains("fn top_level_fields"),
             "inner-txn diff must compare typed Transaction fields, not parse Debug text"
         );
-        assert!(!prod.contains("{:#?}"), "no pretty-Debug text in production code");
+        assert!(
+            !prod.contains("{:#?}"),
+            "no pretty-Debug text in production code"
+        );
     }
 
     #[test]
@@ -2013,6 +2143,147 @@ mod tests {
         })
         .unwrap();
         assert!(!r.checked);
+    }
+
+    // ---- scratch rollback invariants (issue #1721) ----
+
+    fn app_create_stx() -> SignedTransaction {
+        let approval = algo_avm::assembler::assemble_string(
+            "#pragma version 8
+byte \"k\"
+int 7
+app_global_put
+int 1
+return
+",
+        )
+        .unwrap()
+        .program;
+        let clear = algo_avm::assembler::assemble_string(
+            "#pragma version 8
+int 1
+return
+",
+        )
+        .unwrap()
+        .program;
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = SENDER;
+        create.txn.fee = 1_000;
+        create.txn.last_valid = Round(1_000_000);
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        create.txn.global_state_schema = Some(algo_types::StateSchema {
+            num_uint: 1,
+            num_byte_slice: 0,
+        });
+        create.apply_data_application_id = 1;
+        create
+    }
+
+    /// Everything observable about a ledger after a block, for exact
+    /// scratch+real vs real-only comparison.
+    fn ledger_state(l: &SqliteLedger) -> String {
+        let accts: Vec<_> = [SENDER, RECEIVER, FEE_SINK, POOL]
+            .iter()
+            .map(|a| l.get_account(a))
+            .collect();
+        format!(
+            "{accts:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            ChainFields::capture(l),
+            l.get_app_params(1),
+            l.get_asset_params(1),
+            l.scratch_invariant_fingerprint(),
+            l.tracker_rows_fingerprint(),
+            l.lease_table().clone() == crate::lease::LeaseTable::new(),
+            l.check_lease(&SENDER, &[5u8; 32], 1).is_err(),
+            l.check_lease(&SENDER, &[6u8; 32], 1).is_err(),
+            l.txn_counter(),
+        )
+    }
+
+    fn plain_replay(l: &mut SqliteLedger, b: &Block) {
+        apply_block_impl_ex(
+            l,
+            b,
+            ApplyMode::Replay,
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn scratch_plus_real_apply_equals_real_apply_alone() {
+        let mut rewards = block(vec![pay()]);
+        rewards.rewards_level = 77;
+        rewards.rewards_rate = 1_000;
+        rewards.rewards_residue = 5;
+        rewards.rewards_recalculation_round = Round(5);
+        let blocks = [
+            ("pay-only", block(vec![pay()])),
+            ("app-call", block(vec![app_create_stx()])),
+            ("lease-bearing", block(vec![leased_pay(5)])),
+            ("rewards", rewards),
+            ("asset-create", block(vec![acfg_create(1)])),
+        ];
+        for (name, b) in blocks {
+            let mut shadowed = ledger();
+            let mut plain = ledger();
+            for l in [&mut shadowed, &mut plain] {
+                // The rewards case withdraws from the pool.
+                l.set_account(
+                    &POOL,
+                    AccountData {
+                        micro_algos: 1_000_000_000,
+                        ..Default::default()
+                    },
+                );
+            }
+            let report = shadow_check_replay_block(&mut shadowed, &b).unwrap();
+            assert!(report.checked, "{name}");
+            plain_replay(&mut plain, &b);
+            assert_eq!(ledger_state(&shadowed), ledger_state(&plain), "{name}");
+            assert_eq!(
+                shadowed.lease_table(),
+                plain.lease_table(),
+                "{name}: lease table"
+            );
+        }
+    }
+
+    #[test]
+    fn real_apply_changes_tracker_rows_but_scratch_pass_does_not() {
+        // Non-vacuity: the fingerprint really moves when the real apply runs,
+        // so "unchanged across the scratch pass" is a meaningful assertion.
+        let mut l = ledger();
+        let b = block(vec![pay()]);
+        let before = l.tracker_rows_fingerprint();
+        assert!(before.is_some(), "sqlite must support the fingerprint");
+        plain_replay(&mut l, &b);
+        assert_ne!(before, l.tracker_rows_fingerprint());
+        // A scratch-checked block runs both checks (debug asserts are on in
+        // test builds) without tripping them.
+        shadow_check_replay_block(&mut ledger(), &b).unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "scratch pass wrote persistent tracker rows")]
+    fn tracker_write_in_scratch_pass_trips_the_invariant() {
+        let b = block(vec![pay()]);
+        let _ = with_hook(4, || shadow_check_replay_block(&mut ledger(), &b));
+    }
+
+    #[test]
+    #[should_panic(expected = "scratch rollback left tracker/lease/trie-log state changed")]
+    fn leak_surviving_rollback_trips_the_invariant() {
+        let b = block(vec![pay()]);
+        let _ = with_hook(5, || shadow_check_replay_block(&mut ledger(), &b));
     }
 
     #[test]

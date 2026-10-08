@@ -445,6 +445,23 @@ pub trait LedgerStore {
     /// Restore state captured by [`Self::save_scratch_state`].
     fn restore_scratch_state(&mut self, _saved: Box<dyn std::any::Any>) {}
 
+    /// Fingerprint of the persistent auxiliary tracker rows a real block
+    /// apply writes after the scratch early return (block store, txtail,
+    /// online params tail, state-proof voters caches, trie hash nodes).
+    /// A scratch apply must leave it unchanged even before its rollback.
+    /// Debug-only invariant checks use it; `None` (default) = unsupported.
+    fn tracker_rows_fingerprint(&self) -> Option<u64> {
+        None
+    }
+
+    /// Fingerprint of every piece of ledger state a scratch apply must leave
+    /// unchanged once rolled back: [`Self::tracker_rows_fingerprint`], the
+    /// lease table, the trie pre-mutation log and the pending totals delta.
+    /// `None` (default) = unsupported.
+    fn scratch_invariant_fingerprint(&self) -> Option<u64> {
+        None
+    }
+
     // ---- Min balance ----
 
     /// Compute the minimum balance for an account, including schema-based
