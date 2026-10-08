@@ -130,59 +130,73 @@ pub trait SyncBackend: Send + Sync {
     /// Returns `None` if the node does not advertise a catchpoint.
     fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError>;
 
-    /// Fetch a batch of blocks in the range `[start, end]` (inclusive).
+    /// Fetch the blocks of the range `[start, end]` (inclusive): THE primary
+    /// block-range method (issues #1725, #1724); implementors override this
+    /// one and [`Self::fetch_blocks_batch`] is derived from it, so wrappers
+    /// forward only this method and cannot recurse into each other.
     ///
     /// The `concurrency` parameter hints at how many blocks to fetch in
-    /// parallel.  The default implementation fetches blocks sequentially;
-    /// backends backed by an async runtime can override this to use
+    /// parallel. The default implementation fetches blocks sequentially;
+    /// backends backed by an async runtime override this to use
     /// [`ParallelBlockFetcher`] for higher throughput.
-    ///
-    /// Contract (issue #1719): the result is either the whole range, an `Err`,
-    /// or -- only when the peer genuinely does not have the next round (a 404,
-    /// reported as [`AlgoError::NotFound`] when nothing at all was served) --
-    /// the in-order PREFIX of the range that was served (`start..start+n`).
-    /// Callers apply the prefix and then treat the shortfall as "peer cannot
-    /// serve the rest". Transient, auth and decode failures are never turned
-    /// into a short `Ok`.
-    fn fetch_blocks_batch(
-        &self,
-        start: u64,
-        end: u64,
-        _concurrency: usize,
-    ) -> Result<Vec<(u64, Block)>, AlgoError> {
-        let mut blocks = Vec::new();
-        for round in start..=end {
-            let block = self.fetch_block(round)?;
-            blocks.push((round, block));
-        }
-        Ok(blocks)
-    }
-
-    /// Like [`Self::fetch_blocks_batch`], but reports a failure AFTER a
-    /// served prefix without discarding that prefix, and takes the
-    /// orchestrator's cancellation token (issues #1725, #1724).
     ///
     /// - `cancel` is the orchestrator's token: a backend running background
     ///   fetch tasks should derive a `child_token()` from it so a shutdown
     ///   during a long parallel fetch aborts promptly instead of waiting for
     ///   the batch (and its per-round retries) to finish.
-    /// - The result is a [`BatchFetch`]: the in-order prefix that was served
-    ///   plus, if the fetch did not complete, the error that stopped it with
-    ///   its class preserved. The caller applies the prefix first, so a
-    ///   retry does not re-fetch it.
-    ///
-    /// The default implementation delegates to [`Self::fetch_blocks_batch`]
-    /// (all-or-error, no prefix, `cancel` unused).
+    /// - The result is a [`BatchFetch`] (contract of issue #1719): the
+    ///   in-order PREFIX that was served (`start..start+n`, possibly all of
+    ///   it) plus, if the fetch did not complete, the error that stopped it
+    ///   with its class preserved. The caller applies the prefix first, so a
+    ///   retry does not re-fetch it. A short prefix with no error means the
+    ///   peer genuinely does not have the next round (a 404 after a
+    ///   non-empty prefix); an empty prefix with [`AlgoError::NotFound`] is
+    ///   the same verdict for the first round. Transient, auth and decode
+    ///   failures are always an `error`, never a silent short result.
     fn fetch_block_range(
         &self,
         start: u64,
         end: u64,
-        concurrency: usize,
-        _cancel: &CancellationToken,
+        _concurrency: usize,
+        cancel: &CancellationToken,
     ) -> BatchFetch {
-        match self.fetch_blocks_batch(start, end, concurrency) {
-            Ok(blocks) => BatchFetch::complete(blocks),
-            Err(error) => BatchFetch::failed(Vec::new(), error),
+        let mut blocks = Vec::new();
+        for round in start..=end {
+            if cancel.is_cancelled() {
+                return BatchFetch::failed(
+                    blocks,
+                    AlgoError::Ledger {
+                        message: format!("block fetch for rounds {start}..={end} cancelled"),
+                    },
+                );
+            }
+            match self.fetch_block(round) {
+                Ok(block) => blocks.push((round, block)),
+                // A 404 after a served prefix: the peer lacks the next round.
+                Err(AlgoError::NotFound(_)) if !blocks.is_empty() => {
+                    return BatchFetch::complete(blocks)
+                }
+                Err(e) => return BatchFetch::failed(blocks, e),
+            }
+        }
+        BatchFetch::complete(blocks)
+    }
+
+    /// All-or-error view of [`Self::fetch_block_range`] with a fresh,
+    /// never-cancelled token: the whole range, an `Err`, or -- only when the
+    /// peer does not have the next round -- the served prefix. A prefix
+    /// served before a non-404 failure is discarded here; use
+    /// [`Self::fetch_block_range`] to keep it. Derived; do not override.
+    fn fetch_blocks_batch(
+        &self,
+        start: u64,
+        end: u64,
+        concurrency: usize,
+    ) -> Result<Vec<(u64, Block)>, AlgoError> {
+        let fetch = self.fetch_block_range(start, end, concurrency, &CancellationToken::new());
+        match fetch.error {
+            None => Ok(fetch.blocks),
+            Some(e) => Err(e),
         }
     }
 }
@@ -2290,26 +2304,27 @@ impl SyncOrchestrator {
                 }
             }
 
+            let served = batch.len() as u64;
+            let next_missing = batch_start + served;
+            let shortfall = served < batch_end - batch_start + 1;
             // A shutdown that landed while the batch was being applied must
-            // not be recorded as a hand-off (`stopped_early`, exit status 3):
-            // check it before interpreting any shortfall.
-            if self.cancel.is_cancelled() {
+            // not be recorded as a hand-off (`stopped_early`, exit status 3)
+            // or turn into a fetch error. But a fully served batch that was
+            // applied completely is just progress -- possibly the final one,
+            // where the replay is already done -- so only a shortfall or a
+            // fetch error is reinterpreted as a cancellation.
+            if (shortfall || fetch_error.is_some()) && self.cancel.is_cancelled() {
                 self.blocks_replayed = blocks_applied;
                 return Err(self.handle_cancellation());
             }
 
             // The prefix is applied above. Now decide what the shortfall
-            // means. A short batch without an error is the in-order prefix of
-            // a peer that does not have the next round (see
-            // `fetch_blocks_batch`'s contract), as is a `NotFound` error.
-            let served = batch.len() as u64;
-            let next_missing = batch_start + served;
-            let shortfall = served < batch_end - batch_start + 1;
-            let peer_lacks_block = match &fetch_error {
-                None => shortfall,
-                Some(AlgoError::NotFound(_)) => true,
-                Some(_) => false,
-            };
+            // means: a SHORT batch with no error, or with a `NotFound`, is
+            // the in-order prefix of a peer that does not have the next round
+            // (see `fetch_block_range`'s contract). A `NotFound` that comes
+            // with a fully served batch is not a shortfall and is no verdict.
+            let peer_lacks_block =
+                shortfall && matches!(&fetch_error, None | Some(AlgoError::NotFound(_)));
             if !peer_lacks_block {
                 if let Some(e) = fetch_error {
                     // Issue #1725: every other failure fails loudly with its
@@ -4359,6 +4374,9 @@ mod tests {
         /// the error this builds (arg: blocks asked): a failure AFTER a
         /// served prefix, which `fetch_blocks_batch` cannot express.
         PrefixThenFail(u64, fn(u64) -> AlgoError),
+        /// `fetch_block_range` serves EVERY block and still reports an error
+        /// (a backend bug / odd peer): not a shortfall, so no hand-off.
+        CompleteWithError(fn(u64) -> AlgoError),
     }
 
     /// What the parallel fetcher reports when the peer serves nothing.
@@ -4444,33 +4462,11 @@ mod tests {
             Ok(self.block(round))
         }
 
-        fn fetch_blocks_batch(
-            &self,
-            start: u64,
-            end: u64,
-            _concurrency: usize,
-        ) -> Result<Vec<(u64, Block)>, AlgoError> {
-            if let Some(token) = &self.cancel_on_fetch {
-                token.cancel();
-            }
-            match self.batch_mode {
-                BatchMode::Fail(make) => return Err(make(end - start + 1)),
-                BatchMode::ServeUpTo(last) | BatchMode::ServePrefix(last) if start > last => {
-                    return Err(not_served(end - start + 1));
-                }
-                BatchMode::ServePrefix(last) if end > last => {
-                    return Ok((start..=last).map(|r| (r, self.block(r))).collect());
-                }
-                _ => {}
-            }
-            Ok((start..=end).map(|r| (r, self.block(r))).collect())
-        }
-
         fn fetch_block_range(
             &self,
             start: u64,
             end: u64,
-            concurrency: usize,
+            _concurrency: usize,
             cancel: &CancellationToken,
         ) -> BatchFetch {
             if let Some(token) = &self.cancel_on_fetch {
@@ -4479,17 +4475,28 @@ mod tests {
             if cancel.is_cancelled() {
                 RANGE_SAW_CANCEL.with(|c| c.set(true));
             }
+            let asked = end - start + 1;
+            let all = || {
+                (start..=end)
+                    .map(|r| (r, self.block(r)))
+                    .collect::<Vec<_>>()
+            };
             match self.batch_mode {
-                BatchMode::PrefixThenFail(last, make) if end > last => {
-                    let blocks: Vec<_> = (start..=last.min(end))
-                        .map(|r| (r, self.block(r)))
-                        .collect();
-                    BatchFetch::failed(blocks, make(end - start + 1))
+                BatchMode::Fail(make) => BatchFetch::failed(Vec::new(), make(asked)),
+                BatchMode::ServeUpTo(last) | BatchMode::ServePrefix(last) if start > last => {
+                    BatchFetch::failed(Vec::new(), not_served(asked))
                 }
-                _ => match self.fetch_blocks_batch(start, end, concurrency) {
-                    Ok(blocks) => BatchFetch::complete(blocks),
-                    Err(e) => BatchFetch::failed(Vec::new(), e),
-                },
+                BatchMode::ServePrefix(last) if end > last => {
+                    BatchFetch::complete((start..=last).map(|r| (r, self.block(r))).collect())
+                }
+                BatchMode::PrefixThenFail(last, make) if end > last => BatchFetch::failed(
+                    (start..=last.min(end))
+                        .map(|r| (r, self.block(r)))
+                        .collect(),
+                    make(asked),
+                ),
+                BatchMode::CompleteWithError(make) => BatchFetch::failed(all(), make(asked)),
+                _ => BatchFetch::complete(all()),
             }
         }
 
@@ -5056,6 +5063,46 @@ mod tests {
         let ledger = crate::sqlite::SqliteLedger::open_with_prefix(&o.config.db_path).unwrap();
         assert_eq!(ledger.current_round().0, WINDOW_BLOCKS_ROUND + 5);
         drop(ledger);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ctrl+C landing during the FINAL apply (the last batch is fully served
+    /// and applied, `batch_end == target_round`) must not turn an already
+    /// complete replay into a cancellation error. The progress callback fires
+    /// right after the target round is applied, which is where the shutdown
+    /// is injected.
+    #[test]
+    fn cancel_during_the_final_apply_does_not_fail_a_complete_replay() {
+        let token = CancellationToken::new();
+        let (mut o, dir) =
+            window_orchestrator("cancel-final-apply", BatchMode::Serve, 3, None, |_| {});
+        o.set_cancel(token.clone());
+        o.set_progress_callback(Box::new(move |p| {
+            if p.phase_detail.starts_with("replayed") && p.phase_progress >= 1.0 {
+                token.cancel();
+            }
+        }));
+        o.run_replay_blocks()
+            .expect("a completed replay stays completed");
+        assert_eq!(o.final_round, WINDOW_BLOCKS_ROUND + 4);
+        assert!(o.replay_stopped_early.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fully served batch that also carries a `NotFound` error is not a
+    /// shortfall: it must not be recorded as a hand-off.
+    #[test]
+    fn a_not_found_with_a_fully_served_batch_is_not_a_handoff() {
+        let (mut o, dir) = window_orchestrator(
+            "complete-with-not-found",
+            BatchMode::CompleteWithError(not_served),
+            100,
+            None,
+            |_| {},
+        );
+        let e = o.run_replay_blocks().expect_err("loud, not a hand-off");
+        assert!(matches!(e, AlgoError::NotFound(_)), "{e:?}");
+        assert!(o.replay_stopped_early.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

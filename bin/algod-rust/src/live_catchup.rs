@@ -69,7 +69,6 @@
 //! `participate` node therefore still report
 //! [`algo_rest_api::node::NodeError::NotImplemented`] until that lands.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use algo_rest_api::node::CatchupStartResult;
@@ -145,6 +144,16 @@ impl CatchupOutcome {
             None => Self::Complete,
         }
     }
+}
+
+/// Finished-run bookkeeping behind [`LiveCatchupManager::metrics_text`] and
+/// [`LiveCatchupManager::last_outcome`], kept in one struct under one lock so
+/// the two can never be observed out of step.
+#[derive(Debug, Clone, Default)]
+struct CatchupStats {
+    completed: u64,
+    stopped_short: u64,
+    last_outcome: Option<CatchupOutcome>,
 }
 
 /// Controls the node's "normal sync loop" so it can be quiesced while a
@@ -264,13 +273,9 @@ pub struct LiveCatchupManager {
     /// The most recently *completed* catchpoint label, surfaced by
     /// `GET /v2/status`'s `last-catchpoint` field once catchup finishes.
     last_catchpoint: StdMutex<String>,
-    /// How the most recent successful (non-failed, non-aborted) run ended
-    /// (issue #1725); `None` until one has.
-    last_outcome: StdMutex<Option<CatchupOutcome>>,
-    /// Successful runs that reached their replay target / that stopped short
-    /// (issue #1725); exported by [`Self::metrics_text`].
-    completed_total: AtomicU64,
-    stopped_short_total: AtomicU64,
+    /// Successful-run counters and how the most recent one ended (issue
+    /// #1725), under one lock; exported by [`Self::metrics_text`].
+    stats: StdMutex<CatchupStats>,
     /// Live granular progress counters for the in-flight (or most recently
     /// finished) catchup — see [`Self::catchpoint_counters`] (issue #941).
     counters: Arc<StdMutex<CatchpointCounters>>,
@@ -293,9 +298,7 @@ impl LiveCatchupManager {
             control,
             running: AsyncMutex::new(None),
             last_catchpoint: StdMutex::new(String::new()),
-            last_outcome: StdMutex::new(None),
-            completed_total: AtomicU64::new(0),
-            stopped_short_total: AtomicU64::new(0),
+            stats: StdMutex::new(CatchupStats::default()),
             counters: Arc::new(StdMutex::new(CatchpointCounters::default())),
             sync_round_reset: StdMutex::new(None),
         })
@@ -437,22 +440,28 @@ impl LiveCatchupManager {
     /// (issue #1725). Internal bookkeeping only: `GET /v2/status` is
     /// unchanged because go-algorand has no counterpart (its catchpoint
     /// service ends at the catchpoint round).
+    #[cfg(test)]
     pub fn last_outcome(&self) -> Option<CatchupOutcome> {
-        self.last_outcome.lock().ok().and_then(|g| g.clone())
+        self.stats.lock().ok().and_then(|g| g.last_outcome.clone())
     }
 
     /// Prometheus text for finished live catchups (issue #1725); empty until
     /// one has finished, so a node that never ran a live catchup adds nothing
     /// to `/metrics`.
     pub fn metrics_text(&self) -> String {
-        let completed = self.completed_total.load(Ordering::Relaxed);
-        let stopped_short = self.stopped_short_total.load(Ordering::Relaxed);
+        // One lock for the counters AND the last outcome: a scrape never sees
+        // a counter bumped without its outcome (or vice versa).
+        let CatchupStats {
+            completed,
+            stopped_short,
+            last_outcome,
+        } = self.stats.lock().map(|g| g.clone()).unwrap_or_default();
         if completed + stopped_short == 0 {
             return String::new();
         }
         // Rounds the last successful run's replay fell short of its target
         // by; 0 when it reached the target.
-        let behind = match self.last_outcome() {
+        let behind = match last_outcome {
             Some(CatchupOutcome::StoppedShort {
                 stopped_at_round,
                 target_round,
@@ -496,9 +505,14 @@ impl LiveCatchupManager {
         }
     }
 
+    /// Count a successful run and remember how it ended, atomically.
     fn record_outcome(&self, outcome: CatchupOutcome) {
-        if let Ok(mut slot) = self.last_outcome.lock() {
-            *slot = Some(outcome);
+        if let Ok(mut stats) = self.stats.lock() {
+            match outcome {
+                CatchupOutcome::Complete => stats.completed += 1,
+                CatchupOutcome::StoppedShort { .. } => stats.stopped_short += 1,
+            }
+            stats.last_outcome = Some(outcome);
         }
     }
 
@@ -516,7 +530,6 @@ impl LiveCatchupManager {
             Ok(CatchupOutcome::Complete) => {
                 info!(catchpoint = %catchpoint, "live catchpoint catchup completed");
                 self.set_last_catchpoint(&catchpoint);
-                self.completed_total.fetch_add(1, Ordering::Relaxed);
                 self.record_outcome(CatchupOutcome::Complete);
             }
             // Issue #1725: the catchpoint itself WAS applied (so
@@ -536,7 +549,6 @@ impl LiveCatchupManager {
                      (target {target_round}); normal catchup continues"
                 );
                 self.set_last_catchpoint(&catchpoint);
-                self.stopped_short_total.fetch_add(1, Ordering::Relaxed);
                 self.record_outcome(CatchupOutcome::StoppedShort {
                     stopped_at_round: *stopped_at_round,
                     target_round: *target_round,
@@ -753,15 +765,6 @@ impl algo_ledger::sync::SyncBackend for SharedSyncBackend {
         self.0.discover_catchpoint()
     }
 
-    fn fetch_blocks_batch(
-        &self,
-        start: u64,
-        end: u64,
-        concurrency: usize,
-    ) -> anyhow::Result<Vec<(u64, algo_types::Block)>, algo_error::AlgoError> {
-        self.0.fetch_blocks_batch(start, end, concurrency)
-    }
-
     fn fetch_block_range(
         &self,
         start: u64,
@@ -924,6 +927,14 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
+    // -----------------------------------------------------------------------
+    // is_verify_failure_message
+    // -----------------------------------------------------------------------
+
+    /// Regression pin for the classification bug live-dispatch found (PR
+    /// #1638, run 36295601322): the retry must actually fire for the real
+    /// error messages `run_verify_ledger` produces, not just an
+    /// SyncState-based check that never matches by the time `run()` returns.
     #[test]
     fn is_verify_failure_message_matches_label_mismatch() {
         let msg = "ledger error: catchpoint label mismatch: expected \

@@ -57,9 +57,37 @@ use algo_network::tag::Tag;
 
 use crate::{BlockSource, NodeStatus};
 
-/// go: `blockNotAvailableErrMsg` (`rpcs/blockService.go`), the `Error` topic
-/// text a block service answers with when it does not have the round.
+/// go: `blockNotAvailableErrMsg = "requested block is not available"`
+/// (`rpcs/blockService.go:320` at v5.0.2-stable), the `Error` topic text a
+/// block service answers with when it does not have the round. Matched with
+/// `contains`, not equality, so a peer that wraps or extends the text still
+/// classifies as "does not have the round".
 const BLOCK_NOT_AVAILABLE_MSG: &str = "requested block is not available";
+
+/// A failed attempt against one peer, with whether the peer actually
+/// ANSWERED (as opposed to the request failing in transport/timeout).
+struct PeerFetchFailure {
+    error: AlgoError,
+    answered: bool,
+}
+
+/// Whether "the peers said the block is not available" is a verdict
+/// (`NotFound`) rather than inconclusive evidence.
+///
+/// Rule: at least one peer answered not-available; NO peer answered with
+/// anything else (a different service error, an undecodable or wrong block
+/// is an answer that contradicts the claim); and the number of DISTINCT peers
+/// that said not-available reaches `min(pool size, 2)` -- one peer's opinion
+/// out of a pool of two or more is not enough, while a pool of one has only
+/// that opinion to go on. Transport failures (timeouts, closed connections)
+/// are not answers and do not veto a verdict reached by the others.
+fn not_available_is_verdict(
+    pool_size: usize,
+    distinct_not_available: usize,
+    other_answers: bool,
+) -> bool {
+    distinct_not_available > 0 && !other_answers && distinct_not_available >= pool_size.min(2)
+}
 
 // ---------------------------------------------------------------------------
 // Peer-ranking wiring
@@ -126,6 +154,17 @@ pub struct GossipBlockSourceConfig {
 
     /// Maximum total wait time for `wait_for_round` (default: 5 minutes).
     pub max_wait: Duration,
+}
+
+impl GossipBlockSourceConfig {
+    /// Worst-case wall time of one `get_block`: every one of
+    /// `max_peer_attempts` attempts runs to `request_timeout` (peers are
+    /// tried one after another). Used to size how long a failing parallel
+    /// block fetch drains in-flight rounds (issue #1725).
+    pub fn worst_case_round_time(&self) -> Duration {
+        self.request_timeout
+            .saturating_mul(u32::try_from(self.max_peer_attempts).unwrap_or(u32::MAX))
+    }
 }
 
 impl Default for GossipBlockSourceConfig {
@@ -233,7 +272,7 @@ impl GossipBlockSource {
         &self,
         peer: &dyn UnicastPeer,
         round: Round,
-    ) -> Result<(BlockResponse, Vec<u8>)> {
+    ) -> std::result::Result<(BlockResponse, Vec<u8>), PeerFetchFailure> {
         let topics = make_block_request_topics(round.0);
 
         // Send the request and await the response, bounded by this call's
@@ -243,13 +282,16 @@ impl GossipBlockSource {
         let response_topics = peer
             .request_with_timeout(Tag::UniEnsBlockReq, topics, self.config.request_timeout)
             .await
-            .map_err(|e| AlgoError::Network {
-                message: format!(
-                    "WS block request failed for round {} from peer {}: {}",
-                    round,
-                    peer.get_address(),
-                    e
-                ),
+            .map_err(|e| PeerFetchFailure {
+                error: AlgoError::Network {
+                    message: format!(
+                        "WS block request failed for round {} from peer {}: {}",
+                        round,
+                        peer.get_address(),
+                        e
+                    ),
+                },
+                answered: false,
             })?;
 
         // Parse the response topics to get raw block+cert bytes.
@@ -264,20 +306,30 @@ impl GossipBlockSource {
             // genuinely does not have the round (`rpcs/blockService.go`).
             // Keep that class so catchpoint replay can tell "peer cannot
             // serve this round" from a transport failure (issue #1725).
-            match e {
+            let error = match e {
                 BlockFetchError::ServiceError { message: m, .. }
-                    if m == BLOCK_NOT_AVAILABLE_MSG =>
+                    if m.contains(BLOCK_NOT_AVAILABLE_MSG) =>
                 {
                     AlgoError::NotFound(message)
                 }
                 _ => AlgoError::Network { message },
+            };
+            PeerFetchFailure {
+                error,
+                answered: true,
             }
         })?;
 
         // Decode block+cert from their raw msgpack bytes. decode_block_cert
         // borrows the data, so we can move block_data into the return tuple
         // afterward — avoiding a clone.
-        let response = decode_block_cert(&data.block_data, &data.cert_data, round)?;
+        let response =
+            decode_block_cert(&data.block_data, &data.cert_data, round).map_err(|error| {
+                PeerFetchFailure {
+                    error,
+                    answered: true,
+                }
+            })?;
         Ok((response, data.block_data))
     }
 
@@ -308,14 +360,13 @@ impl GossipBlockSource {
         // count — closer to go's `catchupRetryLimit`, which is likewise
         // independent of how many peers are available.
         let attempts = self.config.max_peer_attempts;
-        // A `NotFound` ("peer lacks the round") is only reported when EVERY
-        // attempt got one AND at least `min(peer count, 2)` distinct peers
-        // were asked: a mix with a transport failure, or a single peer's
-        // opinion out of a larger pool, proves nothing about the round's
-        // availability, so the other failure wins.
+        // A `NotFound` ("peers lack the round") is only reported when
+        // `not_available_is_verdict` says so; otherwise the other failure
+        // (or an explanation of the insufficient evidence) is reported.
         let mut last_not_found: Option<AlgoError> = None;
         let mut last_other: Option<AlgoError> = None;
-        let mut asked: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut not_available: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut other_answers = false;
 
         for attempt in 0..attempts {
             // Ask the ranker for the next peer to try (lowest-rank
@@ -353,7 +404,6 @@ impl GossipBlockSource {
                 "requesting block via WS unicast (ranked selection)"
             );
 
-            asked.insert(peer.get_address().to_string());
             let started = Instant::now();
             match self.fetch_from_peer(peer.as_ref(), round).await {
                 Ok((response, raw_block_data)) => {
@@ -374,7 +424,7 @@ impl GossipBlockSource {
                         .fetch_max(round.0, Ordering::Relaxed);
                     return Ok((response, raw_block_data));
                 }
-                Err(e) => {
+                Err(PeerFetchFailure { error: e, answered }) => {
                     warn!(
                         round = %round,
                         peer = peer.get_address(),
@@ -391,33 +441,42 @@ impl GossipBlockSource {
                     selector.rank_peer(&psp, PEER_RANK_DOWNLOAD_FAILED);
                     drop(selector);
                     if matches!(e, AlgoError::NotFound(_)) {
+                        not_available.insert(peer.get_address().to_string());
                         last_not_found = Some(e);
                     } else {
+                        other_answers |= answered;
                         last_other = Some(e);
                     }
                 }
             }
         }
 
-        let enough_peers_asked = asked.len() >= self.peers.len().min(2);
+        let verdict =
+            not_available_is_verdict(self.peers.len(), not_available.len(), other_answers);
         let last_not_found = last_not_found.map(|e| {
-            if enough_peers_asked {
+            if verdict {
                 e
             } else {
                 AlgoError::Network {
                     message: format!(
-                        "block {round} not available from the {} of {} peers asked ({e})",
-                        asked.len(),
+                        "block {round} not available from {} of {} peers, which is not \
+                         enough to conclude it is gone ({e})",
+                        not_available.len(),
                         self.peers.len()
                     ),
                 }
             }
         });
-        Err(last_other
-            .or(last_not_found)
-            .unwrap_or_else(|| AlgoError::Network {
-                message: format!("all {attempts} peers failed for round {round}"),
-            }))
+        // A verdict outranks transport failures; otherwise the other failure
+        // wins over the (insufficient) not-available evidence.
+        let (first, second) = if verdict {
+            (last_not_found, last_other)
+        } else {
+            (last_other, last_not_found)
+        };
+        Err(first.or(second).unwrap_or_else(|| AlgoError::Network {
+            message: format!("all {attempts} peers failed for round {round}"),
+        }))
     }
 
     /// Fetch a block with retry/failover, returning both the decoded response
@@ -1082,6 +1141,76 @@ mod tests {
             ..GossipBlockSourceConfig::default()
         };
         let src = GossipBlockSource::with_config(peers, two_attempts);
+        let err = src.get_block(Round(3)).await.unwrap_err();
+        assert!(matches!(err, AlgoError::NotFound(_)), "{err:?}");
+    }
+
+    /// The verdict rule as a truth table.
+    #[test]
+    fn not_available_verdict_truth_table() {
+        // (pool, distinct not-available, other answers) -> verdict
+        for (pool, na, other, want) in [
+            (1, 1, false, true),  // pool of one: that peer's word is all there is
+            (1, 0, false, false), // nobody said it
+            (2, 1, false, false), // one opinion out of two
+            (2, 2, false, true),
+            (3, 2, false, true), // min(3, 2) = 2 distinct peers
+            (3, 1, false, false),
+            (3, 3, false, true),
+            (2, 2, true, false), // someone answered otherwise: contradiction
+            (1, 1, true, false),
+        ] {
+            assert_eq!(
+                not_available_is_verdict(pool, na, other),
+                want,
+                "pool={pool} na={na} other={other}"
+            );
+        }
+    }
+
+    /// A transport failure from a third peer does not veto two distinct
+    /// peers saying not-available; a different ANSWER (service error) does.
+    #[tokio::test]
+    async fn transport_failure_does_not_veto_but_a_contradicting_answer_does() {
+        let na_a: Arc<dyn UnicastPeer> = Arc::new(MockPeer::new("a:4160"));
+        let na_b: Arc<dyn UnicastPeer> = Arc::new(MockPeer::new("b:4160"));
+        let down: Arc<dyn UnicastPeer> = Arc::new(MockPeer::new("c:4160").always_failing());
+        let src = GossipBlockSource::new(vec![na_a, na_b, down]);
+        let err = src.get_block(Round(3)).await.unwrap_err();
+        assert!(matches!(err, AlgoError::NotFound(_)), "{err:?}");
+
+        let na_a: Arc<dyn UnicastPeer> = Arc::new(MockPeer::new("a:4160"));
+        let na_b: Arc<dyn UnicastPeer> = Arc::new(MockPeer::new("b:4160"));
+        let odd: Arc<dyn UnicastPeer> =
+            Arc::new(MockPeer::new("c:4160").with_service_error(3, "memory at capacity"));
+        let src = GossipBlockSource::new(vec![na_a, na_b, odd]);
+        let err = src.get_block(Round(3)).await.unwrap_err();
+        assert!(matches!(err, AlgoError::Network { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn worst_case_round_time_is_timeout_times_attempts() {
+        let cfg = GossipBlockSourceConfig {
+            request_timeout: Duration::from_secs(4),
+            max_peer_attempts: 5,
+            ..GossipBlockSourceConfig::default()
+        };
+        assert_eq!(cfg.worst_case_round_time(), Duration::from_secs(20));
+    }
+
+    /// The "not available" text is matched structurally: a peer that wraps or
+    /// extends it still says the block is not there.
+    #[tokio::test]
+    async fn not_available_text_is_matched_with_contains() {
+        let peer: Arc<dyn UnicastPeer> = Arc::new(
+            MockPeer::new("a:4160")
+                .with_service_error(3, "error: requested block is not available (round 3)"),
+        );
+        let cfg = GossipBlockSourceConfig {
+            max_peer_attempts: 1,
+            ..GossipBlockSourceConfig::default()
+        };
+        let src = GossipBlockSource::with_config(vec![peer], cfg);
         let err = src.get_block(Round(3)).await.unwrap_err();
         assert!(matches!(err, AlgoError::NotFound(_)), "{err:?}");
     }

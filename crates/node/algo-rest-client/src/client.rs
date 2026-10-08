@@ -45,6 +45,25 @@ pub struct ClientConfig {
     pub initial_backoff: Duration,
 }
 
+impl ClientConfig {
+    /// Worst-case wall time of one request including its retries: every
+    /// attempt (`max_retries + 1`) runs to its `timeout`, with the doubling
+    /// backoff slept between attempts. Used to size how long a failing
+    /// parallel block fetch drains in-flight rounds (issue #1725).
+    pub fn worst_case_request_time(&self) -> Duration {
+        let attempts = self.max_retries.saturating_add(1);
+        let backoff_total = (0..self.max_retries)
+            .map(|i| {
+                self.initial_backoff
+                    .saturating_mul(1u32.checked_shl(i).unwrap_or(u32::MAX))
+            })
+            .fold(Duration::ZERO, Duration::saturating_add);
+        self.timeout
+            .saturating_mul(attempts)
+            .saturating_add(backoff_total)
+    }
+}
+
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
@@ -827,5 +846,28 @@ impl BlockSource for AlgodClient {
                 source: Box::new(e),
                 context: format!("parsing wait-for-block-after/{round} response"),
             })
+    }
+}
+
+#[cfg(test)]
+mod worst_case_tests {
+    use super::*;
+
+    /// 4 attempts of 30 s plus the doubling backoff slept between them
+    /// (100 + 200 + 400 ms).
+    #[test]
+    fn worst_case_request_time_counts_every_attempt_and_the_backoff() {
+        assert_eq!(
+            ClientConfig::default().worst_case_request_time(),
+            Duration::from_millis(4 * 30_000 + 700)
+        );
+        let no_retries = ClientConfig {
+            max_retries: 0,
+            ..ClientConfig::default()
+        };
+        assert_eq!(
+            no_retries.worst_case_request_time(),
+            Duration::from_secs(30)
+        );
     }
 }

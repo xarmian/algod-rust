@@ -91,20 +91,28 @@ impl SyncTuning {
         }
     }
 
-    /// The post-failure drain budget for a fetcher whose individual requests
-    /// time out after `request_timeout` (`ZERO` if unknown).
+    /// The post-failure drain budget for a fetcher whose single-round fetch
+    /// takes at most `worst_case_round_time` (all retries and peer attempts
+    /// included; `ZERO` if unknown).
     ///
-    /// Tradeoff: draining lets a slow LOWER round still report, so a genuine
-    /// 404 hand-off at that round is recognised; the budget bounds how long
-    /// any caller waits for failure reporting. A fast higher-round failure
-    /// can only pre-empt a lower round that outlives the whole budget, so by
-    /// default the budget is at least one full request timeout (and never
-    /// below [`DEFAULT_DRAIN_TIMEOUT`]), meaning any request that would
-    /// complete or time out normally gets to report. An explicit
-    /// [`FETCH_DRAIN_TIMEOUT_SECS_ENV`] value overrides it.
-    pub(crate) fn drain_budget(&self, request_timeout: std::time::Duration) -> std::time::Duration {
+    /// What it guarantees: every round that was already in flight when the
+    /// first failure happened has been running for some time already, so a
+    /// round whose fetch finishes (success or its final error) within
+    /// `worst_case_round_time` of when it STARTED reports before the budget
+    /// expires; the drain therefore never cuts off a round that was behaving
+    /// within its configured limits. The default is that worst case, but
+    /// never below [`DEFAULT_DRAIN_TIMEOUT`]. What it costs: failure
+    /// reporting can be delayed by up to the budget when a round hangs for
+    /// its whole worst case. A round that exceeds the worst case (a hung
+    /// socket the timeouts missed) is cut off and its outcome is unknown,
+    /// which is reported as a retryable error, never as a hand-off. An
+    /// explicit [`FETCH_DRAIN_TIMEOUT_SECS_ENV`] value overrides the budget.
+    pub(crate) fn drain_budget(
+        &self,
+        worst_case_round_time: std::time::Duration,
+    ) -> std::time::Duration {
         self.fetch_drain_timeout
-            .unwrap_or_else(|| DEFAULT_DRAIN_TIMEOUT.max(request_timeout))
+            .unwrap_or_else(|| DEFAULT_DRAIN_TIMEOUT.max(worst_case_round_time))
     }
 }
 
@@ -124,6 +132,23 @@ pub(crate) fn init_sync_tuning_from_env() {
 /// The process-wide tuning (defaults until [`init_sync_tuning_from_env`] ran).
 pub(crate) fn sync_tuning() -> SyncTuning {
     SYNC_TUNING.get().copied().unwrap_or_default()
+}
+
+/// Worst-case wall time to fetch ONE round through `policy`: gossip tries up
+/// to `max_peer_attempts` peers one after another (each bounded by the
+/// request timeout), and `GossipFirst` then falls back to one HTTP fetch.
+fn worst_case_round_time(
+    policy: BlockSourcePolicy,
+    gossip: &algo_rest_client::GossipBlockSourceConfig,
+    http_block_fetch_timeout: std::time::Duration,
+) -> std::time::Duration {
+    match policy {
+        BlockSourcePolicy::HttpOnly => http_block_fetch_timeout,
+        BlockSourcePolicy::GossipOnly => gossip.worst_case_round_time(),
+        BlockSourcePolicy::GossipFirst => gossip
+            .worst_case_round_time()
+            .saturating_add(http_block_fetch_timeout),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -398,15 +423,6 @@ impl SyncBackend for AlgodSyncBackend {
         })
     }
 
-    fn fetch_blocks_batch(
-        &self,
-        start: u64,
-        end: u64,
-        concurrency: usize,
-    ) -> Result<Vec<(u64, Block)>, AlgoError> {
-        fetch_blocks_batch_via_range(self, start, end, concurrency)
-    }
-
     fn fetch_block_range(
         &self,
         start: u64,
@@ -422,8 +438,11 @@ impl SyncBackend for AlgodSyncBackend {
             self.rt.block_on(async {
                 let source: Arc<dyn BlockSource> =
                     Arc::new(AlgodClient::new(&self.algod_url, &self.algod_token));
-                let fetcher = ParallelBlockFetcher::new(source, concurrency)
-                    .with_drain_timeout(sync_tuning().drain_budget(std::time::Duration::ZERO));
+                let fetcher = ParallelBlockFetcher::new(source, concurrency).with_drain_timeout(
+                    sync_tuning().drain_budget(
+                        algo_rest_client::ClientConfig::default().worst_case_request_time(),
+                    ),
+                );
                 collect_block_range(&fetcher, start, end, cancel).await
             })
         })
@@ -541,34 +560,6 @@ async fn collect_block_range(
             )
         }
     }
-}
-
-/// The legacy all-or-error view of a [`BatchFetch`]
-/// ([`SyncBackend::fetch_blocks_batch`]): the served prefix is returned only
-/// when the shortfall is a clean "peer lacks the next round"; any error
-/// discards it.
-fn batch_fetch_into_result(fetch: BatchFetch) -> Result<Vec<(u64, Block)>, AlgoError> {
-    match fetch.error {
-        None => Ok(fetch.blocks),
-        Some(e) => Err(e),
-    }
-}
-
-/// [`SyncBackend::fetch_blocks_batch`] for a backend that implements
-/// [`SyncBackend::fetch_block_range`]: the legacy all-or-error view, with a
-/// fresh (never cancelled) token.
-fn fetch_blocks_batch_via_range(
-    backend: &impl SyncBackend,
-    start: u64,
-    end: u64,
-    concurrency: usize,
-) -> Result<Vec<(u64, Block)>, AlgoError> {
-    batch_fetch_into_result(backend.fetch_block_range(
-        start,
-        end,
-        concurrency,
-        &CancellationToken::new(),
-    ))
 }
 
 /// Build the same [`SyncBackend`] the standalone `algod-rust sync`
@@ -777,20 +768,21 @@ pub struct GossipSyncBackend {
     policy: BlockSourcePolicy,
     /// Concurrency for batch fetches.
     concurrency: usize,
-    /// The slowest per-request timeout of the block sources (HTTP / gossip);
-    /// `ZERO` if unknown. Feeds [`SyncTuning::drain_budget`].
-    request_timeout: std::time::Duration,
+    /// Worst-case wall time of fetching one round through the configured
+    /// policy (gossip attempts across peers plus any HTTP fallback); `ZERO`
+    /// if unknown. Feeds [`SyncTuning::drain_budget`].
+    worst_case_round_time: std::time::Duration,
     /// The network preset name -- see `AlgodSyncBackend`'s `network` field
     /// doc comment (issue #1604).
     network: Option<String>,
 }
 
 impl GossipSyncBackend {
-    /// Record the block sources' per-request timeout so a failing parallel
+    /// Record the worst-case time to fetch one round so a failing parallel
     /// fetch drains in-flight rounds for at least that long.
     #[must_use]
-    pub fn with_request_timeout(mut self, request_timeout: std::time::Duration) -> Self {
-        self.request_timeout = request_timeout;
+    pub fn with_worst_case_round_time(mut self, worst_case: std::time::Duration) -> Self {
+        self.worst_case_round_time = worst_case;
         self
     }
 
@@ -834,7 +826,7 @@ impl GossipSyncBackend {
             rt,
             policy,
             concurrency,
-            request_timeout: std::time::Duration::ZERO,
+            worst_case_round_time: std::time::Duration::ZERO,
             network: network.map(str::to_string),
         }
     }
@@ -967,15 +959,6 @@ impl SyncBackend for GossipSyncBackend {
         })
     }
 
-    fn fetch_blocks_batch(
-        &self,
-        start: u64,
-        end: u64,
-        concurrency: usize,
-    ) -> Result<Vec<(u64, Block)>, AlgoError> {
-        fetch_blocks_batch_via_range(self, start, end, concurrency)
-    }
-
     fn fetch_block_range(
         &self,
         start: u64,
@@ -1023,7 +1006,7 @@ impl SyncBackend for GossipSyncBackend {
                     self.concurrency
                 };
                 let fetcher = ParallelBlockFetcher::new(source, effective_concurrency)
-                    .with_drain_timeout(sync_tuning().drain_budget(self.request_timeout));
+                    .with_drain_timeout(sync_tuning().drain_budget(self.worst_case_round_time));
                 collect_block_range(&fetcher, start, end, cancel).await
             })
         })
@@ -1105,18 +1088,6 @@ impl SyncBackend for CatchpointBackend {
         }
     }
 
-    fn fetch_blocks_batch(
-        &self,
-        start: u64,
-        end: u64,
-        concurrency: usize,
-    ) -> Result<Vec<(u64, Block)>, AlgoError> {
-        match self {
-            Self::Rest(b) => b.fetch_blocks_batch(start, end, concurrency),
-            Self::Gossip(b) => b.fetch_blocks_batch(start, end, concurrency),
-        }
-    }
-
     fn fetch_block_range(
         &self,
         start: u64,
@@ -1188,12 +1159,13 @@ fn build_catchpoint_backend(
     // HTTP-fallback fetcher's `http_block_fetch_timeout` wiring just above
     // (issue #1291) rather than the 4s hardcoded default
     // `GossipBlockSource::new`/`GossipBlockSourceConfig::default()` would use.
+    let gossip_config = algo_rest_client::GossipBlockSourceConfig {
+        request_timeout: catchup_gossip_block_fetch_timeout,
+        ..Default::default()
+    };
     let gossip_source = Arc::new(GossipBlockSource::with_config(
         gossip_peers,
-        algo_rest_client::GossipBlockSourceConfig {
-            request_timeout: catchup_gossip_block_fetch_timeout,
-            ..Default::default()
-        },
+        gossip_config.clone(),
     ));
     // go: `CatchupHTTPBlockFetchTimeoutSec` (`config.Local`, issue #1291) —
     // previously this HTTP fallback fetcher always used a hardcoded 30s
@@ -1214,7 +1186,11 @@ fn build_catchpoint_backend(
             download_config,
             network_name_for_genesis_id(genesis_id),
         )
-        .with_request_timeout(http_block_fetch_timeout.max(catchup_gossip_block_fetch_timeout)),
+        .with_worst_case_round_time(worst_case_round_time(
+            policy,
+            &gossip_config,
+            http_block_fetch_timeout,
+        )),
     ))
 }
 
@@ -2134,6 +2110,69 @@ mod tests {
         assert_eq!(
             t.drain_budget(Duration::from_secs(30)),
             Duration::from_secs(20)
+        );
+    }
+
+    #[test]
+    fn worst_case_round_time_follows_the_block_source_policy() {
+        use std::time::Duration;
+        let gossip = algo_rest_client::GossipBlockSourceConfig {
+            request_timeout: Duration::from_secs(4),
+            max_peer_attempts: 5,
+            ..Default::default()
+        };
+        let http = Duration::from_secs(30);
+        assert_eq!(
+            worst_case_round_time(BlockSourcePolicy::HttpOnly, &gossip, http),
+            http
+        );
+        assert_eq!(
+            worst_case_round_time(BlockSourcePolicy::GossipOnly, &gossip, http),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            worst_case_round_time(BlockSourcePolicy::GossipFirst, &gossip, http),
+            Duration::from_secs(50)
+        );
+    }
+
+    /// Issue #1725: the drain budget is sized from the real worst-case round
+    /// time, so a lower round that is slow but within its limits still
+    /// reports (and a genuine 404 there is still recognised) after a higher
+    /// round failed fast. With the bare 5 s default the same round would be
+    /// cut off and the outcome unknown. Virtual time.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_lower_round_within_the_worst_case_still_reports_its_404() {
+        use std::time::Duration;
+        let script = |r: u64| match r {
+            10 => (40_000, Some(AlgoError::NotFound("404".into()))),
+            11 => (
+                0,
+                Some(AlgoError::Network {
+                    message: "reset".into(),
+                }),
+            ),
+            _ => (0, None),
+        };
+        let tuning = SyncTuning::default();
+        let budget = tuning.drain_budget(Duration::from_secs(60));
+        assert_eq!(budget, Duration::from_secs(60));
+        let sized = ParallelBlockFetcher::new(Arc::new(ScriptedSource(script)), 4)
+            .with_drain_timeout(budget);
+        let fetch = collect_block_range(&sized, 10, 15, &CancellationToken::new()).await;
+        assert!(
+            matches!(fetch.error, Some(AlgoError::NotFound(_))),
+            "the slow round 10 reported its own 404: {:?}",
+            fetch.error
+        );
+
+        let bare = ParallelBlockFetcher::new(Arc::new(ScriptedSource(script)), 4)
+            .with_drain_timeout(tuning.drain_budget(Duration::ZERO));
+        let fetch = collect_block_range(&bare, 10, 15, &CancellationToken::new()).await;
+        assert!(
+            matches!(fetch.error, Some(AlgoError::Network { .. })),
+            "cut off after 5 s: {:?}",
+            fetch.error
         );
     }
 
