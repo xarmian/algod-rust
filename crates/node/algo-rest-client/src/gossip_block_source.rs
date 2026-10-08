@@ -308,11 +308,14 @@ impl GossipBlockSource {
         // count — closer to go's `catchupRetryLimit`, which is likewise
         // independent of how many peers are available.
         let attempts = self.config.max_peer_attempts;
-        // A `NotFound` ("peer lacks the round") is only reported when every
-        // attempt got one: a mix with a transport failure proves nothing
-        // about the round's availability, so the other failure wins.
+        // A `NotFound` ("peer lacks the round") is only reported when EVERY
+        // attempt got one AND at least `min(peer count, 2)` distinct peers
+        // were asked: a mix with a transport failure, or a single peer's
+        // opinion out of a larger pool, proves nothing about the round's
+        // availability, so the other failure wins.
         let mut last_not_found: Option<AlgoError> = None;
         let mut last_other: Option<AlgoError> = None;
+        let mut asked: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for attempt in 0..attempts {
             // Ask the ranker for the next peer to try (lowest-rank
@@ -350,6 +353,7 @@ impl GossipBlockSource {
                 "requesting block via WS unicast (ranked selection)"
             );
 
+            asked.insert(peer.get_address().to_string());
             let started = Instant::now();
             match self.fetch_from_peer(peer.as_ref(), round).await {
                 Ok((response, raw_block_data)) => {
@@ -395,6 +399,20 @@ impl GossipBlockSource {
             }
         }
 
+        let enough_peers_asked = asked.len() >= self.peers.len().min(2);
+        let last_not_found = last_not_found.map(|e| {
+            if enough_peers_asked {
+                e
+            } else {
+                AlgoError::Network {
+                    message: format!(
+                        "block {round} not available from the {} of {} peers asked ({e})",
+                        asked.len(),
+                        self.peers.len()
+                    ),
+                }
+            }
+        });
         Err(last_other
             .or(last_not_found)
             .unwrap_or_else(|| AlgoError::Network {
@@ -1030,6 +1048,42 @@ mod tests {
         let src = GossipBlockSource::new(vec![lacks, broken]);
         let err = src.get_block(Round(3)).await.unwrap_err();
         assert!(matches!(err, AlgoError::Network { .. }), "{err:?}");
+    }
+
+    /// The rule for `NotFound`: EVERY attempt said "not available" AND at
+    /// least `min(peer count, 2)` distinct peers were asked. One peer's
+    /// opinion out of a pool of two is not enough to call the round gone.
+    #[tokio::test]
+    async fn not_found_requires_min_of_peer_count_and_two_distinct_peers_asked() {
+        let one_attempt = || GossipBlockSourceConfig {
+            max_peer_attempts: 1,
+            ..GossipBlockSourceConfig::default()
+        };
+        // Two peers, one attempt: only one peer asked -> not enough.
+        let a: Arc<dyn UnicastPeer> = Arc::new(MockPeer::new("a:4160"));
+        let b: Arc<dyn UnicastPeer> = Arc::new(MockPeer::new("b:4160"));
+        let src = GossipBlockSource::with_config(vec![a, b], one_attempt());
+        let err = src.get_block(Round(3)).await.unwrap_err();
+        assert!(matches!(err, AlgoError::Network { .. }), "{err:?}");
+
+        // A pool of one peer: asking that peer is asking everyone.
+        let only: Arc<dyn UnicastPeer> = Arc::new(MockPeer::new("only:4160"));
+        let src = GossipBlockSource::with_config(vec![only], one_attempt());
+        let err = src.get_block(Round(3)).await.unwrap_err();
+        assert!(matches!(err, AlgoError::NotFound(_)), "{err:?}");
+
+        // Three peers, two attempts: two distinct peers asked = min(3, 2).
+        let peers: Vec<Arc<dyn UnicastPeer>> = ["a:4160", "b:4160", "c:4160"]
+            .into_iter()
+            .map(|n| Arc::new(MockPeer::new(n)) as Arc<dyn UnicastPeer>)
+            .collect();
+        let two_attempts = GossipBlockSourceConfig {
+            max_peer_attempts: 2,
+            ..GossipBlockSourceConfig::default()
+        };
+        let src = GossipBlockSource::with_config(peers, two_attempts);
+        let err = src.get_block(Round(3)).await.unwrap_err();
+        assert!(matches!(err, AlgoError::NotFound(_)), "{err:?}");
     }
 
     /// Any other service error text is not a "peer lacks the block" claim.

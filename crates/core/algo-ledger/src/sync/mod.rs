@@ -270,6 +270,12 @@ pub struct SyncConfig {
     /// (`config/local_defaults.go`, `version[9]:"1000"`) and this field's
     /// previously-nonexistent (unbounded) retry behavior.
     pub catchup_block_download_retry_attempts: u64,
+    /// Minimum lag behind the replay target for a "peer lacks the block"
+    /// answer to hand off to normal catchup instead of failing with a
+    /// retryable error (issue #1725). See [`DEFAULT_HANDOFF_MIN_LAG_ROUNDS`];
+    /// binaries resolve it once at startup from
+    /// [`HANDOFF_MIN_LAG_ROUNDS_ENV`] via [`parse_handoff_min_lag_rounds`].
+    pub handoff_min_lag_rounds: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -336,9 +342,9 @@ impl std::fmt::Display for ReplayStoppedEarly {
 /// service has no hand-off). 64 rounds is roughly three minutes of mainnet
 /// blocks: far beyond ordinary status-vs-block-peer skew, far below any
 /// archival-retention boundary. Override per orchestrator with
-/// [`SyncOrchestrator::set_handoff_min_lag_rounds`], or for a whole process
-/// with the [`HANDOFF_MIN_LAG_ROUNDS_ENV`] environment variable (issue
-/// #1725); `0` hands off on any "peer lacks the block" answer.
+/// [`SyncConfig::handoff_min_lag_rounds`], which binaries fill from the
+/// [`HANDOFF_MIN_LAG_ROUNDS_ENV`] environment variable once at startup
+/// (issue #1725); `0` hands off on any "peer lacks the block" answer.
 pub const DEFAULT_HANDOFF_MIN_LAG_ROUNDS: u64 = 64;
 
 /// Environment variable overriding [`DEFAULT_HANDOFF_MIN_LAG_ROUNDS`]: a
@@ -633,9 +639,6 @@ pub struct SyncOrchestrator {
     final_round: u64,
     /// Set when replay handed off before reaching its target (issue #1719).
     replay_stopped_early: Option<ReplayStoppedEarly>,
-    /// Minimum lag behind the target for a "peer lacks the block" answer to
-    /// hand off (see [`DEFAULT_HANDOFF_MIN_LAG_ROUNDS`]).
-    handoff_min_lag_rounds: u64,
     /// Cancellation token — checked between phases and during long operations.
     cancel: CancellationToken,
     /// Optional progress callback — invoked on state transitions and periodic updates.
@@ -673,9 +676,6 @@ impl SyncOrchestrator {
             blocks_replayed: 0,
             final_round: 0,
             replay_stopped_early: None,
-            handoff_min_lag_rounds: parse_handoff_min_lag_rounds(
-                std::env::var(HANDOFF_MIN_LAG_ROUNDS_ENV).ok().as_deref(),
-            ),
             cancel: CancellationToken::new(),
             on_progress: None,
             eval_delta_stats: EvalDeltaStats::default(),
@@ -688,12 +688,6 @@ impl SyncOrchestrator {
     /// atomic operation, persist checkpoint state, and return an error.
     pub fn set_cancel(&mut self, cancel: CancellationToken) {
         self.cancel = cancel;
-    }
-
-    /// Override the minimum lag behind the target for a hand-off (see
-    /// [`DEFAULT_HANDOFF_MIN_LAG_ROUNDS`]).
-    pub fn set_handoff_min_lag_rounds(&mut self, rounds: u64) {
-        self.handoff_min_lag_rounds = rounds;
     }
 
     /// Set a progress callback that is invoked on state transitions and
@@ -2296,6 +2290,14 @@ impl SyncOrchestrator {
                 }
             }
 
+            // A shutdown that landed while the batch was being applied must
+            // not be recorded as a hand-off (`stopped_early`, exit status 3):
+            // check it before interpreting any shortfall.
+            if self.cancel.is_cancelled() {
+                self.blocks_replayed = blocks_applied;
+                return Err(self.handle_cancellation());
+            }
+
             // The prefix is applied above. Now decide what the shortfall
             // means. A short batch without an error is the in-order prefix of
             // a peer that does not have the next round (see
@@ -2337,7 +2339,7 @@ impl SyncOrchestrator {
             // farther than that from the target means the peer genuinely
             // cannot serve old rounds.
             if self.config.end_round.is_none()
-                && next_missing.saturating_add(self.handoff_min_lag_rounds) <= target_round
+                && next_missing.saturating_add(self.config.handoff_min_lag_rounds) <= target_round
             {
                 tracing::warn!(
                     next_missing,
@@ -3448,6 +3450,7 @@ mod tests {
             accounts_rebuild_synchronous_mode,
             catchup_block_download_retry_attempts:
                 crate::catchpoint::DEFAULT_CATCHUP_BLOCK_DOWNLOAD_RETRY_ATTEMPTS,
+            handoff_min_lag_rounds: DEFAULT_HANDOFF_MIN_LAG_ROUNDS,
         }
     }
 
@@ -5090,9 +5093,8 @@ mod tests {
             BatchMode::Fail(not_served),
             10,
             None,
-            |_| {},
+            |c| c.handoff_min_lag_rounds = 8,
         );
-        o.set_handoff_min_lag_rounds(8);
         o.run_replay_blocks().expect("10 >= 8 hands off");
         assert!(o.replay_stopped_early.is_some());
         let _ = std::fs::remove_dir_all(&dir);
@@ -5102,11 +5104,33 @@ mod tests {
             BatchMode::Fail(not_served),
             200,
             None,
-            |_| {},
+            |c| c.handoff_min_lag_rounds = 500,
         );
-        o.set_handoff_min_lag_rounds(500);
         let e = o.run_replay_blocks().expect_err("200 < 500 stays an error");
         assert!(matches!(e, AlgoError::NotFound(_)), "{e:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A shutdown that lands while a SHORT prefix comes back (no fetch error)
+    /// is a cancellation, not a hand-off: it must not be recorded as
+    /// `stopped_early` (which would surface as exit 3 / StoppedShort).
+    #[test]
+    fn cancel_during_a_short_prefix_batch_is_a_cancellation_not_a_handoff() {
+        let token = CancellationToken::new();
+        let (mut o, dir) = window_orchestrator(
+            "cancel-during-prefix",
+            BatchMode::ServePrefix(WINDOW_BLOCKS_ROUND + 5),
+            100,
+            Some(token.clone()),
+            |c| c.concurrency = 8,
+        );
+        o.set_cancel(token);
+        let err = o.run_replay_blocks().expect_err("cancelled");
+        assert!(err.to_string().contains("cancelled"), "{err:?}");
+        assert!(
+            o.replay_stopped_early.is_none(),
+            "a cancellation must not be reported as a hand-off"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

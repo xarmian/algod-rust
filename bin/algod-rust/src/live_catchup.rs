@@ -409,9 +409,11 @@ impl LiveCatchupManager {
         self.counters.lock().map(|g| *g).unwrap_or_default()
     }
 
-    /// The most recently *completed* catchpoint label (empty if none has
-    /// completed yet), tracked purely as this manager's own internal
-    /// bookkeeping.
+    /// The most recently *applied* catchpoint label (empty if none has
+    /// been applied yet), tracked purely as this manager's own internal
+    /// bookkeeping. Set for a [`CatchupOutcome::StoppedShort`] run too: the
+    /// catchpoint itself was applied there and only the follow-on replay
+    /// stopped short (issue #1725; see [`Self::last_outcome`]).
     ///
     /// No longer backs `GET /v2/status`'s `last-catchpoint` field (issue
     /// #827 theme 4): go's own `LastCatchpoint` (`node/node.go`) is
@@ -435,7 +437,6 @@ impl LiveCatchupManager {
     /// (issue #1725). Internal bookkeeping only: `GET /v2/status` is
     /// unchanged because go-algorand has no counterpart (its catchpoint
     /// service ends at the catchpoint round).
-    #[allow(dead_code)]
     pub fn last_outcome(&self) -> Option<CatchupOutcome> {
         self.last_outcome.lock().ok().and_then(|g| g.clone())
     }
@@ -458,18 +459,41 @@ impl LiveCatchupManager {
             }) => target_round.saturating_sub(stopped_at_round),
             _ => 0,
         };
-        format!(
-            "# HELP algod_rust_catchpoint_catchup_completed_total Live catchpoint catchups whose replay reached its target.
-             # TYPE algod_rust_catchpoint_catchup_completed_total counter
-             algod_rust_catchpoint_catchup_completed_total {completed}
-             # HELP algod_rust_catchpoint_catchup_stopped_short_total Live catchpoint catchups whose replay stopped short of its target (normal catchup continues).
-             # TYPE algod_rust_catchpoint_catchup_stopped_short_total counter
-             algod_rust_catchpoint_catchup_stopped_short_total {stopped_short}
-             # HELP algod_rust_catchpoint_catchup_stopped_short_behind_rounds Rounds the most recent successful live catchup stopped short of its target by (0 if it reached it).
-             # TYPE algod_rust_catchpoint_catchup_stopped_short_behind_rounds gauge
-             algod_rust_catchpoint_catchup_stopped_short_behind_rounds {behind}
+        let mut out = String::new();
+        for (name, kind, help, value) in [
+            (
+                "algod_rust_catchpoint_catchup_completed_total",
+                "counter",
+                "Live catchpoint catchups whose replay reached its target.",
+                completed,
+            ),
+            (
+                "algod_rust_catchpoint_catchup_stopped_short_total",
+                "counter",
+                "Live catchpoint catchups whose replay stopped short of its target (normal catchup continues).",
+                stopped_short,
+            ),
+            (
+                "algod_rust_catchpoint_catchup_stopped_short_behind_rounds",
+                "gauge",
+                "Rounds the most recent successful live catchup stopped short of its target by (0 if it reached it).",
+                behind,
+            ),
+        ] {
+            out.push_str(&format!(
+                "# HELP {name} {help}
+# TYPE {name} {kind}
+{name} {value}
 "
-        )
+            ));
+        }
+        out
+    }
+
+    fn set_last_catchpoint(&self, catchpoint: &str) {
+        if let Ok(mut last) = self.last_catchpoint.lock() {
+            *last = catchpoint.to_string();
+        }
     }
 
     fn record_outcome(&self, outcome: CatchupOutcome) {
@@ -491,32 +515,32 @@ impl LiveCatchupManager {
         match &result {
             Ok(CatchupOutcome::Complete) => {
                 info!(catchpoint = %catchpoint, "live catchpoint catchup completed");
-                if let Ok(mut last) = self.last_catchpoint.lock() {
-                    *last = catchpoint.clone();
-                }
+                self.set_last_catchpoint(&catchpoint);
                 self.completed_total.fetch_add(1, Ordering::Relaxed);
                 self.record_outcome(CatchupOutcome::Complete);
             }
-            // Issue #1725: the catchpoint was applied but block replay
-            // stopped short of the tip. That is not a completed catchup (and
-            // must not set `last_catchpoint`); the node's normal catchup,
-            // resumed below, closes the gap.
-            Ok(outcome @ CatchupOutcome::StoppedShort { .. }) => {
-                if let CatchupOutcome::StoppedShort {
+            // Issue #1725: the catchpoint itself WAS applied (so
+            // `last_catchpoint` is set as before) but block replay stopped
+            // short of the tip. Log and count that apart from a completed
+            // catchup; the node's normal catchup, resumed below, closes the
+            // gap.
+            Ok(CatchupOutcome::StoppedShort {
+                stopped_at_round,
+                target_round,
+            }) => {
+                warn!(
+                    catchpoint = %catchpoint,
                     stopped_at_round,
                     target_round,
-                } = &outcome
-                {
-                    warn!(
-                        catchpoint = %catchpoint,
-                        stopped_at_round,
-                        target_round,
-                        "live catchpoint catchup stopped short at round {stopped_at_round} \
-                         (target {target_round}); normal catchup continues"
-                    );
-                }
+                    "live catchpoint catchup stopped short at round {stopped_at_round} \
+                     (target {target_round}); normal catchup continues"
+                );
+                self.set_last_catchpoint(&catchpoint);
                 self.stopped_short_total.fetch_add(1, Ordering::Relaxed);
-                self.record_outcome(outcome.clone());
+                self.record_outcome(CatchupOutcome::StoppedShort {
+                    stopped_at_round: *stopped_at_round,
+                    target_round: *target_round,
+                });
             }
             Err(e) => {
                 warn!(catchpoint = %catchpoint, error = %e, "live catchpoint catchup failed");
@@ -813,6 +837,8 @@ impl CatchupRunner for OrchestratorCatchupRunner {
             // than the previous unbounded-retry behavior.
             catchup_block_download_retry_attempts:
                 algo_ledger::catchpoint::DEFAULT_CATCHUP_BLOCK_DOWNLOAD_RETRY_ATTEMPTS,
+            handoff_min_lag_rounds: crate::commands::catchpoint_sync::sync_tuning()
+                .handoff_min_lag_rounds,
         };
 
         let mut attempt: u32 = 0;
@@ -1257,7 +1283,8 @@ mod tests {
     }
 
     /// A replay that stopped short is NOT a completed catchup: the manager
-    /// records it as stopped short, leaves `last_catchpoint` alone, and still
+    /// records it as stopped short (the catchpoint itself is still recorded
+    /// as applied in `last_catchpoint`), and still
     /// resumes normal operation (whose catchup closes the gap).
     #[tokio::test]
     async fn stopped_short_catchup_is_not_reported_as_complete() {
@@ -1267,7 +1294,8 @@ mod tests {
         manager.start_catchup("1000#aaaa").await;
         wait_idle(&manager).await;
 
-        assert_eq!(manager.last_catchpoint(), "");
+        // The catchpoint itself was applied; only the replay stopped short.
+        assert_eq!(manager.last_catchpoint(), "1000#aaaa");
         assert_eq!(manager.last_outcome(), Some(stopped_short()));
         assert_eq!(control.resumes.load(Ordering::SeqCst), 1);
         let text = manager.metrics_text();
@@ -1283,6 +1311,44 @@ mod tests {
             text.contains("algod_rust_catchpoint_catchup_stopped_short_behind_rounds 101"),
             "{text}"
         );
+    }
+
+    /// Every non-empty line of the exposition must start at column 0 with
+    /// `#` or a metric name (strict parsers reject the whole payload
+    /// otherwise), and the full text is pinned.
+    #[tokio::test]
+    async fn metrics_text_is_a_strictly_formatted_exposition() {
+        let manager = LiveCatchupManager::new(
+            ImmediateRunner::outcome(stopped_short()),
+            Arc::new(CountingControl::default()),
+        );
+        manager.start_catchup("1000#aaaa").await;
+        wait_idle(&manager).await;
+        let text = manager.metrics_text();
+        assert!(text.ends_with('\n'));
+        for line in text.lines() {
+            assert!(!line.is_empty(), "blank line in {text:?}");
+            assert!(!line.starts_with(char::is_whitespace), "{line:?}");
+            let first = line.chars().next().unwrap();
+            assert!(
+                first == '#' || first.is_ascii_alphabetic() || first == '_',
+                "{line:?}"
+            );
+        }
+        let expected = [
+            "# HELP algod_rust_catchpoint_catchup_completed_total Live catchpoint catchups whose replay reached its target.",
+            "# TYPE algod_rust_catchpoint_catchup_completed_total counter",
+            "algod_rust_catchpoint_catchup_completed_total 0",
+            "# HELP algod_rust_catchpoint_catchup_stopped_short_total Live catchpoint catchups whose replay stopped short of its target (normal catchup continues).",
+            "# TYPE algod_rust_catchpoint_catchup_stopped_short_total counter",
+            "algod_rust_catchpoint_catchup_stopped_short_total 1",
+            "# HELP algod_rust_catchpoint_catchup_stopped_short_behind_rounds Rounds the most recent successful live catchup stopped short of its target by (0 if it reached it).",
+            "# TYPE algod_rust_catchpoint_catchup_stopped_short_behind_rounds gauge",
+            "algod_rust_catchpoint_catchup_stopped_short_behind_rounds 101",
+        ]
+        .join("\n")
+            + "\n";
+        assert_eq!(text, expected);
     }
 
     #[tokio::test]

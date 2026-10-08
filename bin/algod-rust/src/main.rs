@@ -31,9 +31,15 @@ use clap::Parser;
 use cli::{AlgocfgAction, AlgocfgProfileAction, BenchAction, CatchpointAction, Cli, Commands};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> anyhow::Result<std::process::ExitCode> {
     // Initialize logging: RUST_LOG-driven fmt output plus the hickory DNSSEC error rate limit.
     log_setup::init();
+    // Resolve the env-driven sync knobs once (a bad value is logged once).
+    commands::catchpoint_sync::init_sync_tuning_from_env();
+    // Process exit status; only `catchpoint-sync` sets a non-zero success status
+    // (issue #1725). Returned from `main` (not `process::exit`) so destructors
+    // and log flushing still run.
+    let mut exit_status = std::process::ExitCode::SUCCESS;
 
     let cli = Cli::parse();
 
@@ -191,11 +197,9 @@ async fn main() -> anyhow::Result<()> {
                     node_config.catchup_gossip_block_fetch_timeout_sec,
                 )
                 .await?;
-                if exit_code != 0 {
-                    // Issue #1725: a catchpoint sync whose replay stopped
-                    // short of the tip exits non-zero so scripts can tell.
-                    std::process::exit(exit_code);
-                }
+                // Issue #1725: a catchpoint sync whose replay stopped short of
+                // the tip exits non-zero so scripts can tell.
+                exit_status = std::process::ExitCode::from(exit_code);
             } else {
                 // Genesis-based sync path.
                 commands::sync::run(
@@ -689,7 +693,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    Ok(())
+    Ok(exit_status)
 }
 
 /// Go: `daemon/algod/server.go:172-200`'s FD-pressure connection-limit
