@@ -52,6 +52,7 @@ fn test_config() -> SyncConfig {
         accounts_rebuild_synchronous_mode: 1,
         catchup_block_download_retry_attempts:
             algo_ledger::catchpoint::DEFAULT_CATCHUP_BLOCK_DOWNLOAD_RETRY_ATTEMPTS,
+        handoff_min_lag_rounds: algo_ledger::sync::DEFAULT_HANDOFF_MIN_LAG_ROUNDS,
     }
 }
 
@@ -600,6 +601,7 @@ fn test_sync_config_various_constructions() {
         end_round: None,
         accounts_rebuild_synchronous_mode: 1,
         catchup_block_download_retry_attempts: 500,
+        handoff_min_lag_rounds: algo_ledger::sync::DEFAULT_HANDOFF_MIN_LAG_ROUNDS,
     };
 
     assert!(config.catchpoint_label.is_none());

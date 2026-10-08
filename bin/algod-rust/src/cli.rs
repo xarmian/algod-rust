@@ -239,6 +239,24 @@ pub enum Commands {
 
         /// Auto-discover the latest catchpoint from the network.
         /// Triggers catchpoint sync mode instead of genesis sync.
+        ///
+        /// Catchpoint sync exit status: 0 = caught up to its target; 1 = failed;
+        /// 3 = the catchpoint was applied but block replay stopped short of the
+        /// network tip because the peer could not serve the remaining blocks
+        /// (the summary's "Stopped early" line says where; follow up with a
+        /// normal sync). Note for supervisors: status 3 is NOT success to
+        /// `set -e` scripts and to systemd `Restart=on-failure`, which both
+        /// treat any non-zero status as a failure -- it means "caught up with
+        /// a hand-off", so such a unit should list it in
+        /// `SuccessExitStatus=3` (or the script should handle it explicitly).
+        ///
+        /// Environment tuning (no go-algorand counterpart):
+        /// `ALGOD_RUST_HANDOFF_MIN_LAG_ROUNDS` (default 64) sets how far
+        /// behind the tip a peer must be missing a block for that to count as
+        /// "cannot serve" rather than a retryable error;
+        /// `ALGOD_RUST_FETCH_DRAIN_TIMEOUT_SECS` (default: the worst-case time
+        /// to fetch one round, at least 5) sets how long a failing parallel
+        /// block fetch waits for in-flight rounds to report.
         #[arg(long)]
         catchpoint_auto: bool,
 

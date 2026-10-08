@@ -107,6 +107,55 @@ pub struct CatchpointCounters {
     pub acquired_blocks: u64,
 }
 
+/// How a live catchpoint catchup run ended when it did not fail (issue
+/// #1725).
+///
+/// go-algorand's catchpoint service ends at the catchpoint round and its
+/// normal catchup service closes the gap to the tip; it has no concept of a
+/// replay that "stopped short". algod-rust's orchestrator can end its
+/// post-catchpoint block replay early when the catchup peer cannot serve the
+/// remaining rounds (issue #1719), so a successful run is one of these two
+/// states, kept apart in logs, metrics and [`LiveCatchupManager`]'s own
+/// bookkeeping. `GET /v2/status` is deliberately unchanged: go has no
+/// counterpart field, and the node's normal catchup continues either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatchupOutcome {
+    /// The catchpoint was applied and block replay reached its target.
+    Complete,
+    /// The catchpoint was applied and the ledger is consistent at
+    /// `stopped_at_round`, but the peer could not serve the rest; normal
+    /// catchup continues from there.
+    StoppedShort {
+        /// Last round applied to the ledger.
+        stopped_at_round: u64,
+        /// Round replay was trying to reach.
+        target_round: u64,
+    },
+}
+
+impl CatchupOutcome {
+    /// Derive the outcome of a finished orchestrator run.
+    pub fn from_sync_result(result: &algo_ledger::sync::SyncResult) -> Self {
+        match &result.stopped_early {
+            Some(stop) => Self::StoppedShort {
+                stopped_at_round: stop.stopped_at_round,
+                target_round: stop.target_round,
+            },
+            None => Self::Complete,
+        }
+    }
+}
+
+/// Finished-run bookkeeping behind [`LiveCatchupManager::metrics_text`] and
+/// [`LiveCatchupManager::last_outcome`], kept in one struct under one lock so
+/// the two can never be observed out of step.
+#[derive(Debug, Clone, Default)]
+struct CatchupStats {
+    completed: u64,
+    stopped_short: u64,
+    last_outcome: Option<CatchupOutcome>,
+}
+
 /// Controls the node's "normal sync loop" so it can be quiesced while a
 /// live catchpoint catchup owns the ledger, then resumed afterward.
 ///
@@ -200,7 +249,7 @@ pub trait CatchupRunner: Send + Sync {
         catchpoint: &str,
         cancel: CancellationToken,
         counters: Arc<StdMutex<CatchpointCounters>>,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<CatchupOutcome>;
 }
 
 /// State for the currently-running catchup, if any.
@@ -224,6 +273,9 @@ pub struct LiveCatchupManager {
     /// The most recently *completed* catchpoint label, surfaced by
     /// `GET /v2/status`'s `last-catchpoint` field once catchup finishes.
     last_catchpoint: StdMutex<String>,
+    /// Successful-run counters and how the most recent one ended (issue
+    /// #1725), under one lock; exported by [`Self::metrics_text`].
+    stats: StdMutex<CatchupStats>,
     /// Live granular progress counters for the in-flight (or most recently
     /// finished) catchup — see [`Self::catchpoint_counters`] (issue #941).
     counters: Arc<StdMutex<CatchpointCounters>>,
@@ -246,6 +298,7 @@ impl LiveCatchupManager {
             control,
             running: AsyncMutex::new(None),
             last_catchpoint: StdMutex::new(String::new()),
+            stats: StdMutex::new(CatchupStats::default()),
             counters: Arc::new(StdMutex::new(CatchpointCounters::default())),
             sync_round_reset: StdMutex::new(None),
         })
@@ -359,9 +412,11 @@ impl LiveCatchupManager {
         self.counters.lock().map(|g| *g).unwrap_or_default()
     }
 
-    /// The most recently *completed* catchpoint label (empty if none has
-    /// completed yet), tracked purely as this manager's own internal
-    /// bookkeeping.
+    /// The most recently *applied* catchpoint label (empty if none has
+    /// been applied yet), tracked purely as this manager's own internal
+    /// bookkeeping. Set for a [`CatchupOutcome::StoppedShort`] run too: the
+    /// catchpoint itself was applied there and only the follow-on replay
+    /// stopped short (issue #1725; see [`Self::last_outcome`]).
     ///
     /// No longer backs `GET /v2/status`'s `last-catchpoint` field (issue
     /// #827 theme 4): go's own `LastCatchpoint` (`node/node.go`) is
@@ -381,6 +436,86 @@ impl LiveCatchupManager {
             .unwrap_or_default()
     }
 
+    /// How the most recent successful run ended, or `None` if none has
+    /// (issue #1725). Internal bookkeeping only: `GET /v2/status` is
+    /// unchanged because go-algorand has no counterpart (its catchpoint
+    /// service ends at the catchpoint round).
+    #[cfg(test)]
+    pub fn last_outcome(&self) -> Option<CatchupOutcome> {
+        self.stats.lock().ok().and_then(|g| g.last_outcome.clone())
+    }
+
+    /// Prometheus text for finished live catchups (issue #1725); empty until
+    /// one has finished, so a node that never ran a live catchup adds nothing
+    /// to `/metrics`.
+    pub fn metrics_text(&self) -> String {
+        // One lock for the counters AND the last outcome: a scrape never sees
+        // a counter bumped without its outcome (or vice versa).
+        let CatchupStats {
+            completed,
+            stopped_short,
+            last_outcome,
+        } = self.stats.lock().map(|g| g.clone()).unwrap_or_default();
+        if completed + stopped_short == 0 {
+            return String::new();
+        }
+        // Rounds the last successful run's replay fell short of its target
+        // by; 0 when it reached the target.
+        let behind = match last_outcome {
+            Some(CatchupOutcome::StoppedShort {
+                stopped_at_round,
+                target_round,
+            }) => target_round.saturating_sub(stopped_at_round),
+            _ => 0,
+        };
+        let mut out = String::new();
+        for (name, kind, help, value) in [
+            (
+                "algod_rust_catchpoint_catchup_completed_total",
+                "counter",
+                "Live catchpoint catchups whose replay reached its target.",
+                completed,
+            ),
+            (
+                "algod_rust_catchpoint_catchup_stopped_short_total",
+                "counter",
+                "Live catchpoint catchups whose replay stopped short of its target (normal catchup continues).",
+                stopped_short,
+            ),
+            (
+                "algod_rust_catchpoint_catchup_stopped_short_behind_rounds",
+                "gauge",
+                "Rounds the most recent successful live catchup stopped short of its target by (0 if it reached it).",
+                behind,
+            ),
+        ] {
+            out.push_str(&format!(
+                "# HELP {name} {help}
+# TYPE {name} {kind}
+{name} {value}
+"
+            ));
+        }
+        out
+    }
+
+    fn set_last_catchpoint(&self, catchpoint: &str) {
+        if let Ok(mut last) = self.last_catchpoint.lock() {
+            *last = catchpoint.to_string();
+        }
+    }
+
+    /// Count a successful run and remember how it ended, atomically.
+    fn record_outcome(&self, outcome: CatchupOutcome) {
+        if let Ok(mut stats) = self.stats.lock() {
+            match outcome {
+                CatchupOutcome::Complete => stats.completed += 1,
+                CatchupOutcome::StoppedShort { .. } => stats.stopped_short += 1,
+            }
+            stats.last_outcome = Some(outcome);
+        }
+    }
+
     /// Runs the catchup to completion/cancellation/error, then clears the
     /// running state and resumes normal operation — mirroring go's
     /// `processStageSwitch`/`abort` both calling
@@ -392,11 +527,32 @@ impl LiveCatchupManager {
             .run(&catchpoint, cancel, Arc::clone(&self.counters))
             .await;
         match &result {
-            Ok(()) => {
+            Ok(CatchupOutcome::Complete) => {
                 info!(catchpoint = %catchpoint, "live catchpoint catchup completed");
-                if let Ok(mut last) = self.last_catchpoint.lock() {
-                    *last = catchpoint.clone();
-                }
+                self.set_last_catchpoint(&catchpoint);
+                self.record_outcome(CatchupOutcome::Complete);
+            }
+            // Issue #1725: the catchpoint itself WAS applied (so
+            // `last_catchpoint` is set as before) but block replay stopped
+            // short of the tip. Log and count that apart from a completed
+            // catchup; the node's normal catchup, resumed below, closes the
+            // gap.
+            Ok(CatchupOutcome::StoppedShort {
+                stopped_at_round,
+                target_round,
+            }) => {
+                warn!(
+                    catchpoint = %catchpoint,
+                    stopped_at_round,
+                    target_round,
+                    "live catchpoint catchup stopped short at round {stopped_at_round} \
+                     (target {target_round}); normal catchup continues"
+                );
+                self.set_last_catchpoint(&catchpoint);
+                self.record_outcome(CatchupOutcome::StoppedShort {
+                    stopped_at_round: *stopped_at_round,
+                    target_round: *target_round,
+                });
             }
             Err(e) => {
                 warn!(catchpoint = %catchpoint, error = %e, "live catchpoint catchup failed");
@@ -609,13 +765,14 @@ impl algo_ledger::sync::SyncBackend for SharedSyncBackend {
         self.0.discover_catchpoint()
     }
 
-    fn fetch_blocks_batch(
+    fn fetch_block_range(
         &self,
         start: u64,
         end: u64,
         concurrency: usize,
-    ) -> anyhow::Result<Vec<(u64, algo_types::Block)>, algo_error::AlgoError> {
-        self.0.fetch_blocks_batch(start, end, concurrency)
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> algo_ledger::sync::BatchFetch {
+        self.0.fetch_block_range(start, end, concurrency, cancel)
     }
 }
 
@@ -632,7 +789,7 @@ impl CatchupRunner for OrchestratorCatchupRunner {
         catchpoint: &str,
         cancel: CancellationToken,
         counters: Arc<StdMutex<CatchpointCounters>>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<CatchupOutcome> {
         use algo_ledger::sync::{SyncConfig, SyncOrchestrator};
 
         let backend: Arc<dyn algo_ledger::sync::SyncBackend> =
@@ -683,6 +840,8 @@ impl CatchupRunner for OrchestratorCatchupRunner {
             // than the previous unbounded-retry behavior.
             catchup_block_download_retry_attempts:
                 algo_ledger::catchpoint::DEFAULT_CATCHUP_BLOCK_DOWNLOAD_RETRY_ATTEMPTS,
+            handoff_min_lag_rounds: crate::commands::catchpoint_sync::sync_tuning()
+                .handoff_min_lag_rounds,
         };
 
         let mut attempt: u32 = 0;
@@ -718,17 +877,11 @@ impl CatchupRunner for OrchestratorCatchupRunner {
                     // Issue #1719: `Ok` means the catchpoint cutover is done
                     // and the ledger is consistent -- not that it reached the
                     // tip. If the peer could not serve the rest, say so
-                    // explicitly: the node's normal catchup continues from
-                    // `stopped_at_round`.
-                    if let Some(msg) = stopped_early_message(&result) {
-                        warn!(
-                            catchpoint,
-                            stopped_at = result.stopped_early.as_ref().map(|s| s.stopped_at_round),
-                            target = result.stopped_early.as_ref().map(|s| s.target_round),
-                            "live catchpoint catchup handed off: {msg}; normal catchup continues"
-                        );
-                    }
-                    return Ok(());
+                    // explicitly (issue #1725): the node's normal catchup
+                    // continues from `stopped_at_round`, and the manager
+                    // records this as a stopped-short outcome, not a
+                    // completed catchup.
+                    return Ok(CatchupOutcome::from_sync_result(&result));
                 }
                 Err(e) => {
                     // `SyncOrchestrator::run` always transitions to
@@ -764,12 +917,6 @@ impl CatchupRunner for OrchestratorCatchupRunner {
     }
 }
 
-/// Status text for a catchup whose replay stopped short of the tip
-/// (issue #1719); `None` when it reached its target.
-fn stopped_early_message(result: &algo_ledger::sync::SyncResult) -> Option<String> {
-    result.stopped_early.as_ref().map(ToString::to_string)
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -779,25 +926,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
-
-    #[test]
-    fn stopped_early_message_reports_the_hand_off_only_when_replay_stopped() {
-        use algo_ledger::sync::{ReplayStoppedEarly, SyncResult};
-        let mut result = SyncResult {
-            final_round: 100,
-            accounts_imported: 0,
-            blocks_replayed: 0,
-            duration: Duration::ZERO,
-            stopped_early: None,
-        };
-        assert_eq!(stopped_early_message(&result), None);
-        result.stopped_early = Some(ReplayStoppedEarly {
-            stopped_at_round: 100,
-            target_round: 900,
-        });
-        let msg = stopped_early_message(&result).unwrap();
-        assert!(msg.contains("stopped at round 100: peer cannot serve blocks beyond"));
-    }
 
     // -----------------------------------------------------------------------
     // is_verify_failure_message
@@ -873,13 +1001,16 @@ mod tests {
     /// configurable result, recording the catchpoint label and whether it
     /// observed cancellation.
     struct ImmediateRunner {
-        result: StdMutex<Option<Result<(), String>>>,
+        result: StdMutex<Option<Result<CatchupOutcome, String>>>,
     }
 
     impl ImmediateRunner {
         fn ok() -> Arc<Self> {
+            Self::outcome(CatchupOutcome::Complete)
+        }
+        fn outcome(outcome: CatchupOutcome) -> Arc<Self> {
             Arc::new(Self {
-                result: StdMutex::new(Some(Ok(()))),
+                result: StdMutex::new(Some(Ok(outcome))),
             })
         }
         fn err(msg: &str) -> Arc<Self> {
@@ -896,9 +1027,10 @@ mod tests {
             _catchpoint: &str,
             _cancel: CancellationToken,
             _counters: Arc<StdMutex<CatchpointCounters>>,
-        ) -> anyhow::Result<()> {
+        ) -> anyhow::Result<CatchupOutcome> {
             match self.result.lock().unwrap().take() {
-                Some(Ok(())) | None => Ok(()),
+                Some(Ok(outcome)) => Ok(outcome),
+                None => Ok(CatchupOutcome::Complete),
                 Some(Err(e)) => Err(anyhow::anyhow!(e)),
             }
         }
@@ -917,7 +1049,7 @@ mod tests {
             _catchpoint: &str,
             cancel: CancellationToken,
             _counters: Arc<StdMutex<CatchpointCounters>>,
-        ) -> anyhow::Result<()> {
+        ) -> anyhow::Result<CatchupOutcome> {
             cancel.cancelled().await;
             self.cancel_observed
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1150,6 +1282,144 @@ mod tests {
         assert_eq!(control.resumes.load(Ordering::SeqCst), 1);
         // An aborted run is not a "completed" catchup.
         assert_eq!(manager.last_catchpoint(), "");
+    }
+
+    // -- stopped-short vs complete (issue #1725) -----------------------------
+
+    fn stopped_short() -> CatchupOutcome {
+        CatchupOutcome::StoppedShort {
+            stopped_at_round: 1320,
+            target_round: 1421,
+        }
+    }
+
+    /// A replay that stopped short is NOT a completed catchup: the manager
+    /// records it as stopped short (the catchpoint itself is still recorded
+    /// as applied in `last_catchpoint`), and still
+    /// resumes normal operation (whose catchup closes the gap).
+    #[tokio::test]
+    async fn stopped_short_catchup_is_not_reported_as_complete() {
+        let control = Arc::new(CountingControl::default());
+        let manager =
+            LiveCatchupManager::new(ImmediateRunner::outcome(stopped_short()), control.clone());
+        manager.start_catchup("1000#aaaa").await;
+        wait_idle(&manager).await;
+
+        // The catchpoint itself was applied; only the replay stopped short.
+        assert_eq!(manager.last_catchpoint(), "1000#aaaa");
+        assert_eq!(manager.last_outcome(), Some(stopped_short()));
+        assert_eq!(control.resumes.load(Ordering::SeqCst), 1);
+        let text = manager.metrics_text();
+        assert!(
+            text.contains("algod_rust_catchpoint_catchup_stopped_short_total 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("algod_rust_catchpoint_catchup_completed_total 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("algod_rust_catchpoint_catchup_stopped_short_behind_rounds 101"),
+            "{text}"
+        );
+    }
+
+    /// Every non-empty line of the exposition must start at column 0 with
+    /// `#` or a metric name (strict parsers reject the whole payload
+    /// otherwise), and the full text is pinned.
+    #[tokio::test]
+    async fn metrics_text_is_a_strictly_formatted_exposition() {
+        let manager = LiveCatchupManager::new(
+            ImmediateRunner::outcome(stopped_short()),
+            Arc::new(CountingControl::default()),
+        );
+        manager.start_catchup("1000#aaaa").await;
+        wait_idle(&manager).await;
+        let text = manager.metrics_text();
+        assert!(text.ends_with('\n'));
+        for line in text.lines() {
+            assert!(!line.is_empty(), "blank line in {text:?}");
+            assert!(!line.starts_with(char::is_whitespace), "{line:?}");
+            let first = line.chars().next().unwrap();
+            assert!(
+                first == '#' || first.is_ascii_alphabetic() || first == '_',
+                "{line:?}"
+            );
+        }
+        let expected = [
+            "# HELP algod_rust_catchpoint_catchup_completed_total Live catchpoint catchups whose replay reached its target.",
+            "# TYPE algod_rust_catchpoint_catchup_completed_total counter",
+            "algod_rust_catchpoint_catchup_completed_total 0",
+            "# HELP algod_rust_catchpoint_catchup_stopped_short_total Live catchpoint catchups whose replay stopped short of its target (normal catchup continues).",
+            "# TYPE algod_rust_catchpoint_catchup_stopped_short_total counter",
+            "algod_rust_catchpoint_catchup_stopped_short_total 1",
+            "# HELP algod_rust_catchpoint_catchup_stopped_short_behind_rounds Rounds the most recent successful live catchup stopped short of its target by (0 if it reached it).",
+            "# TYPE algod_rust_catchpoint_catchup_stopped_short_behind_rounds gauge",
+            "algod_rust_catchpoint_catchup_stopped_short_behind_rounds 101",
+        ]
+        .join("\n")
+            + "\n";
+        assert_eq!(text, expected);
+    }
+
+    #[tokio::test]
+    async fn complete_catchup_is_recorded_as_complete() {
+        let manager =
+            LiveCatchupManager::new(ImmediateRunner::ok(), Arc::new(CountingControl::default()));
+        manager.start_catchup("1000#aaaa").await;
+        wait_idle(&manager).await;
+
+        assert_eq!(manager.last_catchpoint(), "1000#aaaa");
+        assert_eq!(manager.last_outcome(), Some(CatchupOutcome::Complete));
+        let text = manager.metrics_text();
+        assert!(
+            text.contains("algod_rust_catchpoint_catchup_completed_total 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("algod_rust_catchpoint_catchup_stopped_short_total 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("algod_rust_catchpoint_catchup_stopped_short_behind_rounds 0"),
+            "{text}"
+        );
+    }
+
+    /// Failed and aborted runs are neither; nothing finished -> no metrics.
+    #[tokio::test]
+    async fn failed_catchup_records_no_outcome_and_no_metrics() {
+        let manager = LiveCatchupManager::new(
+            ImmediateRunner::err("boom"),
+            Arc::new(CountingControl::default()),
+        );
+        assert_eq!(manager.metrics_text(), "");
+        manager.start_catchup("1000#aaaa").await;
+        wait_idle(&manager).await;
+        assert_eq!(manager.last_outcome(), None);
+        assert_eq!(manager.last_catchpoint(), "");
+        assert_eq!(manager.metrics_text(), "");
+    }
+
+    #[test]
+    fn outcome_is_derived_from_the_orchestrator_result() {
+        use algo_ledger::sync::{ReplayStoppedEarly, SyncResult};
+        let mut result = SyncResult {
+            final_round: 1421,
+            accounts_imported: 0,
+            blocks_replayed: 101,
+            duration: Duration::ZERO,
+            stopped_early: None,
+        };
+        assert_eq!(
+            CatchupOutcome::from_sync_result(&result),
+            CatchupOutcome::Complete
+        );
+        result.stopped_early = Some(ReplayStoppedEarly {
+            stopped_at_round: 1320,
+            target_round: 1421,
+        });
+        assert_eq!(CatchupOutcome::from_sync_result(&result), stopped_short());
     }
 
     // -- current_catchpoint / last_catchpoint --------------------------------
