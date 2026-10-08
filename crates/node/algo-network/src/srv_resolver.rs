@@ -1508,4 +1508,130 @@ mod tests {
 
         assert_eq!(addrs, vec!["archival1.algorand.network:4160"]);
     }
+
+    // Issue #1702 root-cause evidence: in-process stub DNS server (no DNSSEC
+    // data, like systemd-resolved) -- a validating lookup issues a sequential
+    // DNSKEY/DS/... sub-query walk per additional-section glue name, so its
+    // wall time is (queries x RTT), while the non-validating lookup is 1 query.
+    mod fake_dns {
+        use hickory_resolver::proto::op::{Message, MessageType, ResponseCode};
+        use hickory_resolver::proto::rr::rdata::{A, SRV};
+        use hickory_resolver::proto::rr::{Name, RData, Record, RecordType};
+        use std::net::{Ipv4Addr, SocketAddr};
+        use std::str::FromStr;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        pub struct Fake {
+            pub addr: SocketAddr,
+            pub queries: Arc<AtomicUsize>,
+        }
+
+        pub async fn spawn(n_targets: usize, mode: u8, latency_ms: u64) -> Fake {
+            let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = sock.local_addr().unwrap();
+            let queries = Arc::new(AtomicUsize::new(0));
+            let q2 = queries.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    let (n, peer) = match sock.recv_from(&mut buf).await {
+                        Ok(x) => x,
+                        Err(_) => return,
+                    };
+                    let Ok(req) = Message::from_vec(&buf[..n]) else {
+                        continue;
+                    };
+                    q2.fetch_add(1, Ordering::SeqCst);
+                    let mut resp = Message::new();
+                    resp.set_id(req.id());
+                    resp.set_message_type(MessageType::Response);
+                    resp.set_op_code(req.op_code());
+                    resp.set_recursion_desired(true);
+                    resp.set_recursion_available(true);
+                    resp.set_response_code(ResponseCode::NoError);
+                    if let Some(q) = req.queries().first() {
+                        resp.add_query(q.clone());
+                        if q.query_type() != RecordType::SRV && mode == 1 {
+                            resp.set_response_code(ResponseCode::ServFail);
+                        } else if q.query_type() != RecordType::SRV && mode == 2 {
+                            resp.set_response_code(ResponseCode::NXDomain);
+                        } else if q.query_type() != RecordType::SRV && mode == 3 {
+                            resp.set_response_code(ResponseCode::Refused);
+                        } else if q.query_type() == RecordType::SRV || mode == 4 {
+                            for i in 0..n_targets {
+                                let t = Name::from_str(&format!("r{i}.example.test.")).unwrap();
+                                resp.add_answer(Record::from_rdata(
+                                    q.name().clone(),
+                                    300,
+                                    RData::SRV(SRV::new(1, 1, 4160, t.clone())),
+                                ));
+                                resp.add_additional(Record::from_rdata(
+                                    t,
+                                    300,
+                                    RData::A(A(Ipv4Addr::new(10, 0, 0, 1))),
+                                ));
+                            }
+                        }
+                    }
+                    if let Some(edns) = req.extensions().clone() {
+                        resp.set_edns(edns);
+                    }
+                    let bytes = resp.to_vec().unwrap();
+                    if latency_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(latency_ms)).await;
+                    }
+                    let _ = sock.send_to(&bytes, peer).await;
+                }
+            });
+            Fake { addr, queries }
+        }
+    }
+
+    /// Deterministic (query-count, not wall-clock) pin of the #1702 root
+    /// cause: validation cost scales with the additional section.
+    #[tokio::test]
+    async fn validated_lookup_queries_scale_with_additional_section() {
+        const TARGETS: usize = 10;
+        let mut counts = Vec::new();
+        for validate in [false, true] {
+            let fake = fake_dns::spawn(TARGETS, 0, 0).await;
+            let group =
+                NameServerConfigGroup::from_ips_clear(&[fake.addr.ip()], fake.addr.port(), true);
+            let cfg = ResolverConfig::from_parts(None, vec![], group);
+            let r = HickorySrvResolver::build_resolver(cfg, validate);
+            let res = HickorySrvResolver::do_lookup_bounded(&r, "_algobootstrap._tcp.example.test")
+                .await
+                .expect("stub lookup");
+            assert_eq!(res.len(), TARGETS);
+            counts.push(fake.queries.load(std::sync::atomic::Ordering::SeqCst));
+        }
+        assert_eq!(counts[0], 1, "non-validating lookup is a single query");
+        assert!(
+            counts[1] >= 3 * TARGETS,
+            "validating lookup issued {} queries for {TARGETS} glue names",
+            counts[1]
+        );
+    }
+
+    /// Wall-clock evidence for the PR (run with `--ignored --nocapture`).
+    #[tokio::test]
+    #[ignore]
+    async fn evidence_validated_lookup_latency() {
+        for validate in [false, true] {
+            let fake = fake_dns::spawn(20, 0, 10).await;
+            let group =
+                NameServerConfigGroup::from_ips_clear(&[fake.addr.ip()], fake.addr.port(), true);
+            let cfg = ResolverConfig::from_parts(None, vec![], group);
+            let r = HickorySrvResolver::build_resolver(cfg, validate);
+            let t = std::time::Instant::now();
+            let _ =
+                HickorySrvResolver::do_lookup_bounded(&r, "_algobootstrap._tcp.example.test").await;
+            eprintln!(
+                "validate={validate} elapsed={:?} queries={}",
+                t.elapsed(),
+                fake.queries.load(std::sync::atomic::Ordering::SeqCst)
+            );
+        }
+    }
 }
