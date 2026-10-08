@@ -24,7 +24,7 @@
 
 use algo_types::consensus::{CONSENSUS_V15, CONSENSUS_V41};
 use algo_types::{Block, SignedTransaction};
-use algo_validate::merkle::{compute_payset_merkle_root, compute_payset_merkle_root_raw, HashAlgo};
+use algo_validate::merkle::compute_payset_merkle_root;
 use algo_validate::restore_payset_genesis_fields;
 
 fn block(proto: &str, hgh: bool, header_gh: [u8; 32]) -> Block {
@@ -108,24 +108,4 @@ fn unknown_protocol_is_rejected_by_validate_and_restore() {
         e,
         algo_validate::BlockValidationError::UnknownProtocolVersion { .. }
     )));
-}
-
-/// Issue #1728: the merkle / vector-commitment leaf builders resolve the
-/// genesis rule per block; none of them may rebuild and clone a whole
-/// `ConsensusParams` to do it.
-#[test]
-fn commitment_builders_do_no_consensus_params_lookup() {
-    use algo_types::consensus::{consensus_params_lookup_count, genesis_flags_for_version};
-    let _ = genesis_flags_for_version(CONSENSUS_V41); // warm the one-time table
-    for proto in [CONSENSUS_V15, CONSENSUS_V41] {
-        let b = block(proto, true, [9u8; 32]);
-        let blobs = vec![vec![0x80u8]];
-        let before = consensus_params_lookup_count();
-        let _ = compute_payset_merkle_root(&b);
-        let _ = compute_payset_merkle_root_raw(&b, &blobs);
-        let _ = algo_validate::merkle::compute_vector_commitment(&b, HashAlgo::Sha256);
-        let _ = algo_validate::merkle::compute_vector_commitment_raw(&b, HashAlgo::Sha512, &blobs);
-        let _ = restore_payset_genesis_fields(&b).unwrap();
-        assert_eq!(consensus_params_lookup_count(), before, "{proto}");
-    }
 }

@@ -134,9 +134,17 @@ pub struct InBlockOnlyFieldError {
     pub field: &'static str,
 }
 
+impl InBlockOnlyFieldError {
+    /// The go msgp cause text, `Unknown field: <name>`; the one place that
+    /// wording lives (callers add their own position context).
+    pub fn cause(&self) -> String {
+        format!("Unknown field: {}", self.field)
+    }
+}
+
 impl std::fmt::Display for InBlockOnlyFieldError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "txn {}: Unknown field: {}", self.index, self.field)
+        write!(f, "txn {}: {}", self.index, self.cause())
     }
 }
 
@@ -804,10 +812,10 @@ mod tests {
     /// consensus parameter table (`consensus_params_for_version`) per block.
     #[test]
     fn rule_construction_and_restore_do_no_params_lookup() {
-        use crate::consensus::{consensus_params_lookup_count, genesis_flags_for_version};
-        // Warm the one-time built-in flag cache.
+        use crate::consensus::{consensus_params_clone_count, genesis_flags_for_version};
+        // Warm the one-time built-in table (its build clones).
         let _ = genesis_flags_for_version(CONSENSUS_V41);
-        let before = consensus_params_lookup_count();
+        let before = consensus_params_clone_count();
         for proto in [CONSENSUS_V10, CONSENSUS_V15, CONSENSUS_V41] {
             let b = block(proto, true, true);
             let rule = GenesisRestoreRule::for_block(&b);
@@ -816,7 +824,7 @@ mod tests {
             let _ = restore_payset_genesis_fields(&b).unwrap();
         }
         assert_eq!(
-            consensus_params_lookup_count(),
+            consensus_params_clone_count(),
             before,
             "no ConsensusParams rebuild/clone in the restore paths"
         );

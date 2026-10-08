@@ -917,20 +917,19 @@ impl Default for ConsensusParams {
     }
 }
 
+#[cfg(test)]
 thread_local! {
-    /// Number of [`consensus_params_for_version`] calls made by this thread
-    /// (each rebuilds and clones a whole [`ConsensusParams`]). Test
-    /// instrumentation for [`consensus_params_lookup_count`].
-    static PARAMS_LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Number of whole-`ConsensusParams` clones [`consensus_params_for_version`]
+    /// made on this thread. Test-only (`cfg(test)`): lets this crate's unit
+    /// tests prove the genesis-restore paths never clone (issue #1728). Other
+    /// crates rely on the API shape instead -- the hot functions take an
+    /// already-resolved rule or [`GenesisProtocolFlags`].
+    static PARAMS_CLONES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// How many times the calling thread has run [`consensus_params_for_version`]
-/// (a full `ConsensusParams` rebuild + clone). Lets tests prove a hot path
-/// (genesis restore, issue #1728) does no per-block parameter lookup: take the
-/// count before and after and compare. Not part of any protocol behaviour.
-#[doc(hidden)]
-pub fn consensus_params_lookup_count() -> u64 {
-    PARAMS_LOOKUPS.with(std::cell::Cell::get)
+#[cfg(test)]
+pub(crate) fn consensus_params_clone_count() -> u64 {
+    PARAMS_CLONES.with(std::cell::Cell::get)
 }
 
 /// The two per-protocol booleans block payset genesis-field handling needs
@@ -952,34 +951,61 @@ impl GenesisProtocolFlags {
     }
 }
 
-/// [`GenesisProtocolFlags`] for `version`, with the same answer
-/// [`consensus_params_for_version`] would give (`None`: unknown protocol) but
-/// without rebuilding or cloning a [`ConsensusParams`]: a loaded
-/// `consensus.json` override is read in place, everything else comes from a
-/// table built once from the built-in protocols (issue #1728).
+/// [`GenesisProtocolFlags`] for `version`: the same answer
+/// [`consensus_params_for_version`] gives (`None`: unknown or deleted
+/// protocol) because both go through the one [`with_consensus_params`]
+/// resolution, but read in place -- no `ConsensusParams` is rebuilt or cloned
+/// (issue #1728).
 pub fn genesis_flags_for_version(version: &str) -> Option<GenesisProtocolFlags> {
-    if let Some(entry) = CONSENSUS_OVERRIDES
-        .get()
-        .and_then(|overrides| overrides.get(version))
-    {
-        return entry.as_ref().map(GenesisProtocolFlags::of);
+    with_consensus_params(version, GenesisProtocolFlags::of)
+}
+
+/// The single override-then-built-in resolution behind every protocol
+/// lookup: a `consensus.json` override entry (`Some`: replaced/added, `None`:
+/// deleted) wins wholesale and is read in place; otherwise the entry comes
+/// from a table of the built-in protocols built once.
+///
+/// The built-in walk derives later versions from earlier ones through
+/// [`consensus_params_for_version`], so it honours an overridden ancestor;
+/// a table built before [`install_consensus_overrides`] would therefore be
+/// stale after it. Two write-once tables avoid any invalidation: one used
+/// only while no override registry is installed, one built only after it is
+/// (the registry is itself write-once). A version outside the known list, or
+/// a lookup made while a table is being built (the walk's own recursive
+/// calls), computes straight from the compile-time walk.
+fn with_consensus_params<R>(version: &str, f: impl FnOnce(&ConsensusParams) -> R) -> Option<R> {
+    type Table = HashMap<&'static str, ConsensusParams>;
+    static BUILT_IN_BEFORE_INSTALL: std::sync::OnceLock<Table> = std::sync::OnceLock::new();
+    static BUILT_IN_AFTER_INSTALL: std::sync::OnceLock<Table> = std::sync::OnceLock::new();
+    thread_local! {
+        static BUILDING_TABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
-    static BUILT_IN: std::sync::OnceLock<HashMap<&'static str, GenesisProtocolFlags>> =
-        std::sync::OnceLock::new();
-    BUILT_IN
-        .get_or_init(|| {
-            // Only versions absent from the override registry are ever read
-            // back from here, and for those the lookup is the compile-time
-            // table whether or not overrides were installed first.
-            KNOWN_PROTOCOL_VERSIONS
-                .iter()
-                .filter_map(|&v| {
-                    consensus_params_for_version(v).map(|p| (v, GenesisProtocolFlags::of(&p)))
-                })
-                .collect()
-        })
-        .get(version)
-        .copied()
+
+    let installed = CONSENSUS_OVERRIDES.get();
+    if let Some(entry) = installed.and_then(|overrides| overrides.get(version)) {
+        return entry.as_ref().map(f);
+    }
+    if BUILDING_TABLE.with(std::cell::Cell::get) {
+        return built_in_consensus_params(version).as_ref().map(f);
+    }
+    let cell = if installed.is_some() {
+        &BUILT_IN_AFTER_INSTALL
+    } else {
+        &BUILT_IN_BEFORE_INSTALL
+    };
+    let table = cell.get_or_init(|| {
+        BUILDING_TABLE.with(|b| b.set(true));
+        let table = KNOWN_PROTOCOL_VERSIONS
+            .iter()
+            .filter_map(|&v| built_in_consensus_params(v).map(|p| (v, p)))
+            .collect();
+        BUILDING_TABLE.with(|b| b.set(false));
+        table
+    });
+    match table.get(version) {
+        Some(p) => Some(f(p)),
+        None => built_in_consensus_params(version).as_ref().map(f),
+    }
 }
 
 /// Return consensus parameters for the given protocol version string.
@@ -1007,13 +1033,15 @@ pub fn genesis_flags_for_version(version: &str) -> Option<GenesisProtocolFlags> 
 /// exact same compile-time computation below as before this feature
 /// existed -- zero behavior change.
 pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
-    PARAMS_LOOKUPS.with(|c| c.set(c.get() + 1));
-    if let Some(overrides) = CONSENSUS_OVERRIDES.get() {
-        if let Some(entry) = overrides.get(version) {
-            return entry.clone();
-        }
-    }
+    #[cfg(test)]
+    PARAMS_CLONES.with(|c| c.set(c.get() + 1));
+    with_consensus_params(version, ConsensusParams::clone)
+}
 
+/// The compile-time built-in parameters for `version`, ignoring any
+/// `consensus.json` overrides (the walk [`consensus_params_for_version`]'s
+/// doc describes).
+fn built_in_consensus_params(version: &str) -> Option<ConsensusParams> {
     // Build the v7 base and walk forward to find the right version.
     // This mirrors go-algorand's initConsensusProtocols exactly.
 

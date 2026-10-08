@@ -5434,14 +5434,22 @@ async fn get_transaction_proof_on_v15_block_is_not_found_not_an_error() {
 /// `consensus protocol %s not found` decode failure -- a 500, not a silent
 /// hash-requiring guess.
 #[tokio::test]
-async fn block_txids_and_logs_on_unknown_protocol_are_errors() {
-    let (stripped, _) = legacy_stripped_txn(TxnType::Pay);
+async fn block_txids_logs_and_proof_on_unknown_protocol_are_errors() {
+    let (stripped, full) = legacy_stripped_txn(TxnType::Pay);
+    let proof_path = format!(
+        "/v2/blocks/1/transactions/{}/proof",
+        algo_codec::compute_txn_id(&full)
+    );
     let mut block = make_test_block(1, vec![stripped]);
     block.current_protocol = "no-such-protocol".to_string();
     let mut node = MockNode::synced();
     node.blocks.insert(1, block);
     let server = TestServer::start(node).await;
-    for path in ["/v2/blocks/1/txids", "/v2/blocks/1/logs"] {
+    for path in [
+        "/v2/blocks/1/txids",
+        "/v2/blocks/1/logs",
+        proof_path.as_str(),
+    ] {
         let resp = server
             .client
             .get(server.url(path))

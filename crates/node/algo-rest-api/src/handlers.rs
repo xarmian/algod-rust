@@ -1582,8 +1582,9 @@ fn in_block_flag_bad_request(
     match group {
         None => error::bad_request(format!("could not decode transaction: {e}")),
         Some(g) => error::bad_request(format!(
-            "could not decode transaction {} in group {g}: Unknown field: {}",
-            e.index, e.field
+            "could not decode transaction {} in group {g}: {}",
+            e.index,
+            e.cause()
         )),
     }
 }
@@ -1602,7 +1603,13 @@ fn genesis_rule(
     block: &algo_types::Block,
 ) -> Result<algo_types::genesis_restore::GenesisRestoreRule<'_>, Response> {
     algo_types::genesis_restore::GenesisRestoreRule::try_for_block(block)
-        .map_err(|e| error::internal_error(e.to_string()))
+        .map_err(|e| unknown_protocol_response(&e))
+}
+
+/// The 500 every block endpoint answers for a block whose protocol is not in
+/// the consensus table: go's `consensus protocol %s not found` text.
+fn unknown_protocol_response(e: &algo_types::genesis_restore::UnknownProtocolError) -> Response {
+    error::internal_error(e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1772,7 +1779,9 @@ pub async fn get_transaction_proof<N: NodeInterface>(
     let proto = match algo_types::consensus_params_for_version(&block.current_protocol) {
         Some(p) => p,
         None => {
-            return error::internal_error("could not find consensus params for block protocol");
+            return unknown_protocol_response(&algo_types::genesis_restore::UnknownProtocolError {
+                protocol: block.current_protocol.clone(),
+            });
         }
     };
 

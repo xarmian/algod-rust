@@ -707,10 +707,13 @@ impl Demux {
                     match algo_validate::restore_payset_genesis_fields(&compound.proposal.block) {
                         Ok(r) => r,
                         Err(e) => {
+                            // Distinct from malformed bytes (decode errors
+                            // below): the proposal decoded fine but names a
+                            // protocol this node does not know. No peer
+                            // penalty change.
                             warn!(
-                                len = msg.data.len(),
-                                prefix = %hex_prefix(&msg.data, 96),
-                                "dropping proposal whose payset cannot be decoded: {}",
+                                protocol = %e.protocol,
+                                "dropping proposal for unknown consensus protocol: {}",
                                 e
                             );
                             return None;
@@ -1327,6 +1330,7 @@ mod tests {
             proposal: crate::proposal::UnauthenticatedProposal {
                 block: algo_types::Block {
                     round: Round(1),
+                    current_protocol: algo_types::consensus::CONSENSUS_V41.into(),
                     ..algo_types::Block::default()
                 },
                 seed_proof: [0u8; crate::VRF_PROOF_SIZE],
@@ -1349,6 +1353,36 @@ mod tests {
         let event = result.unwrap();
         // The compound message has a zero/default vote, so only payload is returned.
         assert_eq!(event.event_type(), EventType::PayloadPresent);
+    }
+
+    /// Issue #1728: a proposal naming a protocol this node does not know
+    /// cannot have its payset decoded (go: `consensus protocol %s not
+    /// found`); it is dropped (distinct warn text), without disconnecting.
+    #[test]
+    fn demux_raw_proposal_with_unknown_protocol_is_dropped() {
+        let (demux, ..) = make_test_demux();
+        let compound = CompoundMessage {
+            vote: UnauthenticatedVote::default(),
+            proposal: crate::proposal::UnauthenticatedProposal {
+                block: algo_types::Block {
+                    round: Round(1),
+                    current_protocol: "no-such-protocol".into(),
+                    ..algo_types::Block::default()
+                },
+                seed_proof: [0u8; crate::VRF_PROOF_SIZE],
+                original_period: crate::step::Period(0),
+                original_proposer: Address([0u8; 32]),
+                ..crate::proposal::UnauthenticatedProposal::default()
+            },
+        };
+        let result = demux.handle_raw_proposal(
+            Message {
+                data: codec::encode_compound_message(&compound),
+                handle: None,
+            },
+            &ConsensusVersionView::default(),
+        );
+        assert!(result.is_none());
     }
 
     #[test]
@@ -1383,6 +1417,7 @@ mod tests {
             proposal: crate::proposal::UnauthenticatedProposal {
                 block: algo_types::Block {
                     round: Round(1),
+                    current_protocol: algo_types::consensus::CONSENSUS_V41.into(),
                     payset: vec![bogus_txn],
                     ..algo_types::Block::default()
                 },
@@ -1473,6 +1508,7 @@ mod tests {
             proposal: crate::proposal::UnauthenticatedProposal {
                 block: algo_types::Block {
                     round: Round(1),
+                    current_protocol: algo_types::consensus::CONSENSUS_V41.into(),
                     payset: vec![malformed_txn],
                     ..algo_types::Block::default()
                 },
@@ -1541,6 +1577,7 @@ mod tests {
             proposal: crate::proposal::UnauthenticatedProposal {
                 block: algo_types::Block {
                     round: Round(1),
+                    current_protocol: algo_types::consensus::CONSENSUS_V41.into(),
                     payset: vec![
                         SignedTransaction {
                             txn: txn1,
@@ -1623,6 +1660,7 @@ mod tests {
                     round: Round(1),
                     genesis_id: genesis_id.clone(),
                     genesis_hash,
+                    current_protocol: algo_types::consensus::CONSENSUS_V41.into(),
                     payset: vec![stripped(1), stripped(2)],
                     ..algo_types::Block::default()
                 },
