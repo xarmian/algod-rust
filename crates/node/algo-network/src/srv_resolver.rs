@@ -103,22 +103,26 @@ use tracing::{debug, info, warn};
 ///
 /// Worst case (issue #1702): a stage whose resolver cannot serve the root
 /// DNSKEY fails after at most [`DNSSEC_PROBE_ATTEMPTS`] x
-/// [`DNSSEC_PROBE_ATTEMPT_TIMEOUT`] = 5 s (plus one 200 ms retry pause; see below) without ever starting
-/// the glue walk; a stage that passes the probe is bounded by this 15 s
-/// budget *including* the probe. Three validating stages therefore cost at
-/// most 3 x 5 s = 15 s against non-DNSSEC resolvers (45 s if each stage
-/// passed its probe and then hung), plus the last-resort lookup (15 s), still
-/// leaving headroom inside a typical multi-minute node-startup window.
+/// [`DNSSEC_PROBE_ATTEMPT_TIMEOUT`] = 10 s plus one 200 ms retry pause
+/// (about 10.2 s), without ever starting the glue walk; a stage that passes
+/// the probe is bounded by this 15 s budget *including* the probe. Three
+/// validating stages therefore cost at most about 31 s against non-DNSSEC
+/// resolvers (45 s if each stage passed its probe and then hung), plus the
+/// last-resort lookup (15 s, no probe), still leaving headroom inside a
+/// typical multi-minute node-startup window.
 const DNSSEC_STAGE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Number of root-DNSKEY probe attempts per validating stage (issue #1702);
-/// only a timed-out attempt is retried, an answered one (including an
-/// error or empty answer) is final.
+/// Number of root-DNSKEY probe attempts per validating stage (issue #1702).
+/// A timed-out attempt and a transient resolver error (SERVFAIL, transport
+/// error; see [`HickorySrvResolver::probe_error_is_transient`]) are retried;
+/// a definitive negative answer (empty, NXDOMAIN, NSEC-proven) is final.
 const DNSSEC_PROBE_ATTEMPTS: u32 = 2;
 
 /// Budget of one root-DNSKEY probe attempt (issue #1702), so a probe costs at
-/// most `DNSSEC_PROBE_ATTEMPTS x DNSSEC_PROBE_ATTEMPT_TIMEOUT` = 5 s, and a
-/// single dropped UDP packet on a lossy path does not fail the stage.
+/// most `DNSSEC_PROBE_ATTEMPTS x DNSSEC_PROBE_ATTEMPT_TIMEOUT` = 10 s. The
+/// generous per-attempt budget lets hickory's own UDP retry and a TCP
+/// fallback for the ~1.2 KB root DNSKEY answer complete on a lossy or
+/// high-RTT link, so a slow but working resolver is not cut off.
 ///
 /// Every DNSSEC chain of trust starts at the root DNSKEY RRset: go's
 /// `trustChain.ensure` (`tools/network/dnssec/trustchain.go`) authenticates
@@ -134,7 +138,7 @@ const DNSSEC_PROBE_ATTEMPTS: u32 = 2;
 /// validating root DNSKEY answer cannot validate anything, so the probe fails
 /// that stage fast, exactly as a failed validating lookup would, and the
 /// chain moves on.
-const DNSSEC_PROBE_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(2500);
+const DNSSEC_PROBE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Pause before retrying a root-DNSKEY probe that failed with a transient
 /// resolver error such as SERVFAIL (issue #1702).
@@ -157,7 +161,16 @@ impl StageTimeouts {
         probe_attempt: DNSSEC_PROBE_ATTEMPT_TIMEOUT,
     };
 
-    /// Worst-case probe duration.
+    /// Worst-case duration of a stage whose probe fails: every attempt times
+    /// out, with a retry pause between attempts, capped by the stage budget.
+    #[cfg(test)]
+    fn failed_probe_stage_worst_case(&self) -> Duration {
+        (self.probe_attempt * DNSSEC_PROBE_ATTEMPTS
+            + DNSSEC_PROBE_RETRY_DELAY * (DNSSEC_PROBE_ATTEMPTS - 1))
+            .min(self.stage)
+    }
+
+    /// Worst-case probe time without pauses (attempts x attempt timeout).
     #[cfg(test)]
     fn probe_total(&self) -> Duration {
         self.probe_attempt * DNSSEC_PROBE_ATTEMPTS
@@ -199,6 +212,13 @@ pub enum SrvResolveError {
     /// the configured address does not parse as an IP).
     #[error("fallback resolver not configured or address invalid")]
     FallbackNotConfigured,
+
+    /// The root-DNSKEY probe that precedes every validating stage failed
+    /// (timeout, resolver error such as SERVFAIL, or empty answer): the
+    /// resolver cannot serve DNSSEC data, as opposed to the SRV query itself
+    /// failing. The stage is failed without starting the SRV lookup.
+    #[error("DNS resolver cannot serve DNSSEC (root DNSKEY probe failed): {0}")]
+    DnssecProbeFailed(String),
 
     /// A resolver-stage attempt did not complete within
     /// [`DNSSEC_STAGE_TIMEOUT`] (issue #1614: guards against a hung/slow
@@ -500,7 +520,7 @@ impl HickorySrvResolver {
     /// rather than downgrading it; unvalidated data is only ever returned by
     /// `lookup_srv`'s final last-resort step) and the glue-walking SRV lookup
     /// never starts. The probe and the lookup together are bounded by
-    /// `budget` (issue #1614/#1702).
+    /// `timeouts.stage` (issue #1614/#1702).
     async fn lookup_stage(
         resolver: &TokioResolver,
         srv_name: &str,
@@ -518,11 +538,12 @@ impl HickorySrvResolver {
     /// Ask the validating `resolver` for the root DNSKEY RRset (validated
     /// against the trust anchor by hickory). A timeout, a resolver error
     /// (e.g. SERVFAIL) or an empty answer counts as "cannot validate" and
-    /// fails the stage. A timed-out attempt and a transient resolver error
-    /// (anything but a definitive empty/NXDOMAIN answer) are retried, up to
+    /// fails the stage with [`SrvResolveError::DnssecProbeFailed`]. A
+    /// timed-out attempt and a transient resolver error (see
+    /// [`Self::probe_error_is_transient`]) are retried, up to
     /// [`DNSSEC_PROBE_ATTEMPTS`] attempts in total (after
-    /// [`DNSSEC_PROBE_RETRY_DELAY`] for an error); the cause is logged at
-    /// INFO and returned as the stage error.
+    /// [`DNSSEC_PROBE_RETRY_DELAY`] for an error); the cause is logged at INFO
+    /// and carried in the returned error.
     async fn probe_root_dnskey(
         resolver: &TokioResolver,
         attempt_timeout: Duration,
@@ -535,7 +556,7 @@ impl HickorySrvResolver {
                 Ok(Err(e)) => {
                     if last_attempt || !Self::probe_error_is_transient(&e) {
                         info!("DNS root DNSKEY probe failed ({e}); failing this stage");
-                        return Err(SrvResolveError::ResolveFailed(e));
+                        return Err(SrvResolveError::DnssecProbeFailed(e.to_string()));
                     }
                     info!("DNS root DNSKEY probe attempt {attempt} errored ({e}); retrying");
                     tokio::time::sleep(DNSSEC_PROBE_RETRY_DELAY).await;
@@ -547,17 +568,28 @@ impl HickorySrvResolver {
         }
         let total = attempt_timeout * DNSSEC_PROBE_ATTEMPTS;
         info!("DNS root DNSKEY probe timed out after {total:?}; failing this stage");
-        Err(SrvResolveError::Timeout(total))
+        Err(SrvResolveError::DnssecProbeFailed(format!(
+            "timed out after {total:?}"
+        )))
     }
 
-    /// A probe error worth a retry: anything except a definitive negative
-    /// answer (NOERROR-empty or NXDOMAIN), e.g. SERVFAIL or a transport error.
+    /// A probe error worth one retry: everything except a definitive
+    /// negative answer (an empty NOERROR or NXDOMAIN answer, or a
+    /// DNSSEC-proven negative via NSEC). Note hickory's validating handle
+    /// reports an unauthenticated negative response, which includes a
+    /// SERVFAIL, as a plain protocol message error ("could not validate
+    /// negative response missing SOA", `dnssec_dns_handle::check_nsec`), and
+    /// drops records whose proof is bogus before that point, so a SERVFAIL
+    /// and a validation failure cannot be told apart by error kind; both
+    /// therefore get the single (cheap, 200 ms-paused) retry, which cannot
+    /// turn a failure into a success unless the resolver answers properly.
     fn probe_error_is_transient(e: &ResolveError) -> bool {
         match e.proto().map(|p| p.kind()) {
             Some(ProtoErrorKind::NoRecordsFound { response_code, .. }) => !matches!(
                 response_code,
                 ResponseCode::NoError | ResponseCode::NXDomain
             ),
+            Some(ProtoErrorKind::Nsec { .. }) => false,
             _ => true,
         }
     }
@@ -1401,14 +1433,25 @@ mod tests {
     /// `participate` startup window).
     #[test]
     fn dnssec_stage_timeout_leaves_startup_headroom() {
-        let worst_case_all_four_stages = DNSSEC_STAGE_TIMEOUT * 4;
+        let t = StageTimeouts::PRODUCTION;
+        // The probe (attempts + pause) fits inside the stage budget, leaving
+        // room for a real validating lookup to finish after it.
         assert!(
-            worst_case_all_four_stages < Duration::from_secs(90),
-            "four stages at {DNSSEC_STAGE_TIMEOUT:?} each should fit comfortably inside a \
-             2-minute startup window, got {worst_case_all_four_stages:?}"
+            t.probe_total() + DNSSEC_PROBE_RETRY_DELAY < t.stage,
+            "probe {:?} must fit inside the stage budget {:?}",
+            t.probe_total(),
+            t.stage
+        );
+        // Worst-case chain: three stages whose probe fails, then the
+        // (probe-less) last resort bounded by one stage budget.
+        let worst_chain = t.failed_probe_stage_worst_case() * 3 + t.stage;
+        assert!(
+            worst_chain < Duration::from_secs(90),
+            "worst-case chain {worst_chain:?} should fit comfortably inside a 2-minute \
+             startup window"
         );
         assert!(
-            DNSSEC_STAGE_TIMEOUT >= Duration::from_secs(5),
+            t.stage >= Duration::from_secs(5),
             "the budget must still allow a real (non-hung) DNSSEC validation to complete"
         );
     }
@@ -1695,6 +1738,8 @@ mod tests {
         pub struct Fake {
             pub addr: SocketAddr,
             pub queries: Arc<AtomicUsize>,
+            /// Number of root DNSKEY queries seen (dropped ones included).
+            pub dnskey_queries: Arc<AtomicUsize>,
         }
 
         /// How a stub treats DNSKEY queries for the root.
@@ -1787,6 +1832,8 @@ mod tests {
             let addr = sock.local_addr().unwrap();
             let queries = Arc::new(AtomicUsize::new(0));
             let q2 = queries.clone();
+            let dnskey_queries = Arc::new(AtomicUsize::new(0));
+            let dk2 = dnskey_queries.clone();
             let sock = Arc::new(sock);
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 4096];
@@ -1810,6 +1857,7 @@ mod tests {
                     if let Some(q) = req.queries().first() {
                         resp.add_query(q.clone());
                         if q.query_type() == RecordType::DNSKEY && q.name().is_root() {
+                            dk2.fetch_add(1, Ordering::SeqCst);
                             match &dnskey {
                                 Dnskey::Drop => continue,
                                 Dnskey::Signed(root) => {
@@ -1857,7 +1905,11 @@ mod tests {
                     });
                 }
             });
-            Fake { addr, queries }
+            Fake {
+                addr,
+                queries,
+                dnskey_queries,
+            }
         }
 
         /// Resolver pointed at `fake`; validating with `anchor` when given,
@@ -1978,7 +2030,7 @@ mod tests {
         let elapsed = started.elapsed();
         assert!(res.is_err(), "must not return unvalidated records: {res:?}");
         assert!(
-            elapsed <= TEST_TIMEOUTS.probe_total() * 5 && elapsed < TEST_TIMEOUTS.stage,
+            elapsed <= TEST_TIMEOUTS.probe_total() * 10 && elapsed < TEST_TIMEOUTS.stage,
             "stage took {elapsed:?}"
         );
     }
@@ -1993,12 +2045,12 @@ mod tests {
         let res = HickorySrvResolver::lookup_stage(&r, SRV_NAME, TEST_TIMEOUTS).await;
         let elapsed = started.elapsed();
         assert!(
-            matches!(res, Err(SrvResolveError::Timeout(_))),
-            "expected a probe timeout, got {res:?}"
+            matches!(res, Err(SrvResolveError::DnssecProbeFailed(_))),
+            "expected a probe failure, got {res:?}"
         );
         assert!(
             elapsed >= TEST_TIMEOUTS.probe_attempt
-                && elapsed <= TEST_TIMEOUTS.probe_total() * 5
+                && elapsed <= TEST_TIMEOUTS.probe_total() * 10
                 && elapsed < TEST_TIMEOUTS.stage,
             "stage took {elapsed:?}"
         );
@@ -2017,8 +2069,10 @@ mod tests {
         assert_eq!(res.len(), 5);
     }
 
-    /// A transient SERVFAIL on the probe is retried once instead of failing
-    /// the stage (and, if every stage hit it, falling to the last resort).
+    /// A transient SERVFAIL on the probe must not fail the stage: resolution
+    /// eventually succeeds and the stub saw at least 2 DNSKEY queries (the
+    /// assertion is deliberately agnostic of whether our retry or hickory's
+    /// own retry issued the second one).
     #[tokio::test]
     async fn probe_servfail_once_is_retried() {
         let root = std::sync::Arc::new(fake_dns::signed_root());
@@ -2028,6 +2082,70 @@ mod tests {
             .await
             .expect("one SERVFAIL must not fail the stage");
         assert_eq!(res.len(), 4);
+        assert!(
+            fake.dnskey_queries
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2
+        );
+    }
+
+    /// Definitive negative answers are final; SERVFAIL-like and transport
+    /// errors (including hickory's message error for an unauthenticated
+    /// negative response) get the one retry.
+    #[test]
+    fn probe_error_classification() {
+        use hickory_resolver::proto::op::Query;
+        use hickory_resolver::proto::ProtoError;
+        fn no_records(code: ResponseCode) -> ResolveError {
+            ResolveError::from(ProtoError::from(ProtoErrorKind::NoRecordsFound {
+                query: Box::new(Query::new()),
+                soa: None,
+                ns: None,
+                negative_ttl: None,
+                response_code: code,
+                trusted: false,
+                authorities: None,
+            }))
+        }
+        let transient = HickorySrvResolver::probe_error_is_transient;
+        assert!(transient(&no_records(ResponseCode::ServFail)));
+        assert!(transient(&ResolveError::from(ProtoError::from(
+            ProtoErrorKind::Timeout
+        ))));
+        assert!(transient(&ResolveError::from(ProtoError::from(
+            "could not validate negative response missing SOA"
+        ))));
+        assert!(!transient(&no_records(ResponseCode::NoError)));
+        assert!(!transient(&no_records(ResponseCode::NXDomain)));
+    }
+
+    /// The probe failure is distinguishable from an SRV failure and survives
+    /// into the stringified per-resolver errors of `AllResolversFailed`.
+    #[tokio::test]
+    async fn probe_failure_is_distinguishable_in_chain_error() {
+        let sys = fake_dns::spawn(2, Dnskey::Empty).await;
+        let built = counter();
+        let res = HickorySrvResolver::run_chain(
+            SRV_NAME,
+            chain(
+                fake_dns::resolver(&sys, true, None),
+                None,
+                fake_dns::resolver(&sys, true, None),
+                None,
+                &built,
+            ),
+            TEST_TIMEOUTS,
+        )
+        .await;
+        match res {
+            Err(SrvResolveError::AllResolversFailed {
+                system, default, ..
+            }) => {
+                assert!(system.contains("cannot serve DNSSEC"), "{system}");
+                assert!(default.contains("cannot serve DNSSEC"), "{default}");
+            }
+            other => panic!("expected AllResolversFailed, got {other:?}"),
+        }
     }
 
     /// (d) An attacker-style first stage answers the SRV query with records
@@ -2057,7 +2175,7 @@ mod tests {
         .await
         .expect("chain must succeed via the DNSSEC-capable stage");
         assert_eq!(res.len(), 3, "records must come from the validating stage");
-        assert!(started.elapsed() < TEST_TIMEOUTS.probe_total() * 5 + Duration::from_secs(5));
+        assert!(started.elapsed() < TEST_TIMEOUTS.probe_total() * 10 + Duration::from_secs(5));
         // system + fallback only: neither default nor last resort was built.
         assert_eq!(built.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
