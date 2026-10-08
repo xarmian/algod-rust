@@ -288,7 +288,7 @@ can be a required check). Its single job is named
 followed by `cargo test --workspace --doc` (nextest does not run doctests).
 Reproduce locally with `cargo nextest run --workspace --profile ci`.
 
-Flaky tests are handled in `.config/nextest.toml` (`ci` profile: `retries = 2`,
+The real-thread multi-node agreement binaries (`service_multi_node_test`, `player_real_harness_test`) are filtered out of this job (too slow in a debug build; they still run in release in the daily `Coverage` workflow, see the comment in the workflow). Flaky tests are handled in `.config/nextest.toml` (`ci` profile: `retries = 2`,
 `fail-fast = false`); a test that passes on retry is logged as FLAKY, nothing is
 skipped. Known load-sensitive tests: the multi-node agreement harness (#1695)
 and `lookback_prefetch` (#1723). The scheduled `Coverage` workflow remains the
