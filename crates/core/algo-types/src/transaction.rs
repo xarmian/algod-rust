@@ -207,7 +207,12 @@ pub struct SignedTransaction {
     /// Eval delta -- application state changes (ApplyData.dt).
     /// Opaque passthrough; uses rmpv::Value since EvalDelta contains
     /// recursive inner transactions and complex state deltas.
-    #[serde(rename = "dt", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "dt",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_eval_delta"
+    )]
     pub eval_delta: Option<rmpv::Value>,
 
     /// Created/configured asset ID from ApplyData (ApplyData.caid).
@@ -780,6 +785,134 @@ fn is_none_or_empty_box_ref_name(v: &Option<ByteBuf>) -> bool {
     match v {
         None => true,
         Some(b) => b.is_empty(),
+    }
+}
+
+/// Str-preserving serde representation of `ApplyData.dt` (issue #1743).
+///
+/// go writes `EvalDelta` keys, `bs` and `lg` entries as msgpack `str` even
+/// when the bytes are not valid UTF-8. `rmpv::Value`'s own `Serialize` writes
+/// such a `Utf8String` as `bin`, and `rmp_serde` hands invalid-UTF-8 `str`
+/// back as bytes, so both directions lose the typing. This module (a)
+/// serializes invalid-UTF-8 strings as `str` for non-human-readable formats
+/// and (b) re-applies go's schema typing after deserialize (also upgrading
+/// legacy bin-typed forms). Valid UTF-8 content is unchanged on the wire.
+pub mod serde_eval_delta {
+    use rmpv::Value;
+    use serde::ser::{SerializeMap, SerializeSeq};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    struct Preserving<'a>(&'a Value);
+
+    impl Serialize for Preserving<'_> {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            match self.0 {
+                Value::String(v) if v.is_err() && !s.is_human_readable() => {
+                    // SAFETY: same argument as `serde_bytes_array::serde_raw_str`:
+                    // `rmp_serde`'s `serialize_str` only copies the bytes onto
+                    // the wire and never inspects the characters.
+                    let raw = unsafe { std::str::from_utf8_unchecked(v.as_bytes()) };
+                    s.serialize_str(raw)
+                }
+                Value::Array(a) => {
+                    let mut st = s.serialize_seq(Some(a.len()))?;
+                    for i in a {
+                        st.serialize_element(&Preserving(i))?;
+                    }
+                    st.end()
+                }
+                Value::Map(m) => {
+                    let mut st = s.serialize_map(Some(m.len()))?;
+                    for (k, v) in m {
+                        st.serialize_entry(&Preserving(k), &Preserving(v))?;
+                    }
+                    st.end()
+                }
+                other => other.serialize(s),
+            }
+        }
+    }
+
+    pub fn serialize<S: Serializer>(v: &Option<Value>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(v) => s.serialize_some(&Preserving(v)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+        let mut v = Option::<Value>::deserialize(d)?;
+        if let Some(v) = v.as_mut() {
+            retype_eval_delta(v);
+        }
+        Ok(v)
+    }
+
+    /// Make `v` a go `str` (bytes of a `bin` kept verbatim, even non-UTF-8).
+    fn to_str(v: &mut Value) {
+        if let Value::Binary(b) = v {
+            let b = std::mem::take(b);
+            *v = match String::from_utf8(b) {
+                Ok(s) => Value::from(s),
+                Err(e) => {
+                    let b = e.into_bytes();
+                    let mut buf = Vec::with_capacity(b.len() + 5);
+                    rmp::encode::write_str_len(&mut buf, b.len() as u32).expect("vec write");
+                    buf.extend_from_slice(&b);
+                    rmpv::decode::read_value(&mut &buf[..]).expect("well-formed str")
+                }
+            };
+        }
+    }
+
+    fn retype_state_delta(v: &mut Value) {
+        if let Value::Map(m) = v {
+            for (k, vd) in m.iter_mut() {
+                to_str(k);
+                if let Value::Map(f) = vd {
+                    for (fk, fv) in f.iter_mut() {
+                        if fk.as_str() == Some("bs") {
+                            to_str(fv);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Apply go's `EvalDelta` field typing (`gd`/`ld` keys and `bs`, `lg`
+    /// entries are `str`), recursing through `itx[*].dt`.
+    pub fn retype_eval_delta(v: &mut Value) {
+        let Value::Map(top) = v else { return };
+        for (k, val) in top.iter_mut() {
+            match k.as_str() {
+                Some("gd") => retype_state_delta(val),
+                Some("ld") => {
+                    if let Value::Map(m) = val {
+                        m.iter_mut().for_each(|(_, sd)| retype_state_delta(sd));
+                    }
+                }
+                Some("lg") => {
+                    if let Value::Array(a) = val {
+                        a.iter_mut().for_each(to_str);
+                    }
+                }
+                Some("itx") => {
+                    if let Value::Array(items) = val {
+                        for item in items {
+                            if let Value::Map(f) = item {
+                                for (fk, fv) in f.iter_mut() {
+                                    if fk.as_str() == Some("dt") {
+                                        retype_eval_delta(fv);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }
 

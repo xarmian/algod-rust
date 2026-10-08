@@ -1951,6 +1951,77 @@ mod tests {
         assert_eq!(keys, vec![0, 2]);
     }
 
+    /// Issue #1743: `SignedTransaction.eval_delta` must keep go's msgpack
+    /// `str` typing for non-UTF-8 `dt` keys / `bs` / `lg` through the plain
+    /// serde (`rmp_serde`) path as well as the canonical encoder, and a
+    /// bin-typed legacy `dt` must still decode (and be normalised to str).
+    #[test]
+    fn eval_delta_non_utf8_str_survives_rmp_serde_round_trip() {
+        let stx = appl_child_with_non_utf8_dt();
+        let bytes = rmp_serde::to_vec_named(&stx).unwrap();
+        let has = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
+        assert!(has(&bytes, &[0xa1, 0xff]), "gd key must be written as str");
+        assert!(
+            has(&bytes, &[0xa2, b'b', b's', 0xa1, 0x80]),
+            "bs must be str"
+        );
+        assert!(
+            has(&bytes, &[0xa2, b'l', b'g', 0x91, 0xa1, 0xfe]),
+            "lg must be str"
+        );
+        let back: SignedTransaction = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(back.eval_delta, stx.eval_delta);
+        assert_eq!(
+            algo_codec::canonical_encode_signed_txn_in_block(&back),
+            algo_codec::canonical_encode_signed_txn_in_block(&stx),
+            "canonical encoding is identical after the serde round trip"
+        );
+        // Legacy bin-typed form (what older serde wrote) still decodes and
+        // normalises back to go's str typing.
+        let legacy = {
+            let mut v = rmp_serde::to_vec_named(&stx).unwrap();
+            let mut at = None;
+            for i in 0..v.len().saturating_sub(1) {
+                if v[i] == 0xa1 && v[i + 1] == 0xff {
+                    at = Some(i);
+                    break;
+                }
+            }
+            let i = at.unwrap();
+            v.splice(i..i + 2, [0xc4, 0x01, 0xff]);
+            v
+        };
+        let from_legacy: SignedTransaction = rmp_serde::from_slice(&legacy).unwrap();
+        assert_eq!(from_legacy.eval_delta, stx.eval_delta);
+    }
+
+    /// Issue #1743 (item 2): outside the historical protocol-V24
+    /// `compatibilityMode`, go keys `ld` by `txn.IndexByAddress`, which
+    /// "return[s] the index at the first match"
+    /// (`data/transactions/application.go`; `ledger/eval/appcow.go`
+    /// `buildEvalDelta`). So `accounts = [X, X]` addressed by slot 2 still
+    /// yields `ld` key 1.
+    #[test]
+    fn ld_duplicate_account_uses_first_slot_like_go_index_by_address() {
+        let x = Address([2u8; 32]);
+        let txn = Transaction {
+            sender: Address([1u8; 32]),
+            accounts: Some(vec![x, x]),
+            ..Default::default()
+        };
+        let mut r = algo_avm::eval::AvmResult::empty();
+        r.local_deltas.insert(
+            x,
+            HashMap::from([(b"k".to_vec(), Some(TealValue::Uint(1)))]),
+        );
+        let dt = encode_eval_delta(&r, &txn, true).unwrap();
+        let Value::Map(top) = dt else { panic!() };
+        let ld = top.iter().find(|(k, _)| k.as_str() == Some("ld")).unwrap();
+        let Value::Map(ld) = &ld.1 else { panic!() };
+        let keys: Vec<u64> = ld.iter().map(|(k, _)| k.as_u64().unwrap()).collect();
+        assert_eq!(keys, vec![1]);
+    }
+
     /// Issue #1740: `sa` is appended in the order the local deltas were first
     /// created (go `ensureLocalDelta`), not in address order; indices follow
     /// (`1 + len(accounts) + position`), and an account already in `accounts`
