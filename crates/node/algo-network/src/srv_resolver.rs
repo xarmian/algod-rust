@@ -1527,7 +1527,7 @@ mod tests {
             pub queries: Arc<AtomicUsize>,
         }
 
-        pub async fn spawn(n_targets: usize, mode: u8, latency_ms: u64) -> Fake {
+        pub async fn spawn(n_targets: usize) -> Fake {
             let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let addr = sock.local_addr().unwrap();
             let queries = Arc::new(AtomicUsize::new(0));
@@ -1552,13 +1552,7 @@ mod tests {
                     resp.set_response_code(ResponseCode::NoError);
                     if let Some(q) = req.queries().first() {
                         resp.add_query(q.clone());
-                        if q.query_type() != RecordType::SRV && mode == 1 {
-                            resp.set_response_code(ResponseCode::ServFail);
-                        } else if q.query_type() != RecordType::SRV && mode == 2 {
-                            resp.set_response_code(ResponseCode::NXDomain);
-                        } else if q.query_type() != RecordType::SRV && mode == 3 {
-                            resp.set_response_code(ResponseCode::Refused);
-                        } else if q.query_type() == RecordType::SRV || mode == 4 {
+                        if q.query_type() == RecordType::SRV {
                             for i in 0..n_targets {
                                 let t = Name::from_str(&format!("r{i}.example.test.")).unwrap();
                                 resp.add_answer(Record::from_rdata(
@@ -1578,9 +1572,6 @@ mod tests {
                         resp.set_edns(edns);
                     }
                     let bytes = resp.to_vec().unwrap();
-                    if latency_ms > 0 {
-                        tokio::time::sleep(std::time::Duration::from_millis(latency_ms)).await;
-                    }
                     let _ = sock.send_to(&bytes, peer).await;
                 }
             });
@@ -1588,14 +1579,14 @@ mod tests {
         }
     }
 
-    /// Deterministic (query-count, not wall-clock) pin of the #1702 root
-    /// cause: validation cost scales with the additional section.
+    /// Query-count (not wall-clock) pin of the #1702 root cause: a validating
+    /// lookup's sub-query count grows with the additional-section size, while
+    /// a non-validating one stays a single query. Asserts only the trend, not
+    /// hickory's exact per-name query count.
     #[tokio::test]
-    async fn validated_lookup_queries_scale_with_additional_section() {
-        const TARGETS: usize = 10;
-        let mut counts = Vec::new();
-        for validate in [false, true] {
-            let fake = fake_dns::spawn(TARGETS, 0, 0).await;
+    async fn validated_lookup_queries_grow_with_additional_section() {
+        async fn queries(targets: usize, validate: bool) -> usize {
+            let fake = fake_dns::spawn(targets).await;
             let group =
                 NameServerConfigGroup::from_ips_clear(&[fake.addr.ip()], fake.addr.port(), true);
             let cfg = ResolverConfig::from_parts(None, vec![], group);
@@ -1603,35 +1594,16 @@ mod tests {
             let res = HickorySrvResolver::do_lookup_bounded(&r, "_algobootstrap._tcp.example.test")
                 .await
                 .expect("stub lookup");
-            assert_eq!(res.len(), TARGETS);
-            counts.push(fake.queries.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(res.len(), targets);
+            fake.queries.load(std::sync::atomic::Ordering::SeqCst)
         }
-        assert_eq!(counts[0], 1, "non-validating lookup is a single query");
+        assert_eq!(queries(10, false).await, 1);
+        assert_eq!(queries(20, false).await, 1);
+        let small = queries(5, true).await;
+        let large = queries(20, true).await;
         assert!(
-            counts[1] >= 3 * TARGETS,
-            "validating lookup issued {} queries for {TARGETS} glue names",
-            counts[1]
+            large > small && small > 1,
+            "validating sub-queries should grow with glue names: {small} -> {large}"
         );
-    }
-
-    /// Wall-clock evidence for the PR (run with `--ignored --nocapture`).
-    #[tokio::test]
-    #[ignore]
-    async fn evidence_validated_lookup_latency() {
-        for validate in [false, true] {
-            let fake = fake_dns::spawn(20, 0, 10).await;
-            let group =
-                NameServerConfigGroup::from_ips_clear(&[fake.addr.ip()], fake.addr.port(), true);
-            let cfg = ResolverConfig::from_parts(None, vec![], group);
-            let r = HickorySrvResolver::build_resolver(cfg, validate);
-            let t = std::time::Instant::now();
-            let _ =
-                HickorySrvResolver::do_lookup_bounded(&r, "_algobootstrap._tcp.example.test").await;
-            eprintln!(
-                "validate={validate} elapsed={:?} queries={}",
-                t.elapsed(),
-                fake.queries.load(std::sync::atomic::Ordering::SeqCst)
-            );
-        }
     }
 }

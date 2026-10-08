@@ -45,6 +45,17 @@ use crate::srv_resolver::{resolve_addresses, SrvResolver};
 /// and updates the shared [`Phonebook`].
 ///
 /// [`refresh_phonebook_addresses`]: Discovery::refresh_phonebook_addresses
+/// Maximum number of SRV lookups in flight at once during one refresh
+/// (issue #1702).
+///
+/// A DNSSEC-validating lookup fans out into hundreds of sequential DNSKEY/DS
+/// sub-queries against the resolver (see `srv_resolver::DNSSEC_STAGE_TIMEOUT`);
+/// bounding the number of concurrent lookups keeps many bootstrap entries from
+/// bursting all of those at a stub system resolver simultaneously. Four is the
+/// number of independent lookups one entry with a backup domain needs
+/// (primary/backup x relay/archive), so a single entry is fully parallel.
+pub const MAX_CONCURRENT_SRV_LOOKUPS: usize = 4;
+
 pub struct Discovery {
     /// Shared phonebook for storing discovered peer addresses.
     phonebook: Arc<Phonebook>,
@@ -58,6 +69,9 @@ pub struct Discovery {
     /// Network identifier (e.g. `"mainnet"`, `"testnet"`), used as the
     /// `network_name` parameter when updating the phonebook.
     network_id: String,
+
+    /// Caps in-flight SRV lookups at [`MAX_CONCURRENT_SRV_LOOKUPS`].
+    lookup_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl Discovery {
@@ -98,6 +112,7 @@ impl Discovery {
             resolver,
             bootstrap_entries,
             network_id: network_id.to_string(),
+            lookup_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SRV_LOOKUPS)),
         })
     }
 
@@ -108,16 +123,38 @@ impl Discovery {
     /// warning and returns an empty vector for the failed lookup.
     ///
     /// Mirrors go-algorand's `getDNSAddrs` in `wsNetwork.go`.
+    async fn limited_resolve(
+        &self,
+        service: &str,
+        domain: &str,
+    ) -> Result<Vec<String>, crate::srv_resolver::SrvResolveError> {
+        // The semaphore is never closed, so acquire cannot fail.
+        let _permit = self
+            .lookup_permits
+            .acquire()
+            .await
+            .expect("lookup semaphore is never closed");
+        resolve_addresses(self.resolver.as_ref(), service, "tcp", domain).await
+    }
+
+    /// Resolves relay and archival peer addresses (see the body for the
+    /// concurrency model).
     pub async fn get_dns_addrs(&self, domain: &str) -> (Vec<String>, Vec<String>) {
         // Resolve relay ("_algobootstrap._tcp.<domain>") and archival
-        // ("_archive._tcp.<domain>") addresses concurrently (issue #1702):
-        // the two lookups are independent, and a slow DNSSEC-validating
-        // resolver stage must be paid once rather than once per lookup.
-        // go's `refreshRelayArchivePhonebookAddresses` likewise runs the
-        // relay and archive resolutions as independent goroutines.
+        // ("_archive._tcp.<domain>") addresses concurrently (issue #1702),
+        // each holding one of the `MAX_CONCURRENT_SRV_LOOKUPS` permits.
+        //
+        // Differs from go: `getDNSAddrs` (`network/wsNetwork.go:1874`) resolves
+        // the two names sequentially, and `refreshRelayArchivePhonebookAddresses`
+        // (`network/wsNetwork.go:1654`) walks the bootstrap entries and their
+        // backup domain sequentially too. Doing them concurrently here is a
+        // mitigation only: it shrinks the worst case of a refresh from
+        // ~4 lookups x (resolver stages) to ~1 lookup x (resolver stages);
+        // each lookup still tries system, fallback, default and the
+        // DNSSEC-disabled last-resort stage one after another.
         let (relay_result, archival_result) = futures_util::join!(
-            resolve_addresses(self.resolver.as_ref(), "algobootstrap", "tcp", domain),
-            resolve_addresses(self.resolver.as_ref(), "archive", "tcp", domain),
+            self.limited_resolve("algobootstrap", domain),
+            self.limited_resolve("archive", domain),
         );
 
         let relay_addresses = match relay_result {
@@ -230,24 +267,34 @@ impl Discovery {
     ///
     /// Mirrors go-algorand's `refreshRelayArchivePhonebookAddresses`.
     pub async fn refresh_phonebook_addresses(&self) {
-        // Issue #1702: resolve every entry's primary and backup domains
-        // concurrently (each domain's relay/archive pair is itself concurrent
-        // inside `get_dns_addrs`), then apply the results in entry order.
-        let lookups = self.bootstrap_entries.iter().map(|entry| async move {
-            let has_backup = !entry.backup_srv_bootstrap.is_empty();
-            let (primary, backup) =
-                futures_util::join!(self.get_dns_addrs(&entry.primary_srv_bootstrap), async {
-                    if has_backup {
-                        Some(self.get_dns_addrs(&entry.backup_srv_bootstrap).await)
-                    } else {
-                        None
-                    }
-                });
-            (entry, primary, backup)
-        });
-        let results = futures_util::future::join_all(lookups).await;
+        // Issue #1702 (mitigation, not a fix of the per-lookup stage
+        // stall): resolve the entries concurrently (bounded by
+        // `MAX_CONCURRENT_SRV_LOOKUPS`) but apply each entry's result to the
+        // phonebook as soon as it and every earlier entry have completed
+        // (`FuturesOrdered`), so application order stays deterministic and
+        // equal to go's sequential entry order, while an already-complete
+        // entry is never lost if a later one is slow or the refresh is
+        // cancelled. go does this fully sequentially
+        // (`network/wsNetwork.go:1658-1671`).
+        let mut lookups = futures_util::stream::FuturesOrdered::new();
+        for entry in &self.bootstrap_entries {
+            lookups.push_back(async move {
+                let has_backup = !entry.backup_srv_bootstrap.is_empty();
+                let (primary, backup) =
+                    futures_util::join!(self.get_dns_addrs(&entry.primary_srv_bootstrap), async {
+                        if has_backup {
+                            Some(self.get_dns_addrs(&entry.backup_srv_bootstrap).await)
+                        } else {
+                            None
+                        }
+                    });
+                (entry, primary, backup)
+            });
+        }
 
-        for (entry, (primary_relay, primary_archival), backup) in results {
+        while let Some((entry, (primary_relay, primary_archival), backup)) =
+            futures_util::StreamExt::next(&mut lookups).await
+        {
             if let Some((backup_relay, backup_archival)) = backup {
                 let deduped_relay = Self::merge_primary_secondary(
                     &primary_relay,
@@ -626,54 +673,114 @@ mod tests {
         assert_eq!(archivals[0], "archival1.algorand.network:4160");
     }
 
-    /// A resolver whose every lookup takes a fixed wall-clock delay, standing
-    /// in for a DNSSEC-validating system-resolver stage that burns its stage
-    /// budget (issue #1702).
-    struct SlowResolver {
+    /// Instrumented resolver: tracks peak in-flight lookups, sleeps `delay`
+    /// per lookup, never answers for names containing "slow", and returns one
+    /// relay record for everything else.
+    struct ProbeResolver {
         delay: Duration,
+        in_flight: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
     }
 
-    impl SrvResolver for SlowResolver {
-        fn lookup_srv(
-            &self,
-            _service: &str,
-            _protocol: &str,
-            _name: &str,
-        ) -> Pin<Box<dyn Future<Output = Result<Vec<SrvRecord>, SrvResolveError>> + Send + '_>>
-        {
-            let delay = self.delay;
-            Box::pin(async move {
-                tokio::time::sleep(delay).await;
-                Ok(Vec::new())
+    impl ProbeResolver {
+        fn new(delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                delay,
+                in_flight: Default::default(),
+                peak: Default::default(),
             })
         }
     }
 
-    /// Issue #1702: the four SRV lookups of one refresh (primary/backup x
-    /// relay/archive) are independent, so a slow resolver stage must be paid
-    /// once, not four times (go's `refreshRelayArchivePhonebookAddresses`
-    /// likewise runs relay and archive lookups as independent goroutines).
-    #[tokio::test]
-    async fn refresh_runs_independent_srv_lookups_concurrently() {
-        let delay = Duration::from_millis(200);
+    struct ProbeHandle(Arc<ProbeResolver>);
+
+    impl SrvResolver for ProbeHandle {
+        fn lookup_srv(
+            &self,
+            service: &str,
+            _protocol: &str,
+            name: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<SrvRecord>, SrvResolveError>> + Send + '_>>
+        {
+            use std::sync::atomic::Ordering::SeqCst;
+            let probe = self.0.clone();
+            let slow = name.contains("slow");
+            let records = if service == "algobootstrap" {
+                vec![SrvRecord {
+                    target: format!("relay.{name}"),
+                    port: 4160,
+                    priority: 1,
+                    weight: 1,
+                }]
+            } else {
+                Vec::new()
+            };
+            Box::pin(async move {
+                let now = probe.in_flight.fetch_add(1, SeqCst) + 1;
+                probe.peak.fetch_max(now, SeqCst);
+                if slow {
+                    std::future::pending::<()>().await;
+                } else {
+                    tokio::time::sleep(probe.delay).await;
+                }
+                probe.in_flight.fetch_sub(1, SeqCst);
+                Ok(records)
+            })
+        }
+    }
+
+    fn probe_discovery(probe: &Arc<ProbeResolver>, template: &str) -> (Discovery, Arc<Phonebook>) {
         let pb = Arc::new(Phonebook::new(1, Duration::from_secs(1)));
-        let discovery = Discovery::new(
-            pb,
-            Box::new(SlowResolver { delay }),
-            "<network>.algorand.network?backup=<network>.algorand.net",
+        let d = Discovery::new(
+            pb.clone(),
+            Box::new(ProbeHandle(probe.clone())),
+            template,
             "mainnet",
-            false,
+            true,
         )
         .unwrap();
+        (d, pb)
+    }
 
-        let start = std::time::Instant::now();
-        discovery.refresh_phonebook_addresses().await;
-        let elapsed = start.elapsed();
+    /// Issue #1702: the four independent lookups of one entry (primary/backup
+    /// x relay/archive) overlap -- peak in-flight is exactly four.
+    #[tokio::test]
+    async fn refresh_runs_independent_srv_lookups_concurrently() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let probe = ProbeResolver::new(Duration::from_millis(100));
+        let (d, _pb) = probe_discovery(&probe, "a.example.com?backup=b.example.com");
+        d.refresh_phonebook_addresses().await;
+        assert_eq!(probe.peak.load(SeqCst), 4);
+    }
 
-        // Sequential = 4 * 200ms = 800ms; concurrent ~= 200ms.
-        assert!(
-            elapsed < delay * 2,
-            "4 independent SRV lookups took {elapsed:?}; expected ~one lookup ({delay:?})"
+    /// Many bootstrap entries must not burst past the in-flight cap.
+    #[tokio::test]
+    async fn refresh_caps_in_flight_lookups() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let probe = ProbeResolver::new(Duration::from_millis(50));
+        let template = (0..6)
+            .map(|i| format!("e{i}.example.com?backup=b{i}.example.com"))
+            .collect::<Vec<_>>()
+            .join(";");
+        let (d, _pb) = probe_discovery(&probe, &template);
+        d.refresh_phonebook_addresses().await;
+        let peak = probe.peak.load(SeqCst);
+        assert!(peak <= MAX_CONCURRENT_SRV_LOOKUPS, "peak in-flight {peak}");
+        assert_eq!(peak, MAX_CONCURRENT_SRV_LOOKUPS);
+    }
+
+    /// A completed entry's addresses are applied even if a later entry never
+    /// finishes and the refresh is cancelled.
+    #[tokio::test]
+    async fn refresh_applies_completed_entry_before_slow_entry_finishes() {
+        let probe = ProbeResolver::new(Duration::from_millis(20));
+        let (d, pb) = probe_discovery(&probe, "fast.example.com;slow.example.com");
+        let res =
+            tokio::time::timeout(Duration::from_millis(500), d.refresh_phonebook_addresses()).await;
+        assert!(res.is_err(), "slow entry never completes");
+        assert_eq!(
+            pb.get_addresses(10, RELAY_ROLE),
+            vec!["relay.fast.example.com:4160".to_string()]
         );
     }
 
