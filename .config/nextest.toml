@@ -1,0 +1,25 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+# cargo-nextest configuration. The default profile is untouched (local runs
+# fail fast on the first flake so it is noticed). The `ci` profile is used by
+# .github/workflows/unit-tests.yml (`cargo nextest run --profile ci`).
+
+[profile.ci]
+# Run every test and list all failures in one log instead of stopping at the
+# first failing binary.
+fail-fast = false
+
+# Retry a failed test up to 2 more times; it only fails the job if it fails
+# every attempt. nextest reports a test that passed on a retry as FLAKY in the
+# log, so retried tests stay visible rather than being skipped silently.
+# Known load-sensitive tests on the shared 4-core runner (no test is excluded):
+#   - real-thread multi-node agreement harness quiescence detection,
+#     crates/core/algo-agreement/tests/service_multi_node_test.rs (issues #1693, #1695)
+#   - lookback_prefetch bounded-lookahead timing assertion (issue #1723)
+# Same retry count as the scheduled Coverage workflow (PR #1694).
+retries = 2
+
+# Flag tests that run suspiciously long (they are not killed).
+slow-timeout = { period = "60s" }

@@ -279,6 +279,21 @@ make test
 make fixtures && make test
 ```
 
+### CI: workspace unit tests (issue #1750)
+
+The `Unit Tests` workflow (`.github/workflows/unit-tests.yml`) runs on every
+pull request and on push to `main` (not path-filtered, so it always reports and
+can be a required check). Its single job is named
+**`Workspace unit tests (nextest)`**: `cargo nextest run --workspace --profile ci`
+followed by `cargo test --workspace --doc` (nextest does not run doctests).
+Reproduce locally with `cargo nextest run --workspace --profile ci`.
+
+Flaky tests are handled in `.config/nextest.toml` (`ci` profile: `retries = 2`,
+`fail-fast = false`); a test that passes on retry is logged as FLAKY, nothing is
+skipped. Known load-sensitive tests: the multi-node agreement harness (#1695)
+and `lookback_prefetch` (#1723). The scheduled `Coverage` workflow remains the
+coverage report only.
+
 ## Conformance Validation
 
 ```bash
