@@ -1110,6 +1110,10 @@ impl InnerTxnBuilder {
 // LedgerAvmContext
 // ---------------------------------------------------------------------------
 
+/// go's `EvalParams.txidCache`: group-index keyed TxID cache, shared (`Rc`)
+/// across the evaluators that share one go `EvalParams`.
+pub type GroupTxidCache = Rc<RefCell<HashMap<usize, algo_types::Digest>>>;
+
 /// AVM execution context backed by a `LedgerStore`.
 ///
 /// Wraps ledger state, the current transaction group, and execution metadata
@@ -1215,16 +1219,17 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     /// Keyed **only by numeric group index**, with no distinction between an
     /// outer-peer read (`gtxn N`/`txn`) and an inner read (`gitxn N`/`itxn`,
     /// which always reads index 0) at the same index -- go's own bug, being
-    /// reproduced bug-for-bug here. Only consulted for a top-level (`depth
-    /// == 0`) reading context when `!consensus.unify_inner_tx_ids`; see
+    /// reproduced bug-for-bug here. Consulted pre-v34 at every depth, and
+    /// under UnifyInnerTxIDs only by inner-appl readers (`peer_txid`); see
     /// [`Self::cached_txid`]. Never cleared for the lifetime of
     /// this context (matches go: the cache persists across multiple
     /// `itxn_submit` calls within the same top-level program execution).
     ///
     /// Shared (`Rc`) by every sibling of an inner group, like go's per-inner-
     /// group `EvalParams` (`NewInnerEvalParams` builds a fresh one per
-    /// `itxn_submit`); depth 0 owns its own.
-    txid_cache: Rc<RefCell<HashMap<usize, algo_types::Digest>>>,
+    /// `itxn_submit`); at depth 0 it is the top-level group's single cache,
+    /// shared by all of its app calls via `GroupInfo::txid_cache` (#1736).
+    txid_cache: GroupTxidCache,
     /// go's `EvalParams.innerTxidCache` (UnifyInnerTxIDs `itxn`/`gitxn` TxID
     /// reads, keyed by group index within the last inner group); reset after
     /// each successful submit (`cx.innerTxidCache = nil`).
@@ -2429,7 +2434,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             rewards_level,
             opcode_budget: 0,
             inner_txn_ids: Vec::new(),
-            txid_cache: Rc::new(RefCell::new(HashMap::new())),
+            txid_cache: GroupTxidCache::default(),
             inner_txid_cache: RefCell::new(HashMap::new()),
             caller_txids: None,
             created_assets: Vec::new(),
@@ -2488,6 +2493,13 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// call site.
     pub fn set_program_version(&mut self, version: u8) {
         self.program_version = version;
+    }
+
+    /// Replace this context's top-level txid cache with the group's shared
+    /// one (go: all app calls of a top-level group share one `EvalParams`,
+    /// hence one `txidCache`; issue #1736).
+    pub(crate) fn share_group_txid_cache(&mut self, cache: GroupTxidCache) {
+        self.txid_cache = cache;
     }
 
     /// Issue #1406: reproduces go-algorand's `getTxIDNotUnified`
@@ -5381,11 +5393,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 }),
             };
         }
-        // Issue #1406: pre-v34 (not UnifyInnerTxIDs), a top-level reading
-        // context's TxID reads (both `gtxn`/`txn` and `gitxn`/`itxn`) go
-        // through go's groupIndex-only-keyed `txidCache`, which can return a
-        // stale/colliding value shared with an inner-txn TxID read at the
-        // same numeric index. See `cached_txid`'s doc.
+        // Issue #1406: pre-v34 (not UnifyInnerTxIDs), every `gtxn`/`txn`
+        // TxID read goes through go's groupIndex-only-keyed `txidCache` --
+        // shared with inner-txn TxID reads and, at depth 0, with the other
+        // app calls of the top-level group (#1736) -- which can return a
+        // stale/colliding value. See `cached_txid`'s doc.
         // Issues #1701/#1712: an inner appl's own/peer TxID is go's
         // `InnerID(caller.currentTxID() | caller.txn.ID(), len(caller.InnerTxns)
         // +gi)`, not the raw hash (a unified depth-0 reader keeps `txn.ID()`).
@@ -7235,14 +7247,14 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         let last_txn = last_group.last().ok_or_else(|| AlgoError::Avm {
             message: "last_itxn_field: empty inner txn group".to_string(),
         })?;
-        // TxID (field 23) for inner txns uses the precomputed inner txn ID.
+        // TxID (field 23) goes through `inner_read_txid` (go `getTxID`
+        // inner=true).
         //
         // Issue #1406: pre-v34, go's `opItxn` always reads via the
         // groupIndex-only-keyed `txidCache` at index 0 (`gi = 0`, matching
         // `getLastInner()`'s single-element slice) rather than the
         // `InnerID`-salted value -- and that cache slot collides with a
-        // `gtxn 0`/`txn` (group_index 0) read at a top-level reading
-        // context. See `cached_txid`'s doc.
+        // `gtxn 0`/`txn` (group_index 0) read. See `cached_txid`'s doc.
         if field == 23 {
             let txid = self.inner_read_txid(&last_txn.txn, 0);
             return Ok(TealValue::Bytes(txid.0.to_vec()));
@@ -7268,12 +7280,13 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 ),
             });
         }
-        // TxID (field 23) for inner txns uses the precomputed inner txn ID.
+        // TxID (field 23) goes through `inner_read_txid` (go `getTxID`
+        // inner=true).
         //
         // Issue #1406: pre-v34, `gitxn N TxID` reads via the same
-        // groupIndex-only-keyed `txidCache` as `gtxn N`/`txn` (a top-level
-        // reading context), colliding whenever both are read at the same
-        // numeric index. See `cached_txid`'s doc.
+        // groupIndex-only-keyed `txidCache` as `gtxn N`/`txn`, colliding
+        // whenever both are read at the same numeric index. See
+        // `cached_txid`'s doc.
         if field == 23 {
             let txid = self.inner_read_txid(&last_group[group_index].txn, group_index);
             return Ok(TealValue::Bytes(txid.0.to_vec()));

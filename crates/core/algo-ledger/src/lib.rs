@@ -69,7 +69,7 @@ pub use apply::{
     apply_transaction_with_budget, apply_transaction_with_tracer, ApplyContext, ApplyData,
     ApplyMode, BoxBudgetState, GroupInfo, InnerApplyData,
 };
-pub use avm_context::{type_enum, LedgerAvmContext};
+pub use avm_context::{type_enum, GroupTxidCache, LedgerAvmContext};
 pub use block_header::{compute_load, make_next_block_header, next_bonus, next_congestion_tax};
 pub use eval_compare::{
     compare_eval_delta, CompareResult, EvalDeltaMismatchDetail, EvalDeltaStats, FieldMismatch,
