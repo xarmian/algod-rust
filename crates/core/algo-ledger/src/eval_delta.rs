@@ -1951,41 +1951,30 @@ mod tests {
         assert_eq!(keys, vec![0, 2]);
     }
 
-    /// Issue #1743: `SignedTransaction.eval_delta` must keep go's msgpack
-    /// `str` typing for non-UTF-8 `dt` keys / `bs` / `lg` through the plain
-    /// serde (`rmp_serde`) path as well as the canonical encoder.
+    /// Issue #1743: the serde form of `SignedTransaction.eval_delta` is not
+    /// wire-authoritative (non-UTF-8 `str` is written as `bin`), but it must be
+    /// lossless: after a `rmp_serde` round trip go's `str` typing of non-UTF-8
+    /// `dt` keys / `bs` / `lg` is restored, so the canonical encoder produces
+    /// the same block bytes (agreement crash persistence relies on this).
     #[test]
     fn eval_delta_non_utf8_str_survives_rmp_serde_round_trip() {
         let stx = appl_child_with_non_utf8_dt();
         let bytes = rmp_serde::to_vec_named(&stx).unwrap();
-        // Structural check with rmpv (keeps invalid-UTF-8 `str` distinct from
-        // `bin`): the serde-written `dt` carries `Value::String`, not `Binary`.
-        let top = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
-        let get = |v: &Value, k: &str| -> Value {
-            let Value::Map(m) = v else { panic!() };
-            m.iter()
-                .find(|(kk, _)| kk.as_str() == Some(k))
-                .unwrap()
-                .1
-                .clone()
-        };
-        let dt = get(&top, "dt");
-        let is_str = |v: &Value, b: u8| matches!(v, Value::String(s) if s.as_bytes() == [b]);
-        let Value::Map(gd) = get(&dt, "gd") else {
-            panic!()
-        };
-        assert!(
-            is_str(&gd[0].0, 0xff),
-            "gd key must be str, got {:?}",
-            gd[0].0
-        );
-        assert!(is_str(&get(&gd[0].1, "bs"), 0x80), "bs must be str");
-        let Value::Array(lg) = get(&dt, "lg") else {
-            panic!()
-        };
-        assert!(is_str(&lg[0], 0xfe), "lg must be str");
         let back: SignedTransaction = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(back.eval_delta, stx.eval_delta);
+        let dt = back.eval_delta.as_ref().unwrap();
+        let Value::Map(top) = dt else { panic!() };
+        let gd = &top
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("gd"))
+            .unwrap()
+            .1;
+        let Value::Map(gd) = gd else { panic!() };
+        assert!(
+            matches!(&gd[0].0, Value::String(s) if s.is_err() && s.as_bytes() == [0xff]),
+            "gd key must be a non-UTF-8 str, got {:?}",
+            gd[0].0
+        );
         assert_eq!(
             algo_codec::canonical_encode_signed_txn_in_block(&back),
             algo_codec::canonical_encode_signed_txn_in_block(&stx),
