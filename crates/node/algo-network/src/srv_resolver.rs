@@ -35,6 +35,9 @@ use std::time::Duration;
 
 use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
 use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::proto::op::ResponseCode;
+use hickory_resolver::proto::rr::RecordType;
+use hickory_resolver::proto::ProtoErrorKind;
 use hickory_resolver::{ResolveError, TokioResolver};
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -96,10 +99,83 @@ use tracing::{debug, info, warn};
 /// fallback added below) so that one hung/slow validation walk can never by
 /// itself consume the caller's whole startup window — it fails that one
 /// stage and lets `lookup_srv`'s existing `system -> fallback -> default`
-/// chain (plus the new last-resort stage) keep moving. Four stages at this
-/// budget (60s total worst case) still leave headroom inside a typical
-/// multi-minute node-startup window.
+/// chain (plus the new last-resort stage) keep moving.
+///
+/// Worst case (issue #1702): a stage whose resolver cannot serve the root
+/// DNSKEY fails after at most [`DNSSEC_PROBE_ATTEMPTS`] x
+/// [`DNSSEC_PROBE_ATTEMPT_TIMEOUT`] = 10 s plus one 200 ms retry pause
+/// (about 10.2 s), without ever starting the glue walk; a stage that passes
+/// the probe is bounded by this 15 s budget *including* the probe. Three
+/// validating stages therefore cost at most about 31 s against non-DNSSEC
+/// resolvers (45 s if each stage passed its probe and then hung), plus the
+/// last-resort lookup (15 s, no probe), still leaving headroom inside a
+/// typical multi-minute node-startup window.
 const DNSSEC_STAGE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Number of root-DNSKEY probe attempts per validating stage (issue #1702).
+/// A timed-out attempt and a transient resolver error (SERVFAIL, transport
+/// error; see [`HickorySrvResolver::probe_error_is_transient`]) are retried;
+/// a definitive negative answer (empty, NXDOMAIN, NSEC-proven) is final.
+const DNSSEC_PROBE_ATTEMPTS: u32 = 2;
+
+/// Budget of one root-DNSKEY probe attempt (issue #1702), so a probe costs at
+/// most `DNSSEC_PROBE_ATTEMPTS x DNSSEC_PROBE_ATTEMPT_TIMEOUT` = 10 s. The
+/// generous per-attempt budget lets hickory's own UDP retry and a TCP
+/// fallback for the ~1.2 KB root DNSKEY answer complete on a lossy or
+/// high-RTT link, so a slow but working resolver is not cut off.
+///
+/// Every DNSSEC chain of trust starts at the root DNSKEY RRset: go's
+/// `trustChain.ensure` (`tools/network/dnssec/trustchain.go`) authenticates
+/// zones from `.` downwards, and go bounds each DNS query by
+/// `dnssec.DefaultTimeout` = 1 s (`tools/network/dnssec/config.go:27`), so
+/// against a resolver that carries no DNSSEC data go's stage *fails* after a
+/// handful of one-second queries (`tools/network/bootstrap.go` then moves to
+/// the next resolver; go never downgrades a stage to unvalidated data).
+/// hickory instead walks DNSKEY/DS sub-queries for every additional-section
+/// glue name (`DnssecDnsHandle::verify_rrsets`, hickory-proto 0.25.2
+/// `dnssec/dnssec_dns_handle/mod.rs`), which against such a resolver runs to
+/// [`DNSSEC_STAGE_TIMEOUT`] per stage. A resolver that cannot serve a
+/// validating root DNSKEY answer cannot validate anything, so the probe fails
+/// that stage fast, exactly as a failed validating lookup would, and the
+/// chain moves on.
+const DNSSEC_PROBE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Pause before retrying a root-DNSKEY probe that failed with a transient
+/// resolver error such as SERVFAIL (issue #1702).
+const DNSSEC_PROBE_RETRY_DELAY: Duration = Duration::from_millis(200);
+
+/// The time budgets of one resolver stage; production uses
+/// [`StageTimeouts::PRODUCTION`], tests shrink them so stage behaviour can be
+/// exercised against in-process stub servers in real (not mocked) time.
+#[derive(Clone, Copy)]
+struct StageTimeouts {
+    /// Total budget of a stage, probe included.
+    stage: Duration,
+    /// Budget of one root-DNSKEY probe attempt.
+    probe_attempt: Duration,
+}
+
+impl StageTimeouts {
+    const PRODUCTION: Self = Self {
+        stage: DNSSEC_STAGE_TIMEOUT,
+        probe_attempt: DNSSEC_PROBE_ATTEMPT_TIMEOUT,
+    };
+
+    /// Worst-case duration of a stage whose probe fails: every attempt times
+    /// out, with a retry pause between attempts, capped by the stage budget.
+    #[cfg(test)]
+    fn failed_probe_stage_worst_case(&self) -> Duration {
+        (self.probe_attempt * DNSSEC_PROBE_ATTEMPTS
+            + DNSSEC_PROBE_RETRY_DELAY * (DNSSEC_PROBE_ATTEMPTS - 1))
+            .min(self.stage)
+    }
+
+    /// Worst-case probe time without pauses (attempts x attempt timeout).
+    #[cfg(test)]
+    fn probe_total(&self) -> Duration {
+        self.probe_attempt * DNSSEC_PROBE_ATTEMPTS
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -136,6 +212,13 @@ pub enum SrvResolveError {
     /// the configured address does not parse as an IP).
     #[error("fallback resolver not configured or address invalid")]
     FallbackNotConfigured,
+
+    /// The root-DNSKEY probe that precedes every validating stage failed
+    /// (timeout, resolver error such as SERVFAIL, or empty answer): the
+    /// resolver cannot serve DNSSEC data, as opposed to the SRV query itself
+    /// failing. The stage is failed without starting the SRV lookup.
+    #[error("DNS resolver cannot serve DNSSEC (root DNSKEY probe failed): {0}")]
+    DnssecProbeFailed(String),
 
     /// A resolver-stage attempt did not complete within
     /// [`DNSSEC_STAGE_TIMEOUT`] (issue #1614: guards against a hung/slow
@@ -428,41 +511,104 @@ impl HickorySrvResolver {
         Ok(records)
     }
 
-    /// [`Self::do_lookup`], bounded by [`DNSSEC_STAGE_TIMEOUT`] (issue
-    /// #1614). A stage that doesn't answer within budget fails with
-    /// [`SrvResolveError::Timeout`] instead of silently consuming the rest
-    /// of the caller's startup window.
-    async fn do_lookup_bounded(
+    /// One resolver stage (the single production path used by
+    /// [`SrvResolver::lookup_srv`] and [`Self::lookup_srv_via_stage`]).
+    ///
+    /// A validating `resolver` is first probed with
+    /// [`Self::probe_root_dnskey`]; if it cannot serve a validating root
+    /// DNSKEY answer the stage FAILS fast (like go, which fails the stage
+    /// rather than downgrading it; unvalidated data is only ever returned by
+    /// `lookup_srv`'s final last-resort step) and the glue-walking SRV lookup
+    /// never starts. The probe and the lookup together are bounded by
+    /// `timeouts.stage` (issue #1614/#1702).
+    async fn lookup_stage(
         resolver: &TokioResolver,
         srv_name: &str,
+        timeouts: StageTimeouts,
     ) -> Result<Vec<SrvRecord>, SrvResolveError> {
-        Self::do_lookup_bounded_with_timeout(resolver, srv_name, DNSSEC_STAGE_TIMEOUT).await
+        let stage = async {
+            if resolver.options().validate {
+                Self::probe_root_dnskey(resolver, timeouts.probe_attempt).await?;
+            }
+            Ok::<_, SrvResolveError>(Self::do_lookup(resolver, srv_name).await?)
+        };
+        Self::bound(stage, timeouts.stage).await
     }
 
-    /// [`Self::do_lookup_bounded`] with an explicit budget, split out so
-    /// tests can exercise the timeout path deterministically and quickly
-    /// instead of waiting out the real [`DNSSEC_STAGE_TIMEOUT`].
-    async fn do_lookup_bounded_with_timeout(
+    /// Ask the validating `resolver` for the root DNSKEY RRset (validated
+    /// against the trust anchor by hickory). A timeout, a resolver error
+    /// (e.g. SERVFAIL) or an empty answer counts as "cannot validate" and
+    /// fails the stage with [`SrvResolveError::DnssecProbeFailed`]. A
+    /// timed-out attempt and a transient resolver error (see
+    /// [`Self::probe_error_is_transient`]) are retried, up to
+    /// [`DNSSEC_PROBE_ATTEMPTS`] attempts in total (after
+    /// [`DNSSEC_PROBE_RETRY_DELAY`] for an error); the cause is logged at INFO
+    /// and carried in the returned error.
+    async fn probe_root_dnskey(
         resolver: &TokioResolver,
-        srv_name: &str,
-        budget: Duration,
-    ) -> Result<Vec<SrvRecord>, SrvResolveError> {
-        Self::bound(Self::do_lookup(resolver, srv_name), budget).await
+        attempt_timeout: Duration,
+    ) -> Result<(), SrvResolveError> {
+        for attempt in 1..=DNSSEC_PROBE_ATTEMPTS {
+            let last_attempt = attempt == DNSSEC_PROBE_ATTEMPTS;
+            let probe = resolver.lookup(".", RecordType::DNSKEY);
+            match tokio::time::timeout(attempt_timeout, probe).await {
+                Ok(Ok(_)) => return Ok(()),
+                Ok(Err(e)) => {
+                    if last_attempt || !Self::probe_error_is_transient(&e) {
+                        info!("DNS root DNSKEY probe failed ({e}); failing this stage");
+                        return Err(SrvResolveError::DnssecProbeFailed(e.to_string()));
+                    }
+                    info!("DNS root DNSKEY probe attempt {attempt} errored ({e}); retrying");
+                    tokio::time::sleep(DNSSEC_PROBE_RETRY_DELAY).await;
+                }
+                Err(_elapsed) => {
+                    info!("DNS root DNSKEY probe attempt {attempt} timed out");
+                }
+            }
+        }
+        let total = attempt_timeout * DNSSEC_PROBE_ATTEMPTS;
+        info!("DNS root DNSKEY probe timed out after {total:?}; failing this stage");
+        Err(SrvResolveError::DnssecProbeFailed(format!(
+            "timed out after {total:?}"
+        )))
+    }
+
+    /// A probe error worth one retry: everything except a definitive
+    /// negative answer (an empty NOERROR or NXDOMAIN answer, or a
+    /// DNSSEC-proven negative via NSEC). Note hickory's validating handle
+    /// reports an unauthenticated negative response, which includes a
+    /// SERVFAIL, as a plain protocol message error ("could not validate
+    /// negative response missing SOA", `dnssec_dns_handle::check_nsec`), and
+    /// drops records whose proof is bogus before that point, so a SERVFAIL
+    /// and a validation failure cannot be told apart by error kind; both
+    /// therefore get the single (cheap, 200 ms-paused) retry, which cannot
+    /// turn a failure into a success unless the resolver answers properly.
+    fn probe_error_is_transient(e: &ResolveError) -> bool {
+        match e.proto().map(|p| p.kind()) {
+            Some(ProtoErrorKind::NoRecordsFound { response_code, .. }) => !matches!(
+                response_code,
+                ResponseCode::NoError | ResponseCode::NXDomain
+            ),
+            Some(ProtoErrorKind::Nsec { .. }) => false,
+            _ => true,
+        }
     }
 
     /// Runs `fut` under a `budget`-length [`tokio::time::timeout`],
-    /// converting an elapsed deadline into [`SrvResolveError::Timeout`].
+    /// converting an elapsed deadline into [`SrvResolveError::Timeout`] and
+    /// the future's own error into [`SrvResolveError`].
     ///
-    /// Generic over the future so tests can exercise the timeout-conversion
-    /// path with a synthetic never-resolving future (`std::future::pending`)
-    /// instead of a real, network-bound DNS lookup — deterministic and fast,
-    /// no real waiting or network access required.
-    async fn bound<F>(fut: F, budget: Duration) -> Result<Vec<SrvRecord>, SrvResolveError>
+    /// The one timeout helper, used by [`Self::lookup_stage`] in production
+    /// and by tests, which also drive it with a synthetic never-resolving
+    /// future (`std::future::pending`) to exercise the timeout conversion
+    /// without a real, network-bound lookup.
+    async fn bound<T, E, F>(fut: F, budget: Duration) -> Result<T, SrvResolveError>
     where
-        F: Future<Output = Result<Vec<SrvRecord>, ResolveError>>,
+        F: Future<Output = Result<T, E>>,
+        E: Into<SrvResolveError>,
     {
         match tokio::time::timeout(budget, fut).await {
-            Ok(result) => Ok(result?),
+            Ok(result) => result.map_err(Into::into),
             Err(_elapsed) => Err(SrvResolveError::Timeout(budget)),
         }
     }
@@ -499,7 +645,7 @@ impl HickorySrvResolver {
         match stage {
             ResolverStage::System => {
                 let resolver = Self::system_resolver(self.validate_dnssec)?;
-                Ok(Self::do_lookup(&resolver, &srv_name).await?)
+                Self::lookup_stage(&resolver, &srv_name, StageTimeouts::PRODUCTION).await
             }
             ResolverStage::Fallback => {
                 let addr = self
@@ -508,11 +654,11 @@ impl HickorySrvResolver {
                     .ok_or(SrvResolveError::FallbackNotConfigured)?;
                 let resolver = Self::fallback_resolver(addr, self.validate_dnssec)
                     .ok_or(SrvResolveError::FallbackNotConfigured)?;
-                Ok(Self::do_lookup(&resolver, &srv_name).await?)
+                Self::lookup_stage(&resolver, &srv_name, StageTimeouts::PRODUCTION).await
             }
             ResolverStage::Default => {
                 let resolver = Self::default_resolver(self.validate_dnssec);
-                Ok(Self::do_lookup(&resolver, &srv_name).await?)
+                Self::lookup_stage(&resolver, &srv_name, StageTimeouts::PRODUCTION).await
             }
         }
     }
@@ -593,95 +739,139 @@ impl SrvResolver for HickorySrvResolver {
             // 2. Construct the SRV query name: _<service>._<protocol>.<name>
             let srv_name = format!("_{service}._{protocol}.{name}");
 
-            // 3. Try system resolver first.
-            let sys_err: String = match Self::system_resolver(self.validate_dnssec) {
-                Ok(resolver) => match Self::do_lookup_bounded(&resolver, &srv_name).await {
+            // 3. Build the stage resolvers and run the chain.
+            let validate = self.validate_dnssec;
+            let builders = ChainBuilders {
+                system: Box::new(move || Self::system_resolver(validate)),
+                fallback: self.fallback_dns.clone().map(|addr| {
+                    let log_addr = addr.clone();
+                    let build: FallbackBuilder =
+                        Box::new(move || Self::fallback_resolver(&addr, validate));
+                    (log_addr, build)
+                }),
+                default: Box::new(move || Self::default_resolver(validate)),
+                last_resort: validate.then(|| -> Box<dyn FnOnce() -> TokioResolver + Send> {
+                    Box::new(|| Self::default_resolver(false))
+                }),
+            };
+            Self::run_chain(&srv_name, builders, StageTimeouts::PRODUCTION).await
+        })
+    }
+}
+
+/// Builder of the fallback resolver (`None`: the address does not parse).
+type FallbackBuilder = Box<dyn FnOnce() -> Option<TokioResolver> + Send>;
+
+/// Lazy builders for the resolvers of one `lookup_srv` chain: each is only
+/// invoked when its stage is reached, so a successful first stage builds
+/// exactly one resolver.
+struct ChainBuilders {
+    system: Box<dyn FnOnce() -> Result<TokioResolver, ResolveError> + Send>,
+    /// Fallback address (for logging) and its builder (`None` result: the
+    /// address does not parse).
+    fallback: Option<(String, FallbackBuilder)>,
+    default: Box<dyn FnOnce() -> TokioResolver + Send>,
+    /// Non-validating resolver for the last resort; `None` when the operator
+    /// disabled DNSSEC (every stage was already non-validating).
+    last_resort: Option<Box<dyn FnOnce() -> TokioResolver + Send>>,
+}
+
+impl HickorySrvResolver {
+    /// The `system -> fallback -> default -> last resort` chain of
+    /// [`SrvResolver::lookup_srv`], over lazy resolver builders so tests can
+    /// drive it with in-process stub servers.
+    ///
+    /// Every validating stage goes through [`Self::lookup_stage`]; a stage
+    /// never returns unvalidated data. The last resort is tried exactly once,
+    /// only after all validating stages failed.
+    async fn run_chain(
+        srv_name: &str,
+        builders: ChainBuilders,
+        timeouts: StageTimeouts,
+    ) -> Result<Vec<SrvRecord>, SrvResolveError> {
+        let ChainBuilders {
+            system,
+            fallback,
+            default,
+            last_resort,
+        } = builders;
+        // 1. System resolver first.
+        let sys_err: String = match system() {
+            Ok(resolver) => match Self::lookup_stage(&resolver, srv_name, timeouts).await {
+                Ok(records) => return Ok(records),
+                Err(e) => {
+                    info!("DNS SRV lookup failed with system resolver: {e}");
+                    e.to_string()
+                }
+            },
+            Err(e) => {
+                info!("failed to create system resolver: {e}");
+                e.to_string()
+            }
+        };
+
+        // 2. If system fails and fallback is configured, try fallback.
+        let fb_err: String = match fallback {
+            Some((fallback_addr, build)) => match build() {
+                Some(resolver) => match Self::lookup_stage(&resolver, srv_name, timeouts).await {
                     Ok(records) => return Ok(records),
                     Err(e) => {
-                        info!("DNS SRV lookup failed with system resolver: {e}");
+                        info!(
+                            "DNS SRV lookup failed with fallback '{fallback_addr}' resolver: {e}"
+                        );
                         e.to_string()
                     }
                 },
+                None => "fallback address could not be parsed".to_string(),
+            },
+            None => "not configured".to_string(),
+        };
+
+        // 3. Default resolver (well-known public DNS).
+        let default_resolver = default();
+        let default_err: String =
+            match Self::lookup_stage(&default_resolver, srv_name, timeouts).await {
+                Ok(records) => return Ok(records),
                 Err(e) => {
-                    info!("failed to create system resolver: {e}");
+                    info!("DNS SRV lookup failed with default resolver: {e}");
                     e.to_string()
                 }
             };
 
-            // 4. If system fails and fallback is configured, try fallback.
-            let fb_err: String = if let Some(ref fallback_addr) = self.fallback_dns {
-                match Self::fallback_resolver(fallback_addr, self.validate_dnssec) {
-                    Some(resolver) => match Self::do_lookup_bounded(&resolver, &srv_name).await {
-                        Ok(records) => return Ok(records),
-                        Err(e) => {
-                            info!(
-                                "DNS SRV lookup failed with fallback '{fallback_addr}' resolver: {e}"
-                            );
-                            e.to_string()
-                        }
-                    },
-                    None => "fallback address could not be parsed".to_string(),
-                }
-            } else {
-                "not configured".to_string()
-            };
-
-            // 5. Try default resolver (well-known public DNS).
-            let default_resolver = Self::default_resolver(self.validate_dnssec);
-            let default_err: String =
-                match Self::do_lookup_bounded(&default_resolver, &srv_name).await {
-                    Ok(records) => return Ok(records),
-                    Err(e) => {
-                        info!("DNS SRV lookup failed with default resolver: {e}");
-                        e.to_string()
-                    }
-                };
-
-            // 6. Last resort (issue #1614): if every DNSSEC-validating stage
-            //    above failed or timed out, retry once through the default
-            //    resolver with DNSSEC validation switched off.
-            //
-            //    This does NOT weaken DNSSEC validation of the actual
-            //    queried SRV RRset in the normal case: every attempt above
-            //    already tried real DNSSEC validation first, and this stage
-            //    only runs after all three of them have already failed. It
-            //    exists specifically to work around hickory-proto's
-            //    `DnssecDnsHandle` validating far more than the queried
-            //    RRset (see `DNSSEC_STAGE_TIMEOUT`'s doc comment) in a way
-            //    that can consume a validating attempt's entire time budget
-            //    on additional-section glue this crate's own bootstrap flow
-            //    never reads (`discovery.rs` re-resolves each relay
-            //    hostname's address separately, non-DNSSEC, via
-            //    `TcpStream::connect`). Only reached when
-            //    `self.validate_dnssec` is true — an operator who already
-            //    disabled DNSSEC validation gets no extra stage here, since
-            //    every attempt above was already non-validating.
-            if self.validate_dnssec {
-                warn!(
-                    "all DNSSEC-validating DNS SRV lookup stages failed or timed out for \
-                     '{srv_name}' (system: {sys_err}; fallback: {fb_err}; default: \
-                     {default_err}); retrying once via the default resolver with DNSSEC \
-                     validation disabled as a last resort (see hickory-dns issue #3974 and \
-                     algod-rust issue #1614 for why this stage exists — this does not affect \
-                     the real-validation attempts already made above)"
-                );
-                let unvalidated_default_resolver = Self::default_resolver(false);
-                match Self::do_lookup_bounded(&unvalidated_default_resolver, &srv_name).await {
-                    Ok(records) => return Ok(records),
-                    Err(e) => {
-                        info!(
-                            "DNS SRV lookup also failed with DNSSEC-disabled last-resort \
-                             resolver: {e}"
-                        );
-                    }
+        // 4. Last resort (issue #1614): every validating stage above failed
+        //    or timed out, so retry once through the default resolver with
+        //    DNSSEC validation switched off. This is the ONLY place
+        //    unvalidated data can be returned, and only after ALL validating
+        //    stages failed (a later DNSSEC-capable stage therefore always
+        //    wins over an earlier resolver that cannot validate). It is a
+        //    deliberate availability fallback that go-algorand does not have
+        //    (go fails the whole lookup), kept from #1614 for hickory
+        //    glue-walk failures the bootstrap flow never reads
+        //    (`discovery.rs` re-resolves relay addresses separately). Only
+        //    present when `validate_dnssec` is set: an operator who already
+        //    disabled validation gets no extra stage.
+        if let Some(build) = last_resort {
+            let resolver = build();
+            warn!(
+                "all DNSSEC-validating DNS SRV lookup stages failed or timed out for '{srv_name}' \
+                 (system: {sys_err}; fallback: {fb_err}; default: {default_err}); retrying \
+                 once via the default resolver with DNSSEC validation disabled as a last \
+                 resort (hickory-dns #3974, algod-rust #1614/#1702)"
+            );
+            match Self::lookup_stage(&resolver, srv_name, timeouts).await {
+                Ok(records) => return Ok(records),
+                Err(e) => {
+                    info!(
+                        "DNS SRV lookup also failed with the DNSSEC-disabled last-resort resolver: {e}"
+                    );
                 }
             }
+        }
 
-            Err(SrvResolveError::AllResolversFailed {
-                system: sys_err,
-                fallback: fb_err,
-                default: default_err,
-            })
+        Err(SrvResolveError::AllResolversFailed {
+            system: sys_err,
+            fallback: fb_err,
+            default: default_err,
         })
     }
 }
@@ -1191,7 +1381,11 @@ mod tests {
     #[tokio::test]
     async fn bound_converts_elapsed_deadline_to_timeout_error() {
         let budget = Duration::from_millis(5);
-        let result = HickorySrvResolver::bound(std::future::pending(), budget).await;
+        let result = HickorySrvResolver::bound(
+            std::future::pending::<Result<Vec<SrvRecord>, SrvResolveError>>(),
+            budget,
+        )
+        .await;
         match result {
             Err(SrvResolveError::Timeout(d)) => assert_eq!(d, budget),
             other => panic!("expected SrvResolveError::Timeout({budget:?}), got: {other:?}"),
@@ -1210,10 +1404,12 @@ mod tests {
             weight: 1,
         };
         let expected = record.clone();
-        let result =
-            HickorySrvResolver::bound(async move { Ok(vec![record]) }, Duration::from_secs(5))
-                .await
-                .expect("fast future must resolve Ok, not time out");
+        let result = HickorySrvResolver::bound(
+            async move { Ok::<_, SrvResolveError>(vec![record]) },
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("fast future must resolve Ok, not time out");
         assert_eq!(result, vec![expected]);
     }
 
@@ -1237,14 +1433,25 @@ mod tests {
     /// `participate` startup window).
     #[test]
     fn dnssec_stage_timeout_leaves_startup_headroom() {
-        let worst_case_all_four_stages = DNSSEC_STAGE_TIMEOUT * 4;
+        let t = StageTimeouts::PRODUCTION;
+        // The probe (attempts + pause) fits inside the stage budget, leaving
+        // room for a real validating lookup to finish after it.
         assert!(
-            worst_case_all_four_stages < Duration::from_secs(90),
-            "four stages at {DNSSEC_STAGE_TIMEOUT:?} each should fit comfortably inside a \
-             2-minute startup window, got {worst_case_all_four_stages:?}"
+            t.probe_total() + DNSSEC_PROBE_RETRY_DELAY < t.stage,
+            "probe {:?} must fit inside the stage budget {:?}",
+            t.probe_total(),
+            t.stage
+        );
+        // Worst-case chain: three stages whose probe fails, then the
+        // (probe-less) last resort bounded by one stage budget.
+        let worst_chain = t.failed_probe_stage_worst_case() * 3 + t.stage;
+        assert!(
+            worst_chain < Duration::from_secs(90),
+            "worst-case chain {worst_chain:?} should fit comfortably inside a 2-minute \
+             startup window"
         );
         assert!(
-            DNSSEC_STAGE_TIMEOUT >= Duration::from_secs(5),
+            t.stage >= Duration::from_secs(5),
             "the budget must still allow a real (non-hung) DNSSEC validation to complete"
         );
     }
@@ -1509,11 +1716,16 @@ mod tests {
         assert_eq!(addrs, vec!["archival1.algorand.network:4160"]);
     }
 
-    // Issue #1702 root-cause evidence: in-process stub DNS server (no DNSSEC
-    // data, like systemd-resolved) -- a validating lookup issues a sequential
-    // DNSKEY/DS/... sub-query walk per additional-section glue name, so its
-    // wall time is (queries x RTT), while the non-validating lookup is 1 query.
+    // Issue #1702: in-process stub DNS servers (no DNSSEC data, like a
+    // systemd-resolved stub; an attacker that drops DNSKEY; a resolver that
+    // serves a signed root DNSKEY). Helpers here use hickory-internal APIs
+    // (trust anchors, RRSIG construction): may need updating on hickory
+    // upgrade.
     mod fake_dns {
+        use hickory_resolver::proto::dnssec::crypto::EcdsaSigningKey;
+        use hickory_resolver::proto::dnssec::rdata::{DNSSECRData, DNSKEY, RRSIG};
+        use hickory_resolver::proto::dnssec::tbs::TBS;
+        use hickory_resolver::proto::dnssec::{Algorithm, SigSigner, SigningKey, TrustAnchors};
         use hickory_resolver::proto::op::{Message, MessageType, ResponseCode};
         use hickory_resolver::proto::rr::rdata::{A, SRV};
         use hickory_resolver::proto::rr::{Name, RData, Record, RecordType};
@@ -1521,19 +1733,111 @@ mod tests {
         use std::str::FromStr;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::time::Duration;
 
         pub struct Fake {
             pub addr: SocketAddr,
             pub queries: Arc<AtomicUsize>,
+            /// Number of root DNSKEY queries seen (dropped ones included).
+            pub dnskey_queries: Arc<AtomicUsize>,
         }
 
-        pub async fn spawn(n_targets: usize) -> Fake {
+        /// How a stub treats DNSKEY queries for the root.
+        #[derive(Clone)]
+        pub enum Dnskey {
+            /// NOERROR with an empty answer (a resolver without DNSSEC data).
+            Empty,
+            /// No reply at all (dropped packet / on-path attacker).
+            Drop,
+            /// A root DNSKEY RRset signed by a test key.
+            Signed(Arc<SignedRoot>),
+            /// SERVFAIL for the first root DNSKEY query, then signed answers.
+            ServFailOnce(Arc<SignedRoot>),
+        }
+
+        pub struct SignedRoot {
+            pub anchor: TrustAnchors,
+            dnskey: Record,
+            rrsig: Record,
+        }
+
+        /// A signed root DNSKEY RRset (DNSKEY + RRSIG) plus the trust anchor
+        /// that authenticates it.
+        pub fn signed_root() -> SignedRoot {
+            let alg = Algorithm::ECDSAP256SHA256;
+            let pkcs8 = EcdsaSigningKey::generate_pkcs8(alg).unwrap();
+            let key = EcdsaSigningKey::from_pkcs8(&pkcs8, alg).unwrap();
+            let public = key.to_public_key().unwrap();
+            let dnskey_rdata = DNSKEY::from_key(&public);
+            let mut anchor = TrustAnchors::empty();
+            anchor.insert(&public);
+
+            let signer = SigSigner::dnssec(
+                dnskey_rdata.clone(),
+                Box::new(key),
+                Name::root(),
+                Duration::from_secs(3600),
+            );
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as u32;
+            let dnskey = Record::from_rdata(
+                Name::root(),
+                3600,
+                RData::DNSSEC(DNSSECRData::DNSKEY(dnskey_rdata)),
+            );
+            // One RRSIG parameter set: built empty to derive the TBS, then
+            // rebuilt with the signature.
+            let key_tag = signer.calculate_key_tag().unwrap();
+            let rrsig_with = |sig: Vec<u8>| {
+                RRSIG::new(
+                    RecordType::DNSKEY,
+                    alg,
+                    0,
+                    3600,
+                    now + 3600,
+                    now - 3600,
+                    key_tag,
+                    Name::root(),
+                    sig,
+                )
+            };
+            let tbs = TBS::from_rrsig(
+                &Record::from_rdata(Name::root(), 3600, rrsig_with(vec![])),
+                std::iter::once(&dnskey),
+            )
+            .unwrap();
+            let sig = signer.sign(&tbs).unwrap();
+            let rrsig = Record::from_rdata(
+                Name::root(),
+                3600,
+                RData::DNSSEC(DNSSECRData::RRSIG(rrsig_with(sig))),
+            );
+            SignedRoot {
+                anchor,
+                dnskey,
+                rrsig,
+            }
+        }
+
+        pub async fn spawn(n_targets: usize, dnskey: Dnskey) -> Fake {
+            spawn_with_delay(n_targets, Duration::ZERO, dnskey).await
+        }
+
+        /// Every reply is delayed by `delay` (simulated RTT; replies are
+        /// sent from per-request tasks so concurrent delays overlap).
+        pub async fn spawn_with_delay(n_targets: usize, delay: Duration, dnskey: Dnskey) -> Fake {
             let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let addr = sock.local_addr().unwrap();
             let queries = Arc::new(AtomicUsize::new(0));
             let q2 = queries.clone();
+            let dnskey_queries = Arc::new(AtomicUsize::new(0));
+            let dk2 = dnskey_queries.clone();
+            let sock = Arc::new(sock);
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 4096];
+                let mut servfail_sent = false;
                 loop {
                     let (n, peer) = match sock.recv_from(&mut buf).await {
                         Ok(x) => x,
@@ -1552,6 +1856,26 @@ mod tests {
                     resp.set_response_code(ResponseCode::NoError);
                     if let Some(q) = req.queries().first() {
                         resp.add_query(q.clone());
+                        if q.query_type() == RecordType::DNSKEY && q.name().is_root() {
+                            dk2.fetch_add(1, Ordering::SeqCst);
+                            match &dnskey {
+                                Dnskey::Drop => continue,
+                                Dnskey::Signed(root) => {
+                                    resp.add_answer(root.dnskey.clone());
+                                    resp.add_answer(root.rrsig.clone());
+                                }
+                                Dnskey::ServFailOnce(root) => {
+                                    if servfail_sent {
+                                        resp.add_answer(root.dnskey.clone());
+                                        resp.add_answer(root.rrsig.clone());
+                                    } else {
+                                        servfail_sent = true;
+                                        resp.set_response_code(ResponseCode::ServFail);
+                                    }
+                                }
+                                Dnskey::Empty => {}
+                            }
+                        }
                         if q.query_type() == RecordType::SRV {
                             for i in 0..n_targets {
                                 let t = Name::from_str(&format!("r{i}.example.test.")).unwrap();
@@ -1572,42 +1896,345 @@ mod tests {
                         resp.set_edns(edns);
                     }
                     let bytes = resp.to_vec().unwrap();
-                    let _ = sock.send_to(&bytes, peer).await;
+                    let sock = sock.clone();
+                    tokio::spawn(async move {
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                        let _ = sock.send_to(&bytes, peer).await;
+                    });
                 }
             });
-            Fake { addr, queries }
+            Fake {
+                addr,
+                queries,
+                dnskey_queries,
+            }
         }
-    }
 
-    /// Query-count (not wall-clock) pin of the #1702 root cause: a validating
-    /// lookup's sub-query count grows with the additional-section size, while
-    /// a non-validating one stays a single query. Asserts only the trend, not
-    /// hickory's exact per-name query count.
-    ///
-    /// Diagnostic: may need updating on hickory upgrade (it documents
-    /// hickory's additional-section validation behaviour, which this crate
-    /// cannot change).
-    #[tokio::test]
-    async fn validated_lookup_queries_grow_with_additional_section() {
-        async fn queries(targets: usize, validate: bool) -> usize {
-            let fake = fake_dns::spawn(targets).await;
+        /// Resolver pointed at `fake`; validating with `anchor` when given,
+        /// hickory's default (real root) trust anchor otherwise.
+        pub fn resolver(
+            fake: &Fake,
+            validate: bool,
+            anchor: Option<&TrustAnchors>,
+        ) -> super::TokioResolver {
+            use super::{apply_resolver_opts, TokioConnectionProvider};
+            use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig};
             let group =
                 NameServerConfigGroup::from_ips_clear(&[fake.addr.ip()], fake.addr.port(), true);
             let cfg = ResolverConfig::from_parts(None, vec![], group);
-            let r = HickorySrvResolver::build_resolver(cfg, validate);
-            let res = HickorySrvResolver::do_lookup_bounded(&r, "_algobootstrap._tcp.example.test")
-                .await
-                .expect("stub lookup");
+            let mut b =
+                super::TokioResolver::builder_with_config(cfg, TokioConnectionProvider::default());
+            apply_resolver_opts(b.options_mut(), validate);
+            if let Some(a) = anchor {
+                b = b.with_trust_anchor(Arc::new(a.clone()));
+            }
+            b.build()
+        }
+    }
+
+    use fake_dns::Dnskey;
+
+    const SRV_NAME: &str = "_algobootstrap._tcp.example.test";
+
+    /// Shrunk budgets so stub-server tests run in real time, fast.
+    const TEST_TIMEOUTS: StageTimeouts = StageTimeouts {
+        stage: Duration::from_secs(15),
+        probe_attempt: Duration::from_millis(300),
+    };
+
+    /// Diagnostic: a validating lookup's sub-query count grows with the
+    /// additional-section size (documents the #1702 root cause; may need
+    /// updating on hickory upgrade).
+    #[tokio::test]
+    async fn validated_lookup_queries_grow_with_additional_section() {
+        async fn queries(targets: usize, validate: bool) -> usize {
+            let fake = fake_dns::spawn(targets, Dnskey::Empty).await;
+            let r = fake_dns::resolver(&fake, validate, None);
+            let res = HickorySrvResolver::bound(
+                HickorySrvResolver::do_lookup(&r, SRV_NAME),
+                Duration::from_secs(20),
+            )
+            .await
+            .expect("stub lookup");
             assert_eq!(res.len(), targets);
             fake.queries.load(std::sync::atomic::Ordering::SeqCst)
         }
         assert_eq!(queries(10, false).await, 1);
-        assert_eq!(queries(20, false).await, 1);
         let small = queries(5, true).await;
         let large = queries(20, true).await;
         assert!(
             large > small && small > 1,
             "validating sub-queries should grow with glue names: {small} -> {large}"
         );
+    }
+
+    /// Builders for `run_chain` over pre-built stub resolvers; `built` counts
+    /// how many resolvers the chain actually asked to build.
+    fn chain(
+        sys: TokioResolver,
+        fb: Option<TokioResolver>,
+        def: TokioResolver,
+        last: Option<TokioResolver>,
+        built: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> ChainBuilders {
+        use std::sync::atomic::Ordering;
+        let b = built.clone();
+        let system: Box<dyn FnOnce() -> Result<TokioResolver, ResolveError> + Send> =
+            Box::new(move || {
+                b.fetch_add(1, Ordering::SeqCst);
+                Ok(sys)
+            });
+        let fallback = fb.map(|r| {
+            let b = built.clone();
+            let build: Box<dyn FnOnce() -> Option<TokioResolver> + Send> = Box::new(move || {
+                b.fetch_add(1, Ordering::SeqCst);
+                Some(r)
+            });
+            ("fallback".to_string(), build)
+        });
+        let b = built.clone();
+        let default: Box<dyn FnOnce() -> TokioResolver + Send> = Box::new(move || {
+            b.fetch_add(1, Ordering::SeqCst);
+            def
+        });
+        let last_resort = last.map(|r| {
+            let b = built.clone();
+            let build: Box<dyn FnOnce() -> TokioResolver + Send> = Box::new(move || {
+                b.fetch_add(1, Ordering::SeqCst);
+                r
+            });
+            build
+        });
+        ChainBuilders {
+            system,
+            fallback,
+            default,
+            last_resort,
+        }
+    }
+
+    fn counter() -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0))
+    }
+
+    /// (a) A stage whose resolver serves no DNSSEC data FAILS (no unvalidated
+    /// records) well inside the stage budget.
+    #[tokio::test]
+    async fn stage_without_dnssec_data_fails_within_probe_budget() {
+        let fake = fake_dns::spawn_with_delay(20, Duration::from_millis(5), Dnskey::Empty).await;
+        let r = fake_dns::resolver(&fake, true, None);
+        let started = std::time::Instant::now();
+        let res = HickorySrvResolver::lookup_stage(&r, SRV_NAME, TEST_TIMEOUTS).await;
+        let elapsed = started.elapsed();
+        assert!(res.is_err(), "must not return unvalidated records: {res:?}");
+        assert!(
+            elapsed <= TEST_TIMEOUTS.probe_total() * 10 && elapsed < TEST_TIMEOUTS.stage,
+            "stage took {elapsed:?}"
+        );
+    }
+
+    /// (c) A resolver that drops the DNSKEY query hits the real probe-timeout
+    /// branch: the stage fails with a timeout after the probe attempts.
+    #[tokio::test]
+    async fn stage_with_dropped_dnskey_times_out_within_probe_budget() {
+        let fake = fake_dns::spawn(20, Dnskey::Drop).await;
+        let r = fake_dns::resolver(&fake, true, None);
+        let started = std::time::Instant::now();
+        let res = HickorySrvResolver::lookup_stage(&r, SRV_NAME, TEST_TIMEOUTS).await;
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(res, Err(SrvResolveError::DnssecProbeFailed(_))),
+            "expected a probe failure, got {res:?}"
+        );
+        assert!(
+            elapsed >= TEST_TIMEOUTS.probe_attempt
+                && elapsed <= TEST_TIMEOUTS.probe_total() * 10
+                && elapsed < TEST_TIMEOUTS.stage,
+            "stage took {elapsed:?}"
+        );
+    }
+
+    /// (b) A resolver serving a signed root DNSKEY passes the probe and the
+    /// stage validates and returns the records.
+    #[tokio::test]
+    async fn dnssec_capable_stage_still_validates() {
+        let root = std::sync::Arc::new(fake_dns::signed_root());
+        let fake = fake_dns::spawn(5, Dnskey::Signed(root.clone())).await;
+        let r = fake_dns::resolver(&fake, true, Some(&root.anchor));
+        let res = HickorySrvResolver::lookup_stage(&r, SRV_NAME, TEST_TIMEOUTS)
+            .await
+            .expect("DNSSEC-capable stage must succeed");
+        assert_eq!(res.len(), 5);
+    }
+
+    /// A transient SERVFAIL on the probe must not fail the stage: resolution
+    /// eventually succeeds and the stub saw at least 2 DNSKEY queries (the
+    /// assertion is deliberately agnostic of whether our retry or hickory's
+    /// own retry issued the second one).
+    #[tokio::test]
+    async fn probe_servfail_once_is_retried() {
+        let root = std::sync::Arc::new(fake_dns::signed_root());
+        let fake = fake_dns::spawn(4, Dnskey::ServFailOnce(root.clone())).await;
+        let r = fake_dns::resolver(&fake, true, Some(&root.anchor));
+        let res = HickorySrvResolver::lookup_stage(&r, SRV_NAME, TEST_TIMEOUTS)
+            .await
+            .expect("one SERVFAIL must not fail the stage");
+        assert_eq!(res.len(), 4);
+        assert!(
+            fake.dnskey_queries
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2
+        );
+    }
+
+    /// Definitive negative answers are final; SERVFAIL-like and transport
+    /// errors (including hickory's message error for an unauthenticated
+    /// negative response) get the one retry.
+    #[test]
+    fn probe_error_classification() {
+        use hickory_resolver::proto::op::Query;
+        use hickory_resolver::proto::ProtoError;
+        fn no_records(code: ResponseCode) -> ResolveError {
+            ResolveError::from(ProtoError::from(ProtoErrorKind::NoRecordsFound {
+                query: Box::new(Query::new()),
+                soa: None,
+                ns: None,
+                negative_ttl: None,
+                response_code: code,
+                trusted: false,
+                authorities: None,
+            }))
+        }
+        let transient = HickorySrvResolver::probe_error_is_transient;
+        assert!(transient(&no_records(ResponseCode::ServFail)));
+        assert!(transient(&ResolveError::from(ProtoError::from(
+            ProtoErrorKind::Timeout
+        ))));
+        assert!(transient(&ResolveError::from(ProtoError::from(
+            "could not validate negative response missing SOA"
+        ))));
+        assert!(!transient(&no_records(ResponseCode::NoError)));
+        assert!(!transient(&no_records(ResponseCode::NXDomain)));
+    }
+
+    /// The probe failure is distinguishable from an SRV failure and survives
+    /// into the stringified per-resolver errors of `AllResolversFailed`.
+    #[tokio::test]
+    async fn probe_failure_is_distinguishable_in_chain_error() {
+        let sys = fake_dns::spawn(2, Dnskey::Empty).await;
+        let built = counter();
+        let res = HickorySrvResolver::run_chain(
+            SRV_NAME,
+            chain(
+                fake_dns::resolver(&sys, true, None),
+                None,
+                fake_dns::resolver(&sys, true, None),
+                None,
+                &built,
+            ),
+            TEST_TIMEOUTS,
+        )
+        .await;
+        match res {
+            Err(SrvResolveError::AllResolversFailed {
+                system, default, ..
+            }) => {
+                assert!(system.contains("cannot serve DNSSEC"), "{system}");
+                assert!(default.contains("cannot serve DNSSEC"), "{default}");
+            }
+            other => panic!("expected AllResolversFailed, got {other:?}"),
+        }
+    }
+
+    /// (d) An attacker-style first stage answers the SRV query with records
+    /// but drops DNSKEY: its records must NOT be accepted; the later
+    /// DNSSEC-capable stage wins, and the unvalidated last resort is never
+    /// even built.
+    #[tokio::test]
+    async fn attacker_stage_is_rejected_and_capable_stage_wins() {
+        let attacker = fake_dns::spawn(7, Dnskey::Drop).await;
+        let root = std::sync::Arc::new(fake_dns::signed_root());
+        let good = fake_dns::spawn(3, Dnskey::Signed(root.clone())).await;
+        let last = fake_dns::spawn(9, Dnskey::Empty).await;
+        let built = counter();
+
+        let started = std::time::Instant::now();
+        let res = HickorySrvResolver::run_chain(
+            SRV_NAME,
+            chain(
+                fake_dns::resolver(&attacker, true, Some(&root.anchor)),
+                Some(fake_dns::resolver(&good, true, Some(&root.anchor))),
+                fake_dns::resolver(&good, true, Some(&root.anchor)),
+                Some(fake_dns::resolver(&last, false, None)),
+                &built,
+            ),
+            TEST_TIMEOUTS,
+        )
+        .await
+        .expect("chain must succeed via the DNSSEC-capable stage");
+        assert_eq!(res.len(), 3, "records must come from the validating stage");
+        assert!(started.elapsed() < TEST_TIMEOUTS.probe_total() * 10 + Duration::from_secs(5));
+        // system + fallback only: neither default nor last resort was built.
+        assert_eq!(built.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// With ALL validating stages non-DNSSEC the chain reaches the unvalidated
+    /// last resort exactly once and returns its records; total time is
+    /// bounded by stages x probe budget plus the last resort.
+    #[tokio::test]
+    async fn all_stages_non_dnssec_reach_last_resort_once() {
+        let sys = fake_dns::spawn(4, Dnskey::Empty).await;
+        let fb = fake_dns::spawn(5, Dnskey::Drop).await;
+        let def = fake_dns::spawn(6, Dnskey::Empty).await;
+        let last = fake_dns::spawn(8, Dnskey::Empty).await;
+        let built = counter();
+
+        let started = std::time::Instant::now();
+        let res = HickorySrvResolver::run_chain(
+            SRV_NAME,
+            chain(
+                fake_dns::resolver(&sys, true, None),
+                Some(fake_dns::resolver(&fb, true, None)),
+                fake_dns::resolver(&def, true, None),
+                Some(fake_dns::resolver(&last, false, None)),
+                &built,
+            ),
+            TEST_TIMEOUTS,
+        )
+        .await
+        .expect("last resort returns the unvalidated records");
+        assert_eq!(res.len(), 8, "records come from the last resort");
+        assert!(
+            started.elapsed() < TEST_TIMEOUTS.stage,
+            "chain took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(built.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    /// A successful first stage builds exactly one resolver (no eager
+    /// construction of the fallback/default/last-resort resolvers).
+    #[tokio::test]
+    async fn successful_first_stage_builds_one_resolver() {
+        let root = std::sync::Arc::new(fake_dns::signed_root());
+        let good = fake_dns::spawn(2, Dnskey::Signed(root.clone())).await;
+        let built = counter();
+        let res = HickorySrvResolver::run_chain(
+            SRV_NAME,
+            chain(
+                fake_dns::resolver(&good, true, Some(&root.anchor)),
+                Some(fake_dns::resolver(&good, true, Some(&root.anchor))),
+                fake_dns::resolver(&good, true, Some(&root.anchor)),
+                Some(fake_dns::resolver(&good, false, None)),
+                &built,
+            ),
+            TEST_TIMEOUTS,
+        )
+        .await
+        .expect("first stage succeeds");
+        assert_eq!(res.len(), 2);
+        assert_eq!(built.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
