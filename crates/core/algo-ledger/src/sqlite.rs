@@ -2629,6 +2629,9 @@ impl SqliteLedger {
         .map_err(|e| AlgoError::Ledger {
             message: format!("synchronous pragma error: {e}"),
         })?;
+        // Issue #1678: time the WAL checkpoints SQLite runs on the committing
+        // thread (same PASSIVE auto-checkpoint, now observable).
+        crate::follow_timing::install_wal_checkpoint_hook(&conn);
 
         // G12 (TASK-109): refuse pre-v3 tracker DBs cleanly before
         // schema creation. Go's `performResourceTableMigration`

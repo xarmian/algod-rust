@@ -149,6 +149,31 @@ limit: 360) always fit. The stall rules keep applying during the follow
 window, and `summary.json` gains `follow` (`requested_s`, `observed_s`,
 `time_to_tip_s`, `completed`) alongside the unchanged `lag_rounds`, which
 covers every sample from the first tip sighting, i.e. the follow window.
+`lag_rounds` carries `mean`/`p50`/`p95`/`p99`/`max`.
+
+**Per-block follow-path timing (issue #1678).** The node's `/metrics` always
+exposes fixed-bucket histograms `algod_rust_follow_block_{apply,avm,commit,
+wal_checkpoint,ensure_block}_seconds` (buckets 1 ms ... 30 s plus `+Inf`):
+block apply (includes AVM), top-level AVM program evaluation (only blocks that
+ran programs, so its count is smaller), the SQLite commit, each WAL checkpoint
+run on the committing thread (the ledger connection's auto-checkpoint, timed),
+and the successful `ensure_block` attempt (ledger-lock wait plus commit,
+excluding earlier failed attempts and retry sleeps). Failures are visible
+separately: `..._apply_failed_seconds`, `..._ensure_block_failed_seconds`,
+`..._ensure_block_retries_total` and `..._ensure_block_already_committed_total`.
+Once the node is out of catchup, `status.jsonl` samples carry the parsed
+cumulative histograms (`follow_timing`), scraped at most every 30 s with a 1 s
+timeout so the poll cadence is unaffected (a persistent scrape failure is
+logged once to stderr). `summary.json` gains `follow_block_timing`: per
+metric `count`, `mean_s`, `p50_s`, `p95_s`, `max_s`, plus `baseline` and
+`restarted`. `baseline` is `"delta"` (last scrape minus the first scrape at
+the tip, i.e. the follow window) or `"absolute"` (no earlier scrape to subtract,
+or the node restarted between the scrapes: a counter or bucket went backwards,
+buckets are non-monotonic; then `restarted` is `true` and the post-restart
+absolute values are reported). Percentiles and `max_s` are **bucket upper
+bounds** (the `+Inf` bucket reports 30, i.e. "at least 30 s"). Use these next
+to `lag_rounds` to tell a slow apply from a slow commit or checkpoint when lag
+spikes.
 
 After teardown the job scans `node.log` (`monitor.py scan-log`, merged into
 `summary.json` as `log_scan`, rendered in the step summary):
@@ -221,7 +246,8 @@ Every run uploads `mainnet-node-soak-<run-id>`:
 
 - `node.log` — the participation node's full stdout/stderr.
 - `status.jsonl` — one record per poll: `ts`, the node's and peer's
-  `/v2/status` fields.
+  `/v2/status` fields, and (out of catchup) the parsed `follow_timing`
+  histograms from the node's `/metrics`.
 - `summary.json` — `monitor.py`'s verdict + timing/lag metrics (the same
   object the step summary table is built from).
 - On a halt: `block-<round>.msgpack` / `block-<round>.json` — the halted

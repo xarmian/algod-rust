@@ -34,6 +34,7 @@ pub mod delta_cache;
 pub mod erasable_db;
 pub mod eval_compare;
 pub mod eval_delta;
+pub mod follow_timing;
 pub mod genesis;
 pub mod heartbeat;
 pub mod heartbeat_builder;
