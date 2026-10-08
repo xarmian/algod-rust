@@ -284,7 +284,7 @@ fn test_gtxn_effects_created_asset_id_visible_to_sibling_appl() {
         index: 0,
         ran_program: &ran_program,
         scratch: &scratch,
-        txid_cache: group_txid_cache.clone(),
+        txid_cache: &group_txid_cache,
     };
     apply_transaction_with_budget(
         &mut state,
@@ -311,7 +311,7 @@ fn test_gtxn_effects_created_asset_id_visible_to_sibling_appl() {
         index: 1,
         ran_program: &ran_program,
         scratch: &scratch,
-        txid_cache: group_txid_cache.clone(),
+        txid_cache: &group_txid_cache,
     };
     apply_transaction_with_budget(
         &mut state,
@@ -489,7 +489,7 @@ int 1
         index: 0,
         ran_program: &ran_program,
         scratch: &scratch,
-        txid_cache: group_txid_cache.clone(),
+        txid_cache: &group_txid_cache,
     };
     apply_transaction_with_budget(
         &mut state,
@@ -508,7 +508,7 @@ int 1
         index: 1,
         ran_program: &ran_program,
         scratch: &scratch,
-        txid_cache: group_txid_cache.clone(),
+        txid_cache: &group_txid_cache,
     };
     apply_transaction_with_budget(
         &mut state,

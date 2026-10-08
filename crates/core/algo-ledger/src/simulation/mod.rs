@@ -741,7 +741,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                         index: i,
                         ran_program: &ran_program,
                         scratch: &scratch,
-                        txid_cache: group_txid_cache.clone(),
+                        txid_cache: &group_txid_cache,
                     };
                     apply_transaction_with_budget(
                         self.store,

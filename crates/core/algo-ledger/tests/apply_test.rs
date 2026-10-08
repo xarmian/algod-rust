@@ -2258,7 +2258,7 @@ fn test_gload_errors_on_sibling_clear_state_txn_that_never_ran_a_program() {
         index: 0,
         ran_program: &ran_program,
         scratch: &scratch,
-        txid_cache: group_txid_cache.clone(),
+        txid_cache: &group_txid_cache,
     };
     apply_transaction_with_budget(
         &mut state,
@@ -2281,7 +2281,7 @@ fn test_gload_errors_on_sibling_clear_state_txn_that_never_ran_a_program() {
         index: 1,
         ran_program: &ran_program,
         scratch: &scratch,
-        txid_cache: group_txid_cache.clone(),
+        txid_cache: &group_txid_cache,
     };
     let result = apply_transaction_with_budget(
         &mut state,
@@ -2397,7 +2397,7 @@ fn test_gload_returns_sibling_real_scratch_value_not_zero_placeholder() {
         index: 0,
         ran_program: &ran_program,
         scratch: &scratch,
-        txid_cache: group_txid_cache.clone(),
+        txid_cache: &group_txid_cache,
     };
     apply_transaction_with_budget(
         &mut state,
@@ -2421,7 +2421,7 @@ fn test_gload_returns_sibling_real_scratch_value_not_zero_placeholder() {
         index: 1,
         ran_program: &ran_program,
         scratch: &scratch,
-        txid_cache: group_txid_cache.clone(),
+        txid_cache: &group_txid_cache,
     };
     apply_transaction_with_budget(
         &mut state,
@@ -2535,7 +2535,7 @@ fn write_budget_combined_oversized_create_calls_in_one_group_rejected() {
         index: 0,
         ran_program: &ran_program,
         scratch: &scratch,
-        txid_cache: group_txid_cache.clone(),
+        txid_cache: &group_txid_cache,
     };
     // App A alone: its own 59 extra bytes fit comfortably under the
     // 60-byte shared io_budget.
@@ -2556,7 +2556,7 @@ fn write_budget_combined_oversized_create_calls_in_one_group_rejected() {
         index: 1,
         ran_program: &ran_program,
         scratch: &scratch,
-        txid_cache: group_txid_cache.clone(),
+        txid_cache: &group_txid_cache,
     };
     // App B, sharing `group_box_budget` with app A: the COMBINED extra bytes
     // (118) must exceed the shared 60-byte io_budget and reject, even
@@ -2619,7 +2619,7 @@ fn write_budget_combined_oversized_create_calls_without_group_sharing_wrongly_ac
         index: 0,
         ran_program: &ran_program,
         scratch: &scratch,
-        txid_cache: group_txid_cache.clone(),
+        txid_cache: &group_txid_cache,
     };
     apply_transaction_with_budget(
         &mut state,
@@ -2638,7 +2638,7 @@ fn write_budget_combined_oversized_create_calls_without_group_sharing_wrongly_ac
         index: 1,
         ran_program: &ran_program,
         scratch: &scratch,
-        txid_cache: group_txid_cache.clone(),
+        txid_cache: &group_txid_cache,
     };
     apply_transaction_with_budget(
         &mut state,

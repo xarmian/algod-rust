@@ -133,4 +133,63 @@ fn v34_group_does_not_share_txid_cache() {
         gtxn0, inner_id,
         "v34+: top-level reader never uses the cache"
     );
+    // The plain, unsalted id of the (genesis-restored) top-level txn 0.
+    let mut txn0 = call(APP0).txn;
+    txn0.genesis_id = "test-net-v1".into();
+    txn0.genesis_hash = [7u8; 32];
+    assert_eq!(
+        gtxn0,
+        algo_codec::compute_txn_id(&txn0).0.to_vec(),
+        "v34+: app 1's `gtxn 0 TxID` is txn 0's real id"
+    );
+}
+
+/// Same two-app group through the simulator: it drives `GroupInfo` itself
+/// and must share the cache across the group's app calls too.
+fn run_simulated(proto: &str) -> (Vec<u8>, Vec<u8>) {
+    use algo_ledger::simulation::{SimulationRequest, Simulator};
+    let mut s = LedgerState::new();
+    s.fee_sink = Address([0xFE; 32]);
+    s.protocol = proto.to_string();
+    s.get_or_default_account_mut(&Address([0xAA; 32]))
+        .micro_algos = 100_000_000;
+    s.get_or_default_account_mut(&Address(algo_ledger::avm_context::app_address(APP0)))
+        .micro_algos = 10_000_000;
+    seed(&mut s, APP0, app0_program());
+    seed(&mut s, APP1, app1_program());
+    let request = SimulationRequest {
+        txn_groups: vec![vec![call(APP0), call(APP1)]],
+        allow_empty_signatures: true,
+        ..Default::default()
+    };
+    let result = Simulator::new(&mut s).simulate(request).expect("simulate");
+    let group = &result.txn_groups[0];
+    assert!(
+        group.failure_message.is_none(),
+        "{:?}",
+        group.failure_message
+    );
+    let log = |i: usize| {
+        let ad = group.txn_results[i]
+            .apply_data
+            .as_ref()
+            .expect("apply data");
+        let ed = parse_eval_delta(ad.eval_delta.as_ref().expect("eval delta")).unwrap();
+        let logs = ed.logs.expect("logs");
+        assert_eq!(logs.len(), 1);
+        logs[0].clone()
+    };
+    (log(0), log(1))
+}
+
+#[test]
+fn simulate_pre_v34_group_shares_txid_cache_across_app_calls() {
+    let (inner_id, gtxn0) = run_simulated(CONSENSUS_V33);
+    assert_eq!(gtxn0, inner_id);
+}
+
+#[test]
+fn simulate_v34_group_does_not_share_txid_cache() {
+    let (inner_id, gtxn0) = run_simulated(CONSENSUS_V34);
+    assert_ne!(gtxn0, inner_id);
 }

@@ -1112,6 +1112,9 @@ impl InnerTxnBuilder {
 
 /// go's `EvalParams.txidCache`: group-index keyed TxID cache, shared (`Rc`)
 /// across the evaluators that share one go `EvalParams`.
+/// At depth 0 exactly one instance lives per top-level group evaluation: it
+/// is created by `apply_group_transactions` and by the simulator's group
+/// loop, carried in `GroupInfo::txid_cache`, and dropped with the group.
 pub type GroupTxidCache = Rc<RefCell<HashMap<usize, algo_types::Digest>>>;
 
 /// AVM execution context backed by a `LedgerStore`.
@@ -2521,6 +2524,11 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// (`data/transactions/logic/evalAppTxn_test.go`), ported at
     /// `inner_txid_caching_go_test_inner_txid_caching_port` below.
     ///
+    /// At depth 0 the cache is the top-level group's single shared
+    /// [`GroupTxidCache`] (`GroupInfo::txid_cache`): collisions span sibling
+    /// app calls of the group, exactly like go's shared `EvalParams`
+    /// (issue #1736).
+    ///
     /// For a nested (`caller_txids` set) reader this is go's `cx.caller !=
     /// nil` branch: `InnerID(caller.txn.ID(), len(caller.InnerTxns)+gi)`
     /// (issues #1701/#1712), over the inner group's shared cache.
@@ -2554,6 +2562,9 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// pre-v34 (`getTxIDNotUnified`), and under UnifyInnerTxIDs for an inner
     /// appl (`cx.caller != nil`); `None` for a unified depth-0 reader, whose
     /// value is the plain `txn.ID()` (no cache needed).
+    /// At depth 0 pre-v34 the cache read here is the group-wide shared
+    /// [`GroupTxidCache`], so it may hold a value cached by a sibling app
+    /// call (issue #1736).
     fn peer_txid(
         &self,
         txn: &algo_types::Transaction,
