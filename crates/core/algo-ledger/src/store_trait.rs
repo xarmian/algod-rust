@@ -438,12 +438,32 @@ pub trait LedgerStore {
     ///
     /// `None` (the default) means this store cannot faithfully roll back a
     /// scratch block apply, so [`crate::shadow_execute`] skips it.
-    fn save_scratch_state(&self) -> Option<Box<dyn std::any::Any>> {
+    fn save_scratch_state(&mut self) -> Option<Box<dyn std::any::Any>> {
         None
     }
 
     /// Restore state captured by [`Self::save_scratch_state`].
     fn restore_scratch_state(&mut self, _saved: Box<dyn std::any::Any>) {}
+
+    /// Weak fingerprint of the per-round persistent tracker rows a real block
+    /// apply writes after the scratch early return: for the block store,
+    /// txtail, online-params tail and the state-proof voters tables, the
+    /// min/max round key plus the content of the newest rows only. It does
+    /// NOT cover the trie hash nodes (`accounthashes`), account/resource/kv
+    /// tables, or older rows. A scratch apply must leave it unchanged even
+    /// before its rollback. Debug-only invariant checks use it; `None`
+    /// (default, or an unreadable table) = unsupported/skipped.
+    fn tracker_rows_fingerprint(&self) -> Option<u64> {
+        None
+    }
+
+    /// Fingerprint of the in-memory ledger state a scratch apply must leave
+    /// unchanged once rolled back: the lease table, the trie pre-mutation log
+    /// and the pending totals delta (the tracker rows are covered separately
+    /// by [`Self::tracker_rows_fingerprint`]). `None` (default) = unsupported.
+    fn scratch_invariant_fingerprint(&self) -> Option<u64> {
+        None
+    }
 
     // ---- Min balance ----
 

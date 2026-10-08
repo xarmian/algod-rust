@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use algo_error::AlgoError;
-use algo_types::{AccountData, Address, Block};
+use algo_types::{AccountData, Address, Block, Transaction};
 
 use crate::apply::{apply_block_impl_ex, ApplyData, ApplyMode, KvModsMap};
 use crate::eval_delta::{parse_eval_delta, EvalDelta, ValueDelta};
@@ -94,7 +94,8 @@ static SKIP_WARNED: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 thread_local! {
     /// 0 = none, 1 = pretend the store cannot roll back, 2 = scratch Execute
-    /// returns an error, 3 = scratch Execute panics.
+    /// returns an error, 3 = scratch Execute panics, 4/5 = leaky scratch
+    /// (see `inject_leak`).
     static TEST_HOOK: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 #[cfg(test)]
@@ -104,7 +105,7 @@ fn test_hook() -> u8 {
 
 /// `save_scratch_state` with the test-only "unsupported store" injection
 /// compiled out of production builds.
-fn scratch_state<L: LedgerStore>(store: &L) -> Option<Box<dyn std::any::Any>> {
+fn scratch_state<L: LedgerStore>(store: &mut L) -> Option<Box<dyn std::any::Any>> {
     #[cfg(test)]
     if test_hook() == 1 {
         return None;
@@ -272,6 +273,7 @@ fn clip(s: String) -> String {
 
 /// Chain-level in-memory fields a block apply rewrites and
 /// `restore_snapshot` does not cover.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ChainFields {
     round: algo_types::Round,
     level: u64,
@@ -309,6 +311,103 @@ impl ChainFields {
         s.set_rewards_pool(self.pool);
         s.set_protocol(self.protocol);
         s.set_txn_counter(self.txn_counter);
+    }
+}
+
+/// Scratch-invariant violations seen since process start (debug builds only
+/// evaluate the checks; always 0 in release).
+static INVARIANT_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of scratch-invariant violations logged since process start.
+pub fn shadow_execute_invariant_violations() -> u64 {
+    INVARIANT_VIOLATIONS.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test strict mode (default on): a violation panics so leaky-stub tests
+    /// can assert it. Non-test builds never panic.
+    static TEST_STRICT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Record an invariant violation: error log + counter, never a panic outside
+/// test strict mode (the diagnostic must not take block sync down).
+fn invariant_violation(msg: &str) {
+    INVARIANT_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+    tracing::error!("shadow_execute_invariant_violation: {msg}");
+    #[cfg(test)]
+    if TEST_STRICT.with(|s| s.get()) {
+        panic!("{msg}");
+    }
+}
+
+/// Debug-only guard (issue #1721) that a scratch Execute pass is fully
+/// invisible: it leaves the persistent tracker rows alone (the "KEEP IN SYNC"
+/// early return in `apply_block_impl_ex`) and, once rolled back, leaves the
+/// tracker/lease/chain-field/trie-log state exactly as it found it. Compiled
+/// to a no-op capture in release builds (`cfg!(debug_assertions)`).
+struct ScratchInvariant {
+    tracker: Option<u64>,
+    full: Option<u64>,
+    chain: Option<ChainFields>,
+}
+
+impl ScratchInvariant {
+    fn capture<L: LedgerStore>(store: &L, chain: &ChainFields) -> Self {
+        if !cfg!(debug_assertions) {
+            return Self {
+                tracker: None,
+                full: None,
+                chain: None,
+            };
+        }
+        Self {
+            tracker: store.tracker_rows_fingerprint(),
+            full: store.scratch_invariant_fingerprint(),
+            chain: Some(chain.clone()),
+        }
+    }
+
+    /// After the scratch Execute pass, before any rollback: the pass must not
+    /// have written a persistent tracker row.
+    fn check_scratch_pass<L: LedgerStore>(&self, store: &L) {
+        if self.tracker.is_some() && self.tracker != store.tracker_rows_fingerprint() {
+            invariant_violation(
+                "shadow-execute: scratch pass changed the newest per-round tracker rows (block store/txtail/online-params/voters; accounthashes not covered); the real apply may have gained a tracker write above the scratch early return in apply_block_impl_ex",
+            );
+        }
+    }
+
+    /// After every rollback step: nothing of the scratch pass may remain.
+    fn check_rolled_back<L: LedgerStore>(&self, store: &L) {
+        if (self.full.is_some() && self.full != store.scratch_invariant_fingerprint())
+            || (self.tracker.is_some() && self.tracker != store.tracker_rows_fingerprint())
+        {
+            invariant_violation(
+                "shadow-execute: scratch rollback left lease/trie-log/totals state or the newest tracker rows changed",
+            );
+        }
+        if let Some(chain) = &self.chain {
+            if *chain != ChainFields::capture(store) {
+                invariant_violation("shadow-execute: scratch rollback left chain fields changed");
+            }
+        }
+    }
+}
+
+/// Test-only leaks injected between the scratch pass and the invariant
+/// checks: 4 = persistent tracker row written by the scratch pass, 5 = state
+/// left behind after the rollback.
+#[cfg(test)]
+fn inject_leak<L: LedgerStore>(store: &mut L, phase: u8) {
+    if test_hook() != phase {
+        return;
+    }
+    match phase {
+        4 => {
+            let _ = store.put_txtail(9_999, b"leak");
+        }
+        _ => store.record_lease(&Address([0xEE; 32]), &[0xEE; 32], 9),
     }
 }
 
@@ -683,6 +782,7 @@ pub fn shadow_check_replay_block<L: LedgerStore>(
 
     // ---- scratch Execute evaluation, rolled back ----
     let chain = ChainFields::capture(store);
+    let invariant = ScratchInvariant::capture(store, &chain);
     let sp = store.snapshot(&[]);
     let mut exec_ad: Vec<ApplyData> = Vec::with_capacity(block.payset.len());
     let mut exec_kv = KvModsMap::new();
@@ -703,9 +803,15 @@ pub fn shadow_check_replay_block<L: LedgerStore>(
             ResourceTouches::default(),
         )
     });
+    #[cfg(test)]
+    inject_leak(store, 4);
+    invariant.check_scratch_pass(store);
     store.restore_snapshot(sp);
     chain.restore(store);
     store.restore_scratch_state(aux);
+    #[cfg(test)]
+    inject_leak(store, 5);
+    invariant.check_rolled_back(store);
 
     // ---- the real Replay apply ----
     let mut replay_ad: Vec<ApplyData> = Vec::with_capacity(block.payset.len());
@@ -863,48 +969,99 @@ fn diff_state_delta(
     }
 }
 
-/// Split a pretty-`Debug` struct dump into its top-level `(field, body)` pairs.
-fn top_level_fields(dbg: &str) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    for line in dbg.lines().skip(1) {
-        if line == "}" {
-            continue;
-        }
-        if line.starts_with("    ") && !line.starts_with("     ") {
-            if let Some((name, rest)) = line.trim().split_once(": ") {
-                out.push((name.to_string(), rest.to_string()));
-                continue;
-            }
-        }
-        if let Some(last) = out.last_mut() {
-            last.1.push(' ');
-            last.1.push_str(line.trim());
-        }
+/// One diff per `Transaction` field whose typed value differs, named
+/// `<path>.txn.<field>` (struct declaration order). The field list is checked
+/// exhaustively at compile time: the destructuring pattern below names every
+/// `Transaction` field with no `..`, so adding a field to the struct fails to
+/// compile here until it is added to the list.
+fn txn_field_diffs(path: &str, rec: &Transaction, comp: &Transaction, out: &mut Vec<FieldDiff>) {
+    macro_rules! typed_txn_diffs {
+        ([$($f:ident),* $(,)?]) => {
+            let Transaction { $($f: _),* } = rec;
+            $(
+                if rec.$f != comp.$f {
+                    out.push((
+                        format!("{path}.txn.{}", stringify!($f)),
+                        clip(format!("{:?}", rec.$f)),
+                        clip(format!("{:?}", comp.$f)),
+                    ));
+                }
+            )*
+        };
     }
-    out
+    typed_txn_diffs!([
+        txn_type,
+        sender,
+        fee,
+        first_valid,
+        last_valid,
+        note,
+        genesis_id,
+        genesis_hash,
+        group,
+        lease,
+        rekey_to,
+        amount,
+        receiver,
+        close_remainder_to,
+        xaid,
+        asset_amount,
+        asset_sender,
+        asset_receiver,
+        asset_close_to,
+        config_asset,
+        asset_params,
+        freeze_asset,
+        freeze_account,
+        asset_frozen,
+        application_id,
+        on_completion,
+        approval_program,
+        clear_state_program,
+        app_arguments,
+        accounts,
+        foreign_apps,
+        foreign_assets,
+        boxes,
+        global_state_schema,
+        local_state_schema,
+        extra_program_pages,
+        vote_pk,
+        selection_pk,
+        state_proof_pk,
+        vote_first,
+        vote_last,
+        vote_key_dilution,
+        non_participation,
+        state_proof_type,
+        state_proof,
+        state_proof_message,
+        heartbeat,
+        access,
+        reject_version
+    ]);
 }
 
-/// One diff per top-level transaction field whose pretty-`Debug` body differs,
-/// named `<path>.txn.<field>`.
-fn txn_field_diffs(path: &str, rec: &str, comp: &str, out: &mut Vec<FieldDiff>) {
-    let (r, c) = (top_level_fields(rec), top_level_fields(comp));
-    let mut names: Vec<&String> = Vec::new();
-    for (n, _) in r.iter().chain(c.iter()) {
-        if !names.contains(&n) {
-            names.push(n);
-        }
-    }
-    for n in names {
-        let rb = r.iter().find(|(m, _)| m == n).map(|(_, b)| b.as_str());
-        let cb = c.iter().find(|(m, _)| m == n).map(|(_, b)| b.as_str());
-        if rb != cb {
-            out.push((
-                format!("{path}.txn.{n}"),
-                clip(rb.unwrap_or("<absent>").to_string()),
-                clip(cb.unwrap_or("<absent>").to_string()),
-            ));
-        }
-    }
+/// Fallback entry `<path>.txn` for inner transactions whose canonical
+/// encodings differ while every typed field compares equal: encoded lengths
+/// and the first differing byte offset.
+fn encoding_only_diff(path: &str, enc_rec: &[u8], enc_comp: &[u8], out: &mut Vec<FieldDiff>) {
+    let first = enc_rec
+        .iter()
+        .zip(enc_comp)
+        .position(|(a, b)| a != b)
+        .unwrap_or(enc_rec.len().min(enc_comp.len()));
+    out.push((
+        format!("{path}.txn"),
+        format!(
+            "encoded {} bytes, first difference at byte {first}",
+            enc_rec.len()
+        ),
+        format!(
+            "encoded {} bytes, first difference at byte {first}",
+            enc_comp.len()
+        ),
+    ));
 }
 
 /// Compare one pair of recorded/computed `dt` values with `EvalDelta.Equal`
@@ -1016,7 +1173,13 @@ fn diff_eval_delta(
             algo_codec::canonical_encode_transaction(&b.txn),
         );
         if ea != eb {
-            txn_field_diffs(&p, &format!("{:#?}", a.txn), &format!("{:#?}", b.txn), out);
+            let before = out.len();
+            txn_field_diffs(&p, &a.txn, &b.txn, out);
+            if out.len() == before {
+                // Canonical encodings differ yet no typed field does: never
+                // record the mismatch with zero entries.
+                encoding_only_diff(&p, &ea, &eb, out);
+            }
         }
         macro_rules! scalar {
             ($($f:ident),*) => {$(
@@ -1738,7 +1901,7 @@ mod tests {
         );
         assert_eq!(d.len(), 1, "{d:#?}");
         assert_eq!(d[0].field, "eval_delta.inner_txns[0].txn.amount");
-        assert!(d[0].replay == "10," && d[0].execute == "11,", "{:?}", d[0]);
+        assert!(d[0].replay == "10" && d[0].execute == "11", "{:?}", d[0]);
         assert!(cmp_one(
             |s| s.eval_delta = itx(10),
             ApplyData {
@@ -1796,6 +1959,75 @@ mod tests {
         let d = compare_recorded_apply_data(&recorded, &ads);
         assert_eq!(d.len(), 1, "{d:#?}");
         assert_eq!(d[0].field, "application_id");
+    }
+
+    /// Synthetic inner transaction differing in several typed fields, used by
+    /// the golden mismatch-output test.
+    fn golden_inner(variant: bool) -> Value {
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = "pay".into();
+        stx.txn.sender = SENDER;
+        stx.txn.receiver = RECEIVER;
+        stx.txn.amount = if variant { 11 } else { 10 };
+        stx.txn.fee = if variant { 0 } else { 1_000 };
+        stx.txn.group = if variant { [0u8; 32] } else { [7u8; 32] };
+        stx.txn.rekey_to = if variant { Some(FEE_SINK) } else { None };
+        stx.txn.genesis_id = if variant {
+            "b-v1".into()
+        } else {
+            String::new()
+        };
+        let bytes = rmp_serde::to_vec_named(&stx).unwrap();
+        rmpv::decode::read_value(&mut &bytes[..]).unwrap()
+    }
+
+    #[test]
+    fn inner_txn_mismatch_output_golden() {
+        let itx = |v: bool| {
+            dt(vec![(
+                Value::from("itx"),
+                Value::Array(vec![golden_inner(v)]),
+            )])
+        };
+        let d = cmp_one(
+            |s| s.eval_delta = itx(false),
+            ApplyData {
+                eval_delta: itx(true),
+                ..Default::default()
+            },
+        );
+        let got: Vec<(String, String, String)> = d
+            .iter()
+            .map(|x| (x.field.clone(), x.replay.clone(), x.execute.clone()))
+            .collect();
+        let s = |x: &str| x.to_string();
+        let want: Vec<(String, String, String)> = vec![
+            (s("eval_delta.inner_txns[0].txn.fee"), s("1000"), s("0")),
+            (
+                s("eval_delta.inner_txns[0].txn.genesis_id"),
+                s("\"\""),
+                s("\"b-v1\""),
+            ),
+            (
+                s("eval_delta.inner_txns[0].txn.group"),
+                clip(format!("{:?}", [7u8; 32])),
+                clip(format!("{:?}", [0u8; 32])),
+            ),
+            (
+                s("eval_delta.inner_txns[0].txn.rekey_to"),
+                s("None"),
+                clip(format!("{:?}", Some(FEE_SINK))),
+            ),
+            (s("eval_delta.inner_txns[0].txn.amount"), s("10"), s("11")),
+        ];
+        assert_eq!(got, want);
+        // Every field name still buckets to a stable limiter pattern.
+        for (f, _, _) in &got {
+            assert!(
+                field_pattern(f).starts_with("eval_delta.inner_txns[N].txn."),
+                "{f}"
+            );
+        }
     }
 
     #[test]
@@ -1947,6 +2179,183 @@ mod tests {
         })
         .unwrap();
         assert!(!r.checked);
+    }
+
+    // ---- scratch rollback invariants (issue #1721) ----
+
+    fn app_create_stx() -> SignedTransaction {
+        let approval = algo_avm::assembler::assemble_string(
+            "#pragma version 8
+byte \"k\"
+int 7
+app_global_put
+int 1
+return
+",
+        )
+        .unwrap()
+        .program;
+        let clear = algo_avm::assembler::assemble_string(
+            "#pragma version 8
+int 1
+return
+",
+        )
+        .unwrap()
+        .program;
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = SENDER;
+        create.txn.fee = 1_000;
+        create.txn.last_valid = Round(1_000_000);
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        create.txn.global_state_schema = Some(algo_types::StateSchema {
+            num_uint: 1,
+            num_byte_slice: 0,
+        });
+        create.apply_data_application_id = 1;
+        create
+    }
+
+    /// Everything observable about a ledger after a block, for exact
+    /// scratch+real vs real-only comparison.
+    fn ledger_state(l: &SqliteLedger) -> String {
+        let accts: Vec<_> = [SENDER, RECEIVER, FEE_SINK, POOL]
+            .iter()
+            .map(|a| l.get_account(a))
+            .collect();
+        format!(
+            "{accts:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            ChainFields::capture(l),
+            l.get_app_params(1),
+            l.get_asset_params(1),
+            l.scratch_invariant_fingerprint(),
+            l.tracker_rows_fingerprint(),
+            l.lease_table().clone() == crate::lease::LeaseTable::new(),
+            l.check_lease(&SENDER, &[5u8; 32], 1).is_err(),
+            l.check_lease(&SENDER, &[6u8; 32], 1).is_err(),
+            l.txn_counter(),
+        )
+    }
+
+    fn plain_replay(l: &mut SqliteLedger, b: &Block) {
+        apply_block_impl_ex(
+            l,
+            b,
+            ApplyMode::Replay,
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn scratch_plus_real_apply_equals_real_apply_alone() {
+        let mut rewards = block(vec![pay()]);
+        rewards.rewards_level = 77;
+        rewards.rewards_rate = 1_000;
+        rewards.rewards_residue = 5;
+        rewards.rewards_recalculation_round = Round(5);
+        let blocks = [
+            ("pay-only", block(vec![pay()])),
+            ("app-call", block(vec![app_create_stx()])),
+            ("lease-bearing", block(vec![leased_pay(5)])),
+            ("rewards", rewards),
+            ("asset-create", block(vec![acfg_create(1)])),
+        ];
+        for (name, b) in blocks {
+            let mut shadowed = ledger();
+            let mut plain = ledger();
+            for l in [&mut shadowed, &mut plain] {
+                // The rewards case withdraws from the pool.
+                l.set_account(
+                    &POOL,
+                    AccountData {
+                        micro_algos: 1_000_000_000,
+                        ..Default::default()
+                    },
+                );
+            }
+            let report = shadow_check_replay_block(&mut shadowed, &b).unwrap();
+            assert!(report.checked, "{name}");
+            plain_replay(&mut plain, &b);
+            assert_eq!(ledger_state(&shadowed), ledger_state(&plain), "{name}");
+            assert_eq!(
+                shadowed.lease_table(),
+                plain.lease_table(),
+                "{name}: lease table"
+            );
+        }
+    }
+
+    #[test]
+    fn real_apply_changes_tracker_rows_but_scratch_pass_does_not() {
+        // Non-vacuity: the fingerprint really moves when the real apply runs,
+        // so "unchanged across the scratch pass" is a meaningful assertion.
+        let mut l = ledger();
+        let b = block(vec![pay()]);
+        let before = l.tracker_rows_fingerprint();
+        assert!(before.is_some(), "sqlite must support the fingerprint");
+        plain_replay(&mut l, &b);
+        assert_ne!(before, l.tracker_rows_fingerprint());
+        // A scratch-checked block runs both checks (debug asserts are on in
+        // test builds) without tripping them.
+        shadow_check_replay_block(&mut ledger(), &b).unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "scratch pass changed the newest per-round tracker rows")]
+    fn tracker_write_in_scratch_pass_trips_the_invariant() {
+        let b = block(vec![pay()]);
+        let _ = with_hook(4, || shadow_check_replay_block(&mut ledger(), &b));
+    }
+
+    #[test]
+    fn invariant_violation_is_counted_and_not_fatal_outside_strict_mode() {
+        let before = shadow_execute_invariant_violations();
+        TEST_STRICT.with(|s| s.set(false));
+        let b = block(vec![pay()]);
+        let mut l = ledger();
+        let r = with_hook(5, || shadow_check_replay_block(&mut l, &b));
+        TEST_STRICT.with(|s| s.set(true));
+        let r = r.expect("a violation must not fail block application");
+        assert!(r.checked);
+        assert!(shadow_execute_invariant_violations() > before);
+        assert_eq!(l.current_round(), Round(1), "real apply still ran");
+    }
+
+    #[test]
+    fn encoding_only_difference_still_yields_an_entry() {
+        let mut out: Vec<FieldDiff> = Vec::new();
+        encoding_only_diff(
+            "eval_delta.inner_txns[0]",
+            &[1, 2, 3, 4],
+            &[1, 2, 9],
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "eval_delta.inner_txns[0].txn");
+        assert_eq!(out[0].1, "encoded 4 bytes, first difference at byte 2");
+        assert_eq!(out[0].2, "encoded 3 bytes, first difference at byte 2");
+        assert_eq!(field_pattern(&out[0].0), "eval_delta.inner_txns[N].txn");
+        // Prefix-only difference: first differing offset is the shorter length.
+        let mut out = Vec::new();
+        encoding_only_diff("p", &[1, 2], &[1, 2, 3], &mut out);
+        assert_eq!(out[0].1, "encoded 2 bytes, first difference at byte 2");
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "scratch rollback left lease/trie-log/totals state or the newest tracker rows changed"
+    )]
+    fn leak_surviving_rollback_trips_the_invariant() {
+        let b = block(vec![pay()]);
+        let _ = with_hook(5, || shadow_check_replay_block(&mut ledger(), &b));
     }
 
     #[test]

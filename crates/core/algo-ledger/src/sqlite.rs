@@ -3178,6 +3178,9 @@ impl SqliteLedger {
             .map_err(|e| AlgoError::Ledger {
                 message: format!("begin block error: {e}"),
             })?;
+        // A scratch-apply undo journal still open here is stale (its restore
+        // never ran); close it so it cannot outlive the block boundary.
+        self.lease_table.discard_undo();
         // Snapshot the in-memory lease table so rollback_block can restore it —
         // the SQLite/trie transaction does not cover it.
         self.lease_snapshot = Some(self.lease_table.clone());
@@ -3570,7 +3573,9 @@ impl SqliteLedger {
                 self.set_fee_sink(saved_fee_sink);
                 self.set_rewards_pool(saved_rewards_pool);
                 self.set_txn_counter(saved_txn_counter);
-                self.lease_table = saved_leases;
+                if self.lease_table.replace_with(saved_leases) {
+                    tracing::error!("group-delta scratch apply found an open lease undo journal; rolled it back");
+                }
 
                 self.group_delta_tracer = Some(tracer);
             }
@@ -3730,6 +3735,9 @@ impl SqliteLedger {
     }
 
     pub fn commit_block(&mut self) -> Result<(), AlgoError> {
+        // Hard bound on any scratch-apply undo journal left open by a panic
+        // between save and restore: it must never survive a commit.
+        self.lease_table.discard_undo();
         let result = self.commit_block_uncleaned();
         if result.is_err() {
             self.reset_after_failed_commit();
@@ -3800,7 +3808,9 @@ impl SqliteLedger {
         self.pending_totals_delta = AccountTotalsDelta::default();
         self.pending_online_touched.clear();
         if let Some(snapshot) = self.lease_snapshot.take() {
-            self.lease_table = snapshot;
+            if self.lease_table.replace_with(snapshot) {
+                tracing::error!("lease undo journal still open at block reset; rolled it back");
+            }
         }
         self.in_block = false;
         // Reload the trie from the last committed state -- any in-memory
@@ -4423,7 +4433,9 @@ impl SqliteLedger {
         // ROLLBACK below does not cover it, so leases recorded by partially-
         // applied transactions must be undone or they poison future submissions.
         if let Some(snapshot) = self.lease_snapshot.take() {
-            self.lease_table = snapshot;
+            if self.lease_table.replace_with(snapshot) {
+                tracing::error!("lease undo journal still open at rollback_block; rolled it back");
+            }
         }
 
         self.conn
@@ -7102,37 +7114,137 @@ impl LedgerStore for SqliteLedger {
         self.pending_online_touched = snapshot.online_touched;
     }
 
-    fn save_scratch_state(&self) -> Option<Box<dyn std::any::Any>> {
-        // The lease table is cloned here rather than reusing `lease_snapshot`:
-        // that snapshot is taken at `begin_block` (before any earlier mutation
-        // in the same open block) and is consumed by `rollback_block`, so it
-        // is not the state at scratch-apply time and must stay untouched.
+    fn save_scratch_state(&mut self) -> Option<Box<dyn std::any::Any>> {
+        // The lease table is NOT cloned (issue #1720): an undo journal is
+        // opened instead and records only the leases the scratch apply adds,
+        // overwrites or purges, so the per-block cost is proportional to the
+        // block, not to the whole table. `lease_snapshot` is not reused: it is
+        // taken at `begin_block` (before any earlier mutation in the same open
+        // block) and is consumed by `rollback_block`, so it is not the state at
+        // scratch-apply time and must stay untouched.
         // The SAVEPOINT covers the SQL tables and `snapshot` the totals
         // delta; the lease table and the append-only trie pre-mutation log
         // are in-memory only (same pair `apply_block_caching_delta`'s
         // group-delta scratch apply restores by hand).
-        Some(Box::new((
-            self.lease_table.clone(),
-            self.pre_mutations.len(),
-        )))
+        if !self.lease_table.try_begin_undo() {
+            // A journal is already open (an earlier scratch apply never
+            // restored). Opening a second would corrupt both: report the
+            // store as unable to roll back so the caller skips shadowing.
+            tracing::error!(
+                "save_scratch_state: lease undo journal already open; scratch apply skipped"
+            );
+            return None;
+        }
+        Some(Box::new(self.pre_mutations.len()))
     }
 
     fn restore_scratch_state(&mut self, saved: Box<dyn std::any::Any>) {
-        match saved.downcast::<(LeaseTable, usize)>() {
-            Ok(saved) => {
-                let (leases, pre_mutations_len) = *saved;
-                self.lease_table = leases;
-                self.pre_mutations.truncate(pre_mutations_len);
+        match saved.downcast::<usize>() {
+            Ok(pre_mutations_len) => {
+                self.lease_table.rollback_undo();
+                self.pre_mutations.truncate(*pre_mutations_len);
             }
             Err(_) => {
-                // The state was produced by a different store type: the
-                // scratch apply was NOT rolled back for leases/trie log.
+                // The state was produced by a different store type. Still
+                // close the journal `save_scratch_state` opened (reverting the
+                // scratch leases) so it can never leak or grow; the trie
+                // pre-mutation log cannot be truncated without the saved length.
+                self.lease_table.rollback_undo();
                 tracing::error!(
-                    "restore_scratch_state: saved scratch state has an unexpected type; lease table and trie pre-mutation log were not restored"
+                    "restore_scratch_state: saved scratch state has an unexpected type; lease undo journal was rolled back but the trie pre-mutation log was not truncated"
                 );
                 debug_assert!(false, "restore_scratch_state: unexpected saved state type");
             }
         }
+    }
+
+    fn tracker_rows_fingerprint(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        // Content digest of the newest rows of each per-round tracker table
+        // plus the table's min/max key. A scratch pass can only touch the
+        // block being applied (the newest rows), so replacements (INSERT OR
+        // REPLACE / UPDATE of an existing row) and retention pruning (min key)
+        // are both visible, at O(rows read) -- no table scans. The large
+        // trie-node table (`accounthashes`) is deliberately not covered.
+        // Any failed query returns `None` (logged once) so an unreadable table
+        // is skipped instead of hashing to the same value on both sides.
+        const NEWEST_ROWS: i64 = 8;
+        // (table, key column, payload columns)
+        const TABLES: [(&str, &str, &str); 5] = [
+            ("blockdb.blocks", "rnd", "proto, hdrdata"),
+            ("txtail", "rnd", "data"),
+            ("onlineroundparamstail", "rnd", "data"),
+            (
+                "votersnapshot",
+                "round",
+                "voterscommitment, onlinetotalweight",
+            ),
+            ("votersparticipants", "round", "participants"),
+        ];
+        fn unreadable(table: &str, e: &dyn std::fmt::Display) -> Option<u64> {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::error!(
+                    "tracker_rows_fingerprint: cannot read {table}: {e}; scratch invariant checks that need it are skipped"
+                );
+            }
+            None
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for (table, key, payload) in TABLES {
+            let bounds: Result<(Option<i64>, Option<i64>), _> = self.conn.query_row(
+                &format!("SELECT MIN({key}), MAX({key}) FROM {table}"),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            );
+            let bounds = match bounds {
+                Ok(b) => b,
+                Err(e) => return unreadable(table, &e),
+            };
+            (table, bounds).hash(&mut h);
+            let sql = format!(
+                "SELECT {key}, {payload} FROM {table} ORDER BY {key} DESC LIMIT {NEWEST_ROWS}"
+            );
+            let mut stmt = match self.conn.prepare_cached(&sql) {
+                Ok(s) => s,
+                Err(e) => return unreadable(table, &e),
+            };
+            let ncols = stmt.column_count();
+            let rows = stmt.query_map([], |r| {
+                let mut cells: Vec<rusqlite::types::Value> = Vec::with_capacity(ncols);
+                for c in 0..ncols {
+                    cells.push(r.get::<_, rusqlite::types::Value>(c)?);
+                }
+                Ok(cells)
+            });
+            let rows = match rows {
+                Ok(rows) => rows,
+                Err(e) => return unreadable(table, &e),
+            };
+            for row in rows {
+                match row {
+                    Ok(cells) => format!("{cells:?}").hash(&mut h),
+                    Err(e) => return unreadable(table, &e),
+                }
+            }
+        }
+        Some(h.finish())
+    }
+
+    fn scratch_invariant_fingerprint(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let mut online: Vec<_> = self.pending_online_touched.iter().collect();
+        online.sort();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (
+            self.lease_table.fingerprint(),
+            self.pre_mutations.len(),
+            format!("{:?}", self.pending_totals_delta),
+            online,
+        )
+            .hash(&mut h);
+        Some(h.finish())
     }
 
     // ---- Min balance ----
@@ -11092,6 +11204,109 @@ mod tests {
             ledger.check_lease(&sender, &lease, 100).is_ok(),
             "rolled-back lease must not persist",
         );
+    }
+
+    #[test]
+    fn scratch_state_round_trip_restores_leases_and_pre_mutations() {
+        use crate::store_trait::LedgerStore;
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let s = Address([5u8; 32]);
+        ledger.record_lease(&s, &[1; 32], 100); // purged by the scratch pass
+        ledger.record_lease(&s, &[2; 32], 300); // overwritten by the scratch pass
+        let before = ledger.lease_table().clone();
+
+        let saved = ledger.save_scratch_state().expect("supported");
+        ledger.record_lease(&s, &[3; 32], 500);
+        ledger.record_lease(&s, &[2; 32], 900);
+        ledger.purge_expired_leases(150);
+        ledger.restore_scratch_state(saved);
+
+        assert_eq!(*ledger.lease_table(), before);
+        assert!(
+            ledger.lease_table().undo_len().is_none(),
+            "journal must be closed after restore"
+        );
+    }
+
+    #[test]
+    fn unclosed_scratch_journal_is_bounded_by_commit_block() {
+        // A panic between save and restore leaves the journal open; the next
+        // block boundary must close it so it cannot grow forever.
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let s = Address([6u8; 32]);
+        ledger.begin_block().unwrap();
+        let _leaked = ledger.save_scratch_state().expect("supported");
+        ledger.record_lease(&s, &[1; 32], 100);
+        assert_eq!(ledger.lease_table().undo_len(), Some(1));
+        ledger.commit_block().unwrap();
+        assert!(ledger.lease_table().undo_len().is_none());
+        assert!(ledger.check_lease(&s, &[1; 32], 1).is_err(), "lease kept");
+    }
+
+    #[test]
+    fn begin_block_discards_a_stale_journal() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let _leaked = ledger.save_scratch_state().expect("supported");
+        ledger.begin_block().unwrap();
+        assert!(ledger.lease_table().undo_len().is_none());
+        ledger.rollback_block().unwrap();
+    }
+
+    #[test]
+    fn save_scratch_state_refuses_while_a_journal_is_open() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let _first = ledger.save_scratch_state().expect("supported");
+        ledger.record_lease(&Address([1u8; 32]), &[1; 32], 100);
+        // Nested save must neither drop the outer journal nor succeed.
+        assert!(ledger.save_scratch_state().is_none());
+        assert_eq!(ledger.lease_table().undo_len(), Some(1));
+    }
+
+    #[test]
+    fn tracker_fingerprint_sees_same_size_row_replacement() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.put_txtail(5, b"aaaa").unwrap();
+        let before = ledger.tracker_rows_fingerprint();
+        assert!(before.is_some());
+        ledger.put_txtail(5, b"bbbb").unwrap();
+        assert_ne!(before, ledger.tracker_rows_fingerprint());
+    }
+
+    #[test]
+    fn tracker_fingerprint_is_none_when_a_table_cannot_be_read() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.conn.execute_batch("DROP TABLE txtail").unwrap();
+        assert!(ledger.tracker_rows_fingerprint().is_none());
+        assert!(ledger.scratch_invariant_fingerprint().is_some());
+    }
+
+    #[test]
+    fn restore_scratch_state_with_wrong_type_still_closes_the_journal() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let s = Address([4u8; 32]);
+        let _ours = ledger.save_scratch_state().expect("supported");
+        ledger.record_lease(&s, &[9; 32], 100);
+        // Debug builds also debug_assert on the foreign state; either way the
+        // journal must be closed and the scratch lease reverted.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ledger.restore_scratch_state(Box::new("not a usize"));
+        }));
+        assert!(ledger.lease_table().undo_len().is_none());
+        assert!(ledger.check_lease(&s, &[9; 32], 1).is_ok());
+    }
+
+    #[test]
+    fn rollback_block_with_a_leaked_scratch_journal_restores_the_snapshot() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let s = Address([3u8; 32]);
+        ledger.record_lease(&s, &[1; 32], 100);
+        ledger.begin_block().unwrap();
+        let before = ledger.lease_table().clone();
+        let _leaked = ledger.save_scratch_state().expect("supported");
+        ledger.record_lease(&s, &[2; 32], 200);
+        ledger.rollback_block().unwrap();
+        assert_eq!(*ledger.lease_table(), before);
+        assert!(ledger.lease_table().undo_len().is_none());
     }
 
     #[test]

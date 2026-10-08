@@ -481,12 +481,20 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
         self.inner.delete_voters_participants(round)
     }
 
-    fn save_scratch_state(&self) -> Option<Box<dyn std::any::Any>> {
+    fn save_scratch_state(&mut self) -> Option<Box<dyn std::any::Any>> {
         self.inner.save_scratch_state()
     }
 
     fn restore_scratch_state(&mut self, saved: Box<dyn std::any::Any>) {
         self.inner.restore_scratch_state(saved);
+    }
+
+    fn tracker_rows_fingerprint(&self) -> Option<u64> {
+        self.inner.tracker_rows_fingerprint()
+    }
+
+    fn scratch_invariant_fingerprint(&self) -> Option<u64> {
+        self.inner.scratch_invariant_fingerprint()
     }
 
     // ---- Min balance ----

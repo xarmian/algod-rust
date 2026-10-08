@@ -29,11 +29,38 @@ use algo_types::Address;
 /// A lease is a (sender, lease_value) pair that locks out duplicate
 /// transactions from the same sender with the same lease until the
 /// original transaction's last_valid round has passed.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct LeaseTable {
     /// Maps (sender, lease) to the last_valid round of the recorded transaction.
     entries: HashMap<(Address, [u8; 32]), u64>,
+    /// Optional undo journal (see [`LeaseTable::try_begin_undo`]): the prior value
+    /// of every key `record`/`purge_expired` changed since it was opened, in
+    /// mutation order. `None` outside a scratch apply.
+    undo: Option<Vec<LeaseUndo>>,
 }
+
+/// Cloning snapshots the live entries only: a clone never carries an open
+/// undo journal, so whole-table snapshots (`begin_block`, the group-delta
+/// scratch apply) cannot inherit a stale or ever-growing journal.
+impl Clone for LeaseTable {
+    fn clone(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+            undo: None,
+        }
+    }
+}
+
+/// Prior state of one `(sender, lease)` key: `None` = it was absent.
+type LeaseUndo = ((Address, [u8; 32]), Option<u64>);
+
+/// Equality compares the live entries only; the undo journal is bookkeeping.
+impl PartialEq for LeaseTable {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
+}
+impl Eq for LeaseTable {}
 
 /// A lease value of all zeros is treated as "no lease" and is always allowed.
 const EMPTY_LEASE: [u8; 32] = [0u8; 32];
@@ -79,15 +106,92 @@ impl LeaseTable {
         if *lease == EMPTY_LEASE {
             return;
         }
-        self.entries.insert((*sender, *lease), last_valid);
+        let prior = self.entries.insert((*sender, *lease), last_valid);
+        if let Some(undo) = self.undo.as_mut() {
+            undo.push(((*sender, *lease), prior));
+        }
     }
 
     /// Remove all entries whose `last_valid` is strictly less than
     /// `current_round`. These leases have expired and no longer need
     /// to block new transactions.
     pub fn purge_expired(&mut self, current_round: u64) {
-        self.entries
-            .retain(|_, &mut last_valid| last_valid >= current_round);
+        let undo = &mut self.undo;
+        self.entries.retain(|key, &mut last_valid| {
+            let keep = last_valid >= current_round;
+            if !keep {
+                if let Some(undo) = undo.as_mut() {
+                    undo.push((*key, Some(last_valid)));
+                }
+            }
+            keep
+        });
+    }
+
+    /// Order-independent digest of the live entries (not the undo journal),
+    /// for debug-only rollback invariant checks.
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut entries: Vec<_> = self.entries.iter().collect();
+        entries.sort();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        entries.hash(&mut h);
+        h.finish()
+    }
+
+    /// Start journaling mutations so they can be reverted with
+    /// [`Self::rollback_undo`] without cloning the whole table (the shadow
+    /// execute scratch apply runs per block; the table can hold many leases).
+    ///
+    /// Journals do not nest: if one is already open this returns `false` and
+    /// leaves the open journal untouched (callers must treat that as "cannot
+    /// scratch-apply"). `true` = a fresh journal is now open.
+    pub fn try_begin_undo(&mut self) -> bool {
+        if self.undo.is_some() {
+            return false;
+        }
+        self.undo = Some(Vec::new());
+        true
+    }
+
+    /// Revert every mutation since [`Self::try_begin_undo`] (newest first, so
+    /// repeated writes to one key unwind to its original value) and close the
+    /// journal. No-op when no journal is open.
+    pub fn rollback_undo(&mut self) {
+        let Some(undo) = self.undo.take() else {
+            return;
+        };
+        for (key, prior) in undo.into_iter().rev() {
+            match prior {
+                Some(v) => {
+                    self.entries.insert(key, v);
+                }
+                None => {
+                    self.entries.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Replace the live entries with `snapshot` (a whole-table restore).
+    /// An undo journal still open here is a leaked scratch apply: it is rolled
+    /// back first (so nothing it recorded can survive) and closed. Returns
+    /// whether a journal was open, so callers can log the leak.
+    pub fn replace_with(&mut self, snapshot: LeaseTable) -> bool {
+        let leaked = self.undo.is_some();
+        self.rollback_undo();
+        self.entries = snapshot.entries;
+        leaked
+    }
+
+    /// Close the journal keeping the mutations.
+    pub fn discard_undo(&mut self) {
+        self.undo = None;
+    }
+
+    /// Number of journaled mutations, `None` when no journal is open.
+    pub fn undo_len(&self) -> Option<usize> {
+        self.undo.as_ref().map(Vec::len)
     }
 }
 
@@ -173,6 +277,82 @@ mod tests {
 
         assert!(table.check(&sender, &lease_a, 100).is_ok()); // purged
         assert!(table.check(&sender, &lease_b, 150).is_err()); // still active
+    }
+
+    #[test]
+    fn undo_journal_rolls_back_adds_overwrites_and_purges() {
+        let mut table = LeaseTable::new();
+        let s = test_address(7);
+        table.record(&s, &test_lease(1), 100); // expires at purge(150)
+        table.record(&s, &test_lease(2), 300); // overwritten while journaling
+        let before = table.clone();
+
+        assert!(table.try_begin_undo());
+        table.record(&s, &test_lease(3), 500); // added
+        table.record(&s, &test_lease(2), 900); // overwritten
+        table.purge_expired(150); // lease 1 removed
+        table.record(&s, &test_lease(1), 700); // re-added after purge
+        assert!(table.check(&s, &test_lease(3), 400).is_err());
+        table.rollback_undo();
+
+        assert_eq!(table, before);
+        assert!(table.check(&s, &test_lease(3), 1).is_ok());
+        assert!(table.check(&s, &test_lease(1), 100).is_err());
+        assert!(table.check(&s, &test_lease(2), 301).is_ok());
+    }
+
+    #[test]
+    fn clone_never_carries_an_open_journal() {
+        let mut table = LeaseTable::new();
+        let s = test_address(9);
+        assert!(table.try_begin_undo());
+        table.record(&s, &test_lease(1), 100);
+        let copy = table.clone();
+        assert!(copy.undo_len().is_none(), "snapshot clone must not journal");
+        assert_eq!(copy, table);
+        assert_eq!(table.undo_len(), Some(1));
+    }
+
+    #[test]
+    fn nested_begin_is_refused_and_keeps_the_outer_journal() {
+        let mut table = LeaseTable::new();
+        let s = test_address(10);
+        assert!(table.try_begin_undo());
+        table.record(&s, &test_lease(1), 100);
+        assert!(!table.try_begin_undo(), "nested begin must be refused");
+        assert_eq!(table.undo_len(), Some(1), "outer journal must survive");
+        table.rollback_undo();
+        assert!(table.check(&s, &test_lease(1), 1).is_ok());
+    }
+
+    #[test]
+    fn replace_with_rolls_back_a_leaked_journal_first() {
+        let mut table = LeaseTable::new();
+        let s = test_address(11);
+        table.record(&s, &test_lease(1), 100);
+        let snapshot = table.clone();
+        assert!(!table.replace_with(snapshot.clone()), "no journal open");
+        assert!(table.try_begin_undo());
+        table.record(&s, &test_lease(2), 200);
+        assert!(table.replace_with(snapshot.clone()), "leak reported");
+        assert_eq!(table, snapshot);
+        assert!(table.undo_len().is_none());
+    }
+
+    #[test]
+    fn undo_journal_is_inert_without_begin_and_discardable() {
+        let mut table = LeaseTable::new();
+        let s = test_address(8);
+        table.record(&s, &test_lease(1), 100);
+        assert!(table.undo_len().is_none());
+        assert!(table.try_begin_undo());
+        table.record(&s, &test_lease(2), 100);
+        assert_eq!(table.undo_len(), Some(1));
+        table.discard_undo();
+        assert!(table.undo_len().is_none());
+        // Rolling back with no journal is a no-op.
+        table.rollback_undo();
+        assert!(table.check(&s, &test_lease(2), 1).is_err());
     }
 
     #[test]
