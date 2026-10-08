@@ -264,6 +264,9 @@ NO_ADVANCE_RE = re.compile(r"ensure_block.*did not advance|did not advance.*ensu
 # (key, regex, minimum count for the job to fail, description)
 HARD_RULES = [
     ("permanent_error_writing_block", re.compile(r"permanent error writing block"), 1, "ensure_block hit a permanent ledger write error"),
+    # Issue #1715: the node itself declares it is stuck on a block that
+    # deterministically fails to apply (the monitor also polls /v2/status).
+    ("stalled_on_invalid_block", re.compile(r"stalled on invalid block"), 1, "node entered the stalled-on-invalid-block state"),
     ("apply_block_failed", re.compile(r"apply_block failed"), 1, "a block failed to apply to the ledger"),
     ("panic", re.compile(r"panicked"), 1, "a thread panicked"),
     ("invariant_check_error", re.compile(r"invariant check: error"), 1, "post-catchup ledger invariant validation reported an error"),
@@ -302,6 +305,7 @@ GROUP_STORED_RE = re.compile(r"stored ([0-9a-f]{16,})")
 # A line must contain one of these to be worth running the regexes on.
 _PREFILTER = (
     "permanent error",
+    "stalled on invalid block",
     "apply_block failed",
     "panicked",
     "invariant check",
@@ -424,6 +428,35 @@ _PHASE_ROWS = [
     ("catchup_wall_s", "Catchup wall clock per status polling"),
     ("unaccounted_s", "Unaccounted (wall minus log total; poll latency)"),
 ]
+
+
+def sanitize_text(value, limit: int = 500, table: bool = False) -> str:
+    """Node-supplied text made safe for a markdown issue body or a table
+    cell: backticks become apostrophes, all whitespace (newlines included)
+    collapses to single spaces, `|` becomes `/` for a table cell, and the
+    result is truncated to `limit` characters."""
+    text = re.sub(r"\s+", " ", str(value).replace("`", "'")).strip()
+    if table:
+        text = text.replace("|", "/")
+    if len(text) > limit:
+        text = text[: max(limit - 3, 0)] + "..."
+    return text
+
+
+def format_stall(stall: dict, table: bool = False) -> str:
+    """`key: value` text for a `stalled-on-invalid-block` payload (never a
+    dict repr), sanitized."""
+    parts = []
+    for key, label in (
+        ("round", "round"),
+        ("error", "error"),
+        ("consecutive_failures", "consecutive failures"),
+        ("since_unix_secs", "since (unix s)"),
+        ("source", "source"),
+    ):
+        if stall.get(key) is not None:
+            parts.append(f"{label}: {stall[key]}")
+    return sanitize_text(", ".join(parts), 500, table)
 
 
 def render_markdown(summary: dict) -> str:

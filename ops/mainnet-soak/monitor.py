@@ -47,6 +47,12 @@
 # eventually caught, just not mistaken for a stall at 5 minutes in.
 #
 # Verdict, in priority order:
+#   0. INVALID_BLOCK_STALL (issue #1715) -- the node reports
+#      `stalled-on-invalid-block` in `/v2/status` (or, when `/v2/status` does
+#      not answer, the gauge `algod_rust_sync_stalled_on_invalid_block` is 1):
+#      it is stuck on a block that deterministically fails to apply. Checked
+#      before everything else, exit 1 (issue-worthy), round = the stalled
+#      block's round, the status payload is kept in the summary.
 #   1. NODE_FAILURE -- the node process exited or its REST stopped
 #      answering. Exit 1 (issue-worthy): the round is the last one
 #      observed before the failure.
@@ -142,7 +148,7 @@ TIP_SLACK_ROUNDS = 2
 Verdict = namedtuple(
     "Verdict",
     [
-        "status",  # "ok" | "stuck" | "source_outage" | "node_failure"
+        "status",  # "ok" | "stuck" | "source_outage" | "node_failure" | "invalid_block_stall"
         "phase",  # "catchup" | "follow" | None (node_failure with no samples)
         "round",  # int | None -- the round to report/dedup on
         "message",  # human-readable one-liner
@@ -266,6 +272,24 @@ def peer_advancing_between(samples, start_idx, end_idx):
     return max(seen) > min(seen)
 
 
+def _stall_of(sample: dict):
+    """The `stalled_on_invalid_block` payload of one sample's node, or None."""
+    stall = (sample.get("node") or {}).get("stalled_on_invalid_block")
+    return stall if isinstance(stall, dict) and stall else None
+
+
+def describe_stall(stall: dict) -> str:
+    """One-line description (round, error, consecutive failures) of a stall."""
+    parts = [f"node stalled on invalid block {stall.get('round')}"]
+    if stall.get("error"):
+        parts.append(f": {nodelog.sanitize_text(stall['error'])}")
+    if stall.get("consecutive_failures") is not None:
+        parts.append(f" ({stall['consecutive_failures']} consecutive failures)")
+    if stall.get("source") == "gauge":
+        parts.append(" [from the /metrics gauge; /v2/status unavailable]")
+    return "".join(parts)
+
+
 def classify(
     samples: list,
     halt_minutes: float = DEFAULT_HALT_MINUTES,
@@ -293,6 +317,30 @@ def classify(
         return Verdict("ok", None, None, "no samples collected", None)
 
     halt_s = halt_minutes * 60.0
+
+    # INVALID_BLOCK_STALL (issue #1715): the node says it cannot apply a
+    # block. Only a stall still present in the LAST sample fails the run: one
+    # that cleared (a valid block committed, later samples healthy) is only
+    # reported as `invalid_block_stall_cleared`, and an unreachable node at the
+    # end is a node_failure.
+    if _stall_of(samples[-1]):
+        stall = _stall_of(samples[-1])
+        first = len(samples) - 1
+        while first > 0 and _stall_of(samples[first - 1]):
+            first -= 1
+        phase = None
+        for s in reversed(samples):
+            sig = node_signature(s)
+            if sig is not None:
+                phase = sig[0]
+                break
+        return Verdict(
+            "invalid_block_stall",
+            phase,
+            stall.get("round"),
+            describe_stall(stall),
+            samples[-1]["ts"] - samples[first]["ts"],
+        )
 
     # NODE_FAILURE: the *last* sample reports the node unreachable. A
     # transient blip earlier that later recovered is not a failure -- only
@@ -392,6 +440,20 @@ def verdict_context(samples: list, verdict: Verdict) -> dict:
     node_time_since_last_round = None
     peer_last_round = None
     catchpoint_label = None
+    invalid_block_stall = None
+    invalid_block_stall_cleared = None
+    stalled = [s for s in samples if _stall_of(s)]
+    if stalled and verdict.status == "invalid_block_stall":
+        invalid_block_stall = _stall_of(stalled[-1])
+    elif stalled:
+        last_payload = _stall_of(stalled[-1])
+        invalid_block_stall_cleared = {
+            "round": last_payload.get("round"),
+            "error": last_payload.get("error"),
+            "consecutive_failures": last_payload.get("consecutive_failures"),
+            "first_ts": stalled[0]["ts"],
+            "last_ts": stalled[-1]["ts"],
+        }
     for s in reversed(samples):
         node = s.get("node") or {}
         peer = s.get("peer") or {}
@@ -410,6 +472,8 @@ def verdict_context(samples: list, verdict: Verdict) -> dict:
         "node_time_since_last_round": node_time_since_last_round,
         "peer_last_round": peer_last_round,
         "catchpoint_label": catchpoint_label,
+        "invalid_block_stall": invalid_block_stall,
+        "invalid_block_stall_cleared": invalid_block_stall_cleared,
     }
 
 
@@ -418,6 +482,7 @@ def exit_code_for(verdict: Verdict) -> int:
         "ok": 0,
         "stuck": 1,
         "node_failure": 1,
+        "invalid_block_stall": 1,
         "source_outage": 2,
     }[verdict.status]
 
@@ -425,24 +490,41 @@ def exit_code_for(verdict: Verdict) -> int:
 # --- Fast-catchup timing + summary (healthy-run reporting) -----------------
 
 
-def summarize(samples: list) -> dict:
+def _lag_stats(lag_samples: list) -> dict:
+    stats = {"n": len(lag_samples), "mean": None, "p50": None, "p95": None, "p99": None, "max": None}
+    if lag_samples:
+        stats["mean"] = statistics.mean(lag_samples)
+        stats["max"] = max(lag_samples)
+        sorted_lag = sorted(lag_samples)
+        for key, q in (("p50", 0.50), ("p95", 0.95), ("p99", 0.99)):
+            idx = min(len(sorted_lag) - 1, int(round(q * (len(sorted_lag) - 1))))
+            stats[key] = sorted_lag[idx]
+    return stats
+
+
+HALT_STATUSES = ("stuck", "source_outage", "invalid_block_stall")
+
+
+def summarize(samples: list, verdict: "Verdict | None" = None) -> dict:
     """Derive the reporting metrics for a (not necessarily stall-free) run:
     fast-catchup total time, a coarse per-counter-group phase breakdown,
     and tip-lag stats once the node reaches the tip. Never raises -- a
-    metric that can't be computed from the given samples is `None`."""
+    metric that can't be computed from the given samples is `None`.
+
+    Issue #1759: `lag_rounds` covers every sample after the first tip
+    sighting (kept for compatibility). Given a halt `verdict`, the trailing
+    frozen-node window (`stall_window`: `start_ts` = when the signature
+    froze, `seconds`) is excluded from `lag_rounds_before_stall`, so "node is
+    slow" is not mixed with "node is stuck"; without a halt both are equal
+    and `stall_window` is `None`."""
     if not samples:
         return {
             "fast_catchup_seconds": None,
             "phase_seconds": {},
             "reached_tip": False,
-            "lag_rounds": {
-                "n": 0,
-                "mean": None,
-                "p50": None,
-                "p95": None,
-                "p99": None,
-                "max": None,
-            },
+            "lag_rounds": _lag_stats([]),
+            "lag_rounds_before_stall": _lag_stats([]),
+            "stall_window": None,
             "follow_block_timing": {},
             "first_tip_ts": None,
             "time_to_tip_seconds": None,
@@ -504,7 +586,7 @@ def summarize(samples: list) -> dict:
                     if first_tip_ts is None:
                         first_tip_ts = s["ts"]
                 if reached_tip:
-                    lag_samples.append(max(lag, 0))
+                    lag_samples.append((s["ts"], max(lag, 0)))
 
         prev_ts = s["ts"]
         if node.get("ok"):
@@ -512,27 +594,21 @@ def summarize(samples: list) -> dict:
 
     fast_catchup_seconds = (catchup_end_ts - t0) if catchup_end_ts is not None else None
 
-    lag_stats = {
-        "n": len(lag_samples),
-        "mean": None,
-        "p50": None,
-        "p95": None,
-        "p99": None,
-        "max": None,
-    }
-    if lag_samples:
-        lag_stats["mean"] = statistics.mean(lag_samples)
-        lag_stats["max"] = max(lag_samples)
-        sorted_lag = sorted(lag_samples)
-        for key, q in (("p50", 0.50), ("p95", 0.95), ("p99", 0.99)):
-            idx = min(len(sorted_lag) - 1, int(round(q * (len(sorted_lag) - 1))))
-            lag_stats[key] = sorted_lag[idx]
+    lag_stats = _lag_stats([lag for _, lag in lag_samples])
+    stall_window = None
+    lag_before = lag_stats
+    if verdict is not None and verdict.status in HALT_STATUSES and verdict.stalled_since_s is not None:
+        start_ts = samples[-1]["ts"] - verdict.stalled_since_s
+        stall_window = {"start_ts": start_ts, "seconds": verdict.stalled_since_s}
+        lag_before = _lag_stats([lag for ts, lag in lag_samples if ts <= start_ts])
 
     return {
         "fast_catchup_seconds": fast_catchup_seconds,
         "phase_seconds": {k: round(v, 1) for k, v in phase_seconds.items() if v > 0},
         "reached_tip": reached_tip,
         "lag_rounds": lag_stats,
+        "lag_rounds_before_stall": lag_before,
+        "stall_window": stall_window,
         "follow_block_timing": summarize_follow_timing(samples, first_tip_ts),
         "first_tip_ts": first_tip_ts,
         "time_to_tip_seconds": (first_tip_ts - t0) if first_tip_ts is not None else None,
@@ -544,7 +620,65 @@ def summarize(samples: list) -> dict:
 
 FOLLOW_TIMING_PREFIX = "algod_rust_follow_block_"
 FOLLOW_TIMING_SUFFIX = "_seconds"
-FOLLOW_TIMING_KEYS = ("apply", "avm", "commit", "wal_checkpoint", "ensure_block")
+# Success-path series and, since issue #1761, the failed-path ones.
+FOLLOW_TIMING_KEYS = (
+    "apply",
+    "apply_failed",
+    "avm",
+    "commit",
+    "commit_failed",
+    "wal_checkpoint",
+    "ensure_block",
+    "ensure_block_failed",
+)
+PROCESS_START_KEY = "process_start_time_seconds"
+PROCESS_START_METRIC = "algod_rust_process_start_time_seconds"
+STALL_GAUGE_METRIC = "algod_rust_sync_stalled_on_invalid_block"
+STALL_ROUND_METRIC = "algod_rust_sync_stalled_block_round"
+
+
+def _metric_value(text: str, name: str):
+    """Value of the unlabelled sample `name`, or None."""
+    for line in text.splitlines():
+        if line.startswith(name + " "):
+            try:
+                return float(line.rpartition(" ")[2])
+            except ValueError:
+                return None
+    return None
+
+
+def parse_process_start_time(text: str):
+    """`algod_rust_process_start_time_seconds` from an exposition, or None
+    (node predates the gauge)."""
+    return _metric_value(text, PROCESS_START_METRIC)
+
+
+def parse_stall_gauge(text: str):
+    """{"round": N} when `algod_rust_sync_stalled_on_invalid_block` is 1,
+    else None."""
+    if _metric_value(text, STALL_GAUGE_METRIC) == 1.0:
+        round_ = _metric_value(text, STALL_ROUND_METRIC)
+        return {"round": int(round_) if round_ is not None else None}
+    return None
+
+
+def _scrape_metrics_text(base_url: str, timeout: float) -> str:
+    """The one `/metrics` GET shared by the timing and gauge readers."""
+    import urllib.request
+
+    with urllib.request.urlopen(base_url.rstrip("/") + "/metrics", timeout=timeout) as resp:
+        return resp.read().decode("utf-8", "replace")
+
+
+def fetch_stall_gauge(base_url: str, timeout: float = 1.0):
+    """GET {base_url}/metrics and return the stall gauge payload; None when
+    clear or unreachable (never raises). Only used while `/v2/status` is
+    unavailable, at most once per scrape interval (see `take_sample`)."""
+    try:
+        return parse_stall_gauge(_scrape_metrics_text(base_url, timeout))
+    except Exception:  # noqa: BLE001 -- the gauge is a fallback signal only
+        return None
 
 
 def parse_follow_timing(text: str) -> dict:
@@ -586,7 +720,13 @@ def parse_follow_timing(text: str) -> dict:
 # the poll loop (and with it the stall-detection cadence) is never held up.
 FOLLOW_TIMING_SCRAPE_INTERVAL_S = 30.0
 FOLLOW_TIMING_SCRAPE_TIMEOUT_S = 1.0
-_follow_scrape_state = {"last_ts": 0.0, "failures": 0, "logged": False}
+_follow_scrape_state = {
+    "last_ts": 0.0,
+    "failures": 0,
+    "logged": False,
+    "tip_scraped": False,
+    "gauge_last_ts": 0.0,
+}
 
 
 def fetch_follow_timing(base_url: str, timeout: float = FOLLOW_TIMING_SCRAPE_TIMEOUT_S):
@@ -594,12 +734,13 @@ def fetch_follow_timing(base_url: str, timeout: float = FOLLOW_TIMING_SCRAPE_TIM
     unreachable or the node predates the metrics (never raises). A
     persistent failure is logged to stderr once per process, not swallowed
     silently."""
-    import urllib.request
-
     try:
-        with urllib.request.urlopen(base_url.rstrip("/") + "/metrics", timeout=timeout) as resp:
-            parsed = parse_follow_timing(resp.read().decode("utf-8", "replace"))
+        text = _scrape_metrics_text(base_url, timeout)
+        parsed = parse_follow_timing(text)
         error = None if parsed else "no algod_rust_follow_block_* series in /metrics"
+        start = parse_process_start_time(text)
+        if parsed and start is not None:
+            parsed[PROCESS_START_KEY] = start
     except Exception as e:  # noqa: BLE001 -- reporting must never fail a run
         parsed, error = None, str(e)
     st = _follow_scrape_state
@@ -673,6 +814,19 @@ def _delta_histogram(last, base):
     return buckets, count, total
 
 
+def _restart_between(a: dict, b: dict) -> bool:
+    """True if two consecutive scrapes show the node restarted between them
+    (different process start time, else a counter that went backwards)."""
+    sa, sb = a.get(PROCESS_START_KEY), b.get(PROCESS_START_KEY)
+    if sa is not None and sb is not None:
+        return sa != sb
+    for key in FOLLOW_TIMING_KEYS:
+        ha, hb = a.get(key), b.get(key)
+        if ha and hb and _delta_histogram(hb, ha) is None:
+            return True
+    return False
+
+
 def summarize_follow_timing(samples: list, first_tip_ts=None) -> dict:
     """p50/p95/max (bucket upper bounds, seconds) plus count/mean per
     follow-path histogram. Each entry states its `baseline`: `"delta"` when
@@ -689,11 +843,26 @@ def summarize_follow_timing(samples: list, first_tip_ts=None) -> dict:
     last_sample = scraped[-1]
     last = last_sample["follow_timing"]
     base = {}
+    base_sample = None
     if first_tip_ts is not None:
         for s in scraped[:-1]:
             if s["ts"] >= first_tip_ts:
                 base = s["follow_timing"]
+                base_sample = s
                 break
+    # The first scrape taken after a restart (the last one if no consecutive
+    # pair shows it): were catchup-era timings included in the absolute values?
+    chain = [base_sample] + [s for s in scraped if s["ts"] > base_sample["ts"]] if base_sample else scraped
+    post_restart_sample = last_sample
+    for prev, cur in zip(chain, chain[1:]):
+        if _restart_between(prev["follow_timing"], cur["follow_timing"]):
+            post_restart_sample = cur
+            break
+    pre_tip = not at_tip(post_restart_sample)
+    # Issue #1761: a differing process start time proves a restart even when
+    # the restarted node has since outgrown every baseline counter.
+    start_last, start_base = last.get(PROCESS_START_KEY), base.get(PROCESS_START_KEY)
+    process_restarted = start_last is not None and start_base is not None and start_last != start_base
     out = {}
     for key in FOLLOW_TIMING_KEYS:
         h = last.get(key)
@@ -703,7 +872,9 @@ def summarize_follow_timing(samples: list, first_tip_ts=None) -> dict:
         count, total = h["count"], h["sum"]
         baseline, restarted = "absolute", False
         b0 = base.get(key)
-        if b0:
+        if process_restarted:
+            restarted = True
+        elif b0:
             d = _delta_histogram(h, b0)
             if d is None:
                 restarted = True
@@ -713,6 +884,9 @@ def summarize_follow_timing(samples: list, first_tip_ts=None) -> dict:
         out[key] = {
             "baseline": baseline,
             "restarted": restarted,
+            # True when the post-restart values begin before the node was at
+            # the tip, i.e. include catchup-era timings.
+            "pre_tip_included": restarted and pre_tip,
             "count": count,
             "mean_s": (total / count) if count > 0 else None,
             "p50_s": _histogram_quantile(buckets, count, 0.50),
@@ -723,6 +897,19 @@ def summarize_follow_timing(samples: list, first_tip_ts=None) -> dict:
 
 
 # --- Live collection ---------------------------------------------------
+
+
+def _status_stall(raw):
+    """The `/v2/status` `stalled-on-invalid-block` object, normalised to
+    snake_case keys; None when absent (issue #1715)."""
+    if not isinstance(raw, dict) or not raw:
+        return None
+    return {
+        "round": raw.get("round"),
+        "error": raw.get("error"),
+        "consecutive_failures": raw.get("consecutive-failures"),
+        "since_unix_secs": raw.get("since-unix-secs"),
+    }
 
 
 def fetch_status(base_url: str, token: str, timeout: float = 5.0) -> dict:
@@ -757,6 +944,7 @@ def fetch_status(base_url: str, token: str, timeout: float = 5.0) -> dict:
         "last_round": body.get("last-round"),
         "time_since_last_round_ns": body.get("time-since-last-round"),
         "last_catchpoint": body.get("last-catchpoint") or None,
+        "stalled_on_invalid_block": _status_stall(body.get("stalled-on-invalid-block")),
     }
 
 
@@ -769,14 +957,30 @@ def take_sample(node_url, node_token, peer_url, peer_token) -> dict:
     # Issue #1678: the cumulative follow-path histograms ride along once the
     # node is out of catchup (the latest scrape survives a killed run).
     node = sample["node"]
-    if (
-        node.get("ok")
-        and not (node.get("catchpoint") or "")
-        and follow_timing_scrape_due(sample["ts"])
-    ):
-        timing = fetch_follow_timing(node_url)
-        if timing:
-            sample["follow_timing"] = timing
+    if not node.get("ok"):
+        # Issue #1715: /v2/status is unavailable; the stall gauge still hard
+        # fails a node that is stuck on an invalid block.
+        st = _follow_scrape_state
+        if sample["ts"] - st.get("gauge_last_ts", 0.0) >= FOLLOW_TIMING_SCRAPE_INTERVAL_S:
+            st["gauge_last_ts"] = sample["ts"]
+            gauge = fetch_stall_gauge(node_url)
+            if gauge:
+                node["stalled_on_invalid_block"] = {**gauge, "source": "gauge"}
+    elif not (node.get("catchpoint") or ""):
+        st = _follow_scrape_state
+        due = follow_timing_scrape_due(sample["ts"])
+        on_tip = at_tip(sample)
+        # Issue #1761: the delta window must start exactly at the tip
+        # transition, not up to a rate-limit interval later.
+        if not due and on_tip and not st.get("tip_scraped") and st["failures"] < 3:
+            due = True
+            st["last_ts"] = sample["ts"]
+        if due:
+            timing = fetch_follow_timing(node_url)
+            if timing:
+                sample["follow_timing"] = timing
+                if on_tip:
+                    st["tip_scraped"] = True
     return sample
 
 
@@ -911,6 +1115,61 @@ def collect(
             time.sleep(poll_interval_s)
 
 
+def render_step_summary_lines(r: dict) -> list:
+    """The workflow step-summary markdown (verdict, metrics table, follow
+    timing rows with their `baseline`/`restarted` flags, then the nodelog
+    sections) for a `summary.json` dict. Lives here, not inline in the
+    workflow, so it is unit-tested."""
+    lag = r.get("lag_rounds") or {}
+    lag_before = r.get("lag_rounds_before_stall") or {}
+    phase_s = r.get("phase_seconds") or {}
+
+    def lag_row(label, stats):
+        return (
+            f"| {label}: mean/p50/p95/p99/max (n) | {stats.get('mean')}/{stats.get('p50')}/"
+            f"{stats.get('p95')}/{stats.get('p99')}/{stats.get('max')} (n={stats.get('n')}) |"
+        )
+
+    lines = [
+        "# Mainnet node soak",
+        "",
+        f"**Verdict:** `{r.get('status')}` \u2014 {nodelog.sanitize_text(r.get('message') or '', 700)}",
+        "",
+        "| metric | value |",
+        "| --- | --- |",
+        f"| Catchpoint label | `{r.get('catchpoint_label') or 'n/a'}` |",
+        f"| Fast-catchup time | {r.get('fast_catchup_seconds')} s |",
+        f"| Reached tip | {r.get('reached_tip')} |",
+        f"| Phase durations (s) | {phase_s} |",
+        lag_row("Lag at tip (rounds), whole run", lag),
+    ]
+    window = r.get("stall_window")
+    if window:
+        lines.append(lag_row("Lag before stall (rounds)", lag_before))
+        lines.append(f"| Stall window | {window.get('seconds')} s from ts {window.get('start_ts')} |")
+    stall = r.get("invalid_block_stall")
+    if stall:
+        lines.append(f"| stalled-on-invalid-block | {nodelog.format_stall(stall, table=True)} |")
+    cleared = r.get("invalid_block_stall_cleared")
+    if cleared:
+        lines.append(
+            "| stalled-on-invalid-block cleared (warning, run not failed) | "
+            f"{nodelog.format_stall(cleared, table=True)}, "
+            f"seen from ts {cleared.get('first_ts')} to {cleared.get('last_ts')} |"
+        )
+    lines += [
+        f"| Node last-round | {r.get('node_last_round')} |",
+        f"| Peer last-round | {r.get('peer_last_round')} |",
+    ]
+    for key, h in (r.get("follow_block_timing") or {}).items():
+        lines.append(
+            f"| Follow block {key} (s): p50/p95/max (n) | {h.get('p50_s')}/{h.get('p95_s')}/{h.get('max_s')} "
+            f"(n={h.get('count')}) baseline={h.get('baseline')} restarted={h.get('restarted')} |"
+        )
+    lines += nodelog.render_markdown(r).splitlines()
+    return lines
+
+
 # --- CLI -----------------------------------------------------------------
 
 
@@ -939,7 +1198,7 @@ def build_result(
         "message": verdict.message,
         "stalled_since_s": verdict.stalled_since_s,
         **verdict_context(samples, verdict),
-        **summarize(samples),
+        **summarize(samples, verdict),
     }
     if follow_minutes and follow_minutes > 0:
         first_tip = result.get("first_tip_ts")

@@ -421,9 +421,12 @@ impl AgreementLedgerBridge {
 
         if in_txn {
             let t = std::time::Instant::now();
-            ledger
-                .commit_block()
-                .map_err(|e| CommitFailure::new(CommitStage::Store, e))?;
+            if let Err(e) = ledger.commit_block() {
+                crate::follow_timing::follow_timing()
+                    .commit_failed
+                    .observe(t.elapsed());
+                return Err(CommitFailure::new(CommitStage::Store, e));
+            }
             crate::follow_timing::follow_timing()
                 .commit
                 .observe(t.elapsed());
@@ -820,6 +823,9 @@ impl LedgerWriter for AgreementLedgerBridge {
                 Ok(l) => l,
                 Err(e) => {
                     warn!("ledger lock poisoned in ensure_block: {e}");
+                    crate::follow_timing::follow_timing()
+                        .ensure_block_failed
+                        .observe(ensure_started.elapsed());
                     return;
                 }
             };
@@ -857,6 +863,11 @@ impl LedgerWriter for AgreementLedgerBridge {
                      skipping (needs catchup)",
                     block.round.0, next_round
                 );
+                // Routine: the catchup service fetches the gap. Counted, but not
+                // a failure.
+                crate::follow_timing::follow_timing()
+                    .ensure_block_skipped_ahead
+                    .inc();
                 return;
             }
 
@@ -1676,6 +1687,24 @@ mod tests {
         let already = t.ensure_block_already_committed.get();
         bridge.ensure_block(&ok, &make_cert_with_proposal(1));
         assert!(t.ensure_block_already_committed.get() > already);
+    }
+
+    /// Issue #1761: an `ensure_block` skipped because the block is ahead of
+    /// the ledger (routine, needs catchup) has its own counter and is NOT
+    /// recorded as a failure.
+    #[test]
+    fn ensure_block_ahead_of_ledger_is_counted_as_skipped_not_failed() {
+        let t = crate::follow_timing::follow_timing();
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+        let skipped = t.ensure_block_skipped_ahead.get();
+        let mut ahead = make_round1_block();
+        ahead.round = Round(5);
+        bridge.ensure_block(&ahead, &make_cert_with_proposal(5));
+        assert!(
+            t.ensure_block_skipped_ahead.get() > skipped,
+            "ahead-of-ledger skip counted"
+        );
     }
 
     // -- Certificate storage tests --

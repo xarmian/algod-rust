@@ -2325,8 +2325,11 @@ impl NodeInterface for AlgodNodeInterface {
     /// `algo-agreement`/`algo_rest_api::process_metrics` so no `prometheus`
     /// crate dependency enters the workspace.
     ///
-    /// `None` (404) only when there is genuinely nothing to report: no
-    /// participation metrics attached AND both new gates are off. A
+    /// The follow-path timing histograms and the process start time gauge
+    /// are process-global and always present (issues #1678 and #1761), so
+    /// this adapter never returns `None` and `/metrics` does not 404 on it;
+    /// the 404 contract only applies to other `NodeInterface`
+    /// implementations (the trait default, test doubles). A
     /// non-participating node with `EnableRuntimeMetrics`/
     /// `EnableNetDevMetrics` set still gets a 200 — those counters are
     /// process-wide, not consensus-participation-specific, matching
@@ -2353,6 +2356,9 @@ impl NodeInterface for AlgodNodeInterface {
         // Issue #1678: per-block follow-path timing histograms and counters.
         // They are process-global statics, so they are always exposed.
         text.push_str(&algo_ledger::follow_timing::follow_timing_prometheus_text());
+        // Issue #1761: process start time, so a scraper detects restarts
+        // even when the restarted node outgrew its earlier counters.
+        text.push_str(&algo_ledger::follow_timing::process_start_time_prometheus_text());
         if let Some(pool) = self.pool.as_ref() {
             text.push_str(&pool.reeval_counter().to_prometheus_text());
         }
@@ -3692,6 +3698,7 @@ mod tests {
             "apply_failed",
             "avm",
             "commit",
+            "commit_failed",
             "wal_checkpoint",
             "ensure_block",
             "ensure_block_failed",
@@ -3705,6 +3712,7 @@ mod tests {
             assert!(text.contains(&format!("{family}_sum ")));
             assert!(text.contains(&format!("{family}_count ")));
         }
+        assert!(text.contains("# TYPE algod_rust_process_start_time_seconds gauge\n"));
         assert!(
             text.lines().all(|l| !l.starts_with(char::is_whitespace)),
             "no leading whitespace in the exposition"

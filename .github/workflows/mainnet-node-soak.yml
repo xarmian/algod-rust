@@ -42,7 +42,7 @@ name: Nightly Mainnet Node Soak
 #      run early the moment a halt is detected, rather than burning the
 #      rest of the budget).
 #   6. Tear the node down, print the step-summary table, upload
-#      artifacts, and — only on a verdict of `stuck`/`node_failure` — file
+#      artifacts, and — only on a verdict of `stuck`/`node_failure`/`invalid_block_stall` — file
 #      (or comment on, if a dedup match exists) a GitHub issue via
 #      `file_issue.py`.
 #
@@ -639,10 +639,11 @@ jobs:
         id: scan
         if: always()
         run: |
-          # Hard signatures (permanent block-write errors, apply_block
-          # failures, panics, ledger invariant errors, block-apply balance
-          # errors outside the gossip tx handlers, EAGAIN, repeated
-          # ensure_block no-advance) fail the job in the last step; warn and
+          # Hard signatures (permanent block-write errors, stalled on
+          # invalid block, apply_block failures, panics, ledger invariant
+          # errors, shadow-execute mismatches, block-apply balance errors
+          # outside the gossip tx handlers, EAGAIN, repeated ensure_block
+          # no-advance) fail the job in the last step; warn and
           # noise tiers are only counted. Results are merged into
           # summary.json under "log_scan". See ops/mainnet-soak/nodelog.py.
           mkdir -p mainnet-soak-artifacts
@@ -669,30 +670,12 @@ jobs:
           else:
               with open(path) as f:
                   r = json.load(f)
-              lag = r.get("lag_rounds") or {}
-              phase_s = r.get("phase_seconds") or {}
+              # Rendered by monitor.py (unit-tested): verdict, metrics table
+              # incl. lag before the stall window, follow timing rows with
+              # their baseline/restarted flags, node.log scan.
               sys.path.insert(0, "ops/mainnet-soak")
-              import nodelog
-              lines = [
-                  "# Mainnet node soak",
-                  "",
-                  f"**Verdict:** `{r.get('status')}` — {r.get('message') or ''}",
-                  "",
-                  "| metric | value |",
-                  "| --- | --- |",
-                  f"| Catchpoint label | `{r.get('catchpoint_label') or 'n/a'}` |",
-                  f"| Fast-catchup time | {r.get('fast_catchup_seconds')} s |",
-                  f"| Reached tip | {r.get('reached_tip')} |",
-                  f"| Phase durations (s) | {phase_s} |",
-                  f"| Lag at tip (rounds): mean/p50/p95/p99/max (n) | {lag.get('mean')}/{lag.get('p50')}/{lag.get('p95')}/{lag.get('p99')}/{lag.get('max')} (n={lag.get('n')}) |",
-                  f"| Node last-round | {r.get('node_last_round')} |",
-                  f"| Peer last-round | {r.get('peer_last_round')} |",
-              ]
-              for key, h in (r.get("follow_block_timing") or {}).items():
-                  lines.append(
-                      f"| Follow block {key} (s): p50/p95/max (n) | {h.get('p50_s')}/{h.get('p95_s')}/{h.get('max_s')} (n={h.get('count')}) |"
-                  )
-              lines += nodelog.render_markdown(r).splitlines()
+              import monitor
+              lines = monitor.render_step_summary_lines(r)
           text = "\n".join(lines) + "\n"
           print(text)
           if summary_path:

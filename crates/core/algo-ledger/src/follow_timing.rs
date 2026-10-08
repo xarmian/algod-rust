@@ -45,6 +45,20 @@
 //!   apply is visible instead of silently missing from the success series.
 //!   `..._ensure_block_already_committed_total` counts the idempotent early
 //!   return (block already in the ledger).
+//! - `algod_rust_follow_block_commit_failed_seconds`: the SQLite `COMMIT`
+//!   (`commit_block`) when it returned an error (busy / I/O), which the
+//!   `commit` series (successful commits only) never sees. Early returns of
+//!   `ensure_block` that commit nothing because the ledger lock is
+//!   poisoned are observed into the `ensure_block_failed` series; the routine
+//!   "block is ahead of the ledger, needs catchup" skip is only counted by
+//!   `..._ensure_block_skipped_ahead_total`.
+//! - `algod_rust_process_start_time_seconds` (a gauge, see
+//!   [`process_start_time_prometheus_text`]): process start as float Unix
+//!   seconds with millisecond resolution, captured by
+//!   [`init_process_start_time`] as the first thing `main` does, so a scraper
+//!   can tell a restart from a counter delta even when the restarted node has
+//!   since processed more blocks than the earlier baseline. Compare it for
+//!   exact equality only.
 //!
 //! Sample populations differ: `apply`/`commit`/`ensure_block` are observed
 //! for every committed block, `avm` only for blocks that ran a top-level
@@ -191,6 +205,8 @@ pub struct FollowTiming {
     pub avm: FixedHistogram,
     /// SQLite commit time.
     pub commit: FixedHistogram,
+    /// SQLite commit time of commits that returned an error.
+    pub commit_failed: FixedHistogram,
     /// WAL checkpoint time.
     pub wal_checkpoint: FixedHistogram,
     /// The successful `ensure_block` attempt (lock wait + commit).
@@ -202,6 +218,9 @@ pub struct FollowTiming {
     pub ensure_block_retries: FixedCounter,
     /// `ensure_block` calls for a block the ledger already had.
     pub ensure_block_already_committed: FixedCounter,
+    /// `ensure_block` calls skipped because the block is ahead of the ledger
+    /// (routine: the catchup service will fetch the gap).
+    pub ensure_block_skipped_ahead: FixedCounter,
 }
 
 static FOLLOW_TIMING: FollowTiming = FollowTiming {
@@ -220,6 +239,10 @@ static FOLLOW_TIMING: FollowTiming = FollowTiming {
     commit: FixedHistogram::new(
         "algod_rust_follow_block_commit_seconds",
         "Wall time of the SQLite commit of one block on the follow path.",
+    ),
+    commit_failed: FixedHistogram::new(
+        "algod_rust_follow_block_commit_failed_seconds",
+        "Wall time of SQLite commits of one block on the follow path that returned an error.",
     ),
     wal_checkpoint: FixedHistogram::new(
         "algod_rust_follow_block_wal_checkpoint_seconds",
@@ -241,6 +264,10 @@ static FOLLOW_TIMING: FollowTiming = FollowTiming {
         "algod_rust_follow_block_ensure_block_already_committed_total",
         "ensure_block calls for a block the ledger had already committed (idempotent early return).",
     ),
+    ensure_block_skipped_ahead: FixedCounter::new(
+        "algod_rust_follow_block_ensure_block_skipped_ahead_total",
+        "ensure_block calls skipped because the block is ahead of the ledger (needs catchup; routine, not a failure).",
+    ),
 };
 
 /// The process-wide follow-path histograms.
@@ -256,12 +283,47 @@ pub fn follow_timing_prometheus_text() -> String {
     t.apply_failed.write_prometheus(&mut out);
     t.avm.write_prometheus(&mut out);
     t.commit.write_prometheus(&mut out);
+    t.commit_failed.write_prometheus(&mut out);
     t.wal_checkpoint.write_prometheus(&mut out);
     t.ensure_block.write_prometheus(&mut out);
     t.ensure_block_failed.write_prometheus(&mut out);
     t.ensure_block_retries.write_prometheus(&mut out);
     t.ensure_block_already_committed.write_prometheus(&mut out);
+    t.ensure_block_skipped_ahead.write_prometheus(&mut out);
     out
+}
+
+/// Process start as Unix time in milliseconds. Fixed on the first call;
+/// `main` calls [`init_process_start_time`] as its first statement, and the
+/// accessor initialises lazily as a fallback (tests, other binaries).
+fn process_start_unix_millis() -> u64 {
+    static START: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *START.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0)
+    })
+}
+
+/// Captures the process start time. Call it first thing in `main`.
+pub fn init_process_start_time() {
+    let _ = process_start_unix_millis();
+}
+
+/// Process start, Unix seconds with millisecond resolution.
+pub fn process_start_time_seconds() -> f64 {
+    process_start_unix_millis() as f64 / 1000.0
+}
+
+/// Prometheus text exposition of `algod_rust_process_start_time_seconds`.
+pub fn process_start_time_prometheus_text() -> String {
+    format!(
+        "# HELP algod_rust_process_start_time_seconds Process start as Unix time in seconds (millisecond resolution).\n\
+         # TYPE algod_rust_process_start_time_seconds gauge\n\
+         algod_rust_process_start_time_seconds {:.3}\n",
+        process_start_time_seconds()
+    )
 }
 
 thread_local! {
@@ -358,6 +420,8 @@ extern "C" fn wal_hook_cb(
 /// which installs the default hook), so no code may issue it; the
 /// `no_code_sets_wal_autocheckpoint` test guards that.
 pub fn install_wal_checkpoint_hook(conn: &rusqlite::Connection) {
+    // Fallback: normally `main` has already fixed the process start time.
+    init_process_start_time();
     // SAFETY: `handle()` is the live connection; the callback is a plain
     // `extern "C"` function that ignores its context pointer.
     unsafe {
@@ -394,12 +458,14 @@ mod tests {
         t.apply.observe(Duration::from_millis(3));
         t.avm.observe(Duration::from_millis(30));
         t.commit.observe(Duration::from_millis(1200));
+        t.commit_failed.observe(Duration::from_millis(5));
         t.wal_checkpoint.observe(Duration::from_millis(80));
         t.ensure_block.observe(Duration::from_millis(40));
         t.apply_failed.observe(Duration::from_millis(3));
         t.ensure_block_failed.observe(Duration::from_millis(3));
         t.ensure_block_retries.inc();
         t.ensure_block_already_committed.inc();
+        t.ensure_block_skipped_ahead.inc();
         let text = follow_timing_prometheus_text();
         assert!(text.ends_with('\n'));
         let mut families = std::collections::BTreeMap::<String, Vec<(String, f64)>>::new();
@@ -446,6 +512,7 @@ mod tests {
             "apply_failed",
             "avm",
             "commit",
+            "commit_failed",
             "wal_checkpoint",
             "ensure_block",
             "ensure_block_failed",
@@ -465,9 +532,35 @@ mod tests {
         for c in [
             "algod_rust_follow_block_ensure_block_retries_total",
             "algod_rust_follow_block_ensure_block_already_committed_total",
+            "algod_rust_follow_block_ensure_block_skipped_ahead_total",
         ] {
             assert!(families[c][0].1 >= 1.0, "{c}");
         }
+    }
+
+    /// Strict text-format check of the process start time gauge: exactly
+    /// HELP, TYPE gauge and one integer sample, no leading whitespace, and
+    /// the value is stable within a process and a plausible Unix time.
+    #[test]
+    fn process_start_time_gauge_is_strictly_valid_text_format() {
+        let text = process_start_time_prometheus_text();
+        assert!(text.ends_with('\n'));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text:?}");
+        assert!(lines[0].starts_with("# HELP algod_rust_process_start_time_seconds "));
+        assert_eq!(
+            lines[1],
+            "# TYPE algod_rust_process_start_time_seconds gauge"
+        );
+        let (name, value) = lines[2].rsplit_once(' ').expect("series value");
+        assert_eq!(name, "algod_rust_process_start_time_seconds");
+        let (secs, millis) = value.split_once('.').expect("fractional seconds");
+        assert_eq!(millis.len(), 3, "millisecond resolution: {value}");
+        let value: f64 = value.parse().expect("float seconds");
+        assert!(secs.parse::<u64>().is_ok());
+        assert!(value > 1.6e9, "implausible start time {value}");
+        assert!(lines.iter().all(|l| !l.starts_with(char::is_whitespace)));
+        assert_eq!(text, process_start_time_prometheus_text());
     }
 
     /// The hook replaces SQLite's default auto-checkpoint; a later

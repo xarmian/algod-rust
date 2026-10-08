@@ -32,6 +32,9 @@ use cli::{AlgocfgAction, AlgocfgProfileAction, BenchAction, CatchpointAction, Cl
 
 #[tokio::main]
 async fn main() -> anyhow::Result<std::process::ExitCode> {
+    // Process start time for `algod_rust_process_start_time_seconds`: capture
+    // it before anything else runs.
+    algo_ledger::follow_timing::init_process_start_time();
     // Initialize logging: RUST_LOG-driven fmt output plus the hickory DNSSEC error rate limit.
     log_setup::init();
     // Resolve the env-driven sync knobs once (a bad value is logged once).

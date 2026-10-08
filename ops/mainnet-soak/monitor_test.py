@@ -23,6 +23,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import monitor  # noqa: E402
+import nodelog  # noqa: E402
 
 
 def node_catchup(
@@ -1094,6 +1095,458 @@ class FollowTimingTest(unittest.TestCase):
             self.assertNotIn("follow_timing", monitor.take_sample("n", "", "p", ""))
         finally:
             monitor.fetch_status, monitor.fetch_follow_timing = orig_status, orig_fetch
+
+
+STALL = {
+    "round": 65_668_288,
+    "error": "account balance below minimum",
+    "consecutive_failures": 7,
+    "since_unix_secs": 1_700_000_000,
+}
+
+
+def node_follow_stalled(ts, round_, peer_round=None, stall=None):
+    s = node_follow(ts, round_, peer_round)
+    s["node"]["stalled_on_invalid_block"] = dict(stall or STALL)
+    return s
+
+
+class _FakeResp:
+    def __init__(self, body):
+        self._body = body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class InvalidBlockStallTest(unittest.TestCase):
+    """Issue #1715: stalled-on-invalid-block is a hard failure."""
+
+    def _fetch(self, body):
+        import json
+        import urllib.request
+
+        orig = urllib.request.urlopen
+        urllib.request.urlopen = lambda req, timeout=None: _FakeResp(json.dumps(body).encode())
+        try:
+            return monitor.fetch_status("http://n", "")
+        finally:
+            urllib.request.urlopen = orig
+
+    def test_fetch_status_extracts_the_stall_payload(self):
+        st = self._fetch(
+            {
+                "last-round": 5,
+                "stalled-on-invalid-block": {
+                    "round": 6,
+                    "error": "boom",
+                    "consecutive-failures": 3,
+                    "since-unix-secs": 99,
+                },
+            }
+        )
+        self.assertEqual(
+            st["stalled_on_invalid_block"],
+            {"round": 6, "error": "boom", "consecutive_failures": 3, "since_unix_secs": 99},
+        )
+
+    def test_fetch_status_without_the_field_is_none(self):
+        self.assertIsNone(self._fetch({"last-round": 5})["stalled_on_invalid_block"])
+
+    def test_classify_hard_fails_with_round_error_and_failures(self):
+        samples = [node_follow(1000.0 + i * 10, 100 + i, 100 + i) for i in range(3)]
+        samples.append(node_follow_stalled(1030.0, 103, 104))
+        v = monitor.classify(samples)
+        self.assertEqual(v.status, "invalid_block_stall")
+        self.assertEqual(v.round, STALL["round"])
+        self.assertIn(str(STALL["round"]), v.message)
+        self.assertIn("account balance below minimum", v.message)
+        self.assertIn("7", v.message)
+        self.assertEqual(monitor.exit_code_for(v), 1)
+
+    def test_healthy_node_without_stall_stays_ok(self):
+        samples = [node_follow(1000.0 + i * 10, 100 + i, 100 + i) for i in range(30)]
+        self.assertEqual(monitor.classify(samples).status, "ok")
+
+    def test_stall_reported_by_the_gauge_on_an_unreachable_sample_wins(self):
+        samples = [node_follow_stalled(1000.0, 103, 104)]
+        samples.append(
+            {
+                "ts": 1010.0,
+                "node": {"ok": False, "error": "refused", "stalled_on_invalid_block": {"round": 9, "source": "gauge"}},
+                "peer": {"ok": True, "last_round": 105},
+            }
+        )
+        self.assertEqual(monitor.classify(samples).status, "invalid_block_stall")
+
+    def test_gauge_alone_hard_fails_when_status_is_unavailable(self):
+        orig_status, orig_gauge = monitor.fetch_status, monitor.fetch_stall_gauge
+        monitor._follow_scrape_state["gauge_last_ts"] = 0.0
+        try:
+            monitor.fetch_status = lambda *a, **k: {"ok": False, "error": "timeout"}
+            monitor.fetch_stall_gauge = lambda url, timeout=1.0: {"round": 42}
+            sample = monitor.take_sample("n", "", "p", "")
+        finally:
+            monitor.fetch_status, monitor.fetch_stall_gauge = orig_status, orig_gauge
+        self.assertEqual(sample["node"]["stalled_on_invalid_block"], {"round": 42, "source": "gauge"})
+        v = monitor.classify([sample])
+        self.assertEqual(v.status, "invalid_block_stall")
+        self.assertEqual(v.round, 42)
+
+    def test_gauge_is_not_scraped_while_status_answers(self):
+        orig_status, orig_gauge = monitor.fetch_status, monitor.fetch_stall_gauge
+        calls = []
+        try:
+            monitor.fetch_status = lambda *a, **k: {"ok": True, "catchpoint": "1#X", "last_round": 0}
+            monitor.fetch_stall_gauge = lambda url, timeout=1.0: calls.append(url) or None
+            monitor.take_sample("n", "", "p", "")
+        finally:
+            monitor.fetch_status, monitor.fetch_stall_gauge = orig_status, orig_gauge
+        self.assertEqual(calls, [])
+
+    def test_parse_stall_gauge(self):
+        on = "algod_rust_sync_stalled_on_invalid_block 1\nalgod_rust_sync_stalled_block_round 42\n"
+        off = "algod_rust_sync_stalled_on_invalid_block 0\nalgod_rust_sync_stalled_block_round 0\n"
+        self.assertEqual(monitor.parse_stall_gauge(on), {"round": 42})
+        self.assertIsNone(monitor.parse_stall_gauge(off))
+        self.assertIsNone(monitor.parse_stall_gauge("other 1\n"))
+
+    def test_summary_and_issue_carry_the_status_payload(self):
+        import json
+
+        samples = [node_follow(1000.0 + i * 10, 100 + i, 100 + i) for i in range(3)]
+        samples.append(node_follow_stalled(1030.0, 103, 104))
+        v = monitor.classify(samples)
+        r = monitor.build_result(samples, v)
+        json.dumps(r)
+        self.assertEqual(r["status"], "invalid_block_stall")
+        self.assertEqual(r["invalid_block_stall"], STALL)
+        import file_issue
+
+        fields = file_issue.build_fields(r, "run", "art", "", "peer")
+        self.assertIn("account balance below minimum", fields["invalid_block_stall_line"])
+        self.assertIn("65668288", fields["invalid_block_stall_line"].replace(",", ""))
+        healthy = monitor.build_result(samples[:3], monitor.classify(samples[:3]))
+        self.assertIsNone(healthy["invalid_block_stall"])
+        self.assertEqual(file_issue.build_fields(healthy, "r", "a", "", "p")["invalid_block_stall_line"], "")
+
+    def test_collect_stops_early_on_the_stall(self):
+        import tempfile
+
+        orig = monitor.take_sample
+        monitor.take_sample = lambda *a, **k: node_follow_stalled(time.time(), 100, 101)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                t0 = time.time()
+                v = monitor.collect("n", "", "p", "", 30.0, 5.0, 0.02, os.path.join(d, "o.jsonl"))
+        finally:
+            monitor.take_sample = orig
+        self.assertEqual(v.status, "invalid_block_stall")
+        self.assertLess(time.time() - t0, 3.0)
+
+    def test_step_summary_row_shows_the_stall(self):
+        samples = [node_follow_stalled(1000.0, 103, 104)]
+        r = monitor.build_result(samples, monitor.classify(samples))
+        text = "\n".join(monitor.render_step_summary_lines(r))
+        self.assertIn("stalled-on-invalid-block", text)
+        self.assertIn("account balance below minimum", text)
+
+    def test_nodelog_stalled_log_line_is_hard(self):
+        line = (
+            "2026-01-01T01:00:00.000000Z ERROR algo_ledger::agreement_bridge: ensure_block: "
+            "stalled on invalid block 9: two failed attempts for the same round"
+        )
+        self.assertEqual(nodelog.scan_lines([line])["hard_failures"], {"stalled_on_invalid_block": 1})
+
+
+class LagBeforeStallTest(unittest.TestCase):
+    """Issue #1759: lag excludes the trailing frozen-node window."""
+
+    def _halted(self):
+        samples = [node_follow(1000.0 + i * 10, 500 + i, 500 + i + (i % 2)) for i in range(40)]
+        frozen_round = 539
+        for j in range(31):
+            samples.append(node_follow(1400.0 + j * 10, frozen_round, 540 + j))
+        return samples
+
+    def test_halt_verdict_separates_the_stall_window(self):
+        samples = self._halted()
+        v = monitor.classify(samples)
+        self.assertEqual(v.status, "stuck")
+        r = monitor.build_result(samples, v)
+        before = r["lag_rounds_before_stall"]
+        self.assertEqual(before["n"], 40)
+        self.assertLessEqual(before["max"], 2)
+        self.assertEqual(r["lag_rounds"]["n"], 71)  # unchanged, compatible
+        self.assertGreater(r["lag_rounds"]["max"], 20)
+        self.assertEqual(r["stall_window"]["seconds"], v.stalled_since_s)
+        self.assertIsNotNone(r["stall_window"]["start_ts"])
+
+    def test_without_a_halt_both_views_agree(self):
+        samples = [node_follow(1000.0 + i * 10, 500 + i, 500 + i + (i % 2)) for i in range(40)]
+        r = monitor.build_result(samples, monitor.classify(samples))
+        self.assertEqual(r["lag_rounds_before_stall"], r["lag_rounds"])
+        self.assertIsNone(r["stall_window"])
+
+    def test_step_summary_renders_both_numbers(self):
+        samples = self._halted()
+        r = monitor.build_result(samples, monitor.classify(samples))
+        text = "\n".join(monitor.render_step_summary_lines(r))
+        self.assertIn("Lag before stall", text)
+        self.assertIn("Stall window", text)
+
+
+class FollowTimingLeftoversTest(unittest.TestCase):
+    """Issue #1761 follow-ups."""
+
+    BOUNDS = [0.001, 0.01, 0.1, 1.0, 10.0]
+
+    def _t(self, key, cums, total, sum_s, start=None):
+        text = _exposition({key: (list(zip(self.BOUNDS, cums)), total, sum_s)})
+        out = monitor.parse_follow_timing(text)
+        if start is not None:
+            out["process_start_time_seconds"] = float(start)
+        return out
+
+    def test_failed_path_series_reach_the_summary(self):
+        for k in ("apply_failed", "ensure_block_failed", "commit_failed"):
+            self.assertIn(k, monitor.FOLLOW_TIMING_KEYS)
+        samples = [node_follow(1.0, 5, 5)]
+        samples[0]["follow_timing"] = self._t("apply_failed", [0, 1, 1, 1, 1], 1, 0.005)
+        a = monitor.summarize(samples)["follow_block_timing"]["apply_failed"]
+        self.assertEqual(a["count"], 1)
+
+    def test_process_start_time_is_parsed(self):
+        self.assertEqual(
+            monitor.parse_process_start_time(
+                "# TYPE x gauge\nalgod_rust_process_start_time_seconds 1700000000\n"
+            ),
+            1700000000.0,
+        )
+        self.assertIsNone(monitor.parse_process_start_time("nothing 1\n"))
+
+    def test_restart_with_more_blocks_than_baseline_is_caught_by_start_time(self):
+        samples = [node_follow(1000.0 + i * 10, 500 + i, 500 + i) for i in range(3)]
+        samples[0]["follow_timing"] = self._t("apply", [0, 1, 1, 1, 1], 1, 0.005, start=100)
+        # Restarted, then processed far more blocks: every counter grew.
+        samples[2]["follow_timing"] = self._t("apply", [0, 50, 90, 99, 100], 100, 9.0, start=900)
+        a = monitor.summarize(samples)["follow_block_timing"]["apply"]
+        self.assertTrue(a["restarted"])
+        self.assertEqual((a["baseline"], a["count"]), ("absolute", 100))
+
+    def test_same_start_time_keeps_the_delta(self):
+        samples = [node_follow(1000.0 + i * 10, 500 + i, 500 + i) for i in range(3)]
+        samples[0]["follow_timing"] = self._t("apply", [0, 1, 1, 1, 1], 1, 0.005, start=100)
+        samples[2]["follow_timing"] = self._t("apply", [0, 5, 5, 5, 5], 5, 0.02, start=100)
+        a = monitor.summarize(samples)["follow_block_timing"]["apply"]
+        self.assertFalse(a["restarted"])
+        self.assertEqual((a["baseline"], a["count"]), ("delta", 4))
+
+    def test_baseline_scrape_is_forced_at_the_tip_transition(self):
+        orig_status, orig_fetch = monitor.fetch_status, monitor.fetch_follow_timing
+        monitor._follow_scrape_state.update(last_ts=0.0, failures=0, logged=False, tip_scraped=False)
+        calls = []
+        try:
+            monitor.fetch_follow_timing = lambda url, timeout=1.0: calls.append(url) or {"apply": {}}
+            # Behind the tip: scrape (interval elapsed).
+            monitor.fetch_status = lambda url, *a, **k: {
+                "ok": True,
+                "catchpoint": None,
+                "last_round": 90 if url == "n" else 100,
+            }
+            self.assertIn("follow_timing", monitor.take_sample("n", "", "p", ""))
+            self.assertEqual(len(calls), 1)
+            # Reaches the tip inside the 30 s rate-limit window: still scraped.
+            monitor.fetch_status = lambda url, *a, **k: {"ok": True, "catchpoint": None, "last_round": 100}
+            self.assertIn("follow_timing", monitor.take_sample("n", "", "p", ""))
+            self.assertEqual(len(calls), 2)
+            # Only once: the next in-window sample is rate limited again.
+            self.assertNotIn("follow_timing", monitor.take_sample("n", "", "p", ""))
+            self.assertEqual(len(calls), 2)
+        finally:
+            monitor.fetch_status, monitor.fetch_follow_timing = orig_status, orig_fetch
+
+    def test_step_summary_prints_baseline_and_restarted(self):
+        samples = [node_follow(1.0, 5, 5)]
+        samples[0]["follow_timing"] = self._t("apply", [0, 1, 1, 1, 1], 1, 0.005)
+        r = monitor.build_result(samples, monitor.classify(samples))
+        text = "\n".join(monitor.render_step_summary_lines(r))
+        self.assertIn("Follow block apply", text)
+        self.assertIn("baseline=absolute", text)
+        self.assertIn("restarted=False", text)
+
+
+class StallLifecycleTest(unittest.TestCase):
+    """PR #1762 review: a cleared stall must not hard-fail forever."""
+
+    def _run(self, tail):
+        samples = [node_follow(1000.0 + i * 10, 100 + i, 100 + i) for i in range(3)]
+        samples.append(node_follow_stalled(1030.0, 103, 104))
+        return samples + tail
+
+    def test_cleared_stall_does_not_fail_and_is_reported(self):
+        samples = self._run([node_follow(1040.0 + i * 10, 104 + i, 104 + i) for i in range(5)])
+        v = monitor.classify(samples)
+        self.assertEqual(v.status, "ok")
+        r = monitor.build_result(samples, v)
+        self.assertIsNone(r["invalid_block_stall"])
+        cleared = r["invalid_block_stall_cleared"]
+        self.assertEqual(cleared["round"], STALL["round"])
+        self.assertEqual(cleared["first_ts"], 1030.0)
+        self.assertEqual(cleared["last_ts"], 1030.0)
+        text = "\n".join(monitor.render_step_summary_lines(r))
+        self.assertIn("cleared", text)
+
+    def test_stall_persisting_to_the_end_fails(self):
+        samples = self._run([node_follow_stalled(1040.0, 103, 105)])
+        v = monitor.classify(samples)
+        self.assertEqual(v.status, "invalid_block_stall")
+        self.assertEqual(v.stalled_since_s, 10.0)  # contiguous run only
+
+    def test_stall_then_node_failure_is_node_failure(self):
+        samples = self._run(
+            [{"ts": 1040.0, "node": {"ok": False, "error": "refused"}, "peer": {"ok": True, "last_round": 105}}]
+        )
+        self.assertEqual(monitor.classify(samples).status, "node_failure")
+
+    def test_no_cleared_key_content_for_a_healthy_run(self):
+        samples = [node_follow(1000.0 + i * 10, 100 + i, 100 + i) for i in range(3)]
+        self.assertIsNone(monitor.build_result(samples, monitor.classify(samples))["invalid_block_stall_cleared"])
+
+
+class GaugeScrapeTest(unittest.TestCase):
+    """PR #1762 review: the gauge is rate limited and only read while status is down."""
+
+    def test_gauge_scrape_is_rate_limited(self):
+        orig_status, orig_gauge = monitor.fetch_status, monitor.fetch_stall_gauge
+        calls = []
+        monitor._follow_scrape_state["gauge_last_ts"] = 0.0
+        try:
+            monitor.fetch_status = lambda *a, **k: {"ok": False, "error": "timeout"}
+            monitor.fetch_stall_gauge = lambda url, timeout=1.0: calls.append(url) or None
+            monitor.take_sample("n", "", "p", "")
+            monitor.take_sample("n", "", "p", "")
+            self.assertEqual(len(calls), 1)
+            monitor._follow_scrape_state["gauge_last_ts"] -= monitor.FOLLOW_TIMING_SCRAPE_INTERVAL_S
+            monitor.take_sample("n", "", "p", "")
+            self.assertEqual(len(calls), 2)
+        finally:
+            monitor.fetch_status, monitor.fetch_stall_gauge = orig_status, orig_gauge
+
+    def test_one_metrics_text_feeds_timing_and_gauge(self):
+        text = (
+            _exposition({"apply": ([(0.001, 1), (0.01, 1), (0.1, 1), (1.0, 1), (10.0, 1)], 1, 0.0005)})
+            + "algod_rust_process_start_time_seconds 1700000000.123\n"
+            + "algod_rust_sync_stalled_on_invalid_block 1\nalgod_rust_sync_stalled_block_round 42\n"
+        )
+        import urllib.request
+
+        orig = urllib.request.urlopen
+        n = []
+        urllib.request.urlopen = lambda req, timeout=None: n.append(1) or _FakeResp(text.encode())
+        try:
+            timing = monitor.fetch_follow_timing("http://n")
+        finally:
+            urllib.request.urlopen = orig
+        self.assertEqual(len(n), 1)
+        self.assertEqual(timing["process_start_time_seconds"], 1700000000.123)
+        self.assertEqual(monitor.parse_stall_gauge(text), {"round": 42})
+
+
+class RestartPreTipTest(unittest.TestCase):
+    BOUNDS = [0.001, 0.01, 0.1, 1.0, 10.0]
+
+    def _t(self, cums, total, sum_s, start):
+        out = monitor.parse_follow_timing(
+            _exposition({"apply": (list(zip(self.BOUNDS, cums)), total, sum_s)})
+        )
+        out["process_start_time_seconds"] = start
+        return out
+
+    def _samples(self, post_restart_lag):
+        samples = [node_follow(1000.0 + i * 10, 500 + i, 500 + i) for i in range(4)]
+        samples[0]["follow_timing"] = self._t([0, 1, 1, 1, 1], 1, 0.005, 100.5)
+        # First post-restart scrape: node still behind the peer.
+        samples[2] = node_follow(1020.0, 500, 500 + post_restart_lag)
+        samples[2]["follow_timing"] = self._t([0, 5, 5, 5, 5], 5, 0.02, 900.25)
+        samples[3]["follow_timing"] = self._t([0, 50, 90, 99, 100], 100, 9.0, 900.25)
+        return samples
+
+    def test_restart_while_behind_the_tip_flags_pre_tip_included(self):
+        a = monitor.summarize(self._samples(50))["follow_block_timing"]["apply"]
+        self.assertTrue(a["restarted"])
+        self.assertTrue(a["pre_tip_included"])
+        self.assertEqual(a["count"], 100)
+
+    def test_restart_at_the_tip_does_not_flag_pre_tip(self):
+        a = monitor.summarize(self._samples(0))["follow_block_timing"]["apply"]
+        self.assertTrue(a["restarted"])
+        self.assertFalse(a["pre_tip_included"])
+
+    def test_no_restart_has_no_pre_tip_flag(self):
+        samples = self._samples(0)
+        samples[3]["follow_timing"] = self._t([0, 6, 6, 6, 6], 6, 0.03, 100.5)
+        samples[2].pop("follow_timing")
+        a = monitor.summarize(samples)["follow_block_timing"]["apply"]
+        self.assertFalse(a["restarted"])
+        self.assertFalse(a["pre_tip_included"])
+
+
+class StallTextEscapingTest(unittest.TestCase):
+    NASTY = {
+        "round": 7,
+        "error": "bad `block`\nline2 | pipe " + "x" * 600,
+        "consecutive_failures": 3,
+        "since_unix_secs": 99,
+    }
+
+    def test_sanitize_strips_backticks_newlines_and_truncates(self):
+        out = nodelog.sanitize_text(self.NASTY["error"])
+        self.assertNotIn("`", out)
+        self.assertNotIn("\n", out)
+        self.assertLessEqual(len(out), 500)
+        cell = nodelog.sanitize_text("a|b", table=True)
+        self.assertNotIn("|", cell)
+
+    def test_step_summary_cell_is_one_clean_table_row(self):
+        samples = [node_follow_stalled(1000.0, 103, 104, stall=self.NASTY)]
+        r = monitor.build_result(samples, monitor.classify(samples))
+        lines = monitor.render_step_summary_lines(r)
+        row = [l for l in lines if l.startswith("| stalled-on-invalid-block")]
+        self.assertEqual(len(row), 1)
+        self.assertEqual(row[0].count("|"), 3)
+        self.assertNotIn("`", row[0])
+        self.assertIn("round: 7", row[0])
+        self.assertNotIn("{'", row[0])  # formatted text, not a dict repr
+        verdict_line = [l for l in lines if l.startswith("**Verdict:**")][0]
+        self.assertNotIn("`block`", verdict_line)
+        self.assertNotIn("\n", r["message"])
+        self.assertLessEqual(len(r["message"]), 700)
+
+    def test_issue_body_has_verdict_specific_intro_and_escaped_text(self):
+        import file_issue
+
+        samples = [node_follow_stalled(1000.0, 103, 104, stall=self.NASTY)]
+        r = monitor.build_result(samples, monitor.classify(samples))
+        fields = file_issue.build_fields(r, "run", "art", "", "peer")
+        body = file_issue.render_template(os.path.join(os.path.dirname(os.path.abspath(__file__)), "issue_template.md"), fields)
+        self.assertIn("stalled-on-invalid-block", fields["halt_intro"])
+        self.assertNotIn("no observable progress", body)
+        line = fields["invalid_block_stall_line"]
+        self.assertIn("round: 7", line)
+        self.assertNotIn("bad `block`", line)
+        self.assertNotIn("{'", line)
+        self.assertLessEqual(len(line), 900)
+        stuck = file_issue.build_fields(
+            {"status": "stuck", "phase": "follow", "round": 5, "stalled_since_s": 400.0}, "r", "a", "", "p"
+        )
+        self.assertIn("no observable progress", stuck["halt_intro"])
 
 
 if __name__ == "__main__":
