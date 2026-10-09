@@ -75,10 +75,19 @@ impl RoundSearch {
         self.tried.len()
     }
 
+    /// Record that `round` was actually evaluated (a successful seed fetch
+    /// and sortition draw). Only then does it stop being a candidate and
+    /// count toward the cap, so a probe that failed on a transient error is
+    /// retried rather than silently consumed.
+    pub fn mark_tried(&mut self, round: u64) {
+        self.tried.insert(round);
+    }
+
     /// Decide the next step given the node's last committed round and the time
     /// spent so far. The first poll always yields a probe, so a zero budget
-    /// still evaluates one round.
-    pub fn step(&mut self, last_round: u64, elapsed: Duration) -> SearchStep {
+    /// still evaluates one round. `Probe` does not consume the round: call
+    /// [`Self::mark_tried`] once it has really been evaluated.
+    pub fn step(&self, last_round: u64, elapsed: Duration) -> SearchStep {
         let exhausted = SearchStep::Exhausted {
             distinct_rounds: self.tried.len(),
         };
@@ -90,13 +99,38 @@ impl RoundSearch {
             if elapsed >= self.budget && !self.tried.is_empty() {
                 return exhausted;
             }
-            self.tried.insert(candidate);
             return SearchStep::Probe(candidate);
         }
         if elapsed >= self.budget {
             return exhausted;
         }
         SearchStep::Wait
+    }
+}
+
+/// Exponential backoff for transient REST failures inside the search loop:
+/// 1 s, 2 s, 4 s, then capped at 8 s; [`Backoff::reset`] after a success.
+#[derive(Debug, Clone, Default)]
+pub struct Backoff {
+    failures: u32,
+}
+
+impl Backoff {
+    /// Delay to sleep after one more failure.
+    pub fn next_delay(&mut self) -> Duration {
+        let secs = 1u64 << self.failures.min(3);
+        self.failures = self.failures.saturating_add(1);
+        Duration::from_secs(secs)
+    }
+
+    /// Forget past failures after a successful call.
+    pub fn reset(&mut self) {
+        self.failures = 0;
+    }
+
+    /// Consecutive failures so far.
+    pub fn failures(&self) -> u32 {
+        self.failures
     }
 }
 
@@ -108,14 +142,44 @@ mod tests {
         Duration::from_secs(n)
     }
 
+    fn probe(r: &mut RoundSearch, last: u64, t: u64) -> SearchStep {
+        let step = r.step(last, s(t));
+        if let SearchStep::Probe(round) = step {
+            r.mark_tried(round);
+        }
+        step
+    }
+
     #[test]
     fn repeated_polls_of_the_same_round_are_not_new_draws() {
         let mut r = RoundSearch::new(s(300), 0);
-        assert_eq!(r.step(10, s(0)), SearchStep::Probe(12));
-        assert_eq!(r.step(10, s(1)), SearchStep::Wait);
-        assert_eq!(r.step(10, s(2)), SearchStep::Wait);
-        assert_eq!(r.step(11, s(3)), SearchStep::Probe(13));
+        assert_eq!(probe(&mut r, 10, 0), SearchStep::Probe(12));
+        assert_eq!(probe(&mut r, 10, 1), SearchStep::Wait);
+        assert_eq!(probe(&mut r, 10, 2), SearchStep::Wait);
+        assert_eq!(probe(&mut r, 11, 3), SearchStep::Probe(13));
         assert_eq!(r.distinct_rounds(), 2);
+    }
+
+    #[test]
+    fn a_probe_that_was_not_evaluated_is_retried() {
+        let r = RoundSearch::new(s(300), 0);
+        // The caller hit a transient error before evaluating round 12 and
+        // never called mark_tried: the same round is offered again.
+        assert_eq!(r.step(10, s(0)), SearchStep::Probe(12));
+        assert_eq!(r.step(10, s(1)), SearchStep::Probe(12));
+        assert_eq!(r.distinct_rounds(), 0);
+    }
+
+    #[test]
+    fn failed_probes_do_not_count_toward_the_cap() {
+        let mut r = RoundSearch::new(s(1000), 1);
+        assert_eq!(r.step(1, s(0)), SearchStep::Probe(3));
+        assert_eq!(r.step(1, s(1)), SearchStep::Probe(3));
+        r.mark_tried(3);
+        assert_eq!(
+            r.step(2, s(2)),
+            SearchStep::Exhausted { distinct_rounds: 1 }
+        );
     }
 
     #[test]
@@ -124,7 +188,7 @@ mod tests {
         let mut probes = 0;
         for i in 0..200u64 {
             // 3 polls per round, as on a 2.7 s/round cluster polled at 0.9 s.
-            if let SearchStep::Probe(_) = r.step(100 + i / 3, s(i)) {
+            if let SearchStep::Probe(_) = probe(&mut r, 100 + i / 3, i) {
                 probes += 1;
             }
         }
@@ -134,10 +198,10 @@ mod tests {
     #[test]
     fn exhausted_after_the_time_budget_when_no_new_round() {
         let mut r = RoundSearch::new(s(10), 0);
-        assert_eq!(r.step(5, s(0)), SearchStep::Probe(7));
-        assert_eq!(r.step(5, s(9)), SearchStep::Wait);
+        assert_eq!(probe(&mut r, 5, 0), SearchStep::Probe(7));
+        assert_eq!(probe(&mut r, 5, 9), SearchStep::Wait);
         assert_eq!(
-            r.step(5, s(10)),
+            probe(&mut r, 5, 10),
             SearchStep::Exhausted { distinct_rounds: 1 }
         );
     }
@@ -145,9 +209,9 @@ mod tests {
     #[test]
     fn a_new_round_after_the_deadline_is_not_probed() {
         let mut r = RoundSearch::new(s(10), 0);
-        assert_eq!(r.step(5, s(0)), SearchStep::Probe(7));
+        assert_eq!(probe(&mut r, 5, 0), SearchStep::Probe(7));
         assert_eq!(
-            r.step(6, s(11)),
+            probe(&mut r, 6, 11),
             SearchStep::Exhausted { distinct_rounds: 1 }
         );
     }
@@ -155,9 +219,9 @@ mod tests {
     #[test]
     fn zero_budget_still_evaluates_one_round_then_fails() {
         let mut r = RoundSearch::new(s(0), 0);
-        assert_eq!(r.step(5, s(0)), SearchStep::Probe(7));
+        assert_eq!(probe(&mut r, 5, 0), SearchStep::Probe(7));
         assert_eq!(
-            r.step(6, s(0)),
+            probe(&mut r, 6, 0),
             SearchStep::Exhausted { distinct_rounds: 1 }
         );
     }
@@ -165,11 +229,21 @@ mod tests {
     #[test]
     fn distinct_round_cap_is_honoured() {
         let mut r = RoundSearch::new(s(1000), 2);
-        assert_eq!(r.step(1, s(0)), SearchStep::Probe(3));
-        assert_eq!(r.step(2, s(1)), SearchStep::Probe(4));
+        assert_eq!(probe(&mut r, 1, 0), SearchStep::Probe(3));
+        assert_eq!(probe(&mut r, 2, 1), SearchStep::Probe(4));
         assert_eq!(
-            r.step(3, s(2)),
+            probe(&mut r, 3, 2),
             SearchStep::Exhausted { distinct_rounds: 2 }
         );
+    }
+
+    #[test]
+    fn backoff_doubles_caps_and_resets() {
+        let mut b = Backoff::default();
+        let got: Vec<u64> = (0..6).map(|_| b.next_delay().as_secs()).collect();
+        assert_eq!(got, vec![1, 2, 4, 8, 8, 8]);
+        assert_eq!(b.failures(), 6);
+        b.reset();
+        assert_eq!(b.next_delay(), s(1));
     }
 }

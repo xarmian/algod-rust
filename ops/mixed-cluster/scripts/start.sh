@@ -287,16 +287,19 @@ fi
 # `apply.rs` per-block pruning), so a non-archival Rust node keeps only
 # ~MaxTxnLife rounds, as a non-archival go node does. Merged with any
 # config.json written above.
+# Set (PHASE6_GO_ARCHIVAL=1) or CLEAR (otherwise) the key on every start, so a
+# config.json kept by REUSE_NETROOT=1 cannot carry a stale value.
+RUST_ARCHIVAL=0
 if [ "${PHASE6_GO_ARCHIVAL:-0}" = "1" ]; then
     echo "==> enabling Archival on rust-node-4 (PHASE6_GO_ARCHIVAL=1)"
+    RUST_ARCHIVAL=1
+fi
+if [ -f "$RUST_DATA_DIR/config.json" ] || [ "$RUST_ARCHIVAL" = "1" ]; then
     EXISTING_CFG="{}"
     [ -f "$RUST_DATA_DIR/config.json" ] && EXISTING_CFG="$(cat "$RUST_DATA_DIR/config.json")"
-    python3 -c "
-import json, sys
-cfg = json.loads(sys.argv[1])
-cfg['Archival'] = True
-print(json.dumps(cfg))
-" "$EXISTING_CFG" | tr -d '\r' > "$RUST_DATA_DIR/config.json"
+    printf '%s' "$EXISTING_CFG" | python3 "$HERE/rust_config_merge.py" - "$RUST_ARCHIVAL" \
+        | tr -d '\r' > "$RUST_DATA_DIR/config.json.new"
+    mv "$RUST_DATA_DIR/config.json.new" "$RUST_DATA_DIR/config.json"
 fi
 
 # -- 5. Start the Go nodes, then the Rust node -----------------------------

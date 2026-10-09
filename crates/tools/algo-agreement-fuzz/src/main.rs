@@ -43,7 +43,7 @@ use std::time::Duration;
 use algo_agreement::{Period, Seed, DOWN, PROPOSE};
 use algo_agreement_fuzz::inject::{inject_one, InjectionOutcome, InjectorConfig};
 use algo_agreement_fuzz::inject_p2p::{capture_proposal_p2p, inject_one_p2p, P2pInjectorConfig};
-use algo_agreement_fuzz::round_search::{RoundSearch, SearchStep};
+use algo_agreement_fuzz::round_search::{Backoff, RoundSearch, SearchStep};
 use algo_agreement_fuzz::{
     baseline_and_faulted, bottom, committee_weight, corrupt_proposal, encode_compound_message,
     encode_vote, synthetic_proposal_value, OtsDomain, ParticipationSecrets, ProposalFault,
@@ -112,11 +112,12 @@ struct Cli {
     #[arg(long, default_value_t = 20)]
     observe_secs: u64,
 
-    /// Cap on distinct rounds evaluated while searching for a zero-weight
-    /// selector (`wrong-committee-weight` only); 0 = no cap, bounded only by
-    /// `--weight-search-secs`.
+    /// Cap on DISTINCT rounds evaluated while searching for a zero-weight
+    /// selector (`wrong-committee-weight` only); 0 (the default) = no cap,
+    /// bounded only by `--weight-search-secs`. Before #1778 this counted raw
+    /// polls (default 40), which re-evaluated the same round several times.
     #[arg(long, default_value_t = 0)]
-    weight_search_rounds: usize,
+    weight_search_rounds: u64,
 
     /// Wall-clock bound, in seconds, for the zero-weight round search
     /// (`wrong-committee-weight` only). An account with ~10% stake misses a
@@ -463,6 +464,36 @@ fn parse_proposal_fault(name: &str) -> Result<ProposalFault> {
     })
 }
 
+/// Per-call bound for the REST calls inside the zero-weight search.
+const SEARCH_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Await `fut` for at most [`SEARCH_CALL_TIMEOUT`], folding errors and
+/// timeouts into a message so the caller can retry.
+async fn bounded<T>(
+    what: &str,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> std::result::Result<T, String> {
+    match tokio::time::timeout(SEARCH_CALL_TIMEOUT, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(format!("{what}: {e:#}")),
+        Err(_) => Err(format!(
+            "{what}: timed out after {}s",
+            SEARCH_CALL_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+/// Sleep the next backoff delay (never past the deadline). Returns `true`
+/// when the wall-clock bound is already spent and the search must stop.
+async fn retry_sleep(backoff: &mut Backoff, started: std::time::Instant, budget: Duration) -> bool {
+    let remaining = budget.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return true;
+    }
+    tokio::time::sleep(backoff.next_delay().min(remaining)).await;
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_vote_case(
     cli: &Cli,
@@ -517,43 +548,81 @@ async fn run_vote_case(
         // search polls the node until such a round becomes current.
         // Only distinct rounds count as draws and the search is bounded by
         // wall-clock time, not a fixed probe count (#1778).
+        let budget = Duration::from_secs(cli.weight_search_secs);
         let mut search = RoundSearch::new(
-            Duration::from_secs(cli.weight_search_secs),
-            cli.weight_search_rounds,
+            budget,
+            usize::try_from(cli.weight_search_rounds).unwrap_or(usize::MAX),
         );
+        let mut backoff = Backoff::default();
+        let mut last_err: Option<String> = None;
         let started = std::time::Instant::now();
         let mut found = None;
-        let mut exhausted = 0usize;
         loop {
-            let last = algod.last_round().await?;
+            // Transient REST failures (and hung calls) are retried with
+            // backoff until the wall-clock bound, never abort the case.
+            let last = match bounded("last_round", algod.last_round()).await {
+                Ok(l) => l,
+                Err(e) => {
+                    last_err = Some(e);
+                    if retry_sleep(&mut backoff, started, budget).await {
+                        break;
+                    }
+                    continue;
+                }
+            };
             match search.step(last.0, started.elapsed()) {
                 SearchStep::Probe(r) => {
                     let round = Round(r);
-                    let seed = algod
-                        .seed(algo_agreement::seed_round(round, &params))
-                        .await?;
+                    let seed = match bounded(
+                        "seed",
+                        algod.seed(algo_agreement::seed_round(round, &params)),
+                    )
+                    .await
+                    {
+                        Ok(seed) => seed,
+                        Err(e) => {
+                            last_err = Some(e);
+                            if retry_sleep(&mut backoff, started, budget).await {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+                    backoff.reset();
                     let mut probe = ctx.clone();
                     probe.round = round;
                     probe.seed = seed;
                     probe.proposal = synthetic_proposal_value(sender, round, Period(0));
+                    search.mark_tried(r);
                     if committee_weight(&probe, secrets) == 0 {
                         found = Some(probe);
                         break;
                     }
                 }
-                SearchStep::Wait => {}
-                SearchStep::Exhausted { distinct_rounds } => {
-                    exhausted = distinct_rounds;
-                    break;
-                }
+                SearchStep::Wait => backoff.reset(),
+                SearchStep::Exhausted { .. } => break,
             }
             tokio::time::sleep(Duration::from_millis(900)).await;
         }
+        let elapsed = started.elapsed();
         ctx = found.ok_or_else(|| {
+            let cap = if cli.weight_search_rounds == 0 {
+                "no cap".to_string()
+            } else {
+                cli.weight_search_rounds.to_string()
+            };
             anyhow!(
-                "account won a proposer seat in every one of the {exhausted} distinct rounds \
-                 probed over {}s (--weight-search-secs); no zero-weight round exists within the bound",
-                cli.weight_search_secs
+                concat!(
+                    "no zero-weight round found: account won a proposer seat in every ",
+                    "one of the {} distinct rounds probed in {:.1}s (bounds: ",
+                    "--weight-search-secs {}, --weight-search-rounds {}); ",
+                    "last transient error: {}"
+                ),
+                search.distinct_rounds(),
+                elapsed.as_secs_f64(),
+                cli.weight_search_secs,
+                cap,
+                last_err.as_deref().unwrap_or("none")
             )
         })?;
     }

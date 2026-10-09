@@ -70,6 +70,8 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=cert_window.sh
+source "$HERE/cert_window.sh"
 ROOT="$(cd "$HERE/.." && pwd)"
 REPO_ROOT="$(cd "$ROOT/../.." && pwd)"
 
@@ -292,6 +294,7 @@ if [ "$RUN_CERT" = "1" ]; then
             exit 4
         fi
         CERT_LEDGER_PATH="$CERT_PREFIX_CANDIDATE"
+        BLOCK_PATH="${CERT_PREFIX_CANDIDATE}.block.sqlite"
         echo "==> cert cross-verify (Go-produced → Rust verifier), stride $STRIDE"
         echo "    ledger: $CERT_LEDGER_PATH (--cert-ledger override)"
     else
@@ -338,9 +341,7 @@ if [ "$RUN_CERT" = "1" ]; then
                 exit 4
             fi
             # Lowest block round the Rust ledger retains (#1777).
-            RUST_EARLIEST="$(docker exec phase6-rust-node-4 sqlite3 \
-                    /app/verify-soak-block.sqlite 'SELECT MIN(rnd) FROM blocks' \
-                    2>/dev/null | tr -d '\r' || true)"
+            RUST_EARLIEST="$(probe_earliest_container phase6-rust-node-4 /app/verify-soak-block.sqlite)"
             # Clean up the in-container snapshots; don't leak volume
             # space across runs. `rm -f` is safe even if a file vanished.
             docker exec phase6-rust-node-4 rm -f \
@@ -395,16 +396,15 @@ if [ "$RUN_CERT" = "1" ]; then
     # restricts the pass to the last N rounds. A clamp is never silent: the
     # CERT_WINDOW_CLAMPED line is grepped by consensus-conformance.sh into a
     # WARN row of the summary. The fork detector still covers the whole range.
-    CERT_WINDOW="${CERT_WINDOW:-0}"
-    CERT_RETAIN_MARGIN="${CERT_RETAIN_MARGIN:-100}"
-    if [ -z "${RUST_EARLIEST:-}" ] && [ -s "${BLOCK_PATH:-/nonexistent}" ] && command -v sqlite3 >/dev/null 2>&1; then
-        RUST_EARLIEST="$(sqlite3 "$BLOCK_PATH" 'SELECT MIN(rnd) FROM blocks' 2>/dev/null | tr -d '\r' || true)"
+    # No sqlite3 in the container (or the snapshot path was a raw docker cp):
+    # probe the host copy with sqlite3, then python's sqlite3 module.
+    if [ -z "${RUST_EARLIEST:-}" ]; then
+        RUST_EARLIEST="$(probe_earliest_file "${BLOCK_PATH:-}")"
     fi
-    read -r CERT_FROM CERT_CLAMPED CERT_REASON < <(python3 "$HERE/cert_window.py" \
-        "$FROM_ROUND" "$TO_ROUND" "${RUST_EARLIEST:-none}" "$CERT_RETAIN_MARGIN" "$CERT_WINDOW" | tr -d '\r')
-    if [ "$CERT_CLAMPED" = "1" ]; then
-        echo "    CERT_WINDOW_CLAMPED=1 cert cross-verify covers $CERT_FROM..$TO_ROUND only (requested $FROM_ROUND..$TO_ROUND): $CERT_REASON"
-    fi
+    # An unknown earliest round is never silently unclamped (cert_window.py
+    # falls back to CERT_WINDOW, else the last 900 rounds).
+    resolve_cert_window "$FROM_ROUND" "$TO_ROUND" "${RUST_EARLIEST:-}" || exit 2
+    CERT_FROM="${CERT_FROM:?}"
     set +e
     "$CERT_BIN" \
         --node http://127.0.0.1:4001 \
