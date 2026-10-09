@@ -158,11 +158,12 @@ class Env:
     def __init__(self, container=GO_CONTAINER, wallet=None):
         self.container = container
         self.wallet = wallet
+        self.user = "root"
 
     def sh(self, cmd: str, timeout=180):
         try:
             p = subprocess.run(
-                ["docker", "exec", self.container, "sh", "-c", cmd],
+                ["docker", "exec", "-u", self.user, self.container, "sh", "-c", cmd],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -356,7 +357,11 @@ class Workload:
     def goal_must(self, args):
         rc, out = self.env.goal(args)
         if rc != 0:
-            raise ScenarioAbort("goal {} failed: {}".format(args, out[-200:]))
+            diag = ""
+            if "wallet" in out or "kmd" in out:
+                _, d = self.env.sh("ls -ld {0}/kmd-v0.5; id; tail -n 5 {0}/kmd-v0.5/kmd.log {0}/kmd-v0.5/kmd-err.log".format(DATA_DIR))
+                diag = " | kmd diag: " + d.replace("\n", " ")[-400:]
+            raise ScenarioAbort("goal {} failed: {}{}".format(args, out[-200:], diag))
         return out
 
     def new_account(self):
@@ -390,6 +395,25 @@ class Workload:
             raise ScenarioAbort("{} has no {}".format(addr, key))
         return max(ids)
 
+    def warm_kmd(self):
+        """Start a persistent kmd and wait until it lists wallets.  The first
+        goal call on a cold node has been seen to hit "connection refused"
+        on 127.0.0.1:7833 (CI run 37911992082), so do not rely on goal's
+        implicit start.  Tries root, then the image's own user."""
+        last = ""
+        for user in getattr(self.env, "users", ("root", "algorand")):
+            if hasattr(self.env, "user"):
+                self.env.user = user
+            for attempt in range(8):
+                self.env.goal("kmd start -t 0")
+                rc, out = self.env.goal("wallet list")
+                last = out
+                if rc == 0:
+                    self.emit({"kind": "workload_kmd", "user": user, "attempts": attempt + 1, "t_utc": utc_now()})
+                    return
+                self.env.sleep(5)
+        raise ScenarioAbort("kmd never became ready: " + last[-300:])
+
     # -- setup ----------------------------------------------------------
 
     def setup(self):
@@ -400,6 +424,7 @@ class Workload:
         rc, out = self.env.sh("chmod 700 {}/kmd-v0.5; mkdir -p {}".format(DATA_DIR, WORK_DIR))
         if rc != 0:
             raise SystemExit("cannot create {} in container: {}".format(WORK_DIR, out))
+        self.warm_kmd()
         for name in ("rich_app.teal", "rich_clear.teal"):
             self.env.put_file(os.path.join(WORKLOAD_DIR, name), "{}/{}".format(WORK_DIR, name))
         if not self.funder:
@@ -735,6 +760,10 @@ class Workload:
         try:
             self.setup()
         except StopRequested:
+            self.finish()
+            return
+        except ScenarioAbort as e:
+            self.emit({"kind": "workload_abort", "scenario": "setup", "reason": str(e)[:600], "t_utc": utc_now()})
             self.finish()
             return
         i = 0

@@ -710,6 +710,15 @@ class RichWorkloadTest(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertIn("no steps", res["failures"][0])
 
+    def test_empty_workload_file_is_a_failure_not_a_pass(self):
+        # Regression: CI run 37911992082 passed with an EMPTY workload.jsonl
+        # (kmd never started) because empty input skipped every workload check.
+        res = analyze.rich_workload_check([], [bc_rec(1), bc_rec(2)], workload_expected=True)
+        self.assertFalse(res["ok"])
+        joined = " | ".join(res["failures"])
+        self.assertIn("no steps", joined)
+        self.assertIn("non-payment round", joined)
+
     def test_confirmed_step_in_an_empty_round_fails(self):
         wl = rich_workload()
         wl[0]["round"] = 1  # round 1 carries no txns

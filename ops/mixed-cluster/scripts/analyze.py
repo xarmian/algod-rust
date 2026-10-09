@@ -616,7 +616,7 @@ def block_ts_catch_up_check(block_times: list, header_lags_s: list = ()) -> dict
 
 
 def rich_workload_check(workload_records, bc_records, require_types=("pay", "axfer", "acfg", "appl"),
-                        min_nonpay_rounds=1, require_coverage=True):
+                        min_nonpay_rounds=1, require_coverage=True, workload_expected=None):
     """Issue #1674: did go and algod-rust agree on every block of a run that
     carried non-trivial transactions?  Pure function over parsed JSONL."""
     import blockcompare  # noqa: PLC0415 - sibling script; keeps analyze importable alone
@@ -647,7 +647,9 @@ def rich_workload_check(workload_records, bc_records, require_types=("pay", "axf
             bc["degraded_rounds"], total, bc["nodes_missing"]))
 
     # -- the workload actually ran and exercised the paths ------------------
-    if workload_records:
+    if workload_expected is None:
+        workload_expected = bool(workload_records)
+    if workload_expected:
         if not steps:
             failures.append("workload recorded no steps")
         if not summaries:
@@ -1340,6 +1342,7 @@ def main() -> int:
             require_types=[t for t in args.require_txn_types.split(",") if t],
             min_nonpay_rounds=args.min_nonpay_rounds if args.workload else 0,
             require_coverage=bool(args.workload),
+            workload_expected=bool(args.workload),
         )
 
     clean = print_report(summary, [args.input])

@@ -283,13 +283,42 @@ class DriverTest(unittest.TestCase):
         # setup() copies TEAL files with docker cp; the fake records it instead.
         w.run_all()
         recs = records(out)
-        self.assertEqual(recs[0]["kind"], "workload_step")  # funding
+        self.assertEqual(recs[0]["kind"], "workload_kmd")
         kinds = [r["kind"] for r in recs]
         self.assertIn("workload_meta", kinds)
         self.assertEqual(kinds[-1], "workload_summary")
         summary = recs[-1]
         self.assertGreater(summary["steps"], 4)
         self.assertEqual(summary["seed"], 1)
+
+    def test_kmd_warmup_retries_then_switches_user(self):
+        class FlakyKmd(FakeEnv):
+            users = ("root", "algorand")
+            user = "root"
+
+            def goal(self, args, timeout=180):
+                if args == "wallet list" and self.user == "root":
+                    return 1, "Couldn't list wallets: connection refused"
+                return super().goal(args, timeout)
+
+        env = FlakyKmd()
+        out = io.StringIO()
+        w = wl.Workload(env, out, 1, funder=ADDR)
+        w.warm_kmd()
+        rec = records(out)[0]
+        self.assertEqual((rec["kind"], rec["user"]), ("workload_kmd", "algorand"))
+
+    def test_kmd_never_ready_aborts_setup_with_a_record(self):
+        class DeadKmd(FakeEnv):
+            def goal(self, args, timeout=180):
+                return 1, "Couldn't list wallets: connection refused"
+
+        out = io.StringIO()
+        w = wl.Workload(DeadKmd(), out, 1, funder=ADDR)
+        w.run_all()
+        kinds = [r["kind"] for r in records(out)]
+        self.assertIn("workload_abort", kinds)
+        self.assertEqual(kinds[-1], "workload_summary")
 
     def test_scenario_abort_is_recorded_and_run_continues(self):
         env = FakeEnv(fail=("asset create",))
