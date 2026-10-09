@@ -2220,6 +2220,14 @@ pub struct SqliteLedger {
     /// transactions that reuse them as duplicates until expiry. `None` outside a
     /// `begin_block`/`commit_block` span.
     lease_snapshot: Option<LeaseTable>,
+    /// In-memory chain-level fields captured at `begin_block`, restored by
+    /// `rollback_block` / a failed commit. `apply` advances them
+    /// (`set_current_round`, `set_protocol`, ...) before the SQL transaction
+    /// is decided, and the SQL ROLLBACK does not undo them, so without this a
+    /// rolled-back block left `current_round` one ahead of the committed
+    /// state (`ensure_block` would then treat a retry as already committed).
+    /// `None` outside a `begin_block`/`commit_block` span.
+    chain_snapshot: Option<ChainSnapshot>,
     /// Cached chain-level state (loaded from DB, flushed on commit).
     current_round: Round,
     /// See [`crate::store_trait::LedgerStore::earliest_round`]. Not
@@ -2374,6 +2382,26 @@ pub struct SqliteLedger {
     /// `time_since_last_round` in `bin/algod-rust/src/node_interface_impl.rs`),
     /// so it needs no serialization and is immune to system-clock jumps.
     last_commit_wall_time: Option<std::time::Instant>,
+}
+
+/// The in-memory chain-level fields `apply` advances (see
+/// `SqliteLedger::chain_snapshot`). `earliest_round` is deliberately absent:
+/// it is process-lifetime SetSyncRound state that no block apply advances.
+/// The compile-time field audit in the tests forces every new `SqliteLedger`
+/// field to be classified.
+#[derive(Clone)]
+struct ChainSnapshot {
+    current_round: Round,
+    rewards_level: u64,
+    rewards_rate: u64,
+    rewards_residue: u64,
+    rewards_recalculation_round: u64,
+    fee_sink: Address,
+    rewards_pool: Address,
+    genesis_id: String,
+    genesis_hash: [u8; 32],
+    protocol: String,
+    txn_counter: u64,
 }
 
 /// In-memory accumulator for the per-round change to the `accounttotals`
@@ -2855,6 +2883,7 @@ impl SqliteLedger {
             db_prefix,
             lease_table: LeaseTable::new(),
             lease_snapshot: None,
+            chain_snapshot: None,
             current_round,
             earliest_round: Round(0),
             rewards_level,
@@ -3184,6 +3213,7 @@ impl SqliteLedger {
         // Snapshot the in-memory lease table so rollback_block can restore it —
         // the SQLite/trie transaction does not cover it.
         self.lease_snapshot = Some(self.lease_table.clone());
+        self.chain_snapshot = Some(self.capture_chain_snapshot());
         self.in_block = true;
         // Issue #523: start this block's `accounttotals` delta accumulator
         // clean. Guards against `set_account`/`remove_account` calls made
@@ -3741,7 +3771,11 @@ impl SqliteLedger {
         let result = self.commit_block_uncleaned();
         if result.is_err() {
             self.reset_after_failed_commit();
-        } else if self.current_round.0 > 0 {
+        } else {
+            // The block is committed: its pre-block snapshot is dead.
+            self.chain_snapshot = None;
+        }
+        if result.is_ok() && self.current_round.0 > 0 {
             // Issue #1592: stamp the commit instant here, not on some
             // later REST poll -- see `last_commit_wall_time`'s doc comment.
             //
@@ -3813,6 +3847,7 @@ impl SqliteLedger {
             }
         }
         self.in_block = false;
+        self.restore_chain_snapshot();
         // Reload the trie from the last committed state -- any in-memory
         // mutations `commit_block_uncleaned` applied belong to the round
         // that just failed to commit.
@@ -4438,11 +4473,18 @@ impl SqliteLedger {
             }
         }
 
-        self.conn
-            .execute_batch("ROLLBACK")
-            .map_err(|e| AlgoError::Ledger {
+        let sql_rollback = self.conn.execute_batch("ROLLBACK");
+        // Restore the in-memory chain state whether or not the SQL ROLLBACK
+        // succeeded: it is not covered by the SQL transaction either way.
+        self.restore_chain_snapshot();
+        if let Err(e) = sql_rollback {
+            // Keep `in_block` consistent with whether a SQL transaction is
+            // actually still open.
+            self.in_block = !self.conn.is_autocommit();
+            return Err(AlgoError::Ledger {
                 message: format!("rollback block error: {e}"),
-            })?;
+            });
+        }
         self.in_block = false;
 
         // Reload the trie from the last committed state (DB was rolled back).
@@ -4451,6 +4493,38 @@ impl SqliteLedger {
         }
 
         Ok(())
+    }
+
+    fn capture_chain_snapshot(&self) -> ChainSnapshot {
+        ChainSnapshot {
+            current_round: self.current_round,
+            rewards_level: self.rewards_level,
+            rewards_rate: self.rewards_rate,
+            rewards_residue: self.rewards_residue,
+            rewards_recalculation_round: self.rewards_recalculation_round,
+            fee_sink: self.fee_sink,
+            rewards_pool: self.rewards_pool,
+            genesis_id: self.genesis_id.clone(),
+            genesis_hash: self.genesis_hash,
+            protocol: self.protocol.clone(),
+            txn_counter: self.txn_counter,
+        }
+    }
+
+    fn restore_chain_snapshot(&mut self) {
+        if let Some(c) = self.chain_snapshot.take() {
+            self.current_round = c.current_round;
+            self.rewards_level = c.rewards_level;
+            self.rewards_rate = c.rewards_rate;
+            self.rewards_residue = c.rewards_residue;
+            self.rewards_recalculation_round = c.rewards_recalculation_round;
+            self.fee_sink = c.fee_sink;
+            self.rewards_pool = c.rewards_pool;
+            self.genesis_id = c.genesis_id;
+            self.genesis_hash = c.genesis_hash;
+            self.protocol = c.protocol;
+            self.txn_counter = c.txn_counter;
+        }
     }
 
     /// Get the last committed round (for resume capability).
@@ -14782,5 +14856,167 @@ mod tests {
             )
             .expect("absent_participation_account_candidates");
         assert!(candidates.is_empty());
+    }
+
+    // -- Issue #1758: rollback / failed commit restore the in-memory chain state --
+
+    /// Every chain-level field `apply` advances, as one comparable tuple.
+    type ChainFields = (
+        Round,
+        u64,
+        u64,
+        u64,
+        u64,
+        Address,
+        Address,
+        String,
+        [u8; 32],
+        String,
+        u64,
+    );
+
+    fn chain_fields(l: &SqliteLedger) -> ChainFields {
+        (
+            l.current_round(),
+            l.rewards_level(),
+            l.rewards_rate(),
+            l.rewards_residue(),
+            l.rewards_recalculation_round(),
+            l.fee_sink(),
+            l.rewards_pool(),
+            l.genesis_id().to_string(),
+            *l.genesis_hash(),
+            l.protocol().to_string(),
+            l.txn_counter(),
+        )
+    }
+
+    /// Advance every chain field the way a block apply does.
+    fn advance_chain_fields(l: &mut SqliteLedger) {
+        l.set_current_round(Round(l.current_round().0 + 1));
+        l.set_rewards_level(l.rewards_level() + 1);
+        l.set_rewards_rate(l.rewards_rate() + 1);
+        l.set_rewards_residue(l.rewards_residue() + 1);
+        l.set_rewards_recalculation_round(l.rewards_recalculation_round() + 1);
+        l.set_fee_sink(Address([0xF1; 32]));
+        l.set_rewards_pool(Address([0xF2; 32]));
+        l.set_genesis_id("advanced-gen".into());
+        l.set_genesis_hash([0xF3; 32]);
+        l.set_protocol("advanced-proto".into());
+        l.set_txn_counter(l.txn_counter() + 10);
+    }
+
+    fn ledger_with_distinct_chain_fields() -> SqliteLedger {
+        let mut l = SqliteLedger::open_in_memory().unwrap();
+        l.set_current_round(Round(5));
+        l.set_rewards_level(11);
+        l.set_rewards_rate(12);
+        l.set_rewards_residue(13);
+        l.set_rewards_recalculation_round(14);
+        l.set_fee_sink(Address([1; 32]));
+        l.set_rewards_pool(Address([2; 32]));
+        l.set_genesis_id("gen".into());
+        l.set_genesis_hash([3; 32]);
+        l.set_protocol("proto".into());
+        l.set_txn_counter(15);
+        l
+    }
+
+    #[test]
+    fn rollback_block_restores_every_in_memory_chain_field() {
+        let mut l = ledger_with_distinct_chain_fields();
+        let before = chain_fields(&l);
+        l.begin_block().unwrap();
+        advance_chain_fields(&mut l);
+        assert_ne!(chain_fields(&l), before);
+        l.rollback_block().unwrap();
+        assert_eq!(chain_fields(&l), before);
+    }
+
+    #[test]
+    fn failed_commit_restores_every_in_memory_chain_field() {
+        let mut l = ledger_with_distinct_chain_fields();
+        let before = chain_fields(&l);
+        l.begin_block().unwrap();
+        advance_chain_fields(&mut l);
+        l.conn.execute_batch("PRAGMA query_only = ON;").unwrap();
+        assert!(l.commit_block().is_err());
+        l.conn.execute_batch("PRAGMA query_only = OFF;").unwrap();
+        assert_eq!(chain_fields(&l), before);
+    }
+
+    #[test]
+    fn rollback_with_a_sql_rollback_error_still_restores_and_keeps_in_block_consistent() {
+        let mut l = ledger_with_distinct_chain_fields();
+        let before = chain_fields(&l);
+        l.begin_block().unwrap();
+        advance_chain_fields(&mut l);
+        // The transaction disappears underneath us, so the SQL ROLLBACK in
+        // rollback_block fails with "no transaction is active".
+        l.conn.execute_batch("ROLLBACK").unwrap();
+        assert!(l.rollback_block().is_err());
+        assert_eq!(chain_fields(&l), before);
+        assert!(!l.in_block, "no SQL transaction is open any more");
+        // The ledger is usable for the next block.
+        l.begin_block().unwrap();
+        l.rollback_block().unwrap();
+    }
+
+    #[test]
+    fn committed_block_keeps_its_chain_fields_and_a_later_rollback_does_not_regress_them() {
+        let mut l = ledger_with_distinct_chain_fields();
+        l.begin_block().unwrap();
+        advance_chain_fields(&mut l);
+        let advanced = chain_fields(&l);
+        l.commit_block().unwrap();
+        assert_eq!(chain_fields(&l), advanced);
+        l.begin_block().unwrap();
+        l.rollback_block().unwrap();
+        assert_eq!(chain_fields(&l), advanced);
+    }
+
+    /// Compile-time audit: adding a field to `SqliteLedger` breaks this
+    /// exhaustive destructuring until the field is classified as either part
+    /// of the per-block chain snapshot (`ChainSnapshot`) or deliberately not
+    /// block-scoped. Deliberately excluded: `earliest_round` (process-lifetime
+    /// SetSyncRound state, never advanced by a block apply).
+    #[allow(dead_code)]
+    fn chain_state_field_audit(l: &SqliteLedger) {
+        let SqliteLedger {
+            conn: _,
+            db_prefix: _,
+            lease_table: _, // restored via lease_snapshot
+            lease_snapshot: _,
+            chain_snapshot: _,
+            current_round: _,               // ChainSnapshot
+            earliest_round: _,              // not block-scoped (see above)
+            rewards_level: _,               // ChainSnapshot
+            rewards_rate: _,                // ChainSnapshot
+            rewards_residue: _,             // ChainSnapshot
+            rewards_recalculation_round: _, // ChainSnapshot
+            fee_sink: _,                    // ChainSnapshot
+            rewards_pool: _,                // ChainSnapshot
+            genesis_id: _,                  // ChainSnapshot
+            genesis_hash: _,                // ChainSnapshot
+            protocol: _,                    // ChainSnapshot
+            txn_counter: _,                 // ChainSnapshot
+            savepoint_counter: _,
+            in_block: _,
+            trie: _,          // reloaded by rollback
+            pre_mutations: _, // cleared by rollback
+            trie_cache_target: _,
+            lru_cache_disabled: _,
+            delta_cache: _,
+            group_delta_tracer: _,
+            pending_totals_delta: _,   // reset by rollback
+            pending_online_touched: _, // cleared by rollback
+            catchpoint_auto: _,
+            catchpoint_worker: _,
+            reenable_catchpoints_round: _,
+            acctupdates_stats: _,
+            acctupdates_stats_gate: _,
+            retention: _,
+            last_commit_wall_time: _,
+        } = l;
     }
 }

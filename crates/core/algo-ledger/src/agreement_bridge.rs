@@ -368,31 +368,40 @@ impl AgreementLedgerBridge {
         // fall back to non-transactional mode.
         // Issue #1654 diagnostics: time each stage so a slow first commit
         // after a catchup names its stage in the log.
-        let slow = |stage: &str, since: std::time::Instant| {
-            if since.elapsed() > Duration::from_secs(1) {
+        // Issue #1757: the apply stage also reports its AVM/non-AVM split
+        // (zero for the other stages) so a heavy round is attributed from the
+        // log alone, in the same single warning with a single elapsed reading.
+        let slow = |stage: &str, since: std::time::Instant, avm: Option<Duration>| {
+            let elapsed = since.elapsed();
+            if elapsed > Duration::from_secs(1) {
+                let elapsed_ms = elapsed.as_millis() as u64;
+                let avm_ms = avm.map_or(0, |d| d.as_millis() as u64);
                 warn!(
                     round = %block.round,
                     stage,
-                    elapsed_ms = since.elapsed().as_millis() as u64,
+                    elapsed_ms,
+                    avm_ms,
+                    non_avm_ms = elapsed_ms.saturating_sub(avm_ms),
+                    txns = block.payset.len(),
                     "try_commit_block: slow stage"
                 );
             }
         };
         let t = std::time::Instant::now();
         let in_txn = ledger.begin_block().is_ok();
-        slow("begin_block", t);
+        slow("begin_block", t, None);
 
         let result = (|| -> Result<(), CommitFailure> {
             let t = std::time::Instant::now();
             ledger
                 .put_block(block.round.0, proto, hdr_data, blk_data)
                 .map_err(|e| CommitFailure::new(CommitStage::Store, e))?;
-            slow("put_block", t);
+            slow("put_block", t, None);
             let t = std::time::Instant::now();
             ledger
                 .put_block_cert(block.round.0, cert_bytes)
                 .map_err(|e| CommitFailure::new(CommitStage::Store, e))?;
-            slow("put_block_cert", t);
+            slow("put_block_cert", t, None);
             let t = std::time::Instant::now();
             // Issue #1678: per-block follow-path timing. The AVM accumulator
             // is reset here and taken right after the apply (the only
@@ -400,7 +409,8 @@ impl AgreementLedgerBridge {
             crate::follow_timing::reset_avm_time();
             let applied = crate::apply::apply_block_executing_app_calls(ledger, block);
             let timing = crate::follow_timing::follow_timing();
-            if let Some(avm) = crate::follow_timing::take_avm_time() {
+            let avm = crate::follow_timing::take_avm_time();
+            if let Some(avm) = avm {
                 timing.avm.observe(avm);
             }
             match &applied {
@@ -408,7 +418,7 @@ impl AgreementLedgerBridge {
                 Err(_) => timing.apply_failed.observe(t.elapsed()),
             }
             applied.map_err(|e| CommitFailure::new(CommitStage::Apply, e))?;
-            slow("apply_block", t);
+            slow("apply_block", t, avm);
             Ok(())
         })();
 
@@ -430,7 +440,7 @@ impl AgreementLedgerBridge {
             crate::follow_timing::follow_timing()
                 .commit
                 .observe(t.elapsed());
-            slow("commit_block", t);
+            slow("commit_block", t, None);
         }
 
         Ok(())
