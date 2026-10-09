@@ -63,10 +63,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Run cargo-deny (licenses)
-        uses: EmbarkStudios/cargo-deny-action@v2
+      # cargo-deny-action is a Docker-container action: the runner builds its
+      # Dockerfile (FROM rust:alpine, a Docker Hub pull) during "Set up job",
+      # before any step -- so a login step cannot authenticate that pull and
+      # the job hit Docker Hub's anonymous 429. Install the cargo-deny binary
+      # directly instead (no Docker involved).
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
         with:
-          command: check licenses
+          tool: cargo-deny
+
+      - name: Run cargo-deny (licenses)
+        run: cargo deny check licenses
 
   ci-wiring:
     name: CI Workflow Wiring (GO_ALGORAND_DIR)
