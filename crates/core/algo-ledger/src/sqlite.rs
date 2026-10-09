@@ -2228,10 +2228,15 @@ pub struct SqliteLedger {
     /// state (`ensure_block` would then treat a retry as already committed).
     /// `None` outside a `begin_block`/`commit_block` span.
     chain_snapshot: Option<ChainSnapshot>,
-    /// Test-only: make the next SQL ROLLBACK fail while the transaction stays
-    /// open (stands in for SQLITE_BUSY on ROLLBACK).
+    /// An earlier ROLLBACK failed with the SQL transaction still open: the
+    /// aborted block's state is retained and the next `begin_block` /
+    /// `commit_block` must complete the abort first.
+    pub(crate) pending_abort: bool,
+    /// Test-only: make the next N SQL ROLLBACKs fail while the transaction
+    /// stays open (stands in for SQLITE_BUSY on ROLLBACK). The field exists
+    /// only under `cfg(test)`, so the production struct layout is unchanged.
     #[cfg(test)]
-    fail_rollback_once: bool,
+    pub(crate) fail_rollback_count: u32,
     /// Cached chain-level state (loaded from DB, flushed on commit).
     current_round: Round,
     /// See [`crate::store_trait::LedgerStore::earliest_round`]. Not
@@ -2892,8 +2897,9 @@ impl SqliteLedger {
             lease_table: LeaseTable::new(),
             lease_snapshot: None,
             chain_snapshot: None,
+            pending_abort: false,
             #[cfg(test)]
-            fail_rollback_once: false,
+            fail_rollback_count: 0,
             current_round,
             earliest_round: Round(0),
             rewards_level,
@@ -3212,6 +3218,9 @@ impl SqliteLedger {
 
     /// Begin a block-level transaction.
     pub fn begin_block(&mut self) -> Result<(), AlgoError> {
+        // Self-healing: finish an abort whose ROLLBACK failed earlier before
+        // anything new starts (most callers ignore rollback_block's result).
+        self.heal_pending_abort()?;
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| AlgoError::Ledger {
@@ -3773,6 +3782,16 @@ impl SqliteLedger {
     }
 
     pub fn commit_block(&mut self) -> Result<(), AlgoError> {
+        if self.pending_abort {
+            // The open transaction is an aborted, half-applied block: roll it
+            // back (or report that we cannot) -- never commit it.
+            self.heal_pending_abort()?;
+            return Err(AlgoError::Ledger {
+                message: "previous block could not be rolled back: it was aborted, \
+                          nothing to commit"
+                    .into(),
+            });
+        }
         // Hard bound on any scratch-apply undo journal left open by a panic
         // between save and restore: it must never survive a commit.
         self.lease_table.discard_undo();
@@ -4526,13 +4545,45 @@ impl SqliteLedger {
     /// transaction open, standing in for SQLITE_BUSY).
     fn exec_rollback(&mut self) -> rusqlite::Result<()> {
         #[cfg(test)]
-        if std::mem::take(&mut self.fail_rollback_once) {
+        if self.fail_rollback_count > 0 {
+            self.fail_rollback_count -= 1;
             return Err(rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
                 Some("injected rollback failure".into()),
             ));
         }
         self.conn.execute_batch("ROLLBACK")
+    }
+
+    /// Complete an abort whose ROLLBACK failed earlier with the transaction
+    /// still open (`pending_abort`): retry the ROLLBACK, restore the retained
+    /// in-memory state and reload the trie. If it still fails, the ledger stays
+    /// in the pending-abort state and the caller must NOT start or commit a
+    /// block on top of the half-applied one.
+    pub fn heal_pending_abort(&mut self) -> Result<(), AlgoError> {
+        if !self.pending_abort {
+            return Ok(());
+        }
+        let sql_rollback = self.exec_rollback();
+        if !self.abort_block_state(&sql_rollback) {
+            let detail = sql_rollback
+                .err()
+                .map_or_else(|| "transaction still open".to_string(), |e| e.to_string());
+            return Err(AlgoError::Ledger {
+                message: format!("previous block could not be rolled back: {detail}"),
+            });
+        }
+        if self.trie.is_some() {
+            self.load_trie()?;
+        }
+        Ok(())
+    }
+
+    /// Whether an earlier failed ROLLBACK left an aborted block open (see
+    /// [`Self::begin_block`]); callers must treat a `begin_block` error in this
+    /// state as a failed attempt, never fall back to non-transactional apply.
+    pub fn has_pending_abort(&self) -> bool {
+        self.pending_abort
     }
 
     /// Undo the in-memory effects of an aborted block after an SQL ROLLBACK
@@ -4545,8 +4596,11 @@ impl SqliteLedger {
     fn abort_block_state(&mut self, sql_rollback: &rusqlite::Result<()>) -> bool {
         let tx_gone = sql_rollback.is_ok() || self.conn.is_autocommit();
         if !tx_gone {
+            // The next begin_block / commit_block completes the abort.
+            self.pending_abort = true;
             return false;
         }
+        self.pending_abort = false;
         // Clear pre-mutation records -- they are for the aborted block.
         self.pre_mutations.clear();
         // Discard the aborted block's accumulated `accounttotals` delta
@@ -15008,7 +15062,7 @@ mod tests {
         l.begin_block().unwrap();
         advance_chain_fields(&mut l);
         let advanced = chain_fields(&l);
-        l.fail_rollback_once = true;
+        l.fail_rollback_count = 1;
         assert!(l.rollback_block().is_err());
         // The DB still holds the partially applied block, so memory must keep
         // matching it: nothing restored, snapshot retained, block still open.
@@ -15019,6 +15073,56 @@ mod tests {
         l.rollback_block().unwrap();
         assert!(!l.in_block);
         assert!(l.chain_snapshot.is_none());
+        assert_eq!(chain_fields(&l), before);
+    }
+
+    #[test]
+    fn begin_block_heals_a_rollback_that_failed_with_the_transaction_open() {
+        let mut l = ledger_with_distinct_chain_fields();
+        let before = chain_fields(&l);
+        l.begin_block().unwrap();
+        advance_chain_fields(&mut l);
+        l.fail_rollback_count = 1;
+        // Callers typically ignore this error.
+        let _ = l.rollback_block();
+        assert!(l.pending_abort);
+        // The next block heals first, then starts clean from committed state.
+        l.begin_block().unwrap();
+        assert!(!l.pending_abort);
+        assert_eq!(chain_fields(&l), before);
+        l.rollback_block().unwrap();
+        assert_eq!(chain_fields(&l), before);
+    }
+
+    #[test]
+    fn begin_block_reports_a_rollback_that_keeps_failing_and_applies_nothing() {
+        let mut l = ledger_with_distinct_chain_fields();
+        let before = chain_fields(&l);
+        l.begin_block().unwrap();
+        advance_chain_fields(&mut l);
+        let advanced = chain_fields(&l);
+        l.fail_rollback_count = 2;
+        let _ = l.rollback_block();
+        let err = l.begin_block().unwrap_err();
+        assert!(
+            format!("{err}").contains("previous block could not be rolled back"),
+            "{err}"
+        );
+        assert!(l.pending_abort && l.in_block);
+        assert_eq!(
+            chain_fields(&l),
+            advanced,
+            "state still matches the open tx"
+        );
+        // commit_block must not persist the half-applied block either.
+        l.fail_rollback_count = 1;
+        let err = l.commit_block().unwrap_err();
+        assert!(
+            format!("{err}").contains("previous block could not be rolled back"),
+            "{err}"
+        );
+        // Once ROLLBACK works again the ledger heals.
+        l.begin_block().unwrap();
         assert_eq!(chain_fields(&l), before);
     }
 
@@ -15104,7 +15208,8 @@ mod tests {
             lease_table: _, // restored via lease_snapshot
             lease_snapshot: _,
             chain_snapshot: _,
-            fail_rollback_once: _,          // test-only injection flag
+            pending_abort: _,
+            fail_rollback_count: _,         // test-only injection flag
             current_round: _,               // ChainSnapshot
             earliest_round: _,              // not block-scoped (see above)
             rewards_level: _,               // ChainSnapshot

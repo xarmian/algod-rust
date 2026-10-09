@@ -399,7 +399,15 @@ impl AgreementLedgerBridge {
             }
         };
         let t = std::time::Instant::now();
-        let in_txn = ledger.begin_block().is_ok();
+        let in_txn = match ledger.begin_block() {
+            Ok(()) => true,
+            // An earlier block's ROLLBACK is still failing: never fall back to
+            // non-transactional apply on top of that half-applied block.
+            Err(e) if ledger.has_pending_abort() => {
+                return Err(CommitFailure::new(CommitStage::Store, e));
+            }
+            Err(_) => false,
+        };
         slow("begin_block", t, None);
 
         let result = (|| -> Result<(), CommitFailure> {
@@ -861,6 +869,24 @@ impl LedgerWriter for AgreementLedgerBridge {
                 );
             }
             let commit_started = std::time::Instant::now();
+
+            // An earlier block's ROLLBACK may have failed with its transaction
+            // still open: the in-memory round then still reflects that
+            // half-applied block, so finish the abort BEFORE trusting
+            // `current_round` below. If it still cannot be rolled back this is
+            // a failed attempt; never apply on top of it.
+            if let Err(e) = ledger.heal_pending_abort() {
+                drop(ledger);
+                crate::follow_timing::follow_timing()
+                    .ensure_block_failed
+                    .observe(ensure_started.elapsed());
+                self.apply_stall.count_local_failure();
+                warn!(
+                    round = %block.round,
+                    "ensure_block: cannot start a block: {e}"
+                );
+                return;
+            }
 
             // Check if this block's round has already been committed.
             let next_round = ledger.current_round().0 + 1;
@@ -2211,5 +2237,33 @@ mod tests {
             Some(algo_codec::compute_txn_id(&full).0.to_vec()),
             "TxID must be the id of the transaction with its genesis fields"
         );
+    }
+
+    #[test]
+    fn ensure_block_never_applies_on_top_of_a_block_whose_rollback_failed() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+        {
+            // A half-applied block whose ROLLBACK keeps failing (twice).
+            let mut l = ledger.lock().unwrap();
+            l.begin_block().unwrap();
+            l.set_current_round(Round(1));
+            l.fail_rollback_count = 2;
+            let _ = l.rollback_block();
+        }
+        // First attempt: the heal inside begin_block fails -> failed attempt,
+        // nothing applied or stored.
+        bridge.ensure_block(&make_round1_block(), &make_cert_with_proposal(1));
+        {
+            let l = ledger.lock().unwrap();
+            assert!(
+                l.has_pending_abort(),
+                "abort still pending, nothing applied"
+            );
+            assert!(l.get_block_data(1).unwrap().is_none());
+        }
+        // Second attempt heals and commits normally.
+        bridge.ensure_block(&make_round1_block(), &make_cert_with_proposal(1));
+        assert_eq!(ledger.lock().unwrap().current_round().0, 1);
     }
 }
