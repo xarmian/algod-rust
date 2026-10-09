@@ -369,22 +369,33 @@ impl AgreementLedgerBridge {
         // Issue #1654 diagnostics: time each stage so a slow first commit
         // after a catchup names its stage in the log.
         // Issue #1757: the apply stage also reports its AVM/non-AVM split
-        // (zero for the other stages) so a heavy round is attributed from the
-        // log alone, in the same single warning with a single elapsed reading.
-        let slow = |stage: &str, since: std::time::Instant, avm: Option<Duration>| {
+        // (`apply_avm` is `Some` only for that stage) so a heavy round is
+        // attributed from the log alone, in the same single warning with a
+        // single elapsed reading.
+        let slow = |stage: &str, since: std::time::Instant, apply_avm: Option<Duration>| {
             let elapsed = since.elapsed();
             if elapsed > Duration::from_secs(1) {
                 let elapsed_ms = elapsed.as_millis() as u64;
-                let avm_ms = avm.map_or(0, |d| d.as_millis() as u64);
-                warn!(
-                    round = %block.round,
-                    stage,
-                    elapsed_ms,
-                    avm_ms,
-                    non_avm_ms = elapsed_ms.saturating_sub(avm_ms),
-                    txns = block.payset.len(),
-                    "try_commit_block: slow stage"
-                );
+                match apply_avm {
+                    Some(avm) => {
+                        let avm_ms = avm.as_millis() as u64;
+                        warn!(
+                            round = %block.round,
+                            stage,
+                            elapsed_ms,
+                            avm_ms,
+                            non_avm_ms = elapsed_ms.saturating_sub(avm_ms),
+                            txns = block.payset.len(),
+                            "try_commit_block: slow stage"
+                        );
+                    }
+                    None => warn!(
+                        round = %block.round,
+                        stage,
+                        elapsed_ms,
+                        "try_commit_block: slow stage"
+                    ),
+                }
             }
         };
         let t = std::time::Instant::now();
@@ -417,8 +428,9 @@ impl AgreementLedgerBridge {
                 Ok(()) => timing.apply.observe(t.elapsed()),
                 Err(_) => timing.apply_failed.observe(t.elapsed()),
             }
+            // Also for a failed apply: a slow rejection is just as relevant.
+            slow("apply_block", t, Some(avm.unwrap_or_default()));
             applied.map_err(|e| CommitFailure::new(CommitStage::Apply, e))?;
-            slow("apply_block", t, avm);
             Ok(())
         })();
 

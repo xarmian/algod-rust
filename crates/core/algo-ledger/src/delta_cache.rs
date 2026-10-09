@@ -118,6 +118,12 @@ impl DeltaCache {
         self.min_round = min_round;
     }
 
+    /// Remove all entries for rounds after `round` (a block that never
+    /// committed). Does not move the window cursor.
+    pub fn remove_after(&mut self, round: u64) {
+        self.cache.retain(|&r, _| r <= round);
+    }
+
     /// The current minimum round kept in the cache.
     pub fn min_round(&self) -> u64 {
         self.min_round
