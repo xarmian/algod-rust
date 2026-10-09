@@ -382,12 +382,22 @@ if [ "$RUN_CERT" = "1" ]; then
         CERT_EXTRA_ARGS+=(--export-go-input "$GO_INPUT")
         echo "    rust participant: $RUST_ACCOUNT (>= $MIN_RUST_VOTE_ROUNDS cert(s) must carry its vote)"
     fi
+    # The Rust ledger does not serve round 1 on a long run (issue #1777: 2700
+    # rounds failed with "round 1 not available"), so only the most recent
+    # CERT_WINDOW rounds are cert-verified; the fork detector still covers the
+    # whole range.
+    CERT_WINDOW="${CERT_WINDOW:-900}"
+    CERT_FROM="$FROM_ROUND"
+    if [ $((TO_ROUND - CERT_FROM)) -gt "$CERT_WINDOW" ]; then
+        CERT_FROM=$((TO_ROUND - CERT_WINDOW))
+        echo "    cert range clamped to the last $CERT_WINDOW rounds: $CERT_FROM..$TO_ROUND"
+    fi
     set +e
     "$CERT_BIN" \
         --node http://127.0.0.1:4001 \
         --token-file "$TOKEN_FILE" \
         --ledger-sqlite "$CERT_LEDGER_PATH" \
-        --from-round "$FROM_ROUND" \
+        --from-round "$CERT_FROM" \
         --to-round "$TO_ROUND" \
         --stride "$STRIDE" \
         --jsonl-out "$CERT_OUT" \
