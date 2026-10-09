@@ -3857,17 +3857,38 @@ impl SqliteLedger {
         self.publish_committed_tip(None);
     }
 
-    /// Build and publish the tip from committed state read back from the
-    /// database. `previous` supplies the catchpoint label when the caller
-    /// knows it is unchanged (the label only changes via
-    /// [`Self::set_last_catchpoint_label`], which invalidates or republishes),
-    /// avoiding one query per commit. Never publishes inside a block or when
-    /// the in-memory round differs from the committed one; invalidates
-    /// instead, and logs read failures (rate limited).
+    /// Protocol of the latest committed block: the committed header's
+    /// `current_protocol` when no block is open and a header exists, otherwise
+    /// the in-memory protocol. The published tip and the locked `/v2/status`
+    /// path both use this, so they cannot disagree (a `set_protocol` without a
+    /// commit changes neither).
+    pub fn committed_protocol(&self) -> String {
+        if !self.in_block {
+            if let Ok(Some(round)) = self.last_committed_round() {
+                if let Ok(Some(h)) = self.get_block_header(round) {
+                    if !h.current_protocol.is_empty() {
+                        return h.current_protocol;
+                    }
+                }
+            }
+        }
+        self.protocol.clone()
+    }
+
+    /// Build the tip from committed state read back from the database, THEN
+    /// atomically swap it in, so readers never observe a missing tip during a
+    /// normal commit. The header is re-read (not taken from the block in
+    /// hand) so the tip is byte-identical to what the locked path decodes
+    /// from the stored `hdrdata`. `previous` supplies the catchpoint label
+    /// when the caller knows it is unchanged (any label write bumps the
+    /// generation, making the previous tip invalid), avoiding one query per
+    /// commit. Never publishes inside a block or when the in-memory round
+    /// differs from the committed one: the old tip is marked stale instead.
+    /// Read failures are logged (rate limited) and also leave it stale.
     fn publish_committed_tip(&self, previous: Option<Arc<crate::committed_tip::CommittedTip>>) {
-        self.committed_tip
-            .invalidate_if_owner(self.tip_owner, "republishing");
         if self.in_block {
+            self.committed_tip
+                .invalidate_if_owner(self.tip_owner, "publish inside a block");
             return;
         }
         let built = (|| -> Result<Option<crate::committed_tip::CommittedTip>, AlgoError> {
@@ -3882,26 +3903,32 @@ impl SqliteLedger {
             }
             let latest_header = self.get_block_header(round)?.map(Arc::new);
             let protocol = match latest_header.as_ref() {
-                Some(h) => h.current_protocol.clone(),
-                None => self.protocol.clone(),
+                Some(h) if !h.current_protocol.is_empty() => h.current_protocol.clone(),
+                _ => self.protocol.clone(),
             };
             let last_catchpoint_label = match previous {
                 Some(p) => p.last_catchpoint_label.clone(),
                 None => self.last_catchpoint_label()?,
             };
             Ok(Some(crate::committed_tip::CommittedTip {
-                current_round: round,
-                last_committed_round: round,
+                round,
                 protocol,
                 latest_header,
                 last_catchpoint_label,
                 last_commit_wall_time: self.last_commit_wall_time,
+                generation: 0,
             }))
         })();
         match built {
             Ok(Some(tip)) => self.committed_tip.publish(self.tip_owner, tip),
-            Ok(None) => {}
-            Err(e) => warn_tip_publish_failed(&e),
+            Ok(None) => self
+                .committed_tip
+                .invalidate_if_owner(self.tip_owner, "committed state not provable"),
+            Err(e) => {
+                self.committed_tip
+                    .invalidate_if_owner(self.tip_owner, "tip build failed");
+                warn_tip_publish_failed(&e);
+            }
         }
     }
 
@@ -4124,7 +4151,7 @@ impl SqliteLedger {
     /// successful export's label without needing to re-scan for
     /// catchpoint files on disk.
     pub fn set_last_catchpoint_label(&self, label: &str) -> Result<(), AlgoError> {
-        // Issue #1758: the label is part of the published tip. Invalidate,
+        // Issue #1758: the label is part of the published tip. Mark it stale,
         // write, then re-derive the tip from committed state (inside a block
         // the commit re-publishes it).
         self.committed_tip
@@ -7559,6 +7586,11 @@ impl LedgerStore for SqliteLedger {
         hdrdata: &[u8],
         blkdata: &[u8],
     ) -> Result<(), AlgoError> {
+        if !self.in_block {
+            // Not covered by a following commit publication (issue #1758).
+            self.committed_tip
+                .invalidate_if_owner(self.tip_owner, "put_block outside a block");
+        }
         self.conn
             .execute(
                 "INSERT INTO blockdb.blocks (rnd, proto, hdrdata, blkdata) VALUES (?1, ?2, ?3, ?4) \

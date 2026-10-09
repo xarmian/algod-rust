@@ -28,12 +28,15 @@
 //!
 //! This module is the equivalent: [`SqliteLedger::commit_block`] publishes an
 //! immutable [`CommittedTip`] after a successful commit, and readers that only
-//! need the committed tip (next round, `/v2/status`) read it without taking
-//! the ledger mutex. The tip is always an immutable snapshot of *committed*
-//! state (round, header and label are read back from the database, never
-//! from in-memory setters), it is never visible before the commit succeeded,
-//! and any ledger mutation that does not go through a publication
-//! invalidates it, so readers fall back to the locked path (exactly the
+//! need the committed tip (next round, `/v2/status`, the status long-poll)
+//! read it without taking the ledger mutex. The tip is always an immutable
+//! snapshot of *committed* state (round, header and label are read back from
+//! the database, never from in-memory setters), it is never visible before the
+//! commit succeeded, and a new tip is built *before* it atomically replaces
+//! the old one, so a normal commit never exposes an invalid window. Validity
+//! is keyed on a generation counter that every committed-state mutator bumps
+//! (lock-free for readers to compare), so a stale tip cannot survive an
+//! unforeseen mutator; readers then fall back to the locked path (exactly the
 //! behaviour before this module existed). Fallbacks are counted in
 //! `algod_rust_committed_tip_fallback_total` so a permanent fallback is
 //! visible.
@@ -41,10 +44,12 @@
 //! [`SqliteLedger::commit_block`]: crate::sqlite::SqliteLedger::commit_block
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 use algo_types::BlockHeader;
+
+use crate::sqlite::SqliteLedger;
 
 /// Immutable snapshot of everything `/v2/status` and `next_round` read from
 /// the ledger, captured from committed state.
@@ -52,17 +57,19 @@ use algo_types::BlockHeader;
 pub struct CommittedTip {
     /// Last committed round (`acctrounds.acctbase`; equal to the ledger's
     /// in-memory `current_round`, publication is refused otherwise).
-    pub current_round: u64,
-    /// The round `/v2/status` reports as `last-round`.
-    pub last_committed_round: u64,
-    /// Protocol of the latest committed block.
+    pub round: u64,
+    /// Protocol of the latest committed block (same source the locked
+    /// status path uses: `SqliteLedger::committed_protocol`).
     pub protocol: String,
-    /// Header of `last_committed_round`, if the block store has one.
+    /// Header of `round`, if the block store has one.
     pub latest_header: Option<Arc<BlockHeader>>,
     /// Label of the most recently exported catchpoint (empty if none).
     pub last_catchpoint_label: String,
     /// Instant of the most recent successful commit in this process.
     pub last_commit_wall_time: Option<Instant>,
+    /// Ledger generation this tip was built for; valid only while it equals
+    /// the handle's current generation.
+    pub(crate) generation: u64,
 }
 
 static NEXT_OWNER_ID: AtomicU64 = AtomicU64::new(1);
@@ -73,7 +80,8 @@ pub(crate) fn next_owner_id() -> u64 {
     NEXT_OWNER_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Times a reader found no valid tip and took the ledger mutex instead.
+/// Times (process-wide) a reader found no valid tip and took the ledger
+/// mutex instead.
 pub fn committed_tip_fallback_total() -> u64 {
     FALLBACK_TOTAL.load(Ordering::Relaxed)
 }
@@ -94,11 +102,17 @@ pub fn committed_tip_prometheus_text() -> String {
 #[derive(Debug, Default)]
 struct Shared {
     cell: RwLock<Option<Arc<CommittedTip>>>,
+    /// Bumped by every committed-state mutator; a tip is valid only while its
+    /// generation equals this. Mutators run under the ledger mutex; readers
+    /// compare lock-free.
+    generation: AtomicU64,
     /// Id of the ledger allowed to publish/invalidate (0 = unclaimed).
     owner: AtomicU64,
     /// Set once a locked path observed a poisoned ledger mutex: the tip is
     /// never served or published again.
     poisoned: AtomicBool,
+    /// Fallbacks observed through this handle.
+    fallbacks: AtomicU64,
 }
 
 /// Shared, cheaply clonable handle to the published [`CommittedTip`].
@@ -108,12 +122,13 @@ pub struct CommittedTipHandle {
 }
 
 impl CommittedTipHandle {
-    /// The currently published tip, or `None` when it is invalid, was never
+    /// The currently valid tip, or `None` when it is stale, was never
     /// published or the ledger mutex is poisoned. `None` means "take the
     /// ledger lock and read it there"; the fallback is counted.
     pub fn read(&self) -> Option<Arc<CommittedTip>> {
         let tip = self.get();
         if tip.is_none() {
+            self.shared.fallbacks.fetch_add(1, Ordering::Relaxed);
             FALLBACK_TOTAL.fetch_add(1, Ordering::Relaxed);
         }
         tip
@@ -124,23 +139,26 @@ impl CommittedTipHandle {
         if self.shared.poisoned.load(Ordering::Acquire) {
             return None;
         }
-        self.shared
-            .cell
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .map(Arc::clone)
+        // The read lock pairs the cell with the generation: `publish` swaps
+        // both under the write lock.
+        let cell = self.shared.cell.read().unwrap_or_else(|e| e.into_inner());
+        let tip = cell.as_ref()?;
+        (tip.generation == self.shared.generation.load(Ordering::Acquire)).then(|| Arc::clone(tip))
     }
 
-    /// Record that the ledger mutex was observed poisoned: clears the tip and
-    /// stops any further serving or publication.
+    /// Fallbacks counted through this handle.
+    pub fn fallbacks(&self) -> u64 {
+        self.shared.fallbacks.load(Ordering::Relaxed)
+    }
+
+    /// Record that the ledger mutex was observed poisoned: stops any further
+    /// serving or publication.
     pub fn poison(&self) {
         if !self.shared.poisoned.swap(true, Ordering::AcqRel) {
             tracing::error!(
                 "ledger mutex poisoned: committed tip disabled, reads use the locked path"
             );
         }
-        self.clear();
     }
 
     pub(crate) fn claim(&self, owner: u64) {
@@ -151,33 +169,89 @@ impl CommittedTipHandle {
         self.shared.owner.load(Ordering::Acquire) == 0
     }
 
-    /// Publish `tip` if `owner` is the current publisher and not poisoned.
-    pub(crate) fn publish(&self, owner: u64, tip: CommittedTip) {
+    /// Atomically replace the tip with `tip` (stamped with the next
+    /// generation) if `owner` is the current publisher and not poisoned.
+    pub(crate) fn publish(&self, owner: u64, mut tip: CommittedTip) {
         if self.shared.owner.load(Ordering::Acquire) != owner
             || self.shared.poisoned.load(Ordering::Acquire)
         {
             return;
         }
-        *self.shared.cell.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(tip));
+        let mut cell = self.shared.cell.write().unwrap_or_else(|e| e.into_inner());
+        tip.generation = self.shared.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        *cell = Some(Arc::new(tip));
     }
 
-    /// Invalidate the tip, but only when `owner` is the current publisher, so
-    /// a ledger that never published (e.g. a failed reload) cannot wipe the
-    /// live tip.
+    /// Mark the published tip stale (a committed-state mutator ran), but only
+    /// when `owner` is the current publisher, so a ledger that never
+    /// published (e.g. a failed reload) cannot wipe the live tip.
     pub(crate) fn invalidate_if_owner(&self, owner: u64, why: &str) {
         if self.shared.owner.load(Ordering::Acquire) != owner {
             return;
         }
-        let mut cell = self.shared.cell.write().unwrap_or_else(|e| e.into_inner());
-        if cell.take().is_some() {
-            tracing::debug!(
-                why,
-                "committed tip invalidated; readers use the locked path"
-            );
+        self.shared.generation.fetch_add(1, Ordering::AcqRel);
+        tracing::debug!(
+            why,
+            "committed tip invalidated; readers use the locked path"
+        );
+    }
+}
+
+/// A [`CommittedTipHandle`] obtained lazily, never blocking: the handle lives
+/// inside the ledger mutex, so constructors must not lock it (they could wait
+/// behind a slow apply or self-deadlock when called under the lock). The
+/// handle is resolved with `try_lock` on first use, or seeded by a caller that
+/// already holds the lock.
+#[derive(Debug, Default)]
+pub struct LazyTip {
+    handle: OnceLock<CommittedTipHandle>,
+}
+
+impl LazyTip {
+    /// Seed from a ledger the caller already has locked.
+    pub fn seed(&self, ledger: &mut SqliteLedger) {
+        if self.handle.get().is_none() {
+            let _ = self.handle.set(ledger.committed_tip_handle());
         }
     }
 
-    fn clear(&self) {
-        *self.shared.cell.write().unwrap_or_else(|e| e.into_inner()) = None;
+    /// The handle if already resolved.
+    pub fn handle(&self) -> Option<&CommittedTipHandle> {
+        self.handle.get()
+    }
+
+    /// Resolve the handle without blocking: `None` while the mutex is held by
+    /// someone else (or poisoned); the caller then uses the locked path.
+    pub fn resolve(&self, ledger: &Mutex<SqliteLedger>) -> Option<&CommittedTipHandle> {
+        if let Some(h) = self.handle.get() {
+            return Some(h);
+        }
+        let mut guard = ledger.try_lock().ok()?;
+        self.seed(&mut guard);
+        self.handle.get()
+    }
+
+    /// Valid tip for a lock-free read, or `None` (poisoned mutex, unresolved
+    /// handle, stale tip). Counts the fallback.
+    pub fn read(&self, ledger: &Mutex<SqliteLedger>) -> Option<Arc<CommittedTip>> {
+        if ledger.is_poisoned() {
+            self.poison();
+            FALLBACK_TOTAL.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        match self.resolve(ledger) {
+            Some(h) => h.read(),
+            None => {
+                FALLBACK_TOTAL.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    /// Disable the tip (poisoned ledger mutex observed).
+    pub fn poison(&self) {
+        if let Some(h) = self.handle.get() {
+            h.poison();
+        }
     }
 }

@@ -286,9 +286,9 @@ pub struct AlgodNodeInterface {
     ledger: Arc<Mutex<SqliteLedger>>,
     /// Issue #1758: lock-free committed-tip view used by `/v2/status`, so a
     /// status poll does not queue behind a slow block apply that holds
-    /// `ledger`. Never-published (always `None`) when the mutex was poisoned
-    /// at construction, which sends readers down the locked path.
-    committed_tip: algo_ledger::committed_tip::CommittedTipHandle,
+    /// `ledger`. Resolved lazily with `try_lock` (never blocks in a
+    /// constructor); readers use the locked path until it is resolved.
+    committed_tip: algo_ledger::committed_tip::LazyTip,
     pool: Option<Arc<TransactionPool>>,
     broadcaster: Option<Arc<LocalTxBroadcaster>>,
     /// Bounded admission semaphore for
@@ -448,13 +448,9 @@ impl AlgodNodeInterface {
     /// `NodeError::NotImplemented` until the collaborators are attached via
     /// [`Self::with_pool`] / [`Self::with_broadcaster`].
     pub fn new(ledger: Arc<Mutex<SqliteLedger>>, config: NodeInterfaceConfig) -> Self {
-        let committed_tip = ledger
-            .lock()
-            .map(|mut l| l.committed_tip_handle())
-            .unwrap_or_default();
         Self {
             ledger,
-            committed_tip,
+            committed_tip: algo_ledger::committed_tip::LazyTip::default(),
             pool: None,
             broadcaster: None,
             async_backlog_permits: Arc::new(Semaphore::new(DEFAULT_ASYNC_BACKLOG_SIZE)),
@@ -969,11 +965,9 @@ impl AlgodNodeInterface {
         // A poisoned ledger mutex must keep surfacing as the Internal error
         // from the locked path, so the lock-free path is skipped (and the tip
         // disabled) once the mutex is poisoned.
-        if self.ledger.is_poisoned() {
-            self.committed_tip.poison();
-        } else if let Some(tip) = self.committed_tip.read() {
+        if let Some(tip) = self.committed_tip.read(&self.ledger) {
             return Ok(StatusSnapshot {
-                last_round: tip.last_committed_round,
+                last_round: tip.round,
                 protocol: self.resolve_protocol_str(&tip.protocol),
                 latest_header: tip.latest_header.clone(),
                 last_catchpoint_label: tip.last_catchpoint_label.clone(),
@@ -990,7 +984,8 @@ impl AlgodNodeInterface {
             .last_committed_round()
             .map_err(|e| NodeError::Internal(format!("last_committed_round: {e}")))?
             .unwrap_or(0);
-        let protocol = self.resolve_protocol(&ledger);
+        // Same source as the published tip: the committed header's protocol.
+        let protocol = self.resolve_protocol_str(&ledger.committed_protocol());
         let latest_header = ledger
             .get_block_header(last_round)
             .map_err(|e| NodeError::Internal(format!("get_block_header({last_round}): {e}")))?
@@ -1255,12 +1250,17 @@ impl NodeInterface for AlgodNodeInterface {
         // block-commit path is a PLAN-34 refinement — see the comment
         // on [`WAIT_POLL_INTERVAL`].
         loop {
-            let last = {
-                let ledger = self.lock_ledger("wait_for_round")?;
-                ledger
-                    .last_committed_round()
-                    .map_err(|e| NodeError::Internal(format!("last_committed_round: {e}")))?
-                    .unwrap_or(0)
+            // Issue #1758: poll the committed tip lock-free; only fall back
+            // to the mutex when there is no valid tip.
+            let last = match self.committed_tip.read(&self.ledger) {
+                Some(tip) => tip.round,
+                None => {
+                    let ledger = self.lock_ledger("wait_for_round")?;
+                    ledger
+                        .last_committed_round()
+                        .map_err(|e| NodeError::Internal(format!("last_committed_round: {e}")))?
+                        .unwrap_or(0)
+                }
             };
             if last >= round {
                 return Ok(());
@@ -3371,6 +3371,8 @@ mod tests {
         let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
         let adapter = Arc::new(make_adapter_with_ledger(ledger.clone()));
         apply_one_trivial_block(&ledger, 1);
+        // Resolve the tip handle while the lock is free.
+        adapter.status().await.unwrap();
 
         let (locked_tx, locked_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -3401,8 +3403,11 @@ mod tests {
         let adapter = make_adapter_with_ledger(ledger.clone());
         for round in 1..=4u64 {
             apply_one_trivial_block(&ledger, round);
-            assert!(adapter.committed_tip.get().is_some(), "tip published");
             let fast = adapter.read_status_snapshot().unwrap();
+            assert!(
+                adapter.committed_tip.handle().unwrap().get().is_some(),
+                "tip published"
+            );
             let slow = adapter.read_status_snapshot_locked().unwrap();
             assert_eq!(fast.last_round, slow.last_round);
             assert_eq!(fast.protocol, slow.protocol);
@@ -3410,6 +3415,50 @@ mod tests {
             assert_eq!(fast.last_catchpoint_label, slow.last_catchpoint_label);
             assert_eq!(fast.last_commit_wall_time, slow.last_commit_wall_time);
         }
+    }
+
+    /// Issue #1758: the committed-header protocol is the single source for the
+    /// locked and the published status paths, including after a
+    /// `set_protocol` without a commit.
+    #[tokio::test]
+    async fn status_protocol_agrees_between_tip_and_locked_path_after_set_protocol() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let adapter = make_adapter_with_ledger(ledger.clone());
+        apply_one_trivial_block(&ledger, 1);
+        let fast = adapter.read_status_snapshot().unwrap();
+        ledger.lock().unwrap().set_protocol("future".into());
+        let slow = adapter.read_status_snapshot_locked().unwrap();
+        assert_eq!(fast.protocol, slow.protocol);
+        assert_eq!(slow.protocol, CONSENSUS_V41);
+    }
+
+    /// Issue #1758: the `wait-for-block-after` poll must not queue behind a
+    /// slow apply when the round it waits for is already committed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_for_round_does_not_wait_for_a_slow_apply() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let adapter = Arc::new(make_adapter_with_ledger(ledger.clone()));
+        apply_one_trivial_block(&ledger, 1);
+        // Resolve the tip handle while the lock is free.
+        adapter.wait_for_round(1).await.unwrap();
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let held = ledger.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(60));
+        });
+        locked_rx.recv().unwrap();
+        let a = adapter.clone();
+        let task = tokio::spawn(async move { a.wait_for_round(1).await });
+        let res = tokio::time::timeout(Duration::from_secs(10), task).await;
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        res.expect("wait_for_round blocked while the ledger mutex was held")
+            .unwrap()
+            .unwrap();
     }
 
     /// Issue #1758: a poisoned ledger mutex still surfaces as the Internal
