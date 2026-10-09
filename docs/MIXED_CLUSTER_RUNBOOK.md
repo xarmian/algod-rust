@@ -150,3 +150,23 @@ Triage of a red run:
   coverage.
 * The Rust node is submitted to directly only for must-reject transactions; positive
   transactions reach it by gossip from the Go relays.
+
+## Pool admission and block assembly evaluate with the real apply (#1773, #1774, #1776)
+
+go's pool admits a group by running it through the pending block evaluator
+(`data/pools/transactionPool.go` `ingest` -> `pendingBlockEvaluator.TransactionGroup`),
+and its `GenerateBlock` only ever emits what that evaluator applied. algod-rust does the same:
+
+* Admission (`SimpleBlockEvaluator::transaction_group`, `bin/algod-rust/src/commands/participate.rs`)
+  runs the group through the real apply with AVM execution on a copy-on-write overlay of the
+  pending state (`algo_ledger::pending_overlay`, `algo_ledger::proposal_eval::evaluate_group`).
+  A failing group is rejected with go's text, `TransactionPool.Remember: transaction <txid>: <reason>`,
+  HTTP 400. Cost is proportional to the group, not to the pool: earlier pending groups live in the
+  overlay, only keys they did not touch are read from the ledger. A per-evaluator budget
+  (`EXEC_ADMISSION_BUDGET`, 10 s) bounds re-evaluating a huge pool after a block; once spent, groups
+  are admitted on the cheap checks and policed by assembly.
+* Assembly (`SimpleBlockEvaluator::generate_block`) re-evaluates the whole candidate payset against
+  the ledger in a rolled-back scratch apply (`algo_ledger::shadow_execute::scratch_execute_payset`),
+  drops every group that fails (one extra pass per dropped group), and writes the resulting
+  ApplyData (closing amounts, rewards, created ids, eval deltas) and the final transaction counter
+  (inner transactions included) into the proposal. The ledger mutex is held for that pass.
