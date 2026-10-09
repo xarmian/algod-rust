@@ -911,9 +911,11 @@ impl AlgodNodeInterface {
     fn local_tx_error_to_node_error(err: LocalTxError) -> NodeError {
         match err {
             LocalTxError::Empty => NodeError::Internal("broadcast: empty group".into()),
-            LocalTxError::Pool(msg) => {
-                NodeError::Internal(format!("broadcast: pool rejected group: {msg}"))
-            }
+            // go: `BroadcastSignedTxGroup` returns the pool error as is and the
+            // handler answers `400 {"message": err.Error()}`, i.e.
+            // `TransactionPool.Remember: transaction <id>: <reason>` with no
+            // adapter prefix (issue #1776).
+            LocalTxError::Pool(msg) => NodeError::BadRequest(msg),
             LocalTxError::Encode(msg) => {
                 NodeError::Internal(format!("broadcast: encode failed: {msg}"))
             }
@@ -4970,7 +4972,11 @@ mod tests {
 
         let pool =
             AlgodNodeInterface::local_tx_error_to_node_error(LocalTxError::Pool("bad fee".into()));
-        assert_eq!(msg(pool), "broadcast: pool rejected group: bad fee");
+        // A pool rejection is a client error carrying go's text verbatim.
+        match pool {
+            NodeError::BadRequest(m) => assert_eq!(m, "bad fee"),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
 
         let encode = AlgodNodeInterface::local_tx_error_to_node_error(LocalTxError::Encode(
             "bad msgpack".into(),

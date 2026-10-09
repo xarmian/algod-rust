@@ -1595,11 +1595,51 @@ pub(crate) fn apply_block_impl_ex<L: crate::store_trait::LedgerStore>(
     block: &Block,
     mode: ApplyMode,
     validate: bool,
+    tracer: Option<&mut dyn EvalTracer>,
+    group_deltas: Option<&mut crate::txn_group_delta_tracer::TxnGroupDeltaTracer>,
+    apply_data_out: Option<&mut Vec<ApplyData>>,
+    kv_mods_out: Option<&mut KvModsMap>,
+    scratch: bool,
+) -> Result<(), AlgoError> {
+    apply_block_impl_probe(
+        store,
+        block,
+        mode,
+        validate,
+        tracer,
+        group_deltas,
+        apply_data_out,
+        kv_mods_out,
+        scratch,
+        None,
+    )
+}
+
+/// Side outputs of an apply that the proposer's evaluator needs but a plain
+/// apply has no reason to expose (block assembly, issue #1776).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ExecProbe {
+    /// Payset index of the transaction being applied when the apply failed
+    /// (`None` when it did not fail, or failed before the first transaction).
+    pub failed_txn_index: Option<usize>,
+    /// The transaction counter after every top-level and inner transaction
+    /// of the block (go's `block.TxnCounter`); only set on success.
+    pub final_txn_counter: u64,
+}
+
+/// [`apply_block_impl_ex`] plus an [`ExecProbe`] out-parameter.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+    mode: ApplyMode,
+    validate: bool,
     mut tracer: Option<&mut dyn EvalTracer>,
     mut group_deltas: Option<&mut crate::txn_group_delta_tracer::TxnGroupDeltaTracer>,
     mut apply_data_out: Option<&mut Vec<ApplyData>>,
     kv_mods_out: Option<&mut KvModsMap>,
     scratch: bool,
+    probe: Option<&mut ExecProbe>,
 ) -> Result<(), AlgoError> {
     // A block's payset stores each transaction without the genesis id/hash
     // (the header carries them; `hgi` marks whether the id was elided).
@@ -1953,6 +1993,13 @@ pub(crate) fn apply_block_impl_ex<L: crate::store_trait::LedgerStore>(
         Ok(())
     };
 
+    if let Some(p) = probe {
+        if result.is_err() {
+            p.failed_txn_index = Some(ctx.txn_index.get());
+        } else {
+            p.final_txn_counter = ctx.txn_counter.get();
+        }
+    }
     if result.is_err() {
         // Restore rewards state and addresses on failure.
         store.set_rewards_level(prev_rewards_level);
@@ -3901,52 +3948,51 @@ pub fn apply_pay<L: crate::store_trait::LedgerStore>(
         let close_amount = sender.micro_algos;
         ad.closing_amount = close_amount;
 
-        // Cannot close account with opted-in or created assets/apps.
+        // Cannot close an account that still carries asset/app/box state.
+        // Texts and check order are go's `apply.Payment`
+        // (`ledger/apply/payment.go`).
         if sender.total_assets_opted_in > 0 {
-            return Err(AlgoError::Ledger {
+            return Err(AlgoError::Eval {
                 message: format!(
-                    "sender {} cannot close: has {} opted-in assets",
-                    txn.sender, sender.total_assets_opted_in,
+                    "cannot close: {} outstanding assets",
+                    sender.total_assets_opted_in,
                 ),
             });
         }
         if sender.total_created_assets > 0 {
-            return Err(AlgoError::Ledger {
+            return Err(AlgoError::Eval {
                 message: format!(
-                    "sender {} cannot close: has {} created assets",
-                    txn.sender, sender.total_created_assets,
+                    "cannot close: {} outstanding created assets",
+                    sender.total_created_assets,
                 ),
             });
         }
         if sender.total_apps_opted_in > 0 {
-            return Err(AlgoError::Ledger {
+            return Err(AlgoError::Eval {
                 message: format!(
-                    "sender {} cannot close: has {} opted-in apps",
-                    txn.sender, sender.total_apps_opted_in,
-                ),
-            });
-        }
-        if sender.total_created_apps > 0 {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "sender {} cannot close: has {} created apps",
-                    txn.sender, sender.total_created_apps,
+                    "cannot close: {} outstanding applications opted in. Please opt out or clear them",
+                    sender.total_apps_opted_in,
                 ),
             });
         }
         if sender.total_boxes > 0 {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "sender {} cannot close: has {} outstanding boxes",
-                    txn.sender, sender.total_boxes,
-                ),
+            return Err(AlgoError::Eval {
+                message: format!("cannot close: {} outstanding boxes", sender.total_boxes),
             });
         }
         if sender.total_box_bytes > 0 {
-            return Err(AlgoError::Ledger {
+            return Err(AlgoError::Eval {
                 message: format!(
-                    "sender {} cannot close: has {} outstanding box bytes",
-                    txn.sender, sender.total_box_bytes,
+                    "cannot close: {} outstanding box bytes",
+                    sender.total_box_bytes,
+                ),
+            });
+        }
+        if sender.total_created_apps > 0 {
+            return Err(AlgoError::Eval {
+                message: format!(
+                    "cannot close: {} outstanding created applications",
+                    sender.total_created_apps,
                 ),
             });
         }

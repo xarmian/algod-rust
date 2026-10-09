@@ -757,6 +757,84 @@ fn compare<L: LedgerStore>(
     out
 }
 
+/// Result of [`scratch_execute_payset`].
+#[derive(Debug)]
+pub struct ScratchPayset {
+    /// Per-transaction apply data in payset order.
+    pub apply_data: Vec<ApplyData>,
+    /// The transaction counter after every top-level and inner transaction
+    /// (go `block.TxnCounter`).
+    pub final_txn_counter: u64,
+}
+
+/// Why [`scratch_execute_payset`] did not produce a result.
+#[derive(Debug)]
+pub enum ScratchFailure {
+    /// The payset transaction at `index` cannot be applied.
+    Txn { index: usize, error: AlgoError },
+    /// The evaluation failed for a reason no transaction owns (stale round,
+    /// end-of-block failure, panic).
+    Other(AlgoError),
+    /// The store cannot roll a scratch apply back (a lease journal is
+    /// already open): nothing was evaluated.
+    Unsupported,
+}
+
+/// Evaluate `block` (the proposer's candidate: next-round header + payset,
+/// stripped form) in [`ApplyMode::Execute`] on a rolled-back scratch apply of
+/// `store` and return every transaction's `ApplyData` and the final
+/// transaction counter, or the payset index that failed (issue #1776).
+///
+/// This is the authoritative check the block proposer runs on its assembled
+/// payset (go's `BlockEvaluator.GenerateBlock` only ever emits what its
+/// `TransactionGroup` applied). Nothing is persisted: the SAVEPOINT, the
+/// lease journal and the chain fields are restored before returning.
+pub fn scratch_execute_payset<L: LedgerStore>(
+    store: &mut L,
+    block: &Block,
+) -> Result<ScratchPayset, ScratchFailure> {
+    let Some(aux) = scratch_state(store) else {
+        return Err(ScratchFailure::Unsupported);
+    };
+    let chain = ChainFields::capture(store);
+    let invariant = ScratchInvariant::capture(store, &chain);
+    let sp = store.snapshot(&[]);
+    let mut ad: Vec<ApplyData> = Vec::with_capacity(block.payset.len());
+    let mut probe = crate::apply::ExecProbe::default();
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::apply::apply_block_impl_probe(
+            store,
+            block,
+            ApplyMode::Execute,
+            false,
+            None,
+            None,
+            Some(&mut ad),
+            None,
+            true,
+            Some(&mut probe),
+        )
+    }));
+    invariant.check_scratch_pass(store);
+    store.restore_snapshot(sp);
+    chain.restore(store);
+    store.restore_scratch_state(aux);
+    invariant.check_rolled_back(store);
+    match res {
+        Err(_) => Err(ScratchFailure::Other(AlgoError::Ledger {
+            message: "scratch Execute evaluation panicked".into(),
+        })),
+        Ok(Err(error)) => match probe.failed_txn_index {
+            Some(index) if index < block.payset.len() => Err(ScratchFailure::Txn { index, error }),
+            _ => Err(ScratchFailure::Other(error)),
+        },
+        Ok(Ok(())) => Ok(ScratchPayset {
+            apply_data: ad,
+            final_txn_counter: probe.final_txn_counter,
+        }),
+    }
+}
+
 /// Apply `block` for real in [`ApplyMode::Replay`] (exactly what the follow
 /// path does for a block without app calls) after shadow-evaluating it in
 /// [`ApplyMode::Execute`] on a rolled-back scratch apply, and return the

@@ -109,6 +109,13 @@ pub enum AlgoError {
     #[error("AVM: {message}")]
     Avm { message: String },
 
+    /// A transaction-evaluation failure whose text is go-algorand's verbatim
+    /// (`transaction <txid>: <reason>`, as `eval.TransactionGroup` returns
+    /// it), with no algod-rust category prefix, so the pool/REST layers can
+    /// surface exactly go's `TransactionPool.Remember: ...` message.
+    #[error("{message}")]
+    Eval { message: String },
+
     /// An AVM evaluation failure, enriched with go-algorand-style structured
     /// diagnostics (pc, group index, app index, per-transaction
     /// scratch/stack dump). Mirrors go's `basics.SError`/`EvalError`

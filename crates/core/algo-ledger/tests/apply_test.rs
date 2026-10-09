@@ -537,8 +537,8 @@ fn test_close_with_opted_in_apps_fails() {
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("opted-in apps"),
-        "error should mention opted-in apps, got: {}",
+        err_msg == "cannot close: 2 outstanding applications opted in. Please opt out or clear them",
+        "go's apply.Payment text expected, got: {}",
         err_msg,
     );
 }

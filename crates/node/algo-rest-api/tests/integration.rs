@@ -6695,6 +6695,32 @@ async fn raw_transaction_broadcast_error_returns_400() {
     );
 }
 
+/// Issue #1773: go answers a pool-evaluator rejection with
+/// `400 {"message": "TransactionPool.Remember: transaction <txid>: <reason>"}`
+/// (`handlers.go` `badRequest(ctx, err, err.Error(), ...)`) -- the message is
+/// the pool error verbatim, with no node-side prefix.
+#[tokio::test]
+async fn raw_transaction_pool_evaluator_rejection_body_matches_go() {
+    let go_text = "TransactionPool.Remember: transaction         H6YID47U5WQHWXIVEINCBNIXG7E6CMPKEVPSECLO76JMVYOOKSMQ:         cannot close: 1 outstanding assets";
+    let mut node = MockNode::synced();
+    node.broadcast_result = Some(go_text.to_string());
+    let server = TestServer::start(node).await;
+
+    let body = encode_signed_txn_for_post(&make_test_signed_txn());
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/x-binary")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["message"].as_str().unwrap(), go_text);
+}
+
 /// An oversized transaction group: go-algorand's `decodeTxGroup`
 /// (`daemon/algod/api/server/v2/handlers.go`) decodes concatenated msgpack
 /// `SignedTxn`s one at a time and rejects as soon as the running count

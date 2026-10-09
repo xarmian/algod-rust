@@ -108,6 +108,19 @@ pub enum PoolError {
     #[error("TransactionPool.ingest: {0}")]
     EvaluatorWithDetail(String, algo_error::AvmErrorDetail),
 
+    /// The block evaluator refused a transaction of the group. The text is
+    /// go's verbatim `eval.TransactionGroup` error (`transaction <txid>:
+    /// <reason>`), which go's `Remember` wraps as
+    /// `TransactionPool.Remember: transaction <txid>: <reason>` with no
+    /// `TransactionPool.ingest` frame in between (issue #1776).
+    #[error("{0}")]
+    TxnRejected(String),
+
+    /// [`PoolError::TxnRejected`] for a rejection that carries structured AVM
+    /// eval diagnostics (see [`PoolError::EvaluatorWithDetail`]).
+    #[error("{0}")]
+    TxnRejectedWithDetail(String, algo_error::AvmErrorDetail),
+
     /// The transaction's lease is already recorded for the sender within
     /// the relevant round window.
     ///
@@ -151,6 +164,7 @@ impl PoolError {
     pub fn avm_eval_detail(&self) -> Option<&algo_error::AvmErrorDetail> {
         match self {
             PoolError::EvaluatorWithDetail(_, detail) => Some(detail),
+            PoolError::TxnRejectedWithDetail(_, detail) => Some(detail),
             PoolError::Remember(inner) => inner.avm_eval_detail(),
             _ => None,
         }
@@ -285,6 +299,8 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
         PoolError::AlreadyInLedger(_) => PoolErrorTag::TxId,
         PoolError::Evaluator(msg) => classify_evaluator_message(msg),
         PoolError::EvaluatorWithDetail(msg, _) => classify_evaluator_message(msg),
+        PoolError::TxnRejected(msg) => classify_evaluator_message(msg),
+        PoolError::TxnRejectedWithDetail(msg, _) => classify_evaluator_message(msg),
         PoolError::LeaseConflict {
             in_block_evaluator, ..
         } => {

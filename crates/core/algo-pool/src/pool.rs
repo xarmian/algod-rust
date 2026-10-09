@@ -667,7 +667,22 @@ impl TransactionPool {
                 // walks `e`'s source chain for an `AlgoError::AvmLogicSig`.
                 let detail = e.avm_eval_detail();
                 let message = e.to_string();
-                if message.contains("duplicate lease") || message.contains("overlapping lease") {
+                // The evaluator reports go's verbatim `transaction <txid>: ...`
+                // text through `Eval`/`AvmLogicSig` (issue #1776).
+                let go_text = message.starts_with("transaction ")
+                    && matches!(
+                        e,
+                        algo_error::AlgoError::Eval { .. }
+                            | algo_error::AlgoError::AvmLogicSig { .. }
+                    );
+                if go_text {
+                    match detail {
+                        Some(detail) => PoolError::TxnRejectedWithDetail(message, detail),
+                        None => PoolError::TxnRejected(message),
+                    }
+                } else if message.contains("duplicate lease")
+                    || message.contains("overlapping lease")
+                {
                     PoolError::LeaseConflict {
                         message,
                         in_block_evaluator: reevaluating,
