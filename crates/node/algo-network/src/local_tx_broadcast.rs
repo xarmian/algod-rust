@@ -82,6 +82,11 @@ pub enum LocalTxError {
     #[error("pool rejected group: {0}")]
     Pool(String),
 
+    /// The pool is paused for a live catchpoint catchup (issue #1683); the
+    /// group was not examined. Transient: callers answer 503, not 400.
+    #[error("{0}")]
+    Unavailable(String),
+
     /// msgpack encode of a txn in the group failed.
     #[error("encode failed: {0}")]
     Encode(String),
@@ -105,6 +110,12 @@ pub enum LocalTxError {
 pub trait PoolIngest: Send + Sync + 'static {
     /// Submit `group` to the pool and wait for completion.
     async fn ingest(&self, group: Vec<SignedTransaction>) -> Result<(), String>;
+
+    /// Whether the pool is paused for a live catchpoint catchup (issue
+    /// #1683), so a failed [`Self::ingest`] was not a verdict on the group.
+    fn catching_up(&self) -> bool {
+        false
+    }
 }
 
 /// Production [`PoolIngest`] adapter over [`TransactionPool`].
@@ -132,6 +143,10 @@ impl PoolIngest for PoolIngestAdapter {
             .await
             .map_err(|e| format!("pool ingest task join failed: {e}"))?
             .map_err(|e| e.to_string())
+    }
+
+    fn catching_up(&self) -> bool {
+        self.pool.is_evaluator_paused()
     }
 }
 
@@ -245,6 +260,11 @@ impl LocalTxBroadcaster {
         // which `PoolLedgerAdapter` (the production impl, shared with the
         // dev-mode path) backs with a txtail scan. See issue #456.
         if let Err(e) = self.ingest.ingest(group).await {
+            if self.ingest.catching_up() {
+                // Not a verdict on the group (issue #1683): retryable.
+                debug!(error = %e, "LocalTxBroadcaster: node is catching up; group not admitted");
+                return Err(LocalTxError::Unavailable(e));
+            }
             warn!(error = %e, "LocalTxBroadcaster: pool rejected local group");
             return Err(LocalTxError::Pool(e));
         }
@@ -494,6 +514,36 @@ mod tests {
         assert!(!seen.contains(&compute_txn_id(&group[0].txn)));
         // Ingest was called exactly once.
         assert_eq!(ingestor.recorded().len(), 1);
+    }
+
+    /// Issue #1683: a rejection because the pool is paused for a live
+    /// catchpoint catchup is `Unavailable` (REST answers 503), not `Pool`
+    /// (a permanent-looking 400), and still neither broadcasts nor marks the
+    /// group seen.
+    #[tokio::test]
+    async fn submit_group_reports_unavailable_when_pool_is_catching_up() {
+        struct CatchingUp;
+        #[async_trait]
+        impl PoolIngest for CatchingUp {
+            async fn ingest(&self, _group: Vec<SignedTransaction>) -> Result<(), String> {
+                Err("node is catching up".to_string())
+            }
+            fn catching_up(&self) -> bool {
+                true
+            }
+        }
+        let gossip = Arc::new(MockGossipNode::new());
+        let seen = Arc::new(SeenTxCache::new(16));
+        let bx = LocalTxBroadcaster::new(Arc::new(CatchingUp), gossip.clone(), seen.clone());
+
+        let group = vec![make_signed_txn(7)];
+        let err = bx.submit_group(group.clone()).await.unwrap_err();
+        assert!(
+            matches!(err, LocalTxError::Unavailable(_)),
+            "expected Unavailable, got {err:?}",
+        );
+        assert!(gossip.recorded().is_empty());
+        assert!(!seen.contains(&compute_txn_id(&group[0].txn)));
     }
 
     #[tokio::test]

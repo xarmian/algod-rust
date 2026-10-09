@@ -1647,6 +1647,16 @@ async fn ingest_group(
                 }
             }
         }
+        // Issue #1683: the pool is paused for a live catchpoint catchup. That
+        // says nothing about the group or the peer: drop silently -- no
+        // warning, no eval-error counter, and above all no app-rate-limiter
+        // penalty (the peer did nothing wrong).
+        Ok(Err(e)) if e.is_catching_up() => {
+            debug!(
+                sender = %sender,
+                "TxTagHandler: dropped inbound TX group while the node is catching up",
+            );
+        }
         Ok(Err(e)) => {
             warn!(
                 sender = %sender,
@@ -2265,6 +2275,74 @@ mod app_rate_limiter_wiring_tests {
         assert!(
             !pool.pending_tx_ids().contains(&txid),
             "app penalized for the earlier eval error should be rate limited on retry"
+        );
+    }
+
+    /// Issue #1683: while the pool is paused for a live catchpoint catchup, an
+    /// inbound group is dropped without penalising the peer or the app: no
+    /// eval-error counter, no app-rate-limiter penalty -- so the same app
+    /// from the same origin is admitted as soon as the pool resumes. Covers
+    /// both the `pool.test()` pre-check (via `handle`) and `ingest_group`'s
+    /// `remember` failure arm (called directly).
+    #[tokio::test]
+    async fn catching_up_pool_drops_without_penalising_peer_or_app() {
+        let (pool, _fail) = make_pool();
+        let seen = Arc::new(SeenTxCache::new(1024));
+        // Rate 0/window: any recorded penalty would block the retry below.
+        let limiter = Arc::new(AppRateLimiter::new(1024, 0, Duration::from_secs(10)));
+        let handler =
+            TxTagHandler::new(pool.clone(), seen.clone()).with_app_rate_limiter(limiter.clone(), 0);
+
+        pool.set_evaluator_paused(true);
+
+        // Pre-check path.
+        let out = handler
+            .handle(incoming(&[make_app_call_txn(9, 1)], "5.6.7.8:4160"))
+            .await;
+        assert_eq!(out.action, ForwardingPolicy::Ignore);
+
+        // `remember` failure arm, reached directly.
+        let tx = make_app_call_txn(9, 2);
+        let txids = vec![compute_txn_id(&tx.txn)];
+        let counter = handler.remember_counter();
+        ingest_group(
+            &pool,
+            &seen,
+            &Some(limiter),
+            counter,
+            &None,
+            vec![tx],
+            txids,
+            "5.6.7.8:4160".to_string(),
+        )
+        .await;
+        for tag in algo_pool::PoolErrorTag::ALL {
+            assert_eq!(counter.count(*tag), 0, "no rejection counted for {tag}");
+        }
+        assert_eq!(pool.pending_count(), 0);
+
+        // Resumed: filler primes congestion; the same app/origin is admitted
+        // (a recorded penalty would have dropped it).
+        pool.set_evaluator_paused(false);
+        pool.on_new_block(&Block::default(), &HashSet::new());
+        let filler = {
+            let mut stx = SignedTransaction::default();
+            stx.txn.txn_type = TxnType::Pay;
+            stx.txn.sender = Address([3u8; 32]);
+            stx.txn.fee = 1_000_000;
+            stx.txn.first_valid = Round(1);
+            stx.txn.last_valid = Round(1_000);
+            stx.txn.note = serde_bytes::ByteBuf::from(vec![0xBB]);
+            stx
+        };
+        pool.remember(vec![filler]).expect("filler txn admitted");
+        let tx = make_app_call_txn(9, 3);
+        let txid = compute_txn_id(&tx.txn);
+        let out = handler.handle(incoming(&[tx], "5.6.7.8:4160")).await;
+        assert_eq!(out.action, ForwardingPolicy::Ignore);
+        assert!(
+            pool.pending_tx_ids().contains(&txid),
+            "no penalty was recorded while catching up, so the retry is admitted"
         );
     }
 

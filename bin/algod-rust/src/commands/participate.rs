@@ -629,6 +629,20 @@ impl ParticipateAgreementControl {
 #[async_trait::async_trait]
 impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
     async fn pause(&self) {
+        // Issue #1683: the pool's pending block evaluator keeps a ledger read
+        // snapshot (an open SQLite read transaction) alive; across the
+        // multi-minute catchpoint import that pins the tracker WAL and no
+        // checkpoint can run. Pause the pool's evaluator FIRST -- a flag, not
+        // a one-off drop, so a block the pool follower processes late (or the
+        // wake-up `reload_ledger` sends) cannot rebuild it and re-pin the WAL
+        // -- and also when no cycle was running: the evaluator outlives the
+        // agreement cycle. `set_evaluator_paused` takes the pool's blocking
+        // mutex (the follower holds it across a ledger read), so it runs on
+        // the blocking pool, not on this async task.
+        let pool = self.pool.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || pool.set_evaluator_paused(true)).await {
+            warn!(error = %e, "pause: pool evaluator pause task panicked");
+        }
         let mut guard = self.running.lock().await;
         if let Some(cycle) = guard.take() {
             // `ServiceHandle::shutdown`/`CatchupService::stop` join real OS
@@ -652,13 +666,6 @@ impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
             }
             info!("consensus participation paused for live catchpoint catchup");
         }
-        // Issue #1683: the pool's pending block evaluator keeps a ledger read
-        // snapshot (an open SQLite read transaction) alive; across the
-        // multi-minute catchpoint import that pins the tracker WAL and no
-        // checkpoint can run. Release it now (also when nothing was running:
-        // the evaluator outlives the agreement cycle). The pool follower
-        // rebuilds it on the first block after the ledger reload.
-        self.pool.release_evaluator();
     }
 
     async fn resume(&self) {
@@ -669,7 +676,15 @@ impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
         // `build_cycle` does blocking SQLite/mutex work; run it off the
         // tokio runtime like `pause`'s shutdown does.
         let this = self.clone_for_rebuild();
-        let built = tokio::task::spawn_blocking(move || this.build_cycle()).await;
+        let built = tokio::task::spawn_blocking(move || {
+            // Issue #1683 safety net: the pool must never stay paused once
+            // the node resumes (an aborted catchup, a failed reload). Clearing
+            // the flag builds nothing; the first committed block rebuilds the
+            // evaluator against the then-current ledger.
+            this.pool.set_evaluator_paused(false);
+            this.build_cycle()
+        })
+        .await;
         match built {
             Ok(Ok(cycle)) => {
                 *guard = Some(cycle);
@@ -708,12 +723,16 @@ impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
             open_and_configure_participate_ledger(&ledger_path, &resolved_paths, &node_config)
         })
         .await;
+        // Only a successful reopen makes the ledger handle current; a pool
+        // evaluator must never be built against a stale one.
+        let mut reloaded = false;
         match reopened {
             Ok(Ok(fresh)) => {
                 let round = fresh.current_round().0;
                 match self.ledger.lock() {
                     Ok(mut guard) => {
                         *guard = fresh;
+                        reloaded = true;
                         info!(
                             round,
                             "reloaded ledger from disk after live catchpoint catchup"
@@ -721,7 +740,10 @@ impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
                         // Wake the pool-block-follower (and anything else
                         // waiting on this condvar) immediately rather than
                         // leaving it to discover the new round on its next
-                        // poll-interval timeout.
+                        // poll-interval timeout. The pool is still paused
+                        // (issue #1683), so the wake-up cannot rebuild its
+                        // evaluator and re-pin the WAL before the checkpoint
+                        // below has run.
                         self.round_advanced.notify_all();
                     }
                     Err(e) => {
@@ -755,12 +777,26 @@ impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
         })
         .await;
 
-        // Issue #1683: `pause` released the pool's evaluator; rebuild it
-        // against the reopened ledger now so transaction admission works
-        // again without waiting for the next block (a no-op if the pool
-        // follower already did).
+        // Issue #1683: leave the pool's paused state only now, after the
+        // checkpoint. On a successful reload, rebuild the evaluator against
+        // the fresh handle right away (admission works again without waiting
+        // for the next block). On any failure the handle may be stale: just
+        // clear the flag so the pool is never stuck paused, and let the next
+        // committed block rebuild the evaluator against whichever handle is
+        // current by then. Runs on the blocking pool (the follower holds the
+        // pool mutex across a ledger read).
         let pool = self.pool.clone();
-        let _ = tokio::task::spawn_blocking(move || pool.ensure_evaluator_primed()).await;
+        let resumed = tokio::task::spawn_blocking(move || {
+            if reloaded {
+                pool.resume_evaluator();
+            } else {
+                pool.set_evaluator_paused(false);
+            }
+        })
+        .await;
+        if let Err(e) = resumed {
+            warn!(error = %e, "ledger reload: pool resume task panicked");
+        }
     }
 }
 
@@ -3342,6 +3378,12 @@ impl PoolLedgerAdapter {
         // Snapshot the committed state at the previous round — evaluation reads
         // balances as of the block we build on. This briefly acquires the mutex,
         // captures lease state, then releases.
+        // The first account read below (the rewards-pool balance) is what
+        // turns the snapshot's deferred `BEGIN` into a real WAL read mark, so
+        // from here until this evaluator is dropped the tracker WAL cannot be
+        // reset. `ParticipateAgreementControl::pause` therefore pauses the
+        // pool (dropping its evaluator) for the length of a live catchup
+        // (issue #1683).
         let mut snapshot = LedgerSnapshot::from_ledger(&self.ledger, hdr.round.0);
 
         // Advance the header to the next round, mirroring go's

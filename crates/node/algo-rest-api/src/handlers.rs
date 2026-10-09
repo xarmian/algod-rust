@@ -2699,6 +2699,9 @@ pub async fn raw_transaction<N: NodeInterface>(
             NodeError::BadRequestWithDetail(msg, detail) => {
                 error::bad_request_with_detail(msg, &detail)
             }
+            // Issue #1683: the pool is paused for a live catchup, which can
+            // begin between the status check above and the broadcast.
+            NodeError::Unavailable(msg) => error::service_unavailable(msg),
             e => error::bad_request(e.to_string()),
         };
     }

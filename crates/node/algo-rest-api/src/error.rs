@@ -240,6 +240,7 @@ pub fn ledger_error_response(e: NodeError) -> Response {
         NodeError::NotFound(_) => not_found("failed to retrieve information from the ledger"),
         NodeError::BadRequest(msg) => bad_request(msg),
         NodeError::BadRequestWithDetail(msg, detail) => bad_request_with_detail(msg, &detail),
+        NodeError::Unavailable(msg) => service_unavailable(msg),
         NodeError::Timeout(_) | NodeError::NotImplemented(_) | NodeError::Internal(_) => {
             internal_error("failed to retrieve information from the ledger")
         }
@@ -338,10 +339,7 @@ mod tests {
         assert_eq!(states[0]["scratch"], serde_json::json!([5]));
         assert_eq!(states[0]["stack"], serde_json::json!([100, "AgE="])); // base64(0x02, 0x01)
 
-        assert_eq!(
-            parsed["message"],
-            "app 1234 approval program rejected"
-        );
+        assert_eq!(parsed["message"], "app 1234 approval program rejected");
     }
 
     /// A LogicSig failure (no app-index) must omit the `app-index` key

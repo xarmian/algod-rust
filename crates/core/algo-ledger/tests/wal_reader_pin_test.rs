@@ -18,17 +18,18 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Issue #1683: a live catchpoint catchup must not run while a
-//! [`ReadSnapshot`] (the read transaction a `SimpleBlockEvaluator` keeps for
-//! its whole lifetime) is still open on the tracker database -- an open
-//! reader pins the WAL, so no checkpoint can reset it and the WAL grows for
-//! the entire import/verify/replay (~10.5M frames, ~43 GB on mainnet, then a
-//! 267 s post-sync checkpoint).
+//! Issue #1683 -- the "why" documentation test for the WAL pin.
 //!
-//! These tests pin the raw WAL semantics the fix relies on, using the real
-//! [`SqliteLedger::open_read_snapshot`] reader and a second connection that
-//! stands in for the catchup's private write connection. Run with
-//! `--nocapture` to see the measured WAL sizes.
+//! This exercises raw SQLite WAL semantics only (the real
+//! `SqliteLedger::open_read_snapshot` reader against a second connection
+//! standing in for the catchup's write connection); it does NOT cover the
+//! production wiring. That is `participate_wal_pin_tests.rs` in `algod-rust`
+//! (pause/reload of the real `ParticipateAgreementControl`). What this file
+//! documents and measures: an open `ReadSnapshot` that has performed a read
+//! pins the WAL -- `wal_checkpoint(TRUNCATE)` reports busy and the WAL file
+//! cannot be reset -- so the WAL grows for as long as the reader lives
+//! (~10.5M frames, ~43 GB on mainnet), and it is released the moment the
+//! reader is dropped. Run with `--nocapture` to see the measured WAL sizes.
 
 use algo_ledger::{tracker_path_for_prefix, SqliteLedger};
 use algo_types::Address;
@@ -95,6 +96,9 @@ fn open_pair() -> (
     // The catchup connection checkpoints explicitly below; make that
     // deterministic by disabling the automatic one.
     writer.execute_batch("PRAGMA wal_autocheckpoint=0").unwrap();
+    // A busy TRUNCATE must report busy at once, not after the 5 s default
+    // busy wait.
+    writer.busy_timeout(std::time::Duration::ZERO).unwrap();
     (dir, tracker, ledger, writer)
 }
 

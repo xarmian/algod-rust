@@ -916,6 +916,8 @@ impl AlgodNodeInterface {
             // `TransactionPool.Remember: transaction <id>: <reason>` with no
             // adapter prefix (issue #1776).
             LocalTxError::Pool(msg) => NodeError::BadRequest(msg),
+            // Issue #1683: paused for a live catchup -- transient, so 503.
+            LocalTxError::Unavailable(msg) => NodeError::Unavailable(msg),
             LocalTxError::Encode(msg) => {
                 NodeError::Internal(format!("broadcast: encode failed: {msg}"))
             }
@@ -4978,6 +4980,14 @@ mod tests {
         match pool {
             NodeError::BadRequest(m) => assert_eq!(m, "bad fee"),
             other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        // Issue #1683: paused for a live catchup -- transient, 503.
+        match AlgodNodeInterface::local_tx_error_to_node_error(LocalTxError::Unavailable(
+            "node is catching up".into(),
+        )) {
+            NodeError::Unavailable(m) => assert_eq!(m, "node is catching up"),
+            other => panic!("expected Unavailable, got {other:?}"),
         }
 
         let encode = AlgodNodeInterface::local_tx_error_to_node_error(LocalTxError::Encode(

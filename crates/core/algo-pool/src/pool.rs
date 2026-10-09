@@ -81,6 +81,14 @@ struct PoolInner {
     /// The evaluator building the current pending block.
     evaluator: Option<Box<dyn BlockEvaluator>>,
 
+    /// Issue #1683: while `true` the pool must not hold (or build) an
+    /// evaluator, because the evaluator's ledger read snapshot would pin the
+    /// tracker WAL for the length of a live catchpoint catchup. Every path
+    /// that would build one (`on_new_block`, `ensure_evaluator_primed`,
+    /// `recompute_block_evaluator`) is a no-op, and admission fails with
+    /// [`PoolError::NodeCatchingUp`].
+    evaluator_paused: bool,
+
     /// Number of "whole blocks" worth of transactions that have accumulated.
     /// Drives the exponential fee ramp.
     num_pending_whole_blocks: u64,
@@ -175,6 +183,7 @@ impl TransactionPool {
             remembered_tx_groups: Vec::new(),
             remembered_txids: HashMap::new(),
             evaluator: None,
+            evaluator_paused: false,
             num_pending_whole_blocks: 0,
             fee_threshold_multiplier: 0,
             stateproof_overflowed: false,
@@ -378,6 +387,9 @@ impl TransactionPool {
         tx_group: &[SignedTransaction],
         guard: &mut parking_lot::MutexGuard<'_, PoolInner>,
     ) -> Result<(), PoolError> {
+        if guard.evaluator_paused {
+            return Err(PoolError::NodeCatchingUp);
+        }
         if guard.evaluator.is_none() {
             return Err(PoolError::NoPendingBlockEvaluator);
         }
@@ -400,6 +412,9 @@ impl TransactionPool {
                 let timeout = wait_expires.saturating_duration_since(Instant::now());
                 self.cond.wait_for(guard, timeout);
 
+                if guard.evaluator_paused {
+                    return Err(PoolError::NodeCatchingUp);
+                }
                 if guard.evaluator.is_none() {
                     return Err(PoolError::NoPendingBlockEvaluator);
                 }
@@ -485,6 +500,12 @@ impl TransactionPool {
     /// Assumes `mu` is held by the caller.
     fn recompute_block_evaluator(&self, inner: &mut PoolInner, committed_txids: &HashSet<Digest>) {
         inner.evaluator = None;
+        if inner.evaluator_paused {
+            // Issue #1683: paused for a live catchup -- build nothing. The
+            // pending groups stay; `resume_evaluator` rebuilds from the
+            // ledger's then-current tip.
+            return;
+        }
 
         let latest = self.ledger.latest();
         let prev_hdr = match self.ledger.block_hdr(latest) {
@@ -781,6 +802,9 @@ impl TransactionPool {
 
         let inner = self.mu.lock();
 
+        if inner.evaluator_paused {
+            return Err(PoolError::NodeCatchingUp);
+        }
         if let Some(ref evaluator) = inner.evaluator {
             evaluator
                 .test_transaction_group(tx_group)
@@ -830,6 +854,14 @@ impl TransactionPool {
         let mut inner = self.mu.lock();
 
         if self.is_shutdown() {
+            return;
+        }
+
+        // Issue #1683: a block that commits while the node is paused for a
+        // catchup must not rebuild the evaluator (that would re-pin the WAL).
+        // Nothing needs remembering: resuming rebuilds from `ledger.latest()`.
+        if inner.evaluator_paused {
+            self.cond.notify_all();
             return;
         }
 
@@ -1213,11 +1245,16 @@ impl TransactionPool {
         self.recompute_block_evaluator(&mut inner, &HashSet::new());
 
         // Read the evaluator round while we still have the lock.
-        let eval_round = inner
-            .evaluator
-            .as_ref()
-            .map(|e| e.round())
-            .ok_or(PoolError::NoPendingBlockEvaluator)?;
+        let eval_round =
+            inner
+                .evaluator
+                .as_ref()
+                .map(|e| e.round())
+                .ok_or(if inner.evaluator_paused {
+                    PoolError::NodeCatchingUp
+                } else {
+                    PoolError::NoPendingBlockEvaluator
+                })?;
 
         drop(inner);
 
@@ -1256,22 +1293,50 @@ impl TransactionPool {
         self.fee_per_byte.store(0, Ordering::Relaxed);
     }
 
-    /// Drop the pending block evaluator but keep every pending and
-    /// remembered transaction group (issue #1683).
+    /// Pause or un-pause the pool's block evaluator (issue #1683).
     ///
     /// The evaluator owns a ledger read snapshot (an open SQLite read
     /// transaction) for as long as it lives. A live catchpoint catchup writes
-    /// the ledger through its own connection for many minutes; if the
-    /// evaluator built against the pre-catchup ledger is still alive, that
-    /// read transaction pins the WAL and no checkpoint can make progress.
-    /// The node calls this when it pauses for catchup. The next
-    /// [`Self::on_new_block`] rebuilds the evaluator from the surviving
-    /// groups; until then `remember` fails with
-    /// [`PoolError::NoPendingBlockEvaluator`].
-    pub fn release_evaluator(&self) {
+    /// the ledger through its own connection for many minutes; an evaluator
+    /// built against the pre-catchup ledger would pin the WAL for all of it.
+    ///
+    /// `true` drops the evaluator now (pending and remembered groups are
+    /// kept) and makes every path that would build one a no-op until
+    /// resumed -- including a block the pool follower processes late, or the
+    /// wake-up `reload_ledger` sends. Admission (`remember`/`test`) fails with
+    /// [`PoolError::NodeCatchingUp`] meanwhile.
+    ///
+    /// `false` only clears the flag and builds nothing: the next
+    /// [`Self::on_new_block`] rebuilds the evaluator. Use
+    /// [`Self::resume_evaluator`] to clear the flag and rebuild immediately
+    /// (only when the ledger handle is known to be current).
+    ///
+    /// Takes the pool's blocking mutex; call from `spawn_blocking` on async
+    /// tasks (the pool follower can hold it across a ledger read).
+    pub fn set_evaluator_paused(&self, paused: bool) {
         let mut inner = self.mu.lock();
-        inner.evaluator = None;
+        inner.evaluator_paused = paused;
+        if paused {
+            inner.evaluator = None;
+        }
         self.cond.notify_all();
+    }
+
+    /// Clear the pause flag and rebuild the evaluator against the ledger's
+    /// current tip, in one critical section so no block can slip in between.
+    pub fn resume_evaluator(&self) {
+        let mut inner = self.mu.lock();
+        inner.evaluator_paused = false;
+        if inner.evaluator.is_none() {
+            self.recompute_block_evaluator(&mut inner, &HashSet::new());
+        }
+        self.cond.notify_all();
+    }
+
+    /// Whether the evaluator is currently paused (see
+    /// [`Self::set_evaluator_paused`]).
+    pub fn is_evaluator_paused(&self) -> bool {
+        self.mu.lock().evaluator_paused
     }
 
     /// Whether the pool currently holds a pending block evaluator.
@@ -1367,25 +1432,55 @@ mod tests {
         pool
     }
 
-    /// Issue #1683: `release_evaluator` drops the evaluator (and with it its
-    /// ledger read snapshot) but keeps pending groups, and the pool rebuilds
-    /// the evaluator from them on the next block.
+    /// Issue #1683: pausing drops the evaluator (and its ledger read
+    /// snapshot) but keeps pending groups; nothing rebuilds it while paused
+    /// (not a late `on_new_block`, not `ensure_evaluator_primed`); admission
+    /// reports the distinct retryable `NodeCatchingUp`.
     #[test]
-    fn release_evaluator_keeps_pending_groups_and_recovers_on_new_block() {
+    fn paused_pool_builds_no_evaluator_and_keeps_pending_groups() {
         let pool = make_pool_with_evaluator(10);
         pool.remember(vec![make_test_txn(3)]).unwrap();
         assert!(pool.has_evaluator());
 
-        pool.release_evaluator();
+        pool.set_evaluator_paused(true);
+        assert!(pool.is_evaluator_paused());
         assert!(!pool.has_evaluator());
         assert_eq!(pool.pending_count(), 1, "pending groups survive");
-        assert!(
-            pool.remember(vec![make_test_txn(4)]).is_err(),
-            "no evaluator: admission refused until the next block"
-        );
 
         pool.on_new_block(&Block::default(), &HashSet::new());
-        assert!(pool.has_evaluator(), "on_new_block rebuilds the evaluator");
+        assert!(!pool.has_evaluator(), "late block must not rebuild");
+        pool.ensure_evaluator_primed();
+        assert!(!pool.has_evaluator(), "priming is a no-op while paused");
+
+        assert!(pool
+            .remember(vec![make_test_txn(4)])
+            .unwrap_err()
+            .is_catching_up());
+        assert!(matches!(
+            pool.test(&[make_test_txn(4)]),
+            Err(PoolError::NodeCatchingUp)
+        ));
+        assert_eq!(pool.pending_count(), 1);
+    }
+
+    /// Clearing the flag alone builds nothing (failure path: the ledger
+    /// handle may be stale); the next block rebuilds. `resume_evaluator`
+    /// rebuilds at once.
+    #[test]
+    fn unpausing_does_not_prime_but_resume_does() {
+        let pool = make_pool_with_evaluator(10);
+        pool.set_evaluator_paused(true);
+
+        pool.set_evaluator_paused(false);
+        assert!(!pool.is_evaluator_paused());
+        assert!(!pool.has_evaluator(), "plain un-pause must not build");
+        pool.on_new_block(&Block::default(), &HashSet::new());
+        assert!(pool.has_evaluator(), "next block rebuilds");
+
+        pool.set_evaluator_paused(true);
+        pool.resume_evaluator();
+        assert!(!pool.is_evaluator_paused());
+        assert!(pool.has_evaluator(), "resume primes immediately");
     }
 
     /// Round-3 review of #1727: the pool is the single internal choke point
