@@ -384,31 +384,40 @@ impl AgreementLedgerBridge {
         // fall back to non-transactional mode.
         // Issue #1654 diagnostics: time each stage so a slow first commit
         // after a catchup names its stage in the log.
-        let slow = |stage: &str, since: std::time::Instant| {
-            if since.elapsed() > Duration::from_secs(1) {
+        // Issue #1757: the apply stage also reports its AVM/non-AVM split
+        // (zero for the other stages) so a heavy round is attributed from the
+        // log alone.
+        let slow = |stage: &str, since: std::time::Instant, avm: Option<Duration>| {
+            let elapsed = since.elapsed();
+            if elapsed > Duration::from_secs(1) {
+                let elapsed_ms = elapsed.as_millis() as u64;
+                let avm_ms = avm.map_or(0, |d| d.as_millis() as u64);
                 warn!(
                     round = %block.round,
                     stage,
-                    elapsed_ms = since.elapsed().as_millis() as u64,
+                    elapsed_ms,
+                    avm_ms,
+                    non_avm_ms = elapsed_ms.saturating_sub(avm_ms),
+                    txns = block.payset.len(),
                     "try_commit_block: slow stage"
                 );
             }
         };
         let t = std::time::Instant::now();
         let in_txn = ledger.begin_block().is_ok();
-        slow("begin_block", t);
+        slow("begin_block", t, None);
 
         let result = (|| -> Result<(), CommitFailure> {
             let t = std::time::Instant::now();
             ledger
                 .put_block(block.round.0, proto, hdr_data, blk_data)
                 .map_err(|e| CommitFailure::new(CommitStage::Store, e))?;
-            slow("put_block", t);
+            slow("put_block", t, None);
             let t = std::time::Instant::now();
             ledger
                 .put_block_cert(block.round.0, cert_bytes)
                 .map_err(|e| CommitFailure::new(CommitStage::Store, e))?;
-            slow("put_block_cert", t);
+            slow("put_block_cert", t, None);
             let t = std::time::Instant::now();
             // Issue #1678: per-block follow-path timing. The AVM accumulator
             // is reset here and taken right after the apply (the only
@@ -420,26 +429,12 @@ impl AgreementLedgerBridge {
             if let Some(avm) = avm {
                 timing.avm.observe(avm);
             }
-            // Issue #1757: a slow apply names its own AVM/non-AVM split, so a
-            // soak log attributes each heavy round without a profiler.
-            if t.elapsed() > Duration::from_secs(1) {
-                let apply_ms = t.elapsed().as_millis() as u64;
-                let avm_ms = avm.map_or(0, |d| d.as_millis() as u64);
-                warn!(
-                    round = %block.round,
-                    apply_ms,
-                    avm_ms,
-                    non_avm_ms = apply_ms.saturating_sub(avm_ms),
-                    txns = block.payset.len(),
-                    "try_commit_block: slow apply breakdown"
-                );
-            }
             match &applied {
                 Ok(()) => timing.apply.observe(t.elapsed()),
                 Err(_) => timing.apply_failed.observe(t.elapsed()),
             }
             applied.map_err(|e| CommitFailure::new(CommitStage::Apply, e))?;
-            slow("apply_block", t);
+            slow("apply_block", t, avm);
             Ok(())
         })();
 
@@ -450,6 +445,12 @@ impl AgreementLedgerBridge {
             return Err(e);
         }
 
+        if !in_txn {
+            // Non-transactional fallback: the setters invalidated the tip and
+            // no commit_block will republish it, so re-derive it from the
+            // committed state (a no-op unless that state is consistent).
+            ledger.republish_committed_tip();
+        }
         if in_txn {
             let t = std::time::Instant::now();
             if let Err(e) = ledger.commit_block() {
@@ -461,7 +462,7 @@ impl AgreementLedgerBridge {
             crate::follow_timing::follow_timing()
                 .commit
                 .observe(t.elapsed());
-            slow("commit_block", t);
+            slow("commit_block", t, None);
         }
 
         Ok(())
@@ -491,13 +492,16 @@ impl LedgerReader for AgreementLedgerBridge {
     fn next_round(&self) -> Round {
         // Issue #1758: the last committed round is published after each
         // successful commit; no need to wait for an in-flight apply.
-        if let Some(tip) = self.tip.get() {
+        if self.ledger.is_poisoned() {
+            self.tip.poison();
+        } else if let Some(tip) = self.tip.read() {
             return Round(tip.current_round.saturating_add(1));
         }
         let ledger = match self.ledger.lock() {
             Ok(l) => l,
             Err(e) => {
                 warn!("ledger lock poisoned in next_round: {e}");
+                self.tip.poison();
                 return Round(0);
             }
         };
@@ -859,6 +863,7 @@ impl LedgerWriter for AgreementLedgerBridge {
                 Ok(l) => l,
                 Err(e) => {
                     warn!("ledger lock poisoned in ensure_block: {e}");
+                    self.tip.poison();
                     crate::follow_timing::follow_timing()
                         .ensure_block_failed
                         .observe(ensure_started.elapsed());
@@ -2229,43 +2234,42 @@ mod tests {
 
     // -- Issue #1758: reads must not wait for a slow apply --
 
-    /// Hold the ledger mutex on another thread for `hold` (standing in for a
-    /// slow heavy app-call apply inside `try_commit_block`) and report how long
-    /// `read` took on this thread meanwhile.
-    fn read_latency_while_ledger_locked<T>(
+    /// Run `read` on its own thread while another thread holds the ledger
+    /// mutex (standing in for a slow apply) until `read` has returned.
+    /// Returns the read's result; panics if the read is still blocked after
+    /// a generous hang guard, which means it queued behind the lock.
+    fn read_while_ledger_locked<T: Send + 'static>(
         ledger: &Arc<Mutex<SqliteLedger>>,
-        hold: Duration,
-        read: impl FnOnce() -> T,
-    ) -> (T, Duration) {
+        read: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
         let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let held = Arc::clone(ledger);
         let holder = std::thread::spawn(move || {
-            let _guard = held.lock().unwrap();
+            let _guard = held.lock().unwrap_or_else(|e| e.into_inner());
             locked_tx.send(()).unwrap();
-            std::thread::sleep(hold);
+            let _ = release_rx.recv_timeout(Duration::from_secs(60));
         });
         locked_rx.recv().unwrap();
-        let started = std::time::Instant::now();
-        let out = read();
-        let took = started.elapsed();
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _ = out_tx.send(read());
+        });
+        let out = out_rx.recv_timeout(Duration::from_secs(10));
+        release_tx.send(()).unwrap();
         holder.join().unwrap();
-        (out, took)
+        reader.join().unwrap();
+        out.expect("read blocked while the ledger mutex was held")
     }
 
     #[test]
     fn next_round_does_not_wait_for_a_slow_apply() {
         let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
-        let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+        let bridge = Arc::new(AgreementLedgerBridge::new(Arc::clone(&ledger)));
         bridge.ensure_block(&make_round1_block(), &make_cert_with_proposal(1));
-        let (next, took) =
-            read_latency_while_ledger_locked(&ledger, Duration::from_millis(600), || {
-                bridge.next_round()
-            });
+        let b = Arc::clone(&bridge);
+        let next = read_while_ledger_locked(&ledger, move || b.next_round());
         assert_eq!(next, Round(2));
-        assert!(
-            took < Duration::from_millis(200),
-            "next_round waited {took:?} behind the ledger lock"
-        );
     }
 
     #[test]
@@ -2276,21 +2280,93 @@ mod tests {
         bridge.ensure_block(&make_round1_block(), &make_cert_with_proposal(1));
         assert_eq!(bridge.next_round(), Round(2));
 
-        // A mutation outside a block invalidates the tip: the locked path
+        // A round change outside a block invalidates the tip: the locked path
         // answers, with the new value.
         ledger.lock().unwrap().set_current_round(Round(41));
         assert_eq!(bridge.next_round(), Round(42));
 
         // Swapping in a reopened ledger (live catchup reload) keeps the
-        // reader's handle valid and publishes the new ledger's state.
-        {
-            let mut guard = ledger.lock().unwrap();
-            let tip = guard.committed_tip_handle();
-            *guard = SqliteLedger::open_in_memory().unwrap();
-            guard.adopt_committed_tip_handle(tip);
-        }
+        // reader's handle valid and publishes the new ledger's state; the
+        // reader is lock-free again afterwards.
+        SqliteLedger::swap_in_reloaded(
+            &mut ledger.lock().unwrap(),
+            SqliteLedger::open_in_memory().unwrap(),
+        );
+        let fallbacks = crate::committed_tip::committed_tip_fallback_total();
         assert_eq!(bridge.next_round(), Round(1));
+        assert_eq!(
+            crate::committed_tip::committed_tip_fallback_total(),
+            fallbacks,
+            "reader fell back to the locked path after the swap"
+        );
         bridge.ensure_block(&make_round1_block(), &make_cert_with_proposal(1));
         assert_eq!(bridge.next_round(), Round(2));
+    }
+
+    #[test]
+    fn dropping_a_ledger_that_never_published_keeps_the_live_tip() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+        bridge.ensure_block(&make_round1_block(), &make_cert_with_proposal(1));
+        // A reload that failed after opening: the fresh ledger is dropped
+        // without ever being swapped in.
+        drop(SqliteLedger::open_in_memory().unwrap());
+        let before = crate::committed_tip::committed_tip_fallback_total();
+        assert_eq!(bridge.next_round(), Round(2));
+        assert_eq!(crate::committed_tip::committed_tip_fallback_total(), before);
+    }
+
+    #[test]
+    fn committed_tip_handle_never_publishes_a_setter_only_round() {
+        let mut l = SqliteLedger::open_in_memory().unwrap();
+        l.set_current_round(Round(77));
+        let tip = l.committed_tip_handle();
+        assert!(
+            tip.get().is_none_or(|t| t.current_round != 77),
+            "tip published an uncommitted in-memory round"
+        );
+    }
+
+    #[test]
+    fn poisoned_ledger_mutex_disables_the_tip_fast_path() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+        bridge.ensure_block(&make_round1_block(), &make_cert_with_proposal(1));
+        assert_eq!(bridge.next_round(), Round(2));
+        let poisoner = Arc::clone(&ledger);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the ledger mutex");
+        })
+        .join();
+        assert!(ledger.is_poisoned());
+        // The old locked-path behaviour: a poisoned ledger reports round 0.
+        assert_eq!(bridge.next_round(), Round(0));
+        assert!(bridge.tip.get().is_none());
+    }
+
+    #[test]
+    fn catchpoint_label_write_republishes_the_tip() {
+        let mut l = SqliteLedger::open_in_memory().unwrap();
+        let tip = l.committed_tip_handle();
+        assert_eq!(tip.get().unwrap().last_catchpoint_label, "");
+        l.set_last_catchpoint_label("100#ABC").unwrap();
+        assert_eq!(tip.get().unwrap().last_catchpoint_label, "100#ABC");
+    }
+
+    #[test]
+    fn commit_publish_cost_is_small() {
+        // Measures the extra work commit_block now does under the ledger
+        // mutex (round + header + label reads); reported in the PR body.
+        let mut l = SqliteLedger::open_in_memory().unwrap();
+        let _tip = l.committed_tip_handle();
+        let n = 2000u32;
+        let started = std::time::Instant::now();
+        for _ in 0..n {
+            l.republish_committed_tip();
+        }
+        let per = started.elapsed() / n;
+        eprintln!("committed tip publish: {per:?} per call");
+        assert!(per < Duration::from_millis(50));
     }
 }

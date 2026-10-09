@@ -708,9 +708,7 @@ impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
                     Ok(mut guard) => {
                         // Issue #1758: keep the lock-free committed-tip
                         // handle readers already hold valid across the swap.
-                        let tip = guard.committed_tip_handle();
-                        *guard = fresh;
-                        guard.adopt_committed_tip_handle(tip);
+                        SqliteLedger::swap_in_reloaded(&mut guard, fresh);
                         info!(
                             round,
                             "reloaded ledger from disk after live catchpoint catchup"
