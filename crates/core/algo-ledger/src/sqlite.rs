@@ -2220,6 +2220,23 @@ pub struct SqliteLedger {
     /// transactions that reuse them as duplicates until expiry. `None` outside a
     /// `begin_block`/`commit_block` span.
     lease_snapshot: Option<LeaseTable>,
+    /// In-memory chain-level fields captured at `begin_block`, restored by
+    /// `rollback_block` / a failed commit. `apply` advances them
+    /// (`set_current_round`, `set_protocol`, ...) before the SQL transaction
+    /// is decided, and the SQL ROLLBACK does not undo them, so without this a
+    /// rolled-back block left `current_round` one ahead of the committed
+    /// state (`ensure_block` would then treat a retry as already committed).
+    /// `None` outside a `begin_block`/`commit_block` span.
+    chain_snapshot: Option<ChainSnapshot>,
+    /// An earlier ROLLBACK failed with the SQL transaction still open: the
+    /// aborted block's state is retained and the next `begin_block` /
+    /// `commit_block` must complete the abort first.
+    pub(crate) pending_abort: bool,
+    /// Test-only: make the next N SQL ROLLBACKs fail while the transaction
+    /// stays open (stands in for SQLITE_BUSY on ROLLBACK). The field exists
+    /// only under `cfg(test)`, so the production struct layout is unchanged.
+    #[cfg(test)]
+    pub(crate) fail_rollback_count: u32,
     /// Cached chain-level state (loaded from DB, flushed on commit).
     current_round: Round,
     /// See [`crate::store_trait::LedgerStore::earliest_round`]. Not
@@ -2374,6 +2391,30 @@ pub struct SqliteLedger {
     /// `time_since_last_round` in `bin/algod-rust/src/node_interface_impl.rs`),
     /// so it needs no serialization and is immune to system-clock jumps.
     last_commit_wall_time: Option<std::time::Instant>,
+}
+
+/// The in-memory chain-level fields a block apply advances (see
+/// `SqliteLedger::chain_snapshot`): `apply` calls `set_current_round`,
+/// `set_rewards_*`, `set_fee_sink`, `set_rewards_pool`, `set_protocol` and
+/// `set_txn_counter` inside the block span. `genesis_id`/`genesis_hash` are
+/// only set by genesis population (never inside a block) and `earliest_round`
+/// is process-lifetime SetSyncRound state, so they are deliberately absent; the
+/// compile-time field audit in the tests forces every new `SqliteLedger` field
+/// to be classified.
+#[derive(Clone)]
+struct ChainSnapshot {
+    current_round: Round,
+    rewards_level: u64,
+    rewards_rate: u64,
+    rewards_residue: u64,
+    rewards_recalculation_round: u64,
+    fee_sink: Address,
+    rewards_pool: Address,
+    txn_counter: u64,
+    /// Copy-on-write: `None` means "unchanged since the snapshot"; the old
+    /// value is saved by `set_protocol` the first time it actually changes
+    /// inside the block, so the per-block fast path allocates nothing.
+    protocol: Option<String>,
 }
 
 /// In-memory accumulator for the per-round change to the `accounttotals`
@@ -2855,6 +2896,10 @@ impl SqliteLedger {
             db_prefix,
             lease_table: LeaseTable::new(),
             lease_snapshot: None,
+            chain_snapshot: None,
+            pending_abort: false,
+            #[cfg(test)]
+            fail_rollback_count: 0,
             current_round,
             earliest_round: Round(0),
             rewards_level,
@@ -3173,6 +3218,9 @@ impl SqliteLedger {
 
     /// Begin a block-level transaction.
     pub fn begin_block(&mut self) -> Result<(), AlgoError> {
+        // Self-healing: finish an abort whose ROLLBACK failed earlier before
+        // anything new starts (most callers ignore rollback_block's result).
+        self.heal_pending_abort()?;
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| AlgoError::Ledger {
@@ -3184,6 +3232,7 @@ impl SqliteLedger {
         // Snapshot the in-memory lease table so rollback_block can restore it —
         // the SQLite/trie transaction does not cover it.
         self.lease_snapshot = Some(self.lease_table.clone());
+        self.chain_snapshot = Some(self.capture_chain_snapshot(false));
         self.in_block = true;
         // Issue #523: start this block's `accounttotals` delta accumulator
         // clean. Guards against `set_account`/`remove_account` calls made
@@ -3516,6 +3565,52 @@ impl SqliteLedger {
             .and_then(|t| t.get_deltas_for_round(round).map(|g| g.to_vec()))
     }
 
+    /// Feed the per-group delta tracer on a scratch SAVEPOINT that is rolled
+    /// back, leaving every piece of ledger state exactly as it was.
+    pub(crate) fn scratch_capture_group_deltas(
+        &mut self,
+        block: &algo_types::Block,
+        tracer: &mut crate::txn_group_delta_tracer::TxnGroupDeltaTracer,
+    ) {
+        // The SQLite SAVEPOINT rolls back account/DB state, but the
+        // apply path also mutates in-memory ledger fields (the round
+        // counter, rewards state, reward addresses, protocol, txn counter, and
+        // lease table) that the savepoint does not cover. Save and
+        // restore exactly those (the same set `begin_block` snapshots) so the
+        // scratch capture leaves the ledger identical for the authoritative
+        // apply below.
+        let saved_chain = self.capture_chain_snapshot(true);
+        // The in-memory lease table is not covered by the savepoint
+        // either; without restoring it the authoritative apply below
+        // sees the scratch apply's leases as duplicates and rejects any
+        // block whose transactions carry a nonzero lease.
+        let saved_leases = self.lease_table.clone();
+        // Trie-tracking pre-mutations are an append-only in-memory log
+        // (cleared only at commit, which this path does not call), so the
+        // scratch apply's entries must be truncated away or they would be
+        // consumed by the authoritative commit's trie finalization.
+        let saved_pre_mutations_len = self.pre_mutations.len();
+        // Issue #523/#1521: the scratch apply's `set_account`/
+        // `remove_account` calls also accumulate into
+        // `pending_totals_delta`/`pending_online_touched`; without
+        // restoring them the authoritative apply below would
+        // double-count every account touched by the scratch run on
+        // top of its own. `snapshot`/`restore_snapshot` now save and
+        // restore both fields generically (see `SqliteSnapshot`), so
+        // no separate manual save/restore is needed here.
+        let sp = self.snapshot(&[]);
+        let _ = crate::apply::apply_block_capturing_group_deltas(self, block, tracer);
+        self.restore_snapshot(sp);
+        self.pre_mutations.truncate(saved_pre_mutations_len);
+
+        self.apply_chain_snapshot(saved_chain);
+        if self.lease_table.replace_with(saved_leases) {
+            tracing::error!(
+                "group-delta scratch apply found an open lease undo journal; rolled it back"
+            );
+        }
+    }
+
     pub fn apply_block_caching_delta(
         &mut self,
         block: &algo_types::Block,
@@ -3528,55 +3623,7 @@ impl SqliteLedger {
             // per-round delta both commit the block, so they cannot share one
             // apply; the scratch apply keeps them independent.
             if let Some(mut tracer) = self.group_delta_tracer.take() {
-                // The SQLite SAVEPOINT rolls back account/DB state, but the
-                // apply path also mutates in-memory ledger fields (the round
-                // counter, rewards state, reward addresses, txn counter, and
-                // lease table) that the savepoint does not cover. Save and
-                // restore exactly those so the scratch capture leaves the ledger
-                // identical for the authoritative apply below.
-                let saved_round = self.current_round();
-                let saved_level = self.rewards_level();
-                let saved_rate = self.rewards_rate();
-                let saved_residue = self.rewards_residue();
-                let saved_recalc = self.rewards_recalculation_round();
-                let saved_fee_sink = self.fee_sink();
-                let saved_rewards_pool = self.rewards_pool();
-                let saved_txn_counter = self.txn_counter();
-                // The in-memory lease table is not covered by the savepoint
-                // either; without restoring it the authoritative apply below
-                // sees the scratch apply's leases as duplicates and rejects any
-                // block whose transactions carry a nonzero lease.
-                let saved_leases = self.lease_table.clone();
-                // Trie-tracking pre-mutations are an append-only in-memory log
-                // (cleared only at commit, which this path does not call), so the
-                // scratch apply's entries must be truncated away or they would be
-                // consumed by the authoritative commit's trie finalization.
-                let saved_pre_mutations_len = self.pre_mutations.len();
-                // Issue #523/#1521: the scratch apply's `set_account`/
-                // `remove_account` calls also accumulate into
-                // `pending_totals_delta`/`pending_online_touched`; without
-                // restoring them the authoritative apply below would
-                // double-count every account touched by the scratch run on
-                // top of its own. `snapshot`/`restore_snapshot` now save and
-                // restore both fields generically (see `SqliteSnapshot`), so
-                // no separate manual save/restore is needed here.
-                let sp = self.snapshot(&[]);
-                let _ = crate::apply::apply_block_capturing_group_deltas(self, block, &mut tracer);
-                self.restore_snapshot(sp);
-                self.pre_mutations.truncate(saved_pre_mutations_len);
-
-                self.set_current_round(saved_round);
-                self.set_rewards_level(saved_level);
-                self.set_rewards_rate(saved_rate);
-                self.set_rewards_residue(saved_residue);
-                self.set_rewards_recalculation_round(saved_recalc);
-                self.set_fee_sink(saved_fee_sink);
-                self.set_rewards_pool(saved_rewards_pool);
-                self.set_txn_counter(saved_txn_counter);
-                if self.lease_table.replace_with(saved_leases) {
-                    tracing::error!("group-delta scratch apply found an open lease undo journal; rolled it back");
-                }
-
+                self.scratch_capture_group_deltas(block, &mut tracer);
                 self.group_delta_tracer = Some(tracer);
             }
             // Issue #609: this branch used to hard-code `ApplyMode::Replay`
@@ -3735,32 +3782,47 @@ impl SqliteLedger {
     }
 
     pub fn commit_block(&mut self) -> Result<(), AlgoError> {
+        if self.pending_abort {
+            // The open transaction is an aborted, half-applied block: roll it
+            // back (or report that we cannot) -- never commit it.
+            self.heal_pending_abort()?;
+            return Err(AlgoError::Ledger {
+                message: "previous block could not be rolled back: it was aborted, \
+                          nothing to commit"
+                    .into(),
+            });
+        }
         // Hard bound on any scratch-apply undo journal left open by a panic
         // between save and restore: it must never survive a commit.
         self.lease_table.discard_undo();
         let result = self.commit_block_uncleaned();
-        if result.is_err() {
-            self.reset_after_failed_commit();
-        } else if self.current_round.0 > 0 {
-            // Issue #1592: stamp the commit instant here, not on some
-            // later REST poll -- see `last_commit_wall_time`'s doc comment.
-            //
-            // Guard on round > 0: go-algorand's `OnNewBlock` listener is
-            // never invoked for the genesis block -- genesis is installed
-            // as the ledger's synthetic initial state, not delivered as "a
-            // new block" through the same path a real committed round
-            // takes (`ledger/ledger.go`'s genesis-init path never calls
-            // `notifyCommit`/the `BlockListener`s the way `AddBlock` does).
-            // `StatusReport.LastRoundTimestamp` therefore stays zero-valued
-            // until the first real round-1+ commit, and `/v2/status` at
-            // round 0 reports `time-since-last-round: 0` on both sides --
-            // without this guard, committing genesis here would stamp the
-            // instant genesis was written (node startup), not "no blocks
-            // seen yet", diverging from go the moment any REST client
-            // polls status more than an instant after startup (caught live
-            // by `bin/algod-rust/tests/live_go_parity.rs`'s
-            // `status_at_genesis_is_byte_identical`).
-            self.last_commit_wall_time = Some(std::time::Instant::now());
+        match &result {
+            Err(_) => self.reset_after_failed_commit(),
+            Ok(()) => {
+                // The block is committed: its pre-block snapshot is dead.
+                self.chain_snapshot = None;
+                if self.current_round.0 > 0 {
+                    // Issue #1592: stamp the commit instant here, not on some
+                    // later REST poll -- see `last_commit_wall_time`'s doc comment.
+                    //
+                    // Guard on round > 0: go-algorand's `OnNewBlock` listener is
+                    // never invoked for the genesis block -- genesis is installed
+                    // as the ledger's synthetic initial state, not delivered as "a
+                    // new block" through the same path a real committed round
+                    // takes (`ledger/ledger.go`'s genesis-init path never calls
+                    // `notifyCommit`/the `BlockListener`s the way `AddBlock` does).
+                    // `StatusReport.LastRoundTimestamp` therefore stays zero-valued
+                    // until the first real round-1+ commit, and `/v2/status` at
+                    // round 0 reports `time-since-last-round: 0` on both sides --
+                    // without this guard, committing genesis here would stamp the
+                    // instant genesis was written (node startup), not "no blocks
+                    // seen yet", diverging from go the moment any REST client
+                    // polls status more than an instant after startup (caught live
+                    // by `bin/algod-rust/tests/live_go_parity.rs`'s
+                    // `status_at_genesis_is_byte_identical`).
+                    self.last_commit_wall_time = Some(std::time::Instant::now());
+                }
+            }
         }
         result
     }
@@ -3803,16 +3865,14 @@ impl SqliteLedger {
     /// no transaction is active". Either way the transaction is no longer
     /// usable, so the rest of this cleanup runs unconditionally.
     fn reset_after_failed_commit(&mut self) {
-        let _ = self.conn.execute_batch("ROLLBACK");
-        self.pre_mutations.clear();
-        self.pending_totals_delta = AccountTotalsDelta::default();
-        self.pending_online_touched.clear();
-        if let Some(snapshot) = self.lease_snapshot.take() {
-            if self.lease_table.replace_with(snapshot) {
-                tracing::error!("lease undo journal still open at block reset; rolled it back");
-            }
+        let sql_rollback = self.exec_rollback();
+        if !self.abort_block_state(&sql_rollback) {
+            tracing::error!(
+                "ROLLBACK after a failed commit failed with the transaction still open; \
+                 keeping the block state until rollback_block succeeds"
+            );
+            return;
         }
-        self.in_block = false;
         // Reload the trie from the last committed state -- any in-memory
         // mutations `commit_block_uncleaned` applied belong to the round
         // that just failed to commit.
@@ -4418,32 +4478,18 @@ impl SqliteLedger {
     /// Rollback the current block-level transaction, discarding all changes
     /// made since `begin_block`. Used by the replay CLI when `apply_block` fails.
     pub fn rollback_block(&mut self) -> Result<(), AlgoError> {
-        // Clear pre-mutation records — they are for the rolled-back block.
-        self.pre_mutations.clear();
-        // Discard the rolled-back block's accumulated `accounttotals` delta
-        // (issue #523) — its account writes are being undone by the SQL
-        // ROLLBACK below, so the totals delta must not survive to the next
-        // block's flush.
-        self.pending_totals_delta = AccountTotalsDelta::default();
-        // Issue #960: same reasoning — the touched-address set feeding
-        // `record_online_account_history` must not survive a rolled-back block.
-        self.pending_online_touched.clear();
-
-        // Restore the in-memory lease table to its pre-block state — the SQLite
-        // ROLLBACK below does not cover it, so leases recorded by partially-
-        // applied transactions must be undone or they poison future submissions.
-        if let Some(snapshot) = self.lease_snapshot.take() {
-            if self.lease_table.replace_with(snapshot) {
-                tracing::error!("lease undo journal still open at rollback_block; rolled it back");
+        let sql_rollback = self.exec_rollback();
+        let tx_gone = self.abort_block_state(&sql_rollback);
+        if let Err(e) = sql_rollback {
+            // Transaction still open: state retained for a retry. Transaction
+            // gone despite the error: state was restored above.
+            if tx_gone && self.trie.is_some() {
+                let _ = self.load_trie();
             }
-        }
-
-        self.conn
-            .execute_batch("ROLLBACK")
-            .map_err(|e| AlgoError::Ledger {
+            return Err(AlgoError::Ledger {
                 message: format!("rollback block error: {e}"),
-            })?;
-        self.in_block = false;
+            });
+        }
 
         // Reload the trie from the last committed state (DB was rolled back).
         if self.trie.is_some() {
@@ -4451,6 +4497,129 @@ impl SqliteLedger {
         }
 
         Ok(())
+    }
+
+    /// Capture the chain-level fields. `eager_protocol` clones the protocol
+    /// now (scratch captures); the per-block snapshot leaves it copy-on-write.
+    fn capture_chain_snapshot(&self, eager_protocol: bool) -> ChainSnapshot {
+        ChainSnapshot {
+            current_round: self.current_round,
+            rewards_level: self.rewards_level,
+            rewards_rate: self.rewards_rate,
+            rewards_residue: self.rewards_residue,
+            rewards_recalculation_round: self.rewards_recalculation_round,
+            fee_sink: self.fee_sink,
+            rewards_pool: self.rewards_pool,
+            txn_counter: self.txn_counter,
+            protocol: eager_protocol.then(|| self.protocol.clone()),
+        }
+    }
+
+    fn apply_chain_snapshot(&mut self, c: ChainSnapshot) {
+        self.current_round = c.current_round;
+        self.rewards_level = c.rewards_level;
+        self.rewards_rate = c.rewards_rate;
+        self.rewards_residue = c.rewards_residue;
+        self.rewards_recalculation_round = c.rewards_recalculation_round;
+        self.fee_sink = c.fee_sink;
+        self.rewards_pool = c.rewards_pool;
+        self.txn_counter = c.txn_counter;
+        if let Some(p) = c.protocol {
+            self.protocol = p;
+        }
+    }
+
+    /// Drop the delta-cache / group-tracer entries of rounds above
+    /// `committed_round`: they belong to a block that never committed and must
+    /// not be served (nor shadow a different block retried at the same round).
+    /// Window evictions already performed by the failed block's inserts are not
+    /// undone (they only drop already-old entries).
+    fn discard_uncommitted_deltas(&mut self, committed_round: u64) {
+        self.delta_cache.remove_after(committed_round);
+        if let Some(t) = self.group_delta_tracer.as_mut() {
+            t.remove_after(committed_round);
+        }
+    }
+
+    /// Run the SQL ROLLBACK (test builds can inject a failure that leaves the
+    /// transaction open, standing in for SQLITE_BUSY).
+    fn exec_rollback(&mut self) -> rusqlite::Result<()> {
+        #[cfg(test)]
+        if self.fail_rollback_count > 0 {
+            self.fail_rollback_count -= 1;
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                Some("injected rollback failure".into()),
+            ));
+        }
+        self.conn.execute_batch("ROLLBACK")
+    }
+
+    /// Complete an abort whose ROLLBACK failed earlier with the transaction
+    /// still open (`pending_abort`): retry the ROLLBACK, restore the retained
+    /// in-memory state and reload the trie. If it still fails, the ledger stays
+    /// in the pending-abort state and the caller must NOT start or commit a
+    /// block on top of the half-applied one.
+    pub fn heal_pending_abort(&mut self) -> Result<(), AlgoError> {
+        if !self.pending_abort {
+            return Ok(());
+        }
+        let sql_rollback = self.exec_rollback();
+        if !self.abort_block_state(&sql_rollback) {
+            let detail = sql_rollback
+                .err()
+                .map_or_else(|| "transaction still open".to_string(), |e| e.to_string());
+            return Err(AlgoError::Ledger {
+                message: format!("previous block could not be rolled back: {detail}"),
+            });
+        }
+        if self.trie.is_some() {
+            self.load_trie()?;
+        }
+        Ok(())
+    }
+
+    /// Whether an earlier failed ROLLBACK left an aborted block open (see
+    /// [`Self::begin_block`]); callers must treat a `begin_block` error in this
+    /// state as a failed attempt, never fall back to non-transactional apply.
+    pub fn has_pending_abort(&self) -> bool {
+        self.pending_abort
+    }
+
+    /// Undo the in-memory effects of an aborted block after an SQL ROLLBACK
+    /// attempt, but ONLY if the SQL transaction is really gone (the ROLLBACK
+    /// succeeded, or the connection is back in autocommit). If the transaction
+    /// is still open the database still holds the partially applied block, so
+    /// memory must keep matching it: nothing is touched (snapshots retained,
+    /// `in_block` stays true) and a retried `rollback_block` can complete.
+    /// Returns whether the transaction is gone.
+    fn abort_block_state(&mut self, sql_rollback: &rusqlite::Result<()>) -> bool {
+        let tx_gone = sql_rollback.is_ok() || self.conn.is_autocommit();
+        if !tx_gone {
+            // The next begin_block / commit_block completes the abort.
+            self.pending_abort = true;
+            return false;
+        }
+        self.pending_abort = false;
+        // Clear pre-mutation records -- they are for the aborted block.
+        self.pre_mutations.clear();
+        // Discard the aborted block's accumulated `accounttotals` delta
+        // (issue #523) and touched-address set (issue #960): their account
+        // writes were undone with the transaction.
+        self.pending_totals_delta = AccountTotalsDelta::default();
+        self.pending_online_touched.clear();
+        // The in-memory lease table is not covered by the SQL transaction.
+        if let Some(snapshot) = self.lease_snapshot.take() {
+            if self.lease_table.replace_with(snapshot) {
+                tracing::error!("lease undo journal still open at block abort; rolled it back");
+            }
+        }
+        self.in_block = false;
+        if let Some(snap) = self.chain_snapshot.take() {
+            self.discard_uncommitted_deltas(snap.current_round.0);
+            self.apply_chain_snapshot(snap);
+        }
+        true
     }
 
     /// Get the last committed round (for resume capability).
@@ -7038,6 +7207,13 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn set_protocol(&mut self, protocol: String) {
+        if protocol != self.protocol {
+            if let Some(snap) = self.chain_snapshot.as_mut() {
+                if snap.protocol.is_none() {
+                    snap.protocol = Some(self.protocol.clone());
+                }
+            }
+        }
         self.protocol = protocol;
     }
 
@@ -14782,5 +14958,287 @@ mod tests {
             )
             .expect("absent_participation_account_candidates");
         assert!(candidates.is_empty());
+    }
+
+    // -- Issue #1758: rollback / failed commit restore the in-memory chain state --
+
+    /// Every chain-level field `apply` advances, as one comparable tuple.
+    type ChainFields = (Round, u64, u64, u64, u64, Address, Address, String, u64);
+
+    fn chain_fields(l: &SqliteLedger) -> ChainFields {
+        (
+            l.current_round(),
+            l.rewards_level(),
+            l.rewards_rate(),
+            l.rewards_residue(),
+            l.rewards_recalculation_round(),
+            l.fee_sink(),
+            l.rewards_pool(),
+            l.protocol().to_string(),
+            l.txn_counter(),
+        )
+    }
+
+    /// Advance every chain field the way a block apply does.
+    fn advance_chain_fields(l: &mut SqliteLedger) {
+        l.set_current_round(Round(l.current_round().0 + 1));
+        l.set_rewards_level(l.rewards_level() + 1);
+        l.set_rewards_rate(l.rewards_rate() + 1);
+        l.set_rewards_residue(l.rewards_residue() + 1);
+        l.set_rewards_recalculation_round(l.rewards_recalculation_round() + 1);
+        l.set_fee_sink(Address([0xF1; 32]));
+        l.set_rewards_pool(Address([0xF2; 32]));
+        l.set_protocol("advanced-proto".into());
+        l.set_txn_counter(l.txn_counter() + 10);
+    }
+
+    fn ledger_with_distinct_chain_fields() -> SqliteLedger {
+        let mut l = SqliteLedger::open_in_memory().unwrap();
+        l.set_current_round(Round(5));
+        l.set_rewards_level(11);
+        l.set_rewards_rate(12);
+        l.set_rewards_residue(13);
+        l.set_rewards_recalculation_round(14);
+        l.set_fee_sink(Address([1; 32]));
+        l.set_rewards_pool(Address([2; 32]));
+        l.set_genesis_id("gen".into());
+        l.set_genesis_hash([3; 32]);
+        l.set_protocol("proto".into());
+        l.set_txn_counter(15);
+        l
+    }
+
+    #[test]
+    fn rollback_block_restores_every_in_memory_chain_field() {
+        let mut l = ledger_with_distinct_chain_fields();
+        let before = chain_fields(&l);
+        l.begin_block().unwrap();
+        advance_chain_fields(&mut l);
+        assert_ne!(chain_fields(&l), before);
+        l.rollback_block().unwrap();
+        assert_eq!(chain_fields(&l), before);
+    }
+
+    #[test]
+    fn failed_commit_restores_every_in_memory_chain_field() {
+        let mut l = ledger_with_distinct_chain_fields();
+        let before = chain_fields(&l);
+        l.begin_block().unwrap();
+        advance_chain_fields(&mut l);
+        l.conn.execute_batch("PRAGMA query_only = ON;").unwrap();
+        assert!(l.commit_block().is_err());
+        l.conn.execute_batch("PRAGMA query_only = OFF;").unwrap();
+        assert_eq!(chain_fields(&l), before);
+        assert!(!l.in_block, "a failed commit leaves no open block");
+        // Not wedged: the next block begins and commits.
+        l.begin_block().unwrap();
+        advance_chain_fields(&mut l);
+        let advanced = chain_fields(&l);
+        l.commit_block().unwrap();
+        assert_eq!(chain_fields(&l), advanced);
+    }
+
+    #[test]
+    fn rollback_with_a_sql_rollback_error_still_restores_and_keeps_in_block_consistent() {
+        let mut l = ledger_with_distinct_chain_fields();
+        let before = chain_fields(&l);
+        l.begin_block().unwrap();
+        advance_chain_fields(&mut l);
+        // The transaction disappears underneath us, so the SQL ROLLBACK in
+        // rollback_block fails with "no transaction is active".
+        l.conn.execute_batch("ROLLBACK").unwrap();
+        assert!(l.rollback_block().is_err());
+        assert_eq!(chain_fields(&l), before);
+        assert!(!l.in_block, "no SQL transaction is open any more");
+        // The ledger is usable for the next block.
+        l.begin_block().unwrap();
+        l.rollback_block().unwrap();
+    }
+
+    #[test]
+    fn rollback_error_with_the_transaction_still_open_keeps_state_for_a_retry() {
+        let mut l = ledger_with_distinct_chain_fields();
+        let before = chain_fields(&l);
+        l.begin_block().unwrap();
+        advance_chain_fields(&mut l);
+        let advanced = chain_fields(&l);
+        l.fail_rollback_count = 1;
+        assert!(l.rollback_block().is_err());
+        // The DB still holds the partially applied block, so memory must keep
+        // matching it: nothing restored, snapshot retained, block still open.
+        assert!(l.in_block);
+        assert!(l.chain_snapshot.is_some());
+        assert_eq!(chain_fields(&l), advanced);
+        // A retried rollback completes and restores.
+        l.rollback_block().unwrap();
+        assert!(!l.in_block);
+        assert!(l.chain_snapshot.is_none());
+        assert_eq!(chain_fields(&l), before);
+    }
+
+    #[test]
+    fn begin_block_heals_a_rollback_that_failed_with_the_transaction_open() {
+        let mut l = ledger_with_distinct_chain_fields();
+        let before = chain_fields(&l);
+        l.begin_block().unwrap();
+        advance_chain_fields(&mut l);
+        l.fail_rollback_count = 1;
+        // Callers typically ignore this error.
+        let _ = l.rollback_block();
+        assert!(l.pending_abort);
+        // The next block heals first, then starts clean from committed state.
+        l.begin_block().unwrap();
+        assert!(!l.pending_abort);
+        assert_eq!(chain_fields(&l), before);
+        l.rollback_block().unwrap();
+        assert_eq!(chain_fields(&l), before);
+    }
+
+    #[test]
+    fn begin_block_reports_a_rollback_that_keeps_failing_and_applies_nothing() {
+        let mut l = ledger_with_distinct_chain_fields();
+        let before = chain_fields(&l);
+        l.begin_block().unwrap();
+        advance_chain_fields(&mut l);
+        let advanced = chain_fields(&l);
+        l.fail_rollback_count = 2;
+        let _ = l.rollback_block();
+        let err = l.begin_block().unwrap_err();
+        assert!(
+            format!("{err}").contains("previous block could not be rolled back"),
+            "{err}"
+        );
+        assert!(l.pending_abort && l.in_block);
+        assert_eq!(
+            chain_fields(&l),
+            advanced,
+            "state still matches the open tx"
+        );
+        // commit_block must not persist the half-applied block either.
+        l.fail_rollback_count = 1;
+        let err = l.commit_block().unwrap_err();
+        assert!(
+            format!("{err}").contains("previous block could not be rolled back"),
+            "{err}"
+        );
+        // Once ROLLBACK works again the ledger heals.
+        l.begin_block().unwrap();
+        assert_eq!(chain_fields(&l), before);
+    }
+
+    fn trivial_block(round: u64, fee_sink: u8) -> algo_types::Block {
+        algo_types::Block {
+            round: Round(round),
+            fee_sink: Address([fee_sink; 32]),
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            ..algo_types::Block::default()
+        }
+    }
+
+    #[test]
+    fn failed_commit_discards_the_cached_state_delta_for_the_uncommitted_round() {
+        let mut l = SqliteLedger::open_in_memory().unwrap();
+        l.begin_block().unwrap();
+        l.apply_block_caching_delta(&trivial_block(1, 3)).unwrap();
+        assert!(l.delta_cache.get(1).is_some(), "delta cached during apply");
+        l.conn.execute_batch("PRAGMA query_only = ON;").unwrap();
+        assert!(l.commit_block().is_err());
+        l.conn.execute_batch("PRAGMA query_only = OFF;").unwrap();
+        assert!(
+            l.delta_cache.get(1).is_none(),
+            "no state delta may be served for a round that never committed"
+        );
+        // A different block at the same round is served with its own delta.
+        l.begin_block().unwrap();
+        l.apply_block_caching_delta(&trivial_block(1, 4)).unwrap();
+        l.commit_block().unwrap();
+        assert!(l.delta_cache.get(1).is_some());
+    }
+
+    #[test]
+    fn rollback_discards_group_deltas_of_the_uncommitted_round() {
+        let mut l = SqliteLedger::open_in_memory().unwrap();
+        l.enable_group_delta_tracer(8);
+        l.begin_block().unwrap();
+        l.apply_block_caching_delta(&trivial_block(1, 3)).unwrap();
+        assert!(l.delta_cache.get(1).is_some());
+        l.rollback_block().unwrap();
+        assert!(l.delta_cache.get(1).is_none());
+        assert!(!l.group_delta_tracer.as_ref().unwrap().has_round(1));
+    }
+
+    #[test]
+    fn scratch_group_delta_capture_leaves_the_protocol_and_chain_fields_unchanged() {
+        let mut l = SqliteLedger::open_in_memory().unwrap();
+        l.begin_block().unwrap();
+        let before = chain_fields(&l);
+        assert_eq!(before.7, "", "fresh ledger has no live protocol yet");
+        // The block's apply sets the live protocol to the block's protocol;
+        // the scratch capture must undo that along with the other fields.
+        let b = trivial_block(1, 9);
+        let mut tracer = crate::txn_group_delta_tracer::TxnGroupDeltaTracer::new(8);
+        l.scratch_capture_group_deltas(&b, &mut tracer);
+        assert_eq!(chain_fields(&l), before);
+        l.rollback_block().unwrap();
+    }
+
+    #[test]
+    fn committed_block_keeps_its_chain_fields_and_a_later_rollback_does_not_regress_them() {
+        let mut l = ledger_with_distinct_chain_fields();
+        l.begin_block().unwrap();
+        advance_chain_fields(&mut l);
+        let advanced = chain_fields(&l);
+        l.commit_block().unwrap();
+        assert_eq!(chain_fields(&l), advanced);
+        l.begin_block().unwrap();
+        l.rollback_block().unwrap();
+        assert_eq!(chain_fields(&l), advanced);
+    }
+
+    /// Compile-time audit: adding a field to `SqliteLedger` breaks this
+    /// exhaustive destructuring until the field is classified as either part
+    /// of the per-block chain snapshot (`ChainSnapshot`) or deliberately not
+    /// block-scoped. Deliberately excluded: `earliest_round` (process-lifetime
+    /// SetSyncRound state, never advanced by a block apply).
+    #[allow(dead_code)]
+    fn chain_state_field_audit(l: &SqliteLedger) {
+        let SqliteLedger {
+            conn: _,
+            db_prefix: _,
+            lease_table: _, // restored via lease_snapshot
+            lease_snapshot: _,
+            chain_snapshot: _,
+            pending_abort: _,
+            fail_rollback_count: _,         // test-only injection flag
+            current_round: _,               // ChainSnapshot
+            earliest_round: _,              // not block-scoped (see above)
+            rewards_level: _,               // ChainSnapshot
+            rewards_rate: _,                // ChainSnapshot
+            rewards_residue: _,             // ChainSnapshot
+            rewards_recalculation_round: _, // ChainSnapshot
+            fee_sink: _,                    // ChainSnapshot
+            rewards_pool: _,                // ChainSnapshot
+            genesis_id: _,                  // only set by genesis population, never inside a block
+            genesis_hash: _,                // only set by genesis population, never inside a block
+            protocol: _,                    // ChainSnapshot
+            txn_counter: _,                 // ChainSnapshot
+            savepoint_counter: _,
+            in_block: _,
+            trie: _,          // reloaded by rollback
+            pre_mutations: _, // cleared by rollback
+            trie_cache_target: _,
+            lru_cache_disabled: _,
+            delta_cache: _,
+            group_delta_tracer: _,
+            pending_totals_delta: _,   // reset by rollback
+            pending_online_touched: _, // cleared by rollback
+            catchpoint_auto: _,
+            catchpoint_worker: _,
+            reenable_catchpoints_round: _,
+            acctupdates_stats: _,
+            acctupdates_stats_gate: _,
+            retention: _,
+            last_commit_wall_time: _,
+        } = l;
     }
 }

@@ -94,6 +94,13 @@ impl TxnGroupDeltaTracer {
         self.latest_round = round;
     }
 
+    /// Drop the captured deltas of rounds after `round` (a block that never
+    /// committed) and rewind the latest round to at most `round`.
+    pub fn remove_after(&mut self, round: u64) {
+        self.rounds.retain(|&r, _| r <= round);
+        self.latest_round = self.latest_round.min(round);
+    }
+
     /// Begin capturing deltas for `round`: advance the window and retain an
     /// (initially empty) entry for `round`. Mirrors go's `BeforeBlock`.
     pub fn before_block(&mut self, round: u64) {

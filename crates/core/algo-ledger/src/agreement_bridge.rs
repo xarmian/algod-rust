@@ -368,31 +368,59 @@ impl AgreementLedgerBridge {
         // fall back to non-transactional mode.
         // Issue #1654 diagnostics: time each stage so a slow first commit
         // after a catchup names its stage in the log.
-        let slow = |stage: &str, since: std::time::Instant| {
-            if since.elapsed() > Duration::from_secs(1) {
-                warn!(
-                    round = %block.round,
-                    stage,
-                    elapsed_ms = since.elapsed().as_millis() as u64,
-                    "try_commit_block: slow stage"
-                );
+        // Issue #1757: the apply stage also reports its AVM/non-AVM split
+        // (`apply_avm` is `Some` only for that stage) so a heavy round is
+        // attributed from the log alone, in the same single warning with a
+        // single elapsed reading.
+        let slow = |stage: &str, since: std::time::Instant, apply_avm: Option<Duration>| {
+            let elapsed = since.elapsed();
+            if elapsed > Duration::from_secs(1) {
+                let elapsed_ms = elapsed.as_millis() as u64;
+                match apply_avm {
+                    Some(avm) => {
+                        let avm_ms = avm.as_millis() as u64;
+                        warn!(
+                            round = %block.round,
+                            stage,
+                            elapsed_ms,
+                            avm_ms,
+                            non_avm_ms = elapsed_ms.saturating_sub(avm_ms),
+                            txns = block.payset.len(),
+                            "try_commit_block: slow stage"
+                        );
+                    }
+                    None => warn!(
+                        round = %block.round,
+                        stage,
+                        elapsed_ms,
+                        "try_commit_block: slow stage"
+                    ),
+                }
             }
         };
         let t = std::time::Instant::now();
-        let in_txn = ledger.begin_block().is_ok();
-        slow("begin_block", t);
+        let in_txn = match ledger.begin_block() {
+            Ok(()) => true,
+            // An earlier block's ROLLBACK is still failing: never fall back to
+            // non-transactional apply on top of that half-applied block.
+            Err(e) if ledger.has_pending_abort() => {
+                return Err(CommitFailure::new(CommitStage::Store, e));
+            }
+            Err(_) => false,
+        };
+        slow("begin_block", t, None);
 
         let result = (|| -> Result<(), CommitFailure> {
             let t = std::time::Instant::now();
             ledger
                 .put_block(block.round.0, proto, hdr_data, blk_data)
                 .map_err(|e| CommitFailure::new(CommitStage::Store, e))?;
-            slow("put_block", t);
+            slow("put_block", t, None);
             let t = std::time::Instant::now();
             ledger
                 .put_block_cert(block.round.0, cert_bytes)
                 .map_err(|e| CommitFailure::new(CommitStage::Store, e))?;
-            slow("put_block_cert", t);
+            slow("put_block_cert", t, None);
             let t = std::time::Instant::now();
             // Issue #1678: per-block follow-path timing. The AVM accumulator
             // is reset here and taken right after the apply (the only
@@ -400,15 +428,17 @@ impl AgreementLedgerBridge {
             crate::follow_timing::reset_avm_time();
             let applied = crate::apply::apply_block_executing_app_calls(ledger, block);
             let timing = crate::follow_timing::follow_timing();
-            if let Some(avm) = crate::follow_timing::take_avm_time() {
+            let avm = crate::follow_timing::take_avm_time();
+            if let Some(avm) = avm {
                 timing.avm.observe(avm);
             }
             match &applied {
                 Ok(()) => timing.apply.observe(t.elapsed()),
                 Err(_) => timing.apply_failed.observe(t.elapsed()),
             }
+            // Also for a failed apply: a slow rejection is just as relevant.
+            slow("apply_block", t, Some(avm.unwrap_or_default()));
             applied.map_err(|e| CommitFailure::new(CommitStage::Apply, e))?;
-            slow("apply_block", t);
             Ok(())
         })();
 
@@ -430,7 +460,7 @@ impl AgreementLedgerBridge {
             crate::follow_timing::follow_timing()
                 .commit
                 .observe(t.elapsed());
-            slow("commit_block", t);
+            slow("commit_block", t, None);
         }
 
         Ok(())
@@ -839,6 +869,24 @@ impl LedgerWriter for AgreementLedgerBridge {
                 );
             }
             let commit_started = std::time::Instant::now();
+
+            // An earlier block's ROLLBACK may have failed with its transaction
+            // still open: the in-memory round then still reflects that
+            // half-applied block, so finish the abort BEFORE trusting
+            // `current_round` below. If it still cannot be rolled back this is
+            // a failed attempt; never apply on top of it.
+            if let Err(e) = ledger.heal_pending_abort() {
+                drop(ledger);
+                crate::follow_timing::follow_timing()
+                    .ensure_block_failed
+                    .observe(ensure_started.elapsed());
+                self.apply_stall.count_local_failure();
+                warn!(
+                    round = %block.round,
+                    "ensure_block: cannot start a block: {e}"
+                );
+                return;
+            }
 
             // Check if this block's round has already been committed.
             let next_round = ledger.current_round().0 + 1;
@@ -2189,5 +2237,33 @@ mod tests {
             Some(algo_codec::compute_txn_id(&full).0.to_vec()),
             "TxID must be the id of the transaction with its genesis fields"
         );
+    }
+
+    #[test]
+    fn ensure_block_never_applies_on_top_of_a_block_whose_rollback_failed() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+        {
+            // A half-applied block whose ROLLBACK keeps failing (twice).
+            let mut l = ledger.lock().unwrap();
+            l.begin_block().unwrap();
+            l.set_current_round(Round(1));
+            l.fail_rollback_count = 2;
+            let _ = l.rollback_block();
+        }
+        // First attempt: the heal inside begin_block fails -> failed attempt,
+        // nothing applied or stored.
+        bridge.ensure_block(&make_round1_block(), &make_cert_with_proposal(1));
+        {
+            let l = ledger.lock().unwrap();
+            assert!(
+                l.has_pending_abort(),
+                "abort still pending, nothing applied"
+            );
+            assert!(l.get_block_data(1).unwrap().is_none());
+        }
+        // Second attempt heals and commits normally.
+        bridge.ensure_block(&make_round1_block(), &make_cert_with_proposal(1));
+        assert_eq!(ledger.lock().unwrap().current_round().0, 1);
     }
 }
