@@ -26,7 +26,7 @@ use super::*;
 use algo_pool::traits::BlockEvaluator;
 use algo_types::{AppParams, AssetHolding, SignedTransaction, Transaction};
 use ed25519_dalek::{Signer, SigningKey};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const GENESIS_ID: &str = "net-x";
 const GENESIS_HASH: [u8; 32] = [0xAA; 32];
@@ -386,7 +386,15 @@ fn assembled_block_drops_an_injected_unapplyable_group_and_carries_apply_data() 
         fees: 1_000,
     });
     eval.fees_collected += 1_000;
-    let block = eval.generate_block(&[]).expect("generate_block");
+    let mut block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(
+        eval.exec.as_ref().unwrap().last_passes,
+        2,
+        "one failing pass, one clean pass"
+    );
+    // The agreement layer sets the proposer after assembly: the epilogue of
+    // the final apply must accept the proposed block with it set.
+    block.proposer = b.0;
 
     assert_eq!(block.payset.len(), 2, "the un-applyable group is dropped");
     assert_eq!(
@@ -482,38 +490,56 @@ fn an_evaluation_failure_no_transaction_owns_rejects_the_group() {
 // ---- review findings: go wording of the common reasons ----
 
 #[test]
-fn pool_reason_maps_to_go_wording_and_strips_category_prefixes() {
-    use algo_error::AlgoError;
+fn pool_reason_maps_typed_apply_errors_to_go_wording() {
+    use algo_error::{AlgoError, RejectClass};
+    assert_eq!(
+        pool_reason(&AlgoError::AppDoesNotExist { app_id: 7 }),
+        (
+            "only ClearState is supported for an application (7) that does not exist".to_string(),
+            RejectClass::Other
+        )
+    );
+    assert_eq!(
+        pool_reason(&AlgoError::ApprovalRejected {
+            app_id: 7,
+            reason: None
+        }),
+        (
+            "transaction rejected by ApprovalProgram".to_string(),
+            RejectClass::TealReject
+        )
+    );
+    assert_eq!(
+        pool_reason(&AlgoError::ApprovalRejected {
+            app_id: 7,
+            reason: Some("AVM: assert failed".into())
+        }),
+        (
+            "logic eval error: assert failed. Details: app=7, pc=0".to_string(),
+            RejectClass::TealErr
+        )
+    );
+    // Text that merely LOOKS like a typed verdict is not one.
     assert_eq!(
         pool_reason(&AlgoError::Ledger {
             message: "appl: app 7 does not exist".into()
-        }),
-        "only ClearState is supported for an application (7) that does not exist"
-    );
-    assert_eq!(
-        pool_reason(&AlgoError::Ledger {
-            message: "appl execute: app 7 approval program rejected transaction".into()
-        }),
-        "transaction rejected by ApprovalProgram"
-    );
-    assert_eq!(
-        pool_reason(&AlgoError::Ledger {
-            message: "appl execute: app 7 approval program rejected transaction: assert failed"
-                .into()
-        }),
-        "logic eval error: assert failed. Details: app=7, pc=0"
+        })
+        .1,
+        RejectClass::Other
     );
     assert_eq!(
         pool_reason(&AlgoError::Ledger {
             message: "sender X has insufficient balance 1 for fee 2".into()
-        }),
+        })
+        .0,
         "sender X has insufficient balance 1 for fee 2",
         "no 'ledger error: ' prefix"
     );
     assert_eq!(
         pool_reason(&AlgoError::Avm {
             message: "boom".into()
-        }),
+        })
+        .0,
         "boom",
         "no 'AVM: ' prefix"
     );
@@ -564,7 +590,9 @@ fn proposal_is_trimmed_to_the_byte_limit_measured_with_apply_data() {
     assert_eq!(block.fees_collected, 1_000, "its fees are removed");
 }
 
-// ---- review findings: transient scratch failure is retried once ----
+// ---- review findings: transient / unattributable scratch failures ----
+
+use algo_ledger::shadow_execute::test_hooks;
 
 #[test]
 fn transient_scratch_failure_is_retried_once() {
@@ -573,21 +601,50 @@ fn transient_scratch_failure_is_retried_once() {
     let (_ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))]);
     eval.transaction_group(&[pay(&a, b.0, 1_000, None)])
         .unwrap();
-    algo_ledger::shadow_execute::inject_scratch_failures(1);
+    test_hooks::reset_scratch_calls();
+    test_hooks::inject_scratch_failures(1);
     let block = eval.generate_block(&[]).expect("generate_block");
     assert_eq!(block.payset.len(), 1, "the retry succeeded");
+    assert_eq!(
+        test_hooks::scratch_calls(),
+        2,
+        "one failed pass + one retry"
+    );
 }
 
 #[test]
-fn persistent_scratch_failure_proposes_an_empty_payset_and_is_counted() {
+fn unattributable_failure_keeps_the_longest_prefix_that_evaluates() {
+    let a = key(1);
+    let b = key(2);
+    let (_ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))]);
+    for i in 0..3u64 {
+        eval.transaction_group(&[pay(&a, b.0, 1_000 + i, None)])
+            .unwrap();
+    }
+    test_hooks::reset_scratch_calls();
+    // Any evaluation of more than one transaction fails with a failure no
+    // transaction owns: pass 1 and its retry fail, bisection finds the
+    // prefix of one group (mid=2 fails, mid=1 succeeds), one pass verifies.
+    test_hooks::inject_failure_over_payset_len(Some(1));
+    let block = eval.generate_block(&[]).expect("generate_block");
+    test_hooks::inject_failure_over_payset_len(None);
+    assert_eq!(block.payset.len(), 1, "the clean prefix is proposed");
+    assert_eq!(block.fees_collected, 1_000);
+    assert_eq!(test_hooks::scratch_calls(), 5);
+    assert_eq!(eval.exec.as_ref().unwrap().last_passes, 5);
+}
+
+#[test]
+fn persistent_failure_of_even_the_first_group_proposes_an_empty_payset_and_is_counted() {
     let a = key(1);
     let b = key(2);
     let (_ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))]);
     eval.transaction_group(&[pay(&a, b.0, 1_000, None)])
         .unwrap();
     let before = algo_ledger::proposal_eval::scratch_failures();
-    algo_ledger::shadow_execute::inject_scratch_failures(2);
+    test_hooks::inject_failure_over_payset_len(Some(0));
     let block = eval.generate_block(&[]).expect("generate_block");
+    test_hooks::inject_failure_over_payset_len(None);
     assert!(block.payset.is_empty());
     assert_eq!(block.fees_collected, 0);
     // The counter is process-global: other tests may add to it concurrently.
@@ -595,6 +652,117 @@ fn persistent_scratch_failure_proposes_an_empty_payset_and_is_counted() {
     assert!(
         algo_ledger::proposal_eval::proposal_metrics_prometheus_text()
             .contains("algod_rust_proposal_scratch_failures_total")
+    );
+}
+
+// ---- review findings: oversize is trimmed in one step ----
+
+#[test]
+fn oversize_payset_is_trimmed_to_the_fitting_prefix_in_one_step() {
+    let a = key(1);
+    let closers: Vec<Key> = (10..14).map(key).collect();
+    let mut accounts = vec![(a.0, funded(50_000_000))];
+    accounts.extend(closers.iter().map(|k| (k.0, funded(5_000_000))));
+    let (_ledger, mut eval) = evaluator(&accounts);
+    let txns: Vec<SignedTransaction> = closers.iter().map(|k| pay(k, a.0, 0, Some(a.0))).collect();
+    let mut stripped = 0usize;
+    for stx in &txns {
+        let mut stib = stx.clone();
+        eval.genesis_rule().strip(&mut stib);
+        stripped += canonical_encode_signed_txn_in_block(&stib).len();
+    }
+    // Each closing payment grows by its `ca`; leave room for only one.
+    eval.max_txn_bytes = stripped + 8;
+    for stx in &txns {
+        eval.transaction_group(std::slice::from_ref(stx))
+            .expect("fits when stripped");
+    }
+    test_hooks::reset_scratch_calls();
+    let block = eval.generate_block(&[]).expect("generate_block");
+    assert!(block.payset.len() < 4 && !block.payset.is_empty());
+    let encoded: usize = block
+        .payset
+        .iter()
+        .map(|s| canonical_encode_signed_txn_in_block(s).len())
+        .sum();
+    assert!(encoded <= stripped + 8);
+    assert_eq!(
+        test_hooks::scratch_calls(),
+        2,
+        "one pass measures the ApplyData sizes, one verifies the prefix (not one pass per dropped group)"
+    );
+}
+
+// ---- review findings: lock wait is not charged to the admission budget ----
+
+#[test]
+fn waiting_for_the_ledger_lock_does_not_consume_the_admission_budget() {
+    let a = key(1);
+    let b = key(2);
+    let (ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))]);
+    let held = ledger.clone();
+    let holder = std::thread::spawn(move || {
+        let _g = held.lock().unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    eval.transaction_group(&[pay(&a, b.0, 1_000, None)])
+        .expect("admitted once the lock frees");
+    holder.join().unwrap();
+    let spent = eval.exec.as_ref().unwrap().spent;
+    assert!(
+        spent < Duration::from_millis(200),
+        "the 350 ms lock wait must not be charged to the budget, spent {spent:?}"
+    );
+    assert!(
+        algo_ledger::proposal_eval::proposal_metrics_prometheus_text()
+            .contains("algod_rust_pool_eval_ledger_lock_wait_microseconds_total")
+    );
+}
+
+// ---- review findings: inner-rollback path of the overlay ----
+
+#[test]
+fn a_call_that_creates_an_asset_and_then_rejects_leaves_the_overlay_untouched() {
+    let s = key(3);
+    let app_id = 902u64;
+    let app_addr = Address(algo_ledger::avm_context::app_address(app_id));
+    let (ledger, _pool) = fixture(
+        &[(s.0, funded(5_000_000)), (app_addr, funded(10_000_000))],
+        &[],
+    );
+    put_app(
+        &ledger,
+        app_id,
+        s.0,
+        concat!(
+            "#pragma version 8\n",
+            "itxn_begin\n",
+            "int acfg\n",
+            "itxn_field TypeEnum\n",
+            "int 1\n",
+            "itxn_field ConfigAssetTotal\n",
+            "int 0\n",
+            "itxn_field Fee\n",
+            "itxn_submit\n",
+            "int 0\n",
+        ),
+    );
+    let adapter = PoolLedgerAdapter::new(ledger.clone());
+    let mut eval = adapter
+        .start_simple_evaluator(genesis_header(), 0, 0)
+        .expect("start_evaluator");
+    let err = eval
+        .transaction_group(&[app_call(&s, app_id, vec![], 2_000)])
+        .expect_err("program rejects after creating an asset");
+    assert!(
+        err.to_string()
+            .contains("transaction rejected by ApprovalProgram"),
+        "{err}"
+    );
+    assert!(
+        eval.exec.as_ref().unwrap().overlay.is_empty(),
+        "nothing of the failed group (including the inner asset) may remain"
     );
 }
 

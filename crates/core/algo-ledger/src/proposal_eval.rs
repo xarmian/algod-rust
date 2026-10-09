@@ -136,6 +136,7 @@ static SCRATCH_FAILURES: AtomicU64 = AtomicU64::new(0);
 static LOCK_HOLD_MAX_US: AtomicU64 = AtomicU64::new(0);
 static LOCK_HOLD_TOTAL_US: AtomicU64 = AtomicU64::new(0);
 static LOCK_HOLD_COUNT: AtomicU64 = AtomicU64::new(0);
+static LOCK_WAIT_TOTAL_US: AtomicU64 = AtomicU64::new(0);
 
 /// Count a block assembly that had to propose an empty payset because the
 /// scratch evaluation could not run (or could not be attributed).
@@ -157,9 +158,16 @@ pub fn record_ledger_lock_hold(held: std::time::Duration) {
     LOCK_HOLD_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Record how long a pool/proposer evaluation waited to acquire the ledger
+/// mutex (not charged to the admission budget or to the hold metrics).
+pub fn record_ledger_lock_wait(waited: std::time::Duration) {
+    let us = waited.as_micros().min(u128::from(u64::MAX)) as u64;
+    LOCK_WAIT_TOTAL_US.fetch_add(us, Ordering::Relaxed);
+}
+
 /// Prometheus text for the pool/proposer evaluation counters.
 pub fn proposal_metrics_prometheus_text() -> String {
-    let rows: [(&str, &str, &str, u64); 4] = [
+    let rows: [(&str, &str, &str, u64); 5] = [
         (
             "algod_rust_proposal_scratch_failures_total",
             "counter",
@@ -177,6 +185,12 @@ pub fn proposal_metrics_prometheus_text() -> String {
             "counter",
             "Total ledger mutex hold time of pool/proposer evaluations.",
             LOCK_HOLD_TOTAL_US.load(Ordering::Relaxed),
+        ),
+        (
+            "algod_rust_pool_eval_ledger_lock_wait_microseconds_total",
+            "counter",
+            "Total time pool/proposer evaluations waited to acquire the ledger mutex.",
+            LOCK_WAIT_TOTAL_US.load(Ordering::Relaxed),
         ),
         (
             "algod_rust_pool_eval_ledger_lock_holds_total",

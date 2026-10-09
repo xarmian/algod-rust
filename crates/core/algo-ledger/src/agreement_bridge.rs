@@ -183,6 +183,9 @@ impl CommitFailure {
                     | AlgoError::Avm { .. }
                     | AlgoError::AvmLogicSig { .. }
                     | AlgoError::Codec { .. }
+                    | AlgoError::Eval { .. }
+                    | AlgoError::AppDoesNotExist { .. }
+                    | AlgoError::ApprovalRejected { .. }
             )
     }
 }
@@ -1637,6 +1640,31 @@ mod tests {
             CommitStage::Apply,
             AlgoError::Validation {
                 message: "v".into()
+            }
+        ));
+        // Typed apply verdicts added with the go-text close errors (#1776):
+        // a committed block that hits one must still stall (#1677).
+        assert!(f(
+            CommitStage::Apply,
+            AlgoError::Eval {
+                message: "cannot close: 1 outstanding assets".into()
+            }
+        ));
+        assert!(f(
+            CommitStage::Apply,
+            AlgoError::AppDoesNotExist { app_id: 7 }
+        ));
+        assert!(f(
+            CommitStage::Apply,
+            AlgoError::ApprovalRejected {
+                app_id: 7,
+                reason: None
+            }
+        ));
+        assert!(!f(
+            CommitStage::Store,
+            AlgoError::Eval {
+                message: "cannot close: 1 outstanding assets".into()
             }
         ));
     }

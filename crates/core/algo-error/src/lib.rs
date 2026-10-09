@@ -116,6 +116,31 @@ pub enum AlgoError {
     #[error("{message}")]
     Eval { message: String },
 
+    /// An application call to an application that does not exist (and is
+    /// not ClearState). go: `ledger/apply/application.go` `ApplicationCall`
+    /// (`only ClearState is supported for an application (%d) that does not
+    /// exist`). Typed so the pool maps the type, not message text.
+    #[error("appl: app {app_id} does not exist")]
+    AppDoesNotExist { app_id: u64 },
+
+    /// An approval program rejected the transaction. `reason` is the runtime
+    /// error that ended the program, `None` for a clean reject (go:
+    /// `ledgercore.ApprovalProgramRejectedError` vs `logic.EvalError`).
+    #[error("appl execute: app {app_id} approval program rejected transaction{}", .reason.as_ref().map(|r| format!(": {r}")).unwrap_or_default())]
+    ApprovalRejected { app_id: u64, reason: Option<String> },
+
+    /// The pool/proposer evaluator refused a transaction. `message` is go's
+    /// `transaction <txid>: <reason>` text verbatim; `class` is the pool
+    /// error-tag family; `source` keeps the underlying error (and so any
+    /// structured AVM diagnostics, see [`AlgoError::avm_eval_detail`]).
+    #[error("{message}")]
+    Rejected {
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+        message: String,
+        class: RejectClass,
+    },
+
     /// An AVM evaluation failure, enriched with go-algorand-style structured
     /// diagnostics (pc, group index, app index, per-transaction
     /// scratch/stack dump). Mirrors go's `basics.SError`/`EvalError`
@@ -154,6 +179,17 @@ pub enum AlgoError {
 
     #[error("network error: {message}")]
     Network { message: String },
+}
+
+/// Pool error-tag family of an [`AlgoError::Rejected`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectClass {
+    /// Any other reason (classified from its text by the pool).
+    Other,
+    /// Approval program returned false (go `ApprovalProgramRejectedError`).
+    TealReject,
+    /// Approval program errored (go `logic.EvalError`).
+    TealErr,
 }
 
 pub type Result<T> = std::result::Result<T, AlgoError>;

@@ -5072,9 +5072,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
     // Exception: ClearState always succeeds even if app is deleted (lets users reclaim local state).
     if !is_create && txn.on_completion != ON_COMPLETION_CLEAR_STATE && !store.has_app_params(app_id)
     {
-        return Err(AlgoError::Ledger {
-            message: format!("appl: app {} does not exist", app_id),
-        });
+        return Err(AlgoError::AppDoesNotExist { app_id });
     }
 
     if is_create {
@@ -5467,40 +5465,30 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                             txn,
                             ctx.consensus.no_empty_local_deltas,
                         ));
-                    let message = format!(
-                        "appl execute: app {} approval program rejected transaction{}",
+                    let rejected = AlgoError::ApprovalRejected {
                         app_id,
-                        result
-                            .error
-                            .as_ref()
-                            .map(|e| format!(": {}", e))
-                            .unwrap_or_default()
-                    );
+                        reason: result.error.clone(),
+                    };
                     // When the approval program actually errored (as opposed
                     // to a clean reject), preserve the structured
                     // pc/group-index/app-index/eval-states diagnostics
                     // `run_approval_program` attached to `result.error_detail`
-                    // (issue #1135) by re-wrapping them in an
+                    // (issue #1135) by wrapping them in an
                     // `AlgoError::AvmLogicSig`, matching go's
                     // `basics.Annotate`-based `evalError()`
-                    // (`data/transactions/logic/eval.go`) attaching the same
-                    // attributes regardless of how far up the call stack the
-                    // failure is reported. The message text is unchanged
-                    // either way -- only the error's structured attributes
-                    // (surfaced by the REST API's `ErrorResponse.data`, see
-                    // `algo_rest_api::error`) depend on this branch.
+                    // (`data/transactions/logic/eval.go`). The message text is
+                    // unchanged either way; the typed `ApprovalRejected` is
+                    // the wrapped source so callers can match the type.
                     return Err(match result.error_detail {
                         Some(detail) => AlgoError::AvmLogicSig {
-                            source: Box::new(AlgoError::Ledger {
-                                message: message.clone(),
-                            }),
-                            message,
+                            message: rejected.to_string(),
+                            source: Box::new(rejected),
                             pc: detail.pc,
                             group_index: detail.group_index,
                             app_index: detail.app_index,
                             eval_states: detail.eval_states,
                         },
-                        None => AlgoError::Ledger { message },
+                        None => rejected,
                     });
                 }
                 // Report the approval program's state changes / logs / inner txns.

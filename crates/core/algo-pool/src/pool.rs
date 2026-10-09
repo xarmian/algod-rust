@@ -667,18 +667,14 @@ impl TransactionPool {
                 // walks `e`'s source chain for an `AlgoError::AvmLogicSig`.
                 let detail = e.avm_eval_detail();
                 let message = e.to_string();
-                // The evaluator reports go's verbatim `transaction <txid>: ...`
-                // text through `Eval`/`AvmLogicSig` (issue #1776).
-                let go_text = message.starts_with("transaction ")
-                    && matches!(
-                        e,
-                        algo_error::AlgoError::Eval { .. }
-                            | algo_error::AlgoError::AvmLogicSig { .. }
-                    );
-                if go_text {
-                    match detail {
-                        Some(detail) => PoolError::TxnRejectedWithDetail(message, detail),
-                        None => PoolError::TxnRejected(message),
+                // The evaluator reports a refused transaction as the typed
+                // `Rejected` (go's `transaction <txid>: ...` text, issue
+                // #1776): map the type, never the text.
+                if let algo_error::AlgoError::Rejected { class, .. } = &e {
+                    PoolError::TxnRejected {
+                        message,
+                        class: *class,
+                        detail,
                     }
                 } else if message.contains("duplicate lease")
                     || message.contains("overlapping lease")
@@ -3184,5 +3180,78 @@ mod tests {
             crate::error::classify_pool_error(&err),
             crate::error::PoolErrorTag::LeaseEval
         );
+    }
+
+    /// Evaluator that fails every group with the error `make` builds.
+    struct ErrEvaluator {
+        round: Round,
+        make: fn() -> AlgoError,
+    }
+
+    impl BlockEvaluator for ErrEvaluator {
+        fn round(&self) -> Round {
+            self.round
+        }
+        fn pay_set_size(&self) -> usize {
+            0
+        }
+        fn test_transaction_group(&self, _txgroup: &[SignedTransaction]) -> Result<(), AlgoError> {
+            Ok(())
+        }
+        fn transaction_group(&mut self, _txgroup: &[SignedTransaction]) -> Result<(), AlgoError> {
+            Err((self.make)())
+        }
+        fn generate_block(&mut self, _voting_accounts: &[Address]) -> Result<Block, AlgoError> {
+            Ok(Block::default())
+        }
+        fn reset_txn_bytes(&mut self) {}
+    }
+
+    /// Issue #1776: the pool maps the evaluator error TYPE. A typed
+    /// `Rejected` stays a `TxnRejected` even when its text contains
+    /// "duplicate lease"; an untyped error with that text is still a lease
+    /// conflict (classification unchanged).
+    #[test]
+    fn rejection_is_mapped_by_type_and_lease_classification_is_unchanged() {
+        let pool = make_pool_with_evaluator(1000);
+        let mut guard = pool.mu.lock();
+        let txgroup = vec![make_test_txn(9)];
+
+        guard.evaluator = Some(Box::new(ErrEvaluator {
+            round: Round(2),
+            make: || AlgoError::Rejected {
+                source: None,
+                message: "transaction X: duplicate lease".to_string(),
+                class: algo_error::RejectClass::TealReject,
+            },
+        }));
+        let err = pool
+            .add_to_pending_block_evaluator_once(&txgroup, &mut guard, false)
+            .expect_err("rejected");
+        assert!(
+            matches!(
+                err,
+                PoolError::TxnRejected {
+                    class: algo_error::RejectClass::TealReject,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            crate::error::classify_pool_error(&err),
+            crate::error::PoolErrorTag::TealReject
+        );
+
+        guard.evaluator = Some(Box::new(ErrEvaluator {
+            round: Round(2),
+            make: || AlgoError::Ledger {
+                message: "transaction X: duplicate lease".to_string(),
+            },
+        }));
+        let err = pool
+            .add_to_pending_block_evaluator_once(&txgroup, &mut guard, false)
+            .expect_err("lease");
+        assert!(matches!(err, PoolError::LeaseConflict { .. }), "{err:?}");
     }
 }

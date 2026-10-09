@@ -275,7 +275,14 @@ impl LedgerStore for OverlayStore<'_> {
 
     fn remove_all_asset_holdings_for_asset(&mut self, asset_id: u64) {
         // Rollback cleanup of an id created inside the evaluation: such
-        // holdings only ever exist in the overlay.
+        // holdings only ever exist in the overlay. The committed ledger
+        // cannot hold a row for an id above its transaction counter, so
+        // tombstoning overlay entries is complete; calling this for any
+        // other id would leave committed rows visible.
+        debug_assert!(
+            asset_id > self.st.chain_base.txn_counter,
+            "remove_all_asset_holdings_for_asset is only valid for ids created inside the evaluation"
+        );
         let keys: Vec<(Address, u64)> = self
             .st
             .holdings
@@ -359,6 +366,12 @@ impl LedgerStore for OverlayStore<'_> {
     }
 
     fn remove_all_app_local_states_for_app(&mut self, app_id: u64) {
+        // See `remove_all_asset_holdings_for_asset`: only ids created inside
+        // the evaluation (above the committed transaction counter).
+        debug_assert!(
+            app_id > self.st.chain_base.txn_counter,
+            "remove_all_app_local_states_for_app is only valid for ids created inside the evaluation"
+        );
         let keys: Vec<(Address, u64)> = self
             .st
             .locals

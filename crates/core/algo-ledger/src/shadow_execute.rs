@@ -757,16 +757,50 @@ fn compare<L: LedgerStore>(
     out
 }
 
-thread_local! {
-    static INJECT_SCRATCH_FAILURES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
+/// Fault injection for the proposer assembly tests. Compiled only into test
+/// builds and into builds that enable the `test-hooks` feature (the
+/// `algod-rust` dev-dependency does); never into a production binary.
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod test_hooks {
+    use std::cell::Cell;
 
-/// Test hook: the next `n` calls of [`scratch_execute_payset`] ON THIS THREAD
-/// fail with a transient [`ScratchFailure::Other`] (exercises the proposer
-/// retry without racing other tests).
-#[doc(hidden)]
-pub fn inject_scratch_failures(n: u64) {
-    INJECT_SCRATCH_FAILURES.with(|c| c.set(n));
+    thread_local! {
+        static FAIL_NEXT: Cell<u64> = const { Cell::new(0) };
+        static FAIL_OVER: Cell<Option<usize>> = const { Cell::new(None) };
+        static CALLS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// The next `n` [`super::scratch_execute_payset`] calls on this thread
+    /// fail with a transient, unattributable error.
+    pub fn inject_scratch_failures(n: u64) {
+        FAIL_NEXT.with(|c| c.set(n));
+    }
+
+    /// Every call on this thread whose payset has more than `n` transactions
+    /// fails with an unattributable error (`None` clears it).
+    pub fn inject_failure_over_payset_len(n: Option<usize>) {
+        FAIL_OVER.with(|c| c.set(n));
+    }
+
+    /// Number of scratch passes run on this thread since the last reset.
+    pub fn scratch_calls() -> u64 {
+        CALLS.with(|c| c.get())
+    }
+
+    /// Reset the per-thread pass counter.
+    pub fn reset_scratch_calls() {
+        CALLS.with(|c| c.set(0));
+    }
+
+    pub(super) fn should_fail(payset_len: usize) -> bool {
+        CALLS.with(|c| c.set(c.get() + 1));
+        let next = FAIL_NEXT.with(|c| {
+            let n = c.get();
+            c.set(n.saturating_sub(1));
+            n > 0
+        });
+        next || FAIL_OVER.with(|c| c.get()).is_some_and(|n| payset_len > n)
+    }
 }
 
 /// Result of [`scratch_execute_payset`].
@@ -805,11 +839,8 @@ pub fn scratch_execute_payset<L: LedgerStore>(
     store: &mut L,
     block: &Block,
 ) -> Result<ScratchPayset, ScratchFailure> {
-    if INJECT_SCRATCH_FAILURES.with(|c| {
-        let n = c.get();
-        c.set(n.saturating_sub(1));
-        n > 0
-    }) {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if test_hooks::should_fail(block.payset.len()) {
         return Err(ScratchFailure::Other(AlgoError::Ledger {
             message: "injected transient scratch failure".into(),
         }));
