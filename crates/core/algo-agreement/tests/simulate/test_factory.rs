@@ -132,8 +132,13 @@ impl BlockFactory for AutoBlockFactory {
         round: Round,
         _addresses: &[Address],
     ) -> Result<Box<dyn UnfinishedBlock>, AgreementError> {
+        // The protocol must be one the demux can resolve: since #1749 a
+        // proposal naming an unknown (here: empty) consensus protocol is
+        // dropped on receipt, which silently wedged every multi-node
+        // cluster at round 1 (Coverage red on main).
         let block = Block {
             round,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.into(),
             ..Block::default()
         };
         Ok(Box::new(AutoUnfinishedBlock { block, round }))
