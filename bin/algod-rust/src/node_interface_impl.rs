@@ -2361,6 +2361,8 @@ impl NodeInterface for AlgodNodeInterface {
         // Issue #1761: process start time, so a scraper detects restarts
         // even when the restarted node outgrew its earlier counters.
         text.push_str(&algo_ledger::follow_timing::process_start_time_prometheus_text());
+        // Issue #1776: pool/proposer real-apply evaluation counters.
+        text.push_str(&algo_ledger::proposal_eval::proposal_metrics_prometheus_text());
         if let Some(pool) = self.pool.as_ref() {
             text.push_str(&pool.reeval_counter().to_prometheus_text());
         }

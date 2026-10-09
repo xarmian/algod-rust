@@ -1371,6 +1371,76 @@ struct SimpleBlockEvaluator {
     exec: Option<ExecState>,
 }
 
+/// The text go reports for a failed apply, without algod-rust category
+/// prefixes ("ledger error: ", "AVM: ", ...), with the common reasons mapped
+/// to go wording:
+///
+/// * `ledger/apply/application.go` `ApplicationCall`: a call to an app that
+///   does not exist (and is not ClearState) fails with `only ClearState is
+///   supported for an application (%d) that does not exist`.
+/// * `ledger/ledgercore/error.go` `ApprovalProgramRejectedError`: a clean
+///   reject is `transaction rejected by ApprovalProgram`.
+/// * `data/transactions/logic/eval.go` `EvalError.Error`: a program error is
+///   `logic eval error: <err>. Details: app=<id>, pc=<pc>`.
+///
+/// Overspend / min-balance texts keep their algod-rust wording (go prints a
+/// full `AccountData` dump there), only the category prefix is removed.
+fn pool_reason(e: &algo_error::AlgoError) -> String {
+    use algo_error::AlgoError;
+    let raw = match e {
+        AlgoError::Ledger { message }
+        | AlgoError::Avm { message }
+        | AlgoError::Validation { message }
+        | AlgoError::Eval { message }
+        | AlgoError::AvmLogicSig { message, .. } => message.clone(),
+        other => other.to_string(),
+    };
+    if let Some(id) = raw
+        .strip_prefix("appl: app ")
+        .and_then(|r| r.strip_suffix(" does not exist"))
+    {
+        return format!(
+            "only ClearState is supported for an application ({id}) that does not exist"
+        );
+    }
+    if let Some((id, tail)) = raw
+        .strip_prefix("appl execute: app ")
+        .and_then(|r| r.split_once(" approval program rejected transaction"))
+    {
+        return match tail.strip_prefix(": ") {
+            None => "transaction rejected by ApprovalProgram".to_string(),
+            Some(err) => {
+                // Inner failures arrive wrapped in Display prefixes of the
+                // AlgoError they were raised as; go prints the bare reason.
+                let err = ["AVM: ", "ledger error: ", "validation error: "]
+                    .iter()
+                    .find_map(|p| err.strip_prefix(p))
+                    .unwrap_or(err);
+                let pc = e.avm_eval_detail().map(|d| d.pc).unwrap_or(0);
+                format!("logic eval error: {err}. Details: app={id}, pc={pc}")
+            }
+        };
+    }
+    raw
+}
+
+/// go `eval.TransactionGroup` error for `txid`: `transaction <txid>:
+/// <reason>` (`ledger/eval/eval.go`), keeping structured AVM diagnostics.
+fn go_rejection(txid: &str, error: algo_error::AlgoError) -> algo_error::AlgoError {
+    let message = format!("transaction {txid}: {}", pool_reason(&error));
+    match error.avm_eval_detail() {
+        Some(d) => algo_error::AlgoError::AvmLogicSig {
+            source: Box::new(error),
+            message,
+            pc: d.pc,
+            group_index: d.group_index,
+            app_index: d.app_index,
+            eval_states: d.eval_states,
+        },
+        None => algo_error::AlgoError::Eval { message },
+    }
+}
+
 /// The block skeleton for `hdr` (every header field, empty payset and
 /// commitments): the template groups are applied under.
 fn header_block(hdr: &algo_types::BlockHeader) -> algo_types::Block {
@@ -1420,8 +1490,6 @@ struct ExecGroup {
     /// Index of the group first transaction in `included_txns`.
     start: usize,
     len: usize,
-    /// Serialized payset bytes of the group.
-    bytes: usize,
     /// Fees the group contributed to `fees_collected`.
     fees: u64,
 }
@@ -1433,6 +1501,10 @@ struct ExecState {
     template: algo_types::Block,
     groups: Vec<ExecGroup>,
     spent: Duration,
+    /// Set once a group was admitted without being evaluated (stale base or
+    /// spent budget): the overlay no longer matches the admitted set, so
+    /// admission stops consulting it. Assembly is unaffected.
+    incomplete: bool,
 }
 
 impl SimpleBlockEvaluator {
@@ -1804,28 +1876,36 @@ impl SimpleBlockEvaluator {
 
 impl SimpleBlockEvaluator {
     /// Run the candidate payset through the real apply, drop any group that
-    /// fails it, and fill the surviving transactions ApplyData. Returns the
-    /// payset and the number of transactions to add to the header counter
-    /// (top-level plus inner, go `TxnCounter`).
+    /// fails it, fill the surviving transactions ApplyData, and enforce the
+    /// block byte limit on the payset as it will be encoded (ApplyData
+    /// included). Returns the payset and the number of transactions to add
+    /// to the header counter (top-level plus inner, go `TxnCounter`).
+    ///
+    /// A failure no transaction owns (the tip advanced mid-assembly, the
+    /// scratch journal is busy) is retried once; if it persists the
+    /// proposal is an empty payset, counted in
+    /// `algod_rust_proposal_scratch_failures_total`.
     fn finalize_payset(
         &mut self,
     ) -> Result<(Vec<algo_types::SignedTransaction>, u64), algo_error::AlgoError> {
         use algo_ledger::shadow_execute::{scratch_execute_payset, ScratchFailure};
 
-        let mut payset = std::mem::take(&mut self.included_txns);
+        // Admitted transactions in payset form, with no ApplyData yet.
+        let mut pristine = std::mem::take(&mut self.included_txns);
         let Some(exec) = self.exec.as_mut() else {
-            let n = payset.len() as u64;
-            return Ok((payset, n));
+            let n = pristine.len() as u64;
+            return Ok((pristine, n));
         };
-        if payset.is_empty() {
-            return Ok((payset, 0));
+        if pristine.is_empty() {
+            return Ok((pristine, 0));
         }
         let mut groups = std::mem::take(&mut exec.groups);
         let template = exec.template.clone();
         let mut dropped = 0usize;
+        let mut retried = false;
         loop {
             let mut candidate = template.clone();
-            candidate.payset = payset.clone();
+            candidate.payset = pristine.clone();
             let result = {
                 let mut ledger = self
                     .ledger
@@ -1833,10 +1913,14 @@ impl SimpleBlockEvaluator {
                     .map_err(|e| algo_error::AlgoError::Ledger {
                         message: format!("ledger lock poisoned: {e}"),
                     })?;
-                scratch_execute_payset(&mut *ledger, &candidate)
+                let held = std::time::Instant::now();
+                let r = scratch_execute_payset(&mut *ledger, &candidate);
+                algo_ledger::proposal_eval::record_ledger_lock_hold(held.elapsed());
+                r
             };
             match result {
                 Ok(done) => {
+                    let mut payset = pristine.clone();
                     for (stx, ad) in payset.iter_mut().zip(done.apply_data) {
                         stx.closing_amount = ad.closing_amount;
                         stx.asset_closing_amount = ad.asset_closing_amount;
@@ -1847,13 +1931,35 @@ impl SimpleBlockEvaluator {
                         stx.apply_data_application_id = ad.application_id;
                         stx.eval_delta = ad.eval_delta;
                     }
-                    let counted = done.final_txn_counter.saturating_sub(self.hdr.txn_counter);
+                    // Byte accounting on the encoded payset WITH ApplyData
+                    // (go counts the encoded `SignedTxnInBlock`): admission
+                    // only saw the stripped size.
+                    let total: usize = payset
+                        .iter()
+                        .map(|stx| canonical_encode_signed_txn_in_block(stx).len())
+                        .sum();
+                    if total > self.max_txn_bytes {
+                        // Drop the last group (earlier results are
+                        // unaffected) and evaluate again.
+                        let Some(g) = groups.pop() else {
+                            return self.empty_payset();
+                        };
+                        pristine.truncate(g.start);
+                        self.fees_collected = self.fees_collected.saturating_sub(g.fees);
+                        dropped += 1;
+                        if pristine.is_empty() {
+                            return self.empty_payset();
+                        }
+                        continue;
+                    }
+                    self.txn_bytes = total;
                     if dropped > 0 {
                         warn!(
                             dropped_groups = dropped,
-                            "block assembly dropped groups the evaluator rejected"
+                            "block assembly dropped groups the evaluator rejected or that no longer fit"
                         );
                     }
+                    let counted = done.final_txn_counter.saturating_sub(self.hdr.txn_counter);
                     return Ok((payset, counted));
                 }
                 Err(ScratchFailure::Txn { index, error }) => {
@@ -1861,28 +1967,34 @@ impl SimpleBlockEvaluator {
                         .iter()
                         .position(|g| index >= g.start && index < g.start + g.len)
                     else {
-                        // Cannot attribute the failure to an admitted group.
                         warn!(index, error = %error, "block assembly: unattributable failure; proposing an empty payset");
+                        algo_ledger::proposal_eval::count_scratch_failure();
                         return self.empty_payset();
                     };
                     let g = groups.remove(pos);
                     warn!(index, error = %error, "block assembly: dropping group that fails evaluation");
-                    payset.drain(g.start..g.start + g.len);
+                    pristine.drain(g.start..g.start + g.len);
                     for later in groups.iter_mut().skip(pos) {
                         later.start -= g.len;
                     }
-                    self.txn_bytes = self.txn_bytes.saturating_sub(g.bytes);
                     self.fees_collected = self.fees_collected.saturating_sub(g.fees);
                     dropped += 1;
+                    if pristine.is_empty() {
+                        return self.empty_payset();
+                    }
                 }
-                Err(ScratchFailure::Other(e)) => {
-                    // Typically the ledger advanced under us: this block is
-                    // moot. Never propose an unchecked payset.
-                    warn!(error = %e, "block assembly: evaluation failed; proposing an empty payset");
-                    return self.empty_payset();
-                }
-                Err(ScratchFailure::Unsupported) => {
-                    warn!("block assembly: ledger cannot run a scratch evaluation; proposing an empty payset");
+                Err(failure) => {
+                    let cause = match &failure {
+                        ScratchFailure::Other(e) => e.to_string(),
+                        _ => "ledger cannot run a scratch evaluation".to_string(),
+                    };
+                    if !retried {
+                        retried = true;
+                        debug!(cause = %cause, "block assembly: transient evaluation failure; retrying once");
+                        continue;
+                    }
+                    warn!(cause = %cause, "block assembly: evaluation failed twice; proposing an empty payset");
+                    algo_ledger::proposal_eval::count_scratch_failure();
                     return self.empty_payset();
                 }
             }
@@ -1901,18 +2013,29 @@ impl SimpleBlockEvaluator {
     /// of the pending state. `restored` is the same group with genesis
     /// fields restored, used for txids in error text.
     ///
-    /// `Ok` also when the check could not run (stale base, time budget
-    /// spent, evaluator without exec state): the authoritative pass in
-    /// `generate_block` still polices what gets proposed.
+    /// The overlay and the admitted set must stay consistent: a group that
+    /// is admitted without having been evaluated would leave its effects
+    /// out of the overlay and later groups spending from it would be
+    /// wrongly rejected. So when the check cannot run (stale base, time
+    /// budget spent) the exec state is marked `incomplete` and every later
+    /// group is admitted on the cheap checks alone; `generate_block` stays
+    /// authoritative. A group whose evaluation fails for any other reason is
+    /// rejected (evaluation already rolled its effects out of the overlay).
     fn exec_group(
         &mut self,
         stibs: &[algo_types::SignedTransaction],
         restored: &[algo_types::SignedTransaction],
     ) -> Result<(), algo_error::AlgoError> {
+        use algo_ledger::proposal_eval::GroupEvalError;
+
         let Some(exec) = self.exec.as_mut() else {
             return Ok(());
         };
+        if exec.incomplete {
+            return Ok(());
+        }
         if exec.spent >= EXEC_ADMISSION_BUDGET {
+            exec.incomplete = true;
             return Ok(());
         }
         let started = std::time::Instant::now();
@@ -1923,43 +2046,33 @@ impl SimpleBlockEvaluator {
                 .map_err(|e| algo_error::AlgoError::Ledger {
                     message: format!("ledger lock poisoned: {e}"),
                 })?;
-            algo_ledger::proposal_eval::evaluate_group(
+            let r = algo_ledger::proposal_eval::evaluate_group(
                 &ledger,
                 &mut exec.overlay,
                 &exec.template,
                 stibs,
-            )
+            );
+            algo_ledger::proposal_eval::record_ledger_lock_hold(started.elapsed());
+            r
         };
         exec.spent += started.elapsed();
+        let txid_of = |i: usize| {
+            restored
+                .get(i)
+                .map(|r| algo_codec::compute_txn_id(&r.txn).to_string())
+                .unwrap_or_default()
+        };
         match outcome {
             Ok(eval) => {
                 debug_assert_eq!(eval.apply_data.len(), stibs.len());
                 Ok(())
             }
-            Err(algo_ledger::proposal_eval::GroupEvalError::Txn { index, error }) => {
-                let txid = restored
-                    .get(index)
-                    .map(|r| algo_codec::compute_txn_id(&r.txn).to_string())
-                    .unwrap_or_default();
-                // go: `fmt.Errorf("transaction %v: %w", txid, err)`.
-                let message = format!("transaction {txid}: {error}");
-                Err(match error.avm_eval_detail() {
-                    Some(d) => algo_error::AlgoError::AvmLogicSig {
-                        source: Box::new(error),
-                        message,
-                        pc: d.pc,
-                        group_index: d.group_index,
-                        app_index: d.app_index,
-                        eval_states: d.eval_states,
-                    },
-                    None => algo_error::AlgoError::Eval { message },
-                })
-            }
-            Err(algo_ledger::proposal_eval::GroupEvalError::Stale) => Ok(()),
-            Err(algo_ledger::proposal_eval::GroupEvalError::Other(e)) => {
-                warn!(error = %e, "pool group evaluation could not run; deferring to assembly");
+            Err(GroupEvalError::Txn { index, error }) => Err(go_rejection(&txid_of(index), error)),
+            Err(GroupEvalError::Stale) => {
+                exec.incomplete = true;
                 Ok(())
             }
+            Err(GroupEvalError::Other(e)) => Err(go_rejection(&txid_of(0), e)),
         }
     }
 
@@ -2568,7 +2681,6 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             exec.groups.push(ExecGroup {
                 start: self.included_txns.len(),
                 len: stibs.len(),
-                bytes: exact_bytes,
                 fees: group_fees,
             });
         }
@@ -2658,51 +2770,26 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             }
         };
 
-        // Build the block by propagating ALL header fields from self.hdr,
+        // Build the block from `header_block(&self.hdr)` (ALL header fields),
         // then overriding the computed fields (txn_counter, commitments,
         // payset). This ensures fee_sink, rewards_pool, rewards_level,
         // rewards_rate, rewards_residue, rewards_recalculation_round,
         // proposer, and all other header fields are preserved.
-        let hdr = &self.hdr;
         let mut block = algo_types::Block {
-            round: hdr.round,
-            branch: hdr.branch,
-            seed: hdr.seed,
-            timestamp: hdr.timestamp,
-            genesis_id: hdr.genesis_id.clone(),
-            genesis_hash: hdr.genesis_hash,
-            proposer: hdr.proposer,
-            fee_sink: hdr.fee_sink,
-            rewards_pool: hdr.rewards_pool,
-            rewards_level: hdr.rewards_level,
-            rewards_rate: hdr.rewards_rate,
-            rewards_residue: hdr.rewards_residue,
-            rewards_recalculation_round: hdr.rewards_recalculation_round,
-            current_protocol: hdr.current_protocol.clone(),
-            next_protocol: hdr.next_protocol.clone(),
-            next_protocol_approvals: hdr.next_protocol_approvals,
-            next_protocol_switch_on: hdr.next_protocol_switch_on,
-            next_protocol_vote_before: hdr.next_protocol_vote_before,
-            txn_counter: hdr.txn_counter.saturating_add(txn_count),
+            txn_counter: self.hdr.txn_counter.saturating_add(txn_count),
             fees_collected: self.fees_collected,
-            bonus: hdr.bonus,
-            proposer_payout: hdr.proposer_payout,
-            prev512: hdr.prev512,
-            state_proof_tracking: hdr.state_proof_tracking.clone(),
-            upgrade_propose: hdr.upgrade_propose.clone(),
-            upgrade_delay: hdr.upgrade_delay,
-            upgrade_approve: hdr.upgrade_approve,
             expired_participation_accounts: expired,
             absent_participation_accounts: absent,
             // CongestionTax was already advanced from prev round's Load/Tax by
             // make_next_block_header (go's MakeBlock → NextCongestionTax).
             // Load, however, depends on THIS round's own final payset size, so
             // it can only be computed now that self.txn_bytes reflects every
-            // included transaction — mirrors go's `endOfBlock`:
-            // `if eval.proto.LoadTracking { eval.block.BlockHeader.Load =
-            // ComputeLoad(eval.blockTxBytes, eval.proto.MaxTxnBytesPerBlock) }`.
-            // Uses the raw consensus MaxTxnBytesPerBlock (not the possibly
-            // smaller caller-provided `self.max_txn_bytes`), matching go.
+            // included transaction (with its ApplyData) — mirrors go's
+            // `endOfBlock`: `if eval.proto.LoadTracking {
+            // eval.block.BlockHeader.Load = ComputeLoad(eval.blockTxBytes,
+            // eval.proto.MaxTxnBytesPerBlock) }`. Uses the raw consensus
+            // MaxTxnBytesPerBlock (not the possibly smaller caller-provided
+            // `self.max_txn_bytes`), matching go.
             load: if self.consensus_params.load_tracking {
                 algo_ledger::compute_load(
                     self.txn_bytes as u64,
@@ -2711,12 +2798,8 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             } else {
                 0
             },
-            congestion_tax: hdr.congestion_tax,
             payset,
-            // Commitment fields are computed below.
-            txn_commitment: [0u8; 32],
-            txn256: [0u8; 32],
-            txn512: [0u8; 64],
+            ..header_block(&self.hdr)
         };
 
         // Compute the SHA-512/256 Merkle root (the primary `txn` commitment).
@@ -3187,6 +3270,7 @@ impl PoolLedgerAdapter {
                 template: header_block(&next_hdr),
                 groups: Vec::new(),
                 spent: Duration::ZERO,
+                incomplete: false,
             }
         };
 

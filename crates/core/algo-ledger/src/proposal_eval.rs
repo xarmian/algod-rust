@@ -28,6 +28,8 @@
 //! either keep the result or report the first failing transaction without
 //! leaving anything behind.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use algo_error::AlgoError;
 use algo_types::{Block, SignedTransaction};
 
@@ -83,7 +85,10 @@ pub fn evaluate_group(
 
     overlay.begin_group();
     let mut ad: Vec<ApplyData> = Vec::with_capacity(group.len());
-    let mut probe = ExecProbe::default();
+    let mut probe = ExecProbe {
+        skip_epilogue: true,
+        ..ExecProbe::default()
+    };
     let res = {
         let mut store = OverlayStore::new(base, overlay);
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -123,6 +128,70 @@ pub fn evaluate_group(
             }))
         }
     }
+}
+
+// ---- metrics (issue #1776) ----
+
+static SCRATCH_FAILURES: AtomicU64 = AtomicU64::new(0);
+static LOCK_HOLD_MAX_US: AtomicU64 = AtomicU64::new(0);
+static LOCK_HOLD_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+static LOCK_HOLD_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Count a block assembly that had to propose an empty payset because the
+/// scratch evaluation could not run (or could not be attributed).
+pub fn count_scratch_failure() {
+    SCRATCH_FAILURES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Scratch failures counted so far.
+pub fn scratch_failures() -> u64 {
+    SCRATCH_FAILURES.load(Ordering::Relaxed)
+}
+
+/// Record how long the ledger mutex was held for one pool/proposer
+/// evaluation (admission of one group, or the assembly scratch pass).
+pub fn record_ledger_lock_hold(held: std::time::Duration) {
+    let us = held.as_micros().min(u128::from(u64::MAX)) as u64;
+    LOCK_HOLD_MAX_US.fetch_max(us, Ordering::Relaxed);
+    LOCK_HOLD_TOTAL_US.fetch_add(us, Ordering::Relaxed);
+    LOCK_HOLD_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Prometheus text for the pool/proposer evaluation counters.
+pub fn proposal_metrics_prometheus_text() -> String {
+    let rows: [(&str, &str, &str, u64); 4] = [
+        (
+            "algod_rust_proposal_scratch_failures_total",
+            "counter",
+            "Block assemblies that proposed an empty payset because the scratch evaluation failed.",
+            SCRATCH_FAILURES.load(Ordering::Relaxed),
+        ),
+        (
+            "algod_rust_pool_eval_ledger_lock_hold_max_microseconds",
+            "gauge",
+            "Longest single hold of the ledger mutex by a pool/proposer evaluation.",
+            LOCK_HOLD_MAX_US.load(Ordering::Relaxed),
+        ),
+        (
+            "algod_rust_pool_eval_ledger_lock_hold_microseconds_total",
+            "counter",
+            "Total ledger mutex hold time of pool/proposer evaluations.",
+            LOCK_HOLD_TOTAL_US.load(Ordering::Relaxed),
+        ),
+        (
+            "algod_rust_pool_eval_ledger_lock_holds_total",
+            "counter",
+            "Number of pool/proposer evaluations that held the ledger mutex.",
+            LOCK_HOLD_COUNT.load(Ordering::Relaxed),
+        ),
+    ];
+    let mut out = String::new();
+    for (name, kind, help, value) in rows {
+        out.push_str(&format!(
+            "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"
+        ));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -259,5 +328,47 @@ mod tests {
             evaluate_group(&l, &mut ov, &t, &[pay(a, addr(2), 1, None)]),
             Err(GroupEvalError::Stale)
         ));
+    }
+
+    #[test]
+    fn per_group_evaluation_skips_the_block_epilogue() {
+        let a = addr(1);
+        let proposer = addr(0xAB);
+        let l = ledger(&[(a, funded(50_000_000)), (proposer, funded(1_000_000))]);
+        let mut t = template(&l);
+        // A proposer with a payout configured: the block epilogue would pay
+        // it out (once, in the final scratch apply), never per group.
+        t.proposer = proposer;
+        t.proposer_payout = 777_000;
+        let mut ov = PendingOverlay::new(&l);
+        evaluate_group(&l, &mut ov, &t, &[pay(a, addr(2), 200_000, None)]).expect("first");
+        evaluate_group(&l, &mut ov, &t, &[pay(a, addr(2), 300_000, None)]).expect("second");
+        let store = OverlayStore::new(&l, &mut ov);
+        assert_eq!(
+            store.get_account(&proposer).map(|p| p.micro_algos),
+            Some(1_000_000),
+            "the proposer payout is epilogue, not per-group evaluation"
+        );
+        assert_eq!(
+            store.current_round(),
+            Round(0),
+            "round bookkeeping is epilogue"
+        );
+    }
+
+    #[test]
+    fn failed_member_index_is_reported_for_a_transaction_apply_failure() {
+        let a = addr(1);
+        let l = ledger(&[(a, funded(5_000_000))]);
+        let t = template(&l);
+        let mut ov = PendingOverlay::new(&l);
+        let group = [
+            pay(a, addr(2), 200_000, None),
+            pay(addr(9), addr(2), 200_000, None),
+        ];
+        match evaluate_group(&l, &mut ov, &t, &group) {
+            Err(GroupEvalError::Txn { index, .. }) => assert_eq!(index, 1),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

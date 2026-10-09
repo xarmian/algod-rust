@@ -6701,7 +6701,12 @@ async fn raw_transaction_broadcast_error_returns_400() {
 /// the pool error verbatim, with no node-side prefix.
 #[tokio::test]
 async fn raw_transaction_pool_evaluator_rejection_body_matches_go() {
-    let go_text = "TransactionPool.Remember: transaction         H6YID47U5WQHWXIVEINCBNIXG7E6CMPKEVPSECLO76JMVYOOKSMQ:         cannot close: 1 outstanding assets";
+    // go: fmt.Errorf("TransactionPool.Remember: %w", fmt.Errorf("transaction %v: %w", txid, err))
+    let go_text = concat!(
+        "TransactionPool.Remember: transaction ",
+        "H6YID47U5WQHWXIVEINCBNIXG7E6CMPKEVPSECLO76JMVYOOKSMQ",
+        ": cannot close: 1 outstanding assets"
+    );
     let mut node = MockNode::synced();
     node.broadcast_result = Some(go_text.to_string());
     let server = TestServer::start(node).await;

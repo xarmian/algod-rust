@@ -757,6 +757,18 @@ fn compare<L: LedgerStore>(
     out
 }
 
+thread_local! {
+    static INJECT_SCRATCH_FAILURES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test hook: the next `n` calls of [`scratch_execute_payset`] ON THIS THREAD
+/// fail with a transient [`ScratchFailure::Other`] (exercises the proposer
+/// retry without racing other tests).
+#[doc(hidden)]
+pub fn inject_scratch_failures(n: u64) {
+    INJECT_SCRATCH_FAILURES.with(|c| c.set(n));
+}
+
 /// Result of [`scratch_execute_payset`].
 #[derive(Debug)]
 pub struct ScratchPayset {
@@ -793,6 +805,15 @@ pub fn scratch_execute_payset<L: LedgerStore>(
     store: &mut L,
     block: &Block,
 ) -> Result<ScratchPayset, ScratchFailure> {
+    if INJECT_SCRATCH_FAILURES.with(|c| {
+        let n = c.get();
+        c.set(n.saturating_sub(1));
+        n > 0
+    }) {
+        return Err(ScratchFailure::Other(AlgoError::Ledger {
+            message: "injected transient scratch failure".into(),
+        }));
+    }
     let Some(aux) = scratch_state(store) else {
         return Err(ScratchFailure::Unsupported);
     };

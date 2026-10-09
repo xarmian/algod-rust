@@ -1451,6 +1451,7 @@ fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
     mut tracer: Option<&mut dyn EvalTracer>,
     mut apply_data_out: Option<&mut Vec<ApplyData>>,
     global_txn_idx: &mut usize,
+    failed_txn: &mut Option<usize>,
 ) -> Result<(), AlgoError> {
     // Shared across every member of this atomic group so `gload`/`gloads`/
     // `gloadss` in a later transaction can see whether an earlier sibling
@@ -1462,8 +1463,12 @@ fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
     for (gi_idx, stx) in group.iter().enumerate() {
         ctx.txn_index.set(*global_txn_idx);
         if ctx.validate {
-            check_txn_alive(Round(ctx.round), stx)?;
-            check_authorizer(store, stx)?;
+            check_txn_alive(Round(ctx.round), stx).inspect_err(|_| {
+                *failed_txn = Some(*global_txn_idx);
+            })?;
+            check_authorizer(store, stx).inspect_err(|_| {
+                *failed_txn = Some(*global_txn_idx);
+            })?;
         }
         let gi = GroupInfo {
             txns: group,
@@ -1505,12 +1510,17 @@ fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
                 Some(&mut *group_box_budget),
                 Some(&gi),
                 tracer_ref,
-            )?;
+            )
+            .inspect_err(|_| {
+                *failed_txn = Some(*global_txn_idx);
+            })?;
             if let Some(out) = apply_data_out.as_deref_mut() {
                 out.push(ad);
             }
         } else {
-            let ad = apply_transaction(store, stx, ctx, 0)?;
+            let ad = apply_transaction(store, stx, ctx, 0).inspect_err(|_| {
+                *failed_txn = Some(*global_txn_idx);
+            })?;
             if let Some(out) = apply_data_out.as_deref_mut() {
                 out.push(ad);
             }
@@ -1619,8 +1629,15 @@ pub(crate) fn apply_block_impl_ex<L: crate::store_trait::LedgerStore>(
 /// apply has no reason to expose (block assembly, issue #1776).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ExecProbe {
-    /// Payset index of the transaction being applied when the apply failed
-    /// (`None` when it did not fail, or failed before the first transaction).
+    /// Input: apply only the transactions (go per-group `TransactionGroup`)
+    /// and skip the block epilogue (end-of-block participation updates,
+    /// proposer payout, `record_proposal`, round / protocol / txn-counter
+    /// bookkeeping, lease purge). The proposer runs that epilogue exactly
+    /// once, in the final scratch apply of the whole payset.
+    pub skip_epilogue: bool,
+    /// Payset index of the transaction whose apply failed. `None` when the
+    /// apply did not fail, or failed in a group-level step that no single
+    /// transaction owns.
     pub failed_txn_index: Option<usize>,
     /// The transaction counter after every top-level and inner transaction
     /// of the block (go's `block.TxnCounter`); only set on success.
@@ -1641,6 +1658,9 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
     scratch: bool,
     probe: Option<&mut ExecProbe>,
 ) -> Result<(), AlgoError> {
+    let skip_epilogue = probe.as_ref().is_some_and(|p| p.skip_epilogue);
+    // Index of the transaction whose apply failed (see `ExecProbe`).
+    let mut failed_txn: Option<usize> = None;
     // A block's payset stores each transaction without the genesis id/hash
     // (the header carries them; `hgi` marks whether the id was elided).
     // go decodes them back in (`DecodeSignedTxn`), so a program reading
@@ -1782,12 +1802,14 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         match ctx.mode {
             ApplyMode::Replay => {
                 // Replay mode: process transactions individually (no AVM execution).
-                for stx in &block.payset {
+                for (replay_idx, stx) in block.payset.iter().enumerate() {
                     if ctx.validate {
                         if let Err(e) = check_txn_alive(Round(ctx.round), stx) {
+                            failed_txn = Some(replay_idx);
                             break 'block Err(e);
                         }
                         if let Err(e) = check_authorizer(store, stx) {
+                            failed_txn = Some(replay_idx);
                             break 'block Err(e);
                         }
                     }
@@ -1797,7 +1819,10 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
                                 out.push(ad);
                             }
                         }
-                        Err(e) => break 'block Err(e),
+                        Err(e) => {
+                            failed_txn = Some(replay_idx);
+                            break 'block Err(e);
+                        }
                     }
                 }
             }
@@ -1922,6 +1947,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
                             tracer_reborrow,
                             apply_data_out.as_deref_mut(),
                             &mut global_txn_idx,
+                            &mut failed_txn,
                         ) {
                             break 'block Err(e);
                         }
@@ -1935,6 +1961,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
                         tracer_reborrow,
                         apply_data_out.as_deref_mut(),
                         &mut global_txn_idx,
+                        &mut failed_txn,
                     ) {
                         break 'block Err(e);
                     }
@@ -1994,9 +2021,8 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
     };
 
     if let Some(p) = probe {
-        if result.is_err() {
-            p.failed_txn_index = Some(ctx.txn_index.get());
-        } else {
+        p.failed_txn_index = if result.is_err() { failed_txn } else { None };
+        if result.is_ok() {
             p.final_txn_counter = ctx.txn_counter.get();
         }
     }
@@ -2009,6 +2035,12 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         store.set_fee_sink(prev_fee_sink);
         store.set_rewards_pool(prev_rewards_pool);
         return result;
+    }
+
+    // Per-group evaluation (the proposer pending evaluator) stops here: the
+    // block epilogue below runs once, over the whole payset.
+    if skip_epilogue {
+        return Ok(());
     }
 
     // ── End-of-block participation updates ──────────────────────────

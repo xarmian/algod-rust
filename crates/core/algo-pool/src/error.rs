@@ -533,4 +533,17 @@ mod tests {
         // Go has 19 tags in TxPoolErrTags
         assert_eq!(PoolErrorTag::ALL.len(), 19);
     }
+
+    /// go: `fmt.Errorf("TransactionPool.Remember: %w", err)` around the
+    /// evaluator `transaction %v: %w` error, with nothing in between.
+    #[test]
+    fn remember_of_txn_rejection_displays_go_text_exactly() {
+        let inner = PoolError::TxnRejected(
+            "transaction H6YID47U5WQHWXIVEINCBNIXG7E6CMPKEVPSECLO76JMVYOOKSMQ: cannot close: 1 outstanding assets".to_string(),
+        );
+        assert_eq!(
+            PoolError::Remember(Box::new(inner)).to_string(),
+            "TransactionPool.Remember: transaction H6YID47U5WQHWXIVEINCBNIXG7E6CMPKEVPSECLO76JMVYOOKSMQ: cannot close: 1 outstanding assets"
+        );
+    }
 }
