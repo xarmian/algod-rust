@@ -2221,6 +2221,13 @@ pub struct SqliteLedger {
     /// transactions that reuse them as duplicates until expiry. `None` outside a
     /// `begin_block`/`commit_block` span.
     lease_snapshot: Option<LeaseTable>,
+    /// In-memory chain-level fields captured at `begin_block`, restored by
+    /// `rollback_block` / a failed commit. `apply` advances them
+    /// (`set_current_round`, `set_protocol`, ...) before the SQL transaction
+    /// is decided, and the SQL ROLLBACK does not undo them, so without this a
+    /// rolled-back block left `current_round` one ahead of the committed
+    /// state (`ensure_block` would then treat a retry as already committed).
+    chain_snapshot: Option<ChainSnapshot>,
     /// Cached chain-level state (loaded from DB, flushed on commit).
     current_round: Round,
     /// See [`crate::store_trait::LedgerStore::earliest_round`]. Not
@@ -2378,9 +2385,29 @@ pub struct SqliteLedger {
     /// Issue #1758: lock-free view of the committed tip, published after each
     /// successful `commit_block` and invalidated by ledger mutations that do
     /// not go through that publication. See [`crate::committed_tip`].
-    committed_tip: crate::committed_tip::CommittedTipHandle,
+    pub(crate) committed_tip: crate::committed_tip::CommittedTipHandle,
+    /// Set while `commit_block` runs: inner label writes only invalidate; the
+    /// single publication happens at the end of the commit.
+    pub(crate) suppress_tip_publish: bool,
     /// Publisher id of this ledger instance for `committed_tip`.
     tip_owner: u64,
+}
+
+/// The in-memory chain-level fields `apply` advances (see
+/// `SqliteLedger::chain_snapshot`).
+#[derive(Clone)]
+struct ChainSnapshot {
+    current_round: Round,
+    rewards_level: u64,
+    rewards_rate: u64,
+    rewards_residue: u64,
+    rewards_recalculation_round: u64,
+    fee_sink: Address,
+    rewards_pool: Address,
+    genesis_id: String,
+    genesis_hash: [u8; 32],
+    protocol: String,
+    txn_counter: u64,
 }
 
 /// Log a failed committed-tip publication: WARN at most once a minute, DEBUG
@@ -2391,15 +2418,10 @@ fn warn_tip_publish_failed(err: &AlgoError) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let last = LAST_WARN_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    let last = LAST_WARN_SECS.load(Ordering::Relaxed);
     if now.saturating_sub(last) >= 60
         && LAST_WARN_SECS
-            .compare_exchange(
-                last,
-                now,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            )
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
     {
         tracing::warn!("committed tip not published (readers use the locked path): {err}");
@@ -2896,6 +2918,7 @@ impl SqliteLedger {
             db_prefix,
             lease_table: LeaseTable::new(),
             lease_snapshot: None,
+            chain_snapshot: None,
             current_round,
             earliest_round: Round(0),
             rewards_level,
@@ -2926,6 +2949,7 @@ impl SqliteLedger {
             retention: crate::store_trait::RetentionConfig::default(),
             last_commit_wall_time: None,
             committed_tip: crate::committed_tip::CommittedTipHandle::default(),
+            suppress_tip_publish: false,
             tip_owner: crate::committed_tip::next_owner_id(),
         })
     }
@@ -3227,6 +3251,7 @@ impl SqliteLedger {
         // Snapshot the in-memory lease table so rollback_block can restore it —
         // the SQLite/trie transaction does not cover it.
         self.lease_snapshot = Some(self.lease_table.clone());
+        self.chain_snapshot = Some(self.capture_chain_snapshot());
         self.in_block = true;
         // Issue #523: start this block's `accounttotals` delta accumulator
         // clean. Guards against `set_account`/`remove_account` calls made
@@ -3781,10 +3806,16 @@ impl SqliteLedger {
         // Hard bound on any scratch-apply undo journal left open by a panic
         // between save and restore: it must never survive a commit.
         self.lease_table.discard_undo();
+        self.suppress_tip_publish = true;
         let result = self.commit_block_uncleaned();
+        self.suppress_tip_publish = false;
         if result.is_err() {
             self.reset_after_failed_commit();
-        } else if self.current_round.0 > 0 {
+        } else {
+            // The block is committed: its pre-block snapshot is dead.
+            self.chain_snapshot = None;
+        }
+        if result.is_ok() && self.current_round.0 > 0 {
             // Issue #1592: stamp the commit instant here, not on some
             // later REST poll -- see `last_commit_wall_time`'s doc comment.
             //
@@ -3844,7 +3875,9 @@ impl SqliteLedger {
     /// publication. Dropping a ledger that never published (a failed reload)
     /// does not touch the live tip.
     pub fn swap_in_reloaded(slot: &mut SqliteLedger, fresh: SqliteLedger) {
-        let tip = slot.committed_tip_handle();
+        // Take the handle WITHOUT seeding/publishing: the replaced ledger's
+        // database is going away, so anything it would publish is stale.
+        let tip = slot.committed_tip.clone();
         *slot = fresh;
         slot.adopt_committed_tip_handle(tip);
     }
@@ -3863,16 +3896,22 @@ impl SqliteLedger {
     /// path both use this, so they cannot disagree (a `set_protocol` without a
     /// commit changes neither).
     pub fn committed_protocol(&self) -> String {
-        if !self.in_block {
-            if let Ok(Some(round)) = self.last_committed_round() {
-                if let Ok(Some(h)) = self.get_block_header(round) {
-                    if !h.current_protocol.is_empty() {
-                        return h.current_protocol;
-                    }
-                }
+        let header = match self.last_committed_round() {
+            Ok(Some(round)) => self.get_block_header(round).ok().flatten(),
+            _ => None,
+        };
+        self.protocol_from_committed_header(header.as_ref())
+    }
+
+    /// [`Self::committed_protocol`] for a caller that already fetched the
+    /// latest committed header (avoids a second round read and header decode).
+    pub fn protocol_from_committed_header(&self, header: Option<&BlockHeader>) -> String {
+        match header {
+            Some(h) if !self.in_block && !h.current_protocol.is_empty() => {
+                h.current_protocol.clone()
             }
+            _ => self.protocol.clone(),
         }
-        self.protocol.clone()
     }
 
     /// Build the tip from committed state read back from the database, THEN
@@ -3902,10 +3941,7 @@ impl SqliteLedger {
                 return Ok(None);
             }
             let latest_header = self.get_block_header(round)?.map(Arc::new);
-            let protocol = match latest_header.as_ref() {
-                Some(h) if !h.current_protocol.is_empty() => h.current_protocol.clone(),
-                _ => self.protocol.clone(),
-            };
+            let protocol = self.protocol_from_committed_header(latest_header.as_deref());
             let last_catchpoint_label = match previous {
                 Some(p) => p.last_catchpoint_label.clone(),
                 None => self.last_catchpoint_label()?,
@@ -3980,6 +4016,7 @@ impl SqliteLedger {
             }
         }
         self.in_block = false;
+        self.restore_chain_snapshot();
         // Reload the trie from the last committed state -- any in-memory
         // mutations `commit_block_uncleaned` applied belong to the round
         // that just failed to commit.
@@ -4156,6 +4193,7 @@ impl SqliteLedger {
         // the commit re-publishes it).
         self.committed_tip
             .invalidate_if_owner(self.tip_owner, "catchpoint label write");
+        let publish_after = !self.suppress_tip_publish;
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO catchpointstate(id, strval) VALUES(?1, ?2)",
@@ -4164,7 +4202,9 @@ impl SqliteLedger {
             .map_err(|e| AlgoError::Ledger {
                 message: format!("set_last_catchpoint_label: {e}"),
             })?;
-        self.publish_committed_tip(None);
+        if publish_after {
+            self.publish_committed_tip(None);
+        }
         Ok(())
     }
 
@@ -4617,6 +4657,7 @@ impl SqliteLedger {
                 message: format!("rollback block error: {e}"),
             })?;
         self.in_block = false;
+        self.restore_chain_snapshot();
 
         // Reload the trie from the last committed state (DB was rolled back).
         if self.trie.is_some() {
@@ -4624,6 +4665,38 @@ impl SqliteLedger {
         }
 
         Ok(())
+    }
+
+    fn capture_chain_snapshot(&self) -> ChainSnapshot {
+        ChainSnapshot {
+            current_round: self.current_round,
+            rewards_level: self.rewards_level,
+            rewards_rate: self.rewards_rate,
+            rewards_residue: self.rewards_residue,
+            rewards_recalculation_round: self.rewards_recalculation_round,
+            fee_sink: self.fee_sink,
+            rewards_pool: self.rewards_pool,
+            genesis_id: self.genesis_id.clone(),
+            genesis_hash: self.genesis_hash,
+            protocol: self.protocol.clone(),
+            txn_counter: self.txn_counter,
+        }
+    }
+
+    fn restore_chain_snapshot(&mut self) {
+        if let Some(c) = self.chain_snapshot.take() {
+            self.current_round = c.current_round;
+            self.rewards_level = c.rewards_level;
+            self.rewards_rate = c.rewards_rate;
+            self.rewards_residue = c.rewards_residue;
+            self.rewards_recalculation_round = c.rewards_recalculation_round;
+            self.fee_sink = c.fee_sink;
+            self.rewards_pool = c.rewards_pool;
+            self.genesis_id = c.genesis_id;
+            self.genesis_hash = c.genesis_hash;
+            self.protocol = c.protocol;
+            self.txn_counter = c.txn_counter;
+        }
     }
 
     /// Get the last committed round (for resume capability).
@@ -7366,7 +7439,7 @@ impl LedgerStore for SqliteLedger {
         fn unreadable(table: &str, e: &dyn std::fmt::Display) -> Option<u64> {
             static WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
-            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if !WARNED.swap(true, Ordering::Relaxed) {
                 tracing::error!(
                     "tracker_rows_fingerprint: cannot read {table}: {e}; scratch invariant checks that need it are skipped"
                 );

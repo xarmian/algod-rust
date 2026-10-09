@@ -146,6 +146,12 @@ impl CommittedTipHandle {
         (tip.generation == self.shared.generation.load(Ordering::Acquire)).then(|| Arc::clone(tip))
     }
 
+    /// Current validity generation (bumped by every publish and invalidation).
+    #[cfg(test)]
+    pub(crate) fn generation(&self) -> u64 {
+        self.shared.generation.load(Ordering::Acquire)
+    }
+
     /// Fallbacks counted through this handle.
     pub fn fallbacks(&self) -> u64 {
         self.shared.fallbacks.load(Ordering::Relaxed)

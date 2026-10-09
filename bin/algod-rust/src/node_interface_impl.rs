@@ -979,17 +979,25 @@ impl AlgodNodeInterface {
 
     /// The locked (mutex-holding) body of [`Self::read_status_snapshot`].
     fn read_status_snapshot_locked(&self) -> Result<StatusSnapshot, NodeError> {
-        let ledger = self.lock_ledger("status")?;
+        let mut ledger = self.lock_ledger("status")?;
+        // Issue #1758: seed the lock-free tip from the locked path too (the
+        // try_lock-only resolution rarely wins on a busy node).
+        self.committed_tip.seed(&mut ledger);
         let last_round = ledger
             .last_committed_round()
             .map_err(|e| NodeError::Internal(format!("last_committed_round: {e}")))?
             .unwrap_or(0);
-        // Same source as the published tip: the committed header's protocol.
-        let protocol = self.resolve_protocol_str(&ledger.committed_protocol());
         let latest_header = ledger
             .get_block_header(last_round)
             .map_err(|e| NodeError::Internal(format!("get_block_header({last_round}): {e}")))?
             .map(Arc::new);
+        // `/v2/status` reports the protocol of the last COMMITTED block (go
+        // reports the last committed block's consensus version), taken from
+        // the header fetched above: the same single source as the published
+        // tip. `resolve_protocol` (the in-memory protocol) serves the other
+        // endpoints and is identical whenever no block is open.
+        let protocol = self
+            .resolve_protocol_str(&ledger.protocol_from_committed_header(latest_header.as_deref()));
         // go: `ledger.GetLastCatchpointLabel()`, read unconditionally here
         // (not gated on whether a `LiveCatchupManager` is attached) —
         // `SqliteLedger::last_catchpoint_label` is the ledger's own
@@ -1255,7 +1263,8 @@ impl NodeInterface for AlgodNodeInterface {
             let last = match self.committed_tip.read(&self.ledger) {
                 Some(tip) => tip.round,
                 None => {
-                    let ledger = self.lock_ledger("wait_for_round")?;
+                    let mut ledger = self.lock_ledger("wait_for_round")?;
+                    self.committed_tip.seed(&mut ledger);
                     ledger
                         .last_committed_round()
                         .map_err(|e| NodeError::Internal(format!("last_committed_round: {e}")))?
@@ -3457,6 +3466,56 @@ mod tests {
         release_tx.send(()).unwrap();
         holder.join().unwrap();
         res.expect("wait_for_round blocked while the ledger mutex was held")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// Issue #1758: a busy node's `try_lock` rarely wins, so the first locked
+    /// status call must seed the tip and the next call must be lock-free.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn locked_fallback_seeds_the_tip_for_the_next_status_call() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let adapter = Arc::new(make_adapter_with_ledger(ledger.clone()));
+        apply_one_trivial_block(&ledger, 1);
+
+        // First call: the ledger lock is held, so try_lock cannot resolve the
+        // handle and the call falls back to the (blocking) locked path.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let held = ledger.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(60));
+        });
+        locked_rx.recv().unwrap();
+        let a = adapter.clone();
+        let first = tokio::spawn(async move { a.status().await });
+        tokio::task::yield_now().await;
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        first.await.unwrap().unwrap();
+        assert!(
+            adapter.committed_tip.handle().is_some(),
+            "locked path seeded"
+        );
+
+        // Second call while the lock is held again: lock-free.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let held = ledger.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(60));
+        });
+        locked_rx.recv().unwrap();
+        let a = adapter.clone();
+        let second = tokio::spawn(async move { a.status().await });
+        let res = tokio::time::timeout(Duration::from_secs(10), second).await;
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        res.expect("second status call blocked on the ledger mutex")
             .unwrap()
             .unwrap();
     }

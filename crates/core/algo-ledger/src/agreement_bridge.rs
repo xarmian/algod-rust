@@ -491,7 +491,7 @@ impl LedgerReader for AgreementLedgerBridge {
         if let Some(tip) = self.tip.read(&self.ledger) {
             return Round(tip.round.saturating_add(1));
         }
-        let ledger = match self.ledger.lock() {
+        let mut ledger = match self.ledger.lock() {
             Ok(l) => l,
             Err(e) => {
                 warn!("ledger lock poisoned in next_round: {e}");
@@ -499,6 +499,9 @@ impl LedgerReader for AgreementLedgerBridge {
                 return Round(0);
             }
         };
+        // Issue #1758: on a busy node the try_lock above rarely wins, so seed
+        // the tip from the locked path too.
+        self.tip.seed(&mut ledger);
         // next_round = current_round + 1 (current_round is the last committed)
         Round(ledger.current_round().0.saturating_add(1))
     }
@@ -2354,19 +2357,21 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "benchmark: prints the per-publish cost"]
     fn commit_publish_cost_is_small() {
         // Measures the extra work commit_block now does under the ledger
         // mutex (round + header + label reads); reported in the PR body.
         let mut l = SqliteLedger::open_in_memory().unwrap();
         let _tip = l.committed_tip_handle();
-        let n = 2000u32;
+        let n = 200u32;
         let started = std::time::Instant::now();
         for _ in 0..n {
             l.republish_committed_tip();
         }
         let per = started.elapsed() / n;
         eprintln!("committed tip publish: {per:?} per call");
+        // Very loose bound (measured around 10 us); only catches a gross
+        // regression such as a per-publish full-table scan.
+        assert!(per < Duration::from_millis(10), "publish took {per:?}");
     }
 
     // -- Issue #1758 round 3: invariants --
@@ -2491,5 +2496,53 @@ mod tests {
         assert!(handle.get().is_none(), "set_protocol made the tip stale");
         ledger.lock().unwrap().republish_committed_tip();
         assert_eq!(handle.get().unwrap().protocol, committed);
+    }
+
+    #[test]
+    fn rollback_restores_in_memory_chain_state_so_fast_and_locked_next_round_agree() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+        bridge.ensure_block(&make_round1_block(), &make_cert_with_proposal(1));
+        // A block whose apply advanced the in-memory round and then failed to
+        // commit: begin, apply round 2, roll back.
+        {
+            let mut l = ledger.lock().unwrap();
+            l.begin_block().unwrap();
+            let mut b = make_round1_block();
+            b.round = Round(2);
+            l.apply_block_caching_delta(&b).unwrap();
+            assert_eq!(l.current_round().0, 2);
+            l.rollback_block().unwrap();
+            assert_eq!(l.current_round().0, 1, "rollback must undo the round");
+            assert_eq!(l.committed_protocol(), l.protocol());
+        }
+        let fast = bridge.next_round();
+        let locked = Round(ledger.lock().unwrap().current_round().0 + 1);
+        assert_eq!(fast, Round(2));
+        assert_eq!(locked, fast);
+    }
+
+    #[test]
+    fn swap_in_reloaded_does_not_publish_from_the_replaced_ledger() {
+        let old = SqliteLedger::open_in_memory().unwrap();
+        let mut slot = old;
+        let handle = slot.committed_tip.clone();
+        let before = handle.generation();
+        SqliteLedger::swap_in_reloaded(&mut slot, SqliteLedger::open_in_memory().unwrap());
+        // Only the new ledger's adopt publication; the old ledger neither
+        // seeded nor published a (possibly stale) tip.
+        assert_eq!(handle.generation(), before + 1);
+    }
+
+    #[test]
+    fn label_write_during_commit_does_not_publish_a_second_tip() {
+        let mut l = SqliteLedger::open_in_memory().unwrap();
+        let handle = l.committed_tip_handle();
+        let before = handle.generation();
+        l.suppress_tip_publish = true;
+        l.set_last_catchpoint_label("1#X").unwrap();
+        l.suppress_tip_publish = false;
+        // Invalidation only; the single publish happens at the end of commit.
+        assert_eq!(handle.generation(), before + 1);
     }
 }
