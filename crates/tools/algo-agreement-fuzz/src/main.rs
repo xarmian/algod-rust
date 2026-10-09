@@ -43,6 +43,7 @@ use std::time::Duration;
 use algo_agreement::{Period, Seed, DOWN, PROPOSE};
 use algo_agreement_fuzz::inject::{inject_one, InjectionOutcome, InjectorConfig};
 use algo_agreement_fuzz::inject_p2p::{capture_proposal_p2p, inject_one_p2p, P2pInjectorConfig};
+use algo_agreement_fuzz::round_search::{RoundSearch, SearchStep};
 use algo_agreement_fuzz::{
     baseline_and_faulted, bottom, committee_weight, corrupt_proposal, encode_compound_message,
     encode_vote, synthetic_proposal_value, OtsDomain, ParticipationSecrets, ProposalFault,
@@ -111,10 +112,18 @@ struct Cli {
     #[arg(long, default_value_t = 20)]
     observe_secs: u64,
 
-    /// How many rounds to search for a zero-weight selector
-    /// (`wrong-committee-weight` only).
-    #[arg(long, default_value_t = 40)]
-    weight_search_rounds: u64,
+    /// Cap on distinct rounds evaluated while searching for a zero-weight
+    /// selector (`wrong-committee-weight` only); 0 = no cap, bounded only by
+    /// `--weight-search-secs`.
+    #[arg(long, default_value_t = 0)]
+    weight_search_rounds: usize,
+
+    /// Wall-clock bound, in seconds, for the zero-weight round search
+    /// (`wrong-committee-weight` only). An account with ~10% stake misses a
+    /// round ~13.5% of the time, so 300 s (~110 rounds at 2.7 s/round) makes
+    /// a false failure vanishingly unlikely (#1778).
+    #[arg(long, default_value_t = 300)]
+    weight_search_secs: u64,
 
     /// Seconds to wait for a real proposal to capture (`malformed-proposal`).
     #[arg(long, default_value_t = 60)]
@@ -506,28 +515,45 @@ async fn run_vote_case(
         // Search forward for a round where this account misses the proposer
         // committee. Only rounds within the freshness window are usable, so the
         // search polls the node until such a round becomes current.
+        // Only distinct rounds count as draws and the search is bounded by
+        // wall-clock time, not a fixed probe count (#1778).
+        let mut search = RoundSearch::new(
+            Duration::from_secs(cli.weight_search_secs),
+            cli.weight_search_rounds,
+        );
+        let started = std::time::Instant::now();
         let mut found = None;
-        for _ in 0..cli.weight_search_rounds {
+        let mut exhausted = 0usize;
+        loop {
             let last = algod.last_round().await?;
-            let round = Round(last.0 + 2);
-            let seed = algod
-                .seed(algo_agreement::seed_round(round, &params))
-                .await?;
-            let mut probe = ctx.clone();
-            probe.round = round;
-            probe.seed = seed;
-            probe.proposal = synthetic_proposal_value(sender, round, Period(0));
-            if committee_weight(&probe, secrets) == 0 {
-                found = Some(probe);
-                break;
+            match search.step(last.0, started.elapsed()) {
+                SearchStep::Probe(r) => {
+                    let round = Round(r);
+                    let seed = algod
+                        .seed(algo_agreement::seed_round(round, &params))
+                        .await?;
+                    let mut probe = ctx.clone();
+                    probe.round = round;
+                    probe.seed = seed;
+                    probe.proposal = synthetic_proposal_value(sender, round, Period(0));
+                    if committee_weight(&probe, secrets) == 0 {
+                        found = Some(probe);
+                        break;
+                    }
+                }
+                SearchStep::Wait => {}
+                SearchStep::Exhausted { distinct_rounds } => {
+                    exhausted = distinct_rounds;
+                    break;
+                }
             }
             tokio::time::sleep(Duration::from_millis(900)).await;
         }
         ctx = found.ok_or_else(|| {
             anyhow!(
-                "account won a proposer seat in every one of the {} rounds probed; \
-                 rerun (the search is stochastic)",
-                cli.weight_search_rounds
+                "account won a proposer seat in every one of the {exhausted} distinct rounds \
+                 probed over {}s (--weight-search-secs); no zero-weight round exists within the bound",
+                cli.weight_search_secs
             )
         })?;
     }

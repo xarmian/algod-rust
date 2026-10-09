@@ -299,10 +299,6 @@ jobs:
           ROUNDS: ${{ needs.plan.outputs.rounds }}
           WORKLOAD: ${{ needs.plan.outputs.workload }}
           WORKLOAD_SEED: ${{ needs.plan.outputs.seed }}
-          # Explicit, recorded (WARN row cert_window_clamped) workaround for
-          # #1777: on runs over 900 rounds cert cross-verify only covers the
-          # last 900 rounds.
-          CERT_WINDOW: ${{ fromJSON(needs.plan.outputs.rounds) > 900 && '900' || '0' }}
           GO_ALGORAND_DIR: ${{ runner.temp }}/go-algorand-src
         run: make consensus-cluster-test RESTART_SCENARIOS=1 NEGATIVE_CASES=1
 

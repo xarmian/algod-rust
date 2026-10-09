@@ -337,6 +337,10 @@ if [ "$RUN_CERT" = "1" ]; then
                 echo "error: failed to docker cp the block snapshot." >&2
                 exit 4
             fi
+            # Lowest block round the Rust ledger retains (#1777).
+            RUST_EARLIEST="$(docker exec phase6-rust-node-4 sqlite3 \
+                    /app/verify-soak-block.sqlite 'SELECT MIN(rnd) FROM blocks' \
+                    2>/dev/null | tr -d '\r' || true)"
             # Clean up the in-container snapshots; don't leak volume
             # space across runs. `rm -f` is safe even if a file vanished.
             docker exec phase6-rust-node-4 rm -f \
@@ -382,16 +386,24 @@ if [ "$RUN_CERT" = "1" ]; then
         CERT_EXTRA_ARGS+=(--export-go-input "$GO_INPUT")
         echo "    rust participant: $RUST_ACCOUNT (>= $MIN_RUST_VOTE_ROUNDS cert(s) must carry its vote)"
     fi
-    # OPT-IN workaround for issue #1777 (the Rust ledger did not serve round 1
-    # on a 2700-round run). CERT_WINDOW=N (default 0 = off) restricts the cert
-    # pass to the last N rounds; the fork detector still covers the whole
-    # range. The clamp is never silent: the line below is grepped by
-    # consensus-conformance.sh into a WARN row of the summary.
+    # Issue #1777: a non-archival Rust node (like a non-archival go node) keeps
+    # only the last ~1001 blocks, so the cert pass must not start before the
+    # earliest block the Rust snapshot actually holds. The window is DERIVED
+    # from the snapshot (RUST_EARLIEST, lowest block round) by cert_window.py;
+    # PHASE6_GO_ARCHIVAL=1 runs make the Rust node archival too (start.sh), so
+    # they cover the whole range. CERT_WINDOW=N (default 0 = off) additionally
+    # restricts the pass to the last N rounds. A clamp is never silent: the
+    # CERT_WINDOW_CLAMPED line is grepped by consensus-conformance.sh into a
+    # WARN row of the summary. The fork detector still covers the whole range.
     CERT_WINDOW="${CERT_WINDOW:-0}"
-    CERT_FROM="$FROM_ROUND"
-    if [ "$CERT_WINDOW" -gt 0 ] && [ $((TO_ROUND - CERT_FROM)) -gt "$CERT_WINDOW" ]; then
-        CERT_FROM=$((TO_ROUND - CERT_WINDOW))
-        echo "    CERT_WINDOW_CLAMPED=1 cert cross-verify covers $CERT_FROM..$TO_ROUND only (requested $FROM_ROUND..$TO_ROUND, CERT_WINDOW=$CERT_WINDOW, workaround for #1777)"
+    CERT_RETAIN_MARGIN="${CERT_RETAIN_MARGIN:-100}"
+    if [ -z "${RUST_EARLIEST:-}" ] && [ -s "${BLOCK_PATH:-/nonexistent}" ] && command -v sqlite3 >/dev/null 2>&1; then
+        RUST_EARLIEST="$(sqlite3 "$BLOCK_PATH" 'SELECT MIN(rnd) FROM blocks' 2>/dev/null | tr -d '\r' || true)"
+    fi
+    read -r CERT_FROM CERT_CLAMPED CERT_REASON < <(python3 "$HERE/cert_window.py" \
+        "$FROM_ROUND" "$TO_ROUND" "${RUST_EARLIEST:-none}" "$CERT_RETAIN_MARGIN" "$CERT_WINDOW" | tr -d '\r')
+    if [ "$CERT_CLAMPED" = "1" ]; then
+        echo "    CERT_WINDOW_CLAMPED=1 cert cross-verify covers $CERT_FROM..$TO_ROUND only (requested $FROM_ROUND..$TO_ROUND): $CERT_REASON"
     fi
     set +e
     "$CERT_BIN" \
