@@ -22,7 +22,7 @@
 //!
 //! Mirrors `go-algorand/data/pools/transactionPool.go`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -67,6 +67,11 @@ struct AssemblyResults {
 
 // ── Inner state (behind `mu`) ────────────────────────────────────
 
+/// How many blocks' committed-txid sets a paused pool remembers (issue
+/// #1683). Roughly `MaxTxnLife`-scale; older blocks' transactions have
+/// expired from the pending set anyway.
+const MAX_PAUSED_BLOCKS: usize = 1000;
+
 /// State protected by the main mutex (`mu`).
 ///
 /// Matches the fields that live behind `pool.mu` in go-algorand.
@@ -88,6 +93,19 @@ struct PoolInner {
     /// `recompute_block_evaluator`) is a no-op, and admission fails with
     /// [`PoolError::NodeCatchingUp`].
     evaluator_paused: bool,
+
+    /// Set when the evaluator was paused and not yet rebuilt: `remember` and
+    /// `test` then rebuild it on demand (once unpaused) instead of failing
+    /// with `NoPendingBlockEvaluator` until some later block arrives. A pool
+    /// that was never paused keeps go's behaviour (no evaluator until the
+    /// first `on_new_block`).
+    reprime_on_demand: bool,
+
+    /// Committed-txid sets of the blocks that arrived while paused (bounded to
+    /// [`MAX_PAUSED_BLOCKS`]); merged into the next recompute so groups those
+    /// blocks confirmed are recorded as confirmed, not re-evaluated into an
+    /// error.
+    paused_committed: VecDeque<HashSet<Digest>>,
 
     /// Number of "whole blocks" worth of transactions that have accumulated.
     /// Drives the exponential fee ramp.
@@ -184,6 +202,8 @@ impl TransactionPool {
             remembered_txids: HashMap::new(),
             evaluator: None,
             evaluator_paused: false,
+            reprime_on_demand: false,
+            paused_committed: VecDeque::new(),
             num_pending_whole_blocks: 0,
             fee_threshold_multiplier: 0,
             stateproof_overflowed: false,
@@ -390,6 +410,7 @@ impl TransactionPool {
         if guard.evaluator_paused {
             return Err(PoolError::NodeCatchingUp);
         }
+        self.maybe_reprime(guard);
         if guard.evaluator.is_none() {
             return Err(PoolError::NoPendingBlockEvaluator);
         }
@@ -507,6 +528,21 @@ impl TransactionPool {
             return;
         }
 
+        // Blocks that committed while paused: their transactions count as
+        // committed too (confirmed marker in the status cache, not a
+        // re-evaluation error).
+        let merged_committed: HashSet<Digest>;
+        let committed_txids = if inner.paused_committed.is_empty() {
+            committed_txids
+        } else {
+            let mut all = committed_txids.clone();
+            for set in inner.paused_committed.drain(..) {
+                all.extend(set);
+            }
+            merged_committed = all;
+            &merged_committed
+        };
+
         let latest = self.ledger.latest();
         let prev_hdr = match self.ledger.block_hdr(latest) {
             Ok(hdr) => hdr,
@@ -541,6 +577,7 @@ impl TransactionPool {
             Err(_) => return, // Cannot start evaluator; leave pool without one
         };
         inner.evaluator = Some(new_eval);
+        inner.reprime_on_demand = false;
 
         // Clear remembered state -- we are rebuilding from scratch.
         inner.remembered_tx_groups = Vec::new();
@@ -800,11 +837,12 @@ impl TransactionPool {
         algo_types::genesis_restore::reject_in_block_flags(tx_group)?;
         self.check_pending_queue_size(tx_group)?;
 
-        let inner = self.mu.lock();
+        let mut inner = self.mu.lock();
 
         if inner.evaluator_paused {
             return Err(PoolError::NodeCatchingUp);
         }
+        self.maybe_reprime(&mut inner);
         if let Some(ref evaluator) = inner.evaluator {
             evaluator
                 .test_transaction_group(tx_group)
@@ -859,8 +897,15 @@ impl TransactionPool {
 
         // Issue #1683: a block that commits while the node is paused for a
         // catchup must not rebuild the evaluator (that would re-pin the WAL).
-        // Nothing needs remembering: resuming rebuilds from `ledger.latest()`.
+        // Do the evaluator-free bookkeeping now and remember which
+        // transactions the block confirmed, for the rebuild on resume.
         if inner.evaluator_paused {
+            self.adjust_fee_threshold(&mut inner);
+            inner.num_pending_whole_blocks = 0;
+            if inner.paused_committed.len() >= MAX_PAUSED_BLOCKS {
+                inner.paused_committed.pop_front();
+            }
+            inner.paused_committed.push_back(committed_txids.clone());
             self.cond.notify_all();
             return;
         }
@@ -872,31 +917,7 @@ impl TransactionPool {
         };
 
         if should_process {
-            // Adjust the pool fee threshold. The rules are:
-            // - If there was less than one full block in the pool, reduce
-            //   the multiplier by 2x. It will eventually go to 0, so that
-            //   only the flat MinTxnFee matters if the pool is idle.
-            // - If there were less than two full blocks in the pool, keep
-            //   the multiplier as-is.
-            // - If there were two or more full blocks in the pool, grow
-            //   the multiplier by 2x (or increment by 1, if 0).
-            match inner.num_pending_whole_blocks {
-                0 => {
-                    inner.fee_threshold_multiplier /= self.config.exponential_increase_factor;
-                }
-                1 => {
-                    // Keep the fee multiplier the same.
-                }
-                _ => {
-                    if inner.fee_threshold_multiplier == 0 {
-                        inner.fee_threshold_multiplier = 1;
-                    } else {
-                        inner.fee_threshold_multiplier = inner
-                            .fee_threshold_multiplier
-                            .saturating_mul(self.config.exponential_increase_factor);
-                    }
-                }
-            }
+            self.adjust_fee_threshold(&mut inner);
 
             // Recompute the pool by starting from the new latest block.
             // This has the side-effect of discarding transactions that
@@ -907,6 +928,45 @@ impl TransactionPool {
         // Wake any threads waiting in ingest() for the evaluator to catch up.
         // Mirrors Go's `defer pool.cond.Broadcast()` in OnNewBlock().
         self.cond.notify_all();
+    }
+
+    /// Adjust the pool fee threshold for one committed block (see the rules
+    /// below); needs no evaluator, so it also runs while paused.
+    fn adjust_fee_threshold(&self, inner: &mut PoolInner) {
+        // The rules are:
+        // - If there was less than one full block in the pool, reduce
+        //   the multiplier by 2x. It will eventually go to 0, so that
+        //   only the flat MinTxnFee matters if the pool is idle.
+        // - If there were less than two full blocks in the pool, keep
+        //   the multiplier as-is.
+        // - If there were two or more full blocks in the pool, grow
+        //   the multiplier by 2x (or increment by 1, if 0).
+        match inner.num_pending_whole_blocks {
+            0 => {
+                inner.fee_threshold_multiplier /= self.config.exponential_increase_factor;
+            }
+            1 => {
+                // Keep the fee multiplier the same.
+            }
+            _ => {
+                if inner.fee_threshold_multiplier == 0 {
+                    inner.fee_threshold_multiplier = 1;
+                } else {
+                    inner.fee_threshold_multiplier = inner
+                        .fee_threshold_multiplier
+                        .saturating_mul(self.config.exponential_increase_factor);
+                }
+            }
+        }
+    }
+
+    /// Rebuild the evaluator on demand after a pause (see
+    /// `PoolInner::reprime_on_demand`). No-op while paused or when an
+    /// evaluator exists.
+    fn maybe_reprime(&self, inner: &mut PoolInner) {
+        if inner.evaluator.is_none() && inner.reprime_on_demand && !inner.evaluator_paused {
+            self.recompute_block_evaluator(inner, &HashSet::new());
+        }
     }
 
     /// Assemble a block for `round`, spending at most until `deadline`.
@@ -1287,6 +1347,7 @@ impl TransactionPool {
         inner.num_pending_whole_blocks = 0;
         inner.fee_threshold_multiplier = 0;
         inner.evaluator = None;
+        inner.paused_committed.clear();
         inner.stateproof_overflowed = false;
         inner.status_cache.reset();
 
@@ -1318,6 +1379,7 @@ impl TransactionPool {
         inner.evaluator_paused = paused;
         if paused {
             inner.evaluator = None;
+            inner.reprime_on_demand = true;
         }
         self.cond.notify_all();
     }
@@ -1463,17 +1525,29 @@ mod tests {
         assert_eq!(pool.pending_count(), 1);
     }
 
-    /// Clearing the flag alone builds nothing (failure path: the ledger
-    /// handle may be stale); the next block rebuilds. `resume_evaluator`
-    /// rebuilds at once.
+    /// Clearing the flag alone builds nothing, but the next admission (or the
+    /// next block) rebuilds the evaluator, so a failed reload never leaves the
+    /// pool without one. `resume_evaluator` rebuilds at once.
     #[test]
-    fn unpausing_does_not_prime_but_resume_does() {
+    fn unpausing_does_not_prime_but_remember_and_resume_do() {
         let pool = make_pool_with_evaluator(10);
         pool.set_evaluator_paused(true);
 
         pool.set_evaluator_paused(false);
         assert!(!pool.is_evaluator_paused());
         assert!(!pool.has_evaluator(), "plain un-pause must not build");
+        pool.remember(vec![make_test_txn(5)])
+            .expect("remember rebuilds the evaluator on demand");
+        assert!(pool.has_evaluator());
+
+        pool.set_evaluator_paused(true);
+        pool.set_evaluator_paused(false);
+        pool.test(&[make_test_txn(6)])
+            .expect("test rebuilds the evaluator on demand");
+        assert!(pool.has_evaluator());
+
+        pool.set_evaluator_paused(true);
+        pool.set_evaluator_paused(false);
         pool.on_new_block(&Block::default(), &HashSet::new());
         assert!(pool.has_evaluator(), "next block rebuilds");
 
@@ -1481,6 +1555,48 @@ mod tests {
         pool.resume_evaluator();
         assert!(!pool.is_evaluator_paused());
         assert!(pool.has_evaluator(), "resume primes immediately");
+    }
+
+    /// A pool that was never paused keeps go's behaviour: no on-demand build.
+    #[test]
+    fn never_paused_pool_does_not_self_prime() {
+        let ledger = Arc::new(StubLedger { round: Round(1) });
+        let pool = TransactionPool::new(PoolConfig::default(), ledger);
+        assert!(pool.remember(vec![make_test_txn(1)]).is_err());
+        assert!(!pool.has_evaluator());
+    }
+
+    /// Issue #1683: a transaction included in a block that commits while the
+    /// pool is paused is reported confirmed (empty status string) after
+    /// resume, not turned into a re-evaluation error.
+    #[test]
+    fn tx_confirmed_by_a_block_during_pause_reports_confirmed_after_resume() {
+        let pool = make_pool_with_evaluator(10);
+        let stx = make_test_txn(3);
+        let txid = compute_txn_id(&stx.txn);
+        pool.remember(vec![stx.clone()]).unwrap();
+
+        pool.set_evaluator_paused(true);
+        let committed: HashSet<Digest> = [txid].into_iter().collect();
+        pool.on_new_block(&Block::default(), &committed);
+        assert!(!pool.has_evaluator());
+
+        pool.resume_evaluator();
+        let (_, err, found) = pool.lookup(&txid);
+        assert!(found, "the status cache remembers the txid");
+        assert!(err.is_empty(), "confirmed marker, not an error: {err:?}");
+        assert_eq!(pool.pending_count(), 0, "confirmed group left the pool");
+    }
+
+    /// The paused-block buffer is bounded.
+    #[test]
+    fn paused_block_buffer_is_bounded() {
+        let pool = make_pool_with_evaluator(10);
+        pool.set_evaluator_paused(true);
+        for _ in 0..(MAX_PAUSED_BLOCKS + 50) {
+            pool.on_new_block(&Block::default(), &HashSet::new());
+        }
+        assert_eq!(pool.mu.lock().paused_committed.len(), MAX_PAUSED_BLOCKS);
     }
 
     /// Round-3 review of #1727: the pool is the single internal choke point

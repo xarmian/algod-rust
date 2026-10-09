@@ -247,10 +247,41 @@ pub fn ledger_error_response(e: NodeError) -> Response {
     }
 }
 
+/// Map a `NodeError` from a pool-backed submission (`POST /v2/transactions`
+/// and friends) to its HTTP response, in one place.
+///
+/// A rejected group is a client error (400, with structured AVM diagnostics
+/// when present); [`NodeError::Unavailable`] -- the pool is paused for a live
+/// catchpoint catchup (issue #1683) -- is a retryable 503, like go's
+/// `operation not available during catchup`.
+pub fn broadcast_error_response(e: NodeError) -> Response {
+    match e {
+        NodeError::BadRequestWithDetail(msg, detail) => bad_request_with_detail(msg, &detail),
+        NodeError::Unavailable(msg) => service_unavailable(msg),
+        e => bad_request(e.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+
+    #[test]
+    fn broadcast_error_response_maps_unavailable_to_503_and_rejections_to_400() {
+        assert_eq!(
+            broadcast_error_response(NodeError::Unavailable("node is catching up".into())).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            broadcast_error_response(NodeError::BadRequest("bad fee".into())).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            broadcast_error_response(NodeError::Internal("boom".into())).status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
 
     #[tokio::test]
     async fn bad_request_returns_400() {

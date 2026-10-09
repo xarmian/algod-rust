@@ -4341,7 +4341,7 @@ mod tests {
             async fn ingest(
                 &self,
                 _group: Vec<algo_types::SignedTransaction>,
-            ) -> Result<(), String> {
+            ) -> Result<(), algo_network::local_tx_broadcast::PoolIngestError> {
                 Ok(())
             }
         }

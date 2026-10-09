@@ -867,6 +867,11 @@ struct BacklogItem {
     group: Vec<SignedTransaction>,
     txids: Vec<Digest>,
     sender: String,
+    /// Canonical-form dedup entry this group was admitted under (if a cache
+    /// is attached), rolled back if the pool turns out to be paused for a
+    /// live catchup (issue #1683) so the peer's re-gossip is not dropped as a
+    /// duplicate.
+    canonical_rollback: Option<(Digest, Arc<SeenTxCache>)>,
     /// Capacity unit held against a [`TxBacklogPeerLimiter`] (issue #1195),
     /// if one is attached. Released — and the service event recorded — when
     /// [`backlog_worker`] dequeues this item; released without a service
@@ -1403,8 +1408,11 @@ impl MessageHandler for TxTagHandler {
         // group never earns a legitimate `seen`/canonical slot.
         if let Err(e) = self.pool.test(&group) {
             // `transactionMessageTxPoolCheckCounter.Add(ClassifyTxPoolError(err), 1)`
-            // (issue #1251).
-            self.check_counter.record(classify_pool_error(&e));
+            // (issue #1251). Not for a pool paused for a live catchup (issue
+            // #1683): that is no verdict on the group.
+            if !e.is_catching_up() {
+                self.check_counter.record(classify_pool_error(&e));
+            }
             debug!(
                 sender = %msg.sender,
                 group_len = group.len(),
@@ -1499,6 +1507,7 @@ impl MessageHandler for TxTagHandler {
                 group,
                 txids,
                 sender: msg.sender.clone(),
+                canonical_rollback: canonical_digest.zip(self.canonical_cache.clone()),
                 peer_guard,
             };
             // Non-blocking `try_send` mirrors go's `select { case
@@ -1543,6 +1552,7 @@ impl MessageHandler for TxTagHandler {
                 group,
                 txids,
                 msg.sender.clone(),
+                canonical_digest.zip(self.canonical_cache.clone()),
             )
             .await;
         }
@@ -1584,6 +1594,7 @@ async fn ingest_group(
     group: Vec<SignedTransaction>,
     txids: Vec<Digest>,
     sender: String,
+    canonical_rollback: Option<(Digest, Arc<SeenTxCache>)>,
 ) {
     // Cloned only when a limiter is attached: `penalize_eval_error` needs
     // the group's app ids after `remember` has moved `group` into the
@@ -1652,6 +1663,12 @@ async fn ingest_group(
         // warning, no eval-error counter, and above all no app-rate-limiter
         // penalty (the peer did nothing wrong).
         Ok(Err(e)) if e.is_catching_up() => {
+            // Roll back the canonical-form dedup entry like the other
+            // early-drop paths, or the peer's re-gossip after the catchup
+            // would be dropped as a duplicate of a group never ingested.
+            if let Some((digest, cache)) = &canonical_rollback {
+                cache.remove(digest);
+            }
             debug!(
                 sender = %sender,
                 "TxTagHandler: dropped inbound TX group while the node is catching up",
@@ -1707,6 +1724,7 @@ async fn backlog_worker(
             group,
             txids,
             sender,
+            canonical_rollback,
             peer_guard,
         } = item;
         if let (Some(limiter), Some(guard)) = (&peer_limiter, peer_guard) {
@@ -1721,6 +1739,7 @@ async fn backlog_worker(
             group,
             txids,
             sender,
+            canonical_rollback,
         )
         .await;
     }
@@ -2314,10 +2333,16 @@ mod app_rate_limiter_wiring_tests {
             vec![tx],
             txids,
             "5.6.7.8:4160".to_string(),
+            None,
         )
         .await;
         for tag in algo_pool::PoolErrorTag::ALL {
             assert_eq!(counter.count(*tag), 0, "no rejection counted for {tag}");
+            assert_eq!(
+                handler.check_counter().count(*tag),
+                0,
+                "the pre-check records nothing for a paused pool ({tag})"
+            );
         }
         assert_eq!(pool.pending_count(), 0);
 
@@ -2965,6 +2990,61 @@ mod canonical_cache_wiring_tests {
             calls.load(Ordering::SeqCst),
             1,
             "exact resend must be dropped by the canonical cache, not reach the evaluator again"
+        );
+    }
+
+    /// Issue #1683: a group dropped because the pool is paused for a live
+    /// catchup never earned its canonical-form dedup slot, so the peer's
+    /// re-gossip after the catchup is admitted, not dropped as a duplicate.
+    /// Covers the pre-check path (via `handle`) and `ingest_group`'s
+    /// `remember` failure arm (called directly).
+    #[tokio::test]
+    async fn catching_up_drop_rolls_back_the_canonical_cache_entry() {
+        let (pool, _fail, _calls) = make_pool();
+        let seen = Arc::new(SeenTxCache::new(1024));
+        let canonical = Arc::new(SeenTxCache::new(1024));
+        let handler =
+            TxTagHandler::new(pool.clone(), seen.clone()).with_canonical_cache(canonical.clone());
+
+        // Pre-check path.
+        pool.set_evaluator_paused(true);
+        let tx = make_payment_txn(1, 1, 1_000_000);
+        let txid = compute_txn_id(&tx.txn);
+        let out = handler
+            .handle(incoming(std::slice::from_ref(&tx), "1.2.3.4:4160"))
+            .await;
+        assert_eq!(out.action, ForwardingPolicy::Ignore);
+        assert!(pool.pending_tx_ids().is_empty());
+
+        // `ingest_group` failure arm: the digest was admitted by the cache.
+        let digest = canonical_group_digest(std::slice::from_ref(&tx));
+        assert!(canonical.insert(digest));
+        ingest_group(
+            &pool,
+            &seen,
+            &None,
+            handler.remember_counter(),
+            &None,
+            vec![tx.clone()],
+            vec![txid],
+            "1.2.3.4:4160".to_string(),
+            Some((digest, canonical.clone())),
+        )
+        .await;
+        assert!(
+            !canonical.contains(&digest),
+            "the catching-up drop must roll back the canonical entry"
+        );
+
+        // After the catchup the same bytes are admitted.
+        pool.resume_evaluator();
+        let out = handler
+            .handle(incoming(std::slice::from_ref(&tx), "1.2.3.4:4160"))
+            .await;
+        assert_eq!(out.action, ForwardingPolicy::Ignore);
+        assert!(
+            pool.pending_tx_ids().contains(&txid),
+            "re-gossip after resume must be admitted, not deduped"
         );
     }
 

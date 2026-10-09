@@ -85,7 +85,7 @@ pub enum LocalTxError {
     /// The pool is paused for a live catchpoint catchup (issue #1683); the
     /// group was not examined. Transient: callers answer 503, not 400.
     #[error("{0}")]
-    Unavailable(String),
+    CatchingUp(String),
 
     /// msgpack encode of a txn in the group failed.
     #[error("encode failed: {0}")]
@@ -100,6 +100,26 @@ pub enum LocalTxError {
 // PoolIngest trait
 // ---------------------------------------------------------------------------
 
+/// Why [`PoolIngest::ingest`] refused a group. Typed so callers never have to
+/// re-read pool state (racy) to tell a verdict on the group from a transient
+/// "node is catching up" (issue #1683).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PoolIngestError {
+    /// The pool is paused for a live catchpoint catchup; the group was not
+    /// judged.
+    #[error("{0}")]
+    CatchingUp(String),
+    /// The pool (or its evaluator) rejected the group.
+    #[error("{0}")]
+    Rejected(String),
+}
+
+impl From<String> for PoolIngestError {
+    fn from(msg: String) -> Self {
+        Self::Rejected(msg)
+    }
+}
+
 /// Async wrapper over the pool's `remember` call.
 ///
 /// Abstracting the pool behind a trait lets this module be unit-tested
@@ -109,13 +129,7 @@ pub enum LocalTxError {
 #[async_trait]
 pub trait PoolIngest: Send + Sync + 'static {
     /// Submit `group` to the pool and wait for completion.
-    async fn ingest(&self, group: Vec<SignedTransaction>) -> Result<(), String>;
-
-    /// Whether the pool is paused for a live catchpoint catchup (issue
-    /// #1683), so a failed [`Self::ingest`] was not a verdict on the group.
-    fn catching_up(&self) -> bool {
-        false
-    }
+    async fn ingest(&self, group: Vec<SignedTransaction>) -> Result<(), PoolIngestError>;
 }
 
 /// Production [`PoolIngest`] adapter over [`TransactionPool`].
@@ -137,16 +151,18 @@ impl PoolIngestAdapter {
 
 #[async_trait]
 impl PoolIngest for PoolIngestAdapter {
-    async fn ingest(&self, group: Vec<SignedTransaction>) -> Result<(), String> {
+    async fn ingest(&self, group: Vec<SignedTransaction>) -> Result<(), PoolIngestError> {
         let pool = self.pool.clone();
         tokio::task::spawn_blocking(move || pool.remember(group))
             .await
-            .map_err(|e| format!("pool ingest task join failed: {e}"))?
-            .map_err(|e| e.to_string())
-    }
-
-    fn catching_up(&self) -> bool {
-        self.pool.is_evaluator_paused()
+            .map_err(|e| PoolIngestError::Rejected(format!("pool ingest task join failed: {e}")))?
+            .map_err(|e| {
+                if e.is_catching_up() {
+                    PoolIngestError::CatchingUp(e.to_string())
+                } else {
+                    PoolIngestError::Rejected(e.to_string())
+                }
+            })
     }
 }
 
@@ -259,14 +275,17 @@ impl LocalTxBroadcaster {
         // transactions -- the latter via `PoolLedger::contains_confirmed_txid`,
         // which `PoolLedgerAdapter` (the production impl, shared with the
         // dev-mode path) backs with a txtail scan. See issue #456.
-        if let Err(e) = self.ingest.ingest(group).await {
-            if self.ingest.catching_up() {
+        match self.ingest.ingest(group).await {
+            Ok(()) => {}
+            Err(PoolIngestError::CatchingUp(e)) => {
                 // Not a verdict on the group (issue #1683): retryable.
                 debug!(error = %e, "LocalTxBroadcaster: node is catching up; group not admitted");
-                return Err(LocalTxError::Unavailable(e));
+                return Err(LocalTxError::CatchingUp(e));
             }
-            warn!(error = %e, "LocalTxBroadcaster: pool rejected local group");
-            return Err(LocalTxError::Pool(e));
+            Err(PoolIngestError::Rejected(e)) => {
+                warn!(error = %e, "LocalTxBroadcaster: pool rejected local group");
+                return Err(LocalTxError::Pool(e));
+            }
         }
 
         // 4. Record txids in the seen cache *before* broadcasting, so
@@ -336,9 +355,9 @@ mod tests {
 
     #[async_trait]
     impl PoolIngest for RecordingIngestor {
-        async fn ingest(&self, group: Vec<SignedTransaction>) -> Result<(), String> {
+        async fn ingest(&self, group: Vec<SignedTransaction>) -> Result<(), PoolIngestError> {
             self.calls.lock().unwrap().push(group);
-            self.result.clone()
+            self.result.clone().map_err(PoolIngestError::from)
         }
     }
 
@@ -517,7 +536,7 @@ mod tests {
     }
 
     /// Issue #1683: a rejection because the pool is paused for a live
-    /// catchpoint catchup is `Unavailable` (REST answers 503), not `Pool`
+    /// catchpoint catchup is `CatchingUp` (REST answers 503), not `Pool`
     /// (a permanent-looking 400), and still neither broadcasts nor marks the
     /// group seen.
     #[tokio::test]
@@ -525,11 +544,8 @@ mod tests {
         struct CatchingUp;
         #[async_trait]
         impl PoolIngest for CatchingUp {
-            async fn ingest(&self, _group: Vec<SignedTransaction>) -> Result<(), String> {
-                Err("node is catching up".to_string())
-            }
-            fn catching_up(&self) -> bool {
-                true
+            async fn ingest(&self, _group: Vec<SignedTransaction>) -> Result<(), PoolIngestError> {
+                Err(PoolIngestError::CatchingUp("node is catching up".into()))
             }
         }
         let gossip = Arc::new(MockGossipNode::new());
@@ -539,8 +555,8 @@ mod tests {
         let group = vec![make_signed_txn(7)];
         let err = bx.submit_group(group.clone()).await.unwrap_err();
         assert!(
-            matches!(err, LocalTxError::Unavailable(_)),
-            "expected Unavailable, got {err:?}",
+            matches!(err, LocalTxError::CatchingUp(_)),
+            "expected CatchingUp, got {err:?}",
         );
         assert!(gossip.recorded().is_empty());
         assert!(!seen.contains(&compute_txn_id(&group[0].txn)));

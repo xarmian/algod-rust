@@ -218,12 +218,12 @@ async fn successful_reload_resumes_and_reprimes_the_pool() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
-/// A failed reload must not leave the pool paused, and must not build an
-/// evaluator on the stale ledger handle; the next block rebuilds it.
+/// A failed reload must not leave the pool paused or evaluator-less: the
+/// unchanged old ledger handle is still valid, so the pool is re-primed
+/// against it (and would also self-prime on the next admission).
 #[tokio::test]
-async fn failed_reload_unpauses_without_building_an_evaluator() {
+async fn failed_reload_unpauses_and_reprimes_on_the_old_handle() {
     let (mut control, tmp_dir, ledger, pool) = fixture();
-    let tracker = control.resolved_paths.tracker_path.clone();
 
     control.pause().await;
     commit_round(&ledger, 1);
@@ -240,13 +240,9 @@ async fn failed_reload_unpauses_without_building_an_evaluator() {
         "failure path must not stay paused"
     );
     assert!(
-        !pool.has_evaluator(),
-        "no evaluator on the stale handle after a failed reload"
+        pool.has_evaluator(),
+        "failure path re-primes against the still-valid old handle"
     );
-    assert_eq!(truncate_busy(&tracker), 0, "nothing pins the WAL");
-
-    pool.on_new_block(&algo_types::Block::default(), &Default::default());
-    assert!(pool.has_evaluator(), "the next block rebuilds it");
 
     drop((pool, ledger, control));
     let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -264,6 +260,32 @@ async fn resume_clears_a_pause_left_behind() {
     assert!(!pool.is_evaluator_paused());
     control.pause().await;
 
+    drop((pool, control));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// `resume()` with a cycle already running used to return before clearing the
+/// pause, leaving every admission failing with `NodeCatchingUp` forever.
+#[tokio::test]
+async fn resume_with_a_cycle_already_running_still_unpauses_the_pool() {
+    let (control, tmp_dir, _ledger, pool) = fixture();
+
+    control.resume().await;
+    assert!(control.running.lock().await.is_some(), "cycle running");
+    pool.set_evaluator_paused(true);
+    assert!(pool.is_evaluator_paused());
+
+    control.resume().await; // early-return path
+    assert!(!pool.is_evaluator_paused(), "double resume must unpause");
+    assert!(pool.has_evaluator(), "and re-prime");
+
+    // pause() with no cycle running, then resume(): same guarantee.
+    control.pause().await;
+    control.pause().await;
+    control.resume().await;
+    assert!(!pool.is_evaluator_paused());
+
+    control.pause().await;
     drop((pool, control));
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }

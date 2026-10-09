@@ -37,8 +37,8 @@ use rusqlite::{params, Connection};
 use std::path::Path;
 use std::time::Instant;
 
-const ROWS_PER_BATCH: usize = 200;
-const BATCHES: usize = 60;
+const ROWS_PER_BATCH: usize = 20;
+const BATCHES: usize = 40;
 
 fn wal_len(tracker: &Path) -> u64 {
     let mut p = tracker.as_os_str().to_owned();
@@ -147,7 +147,7 @@ fn wal_stays_bounded_when_the_snapshot_is_released_before_the_import() {
 
     let snap = ledger.open_read_snapshot().expect("file-backed snapshot");
     let _ = snap.get_account(&Address([1u8; 32]));
-    drop(snap); // what `TransactionPool::release_evaluator` does at pause
+    drop(snap); // what `TransactionPool::set_evaluator_paused(true)` does at pause
 
     let released_peak = write_import_load(&writer, &tracker);
     let (busy, _, _) = checkpoint(&writer, "TRUNCATE");

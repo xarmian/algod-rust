@@ -135,7 +135,7 @@ impl SolicitedTxHandler for PoolSolicitedTxHandler {
             }
             Err(e) => {
                 warn!(error = %e, "PoolSolicitedTxHandler: pool rejected pulled TX group");
-                Err(TxSyncError::Handler(e))
+                Err(TxSyncError::Handler(e.to_string()))
             }
         }
     }
@@ -163,9 +163,14 @@ mod tests {
 
     #[async_trait]
     impl PoolIngest for FakeIngest {
-        async fn ingest(&self, group: Vec<SignedTransaction>) -> Result<(), String> {
+        async fn ingest(
+            &self,
+            group: Vec<SignedTransaction>,
+        ) -> Result<(), crate::local_tx_broadcast::PoolIngestError> {
             self.calls.lock().unwrap().push(group);
-            self.result.clone()
+            self.result
+                .clone()
+                .map_err(crate::local_tx_broadcast::PoolIngestError::from)
         }
     }
 

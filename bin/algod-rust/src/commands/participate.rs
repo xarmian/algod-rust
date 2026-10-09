@@ -669,6 +669,11 @@ impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
     }
 
     async fn resume(&self) {
+        // Issue #1683 safety net, deliberately BEFORE the already-running
+        // early return: whatever path got us here (an aborted catchup, a
+        // failed reload, a repeated resume) the pool must never stay paused,
+        // or every admission would fail with `NodeCatchingUp` forever.
+        self.unpause_pool().await;
         let mut guard = self.running.lock().await;
         if guard.is_some() {
             return;
@@ -676,15 +681,7 @@ impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
         // `build_cycle` does blocking SQLite/mutex work; run it off the
         // tokio runtime like `pause`'s shutdown does.
         let this = self.clone_for_rebuild();
-        let built = tokio::task::spawn_blocking(move || {
-            // Issue #1683 safety net: the pool must never stay paused once
-            // the node resumes (an aborted catchup, a failed reload). Clearing
-            // the flag builds nothing; the first committed block rebuilds the
-            // evaluator against the then-current ledger.
-            this.pool.set_evaluator_paused(false);
-            this.build_cycle()
-        })
-        .await;
+        let built = tokio::task::spawn_blocking(move || this.build_cycle()).await;
         match built {
             Ok(Ok(cycle)) => {
                 *guard = Some(cycle);
@@ -778,29 +775,38 @@ impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
         .await;
 
         // Issue #1683: leave the pool's paused state only now, after the
-        // checkpoint. On a successful reload, rebuild the evaluator against
-        // the fresh handle right away (admission works again without waiting
-        // for the next block). On any failure the handle may be stale: just
-        // clear the flag so the pool is never stuck paused, and let the next
-        // committed block rebuild the evaluator against whichever handle is
-        // current by then. Runs on the blocking pool (the follower holds the
-        // pool mutex across a ledger read).
-        let pool = self.pool.clone();
-        let resumed = tokio::task::spawn_blocking(move || {
-            if reloaded {
-                pool.resume_evaluator();
-            } else {
-                pool.set_evaluator_paused(false);
-            }
-        })
-        .await;
-        if let Err(e) = resumed {
-            warn!(error = %e, "ledger reload: pool resume task panicked");
+        // checkpoint, and rebuild the evaluator right away so admission works
+        // again without waiting for the next block. After a failed reload the
+        // old handle is unchanged and still usable, so the pool is re-primed
+        // against it too (the pool also retries on the next admission or
+        // block should that fail) -- never left paused or evaluator-less.
+        if !reloaded {
+            warn!(
+                "ledger reload failed; re-priming the pool against the unchanged pre-reload                  ledger handle (a later block or admission retries if that fails)"
+            );
         }
+        self.unpause_pool().await;
     }
 }
 
 impl ParticipateAgreementControl {
+    /// Leave the pool's catchup-paused state and rebuild its evaluator
+    /// against the current ledger handle (issue #1683). A no-op when not
+    /// paused. Runs on the blocking pool: the pool follower can hold the pool
+    /// mutex across a ledger read.
+    async fn unpause_pool(&self) {
+        let pool = self.pool.clone();
+        let done = tokio::task::spawn_blocking(move || {
+            if pool.is_evaluator_paused() {
+                pool.resume_evaluator();
+            }
+        })
+        .await;
+        if let Err(e) = done {
+            warn!(error = %e, "pool resume task panicked");
+        }
+    }
+
     /// A cheap `Arc`-cloning "clone" of the fields `build_cycle` needs, so
     /// `resume` can move a self-contained value into `spawn_blocking`
     /// without requiring `ParticipateAgreementControl` itself (which holds
@@ -12094,9 +12100,15 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or_default();
         let tmp_dir = std::env::temp_dir().join(format!(
-            "algod-rust-agreement-control-test-{}-{}",
+            "algod-rust-agreement-control-test-{}-{}-{}",
             std::process::id(),
             nonce,
+            // Parallel tests can read the same clock tick (Windows clock
+            // granularity), so add a process-wide sequence number.
+            {
+                static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
         ));
         std::fs::create_dir_all(&tmp_dir).expect("create tmp dir");
         let ledger_path = tmp_dir.join("ledger");
