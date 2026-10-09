@@ -345,7 +345,7 @@ fn invariant_violation(msg: &str) {
 /// invisible: it leaves the persistent tracker rows alone (the "KEEP IN SYNC"
 /// early return in `apply_block_impl_ex`) and, once rolled back, leaves the
 /// tracker/lease/chain-field/trie-log state exactly as it found it. Compiled
-/// to a no-op capture in release builds (`cfg!(debug_assertions)`).
+/// to a no-op capture in non-test release builds.
 struct ScratchInvariant {
     tracker: Option<u64>,
     full: Option<u64>,
@@ -354,7 +354,9 @@ struct ScratchInvariant {
 
 impl ScratchInvariant {
     fn capture<L: LedgerStore>(store: &L, chain: &ChainFields) -> Self {
-        if !cfg!(debug_assertions) {
+        // Also enabled for unit-test builds so `--release` test profiles
+        // (the Coverage workflow) exercise the same invariants as debug.
+        if !cfg!(any(debug_assertions, test)) {
             return Self {
                 tracker: None,
                 full: None,
