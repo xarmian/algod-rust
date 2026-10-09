@@ -284,7 +284,7 @@ make fixtures && make test
 GitHub-hosted runners share egress IPs, so anonymous Docker Hub pulls hit
 `toomanyrequests: You have reached your unauthenticated pull rate limit`
 (HTTP 429) in bursts. Every workflow job that pulls from or builds `FROM`
-Docker Hub (`validate-api.yml`, `license-compliance.yml` -> cargo-deny-action,
+Docker Hub (`validate-api.yml`, `license-compliance.yml`,
 `docker-image.yml` `pr-check`, `consensus-cluster.yml`,
 `p2p-consensus-soak.yml`, `p2p-interop.yml`, `algokey-e2e.yml`) therefore runs
 a `docker/login-action@v3` step right after checkout and **before** any
@@ -295,7 +295,12 @@ job copies them into job-level `env` and guards the step with
 the login and behave exactly as before. login-action writes
 `~/.docker/config.json`, which `docker pull`, `docker build`, `docker compose`
 and buildx (including the docker-container driver) all read. Any new job that
-touches Docker Hub must add the same env + step.
+touches Docker Hub must add the same env + step. The login step is
+`continue-on-error` so a Docker Hub auth-endpoint outage does not add a second
+failure. Docker-container *actions* (e.g. `EmbarkStudios/cargo-deny-action`)
+build their image during "Set up job", before any step, so a login step cannot
+help them; `license-compliance.yml` installs the `cargo-deny` binary with
+`taiki-e/install-action` instead of using the container action.
 
 ### CI: workspace unit tests (issue #1750)
 
