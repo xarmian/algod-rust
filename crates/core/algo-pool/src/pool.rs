@@ -1255,6 +1255,29 @@ impl TransactionPool {
 
         self.fee_per_byte.store(0, Ordering::Relaxed);
     }
+
+    /// Drop the pending block evaluator but keep every pending and
+    /// remembered transaction group (issue #1683).
+    ///
+    /// The evaluator owns a ledger read snapshot (an open SQLite read
+    /// transaction) for as long as it lives. A live catchpoint catchup writes
+    /// the ledger through its own connection for many minutes; if the
+    /// evaluator built against the pre-catchup ledger is still alive, that
+    /// read transaction pins the WAL and no checkpoint can make progress.
+    /// The node calls this when it pauses for catchup. The next
+    /// [`Self::on_new_block`] rebuilds the evaluator from the surviving
+    /// groups; until then `remember` fails with
+    /// [`PoolError::NoPendingBlockEvaluator`].
+    pub fn release_evaluator(&self) {
+        let mut inner = self.mu.lock();
+        inner.evaluator = None;
+        self.cond.notify_all();
+    }
+
+    /// Whether the pool currently holds a pending block evaluator.
+    pub fn has_evaluator(&self) -> bool {
+        self.mu.lock().evaluator.is_some()
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -1342,6 +1365,27 @@ mod tests {
         }
 
         pool
+    }
+
+    /// Issue #1683: `release_evaluator` drops the evaluator (and with it its
+    /// ledger read snapshot) but keeps pending groups, and the pool rebuilds
+    /// the evaluator from them on the next block.
+    #[test]
+    fn release_evaluator_keeps_pending_groups_and_recovers_on_new_block() {
+        let pool = make_pool_with_evaluator(10);
+        pool.remember(vec![make_test_txn(3)]).unwrap();
+        assert!(pool.has_evaluator());
+
+        pool.release_evaluator();
+        assert!(!pool.has_evaluator());
+        assert_eq!(pool.pending_count(), 1, "pending groups survive");
+        assert!(
+            pool.remember(vec![make_test_txn(4)]).is_err(),
+            "no evaluator: admission refused until the next block"
+        );
+
+        pool.on_new_block(&Block::default(), &HashSet::new());
+        assert!(pool.has_evaluator(), "on_new_block rebuilds the evaluator");
     }
 
     /// Round-3 review of #1727: the pool is the single internal choke point

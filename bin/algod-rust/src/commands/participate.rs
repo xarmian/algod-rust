@@ -652,6 +652,13 @@ impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
             }
             info!("consensus participation paused for live catchpoint catchup");
         }
+        // Issue #1683: the pool's pending block evaluator keeps a ledger read
+        // snapshot (an open SQLite read transaction) alive; across the
+        // multi-minute catchpoint import that pins the tracker WAL and no
+        // checkpoint can run. Release it now (also when nothing was running:
+        // the evaluator outlives the agreement cycle). The pool follower
+        // rebuilds it on the first block after the ledger reload.
+        self.pool.release_evaluator();
     }
 
     async fn resume(&self) {
@@ -747,6 +754,13 @@ impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
             algo_ledger::sync::SyncOrchestrator::checkpoint_wal_file(&block_path, "block");
         })
         .await;
+
+        // Issue #1683: `pause` released the pool's evaluator; rebuild it
+        // against the reopened ledger now so transaction admission works
+        // again without waiting for the next block (a no-op if the pool
+        // follower already did).
+        let pool = self.pool.clone();
+        let _ = tokio::task::spawn_blocking(move || pool.ensure_evaluator_primed()).await;
     }
 }
 
@@ -12016,7 +12030,23 @@ mod tests {
     /// wiring, except the network stays offline (no listener bound, no
     /// peers dialed) since these tests only exercise the agreement
     /// `Service`'s own start/stop lifecycle, not wire traffic.
-    fn test_agreement_control() -> (ParticipateAgreementControl, PathBuf) {
+    pub(super) fn test_agreement_control() -> (ParticipateAgreementControl, PathBuf) {
+        test_agreement_control_with(|_prefix| {
+            let ledger = test_ledger();
+            let pool = Arc::new(TransactionPool::new(
+                PoolConfig::default(),
+                Arc::new(PoolLedgerAdapter::new(ledger.clone()))
+                    as Arc<dyn algo_pool::traits::PoolLedger>,
+            ));
+            (ledger, pool)
+        })
+    }
+
+    /// [`test_agreement_control`] with the ledger and pool supplied by
+    /// `make`, which receives the ledger prefix inside the temp directory.
+    pub(super) fn test_agreement_control_with(
+        make: impl FnOnce(&Path) -> (Arc<Mutex<SqliteLedger>>, Arc<TransactionPool>),
+    ) -> (ParticipateAgreementControl, PathBuf) {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -12030,12 +12060,7 @@ mod tests {
         let ledger_path = tmp_dir.join("ledger");
         let partkey_path = tmp_dir.join("partkeys.sqlite");
 
-        let ledger = test_ledger();
-        let pool = Arc::new(TransactionPool::new(
-            PoolConfig::default(),
-            Arc::new(PoolLedgerAdapter::new(ledger.clone()))
-                as Arc<dyn algo_pool::traits::PoolLedger>,
-        ));
+        let (ledger, pool) = make(&ledger_path);
         let phonebook = Arc::new(Phonebook::new(0, Duration::from_secs(60)));
         let gossip_node = Arc::new(WebsocketNetwork::new(
             WebsocketNetworkConfig::default(),
@@ -12165,3 +12190,7 @@ mod tests {
 #[cfg(test)]
 #[path = "participate_exec_tests.rs"]
 mod exec_admission_tests;
+
+#[cfg(test)]
+#[path = "participate_wal_pin_tests.rs"]
+mod wal_pin_tests;
