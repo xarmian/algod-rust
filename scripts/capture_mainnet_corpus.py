@@ -37,6 +37,16 @@ that carried the key": the indexer says in which rounds an account / asset /
 application was involved, and /v2/deltas/<round> supplies the full record
 that go wrote in that round.
 
+Known limitations (see fixtures/mainnet_corpus/README.md):
+  * a base record can change without a transaction (block proposer payouts,
+    fee sink / rewards pool): the last PRESCAN deltas are scanned directly, but
+    an older proposer-only write of a touched account would be missed (stale
+    record); the replay test would then report the divergence;
+  * read-only keys are approximated from the chain tip or left unresolved past
+    a walk limit; both are recorded in `meta` and pinned by the test;
+  * indexer failures abort the capture (nothing is silently treated as
+    "no history").
+
 Usage:  python3 scripts/capture_mainnet_corpus.py ROUND [ROUND ...]
 Needs:  python3, `pip install msgpack requests`. Network responses are cached
 in $CORPUS_CACHE (default: <tmpdir>/algod-corpus-cache).
@@ -53,7 +63,7 @@ import requests
 
 ALGOD = os.environ.get("CORPUS_ALGOD", "https://mainnet-api.algonode.cloud")
 INDEXER = os.environ.get("CORPUS_INDEXER", "https://mainnet-idx.algonode.cloud")
-OUT_DIR = os.path.join(
+OUT_DIR = os.environ.get("CORPUS_OUT") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "..",
     "crates",
@@ -118,12 +128,20 @@ def http(url, params=None):
     raise RuntimeError("giving up on " + url)
 
 
+def _atomic_write(path, data):
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
 def cached(name, fetch):
     p = os.path.join(CACHE, name)
     if os.path.exists(p):
-        return open(p, "rb").read()
+        with open(p, "rb") as f:
+            return f.read()
     b = fetch()
-    open(p, "wb").write(b)
+    _atomic_write(p, b)
     return b
 
 
@@ -161,30 +179,30 @@ def kvmods(d):
     return out
 
 
+class IndexerError(Exception):
+    """The indexer could not answer a query. Never treated as 'no history'."""
+
+
 def idx_json(path, params=None):
     import json
 
-    key = path.replace("/", "_") + "_" + "_".join(
-        f"{k}-{v}" for k, v in sorted((params or {}).items())
-    )
+    ident = json.dumps([path, sorted((params or {}).items())], default=str)
+    name = "idx-" + hashlib.sha256(ident.encode()).hexdigest()
 
     def f():
         resp = http(f"{INDEXER}/v2/{path}", params)
         if resp.status_code == 404:
             return b'{"_404":true}'
         if resp.status_code >= 500:
-            return None  # transient/poisoned query: not cached, treated as empty
+            raise IndexerError(f"{resp.status_code} for {path} {params}")
         resp.raise_for_status()
         return resp.content
 
-    p = os.path.join(CACHE, "idx-" + key[:180])
-    if not os.path.exists(p):
-        b = f()
-        if b is None:
-            print("WARN indexer error for", path, params, file=sys.stderr, flush=True)
-            return {"_err": True}
-        open(p, "wb").write(b)
-    return json.loads(open(p, "rb").read())
+    d = json.loads(cached(name, f))
+    if d.get("message") and not d.get("_404"):
+        # e.g. "rewinding account is no longer supported": an error body
+        raise IndexerError(f"{d['message']} for {path} {params}")
+    return d
 
 
 def addr_b32(raw):
@@ -203,10 +221,6 @@ def app_address(app_id):
 # ---------------------------------------------------------------------------
 
 
-class IndexerError(Exception):
-    pass
-
-
 def account_rounds(addr, before, **flt):
     """Distinct confirmed rounds < before of txns involving addr, newest first."""
     seen = []
@@ -217,9 +231,7 @@ def account_rounds(addr, before, **flt):
         if token:
             p["next"] = token
         d = idx_json(f"accounts/{addr_b32(addr)}/transactions", p)
-        if d.get("_err"):
-            raise IndexerError(addr_b32(addr))
-        if d.get("_404") or d.get("message"):
+        if d.get("_404"):
             return
         for t in d.get("transactions", []):
             r = t["confirmed-round"]
@@ -274,23 +286,15 @@ def resource_account_rounds(addr, before, **flt):
 
 
 def merged_account_rounds(addr, before):
-    """Rounds in which addr's algo balance could have changed (it paid a fee,
-    sent, or received), newest first."""
-    gens = [
-        account_rounds(addr, before, **{"address-role": "sender"}),
-        account_rounds(addr, before, **{"address-role": "receiver"}),
-    ]
-    heads = [next(g, None) for g in gens]
-    last = None
-    while any(h is not None for h in heads):
-        i = max(range(2), key=lambda k: -1 if heads[k] is None else heads[k])
-        v = heads[i]
-        heads[i] = next(gens[i], None)
-        if v != last:
-            last = v
-            yield v
+    """Every round < before in which addr took part in a transaction in any role
+    (sender, receiver, close-to, freeze target, app-call account, inner
+    transactions), newest first. The role-less query is a superset of the
+    rounds in which the base record can change."""
+    yield from account_rounds(addr, before)
 
 
+RES_PRESCAN = {}
+_prescan = {}
 PRESCAN = 40
 EXTRA_HDRS = 16  # headers R-2..R-17 for the `block` opcode
 
@@ -314,12 +318,6 @@ def prescan(before):
                     if p.get("Deleted") or p.get(inner) is not None:
                         RES_PRESCAN.setdefault((before, listname, part, rec["Addr"], rec["Aidx"]), p)
     return accts
-
-
-RES_PRESCAN = {}
-
-
-_prescan = {}
 
 
 WALK_LIMIT = 150
@@ -589,25 +587,25 @@ def _decode_addr(s):
 # Static reference extraction from the block
 # ---------------------------------------------------------------------------
 
-_HASH_KEYS = {"grp", "lx", "am", "txid", "note", "lg", "sig", "msig", "lsig"}
+_ADDR_FIELDS = ("snd", "rcv", "close", "arcv", "asnd", "aclose", "fadd", "rekey")
+_APAR_ADDRS = ("m", "r", "f", "c")  # asset manager / reserve / freeze / clawback
 
 
 def walk_txn(t, accts, apps, assets):
-    for k, v in t.items():
-        if k in _HASH_KEYS:
-            continue
-        if isinstance(v, bytes) and len(v) == 32 and k in (
-            "snd", "rcv", "close", "arcv", "asnd", "aclose", "fadd", "rekey", "f", "m", "r", "c", "ss"
-        ):
+    """Add every account / app / asset a transaction names."""
+    for k in _ADDR_FIELDS:
+        v = t.get(k)
+        if isinstance(v, bytes) and len(v) == 32:
             accts.add(v)
-    for k in ("apat",):
-        for a in t.get(k, []) or []:
-            if isinstance(a, bytes) and len(a) == 32:
-                accts.add(a)
-    for k in ("apfa",):
-        apps.update(t.get(k, []) or [])
-    for k in ("apas",):
-        assets.update(t.get(k, []) or [])
+    for a in t.get("apat", []) or []:
+        if isinstance(a, bytes) and len(a) == 32:
+            accts.add(a)
+    for k in _APAR_ADDRS:
+        v = (t.get("apar") or {}).get(k)
+        if isinstance(v, bytes) and len(v) == 32:
+            accts.add(v)
+    apps.update(t.get("apfa", []) or [])
+    assets.update(t.get("apas", []) or [])
     for k in ("xaid", "caid", "faid"):
         if t.get(k):
             assets.add(t[k])
@@ -615,36 +613,48 @@ def walk_txn(t, accts, apps, assets):
         apps.add(t["apid"])
     for al in t.get("al", []) or []:
         if isinstance(al, dict):
-            for k, v in al.items():
+            for v in al.values():
                 if isinstance(v, bytes) and len(v) == 32:
                     accts.add(v)
 
 
 def collect_refs(block):
-    """Per-transaction reference sets, recursing into inner transactions."""
-    txs = []
+    """Reference sets per transaction GROUP.
 
-    def visit(stib):
-        accts, apps, assets, boxes = set(), set(), set(), set()
+    AVM resource sharing lets every app call in a group use the resources
+    named by any other transaction of the group, so each group's accounts,
+    apps, assets and boxes are unioned (inner transactions join the group of
+    their top-level parent)."""
+    groups = {}
+    order = []
+
+    def visit(stib, bucket):
         t = stib.get("txn", {})
+        accts, apps, assets, boxes = bucket
         walk_txn(t, accts, apps, assets)
         for bx in t.get("apbx", []) or []:
             idx = bx.get("i", 0)
-            appid = (t.get("apfa") or [])[idx - 1] if idx else t.get("apid", 0)
+            fa = t.get("apfa") or []
+            appid = fa[idx - 1] if idx and idx <= len(fa) else t.get("apid", 0)
             boxes.add((appid, bx.get("n", b"")))
-        txs.append((accts, apps, assets, boxes))
         for inner in (stib.get("dt") or {}).get("itx", []) or []:
-            visit(inner)
+            visit(inner, bucket)
 
-    for stib in block["txns"]:
-        visit(stib)
-    return txs
+    for n, stib in enumerate(block["txns"]):
+        key = stib.get("txn", {}).get("grp") or ("solo", n)
+        if key not in groups:
+            groups[key] = (set(), set(), set(), set())
+            order.append(key)
+        visit(stib, groups[key])
+    return [groups[k] for k in order]
 
 
 # ---------------------------------------------------------------------------
 
 
 def capture(r):
+    _prescan.clear()
+    RES_PRESCAN.clear()
     APPROX.clear()
     APPROX_RES.clear()
     UNRESOLVED_RES.clear()
@@ -735,13 +745,6 @@ def capture(r):
         else:
             pre_accts.append(rec)
 
-    def acct_rounds(addr, kind, ident):
-        return [
-            (rr, addr, ident)
-            for rr in account_rounds(addr, r, **{kind: ident})
-        ]
-
-    print("accounts done", flush=True)
     pre_app, pre_asset = [], []
     for (addr, aidx), parts in sorted(need_app.items()):
         rec = {"Addr": addr, "Aidx": aidx,
