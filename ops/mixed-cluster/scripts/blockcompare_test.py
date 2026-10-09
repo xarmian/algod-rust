@@ -150,7 +150,7 @@ class CompareRoundTest(unittest.TestCase):
             name = {p: n for n, p in self.NODES}[port]
             return (hashes or {}).get(name, "blk-same")
 
-        return bc.compare_round(7, fetch, fetch_h, self.NODES)
+        return bc.compare_round(7, fetch, fetch_h, self.NODES, sleep=lambda s: None)
 
     def same(self, blk):
         # certs differ per node on purpose
@@ -177,10 +177,55 @@ class CompareRoundTest(unittest.TestCase):
         rec = self.run_round(self.same(block_with([PAY])), hashes={"rust-node-4": "blk-other"})
         self.assertFalse(rec["hash_match"])
 
-    def test_one_node_down_is_recorded_not_fatal(self):
+    def test_one_node_down_is_incomplete_and_never_identical(self):
         rec = self.run_round(self.same(block_with([PAY])), fail=("go-node-3",))
-        self.assertTrue(rec["identical"])
+        self.assertFalse(rec["complete"])
+        self.assertFalse(rec["identical"])
         self.assertEqual(rec["missing"], ["go-node-3"])
+        self.assertNotIn("mismatch_nodes", rec)
+
+    def test_rust_node_down_is_incomplete(self):
+        rec = self.run_round(self.same(block_with([PAY])), fail=("rust-node-4",))
+        self.assertFalse(rec["complete"])
+        self.assertFalse(rec["identical"])
+        self.assertEqual(rec["missing"], ["rust-node-4"])
+
+    def test_complete_round_is_marked_complete(self):
+        rec = self.run_round(self.same(block_with([PAY])))
+        self.assertTrue(rec["complete"])
+        self.assertTrue(rec["identical"])
+
+    def test_node_without_a_hash_is_not_a_hash_match(self):
+        def fetch_h(port, rnd):
+            if port == 4:
+                raise OSError("no hash endpoint")
+            return "blk-same"
+
+        blocks = self.same(block_with([PAY]))
+        rec = bc.compare_round(7, lambda p, r: blocks[{v: k for k, v in dict(self.NODES).items()}[p]],
+                               fetch_h, self.NODES)
+        self.assertFalse(rec["hash_match"])
+        self.assertEqual(rec["hash_missing"], ["rust-node-4"])
+
+    def test_transient_fetch_failure_is_retried(self):
+        calls = {"n": 0}
+        blocks = self.same(block_with([PAY]))
+        names = {v: k for k, v in dict(self.NODES).items()}
+
+        def fetch(port, rnd):
+            if port == 4:
+                calls["n"] += 1
+                if calls["n"] < 3:
+                    raise OSError("blip")
+            return blocks[names[port]]
+
+        rec = bc.compare_round(7, fetch, lambda p, r: "blk-same", self.NODES, retries=3, sleep=lambda s: None)
+        self.assertTrue(rec["complete"])
+        self.assertEqual(calls["n"], 3)
+
+    def test_persistent_failure_exhausts_retries(self):
+        rec = self.run_round(self.same(block_with([PAY])), fail=("rust-node-4",))
+        self.assertFalse(rec["complete"])
 
     def test_reference_down_is_degraded(self):
         rec = self.run_round(self.same(block_with([PAY])), fail=("go-node-1",))
@@ -206,6 +251,97 @@ class SummaryTest(unittest.TestCase):
         self.assertEqual(s["txn_types"], {"pay": 1, "appl": 1})
         self.assertEqual([m["round"] for m in s["mismatches"]], [3])
         self.assertEqual([m["round"] for m in s["hash_mismatches"]], [3])
+
+    def test_incomplete_rounds_and_per_node_missing_are_counted(self):
+        recs = [
+            {"kind": "block_compare", "round": 1, "txn_count": 0, "complete": True, "identical": True, "hash_match": True},
+            {"kind": "block_compare", "round": 2, "txn_count": 0, "complete": False, "identical": False,
+             "missing": ["rust-node-4"], "hash_match": True},
+            {"kind": "block_compare", "round": 3, "txn_count": 0, "complete": False, "identical": False,
+             "missing": ["rust-node-4", "go-node-3"], "hash_match": False, "hash_missing": ["rust-node-4"],
+             "hashes": {}},
+            {"kind": "block_compare", "round": 4, "degraded": True, "missing": ["go-node-1"]},
+        ]
+        s = bc.summarize_records(recs)
+        self.assertEqual(s["rounds_compared"], 1)
+        self.assertEqual(s["incomplete_rounds"], 2)
+        self.assertEqual(s["degraded_rounds"], 1)
+        self.assertEqual(s["nodes_missing"], {"rust-node-4": 2, "go-node-3": 1, "go-node-1": 1})
+        # an incomplete round is not a byte mismatch
+        self.assertEqual(s["mismatches"], [])
+        self.assertEqual(s["missing_rounds"], 3)
+        self.assertEqual([m["round"] for m in s["hash_mismatches"]], [3])
+
+    def test_close_txns_are_aggregated(self):
+        recs = [{"kind": "block_compare", "round": 1, "txn_count": 1, "complete": True, "identical": True,
+                 "hash_match": True, "close_txns": 2, "nodes_compared": ["a"]}]
+        self.assertEqual(bc.summarize_records(recs)["close_txns"], 2)
+
+    def test_facts_count_close_to(self):
+        pay_close = {"txn": {"type": "pay", "close": b"x" * 32}}
+        axfer_close = {"txn": {"type": "axfer", "aclose": b"x" * 32}}
+        self.assertEqual(bc.block_facts(block_with([PAY, pay_close, axfer_close]))["close_txns"], 2)
+
+
+class ExitCodeTest(unittest.TestCase):
+    def summ(self, *recs):
+        return bc.summarize_records(list(recs))
+
+    OK = {"kind": "block_compare", "round": 1, "txn_count": 0, "complete": True, "identical": True,
+          "hash_match": True, "nodes_compared": ["rust-node-4"]}
+
+    def test_clean_is_zero(self):
+        self.assertEqual(bc.exit_code(self.summ(self.OK)), 0)
+
+    def test_missing_node_fails_unless_allowed(self):
+        miss = {"kind": "block_compare", "round": 2, "txn_count": 0, "complete": False, "identical": False,
+                "missing": ["rust-node-4"], "hash_match": True}
+        s = self.summ(self.OK, miss)
+        self.assertEqual(bc.exit_code(s), 3)
+        self.assertEqual(bc.exit_code(s, allow_missing=True), 0)
+
+    def test_missing_hash_fails_unless_allowed(self):
+        h = dict(self.OK, round=2, hash_match=False, hash_missing=["rust-node-4"], hashes={})
+        s = self.summ(self.OK, h)
+        self.assertEqual(bc.exit_code(s), 3)
+        self.assertEqual(bc.exit_code(s, allow_missing=True), 0)
+
+    def test_real_mismatch_is_two_even_when_missing_allowed(self):
+        bad = dict(self.OK, round=2, identical=False, mismatch_nodes=["rust-node-4"], diff=["$.x"])
+        self.assertEqual(bc.exit_code(self.summ(self.OK, bad), allow_missing=True), 2)
+
+    def test_nothing_compared_is_three(self):
+        self.assertEqual(bc.exit_code(self.summ()), 3)
+
+
+class RunLoopTest(unittest.TestCase):
+    def test_common_tip_ignores_unreachable_nodes(self):
+        self.assertEqual(bc.common_tip([10, None, 12, 11]), 10)
+        self.assertIsNone(bc.common_tip([None, None]))
+
+    def test_batch_run_compares_reachable_nodes_when_one_is_unreachable(self):
+        import io
+        import types
+        seen = []
+        orig = (bc.node_round, bc.compare_round)
+        rounds = {4001: 5, 4002: 5, 4003: 6, 4004: None}
+        bc.node_round = lambda port: rounds[port]
+
+        def fake(rnd, **kw):
+            seen.append(rnd)
+            return {"kind": "block_compare", "round": rnd, "txn_count": 0, "complete": False, "identical": False,
+                    "missing": ["rust-node-4"], "hash_match": True}
+
+        bc.compare_round = fake
+        try:
+            args = types.SimpleNamespace(from_round=1, to_round=0, follow=False, stop_file=None,
+                                         poll_interval=0, max_idle_s=0, retries=1)
+            s = bc.run(args, io.StringIO())
+        finally:
+            bc.node_round, bc.compare_round = orig
+        self.assertEqual(seen, [1, 2, 3, 4, 5])
+        self.assertEqual(s["incomplete_rounds"], 5)
+        self.assertEqual(s["nodes_missing"], {"rust-node-4": 5})
 
 
 if __name__ == "__main__":

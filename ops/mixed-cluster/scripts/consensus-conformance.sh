@@ -75,6 +75,9 @@
 #                         PHASE6_GO_ARCHIVAL=1 so the Go nodes keep every
 #                         block for the post-hoc verifiers.
 #   WORKLOAD_SEED         seed of the rich workload schedule (default 1674)
+#   CERT_WINDOW           opt-in (default 0 = off): restrict the cert
+#                         cross-verify to the last N rounds (#1777 workaround);
+#                         recorded as a cert_window_clamped WARN check
 #   SKIP_START=1          use an already-running cluster
 #   KEEP_CLUSTER=1        leave the cluster up on exit
 #   REUSE_NETROOT=1       keep an existing netroot/ (keys, genesis, Go
@@ -155,10 +158,12 @@ mkdir -p "$OUT_DIR"
 CHECKS_FILE="$OUT_DIR/.checks.tsv"
 : > "$CHECKS_FILE"
 
-record() {  # record <name> <pass|fail> <detail>
+record() {  # record <name> <pass|fail|warn> <detail>
     printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$CHECKS_FILE"
     if [ "$2" = "pass" ]; then
         echo "    [PASS] $1: $3"
+    elif [ "$2" = "warn" ]; then
+        echo "    [WARN] $1: $3"
     else
         echo "    [FAIL] $1: $3" >&2
     fi
@@ -463,6 +468,9 @@ fi
     > "$OUT_DIR/verify.log" 2>&1 || verify_rc=$?
 tail -20 "$OUT_DIR/verify.log" || true
 
+if grep -q "CERT_WINDOW_CLAMPED=1" "$OUT_DIR/verify.log"; then
+    record "cert_window_clamped" warn "$(grep -m1 'CERT_WINDOW_CLAMPED=1' "$OUT_DIR/verify.log" | sed 's/^ *//')"
+fi
 if [ "$WORKLOAD" = "rich" ]; then
     if grep -q "blockcompare exit: 0" "$OUT_DIR/verify.log"; then
         record "blockcompare_recheck" pass "blockcompare.jsonl re-checked clean by verify-soak.sh"

@@ -159,9 +159,12 @@ fi
 WORKLOAD_PID=""
 BLOCKCOMPARE_PID=""
 if [ "$WORKLOAD" = "rich" ]; then
-    START_ROUND="$(curl -sf -H "X-Algo-API-Token: $ALGOD_TOKEN" http://127.0.0.1:4001/v2/status         | python3 -c 'import json,sys; print(json.load(sys.stdin)["last-round"])' | tr -d '')"
+    START_JSON="$(curl -sf -H "X-Algo-API-Token: $ALGOD_TOKEN" http://127.0.0.1:4001/v2/status || true)"
+    START_ROUND="$(printf '%s' "$START_JSON" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["last-round"])' 2>/dev/null || true)"
+    START_ROUND="${START_ROUND//$'\r'/}"
     if ! [[ "$START_ROUND" =~ ^[0-9]+$ ]]; then
-        echo "error: could not read the start round from go-node-1" >&2
+        echo "error: could not read the start round from go-node-1 (GET http://127.0.0.1:4001/v2/status failed or returned no last-round)" >&2
         exit 2
     fi
     echo "==> rich workload: seed=$WORKLOAD_SEED start_round=$START_ROUND"
@@ -176,28 +179,42 @@ fi
 
 # Stop the helpers on any exit path so a failed collector never leaves a
 # workload or comparator running against the cluster.
+WORKLOAD_RC=0
+BLOCKCOMPARE_RC=0
 stop_rich_helpers() {
-    if [ -n "$WORKLOAD_PID" ] && kill -0 "$WORKLOAD_PID" 2>/dev/null; then
-        kill -TERM "$WORKLOAD_PID" 2>/dev/null || true
-        for _ in $(seq 1 90); do
+    if [ -n "$WORKLOAD_PID" ]; then
+        # workload.py stops itself a few rounds before the soak ends; give
+        # it time to finish its step and write workload_summary, then ask.
+        for _ in $(seq 1 60); do
             kill -0 "$WORKLOAD_PID" 2>/dev/null || break
             sleep 2
         done
-        kill -KILL "$WORKLOAD_PID" 2>/dev/null || true
+        if kill -0 "$WORKLOAD_PID" 2>/dev/null; then
+            kill -TERM "$WORKLOAD_PID" 2>/dev/null || true
+            for _ in $(seq 1 45); do
+                kill -0 "$WORKLOAD_PID" 2>/dev/null || break
+                sleep 2
+            done
+            kill -KILL "$WORKLOAD_PID" 2>/dev/null || true
+        fi
+        wait "$WORKLOAD_PID" || WORKLOAD_RC=$?
     fi
-    if [ -n "$BLOCKCOMPARE_PID" ] && kill -0 "$BLOCKCOMPARE_PID" 2>/dev/null; then
+    if [ -n "$BLOCKCOMPARE_PID" ]; then
         # It exits by itself after the last target round; give it time to
         # drain, then ask it to stop.
         for _ in $(seq 1 60); do
             kill -0 "$BLOCKCOMPARE_PID" 2>/dev/null || break
             sleep 2
         done
-        touch "$BLOCKCOMPARE_STOP"
-        for _ in $(seq 1 15); do
-            kill -0 "$BLOCKCOMPARE_PID" 2>/dev/null || break
-            sleep 2
-        done
-        kill -TERM "$BLOCKCOMPARE_PID" 2>/dev/null || true
+        if kill -0 "$BLOCKCOMPARE_PID" 2>/dev/null; then
+            touch "$BLOCKCOMPARE_STOP"
+            for _ in $(seq 1 15); do
+                kill -0 "$BLOCKCOMPARE_PID" 2>/dev/null || break
+                sleep 2
+            done
+            kill -TERM "$BLOCKCOMPARE_PID" 2>/dev/null || true
+        fi
+        wait "$BLOCKCOMPARE_PID" || BLOCKCOMPARE_RC=$?
     fi
     WORKLOAD_PID=""
     BLOCKCOMPARE_PID=""
@@ -226,6 +243,15 @@ set -e
 if [ "$WORKLOAD" = "rich" ]; then
     echo "==> stopping rich workload and draining blockcompare"
     stop_rich_helpers
+    if [ "$WORKLOAD_RC" -ne 0 ]; then
+        echo "error: workload.py exited with status $WORKLOAD_RC - see $OUT_DIRNAME/workload.log" >&2
+    fi
+    if [ "$BLOCKCOMPARE_RC" -ne 0 ]; then
+        echo "error: blockcompare.py exited with status $BLOCKCOMPARE_RC (2 = nodes disagree, 3 = incomplete coverage) - see $OUT_DIRNAME/blockcompare.log" >&2
+    fi
+    if [ "$rc" -eq 0 ] && { [ "$WORKLOAD_RC" -ne 0 ] || [ "$BLOCKCOMPARE_RC" -ne 0 ]; }; then
+        rc=1
+    fi
     for f in "$WORKLOAD_OUT" "$BLOCKCOMPARE_OUT"; do
         echo "    $(basename "$f"): $(wc -l < "$f" 2>/dev/null | tr -d ' ') record(s)"
     done
@@ -240,6 +266,8 @@ for line in sys.stdin:
         print("    blockcompare: rounds={0} non_payment={1} mismatches={2} hash_mismatches={3} degraded={4}".format(
             r.get("rounds_compared"), r.get("rounds_non_payment"), r.get("mismatch_count"),
             r.get("hash_mismatch_count"), r.get("degraded_rounds")))
+        print("    blockcompare: incomplete={0} missing_per_node={1}".format(
+            r.get("incomplete_rounds"), r.get("nodes_missing")))
 ' || true
 fi
 

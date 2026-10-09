@@ -132,6 +132,11 @@ jobs:
             rounds="${IN_ROUNDS:-200}"
           fi
           case "$rounds" in ''|*[!0-9]*) echo "rounds must be a number" >&2; exit 1 ;; esac
+          [ "${#rounds}" -le 6 ] || { echo "rounds too long" >&2; exit 1; }
+          seed="${IN_SEED:-1674}"
+          case "$seed" in ''|*[!0-9]*) echo "seed must be digits only" >&2; exit 1 ;; esac
+          [ "${#seed}" -le 10 ] || { echo "seed must be at most 10 digits" >&2; exit 1; }
+          case "$workload" in plain|rich) ;; *) echo "workload must be plain or rich" >&2; exit 1 ;; esac
           # ~3 s/round soak + ~75 min of build, Tier 1, restart/negative
           # stages and verifiers. Plain nightly keeps its 120 min stop; a
           # long or rich run gets at least 240 (GitHub's cap is 360).
@@ -148,7 +153,7 @@ jobs:
           {
             echo "workload=$workload"
             echo "rounds=$rounds"
-            echo "seed=${IN_SEED:-1674}"
+            echo "seed=$seed"
             echo "timeout=$timeout"
           } >> "$GITHUB_OUTPUT"
           echo "workload=$workload rounds=$rounds timeout=${timeout}m"
@@ -294,6 +299,10 @@ jobs:
           ROUNDS: ${{ needs.plan.outputs.rounds }}
           WORKLOAD: ${{ needs.plan.outputs.workload }}
           WORKLOAD_SEED: ${{ needs.plan.outputs.seed }}
+          # Explicit, recorded (WARN row cert_window_clamped) workaround for
+          # #1777: on runs over 900 rounds cert cross-verify only covers the
+          # last 900 rounds.
+          CERT_WINDOW: ${{ fromJSON(needs.plan.outputs.rounds) > 900 && '900' || '0' }}
           GO_ALGORAND_DIR: ${{ runner.temp }}/go-algorand-src
         run: make consensus-cluster-test RESTART_SCENARIOS=1 NEGATIVE_CASES=1
 

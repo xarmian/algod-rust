@@ -237,6 +237,87 @@ class ScenarioTest(unittest.TestCase):
         self.assertTrue(any(r.get("outcome") == "rejected" for r in records(out)))
 
 
+class RobustnessTest(unittest.TestCase):
+    def test_negative_build_failure_is_a_failed_step_with_the_output(self):
+        env = FakeEnv(fail=("BUILD",))
+        w, out = make(env)
+        w.negative("close_account_with_assets", "BUILD me", "/tmp/w/neg.stxn")
+        step = [r for r in records(out) if r["kind"] == "workload_step"][0]
+        self.assertFalse(step["ok"])
+        self.assertEqual(step["outcome"], "error")
+        self.assertIn("boom", step["detail"])
+        self.assertEqual(env.posts, [])
+        self.assertEqual(w.counters["unexpected"], 1)
+
+    def test_setup_abort_returns_nonzero_and_still_writes_summary(self):
+        class DeadKmd(FakeEnv):
+            def goal(self, args, timeout=180):
+                return 1, "Couldn't list wallets: connection refused"
+
+        out = io.StringIO()
+        w = wl.Workload(DeadKmd(), out, 1, funder=ADDR)
+        self.assertEqual(w.run_all(), 2)
+        kinds = [r["kind"] for r in records(out)]
+        self.assertIn("workload_abort", kinds)
+        self.assertEqual(kinds[-1], "workload_summary")
+        self.assertEqual([r for r in records(out) if r["kind"] == "workload_abort"][0]["scenario"], "setup")
+
+    def test_funding_failure_in_setup_returns_nonzero(self):
+        env = FakeEnv(fail=("clerk send",))
+        out = io.StringIO()
+        w = wl.Workload(env, out, 1, funder=ADDR)
+        self.assertEqual(w.run_all(), 2)
+
+    def test_unexpected_exception_in_setup_is_recorded(self):
+        class Boom(FakeEnv):
+            def current_round(self):
+                raise RuntimeError("rest exploded")
+
+        out = io.StringIO()
+        w = wl.Workload(Boom(), out, 1, funder=ADDR)
+        self.assertEqual(w.run_all(), 2)
+        self.assertEqual(records(out)[-1]["kind"], "workload_summary")
+
+    def test_rest_error_in_a_scenario_aborts_only_that_scenario(self):
+        import urllib.error
+
+        class RestDown(FakeEnv):
+            def rest_json(self, path, node="go-node-1"):
+                if "/v2/accounts/" in path:
+                    raise urllib.error.URLError("connection refused")
+                return super().rest_json(path, node)
+
+        out = io.StringIO()
+        ticks = iter(range(0, 100_000, 5))
+        w = wl.Workload(RestDown(), out, 1, duration_s=3000, funder=ADDR, clock=lambda: next(ticks))
+        rc = w.run_all()
+        recs = records(out)
+        self.assertEqual(rc, 0)
+        self.assertEqual(recs[-1]["kind"], "workload_summary")
+        aborts = [r for r in recs if r["kind"] == "workload_abort"]
+        self.assertTrue(aborts)
+        self.assertTrue(any("URLError" in a["reason"] for a in aborts))
+        failed = [r for r in recs if r["kind"] == "workload_step" and not r["ok"]]
+        self.assertTrue(failed)
+        # scenarios that need no account lookup still ran after the failures
+        self.assertGreater(len(w.scenario_counts), 1)
+
+    def test_json_error_is_caught_too(self):
+        class BadJson(FakeEnv):
+            def rest_json(self, path, node="go-node-1"):
+                if "/v2/accounts/" in path:
+                    return {"unexpected": "shape"}
+                return super().rest_json(path, node)
+
+        out = io.StringIO()
+        ticks = iter(range(0, 100_000, 5))
+        w = wl.Workload(BadJson(), out, 1, only=["min_balance"], duration_s=200, funder=ADDR,
+                        clock=lambda: next(ticks))
+        w.run_all()
+        self.assertEqual(records(out)[-1]["kind"], "workload_summary")
+        self.assertTrue([r for r in records(out) if r["kind"] == "workload_abort"])
+
+
 class NegativeTest(unittest.TestCase):
     def neg(self, post_status):
         env = FakeEnv(post_status=post_status)

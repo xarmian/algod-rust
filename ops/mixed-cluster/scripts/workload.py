@@ -329,8 +329,11 @@ class Workload:
         self.gate()
         rc, out = self.env.sh(build_cmd)
         if rc != 0:
-            # goal itself refused to build it: nothing to compare.
-            self.record_step(op, "rejected", "rejected", {}, "goal build refused: " + out, submissions=[])
+            # The build/sign command itself failed (kmd down, bad flag, ...):
+            # nothing was submitted, so this is NOT evidence that both nodes
+            # reject the transaction.  Record a failed step with the output.
+            self.record_step(op, "error", "rejected", {}, "build/sign failed (rc={}): {}".format(rc, out),
+                             submissions=[])
             return
         rc, b64 = self.env.fetch_file_b64(out_file)
         if rc != 0 or not b64:
@@ -756,16 +759,27 @@ class Workload:
             names.append(rng.choices(pool, weights)[0])
         return names[:count]
 
+    def abort(self, scenario, reason, exception=False):
+        self.emit({"kind": "workload_abort", "scenario": scenario, "reason": reason[:600],
+                   "exception": exception, "t_utc": utc_now()})
+
     def run_all(self):
+        """Run until the budget is spent.  Returns the process exit status:
+        2 if setup failed (kmd never ready, funding failed, ...), else 0.
+        A workload_summary is always written."""
         try:
             self.setup()
         except StopRequested:
             self.finish()
-            return
-        except ScenarioAbort as e:
-            self.emit({"kind": "workload_abort", "scenario": "setup", "reason": str(e)[:600], "t_utc": utc_now()})
+            return 0
+        except (ScenarioAbort, SystemExit) as e:
+            self.abort("setup", str(e))
             self.finish()
-            return
+            return 2
+        except Exception as e:  # noqa: BLE001 - REST/JSON/OS errors must not kill the run silently
+            self.abort("setup", "unexpected {}: {}".format(type(e).__name__, e), exception=True)
+            self.finish()
+            return 2
         i = 0
         while not self.should_stop():
             name = self.plan(i + 1)[i]
@@ -776,12 +790,23 @@ class Workload:
             except StopRequested:
                 break
             except ScenarioAbort as e:
-                self.emit({"kind": "workload_abort", "scenario": name, "reason": str(e)[:300], "t_utc": utc_now()})
+                self.abort(name, str(e))
+                self.env.sleep(2)
+            except Exception as e:  # noqa: BLE001 - e.g. URLError / KeyError from REST helpers
+                reason = "unexpected {}: {}".format(type(e).__name__, e)
+                # A failed step so the analyzer cannot count this as success.
+                self.record_step("exception:" + name, "error", "confirmed", {}, reason)
+                self.abort(name, reason, exception=True)
                 self.env.sleep(2)
             i += 1
         self.finish()
+        return 0
 
     def finish(self):
+        try:
+            end_round = self.env.current_round()
+        except Exception:  # noqa: BLE001 - the summary must always be written
+            end_round = None
         self.emit({
             "kind": "workload_summary",
             "seed": self.seed,
@@ -793,7 +818,7 @@ class Workload:
             "op_counts": self.op_counts,
             "scenario_counts": self.scenario_counts,
             "start_round": self.start_round,
-            "end_round": self.env.current_round(),
+            "end_round": end_round,
             "t_utc": utc_now(),
         })
 
@@ -831,13 +856,7 @@ def main():
 
         signal.signal(signal.SIGTERM, _stop)
         signal.signal(signal.SIGINT, _stop)
-        try:
-            w.run_all()
-        except SystemExit as e:
-            w.emit({"kind": "workload_abort", "scenario": "setup", "reason": str(e), "t_utc": utc_now()})
-            w.finish()
-            return 2
-    return 0
+        return w.run_all()
 
 
 if __name__ == "__main__":

@@ -141,7 +141,8 @@ Triage of a red run:
 
 ## Known limits
 
-* `verify-soak.sh` cert cross-verify covers only the last 900 rounds (`CERT_WINDOW`); the Rust ledger did not serve round 1 on a 2700-round run (#1777). The fork detector and the live block comparison cover every round.
+* Cert cross-verify cannot cover a very long run: the Rust ledger did not serve round 1 on a 2700-round run (#1777). `CERT_WINDOW=N` (opt-in, default off) restricts it to the last N rounds; the CI workflow sets 900 for runs over 900 rounds. A clamp is never silent: `verify.log` carries `CERT_WINDOW_CLAMPED=1` and `summary.json` a `cert_window_clamped` WARN row. The fork detector and the live block comparison always cover every round.
+* The comparison is strict by design (a harness that can pass vacuously is worthless): a round where any of the 4 nodes (or its block hash) could not be fetched is `incomplete` and fails the run, as does a soak where fewer than 90% of the rounds were compared (`--min-compare-coverage`), a Rust node absent from a compared round, no committed close-to / inner-txn / box-ref / axfer / appl, a missing `workload_summary`, any `workload_abort` (setup included), and any workload step whose outcome differed from its expectation. `--allow-missing` (blockcompare and analyze) is the explicit opt-out for missing nodes.
 
 * The workload is single-threaded (one `goal` call at a time), so blocks carry a few
   transactions each, not a stress load. Throughput testing is `docker/scripts/bench-stress.sh`.

@@ -237,6 +237,7 @@ def block_facts(block: dict) -> dict:
     types = {}
     inner = 0
     boxes = 0
+    closes = 0
     for t in txns:
         txn = t.get("txn") or {}
         ty = txn.get("type", "?")
@@ -246,12 +247,15 @@ def block_facts(block: dict) -> dict:
             inner += 1
         if txn.get("apbx"):
             boxes += 1
+        if txn.get("close") or txn.get("aclose"):
+            closes += 1
     return {
         "txn_count": len(txns),
         "types": types,
         "non_payment": any(k != "pay" for k in types),
         "inner_txn_txns": inner,
         "box_ref_txns": boxes,
+        "close_txns": closes,
     }
 
 
@@ -264,6 +268,10 @@ def summarize_records(records) -> dict:
         "mismatches": [],
         "hash_mismatches": [],
         "degraded_rounds": 0,
+        "incomplete_rounds": 0,
+        "missing_rounds": 0,
+        "close_txns": 0,
+        "rust_rounds": 0,
         "txn_types": {},
         "inner_txn_txns": 0,
         "box_ref_txns": 0,
@@ -275,10 +283,25 @@ def summarize_records(records) -> dict:
             continue
         if r.get("degraded"):
             s["degraded_rounds"] += 1
+            s["missing_rounds"] += 1
             for n in r.get("missing", []):
                 s["nodes_missing"][n] = s["nodes_missing"].get(n, 0) + 1
             continue
+        if r.get("complete") is False:
+            # Some node could not be fetched: this round proves nothing.
+            s["incomplete_rounds"] += 1
+            s["missing_rounds"] += 1
+            for n in r.get("missing", []):
+                s["nodes_missing"][n] = s["nodes_missing"].get(n, 0) + 1
+            if r.get("mismatch_nodes"):
+                s["mismatches"].append({"round": r["round"], "nodes": r["mismatch_nodes"], "diff": r.get("diff", [])})
+            if not r.get("hash_match", True):
+                s["hash_mismatches"].append({"round": r["round"], "hashes": r.get("hashes", {}),
+                                             "missing": r.get("hash_missing", [])})
+            continue
         s["rounds_compared"] += 1
+        if "rust-node-4" in (r.get("nodes_compared") or []):
+            s["rust_rounds"] += 1
         tc = r.get("txn_count", 0)
         s["total_txns"] += tc
         if tc:
@@ -289,10 +312,12 @@ def summarize_records(records) -> dict:
             s["txn_types"][ty] = s["txn_types"].get(ty, 0) + c
         s["inner_txn_txns"] += r.get("inner_txn_txns", 0)
         s["box_ref_txns"] += r.get("box_ref_txns", 0)
+        s["close_txns"] += r.get("close_txns", 0)
         if not r.get("identical", True):
             s["mismatches"].append({"round": r["round"], "nodes": r.get("mismatch_nodes", []), "diff": r.get("diff", [])})
         if not r.get("hash_match", True):
-            s["hash_mismatches"].append({"round": r["round"], "hashes": r.get("hashes", {})})
+            s["hash_mismatches"].append({"round": r["round"], "hashes": r.get("hashes", {}),
+                                         "missing": r.get("hash_missing", [])})
     return s
 
 
@@ -320,19 +345,35 @@ def fetch_hash(port, rnd):
     return json.loads(http_get(port, "/v2/blocks/{}/hash".format(rnd))).get("blockHash")
 
 
-def compare_round(rnd, fetch=fetch_block, fetch_h=fetch_hash, nodes=NODES, reference=REFERENCE):
-    """Compare one round across nodes; returns a block_compare record."""
+def common_tip(rounds):
+    """Highest round every REACHABLE node has; None when none is reachable."""
+    known = [r for r in rounds if r is not None]
+    return min(known) if known else None
+
+
+def compare_round(rnd, fetch=fetch_block, fetch_h=fetch_hash, nodes=NODES, reference=REFERENCE,
+                  retries=3, sleep=time.sleep):
+    """Compare one round across nodes; returns a block_compare record.
+
+    `identical` is True only when EVERY node was fetched and all `block`
+    values are byte-equal.  A node that cannot be fetched (after `retries`
+    attempts) makes the round incomplete, never identical."""
     raw = {}
     errors = {}
     for name, port in nodes:
-        try:
-            full = fetch(port, rnd)
-            blk = map_entry_slice(full, "block")
-            if blk is None:
-                raise MsgpackError("no `block` entry in response")
-            raw[name] = blk
-        except Exception as e:  # noqa: BLE001 - recorded, not swallowed
-            errors[name] = str(e)[:120]
+        for attempt in range(max(1, retries)):
+            try:
+                full = fetch(port, rnd)
+                blk = map_entry_slice(full, "block")
+                if blk is None:
+                    raise MsgpackError("no `block` entry in response")
+                raw[name] = blk
+                errors.pop(name, None)
+                break
+            except Exception as e:  # noqa: BLE001 - recorded, not swallowed
+                errors[name] = str(e)[:120]
+                if attempt + 1 < max(1, retries):
+                    sleep(1.0)
     rec = {"kind": "block_compare", "round": rnd}
     if reference not in raw or len(raw) < 2:
         rec.update({"degraded": True, "missing": sorted(errors), "errors": errors})
@@ -341,7 +382,8 @@ def compare_round(rnd, fetch=fetch_block, fetch_h=fetch_hash, nodes=NODES, refer
     ref_val, _ = decode(ref)
     rec.update(block_facts(ref_val))
     mism = sorted(n for n, b in raw.items() if b != ref)
-    rec["identical"] = not mism
+    rec["complete"] = not errors and len(raw) == len(nodes)
+    rec["identical"] = rec["complete"] and not mism
     rec["nodes_compared"] = sorted(raw)
     rec["bytes"] = len(ref)
     if errors:
@@ -355,11 +397,13 @@ def compare_round(rnd, fetch=fetch_block, fetch_h=fetch_hash, nodes=NODES, refer
     for name, port in nodes:
         try:
             hashes[name] = fetch_h(port, rnd)
-        except Exception:  # noqa: BLE001 - hash endpoint is advisory
+        except Exception:  # noqa: BLE001 - a missing hash is a failed match
             hashes[name] = None
     known = {h for h in hashes.values() if h}
     rec["hashes"] = hashes
-    rec["hash_match"] = len(known) <= 1
+    rec["hash_missing"] = sorted(n for n, h in hashes.items() if not h)
+    # Every node must report a hash and they must all agree.
+    rec["hash_match"] = not rec["hash_missing"] and len(known) == 1
     return rec
 
 
@@ -385,14 +429,16 @@ def run(args, out, now=time.time):
     idle_since = now()
     while not (stop["flag"] or (args.stop_file and os.path.exists(args.stop_file))):
         rounds = [node_round(p) for _, p in NODES]
-        tip = None if any(r is None for r in rounds) else min(rounds)
+        # An unreachable node must not stop the comparison of the others:
+        # its rounds are recorded as incomplete (and fail the check).
+        tip = common_tip(rounds)
         upper = tip
         if tip is not None and args.to_round:
             upper = min(tip, args.to_round)
         if upper is not None and nxt <= upper:
             idle_since = now()
             while nxt <= upper and not stop["flag"]:
-                rec = compare_round(nxt)
+                rec = compare_round(nxt, retries=getattr(args, "retries", 3))
                 records.append(rec)
                 out.write(json.dumps(rec, sort_keys=True) + "\n")
                 out.flush()
@@ -429,6 +475,10 @@ def main():
     ap.add_argument("--stop-file", default=None, help="Stop (after finishing the pending round) when this file exists.")
     ap.add_argument("--poll-interval", type=float, default=1.0)
     ap.add_argument("--max-idle-s", type=float, default=0, help="Follow mode: stop after S s without new rounds.")
+    ap.add_argument("--retries", type=int, default=3, help="Fetch attempts per node and round (default 3).")
+    ap.add_argument("--allow-missing", action="store_true",
+                    help="Do not fail when some node could not be fetched or reported no hash "
+                         "(default: any missing node or hash fails the run).")
     args = ap.parse_args()
     if args.summarize:
         with open(args.summarize, encoding="utf-8") as f:
@@ -442,10 +492,21 @@ def main():
         with open(args.out, "w", encoding="utf-8") as out:
             s = run(args, out)
     print(json.dumps({k: s[k] for k in ("rounds_compared", "rounds_non_payment", "mismatch_count",
-                                         "hash_mismatch_count", "degraded_rounds", "last_round")}))
-    if s["mismatch_count"] or s["hash_mismatch_count"]:
+                                         "hash_mismatch_count", "degraded_rounds", "incomplete_rounds",
+                                         "nodes_missing", "last_round")}))
+    return exit_code(s, args.allow_missing)
+
+
+def exit_code(s, allow_missing=False):
+    """2 = a node disagreed; 3 = incomplete coverage (a node or hash was
+    missing, or nothing compared); 0 = every compared round complete+equal."""
+    real_hash = [h for h in s["hash_mismatches"] if not h.get("missing")]
+    if s["mismatches"] or real_hash:
         return 2
     if s["rounds_compared"] == 0:
+        return 3
+    hash_missing = [h for h in s["hash_mismatches"] if h.get("missing")]
+    if (s["missing_rounds"] or hash_missing) and not allow_missing:
         return 3
     return 0
 

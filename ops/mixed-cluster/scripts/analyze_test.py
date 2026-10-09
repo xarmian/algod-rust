@@ -617,7 +617,8 @@ class ParticipationEndpointTest(unittest.TestCase):
 
 
 def bc_rec(rnd, **kw):
-    rec = {"kind": "block_compare", "round": rnd, "txn_count": 0, "identical": True, "hash_match": True}
+    rec = {"kind": "block_compare", "round": rnd, "txn_count": 0, "complete": True, "identical": True,
+           "hash_match": True, "nodes_compared": ["go-node-1", "go-node-2", "go-node-3", "rust-node-4"]}
     rec.update(kw)
     return rec
 
@@ -627,7 +628,7 @@ def rich_blockcompare():
     return [
         bc_rec(1),
         bc_rec(2, txn_count=2, types={"pay": 2}),
-        bc_rec(3, txn_count=3, non_payment=True, types={"acfg": 1, "axfer": 1, "afrz": 1}),
+        bc_rec(3, txn_count=3, non_payment=True, types={"acfg": 1, "axfer": 1, "afrz": 1}, close_txns=1),
         bc_rec(4, txn_count=2, non_payment=True, types={"appl": 2}, inner_txn_txns=1, box_ref_txns=1),
     ]
 
@@ -726,12 +727,86 @@ class RichWorkloadTest(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertIn("empty round", " ".join(res["failures"]))
 
-    def test_unexpected_go_outcome_is_a_note_not_a_failure(self):
+    def test_must_reject_step_that_was_accepted_is_a_failure(self):
         wl = rich_workload(more=[{"kind": "workload_step", "seq": 9, "op": "asset_send_frozen",
                                   "outcome": "confirmed", "expect": "rejected", "ok": False}])
         res = self.check(wl=wl)
+        self.assertFalse(res["ok"])
+        self.assertIn("asset_send_frozen", " ".join(res["failures"]))
+
+    def test_must_confirm_step_that_failed_is_a_failure(self):
+        wl = rich_workload(more=[{"kind": "workload_step", "seq": 9, "op": "app_create",
+                                  "outcome": "rejected", "expect": "confirmed", "ok": False}])
+        res = self.check(wl=wl)
+        self.assertFalse(res["ok"])
+        self.assertIn("app_create", " ".join(res["failures"]))
+
+    def test_build_error_step_is_a_failure(self):
+        wl = rich_workload(more=[{"kind": "workload_step", "seq": 9, "op": "pay_below_min_balance",
+                                  "outcome": "error", "expect": "rejected", "ok": False}])
+        self.assertFalse(self.check(wl=wl)["ok"])
+
+    def test_optional_step_failure_is_only_a_note(self):
+        wl = rich_workload(more=[{"kind": "workload_step", "seq": 9, "op": "maybe", "optional": True,
+                                  "outcome": "rejected", "expect": "confirmed", "ok": False}])
+        res = self.check(wl=wl)
         self.assertTrue(res["ok"], res["failures"])
-        self.assertIn("asset_send_frozen", res["notes"][0])
+        self.assertIn("maybe", res["notes"][0])
+
+    def test_setup_abort_is_a_hard_failure(self):
+        wl = rich_workload(more=[{"kind": "workload_abort", "scenario": "setup", "reason": "kmd never became ready"}])
+        res = self.check(wl=wl)
+        self.assertFalse(res["ok"])
+        self.assertIn("setup", " ".join(res["failures"]))
+
+    def test_any_scenario_abort_is_a_failure(self):
+        wl = rich_workload(more=[{"kind": "workload_abort", "scenario": "asset", "reason": "URLError"}])
+        self.assertFalse(self.check(wl=wl)["ok"])
+
+    def test_missing_workload_summary_is_a_failure(self):
+        wl = [r for r in rich_workload() if r["kind"] != "workload_summary"]
+        res = self.check(wl=wl)
+        self.assertFalse(res["ok"])
+        self.assertIn("workload_summary", " ".join(res["failures"]))
+
+    def test_one_missing_node_in_one_round_fails(self):
+        bc = rich_blockcompare() + [bc_rec(5, complete=False, identical=False, missing=["rust-node-4"])]
+        res = self.check(bc=bc)
+        self.assertFalse(res["ok"])
+        self.assertIn("rust-node-4", " ".join(res["failures"]))
+
+    def test_allow_missing_tolerates_a_missing_node(self):
+        bc = rich_blockcompare() + [bc_rec(5, complete=False, identical=False, missing=["go-node-3"])]
+        res = self.check(bc=bc, allow_missing=True)
+        self.assertTrue(res["ok"], res["failures"])
+
+    def test_node_without_hash_fails(self):
+        bc = rich_blockcompare() + [bc_rec(5, hash_match=False, hash_missing=["rust-node-4"], hashes={})]
+        res = self.check(bc=bc)
+        self.assertFalse(res["ok"])
+        self.assertIn("rust-node-4", " ".join(res["failures"]))
+
+    def test_coverage_of_the_soak_window_is_required(self):
+        res = self.check(expected_rounds=100)
+        self.assertFalse(res["ok"])
+        self.assertIn("coverage", " ".join(res["failures"]))
+        self.assertTrue(self.check(expected_rounds=4)["ok"])
+        self.assertTrue(self.check(expected_rounds=4, min_compare_coverage=1.0)["ok"])
+        self.assertFalse(self.check(expected_rounds=5, min_compare_coverage=1.0)["ok"])
+
+    def test_rust_node_must_take_part_in_every_compared_round(self):
+        bc = rich_blockcompare()
+        bc[1]["nodes_compared"] = ["go-node-1", "go-node-2", "go-node-3"]
+        res = self.check(bc=bc)
+        self.assertFalse(res["ok"])
+        self.assertIn("rust-node-4", " ".join(res["failures"]))
+
+    def test_close_to_must_be_committed(self):
+        bc = rich_blockcompare()
+        bc[2]["close_txns"] = 0
+        res = self.check(bc=bc)
+        self.assertFalse(res["ok"])
+        self.assertIn("close", " ".join(res["failures"]))
 
     def test_degraded_comparison_fails(self):
         bc = rich_blockcompare() + [{"kind": "block_compare", "round": r, "degraded": True,
@@ -745,6 +820,13 @@ class RichWorkloadTest(unittest.TestCase):
         res = analyze.rich_workload_check([], [bc_rec(1), bc_rec(2, txn_count=1, types={"pay": 1})],
                                           min_nonpay_rounds=0, require_coverage=False)
         self.assertTrue(res["ok"], res["failures"])
+        # ... but even then a missing node is fatal
+        res = analyze.rich_workload_check([], [bc_rec(1, complete=False, identical=False, missing=["rust-node-4"])],
+                                          min_nonpay_rounds=0, require_coverage=False)
+        self.assertFalse(res["ok"])
+        res = analyze.rich_workload_check([], [bc_rec(1), bc_rec(2, txn_count=1, types={"pay": 1})],
+                                          min_nonpay_rounds=0, require_coverage=False)
+        self.assertTrue(res["ok"], res["failures"])
 
     def test_cli_end_to_end(self):
         base = os.path.join(FIXTURES, "issue-1590-stale-genesis-catchup.jsonl")
@@ -754,7 +836,7 @@ class RichWorkloadTest(unittest.TestCase):
                 with open(path, "w") as f:
                     f.write("\n".join(json.dumps(r) for r in recs) + "\n")
             ok = subprocess.run([sys.executable, ANALYZE_PY, base, "--workload", wlp, "--blockcompare", bcp,
-                                 "--json-out", js, "--lag-tolerance", "1000"],
+                                 "--json-out", js, "--lag-tolerance", "1000", "--min-compare-coverage", "0"],
                                 capture_output=True, text=True)
             self.assertIn("cross-implementation agreement", ok.stdout)
             summary = json.load(open(js))
@@ -764,7 +846,7 @@ class RichWorkloadTest(unittest.TestCase):
                 f.write(json.dumps(bc_rec(9, txn_count=1, identical=False, mismatch_nodes=["rust-node-4"],
                                           diff=["$.x"])) + "\n")
             bad = subprocess.run([sys.executable, ANALYZE_PY, base, "--workload", wlp, "--blockcompare", bcp,
-                                  "--json-out", js, "--lag-tolerance", "1000"],
+                                  "--json-out", js, "--lag-tolerance", "1000", "--min-compare-coverage", "0"],
                                  capture_output=True, text=True)
             self.assertIn("block bytes differ at round 9", bad.stdout)
             self.assertFalse(json.load(open(js))["rich_workload"]["ok"])
