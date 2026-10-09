@@ -126,8 +126,12 @@ pub fn apply_state_proof<L: LedgerStore>(
                 ctx.round.saturating_sub(1)
             ))
         })?;
-    let next_state_proof_rnd =
-        crate::block_header::state_proof_next_round(&prev_hdr.state_proof_tracking);
+    // go reads the cow's value, which an earlier state proof of the same
+    // block may already have advanced (issue #1791).
+    let next_state_proof_rnd = match ctx.state_proof_next.get() {
+        0 => crate::block_header::state_proof_next_round(&prev_hdr.state_proof_tracking),
+        advanced => advanced,
+    };
 
     if next_state_proof_rnd == 0 || next_state_proof_rnd != last_round_in_interval {
         return Err(ledger_err(format!(
@@ -204,6 +208,14 @@ pub fn apply_state_proof<L: LedgerStore>(
         verifier
             .verify(last_round_in_interval, msg_hash, &crypto_proof)
             .map_err(|e| ledger_err(format!("applyStateProof: state proof crypto error: {e}")))?;
+    }
+
+    // go `apply.StateProof` (stateproof.go:73): `sp.SetStateProofNextRound(
+    // lastRoundInInterval + StateProofInterval)`, with the current block's
+    // consensus params.
+    if ctx.consensus.state_proof_interval > 0 {
+        ctx.state_proof_next
+            .set(last_round_in_interval.saturating_add(ctx.consensus.state_proof_interval));
     }
 
     Ok(ApplyData::default())
@@ -804,6 +816,45 @@ mod tests {
         };
         apply_state_proof(&store, &ctx2, &second_txn)
             .expect("state proof for the newly-advanced round must also be accepted");
+    }
+
+    /// Issue #1791: go's `apply.StateProof` ends with
+    /// `SetStateProofNextRound(lastRoundInInterval + StateProofInterval)` on
+    /// the block's cow, so a second proof for the same round in one block is
+    /// refused and the next interval's proof is accepted. The advanced value
+    /// is what `endOfBlock` writes into the header.
+    #[test]
+    fn applied_state_proof_advances_the_blocks_next_round_by_one_interval() {
+        let mut store = LedgerState::new();
+        put_header(
+            &mut store,
+            &header_at(1171, CONSENSUS_V41, tracking_value(1024, &[], 0)),
+        );
+        let mut ctx = ApplyContext::new_replay(0, Address::ZERO, 1172);
+        ctx.consensus = consensus_params_for_version(CONSENSUS_V41).unwrap();
+        let stpf = |round: u64| Transaction {
+            txn_type: "stpf".into(),
+            state_proof_message: Some(StateProofMessage {
+                last_attested_round: round,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        apply_state_proof(&store, &ctx, &stpf(1024)).expect("expected round");
+        assert_eq!(
+            ctx.state_proof_next.get(),
+            1280,
+            "1024 + StateProofInterval"
+        );
+
+        let err = apply_state_proof(&store, &ctx, &stpf(1024)).unwrap_err();
+        assert!(
+            format!("{err}").contains("expected different state proof round"),
+            "a repeated proof must be refused: {err}"
+        );
+        apply_state_proof(&store, &ctx, &stpf(1280)).expect("next interval");
+        assert_eq!(ctx.state_proof_next.get(), 1536);
     }
 
     #[test]

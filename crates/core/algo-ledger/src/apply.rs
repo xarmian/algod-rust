@@ -116,6 +116,18 @@ pub struct ApplyContext {
     /// Uses `Cell` for interior mutability — the context is shared via `&`
     /// across all transactions in a block.
     pub txn_counter: Cell<u64>,
+    /// The ledger's `StateProofNextRound` as this block's transactions
+    /// advance it (issue #1791).
+    ///
+    /// Mirrors go's `roundCowState.GetStateProofNextRound` /
+    /// `SetStateProofNextRound` (`ledger/eval/cow.go`): an applied state
+    /// proof transaction moves it to `lastAttestedRound + StateProofInterval`
+    /// (`ledger/apply/stateproof.go:73`), and `endOfBlock` writes the final
+    /// value into the header's `StateProofTracking`. `0` means "no state
+    /// proof applied yet in this block": the value is then the previous
+    /// header's `StateProofNextRound` (with go's enabling-block
+    /// initialization), see [`expected_state_proof_next`].
+    pub state_proof_next: Cell<u64>,
     /// Fee credit available to inner transactions from outer group overpayment.
     ///
     /// Mirrors go-algorand's `EvalParams.FeeCredit`. Computed per group as
@@ -202,6 +214,7 @@ impl ApplyContext {
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
+            state_proof_next: Cell::new(0),
             fee_credit: Cell::new(0),
             fee_residue: Cell::new(0),
             txn_index: Cell::new(0),
@@ -1642,6 +1655,10 @@ pub struct ExecProbe {
     /// The transaction counter after every top-level and inner transaction
     /// of the block (go's `block.TxnCounter`); only set on success.
     pub final_txn_counter: u64,
+    /// The `StateProofNextRound` after every state proof transaction of the
+    /// block (go `cow.GetStateProofNextRound()` at `endOfBlock`, issue
+    /// #1791); only set on success. `0` when state proofs are not enabled.
+    pub final_state_proof_next: u64,
 }
 
 /// [`apply_block_impl_ex`] plus an [`ExecProbe`] out-parameter.
@@ -1780,6 +1797,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
             .unwrap_or(block.timestamp as u64),
         genesis_hash: gh,
         txn_counter: Cell::new(base_txn_counter),
+        state_proof_next: Cell::new(0),
         fee_credit: Cell::new(0),
         fee_residue: Cell::new(0),
         txn_index: Cell::new(0),
@@ -2024,6 +2042,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         p.failed_txn_index = if result.is_err() { failed_txn } else { None };
         if result.is_ok() {
             p.final_txn_counter = ctx.txn_counter.get();
+            p.final_state_proof_next = expected_state_proof_next(store, &ctx, block).unwrap_or(0);
         }
     }
     if result.is_err() {
@@ -2088,7 +2107,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
             validate_absent_online_accounts(store, block, &consensus, ctx.validate)?;
             suspend_absent_accounts(store, block, &consensus)?;
             if ctx.validate {
-                validate_state_proof_tracking(store, block, &consensus)?;
+                validate_state_proof_tracking(store, &ctx, block, &consensus)?;
             }
             apply_proposer_payout(store, block)?;
             record_proposal(store, block)
@@ -2571,6 +2590,54 @@ fn validate_absent_online_accounts<L: crate::store_trait::LedgerStore>(
     Ok(())
 }
 
+/// The ledger's `StateProofNextRound` once this block's state proof
+/// transactions have been applied (go `cow.GetStateProofNextRound()` read by
+/// `endOfBlock`, `ledger/eval/eval.go:1489`; issue #1791).
+///
+/// A state proof applied in the block (`ctx.state_proof_next != 0`) moved it
+/// to `lastAttestedRound + StateProofInterval`; otherwise it is the previous
+/// header's value, initialized as go's `startEvaluator` does
+/// (`eval.go:766-782`) when state proofs are enabled by this very block.
+/// `Some(0)` when the block's protocol has no state proofs; `None` when the
+/// previous header is not in the store (a block applied right after a
+/// catchpoint) or carries no tracking map, so the value cannot be derived
+/// and must not be checked.
+pub(crate) fn expected_state_proof_next<L: crate::store_trait::LedgerStore>(
+    store: &L,
+    ctx: &ApplyContext,
+    block: &Block,
+) -> Option<u64> {
+    let interval = ctx.consensus.state_proof_interval;
+    if interval == 0 {
+        return Some(0);
+    }
+    let advanced = ctx.state_proof_next.get();
+    if advanced != 0 {
+        return Some(advanced);
+    }
+    let prev_hdr = block
+        .round
+        .0
+        .checked_sub(1)
+        .and_then(|r| store.get_block_header(r).ok().flatten())?;
+    // A previous header without any tracking map (state proofs enabled by
+    // this very protocol switch, or a minimal test chain) gives no baseline
+    // to hold the header to.
+    prev_hdr.state_proof_tracking.as_ref()?;
+    let prev = crate::block_header::state_proof_next_round(&prev_hdr.state_proof_tracking);
+    if prev != 0 {
+        return Some(prev);
+    }
+    let voters_round = block
+        .round
+        .0
+        .saturating_add(ctx.consensus.state_proof_voters_lookback)
+        .saturating_add(interval - 1)
+        / interval
+        * interval;
+    Some(voters_round.saturating_add(interval))
+}
+
 /// Cross-check an incoming block's own `state_proof_tracking` `"v"`/`"t"`
 /// fields (voters commitment / online total weight) against an independent
 /// recomputation from the voters-snapshot cache, rejecting a mismatch --
@@ -2586,11 +2653,24 @@ fn validate_absent_online_accounts<L: crate::store_trait::LedgerStore>(
 /// versions.
 fn validate_state_proof_tracking<L: crate::store_trait::LedgerStore>(
     store: &L,
+    ctx: &ApplyContext,
     block: &Block,
     consensus: &ConsensusParams,
 ) -> Result<(), AlgoError> {
     if consensus.state_proof_interval == 0 {
         return Ok(());
+    }
+
+    // go `endOfBlock` (eval.go:1564): the header's `StateProofNextRound`
+    // must equal the cow's, i.e. the previous header's value advanced by
+    // every state proof transaction of this block (issue #1791).
+    if let Some(expected_next) = expected_state_proof_next(store, ctx, block) {
+        let actual_next = crate::block_header::state_proof_next_round(&block.state_proof_tracking);
+        if actual_next != expected_next {
+            return Err(AlgoError::Ledger {
+                message: format!("StateProofNextRound wrong: {actual_next} != {expected_next}"),
+            });
+        }
     }
 
     let (expected_root, expected_weight) =
@@ -9449,6 +9529,7 @@ mod tests {
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
+            state_proof_next: Cell::new(0),
             fee_credit: Cell::new(0),
             fee_residue: Cell::new(0),
             txn_index: Cell::new(0),
@@ -10154,6 +10235,7 @@ mod tests {
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
+            state_proof_next: Cell::new(0),
             fee_credit: Cell::new(0),
             fee_residue: Cell::new(0),
             txn_index: Cell::new(0),
@@ -10337,6 +10419,7 @@ mod tests {
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
+            state_proof_next: Cell::new(0),
             fee_credit: Cell::new(0),
             fee_residue: Cell::new(0),
             txn_index: Cell::new(0),
@@ -10359,6 +10442,7 @@ mod tests {
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
+            state_proof_next: Cell::new(0),
             fee_credit: Cell::new(0),
             fee_residue: Cell::new(0),
             txn_index: Cell::new(0),
@@ -11812,6 +11896,7 @@ return
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
+            state_proof_next: Cell::new(0),
             fee_credit: Cell::new(0),
             fee_residue: Cell::new(0),
             txn_index: Cell::new(0),
@@ -12238,7 +12323,18 @@ return
     // behavior end-to-end through `apply_block_validating`.
 
     fn spt_value(voters_commitment: &[u8], online_total_weight: u64) -> Option<rmpv::Value> {
-        let mut fields = Vec::new();
+        spt_value_with_next(768, voters_commitment, online_total_weight)
+    }
+
+    /// `spt_value` with an explicit `StateProofNextRound`. The default 768 is
+    /// go's enabling-block initialization at round 256 (V41: interval 256,
+    /// lookback 16): `roundUp(256 + 16, 256) + 256` (issue #1791).
+    fn spt_value_with_next(
+        next: u64,
+        voters_commitment: &[u8],
+        online_total_weight: u64,
+    ) -> Option<rmpv::Value> {
+        let mut fields = vec![(rmpv::Value::from("n"), rmpv::Value::from(next))];
         if !voters_commitment.is_empty() {
             fields.push((
                 rmpv::Value::from("v"),
@@ -12300,6 +12396,46 @@ return
         };
         apply_block_validating(&mut state, &block)
             .expect("matching voters commitment/weight must be accepted");
+    }
+
+    /// Issue #1791: go's `endOfBlock` rejects a header whose
+    /// `StateProofNextRound` differs from the cow's
+    /// (`StateProofNextRound wrong: 1024 != 1280`); algod-rust used to accept it
+    /// and even attested to its own wrong proposal.
+    #[test]
+    fn validate_state_proof_tracking_rejects_wrong_next_round() {
+        let (mut state, root, weight) = state_with_voters_snapshot_at_240();
+        // Round 255 tracks NextRound 768, which round 256 must carry on.
+        let prev = algo_types::BlockHeader {
+            round: Round(255),
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            state_proof_tracking: spt_value_with_next(768, &[], 0),
+            ..algo_types::BlockHeader::default()
+        };
+        crate::store_trait::LedgerStore::put_block(
+            &mut state,
+            255,
+            &prev.current_protocol,
+            &algo_codec::canonical_encode_block_header(&prev),
+            &[],
+        )
+        .unwrap();
+        let block = Block {
+            round: Round(256),
+            state_proof_tracking: spt_value_with_next(1024, &root, weight),
+            ..make_empty_block_with_protocol(
+                Address([3u8; 32]),
+                algo_types::consensus::CONSENSUS_V41,
+                None,
+                None,
+            )
+        };
+        let err = apply_block_validating(&mut state, &block).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("StateProofNextRound wrong: 1024 != 768"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -13029,6 +13165,7 @@ return
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
+            state_proof_next: Cell::new(0),
             fee_credit: Cell::new(0),
             fee_residue: Cell::new(0),
             txn_index: Cell::new(0),

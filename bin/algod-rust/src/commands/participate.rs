@@ -1510,6 +1510,10 @@ struct ExecState {
     incomplete: bool,
     /// Scratch passes the last `generate_block` ran (diagnostics, tests).
     last_passes: usize,
+    /// The `StateProofNextRound` the final scratch apply produced for the
+    /// payset `finalize_payset` kept (go `cow.GetStateProofNextRound()` at
+    /// `endOfBlock`); `None` while no payset has been evaluated (issue #1791).
+    final_state_proof_next: Option<u64>,
 }
 
 impl SimpleBlockEvaluator {
@@ -1960,12 +1964,14 @@ impl SimpleBlockEvaluator {
         if pristine.is_empty() {
             return Ok((pristine, 0));
         }
+        exec.final_state_proof_next = None;
         let mut groups = std::mem::take(&mut exec.groups);
         let template = exec.template.clone();
         let mut passes = 0usize;
         let mut dropped = 0usize;
         let mut retried = false;
         let mut bisected = false;
+        let mut final_state_proof_next = None;
         let result = loop {
             passes += 1;
             let result = self.scratch_pass(&template, &pristine, &groups)?;
@@ -1987,6 +1993,7 @@ impl SimpleBlockEvaluator {
                     if total <= self.max_txn_bytes {
                         self.txn_bytes = total;
                         let counted = done.final_txn_counter.saturating_sub(self.hdr.txn_counter);
+                        final_state_proof_next = Some(done.final_state_proof_next);
                         break (payset, counted);
                     }
                     // Largest fitting prefix of groups, from the sizes just
@@ -2079,6 +2086,7 @@ impl SimpleBlockEvaluator {
         self.fees_collected = groups.iter().map(|g| g.fees).sum();
         if let Some(exec) = self.exec.as_mut() {
             exec.last_passes = passes;
+            exec.final_state_proof_next = final_state_proof_next;
         }
         if result.0.is_empty() {
             self.txn_bytes = 0;
@@ -2841,6 +2849,17 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         // `GenerateBlock` output. Falls back to the legacy "included as
         // admitted" behavior only for an evaluator without exec state.
         let (payset, txn_count) = self.finalize_payset()?;
+        // The header's `StateProofTracking.NextRound` is what the payset's
+        // state proof transactions leave behind, not the template's
+        // (previous-round) value: go reads it from the cow at `endOfBlock`
+        // (issue #1791). Taken from the scratch apply, not recomputed here.
+        let state_proof_tracking = match self.exec.as_ref().and_then(|e| e.final_state_proof_next) {
+            Some(next) if next != 0 => algo_ledger::block_header::with_state_proof_next_round(
+                &self.hdr.state_proof_tracking,
+                next,
+            ),
+            _ => self.hdr.state_proof_tracking.clone(),
+        };
 
         // Compute the expired-participation-accounts sweep list (issue #526).
         // Mirrors go's `generateKnockOfflineAccountsList`'s expiry half
@@ -2937,6 +2956,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                 0
             },
             payset,
+            state_proof_tracking,
             ..header_block(&self.hdr)
         };
 
@@ -3410,6 +3430,7 @@ impl PoolLedgerAdapter {
                 spent: Duration::ZERO,
                 incomplete: false,
                 last_passes: 0,
+                final_state_proof_next: None,
             }
         };
 

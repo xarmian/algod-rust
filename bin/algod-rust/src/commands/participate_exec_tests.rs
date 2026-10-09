@@ -75,6 +75,15 @@ fn fixture(
     accounts: &[(Address, AccountData)],
     holdings: &[(Address, u64)],
 ) -> (Arc<Mutex<SqliteLedger>>, Arc<TransactionPool>) {
+    fixture_with_tracking(accounts, holdings, None)
+}
+
+/// [`fixture`] whose round-0 header carries `state_proof_tracking`.
+fn fixture_with_tracking(
+    accounts: &[(Address, AccountData)],
+    holdings: &[(Address, u64)],
+    state_proof_tracking: Option<rmpv::Value>,
+) -> (Arc<Mutex<SqliteLedger>>, Arc<TransactionPool>) {
     let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().expect("ledger")));
     let hdr = genesis_header();
     let block = algo_types::Block {
@@ -85,6 +94,7 @@ fn fixture(
         genesis_id: hdr.genesis_id.clone(),
         genesis_hash: hdr.genesis_hash,
         timestamp: hdr.timestamp,
+        state_proof_tracking,
         ..algo_types::Block::default()
     };
     {
@@ -790,5 +800,96 @@ fn ledger_lock_hold_for_a_full_scratch_pass_is_recorded() {
     assert!(
         algo_ledger::proposal_eval::proposal_metrics_prometheus_text()
             .contains("algod_rust_pool_eval_ledger_lock_hold_max_microseconds")
+    );
+}
+
+// ---- #1791: header fields derived from the payset's apply effects ----
+
+fn spt(next: u64) -> Option<rmpv::Value> {
+    algo_ledger::block_header::with_state_proof_next_round(&None, next)
+}
+
+fn state_proof_txn(last_attested_round: u64) -> SignedTransaction {
+    let mut t = base_txn(Address::STATE_PROOF_SENDER, TxnType::Stpf);
+    t.fee = 0;
+    t.state_proof_type = 0;
+    t.state_proof_message = Some(algo_types::StateProofMessage {
+        last_attested_round,
+        ..Default::default()
+    });
+    t.state_proof = Some(algo_types::StateProofBody::default());
+    SignedTransaction {
+        txn: t,
+        ..Default::default()
+    }
+}
+
+/// The header of a proposal whose payset carries a state proof transaction
+/// holds the `StateProofNextRound` that transaction leaves behind
+/// (`lastAttestedRound + StateProofInterval`), exactly what a replica's real
+/// apply computes. Before #1791 the template's previous-round value was
+/// proposed, so go rejected it: `StateProofNextRound wrong: 1024 != 1280`.
+#[test]
+fn proposal_with_a_state_proof_txn_carries_the_advanced_next_round() {
+    use algo_ledger::shadow_execute::scratch_execute_payset;
+
+    let a = key(1);
+    let b = key(2);
+    let accounts = vec![(a.0, funded(50_000_000)), (b.0, funded(1_000_000))];
+    let (ledger, _pool) = fixture_with_tracking(&accounts, &[], spt(1024));
+
+    let mut prev = genesis_header();
+    prev.state_proof_tracking = spt(1024);
+    let adapter = PoolLedgerAdapter::new(ledger.clone());
+    let mut eval = adapter
+        .start_simple_evaluator(prev, 0, 0)
+        .expect("start_evaluator");
+    assert_eq!(
+        algo_ledger::block_header::state_proof_next_round(&eval.hdr.state_proof_tracking),
+        1024,
+        "the template inherits the previous round value"
+    );
+
+    eval.transaction_group(&[pay(&a, b.0, 2_000_000, None)])
+        .expect("payment");
+    eval.transaction_group(&[state_proof_txn(1024)])
+        .expect("state proof for the expected round");
+    let block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(block.payset.len(), 2, "both groups proposed");
+
+    let proposed = algo_ledger::block_header::state_proof_next_round(&block.state_proof_tracking);
+    assert_eq!(
+        proposed, 1280,
+        "go: lastRoundInInterval + StateProofInterval (1024 + 256)"
+    );
+
+    // A replica's real apply of the same payset agrees with the header.
+    let (replica, _p) = fixture_with_tracking(&accounts, &[], spt(1024));
+    let mut l = replica.lock().unwrap();
+    let scratch = scratch_execute_payset(&mut *l, &block).expect("replica apply");
+    assert_eq!(scratch.final_state_proof_next, proposed);
+    // Everything else the apply derives matches too.
+    assert_eq!(scratch.final_txn_counter, block.txn_counter);
+}
+
+/// Without a state proof in the payset the header keeps the inherited value.
+#[test]
+fn proposal_without_a_state_proof_txn_keeps_the_inherited_next_round() {
+    let a = key(1);
+    let b = key(2);
+    let accounts = vec![(a.0, funded(50_000_000)), (b.0, funded(1_000_000))];
+    let (ledger, _pool) = fixture_with_tracking(&accounts, &[], spt(1024));
+    let mut prev = genesis_header();
+    prev.state_proof_tracking = spt(1024);
+    let adapter = PoolLedgerAdapter::new(ledger.clone());
+    let mut eval = adapter
+        .start_simple_evaluator(prev, 0, 0)
+        .expect("start_evaluator");
+    eval.transaction_group(&[pay(&a, b.0, 2_000_000, None)])
+        .expect("payment");
+    let block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(
+        algo_ledger::block_header::state_proof_next_round(&block.state_proof_tracking),
+        1024
     );
 }

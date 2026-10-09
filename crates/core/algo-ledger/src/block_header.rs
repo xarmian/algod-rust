@@ -409,6 +409,40 @@ pub fn state_proof_next_round(tracking: &Option<rmpv::Value>) -> u64 {
         .unwrap_or(0)
 }
 
+/// `tracking` with `StateProofTracking[StateProofBasic].StateProofNextRound`
+/// (the `"n"` field) replaced by `next`, every other field kept: how a
+/// proposer carries the value its payset's state proof transactions left
+/// behind into the header (go `endOfBlock` writes the cow's
+/// `StateProofNextRound`, issue #1791). A header without a tracking map gets
+/// a fresh `{0: {"n": next}}`.
+pub fn with_state_proof_next_round(
+    tracking: &Option<rmpv::Value>,
+    next: u64,
+) -> Option<rmpv::Value> {
+    let mut types = match tracking {
+        Some(rmpv::Value::Map(types)) => types.clone(),
+        _ => Vec::new(),
+    };
+    let mut fields = match types
+        .iter()
+        .find(|(k, _)| k.as_u64() == Some(STATE_PROOF_BASIC))
+        .map(|(_, v)| v)
+    {
+        Some(rmpv::Value::Map(fields)) => fields.clone(),
+        _ => Vec::new(),
+    };
+    fields.retain(|(k, _)| k.as_str() != Some("n"));
+    if next != 0 {
+        fields.insert(0, (rmpv::Value::from("n"), rmpv::Value::from(next)));
+    }
+    types.retain(|(k, _)| k.as_u64() != Some(STATE_PROOF_BASIC));
+    types.push((
+        rmpv::Value::from(STATE_PROOF_BASIC),
+        rmpv::Value::Map(fields),
+    ));
+    Some(rmpv::Value::Map(types))
+}
+
 /// Read `StateProofTracking[StateProofBasic].VotersCommitment` (the `"v"`
 /// field under map key `0`) out of an encoded `"spt"` value, defaulting to
 /// empty when absent.
