@@ -39,6 +39,16 @@
 #                  [--cert-ledger PATH] [--skip-preflight]
 #                  [--rust-account ADDR] [--min-rust-vote-rounds N]
 #                  [--no-go-authenticate]
+#                  [--blockcompare | --blockcompare-jsonl PATH]
+#
+# 4. (issue #1674) Cross-implementation raw block bytes. blockcompare.py
+#    compares the `block` value of GET /v2/blocks/{r}?format=msgpack from all
+#    four nodes (3 go-algorand + algod-rust) byte for byte, which covers the
+#    block hash, per-round txn count and every transaction's ApplyData.
+#    --blockcompare-jsonl re-checks a file written live during the soak
+#    (soak.sh WORKLOAD=rich); --blockcompare runs a fresh batch pass over the
+#    verify range, which needs the Go nodes to still hold those blocks
+#    (PHASE6_GO_ARCHIVAL=1 for long runs).
 #
 # Exit codes:
 #   0 — every tool that ran reported clean
@@ -79,6 +89,9 @@ CERT_LEDGER_OVERRIDE=""
 RUST_ACCOUNT="${RUST_ACCOUNT:-}"
 MIN_RUST_VOTE_ROUNDS="${MIN_RUST_VOTE_ROUNDS:-1}"
 RUN_GO_AUTH=1
+# issue #1674 — raw block bytes, go vs algod-rust.
+RUN_BLOCKCOMPARE=0
+BLOCKCOMPARE_JSONL=""
 
 usage() {
     cat <<EOF
@@ -118,6 +131,11 @@ Options:
   --no-go-authenticate   Skip the go-algorand-side authentication even
                          when --rust-account is given (e.g. no Docker,
                          or you only want the Rust-side assertions).
+  --blockcompare         (#1674) Also compare raw block bytes of all four
+                         nodes over the verify range (batch pass).
+  --blockcompare-jsonl PATH
+                         (#1674) Re-check a blockcompare JSONL the soak
+                         wrote live instead of fetching again.
   -h, --help             Show this help.
 
 Artifacts written:
@@ -149,6 +167,8 @@ while [ $# -gt 0 ]; do
         --rust-account)           need_arg "$@"; RUST_ACCOUNT="$2"; shift 2 ;;
         --min-rust-vote-rounds)   need_arg "$@"; MIN_RUST_VOTE_ROUNDS="$2"; shift 2 ;;
         --no-go-authenticate)     RUN_GO_AUTH=0; shift ;;
+        --blockcompare)           RUN_BLOCKCOMPARE=1; shift ;;
+        --blockcompare-jsonl)     need_arg "$@"; BLOCKCOMPARE_JSONL="$2"; shift 2 ;;
         --no-cert-crossverify)    RUN_CERT=0; shift ;;
         --skip-preflight)         SKIP_PREFLIGHT=1; shift ;;
         -h|--help)                usage; exit 0 ;;
@@ -401,9 +421,27 @@ elif [ -n "$RUST_ACCOUNT" ] && [ "$RUN_GO_AUTH" = "0" ]; then
     echo "==> go-algorand cert authentication: SKIPPED (--no-go-authenticate)"
 fi
 
+# -- 4. Cross-implementation raw block bytes (issue #1674) ------------------
+bc_rc=0
+if [ -n "$BLOCKCOMPARE_JSONL" ] || [ "$RUN_BLOCKCOMPARE" = "1" ]; then
+    set +e
+    if [ -n "$BLOCKCOMPARE_JSONL" ]; then
+        echo "==> block byte comparison (re-checking $BLOCKCOMPARE_JSONL)"
+        python3 "$HERE/blockcompare.py" --summarize "$BLOCKCOMPARE_JSONL"
+        bc_rc=$?
+    else
+        BC_OUT="$OUT_DIR/verify-blockcompare-$(date +%s).jsonl"
+        echo "==> block byte comparison: $FROM_ROUND..$TO_ROUND (go-node-1..3 vs rust-node-4)"
+        python3 "$HERE/blockcompare.py" --out "$BC_OUT" --from-round "$FROM_ROUND" --to-round "$TO_ROUND"
+        bc_rc=$?
+    fi
+    set -e
+    echo "    blockcompare exit: $bc_rc"
+fi
+
 # -- Summary ----------------------------------------------------------------
 echo ""
-if [ "$fork_rc" -eq 0 ] && [ "$cert_rc" -eq 0 ] && [ "$go_auth_rc" -eq 0 ]; then
+if [ "$fork_rc" -eq 0 ] && [ "$cert_rc" -eq 0 ] && [ "$go_auth_rc" -eq 0 ] && [ "$bc_rc" -eq 0 ]; then
     if [ "$RUN_CERT" = "1" ] && [ -n "$RUST_ACCOUNT" ] && [ "$RUN_GO_AUTH" = "1" ]; then
         echo "verify-soak: CLEAN — fork detector + Go→Rust cert cross-verify +"
         echo "             Rust→Go cert authentication all passed."
@@ -428,5 +466,8 @@ fi
 if [ "$go_auth_rc" -gt "$worst" ]; then
     worst=$go_auth_rc
 fi
-echo "verify-soak: FAILED — fork_rc=$fork_rc cert_rc=$cert_rc go_auth_rc=$go_auth_rc (exit=$worst)" >&2
+if [ "$bc_rc" -gt "$worst" ]; then
+    worst=$bc_rc
+fi
+echo "verify-soak: FAILED — fork_rc=$fork_rc cert_rc=$cert_rc go_auth_rc=$go_auth_rc blockcompare_rc=$bc_rc (exit=$worst)" >&2
 exit "$worst"

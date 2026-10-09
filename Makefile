@@ -755,6 +755,11 @@ consensus-cluster-smoke: ## Run the #469 participation smoke test (up + 30 round
 ##   make consensus-cluster-restart          # restart stage only, on an
 ##                                           # already-running cluster
 ##
+## WORKLOAD=rich (issue #1674) submits boxes / inner txns / ASA / app / group
+## traffic during the soak and compares raw block bytes of all four nodes every
+## round: `make consensus-cluster-test ROUNDS=60 WORKLOAD=rich`. See
+## docs/MIXED_CLUSTER_RUNBOOK.md.
+##
 ## NEGATIVE_CASES=1 additionally runs the #472 negative suite (one malformed
 ## agreement message per case injected into go-node-1, asserting Go rejects
 ## each one and the cluster stays healthy) against the same running cluster.
@@ -764,6 +769,8 @@ consensus-cluster-test: consensus-cluster-analyzer ## Run the #470 conformance s
 	RESTART_SCENARIOS=$(or $(RESTART_SCENARIOS),0) \
 	RESTART_MODE=$(or $(RESTART_MODE),all) \
 	NEGATIVE_CASES=$(or $(NEGATIVE_CASES),0) \
+	WORKLOAD=$(or $(WORKLOAD),plain) \
+	WORKLOAD_SEED=$(or $(WORKLOAD_SEED),1674) \
 		$(PHASE6_CLUSTER)/scripts/consensus-conformance.sh
 
 consensus-cluster-restart: ## Run the #471 restart/rejoin scenarios against a RUNNING cluster
@@ -779,6 +786,8 @@ consensus-cluster-negative: ## Run the #472 negative conformance suite (up + inj
 
 consensus-cluster-analyzer: ## Unit-test the #470 soak-analyzer logic (no Docker needed)
 	python3 $(PHASE6_CLUSTER)/scripts/analyze_test.py
+	python3 $(PHASE6_CLUSTER)/scripts/blockcompare_test.py
+	python3 $(PHASE6_CLUSTER)/scripts/workload_test.py
 
 ## ops/mixed-cluster-p2p harness (issues #543, #560, #564, #589) — three
 ## real go-algorand v5.0.2-stable nodes in plain P2P mode, chain-bootstrapped

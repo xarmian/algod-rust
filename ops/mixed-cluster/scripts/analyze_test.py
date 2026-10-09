@@ -616,6 +616,150 @@ class ParticipationEndpointTest(unittest.TestCase):
         self.assertEqual(res["missing_steps"], [])
 
 
+def bc_rec(rnd, **kw):
+    rec = {"kind": "block_compare", "round": rnd, "txn_count": 0, "identical": True, "hash_match": True}
+    rec.update(kw)
+    return rec
+
+
+def rich_blockcompare():
+    """A healthy rich run: payments, every non-payment type, inner + box evidence."""
+    return [
+        bc_rec(1),
+        bc_rec(2, txn_count=2, types={"pay": 2}),
+        bc_rec(3, txn_count=3, non_payment=True, types={"acfg": 1, "axfer": 1, "afrz": 1}),
+        bc_rec(4, txn_count=2, non_payment=True, types={"appl": 2}, inner_txn_txns=1, box_ref_txns=1),
+    ]
+
+
+def rich_workload(**extra):
+    steps = [
+        {"kind": "workload_step", "seq": 1, "op": "pay", "outcome": "confirmed", "expect": "confirmed",
+         "ok": True, "round": 2, "txids": ["T" * 52]},
+        {"kind": "workload_step", "seq": 2, "op": "app_call", "outcome": "confirmed", "expect": "confirmed",
+         "ok": True, "round": 4, "txids": ["U" * 52]},
+        {"kind": "workload_step", "seq": 3, "op": "pay_below_min_balance", "outcome": "rejected",
+         "expect": "rejected", "ok": True, "txids": []},
+        {"kind": "workload_summary", "steps": 3},
+    ]
+    return steps + list(extra.get("more", []))
+
+
+class RichWorkloadTest(unittest.TestCase):
+    """Issue #1674: cross-implementation agreement under the rich workload."""
+
+    def check(self, wl=None, bc=None, **kw):
+        return analyze.rich_workload_check(
+            rich_workload() if wl is None else wl,
+            rich_blockcompare() if bc is None else bc,
+            **kw,
+        )
+
+    def test_healthy_run_passes(self):
+        res = self.check()
+        self.assertTrue(res["ok"], res["failures"])
+        self.assertEqual(res["blockcompare"]["rounds_non_payment"], 2)
+        self.assertEqual(res["workload"]["confirmed"], 2)
+        self.assertEqual(res["workload"]["rejected"], 1)
+
+    def test_rust_block_byte_mismatch_fails_with_the_diff(self):
+        bc = rich_blockcompare()
+        bc.append(bc_rec(5, txn_count=1, identical=False, mismatch_nodes=["rust-node-4"],
+                         diff=["$.txns[0].dt.itx: length 1 != 0"]))
+        res = self.check(bc=bc)
+        self.assertFalse(res["ok"])
+        self.assertIn("round 5", res["failures"][0])
+        self.assertIn("rust-node-4", res["failures"][0])
+        self.assertIn("dt.itx", res["failures"][0])
+        self.assertEqual(res["mismatch_rounds"], [5])
+
+    def test_block_hash_mismatch_fails(self):
+        bc = rich_blockcompare() + [bc_rec(6, hash_match=False, hashes={"go-node-1": "a", "rust-node-4": "b"})]
+        res = self.check(bc=bc)
+        self.assertFalse(res["ok"])
+        self.assertIn("block hash differs at round 6", res["failures"][0])
+
+    def test_no_comparison_at_all_fails(self):
+        res = self.check(bc=[])
+        self.assertFalse(res["ok"])
+        self.assertIn("no round was compared", res["failures"][0])
+
+    def test_payment_only_run_does_not_prove_the_rich_paths(self):
+        bc = [bc_rec(1), bc_rec(2, txn_count=2, types={"pay": 2})]
+        res = self.check(bc=bc)
+        self.assertFalse(res["ok"])
+        joined = " | ".join(res["failures"])
+        self.assertIn("non-payment round", joined)
+        self.assertIn("never on chain: axfer,acfg,appl", joined)
+        self.assertIn("inner transactions", joined)
+        self.assertIn("box references", joined)
+
+    def test_coverage_requirements_can_be_relaxed(self):
+        bc = [bc_rec(1), bc_rec(2, txn_count=1, non_payment=True, types={"appl": 1})]
+        res = self.check(bc=bc, require_types=("appl",), require_coverage=False)
+        self.assertTrue(res["ok"], res["failures"])
+
+    def test_go_rust_admission_divergence_fails(self):
+        wl = rich_workload(more=[{"kind": "workload_divergence", "seq": 3, "op": "close_account_with_assets"}])
+        res = self.check(wl=wl)
+        self.assertFalse(res["ok"])
+        self.assertIn("close_account_with_assets", res["failures"][0])
+
+    def test_workload_that_never_ran_fails(self):
+        res = self.check(wl=[{"kind": "workload_meta"}])
+        self.assertFalse(res["ok"])
+        self.assertIn("no steps", res["failures"][0])
+
+    def test_confirmed_step_in_an_empty_round_fails(self):
+        wl = rich_workload()
+        wl[0]["round"] = 1  # round 1 carries no txns
+        res = self.check(wl=wl)
+        self.assertFalse(res["ok"])
+        self.assertIn("empty round", " ".join(res["failures"]))
+
+    def test_unexpected_go_outcome_is_a_note_not_a_failure(self):
+        wl = rich_workload(more=[{"kind": "workload_step", "seq": 9, "op": "asset_send_frozen",
+                                  "outcome": "confirmed", "expect": "rejected", "ok": False}])
+        res = self.check(wl=wl)
+        self.assertTrue(res["ok"], res["failures"])
+        self.assertIn("asset_send_frozen", res["notes"][0])
+
+    def test_degraded_comparison_fails(self):
+        bc = rich_blockcompare() + [{"kind": "block_compare", "round": r, "degraded": True,
+                                     "missing": ["rust-node-4"]} for r in range(10, 20)]
+        res = self.check(bc=bc)
+        self.assertFalse(res["ok"])
+        self.assertIn("could not be fetched", " ".join(res["failures"]))
+
+    def test_plain_soak_without_workload_inputs_is_unchanged(self):
+        # No --workload: only the byte comparison is gated.
+        res = analyze.rich_workload_check([], [bc_rec(1), bc_rec(2, txn_count=1, types={"pay": 1})],
+                                          min_nonpay_rounds=0, require_coverage=False)
+        self.assertTrue(res["ok"], res["failures"])
+
+    def test_cli_end_to_end(self):
+        base = os.path.join(FIXTURES, "issue-1590-stale-genesis-catchup.jsonl")
+        with tempfile.TemporaryDirectory() as d:
+            wlp, bcp, js = (os.path.join(d, n) for n in ("wl.jsonl", "bc.jsonl", "out.json"))
+            for path, recs in ((wlp, rich_workload()), (bcp, rich_blockcompare())):
+                with open(path, "w") as f:
+                    f.write("\n".join(json.dumps(r) for r in recs) + "\n")
+            ok = subprocess.run([sys.executable, ANALYZE_PY, base, "--workload", wlp, "--blockcompare", bcp,
+                                 "--json-out", js, "--lag-tolerance", "1000"],
+                                capture_output=True, text=True)
+            self.assertIn("cross-implementation agreement", ok.stdout)
+            summary = json.load(open(js))
+            self.assertTrue(summary["rich_workload"]["ok"], summary["rich_workload"])
+            # Doctor one block: the CLI must now report the mismatch.
+            with open(bcp, "a") as f:
+                f.write(json.dumps(bc_rec(9, txn_count=1, identical=False, mismatch_nodes=["rust-node-4"],
+                                          diff=["$.x"])) + "\n")
+            bad = subprocess.run([sys.executable, ANALYZE_PY, base, "--workload", wlp, "--blockcompare", bcp,
+                                  "--json-out", js, "--lag-tolerance", "1000"],
+                                 capture_output=True, text=True)
+            self.assertIn("block bytes differ at round 9", bad.stdout)
+            self.assertFalse(json.load(open(js))["rich_workload"]["ok"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=isinstance(sys.stdout, io.TextIOBase))

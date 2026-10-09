@@ -65,6 +65,16 @@
 #   NEGATIVE_CASES        1 = also run the issue #472 negative stage
 #                         (inject one malformed agreement message per
 #                         case and assert Go rejects it)    (default 0)
+#   WORKLOAD              plain (default) = the historical empty-block soak;
+#                         rich = issue #1674: run workload.py during the soak
+#                         (boxes, inner txns, ASA lifecycle, app create/call/
+#                         delete, app-account close, groups, min-balance edge
+#                         cases, must-reject txns) and compare the raw block
+#                         bytes of all four nodes every round
+#                         (blockcompare.py --follow). Implies
+#                         PHASE6_GO_ARCHIVAL=1 so the Go nodes keep every
+#                         block for the post-hoc verifiers.
+#   WORKLOAD_SEED         seed of the rich workload schedule (default 1674)
 #   SKIP_START=1          use an already-running cluster
 #   KEEP_CLUSTER=1        leave the cluster up on exit
 #   REUSE_NETROOT=1       keep an existing netroot/ (keys, genesis, Go
@@ -114,6 +124,12 @@ MIN_RUST_VOTE_ROUNDS="${MIN_RUST_VOTE_ROUNDS:-0}"
 FORCE_NEXT_STEP="${FORCE_NEXT_STEP:-1}"
 PAUSE_SECONDS="${PAUSE_SECONDS:-25}"
 REQUIRE_NEXT_STEP="${REQUIRE_NEXT_STEP:-0}"
+WORKLOAD="${WORKLOAD:-plain}"
+WORKLOAD_SEED="${WORKLOAD_SEED:-1674}"
+case "$WORKLOAD" in
+    plain|rich) : ;;
+    *) echo "error: WORKLOAD must be plain or rich (got '$WORKLOAD')" >&2; exit 2 ;;
+esac
 SKIP_START="${SKIP_START:-0}"
 KEEP_CLUSTER="${KEEP_CLUSTER:-0}"
 ALGOD_TOKEN="${ALGOD_TOKEN:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
@@ -203,7 +219,7 @@ rust_account() {
 
 echo "======================================================================"
 echo "issue #470 consensus conformance suite"
-echo "  rounds=$ROUNDS stake_fraction=$RUST_STAKE_FRACTION sigma=$PROPOSER_SIGMA"
+echo "  rounds=$ROUNDS stake_fraction=$RUST_STAKE_FRACTION sigma=$PROPOSER_SIGMA workload=$WORKLOAD"
 echo "  artifacts: $OUT_DIR"
 echo "======================================================================"
 
@@ -235,6 +251,9 @@ if [ "$SKIP_START" != "1" ]; then
         "$HERE/stop.sh" --purge > "$OUT_DIR/purge.log" 2>&1 || {
             echo "warning: stop.sh --purge failed — see $OUT_DIR/purge.log; continuing" >&2
         }
+    fi
+    if [ "$WORKLOAD" = "rich" ]; then
+        export PHASE6_GO_ARCHIVAL=1
     fi
     echo "==> starting the 4-node cluster"
     "$HERE/start.sh" > "$OUT_DIR/start.log" 2>&1 || {
@@ -338,6 +357,7 @@ print((datetime.datetime.now(datetime.timezone.utc)
 soak_rc=0
 "$HERE/soak.sh" --rounds "$ROUNDS" --out "$SOAK_JSONL" \
     --stall-timeout "$SOAK_STALL_TIMEOUT" \
+    --workload "$WORKLOAD" --seed "$WORKLOAD_SEED" \
     > "$OUT_DIR/soak.log" 2>&1 || soak_rc=$?
 if [ "$soak_rc" -eq 0 ]; then
     record "soak_completed" pass "$ROUNDS rounds observed (see $SOAK_JSONL)"
@@ -355,7 +375,12 @@ done
 # -- 4. Analyze: proposer share, step coverage, cadence, lag ------------
 echo "==> analyze.py (proposer share, step coverage, cadence)"
 analyze_rc=0
+RICH_ARGS=()
+if [ "$WORKLOAD" = "rich" ]; then
+    RICH_ARGS=(--workload "$OUT_DIR/workload.jsonl" --blockcompare "$OUT_DIR/blockcompare.jsonl")
+fi
 "$HERE/analyze.py" "$SOAK_JSONL" \
+    "${RICH_ARGS[@]+"${RICH_ARGS[@]}"}" \
     --lag-tolerance "$LAG_TOLERANCE" \
     --rust-account "$RUST_ACCOUNT" \
     --rust-stake-fraction "$RUST_STAKE_FRACTION" \
@@ -396,6 +421,19 @@ cad = s.get('cadence')
 if cad:
     rows.append(('block_cadence', 'pass' if cad['ok'] else 'fail',
                  '; '.join(cad['failures']) or 'within bounds'))
+rw = s.get('rich_workload')
+if rw:
+    b, wk = rw['blockcompare'], rw['workload']
+    rows.append(('cross_impl_blocks_identical', 'fail' if rw['mismatch_rounds'] else 'pass',
+                 '{} rounds ({} with txns, {} non-payment) byte-identical on 4 nodes'.format(
+                     b['rounds_compared'], b['rounds_with_txns'], b['rounds_non_payment'])
+                 if not rw['mismatch_rounds'] else 'block bytes differ at rounds {}'.format(
+                     ','.join(str(r) for r in rw['mismatch_rounds'][:10]))))
+    rows.append(('rich_workload', 'pass' if rw['ok'] else 'fail',
+                 'steps={} confirmed={} rejected={} divergences={} types={} inner={} box_refs={}'.format(
+                     wk['steps'], wk['confirmed'], wk['rejected'], wk['divergences'],
+                     b['txn_types'], b['inner_txn_txns'], b['box_ref_txns'])
+                 if rw['ok'] else '; '.join(rw['failures'])[:600]))
 lag = s.get('lag_violation')
 rows.append(('node_lockstep', 'fail' if lag else 'pass',
              'lag {} > {}'.format(lag['delta'], s['lag_tolerance']) if lag
@@ -411,7 +449,12 @@ fi
 echo "==> verify-soak.sh (fork detector + cert cross-verify both directions)"
 TOOLS_DIR="${TOOLS_DIR:-$REPO_ROOT/target/debug}"
 verify_rc=0
+VERIFY_EXTRA=()
+if [ "$WORKLOAD" = "rich" ]; then
+    VERIFY_EXTRA=(--blockcompare-jsonl "$OUT_DIR/blockcompare.jsonl")
+fi
 "$HERE/verify-soak.sh" \
+    ${VERIFY_EXTRA[@]+"${VERIFY_EXTRA[@]}"} \
     --stride "$CERT_STRIDE" \
     --tools-dir "$TOOLS_DIR" \
     --out-dir "$OUT_DIR" \
@@ -420,6 +463,13 @@ verify_rc=0
     > "$OUT_DIR/verify.log" 2>&1 || verify_rc=$?
 tail -20 "$OUT_DIR/verify.log" || true
 
+if [ "$WORKLOAD" = "rich" ]; then
+    if grep -q "blockcompare exit: 0" "$OUT_DIR/verify.log"; then
+        record "blockcompare_recheck" pass "blockcompare.jsonl re-checked clean by verify-soak.sh"
+    else
+        record "blockcompare_recheck" fail "blockcompare re-check non-zero - see $OUT_DIR/verify.log"
+    fi
+fi
 if grep -q "fork-detector exit: 0" "$OUT_DIR/verify.log"; then
     record "fork_free" pass "algo-fork-detector reported no forks"
 else
@@ -581,6 +631,8 @@ summary = {
     'proposer_sigma': float(sys.argv[6]),
     'min_rust_vote_rounds': int(sys.argv[7]),
     'next_step_phase': sys.argv[8],
+    'workload': sys.argv[11],
+    'workload_seed': int(sys.argv[12]),
     'go_accepted_rust_votes': json.loads(sys.argv[9]),
     'checks': checks,
     'checks_total': len(checks),
@@ -594,7 +646,7 @@ print(json.dumps({'result': summary['result'],
                   'checks_failed': summary['checks_failed']}))
 " "$CHECKS_FILE" "$RUN_ID" "$ROUNDS" "$RUST_ACCOUNT" "$RUST_STAKE_FRACTION" \
   "$PROPOSER_SIGMA" "$MIN_RUST_VOTE_ROUNDS" "$NEXT_STEP_PHASE" "$VOTE_STATS" \
-  "$SUMMARY_JSON"
+  "$SUMMARY_JSON" "$WORKLOAD" "$WORKLOAD_SEED"
 
 FAILED="$(awk -F'\t' '$2=="fail"' "$CHECKS_FILE" | wc -l | tr -d ' ')"
 TOTAL="$(wc -l < "$CHECKS_FILE" | tr -d ' ')"

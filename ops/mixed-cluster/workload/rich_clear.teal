@@ -1,0 +1,7 @@
+// Copyright (c) 2026 Algod DAO
+// SPDX-License-Identifier: MIT
+// See the LICENSE-MIT file in the repository root for the full license text.
+//
+// Provenance: original, issue #1674. Clear-state program for rich_app.teal.
+#pragma version 10
+int 1

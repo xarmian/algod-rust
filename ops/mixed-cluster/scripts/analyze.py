@@ -64,6 +64,26 @@
 # plus per-round timings the log never carried. --rust-log is still
 # supported (and still the only source for equivocation-shaped checks).
 #
+# Issue #1674 additions: rich-workload cross-implementation agreement. Two
+# more JSONL inputs, both optional (pre-#1674 soaks analyze unchanged):
+#
+#   --workload PATH       workload.py's JSONL (every submitted step with its
+#                         txids, round and outcome).
+#   --blockcompare PATH   blockcompare.py's JSONL: per round, the raw
+#                         `block` bytes of all four nodes (3 go-algorand +
+#                         the algod-rust node) compared byte for byte, which
+#                         covers block hash, per-round txn count and every
+#                         transaction's ApplyData.
+#   --require-txn-types   Txn types that must appear on chain (default
+#                         "pay,axfer,acfg,appl"; empty disables).
+#   --min-nonpay-rounds N Non-payment rounds that must have been compared
+#                         (default 1 when --workload is given).
+#
+# Fails on any byte mismatch, any block-hash mismatch, a Go-vs-Rust
+# disagreement on whether a malformed transaction is admitted, a workload
+# that did not run, or a workload that never put inner transactions /
+# box references on chain (a run that proves nothing must not pass).
+#
 # Acceptance-criteria hints (printed at the bottom):
 #   - Any stall / interrupt / timeout phase in run_meta
 #   - Any lag > --lag-tolerance
@@ -595,6 +615,91 @@ def block_ts_catch_up_check(block_times: list, header_lags_s: list = ()) -> dict
     }
 
 
+def rich_workload_check(workload_records, bc_records, require_types=("pay", "axfer", "acfg", "appl"),
+                        min_nonpay_rounds=1, require_coverage=True):
+    """Issue #1674: did go and algod-rust agree on every block of a run that
+    carried non-trivial transactions?  Pure function over parsed JSONL."""
+    import blockcompare  # noqa: PLC0415 - sibling script; keeps analyze importable alone
+
+    failures = []
+    notes = []
+    bc = blockcompare.summarize_records(bc_records)
+    steps = [r for r in workload_records if r.get("kind") == "workload_step"]
+    summaries = [r for r in workload_records if r.get("kind") == "workload_summary"]
+    divergences = [r for r in workload_records if r.get("kind") == "workload_divergence"]
+    aborts = [r for r in workload_records if r.get("kind") == "workload_abort"]
+    confirmed = [r for r in steps if r.get("outcome") == "confirmed"]
+    unexpected = [r for r in steps if not r.get("ok", True)]
+
+    # -- cross-implementation block agreement ------------------------------
+    if bc["rounds_compared"] == 0:
+        failures.append("no round was compared across implementations (blockcompare produced nothing)")
+    for m in bc["mismatches"][:5]:
+        failures.append("block bytes differ at round {} on {}: {}".format(
+            m["round"], ",".join(m["nodes"]) or "?", "; ".join(m["diff"][:3]) or "no diff"))
+    if len(bc["mismatches"]) > 5:
+        failures.append("... and {} more mismatching round(s)".format(len(bc["mismatches"]) - 5))
+    for m in bc["hash_mismatches"][:5]:
+        failures.append("block hash differs at round {}: {}".format(m["round"], m["hashes"]))
+    total = bc["rounds_compared"] + bc["degraded_rounds"]
+    if total and bc["degraded_rounds"] > max(2, total // 20):
+        failures.append("{} of {} round(s) could not be fetched from all nodes (missing: {})".format(
+            bc["degraded_rounds"], total, bc["nodes_missing"]))
+
+    # -- the workload actually ran and exercised the paths ------------------
+    if workload_records:
+        if not steps:
+            failures.append("workload recorded no steps")
+        if not summaries:
+            notes.append("workload_summary missing (workload was killed before finishing)")
+        if divergences:
+            failures.append(
+                "{} negative transaction(s) were admitted by one implementation and rejected by the other: {}".format(
+                    len(divergences), ", ".join(sorted({d.get("op", "?") for d in divergences}))))
+        if bc["rounds_non_payment"] < min_nonpay_rounds:
+            failures.append("only {} non-payment round(s) compared, need {}".format(
+                bc["rounds_non_payment"], min_nonpay_rounds))
+        missing = [t for t in require_types if bc["txn_types"].get(t, 0) == 0]
+        if missing:
+            failures.append("txn type(s) never on chain: " + ",".join(missing))
+        if require_coverage:
+            if bc["inner_txn_txns"] == 0:
+                failures.append("no block carried inner transactions (dt.itx)")
+            if bc["box_ref_txns"] == 0:
+                failures.append("no block carried box references (apbx)")
+        # every confirmed step must sit in a compared round that has txns
+        by_round = {r["round"]: r for r in bc_records if r.get("kind") == "block_compare" and not r.get("degraded")}
+        empty = [r for r in confirmed
+                 if r.get("round") in by_round and by_round[r["round"]].get("txn_count", 0) == 0]
+        if empty:
+            failures.append("{} confirmed workload step(s) point at an empty round, e.g. {} in round {}".format(
+                len(empty), empty[0].get("op"), empty[0].get("round")))
+    if unexpected:
+        notes.append("{} workload step(s) had an unexpected go outcome (harness expectation, not a divergence): {}".format(
+            len(unexpected), ", ".join(sorted({u.get("op", "?") for u in unexpected})[:8])))
+    if aborts:
+        notes.append("{} scenario abort(s): {}".format(
+            len(aborts), "; ".join("{}: {}".format(a.get("scenario"), a.get("reason", "")[:80]) for a in aborts[:3])))
+
+    return {
+        "ok": not failures,
+        "failures": failures,
+        "notes": notes,
+        "blockcompare": {k: bc[k] for k in (
+            "rounds_compared", "rounds_with_txns", "rounds_non_payment", "total_txns", "txn_types",
+            "inner_txn_txns", "box_ref_txns", "degraded_rounds")},
+        "mismatch_rounds": [m["round"] for m in bc["mismatches"]],
+        "workload": {
+            "steps": len(steps),
+            "confirmed": len(confirmed),
+            "rejected": len(steps) - len(confirmed),
+            "unexpected": len(unexpected),
+            "divergences": len(divergences),
+            "aborts": len(aborts),
+        },
+    }
+
+
 def summarize(records, lag_tolerance: int):
     run_metas = []
     warnings = []
@@ -1050,6 +1155,23 @@ def print_report(summary, source_paths):  # noqa: C901 — one linear report
             print("  " + ("OK" if pc["ok"] else "FAIL"))
         print()
 
+    rw = summary.get("rich_workload")
+    if rw:
+        b, wk = rw["blockcompare"], rw["workload"]
+        print("Rich workload / cross-implementation agreement (issue #1674):")
+        print(f"  rounds compared byte-for-byte across 4 nodes: {b['rounds_compared']} "
+              f"({b['rounds_with_txns']} with txns, {b['rounds_non_payment']} non-payment, "
+              f"{b['total_txns']} txns, {b['degraded_rounds']} degraded)")
+        print(f"  txn types on chain: {b['txn_types']}  inner-txn txns={b['inner_txn_txns']} "
+              f"box-ref txns={b['box_ref_txns']}")
+        print(f"  workload steps={wk['steps']} confirmed={wk['confirmed']} rejected={wk['rejected']} "
+              f"unexpected={wk['unexpected']} go/rust admission divergences={wk['divergences']} "
+              f"aborts={wk['aborts']}")
+        for n in rw["notes"]:
+            print(f"  note: {n}")
+        print("  " + ("OK" if rw["ok"] else "FAIL"))
+        print()
+
     rs = summary["rust_summary"]
     print(f"Rust node (phase6-rust-node-4): samples={rs['samples']} "
           f"states={rs['state_counts']} "
@@ -1086,6 +1208,7 @@ def print_report(summary, source_paths):  # noqa: C901 — one linear report
         "rust_step_coverage",
         "rust_participation_check",
         "cadence",
+        "rich_workload",
     ):
         section = summary.get(key)
         if section:
@@ -1148,6 +1271,17 @@ def main() -> int:
                         help="Fail if p95 inter-block time exceeds this many "
                              "seconds (0 = disabled). Same source rule as "
                              "--max-mean-block-time.")
+    # ── issue #1674 rich workload / cross-implementation agreement ──────
+    parser.add_argument("--workload", default=None,
+                        help="workload.py JSONL; enables the rich-workload checks.")
+    parser.add_argument("--blockcompare", default=None,
+                        help="blockcompare.py JSONL (raw block bytes of all 4 nodes).")
+    parser.add_argument("--require-txn-types", default="pay,axfer,acfg,appl",
+                        help="Txn types that must appear on chain with --workload "
+                             "(comma list, empty disables).")
+    parser.add_argument("--min-nonpay-rounds", type=int, default=1,
+                        help="Non-payment rounds that must have been compared "
+                             "with --workload (default 1).")
     args = parser.parse_args()
 
     if not os.path.exists(args.input):
@@ -1194,6 +1328,19 @@ def main() -> int:
         args.max_p95_block_time,
         summary.get("wall_block_time_s"),
     )
+
+    if args.blockcompare or args.workload:
+        for label, path in (("--workload", args.workload), ("--blockcompare", args.blockcompare)):
+            if path and not os.path.exists(path):
+                print(f"error: {label} {path} not found", file=sys.stderr)
+                return 2
+        summary["rich_workload"] = rich_workload_check(
+            list(load_jsonl([args.workload])) if args.workload else [],
+            list(load_jsonl([args.blockcompare])) if args.blockcompare else [],
+            require_types=[t for t in args.require_txn_types.split(",") if t],
+            min_nonpay_rounds=args.min_nonpay_rounds if args.workload else 0,
+            require_coverage=bool(args.workload),
+        )
 
     clean = print_report(summary, [args.input])
 

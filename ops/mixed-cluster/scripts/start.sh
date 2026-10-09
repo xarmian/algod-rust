@@ -25,6 +25,10 @@
 #      in shell. The Rust node needs it to validate blocks.
 #   5. docker compose up -d --build rust-node-4 (or, with
 #      PHASE6_SKIP_BUILD=1, reuse a pre-built algod-rust-phase6:local).
+#
+# Env: PHASE6_GO_ARCHIVAL=1 sets Archival=true on the three Go relays so a
+# long soak can still be verified after the fact (issue #1674); the default
+# keeps go-algorand's non-archival block pruning.
 
 set -euo pipefail
 
@@ -157,7 +161,14 @@ for node in Node1 Node2 Node3 Node4Rust Node5Go; do
         NET_ADDRESS="0.0.0.0:4161"
     fi
     NODE_HOST_PATH="$(host_path "$NETROOT/$node")"
-    for kv in "NetAddress=$NET_ADDRESS" "EndpointAddress=0.0.0.0:8080" "DNSBootstrapID="; do
+    CFG_KVS=("NetAddress=$NET_ADDRESS" "EndpointAddress=0.0.0.0:8080" "DNSBootstrapID=")
+    # Issue #1674: a non-archival go-algorand node prunes blocks older than
+    # ~MaxTxnLife (1000) rounds, which breaks any post-hoc verification
+    # (fork detector, block-byte comparison) of a long soak. Opt in per run.
+    if [ "${PHASE6_GO_ARCHIVAL:-0}" = "1" ] && [ -n "$NET_ADDRESS" ]; then
+        CFG_KVS+=("Archival=true")
+    fi
+    for kv in "${CFG_KVS[@]}"; do
         MSYS_NO_PATHCONV=1 docker run --rm \
             -v "$NODE_HOST_PATH:/algod/data" \
             --entrypoint algocfg \

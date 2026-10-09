@@ -170,6 +170,7 @@ Verified individually per the proposal's instruction not to assume:
 | `docker/scripts/canonical-extract/*.go` | (b) MIT | Imports only the MIT-licensed `go-algorand-sdk/v2` (per `COPYING_FAQ` item 1's own MIT classification of Algorand's SDKs) to pull data over the REST API; comments reference go-algorand schema paths for documentation but no go-algorand source is imported or ported. |
 | `ops/mixed-cluster*/docker-compose.yml`, `template.json`, `README.md` | (b) MIT | Original cluster-topology definitions and docs. |
 | `ops/mixed-cluster*/scripts/*.sh` | (b) MIT | Original orchestration (start/stop/status/soak) shell scripts. |
+| `ops/mixed-cluster/workload/*.teal`, `ops/mixed-cluster/scripts/{workload,blockcompare}{,_test}.py` | (b) MIT | Original rich-workload driver, block comparator and TEAL programs (issue #1674); no go-algorand code is ported (the TEAL only uses documented opcodes). |
 | `ops/mixed-cluster*/scripts/*.py` (`metrics.py`, `analyze.py`, `equivocation.py`, `analyze_test.py`, `equivocation_test.py`) | (b) MIT | Original monitoring/analysis tooling. These scripts *describe* go-algorand's semantics in comments (e.g. citing `agreement/bundle.go`'s equivocation-vote handling as rationale for what the detector looks for) but implement their own independent log-parsing and detection logic, not a port of go-algorand's algorithm. |
 
 ## `.github/workflows/*`
