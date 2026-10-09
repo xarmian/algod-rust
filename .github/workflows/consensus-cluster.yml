@@ -51,6 +51,12 @@ on:
     # 02:41 UTC daily — off-peak, and offset from nightly-fuzz.yml's
     # 03:17 so the two don't contend for runners.
     - cron: "41 2 * * *"
+    # Issue #1674: weekly RICH run (Sunday 04:17 UTC) - ~1000 rounds of the
+    # seeded transaction workload (boxes, inner txns, ASA lifecycle, app
+    # create/call/delete, app-account closes, groups, min-balance edges) with
+    # a byte-for-byte block comparison of all four nodes every round. The
+    # nightly above stays the plain 200-round empty-block soak.
+    - cron: "17 4 * * 0"
   workflow_dispatch:
     inputs:
       tier:
@@ -59,8 +65,17 @@ on:
         options: [full, smoke]
         default: full
       rounds:
-        description: "Tier-2 soak length in rounds"
+        description: "Tier-2 soak length in rounds (about 3 s/round; > 400 raises the job timeout to 240 min, so up to ~3 h of soak)"
         default: "200"
+        required: false
+      workload:
+        description: "plain = empty-block soak (historical); rich = #1674 transaction workload + cross-implementation block comparison"
+        type: choice
+        options: [plain, rich]
+        default: plain
+      seed:
+        description: "Rich workload seed (schedule is a pure function of it)"
+        default: "1674"
         required: false
 
 concurrency:
@@ -85,13 +100,73 @@ env:
   CERT_AUTH_VOLUME: algod-rust-goalgo-src
 
 jobs:
+  # Resolves workload / rounds / timeout once so the cluster job's
+  # `timeout-minutes` (which cannot see step outputs) scales with the run.
+  plan:
+    name: Plan run (workload, rounds, timeout)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      workload: ${{ steps.p.outputs.workload }}
+      rounds: ${{ steps.p.outputs.rounds }}
+      seed: ${{ steps.p.outputs.seed }}
+      timeout: ${{ steps.p.outputs.timeout }}
+    steps:
+      - id: p
+        env:
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          IN_ROUNDS: ${{ github.event.inputs.rounds }}
+          IN_WORKLOAD: ${{ github.event.inputs.workload }}
+          IN_SEED: ${{ github.event.inputs.seed }}
+        run: |
+          set -euo pipefail
+          workload=plain
+          rounds=200
+          if [ "$EVENT" = "schedule" ] && [ "$SCHEDULE" = "17 4 * * 0" ]; then
+            workload=rich
+            rounds=1000
+          fi
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            workload="${IN_WORKLOAD:-plain}"
+            rounds="${IN_ROUNDS:-200}"
+          fi
+          case "$rounds" in ''|*[!0-9]*) echo "rounds must be a number" >&2; exit 1 ;; esac
+          [ "${#rounds}" -le 6 ] || { echo "rounds too long" >&2; exit 1; }
+          seed="${IN_SEED:-1674}"
+          case "$seed" in ''|*[!0-9]*) echo "seed must be digits only" >&2; exit 1 ;; esac
+          [ "${#seed}" -le 10 ] || { echo "seed must be at most 10 digits" >&2; exit 1; }
+          case "$workload" in plain|rich) ;; *) echo "workload must be plain or rich" >&2; exit 1 ;; esac
+          # ~3 s/round soak + ~75 min of build, Tier 1, restart/negative
+          # stages and verifiers. Plain nightly keeps its 120 min stop; a
+          # long or rich run gets at least 240 (GitHub's cap is 360).
+          need=$(( (rounds * 3 + 59) / 60 + 75 ))
+          timeout=120
+          if [ "$rounds" -gt 400 ] || [ "$workload" = "rich" ]; then
+            timeout=240
+          fi
+          [ "$need" -gt "$timeout" ] && timeout=$need
+          if [ "$timeout" -gt 350 ]; then
+            echo "rounds=$rounds needs ~${need} min, over the 350 min job cap" >&2
+            exit 1
+          fi
+          {
+            echo "workload=$workload"
+            echo "rounds=$rounds"
+            echo "seed=$seed"
+            echo "timeout=$timeout"
+          } >> "$GITHUB_OUTPUT"
+          echo "workload=$workload rounds=$rounds timeout=${timeout}m"
+
   consensus-cluster:
     name: Mixed-cluster consensus conformance (3 Go + 1 Rust)
+    needs: plan
     runs-on: ubuntu-latest
-    # Tier 1 is ~10 min warm; Tier 2's 200-round soak plus the restart
-    # and negative stages is the bulk of the rest. 120 min is a hard
-    # stop so a wedged cluster can't hold a runner all day.
-    timeout-minutes: 120
+    # Tier 1 is ~10 min warm; Tier 2's soak plus the restart and negative
+    # stages is the bulk of the rest. The `plan` job sizes this: 120 min
+    # for the plain 200-round nightly, 240+ for rich or > 400-round runs.
+    # It stays a hard stop so a wedged cluster can't hold a runner all day.
+    timeout-minutes: ${{ fromJSON(needs.plan.outputs.timeout) }}
 
     steps:
       - name: Checkout
@@ -221,7 +296,13 @@ jobs:
         if: github.event.inputs.tier != 'smoke'
         env:
           OUT_DIR: ${{ github.workspace }}/consensus-artifacts
-          ROUNDS: ${{ github.event.inputs.rounds || '200' }}
+          ROUNDS: ${{ needs.plan.outputs.rounds }}
+          WORKLOAD: ${{ needs.plan.outputs.workload }}
+          WORKLOAD_SEED: ${{ needs.plan.outputs.seed }}
+          # Explicit, recorded (WARN row cert_window_clamped) workaround for
+          # #1777: on runs over 900 rounds cert cross-verify only covers the
+          # last 900 rounds.
+          CERT_WINDOW: ${{ fromJSON(needs.plan.outputs.rounds) > 900 && '900' || '0' }}
           GO_ALGORAND_DIR: ${{ runner.temp }}/go-algorand-src
         run: make consensus-cluster-test RESTART_SCENARIOS=1 NEGATIVE_CASES=1
 
@@ -242,7 +323,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          # summary.json, soak.jsonl, analyze.summary.json, verify.log +
+          # summary.json, soak.jsonl, workload.jsonl + blockcompare.jsonl
+          # (rich runs), analyze.summary.json, verify.log +
           # verify-go-report-*.json (the go-algorand cert verifier),
           # cert-crossverify JSONL, restart/ and negative/ sub-summaries,
           # and the per-node logs the analyzers read.

@@ -187,6 +187,19 @@ sidecar.
 See `docs/SOAK_METHODOLOGY.md` for the full set of tuning knobs,
 measured metrics, acceptance criteria, and known limitations.
 
+The default soak submits nothing, so its blocks are empty. To exercise the
+Execute-mode follow path and the minimum-balance checks, run it with the rich
+workload (boxes, inner transactions, ASA and app lifecycles, groups, must-reject
+transactions) and a byte-for-byte block comparison of all four nodes:
+
+```bash
+ops/mixed-cluster/scripts/soak.sh --workload rich --rounds 200
+make consensus-cluster-test ROUNDS=200 WORKLOAD=rich
+```
+
+See `docs/MIXED_CLUSTER_RUNBOOK.md` (issue #1674) for running it locally and in
+CI, reading the result, and adding workload ops.
+
 ## Verifying a soak (TASK-88 + TASK-95)
 
 After a soak, run the verifier to assert no forks occurred across the
@@ -665,6 +678,7 @@ Everything TASK-86 originally deferred has since shipped:
 | Why is the topology shaped this way? | `docs/MIXED_CLUSTER_HARNESS.md` |
 | How does Layer 9 fit the overall conformance plan? | `docs/CONFORMANCE_STRATEGY.md` §11 |
 | What does the soak measure, with what thresholds? | `docs/SOAK_METHODOLOGY.md` |
+| How do I run go + algod-rust under a rich transaction workload, locally or in CI? | `docs/MIXED_CLUSTER_RUNBOOK.md` |
 | All the make targets | `make help` |
 
 Note that `docker/docker-compose.mixed-cluster.yml` is a *different*

@@ -1,0 +1,312 @@
+// Copyright (c) 2026 Algod DAO
+// SPDX-License-Identifier: MIT
+// See the LICENSE-MIT file in the repository root for the full license text.
+//
+// Provenance: original program written for issue #1674 (mixed-cluster rich
+// workload). It is NOT derived from go-algorand sources; it only uses
+// opcodes documented in go-algorand's data/transactions/logic/opcodes.go
+// (v10 = box_resize / box_splice, v8 = box_*, v5+ = inner transactions).
+//
+// One approval program with a dispatch on ApplicationArgs[0] so a single
+// goal-compiled app can drive every Execute-mode code path the soak wants
+// to cover. Assemble with `goal clerk compile` (the workload does this
+// implicitly through `goal app create --approval-prog`).
+//
+//   box ops   : bput bcreate bget bext brepl bsplice bresize bdel
+//   inner txn : ipay iclosepay iasset idestroy iopt isend iaclose iappl icall idel
+//   state     : gput lput log
+//   delete    : DeleteApplication with ApplicationArgs[0] == "closedel"
+//               closes the app account into Accounts[1] through an inner
+//               payment with close_remainder_to.
+//
+// Inner transactions always set Fee 0, so the caller covers them by fee
+// pooling (the workload passes --fee 6000).
+#pragma version 10
+txn ApplicationID
+bz approve
+txn OnCompletion
+switch noop approve approve fail fail on_delete
+
+noop:
+byte "bput"
+byte "bcreate"
+byte "bget"
+byte "bext"
+byte "brepl"
+byte "bsplice"
+byte "bresize"
+byte "bdel"
+byte "ipay"
+byte "iclosepay"
+byte "iasset"
+byte "idestroy"
+byte "iopt"
+byte "isend"
+byte "iaclose"
+byte "iappl"
+byte "icall"
+byte "idel"
+byte "gput"
+byte "lput"
+byte "log"
+txna ApplicationArgs 0
+match bput bcreate bget bext brepl bsplice bresize bdel ipay iclosepay iasset idestroy iopt isend iaclose iappl icall idel gput lput dolog
+b fail
+
+bput:
+txna ApplicationArgs 1
+txna ApplicationArgs 2
+box_put
+b approve
+
+bcreate:
+txna ApplicationArgs 1
+txna ApplicationArgs 2
+btoi
+box_create
+pop
+b approve
+
+bget:
+txna ApplicationArgs 1
+box_get
+assert
+pop
+b approve
+
+bext:
+txna ApplicationArgs 1
+int 0
+txna ApplicationArgs 2
+btoi
+box_extract
+pop
+b approve
+
+brepl:
+txna ApplicationArgs 1
+int 0
+txna ApplicationArgs 2
+box_replace
+b approve
+
+bsplice:
+txna ApplicationArgs 1
+int 0
+int 1
+txna ApplicationArgs 2
+box_splice
+b approve
+
+bresize:
+txna ApplicationArgs 1
+txna ApplicationArgs 2
+btoi
+box_resize
+b approve
+
+bdel:
+txna ApplicationArgs 1
+box_del
+pop
+b approve
+
+ipay:
+itxn_begin
+int pay
+itxn_field TypeEnum
+txna Accounts 1
+itxn_field Receiver
+txna ApplicationArgs 1
+btoi
+itxn_field Amount
+int 0
+itxn_field Fee
+itxn_submit
+itxn TxID
+log
+b approve
+
+iclosepay:
+itxn_begin
+int pay
+itxn_field TypeEnum
+txna Accounts 1
+itxn_field Receiver
+txna Accounts 1
+itxn_field CloseRemainderTo
+int 0
+itxn_field Fee
+itxn_submit
+itxn TxID
+log
+b approve
+
+iasset:
+itxn_begin
+int acfg
+itxn_field TypeEnum
+int 1000
+itxn_field ConfigAssetTotal
+int 0
+itxn_field ConfigAssetDecimals
+byte "ITX"
+itxn_field ConfigAssetUnitName
+byte "inner-asset"
+itxn_field ConfigAssetName
+global CurrentApplicationAddress
+itxn_field ConfigAssetManager
+int 0
+itxn_field Fee
+itxn_submit
+itxn CreatedAssetID
+itob
+log
+b approve
+
+idestroy:
+itxn_begin
+int acfg
+itxn_field TypeEnum
+txna Assets 0
+itxn_field ConfigAsset
+int 0
+itxn_field Fee
+itxn_submit
+b approve
+
+iopt:
+itxn_begin
+int axfer
+itxn_field TypeEnum
+txna Assets 0
+itxn_field XferAsset
+global CurrentApplicationAddress
+itxn_field AssetReceiver
+int 0
+itxn_field AssetAmount
+int 0
+itxn_field Fee
+itxn_submit
+b approve
+
+isend:
+itxn_begin
+int axfer
+itxn_field TypeEnum
+txna Assets 0
+itxn_field XferAsset
+txna Accounts 1
+itxn_field AssetReceiver
+txna ApplicationArgs 1
+btoi
+itxn_field AssetAmount
+int 0
+itxn_field Fee
+itxn_submit
+b approve
+
+iaclose:
+itxn_begin
+int axfer
+itxn_field TypeEnum
+txna Assets 0
+itxn_field XferAsset
+txna Accounts 1
+itxn_field AssetReceiver
+txna Accounts 1
+itxn_field AssetCloseTo
+int 0
+itxn_field AssetAmount
+int 0
+itxn_field Fee
+itxn_submit
+b approve
+
+// Inner application create. The child program is the 3-byte AVM program
+// `version 10; pushint 1` (0x0a 0x81 0x01) so no assembler is needed.
+iappl:
+itxn_begin
+int appl
+itxn_field TypeEnum
+byte 0x0a8101
+itxn_field ApprovalProgram
+byte 0x0a8101
+itxn_field ClearStateProgram
+int 0
+itxn_field Fee
+itxn_submit
+itxn CreatedApplicationID
+itob
+log
+b approve
+
+icall:
+itxn_begin
+int appl
+itxn_field TypeEnum
+txna Applications 1
+itxn_field ApplicationID
+int 0
+itxn_field Fee
+itxn_submit
+b approve
+
+idel:
+itxn_begin
+int appl
+itxn_field TypeEnum
+txna Applications 1
+itxn_field ApplicationID
+int DeleteApplication
+itxn_field OnCompletion
+int 0
+itxn_field Fee
+itxn_submit
+b approve
+
+gput:
+byte "g"
+txna ApplicationArgs 1
+btoi
+app_global_put
+b approve
+
+lput:
+txn Sender
+byte "l"
+txna ApplicationArgs 1
+btoi
+app_local_put
+b approve
+
+dolog:
+txna ApplicationArgs 1
+log
+b approve
+
+on_delete:
+txn NumAppArgs
+bz approve
+txna ApplicationArgs 0
+byte "closedel"
+==
+bz approve
+itxn_begin
+int pay
+itxn_field TypeEnum
+txna Accounts 1
+itxn_field Receiver
+txna Accounts 1
+itxn_field CloseRemainderTo
+int 0
+itxn_field Fee
+itxn_submit
+b approve
+
+fail:
+err
+
+approve:
+int 1
+return

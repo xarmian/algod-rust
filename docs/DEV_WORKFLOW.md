@@ -304,6 +304,14 @@ a retry are listed under "Flaky tests" in the job summary. The first run on a
 fresh cache (until `main` populates it) compiles from scratch, about 4 extra
 minutes; a warm run is a few minutes.
 
+## Mixed-cluster rich-workload soak (issue #1674)
+
+To check that go-algorand and algod-rust agree block for block while the chain
+carries boxes, inner transactions, asset and app lifecycles and groups (not just
+empty blocks), run `make consensus-cluster-test ROUNDS=200 WORKLOAD=rich` or
+dispatch `consensus-cluster.yml` with `workload=rich`. See
+`docs/MIXED_CLUSTER_RUNBOOK.md`.
+
 ## Conformance Validation
 
 ```bash
