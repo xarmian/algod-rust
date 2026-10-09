@@ -70,6 +70,8 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=cert_window.sh
+source "$HERE/cert_window.sh"
 ROOT="$(cd "$HERE/.." && pwd)"
 REPO_ROOT="$(cd "$ROOT/../.." && pwd)"
 
@@ -292,6 +294,7 @@ if [ "$RUN_CERT" = "1" ]; then
             exit 4
         fi
         CERT_LEDGER_PATH="$CERT_PREFIX_CANDIDATE"
+        BLOCK_PATH="${CERT_PREFIX_CANDIDATE}.block.sqlite"
         echo "==> cert cross-verify (Go-produced → Rust verifier), stride $STRIDE"
         echo "    ledger: $CERT_LEDGER_PATH (--cert-ledger override)"
     else
@@ -337,6 +340,8 @@ if [ "$RUN_CERT" = "1" ]; then
                 echo "error: failed to docker cp the block snapshot." >&2
                 exit 4
             fi
+            # Lowest block round the Rust ledger retains (#1777).
+            RUST_EARLIEST="$(probe_earliest_container phase6-rust-node-4 /app/verify-soak-block.sqlite)"
             # Clean up the in-container snapshots; don't leak volume
             # space across runs. `rm -f` is safe even if a file vanished.
             docker exec phase6-rust-node-4 rm -f \
@@ -382,17 +387,24 @@ if [ "$RUN_CERT" = "1" ]; then
         CERT_EXTRA_ARGS+=(--export-go-input "$GO_INPUT")
         echo "    rust participant: $RUST_ACCOUNT (>= $MIN_RUST_VOTE_ROUNDS cert(s) must carry its vote)"
     fi
-    # OPT-IN workaround for issue #1777 (the Rust ledger did not serve round 1
-    # on a 2700-round run). CERT_WINDOW=N (default 0 = off) restricts the cert
-    # pass to the last N rounds; the fork detector still covers the whole
-    # range. The clamp is never silent: the line below is grepped by
-    # consensus-conformance.sh into a WARN row of the summary.
-    CERT_WINDOW="${CERT_WINDOW:-0}"
-    CERT_FROM="$FROM_ROUND"
-    if [ "$CERT_WINDOW" -gt 0 ] && [ $((TO_ROUND - CERT_FROM)) -gt "$CERT_WINDOW" ]; then
-        CERT_FROM=$((TO_ROUND - CERT_WINDOW))
-        echo "    CERT_WINDOW_CLAMPED=1 cert cross-verify covers $CERT_FROM..$TO_ROUND only (requested $FROM_ROUND..$TO_ROUND, CERT_WINDOW=$CERT_WINDOW, workaround for #1777)"
+    # Issue #1777: a non-archival Rust node (like a non-archival go node) keeps
+    # only the last ~1001 blocks, so the cert pass must not start before the
+    # earliest block the Rust snapshot actually holds. The window is DERIVED
+    # from the snapshot (RUST_EARLIEST, lowest block round) by cert_window.py;
+    # PHASE6_GO_ARCHIVAL=1 runs make the Rust node archival too (start.sh), so
+    # they cover the whole range. CERT_WINDOW=N (default 0 = off) additionally
+    # restricts the pass to the last N rounds. A clamp is never silent: the
+    # CERT_WINDOW_CLAMPED line is grepped by consensus-conformance.sh into a
+    # WARN row of the summary. The fork detector still covers the whole range.
+    # No sqlite3 in the container (or the snapshot path was a raw docker cp):
+    # probe the host copy with sqlite3, then python's sqlite3 module.
+    if [ -z "${RUST_EARLIEST:-}" ]; then
+        RUST_EARLIEST="$(probe_earliest_file "${BLOCK_PATH:-}")"
     fi
+    # An unknown earliest round is never silently unclamped (cert_window.py
+    # falls back to CERT_WINDOW, else the last 900 rounds).
+    resolve_cert_window "$FROM_ROUND" "$TO_ROUND" "${RUST_EARLIEST:-}" || exit 2
+    CERT_FROM="${CERT_FROM:?}"
     set +e
     "$CERT_BIN" \
         --node http://127.0.0.1:4001 \

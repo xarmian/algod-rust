@@ -76,8 +76,10 @@
 #                         block for the post-hoc verifiers.
 #   WORKLOAD_SEED         seed of the rich workload schedule (default 1674)
 #   CERT_WINDOW           opt-in (default 0 = off): restrict the cert
-#                         cross-verify to the last N rounds (#1777 workaround);
-#                         recorded as a cert_window_clamped WARN check
+#                         cross-verify to the last N rounds. Independently, a
+#                         non-archival Rust ledger is clamped to its retained
+#                         blocks (#1777); either is recorded as a
+#                         cert_window_clamped WARN check
 #   SKIP_START=1          use an already-running cluster
 #   KEEP_CLUSTER=1        leave the cluster up on exit
 #   REUSE_NETROOT=1       keep an existing netroot/ (keys, genesis, Go

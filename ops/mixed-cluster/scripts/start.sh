@@ -26,9 +26,9 @@
 #   5. docker compose up -d --build rust-node-4 (or, with
 #      PHASE6_SKIP_BUILD=1, reuse a pre-built algod-rust-phase6:local).
 #
-# Env: PHASE6_GO_ARCHIVAL=1 sets Archival=true on the three Go relays so a
-# long soak can still be verified after the fact (issue #1674); the default
-# keeps go-algorand's non-archival block pruning.
+# Env: PHASE6_GO_ARCHIVAL=1 sets Archival=true on the three Go relays AND the
+# Rust node so a long soak can still be verified after the fact (issues
+# #1674, #1777); the default keeps go-algorand's non-archival block pruning.
 
 set -euo pipefail
 
@@ -277,6 +277,29 @@ cfg.update({
 })
 print(json.dumps(cfg))
 " "$EXISTING_CFG" "$CATCHPOINT_INTERVAL" | tr -d '\r' > "$RUST_DATA_DIR/config.json"
+fi
+
+# -- 4e. Archival Rust node (issue #1777) ----------------------------------
+# PHASE6_GO_ARCHIVAL=1 keeps every block on the Go relays; the Rust node must
+# do the same or the post-hoc cert cross-verify (which opens a snapshot of the
+# Rust ledger) fails on a long run with "round 1 not available". algod-rust
+# honours `Archival` exactly like go (`resolve_retention_config` ->
+# `apply.rs` per-block pruning), so a non-archival Rust node keeps only
+# ~MaxTxnLife rounds, as a non-archival go node does. Merged with any
+# config.json written above.
+# Set (PHASE6_GO_ARCHIVAL=1) or CLEAR (otherwise) the key on every start, so a
+# config.json kept by REUSE_NETROOT=1 cannot carry a stale value.
+RUST_ARCHIVAL=0
+if [ "${PHASE6_GO_ARCHIVAL:-0}" = "1" ]; then
+    echo "==> enabling Archival on rust-node-4 (PHASE6_GO_ARCHIVAL=1)"
+    RUST_ARCHIVAL=1
+fi
+if [ -f "$RUST_DATA_DIR/config.json" ] || [ "$RUST_ARCHIVAL" = "1" ]; then
+    EXISTING_CFG="{}"
+    [ -f "$RUST_DATA_DIR/config.json" ] && EXISTING_CFG="$(cat "$RUST_DATA_DIR/config.json")"
+    printf '%s' "$EXISTING_CFG" | python3 "$HERE/rust_config_merge.py" - "$RUST_ARCHIVAL" \
+        | tr -d '\r' > "$RUST_DATA_DIR/config.json.new"
+    mv "$RUST_DATA_DIR/config.json.new" "$RUST_DATA_DIR/config.json"
 fi
 
 # -- 5. Start the Go nodes, then the Rust node -----------------------------
