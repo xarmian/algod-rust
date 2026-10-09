@@ -108,6 +108,20 @@ pub enum PoolError {
     #[error("TransactionPool.ingest: {0}")]
     EvaluatorWithDetail(String, algo_error::AvmErrorDetail),
 
+    /// The block evaluator refused a transaction of the group
+    /// ([`algo_error::AlgoError::Rejected`]). `message` is go's verbatim
+    /// `eval.TransactionGroup` error (`transaction <txid>: <reason>`), which
+    /// go's `Remember` wraps as `TransactionPool.Remember: transaction
+    /// <txid>: <reason>` with no `TransactionPool.ingest` frame in between
+    /// (issue #1776). `class` selects the error tag by type; `detail` carries
+    /// structured AVM diagnostics when the program errored.
+    #[error("{message}")]
+    TxnRejected {
+        message: String,
+        class: algo_error::RejectClass,
+        detail: Option<algo_error::AvmErrorDetail>,
+    },
+
     /// The transaction's lease is already recorded for the sender within
     /// the relevant round window.
     ///
@@ -151,6 +165,7 @@ impl PoolError {
     pub fn avm_eval_detail(&self) -> Option<&algo_error::AvmErrorDetail> {
         match self {
             PoolError::EvaluatorWithDetail(_, detail) => Some(detail),
+            PoolError::TxnRejected { detail, .. } => detail.as_ref(),
             PoolError::Remember(inner) => inner.avm_eval_detail(),
             _ => None,
         }
@@ -285,6 +300,11 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
         PoolError::AlreadyInLedger(_) => PoolErrorTag::TxId,
         PoolError::Evaluator(msg) => classify_evaluator_message(msg),
         PoolError::EvaluatorWithDetail(msg, _) => classify_evaluator_message(msg),
+        PoolError::TxnRejected { class, message, .. } => match class {
+            algo_error::RejectClass::TealReject => PoolErrorTag::TealReject,
+            algo_error::RejectClass::TealErr => PoolErrorTag::TealErr,
+            algo_error::RejectClass::Other => classify_evaluator_message(message),
+        },
         PoolError::LeaseConflict {
             in_block_evaluator, ..
         } => {
@@ -516,5 +536,38 @@ mod tests {
     fn pool_error_tag_all_count() {
         // Go has 19 tags in TxPoolErrTags
         assert_eq!(PoolErrorTag::ALL.len(), 19);
+    }
+
+    /// go: `fmt.Errorf("TransactionPool.Remember: %w", err)` around the
+    /// evaluator `transaction %v: %w` error, with nothing in between.
+    #[test]
+    fn remember_of_txn_rejection_displays_go_text_exactly() {
+        let inner = PoolError::TxnRejected {
+            message: "transaction H6YID47U5WQHWXIVEINCBNIXG7E6CMPKEVPSECLO76JMVYOOKSMQ: cannot close: 1 outstanding assets".to_string(),
+            class: algo_error::RejectClass::Other,
+            detail: None,
+        };
+        assert_eq!(
+            PoolError::Remember(Box::new(inner)).to_string(),
+            "TransactionPool.Remember: transaction H6YID47U5WQHWXIVEINCBNIXG7E6CMPKEVPSECLO76JMVYOOKSMQ: cannot close: 1 outstanding assets"
+        );
+    }
+
+    /// Classification follows the rejection type, not the message text.
+    #[test]
+    fn txn_rejection_is_classified_by_class_not_message() {
+        let rej = |class| PoolError::TxnRejected {
+            message: "transaction X: duplicate lease approval program rejected transaction".into(),
+            class,
+            detail: None,
+        };
+        assert_eq!(
+            classify_pool_error(&rej(algo_error::RejectClass::TealReject)),
+            PoolErrorTag::TealReject
+        );
+        assert_eq!(
+            classify_pool_error(&rej(algo_error::RejectClass::TealErr)),
+            PoolErrorTag::TealErr
+        );
     }
 }

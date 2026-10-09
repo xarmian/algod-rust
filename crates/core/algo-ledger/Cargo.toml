@@ -5,6 +5,10 @@ edition = "2021"
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Fault-injection hooks for the proposer assembly tests (never in production).
+test-hooks = []
+
 [dependencies]
 algo-types = { workspace = true }
 algo-error = { workspace = true }

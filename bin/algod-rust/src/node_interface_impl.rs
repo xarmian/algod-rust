@@ -911,9 +911,11 @@ impl AlgodNodeInterface {
     fn local_tx_error_to_node_error(err: LocalTxError) -> NodeError {
         match err {
             LocalTxError::Empty => NodeError::Internal("broadcast: empty group".into()),
-            LocalTxError::Pool(msg) => {
-                NodeError::Internal(format!("broadcast: pool rejected group: {msg}"))
-            }
+            // go: `BroadcastSignedTxGroup` returns the pool error as is and the
+            // handler answers `400 {"message": err.Error()}`, i.e.
+            // `TransactionPool.Remember: transaction <id>: <reason>` with no
+            // adapter prefix (issue #1776).
+            LocalTxError::Pool(msg) => NodeError::BadRequest(msg),
             LocalTxError::Encode(msg) => {
                 NodeError::Internal(format!("broadcast: encode failed: {msg}"))
             }
@@ -2359,6 +2361,8 @@ impl NodeInterface for AlgodNodeInterface {
         // Issue #1761: process start time, so a scraper detects restarts
         // even when the restarted node outgrew its earlier counters.
         text.push_str(&algo_ledger::follow_timing::process_start_time_prometheus_text());
+        // Issue #1776: pool/proposer real-apply evaluation counters.
+        text.push_str(&algo_ledger::proposal_eval::proposal_metrics_prometheus_text());
         if let Some(pool) = self.pool.as_ref() {
             text.push_str(&pool.reeval_counter().to_prometheus_text());
         }
@@ -4970,7 +4974,11 @@ mod tests {
 
         let pool =
             AlgodNodeInterface::local_tx_error_to_node_error(LocalTxError::Pool("bad fee".into()));
-        assert_eq!(msg(pool), "broadcast: pool rejected group: bad fee");
+        // A pool rejection is a client error carrying go's text verbatim.
+        match pool {
+            NodeError::BadRequest(m) => assert_eq!(m, "bad fee"),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
 
         let encode = AlgodNodeInterface::local_tx_error_to_node_error(LocalTxError::Encode(
             "bad msgpack".into(),

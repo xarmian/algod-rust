@@ -757,6 +757,136 @@ fn compare<L: LedgerStore>(
     out
 }
 
+/// Fault injection for the proposer assembly tests. Compiled only into test
+/// builds and into builds that enable the `test-hooks` feature (the
+/// `algod-rust` dev-dependency does); never into a production binary.
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_NEXT: Cell<u64> = const { Cell::new(0) };
+        static FAIL_OVER: Cell<Option<usize>> = const { Cell::new(None) };
+        static CALLS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// The next `n` [`super::scratch_execute_payset`] calls on this thread
+    /// fail with a transient, unattributable error.
+    pub fn inject_scratch_failures(n: u64) {
+        FAIL_NEXT.with(|c| c.set(n));
+    }
+
+    /// Every call on this thread whose payset has more than `n` transactions
+    /// fails with an unattributable error (`None` clears it).
+    pub fn inject_failure_over_payset_len(n: Option<usize>) {
+        FAIL_OVER.with(|c| c.set(n));
+    }
+
+    /// Number of scratch passes run on this thread since the last reset.
+    pub fn scratch_calls() -> u64 {
+        CALLS.with(|c| c.get())
+    }
+
+    /// Reset the per-thread pass counter.
+    pub fn reset_scratch_calls() {
+        CALLS.with(|c| c.set(0));
+    }
+
+    pub(super) fn should_fail(payset_len: usize) -> bool {
+        CALLS.with(|c| c.set(c.get() + 1));
+        let next = FAIL_NEXT.with(|c| {
+            let n = c.get();
+            c.set(n.saturating_sub(1));
+            n > 0
+        });
+        next || FAIL_OVER.with(|c| c.get()).is_some_and(|n| payset_len > n)
+    }
+}
+
+/// Result of [`scratch_execute_payset`].
+#[derive(Debug)]
+pub struct ScratchPayset {
+    /// Per-transaction apply data in payset order.
+    pub apply_data: Vec<ApplyData>,
+    /// The transaction counter after every top-level and inner transaction
+    /// (go `block.TxnCounter`).
+    pub final_txn_counter: u64,
+}
+
+/// Why [`scratch_execute_payset`] did not produce a result.
+#[derive(Debug)]
+pub enum ScratchFailure {
+    /// The payset transaction at `index` cannot be applied.
+    Txn { index: usize, error: AlgoError },
+    /// The evaluation failed for a reason no transaction owns (stale round,
+    /// end-of-block failure, panic).
+    Other(AlgoError),
+    /// The store cannot roll a scratch apply back (a lease journal is
+    /// already open): nothing was evaluated.
+    Unsupported,
+}
+
+/// Evaluate `block` (the proposer's candidate: next-round header + payset,
+/// stripped form) in [`ApplyMode::Execute`] on a rolled-back scratch apply of
+/// `store` and return every transaction's `ApplyData` and the final
+/// transaction counter, or the payset index that failed (issue #1776).
+///
+/// This is the authoritative check the block proposer runs on its assembled
+/// payset (go's `BlockEvaluator.GenerateBlock` only ever emits what its
+/// `TransactionGroup` applied). Nothing is persisted: the SAVEPOINT, the
+/// lease journal and the chain fields are restored before returning.
+pub fn scratch_execute_payset<L: LedgerStore>(
+    store: &mut L,
+    block: &Block,
+) -> Result<ScratchPayset, ScratchFailure> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if test_hooks::should_fail(block.payset.len()) {
+        return Err(ScratchFailure::Other(AlgoError::Ledger {
+            message: "injected transient scratch failure".into(),
+        }));
+    }
+    let Some(aux) = scratch_state(store) else {
+        return Err(ScratchFailure::Unsupported);
+    };
+    let chain = ChainFields::capture(store);
+    let invariant = ScratchInvariant::capture(store, &chain);
+    let sp = store.snapshot(&[]);
+    let mut ad: Vec<ApplyData> = Vec::with_capacity(block.payset.len());
+    let mut probe = crate::apply::ExecProbe::default();
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::apply::apply_block_impl_probe(
+            store,
+            block,
+            ApplyMode::Execute,
+            false,
+            None,
+            None,
+            Some(&mut ad),
+            None,
+            true,
+            Some(&mut probe),
+        )
+    }));
+    invariant.check_scratch_pass(store);
+    store.restore_snapshot(sp);
+    chain.restore(store);
+    store.restore_scratch_state(aux);
+    invariant.check_rolled_back(store);
+    match res {
+        Err(_) => Err(ScratchFailure::Other(AlgoError::Ledger {
+            message: "scratch Execute evaluation panicked".into(),
+        })),
+        Ok(Err(error)) => match probe.failed_txn_index {
+            Some(index) if index < block.payset.len() => Err(ScratchFailure::Txn { index, error }),
+            _ => Err(ScratchFailure::Other(error)),
+        },
+        Ok(Ok(())) => Ok(ScratchPayset {
+            apply_data: ad,
+            final_txn_counter: probe.final_txn_counter,
+        }),
+    }
+}
+
 /// Apply `block` for real in [`ApplyMode::Replay`] (exactly what the follow
 /// path does for a block without app calls) after shadow-evaluating it in
 /// [`ApplyMode::Execute`] on a rolled-back scratch apply, and return the

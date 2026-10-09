@@ -1451,6 +1451,7 @@ fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
     mut tracer: Option<&mut dyn EvalTracer>,
     mut apply_data_out: Option<&mut Vec<ApplyData>>,
     global_txn_idx: &mut usize,
+    failed_txn: &mut Option<usize>,
 ) -> Result<(), AlgoError> {
     // Shared across every member of this atomic group so `gload`/`gloads`/
     // `gloadss` in a later transaction can see whether an earlier sibling
@@ -1462,8 +1463,12 @@ fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
     for (gi_idx, stx) in group.iter().enumerate() {
         ctx.txn_index.set(*global_txn_idx);
         if ctx.validate {
-            check_txn_alive(Round(ctx.round), stx)?;
-            check_authorizer(store, stx)?;
+            check_txn_alive(Round(ctx.round), stx).inspect_err(|_| {
+                *failed_txn = Some(*global_txn_idx);
+            })?;
+            check_authorizer(store, stx).inspect_err(|_| {
+                *failed_txn = Some(*global_txn_idx);
+            })?;
         }
         let gi = GroupInfo {
             txns: group,
@@ -1505,12 +1510,17 @@ fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
                 Some(&mut *group_box_budget),
                 Some(&gi),
                 tracer_ref,
-            )?;
+            )
+            .inspect_err(|_| {
+                *failed_txn = Some(*global_txn_idx);
+            })?;
             if let Some(out) = apply_data_out.as_deref_mut() {
                 out.push(ad);
             }
         } else {
-            let ad = apply_transaction(store, stx, ctx, 0)?;
+            let ad = apply_transaction(store, stx, ctx, 0).inspect_err(|_| {
+                *failed_txn = Some(*global_txn_idx);
+            })?;
             if let Some(out) = apply_data_out.as_deref_mut() {
                 out.push(ad);
             }
@@ -1595,12 +1605,62 @@ pub(crate) fn apply_block_impl_ex<L: crate::store_trait::LedgerStore>(
     block: &Block,
     mode: ApplyMode,
     validate: bool,
+    tracer: Option<&mut dyn EvalTracer>,
+    group_deltas: Option<&mut crate::txn_group_delta_tracer::TxnGroupDeltaTracer>,
+    apply_data_out: Option<&mut Vec<ApplyData>>,
+    kv_mods_out: Option<&mut KvModsMap>,
+    scratch: bool,
+) -> Result<(), AlgoError> {
+    apply_block_impl_probe(
+        store,
+        block,
+        mode,
+        validate,
+        tracer,
+        group_deltas,
+        apply_data_out,
+        kv_mods_out,
+        scratch,
+        None,
+    )
+}
+
+/// Side outputs of an apply that the proposer's evaluator needs but a plain
+/// apply has no reason to expose (block assembly, issue #1776).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ExecProbe {
+    /// Input: apply only the transactions (go per-group `TransactionGroup`)
+    /// and skip the block epilogue (end-of-block participation updates,
+    /// proposer payout, `record_proposal`, round / protocol / txn-counter
+    /// bookkeeping, lease purge). The proposer runs that epilogue exactly
+    /// once, in the final scratch apply of the whole payset.
+    pub skip_epilogue: bool,
+    /// Payset index of the transaction whose apply failed. `None` when the
+    /// apply did not fail, or failed in a group-level step that no single
+    /// transaction owns.
+    pub failed_txn_index: Option<usize>,
+    /// The transaction counter after every top-level and inner transaction
+    /// of the block (go's `block.TxnCounter`); only set on success.
+    pub final_txn_counter: u64,
+}
+
+/// [`apply_block_impl_ex`] plus an [`ExecProbe`] out-parameter.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+    mode: ApplyMode,
+    validate: bool,
     mut tracer: Option<&mut dyn EvalTracer>,
     mut group_deltas: Option<&mut crate::txn_group_delta_tracer::TxnGroupDeltaTracer>,
     mut apply_data_out: Option<&mut Vec<ApplyData>>,
     kv_mods_out: Option<&mut KvModsMap>,
     scratch: bool,
+    probe: Option<&mut ExecProbe>,
 ) -> Result<(), AlgoError> {
+    let skip_epilogue = probe.as_ref().is_some_and(|p| p.skip_epilogue);
+    // Index of the transaction whose apply failed (see `ExecProbe`).
+    let mut failed_txn: Option<usize> = None;
     // A block's payset stores each transaction without the genesis id/hash
     // (the header carries them; `hgi` marks whether the id was elided).
     // go decodes them back in (`DecodeSignedTxn`), so a program reading
@@ -1742,12 +1802,14 @@ pub(crate) fn apply_block_impl_ex<L: crate::store_trait::LedgerStore>(
         match ctx.mode {
             ApplyMode::Replay => {
                 // Replay mode: process transactions individually (no AVM execution).
-                for stx in &block.payset {
+                for (replay_idx, stx) in block.payset.iter().enumerate() {
                     if ctx.validate {
                         if let Err(e) = check_txn_alive(Round(ctx.round), stx) {
+                            failed_txn = Some(replay_idx);
                             break 'block Err(e);
                         }
                         if let Err(e) = check_authorizer(store, stx) {
+                            failed_txn = Some(replay_idx);
                             break 'block Err(e);
                         }
                     }
@@ -1757,7 +1819,10 @@ pub(crate) fn apply_block_impl_ex<L: crate::store_trait::LedgerStore>(
                                 out.push(ad);
                             }
                         }
-                        Err(e) => break 'block Err(e),
+                        Err(e) => {
+                            failed_txn = Some(replay_idx);
+                            break 'block Err(e);
+                        }
                     }
                 }
             }
@@ -1882,6 +1947,7 @@ pub(crate) fn apply_block_impl_ex<L: crate::store_trait::LedgerStore>(
                             tracer_reborrow,
                             apply_data_out.as_deref_mut(),
                             &mut global_txn_idx,
+                            &mut failed_txn,
                         ) {
                             break 'block Err(e);
                         }
@@ -1895,6 +1961,7 @@ pub(crate) fn apply_block_impl_ex<L: crate::store_trait::LedgerStore>(
                         tracer_reborrow,
                         apply_data_out.as_deref_mut(),
                         &mut global_txn_idx,
+                        &mut failed_txn,
                     ) {
                         break 'block Err(e);
                     }
@@ -1953,6 +2020,12 @@ pub(crate) fn apply_block_impl_ex<L: crate::store_trait::LedgerStore>(
         Ok(())
     };
 
+    if let Some(p) = probe {
+        p.failed_txn_index = if result.is_err() { failed_txn } else { None };
+        if result.is_ok() {
+            p.final_txn_counter = ctx.txn_counter.get();
+        }
+    }
     if result.is_err() {
         // Restore rewards state and addresses on failure.
         store.set_rewards_level(prev_rewards_level);
@@ -1962,6 +2035,12 @@ pub(crate) fn apply_block_impl_ex<L: crate::store_trait::LedgerStore>(
         store.set_fee_sink(prev_fee_sink);
         store.set_rewards_pool(prev_rewards_pool);
         return result;
+    }
+
+    // Per-group evaluation (the proposer pending evaluator) stops here: the
+    // block epilogue below runs once, over the whole payset.
+    if skip_epilogue {
+        return Ok(());
     }
 
     // ── End-of-block participation updates ──────────────────────────
@@ -3901,52 +3980,51 @@ pub fn apply_pay<L: crate::store_trait::LedgerStore>(
         let close_amount = sender.micro_algos;
         ad.closing_amount = close_amount;
 
-        // Cannot close account with opted-in or created assets/apps.
+        // Cannot close an account that still carries asset/app/box state.
+        // Texts and check order are go's `apply.Payment`
+        // (`ledger/apply/payment.go`).
         if sender.total_assets_opted_in > 0 {
-            return Err(AlgoError::Ledger {
+            return Err(AlgoError::Eval {
                 message: format!(
-                    "sender {} cannot close: has {} opted-in assets",
-                    txn.sender, sender.total_assets_opted_in,
+                    "cannot close: {} outstanding assets",
+                    sender.total_assets_opted_in,
                 ),
             });
         }
         if sender.total_created_assets > 0 {
-            return Err(AlgoError::Ledger {
+            return Err(AlgoError::Eval {
                 message: format!(
-                    "sender {} cannot close: has {} created assets",
-                    txn.sender, sender.total_created_assets,
+                    "cannot close: {} outstanding created assets",
+                    sender.total_created_assets,
                 ),
             });
         }
         if sender.total_apps_opted_in > 0 {
-            return Err(AlgoError::Ledger {
+            return Err(AlgoError::Eval {
                 message: format!(
-                    "sender {} cannot close: has {} opted-in apps",
-                    txn.sender, sender.total_apps_opted_in,
-                ),
-            });
-        }
-        if sender.total_created_apps > 0 {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "sender {} cannot close: has {} created apps",
-                    txn.sender, sender.total_created_apps,
+                    "cannot close: {} outstanding applications opted in. Please opt out or clear them",
+                    sender.total_apps_opted_in,
                 ),
             });
         }
         if sender.total_boxes > 0 {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "sender {} cannot close: has {} outstanding boxes",
-                    txn.sender, sender.total_boxes,
-                ),
+            return Err(AlgoError::Eval {
+                message: format!("cannot close: {} outstanding boxes", sender.total_boxes),
             });
         }
         if sender.total_box_bytes > 0 {
-            return Err(AlgoError::Ledger {
+            return Err(AlgoError::Eval {
                 message: format!(
-                    "sender {} cannot close: has {} outstanding box bytes",
-                    txn.sender, sender.total_box_bytes,
+                    "cannot close: {} outstanding box bytes",
+                    sender.total_box_bytes,
+                ),
+            });
+        }
+        if sender.total_created_apps > 0 {
+            return Err(AlgoError::Eval {
+                message: format!(
+                    "cannot close: {} outstanding created applications",
+                    sender.total_created_apps,
                 ),
             });
         }
@@ -4994,9 +5072,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
     // Exception: ClearState always succeeds even if app is deleted (lets users reclaim local state).
     if !is_create && txn.on_completion != ON_COMPLETION_CLEAR_STATE && !store.has_app_params(app_id)
     {
-        return Err(AlgoError::Ledger {
-            message: format!("appl: app {} does not exist", app_id),
-        });
+        return Err(AlgoError::AppDoesNotExist { app_id });
     }
 
     if is_create {
@@ -5389,40 +5465,30 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                             txn,
                             ctx.consensus.no_empty_local_deltas,
                         ));
-                    let message = format!(
-                        "appl execute: app {} approval program rejected transaction{}",
+                    let rejected = AlgoError::ApprovalRejected {
                         app_id,
-                        result
-                            .error
-                            .as_ref()
-                            .map(|e| format!(": {}", e))
-                            .unwrap_or_default()
-                    );
+                        reason: result.error.clone(),
+                    };
                     // When the approval program actually errored (as opposed
                     // to a clean reject), preserve the structured
                     // pc/group-index/app-index/eval-states diagnostics
                     // `run_approval_program` attached to `result.error_detail`
-                    // (issue #1135) by re-wrapping them in an
+                    // (issue #1135) by wrapping them in an
                     // `AlgoError::AvmLogicSig`, matching go's
                     // `basics.Annotate`-based `evalError()`
-                    // (`data/transactions/logic/eval.go`) attaching the same
-                    // attributes regardless of how far up the call stack the
-                    // failure is reported. The message text is unchanged
-                    // either way -- only the error's structured attributes
-                    // (surfaced by the REST API's `ErrorResponse.data`, see
-                    // `algo_rest_api::error`) depend on this branch.
+                    // (`data/transactions/logic/eval.go`). The message text is
+                    // unchanged either way; the typed `ApprovalRejected` is
+                    // the wrapped source so callers can match the type.
                     return Err(match result.error_detail {
                         Some(detail) => AlgoError::AvmLogicSig {
-                            source: Box::new(AlgoError::Ledger {
-                                message: message.clone(),
-                            }),
-                            message,
+                            message: rejected.to_string(),
+                            source: Box::new(rejected),
                             pc: detail.pc,
                             group_index: detail.group_index,
                             app_index: detail.app_index,
                             eval_states: detail.eval_states,
                         },
-                        None => AlgoError::Ledger { message },
+                        None => rejected,
                     });
                 }
                 // Report the approval program's state changes / logs / inner txns.
