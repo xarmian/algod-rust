@@ -2312,7 +2312,7 @@ mod app_rate_limiter_wiring_tests {
         let handler =
             TxTagHandler::new(pool.clone(), seen.clone()).with_app_rate_limiter(limiter.clone(), 0);
 
-        pool.set_evaluator_paused(true);
+        pool.pause_evaluator();
 
         // Pre-check path.
         let out = handler
@@ -2348,8 +2348,7 @@ mod app_rate_limiter_wiring_tests {
 
         // Resumed: filler primes congestion; the same app/origin is admitted
         // (a recorded penalty would have dropped it).
-        pool.set_evaluator_paused(false);
-        pool.on_new_block(&Block::default(), &HashSet::new());
+        pool.resume_evaluator(true);
         let filler = {
             let mut stx = SignedTransaction::default();
             stx.txn.txn_type = TxnType::Pay;
@@ -3007,7 +3006,7 @@ mod canonical_cache_wiring_tests {
             TxTagHandler::new(pool.clone(), seen.clone()).with_canonical_cache(canonical.clone());
 
         // Pre-check path.
-        pool.set_evaluator_paused(true);
+        pool.pause_evaluator();
         let tx = make_payment_txn(1, 1, 1_000_000);
         let txid = compute_txn_id(&tx.txn);
         let out = handler
@@ -3037,7 +3036,7 @@ mod canonical_cache_wiring_tests {
         );
 
         // After the catchup the same bytes are admitted.
-        pool.resume_evaluator();
+        pool.resume_evaluator(true);
         let out = handler
             .handle(incoming(std::slice::from_ref(&tx), "1.2.3.4:4160"))
             .await;

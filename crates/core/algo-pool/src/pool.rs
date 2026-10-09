@@ -72,6 +72,10 @@ struct AssemblyResults {
 /// expired from the pending set anyway.
 const MAX_PAUSED_BLOCKS: usize = 1000;
 
+/// Minimum spacing between failed on-demand evaluator rebuild attempts within
+/// one ledger round (issue #1683).
+const REPRIME_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
 /// State protected by the main mutex (`mu`).
 ///
 /// Matches the fields that live behind `pool.mu` in go-algorand.
@@ -106,6 +110,17 @@ struct PoolInner {
     /// blocks confirmed are recorded as confirmed, not re-evaluated into an
     /// error.
     paused_committed: VecDeque<HashSet<Digest>>,
+
+    /// Highest block round `on_new_block` has recorded while paused: a
+    /// re-delivered older (or the same) block must not be recorded or counted
+    /// toward the fee threshold twice.
+    paused_last_round: Option<Round>,
+
+    /// Ledger round and time of the last on-demand rebuild attempt, so a
+    /// failing rebuild is retried at most once per
+    /// [`REPRIME_RETRY_INTERVAL`] per round instead of inside every
+    /// `remember()`/`test()` under the pool mutex.
+    reprime_attempt: Option<(Round, Instant)>,
 
     /// Number of "whole blocks" worth of transactions that have accumulated.
     /// Drives the exponential fee ramp.
@@ -204,6 +219,8 @@ impl TransactionPool {
             evaluator_paused: false,
             reprime_on_demand: false,
             paused_committed: VecDeque::new(),
+            paused_last_round: None,
+            reprime_attempt: None,
             num_pending_whole_blocks: 0,
             fee_threshold_multiplier: 0,
             stateproof_overflowed: false,
@@ -412,7 +429,7 @@ impl TransactionPool {
         }
         self.maybe_reprime(guard);
         if guard.evaluator.is_none() {
-            return Err(PoolError::NoPendingBlockEvaluator);
+            return Err(Self::no_evaluator_error(guard));
         }
 
         // Wait for OnNewBlock to catch up to the ledger.
@@ -437,7 +454,7 @@ impl TransactionPool {
                     return Err(PoolError::NodeCatchingUp);
                 }
                 if guard.evaluator.is_none() {
-                    return Err(PoolError::NoPendingBlockEvaluator);
+                    return Err(Self::no_evaluator_error(guard));
                 }
                 if self.is_shutdown() {
                     return Err(PoolError::PoolShutdown);
@@ -535,9 +552,11 @@ impl TransactionPool {
         let committed_txids = if inner.paused_committed.is_empty() {
             committed_txids
         } else {
+            // Cloned, not drained: if the rebuild below fails, the sets must
+            // still be there for the next attempt.
             let mut all = committed_txids.clone();
-            for set in inner.paused_committed.drain(..) {
-                all.extend(set);
+            for set in &inner.paused_committed {
+                all.extend(set.iter().copied());
             }
             merged_committed = all;
             &merged_committed
@@ -578,6 +597,8 @@ impl TransactionPool {
         };
         inner.evaluator = Some(new_eval);
         inner.reprime_on_demand = false;
+        inner.reprime_attempt = None;
+        inner.paused_committed.clear();
 
         // Clear remembered state -- we are rebuilding from scratch.
         inner.remembered_tx_groups = Vec::new();
@@ -849,7 +870,7 @@ impl TransactionPool {
                 .map_err(|e| PoolError::Evaluator(e.to_string()))?;
             Ok(())
         } else {
-            Err(PoolError::NoPendingBlockEvaluator)
+            Err(Self::no_evaluator_error(&inner))
         }
     }
 
@@ -900,12 +921,24 @@ impl TransactionPool {
         // Do the evaluator-free bookkeeping now and remember which
         // transactions the block confirmed, for the rebuild on resume.
         if inner.evaluator_paused {
-            self.adjust_fee_threshold(&mut inner);
-            inner.num_pending_whole_blocks = 0;
-            if inner.paused_committed.len() >= MAX_PAUSED_BLOCKS {
-                inner.paused_committed.pop_front();
+            // Same staleness rule as the normal path: a re-delivered old (or
+            // identical) block is neither recorded nor counted again.
+            let fresh = inner
+                .paused_last_round
+                .is_none_or(|last| block.round > last);
+            if fresh {
+                inner.paused_last_round = Some(block.round);
+                self.adjust_fee_threshold(&mut inner);
+                inner.num_pending_whole_blocks = 0;
+                if inner.paused_committed.len() >= MAX_PAUSED_BLOCKS {
+                    inner.paused_committed.pop_front();
+                    tracing::debug!(
+                        cap = MAX_PAUSED_BLOCKS,
+                        "paused pool: committed-txid buffer full, evicting the oldest block's set"
+                    );
+                }
+                inner.paused_committed.push_back(committed_txids.clone());
             }
-            inner.paused_committed.push_back(committed_txids.clone());
             self.cond.notify_all();
             return;
         }
@@ -961,11 +994,32 @@ impl TransactionPool {
     }
 
     /// Rebuild the evaluator on demand after a pause (see
-    /// `PoolInner::reprime_on_demand`). No-op while paused or when an
-    /// evaluator exists.
+    /// `PoolInner::reprime_on_demand`). No-op while paused, when an evaluator
+    /// exists, or when the last failed attempt was in this same ledger round
+    /// less than [`REPRIME_RETRY_INTERVAL`] ago (the rebuild is a full
+    /// recompute under the pool mutex).
     fn maybe_reprime(&self, inner: &mut PoolInner) {
-        if inner.evaluator.is_none() && inner.reprime_on_demand && !inner.evaluator_paused {
-            self.recompute_block_evaluator(inner, &HashSet::new());
+        if inner.evaluator.is_some() || !inner.reprime_on_demand || inner.evaluator_paused {
+            return;
+        }
+        let latest = self.ledger.latest();
+        if let Some((round, at)) = inner.reprime_attempt {
+            if round == latest && at.elapsed() < REPRIME_RETRY_INTERVAL {
+                return;
+            }
+        }
+        inner.reprime_attempt = Some((latest, Instant::now()));
+        self.recompute_block_evaluator(inner, &HashSet::new());
+    }
+
+    /// The error for "no evaluator": after a pause the pool is waiting to be
+    /// rebuilt, which is transient ([`PoolError::NodeCatchingUp`]); a pool
+    /// that was never primed keeps go's `ErrNoPendingBlockEvaluator`.
+    fn no_evaluator_error(inner: &PoolInner) -> PoolError {
+        if inner.reprime_on_demand {
+            PoolError::NodeCatchingUp
+        } else {
+            PoolError::NoPendingBlockEvaluator
         }
     }
 
@@ -1354,49 +1408,56 @@ impl TransactionPool {
         self.fee_per_byte.store(0, Ordering::Relaxed);
     }
 
-    /// Pause or un-pause the pool's block evaluator (issue #1683).
+    /// Pause the pool's block evaluator (issue #1683).
     ///
     /// The evaluator owns a ledger read snapshot (an open SQLite read
     /// transaction) for as long as it lives. A live catchpoint catchup writes
     /// the ledger through its own connection for many minutes; an evaluator
     /// built against the pre-catchup ledger would pin the WAL for all of it.
     ///
-    /// `true` drops the evaluator now (pending and remembered groups are
-    /// kept) and makes every path that would build one a no-op until
-    /// resumed -- including a block the pool follower processes late, or the
-    /// wake-up `reload_ledger` sends. Admission (`remember`/`test`) fails with
+    /// Drops the evaluator now (pending and remembered groups are kept) and
+    /// makes every path that would build one a no-op until
+    /// [`Self::resume_evaluator`] -- including a block the pool follower
+    /// processes late, or the wake-up `reload_ledger` sends. Blocks that
+    /// arrive meanwhile have their committed txids recorded (bounded) and
+    /// applied on resume. Admission (`remember`/`test`) fails with
     /// [`PoolError::NodeCatchingUp`] meanwhile.
-    ///
-    /// `false` only clears the flag and builds nothing: the next
-    /// [`Self::on_new_block`] rebuilds the evaluator. Use
-    /// [`Self::resume_evaluator`] to clear the flag and rebuild immediately
-    /// (only when the ledger handle is known to be current).
     ///
     /// Takes the pool's blocking mutex; call from `spawn_blocking` on async
     /// tasks (the pool follower can hold it across a ledger read).
-    pub fn set_evaluator_paused(&self, paused: bool) {
+    pub fn pause_evaluator(&self) {
         let mut inner = self.mu.lock();
-        inner.evaluator_paused = paused;
-        if paused {
-            inner.evaluator = None;
-            inner.reprime_on_demand = true;
-        }
+        inner.evaluator_paused = true;
+        inner.evaluator = None;
+        inner.reprime_on_demand = true;
+        inner.paused_last_round = None;
         self.cond.notify_all();
     }
 
-    /// Clear the pause flag and rebuild the evaluator against the ledger's
-    /// current tip, in one critical section so no block can slip in between.
-    pub fn resume_evaluator(&self) {
+    /// Leave the paused state -- the single production operation for it.
+    ///
+    /// With `prime` the evaluator is rebuilt against the ledger's current tip
+    /// in the same critical section (so no block can slip in between), using
+    /// the committed txids recorded while paused. Without it nothing is built
+    /// now: use that only while the ledger handle is known to be about to be
+    /// swapped, so no evaluator is built on the stale one. Either way, if no
+    /// evaluator exists afterwards, the next `remember()`/`test()` (at most
+    /// one attempt per ledger round per second) or `on_new_block` rebuilds it
+    /// and admission reports the retryable [`PoolError::NodeCatchingUp`] in
+    /// between.
+    pub fn resume_evaluator(&self, prime: bool) {
         let mut inner = self.mu.lock();
         inner.evaluator_paused = false;
-        if inner.evaluator.is_none() {
+        inner.paused_last_round = None;
+        if prime {
+            inner.reprime_attempt = Some((self.ledger.latest(), Instant::now()));
             self.recompute_block_evaluator(&mut inner, &HashSet::new());
         }
         self.cond.notify_all();
     }
 
     /// Whether the evaluator is currently paused (see
-    /// [`Self::set_evaluator_paused`]).
+    /// [`Self::pause_evaluator`]).
     pub fn is_evaluator_paused(&self) -> bool {
         self.mu.lock().evaluator_paused
     }
@@ -1494,6 +1555,62 @@ mod tests {
         pool
     }
 
+    /// Ledger whose `start_evaluator` can be made to fail and whose round can
+    /// advance, counting evaluator starts (issue #1683 rebuild tests).
+    struct FlakyLedger {
+        round: std::sync::atomic::AtomicU64,
+        fail_start: AtomicBool,
+        starts: AtomicU64,
+    }
+
+    impl FlakyLedger {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                round: std::sync::atomic::AtomicU64::new(1),
+                fail_start: AtomicBool::new(false),
+                starts: AtomicU64::new(0),
+            })
+        }
+    }
+
+    impl PoolLedger for FlakyLedger {
+        fn latest(&self) -> Round {
+            Round(self.round.load(Ordering::SeqCst))
+        }
+
+        fn block_hdr(&self, _round: Round) -> Result<BlockHeader, AlgoError> {
+            Ok(BlockHeader::default())
+        }
+
+        fn consensus_params(&self, _round: Round) -> Result<ConsensusParams, AlgoError> {
+            Ok(ConsensusParams::default())
+        }
+
+        fn start_evaluator(
+            &self,
+            _hdr: BlockHeader,
+            _payset_hint: usize,
+            _max_txn_bytes_per_block: usize,
+        ) -> Result<Box<dyn BlockEvaluator>, AlgoError> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            if self.fail_start.load(Ordering::SeqCst) {
+                return Err(AlgoError::Ledger {
+                    message: "injected start_evaluator failure".into(),
+                });
+            }
+            Ok(Box::new(StubEvaluator {
+                round: self.latest().next(),
+            }))
+        }
+    }
+
+    fn block_at(round: u64) -> Block {
+        Block {
+            round: Round(round),
+            ..Block::default()
+        }
+    }
+
     /// Issue #1683: pausing drops the evaluator (and its ledger read
     /// snapshot) but keeps pending groups; nothing rebuilds it while paused
     /// (not a late `on_new_block`, not `ensure_evaluator_primed`); admission
@@ -1504,7 +1621,7 @@ mod tests {
         pool.remember(vec![make_test_txn(3)]).unwrap();
         assert!(pool.has_evaluator());
 
-        pool.set_evaluator_paused(true);
+        pool.pause_evaluator();
         assert!(pool.is_evaluator_paused());
         assert!(!pool.has_evaluator());
         assert_eq!(pool.pending_count(), 1, "pending groups survive");
@@ -1525,36 +1642,39 @@ mod tests {
         assert_eq!(pool.pending_count(), 1);
     }
 
-    /// Clearing the flag alone builds nothing, but the next admission (or the
-    /// next block) rebuilds the evaluator, so a failed reload never leaves the
-    /// pool without one. `resume_evaluator` rebuilds at once.
+    /// `resume_evaluator(true)` rebuilds at once; `resume_evaluator(false)`
+    /// builds nothing now, but the next admission or block does, and
+    /// admission reports the retryable error in between (never
+    /// `NoPendingBlockEvaluator`).
     #[test]
-    fn unpausing_does_not_prime_but_remember_and_resume_do() {
-        let pool = make_pool_with_evaluator(10);
-        pool.set_evaluator_paused(true);
+    fn resume_primes_or_defers_and_remember_self_primes() {
+        let ledger = FlakyLedger::new();
+        let pool = TransactionPool::new(PoolConfig::default(), ledger.clone());
+        pool.ensure_evaluator_primed();
+        assert!(pool.has_evaluator());
 
-        pool.set_evaluator_paused(false);
+        pool.pause_evaluator();
+        pool.resume_evaluator(true);
         assert!(!pool.is_evaluator_paused());
-        assert!(!pool.has_evaluator(), "plain un-pause must not build");
+        assert!(pool.has_evaluator(), "resume(true) primes immediately");
+
+        pool.pause_evaluator();
+        pool.resume_evaluator(false);
+        assert!(!pool.is_evaluator_paused());
+        assert!(!pool.has_evaluator(), "resume(false) builds nothing");
         pool.remember(vec![make_test_txn(5)])
             .expect("remember rebuilds the evaluator on demand");
         assert!(pool.has_evaluator());
 
-        pool.set_evaluator_paused(true);
-        pool.set_evaluator_paused(false);
+        pool.pause_evaluator();
+        pool.resume_evaluator(false);
         pool.test(&[make_test_txn(6)])
             .expect("test rebuilds the evaluator on demand");
-        assert!(pool.has_evaluator());
 
-        pool.set_evaluator_paused(true);
-        pool.set_evaluator_paused(false);
+        pool.pause_evaluator();
+        pool.resume_evaluator(false);
         pool.on_new_block(&Block::default(), &HashSet::new());
         assert!(pool.has_evaluator(), "next block rebuilds");
-
-        pool.set_evaluator_paused(true);
-        pool.resume_evaluator();
-        assert!(!pool.is_evaluator_paused());
-        assert!(pool.has_evaluator(), "resume primes immediately");
     }
 
     /// A pool that was never paused keeps go's behaviour: no on-demand build.
@@ -1562,8 +1682,39 @@ mod tests {
     fn never_paused_pool_does_not_self_prime() {
         let ledger = Arc::new(StubLedger { round: Round(1) });
         let pool = TransactionPool::new(PoolConfig::default(), ledger);
-        assert!(pool.remember(vec![make_test_txn(1)]).is_err());
+        let err = pool.remember(vec![make_test_txn(1)]).unwrap_err();
+        assert!(!err.is_catching_up());
         assert!(!pool.has_evaluator());
+    }
+
+    /// The on-demand rebuild is throttled: with a failing `start_evaluator`,
+    /// repeated admissions in the same round make one attempt, and report the
+    /// retryable error in between; a new round allows another attempt.
+    #[test]
+    fn failing_on_demand_rebuild_is_throttled_per_round() {
+        let ledger = FlakyLedger::new();
+        let pool = TransactionPool::new(PoolConfig::default(), ledger.clone());
+        pool.ensure_evaluator_primed();
+        ledger.fail_start.store(true, Ordering::SeqCst);
+
+        pool.pause_evaluator();
+        pool.resume_evaluator(true); // attempt 1 (fails); starts == 2 so far
+        let before = ledger.starts.load(Ordering::SeqCst);
+        for n in 0..5 {
+            let err = pool.remember(vec![make_test_txn(10 + n)]).unwrap_err();
+            assert!(err.is_catching_up(), "retryable in between: {err:?}");
+        }
+        assert_eq!(
+            ledger.starts.load(Ordering::SeqCst),
+            before,
+            "no further attempt within the same round and interval"
+        );
+
+        ledger.round.store(2, Ordering::SeqCst);
+        ledger.fail_start.store(false, Ordering::SeqCst);
+        pool.remember(vec![make_test_txn(20)])
+            .expect("a new round allows a fresh attempt, which now succeeds");
+        assert!(pool.has_evaluator());
     }
 
     /// Issue #1683: a transaction included in a block that commits while the
@@ -1576,25 +1727,68 @@ mod tests {
         let txid = compute_txn_id(&stx.txn);
         pool.remember(vec![stx.clone()]).unwrap();
 
-        pool.set_evaluator_paused(true);
+        pool.pause_evaluator();
         let committed: HashSet<Digest> = [txid].into_iter().collect();
-        pool.on_new_block(&Block::default(), &committed);
+        pool.on_new_block(&block_at(5), &committed);
         assert!(!pool.has_evaluator());
 
-        pool.resume_evaluator();
+        pool.resume_evaluator(true);
         let (_, err, found) = pool.lookup(&txid);
         assert!(found, "the status cache remembers the txid");
         assert!(err.is_empty(), "confirmed marker, not an error: {err:?}");
         assert_eq!(pool.pending_count(), 0, "confirmed group left the pool");
     }
 
-    /// The paused-block buffer is bounded.
+    /// If the rebuild on resume fails, the recorded committed sets are kept
+    /// for the next attempt (they used to be drained before the rebuild was
+    /// known to succeed and were lost).
     #[test]
-    fn paused_block_buffer_is_bounded() {
+    fn failed_rebuild_keeps_the_paused_committed_sets() {
+        let ledger = FlakyLedger::new();
+        let pool = TransactionPool::new(PoolConfig::default(), ledger.clone());
+        pool.ensure_evaluator_primed();
+        let stx = make_test_txn(3);
+        let txid = compute_txn_id(&stx.txn);
+        pool.remember(vec![stx]).unwrap();
+
+        pool.pause_evaluator();
+        let committed: HashSet<Digest> = [txid].into_iter().collect();
+        pool.on_new_block(&block_at(5), &committed);
+
+        ledger.fail_start.store(true, Ordering::SeqCst);
+        pool.resume_evaluator(true);
+        assert!(!pool.has_evaluator(), "rebuild failed");
+        assert_eq!(pool.mu.lock().paused_committed.len(), 1, "sets kept");
+
+        ledger.fail_start.store(false, Ordering::SeqCst);
+        pool.on_new_block(&block_at(6), &HashSet::new());
+        assert!(pool.has_evaluator());
+        let (_, err, found) = pool.lookup(&txid);
+        assert!(found && err.is_empty(), "still confirmed: {err:?}");
+        assert!(
+            pool.mu.lock().paused_committed.is_empty(),
+            "cleared on success"
+        );
+    }
+
+    /// While paused, a re-delivered old or identical block is neither
+    /// recorded nor counted toward the fee threshold again; the buffer is
+    /// bounded.
+    #[test]
+    fn paused_blocks_are_deduplicated_by_round_and_the_buffer_is_bounded() {
         let pool = make_pool_with_evaluator(10);
-        pool.set_evaluator_paused(true);
-        for _ in 0..(MAX_PAUSED_BLOCKS + 50) {
-            pool.on_new_block(&Block::default(), &HashSet::new());
+        pool.pause_evaluator();
+        pool.on_new_block(&block_at(7), &HashSet::new());
+        pool.on_new_block(&block_at(7), &HashSet::new());
+        pool.on_new_block(&block_at(6), &HashSet::new());
+        assert_eq!(
+            pool.mu.lock().paused_committed.len(),
+            1,
+            "stale deliveries ignored"
+        );
+
+        for r in 8..(8 + MAX_PAUSED_BLOCKS as u64 + 50) {
+            pool.on_new_block(&block_at(r), &HashSet::new());
         }
         assert_eq!(pool.mu.lock().paused_committed.len(), MAX_PAUSED_BLOCKS);
     }

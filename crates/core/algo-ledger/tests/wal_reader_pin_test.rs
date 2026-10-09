@@ -147,7 +147,7 @@ fn wal_stays_bounded_when_the_snapshot_is_released_before_the_import() {
 
     let snap = ledger.open_read_snapshot().expect("file-backed snapshot");
     let _ = snap.get_account(&Address([1u8; 32]));
-    drop(snap); // what `TransactionPool::set_evaluator_paused(true)` does at pause
+    drop(snap); // what `TransactionPool::pause_evaluator()` does at pause
 
     let released_peak = write_import_load(&writer, &tracker);
     let (busy, _, _) = checkpoint(&writer, "TRUNCATE");

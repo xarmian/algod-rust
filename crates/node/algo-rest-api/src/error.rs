@@ -370,7 +370,10 @@ mod tests {
         assert_eq!(states[0]["scratch"], serde_json::json!([5]));
         assert_eq!(states[0]["stack"], serde_json::json!([100, "AgE="])); // base64(0x02, 0x01)
 
-        assert_eq!(parsed["message"], "app 1234 approval program rejected");
+        assert_eq!(
+            parsed["message"],
+            "app 1234 approval program rejected"
+        );
     }
 
     /// A LogicSig failure (no app-index) must omit the `app-index` key

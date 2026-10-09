@@ -114,12 +114,6 @@ pub enum PoolIngestError {
     Rejected(String),
 }
 
-impl From<String> for PoolIngestError {
-    fn from(msg: String) -> Self {
-        Self::Rejected(msg)
-    }
-}
-
 /// Async wrapper over the pool's `remember` call.
 ///
 /// Abstracting the pool behind a trait lets this module be unit-tested
@@ -130,6 +124,14 @@ impl From<String> for PoolIngestError {
 pub trait PoolIngest: Send + Sync + 'static {
     /// Submit `group` to the pool and wait for completion.
     async fn ingest(&self, group: Vec<SignedTransaction>) -> Result<(), PoolIngestError>;
+
+    /// Whether the pool is currently paused for a live catchpoint catchup
+    /// (issue #1683). Only a cheap pre-check for fire-and-forget callers that
+    /// cannot see [`Self::ingest`]'s typed error; never used to classify a
+    /// failed ingest.
+    fn is_catching_up(&self) -> bool {
+        false
+    }
 }
 
 /// Production [`PoolIngest`] adapter over [`TransactionPool`].
@@ -163,6 +165,10 @@ impl PoolIngest for PoolIngestAdapter {
                     PoolIngestError::Rejected(e.to_string())
                 }
             })
+    }
+
+    fn is_catching_up(&self) -> bool {
+        self.pool.is_evaluator_paused()
     }
 }
 
@@ -223,6 +229,13 @@ impl std::fmt::Debug for LocalTxBroadcaster {
 }
 
 impl LocalTxBroadcaster {
+    /// Whether the pool is paused for a live catchpoint catchup (issue
+    /// #1683): a fire-and-forget submission would be dropped.
+    #[must_use]
+    pub fn is_catching_up(&self) -> bool {
+        self.ingest.is_catching_up()
+    }
+
     /// Build a new broadcaster.
     ///
     /// `seen` should be the same cache shared with the inbound
@@ -357,7 +370,7 @@ mod tests {
     impl PoolIngest for RecordingIngestor {
         async fn ingest(&self, group: Vec<SignedTransaction>) -> Result<(), PoolIngestError> {
             self.calls.lock().unwrap().push(group);
-            self.result.clone().map_err(PoolIngestError::from)
+            self.result.clone().map_err(PoolIngestError::Rejected)
         }
     }
 

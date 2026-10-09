@@ -249,17 +249,32 @@ async fn failed_reload_unpauses_and_reprimes_on_the_old_handle() {
 }
 
 /// `resume()` is the safety net for any path that never reached a
-/// successful `reload_ledger` (e.g. an aborted catchup): it clears the pause.
+/// successful `reload_ledger` (e.g. an aborted catchup): it clears the pause
+/// -- but while a reload is still pending it does not prime the pool (the
+/// ledger handle is about to be swapped), not even on a second resume;
+/// `reload_ledger` then primes it.
 #[tokio::test]
-async fn resume_clears_a_pause_left_behind() {
+async fn resume_unpauses_without_priming_while_a_reload_is_pending() {
     let (control, tmp_dir, _ledger, pool) = fixture();
 
     control.pause().await;
     assert!(pool.is_evaluator_paused());
     control.resume().await;
-    assert!(!pool.is_evaluator_paused());
-    control.pause().await;
+    assert!(!pool.is_evaluator_paused(), "resume still unpauses");
+    assert!(
+        !pool.has_evaluator(),
+        "but builds no evaluator on the about-to-be-swapped handle"
+    );
+    control.resume().await; // early-return path
+    assert!(
+        !pool.has_evaluator(),
+        "a double resume does not prime either"
+    );
 
+    control.reload_ledger().await;
+    assert!(pool.has_evaluator(), "reload_ledger primes the pool");
+
+    control.pause().await;
     drop((pool, control));
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
@@ -272,14 +287,15 @@ async fn resume_with_a_cycle_already_running_still_unpauses_the_pool() {
 
     control.resume().await;
     assert!(control.running.lock().await.is_some(), "cycle running");
-    pool.set_evaluator_paused(true);
+    pool.pause_evaluator();
     assert!(pool.is_evaluator_paused());
 
-    control.resume().await; // early-return path
+    control.resume().await; // early-return path, no reload pending
     assert!(!pool.is_evaluator_paused(), "double resume must unpause");
     assert!(pool.has_evaluator(), "and re-prime");
 
-    // pause() with no cycle running, then resume(): same guarantee.
+    // pause() with no cycle running, then resume(): unpaused again (a
+    // reload is pending, so not primed).
     control.pause().await;
     control.pause().await;
     control.resume().await;

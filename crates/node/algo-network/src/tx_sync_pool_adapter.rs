@@ -52,7 +52,7 @@ use algo_codec::compute_txn_id;
 use algo_pool::TransactionPool;
 use algo_types::{Digest, SignedTransaction};
 
-use crate::local_tx_broadcast::PoolIngest;
+use crate::local_tx_broadcast::{PoolIngest, PoolIngestError};
 use crate::tx_sync_service::PendingTxGroupsSource;
 use crate::tx_syncer::{PendingTxAggregate, SeenTxCache, SolicitedTxHandler, TxSyncError};
 
@@ -133,9 +133,17 @@ impl SolicitedTxHandler for PoolSolicitedTxHandler {
                 }
                 Ok(())
             }
-            Err(e) => {
+            // Issue #1683: the pool is paused for a live catchpoint catchup.
+            // That says nothing about the group or the peer that sent it:
+            // drop it quietly (it is not marked seen, so a later sync can
+            // pull it again) rather than warn and score the peer.
+            Err(PoolIngestError::CatchingUp(e)) => {
+                debug!(error = %e, "PoolSolicitedTxHandler: node is catching up; pulled TX group dropped");
+                Ok(())
+            }
+            Err(PoolIngestError::Rejected(e)) => {
                 warn!(error = %e, "PoolSolicitedTxHandler: pool rejected pulled TX group");
-                Err(TxSyncError::Handler(e.to_string()))
+                Err(TxSyncError::Handler(e))
             }
         }
     }
@@ -170,8 +178,31 @@ mod tests {
             self.calls.lock().unwrap().push(group);
             self.result
                 .clone()
-                .map_err(crate::local_tx_broadcast::PoolIngestError::from)
+                .map_err(crate::local_tx_broadcast::PoolIngestError::Rejected)
         }
+    }
+
+    /// Issue #1683: a pool paused for a live catchup drops a pulled group
+    /// quietly -- no handler error (so no peer scoring) and no seen mark, so a
+    /// later sync can pull it again.
+    #[tokio::test]
+    async fn catching_up_drops_quietly_without_marking_seen() {
+        struct CatchingUp;
+        #[async_trait]
+        impl PoolIngest for CatchingUp {
+            async fn ingest(&self, _group: Vec<SignedTransaction>) -> Result<(), PoolIngestError> {
+                Err(PoolIngestError::CatchingUp("node is catching up".into()))
+            }
+        }
+        let seen = Arc::new(SeenTxCache::new(100));
+        let handler = PoolSolicitedTxHandler::new(Arc::new(CatchingUp), seen.clone());
+        let tx = make_txn(9);
+        let id = compute_txn_id(&tx.txn);
+        handler
+            .handle(vec![tx])
+            .await
+            .expect("a catching-up drop is not a handler error");
+        assert!(!seen.contains(&id), "not marked seen");
     }
 
     #[tokio::test]

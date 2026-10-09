@@ -426,6 +426,11 @@ struct ParticipateAgreementControl {
     /// `catchup/universalFetcher.go`'s per-fetch `context.WithTimeout`.
     catchup_gossip_block_fetch_timeout: Duration,
     running: tokio::sync::Mutex<Option<RunningAgreementCycle>>,
+    /// Issue #1683: set by `pause()` and cleared by `reload_ledger()`. While
+    /// set, a `resume()` must not re-prime the pool's evaluator: the ledger
+    /// handle is about to be swapped, and an evaluator built on the old one
+    /// would be stale.
+    reload_pending: std::sync::atomic::AtomicBool,
 }
 
 impl ParticipateAgreementControl {
@@ -636,11 +641,13 @@ impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
         // a one-off drop, so a block the pool follower processes late (or the
         // wake-up `reload_ledger` sends) cannot rebuild it and re-pin the WAL
         // -- and also when no cycle was running: the evaluator outlives the
-        // agreement cycle. `set_evaluator_paused` takes the pool's blocking
+        // agreement cycle. `pause_evaluator` takes the pool's blocking
         // mutex (the follower holds it across a ledger read), so it runs on
         // the blocking pool, not on this async task.
+        self.reload_pending
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let pool = self.pool.clone();
-        if let Err(e) = tokio::task::spawn_blocking(move || pool.set_evaluator_paused(true)).await {
+        if let Err(e) = tokio::task::spawn_blocking(move || pool.pause_evaluator()).await {
             warn!(error = %e, "pause: pool evaluator pause task panicked");
         }
         let mut guard = self.running.lock().await;
@@ -673,7 +680,14 @@ impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
         // early return: whatever path got us here (an aborted catchup, a
         // failed reload, a repeated resume) the pool must never stay paused,
         // or every admission would fail with `NodeCatchingUp` forever.
-        self.unpause_pool().await;
+        //
+        // Re-prime only when no reload is pending: after `pause()` the ledger
+        // handle is about to be swapped by `reload_ledger`, which primes the
+        // pool itself; an evaluator built here would sit on the old handle.
+        let reload_pending = self
+            .reload_pending
+            .load(std::sync::atomic::Ordering::SeqCst);
+        self.unpause_pool(true, !reload_pending).await;
         let mut guard = self.running.lock().await;
         if guard.is_some() {
             return;
@@ -782,23 +796,30 @@ impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
         // block should that fail) -- never left paused or evaluator-less.
         if !reloaded {
             warn!(
-                "ledger reload failed; re-priming the pool against the unchanged pre-reload                  ledger handle (a later block or admission retries if that fails)"
+                "ledger reload failed; re-priming the pool against the unchanged pre-reload ledger handle (a later block or admission retries if that fails)"
             );
         }
-        self.unpause_pool().await;
+        // The reload (successful or not) is over: from here a `resume()` may
+        // prime the pool too.
+        self.reload_pending
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        // Always rebuild here, even if a `resume()` already un-paused the
+        // pool without priming (or built an evaluator on the old handle).
+        self.unpause_pool(false, true).await;
     }
 }
 
 impl ParticipateAgreementControl {
-    /// Leave the pool's catchup-paused state and rebuild its evaluator
-    /// against the current ledger handle (issue #1683). A no-op when not
-    /// paused. Runs on the blocking pool: the pool follower can hold the pool
-    /// mutex across a ledger read.
-    async fn unpause_pool(&self) {
+    /// Leave the pool's catchup-paused state (issue #1683), optionally
+    /// rebuilding its evaluator against the current ledger handle. With
+    /// `only_if_paused` it is a no-op for a pool that is not paused. Runs on
+    /// the blocking pool: the pool follower can hold the pool mutex across a
+    /// ledger read.
+    async fn unpause_pool(&self, only_if_paused: bool, prime: bool) {
         let pool = self.pool.clone();
         let done = tokio::task::spawn_blocking(move || {
-            if pool.is_evaluator_paused() {
-                pool.resume_evaluator();
+            if !only_if_paused || pool.is_evaluator_paused() {
+                pool.resume_evaluator(prime);
             }
         })
         .await;
@@ -837,6 +858,7 @@ impl ParticipateAgreementControl {
             catchup_parallel_blocks: self.catchup_parallel_blocks,
             catchup_gossip_block_fetch_timeout: self.catchup_gossip_block_fetch_timeout,
             running: tokio::sync::Mutex::new(None),
+            reload_pending: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -5992,6 +6014,7 @@ pub async fn run(
             node_config.catchup_gossip_block_fetch_timeout_sec.max(0) as u64,
         ),
         running: tokio::sync::Mutex::new(None),
+        reload_pending: std::sync::atomic::AtomicBool::new(false),
     });
 
     // Live catchpoint-catchup mode (issue #940): only meaningful with a REST
@@ -12152,6 +12175,7 @@ mod tests {
             catchup_parallel_blocks: 4,
             catchup_gossip_block_fetch_timeout: Duration::from_secs(4),
             running: tokio::sync::Mutex::new(None),
+            reload_pending: std::sync::atomic::AtomicBool::new(false),
         };
         (control, tmp_dir)
     }

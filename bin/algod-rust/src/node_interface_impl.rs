@@ -1941,6 +1941,7 @@ impl NodeInterface for AlgodNodeInterface {
         //   1. No broadcaster attached       → NotImplemented
         //   2. Empty group                   → Internal("empty group")
         //   3. Async backlog is full         → Internal("async backlog full")
+        //   4. Pool paused for catchup       → Unavailable (503)
         //
         // Pool-rejection / gossip failures after the spawn are not
         // surfaced through the return value. `LocalTxBroadcaster::submit_group`
@@ -1956,6 +1957,16 @@ impl NodeInterface for AlgodNodeInterface {
         // immediate feedback rather than a silent drop.
         if tx_group.is_empty() {
             return Err(Self::local_tx_error_to_node_error(LocalTxError::Empty));
+        }
+
+        // Issue #1683: the pool is paused for a live catchpoint catchup, so
+        // the background submission below would be dropped. Say so (503,
+        // like go's `operation not available during catchup`) instead of
+        // returning success for a group that is gone.
+        if broadcaster.is_catching_up() {
+            return Err(NodeError::Unavailable(
+                "operation not available during catchup".into(),
+            ));
         }
 
         // Admission control: mirror go-algorand's bounded backlog. Under
@@ -4828,6 +4839,45 @@ mod tests {
                 assert_eq!(name, "async_broadcast_signed_tx_group");
             }
             other => panic!("expected NotImplemented, got {other:?}"),
+        }
+    }
+
+    /// Issue #1683: the async endpoint reports a pool that is paused for a
+    /// live catchup as `Unavailable` (503) instead of returning success for
+    /// a group the background task would drop.
+    #[tokio::test]
+    async fn async_broadcast_reports_unavailable_while_the_pool_is_catching_up() {
+        use algo_network::local_tx_broadcast::{PoolIngest, PoolIngestError};
+        use algo_network::{Phonebook, WebsocketNetwork, WebsocketNetworkConfig};
+
+        struct CatchingUp;
+        #[async_trait::async_trait]
+        impl PoolIngest for CatchingUp {
+            async fn ingest(&self, _group: Vec<SignedTransaction>) -> Result<(), PoolIngestError> {
+                Err(PoolIngestError::CatchingUp("node is catching up".into()))
+            }
+            fn is_catching_up(&self) -> bool {
+                true
+            }
+        }
+        let gossip = Arc::new(WebsocketNetwork::new(
+            WebsocketNetworkConfig::default(),
+            Arc::new(Phonebook::new(0, std::time::Duration::from_secs(60))),
+        ));
+        let broadcaster = Arc::new(LocalTxBroadcaster::new(
+            Arc::new(CatchingUp),
+            gossip,
+            Arc::new(algo_network::tx_syncer::SeenTxCache::new(16)),
+        ));
+        let adapter = make_adapter().with_broadcaster(broadcaster);
+
+        match adapter
+            .async_broadcast_signed_tx_group(vec![SignedTransaction::default()])
+            .await
+            .expect_err("catching up must not report success")
+        {
+            NodeError::Unavailable(m) => assert!(m.contains("catchup"), "{m}"),
+            other => panic!("expected Unavailable, got {other:?}"),
         }
     }
 
