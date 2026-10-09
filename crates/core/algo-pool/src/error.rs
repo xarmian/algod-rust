@@ -52,6 +52,12 @@ pub enum PoolError {
     #[error("TransactionPool: node is catching up")]
     NodeCatchingUp,
 
+    /// The pool is not paused but has no block evaluator and rebuilding one
+    /// keeps failing (issue #1683): a node-side fault, not the submitter's.
+    /// Carries the underlying rebuild failure.
+    #[error("TransactionPool: cannot rebuild the block evaluator: {0}")]
+    EvaluatorRebuildFailed(String),
+
     /// The requested block assembly round is older than the current pool round.
     ///
     /// Corresponds to `ErrStaleBlockAssemblyRequest` in Go.
@@ -174,6 +180,16 @@ impl PoolError {
         match self {
             PoolError::NodeCatchingUp => true,
             PoolError::Remember(inner) => inner.is_catching_up(),
+            _ => false,
+        }
+    }
+
+    /// Whether this error (or the one it wraps via `Remember`) is
+    /// [`PoolError::EvaluatorRebuildFailed`]: a node-side fault (issue #1683).
+    pub fn is_evaluator_rebuild_failed(&self) -> bool {
+        match self {
+            PoolError::EvaluatorRebuildFailed(_) => true,
+            PoolError::Remember(inner) => inner.is_evaluator_rebuild_failed(),
             _ => false,
         }
     }
@@ -312,6 +328,7 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
         PoolError::PendingQueueFull => PoolErrorTag::Cap,
         PoolError::NoPendingBlockEvaluator => PoolErrorTag::PendingEval,
         PoolError::NodeCatchingUp => PoolErrorTag::PendingEval,
+        PoolError::EvaluatorRebuildFailed(_) => PoolErrorTag::EvalGeneric,
         PoolError::FeeBelowThreshold { .. } => PoolErrorTag::Fee,
         PoolError::StaleBlockAssemblyRequest => PoolErrorTag::EvalGeneric,
         PoolError::PoolShutdown => PoolErrorTag::EvalGeneric,

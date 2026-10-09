@@ -918,6 +918,8 @@ impl AlgodNodeInterface {
             LocalTxError::Pool(msg) => NodeError::BadRequest(msg),
             // Issue #1683: paused for a live catchup -- transient, so 503.
             LocalTxError::CatchingUp(msg) => NodeError::Unavailable(msg),
+            // Issue #1683: node-side pool fault, not a verdict on the group.
+            LocalTxError::Internal(msg) => NodeError::PoolFault(msg),
             LocalTxError::Encode(msg) => {
                 NodeError::Internal(format!("broadcast: encode failed: {msg}"))
             }

@@ -87,6 +87,11 @@ pub enum LocalTxError {
     #[error("{0}")]
     CatchingUp(String),
 
+    /// The pool hit a node-side fault (issue #1683): its block evaluator
+    /// cannot be rebuilt. Answered 500, not 400.
+    #[error("{0}")]
+    Internal(String),
+
     /// msgpack encode of a txn in the group failed.
     #[error("encode failed: {0}")]
     Encode(String),
@@ -112,6 +117,11 @@ pub enum PoolIngestError {
     /// The pool (or its evaluator) rejected the group.
     #[error("{0}")]
     Rejected(String),
+    /// The pool could not even examine the group because of a node-side
+    /// fault (its block evaluator cannot be rebuilt): 500-class, not the
+    /// submitter's fault.
+    #[error("{0}")]
+    Internal(String),
 }
 
 /// Async wrapper over the pool's `remember` call.
@@ -161,6 +171,8 @@ impl PoolIngest for PoolIngestAdapter {
             .map_err(|e| {
                 if e.is_catching_up() {
                     PoolIngestError::CatchingUp(e.to_string())
+                } else if e.is_evaluator_rebuild_failed() {
+                    PoolIngestError::Internal(e.to_string())
                 } else {
                     PoolIngestError::Rejected(e.to_string())
                 }
@@ -298,6 +310,10 @@ impl LocalTxBroadcaster {
             Err(PoolIngestError::Rejected(e)) => {
                 warn!(error = %e, "LocalTxBroadcaster: pool rejected local group");
                 return Err(LocalTxError::Pool(e));
+            }
+            Err(PoolIngestError::Internal(e)) => {
+                warn!(error = %e, "LocalTxBroadcaster: pool fault while admitting local group");
+                return Err(LocalTxError::Internal(e));
             }
         }
 
@@ -573,6 +589,25 @@ mod tests {
         );
         assert!(gossip.recorded().is_empty());
         assert!(!seen.contains(&compute_txn_id(&group[0].txn)));
+    }
+
+    /// Issue #1683: a node-side pool fault (its evaluator cannot be rebuilt)
+    /// surfaces as `Internal`, not as a verdict on the group (`Pool`, 400).
+    #[tokio::test]
+    async fn submit_group_reports_internal_when_the_pool_cannot_rebuild() {
+        struct Broken;
+        #[async_trait]
+        impl PoolIngest for Broken {
+            async fn ingest(&self, _group: Vec<SignedTransaction>) -> Result<(), PoolIngestError> {
+                Err(PoolIngestError::Internal("cannot rebuild".into()))
+            }
+        }
+        let gossip = Arc::new(MockGossipNode::new());
+        let seen = Arc::new(SeenTxCache::new(16));
+        let bx = LocalTxBroadcaster::new(Arc::new(Broken), gossip.clone(), seen);
+        let err = bx.submit_group(vec![make_signed_txn(7)]).await.unwrap_err();
+        assert!(matches!(err, LocalTxError::Internal(_)), "got {err:?}");
+        assert!(gossip.recorded().is_empty());
     }
 
     #[tokio::test]

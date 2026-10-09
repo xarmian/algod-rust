@@ -218,11 +218,11 @@ async fn successful_reload_resumes_and_reprimes_the_pool() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
-/// A failed reload must not leave the pool paused or evaluator-less: the
-/// unchanged old ledger handle is still valid, so the pool is re-primed
-/// against it (and would also self-prime on the next admission).
+/// A failed reload must not leave the pool paused, and must not prime it on
+/// the old handle (which may already be cut over): it stays unprimed and the
+/// first block (or admission) rebuilds against whatever handle is current.
 #[tokio::test]
-async fn failed_reload_unpauses_and_reprimes_on_the_old_handle() {
+async fn failed_reload_unpauses_without_priming_on_the_old_handle() {
     let (mut control, tmp_dir, ledger, pool) = fixture();
 
     control.pause().await;
@@ -240,39 +240,81 @@ async fn failed_reload_unpauses_and_reprimes_on_the_old_handle() {
         "failure path must not stay paused"
     );
     assert!(
-        pool.has_evaluator(),
-        "failure path re-primes against the still-valid old handle"
+        !pool.has_evaluator(),
+        "no evaluator is built on the possibly-stale old handle"
     );
+    assert!(
+        !control
+            .reload_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the in-flight marker is scoped to reload_ledger"
+    );
+
+    pool.on_new_block(&algo_types::Block::default(), &Default::default());
+    assert!(pool.has_evaluator(), "the next block rebuilds it");
 
     drop((pool, ledger, control));
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
-/// `resume()` is the safety net for any path that never reached a
-/// successful `reload_ledger` (e.g. an aborted catchup): it clears the pause
-/// -- but while a reload is still pending it does not prime the pool (the
-/// ledger handle is about to be swapped), not even on a second resume;
-/// `reload_ledger` then primes it.
+/// Abort path: `pause()` followed by `resume()` with no `reload_ledger` (an
+/// aborted catchup that never reached the reload) must leave the pool
+/// unpaused AND primed; nothing sticks.
 #[tokio::test]
-async fn resume_unpauses_without_priming_while_a_reload_is_pending() {
+async fn pause_then_resume_without_reload_unpauses_and_primes() {
     let (control, tmp_dir, _ledger, pool) = fixture();
 
     control.pause().await;
     assert!(pool.is_evaluator_paused());
+    assert!(!pool.has_evaluator());
     control.resume().await;
-    assert!(!pool.is_evaluator_paused(), "resume still unpauses");
-    assert!(
-        !pool.has_evaluator(),
-        "but builds no evaluator on the about-to-be-swapped handle"
-    );
-    control.resume().await; // early-return path
-    assert!(
-        !pool.has_evaluator(),
-        "a double resume does not prime either"
-    );
+    assert!(!pool.is_evaluator_paused());
+    assert!(pool.has_evaluator(), "primed against the current handle");
 
+    control.pause().await;
+    drop((pool, control));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// Normal order: `pause`, `reload_ledger` (primes), then `resume` (a no-op
+/// for the pool).
+#[tokio::test]
+async fn normal_order_pause_reload_resume_leaves_a_primed_pool() {
+    let (control, tmp_dir, _ledger, pool) = fixture();
+
+    control.pause().await;
     control.reload_ledger().await;
-    assert!(pool.has_evaluator(), "reload_ledger primes the pool");
+    assert!(!pool.is_evaluator_paused());
+    assert!(pool.has_evaluator());
+    control.resume().await;
+    assert!(!pool.is_evaluator_paused());
+    assert!(pool.has_evaluator());
+
+    control.pause().await;
+    drop((pool, control));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// While a reload is executing, `resume()` leaves the pool to
+/// `reload_ledger` (it would otherwise prime on the about-to-be-swapped
+/// handle).
+#[tokio::test]
+async fn resume_leaves_the_pool_alone_while_a_reload_is_in_flight() {
+    let (control, tmp_dir, _ledger, pool) = fixture();
+
+    control.pause().await;
+    control
+        .reload_in_flight
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    control.resume().await;
+    assert!(pool.is_evaluator_paused(), "reload_ledger owns the unpause");
+
+    control
+        .reload_in_flight
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    control.reload_ledger().await;
+    assert!(!pool.is_evaluator_paused());
+    assert!(pool.has_evaluator());
 
     control.pause().await;
     drop((pool, control));
@@ -290,12 +332,11 @@ async fn resume_with_a_cycle_already_running_still_unpauses_the_pool() {
     pool.pause_evaluator();
     assert!(pool.is_evaluator_paused());
 
-    control.resume().await; // early-return path, no reload pending
+    control.resume().await; // early-return path
     assert!(!pool.is_evaluator_paused(), "double resume must unpause");
     assert!(pool.has_evaluator(), "and re-prime");
 
-    // pause() with no cycle running, then resume(): unpaused again (a
-    // reload is pending, so not primed).
+    // pause() with no cycle running, then resume(): unpaused again.
     control.pause().await;
     control.pause().await;
     control.resume().await;

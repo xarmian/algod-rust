@@ -241,23 +241,36 @@ pub fn ledger_error_response(e: NodeError) -> Response {
         NodeError::BadRequest(msg) => bad_request(msg),
         NodeError::BadRequestWithDetail(msg, detail) => bad_request_with_detail(msg, &detail),
         NodeError::Unavailable(msg) => service_unavailable(msg),
-        NodeError::Timeout(_) | NodeError::NotImplemented(_) | NodeError::Internal(_) => {
+        NodeError::Timeout(_)
+        | NodeError::NotImplemented(_)
+        | NodeError::Internal(_)
+        | NodeError::PoolFault(_) => {
             internal_error("failed to retrieve information from the ledger")
         }
     }
 }
 
 /// Map a `NodeError` from a pool-backed submission (`POST /v2/transactions`
-/// and friends) to its HTTP response, in one place.
+/// and `/v2/transactions/async`) to its HTTP response, in one place.
 ///
-/// A rejected group is a client error (400, with structured AVM diagnostics
-/// when present); [`NodeError::Unavailable`] -- the pool is paused for a live
-/// catchpoint catchup (issue #1683) -- is a retryable 503, like go's
-/// `operation not available during catchup`.
-pub fn broadcast_error_response(e: NodeError) -> Response {
+/// Synchronous (`asynchronous = false`): a rejected group is a client error
+/// (400, with structured AVM diagnostics when present);
+/// [`NodeError::Unavailable`] -- the pool is paused for a live catchpoint
+/// catchup (issue #1683) -- is a retryable 503, like go's `operation not
+/// available during catchup`; [`NodeError::PoolFault`] -- the pool cannot
+/// rebuild its evaluator -- is a 500.
+///
+/// Asynchronous: go answers every error from `AsyncBroadcastSignedTxGroup`
+/// (including its "backlog full") with `serviceUnavailable`
+/// (`handlers.go` `RawTransactionAsync`), so every error is a 503.
+pub fn broadcast_error_response(e: NodeError, asynchronous: bool) -> Response {
+    if asynchronous {
+        return service_unavailable(e.to_string());
+    }
     match e {
         NodeError::BadRequestWithDetail(msg, detail) => bad_request_with_detail(msg, &detail),
         NodeError::Unavailable(msg) => service_unavailable(msg),
+        NodeError::PoolFault(msg) => internal_error(msg),
         e => bad_request(e.to_string()),
     }
 }
@@ -268,18 +281,33 @@ mod tests {
     use axum::body::to_bytes;
 
     #[test]
-    fn broadcast_error_response_maps_unavailable_to_503_and_rejections_to_400() {
+    fn broadcast_error_response_maps_each_class_once() {
+        let sync = |e| broadcast_error_response(e, false).status();
         assert_eq!(
-            broadcast_error_response(NodeError::Unavailable("node is catching up".into())).status(),
+            sync(NodeError::Unavailable("node is catching up".into())),
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(
-            broadcast_error_response(NodeError::BadRequest("bad fee".into())).status(),
+            sync(NodeError::BadRequest("bad fee".into())),
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
-            broadcast_error_response(NodeError::Internal("boom".into())).status(),
+            sync(NodeError::Internal("boom".into())),
             StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            sync(NodeError::PoolFault("cannot rebuild".into())),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        // go's async handler answers every error (queue full included) 503.
+        let asy = |e| broadcast_error_response(e, true).status();
+        assert_eq!(
+            asy(NodeError::Unavailable("catching up".into())),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            asy(NodeError::Internal("broadcast: async backlog full".into())),
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 

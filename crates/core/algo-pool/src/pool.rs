@@ -122,6 +122,11 @@ struct PoolInner {
     /// `remember()`/`test()` under the pool mutex.
     reprime_attempt: Option<(Round, Instant)>,
 
+    /// Why the last evaluator rebuild failed (cleared on success), so an
+    /// unpaused pool that cannot rebuild reports the real fault instead of a
+    /// misleading "catching up".
+    last_rebuild_error: Option<String>,
+
     /// Number of "whole blocks" worth of transactions that have accumulated.
     /// Drives the exponential fee ramp.
     num_pending_whole_blocks: u64,
@@ -197,6 +202,11 @@ pub struct TransactionPool {
     /// Whether the pool is shutting down.
     shutdown: AtomicBool,
 
+    /// Lock-free mirror of `PoolInner::evaluator_paused` (written under `mu`),
+    /// so async callers can ask "is the node catching up?" without taking the
+    /// blocking pool mutex on a tokio worker.
+    paused_flag: AtomicBool,
+
     /// Per-tag counters for transaction groups evicted during
     /// re-evaluation (issue #1134), mirroring go's `txPoolReevalCounter`.
     reeval_counter: crate::metrics::TxPoolReevalCounter,
@@ -221,6 +231,7 @@ impl TransactionPool {
             paused_committed: VecDeque::new(),
             paused_last_round: None,
             reprime_attempt: None,
+            last_rebuild_error: None,
             num_pending_whole_blocks: 0,
             fee_threshold_multiplier: 0,
             stateproof_overflowed: false,
@@ -248,6 +259,7 @@ impl TransactionPool {
             cond: Condvar::new(),
             fee_per_byte: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
+            paused_flag: AtomicBool::new(false),
             reeval_counter: crate::metrics::TxPoolReevalCounter::new(),
         }
     }
@@ -565,7 +577,12 @@ impl TransactionPool {
         let latest = self.ledger.latest();
         let prev_hdr = match self.ledger.block_hdr(latest) {
             Ok(hdr) => hdr,
-            Err(_) => return, // Cannot proceed without the header
+            Err(e) => {
+                // Cannot proceed without the header.
+                tracing::warn!(error = %e, "pool: cannot read the latest block header; no block evaluator");
+                inner.last_rebuild_error = Some(format!("block header: {e}"));
+                return;
+            }
         };
 
         // Snapshot the current pending transaction groups (read lock).
@@ -593,11 +610,17 @@ impl TransactionPool {
         let hint = pending_count.saturating_sub(committed_txids.len());
         let new_eval = match self.ledger.start_evaluator(prev_hdr, hint, 0) {
             Ok(eval) => eval,
-            Err(_) => return, // Cannot start evaluator; leave pool without one
+            Err(e) => {
+                // Cannot start evaluator; leave the pool without one.
+                tracing::warn!(error = %e, "pool: cannot start a block evaluator");
+                inner.last_rebuild_error = Some(format!("start evaluator: {e}"));
+                return;
+            }
         };
         inner.evaluator = Some(new_eval);
         inner.reprime_on_demand = false;
         inner.reprime_attempt = None;
+        inner.last_rebuild_error = None;
         inner.paused_committed.clear();
 
         // Clear remembered state -- we are rebuilding from scratch.
@@ -1012,15 +1035,24 @@ impl TransactionPool {
         self.recompute_block_evaluator(inner, &HashSet::new());
     }
 
-    /// The error for "no evaluator": after a pause the pool is waiting to be
-    /// rebuilt, which is transient ([`PoolError::NodeCatchingUp`]); a pool
+    /// The error for "no evaluator": while paused for a catchup it is the
+    /// transient [`PoolError::NodeCatchingUp`]. Unpaused but waiting for a
+    /// rebuild that keeps failing is a real, node-side fault
+    /// ([`PoolError::EvaluatorRebuildFailed`], counted and 500-class). A pool
     /// that was never primed keeps go's `ErrNoPendingBlockEvaluator`.
     fn no_evaluator_error(inner: &PoolInner) -> PoolError {
-        if inner.reprime_on_demand {
-            PoolError::NodeCatchingUp
-        } else {
-            PoolError::NoPendingBlockEvaluator
+        if inner.evaluator_paused {
+            return PoolError::NodeCatchingUp;
         }
+        if inner.reprime_on_demand {
+            return match &inner.last_rebuild_error {
+                Some(msg) => PoolError::EvaluatorRebuildFailed(msg.clone()),
+                // Not yet attempted (throttle window without a recorded
+                // failure): the rebuild is imminent, so stay retryable.
+                None => PoolError::NodeCatchingUp,
+            };
+        }
+        PoolError::NoPendingBlockEvaluator
     }
 
     /// Assemble a block for `round`, spending at most until `deadline`.
@@ -1428,6 +1460,7 @@ impl TransactionPool {
     pub fn pause_evaluator(&self) {
         let mut inner = self.mu.lock();
         inner.evaluator_paused = true;
+        self.paused_flag.store(true, Ordering::SeqCst);
         inner.evaluator = None;
         inner.reprime_on_demand = true;
         inner.paused_last_round = None;
@@ -1439,15 +1472,17 @@ impl TransactionPool {
     /// With `prime` the evaluator is rebuilt against the ledger's current tip
     /// in the same critical section (so no block can slip in between), using
     /// the committed txids recorded while paused. Without it nothing is built
-    /// now: use that only while the ledger handle is known to be about to be
-    /// swapped, so no evaluator is built on the stale one. Either way, if no
-    /// evaluator exists afterwards, the next `remember()`/`test()` (at most
-    /// one attempt per ledger round per second) or `on_new_block` rebuilds it
-    /// and admission reports the retryable [`PoolError::NodeCatchingUp`] in
-    /// between.
+    /// now: use that when the ledger handle may be stale (a failed reload), so
+    /// the first block or admission rebuilds against whatever handle is
+    /// current. Either way, if no evaluator exists afterwards, the next
+    /// `remember()`/`test()` (at most one attempt per ledger round per second)
+    /// or `on_new_block` rebuilds it; in between admission reports
+    /// [`PoolError::EvaluatorRebuildFailed`] if the last rebuild failed, else
+    /// the retryable [`PoolError::NodeCatchingUp`].
     pub fn resume_evaluator(&self, prime: bool) {
         let mut inner = self.mu.lock();
         inner.evaluator_paused = false;
+        self.paused_flag.store(false, Ordering::SeqCst);
         inner.paused_last_round = None;
         if prime {
             inner.reprime_attempt = Some((self.ledger.latest(), Instant::now()));
@@ -1458,8 +1493,11 @@ impl TransactionPool {
 
     /// Whether the evaluator is currently paused (see
     /// [`Self::pause_evaluator`]).
+    ///
+    /// Lock-free: reads an atomic mirror kept in step with the flag under the
+    /// pool mutex, so it is safe to call from async tasks.
     pub fn is_evaluator_paused(&self) -> bool {
-        self.mu.lock().evaluator_paused
+        self.paused_flag.load(Ordering::SeqCst)
     }
 
     /// Whether the pool currently holds a pending block evaluator.
@@ -1689,7 +1727,8 @@ mod tests {
 
     /// The on-demand rebuild is throttled: with a failing `start_evaluator`,
     /// repeated admissions in the same round make one attempt, and report the
-    /// retryable error in between; a new round allows another attempt.
+    /// real rebuild fault (not "catching up": the pool is not paused) in
+    /// between; a new round allows another attempt.
     #[test]
     fn failing_on_demand_rebuild_is_throttled_per_round() {
         let ledger = FlakyLedger::new();
@@ -1702,7 +1741,20 @@ mod tests {
         let before = ledger.starts.load(Ordering::SeqCst);
         for n in 0..5 {
             let err = pool.remember(vec![make_test_txn(10 + n)]).unwrap_err();
-            assert!(err.is_catching_up(), "retryable in between: {err:?}");
+            assert!(
+                !err.is_catching_up(),
+                "unpaused, so not catching up: {err:?}"
+            );
+            assert!(
+                err.to_string()
+                    .contains("cannot rebuild the block evaluator"),
+                "the real fault is reported: {err}"
+            );
+            assert_eq!(
+                crate::error::classify_pool_error(&err),
+                crate::error::PoolErrorTag::EvalGeneric,
+                "counted"
+            );
         }
         assert_eq!(
             ledger.starts.load(Ordering::SeqCst),

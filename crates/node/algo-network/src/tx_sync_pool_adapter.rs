@@ -141,7 +141,7 @@ impl SolicitedTxHandler for PoolSolicitedTxHandler {
                 debug!(error = %e, "PoolSolicitedTxHandler: node is catching up; pulled TX group dropped");
                 Ok(())
             }
-            Err(PoolIngestError::Rejected(e)) => {
+            Err(PoolIngestError::Rejected(e) | PoolIngestError::Internal(e)) => {
                 warn!(error = %e, "PoolSolicitedTxHandler: pool rejected pulled TX group");
                 Err(TxSyncError::Handler(e))
             }
