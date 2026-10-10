@@ -36,6 +36,38 @@ Full Rust reimplementation of go-algorand — a production-grade Algorand node. 
   (Makefile targets, scripts/) over ad-hoc `go build`/`go test` invocations —
   they encode required native-dependency setup.
 
+## Two-team parallel development (team:a / team:b)
+
+- Two computers work the backlog in parallel. Every open issue carries
+  exactly one ownership label: `team:a` (consensus / ledger / sync core —
+  `apply.rs`, agreement, perf) or `team:b` (tests, CI, infrastructure,
+  mixed-cluster tooling, docs). A session works **only its own team's
+  issues**, in this order: `in-progress` first (resume), then lowest
+  effort/oldest.
+- **One open PR per team** (this supersedes "one open PR in total" below,
+  which still applies within a team). Check `gh pr list --state open` for
+  your team's PRs only.
+- **Claim before starting**: add `in-progress` to the issue; remove it when
+  the PR merges or you abandon the work. Never touch an `in-progress` issue
+  owned by the other team.
+- **Team B's machine is offline at night.** When team A has no work left (or
+  a team B issue has no `in-progress` label and team B is idle/offline),
+  team A may take it: swap its `team:b` label to `team:a` first (comment
+  "rebalanced from team B"), then claim it. Never take an `in-progress`
+  issue; if a stale `in-progress` has no recent branch/PR activity for 12 h,
+  comment on it, then reclaim.
+- New issues filed by a team get that team's label (or the label of the
+  area they belong to) at creation.
+- **Conflict hygiene**: keep PRs small; rebase on `origin/main` right before
+  merging; do not hand-edit the aggregate table in
+  `docs/PHASE17_TEST_PARITY.md` in feature PRs when the other team has an
+  open PR — update the per-area `docs/phase17/parity_*.md` rows in the PR and
+  regenerate the aggregate with `scripts/update_phase17_summary.py` in a
+  follow-up docs commit on `main`.
+- Per-issue loop for both teams: file/refine issue with acceptance criteria →
+  TDD failing test → fix with go-algorand parity → PR → code review → fix
+  all findings → re-review until clean → CI green → merge to `main`.
+
 ## Issue-fix dispatch: one at a time, one open PR at a time
 
 - When working through the open-issue backlog (Phase 17 or otherwise),
