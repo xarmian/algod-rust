@@ -46,6 +46,8 @@ pub mod merkle_trie;
 pub mod params;
 pub mod participation;
 pub mod pending_overlay;
+#[cfg(test)]
+mod pending_overlay_differential_test;
 pub mod proposal_eval;
 pub mod proposal_validator;
 pub(crate) mod recording_store;
