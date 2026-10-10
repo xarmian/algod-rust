@@ -2999,22 +2999,35 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                     .map_err(|e| algo_error::AlgoError::Ledger {
                         message: format!("ledger lock poisoned: {e}"),
                     })?;
-                use algo_ledger::store_trait::LedgerStore;
-                let sink = ledger.get_account(&self.hdr.fee_sink).unwrap_or_default();
-                sink.micro_algos
-                    .saturating_add(self.fees_collected)
-                    .saturating_sub(ledger.min_balance_with_state(&self.hdr.fee_sink, &sink))
+                // The balances are only meaningful at the evaluator's base
+                // round (`hdr.round - 1`). If the tip moved the proposal is
+                // stale anyway; a lower payout is always accepted, so claim
+                // nothing.
+                if ledger.current_round().0.saturating_add(1) == self.hdr.round.0 {
+                    algo_ledger::block_header::fee_sink_available(&*ledger, &self.hdr.fee_sink)
+                        .saturating_add(self.fees_collected)
+                } else {
+                    0
+                }
             }
         };
+        // go errors when `incentive + Bonus` overflows; the proposer-safe
+        // answer is a payout of 0 (go accepts any payout at or below the
+        // allowance), so the node still proposes.
         let proposer_payout = algo_ledger::block_header::proposer_payout(
             &self.consensus_params,
             self.fees_collected,
             self.hdr.bonus,
             fee_sink_available,
         )
-        .ok_or_else(|| algo_error::AlgoError::Ledger {
-            message: "payout overflowed adding bonus incentive".to_string(),
-        })?;
+        .unwrap_or_else(|| {
+            warn!(
+                fees_collected = self.fees_collected,
+                bonus = self.hdr.bonus,
+                "proposer payout overflowed adding the bonus; proposing payout 0"
+            );
+            0
+        });
 
         // Compute the expired-participation-accounts sweep list (issue #526).
         // Mirrors go's `generateKnockOfflineAccountsList`'s expiry half
@@ -9908,6 +9921,8 @@ mod tests {
         let fee_sink = Address([0x11; 32]);
         let rewards_pool = Address([0x22; 32]);
         let proposer = Address([0x33; 32]);
+        // The ledger tip is the evaluator's base round (hdr.round - 1).
+        ledger.lock().unwrap().set_current_round(Round(499));
         ledger.lock().unwrap().set_account(
             &fee_sink,
             AccountData {

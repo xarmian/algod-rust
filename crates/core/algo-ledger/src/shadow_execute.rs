@@ -863,7 +863,10 @@ pub fn scratch_execute_payset<L: LedgerStore>(
     let invariant = ScratchInvariant::capture(store, &chain);
     let sp = store.snapshot(&[]);
     let mut ad: Vec<ApplyData> = Vec::with_capacity(block.payset.len());
-    let mut probe = crate::apply::ExecProbe::default();
+    let mut probe = crate::apply::ExecProbe {
+        want_fee_sink_available: true,
+        ..Default::default()
+    };
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::apply::apply_block_impl_probe(
             store,

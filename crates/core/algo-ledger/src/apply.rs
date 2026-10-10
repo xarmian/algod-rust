@@ -1801,6 +1801,10 @@ pub struct ExecProbe {
     /// .AvailableBalance(&proto)` in `proposerPayout()` (issue #1794). Only
     /// set on success.
     pub final_fee_sink_available: Option<u64>,
+    /// Input: compute `final_fee_sink_available`. Only the proposer's final
+    /// scratch apply asks; per-group overlay runs and plain applies skip the
+    /// account read and min-balance scan.
+    pub want_fee_sink_available: bool,
 }
 
 /// [`apply_block_impl_ex`] plus an [`ExecProbe`] out-parameter.
@@ -2194,10 +2198,12 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         if result.is_ok() {
             p.final_txn_counter = ctx.txn_counter.get();
             p.final_state_proof_next = final_state_proof_next;
-            p.final_fee_sink_available = store.get_account(&block.fee_sink).map(|sink| {
-                sink.micro_algos
-                    .saturating_sub(store.min_balance_with_state(&block.fee_sink, &sink))
-            });
+            if p.want_fee_sink_available {
+                p.final_fee_sink_available = Some(crate::block_header::fee_sink_available(
+                    store,
+                    &block.fee_sink,
+                ));
+            }
         }
     }
     if result.is_err() {

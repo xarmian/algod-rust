@@ -241,6 +241,17 @@ fn process_upgrade_params(
     Ok((vote, state))
 }
 
+/// The fee sink's available balance in `store`: `micro_algos` minus its minimum
+/// balance (floored at 0), with pending rewards NOT applied -- go's
+/// `eval.state.lookup(FeeSink).AvailableBalance(&proto)` (`lookup` is
+/// `LookupWithoutRewards`). A missing account has nothing available.
+pub fn fee_sink_available<L: crate::store_trait::LedgerStore>(store: &L, sink: &Address) -> u64 {
+    store.get_account(sink).map_or(0, |acct| {
+        acct.micro_algos
+            .saturating_sub(store.min_balance_with_state(sink, &acct))
+    })
+}
+
 /// The proposer payout a block should carry (go `BlockEvaluator.proposerPayout`,
 /// `ledger/eval/eval.go`): `min(floor(Payouts.Percent% * feesCollected) + bonus,
 /// feeSinkAvailable)`. `None` when payouts are disabled (go leaves
@@ -254,9 +265,13 @@ pub fn proposer_payout(
     if !params.payouts_enabled {
         return Some(0);
     }
+    // go's `NewPercent` panics on an improper fraction (> 100%); consensus
+    // params never carry one, so saturate rather than panic.
+    debug_assert!(params.payouts_percent <= 100, "payouts percent above 100");
+    let percent = params.payouts_percent.min(100);
     // `NewPercent(p).DivvyAlgos(fees)`: floor(fees * p / 100), no overflow
     // for p <= 100.
-    let incentive = (u128::from(fees_collected) * u128::from(params.payouts_percent) / 100) as u64;
+    let incentive = (u128::from(fees_collected) * u128::from(percent) / 100) as u64;
     let total = incentive.checked_add(bonus)?;
     Some(total.min(fee_sink_available))
 }
@@ -1346,6 +1361,16 @@ mod tests {
         assert_eq!(
             proposer_payout(&p, u64::MAX, 0, u64::MAX),
             Some((u128::from(u64::MAX) * 50 / 100) as u64)
+        );
+        // 100%: all fees (plus bonus), still capped.
+        let all = ConsensusParams {
+            payouts_percent: 100,
+            ..p.clone()
+        };
+        assert_eq!(proposer_payout(&all, u64::MAX, 0, u64::MAX), Some(u64::MAX));
+        assert_eq!(
+            proposer_payout(&all, 1_000_000_000_000, 7, u64::MAX),
+            Some(1_000_000_000_007)
         );
         let off = ConsensusParams {
             payouts_enabled: false,
