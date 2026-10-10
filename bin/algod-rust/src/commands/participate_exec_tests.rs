@@ -1124,3 +1124,66 @@ fn per_group_probe_does_not_read_the_fee_sink() {
     let p = algo_ledger::apply::ExecProbe::default();
     assert!(!p.want_fee_sink_available && p.final_fee_sink_available.is_none());
 }
+
+/// Hand-computed from go's `proposerPayout` (independent of any helper).
+/// V41: Payouts.Percent = 50, genesis fee sink = 10_000_000, min balance =
+/// 100_000. Three payments at the 1_000 min fee collect 3_000.
+///   * bonus 1_234:  floor(3_000 * 50 / 100) + 1_234 = 1_500 + 1_234 = 2_734
+///     (sink available 10_000_000 + 3_000 - 100_000 = 9_903_000, not binding)
+///   * bonus 20_000_000: 1_500 + 20_000_000 = 20_001_500 > 9_903_000, so the
+///     sink cap wins: 9_903_000.
+#[test]
+fn proposer_payout_golden_values() {
+    for (bonus, want) in [(1_234u64, 2_734u64), (20_000_000, 9_903_000)] {
+        let a = key(1);
+        let b = key(2);
+        let (_l, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))]);
+        eval.hdr.bonus = bonus;
+        for amount in [1_000_000u64, 2_000_000, 3_000_000] {
+            eval.transaction_group(&[pay(&a, b.0, amount, None)])
+                .unwrap();
+        }
+        let block = eval.generate_block(&[]).unwrap();
+        assert_eq!(block.fees_collected, 3_000);
+        assert_eq!(block.proposer_payout, want, "bonus {bonus}");
+    }
+}
+
+/// Fallback path (no exec state): the sink's deficit must not turn positive
+/// when fees are added. Min balance 100_000, sink balance 1, fees 5_000:
+/// (1 + 5_000) - 100_000 saturates to 0, so the payout is 0.
+#[test]
+fn fallback_sink_deficit_is_not_cured_by_fees() {
+    let a = key(1);
+    let (ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000))]);
+    ledger.lock().unwrap().set_account(&FEE_SINK, funded(1));
+    eval.exec = None;
+    eval.fees_collected = 5_000;
+    let block = eval.generate_block(&[]).unwrap();
+    assert_eq!(block.proposer_payout, 0);
+}
+
+/// Fallback path: a payset transaction that touches the fee sink (here the
+/// sink as sender) has effects beyond `fees_collected` that the fallback
+/// cannot see, so it proposes payout 0 (go accepts any lower payout).
+#[test]
+fn fallback_payout_is_zero_when_the_payset_touches_the_fee_sink() {
+    let a = key(1);
+    let (_ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000))]);
+    eval.exec = None;
+    let mut t = base_txn(FEE_SINK, TxnType::Pay);
+    t.receiver = a.0;
+    t.amount = 1;
+    let mut stx = SignedTransaction {
+        txn: t,
+        ..Default::default()
+    };
+    eval.genesis_rule().strip(&mut stx);
+    eval.included_txns.push(stx);
+    let block = eval.generate_block(&[]).unwrap();
+    assert_eq!(block.proposer_payout, 0);
+    // Control: the same evaluator without that transaction pays the bonus.
+    let (_l, mut eval) = evaluator(&[(a.0, funded(50_000_000))]);
+    eval.exec = None;
+    assert!(eval.generate_block(&[]).unwrap().proposer_payout > 0);
+}

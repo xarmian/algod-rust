@@ -2202,6 +2202,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
                 p.final_fee_sink_available = Some(crate::block_header::fee_sink_available(
                     store,
                     &block.fee_sink,
+                    0,
                 ));
             }
         }

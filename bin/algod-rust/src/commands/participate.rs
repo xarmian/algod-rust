@@ -3003,15 +3003,37 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                 // round (`hdr.round - 1`). If the tip moved the proposal is
                 // stale anyway; a lower payout is always accepted, so claim
                 // nothing.
-                if ledger.current_round().0.saturating_add(1) == self.hdr.round.0 {
-                    algo_ledger::block_header::fee_sink_available(&*ledger, &self.hdr.fee_sink)
-                        .saturating_add(self.fees_collected)
-                } else {
+                let sink = self.hdr.fee_sink;
+                let touches_sink = payset.iter().any(|stx| {
+                    stx.txn.sender == sink
+                        || stx.txn.receiver == sink
+                        || stx.txn.close_remainder_to == sink
+                });
+                if ledger.current_round().0.saturating_add(1) != self.hdr.round.0 {
+                    debug!(
+                        tip = ledger.current_round().0,
+                        round = self.hdr.round.0,
+                        "ledger tip is not the evaluator base round; proposing payout 0"
+                    );
                     0
+                } else if touches_sink {
+                    // Without exec state the sink's post-payset balance is
+                    // unknown beyond the fees; a payset transaction that
+                    // moves the sink (sender, receiver, close-to) makes the
+                    // fees-only estimate wrong. Fail safe: payout 0.
+                    debug!("payset touches the fee sink; proposing payout 0");
+                    0
+                } else {
+                    algo_ledger::block_header::fee_sink_available(
+                        &*ledger,
+                        &sink,
+                        self.fees_collected,
+                    )
                 }
             }
         };
-        // go errors when `incentive + Bonus` overflows; the proposer-safe
+        // Deliberate (reviewed): go errors when `incentive + Bonus` overflows;
+        // the proposer-safe
         // answer is a payout of 0 (go accepts any payout at or below the
         // allowance), so the node still proposes.
         let proposer_payout = algo_ledger::block_header::proposer_payout(

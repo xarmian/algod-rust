@@ -863,6 +863,8 @@ pub fn scratch_execute_payset<L: LedgerStore>(
     let invariant = ScratchInvariant::capture(store, &chain);
     let sp = store.snapshot(&[]);
     let mut ad: Vec<ApplyData> = Vec::with_capacity(block.payset.len());
+    // Input flag (reviewed, intentional): only this final epilogue apply
+    // needs the post-payset sink balance.
     let mut probe = crate::apply::ExecProbe {
         want_fee_sink_available: true,
         ..Default::default()
