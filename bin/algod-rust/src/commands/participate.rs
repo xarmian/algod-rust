@@ -37,6 +37,7 @@ use algo_codec::{
 use algo_ledger::catchpoint::{get_catchpoint_stream, CatchpointError};
 use algo_ledger::participation::{restore_participation, ParticipationStore};
 use algo_ledger::store_trait::LedgerStore;
+use algo_ledger::PayoutCheckingValidator;
 use algo_ledger::{
     make_genesis_block, parse_genesis_json, populate_store, seed_account_totals_from_genesis,
     AgreementKeyManagerBridge, AgreementLedgerBridge, BlockFetcher, CatchupService, FetchError,
@@ -544,11 +545,18 @@ impl ParticipateAgreementControl {
                 None
             }
         };
-        let block_validator: Arc<BlockValidatorBridge> = Arc::new(BlockValidatorBridge::new(
-            self.resolved_genesis_id.clone(),
-            self.genesis_hash,
-            prev_timestamp,
-        ));
+        // Stateless validation plus go's `validateForPayouts` against the
+        // committed ledger (issue #1798): a peer proposal's FeesCollected /
+        // Proposer / ProposerPayout are judged before this node votes.
+        let block_validator: Arc<PayoutCheckingValidator<BlockValidatorBridge>> =
+            Arc::new(PayoutCheckingValidator::new(
+                BlockValidatorBridge::new(
+                    self.resolved_genesis_id.clone(),
+                    self.genesis_hash,
+                    prev_timestamp,
+                ),
+                self.ledger.clone(),
+            ));
 
         let random_source = RealRandomSource;
         let monitor = NoOpMonitor;
@@ -2534,6 +2542,12 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         // to this address in the overlay, mirroring Go's `takeFee()`
         // which calls `cow.Move(sender, FeeSink, fee)`.
         let fee_sink = self.hdr.fee_sink;
+        // `FeesCollected` has ONE definition, shared with block validation
+        // (go `takeFee`: fees paid by the sink itself are not collected).
+        // Rolled back to the checkpoint on every failure path below.
+        self.fees_collected = fees_collected_checkpoint.saturating_add(
+            algo_ledger::block_header::payset_fees_collected(&stibs, &fee_sink),
+        );
 
         // Record txids, leases, and balance deltas in the COW overlay.
         // This mirrors Go's cow.addTx() which records txids and leases,
@@ -2588,7 +2602,6 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                         fee_sink_balance.saturating_add(stx.txn.fee),
                         &mut checkpoint,
                     );
-                    self.fees_collected = self.fees_collected.saturating_add(stx.txn.fee);
                 }
                 sender_balance.saturating_sub(stx.txn.fee)
             };
@@ -3032,24 +3045,19 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                 }
             }
         };
-        // Deliberate (reviewed): go errors when `incentive + Bonus` overflows;
-        // the proposer-safe
-        // answer is a payout of 0 (go accepts any payout at or below the
-        // allowance), so the node still proposes.
+        // go errors when `incentive + Bonus` overflows, failing block
+        // generation outright (so the node does not propose this round). A
+        // payout of 0 would not be a safe substitute: the node's own
+        // validator (`validateForPayouts`) is the same function go runs.
         let proposer_payout = algo_ledger::block_header::proposer_payout(
             &self.consensus_params,
             self.fees_collected,
             self.hdr.bonus,
             fee_sink_available,
         )
-        .unwrap_or_else(|| {
-            warn!(
-                fees_collected = self.fees_collected,
-                bonus = self.hdr.bonus,
-                "proposer payout overflowed adding the bonus; proposing payout 0"
-            );
-            0
-        });
+        .map_err(|e| algo_error::AlgoError::Ledger {
+            message: e.to_string(),
+        })?;
 
         // Compute the expired-participation-accounts sweep list (issue #526).
         // Mirrors go's `generateKnockOfflineAccountsList`'s expiry half

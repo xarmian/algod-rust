@@ -23,6 +23,7 @@
 //! so nothing go refuses is admitted or proposed.
 
 use super::*;
+use algo_agreement::BlockValidator;
 use algo_pool::traits::BlockEvaluator;
 use algo_types::{AppParams, AssetHolding, SignedTransaction, Transaction};
 use ed25519_dalek::{Signer, SigningKey};
@@ -1005,6 +1006,145 @@ fn proposal_header_carries_the_proposer_payout() {
     assert_eq!(block.proposer_payout, want);
 }
 
+/// Generation and validation cannot drift (issue #1798): the block a proposer
+/// builds (fees, bonus and capped payout from #1794) passes the validating
+/// apply once agreement has set the proposer, and the same block with the
+/// payout raised by one microAlgo is rejected as over the allowance.
+#[test]
+fn proposer_built_block_passes_the_validating_apply() {
+    let a = key(1);
+    let b = key(2);
+    let (ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))]);
+    for amount in [1_000_000u64, 2_000_000] {
+        eval.transaction_group(&[pay(&a, b.0, amount, None)])
+            .expect("payment");
+    }
+    let mut block = eval.generate_block(&[]).expect("generate_block");
+    assert!(block.proposer_payout > 0, "must exercise a real payout");
+    // agreement sets the proposer after generation (go `WithProposer`).
+    block.proposer = a.0;
+    let mut l = ledger.lock().unwrap();
+    algo_ledger::apply_block_validating(&mut *l, &block)
+        .expect("a proposer-built block must validate");
+    drop(l);
+
+    // ...and one microAlgo more than it chose is over the allowance.
+    let (ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))]);
+    eval.transaction_group(&[pay(&a, b.0, 1_000_000, None)])
+        .expect("payment");
+    let mut block = eval.generate_block(&[]).expect("generate_block");
+    block.proposer = a.0;
+    block.proposer_payout += 1;
+    let mut l = ledger.lock().unwrap();
+    let err = algo_ledger::apply_block_validating(&mut *l, &block).unwrap_err();
+    assert!(err.to_string().contains("is allowed"), "{err}");
+}
+
+/// The node's real proposal-validation entry point (issue #1798): the
+/// stateless validator wrapped with go's `validateForPayouts` over the ledger.
+fn payout_validator(
+    ledger: &Arc<Mutex<SqliteLedger>>,
+) -> algo_ledger::PayoutCheckingValidator<algo_agreement::StubBlockValidator> {
+    algo_ledger::PayoutCheckingValidator::new(
+        algo_agreement::StubBlockValidator::accepting(),
+        ledger.clone(),
+    )
+}
+
+/// A proposer-built block (single fees, a pooled group fee and a transaction
+/// sent by the fee sink) is accepted by the validation entry point once
+/// agreement has set the proposer; an inflated payout, a forged
+/// `FeesCollected` and a missing proposer are each rejected.
+#[test]
+fn proposal_validation_entry_point_enforces_validate_for_payouts() {
+    let a = key(1);
+    let b = key(2);
+    let build = || {
+        let (ledger, mut eval) = evaluator(&[
+            (a.0, funded(50_000_000)),
+            (b.0, funded(1_000_000)),
+            (
+                FEE_SINK,
+                AccountData {
+                    auth_addr: Some(a.0),
+                    ..funded(50_000_000)
+                },
+            ),
+        ]);
+        eval.transaction_group(&[pay(&a, b.0, 1_000_000, None)])
+            .expect("single payment");
+        // Pooled group: the first member pays the whole 2_000 group fee.
+        let mut members = [(1_000u64, 2_000u64), (2_000, 0)].map(|(amount, fee)| {
+            let mut t = base_txn(a.0, TxnType::Pay);
+            t.receiver = b.0;
+            t.amount = amount;
+            t.fee = fee;
+            t
+        });
+        let gid = algo_codec::compute_group_id(&members);
+        for t in members.iter_mut() {
+            t.group = gid.0;
+        }
+        let group: Vec<_> = members.into_iter().map(|t| sign(t, &a.1)).collect();
+        eval.transaction_group(&group).expect("pooled group");
+        // A transaction paid FOR by the fee sink collects no fee (go
+        // `takeFee`): generation and validation must agree on that.
+        let mut from_sink = base_txn(FEE_SINK, TxnType::Pay);
+        from_sink.receiver = b.0;
+        from_sink.amount = 1_000;
+        // The sink is rekeyed to `a` so the test can sign for it.
+        let mut from_sink = sign(from_sink, &a.1);
+        from_sink.auth_addr = Some(a.0);
+        eval.transaction_group(&[from_sink])
+            .expect("fee sink sender");
+        let mut block = eval.generate_block(&[]).expect("generate_block");
+        assert_eq!(block.fees_collected, 3_000);
+        assert!(block.proposer_payout > 0, "must exercise a real payout");
+        // agreement sets the proposer after generation (go `WithProposer`).
+        block.proposer = a.0;
+        (ledger, block)
+    };
+
+    let (ledger, block) = build();
+    payout_validator(&ledger)
+        .validate(&block)
+        .map(|_| ())
+        .expect("a proposer-built block must validate");
+
+    let (ledger, mut inflated) = build();
+    inflated.proposer_payout += 1;
+    let err = payout_validator(&ledger).validate(&inflated).err().unwrap();
+    assert!(err.to_string().contains("is allowed"), "{err}");
+
+    let (ledger, mut forged) = build();
+    forged.fees_collected += 1;
+    let err = payout_validator(&ledger).validate(&forged).err().unwrap();
+    assert!(err.to_string().contains("fees collected wrong"), "{err}");
+
+    let (ledger, mut orphan) = build();
+    orphan.proposer = Address::ZERO;
+    let err = payout_validator(&ledger).validate(&orphan).err().unwrap();
+    assert!(err.to_string().contains("proposer missing"), "{err}");
+}
+
+/// go fails block generation outright when `incentive + Bonus` overflows;
+/// the node must not propose that round (a payout of 0 would instead be
+/// rejected by its own `validateForPayouts`).
+#[test]
+fn generate_block_fails_when_the_bonus_overflows_the_payout() {
+    let a = key(1);
+    let b = key(2);
+    let (_ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))]);
+    eval.transaction_group(&[pay(&a, b.0, 1_000_000, None)])
+        .expect("payment");
+    eval.hdr.bonus = u64::MAX;
+    let err = eval.generate_block(&[]).expect_err("must not propose");
+    assert!(
+        err.to_string().contains("payout overflowed adding bonus"),
+        "{err}"
+    );
+}
+
 /// An empty block still pays the bonus (go computes it from `Bonus` alone),
 /// read through the ledger fallback because nothing was evaluated.
 #[test]
@@ -1102,20 +1242,6 @@ fn trimmed_payset_pays_out_on_the_kept_fees_only() {
         expected_payout(&ledger, &eval, &block)
     );
     assert!(block.proposer_payout > 0);
-}
-
-/// go errors when `incentive + Bonus` overflows; a Rust proposer proposes
-/// payout 0 instead (a lower payout is always accepted).
-#[test]
-fn bonus_overflow_proposes_a_zero_payout() {
-    let a = key(1);
-    let b = key(2);
-    let (_ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))]);
-    eval.hdr.bonus = u64::MAX;
-    eval.transaction_group(&[pay(&a, b.0, 1_000_000, None)])
-        .expect("payment");
-    let block = eval.generate_block(&[]).expect("must still propose");
-    assert_eq!(block.proposer_payout, 0);
 }
 
 /// The per-group overlay evaluation never asks for the sink balance.

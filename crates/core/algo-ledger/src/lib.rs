@@ -44,9 +44,10 @@ pub mod merkle_committer;
 pub mod merkle_page;
 pub mod merkle_trie;
 pub mod params;
+pub mod participation;
 pub mod pending_overlay;
 pub mod proposal_eval;
-pub mod participation;
+pub mod proposal_validator;
 pub(crate) mod recording_store;
 pub mod rewards;
 pub mod shadow_execute;
@@ -123,6 +124,7 @@ pub use apply_stall::{ApplyStall, ApplyStallTracker, StallTransition};
 pub use catchup_service::{
     BlockFetcher, CatchupLedger, CatchupService, FetchError, FetchedBlockCert,
 };
+pub use proposal_validator::PayoutCheckingValidator;
 pub use state_delta::{
     AccountBaseData, AccountDeltas, AccountTotals, AlgoCount, AppLocalStateDelta, AppParamsDelta,
     AppResourceRecord, AssetHoldingDelta, AssetParamsDelta, AssetResourceRecord, BalanceRecord,

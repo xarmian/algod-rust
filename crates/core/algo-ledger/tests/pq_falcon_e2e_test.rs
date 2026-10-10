@@ -77,7 +77,8 @@ fn minimal_block(genesis_hash: [u8; 32], fee_sink: Address, round: u64) -> Block
         timestamp: 0,
         genesis_id: String::new(),
         genesis_hash,
-        proposer: Address::ZERO,
+        // go's validateForPayouts requires a proposer on a validated block.
+        proposer: Address([0x55; 32]),
         fee_sink,
         rewards_pool: Address::ZERO,
         rewards_level: 0,
@@ -114,6 +115,9 @@ fn minimal_block(genesis_hash: [u8; 32], fee_sink: Address, round: u64) -> Block
 fn set_payset(block: &mut Block, mut txns: Vec<algo_types::SignedTransaction>) {
     algo_types::genesis_restore::GenesisRestoreRule::for_block(block).strip_payset(&mut txns);
     block.payset = txns;
+    // ...and `FeesCollected` must equal what the payset paid.
+    block.fees_collected =
+        algo_ledger::block_header::payset_fees_collected(&block.payset, &block.fee_sink);
 }
 
 /// Assert a block validates cleanly (real signature/fee/proof checks) and

@@ -106,6 +106,13 @@ pub enum AlgoError {
     #[error("ledger error: {message}")]
     Ledger { message: String },
 
+    /// go's `validateForPayouts` rejected a block header (fees collected,
+    /// proposer or proposer payout fields). A genuine verdict on the block,
+    /// kept distinct from every other evaluation failure so it can never be
+    /// mistaken for "could not evaluate".
+    #[error("{message}")]
+    PayoutViolation { message: String },
+
     #[error("AVM: {message}")]
     Avm { message: String },
 
