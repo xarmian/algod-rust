@@ -482,9 +482,14 @@ class Workload:
 
     def sc_pay(self):
         a, b = self.rng.sample(sorted(self.actors), 2)
-        self.ensure_balance(self.actors[a], PAY_MAX + PAY_FEE_HEADROOM)
+        # Strict reads: a REST failure aborts the scenario instead of looking
+        # like a drained actor (which would send a pointless funding tx).
         try:
+            if self.spendable(self.actors[a]) < PAY_MAX + PAY_FEE_HEADROOM:
+                self.ensure_balance(self.actors[a], PAY_MAX + PAY_FEE_HEADROOM)
             room = self.spendable(self.actors[a]) - PAY_FEE_HEADROOM
+        except ScenarioAbort:
+            raise
         except Exception as e:  # noqa: BLE001 - a transient REST failure is not a pay failure
             raise ScenarioAbort("cannot read {}'s balance: {}".format(a, e))
         if room < 1:
@@ -823,7 +828,12 @@ class Workload:
             self.scenario_counts[name] = self.scenario_counts.get(name, 0) + 1
             try:
                 if i % TOP_UP_EVERY == 0:
-                    self.top_up_actors()
+                    try:
+                        self.top_up_actors()
+                    except ScenarioAbort as e:
+                        # A funding failure is a workload-planning problem,
+                        # reported as such, not charged to this scenario.
+                        self.abort("top_up", str(e))
                 Workload.SCENARIOS[name](self)
             except StopRequested:
                 break

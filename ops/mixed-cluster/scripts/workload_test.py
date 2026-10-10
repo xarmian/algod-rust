@@ -11,8 +11,8 @@
 import base64
 import io
 import json
-import re
 import os
+import re
 import sys
 import unittest
 
