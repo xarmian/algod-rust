@@ -44,11 +44,16 @@ fixture to prove each check can fail.
 `65682823` carries a state proof transaction (`stpf`). A mainnet state proof
 body (`sp`) is ~300 KB, above the per-file limit, and Execute-mode replay
 never reads it (proofs are only verified in validate mode). The capture script
-therefore drops the `sp` body of every `stpf` from the stored block and counts
-the drops in `meta.stripped_state_proof_bodies`; the transaction's message
-(`spmsg`), the header's `StateProofTracking` and every other byte are as
-served. The replay asserts the `StateProofNextRound` the apply leaves behind
-equals the header value go wrote (here 65682688 -> 65682944).
+therefore cuts the `sp` key/value of every `stpf` out of the stored block at
+the byte level (no re-encoding) and counts the cuts in
+`meta.stripped_state_proof_bodies`. Every other byte is as served except the
+owning transaction map's entry count (one less). Consequently the block is NOT
+byte-identical to go's: the header's payset commitments (`txn`, `txn256`) no
+longer match the stored payset and the block cannot be validated or hashed
+against the chain; Execute-mode replay never recomputes them. The
+transaction's message (`spmsg`) and the header's `StateProofTracking` are
+untouched, and the replay asserts the `StateProofNextRound` the apply leaves
+behind equals the header value go wrote (here 65682688 -> 65682944).
 
 ## How the pre-state is obtained (and its limits)
 

@@ -2097,31 +2097,6 @@ impl SimpleBlockEvaluator {
         Ok(result)
     }
 
-    /// `StateProofNextRound` after `payset` for an evaluator without exec
-    /// state (no scratch apply): each state proof transaction for the round
-    /// currently expected advances it by one `StateProofInterval`, as go's
-    /// `apply.StateProof` does (`ledger/apply/stateproof.go:73`). `None` when
-    /// the template tracks no state proofs.
-    fn legacy_state_proof_next(&self, payset: &[algo_types::SignedTransaction]) -> Option<u64> {
-        let interval = self.consensus_params.state_proof_interval;
-        let mut next =
-            algo_ledger::block_header::state_proof_next_round(&self.hdr.state_proof_tracking);
-        if interval == 0 || next == 0 {
-            return None;
-        }
-        for stx in payset.iter().filter(|s| s.txn.txn_type == "stpf") {
-            let attested = stx
-                .txn
-                .state_proof_message
-                .as_ref()
-                .map(|m| m.last_attested_round);
-            if attested == Some(next) {
-                next = next.saturating_add(interval);
-            }
-        }
-        Some(next)
-    }
-
     fn empty_payset_parts(&self) -> (Vec<algo_types::SignedTransaction>, u64) {
         (Vec::new(), 0)
     }
@@ -2885,14 +2860,29 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         // from the payset's state proof transactions.
         let next_round = match self.exec.as_ref() {
             Some(exec) => exec.final_state_proof_next,
-            None => self.legacy_state_proof_next(&payset),
+            None => {
+                // Production evaluators always carry exec state. Without it
+                // nothing evaluated the payset, so a state proof cannot be
+                // proposed (a second implementation of its effect here could
+                // drift from `apply_state_proof`): fail closed.
+                if payset.iter().any(|s| s.txn.txn_type == "stpf") {
+                    return Err(algo_error::AlgoError::Ledger {
+                        message: "cannot propose a state proof transaction without \
+                                  evaluator state"
+                            .to_string(),
+                    });
+                }
+                None
+            }
         };
+        // `None`/`Some(0)` (unknown / no state proofs) keep the template;
+        // otherwise the type-0 entry's NextRound is replaced in place.
         let state_proof_tracking = match next_round {
-            Some(next) => algo_ledger::block_header::with_state_proof_next_round(
+            Some(next) if next != 0 => algo_ledger::block_header::with_state_proof_next_round(
                 &self.hdr.state_proof_tracking,
                 next,
             ),
-            None => self.hdr.state_proof_tracking.clone(),
+            _ => self.hdr.state_proof_tracking.clone(),
         };
 
         // Compute the expired-participation-accounts sweep list (issue #526).

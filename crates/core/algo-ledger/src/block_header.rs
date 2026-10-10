@@ -418,6 +418,8 @@ pub fn state_proof_next_round(tracking: &Option<rmpv::Value>) -> u64 {
 /// The `StateProofBasic` entry is replaced in place and a tracking map is
 /// never fabricated: a header without a type-0 entry (state proofs disabled)
 /// is returned unchanged, so the header hash only ever changes by the value.
+/// `next == 0` removes the `"n"` key (go omits zero fields); an absent `"n"`
+/// is inserted in sorted key position.
 pub fn with_state_proof_next_round(
     tracking: &Option<rmpv::Value>,
     next: u64,
@@ -433,10 +435,23 @@ pub fn with_state_proof_next_round(
         let rmpv::Value::Map(fields) = v else {
             continue;
         };
-        match fields.iter_mut().find(|(fk, _)| fk.as_str() == Some("n")) {
-            Some((_, fv)) => *fv = rmpv::Value::from(next),
-            None if next != 0 => fields.push((rmpv::Value::from("n"), rmpv::Value::from(next))),
-            None => {}
+        // go omits a zero NextRound (`codec:",omitempty"`); a non-zero value
+        // replaces the existing entry in place or, if absent, goes in the
+        // canonical (lexicographically sorted) key position.
+        let existing = fields.iter().position(|(fk, _)| fk.as_str() == Some("n"));
+        match (existing, next) {
+            (Some(i), 0) => {
+                fields.remove(i);
+            }
+            (Some(i), _) => fields[i].1 = rmpv::Value::from(next),
+            (None, 0) => {}
+            (None, _) => {
+                let at = fields
+                    .iter()
+                    .position(|(fk, _)| fk.as_str().is_some_and(|k| k > "n"))
+                    .unwrap_or(fields.len());
+                fields.insert(at, (rmpv::Value::from("n"), rmpv::Value::from(next)));
+            }
         }
     }
     Some(rmpv::Value::Map(types))
@@ -1532,5 +1547,50 @@ mod tests {
         let mut off = v41_params();
         off.state_proof_interval = 0;
         assert_eq!(initial_state_proof_next_round(0, 5, &off), 0);
+    }
+
+    #[test]
+    fn with_state_proof_next_round_zero_omits_the_key() {
+        let before = tracking_map(vec![
+            ("n", rmpv::Value::from(1024u64)),
+            ("t", rmpv::Value::from(99u64)),
+        ]);
+        let expected = tracking_map(vec![("t", rmpv::Value::from(99u64))]);
+        assert_eq!(with_state_proof_next_round(&before, 0), expected);
+        // Already absent: unchanged.
+        assert_eq!(with_state_proof_next_round(&expected, 0), expected);
+    }
+
+    #[test]
+    fn with_state_proof_next_round_inserts_an_absent_key_in_canonical_order() {
+        // Sorted keys: n < t < v.
+        let before = tracking_map(vec![
+            ("t", rmpv::Value::from(99u64)),
+            ("v", rmpv::Value::Binary(vec![1u8; 64])),
+        ]);
+        let expected = tracking_map(vec![
+            ("n", rmpv::Value::from(1280u64)),
+            ("t", rmpv::Value::from(99u64)),
+            ("v", rmpv::Value::Binary(vec![1u8; 64])),
+        ]);
+        assert_eq!(with_state_proof_next_round(&before, 1280), expected);
+
+        let only_v = tracking_map(vec![("v", rmpv::Value::Binary(vec![1u8; 64]))]);
+        let got = with_state_proof_next_round(&only_v, 5);
+        assert_eq!(
+            got,
+            tracking_map(vec![
+                ("n", rmpv::Value::from(5u64)),
+                ("v", rmpv::Value::Binary(vec![1u8; 64])),
+            ])
+        );
+        let only_t = tracking_map(vec![("t", rmpv::Value::from(1u64))]);
+        assert_eq!(
+            with_state_proof_next_round(&only_t, 5),
+            tracking_map(vec![
+                ("n", rmpv::Value::from(5u64)),
+                ("t", rmpv::Value::from(1u64)),
+            ])
+        );
     }
 }

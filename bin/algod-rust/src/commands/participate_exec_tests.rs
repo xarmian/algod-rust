@@ -942,20 +942,25 @@ fn finalize_payset_twice_does_not_keep_a_stale_next_round() {
     );
 }
 
-/// An evaluator without exec state (legacy path) derives the value from the
-/// payset instead of keeping the template's.
+/// An evaluator without exec state never proposes a state proof (fail
+/// closed: nothing evaluated it), and keeps the template's value otherwise.
 #[test]
-fn evaluator_without_exec_state_derives_next_round_from_the_payset() {
+fn evaluator_without_exec_state_refuses_a_state_proof_payset() {
     let a = key(1);
     let (_ledger, mut eval) = tracked_evaluator(&[(a.0, funded(50_000_000))]);
     eval.exec = None;
     let mut stpf = state_proof_txn(1024);
     eval.genesis_rule().strip(&mut stpf);
     eval.included_txns.push(stpf);
+    let err = eval.generate_block(&[]).expect_err("must fail closed");
+    assert!(err.to_string().contains("without evaluator state"), "{err}");
+
+    // No state proof in the payset: the template value is kept.
+    let (_ledger, mut eval) = tracked_evaluator(&[(key(1).0, funded(50_000_000))]);
+    eval.exec = None;
     let block = eval.generate_block(&[]).expect("generate_block");
-    assert_eq!(block.payset.len(), 1);
     assert_eq!(
         algo_ledger::block_header::state_proof_next_round(&block.state_proof_tracking),
-        1280
+        1024
     );
 }

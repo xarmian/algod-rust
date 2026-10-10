@@ -656,6 +656,50 @@ def collect_refs(block):
 # ---------------------------------------------------------------------------
 
 
+def strip_state_proof_bodies(buf):
+    """Remove the `sp` key/value of every `stpf` txn from a block response,
+    byte-exactly (no re-encoding). Returns (new_bytes, count)."""
+    u = msgpack.Unpacker(raw=False, strict_map_key=False, max_buffer_size=len(buf) + 1)
+    u.feed(buf)
+    cuts = []  # (txn_map_header_pos, key_start, value_end)
+    for _ in range(u.read_map_header()):
+        if u.unpack() != "block":
+            u.skip()
+            continue
+        for _ in range(u.read_map_header()):
+            if u.unpack() != "txns":
+                u.skip()
+                continue
+            for _ in range(u.read_array_header()):
+                for _ in range(u.read_map_header()):  # SignedTxnInBlock
+                    if u.unpack() != "txn":
+                        u.skip()
+                        continue
+                    hdr = u.tell()
+                    n = u.read_map_header()
+                    found = None
+                    is_stpf = False
+                    for _ in range(n):
+                        kstart = u.tell()
+                        k = u.unpack()
+                        if k == "sp":
+                            u.skip()
+                            found = (kstart, u.tell())
+                        elif k == "type":
+                            is_stpf = u.unpack() == "stpf"
+                        else:
+                            u.skip()
+                    if is_stpf and found:
+                        cuts.append((hdr, found[0], found[1], n))
+    out = bytearray(buf)
+    for hdr, ks, ve, n in sorted(cuts, reverse=True):
+        # The txn map header must be a fixmap (< 16 entries) to patch in place.
+        assert 0x80 <= buf[hdr] <= 0x8F and n < 16, "unexpected txn map header"
+        del out[ks:ve]
+        out[hdr] = 0x80 | (n - 1)
+    return bytes(out), len(cuts)
+
+
 def capture(r):
     _prescan.clear()
     RES_PRESCAN.clear()
@@ -664,22 +708,18 @@ def capture(r):
     UNRESOLVED_RES.clear()
     os.makedirs(OUT_DIR, exist_ok=True)
     blk_bytes = raw_block(r)
-    resp = unpack(blk_bytes)
-    block = resp["block"]
     # A mainnet state proof transaction carries a ~300 KB proof body (`sp`),
     # far above the per-file size limit of this corpus. Execute-mode replay
     # (no proof verification) never reads it: the replay needs only the
     # transaction's message (`spmsg`) and the header's StateProofTracking.
-    # The bodies are dropped from the stored block and counted in
-    # `meta.stripped_state_proof_bodies` (the test pins the count).
-    stripped_sp = 0
-    for stib in block.get("txns") or []:
-        t = stib.get("txn") or {}
-        if t.get("type") == "stpf" and "sp" in t:
-            del t["sp"]
-            stripped_sp += 1
-    if stripped_sp:
-        blk_bytes = pack(resp)
+    # The bodies are cut out of the stored block at the byte level (every
+    # other byte is as served; only the `sp` key/value and the owning txn
+    # map's entry count change) and counted in
+    # `meta.stripped_state_proof_bodies` (the test pins the count). The block's
+    # payset commitments (`txn`/`txn256`) therefore no longer match the
+    # stored payset; Execute-mode replay never recomputes them.
+    blk_bytes, stripped_sp = strip_state_proof_bodies(blk_bytes)
+    block = unpack(blk_bytes)["block"]
     dr = delta(r)
     d_prev = delta(r - 1)
 

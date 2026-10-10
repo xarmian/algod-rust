@@ -133,7 +133,14 @@ pub fn apply_state_proof<L: LedgerStore>(
             ))
         })?;
     // go reads the cow's value, which an earlier state proof of the same
-    // block may already have advanced (issue #1791).
+    // block may already have advanced (issue #1791). The cell is lazy: the
+    // first state proof of a block seeds it from the previous header just
+    // read, with the same initialization `apply`'s end-of-block check uses.
+    //
+    // A context is never reused across blocks or simulated groups with a
+    // stale advanced cell: `apply` builds one per block, and the simulator
+    // (`simulation/mod.rs`, one `ApplyContext` per `simulate` call)
+    // starts every group at 0 and drops the context afterwards.
     let next_state_proof_rnd = match ctx.state_proof_next.get() {
         0 => {
             let prev_next =
