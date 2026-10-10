@@ -1,0 +1,87 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: Agreement Multi-node (release)
+
+# Issue #1752 (epic #1680): the real-thread multi-node agreement binary
+# `crates/core/algo-agreement/tests/service_multi_node_test.rs` (real Service +
+# threads + simulated network) is excluded from the PR-level Unit Tests job
+# because its tests take 17+ min each in an unoptimized build on a 4-core
+# runner. Until this workflow it only ran in the daily Coverage workflow, so a
+# regression in agreement/consensus code was found a day after merge.
+#
+# This job runs just that binary in the release profile on PRs that touch the
+# code it exercises. Path-filtered on purpose (unlike unit-tests.yml): a
+# release build of the agreement dependency tree is the expensive part, and a
+# docs-only PR has nothing to gain. It is therefore not suitable as a required
+# check. Flaky-test handling lives in .config/nextest.toml (`ci` profile:
+# retries = 2 for this binary, visible as FLAKY in the summary, #1693/#1695).
+
+on:
+  pull_request:
+    paths:
+      - "crates/core/algo-agreement/**"
+      - "crates/core/algo-consensus-crypto/**"
+      - "crates/core/algo-falcon/**"
+      - "crates/core/algo-pool/**"
+      - "crates/core/algo-types/**"
+      - "crates/core/algo-validate/**"
+      - "crates/core/algo-codec/**"
+      - "crates/core/algo-error/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".config/nextest.toml"
+      - ".github/workflows/agreement-multinode.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: agreement-multinode-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  multinode:
+    name: service_multi_node_test (nextest, release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: agreement-multinode
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Run service_multi_node_test (release)
+        shell: bash
+        run: |
+          cargo nextest run --release --profile ci -p algo-agreement \
+            -E 'binary(service_multi_node_test)' 2>&1 | tee nextest.log
+
+      # Retried-then-passed tests are not failures but must not be invisible.
+      - name: Summarize flaky tests
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          {
+            echo "### Flaky tests (passed only after a retry)"
+            sed -E 's/\x1b\[[0-9;]*m//g' nextest.log | grep -E 'FLAKY|TRY [0-9]+ (FAIL|PASS)' | sort -u || true
+            echo "(none listed above means no test needed a retry)"
+          } >> "$GITHUB_STEP_SUMMARY"

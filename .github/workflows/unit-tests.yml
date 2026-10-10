@@ -72,7 +72,8 @@ jobs:
       # in an unoptimized (debug) build its tests take 17+ min each on a
       # 4-core runner (a first all-in run hit the 40 min timeout), and they
       # are load/timing-sensitive (#1693, #1695). It still runs, in release
-      # with retries, in the daily Coverage workflow (cargo llvm-cov nextest
+      # with retries, per PR (path-filtered) in agreement-multinode.yml
+      # (#1752) and daily in the Coverage workflow (cargo llvm-cov nextest
       # --workspace --release). Everything else, including the rest of
       # algo-agreement (player_real_harness_test: direct Player with real
       # VRF/OTS signing, slow but only ~4 min in debug), runs per PR.
