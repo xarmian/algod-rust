@@ -18,19 +18,45 @@ name: Agreement Multi-node (release)
 # check. Flaky-test handling lives in .config/nextest.toml (`ci` profile:
 # retries = 2 for this binary, visible as FLAKY in the summary, #1693/#1695).
 
+# The path list is algo-agreement's workspace dependency closure (normal +
+# dev, `cargo tree -p algo-agreement -e normal,dev`) plus the manifests,
+# toolchain pin and nextest config. Re-derive it if the crate gains a
+# workspace dependency. The push-to-main trigger runs the same job after
+# merge, which also populates the cache that PR runs restore.
 on:
   pull_request:
     paths:
+      - "crates/core/algo-abi/**"
       - "crates/core/algo-agreement/**"
+      - "crates/core/algo-avm/**"
+      - "crates/core/algo-codec/**"
       - "crates/core/algo-consensus-crypto/**"
+      - "crates/core/algo-error/**"
       - "crates/core/algo-falcon/**"
       - "crates/core/algo-pool/**"
       - "crates/core/algo-types/**"
       - "crates/core/algo-validate/**"
-      - "crates/core/algo-codec/**"
-      - "crates/core/algo-error/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".config/nextest.toml"
+      - ".github/workflows/agreement-multinode.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/core/algo-abi/**"
+      - "crates/core/algo-agreement/**"
+      - "crates/core/algo-avm/**"
+      - "crates/core/algo-codec/**"
+      - "crates/core/algo-consensus-crypto/**"
+      - "crates/core/algo-error/**"
+      - "crates/core/algo-falcon/**"
+      - "crates/core/algo-pool/**"
+      - "crates/core/algo-types/**"
+      - "crates/core/algo-validate/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
       - ".config/nextest.toml"
       - ".github/workflows/agreement-multinode.yml"
   workflow_dispatch:
