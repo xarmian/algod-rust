@@ -84,6 +84,19 @@ pub enum NodeError {
     #[error("{0}")]
     Timeout(String),
 
+    /// The node is temporarily unable to serve the request because it is
+    /// paused for a live catchpoint catchup (issue #1683) -- handlers map to
+    /// 503, like go's `operation not available during catchup`. Retryable;
+    /// not the caller's fault.
+    #[error("{0}")]
+    Unavailable(String),
+
+    /// The transaction pool hit a node-side fault while admitting a
+    /// submission (its block evaluator cannot be rebuilt, issue #1683) --
+    /// handlers map to 500, never to the 400 a rejected group gets.
+    #[error("{0}")]
+    PoolFault(String),
+
     /// Default trait method stub — handlers map to 500.
     #[error("{0} not implemented")]
     NotImplemented(&'static str),

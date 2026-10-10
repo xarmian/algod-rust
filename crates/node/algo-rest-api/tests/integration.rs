@@ -1019,6 +1019,10 @@ impl NodeInterface for MockNode {
     ) -> Result<(), NodeError> {
         match &self.broadcast_result {
             None => Ok(()),
+            // Issue #1683: the pool is paused for a live catchup.
+            Some(msg) if msg.starts_with("UNAVAILABLE:") => Err(NodeError::Unavailable(
+                msg.trim_start_matches("UNAVAILABLE:").to_string(),
+            )),
             Some(msg) => Err(NodeError::Internal(msg.clone())),
         }
     }
@@ -6662,6 +6666,29 @@ async fn raw_transaction_catchpoint_returns_503() {
         "error should mention catchup, got: {}",
         json["message"]
     );
+}
+
+/// Issue #1683: a submission that races a live catchup (the pool is paused)
+/// is a retryable 503, not a permanent-looking 400 "pool rejected group".
+#[tokio::test]
+async fn raw_transaction_pool_paused_for_catchup_returns_503() {
+    let mut node = MockNode::synced();
+    node.broadcast_result = Some("UNAVAILABLE:node is catching up".to_string());
+    let server = TestServer::start(node).await;
+
+    let body = encode_signed_txn_for_post(&make_test_signed_txn());
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/x-binary")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert!(json["message"].as_str().unwrap().contains("catching up"));
 }
 
 #[tokio::test]

@@ -540,7 +540,10 @@ mod tests {
         struct NoopPoolIngest;
         #[async_trait]
         impl PoolIngest for NoopPoolIngest {
-            async fn ingest(&self, _group: Vec<SignedTransaction>) -> Result<(), String> {
+            async fn ingest(
+                &self,
+                _group: Vec<SignedTransaction>,
+            ) -> Result<(), algo_network::local_tx_broadcast::PoolIngestError> {
                 Ok(())
             }
         }

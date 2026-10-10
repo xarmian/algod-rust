@@ -347,6 +347,7 @@ pub use tx_tag_handler::{
 // Pool ingest trait, adapter, and local-txn broadcast orchestrator
 pub use local_tx_broadcast::{
     encode_tx_group, LocalTxBroadcaster, LocalTxError, PoolIngest, PoolIngestAdapter,
+    PoolIngestError,
 };
 
 // ---------------------------------------------------------------------------

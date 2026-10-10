@@ -426,6 +426,11 @@ struct ParticipateAgreementControl {
     /// `catchup/universalFetcher.go`'s per-fetch `context.WithTimeout`.
     catchup_gossip_block_fetch_timeout: Duration,
     running: tokio::sync::Mutex<Option<RunningAgreementCycle>>,
+    /// Issue #1683: true only while `reload_ledger()` is executing (scoped by
+    /// a [`ReloadInFlight`] guard, so it can never stay set). A `resume()`
+    /// that runs concurrently must leave the pool to `reload_ledger`, which
+    /// unpauses it itself once the handle swap and WAL checkpoint are done.
+    reload_in_flight: std::sync::atomic::AtomicBool,
 }
 
 impl ParticipateAgreementControl {
@@ -629,6 +634,20 @@ impl ParticipateAgreementControl {
 #[async_trait::async_trait]
 impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
     async fn pause(&self) {
+        // Issue #1683: the pool's pending block evaluator keeps a ledger read
+        // snapshot (an open SQLite read transaction) alive; across the
+        // multi-minute catchpoint import that pins the tracker WAL and no
+        // checkpoint can run. Pause the pool's evaluator FIRST -- a flag, not
+        // a one-off drop, so a block the pool follower processes late (or the
+        // wake-up `reload_ledger` sends) cannot rebuild it and re-pin the WAL
+        // -- and also when no cycle was running: the evaluator outlives the
+        // agreement cycle. `pause_evaluator` takes the pool's blocking
+        // mutex (the follower holds it across a ledger read), so it runs on
+        // the blocking pool, not on this async task.
+        let pool = self.pool.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || pool.pause_evaluator()).await {
+            warn!(error = %e, "pause: pool evaluator pause task panicked");
+        }
         let mut guard = self.running.lock().await;
         if let Some(cycle) = guard.take() {
             // `ServiceHandle::shutdown`/`CatchupService::stop` join real OS
@@ -655,6 +674,20 @@ impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
     }
 
     async fn resume(&self) {
+        // Issue #1683 safety net, deliberately BEFORE the already-running
+        // early return: whatever path got us here (an aborted catchup, a
+        // failed reload, a repeated resume) the pool must never stay paused,
+        // or every admission would fail with `NodeCatchingUp` forever.
+        //
+        // Unpause and re-prime against the current handle -- unless a
+        // reload is executing right now, in which case `reload_ledger`
+        // unpauses the pool itself once the swap and checkpoint are done.
+        if !self
+            .reload_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.unpause_pool(true, true).await;
+        }
         let mut guard = self.running.lock().await;
         if guard.is_some() {
             return;
@@ -694,6 +727,7 @@ impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
     /// methods and tolerates a momentarily-locked ledger the same way it
     /// already tolerates lock contention from a normal `commit_block`.
     async fn reload_ledger(&self) {
+        let _in_flight = ReloadInFlight::enter(&self.reload_in_flight);
         let ledger_path = self.ledger_path.clone();
         let resolved_paths = self.resolved_paths.clone();
         let node_config = self.node_config.clone();
@@ -701,12 +735,16 @@ impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
             open_and_configure_participate_ledger(&ledger_path, &resolved_paths, &node_config)
         })
         .await;
+        // Only a successful reopen makes the ledger handle current; a pool
+        // evaluator must never be built against a stale one.
+        let mut reloaded = false;
         match reopened {
             Ok(Ok(fresh)) => {
                 let round = fresh.current_round().0;
                 match self.ledger.lock() {
                     Ok(mut guard) => {
                         *guard = fresh;
+                        reloaded = true;
                         info!(
                             round,
                             "reloaded ledger from disk after live catchpoint catchup"
@@ -714,7 +752,10 @@ impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
                         // Wake the pool-block-follower (and anything else
                         // waiting on this condvar) immediately rather than
                         // leaving it to discover the new round on its next
-                        // poll-interval timeout.
+                        // poll-interval timeout. The pool is still paused
+                        // (issue #1683), so the wake-up cannot rebuild its
+                        // evaluator and re-pin the WAL before the checkpoint
+                        // below has run.
                         self.round_advanced.notify_all();
                     }
                     Err(e) => {
@@ -747,10 +788,58 @@ impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
             algo_ledger::sync::SyncOrchestrator::checkpoint_wal_file(&block_path, "block");
         })
         .await;
+
+        // Issue #1683: leave the pool's paused state only now, after the
+        // checkpoint. After a successful reload, rebuild the evaluator
+        // against the fresh handle right away so admission works again
+        // without waiting for the next block. After a failed reload the old
+        // handle may already be cut over (stale), so just unpause: the first
+        // block or admission rebuilds against whichever handle is current by
+        // then, instead of priming on the stale one here.
+        if !reloaded {
+            warn!("ledger reload failed; leaving the pool unpaused but unprimed");
+        }
+        self.unpause_pool(false, reloaded).await;
+    }
+}
+
+/// RAII marker for "`reload_ledger` is executing" (see
+/// `ParticipateAgreementControl::reload_in_flight`): set on entry, cleared on
+/// drop, including on panic or early return.
+struct ReloadInFlight<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl<'a> ReloadInFlight<'a> {
+    fn enter(flag: &'a std::sync::atomic::AtomicBool) -> Self {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self(flag)
+    }
+}
+
+impl Drop for ReloadInFlight<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
 impl ParticipateAgreementControl {
+    /// Leave the pool's catchup-paused state (issue #1683), optionally
+    /// rebuilding its evaluator against the current ledger handle. With
+    /// `only_if_paused` it is a no-op for a pool that is not paused. Runs on
+    /// the blocking pool: the pool follower can hold the pool mutex across a
+    /// ledger read.
+    async fn unpause_pool(&self, only_if_paused: bool, prime: bool) {
+        let pool = self.pool.clone();
+        let done = tokio::task::spawn_blocking(move || {
+            if !only_if_paused || pool.is_evaluator_paused() {
+                pool.resume_evaluator(prime);
+            }
+        })
+        .await;
+        if let Err(e) = done {
+            warn!(error = %e, "pool resume task panicked");
+        }
+    }
+
     /// A cheap `Arc`-cloning "clone" of the fields `build_cycle` needs, so
     /// `resume` can move a self-contained value into `spawn_blocking`
     /// without requiring `ParticipateAgreementControl` itself (which holds
@@ -781,6 +870,7 @@ impl ParticipateAgreementControl {
             catchup_parallel_blocks: self.catchup_parallel_blocks,
             catchup_gossip_block_fetch_timeout: self.catchup_gossip_block_fetch_timeout,
             running: tokio::sync::Mutex::new(None),
+            reload_in_flight: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -3328,6 +3418,12 @@ impl PoolLedgerAdapter {
         // Snapshot the committed state at the previous round — evaluation reads
         // balances as of the block we build on. This briefly acquires the mutex,
         // captures lease state, then releases.
+        // The first account read below (the rewards-pool balance) is what
+        // turns the snapshot's deferred `BEGIN` into a real WAL read mark, so
+        // from here until this evaluator is dropped the tracker WAL cannot be
+        // reset. `ParticipateAgreementControl::pause` therefore pauses the
+        // pool (dropping its evaluator) for the length of a live catchup
+        // (issue #1683).
         let mut snapshot = LedgerSnapshot::from_ledger(&self.ledger, hdr.round.0);
 
         // Advance the header to the next round, mirroring go's
@@ -5930,6 +6026,7 @@ pub async fn run(
             node_config.catchup_gossip_block_fetch_timeout_sec.max(0) as u64,
         ),
         running: tokio::sync::Mutex::new(None),
+        reload_in_flight: std::sync::atomic::AtomicBool::new(false),
     });
 
     // Live catchpoint-catchup mode (issue #940): only meaningful with a REST
@@ -12016,26 +12113,43 @@ mod tests {
     /// wiring, except the network stays offline (no listener bound, no
     /// peers dialed) since these tests only exercise the agreement
     /// `Service`'s own start/stop lifecycle, not wire traffic.
-    fn test_agreement_control() -> (ParticipateAgreementControl, PathBuf) {
+    pub(super) fn test_agreement_control() -> (ParticipateAgreementControl, PathBuf) {
+        test_agreement_control_with(|_prefix| {
+            let ledger = test_ledger();
+            let pool = Arc::new(TransactionPool::new(
+                PoolConfig::default(),
+                Arc::new(PoolLedgerAdapter::new(ledger.clone()))
+                    as Arc<dyn algo_pool::traits::PoolLedger>,
+            ));
+            (ledger, pool)
+        })
+    }
+
+    /// [`test_agreement_control`] with the ledger and pool supplied by
+    /// `make`, which receives the ledger prefix inside the temp directory.
+    pub(super) fn test_agreement_control_with(
+        make: impl FnOnce(&Path) -> (Arc<Mutex<SqliteLedger>>, Arc<TransactionPool>),
+    ) -> (ParticipateAgreementControl, PathBuf) {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or_default();
         let tmp_dir = std::env::temp_dir().join(format!(
-            "algod-rust-agreement-control-test-{}-{}",
+            "algod-rust-agreement-control-test-{}-{}-{}",
             std::process::id(),
             nonce,
+            // Parallel tests can read the same clock tick (Windows clock
+            // granularity), so add a process-wide sequence number.
+            {
+                static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
         ));
         std::fs::create_dir_all(&tmp_dir).expect("create tmp dir");
         let ledger_path = tmp_dir.join("ledger");
         let partkey_path = tmp_dir.join("partkeys.sqlite");
 
-        let ledger = test_ledger();
-        let pool = Arc::new(TransactionPool::new(
-            PoolConfig::default(),
-            Arc::new(PoolLedgerAdapter::new(ledger.clone()))
-                as Arc<dyn algo_pool::traits::PoolLedger>,
-        ));
+        let (ledger, pool) = make(&ledger_path);
         let phonebook = Arc::new(Phonebook::new(0, Duration::from_secs(60)));
         let gossip_node = Arc::new(WebsocketNetwork::new(
             WebsocketNetworkConfig::default(),
@@ -12073,6 +12187,7 @@ mod tests {
             catchup_parallel_blocks: 4,
             catchup_gossip_block_fetch_timeout: Duration::from_secs(4),
             running: tokio::sync::Mutex::new(None),
+            reload_in_flight: std::sync::atomic::AtomicBool::new(false),
         };
         (control, tmp_dir)
     }
@@ -12165,3 +12280,7 @@ mod tests {
 #[cfg(test)]
 #[path = "participate_exec_tests.rs"]
 mod exec_admission_tests;
+
+#[cfg(test)]
+#[path = "participate_wal_pin_tests.rs"]
+mod wal_pin_tests;

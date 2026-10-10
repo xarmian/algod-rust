@@ -2695,12 +2695,10 @@ pub async fn raw_transaction<N: NodeInterface>(
         // carries structured pc/group-index/app-index/eval-states
         // diagnostics (issue #1135) -- surface them in `ErrorResponse.data`,
         // matching go's `returnError()` copying `basics.SError.Attrs`.
-        return match e {
-            NodeError::BadRequestWithDetail(msg, detail) => {
-                error::bad_request_with_detail(msg, &detail)
-            }
-            e => error::bad_request(e.to_string()),
-        };
+        // The one shared mapping also turns a pool paused for a live
+        // catchup (issue #1683), which can begin between the status check
+        // above and the broadcast, into a retryable 503.
+        return error::broadcast_error_response(e, false);
     }
 
     // Return txid of first transaction (for backwards compatibility)
@@ -4863,7 +4861,8 @@ pub async fn raw_transaction_async<N: NodeInterface>(
     }
 
     if let Err(e) = node.async_broadcast_signed_tx_group(txgroup).await {
-        return error::service_unavailable(e.to_string());
+        // go: `serviceUnavailable` for every error; shared mapping.
+        return error::broadcast_error_response(e, true);
     }
 
     StatusCode::OK.into_response()
