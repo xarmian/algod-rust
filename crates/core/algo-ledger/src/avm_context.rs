@@ -6370,11 +6370,10 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     fn itxn_submit(&mut self) -> Result<(), AlgoError> {
         // go clears `innerTxidCache` once a submit finishes; clearing again
         // on entry means no error/early-return path can ever leave a stale
-        // group's ids behind for the next submit's reads. Not observable as a
-        // divergence from go: nothing reads this cache while the submit runs
-        // (child programs have their own contexts), and both go and the
-        // clear at the end of this function empty it before any read after
-        // the submit; an erroring submit aborts the whole call.
+        // group's ids behind for the next submit's reads. Defence in depth, not a
+        // behaviour difference: nothing reads this cache while a submit runs
+        // (child programs have their own contexts) and the clear at the end
+        // of a successful submit already empties it before any later read.
         self.inner_txid_cache.borrow_mut().clear();
         if self.inner_building.is_empty() {
             return Err(AlgoError::Avm {
