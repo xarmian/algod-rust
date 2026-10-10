@@ -124,6 +124,19 @@ else
     echo "==> reusing existing netroot/ (run stop.sh to reset)"
 fi
 
+# Issue #1782 (follow-up of #1777): P2PINTEROP_GO_ARCHIVAL=1 sets Archival=true
+# on the three Go nodes AND the Rust node (below) so a long P2P soak can still
+# be verified after the fact; the default keeps go-algorand's non-archival
+# ~1001-block pruning. Mirrors PHASE6_GO_ARCHIVAL in ops/mixed-cluster. The key
+# is written explicitly either way, so a netroot reused across runs cannot
+# carry a stale value.
+GO_ARCHIVAL=false
+RUST_ARCHIVAL=0
+if [ "${P2PINTEROP_GO_ARCHIVAL:-0}" = "1" ]; then
+    GO_ARCHIVAL=true
+    RUST_ARCHIVAL=1
+fi
+
 # -- 2. Patch each node's config.json for plain P2P mode ------------------
 #
 # NetAddress is bound to each node's *static* docker-network IP (see the
@@ -138,19 +151,6 @@ fi
 # `PutProviderAddrs`: "no known addresses for self, cannot put provider").
 # Binding to the specific static IP keeps `needAddressFilter` false so the
 # real, routable-within-this-network address is advertised instead.
-# Issue #1782 (follow-up of #1777): P2PINTEROP_GO_ARCHIVAL=1 sets Archival=true
-# on the three Go nodes AND the Rust node (below) so a long P2P soak can still
-# be verified after the fact; the default keeps go-algorand's non-archival
-# ~1001-block pruning. Mirrors PHASE6_GO_ARCHIVAL in ops/mixed-cluster. The key
-# is written explicitly either way, so a netroot reused across runs cannot
-# carry a stale value.
-GO_ARCHIVAL=false
-RUST_ARCHIVAL=0
-if [ "${P2PINTEROP_GO_ARCHIVAL:-0}" = "1" ]; then
-    GO_ARCHIVAL=true
-    RUST_ARCHIVAL=1
-fi
-
 patch_p2p_config() {
     local node_dir="$1" p2p_port="$2" net_address="$3"
     local node_host_path

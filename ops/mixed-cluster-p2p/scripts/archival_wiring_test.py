@@ -46,12 +46,16 @@ class ArchivalWiringTest(unittest.TestCase):
         self.assertIn("probe_earliest_container", v)
         self.assertIn("resolve_cert_window", v)
         # The cert pass starts at the derived round, not the raw FROM_ROUND.
-        cert_call = v[v.index('"$CERT_BIN" \\'):]
-        cert_call = cert_call[: cert_call.index("cert_rc=$?")]
+        start = v.find('"$CERT_BIN" ' + chr(92) + chr(10))
+        end = v.find("cert_rc=$?", start)
+        self.assertTrue(0 <= start < end, "cert-crossverify invocation not found")
+        cert_call = v[start:end]
         self.assertIn('--from-round "$CERT_FROM"', cert_call)
         self.assertNotRegex(cert_call, r'--from-round "\$FROM_ROUND"')
         # The fork detector keeps covering the whole range.
         self.assertRegex(v, r'--from-round "\$FROM_ROUND"')
+        # The --cert-ledger override branch feeds the earliest-round probe.
+        self.assertRegex(v, r'BLOCK_PATH="\$\{CERT_PREFIX_CANDIDATE\}\.block\.sqlite"')
 
     def test_runbook_documents_the_knob(self):
         with open(os.path.join(HERE, "..", "..", "..", "docs", "MIXED_CLUSTER_RUNBOOK.md"), encoding="utf-8") as f:
