@@ -138,6 +138,19 @@ fi
 # `PutProviderAddrs`: "no known addresses for self, cannot put provider").
 # Binding to the specific static IP keeps `needAddressFilter` false so the
 # real, routable-within-this-network address is advertised instead.
+# Issue #1782 (follow-up of #1777): P2PINTEROP_GO_ARCHIVAL=1 sets Archival=true
+# on the three Go nodes AND the Rust node (below) so a long P2P soak can still
+# be verified after the fact; the default keeps go-algorand's non-archival
+# ~1001-block pruning. Mirrors PHASE6_GO_ARCHIVAL in ops/mixed-cluster. The key
+# is written explicitly either way, so a netroot reused across runs cannot
+# carry a stale value.
+GO_ARCHIVAL=false
+RUST_ARCHIVAL=0
+if [ "${P2PINTEROP_GO_ARCHIVAL:-0}" = "1" ]; then
+    GO_ARCHIVAL=true
+    RUST_ARCHIVAL=1
+fi
+
 patch_p2p_config() {
     local node_dir="$1" p2p_port="$2" net_address="$3"
     local node_host_path
@@ -148,7 +161,8 @@ patch_p2p_config() {
         "IncomingConnectionsLimit=100" \
         "EndpointAddress=0.0.0.0:8080" \
         "DNSBootstrapID=" \
-        "EnableDHTProviders=true"
+        "EnableDHTProviders=true" \
+        "Archival=${GO_ARCHIVAL}"
     do
         MSYS_NO_PATHCONV=1 docker run --rm \
             -v "$node_host_path:/algod/data" \
@@ -305,6 +319,21 @@ echo "==> genesis hash: $GENESIS_HASH"
 mkdir -p "$RUST_DATA_DIR"
 printf '%s' "$ALGOD_TOKEN" > "$RUST_DATA_DIR/algod.token"
 printf '%s' "$ALGOD_TOKEN" > "$RUST_DATA_DIR/algod.admin.token"
+
+# Rust node: set (P2PINTEROP_GO_ARCHIVAL=1) or CLEAR `Archival` in its
+# config.json on every start (same helper as ops/mixed-cluster/scripts/start.sh,
+# issue #1777; algod-rust honours Archival exactly like go).
+if [ "$RUST_ARCHIVAL" = "1" ]; then
+    echo "==> enabling Archival on rust-node-4 (P2PINTEROP_GO_ARCHIVAL=1)"
+fi
+if [ -f "$RUST_DATA_DIR/config.json" ] || [ "$RUST_ARCHIVAL" = "1" ]; then
+    EXISTING_CFG="{}"
+    [ -f "$RUST_DATA_DIR/config.json" ] && EXISTING_CFG="$(cat "$RUST_DATA_DIR/config.json")"
+    printf '%s' "$EXISTING_CFG" \
+        | python3 "$ROOT/../mixed-cluster/scripts/rust_config_merge.py" - "$RUST_ARCHIVAL" \
+        | tr -d '\r' > "$RUST_DATA_DIR/config.json.new"
+    mv "$RUST_DATA_DIR/config.json.new" "$RUST_DATA_DIR/config.json"
+fi
 
 export P2PINTEROP_GENESIS_ID="$GENESIS_ID"
 export P2PINTEROP_GENESIS_HASH="$GENESIS_HASH"

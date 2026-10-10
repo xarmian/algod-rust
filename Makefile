@@ -791,6 +791,7 @@ consensus-cluster-analyzer: ## Unit-test the #470 soak-analyzer logic (no Docker
 	python3 $(PHASE6_CLUSTER)/scripts/cert_window_test.py
 	python3 $(PHASE6_CLUSTER)/scripts/rust_config_merge_test.py
 	bash $(PHASE6_CLUSTER)/scripts/cert_window_shell_test.sh
+	python3 ops/mixed-cluster-p2p/scripts/archival_wiring_test.py
 
 ## ops/mixed-cluster-p2p harness (issues #543, #560, #564, #589) — three
 ## real go-algorand v5.0.2-stable nodes in plain P2P mode, chain-bootstrapped
