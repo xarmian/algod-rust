@@ -56,6 +56,9 @@ Full Rust reimplementation of go-algorand — a production-grade Algorand node. 
   "rebalanced from team B"), then claim it. Never take an `in-progress`
   issue; if a stale `in-progress` has no recent branch/PR activity for 12 h,
   comment on it, then reclaim.
+- **Every PR carries its team label** (`team:a` / `team:b`, the team that
+  owns the issue it fixes) in addition to the usual domain/kind labels —
+  pass `--label team:x` to `gh pr create`.
 - New issues filed by a team get that team's label (or the label of the
   area they belong to) at creation.
 - **Conflict hygiene**: keep PRs small; rebase on `origin/main` right before
