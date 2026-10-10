@@ -141,6 +141,13 @@ def genesis_funder(genesis_path: str):
     return None
 
 
+# Minimum spendable balance every actor is topped back up to before each
+# scenario, the largest `pay` amount, and the fee headroom a pay keeps back.
+ACTOR_FLOOR = 25_000_000
+PAY_MAX = 5_000_000
+PAY_FEE_HEADROOM = 1_000
+
+
 class ScenarioAbort(Exception):
     """A scenario cannot continue (a prerequisite step failed)."""
 
@@ -391,6 +398,16 @@ class Workload:
         if spendable < minimum:
             self.fund(addr, minimum - spendable + 1000000)
 
+    def spendable(self, addr):
+        info = self.account_info(addr)
+        return int(info["amount"]) - int(info.get("min-balance", 0))
+
+    def top_up_actors(self):
+        """Refill every scenario actor below ACTOR_FLOOR from the funder, so a
+        long run never exhausts them (issue #1792)."""
+        for addr in self.actors.values():
+            self.ensure_balance(addr, ACTOR_FLOOR)
+
     def newest_created(self, addr, key, idkey):
         info = self.account_info(addr)
         ids = [int(x[idkey]) for x in info.get(key, [])]
@@ -454,7 +471,12 @@ class Workload:
 
     def sc_pay(self):
         a, b = self.rng.sample(sorted(self.actors), 2)
-        amt = self.rng.randint(1, 5000000)
+        self.ensure_balance(self.actors[a], PAY_MAX + PAY_FEE_HEADROOM)
+        room = self.spendable(self.actors[a]) - PAY_FEE_HEADROOM
+        if room < 1:
+            raise ScenarioAbort(
+                "workload planning error: {} has no spendable balance for a pay even after top-up".format(a))
+        amt = self.rng.randint(1, min(PAY_MAX, room))
         self.run("pay", "clerk send -f {} -t {} -a {}".format(self.actors[a], self.actors[b], amt), must=True)
         if self.rng.random() < 0.5:
             self.run(
@@ -786,6 +808,7 @@ class Workload:
             self.scenario = name
             self.scenario_counts[name] = self.scenario_counts.get(name, 0) + 1
             try:
+                self.top_up_actors()
                 Workload.SCENARIOS[name](self)
             except StopRequested:
                 break
