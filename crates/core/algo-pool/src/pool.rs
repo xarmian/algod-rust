@@ -106,7 +106,8 @@ struct PoolInner {
     reprime_on_demand: bool,
 
     /// Committed-txid sets of the blocks that arrived while paused (bounded to
-    /// [`MAX_PAUSED_BLOCKS`]); merged into the next recompute so groups those
+    /// [`MAX_PAUSED_BLOCKS`]), reduced to the txids matching a pending or
+    /// remembered transaction; merged into the next recompute so groups those
     /// blocks confirmed are recorded as confirmed, not re-evaluated into an
     /// error.
     paused_committed: VecDeque<HashSet<Digest>>,
@@ -960,7 +961,34 @@ impl TransactionPool {
                         "paused pool: committed-txid buffer full, evicting the oldest block's set"
                     );
                 }
-                inner.paused_committed.push_back(committed_txids.clone());
+                // Keep only txids that match a pending/remembered txn: those
+                // are all the rebuild consults (issue #1793). Admission
+                // rechecks `evaluator_paused` under `mu` (`ingest`, `test`),
+                // so no group can enter pending meanwhile. Iterate whichever
+                // side is smaller; the pending set is usually the small one.
+                let relevant: HashSet<Digest> = {
+                    let pending = self.pending_mu.read();
+                    let n = pending.txids.len() + inner.remembered_txids.len();
+                    if n < committed_txids.len() {
+                        pending
+                            .txids
+                            .keys()
+                            .chain(inner.remembered_txids.keys())
+                            .filter(|id| committed_txids.contains(*id))
+                            .copied()
+                            .collect()
+                    } else {
+                        committed_txids
+                            .iter()
+                            .filter(|id| {
+                                pending.txids.contains_key(*id)
+                                    || inner.remembered_txids.contains_key(*id)
+                            })
+                            .copied()
+                            .collect()
+                    }
+                };
+                inner.paused_committed.push_back(relevant);
             }
             self.cond.notify_all();
             return;
@@ -1789,6 +1817,29 @@ mod tests {
         assert!(found, "the status cache remembers the txid");
         assert!(err.is_empty(), "confirmed marker, not an error: {err:?}");
         assert_eq!(pool.pending_count(), 0, "confirmed group left the pool");
+    }
+
+    /// Issue #1793: the paused buffer keeps only txids matching a pending
+    /// transaction, so its size scales with pending groups, not block size.
+    #[test]
+    fn paused_buffer_keeps_only_txids_matching_pending() {
+        let pool = make_pool_with_evaluator(10);
+        let stx = make_test_txn(3);
+        let txid = compute_txn_id(&stx.txn);
+        pool.remember(vec![stx]).unwrap();
+
+        pool.pause_evaluator();
+        let mut committed: HashSet<Digest> = [txid].into_iter().collect();
+        for i in 100..200u8 {
+            committed.insert(compute_txn_id(&make_test_txn(i).txn));
+        }
+        pool.on_new_block(&block_at(5), &committed);
+        let kept = pool.mu.lock().paused_committed.back().cloned().unwrap();
+        assert_eq!(kept, [txid].into_iter().collect::<HashSet<_>>());
+
+        pool.resume_evaluator(true);
+        let (_, err, found) = pool.lookup(&txid);
+        assert!(found && err.is_empty(), "still confirmed: {err:?}");
     }
 
     /// If the rebuild on resume fails, the recorded committed sets are kept
