@@ -2341,8 +2341,11 @@ pub struct SqliteLedger {
     pending_online_touched: std::collections::HashSet<Address>,
 
     /// `(round, rewards_level)` of the last COMMITTED block header consulted by
-    /// [`Self::rewards_level_at`]. One lock guards the pair, so a reader never
-    /// sees a round with another round's level; see [`RewardsLevelCache`].
+    /// [`Self::rewards_level_at`]. The pair is a single `Cell` value read and
+    /// written as a unit, so a reader never sees a round with another round's
+    /// level; `Cell` is not `Sync`, so the compiler keeps the ledger
+    /// single-writer (it is used behind its owner's mutex, never shared across
+    /// threads). See [`RewardsLevelCache`].
     rewards_cache: RewardsLevelCache,
 
     /// Automatic interval-driven catchpoint generation config (issue
