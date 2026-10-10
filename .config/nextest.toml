@@ -32,6 +32,8 @@ slow-timeout = { period = "60s", terminate-after = 20 }
 filter = 'binary(service_multi_node_test) | test(/lookback_prefetch::/)'
 retries = 2
 
-# NOTE: the PR workflow EXCLUDES the `service_multi_node_test` binary (via a
-# `-E` filter on the command line, see .github/workflows/unit-tests.yml and
-# issue #1752); it still runs in the daily Coverage workflow.
+# NOTE: the PR Unit Tests workflow EXCLUDES the `service_multi_node_test`
+# binary (via a `-E` filter on the command line, see
+# .github/workflows/unit-tests.yml); it runs in release on PRs touching the
+# agreement/consensus crates via .github/workflows/agreement-multinode.yml
+# (issue #1752) and in the daily Coverage workflow.
