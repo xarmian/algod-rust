@@ -962,18 +962,31 @@ impl TransactionPool {
                     );
                 }
                 // Keep only txids that match a pending/remembered txn: those
-                // are all the rebuild consults (issue #1793). No group can be
-                // admitted while paused, so nothing else can ever match.
+                // are all the rebuild consults (issue #1793). Admission
+                // rechecks `evaluator_paused` under `mu` (`ingest`, `test`),
+                // so no group can enter pending meanwhile. Iterate whichever
+                // side is smaller; the pending set is usually the small one.
                 let relevant: HashSet<Digest> = {
                     let pending = self.pending_mu.read();
-                    committed_txids
-                        .iter()
-                        .filter(|id| {
-                            pending.txids.contains_key(*id)
-                                || inner.remembered_txids.contains_key(*id)
-                        })
-                        .copied()
-                        .collect()
+                    let n = pending.txids.len() + inner.remembered_txids.len();
+                    if n < committed_txids.len() {
+                        pending
+                            .txids
+                            .keys()
+                            .chain(inner.remembered_txids.keys())
+                            .filter(|id| committed_txids.contains(*id))
+                            .copied()
+                            .collect()
+                    } else {
+                        committed_txids
+                            .iter()
+                            .filter(|id| {
+                                pending.txids.contains_key(*id)
+                                    || inner.remembered_txids.contains_key(*id)
+                            })
+                            .copied()
+                            .collect()
+                    }
                 };
                 inner.paused_committed.push_back(relevant);
             }
