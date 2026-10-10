@@ -6946,16 +6946,19 @@ mod tests {
         let absent_addr = Address([9u8; 32]);
         {
             let mut l = ledger.lock().expect("ledger lock");
-            l.set_account(
-                &absent_addr,
-                AccountData {
-                    micro_algos: 5_000_000,
-                    status: AccountStatus::Online,
-                    incentive_eligible: true,
-                    last_heartbeat: 1,
-                    ..AccountData::default()
-                },
-            );
+            let acct = AccountData {
+                micro_algos: 5_000_000,
+                status: AccountStatus::Online,
+                incentive_eligible: true,
+                last_heartbeat: 1,
+                vote_id: Some([1u8; 32]),
+                vote_last_valid: 1_000_000,
+                ..AccountData::default()
+            };
+            l.set_account(&absent_addr, acct.clone());
+            // Online at the balance round (go's `LookupAgreement` history).
+            l.put_online_account_at_round(&absent_addr, 0, &acct)
+                .expect("seed online history");
         }
 
         let adapter = PoolLedgerAdapter::new(ledger.clone());
@@ -7024,6 +7027,8 @@ mod tests {
                     status: AccountStatus::Online,
                     incentive_eligible: true,
                     last_heartbeat: 100,
+                    vote_id: Some([1u8; 32]),
+                    vote_last_valid: 1_000_000,
                     ..AccountData::default()
                 },
             );

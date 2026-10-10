@@ -1869,12 +1869,18 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
     }
 
     // One scan of the online set; the payset's touched accounts overwrite the
-    // base data with their end-of-block state (go: `mods.Accts.GetData`).
+    // base data with their end-of-block state (go: `mods.Accts.GetData`). Like
+    // go, the online set is only a candidate source while suspensions are
+    // enabled (`if maxSuspensions > 0 { GetKnockOfflineCandidates }`);
+    // otherwise only the modified accounts are considered, and the scan is
+    // skipped.
     let mut index: std::collections::HashMap<Address, usize> = std::collections::HashMap::new();
     let mut candidates: Vec<(Address, algo_types::AccountData)> = Vec::new();
-    for (addr, acct) in store.online_accounts() {
-        index.insert(addr, candidates.len());
-        candidates.push((addr, acct));
+    if max_absent > 0 {
+        for (addr, acct) in store.online_accounts() {
+            index.insert(addr, candidates.len());
+            candidates.push((addr, acct));
+        }
     }
     for addr in touched {
         if addr.is_zero() {
@@ -1919,6 +1925,9 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
     let rewards_level = store.rewards_level();
 
     for (addr, acct) in candidates {
+        if lists.expired.len() >= max_expired && lists.absent.len() >= max_absent {
+            break; // both lists are full
+        }
         let with_rewards =
             acct.micro_algos
                 .saturating_add(crate::rewards::compute_pending_rewards(
@@ -1940,13 +1949,21 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
             continue;
         }
         let last_seen = crate::heartbeat::last_seen(acct.last_proposed, acct.last_heartbeat);
+        // The challenge test needs no lookup, and `is_absent` is false for a
+        // never-seen account, so the (database) stake lookup is the last,
+        // rarest step.
+        if challenge.failed(&addr.0, last_seen) {
+            lists.absent.push(addr);
+            continue;
+        }
+        if last_seen == 0 {
+            continue;
+        }
         let Ok(stake) = lookback_voting_stake(store, round, consensus, &addr) else {
             tracing::error!("unable to check account for absenteeism: {addr}");
             continue;
         };
-        if is_absent(total_online_stake, stake, last_seen, round)
-            || challenge.failed(&addr.0, last_seen)
-        {
+        if is_absent(total_online_stake, stake, last_seen, round) {
             lists.absent.push(addr);
         }
     }
@@ -1955,6 +1972,12 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
 
 /// The addresses a payset's top-level transactions name: the accounts a block
 /// plausibly modified, as extra [`knock_offline_lists`] candidates.
+///
+/// This under-approximates go's `modifiedAccounts()`: accounts changed only
+/// by inner transactions or by a heartbeat's target are missing. That merely
+/// shortens the proposed expired list (an offline account with keys that only
+/// an inner transaction touched is not offered for expiry), and validators
+/// accept any valid subset, so the omission is always safe.
 pub(crate) fn payset_touched_addresses(payset: &[algo_types::SignedTransaction]) -> Vec<Address> {
     let mut out = Vec::new();
     for stx in payset {
@@ -14109,61 +14132,64 @@ return
     /// Phase 17 (e2e sweep batch 2): TestWhaleJoin / TestBigJoin /
     /// TestBigIncrease (`test/e2e-go/features/incentives/whalejoin_test.go`).
     ///
-    /// Go's regression: a same-block change to total online stake (a large
-    /// account keyreg'ing online) must be reflected in the `isAbsent`
-    /// stake-ratio denominator used to validate that very block's own
-    /// `absent_participation_accounts` list -- using a *stale* (pre-keyreg)
-    /// total would let a low-stake account get wrongly flagged "absent"
-    /// (its allowable lag computed against a too-small total) even though
-    /// the block that claims it absent also brings enough new stake online,
-    /// within the same block, to make that lag allowance far larger.
+    /// go judges absence against the balance-round LOOKBACK
+    /// (`roundCowBase.onlineStake()` = `OnlineCirculation(balanceRound, ..)`,
+    /// `lookupAgreement` at the balance round), never against stake that
+    /// changes within the block or since the lookback round. So a whale
+    /// keyreg'ing online in the very block that lists an account absent does
+    /// NOT enlarge that account's allowable lag: the block is accepted on the
+    /// strength of the lookback total, and (the other half of the e2e tests)
+    /// the whale itself, with no online row at the balance round, has stake 0
+    /// and is never absent while the lookback catches up.
     ///
-    /// This proves algod-rust's `validate_absent_online_accounts` reads the
-    /// *post-transaction* store state: `apply_block_validating` applies the
-    /// block's `payset` (including a keyreg that brings a whale online)
-    /// before running end-of-block absentee validation, so
-    /// `total_online_voting_stake` picks up the whale's stake in the very
-    /// same block it joins.
-    ///
-    /// `absent_addr`'s own stake is 5_000_000 and it was last seen 500
-    /// rounds ago:
-    /// - Computed against a *stale* total (itself alone, 5_000_000):
-    ///   ratio=1, allowable_lag = ABSENT_FACTOR(20)*1 = 20 < 500 -- would
-    ///   incorrectly accept the block's claim that it is absent.
-    /// - Computed against the *fresh* total (itself + the whale's
-    ///   ~499,999,000 stake once its same-block keyreg applies): ratio is
-    ///   ~101, allowable_lag ~= 2020 > 500 -- the account is NOT genuinely
-    ///   absent yet, so the block must be REJECTED.
-    ///
-    /// If algod-rust ever cached/staled the total (the bug these go tests
-    /// guard against), this test would wrongly pass (block accepted)
-    /// instead of failing with "is not absent".
+    /// Uses `SqliteLedger`, whose history honors the round (the in-memory
+    /// `LedgerState` double ignores it): `absent_addr` was online at the
+    /// balance round (181 for round 501) with 5_000_000, the lookback total
+    /// is 5_000_000, and it was last seen at round 1, so its lag allowance is
+    /// ABSENT_FACTOR (20) < 500: absent. A fresh (post-keyreg) total would be
+    /// ~505_000_000 and a lag of ~2020 > 500 would reject the block; go does
+    /// not, and neither may we.
     #[test]
-    fn test_absent_validation_uses_fresh_total_after_same_block_whale_keyreg() {
+    fn test_absent_validation_uses_lookback_total_not_same_block_whale_keyreg() {
+        use crate::sqlite::SqliteLedger;
+        use crate::store_trait::LedgerStore;
+
         let absent_addr = Address([11u8; 32]);
         let whale_addr = Address([12u8; 32]);
         let fee_sink = Address([3u8; 32]);
 
-        let mut state = make_state_with_accounts(
-            &[
-                (absent_addr, 5_000_000),
-                (whale_addr, 500_000_000),
-                (fee_sink, 0),
-            ],
-            fee_sink,
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let absent_acct = algo_types::AccountData {
+            micro_algos: 5_000_000,
+            status: AccountStatus::Online,
+            incentive_eligible: true,
+            last_heartbeat: 1,
+            vote_id: Some([5u8; 32]),
+            vote_last_valid: 1_000_000,
+            ..algo_types::AccountData::default()
+        };
+        ledger.set_account(&absent_addr, absent_acct.clone());
+        ledger.set_account(
+            &whale_addr,
+            algo_types::AccountData {
+                micro_algos: 500_000_000,
+                ..algo_types::AccountData::default()
+            },
         );
-        {
-            let acct = state.get_or_default_account_mut(&absent_addr);
-            acct.status = AccountStatus::Online;
-            acct.incentive_eligible = true;
-            acct.last_heartbeat = 1; // last seen at round 1
-        }
-        // whale_addr starts Offline; it only comes Online via the keyreg
-        // transaction inside this very block's payset.
-        {
-            use crate::store_trait::LedgerStore;
-            state.set_current_round(Round(500));
-        }
+        ledger.set_account(
+            &fee_sink,
+            algo_types::AccountData {
+                micro_algos: 1_000_000,
+                ..algo_types::AccountData::default()
+            },
+        );
+        ledger.set_fee_sink(fee_sink);
+        ledger.set_current_round(Round(500));
+        // Online history at the balance round, and the lookback total.
+        ledger
+            .put_online_account_at_round(&absent_addr, 0, &absent_acct)
+            .unwrap();
+        ledger.put_online_supply_at_round(181, 5_000_000).unwrap();
 
         let mut whale_keyreg = SignedTransaction::default();
         whale_keyreg.txn.txn_type = "keyreg".into();
@@ -14173,45 +14199,36 @@ return
         whale_keyreg.txn.selection_pk = Some([2u8; 32]);
         whale_keyreg.txn.state_proof_pk = Some([3u8; 64]);
         whale_keyreg.txn.vote_first = 1;
-        whale_keyreg.txn.vote_last = 1_000_000; // spans well past round 501
+        whale_keyreg.txn.vote_last = 1_000_000;
         whale_keyreg.txn.vote_key_dilution = 10;
-        whale_keyreg.txn.last_valid = Round(1_000_000); // stay alive through round 501
+        whale_keyreg.txn.last_valid = Round(1_000_000);
 
         let block = Block {
             round: Round(501),
             fee_sink,
+            fees_collected: 1_000,
+            proposer: whale_addr,
             current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
             absent_participation_accounts: Some(vec![absent_addr]),
             payset: vec![whale_keyreg],
             ..Block::default()
         };
 
-        let result = apply_block_validating(&mut state, &block);
-        assert!(
-            result.is_err(),
-            "absent_addr is NOT genuinely absent once the whale's same-block \
-             keyreg is reflected in total_online_stake -- the block's claim \
-             must be rejected, not accepted via a stale pre-keyreg total"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("is not absent"),
-            "expected 'is not absent' error (proving the fresh, post-keyreg \
-             total was used), got: {}",
-            err_msg
-        );
-
-        // Sanity check: the whale really did go online via this block's
-        // own keyreg (so the "fresh total" premise actually held).
-        let whale = state.get_account(&whale_addr).unwrap();
+        apply_block_validating(&mut ledger, &block)
+            .expect("lookback total: the account is absent whatever the whale brings online");
+        let whale = ledger.get_account(&whale_addr).unwrap();
         assert_eq!(
             whale.status,
             AccountStatus::Online,
-            "whale keyreg should have been applied before the EOB absentee check ran"
+            "the whale really did join in this block"
+        );
+        assert_eq!(
+            ledger.get_account(&absent_addr).unwrap().status,
+            AccountStatus::Offline,
+            "and the absent account was suspended"
         );
     }
 
-    // Fix #4: Gate keyreg last_heartbeat/incentive_eligible on payouts_enabled
     #[test]
     fn test_keyreg_online_payouts_disabled_no_heartbeat_or_incentive() {
         // When payouts_enabled = false (pre-v40), keyreg should NOT set

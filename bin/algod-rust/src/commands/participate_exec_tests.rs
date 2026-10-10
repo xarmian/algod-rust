@@ -1392,6 +1392,8 @@ fn absent_list_is_computed_from_the_post_payset_state() {
         status: algo_types::AccountStatus::Online,
         incentive_eligible: true,
         last_heartbeat: 1,
+        vote_id: Some([7u8; 32]),
+        vote_last_valid: 1_000_000,
         ..Default::default()
     };
     let (ledger, mut eval) = evaluator_at_99(&[
@@ -1399,6 +1401,10 @@ fn absent_list_is_computed_from_the_post_payset_state() {
         (b.0, funded(1_000_000)),
         (c.0, absent(5_000_000)),
     ]);
+    seed_online_history(
+        &ledger,
+        &[(a.0, absent(5_000_000)), (c.0, absent(5_000_000))],
+    );
     eval.transaction_group(&[pay(&a, b.0, 0, Some(b.0))])
         .expect("close the absent account out");
     let mut block = eval.generate_block(&[]).expect("generate_block");
@@ -1449,13 +1455,19 @@ fn own_participating_address_is_never_listed_absent() {
         status: algo_types::AccountStatus::Online,
         incentive_eligible: true,
         last_heartbeat: 1,
+        vote_id: Some([7u8; 32]),
+        vote_last_valid: 1_000_000,
         ..Default::default()
     };
-    let (_ledger, mut eval) = evaluator_at_99(&[
+    let (ledger, mut eval) = evaluator_at_99(&[
         (a.0, funded(50_000_000)),
         (b.0, absent(5_000_000)),
         (c.0, absent(5_000_000)),
     ]);
+    seed_online_history(
+        &ledger,
+        &[(b.0, absent(5_000_000)), (c.0, absent(5_000_000))],
+    );
     eval.transaction_group(&[pay(&a, a.0, 1, None)])
         .expect("payment");
     let block = eval.generate_block(&[b.0]).expect("generate_block");
@@ -1501,24 +1513,103 @@ fn non_empty_payset_without_a_scratch_result_gets_empty_lists() {
     assert!(block.absent_participation_accounts.is_none());
 }
 
-/// The same when the scratch apply cannot run for a non-empty payset: the
-/// proposal is retried/bisected down to an empty payset (tip lists) or keeps
-/// the evaluated prefix (its own lists), never a stale mix.
+/// Seed the history rows go would hold for accounts that were online at the
+/// balance round (round 0 for the round-100 proposals of these tests).
+fn seed_online_history(ledger: &Arc<Mutex<SqliteLedger>>, accounts: &[(Address, AccountData)]) {
+    let l = ledger.lock().unwrap();
+    for (addr, acct) in accounts {
+        l.put_online_account_at_round(addr, 0, acct).unwrap();
+    }
+}
+
+fn evaluator_at_99_limited(
+    accounts: &[(Address, AccountData)],
+    max_txn_bytes: usize,
+) -> (Arc<Mutex<SqliteLedger>>, SimpleBlockEvaluator) {
+    let mut prev = genesis_header();
+    prev.round = Round(99);
+    let (ledger, _pool) = fixture_at(accounts, &[], None, prev.clone());
+    let eval = PoolLedgerAdapter::new(ledger.clone())
+        .start_simple_evaluator(prev, 0, max_txn_bytes)
+        .expect("start_evaluator");
+    (ledger, eval)
+}
+
+/// Two groups: an unrelated payment and a close-out of the expired account
+/// `x`. The lists must describe the payset that is KEPT. Here a failure no
+/// transaction owns forces bisection (probes run without lists) down to the
+/// first group; `x` is then still online and expired, so it is listed. A list
+/// taken from the two-group state (where `x` is closed) would omit it.
 #[test]
-fn lists_always_describe_the_payset_that_was_kept() {
+fn lists_describe_the_prefix_kept_after_bisection() {
     let a = key(1);
-    let c = key(3);
+    let b = key(2);
+    let x = key(3);
     let (_ledger, mut eval) = evaluator_at_99(&[
         (a.0, funded(50_000_000)),
-        (c.0, online_with_key(5_000_000, 60)),
+        (b.0, funded(1_000_000)),
+        (x.0, online_with_key(5_000_000, 60)),
     ]);
     eval.transaction_group(&[pay(&a, a.0, 1, None)])
         .expect("payment");
+    eval.transaction_group(&[pay(&x, b.0, 0, Some(b.0))])
+        .expect("close-out");
+    test_hooks::inject_failure_over_payset_len(Some(1));
     let block = eval.generate_block(&[]).expect("generate_block");
-    assert_eq!(block.payset.len(), 1);
+    test_hooks::inject_failure_over_payset_len(None);
+    assert_eq!(block.payset.len(), 1, "only the first group is kept");
     assert_eq!(
         block.expired_participation_accounts.as_deref(),
-        Some(&[c.0][..])
+        Some(&[x.0][..]),
+        "x is not closed by the kept payset"
+    );
+}
+
+/// The oversize path: the first pass evaluates both groups (its lists omit
+/// the closed `x`), then the byte limit truncates to the first group and a
+/// rerun produces the lists the proposal carries. The stale first-pass lists
+/// must not survive into the kept payset.
+#[test]
+fn stale_first_pass_lists_do_not_survive_a_truncating_rerun() {
+    let a = key(1);
+    let b = key(2);
+    let x = key(3);
+    let accounts = [
+        (a.0, funded(50_000_000)),
+        (b.0, funded(1_000_000)),
+        (x.0, online_with_key(5_000_000, 60)),
+    ];
+    // Measure the two groups as they will be encoded with their ApplyData.
+    let (_l, mut probe) = evaluator_at_99(&accounts);
+    probe
+        .transaction_group(&[pay(&a, a.0, 1, None)])
+        .expect("payment");
+    probe
+        .transaction_group(&[pay(&x, b.0, 0, Some(b.0))])
+        .expect("close-out");
+    let full = probe.generate_block(&[]).expect("generate_block");
+    assert_eq!(full.payset.len(), 2);
+    assert_eq!(
+        full.expired_participation_accounts, None,
+        "both groups kept: x is closed, nothing to expire"
+    );
+    let sizes: Vec<usize> = full
+        .payset
+        .iter()
+        .map(SimpleBlockEvaluator::encoded_len)
+        .collect();
+
+    let (_ledger, mut eval) = evaluator_at_99_limited(&accounts, sizes[0] + sizes[1] - 1);
+    eval.transaction_group(&[pay(&a, a.0, 1, None)])
+        .expect("payment");
+    eval.transaction_group(&[pay(&x, b.0, 0, Some(b.0))])
+        .expect("close-out admitted on its pre-ApplyData size");
+    let block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(block.payset.len(), 1, "the close-out no longer fits");
+    assert_eq!(
+        block.expired_participation_accounts.as_deref(),
+        Some(&[x.0][..]),
+        "lists come from the rerun over the kept payset"
     );
 }
 
@@ -1533,27 +1624,28 @@ fn absent_list_uses_the_lookback_stake_not_the_post_payset_sum() {
     let x = key(1);
     let z = key(2);
     let b = key(3);
+    let x_acct = AccountData {
+        micro_algos: 5_000_000,
+        status: algo_types::AccountStatus::Online,
+        incentive_eligible: true,
+        last_heartbeat: 1,
+        vote_id: Some([7u8; 32]),
+        vote_last_valid: 1_000_000,
+        ..Default::default()
+    };
+    let z_acct = AccountData {
+        micro_algos: 5_000_000,
+        status: algo_types::AccountStatus::Online,
+        vote_id: Some([8u8; 32]),
+        vote_last_valid: 1_000_000,
+        ..Default::default()
+    };
     let (ledger, mut eval) = evaluator_at_99(&[
-        (
-            x.0,
-            AccountData {
-                micro_algos: 5_000_000,
-                status: algo_types::AccountStatus::Online,
-                incentive_eligible: true,
-                last_heartbeat: 1,
-                ..Default::default()
-            },
-        ),
-        (
-            z.0,
-            AccountData {
-                micro_algos: 5_000_000,
-                status: algo_types::AccountStatus::Online,
-                ..Default::default()
-            },
-        ),
+        (x.0, x_acct.clone()),
+        (z.0, z_acct.clone()),
         (b.0, funded(1_000_000)),
     ]);
+    seed_online_history(&ledger, &[(x.0, x_acct), (z.0, z_acct)]);
     ledger
         .lock()
         .unwrap()
@@ -1572,4 +1664,50 @@ fn absent_list_uses_the_lookback_stake_not_the_post_payset_sum() {
     let mut l = ledger.lock().unwrap();
     algo_ledger::apply_block_validating(&mut *l, &block)
         .expect("a proposer-built block must pass the validating apply");
+}
+
+/// go reads the account's stake at the balance round and gets an empty
+/// `OnlineAccountData` (stake 0, so never absent) for an account with no
+/// online history at or before it. An account that went online AFTER the
+/// balance round and has been quiet since must not be listed absent: go's
+/// validator would reject the block ("is not absent").
+#[test]
+fn account_that_went_online_after_the_balance_round_is_not_listed_absent() {
+    let a = key(1);
+    let x = key(2);
+    let x_acct = AccountData {
+        micro_algos: 5_000_000,
+        status: algo_types::AccountStatus::Online,
+        incentive_eligible: true,
+        last_heartbeat: 1,
+        vote_id: Some([7u8; 32]),
+        vote_last_valid: 1_000_000,
+        ..Default::default()
+    };
+    let (ledger, mut eval) = evaluator_at_99(&[(a.0, funded(50_000_000)), (x.0, x_acct.clone())]);
+    // x's only history row is at round 50, after round 100's balance round 0.
+    ledger
+        .lock()
+        .unwrap()
+        .put_online_account_at_round(&x.0, 50, &x_acct)
+        .unwrap();
+    ledger
+        .lock()
+        .unwrap()
+        .put_online_supply_at_round(0, 5_000_000)
+        .unwrap();
+    eval.transaction_group(&[pay(&a, a.0, 1, None)])
+        .expect("payment");
+    let mut block = eval.generate_block(&[]).expect("generate_block");
+    assert!(
+        block.absent_participation_accounts.is_none(),
+        "no online row at the balance round: stake 0, not absent"
+    );
+
+    // The validating apply agrees with go: listing x anyway is rejected.
+    block.proposer = a.0;
+    block.absent_participation_accounts = Some(vec![x.0]);
+    let mut l = ledger.lock().unwrap();
+    let err = algo_ledger::apply_block_validating(&mut *l, &block).unwrap_err();
+    assert!(err.to_string().contains("is not absent"), "{err}");
 }

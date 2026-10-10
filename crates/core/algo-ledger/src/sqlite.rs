@@ -5199,6 +5199,19 @@ impl SqliteLedger {
         self.prune_online_account_history_before(forget_before)
     }
 
+    /// Seed one `onlineaccounts` history row for `addr` at `round` (what the
+    /// live writer [`Self::record_online_account_history`] and catchpoint
+    /// import record). For tests and backfills that need an account to have
+    /// been online at a past round, e.g. before a balance-round lookback.
+    pub fn put_online_account_at_round(
+        &self,
+        addr: &Address,
+        round: u64,
+        account: &AccountData,
+    ) -> Result<(), AlgoError> {
+        self.insert_online_account_row(addr, round, account)
+    }
+
     /// Insert (or replace, for an idempotent re-run within the same round) a
     /// single `onlineaccounts` history row for `addr` at `round`, keeping
     /// `normalizedonlinebalance`/`votelastvalid` in sync with `account`.
@@ -7737,21 +7750,23 @@ impl LedgerStore for SqliteLedger {
 
     // ---- Balance-round-lookback online-participation queries (issue #1215) ----
 
-    /// Mirrors `AgreementLedgerBridge::lookup_agreement`'s historical
-    /// (`onlineaccounts` table) lookup with a current-account-state fallback
-    /// when no historical row exists, gated on `AccountStatus::Online` so an
-    /// offline account never leaks its raw balance/stale key material into
-    /// `voter_params_get` -- see that function's doc comment
-    /// (`agreement_bridge.rs`) for the full go-algorand rationale
-    /// (`LookupAgreement`/`basics.OnlineAccountData{}`).
+    /// go's `LookupAgreement(round, addr)`: the account's `onlineaccounts` row
+    /// at or before `round`; no row (an account that was never online by
+    /// then, e.g. went online after the balance round) is an empty
+    /// `OnlineAccountData`. Unlike `AgreementLedgerBridge::lookup_agreement`
+    /// there is deliberately NO fallback to the account's current state: the
+    /// absence checks (`generateKnockOfflineAccountsList`,
+    /// `validateAbsentOnlineAccounts`) and `voter_params_get` must agree with
+    /// go, where a late joiner has stake 0 until the lookback passes it.
+    /// Gated on `AccountStatus::Online` (a zero marker row means offline).
     fn voter_agreement_data_at_round(
         &self,
         round: u64,
         addr: &Address,
     ) -> Result<VoterAgreementData, AlgoError> {
-        let acct = match self.get_online_account_at_round(addr, round) {
-            Ok(Some(acct)) => acct,
-            Ok(None) | Err(_) => self.get_account(addr).unwrap_or_default(),
+        let acct = match self.get_online_account_at_round(addr, round)? {
+            Some(acct) => acct,
+            None => return Ok(VoterAgreementData::default()),
         };
         if acct.status != AccountStatus::Online {
             return Ok(VoterAgreementData::default());
@@ -14623,8 +14638,17 @@ mod tests {
             status: AccountStatus::Online,
             incentive_eligible: true,
             last_heartbeat,
+            vote_id: Some([7u8; 32]),
+            vote_last_valid: 1_000_000,
             ..AccountData::default()
         }
+    }
+
+    /// Set `acct` and seed the `onlineaccounts` row go would hold for it at
+    /// the balance round (0 for the round-101 queries below).
+    fn set_online(ledger: &mut SqliteLedger, addr: &Address, acct: AccountData) {
+        ledger.set_account(addr, acct.clone());
+        ledger.put_online_account_at_round(addr, 0, &acct).unwrap();
     }
 
     fn keyed_acct(status: AccountStatus, vote_last_valid: u64) -> AccountData {
@@ -14641,7 +14665,7 @@ mod tests {
     fn absent_candidates_includes_genuinely_absent_online_account() {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
         let addr = Address([9u8; 32]);
-        ledger.set_account(&addr, absent_acct(1));
+        set_online(&mut ledger, &addr, absent_acct(1));
 
         // Single online account: the lookback total equals its own stake, so
         // is_absent's allowable_lag is exactly ABSENT_FACTOR (20).
@@ -14650,10 +14674,33 @@ mod tests {
         assert_eq!(l.absent, vec![addr]);
     }
 
+    /// go's `LookupAgreement(balanceRound, addr)` has no row for an account
+    /// that went online after the balance round: stake 0, never absent.
+    #[test]
+    fn absent_candidates_ignore_an_account_that_went_online_after_the_balance_round() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([9u8; 32]);
+        let acct = absent_acct(1);
+        ledger.set_account(&addr, acct.clone());
+        // Its only history row is at round 50; round 101's balance round is 0.
+        ledger
+            .put_online_account_at_round(&addr, 50, &acct)
+            .unwrap();
+        ledger.put_online_supply_at_round(0, 5_000_000).unwrap();
+
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
+        assert!(l.absent.is_empty());
+        assert_eq!(
+            ledger.voter_agreement_data_at_round(0, &addr).unwrap(),
+            crate::store_trait::VoterAgreementData::default(),
+            "no row at or before the round: empty OnlineAccountData"
+        );
+    }
+
     #[test]
     fn absent_candidates_excludes_recently_seen_account() {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
-        ledger.set_account(&Address([9u8; 32]), absent_acct(100));
+        set_online(&mut ledger, &Address([9u8; 32]), absent_acct(100));
         // Lookback total = the account's own stake, so the lag is 20.
         ledger.put_online_supply_at_round(0, 5_000_000).unwrap();
 
@@ -14666,7 +14713,7 @@ mod tests {
     fn absent_candidates_excludes_addresses_in_exclude_set() {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
         let addr = Address([9u8; 32]);
-        ledger.set_account(&addr, absent_acct(1));
+        set_online(&mut ledger, &addr, absent_acct(1));
 
         let exclude: std::collections::HashSet<Address> = [addr].into_iter().collect();
         let l = lists(&ledger, 101, &consensus_v41(), &exclude, &[]);
@@ -14682,7 +14729,7 @@ mod tests {
         let mut consensus = consensus_v41();
         consensus.payouts_max_mark_absent = 1;
         for i in 0..3u8 {
-            ledger.set_account(&Address([i + 1; 32]), absent_acct(1));
+            set_online(&mut ledger, &Address([i + 1; 32]), absent_acct(1));
         }
 
         let l = lists(&ledger, 101, &consensus, &Default::default(), &[]);
@@ -14695,7 +14742,7 @@ mod tests {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
         let mut consensus = consensus_v41();
         consensus.payouts_max_mark_absent = 0;
-        ledger.set_account(&Address([9u8; 32]), absent_acct(1));
+        set_online(&mut ledger, &Address([9u8; 32]), absent_acct(1));
 
         let l = lists(&ledger, 101, &consensus, &Default::default(), &[]);
         assert!(l.absent.is_empty());
@@ -14749,6 +14796,23 @@ mod tests {
         assert_eq!(l.expired, vec![addr], "touched offline account with keys");
     }
 
+    /// go reads the online set (`GetKnockOfflineCandidates`) only while
+    /// suspensions are enabled; with `MaxMarkAbsent == 0` just the modified
+    /// accounts are candidates, so an untouched expired account is not listed.
+    #[test]
+    fn online_scan_is_skipped_when_suspensions_are_disabled() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let mut consensus = consensus_v41();
+        consensus.payouts_max_mark_absent = 0;
+        let untouched = Address([1u8; 32]);
+        let touched = Address([2u8; 32]);
+        ledger.set_account(&untouched, keyed_acct(AccountStatus::Online, 50));
+        ledger.set_account(&touched, keyed_acct(AccountStatus::Online, 50));
+
+        let l = lists(&ledger, 101, &consensus, &Default::default(), &[touched]);
+        assert_eq!(l.expired, vec![touched]);
+    }
+
     #[test]
     fn candidates_skip_zero_balance_accounts() {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
@@ -14769,7 +14833,7 @@ mod tests {
     fn absent_candidates_use_the_balance_round_lookback_total() {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
         let addr = Address([9u8; 32]);
-        ledger.set_account(&addr, absent_acct(1));
+        set_online(&mut ledger, &addr, absent_acct(1));
         // Round 101's balance round is 0 (saturating): seed that snapshot.
         ledger.put_online_supply_at_round(0, 5_000_000).unwrap();
         let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
