@@ -964,3 +964,74 @@ fn evaluator_without_exec_state_refuses_a_state_proof_payset() {
         1024
     );
 }
+
+// ---- #1794: the proposal header carries the ProposerPayout ----
+
+/// go `proposerPayout`: `min(Percent% of FeesCollected + Bonus, sink available)`.
+fn expected_payout(fees: u64, bonus: u64, sink_balance: u64, percent: u64) -> u64 {
+    let total = fees * percent / 100 + bonus;
+    total.min(sink_balance.saturating_sub(100_000))
+}
+
+/// A proposal built while payouts are enabled carries the payout go's
+/// `endOfBlock` would set (`ledger/eval/eval.go`: `eval.block.BlockHeader
+/// .ProposerPayout, err = eval.proposerPayout()`): the payouts percent of the
+/// fees the payset collected plus the header bonus, bounded by the fee sink's
+/// available balance after the payset. Before #1794 the header kept the
+/// template's 0, so Rust proposers never applied their payout.
+#[test]
+fn proposal_header_carries_the_proposer_payout() {
+    let a = key(1);
+    let b = key(2);
+    let (_ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))]);
+    for amount in [1_000_000u64, 2_000_000, 3_000_000] {
+        eval.transaction_group(&[pay(&a, b.0, amount, None)])
+            .expect("payment");
+    }
+    let block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(block.fees_collected, 3_000);
+    let percent = eval.consensus_params.payouts_percent;
+    assert!(eval.consensus_params.payouts_enabled && percent > 0);
+    let want = expected_payout(
+        block.fees_collected,
+        block.bonus,
+        10_000_000 + block.fees_collected,
+        percent,
+    );
+    assert!(want > 0, "test must exercise a non-zero payout");
+    assert_eq!(block.proposer_payout, want);
+}
+
+/// An empty block still pays the bonus (go computes it from `Bonus` alone).
+#[test]
+fn empty_proposal_pays_the_bonus_only() {
+    let a = key(1);
+    let (_ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000))]);
+    let block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(block.fees_collected, 0);
+    assert_eq!(block.proposer_payout, block.bonus.min(10_000_000 - 100_000));
+}
+
+/// The payout never exceeds what the fee sink can spend without closing
+/// (go `sink.AvailableBalance(&proto)`, `MinBalance` floor).
+#[test]
+fn proposer_payout_is_capped_by_the_fee_sink_available_balance() {
+    let a = key(1);
+    let b = key(2);
+    let (ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))]);
+    // Sink at exactly its minimum balance: only the collected fees are
+    // available once the payset has paid them in.
+    ledger
+        .lock()
+        .unwrap()
+        .set_account(&FEE_SINK, funded(100_000));
+    eval.transaction_group(&[pay(&a, b.0, 1_000_000, None)])
+        .expect("payment");
+    let block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(block.fees_collected, 1_000);
+    assert!(block.proposer_payout <= 1_000, "{}", block.proposer_payout);
+    assert_eq!(
+        block.proposer_payout,
+        (1_000 * eval.consensus_params.payouts_percent / 100 + block.bonus).min(1_000)
+    );
+}

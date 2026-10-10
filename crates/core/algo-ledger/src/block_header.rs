@@ -241,6 +241,26 @@ fn process_upgrade_params(
     Ok((vote, state))
 }
 
+/// The proposer payout a block should carry (go `BlockEvaluator.proposerPayout`,
+/// `ledger/eval/eval.go`): `min(floor(Payouts.Percent% * feesCollected) + bonus,
+/// feeSinkAvailable)`. `None` when payouts are disabled (go leaves
+/// `ProposerPayout` zero) or when adding the bonus overflows (go errors).
+pub fn proposer_payout(
+    params: &ConsensusParams,
+    fees_collected: u64,
+    bonus: u64,
+    fee_sink_available: u64,
+) -> Option<u64> {
+    if !params.payouts_enabled {
+        return Some(0);
+    }
+    // `NewPercent(p).DivvyAlgos(fees)`: floor(fees * p / 100), no overflow
+    // for p <= 100.
+    let incentive = (u128::from(fees_collected) * u128::from(params.payouts_percent) / 100) as u64;
+    let total = incentive.checked_add(bonus)?;
+    Some(total.min(fee_sink_available))
+}
+
 /// Compute the proposer bonus ("bi") for the round after `prev`.
 ///
 /// Direct port of go-algorand `data/bookkeeping/block.go`'s `NextBonus` /
@@ -1307,6 +1327,31 @@ mod tests {
             "one StateProofBasic entry carrying only the next round",
         );
         assert_eq!(spt_next_round(&hdr), 512);
+    }
+
+    #[test]
+    fn proposer_payout_matches_go_formula() {
+        let p = ConsensusParams {
+            payouts_enabled: true,
+            payouts_percent: 50,
+            ..Default::default()
+        };
+        // floor(50% of 1001) = 500, plus bonus.
+        assert_eq!(proposer_payout(&p, 1001, 5, u64::MAX), Some(505));
+        // Capped by the sink's available balance.
+        assert_eq!(proposer_payout(&p, 1001, 5, 100), Some(100));
+        // Bonus overflow is an error in go.
+        assert_eq!(proposer_payout(&p, 100, u64::MAX, u64::MAX), None);
+        // Large fees do not overflow the percentage.
+        assert_eq!(
+            proposer_payout(&p, u64::MAX, 0, u64::MAX),
+            Some((u128::from(u64::MAX) * 50 / 100) as u64)
+        );
+        let off = ConsensusParams {
+            payouts_enabled: false,
+            ..p.clone()
+        };
+        assert_eq!(proposer_payout(&off, 1000, 5, 100), Some(0));
     }
 
     #[test]

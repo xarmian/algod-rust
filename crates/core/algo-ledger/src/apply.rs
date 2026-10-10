@@ -1795,6 +1795,12 @@ pub struct ExecProbe {
     /// `n` is the resulting round; `None`: none was applied, so the template
     /// (previous header) value stands. No previous-header lookup is involved.
     pub final_state_proof_next: Option<u64>,
+    /// The fee sink's available balance (`micro_algos - min balance`, floored
+    /// at 0, rewards NOT applied) once every transaction of the block has been
+    /// applied, before the epilogue: go `eval.state.lookup(FeeSink)
+    /// .AvailableBalance(&proto)` in `proposerPayout()` (issue #1794). Only
+    /// set on success.
+    pub final_fee_sink_available: Option<u64>,
 }
 
 /// [`apply_block_impl_ex`] plus an [`ExecProbe`] out-parameter.
@@ -2188,6 +2194,10 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         if result.is_ok() {
             p.final_txn_counter = ctx.txn_counter.get();
             p.final_state_proof_next = final_state_proof_next;
+            p.final_fee_sink_available = store.get_account(&block.fee_sink).map(|sink| {
+                sink.micro_algos
+                    .saturating_sub(store.min_balance_with_state(&block.fee_sink, &sink))
+            });
         }
     }
     if result.is_err() {
