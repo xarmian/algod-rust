@@ -930,14 +930,18 @@ fn finalize_payset_twice_does_not_keep_a_stale_next_round() {
     let (_ledger, mut eval) = tracked_evaluator(&[(a.0, funded(50_000_000))]);
     eval.transaction_group(&[state_proof_txn(1024)])
         .expect("state proof");
-    let (payset, _) = eval.finalize_payset().expect("first finalize");
+    let (payset, _) = eval
+        .finalize_payset(&Default::default())
+        .expect("first finalize");
     assert_eq!(payset.len(), 1);
     assert_eq!(
         eval.exec.as_ref().unwrap().final_state_proof_next,
         Some(1280)
     );
 
-    let (payset, _) = eval.finalize_payset().expect("second finalize");
+    let (payset, _) = eval
+        .finalize_payset(&Default::default())
+        .expect("second finalize");
     assert!(payset.is_empty());
     assert_eq!(
         eval.exec.as_ref().unwrap().final_state_proof_next,

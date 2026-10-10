@@ -1712,11 +1712,14 @@ impl crate::store_trait::LedgerStore for LedgerState {
         })
     }
 
-    /// `LedgerState` keeps no per-round history, so it never has a snapshot:
-    /// it must not be used to decide absence (the proposer's
-    /// `knock_offline_lists` lists nobody absent over it).
+    /// `LedgerState` keeps no per-round history: both the total
+    /// ([`Self::online_stake_at_round`]) and the per-account stake
+    /// ([`Self::voter_agreement_data_at_round`]) come from the current state,
+    /// so they share one time basis and absence is decidable over it. It is an
+    /// approximation for tests; real block apply always runs on `SqliteLedger`,
+    /// whose answers honor the round.
     fn has_online_supply_snapshot(&self, _round: u64) -> bool {
-        false
+        true
     }
 
     fn online_stake_at_round(
@@ -2646,11 +2649,11 @@ mod tests {
         assert_eq!(page, vec![(b"b".to_vec(), None)]);
     }
 
-    /// `LedgerState` has no per-round history: it reports no supply snapshot,
-    /// so the proposer's `knock_offline_lists` lists nobody absent over it
-    /// (it must not be used for absence checks).
+    /// `LedgerState` answers every round from the current state for both the
+    /// total and the per-account stake (one coherent basis), so absence is
+    /// decidable over it.
     #[test]
-    fn ledger_state_has_no_online_supply_snapshot_and_lists_nobody_absent() {
+    fn ledger_state_uses_one_current_basis_for_absence() {
         use crate::store_trait::LedgerStore;
         let mut state = LedgerState::new();
         let addr = Address([9u8; 32]);
@@ -2666,13 +2669,13 @@ mod tests {
                 ..AccountData::default()
             },
         );
-        assert!(!state.has_online_supply_snapshot(0));
+        assert!(state.has_online_supply_snapshot(0));
         let consensus = algo_types::consensus::consensus_params_for_version(
             algo_types::consensus::CONSENSUS_V41,
         )
         .unwrap();
         let lists =
             crate::apply::knock_offline_lists(&state, 101, &consensus, &Default::default(), &[]);
-        assert!(lists.absent.is_empty());
+        assert_eq!(lists.absent, vec![addr]);
     }
 }

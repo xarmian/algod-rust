@@ -1615,9 +1615,6 @@ struct ExecState {
     /// The fee sink's available balance after the kept payset (go
     /// `proposerPayout()`); `None` while no payset has been evaluated.
     final_fee_sink_available: Option<u64>,
-    /// The proposer's own participating addresses, never listed as expired or
-    /// absent (go `partAddrs`); set by `generate_block` before assembly.
-    knock_offline_exclude: std::collections::HashSet<algo_types::Address>,
     /// The expired / absent lists the final scratch apply computed over the
     /// state after the kept payset (go `endOfBlock`, issue #1795); `None`
     /// while no payset has been evaluated.
@@ -2024,13 +2021,15 @@ impl SimpleBlockEvaluator {
     fn fits_gate(&self, payset: &[algo_types::SignedTransaction]) -> algo_ledger::apply::FitsGate {
         let payset = payset.to_vec();
         let max = self.max_txn_bytes;
-        algo_ledger::apply::FitsGate(Arc::new(move |ad| {
-            Self::with_apply_data(&payset, ad)
-                .iter()
-                .map(Self::encoded_len)
-                .sum::<usize>()
-                <= max
-        }))
+        algo_ledger::apply::FitsGate {
+            size_of: Arc::new(move |ad| {
+                Self::with_apply_data(&payset, ad)
+                    .iter()
+                    .map(Self::encoded_len)
+                    .sum()
+            }),
+            max,
+        }
     }
 
     /// One scratch evaluation of `payset` (groups described by `groups`)
@@ -2045,7 +2044,7 @@ impl SimpleBlockEvaluator {
         template: &algo_types::Block,
         payset: &[algo_types::SignedTransaction],
         groups: &[ExecGroup],
-        with_lists: bool,
+        own_addresses: Option<&std::collections::HashSet<algo_types::Address>>,
     ) -> Result<
         Result<
             algo_ledger::shadow_execute::ScratchPayset,
@@ -2075,16 +2074,10 @@ impl SimpleBlockEvaluator {
         // bisection probes do not, and a pass whose ApplyData leaves the
         // payset over the block limit (so it will be truncated and rerun) is
         // gated out inside the apply, before the scan.
-        let request = if with_lists {
-            self.exec
-                .as_ref()
-                .map(|e| algo_ledger::apply::ListsRequest {
-                    own_addresses: e.knock_offline_exclude.clone(),
-                    fits: Some(self.fits_gate(payset)),
-                })
-        } else {
-            None
-        };
+        let request = own_addresses.map(|own| algo_ledger::apply::ListsRequest {
+            own_addresses: own.clone(),
+            fits: Some(self.fits_gate(payset)),
+        });
         let r =
             algo_ledger::shadow_execute::scratch_execute_payset(&mut *ledger, &candidate, request);
         algo_ledger::proposal_eval::record_ledger_lock_hold(held.elapsed());
@@ -2111,6 +2104,7 @@ impl SimpleBlockEvaluator {
     ///   `algod_rust_proposal_scratch_failures_total`.
     fn finalize_payset(
         &mut self,
+        own_addresses: &std::collections::HashSet<algo_types::Address>,
     ) -> Result<(Vec<algo_types::SignedTransaction>, u64), algo_error::AlgoError> {
         use algo_ledger::shadow_execute::ScratchFailure;
         const MAX_FAILURE_PASSES: usize = 8;
@@ -2140,12 +2134,15 @@ impl SimpleBlockEvaluator {
         let mut final_knock_offline = None;
         let result = loop {
             passes += 1;
-            let result = self.scratch_pass(&template, &pristine, &groups, true)?;
+            let result = self.scratch_pass(&template, &pristine, &groups, Some(own_addresses))?;
             match result {
                 Ok(done) => {
                     let payset = Self::with_apply_data(&pristine, &done.apply_data);
-                    let sizes: Vec<usize> = payset.iter().map(Self::encoded_len).collect();
-                    let total: usize = sizes.iter().sum();
+                    // The apply already measured the payset when the pass asked
+                    // for the lists; otherwise encode it here.
+                    let total: usize = done
+                        .payset_bytes
+                        .unwrap_or_else(|| payset.iter().map(Self::encoded_len).sum());
                     if total <= self.max_txn_bytes {
                         self.txn_bytes = total;
                         let counted = done.final_txn_counter.saturating_sub(self.hdr.txn_counter);
@@ -2156,6 +2153,7 @@ impl SimpleBlockEvaluator {
                     }
                     // Largest fitting prefix of groups, from the sizes just
                     // measured; one more pass verifies it.
+                    let sizes: Vec<usize> = payset.iter().map(Self::encoded_len).collect();
                     let mut acc = 0usize;
                     let mut keep = 0usize;
                     for g in &groups {
@@ -2298,7 +2296,7 @@ impl SimpleBlockEvaluator {
             let mid = (lo + hi).div_ceil(2);
             let end = groups[mid - 1].start + groups[mid - 1].len;
             *passes += 1;
-            match self.scratch_pass(template, &payset[..end], &groups[..mid], false)? {
+            match self.scratch_pass(template, &payset[..end], &groups[..mid], None)? {
                 Ok(_) => lo = mid,
                 Err(_) => hi = mid - 1,
             }
@@ -3013,10 +3011,11 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         // rewards, created ids, eval deltas), exactly like go's
         // `GenerateBlock` output. Falls back to the legacy "included as
         // admitted" behavior only for an evaluator without exec state.
-        if let Some(exec) = self.exec.as_mut() {
-            exec.knock_offline_exclude = voting_accounts.iter().copied().collect();
-        }
-        let (payset, txn_count) = self.finalize_payset()?;
+        // The proposer's own participating addresses are never listed as
+        // expired or absent (go `partAddrs`).
+        let own_addresses: std::collections::HashSet<algo_types::Address> =
+            voting_accounts.iter().copied().collect();
+        let (payset, txn_count) = self.finalize_payset(&own_addresses)?;
         // The header's `StateProofTracking.NextRound` is what the payset's
         // state proof transactions leave behind, not the template's
         // (previous-round) value: go reads it from the cow at `endOfBlock`
@@ -3670,7 +3669,6 @@ impl PoolLedgerAdapter {
                 last_passes: 0,
                 final_state_proof_next: None,
                 final_fee_sink_available: None,
-                knock_offline_exclude: Default::default(),
                 final_knock_offline: None,
             }
         };

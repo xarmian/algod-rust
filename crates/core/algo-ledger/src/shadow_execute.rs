@@ -847,6 +847,9 @@ pub struct ScratchPayset {
     /// The expired / absent participation lists go's `endOfBlock` would
     /// generate over the state after the payset (issue #1795).
     pub knock_offline_lists: Option<crate::apply::KnockOfflineLists>,
+    /// The encoded payset size the request's `FitsGate` measured (`None`
+    /// when no gate was passed).
+    pub payset_bytes: Option<usize>,
 }
 
 /// Why [`scratch_execute_payset`] did not produce a result.
@@ -991,6 +994,7 @@ fn scratch_execute_with<L: LedgerStore>(
             final_state_proof_next: probe.final_state_proof_next,
             final_fee_sink_available: probe.final_fee_sink_available,
             knock_offline_lists: probe.knock_offline_lists.take(),
+            payset_bytes: probe.payset_bytes,
         }),
     }
 }

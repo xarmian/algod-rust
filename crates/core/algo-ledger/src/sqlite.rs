@@ -5491,6 +5491,41 @@ impl SqliteLedger {
         Ok(expired_stake)
     }
 
+    /// go's `LookupAgreement(round, addr)` -- the single place that decides
+    /// the fallback policy and the rewards folding for every consumer
+    /// (`voter_params_get`, the absence checks, agreement's membership
+    /// lookup): the account's `onlineaccounts` row at or before `round`,
+    /// `None` when there is no such row or the account was not online then
+    /// (go's empty `OnlineAccountData`), with the rewards pending at `round`'s
+    /// rewards level folded into `micro_algos` (`MicroAlgosWithRewards`,
+    /// issue #1654). There is deliberately NO fallback to the account's
+    /// current state: a late joiner has no stake until the lookback passes it.
+    pub fn lookup_agreement_account(
+        &self,
+        addr: &Address,
+        round: u64,
+    ) -> Result<Option<AccountData>, AlgoError> {
+        let Some(mut acct) = self.get_online_account_at_round(addr, round)? else {
+            return Ok(None);
+        };
+        if acct.status != AccountStatus::Online {
+            return Ok(None);
+        }
+        let rewards_level = self
+            .get_block_header_data(round)
+            .ok()
+            .flatten()
+            .and_then(|hdr| BlockHeader::decode_from_bytes(&hdr).ok())
+            .map(|hdr| hdr.rewards_level)
+            .unwrap_or_else(|| self.rewards_level());
+        if rewards_level >= acct.rewards_base {
+            let pending = crate::rewards::compute_pending_rewards(&acct, rewards_level);
+            acct.micro_algos = acct.micro_algos.saturating_add(pending);
+            acct.rewards_base = rewards_level;
+        }
+        Ok(Some(acct))
+    }
+
     /// Look up an account's online data at a specific round from the
     /// `onlineaccounts` table.
     ///
@@ -7764,31 +7799,12 @@ impl LedgerStore for SqliteLedger {
         round: u64,
         addr: &Address,
     ) -> Result<VoterAgreementData, AlgoError> {
-        let acct = match self.get_online_account_at_round(addr, round)? {
-            Some(acct) => acct,
-            None => return Ok(VoterAgreementData::default()),
-        };
-        if acct.status != AccountStatus::Online {
-            return Ok(VoterAgreementData::default());
-        }
-        // go's `VotingStake()` is `MicroAlgosWithRewards`: fold in the rewards
-        // pending at the lookup round's rewards level (issue #1654, as in
-        // `AgreementLedgerBridge::lookup_agreement`).
-        let rewards_level = self
-            .get_block_header_data(round)
-            .ok()
-            .flatten()
-            .and_then(|hdr| BlockHeader::decode_from_bytes(&hdr).ok())
-            .map(|hdr| hdr.rewards_level)
-            .unwrap_or_else(|| self.rewards_level());
-        let pending = if rewards_level >= acct.rewards_base {
-            crate::rewards::compute_pending_rewards(&acct, rewards_level)
-        } else {
-            0
-        };
-        Ok(VoterAgreementData {
-            micro_algos: acct.micro_algos.saturating_add(pending),
-            incentive_eligible: acct.incentive_eligible,
+        Ok(match self.lookup_agreement_account(addr, round)? {
+            Some(acct) => VoterAgreementData {
+                micro_algos: acct.micro_algos,
+                incentive_eligible: acct.incentive_eligible,
+            },
+            None => VoterAgreementData::default(),
         })
     }
 
@@ -14736,6 +14752,24 @@ mod tests {
                 .micro_algos,
             10_000_250_000
         );
+        // No change at the account's own level, and no wrap-around for an
+        // older lookup level.
+        ledger.set_rewards_level(100);
+        assert_eq!(
+            ledger
+                .voter_agreement_data_at_round(0, &addr)
+                .unwrap()
+                .micro_algos,
+            10_000_000_000
+        );
+        ledger.set_rewards_level(50);
+        assert_eq!(
+            ledger
+                .voter_agreement_data_at_round(0, &addr)
+                .unwrap()
+                .micro_algos,
+            10_000_000_000
+        );
     }
 
     /// Without a per-round supply snapshot at the balance round the total
@@ -14757,6 +14791,60 @@ mod tests {
         ledger.put_online_supply_at_round(0, 10_000_000).unwrap();
         let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
         assert_eq!(l.absent, vec![absent], "decidable once the snapshot exists");
+    }
+
+    /// Evidence for the strict no-fallback lookback: an account that is online
+    /// in the genesis allocation and never changes afterwards has an
+    /// `onlineaccounts` row (written by `commit_block`'s
+    /// `record_online_account_history` for every account touched since
+    /// `begin_block`, which includes the genesis `set_account`s), so it has
+    /// its real stake at any later balance round, exactly like go's genesis
+    /// rows. Mirrors `seed_ledger_from_genesis`: begin_block, populate,
+    /// put_block(0), commit_block.
+    #[test]
+    fn genesis_online_account_that_never_changes_has_its_stake_at_the_balance_round() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([9u8; 32]);
+        ledger.begin_block().unwrap();
+        ledger.set_account(&addr, absent_acct(0));
+        ledger.put_block(0, "proto", b"hdr0", b"blk0").unwrap();
+        ledger.commit_block().unwrap();
+        // Later rounds that never touch the account.
+        for r in 1..=5u64 {
+            ledger.begin_block().unwrap();
+            ledger.put_block(r, "proto", b"hdr", b"blk").unwrap();
+            ledger.set_current_round(Round(r));
+            ledger.commit_block().unwrap();
+        }
+        for round in [0u64, 3, 500] {
+            assert_eq!(
+                ledger
+                    .voter_agreement_data_at_round(round, &addr)
+                    .unwrap()
+                    .micro_algos,
+                5_000_000,
+                "round {round}"
+            );
+        }
+    }
+
+    /// A new store wrapper cannot silently disable absence listing: the
+    /// snapshot query is forwarded by every `LedgerStore` wrapper.
+    #[test]
+    fn supply_snapshot_query_is_forwarded_by_the_store_wrappers() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.put_online_supply_at_round(7, 1_000).unwrap();
+        assert!(ledger.has_online_supply_snapshot(7));
+        assert!(!ledger.has_online_supply_snapshot(8));
+        {
+            let mut overlay = crate::pending_overlay::PendingOverlay::new(&ledger);
+            let store = crate::pending_overlay::OverlayStore::new(&ledger, &mut overlay);
+            assert!(store.has_online_supply_snapshot(7));
+            assert!(!store.has_online_supply_snapshot(8));
+        }
+        let rec = crate::recording_store::RecordingStore::new(&mut ledger);
+        assert!(rec.has_online_supply_snapshot(7));
+        assert!(!rec.has_online_supply_snapshot(8));
     }
 
     #[test]
