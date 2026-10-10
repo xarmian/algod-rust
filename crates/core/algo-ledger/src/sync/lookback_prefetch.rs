@@ -182,53 +182,88 @@ mod tests {
 
     #[test]
     fn delivers_every_round_in_consumer_order_with_bounded_lookahead() {
+        use std::time::{Duration, Instant};
+
         let in_flight = AtomicUsize::new(0);
         let max_seen = AtomicUsize::new(0);
+        // Fetches that finished while only workers were fetching (the
+        // consumer's direct fallback fetches are not counted).
         let completed = AtomicUsize::new(0);
-        let fetch = |r: u64| -> Result<RawBlock, AlgoError> {
+        // The first PREFETCH_WORKERS fetches hold until every worker is
+        // inside `fetch` together, which proves they really run concurrently.
+        let started = AtomicUsize::new(0);
+        // A deadline only turns a broken prefetcher into a failure instead of
+        // a hang; a correct one never gets near it.
+        let wait_until = |what: &str, cond: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !cond() {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let fetch_inner = |r: u64, count: bool| -> Result<RawBlock, AlgoError> {
             let n = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             max_seen.fetch_max(n, Ordering::SeqCst);
+            // Only each worker's first fetch rendezvous; gating later ones
+            // would deadlock once fewer than PREFETCH_WORKERS rounds remain.
+            if count && started.fetch_add(1, Ordering::SeqCst) < PREFETCH_WORKERS {
+                // `started` only grows, so an early waiter cannot be stranded
+                // by a peer that already passed and decremented `in_flight`.
+                wait_until("all workers in flight", &|| {
+                    started.load(Ordering::SeqCst) >= PREFETCH_WORKERS
+                });
+            }
             in_flight.fetch_sub(1, Ordering::SeqCst);
-            completed.fetch_add(1, Ordering::SeqCst);
+            if count {
+                completed.fetch_add(1, Ordering::SeqCst);
+            }
             Ok(blk(r))
         };
+        let worker_fetch = |r: u64| fetch_inner(r, true);
         let pf = LookbackPrefetch::new(199, 100);
+        let window = PREFETCH_WINDOW as usize;
         std::thread::scope(|s| {
             for _ in 0..PREFETCH_WORKERS {
-                s.spawn(|| pf.run_worker(&fetch));
+                s.spawn(|| pf.run_worker(&worker_fetch));
             }
             let _guard = ShutdownOnDrop(&pf);
             // Until the consumer takes something, the window is anchored at
             // round 199, so the workers prefetch exactly PREFETCH_WINDOW
-            // rounds and then block. Wait (condition, not wall clock) for that.
-            // The generous deadline only turns a broken prefetcher into a
-            // failure instead of a hang; a correct one never gets near it.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-            while completed.load(Ordering::SeqCst) < PREFETCH_WINDOW as usize {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "workers never prefetched the first window"
-                );
-                std::thread::yield_now();
-            }
+            // rounds and then block.
+            wait_until("the first window", &|| {
+                completed.load(Ordering::SeqCst) >= window
+            });
+            assert_eq!(completed.load(Ordering::SeqCst), window);
             assert_eq!(
-                completed.load(Ordering::SeqCst),
-                PREFETCH_WINDOW as usize,
+                pf.inner.lock().unwrap().next_claim,
+                Some(199 - PREFETCH_WINDOW),
                 "lookahead must be bounded by the window"
+            );
+            assert_eq!(
+                max_seen.load(Ordering::SeqCst),
+                PREFETCH_WORKERS,
+                "all workers fetched concurrently, and no more than that"
             );
             // Mirrors the production consumer: a `None` means "fetch it
             // yourself" (e.g. the worker has not claimed that round yet).
             for r in (100..=199u64).rev() {
-                let window_start = 199 - PREFETCH_WINDOW + 1;
                 match pf.take(r) {
                     Some(got) => assert_eq!(got, blk(r)),
                     None => {
                         assert!(
-                            r < window_start,
+                            r < 199 - PREFETCH_WINDOW + 1,
                             "round {r} in the first window must be prefetched"
                         );
-                        assert_eq!(fetch(r).unwrap(), blk(r));
+                        assert_eq!(fetch_inner(r, false).unwrap(), blk(r));
                     }
+                }
+                if r == 199 - PREFETCH_WINDOW + 1 {
+                    // First window consumed: the window must slide, letting
+                    // the workers claim rounds up to PREFETCH_WINDOW - 1
+                    // below the consumer's position.
+                    wait_until("the window to slide", &|| {
+                        completed.load(Ordering::SeqCst) >= 2 * window - 1
+                    });
                 }
             }
         });
