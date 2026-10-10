@@ -1817,8 +1817,44 @@ pub struct ExecProbe {
     /// proposer's own participating addresses, which go never lists. Only the
     /// proposer's final scratch apply asks.
     pub knock_offline_exclude: Option<std::collections::HashSet<Address>>,
+    /// Input: only compute the lists when this says the pass's `ApplyData`
+    /// leaves the payset within the block size limit, i.e. when the pass is
+    /// the one the proposer keeps. A pass that will be discarded as oversize
+    /// then never pays for the O(online accounts) scan (issue #1795).
+    pub knock_offline_gate: Option<FitsGate>,
     /// Output of [`Self::knock_offline_exclude`]; only set on success.
     pub knock_offline_lists: Option<KnockOfflineLists>,
+}
+
+/// Predicate over a scratch pass's per-transaction [`ApplyData`]: does the
+/// resulting payset fit the block? See [`ExecProbe::knock_offline_gate`].
+#[derive(Clone)]
+pub struct FitsGate(pub std::sync::Arc<FitsFn>);
+
+/// The predicate inside a [`FitsGate`].
+pub type FitsFn = dyn Fn(&[ApplyData]) -> bool + Send + Sync;
+
+impl std::fmt::Debug for FitsGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FitsGate")
+    }
+}
+
+impl PartialEq for FitsGate {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for FitsGate {}
+
+/// What the proposer asks of its final scratch pass: the expired / absent
+/// lists, skipping its own participating addresses, and only when the pass
+/// fits ([`ExecProbe::knock_offline_gate`]).
+#[derive(Debug, Clone, Default)]
+pub struct ListsRequest {
+    pub own_addresses: std::collections::HashSet<Address>,
+    pub fits: Option<FitsGate>,
 }
 
 /// The accounts a proposer lists in `ParticipationUpdates` (go
@@ -1901,7 +1937,15 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
 
     // Absence inputs (go computes them before looking at candidates; an error
     // fetching the online stake means no knock-offs at all).
-    let (total_online_stake, challenge) = if max_absent > 0 {
+    //
+    // A per-round supply snapshot at the balance round must exist: without
+    // one the total would come from today's aggregate while each account's
+    // stake comes from history (two time bases), so absence is undecidable
+    // and nobody is listed -- an empty list is always valid. (The validator
+    // keeps go's semantics and judges what a block lists.)
+    let brnd = algo_agreement::balance_round(algo_types::Round(round), consensus);
+    let absent_decidable = max_absent > 0 && store.has_online_supply_snapshot(brnd.0);
+    let (total_online_stake, challenge) = if absent_decidable {
         let total = match lookback_total_online_stake(store, round, consensus) {
             Ok(t) => t,
             Err(e) => {
@@ -1925,7 +1969,9 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
     let rewards_level = store.rewards_level();
 
     for (addr, acct) in candidates {
-        if lists.expired.len() >= max_expired && lists.absent.len() >= max_absent {
+        if lists.expired.len() >= max_expired
+            && (!absent_decidable || lists.absent.len() >= max_absent)
+        {
             break; // both lists are full
         }
         let with_rewards =
@@ -1942,7 +1988,7 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
             lists.expired.push(addr);
             continue; // if marking expired, do not consider suspension
         }
-        if lists.absent.len() >= max_absent {
+        if !absent_decidable || lists.absent.len() >= max_absent {
             continue; // no more room (more expiries may follow)
         }
         if acct.status != AccountStatus::Online || !acct.incentive_eligible {
@@ -2388,8 +2434,14 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         if result.is_ok() {
             p.final_txn_counter = ctx.txn_counter.get();
             p.final_state_proof_next = final_state_proof_next;
-            if let Some(exclude) = &p.knock_offline_exclude {
+            let fits = p
+                .knock_offline_gate
+                .as_ref()
+                .is_none_or(|g| (g.0)(apply_data_out.as_deref().map(Vec::as_slice).unwrap_or(&[])));
+            if let (Some(exclude), true) = (&p.knock_offline_exclude, fits) {
                 // After the payset, before the epilogue: go `endOfBlock`.
+                #[cfg(any(test, feature = "test-hooks"))]
+                crate::shadow_execute::test_hooks::note_knock_offline();
                 let touched = payset_touched_addresses(&block.payset);
                 p.knock_offline_lists = Some(knock_offline_lists(
                     &*store,
@@ -14229,6 +14281,7 @@ return
         );
     }
 
+    // Fix #4: Gate keyreg last_heartbeat/incentive_eligible on payouts_enabled
     #[test]
     fn test_keyreg_online_payouts_disabled_no_heartbeat_or_incentive() {
         // When payouts_enabled = false (pre-v40), keyreg should NOT set

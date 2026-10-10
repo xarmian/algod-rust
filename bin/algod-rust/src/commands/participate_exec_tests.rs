@@ -1517,9 +1517,13 @@ fn non_empty_payset_without_a_scratch_result_gets_empty_lists() {
 /// balance round (round 0 for the round-100 proposals of these tests).
 fn seed_online_history(ledger: &Arc<Mutex<SqliteLedger>>, accounts: &[(Address, AccountData)]) {
     let l = ledger.lock().unwrap();
+    let mut total = 0u64;
     for (addr, acct) in accounts {
         l.put_online_account_at_round(addr, 0, acct).unwrap();
+        total += acct.micro_algos;
     }
+    // The lookback total, from the same time basis as the history rows.
+    l.put_online_supply_at_round(0, total).unwrap();
 }
 
 fn evaluator_at_99_limited(
@@ -1604,8 +1608,14 @@ fn stale_first_pass_lists_do_not_survive_a_truncating_rerun() {
         .expect("payment");
     eval.transaction_group(&[pay(&x, b.0, 0, Some(b.0))])
         .expect("close-out admitted on its pre-ApplyData size");
+    test_hooks::reset_knock_offline_calls();
     let block = eval.generate_block(&[]).expect("generate_block");
     assert_eq!(block.payset.len(), 1, "the close-out no longer fits");
+    assert_eq!(
+        test_hooks::knock_offline_calls(),
+        1,
+        "the discarded oversize pass must not pay for the O(online) scan"
+    );
     assert_eq!(
         block.expired_participation_accounts.as_deref(),
         Some(&[x.0][..]),

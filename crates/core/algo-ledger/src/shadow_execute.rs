@@ -774,6 +774,24 @@ pub mod test_hooks {
         static FAIL_NEXT: Cell<u64> = const { Cell::new(0) };
         static FAIL_OVER: Cell<Option<usize>> = const { Cell::new(None) };
         static CALLS: Cell<u64> = const { Cell::new(0) };
+        static KNOCK_CALLS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Number of expired / absent list computations
+    /// ([`crate::apply::knock_offline_lists`]) run on this thread since the
+    /// last reset: the O(online accounts) scan a discarded scratch pass must
+    /// not pay for (issue #1795).
+    pub fn knock_offline_calls() -> u64 {
+        KNOCK_CALLS.with(|c| c.get())
+    }
+
+    /// Reset the per-thread list-computation counter.
+    pub fn reset_knock_offline_calls() {
+        KNOCK_CALLS.with(|c| c.set(0));
+    }
+
+    pub(crate) fn note_knock_offline() {
+        KNOCK_CALLS.with(|c| c.set(c.get() + 1));
     }
 
     /// The next `n` [`super::scratch_execute_payset`] calls on this thread
@@ -856,13 +874,14 @@ pub enum ScratchFailure {
 pub fn scratch_execute_payset<L: LedgerStore>(
     store: &mut L,
     block: &Block,
-    own_addresses: Option<&std::collections::HashSet<algo_types::Address>>,
+    lists: Option<crate::apply::ListsRequest>,
 ) -> Result<ScratchPayset, ScratchFailure> {
     // Input flag (reviewed, intentional): only this final epilogue apply
     // needs the post-payset sink balance.
     let mut probe = ExecProbe {
         want_fee_sink_available: true,
-        knock_offline_exclude: own_addresses.cloned(),
+        knock_offline_exclude: lists.as_ref().map(|l| l.own_addresses.clone()),
+        knock_offline_gate: lists.and_then(|l| l.fits),
         ..Default::default()
     };
     scratch_execute_with(store, block, &mut probe)

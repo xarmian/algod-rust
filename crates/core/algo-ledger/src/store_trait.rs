@@ -702,6 +702,13 @@ pub trait LedgerStore {
     /// sortition/committee-sizing lookback.
     fn online_stake_at_round(&self, round: u64, vote_rnd: u64) -> Result<u64, AlgoError>;
 
+    /// Whether a per-round online-supply snapshot exists for `round`. When it
+    /// does not, [`Self::online_stake_at_round`] falls back to today's
+    /// aggregate, a different time basis from
+    /// [`Self::voter_agreement_data_at_round`]'s historical rows; the
+    /// proposer then treats absence as undecidable (issue #1795).
+    fn has_online_supply_snapshot(&self, round: u64) -> bool;
+
     /// Store a voters snapshot -- `(voters_commitment, online_total_weight)`
     /// -- keyed by the round it was taken at (go's `votersForRoundCache` map
     /// key).

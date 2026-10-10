@@ -1998,6 +1998,41 @@ impl SimpleBlockEvaluator {
         canonical_encode_signed_txn_in_block(stx).len()
     }
 
+    /// `payset` with each transaction's ApplyData filled in, as it is encoded
+    /// in the block.
+    fn with_apply_data(
+        payset: &[algo_types::SignedTransaction],
+        apply_data: &[algo_ledger::apply::ApplyData],
+    ) -> Vec<algo_types::SignedTransaction> {
+        let mut out = payset.to_vec();
+        for (stx, ad) in out.iter_mut().zip(apply_data) {
+            stx.closing_amount = ad.closing_amount;
+            stx.asset_closing_amount = ad.asset_closing_amount;
+            stx.sender_rewards = ad.sender_rewards;
+            stx.receiver_rewards = ad.receiver_rewards;
+            stx.close_rewards = ad.close_rewards;
+            stx.apply_data_config_asset = ad.config_asset;
+            stx.apply_data_application_id = ad.application_id;
+            stx.eval_delta = ad.eval_delta.clone();
+        }
+        out
+    }
+
+    /// Does `payset`, once a scratch pass has produced its ApplyData, fit the
+    /// block byte limit? The same test `finalize_payset` applies to a pass's
+    /// result, usable inside the apply (see `ExecProbe::knock_offline_gate`).
+    fn fits_gate(&self, payset: &[algo_types::SignedTransaction]) -> algo_ledger::apply::FitsGate {
+        let payset = payset.to_vec();
+        let max = self.max_txn_bytes;
+        algo_ledger::apply::FitsGate(Arc::new(move |ad| {
+            Self::with_apply_data(&payset, ad)
+                .iter()
+                .map(Self::encoded_len)
+                .sum::<usize>()
+                <= max
+        }))
+    }
+
     /// One scratch evaluation of `payset` (groups described by `groups`)
     /// under the ledger mutex. The candidate carries the fees and load of the
     /// payset it holds, so the block epilogue sees the same inputs as the
@@ -2036,19 +2071,22 @@ impl SimpleBlockEvaluator {
         algo_ledger::proposal_eval::record_ledger_lock_wait(waited.elapsed());
         let held = std::time::Instant::now();
         // The expired / absent lists scan every online account under the
-        // ledger lock, so only passes that can be the final one ask for them
-        // (not bisection probes). A pass that then turns out oversize still
-        // paid for its scan once; the rerun after truncation is the final one.
-        let own = if with_lists {
-            self.exec.as_ref().map(|e| e.knock_offline_exclude.clone())
+        // ledger lock, so only the pass the proposer keeps asks for them:
+        // bisection probes do not, and a pass whose ApplyData leaves the
+        // payset over the block limit (so it will be truncated and rerun) is
+        // gated out inside the apply, before the scan.
+        let request = if with_lists {
+            self.exec
+                .as_ref()
+                .map(|e| algo_ledger::apply::ListsRequest {
+                    own_addresses: e.knock_offline_exclude.clone(),
+                    fits: Some(self.fits_gate(payset)),
+                })
         } else {
             None
         };
-        let r = algo_ledger::shadow_execute::scratch_execute_payset(
-            &mut *ledger,
-            &candidate,
-            own.as_ref(),
-        );
+        let r =
+            algo_ledger::shadow_execute::scratch_execute_payset(&mut *ledger, &candidate, request);
         algo_ledger::proposal_eval::record_ledger_lock_hold(held.elapsed());
         Ok(r)
     }
@@ -2105,17 +2143,7 @@ impl SimpleBlockEvaluator {
             let result = self.scratch_pass(&template, &pristine, &groups, true)?;
             match result {
                 Ok(done) => {
-                    let mut payset = pristine.clone();
-                    for (stx, ad) in payset.iter_mut().zip(done.apply_data) {
-                        stx.closing_amount = ad.closing_amount;
-                        stx.asset_closing_amount = ad.asset_closing_amount;
-                        stx.sender_rewards = ad.sender_rewards;
-                        stx.receiver_rewards = ad.receiver_rewards;
-                        stx.close_rewards = ad.close_rewards;
-                        stx.apply_data_config_asset = ad.config_asset;
-                        stx.apply_data_application_id = ad.application_id;
-                        stx.eval_delta = ad.eval_delta;
-                    }
+                    let payset = Self::with_apply_data(&pristine, &done.apply_data);
                     let sizes: Vec<usize> = payset.iter().map(Self::encoded_len).collect();
                     let total: usize = sizes.iter().sum();
                     if total <= self.max_txn_bytes {
@@ -6938,11 +6966,11 @@ mod tests {
         let ledger = test_ledger();
 
         // Seed a single online, incentive-eligible account that hasn't
-        // proposed or heartbeated since round 1. With only one online
-        // account, total_online_voting_stake == this account's own stake,
-        // so is_absent's allowable_lag collapses to exactly ABSENT_FACTOR
-        // (20): last_seen(1) + 20 = 21 < 101 (the round being built), so
-        // this account must be listed absent.
+        // proposed or heartbeated since round 1. It was online at the
+        // balance round (seeded history row) and the lookback total (seeded
+        // supply snapshot) is its own stake, so is_absent's allowable_lag
+        // collapses to exactly ABSENT_FACTOR (20): last_seen(1) + 20 = 21 <
+        // 101 (the round being built), so this account must be listed absent.
         let absent_addr = Address([9u8; 32]);
         {
             let mut l = ledger.lock().expect("ledger lock");
@@ -6959,6 +6987,8 @@ mod tests {
             // Online at the balance round (go's `LookupAgreement` history).
             l.put_online_account_at_round(&absent_addr, 0, &acct)
                 .expect("seed online history");
+            l.put_online_supply_at_round(0, 5_000_000)
+                .expect("seed lookback supply");
         }
 
         let adapter = PoolLedgerAdapter::new(ledger.clone());

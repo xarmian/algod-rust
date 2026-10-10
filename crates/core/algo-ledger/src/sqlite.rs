@@ -7771,14 +7771,33 @@ impl LedgerStore for SqliteLedger {
         if acct.status != AccountStatus::Online {
             return Ok(VoterAgreementData::default());
         }
+        // go's `VotingStake()` is `MicroAlgosWithRewards`: fold in the rewards
+        // pending at the lookup round's rewards level (issue #1654, as in
+        // `AgreementLedgerBridge::lookup_agreement`).
+        let rewards_level = self
+            .get_block_header_data(round)
+            .ok()
+            .flatten()
+            .and_then(|hdr| BlockHeader::decode_from_bytes(&hdr).ok())
+            .map(|hdr| hdr.rewards_level)
+            .unwrap_or_else(|| self.rewards_level());
+        let pending = if rewards_level >= acct.rewards_base {
+            crate::rewards::compute_pending_rewards(&acct, rewards_level)
+        } else {
+            0
+        };
         Ok(VoterAgreementData {
-            micro_algos: acct.micro_algos,
+            micro_algos: acct.micro_algos.saturating_add(pending),
             incentive_eligible: acct.incentive_eligible,
         })
     }
 
     fn online_stake_at_round(&self, round: u64, vote_rnd: u64) -> Result<u64, AlgoError> {
         self.online_circulation_at_round(round, vote_rnd)
+    }
+
+    fn has_online_supply_snapshot(&self, round: u64) -> bool {
+        matches!(self.online_supply_at_round(round), Ok(Some(_)))
     }
 }
 
@@ -14666,6 +14685,7 @@ mod tests {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
         let addr = Address([9u8; 32]);
         set_online(&mut ledger, &addr, absent_acct(1));
+        ledger.put_online_supply_at_round(0, 5_000_000).unwrap();
 
         // Single online account: the lookback total equals its own stake, so
         // is_absent's allowable_lag is exactly ABSENT_FACTOR (20).
@@ -14695,6 +14715,48 @@ mod tests {
             crate::store_trait::VoterAgreementData::default(),
             "no row at or before the round: empty OnlineAccountData"
         );
+    }
+
+    /// go's `VotingStake()` is `MicroAlgosWithRewards`: the historical row's
+    /// balance with the rewards pending at the lookup round folded in.
+    #[test]
+    fn lookback_voting_stake_includes_pending_rewards() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([9u8; 32]);
+        let mut acct = absent_acct(1);
+        acct.micro_algos = 10_000_000_000; // 10_000 reward units
+        acct.rewards_base = 100;
+        ledger.set_account(&addr, acct.clone());
+        ledger.put_online_account_at_round(&addr, 0, &acct).unwrap();
+        ledger.set_rewards_level(125); // 25 levels * 10_000 units
+        assert_eq!(
+            ledger
+                .voter_agreement_data_at_round(0, &addr)
+                .unwrap()
+                .micro_algos,
+            10_000_250_000
+        );
+    }
+
+    /// Without a per-round supply snapshot at the balance round the total
+    /// would come from today's aggregate while the per-account stake comes
+    /// from history: two time bases. Absence is then undecidable and the
+    /// proposer lists nobody (an empty list is always valid); expiry, which
+    /// needs no stake, still works.
+    #[test]
+    fn absent_candidates_are_skipped_without_a_supply_snapshot() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let absent = Address([9u8; 32]);
+        let expired = Address([8u8; 32]);
+        set_online(&mut ledger, &absent, absent_acct(1));
+        set_online(&mut ledger, &expired, keyed_acct(AccountStatus::Online, 50));
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
+        assert!(l.absent.is_empty(), "undecidable: no snapshot at round 0");
+        assert_eq!(l.expired, vec![expired]);
+
+        ledger.put_online_supply_at_round(0, 10_000_000).unwrap();
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
+        assert_eq!(l.absent, vec![absent], "decidable once the snapshot exists");
     }
 
     #[test]
@@ -14731,6 +14793,7 @@ mod tests {
         for i in 0..3u8 {
             set_online(&mut ledger, &Address([i + 1; 32]), absent_acct(1));
         }
+        ledger.put_online_supply_at_round(0, 15_000_000).unwrap();
 
         let l = lists(&ledger, 101, &consensus, &Default::default(), &[]);
         assert_eq!(l.absent.len(), 1, "capped at payouts_max_mark_absent");
