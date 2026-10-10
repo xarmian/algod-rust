@@ -173,6 +173,18 @@ Full Rust reimplementation of go-algorand — a production-grade Algorand node. 
   deliberately exempt from per-file headers — see `docs/LICENSING_AUDIT.md`'s
   explicit note on this.
 
+## Commit and PR issue references
+
+- **Every git commit message must reference the GitHub issue it is bound
+  to** (e.g. `(#1796)` in the subject line, or `Refs #1796` / `Closes #1796`
+  in the body). If the work is bound to several issues, list all of them.
+- **Every pull request title must include the issue number(s) it addresses**
+  as `#N` hash ids (e.g. `consensus: fix X (#1796)` or `(#1796, #1801)`).
+- Work with no bound issue is the only exception — file one first via the
+  `algod-issue-create` skill when the change is non-trivial.
+- Mind the auto-close caveat: only use the literal `fixes`/`closes` keywords
+  for issues the change fully resolves; use `Refs #N` otherwise.
+
 ## Bash Tool Constraints
 
 - Do NOT chain test runs hoping for different results. If a test fails, diagnose the issue first.
