@@ -2010,6 +2010,7 @@ impl SimpleBlockEvaluator {
         template: &algo_types::Block,
         payset: &[algo_types::SignedTransaction],
         groups: &[ExecGroup],
+        with_lists: bool,
     ) -> Result<
         Result<
             algo_ledger::shadow_execute::ScratchPayset,
@@ -2034,12 +2035,20 @@ impl SimpleBlockEvaluator {
             })?;
         algo_ledger::proposal_eval::record_ledger_lock_wait(waited.elapsed());
         let held = std::time::Instant::now();
-        let own = self
-            .exec
-            .as_ref()
-            .map(|e| e.knock_offline_exclude.clone())
-            .unwrap_or_default();
-        let r = algo_ledger::shadow_execute::scratch_execute_payset(&mut *ledger, &candidate, &own);
+        // The expired / absent lists scan every online account under the
+        // ledger lock, so only passes that can be the final one ask for them
+        // (not bisection probes). A pass that then turns out oversize still
+        // paid for its scan once; the rerun after truncation is the final one.
+        let own = if with_lists {
+            self.exec.as_ref().map(|e| e.knock_offline_exclude.clone())
+        } else {
+            None
+        };
+        let r = algo_ledger::shadow_execute::scratch_execute_payset(
+            &mut *ledger,
+            &candidate,
+            own.as_ref(),
+        );
         algo_ledger::proposal_eval::record_ledger_lock_hold(held.elapsed());
         Ok(r)
     }
@@ -2093,7 +2102,7 @@ impl SimpleBlockEvaluator {
         let mut final_knock_offline = None;
         let result = loop {
             passes += 1;
-            let result = self.scratch_pass(&template, &pristine, &groups)?;
+            let result = self.scratch_pass(&template, &pristine, &groups, true)?;
             match result {
                 Ok(done) => {
                     let mut payset = pristine.clone();
@@ -2261,7 +2270,7 @@ impl SimpleBlockEvaluator {
             let mid = (lo + hi).div_ceil(2);
             let end = groups[mid - 1].start + groups[mid - 1].len;
             *passes += 1;
-            match self.scratch_pass(template, &payset[..end], &groups[..mid])? {
+            match self.scratch_pass(template, &payset[..end], &groups[..mid], false)? {
                 Ok(_) => lo = mid,
                 Err(_) => hi = mid - 1,
             }
@@ -3088,12 +3097,18 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         // account the payset closed, renewed or re-registered, which the
         // validating apply rejects. Nodes are free to propose any valid
         // subset; a lower or empty list is always accepted.
+        //
+        // A NON-empty payset with no scratch result (store cannot roll back,
+        // transient failure, legacy path without exec state) gets EMPTY
+        // lists: the tip is not the post-payset state, and an empty list is
+        // always valid.
         let lists = match self
             .exec
             .as_ref()
             .and_then(|e| e.final_knock_offline.clone())
         {
             Some(lists) => lists,
+            None if !payset.is_empty() => algo_ledger::apply::KnockOfflineLists::default(),
             None => {
                 let exclude: std::collections::HashSet<algo_types::Address> =
                     voting_accounts.iter().copied().collect();
@@ -3108,6 +3123,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                     self.hdr.round.0,
                     &self.consensus_params,
                     &exclude,
+                    &[],
                 )
             }
         };
@@ -7011,6 +7027,10 @@ mod tests {
                     ..AccountData::default()
                 },
             );
+            // The lag is judged against the balance-round lookback total
+            // (go `onlineStake()`): this account's own stake.
+            l.put_online_supply_at_round(0, 5_000_000)
+                .expect("seed lookback supply");
         }
 
         let adapter = PoolLedgerAdapter::new(ledger.clone());

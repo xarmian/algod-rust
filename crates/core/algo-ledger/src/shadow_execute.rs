@@ -856,13 +856,13 @@ pub enum ScratchFailure {
 pub fn scratch_execute_payset<L: LedgerStore>(
     store: &mut L,
     block: &Block,
-    own_addresses: &std::collections::HashSet<algo_types::Address>,
+    own_addresses: Option<&std::collections::HashSet<algo_types::Address>>,
 ) -> Result<ScratchPayset, ScratchFailure> {
     // Input flag (reviewed, intentional): only this final epilogue apply
     // needs the post-payset sink balance.
     let mut probe = ExecProbe {
         want_fee_sink_available: true,
-        knock_offline_exclude: Some(own_addresses.clone()),
+        knock_offline_exclude: own_addresses.cloned(),
         ..Default::default()
     };
     scratch_execute_with(store, block, &mut probe)

@@ -1835,17 +1835,31 @@ pub struct KnockOfflineLists {
 /// [`validate_expired_online_accounts`] / [`validate_absent_online_accounts`]
 /// judge the lists against (issue #1795).
 ///
-/// Candidates are the online accounts, in ascending address order (go iterates
-/// a Go map; any order is valid and the lists need not be complete). An
-/// account is skipped when its balance is zero (being closed) or it is one of
-/// `exclude` (the proposer's own addresses). Expiry takes precedence over
-/// suspension, each list is capped at its consensus maximum, and a suspension
-/// candidate must be `Online` and `IncentiveEligible`.
+/// Candidates follow go: every online account (go's top-N online accounts of
+/// the previous round, whose data is unchanged unless modified) plus the
+/// accounts the block modified, with their post-payset data and whatever their
+/// status -- an offline (suspended) account that still holds voting keys can be
+/// expired. `touched` approximates "modified": the addresses the payset's
+/// top-level transactions name. An under-approximation only shortens the list,
+/// which validators accept (they check what is listed, never completeness).
+///
+/// Per candidate, in ascending address order (go iterates a Go map; any order
+/// is valid): zero rewards-adjusted balance (`MicroAlgosWithRewards.IsZero()`,
+/// an account being closed) and `exclude` (the proposer's own addresses) are
+/// skipped; a non-empty vote key with `VoteLastValid < round` is expired
+/// (no other condition: `VoteLastValid == 0` counts, as in go) and takes
+/// precedence over suspension; otherwise an `Online`, `IncentiveEligible`
+/// account is suspended when [`is_absent`] or the active challenge says so.
+/// Absence is judged like go's `validateAbsentOnlineAccounts`: the total and
+/// the account's stake come from the balance-round lookback
+/// (`onlineStake()` / `lookupAgreement().VotingStake()`), the last-seen round
+/// from the post-payset record. Each list is capped at its consensus maximum.
 pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
     store: &L,
     round: u64,
     consensus: &ConsensusParams,
     exclude: &std::collections::HashSet<Address>,
+    touched: &[Address],
 ) -> KnockOfflineLists {
     let max_expired = consensus.max_proposed_expired_online_accounts;
     let max_absent = consensus.payouts_max_mark_absent;
@@ -1853,15 +1867,45 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
     if max_expired == 0 && max_absent == 0 {
         return lists;
     }
-    let mut accounts = store.online_accounts();
-    accounts.sort_by_key(|a| a.0 .0);
 
-    // Total online stake and the active challenge are only needed to judge
-    // suspension candidates.
+    // One scan of the online set; the payset's touched accounts overwrite the
+    // base data with their end-of-block state (go: `mods.Accts.GetData`).
+    let mut index: std::collections::HashMap<Address, usize> = std::collections::HashMap::new();
+    let mut candidates: Vec<(Address, algo_types::AccountData)> = Vec::new();
+    for (addr, acct) in store.online_accounts() {
+        index.insert(addr, candidates.len());
+        candidates.push((addr, acct));
+    }
+    for addr in touched {
+        if addr.is_zero() {
+            continue;
+        }
+        let Some(acct) = store.get_account(addr) else {
+            continue;
+        };
+        match index.get(addr) {
+            Some(&i) => candidates[i].1 = acct,
+            None => {
+                index.insert(*addr, candidates.len());
+                candidates.push((*addr, acct));
+            }
+        }
+    }
+    candidates.sort_by_key(|(a, _)| a.0);
+
+    // Absence inputs (go computes them before looking at candidates; an error
+    // fetching the online stake means no knock-offs at all).
     let (total_online_stake, challenge) = if max_absent > 0 {
+        let total = match lookback_total_online_stake(store, round, consensus) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("unable to fetch online stake, no knockoffs: {e}");
+                return lists;
+            }
+        };
         let provider = crate::heartbeat::StoreHeaderProvider { store };
         (
-            total_online_voting_stake(store),
+            total,
             crate::heartbeat::find_challenge(
                 consensus,
                 round,
@@ -1874,16 +1918,18 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
     };
     let rewards_level = store.rewards_level();
 
-    for (addr, acct) in accounts {
-        if acct.micro_algos == 0 || exclude.contains(&addr) {
+    for (addr, acct) in candidates {
+        let with_rewards =
+            acct.micro_algos
+                .saturating_add(crate::rewards::compute_pending_rewards(
+                    &acct,
+                    rewards_level,
+                ));
+        if with_rewards == 0 || exclude.contains(&addr) {
             continue;
         }
         let has_vote_key = acct.vote_id.is_some_and(|v| v != [0u8; 32]);
-        if has_vote_key
-            && acct.vote_last_valid != 0
-            && acct.vote_last_valid < round
-            && lists.expired.len() < max_expired
-        {
+        if has_vote_key && acct.vote_last_valid < round && lists.expired.len() < max_expired {
             lists.expired.push(addr);
             continue; // if marking expired, do not consider suspension
         }
@@ -1894,19 +1940,37 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
             continue;
         }
         let last_seen = crate::heartbeat::last_seen(acct.last_proposed, acct.last_heartbeat);
-        let acct_stake = acct
-            .micro_algos
-            .saturating_add(crate::rewards::compute_pending_rewards(
-                &acct,
-                rewards_level,
-            ));
-        if is_absent(total_online_stake, acct_stake, last_seen, round)
+        let Ok(stake) = lookback_voting_stake(store, round, consensus, &addr) else {
+            tracing::error!("unable to check account for absenteeism: {addr}");
+            continue;
+        };
+        if is_absent(total_online_stake, stake, last_seen, round)
             || challenge.failed(&addr.0, last_seen)
         {
             lists.absent.push(addr);
         }
     }
     lists
+}
+
+/// The addresses a payset's top-level transactions name: the accounts a block
+/// plausibly modified, as extra [`knock_offline_lists`] candidates.
+pub(crate) fn payset_touched_addresses(payset: &[algo_types::SignedTransaction]) -> Vec<Address> {
+    let mut out = Vec::new();
+    for stx in payset {
+        let t = &stx.txn;
+        out.extend([t.sender, t.receiver, t.close_remainder_to]);
+        out.extend(t.asset_sender);
+        out.extend(t.asset_receiver);
+        out.extend(t.asset_close_to);
+        out.extend(t.freeze_account);
+        if let Some(accts) = &t.accounts {
+            out.extend(accts.iter().copied());
+        }
+    }
+    out.sort_by_key(|a| a.0);
+    out.dedup();
+    out
 }
 
 /// [`apply_block_impl_ex`] plus an [`ExecProbe`] out-parameter.
@@ -2303,11 +2367,13 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
             p.final_state_proof_next = final_state_proof_next;
             if let Some(exclude) = &p.knock_offline_exclude {
                 // After the payset, before the epilogue: go `endOfBlock`.
+                let touched = payset_touched_addresses(&block.payset);
                 p.knock_offline_lists = Some(knock_offline_lists(
                     &*store,
                     block.round.0,
                     &consensus,
                     exclude,
+                    &touched,
                 ));
             }
             if p.want_fee_sink_available {
@@ -2689,10 +2755,9 @@ const ABSENT_FACTOR: u64 = 20;
 ///
 /// Used on the validation side by [`validate_absent_online_accounts`] to
 /// check a *received* block's claimed absentee list, and reused on the
-/// proposal side by
-/// [`SqliteLedger::absent_participation_account_candidates`](crate::sqlite::SqliteLedger::absent_participation_account_candidates)
-/// to compute this node's own block-assembly-time absentee list, mirroring
-/// go's `generateKnockOfflineAccountsList` (issue #845).
+/// proposal side by [`knock_offline_lists`] to compute this node's own
+/// block-assembly-time absentee list, mirroring go's
+/// `generateKnockOfflineAccountsList` (issues #845, #1795).
 pub(crate) fn is_absent(
     total_online_stake: u64,
     acct_stake: u64,
@@ -2721,30 +2786,32 @@ pub(crate) fn is_absent(
     last_seen.saturating_add(allowable_lag as u64) < current
 }
 
-/// Sum of rewards-adjusted balances of every currently `Online` account.
-///
-/// Mirrors go-algorand's `roundCowBase.onlineStake()` (`ledger/eval/eval.go`),
-/// which reports the online-circulation total (`AccountTotals.Online.Money`,
-/// rewards-extrapolated to the current round) used as the denominator-side
-/// input to `isAbsent`'s stake ratio. Built generically over [`LedgerStore`]
-/// from [`LedgerStore::online_accounts`] plus [`rewards::compute_pending_rewards`],
-/// the same pattern already used by `voters_tracker::total_online_stake` for
-/// state-proof voter selection.
-///
-/// Accumulates in `u128` and saturates into `u64` at the end, matching this
-/// crate's existing `saturating_*` style for aggregate-money arithmetic
-/// rather than treating an overflow as fatal.
-///
-/// [`LedgerStore`]: crate::store_trait::LedgerStore
-/// [`LedgerStore::online_accounts`]: crate::store_trait::LedgerStore::online_accounts
-pub(crate) fn total_online_voting_stake<L: crate::store_trait::LedgerStore>(store: &L) -> u64 {
-    let rewards_level = store.rewards_level();
-    let mut total: u128 = 0;
-    for (_, acct) in store.online_accounts() {
-        let pending = crate::rewards::compute_pending_rewards(&acct, rewards_level);
-        total += acct.micro_algos as u128 + pending as u128;
-    }
-    total.min(u64::MAX as u128) as u64
+/// Total online stake for absence checks: go `roundCowBase.onlineStake()`,
+/// i.e. `OnlineCirculation(balanceRound, round)` -- the balance-round lookback
+/// total, NOT the state after this block's payset (go TestWhaleJoin relies on
+/// that: stake that joins in this block does not count yet).
+pub(crate) fn lookback_total_online_stake<L: crate::store_trait::LedgerStore>(
+    store: &L,
+    round: u64,
+    consensus: &ConsensusParams,
+) -> Result<u64, AlgoError> {
+    let brnd = algo_agreement::balance_round(algo_types::Round(round), consensus);
+    store.online_stake_at_round(brnd.0, round)
+}
+
+/// An account's voting stake for absence checks: go
+/// `lookupAgreement(addr).VotingStake()`, read at the balance round (0 when the
+/// account was not online then).
+pub(crate) fn lookback_voting_stake<L: crate::store_trait::LedgerStore>(
+    store: &L,
+    round: u64,
+    consensus: &ConsensusParams,
+    addr: &Address,
+) -> Result<u64, AlgoError> {
+    let brnd = algo_agreement::balance_round(algo_types::Round(round), consensus);
+    Ok(store
+        .voter_agreement_data_at_round(brnd.0, addr)?
+        .micro_algos)
 }
 
 /// Validate absent participation accounts at end of block.
@@ -2758,7 +2825,7 @@ pub(crate) fn total_online_voting_stake<L: crate::store_trait::LedgerStore>(stor
 /// 3. the account is `Online`, has non-zero balance, and is `IncentiveEligible`
 /// 4. the account is *actually* absent: either [`is_absent`] (silent for
 ///    longer than its stake-scaled allowance, computed against
-///    [`total_online_voting_stake`]) or it failed the currently-active
+///    [`lookback_total_online_stake`]) or it failed the currently-active
 ///    challenge (`heartbeat::find_challenge` with
 ///    [`heartbeat::ChallengePeriod::Active`] + [`heartbeat::Challenge::failed`])
 ///
@@ -2795,14 +2862,13 @@ fn validate_absent_online_accounts<L: crate::store_trait::LedgerStore>(
         });
     }
 
-    // Total online stake and the currently-active challenge (go's
-    // `FindChallenge(..., ChActive)`) are only needed when there's at least
-    // one candidate to check them against -- skip the store scan for the
-    // common case of an empty absentee list.
+    // Total online stake (balance-round lookback, go `onlineStake()`) and the
+    // currently-active challenge (go's `FindChallenge(..., ChActive)`) are only
+    // needed when there's at least one candidate to check them against.
     let (total_online_stake, challenge) = if absent.is_empty() {
         (0, crate::heartbeat::Challenge::default())
     } else {
-        let total = total_online_voting_stake(store);
+        let total = lookback_total_online_stake(store, block.round.0, consensus)?;
         let provider = crate::heartbeat::StoreHeaderProvider { store };
         let ch = crate::heartbeat::find_challenge(
             consensus,
@@ -2844,12 +2910,7 @@ fn validate_absent_online_accounts<L: crate::store_trait::LedgerStore>(
         }
 
         let last_seen = crate::heartbeat::last_seen(acct.last_proposed, acct.last_heartbeat);
-        let acct_stake = acct
-            .micro_algos
-            .saturating_add(crate::rewards::compute_pending_rewards(
-                &acct,
-                store.rewards_level(),
-            ));
+        let acct_stake = lookback_voting_stake(store, block.round.0, consensus, addr)?;
 
         if is_absent(total_online_stake, acct_stake, last_seen, block.round.0) {
             continue; // ok. it's "normal absent"

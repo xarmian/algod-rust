@@ -5478,222 +5478,6 @@ impl SqliteLedger {
         Ok(expired_stake)
     }
 
-    /// Select up to `max_count` currently-online accounts (`accountbase`,
-    /// `normalizedonlinebalance > 0`) whose participation key has expired as
-    /// of `current_round` -- candidates for a self-produced block's
-    /// `expired_participation_accounts` header field.
-    ///
-    /// Mirrors the expiry half of go-algorand's
-    /// `generateKnockOfflineAccountsList` (`ledger/eval/eval.go`, v41): a
-    /// candidate has a nonempty vote key, a nonzero balance (go skips
-    /// `MicroAlgosWithRewards.IsZero()` -- closing accounts), and
-    /// `VoteLastValid != 0 && VoteLastValid < current_round` (`current_round`
-    /// being the round of the block being built, i.e. go's `eval.Round()`).
-    /// This covers only the expiry list, not go's absent/suspend list
-    /// (`AbsentParticipationAccounts`, gated on the payouts feature) -- that
-    /// is a separate mechanism (issue #526 is scoped to expiry only) -- and
-    /// does not exclude the node's own participating addresses, since
-    /// dev-mode block production holds no participation keys of its own.
-    ///
-    /// Selection order among more candidates than `max_count` is not
-    /// consensus-significant: go's own selection iterates a Go map, whose
-    /// iteration order is randomized per process ("different nodes may
-    /// propose different lists of addresses based on node state" -- see the
-    /// doc comment on `generateKnockOfflineAccountsList`), so any
-    /// deterministic order is equally valid here. This returns addresses in
-    /// ascending byte order for reproducible tests.
-    pub fn expired_participation_account_candidates(
-        &self,
-        current_round: u64,
-        max_count: usize,
-    ) -> Result<Vec<Address>, AlgoError> {
-        if max_count == 0 {
-            return Ok(Vec::new());
-        }
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT address, data FROM accountbase WHERE normalizedonlinebalance > 0 \
-                 ORDER BY address",
-            )
-            .map_err(|e| AlgoError::Ledger {
-                message: format!(
-                    "prepare expired_participation_account_candidates query error: {e}"
-                ),
-            })?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })
-            .map_err(|e| AlgoError::Ledger {
-                message: format!("query expired_participation_account_candidates error: {e}"),
-            })?;
-
-        let mut out = Vec::new();
-        for row in rows {
-            let (addr_bytes, data) = row.map_err(|e| AlgoError::Ledger {
-                message: format!("read expired_participation_account_candidates row error: {e}"),
-            })?;
-            let account = decode_account_data(&data).map_err(|e| AlgoError::Ledger {
-                message: format!(
-                    "decode expired_participation_account_candidates account error: {e}"
-                ),
-            })?;
-            if account.micro_algos == 0 {
-                continue;
-            }
-            let has_vote_key = account.vote_id.is_some_and(|v| v != [0u8; 32]);
-            if !has_vote_key {
-                continue;
-            }
-            if account.vote_last_valid != 0 && account.vote_last_valid < current_round {
-                let addr_arr: [u8; 32] =
-                    addr_bytes
-                        .try_into()
-                        .map_err(|v: Vec<u8>| AlgoError::Ledger {
-                            message: format!(
-                                "expired_participation_account_candidates: bad address length {} \
-                                 (expected 32)",
-                                v.len()
-                            ),
-                        })?;
-                out.push(Address(addr_arr));
-                if out.len() >= max_count {
-                    break;
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    /// Select up to `consensus.payouts_max_mark_absent` currently-online,
-    /// incentive-eligible accounts (`accountbase`, `normalizedonlinebalance
-    /// > 0`) that should be suspended for absenteeism as of `current_round`
-    /// -- candidates for a self-produced block's
-    /// `absent_participation_accounts` header field.
-    ///
-    /// Mirrors the absentee half of go-algorand's
-    /// `generateKnockOfflineAccountsList` (`ledger/eval/eval.go`, v41): for
-    /// every `Online && IncentiveEligible` candidate not in `exclude`, this
-    /// computes `lastSeen = max(LastProposed, LastHeartbeat)` and the
-    /// account's rewards-adjusted stake, then includes the address when
-    /// [`crate::apply::is_absent`] holds (silent for longer than its
-    /// stake-scaled allowance, against
-    /// [`crate::apply::total_online_voting_stake`]) or the account failed
-    /// the currently-active heartbeat challenge
-    /// ([`crate::heartbeat::find_challenge`] +
-    /// [`crate::heartbeat::Challenge::failed`]).
-    ///
-    /// `exclude` is the union of go's two independent skip conditions --
-    /// `partAddrs.Contains(accountAddr)` (this node's own participation
-    /// addresses, passed in by the caller) and "already added to
-    /// `ExpiredParticipationAccounts` this round, so don't also suspend it"
-    /// (`continue // if marking expired, do not consider suspension`) --
-    /// which the caller (`generate_block`) folds together before calling
-    /// this, since both are simple set-membership skips over the same
-    /// candidate loop.
-    ///
-    /// Selection order among more candidates than the cap is not
-    /// consensus-significant (see `expired_participation_account_candidates`'s
-    /// doc comment on Go's randomized map iteration) -- this returns
-    /// addresses in ascending byte order for reproducible tests, exactly
-    /// like that function.
-    pub fn absent_participation_account_candidates(
-        &self,
-        current_round: u64,
-        consensus: &algo_types::ConsensusParams,
-        exclude: &std::collections::HashSet<Address>,
-    ) -> Result<Vec<Address>, AlgoError> {
-        let max_count = consensus.payouts_max_mark_absent;
-        if max_count == 0 {
-            return Ok(Vec::new());
-        }
-
-        let total_online_stake = crate::apply::total_online_voting_stake(self);
-        let provider = crate::heartbeat::StoreHeaderProvider { store: self };
-        let challenge = crate::heartbeat::find_challenge(
-            consensus,
-            current_round,
-            &provider,
-            crate::heartbeat::ChallengePeriod::Active,
-        );
-
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT address, data FROM accountbase WHERE normalizedonlinebalance > 0 \
-                 ORDER BY address",
-            )
-            .map_err(|e| AlgoError::Ledger {
-                message: format!(
-                    "prepare absent_participation_account_candidates query error: {e}"
-                ),
-            })?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })
-            .map_err(|e| AlgoError::Ledger {
-                message: format!("query absent_participation_account_candidates error: {e}"),
-            })?;
-
-        let mut out = Vec::new();
-        for row in rows {
-            let (addr_bytes, data) = row.map_err(|e| AlgoError::Ledger {
-                message: format!("read absent_participation_account_candidates row error: {e}"),
-            })?;
-            let addr_arr: [u8; 32] =
-                addr_bytes
-                    .clone()
-                    .try_into()
-                    .map_err(|v: Vec<u8>| AlgoError::Ledger {
-                        message: format!(
-                            "absent_participation_account_candidates: bad address length {} \
-                             (expected 32)",
-                            v.len()
-                        ),
-                    })?;
-            let addr = Address(addr_arr);
-
-            if exclude.contains(&addr) {
-                continue;
-            }
-
-            let account = decode_account_data(&data).map_err(|e| AlgoError::Ledger {
-                message: format!(
-                    "decode absent_participation_account_candidates account error: {e}"
-                ),
-            })?;
-
-            if account.micro_algos == 0 {
-                continue; // don't check accounts that are being closed
-            }
-            if account.status != AccountStatus::Online || !account.incentive_eligible {
-                continue;
-            }
-
-            let last_seen =
-                crate::heartbeat::last_seen(account.last_proposed, account.last_heartbeat);
-            let acct_stake =
-                account
-                    .micro_algos
-                    .saturating_add(crate::rewards::compute_pending_rewards(
-                        &account,
-                        self.rewards_level,
-                    ));
-
-            if crate::apply::is_absent(total_online_stake, acct_stake, last_seen, current_round)
-                || challenge.failed(&addr.0, last_seen)
-            {
-                out.push(addr);
-                if out.len() >= max_count {
-                    break;
-                }
-            }
-        }
-        Ok(out)
-    }
-
     /// Look up an account's online data at a specific round from the
     /// `onlineaccounts` table.
     ///
@@ -14813,9 +14597,9 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // absent_participation_account_candidates (issue #845): proposal-side
-    // absentee computation, mirroring go-algorand's
-    // generateKnockOfflineAccountsList absentee half.
+    // knock_offline_lists (issues #526, #845, #1795): proposal-side expired /
+    // absent computation, mirroring go-algorand's
+    // generateKnockOfflineAccountsList.
     // ---------------------------------------------------------------------
 
     fn consensus_v41() -> algo_types::ConsensusParams {
@@ -14823,83 +14607,72 @@ mod tests {
             .expect("v41 consensus params")
     }
 
+    fn lists(
+        ledger: &SqliteLedger,
+        round: u64,
+        consensus: &algo_types::ConsensusParams,
+        exclude: &std::collections::HashSet<Address>,
+        touched: &[Address],
+    ) -> crate::apply::KnockOfflineLists {
+        crate::apply::knock_offline_lists(ledger, round, consensus, exclude, touched)
+    }
+
+    fn absent_acct(last_heartbeat: u64) -> AccountData {
+        AccountData {
+            micro_algos: 5_000_000,
+            status: AccountStatus::Online,
+            incentive_eligible: true,
+            last_heartbeat,
+            ..AccountData::default()
+        }
+    }
+
+    fn keyed_acct(status: AccountStatus, vote_last_valid: u64) -> AccountData {
+        AccountData {
+            micro_algos: 5_000_000,
+            status,
+            vote_id: Some([7u8; 32]),
+            vote_last_valid,
+            ..AccountData::default()
+        }
+    }
+
     #[test]
     fn absent_candidates_includes_genuinely_absent_online_account() {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
         let addr = Address([9u8; 32]);
-        ledger.set_account(
-            &addr,
-            AccountData {
-                micro_algos: 5_000_000,
-                status: AccountStatus::Online,
-                incentive_eligible: true,
-                last_heartbeat: 1,
-                ..AccountData::default()
-            },
-        );
+        ledger.set_account(&addr, absent_acct(1));
 
-        // Single online account: total_online_voting_stake == its own
-        // stake, so is_absent's allowable_lag is exactly ABSENT_FACTOR
-        // (20). last_seen(1) + 20 = 21 < 101.
-        let candidates = ledger
-            .absent_participation_account_candidates(
-                101,
-                &consensus_v41(),
-                &std::collections::HashSet::new(),
-            )
-            .expect("absent_participation_account_candidates");
-        assert_eq!(candidates, vec![addr]);
+        // Single online account: the lookback total equals its own stake, so
+        // is_absent's allowable_lag is exactly ABSENT_FACTOR (20).
+        // last_seen(1) + 20 = 21 < 101.
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
+        assert_eq!(l.absent, vec![addr]);
     }
 
     #[test]
     fn absent_candidates_excludes_recently_seen_account() {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
-        let addr = Address([9u8; 32]);
-        ledger.set_account(
-            &addr,
-            AccountData {
-                micro_algos: 5_000_000,
-                status: AccountStatus::Online,
-                incentive_eligible: true,
-                last_heartbeat: 100,
-                ..AccountData::default()
-            },
-        );
+        ledger.set_account(&Address([9u8; 32]), absent_acct(100));
+        // Lookback total = the account's own stake, so the lag is 20.
+        ledger.put_online_supply_at_round(0, 5_000_000).unwrap();
 
         // last_seen(100) + 20 = 120, not < 101.
-        let candidates = ledger
-            .absent_participation_account_candidates(
-                101,
-                &consensus_v41(),
-                &std::collections::HashSet::new(),
-            )
-            .expect("absent_participation_account_candidates");
-        assert!(candidates.is_empty());
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
+        assert!(l.absent.is_empty());
     }
 
     #[test]
     fn absent_candidates_excludes_addresses_in_exclude_set() {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
         let addr = Address([9u8; 32]);
-        ledger.set_account(
-            &addr,
-            AccountData {
-                micro_algos: 5_000_000,
-                status: AccountStatus::Online,
-                incentive_eligible: true,
-                last_heartbeat: 1,
-                ..AccountData::default()
-            },
-        );
+        ledger.set_account(&addr, absent_acct(1));
 
-        let mut exclude = std::collections::HashSet::new();
-        exclude.insert(addr);
-        let candidates = ledger
-            .absent_participation_account_candidates(101, &consensus_v41(), &exclude)
-            .expect("absent_participation_account_candidates");
+        let exclude: std::collections::HashSet<Address> = [addr].into_iter().collect();
+        let l = lists(&ledger, 101, &consensus_v41(), &exclude, &[]);
         assert!(
-            candidates.is_empty(),
-            "excluded address (own participation / already-expired) must never appear"
+            l.absent.is_empty(),
+            "an own participation address must never appear"
         );
     }
 
@@ -14908,29 +14681,13 @@ mod tests {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
         let mut consensus = consensus_v41();
         consensus.payouts_max_mark_absent = 1;
-
         for i in 0..3u8 {
-            let addr = Address([i + 1; 32]);
-            ledger.set_account(
-                &addr,
-                AccountData {
-                    micro_algos: 5_000_000,
-                    status: AccountStatus::Online,
-                    incentive_eligible: true,
-                    last_heartbeat: 1,
-                    ..AccountData::default()
-                },
-            );
+            ledger.set_account(&Address([i + 1; 32]), absent_acct(1));
         }
 
-        let candidates = ledger
-            .absent_participation_account_candidates(
-                101,
-                &consensus,
-                &std::collections::HashSet::new(),
-            )
-            .expect("absent_participation_account_candidates");
-        assert_eq!(candidates.len(), 1, "capped at payouts_max_mark_absent");
+        let l = lists(&ledger, 101, &consensus, &Default::default(), &[]);
+        assert_eq!(l.absent.len(), 1, "capped at payouts_max_mark_absent");
+        assert_eq!(l.absent, vec![Address([1u8; 32])], "lowest address first");
     }
 
     #[test]
@@ -14938,26 +14695,90 @@ mod tests {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
         let mut consensus = consensus_v41();
         consensus.payouts_max_mark_absent = 0;
-        let addr = Address([9u8; 32]);
-        ledger.set_account(
-            &addr,
-            AccountData {
-                micro_algos: 5_000_000,
-                status: AccountStatus::Online,
-                incentive_eligible: true,
-                last_heartbeat: 1,
-                ..AccountData::default()
-            },
+        ledger.set_account(&Address([9u8; 32]), absent_acct(1));
+
+        let l = lists(&ledger, 101, &consensus, &Default::default(), &[]);
+        assert!(l.absent.is_empty());
+    }
+
+    #[test]
+    fn expired_candidates_respect_max_proposed_expired_cap() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let mut consensus = consensus_v41();
+        consensus.max_proposed_expired_online_accounts = 2;
+        for i in 0..4u8 {
+            ledger.set_account(&Address([i + 1; 32]), keyed_acct(AccountStatus::Online, 50));
+        }
+
+        let l = lists(&ledger, 101, &consensus, &Default::default(), &[]);
+        assert_eq!(
+            l.expired,
+            vec![Address([1u8; 32]), Address([2u8; 32])],
+            "capped at max_proposed_expired_online_accounts, lowest addresses first"
         );
 
-        let candidates = ledger
-            .absent_participation_account_candidates(
-                101,
-                &consensus,
-                &std::collections::HashSet::new(),
-            )
-            .expect("absent_participation_account_candidates");
-        assert!(candidates.is_empty());
+        consensus.max_proposed_expired_online_accounts = 0;
+        let l = lists(&ledger, 101, &consensus, &Default::default(), &[]);
+        assert!(l.expired.is_empty(), "feature disabled at cap 0");
+    }
+
+    /// go's expiry check is `!VoteID.IsEmpty() && VoteLastValid < current` --
+    /// no `VoteLastValid != 0` exemption.
+    #[test]
+    fn expired_candidates_include_a_zero_vote_last_valid() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([9u8; 32]);
+        ledger.set_account(&addr, keyed_acct(AccountStatus::Online, 0));
+
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
+        assert_eq!(l.expired, vec![addr]);
+    }
+
+    /// go expires any modified account holding voting data, whatever its
+    /// status: an offline (suspended) account that keeps its keys is listed
+    /// when the block touches it, but an untouched one is not a candidate.
+    #[test]
+    fn expired_candidates_include_a_touched_offline_account_with_keys() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([9u8; 32]);
+        ledger.set_account(&addr, keyed_acct(AccountStatus::Offline, 50));
+
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
+        assert!(l.expired.is_empty(), "untouched offline account");
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[addr]);
+        assert_eq!(l.expired, vec![addr], "touched offline account with keys");
+    }
+
+    #[test]
+    fn candidates_skip_zero_balance_accounts() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([9u8; 32]);
+        let mut acct = keyed_acct(AccountStatus::Offline, 50);
+        acct.micro_algos = 0;
+        ledger.set_account(&addr, acct);
+
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[addr]);
+        assert!(l.expired.is_empty(), "an account being closed is skipped");
+    }
+
+    /// go's absence test reads the total online stake and the account's
+    /// stake at the balance round, not from the state after the payset: a
+    /// lookback total far above today's online sum keeps a quiet account from
+    /// being listed.
+    #[test]
+    fn absent_candidates_use_the_balance_round_lookback_total() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([9u8; 32]);
+        ledger.set_account(&addr, absent_acct(1));
+        // Round 101's balance round is 0 (saturating): seed that snapshot.
+        ledger.put_online_supply_at_round(0, 5_000_000).unwrap();
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
+        assert_eq!(l.absent, vec![addr], "lag 20 -> absent");
+
+        // The same account against a lookback total 100x larger: lag 2000.
+        ledger.put_online_supply_at_round(0, 500_000_000).unwrap();
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
+        assert!(l.absent.is_empty(), "lag 2000 -> not absent");
     }
 
     // -- Issue #1758: rollback / failed commit restore the in-memory chain state --

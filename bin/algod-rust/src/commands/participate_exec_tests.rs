@@ -880,8 +880,7 @@ fn proposal_with_a_state_proof_txn_carries_the_advanced_next_round() {
     // A replica's real apply of the same payset agrees with the header.
     let (replica, _p) = fixture_with_tracking(&accounts, &[], spt(1024));
     let mut l = replica.lock().unwrap();
-    let scratch =
-        scratch_execute_payset(&mut *l, &block, &Default::default()).expect("replica apply");
+    let scratch = scratch_execute_payset(&mut *l, &block, None).expect("replica apply");
     assert_eq!(scratch.final_state_proof_next, Some(proposed));
     // Everything else the apply derives matches too.
     assert_eq!(scratch.final_txn_counter, block.txn_counter);
@@ -1437,4 +1436,140 @@ fn own_participating_address_is_never_listed_expired() {
         block.expired_participation_accounts.as_deref(),
         Some(&[c.0][..])
     );
+}
+
+/// The absent list also skips the proposer's own addresses (go `partAddrs`).
+#[test]
+fn own_participating_address_is_never_listed_absent() {
+    let a = key(1);
+    let b = key(2);
+    let c = key(3);
+    let absent = |micro| AccountData {
+        micro_algos: micro,
+        status: algo_types::AccountStatus::Online,
+        incentive_eligible: true,
+        last_heartbeat: 1,
+        ..Default::default()
+    };
+    let (_ledger, mut eval) = evaluator_at_99(&[
+        (a.0, funded(50_000_000)),
+        (b.0, absent(5_000_000)),
+        (c.0, absent(5_000_000)),
+    ]);
+    eval.transaction_group(&[pay(&a, a.0, 1, None)])
+        .expect("payment");
+    let block = eval.generate_block(&[b.0]).expect("generate_block");
+    assert_eq!(block.payset.len(), 1);
+    assert_eq!(
+        block.absent_participation_accounts.as_deref(),
+        Some(&[c.0][..])
+    );
+}
+
+/// With nothing in the payset the post-payset state IS the ledger tip, so
+/// the lists come straight from it.
+#[test]
+fn empty_payset_lists_come_from_the_ledger_tip() {
+    let c = key(3);
+    let (_ledger, mut eval) = evaluator_at_99(&[(c.0, online_with_key(5_000_000, 60))]);
+    let block = eval.generate_block(&[]).expect("generate_block");
+    assert!(block.payset.is_empty());
+    assert_eq!(
+        block.expired_participation_accounts.as_deref(),
+        Some(&[c.0][..])
+    );
+}
+
+/// A non-empty payset that no scratch apply evaluated (legacy path without
+/// exec state) must not borrow the pre-payset tip's lists: they are empty,
+/// which is always valid.
+#[test]
+fn non_empty_payset_without_a_scratch_result_gets_empty_lists() {
+    let a = key(1);
+    let c = key(3);
+    let (_ledger, mut eval) = evaluator_at_99(&[
+        (a.0, funded(50_000_000)),
+        (c.0, online_with_key(5_000_000, 60)),
+    ]);
+    eval.exec = None;
+    let mut stx = pay(&a, a.0, 1, None);
+    eval.genesis_rule().strip(&mut stx);
+    eval.included_txns.push(stx);
+    let block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(block.payset.len(), 1);
+    assert!(block.expired_participation_accounts.is_none());
+    assert!(block.absent_participation_accounts.is_none());
+}
+
+/// The same when the scratch apply cannot run for a non-empty payset: the
+/// proposal is retried/bisected down to an empty payset (tip lists) or keeps
+/// the evaluated prefix (its own lists), never a stale mix.
+#[test]
+fn lists_always_describe_the_payset_that_was_kept() {
+    let a = key(1);
+    let c = key(3);
+    let (_ledger, mut eval) = evaluator_at_99(&[
+        (a.0, funded(50_000_000)),
+        (c.0, online_with_key(5_000_000, 60)),
+    ]);
+    eval.transaction_group(&[pay(&a, a.0, 1, None)])
+        .expect("payment");
+    let block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(block.payset.len(), 1);
+    assert_eq!(
+        block.expired_participation_accounts.as_deref(),
+        Some(&[c.0][..])
+    );
+}
+
+/// go judges absence against the balance-round lookback stake, so a payset
+/// that moves online stake in this very block does not change who is listed
+/// (go TestWhaleJoin). The lookback total (100M, seeded at the balance round)
+/// keeps a 5M account at lag 400 > 99 quiet rounds, although the online sum
+/// after the payset (about 6M) would make it absent; the replica's validating
+/// apply, which uses the same lookback, accepts the block.
+#[test]
+fn absent_list_uses_the_lookback_stake_not_the_post_payset_sum() {
+    let x = key(1);
+    let z = key(2);
+    let b = key(3);
+    let (ledger, mut eval) = evaluator_at_99(&[
+        (
+            x.0,
+            AccountData {
+                micro_algos: 5_000_000,
+                status: algo_types::AccountStatus::Online,
+                incentive_eligible: true,
+                last_heartbeat: 1,
+                ..Default::default()
+            },
+        ),
+        (
+            z.0,
+            AccountData {
+                micro_algos: 5_000_000,
+                status: algo_types::AccountStatus::Online,
+                ..Default::default()
+            },
+        ),
+        (b.0, funded(1_000_000)),
+    ]);
+    ledger
+        .lock()
+        .unwrap()
+        .put_online_supply_at_round(0, 100_000_000)
+        .unwrap();
+    // Z moves most of its online stake to an offline account.
+    eval.transaction_group(&[pay(&z, b.0, 4_000_000, None)])
+        .expect("payment");
+    let mut block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(block.payset.len(), 1);
+    assert!(
+        block.absent_participation_accounts.is_none(),
+        "lookback lag 400 > 99: not absent, whatever the post-payset online sum says"
+    );
+    block.proposer = b.0;
+    let mut l = ledger.lock().unwrap();
+    algo_ledger::apply_block_validating(&mut *l, &block)
+        .expect("a proposer-built block must pass the validating apply");
 }
