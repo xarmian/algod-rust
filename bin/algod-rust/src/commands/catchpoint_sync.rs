@@ -436,13 +436,13 @@ impl SyncBackend for AlgodSyncBackend {
 
         tokio::task::block_in_place(|| {
             self.rt.block_on(async {
-                let source: Arc<dyn BlockSource> =
-                    Arc::new(AlgodClient::new(&self.algod_url, &self.algod_token));
-                let fetcher = ParallelBlockFetcher::new(source, concurrency).with_drain_timeout(
-                    sync_tuning().drain_budget(
-                        algo_rest_client::ClientConfig::default().worst_case_request_time(),
-                    ),
-                );
+                let client = AlgodClient::new(&self.algod_url, &self.algod_token);
+                // Size the drain from the client's own timeouts, not a
+                // separately constructed default (issue #1755).
+                let drain = sync_tuning().drain_budget(client.worst_case_request_time());
+                let source: Arc<dyn BlockSource> = Arc::new(client);
+                let fetcher =
+                    ParallelBlockFetcher::new(source, concurrency).with_drain_timeout(drain);
                 collect_block_range(&fetcher, start, end, cancel).await
             })
         })
