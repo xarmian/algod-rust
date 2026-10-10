@@ -717,6 +717,16 @@ pub trait LedgerStore {
         vote_rnd: u64,
     ) -> Result<u64, AlgoError>;
 
+    /// Whether the online-account history around `balance_round` includes
+    /// rows that were synthesized from current account state when a legacy
+    /// database was upgraded, so go's stake figures cannot be reproduced for it
+    /// (an account that really went online recently reads as online for the
+    /// whole window). While true, the stake-based absence test is undecidable:
+    /// the proposer lists nobody by lag and the validator skips the test
+    /// rather than rejecting. `false` for every ledger whose history was
+    /// maintained from its start. Issue #1795.
+    fn absence_history_uncertain(&self, balance_round: u64) -> bool;
+
     /// Store a voters snapshot -- `(voters_commitment, online_total_weight)`
     /// -- keyed by the round it was taken at (go's `votersForRoundCache` map
     /// key).

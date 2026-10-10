@@ -2657,29 +2657,44 @@ impl SqliteLedger {
     /// Upgrade path for a database synced before the `onlineaccounts` history
     /// was maintained at every commit (only catchpoint import populated it):
     /// an account that went online since then is `Online` in `accountbase` but
-    /// has no history row, so without the data it would read as stake 0 at the
-    /// balance round and valid go blocks listing it absent would be rejected.
+    /// has no history row, so it would read as stake 0 at the balance round.
     ///
-    /// Policy: every currently-online account with NO history row at all gets
-    /// one, dated at the earliest balance round the next blocks can look up
-    /// (`tip + 1 - lookback`), i.e. it is treated as online throughout the
-    /// window. The true online-since round is unknowable from the account
-    /// state; this is exact for accounts that were online across the whole
-    /// window and an approximation (logged) for accounts that joined within
-    /// it, and it expires by itself once the window has passed. Without it the
-    /// node would stall on valid blocks. Accounts that already have any row
-    /// (live commits, catchpoint import) are never touched.
+    /// Runs once: the `acctrounds` row `onlinebackfill` is the marker that the
+    /// database has been checked. Every currently-online account with NO
+    /// history row gets one, in a single transaction together with the marker,
+    /// dated at the earliest balance round upcoming blocks can look up
+    /// (`tip + 1 - lookback`) -- the best available stake for
+    /// `voter_params_get`. The true online-since round is unknowable, so those
+    /// rows are SYNTHETIC: the marker value is the tip they were made at, and
+    /// while a balance round is below it ([`LedgerStore::absence_history_uncertain`])
+    /// the stake-based absence test is undecidable (the proposer lists nobody
+    /// by lag, the validator skips the test), because a quiet account that
+    /// really joined recently would otherwise be listed absent while go sees
+    /// stake 0. From balance round `tip` on, rows are real and the checks decide
+    /// normally. Marker value 0 means nothing was synthesized (a fresh or
+    /// catchpoint-imported database).
     fn backfill_legacy_online_history(&self) -> Result<(), AlgoError> {
-        let tip = self.current_round.0;
-        if tip == 0 {
+        let done: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT rnd FROM acctrounds WHERE id = 'onlinebackfill'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("read onlinebackfill marker error: {e}"),
+            })?;
+        if done.is_some() {
             return Ok(());
         }
+        let tip = self.current_round.0;
         let max_bal_lookback = algo_types::consensus::consensus_params_for_version(&self.protocol)
             .map(|p| p.max_bal_lookback)
             .unwrap_or(crate::catchpoint::writer::DEFAULT_MAX_BAL_LOOKBACK);
         let row_round = (tip + 1).saturating_sub(max_bal_lookback);
         let mut missing: Vec<(Address, AccountData)> = Vec::new();
-        {
+        if tip > 0 {
             let mut stmt = self
                 .conn
                 .prepare(
@@ -2713,19 +2728,36 @@ impl SqliteLedger {
                 missing.push((Address(addr), decode_account_data(&data)?));
             }
         }
-        if missing.is_empty() {
-            return Ok(());
-        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("begin legacy online-history backfill error: {e}"),
+            })?;
         for (addr, acct) in &missing {
             self.insert_online_account_row(addr, row_round, acct)?;
         }
-        tracing::warn!(
-            accounts = missing.len(),
-            tip,
-            row_round,
-            "online-account history predates this database: backfilled one row per online \
-             account at the start of the lookback window (approximation until the window passes)"
-        );
+        let history_since = if missing.is_empty() { 0 } else { tip };
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('onlinebackfill', ?1)",
+                params![history_since as i64],
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("write onlinebackfill marker error: {e}"),
+            })?;
+        tx.commit().map_err(|e| AlgoError::Ledger {
+            message: format!("commit legacy online-history backfill error: {e}"),
+        })?;
+        if !missing.is_empty() {
+            tracing::warn!(
+                accounts = missing.len(),
+                tip,
+                row_round,
+                "online-account history predates this database: synthesized one row per online \
+                 account; stake-based absence is undecidable until balance round {tip}"
+            );
+        }
         Ok(())
     }
 
@@ -5649,6 +5681,35 @@ impl SqliteLedger {
         Ok(expired_stake)
     }
 
+    /// Test fixture: write a minimal block header carrying `rewards_level` at
+    /// `round` (what a real block commit would have stored), for ledgers that
+    /// are built without real blocks. Not part of any consensus path.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn put_block_header_fixture(
+        &self,
+        round: u64,
+        rewards_level: u64,
+    ) -> Result<(), AlgoError> {
+        let hdr = algo_types::BlockHeader {
+            round: Round(round),
+            rewards_level,
+            ..algo_types::BlockHeader::default()
+        };
+        let hdrdata = rmp_serde::to_vec_named(&hdr).map_err(|e| AlgoError::Ledger {
+            message: format!("encode fixture header: {e}"),
+        })?;
+        self.conn
+            .execute(
+                "INSERT INTO blockdb.blocks (rnd, proto, hdrdata, blkdata) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(rnd) DO UPDATE SET hdrdata=excluded.hdrdata",
+                params![round as i64, self.protocol, hdrdata, &[] as &[u8]],
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("insert fixture header error: {e}"),
+            })?;
+        Ok(())
+    }
+
     /// The rewards level at `round`'s block header -- the one place both the
     /// per-account stake ([`Self::lookup_agreement_account`]) and the derived
     /// total ([`Self::derive_online_supply_from_history`]) take it from, so
@@ -5657,9 +5718,9 @@ impl SqliteLedger {
     /// Consensus-critical, NO fallback: a header that cannot be read or decoded
     /// is an error, and so is a header that is missing -- reading the current
     /// level instead would silently mix time bases (the validator rejects the
-    /// block; the proposer skips the stake-based listing). Only test builds
-    /// (`test-hooks` / `cfg(test)`) fall back for ledgers built without
-    /// headers, unless a test opts into the strict behavior.
+    /// block; the proposer skips the stake-based listing). There is no
+    /// test-only fallback: test builds exercise this same path, so fixtures
+    /// write the headers they need ([`Self::put_block_header_fixture`]).
     ///
     /// Only COMMITTED headers are cached: a header at or above the in-flight
     /// block's round may belong to a scratch apply that is rolled back.
@@ -5681,22 +5742,9 @@ impl SqliteLedger {
                 }
                 Ok(level)
             }
-            None => {
-                #[cfg(any(test, feature = "test-hooks"))]
-                if !crate::shadow_execute::test_hooks::strict_balance_round_headers() {
-                    tracing::debug!(
-                        round,
-                        "test ledger without a block header at the balance round; \
-                         using the current rewards level"
-                    );
-                    return Ok(self.rewards_level());
-                }
-                Err(AlgoError::Ledger {
-                    message: format!(
-                        "no block header at round {round} to read its rewards level from"
-                    ),
-                })
-            }
+            None => Err(AlgoError::Ledger {
+                message: format!("no block header at round {round} to read its rewards level from"),
+            }),
         }
     }
 
@@ -8016,6 +8064,21 @@ impl LedgerStore for SqliteLedger {
 
     fn online_stake_at_round(&self, round: u64, vote_rnd: u64) -> Result<u64, AlgoError> {
         self.online_circulation_at_round(round, vote_rnd)
+    }
+
+    /// True while `balance_round` is below the tip at which a legacy database's
+    /// synthetic history rows were made (see `backfill_legacy_online_history`).
+    fn absence_history_uncertain(&self, balance_round: u64) -> bool {
+        let since: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT rnd FROM acctrounds WHERE id = 'onlinebackfill'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap_or(None);
+        since.is_some_and(|since| since > 0 && balance_round < since as u64)
     }
 
     /// go's `OnlineCirculation(balanceRound, round)` on the history basis: the
@@ -14910,6 +14973,8 @@ mod tests {
     fn set_online(ledger: &mut SqliteLedger, addr: &Address, acct: AccountData) {
         ledger.set_account(addr, acct.clone());
         ledger.put_online_account_at_round(addr, 0, &acct).unwrap();
+        // The balance-round header the lookups read the rewards level from.
+        ledger.put_block_header_fixture(0, 0).unwrap();
     }
 
     fn keyed_acct(status: AccountStatus, vote_last_valid: u64) -> AccountData {
@@ -14970,7 +15035,7 @@ mod tests {
         acct.rewards_base = 100;
         ledger.set_account(&addr, acct.clone());
         ledger.put_online_account_at_round(&addr, 0, &acct).unwrap();
-        ledger.set_rewards_level(125); // 25 levels * 10_000 units
+        ledger.put_block_header_fixture(0, 125).unwrap(); // 25 levels * 10_000 units
         assert_eq!(
             ledger
                 .voter_agreement_data_at_round(0, &addr)
@@ -14980,7 +15045,8 @@ mod tests {
         );
         // No change at the account's own level, and no wrap-around for an
         // older lookup level.
-        ledger.set_rewards_level(100);
+        ledger.put_block_header_fixture(0, 100).unwrap();
+        ledger.rewards_cache.put(u64::MAX, 0); // drop any cached level for round 0
         assert_eq!(
             ledger
                 .voter_agreement_data_at_round(0, &addr)
@@ -14988,7 +15054,8 @@ mod tests {
                 .micro_algos,
             10_000_000_000
         );
-        ledger.set_rewards_level(50);
+        ledger.put_block_header_fixture(0, 50).unwrap();
+        ledger.rewards_cache.put(u64::MAX, 0);
         assert_eq!(
             ledger
                 .voter_agreement_data_at_round(0, &addr)
@@ -15072,7 +15139,7 @@ mod tests {
             ledger.set_current_round(Round(r));
             ledger.commit_block().unwrap();
         }
-        for round in [0u64, 3, 500] {
+        for round in [0u64, 3, 5] {
             assert_eq!(
                 ledger
                     .voter_agreement_data_at_round(round, &addr)
@@ -15417,6 +15484,8 @@ mod tests {
         importer.atomic_cutover(&header).unwrap();
 
         let brnd = tip + 1 - 320;
+        // A catchpoint-synced node also holds the lookback window's headers.
+        ledger.put_block_header_fixture(brnd, 0).unwrap();
         assert!(ledger.online_supply_at_round(brnd).unwrap().is_some());
         assert_eq!(
             ledger
@@ -15521,68 +15590,95 @@ mod tests {
     /// validator rejects) and the proposer lists nobody absent.
     #[test]
     fn missing_balance_round_header_fails_closed() {
-        use crate::shadow_execute::test_hooks;
-        test_hooks::set_strict_balance_round_headers(true);
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
-        set_online(&mut ledger, &Address([9u8; 32]), absent_acct(1));
         let addr = Address([9u8; 32]);
+        // History rows but NO block header at the balance round (round 0).
+        ledger.set_account(&addr, absent_acct(1));
+        ledger
+            .put_online_account_at_round(&addr, 0, &absent_acct(1))
+            .unwrap();
         let stake = ledger.voter_agreement_data_at_round(0, &addr);
         let total = ledger.balance_round_total_online_stake(0, 101);
         let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
-        test_hooks::set_strict_balance_round_headers(false);
         assert!(stake.is_err(), "no header at round 0");
         assert!(total.is_err());
         assert!(l.absent.is_empty());
     }
 
-    /// Upgrade path: a database from before the history table was maintained
-    /// (accounts online in `accountbase`, no `onlineaccounts` rows) is
-    /// backfilled when it is opened, so `voter_params_get` sees the real stake
-    /// and the absence checks still decide instead of rejecting valid blocks.
+    fn legacy_ledger_with_quiet_new_account(prefix: &std::path::Path) -> (Address, Address) {
+        let x = Address([9u8; 32]); // online since round 350, quiet (last seen 1)
+        let z = Address([10u8; 32]); // online since round 1
+        let mut ledger = SqliteLedger::open_with_prefix(prefix).unwrap();
+        for r in 1..=400u64 {
+            ledger.begin_block().unwrap();
+            ledger.set_current_round(Round(r));
+            if r == 1 {
+                ledger.set_account(&z, absent_acct(1));
+            }
+            if r == 350 {
+                ledger.set_account(&x, absent_acct(1));
+            }
+            ledger.commit_block().unwrap();
+        }
+        drop(ledger);
+        // Make it legacy-shaped: the history, the supply tail and the marker
+        // never existed.
+        let conn = Connection::open(tracker_path_for_prefix(prefix)).unwrap();
+        conn.execute("DELETE FROM onlineaccounts", []).unwrap();
+        conn.execute("DELETE FROM onlineroundparamstail", [])
+            .unwrap();
+        conn.execute("DELETE FROM acctrounds WHERE id = 'onlinebackfill'", [])
+            .unwrap();
+        (x, z)
+    }
+
+    fn history_rows(ledger: &SqliteLedger) -> i64 {
+        ledger
+            .conn
+            .query_row("SELECT COUNT(*) FROM onlineaccounts", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Upgrade path: a database from before the history was maintained gets
+    /// one synthetic row per online account when it is opened (in one
+    /// transaction, once), so `voter_params_get` sees the best available stake.
+    /// The rows are marked synthetic: until the lookback window has passed on
+    /// real rows the stake-based absence test is undecidable -- the proposer
+    /// lists nobody by lag (a quiet account that really joined 50 rounds ago
+    /// would otherwise be listed absent while go sees stake 0) and the
+    /// validator skips rather than rejects -- and afterwards it behaves
+    /// normally. The marker keeps a second open from backfilling again.
     #[test]
-    fn legacy_database_without_online_history_is_backfilled_on_open() {
+    fn legacy_database_is_backfilled_once_and_absence_is_undecidable_until_the_window_passes() {
         let dir = tempfile::tempdir().unwrap();
         let prefix = dir.path().join("ledger");
-        let x = Address([9u8; 32]);
-        let z = Address([10u8; 32]);
-        {
-            let mut ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
-            ledger.begin_block().unwrap();
-            ledger.set_current_round(Round(1));
-            ledger.set_account(&x, absent_acct(1));
-            ledger.set_account(&z, absent_acct(1));
-            ledger.commit_block().unwrap();
-            for r in 2..=400u64 {
-                ledger.begin_block().unwrap();
-                ledger.set_current_round(Round(r));
-                ledger.commit_block().unwrap();
-            }
-        }
-        // Make it legacy-shaped: the history and the supply tail never existed.
-        {
-            let conn = Connection::open(tracker_path_for_prefix(&prefix)).unwrap();
-            conn.execute("DELETE FROM onlineaccounts", []).unwrap();
-            conn.execute("DELETE FROM onlineroundparamstail", [])
-                .unwrap();
-        }
+        let (x, z) = legacy_ledger_with_quiet_new_account(&prefix);
+
         let ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
         assert_eq!(ledger.current_round().0, 400);
+        assert_eq!(
+            history_rows(&ledger),
+            2,
+            "one synthetic row per online account"
+        );
         let brnd = 401 - 320;
+        assert!(ledger.absence_history_uncertain(brnd));
+        assert!(!ledger.absence_history_uncertain(400));
+        ledger.put_block_header_fixture(brnd, 0).unwrap();
         assert_eq!(
             ledger
                 .voter_agreement_data_at_round(brnd, &x)
                 .unwrap()
                 .micro_algos,
             5_000_000,
-            "voter_params_get sees the real stake"
+            "voter_params_get: the best available stake"
         );
-        assert_eq!(
-            ledger.balance_round_total_online_stake(brnd, 401).unwrap(),
-            10_000_000
-        );
+
+        // Undecidable: nobody is listed by lag, though under the synthetic
+        // history x (last seen at round 1) would look absent ...
         let l = lists(&ledger, 401, &consensus_v41(), &Default::default(), &[]);
-        assert_eq!(l.absent, vec![x, z]);
-        // The validating path agrees: a go-listed absent account is accepted.
+        assert!(l.absent.is_empty(), "{:?}", l.absent);
+        // ... and a peer block listing x is not rejected.
         let block = algo_types::Block {
             round: Round(401),
             current_protocol: algo_types::CONSENSUS_V41.to_string(),
@@ -15590,15 +15686,61 @@ mod tests {
             ..algo_types::Block::default()
         };
         crate::apply::validate_absent_online_accounts(&ledger, &block, &consensus_v41(), true)
-            .expect("backfilled history: the listed account is absent");
-        // Reopening again changes nothing (rows already exist).
+            .expect("skipped, not rejected, while the history is synthetic");
+
+        // The marker prevents a second run.
         drop(ledger);
-        let ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
-        let n: i64 = ledger
-            .conn
-            .query_row("SELECT COUNT(*) FROM onlineaccounts", [], |r| r.get(0))
+        {
+            let conn = Connection::open(tracker_path_for_prefix(&prefix)).unwrap();
+            conn.execute(
+                "DELETE FROM onlineaccounts WHERE address = ?1",
+                params![x.0.as_slice()],
+            )
             .unwrap();
-        assert_eq!(n, 2);
+        }
+        let mut ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
+        assert_eq!(history_rows(&ledger), 1, "not backfilled again");
+        // Put x's row back to continue (as the first open made it).
+        ledger
+            .put_online_account_at_round(&x, 81, &absent_acct(1))
+            .unwrap();
+
+        // Once the window has passed (block 721's balance round 401 >= 400) the
+        // history is real and the checks decide normally.
+        ledger
+            .put_account_totals_seed(10_000_000, 0, 0, 0, 0, 0)
+            .unwrap();
+        for r in 401..=720u64 {
+            ledger.begin_block().unwrap();
+            ledger.set_current_round(Round(r));
+            ledger.commit_block().unwrap();
+        }
+        assert!(!ledger.absence_history_uncertain(401));
+        let l = lists(&ledger, 721, &consensus_v41(), &Default::default(), &[]);
+        assert_eq!(
+            l.absent,
+            vec![x, z],
+            "decidable again: both are long silent"
+        );
+    }
+
+    /// A fresh database has nothing to synthesize: the marker is 0 and no
+    /// balance round is ever uncertain.
+    #[test]
+    fn fresh_database_has_no_uncertain_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SqliteLedger::open_with_prefix(&dir.path().join("ledger")).unwrap();
+        let marker: i64 = ledger
+            .conn
+            .query_row(
+                "SELECT rnd FROM acctrounds WHERE id = 'onlinebackfill'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, 0);
+        assert!(!ledger.absence_history_uncertain(0));
+        assert!(!ledger.absence_history_uncertain(1_000_000));
     }
 
     // -- Issue #1758: rollback / failed commit restore the in-memory chain state --

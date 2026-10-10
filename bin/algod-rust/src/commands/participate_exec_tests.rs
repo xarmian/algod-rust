@@ -1556,8 +1556,10 @@ fn seed_online_history(ledger: &Arc<Mutex<SqliteLedger>>, accounts: &[(Address, 
         l.put_online_account_at_round(addr, 0, acct).unwrap();
         total += acct.micro_algos;
     }
-    // The lookback total, from the same time basis as the history rows.
+    // The lookback total, from the same time basis as the history rows, and
+    // the balance-round header the stake lookups read the rewards level from.
     l.put_online_supply_at_round(0, total).unwrap();
+    l.put_block_header_fixture(0, 0).unwrap();
 }
 
 fn evaluator_at_99_limited(

@@ -7635,6 +7635,16 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     // lookback on the agreement/sortition path
     // (`crate::agreement_bridge::membership_from_ledger`).
 
+    /// go: `opVoterParamsGet` (data/transactions/logic/eval.go:5433) calls
+    /// `cx.Ledger.AgreementData(addr)` and returns its error, failing the
+    /// program; `AgreementData` is `lookupAgreement` -> `Ledger.LookupAgreement`
+    /// (ledger/ledger.go:656), which returns the database/round-window error
+    /// from `lookupOnlineAccountData` (ledger/acctonline.go:657) and the empty
+    /// `OnlineAccountData{}` only when the account has no row. So a lookup
+    /// that cannot be answered (here: the balance-round block header or the
+    /// history row query fails) is an error, never a silent zero: a node with
+    /// a retention gap must fail the program exactly like go does, not execute
+    /// the opcode differently (consensus-critical).
     fn voter_params_get(
         &self,
         account: &[u8; 32],
@@ -10889,8 +10899,9 @@ mod tests {
         store.set_current_round(Round(400));
         store.set_account(&late, online(7_000_000, 0));
         store.commit_block().unwrap();
-        // 25 reward levels have accrued by the lookup.
-        store.set_rewards_level(125);
+        // The balance round's header carries the rewards level: 25 reward
+        // levels have accrued by then.
+        store.put_block_header_fixture(130, 125).unwrap();
 
         let txn = make_pay_txn([41u8; 32], [20u8; 32], 5000);
         // Building round 450: balance round 130.
@@ -10923,6 +10934,46 @@ mod tests {
         assert_eq!(val, TealValue::Uint(0));
         let (val, _) = ctx.voter_params_get(&late.0, 1).unwrap();
         assert_eq!(val, TealValue::Uint(0));
+    }
+
+    /// The missing-data case: the balance-round block header is not there
+    /// (a retention gap), so the lookup cannot be answered. go fails the
+    /// program with the ledger error (see `voter_params_get`); so do we -- the
+    /// opcode must not quietly return zero.
+    #[test]
+    fn voter_params_get_errors_when_the_balance_round_data_is_missing() {
+        let mut store = crate::sqlite::SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([43u8; 32]);
+        let acct = AccountData {
+            micro_algos: 5_000_000,
+            status: AccountStatus::Online,
+            incentive_eligible: true,
+            vote_id: Some([1u8; 32]),
+            selection_id: Some([2u8; 32]),
+            vote_last_valid: 100_000,
+            ..Default::default()
+        };
+        store.begin_block().unwrap();
+        store.set_current_round(Round(100));
+        store.set_account(&addr, acct);
+        store.commit_block().unwrap();
+        // History row at the balance round, but no header for round 130.
+        let txn = make_pay_txn([43u8; 32], [20u8; 32], 5000);
+        let ctx = LedgerAvmContext::new(
+            &mut store,
+            vec![txn],
+            0,
+            450,
+            12345,
+            42,
+            [1u8; 32],
+            true,
+            [2u8; 32],
+            [3u8; 32],
+            ConsensusParams::default(),
+            0,
+        );
+        assert!(ctx.voter_params_get(&addr.0, 0).is_err());
     }
 
     // ---- LogicSig args tests ----

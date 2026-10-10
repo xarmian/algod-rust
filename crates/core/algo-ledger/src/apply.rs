@@ -1816,7 +1816,7 @@ pub struct ExecProbe {
     /// `endOfBlock`, after every transaction; issue #1795). The set holds the
     /// proposer's own participating addresses, which go never lists. Only the
     /// proposer's final scratch apply asks.
-    pub knock_offline_exclude: Option<std::collections::HashSet<Address>>,
+    pub knock_offline_exclude: Option<std::sync::Arc<std::collections::HashSet<Address>>>,
     /// Input: only compute the lists when this says the pass's `ApplyData`
     /// leaves the payset within the block size limit, i.e. when the pass is
     /// the one the proposer keeps. A pass that will be discarded as oversize
@@ -1849,7 +1849,8 @@ pub struct FitsGate {
 /// fits ([`ExecProbe::knock_offline_gate`]).
 #[derive(Debug, Clone, Default)]
 pub struct ListsRequest {
-    pub own_addresses: std::collections::HashSet<Address>,
+    /// Shared (not cloned under the ledger mutex).
+    pub own_addresses: std::sync::Arc<std::collections::HashSet<Address>>,
     pub fits: Option<FitsGate>,
 }
 
@@ -1940,6 +1941,18 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
     // that is logged once per process, not per block. The challenge-failure
     // test needs no stake and keeps working.
     let brnd = algo_agreement::balance_round(algo_types::Round(round), consensus);
+    // Synthetic history rows (legacy-database upgrade): go's stake figures
+    // cannot be reproduced yet, so nobody is listed by lag.
+    let history_uncertain = max_absent > 0 && store.absence_history_uncertain(brnd.0);
+    if history_uncertain {
+        note_undecidable_absence(
+            round,
+            brnd.0,
+            &AlgoError::Ledger {
+                message: "online-account history was synthesized at upgrade".to_string(),
+            },
+        );
+    }
     let mut total_cache: Option<Option<u64>> = None;
     let challenge = if max_absent > 0 {
         let provider = crate::heartbeat::StoreHeaderProvider { store };
@@ -1988,7 +2001,7 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
         // stake does not exceed the total, so an account seen within the last
         // `ABSENT_FACTOR` rounds is not absent. (Skipping a candidate only
         // shortens the list, which is always valid.)
-        if last_seen == 0 || last_seen.saturating_add(ABSENT_FACTOR) >= round {
+        if history_uncertain || last_seen == 0 || last_seen.saturating_add(ABSENT_FACTOR) >= round {
             continue;
         }
         let total_online_stake = match *total_cache.get_or_insert_with(|| {
@@ -3030,6 +3043,14 @@ pub(crate) fn validate_absent_online_accounts<L: crate::store_trait::LedgerStore
         )
     };
     let mut total_online_stake: Option<u64> = None;
+    // Synthetic history rows (legacy-database upgrade): go's stake figures
+    // cannot be reproduced for this balance round, so the stake-based test is
+    // skipped (the eligibility and challenge checks still apply) instead of
+    // rejecting a block go accepts.
+    let history_uncertain = !absent.is_empty()
+        && store.absence_history_uncertain(
+            algo_agreement::balance_round(algo_types::Round(block.round.0), consensus).0,
+        );
 
     // Check for duplicates and basic account eligibility for suspension.
     let mut seen = std::collections::HashSet::with_capacity(absent.len());
@@ -3064,6 +3085,9 @@ pub(crate) fn validate_absent_online_accounts<L: crate::store_trait::LedgerStore
         let last_seen = crate::heartbeat::last_seen(acct.last_proposed, acct.last_heartbeat);
         if challenge.failed(&addr.0, last_seen) {
             continue; // ok. it's "challenge absent"
+        }
+        if history_uncertain {
+            continue; // undecidable while the history is synthetic (see above)
         }
         let total = match total_online_stake {
             Some(t) => t,
@@ -14431,6 +14455,7 @@ return
         };
         ledger.set_account(&x, acct.clone());
         ledger.put_online_account_at_round(&x, 0, &acct).unwrap();
+        ledger.put_block_header_fixture(181, 0).unwrap();
         // Today's aggregate says 500M online (lag 2000 > 500 quiet rounds);
         // the history says 5M (lag 20): the history decides.
         ledger
@@ -14480,6 +14505,7 @@ return
                 ..algo_types::AccountData::default()
             },
         );
+        ledger.put_block_header_fixture(181, 0).unwrap();
         let consensus = algo_types::consensus::consensus_params_for_version(
             algo_types::consensus::CONSENSUS_V41,
         )
@@ -14594,6 +14620,7 @@ return
             .put_online_account_at_round(&absent_addr, 0, &absent_acct)
             .unwrap();
         ledger.put_online_supply_at_round(181, 5_000_000).unwrap();
+        ledger.put_block_header_fixture(181, 0).unwrap();
 
         let mut whale_keyreg = SignedTransaction::default();
         whale_keyreg.txn.txn_type = "keyreg".into();

@@ -1726,6 +1726,11 @@ impl crate::store_trait::LedgerStore for LedgerState {
         self.online_stake_at_round(balance_round, vote_rnd)
     }
 
+    /// `LedgerState` has no history to synthesize.
+    fn absence_history_uncertain(&self, _balance_round: u64) -> bool {
+        false
+    }
+
     fn online_stake_at_round(
         &self,
         _round: u64,

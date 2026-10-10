@@ -2080,7 +2080,7 @@ impl SimpleBlockEvaluator {
         template: &algo_types::Block,
         payset: &[algo_types::SignedTransaction],
         groups: &[ExecGroup],
-        own_addresses: Option<&std::collections::HashSet<algo_types::Address>>,
+        own_addresses: Option<&std::sync::Arc<std::collections::HashSet<algo_types::Address>>>,
         gated: bool,
     ) -> Result<
         Result<
@@ -2107,20 +2107,13 @@ impl SimpleBlockEvaluator {
             candidate.load =
                 algo_ledger::compute_load(bytes, self.consensus_params.max_txn_bytes_per_block);
         }
-        let waited = std::time::Instant::now();
-        let mut ledger = self
-            .ledger
-            .lock()
-            .map_err(|e| algo_error::AlgoError::Ledger {
-                message: format!("ledger lock poisoned: {e}"),
-            })?;
-        algo_ledger::proposal_eval::record_ledger_lock_wait(waited.elapsed());
-        let held = std::time::Instant::now();
         // The expired / absent lists scan every online account under the
         // ledger lock, so only the pass the proposer keeps asks for them:
         // bisection probes do not, and a pass whose ApplyData leaves the
         // payset over the block limit (so it will be truncated and rerun) is
-        // estimated out inside the apply, before the scan.
+        // estimated out inside the apply, before the scan. The request (an
+        // `Arc` share of the exclusion set and of the sizes) is built before
+        // the lock is taken.
         let max = self.max_txn_bytes;
         let request = own_addresses.map(|own| algo_ledger::apply::ListsRequest {
             own_addresses: own.clone(),
@@ -2130,6 +2123,15 @@ impl SimpleBlockEvaluator {
                 max,
             }),
         });
+        let waited = std::time::Instant::now();
+        let mut ledger = self
+            .ledger
+            .lock()
+            .map_err(|e| algo_error::AlgoError::Ledger {
+                message: format!("ledger lock poisoned: {e}"),
+            })?;
+        algo_ledger::proposal_eval::record_ledger_lock_wait(waited.elapsed());
+        let held = std::time::Instant::now();
         let r =
             algo_ledger::shadow_execute::scratch_execute_payset(&mut *ledger, &candidate, request);
         algo_ledger::proposal_eval::record_ledger_lock_hold(held.elapsed());
@@ -2156,7 +2158,7 @@ impl SimpleBlockEvaluator {
     ///   `algod_rust_proposal_scratch_failures_total`.
     fn finalize_payset(
         &mut self,
-        own_addresses: &std::collections::HashSet<algo_types::Address>,
+        own_addresses: &std::sync::Arc<std::collections::HashSet<algo_types::Address>>,
     ) -> Result<(Vec<algo_types::SignedTransaction>, u64), algo_error::AlgoError> {
         use algo_ledger::shadow_execute::ScratchFailure;
         const MAX_FAILURE_PASSES: usize = 8;
@@ -3081,8 +3083,8 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         // admitted" behavior only for an evaluator without exec state.
         // The proposer's own participating addresses are never listed as
         // expired or absent (go `partAddrs`).
-        let own_addresses: std::collections::HashSet<algo_types::Address> =
-            voting_accounts.iter().copied().collect();
+        let own_addresses: std::sync::Arc<std::collections::HashSet<algo_types::Address>> =
+            std::sync::Arc::new(voting_accounts.iter().copied().collect());
         let (payset, txn_count) = self.finalize_payset(&own_addresses)?;
         // The header's `StateProofTracking.NextRound` is what the payset's
         // state proof transactions leave behind, not the template's
@@ -3232,7 +3234,8 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                                 &[],
                             )
                         } else {
-                            let mut exclude = own_addresses.clone();
+                            let mut exclude: std::collections::HashSet<algo_types::Address> =
+                                (*own_addresses).clone();
                             exclude.extend(touched);
                             algo_ledger::apply::knock_offline_lists(
                                 &*ledger,
@@ -7094,6 +7097,8 @@ mod tests {
                 .expect("seed online history");
             l.put_online_supply_at_round(0, 5_000_000)
                 .expect("seed lookback supply");
+            l.put_block_header_fixture(0, 0)
+                .expect("seed balance-round header");
         }
 
         let adapter = PoolLedgerAdapter::new(ledger.clone());
@@ -7176,6 +7181,8 @@ mod tests {
             // (go `onlineStake()`): this account's own stake.
             l.put_online_supply_at_round(0, 5_000_000)
                 .expect("seed lookback supply");
+            l.put_block_header_fixture(0, 0)
+                .expect("seed balance-round header");
         }
 
         let adapter = PoolLedgerAdapter::new(ledger.clone());
