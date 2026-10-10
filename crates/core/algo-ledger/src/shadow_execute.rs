@@ -775,6 +775,20 @@ pub mod test_hooks {
         static FAIL_OVER: Cell<Option<usize>> = const { Cell::new(None) };
         static CALLS: Cell<u64> = const { Cell::new(0) };
         static KNOCK_CALLS: Cell<u64> = const { Cell::new(0) };
+        static STRICT_HEADERS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Production behavior for a missing balance-round block header is an
+    /// error (see `SqliteLedger::rewards_level_at`); test ledgers are usually
+    /// built without headers, so in test builds a missing header falls back to
+    /// the current rewards level unless this thread opts into the strict
+    /// behavior.
+    pub fn set_strict_balance_round_headers(on: bool) {
+        STRICT_HEADERS.with(|c| c.set(on));
+    }
+
+    pub(crate) fn strict_balance_round_headers() -> bool {
+        STRICT_HEADERS.with(|c| c.get())
     }
 
     /// Number of expired / absent list computations

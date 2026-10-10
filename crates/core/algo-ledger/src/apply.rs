@@ -2003,9 +2003,13 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
             Some(t) => t,
             None => continue, // undecidable: the lag test is skipped
         };
-        let Ok(stake) = lookback_voting_stake(store, round, consensus, &addr) else {
-            tracing::error!("unable to check account for absenteeism: {addr}");
-            continue;
+        let stake = match lookback_voting_stake(store, round, consensus, &addr) {
+            Ok(stake) => stake,
+            Err(e) => {
+                // e.g. no block header at the balance round: undecidable.
+                note_undecidable_absence(round, brnd.0, &e);
+                continue;
+            }
         };
         if is_absent(total_online_stake, stake, last_seen, round) {
             lists.absent.push(addr);
@@ -2979,7 +2983,7 @@ pub(crate) fn lookback_voting_stake<L: crate::store_trait::LedgerStore>(
 /// wrongly suspended by every validating node. A proposed absent account
 /// that satisfies neither condition is rejected, matching Go's
 /// `"proposed absent account %v is not absent in %d, %d"` error.
-fn validate_absent_online_accounts<L: crate::store_trait::LedgerStore>(
+pub(crate) fn validate_absent_online_accounts<L: crate::store_trait::LedgerStore>(
     store: &L,
     block: &Block,
     consensus: &ConsensusParams,

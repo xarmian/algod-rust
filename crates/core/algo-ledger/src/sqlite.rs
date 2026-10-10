@@ -2201,6 +2201,27 @@ impl Drop for ReadSnapshot {
     }
 }
 
+/// A single-entry cache of the rewards level of one committed block header.
+/// The `(round, level)` pair lives behind one lock so concurrent users can
+/// never observe a mismatched pair; only committed headers are ever stored
+/// (a header written by an in-flight block that may still be rolled back must
+/// not be cached).
+#[derive(Debug, Default)]
+pub(crate) struct RewardsLevelCache(std::sync::Mutex<Option<(u64, u64)>>);
+
+impl RewardsLevelCache {
+    pub(crate) fn get(&self, round: u64) -> Option<u64> {
+        match *self.0.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some((r, level)) if r == round => Some(level),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn put(&self, round: u64, level: u64) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some((round, level));
+    }
+}
+
 pub struct SqliteLedger {
     conn: Connection,
     /// Ledger prefix for the on-disk database pair, or `None` for in-memory
@@ -2317,12 +2338,10 @@ pub struct SqliteLedger {
     /// to a full sweep of every currently-online account.
     pending_online_touched: std::collections::HashSet<Address>,
 
-    /// `(round, rewards_level)` of the last committed block header consulted by
-    /// [`Self::rewards_level_at`]; `rewards_cache_round == u64::MAX` is empty.
-    /// A committed header never changes, so the pair is valid for its round and
-    /// saves a header read + decode per candidate in the absence scans.
-    rewards_cache_round: AtomicU64,
-    rewards_cache_level: AtomicU64,
+    /// `(round, rewards_level)` of the last COMMITTED block header consulted by
+    /// [`Self::rewards_level_at`]. One lock guards the pair, so a reader never
+    /// sees a round with another round's level; see [`RewardsLevelCache`].
+    rewards_cache: RewardsLevelCache,
 
     /// Automatic interval-driven catchpoint generation config (issue
     /// #770), set via [`Self::configure_automatic_catchpoints`]. `None`
@@ -2630,7 +2649,84 @@ impl SqliteLedger {
                 block_path.display()
             ),
         })?;
-        Self::init(conn, prefix)
+        let ledger = Self::init(conn, prefix)?;
+        ledger.backfill_legacy_online_history()?;
+        Ok(ledger)
+    }
+
+    /// Upgrade path for a database synced before the `onlineaccounts` history
+    /// was maintained at every commit (only catchpoint import populated it):
+    /// an account that went online since then is `Online` in `accountbase` but
+    /// has no history row, so without the data it would read as stake 0 at the
+    /// balance round and valid go blocks listing it absent would be rejected.
+    ///
+    /// Policy: every currently-online account with NO history row at all gets
+    /// one, dated at the earliest balance round the next blocks can look up
+    /// (`tip + 1 - lookback`), i.e. it is treated as online throughout the
+    /// window. The true online-since round is unknowable from the account
+    /// state; this is exact for accounts that were online across the whole
+    /// window and an approximation (logged) for accounts that joined within
+    /// it, and it expires by itself once the window has passed. Without it the
+    /// node would stall on valid blocks. Accounts that already have any row
+    /// (live commits, catchpoint import) are never touched.
+    fn backfill_legacy_online_history(&self) -> Result<(), AlgoError> {
+        let tip = self.current_round.0;
+        if tip == 0 {
+            return Ok(());
+        }
+        let max_bal_lookback = algo_types::consensus::consensus_params_for_version(&self.protocol)
+            .map(|p| p.max_bal_lookback)
+            .unwrap_or(crate::catchpoint::writer::DEFAULT_MAX_BAL_LOOKBACK);
+        let row_round = (tip + 1).saturating_sub(max_bal_lookback);
+        let mut missing: Vec<(Address, AccountData)> = Vec::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT a.address, a.data FROM accountbase a \
+                     WHERE a.normalizedonlinebalance > 0 \
+                     AND NOT EXISTS (SELECT 1 FROM onlineaccounts o WHERE o.address = a.address)",
+                )
+                .map_err(|e| AlgoError::Ledger {
+                    message: format!("prepare legacy online-history scan error: {e}"),
+                })?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(|e| AlgoError::Ledger {
+                    message: format!("query legacy online-history scan error: {e}"),
+                })?;
+            for row in rows {
+                let (addr_bytes, data) = row.map_err(|e| AlgoError::Ledger {
+                    message: format!("read legacy online-history row error: {e}"),
+                })?;
+                let addr: [u8; 32] =
+                    addr_bytes
+                        .try_into()
+                        .map_err(|v: Vec<u8>| AlgoError::Ledger {
+                            message: format!(
+                                "legacy online-history scan: bad address length {}",
+                                v.len()
+                            ),
+                        })?;
+                missing.push((Address(addr), decode_account_data(&data)?));
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        for (addr, acct) in &missing {
+            self.insert_online_account_row(addr, row_round, acct)?;
+        }
+        tracing::warn!(
+            accounts = missing.len(),
+            tip,
+            row_round,
+            "online-account history predates this database: backfilled one row per online \
+             account at the start of the lookback window (approximation until the window passes)"
+        );
+        Ok(())
     }
 
     /// Open an in-memory database pair (for testing). Both the tracker and
@@ -2929,8 +3025,7 @@ impl SqliteLedger {
             group_delta_tracer: None,
             pending_totals_delta: AccountTotalsDelta::default(),
             pending_online_touched: std::collections::HashSet::new(),
-            rewards_cache_round: AtomicU64::new(u64::MAX),
-            rewards_cache_level: AtomicU64::new(0),
+            rewards_cache: RewardsLevelCache::default(),
             catchpoint_auto: None,
             catchpoint_worker: None,
             reenable_catchpoints_round: 0,
@@ -5554,25 +5649,23 @@ impl SqliteLedger {
         Ok(expired_stake)
     }
 
-    /// go's `LookupAgreement(round, addr)` -- the single place that decides
-    /// the fallback policy and the rewards folding for the stake lookbacks
-    /// (`voter_params_get`, the absence checks): the account's
-    /// `onlineaccounts` row at or before `round`,
-    /// `None` when there is no such row or the account was not online then
-    /// (go's empty `OnlineAccountData`), with the rewards pending at `round`'s
-    /// rewards level folded into `micro_algos` (`MicroAlgosWithRewards`,
-    /// issue #1654). There is deliberately NO fallback to the account's
-    /// current state: a late joiner has no stake until the lookback passes it.
-    /// Used by [`LedgerStore::voter_agreement_data_at_round`]; agreement's own
-    /// membership lookup keeps its current-state fallback (issue #1809).
-    /// The rewards level at `round`'s block header -- the single place both the
-    /// per-account stake and the derived total take it from, so they share one
-    /// time basis. A header that cannot be read or decoded is an error; only a
-    /// header that is absent (a synthetic ledger without one) falls back to the
-    /// current level, and says so at debug level.
+    /// The rewards level at `round`'s block header -- the one place both the
+    /// per-account stake ([`Self::lookup_agreement_account`]) and the derived
+    /// total ([`Self::derive_online_supply_from_history`]) take it from, so
+    /// they share one time basis.
+    ///
+    /// Consensus-critical, NO fallback: a header that cannot be read or decoded
+    /// is an error, and so is a header that is missing -- reading the current
+    /// level instead would silently mix time bases (the validator rejects the
+    /// block; the proposer skips the stake-based listing). Only test builds
+    /// (`test-hooks` / `cfg(test)`) fall back for ledgers built without
+    /// headers, unless a test opts into the strict behavior.
+    ///
+    /// Only COMMITTED headers are cached: a header at or above the in-flight
+    /// block's round may belong to a scratch apply that is rolled back.
     fn rewards_level_at(&self, round: u64) -> Result<u64, AlgoError> {
-        if self.rewards_cache_round.load(Ordering::Relaxed) == round {
-            return Ok(self.rewards_cache_level.load(Ordering::Relaxed));
+        if let Some(level) = self.rewards_cache.get(round) {
+            return Ok(level);
         }
         match self.get_block_header_data(round)? {
             Some(hdr) => {
@@ -5581,22 +5674,44 @@ impl SqliteLedger {
                         message: format!("decode block header {round} for its rewards level: {e}"),
                     })?
                     .rewards_level;
-                if round <= self.current_round.0 {
-                    self.rewards_cache_level.store(level, Ordering::Relaxed);
-                    self.rewards_cache_round.store(round, Ordering::Relaxed);
+                let committed = round < self.current_round.0
+                    || (!self.in_block && round == self.current_round.0);
+                if committed {
+                    self.rewards_cache.put(round, level);
                 }
                 Ok(level)
             }
             None => {
-                tracing::debug!(
-                    round,
-                    "no block header at the balance round; using the current rewards level"
-                );
-                Ok(self.rewards_level())
+                #[cfg(any(test, feature = "test-hooks"))]
+                if !crate::shadow_execute::test_hooks::strict_balance_round_headers() {
+                    tracing::debug!(
+                        round,
+                        "test ledger without a block header at the balance round; \
+                         using the current rewards level"
+                    );
+                    return Ok(self.rewards_level());
+                }
+                Err(AlgoError::Ledger {
+                    message: format!(
+                        "no block header at round {round} to read its rewards level from"
+                    ),
+                })
             }
         }
     }
 
+    /// go's `LookupAgreement(round, addr)`: the account's `onlineaccounts` row
+    /// at or before `round`, `None` when there is no such row or the account
+    /// was not online then (go's empty `OnlineAccountData`), with the rewards
+    /// pending at `round`'s level ([`Self::rewards_level_at`]) folded into
+    /// `micro_algos` (`MicroAlgosWithRewards`, issue #1654).
+    ///
+    /// Consensus-critical, NO fallback to the account's current state: a late
+    /// joiner has no stake until the lookback passes it, exactly as in go (a
+    /// node whose history predates this table is backfilled when the database
+    /// is opened, see `backfill_legacy_online_history`). Used by
+    /// [`LedgerStore::voter_agreement_data_at_round`]; agreement's own
+    /// membership lookup keeps its current-state fallback (issue #1809).
     fn lookup_agreement_account(
         &self,
         addr: &Address,
@@ -15329,6 +15444,163 @@ mod tests {
         );
     }
 
+    /// The rewards-level cache keeps `(round, level)` pairs intact under
+    /// concurrent writers: every reader sees a level that belongs to the round
+    /// it asked about.
+    #[test]
+    fn rewards_level_cache_never_returns_a_mismatched_pair() {
+        let cache = std::sync::Arc::new(RewardsLevelCache::default());
+        let mut handles = Vec::new();
+        for t in 0..4u64 {
+            let cache = cache.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..20_000u64 {
+                    let round = (i % 64) + t * 1000;
+                    cache.put(round, round * 10 + 7);
+                    for probe in [round, (i % 64) + ((t + 1) % 4) * 1000] {
+                        if let Some(level) = cache.get(probe) {
+                            assert_eq!(level, probe * 10 + 7, "mismatched pair for {probe}");
+                        }
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    fn header_with_level(round: u64, level: u64) -> Vec<u8> {
+        let b = algo_types::Block {
+            round: Round(round),
+            rewards_level: level,
+            ..algo_types::Block::default()
+        };
+        algo_codec::canonical_encode_block_header_from_block(&b)
+    }
+
+    /// A header written by an in-flight block that is then rolled back is never
+    /// cached: after the rollback and a different header for the same round
+    /// the lookup returns the committed value.
+    #[test]
+    fn rolled_back_in_flight_header_is_not_cached() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(1));
+        ledger
+            .put_block(1, "proto", &header_with_level(1, 111), b"b")
+            .unwrap();
+        ledger.commit_block().unwrap();
+        assert_eq!(ledger.rewards_level_at(1).unwrap(), 111);
+
+        // In-flight block 2 (current round advanced, like a scratch apply).
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(2));
+        ledger
+            .put_block(2, "proto", &header_with_level(2, 222), b"b")
+            .unwrap();
+        assert_eq!(ledger.rewards_level_at(2).unwrap(), 222);
+        assert!(
+            ledger.rewards_cache.get(2).is_none(),
+            "in-flight header must not be cached"
+        );
+        ledger.rollback_block().unwrap();
+        ledger.set_current_round(Round(1));
+
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(2));
+        ledger
+            .put_block(2, "proto", &header_with_level(2, 333), b"b")
+            .unwrap();
+        ledger.commit_block().unwrap();
+        assert_eq!(ledger.rewards_level_at(2).unwrap(), 333);
+    }
+
+    /// With a missing balance-round header the stake and the derived total
+    /// cannot be placed on the historical basis: the lookups error (the
+    /// validator rejects) and the proposer lists nobody absent.
+    #[test]
+    fn missing_balance_round_header_fails_closed() {
+        use crate::shadow_execute::test_hooks;
+        test_hooks::set_strict_balance_round_headers(true);
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        set_online(&mut ledger, &Address([9u8; 32]), absent_acct(1));
+        let addr = Address([9u8; 32]);
+        let stake = ledger.voter_agreement_data_at_round(0, &addr);
+        let total = ledger.balance_round_total_online_stake(0, 101);
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
+        test_hooks::set_strict_balance_round_headers(false);
+        assert!(stake.is_err(), "no header at round 0");
+        assert!(total.is_err());
+        assert!(l.absent.is_empty());
+    }
+
+    /// Upgrade path: a database from before the history table was maintained
+    /// (accounts online in `accountbase`, no `onlineaccounts` rows) is
+    /// backfilled when it is opened, so `voter_params_get` sees the real stake
+    /// and the absence checks still decide instead of rejecting valid blocks.
+    #[test]
+    fn legacy_database_without_online_history_is_backfilled_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+        let x = Address([9u8; 32]);
+        let z = Address([10u8; 32]);
+        {
+            let mut ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
+            ledger.begin_block().unwrap();
+            ledger.set_current_round(Round(1));
+            ledger.set_account(&x, absent_acct(1));
+            ledger.set_account(&z, absent_acct(1));
+            ledger.commit_block().unwrap();
+            for r in 2..=400u64 {
+                ledger.begin_block().unwrap();
+                ledger.set_current_round(Round(r));
+                ledger.commit_block().unwrap();
+            }
+        }
+        // Make it legacy-shaped: the history and the supply tail never existed.
+        {
+            let conn = Connection::open(tracker_path_for_prefix(&prefix)).unwrap();
+            conn.execute("DELETE FROM onlineaccounts", []).unwrap();
+            conn.execute("DELETE FROM onlineroundparamstail", [])
+                .unwrap();
+        }
+        let ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
+        assert_eq!(ledger.current_round().0, 400);
+        let brnd = 401 - 320;
+        assert_eq!(
+            ledger
+                .voter_agreement_data_at_round(brnd, &x)
+                .unwrap()
+                .micro_algos,
+            5_000_000,
+            "voter_params_get sees the real stake"
+        );
+        assert_eq!(
+            ledger.balance_round_total_online_stake(brnd, 401).unwrap(),
+            10_000_000
+        );
+        let l = lists(&ledger, 401, &consensus_v41(), &Default::default(), &[]);
+        assert_eq!(l.absent, vec![x, z]);
+        // The validating path agrees: a go-listed absent account is accepted.
+        let block = algo_types::Block {
+            round: Round(401),
+            current_protocol: algo_types::CONSENSUS_V41.to_string(),
+            absent_participation_accounts: Some(vec![x]),
+            ..algo_types::Block::default()
+        };
+        crate::apply::validate_absent_online_accounts(&ledger, &block, &consensus_v41(), true)
+            .expect("backfilled history: the listed account is absent");
+        // Reopening again changes nothing (rows already exist).
+        drop(ledger);
+        let ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
+        let n: i64 = ledger
+            .conn
+            .query_row("SELECT COUNT(*) FROM onlineaccounts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
     // -- Issue #1758: rollback / failed commit restore the in-memory chain state --
 
     /// Every chain-level field `apply` advances, as one comparable tuple.
@@ -15601,8 +15873,7 @@ mod tests {
             group_delta_tracer: _,
             pending_totals_delta: _,   // reset by rollback
             pending_online_touched: _, // cleared by rollback
-            rewards_cache_round: _,    // committed-header cache, immutable data
-            rewards_cache_level: _,    // (see rewards_level_at)
+            rewards_cache: _,          // committed-header cache, immutable data
             catchpoint_auto: _,
             catchpoint_worker: _,
             reenable_catchpoints_round: _,
