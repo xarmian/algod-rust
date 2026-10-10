@@ -141,6 +141,17 @@ def genesis_funder(genesis_path: str):
     return None
 
 
+# Minimum spendable balance every actor is topped back up to before each
+# scenario, the largest `pay` amount, and the fee headroom a pay keeps back.
+ACTOR_FLOOR = 25_000_000
+PAY_MAX = 5_000_000
+PAY_FEE_HEADROOM = 1_000
+# Check actor balances every this many scenarios (each check is one REST
+# read per actor); `pay` also tops up its own sender, and no scenario spends
+# more than a few Algo, so a 25 Algo floor leaves ample slack in between.
+TOP_UP_EVERY = 5
+
+
 class ScenarioAbort(Exception):
     """A scenario cannot continue (a prerequisite step failed)."""
 
@@ -391,6 +402,23 @@ class Workload:
         if spendable < minimum:
             self.fund(addr, minimum - spendable + 1000000)
 
+    def spendable(self, addr):
+        info = self.account_info(addr)
+        return int(info["amount"]) - int(info.get("min-balance", 0))
+
+    def top_up_actors(self):
+        """Refill every scenario actor below ACTOR_FLOOR from the funder, so a
+        long run never exhausts them (issue #1792). An actor whose balance
+        cannot be read is skipped, not treated as drained: funding on a REST
+        hiccup would stack sends and hide the outage."""
+        for addr in self.actors.values():
+            try:
+                low = self.spendable(addr) < ACTOR_FLOOR
+            except Exception:  # noqa: BLE001 - REST/JSON errors; retry next time
+                continue
+            if low:
+                self.ensure_balance(addr, ACTOR_FLOOR)
+
     def newest_created(self, addr, key, idkey):
         info = self.account_info(addr)
         ids = [int(x[idkey]) for x in info.get(key, [])]
@@ -454,7 +482,20 @@ class Workload:
 
     def sc_pay(self):
         a, b = self.rng.sample(sorted(self.actors), 2)
-        amt = self.rng.randint(1, 5000000)
+        # Strict reads: a REST failure aborts the scenario instead of looking
+        # like a drained actor (which would send a pointless funding tx).
+        try:
+            if self.spendable(self.actors[a]) < PAY_MAX + PAY_FEE_HEADROOM:
+                self.ensure_balance(self.actors[a], PAY_MAX + PAY_FEE_HEADROOM)
+            room = self.spendable(self.actors[a]) - PAY_FEE_HEADROOM
+        except ScenarioAbort:
+            raise
+        except Exception as e:  # noqa: BLE001 - a transient REST failure is not a pay failure
+            raise ScenarioAbort("cannot read {}'s balance: {}".format(a, e))
+        if room < 1:
+            raise ScenarioAbort(
+                "workload planning error: {} has no spendable balance for a pay even after top-up".format(a))
+        amt = self.rng.randint(1, min(PAY_MAX, room))
         self.run("pay", "clerk send -f {} -t {} -a {}".format(self.actors[a], self.actors[b], amt), must=True)
         if self.rng.random() < 0.5:
             self.run(
@@ -786,6 +827,13 @@ class Workload:
             self.scenario = name
             self.scenario_counts[name] = self.scenario_counts.get(name, 0) + 1
             try:
+                if i % TOP_UP_EVERY == 0:
+                    try:
+                        self.top_up_actors()
+                    except ScenarioAbort as e:
+                        # A funding failure is a workload-planning problem,
+                        # reported as such, not charged to this scenario.
+                        self.abort("top_up", str(e))
                 Workload.SCENARIOS[name](self)
             except StopRequested:
                 break

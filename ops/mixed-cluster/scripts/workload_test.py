@@ -12,6 +12,7 @@ import base64
 import io
 import json
 import os
+import re
 import sys
 import unittest
 
@@ -31,8 +32,11 @@ class FakeEnv:
     what real goal prints; commands whose text contains a key of `fail` exit
     non-zero.  Records every command it saw."""
 
-    def __init__(self, fail=(), post_status=None, rounds=None):
+    def __init__(self, fail=(), post_status=None, rounds=None, balances=None, default_balance=10_000_000):
         self.cmds = []
+        # addr -> microAlgos for /v2/accounts; absent addresses report 10 Algo.
+        self.balances = balances or {}
+        self.default_balance = default_balance
         self.fail = tuple(fail)
         self.n = 0
         self.app = 100
@@ -66,6 +70,11 @@ class FakeEnv:
         for f in self.fail:
             if f in args:
                 return 1, "goal: boom ({})".format(f)
+        if args.startswith("clerk send -f " + ADDR + " "):
+            # A funding send from the funder lands in the target's balance.
+            m = re.search(r"-t (\S+) -a (\d+)", args)
+            if m:
+                self.balances[m.group(1)] = self.balances.get(m.group(1), self.default_balance) + int(m.group(2))
         if args.startswith("account new"):
             self.accounts += 1
             return 0, "Created new account with address {}\n".format(("B%057d" % self.accounts).replace("0", "A"))
@@ -85,7 +94,8 @@ class FakeEnv:
 
     def rest_json(self, path, node="go-node-1"):
         if "/v2/accounts/" in path:
-            return {"amount": 10_000_000, "min-balance": 100000,
+            addr = path.rsplit("/", 1)[-1]
+            return {"amount": self.balances.get(addr, self.default_balance), "min-balance": 100000,
                     "created-assets": [{"index": self.asset}], "created-apps": [{"id": self.app}]}
         return {"last-round": self.round}
 
@@ -192,6 +202,89 @@ class ScenarioTest(unittest.TestCase):
                 self.fail("{}: {}".format(name, e))
             steps = [r for r in records(out) if r["kind"] == "workload_step"]
             self.assertTrue(steps, name)
+
+    def test_pay_never_spends_more_than_the_live_spendable_balance(self):
+        # Issue #1792: a drained actor made `pay` try to spend 4.27 Algo it
+        # no longer had; both nodes rejected it and the scenario aborted.
+        actors = {k: ("%s" % k) * 58 for k in "ABCD"}
+        for seed in range(40):
+            env = FakeEnv(balances={a: 1_200_000 for a in actors.values()})
+            w, out = make(env, seed=seed)
+            w.actors = dict(actors)
+            w.scenario = "pay"
+            wl.Workload.SCENARIOS["pay"](w)
+            for c in env.cmds:
+                if "clerk send" in c and "-f " + w.funder not in c and "-a 0" not in c:
+                    amt = int(c.split("-a ")[1].split()[0])
+                    sender = c.split("-f ")[1].split()[0]
+                    # The fake never debits, so the final balance is the
+                    # live one at send time (after any top-up).
+                    self.assertLessEqual(amt, env.balances[sender] - 100000 - 1000, c)
+
+    def test_pay_after_top_up_can_use_the_refilled_balance(self):
+        # The fake env credits funding sends, so this exercises fund-then-pay:
+        # a drained sender is refilled first and the amount then ranges over
+        # the refilled balance, not the stale low one.
+        actors = {k: ("%s" % k) * 58 for k in "ABCD"}
+        amounts = set()
+        for seed in range(40):
+            env = FakeEnv(balances={a: 150_000 for a in actors.values()})
+            w, out = make(env, seed=seed)
+            w.actors = dict(actors)
+            w.scenario = "pay"
+            wl.Workload.SCENARIOS["pay"](w)
+            for c in env.cmds:
+                if "clerk send" in c and "-f " + w.funder not in c and "-a 0" not in c:
+                    amounts.add(int(c.split("-a ")[1].split()[0]))
+        self.assertTrue(amounts and max(amounts) > 150_000, amounts)
+
+    def test_top_up_skips_an_actor_whose_balance_cannot_be_read(self):
+        actors = {k: ("%s" % k) * 58 for k in "AB"}
+        env = FakeEnv(balances={a: 100_000 for a in actors.values()})
+        env.rest_json_orig = env.rest_json
+        def flaky(path, node="go-node-1"):
+            if actors["A"] in path:
+                raise OSError("rest down")
+            return env.rest_json_orig(path, node)
+        env.rest_json = flaky
+        w, out = make(env)
+        w.actors = dict(actors)
+        w.top_up_actors()
+        funded = [c for c in env.cmds if "clerk send -f " + ADDR in c]
+        self.assertFalse(any("-t " + actors["A"] in c for c in funded), funded)
+        self.assertTrue(any("-t " + actors["B"] in c for c in funded), funded)
+
+    def test_underfunded_actor_is_topped_up_from_the_funder_before_pay(self):
+        actors = {k: ("%s" % k) * 58 for k in "ABCD"}
+        env = FakeEnv(balances={a: 150_000 for a in actors.values()})
+        w, out = make(env)
+        w.actors = dict(actors)
+        w.scenario = "pay"
+        wl.Workload.SCENARIOS["pay"](w)
+        funds = [c for c in env.cmds if "clerk send -f " + w.funder in c]
+        self.assertTrue(funds, env.cmds)
+
+    def test_top_up_actors_refills_only_the_drained_ones(self):
+        actors = {k: ("%s" % k) * 58 for k in "ABCD"}
+        env = FakeEnv(balances={actors["A"]: 200_000, actors["B"]: 900_000_000})
+        w, out = make(env)
+        w.actors = dict(actors)
+        w.top_up_actors()
+        funded = [c for c in env.cmds if "clerk send -f " + ADDR in c]
+        self.assertTrue(any("-t " + actors["A"] in c for c in funded), funded)
+        self.assertFalse(any("-t " + actors["B"] in c for c in funded), funded)
+
+    def test_run_all_tops_up_before_the_first_scenario(self):
+        env = FakeEnv(default_balance=200_000)
+        out = io.StringIO()
+        ticks = iter(range(0, 100_000, 5))
+        w = wl.Workload(env, out, 1, duration_s=100, funder=ADDR, clock=lambda: next(ticks))
+        calls = []
+        orig = w.top_up_actors
+        w.top_up_actors = lambda: (calls.append(w.scenario), orig())[1]
+        w.run_all()
+        self.assertTrue(calls)
+        self.assertNotIn("setup", calls)
 
     def test_boxes_scenario_exercises_every_box_opcode(self):
         _, env, recs = self.run_scenario("app_boxes")
