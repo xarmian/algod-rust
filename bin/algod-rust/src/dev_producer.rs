@@ -203,6 +203,14 @@ pub fn produce_dev_block(
         }
     }
 
+    // go's `writeDevmodeBlock` zeroes the payout when no proposer is set
+    // (`node/node.go`: "Zero out payouts if Proposer not set"); the evaluator
+    // now proposes a payout (issue #1794), and a dev block has no proposer to
+    // receive it. Without this the header carries a payout nobody is paid.
+    if block.proposer.is_zero() {
+        block.proposer_payout = 0;
+    }
+
     // Deterministic dev finality seed (see step 2 above).
     block.seed = block.branch;
 
