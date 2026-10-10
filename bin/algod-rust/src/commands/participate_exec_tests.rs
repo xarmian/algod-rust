@@ -805,8 +805,12 @@ fn ledger_lock_hold_for_a_full_scratch_pass_is_recorded() {
 
 // ---- #1791: header fields derived from the payset's apply effects ----
 
+/// A tracking map `{0: {"n": next}}`.
 fn spt(next: u64) -> Option<rmpv::Value> {
-    algo_ledger::block_header::with_state_proof_next_round(&None, next)
+    Some(rmpv::Value::Map(vec![(
+        rmpv::Value::from(0u64),
+        rmpv::Value::Map(vec![(rmpv::Value::from("n"), rmpv::Value::from(next))]),
+    )]))
 }
 
 fn state_proof_txn(last_attested_round: u64) -> SignedTransaction {
@@ -867,7 +871,7 @@ fn proposal_with_a_state_proof_txn_carries_the_advanced_next_round() {
     let (replica, _p) = fixture_with_tracking(&accounts, &[], spt(1024));
     let mut l = replica.lock().unwrap();
     let scratch = scratch_execute_payset(&mut *l, &block).expect("replica apply");
-    assert_eq!(scratch.final_state_proof_next, proposed);
+    assert_eq!(scratch.final_state_proof_next, Some(proposed));
     // Everything else the apply derives matches too.
     assert_eq!(scratch.final_txn_counter, block.txn_counter);
 }
@@ -891,5 +895,67 @@ fn proposal_without_a_state_proof_txn_keeps_the_inherited_next_round() {
     assert_eq!(
         algo_ledger::block_header::state_proof_next_round(&block.state_proof_tracking),
         1024
+    );
+}
+
+/// An evaluator on a ledger whose round-0 header tracks NextRound 1024.
+fn tracked_evaluator(
+    accounts: &[(Address, AccountData)],
+) -> (Arc<Mutex<SqliteLedger>>, SimpleBlockEvaluator) {
+    let (ledger, _pool) = fixture_with_tracking(accounts, &[], spt(1024));
+    let mut prev = genesis_header();
+    prev.state_proof_tracking = spt(1024);
+    let eval = PoolLedgerAdapter::new(ledger.clone())
+        .start_simple_evaluator(prev, 0, 0)
+        .expect("start_evaluator");
+    (ledger, eval)
+}
+
+/// `finalize_payset` resets the remembered NextRound before its empty-payset
+/// early return: a second call (nothing left to propose) must not leave the
+/// first call's value for `generate_block` to read.
+#[test]
+fn finalize_payset_twice_does_not_keep_a_stale_next_round() {
+    let a = key(1);
+    let (_ledger, mut eval) = tracked_evaluator(&[(a.0, funded(50_000_000))]);
+    eval.transaction_group(&[state_proof_txn(1024)])
+        .expect("state proof");
+    let (payset, _) = eval.finalize_payset().expect("first finalize");
+    assert_eq!(payset.len(), 1);
+    assert_eq!(
+        eval.exec.as_ref().unwrap().final_state_proof_next,
+        Some(1280)
+    );
+
+    let (payset, _) = eval.finalize_payset().expect("second finalize");
+    assert!(payset.is_empty());
+    assert_eq!(
+        eval.exec.as_ref().unwrap().final_state_proof_next,
+        None,
+        "an empty second finalize must not report the first call's value"
+    );
+    let block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(
+        algo_ledger::block_header::state_proof_next_round(&block.state_proof_tracking),
+        1024,
+        "an empty payset keeps the template's value"
+    );
+}
+
+/// An evaluator without exec state (legacy path) derives the value from the
+/// payset instead of keeping the template's.
+#[test]
+fn evaluator_without_exec_state_derives_next_round_from_the_payset() {
+    let a = key(1);
+    let (_ledger, mut eval) = tracked_evaluator(&[(a.0, funded(50_000_000))]);
+    eval.exec = None;
+    let mut stpf = state_proof_txn(1024);
+    eval.genesis_rule().strip(&mut stpf);
+    eval.included_txns.push(stpf);
+    let block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(block.payset.len(), 1);
+    assert_eq!(
+        algo_ledger::block_header::state_proof_next_round(&block.state_proof_tracking),
+        1280
     );
 }

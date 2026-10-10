@@ -96,10 +96,16 @@ fn ledger_err(message: impl Into<String>) -> AlgoError {
 ///    context and run the full cryptographic verification.
 ///
 /// State-proof transactions carry no fee, so `ApplyData::default()` is
-/// always the (only) return value on success — the actual `StateProofNext`
-/// advancement is derived by the caller from the *block's own* header
-/// tracking (see `apply::apply_block_with_delta_mode`'s `state_proof_next`
-/// field), not tracked here.
+/// always the (only) return value on success. On success the block's
+/// `StateProofNextRound` ([`ApplyContext::state_proof_next`], go's cow
+/// `SetStateProofNextRound`, `ledger/apply/stateproof.go:73`) advances to
+/// `lastAttestedRound + StateProofInterval`; the expected round is that same
+/// cell, seeded at block start (go `startEvaluator`, `eval.go:766-782`), or,
+/// for a direct call on an unseeded context, derived from the previous
+/// header with the same initialization
+/// ([`crate::block_header::initial_state_proof_next_round`]). The block's
+/// header value is checked against the cell by `apply`'s end-of-block
+/// validation, never trusted.
 pub fn apply_state_proof<L: LedgerStore>(
     store: &L,
     ctx: &ApplyContext,
@@ -129,8 +135,22 @@ pub fn apply_state_proof<L: LedgerStore>(
     // go reads the cow's value, which an earlier state proof of the same
     // block may already have advanced (issue #1791).
     let next_state_proof_rnd = match ctx.state_proof_next.get() {
-        0 => crate::block_header::state_proof_next_round(&prev_hdr.state_proof_tracking),
-        advanced => advanced,
+        0 => {
+            let prev_next =
+                crate::block_header::state_proof_next_round(&prev_hdr.state_proof_tracking);
+            if ctx.consensus.state_proof_interval == 0 {
+                // Context without consensus params (single-transaction
+                // callers): only the inherited value is known.
+                prev_next
+            } else {
+                crate::block_header::initial_state_proof_next_round(
+                    prev_next,
+                    ctx.round,
+                    &ctx.consensus,
+                )
+            }
+        }
+        seeded => seeded,
     };
 
     if next_state_proof_rnd == 0 || next_state_proof_rnd != last_round_in_interval {

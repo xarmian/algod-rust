@@ -1961,10 +1961,12 @@ impl SimpleBlockEvaluator {
             let n = pristine.len() as u64;
             return Ok((pristine, n));
         };
+        // Reset first: an empty payset must not leave the previous call's
+        // value behind for `generate_block` to read (issue #1791).
+        exec.final_state_proof_next = None;
         if pristine.is_empty() {
             return Ok((pristine, 0));
         }
-        exec.final_state_proof_next = None;
         let mut groups = std::mem::take(&mut exec.groups);
         let template = exec.template.clone();
         let mut passes = 0usize;
@@ -1993,7 +1995,7 @@ impl SimpleBlockEvaluator {
                     if total <= self.max_txn_bytes {
                         self.txn_bytes = total;
                         let counted = done.final_txn_counter.saturating_sub(self.hdr.txn_counter);
-                        final_state_proof_next = Some(done.final_state_proof_next);
+                        final_state_proof_next = done.final_state_proof_next;
                         break (payset, counted);
                     }
                     // Largest fitting prefix of groups, from the sizes just
@@ -2093,6 +2095,31 @@ impl SimpleBlockEvaluator {
             self.fees_collected = 0;
         }
         Ok(result)
+    }
+
+    /// `StateProofNextRound` after `payset` for an evaluator without exec
+    /// state (no scratch apply): each state proof transaction for the round
+    /// currently expected advances it by one `StateProofInterval`, as go's
+    /// `apply.StateProof` does (`ledger/apply/stateproof.go:73`). `None` when
+    /// the template tracks no state proofs.
+    fn legacy_state_proof_next(&self, payset: &[algo_types::SignedTransaction]) -> Option<u64> {
+        let interval = self.consensus_params.state_proof_interval;
+        let mut next =
+            algo_ledger::block_header::state_proof_next_round(&self.hdr.state_proof_tracking);
+        if interval == 0 || next == 0 {
+            return None;
+        }
+        for stx in payset.iter().filter(|s| s.txn.txn_type == "stpf") {
+            let attested = stx
+                .txn
+                .state_proof_message
+                .as_ref()
+                .map(|m| m.last_attested_round);
+            if attested == Some(next) {
+                next = next.saturating_add(interval);
+            }
+        }
+        Some(next)
     }
 
     fn empty_payset_parts(&self) -> (Vec<algo_types::SignedTransaction>, u64) {
@@ -2853,12 +2880,19 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         // state proof transactions leave behind, not the template's
         // (previous-round) value: go reads it from the cow at `endOfBlock`
         // (issue #1791). Taken from the scratch apply, not recomputed here.
-        let state_proof_tracking = match self.exec.as_ref().and_then(|e| e.final_state_proof_next) {
-            Some(next) if next != 0 => algo_ledger::block_header::with_state_proof_next_round(
+        // `None` (unknown) keeps the template; `Some` replaces the type-0
+        // entry's NextRound in place. Without exec state the value is derived
+        // from the payset's state proof transactions.
+        let next_round = match self.exec.as_ref() {
+            Some(exec) => exec.final_state_proof_next,
+            None => self.legacy_state_proof_next(&payset),
+        };
+        let state_proof_tracking = match next_round {
+            Some(next) => algo_ledger::block_header::with_state_proof_next_round(
                 &self.hdr.state_proof_tracking,
                 next,
             ),
-            _ => self.hdr.state_proof_tracking.clone(),
+            None => self.hdr.state_proof_tracking.clone(),
         };
 
         // Compute the expired-participation-accounts sweep list (issue #526).

@@ -812,9 +812,10 @@ pub struct ScratchPayset {
     /// (go `block.TxnCounter`).
     pub final_txn_counter: u64,
     /// The `StateProofNextRound` after the payset's state proof transactions
-    /// (go `cow.GetStateProofNextRound()`; `0` without state proofs). The
-    /// proposed header must carry this value (issue #1791).
-    pub final_state_proof_next: u64,
+    /// (go `cow.GetStateProofNextRound()`; `Some(0)`: the protocol has no
+    /// state proofs, `None`: unknown). The proposed header must carry this
+    /// value (issue #1791).
+    pub final_state_proof_next: Option<u64>,
 }
 
 /// Why [`scratch_execute_payset`] did not produce a result.

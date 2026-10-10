@@ -39,6 +39,17 @@ for the per-block tests and the wiring check, which fails if a fixture exists
 without a test or the reverse. Negative tests tamper with in-memory copies of a
 fixture to prove each check can fail.
 
+## State proof transactions (issue #1791)
+
+`65682823` carries a state proof transaction (`stpf`). A mainnet state proof
+body (`sp`) is ~300 KB, above the per-file limit, and Execute-mode replay
+never reads it (proofs are only verified in validate mode). The capture script
+therefore drops the `sp` body of every `stpf` from the stored block and counts
+the drops in `meta.stripped_state_proof_bodies`; the transaction's message
+(`spmsg`), the header's `StateProofTracking` and every other byte are as
+served. The replay asserts the `StateProofNextRound` the apply leaves behind
+equals the header value go wrote (here 65682688 -> 65682944).
+
 ## How the pre-state is obtained (and its limits)
 
 The free public endpoints cannot rewind state (the indexer rejects `round=`,

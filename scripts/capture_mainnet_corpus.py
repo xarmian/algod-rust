@@ -122,6 +122,10 @@ def http(url, params=None):
             if r.status_code in (429, 502, 503, 504):
                 time.sleep(1.5 * (attempt + 1))
                 continue
+            if r.status_code == 403:
+                # algonode's edge answers 403 when a burst trips its rate limit.
+                time.sleep(8 * (attempt + 1))
+                continue
             return r
         except requests.RequestException:
             time.sleep(1.5 * (attempt + 1))
@@ -660,7 +664,22 @@ def capture(r):
     UNRESOLVED_RES.clear()
     os.makedirs(OUT_DIR, exist_ok=True)
     blk_bytes = raw_block(r)
-    block = unpack(blk_bytes)["block"]
+    resp = unpack(blk_bytes)
+    block = resp["block"]
+    # A mainnet state proof transaction carries a ~300 KB proof body (`sp`),
+    # far above the per-file size limit of this corpus. Execute-mode replay
+    # (no proof verification) never reads it: the replay needs only the
+    # transaction's message (`spmsg`) and the header's StateProofTracking.
+    # The bodies are dropped from the stored block and counted in
+    # `meta.stripped_state_proof_bodies` (the test pins the count).
+    stripped_sp = 0
+    for stib in block.get("txns") or []:
+        t = stib.get("txn") or {}
+        if t.get("type") == "stpf" and "sp" in t:
+            del t["sp"]
+            stripped_sp += 1
+    if stripped_sp:
+        blk_bytes = pack(resp)
     dr = delta(r)
     d_prev = delta(r - 1)
 
@@ -845,6 +864,7 @@ def capture(r):
             "tip_approximated_accounts": [addr_b32(a) for a in APPROX],
             "tip_approximated_resource_parts": len(APPROX_RES),
             "unresolved_resource_parts": list(UNRESOLVED_RES),
+            "stripped_state_proof_bodies": stripped_sp,
         },
         "prev_hdr": d_prev["Hdr"],
         "extra_hdrs": [delta(r - k)["Hdr"] for k in range(2, 2 + EXTRA_HDRS)],
