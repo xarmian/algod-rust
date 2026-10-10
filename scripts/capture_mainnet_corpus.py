@@ -116,11 +116,26 @@ def pack(x):
 
 
 def http(url, params=None):
+    forbidden_sleep = 0
     for attempt in range(6):
         try:
             r = SESSION.get(url, params=params, timeout=90)
             if r.status_code in (429, 502, 503, 504):
                 time.sleep(1.5 * (attempt + 1))
+                continue
+            if r.status_code == 403 and "algonode.cloud" in url:
+                # algonode's edge answers 403 when a burst trips its rate
+                # limit (other hosts: a 403 is final, returned to the caller).
+                # Bounded: at most 5 back-offs and 30 s of sleeping in total.
+                if attempt >= 5 or forbidden_sleep >= 30:
+                    return r
+                pause = min(6 * (attempt + 1), 30 - forbidden_sleep)
+                forbidden_sleep += pause
+                print(
+                    f"  403 from {url} (attempt {attempt + 1}/6), backing off {pause}s",
+                    file=sys.stderr,
+                )
+                time.sleep(pause)
                 continue
             return r
         except requests.RequestException:
@@ -652,6 +667,59 @@ def collect_refs(block):
 # ---------------------------------------------------------------------------
 
 
+def strip_state_proof_bodies(buf):
+    """Remove the `sp` key/value of every `stpf` txn from a block response,
+    byte-exactly (no re-encoding). Returns (new_bytes, count)."""
+    u = msgpack.Unpacker(raw=False, strict_map_key=False, max_buffer_size=len(buf) + 1)
+    u.feed(buf)
+    cuts = []  # (txn_map_header_pos, key_start, value_end)
+    for _ in range(u.read_map_header()):
+        if u.unpack() != "block":
+            u.skip()
+            continue
+        for _ in range(u.read_map_header()):
+            if u.unpack() != "txns":
+                u.skip()
+                continue
+            for _ in range(u.read_array_header()):
+                for _ in range(u.read_map_header()):  # SignedTxnInBlock
+                    if u.unpack() != "txn":
+                        u.skip()
+                        continue
+                    hdr = u.tell()
+                    n = u.read_map_header()
+                    found = None
+                    is_stpf = False
+                    for _ in range(n):
+                        kstart = u.tell()
+                        k = u.unpack()
+                        if k == "sp":
+                            u.skip()
+                            found = (kstart, u.tell())
+                        elif k == "type":
+                            is_stpf = u.unpack() == "stpf"
+                        else:
+                            u.skip()
+                    if is_stpf and not found:
+                        raise SystemExit(
+                            "stpf transaction without an `sp` key: refusing to "
+                            "store an unstripped state proof body"
+                        )
+                    if is_stpf:
+                        cuts.append((hdr, found[0], found[1], n))
+    out = bytearray(buf)
+    for hdr, ks, ve, n in sorted(cuts, reverse=True):
+        del out[ks:ve]  # the entries follow the header, so hdr stays valid
+        if 0x80 <= buf[hdr] <= 0x8F and n < 16:  # fixmap
+            out[hdr] = 0x80 | (n - 1)
+        elif buf[hdr] == 0xDE:  # map16: 2-byte big-endian count
+            assert int.from_bytes(buf[hdr + 1 : hdr + 3], "big") == n
+            out[hdr + 1 : hdr + 3] = (n - 1).to_bytes(2, "big")
+        else:
+            raise SystemExit(f"unexpected txn map header byte {buf[hdr]:#x}")
+    return bytes(out), len(cuts)
+
+
 def capture(r):
     _prescan.clear()
     RES_PRESCAN.clear()
@@ -660,6 +728,17 @@ def capture(r):
     UNRESOLVED_RES.clear()
     os.makedirs(OUT_DIR, exist_ok=True)
     blk_bytes = raw_block(r)
+    # A mainnet state proof transaction carries a ~300 KB proof body (`sp`),
+    # far above the per-file size limit of this corpus. Execute-mode replay
+    # (no proof verification) never reads it: the replay needs only the
+    # transaction's message (`spmsg`) and the header's StateProofTracking.
+    # The bodies are cut out of the stored block at the byte level (every
+    # other byte is as served; only the `sp` key/value and the owning txn
+    # map's entry count change) and counted in
+    # `meta.stripped_state_proof_bodies` (the test pins the count). The block's
+    # payset commitments (`txn`/`txn256`) therefore no longer match the
+    # stored payset; Execute-mode replay never recomputes them.
+    blk_bytes, stripped_sp = strip_state_proof_bodies(blk_bytes)
     block = unpack(blk_bytes)["block"]
     dr = delta(r)
     d_prev = delta(r - 1)
@@ -845,6 +924,7 @@ def capture(r):
             "tip_approximated_accounts": [addr_b32(a) for a in APPROX],
             "tip_approximated_resource_parts": len(APPROX_RES),
             "unresolved_resource_parts": list(UNRESOLVED_RES),
+            "stripped_state_proof_bodies": stripped_sp,
         },
         "prev_hdr": d_prev["Hdr"],
         "extra_hdrs": [delta(r - k)["Hdr"] for k in range(2, 2 + EXTRA_HDRS)],

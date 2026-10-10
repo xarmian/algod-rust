@@ -409,6 +409,79 @@ pub fn state_proof_next_round(tracking: &Option<rmpv::Value>) -> u64 {
         .unwrap_or(0)
 }
 
+/// `tracking` with `StateProofTracking[StateProofBasic].StateProofNextRound`
+/// (the `"n"` field) set to `next`, everything else -- map order, the other
+/// fields, other tracking types -- untouched: how a proposer carries the value
+/// its payset's state proof transactions left behind into the header (go
+/// `endOfBlock` writes the cow's `StateProofNextRound`, issue #1791).
+///
+/// The `StateProofBasic` entry is replaced in place and a tracking map is
+/// never fabricated: a header without a type-0 entry (state proofs disabled)
+/// is returned unchanged, so the header hash only ever changes by the value.
+/// `next == 0` removes the `"n"` key (go omits zero fields); an absent `"n"`
+/// is inserted in sorted key position.
+pub fn with_state_proof_next_round(
+    tracking: &Option<rmpv::Value>,
+    next: u64,
+) -> Option<rmpv::Value> {
+    let Some(rmpv::Value::Map(types)) = tracking else {
+        return tracking.clone();
+    };
+    let mut types = types.clone();
+    for (k, v) in types.iter_mut() {
+        if k.as_u64() != Some(STATE_PROOF_BASIC) {
+            continue;
+        }
+        let rmpv::Value::Map(fields) = v else {
+            continue;
+        };
+        // go omits a zero NextRound (`codec:",omitempty"`); a non-zero value
+        // replaces the existing entry in place or, if absent, goes in the
+        // canonical (lexicographically sorted) key position.
+        let existing = fields.iter().position(|(fk, _)| fk.as_str() == Some("n"));
+        match (existing, next) {
+            (Some(i), 0) => {
+                fields.remove(i);
+            }
+            (Some(i), _) => fields[i].1 = rmpv::Value::from(next),
+            (None, 0) => {}
+            (None, _) => {
+                let at = fields
+                    .iter()
+                    .position(|(fk, _)| fk.as_str().is_some_and(|k| k > "n"))
+                    .unwrap_or(fields.len());
+                fields.insert(at, (rmpv::Value::from("n"), rmpv::Value::from(next)));
+            }
+        }
+    }
+    Some(rmpv::Value::Map(types))
+}
+
+/// go's `StateProofNextRound` at the start of block evaluation
+/// (`ledger/eval/eval.go:766-782`, `startEvaluator`): the previous header's
+/// value, except when it is still zero and the block's protocol has state
+/// proofs (`StateProofInterval != 0`), where it is initialized to
+/// `roundUp(round + StateProofVotersLookback, StateProofInterval) +
+/// StateProofInterval`. `0` when the protocol has no state proofs.
+pub fn initial_state_proof_next_round(
+    prev_next_round: u64,
+    round: u64,
+    params: &ConsensusParams,
+) -> u64 {
+    let interval = params.state_proof_interval;
+    if interval == 0 {
+        return 0;
+    }
+    if prev_next_round != 0 {
+        return prev_next_round;
+    }
+    round_up_to_multiple_of(
+        round.saturating_add(params.state_proof_voters_lookback),
+        interval,
+    )
+    .saturating_add(interval)
+}
+
 /// Read `StateProofTracking[StateProofBasic].VotersCommitment` (the `"v"`
 /// field under map key `0`) out of an encoded `"spt"` value, defaulting to
 /// empty when absent.
@@ -496,18 +569,12 @@ fn next_state_proof_tracking(
         return None;
     }
 
-    let mut next = state_proof_next_round(&prev.state_proof_tracking);
-    if next == 0 {
-        // First block after state proofs are enabled: the first block carrying
-        // a vector commitment to the voters is the next multiple of the
-        // interval at or after `round + lookback`; the first state proof itself
-        // lands one interval after that (eval.go:773–782).
-        let voters_round = round_up_to_multiple_of(
-            next_round.saturating_add(params.state_proof_voters_lookback),
-            interval,
-        );
-        next = voters_round.saturating_add(interval);
-    }
+    // eval.go:766-782: inherited, or initialized when still zero.
+    let next = initial_state_proof_next_round(
+        state_proof_next_round(&prev.state_proof_tracking),
+        next_round,
+        params,
+    );
 
     // One entry, keyed by StateProofBasic. Zero-valued fields ("v" voters
     // commitment, "t" online total weight) are omitted, matching go's
@@ -1407,5 +1474,123 @@ mod tests {
         assert_eq!(compute_load(1, 0), 1_000_000);
         // Load can never exceed 1,000,000 even if block_size > max_size.
         assert_eq!(compute_load(2_000_000, 1_000_000), 1_000_000);
+    }
+
+    // ── Issue #1791: in-place NextRound replacement, enabling-block seed ──
+
+    fn tracking_map(fields: Vec<(&str, rmpv::Value)>) -> Option<rmpv::Value> {
+        Some(rmpv::Value::Map(vec![(
+            rmpv::Value::from(0u64),
+            rmpv::Value::Map(
+                fields
+                    .into_iter()
+                    .map(|(k, v)| (rmpv::Value::from(k), v))
+                    .collect(),
+            ),
+        )]))
+    }
+
+    #[test]
+    fn with_state_proof_next_round_changes_only_the_value_in_the_encoding() {
+        let before = tracking_map(vec![
+            ("v", rmpv::Value::Binary(vec![7u8; 64])),
+            ("n", rmpv::Value::from(1024u64)),
+            ("t", rmpv::Value::from(99u64)),
+        ]);
+        let expected = tracking_map(vec![
+            ("v", rmpv::Value::Binary(vec![7u8; 64])),
+            ("n", rmpv::Value::from(1280u64)),
+            ("t", rmpv::Value::from(99u64)),
+        ]);
+        let replaced = with_state_proof_next_round(&before, 1280);
+        assert_eq!(replaced, expected, "order and other fields are kept");
+
+        let header = |t| BlockHeader {
+            round: Round(7),
+            current_protocol: CONSENSUS_V41.to_string(),
+            state_proof_tracking: t,
+            ..BlockHeader::default()
+        };
+        let a = algo_codec::canonical_encode_block_header(&header(replaced));
+        let b = algo_codec::canonical_encode_block_header(&header(expected));
+        assert_eq!(
+            a, b,
+            "encoded header bytes (hence the hash) differ only by the value"
+        );
+        let c = algo_codec::canonical_encode_block_header(&header(before));
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn with_state_proof_next_round_never_fabricates_a_tracking_map() {
+        assert_eq!(with_state_proof_next_round(&None, 1280), None);
+        let other_type = Some(rmpv::Value::Map(vec![(
+            rmpv::Value::from(1u64),
+            rmpv::Value::Map(vec![]),
+        )]));
+        assert_eq!(with_state_proof_next_round(&other_type, 1280), other_type);
+    }
+
+    #[test]
+    fn initial_state_proof_next_round_matches_go_start_evaluator() {
+        // go eval.go:766-782: roundUp(round + lookback, interval) + interval.
+        let p = v41_params();
+        assert_eq!(
+            (p.state_proof_interval, p.state_proof_voters_lookback),
+            (256, 16)
+        );
+        assert_eq!(initial_state_proof_next_round(0, 1, &p), 512);
+        assert_eq!(initial_state_proof_next_round(0, 240, &p), 512);
+        assert_eq!(initial_state_proof_next_round(0, 241, &p), 768);
+        assert_eq!(initial_state_proof_next_round(0, 256, &p), 768);
+        assert_eq!(initial_state_proof_next_round(1024, 1172, &p), 1024);
+        let mut off = v41_params();
+        off.state_proof_interval = 0;
+        assert_eq!(initial_state_proof_next_round(0, 5, &off), 0);
+    }
+
+    #[test]
+    fn with_state_proof_next_round_zero_omits_the_key() {
+        let before = tracking_map(vec![
+            ("n", rmpv::Value::from(1024u64)),
+            ("t", rmpv::Value::from(99u64)),
+        ]);
+        let expected = tracking_map(vec![("t", rmpv::Value::from(99u64))]);
+        assert_eq!(with_state_proof_next_round(&before, 0), expected);
+        // Already absent: unchanged.
+        assert_eq!(with_state_proof_next_round(&expected, 0), expected);
+    }
+
+    #[test]
+    fn with_state_proof_next_round_inserts_an_absent_key_in_canonical_order() {
+        // Sorted keys: n < t < v.
+        let before = tracking_map(vec![
+            ("t", rmpv::Value::from(99u64)),
+            ("v", rmpv::Value::Binary(vec![1u8; 64])),
+        ]);
+        let expected = tracking_map(vec![
+            ("n", rmpv::Value::from(1280u64)),
+            ("t", rmpv::Value::from(99u64)),
+            ("v", rmpv::Value::Binary(vec![1u8; 64])),
+        ]);
+        assert_eq!(with_state_proof_next_round(&before, 1280), expected);
+
+        let only_v = tracking_map(vec![("v", rmpv::Value::Binary(vec![1u8; 64]))]);
+        let got = with_state_proof_next_round(&only_v, 5);
+        assert_eq!(
+            got,
+            tracking_map(vec![
+                ("n", rmpv::Value::from(5u64)),
+                ("v", rmpv::Value::Binary(vec![1u8; 64])),
+            ])
+        );
+        let only_t = tracking_map(vec![("t", rmpv::Value::from(1u64))]);
+        assert_eq!(
+            with_state_proof_next_round(&only_t, 5),
+            tracking_map(vec![
+                ("n", rmpv::Value::from(5u64)),
+                ("t", rmpv::Value::from(1u64)),
+            ])
+        );
     }
 }

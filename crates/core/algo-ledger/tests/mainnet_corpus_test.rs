@@ -44,8 +44,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
+use algo_ledger::apply::apply_block_capturing_state_proof_next;
 use algo_ledger::shadow_execute::compare_recorded_apply_data;
-use algo_ledger::{apply_block_capturing_apply_data, ApplyMode, LedgerState, LedgerStore};
+use algo_ledger::{ApplyMode, LedgerState, LedgerStore};
 use algo_types::{
     AccountData, AccountStatus, Address, AppLocalState, AppParams, AssetHolding, AssetParams,
     AssetParamsRecord, Round, StateSchema, TealValue,
@@ -674,27 +675,53 @@ fn get_mut<'a>(v: &'a mut Value, key: &str) -> Option<&'a mut Value> {
 /// Replay one corpus entry; `mutate` may tamper with an in-memory copy of the
 /// state file (used by the negative tests). Returns every divergence found.
 fn run_entry(round: u64, mutate: &dyn Fn(&mut Value)) -> Vec<String> {
+    run_entry_with_block(round, mutate, &|_| {})
+}
+
+fn run_entry_with_block(
+    round: u64,
+    mutate: &dyn Fn(&mut Value),
+    mutate_block: &dyn Fn(&mut algo_types::Block),
+) -> Vec<String> {
     let dir = corpus_dir();
     let raw_block = std::fs::read(dir.join(format!("{round}.msgpack")))
         .unwrap_or_else(|e| panic!("missing corpus block {round}: {e}"));
     let block = algo_codec::decode_block_response(&raw_block)
         .unwrap_or_else(|e| panic!("cannot decode block {round}: {e}"))
         .block;
+    let mut block = block;
+    mutate_block(&mut block);
     assert_eq!(block.round, Round(round));
     let mut state = read_value(&dir.join(format!("{round}.state.msgpack")));
     mutate(&mut state);
     let mut ls = build_pre_state(round, &state);
     let before = Snapshot::of(&ls);
 
-    let computed = match apply_block_capturing_apply_data(&mut ls, &block, ApplyMode::Execute) {
-        Ok(c) => c,
-        Err(e) => return vec![format!("Execute-mode apply failed: {e}")],
-    };
+    let (computed, final_state_proof_next) =
+        match apply_block_capturing_state_proof_next(&mut ls, &block, ApplyMode::Execute) {
+            Ok(c) => c,
+            Err(e) => return vec![format!("Execute-mode apply failed: {e}")],
+        };
 
     let mut diffs: Vec<String> = compare_recorded_apply_data(&block, &computed)
         .iter()
         .map(|d| format!("apply_data {d}"))
         .collect();
+    // Issue #1791: the StateProofNextRound the apply leaves behind is the one
+    // go wrote into the header (go eval.go:1489 / 1564).
+    let header_next =
+        algo_ledger::block_header::state_proof_next_round(&block.state_proof_tracking);
+    // `None` = no state proof applied: the previous header's value carries over.
+    let prev_next = algo_ledger::block_header::state_proof_next_round(&Some(
+        get(get(&state, "prev_hdr").expect("prev_hdr"), "spt")
+            .cloned()
+            .unwrap_or(Value::Nil),
+    ));
+    if final_state_proof_next.unwrap_or(prev_next) != header_next {
+        diffs.push(format!(
+            "StateProofNextRound: apply {final_state_proof_next:?} (carried {prev_next}), go header {header_next}"
+        ));
+    }
     check_post_state(&ls, &state, &mut diffs);
     check_no_unlisted_writes(&before, &ls, &state, &mut diffs);
     diffs
@@ -762,6 +789,11 @@ corpus! {
     /// and because its inner transactions (axfer/appl with nested deltas)
     /// exercise the eval-delta/itx encoding (#1742) that older trees get wrong.
     round_65723784_smoke_replay_spend_from_new_account => 65723784, approx (2, 10, 20, 30);
+    /// #1791: a block carrying a state proof transaction for round 65682688:
+    /// go's header NextRound moves 65682688 -> 65682944 (one interval). The
+    /// apply's NextRound must equal go's header value. The transaction's
+    /// ~300 KB proof body is stripped from the fixture (README).
+    round_65682823_state_proof_advances_next_round => 65682823, approx (0, 1, 3, 2);
 }
 
 /// Every fixture needs a test and every test a fixture (both directions).
@@ -881,5 +913,39 @@ fn negative_meta_approximation_allow_list_rejects_drift() {
     assert!(
         err.contains("tip_approximated_accounts"),
         "message must print the meta: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1791: StateProofNextRound
+// ---------------------------------------------------------------------------
+
+/// The state proof block really advances NextRound by one interval, the apply
+/// reproduces it, and a header carrying the previous round's value (what the
+/// proposer used to emit) is reported as a divergence.
+#[test]
+fn state_proof_block_next_round_is_derived_by_the_apply() {
+    let round = 65682823;
+    let state = read_value(&corpus_dir().join(format!("{round}.state.msgpack")));
+    let prev_next = algo_ledger::block_header::state_proof_next_round(&Some(
+        get(get(&state, "prev_hdr").expect("prev_hdr"), "spt")
+            .expect("prev spt")
+            .clone(),
+    ));
+    assert_eq!(prev_next, 65682688);
+    let diffs = run_entry(round, &|_| {});
+    assert!(diffs.is_empty(), "{diffs:?}");
+
+    let diffs = run_entry_with_block(round, &|_| {}, &|b| {
+        b.state_proof_tracking = algo_ledger::block_header::with_state_proof_next_round(
+            &b.state_proof_tracking,
+            prev_next,
+        );
+    });
+    assert!(
+        diffs
+            .iter()
+            .any(|d| d.contains("StateProofNextRound: apply Some(65682944)")),
+        "a header with the stale NextRound must be flagged: {diffs:?}"
     );
 }

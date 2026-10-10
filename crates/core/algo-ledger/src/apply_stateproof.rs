@@ -96,10 +96,17 @@ fn ledger_err(message: impl Into<String>) -> AlgoError {
 ///    context and run the full cryptographic verification.
 ///
 /// State-proof transactions carry no fee, so `ApplyData::default()` is
-/// always the (only) return value on success — the actual `StateProofNext`
-/// advancement is derived by the caller from the *block's own* header
-/// tracking (see `apply::apply_block_with_delta_mode`'s `state_proof_next`
-/// field), not tracked here.
+/// always the (only) return value on success. On success the block's
+/// `StateProofNextRound` ([`ApplyContext::state_proof_next`], go's cow
+/// `SetStateProofNextRound`, `ledger/apply/stateproof.go:73`) advances to
+/// `lastAttestedRound + StateProofInterval`. The expected round is that same
+/// cell. It starts at 0 and is seeded lazily: the first state proof of the
+/// block derives it from the previous header with go's `startEvaluator`
+/// initialization (`eval.go:766-782`,
+/// [`crate::block_header::initial_state_proof_next_round`]); nothing is looked
+/// up for a block without a state proof except by `apply`'s validating
+/// end-of-block check. The block's header value is checked against the cell
+/// there, never trusted.
 pub fn apply_state_proof<L: LedgerStore>(
     store: &L,
     ctx: &ApplyContext,
@@ -118,16 +125,39 @@ pub fn apply_state_proof<L: LedgerStore>(
         .ok_or_else(|| ledger_err("applyStateProof: missing state proof message"))?;
     let last_round_in_interval = message.last_attested_round;
 
-    let prev_hdr = store
-        .get_block_header(ctx.round.saturating_sub(1))?
-        .ok_or_else(|| {
-            ledger_err(format!(
-                "applyStateProof: no header for round {} (previous round)",
-                ctx.round.saturating_sub(1)
-            ))
-        })?;
-    let next_state_proof_rnd =
-        crate::block_header::state_proof_next_round(&prev_hdr.state_proof_tracking);
+    // go's `SetStateProofNextRound` uses the current block's interval; a
+    // context without it could not advance the cell (letting the same proof
+    // be applied twice), so it is refused.
+    if ctx.consensus.state_proof_interval == 0 {
+        return Err(ledger_err(
+            "applyStateProof: state proofs are not enabled for this protocol",
+        ));
+    }
+    // go reads the cow's value, which an earlier state proof of the same
+    // block may already have advanced (issue #1791). The cell is lazy: the
+    // first state proof of a block seeds it from the previous header just
+    // read, with the same initialization `apply`'s end-of-block check uses.
+    //
+    // `apply` builds one context per block. The simulator never reaches this
+    // function with a state proof: it rejects `stpf` transactions outright
+    // (`simulation_gaps_test::state_proof_txn_rejected`), and it builds a fresh
+    // context per `simulate` call anyway.
+    let next_state_proof_rnd = match ctx.state_proof_next.get() {
+        0 => {
+            let prev_hdr = ctx.previous_header(store)?.ok_or_else(|| {
+                ledger_err(format!(
+                    "applyStateProof: no header for round {} (previous round)",
+                    ctx.round.saturating_sub(1)
+                ))
+            })?;
+            crate::block_header::initial_state_proof_next_round(
+                crate::block_header::state_proof_next_round(&prev_hdr.state_proof_tracking),
+                ctx.round,
+                &ctx.consensus,
+            )
+        }
+        seeded => seeded,
+    };
 
     if next_state_proof_rnd == 0 || next_state_proof_rnd != last_round_in_interval {
         return Err(ledger_err(format!(
@@ -205,6 +235,12 @@ pub fn apply_state_proof<L: LedgerStore>(
             .verify(last_round_in_interval, msg_hash, &crypto_proof)
             .map_err(|e| ledger_err(format!("applyStateProof: state proof crypto error: {e}")))?;
     }
+
+    // go `apply.StateProof` (stateproof.go:73): `sp.SetStateProofNextRound(
+    // lastRoundInInterval + StateProofInterval)`, with the current block's
+    // consensus params.
+    ctx.state_proof_next
+        .set(last_round_in_interval.saturating_add(ctx.consensus.state_proof_interval));
 
     Ok(ApplyData::default())
 }
@@ -637,6 +673,13 @@ mod tests {
         )]))
     }
 
+    /// A replay context with the V41 consensus params (state proofs on).
+    fn replay_ctx(round: u64) -> ApplyContext {
+        let mut ctx = ApplyContext::new_replay(0, Address::ZERO, round);
+        ctx.consensus = consensus_params_for_version(CONSENSUS_V41).unwrap();
+        ctx
+    }
+
     fn header_at(round: u64, protocol: &str, tracking: Option<rmpv::Value>) -> BlockHeader {
         BlockHeader {
             round: Round(round),
@@ -649,7 +692,7 @@ mod tests {
     #[test]
     fn rejects_unsupported_state_proof_type() {
         let store = LedgerState::new();
-        let ctx = ApplyContext::new_replay(0, Address::ZERO, 10);
+        let ctx = replay_ctx(10);
         let txn = Transaction {
             txn_type: "stpf".into(),
             state_proof_type: 1,
@@ -670,7 +713,7 @@ mod tests {
             &mut store,
             &header_at(9, CONSENSUS_V41, tracking_value(500, &[], 0)),
         );
-        let ctx = ApplyContext::new_replay(0, Address::ZERO, 10);
+        let ctx = replay_ctx(10);
 
         let txn = Transaction {
             txn_type: "stpf".into(),
@@ -695,7 +738,7 @@ mod tests {
         // guard (`ledger/apply/stateproof.go:45`).
         let mut store = LedgerState::new();
         put_header(&mut store, &header_at(9, CONSENSUS_V41, None));
-        let ctx = ApplyContext::new_replay(0, Address::ZERO, 10);
+        let ctx = replay_ctx(10);
 
         let txn = Transaction {
             txn_type: "stpf".into(),
@@ -748,7 +791,7 @@ mod tests {
                 tracking_value(FIRST_STATE_PROOF, &[], 0),
             ),
         );
-        let ctx = ApplyContext::new_replay(0, Address::ZERO, FIRST_STATE_PROOF);
+        let ctx = replay_ctx(FIRST_STATE_PROOF);
 
         // 1. Cannot apply a state proof for 3*interval when 2*interval (512)
         //    is expected.
@@ -790,7 +833,7 @@ mod tests {
                 tracking_value(second_round, &[], 0),
             ),
         );
-        let ctx2 = ApplyContext::new_replay(0, Address::ZERO, second_round);
+        let ctx2 = replay_ctx(second_round);
 
         // 3. Applying the next state proof (768) against the now-advanced
         //    expectation also succeeds.
@@ -804,6 +847,44 @@ mod tests {
         };
         apply_state_proof(&store, &ctx2, &second_txn)
             .expect("state proof for the newly-advanced round must also be accepted");
+    }
+
+    /// Issue #1791: go's `apply.StateProof` ends with
+    /// `SetStateProofNextRound(lastRoundInInterval + StateProofInterval)` on
+    /// the block's cow, so a second proof for the same round in one block is
+    /// refused and the next interval's proof is accepted. The advanced value
+    /// is what `endOfBlock` writes into the header.
+    #[test]
+    fn applied_state_proof_advances_the_blocks_next_round_by_one_interval() {
+        let mut store = LedgerState::new();
+        put_header(
+            &mut store,
+            &header_at(1171, CONSENSUS_V41, tracking_value(1024, &[], 0)),
+        );
+        let ctx = replay_ctx(1172);
+        let stpf = |round: u64| Transaction {
+            txn_type: "stpf".into(),
+            state_proof_message: Some(StateProofMessage {
+                last_attested_round: round,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        apply_state_proof(&store, &ctx, &stpf(1024)).expect("expected round");
+        assert_eq!(
+            ctx.state_proof_next.get(),
+            1280,
+            "1024 + StateProofInterval"
+        );
+
+        let err = apply_state_proof(&store, &ctx, &stpf(1024)).unwrap_err();
+        assert!(
+            format!("{err}").contains("expected different state proof round"),
+            "a repeated proof must be refused: {err}"
+        );
+        apply_state_proof(&store, &ctx, &stpf(1280)).expect("next interval");
+        assert_eq!(ctx.state_proof_next.get(), 1536);
     }
 
     #[test]
@@ -827,7 +908,7 @@ mod tests {
         // ctx.round == last_attested_round (offset == 0) => go's
         // `calculateAcceptableStateProofWeight` demands the *full* online
         // total weight (1_000_000) be signed.
-        let mut ctx = ApplyContext::new_replay(0, Address::ZERO, 256);
+        let mut ctx = replay_ctx(256);
         ctx.validate = true;
 
         let txn = Transaction {
@@ -1303,7 +1384,7 @@ mod tests {
             ),
         );
 
-        let mut ctx = ApplyContext::new_replay(0, Address::ZERO, LAST_ATTESTED);
+        let mut ctx = replay_ctx(LAST_ATTESTED);
         ctx.validate = true;
 
         let txn = Transaction {

@@ -1600,6 +1600,10 @@ struct ExecState {
     incomplete: bool,
     /// Scratch passes the last `generate_block` ran (diagnostics, tests).
     last_passes: usize,
+    /// The `StateProofNextRound` the final scratch apply produced for the
+    /// payset `finalize_payset` kept (go `cow.GetStateProofNextRound()` at
+    /// `endOfBlock`); `None` while no payset has been evaluated (issue #1791).
+    final_state_proof_next: Option<u64>,
 }
 
 impl SimpleBlockEvaluator {
@@ -2047,6 +2051,9 @@ impl SimpleBlockEvaluator {
             let n = pristine.len() as u64;
             return Ok((pristine, n));
         };
+        // Reset first: an empty payset must not leave the previous call's
+        // value behind for `generate_block` to read (issue #1791).
+        exec.final_state_proof_next = None;
         if pristine.is_empty() {
             return Ok((pristine, 0));
         }
@@ -2056,6 +2063,7 @@ impl SimpleBlockEvaluator {
         let mut dropped = 0usize;
         let mut retried = false;
         let mut bisected = false;
+        let mut final_state_proof_next = None;
         let result = loop {
             passes += 1;
             let result = self.scratch_pass(&template, &pristine, &groups)?;
@@ -2077,6 +2085,7 @@ impl SimpleBlockEvaluator {
                     if total <= self.max_txn_bytes {
                         self.txn_bytes = total;
                         let counted = done.final_txn_counter.saturating_sub(self.hdr.txn_counter);
+                        final_state_proof_next = done.final_state_proof_next;
                         break (payset, counted);
                     }
                     // Largest fitting prefix of groups, from the sizes just
@@ -2169,6 +2178,7 @@ impl SimpleBlockEvaluator {
         self.fees_collected = groups.iter().map(|g| g.fees).sum();
         if let Some(exec) = self.exec.as_mut() {
             exec.last_passes = passes;
+            exec.final_state_proof_next = final_state_proof_next;
         }
         if result.0.is_empty() {
             self.txn_bytes = 0;
@@ -2931,6 +2941,40 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         // `GenerateBlock` output. Falls back to the legacy "included as
         // admitted" behavior only for an evaluator without exec state.
         let (payset, txn_count) = self.finalize_payset()?;
+        // The header's `StateProofTracking.NextRound` is what the payset's
+        // state proof transactions leave behind, not the template's
+        // (previous-round) value: go reads it from the cow at `endOfBlock`
+        // (issue #1791). Taken from the scratch apply, not recomputed here.
+        // `None` (unknown) keeps the template; `Some` replaces the type-0
+        // entry's NextRound in place. Without exec state the value is derived
+        // from the payset's state proof transactions.
+        let next_round = match self.exec.as_ref() {
+            Some(exec) => exec.final_state_proof_next,
+            None => {
+                // Production evaluators always carry exec state. Without it
+                // nothing evaluated the payset, so a state proof cannot be
+                // proposed (a second implementation of its effect here could
+                // drift from `apply_state_proof`): fail closed.
+                if payset.iter().any(|s| s.txn.txn_type == "stpf") {
+                    return Err(algo_error::AlgoError::Ledger {
+                        message: "cannot propose a state proof transaction without \
+                                  evaluator state"
+                            .to_string(),
+                    });
+                }
+                None
+            }
+        };
+        // `None` (no state proof applied) keeps the template; `Some` replaces
+        // the type-0 entry's NextRound in place (zero handling lives in
+        // `with_state_proof_next_round`).
+        let state_proof_tracking = match next_round {
+            Some(next) => algo_ledger::block_header::with_state_proof_next_round(
+                &self.hdr.state_proof_tracking,
+                next,
+            ),
+            None => self.hdr.state_proof_tracking.clone(),
+        };
 
         // Compute the expired-participation-accounts sweep list (issue #526).
         // Mirrors go's `generateKnockOfflineAccountsList`'s expiry half
@@ -3027,6 +3071,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                 0
             },
             payset,
+            state_proof_tracking,
             ..header_block(&self.hdr)
         };
 
@@ -3506,6 +3551,7 @@ impl PoolLedgerAdapter {
                 spent: Duration::ZERO,
                 incomplete: false,
                 last_passes: 0,
+                final_state_proof_next: None,
             }
         };
 

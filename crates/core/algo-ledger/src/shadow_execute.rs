@@ -813,6 +813,11 @@ pub struct ScratchPayset {
     /// The transaction counter after every top-level and inner transaction
     /// (go `block.TxnCounter`).
     pub final_txn_counter: u64,
+    /// The `StateProofNextRound` after the payset's state proof transactions
+    /// (go `cow.GetStateProofNextRound()`): `Some(n)` when a state proof was
+    /// applied, `None` when none was (the template value stands). The proposed
+    /// header must carry `n` (issue #1791).
+    pub final_state_proof_next: Option<u64>,
 }
 
 /// Why [`scratch_execute_payset`] did not produce a result.
@@ -885,6 +890,7 @@ pub fn scratch_execute_payset<L: LedgerStore>(
         Ok(Ok(())) => Ok(ScratchPayset {
             apply_data: ad,
             final_txn_counter: probe.final_txn_counter,
+            final_state_proof_next: probe.final_state_proof_next,
         }),
     }
 }
