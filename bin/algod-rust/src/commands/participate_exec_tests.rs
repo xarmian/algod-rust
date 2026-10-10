@@ -1005,6 +1005,39 @@ fn proposal_header_carries_the_proposer_payout() {
     assert_eq!(block.proposer_payout, want);
 }
 
+/// Generation and validation cannot drift (issue #1798): the block a proposer
+/// builds (fees, bonus and capped payout from #1794) passes the validating
+/// apply once agreement has set the proposer, at the payout it chose.
+#[test]
+fn proposer_built_block_passes_the_validating_apply() {
+    let a = key(1);
+    let b = key(2);
+    let (ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))]);
+    for amount in [1_000_000u64, 2_000_000] {
+        eval.transaction_group(&[pay(&a, b.0, amount, None)])
+            .expect("payment");
+    }
+    let mut block = eval.generate_block(&[]).expect("generate_block");
+    assert!(block.proposer_payout > 0, "must exercise a real payout");
+    // agreement sets the proposer after generation (go `WithProposer`).
+    block.proposer = a.0;
+    let mut l = ledger.lock().unwrap();
+    algo_ledger::apply_block_validating(&mut *l, &block)
+        .expect("a proposer-built block must validate");
+    drop(l);
+
+    // ...and one microAlgo more than it chose is over the allowance.
+    let (ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))]);
+    eval.transaction_group(&[pay(&a, b.0, 1_000_000, None)])
+        .expect("payment");
+    let mut block = eval.generate_block(&[]).expect("generate_block");
+    block.proposer = a.0;
+    block.proposer_payout += 1;
+    let mut l = ledger.lock().unwrap();
+    let err = algo_ledger::apply_block_validating(&mut *l, &block).unwrap_err();
+    assert!(err.to_string().contains("is allowed"), "{err}");
+}
+
 /// An empty block still pays the bonus (go computes it from `Bonus` alone),
 /// read through the ledger fallback because nothing was evaluated.
 #[test]

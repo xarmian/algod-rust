@@ -2970,42 +2970,91 @@ fn suspend_absent_accounts<L: crate::store_trait::LedgerStore>(
     Ok(())
 }
 
-/// Reject a block whose header `ProposerPayout` exceeds what go allows.
+/// Port of go's `BlockEvaluator.validateForPayouts` (`ledger/eval/eval.go`),
+/// run for validating (non-generating) evaluation, over the state after the
+/// payset and before the payout moves.
 ///
-/// Mirrors the validate-mode tail of go's `endOfBlock`
-/// (`ledger/eval/eval.go`): `payout > proposerPayout()` fails with
-/// `proposal wants N payout, M is allowed`, where the allowance is
-/// `min(percent% * FeesCollected + Bonus, fee-sink balance above MinBalance)`
-/// evaluated on the state after the payset and before the payout moves.
-/// A payout *below* the allowance is accepted (a proposer may be altruistic).
+/// * Payouts disabled: `FeesCollected`, `Proposer` and `ProposerPayout` must
+///   all be zero.
+/// * Payouts enabled: `FeesCollected` must equal the fees the payset paid
+///   (fees paid by the fee sink itself add no net algos and are not counted,
+///   go `takeFee`); `ProposerPayout` must not exceed `min(percent% *
+///   FeesCollected + Bonus, fee-sink balance above MinBalance)` (a lower
+///   payout is fine: a proposer may be altruistic); the proposer must be set,
+///   and must not be a closed account when a payout is expected.
 fn validate_proposer_payout<L: crate::store_trait::LedgerStore>(
     store: &L,
     block: &Block,
     consensus: &ConsensusParams,
 ) -> Result<(), AlgoError> {
+    let err = |message: String| Err(AlgoError::Ledger { message });
     if !consensus.payouts_enabled {
+        if block.fees_collected != 0 {
+            return err(format!(
+                "feesCollected {} present when payouts disabled",
+                block.fees_collected
+            ));
+        }
+        if !block.proposer.is_zero() {
+            return err(format!(
+                "proposer {} present when payouts disabled",
+                block.proposer
+            ));
+        }
+        if block.proposer_payout != 0 {
+            return err(format!(
+                "payout {} present when payouts disabled",
+                block.proposer_payout
+            ));
+        }
         return Ok(());
     }
+
+    let paid = block
+        .payset
+        .iter()
+        .filter(|stx| stx.txn.sender != block.fee_sink)
+        .fold(0u64, |acc, stx| acc.saturating_add(stx.txn.fee));
+    if block.fees_collected != paid {
+        return err(format!(
+            "fees collected wrong: {} != {}",
+            block.fees_collected, paid
+        ));
+    }
+
     let available = crate::block_header::fee_sink_available(store, &block.fee_sink, 0);
-    let allowed = crate::block_header::proposer_payout(
+    let Some(allowed) = crate::block_header::proposer_payout(
         consensus,
         block.fees_collected,
         block.bonus,
         available,
-    )
-    .ok_or_else(|| AlgoError::Ledger {
-        message: format!(
+    ) else {
+        let incentive =
+            u128::from(block.fees_collected) * u128::from(consensus.payouts_percent.min(100)) / 100;
+        return err(format!(
             "payout overflowed adding bonus incentive {} {}",
-            block.fees_collected, block.bonus
-        ),
-    })?;
+            incentive, block.bonus
+        ));
+    };
     if block.proposer_payout > allowed {
-        return Err(AlgoError::Ledger {
-            message: format!(
-                "proposal wants {} payout, {} is allowed",
-                block.proposer_payout, allowed
-            ),
-        });
+        return err(format!(
+            "proposal wants {} payout, {} is allowed",
+            block.proposer_payout, allowed
+        ));
+    }
+
+    if block.proposer.is_zero() {
+        return err("proposer missing when payouts enabled".to_string());
+    }
+    if block.proposer_payout != 0
+        && store
+            .get_account(&block.proposer)
+            .is_none_or(|acct| acct == algo_types::AccountData::default())
+    {
+        return err(format!(
+            "proposer {} is closed but expects payout {}",
+            block.proposer, block.proposer_payout
+        ));
     }
     Ok(())
 }
@@ -3042,25 +3091,34 @@ fn apply_proposer_payout<L: crate::store_trait::LedgerStore>(
     }
 
     let mut sink = store.get_or_default_account(&block.fee_sink);
-    // Go's `proposerPayout()` clamps the payout to the fee sink's
-    // available balance before it ever reaches a block header
-    // (`ledger/eval/eval.go`), so this should never trip on a
-    // well-formed block. `block.proposer_payout` is still
-    // replay-path/untrusted-peer-reachable data, though, so surface a
-    // `Result` here rather than underflowing or panicking.
-    if sink.micro_algos < block.proposer_payout {
-        return Err(AlgoError::Ledger {
+    // The real limit (payout <= min(percent% * fees + bonus, sink balance
+    // above MinBalance)) is enforced by `validate_proposer_payout` for
+    // validating evaluation, as in go's `validateForPayouts`. Replay trusts
+    // certified blocks, but the header is still peer-reachable data, so the
+    // money movement itself uses checked arithmetic and errors, never wraps.
+    let overflow = |what: &str| AlgoError::Ledger {
+        message: format!(
+            "proposer payout {} overflow: {} (round {})",
+            block.proposer_payout, what, block.round.0
+        ),
+    };
+    let sink_balance = sink.micro_algos;
+    sink.micro_algos = sink_balance
+        .checked_sub(block.proposer_payout)
+        .ok_or_else(|| AlgoError::Ledger {
             message: format!(
                 "fee sink {} balance {} insufficient for proposer payout {} (round {})",
-                block.fee_sink, sink.micro_algos, block.proposer_payout, block.round.0
+                block.fee_sink, sink_balance, block.proposer_payout, block.round.0
             ),
-        });
-    }
-    sink.micro_algos -= block.proposer_payout;
+        })?;
+    // Write the debit before reading the proposer so a proposer that is the
+    // fee sink itself sees it.
     store.set_account(&block.fee_sink, sink);
-
     let mut proposer = store.get_or_default_account(&block.proposer);
-    proposer.micro_algos += block.proposer_payout;
+    proposer.micro_algos = proposer
+        .micro_algos
+        .checked_add(block.proposer_payout)
+        .ok_or_else(|| overflow("proposer balance"))?;
     store.set_account(&block.proposer, proposer);
 
     Ok(())
@@ -6590,6 +6648,8 @@ mod tests {
             round: Round(1),
             fee_sink,
             current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            proposer: Address([0x55u8; 32]),
+            fees_collected: 1_000,
             payset: vec![rekey_stx],
             ..Block::default()
         };
@@ -6608,6 +6668,8 @@ mod tests {
             round: Round(2),
             fee_sink,
             current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            proposer: Address([0x55u8; 32]),
+            fees_collected: 1_000,
             payset: vec![stale_spend],
             ..Block::default()
         };
@@ -6636,6 +6698,8 @@ mod tests {
             round: Round(1),
             fee_sink,
             current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            proposer: Address([0x55u8; 32]),
+            fees_collected: 1_000,
             payset: vec![rekey_stx],
             ..Block::default()
         };
@@ -6648,6 +6712,8 @@ mod tests {
             round: Round(2),
             fee_sink,
             current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            proposer: Address([0x55u8; 32]),
+            fees_collected: 1_000,
             payset: vec![correct_spend],
             ..Block::default()
         };
@@ -6695,6 +6761,8 @@ mod tests {
             round: Round(round),
             fee_sink,
             current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            proposer: Address([0x55u8; 32]),
+            fees_collected: 1_000,
             payset: vec![stx],
             ..Block::default()
         };
@@ -9310,6 +9378,120 @@ mod tests {
         let (mut state, block, fee_sink, _) = payout_case(150_000, 10_000_000, 51_000);
         apply_block_validating(&mut state, &block).unwrap();
         assert_eq!(state.get_account(&fee_sink).unwrap().micro_algos, 100_000);
+    }
+
+    fn validating_err(state: &mut LedgerState, block: &Block) -> String {
+        apply_block_validating(state, block)
+            .unwrap_err()
+            .to_string()
+    }
+
+    /// go `validateForPayouts`: FeesCollected must equal the fees the payset
+    /// actually paid, otherwise a forged value inflates the allowance.
+    #[test]
+    fn validating_rejects_forged_fees_collected() {
+        let (mut state, mut block, _, _) = payout_case(5_000_000, 0, 0);
+        block.fees_collected = 2_000;
+        assert!(validating_err(&mut state, &block).contains("fees collected wrong: 2000 != 1000"),);
+        let (mut state, mut block, _, _) = payout_case(5_000_000, 0, 0);
+        block.fees_collected = 0;
+        assert!(validating_err(&mut state, &block).contains("fees collected wrong: 0 != 1000"));
+    }
+
+    /// Fees paid BY the fee sink add no net algos and are not collected.
+    #[test]
+    fn validating_does_not_count_fee_sink_paid_fees() {
+        let (mut state, mut block, fee_sink, _) = payout_case(5_000_000, 0, 0);
+        block.payset = vec![pay_txn(fee_sink, Address([2u8; 32]), 100, 1_000)];
+        block.fees_collected = 0;
+        apply_block_validating(&mut state, &block).unwrap();
+    }
+
+    /// With payouts disabled the header must carry no fees, proposer or payout.
+    #[test]
+    fn validating_rejects_payout_fields_when_payouts_disabled() {
+        let old = algo_types::consensus::CONSENSUS_V38.to_string();
+        let case = || {
+            let (state, mut block, _, proposer) = payout_case(5_000_000, 0, 0);
+            block.current_protocol = old.clone();
+            block.fees_collected = 0;
+            block.proposer = Address::ZERO;
+            (state, block, proposer)
+        };
+        let (mut state, block, _) = case();
+        apply_block_validating(&mut state, &block).expect("clean legacy block");
+
+        let (mut state, mut block, _) = case();
+        block.fees_collected = 1_000;
+        assert!(validating_err(&mut state, &block)
+            .contains("feesCollected 1000 present when payouts disabled"));
+
+        let (mut state, mut block, proposer) = case();
+        block.proposer = proposer;
+        let e = validating_err(&mut state, &block);
+        assert!(
+            e.contains(&format!(
+                "proposer {proposer} present when payouts disabled"
+            )),
+            "{e}"
+        );
+
+        let (mut state, mut block, _) = case();
+        block.proposer_payout = 7;
+        assert!(
+            validating_err(&mut state, &block).contains("payout 7 present when payouts disabled")
+        );
+    }
+
+    /// Payouts enabled: a validating evaluator needs the proposer set.
+    #[test]
+    fn validating_rejects_missing_proposer_when_payouts_enabled() {
+        let (mut state, mut block, _, _) = payout_case(5_000_000, 0, 0);
+        block.proposer = Address::ZERO;
+        assert!(
+            validating_err(&mut state, &block).contains("proposer missing when payouts enabled")
+        );
+        let (mut state, mut block, _, _) = payout_case(5_000_000, 0, 1);
+        block.proposer = Address::ZERO;
+        assert!(
+            validating_err(&mut state, &block).contains("proposer missing when payouts enabled")
+        );
+    }
+
+    /// A closed (all-zero) proposer account cannot receive a payout.
+    #[test]
+    fn validating_rejects_payout_to_closed_proposer() {
+        let (mut state, mut block, _, _) = payout_case(5_000_000, 0, 5);
+        block.proposer = Address([0x77; 32]);
+        let e = validating_err(&mut state, &block);
+        assert!(e.contains("is closed but expects payout 5"), "{e}");
+        // zero payout to a closed proposer is fine
+        let (mut state, mut block, _, _) = payout_case(5_000_000, 0, 0);
+        block.proposer = Address([0x77; 32]);
+        apply_block_validating(&mut state, &block).unwrap();
+    }
+
+    /// go errors when incentive + bonus overflows.
+    #[test]
+    fn validating_errors_when_bonus_overflows_the_allowance() {
+        let (mut state, block, _, _) = payout_case(5_000_000, u64::MAX, 0);
+        let e = validating_err(&mut state, &block);
+        assert!(
+            e.contains(&format!(
+                "payout overflowed adding bonus incentive 500 {}",
+                u64::MAX
+            )),
+            "{e}"
+        );
+    }
+
+    /// The replay-path payout moves money with checked arithmetic.
+    #[test]
+    fn apply_proposer_payout_errors_instead_of_wrapping_the_proposer_credit() {
+        let (mut state, block, _, proposer) = payout_case(5_000_000, 0, 10);
+        state.get_or_default_account_mut(&proposer).micro_algos = u64::MAX - 5;
+        let err = apply_proposer_payout(&mut state, &block).unwrap_err();
+        assert!(err.to_string().contains("overflow"), "{err}");
     }
 
     // ---------------------------------------------------------------------
@@ -12768,6 +12950,7 @@ return
         let block = Block {
             round: Round(256),
             state_proof_tracking: spt_value(&root, weight),
+            proposer: Address([0x55u8; 32]),
             ..make_empty_block_with_protocol(
                 Address([3u8; 32]),
                 algo_types::consensus::CONSENSUS_V41,
@@ -12790,6 +12973,7 @@ return
         let block = Block {
             round: Round(256),
             state_proof_tracking: spt_value_with_next(1024, &root, weight),
+            proposer: Address([0x55u8; 32]),
             ..make_empty_block_with_protocol(
                 Address([3u8; 32]),
                 algo_types::consensus::CONSENSUS_V41,
@@ -12817,6 +13001,7 @@ return
             let block = Block {
                 round: Round(256),
                 state_proof_tracking: spt_value_with_next(next, &root, weight),
+                proposer: Address([0x55u8; 32]),
                 ..make_empty_block_with_protocol(
                     Address([3u8; 32]),
                     algo_types::consensus::CONSENSUS_V41,
@@ -12843,6 +13028,7 @@ return
         let block = Block {
             round: Round(256),
             state_proof_tracking: spt_value_with_next(768, &root, weight),
+            proposer: Address([0x55u8; 32]),
             ..make_empty_block_with_protocol(
                 Address([3u8; 32]),
                 algo_types::consensus::CONSENSUS_V41,
@@ -12876,6 +13062,7 @@ return
         let block = |next| Block {
             round: Round(1172),
             state_proof_tracking: spt_value_with_next(next, &[], 0),
+            proposer: Address([0x55u8; 32]),
             ..make_empty_block_with_protocol(
                 fee_sink,
                 algo_types::consensus::CONSENSUS_V41,
@@ -12902,6 +13089,7 @@ return
         let bare = |state: &mut LedgerState| {
             let block = Block {
                 round: Round(256),
+                proposer: Address([0x55u8; 32]),
                 ..make_empty_block_with_protocol(
                     Address([3u8; 32]),
                     algo_types::consensus::CONSENSUS_V41,
