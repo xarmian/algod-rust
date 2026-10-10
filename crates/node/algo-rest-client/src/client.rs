@@ -115,6 +115,13 @@ impl AlgodClient {
         }
     }
 
+    /// Worst-case wall time of one request through this client, from the
+    /// config it was actually built with (see
+    /// [`ClientConfig::worst_case_request_time`]).
+    pub fn worst_case_request_time(&self) -> Duration {
+        self.config.worst_case_request_time()
+    }
+
     /// Execute a GET request with retry and exponential backoff.
     ///
     /// Retries on connection errors, timeouts, and 5xx responses.
@@ -868,6 +875,32 @@ mod worst_case_tests {
         assert_eq!(
             no_retries.worst_case_request_time(),
             Duration::from_secs(30)
+        );
+    }
+
+    /// A client built with a non-default [`ClientConfig`] reports ITS worst
+    /// case, not the default's (issue #1755: the failure-drain budget must be
+    /// sized from the timeouts the client really uses).
+    #[test]
+    fn client_worst_case_request_time_follows_its_own_config() {
+        let cfg = ClientConfig {
+            timeout: Duration::from_secs(2),
+            max_retries: 1,
+            initial_backoff: Duration::from_millis(50),
+            ..ClientConfig::default()
+        };
+        let client = AlgodClient::with_config("http://127.0.0.1:1", "t", cfg.clone());
+        assert_eq!(
+            client.worst_case_request_time(),
+            cfg.worst_case_request_time()
+        );
+        assert_eq!(
+            client.worst_case_request_time(),
+            Duration::from_millis(4050)
+        );
+        assert_ne!(
+            client.worst_case_request_time(),
+            ClientConfig::default().worst_case_request_time()
         );
     }
 }
