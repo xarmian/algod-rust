@@ -5762,10 +5762,10 @@ impl SqliteLedger {
     /// Consensus-critical, NO fallback to the account's current state: a late
     /// joiner has no stake until the lookback passes it, exactly as in go (a
     /// node whose history predates this table is backfilled when the database
-    /// is opened, see `backfill_legacy_online_history`). Used by
-    /// [`LedgerStore::voter_agreement_data_at_round`]; agreement's own
-    /// membership lookup keeps its current-state fallback (issue #1809).
-    fn lookup_agreement_account(
+    /// is opened, see `backfill_legacy_online_history`). Shared by
+    /// [`LedgerStore::voter_agreement_data_at_round`] and
+    /// `AgreementLedgerBridge::lookup_agreement` (issue #1809).
+    pub(crate) fn lookup_agreement_account(
         &self,
         addr: &Address,
         round: u64,
@@ -8047,8 +8047,8 @@ impl LedgerStore for SqliteLedger {
     /// go's `LookupAgreement(round, addr)`: the account's `onlineaccounts` row
     /// at or before `round`; no row (an account that was never online by
     /// then, e.g. went online after the balance round) is an empty
-    /// `OnlineAccountData`. Unlike `AgreementLedgerBridge::lookup_agreement`
-    /// there is deliberately NO fallback to the account's current state: the
+    /// `OnlineAccountData`. There is deliberately NO fallback to the account's current state (shared
+    /// with `AgreementLedgerBridge::lookup_agreement`, issue #1809): the
     /// absence checks (`generateKnockOfflineAccountsList`,
     /// `validateAbsentOnlineAccounts`) and `voter_params_get` must agree with
     /// go, where a late joiner has stake 0 until the lookback passes it.
