@@ -122,8 +122,13 @@ def http(url, params=None):
             if r.status_code in (429, 502, 503, 504):
                 time.sleep(1.5 * (attempt + 1))
                 continue
-            if r.status_code == 403:
-                # algonode's edge answers 403 when a burst trips its rate limit.
+            if r.status_code == 403 and "algonode.cloud" in url:
+                # algonode's edge answers 403 when a burst trips its rate
+                # limit (other hosts: a 403 is final, returned to the caller).
+                print(
+                    f"  403 from {url} (attempt {attempt + 1}/6), backing off",
+                    file=sys.stderr,
+                )
                 time.sleep(8 * (attempt + 1))
                 continue
             return r

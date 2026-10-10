@@ -812,9 +812,9 @@ pub struct ScratchPayset {
     /// (go `block.TxnCounter`).
     pub final_txn_counter: u64,
     /// The `StateProofNextRound` after the payset's state proof transactions
-    /// (go `cow.GetStateProofNextRound()`; `Some(0)`: the protocol has no
-    /// state proofs, `None`: unknown). The proposed header must carry this
-    /// value (issue #1791).
+    /// (go `cow.GetStateProofNextRound()`): `Some(n)` when a state proof was
+    /// applied, `None` when none was (the template value stands). The proposed
+    /// header must carry `n` (issue #1791).
     pub final_state_proof_next: Option<u64>,
 }
 

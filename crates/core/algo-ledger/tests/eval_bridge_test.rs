@@ -128,6 +128,7 @@ fn execute_ctx(fee_sink: Address, round: u64) -> ApplyContext {
         genesis_hash: [0u8; 32],
         txn_counter: Cell::new(0),
         state_proof_next: Cell::new(0),
+        prev_header: std::cell::RefCell::new(None),
         fee_credit: Cell::new(0),
         fee_residue: Cell::new(0),
         txn_index: Cell::new(0),
@@ -1204,6 +1205,7 @@ fn two_app_calls_produce_distinct_inner_asset_ids() {
         genesis_hash: [0u8; 32],
         txn_counter: Cell::new(200),
         state_proof_next: Cell::new(0),
+        prev_header: std::cell::RefCell::new(None),
         fee_credit: Cell::new(0),
         fee_residue: Cell::new(0),
         txn_index: Cell::new(0),
@@ -1361,6 +1363,7 @@ fn fee_credit_from_outer_overpayment_enables_inner_zero_fee() {
         genesis_hash: [0u8; 32],
         txn_counter: Cell::new(0),
         state_proof_next: Cell::new(0),
+        prev_header: std::cell::RefCell::new(None),
         fee_credit: Cell::new(2_000 - 1_000), // overpayment
         fee_residue: Cell::new(0),
         txn_index: Cell::new(0),
@@ -1434,6 +1437,7 @@ fn inner_zero_fee_fails_without_fee_credit() {
         genesis_hash: [0u8; 32],
         txn_counter: Cell::new(0),
         state_proof_next: Cell::new(0),
+        prev_header: std::cell::RefCell::new(None),
         fee_credit: Cell::new(0), // no fee credit
         fee_residue: Cell::new(0),
         txn_index: Cell::new(0),

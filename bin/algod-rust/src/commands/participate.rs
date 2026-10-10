@@ -2875,14 +2875,15 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                 None
             }
         };
-        // `None`/`Some(0)` (unknown / no state proofs) keep the template;
-        // otherwise the type-0 entry's NextRound is replaced in place.
+        // `None` (no state proof applied) keeps the template; `Some` replaces
+        // the type-0 entry's NextRound in place (zero handling lives in
+        // `with_state_proof_next_round`).
         let state_proof_tracking = match next_round {
-            Some(next) if next != 0 => algo_ledger::block_header::with_state_proof_next_round(
+            Some(next) => algo_ledger::block_header::with_state_proof_next_round(
                 &self.hdr.state_proof_tracking,
                 next,
             ),
-            _ => self.hdr.state_proof_tracking.clone(),
+            None => self.hdr.state_proof_tracking.clone(),
         };
 
         // Compute the expired-participation-accounts sweep list (issue #526).

@@ -711,9 +711,15 @@ fn run_entry_with_block(
     // go wrote into the header (go eval.go:1489 / 1564).
     let header_next =
         algo_ledger::block_header::state_proof_next_round(&block.state_proof_tracking);
-    if final_state_proof_next != Some(header_next) {
+    // `None` = no state proof applied: the previous header's value carries over.
+    let prev_next = algo_ledger::block_header::state_proof_next_round(&Some(
+        get(get(&state, "prev_hdr").expect("prev_hdr"), "spt")
+            .cloned()
+            .unwrap_or(Value::Nil),
+    ));
+    if final_state_proof_next.unwrap_or(prev_next) != header_next {
         diffs.push(format!(
-            "StateProofNextRound: apply {final_state_proof_next:?}, go header {header_next}"
+            "StateProofNextRound: apply {final_state_proof_next:?} (carried {prev_next}), go header {header_next}"
         ));
     }
     check_post_state(&ls, &state, &mut diffs);
@@ -939,7 +945,7 @@ fn state_proof_block_next_round_is_derived_by_the_apply() {
     assert!(
         diffs
             .iter()
-            .any(|d| d.contains("StateProofNextRound: apply Some(65682944), go header 65682688")),
+            .any(|d| d.contains("StateProofNextRound: apply Some(65682944)")),
         "a header with the stale NextRound must be flagged: {diffs:?}"
     );
 }
