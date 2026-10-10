@@ -59,6 +59,14 @@ jobs:
           shared-key: unit-tests
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # Issue #1787: PR tests run in debug, Coverage in --release. Every
+      # `debug_assertions` cfg must carry a `debug-assertions-ok:` note so a
+      # test cannot depend on the profile unnoticed (seconds, no compile).
+      - name: Lint debug_assertions usage
+        run: |
+          python3 scripts/check_debug_assertions_test.py
+          python3 scripts/check_debug_assertions.py
+
       # The real-thread multi-node agreement binary `service_multi_node_test`
       # (real Service + threads + simulated network) is excluded here only:
       # in an unoptimized (debug) build its tests take 17+ min each on a
@@ -69,14 +77,6 @@ jobs:
       # algo-agreement (player_real_harness_test: direct Player with real
       # VRF/OTS signing, slow but only ~4 min in debug), runs per PR.
       # Tracked in #1750 / follow-up #1752.
-      # Issue #1787: PR tests run in debug, Coverage in --release. Every
-      # `debug_assertions` cfg must carry a `debug-assertions-ok:` note so a
-      # test cannot depend on the profile unnoticed (seconds, no compile).
-      - name: Lint debug_assertions usage
-        run: |
-          python3 scripts/check_debug_assertions_test.py
-          python3 scripts/check_debug_assertions.py
-
       - name: Run workspace tests
         shell: bash
         run: |

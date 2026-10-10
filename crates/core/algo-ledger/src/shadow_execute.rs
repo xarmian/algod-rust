@@ -356,8 +356,10 @@ impl ScratchInvariant {
     fn capture<L: LedgerStore>(store: &L, chain: &ChainFields) -> Self {
         // Also enabled for unit-test builds so `--release` test profiles
         // (the Coverage workflow) exercise the same invariants as debug.
-        // debug-assertions-ok: `test` is OR-ed in, so test builds run the
-        // invariants in debug and --release alike (#1784).
+        // debug-assertions-ok: `test` makes algo-ledger's OWN unit tests run
+        // the invariants in --release too (#1784). `cfg!(test)` is false when
+        // other crates' tests link algo-ledger, so there a --release run
+        // skips them: that is a known, accepted profile difference.
         if !cfg!(any(debug_assertions, test)) {
             return Self {
                 tracker: None,
