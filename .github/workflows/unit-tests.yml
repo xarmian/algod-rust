@@ -47,6 +47,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Issue #1787: PR tests run in debug, Coverage in --release. Every
+      # `debug_assertions` cfg must carry a `debug-assertions-ok:` note so a
+      # test cannot depend on the profile unnoticed (seconds, no compile).
+      - name: Lint debug_assertions usage
+        run: |
+          python3 scripts/check_debug_assertions_test.py
+          python3 scripts/check_debug_assertions.py
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 

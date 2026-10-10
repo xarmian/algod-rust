@@ -152,6 +152,9 @@ fn vrf_parity_vs_go_algorand() {
         )
     });
 
+    // debug-assertions-ok: intentional profile split, not an alignment claim:
+    // debug runs only the `fixed/` vectors (full sweep is too slow unoptimized);
+    // the full sweep runs in --release (daily Coverage) or with AVR_FULL=1.
     let full_sweep = !cfg!(debug_assertions) || std::env::var_os("AVR_FULL").is_some();
 
     let mut total = 0usize;
