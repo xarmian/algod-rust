@@ -1811,6 +1811,102 @@ pub struct ExecProbe {
     /// payout / fees / proposer header fields are judged against the
     /// pre-block state without turning on every other validate-mode check.
     pub validate_payouts: bool,
+    /// Input: compute go's expired / absent participation lists from the state
+    /// the payset leaves behind (go `generateKnockOfflineAccountsList` runs in
+    /// `endOfBlock`, after every transaction; issue #1795). The set holds the
+    /// proposer's own participating addresses, which go never lists. Only the
+    /// proposer's final scratch apply asks.
+    pub knock_offline_exclude: Option<std::collections::HashSet<Address>>,
+    /// Output of [`Self::knock_offline_exclude`]; only set on success.
+    pub knock_offline_lists: Option<KnockOfflineLists>,
+}
+
+/// The accounts a proposer lists in `ParticipationUpdates` (go
+/// `ExpiredParticipationAccounts` / `AbsentParticipationAccounts`).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct KnockOfflineLists {
+    pub expired: Vec<Address>,
+    pub absent: Vec<Address>,
+}
+
+/// go `generateKnockOfflineAccountsList` (`ledger/eval/eval.go`): the expired
+/// and absent participation accounts a proposer lists, computed over `store`
+/// as of `round` -- the state AFTER the block's payset, which is also the state
+/// [`validate_expired_online_accounts`] / [`validate_absent_online_accounts`]
+/// judge the lists against (issue #1795).
+///
+/// Candidates are the online accounts, in ascending address order (go iterates
+/// a Go map; any order is valid and the lists need not be complete). An
+/// account is skipped when its balance is zero (being closed) or it is one of
+/// `exclude` (the proposer's own addresses). Expiry takes precedence over
+/// suspension, each list is capped at its consensus maximum, and a suspension
+/// candidate must be `Online` and `IncentiveEligible`.
+pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
+    store: &L,
+    round: u64,
+    consensus: &ConsensusParams,
+    exclude: &std::collections::HashSet<Address>,
+) -> KnockOfflineLists {
+    let max_expired = consensus.max_proposed_expired_online_accounts;
+    let max_absent = consensus.payouts_max_mark_absent;
+    let mut lists = KnockOfflineLists::default();
+    if max_expired == 0 && max_absent == 0 {
+        return lists;
+    }
+    let mut accounts = store.online_accounts();
+    accounts.sort_by_key(|a| a.0 .0);
+
+    // Total online stake and the active challenge are only needed to judge
+    // suspension candidates.
+    let (total_online_stake, challenge) = if max_absent > 0 {
+        let provider = crate::heartbeat::StoreHeaderProvider { store };
+        (
+            total_online_voting_stake(store),
+            crate::heartbeat::find_challenge(
+                consensus,
+                round,
+                &provider,
+                crate::heartbeat::ChallengePeriod::Active,
+            ),
+        )
+    } else {
+        (0, crate::heartbeat::Challenge::default())
+    };
+    let rewards_level = store.rewards_level();
+
+    for (addr, acct) in accounts {
+        if acct.micro_algos == 0 || exclude.contains(&addr) {
+            continue;
+        }
+        let has_vote_key = acct.vote_id.is_some_and(|v| v != [0u8; 32]);
+        if has_vote_key
+            && acct.vote_last_valid != 0
+            && acct.vote_last_valid < round
+            && lists.expired.len() < max_expired
+        {
+            lists.expired.push(addr);
+            continue; // if marking expired, do not consider suspension
+        }
+        if lists.absent.len() >= max_absent {
+            continue; // no more room (more expiries may follow)
+        }
+        if acct.status != AccountStatus::Online || !acct.incentive_eligible {
+            continue;
+        }
+        let last_seen = crate::heartbeat::last_seen(acct.last_proposed, acct.last_heartbeat);
+        let acct_stake = acct
+            .micro_algos
+            .saturating_add(crate::rewards::compute_pending_rewards(
+                &acct,
+                rewards_level,
+            ));
+        if is_absent(total_online_stake, acct_stake, last_seen, round)
+            || challenge.failed(&addr.0, last_seen)
+        {
+            lists.absent.push(addr);
+        }
+    }
+    lists
 }
 
 /// [`apply_block_impl_ex`] plus an [`ExecProbe`] out-parameter.
@@ -2205,6 +2301,15 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         if result.is_ok() {
             p.final_txn_counter = ctx.txn_counter.get();
             p.final_state_proof_next = final_state_proof_next;
+            if let Some(exclude) = &p.knock_offline_exclude {
+                // After the payset, before the epilogue: go `endOfBlock`.
+                p.knock_offline_lists = Some(knock_offline_lists(
+                    &*store,
+                    block.round.0,
+                    &consensus,
+                    exclude,
+                ));
+            }
             if p.want_fee_sink_available {
                 p.final_fee_sink_available = Some(crate::block_header::fee_sink_available(
                     store,

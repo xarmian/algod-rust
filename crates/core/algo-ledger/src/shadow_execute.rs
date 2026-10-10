@@ -826,6 +826,9 @@ pub struct ScratchPayset {
     /// `proposerPayout()`'s `sink.AvailableBalance`), the cap on the proposed
     /// `ProposerPayout` (issue #1794).
     pub final_fee_sink_available: Option<u64>,
+    /// The expired / absent participation lists go's `endOfBlock` would
+    /// generate over the state after the payset (issue #1795).
+    pub knock_offline_lists: Option<crate::apply::KnockOfflineLists>,
 }
 
 /// Why [`scratch_execute_payset`] did not produce a result.
@@ -853,11 +856,13 @@ pub enum ScratchFailure {
 pub fn scratch_execute_payset<L: LedgerStore>(
     store: &mut L,
     block: &Block,
+    own_addresses: &std::collections::HashSet<algo_types::Address>,
 ) -> Result<ScratchPayset, ScratchFailure> {
     // Input flag (reviewed, intentional): only this final epilogue apply
     // needs the post-payset sink balance.
     let mut probe = ExecProbe {
         want_fee_sink_available: true,
+        knock_offline_exclude: Some(own_addresses.clone()),
         ..Default::default()
     };
     scratch_execute_with(store, block, &mut probe)
@@ -966,6 +971,7 @@ fn scratch_execute_with<L: LedgerStore>(
             final_txn_counter: probe.final_txn_counter,
             final_state_proof_next: probe.final_state_proof_next,
             final_fee_sink_available: probe.final_fee_sink_available,
+            knock_offline_lists: probe.knock_offline_lists.take(),
         }),
     }
 }

@@ -1615,6 +1615,13 @@ struct ExecState {
     /// The fee sink's available balance after the kept payset (go
     /// `proposerPayout()`); `None` while no payset has been evaluated.
     final_fee_sink_available: Option<u64>,
+    /// The proposer's own participating addresses, never listed as expired or
+    /// absent (go `partAddrs`); set by `generate_block` before assembly.
+    knock_offline_exclude: std::collections::HashSet<algo_types::Address>,
+    /// The expired / absent lists the final scratch apply computed over the
+    /// state after the kept payset (go `endOfBlock`, issue #1795); `None`
+    /// while no payset has been evaluated.
+    final_knock_offline: Option<algo_ledger::apply::KnockOfflineLists>,
 }
 
 impl SimpleBlockEvaluator {
@@ -2027,7 +2034,12 @@ impl SimpleBlockEvaluator {
             })?;
         algo_ledger::proposal_eval::record_ledger_lock_wait(waited.elapsed());
         let held = std::time::Instant::now();
-        let r = algo_ledger::shadow_execute::scratch_execute_payset(&mut *ledger, &candidate);
+        let own = self
+            .exec
+            .as_ref()
+            .map(|e| e.knock_offline_exclude.clone())
+            .unwrap_or_default();
+        let r = algo_ledger::shadow_execute::scratch_execute_payset(&mut *ledger, &candidate, &own);
         algo_ledger::proposal_eval::record_ledger_lock_hold(held.elapsed());
         Ok(r)
     }
@@ -2066,6 +2078,7 @@ impl SimpleBlockEvaluator {
         // value behind for `generate_block` to read (issue #1791).
         exec.final_state_proof_next = None;
         exec.final_fee_sink_available = None;
+        exec.final_knock_offline = None;
         if pristine.is_empty() {
             return Ok((pristine, 0));
         }
@@ -2077,6 +2090,7 @@ impl SimpleBlockEvaluator {
         let mut bisected = false;
         let mut final_state_proof_next = None;
         let mut final_fee_sink_available = None;
+        let mut final_knock_offline = None;
         let result = loop {
             passes += 1;
             let result = self.scratch_pass(&template, &pristine, &groups)?;
@@ -2100,6 +2114,7 @@ impl SimpleBlockEvaluator {
                         let counted = done.final_txn_counter.saturating_sub(self.hdr.txn_counter);
                         final_state_proof_next = done.final_state_proof_next;
                         final_fee_sink_available = done.final_fee_sink_available;
+                        final_knock_offline = done.knock_offline_lists;
                         break (payset, counted);
                     }
                     // Largest fitting prefix of groups, from the sizes just
@@ -2194,6 +2209,7 @@ impl SimpleBlockEvaluator {
             exec.last_passes = passes;
             exec.final_state_proof_next = final_state_proof_next;
             exec.final_fee_sink_available = final_fee_sink_available;
+            exec.final_knock_offline = final_knock_offline;
         }
         if result.0.is_empty() {
             self.txn_bytes = 0;
@@ -2960,6 +2976,9 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         // rewards, created ids, eval deltas), exactly like go's
         // `GenerateBlock` output. Falls back to the legacy "included as
         // admitted" behavior only for an evaluator without exec state.
+        if let Some(exec) = self.exec.as_mut() {
+            exec.knock_offline_exclude = voting_accounts.iter().copied().collect();
+        }
         let (payset, txn_count) = self.finalize_payset()?;
         // The header's `StateProofTracking.NextRound` is what the payset's
         // state proof transactions leave behind, not the template's
@@ -3059,71 +3078,41 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             message: e.to_string(),
         })?;
 
-        // Compute the expired-participation-accounts sweep list (issue #526).
-        // Mirrors go's `generateKnockOfflineAccountsList`'s expiry half
-        // (`ledger/eval/eval.go`), invoked as part of the proposer's own
-        // block assembly (`eval.endOfBlock` → `generateKnockOfflineAccountsList`
-        // before `resetExpiredOnlineAccountsParticipationKeys` runs at apply
-        // time). Without this, a self-produced block never lists an account
-        // whose participation key has expired, so the apply-side sweep
-        // (`algo_ledger::apply::reset_expired_online_accounts`, which already
-        // reads this field correctly) never fires and the account stays
-        // `Online` forever.
-        let max_expired = self.consensus_params.max_proposed_expired_online_accounts;
-        let expired = if max_expired > 0 {
-            let candidates = self
-                .ledger
-                .lock()
-                .map_err(|e| algo_error::AlgoError::Ledger {
-                    message: format!("ledger lock poisoned: {e}"),
-                })?
-                .expired_participation_account_candidates(self.hdr.round.0, max_expired)?;
-            if candidates.is_empty() {
-                None
-            } else {
-                Some(candidates)
-            }
-        } else {
-            None
-        };
-
-        // Compute the absent-participation-accounts sweep list (issue #845).
-        // Mirrors go's `generateKnockOfflineAccountsList`'s absentee half
-        // (`ledger/eval/eval.go`): for every `Online && IncentiveEligible`
-        // account not among this node's own participating addresses or
-        // already listed as expired above, check `isAbsent` (silent for
-        // longer than its stake-scaled allowance) or an active-challenge
-        // failure, and list it for suspension. Without this, a self-produced
-        // block's `ParticipationUpdates.AbsentParticipationAccounts` was
-        // always empty (`hdr.absent_participation_accounts.clone()` below
-        // just carried forward the previous header's -- always `None` --
-        // value), so this node never proposed suspending a genuinely absent
-        // online account; the apply-side sweep
-        // (`algo_ledger::apply::validate_absent_online_accounts`, the
-        // consumer/validator side) was already correct.
-        let mut absent_exclude: std::collections::HashSet<algo_types::Address> =
-            voting_accounts.iter().copied().collect();
-        if let Some(expired) = &expired {
-            absent_exclude.extend(expired.iter().copied());
-        }
-        let absent = {
-            let candidates = self
-                .ledger
-                .lock()
-                .map_err(|e| algo_error::AlgoError::Ledger {
-                    message: format!("ledger lock poisoned: {e}"),
-                })?
-                .absent_participation_account_candidates(
+        // The expired / absent participation lists (issues #526, #845, #1795).
+        // Mirrors go's `generateKnockOfflineAccountsList`, which runs in
+        // `endOfBlock` over the state AFTER the payset: the final scratch
+        // apply computed them there. With no payset evaluated (empty payset,
+        // or no exec state) the post-payset state is the ledger tip.
+        // Without them a self-produced block never expires or suspends
+        // anyone, and lists taken from the pre-block state can name an
+        // account the payset closed, renewed or re-registered, which the
+        // validating apply rejects. Nodes are free to propose any valid
+        // subset; a lower or empty list is always accepted.
+        let lists = match self
+            .exec
+            .as_ref()
+            .and_then(|e| e.final_knock_offline.clone())
+        {
+            Some(lists) => lists,
+            None => {
+                let exclude: std::collections::HashSet<algo_types::Address> =
+                    voting_accounts.iter().copied().collect();
+                let ledger = self
+                    .ledger
+                    .lock()
+                    .map_err(|e| algo_error::AlgoError::Ledger {
+                        message: format!("ledger lock poisoned: {e}"),
+                    })?;
+                algo_ledger::apply::knock_offline_lists(
+                    &*ledger,
                     self.hdr.round.0,
                     &self.consensus_params,
-                    &absent_exclude,
-                )?;
-            if candidates.is_empty() {
-                None
-            } else {
-                Some(candidates)
+                    &exclude,
+                )
             }
         };
+        let expired = (!lists.expired.is_empty()).then_some(lists.expired);
+        let absent = (!lists.absent.is_empty()).then_some(lists.absent);
 
         // Build the block from `header_block(&self.hdr)` (ALL header fields),
         // then overriding the computed fields (txn_counter, commitments,
@@ -3637,6 +3626,8 @@ impl PoolLedgerAdapter {
                 last_passes: 0,
                 final_state_proof_next: None,
                 final_fee_sink_available: None,
+                knock_offline_exclude: Default::default(),
+                final_knock_offline: None,
             }
         };
 

@@ -85,8 +85,17 @@ fn fixture_with_tracking(
     holdings: &[(Address, u64)],
     state_proof_tracking: Option<rmpv::Value>,
 ) -> (Arc<Mutex<SqliteLedger>>, Arc<TransactionPool>) {
+    fixture_at(accounts, holdings, state_proof_tracking, genesis_header())
+}
+
+/// [`fixture_with_tracking`] committed at `hdr.round` instead of round 0.
+fn fixture_at(
+    accounts: &[(Address, AccountData)],
+    holdings: &[(Address, u64)],
+    state_proof_tracking: Option<rmpv::Value>,
+    hdr: BlockHeader,
+) -> (Arc<Mutex<SqliteLedger>>, Arc<TransactionPool>) {
     let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().expect("ledger")));
-    let hdr = genesis_header();
     let block = algo_types::Block {
         round: hdr.round,
         current_protocol: hdr.current_protocol.clone(),
@@ -102,13 +111,13 @@ fn fixture_with_tracking(
         let mut l = ledger.lock().unwrap();
         l.begin_block().unwrap();
         l.put_block(
-            0,
+            hdr.round.0,
             &block.current_protocol,
             &canonical_encode_block_header_from_block(&block),
             &canonical_encode_block(&block),
         )
         .unwrap();
-        l.set_current_round(Round(0));
+        l.set_current_round(hdr.round);
         l.set_fee_sink(FEE_SINK);
         l.set_rewards_pool(REWARDS_POOL);
         l.set_genesis_id(GENESIS_ID.to_string());
@@ -871,7 +880,8 @@ fn proposal_with_a_state_proof_txn_carries_the_advanced_next_round() {
     // A replica's real apply of the same payset agrees with the header.
     let (replica, _p) = fixture_with_tracking(&accounts, &[], spt(1024));
     let mut l = replica.lock().unwrap();
-    let scratch = scratch_execute_payset(&mut *l, &block).expect("replica apply");
+    let scratch =
+        scratch_execute_payset(&mut *l, &block, &Default::default()).expect("replica apply");
     assert_eq!(scratch.final_state_proof_next, Some(proposed));
     // Everything else the apply derives matches too.
     assert_eq!(scratch.final_txn_counter, block.txn_counter);
@@ -1312,4 +1322,119 @@ fn fallback_payout_is_zero_when_the_payset_touches_the_fee_sink() {
     let (_l, mut eval) = evaluator(&[(a.0, funded(50_000_000))]);
     eval.exec = None;
     assert!(eval.generate_block(&[]).unwrap().proposer_payout > 0);
+}
+
+// ---- #1795: knock-offline lists come from the post-payset state ----
+
+/// An evaluator whose ledger tip is round 99, so the proposal is round 100.
+fn evaluator_at_99(
+    accounts: &[(Address, AccountData)],
+) -> (Arc<Mutex<SqliteLedger>>, SimpleBlockEvaluator) {
+    let mut prev = genesis_header();
+    prev.round = Round(99);
+    let (ledger, _pool) = fixture_at(accounts, &[], None, prev.clone());
+    let eval = PoolLedgerAdapter::new(ledger.clone())
+        .start_simple_evaluator(prev, 0, 0)
+        .expect("start_evaluator");
+    (ledger, eval)
+}
+
+fn online_with_key(micro: u64, last_valid: u64) -> AccountData {
+    AccountData {
+        micro_algos: micro,
+        status: algo_types::AccountStatus::Online,
+        vote_id: Some([7u8; 32]),
+        vote_last_valid: last_valid,
+        ..Default::default()
+    }
+}
+
+/// go computes `ExpiredParticipationAccounts` in `endOfBlock`, over the state
+/// the payset left behind (`generateKnockOfflineAccountsList`). An expired
+/// account the payset closes out is therefore not listed (go skips zero
+/// balances), while an untouched expired account still is; and the validating
+/// apply, which judges the lists against the post-payset state, accepts the
+/// block. Before #1795 the list was read from the pre-block ledger, so the
+/// closed account was listed and the block failed `had no vote key`.
+#[test]
+fn expired_list_is_computed_from_the_post_payset_state() {
+    let a = key(1);
+    let b = key(2);
+    let c = key(3);
+    let (ledger, mut eval) = evaluator_at_99(&[
+        (a.0, online_with_key(5_000_000, 50)),
+        (b.0, funded(1_000_000)),
+        (c.0, online_with_key(5_000_000, 60)),
+    ]);
+    eval.transaction_group(&[pay(&a, b.0, 0, Some(b.0))])
+        .expect("close the expired account out");
+    let mut block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(block.payset.len(), 1);
+    assert_eq!(
+        block.expired_participation_accounts.as_deref(),
+        Some(&[c.0][..]),
+        "only the untouched expired account may be listed"
+    );
+    block.proposer = b.0;
+    let mut l = ledger.lock().unwrap();
+    algo_ledger::apply_block_validating(&mut *l, &block)
+        .expect("a proposer-built block must pass the validating apply");
+}
+
+/// Same for `AbsentParticipationAccounts`: an absent account closed by the
+/// payset has a zero balance in go's post-payset state and is skipped.
+#[test]
+fn absent_list_is_computed_from_the_post_payset_state() {
+    let a = key(1);
+    let b = key(2);
+    let c = key(3);
+    let absent = |micro| AccountData {
+        micro_algos: micro,
+        status: algo_types::AccountStatus::Online,
+        incentive_eligible: true,
+        last_heartbeat: 1,
+        ..Default::default()
+    };
+    let (ledger, mut eval) = evaluator_at_99(&[
+        (a.0, absent(5_000_000)),
+        (b.0, funded(1_000_000)),
+        (c.0, absent(5_000_000)),
+    ]);
+    eval.transaction_group(&[pay(&a, b.0, 0, Some(b.0))])
+        .expect("close the absent account out");
+    let mut block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(block.payset.len(), 1);
+    assert_eq!(
+        block.absent_participation_accounts.as_deref(),
+        Some(&[c.0][..]),
+        "only the untouched absent account may be listed"
+    );
+    block.proposer = b.0;
+    let mut l = ledger.lock().unwrap();
+    algo_ledger::apply_block_validating(&mut *l, &block)
+        .expect("a proposer-built block must pass the validating apply");
+}
+
+/// go skips the proposer's own participating addresses for BOTH lists
+/// (`partAddrs.Contains` precedes the expiry check): a node never proposes
+/// expiring itself. The payset here is non-empty, so the final scratch apply
+/// (not the ledger fallback) must honor the exclusion.
+#[test]
+fn own_participating_address_is_never_listed_expired() {
+    let a = key(1);
+    let b = key(2);
+    let c = key(3);
+    let (_ledger, mut eval) = evaluator_at_99(&[
+        (a.0, funded(50_000_000)),
+        (b.0, online_with_key(5_000_000, 50)),
+        (c.0, online_with_key(5_000_000, 60)),
+    ]);
+    eval.transaction_group(&[pay(&a, a.0, 1, None)])
+        .expect("payment");
+    let block = eval.generate_block(&[b.0]).expect("generate_block");
+    assert_eq!(block.payset.len(), 1);
+    assert_eq!(
+        block.expired_participation_accounts.as_deref(),
+        Some(&[c.0][..])
+    );
 }
