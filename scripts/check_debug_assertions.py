@@ -19,10 +19,12 @@ in the scheduled release run (the three shadow_execute invariant tests,
 statement. The reason text is required. (`debug_assert!` macros are not
 flagged: they only add checks and compile out, they do not select behaviour.)
 
-Known limits (non-blocking, a lint not a proof): multi-line `/* */` comments,
-`cfg!(not(test))`, `cfg_attr(debug_assertions, ..)` and side-effecting
-`debug_assert!` arguments are not analysed, and the note's claim is not
-verified, only required.
+`cfg_attr(debug_assertions, ..)` is flagged like any other use. Known limits
+(a lint not a proof): multi-line `/* */` comments and strings, raw strings and
+char literals, `cfg!(not(test))` without `debug_assertions`, side-effecting
+`debug_assert!` arguments, and the note's claim is required but not verified.
+A note is credited to the statement that opens directly below it, climbing
+only over lines ending in `(`, `,` or `[` and single-line attributes.
 
 Usage: check_debug_assertions.py [ROOT ...]   (default: the repository root)
 Exit 0 clean, 1 on any unannotated use.
@@ -32,7 +34,7 @@ import re
 import sys
 
 RUST_PATTERN = re.compile(r"\bdebug_assertions\b")
-TOML_PATTERN = re.compile(r"^\s*(debug-assertions|overflow-checks)\s*=")
+TOML_PATTERN = re.compile(r"(debug-assertions|overflow-checks)(\s*=|.*true|.*false|$)|-C\s*(debug-assertions|overflow-checks)|-Cdebug-assertions|-Coverflow-checks")
 NOTE = re.compile(r"(//|#).*debug-assertions-ok:\s*\S")
 BLOCK_COMMENT = re.compile(r"/\*.*?\*/")
 STRING = re.compile(r'"(?:\\.|[^"\\])*"')
@@ -62,14 +64,15 @@ def annotated_above(lines, i, comment_prefix):
 
 def scan_file(path):
     """Return [(line_no, text)] of unannotated profile-dependent settings."""
-    is_toml = path.endswith(".toml")
+    is_toml = path.endswith((".toml", ".yml", ".yaml"))
     pattern = TOML_PATTERN if is_toml else RUST_PATTERN
     prefix = "#" if is_toml else "//"
     bad = []
     with open(path, encoding="utf-8", errors="replace") as f:
         lines = f.read().splitlines()
     for i, line in enumerate(lines):
-        bare = BLOCK_COMMENT.sub("", STRING.sub('""', line))
+        # Rust strings are not code; TOML/YAML values (rustflags) are.
+        bare = line if is_toml else BLOCK_COMMENT.sub("", STRING.sub('""', line))
         if not pattern.search(bare.split(prefix, 1)[0]):
             continue
         if NOTE.search(bare) or annotated_above(lines, i, prefix):
@@ -84,7 +87,7 @@ def scan(roots):
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
             for name in filenames:
-                if name.endswith(".rs") or name in ("Cargo.toml", "config.toml"):
+                if name.endswith((".rs", ".yml", ".yaml")) or name in ("Cargo.toml", "config.toml"):
                     p = os.path.join(dirpath, name)
                     findings += [(p, n, t) for n, t in scan_file(p)]
     return findings

@@ -66,6 +66,13 @@ class CheckTest(unittest.TestCase):
     def test_single_line_block_comment_mention_is_not_flagged(self):
         self.assertEqual(self.scan_src(lines("let a = 1; /* debug_assertions */")), [])
 
+    def test_rustflags_and_inline_table_overrides_are_flagged(self):
+        flags = lines('rustflags = ["-C debug-assertions=on"]')
+        self.assertEqual(len(self.scan_src(flags, "config.toml")), 1)
+        inline = lines("profile.release = { debug-assertions = true }")
+        self.assertEqual(len(self.scan_src(inline, "Cargo.toml")), 1)
+        self.assertEqual(len(self.scan_src(lines("env:", "  RUSTFLAGS: -Cdebug-assertions=off"), "w.yml")), 1)
+
     def test_cargo_profile_override_needs_a_note(self):
         toml = lines("[profile.release]", "debug-assertions = true")
         self.assertEqual(len(self.scan_src(toml, "Cargo.toml")), 1)
