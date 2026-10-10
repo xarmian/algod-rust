@@ -1983,14 +1983,19 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
             lists.absent.push(addr);
             continue;
         }
-        if last_seen == 0 {
+        // Cheap prefilter before any database access: the allowable lag is
+        // `ABSENT_FACTOR * total / stake`, at least `ABSENT_FACTOR` whenever the
+        // stake does not exceed the total, so an account seen within the last
+        // `ABSENT_FACTOR` rounds is not absent. (Skipping a candidate only
+        // shortens the list, which is always valid.)
+        if last_seen == 0 || last_seen.saturating_add(ABSENT_FACTOR) >= round {
             continue;
         }
         let total_online_stake = match *total_cache.get_or_insert_with(|| {
             match store.balance_round_total_online_stake(brnd.0, round) {
                 Ok(t) => Some(t),
                 Err(e) => {
-                    note_undecidable_absence_once(round, brnd.0, &e);
+                    note_undecidable_absence(round, brnd.0, &e);
                     None
                 }
             }
@@ -2009,21 +2014,31 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
     lists
 }
 
-/// Log, once per process, that the stake-based absence test is undecidable
-/// (no supply snapshot and no usable history at the balance round).
-fn note_undecidable_absence_once(round: u64, balance_round: u64, err: &AlgoError) {
-    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+/// Log that the stake-based absence test is undecidable (the balance-round
+/// total cannot be determined): a warning at most once per five minutes, so a
+/// long-lived degradation stays visible without a line per block, and a debug
+/// line otherwise.
+fn note_undecidable_absence(round: u64, balance_round: u64, err: &AlgoError) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const WARN_EVERY_SECS: u64 = 300;
+    static LAST_WARN_SECS: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_WARN_SECS.load(Ordering::Relaxed);
+    if last == 0 || now.saturating_sub(last) >= WARN_EVERY_SECS {
+        LAST_WARN_SECS.store(now.max(1), Ordering::Relaxed);
+        tracing::warn!(
+            round,
+            balance_round,
+            "{err}; not proposing stake-based absences (warned at most every {WARN_EVERY_SECS}s)"
+        );
+    } else {
         tracing::debug!(
             round,
             balance_round,
             "{err}; no stake-based absences proposed"
-        );
-    } else {
-        tracing::warn!(
-            round,
-            balance_round,
-            "{err}; not proposing stake-based absences (logged once; later rounds at debug)"
         );
     }
 }
@@ -14244,6 +14259,93 @@ return
 
         validate_absent_online_accounts(&state, &block, &consensus, true)
             .expect("challenge-failed account must validate via the challenge path");
+    }
+
+    /// The fallback that filters ledger-tip lists by the payset's touched
+    /// accounts relies on every transaction type modifying only accounts it
+    /// names, except application calls (inner transactions). One assertion
+    /// per transaction type: the helper returns the named accounts, or `None`
+    /// for `appl`.
+    #[test]
+    fn touched_addresses_are_bounded_for_every_type_except_appl() {
+        use algo_types::{HeartbeatTxnFields, SignedTransaction, TxnType};
+        let a = |n: u8| Address([n; 32]);
+        let stx = |f: &dyn Fn(&mut SignedTransaction)| {
+            let mut s = SignedTransaction::default();
+            s.txn.sender = a(1);
+            f(&mut s);
+            s
+        };
+        let cases: Vec<(&str, SignedTransaction, Vec<Address>)> = vec![
+            (
+                "pay: receiver and close-out credit",
+                stx(&|s| {
+                    s.txn.txn_type = TxnType::Pay;
+                    s.txn.receiver = a(2);
+                    s.txn.close_remainder_to = a(3);
+                }),
+                vec![a(1), a(2), a(3)],
+            ),
+            (
+                "axfer: clawback source, receiver, close-to",
+                stx(&|s| {
+                    s.txn.txn_type = TxnType::Axfer;
+                    s.txn.asset_sender = Some(a(4));
+                    s.txn.asset_receiver = Some(a(5));
+                    s.txn.asset_close_to = Some(a(6));
+                }),
+                vec![a(1), a(4), a(5), a(6)],
+            ),
+            (
+                "afrz: freeze target",
+                stx(&|s| {
+                    s.txn.txn_type = TxnType::Afrz;
+                    s.txn.freeze_account = Some(a(7));
+                }),
+                vec![a(1), a(7)],
+            ),
+            (
+                "acfg: sender only",
+                stx(&|s| s.txn.txn_type = TxnType::Acfg),
+                vec![a(1)],
+            ),
+            (
+                "keyreg: sender only (rekey_to changes the sender record)",
+                stx(&|s| {
+                    s.txn.txn_type = TxnType::Keyreg;
+                    s.txn.rekey_to = Some(a(8));
+                }),
+                vec![a(1)],
+            ),
+            (
+                "stpf: sender only",
+                stx(&|s| s.txn.txn_type = TxnType::Stpf),
+                vec![a(1)],
+            ),
+            (
+                "hb: heartbeat target",
+                stx(&|s| {
+                    s.txn.txn_type = TxnType::Hb;
+                    s.txn.heartbeat = Some(HeartbeatTxnFields {
+                        address: a(9),
+                        ..Default::default()
+                    });
+                }),
+                vec![a(1), a(9)],
+            ),
+        ];
+        for (name, tx, named) in cases {
+            let got = payset_touched_addresses_bounded(std::slice::from_ref(&tx))
+                .unwrap_or_else(|| panic!("{name}: must be bounded"));
+            for n in &named {
+                assert!(got.contains(n), "{name}: missing {n}");
+            }
+        }
+        let appl = stx(&|s| s.txn.txn_type = TxnType::Appl);
+        assert!(
+            payset_touched_addresses_bounded(std::slice::from_ref(&appl)).is_none(),
+            "appl: inner transactions can modify any account"
+        );
     }
 
     /// A challenge-failed account is proposed (and accepted) as absent even

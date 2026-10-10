@@ -2317,6 +2317,13 @@ pub struct SqliteLedger {
     /// to a full sweep of every currently-online account.
     pending_online_touched: std::collections::HashSet<Address>,
 
+    /// `(round, rewards_level)` of the last committed block header consulted by
+    /// [`Self::rewards_level_at`]; `rewards_cache_round == u64::MAX` is empty.
+    /// A committed header never changes, so the pair is valid for its round and
+    /// saves a header read + decode per candidate in the absence scans.
+    rewards_cache_round: AtomicU64,
+    rewards_cache_level: AtomicU64,
+
     /// Automatic interval-driven catchpoint generation config (issue
     /// #770), set via [`Self::configure_automatic_catchpoints`]. `None`
     /// (the default) disables the feature entirely — matching go's
@@ -2922,6 +2929,8 @@ impl SqliteLedger {
             group_delta_tracer: None,
             pending_totals_delta: AccountTotalsDelta::default(),
             pending_online_touched: std::collections::HashSet::new(),
+            rewards_cache_round: AtomicU64::new(u64::MAX),
+            rewards_cache_level: AtomicU64::new(0),
             catchpoint_auto: None,
             catchpoint_worker: None,
             reenable_catchpoints_round: 0,
@@ -5406,13 +5415,7 @@ impl SqliteLedger {
     /// row. `None` when the history holds no row at or before `round` at all
     /// (nothing to derive from).
     fn derive_online_supply_from_history(&self, round: u64) -> Result<Option<u64>, AlgoError> {
-        let rewards_level = self
-            .get_block_header_data(round)
-            .ok()
-            .flatten()
-            .and_then(|hdr| BlockHeader::decode_from_bytes(&hdr).ok())
-            .map(|hdr| hdr.rewards_level)
-            .unwrap_or_else(|| self.rewards_level());
+        let rewards_level = self.rewards_level_at(round)?;
         let mut stmt = self
             .conn
             .prepare(
@@ -5562,6 +5565,38 @@ impl SqliteLedger {
     /// current state: a late joiner has no stake until the lookback passes it.
     /// Used by [`LedgerStore::voter_agreement_data_at_round`]; agreement's own
     /// membership lookup keeps its current-state fallback (issue #1809).
+    /// The rewards level at `round`'s block header -- the single place both the
+    /// per-account stake and the derived total take it from, so they share one
+    /// time basis. A header that cannot be read or decoded is an error; only a
+    /// header that is absent (a synthetic ledger without one) falls back to the
+    /// current level, and says so at debug level.
+    fn rewards_level_at(&self, round: u64) -> Result<u64, AlgoError> {
+        if self.rewards_cache_round.load(Ordering::Relaxed) == round {
+            return Ok(self.rewards_cache_level.load(Ordering::Relaxed));
+        }
+        match self.get_block_header_data(round)? {
+            Some(hdr) => {
+                let level = BlockHeader::decode_from_bytes(&hdr)
+                    .map_err(|e| AlgoError::Ledger {
+                        message: format!("decode block header {round} for its rewards level: {e}"),
+                    })?
+                    .rewards_level;
+                if round <= self.current_round.0 {
+                    self.rewards_cache_level.store(level, Ordering::Relaxed);
+                    self.rewards_cache_round.store(round, Ordering::Relaxed);
+                }
+                Ok(level)
+            }
+            None => {
+                tracing::debug!(
+                    round,
+                    "no block header at the balance round; using the current rewards level"
+                );
+                Ok(self.rewards_level())
+            }
+        }
+    }
+
     fn lookup_agreement_account(
         &self,
         addr: &Address,
@@ -5573,13 +5608,7 @@ impl SqliteLedger {
         if acct.status != AccountStatus::Online {
             return Ok(None);
         }
-        let rewards_level = self
-            .get_block_header_data(round)
-            .ok()
-            .flatten()
-            .and_then(|hdr| BlockHeader::decode_from_bytes(&hdr).ok())
-            .map(|hdr| hdr.rewards_level)
-            .unwrap_or_else(|| self.rewards_level());
+        let rewards_level = self.rewards_level_at(round)?;
         if rewards_level >= acct.rewards_base {
             let pending = crate::rewards::compute_pending_rewards(&acct, rewards_level);
             acct.micro_algos = acct.micro_algos.saturating_add(pending);
@@ -14905,15 +14934,26 @@ mod tests {
     #[test]
     fn genesis_online_account_that_never_changes_has_its_stake_at_the_balance_round() {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let header_bytes = |round: u64| {
+            let b = algo_types::Block {
+                round: Round(round),
+                ..algo_types::Block::default()
+            };
+            algo_codec::canonical_encode_block_header_from_block(&b)
+        };
         let addr = Address([9u8; 32]);
         ledger.begin_block().unwrap();
         ledger.set_account(&addr, absent_acct(0));
-        ledger.put_block(0, "proto", b"hdr0", b"blk0").unwrap();
+        ledger
+            .put_block(0, "proto", &header_bytes(0), b"blk0")
+            .unwrap();
         ledger.commit_block().unwrap();
         // Later rounds that never touch the account.
         for r in 1..=5u64 {
             ledger.begin_block().unwrap();
-            ledger.put_block(r, "proto", b"hdr", b"blk").unwrap();
+            ledger
+                .put_block(r, "proto", &header_bytes(r), b"blk")
+                .unwrap();
             ledger.set_current_round(Round(r));
             ledger.commit_block().unwrap();
         }
@@ -15102,6 +15142,191 @@ mod tests {
         ledger.put_online_supply_at_round(0, 500_000_000).unwrap();
         let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
         assert!(l.absent.is_empty(), "lag 2000 -> not absent");
+    }
+
+    /// Liveness of the fail-closed validator (issue #1795): at every tip of a
+    /// long-running node the next block's balance round still has both the
+    /// per-round supply snapshot and the `onlineaccounts` rows the total and
+    /// the per-account stake are read from. Writers: `commit_block` ->
+    /// `record_online_supply_snapshot` / `record_online_account_history`;
+    /// pruning keeps snapshots with `rnd >= round - MaxBalLookback` and, per
+    /// address, the latest row older than that window (online ones only), and
+    /// the balance round of the next block is `tip + 1 - 320`, inside both.
+    #[test]
+    fn pruning_never_removes_what_the_next_balance_round_needs() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.set_protocol(algo_types::CONSENSUS_V41.to_string());
+        let consensus = consensus_v41();
+        let stable = Address([1u8; 32]);
+        let flaps = Address([2u8; 32]);
+        let acct = |micro: u64| AccountData {
+            micro_algos: micro,
+            status: AccountStatus::Online,
+            vote_id: Some([7u8; 32]),
+            vote_last_valid: 1_000_000,
+            incentive_eligible: true,
+            ..AccountData::default()
+        };
+        for round in 0..=700u64 {
+            ledger.begin_block().unwrap();
+            ledger.set_current_round(Round(round));
+            if round == 1 {
+                ledger.set_account(&stable, acct(5_000_000));
+                ledger.set_account(&flaps, acct(3_000_000));
+                ledger
+                    .put_account_totals_seed(8_000_000, 0, 0, 0, 0, 0)
+                    .unwrap();
+            }
+            if round == 200 {
+                ledger.set_account(&flaps, AccountData::default());
+            }
+            if round == 600 {
+                ledger.set_account(&flaps, acct(3_000_000));
+            }
+            ledger.commit_block().unwrap();
+
+            if round >= 330 {
+                let next = round + 1;
+                let brnd = algo_agreement::balance_round(Round(next), &consensus).0;
+                assert_eq!(brnd, next - 320);
+                // The snapshot written by the commit loop is there ...
+                assert!(
+                    ledger.online_supply_at_round(brnd).unwrap().is_some(),
+                    "supply snapshot at {brnd} (tip {round})"
+                );
+                ledger
+                    .balance_round_total_online_stake(brnd, next)
+                    .unwrap_or_else(|e| panic!("tip {round}: {e}"));
+                // ... and so is the history, in case a legacy store lacks the tail.
+                assert!(
+                    ledger
+                        .derive_online_supply_from_history(brnd)
+                        .unwrap()
+                        .is_some(),
+                    "history at {brnd} (tip {round})"
+                );
+                assert_eq!(
+                    ledger
+                        .voter_agreement_data_at_round(brnd, &stable)
+                        .unwrap()
+                        .micro_algos,
+                    5_000_000,
+                    "stable account's stake at {brnd}"
+                );
+            }
+        }
+        // A legacy store without the supply tail derives the same total.
+        let brnd = 701 - 320;
+        ledger.balance_round_total_online_stake(brnd, 701).unwrap();
+        ledger
+            .conn
+            .execute("DELETE FROM onlineroundparamstail", [])
+            .unwrap();
+        assert!(ledger.online_supply_at_round(brnd).unwrap().is_none());
+        let derived = ledger.balance_round_total_online_stake(brnd, 701).unwrap();
+        // `flaps` went offline at round 200 and is not back until 600.
+        assert_eq!(
+            derived, 5_000_000,
+            "only the stable account at round {brnd}"
+        );
+    }
+
+    /// A catchpoint-imported store carries go's `onlineaccounts` rows and
+    /// `onlineroundparamstail` window verbatim (importer.rs:495-496 renames
+    /// them into place), so right after import the next block's balance round
+    /// has the snapshot, and the per-account stake and derived total come from
+    /// the imported rows too.
+    #[test]
+    fn catchpoint_imported_store_has_the_balance_round_data() {
+        use crate::catchpoint::importer::CatchpointImporter;
+        use crate::catchpoint::types::{AccountTotals, AlgoCount};
+        use crate::catchpoint::{
+            CatchpointFileHeader, CatchpointSnapshotChunkV6, OnlineAccountRecordV6,
+            OnlineRoundParamsRecordV6,
+        };
+        use serde_bytes::ByteBuf;
+
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([3u8; 32]);
+        let acct = AccountData {
+            micro_algos: 5_000_000,
+            status: AccountStatus::Online,
+            vote_id: Some([7u8; 32]),
+            vote_last_valid: 1_000_000,
+            incentive_eligible: true,
+            ..AccountData::default()
+        };
+        let tip = 5_000u64;
+        let online_account = OnlineAccountRecordV6 {
+            address: ByteBuf::from(addr.0.to_vec()),
+            updated_round: 100,
+            normalized_online_balance: account_nob_i64(&acct) as u64,
+            vote_last_valid: acct.vote_last_valid,
+            data: ByteBuf::from(encode_online_account_data(&acct)),
+        };
+        // go's catchpoint carries the supply tail for the lookback window.
+        let params: Vec<OnlineRoundParamsRecordV6> = (tip - 320..=tip)
+            .map(|rnd| OnlineRoundParamsRecordV6 {
+                round: rnd,
+                data: ByteBuf::from(encode_mixed_map(&[(
+                    "online",
+                    encode_msgpack_uint(5_000_000),
+                )])),
+            })
+            .collect();
+        let chunk = CatchpointSnapshotChunkV6 {
+            balances: vec![],
+            kvs: vec![],
+            online_accounts: vec![online_account],
+            online_round_params: params,
+        };
+        let mut importer =
+            CatchpointImporter::new(&ledger.conn, "5000#TEST".to_string(), REWARD_UNITS);
+        importer.prepare_staging().unwrap();
+        importer
+            .import_chunks(vec![Ok((1, chunk))].into_iter(), 1)
+            .unwrap();
+        let header = CatchpointFileHeader {
+            version: 131,
+            balances_round: tip,
+            totals: AccountTotals {
+                online: AlgoCount {
+                    money: 5_000_000,
+                    reward_units: 5,
+                },
+                ..Default::default()
+            },
+            catchpoint: "5000#TEST".to_string(),
+            ..Default::default()
+        };
+        importer.atomic_cutover(&header).unwrap();
+
+        let brnd = tip + 1 - 320;
+        assert!(ledger.online_supply_at_round(brnd).unwrap().is_some());
+        assert_eq!(
+            ledger
+                .balance_round_total_online_stake(brnd, tip + 1)
+                .unwrap(),
+            5_000_000
+        );
+        assert_eq!(
+            ledger
+                .voter_agreement_data_at_round(brnd, &addr)
+                .unwrap()
+                .micro_algos,
+            5_000_000
+        );
+        // Without the tail the imported rows still derive the total.
+        ledger
+            .conn
+            .execute("DELETE FROM onlineroundparamstail", [])
+            .unwrap();
+        assert_eq!(
+            ledger
+                .balance_round_total_online_stake(brnd, tip + 1)
+                .unwrap(),
+            5_000_000
+        );
     }
 
     // -- Issue #1758: rollback / failed commit restore the in-memory chain state --
@@ -15376,6 +15601,8 @@ mod tests {
             group_delta_tracer: _,
             pending_totals_delta: _,   // reset by rollback
             pending_online_touched: _, // cleared by rollback
+            rewards_cache_round: _,    // committed-header cache, immutable data
+            rewards_cache_level: _,    // (see rewards_level_at)
             catchpoint_auto: _,
             catchpoint_worker: _,
             reenable_catchpoints_round: _,

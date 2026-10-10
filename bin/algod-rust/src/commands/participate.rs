@@ -2094,7 +2094,14 @@ impl SimpleBlockEvaluator {
         candidate.fees_collected = groups.iter().map(|g| g.fees).sum();
         // Measured here, outside the ledger lock: feeds the load and the size
         // gate, so nothing is cloned or encoded under the mutex.
-        let base_sizes: std::sync::Arc<[usize]> = payset.iter().map(Self::encoded_len).collect();
+        // Only when something uses them: the load and the size gate (never on
+        // bisection probes, which ask for neither).
+        let base_sizes: std::sync::Arc<[usize]> =
+            if self.consensus_params.load_tracking || (own_addresses.is_some() && gated) {
+                payset.iter().map(Self::encoded_len).collect()
+            } else {
+                std::sync::Arc::from(Vec::<usize>::new())
+            };
         if self.consensus_params.load_tracking {
             let bytes: u64 = base_sizes.iter().map(|b| *b as u64).sum();
             candidate.load =
@@ -2280,10 +2287,18 @@ impl SimpleBlockEvaluator {
         // exact size fits, e.g. near the limit) the pass skipped the list scan.
         // One more pass over the kept payset, ungated, produces the lists.
         if final_knock_offline.is_none() && !result.0.is_empty() {
-            if let Ok(Ok(done)) =
-                self.scratch_pass(&template, &pristine, &groups, Some(own_addresses), false)
-            {
-                final_knock_offline = done.knock_offline_lists;
+            match self.scratch_pass(&template, &pristine, &groups, Some(own_addresses), false) {
+                Ok(Ok(done)) => final_knock_offline = done.knock_offline_lists,
+                Ok(Err(failure)) => warn!(
+                    ?failure,
+                    "block assembly: list pass over the kept payset failed; \
+                     using the ledger-tip lists"
+                ),
+                Err(e) => warn!(
+                    error = %e,
+                    "block assembly: list pass over the kept payset failed; \
+                     using the ledger-tip lists"
+                ),
             }
         }
         if dropped > 0 {
