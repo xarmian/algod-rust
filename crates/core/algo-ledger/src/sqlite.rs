@@ -5203,6 +5203,7 @@ impl SqliteLedger {
     /// live writer [`Self::record_online_account_history`] and catchpoint
     /// import record). For tests and backfills that need an account to have
     /// been online at a past round, e.g. before a balance-round lookback.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn put_online_account_at_round(
         &self,
         addr: &Address,
@@ -5492,15 +5493,17 @@ impl SqliteLedger {
     }
 
     /// go's `LookupAgreement(round, addr)` -- the single place that decides
-    /// the fallback policy and the rewards folding for every consumer
-    /// (`voter_params_get`, the absence checks, agreement's membership
-    /// lookup): the account's `onlineaccounts` row at or before `round`,
+    /// the fallback policy and the rewards folding for the stake lookbacks
+    /// (`voter_params_get`, the absence checks): the account's
+    /// `onlineaccounts` row at or before `round`,
     /// `None` when there is no such row or the account was not online then
     /// (go's empty `OnlineAccountData`), with the rewards pending at `round`'s
     /// rewards level folded into `micro_algos` (`MicroAlgosWithRewards`,
     /// issue #1654). There is deliberately NO fallback to the account's
     /// current state: a late joiner has no stake until the lookback passes it.
-    pub fn lookup_agreement_account(
+    /// Used by [`LedgerStore::voter_agreement_data_at_round`]; agreement's own
+    /// membership lookup keeps its current-state fallback (issue #1809).
+    fn lookup_agreement_account(
         &self,
         addr: &Address,
         round: u64,

@@ -1995,40 +1995,59 @@ impl SimpleBlockEvaluator {
         canonical_encode_signed_txn_in_block(stx).len()
     }
 
-    /// `payset` with each transaction's ApplyData filled in, as it is encoded
-    /// in the block.
+    /// Fill one transaction's ApplyData in, as it is encoded in the block.
+    fn fill_apply_data(
+        stx: &mut algo_types::SignedTransaction,
+        ad: &algo_ledger::apply::ApplyData,
+    ) {
+        stx.closing_amount = ad.closing_amount;
+        stx.asset_closing_amount = ad.asset_closing_amount;
+        stx.sender_rewards = ad.sender_rewards;
+        stx.receiver_rewards = ad.receiver_rewards;
+        stx.close_rewards = ad.close_rewards;
+        stx.apply_data_config_asset = ad.config_asset;
+        stx.apply_data_application_id = ad.application_id;
+        stx.eval_delta = ad.eval_delta.clone();
+    }
+
+    /// `payset` with each transaction's ApplyData filled in.
     fn with_apply_data(
         payset: &[algo_types::SignedTransaction],
         apply_data: &[algo_ledger::apply::ApplyData],
     ) -> Vec<algo_types::SignedTransaction> {
         let mut out = payset.to_vec();
         for (stx, ad) in out.iter_mut().zip(apply_data) {
-            stx.closing_amount = ad.closing_amount;
-            stx.asset_closing_amount = ad.asset_closing_amount;
-            stx.sender_rewards = ad.sender_rewards;
-            stx.receiver_rewards = ad.receiver_rewards;
-            stx.close_rewards = ad.close_rewards;
-            stx.apply_data_config_asset = ad.config_asset;
-            stx.apply_data_application_id = ad.application_id;
-            stx.eval_delta = ad.eval_delta.clone();
+            Self::fill_apply_data(stx, ad);
         }
         out
     }
 
-    /// Does `payset`, once a scratch pass has produced its ApplyData, fit the
-    /// block byte limit? The same test `finalize_payset` applies to a pass's
-    /// result, usable inside the apply (see `ExecProbe::knock_offline_gate`).
-    fn fits_gate(&self, payset: &[algo_types::SignedTransaction]) -> algo_ledger::apply::FitsGate {
-        let payset = payset.to_vec();
-        let max = self.max_txn_bytes;
+    /// Encoded size of `payset` once `apply_data` is filled in. Runs inside
+    /// the apply under the ledger mutex (see `ExecProbe::knock_offline_gate`)
+    /// over the apply's own payset: it never copies the payset, only one
+    /// transaction at a time while encoding it. Each transaction is encoded
+    /// once here; `finalize_payset` reuses the total on the happy path and
+    /// encodes per-transaction sizes (outside the lock) only when oversize.
+    fn encoded_len_with_apply_data(
+        payset: &[algo_types::SignedTransaction],
+        apply_data: &[algo_ledger::apply::ApplyData],
+    ) -> usize {
+        payset
+            .iter()
+            .zip(apply_data)
+            .map(|(stx, ad)| {
+                let mut one = stx.clone();
+                Self::fill_apply_data(&mut one, ad);
+                Self::encoded_len(&one)
+            })
+            .sum()
+    }
+
+    /// The block-size gate handed to the scratch apply.
+    fn fits_gate(&self) -> algo_ledger::apply::FitsGate {
         algo_ledger::apply::FitsGate {
-            size_of: Arc::new(move |ad| {
-                Self::with_apply_data(&payset, ad)
-                    .iter()
-                    .map(Self::encoded_len)
-                    .sum()
-            }),
-            max,
+            size_of: Self::encoded_len_with_apply_data,
+            max: self.max_txn_bytes,
         }
     }
 
@@ -2076,7 +2095,7 @@ impl SimpleBlockEvaluator {
         // gated out inside the apply, before the scan.
         let request = own_addresses.map(|own| algo_ledger::apply::ListsRequest {
             own_addresses: own.clone(),
-            fits: Some(self.fits_gate(payset)),
+            fits: Some(self.fits_gate()),
         });
         let r =
             algo_ledger::shadow_execute::scratch_execute_payset(&mut *ledger, &candidate, request);
@@ -3126,32 +3145,58 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         // subset; a lower or empty list is always accepted.
         //
         // A NON-empty payset with no scratch result (store cannot roll back,
-        // transient failure, legacy path without exec state) gets EMPTY
-        // lists: the tip is not the post-payset state, and an empty list is
-        // always valid.
+        // transient failure, legacy path without exec state): the tip is not
+        // the post-payset state, but accounts the payset does not touch (and
+        // that are not the proposer's own) are unaffected by it, so the tip
+        // lists filtered to those are valid. A payset whose effects cannot be
+        // bounded (application calls: inner transactions) or a tip that is not
+        // this block's parent gets empty lists, which are always valid.
         let lists = match self
             .exec
             .as_ref()
             .and_then(|e| e.final_knock_offline.clone())
         {
             Some(lists) => lists,
-            None if !payset.is_empty() => algo_ledger::apply::KnockOfflineLists::default(),
             None => {
-                let exclude: std::collections::HashSet<algo_types::Address> =
-                    voting_accounts.iter().copied().collect();
-                let ledger = self
-                    .ledger
-                    .lock()
-                    .map_err(|e| algo_error::AlgoError::Ledger {
-                        message: format!("ledger lock poisoned: {e}"),
-                    })?;
-                algo_ledger::apply::knock_offline_lists(
-                    &*ledger,
-                    self.hdr.round.0,
-                    &self.consensus_params,
-                    &exclude,
-                    &[],
-                )
+                let touched = if payset.is_empty() {
+                    Some(Vec::new())
+                } else {
+                    algo_ledger::apply::payset_touched_addresses_bounded(&payset)
+                };
+                match touched {
+                    None => algo_ledger::apply::KnockOfflineLists::default(),
+                    Some(touched) => {
+                        let ledger =
+                            self.ledger
+                                .lock()
+                                .map_err(|e| algo_error::AlgoError::Ledger {
+                                    message: format!("ledger lock poisoned: {e}"),
+                                })?;
+                        if !payset.is_empty()
+                            && ledger.current_round().0.saturating_add(1) != self.hdr.round.0
+                        {
+                            algo_ledger::apply::KnockOfflineLists::default()
+                        } else if touched.is_empty() {
+                            algo_ledger::apply::knock_offline_lists(
+                                &*ledger,
+                                self.hdr.round.0,
+                                &self.consensus_params,
+                                &own_addresses,
+                                &[],
+                            )
+                        } else {
+                            let mut exclude = own_addresses.clone();
+                            exclude.extend(touched);
+                            algo_ledger::apply::knock_offline_lists(
+                                &*ledger,
+                                self.hdr.round.0,
+                                &self.consensus_params,
+                                &exclude,
+                                &[],
+                            )
+                        }
+                    }
+                }
             }
         };
         let expired = (!lists.expired.is_empty()).then_some(lists.expired);

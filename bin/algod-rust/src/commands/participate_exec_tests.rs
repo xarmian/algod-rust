@@ -1497,10 +1497,40 @@ fn empty_payset_lists_come_from_the_ledger_tip() {
 }
 
 /// A non-empty payset that no scratch apply evaluated (legacy path without
-/// exec state) must not borrow the pre-payset tip's lists: they are empty,
-/// which is always valid.
+/// exec state): the ledger-tip lists are filtered to accounts the payset does
+/// not touch and that are not the proposer's own, which the payset cannot have
+/// changed, so the lists are valid. `d` (paid by the payset) and `own` are
+/// dropped; `c` is kept.
 #[test]
-fn non_empty_payset_without_a_scratch_result_gets_empty_lists() {
+fn non_empty_payset_without_a_scratch_result_lists_only_untouched_accounts() {
+    let a = key(1);
+    let c = key(3);
+    let d = key(4);
+    let own = key(5);
+    let (_ledger, mut eval) = evaluator_at_99(&[
+        (a.0, funded(50_000_000)),
+        (c.0, online_with_key(5_000_000, 60)),
+        (d.0, online_with_key(5_000_000, 60)),
+        (own.0, online_with_key(5_000_000, 60)),
+    ]);
+    eval.exec = None;
+    let mut stx = pay(&a, d.0, 1, None);
+    eval.genesis_rule().strip(&mut stx);
+    eval.included_txns.push(stx);
+    let block = eval.generate_block(&[own.0]).expect("generate_block");
+    assert_eq!(block.payset.len(), 1);
+    assert_eq!(
+        block.expired_participation_accounts.as_deref(),
+        Some(&[c.0][..]),
+        "tip lists minus the payset's touched accounts and the proposer's own"
+    );
+    assert!(block.absent_participation_accounts.is_none());
+}
+
+/// An application call can modify any account through inner transactions, so
+/// the touched set is unbounded and the fallback proposes empty lists.
+#[test]
+fn unevaluated_payset_with_an_app_call_gets_empty_lists() {
     let a = key(1);
     let c = key(3);
     let (_ledger, mut eval) = evaluator_at_99(&[
@@ -1508,7 +1538,7 @@ fn non_empty_payset_without_a_scratch_result_gets_empty_lists() {
         (c.0, online_with_key(5_000_000, 60)),
     ]);
     eval.exec = None;
-    let mut stx = pay(&a, a.0, 1, None);
+    let mut stx = app_call(&a, 1, vec![], 1_000);
     eval.genesis_rule().strip(&mut stx);
     eval.included_txns.push(stx);
     let block = eval.generate_block(&[]).expect("generate_block");

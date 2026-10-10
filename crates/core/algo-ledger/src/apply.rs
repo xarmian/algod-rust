@@ -1774,7 +1774,7 @@ pub(crate) fn apply_block_impl_ex<L: crate::store_trait::LedgerStore>(
 
 /// Side outputs of an apply that the proposer's evaluator needs but a plain
 /// apply has no reason to expose (block assembly, issue #1776).
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone)]
 pub struct ExecProbe {
     /// Input: apply only the transactions (go per-group `TransactionGroup`)
     /// and skip the block epilogue (end-of-block participation updates,
@@ -1829,33 +1829,17 @@ pub struct ExecProbe {
     pub payset_bytes: Option<usize>,
 }
 
-/// Measures a scratch pass's payset (with its per-transaction [`ApplyData`])
-/// and its limit: does the resulting payset fit the block? See
-/// [`ExecProbe::knock_offline_gate`].
-#[derive(Clone)]
+/// Measures a scratch pass's payset and its limit: does the resulting payset
+/// fit the block? See [`ExecProbe::knock_offline_gate`]. A plain function over
+/// the apply's own `block.payset` and per-transaction [`ApplyData`], so no
+/// copy of the payset is captured or made under the ledger mutex.
+#[derive(Debug, Clone, Copy)]
 pub struct FitsGate {
     /// Encoded size of the payset once `ApplyData` is filled in.
-    pub size_of: std::sync::Arc<SizeFn>,
+    pub size_of: fn(&[SignedTransaction], &[ApplyData]) -> usize,
     /// The block byte limit.
     pub max: usize,
 }
-
-/// The size function inside a [`FitsGate`].
-pub type SizeFn = dyn Fn(&[ApplyData]) -> usize + Send + Sync;
-
-impl std::fmt::Debug for FitsGate {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("FitsGate")
-    }
-}
-
-impl PartialEq for FitsGate {
-    fn eq(&self, other: &Self) -> bool {
-        std::sync::Arc::ptr_eq(&self.size_of, &other.size_of) && self.max == other.max
-    }
-}
-
-impl Eq for FitsGate {}
 
 /// What the proposer asks of its final scratch pass: the expired / absent
 /// lists, skipping its own participating addresses, and only when the pass
@@ -2040,7 +2024,7 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
 /// shortens the proposed expired list (an offline account with keys that only
 /// an inner transaction touched is not offered for expiry), and validators
 /// accept any valid subset, so the omission is always safe.
-pub(crate) fn payset_touched_addresses(payset: &[algo_types::SignedTransaction]) -> Vec<Address> {
+pub fn payset_touched_addresses(payset: &[algo_types::SignedTransaction]) -> Vec<Address> {
     let mut out = Vec::new();
     for stx in payset {
         let t = &stx.txn;
@@ -2049,6 +2033,7 @@ pub(crate) fn payset_touched_addresses(payset: &[algo_types::SignedTransaction])
         out.extend(t.asset_receiver);
         out.extend(t.asset_close_to);
         out.extend(t.freeze_account);
+        out.extend(t.heartbeat.as_ref().map(|hb| hb.address));
         if let Some(accts) = &t.accounts {
             out.extend(accts.iter().copied());
         }
@@ -2056,6 +2041,20 @@ pub(crate) fn payset_touched_addresses(payset: &[algo_types::SignedTransaction])
     out.sort_by_key(|a| a.0);
     out.dedup();
     out
+}
+
+/// The accounts `payset` is known not to have modified beyond: its
+/// [`payset_touched_addresses`], or `None` when that set cannot be bounded --
+/// an application call can modify any account through inner transactions.
+/// Used to filter lists computed from the pre-payset ledger tip.
+pub fn payset_touched_addresses_bounded(payset: &[SignedTransaction]) -> Option<Vec<Address>> {
+    if payset
+        .iter()
+        .any(|s| s.txn.txn_type == algo_types::TxnType::Appl)
+    {
+        return None;
+    }
+    Some(payset_touched_addresses(payset))
 }
 
 /// [`apply_block_impl_ex`] plus an [`ExecProbe`] out-parameter.
@@ -2453,7 +2452,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
             let ad = apply_data_out.as_deref().map(Vec::as_slice).unwrap_or(&[]);
             let fits = match &p.knock_offline_gate {
                 Some(g) => {
-                    let bytes = (g.size_of)(ad);
+                    let bytes = (g.size_of)(&block.payset, ad);
                     p.payset_bytes = Some(bytes);
                     bytes <= g.max
                 }
