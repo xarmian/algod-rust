@@ -356,6 +356,8 @@ impl ScratchInvariant {
     fn capture<L: LedgerStore>(store: &L, chain: &ChainFields) -> Self {
         // Also enabled for unit-test builds so `--release` test profiles
         // (the Coverage workflow) exercise the same invariants as debug.
+        // debug-assertions-ok: `test` is OR-ed in, so test builds run the
+        // invariants in debug and --release alike (#1784).
         if !cfg!(any(debug_assertions, test)) {
             return Self {
                 tracker: None,

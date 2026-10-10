@@ -152,6 +152,8 @@ fn vrf_parity_vs_go_algorand() {
         )
     });
 
+    // debug-assertions-ok: only the sweep size differs (debug is too slow for
+    // every vector); the asserted vectors pass in both profiles.
     let full_sweep = !cfg!(debug_assertions) || std::env::var_os("AVR_FULL").is_some();
 
     let mut total = 0usize;
