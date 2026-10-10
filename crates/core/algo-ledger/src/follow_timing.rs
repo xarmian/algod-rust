@@ -572,9 +572,13 @@ mod tests {
             for e in std::fs::read_dir(dir).unwrap() {
                 let p = e.unwrap().path();
                 if p.is_dir() {
-                    walk(&p, hits);
+                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if !matches!(name, "target" | "tests" | "benches" | "fixtures") {
+                        walk(&p, hits);
+                    }
                 } else if p.extension().is_some_and(|x| x == "rs")
                     && !p.ends_with("follow_timing.rs")
+                    && !p.to_string_lossy().ends_with("_tests.rs")
                 {
                     let text = std::fs::read_to_string(&p).unwrap().to_lowercase();
                     for pat in ["pragma wal_autocheckpoint", "sqlite3_wal_autocheckpoint"] {
@@ -585,11 +589,13 @@ mod tests {
                 }
             }
         }
+        // Every production source in the workspace, not just this crate:
+        // any crate that reaches the ledger connection could replace the hook.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let mut hits = Vec::new();
-        walk(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut hits,
-        );
+        for top in ["crates", "bin"] {
+            walk(&root.join(top), &mut hits);
+        }
         assert!(hits.is_empty(), "{hits:?}");
     }
 
