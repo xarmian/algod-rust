@@ -1805,6 +1805,12 @@ pub struct ExecProbe {
     /// scratch apply asks; per-group overlay runs and plain applies skip the
     /// account read and min-balance scan.
     pub want_fee_sink_available: bool,
+    /// Input: run go's `validateForPayouts` (see `validate_proposer_payout`)
+    /// in the end-of-block step even though the rest of the apply is not in
+    /// validating mode. Used by the scratch proposal check so a peer's
+    /// payout / fees / proposer header fields are judged against the
+    /// pre-block state without turning on every other validate-mode check.
+    pub validate_payouts: bool,
 }
 
 /// [`apply_block_impl_ex`] plus an [`ExecProbe`] out-parameter.
@@ -1822,6 +1828,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
     probe: Option<&mut ExecProbe>,
 ) -> Result<(), AlgoError> {
     let skip_epilogue = probe.as_ref().is_some_and(|p| p.skip_epilogue);
+    let check_payouts = validate || probe.as_ref().is_some_and(|p| p.validate_payouts);
     // Index of the transaction whose apply failed (see `ExecProbe`).
     let mut failed_txn: Option<usize> = None;
     // A block's payset stores each transaction without the genesis id/hash
@@ -2268,11 +2275,12 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
             reset_expired_online_accounts(store, block, &consensus)?;
             validate_absent_online_accounts(store, block, &consensus, ctx.validate)?;
             suspend_absent_accounts(store, block, &consensus)?;
-            if ctx.validate {
-                validate_state_proof_tracking(store, &ctx, block, &consensus)?;
+            // go order: `validateForPayouts` precedes the state proof checks.
+            if check_payouts {
+                validate_proposer_payout(store, block, &consensus)?;
             }
             if ctx.validate {
-                validate_proposer_payout(store, block, &consensus)?;
+                validate_state_proof_tracking(store, &ctx, block, &consensus)?;
             }
             apply_proposer_payout(store, block)?;
             record_proposal(store, block)
@@ -3010,11 +3018,7 @@ fn validate_proposer_payout<L: crate::store_trait::LedgerStore>(
         return Ok(());
     }
 
-    let paid = block
-        .payset
-        .iter()
-        .filter(|stx| stx.txn.sender != block.fee_sink)
-        .fold(0u64, |acc, stx| acc.saturating_add(stx.txn.fee));
+    let paid = crate::block_header::payset_fees_collected(&block.payset, &block.fee_sink);
     if block.fees_collected != paid {
         return err(format!(
             "fees collected wrong: {} != {}",
@@ -3023,19 +3027,15 @@ fn validate_proposer_payout<L: crate::store_trait::LedgerStore>(
     }
 
     let available = crate::block_header::fee_sink_available(store, &block.fee_sink, 0);
-    let Some(allowed) = crate::block_header::proposer_payout(
+    let allowed = crate::block_header::proposer_payout(
         consensus,
         block.fees_collected,
         block.bonus,
         available,
-    ) else {
-        let incentive =
-            u128::from(block.fees_collected) * u128::from(consensus.payouts_percent.min(100)) / 100;
-        return err(format!(
-            "payout overflowed adding bonus incentive {} {}",
-            incentive, block.bonus
-        ));
-    };
+    )
+    .map_err(|e| AlgoError::Ledger {
+        message: e.to_string(),
+    })?;
     if block.proposer_payout > allowed {
         return err(format!(
             "proposal wants {} payout, {} is allowed",
@@ -3049,7 +3049,7 @@ fn validate_proposer_payout<L: crate::store_trait::LedgerStore>(
     if block.proposer_payout != 0
         && store
             .get_account(&block.proposer)
-            .is_none_or(|acct| acct == algo_types::AccountData::default())
+            .is_none_or(|acct| crate::block_header::is_closed_account(&acct))
     {
         return err(format!(
             "proposer {} is closed but expects payout {}",
@@ -3175,7 +3175,7 @@ fn record_proposal<L: crate::store_trait::LedgerStore>(
     }
 
     let mut prp = store.get_or_default_account(&block.proposer);
-    if prp != algo_types::AccountData::default() {
+    if !crate::block_header::is_closed_account(&prp) {
         prp.last_proposed = block.round.0;
     }
     // Go: `!VoteID.IsEmpty()` -- an unset or all-zero vote key means "no
@@ -6454,6 +6454,12 @@ mod tests {
         assert!(!is_absent(u64::MAX, 1, 1, u64::MAX));
     }
 
+    /// Header fields every validating-mode test block needs once payouts are
+    /// enabled (go `validateForPayouts`): a proposer, and `FeesCollected`
+    /// equal to the fee of its single `pay_txn(.., TEST_PAYSET_FEE)`.
+    const TEST_PROPOSER: Address = Address([0x55u8; 32]);
+    const TEST_PAYSET_FEE: u64 = 1_000;
+
     fn make_state_with_accounts(balances: &[(Address, u64)], fee_sink: Address) -> LedgerState {
         let mut state = LedgerState::new();
         state.fee_sink = fee_sink;
@@ -6648,8 +6654,8 @@ mod tests {
             round: Round(1),
             fee_sink,
             current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
-            proposer: Address([0x55u8; 32]),
-            fees_collected: 1_000,
+            proposer: TEST_PROPOSER,
+            fees_collected: TEST_PAYSET_FEE,
             payset: vec![rekey_stx],
             ..Block::default()
         };
@@ -6668,8 +6674,8 @@ mod tests {
             round: Round(2),
             fee_sink,
             current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
-            proposer: Address([0x55u8; 32]),
-            fees_collected: 1_000,
+            proposer: TEST_PROPOSER,
+            fees_collected: TEST_PAYSET_FEE,
             payset: vec![stale_spend],
             ..Block::default()
         };
@@ -6698,8 +6704,8 @@ mod tests {
             round: Round(1),
             fee_sink,
             current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
-            proposer: Address([0x55u8; 32]),
-            fees_collected: 1_000,
+            proposer: TEST_PROPOSER,
+            fees_collected: TEST_PAYSET_FEE,
             payset: vec![rekey_stx],
             ..Block::default()
         };
@@ -6712,8 +6718,8 @@ mod tests {
             round: Round(2),
             fee_sink,
             current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
-            proposer: Address([0x55u8; 32]),
-            fees_collected: 1_000,
+            proposer: TEST_PROPOSER,
+            fees_collected: TEST_PAYSET_FEE,
             payset: vec![correct_spend],
             ..Block::default()
         };
@@ -6761,8 +6767,8 @@ mod tests {
             round: Round(round),
             fee_sink,
             current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
-            proposer: Address([0x55u8; 32]),
-            fees_collected: 1_000,
+            proposer: TEST_PROPOSER,
+            fees_collected: TEST_PAYSET_FEE,
             payset: vec![stx],
             ..Block::default()
         };
@@ -12950,7 +12956,7 @@ return
         let block = Block {
             round: Round(256),
             state_proof_tracking: spt_value(&root, weight),
-            proposer: Address([0x55u8; 32]),
+            proposer: TEST_PROPOSER,
             ..make_empty_block_with_protocol(
                 Address([3u8; 32]),
                 algo_types::consensus::CONSENSUS_V41,
@@ -12973,7 +12979,7 @@ return
         let block = Block {
             round: Round(256),
             state_proof_tracking: spt_value_with_next(1024, &root, weight),
-            proposer: Address([0x55u8; 32]),
+            proposer: TEST_PROPOSER,
             ..make_empty_block_with_protocol(
                 Address([3u8; 32]),
                 algo_types::consensus::CONSENSUS_V41,
@@ -13001,7 +13007,7 @@ return
             let block = Block {
                 round: Round(256),
                 state_proof_tracking: spt_value_with_next(next, &root, weight),
-                proposer: Address([0x55u8; 32]),
+                proposer: TEST_PROPOSER,
                 ..make_empty_block_with_protocol(
                     Address([3u8; 32]),
                     algo_types::consensus::CONSENSUS_V41,
@@ -13028,7 +13034,7 @@ return
         let block = Block {
             round: Round(256),
             state_proof_tracking: spt_value_with_next(768, &root, weight),
-            proposer: Address([0x55u8; 32]),
+            proposer: TEST_PROPOSER,
             ..make_empty_block_with_protocol(
                 Address([3u8; 32]),
                 algo_types::consensus::CONSENSUS_V41,
@@ -13062,7 +13068,7 @@ return
         let block = |next| Block {
             round: Round(1172),
             state_proof_tracking: spt_value_with_next(next, &[], 0),
-            proposer: Address([0x55u8; 32]),
+            proposer: TEST_PROPOSER,
             ..make_empty_block_with_protocol(
                 fee_sink,
                 algo_types::consensus::CONSENSUS_V41,
@@ -13089,7 +13095,7 @@ return
         let bare = |state: &mut LedgerState| {
             let block = Block {
                 round: Round(256),
-                proposer: Address([0x55u8; 32]),
+                proposer: TEST_PROPOSER,
                 ..make_empty_block_with_protocol(
                     Address([3u8; 32]),
                     algo_types::consensus::CONSENSUS_V41,
@@ -13146,6 +13152,7 @@ return
         validating.current_round = Round(299);
         let tracked = Block {
             state_proof_tracking: spt_value_with_next(768, &[], 0),
+            proposer: TEST_PROPOSER,
             ..block.clone()
         };
         let err = apply_block_validating(&mut validating, &tracked).unwrap_err();
@@ -13166,6 +13173,7 @@ return
             round: Round(1171),
             current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
             state_proof_tracking: spt_value_with_next(1024, &[], 0),
+            proposer: TEST_PROPOSER,
             ..algo_types::BlockHeader::default()
         };
         crate::store_trait::LedgerStore::put_block(
@@ -13205,6 +13213,7 @@ return
             round: Round(1171),
             current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
             state_proof_tracking: spt_value_with_next(1024, &[], 0),
+            proposer: TEST_PROPOSER,
             ..algo_types::BlockHeader::default()
         };
         crate::store_trait::LedgerStore::put_block(
@@ -13298,6 +13307,7 @@ return
         let wrong_both = Block {
             round: Round(256),
             state_proof_tracking: spt_value_with_next(1024, &[0xFFu8; 64], weight),
+            proposer: TEST_PROPOSER,
             ..make_empty_block_with_protocol(
                 Address([3u8; 32]),
                 algo_types::consensus::CONSENSUS_V41,
@@ -13315,6 +13325,7 @@ return
         let wrong_weight_and_next = Block {
             round: Round(256),
             state_proof_tracking: spt_value_with_next(1024, &root, weight + 1),
+            proposer: TEST_PROPOSER,
             ..make_empty_block_with_protocol(
                 Address([3u8; 32]),
                 algo_types::consensus::CONSENSUS_V41,
@@ -13337,6 +13348,7 @@ return
         let block = Block {
             round: Round(256),
             state_proof_tracking: spt_value(&tampered_root, weight),
+            proposer: TEST_PROPOSER,
             ..make_empty_block_with_protocol(
                 Address([3u8; 32]),
                 algo_types::consensus::CONSENSUS_V41,
@@ -13359,6 +13371,7 @@ return
         let block = Block {
             round: Round(256),
             state_proof_tracking: spt_value(&root, weight + 1),
+            proposer: TEST_PROPOSER,
             ..make_empty_block_with_protocol(
                 Address([3u8; 32]),
                 algo_types::consensus::CONSENSUS_V41,
@@ -13383,6 +13396,7 @@ return
         let block = Block {
             round: Round(256),
             state_proof_tracking: spt_value(&[0xFFu8; 64], 999_999),
+            proposer: TEST_PROPOSER,
             ..make_empty_block_with_protocol(
                 Address([3u8; 32]),
                 algo_types::consensus::CONSENSUS_V41,

@@ -43,7 +43,7 @@ use std::sync::OnceLock;
 use algo_error::AlgoError;
 use algo_types::{AccountData, Address, Block, Transaction};
 
-use crate::apply::{apply_block_impl_ex, ApplyData, ApplyMode, KvModsMap};
+use crate::apply::{apply_block_impl_ex, ApplyData, ApplyMode, ExecProbe, KvModsMap};
 use crate::eval_delta::{parse_eval_delta, EvalDelta, ValueDelta};
 use crate::recording_store::{RecordingStore, ResourceTouches};
 use crate::store_trait::LedgerStore;
@@ -850,6 +850,44 @@ pub fn scratch_execute_payset<L: LedgerStore>(
     store: &mut L,
     block: &Block,
 ) -> Result<ScratchPayset, ScratchFailure> {
+    // Input flag (reviewed, intentional): only this final epilogue apply
+    // needs the post-payset sink balance.
+    scratch_execute_with(
+        store,
+        block,
+        ExecProbe {
+            want_fee_sink_available: true,
+            ..Default::default()
+        },
+    )
+}
+
+/// Judge a peer proposal's `FeesCollected` / `Proposer` / `ProposerPayout`
+/// header fields against the pre-block state (go `validateForPayouts`, issue
+/// #1798): the whole block is evaluated in [`ApplyMode::Execute`] on a
+/// rolled-back scratch apply with only the payout validation switched on, so
+/// nothing is persisted and no other validate-mode check can reject a block
+/// go would accept. `store` must be at `block.round - 1`.
+pub fn scratch_validate_payouts<L: LedgerStore>(
+    store: &mut L,
+    block: &Block,
+) -> Result<(), ScratchFailure> {
+    scratch_execute_with(
+        store,
+        block,
+        ExecProbe {
+            validate_payouts: true,
+            ..Default::default()
+        },
+    )
+    .map(|_| ())
+}
+
+fn scratch_execute_with<L: LedgerStore>(
+    store: &mut L,
+    block: &Block,
+    mut probe: ExecProbe,
+) -> Result<ScratchPayset, ScratchFailure> {
     #[cfg(any(test, feature = "test-hooks"))]
     if test_hooks::should_fail(block.payset.len()) {
         return Err(ScratchFailure::Other(AlgoError::Ledger {
@@ -863,12 +901,6 @@ pub fn scratch_execute_payset<L: LedgerStore>(
     let invariant = ScratchInvariant::capture(store, &chain);
     let sp = store.snapshot(&[]);
     let mut ad: Vec<ApplyData> = Vec::with_capacity(block.payset.len());
-    // Input flag (reviewed, intentional): only this final epilogue apply
-    // needs the post-payset sink balance.
-    let mut probe = crate::apply::ExecProbe {
-        want_fee_sink_available: true,
-        ..Default::default()
-    };
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::apply::apply_block_impl_probe(
             store,

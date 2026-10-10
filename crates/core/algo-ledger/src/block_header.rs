@@ -262,16 +262,17 @@ pub fn fee_sink_available<L: crate::store_trait::LedgerStore>(
 
 /// The proposer payout a block should carry (go `BlockEvaluator.proposerPayout`,
 /// `ledger/eval/eval.go`): `min(floor(Payouts.Percent% * feesCollected) + bonus,
-/// feeSinkAvailable)`. `None` when payouts are disabled (go leaves
-/// `ProposerPayout` zero) or when adding the bonus overflows (go errors).
+/// feeSinkAvailable)`. `Ok(0)` when payouts are disabled (go leaves
+/// `ProposerPayout` zero); [`PayoutOverflow`] when adding the bonus overflows
+/// (go errors).
 pub fn proposer_payout(
     params: &ConsensusParams,
     fees_collected: u64,
     bonus: u64,
     fee_sink_available: u64,
-) -> Option<u64> {
+) -> Result<u64, PayoutOverflow> {
     if !params.payouts_enabled {
-        return Some(0);
+        return Ok(0);
     }
     // go's `NewPercent` panics on an improper fraction (> 100%); consensus
     // params never carry one, so clamp (identically in debug and release)
@@ -280,8 +281,47 @@ pub fn proposer_payout(
     // `NewPercent(p).DivvyAlgos(fees)`: floor(fees * p / 100), no overflow
     // for p <= 100.
     let incentive = (u128::from(fees_collected) * u128::from(percent) / 100) as u64;
-    let total = incentive.checked_add(bonus)?;
-    Some(total.min(fee_sink_available))
+    let total = incentive
+        .checked_add(bonus)
+        .ok_or(PayoutOverflow { incentive, bonus })?;
+    Ok(total.min(fee_sink_available))
+}
+
+/// go's `payout overflowed adding bonus incentive %d %d` error from
+/// `proposerPayout()`: `incentive + bonus` does not fit a uint64.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayoutOverflow {
+    pub incentive: u64,
+    pub bonus: u64,
+}
+
+impl std::fmt::Display for PayoutOverflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "payout overflowed adding bonus incentive {} {}",
+            self.incentive, self.bonus
+        )
+    }
+}
+
+impl std::error::Error for PayoutOverflow {}
+
+/// The fees a payset contributes to the header's `FeesCollected` (go
+/// `takeFee`): every top-level transaction's fee, except those paid BY the
+/// fee sink (no net algos reach the sink). The single definition used by
+/// block validation.
+pub fn payset_fees_collected(payset: &[algo_types::SignedTransaction], fee_sink: &Address) -> u64 {
+    payset
+        .iter()
+        .filter(|stx| stx.txn.sender != *fee_sink)
+        .fold(0u64, |acc, stx| acc.saturating_add(stx.txn.fee))
+}
+
+/// go's `AccountData.IsZero`: a closed (all-default) account. Shared by
+/// `recordProposal` and the payout validation.
+pub fn is_closed_account(acct: &algo_types::AccountData) -> bool {
+    *acct == algo_types::AccountData::default()
 }
 
 /// Compute the proposer bonus ("bi") for the round after `prev`.
@@ -1360,31 +1400,37 @@ mod tests {
             ..Default::default()
         };
         // floor(50% of 1001) = 500, plus bonus.
-        assert_eq!(proposer_payout(&p, 1001, 5, u64::MAX), Some(505));
+        assert_eq!(proposer_payout(&p, 1001, 5, u64::MAX), Ok(505));
         // Capped by the sink's available balance.
-        assert_eq!(proposer_payout(&p, 1001, 5, 100), Some(100));
+        assert_eq!(proposer_payout(&p, 1001, 5, 100), Ok(100));
         // Bonus overflow is an error in go.
-        assert_eq!(proposer_payout(&p, 100, u64::MAX, u64::MAX), None);
+        assert_eq!(
+            proposer_payout(&p, 100, u64::MAX, u64::MAX),
+            Err(PayoutOverflow {
+                incentive: 50,
+                bonus: u64::MAX
+            })
+        );
         // Large fees do not overflow the percentage.
         assert_eq!(
             proposer_payout(&p, u64::MAX, 0, u64::MAX),
-            Some((u128::from(u64::MAX) * 50 / 100) as u64)
+            Ok((u128::from(u64::MAX) * 50 / 100) as u64)
         );
         // 100%: all fees (plus bonus), still capped.
         let all = ConsensusParams {
             payouts_percent: 100,
             ..p.clone()
         };
-        assert_eq!(proposer_payout(&all, u64::MAX, 0, u64::MAX), Some(u64::MAX));
+        assert_eq!(proposer_payout(&all, u64::MAX, 0, u64::MAX), Ok(u64::MAX));
         assert_eq!(
             proposer_payout(&all, 1_000_000_000_000, 7, u64::MAX),
-            Some(1_000_000_000_007)
+            Ok(1_000_000_000_007)
         );
         let off = ConsensusParams {
             payouts_enabled: false,
             ..p.clone()
         };
-        assert_eq!(proposer_payout(&off, 1000, 5, 100), Some(0));
+        assert_eq!(proposer_payout(&off, 1000, 5, 100), Ok(0));
     }
 
     #[test]

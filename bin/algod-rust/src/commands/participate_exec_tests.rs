@@ -23,6 +23,7 @@
 //! so nothing go refuses is admitted or proposed.
 
 use super::*;
+use algo_agreement::BlockValidator;
 use algo_pool::traits::BlockEvaluator;
 use algo_types::{AppParams, AssetHolding, SignedTransaction, Transaction};
 use ed25519_dalek::{Signer, SigningKey};
@@ -1036,6 +1037,73 @@ fn proposer_built_block_passes_the_validating_apply() {
     let mut l = ledger.lock().unwrap();
     let err = algo_ledger::apply_block_validating(&mut *l, &block).unwrap_err();
     assert!(err.to_string().contains("is allowed"), "{err}");
+}
+
+/// The node's real proposal-validation entry point (issue #1798): the
+/// stateless validator wrapped with go's `validateForPayouts` over the ledger.
+fn payout_validator(
+    ledger: &Arc<Mutex<SqliteLedger>>,
+) -> algo_ledger::PayoutCheckingValidator<algo_agreement::StubBlockValidator> {
+    algo_ledger::PayoutCheckingValidator::new(
+        algo_agreement::StubBlockValidator::accepting(),
+        ledger.clone(),
+    )
+}
+
+/// A proposer-built block (single fees, a pooled group fee and a fee-sink
+/// sender transaction) is accepted by the validation entry point once
+/// agreement has set the proposer; an inflated payout, a forged
+/// `FeesCollected` and a missing proposer are each rejected.
+#[test]
+fn proposal_validation_entry_point_enforces_validate_for_payouts() {
+    let a = key(1);
+    let b = key(2);
+    let build = || {
+        let (ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))]);
+        eval.transaction_group(&[pay(&a, b.0, 1_000_000, None)])
+            .expect("single payment");
+        // Pooled group: the first member pays the whole 2_000 group fee.
+        let mut members = [(1_000u64, 2_000u64), (2_000, 0)].map(|(amount, fee)| {
+            let mut t = base_txn(a.0, TxnType::Pay);
+            t.receiver = b.0;
+            t.amount = amount;
+            t.fee = fee;
+            t
+        });
+        let gid = algo_codec::compute_group_id(&members);
+        for t in members.iter_mut() {
+            t.group = gid.0;
+        }
+        let group: Vec<_> = members.into_iter().map(|t| sign(t, &a.1)).collect();
+        eval.transaction_group(&group).expect("pooled group");
+        let mut block = eval.generate_block(&[]).expect("generate_block");
+        assert_eq!(block.fees_collected, 3_000);
+        assert!(block.proposer_payout > 0, "must exercise a real payout");
+        // agreement sets the proposer after generation (go `WithProposer`).
+        block.proposer = a.0;
+        (ledger, block)
+    };
+
+    let (ledger, block) = build();
+    payout_validator(&ledger)
+        .validate(&block)
+        .map(|_| ())
+        .expect("a proposer-built block must validate");
+
+    let (ledger, mut inflated) = build();
+    inflated.proposer_payout += 1;
+    let err = payout_validator(&ledger).validate(&inflated).err().unwrap();
+    assert!(err.to_string().contains("is allowed"), "{err}");
+
+    let (ledger, mut forged) = build();
+    forged.fees_collected += 1;
+    let err = payout_validator(&ledger).validate(&forged).err().unwrap();
+    assert!(err.to_string().contains("fees collected wrong"), "{err}");
+
+    let (ledger, mut orphan) = build();
+    orphan.proposer = Address::ZERO;
+    let err = payout_validator(&ledger).validate(&orphan).err().unwrap();
+    assert!(err.to_string().contains("proposer missing"), "{err}");
 }
 
 /// An empty block still pays the bonus (go computes it from `Bonus` alone),

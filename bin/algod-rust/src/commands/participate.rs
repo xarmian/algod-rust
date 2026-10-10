@@ -37,6 +37,7 @@ use algo_codec::{
 use algo_ledger::catchpoint::{get_catchpoint_stream, CatchpointError};
 use algo_ledger::participation::{restore_participation, ParticipationStore};
 use algo_ledger::store_trait::LedgerStore;
+use algo_ledger::PayoutCheckingValidator;
 use algo_ledger::{
     make_genesis_block, parse_genesis_json, populate_store, seed_account_totals_from_genesis,
     AgreementKeyManagerBridge, AgreementLedgerBridge, BlockFetcher, CatchupService, FetchError,
@@ -544,11 +545,18 @@ impl ParticipateAgreementControl {
                 None
             }
         };
-        let block_validator: Arc<BlockValidatorBridge> = Arc::new(BlockValidatorBridge::new(
-            self.resolved_genesis_id.clone(),
-            self.genesis_hash,
-            prev_timestamp,
-        ));
+        // Stateless validation plus go's `validateForPayouts` against the
+        // committed ledger (issue #1798): a peer proposal's FeesCollected /
+        // Proposer / ProposerPayout are judged before this node votes.
+        let block_validator: Arc<PayoutCheckingValidator<BlockValidatorBridge>> =
+            Arc::new(PayoutCheckingValidator::new(
+                BlockValidatorBridge::new(
+                    self.resolved_genesis_id.clone(),
+                    self.genesis_hash,
+                    prev_timestamp,
+                ),
+                self.ledger.clone(),
+            ));
 
         let random_source = RealRandomSource;
         let monitor = NoOpMonitor;
@@ -3042,7 +3050,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             self.hdr.bonus,
             fee_sink_available,
         )
-        .unwrap_or_else(|| {
+        .unwrap_or_else(|_| {
             warn!(
                 fees_collected = self.fees_collected,
                 bonus = self.hdr.bonus,
