@@ -204,7 +204,8 @@ mod tests {
         let fetch_inner = |r: u64, count: bool| -> Result<RawBlock, AlgoError> {
             let n = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             max_seen.fetch_max(n, Ordering::SeqCst);
-            // Only each worker's first fetch rendezvous; gating later ones
+            // Only the first PREFETCH_WORKERS fetches overall rendezvous (one per
+            // worker, as each blocks until all have arrived); gating later ones
             // would deadlock once fewer than PREFETCH_WORKERS rounds remain.
             if count && started.fetch_add(1, Ordering::SeqCst) < PREFETCH_WORKERS {
                 // `started` only grows, so an early waiter cannot be stranded
@@ -258,9 +259,10 @@ mod tests {
                     }
                 }
                 if r == 199 - PREFETCH_WINDOW + 1 {
-                    // First window consumed: the window must slide, letting
-                    // the workers claim rounds up to PREFETCH_WINDOW - 1
-                    // below the consumer's position.
+                    // First window consumed: the window must slide. With the
+                    // consumer at round 184 a worker may claim `next` while
+                    // 184 - next < PREFETCH_WINDOW, i.e. down to 169: 31 rounds
+                    // claimed in total, 2 * PREFETCH_WINDOW - 1.
                     wait_until("the window to slide", &|| {
                         completed.load(Ordering::SeqCst) >= 2 * window - 1
                     });
