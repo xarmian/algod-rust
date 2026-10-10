@@ -964,3 +964,226 @@ fn evaluator_without_exec_state_refuses_a_state_proof_payset() {
         1024
     );
 }
+
+// ---- #1794: the proposal header carries the ProposerPayout ----
+
+/// go `proposerPayout` with the sink read from the ledger: the fee sink's
+/// balance after the proposal's fees are paid in, minus its minimum balance.
+fn expected_payout(
+    ledger: &Arc<Mutex<SqliteLedger>>,
+    eval: &SimpleBlockEvaluator,
+    block: &algo_types::Block,
+) -> u64 {
+    let l = ledger.lock().unwrap();
+    let sink = l.get_account(&FEE_SINK).unwrap_or_default();
+    let balance = sink.micro_algos + block.fees_collected;
+    let available = balance.saturating_sub(l.min_balance_with_state(&FEE_SINK, &sink));
+    let p = &eval.consensus_params;
+    (block.fees_collected * p.payouts_percent / 100 + block.bonus).min(available)
+}
+
+/// A proposal built while payouts are enabled carries the payout go's
+/// `endOfBlock` would set (`ledger/eval/eval.go`: `eval.block.BlockHeader
+/// .ProposerPayout, err = eval.proposerPayout()`): the payouts percent of the
+/// fees the payset collected plus the header bonus, bounded by the fee sink's
+/// available balance after the payset. Before #1794 the header kept the
+/// template's 0, so Rust proposers never applied their payout.
+#[test]
+fn proposal_header_carries_the_proposer_payout() {
+    let a = key(1);
+    let b = key(2);
+    let (ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))]);
+    for amount in [1_000_000u64, 2_000_000, 3_000_000] {
+        eval.transaction_group(&[pay(&a, b.0, amount, None)])
+            .expect("payment");
+    }
+    let block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(block.fees_collected, 3_000);
+    assert!(eval.consensus_params.payouts_enabled && eval.consensus_params.payouts_percent > 0);
+    let want = expected_payout(&ledger, &eval, &block);
+    assert!(want > 0, "test must exercise a non-zero payout");
+    assert_eq!(block.proposer_payout, want);
+}
+
+/// An empty block still pays the bonus (go computes it from `Bonus` alone),
+/// read through the ledger fallback because nothing was evaluated.
+#[test]
+fn empty_proposal_pays_the_bonus_only() {
+    let a = key(1);
+    let (ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000))]);
+    let block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(block.fees_collected, 0);
+    assert!(block.bonus > 0);
+    assert_eq!(
+        block.proposer_payout,
+        expected_payout(&ledger, &eval, &block)
+    );
+    assert!(block.proposer_payout > 0);
+}
+
+/// The payout never exceeds what the fee sink can spend without closing
+/// (go `sink.AvailableBalance(&proto)`): with the sink 1 microAlgo above its
+/// minimum, only that plus the collected fees is available.
+#[test]
+fn proposer_payout_is_capped_by_the_fee_sink_available_balance() {
+    let a = key(1);
+    let b = key(2);
+    let (ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))]);
+    let min = {
+        let mut l = ledger.lock().unwrap();
+        let min = l.min_balance_with_state(&FEE_SINK, &AccountData::default());
+        l.set_account(&FEE_SINK, funded(min + 1));
+        min
+    };
+    eval.transaction_group(&[pay(&a, b.0, 1_000_000, None)])
+        .expect("payment");
+    let block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(block.fees_collected, 1_000);
+    assert!(min + 1 < 10_000_000, "min balance read from the ledger");
+    assert_eq!(block.proposer_payout, 1_001, "sink surplus 1 + fees 1000");
+    assert_eq!(
+        block.proposer_payout,
+        expected_payout(&ledger, &eval, &block)
+    );
+    assert!(
+        block.fees_collected * eval.consensus_params.payouts_percent / 100 + block.bonus
+            > block.proposer_payout,
+        "the cap, not the formula, bounds the payout"
+    );
+}
+
+/// A sink below its minimum balance has nothing available: payout 0.
+#[test]
+fn proposer_payout_is_zero_when_the_sink_is_below_its_minimum_balance() {
+    let a = key(1);
+    let b = key(2);
+    let (ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))]);
+    ledger.lock().unwrap().set_account(&FEE_SINK, funded(1));
+    // Fees (1000) do not lift a 1 microAlgo sink above its minimum either.
+    eval.transaction_group(&[pay(&a, b.0, 1_000_000, None)])
+        .expect("payment");
+    let block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(block.proposer_payout, 0);
+    // Same through the empty-payset ledger fallback.
+    let (ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000))]);
+    ledger.lock().unwrap().set_account(&FEE_SINK, funded(1));
+    let block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(block.proposer_payout, 0);
+}
+
+/// A payset trimmed to the byte limit before the header is built pays out on
+/// the fees of the groups that were kept, with the sink balance after them.
+#[test]
+fn trimmed_payset_pays_out_on_the_kept_fees_only() {
+    let a = key(1);
+    let b = key(2);
+    let d = key(7);
+    let (ledger, mut eval) = evaluator(&[
+        (a.0, funded(50_000_000)),
+        (b.0, funded(1_000_000)),
+        (d.0, funded(5_000_000)),
+    ]);
+    let plain = pay(&a, b.0, 2_000_000, None);
+    let closing = pay(&d, a.0, 0, Some(a.0));
+    let mut sizes = 0usize;
+    for stx in [&plain, &closing] {
+        let mut stib = stx.clone();
+        eval.genesis_rule().strip(&mut stib);
+        sizes += canonical_encode_signed_txn_in_block(&stib).len();
+    }
+    eval.max_txn_bytes = sizes;
+    eval.transaction_group(&[plain]).unwrap();
+    eval.transaction_group(&[closing]).unwrap();
+    let block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(block.payset.len(), 1, "the closing group was trimmed");
+    assert_eq!(block.fees_collected, 1_000);
+    assert_eq!(
+        block.proposer_payout,
+        expected_payout(&ledger, &eval, &block)
+    );
+    assert!(block.proposer_payout > 0);
+}
+
+/// go errors when `incentive + Bonus` overflows; a Rust proposer proposes
+/// payout 0 instead (a lower payout is always accepted).
+#[test]
+fn bonus_overflow_proposes_a_zero_payout() {
+    let a = key(1);
+    let b = key(2);
+    let (_ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))]);
+    eval.hdr.bonus = u64::MAX;
+    eval.transaction_group(&[pay(&a, b.0, 1_000_000, None)])
+        .expect("payment");
+    let block = eval.generate_block(&[]).expect("must still propose");
+    assert_eq!(block.proposer_payout, 0);
+}
+
+/// The per-group overlay evaluation never asks for the sink balance.
+#[test]
+fn per_group_probe_does_not_read_the_fee_sink() {
+    let p = algo_ledger::apply::ExecProbe::default();
+    assert!(!p.want_fee_sink_available && p.final_fee_sink_available.is_none());
+}
+
+/// Hand-computed from go's `proposerPayout` (independent of any helper).
+/// V41: Payouts.Percent = 50, genesis fee sink = 10_000_000, min balance =
+/// 100_000. Three payments at the 1_000 min fee collect 3_000.
+///   * bonus 1_234:  floor(3_000 * 50 / 100) + 1_234 = 1_500 + 1_234 = 2_734
+///     (sink available 10_000_000 + 3_000 - 100_000 = 9_903_000, not binding)
+///   * bonus 20_000_000: 1_500 + 20_000_000 = 20_001_500 > 9_903_000, so the
+///     sink cap wins: 9_903_000.
+#[test]
+fn proposer_payout_golden_values() {
+    for (bonus, want) in [(1_234u64, 2_734u64), (20_000_000, 9_903_000)] {
+        let a = key(1);
+        let b = key(2);
+        let (_l, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))]);
+        eval.hdr.bonus = bonus;
+        for amount in [1_000_000u64, 2_000_000, 3_000_000] {
+            eval.transaction_group(&[pay(&a, b.0, amount, None)])
+                .unwrap();
+        }
+        let block = eval.generate_block(&[]).unwrap();
+        assert_eq!(block.fees_collected, 3_000);
+        assert_eq!(block.proposer_payout, want, "bonus {bonus}");
+    }
+}
+
+/// Fallback path (no exec state): the sink's deficit must not turn positive
+/// when fees are added. Min balance 100_000, sink balance 1, fees 5_000:
+/// (1 + 5_000) - 100_000 saturates to 0, so the payout is 0.
+#[test]
+fn fallback_sink_deficit_is_not_cured_by_fees() {
+    let a = key(1);
+    let (ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000))]);
+    ledger.lock().unwrap().set_account(&FEE_SINK, funded(1));
+    eval.exec = None;
+    eval.fees_collected = 5_000;
+    let block = eval.generate_block(&[]).unwrap();
+    assert_eq!(block.proposer_payout, 0);
+}
+
+/// Fallback path: a payset transaction that touches the fee sink (here the
+/// sink as sender) has effects beyond `fees_collected` that the fallback
+/// cannot see, so it proposes payout 0 (go accepts any lower payout).
+#[test]
+fn fallback_payout_is_zero_when_the_payset_touches_the_fee_sink() {
+    let a = key(1);
+    let (_ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000))]);
+    eval.exec = None;
+    let mut t = base_txn(FEE_SINK, TxnType::Pay);
+    t.receiver = a.0;
+    t.amount = 1;
+    let mut stx = SignedTransaction {
+        txn: t,
+        ..Default::default()
+    };
+    eval.genesis_rule().strip(&mut stx);
+    eval.included_txns.push(stx);
+    let block = eval.generate_block(&[]).unwrap();
+    assert_eq!(block.proposer_payout, 0);
+    // Control: the same evaluator without that transaction pays the bonus.
+    let (_l, mut eval) = evaluator(&[(a.0, funded(50_000_000))]);
+    eval.exec = None;
+    assert!(eval.generate_block(&[]).unwrap().proposer_payout > 0);
+}

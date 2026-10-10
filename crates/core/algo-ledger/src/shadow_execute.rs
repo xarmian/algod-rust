@@ -818,6 +818,10 @@ pub struct ScratchPayset {
     /// applied, `None` when none was (the template value stands). The proposed
     /// header must carry `n` (issue #1791).
     pub final_state_proof_next: Option<u64>,
+    /// The fee sink's available balance after the payset (go
+    /// `proposerPayout()`'s `sink.AvailableBalance`), the cap on the proposed
+    /// `ProposerPayout` (issue #1794).
+    pub final_fee_sink_available: Option<u64>,
 }
 
 /// Why [`scratch_execute_payset`] did not produce a result.
@@ -859,7 +863,12 @@ pub fn scratch_execute_payset<L: LedgerStore>(
     let invariant = ScratchInvariant::capture(store, &chain);
     let sp = store.snapshot(&[]);
     let mut ad: Vec<ApplyData> = Vec::with_capacity(block.payset.len());
-    let mut probe = crate::apply::ExecProbe::default();
+    // Input flag (reviewed, intentional): only this final epilogue apply
+    // needs the post-payset sink balance.
+    let mut probe = crate::apply::ExecProbe {
+        want_fee_sink_available: true,
+        ..Default::default()
+    };
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::apply::apply_block_impl_probe(
             store,
@@ -891,6 +900,7 @@ pub fn scratch_execute_payset<L: LedgerStore>(
             apply_data: ad,
             final_txn_counter: probe.final_txn_counter,
             final_state_proof_next: probe.final_state_proof_next,
+            final_fee_sink_available: probe.final_fee_sink_available,
         }),
     }
 }

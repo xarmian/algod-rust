@@ -1604,6 +1604,9 @@ struct ExecState {
     /// payset `finalize_payset` kept (go `cow.GetStateProofNextRound()` at
     /// `endOfBlock`); `None` while no payset has been evaluated (issue #1791).
     final_state_proof_next: Option<u64>,
+    /// The fee sink's available balance after the kept payset (go
+    /// `proposerPayout()`); `None` while no payset has been evaluated.
+    final_fee_sink_available: Option<u64>,
 }
 
 impl SimpleBlockEvaluator {
@@ -2054,6 +2057,7 @@ impl SimpleBlockEvaluator {
         // Reset first: an empty payset must not leave the previous call's
         // value behind for `generate_block` to read (issue #1791).
         exec.final_state_proof_next = None;
+        exec.final_fee_sink_available = None;
         if pristine.is_empty() {
             return Ok((pristine, 0));
         }
@@ -2064,6 +2068,7 @@ impl SimpleBlockEvaluator {
         let mut retried = false;
         let mut bisected = false;
         let mut final_state_proof_next = None;
+        let mut final_fee_sink_available = None;
         let result = loop {
             passes += 1;
             let result = self.scratch_pass(&template, &pristine, &groups)?;
@@ -2086,6 +2091,7 @@ impl SimpleBlockEvaluator {
                         self.txn_bytes = total;
                         let counted = done.final_txn_counter.saturating_sub(self.hdr.txn_counter);
                         final_state_proof_next = done.final_state_proof_next;
+                        final_fee_sink_available = done.final_fee_sink_available;
                         break (payset, counted);
                     }
                     // Largest fitting prefix of groups, from the sizes just
@@ -2179,6 +2185,7 @@ impl SimpleBlockEvaluator {
         if let Some(exec) = self.exec.as_mut() {
             exec.last_passes = passes;
             exec.final_state_proof_next = final_state_proof_next;
+            exec.final_fee_sink_available = final_fee_sink_available;
         }
         if result.0.is_empty() {
             self.txn_bytes = 0;
@@ -2976,6 +2983,74 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             None => self.hdr.state_proof_tracking.clone(),
         };
 
+        // The proposer payout (go `endOfBlock` -> `proposerPayout()`, issue
+        // #1794): `min(Percent% of FeesCollected + Bonus, fee sink available)`.
+        // Agreement zeroes it in `finish_block` when the proposer turns out
+        // ineligible. The sink's available balance is the post-payset value
+        // the scratch apply saw; with nothing evaluated (empty payset, or no
+        // exec state) it is read from the ledger tip plus the fees the payset
+        // pays into the sink.
+        let fee_sink_available = match self.exec.as_ref().and_then(|e| e.final_fee_sink_available) {
+            Some(v) => v,
+            None => {
+                let ledger = self
+                    .ledger
+                    .lock()
+                    .map_err(|e| algo_error::AlgoError::Ledger {
+                        message: format!("ledger lock poisoned: {e}"),
+                    })?;
+                // The balances are only meaningful at the evaluator's base
+                // round (`hdr.round - 1`). If the tip moved the proposal is
+                // stale anyway; a lower payout is always accepted, so claim
+                // nothing.
+                let sink = self.hdr.fee_sink;
+                let touches_sink = payset.iter().any(|stx| {
+                    stx.txn.sender == sink
+                        || stx.txn.receiver == sink
+                        || stx.txn.close_remainder_to == sink
+                });
+                if ledger.current_round().0.saturating_add(1) != self.hdr.round.0 {
+                    debug!(
+                        tip = ledger.current_round().0,
+                        round = self.hdr.round.0,
+                        "ledger tip is not the evaluator base round; proposing payout 0"
+                    );
+                    0
+                } else if touches_sink {
+                    // Without exec state the sink's post-payset balance is
+                    // unknown beyond the fees; a payset transaction that
+                    // moves the sink (sender, receiver, close-to) makes the
+                    // fees-only estimate wrong. Fail safe: payout 0.
+                    debug!("payset touches the fee sink; proposing payout 0");
+                    0
+                } else {
+                    algo_ledger::block_header::fee_sink_available(
+                        &*ledger,
+                        &sink,
+                        self.fees_collected,
+                    )
+                }
+            }
+        };
+        // Deliberate (reviewed): go errors when `incentive + Bonus` overflows;
+        // the proposer-safe
+        // answer is a payout of 0 (go accepts any payout at or below the
+        // allowance), so the node still proposes.
+        let proposer_payout = algo_ledger::block_header::proposer_payout(
+            &self.consensus_params,
+            self.fees_collected,
+            self.hdr.bonus,
+            fee_sink_available,
+        )
+        .unwrap_or_else(|| {
+            warn!(
+                fees_collected = self.fees_collected,
+                bonus = self.hdr.bonus,
+                "proposer payout overflowed adding the bonus; proposing payout 0"
+            );
+            0
+        });
+
         // Compute the expired-participation-accounts sweep list (issue #526).
         // Mirrors go's `generateKnockOfflineAccountsList`'s expiry half
         // (`ledger/eval/eval.go`), invoked as part of the proposer's own
@@ -3072,6 +3147,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             },
             payset,
             state_proof_tracking,
+            proposer_payout,
             ..header_block(&self.hdr)
         };
 
@@ -3552,6 +3628,7 @@ impl PoolLedgerAdapter {
                 incomplete: false,
                 last_passes: 0,
                 final_state_proof_next: None,
+                final_fee_sink_available: None,
             }
         };
 
@@ -9866,6 +9943,15 @@ mod tests {
         let fee_sink = Address([0x11; 32]);
         let rewards_pool = Address([0x22; 32]);
         let proposer = Address([0x33; 32]);
+        // The ledger tip is the evaluator's base round (hdr.round - 1).
+        ledger.lock().unwrap().set_current_round(Round(499));
+        ledger.lock().unwrap().set_account(
+            &fee_sink,
+            AccountData {
+                micro_algos: 1_000_000,
+                ..Default::default()
+            },
+        );
 
         let mut eval = SimpleBlockEvaluator {
             hdr: BlockHeader {
@@ -9930,9 +10016,12 @@ mod tests {
             block.fees_collected, 12345,
             "fees_collected should be propagated"
         );
+        // Issue #1794: the payout is recomputed from the block (go
+        // `proposerPayout()`), not copied from the template header:
+        // floor(50% of 12345) + bonus 99, within the sink's available balance.
         assert_eq!(
-            block.proposer_payout, 6789,
-            "proposer_payout should be propagated"
+            block.proposer_payout, 6_271,
+            "proposer_payout is derived from fees_collected and bonus"
         );
     }
 

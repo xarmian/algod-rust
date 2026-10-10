@@ -7062,6 +7062,54 @@ mod tests {
         );
     }
 
+    /// Issue #1794 regression (CI "Live parity", `block.pp: go=<missing>
+    /// rust=1000` at round 1): a dev-mode block has no proposer, and go's
+    /// `writeDevmodeBlock` zeroes `ProposerPayout` when the proposer is unset
+    /// (`node/node.go`: "Zero out payouts if Proposer not set"). Fees are
+    /// still collected, but the header must carry no payout.
+    #[tokio::test]
+    async fn dev_block_without_a_proposer_carries_no_proposer_payout() {
+        use algo_types::{Round, Transaction, TxnType};
+        use ed25519_dalek::SigningKey;
+
+        let sender_key = SigningKey::from_bytes(&[0x78u8; 32]);
+        let sender = Address(sender_key.verifying_key().to_bytes());
+        let (adapter, ledger, gh) = seed_dev_adapter(sender, 10_000_000);
+        // A funded fee sink, as on a real network, so a payout is possible.
+        ledger.lock().unwrap().set_account(
+            &Address([0xFEu8; 32]),
+            algo_types::AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+        let txn = Transaction {
+            txn_type: TxnType::Pay,
+            sender,
+            receiver: Address([0x89u8; 32]),
+            amount: 1_000_000,
+            fee: 1000,
+            first_valid: Round(1),
+            last_valid: Round(1000),
+            genesis_hash: gh,
+            ..Default::default()
+        };
+        adapter
+            .broadcast_signed_tx_group(vec![sign_txn(&txn, &sender_key)])
+            .await
+            .expect("dev broadcast");
+        let bytes = ledger
+            .lock()
+            .unwrap()
+            .get_block_data(1)
+            .expect("read block")
+            .expect("block present");
+        let block = algo_codec::decode_block(&bytes).expect("decode block");
+        assert_eq!(block.fees_collected, 1000);
+        assert!(block.proposer.is_zero());
+        assert_eq!(block.proposer_payout, 0);
+    }
+
     /// Debug profiling settings start at `(0, 0)` and round-trip per provided
     /// rate, returning the previous value only for rates that were set — matching
     /// go's `PutDebugSettingsProf`.
