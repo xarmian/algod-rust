@@ -3225,23 +3225,24 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                                 })?;
                         if ledger.current_round().0.saturating_add(1) != self.hdr.round.0 {
                             algo_ledger::apply::KnockOfflineLists::default()
-                        } else if touched.is_empty() {
-                            algo_ledger::apply::knock_offline_lists(
-                                &*ledger,
-                                self.hdr.round.0,
-                                &self.consensus_params,
-                                &own_addresses,
-                                &[],
-                            )
                         } else {
-                            let mut exclude: std::collections::HashSet<algo_types::Address> =
-                                (*own_addresses).clone();
-                            exclude.extend(touched);
+                            // Own addresses plus everything the payset touched,
+                            // built once (borrowed as is when nothing was touched).
+                            let extended;
+                            let exclude: &std::collections::HashSet<algo_types::Address> =
+                                if touched.is_empty() {
+                                    &own_addresses
+                                } else {
+                                    let mut set = (*own_addresses).clone();
+                                    set.extend(touched);
+                                    extended = set;
+                                    &extended
+                                };
                             algo_ledger::apply::knock_offline_lists(
                                 &*ledger,
                                 self.hdr.round.0,
                                 &self.consensus_params,
-                                &exclude,
+                                exclude,
                                 &[],
                             )
                         }

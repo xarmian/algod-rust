@@ -647,7 +647,7 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
             .balance_round_total_online_stake(balance_round, vote_rnd)
     }
 
-    fn absence_history_uncertain(&self, balance_round: u64) -> bool {
+    fn absence_history_uncertain(&self, balance_round: u64) -> Result<bool, AlgoError> {
         self.inner.absence_history_uncertain(balance_round)
     }
 }

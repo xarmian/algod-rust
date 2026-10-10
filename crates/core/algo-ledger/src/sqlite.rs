@@ -2202,23 +2202,25 @@ impl Drop for ReadSnapshot {
 }
 
 /// A single-entry cache of the rewards level of one committed block header.
-/// The `(round, level)` pair lives behind one lock so concurrent users can
-/// never observe a mismatched pair; only committed headers are ever stored
-/// (a header written by an in-flight block that may still be rolled back must
-/// not be cached).
+/// The `(round, level)` pair is one `Cell` value, written and read as a unit, so
+/// a reader can never observe a round with another round's level; `Cell` is
+/// not `Sync`, so the compiler (not a lock) guarantees it is never shared
+/// across threads (a `SqliteLedger` is used behind its owner's mutex). Only
+/// committed headers are ever stored (a header written by an in-flight block
+/// that may still be rolled back must not be cached).
 #[derive(Debug, Default)]
-pub(crate) struct RewardsLevelCache(std::sync::Mutex<Option<(u64, u64)>>);
+pub(crate) struct RewardsLevelCache(std::cell::Cell<Option<(u64, u64)>>);
 
 impl RewardsLevelCache {
     pub(crate) fn get(&self, round: u64) -> Option<u64> {
-        match *self.0.lock().unwrap_or_else(|e| e.into_inner()) {
+        match self.0.get() {
             Some((r, level)) if r == round => Some(level),
             _ => None,
         }
     }
 
     pub(crate) fn put(&self, round: u64, level: u64) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some((round, level));
+        self.0.set(Some((round, level)));
     }
 }
 
@@ -8068,7 +8070,13 @@ impl LedgerStore for SqliteLedger {
 
     /// True while `balance_round` is below the tip at which a legacy database's
     /// synthetic history rows were made (see `backfill_legacy_online_history`).
-    fn absence_history_uncertain(&self, balance_round: u64) -> bool {
+    ///
+    /// Applies to legacy-upgraded nodes only (for ~one lookback window, 320
+    /// rounds, after the upgrade): a fresh, catchpoint-imported or already
+    /// backfilled-and-aged database has marker 0 and is never uncertain. A
+    /// database error is an error, not "certain": the caller must not run the
+    /// strict test against rows that may be synthetic.
+    fn absence_history_uncertain(&self, balance_round: u64) -> Result<bool, AlgoError> {
         let since: Option<i64> = self
             .conn
             .query_row(
@@ -8077,8 +8085,10 @@ impl LedgerStore for SqliteLedger {
                 |row| row.get(0),
             )
             .optional()
-            .unwrap_or(None);
-        since.is_some_and(|since| since > 0 && balance_round < since as u64)
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("read onlinebackfill marker error: {e}"),
+            })?;
+        Ok(since.is_some_and(|since| since > 0 && balance_round < since as u64))
     }
 
     /// go's `OnlineCirculation(balanceRound, round)` on the history basis: the
@@ -15462,6 +15472,15 @@ mod tests {
             online_accounts: vec![online_account],
             online_round_params: params,
         };
+        // A marker left by an earlier legacy backfill (synthetic history).
+        ledger
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('onlinebackfill', 9000)",
+                [],
+            )
+            .unwrap();
+        assert!(ledger.absence_history_uncertain(tip + 1 - 320).unwrap());
         let mut importer =
             CatchpointImporter::new(&ledger.conn, "5000#TEST".to_string(), REWARD_UNITS);
         importer.prepare_staging().unwrap();
@@ -15484,6 +15503,8 @@ mod tests {
         importer.atomic_cutover(&header).unwrap();
 
         let brnd = tip + 1 - 320;
+        // The imported history is real go data: the marker no longer applies.
+        assert!(!ledger.absence_history_uncertain(brnd).unwrap());
         // A catchpoint-synced node also holds the lookback window's headers.
         ledger.put_block_header_fixture(brnd, 0).unwrap();
         assert!(ledger.online_supply_at_round(brnd).unwrap().is_some());
@@ -15513,30 +15534,18 @@ mod tests {
         );
     }
 
-    /// The rewards-level cache keeps `(round, level)` pairs intact under
-    /// concurrent writers: every reader sees a level that belongs to the round
-    /// it asked about.
+    /// The rewards-level cache returns a level only for the round it was stored
+    /// for, and a later `put` replaces the pair as a unit.
     #[test]
-    fn rewards_level_cache_never_returns_a_mismatched_pair() {
-        let cache = std::sync::Arc::new(RewardsLevelCache::default());
-        let mut handles = Vec::new();
-        for t in 0..4u64 {
-            let cache = cache.clone();
-            handles.push(std::thread::spawn(move || {
-                for i in 0..20_000u64 {
-                    let round = (i % 64) + t * 1000;
-                    cache.put(round, round * 10 + 7);
-                    for probe in [round, (i % 64) + ((t + 1) % 4) * 1000] {
-                        if let Some(level) = cache.get(probe) {
-                            assert_eq!(level, probe * 10 + 7, "mismatched pair for {probe}");
-                        }
-                    }
-                }
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
+    fn rewards_level_cache_keeps_the_round_level_pair_together() {
+        let cache = RewardsLevelCache::default();
+        assert_eq!(cache.get(1), None);
+        cache.put(1, 10);
+        assert_eq!(cache.get(1), Some(10));
+        assert_eq!(cache.get(2), None);
+        cache.put(2, 20);
+        assert_eq!(cache.get(1), None, "the old round's entry is gone");
+        assert_eq!(cache.get(2), Some(20));
     }
 
     fn header_with_level(round: u64, level: u64) -> Vec<u8> {
@@ -15662,8 +15671,8 @@ mod tests {
             "one synthetic row per online account"
         );
         let brnd = 401 - 320;
-        assert!(ledger.absence_history_uncertain(brnd));
-        assert!(!ledger.absence_history_uncertain(400));
+        assert!(ledger.absence_history_uncertain(brnd).unwrap());
+        assert!(!ledger.absence_history_uncertain(400).unwrap());
         ledger.put_block_header_fixture(brnd, 0).unwrap();
         assert_eq!(
             ledger
@@ -15715,7 +15724,7 @@ mod tests {
             ledger.set_current_round(Round(r));
             ledger.commit_block().unwrap();
         }
-        assert!(!ledger.absence_history_uncertain(401));
+        assert!(!ledger.absence_history_uncertain(401).unwrap());
         let l = lists(&ledger, 721, &consensus_v41(), &Default::default(), &[]);
         assert_eq!(
             l.absent,
@@ -15739,8 +15748,58 @@ mod tests {
             )
             .unwrap();
         assert_eq!(marker, 0);
-        assert!(!ledger.absence_history_uncertain(0));
-        assert!(!ledger.absence_history_uncertain(1_000_000));
+        assert!(!ledger.absence_history_uncertain(0).unwrap());
+        assert!(!ledger.absence_history_uncertain(1_000_000).unwrap());
+    }
+
+    /// A database error reading the marker is an error, never "certain": the
+    /// validating path fails closed and the proposer lists nobody by lag.
+    #[test]
+    fn marker_read_error_is_not_treated_as_certain() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        set_online(&mut ledger, &Address([9u8; 32]), absent_acct(1));
+        ledger.put_online_supply_at_round(0, 5_000_000).unwrap();
+        assert_eq!(
+            lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]).absent,
+            vec![Address([9u8; 32])],
+            "sanity: listed while the marker is readable"
+        );
+        ledger.conn.execute("DROP TABLE acctrounds", []).unwrap();
+        assert!(ledger.absence_history_uncertain(0).is_err());
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
+        assert!(l.absent.is_empty(), "proposer: undecidable, nobody listed");
+        let block = algo_types::Block {
+            round: Round(101),
+            current_protocol: algo_types::CONSENSUS_V41.to_string(),
+            absent_participation_accounts: Some(vec![Address([9u8; 32])]),
+            ..algo_types::Block::default()
+        };
+        assert!(
+            crate::apply::validate_absent_online_accounts(&ledger, &block, &consensus_v41(), true)
+                .is_err(),
+            "validator: fails closed"
+        );
+    }
+
+    /// Protocols v31-v39 have `payouts_max_mark_absent == 0`: like go
+    /// (`GetKnockOfflineCandidates` is only consulted when suspensions are
+    /// enabled) the online set is not a candidate source, so an untouched
+    /// expired account is not listed, while one the block touches still is.
+    #[test]
+    fn untouched_expired_accounts_are_not_listed_when_suspensions_are_disabled() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V39,
+        )
+        .expect("v39 params");
+        assert_eq!(consensus.payouts_max_mark_absent, 0);
+        assert!(consensus.max_proposed_expired_online_accounts > 0);
+        let untouched = Address([1u8; 32]);
+        let touched = Address([2u8; 32]);
+        ledger.set_account(&untouched, keyed_acct(AccountStatus::Online, 50));
+        ledger.set_account(&touched, keyed_acct(AccountStatus::Online, 50));
+        let l = lists(&ledger, 101, &consensus, &Default::default(), &[touched]);
+        assert_eq!(l.expired, vec![touched]);
     }
 
     // -- Issue #1758: rollback / failed commit restore the in-memory chain state --

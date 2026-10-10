@@ -725,7 +725,12 @@ pub trait LedgerStore {
     /// the proposer lists nobody by lag and the validator skips the test
     /// rather than rejecting. `false` for every ledger whose history was
     /// maintained from its start. Issue #1795.
-    fn absence_history_uncertain(&self, balance_round: u64) -> bool;
+    ///
+    /// Scope: legacy-upgraded databases only, for about one lookback window
+    /// (320 rounds) after the upgrade; the validator then skips ONLY the
+    /// stake-lag test (status, eligibility and the challenge test still apply).
+    /// A database error is an `Err` (never "certain").
+    fn absence_history_uncertain(&self, balance_round: u64) -> Result<bool, AlgoError>;
 
     /// Store a voters snapshot -- `(voters_commitment, online_total_weight)`
     /// -- keyed by the round it was taken at (go's `votersForRoundCache` map

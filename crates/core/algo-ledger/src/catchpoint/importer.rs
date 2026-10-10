@@ -528,7 +528,7 @@ impl<'a> CatchpointImporter<'a> {
         // Step 2: capture prior acctrounds rows, then reconstruct.
         {
             let mut stmt =
-                tx.prepare("SELECT id, rnd FROM acctrounds WHERE id IN ('acctbase', 'hashbase')")?;
+                tx.prepare("SELECT id, rnd FROM acctrounds WHERE id IN ('acctbase', 'hashbase', 'onlinebackfill')")?;
             let mut rows = stmt.query([])?;
             while let Some(row) = rows.next()? {
                 let id: String = row.get(0)?;
@@ -543,6 +543,13 @@ impl<'a> CatchpointImporter<'a> {
         tx.execute(
             "INSERT OR REPLACE INTO acctrounds(id, rnd) VALUES('hashbase', ?1)",
             rusqlite::params![round],
+        )?;
+        // The imported `onlineaccounts` rows and supply tail are real go data:
+        // any marker left by a legacy-database backfill (synthetic history,
+        // `SqliteLedger::absence_history_uncertain`) no longer applies.
+        tx.execute(
+            "INSERT OR REPLACE INTO acctrounds(id, rnd) VALUES('onlinebackfill', 0)",
+            [],
         )?;
 
         // Step 3: capture prior account totals, then write the new ones
@@ -736,7 +743,7 @@ impl<'a> CatchpointImporter<'a> {
         // reinstate whatever was captured (nothing, if the row didn't
         // exist before — i.e. a fresh, never-synced database).
         tx.execute(
-            "DELETE FROM acctrounds WHERE id IN ('acctbase', 'hashbase')",
+            "DELETE FROM acctrounds WHERE id IN ('acctbase', 'hashbase', 'onlinebackfill')",
             [],
         )?;
         for (id, rnd) in &backup.old_acctrounds {

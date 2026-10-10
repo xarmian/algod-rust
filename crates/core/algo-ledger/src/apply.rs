@@ -1943,17 +1943,42 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
     let brnd = algo_agreement::balance_round(algo_types::Round(round), consensus);
     // Synthetic history rows (legacy-database upgrade): go's stake figures
     // cannot be reproduced yet, so nobody is listed by lag.
-    let history_uncertain = max_absent > 0 && store.absence_history_uncertain(brnd.0);
-    if history_uncertain {
-        note_undecidable_absence(
-            round,
-            brnd.0,
-            &AlgoError::Ledger {
-                message: "online-account history was synthesized at upgrade".to_string(),
-            },
-        );
-    }
+    // A marker read error is also "uncertain": never decide on rows that may
+    // be synthetic.
+    let history_uncertain = max_absent > 0
+        && match store.absence_history_uncertain(brnd.0) {
+            Ok(false) => false,
+            Ok(true) => {
+                note_undecidable_absence(
+                    round,
+                    brnd.0,
+                    &AlgoError::Ledger {
+                        message: "online-account history was synthesized at upgrade".to_string(),
+                    },
+                );
+                true
+            }
+            Err(e) => {
+                note_undecidable_absence(round, brnd.0, &e);
+                true
+            }
+        };
+    // go computes `onlineStake()` up front whenever it checks absences, and a
+    // block it cannot compute it for fails: so nothing is listed (challenge
+    // failures included) unless the total can be determined. Fetched lazily
+    // at the first account that would be listed.
     let mut total_cache: Option<Option<u64>> = None;
+    let mut total = |store: &L| -> Option<u64> {
+        *total_cache.get_or_insert_with(|| {
+            match store.balance_round_total_online_stake(brnd.0, round) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    note_undecidable_absence(round, brnd.0, &e);
+                    None
+                }
+            }
+        })
+    };
     let challenge = if max_absent > 0 {
         let provider = crate::heartbeat::StoreHeaderProvider { store };
         crate::heartbeat::find_challenge(
@@ -1993,7 +2018,9 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
         // never-seen account, so the (database) stake lookup is the last,
         // rarest step.
         if challenge.failed(&addr.0, last_seen) {
-            lists.absent.push(addr);
+            if total(store).is_some() {
+                lists.absent.push(addr);
+            }
             continue;
         }
         // Cheap prefilter before any database access: the allowable lag is
@@ -2004,17 +2031,8 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
         if history_uncertain || last_seen == 0 || last_seen.saturating_add(ABSENT_FACTOR) >= round {
             continue;
         }
-        let total_online_stake = match *total_cache.get_or_insert_with(|| {
-            match store.balance_round_total_online_stake(brnd.0, round) {
-                Ok(t) => Some(t),
-                Err(e) => {
-                    note_undecidable_absence(round, brnd.0, &e);
-                    None
-                }
-            }
-        }) {
-            Some(t) => t,
-            None => continue, // undecidable: the lag test is skipped
+        let Some(total_online_stake) = total(store) else {
+            continue; // undecidable: the lag test is skipped
         };
         let stake = match lookback_voting_stake(store, round, consensus, &addr) {
             Ok(stake) => stake,
@@ -2064,10 +2082,11 @@ fn note_undecidable_absence(round: u64, balance_round: u64, err: &AlgoError) {
 /// plausibly modified, as extra [`knock_offline_lists`] candidates.
 ///
 /// This under-approximates go's `modifiedAccounts()`: accounts changed only
-/// by inner transactions or by a heartbeat's target are missing. That merely
-/// shortens the proposed expired list (an offline account with keys that only
-/// an inner transaction touched is not offered for expiry), and validators
-/// accept any valid subset, so the omission is always safe.
+/// by inner transactions are missing (heartbeat targets, freeze targets and
+/// the other named accounts are included). That merely shortens the proposed
+/// expired list (an offline account with keys that only an inner transaction
+/// touched is not offered for expiry), and validators accept any valid
+/// subset, so the omission is always safe.
 pub fn payset_touched_addresses(payset: &[algo_types::SignedTransaction]) -> Vec<Address> {
     let mut out = Vec::new();
     for stx in payset {
@@ -3042,15 +3061,25 @@ pub(crate) fn validate_absent_online_accounts<L: crate::store_trait::LedgerStore
             crate::heartbeat::ChallengePeriod::Active,
         )
     };
-    let mut total_online_stake: Option<u64> = None;
-    // Synthetic history rows (legacy-database upgrade): go's stake figures
-    // cannot be reproduced for this balance round, so the stake-based test is
-    // skipped (the eligibility and challenge checks still apply) instead of
-    // rejecting a block go accepts.
+    // Like go (`validateAbsentOnlineAccounts` computes `onlineStake()` before
+    // looking at any account), the total is fetched up front whenever the list
+    // is non-empty, so an undeterminable total rejects even a list of only
+    // challenge-failed accounts.
+    let total_online_stake = if absent.is_empty() {
+        0
+    } else {
+        lookback_total_online_stake(store, block.round.0, consensus)?
+    };
+    // Synthetic history rows (legacy-database upgrade only, for about one
+    // lookback window -- 320 rounds -- after the upgrade): go's stake figures
+    // cannot be reproduced for this balance round, so ONLY the stake-lag test
+    // is skipped (status, eligibility and the challenge test still apply)
+    // instead of rejecting a block go accepts. A marker read error propagates:
+    // the strict test is never run against rows that may be synthetic.
     let history_uncertain = !absent.is_empty()
         && store.absence_history_uncertain(
             algo_agreement::balance_round(algo_types::Round(block.round.0), consensus).0,
-        );
+        )?;
 
     // Check for duplicates and basic account eligibility for suspension.
     let mut seen = std::collections::HashSet::with_capacity(absent.len());
@@ -3089,16 +3118,8 @@ pub(crate) fn validate_absent_online_accounts<L: crate::store_trait::LedgerStore
         if history_uncertain {
             continue; // undecidable while the history is synthetic (see above)
         }
-        let total = match total_online_stake {
-            Some(t) => t,
-            None => {
-                let t = lookback_total_online_stake(store, block.round.0, consensus)?;
-                total_online_stake = Some(t);
-                t
-            }
-        };
         let acct_stake = lookback_voting_stake(store, block.round.0, consensus, addr)?;
-        if is_absent(total, acct_stake, last_seen, block.round.0) {
+        if is_absent(total_online_stake, acct_stake, last_seen, block.round.0) {
             continue; // ok. it's "normal absent"
         }
         return Err(AlgoError::Ledger {
@@ -14405,6 +14426,8 @@ return
             .put_block(2000, algo_types::consensus::CONSENSUS_V41, &hdr, &[])
             .unwrap();
         ledger.commit_block().unwrap();
+        // The balance round's header (round 2250 - 320) for the total.
+        ledger.put_block_header_fixture(1930, 0).unwrap();
         let consensus = algo_types::consensus::consensus_params_for_version(
             algo_types::consensus::CONSENSUS_V41,
         )
@@ -14429,6 +14452,57 @@ return
         block.round = Round(2250);
         validate_absent_online_accounts(&ledger, &block, &consensus, true)
             .expect("challenge-failed account validates without a snapshot");
+    }
+
+    /// go computes `onlineStake()` before looking at any account: with an
+    /// undeterminable total even a list of only challenge-failed accounts is
+    /// rejected (and the proposer, which would otherwise propose a block its
+    /// own validator rejects, lists nobody).
+    #[test]
+    fn undeterminable_total_rejects_even_challenge_only_lists() {
+        use crate::sqlite::SqliteLedger;
+        use crate::store_trait::LedgerStore;
+
+        let seed = [0xF8u8; 32];
+        let challenged = Address([0xFFu8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        // The account exists but there is NO supply snapshot and NO history.
+        ledger.set_account(
+            &challenged,
+            algo_types::AccountData {
+                micro_algos: 5_000_000,
+                status: AccountStatus::Online,
+                incentive_eligible: true,
+                vote_id: Some([1u8; 32]),
+                vote_last_valid: 1_000_000,
+                ..algo_types::AccountData::default()
+            },
+        );
+        let hdr = make_challenge_header_data(&seed, algo_types::consensus::CONSENSUS_V41);
+        ledger.begin_block().unwrap();
+        ledger
+            .put_block(2000, algo_types::consensus::CONSENSUS_V41, &hdr, &[])
+            .unwrap();
+        ledger.commit_block().unwrap();
+        ledger.put_block_header_fixture(1930, 0).unwrap();
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+        assert!(ledger.balance_round_total_online_stake(1930, 2250).is_err());
+
+        let mut block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            None,
+            Some(vec![challenged]),
+        );
+        block.round = Round(2250);
+        let err = validate_absent_online_accounts(&ledger, &block, &consensus, true).unwrap_err();
+        assert!(err.to_string().contains("cannot determine"), "{err}");
+        let lists = knock_offline_lists(&ledger, 2250, &consensus, &Default::default(), &[]);
+        assert!(lists.absent.is_empty());
     }
 
     /// Without a supply snapshot at the balance round the total is derived
