@@ -2271,6 +2271,9 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
             if ctx.validate {
                 validate_state_proof_tracking(store, &ctx, block, &consensus)?;
             }
+            if ctx.validate {
+                validate_proposer_payout(store, block, &consensus)?;
+            }
             apply_proposer_payout(store, block)?;
             record_proposal(store, block)
         })();
@@ -2964,6 +2967,46 @@ fn suspend_absent_accounts<L: crate::store_trait::LedgerStore>(
         store.set_account(addr, acct);
     }
 
+    Ok(())
+}
+
+/// Reject a block whose header `ProposerPayout` exceeds what go allows.
+///
+/// Mirrors the validate-mode tail of go's `endOfBlock`
+/// (`ledger/eval/eval.go`): `payout > proposerPayout()` fails with
+/// `proposal wants N payout, M is allowed`, where the allowance is
+/// `min(percent% * FeesCollected + Bonus, fee-sink balance above MinBalance)`
+/// evaluated on the state after the payset and before the payout moves.
+/// A payout *below* the allowance is accepted (a proposer may be altruistic).
+fn validate_proposer_payout<L: crate::store_trait::LedgerStore>(
+    store: &L,
+    block: &Block,
+    consensus: &ConsensusParams,
+) -> Result<(), AlgoError> {
+    if !consensus.payouts_enabled {
+        return Ok(());
+    }
+    let available = crate::block_header::fee_sink_available(store, &block.fee_sink, 0);
+    let allowed = crate::block_header::proposer_payout(
+        consensus,
+        block.fees_collected,
+        block.bonus,
+        available,
+    )
+    .ok_or_else(|| AlgoError::Ledger {
+        message: format!(
+            "payout overflowed adding bonus incentive {} {}",
+            block.fees_collected, block.bonus
+        ),
+    })?;
+    if block.proposer_payout > allowed {
+        return Err(AlgoError::Ledger {
+            message: format!(
+                "proposal wants {} payout, {} is allowed",
+                block.proposer_payout, allowed
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -9177,6 +9220,96 @@ mod tests {
             1_000,
             "only the payment's fee should have reached the fee sink"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Proposer payout allowance (issue #1798)
+    // ---------------------------------------------------------------------
+
+    /// A validating-mode block carrying `fees_collected = 1_000` (the test
+    /// payment's fee), the given `bonus`, `payout`, and a fee sink starting
+    /// at `sink_start`. The sink ends the payset at `sink_start + 1_000`.
+    fn payout_case(
+        sink_start: u64,
+        bonus: u64,
+        payout: u64,
+    ) -> (LedgerState, Block, Address, Address) {
+        let fee_sink = Address([3u8; 32]);
+        let proposer = Address([9u8; 32]);
+        let state = make_state_with_accounts(
+            &[
+                (Address([1u8; 32]), 10_000_000),
+                (Address([2u8; 32]), 1_000_000),
+                (fee_sink, sink_start),
+                (proposer, 1_000_000),
+            ],
+            fee_sink,
+        );
+        let mut block = make_test_block(fee_sink);
+        block.proposer = proposer;
+        block.fees_collected = 1_000;
+        block.bonus = bonus;
+        block.proposer_payout = payout;
+        (state, block, fee_sink, proposer)
+    }
+
+    /// go `endOfBlock`: `proposal wants N payout, M is allowed` when the
+    /// header payout exceeds `min(percent% * fees + bonus, sink available)`.
+    #[test]
+    fn validating_rejects_payout_above_allowance() {
+        let params = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+        let allowed = crate::block_header::proposer_payout(&params, 1_000, 0, u64::MAX).unwrap();
+        assert!(allowed > 0);
+        let (mut state, block, _, _) = payout_case(5_000_000, 0, allowed + 1);
+        let err = apply_block_validating(&mut state, &block).unwrap_err();
+        assert!(
+            err.to_string().contains(&format!(
+                "proposal wants {} payout, {} is allowed",
+                allowed + 1,
+                allowed
+            )),
+            "got: {err}"
+        );
+    }
+
+    /// Payout exactly at the allowance, and below it ("proposer can be
+    /// altruistic"), are accepted.
+    #[test]
+    fn validating_accepts_payout_at_and_below_allowance() {
+        let params = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+        let allowed = crate::block_header::proposer_payout(&params, 1_000, 0, u64::MAX).unwrap();
+        for payout in [allowed, allowed - 1, 0] {
+            let (mut state, block, _, proposer) = payout_case(5_000_000, 0, payout);
+            apply_block_validating(&mut state, &block)
+                .unwrap_or_else(|e| panic!("payout {payout} must be accepted: {e}"));
+            assert_eq!(
+                state.get_account(&proposer).unwrap().micro_algos,
+                1_000_000 + payout
+            );
+        }
+    }
+
+    /// The allowance is capped by the sink's balance above its MinBalance
+    /// (100_000): sink 150_000 + 1_000 fee leaves 51_000 available even
+    /// with a huge bonus.
+    #[test]
+    fn validating_payout_allowance_honors_sink_min_balance_floor() {
+        let (mut state, block, _, _) = payout_case(150_000, 10_000_000, 51_001);
+        let err = apply_block_validating(&mut state, &block).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("proposal wants 51001 payout, 51000 is allowed"),
+            "got: {err}"
+        );
+        let (mut state, block, fee_sink, _) = payout_case(150_000, 10_000_000, 51_000);
+        apply_block_validating(&mut state, &block).unwrap();
+        assert_eq!(state.get_account(&fee_sink).unwrap().micro_algos, 100_000);
     }
 
     // ---------------------------------------------------------------------
