@@ -702,6 +702,36 @@ pub trait LedgerStore {
     /// sortition/committee-sizing lookback.
     fn online_stake_at_round(&self, round: u64, vote_rnd: u64) -> Result<u64, AlgoError>;
 
+    /// The total online stake the absence checks divide by (go
+    /// `roundCowBase.onlineStake()` = `OnlineCirculation(balanceRound, round)`),
+    /// on the SAME time basis as [`Self::voter_agreement_data_at_round`]'s
+    /// historical rows: from the per-round supply snapshot at `balance_round`
+    /// when there is one, else derived from the `onlineaccounts` history.
+    /// Unlike [`Self::online_stake_at_round`] it never falls back to today's
+    /// aggregate; when the total cannot be determined on the historical basis
+    /// it is an `Err` (the validator rejects the block, the proposer lists no
+    /// stake-based absences). Issue #1795.
+    fn balance_round_total_online_stake(
+        &self,
+        balance_round: u64,
+        vote_rnd: u64,
+    ) -> Result<u64, AlgoError>;
+
+    /// Whether the online-account history around `balance_round` includes
+    /// rows that were synthesized from current account state when a legacy
+    /// database was upgraded, so go's stake figures cannot be reproduced for it
+    /// (an account that really went online recently reads as online for the
+    /// whole window). While true, the stake-based absence test is undecidable:
+    /// the proposer lists nobody by lag and the validator skips the test
+    /// rather than rejecting. `false` for every ledger whose history was
+    /// maintained from its start. Issue #1795.
+    ///
+    /// Scope: legacy-upgraded databases only, for about one lookback window
+    /// (320 rounds) after the upgrade; the validator then skips ONLY the
+    /// stake-lag test (status, eligibility and the challenge test still apply).
+    /// A database error is an `Err` (never "certain").
+    fn absence_history_uncertain(&self, balance_round: u64) -> Result<bool, AlgoError>;
+
     /// Store a voters snapshot -- `(voters_commitment, online_total_weight)`
     /// -- keyed by the round it was taken at (go's `votersForRoundCache` map
     /// key).

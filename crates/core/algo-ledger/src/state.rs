@@ -1712,6 +1712,28 @@ impl crate::store_trait::LedgerStore for LedgerState {
         })
     }
 
+    /// `LedgerState` keeps no per-round history: both the total
+    /// ([`Self::online_stake_at_round`]) and the per-account stake
+    /// ([`Self::voter_agreement_data_at_round`]) come from the current state,
+    /// so they share one time basis and absence is decidable over it. It is an
+    /// approximation for tests; real block apply always runs on `SqliteLedger`,
+    /// whose answers honor the round.
+    fn balance_round_total_online_stake(
+        &self,
+        balance_round: u64,
+        vote_rnd: u64,
+    ) -> Result<u64, algo_error::AlgoError> {
+        self.online_stake_at_round(balance_round, vote_rnd)
+    }
+
+    /// `LedgerState` has no history to synthesize.
+    fn absence_history_uncertain(
+        &self,
+        _balance_round: u64,
+    ) -> Result<bool, algo_error::AlgoError> {
+        Ok(false)
+    }
+
     fn online_stake_at_round(
         &self,
         _round: u64,
@@ -2637,5 +2659,38 @@ mod tests {
         let (page, more) = state.box_keys_by_prefix_paginated(100, b"", Some(b"a"), None, false);
         assert!(!more);
         assert_eq!(page, vec![(b"b".to_vec(), None)]);
+    }
+
+    /// `LedgerState` answers every round from the current state for both the
+    /// total and the per-account stake (one coherent basis), so absence is
+    /// decidable over it.
+    #[test]
+    fn ledger_state_uses_one_current_basis_for_absence() {
+        use crate::store_trait::LedgerStore;
+        let mut state = LedgerState::new();
+        let addr = Address([9u8; 32]);
+        state.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 5_000_000,
+                status: AccountStatus::Online,
+                incentive_eligible: true,
+                last_heartbeat: 1,
+                vote_id: Some([1u8; 32]),
+                vote_last_valid: 1_000_000,
+                ..AccountData::default()
+            },
+        );
+        assert_eq!(
+            state.balance_round_total_online_stake(0, 101).unwrap(),
+            5_000_000
+        );
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+        let lists =
+            crate::apply::knock_offline_lists(&state, 101, &consensus, &Default::default(), &[]);
+        assert_eq!(lists.absent, vec![addr]);
     }
 }

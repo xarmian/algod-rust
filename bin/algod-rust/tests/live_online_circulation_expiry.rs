@@ -76,7 +76,7 @@
 //! `expired_participation_accounts` when assembling its own blocks, so on
 //! algod-rust's self-produced chain the account stayed `status: "Online"`
 //! indefinitely. Issue #526 closed that gap (proposal-time computation via
-//! `SqliteLedger::expired_participation_account_candidates`, mirroring the
+//! `algo_ledger::apply::knock_offline_lists`, mirroring the
 //! expiry half of go's `generateKnockOfflineAccountsList`), so this test now
 //! asserts `status`/`online-money` on both implementations, not just the
 //! `online-stake` field #518 governs.

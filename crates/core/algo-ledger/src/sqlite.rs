@@ -2201,6 +2201,29 @@ impl Drop for ReadSnapshot {
     }
 }
 
+/// A single-entry cache of the rewards level of one committed block header.
+/// The `(round, level)` pair is one `Cell` value, written and read as a unit, so
+/// a reader can never observe a round with another round's level; `Cell` is
+/// not `Sync`, so the compiler (not a lock) guarantees it is never shared
+/// across threads (a `SqliteLedger` is used behind its owner's mutex). Only
+/// committed headers are ever stored (a header written by an in-flight block
+/// that may still be rolled back must not be cached).
+#[derive(Debug, Default)]
+pub(crate) struct RewardsLevelCache(std::cell::Cell<Option<(u64, u64)>>);
+
+impl RewardsLevelCache {
+    pub(crate) fn get(&self, round: u64) -> Option<u64> {
+        match self.0.get() {
+            Some((r, level)) if r == round => Some(level),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn put(&self, round: u64, level: u64) {
+        self.0.set(Some((round, level)));
+    }
+}
+
 pub struct SqliteLedger {
     conn: Connection,
     /// Ledger prefix for the on-disk database pair, or `None` for in-memory
@@ -2316,6 +2339,14 @@ pub struct SqliteLedger {
     /// commit considers for a new `onlineaccounts` history row, as opposed
     /// to a full sweep of every currently-online account.
     pending_online_touched: std::collections::HashSet<Address>,
+
+    /// `(round, rewards_level)` of the last COMMITTED block header consulted by
+    /// [`Self::rewards_level_at`]. The pair is a single `Cell` value read and
+    /// written as a unit, so a reader never sees a round with another round's
+    /// level; `Cell` is not `Sync`, so the compiler keeps the ledger
+    /// single-writer (it is used behind its owner's mutex, never shared across
+    /// threads). See [`RewardsLevelCache`].
+    rewards_cache: RewardsLevelCache,
 
     /// Automatic interval-driven catchpoint generation config (issue
     /// #770), set via [`Self::configure_automatic_catchpoints`]. `None`
@@ -2623,7 +2654,116 @@ impl SqliteLedger {
                 block_path.display()
             ),
         })?;
-        Self::init(conn, prefix)
+        let ledger = Self::init(conn, prefix)?;
+        ledger.backfill_legacy_online_history()?;
+        Ok(ledger)
+    }
+
+    /// Upgrade path for a database synced before the `onlineaccounts` history
+    /// was maintained at every commit (only catchpoint import populated it):
+    /// an account that went online since then is `Online` in `accountbase` but
+    /// has no history row, so it would read as stake 0 at the balance round.
+    ///
+    /// Runs once: the `acctrounds` row `onlinebackfill` is the marker that the
+    /// database has been checked. Every currently-online account with NO
+    /// history row gets one, in a single transaction together with the marker,
+    /// dated at the earliest balance round upcoming blocks can look up
+    /// (`tip + 1 - lookback`) -- the best available stake for
+    /// `voter_params_get`. The true online-since round is unknowable, so those
+    /// rows are SYNTHETIC: the marker value is the tip they were made at, and
+    /// while a balance round is below it ([`LedgerStore::absence_history_uncertain`])
+    /// the stake-based absence test is undecidable (the proposer lists nobody
+    /// by lag, the validator skips the test), because a quiet account that
+    /// really joined recently would otherwise be listed absent while go sees
+    /// stake 0. From balance round `tip` on, rows are real and the checks decide
+    /// normally. Marker value 0 means nothing was synthesized (a fresh or
+    /// catchpoint-imported database).
+    fn backfill_legacy_online_history(&self) -> Result<(), AlgoError> {
+        let done: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT rnd FROM acctrounds WHERE id = 'onlinebackfill'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("read onlinebackfill marker error: {e}"),
+            })?;
+        if done.is_some() {
+            return Ok(());
+        }
+        let tip = self.current_round.0;
+        let max_bal_lookback = algo_types::consensus::consensus_params_for_version(&self.protocol)
+            .map(|p| p.max_bal_lookback)
+            .unwrap_or(crate::catchpoint::writer::DEFAULT_MAX_BAL_LOOKBACK);
+        let row_round = (tip + 1).saturating_sub(max_bal_lookback);
+        let mut missing: Vec<(Address, AccountData)> = Vec::new();
+        if tip > 0 {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT a.address, a.data FROM accountbase a \
+                     WHERE a.normalizedonlinebalance > 0 \
+                     AND NOT EXISTS (SELECT 1 FROM onlineaccounts o WHERE o.address = a.address)",
+                )
+                .map_err(|e| AlgoError::Ledger {
+                    message: format!("prepare legacy online-history scan error: {e}"),
+                })?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(|e| AlgoError::Ledger {
+                    message: format!("query legacy online-history scan error: {e}"),
+                })?;
+            for row in rows {
+                let (addr_bytes, data) = row.map_err(|e| AlgoError::Ledger {
+                    message: format!("read legacy online-history row error: {e}"),
+                })?;
+                let addr: [u8; 32] =
+                    addr_bytes
+                        .try_into()
+                        .map_err(|v: Vec<u8>| AlgoError::Ledger {
+                            message: format!(
+                                "legacy online-history scan: bad address length {}",
+                                v.len()
+                            ),
+                        })?;
+                missing.push((Address(addr), decode_account_data(&data)?));
+            }
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("begin legacy online-history backfill error: {e}"),
+            })?;
+        for (addr, acct) in &missing {
+            self.insert_online_account_row(addr, row_round, acct)?;
+        }
+        let history_since = if missing.is_empty() { 0 } else { tip };
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('onlinebackfill', ?1)",
+                params![history_since as i64],
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("write onlinebackfill marker error: {e}"),
+            })?;
+        tx.commit().map_err(|e| AlgoError::Ledger {
+            message: format!("commit legacy online-history backfill error: {e}"),
+        })?;
+        if !missing.is_empty() {
+            tracing::warn!(
+                accounts = missing.len(),
+                tip,
+                row_round,
+                "online-account history predates this database: synthesized one row per online \
+                 account; stake-based absence is undecidable until balance round {tip}"
+            );
+        }
+        Ok(())
     }
 
     /// Open an in-memory database pair (for testing). Both the tracker and
@@ -2922,6 +3062,7 @@ impl SqliteLedger {
             group_delta_tracer: None,
             pending_totals_delta: AccountTotalsDelta::default(),
             pending_online_touched: std::collections::HashSet::new(),
+            rewards_cache: RewardsLevelCache::default(),
             catchpoint_auto: None,
             catchpoint_worker: None,
             reenable_catchpoints_round: 0,
@@ -5199,6 +5340,20 @@ impl SqliteLedger {
         self.prune_online_account_history_before(forget_before)
     }
 
+    /// Seed one `onlineaccounts` history row for `addr` at `round` (what the
+    /// live writer [`Self::record_online_account_history`] and catchpoint
+    /// import record). For tests and backfills that need an account to have
+    /// been online at a past round, e.g. before a balance-round lookback.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn put_online_account_at_round(
+        &self,
+        addr: &Address,
+        round: u64,
+        account: &AccountData,
+    ) -> Result<(), AlgoError> {
+        self.insert_online_account_row(addr, round, account)
+    }
+
     /// Insert (or replace, for an idempotent re-run within the same round) a
     /// single `onlineaccounts` history row for `addr` at `round`, keeping
     /// `normalizedonlinebalance`/`votelastvalid` in sync with `account`.
@@ -5346,7 +5501,17 @@ impl SqliteLedger {
         } else {
             self.online_stake()?
         };
+        self.exclude_expired_from_total(total, round, vote_rnd)
+    }
 
+    /// `total` less the stake of accounts whose keys are expired by `vote_rnd`
+    /// (go `onlineCirculation`'s `expiredOnlineCirculation` subtraction).
+    fn exclude_expired_from_total(
+        &self,
+        total: u64,
+        round: u64,
+        vote_rnd: u64,
+    ) -> Result<u64, AlgoError> {
         let exclude_expired = algo_types::consensus::consensus_params_for_version(&self.protocol)
             .map(|p| p.exclude_expired_circulation)
             .unwrap_or(false);
@@ -5374,6 +5539,49 @@ impl SqliteLedger {
             }
         };
         Ok(total.saturating_sub(expired))
+    }
+
+    /// The online supply at `round` derived from the `onlineaccounts`
+    /// history: the stake (rewards pending at `round`'s level folded in) of
+    /// every account whose latest row at or before `round` is a real online
+    /// row. `None` when the history holds no row at or before `round` at all
+    /// (nothing to derive from).
+    fn derive_online_supply_from_history(&self, round: u64) -> Result<Option<u64>, AlgoError> {
+        let rewards_level = self.rewards_level_at(round)?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT o.data FROM onlineaccounts o \
+                 WHERE o.updround = (SELECT MAX(i.updround) FROM onlineaccounts i \
+                                     WHERE i.address = o.address AND i.updround <= ?1)",
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("prepare derive_online_supply_from_history error: {e}"),
+            })?;
+        let rows = stmt
+            .query_map(params![round as i64], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("query derive_online_supply_from_history error: {e}"),
+            })?;
+        let mut count = 0u64;
+        let mut total: u128 = 0;
+        for row in rows {
+            let data = row.map_err(|e| AlgoError::Ledger {
+                message: format!("read derive_online_supply_from_history row error: {e}"),
+            })?;
+            count += 1;
+            let acct = decode_online_account_data(&data)?;
+            if acct.status != AccountStatus::Online {
+                continue;
+            }
+            let pending = if rewards_level >= acct.rewards_base {
+                crate::rewards::compute_pending_rewards(&acct, rewards_level)
+            } else {
+                0
+            };
+            total += acct.micro_algos as u128 + pending as u128;
+        }
+        Ok((count > 0).then_some(total.min(u64::MAX as u128) as u64))
     }
 
     /// Sum the stake -- with the rewards pending at `round`'s rewards level
@@ -5478,220 +5686,103 @@ impl SqliteLedger {
         Ok(expired_stake)
     }
 
-    /// Select up to `max_count` currently-online accounts (`accountbase`,
-    /// `normalizedonlinebalance > 0`) whose participation key has expired as
-    /// of `current_round` -- candidates for a self-produced block's
-    /// `expired_participation_accounts` header field.
-    ///
-    /// Mirrors the expiry half of go-algorand's
-    /// `generateKnockOfflineAccountsList` (`ledger/eval/eval.go`, v41): a
-    /// candidate has a nonempty vote key, a nonzero balance (go skips
-    /// `MicroAlgosWithRewards.IsZero()` -- closing accounts), and
-    /// `VoteLastValid != 0 && VoteLastValid < current_round` (`current_round`
-    /// being the round of the block being built, i.e. go's `eval.Round()`).
-    /// This covers only the expiry list, not go's absent/suspend list
-    /// (`AbsentParticipationAccounts`, gated on the payouts feature) -- that
-    /// is a separate mechanism (issue #526 is scoped to expiry only) -- and
-    /// does not exclude the node's own participating addresses, since
-    /// dev-mode block production holds no participation keys of its own.
-    ///
-    /// Selection order among more candidates than `max_count` is not
-    /// consensus-significant: go's own selection iterates a Go map, whose
-    /// iteration order is randomized per process ("different nodes may
-    /// propose different lists of addresses based on node state" -- see the
-    /// doc comment on `generateKnockOfflineAccountsList`), so any
-    /// deterministic order is equally valid here. This returns addresses in
-    /// ascending byte order for reproducible tests.
-    pub fn expired_participation_account_candidates(
+    /// Test fixture: write a minimal block header carrying `rewards_level` at
+    /// `round` (what a real block commit would have stored), for ledgers that
+    /// are built without real blocks. Not part of any consensus path.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn put_block_header_fixture(
         &self,
-        current_round: u64,
-        max_count: usize,
-    ) -> Result<Vec<Address>, AlgoError> {
-        if max_count == 0 {
-            return Ok(Vec::new());
-        }
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT address, data FROM accountbase WHERE normalizedonlinebalance > 0 \
-                 ORDER BY address",
+        round: u64,
+        rewards_level: u64,
+    ) -> Result<(), AlgoError> {
+        let hdr = algo_types::BlockHeader {
+            round: Round(round),
+            rewards_level,
+            ..algo_types::BlockHeader::default()
+        };
+        let hdrdata = rmp_serde::to_vec_named(&hdr).map_err(|e| AlgoError::Ledger {
+            message: format!("encode fixture header: {e}"),
+        })?;
+        self.conn
+            .execute(
+                "INSERT INTO blockdb.blocks (rnd, proto, hdrdata, blkdata) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(rnd) DO UPDATE SET hdrdata=excluded.hdrdata",
+                params![round as i64, self.protocol, hdrdata, &[] as &[u8]],
             )
             .map_err(|e| AlgoError::Ledger {
-                message: format!(
-                    "prepare expired_participation_account_candidates query error: {e}"
-                ),
+                message: format!("insert fixture header error: {e}"),
             })?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })
-            .map_err(|e| AlgoError::Ledger {
-                message: format!("query expired_participation_account_candidates error: {e}"),
-            })?;
-
-        let mut out = Vec::new();
-        for row in rows {
-            let (addr_bytes, data) = row.map_err(|e| AlgoError::Ledger {
-                message: format!("read expired_participation_account_candidates row error: {e}"),
-            })?;
-            let account = decode_account_data(&data).map_err(|e| AlgoError::Ledger {
-                message: format!(
-                    "decode expired_participation_account_candidates account error: {e}"
-                ),
-            })?;
-            if account.micro_algos == 0 {
-                continue;
-            }
-            let has_vote_key = account.vote_id.is_some_and(|v| v != [0u8; 32]);
-            if !has_vote_key {
-                continue;
-            }
-            if account.vote_last_valid != 0 && account.vote_last_valid < current_round {
-                let addr_arr: [u8; 32] =
-                    addr_bytes
-                        .try_into()
-                        .map_err(|v: Vec<u8>| AlgoError::Ledger {
-                            message: format!(
-                                "expired_participation_account_candidates: bad address length {} \
-                                 (expected 32)",
-                                v.len()
-                            ),
-                        })?;
-                out.push(Address(addr_arr));
-                if out.len() >= max_count {
-                    break;
-                }
-            }
-        }
-        Ok(out)
+        Ok(())
     }
 
-    /// Select up to `consensus.payouts_max_mark_absent` currently-online,
-    /// incentive-eligible accounts (`accountbase`, `normalizedonlinebalance
-    /// > 0`) that should be suspended for absenteeism as of `current_round`
-    /// -- candidates for a self-produced block's
-    /// `absent_participation_accounts` header field.
+    /// The rewards level at `round`'s block header -- the one place both the
+    /// per-account stake ([`Self::lookup_agreement_account`]) and the derived
+    /// total ([`Self::derive_online_supply_from_history`]) take it from, so
+    /// they share one time basis.
     ///
-    /// Mirrors the absentee half of go-algorand's
-    /// `generateKnockOfflineAccountsList` (`ledger/eval/eval.go`, v41): for
-    /// every `Online && IncentiveEligible` candidate not in `exclude`, this
-    /// computes `lastSeen = max(LastProposed, LastHeartbeat)` and the
-    /// account's rewards-adjusted stake, then includes the address when
-    /// [`crate::apply::is_absent`] holds (silent for longer than its
-    /// stake-scaled allowance, against
-    /// [`crate::apply::total_online_voting_stake`]) or the account failed
-    /// the currently-active heartbeat challenge
-    /// ([`crate::heartbeat::find_challenge`] +
-    /// [`crate::heartbeat::Challenge::failed`]).
+    /// Consensus-critical, NO fallback: a header that cannot be read or decoded
+    /// is an error, and so is a header that is missing -- reading the current
+    /// level instead would silently mix time bases (the validator rejects the
+    /// block; the proposer skips the stake-based listing). There is no
+    /// test-only fallback: test builds exercise this same path, so fixtures
+    /// write the headers they need ([`Self::put_block_header_fixture`]).
     ///
-    /// `exclude` is the union of go's two independent skip conditions --
-    /// `partAddrs.Contains(accountAddr)` (this node's own participation
-    /// addresses, passed in by the caller) and "already added to
-    /// `ExpiredParticipationAccounts` this round, so don't also suspend it"
-    /// (`continue // if marking expired, do not consider suspension`) --
-    /// which the caller (`generate_block`) folds together before calling
-    /// this, since both are simple set-membership skips over the same
-    /// candidate loop.
-    ///
-    /// Selection order among more candidates than the cap is not
-    /// consensus-significant (see `expired_participation_account_candidates`'s
-    /// doc comment on Go's randomized map iteration) -- this returns
-    /// addresses in ascending byte order for reproducible tests, exactly
-    /// like that function.
-    pub fn absent_participation_account_candidates(
-        &self,
-        current_round: u64,
-        consensus: &algo_types::ConsensusParams,
-        exclude: &std::collections::HashSet<Address>,
-    ) -> Result<Vec<Address>, AlgoError> {
-        let max_count = consensus.payouts_max_mark_absent;
-        if max_count == 0 {
-            return Ok(Vec::new());
+    /// Only COMMITTED headers are cached: a header at or above the in-flight
+    /// block's round may belong to a scratch apply that is rolled back.
+    fn rewards_level_at(&self, round: u64) -> Result<u64, AlgoError> {
+        if let Some(level) = self.rewards_cache.get(round) {
+            return Ok(level);
         }
-
-        let total_online_stake = crate::apply::total_online_voting_stake(self);
-        let provider = crate::heartbeat::StoreHeaderProvider { store: self };
-        let challenge = crate::heartbeat::find_challenge(
-            consensus,
-            current_round,
-            &provider,
-            crate::heartbeat::ChallengePeriod::Active,
-        );
-
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT address, data FROM accountbase WHERE normalizedonlinebalance > 0 \
-                 ORDER BY address",
-            )
-            .map_err(|e| AlgoError::Ledger {
-                message: format!(
-                    "prepare absent_participation_account_candidates query error: {e}"
-                ),
-            })?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })
-            .map_err(|e| AlgoError::Ledger {
-                message: format!("query absent_participation_account_candidates error: {e}"),
-            })?;
-
-        let mut out = Vec::new();
-        for row in rows {
-            let (addr_bytes, data) = row.map_err(|e| AlgoError::Ledger {
-                message: format!("read absent_participation_account_candidates row error: {e}"),
-            })?;
-            let addr_arr: [u8; 32] =
-                addr_bytes
-                    .clone()
-                    .try_into()
-                    .map_err(|v: Vec<u8>| AlgoError::Ledger {
-                        message: format!(
-                            "absent_participation_account_candidates: bad address length {} \
-                             (expected 32)",
-                            v.len()
-                        ),
-                    })?;
-            let addr = Address(addr_arr);
-
-            if exclude.contains(&addr) {
-                continue;
-            }
-
-            let account = decode_account_data(&data).map_err(|e| AlgoError::Ledger {
-                message: format!(
-                    "decode absent_participation_account_candidates account error: {e}"
-                ),
-            })?;
-
-            if account.micro_algos == 0 {
-                continue; // don't check accounts that are being closed
-            }
-            if account.status != AccountStatus::Online || !account.incentive_eligible {
-                continue;
-            }
-
-            let last_seen =
-                crate::heartbeat::last_seen(account.last_proposed, account.last_heartbeat);
-            let acct_stake =
-                account
-                    .micro_algos
-                    .saturating_add(crate::rewards::compute_pending_rewards(
-                        &account,
-                        self.rewards_level,
-                    ));
-
-            if crate::apply::is_absent(total_online_stake, acct_stake, last_seen, current_round)
-                || challenge.failed(&addr.0, last_seen)
-            {
-                out.push(addr);
-                if out.len() >= max_count {
-                    break;
+        match self.get_block_header_data(round)? {
+            Some(hdr) => {
+                let level = BlockHeader::decode_from_bytes(&hdr)
+                    .map_err(|e| AlgoError::Ledger {
+                        message: format!("decode block header {round} for its rewards level: {e}"),
+                    })?
+                    .rewards_level;
+                let committed = round < self.current_round.0
+                    || (!self.in_block && round == self.current_round.0);
+                if committed {
+                    self.rewards_cache.put(round, level);
                 }
+                Ok(level)
             }
+            None => Err(AlgoError::Ledger {
+                message: format!("no block header at round {round} to read its rewards level from"),
+            }),
         }
-        Ok(out)
+    }
+
+    /// go's `LookupAgreement(round, addr)`: the account's `onlineaccounts` row
+    /// at or before `round`, `None` when there is no such row or the account
+    /// was not online then (go's empty `OnlineAccountData`), with the rewards
+    /// pending at `round`'s level ([`Self::rewards_level_at`]) folded into
+    /// `micro_algos` (`MicroAlgosWithRewards`, issue #1654).
+    ///
+    /// Consensus-critical, NO fallback to the account's current state: a late
+    /// joiner has no stake until the lookback passes it, exactly as in go (a
+    /// node whose history predates this table is backfilled when the database
+    /// is opened, see `backfill_legacy_online_history`). Used by
+    /// [`LedgerStore::voter_agreement_data_at_round`]; agreement's own
+    /// membership lookup keeps its current-state fallback (issue #1809).
+    fn lookup_agreement_account(
+        &self,
+        addr: &Address,
+        round: u64,
+    ) -> Result<Option<AccountData>, AlgoError> {
+        let Some(mut acct) = self.get_online_account_at_round(addr, round)? else {
+            return Ok(None);
+        };
+        if acct.status != AccountStatus::Online {
+            return Ok(None);
+        }
+        let rewards_level = self.rewards_level_at(round)?;
+        if rewards_level >= acct.rewards_base {
+            let pending = crate::rewards::compute_pending_rewards(&acct, rewards_level);
+            acct.micro_algos = acct.micro_algos.saturating_add(pending);
+            acct.rewards_base = rewards_level;
+        }
+        Ok(Some(acct))
     }
 
     /// Look up an account's online data at a specific round from the
@@ -7953,33 +8044,78 @@ impl LedgerStore for SqliteLedger {
 
     // ---- Balance-round-lookback online-participation queries (issue #1215) ----
 
-    /// Mirrors `AgreementLedgerBridge::lookup_agreement`'s historical
-    /// (`onlineaccounts` table) lookup with a current-account-state fallback
-    /// when no historical row exists, gated on `AccountStatus::Online` so an
-    /// offline account never leaks its raw balance/stale key material into
-    /// `voter_params_get` -- see that function's doc comment
-    /// (`agreement_bridge.rs`) for the full go-algorand rationale
-    /// (`LookupAgreement`/`basics.OnlineAccountData{}`).
+    /// go's `LookupAgreement(round, addr)`: the account's `onlineaccounts` row
+    /// at or before `round`; no row (an account that was never online by
+    /// then, e.g. went online after the balance round) is an empty
+    /// `OnlineAccountData`. Unlike `AgreementLedgerBridge::lookup_agreement`
+    /// there is deliberately NO fallback to the account's current state: the
+    /// absence checks (`generateKnockOfflineAccountsList`,
+    /// `validateAbsentOnlineAccounts`) and `voter_params_get` must agree with
+    /// go, where a late joiner has stake 0 until the lookback passes it.
+    /// Gated on `AccountStatus::Online` (a zero marker row means offline).
     fn voter_agreement_data_at_round(
         &self,
         round: u64,
         addr: &Address,
     ) -> Result<VoterAgreementData, AlgoError> {
-        let acct = match self.get_online_account_at_round(addr, round) {
-            Ok(Some(acct)) => acct,
-            Ok(None) | Err(_) => self.get_account(addr).unwrap_or_default(),
-        };
-        if acct.status != AccountStatus::Online {
-            return Ok(VoterAgreementData::default());
-        }
-        Ok(VoterAgreementData {
-            micro_algos: acct.micro_algos,
-            incentive_eligible: acct.incentive_eligible,
+        Ok(match self.lookup_agreement_account(addr, round)? {
+            Some(acct) => VoterAgreementData {
+                micro_algos: acct.micro_algos,
+                incentive_eligible: acct.incentive_eligible,
+            },
+            None => VoterAgreementData::default(),
         })
     }
 
     fn online_stake_at_round(&self, round: u64, vote_rnd: u64) -> Result<u64, AlgoError> {
         self.online_circulation_at_round(round, vote_rnd)
+    }
+
+    /// True while `balance_round` is below the tip at which a legacy database's
+    /// synthetic history rows were made (see `backfill_legacy_online_history`).
+    ///
+    /// Applies to legacy-upgraded nodes only (for ~one lookback window, 320
+    /// rounds, after the upgrade): a fresh, catchpoint-imported or already
+    /// backfilled-and-aged database has marker 0 and is never uncertain. A
+    /// database error is an error, not "certain": the caller must not run the
+    /// strict test against rows that may be synthetic.
+    fn absence_history_uncertain(&self, balance_round: u64) -> Result<bool, AlgoError> {
+        let since: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT rnd FROM acctrounds WHERE id = 'onlinebackfill'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("read onlinebackfill marker error: {e}"),
+            })?;
+        Ok(since.is_some_and(|since| since > 0 && balance_round < since as u64))
+    }
+
+    /// go's `OnlineCirculation(balanceRound, round)` on the history basis: the
+    /// per-round supply snapshot when present, else the supply derived from
+    /// the `onlineaccounts` rows (the same data the per-account stake comes
+    /// from), less the expired stake. `Err` when neither exists -- never
+    /// today's aggregate, which would mix time bases.
+    fn balance_round_total_online_stake(
+        &self,
+        balance_round: u64,
+        vote_rnd: u64,
+    ) -> Result<u64, AlgoError> {
+        let total = match self.online_supply_at_round(balance_round)? {
+            Some(supply) => supply,
+            None => self
+                .derive_online_supply_from_history(balance_round)?
+                .ok_or_else(|| AlgoError::Ledger {
+                    message: format!(
+                        "cannot determine the online stake at balance round {balance_round}: \
+                         no supply snapshot and no onlineaccounts history"
+                    ),
+                })?,
+        };
+        self.exclude_expired_from_total(total, balance_round, vote_rnd)
     }
 }
 
@@ -14813,9 +14949,9 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // absent_participation_account_candidates (issue #845): proposal-side
-    // absentee computation, mirroring go-algorand's
-    // generateKnockOfflineAccountsList absentee half.
+    // knock_offline_lists (issues #526, #845, #1795): proposal-side expired /
+    // absent computation, mirroring go-algorand's
+    // generateKnockOfflineAccountsList.
     // ---------------------------------------------------------------------
 
     fn consensus_v41() -> algo_types::ConsensusParams {
@@ -14823,83 +14959,260 @@ mod tests {
             .expect("v41 consensus params")
     }
 
+    fn lists(
+        ledger: &SqliteLedger,
+        round: u64,
+        consensus: &algo_types::ConsensusParams,
+        exclude: &std::collections::HashSet<Address>,
+        touched: &[Address],
+    ) -> crate::apply::KnockOfflineLists {
+        crate::apply::knock_offline_lists(ledger, round, consensus, exclude, touched)
+    }
+
+    fn absent_acct(last_heartbeat: u64) -> AccountData {
+        AccountData {
+            micro_algos: 5_000_000,
+            status: AccountStatus::Online,
+            incentive_eligible: true,
+            last_heartbeat,
+            vote_id: Some([7u8; 32]),
+            vote_last_valid: 1_000_000,
+            ..AccountData::default()
+        }
+    }
+
+    /// Set `acct` and seed the `onlineaccounts` row go would hold for it at
+    /// the balance round (0 for the round-101 queries below).
+    fn set_online(ledger: &mut SqliteLedger, addr: &Address, acct: AccountData) {
+        ledger.set_account(addr, acct.clone());
+        ledger.put_online_account_at_round(addr, 0, &acct).unwrap();
+        // The balance-round header the lookups read the rewards level from.
+        ledger.put_block_header_fixture(0, 0).unwrap();
+    }
+
+    fn keyed_acct(status: AccountStatus, vote_last_valid: u64) -> AccountData {
+        AccountData {
+            micro_algos: 5_000_000,
+            status,
+            vote_id: Some([7u8; 32]),
+            vote_last_valid,
+            ..AccountData::default()
+        }
+    }
+
     #[test]
     fn absent_candidates_includes_genuinely_absent_online_account() {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
         let addr = Address([9u8; 32]);
-        ledger.set_account(
-            &addr,
-            AccountData {
-                micro_algos: 5_000_000,
-                status: AccountStatus::Online,
-                incentive_eligible: true,
-                last_heartbeat: 1,
-                ..AccountData::default()
-            },
-        );
+        set_online(&mut ledger, &addr, absent_acct(1));
+        ledger.put_online_supply_at_round(0, 5_000_000).unwrap();
 
-        // Single online account: total_online_voting_stake == its own
-        // stake, so is_absent's allowable_lag is exactly ABSENT_FACTOR
-        // (20). last_seen(1) + 20 = 21 < 101.
-        let candidates = ledger
-            .absent_participation_account_candidates(
-                101,
-                &consensus_v41(),
-                &std::collections::HashSet::new(),
-            )
-            .expect("absent_participation_account_candidates");
-        assert_eq!(candidates, vec![addr]);
+        // Single online account: the lookback total equals its own stake, so
+        // is_absent's allowable_lag is exactly ABSENT_FACTOR (20).
+        // last_seen(1) + 20 = 21 < 101.
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
+        assert_eq!(l.absent, vec![addr]);
+    }
+
+    /// go's `LookupAgreement(balanceRound, addr)` has no row for an account
+    /// that went online after the balance round: stake 0, never absent.
+    #[test]
+    fn absent_candidates_ignore_an_account_that_went_online_after_the_balance_round() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([9u8; 32]);
+        let acct = absent_acct(1);
+        ledger.set_account(&addr, acct.clone());
+        // Its only history row is at round 50; round 101's balance round is 0.
+        ledger
+            .put_online_account_at_round(&addr, 50, &acct)
+            .unwrap();
+        ledger.put_online_supply_at_round(0, 5_000_000).unwrap();
+
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
+        assert!(l.absent.is_empty());
+        assert_eq!(
+            ledger.voter_agreement_data_at_round(0, &addr).unwrap(),
+            crate::store_trait::VoterAgreementData::default(),
+            "no row at or before the round: empty OnlineAccountData"
+        );
+    }
+
+    /// go's `VotingStake()` is `MicroAlgosWithRewards`: the historical row's
+    /// balance with the rewards pending at the lookup round folded in.
+    #[test]
+    fn lookback_voting_stake_includes_pending_rewards() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([9u8; 32]);
+        let mut acct = absent_acct(1);
+        acct.micro_algos = 10_000_000_000; // 10_000 reward units
+        acct.rewards_base = 100;
+        ledger.set_account(&addr, acct.clone());
+        ledger.put_online_account_at_round(&addr, 0, &acct).unwrap();
+        ledger.put_block_header_fixture(0, 125).unwrap(); // 25 levels * 10_000 units
+        assert_eq!(
+            ledger
+                .voter_agreement_data_at_round(0, &addr)
+                .unwrap()
+                .micro_algos,
+            10_000_250_000
+        );
+        // No change at the account's own level, and no wrap-around for an
+        // older lookup level.
+        ledger.put_block_header_fixture(0, 100).unwrap();
+        ledger.rewards_cache.put(u64::MAX, 0); // drop any cached level for round 0
+        assert_eq!(
+            ledger
+                .voter_agreement_data_at_round(0, &addr)
+                .unwrap()
+                .micro_algos,
+            10_000_000_000
+        );
+        ledger.put_block_header_fixture(0, 50).unwrap();
+        ledger.rewards_cache.put(u64::MAX, 0);
+        assert_eq!(
+            ledger
+                .voter_agreement_data_at_round(0, &addr)
+                .unwrap()
+                .micro_algos,
+            10_000_000_000
+        );
+    }
+
+    /// Without a per-round supply snapshot at the balance round the total is
+    /// derived from the `onlineaccounts` history -- the same rows the
+    /// per-account stake comes from -- never from today's aggregate, so the
+    /// lag test stays decidable and on one time basis.
+    #[test]
+    fn absent_candidates_derive_the_total_from_history_without_a_snapshot() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let absent = Address([9u8; 32]);
+        let expired = Address([8u8; 32]);
+        set_online(&mut ledger, &absent, absent_acct(1));
+        set_online(&mut ledger, &expired, keyed_acct(AccountStatus::Online, 50));
+        // Today's aggregate says 500M: lag 2000 would hide the account.
+        ledger
+            .put_account_totals_seed(500_000_000, 0, 0, 0, 0, 0)
+            .unwrap();
+        // Derived total = 5M + 5M: lag 20 * 10M / 5M = 40 < 100 quiet rounds.
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
+        assert_eq!(l.absent, vec![absent]);
+        assert_eq!(l.expired, vec![expired]);
+    }
+
+    /// With no snapshot and no history the total cannot be determined on the
+    /// historical basis: the lag test is skipped (nobody absent) while expiry,
+    /// which needs no stake, still works.
+    #[test]
+    fn absent_candidates_skip_the_lag_test_when_the_total_is_not_derivable() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let absent = Address([9u8; 32]);
+        let expired = Address([8u8; 32]);
+        ledger.set_account(&absent, absent_acct(1));
+        ledger.set_account(&expired, keyed_acct(AccountStatus::Online, 50));
+        ledger
+            .put_account_totals_seed(10_000_000, 0, 0, 0, 0, 0)
+            .unwrap();
+        assert!(ledger.balance_round_total_online_stake(0, 101).is_err());
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
+        assert!(l.absent.is_empty());
+        assert_eq!(l.expired, vec![expired]);
+    }
+
+    /// Evidence for the strict no-fallback lookback: an account that is online
+    /// in the genesis allocation and never changes afterwards has an
+    /// `onlineaccounts` row (written by `commit_block`'s
+    /// `record_online_account_history` for every account touched since
+    /// `begin_block`, which includes the genesis `set_account`s), so it has
+    /// its real stake at any later balance round, exactly like go's genesis
+    /// rows. Mirrors `seed_ledger_from_genesis`: begin_block, populate,
+    /// put_block(0), commit_block.
+    #[test]
+    fn genesis_online_account_that_never_changes_has_its_stake_at_the_balance_round() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let header_bytes = |round: u64| {
+            let b = algo_types::Block {
+                round: Round(round),
+                ..algo_types::Block::default()
+            };
+            algo_codec::canonical_encode_block_header_from_block(&b)
+        };
+        let addr = Address([9u8; 32]);
+        ledger.begin_block().unwrap();
+        ledger.set_account(&addr, absent_acct(0));
+        ledger
+            .put_block(0, "proto", &header_bytes(0), b"blk0")
+            .unwrap();
+        ledger.commit_block().unwrap();
+        // Later rounds that never touch the account.
+        for r in 1..=5u64 {
+            ledger.begin_block().unwrap();
+            ledger
+                .put_block(r, "proto", &header_bytes(r), b"blk")
+                .unwrap();
+            ledger.set_current_round(Round(r));
+            ledger.commit_block().unwrap();
+        }
+        for round in [0u64, 3, 5] {
+            assert_eq!(
+                ledger
+                    .voter_agreement_data_at_round(round, &addr)
+                    .unwrap()
+                    .micro_algos,
+                5_000_000,
+                "round {round}"
+            );
+        }
+    }
+
+    /// The balance-round total is forwarded by every `LedgerStore` wrapper, so
+    /// a wrapper cannot silently change or disable absence listing.
+    #[test]
+    fn balance_round_total_is_forwarded_by_the_store_wrappers() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        set_online(&mut ledger, &Address([9u8; 32]), absent_acct(1));
+        // Derived from history (no snapshot): 5M.
+        assert_eq!(
+            ledger.balance_round_total_online_stake(0, 101).unwrap(),
+            5_000_000
+        );
+        {
+            let mut overlay = crate::pending_overlay::PendingOverlay::new(&ledger);
+            let store = crate::pending_overlay::OverlayStore::new(&ledger, &mut overlay);
+            assert_eq!(
+                store.balance_round_total_online_stake(0, 101).unwrap(),
+                5_000_000
+            );
+        }
+        let rec = crate::recording_store::RecordingStore::new(&mut ledger);
+        assert_eq!(
+            rec.balance_round_total_online_stake(0, 101).unwrap(),
+            5_000_000
+        );
     }
 
     #[test]
     fn absent_candidates_excludes_recently_seen_account() {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
-        let addr = Address([9u8; 32]);
-        ledger.set_account(
-            &addr,
-            AccountData {
-                micro_algos: 5_000_000,
-                status: AccountStatus::Online,
-                incentive_eligible: true,
-                last_heartbeat: 100,
-                ..AccountData::default()
-            },
-        );
+        set_online(&mut ledger, &Address([9u8; 32]), absent_acct(100));
+        // Lookback total = the account's own stake, so the lag is 20.
+        ledger.put_online_supply_at_round(0, 5_000_000).unwrap();
 
         // last_seen(100) + 20 = 120, not < 101.
-        let candidates = ledger
-            .absent_participation_account_candidates(
-                101,
-                &consensus_v41(),
-                &std::collections::HashSet::new(),
-            )
-            .expect("absent_participation_account_candidates");
-        assert!(candidates.is_empty());
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
+        assert!(l.absent.is_empty());
     }
 
     #[test]
     fn absent_candidates_excludes_addresses_in_exclude_set() {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
         let addr = Address([9u8; 32]);
-        ledger.set_account(
-            &addr,
-            AccountData {
-                micro_algos: 5_000_000,
-                status: AccountStatus::Online,
-                incentive_eligible: true,
-                last_heartbeat: 1,
-                ..AccountData::default()
-            },
-        );
+        set_online(&mut ledger, &addr, absent_acct(1));
 
-        let mut exclude = std::collections::HashSet::new();
-        exclude.insert(addr);
-        let candidates = ledger
-            .absent_participation_account_candidates(101, &consensus_v41(), &exclude)
-            .expect("absent_participation_account_candidates");
+        let exclude: std::collections::HashSet<Address> = [addr].into_iter().collect();
+        let l = lists(&ledger, 101, &consensus_v41(), &exclude, &[]);
         assert!(
-            candidates.is_empty(),
-            "excluded address (own participation / already-expired) must never appear"
+            l.absent.is_empty(),
+            "an own participation address must never appear"
         );
     }
 
@@ -14908,29 +15221,14 @@ mod tests {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
         let mut consensus = consensus_v41();
         consensus.payouts_max_mark_absent = 1;
-
         for i in 0..3u8 {
-            let addr = Address([i + 1; 32]);
-            ledger.set_account(
-                &addr,
-                AccountData {
-                    micro_algos: 5_000_000,
-                    status: AccountStatus::Online,
-                    incentive_eligible: true,
-                    last_heartbeat: 1,
-                    ..AccountData::default()
-                },
-            );
+            set_online(&mut ledger, &Address([i + 1; 32]), absent_acct(1));
         }
+        ledger.put_online_supply_at_round(0, 15_000_000).unwrap();
 
-        let candidates = ledger
-            .absent_participation_account_candidates(
-                101,
-                &consensus,
-                &std::collections::HashSet::new(),
-            )
-            .expect("absent_participation_account_candidates");
-        assert_eq!(candidates.len(), 1, "capped at payouts_max_mark_absent");
+        let l = lists(&ledger, 101, &consensus, &Default::default(), &[]);
+        assert_eq!(l.absent.len(), 1, "capped at payouts_max_mark_absent");
+        assert_eq!(l.absent, vec![Address([1u8; 32])], "lowest address first");
     }
 
     #[test]
@@ -14938,26 +15236,573 @@ mod tests {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
         let mut consensus = consensus_v41();
         consensus.payouts_max_mark_absent = 0;
-        let addr = Address([9u8; 32]);
-        ledger.set_account(
-            &addr,
-            AccountData {
-                micro_algos: 5_000_000,
-                status: AccountStatus::Online,
-                incentive_eligible: true,
-                last_heartbeat: 1,
-                ..AccountData::default()
-            },
+        set_online(&mut ledger, &Address([9u8; 32]), absent_acct(1));
+
+        let l = lists(&ledger, 101, &consensus, &Default::default(), &[]);
+        assert!(l.absent.is_empty());
+    }
+
+    #[test]
+    fn expired_candidates_respect_max_proposed_expired_cap() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let mut consensus = consensus_v41();
+        consensus.max_proposed_expired_online_accounts = 2;
+        for i in 0..4u8 {
+            ledger.set_account(&Address([i + 1; 32]), keyed_acct(AccountStatus::Online, 50));
+        }
+
+        let l = lists(&ledger, 101, &consensus, &Default::default(), &[]);
+        assert_eq!(
+            l.expired,
+            vec![Address([1u8; 32]), Address([2u8; 32])],
+            "capped at max_proposed_expired_online_accounts, lowest addresses first"
         );
 
-        let candidates = ledger
-            .absent_participation_account_candidates(
-                101,
-                &consensus,
-                &std::collections::HashSet::new(),
+        consensus.max_proposed_expired_online_accounts = 0;
+        let l = lists(&ledger, 101, &consensus, &Default::default(), &[]);
+        assert!(l.expired.is_empty(), "feature disabled at cap 0");
+    }
+
+    /// go's expiry check is `!VoteID.IsEmpty() && VoteLastValid < current` --
+    /// no `VoteLastValid != 0` exemption.
+    #[test]
+    fn expired_candidates_include_a_zero_vote_last_valid() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([9u8; 32]);
+        ledger.set_account(&addr, keyed_acct(AccountStatus::Online, 0));
+
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
+        assert_eq!(l.expired, vec![addr]);
+    }
+
+    /// go expires any modified account holding voting data, whatever its
+    /// status: an offline (suspended) account that keeps its keys is listed
+    /// when the block touches it, but an untouched one is not a candidate.
+    #[test]
+    fn expired_candidates_include_a_touched_offline_account_with_keys() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([9u8; 32]);
+        ledger.set_account(&addr, keyed_acct(AccountStatus::Offline, 50));
+
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
+        assert!(l.expired.is_empty(), "untouched offline account");
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[addr]);
+        assert_eq!(l.expired, vec![addr], "touched offline account with keys");
+    }
+
+    /// go reads the online set (`GetKnockOfflineCandidates`) only while
+    /// suspensions are enabled; with `MaxMarkAbsent == 0` just the modified
+    /// accounts are candidates, so an untouched expired account is not listed.
+    #[test]
+    fn online_scan_is_skipped_when_suspensions_are_disabled() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let mut consensus = consensus_v41();
+        consensus.payouts_max_mark_absent = 0;
+        let untouched = Address([1u8; 32]);
+        let touched = Address([2u8; 32]);
+        ledger.set_account(&untouched, keyed_acct(AccountStatus::Online, 50));
+        ledger.set_account(&touched, keyed_acct(AccountStatus::Online, 50));
+
+        let l = lists(&ledger, 101, &consensus, &Default::default(), &[touched]);
+        assert_eq!(l.expired, vec![touched]);
+    }
+
+    #[test]
+    fn candidates_skip_zero_balance_accounts() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([9u8; 32]);
+        let mut acct = keyed_acct(AccountStatus::Offline, 50);
+        acct.micro_algos = 0;
+        ledger.set_account(&addr, acct);
+
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[addr]);
+        assert!(l.expired.is_empty(), "an account being closed is skipped");
+    }
+
+    /// go's absence test reads the total online stake and the account's
+    /// stake at the balance round, not from the state after the payset: a
+    /// lookback total far above today's online sum keeps a quiet account from
+    /// being listed.
+    #[test]
+    fn absent_candidates_use_the_balance_round_lookback_total() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([9u8; 32]);
+        set_online(&mut ledger, &addr, absent_acct(1));
+        // Round 101's balance round is 0 (saturating): seed that snapshot.
+        ledger.put_online_supply_at_round(0, 5_000_000).unwrap();
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
+        assert_eq!(l.absent, vec![addr], "lag 20 -> absent");
+
+        // The same account against a lookback total 100x larger: lag 2000.
+        ledger.put_online_supply_at_round(0, 500_000_000).unwrap();
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
+        assert!(l.absent.is_empty(), "lag 2000 -> not absent");
+    }
+
+    /// Liveness of the fail-closed validator (issue #1795): at every tip of a
+    /// long-running node the next block's balance round still has both the
+    /// per-round supply snapshot and the `onlineaccounts` rows the total and
+    /// the per-account stake are read from. Writers: `commit_block` ->
+    /// `record_online_supply_snapshot` / `record_online_account_history`;
+    /// pruning keeps snapshots with `rnd >= round - MaxBalLookback` and, per
+    /// address, the latest row older than that window (online ones only), and
+    /// the balance round of the next block is `tip + 1 - 320`, inside both.
+    #[test]
+    fn pruning_never_removes_what_the_next_balance_round_needs() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.set_protocol(algo_types::CONSENSUS_V41.to_string());
+        let consensus = consensus_v41();
+        let stable = Address([1u8; 32]);
+        let flaps = Address([2u8; 32]);
+        let acct = |micro: u64| AccountData {
+            micro_algos: micro,
+            status: AccountStatus::Online,
+            vote_id: Some([7u8; 32]),
+            vote_last_valid: 1_000_000,
+            incentive_eligible: true,
+            ..AccountData::default()
+        };
+        for round in 0..=700u64 {
+            ledger.begin_block().unwrap();
+            ledger.set_current_round(Round(round));
+            if round == 1 {
+                ledger.set_account(&stable, acct(5_000_000));
+                ledger.set_account(&flaps, acct(3_000_000));
+                ledger
+                    .put_account_totals_seed(8_000_000, 0, 0, 0, 0, 0)
+                    .unwrap();
+            }
+            if round == 200 {
+                ledger.set_account(&flaps, AccountData::default());
+            }
+            if round == 600 {
+                ledger.set_account(&flaps, acct(3_000_000));
+            }
+            ledger.commit_block().unwrap();
+
+            if round >= 330 {
+                let next = round + 1;
+                let brnd = algo_agreement::balance_round(Round(next), &consensus).0;
+                assert_eq!(brnd, next - 320);
+                // The snapshot written by the commit loop is there ...
+                assert!(
+                    ledger.online_supply_at_round(brnd).unwrap().is_some(),
+                    "supply snapshot at {brnd} (tip {round})"
+                );
+                ledger
+                    .balance_round_total_online_stake(brnd, next)
+                    .unwrap_or_else(|e| panic!("tip {round}: {e}"));
+                // ... and so is the history, in case a legacy store lacks the tail.
+                assert!(
+                    ledger
+                        .derive_online_supply_from_history(brnd)
+                        .unwrap()
+                        .is_some(),
+                    "history at {brnd} (tip {round})"
+                );
+                assert_eq!(
+                    ledger
+                        .voter_agreement_data_at_round(brnd, &stable)
+                        .unwrap()
+                        .micro_algos,
+                    5_000_000,
+                    "stable account's stake at {brnd}"
+                );
+            }
+        }
+        // A legacy store without the supply tail derives the same total.
+        let brnd = 701 - 320;
+        ledger.balance_round_total_online_stake(brnd, 701).unwrap();
+        ledger
+            .conn
+            .execute("DELETE FROM onlineroundparamstail", [])
+            .unwrap();
+        assert!(ledger.online_supply_at_round(brnd).unwrap().is_none());
+        let derived = ledger.balance_round_total_online_stake(brnd, 701).unwrap();
+        // `flaps` went offline at round 200 and is not back until 600.
+        assert_eq!(
+            derived, 5_000_000,
+            "only the stable account at round {brnd}"
+        );
+    }
+
+    /// A catchpoint-imported store carries go's `onlineaccounts` rows and
+    /// `onlineroundparamstail` window verbatim (importer.rs:495-496 renames
+    /// them into place), so right after import the next block's balance round
+    /// has the snapshot, and the per-account stake and derived total come from
+    /// the imported rows too.
+    #[test]
+    fn catchpoint_imported_store_has_the_balance_round_data() {
+        use crate::catchpoint::importer::CatchpointImporter;
+        use crate::catchpoint::types::{AccountTotals, AlgoCount};
+        use crate::catchpoint::{
+            CatchpointFileHeader, CatchpointSnapshotChunkV6, OnlineAccountRecordV6,
+            OnlineRoundParamsRecordV6,
+        };
+        use serde_bytes::ByteBuf;
+
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([3u8; 32]);
+        let acct = AccountData {
+            micro_algos: 5_000_000,
+            status: AccountStatus::Online,
+            vote_id: Some([7u8; 32]),
+            vote_last_valid: 1_000_000,
+            incentive_eligible: true,
+            ..AccountData::default()
+        };
+        let tip = 5_000u64;
+        let online_account = OnlineAccountRecordV6 {
+            address: ByteBuf::from(addr.0.to_vec()),
+            updated_round: 100,
+            normalized_online_balance: account_nob_i64(&acct) as u64,
+            vote_last_valid: acct.vote_last_valid,
+            data: ByteBuf::from(encode_online_account_data(&acct)),
+        };
+        // go's catchpoint carries the supply tail for the lookback window.
+        let params: Vec<OnlineRoundParamsRecordV6> = (tip - 320..=tip)
+            .map(|rnd| OnlineRoundParamsRecordV6 {
+                round: rnd,
+                data: ByteBuf::from(encode_mixed_map(&[(
+                    "online",
+                    encode_msgpack_uint(5_000_000),
+                )])),
+            })
+            .collect();
+        let chunk = CatchpointSnapshotChunkV6 {
+            balances: vec![],
+            kvs: vec![],
+            online_accounts: vec![online_account],
+            online_round_params: params,
+        };
+        // A marker left by an earlier legacy backfill (synthetic history).
+        ledger
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('onlinebackfill', 9000)",
+                [],
             )
-            .expect("absent_participation_account_candidates");
-        assert!(candidates.is_empty());
+            .unwrap();
+        assert!(ledger.absence_history_uncertain(tip + 1 - 320).unwrap());
+        let mut importer =
+            CatchpointImporter::new(&ledger.conn, "5000#TEST".to_string(), REWARD_UNITS);
+        importer.prepare_staging().unwrap();
+        importer
+            .import_chunks(vec![Ok((1, chunk))].into_iter(), 1)
+            .unwrap();
+        let header = CatchpointFileHeader {
+            version: 131,
+            balances_round: tip,
+            totals: AccountTotals {
+                online: AlgoCount {
+                    money: 5_000_000,
+                    reward_units: 5,
+                },
+                ..Default::default()
+            },
+            catchpoint: "5000#TEST".to_string(),
+            ..Default::default()
+        };
+        importer.atomic_cutover(&header).unwrap();
+
+        let brnd = tip + 1 - 320;
+        // The imported history is real go data: the marker no longer applies.
+        assert!(!ledger.absence_history_uncertain(brnd).unwrap());
+        // A catchpoint-synced node also holds the lookback window's headers.
+        ledger.put_block_header_fixture(brnd, 0).unwrap();
+        assert!(ledger.online_supply_at_round(brnd).unwrap().is_some());
+        assert_eq!(
+            ledger
+                .balance_round_total_online_stake(brnd, tip + 1)
+                .unwrap(),
+            5_000_000
+        );
+        assert_eq!(
+            ledger
+                .voter_agreement_data_at_round(brnd, &addr)
+                .unwrap()
+                .micro_algos,
+            5_000_000
+        );
+        // Without the tail the imported rows still derive the total.
+        ledger
+            .conn
+            .execute("DELETE FROM onlineroundparamstail", [])
+            .unwrap();
+        assert_eq!(
+            ledger
+                .balance_round_total_online_stake(brnd, tip + 1)
+                .unwrap(),
+            5_000_000
+        );
+    }
+
+    /// The rewards-level cache returns a level only for the round it was stored
+    /// for, and a later `put` replaces the pair as a unit.
+    #[test]
+    fn rewards_level_cache_keeps_the_round_level_pair_together() {
+        let cache = RewardsLevelCache::default();
+        assert_eq!(cache.get(1), None);
+        cache.put(1, 10);
+        assert_eq!(cache.get(1), Some(10));
+        assert_eq!(cache.get(2), None);
+        cache.put(2, 20);
+        assert_eq!(cache.get(1), None, "the old round's entry is gone");
+        assert_eq!(cache.get(2), Some(20));
+    }
+
+    fn header_with_level(round: u64, level: u64) -> Vec<u8> {
+        let b = algo_types::Block {
+            round: Round(round),
+            rewards_level: level,
+            ..algo_types::Block::default()
+        };
+        algo_codec::canonical_encode_block_header_from_block(&b)
+    }
+
+    /// A header written by an in-flight block that is then rolled back is never
+    /// cached: after the rollback and a different header for the same round
+    /// the lookup returns the committed value.
+    #[test]
+    fn rolled_back_in_flight_header_is_not_cached() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(1));
+        ledger
+            .put_block(1, "proto", &header_with_level(1, 111), b"b")
+            .unwrap();
+        ledger.commit_block().unwrap();
+        assert_eq!(ledger.rewards_level_at(1).unwrap(), 111);
+
+        // In-flight block 2 (current round advanced, like a scratch apply).
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(2));
+        ledger
+            .put_block(2, "proto", &header_with_level(2, 222), b"b")
+            .unwrap();
+        assert_eq!(ledger.rewards_level_at(2).unwrap(), 222);
+        assert!(
+            ledger.rewards_cache.get(2).is_none(),
+            "in-flight header must not be cached"
+        );
+        ledger.rollback_block().unwrap();
+        ledger.set_current_round(Round(1));
+
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(2));
+        ledger
+            .put_block(2, "proto", &header_with_level(2, 333), b"b")
+            .unwrap();
+        ledger.commit_block().unwrap();
+        assert_eq!(ledger.rewards_level_at(2).unwrap(), 333);
+    }
+
+    /// With a missing balance-round header the stake and the derived total
+    /// cannot be placed on the historical basis: the lookups error (the
+    /// validator rejects) and the proposer lists nobody absent.
+    #[test]
+    fn missing_balance_round_header_fails_closed() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([9u8; 32]);
+        // History rows but NO block header at the balance round (round 0).
+        ledger.set_account(&addr, absent_acct(1));
+        ledger
+            .put_online_account_at_round(&addr, 0, &absent_acct(1))
+            .unwrap();
+        let stake = ledger.voter_agreement_data_at_round(0, &addr);
+        let total = ledger.balance_round_total_online_stake(0, 101);
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
+        assert!(stake.is_err(), "no header at round 0");
+        assert!(total.is_err());
+        assert!(l.absent.is_empty());
+    }
+
+    fn legacy_ledger_with_quiet_new_account(prefix: &std::path::Path) -> (Address, Address) {
+        let x = Address([9u8; 32]); // online since round 350, quiet (last seen 1)
+        let z = Address([10u8; 32]); // online since round 1
+        let mut ledger = SqliteLedger::open_with_prefix(prefix).unwrap();
+        for r in 1..=400u64 {
+            ledger.begin_block().unwrap();
+            ledger.set_current_round(Round(r));
+            if r == 1 {
+                ledger.set_account(&z, absent_acct(1));
+            }
+            if r == 350 {
+                ledger.set_account(&x, absent_acct(1));
+            }
+            ledger.commit_block().unwrap();
+        }
+        drop(ledger);
+        // Make it legacy-shaped: the history, the supply tail and the marker
+        // never existed.
+        let conn = Connection::open(tracker_path_for_prefix(prefix)).unwrap();
+        conn.execute("DELETE FROM onlineaccounts", []).unwrap();
+        conn.execute("DELETE FROM onlineroundparamstail", [])
+            .unwrap();
+        conn.execute("DELETE FROM acctrounds WHERE id = 'onlinebackfill'", [])
+            .unwrap();
+        (x, z)
+    }
+
+    fn history_rows(ledger: &SqliteLedger) -> i64 {
+        ledger
+            .conn
+            .query_row("SELECT COUNT(*) FROM onlineaccounts", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Upgrade path: a database from before the history was maintained gets
+    /// one synthetic row per online account when it is opened (in one
+    /// transaction, once), so `voter_params_get` sees the best available stake.
+    /// The rows are marked synthetic: until the lookback window has passed on
+    /// real rows the stake-based absence test is undecidable -- the proposer
+    /// lists nobody by lag (a quiet account that really joined 50 rounds ago
+    /// would otherwise be listed absent while go sees stake 0) and the
+    /// validator skips rather than rejects -- and afterwards it behaves
+    /// normally. The marker keeps a second open from backfilling again.
+    #[test]
+    fn legacy_database_is_backfilled_once_and_absence_is_undecidable_until_the_window_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+        let (x, z) = legacy_ledger_with_quiet_new_account(&prefix);
+
+        let ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
+        assert_eq!(ledger.current_round().0, 400);
+        assert_eq!(
+            history_rows(&ledger),
+            2,
+            "one synthetic row per online account"
+        );
+        let brnd = 401 - 320;
+        assert!(ledger.absence_history_uncertain(brnd).unwrap());
+        assert!(!ledger.absence_history_uncertain(400).unwrap());
+        ledger.put_block_header_fixture(brnd, 0).unwrap();
+        assert_eq!(
+            ledger
+                .voter_agreement_data_at_round(brnd, &x)
+                .unwrap()
+                .micro_algos,
+            5_000_000,
+            "voter_params_get: the best available stake"
+        );
+
+        // Undecidable: nobody is listed by lag, though under the synthetic
+        // history x (last seen at round 1) would look absent ...
+        let l = lists(&ledger, 401, &consensus_v41(), &Default::default(), &[]);
+        assert!(l.absent.is_empty(), "{:?}", l.absent);
+        // ... and a peer block listing x is not rejected.
+        let block = algo_types::Block {
+            round: Round(401),
+            current_protocol: algo_types::CONSENSUS_V41.to_string(),
+            absent_participation_accounts: Some(vec![x]),
+            ..algo_types::Block::default()
+        };
+        crate::apply::validate_absent_online_accounts(&ledger, &block, &consensus_v41(), true)
+            .expect("skipped, not rejected, while the history is synthetic");
+
+        // The marker prevents a second run.
+        drop(ledger);
+        {
+            let conn = Connection::open(tracker_path_for_prefix(&prefix)).unwrap();
+            conn.execute(
+                "DELETE FROM onlineaccounts WHERE address = ?1",
+                params![x.0.as_slice()],
+            )
+            .unwrap();
+        }
+        let mut ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
+        assert_eq!(history_rows(&ledger), 1, "not backfilled again");
+        // Put x's row back to continue (as the first open made it).
+        ledger
+            .put_online_account_at_round(&x, 81, &absent_acct(1))
+            .unwrap();
+
+        // Once the window has passed (block 721's balance round 401 >= 400) the
+        // history is real and the checks decide normally.
+        ledger
+            .put_account_totals_seed(10_000_000, 0, 0, 0, 0, 0)
+            .unwrap();
+        for r in 401..=720u64 {
+            ledger.begin_block().unwrap();
+            ledger.set_current_round(Round(r));
+            ledger.commit_block().unwrap();
+        }
+        assert!(!ledger.absence_history_uncertain(401).unwrap());
+        let l = lists(&ledger, 721, &consensus_v41(), &Default::default(), &[]);
+        assert_eq!(
+            l.absent,
+            vec![x, z],
+            "decidable again: both are long silent"
+        );
+    }
+
+    /// A fresh database has nothing to synthesize: the marker is 0 and no
+    /// balance round is ever uncertain.
+    #[test]
+    fn fresh_database_has_no_uncertain_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SqliteLedger::open_with_prefix(&dir.path().join("ledger")).unwrap();
+        let marker: i64 = ledger
+            .conn
+            .query_row(
+                "SELECT rnd FROM acctrounds WHERE id = 'onlinebackfill'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, 0);
+        assert!(!ledger.absence_history_uncertain(0).unwrap());
+        assert!(!ledger.absence_history_uncertain(1_000_000).unwrap());
+    }
+
+    /// A database error reading the marker is an error, never "certain": the
+    /// validating path fails closed and the proposer lists nobody by lag.
+    #[test]
+    fn marker_read_error_is_not_treated_as_certain() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        set_online(&mut ledger, &Address([9u8; 32]), absent_acct(1));
+        ledger.put_online_supply_at_round(0, 5_000_000).unwrap();
+        assert_eq!(
+            lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]).absent,
+            vec![Address([9u8; 32])],
+            "sanity: listed while the marker is readable"
+        );
+        ledger.conn.execute("DROP TABLE acctrounds", []).unwrap();
+        assert!(ledger.absence_history_uncertain(0).is_err());
+        let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
+        assert!(l.absent.is_empty(), "proposer: undecidable, nobody listed");
+        let block = algo_types::Block {
+            round: Round(101),
+            current_protocol: algo_types::CONSENSUS_V41.to_string(),
+            absent_participation_accounts: Some(vec![Address([9u8; 32])]),
+            ..algo_types::Block::default()
+        };
+        assert!(
+            crate::apply::validate_absent_online_accounts(&ledger, &block, &consensus_v41(), true)
+                .is_err(),
+            "validator: fails closed"
+        );
+    }
+
+    /// Protocols v31-v39 have `payouts_max_mark_absent == 0`: like go
+    /// (`GetKnockOfflineCandidates` is only consulted when suspensions are
+    /// enabled) the online set is not a candidate source, so an untouched
+    /// expired account is not listed, while one the block touches still is.
+    #[test]
+    fn untouched_expired_accounts_are_not_listed_when_suspensions_are_disabled() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V39,
+        )
+        .expect("v39 params");
+        assert_eq!(consensus.payouts_max_mark_absent, 0);
+        assert!(consensus.max_proposed_expired_online_accounts > 0);
+        let untouched = Address([1u8; 32]);
+        let touched = Address([2u8; 32]);
+        ledger.set_account(&untouched, keyed_acct(AccountStatus::Online, 50));
+        ledger.set_account(&touched, keyed_acct(AccountStatus::Online, 50));
+        let l = lists(&ledger, 101, &consensus, &Default::default(), &[touched]);
+        assert_eq!(l.expired, vec![touched]);
     }
 
     // -- Issue #1758: rollback / failed commit restore the in-memory chain state --
@@ -15232,6 +16077,7 @@ mod tests {
             group_delta_tracer: _,
             pending_totals_delta: _,   // reset by rollback
             pending_online_touched: _, // cleared by rollback
+            rewards_cache: _,          // committed-header cache, immutable data
             catchpoint_auto: _,
             catchpoint_worker: _,
             reenable_catchpoints_round: _,

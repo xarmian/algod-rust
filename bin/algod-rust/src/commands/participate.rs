@@ -1615,6 +1615,30 @@ struct ExecState {
     /// The fee sink's available balance after the kept payset (go
     /// `proposerPayout()`); `None` while no payset has been evaluated.
     final_fee_sink_available: Option<u64>,
+    /// The expired / absent lists the final scratch apply computed over the
+    /// state after the kept payset (go `endOfBlock`, issue #1795); `None`
+    /// while no payset has been evaluated.
+    final_knock_offline: Option<algo_ledger::apply::KnockOfflineLists>,
+}
+
+/// Counts the bytes written to it.
+struct CountingWriter(usize);
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Encoded msgpack length of `v`, without allocating the encoding.
+fn encoded_value_len(v: &rmpv::Value) -> usize {
+    let mut c = CountingWriter(0);
+    let _ = rmpv::encode::write_value(&mut c, v);
+    c.0
 }
 
 impl SimpleBlockEvaluator {
@@ -1991,6 +2015,59 @@ impl SimpleBlockEvaluator {
         canonical_encode_signed_txn_in_block(stx).len()
     }
 
+    /// Fill one transaction's ApplyData in, as it is encoded in the block.
+    fn fill_apply_data(
+        stx: &mut algo_types::SignedTransaction,
+        ad: &algo_ledger::apply::ApplyData,
+    ) {
+        stx.closing_amount = ad.closing_amount;
+        stx.asset_closing_amount = ad.asset_closing_amount;
+        stx.sender_rewards = ad.sender_rewards;
+        stx.receiver_rewards = ad.receiver_rewards;
+        stx.close_rewards = ad.close_rewards;
+        stx.apply_data_config_asset = ad.config_asset;
+        stx.apply_data_application_id = ad.application_id;
+        stx.eval_delta = ad.eval_delta.clone();
+    }
+
+    /// `payset` with each transaction's ApplyData filled in.
+    fn with_apply_data(
+        payset: &[algo_types::SignedTransaction],
+        apply_data: &[algo_ledger::apply::ApplyData],
+    ) -> Vec<algo_types::SignedTransaction> {
+        let mut out = payset.to_vec();
+        for (stx, ad) in out.iter_mut().zip(apply_data) {
+            Self::fill_apply_data(stx, ad);
+        }
+        out
+    }
+
+    /// Estimated extra encoded bytes one `ApplyData` adds to its transaction:
+    /// at most ~21 bytes per nonzero numeric field (msgpack key + 9-byte
+    /// value) plus the encoded `eval_delta`. Only an estimate for the list
+    /// scan's size gate (see `ExecProbe::knock_offline_gate`); the exact size
+    /// is always measured outside the ledger lock before a payset is kept.
+    fn apply_data_overhead(ad: &algo_ledger::apply::ApplyData) -> usize {
+        const NUMERIC_FIELD: usize = 21;
+        let numeric = [
+            ad.closing_amount,
+            ad.asset_closing_amount,
+            ad.sender_rewards,
+            ad.receiver_rewards,
+            ad.close_rewards,
+            ad.config_asset,
+            ad.application_id,
+        ]
+        .iter()
+        .filter(|v| **v != 0)
+        .count();
+        let delta = ad
+            .eval_delta
+            .as_ref()
+            .map_or(0, |v| 8 + encoded_value_len(v));
+        numeric * NUMERIC_FIELD + delta
+    }
+
     /// One scratch evaluation of `payset` (groups described by `groups`)
     /// under the ledger mutex. The candidate carries the fees and load of the
     /// payset it holds, so the block epilogue sees the same inputs as the
@@ -2003,6 +2080,8 @@ impl SimpleBlockEvaluator {
         template: &algo_types::Block,
         payset: &[algo_types::SignedTransaction],
         groups: &[ExecGroup],
+        own_addresses: Option<&std::sync::Arc<std::collections::HashSet<algo_types::Address>>>,
+        gated: bool,
     ) -> Result<
         Result<
             algo_ledger::shadow_execute::ScratchPayset,
@@ -2013,11 +2092,37 @@ impl SimpleBlockEvaluator {
         let mut candidate = template.clone();
         candidate.payset = payset.to_vec();
         candidate.fees_collected = groups.iter().map(|g| g.fees).sum();
+        // Measured here, outside the ledger lock: feeds the load and the size
+        // gate, so nothing is cloned or encoded under the mutex.
+        // Only when something uses them: the load and the size gate (never on
+        // bisection probes, which ask for neither).
+        let base_sizes: std::sync::Arc<[usize]> =
+            if self.consensus_params.load_tracking || (own_addresses.is_some() && gated) {
+                payset.iter().map(Self::encoded_len).collect()
+            } else {
+                std::sync::Arc::from(Vec::<usize>::new())
+            };
         if self.consensus_params.load_tracking {
-            let bytes: u64 = payset.iter().map(|s| Self::encoded_len(s) as u64).sum();
+            let bytes: u64 = base_sizes.iter().map(|b| *b as u64).sum();
             candidate.load =
                 algo_ledger::compute_load(bytes, self.consensus_params.max_txn_bytes_per_block);
         }
+        // The expired / absent lists scan every online account under the
+        // ledger lock, so only the pass the proposer keeps asks for them:
+        // bisection probes do not, and a pass whose ApplyData leaves the
+        // payset over the block limit (so it will be truncated and rerun) is
+        // estimated out inside the apply, before the scan. The request (an
+        // `Arc` share of the exclusion set and of the sizes) is built before
+        // the lock is taken.
+        let max = self.max_txn_bytes;
+        let request = own_addresses.map(|own| algo_ledger::apply::ListsRequest {
+            own_addresses: own.clone(),
+            fits: gated.then(|| algo_ledger::apply::FitsGate {
+                base_sizes: base_sizes.clone(),
+                overhead_of: Self::apply_data_overhead,
+                max,
+            }),
+        });
         let waited = std::time::Instant::now();
         let mut ledger = self
             .ledger
@@ -2027,7 +2132,8 @@ impl SimpleBlockEvaluator {
             })?;
         algo_ledger::proposal_eval::record_ledger_lock_wait(waited.elapsed());
         let held = std::time::Instant::now();
-        let r = algo_ledger::shadow_execute::scratch_execute_payset(&mut *ledger, &candidate);
+        let r =
+            algo_ledger::shadow_execute::scratch_execute_payset(&mut *ledger, &candidate, request);
         algo_ledger::proposal_eval::record_ledger_lock_hold(held.elapsed());
         Ok(r)
     }
@@ -2052,6 +2158,7 @@ impl SimpleBlockEvaluator {
     ///   `algod_rust_proposal_scratch_failures_total`.
     fn finalize_payset(
         &mut self,
+        own_addresses: &std::sync::Arc<std::collections::HashSet<algo_types::Address>>,
     ) -> Result<(Vec<algo_types::SignedTransaction>, u64), algo_error::AlgoError> {
         use algo_ledger::shadow_execute::ScratchFailure;
         const MAX_FAILURE_PASSES: usize = 8;
@@ -2066,6 +2173,7 @@ impl SimpleBlockEvaluator {
         // value behind for `generate_block` to read (issue #1791).
         exec.final_state_proof_next = None;
         exec.final_fee_sink_available = None;
+        exec.final_knock_offline = None;
         if pristine.is_empty() {
             return Ok((pristine, 0));
         }
@@ -2077,33 +2185,27 @@ impl SimpleBlockEvaluator {
         let mut bisected = false;
         let mut final_state_proof_next = None;
         let mut final_fee_sink_available = None;
+        let mut final_knock_offline = None;
         let result = loop {
             passes += 1;
-            let result = self.scratch_pass(&template, &pristine, &groups)?;
+            let result =
+                self.scratch_pass(&template, &pristine, &groups, Some(own_addresses), true)?;
             match result {
                 Ok(done) => {
-                    let mut payset = pristine.clone();
-                    for (stx, ad) in payset.iter_mut().zip(done.apply_data) {
-                        stx.closing_amount = ad.closing_amount;
-                        stx.asset_closing_amount = ad.asset_closing_amount;
-                        stx.sender_rewards = ad.sender_rewards;
-                        stx.receiver_rewards = ad.receiver_rewards;
-                        stx.close_rewards = ad.close_rewards;
-                        stx.apply_data_config_asset = ad.config_asset;
-                        stx.apply_data_application_id = ad.application_id;
-                        stx.eval_delta = ad.eval_delta;
-                    }
-                    let sizes: Vec<usize> = payset.iter().map(Self::encoded_len).collect();
-                    let total: usize = sizes.iter().sum();
+                    let payset = Self::with_apply_data(&pristine, &done.apply_data);
+                    // The exact size, measured here outside the ledger lock.
+                    let total: usize = payset.iter().map(Self::encoded_len).sum();
                     if total <= self.max_txn_bytes {
                         self.txn_bytes = total;
                         let counted = done.final_txn_counter.saturating_sub(self.hdr.txn_counter);
                         final_state_proof_next = done.final_state_proof_next;
                         final_fee_sink_available = done.final_fee_sink_available;
+                        final_knock_offline = done.knock_offline_lists;
                         break (payset, counted);
                     }
                     // Largest fitting prefix of groups, from the sizes just
                     // measured; one more pass verifies it.
+                    let sizes: Vec<usize> = payset.iter().map(Self::encoded_len).collect();
                     let mut acc = 0usize;
                     let mut keep = 0usize;
                     for g in &groups {
@@ -2183,6 +2285,24 @@ impl SimpleBlockEvaluator {
                 }
             }
         };
+        // The size gate is an estimate: if it judged the kept pass too big (the
+        // exact size fits, e.g. near the limit) the pass skipped the list scan.
+        // One more pass over the kept payset, ungated, produces the lists.
+        if final_knock_offline.is_none() && !result.0.is_empty() {
+            match self.scratch_pass(&template, &pristine, &groups, Some(own_addresses), false) {
+                Ok(Ok(done)) => final_knock_offline = done.knock_offline_lists,
+                Ok(Err(failure)) => warn!(
+                    ?failure,
+                    "block assembly: list pass over the kept payset failed; \
+                     using the ledger-tip lists"
+                ),
+                Err(e) => warn!(
+                    error = %e,
+                    "block assembly: list pass over the kept payset failed; \
+                     using the ledger-tip lists"
+                ),
+            }
+        }
         if dropped > 0 {
             warn!(
                 dropped_groups = dropped,
@@ -2194,6 +2314,7 @@ impl SimpleBlockEvaluator {
             exec.last_passes = passes;
             exec.final_state_proof_next = final_state_proof_next;
             exec.final_fee_sink_available = final_fee_sink_available;
+            exec.final_knock_offline = final_knock_offline;
         }
         if result.0.is_empty() {
             self.txn_bytes = 0;
@@ -2245,7 +2366,7 @@ impl SimpleBlockEvaluator {
             let mid = (lo + hi).div_ceil(2);
             let end = groups[mid - 1].start + groups[mid - 1].len;
             *passes += 1;
-            match self.scratch_pass(template, &payset[..end], &groups[..mid])? {
+            match self.scratch_pass(template, &payset[..end], &groups[..mid], None, false)? {
                 Ok(_) => lo = mid,
                 Err(_) => hi = mid - 1,
             }
@@ -2960,7 +3081,11 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         // rewards, created ids, eval deltas), exactly like go's
         // `GenerateBlock` output. Falls back to the legacy "included as
         // admitted" behavior only for an evaluator without exec state.
-        let (payset, txn_count) = self.finalize_payset()?;
+        // The proposer's own participating addresses are never listed as
+        // expired or absent (go `partAddrs`).
+        let own_addresses: std::sync::Arc<std::collections::HashSet<algo_types::Address>> =
+            std::sync::Arc::new(voting_accounts.iter().copied().collect());
+        let (payset, txn_count) = self.finalize_payset(&own_addresses)?;
         // The header's `StateProofTracking.NextRound` is what the payset's
         // state proof transactions leave behind, not the template's
         // (previous-round) value: go reads it from the cow at `endOfBlock`
@@ -3059,71 +3184,74 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             message: e.to_string(),
         })?;
 
-        // Compute the expired-participation-accounts sweep list (issue #526).
-        // Mirrors go's `generateKnockOfflineAccountsList`'s expiry half
-        // (`ledger/eval/eval.go`), invoked as part of the proposer's own
-        // block assembly (`eval.endOfBlock` → `generateKnockOfflineAccountsList`
-        // before `resetExpiredOnlineAccountsParticipationKeys` runs at apply
-        // time). Without this, a self-produced block never lists an account
-        // whose participation key has expired, so the apply-side sweep
-        // (`algo_ledger::apply::reset_expired_online_accounts`, which already
-        // reads this field correctly) never fires and the account stays
-        // `Online` forever.
-        let max_expired = self.consensus_params.max_proposed_expired_online_accounts;
-        let expired = if max_expired > 0 {
-            let candidates = self
-                .ledger
-                .lock()
-                .map_err(|e| algo_error::AlgoError::Ledger {
-                    message: format!("ledger lock poisoned: {e}"),
-                })?
-                .expired_participation_account_candidates(self.hdr.round.0, max_expired)?;
-            if candidates.is_empty() {
-                None
-            } else {
-                Some(candidates)
+        // The expired / absent participation lists (issues #526, #845, #1795).
+        // Mirrors go's `generateKnockOfflineAccountsList`, which runs in
+        // `endOfBlock` over the state AFTER the payset: the final scratch
+        // apply computed them there. With no payset evaluated (empty payset,
+        // or no exec state) the post-payset state is the ledger tip.
+        // Without them a self-produced block never expires or suspends
+        // anyone, and lists taken from the pre-block state can name an
+        // account the payset closed, renewed or re-registered, which the
+        // validating apply rejects. Nodes are free to propose any valid
+        // subset; a lower or empty list is always accepted.
+        //
+        // A NON-empty payset with no scratch result (store cannot roll back,
+        // transient failure, legacy path without exec state): the tip is not
+        // the post-payset state, but accounts the payset does not touch (and
+        // that are not the proposer's own) are unaffected by it, so the tip
+        // lists filtered to those are valid. A payset whose effects cannot be
+        // bounded (application calls: inner transactions) or a tip that is not
+        // this block's parent gets empty lists, which are always valid.
+        let lists = match self
+            .exec
+            .as_ref()
+            .and_then(|e| e.final_knock_offline.clone())
+        {
+            Some(lists) => lists,
+            None => {
+                let touched = if payset.is_empty() {
+                    Some(Vec::new())
+                } else {
+                    algo_ledger::apply::payset_touched_addresses_bounded(&payset)
+                };
+                match touched {
+                    None => algo_ledger::apply::KnockOfflineLists::default(),
+                    Some(touched) => {
+                        let ledger =
+                            self.ledger
+                                .lock()
+                                .map_err(|e| algo_error::AlgoError::Ledger {
+                                    message: format!("ledger lock poisoned: {e}"),
+                                })?;
+                        if ledger.current_round().0.saturating_add(1) != self.hdr.round.0 {
+                            algo_ledger::apply::KnockOfflineLists::default()
+                        } else {
+                            // Own addresses plus everything the payset touched,
+                            // built once (borrowed as is when nothing was touched).
+                            let extended;
+                            let exclude: &std::collections::HashSet<algo_types::Address> =
+                                if touched.is_empty() {
+                                    &own_addresses
+                                } else {
+                                    let mut set = (*own_addresses).clone();
+                                    set.extend(touched);
+                                    extended = set;
+                                    &extended
+                                };
+                            algo_ledger::apply::knock_offline_lists(
+                                &*ledger,
+                                self.hdr.round.0,
+                                &self.consensus_params,
+                                exclude,
+                                &[],
+                            )
+                        }
+                    }
+                }
             }
-        } else {
-            None
         };
-
-        // Compute the absent-participation-accounts sweep list (issue #845).
-        // Mirrors go's `generateKnockOfflineAccountsList`'s absentee half
-        // (`ledger/eval/eval.go`): for every `Online && IncentiveEligible`
-        // account not among this node's own participating addresses or
-        // already listed as expired above, check `isAbsent` (silent for
-        // longer than its stake-scaled allowance) or an active-challenge
-        // failure, and list it for suspension. Without this, a self-produced
-        // block's `ParticipationUpdates.AbsentParticipationAccounts` was
-        // always empty (`hdr.absent_participation_accounts.clone()` below
-        // just carried forward the previous header's -- always `None` --
-        // value), so this node never proposed suspending a genuinely absent
-        // online account; the apply-side sweep
-        // (`algo_ledger::apply::validate_absent_online_accounts`, the
-        // consumer/validator side) was already correct.
-        let mut absent_exclude: std::collections::HashSet<algo_types::Address> =
-            voting_accounts.iter().copied().collect();
-        if let Some(expired) = &expired {
-            absent_exclude.extend(expired.iter().copied());
-        }
-        let absent = {
-            let candidates = self
-                .ledger
-                .lock()
-                .map_err(|e| algo_error::AlgoError::Ledger {
-                    message: format!("ledger lock poisoned: {e}"),
-                })?
-                .absent_participation_account_candidates(
-                    self.hdr.round.0,
-                    &self.consensus_params,
-                    &absent_exclude,
-                )?;
-            if candidates.is_empty() {
-                None
-            } else {
-                Some(candidates)
-            }
-        };
+        let expired = (!lists.expired.is_empty()).then_some(lists.expired);
+        let absent = (!lists.absent.is_empty()).then_some(lists.absent);
 
         // Build the block from `header_block(&self.hdr)` (ALL header fields),
         // then overriding the computed fields (txn_counter, commitments,
@@ -3637,6 +3765,7 @@ impl PoolLedgerAdapter {
                 last_passes: 0,
                 final_state_proof_next: None,
                 final_fee_sink_available: None,
+                final_knock_offline: None,
             }
         };
 
@@ -6812,6 +6941,11 @@ mod tests {
         use algo_types::AccountStatus;
 
         let ledger = test_ledger();
+        // The ledger tip is the parent of the block being built.
+        ledger
+            .lock()
+            .expect("ledger lock")
+            .set_current_round(Round(5));
 
         // Seed an online account whose vote key expired before the round
         // about to be built (round 6): VoteLastValid = 3 < 6.
@@ -6880,6 +7014,11 @@ mod tests {
         use algo_types::AccountStatus;
 
         let ledger = test_ledger();
+        // The ledger tip is the parent of the block being built.
+        ledger
+            .lock()
+            .expect("ledger lock")
+            .set_current_round(Round(5));
 
         // Online account whose vote key is still valid at the round being
         // built (round 6): VoteLastValid = 100 >= 6.
@@ -6929,26 +7068,38 @@ mod tests {
         use algo_types::AccountStatus;
 
         let ledger = test_ledger();
+        // The ledger tip is the parent of the block being built.
+        ledger
+            .lock()
+            .expect("ledger lock")
+            .set_current_round(Round(100));
 
         // Seed a single online, incentive-eligible account that hasn't
-        // proposed or heartbeated since round 1. With only one online
-        // account, total_online_voting_stake == this account's own stake,
-        // so is_absent's allowable_lag collapses to exactly ABSENT_FACTOR
-        // (20): last_seen(1) + 20 = 21 < 101 (the round being built), so
-        // this account must be listed absent.
+        // proposed or heartbeated since round 1. It was online at the
+        // balance round (seeded history row) and the lookback total (seeded
+        // supply snapshot) is its own stake, so is_absent's allowable_lag
+        // collapses to exactly ABSENT_FACTOR (20): last_seen(1) + 20 = 21 <
+        // 101 (the round being built), so this account must be listed absent.
         let absent_addr = Address([9u8; 32]);
         {
             let mut l = ledger.lock().expect("ledger lock");
-            l.set_account(
-                &absent_addr,
-                AccountData {
-                    micro_algos: 5_000_000,
-                    status: AccountStatus::Online,
-                    incentive_eligible: true,
-                    last_heartbeat: 1,
-                    ..AccountData::default()
-                },
-            );
+            let acct = AccountData {
+                micro_algos: 5_000_000,
+                status: AccountStatus::Online,
+                incentive_eligible: true,
+                last_heartbeat: 1,
+                vote_id: Some([1u8; 32]),
+                vote_last_valid: 1_000_000,
+                ..AccountData::default()
+            };
+            l.set_account(&absent_addr, acct.clone());
+            // Online at the balance round (go's `LookupAgreement` history).
+            l.put_online_account_at_round(&absent_addr, 0, &acct)
+                .expect("seed online history");
+            l.put_online_supply_at_round(0, 5_000_000)
+                .expect("seed lookback supply");
+            l.put_block_header_fixture(0, 0)
+                .expect("seed balance-round header");
         }
 
         let adapter = PoolLedgerAdapter::new(ledger.clone());
@@ -7003,6 +7154,11 @@ mod tests {
         use algo_types::AccountStatus;
 
         let ledger = test_ledger();
+        // The ledger tip is the parent of the block being built.
+        ledger
+            .lock()
+            .expect("ledger lock")
+            .set_current_round(Round(100));
 
         // Same single-online-account setup as the positive case, but with
         // a recent last_heartbeat: last_seen(100) + allowable_lag(20) =
@@ -7017,9 +7173,17 @@ mod tests {
                     status: AccountStatus::Online,
                     incentive_eligible: true,
                     last_heartbeat: 100,
+                    vote_id: Some([1u8; 32]),
+                    vote_last_valid: 1_000_000,
                     ..AccountData::default()
                 },
             );
+            // The lag is judged against the balance-round lookback total
+            // (go `onlineStake()`): this account's own stake.
+            l.put_online_supply_at_round(0, 5_000_000)
+                .expect("seed lookback supply");
+            l.put_block_header_fixture(0, 0)
+                .expect("seed balance-round header");
         }
 
         let adapter = PoolLedgerAdapter::new(ledger.clone());
@@ -7050,6 +7214,11 @@ mod tests {
         use algo_types::AccountStatus;
 
         let ledger = test_ledger();
+        // The ledger tip is the parent of the block being built.
+        ledger
+            .lock()
+            .expect("ledger lock")
+            .set_current_round(Round(100));
 
         // An account that would otherwise trip is_absent (very stale
         // last_heartbeat), but is not IncentiveEligible -- go's
@@ -7099,6 +7268,11 @@ mod tests {
         use algo_types::AccountStatus;
 
         let ledger = test_ledger();
+        // The ledger tip is the parent of the block being built.
+        ledger
+            .lock()
+            .expect("ledger lock")
+            .set_current_round(Round(100));
 
         // Same stale-heartbeat setup that would otherwise trip is_absent,
         // but this address is passed as one of the node's own
