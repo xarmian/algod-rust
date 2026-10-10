@@ -170,13 +170,22 @@ def raw_block(r):
 
 
 _delta_mem = {}
+DELTA_404_RETRIES = 12
 
 
 def delta(r):
     if r not in _delta_mem:
 
         def f():
-            resp = http(f"{ALGOD}/v2/deltas/{r}", {"format": "msgpack"})
+            # algonode load-balances over backends of which some lack a given
+            # round, so the same URL alternates 200 and 404 (issue #1769: a
+            # 43-minute capture died on a transient 404). A real gap still
+            # fails after DELTA_404_RETRIES attempts.
+            for attempt in range(DELTA_404_RETRIES):
+                resp = http(f"{ALGOD}/v2/deltas/{r}", {"format": "msgpack"})
+                if resp.status_code != 404:
+                    break
+                time.sleep(0.5 * min(attempt + 1, 4))
             resp.raise_for_status()
             return resp.content
 
