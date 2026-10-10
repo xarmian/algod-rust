@@ -1755,3 +1755,67 @@ fn account_that_went_online_after_the_balance_round_is_not_listed_absent() {
     let err = algo_ledger::apply_block_validating(&mut *l, &block).unwrap_err();
     assert!(err.to_string().contains("is not absent"), "{err}");
 }
+
+/// The tip-vs-parent check also guards the empty payset: when the ledger tip
+/// is not the block's parent (the chain moved under the evaluator) the tip's
+/// state says nothing about this block, so the lists are empty.
+#[test]
+fn empty_payset_with_a_stale_tip_gets_empty_lists() {
+    let c = key(3);
+    let (ledger, mut eval) = evaluator_at_99(&[(c.0, online_with_key(5_000_000, 60))]);
+    ledger.lock().unwrap().set_current_round(Round(120));
+    let block = eval.generate_block(&[]).expect("generate_block");
+    assert!(block.payset.is_empty());
+    assert!(block.expired_participation_accounts.is_none());
+    assert!(block.absent_participation_accounts.is_none());
+}
+
+/// The size gate is an estimate. When it judges the kept pass too big although
+/// the exact size fits (here the limit is exactly the encoded size), the pass
+/// skips the scan and one ungated pass produces the lists: the proposal is
+/// still complete, and the scan ran exactly once.
+#[test]
+fn lists_survive_a_size_estimate_that_overshoots_the_limit() {
+    let a = key(1);
+    let b = key(2);
+    let x = key(3);
+    let accounts = [
+        (a.0, funded(50_000_000)),
+        (b.0, funded(1_000_000)),
+        (x.0, online_with_key(5_000_000, 60)),
+        (key(4).0, online_with_key(5_000_000, 60)),
+    ];
+    let (_l, mut probe) = evaluator_at_99(&accounts);
+    probe
+        .transaction_group(&[pay(&a, a.0, 1, None)])
+        .expect("payment");
+    probe
+        .transaction_group(&[pay(&x, b.0, 0, Some(b.0))])
+        .expect("close-out");
+    let full = probe.generate_block(&[]).expect("generate_block");
+    assert_eq!(full.payset.len(), 2);
+    let exact: usize = full
+        .payset
+        .iter()
+        .map(SimpleBlockEvaluator::encoded_len)
+        .sum();
+
+    let (_ledger, mut eval) = evaluator_at_99_limited(&accounts, exact);
+    eval.transaction_group(&[pay(&a, a.0, 1, None)])
+        .expect("payment");
+    eval.transaction_group(&[pay(&x, b.0, 0, Some(b.0))])
+        .expect("close-out");
+    test_hooks::reset_knock_offline_calls();
+    let block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(block.payset.len(), 2, "the exact size fits the limit");
+    assert_eq!(
+        block.expired_participation_accounts.as_deref(),
+        Some(&[key(4).0][..]),
+        "x is closed by the payset; the other expired account is listed"
+    );
+    assert_eq!(
+        test_hooks::knock_offline_calls(),
+        1,
+        "one scan, whichever pass produced the lists"
+    );
+}

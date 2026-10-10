@@ -1824,19 +1824,22 @@ pub struct ExecProbe {
     pub knock_offline_gate: Option<FitsGate>,
     /// Output of [`Self::knock_offline_exclude`]; only set on success.
     pub knock_offline_lists: Option<KnockOfflineLists>,
-    /// Output of [`Self::knock_offline_gate`]: the encoded size of the pass's
-    /// payset with its ApplyData, so the proposer does not encode it again.
-    pub payset_bytes: Option<usize>,
 }
 
-/// Measures a scratch pass's payset and its limit: does the resulting payset
-/// fit the block? See [`ExecProbe::knock_offline_gate`]. A plain function over
-/// the apply's own `block.payset` and per-transaction [`ApplyData`], so no
-/// copy of the payset is captured or made under the ledger mutex.
-#[derive(Debug, Clone, Copy)]
+/// Estimates whether a scratch pass's payset, once its [`ApplyData`] is
+/// encoded, fits the block: the stripped transactions' already-measured
+/// encoded sizes plus an estimate of each `ApplyData`'s encoded size. It only
+/// gates the optional list scan (see [`ExecProbe::knock_offline_gate`]); the
+/// proposer still measures the exact size outside the ledger lock and never
+/// proposes an oversize block, so a wrong estimate costs a wasted scan or one
+/// extra pass, never correctness. Built from sizes computed outside the lock,
+/// so nothing is cloned or encoded under the mutex.
+#[derive(Debug, Clone)]
 pub struct FitsGate {
-    /// Encoded size of the payset once `ApplyData` is filled in.
-    pub size_of: fn(&[SignedTransaction], &[ApplyData]) -> usize,
+    /// Encoded size of each stripped payset transaction (no ApplyData).
+    pub base_sizes: std::sync::Arc<[usize]>,
+    /// Estimated extra encoded bytes one `ApplyData` adds.
+    pub overhead_of: fn(&ApplyData) -> usize,
     /// The block byte limit.
     pub max: usize,
 }
@@ -1928,35 +1931,16 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
     }
     candidates.sort_by_key(|(a, _)| a.0);
 
-    // Absence inputs (go computes them before looking at candidates; an error
-    // fetching the online stake means no knock-offs at all).
-    //
-    // The stake-based lag test needs a per-round supply snapshot at the
-    // balance round: without one the total would come from today's aggregate
-    // while each account's stake comes from history (two time bases), so that
-    // test is undecidable and skipped -- an empty list is always valid. The
-    // challenge-failure test needs no stake and keeps working. (The validator
-    // keeps go's semantics and judges what a block lists.)
+    // Absence inputs. The total online stake is the balance-round lookback
+    // total on the same history basis as each account's stake
+    // (`balance_round_total_online_stake`: supply snapshot, else derived from
+    // the `onlineaccounts` history), fetched lazily at the first candidate
+    // that needs the stake-based lag test. If it cannot be determined the lag
+    // test is undecidable and skipped -- an empty list is always valid -- and
+    // that is logged once per process, not per block. The challenge-failure
+    // test needs no stake and keeps working.
     let brnd = algo_agreement::balance_round(algo_types::Round(round), consensus);
-    let lag_decidable = max_absent > 0 && store.has_online_supply_snapshot(brnd.0);
-    if max_absent > 0 && !lag_decidable {
-        tracing::warn!(
-            round,
-            balance_round = brnd.0,
-            "no online-supply snapshot at the balance round: not proposing stake-based absences"
-        );
-    }
-    let total_online_stake = if lag_decidable {
-        match lookback_total_online_stake(store, round, consensus) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!("unable to fetch online stake, no knockoffs: {e}");
-                return lists;
-            }
-        }
-    } else {
-        0
-    };
+    let mut total_cache: Option<Option<u64>> = None;
     let challenge = if max_absent > 0 {
         let provider = crate::heartbeat::StoreHeaderProvider { store };
         crate::heartbeat::find_challenge(
@@ -1968,19 +1952,16 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
     } else {
         crate::heartbeat::Challenge::default()
     };
-    let rewards_level = store.rewards_level();
-
     for (addr, acct) in candidates {
         if lists.expired.len() >= max_expired && lists.absent.len() >= max_absent {
             break; // both lists are full
         }
-        let with_rewards =
-            acct.micro_algos
-                .saturating_add(crate::rewards::compute_pending_rewards(
-                    &acct,
-                    rewards_level,
-                ));
-        if with_rewards == 0 || exclude.contains(&addr) {
+        // go skips `MicroAlgosWithRewards.IsZero()` (an account being
+        // closed). Rewards are `(level - base) * (micro / unit)`, nonzero only
+        // for a nonzero balance, so this is `micro_algos == 0` whichever
+        // rewards level (prior round for untouched candidates, post-payset for
+        // touched ones) the figure is taken at.
+        if acct.micro_algos == 0 || exclude.contains(&addr) {
             continue;
         }
         let has_vote_key = acct.vote_id.is_some_and(|v| v != [0u8; 32]);
@@ -2002,9 +1983,21 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
             lists.absent.push(addr);
             continue;
         }
-        if !lag_decidable || last_seen == 0 {
+        if last_seen == 0 {
             continue;
         }
+        let total_online_stake = match *total_cache.get_or_insert_with(|| {
+            match store.balance_round_total_online_stake(brnd.0, round) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    note_undecidable_absence_once(round, brnd.0, &e);
+                    None
+                }
+            }
+        }) {
+            Some(t) => t,
+            None => continue, // undecidable: the lag test is skipped
+        };
         let Ok(stake) = lookback_voting_stake(store, round, consensus, &addr) else {
             tracing::error!("unable to check account for absenteeism: {addr}");
             continue;
@@ -2014,6 +2007,25 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
         }
     }
     lists
+}
+
+/// Log, once per process, that the stake-based absence test is undecidable
+/// (no supply snapshot and no usable history at the balance round).
+fn note_undecidable_absence_once(round: u64, balance_round: u64, err: &AlgoError) {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::debug!(
+            round,
+            balance_round,
+            "{err}; no stake-based absences proposed"
+        );
+    } else {
+        tracing::warn!(
+            round,
+            balance_round,
+            "{err}; not proposing stake-based absences (logged once; later rounds at debug)"
+        );
+    }
 }
 
 /// The addresses a payset's top-level transactions name: the accounts a block
@@ -2044,8 +2056,13 @@ pub fn payset_touched_addresses(payset: &[algo_types::SignedTransaction]) -> Vec
 }
 
 /// The accounts `payset` is known not to have modified beyond: its
-/// [`payset_touched_addresses`], or `None` when that set cannot be bounded --
-/// an application call can modify any account through inner transactions.
+/// [`payset_touched_addresses`], or `None` when that set cannot be bounded.
+/// Checked against go's transaction effects: payments (receiver, close-out
+/// credit), asset transfers (sender/clawback, receiver, close-to), freezes
+/// (freeze target), keyregs, asset configs and heartbeats (target) only ever
+/// modify accounts the transaction itself names, and a rekey changes the
+/// sender's own record. Only an application call can modify other accounts
+/// (inner transactions), so an `appl` is the one unbounded case.
 /// Used to filter lists computed from the pre-payset ledger tip.
 pub fn payset_touched_addresses_bounded(payset: &[SignedTransaction]) -> Option<Vec<Address>> {
     if payset
@@ -2072,6 +2089,18 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
     probe: Option<&mut ExecProbe>,
 ) -> Result<(), AlgoError> {
     let skip_epilogue = probe.as_ref().is_some_and(|p| p.skip_epilogue);
+    // The size gate reads the per-transaction ApplyData: without a place to
+    // collect it the gate would see an empty payset and wave everything
+    // through, so that combination is rejected up front, before any mutation.
+    if probe
+        .as_ref()
+        .is_some_and(|p| p.knock_offline_gate.is_some())
+        && apply_data_out.is_none()
+    {
+        return Err(AlgoError::Ledger {
+            message: "knock_offline_gate requires apply_data_out".to_string(),
+        });
+    }
     let check_payouts = validate || probe.as_ref().is_some_and(|p| p.validate_payouts);
     // Index of the transaction whose apply failed (see `ExecProbe`).
     let mut failed_txn: Option<usize> = None;
@@ -2449,12 +2478,17 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         if result.is_ok() {
             p.final_txn_counter = ctx.txn_counter.get();
             p.final_state_proof_next = final_state_proof_next;
-            let ad = apply_data_out.as_deref().map(Vec::as_slice).unwrap_or(&[]);
             let fits = match &p.knock_offline_gate {
                 Some(g) => {
-                    let bytes = (g.size_of)(&block.payset, ad);
-                    p.payset_bytes = Some(bytes);
-                    bytes <= g.max
+                    // `apply_data_out` is present (checked on entry).
+                    let ad = apply_data_out.as_deref().map(Vec::as_slice).unwrap_or(&[]);
+                    let estimate: usize = g
+                        .base_sizes
+                        .iter()
+                        .zip(ad)
+                        .map(|(base, a)| base + (g.overhead_of)(a))
+                        .sum();
+                    estimate <= g.max
                 }
                 None => true,
             };
@@ -2891,7 +2925,7 @@ pub(crate) fn lookback_total_online_stake<L: crate::store_trait::LedgerStore>(
     consensus: &ConsensusParams,
 ) -> Result<u64, AlgoError> {
     let brnd = algo_agreement::balance_round(algo_types::Round(round), consensus);
-    store.online_stake_at_round(brnd.0, round)
+    store.balance_round_total_online_stake(brnd.0, round)
 }
 
 /// An account's voting stake for absence checks: go
@@ -2957,43 +2991,26 @@ fn validate_absent_online_accounts<L: crate::store_trait::LedgerStore>(
         });
     }
 
-    // Total online stake (balance-round lookback, go `onlineStake()`) and the
-    // currently-active challenge (go's `FindChallenge(..., ChActive)`) are only
-    // needed when there's at least one candidate to check them against.
+    // The currently-active challenge (go's `FindChallenge(..., ChActive)`) and,
+    // lazily, the total online stake (balance-round lookback, go
+    // `onlineStake()`) are only needed when a candidate reaches that check.
     //
-    // go always has the supply snapshot at the balance round. Here a missing
-    // one would silently swap the total for today's aggregate while the
-    // per-account stake stays historical (two time bases), so the stake-based
-    // lag test is undecidable: it is skipped (with a warning) and a listed
-    // account passes on the other eligibility checks or the challenge test.
-    // This never rejects a certified block for a gap in local history; a
-    // store ERROR still propagates.
-    let brnd = algo_agreement::balance_round(algo_types::Round(block.round.0), consensus);
-    let lag_decidable = !absent.is_empty() && store.has_online_supply_snapshot(brnd.0);
-    if !absent.is_empty() && !lag_decidable {
-        tracing::warn!(
-            round = block.round.0,
-            balance_round = brnd.0,
-            "no online-supply snapshot at the balance round: skipping the stake-based absence test"
-        );
-    }
-    let (total_online_stake, challenge) = if absent.is_empty() {
-        (0, crate::heartbeat::Challenge::default())
+    // The total is on the history basis (supply snapshot, else derived from
+    // the `onlineaccounts` rows; see `balance_round_total_online_stake`). If it
+    // cannot be determined the block is REJECTED (the store error propagates):
+    // the validating path never skips the check.
+    let challenge = if absent.is_empty() {
+        crate::heartbeat::Challenge::default()
     } else {
-        let total = if lag_decidable {
-            lookback_total_online_stake(store, block.round.0, consensus)?
-        } else {
-            0
-        };
         let provider = crate::heartbeat::StoreHeaderProvider { store };
-        let ch = crate::heartbeat::find_challenge(
+        crate::heartbeat::find_challenge(
             consensus,
             block.round.0,
             &provider,
             crate::heartbeat::ChallengePeriod::Active,
-        );
-        (total, ch)
+        )
     };
+    let mut total_online_stake: Option<u64> = None;
 
     // Check for duplicates and basic account eligibility for suspension.
     let mut seen = std::collections::HashSet::with_capacity(absent.len());
@@ -3026,17 +3043,20 @@ fn validate_absent_online_accounts<L: crate::store_trait::LedgerStore>(
         }
 
         let last_seen = crate::heartbeat::last_seen(acct.last_proposed, acct.last_heartbeat);
-        if lag_decidable {
-            let acct_stake = lookback_voting_stake(store, block.round.0, consensus, addr)?;
-            if is_absent(total_online_stake, acct_stake, last_seen, block.round.0) {
-                continue; // ok. it's "normal absent"
-            }
-        }
         if challenge.failed(&addr.0, last_seen) {
             continue; // ok. it's "challenge absent"
         }
-        if !lag_decidable {
-            continue; // undecidable by stake (see above): not rejected
+        let total = match total_online_stake {
+            Some(t) => t,
+            None => {
+                let t = lookback_total_online_stake(store, block.round.0, consensus)?;
+                total_online_stake = Some(t);
+                t
+            }
+        };
+        let acct_stake = lookback_voting_stake(store, block.round.0, consensus, addr)?;
+        if is_absent(total, acct_stake, last_seen, block.round.0) {
+            continue; // ok. it's "normal absent"
         }
         return Err(AlgoError::Ledger {
             message: format!(
@@ -14259,8 +14279,8 @@ return
             algo_types::consensus::CONSENSUS_V41,
         )
         .unwrap();
-        // Round 2250's balance round (2250 - 320): no snapshot there.
-        assert!(!ledger.has_online_supply_snapshot(1930));
+        // No supply snapshot at round 2250's balance round; the challenge
+        // path decides without the total.
 
         let lists = knock_offline_lists(&ledger, 2250, &consensus, &Default::default(), &[]);
         assert_eq!(
@@ -14281,13 +14301,13 @@ return
             .expect("challenge-failed account validates without a snapshot");
     }
 
-    /// Without a supply snapshot at the balance round the stake-based lag
-    /// test is undecidable (the total would be today's aggregate while the
-    /// stake is historical): the validator skips it instead of mixing time
-    /// bases and rejecting a block go accepts; with the snapshot the same
-    /// listing is judged and rejected.
+    /// Without a supply snapshot at the balance round the total is derived
+    /// from the `onlineaccounts` history (the basis of the per-account
+    /// stake), never from today's aggregate: the check stays decidable and
+    /// matches go. With the snapshot present the same listing is judged
+    /// against it.
     #[test]
-    fn validator_skips_the_lag_test_without_a_supply_snapshot() {
+    fn validator_derives_the_total_from_history_without_a_supply_snapshot() {
         use crate::sqlite::SqliteLedger;
         use crate::store_trait::LedgerStore;
 
@@ -14305,7 +14325,8 @@ return
         };
         ledger.set_account(&x, acct.clone());
         ledger.put_online_account_at_round(&x, 0, &acct).unwrap();
-        // Today's aggregate says 500M online: lag 2000 > 500 quiet rounds.
+        // Today's aggregate says 500M online (lag 2000 > 500 quiet rounds);
+        // the history says 5M (lag 20): the history decides.
         ledger
             .put_account_totals_seed(500_000_000, 0, 0, 0, 0, 0)
             .unwrap();
@@ -14322,12 +14343,88 @@ return
         block.round = Round(501);
 
         validate_absent_online_accounts(&ledger, &block, &consensus, true)
-            .expect("no snapshot: the lag test is skipped, not decided on mixed bases");
+            .expect("derived total 5M: the account is absent");
 
-        // Round 501's balance round is 181; with its snapshot the lag is judged.
+        // Round 501's balance round is 181; its snapshot is judged when present.
         ledger.put_online_supply_at_round(181, 500_000_000).unwrap();
         let err = validate_absent_online_accounts(&ledger, &block, &consensus, true).unwrap_err();
         assert!(err.to_string().contains("is not absent"), "{err}");
+    }
+
+    /// No snapshot and no history: the total cannot be determined on the
+    /// historical basis, so the validating path fails closed (rejects the
+    /// block) instead of skipping the check.
+    #[test]
+    fn validator_fails_closed_when_the_total_cannot_be_determined() {
+        use crate::sqlite::SqliteLedger;
+        use crate::store_trait::LedgerStore;
+
+        let x = Address([11u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.set_account(
+            &x,
+            algo_types::AccountData {
+                micro_algos: 5_000_000,
+                status: AccountStatus::Online,
+                incentive_eligible: true,
+                last_heartbeat: 1,
+                vote_id: Some([5u8; 32]),
+                vote_last_valid: 1_000_000,
+                ..algo_types::AccountData::default()
+            },
+        );
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+        let mut block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            None,
+            Some(vec![x]),
+        );
+        block.round = Round(501);
+        let err = validate_absent_online_accounts(&ledger, &block, &consensus, true).unwrap_err();
+        assert!(err.to_string().contains("cannot determine"), "{err}");
+    }
+
+    /// A size gate needs the per-transaction ApplyData it estimates from:
+    /// asking for one without an `apply_data_out` is rejected up front, never
+    /// silently treated as an empty payset that fits.
+    #[test]
+    fn knock_offline_gate_without_apply_data_out_is_rejected() {
+        use crate::sqlite::SqliteLedger;
+
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let block = Block {
+            round: Round(1),
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            ..Block::default()
+        };
+        let mut probe = ExecProbe {
+            knock_offline_exclude: Some(Default::default()),
+            knock_offline_gate: Some(FitsGate {
+                base_sizes: std::sync::Arc::from(Vec::<usize>::new()),
+                overhead_of: |_| 0,
+                max: 1,
+            }),
+            ..ExecProbe::default()
+        };
+        let err = apply_block_impl_probe(
+            &mut ledger,
+            &block,
+            ApplyMode::Execute,
+            false,
+            None,
+            None,
+            None,
+            None,
+            true,
+            Some(&mut probe),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("requires apply_data_out"), "{err}");
     }
 
     /// Phase 17 (e2e sweep batch 2): TestWhaleJoin / TestBigJoin /

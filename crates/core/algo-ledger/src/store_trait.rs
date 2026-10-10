@@ -702,12 +702,20 @@ pub trait LedgerStore {
     /// sortition/committee-sizing lookback.
     fn online_stake_at_round(&self, round: u64, vote_rnd: u64) -> Result<u64, AlgoError>;
 
-    /// Whether a per-round online-supply snapshot exists for `round`. When it
-    /// does not, [`Self::online_stake_at_round`] falls back to today's
-    /// aggregate, a different time basis from
-    /// [`Self::voter_agreement_data_at_round`]'s historical rows; the
-    /// proposer then treats absence as undecidable (issue #1795).
-    fn has_online_supply_snapshot(&self, round: u64) -> bool;
+    /// The total online stake the absence checks divide by (go
+    /// `roundCowBase.onlineStake()` = `OnlineCirculation(balanceRound, round)`),
+    /// on the SAME time basis as [`Self::voter_agreement_data_at_round`]'s
+    /// historical rows: from the per-round supply snapshot at `balance_round`
+    /// when there is one, else derived from the `onlineaccounts` history.
+    /// Unlike [`Self::online_stake_at_round`] it never falls back to today's
+    /// aggregate; when the total cannot be determined on the historical basis
+    /// it is an `Err` (the validator rejects the block, the proposer lists no
+    /// stake-based absences). Issue #1795.
+    fn balance_round_total_online_stake(
+        &self,
+        balance_round: u64,
+        vote_rnd: u64,
+    ) -> Result<u64, AlgoError>;
 
     /// Store a voters snapshot -- `(voters_commitment, online_total_weight)`
     /// -- keyed by the round it was taken at (go's `votersForRoundCache` map

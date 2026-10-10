@@ -1621,6 +1621,26 @@ struct ExecState {
     final_knock_offline: Option<algo_ledger::apply::KnockOfflineLists>,
 }
 
+/// Counts the bytes written to it.
+struct CountingWriter(usize);
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Encoded msgpack length of `v`, without allocating the encoding.
+fn encoded_value_len(v: &rmpv::Value) -> usize {
+    let mut c = CountingWriter(0);
+    let _ = rmpv::encode::write_value(&mut c, v);
+    c.0
+}
+
 impl SimpleBlockEvaluator {
     /// Restore genesis fields on a signed transaction that may have had them
     /// stripped (STIB format). If `has_genesis_id` is set and genesis_id is
@@ -2022,33 +2042,30 @@ impl SimpleBlockEvaluator {
         out
     }
 
-    /// Encoded size of `payset` once `apply_data` is filled in. Runs inside
-    /// the apply under the ledger mutex (see `ExecProbe::knock_offline_gate`)
-    /// over the apply's own payset: it never copies the payset, only one
-    /// transaction at a time while encoding it. Each transaction is encoded
-    /// once here; `finalize_payset` reuses the total on the happy path and
-    /// encodes per-transaction sizes (outside the lock) only when oversize.
-    fn encoded_len_with_apply_data(
-        payset: &[algo_types::SignedTransaction],
-        apply_data: &[algo_ledger::apply::ApplyData],
-    ) -> usize {
-        payset
-            .iter()
-            .zip(apply_data)
-            .map(|(stx, ad)| {
-                let mut one = stx.clone();
-                Self::fill_apply_data(&mut one, ad);
-                Self::encoded_len(&one)
-            })
-            .sum()
-    }
-
-    /// The block-size gate handed to the scratch apply.
-    fn fits_gate(&self) -> algo_ledger::apply::FitsGate {
-        algo_ledger::apply::FitsGate {
-            size_of: Self::encoded_len_with_apply_data,
-            max: self.max_txn_bytes,
-        }
+    /// Estimated extra encoded bytes one `ApplyData` adds to its transaction:
+    /// at most ~21 bytes per nonzero numeric field (msgpack key + 9-byte
+    /// value) plus the encoded `eval_delta`. Only an estimate for the list
+    /// scan's size gate (see `ExecProbe::knock_offline_gate`); the exact size
+    /// is always measured outside the ledger lock before a payset is kept.
+    fn apply_data_overhead(ad: &algo_ledger::apply::ApplyData) -> usize {
+        const NUMERIC_FIELD: usize = 21;
+        let numeric = [
+            ad.closing_amount,
+            ad.asset_closing_amount,
+            ad.sender_rewards,
+            ad.receiver_rewards,
+            ad.close_rewards,
+            ad.config_asset,
+            ad.application_id,
+        ]
+        .iter()
+        .filter(|v| **v != 0)
+        .count();
+        let delta = ad
+            .eval_delta
+            .as_ref()
+            .map_or(0, |v| 8 + encoded_value_len(v));
+        numeric * NUMERIC_FIELD + delta
     }
 
     /// One scratch evaluation of `payset` (groups described by `groups`)
@@ -2064,6 +2081,7 @@ impl SimpleBlockEvaluator {
         payset: &[algo_types::SignedTransaction],
         groups: &[ExecGroup],
         own_addresses: Option<&std::collections::HashSet<algo_types::Address>>,
+        gated: bool,
     ) -> Result<
         Result<
             algo_ledger::shadow_execute::ScratchPayset,
@@ -2074,8 +2092,11 @@ impl SimpleBlockEvaluator {
         let mut candidate = template.clone();
         candidate.payset = payset.to_vec();
         candidate.fees_collected = groups.iter().map(|g| g.fees).sum();
+        // Measured here, outside the ledger lock: feeds the load and the size
+        // gate, so nothing is cloned or encoded under the mutex.
+        let base_sizes: std::sync::Arc<[usize]> = payset.iter().map(Self::encoded_len).collect();
         if self.consensus_params.load_tracking {
-            let bytes: u64 = payset.iter().map(|s| Self::encoded_len(s) as u64).sum();
+            let bytes: u64 = base_sizes.iter().map(|b| *b as u64).sum();
             candidate.load =
                 algo_ledger::compute_load(bytes, self.consensus_params.max_txn_bytes_per_block);
         }
@@ -2092,10 +2113,15 @@ impl SimpleBlockEvaluator {
         // ledger lock, so only the pass the proposer keeps asks for them:
         // bisection probes do not, and a pass whose ApplyData leaves the
         // payset over the block limit (so it will be truncated and rerun) is
-        // gated out inside the apply, before the scan.
+        // estimated out inside the apply, before the scan.
+        let max = self.max_txn_bytes;
         let request = own_addresses.map(|own| algo_ledger::apply::ListsRequest {
             own_addresses: own.clone(),
-            fits: Some(self.fits_gate()),
+            fits: gated.then(|| algo_ledger::apply::FitsGate {
+                base_sizes: base_sizes.clone(),
+                overhead_of: Self::apply_data_overhead,
+                max,
+            }),
         });
         let r =
             algo_ledger::shadow_execute::scratch_execute_payset(&mut *ledger, &candidate, request);
@@ -2153,15 +2179,13 @@ impl SimpleBlockEvaluator {
         let mut final_knock_offline = None;
         let result = loop {
             passes += 1;
-            let result = self.scratch_pass(&template, &pristine, &groups, Some(own_addresses))?;
+            let result =
+                self.scratch_pass(&template, &pristine, &groups, Some(own_addresses), true)?;
             match result {
                 Ok(done) => {
                     let payset = Self::with_apply_data(&pristine, &done.apply_data);
-                    // The apply already measured the payset when the pass asked
-                    // for the lists; otherwise encode it here.
-                    let total: usize = done
-                        .payset_bytes
-                        .unwrap_or_else(|| payset.iter().map(Self::encoded_len).sum());
+                    // The exact size, measured here outside the ledger lock.
+                    let total: usize = payset.iter().map(Self::encoded_len).sum();
                     if total <= self.max_txn_bytes {
                         self.txn_bytes = total;
                         let counted = done.final_txn_counter.saturating_sub(self.hdr.txn_counter);
@@ -2252,6 +2276,16 @@ impl SimpleBlockEvaluator {
                 }
             }
         };
+        // The size gate is an estimate: if it judged the kept pass too big (the
+        // exact size fits, e.g. near the limit) the pass skipped the list scan.
+        // One more pass over the kept payset, ungated, produces the lists.
+        if final_knock_offline.is_none() && !result.0.is_empty() {
+            if let Ok(Ok(done)) =
+                self.scratch_pass(&template, &pristine, &groups, Some(own_addresses), false)
+            {
+                final_knock_offline = done.knock_offline_lists;
+            }
+        }
         if dropped > 0 {
             warn!(
                 dropped_groups = dropped,
@@ -2315,7 +2349,7 @@ impl SimpleBlockEvaluator {
             let mid = (lo + hi).div_ceil(2);
             let end = groups[mid - 1].start + groups[mid - 1].len;
             *passes += 1;
-            match self.scratch_pass(template, &payset[..end], &groups[..mid], None)? {
+            match self.scratch_pass(template, &payset[..end], &groups[..mid], None, false)? {
                 Ok(_) => lo = mid,
                 Err(_) => hi = mid - 1,
             }
@@ -3172,9 +3206,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                                 .map_err(|e| algo_error::AlgoError::Ledger {
                                     message: format!("ledger lock poisoned: {e}"),
                                 })?;
-                        if !payset.is_empty()
-                            && ledger.current_round().0.saturating_add(1) != self.hdr.round.0
-                        {
+                        if ledger.current_round().0.saturating_add(1) != self.hdr.round.0 {
                             algo_ledger::apply::KnockOfflineLists::default()
                         } else if touched.is_empty() {
                             algo_ledger::apply::knock_offline_lists(
@@ -6890,6 +6922,11 @@ mod tests {
         use algo_types::AccountStatus;
 
         let ledger = test_ledger();
+        // The ledger tip is the parent of the block being built.
+        ledger
+            .lock()
+            .expect("ledger lock")
+            .set_current_round(Round(5));
 
         // Seed an online account whose vote key expired before the round
         // about to be built (round 6): VoteLastValid = 3 < 6.
@@ -6958,6 +6995,11 @@ mod tests {
         use algo_types::AccountStatus;
 
         let ledger = test_ledger();
+        // The ledger tip is the parent of the block being built.
+        ledger
+            .lock()
+            .expect("ledger lock")
+            .set_current_round(Round(5));
 
         // Online account whose vote key is still valid at the round being
         // built (round 6): VoteLastValid = 100 >= 6.
@@ -7007,6 +7049,11 @@ mod tests {
         use algo_types::AccountStatus;
 
         let ledger = test_ledger();
+        // The ledger tip is the parent of the block being built.
+        ledger
+            .lock()
+            .expect("ledger lock")
+            .set_current_round(Round(100));
 
         // Seed a single online, incentive-eligible account that hasn't
         // proposed or heartbeated since round 1. It was online at the
@@ -7086,6 +7133,11 @@ mod tests {
         use algo_types::AccountStatus;
 
         let ledger = test_ledger();
+        // The ledger tip is the parent of the block being built.
+        ledger
+            .lock()
+            .expect("ledger lock")
+            .set_current_round(Round(100));
 
         // Same single-online-account setup as the positive case, but with
         // a recent last_heartbeat: last_seen(100) + allowable_lag(20) =
@@ -7139,6 +7191,11 @@ mod tests {
         use algo_types::AccountStatus;
 
         let ledger = test_ledger();
+        // The ledger tip is the parent of the block being built.
+        ledger
+            .lock()
+            .expect("ledger lock")
+            .set_current_round(Round(100));
 
         // An account that would otherwise trip is_absent (very stale
         // last_heartbeat), but is not IncentiveEligible -- go's
@@ -7188,6 +7245,11 @@ mod tests {
         use algo_types::AccountStatus;
 
         let ledger = test_ledger();
+        // The ledger tip is the parent of the block being built.
+        ledger
+            .lock()
+            .expect("ledger lock")
+            .set_current_round(Round(100));
 
         // Same stale-heartbeat setup that would otherwise trip is_absent,
         // but this address is passed as one of the node's own

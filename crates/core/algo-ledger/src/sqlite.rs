@@ -5360,7 +5360,17 @@ impl SqliteLedger {
         } else {
             self.online_stake()?
         };
+        self.exclude_expired_from_total(total, round, vote_rnd)
+    }
 
+    /// `total` less the stake of accounts whose keys are expired by `vote_rnd`
+    /// (go `onlineCirculation`'s `expiredOnlineCirculation` subtraction).
+    fn exclude_expired_from_total(
+        &self,
+        total: u64,
+        round: u64,
+        vote_rnd: u64,
+    ) -> Result<u64, AlgoError> {
         let exclude_expired = algo_types::consensus::consensus_params_for_version(&self.protocol)
             .map(|p| p.exclude_expired_circulation)
             .unwrap_or(false);
@@ -5388,6 +5398,55 @@ impl SqliteLedger {
             }
         };
         Ok(total.saturating_sub(expired))
+    }
+
+    /// The online supply at `round` derived from the `onlineaccounts`
+    /// history: the stake (rewards pending at `round`'s level folded in) of
+    /// every account whose latest row at or before `round` is a real online
+    /// row. `None` when the history holds no row at or before `round` at all
+    /// (nothing to derive from).
+    fn derive_online_supply_from_history(&self, round: u64) -> Result<Option<u64>, AlgoError> {
+        let rewards_level = self
+            .get_block_header_data(round)
+            .ok()
+            .flatten()
+            .and_then(|hdr| BlockHeader::decode_from_bytes(&hdr).ok())
+            .map(|hdr| hdr.rewards_level)
+            .unwrap_or_else(|| self.rewards_level());
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT o.data FROM onlineaccounts o \
+                 WHERE o.updround = (SELECT MAX(i.updround) FROM onlineaccounts i \
+                                     WHERE i.address = o.address AND i.updround <= ?1)",
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("prepare derive_online_supply_from_history error: {e}"),
+            })?;
+        let rows = stmt
+            .query_map(params![round as i64], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("query derive_online_supply_from_history error: {e}"),
+            })?;
+        let mut count = 0u64;
+        let mut total: u128 = 0;
+        for row in rows {
+            let data = row.map_err(|e| AlgoError::Ledger {
+                message: format!("read derive_online_supply_from_history row error: {e}"),
+            })?;
+            count += 1;
+            let acct = decode_online_account_data(&data)?;
+            if acct.status != AccountStatus::Online {
+                continue;
+            }
+            let pending = if rewards_level >= acct.rewards_base {
+                crate::rewards::compute_pending_rewards(&acct, rewards_level)
+            } else {
+                0
+            };
+            total += acct.micro_algos as u128 + pending as u128;
+        }
+        Ok((count > 0).then_some(total.min(u64::MAX as u128) as u64))
     }
 
     /// Sum the stake -- with the rewards pending at `round`'s rewards level
@@ -7815,8 +7874,28 @@ impl LedgerStore for SqliteLedger {
         self.online_circulation_at_round(round, vote_rnd)
     }
 
-    fn has_online_supply_snapshot(&self, round: u64) -> bool {
-        matches!(self.online_supply_at_round(round), Ok(Some(_)))
+    /// go's `OnlineCirculation(balanceRound, round)` on the history basis: the
+    /// per-round supply snapshot when present, else the supply derived from
+    /// the `onlineaccounts` rows (the same data the per-account stake comes
+    /// from), less the expired stake. `Err` when neither exists -- never
+    /// today's aggregate, which would mix time bases.
+    fn balance_round_total_online_stake(
+        &self,
+        balance_round: u64,
+        vote_rnd: u64,
+    ) -> Result<u64, AlgoError> {
+        let total = match self.online_supply_at_round(balance_round)? {
+            Some(supply) => supply,
+            None => self
+                .derive_online_supply_from_history(balance_round)?
+                .ok_or_else(|| AlgoError::Ledger {
+                    message: format!(
+                        "cannot determine the online stake at balance round {balance_round}: \
+                         no supply snapshot and no onlineaccounts history"
+                    ),
+                })?,
+        };
+        self.exclude_expired_from_total(total, balance_round, vote_rnd)
     }
 }
 
@@ -14775,25 +14854,44 @@ mod tests {
         );
     }
 
-    /// Without a per-round supply snapshot at the balance round the total
-    /// would come from today's aggregate while the per-account stake comes
-    /// from history: two time bases. Absence is then undecidable and the
-    /// proposer lists nobody (an empty list is always valid); expiry, which
-    /// needs no stake, still works.
+    /// Without a per-round supply snapshot at the balance round the total is
+    /// derived from the `onlineaccounts` history -- the same rows the
+    /// per-account stake comes from -- never from today's aggregate, so the
+    /// lag test stays decidable and on one time basis.
     #[test]
-    fn absent_candidates_are_skipped_without_a_supply_snapshot() {
+    fn absent_candidates_derive_the_total_from_history_without_a_snapshot() {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
         let absent = Address([9u8; 32]);
         let expired = Address([8u8; 32]);
         set_online(&mut ledger, &absent, absent_acct(1));
         set_online(&mut ledger, &expired, keyed_acct(AccountStatus::Online, 50));
+        // Today's aggregate says 500M: lag 2000 would hide the account.
+        ledger
+            .put_account_totals_seed(500_000_000, 0, 0, 0, 0, 0)
+            .unwrap();
+        // Derived total = 5M + 5M: lag 20 * 10M / 5M = 40 < 100 quiet rounds.
         let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
-        assert!(l.absent.is_empty(), "undecidable: no snapshot at round 0");
+        assert_eq!(l.absent, vec![absent]);
         assert_eq!(l.expired, vec![expired]);
+    }
 
-        ledger.put_online_supply_at_round(0, 10_000_000).unwrap();
+    /// With no snapshot and no history the total cannot be determined on the
+    /// historical basis: the lag test is skipped (nobody absent) while expiry,
+    /// which needs no stake, still works.
+    #[test]
+    fn absent_candidates_skip_the_lag_test_when_the_total_is_not_derivable() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let absent = Address([9u8; 32]);
+        let expired = Address([8u8; 32]);
+        ledger.set_account(&absent, absent_acct(1));
+        ledger.set_account(&expired, keyed_acct(AccountStatus::Online, 50));
+        ledger
+            .put_account_totals_seed(10_000_000, 0, 0, 0, 0, 0)
+            .unwrap();
+        assert!(ledger.balance_round_total_online_stake(0, 101).is_err());
         let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
-        assert_eq!(l.absent, vec![absent], "decidable once the snapshot exists");
+        assert!(l.absent.is_empty());
+        assert_eq!(l.expired, vec![expired]);
     }
 
     /// Evidence for the strict no-fallback lookback: an account that is online
@@ -14831,23 +14929,30 @@ mod tests {
         }
     }
 
-    /// A new store wrapper cannot silently disable absence listing: the
-    /// snapshot query is forwarded by every `LedgerStore` wrapper.
+    /// The balance-round total is forwarded by every `LedgerStore` wrapper, so
+    /// a wrapper cannot silently change or disable absence listing.
     #[test]
-    fn supply_snapshot_query_is_forwarded_by_the_store_wrappers() {
+    fn balance_round_total_is_forwarded_by_the_store_wrappers() {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
-        ledger.put_online_supply_at_round(7, 1_000).unwrap();
-        assert!(ledger.has_online_supply_snapshot(7));
-        assert!(!ledger.has_online_supply_snapshot(8));
+        set_online(&mut ledger, &Address([9u8; 32]), absent_acct(1));
+        // Derived from history (no snapshot): 5M.
+        assert_eq!(
+            ledger.balance_round_total_online_stake(0, 101).unwrap(),
+            5_000_000
+        );
         {
             let mut overlay = crate::pending_overlay::PendingOverlay::new(&ledger);
             let store = crate::pending_overlay::OverlayStore::new(&ledger, &mut overlay);
-            assert!(store.has_online_supply_snapshot(7));
-            assert!(!store.has_online_supply_snapshot(8));
+            assert_eq!(
+                store.balance_round_total_online_stake(0, 101).unwrap(),
+                5_000_000
+            );
         }
         let rec = crate::recording_store::RecordingStore::new(&mut ledger);
-        assert!(rec.has_online_supply_snapshot(7));
-        assert!(!rec.has_online_supply_snapshot(8));
+        assert_eq!(
+            rec.balance_round_total_online_stake(0, 101).unwrap(),
+            5_000_000
+        );
     }
 
     #[test]

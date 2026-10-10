@@ -1718,8 +1718,12 @@ impl crate::store_trait::LedgerStore for LedgerState {
     /// so they share one time basis and absence is decidable over it. It is an
     /// approximation for tests; real block apply always runs on `SqliteLedger`,
     /// whose answers honor the round.
-    fn has_online_supply_snapshot(&self, _round: u64) -> bool {
-        true
+    fn balance_round_total_online_stake(
+        &self,
+        balance_round: u64,
+        vote_rnd: u64,
+    ) -> Result<u64, algo_error::AlgoError> {
+        self.online_stake_at_round(balance_round, vote_rnd)
     }
 
     fn online_stake_at_round(
@@ -2669,7 +2673,10 @@ mod tests {
                 ..AccountData::default()
             },
         );
-        assert!(state.has_online_supply_snapshot(0));
+        assert_eq!(
+            state.balance_round_total_online_stake(0, 101).unwrap(),
+            5_000_000
+        );
         let consensus = algo_types::consensus::consensus_params_for_version(
             algo_types::consensus::CONSENSUS_V41,
         )

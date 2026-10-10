@@ -638,8 +638,13 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
         self.inner.online_stake_at_round(round, vote_rnd)
     }
 
-    fn has_online_supply_snapshot(&self, round: u64) -> bool {
-        self.inner.has_online_supply_snapshot(round)
+    fn balance_round_total_online_stake(
+        &self,
+        balance_round: u64,
+        vote_rnd: u64,
+    ) -> Result<u64, AlgoError> {
+        self.inner
+            .balance_round_total_online_stake(balance_round, vote_rnd)
     }
 }
 

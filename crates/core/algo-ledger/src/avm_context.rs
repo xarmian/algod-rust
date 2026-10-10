@@ -10851,6 +10851,80 @@ mod tests {
         assert_eq!(ctx_late.online_stake().unwrap(), 0);
     }
 
+    /// `voter_params_get` is go's `AgreementData` -> `LookupAgreement(balanceRound,
+    /// addr)` (`data/transactions/logic/eval.go:5433`,
+    /// `ledger/eval/applications.go:42`, `ledger/eval/eval.go:224`,
+    /// `ledger/ledger.go:656`, `ledger/acctonline.go:657`): the account's
+    /// `onlineaccounts` row at or before the balance round, with the rewards
+    /// pending at that round folded in; an account with no such row -- one that
+    /// went online after the balance round -- is the empty `OnlineAccountData{}`
+    /// (`acctonline.go`, "no such online account, return empty"), i.e. `(0,
+    /// false)`. There is no current-state fallback.
+    #[test]
+    fn voter_params_get_matches_go_for_late_joiners_and_pending_rewards() {
+        let mut store = crate::sqlite::SqliteLedger::open_in_memory().unwrap();
+        let early = Address([41u8; 32]);
+        let late = Address([42u8; 32]);
+        let online = |micro: u64, rewards_base: u64| AccountData {
+            micro_algos: micro,
+            rewards_base,
+            status: AccountStatus::Online,
+            incentive_eligible: true,
+            vote_id: Some([1u8; 32]),
+            selection_id: Some([2u8; 32]),
+            vote_first_valid: 1,
+            vote_last_valid: 100_000,
+            vote_key_dilution: 10_000,
+            ..Default::default()
+        };
+
+        // `early` is online from round 100 with unclaimed rewards: 10_000
+        // reward units, base level 100.
+        store.begin_block().unwrap();
+        store.set_current_round(Round(100));
+        store.set_account(&early, online(10_000_000_000, 100));
+        store.commit_block().unwrap();
+        // `late` only goes online at round 400, after the balance round 130.
+        store.begin_block().unwrap();
+        store.set_current_round(Round(400));
+        store.set_account(&late, online(7_000_000, 0));
+        store.commit_block().unwrap();
+        // 25 reward levels have accrued by the lookup.
+        store.set_rewards_level(125);
+
+        let txn = make_pay_txn([41u8; 32], [20u8; 32], 5000);
+        // Building round 450: balance round 130.
+        let ctx = LedgerAvmContext::new(
+            &mut store,
+            vec![txn],
+            0,
+            450,
+            12345,
+            42,
+            [1u8; 32],
+            true,
+            [2u8; 32],
+            [3u8; 32],
+            ConsensusParams::default(),
+            0,
+        );
+        let (val, exists) = ctx.voter_params_get(&early.0, 0).unwrap();
+        assert!(exists);
+        assert_eq!(
+            val,
+            TealValue::Uint(10_000_250_000),
+            "VoterBalance includes the rewards pending at the lookup round"
+        );
+        let (val, _) = ctx.voter_params_get(&early.0, 1).unwrap();
+        assert_eq!(val, TealValue::Uint(1));
+
+        let (val, exists) = ctx.voter_params_get(&late.0, 0).unwrap();
+        assert!(!exists, "went online after the balance round: no row");
+        assert_eq!(val, TealValue::Uint(0));
+        let (val, _) = ctx.voter_params_get(&late.0, 1).unwrap();
+        assert_eq!(val, TealValue::Uint(0));
+    }
+
     // ---- LogicSig args tests ----
 
     #[test]
