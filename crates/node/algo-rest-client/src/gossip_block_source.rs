@@ -71,6 +71,34 @@ struct PeerFetchFailure {
     answered: bool,
 }
 
+/// Classify a [`parse_block_response`] failure from one peer.
+///
+/// go's block service answers `blockNotAvailableErrMsg` when it genuinely
+/// does not have the round (`rpcs/blockService.go`); that keeps its own
+/// class (`NotFound`) so catchpoint replay can tell "peer cannot serve this
+/// round" from a transport failure (issue #1725). Only a service error
+/// counts as the peer having ANSWERED: a malformed or empty reply (missing
+/// topics, bad `latest` encoding) is a garbled transport-level failure, not
+/// an opinion about the round, so it must not veto a not-available verdict
+/// reached by the other peers (issue #1755).
+fn classify_parse_error(round: Round, peer: &str, e: BlockFetchError) -> PeerFetchFailure {
+    let message = format!("failed to parse block response for round {round} from peer {peer}: {e}");
+    match e {
+        BlockFetchError::ServiceError { message: m, .. } => PeerFetchFailure {
+            error: if m.contains(BLOCK_NOT_AVAILABLE_MSG) {
+                AlgoError::NotFound(message)
+            } else {
+                AlgoError::Network { message }
+            },
+            answered: true,
+        },
+        _ => PeerFetchFailure {
+            error: AlgoError::Network { message },
+            answered: false,
+        },
+    }
+}
+
 /// Whether "the peers said the block is not available" is a verdict
 /// (`NotFound`) rather than inconclusive evidence.
 ///
@@ -295,30 +323,8 @@ impl GossipBlockSource {
             })?;
 
         // Parse the response topics to get raw block+cert bytes.
-        let data = parse_block_response(&response_topics).map_err(|e| {
-            let message = format!(
-                "failed to parse block response for round {} from peer {}: {}",
-                round,
-                peer.get_address(),
-                e
-            );
-            // go's block service answers `blockNotAvailableErrMsg` when it
-            // genuinely does not have the round (`rpcs/blockService.go`).
-            // Keep that class so catchpoint replay can tell "peer cannot
-            // serve this round" from a transport failure (issue #1725).
-            let error = match e {
-                BlockFetchError::ServiceError { message: m, .. }
-                    if m.contains(BLOCK_NOT_AVAILABLE_MSG) =>
-                {
-                    AlgoError::NotFound(message)
-                }
-                _ => AlgoError::Network { message },
-            };
-            PeerFetchFailure {
-                error,
-                answered: true,
-            }
-        })?;
+        let data = parse_block_response(&response_topics)
+            .map_err(|e| classify_parse_error(round, &peer.get_address().to_string(), e))?;
 
         // Decode block+cert from their raw msgpack bytes. decode_block_cert
         // borrows the data, so we can move block_data into the return tuple
@@ -1389,5 +1395,26 @@ mod tests {
             "fetch_from_peer must pass GossipBlockSourceConfig::request_timeout \
              through to request_with_timeout's timeout argument"
         );
+    }
+
+    #[test]
+    fn garbled_replies_are_not_answers_but_service_errors_are() {
+        let svc = |m: &str| BlockFetchError::ServiceError {
+            message: m.to_string(),
+            latest_round: None,
+        };
+        let f = classify_parse_error(Round(7), "p", svc("requested block is not available"));
+        assert!(f.answered && matches!(f.error, AlgoError::NotFound(_)));
+        let f = classify_parse_error(Round(7), "p", svc("internal error"));
+        assert!(f.answered && matches!(f.error, AlgoError::Network { .. }));
+        for garbled in [
+            BlockFetchError::MissingBlockData,
+            BlockFetchError::MissingCertData,
+            BlockFetchError::InvalidLatestRound(3),
+        ] {
+            let f = classify_parse_error(Round(7), "p", garbled);
+            assert!(!f.answered, "garbled reply must not veto a verdict");
+            assert!(matches!(f.error, AlgoError::Network { .. }));
+        }
     }
 }
