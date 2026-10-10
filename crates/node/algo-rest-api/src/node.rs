@@ -1093,8 +1093,10 @@ pub trait NodeInterface: Send + Sync + 'static {
         None
     }
 
-    /// The same counters rendered as Prometheus text exposition, or `None`
-    /// when this node is not participating in consensus.
+    /// The node's metrics rendered as Prometheus text exposition, or `None`
+    /// when this implementation has nothing to report (this default, test
+    /// doubles). The production adapter always returns `Some`: the follow-path
+    /// timing series and process start time are process-global (#1678, #1761).
     ///
     /// Served by `GET /metrics`. Rendering happens in `algo-agreement` (see
     /// `ParticipationSnapshot::to_prometheus_text`) so the workspace needs no
