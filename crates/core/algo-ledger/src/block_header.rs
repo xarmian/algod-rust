@@ -309,8 +309,10 @@ impl std::error::Error for PayoutOverflow {}
 
 /// The fees a payset contributes to the header's `FeesCollected` (go
 /// `takeFee`): every top-level transaction's fee, except those paid BY the
-/// fee sink (no net algos reach the sink). The single definition used by
-/// block validation.
+/// fee sink (no net algos reach the sink). The single definition shared by
+/// block validation and the proposer. Saturating where go wraps (`OAddA`
+/// ignores the overflow flag): unreachable, the fees of a payset cannot sum
+/// past the max supply.
 pub fn payset_fees_collected(payset: &[algo_types::SignedTransaction], fee_sink: &Address) -> u64 {
     payset
         .iter()

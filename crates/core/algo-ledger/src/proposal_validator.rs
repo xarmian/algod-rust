@@ -36,6 +36,11 @@
 // with a warning and a counter, so the new check can never cost the node a
 // block go accepts.
 //
+// Failing open on "no verdict" is a deliberate liveness choice. The residual
+// adversarial window it leaves (a proposal that makes the check unevaluable
+// and carries a bad payout) is closed by #1803, the validating apply on the
+// commit path.
+//
 // Known cost (tracked in #1781): the ledger mutex is held for the whole
 // scratch Execute of the payset, the same way the proposer's own scratch
 // evaluation holds it. The guard is dropped before any post-processing.
@@ -61,7 +66,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 static FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
 /// Number of proposals accepted on the stateless verdict alone because the
-/// payout check could not be evaluated (metric source).
+/// payout check could not be evaluated. A test and diagnostic counter only:
+/// it is not exported to the node's metrics; the `warn!` emitted on every
+/// fallback is the operator-facing signal.
 pub fn payout_check_fallbacks() -> u64 {
     FALLBACKS.load(Ordering::Relaxed)
 }
@@ -293,5 +300,52 @@ mod tests {
             .expect("judged after wait");
         assert!(err.to_string().contains("is allowed"), "{err}");
         holder.join().unwrap();
+    }
+
+    /// go `WithProposer`: before payouts are enabled the proposer stays unset,
+    /// so a block finished by agreement still passes `validateForPayouts`
+    /// (which rejects a proposer when payouts are disabled).
+    #[test]
+    fn finished_block_on_a_pre_payouts_protocol_passes_validation() {
+        use algo_agreement::{PoolUnfinishedBlock, Seed, UnfinishedBlock};
+        let ledger = ledger_at(0);
+        let v = validator(&ledger, Duration::from_millis(200));
+        let template = Block {
+            round: Round(1),
+            current_protocol: algo_types::consensus::CONSENSUS_V38.to_string(),
+            fee_sink: Address([3u8; 32]),
+            ..Block::default()
+        };
+        let finished =
+            PoolUnfinishedBlock::new(template).finish_block(Seed([7; 32]), Address([9; 32]), true);
+        assert_eq!(finished.proposer, Address::ZERO);
+        v.validate(&finished)
+            .map(|_| ())
+            .expect("pre-payouts finished block must validate");
+
+        // With payouts enabled the proposer is set and the block validates.
+        let template = Block {
+            round: Round(1),
+            current_protocol: CONSENSUS_V41.to_string(),
+            fee_sink: Address([3u8; 32]),
+            ..Block::default()
+        };
+        let finished =
+            PoolUnfinishedBlock::new(template).finish_block(Seed([7; 32]), Address([9; 32]), true);
+        assert_eq!(finished.proposer, Address([9; 32]));
+        v.validate(&finished)
+            .map(|_| ())
+            .expect("payouts-enabled finished block must validate");
+    }
+
+    /// A payout verdict is a typed rejection, never a "no verdict" fallback.
+    #[test]
+    fn payout_violation_is_classified_as_a_verdict() {
+        let ledger = ledger_at(0);
+        let mut l = ledger.lock().unwrap();
+        match scratch_validate_payouts(&mut *l, &proposal(1, 5)) {
+            PayoutCheck::Violation(m) => assert!(m.contains("is allowed"), "{m}"),
+            other => panic!("expected a violation, got {other:?}"),
+        }
     }
 }

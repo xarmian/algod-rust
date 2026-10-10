@@ -61,9 +61,17 @@ impl UnfinishedBlock for PoolUnfinishedBlock {
     fn finish_block(&self, seed: Seed, proposer: Address, eligible: bool) -> Block {
         let mut finished = self.block.clone();
         finished.seed = seed.0;
-        finished.proposer = proposer;
-        if !eligible {
-            // When not eligible, zero out the proposer payout.
+        // Mirrors go's `WithProposer`: the proposer is recorded only when
+        // the block's protocol has payouts enabled (validation rejects a
+        // proposer on a pre-payouts block), and the payout is zeroed when
+        // payouts are disabled or the proposer is ineligible.
+        let payouts_enabled =
+            algo_types::consensus::consensus_params_for_version(&finished.current_protocol)
+                .is_some_and(|p| p.payouts_enabled);
+        if payouts_enabled {
+            finished.proposer = proposer;
+        }
+        if !payouts_enabled || !eligible {
             // Mirrors Go: `if !eligible { blk.ProposerPayout = MicroAlgos{} }`
             finished.proposer_payout = 0;
         }
@@ -152,6 +160,7 @@ mod tests {
         let block = Block {
             round: Round(10),
             proposer_payout: 1000,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
             ..Default::default()
         };
         let ub = PoolUnfinishedBlock::new(block);
@@ -170,6 +179,7 @@ mod tests {
         let block = Block {
             round: Round(10),
             proposer_payout: 5000,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
             ..Default::default()
         };
         let ub = PoolUnfinishedBlock::new(block);

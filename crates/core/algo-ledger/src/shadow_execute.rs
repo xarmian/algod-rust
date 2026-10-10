@@ -889,9 +889,12 @@ pub fn scratch_validate_payouts<L: LedgerStore>(store: &mut L, block: &Block) ->
     };
     match scratch_execute_with(store, block, &mut probe) {
         Ok(_) => PayoutCheck::Valid,
-        Err(failure) => match probe.payout_violation {
-            Some(v) => PayoutCheck::Violation(v),
-            None => match failure {
+        Err(failure) => match failure {
+            // The only verdict: go's `validateForPayouts` rejected the header.
+            ScratchFailure::Other(AlgoError::PayoutViolation { message }) => {
+                PayoutCheck::Violation(message)
+            }
+            failure => match failure {
                 ScratchFailure::Txn { index, error } => PayoutCheck::NoVerdict {
                     reason: format!("payset transaction {index} not evaluable: {error}"),
                     transient: false,
