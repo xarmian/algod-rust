@@ -51,6 +51,9 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 REPO_ROOT="$(cd "$ROOT/../.." && pwd)"
+# Issue #1782: share the mixed-cluster cert-window plumbing (#1777).
+# shellcheck source=../../mixed-cluster/scripts/cert_window.sh
+source "$ROOT/../mixed-cluster/scripts/cert_window.sh"
 
 FROM_ROUND=""
 TO_ROUND=""
@@ -244,6 +247,8 @@ if [ "$RUN_CERT" = "1" ]; then
             exit 4
         fi
         CERT_LEDGER_PATH="$CERT_PREFIX_CANDIDATE"
+        # So the earliest retained round is probed for the cert window (#1782).
+        BLOCK_PATH="${CERT_PREFIX_CANDIDATE}.block.sqlite"
         echo "==> cert cross-verify (Go-produced → Rust verifier), stride $STRIDE"
         echo "    ledger: $CERT_LEDGER_PATH (--cert-ledger override)"
     else
@@ -268,6 +273,8 @@ if [ "$RUN_CERT" = "1" ]; then
                 echo "error: failed to docker cp the block snapshot." >&2
                 exit 4
             fi
+            # Lowest block round the Rust ledger retains (#1782 / #1777).
+            RUST_EARLIEST="$(probe_earliest_container "$RUST_CONTAINER" /app/verify-soak-block.sqlite)"
             docker exec "$RUST_CONTAINER" rm -f \
                     /app/verify-soak-tracker.sqlite \
                     /app/verify-soak-block.sqlite \
@@ -308,12 +315,23 @@ if [ "$RUN_CERT" = "1" ]; then
         CERT_EXTRA_ARGS+=(--export-go-input "$GO_INPUT")
         echo "    rust participant: $RUST_ACCOUNT (>= $MIN_RUST_VOTE_ROUNDS cert(s) must carry its vote)"
     fi
+    # Issue #1782: a non-archival Rust node keeps only the last ~1001 blocks, so
+    # the cert pass must not start before the earliest block the Rust snapshot
+    # holds (derived by cert_window.py, never silently unclamped; see
+    # docs/MIXED_CLUSTER_RUNBOOK.md). P2PINTEROP_GO_ARCHIVAL=1 runs make the
+    # Rust node archival too (start.sh), so they cover the whole range. The
+    # fork detector still covers FROM_ROUND..TO_ROUND.
+    if [ -z "${RUST_EARLIEST:-}" ]; then
+        RUST_EARLIEST="$(probe_earliest_file "${BLOCK_PATH:-}")"
+    fi
+    resolve_cert_window "$FROM_ROUND" "$TO_ROUND" "${RUST_EARLIEST:-}" || exit 2
+    CERT_FROM="${CERT_FROM:?}"
     set +e
     "$CERT_BIN" \
         --node http://127.0.0.1:5001 \
         --token-file "$TOKEN_FILE" \
         --ledger-sqlite "$CERT_LEDGER_PATH" \
-        --from-round "$FROM_ROUND" \
+        --from-round "$CERT_FROM" \
         --to-round "$TO_ROUND" \
         --stride "$STRIDE" \
         --jsonl-out "$CERT_OUT" \
