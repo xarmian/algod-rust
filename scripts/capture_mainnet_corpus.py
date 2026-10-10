@@ -116,6 +116,7 @@ def pack(x):
 
 
 def http(url, params=None):
+    forbidden_sleep = 0
     for attempt in range(6):
         try:
             r = SESSION.get(url, params=params, timeout=90)
@@ -125,11 +126,16 @@ def http(url, params=None):
             if r.status_code == 403 and "algonode.cloud" in url:
                 # algonode's edge answers 403 when a burst trips its rate
                 # limit (other hosts: a 403 is final, returned to the caller).
+                # Bounded: at most 5 back-offs and 30 s of sleeping in total.
+                if attempt >= 5 or forbidden_sleep >= 30:
+                    return r
+                pause = min(6 * (attempt + 1), 30 - forbidden_sleep)
+                forbidden_sleep += pause
                 print(
-                    f"  403 from {url} (attempt {attempt + 1}/6), backing off",
+                    f"  403 from {url} (attempt {attempt + 1}/6), backing off {pause}s",
                     file=sys.stderr,
                 )
-                time.sleep(8 * (attempt + 1))
+                time.sleep(pause)
                 continue
             return r
         except requests.RequestException:
@@ -694,14 +700,23 @@ def strip_state_proof_bodies(buf):
                             is_stpf = u.unpack() == "stpf"
                         else:
                             u.skip()
-                    if is_stpf and found:
+                    if is_stpf and not found:
+                        raise SystemExit(
+                            "stpf transaction without an `sp` key: refusing to "
+                            "store an unstripped state proof body"
+                        )
+                    if is_stpf:
                         cuts.append((hdr, found[0], found[1], n))
     out = bytearray(buf)
     for hdr, ks, ve, n in sorted(cuts, reverse=True):
-        # The txn map header must be a fixmap (< 16 entries) to patch in place.
-        assert 0x80 <= buf[hdr] <= 0x8F and n < 16, "unexpected txn map header"
-        del out[ks:ve]
-        out[hdr] = 0x80 | (n - 1)
+        del out[ks:ve]  # the entries follow the header, so hdr stays valid
+        if 0x80 <= buf[hdr] <= 0x8F and n < 16:  # fixmap
+            out[hdr] = 0x80 | (n - 1)
+        elif buf[hdr] == 0xDE:  # map16: 2-byte big-endian count
+            assert int.from_bytes(buf[hdr + 1 : hdr + 3], "big") == n
+            out[hdr + 1 : hdr + 3] = (n - 1).to_bytes(2, "big")
+        else:
+            raise SystemExit(f"unexpected txn map header byte {buf[hdr]:#x}")
     return bytes(out), len(cuts)
 
 

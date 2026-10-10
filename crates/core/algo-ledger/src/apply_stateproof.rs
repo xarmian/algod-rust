@@ -99,13 +99,14 @@ fn ledger_err(message: impl Into<String>) -> AlgoError {
 /// always the (only) return value on success. On success the block's
 /// `StateProofNextRound` ([`ApplyContext::state_proof_next`], go's cow
 /// `SetStateProofNextRound`, `ledger/apply/stateproof.go:73`) advances to
-/// `lastAttestedRound + StateProofInterval`; the expected round is that same
-/// cell, seeded at block start (go `startEvaluator`, `eval.go:766-782`), or,
-/// for a direct call on an unseeded context, derived from the previous
-/// header with the same initialization
-/// ([`crate::block_header::initial_state_proof_next_round`]). The block's
-/// header value is checked against the cell by `apply`'s end-of-block
-/// validation, never trusted.
+/// `lastAttestedRound + StateProofInterval`. The expected round is that same
+/// cell. It starts at 0 and is seeded lazily: the first state proof of the
+/// block derives it from the previous header with go's `startEvaluator`
+/// initialization (`eval.go:766-782`,
+/// [`crate::block_header::initial_state_proof_next_round`]); nothing is looked
+/// up for a block without a state proof except by `apply`'s validating
+/// end-of-block check. The block's header value is checked against the cell
+/// there, never trusted.
 pub fn apply_state_proof<L: LedgerStore>(
     store: &L,
     ctx: &ApplyContext,
@@ -137,11 +138,10 @@ pub fn apply_state_proof<L: LedgerStore>(
     // first state proof of a block seeds it from the previous header just
     // read, with the same initialization `apply`'s end-of-block check uses.
     //
-    // `apply` builds one context per block. The simulator
-    // (`simulation/mod.rs`) builds one per `simulate` call and a call takes
-    // exactly one transaction group (more are rejected), so the cell never
-    // outlives a simulated group; within that group a successful state proof
-    // advances the expected round for its later members, as go's cow does.
+    // `apply` builds one context per block. The simulator never reaches this
+    // function with a state proof: it rejects `stpf` transactions outright
+    // (`simulation_gaps_test::state_proof_txn_rejected`), and it builds a fresh
+    // context per `simulate` call anyway.
     let next_state_proof_rnd = match ctx.state_proof_next.get() {
         0 => {
             let prev_hdr = ctx.previous_header(store)?.ok_or_else(|| {

@@ -2825,9 +2825,35 @@ fn validate_state_proof_tracking<L: crate::store_trait::LedgerStore>(
         return Ok(());
     }
 
-    // go `endOfBlock` (eval.go:1564): the header's `StateProofNextRound`
-    // must equal the cow's, i.e. the previous header's value advanced by
-    // every state proof transaction of this block (issue #1791).
+    // A block without a tracking map: go always writes one on a state proof
+    // protocol (and fails `0 != expected` on NextRound). Rejected whenever the
+    // previous header tracked state proofs. The one residual (no change, kept
+    // deliberately): the very first block of a chain whose previous header has
+    // no tracking at all (genesis, or the switch to a state proof protocol);
+    // there only this repo's synthetic unit-test blocks omit the map.
+    //
+    // A store error is an error; a previous header that is simply absent (a
+    // chain without history, e.g. the first block applied to a bare test
+    // ledger) leaves nothing to hold the block to.
+    if block.state_proof_tracking.is_none() {
+        let prev = ctx.previous_header(store)?;
+        if prev.is_some_and(|p| p.state_proof_tracking.is_some()) {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "StateProofTracking missing: block {} has no tracking map but the previous                      header tracks state proofs",
+                    block.round.0
+                ),
+            });
+        }
+    }
+
+    // go `endOfBlock` order (eval.go:1532-1566): voters commitment, online
+    // total weight, then `StateProofNextRound`.
+    validate_voters_commitment_and_weight(store, block, consensus)?;
+
+    // go (eval.go:1564): the header's `StateProofNextRound` must equal the
+    // cow's, i.e. the previous header's value advanced by every state proof
+    // transaction of this block (issue #1791).
     if block.state_proof_tracking.is_some() {
         let expected_next = expected_state_proof_next(store, ctx, block)?;
         let actual_next = crate::block_header::state_proof_next_round(&block.state_proof_tracking);
@@ -2836,29 +2862,17 @@ fn validate_state_proof_tracking<L: crate::store_trait::LedgerStore>(
                 message: format!("StateProofNextRound wrong: {actual_next} != {expected_next}"),
             });
         }
-    } else {
-        // go always writes the map on a state proof protocol and checks it
-        // (`0 != expected`). A block without one is rejected whenever the
-        // previous header tracked state proofs. The one residual: the very
-        // first block of a chain whose previous header has no tracking at all
-        // (genesis, or the switch to a state proof protocol) -- there only
-        // this repo's synthetic unit-test blocks omit the map.
-        //
-        // A store error is an error; a previous header that is simply absent
-        // (a chain without history, e.g. the first block applied to a bare
-        // test ledger) leaves nothing to hold the block to.
-        let prev = ctx.previous_header(store)?;
-        if prev.is_some_and(|p| p.state_proof_tracking.is_some()) {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "StateProofTracking missing: block {} has no tracking map but the previous \
-                     header tracks state proofs",
-                    block.round.0
-                ),
-            });
-        }
     }
+    Ok(())
+}
 
+/// The voters-commitment and online-total-weight half of go's `endOfBlock`
+/// state proof validation (issue #780).
+fn validate_voters_commitment_and_weight<L: crate::store_trait::LedgerStore>(
+    store: &L,
+    block: &Block,
+    consensus: &ConsensusParams,
+) -> Result<(), AlgoError> {
     let (expected_root, expected_weight) =
         crate::voters_tracker::expected_voters_tracking(store, block.round.0, consensus)?;
     let actual_root =
@@ -12936,6 +12950,46 @@ return
         )
         .expect("stpf alone applies");
         assert_eq!(ctx.state_proof_next.get(), 1280);
+    }
+
+    /// go's `endOfBlock` order: voters commitment, online total weight, then
+    /// NextRound. A block wrong in both reports the commitment first.
+    #[test]
+    fn validate_state_proof_tracking_reports_go_error_order() {
+        let (mut state, _root, weight) = state_with_voters_snapshot_at_240();
+        let wrong_both = Block {
+            round: Round(256),
+            state_proof_tracking: spt_value_with_next(1024, &[0xFFu8; 64], weight),
+            ..make_empty_block_with_protocol(
+                Address([3u8; 32]),
+                algo_types::consensus::CONSENSUS_V41,
+                None,
+                None,
+            )
+        };
+        let err = apply_block_validating(&mut state, &wrong_both).unwrap_err();
+        assert!(
+            err.to_string().contains("StateProofVotersCommitment wrong"),
+            "commitment is reported before NextRound: {err}"
+        );
+
+        let (mut state, root, weight) = state_with_voters_snapshot_at_240();
+        let wrong_weight_and_next = Block {
+            round: Round(256),
+            state_proof_tracking: spt_value_with_next(1024, &root, weight + 1),
+            ..make_empty_block_with_protocol(
+                Address([3u8; 32]),
+                algo_types::consensus::CONSENSUS_V41,
+                None,
+                None,
+            )
+        };
+        let err = apply_block_validating(&mut state, &wrong_weight_and_next).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("StateProofOnlineTotalWeight wrong"),
+            "weight is reported before NextRound: {err}"
+        );
     }
 
     #[test]
