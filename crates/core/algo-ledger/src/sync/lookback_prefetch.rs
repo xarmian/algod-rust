@@ -184,33 +184,54 @@ mod tests {
     fn delivers_every_round_in_consumer_order_with_bounded_lookahead() {
         let in_flight = AtomicUsize::new(0);
         let max_seen = AtomicUsize::new(0);
+        let completed = AtomicUsize::new(0);
         let fetch = |r: u64| -> Result<RawBlock, AlgoError> {
             let n = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             max_seen.fetch_max(n, Ordering::SeqCst);
-            std::thread::sleep(std::time::Duration::from_millis(2));
             in_flight.fetch_sub(1, Ordering::SeqCst);
+            completed.fetch_add(1, Ordering::SeqCst);
             Ok(blk(r))
         };
         let pf = LookbackPrefetch::new(199, 100);
-        let mut prefetched = 0;
         std::thread::scope(|s| {
             for _ in 0..PREFETCH_WORKERS {
                 s.spawn(|| pf.run_worker(&fetch));
             }
+            let _guard = ShutdownOnDrop(&pf);
+            // Until the consumer takes something, the window is anchored at
+            // round 199, so the workers prefetch exactly PREFETCH_WINDOW
+            // rounds and then block. Wait (condition, not wall clock) for that.
+            // The generous deadline only turns a broken prefetcher into a
+            // failure instead of a hang; a correct one never gets near it.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while completed.load(Ordering::SeqCst) < PREFETCH_WINDOW as usize {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "workers never prefetched the first window"
+                );
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                completed.load(Ordering::SeqCst),
+                PREFETCH_WINDOW as usize,
+                "lookahead must be bounded by the window"
+            );
             // Mirrors the production consumer: a `None` means "fetch it
             // yourself" (e.g. the worker has not claimed that round yet).
-            let _guard = ShutdownOnDrop(&pf);
             for r in (100..=199u64).rev() {
+                let window_start = 199 - PREFETCH_WINDOW + 1;
                 match pf.take(r) {
-                    Some(got) => {
-                        prefetched += 1;
-                        assert_eq!(got, blk(r));
+                    Some(got) => assert_eq!(got, blk(r)),
+                    None => {
+                        assert!(
+                            r < window_start,
+                            "round {r} in the first window must be prefetched"
+                        );
+                        assert_eq!(fetch(r).unwrap(), blk(r));
                     }
-                    None => assert_eq!(fetch(r).unwrap(), blk(r)),
                 }
             }
         });
-        assert!(prefetched > 50, "prefetch served only {prefetched}/100");
         // workers plus the consumer's own direct fetches
         assert!(max_seen.load(Ordering::SeqCst) <= PREFETCH_WORKERS + 1);
         // Out-of-range / already-consumed rounds are not served.
