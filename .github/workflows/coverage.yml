@@ -107,26 +107,33 @@ jobs:
           retention-days: 14
 
       # Requires the CODECOV_TOKEN repository secret (Codecov requires a token
-      # for non-fork uploads). Issue #1696: without it the upload used to be
+      # for non-fork uploads; this workflow runs only on schedule/dispatch, so
+      # there are no fork runs). Issue #1696: without it the upload used to be
       # rejected silently (green job, nothing in Codecov, thresholds never
       # enforced). Now a missing token is a loud warning annotation + job
-      # summary line, and once the secret exists a rejected upload fails the
-      # run (fail_ci_if_error follows the secret's presence) so it cannot hide
-      # again. The lcov/HTML artifacts above are always available either way.
-      - name: Warn when CODECOV_TOKEN is missing
+      # summary line and the upload is skipped; once the secret exists a
+      # rejected upload fails the scheduled run so it cannot hide again (the
+      # lcov/HTML artifacts above are uploaded either way). One step output
+      # drives both behaviours.
+      - name: Check CODECOV_TOKEN
+        id: codecov
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
         run: |
           if [ -z "$CODECOV_TOKEN" ]; then
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
             msg="CODECOV_TOKEN secret is not set: coverage is NOT uploaded to Codecov and codecov.yml thresholds are not enforced (issue #1696). Add the secret (repository admin)."
             echo "::warning title=Codecov upload skipped::$msg"
             echo "### :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "has_token=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Upload to Codecov
+        if: steps.codecov.outputs.has_token == 'true'
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
-          fail_ci_if_error: ${{ secrets.CODECOV_TOKEN != '' }}
+          fail_ci_if_error: true
           verbose: true
