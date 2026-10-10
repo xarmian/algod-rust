@@ -1811,6 +1811,10 @@ pub struct ExecProbe {
     /// payout / fees / proposer header fields are judged against the
     /// pre-block state without turning on every other validate-mode check.
     pub validate_payouts: bool,
+    /// Output: set when the apply failed because go's `validateForPayouts`
+    /// rejected the header (a genuine verdict on the block), as opposed to
+    /// any other evaluation failure.
+    pub payout_violation: Option<String>,
 }
 
 /// [`apply_block_impl_ex`] plus an [`ExecProbe`] out-parameter.
@@ -1825,7 +1829,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
     mut apply_data_out: Option<&mut Vec<ApplyData>>,
     kv_mods_out: Option<&mut KvModsMap>,
     scratch: bool,
-    probe: Option<&mut ExecProbe>,
+    mut probe: Option<&mut ExecProbe>,
 ) -> Result<(), AlgoError> {
     let skip_epilogue = probe.as_ref().is_some_and(|p| p.skip_epilogue);
     let check_payouts = validate || probe.as_ref().is_some_and(|p| p.validate_payouts);
@@ -2200,7 +2204,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         0 => None,
         advanced => Some(advanced),
     };
-    if let Some(p) = probe {
+    if let Some(p) = probe.as_deref_mut() {
         p.failed_txn_index = if result.is_err() { failed_txn } else { None };
         if result.is_ok() {
             p.final_txn_counter = ctx.txn_counter.get();
@@ -2270,6 +2274,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
             eob_addrs.push(block.proposer);
         }
         let eob_snapshot = store.snapshot(&eob_addrs);
+        let mut payout_violation: Option<String> = None;
         let eob_result = (|| {
             validate_expired_online_accounts(store, block, &consensus, ctx.validate)?;
             reset_expired_online_accounts(store, block, &consensus)?;
@@ -2277,7 +2282,9 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
             suspend_absent_accounts(store, block, &consensus)?;
             // go order: `validateForPayouts` precedes the state proof checks.
             if check_payouts {
-                validate_proposer_payout(store, block, &consensus)?;
+                validate_proposer_payout(store, block, &consensus).inspect_err(|e| {
+                    payout_violation = Some(e.to_string());
+                })?;
             }
             if ctx.validate {
                 validate_state_proof_tracking(store, &ctx, block, &consensus)?;
@@ -2286,6 +2293,9 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
             record_proposal(store, block)
         })();
         if eob_result.is_err() {
+            if let (Some(p), Some(v)) = (probe.as_mut(), payout_violation) {
+                p.payout_violation = Some(v);
+            }
             store.restore_snapshot(eob_snapshot);
             return eob_result;
         }

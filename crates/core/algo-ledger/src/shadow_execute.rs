@@ -852,14 +852,26 @@ pub fn scratch_execute_payset<L: LedgerStore>(
 ) -> Result<ScratchPayset, ScratchFailure> {
     // Input flag (reviewed, intentional): only this final epilogue apply
     // needs the post-payset sink balance.
-    scratch_execute_with(
-        store,
-        block,
-        ExecProbe {
-            want_fee_sink_available: true,
-            ..Default::default()
-        },
-    )
+    let mut probe = ExecProbe {
+        want_fee_sink_available: true,
+        ..Default::default()
+    };
+    scratch_execute_with(store, block, &mut probe)
+}
+
+/// Outcome of [`scratch_validate_payouts`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum PayoutCheck {
+    /// go's `validateForPayouts` accepts the header.
+    Valid,
+    /// A genuine verdict: `validateForPayouts` rejected the header.
+    Violation(String),
+    /// The evaluation could not reach a verdict (store cannot roll back,
+    /// payset transaction not evaluable in Execute mode, panic, ...). Says
+    /// nothing about the block. `transient`: retrying the same evaluation
+    /// shortly may succeed (the store was busy), unlike a deterministic
+    /// failure.
+    NoVerdict { reason: String, transient: bool },
 }
 
 /// Judge a peer proposal's `FeesCollected` / `Proposer` / `ProposerPayout`
@@ -867,26 +879,40 @@ pub fn scratch_execute_payset<L: LedgerStore>(
 /// #1798): the whole block is evaluated in [`ApplyMode::Execute`] on a
 /// rolled-back scratch apply with only the payout validation switched on, so
 /// nothing is persisted and no other validate-mode check can reject a block
-/// go would accept. `store` must be at `block.round - 1`.
-pub fn scratch_validate_payouts<L: LedgerStore>(
-    store: &mut L,
-    block: &Block,
-) -> Result<(), ScratchFailure> {
-    scratch_execute_with(
-        store,
-        block,
-        ExecProbe {
-            validate_payouts: true,
-            ..Default::default()
+/// go would accept. `store` must be at `block.round - 1`. Only a payout
+/// rejection is a [`PayoutCheck::Violation`]; every other failure is
+/// [`PayoutCheck::NoVerdict`].
+pub fn scratch_validate_payouts<L: LedgerStore>(store: &mut L, block: &Block) -> PayoutCheck {
+    let mut probe = ExecProbe {
+        validate_payouts: true,
+        ..Default::default()
+    };
+    match scratch_execute_with(store, block, &mut probe) {
+        Ok(_) => PayoutCheck::Valid,
+        Err(failure) => match probe.payout_violation {
+            Some(v) => PayoutCheck::Violation(v),
+            None => match failure {
+                ScratchFailure::Txn { index, error } => PayoutCheck::NoVerdict {
+                    reason: format!("payset transaction {index} not evaluable: {error}"),
+                    transient: false,
+                },
+                ScratchFailure::Other(error) => PayoutCheck::NoVerdict {
+                    reason: error.to_string(),
+                    transient: false,
+                },
+                ScratchFailure::Unsupported => PayoutCheck::NoVerdict {
+                    reason: "ledger cannot roll back a scratch apply".into(),
+                    transient: true,
+                },
+            },
         },
-    )
-    .map(|_| ())
+    }
 }
 
 fn scratch_execute_with<L: LedgerStore>(
     store: &mut L,
     block: &Block,
-    mut probe: ExecProbe,
+    probe: &mut ExecProbe,
 ) -> Result<ScratchPayset, ScratchFailure> {
     #[cfg(any(test, feature = "test-hooks"))]
     if test_hooks::should_fail(block.payset.len()) {
@@ -912,7 +938,7 @@ fn scratch_execute_with<L: LedgerStore>(
             Some(&mut ad),
             None,
             true,
-            Some(&mut probe),
+            Some(&mut *probe),
         )
     }));
     invariant.check_scratch_pass(store);
