@@ -310,6 +310,8 @@ fn pool_unfinished_block_round_returns_block_round() {
 fn pool_unfinished_block_finish_sets_seed_and_proposer() {
     let block = Block {
         round: Round(10),
+        // Payouts-enabled protocol: only then is the proposer recorded.
+        current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
         ..Default::default()
     };
     let ub = PoolUnfinishedBlock::new(block);
@@ -326,6 +328,7 @@ fn pool_unfinished_block_finish_sets_seed_and_proposer() {
 fn pool_unfinished_block_eligible_preserves_payout() {
     let block = Block {
         proposer_payout: 12345,
+        current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
         ..Default::default()
     };
     let ub = PoolUnfinishedBlock::new(block);
