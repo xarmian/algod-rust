@@ -6,6 +6,14 @@
 [advisories]
 unmaintained = "workspace"
 yanked = "warn"
+# Issue #1671. Each ignore needs a reason and is re-evaluated on dependency
+# refreshes; remove an entry as soon as its fix is reachable.
+ignore = [
+    { id = "RUSTSEC-2026-0118", reason = "hickory-proto NSEC3 loop: fixed only in the 0.26 major (resolver/libp2p-mdns pin 0.25); DNSSEC validation here is bounded by DNSSEC_STAGE_TIMEOUT (see #1702); upgrade tracked separately" },
+    { id = "RUSTSEC-2026-0119", reason = "hickory-proto O(n^2) name compression on message encoding; only encodes our own bounded SRV queries; fixed only in the 0.26 major, tracked separately" },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained (no CVE): transitive via libp2p/hyper-rustls; no replacement reachable without upstream bumps" },
+    { id = "RUSTSEC-2023-0037", reason = "xsalsa20poly1305 renamed to crypto_secretbox (no CVE): transitive via libp2p-noise-adjacent deps; rename only" },
+]
 
 # `unlicensed` was removed from cargo-deny's schema — recent versions
 # always require every non-excepted dependency to resolve to an `allow`ed
