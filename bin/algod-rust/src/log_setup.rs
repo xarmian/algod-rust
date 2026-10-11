@@ -566,9 +566,9 @@ mod tests {
         }
     }
 
-    /// Pins the noisy path to the locked hickory-proto versions: 0.25.2 logs
-    /// the error at `hickory_proto::dnssec::dnssec_dns_handle`, 0.24.4 does
-    /// not log it. A bump changes the set and fails here, prompting a
+    /// Pins the noisy path to the locked hickory-proto versions: 0.25.2 (the only
+    /// copy since libp2p 0.56, #1846) logs the error at
+    /// `hickory_proto::dnssec::dnssec_dns_handle`. A bump changes the set and fails here, prompting a
     /// re-check of `NOISY_TARGET_PATHS`.
     #[test]
     fn locked_hickory_versions_match_the_pinned_noisy_path() {
@@ -585,7 +585,7 @@ mod tests {
         versions.sort_unstable();
         assert_eq!(
             versions,
-            ["0.24.4", "0.25.2"],
+            ["0.25.2"],
             "locked hickory-proto versions changed: re-check where `exceeded max validation              depth` is logged and update NOISY_TARGET_PATHS"
         );
     }
