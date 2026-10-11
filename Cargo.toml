@@ -140,7 +140,7 @@ algo-bench = { path = "crates/tools/algo-bench" }
 algo-build-info = { path = "crates/tools/algo-build-info" }
 num-bigint = "0.4"
 num-traits = "0.2"
-statrs = "0.18"
+statrs = "0.19"
 
 # Elliptic curves (for AVM ec_* opcodes)
 ark-ff = "0.5"
