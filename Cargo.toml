@@ -166,7 +166,7 @@ rand = "0.8"
 zeroize = "1"
 http = "1"
 url = "2"
-hickory-resolver = { version = "0.25", features = ["dnssec-ring", "tokio"] }
+hickory-resolver = { version = "0.26", features = ["dnssec-ring", "tokio"] }
 regex = "1"
 crossbeam-channel = "0.5"
 
