@@ -28,6 +28,16 @@ updates:
         update-types: ["version-update:semver-major"]
       - dependency-name: "ark-*"
         update-types: ["version-update:semver-major"]
+      # statrs 0.19 (and nalgebra/wide/safe_arch) need rustc 1.89 > MSRV 1.88.
+      - dependency-name: "statrs"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      # RustCrypto digest 0.11 train (sha2 0.11, hkdf 0.13, ...): the
+      # dependent crates (hmac, blake2, sha3, ed25519-dalek, ...) must move
+      # together or trait bounds (CoreProxy/FixedOutput) mismatch.
+      - dependency-name: "sha2"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "hkdf"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
