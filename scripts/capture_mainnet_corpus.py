@@ -147,7 +147,20 @@ def _atomic_write(path, data):
     tmp = f"{path}.tmp{os.getpid()}"
     with open(tmp, "wb") as f:
         f.write(data)
-    os.replace(tmp, path)
+    try:
+        os.replace(tmp, path)
+    except PermissionError:
+        # Windows: a concurrent capture sharing the cache may be replacing or
+        # reading the same entry. If the file is already there with our bytes
+        # the write is redundant; otherwise it is a real error.
+        try:
+            with open(path, "rb") as f:
+                same = f.read() == data
+        except OSError:
+            same = False
+        os.unlink(tmp)
+        if not same:
+            raise
 
 
 def cached(name, fetch):
@@ -170,13 +183,22 @@ def raw_block(r):
 
 
 _delta_mem = {}
+DELTA_404_RETRIES = 12
 
 
 def delta(r):
     if r not in _delta_mem:
 
         def f():
-            resp = http(f"{ALGOD}/v2/deltas/{r}", {"format": "msgpack"})
+            # algonode load-balances over backends of which some lack a given
+            # round, so the same URL alternates 200 and 404 (issue #1769: a
+            # 43-minute capture died on a transient 404). A real gap still
+            # fails after DELTA_404_RETRIES attempts.
+            for attempt in range(DELTA_404_RETRIES):
+                resp = http(f"{ALGOD}/v2/deltas/{r}", {"format": "msgpack"})
+                if resp.status_code != 404:
+                    break
+                time.sleep(0.5 * min(attempt + 1, 4))
             resp.raise_for_status()
             return resp.content
 
