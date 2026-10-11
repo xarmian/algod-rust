@@ -135,12 +135,12 @@ jobs:
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Log in to Docker Hub (avoid unauthenticated pull rate limit)
         if: ${{ env.DOCKERHUB_TOKEN != '' }}
         continue-on-error: true
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ env.DOCKERHUB_USERNAME }}
           password: ${{ env.DOCKERHUB_TOKEN }}
@@ -155,7 +155,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Pull algorand/algod:5.0.2-stable
         run: docker pull algorand/algod:5.0.2-stable
@@ -165,7 +165,7 @@ jobs:
       # With P2PINTEROP_SKIP_BUILD=1 start.sh runs
       # `docker compose up -d rust-node-4` (no --build) and picks this up.
       - name: Build algod-rust node image (layer-cached)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile
@@ -247,7 +247,7 @@ jobs:
 
       - name: Upload 1v1 soak artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: p2p-1v1-consensus-soak-${{ github.run_id }}
           path: p2p-1v1-soak-artifacts/
@@ -277,7 +277,7 @@ jobs:
       - name: Restore cert-authenticate libsodium volume
         id: certauth-vol
         if: github.event.inputs.tier != 'smoke'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/certauth-volume
           # Distinct key from consensus-cluster.yml's own
@@ -346,7 +346,7 @@ jobs:
 
       - name: Upload soak artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           # summary.json, soak.jsonl, analyze.summary.json, analyze.log,
           # verify.log + verify-go-report-*.json (#596 cert authenticate),
