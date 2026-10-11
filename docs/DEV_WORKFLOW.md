@@ -1503,3 +1503,21 @@ decoded it is logged (`warn!`) and its row left as is; the marker is then NOT
 written, so the repair retries on the next open. Downgrade-then-upgrade is an
 unsupported flow: rows written by the older build after the marker was set are
 not repaired again.
+
+## Divergence hunts: diffing against public nodes
+
+`scripts/state_diff.py` compares one round (and any number of addresses)
+between a public node and a local algod-rust (issue #1771):
+
+```bash
+python3 scripts/state_diff.py --round 65743637 \
+    --address <ADDR> [--local http://127.0.0.1:8080] [--local-token TOKEN]
+```
+
+It diffs the block header (public algod `/v2/blocks/<r>?format=json` vs
+local) and each account (public indexer `/v2/accounts/<a>?round=<r>` vs the
+local `/v2/accounts/<a>`; the local node serves the latest state only, so
+the tool warns when the local round differs from `--round`). Exit status is
+0 identical, 1 differences, 2 fetch error. Hosts are overridable with
+`STATE_DIFF_ALGOD` / `STATE_DIFF_INDEXER`. Unit tests:
+`python3 scripts/state_diff_test.py`.
