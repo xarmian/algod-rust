@@ -48,7 +48,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -71,7 +71,7 @@ jobs:
       # even if the PR-creation step below fails (e.g. token scope issues).
       - name: Upload proptest-regressions artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: proptest-regressions-${{ github.run_id }}
           path: crates/core/algo-agreement/tests/proptest-regressions/
@@ -84,7 +84,7 @@ jobs:
       # the seed lands on main.
       - name: Open PR with new proptest regression seeds
         if: failure()
-        uses: peter-evans/create-pull-request@v6
+        uses: peter-evans/create-pull-request@v8
         with:
           branch: nightly-fuzz/proptest-regressions
           base: main

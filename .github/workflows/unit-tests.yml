@@ -45,7 +45,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Issue #1787: PR tests run in debug, Coverage in --release. Every
       # `debug_assertions` cfg must carry a `debug-assertions-ok:` note so a
