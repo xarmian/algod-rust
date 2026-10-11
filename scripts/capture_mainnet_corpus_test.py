@@ -58,5 +58,29 @@ class DeltaRetryTest(unittest.TestCase):
             c.delta(987654322)
 
 
+class AtomicWriteTest(unittest.TestCase):
+    def test_replace_denied_because_another_capture_wrote_the_same_file(self):
+        # Two capture processes sharing the cache can race on the same entry;
+        # on Windows os.replace then raises PermissionError although the
+        # content is already in place (issue #1769).
+        d = tempfile.mkdtemp(prefix="atomic-")
+        path = os.path.join(d, "delta-1.mp")
+        with open(path, "wb") as f:
+            f.write(b"payload")
+        real = c.os.replace
+
+        def denied(src, dst):
+            raise PermissionError(5, "Access is denied")
+
+        c.os.replace = denied
+        try:
+            c._atomic_write(path, b"payload")
+        finally:
+            c.os.replace = real
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), b"payload")
+        self.assertEqual(os.listdir(d), ["delta-1.mp"], "temp file cleaned up")
+
+
 if __name__ == "__main__":
     unittest.main()
