@@ -209,7 +209,7 @@ async fn test_high_message_volume() {
                     .unwrap_or_else(|e| panic!("encode_frame failed: {e}"));
 
                 write
-                    .send(tungstenite::Message::Binary(frame.clone()))
+                    .send(tungstenite::Message::Binary(frame.clone().into()))
                     .await
                     .unwrap_or_else(|e| {
                         panic!("client {client_id} msg {msg_idx} send failed: {e}")
@@ -283,7 +283,7 @@ async fn test_high_message_volume() {
     let post_burst_frame =
         encode_frame(&Tag::Transaction, &post_burst_payload).expect("encode post-burst frame");
     write
-        .send(tungstenite::Message::Binary(post_burst_frame))
+        .send(tungstenite::Message::Binary(post_burst_frame.into()))
         .await
         .expect("post-burst message should send successfully");
     let _ = write.close().await;
@@ -361,7 +361,7 @@ async fn test_sustained_throughput() {
                 };
 
                 match write
-                    .send(tungstenite::Message::Binary(frame.clone()))
+                    .send(tungstenite::Message::Binary(frame.clone().into()))
                     .await
                 {
                     Ok(()) => {
@@ -460,7 +460,7 @@ async fn test_sustained_throughput() {
     let check_payload = make_payload(1024, 0xAA);
     let check_frame = encode_frame(&Tag::Transaction, &check_payload).expect("encode check frame");
     write
-        .send(tungstenite::Message::Binary(check_frame))
+        .send(tungstenite::Message::Binary(check_frame.into()))
         .await
         .expect("post-sustained-load message should send successfully");
     let _ = write.close().await;

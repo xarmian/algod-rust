@@ -533,7 +533,7 @@ async fn relay_forwards_messages() {
     let frame = encode_frame(&Tag::AgreementVote, b"hello-from-peer-a")
         .expect("frame encode should succeed");
     write_a
-        .send(tungstenite::Message::Binary(frame))
+        .send(tungstenite::Message::Binary(frame.into()))
         .await
         .expect("peer A should be able to send");
 
@@ -1269,7 +1269,7 @@ async fn inbound_zstd_proposal_is_decompressed() {
     frame.extend_from_slice(&Tag::ProposalPayload.as_bytes());
     frame.extend_from_slice(&compressed);
     write
-        .send(tungstenite::Message::Binary(frame))
+        .send(tungstenite::Message::Binary(frame.into()))
         .await
         .expect("peer should be able to send");
 
