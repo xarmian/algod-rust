@@ -156,7 +156,7 @@ sysinfo = "0.33"
 snap = "1"
 tar = "0.4"
 flate2 = "1"
-zstd = "0.13"
+zstd = "0.14"
 
 # Networking (WebSocket)
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
