@@ -159,7 +159,7 @@ flate2 = "1"
 zstd = "0.14"
 
 # Networking (WebSocket)
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
 futures-util = "0.3"
 parking_lot = "0.12"
 rand = "0.8"
