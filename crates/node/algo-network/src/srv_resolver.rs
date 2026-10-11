@@ -1970,6 +1970,27 @@ mod tests {
         );
     }
 
+    /// Live check (needs internet): a validating default resolver resolves
+    /// the real, DNSSEC-signed mainnet bootstrap SRV set quickly. Guards
+    /// hickory upgrades: 0.26.3 failed this intermittently (DnssecBogus /
+    /// truncated-DNSKEY probe failure, issue #1828) where 0.25 passes.
+    /// Run with `cargo test -p algo-network --lib live_ -- --ignored`.
+    #[tokio::test]
+    #[ignore = "needs internet access"]
+    async fn live_mainnet_srv_validates_with_default_resolver() {
+        let r = HickorySrvResolver::default_resolver(true);
+        let started = std::time::Instant::now();
+        let res = HickorySrvResolver::lookup_stage(
+            &r,
+            "_algobootstrap._tcp.mainnet.algorand.network",
+            StageTimeouts::PRODUCTION,
+        )
+        .await
+        .expect("validated mainnet SRV lookup");
+        assert!(!res.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
     /// Builders for `run_chain` over pre-built stub resolvers; `built` counts
     /// how many resolvers the chain actually asked to build.
     fn chain(
