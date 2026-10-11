@@ -8047,8 +8047,9 @@ impl LedgerStore for SqliteLedger {
     /// go's `LookupAgreement(round, addr)`: the account's `onlineaccounts` row
     /// at or before `round`; no row (an account that was never online by
     /// then, e.g. went online after the balance round) is an empty
-    /// `OnlineAccountData`. There is deliberately NO fallback to the account's current state (shared
-    /// with `AgreementLedgerBridge::lookup_agreement`, issue #1809): the
+    /// `OnlineAccountData`. There is deliberately NO fallback to the account's
+    /// current state (shared with `AgreementLedgerBridge::lookup_agreement`,
+    /// issue #1809): the
     /// absence checks (`generateKnockOfflineAccountsList`,
     /// `validateAbsentOnlineAccounts`) and `voter_params_get` must agree with
     /// go, where a late joiner has stake 0 until the lookback passes it.
