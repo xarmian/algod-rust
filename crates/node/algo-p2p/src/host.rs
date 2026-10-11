@@ -801,15 +801,13 @@ impl P2pHost {
     /// Unsubscribe from a gossipsub topic previously joined via
     /// [`P2pHost::gossipsub_subscribe`].
     pub fn gossipsub_unsubscribe(&mut self, topic_name: &str) -> Result<(), P2pError> {
+        // libp2p-gossipsub 0.50+ reports "was subscribed" as a plain bool
+        // (unsubscribing a topic we never joined is a no-op, not an error).
         self.swarm
             .behaviour_mut()
             .gossipsub
-            .unsubscribe(&crate::pubsub::ident_topic(topic_name))
-            .map(|_| ())
-            .map_err(|source| P2pError::GossipsubPublish {
-                topic: topic_name.to_string(),
-                source: Box::new(source),
-            })
+            .unsubscribe(&crate::pubsub::ident_topic(topic_name));
+        Ok(())
     }
 
     /// Whether this host currently holds a live gossipsub subscription to
@@ -888,16 +886,13 @@ impl P2pHost {
         // only; `PublishError` here would indicate an internal gossipsub
         // state issue, not an untrusted-input problem, so it is logged
         // rather than propagated as a caller-facing error.
-        if let Err(e) = self
+        if !self
             .swarm
             .behaviour_mut()
             .gossipsub
             .report_message_validation_result(msg_id, propagation_source, result.into())
         {
-            tracing::debug!(
-                error = %e,
-                "failed to report gossipsub message validation result"
-            );
+            tracing::debug!("gossipsub message validation result not applied (message not in cache)");
         }
     }
 

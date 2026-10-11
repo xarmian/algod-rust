@@ -16,15 +16,14 @@ libp2p = { version = "0.56", features = [
     "gossipsub",
     "macros",
 ] }
-# Pinned to the 0.2.0-alpha release train specifically because it is the one
-# built against libp2p-swarm 0.45.x / libp2p-core 0.42.x — the exact versions
-# the `libp2p` facade crate above (0.54.x) re-exports. A newer libp2p-stream
-# (0.3.0-alpha+, built against swarm 0.46) pulls in a *second*, incompatible
-# copy of libp2p-swarm/-core, and `libp2p_stream::Behaviour` then implements
-# a different `NetworkBehaviour` trait than the one `#[derive(NetworkBehaviour)]`
-# on `P2pBehaviour` (host.rs) uses — a hard compile error, not a version
-# warning. Bump this only in lockstep with the `libp2p` facade version above.
-libp2p-stream = "0.2.0-alpha"
+# libp2p-stream must track the `libp2p` facade version above: 0.4.0-alpha is
+# the release built against the libp2p-swarm / libp2p-core copies that
+# libp2p 0.56.x re-exports. A mismatched libp2p-stream pulls in a *second*,
+# incompatible copy of libp2p-swarm/-core, and `libp2p_stream::Behaviour` then
+# implements a different `NetworkBehaviour` trait than the one
+# `#[derive(NetworkBehaviour)]` on `P2pBehaviour` (host.rs) uses — a hard
+# compile error, not a version warning. Bump only in lockstep with `libp2p`.
+libp2p-stream = "0.4.0-alpha"
 # Used to derive the raw Ed25519 signing key underlying a `libp2p::identity`
 # `Keypair`, for `identity::to_identity_signing_key` (issue #1133) — the
 # adapter that lets the P2P transport's own peer identity drive
