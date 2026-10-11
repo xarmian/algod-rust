@@ -76,6 +76,25 @@ jobs:
       - name: Run cargo-deny (licenses)
         run: cargo deny check licenses
 
+  dependency-advisories:
+    name: Dependency Advisories (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      # Issue #1671: RustSec vulnerabilities fail the job; an accepted one
+      # must be listed in deny.toml [advisories].ignore with a reason.
+      - name: Run cargo-deny (advisories)
+        run: cargo deny check advisories
+
   ci-wiring:
     name: CI Workflow Wiring (GO_ALGORAND_DIR)
     runs-on: ubuntu-latest

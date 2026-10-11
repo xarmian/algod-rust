@@ -1,0 +1,27 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+#
+# Issue #1671: propose dependency updates weekly, grouped so a week's worth
+# of semver-compatible bumps lands as one reviewable PR (consensus-critical
+# crates still go through the full suite + parity jobs before merge).
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels: [dependencies, team:b]
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels: [dependencies, team:b]
+    groups:
+      actions:
+        patterns: ["*"]
