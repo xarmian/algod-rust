@@ -537,49 +537,18 @@ impl LedgerReader for AgreementLedgerBridge {
             return Err(LedgerError::RoundNotAvailable(round));
         }
 
-        // Try historical lookup from the onlineaccounts table first.
-        // This mirrors Go's LookupAgreement which queries the online accounts
-        // tracker at the specified round, not just the latest snapshot.
-        let acct = match ledger.get_online_account_at_round(addr, round.0) {
-            Ok(Some(acct)) => acct,
-            Ok(None) | Err(_) => {
-                // Fall back to current account state if no historical data
-                // is available (e.g., onlineaccounts table not populated).
-                ledger.get_account(addr).unwrap_or_default()
-            }
-        };
-
-        // Go's real online-accounts tracker only ever has rows for accounts
-        // that are (or were, historically) `Online` -- an offline/
-        // not-participating account's agreement lookup returns the
-        // all-zero `basics.OnlineAccountData{}` (see
-        // `data/basics/testing/userBalance.go::OnlineAccountData`, the
-        // exact oracle `TestLookupAgreement` checks against). The account
-        // state fallback above reads the raw account row regardless of
-        // status, so it must be gated here -- otherwise an offline
-        // account's real balance/stale voting-key material would leak
-        // into agreement's stake/committee-membership calculations.
-        if acct.status != algo_types::AccountStatus::Online {
+        // One policy shared with `LedgerStore::voter_agreement_data_at_round`
+        // (issue #1809): go's `LookupAgreement` -- the `onlineaccounts` row at
+        // or before `round`, empty when there is none or the account was not
+        // online then, with the rewards pending at `round`'s level folded in
+        // (issue #1654). No fallback to the current account state: a late
+        // joiner has no stake until the lookback passes it.
+        let Some(acct) = ledger
+            .lookup_agreement_account(addr, round.0)
+            .map_err(|e| LedgerError::Other(format!("lookup_agreement_account: {e}")))?
+        else {
             return Ok(OnlineAccountData::default());
-        }
-
-        // Issue #1654 (live soak 36926581071, block 65574392: certificate
-        // weight 1111 < threshold 1112): go's `LookupAgreement` returns
-        // `MicroAlgosWithRewards` -- the account's balance with the rewards
-        // pending at the *lookup round's* rewards level folded in
-        // (`BaseOnlineAccountData.GetOnlineAccountData`,
-        // `ledger/store/trackerdb/data.go`) -- because that is the stake
-        // sortition weighs. The raw stored balance understates it by the
-        // pending rewards, shifting committee-membership weights by a vote
-        // here and there and eventually failing a certificate quorum.
-        let rewards_level = ledger
-            .get_block_header_data(round.0)
-            .ok()
-            .flatten()
-            .and_then(|hdr| algo_types::BlockHeader::decode_from_bytes(&hdr).ok())
-            .map(|hdr| hdr.rewards_level)
-            .unwrap_or_else(|| ledger.rewards_level());
-        let acct = with_pending_rewards(acct, rewards_level);
+        };
 
         Ok(OnlineAccountData {
             micro_algos: acct.micro_algos,
@@ -1163,20 +1132,6 @@ impl crate::catchup_service::CatchupLedger for AgreementLedgerBridge {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// `acct` with the rewards pending at `rewards_level` folded into its
-/// balance (go's `basics.WithUpdatedRewards`). A level below the account's
-/// `rewards_base` (a lookup at a round older than the stored record) adds
-/// nothing rather than wrapping.
-fn with_pending_rewards(
-    mut acct: algo_types::AccountData,
-    rewards_level: u64,
-) -> algo_types::AccountData {
-    if rewards_level >= acct.rewards_base {
-        crate::rewards::apply_rewards(&mut acct, rewards_level);
-    }
-    acct
-}
-
 /// Extract the committee seed from a msgpack-encoded block header.
 ///
 /// The seed is stored under codec key `"seed"` as a 32-byte binary value.
@@ -1274,19 +1229,20 @@ mod tests {
         let addr = Address([1u8; 32]);
         {
             let mut l = ledger.lock().unwrap();
-            l.set_account(
-                &addr,
-                algo_types::AccountData {
-                    micro_algos: 1_000_000,
-                    status: algo_types::AccountStatus::Online,
-                    vote_id: Some([7u8; 32]),
-                    selection_id: Some([8u8; 32]),
-                    vote_first_valid: 0,
-                    vote_last_valid: 1_000_000,
-                    vote_key_dilution: 100,
-                    ..Default::default()
-                },
-            );
+            let acct = algo_types::AccountData {
+                micro_algos: 1_000_000,
+                status: algo_types::AccountStatus::Online,
+                vote_id: Some([7u8; 32]),
+                selection_id: Some([8u8; 32]),
+                vote_first_valid: 0,
+                vote_last_valid: 1_000_000,
+                vote_key_dilution: 100,
+                ..Default::default()
+            };
+            l.set_account(&addr, acct.clone());
+            // go's LookupAgreement reads the onlineaccounts history row.
+            l.put_online_account_at_round(&addr, 0, &acct).unwrap();
+            l.put_block_header_fixture(0, 0).unwrap();
         }
         let bridge = AgreementLedgerBridge::new(ledger);
 
@@ -1295,30 +1251,6 @@ mod tests {
         assert_eq!(oad.vote_id, [7u8; 32]);
         assert_eq!(oad.selection_id, [8u8; 32]);
         assert_eq!(oad.vote_key_dilution, 100);
-    }
-
-    /// Issue #1654: the voting stake includes the rewards pending at the
-    /// lookup round's level (go's `MicroAlgosWithRewards`).
-    #[test]
-    fn with_pending_rewards_folds_in_rewards_like_go() {
-        let acct = algo_types::AccountData {
-            micro_algos: 10_000_000_000, // 10_000 reward units
-            rewards_base: 100,
-            status: algo_types::AccountStatus::Online,
-            ..Default::default()
-        };
-        // (level - base) * units = 25 * 10_000
-        assert_eq!(
-            with_pending_rewards(acct.clone(), 125).micro_algos,
-            10_000_250_000
-        );
-        // No change at the account's own level, and no wrap-around for an
-        // older lookup level.
-        assert_eq!(
-            with_pending_rewards(acct.clone(), 100).micro_algos,
-            10_000_000_000
-        );
-        assert_eq!(with_pending_rewards(acct, 50).micro_algos, 10_000_000_000);
     }
 
     #[test]
@@ -1369,6 +1301,95 @@ mod tests {
             .lookup_agreement(Round(0), &Address([3u8; 32]))
             .unwrap();
         assert_eq!(oad, OnlineAccountData::default());
+    }
+
+    fn online_acct(micro_algos: u64) -> algo_types::AccountData {
+        algo_types::AccountData {
+            micro_algos,
+            status: algo_types::AccountStatus::Online,
+            vote_id: Some([7u8; 32]),
+            selection_id: Some([8u8; 32]),
+            vote_last_valid: 1_000_000,
+            vote_key_dilution: 100,
+            ..Default::default()
+        }
+    }
+
+    /// Issue #1809: go's `LookupAgreement` has no current-state fallback. An
+    /// account that is `Online` now but has no `onlineaccounts` row at or
+    /// before the balance round (a late joiner) has stake 0 there.
+    #[test]
+    fn lookup_agreement_late_joiner_has_no_stake_before_its_history_row() {
+        use crate::store_trait::LedgerStore;
+        let mut l = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([4u8; 32]);
+        let acct = online_acct(7_000_000);
+        l.set_account(&addr, acct.clone());
+        l.put_online_account_at_round(&addr, 50, &acct).unwrap();
+        l.put_block_header_fixture(0, 0).unwrap();
+        l.set_current_round(Round(60));
+        let bridge = AgreementLedgerBridge::new(Arc::new(Mutex::new(l)));
+        assert_eq!(
+            bridge.lookup_agreement(Round(0), &addr).unwrap(),
+            OnlineAccountData::default(),
+            "no row at or before round 0: empty, not the current state"
+        );
+    }
+
+    /// Issue #1809: an Online account with no history row at all (pre-history
+    /// database) is empty too -- the open-time backfill, not the lookup, is
+    /// what gives such accounts a row.
+    #[test]
+    fn lookup_agreement_pre_history_account_is_empty() {
+        let mut l = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([5u8; 32]);
+        l.set_account(&addr, online_acct(7_000_000));
+        l.put_block_header_fixture(0, 0).unwrap();
+        let bridge = AgreementLedgerBridge::new(Arc::new(Mutex::new(l)));
+        assert_eq!(
+            bridge.lookup_agreement(Round(0), &addr).unwrap(),
+            OnlineAccountData::default()
+        );
+    }
+
+    /// Issue #1809: the bridge and the store's `voter_agreement_data_at_round`
+    /// share one policy: same stake (incl. pending rewards at the lookup
+    /// round) for every case.
+    #[test]
+    fn lookup_agreement_matches_store_lookback_policy() {
+        use crate::store_trait::LedgerStore;
+        let mut l = SqliteLedger::open_in_memory().unwrap();
+        let rich = Address([6u8; 32]);
+        let late = Address([7u8; 32]);
+        let none = Address([8u8; 32]);
+        let mut a = online_acct(10_000_000_000);
+        a.rewards_base = 100;
+        l.set_account(&rich, a.clone());
+        l.put_online_account_at_round(&rich, 0, &a).unwrap();
+        l.set_account(&late, online_acct(1_000_000));
+        l.put_online_account_at_round(&late, 9, &online_acct(1_000_000))
+            .unwrap();
+        l.put_block_header_fixture(0, 125).unwrap();
+        l.set_current_round(Round(10));
+        let bridge = AgreementLedgerBridge::new(Arc::new(Mutex::new(l)));
+        for addr in [&rich, &late, &none] {
+            let oad = bridge.lookup_agreement(Round(0), addr).unwrap();
+            let v = bridge
+                .ledger
+                .lock()
+                .unwrap()
+                .voter_agreement_data_at_round(0, addr)
+                .unwrap();
+            assert_eq!(oad.micro_algos, v.micro_algos);
+            assert_eq!(oad.incentive_eligible, v.incentive_eligible);
+        }
+        assert_eq!(
+            bridge
+                .lookup_agreement(Round(0), &rich)
+                .unwrap()
+                .micro_algos,
+            10_000_250_000
+        );
     }
 
     // -- Helper: tracking network advancer --
