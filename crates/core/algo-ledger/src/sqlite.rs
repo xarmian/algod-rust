@@ -3781,7 +3781,8 @@ impl SqliteLedger {
             } else {
                 crate::apply::ApplyMode::Replay
             };
-            let delta = crate::apply::apply_block_with_delta_mode(self, block, mode)?;
+            let delta =
+                crate::apply::apply_block_with_delta_mode_checking_payouts(self, block, mode)?;
             self.cache_state_delta(round, delta);
             Ok(())
         } else {
@@ -3807,9 +3808,17 @@ impl SqliteLedger {
             // cannot touch box storage, so they keep the cheaper Replay
             // path.
             if block_has_app_call(block) {
-                crate::apply::apply_block_with_mode(self, block, crate::apply::ApplyMode::Execute)?;
+                crate::apply::apply_block_checking_payouts(
+                    self,
+                    block,
+                    crate::apply::ApplyMode::Execute,
+                )?;
             } else {
-                crate::apply::apply_block(self, block)?;
+                crate::apply::apply_block_checking_payouts(
+                    self,
+                    block,
+                    crate::apply::ApplyMode::Replay,
+                )?;
             }
             self.delta_cache.advance(block.round.0);
             Ok(())

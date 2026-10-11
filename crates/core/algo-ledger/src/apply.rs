@@ -313,29 +313,42 @@ pub fn apply_block_executing_app_calls<L: crate::store_trait::LedgerStore>(
         if crate::shadow_execute::shadow_execute_enabled() {
             return crate::shadow_execute::apply_replay_block_with_shadow(store, block);
         }
-        return apply_block_impl(
-            store,
-            block,
-            ApplyMode::Replay,
-            false,
-            None,
-            None,
-            None,
-            None,
-        );
+        return apply_block_checking_payouts(store, block, ApplyMode::Replay);
     }
     if crate::shadow_execute::shadow_execute_enabled() {
         return crate::shadow_execute::apply_execute_block_with_apply_data_check(store, block);
     }
-    apply_block_impl(
+    apply_block_checking_payouts(store, block, ApplyMode::Execute)
+}
+
+/// Apply a certified block received from the network (follow / catch-up).
+///
+/// go applies those through the validating evaluator, whose `endOfBlock`
+/// runs `validateForPayouts`; this runs that one check (fees collected,
+/// disabled-payout fields, proposer present / not closed, payout within the
+/// allowance) without turning on the rest of `eval.validate`, which a
+/// certificate already vouches for (issue #1803). A pre-payouts protocol
+/// only checks that the payout fields are zero.
+pub fn apply_block_checking_payouts<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+    mode: ApplyMode,
+) -> Result<(), AlgoError> {
+    let mut probe = ExecProbe {
+        validate_payouts: true,
+        ..ExecProbe::default()
+    };
+    apply_block_impl_probe(
         store,
         block,
-        ApplyMode::Execute,
+        mode,
         false,
         None,
         None,
         None,
         None,
+        false,
+        Some(&mut probe),
     )
 }
 
@@ -627,7 +640,19 @@ pub fn apply_block_with_delta_mode<L: crate::store_trait::LedgerStore>(
     mode: ApplyMode,
 ) -> Result<crate::state_delta::StateDelta, AlgoError> {
     let (delta, _apply_data) =
-        apply_block_with_delta_mode_and_apply_data(store, block, mode, false)?;
+        apply_block_with_delta_mode_and_apply_data(store, block, mode, false, false)?;
+    Ok(delta)
+}
+
+/// [`apply_block_with_delta_mode`] for a certified block from the network:
+/// also runs go's `validateForPayouts` (see [`apply_block_checking_payouts`]).
+pub fn apply_block_with_delta_mode_checking_payouts<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+    mode: ApplyMode,
+) -> Result<crate::state_delta::StateDelta, AlgoError> {
+    let (delta, _apply_data) =
+        apply_block_with_delta_mode_and_apply_data(store, block, mode, false, true)?;
     Ok(delta)
 }
 
@@ -650,7 +675,8 @@ pub fn apply_block_capturing_apply_data_with_delta<L: crate::store_trait::Ledger
     block: &Block,
     mode: ApplyMode,
 ) -> Result<(Vec<ApplyData>, crate::state_delta::StateDelta), AlgoError> {
-    let (delta, apply_data) = apply_block_with_delta_mode_and_apply_data(store, block, mode, true)?;
+    let (delta, apply_data) =
+        apply_block_with_delta_mode_and_apply_data(store, block, mode, true, false)?;
     Ok((apply_data, delta))
 }
 
@@ -659,6 +685,7 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
     block: &Block,
     mode: ApplyMode,
     capture_apply_data: bool,
+    validate_payouts: bool,
 ) -> Result<(crate::state_delta::StateDelta, Vec<ApplyData>), AlgoError> {
     use std::collections::{HashMap, HashSet};
 
@@ -863,7 +890,11 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
     // discovered before the apply either. See `recording_store`'s module
     // doc comment for why a pre-apply snapshot alone doesn't work here.
     let mut recording_store = crate::recording_store::RecordingStore::new(store);
-    apply_block_impl(
+    let mut probe = ExecProbe {
+        validate_payouts,
+        ..ExecProbe::default()
+    };
+    apply_block_impl_probe(
         &mut recording_store,
         block,
         mode,
@@ -872,6 +903,8 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
         None,
         Some(&mut apply_data),
         Some(&mut kv_mods),
+        false,
+        Some(&mut probe),
     )?;
     let touches = recording_store.touches;
 
@@ -9819,6 +9852,52 @@ mod tests {
         assert!(
             validating_err(&mut state, &block).contains("payout 7 present when payouts disabled")
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Sync-applied (certified) blocks run validateForPayouts too (issue #1803)
+    // ---------------------------------------------------------------------
+
+    /// go applies a certified block received from the network through the
+    /// validating evaluator, so a bad payout / fees header is rejected there
+    /// too. The follow/catch-up entry point must do the same.
+    #[test]
+    fn sync_apply_rejects_bad_payout_header() {
+        let params = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+        let allowed = crate::block_header::proposer_payout(&params, 1_000, 0, u64::MAX).unwrap();
+        let (mut state, block, _, _) = payout_case(5_000_000, 0, allowed + 1);
+        let err = apply_block_executing_app_calls(&mut state, &block).unwrap_err();
+        assert!(matches!(err, AlgoError::PayoutViolation { .. }), "{err}");
+
+        let (mut state, mut block, _, _) = payout_case(5_000_000, 0, 0);
+        block.fees_collected = 999;
+        let err =
+            apply_block_with_delta_mode_checking_payouts(&mut state, &block, ApplyMode::Replay)
+                .unwrap_err();
+        assert!(matches!(err, AlgoError::PayoutViolation { .. }), "{err}");
+
+        let (mut state, mut block, _, _) = payout_case(5_000_000, 0, 0);
+        block.proposer = Address::ZERO;
+        let err = apply_block_checking_payouts(&mut state, &block, ApplyMode::Replay).unwrap_err();
+        assert!(matches!(err, AlgoError::PayoutViolation { .. }), "{err}");
+    }
+
+    /// Valid payout headers, and pre-payouts protocols with all-zero payout
+    /// fields, still sync.
+    #[test]
+    fn sync_apply_accepts_valid_and_pre_payout_blocks() {
+        let (mut state, block, _, _) = payout_case(5_000_000, 0, 0);
+        apply_block_executing_app_calls(&mut state, &block).unwrap();
+
+        let (mut state, mut block, _, _) = payout_case(5_000_000, 0, 0);
+        block.current_protocol = algo_types::consensus::CONSENSUS_V38.to_string();
+        block.fees_collected = 0;
+        block.proposer = Address::ZERO;
+        apply_block_with_delta_mode_checking_payouts(&mut state, &block, ApplyMode::Replay)
+            .unwrap();
     }
 
     /// Payouts enabled: a validating evaluator needs the proposer set.
