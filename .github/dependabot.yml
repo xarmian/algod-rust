@@ -16,6 +16,18 @@ updates:
     groups:
       cargo-minor-patch:
         update-types: [minor, patch]
+    # Major bumps that need a coordinated migration (issue #1839): rand 0.10
+    # renames the whole API and moves rand_core, which the seeded
+    # rand_chacha 0.3 test RNGs and the key-generation paths in
+    # algo-consensus-crypto depend on; the ark-* crates (BN254/BLS12-381 AVM
+    # ops) must move together. Re-enable when that migration is scheduled.
+    ignore:
+      - dependency-name: "rand"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "rand_chacha"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "ark-*"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
