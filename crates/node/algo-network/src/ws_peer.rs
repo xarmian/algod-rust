@@ -1254,7 +1254,7 @@ impl PeerHandle {
                                 }
                             }
                             Some(WriteCommand::Ping(data)) => {
-                                if ws_writer.send(axum::extract::ws::Message::Ping(data)).await.is_err() {
+                                if ws_writer.send(axum::extract::ws::Message::Ping(data.into())).await.is_err() {
                                     break;
                                 }
                             }
@@ -1286,7 +1286,7 @@ impl PeerHandle {
                                 }
                             }
                             Some(WriteCommand::Ping(data)) => {
-                                if ws_writer.send(axum::extract::ws::Message::Ping(data)).await.is_err() {
+                                if ws_writer.send(axum::extract::ws::Message::Ping(data.into())).await.is_err() {
                                     break;
                                 }
                             }
@@ -1431,7 +1431,7 @@ async fn write_inbound_data_message(
 
     let sent_len = frame.len() as u64;
     if ws_writer
-        .send(axum::extract::ws::Message::Binary(frame))
+        .send(axum::extract::ws::Message::Binary(frame.into()))
         .await
         .is_err()
     {
@@ -1458,7 +1458,7 @@ async fn send_vp_abort_axum(
     frame.extend_from_slice(&Tag::VotePacked.as_bytes());
     frame.push(VOTE_COMPRESSION_ABORT_BYTE);
     if ws_writer
-        .send(axum::extract::ws::Message::Binary(frame))
+        .send(axum::extract::ws::Message::Binary(frame.into()))
         .await
         .is_err()
     {
@@ -2813,7 +2813,7 @@ where
         }
         WriteCommand::Ping(payload) => {
             // Send a WebSocket Ping frame.
-            if let Err(e) = sink.send(WsMessage::Ping(payload)).await {
+            if let Err(e) = sink.send(WsMessage::Ping(payload.into())).await {
                 return Err(format!("ping write error: {e}"));
             }
             // Do NOT update last_packet_time here — only inbound traffic
@@ -2973,7 +2973,9 @@ where
             let remaining_budget =
                 MAX_MESSAGE_QUEUE_DURATION.saturating_sub(send_msg.enqueued.elapsed());
             let sent_len = data.len() as u64;
-            match tokio::time::timeout(remaining_budget, sink.send(WsMessage::Binary(data))).await {
+            match tokio::time::timeout(remaining_budget, sink.send(WsMessage::Binary(data.into())))
+                .await
+            {
                 Ok(Ok(())) => {
                     // Issue #1425: count sent bytes/messages by tag only on
                     // a successful write, mirroring go's placement of
@@ -3169,7 +3171,7 @@ where
     let mut frame = Vec::with_capacity(3);
     frame.extend_from_slice(&Tag::VotePacked.as_bytes());
     frame.push(VOTE_COMPRESSION_ABORT_BYTE);
-    if let Err(e) = sink.send(WsMessage::Binary(frame)).await {
+    if let Err(e) = sink.send(WsMessage::Binary(frame.into())).await {
         tracing::warn!(
             peer = %remote_addr,
             error = %e,
@@ -4167,7 +4169,10 @@ mod tests {
 
         // Send a TX message from the client.
         let frame = encode_frame(&Tag::Transaction, b"test data").unwrap();
-        client_sink.send(WsMessage::Binary(frame)).await.unwrap();
+        client_sink
+            .send(WsMessage::Binary(frame.into()))
+            .await
+            .unwrap();
 
         // Read it from the incoming channel.
         let msg = tokio::time::timeout(Duration::from_secs(2), incoming_rx.recv())
@@ -4220,7 +4225,10 @@ mod tests {
         // Build and send an MI message saying we only want AV and TX.
         let mi_payload = marshal_msg_of_interest(&[Tag::AgreementVote, Tag::Transaction]);
         let mi_frame = encode_frame(&Tag::MsgOfInterest, &mi_payload).unwrap();
-        client_sink.send(WsMessage::Binary(mi_frame)).await.unwrap();
+        client_sink
+            .send(WsMessage::Binary(mi_frame.into()))
+            .await
+            .unwrap();
 
         // The MI message should NOT appear on the incoming channel.
         // Instead, a filter update should appear on the high-prio channel.
@@ -4301,7 +4309,10 @@ mod tests {
             topics.marshal()
         };
         let mi_frame = encode_frame(&Tag::MsgOfInterest, &bad_payload).unwrap();
-        client_sink.send(WsMessage::Binary(mi_frame)).await.unwrap();
+        client_sink
+            .send(WsMessage::Binary(mi_frame.into()))
+            .await
+            .unwrap();
 
         // The read loop must tear the connection down (closing cancelled)
         // rather than forward the bad MI payload or a filter update.
@@ -4696,7 +4707,10 @@ mod tests {
         // Send several messages to fill the incoming channel and overflow it.
         for i in 0..5u8 {
             let frame = encode_frame(&Tag::Transaction, &[i]).unwrap();
-            client_sink.send(WsMessage::Binary(frame)).await.unwrap();
+            client_sink
+                .send(WsMessage::Binary(frame.into()))
+                .await
+                .unwrap();
         }
 
         // Give the read loop time to process all the frames.
@@ -4782,7 +4796,10 @@ mod tests {
         // Send a MsgDigestSkip with a 32-byte digest.
         let digest = [0xABu8; 32];
         let frame = encode_frame(&Tag::MsgDigestSkip, &digest).unwrap();
-        client_sink.send(WsMessage::Binary(frame)).await.unwrap();
+        client_sink
+            .send(WsMessage::Binary(frame.into()))
+            .await
+            .unwrap();
 
         // Give the read loop time to process.
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -4842,10 +4859,13 @@ mod tests {
         let payload = b"duplicate transaction data";
         let frame = encode_frame(&Tag::Transaction, payload).unwrap();
         client_sink
-            .send(WsMessage::Binary(frame.clone()))
+            .send(WsMessage::Binary(frame.clone().into()))
             .await
             .unwrap();
-        client_sink.send(WsMessage::Binary(frame)).await.unwrap();
+        client_sink
+            .send(WsMessage::Binary(frame.into()))
+            .await
+            .unwrap();
 
         // Give the read loop time to process both.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -4939,7 +4959,10 @@ mod tests {
         ]);
         let response_data = response_topics.marshal();
         let frame = encode_frame(&Tag::TopicMsgResp, &response_data).unwrap();
-        client_sink.send(WsMessage::Binary(frame)).await.unwrap();
+        client_sink
+            .send(WsMessage::Binary(frame.into()))
+            .await
+            .unwrap();
 
         // The receiver should get the response.
         let response = tokio::time::timeout(Duration::from_secs(2), rx)
@@ -5008,7 +5031,10 @@ mod tests {
         let response_topics = Topics::from_vec(vec![Topic::new("foo", b"bar".to_vec())]);
         let response_data = response_topics.marshal();
         let frame = encode_frame(&Tag::TopicMsgResp, &response_data).unwrap();
-        client_sink.send(WsMessage::Binary(frame)).await.unwrap();
+        client_sink
+            .send(WsMessage::Binary(frame.into()))
+            .await
+            .unwrap();
 
         // The read loop must disconnect: it cancels the shared `closing`
         // token and returns, rather than continuing to read from the peer.
@@ -5114,7 +5140,10 @@ mod tests {
             ));
 
             let frame = encode_frame(&Tag::Transaction, b"tx-data").unwrap();
-            client_sink.send(WsMessage::Binary(frame)).await.unwrap();
+            client_sink
+                .send(WsMessage::Binary(frame.into()))
+                .await
+                .unwrap();
 
             // Give it time to process.
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -5171,7 +5200,10 @@ mod tests {
             ));
 
             let frame = encode_frame(&Tag::AgreementVote, b"bad-vote").unwrap();
-            client_sink.send(WsMessage::Binary(frame)).await.unwrap();
+            client_sink
+                .send(WsMessage::Binary(frame.into()))
+                .await
+                .unwrap();
 
             // Give it time to process.
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -5238,7 +5270,10 @@ mod tests {
         ));
 
         let frame = encode_frame(&Tag::UniEnsBlockReq, b"request-data").unwrap();
-        client_sink.send(WsMessage::Binary(frame)).await.unwrap();
+        client_sink
+            .send(WsMessage::Binary(frame.into()))
+            .await
+            .unwrap();
 
         // The Respond action should enqueue a reply on the high-prio channel.
         let cmd = tokio::time::timeout(Duration::from_secs(2), high_prio_rx.recv())
@@ -5444,7 +5479,10 @@ mod tests {
 
         // Send a TX message.
         let frame = encode_frame(&Tag::Transaction, b"compat-test").unwrap();
-        client_sink.send(WsMessage::Binary(frame)).await.unwrap();
+        client_sink
+            .send(WsMessage::Binary(frame.into()))
+            .await
+            .unwrap();
 
         // Should arrive on the incoming channel as before.
         let msg = tokio::time::timeout(Duration::from_secs(2), incoming_rx.recv())
@@ -5664,7 +5702,7 @@ mod tests {
         // Send the response back through the server sink.
         let mut server_sink = server_sink;
         server_sink
-            .send(WsMessage::Binary(resp_frame))
+            .send(WsMessage::Binary(resp_frame.into()))
             .await
             .unwrap();
 
@@ -6274,7 +6312,10 @@ mod tests {
 
         // Send a stateless-vpack-compressed AV frame from the server side.
         let frame = encode_frame(&Tag::AgreementVote, &compressed).unwrap();
-        server_sink.send(WsMessage::Binary(frame)).await.unwrap();
+        server_sink
+            .send(WsMessage::Binary(frame.into()))
+            .await
+            .unwrap();
 
         let received = tokio::time::timeout(Duration::from_secs(2), incoming_rx.recv())
             .await
@@ -6327,7 +6368,10 @@ mod tests {
         ));
 
         let frame = encode_frame(&Tag::VotePacked, &stateful).unwrap();
-        server_sink.send(WsMessage::Binary(frame)).await.unwrap();
+        server_sink
+            .send(WsMessage::Binary(frame.into()))
+            .await
+            .unwrap();
 
         let received = tokio::time::timeout(Duration::from_secs(2), incoming_rx.recv())
             .await
@@ -6393,7 +6437,10 @@ mod tests {
         ));
 
         let frame = encode_frame(&Tag::ProposalPayload, &raw_payload).unwrap();
-        server_sink.send(WsMessage::Binary(frame)).await.unwrap();
+        server_sink
+            .send(WsMessage::Binary(frame.into()))
+            .await
+            .unwrap();
 
         let received = tokio::time::timeout(Duration::from_secs(2), incoming_rx.recv())
             .await
@@ -6406,7 +6453,10 @@ mod tests {
         // by sending a second, unrelated message and confirming it still
         // arrives.
         let tx_frame = encode_frame(&Tag::Transaction, b"after-pp-passthrough").unwrap();
-        server_sink.send(WsMessage::Binary(tx_frame)).await.unwrap();
+        server_sink
+            .send(WsMessage::Binary(tx_frame.into()))
+            .await
+            .unwrap();
         let received2 = tokio::time::timeout(Duration::from_secs(2), incoming_rx.recv())
             .await
             .expect("timeout waiting for follow-up message")
@@ -6455,12 +6505,18 @@ mod tests {
 
         // Send the VP abort control byte.
         let frame = encode_frame(&Tag::VotePacked, &[vpack::VOTE_COMPRESSION_ABORT_BYTE]).unwrap();
-        server_sink.send(WsMessage::Binary(frame)).await.unwrap();
+        server_sink
+            .send(WsMessage::Binary(frame.into()))
+            .await
+            .unwrap();
 
         // Follow it with an unrelated TX message; if the abort had wedged
         // the loop this would never arrive.
         let tx_frame = encode_frame(&Tag::Transaction, b"after-abort").unwrap();
-        server_sink.send(WsMessage::Binary(tx_frame)).await.unwrap();
+        server_sink
+            .send(WsMessage::Binary(tx_frame.into()))
+            .await
+            .unwrap();
 
         let received = tokio::time::timeout(Duration::from_secs(2), incoming_rx.recv())
             .await

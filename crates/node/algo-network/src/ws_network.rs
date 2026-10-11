@@ -4809,11 +4809,9 @@ mod tests {
         // The client itself must NOT be the one enforcing the limit, so it
         // is deliberately configured with a ceiling well above the
         // server's — proving any rejection observed is the server's doing.
-        let client_config = WebSocketConfig {
-            max_message_size: Some(crate::tag::MAX_MESSAGE_LENGTH * 4),
-            max_frame_size: Some(crate::tag::MAX_MESSAGE_LENGTH * 4),
-            ..WebSocketConfig::default()
-        };
+        let client_config = WebSocketConfig::default()
+            .max_message_size(Some(crate::tag::MAX_MESSAGE_LENGTH * 4))
+            .max_frame_size(Some(crate::tag::MAX_MESSAGE_LENGTH * 4));
         let (mut ws_stream, _response) =
             tokio_tungstenite::connect_async_with_config(request, Some(client_config), false)
                 .await
@@ -4836,7 +4834,7 @@ mod tests {
         // consistent with WS-layer enforcement, so only fail the test if
         // the send succeeds *and* is followed by a normally-open
         // connection.
-        let send_result = ws_stream.send(Message::Binary(oversized)).await;
+        let send_result = ws_stream.send(Message::Binary(oversized.into())).await;
 
         if send_result.is_ok() {
             // The connection must close (Close frame or a hard error) --

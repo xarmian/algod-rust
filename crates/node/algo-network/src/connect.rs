@@ -328,11 +328,9 @@ async fn try_connect_inner(
     // runs (issue #1102). Go's `wsPeer.go` readLoop enforces the
     // equivalent bound incrementally via `LimitedReaderSlurper`.
     let handshake_timeout = config.handshake_timeout;
-    let ws_config = WebSocketConfig {
-        max_message_size: Some(MAX_MESSAGE_LENGTH),
-        max_frame_size: Some(MAX_MESSAGE_LENGTH),
-        ..WebSocketConfig::default()
-    };
+    let ws_config = WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE_LENGTH))
+        .max_frame_size(Some(MAX_MESSAGE_LENGTH));
     // Written as an explicit match (rather than `.map_err().and_then()`)
     // because clippy's `result_large_err` lint fires on a closure whose
     // `Result::Err` is `WsConnectError` (it carries a `tokio_tungstenite`
@@ -736,7 +734,7 @@ fn verify_handshake_response(
 ) -> Result<(), WsConnectError> {
     if response.status() != http::StatusCode::SWITCHING_PROTOCOLS {
         return Err(map_tungstenite_error(
-            tokio_tungstenite::tungstenite::Error::Http(response.clone()),
+            tokio_tungstenite::tungstenite::Error::Http(Box::new(response.clone())),
         ));
     }
 
@@ -937,7 +935,7 @@ mod tests {
             .status(412)
             .body(Some(b"genesis mismatch".to_vec()))
             .unwrap();
-        let err = map_tungstenite_error(TungError::Http(response));
+        let err = map_tungstenite_error(TungError::Http(Box::new(response)));
         assert!(matches!(err, WsConnectError::GenesisMismatch));
     }
 
@@ -950,7 +948,7 @@ mod tests {
             .header("Retry-After", "60")
             .body(Some(b"too many requests".to_vec()))
             .unwrap();
-        let err = map_tungstenite_error(TungError::Http(response));
+        let err = map_tungstenite_error(TungError::Http(Box::new(response)));
         match err {
             WsConnectError::TooManyRequests { retry_after_secs } => {
                 assert_eq!(retry_after_secs, Some(60));
@@ -967,7 +965,7 @@ mod tests {
             .status(429)
             .body(Some(b"too many requests".to_vec()))
             .unwrap();
-        let err = map_tungstenite_error(TungError::Http(response));
+        let err = map_tungstenite_error(TungError::Http(Box::new(response)));
         match err {
             WsConnectError::TooManyRequests { retry_after_secs } => {
                 assert_eq!(retry_after_secs, None);
@@ -984,7 +982,7 @@ mod tests {
             .status(508)
             .body(Some(b"loop detected".to_vec()))
             .unwrap();
-        let err = map_tungstenite_error(TungError::Http(response));
+        let err = map_tungstenite_error(TungError::Http(Box::new(response)));
         assert!(matches!(err, WsConnectError::SelfLoop));
     }
 
@@ -996,7 +994,7 @@ mod tests {
             .status(500)
             .body(Some(b"internal error".to_vec()))
             .unwrap();
-        let err = map_tungstenite_error(TungError::Http(response));
+        let err = map_tungstenite_error(TungError::Http(Box::new(response)));
         match err {
             WsConnectError::HttpStatus { status, body } => {
                 assert_eq!(status, 500);
@@ -1014,7 +1012,7 @@ mod tests {
             .status(403)
             .body(None::<Vec<u8>>)
             .unwrap();
-        let err = map_tungstenite_error(TungError::Http(response));
+        let err = map_tungstenite_error(TungError::Http(Box::new(response)));
         match err {
             WsConnectError::HttpStatus { status, body } => {
                 assert_eq!(status, 403);
