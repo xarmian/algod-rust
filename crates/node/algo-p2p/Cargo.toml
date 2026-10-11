@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-libp2p = { version = "0.54", features = [
+libp2p = { version = "0.56", features = [
     "tcp",
     "noise",
     "yamux",
