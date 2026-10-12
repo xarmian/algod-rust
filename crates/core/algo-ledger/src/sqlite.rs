@@ -2363,6 +2363,25 @@ pub struct SqliteLedger {
     /// to a full sweep of every currently-online account.
     pending_online_touched: std::collections::HashSet<Address>,
 
+    /// Candidate index for the proposer's knock-offline selection (issue
+    /// #1885), built lazily from the account table and kept in step at
+    /// `commit_block` from the written addresses. `RefCell`: built on first
+    /// use behind `&self` (the ledger is single-writer, see `rewards_cache`).
+    knock_index: std::cell::RefCell<Option<crate::knock_index::KnockIndex>>,
+
+    /// Addresses written by `set_account`/`remove_account` OUTSIDE a
+    /// `begin_block`/`commit_block` span (genesis / bootstrap / tests):
+    /// `begin_block` clears `pending_online_touched`, so these are tracked
+    /// apart and folded into the index at the next commit (and overlaid on
+    /// queries until then).
+    knock_dirty: std::collections::HashSet<Address>,
+
+    /// When more than `1/knock_fallback_divisor` of the indexed accounts are
+    /// candidates, walking the whole ordered stream is cheaper than one point
+    /// lookup per candidate, so it is used instead (a superset either way).
+    /// 0 never falls back (tests).
+    knock_fallback_divisor: usize,
+
     /// `(round, rewards_level)` of the last COMMITTED block header consulted by
     /// [`Self::rewards_level_at`]. The pair is a single `Cell` value read and
     /// written as a unit, so a reader never sees a round with another round's
@@ -3105,6 +3124,9 @@ impl SqliteLedger {
             online_history_checked: std::sync::atomic::AtomicBool::new(db_prefix_is_none),
             pending_totals_delta: AccountTotalsDelta::default(),
             pending_online_touched: std::collections::HashSet::new(),
+            knock_index: std::cell::RefCell::new(None),
+            knock_dirty: std::collections::HashSet::new(),
+            knock_fallback_divisor: crate::knock_index::DEFAULT_FALLBACK_DIVISOR,
             rewards_cache: RewardsLevelCache::default(),
             catchpoint_auto: None,
             catchpoint_worker: None,
@@ -4142,6 +4164,17 @@ impl SqliteLedger {
         // `get_online_account_at_round` (backing `AgreementLedgerBridge`'s
         // per-round online-status lookups) silently fell back to current
         // state for any round the last catchpoint import didn't cover.
+        // Issue #1885: the addresses this commit writes, for the knock-offline
+        // candidate index (applied once the COMMIT has succeeded).
+        let knock_changed: Vec<Address> = if self.knock_index.get_mut().is_some() {
+            self.pending_online_touched
+                .iter()
+                .chain(self.knock_dirty.iter())
+                .copied()
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.record_online_account_history()?;
         if let Some(start) = accounts_writing_start {
             acctupdates_sample.accounts_writing_duration = start.elapsed();
@@ -4220,6 +4253,7 @@ impl SqliteLedger {
         // The committed lease changes stand; discard the rollback snapshot.
         self.lease_snapshot = None;
         self.in_block = false;
+        self.apply_knock_index_commit(&knock_changed);
 
         // Issue #1187: emit the periodic AccountUpdates telemetry-equivalent
         // event now that the commit has actually succeeded — go's
@@ -5971,6 +6005,107 @@ impl SqliteLedger {
 
     // ---- Internal helpers ----
 
+    /// Keys of `acct` in the knock-offline candidate index, `None` when it is
+    /// not in the online set the knock-offline stream walks
+    /// (`normalizedonlinebalance > 0` and `Online`) or can never be listed.
+    fn knock_keys(acct: &AccountData) -> Option<(Option<u64>, Option<u64>)> {
+        crate::knock_index::keys_of(acct, account_nob_i64(acct) > 0)
+    }
+
+    /// Build the candidate index from the account table. Entries are decoded
+    /// from whatever the connection sees; uncommitted writes may be visible
+    /// (`pending`), and a rollback can undo what was read, so those addresses
+    /// are marked unsettled (re-read at the next commit, never answered from
+    /// the index).
+    fn build_knock_index(
+        &self,
+        pending: impl Iterator<Item = Address>,
+    ) -> crate::knock_index::KnockIndex {
+        let mut index = crate::knock_index::KnockIndex::default();
+        self.for_each_online_account_ordered(&mut |addr, acct| {
+            index.set(&addr, Self::knock_keys(&acct));
+            true
+        });
+        index.unsettled.extend(pending);
+        index
+    }
+
+    /// Fold a successful commit's written addresses (and any unsettled ones)
+    /// into the candidate index, if one has been built.
+    fn apply_knock_index_commit(&mut self, changed: &[Address]) {
+        let mut taken = self.knock_index.get_mut().take();
+        if let Some(index) = taken.as_mut() {
+            let mut addrs: Vec<Address> = changed.to_vec();
+            addrs.extend(index.unsettled.drain());
+            for addr in addrs {
+                let keys = self.get_account(&addr).as_ref().and_then(Self::knock_keys);
+                index.set(&addr, keys);
+            }
+        }
+        *self.knock_index.get_mut() = taken;
+        self.knock_dirty.clear();
+    }
+
+    fn knock_pending_addresses(&self) -> std::collections::HashSet<Address> {
+        self.pending_online_touched
+            .iter()
+            .chain(self.knock_dirty.iter())
+            .copied()
+            .collect()
+    }
+
+    fn ensure_knock_index(&self) {
+        if self.knock_index.borrow().is_some() {
+            return;
+        }
+        let built = self.build_knock_index(self.knock_pending_addresses().into_iter());
+        *self.knock_index.borrow_mut() = Some(built);
+    }
+
+    /// Test/diagnostic: the candidate index (built if needed) equals one
+    /// rebuilt from the account table, ignoring addresses with uncommitted
+    /// writes. Returns the number of compared entries.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn knock_index_check(&self) -> Result<usize, String> {
+        self.ensure_knock_index();
+        let pending = self.knock_pending_addresses();
+        let fresh = self.build_knock_index(std::iter::empty());
+        let guard = self.knock_index.borrow();
+        let index = guard.as_ref().expect("built");
+        let skip =
+            |a: &[u8; 32]| pending.contains(&Address(*a)) || index.unsettled.contains(&Address(*a));
+        let have: Vec<_> = index
+            .snapshot()
+            .into_iter()
+            .filter(|(a, _, _)| !skip(a))
+            .collect();
+        let want: Vec<_> = fresh
+            .snapshot()
+            .into_iter()
+            .filter(|(a, _, _)| !skip(a))
+            .collect();
+        if have == want {
+            Ok(have.len())
+        } else {
+            Err(format!(
+                "knock index drift: index={have:?} rebuilt={want:?}"
+            ))
+        }
+    }
+
+    /// Test/diagnostic: tune (0 = never) the candidate-fraction threshold
+    /// beyond which the full ordered stream replaces per-candidate lookups.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn knock_index_set_fallback_divisor(&mut self, divisor: usize) {
+        self.knock_fallback_divisor = divisor;
+    }
+
+    /// Test/diagnostic: drop the candidate index (forces a lazy rebuild).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn knock_index_drop(&mut self) {
+        *self.knock_index.get_mut() = None;
+    }
+
     /// Get the rowid for an address in accountbase, or None.
     fn get_rowid(&self, addr: &Address) -> Option<i64> {
         self.conn
@@ -6374,6 +6509,9 @@ impl LedgerStore for SqliteLedger {
         // `record_online_account_history` (called from `commit_block`)
         // considers it for a new `onlineaccounts` history row.
         self.pending_online_touched.insert(*addr);
+        if !self.in_block {
+            self.knock_dirty.insert(*addr);
+        }
         // Issue #523: fold this write's status/balance change into the
         // block-level `accounttotals` delta accumulator (flushed once at
         // `commit_block`) — see `AccountTotalsDelta::fold`.
@@ -6410,6 +6548,9 @@ impl LedgerStore for SqliteLedger {
         // Issue #960: same reasoning as `set_account` — a closed account
         // that was previously online must still get an offline marker row.
         self.pending_online_touched.insert(*addr);
+        if !self.in_block {
+            self.knock_dirty.insert(*addr);
+        }
         // Issue #523: fold the removal (no replacement state) into the
         // block-level `accounttotals` delta accumulator — see `set_account`.
         if let Some(old) = &old {
@@ -8034,6 +8175,55 @@ impl LedgerStore for SqliteLedger {
                 }
                 Ok(_) => {}
                 Err(e) => tracing::error!("for_each_online_account_ordered: decode error: {e}"),
+            }
+        }
+    }
+
+    fn pending_modified_addresses(&self) -> Option<Vec<Address>> {
+        Some(self.knock_pending_addresses().into_iter().collect())
+    }
+
+    fn for_each_knock_offline_candidate_ordered(
+        &self,
+        round: u64,
+        challenge_round: u64,
+        visit: &mut dyn FnMut(Address, AccountData) -> bool,
+    ) {
+        // Issue #1885: answer from the candidate index; only candidates are
+        // read and decoded. Addresses with uncommitted writes (this block /
+        // scratch pass) or unsettled entries are never answered from the
+        // index: they are re-read from the connection, which sees (and
+        // correctly rolls back) the in-flight writes.
+        self.ensure_knock_index();
+        let mut overlay = self.knock_pending_addresses();
+        let candidates = {
+            let guard = self.knock_index.borrow();
+            let index = guard.as_ref().expect("built above");
+            overlay.extend(index.unsettled.iter().copied());
+            let limit = match self.knock_fallback_divisor {
+                0 => usize::MAX,
+                d => index.len() / d,
+            };
+            index.candidates(round, challenge_round, &overlay, limit)
+        };
+        // Beyond the threshold most of the online set is a candidate: streaming
+        // it is cheaper than a point lookup per candidate.
+        let Some(mut order) = candidates else {
+            self.for_each_online_account_ordered(visit);
+            return;
+        };
+        order.extend(overlay.iter().map(|a| a.0));
+        for a in order {
+            let addr = Address(a);
+            let Some(acct) = self.get_account(&addr) else {
+                continue;
+            };
+            // Same membership as the full ordered stream.
+            if account_nob_i64(&acct) <= 0 || acct.status != AccountStatus::Online {
+                continue;
+            }
+            if !visit(addr, acct) {
+                return;
             }
         }
     }
@@ -16312,6 +16502,9 @@ mod tests {
             online_history_checked: _, // upgrade-once flag, not chain state
             pending_totals_delta: _,   // reset by rollback
             pending_online_touched: _, // cleared by rollback
+            knock_index: _,            // committed-state index; overlay covers in-flight writes
+            knock_dirty: _,            // out-of-block writes, persisted immediately
+            knock_fallback_divisor: _, // tuning knob
             rewards_cache: _,          // committed-header cache, immutable data
             catchpoint_auto: _,
             catchpoint_worker: _,

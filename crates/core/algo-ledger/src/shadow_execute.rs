@@ -778,9 +778,10 @@ pub mod test_hooks {
     }
 
     /// Number of expired / absent list computations
-    /// ([`crate::apply::knock_offline_lists`]) run on this thread since the
-    /// last reset: the O(online accounts) scan a discarded scratch pass must
-    /// not pay for (issue #1795).
+    /// ([`crate::apply::knock_offline_lists`] and
+    /// [`crate::apply::knock_offline_lists_from_modified`]) run on this
+    /// thread since the last reset: the scan a discarded scratch pass must
+    /// not pay for (issues #1795, #1885).
     pub fn knock_offline_calls() -> u64 {
         KNOCK_CALLS.with(|c| c.get())
     }
@@ -847,6 +848,12 @@ pub struct ScratchPayset {
     /// The expired / absent participation lists go's `endOfBlock` would
     /// generate over the state after the payset (issue #1795).
     pub knock_offline_lists: Option<crate::apply::KnockOfflineLists>,
+    /// The post-payset state of every modified account, for a store that can
+    /// enumerate them: the lists are then computed from it on the committed
+    /// ledger by [`crate::apply::knock_offline_lists_from_modified`] once the
+    /// proposer has kept the payset, with no second execution (issue #1885).
+    /// Mutually exclusive with `knock_offline_lists`.
+    pub knock_offline_modified: Option<crate::apply::KnockOfflineModified>,
 }
 
 /// Why [`scratch_execute_payset`] did not produce a result.
@@ -882,7 +889,6 @@ pub fn scratch_execute_payset<L: LedgerStore>(
         request: ProbeRequest {
             want_fee_sink_available: true,
             knock_offline_exclude: lists.as_ref().map(|l| l.own_addresses.clone()),
-            knock_offline_gate: lists.and_then(|l| l.fits),
             ..Default::default()
         },
         ..Default::default()
@@ -997,6 +1003,7 @@ fn scratch_execute_with<L: LedgerStore>(
             final_state_proof_next: probe.out.final_state_proof_next,
             final_fee_sink_available: probe.out.final_fee_sink_available,
             knock_offline_lists: probe.out.knock_offline_lists.take(),
+            knock_offline_modified: probe.out.knock_offline_modified.take(),
         }),
     }
 }
