@@ -9900,6 +9900,42 @@ mod tests {
             .unwrap();
     }
 
+    /// The post-payset fee sink balance is only computed when the probe asks
+    /// for it (the proposer's final scratch apply): a plain apply and the
+    /// per-group overlay runs (default probe) skip the account read and the
+    /// min-balance scan (issues #1794, #1799).
+    #[test]
+    fn fee_sink_available_is_only_computed_when_the_probe_asks() {
+        let sink_start = 5_000_000u64;
+        let run = |want: bool| {
+            let (mut state, block, _, _) = payout_case(sink_start, 0, 0);
+            let mut probe = ExecProbe {
+                want_fee_sink_available: want,
+                ..ExecProbe::default()
+            };
+            apply_block_impl_probe(
+                &mut state,
+                &block,
+                ApplyMode::Execute,
+                false,
+                None,
+                None,
+                None,
+                None,
+                false,
+                Some(&mut probe),
+            )
+            .unwrap();
+            probe.final_fee_sink_available
+        };
+        let skipped = run(false);
+        assert_eq!(skipped, None, "default probe must not read the fee sink");
+        let asked = run(true);
+        // Sink balance after the payset (its start plus the 1_000 fee), above
+        // the 100_000 minimum balance; the payout has not moved yet.
+        assert_eq!(asked, Some(sink_start + 1_000 - 100_000));
+    }
+
     /// Payouts enabled: a validating evaluator needs the proposer set.
     #[test]
     fn validating_rejects_missing_proposer_when_payouts_enabled() {

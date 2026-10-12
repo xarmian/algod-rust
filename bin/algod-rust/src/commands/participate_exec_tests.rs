@@ -1257,13 +1257,6 @@ fn trimmed_payset_pays_out_on_the_kept_fees_only() {
     assert!(block.proposer_payout > 0);
 }
 
-/// The per-group overlay evaluation never asks for the sink balance.
-#[test]
-fn per_group_probe_does_not_read_the_fee_sink() {
-    let p = algo_ledger::apply::ExecProbe::default();
-    assert!(!p.want_fee_sink_available && p.final_fee_sink_available.is_none());
-}
-
 /// Hand-computed from go's `proposerPayout` (independent of any helper).
 /// V41: Payouts.Percent = 50, genesis fee sink = 10_000_000, min balance =
 /// 100_000. Three payments at the 1_000 min fee collect 3_000.
