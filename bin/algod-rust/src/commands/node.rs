@@ -898,12 +898,12 @@ mod follow_loop_tests {
         // this loop exercises).
         let mut blocks = std::collections::BTreeMap::new();
         for round in 1..=2u64 {
-            let block = algo_types::Block {
+            let block = algo_ledger::block_header::with_valid_payout_header(algo_types::Block {
                 round: algo_types::Round(round),
                 fee_sink,
                 current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
                 ..algo_types::Block::default()
-            };
+            });
             blocks.insert(round, block);
         }
 
