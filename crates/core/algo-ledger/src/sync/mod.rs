@@ -132,8 +132,8 @@ pub trait SyncBackend: Send + Sync {
 
     /// Fetch the blocks of the range `[start, end]` (inclusive): THE primary
     /// block-range method (issues #1725, #1724); implementors override this
-    /// one and [`Self::fetch_blocks_batch`] is derived from it, so wrappers
-    /// forward only this method and cannot recurse into each other.
+    /// one and [`SyncBackendExt::fetch_blocks_batch`] is derived from it, so
+    /// wrappers forward only this method and cannot recurse into each other.
     ///
     /// The `concurrency` parameter hints at how many blocks to fetch in
     /// parallel. The default implementation fetches blocks sequentially;
@@ -163,12 +163,7 @@ pub trait SyncBackend: Send + Sync {
         let mut blocks = Vec::new();
         for round in start..=end {
             if cancel.is_cancelled() {
-                return BatchFetch::failed(
-                    blocks,
-                    AlgoError::Ledger {
-                        message: format!("block fetch for rounds {start}..={end} cancelled"),
-                    },
-                );
+                return BatchFetch::cancelled(blocks, start, end);
             }
             match self.fetch_block(round) {
                 Ok(block) => blocks.push((round, block)),
@@ -182,11 +177,17 @@ pub trait SyncBackend: Send + Sync {
         BatchFetch::complete(blocks)
     }
 
-    /// All-or-error view of [`Self::fetch_block_range`] with a fresh,
+}
+
+/// Derived views over [`SyncBackend`]. A separate trait with a blanket impl,
+/// so an implementor cannot define (and silently bypass) them: a manual impl
+/// conflicts with the blanket one (issue #1755).
+pub trait SyncBackendExt: SyncBackend {
+    /// All-or-error view of [`SyncBackend::fetch_block_range`] with a fresh,
     /// never-cancelled token: the whole range, an `Err`, or -- only when the
     /// peer does not have the next round -- the served prefix. A prefix
     /// served before a non-404 failure is discarded here; use
-    /// [`Self::fetch_block_range`] to keep it. Derived; do not override.
+    /// [`SyncBackend::fetch_block_range`] to keep it.
     fn fetch_blocks_batch(
         &self,
         start: u64,
@@ -200,6 +201,8 @@ pub trait SyncBackend: Send + Sync {
         }
     }
 }
+
+impl<T: SyncBackend + ?Sized> SyncBackendExt for T {}
 
 /// Outcome of [`SyncBackend::fetch_block_range`].
 #[derive(Debug)]
@@ -229,6 +232,17 @@ impl BatchFetch {
             blocks,
             error: Some(error),
         }
+    }
+
+    /// A fetch of `start..=end` that was cancelled after serving `blocks`
+    /// (the one place the cancelled-error text is built, issue #1755).
+    pub fn cancelled(blocks: Vec<(u64, Block)>, start: u64, end: u64) -> Self {
+        Self::failed(
+            blocks,
+            AlgoError::Ledger {
+                message: format!("block fetch for rounds {start}..={end} cancelled"),
+            },
+        )
     }
 }
 
@@ -4528,6 +4542,20 @@ mod tests {
     /// `balances_round + 1` pays a receiver that does not exist in the
     /// snapshot, and the block at `blocks_round + 1` spends from that
     /// receiver.
+    /// The cancelled fetch is built in one place: the served prefix plus the
+    /// range-naming error (issue #1755).
+    #[test]
+    fn batch_fetch_cancelled_names_the_range_and_keeps_the_prefix() {
+        let f = BatchFetch::cancelled(vec![(5, Block::default())], 5, 9);
+        assert_eq!(f.blocks.len(), 1);
+        assert!(
+            f.error
+                .unwrap()
+                .to_string()
+                .contains("block fetch for rounds 5..=9 cancelled")
+        );
+    }
+
     #[test]
     fn go_shaped_catchpoint_replays_lookback_window_before_following() {
         use crate::catchpoint::writer::{export_catchpoint_file, ExportOptions};

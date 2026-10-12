@@ -240,15 +240,15 @@ pub enum Commands {
         /// Auto-discover the latest catchpoint from the network.
         /// Triggers catchpoint sync mode instead of genesis sync.
         ///
-        /// Catchpoint sync exit status: 0 = caught up to its target; 1 = failed;
-        /// 3 = the catchpoint was applied but block replay stopped short of the
-        /// network tip because the peer could not serve the remaining blocks
-        /// (the summary's "Stopped early" line says where; follow up with a
-        /// normal sync). Note for supervisors: status 3 is NOT success to
-        /// `set -e` scripts and to systemd `Restart=on-failure`, which both
-        /// treat any non-zero status as a failure -- it means "caught up with
-        /// a hand-off", so such a unit should list it in
-        /// `SuccessExitStatus=3` (or the script should handle it explicitly).
+        /// Catchpoint sync exit status: 0 = success (caught up, or the
+        /// catchpoint was applied but block replay stopped short of the
+        /// network tip because the peer could not serve the remaining blocks;
+        /// the summary's "Stopped early" line says where -- follow up with a
+        /// normal sync); 1 = failed. With `--stopped-short-exit-status` the
+        /// stopped-short hand-off exits 3 instead, so a script can tell it
+        /// from "caught up" (such a systemd unit needs `SuccessExitStatus=3`,
+        /// since 3 is otherwise a failure to `set -e` and
+        /// `Restart=on-failure`).
         ///
         /// Environment tuning (no go-algorand counterpart):
         /// `ALGOD_RUST_HANDOFF_MIN_LAG_ROUNDS` (default 64) sets how far
@@ -259,6 +259,11 @@ pub enum Commands {
         /// block fetch waits for in-flight rounds to report.
         #[arg(long)]
         catchpoint_auto: bool,
+
+        /// Exit with status 3 (instead of 0) when a catchpoint sync's block
+        /// replay stopped short of the network tip. See `--catchpoint-auto`.
+        #[arg(long)]
+        stopped_short_exit_status: bool,
 
         /// Continue following new blocks after sync completes (catchpoint mode).
         #[arg(long)]
