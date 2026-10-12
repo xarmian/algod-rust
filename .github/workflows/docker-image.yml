@@ -29,7 +29,7 @@ name: Docker Image
 #                          also published as its own tag
 #   nightly             — latest scheduled build of `main` (daily)
 #   <short-sha>-nightly — that same nightly build, pinned
-#   <go-algorand-pin>   — e.g. `5.0.2-stable`, published alongside `latest`
+#   <go-algorand-pin>   — e.g. `5.0.3-stable`, published alongside `latest`
 #                          and `stable` (the pinned go-algorand parity
 #                          version — env GO_ALGORAND_REV below, kept in sync
 #                          with consensus-cluster.yml / algokey-e2e.yml)
@@ -127,9 +127,9 @@ env:
   DOCKERHUB_IMAGE: algod-rust
   # Same pin as consensus-cluster.yml / algokey-e2e.yml (see CLAUDE.md).
   # Published as a bare version tag (no "v" prefix) to match the
-  # `algorand/algod:5.0.2-stable` Docker Hub tag naming this image is
+  # `algorand/algod:5.0.3-stable` Docker Hub tag naming this image is
   # meant to be substitutable for.
-  GO_ALGORAND_REV: "v5.0.2-stable"
+  GO_ALGORAND_REV: "v5.0.3-stable"
 
 jobs:
   prepare:

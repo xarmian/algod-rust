@@ -31,7 +31,7 @@ import nodelog
 FILED_STATUSES = ("stuck", "node_failure", "invalid_block_stall")
 
 DEDUP_LABEL = "mainnet-soak"
-ISSUE_LABELS = ["bug", "sync", "conformance", "mainnet-soak", "algod:v5.0.2-stable", "effort:medium"]
+ISSUE_LABELS = ["bug", "sync", "conformance", "mainnet-soak", "algod:v5.0.3-stable", "effort:medium"]
 
 
 class _SafeDict(dict):

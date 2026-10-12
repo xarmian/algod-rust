@@ -80,7 +80,7 @@ pub const DEFAULT_MAX_HEADER_BYTES: usize = 4096;
 /// `crates/node/algo-rest-client/src/http_block_fetcher.rs`'s
 /// `USER_AGENT_VALUE`, which uses the same scheme), and the short git ref
 /// this binary was built from (`ALGO_BUILD_GIT_TAG`, set by `build.rs`).
-const USER_AGENT: &str = concat!("algod-rust/5.0.2 (", env!("ALGO_BUILD_GIT_TAG"), ")");
+const USER_AGENT: &str = concat!("algod-rust/5.0.3 (", env!("ALGO_BUILD_GIT_TAG"), ")");
 
 /// Sets the `User-Agent` header on `headers`. Mirrors go's
 /// `SetUserAgentHeader` (`network/wsNetwork.go`), a small standalone helper
@@ -1068,7 +1068,7 @@ mod tests {
         // "algod-rust/<go-algorand parity version> (<short git ref>)" — same
         // scheme as algo-rest-client's USER_AGENT_VALUE.
         assert!(
-            USER_AGENT.starts_with("algod-rust/5.0.2 ("),
+            USER_AGENT.starts_with("algod-rust/5.0.3 ("),
             "unexpected USER_AGENT: {USER_AGENT}"
         );
         assert!(
@@ -1076,7 +1076,7 @@ mod tests {
             "unexpected USER_AGENT: {USER_AGENT}"
         );
         let git_ref = USER_AGENT
-            .strip_prefix("algod-rust/5.0.2 (")
+            .strip_prefix("algod-rust/5.0.3 (")
             .and_then(|s| s.strip_suffix(')'))
             .unwrap();
         assert!(!git_ref.is_empty(), "git ref must not be empty");
