@@ -816,6 +816,10 @@ corpus! {
     /// args/logs). Too big for the 200 KB per-fixture budget as plain msgpack,
     /// so both files are stored zstd-compressed (`*.msgpack.zst`, README).
     round_65743637_heavy_app_call_block => 65743637, approx (7, 118, 18, 1273);
+    /// #1742: inner transactions of a block 12M rounds back (app calls whose
+    /// apps were later deleted); its itx bytes oracle also lives in
+    /// `fixtures/mainnet_53000003_txn3_itx.hex`.
+    round_53000003_inner_txns => 53000003, approx (0, 1, 0, 6);
 }
 
 /// Every fixture needs a test and every test a fixture (both directions).
