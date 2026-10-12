@@ -81,7 +81,7 @@ pub fn ledger() -> SqliteLedger {
 }
 
 fn base_block(stx: SignedTransaction) -> Block {
-    Block {
+    algo_ledger::block_header::with_valid_payout_header(Block {
         round: Round(1),
         genesis_id: "test-net-v1".to_string(),
         genesis_hash: [7u8; 32],
@@ -90,7 +90,7 @@ fn base_block(stx: SignedTransaction) -> Block {
         txn_counter: 1001,
         payset: vec![stx],
         ..Block::default()
-    }
+    })
 }
 
 fn base_stx(txn_type: &str) -> SignedTransaction {

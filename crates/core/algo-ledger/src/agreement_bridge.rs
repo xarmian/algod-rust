@@ -1808,11 +1808,11 @@ mod tests {
 
     /// Build a minimal block for round 1 that can be committed via ensure_block.
     fn make_round1_block() -> algo_types::Block {
-        algo_types::Block {
+        crate::block_header::with_valid_payout_header(algo_types::Block {
             round: Round(1),
             current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
             ..algo_types::Block::default()
-        }
+        })
     }
 
     /// Build a certificate with non-default fields so we can verify round-trip fidelity.
@@ -2042,13 +2042,13 @@ mod tests {
                 },
                 ..Default::default()
             };
-            Block {
+            crate::block_header::with_valid_payout_header(Block {
                 round: Round(round),
                 fee_sink,
                 current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
                 payset: vec![stx],
                 ..Block::default()
-            }
+            })
         };
 
         bridge.ensure_block(&call_block(1), &make_cert_with_proposal(1));
@@ -2140,13 +2140,15 @@ mod tests {
             );
         }
         let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
-        let block = |round: u64, timestamp: i64, payset: Vec<SignedTransaction>| Block {
-            round: Round(round),
-            timestamp,
-            fee_sink,
-            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
-            payset,
-            ..Block::default()
+        let block = |round: u64, timestamp: i64, payset: Vec<SignedTransaction>| {
+            crate::block_header::with_valid_payout_header(Block {
+                round: Round(round),
+                timestamp,
+                fee_sink,
+                current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+                payset,
+                ..Block::default()
+            })
         };
         bridge.ensure_block(&block(1, 1000, vec![]), &make_cert_with_proposal(1));
         let call = SignedTransaction {
@@ -2269,7 +2271,7 @@ mod tests {
         let mut full = stored.txn.clone();
         full.genesis_id = "test-v1".into();
         full.genesis_hash = [7u8; 32];
-        let block = Block {
+        let block = crate::block_header::with_valid_payout_header(Block {
             round: Round(1),
             fee_sink,
             genesis_id: "test-v1".into(),
@@ -2277,7 +2279,7 @@ mod tests {
             current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
             payset: vec![stored],
             ..Block::default()
-        };
+        });
         bridge.ensure_block(&block, &make_cert_with_proposal(1));
         let l = ledger.lock().unwrap();
         assert_eq!(l.current_round(), Round(1));

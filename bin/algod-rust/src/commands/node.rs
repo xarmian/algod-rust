@@ -289,6 +289,9 @@ async fn run_start(
         .map_err(|e| anyhow::anyhow!("opening ledger at {}: {e}", ledger_prefix.display()))?;
 
     let latest = sqlite_ledger.current_round().0;
+    // A go devmode chain's blocks have no proposer, so sync-applied blocks
+    // cannot be held to `validateForPayouts` (issue #1803).
+    sqlite_ledger.set_devmode_chain(genesis.devmode);
     // "Already seeded" is the presence of the accounttotals row, not nonzero
     // online stake (a network with every allocation offline legitimately has
     // online=0 after seeding). Mirrors the relay command's check.
@@ -895,12 +898,12 @@ mod follow_loop_tests {
         // this loop exercises).
         let mut blocks = std::collections::BTreeMap::new();
         for round in 1..=2u64 {
-            let block = algo_types::Block {
+            let block = algo_ledger::block_header::with_valid_payout_header(algo_types::Block {
                 round: algo_types::Round(round),
                 fee_sink,
                 current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
                 ..algo_types::Block::default()
-            };
+            });
             blocks.insert(round, block);
         }
 

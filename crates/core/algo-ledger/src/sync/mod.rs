@@ -4433,7 +4433,7 @@ mod tests {
             } else if round == self.spend_round {
                 block.payset.push(pay(self.receiver, self.payer, 1_000));
             }
-            block
+            crate::block_header::with_valid_payout_header(block)
         }
     }
 

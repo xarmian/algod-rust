@@ -2321,6 +2321,12 @@ pub struct SqliteLedger {
     /// endpoints report 501. Enabled via [`Self::enable_group_delta_tracer`].
     group_delta_tracer: Option<crate::txn_group_delta_tracer::TxnGroupDeltaTracer>,
 
+    /// The chain is a go `devmode` chain: its blocks are assembled without
+    /// agreement (`AssembleDevModeBlock`), so they never carry a proposer and
+    /// go itself could not validate them. Sync-applied blocks then skip
+    /// `validateForPayouts` (issue #1803). Set via [`Self::set_devmode_chain`].
+    devmode_chain: bool,
+
     /// Accumulated `accounttotals` per-status money/reward-unit deltas for
     /// the block currently open between `begin_block`/`commit_block`.
     /// Populated incrementally by `set_account`/`remove_account` and
@@ -3060,6 +3066,7 @@ impl SqliteLedger {
             lru_cache_disabled: false,
             delta_cache: crate::delta_cache::DeltaCache::with_default_window(),
             group_delta_tracer: None,
+            devmode_chain: false,
             pending_totals_delta: AccountTotalsDelta::default(),
             pending_online_touched: std::collections::HashSet::new(),
             rewards_cache: RewardsLevelCache::default(),
@@ -3679,6 +3686,12 @@ impl SqliteLedger {
         ));
     }
 
+    /// Mark this ledger as following a go `devmode` chain, whose blocks carry
+    /// no proposer: sync-applied blocks then skip `validateForPayouts`.
+    pub fn set_devmode_chain(&mut self, devmode: bool) {
+        self.devmode_chain = devmode;
+    }
+
     /// Whether the per-group delta tracer is enabled.
     pub fn group_delta_tracer_enabled(&self) -> bool {
         self.group_delta_tracer.is_some()
@@ -3781,7 +3794,11 @@ impl SqliteLedger {
             } else {
                 crate::apply::ApplyMode::Replay
             };
-            let delta = crate::apply::apply_block_with_delta_mode(self, block, mode)?;
+            let delta = if self.devmode_chain {
+                crate::apply::apply_block_with_delta_mode(self, block, mode)?
+            } else {
+                crate::apply::apply_block_with_delta_mode_checking_payouts(self, block, mode)?
+            };
             self.cache_state_delta(round, delta);
             Ok(())
         } else {
@@ -3806,10 +3823,15 @@ impl SqliteLedger {
             // Blocks with no `appl` transaction (Acfg/Axfer/Afrz/Stpf/Hb)
             // cannot touch box storage, so they keep the cheaper Replay
             // path.
-            if block_has_app_call(block) {
-                crate::apply::apply_block_with_mode(self, block, crate::apply::ApplyMode::Execute)?;
+            let mode = if block_has_app_call(block) {
+                crate::apply::ApplyMode::Execute
             } else {
-                crate::apply::apply_block(self, block)?;
+                crate::apply::ApplyMode::Replay
+            };
+            if self.devmode_chain {
+                crate::apply::apply_block_with_mode(self, block, mode)?;
+            } else {
+                crate::apply::apply_block_checking_payouts(self, block, mode)?;
             }
             self.delta_cache.advance(block.round.0);
             Ok(())
@@ -10008,13 +10030,13 @@ mod tests {
         stx.txn.amount = 1_000_000;
         stx.txn.fee = 1_000;
 
-        let block = Block {
+        let block = crate::block_header::with_valid_payout_header(Block {
             round: Round(1),
             fee_sink,
             current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
             payset: vec![stx],
             ..Block::default()
-        };
+        });
 
         ledger.begin_block().unwrap();
         let delta = crate::apply::apply_block_with_delta(&mut ledger, &block).unwrap();
@@ -12172,13 +12194,13 @@ mod tests {
             stx.txn.amount = 100_000;
             stx.txn.fee = 1000;
             stx.txn.last_valid = Round(1000);
-            Block {
+            crate::block_header::with_valid_payout_header(Block {
                 round: Round(1),
                 fee_sink,
                 current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
                 payset: vec![stx],
                 ..Block::default()
-            }
+            })
         };
 
         let committed_root = |tracer_on: bool| -> [u8; 32] {
@@ -12341,13 +12363,13 @@ mod tests {
             ..Default::default()
         };
 
-        let block = Block {
+        let block = crate::block_header::with_valid_payout_header(Block {
             round: Round(1),
             fee_sink,
             current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
             payset: vec![stx],
             ..Block::default()
-        };
+        });
 
         // This is exactly what `commands/sync.rs`'s default (non-
         // `--avm-execute`) branch calls per received block.
@@ -12468,13 +12490,13 @@ mod tests {
             },
             ..Default::default()
         };
-        let block = Block {
+        let block = crate::block_header::with_valid_payout_header(Block {
             round: Round(1),
             fee_sink,
             current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
             payset: vec![stx],
             ..Block::default()
-        };
+        });
 
         // Precondition: the widened gate must admit this payset.
         assert!(
@@ -12643,13 +12665,13 @@ mod tests {
             ..Default::default()
         };
         let tid = algo_codec::compute_txn_id(&stx.txn);
-        let block = Block {
+        let block = crate::block_header::with_valid_payout_header(Block {
             round: Round(1),
             fee_sink,
             current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
             payset: vec![stx],
             ..Block::default()
-        };
+        });
 
         ledger.begin_block().unwrap();
         ledger.apply_block_caching_delta(&block).unwrap();
@@ -15973,12 +15995,30 @@ mod tests {
     }
 
     fn trivial_block(round: u64, fee_sink: u8) -> algo_types::Block {
-        algo_types::Block {
+        crate::block_header::with_valid_payout_header(algo_types::Block {
             round: Round(round),
             fee_sink: Address([fee_sink; 32]),
             current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
             ..algo_types::Block::default()
-        }
+        })
+    }
+
+    /// Issue #1803: a sync-applied block is held to go's `validateForPayouts`
+    /// (a V41 block without a proposer is rejected) -- except on a devmode
+    /// chain, whose proposer-less blocks go itself never validates.
+    #[test]
+    fn apply_block_caching_delta_checks_payouts_except_on_devmode_chain() {
+        let mut l = SqliteLedger::open_in_memory().unwrap();
+        l.begin_block().unwrap();
+        let mut no_proposer = trivial_block(1, 3);
+        no_proposer.proposer = Address::ZERO;
+        let err = l.apply_block_caching_delta(&no_proposer).unwrap_err();
+        assert!(matches!(err, AlgoError::PayoutViolation { .. }), "{err}");
+
+        let mut l = SqliteLedger::open_in_memory().unwrap();
+        l.set_devmode_chain(true);
+        l.begin_block().unwrap();
+        l.apply_block_caching_delta(&no_proposer).unwrap();
     }
 
     #[test]
@@ -16076,6 +16116,7 @@ mod tests {
             lru_cache_disabled: _,
             delta_cache: _,
             group_delta_tracer: _,
+            devmode_chain: _,          // node-lifetime config, set once at open
             pending_totals_delta: _,   // reset by rollback
             pending_online_touched: _, // cleared by rollback
             rewards_cache: _,          // committed-header cache, immutable data

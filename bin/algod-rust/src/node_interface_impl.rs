@@ -7497,12 +7497,12 @@ mod tests {
     /// tests (go's `ErrSyncRoundInvalid` is defined relative to
     /// `ledger.LastRound()`).
     fn apply_one_trivial_block(ledger: &Arc<Mutex<SqliteLedger>>, round: u64) {
-        let block = algo_types::Block {
+        let block = algo_ledger::block_header::with_valid_payout_header(algo_types::Block {
             round: algo_types::Round(round),
             fee_sink: Address([3u8; 32]),
             current_protocol: CONSENSUS_V41.to_string(),
             ..algo_types::Block::default()
-        };
+        });
         let mut l = ledger.lock().unwrap();
         l.begin_block().unwrap();
         l.apply_block_caching_delta(&block).unwrap();
