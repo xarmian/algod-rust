@@ -1855,7 +1855,7 @@ mod tests {
     /// `protocol.RunEncodingTest` iteration count.
     #[test]
     fn one_time_signature_standalone_randomized_roundtrip() {
-        use rand::{RngCore, SeedableRng};
+        use rand::{Rng, SeedableRng};
         use rand_chacha::ChaCha20Rng;
 
         let mut rng = ChaCha20Rng::seed_from_u64(0x0751_5300);

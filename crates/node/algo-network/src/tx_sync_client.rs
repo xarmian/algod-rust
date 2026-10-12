@@ -61,7 +61,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use rand::Rng;
+use rand::RngExt;
 
 use algo_types::{Digest, SignedTransaction};
 
@@ -152,7 +152,7 @@ impl TxSyncPeerClient for HttpTxSyncClient {
         // module doc comment for why the prefix is a random nonce rather
         // than a threaded, persistent counter.
         let (size_bits, num_hashes) = Filter::optimal(pending.len(), BLOOM_FALSE_POSITIVE_RATE);
-        let prefix: u32 = rand::thread_rng().gen();
+        let prefix: u32 = rand::rng().random();
         let mut filter = Filter::new(size_bits, num_hashes, prefix);
         for id in pending {
             filter.set(id.as_bytes());
@@ -326,7 +326,7 @@ impl PeerSource for GossipTxSyncPeerSource {
         if peers.is_empty() {
             return None;
         }
-        let idx = rand::thread_rng().gen_range(0..peers.len());
+        let idx = rand::rng().random_range(0..peers.len());
         let addr = peers[idx].get_address().to_string();
         Some(Arc::new(HttpTxSyncClient::new(
             addr,

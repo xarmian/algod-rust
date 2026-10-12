@@ -32,7 +32,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rand::RngCore;
+use rand::TryRng;
 use sha2::{Digest as _, Sha512_256};
 use subtle::ConstantTimeEq;
 
@@ -459,7 +459,7 @@ fn fast_hash_with_salt(password: &[u8], salt: &[u8]) -> [u8; 32] {
 }
 
 fn fill_random(out: &mut [u8]) -> Result<()> {
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(out)
         .map_err(|_| Error::RandBytes)
 }

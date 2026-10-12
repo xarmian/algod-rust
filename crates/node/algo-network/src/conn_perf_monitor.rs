@@ -62,7 +62,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use rand::Rng;
+use rand::RngExt;
 
 use crate::message::IncomingMessage;
 use crate::message_filter::generate_message_digest;
@@ -480,10 +480,10 @@ impl ConnectionPerformanceMonitor {
 
 /// Returns a random value in `[0, bound)`. A tiny wrapper so
 /// [`ConnectionPerformanceMonitor::reset`]'s accumulation-time jitter
-/// doesn't need `rand::thread_rng()` spelled out inline, and so `bound == 0`
+/// doesn't need `rand::rng()` spelled out inline, and so `bound == 0`
 /// (which `rand`'s range types reject) can't happen (callers pass `.max(1)`).
 fn rand_i64_below(bound: i64) -> i64 {
-    rand::thread_rng().gen_range(0..bound)
+    rand::rng().random_range(0..bound)
 }
 
 /// Tracks whether the agreement protocol has recently made progress, as a

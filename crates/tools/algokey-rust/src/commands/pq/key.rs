@@ -344,8 +344,8 @@ mod tests {
     /// msgpack encode/decode).
     #[test]
     fn encode_decode_round_trips_randomized_fields() {
-        use rand::RngCore;
-        let mut rng = rand::thread_rng();
+        use rand::Rng;
+        let mut rng = rand::rng();
 
         for _ in 0..256 {
             let mut public_key = vec![0u8; algo_falcon::FALCON_DET1024_PUBKEY_SIZE];

@@ -63,7 +63,7 @@
 //! Reference: `../go-algorand/network/msgp_gen.go`
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use super::errors::IdentityError;
@@ -573,7 +573,7 @@ pub fn generate_challenge(
     public_address: &str,
 ) -> (IdentityChallengeSigned, IdentityChallengeValue) {
     let mut challenge = [0u8; CHALLENGE_SIZE];
-    rand::thread_rng().fill_bytes(&mut challenge);
+    rand::rng().fill_bytes(&mut challenge);
 
     let msg = IdentityChallenge {
         key: our_key.verifying_key().to_bytes().to_vec(),
@@ -667,7 +667,7 @@ pub fn verify_challenge_and_respond(
 
     // Generate response challenge
     let mut response_challenge = [0u8; CHALLENGE_SIZE];
-    rand::thread_rng().fill_bytes(&mut response_challenge);
+    rand::rng().fill_bytes(&mut response_challenge);
 
     let resp_msg = IdentityChallengeResponse {
         key: our_key.verifying_key().to_bytes().to_vec(),
@@ -2012,7 +2012,7 @@ mod tests {
     // fixture-based `go_conformance_*` tests above don't sweep), is: encode
     // -> decode -> re-encode is lossless and idempotent for every type in
     // the three-message identity exchange.
-    fn random_bytes(rng: &mut impl RngCore, len: usize) -> Vec<u8> {
+    fn random_bytes(rng: &mut impl Rng, len: usize) -> Vec<u8> {
         let mut v = vec![0u8; len];
         rng.fill_bytes(&mut v);
         v
@@ -2020,12 +2020,12 @@ mod tests {
 
     #[test]
     fn randomized_roundtrip_identity_challenge() {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(0x1DE1_11FE);
         for _ in 0..200 {
-            let public_address = if rng.gen_bool(0.5) {
+            let public_address = if rng.random_bool(0.5) {
                 {
-                    let len = rng.gen_range(0..40);
+                    let len = rng.random_range(0..40);
                     random_bytes(&mut rng, len)
                 }
             } else {
@@ -2050,12 +2050,12 @@ mod tests {
 
     #[test]
     fn randomized_roundtrip_identity_challenge_signed() {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(0x1DE1_5163);
         for _ in 0..200 {
-            let public_address = if rng.gen_bool(0.5) {
+            let public_address = if rng.random_bool(0.5) {
                 {
-                    let len = rng.gen_range(0..40);
+                    let len = rng.random_range(0..40);
                     random_bytes(&mut rng, len)
                 }
             } else {

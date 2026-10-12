@@ -27,7 +27,8 @@
 //!   - Vector commitment computation (SHA-256 and SHA-512)
 //!   - Full block validation (empty and with transactions)
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
 
 use algo_codec::canonical_encode_transaction;
 use algo_types::{Address, Block, Round, SignedTransaction, Transaction};

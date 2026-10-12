@@ -269,8 +269,8 @@ mod tests {
     /// Mirrors Go's `TestGenerateAndRecovery` (1,000 random round-trips).
     #[test]
     fn round_trip_random() {
-        use rand::RngCore;
-        let mut rng = rand::thread_rng();
+        use rand::Rng;
+        let mut rng = rand::rng();
         let mut key = [0u8; 32];
         for _ in 0..1_000 {
             rng.fill_bytes(&mut key);
@@ -350,8 +350,8 @@ mod tests {
     /// `TestUint11Array` shape but scaled down).
     #[test]
     fn uint11_round_trip() {
-        use rand::RngCore;
-        let mut rng = rand::thread_rng();
+        use rand::Rng;
+        let mut rng = rand::rng();
         for len in [0usize, 1, 7, 11, 16, 32, 33, 64, 100] {
             let mut a = vec![0u8; len];
             rng.fill_bytes(&mut a);

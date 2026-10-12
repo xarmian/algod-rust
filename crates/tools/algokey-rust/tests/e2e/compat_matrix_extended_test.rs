@@ -52,7 +52,7 @@ use algo_types::{
 use algo_validate::signature::verify_multisig;
 use assert_cmd::Command as AssertCmd;
 use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
-use rand::RngCore;
+use rand::Rng;
 use tempfile::TempDir;
 
 use e2e::compat_framework::{go_algokey_available, skip_message, Direction, MatrixReport};
@@ -125,7 +125,7 @@ struct MsigKey {
 
 fn fresh_msig_signer() -> MsigKey {
     let mut seed = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut seed);
+    rand::rng().fill_bytes(&mut seed);
     let address = address_for_seed(&seed);
     let mnemonic = key_to_mnemonic(&seed).expect("encode mnemonic");
     MsigKey { address, mnemonic }
@@ -499,7 +499,7 @@ async fn row_append_auth_addr(report: &mut MatrixReport, workdir: &Path, net: &L
     // validated against AuthAddr semantics. Both Go and Rust produce equivalent
     // outputs given the same input.
     let mut seed = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut seed);
+    rand::rng().fill_bytes(&mut seed);
     let sender = address_for_seed(&seed);
 
     // Build a vanilla unsigned txn (no msig block yet) with sender = some
@@ -795,7 +795,7 @@ async fn row_keyreg_offline(report: &mut MatrixReport, workdir: &Path, net: &Loc
     // state, then offline-keyreg via the named side and assert.
     for direction in [Direction::GoToRust, Direction::RustToGo] {
         let mut seed = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut seed);
+        rand::rng().fill_bytes(&mut seed);
         let addr = address_for_seed(&seed);
         let mnemonic = key_to_mnemonic(&seed).expect("encode mnemonic");
 

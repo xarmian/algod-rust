@@ -689,14 +689,14 @@ mod tests {
     // randomly generated `BTreeMap<String, Vec<String>>` / `Vec<String>`
     // instances (including empty maps/vecs, empty strings, and duplicate
     // values), encode -> decode -> re-encode is lossless and idempotent.
-    fn random_string(rng: &mut impl rand::RngCore, max_len: usize) -> String {
-        use rand::Rng;
-        let len = rng.gen_range(0..=max_len);
+    fn random_string(rng: &mut impl rand::Rng, max_len: usize) -> String {
+        use rand::RngExt;
+        let len = rng.random_range(0..=max_len);
         (0..len)
             .map(|_| {
                 // Printable ASCII range, including a few header-hostile
                 // characters (spaces, dashes) to catch escaping bugs.
-                let c = rng.gen_range(0x20u8..=0x7Eu8);
+                let c = rng.random_range(0x20u8..=0x7Eu8);
                 c as char
             })
             .collect()
@@ -704,14 +704,14 @@ mod tests {
 
     #[test]
     fn randomized_roundtrip_peer_meta_headers() {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(0xC0FFEE);
         for _ in 0..200 {
-            let num_keys = rng.gen_range(0..=6);
+            let num_keys = rng.random_range(0..=6);
             let mut headers = PeerMetaHeaders::new();
             for _ in 0..num_keys {
                 let key = random_string(&mut rng, 24);
-                let num_values = rng.gen_range(0..=4);
+                let num_values = rng.random_range(0..=4);
                 let values: Vec<String> = (0..num_values)
                     .map(|_| random_string(&mut rng, 32))
                     .collect();
@@ -735,10 +735,10 @@ mod tests {
 
     #[test]
     fn randomized_roundtrip_peer_meta_values() {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(0xFACADE);
         for _ in 0..200 {
-            let num_values = rng.gen_range(0..=8);
+            let num_values = rng.random_range(0..=8);
             let values: Vec<String> = (0..num_values)
                 .map(|_| random_string(&mut rng, 40))
                 .collect();

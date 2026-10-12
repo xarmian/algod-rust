@@ -48,7 +48,7 @@ use algo_codec::{
     StateProofVerificationContext,
 };
 use algo_types::{AccountData, AccountStatus, Address, BlockHeader, StateSchema, TealValue};
-use rand::{Rng, RngCore, SeedableRng};
+use rand::{RngExt, Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
 /// Root of the trackerdb fixture corpus, relative to the crate manifest.
@@ -791,7 +791,7 @@ fn gen_nonzero_bytes64(rng: &mut ChaCha20Rng) -> [u8; 64] {
 }
 
 fn gen_option_bytes32(rng: &mut ChaCha20Rng) -> Option<[u8; 32]> {
-    if rng.gen_bool(0.5) {
+    if rng.random_bool(0.5) {
         Some(gen_nonzero_bytes32(rng))
     } else {
         None
@@ -799,7 +799,7 @@ fn gen_option_bytes32(rng: &mut ChaCha20Rng) -> Option<[u8; 32]> {
 }
 
 fn gen_option_bytes64(rng: &mut ChaCha20Rng) -> Option<[u8; 64]> {
-    if rng.gen_bool(0.5) {
+    if rng.random_bool(0.5) {
         Some(gen_nonzero_bytes64(rng))
     } else {
         None
@@ -807,7 +807,7 @@ fn gen_option_bytes64(rng: &mut ChaCha20Rng) -> Option<[u8; 64]> {
 }
 
 fn gen_option_address(rng: &mut ChaCha20Rng) -> Option<Address> {
-    if rng.gen_bool(0.5) {
+    if rng.random_bool(0.5) {
         Some(Address(gen_nonzero_bytes32(rng)))
     } else {
         None
@@ -815,14 +815,14 @@ fn gen_option_address(rng: &mut ChaCha20Rng) -> Option<Address> {
 }
 
 fn gen_string(rng: &mut ChaCha20Rng, max_len: usize) -> String {
-    let len = rng.gen_range(0..=max_len);
+    let len = rng.random_range(0..=max_len);
     (0..len)
-        .map(|_| char::from(rng.gen_range(b'a'..=b'z')))
+        .map(|_| char::from(rng.random_range(b'a'..=b'z')))
         .collect()
 }
 
 fn gen_bytes_vec(rng: &mut ChaCha20Rng, max_len: usize) -> Vec<u8> {
-    let len = rng.gen_range(0..=max_len);
+    let len = rng.random_range(0..=max_len);
     let mut v = vec![0u8; len];
     rng.fill_bytes(&mut v);
     v
@@ -836,32 +836,32 @@ fn gen_bytes_vec(rng: &mut ChaCha20Rng, max_len: usize) -> Vec<u8> {
 /// what `decode_base_account_data_value` itself always produces.
 fn gen_base_account_data(rng: &mut ChaCha20Rng) -> AccountData {
     AccountData {
-        status: AccountStatus::from(rng.gen_range(0u8..=2)),
-        micro_algos: rng.gen(),
-        rewards_base: rng.gen(),
-        rewarded_micro_algos: rng.gen(),
+        status: AccountStatus::from(rng.random_range(0u8..=2)),
+        micro_algos: rng.random(),
+        rewards_base: rng.random(),
+        rewarded_micro_algos: rng.random(),
         auth_addr: gen_option_address(rng),
         total_app_schema: StateSchema {
-            num_uint: rng.gen(),
-            num_byte_slice: rng.gen(),
+            num_uint: rng.random(),
+            num_byte_slice: rng.random(),
         },
-        total_extra_app_pages: rng.gen(),
-        total_created_assets: rng.gen(),
-        total_assets_opted_in: rng.gen(),
-        total_created_apps: rng.gen(),
-        total_apps_opted_in: rng.gen(),
-        total_boxes: rng.gen(),
-        total_box_bytes: rng.gen(),
-        incentive_eligible: rng.gen(),
-        last_proposed: rng.gen(),
-        last_heartbeat: rng.gen(),
-        update_round: rng.gen(),
+        total_extra_app_pages: rng.random(),
+        total_created_assets: rng.random(),
+        total_assets_opted_in: rng.random(),
+        total_created_apps: rng.random(),
+        total_apps_opted_in: rng.random(),
+        total_boxes: rng.random(),
+        total_box_bytes: rng.random(),
+        incentive_eligible: rng.random(),
+        last_proposed: rng.random(),
+        last_heartbeat: rng.random(),
+        update_round: rng.random(),
         vote_id: gen_option_bytes32(rng),
         selection_id: gen_option_bytes32(rng),
         state_proof_id: gen_option_bytes64(rng),
-        vote_first_valid: rng.gen(),
-        vote_last_valid: rng.gen(),
-        vote_key_dilution: rng.gen(),
+        vote_first_valid: rng.random(),
+        vote_last_valid: rng.random(),
+        vote_key_dilution: rng.random(),
         asset_params: BTreeMap::new(),
         assets: BTreeMap::new(),
         app_local_states: BTreeMap::new(),
@@ -883,15 +883,15 @@ fn gen_base_online_account_data(rng: &mut ChaCha20Rng) -> BaseOnlineAccountData 
     BaseOnlineAccountData {
         vote_id: gen_nonzero_or_zero_bytes32(rng),
         selection_id: gen_nonzero_or_zero_bytes32(rng),
-        vote_first_valid: rng.gen(),
-        vote_last_valid: rng.gen(),
-        vote_key_dilution: rng.gen(),
+        vote_first_valid: rng.random(),
+        vote_last_valid: rng.random(),
+        vote_key_dilution: rng.random(),
         state_proof_id: gen_nonzero_or_zero_bytes64(rng),
-        last_proposed: rng.gen(),
-        last_heartbeat: rng.gen(),
-        incentive_eligible: rng.gen(),
-        micro_algos: rng.gen(),
-        rewards_base: rng.gen(),
+        last_proposed: rng.random(),
+        last_heartbeat: rng.random(),
+        incentive_eligible: rng.random(),
+        micro_algos: rng.random(),
+        rewards_base: rng.random(),
     }
 }
 
@@ -902,7 +902,7 @@ fn gen_base_online_account_data(rng: &mut ChaCha20Rng) -> BaseOnlineAccountData 
 /// the correct value either way). Bias towards nonzero so most iterations
 /// still exercise the tag-present path, but don't forbid zero outright.
 fn gen_nonzero_or_zero_bytes32(rng: &mut ChaCha20Rng) -> [u8; 32] {
-    if rng.gen_bool(0.9) {
+    if rng.random_bool(0.9) {
         gen_nonzero_bytes32(rng)
     } else {
         [0u8; 32]
@@ -910,7 +910,7 @@ fn gen_nonzero_or_zero_bytes32(rng: &mut ChaCha20Rng) -> [u8; 32] {
 }
 
 fn gen_nonzero_or_zero_bytes64(rng: &mut ChaCha20Rng) -> [u8; 64] {
-    if rng.gen_bool(0.9) {
+    if rng.random_bool(0.9) {
         gen_nonzero_bytes64(rng)
     } else {
         [0u8; 64]
@@ -949,12 +949,12 @@ fn base_online_account_data_randomized_roundtrip() {
 /// `canonical_encode_resources_data`/`decode_resources_data_value`'s own
 /// correctness.
 fn gen_teal_key_value_bytes(rng: &mut ChaCha20Rng) -> Vec<u8> {
-    let n = rng.gen_range(0..=4);
+    let n = rng.random_range(0..=4);
     let mut map = BTreeMap::new();
     for _ in 0..n {
         let key = gen_string(rng, 8).into_bytes();
-        let value = if rng.gen_bool(0.5) {
-            TealValue::Uint(rng.gen())
+        let value = if rng.random_bool(0.5) {
+            TealValue::Uint(rng.random())
         } else {
             TealValue::Bytes(gen_string(rng, 16).into_bytes())
         };
@@ -978,9 +978,9 @@ fn gen_teal_key_value_bytes(rng: &mut ChaCha20Rng) -> Vec<u8> {
 
 fn gen_resources_data(rng: &mut ChaCha20Rng) -> ResourcesData {
     ResourcesData {
-        total: rng.gen(),
-        decimals: rng.gen(),
-        default_frozen: rng.gen(),
+        total: rng.random(),
+        decimals: rng.random(),
+        default_frozen: rng.random(),
         unit_name: gen_string(rng, 8).into_bytes(),
         asset_name: gen_string(rng, 12).into_bytes(),
         url: gen_string(rng, 16).into_bytes(),
@@ -989,25 +989,25 @@ fn gen_resources_data(rng: &mut ChaCha20Rng) -> ResourcesData {
         reserve: gen_nonzero_or_zero_bytes32(rng),
         freeze: gen_nonzero_or_zero_bytes32(rng),
         clawback: gen_nonzero_or_zero_bytes32(rng),
-        amount: rng.gen(),
-        frozen: rng.gen(),
-        schema_num_uint: rng.gen(),
-        schema_num_byte_slice: rng.gen(),
+        amount: rng.random(),
+        frozen: rng.random(),
+        schema_num_uint: rng.random(),
+        schema_num_byte_slice: rng.random(),
         key_value: gen_teal_key_value_bytes(rng),
         approval_program: gen_bytes_vec(rng, 32),
         clear_state_program: gen_bytes_vec(rng, 32),
         global_state: gen_teal_key_value_bytes(rng),
-        local_state_schema_num_uint: rng.gen(),
-        local_state_schema_num_byte_slice: rng.gen(),
-        global_state_schema_num_uint: rng.gen(),
-        global_state_schema_num_byte_slice: rng.gen(),
-        extra_program_pages: rng.gen(),
-        resource_flags: rng.gen(),
-        update_round: rng.gen(),
-        version: rng.gen(),
+        local_state_schema_num_uint: rng.random(),
+        local_state_schema_num_byte_slice: rng.random(),
+        global_state_schema_num_uint: rng.random(),
+        global_state_schema_num_byte_slice: rng.random(),
+        extra_program_pages: rng.random(),
+        resource_flags: rng.random(),
+        update_round: rng.random(),
+        version: rng.random(),
         size_sponsor: gen_nonzero_or_zero_bytes32(rng),
-        foreign_box_reads: rng.gen(),
-        family_box_access: rng.gen(),
+        foreign_box_reads: rng.random(),
+        family_box_access: rng.random(),
     }
 }
 
@@ -1023,9 +1023,9 @@ fn resources_data_randomized_roundtrip() {
 
 fn gen_state_proof_verification_context(rng: &mut ChaCha20Rng) -> StateProofVerificationContext {
     StateProofVerificationContext {
-        last_attested_round: rng.gen(),
+        last_attested_round: rng.random(),
         voters_commitment: gen_bytes_vec(rng, 64),
-        online_total_weight: rng.gen(),
+        online_total_weight: rng.random(),
         version: gen_string(rng, 12),
     }
 }
@@ -1045,17 +1045,17 @@ fn state_proof_verification_context_randomized_roundtrip() {
 
 fn gen_txtail_round_lease(rng: &mut ChaCha20Rng) -> algo_types::TxTailRoundLease {
     algo_types::TxTailRoundLease {
-        sender: if rng.gen_bool(0.9) {
+        sender: if rng.random_bool(0.9) {
             Address(gen_nonzero_bytes32(rng))
         } else {
             Address::ZERO
         },
-        lease: if rng.gen_bool(0.9) {
+        lease: if rng.random_bool(0.9) {
             serde_bytes::ByteBuf::from(gen_nonzero_bytes32(rng).to_vec())
         } else {
             serde_bytes::ByteBuf::from(Vec::new())
         },
-        txn_idx: rng.gen(),
+        txn_idx: rng.random(),
     }
 }
 
@@ -1069,20 +1069,20 @@ fn gen_txtail_round_lease(rng: &mut ChaCha20Rng) -> algo_types::TxTailRoundLease
 /// `TestRandomizedEncodingTxTailRound`/`TestRandomizedEncodingTxTailRoundLease`
 /// actually pin.
 fn gen_txtail_round(rng: &mut ChaCha20Rng) -> algo_types::TxTailRound {
-    let n = rng.gen_range(0..=5);
+    let n = rng.random_range(0..=5);
     let txn_ids: Vec<serde_bytes::ByteBuf> = (0..n)
         .map(|_| serde_bytes::ByteBuf::from(gen_bytes32(rng).to_vec()))
         .collect();
-    let last_valid: Vec<u64> = (0..n).map(|_| rng.gen()).collect();
-    let lease_count = rng.gen_range(0..=3);
+    let last_valid: Vec<u64> = (0..n).map(|_| rng.random()).collect();
+    let lease_count = rng.random_range(0..=3);
     let leases: Vec<algo_types::TxTailRoundLease> = (0..lease_count)
         .map(|_| gen_txtail_round_lease(rng))
         .collect();
 
     let hdr = BlockHeader {
-        round: rng.gen::<u64>().into(),
-        timestamp: rng.gen(),
-        txn_counter: rng.gen(),
+        round: rng.random::<u64>().into(),
+        timestamp: rng.random(),
+        txn_counter: rng.random(),
         ..BlockHeader::default()
     };
 

@@ -48,7 +48,7 @@
 use std::collections::HashSet;
 use std::sync::Mutex;
 
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest as _, Sha512_256};
 
 use crate::tag::Tag;
@@ -135,7 +135,7 @@ impl MessageFilter {
     pub fn new(bucket_count: usize, max_bucket_size: usize) -> Self {
         let bucket_count = bucket_count.max(1);
         let mut nonce = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut nonce);
+        rand::rng().fill_bytes(&mut nonce);
         let mut buckets = Vec::with_capacity(bucket_count);
         buckets.push(HashSet::with_capacity(max_bucket_size));
         for _ in 1..bucket_count {

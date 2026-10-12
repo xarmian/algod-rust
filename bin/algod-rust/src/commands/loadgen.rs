@@ -61,7 +61,7 @@ use algo_rest_client::{AlgodClient, SuggestedParams, TxId};
 use algo_txn_pipeline::PaymentBuilder;
 use algo_types::{Address, SignedTransaction};
 use ed25519_dalek::{Signer, SigningKey};
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -180,7 +180,7 @@ fn gen_accounts_inner(count: usize, deterministic: bool, out: &Path) -> anyhow::
     if count == 0 {
         anyhow::bail!("--count must be at least 1");
     }
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut accounts = Vec::with_capacity(count);
     for i in 0..count {
         let seed = if deterministic {

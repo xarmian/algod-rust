@@ -384,12 +384,12 @@ async fn algod_is_running(data_dir: &Path) -> bool {
 }
 
 fn generate_api_token_hex() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     // 32 bytes → 64 hex chars. Mirrors Go's
     // `util/tokens/tokens.go:GenerateAPIToken` (entropyLen =
     // (minimumAPITokenLength + 1) / 2 = 32).
     let mut buf = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     let mut s = String::with_capacity(64);
     for b in buf {
         use std::fmt::Write;

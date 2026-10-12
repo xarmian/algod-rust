@@ -104,9 +104,9 @@ pub fn derive_pq_signing_material_from_entropy(
 pub fn generate_pq_signing_material(
     scheme: [u8; 2],
 ) -> Result<([u8; 32], PqSigningMaterial), String> {
-    use rand::RngCore;
+    use rand::TryRng;
     let mut entropy = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut entropy);
+    rand::rngs::SysRng.try_fill_bytes(&mut entropy).expect("system entropy");
     let signing = derive_pq_signing_material_from_entropy(scheme, &entropy)?;
     Ok((entropy, signing))
 }

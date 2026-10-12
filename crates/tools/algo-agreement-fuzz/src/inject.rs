@@ -96,7 +96,7 @@ pub struct InjectionOutcome {
 /// ledger — it is a plain gossip client, exactly like an observer node.
 fn throwaway_config(cfg: &InjectorConfig) -> ConnectConfig {
     let mut seed = [0u8; 32];
-    rand::Rng::fill(&mut rand::thread_rng(), &mut seed);
+    rand::RngExt::fill(&mut rand::rng(), &mut seed);
     ConnectConfig {
         genesis_id: cfg.genesis_id.clone(),
         node_random: rand::random(),

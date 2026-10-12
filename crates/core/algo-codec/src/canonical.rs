@@ -2242,7 +2242,7 @@ pub fn canonical_encode_account_application_model(
 mod tests {
     use super::*;
     use algo_types::Round;
-    use rand::{Rng, RngCore, SeedableRng};
+    use rand::{RngExt, Rng, SeedableRng};
     use rand_chacha::ChaCha20Rng;
 
     #[test]
@@ -3478,7 +3478,7 @@ mod tests {
     /// byte, so it never collides with the codec's "all-zero content is
     /// empty" `add_bytes` omitempty rule (see the module note above).
     fn gen_nonzero_bytes(rng: &mut ChaCha20Rng, min_len: usize, max_len: usize) -> Vec<u8> {
-        let len = rng.gen_range(min_len.max(1)..=max_len.max(min_len.max(1)));
+        let len = rng.random_range(min_len.max(1)..=max_len.max(min_len.max(1)));
         let mut v = vec![0u8; len];
         rng.fill_bytes(&mut v);
         v[0] |= 1;
@@ -3487,7 +3487,7 @@ mod tests {
 
     fn gen_hash_factory(rng: &mut ChaCha20Rng) -> HashFactory {
         HashFactory {
-            hash_type: rng.gen_range(1..=1000u16),
+            hash_type: rng.random_range(1..=1000u16),
         }
     }
 
@@ -3498,12 +3498,12 @@ mod tests {
     }
 
     fn gen_merkle_proof(rng: &mut ChaCha20Rng) -> MerkleProof {
-        let path = if rng.gen_bool(0.6) {
-            let len = rng.gen_range(1..=4);
+        let path = if rng.random_bool(0.6) {
+            let len = rng.random_range(1..=4);
             Some(
                 (0..len)
                     .map(|_| {
-                        if rng.gen_bool(0.3) {
+                        if rng.random_bool(0.3) {
                             None
                         } else {
                             Some(ByteBuf::from(gen_nonzero_bytes(rng, 1, 32)))
@@ -3514,7 +3514,7 @@ mod tests {
         } else {
             None
         };
-        let hash_factory = if rng.gen_bool(0.6) {
+        let hash_factory = if rng.random_bool(0.6) {
             Some(gen_hash_factory(rng))
         } else {
             None
@@ -3526,7 +3526,7 @@ mod tests {
             // is never the empty map, so it never collapses when wrapped in
             // an `Option<MerkleProof>` field (`sig_proofs`/`part_proofs`/
             // `MerkleSignature::proof`).
-            tree_depth: rng.gen_range(1..=255),
+            tree_depth: rng.random_range(1..=255),
         }
     }
 
@@ -3536,13 +3536,13 @@ mod tests {
             // own encoding is never the empty map, for the same reason as
             // `gen_merkle_proof`'s `tree_depth` above.
             signature: ByteBuf::from(gen_nonzero_bytes(rng, 1, 64)),
-            vector_commitment_index: rng.gen::<u64>(),
-            proof: if rng.gen_bool(0.6) {
+            vector_commitment_index: rng.random::<u64>(),
+            proof: if rng.random_bool(0.6) {
                 Some(gen_merkle_proof(rng))
             } else {
                 None
             },
-            verifying_key: if rng.gen_bool(0.6) {
+            verifying_key: if rng.random_bool(0.6) {
                 Some(gen_falcon_verifier(rng))
             } else {
                 None
@@ -3556,13 +3556,13 @@ mod tests {
         commitment[0] |= 1; // guarantee non-zero content, see module note above
         MerkleSignatureVerifier {
             commitment,
-            key_lifetime: rng.gen::<u64>(),
+            key_lifetime: rng.random::<u64>(),
         }
     }
 
     fn gen_sig_slot_commit(rng: &mut ChaCha20Rng) -> SigSlotCommit {
         SigSlotCommit {
-            sig: if rng.gen_bool(0.7) {
+            sig: if rng.random_bool(0.7) {
                 Some(gen_merkle_signature(rng))
             } else {
                 None
@@ -3571,13 +3571,13 @@ mod tests {
             // this SigSlotCommit is wrapped in `Reveal::sig_slot`
             // (`Option<SigSlotCommit>`), regardless of whether `sig` above
             // is `None`.
-            l: rng.gen_range(1..=u64::MAX),
+            l: rng.random_range(1..=u64::MAX),
         }
     }
 
     fn gen_participant(rng: &mut ChaCha20Rng) -> Participant {
         Participant {
-            pk: if rng.gen_bool(0.7) {
+            pk: if rng.random_bool(0.7) {
                 Some(gen_merkle_sig_verifier(rng))
             } else {
                 None
@@ -3585,18 +3585,18 @@ mod tests {
             // Always non-zero: guarantees a non-collapsing encoding when
             // this Participant is wrapped in `Reveal::part`
             // (`Option<Participant>`).
-            weight: rng.gen_range(1..=u64::MAX),
+            weight: rng.random_range(1..=u64::MAX),
         }
     }
 
     fn gen_reveal(rng: &mut ChaCha20Rng) -> Reveal {
         Reveal {
-            sig_slot: if rng.gen_bool(0.7) {
+            sig_slot: if rng.random_bool(0.7) {
                 Some(gen_sig_slot_commit(rng))
             } else {
                 None
             },
-            part: if rng.gen_bool(0.7) {
+            part: if rng.random_bool(0.7) {
                 Some(gen_participant(rng))
             } else {
                 None
@@ -3605,43 +3605,43 @@ mod tests {
     }
 
     fn gen_state_proof_body(rng: &mut ChaCha20Rng) -> StateProofBody {
-        let sig_commit = if rng.gen_bool(0.7) {
+        let sig_commit = if rng.random_bool(0.7) {
             ByteBuf::from(gen_nonzero_bytes(rng, 1, 64))
         } else {
             ByteBuf::new()
         };
-        let sig_proofs = if rng.gen_bool(0.6) {
+        let sig_proofs = if rng.random_bool(0.6) {
             Some(gen_merkle_proof(rng))
         } else {
             None
         };
-        let part_proofs = if rng.gen_bool(0.6) {
+        let part_proofs = if rng.random_bool(0.6) {
             Some(gen_merkle_proof(rng))
         } else {
             None
         };
-        let reveals = if rng.gen_bool(0.7) {
-            let n = rng.gen_range(1..=4);
+        let reveals = if rng.random_bool(0.7) {
+            let n = rng.random_range(1..=4);
             let mut map = BTreeMap::new();
             for _ in 0..n {
-                map.insert(rng.gen::<u64>(), gen_reveal(rng));
+                map.insert(rng.random::<u64>(), gen_reveal(rng));
             }
             Some(map)
         } else {
             None
         };
-        let positions_to_reveal = if rng.gen_bool(0.7) {
-            let n = rng.gen_range(1..=6);
-            Some((0..n).map(|_| rng.gen::<u64>()).collect())
+        let positions_to_reveal = if rng.random_bool(0.7) {
+            let n = rng.random_range(1..=6);
+            Some((0..n).map(|_| rng.random::<u64>()).collect())
         } else {
             None
         };
         StateProofBody {
             sig_commit,
-            signed_weight: rng.gen::<u64>(),
+            signed_weight: rng.random::<u64>(),
             sig_proofs,
             part_proofs,
-            merkle_signature_salt_version: rng.gen::<u8>(),
+            merkle_signature_salt_version: rng.random::<u8>(),
             reveals,
             positions_to_reveal,
         }
@@ -3744,7 +3744,7 @@ mod tests {
         }
         PQSig {
             scheme,
-            salt: algo_types::PQAddressSalt(rng.gen_range(1..=u8::MAX)),
+            salt: algo_types::PQAddressSalt(rng.random_range(1..=u8::MAX)),
             public_key: ByteBuf::from(gen_nonzero_bytes(rng, 1, 1793)),
             signature: ByteBuf::from(gen_nonzero_bytes(rng, 1, 64)),
         }
@@ -3760,7 +3760,7 @@ mod tests {
     fn gen_multisig_subsig(rng: &mut ChaCha20Rng) -> MultisigSubsig {
         let mut public_key = [0u8; 32];
         rng.fill_bytes(&mut public_key);
-        let signature = if rng.gen_bool(0.5) {
+        let signature = if rng.random_bool(0.5) {
             let mut s = [0u8; 64];
             rng.fill_bytes(&mut s);
             // Guarantee non-zero so `is_zero_64`'s skip_serializing_if
@@ -3808,7 +3808,7 @@ mod tests {
     /// isolation, with 1000 randomized instances.
     #[test]
     fn sha512_digest_standalone_randomized_roundtrip() {
-        use rand::RngCore;
+        use rand::Rng;
 
         let mut rng = ChaCha20Rng::seed_from_u64(0x5348_4132_0001);
         for i in 0..1000 {
@@ -3839,12 +3839,12 @@ mod tests {
             // would round-trip-fail for a codec reason unrelated to the
             // thing this test is pinning (real MultisigSigs always carry a
             // non-zero version/threshold).
-            version: rng.gen_range(1..=10u8),
-            threshold: rng.gen_range(1..=255u8),
+            version: rng.random_range(1..=10u8),
+            threshold: rng.random_range(1..=255u8),
             // Always non-empty for the same reason: an empty `subsig`
             // array is omitted on the wire, which `Vec<MultisigSubsig>`'s
             // non-defaulted Deserialize can't reconstruct from absence.
-            subsigs: (0..rng.gen_range(1..=3))
+            subsigs: (0..rng.random_range(1..=3))
                 .map(|_| gen_multisig_subsig(rng))
                 .collect(),
         }
@@ -3853,7 +3853,7 @@ mod tests {
     fn gen_logicsig(rng: &mut ChaCha20Rng) -> LogicSig {
         LogicSig {
             logic: ByteBuf::from(gen_nonzero_bytes(rng, 1, 64)),
-            sig: if rng.gen_bool(0.3) {
+            sig: if rng.random_bool(0.3) {
                 let mut s = [0u8; 64];
                 rng.fill_bytes(&mut s);
                 s[0] |= 1;
@@ -3861,13 +3861,13 @@ mod tests {
             } else {
                 [0u8; 64]
             },
-            msig: if rng.gen_bool(0.3) {
+            msig: if rng.random_bool(0.3) {
                 Some(gen_multisig(rng))
             } else {
                 None
             },
-            args: if rng.gen_bool(0.3) {
-                let n = rng.gen_range(1..=3);
+            args: if rng.random_bool(0.3) {
+                let n = rng.random_range(1..=3);
                 Some(
                     (0..n)
                         .map(|_| ByteBuf::from(gen_nonzero_bytes(rng, 1, 16)))
@@ -3876,12 +3876,12 @@ mod tests {
             } else {
                 None
             },
-            lmsig: if rng.gen_bool(0.3) {
+            lmsig: if rng.random_bool(0.3) {
                 Some(gen_multisig(rng))
             } else {
                 None
             },
-            pqsig: if rng.gen_bool(0.3) {
+            pqsig: if rng.random_bool(0.3) {
                 Some(gen_pqsig(rng))
             } else {
                 None
@@ -3909,7 +3909,7 @@ mod tests {
         use algo_types::Digest;
         let mut rng = ChaCha20Rng::seed_from_u64(0x1740_0003);
         for i in 0..STATE_PROOF_ITERATIONS {
-            let n = rng.gen_range(1..=16);
+            let n = rng.random_range(1..=16);
             let hashes: Vec<Digest> = (0..n)
                 .map(|_| {
                     let mut bytes = [0u8; 32];
@@ -3988,7 +3988,7 @@ mod tests {
     }
 
     fn gen_option_address_nonzero(rng: &mut ChaCha20Rng, p_some: f64) -> Option<Address> {
-        if rng.gen_bool(p_some) {
+        if rng.random_bool(p_some) {
             Some(gen_address_nonzero(rng))
         } else {
             None
@@ -3996,7 +3996,7 @@ mod tests {
     }
 
     fn gen_bytes_any(rng: &mut ChaCha20Rng, min_len: usize, max_len: usize) -> Vec<u8> {
-        let len = rng.gen_range(min_len..=max_len.max(min_len));
+        let len = rng.random_range(min_len..=max_len.max(min_len));
         let mut v = vec![0u8; len];
         rng.fill_bytes(&mut v);
         v
@@ -4004,9 +4004,9 @@ mod tests {
 
     fn gen_alnum_string(rng: &mut ChaCha20Rng, min_len: usize, max_len: usize) -> String {
         const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-        let len = rng.gen_range(min_len..=max_len.max(min_len));
+        let len = rng.random_range(min_len..=max_len.max(min_len));
         (0..len)
-            .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+            .map(|_| CHARS[rng.random_range(0..CHARS.len())] as char)
             .collect()
     }
 
@@ -4017,7 +4017,7 @@ mod tests {
     }
 
     fn gen_option_fixed32_nonzero(rng: &mut ChaCha20Rng, p_some: f64) -> Option<[u8; 32]> {
-        if rng.gen_bool(p_some) {
+        if rng.random_bool(p_some) {
             let mut b = gen_fixed32(rng);
             b[0] |= 1;
             Some(b)
@@ -4033,7 +4033,7 @@ mod tests {
     }
 
     fn gen_option_fixed64_nonzero(rng: &mut ChaCha20Rng, p_some: f64) -> Option<[u8; 64]> {
-        if rng.gen_bool(p_some) {
+        if rng.random_bool(p_some) {
             let mut b = gen_fixed64(rng);
             b[0] |= 1;
             Some(b)
@@ -4043,7 +4043,7 @@ mod tests {
     }
 
     fn gen_option_bytes_nonzero(rng: &mut ChaCha20Rng, p_some: f64) -> Option<ByteBuf> {
-        if rng.gen_bool(p_some) {
+        if rng.random_bool(p_some) {
             Some(ByteBuf::from(gen_nonzero_bytes(rng, 1, 32)))
         } else {
             None
@@ -4051,8 +4051,8 @@ mod tests {
     }
 
     fn gen_option_vec_address(rng: &mut ChaCha20Rng, p_some: f64) -> Option<Vec<Address>> {
-        if rng.gen_bool(p_some) {
-            let n = rng.gen_range(1..=4);
+        if rng.random_bool(p_some) {
+            let n = rng.random_range(1..=4);
             Some((0..n).map(|_| gen_address_nonzero(rng)).collect())
         } else {
             None
@@ -4060,9 +4060,9 @@ mod tests {
     }
 
     fn gen_option_vec_u64(rng: &mut ChaCha20Rng, p_some: f64) -> Option<Vec<u64>> {
-        if rng.gen_bool(p_some) {
-            let n = rng.gen_range(1..=4);
-            Some((0..n).map(|_| rng.gen::<u64>()).collect())
+        if rng.random_bool(p_some) {
+            let n = rng.random_range(1..=4);
+            Some((0..n).map(|_| rng.random::<u64>()).collect())
         } else {
             None
         }
@@ -4072,12 +4072,12 @@ mod tests {
         rng: &mut ChaCha20Rng,
         p_some: f64,
     ) -> Option<Vec<Option<ByteBuf>>> {
-        if rng.gen_bool(p_some) {
-            let n = rng.gen_range(1..=4);
+        if rng.random_bool(p_some) {
+            let n = rng.random_range(1..=4);
             Some(
                 (0..n)
                     .map(|_| {
-                        if rng.gen_bool(0.2) {
+                        if rng.random_bool(0.2) {
                             None
                         } else {
                             Some(ByteBuf::from(gen_bytes_any(rng, 0, 16)))
@@ -4096,8 +4096,8 @@ mod tests {
     /// `Option<BoxRef>` field.
     fn gen_box_ref_nonempty(rng: &mut ChaCha20Rng) -> BoxRef {
         BoxRef {
-            index: rng.gen_range(1..=u64::MAX),
-            name: if rng.gen_bool(0.5) {
+            index: rng.random_range(1..=u64::MAX),
+            name: if rng.random_bool(0.5) {
                 Some(ByteBuf::from(gen_nonzero_bytes(rng, 1, 16)))
             } else {
                 None
@@ -4106,8 +4106,8 @@ mod tests {
     }
 
     fn gen_option_vec_box_ref(rng: &mut ChaCha20Rng, p_some: f64) -> Option<Vec<BoxRef>> {
-        if rng.gen_bool(p_some) {
-            let n = rng.gen_range(1..=3);
+        if rng.random_bool(p_some) {
+            let n = rng.random_range(1..=3);
             Some((0..n).map(|_| gen_box_ref_nonempty(rng)).collect())
         } else {
             None
@@ -4117,39 +4117,39 @@ mod tests {
     /// `HoldingRef`, guaranteed non-empty (see `gen_box_ref_nonempty`).
     fn gen_holding_ref_nonempty(rng: &mut ChaCha20Rng) -> HoldingRef {
         HoldingRef {
-            address: rng.gen_range(1..=u64::MAX),
-            asset: rng.gen::<u64>(),
+            address: rng.random_range(1..=u64::MAX),
+            asset: rng.random::<u64>(),
         }
     }
 
     /// `LocalsRef`, guaranteed non-empty (see `gen_box_ref_nonempty`).
     fn gen_locals_ref_nonempty(rng: &mut ChaCha20Rng) -> LocalsRef {
         LocalsRef {
-            address: rng.gen_range(1..=u64::MAX),
-            app: rng.gen::<u64>(),
+            address: rng.random_range(1..=u64::MAX),
+            app: rng.random::<u64>(),
         }
     }
 
     fn gen_resource_ref(rng: &mut ChaCha20Rng) -> ResourceRef {
         ResourceRef {
-            address: if rng.gen_bool(0.4) {
+            address: if rng.random_bool(0.4) {
                 gen_address_nonzero(rng)
             } else {
                 Address::default()
             },
-            asset: rng.gen::<u64>(),
-            app: rng.gen::<u64>(),
-            holding: if rng.gen_bool(0.35) {
+            asset: rng.random::<u64>(),
+            app: rng.random::<u64>(),
+            holding: if rng.random_bool(0.35) {
                 Some(gen_holding_ref_nonempty(rng))
             } else {
                 None
             },
-            locals: if rng.gen_bool(0.35) {
+            locals: if rng.random_bool(0.35) {
                 Some(gen_locals_ref_nonempty(rng))
             } else {
                 None
             },
-            box_ref: if rng.gen_bool(0.35) {
+            box_ref: if rng.random_bool(0.35) {
                 Some(gen_box_ref_nonempty(rng))
             } else {
                 None
@@ -4158,8 +4158,8 @@ mod tests {
     }
 
     fn gen_option_vec_resource_ref(rng: &mut ChaCha20Rng, p_some: f64) -> Option<Vec<ResourceRef>> {
-        if rng.gen_bool(p_some) {
-            let n = rng.gen_range(1..=3);
+        if rng.random_bool(p_some) {
+            let n = rng.random_range(1..=3);
             Some((0..n).map(|_| gen_resource_ref(rng)).collect())
         } else {
             None
@@ -4170,9 +4170,9 @@ mod tests {
     /// never collapses when wrapped in `Transaction::asset_params`.
     fn gen_asset_params_nonempty(rng: &mut ChaCha20Rng) -> AssetParams {
         AssetParams {
-            total: rng.gen_range(1..=u64::MAX),
-            decimals: rng.gen::<u32>(),
-            default_frozen: rng.gen_bool(0.5),
+            total: rng.random_range(1..=u64::MAX),
+            decimals: rng.random::<u32>(),
+            default_frozen: rng.random_bool(0.5),
             unit_name: gen_alnum_string(rng, 0, 8).into_bytes(),
             asset_name: gen_alnum_string(rng, 0, 32).into_bytes(),
             url: gen_alnum_string(rng, 0, 32).into_bytes(),
@@ -4189,8 +4189,8 @@ mod tests {
     /// / `local_state_schema`.
     fn gen_state_schema_nonempty(rng: &mut ChaCha20Rng) -> StateSchema {
         StateSchema {
-            num_uint: rng.gen_range(1..=u64::MAX),
-            num_byte_slice: rng.gen::<u64>(),
+            num_uint: rng.random_range(1..=u64::MAX),
+            num_byte_slice: rng.random::<u64>(),
         }
     }
 
@@ -4210,9 +4210,9 @@ mod tests {
         StateProofMessage {
             block_headers_commitment: ByteBuf::from(gen_bytes_any(rng, 1, 32)),
             voters_commitment: ByteBuf::from(gen_bytes_any(rng, 1, 32)),
-            ln_proven_weight: rng.gen_range(1..=u64::MAX),
-            first_attested_round: rng.gen::<u64>(),
-            last_attested_round: rng.gen::<u64>(),
+            ln_proven_weight: rng.random_range(1..=u64::MAX),
+            first_attested_round: rng.random::<u64>(),
+            last_attested_round: rng.random::<u64>(),
         }
     }
 
@@ -4221,7 +4221,7 @@ mod tests {
     /// collapses when wrapped in `Transaction::state_proof`.
     fn gen_state_proof_body_nonempty(rng: &mut ChaCha20Rng) -> StateProofBody {
         let mut body = gen_state_proof_body(rng);
-        body.signed_weight = rng.gen_range(1..=u64::MAX);
+        body.signed_weight = rng.random_range(1..=u64::MAX);
         body
     }
 
@@ -4230,28 +4230,28 @@ mod tests {
     /// `Transaction::heartbeat`.
     fn gen_heartbeat_txn_fields_nonempty(rng: &mut ChaCha20Rng) -> HeartbeatTxnFields {
         HeartbeatTxnFields {
-            address: if rng.gen_bool(0.5) {
+            address: if rng.random_bool(0.5) {
                 gen_address_nonzero(rng)
             } else {
                 Address::default()
             },
-            proof: if rng.gen_bool(0.5) {
+            proof: if rng.random_bool(0.5) {
                 Some(gen_heartbeat_proof(rng))
             } else {
                 None
             },
-            seed: if rng.gen_bool(0.5) {
+            seed: if rng.random_bool(0.5) {
                 gen_fixed32(rng)
             } else {
                 [0u8; 32]
             },
-            vote_id: if rng.gen_bool(0.5) {
+            vote_id: if rng.random_bool(0.5) {
                 gen_fixed32(rng)
             } else {
                 [0u8; 32]
             },
-            key_dilution: rng.gen_range(1..=u64::MAX),
-            hb_challenge_discount: rng.gen_bool(0.5),
+            key_dilution: rng.random_range(1..=u64::MAX),
+            hb_challenge_discount: rng.random_bool(0.5),
         }
     }
 
@@ -4267,44 +4267,44 @@ mod tests {
     /// for `TestRandomizedEncodingTransaction`.
     fn gen_transaction(rng: &mut ChaCha20Rng) -> Transaction {
         Transaction {
-            txn_type: TXN_TYPE_POOL[rng.gen_range(0..TXN_TYPE_POOL.len())].into(),
+            txn_type: TXN_TYPE_POOL[rng.random_range(0..TXN_TYPE_POOL.len())].into(),
             sender: gen_address_nonzero(rng),
-            fee: rng.gen::<u64>(),
-            first_valid: Round(rng.gen::<u64>()),
-            last_valid: Round(rng.gen::<u64>()),
+            fee: rng.random::<u64>(),
+            first_valid: Round(rng.random::<u64>()),
+            last_valid: Round(rng.random::<u64>()),
             note: ByteBuf::from(gen_bytes_any(rng, 0, 32)),
             genesis_id: gen_alnum_string(rng, 0, 8),
             genesis_hash: gen_fixed32(rng),
             group: gen_fixed32(rng),
             lease: gen_fixed32(rng),
             rekey_to: gen_option_address_nonzero(rng, 0.4),
-            amount: rng.gen::<u64>(),
-            receiver: if rng.gen_bool(0.6) {
+            amount: rng.random::<u64>(),
+            receiver: if rng.random_bool(0.6) {
                 gen_address_nonzero(rng)
             } else {
                 Address::default()
             },
-            close_remainder_to: if rng.gen_bool(0.6) {
+            close_remainder_to: if rng.random_bool(0.6) {
                 gen_address_nonzero(rng)
             } else {
                 Address::default()
             },
-            xaid: rng.gen::<u64>(),
-            asset_amount: rng.gen::<u64>(),
+            xaid: rng.random::<u64>(),
+            asset_amount: rng.random::<u64>(),
             asset_sender: gen_option_address_nonzero(rng, 0.4),
             asset_receiver: gen_option_address_nonzero(rng, 0.4),
             asset_close_to: gen_option_address_nonzero(rng, 0.4),
-            config_asset: rng.gen::<u64>(),
-            asset_params: if rng.gen_bool(0.6) {
+            config_asset: rng.random::<u64>(),
+            asset_params: if rng.random_bool(0.6) {
                 Some(gen_asset_params_nonempty(rng))
             } else {
                 None
             },
-            freeze_asset: rng.gen::<u64>(),
+            freeze_asset: rng.random::<u64>(),
             freeze_account: gen_option_address_nonzero(rng, 0.4),
-            asset_frozen: rng.gen_bool(0.5),
-            application_id: rng.gen::<u64>(),
-            on_completion: rng.gen::<u64>(),
+            asset_frozen: rng.random_bool(0.5),
+            application_id: rng.random::<u64>(),
+            on_completion: rng.random::<u64>(),
             approval_program: gen_option_bytes_nonzero(rng, 0.6),
             clear_state_program: gen_option_bytes_nonzero(rng, 0.6),
             app_arguments: gen_option_app_arguments(rng, 0.6),
@@ -4312,42 +4312,42 @@ mod tests {
             foreign_apps: gen_option_vec_u64(rng, 0.6),
             foreign_assets: gen_option_vec_u64(rng, 0.6),
             boxes: gen_option_vec_box_ref(rng, 0.6),
-            global_state_schema: if rng.gen_bool(0.6) {
+            global_state_schema: if rng.random_bool(0.6) {
                 Some(gen_state_schema_nonempty(rng))
             } else {
                 None
             },
-            local_state_schema: if rng.gen_bool(0.6) {
+            local_state_schema: if rng.random_bool(0.6) {
                 Some(gen_state_schema_nonempty(rng))
             } else {
                 None
             },
-            extra_program_pages: rng.gen::<u32>(),
+            extra_program_pages: rng.random::<u32>(),
             vote_pk: gen_option_fixed32_nonzero(rng, 0.5),
             selection_pk: gen_option_fixed32_nonzero(rng, 0.5),
             state_proof_pk: gen_option_fixed64_nonzero(rng, 0.5),
-            vote_first: rng.gen::<u64>(),
-            vote_last: rng.gen::<u64>(),
-            vote_key_dilution: rng.gen::<u64>(),
-            non_participation: rng.gen_bool(0.5),
-            state_proof_type: rng.gen::<u64>(),
-            state_proof: if rng.gen_bool(0.5) {
+            vote_first: rng.random::<u64>(),
+            vote_last: rng.random::<u64>(),
+            vote_key_dilution: rng.random::<u64>(),
+            non_participation: rng.random_bool(0.5),
+            state_proof_type: rng.random::<u64>(),
+            state_proof: if rng.random_bool(0.5) {
                 Some(gen_state_proof_body_nonempty(rng))
             } else {
                 None
             },
-            state_proof_message: if rng.gen_bool(0.5) {
+            state_proof_message: if rng.random_bool(0.5) {
                 Some(gen_state_proof_message_nonempty(rng))
             } else {
                 None
             },
-            heartbeat: if rng.gen_bool(0.5) {
+            heartbeat: if rng.random_bool(0.5) {
                 Some(gen_heartbeat_txn_fields_nonempty(rng))
             } else {
                 None
             },
             access: gen_option_vec_resource_ref(rng, 0.6),
-            reject_version: rng.gen::<u64>(),
+            reject_version: rng.random::<u64>(),
         }
     }
 
@@ -4459,13 +4459,13 @@ mod tests {
     /// passes the value through unsorted/unmodified, and decode preserves
     /// wire order too, so a small fixed-shape map round-trips exactly.
     fn gen_nonempty_eval_delta(rng: &mut ChaCha20Rng) -> rmpv::Value {
-        let n = rng.gen_range(1..=3);
+        let n = rng.random_range(1..=3);
         rmpv::Value::Map(
             (0..n)
                 .map(|i| {
                     (
                         rmpv::Value::String(format!("k{i}").into()),
-                        rmpv::Value::Integer(rng.gen::<i64>().into()),
+                        rmpv::Value::Integer(rng.random::<i64>().into()),
                     )
                 })
                 .collect(),
@@ -4478,7 +4478,7 @@ mod tests {
     /// `SignedTxnInBlock`).
     fn gen_signed_txn_core(rng: &mut ChaCha20Rng) -> SignedTransaction {
         let mut sig = [0u8; 64];
-        let msig = if rng.gen_bool(0.3) {
+        let msig = if rng.random_bool(0.3) {
             Some(gen_multisig(rng))
         } else {
             None
@@ -4486,7 +4486,7 @@ mod tests {
         // Go's SignedTxn accepts (and this round-trip only cares about
         // wire shape, not signature-scheme legality) any combination of
         // sig/msig/lsig/pqsig being present; randomize sig independently.
-        if rng.gen_bool(0.5) {
+        if rng.random_bool(0.5) {
             rng.fill_bytes(&mut sig);
             sig[0] |= 1;
         }
@@ -4494,12 +4494,12 @@ mod tests {
             txn: gen_transaction(rng),
             sig,
             msig,
-            lsig: if rng.gen_bool(0.3) {
+            lsig: if rng.random_bool(0.3) {
                 Some(gen_logicsig(rng))
             } else {
                 None
             },
-            pqsig: if rng.gen_bool(0.3) {
+            pqsig: if rng.random_bool(0.3) {
                 Some(gen_pqsig(rng))
             } else {
                 None
@@ -4534,14 +4534,14 @@ mod tests {
     /// byte-identical to `SignedTxnWithAD`'s wire shape for these inputs.
     fn gen_signed_txn_with_ad(rng: &mut ChaCha20Rng) -> SignedTransaction {
         let mut stx = gen_signed_txn_core(rng);
-        stx.closing_amount = rng.gen::<u64>();
-        stx.asset_closing_amount = rng.gen::<u64>();
-        stx.sender_rewards = rng.gen::<u64>();
-        stx.receiver_rewards = rng.gen::<u64>();
-        stx.close_rewards = rng.gen::<u64>();
-        stx.apply_data_config_asset = rng.gen::<u64>();
-        stx.apply_data_application_id = rng.gen::<u64>();
-        stx.eval_delta = if rng.gen_bool(0.5) {
+        stx.closing_amount = rng.random::<u64>();
+        stx.asset_closing_amount = rng.random::<u64>();
+        stx.sender_rewards = rng.random::<u64>();
+        stx.receiver_rewards = rng.random::<u64>();
+        stx.close_rewards = rng.random::<u64>();
+        stx.apply_data_config_asset = rng.random::<u64>();
+        stx.apply_data_application_id = rng.random::<u64>();
+        stx.eval_delta = if rng.random_bool(0.5) {
             Some(gen_nonempty_eval_delta(rng))
         } else {
             None
@@ -4569,8 +4569,8 @@ mod tests {
     /// (`SignedTxnWithAD` + `hgi`/`hgh`).
     fn gen_signed_txn_in_block(rng: &mut ChaCha20Rng) -> SignedTransaction {
         let mut stx = gen_signed_txn_with_ad(rng);
-        stx.has_genesis_id = rng.gen_bool(0.5);
-        stx.has_genesis_hash = rng.gen_bool(0.5);
+        stx.has_genesis_id = rng.random_bool(0.5);
+        stx.has_genesis_hash = rng.random_bool(0.5);
         stx
     }
 
@@ -4596,7 +4596,7 @@ mod tests {
     fn payset_randomized_roundtrip() {
         let mut rng = ChaCha20Rng::seed_from_u64(0x1740_0023);
         for i in 0..STATE_PROOF_ITERATIONS {
-            let n = rng.gen_range(0..=8);
+            let n = rng.random_range(0..=8);
             let payset: Vec<SignedTransaction> =
                 (0..n).map(|_| gen_signed_txn_in_block(&mut rng)).collect();
 

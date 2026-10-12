@@ -31,7 +31,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use algo_falcon::{falcon_keygen, FALCON_SEED_SIZE};
-use rand::{rngs::OsRng, RngCore};
+use rand::rngs::SysRng;
+use rand::TryRng;
 
 use super::{FalconSigner, MssError};
 
@@ -202,7 +203,7 @@ struct OsRngSeedProvider;
 impl SeedProvider for OsRngSeedProvider {
     fn seed_for(&self, _index: u64) -> [u8; FALCON_SEED_SIZE] {
         let mut seed = [0u8; FALCON_SEED_SIZE];
-        OsRng.fill_bytes(&mut seed);
+        SysRng.try_fill_bytes(&mut seed).expect("system entropy");
         seed
     }
 }

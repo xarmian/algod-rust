@@ -41,14 +41,14 @@
 //! These match go-algorand's `protocol.OneTimeSigKey1` / `OneTimeSigKey2`.
 
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
-use rand::{Rng, RngCore};
+use rand::{RngExt, Rng};
 use zeroize::Zeroize;
 
 // ── Domain separation prefixes ─────────────────────────────────────────────
 
 /// Generate a random ed25519 signing key using the thread-local RNG.
 fn random_signing_key() -> SigningKey {
-    let seed: [u8; 32] = rand::thread_rng().gen();
+    let seed: [u8; 32] = rand::rng().random();
     SigningKey::from_bytes(&seed)
 }
 
@@ -56,7 +56,7 @@ fn random_signing_key() -> SigningKey {
 ///
 /// Mirrors go-algorand's `ed25519GenerateKeyRNG(rng crypto.RNG)`: a 32-byte
 /// seed is drawn from `rng` and expanded by ed25519 to (pk, sk).
-fn random_signing_key_with_rng<R: RngCore>(rng: &mut R) -> SigningKey {
+fn random_signing_key_with_rng<R: Rng>(rng: &mut R) -> SigningKey {
     let mut seed = [0u8; 32];
     rng.fill_bytes(&mut seed);
     SigningKey::from_bytes(&seed)
@@ -353,9 +353,9 @@ impl OneTimeSignatureSecrets {
     ///
     /// Note: byte-for-byte parity with a Go `crypto.PRNG`-seeded run requires
     /// matching Go's HMAC-DRBG; this entry point lets callers feed any
-    /// `RngCore`, which is sufficient for deterministic-Rust testing and for
+    /// `Rng`, which is sufficient for deterministic-Rust testing and for
     /// `FillDBWithParticipationKeys` to inject randomness.
-    pub fn generate_with_rng<R: RngCore>(start_batch: u64, num_batches: u64, rng: &mut R) -> Self {
+    pub fn generate_with_rng<R: Rng>(start_batch: u64, num_batches: u64, rng: &mut R) -> Self {
         let master = random_signing_key_with_rng(rng);
         let mut batches = Vec::with_capacity(num_batches as usize);
 
@@ -1755,12 +1755,12 @@ mod tests {
             )
         }
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..200 {
             let mut pk = [0u8; 32];
             rng.fill(&mut pk);
-            let batch: u64 = rng.gen();
-            let offset: u64 = rng.gen();
+            let batch: u64 = rng.random();
+            let offset: u64 = rng.random();
 
             let encoded = encode_offset_id(&pk, batch, offset);
             let (decoded_pk, decoded_batch, decoded_offset) = decode_offset_id(&encoded);

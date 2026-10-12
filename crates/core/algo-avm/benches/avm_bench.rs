@@ -18,7 +18,8 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
 
 use algo_avm::bytecode::parse;
 use algo_avm::machine::{AvmMachine, ExecMode};

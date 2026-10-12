@@ -58,7 +58,7 @@ use algo_types::{AccountData, Address, BlockHeader, Digest, Round, TxnType};
 use algo_validate::merkle::{compute_payset_merkle_root, compute_vector_commitment, HashAlgo};
 use algo_validate::rules::{has_txn256, has_txn512};
 use algo_validate::signature::verify_transaction_signature;
-use rand::Rng;
+use rand::RngExt;
 use sha2::{Digest as _, Sha512_256};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -108,7 +108,7 @@ struct RealRandomSource;
 
 impl RandomSource for RealRandomSource {
     fn uint64(&self) -> u64 {
-        rand::thread_rng().gen()
+        rand::rng().random()
     }
 }
 

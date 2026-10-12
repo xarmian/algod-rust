@@ -39,7 +39,7 @@
 //! (`typedPlaintext`, `encryptedDBBlob`). HKDF-based key derivation
 //! (`extractKeyWithIndex`, sqlite_crypto.go:234) belongs to TASK-205.
 
-use rand::RngCore;
+use rand::TryRng;
 use serde::{Deserialize, Serialize};
 use xsalsa20poly1305::{
     aead::{Aead, KeyInit},
@@ -210,7 +210,7 @@ fn derive_encryption_key_with_salt(
 }
 
 fn fill_random(out: &mut [u8]) -> Result<()> {
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(out)
         .map_err(|_| Error::RandBytes)
 }

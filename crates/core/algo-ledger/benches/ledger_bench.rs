@@ -18,7 +18,8 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
 
 use algo_ledger::{apply_pay, LedgerStore, SqliteLedger};
 use algo_types::{AccountData, Address, SignedTransaction};

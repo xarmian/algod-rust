@@ -288,9 +288,9 @@ fn api_wallet_from_metadata(m: &WalletMetadata) -> APIV1Wallet {
 /// Generate a fresh 32-char lowercase-hex wallet ID.  Matches
 /// `wallet.GenerateWalletID` (`daemon/kmd/wallet/wallet.go:75`).
 fn generate_wallet_id() -> Result<String, Error> {
-    use rand::RngCore;
+    use rand::TryRng;
     let mut bytes = [0u8; WALLET_ID_BYTES];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut bytes)
         .map_err(|_| Error::RandBytes)?;
     let mut s = String::with_capacity(WALLET_ID_BYTES * 2);

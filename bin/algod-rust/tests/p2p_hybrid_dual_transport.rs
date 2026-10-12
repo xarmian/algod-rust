@@ -132,7 +132,7 @@ struct OnlineGenesis {
 
 fn build_online_genesis() -> OnlineGenesis {
     let mut seed = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed);
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
     let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
     let stake_address = Address(sk.verifying_key().to_bytes());
 

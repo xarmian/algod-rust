@@ -41,7 +41,7 @@
 
 use std::collections::BTreeSet;
 
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 use algo_types::{
@@ -207,36 +207,36 @@ struct Known {
 }
 
 fn pick_actor(rng: &mut ChaCha8Rng) -> Address {
-    addr(rng.gen_range(1..=ACTORS))
+    addr(rng.random_range(1..=ACTORS))
 }
 
 fn pick_id(rng: &mut ChaCha8Rng, ids: &[u64]) -> u64 {
     // Mostly known ids, sometimes a bogus one (a rejection path).
-    if ids.is_empty() || rng.gen_range(0..8) == 0 {
-        rng.gen_range(1..MAX_ID)
+    if ids.is_empty() || rng.random_range(0..8) == 0 {
+        rng.random_range(1..MAX_ID)
     } else {
-        ids[rng.gen_range(0..ids.len())]
+        ids[rng.random_range(0..ids.len())]
     }
 }
 
 fn random_txn(rng: &mut ChaCha8Rng, known: &Known) -> Transaction {
     let sender = pick_actor(rng);
-    match rng.gen_range(0..11) {
+    match rng.random_range(0..11) {
         0 | 1 => {
             let mut t = base_txn(sender, "pay");
-            t.receiver = if rng.gen_range(0..4) == 0 {
+            t.receiver = if rng.random_range(0..4) == 0 {
                 // A brand new account: the minimum-balance path.
-                addr(100 + rng.gen_range(0..4))
+                addr(100 + rng.random_range(0..4))
             } else {
                 pick_actor(rng)
             };
-            t.amount = match rng.gen_range(0..4) {
+            t.amount = match rng.random_range(0..4) {
                 0 => 0,
                 1 => 50_000, // below min balance for a new account
-                2 => rng.gen_range(1..5_000_000),
+                2 => rng.random_range(1..5_000_000),
                 _ => 1_000_000_000, // overspend
             };
-            if rng.gen_range(0..6) == 0 {
+            if rng.random_range(0..6) == 0 {
                 t.close_remainder_to = pick_actor(rng);
             }
             t
@@ -244,9 +244,9 @@ fn random_txn(rng: &mut ChaCha8Rng, known: &Known) -> Transaction {
         2 => {
             let mut t = base_txn(sender, "acfg");
             t.asset_params = Some(AssetParams {
-                total: rng.gen_range(1..1_000_000),
-                decimals: rng.gen_range(0..4),
-                default_frozen: rng.gen_range(0..5) == 0,
+                total: rng.random_range(1..1_000_000),
+                decimals: rng.random_range(0..4),
+                default_frozen: rng.random_range(0..5) == 0,
                 manager: Some(sender),
                 clawback: Some(sender),
                 ..Default::default()
@@ -257,7 +257,7 @@ fn random_txn(rng: &mut ChaCha8Rng, known: &Known) -> Transaction {
             // Opt in (self transfer of 0) or transfer.
             let mut t = base_txn(sender, "axfer");
             t.xaid = pick_id(rng, &known.assets);
-            let to = if rng.gen_range(0..2) == 0 {
+            let to = if rng.random_range(0..2) == 0 {
                 sender
             } else {
                 pick_actor(rng)
@@ -266,7 +266,7 @@ fn random_txn(rng: &mut ChaCha8Rng, known: &Known) -> Transaction {
             t.asset_amount = if to == sender {
                 0
             } else {
-                rng.gen_range(0..2_000)
+                rng.random_range(0..2_000)
             };
             t
         }
@@ -288,7 +288,7 @@ fn random_txn(rng: &mut ChaCha8Rng, known: &Known) -> Transaction {
             let app = pick_id(rng, &known.apps);
             let mut t = base_txn(sender, "appl");
             t.application_id = app;
-            let arg: &[u8] = match rng.gen_range(0..4) {
+            let arg: &[u8] = match rng.random_range(0..4) {
                 0 => b"box",
                 1 => b"pay",
                 2 => b"bdel",
@@ -299,7 +299,7 @@ fn random_txn(rng: &mut ChaCha8Rng, known: &Known) -> Transaction {
                 index: 0,
                 name: Some(serde_bytes::ByteBuf::from(b"k1".to_vec())),
             }]);
-            if rng.gen_range(0..3) == 0 {
+            if rng.random_range(0..3) == 0 {
                 t.fee = 3_000; // cover inner fees by pooling
             }
             t
@@ -317,13 +317,13 @@ fn random_group(rng: &mut ChaCha8Rng, known: &Known) -> Vec<SignedTransaction> {
     // Funding the app accounts keeps box / inner-pay calls from always
     // failing on minimum balance.
     let mut txns: Vec<Transaction> = Vec::new();
-    if !known.apps.is_empty() && rng.gen_range(0..3) == 0 {
+    if !known.apps.is_empty() && rng.random_range(0..3) == 0 {
         let mut t = base_txn(pick_actor(rng), "pay");
-        t.receiver = app_addr(known.apps[rng.gen_range(0..known.apps.len())]);
-        t.amount = rng.gen_range(100_000..1_000_000);
+        t.receiver = app_addr(known.apps[rng.random_range(0..known.apps.len())]);
+        t.amount = rng.random_range(100_000..1_000_000);
         txns.push(t);
     }
-    let extra = match rng.gen_range(0..4) {
+    let extra = match rng.random_range(0..4) {
         0 => 3,
         1 | 2 => 2,
         _ => 1,

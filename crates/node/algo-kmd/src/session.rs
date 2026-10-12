@@ -44,7 +44,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use rand::RngCore;
+use rand::TryRng;
 use subtle::ConstantTimeEq;
 
 use crate::error::{Error, Result};
@@ -268,7 +268,7 @@ fn is_lower_hex(s: &str) -> bool {
 fn generate_handle_id_and_secret() -> Result<(String, String)> {
     let mut id_bytes = [0u8; HANDLE_ID_BYTES];
     let mut secret_bytes = [0u8; HANDLE_SECRET_BYTES];
-    let mut rng = rand::rngs::OsRng;
+    let mut rng = rand::rngs::SysRng;
     rng.try_fill_bytes(&mut id_bytes)
         .map_err(|_| Error::RandBytes)?;
     rng.try_fill_bytes(&mut secret_bytes)

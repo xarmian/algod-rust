@@ -694,14 +694,14 @@ fn sort_and_randomize_srv_records(records: &mut [SrvRecord]) {
 /// tier), per RFC 2782's SRV selection algorithm — a direct port of go's
 /// `srvRecArray.randomize`.
 fn randomize_weighted_range(records: &mut [SrvRecord], start: usize, end: usize) {
-    use rand::Rng;
+    use rand::RngExt;
 
     let mut sum: u32 = records[start..end].iter().map(|r| r.weight as u32).sum();
     let mut start = start;
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     while sum > 0 && end > start {
         // Choose a uniform random number between 0 and the sum (inclusive).
-        let num = rng.gen_range(0..=sum);
+        let num = rng.random_range(0..=sum);
         let mut running_sum: u32 = 0;
         for i in start..end {
             running_sum += records[i].weight as u32;
