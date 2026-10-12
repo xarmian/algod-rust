@@ -602,6 +602,10 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
         self.inner.online_accounts()
     }
 
+    fn for_each_online_account_ordered(&self, visit: &mut dyn FnMut(Address, AccountData) -> bool) {
+        self.inner.for_each_online_account_ordered(visit)
+    }
+
     fn put_voters_snapshot(
         &mut self,
         round: u64,
