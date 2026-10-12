@@ -817,7 +817,7 @@ pub mod test_hooks {
         CALLS.with(|c| c.set(0));
     }
 
-    pub(super) fn should_fail(payset_len: usize) -> bool {
+    pub(crate) fn should_fail(payset_len: usize) -> bool {
         CALLS.with(|c| c.set(c.get() + 1));
         let next = FAIL_NEXT.with(|c| {
             let n = c.get();
@@ -867,6 +867,10 @@ pub enum ScratchFailure {
     /// The store cannot roll a scratch apply back (a lease journal is
     /// already open): nothing was evaluated.
     Unsupported,
+    /// The ledger was not at the block's parent round, or advanced while the
+    /// payset was evaluated on an overlay (issue #1781): the result was
+    /// dropped. Retrying or bisecting cannot help.
+    Stale,
 }
 
 /// Evaluate `block` (the proposer's candidate: next-round header + payset,
@@ -945,6 +949,10 @@ pub fn scratch_validate_payouts<L: LedgerStore>(store: &mut L, block: &Block) ->
                 },
                 ScratchFailure::Unsupported => PayoutCheck::NoVerdict {
                     reason: "ledger cannot roll back a scratch apply".into(),
+                    transient: true,
+                },
+                ScratchFailure::Stale => PayoutCheck::NoVerdict {
+                    reason: "ledger advanced during the evaluation".into(),
                     transient: true,
                 },
             },

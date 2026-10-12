@@ -1620,6 +1620,26 @@ struct ExecState {
     /// size check, from the kept pass's modified accounts; `None` while no
     /// payset has been evaluated.
     final_knock_offline: Option<algo_ledger::apply::KnockOfflineLists>,
+    /// Issue #1781: run the assembly verification pass the old way, as a
+    /// SAVEPOINT scratch apply on the live connection under the ledger mutex
+    /// (`ALGOD_RUST_LOCKED_SCRATCH=1`). The default evaluates the payset on a
+    /// fresh overlay taking the mutex per read.
+    locked_scratch: bool,
+    /// Longest single hold of the ledger mutex by this evaluator's
+    /// evaluations, and how many times it took the mutex (diagnostics, tests).
+    lock_hold_max: std::cell::Cell<Duration>,
+    lock_acquisitions: std::cell::Cell<u64>,
+}
+
+/// Whether `ALGOD_RUST_LOCKED_SCRATCH` selects the legacy locked scratch
+/// apply for block assembly (issue #1781), read once.
+fn locked_scratch_from_env() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("ALGOD_RUST_LOCKED_SCRATCH")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
 }
 
 impl SimpleBlockEvaluator {
@@ -2062,6 +2082,23 @@ impl SimpleBlockEvaluator {
         let request = own_addresses.map(|own| algo_ledger::apply::ListsRequest {
             own_addresses: own.clone(),
         });
+        if !self.exec.as_ref().is_some_and(|e| e.locked_scratch) {
+            // Issue #1781: evaluate the payset on a fresh overlay that takes
+            // the ledger mutex per read, so agreement commits and REST reads
+            // are not blocked behind the whole AVM evaluation. A ledger that
+            // advanced meanwhile is reported as `Stale` and the result is
+            // dropped.
+            let base = algo_ledger::locked_base::LockedBase::new(
+                &self.ledger,
+                algo_types::Round(template.round.0.saturating_sub(1)),
+            );
+            let r = algo_ledger::proposal_eval::evaluate_payset(&base, &candidate, request);
+            self.note_lock_use(&base);
+            if base.is_poisoned() {
+                return Err(algo_ledger::locked_base::LockedBase::poison_error());
+            }
+            return Ok(r);
+        }
         let waited = std::time::Instant::now();
         let mut ledger = self
             .ledger
@@ -2075,6 +2112,33 @@ impl SimpleBlockEvaluator {
             algo_ledger::shadow_execute::scratch_execute_payset(&mut *ledger, &candidate, request);
         algo_ledger::proposal_eval::record_ledger_lock_hold(held.elapsed());
         Ok(r)
+    }
+
+    /// Fold one evaluation's ledger mutex usage into the process metrics and
+    /// this evaluator's diagnostics (issue #1781).
+    fn note_lock_use(&self, base: &algo_ledger::locked_base::LockedBase<'_>) {
+        let st = base.stats();
+        algo_ledger::proposal_eval::record_ledger_lock_wait(st.wait);
+        algo_ledger::proposal_eval::record_ledger_lock_holds(st.acquisitions, st.hold, st.hold_max);
+        if let Some(exec) = self.exec.as_ref() {
+            exec.lock_hold_max
+                .set(exec.lock_hold_max.get().max(st.hold_max));
+            exec.lock_acquisitions
+                .set(exec.lock_acquisitions.get() + st.acquisitions);
+        }
+    }
+
+    /// The error for a proposal whose base ledger advanced while it was being
+    /// evaluated: dropped, never built on the wrong parent (issue #1781).
+    fn stale_proposal_error(&self) -> algo_error::AlgoError {
+        algo_ledger::proposal_eval::count_stale_base();
+        algo_error::AlgoError::Ledger {
+            message: format!(
+                "block assembly: the ledger advanced past round {} while the proposal was \
+                 evaluated; proposal dropped",
+                self.hdr.round.0.saturating_sub(1)
+            ),
+        }
     }
 
     /// Run the candidate payset through the real apply, drop any group that
@@ -2202,6 +2266,16 @@ impl SimpleBlockEvaluator {
                         break self.empty_payset_parts();
                     }
                 }
+                Err(ScratchFailure::Stale) => {
+                    // Nothing was evaluated against a consistent base:
+                    // retrying or bisecting cannot help. Put the admitted set
+                    // back and drop the proposal.
+                    self.included_txns = pristine;
+                    if let Some(exec) = self.exec.as_mut() {
+                        exec.groups = groups;
+                    }
+                    return Err(self.stale_proposal_error());
+                }
                 Err(failure) => {
                     let cause = match &failure {
                         ScratchFailure::Other(e) => e.to_string(),
@@ -2234,7 +2308,10 @@ impl SimpleBlockEvaluator {
         // fallback then proposes empty lists.
         if let (None, Some(modified)) = (&final_knock_offline, &final_modified) {
             if !result.0.is_empty() {
-                final_knock_offline = self.knock_offline_from_modified(own_addresses, modified)?;
+                final_knock_offline = Some(
+                    self.knock_offline_from_modified(own_addresses, modified)?
+                        .ok_or_else(|| self.stale_proposal_error())?,
+                );
             }
         }
         if dropped > 0 {
@@ -2333,6 +2410,9 @@ impl SimpleBlockEvaluator {
             *passes += 1;
             match self.scratch_pass(template, &payset[..end], &groups[..mid], None)? {
                 Ok(_) => lo = mid,
+                Err(algo_ledger::shadow_execute::ScratchFailure::Stale) => {
+                    return Err(self.stale_proposal_error());
+                }
                 Err(_) => hi = mid - 1,
             }
         }
@@ -2376,25 +2456,31 @@ impl SimpleBlockEvaluator {
             exec.incomplete = true;
             return Ok(());
         }
-        let waited = std::time::Instant::now();
-        let ledger = self
-            .ledger
-            .lock()
-            .map_err(|e| algo_error::AlgoError::Ledger {
-                message: format!("ledger lock poisoned: {e}"),
-            })?;
-        algo_ledger::proposal_eval::record_ledger_lock_wait(waited.elapsed());
+        // Issue #1781: the ledger mutex is taken per read, not across the AVM
+        // evaluation of the group. Only the time spent evaluating is charged to
+        // the admission budget; waits for the mutex are recorded separately.
+        let base =
+            algo_ledger::locked_base::LockedBase::new(&self.ledger, exec.overlay.base_round());
         let started = std::time::Instant::now();
         let outcome = algo_ledger::proposal_eval::evaluate_group(
-            &ledger,
+            &base,
             &mut exec.overlay,
             &exec.template,
             stibs,
         );
-        let held = started.elapsed();
-        drop(ledger);
-        algo_ledger::proposal_eval::record_ledger_lock_hold(held);
-        exec.spent += held;
+        let st = base.stats();
+        let poisoned = base.is_poisoned();
+        let elapsed = started.elapsed();
+        algo_ledger::proposal_eval::record_ledger_lock_wait(st.wait);
+        algo_ledger::proposal_eval::record_ledger_lock_holds(st.acquisitions, st.hold, st.hold_max);
+        exec.lock_hold_max
+            .set(exec.lock_hold_max.get().max(st.hold_max));
+        exec.lock_acquisitions
+            .set(exec.lock_acquisitions.get() + st.acquisitions);
+        exec.spent += elapsed.saturating_sub(st.wait);
+        if poisoned {
+            return Err(algo_ledger::locked_base::LockedBase::poison_error());
+        }
         let txid_of = |i: usize| {
             restored
                 .get(i)
@@ -2408,6 +2494,7 @@ impl SimpleBlockEvaluator {
             }
             Err(GroupEvalError::Txn { index, error }) => Err(go_rejection(&txid_of(index), error)),
             Err(GroupEvalError::Stale) => {
+                algo_ledger::proposal_eval::count_stale_base();
                 exec.incomplete = true;
                 Ok(())
             }
@@ -3722,7 +3809,7 @@ impl PoolLedgerAdapter {
                     message: format!("ledger lock poisoned: {e}"),
                 })?;
             ExecState {
-                overlay: algo_ledger::pending_overlay::PendingOverlay::new(&l),
+                overlay: algo_ledger::pending_overlay::PendingOverlay::new(&*l),
                 template: header_block(&next_hdr),
                 groups: Vec::new(),
                 spent: Duration::ZERO,
@@ -3731,6 +3818,9 @@ impl PoolLedgerAdapter {
                 final_state_proof_next: None,
                 final_fee_sink_available: None,
                 final_knock_offline: None,
+                locked_scratch: locked_scratch_from_env(),
+                lock_hold_max: std::cell::Cell::new(Duration::ZERO),
+                lock_acquisitions: std::cell::Cell::new(0),
             }
         };
 

@@ -33,9 +33,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use algo_error::AlgoError;
 use algo_types::{Block, SignedTransaction};
 
-use crate::apply::{apply_block_impl_probe, ApplyData, ApplyMode, ExecProbe, ProbeRequest};
-use crate::pending_overlay::{OverlayStore, PendingOverlay};
-use crate::sqlite::SqliteLedger;
+use crate::apply::{
+    apply_block_impl_probe, ApplyData, ApplyMode, ExecProbe, ListsRequest, ProbeRequest,
+};
+use crate::pending_overlay::{OverlayBase, OverlayStore, PendingOverlay};
+use crate::shadow_execute::{ScratchFailure, ScratchPayset};
 
 /// Successful evaluation of one group.
 #[derive(Debug)]
@@ -67,17 +69,19 @@ pub enum GroupEvalError {
 ///
 /// On success the group effects stay in `overlay` and later groups see them.
 /// On failure the overlay is rolled back.
-pub fn evaluate_group(
-    base: &SqliteLedger,
+///
+/// `base` may take the ledger mutex per read (`LockedBase`, issue #1781): a
+/// ledger that moved while the group was evaluated is reported as
+/// [`GroupEvalError::Stale`] and the overlay is rolled back, whatever the
+/// apply itself concluded.
+pub fn evaluate_group<B: OverlayBase + ?Sized>(
+    base: &B,
     overlay: &mut PendingOverlay,
     template: &Block,
     group: &[SignedTransaction],
 ) -> Result<GroupEval, GroupEvalError> {
-    use crate::store_trait::LedgerStore;
-
-    if overlay.base_round() != base.current_round()
-        || template.round.0 != base.current_round().0 + 1
-    {
+    let tip = base.base_current_round();
+    if base.base_is_stale() || overlay.base_round() != tip || template.round.0 != tip.0 + 1 {
         return Err(GroupEvalError::Stale);
     }
     let mut block = template.clone();
@@ -109,6 +113,12 @@ pub fn evaluate_group(
             )
         }))
     };
+    if base.base_is_stale() {
+        // A read saw another committed state: nothing this evaluation
+        // concluded (accept or reject) says anything about the pending block.
+        overlay.rollback_group();
+        return Err(GroupEvalError::Stale);
+    }
     match res {
         Ok(Ok(())) => {
             overlay.commit_group(probe.out.final_txn_counter);
@@ -133,9 +143,89 @@ pub fn evaluate_group(
     }
 }
 
+/// Evaluate the whole candidate `block` payset (next-round header + stripped
+/// payset) on a **fresh** overlay over `base` and return exactly what the
+/// proposer's locked scratch apply returns
+/// ([`crate::shadow_execute::scratch_execute_payset`]), without a SAVEPOINT on
+/// the live connection (issue #1781).
+///
+/// The block epilogue is skipped: every output the proposer consumes (apply
+/// data, transaction counter, `StateProofNextRound`, the fee sink's available
+/// balance, the modified accounts for the expired / absent lists) is produced
+/// before it, and the epilogue itself cannot fail for the candidate (empty
+/// participation lists, no payout in the template).
+///
+/// [`ScratchFailure::Stale`] when the base is not at `block.round - 1`, or
+/// moved while evaluating: the result is dropped, never returned.
+pub fn evaluate_payset<B: OverlayBase + ?Sized>(
+    base: &B,
+    block: &Block,
+    lists: Option<ListsRequest>,
+) -> Result<ScratchPayset, ScratchFailure> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if crate::shadow_execute::test_hooks::should_fail(block.payset.len()) {
+        return Err(ScratchFailure::Other(AlgoError::Ledger {
+            message: "injected transient scratch failure".into(),
+        }));
+    }
+    let mut overlay = PendingOverlay::new(base);
+    if base.base_is_stale() || block.round.0 != overlay.base_round().0 + 1 {
+        return Err(ScratchFailure::Stale);
+    }
+    let mut probe = ExecProbe {
+        request: ProbeRequest {
+            skip_epilogue: true,
+            want_fee_sink_available: true,
+            knock_offline_exclude: lists.as_ref().map(|l| l.own_addresses.clone()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut ad: Vec<ApplyData> = Vec::with_capacity(block.payset.len());
+    overlay.begin_group();
+    let res = {
+        let mut store = OverlayStore::new(base, &mut overlay);
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            apply_block_impl_probe(
+                &mut store,
+                block,
+                ApplyMode::Execute,
+                false,
+                None,
+                None,
+                Some(&mut ad),
+                None,
+                true,
+                Some(&mut probe),
+            )
+        }))
+    };
+    if base.base_is_stale() {
+        return Err(ScratchFailure::Stale);
+    }
+    match res {
+        Err(_) => Err(ScratchFailure::Other(AlgoError::Ledger {
+            message: "scratch Execute evaluation panicked".into(),
+        })),
+        Ok(Err(error)) => match probe.out.failed_txn_index {
+            Some(index) if index < block.payset.len() => Err(ScratchFailure::Txn { index, error }),
+            _ => Err(ScratchFailure::Other(error)),
+        },
+        Ok(Ok(())) => Ok(ScratchPayset {
+            apply_data: ad,
+            final_txn_counter: probe.out.final_txn_counter,
+            final_state_proof_next: probe.out.final_state_proof_next,
+            final_fee_sink_available: probe.out.final_fee_sink_available,
+            knock_offline_lists: probe.out.knock_offline_lists.take(),
+            knock_offline_modified: probe.out.knock_offline_modified.take(),
+        }),
+    }
+}
+
 // ---- metrics (issue #1776) ----
 
 static SCRATCH_FAILURES: AtomicU64 = AtomicU64::new(0);
+static STALE_BASE: AtomicU64 = AtomicU64::new(0);
 static LOCK_HOLD_MAX_US: AtomicU64 = AtomicU64::new(0);
 static LOCK_HOLD_TOTAL_US: AtomicU64 = AtomicU64::new(0);
 static LOCK_HOLD_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -145,6 +235,17 @@ static LOCK_WAIT_TOTAL_US: AtomicU64 = AtomicU64::new(0);
 /// scratch evaluation could not run (or could not be attributed).
 pub fn count_scratch_failure() {
     SCRATCH_FAILURES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count an evaluation (admission of a group or block assembly) that was
+/// dropped because the ledger advanced while it ran (issue #1781).
+pub fn count_stale_base() {
+    STALE_BASE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Stale-base evaluations counted so far.
+pub fn stale_base_total() -> u64 {
+    STALE_BASE.load(Ordering::Relaxed)
 }
 
 /// Scratch failures counted so far.
@@ -161,6 +262,24 @@ pub fn record_ledger_lock_hold(held: std::time::Duration) {
     LOCK_HOLD_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Record the mutex usage of one evaluation that took the ledger mutex once
+/// per read (`LockedBase`, issue #1781): `holds` acquisitions, `total` time
+/// held across them and the longest `max` single hold.
+pub fn record_ledger_lock_holds(holds: u64, total: std::time::Duration, max: std::time::Duration) {
+    if holds == 0 {
+        return;
+    }
+    LOCK_HOLD_MAX_US.fetch_max(
+        max.as_micros().min(u128::from(u64::MAX)) as u64,
+        Ordering::Relaxed,
+    );
+    LOCK_HOLD_TOTAL_US.fetch_add(
+        total.as_micros().min(u128::from(u64::MAX)) as u64,
+        Ordering::Relaxed,
+    );
+    LOCK_HOLD_COUNT.fetch_add(holds, Ordering::Relaxed);
+}
+
 /// Record how long a pool/proposer evaluation waited to acquire the ledger
 /// mutex (not charged to the admission budget or to the hold metrics).
 pub fn record_ledger_lock_wait(waited: std::time::Duration) {
@@ -170,7 +289,13 @@ pub fn record_ledger_lock_wait(waited: std::time::Duration) {
 
 /// Prometheus text for the pool/proposer evaluation counters.
 pub fn proposal_metrics_prometheus_text() -> String {
-    let rows: [(&str, &str, &str, u64); 5] = [
+    let rows: [(&str, &str, &str, u64); 6] = [
+        (
+            "algod_rust_pool_eval_stale_base_total",
+            "counter",
+            "Pool/proposer evaluations dropped because the ledger advanced while they ran.",
+            STALE_BASE.load(Ordering::Relaxed),
+        ),
         (
             "algod_rust_proposal_scratch_failures_total",
             "counter",
@@ -214,6 +339,7 @@ pub fn proposal_metrics_prometheus_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sqlite::SqliteLedger;
     use crate::store_trait::LedgerStore;
     use algo_types::{AccountData, Address, AssetHolding, Round, TxnType, CONSENSUS_V41};
 
@@ -387,5 +513,83 @@ mod tests {
             Err(GroupEvalError::Txn { index, .. }) => assert_eq!(index, 1),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    // ---- issue #1781: per-read locked base ----
+
+    #[test]
+    fn payset_evaluated_while_the_ledger_advances_is_stale_and_returns_nothing() {
+        use crate::locked_base::LockedBase;
+        use std::sync::{Arc, Mutex};
+
+        let a = addr(1);
+        let shared = Arc::new(Mutex::new(ledger(&[(a, funded(5_000_000_000_000))])));
+        let (t,) = {
+            let l = shared.lock().unwrap();
+            (template(&l),)
+        };
+        let mut block = t;
+        block.payset = (0..600u64)
+            .map(|i| {
+                let mut p = pay(a, addr(2), 200_000 + i, None);
+                p.txn.note = serde_bytes::ByteBuf::from(i.to_be_bytes().to_vec());
+                p
+            })
+            .collect();
+        let base = LockedBase::new(&shared, Round(0));
+        // A block commit lands after 200 reads, in the middle of the evaluation.
+        let m = shared.clone();
+        base.before_acquisition(200, move || {
+            m.lock().unwrap().set_current_round(Round(1));
+        });
+        let res = evaluate_payset(&base, &block, None);
+        assert!(
+            base.stats().acquisitions > 200,
+            "the commit must land mid-evaluation"
+        );
+        assert!(
+            matches!(res, Err(crate::shadow_execute::ScratchFailure::Stale)),
+            "a result computed across a commit must be dropped, got {res:?}"
+        );
+        assert!(base.is_stale());
+    }
+
+    #[test]
+    fn group_evaluated_against_an_advanced_ledger_is_stale_and_rolled_back() {
+        use crate::locked_base::LockedBase;
+        use std::sync::Mutex;
+
+        let a = addr(1);
+        let shared = Mutex::new(ledger(&[(a, funded(50_000_000))]));
+        let (t, mut ov) = {
+            let l = shared.lock().unwrap();
+            (template(&l), PendingOverlay::new(&*l))
+        };
+        shared.lock().unwrap().set_current_round(Round(1));
+        let base = LockedBase::new(&shared, Round(0));
+        assert!(matches!(
+            evaluate_group(&base, &mut ov, &t, &[pay(a, addr(2), 1, None)]),
+            Err(GroupEvalError::Stale)
+        ));
+        assert!(ov.is_empty());
+    }
+
+    #[test]
+    fn evaluation_does_not_hold_the_mutex_between_reads() {
+        use crate::locked_base::LockedBase;
+        use std::sync::Mutex;
+
+        let a = addr(1);
+        let shared = Mutex::new(ledger(&[(a, funded(5_000_000_000))]));
+        let (t, mut ov) = {
+            let l = shared.lock().unwrap();
+            (template(&l), PendingOverlay::new(&*l))
+        };
+        let base = LockedBase::new(&shared, Round(0));
+        evaluate_group(&base, &mut ov, &t, &[pay(a, addr(2), 5_000_000, None)]).expect("group");
+        // Free after the evaluation, and it was taken once per read.
+        assert!(shared.try_lock().is_ok());
+        assert!(base.stats().acquisitions > 1);
+        assert!(!base.is_stale());
     }
 }
