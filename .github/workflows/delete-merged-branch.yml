@@ -7,8 +7,9 @@ name: Delete merged branch
 # Issue #1679: ~190 merged branches piled up because the repository setting
 # "Automatically delete head branches" needs an admin. This workflow gives the
 # same behavior without it: when a pull request from a branch in THIS
-# repository is merged, its head branch is deleted. Fork branches, the default
-# branch and protected-looking names are never touched.
+# repository is MERGED, its head branch is deleted. Fork branches, the default
+# branch and any branch GitHub reports as protected are never touched; the
+# branch of a PR that was closed WITHOUT merging is deliberately kept.
 
 on:
   pull_request:
@@ -25,23 +26,37 @@ jobs:
     if: >-
       github.event.pull_request.merged == true &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.head.ref != github.event.repository.default_branch &&
-      !startsWith(github.event.pull_request.head.ref, 'release/') &&
-      !startsWith(github.event.pull_request.head.ref, 'gh-pages')
+      github.event.pull_request.head.ref != github.event.repository.default_branch
     steps:
-      - name: Delete ${{ github.event.pull_request.head.ref }}
+      - name: Delete the merged head branch
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |
-          # `gh pr merge --delete-branch` (and Dependabot's own cleanup) may
-          # already have removed it: a 404/422 here is success, not failure.
-          if gh api -X DELETE "repos/${REPO}/git/refs/heads/${BRANCH}" 2>/tmp/err; then
-            echo "deleted ${BRANCH}"
-          elif grep -qiE "Reference does not exist|Not Found|422" /tmp/err; then
-            echo "${BRANCH} already deleted"
-          else
+          set -u
+          # Percent-encode every path segment but keep the '/' separators
+          # (feature/x stays feature/x; '#', '?', '%' etc. are escaped).
+          ENC="$(jq -rn --arg b "$BRANCH" '$b | split("/") | map(@uri) | join("/")')"
+
+          # `gh pr merge --delete-branch` or Dependabot may have removed it
+          # already: only a 404 on this lookup means "already gone".
+          if ! INFO="$(gh api "repos/${REPO}/branches/${ENC}" 2>/tmp/err)"; then
+            if grep -qE 'HTTP 404' /tmp/err; then
+              echo "${BRANCH} already deleted"
+              exit 0
+            fi
             cat /tmp/err
             exit 1
           fi
+
+          # Never delete a branch GitHub says is protected.
+          if [ "$(printf '%s' "$INFO" | jq -r '.protected')" = "true" ]; then
+            echo "${BRANCH} is protected: keeping it"
+            exit 0
+          fi
+
+          # Any other failure (403 permissions, 422 protected, ...) must fail
+          # the job so a silently surviving branch is visible.
+          gh api -X DELETE "repos/${REPO}/git/refs/heads/${ENC}"
+          echo "deleted ${BRANCH}"
