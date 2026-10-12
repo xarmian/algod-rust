@@ -964,8 +964,8 @@ fn ecdsa_verify_secp256k1(
     pk_y: &[u8],
 ) -> bool {
     use k256::ecdsa::signature::hazmat::PrehashVerifier;
-    use k256::elliptic_curve::sec1::FromEncodedPoint;
-    use k256::{AffinePoint, EncodedPoint};
+    use k256::elliptic_curve::sec1::FromSec1Point;
+    use k256::{AffinePoint, Sec1Point};
 
     // Build the uncompressed point (0x04 || x || y)
     let mut uncompressed = Vec::with_capacity(1 + 32 + 32);
@@ -980,11 +980,11 @@ fn ecdsa_verify_secp256k1(
     uncompressed.extend_from_slice(&x_padded);
     uncompressed.extend_from_slice(&y_padded);
 
-    let Ok(encoded_point) = EncodedPoint::from_bytes(&uncompressed) else {
+    let Ok(encoded_point) = Sec1Point::from_bytes(&uncompressed) else {
         return false;
     };
 
-    let maybe_point = AffinePoint::from_encoded_point(&encoded_point);
+    let maybe_point = AffinePoint::from_sec1_point(&encoded_point);
     if maybe_point.is_none().into() {
         return false;
     }
@@ -1013,7 +1013,7 @@ fn ecdsa_verify_secp256k1(
     };
 
     // Normalize S to low-S (matching Go's libsecp256k1 behavior).
-    sig = sig.normalize_s().unwrap_or(sig);
+    sig = sig.normalize_s();
 
     vk.verify_prehash(data, &sig).is_ok()
 }
@@ -1028,7 +1028,7 @@ fn ecdsa_verify_secp256k1(
 /// v38+ bails to `false` immediately without the expensive verify call.
 ///
 /// Known limitation: the underlying `p256` crate's safe API
-/// (`AffinePoint::from_encoded_point`) *always* validates that a decoded
+/// (`AffinePoint::from_sec1_point`) *always* validates that a decoded
 /// point lies on the curve, by design -- there is no supported way to
 /// construct an off-curve `AffinePoint` and feed it through verification
 /// the way pre-fix go-algorand's non-validating `ecdsa.Verify` could. This
@@ -1049,8 +1049,8 @@ fn ecdsa_verify_secp256r1(
     enable_precheck: bool,
 ) -> bool {
     use p256::ecdsa::signature::hazmat::PrehashVerifier;
-    use p256::elliptic_curve::sec1::FromEncodedPoint;
-    use p256::{AffinePoint, EncodedPoint};
+    use p256::elliptic_curve::sec1::FromSec1Point;
+    use p256::{AffinePoint, Sec1Point};
     let _ = enable_precheck; // see doc comment: both branches validate on-curve today.
 
     // Build the uncompressed point (0x04 || x || y)
@@ -1065,11 +1065,11 @@ fn ecdsa_verify_secp256r1(
     uncompressed.extend_from_slice(&x_padded);
     uncompressed.extend_from_slice(&y_padded);
 
-    let Ok(encoded_point) = EncodedPoint::from_bytes(&uncompressed) else {
+    let Ok(encoded_point) = Sec1Point::from_bytes(&uncompressed) else {
         return false;
     };
 
-    let maybe_point = AffinePoint::from_encoded_point(&encoded_point);
+    let maybe_point = AffinePoint::from_sec1_point(&encoded_point);
     if maybe_point.is_none().into() {
         return false;
     }
@@ -1102,7 +1102,7 @@ fn ecdsa_verify_secp256r1(
 fn ecdsa_decompress_secp256k1(compressed: &[u8]) -> Result<(Vec<u8>, Vec<u8>), AlgoError> {
     let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(compressed)
         .map_err(|_| avm_err("invalid pubkey"))?;
-    let uncompressed = vk.to_encoded_point(false);
+    let uncompressed = vk.to_sec1_point(false);
     let x = uncompressed.x().ok_or_else(|| avm_err("invalid pubkey"))?;
     let y = uncompressed.y().ok_or_else(|| avm_err("invalid pubkey"))?;
     Ok((x.to_vec(), y.to_vec()))
@@ -1112,7 +1112,7 @@ fn ecdsa_decompress_secp256k1(compressed: &[u8]) -> Result<(Vec<u8>, Vec<u8>), A
 fn ecdsa_decompress_secp256r1(compressed: &[u8]) -> Result<(Vec<u8>, Vec<u8>), AlgoError> {
     let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(compressed)
         .map_err(|_| avm_err("invalid compressed pubkey"))?;
-    let uncompressed = vk.to_encoded_point(false);
+    let uncompressed = vk.to_sec1_point(false);
     let x = uncompressed
         .x()
         .ok_or_else(|| avm_err("invalid compressed pubkey"))?;
@@ -1145,7 +1145,7 @@ fn ecdsa_recover_secp256k1(
     let vk = VerifyingKey::recover_from_prehash(data, &sig, recovery_id)
         .map_err(|e| avm_err(format!("pubkey recover failed: {e}")))?;
 
-    let encoded = vk.to_encoded_point(false);
+    let encoded = vk.to_sec1_point(false);
     let x = encoded
         .x()
         .ok_or_else(|| avm_err("pubkey unmarshal failed"))?;
@@ -2908,7 +2908,7 @@ mod tests {
         let r = &sig_bytes[..32];
         let s = &sig_bytes[32..];
 
-        let encoded = vk.to_encoded_point(false);
+        let encoded = vk.to_sec1_point(false);
         let x = encoded.x().unwrap();
         let y = encoded.y().unwrap();
 
@@ -2941,7 +2941,7 @@ mod tests {
         let r = [0x01u8; 32]; // arbitrary non-zero R
         let s = [0x01u8; 32]; // arbitrary non-zero S
 
-        let encoded = vk.to_encoded_point(false);
+        let encoded = vk.to_sec1_point(false);
         let x = encoded.x().unwrap();
         let y = encoded.y().unwrap();
 
@@ -2999,7 +2999,7 @@ mod tests {
         let r = &sig_bytes[..32];
         let s = &sig_bytes[32..];
 
-        let encoded = vk.to_encoded_point(false);
+        let encoded = vk.to_sec1_point(false);
         let x = encoded.x().unwrap();
         let y = encoded.y().unwrap();
 
@@ -3036,7 +3036,7 @@ mod tests {
         let msg = [0x11u8; 32];
         let (sig, _recid) = sk.sign_prehash(&msg).unwrap();
         let sig_bytes = sig.to_bytes();
-        let encoded = vk.to_encoded_point(false);
+        let encoded = vk.to_sec1_point(false);
         let x = encoded.x().unwrap();
         let y = encoded.y().unwrap();
 
@@ -3081,8 +3081,8 @@ mod tests {
 
         let sk = SigningKey::from_bytes(&[5u8; 32].into()).unwrap();
         let vk = sk.verifying_key();
-        let compressed = vk.to_encoded_point(true);
-        let expected_uncompressed = vk.to_encoded_point(false);
+        let compressed = vk.to_sec1_point(true);
+        let expected_uncompressed = vk.to_sec1_point(false);
         let expected_x = expected_uncompressed.x().unwrap();
         let expected_y = expected_uncompressed.y().unwrap();
 
@@ -3113,8 +3113,8 @@ mod tests {
 
         let sk = SigningKey::from_bytes(&[5u8; 32].into()).unwrap();
         let vk = sk.verifying_key();
-        let compressed = vk.to_encoded_point(true);
-        let expected_uncompressed = vk.to_encoded_point(false);
+        let compressed = vk.to_sec1_point(true);
+        let expected_uncompressed = vk.to_sec1_point(false);
         let expected_x = expected_uncompressed.x().unwrap();
         let expected_y = expected_uncompressed.y().unwrap();
 
@@ -3171,7 +3171,7 @@ mod tests {
         let r = &sig_bytes[..32];
         let s = &sig_bytes[32..];
 
-        let expected = vk.to_encoded_point(false);
+        let expected = vk.to_sec1_point(false);
         let expected_x = expected.x().unwrap();
         let expected_y = expected.y().unwrap();
 
@@ -3228,7 +3228,7 @@ mod tests {
         let r = &sig_bytes[..32];
         let s = &sig_bytes[32..];
 
-        let expected = vk.to_encoded_point(false);
+        let expected = vk.to_sec1_point(false);
         let expected_x = expected.x().unwrap();
         let expected_y = expected.y().unwrap();
 
@@ -3336,7 +3336,7 @@ mod tests {
         // pubkey.
         use k256::ecdsa::SigningKey;
         let sk = SigningKey::from_bytes(&[7u8; 32].into()).unwrap();
-        let target = sk.verifying_key().to_encoded_point(false);
+        let target = sk.verifying_key().to_sec1_point(false);
         let target_x = target.x().unwrap().to_vec();
         let target_y = target.y().unwrap().to_vec();
 
@@ -3367,7 +3367,7 @@ mod tests {
         use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
         let sk = SigningKey::from_bytes(&[13u8; 32].into()).unwrap();
         let vk = sk.verifying_key();
-        let target = vk.to_encoded_point(false);
+        let target = vk.to_sec1_point(false);
         let target_x = target.x().unwrap().to_vec();
         let target_y = target.y().unwrap().to_vec();
 
@@ -3425,7 +3425,7 @@ mod tests {
         // (matching Go's libsecp256k1 behavior which normalizes internally).
         use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
         use k256::elliptic_curve::ops::Reduce;
-        use k256::{Scalar, U256};
+        use k256::{FieldBytes, Scalar};
 
         let sk = SigningKey::from_bytes(&[10u8; 32].into()).unwrap();
         let vk = sk.verifying_key();
@@ -3437,7 +3437,7 @@ mod tests {
         let (r_component, s_component) = sig.split_bytes();
 
         // Compute high-S: n - s (where n is the curve order)
-        let s_scalar = <Scalar as Reduce<U256>>::reduce_bytes(&s_component);
+        let s_scalar = <Scalar as Reduce<FieldBytes>>::reduce(&s_component);
         let neg_s = -s_scalar;
         let high_s_bytes = neg_s.to_bytes();
 
@@ -3446,8 +3446,8 @@ mod tests {
             &msg,
             &r_component,
             &high_s_bytes,
-            vk.to_encoded_point(false).x().unwrap(),
-            vk.to_encoded_point(false).y().unwrap(),
+            vk.to_sec1_point(false).x().unwrap(),
+            vk.to_sec1_point(false).y().unwrap(),
         );
         assert!(
             result,
@@ -3461,8 +3461,8 @@ mod tests {
 
         let sk = SigningKey::from_bytes(&[20u8; 32].into()).unwrap();
         let vk = sk.verifying_key();
-        let compressed = vk.to_encoded_point(true);
-        let expected = vk.to_encoded_point(false);
+        let compressed = vk.to_sec1_point(true);
+        let expected = vk.to_sec1_point(false);
 
         let (x, y) = ecdsa_decompress_secp256k1(compressed.as_bytes()).unwrap();
         assert_eq!(x.as_slice(), expected.x().unwrap().as_slice());
@@ -3475,8 +3475,8 @@ mod tests {
 
         let sk = SigningKey::from_bytes(&[20u8; 32].into()).unwrap();
         let vk = sk.verifying_key();
-        let compressed = vk.to_encoded_point(true);
-        let expected = vk.to_encoded_point(false);
+        let compressed = vk.to_sec1_point(true);
+        let expected = vk.to_sec1_point(false);
 
         let (x, y) = ecdsa_decompress_secp256r1(compressed.as_bytes()).unwrap();
         assert_eq!(x.as_slice(), expected.x().unwrap().as_slice());
@@ -3497,7 +3497,7 @@ mod tests {
         let s = &sig_bytes[32..];
 
         let (x, y) = ecdsa_recover_secp256k1(&msg, r, s, recid.to_byte()).unwrap();
-        let expected = vk.to_encoded_point(false);
+        let expected = vk.to_sec1_point(false);
         assert_eq!(x.as_slice(), expected.x().unwrap().as_slice());
         assert_eq!(y.as_slice(), expected.y().unwrap().as_slice());
     }
@@ -4106,7 +4106,7 @@ mod tests {
         // r == (k*G).x mod n, which works for both s and n-s.
         use p256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
         use p256::elliptic_curve::ops::Reduce;
-        use p256::{Scalar, U256};
+        use p256::{FieldBytes, Scalar};
 
         let sk = SigningKey::from_bytes(&[10u8; 32].into()).unwrap();
         let vk = sk.verifying_key();
@@ -4116,7 +4116,7 @@ mod tests {
         let (r_component, s_component) = sig.split_bytes();
 
         // Compute high-S: n - s (where n is the curve order)
-        let s_scalar = <Scalar as Reduce<U256>>::reduce_bytes(&s_component);
+        let s_scalar = <Scalar as Reduce<FieldBytes>>::reduce(&s_component);
         let neg_s = -s_scalar;
         let high_s_bytes = neg_s.to_bytes();
 
@@ -4126,8 +4126,8 @@ mod tests {
             &msg,
             &r_component,
             &high_s_bytes,
-            vk.to_encoded_point(false).x().unwrap(),
-            vk.to_encoded_point(false).y().unwrap(),
+            vk.to_sec1_point(false).x().unwrap(),
+            vk.to_sec1_point(false).y().unwrap(),
             true,
         );
         assert!(
@@ -4175,7 +4175,7 @@ mod tests {
         let vk = sk.verifying_key();
         let data = [0xa1u8; 32];
 
-        let encoded = vk.to_encoded_point(false);
+        let encoded = vk.to_sec1_point(false);
         let x = encoded.x().unwrap();
         let y = encoded.y().unwrap();
 
@@ -4207,7 +4207,7 @@ mod tests {
         let vk = sk.verifying_key();
         let data = [0xb2u8; 32];
 
-        let encoded = vk.to_encoded_point(false);
+        let encoded = vk.to_sec1_point(false);
         let x = encoded.x().unwrap();
         let y = encoded.y().unwrap();
 

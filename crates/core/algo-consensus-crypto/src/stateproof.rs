@@ -39,8 +39,8 @@ use std::collections::BTreeMap;
 
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
-use sha3::digest::{ExtendableOutput, Update, XofReader};
-use sha3::Shake256;
+use shake::digest::{ExtendableOutput, Update, XofReader};
+use shake::Shake256;
 
 use crate::merklearray::{self, GenericDigest, Hashable, MerkleError, Proof};
 use crate::merklesig;
