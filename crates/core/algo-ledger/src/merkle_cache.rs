@@ -66,13 +66,43 @@
 //! tests that don't commit) leave `lazy_loader = None`; the cache
 //! behaves as a pure in-memory store and a miss returns `Ok(None)`.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::{Arc, Mutex};
 
 use algo_error::AlgoError;
 
 use crate::merkle_page::{ChildEntry as PageChildEntry, Page, PageNode, NODES_PER_PAGE};
 use crate::merkle_trie::{Bitset, ChildEntry, TrieNode};
+
+/// Cheap multiplicative hasher for the cache's `u64` page / node-id keys
+/// (issue #1682). The std SipHash dominated the per-`add` cost: every trie
+/// level performs several map operations (`pages`, `pending_created`,
+/// `pending_dirty_pages`, LRU bookkeeping). Keys are internal sequential ids,
+/// never attacker-controlled, and no iteration order of these maps feeds the
+/// persisted bytes (std's `RandomState` already randomizes it per process).
+#[derive(Default, Clone, Copy)]
+pub(crate) struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ u64::from(b)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+    #[inline]
+    fn write_u64(&mut self, x: u64) {
+        self.0 = (self.0.rotate_left(5) ^ x).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0 ^ (self.0 >> 32)
+    }
+}
+
+type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<IdHasher>>;
+type FastSet<K> = HashSet<K, BuildHasherDefault<IdHasher>>;
 
 /// First node ID allocated by a fresh trie. Matches go-algorand's
 /// `storedNodeIdentifierBase = 0x4160` at `crypto/merkletrie/cache.go:34`.
@@ -257,7 +287,7 @@ pub struct MerkleTrieCache {
     /// `page_id -> { node_id -> TrieNode }`. The inner map is per-page so
     /// page-level operations (load, write, evict) are O(1) over the
     /// page's node count.
-    pages: HashMap<u64, HashMap<u64, TrieNode>>,
+    pages: FastMap<u64, FastMap<u64, TrieNode>>,
     /// Next node id to allocate. Begins at [`FIRST_NODE_ID`].
     next_node_id: u64,
     /// `next_node_id` at the time of the last commit. Used to decide
@@ -274,22 +304,29 @@ pub struct MerkleTrieCache {
     /// from "the page is in-memory but unchanged", AND to drive the
     /// silent-delete fast-path in [`MerkleTrieCache::delete`] for nodes
     /// that were never persisted.
-    pending_created: HashSet<u64>,
+    pending_created: FastSet<u64>,
     /// Pages with at least one created OR mutated-in-place node since the
     /// last commit. This is the commit write-set: a page is written iff
     /// it appears here. Populated by `allocate` (newly-created nodes)
     /// and `get_mut` (any in-place mutation of an already-cached node);
     /// the latter is critical for `recompute_all_hashes` writing SHA
     /// values back to pre-existing internal nodes via `get_mut`.
-    pending_dirty_pages: HashSet<u64>,
+    pending_dirty_pages: FastSet<u64>,
     /// Pages that had at least one node removed since the last commit.
     /// On commit, these become either DELETE rows (page is now empty)
     /// or UPDATE rows (page still has live nodes).
-    pending_deletion_pages: HashSet<u64>,
-    /// LRU order: front = most recently used, back = least recently used.
-    /// `evict` removes from the back until the cached node count fits.
-    pages_priority: VecDeque<u64>,
-    pages_priority_set: HashSet<u64>,
+    pending_deletion_pages: FastSet<u64>,
+    /// LRU order as `tick -> page`: the highest tick is the most recently
+    /// used page (the old deque's front), the lowest the least recently used
+    /// (its back). `evict` removes from the low end until the cached node
+    /// count fits. A tick map makes "touch" O(log n) instead of an O(pages)
+    /// deque scan on every node access (issue #1682); the eviction order is
+    /// identical to the deque it replaced.
+    pages_priority: BTreeMap<u64, u64>,
+    /// `page -> tick` (its entry in `pages_priority`).
+    pages_priority_set: FastMap<u64, u64>,
+    /// Next LRU tick; strictly increasing.
+    next_tick: u64,
     /// In-memory node count across all pages — kept in sync with
     /// `pages` mutations so `evict` doesn't have to walk every page.
     cached_node_count: usize,
@@ -363,15 +400,16 @@ impl MerkleTrieCache {
     /// Construct an empty cache with a custom eviction target.
     pub fn with_target(target: usize) -> Self {
         Self {
-            pages: HashMap::new(),
+            pages: FastMap::default(),
             next_node_id: FIRST_NODE_ID,
             last_committed_node_id: FIRST_NODE_ID,
             nodes_per_page: NODES_PER_PAGE,
-            pending_created: HashSet::new(),
-            pending_dirty_pages: HashSet::new(),
-            pending_deletion_pages: HashSet::new(),
-            pages_priority: VecDeque::new(),
-            pages_priority_set: HashSet::new(),
+            pending_created: FastSet::default(),
+            pending_dirty_pages: FastSet::default(),
+            pending_deletion_pages: FastSet::default(),
+            pages_priority: BTreeMap::new(),
+            pages_priority_set: FastMap::default(),
+            next_tick: 0,
             cached_node_count: 0,
             cached_node_count_target: target,
             lazy_loader: None,
@@ -600,7 +638,7 @@ impl MerkleTrieCache {
             return Ok(());
         }
         let decoded = Page::deserialize(&bytes)?;
-        let page_map: HashMap<u64, TrieNode> = decoded
+        let page_map: FastMap<u64, TrieNode> = decoded
             .nodes
             .into_iter()
             .map(|(nid, pn)| (nid, page_node_to_trie_node(pn)))
@@ -637,16 +675,18 @@ impl MerkleTrieCache {
             self.pages_priority.len(),
             "pages_priority_set and pages_priority must track the same page count"
         );
-        for page in &self.pages_priority {
+        for page in self.pages_priority.values() {
             assert!(
-                self.pages_priority_set.contains(page),
+                self.pages_priority_set.contains_key(page),
                 "page {page} in the LRU list is missing from the priority set"
             );
         }
 
         let pages_keys: std::collections::HashSet<u64> = self.pages.keys().copied().collect();
+        let priority_keys: std::collections::HashSet<u64> =
+            self.pages_priority_set.keys().copied().collect();
         assert_eq!(
-            pages_keys, self.pages_priority_set,
+            pages_keys, priority_keys,
             "every in-memory page must have exactly one LRU priority entry"
         );
     }
@@ -699,26 +739,21 @@ impl MerkleTrieCache {
     // -----------------------------------------------------------------------
 
     fn prioritize_front(&mut self, page: u64) {
-        if self.pages_priority_set.contains(&page) {
-            // Already in the list — move to front. O(n) over the priority
-            // list length, which is the unique-pages-in-memory count.
-            // Acceptable for the cache sizes we expect; can switch to an
-            // intrusive linked list (Go's container/list) if profiling
-            // shows this is hot.
-            if let Some(pos) = self.pages_priority.iter().position(|&p| p == page) {
-                self.pages_priority.remove(pos);
-            }
-        } else {
-            self.pages_priority_set.insert(page);
+        // Already the most recently used page: nothing to reorder.
+        if self.next_tick > 0 && self.pages_priority_set.get(&page) == Some(&(self.next_tick - 1)) {
+            return;
         }
-        self.pages_priority.push_front(page);
+        let tick = self.next_tick;
+        self.next_tick += 1;
+        if let Some(old) = self.pages_priority_set.insert(page, tick) {
+            self.pages_priority.remove(&old);
+        }
+        self.pages_priority.insert(tick, page);
     }
 
     fn remove_from_priority(&mut self, page: u64) {
-        if self.pages_priority_set.remove(&page) {
-            if let Some(pos) = self.pages_priority.iter().position(|&p| p == page) {
-                self.pages_priority.remove(pos);
-            }
+        if let Some(tick) = self.pages_priority_set.remove(&page) {
+            self.pages_priority.remove(&tick);
         }
     }
 
@@ -750,11 +785,8 @@ impl MerkleTrieCache {
         // Pin the root page at the front.
         let root_page = root_id.map(|rid| self.page_of(rid));
         if let Some(rp) = root_page {
-            if self.pages_priority_set.contains(&rp) {
-                if let Some(pos) = self.pages_priority.iter().position(|&p| p == rp) {
-                    self.pages_priority.remove(pos);
-                }
-                self.pages_priority.push_front(rp);
+            if self.pages_priority_set.contains_key(&rp) {
+                self.prioritize_front(rp);
             }
         }
 
@@ -765,13 +797,13 @@ impl MerkleTrieCache {
             // (otherwise root_hash + algorithm traversal would panic).
             // Mirrors Go's invariant at `cache.go:710-716` that the root
             // page never appears in the eviction back-pop.
-            let Some(&back_page) = self.pages_priority.back() else {
+            let Some((&back_tick, &back_page)) = self.pages_priority.first_key_value() else {
                 break;
             };
             if Some(back_page) == root_page {
                 break;
             }
-            self.pages_priority.pop_back();
+            self.pages_priority.remove(&back_tick);
             self.pages_priority_set.remove(&back_page);
             if let Some(page_map) = self.pages.remove(&back_page) {
                 self.cached_node_count -= page_map.len();
