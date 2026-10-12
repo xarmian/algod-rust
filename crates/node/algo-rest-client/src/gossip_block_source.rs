@@ -174,6 +174,8 @@ pub struct GossipBlockSourceConfig {
     pub request_timeout: Duration,
 
     /// Maximum number of peers to try per round before giving up (default: 5).
+    /// Raised to `min(peer count, 2)` when lower, so a not-available verdict
+    /// stays reachable.
     pub max_peer_attempts: usize,
 
     /// Backoff between retry attempts when polling in `wait_for_round`
@@ -185,13 +187,15 @@ pub struct GossipBlockSourceConfig {
 }
 
 impl GossipBlockSourceConfig {
-    /// Worst-case wall time of one `get_block`: every one of
-    /// `max_peer_attempts` attempts runs to `request_timeout` (peers are
-    /// tried one after another). Used to size how long a failing parallel
-    /// block fetch drains in-flight rounds (issue #1725).
+    /// Worst-case wall time of one `get_block`: every attempt runs to
+    /// `request_timeout` (peers are tried one after another). `get_block`
+    /// raises the budget to at most two attempts so a not-available verdict
+    /// is reachable (issue #1755), so that bound is used. Used to size how
+    /// long a failing parallel block fetch drains in-flight rounds
+    /// (issue #1725).
     pub fn worst_case_round_time(&self) -> Duration {
         self.request_timeout
-            .saturating_mul(u32::try_from(self.max_peer_attempts).unwrap_or(u32::MAX))
+            .saturating_mul(u32::try_from(self.max_peer_attempts.max(2)).unwrap_or(u32::MAX))
     }
 }
 
@@ -365,7 +369,10 @@ impl GossipBlockSource {
         // full configured attempt budget instead, decoupled from peer
         // count — closer to go's `catchupRetryLimit`, which is likewise
         // independent of how many peers are available.
-        let attempts = self.config.max_peer_attempts;
+        // ... but never fewer than the distinct peers the not-available
+        // verdict needs (`min(pool, 2)`), or it could never be reached
+        // (issue #1755).
+        let attempts = self.config.max_peer_attempts.max(self.peers.len().min(2));
         // A `NotFound` ("peers lack the round") is only reported when
         // `not_available_is_verdict` says so; otherwise the other failure
         // (or an explanation of the insufficient evidence) is reported.
@@ -1117,19 +1124,22 @@ mod tests {
 
     /// The rule for `NotFound`: EVERY attempt said "not available" AND at
     /// least `min(peer count, 2)` distinct peers were asked. One peer's
-    /// opinion out of a pool of two is not enough to call the round gone.
+    /// opinion out of a pool of two is not enough to call the round gone --
+    /// and the attempt budget is raised to `min(peer count, 2)` so that bar
+    /// is always reachable, even with `max_peer_attempts = 1` (issue #1755).
     #[tokio::test]
     async fn not_found_requires_min_of_peer_count_and_two_distinct_peers_asked() {
         let one_attempt = || GossipBlockSourceConfig {
             max_peer_attempts: 1,
             ..GossipBlockSourceConfig::default()
         };
-        // Two peers, one attempt: only one peer asked -> not enough.
+        // Two peers, one configured attempt: the budget is raised to two so
+        // both are asked and the verdict is reachable.
         let a: Arc<dyn UnicastPeer> = Arc::new(MockPeer::new("a:4160"));
         let b: Arc<dyn UnicastPeer> = Arc::new(MockPeer::new("b:4160"));
         let src = GossipBlockSource::with_config(vec![a, b], one_attempt());
         let err = src.get_block(Round(3)).await.unwrap_err();
-        assert!(matches!(err, AlgoError::Network { .. }), "{err:?}");
+        assert!(matches!(err, AlgoError::NotFound(_)), "{err:?}");
 
         // A pool of one peer: asking that peer is asking everyone.
         let only: Arc<dyn UnicastPeer> = Arc::new(MockPeer::new("only:4160"));
@@ -1202,6 +1212,14 @@ mod tests {
             ..GossipBlockSourceConfig::default()
         };
         assert_eq!(cfg.worst_case_round_time(), Duration::from_secs(20));
+
+        // One configured attempt is raised to two for the verdict (#1755).
+        let one = GossipBlockSourceConfig {
+            request_timeout: Duration::from_secs(4),
+            max_peer_attempts: 1,
+            ..GossipBlockSourceConfig::default()
+        };
+        assert_eq!(one.worst_case_round_time(), Duration::from_secs(8));
     }
 
     /// The "not available" text is matched structurally: a peer that wraps or
