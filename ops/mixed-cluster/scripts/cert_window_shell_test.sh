@@ -97,6 +97,30 @@ rc=$?
 check "python failure returns 2" 2 "$rc"
 case "$err" in *"cert_window.py failed: boom"*) ok "python failure is reported" ;; *) bad "python failure is reported: $err" ;; esac
 
+# 6. issue #1821: --cert-latest N clamps the cert pass to the newest N rounds of
+# the SNAPSHOT (online-account history is only retained back to tip-320, so
+# only the snapshot's own newest rounds can be re-verified post hoc).
+check "probe_latest_file reads MAX(rnd)" 2702 "$(probe_latest_file "$DB")"
+check "probe_latest_file on a missing file is empty" "" "$(probe_latest_file "$TMP/nope.sqlite")"
+
+CERT_FROM=1 CERT_TO=900
+resolve_cert_latest 1 500 1 >/dev/null
+check "latest 1 -> only the snapshot tip (from)" 500 "$CERT_FROM"
+check "latest 1 -> only the snapshot tip (to)" 500 "$CERT_TO"
+resolve_cert_latest 1 500 3 >/dev/null
+check "latest 3 from" 498 "$CERT_FROM"
+check "latest 3 to" 500 "$CERT_TO"
+resolve_cert_latest 499 500 5 >/dev/null
+check "requested --from-round is never lowered" 499 "$CERT_FROM"
+CERT_FROM=7 CERT_TO=9
+resolve_cert_latest 7 500 0 >/dev/null
+check "latest 0 leaves the range alone (from)" 7 "$CERT_FROM"
+check "latest 0 leaves the range alone (to)" 9 "$CERT_TO"
+resolve_cert_latest 1 500 x >/dev/null 2>&1
+check "non-numeric latest rejected" 2 "$?"
+resolve_cert_latest 1 "" 2 >/dev/null 2>&1
+check "unknown snapshot tip is an error, never silently unclamped" 2 "$?"
+
 if [ "$FAILS" -ne 0 ]; then
     echo "$FAILS failure(s)"
     exit 1
