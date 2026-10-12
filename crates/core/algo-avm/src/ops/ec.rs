@@ -23,6 +23,11 @@
 //!
 //! Supports four groups: BN254g1, BN254g2, BLS12-381g1, BLS12-381g2.
 //! Matches go-algorand's gnark-crypto-based implementation.
+//!
+//! num-bigint boundary: arkworks (even 0.6) depends on num-bigint 0.4 while the
+//! workspace is on 0.5 (issue #1876). Never hand a workspace `BigUint` to an
+//! arkworks API; convert through bytes (`from_be_bytes_mod_order`) or arkworks'
+//! own `FromStr`. A mismatch is a compile error, not a silent bug.
 
 use algo_error::AlgoError;
 use num_bigint::BigUint;
@@ -1164,6 +1169,13 @@ fn legendre_negative_fq2(x: BN254Fq2) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::bytecode;
+    use crate::context::NullContext;
+    use crate::machine::{AvmMachine, AvmValue, ExecMode};
+    use crate::ops::helpers::prog;
+    use crate::ops::hex_decode;
+
     /// The G2 endomorphism constants are parsed with `fq_from_dec` (panics on a
     /// malformed or non-canonical constant): exercise the whole path and check
     /// the images stay on the curve (issue #1876 review).
@@ -1177,13 +1189,6 @@ mod tests {
         let psi2_g = bn254_g2_psi(&bn254_g2_psi(&g)).into_affine();
         assert!(psi2_g.is_on_curve());
     }
-
-    use super::*;
-    use crate::bytecode;
-    use crate::context::NullContext;
-    use crate::machine::{AvmMachine, AvmValue, ExecMode};
-    use crate::ops::helpers::prog;
-    use crate::ops::hex_decode;
 
     /// Helper: step machine through N instructions.
     fn step_n(

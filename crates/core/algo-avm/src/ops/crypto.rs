@@ -1373,6 +1373,10 @@ fn be_lt(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Parse input bytes into field elements (big-endian, 32-byte chunks).
+///
+/// The 32-byte chunk width is the opcode's *encoding* (go-algorand's `mimc`
+/// consumes 32-byte big-endian words), not a property of the field: every
+/// chunk must be numerically below the field modulus, whatever its width.
 fn parse_field_elements<F: ark_ff::PrimeField>(data: &[u8]) -> Result<Vec<F>, AlgoError> {
     use ark_ff::BigInteger;
     let mut elements = Vec::with_capacity(data.len() / 32);
@@ -4527,6 +4531,18 @@ mod tests {
     /// must parse for a field whose modulus is wider than 32 bytes (BLS12-381
     /// Fq is 48 bytes) and the numeric range check must be width independent.
     #[test]
+    fn test_mimc_bls12_modulus_boundary() {
+        // BLS12-381 Fr modulus r = 0x73eda753...00000001.
+        let r_minus_1 = "73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000000";
+        let r = "73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001";
+        assert!(
+            mimc_bls12_direct(r_minus_1).is_ok(),
+            "r-1 is a valid element"
+        );
+        assert!(mimc_bls12_direct(r).is_err(), "r itself must be rejected");
+    }
+
+    #[test]
     fn test_parse_field_elements_is_width_independent() {
         use ark_bls12_381::Fq;
         let mut chunk = [0u8; 32];
@@ -4549,9 +4565,10 @@ mod tests {
         assert!(super::be_lt(&[0xff], &[1, 0]));
     }
 
-    /// The modulus boundary of the MiMC input check (issue #1876 reworked the
-    /// check to a canonical round-trip): `r - 1` is the largest valid BN254 Fr
-    /// element and `r` itself must be rejected (go: `SetBytesCanonical`).
+    /// The modulus boundary of the MiMC input check (a numeric comparison
+    /// against the field modulus, issue #1876): `r - 1` is the largest valid
+    /// BN254 Fr element and `r` itself must be rejected (go:
+    /// `SetBytesCanonical`).
     #[test]
     fn test_mimc_bn254_modulus_boundary() {
         let r_minus_1 = "30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000000";
