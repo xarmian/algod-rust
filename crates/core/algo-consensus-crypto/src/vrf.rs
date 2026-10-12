@@ -38,7 +38,7 @@
 
 use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
 use curve25519_dalek::scalar::Scalar;
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha512};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -804,7 +804,7 @@ impl VrfKeypair {
     /// `crypto/rand` — equivalent to Rust's `OsRng` via `thread_rng`).
     #[must_use]
     pub fn generate() -> Self {
-        Self::generate_with_rng(&mut rand::thread_rng())
+        Self::generate_with_rng(&mut rand::rng())
     }
 
     /// Generate a random keypair using the supplied RNG.
@@ -813,7 +813,7 @@ impl VrfKeypair {
     /// (`ed25519GenerateKeyRNG` with an explicit `crypto.RNG`). Use for
     /// deterministic testing or to plumb a `crypto.PRNG`-equivalent through.
     #[must_use]
-    pub fn generate_with_rng<R: RngCore>(rng: &mut R) -> Self {
+    pub fn generate_with_rng<R: Rng>(rng: &mut R) -> Self {
         let mut seed = [0u8; 32];
         rng.fill_bytes(&mut seed);
         Self::from_seed(seed)
@@ -1082,7 +1082,7 @@ mod tests {
 
     #[test]
     fn test_vrf_pubkey_standalone_randomized_roundtrip() {
-        use rand::{RngCore, SeedableRng};
+        use rand::{Rng, SeedableRng};
         use rand_chacha::ChaCha20Rng;
 
         let mut rng = ChaCha20Rng::seed_from_u64(0x5652_465f_0001);
@@ -1097,7 +1097,7 @@ mod tests {
 
     #[test]
     fn test_vrf_proof_standalone_randomized_roundtrip() {
-        use rand::{RngCore, SeedableRng};
+        use rand::{Rng, SeedableRng};
         use rand_chacha::ChaCha20Rng;
 
         let mut rng = ChaCha20Rng::seed_from_u64(0x5652_465f_0002);
@@ -1115,7 +1115,7 @@ mod tests {
 
     #[test]
     fn test_vrf_output_standalone_randomized_roundtrip() {
-        use rand::{RngCore, SeedableRng};
+        use rand::{Rng, SeedableRng};
         use rand_chacha::ChaCha20Rng;
 
         let mut rng = ChaCha20Rng::seed_from_u64(0x5652_465f_0003);

@@ -23,7 +23,7 @@ algo-agreement = { path = ".", features = ["test-support"] }
 hex.workspace = true
 proptest.workspace = true
 rand.workspace = true
-rand_chacha = "0.3"
+rand_chacha = "0.10"
 serde_json.workspace = true
 sha2.workspace = true
 tracing-subscriber.workspace = true

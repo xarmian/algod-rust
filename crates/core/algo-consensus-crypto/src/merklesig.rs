@@ -901,7 +901,7 @@ impl Secrets {
         let mut keys = Vec::with_capacity(number_of_keys as usize);
         for _ in 0..number_of_keys {
             let mut seed = [0u8; algo_falcon::FALCON_SEED_SIZE];
-            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed);
+            rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
 
             let (pubkey, privkey) = algo_falcon::falcon_keygen(&seed)
                 .map_err(|e| MerkleSignatureError::FalconError(e.to_string()))?;
@@ -1898,7 +1898,7 @@ mod tests {
     /// only prior coverage was indirect (as a field of `FalconSigner`).
     #[test]
     fn test_falcon_private_key_standalone_randomized_roundtrip() {
-        use rand::{RngCore, SeedableRng};
+        use rand::{Rng, SeedableRng};
         use rand_chacha::ChaCha20Rng;
 
         let mut rng = ChaCha20Rng::seed_from_u64(0x4641_4c43_0001);
@@ -1927,7 +1927,7 @@ mod tests {
     /// (`[u8; FALCON_DET1024_PUBKEY_SIZE]`).
     #[test]
     fn test_falcon_public_key_standalone_randomized_roundtrip() {
-        use rand::{RngCore, SeedableRng};
+        use rand::{Rng, SeedableRng};
         use rand_chacha::ChaCha20Rng;
 
         let mut rng = ChaCha20Rng::seed_from_u64(0x4641_4c43_0002);

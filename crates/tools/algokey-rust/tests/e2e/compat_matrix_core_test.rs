@@ -51,7 +51,7 @@ use algo_types::{Address, Round, SignedTransaction, Transaction, TxnType};
 use algo_validate::signature::verify_single_sig;
 use assert_cmd::Command as AssertCmd;
 use ed25519_dalek::SigningKey;
-use rand::RngCore;
+use rand::Rng;
 use tempfile::TempDir;
 
 use e2e::compat_framework::{go_algokey_available, skip_message, Direction, MatrixReport};
@@ -268,7 +268,7 @@ fn row_mnemonic(report: &mut MatrixReport, workdir: &Path) {
     // Rust → Go: Rust mnemonic → Go import → same address.
     {
         let mut seed = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut seed);
+        rand::rng().fill_bytes(&mut seed);
         let rust_mnemonic = key_to_mnemonic(&seed).expect("encode mnemonic");
         let rust_addr = address_for_seed(&seed);
 
@@ -396,7 +396,7 @@ async fn row_signed_txn_rekeyed(report: &mut MatrixReport, workdir: &Path, net: 
     // signature math. No on-chain submission needed (Rust verifies math).
     {
         let mut seed = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut seed);
+        rand::rng().fill_bytes(&mut seed);
         let signer_addr = address_for_seed(&seed);
         let sender = Address([0xAA; 32]); // arbitrary sender ≠ signer
 
@@ -453,7 +453,7 @@ async fn row_signed_txn_rekeyed(report: &mut MatrixReport, workdir: &Path, net: 
     //   4. Submit to algod, observe confirmation
     {
         let mut a_seed = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut a_seed);
+        rand::rng().fill_bytes(&mut a_seed);
         let a_addr = address_for_seed(&a_seed);
         let a_mnemonic = key_to_mnemonic(&a_seed).expect("encode mnemonic");
 
@@ -548,7 +548,7 @@ fn row_negative_control(report: &mut MatrixReport, workdir: &Path) {
 
     // Build, sign, then flip a byte in the signature → verify must fail.
     let mut seed = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut seed);
+    rand::rng().fill_bytes(&mut seed);
     let signer = address_for_seed(&seed);
     let mnemonic = key_to_mnemonic(&seed).unwrap();
 

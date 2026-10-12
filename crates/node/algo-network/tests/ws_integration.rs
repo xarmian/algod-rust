@@ -63,7 +63,7 @@ use algo_network::tag::Tag;
 use algo_network::WsConnectError;
 
 use ed25519_dalek::SigningKey;
-use rand::Rng;
+use rand::RngExt;
 use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
@@ -171,7 +171,7 @@ macro_rules! skip_unless_relay {
 /// Generate a random ed25519 signing key.
 fn random_signing_key() -> SigningKey {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill(&mut bytes);
+    rand::rng().fill(&mut bytes);
     SigningKey::from_bytes(&bytes)
 }
 

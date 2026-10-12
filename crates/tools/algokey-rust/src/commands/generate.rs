@@ -35,7 +35,7 @@ use std::io::Write;
 use std::process::ExitCode;
 
 use algo_consensus_crypto::key_to_mnemonic;
-use rand::RngCore;
+use rand::TryRng;
 
 use crate::cli::GenerateArgs;
 use crate::common::{address_for_seed, write_private_key, write_public_key, Seed};
@@ -52,7 +52,7 @@ pub fn run(args: GenerateArgs) -> ExitCode {
 /// `crypto/rand.Read` semantics (cryptographic randomness on every call).
 fn fresh_seed() -> Seed {
     let mut seed = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut seed);
+    rand::rngs::SysRng.try_fill_bytes(&mut seed).expect("system entropy");
     seed
 }
 

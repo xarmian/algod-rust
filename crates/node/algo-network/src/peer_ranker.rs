@@ -56,7 +56,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rand::Rng;
+use rand::RngExt;
 
 // ---------------------------------------------------------------------------
 // Rank constants (catchup/peerSelector.go lines 32-77)
@@ -542,7 +542,7 @@ impl PeerSelector for PeerRanker {
         self.refresh_available_peers();
         for pool in &self.pools {
             if !pool.peers.is_empty() {
-                let idx = rand::thread_rng().gen_range(0..pool.peers.len());
+                let idx = rand::rng().random_range(0..pool.peers.len());
                 let entry = &pool.peers[idx];
                 return Ok(PeerSelectorPeer {
                     peer_id: entry.peer_id.clone(),

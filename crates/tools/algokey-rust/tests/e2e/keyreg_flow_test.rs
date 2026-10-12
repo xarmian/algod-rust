@@ -59,7 +59,7 @@ use algo_types::{Address, SignedTransaction};
 use assert_cmd::Command as AssertCmd;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::SigningKey;
-use rand::RngCore;
+use rand::Rng;
 use tempfile::TempDir;
 
 use e2e::Localnet;
@@ -89,7 +89,7 @@ struct FreshAccount {
 
 fn generate_account() -> FreshAccount {
     let mut seed = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut seed);
+    rand::rng().fill_bytes(&mut seed);
     let pk = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
     let mnemonic = key_to_mnemonic(&seed).expect("encode mnemonic");
 

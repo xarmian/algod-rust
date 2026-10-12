@@ -143,7 +143,7 @@ fn build_online_genesis_with_proto(proto: &str) -> OnlineGenesis {
     // pure genesis-stake account (never spends) only the address (public
     // key) bytes matter.
     let mut seed = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed);
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
     let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
     let stake_address = Address(sk.verifying_key().to_bytes());
 
@@ -241,7 +241,7 @@ struct TwoVoterGenesis {
 fn build_two_voter_genesis() -> TwoVoterGenesis {
     fn make_account(first_valid: Round, last_valid: Round) -> (Address, Participation) {
         let mut seed = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
         let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
         let address = Address(sk.verifying_key().to_bytes());
         let participation = Participation::generate(

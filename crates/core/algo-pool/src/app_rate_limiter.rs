@@ -249,7 +249,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest};
 use parking_lot::Mutex;
-use rand::RngCore;
+use rand::Rng;
 
 use algo_types::{ResourceRef, SignedTransaction, TxnType};
 
@@ -410,7 +410,7 @@ impl AppRateLimiter {
             }
         };
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let seed = rng.next_u64();
         let mut salt = [0u8; 16];
         rng.fill_bytes(&mut salt);

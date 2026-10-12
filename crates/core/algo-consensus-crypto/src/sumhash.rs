@@ -32,8 +32,8 @@
 //! redistributions; that attribution is recorded here and in
 //! `docs/LICENSING.md` / `docs/LICENSING_AUDIT.md`.
 
-use sha3::digest::{ExtendableOutput, Update, XofReader};
-use sha3::Shake256;
+use shake::digest::{ExtendableOutput, Update, XofReader};
+use shake::Shake256;
 
 /// Digest size in bytes (512 bits).
 pub const SUMHASH512_DIGEST_SIZE: usize = 64;
@@ -375,7 +375,7 @@ mod tests {
     /// Test with 6000-byte SHAKE256-derived input (from Go test).
     #[test]
     fn test_sumhash512_large_input() {
-        use sha3::digest::ExtendableOutput;
+        use shake::digest::ExtendableOutput;
 
         let mut input = vec![0u8; 6000];
         let mut xof = Shake256::default();
@@ -391,7 +391,7 @@ mod tests {
     /// Test salted mode with 6000-byte input (from Go test).
     #[test]
     fn test_sumhash512_with_salt() {
-        use sha3::digest::ExtendableOutput;
+        use shake::digest::ExtendableOutput;
 
         let mut input = vec![0u8; 6000];
         let mut xof = Shake256::default();
@@ -415,7 +415,7 @@ mod tests {
     /// Test reset behavior (from Go test).
     #[test]
     fn test_sumhash512_reset() {
-        use sha3::digest::ExtendableOutput;
+        use shake::digest::ExtendableOutput;
 
         // Write some garbage first
         let mut garbage = vec![0u8; 6000];

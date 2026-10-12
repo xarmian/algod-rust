@@ -33,7 +33,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use rand::Rng;
+use rand::RngExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::errors::{HandshakeError, PeerError, WsConnectError};
@@ -95,12 +95,12 @@ impl ExponentialBackoff {
         self.current_delay = next.min(self.max_delay);
 
         if self.jitter {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             // Jitter: uniform in [0.75 * base, 1.25 * base], clamped to
             // [min_delay, max_delay].
             let lo = base.as_secs_f64() * 0.75;
             let hi = base.as_secs_f64() * 1.25;
-            let jittered = rng.gen_range(lo..=hi);
+            let jittered = rng.random_range(lo..=hi);
             let d = Duration::from_secs_f64(jittered);
             d.max(self.min_delay).min(self.max_delay)
         } else {

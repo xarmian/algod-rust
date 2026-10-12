@@ -129,11 +129,11 @@ pub async fn require_token(
 
 /// Generate a new random 64-character hex API token.
 ///
-/// Uses `rand::thread_rng()` which is backed by the ChaCha12 CSPRNG,
+/// Uses `rand::rng()` which is backed by the ChaCha12 CSPRNG,
 /// making the output suitable for cryptographic token generation.
 pub fn generate_token() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
+    use rand::RngExt;
+    let mut rng = rand::rng();
     let mut bytes = [0u8; 32];
     rng.fill(&mut bytes);
     hex::encode(bytes)

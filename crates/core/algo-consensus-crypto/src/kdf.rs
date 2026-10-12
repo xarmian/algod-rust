@@ -57,7 +57,7 @@ pub fn scrypt_key(
 ) -> Result<Vec<u8>, ScryptError> {
     let log_n =
         log2_exact(n).ok_or_else(|| ScryptError(format!("N must be a power of 2, got {n}")))?;
-    let params = scrypt::Params::new(log_n, r, p, key_len)
+    let params = scrypt::Params::new(log_n, r, p)
         .map_err(|e| ScryptError(format!("invalid scrypt params: {e}")))?;
     let mut out = vec![0u8; key_len];
     scrypt(password, salt, &params, &mut out).map_err(|e| ScryptError(format!("scrypt: {e}")))?;

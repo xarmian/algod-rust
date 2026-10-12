@@ -246,12 +246,12 @@ pub fn multisig_assemble(parts: &[MultisigSig]) -> Result<MultisigSig, Error> {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
-    use rand::RngCore;
+    use rand::rngs::SysRng;
+    use rand::TryRng;
 
     fn fresh_signer() -> (SigningKey, [u8; 32]) {
         let mut seed = [0u8; 32];
-        OsRng.fill_bytes(&mut seed);
+        SysRng.try_fill_bytes(&mut seed).expect("system entropy");
         let sk = SigningKey::from_bytes(&seed);
         let pk = sk.verifying_key().to_bytes();
         (sk, pk)

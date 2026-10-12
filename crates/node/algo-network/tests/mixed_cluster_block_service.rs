@@ -176,7 +176,7 @@ async fn test_rust_relay_forwards_messages() {
 
     // Generate a random signing key.
     let mut key_bytes = [0u8; 32];
-    rand::Rng::fill(&mut rand::thread_rng(), &mut key_bytes);
+    rand::RngExt::fill(&mut rand::rng(), &mut key_bytes);
     let signing_key = SigningKey::from_bytes(&key_bytes);
 
     let config = ConnectConfig {

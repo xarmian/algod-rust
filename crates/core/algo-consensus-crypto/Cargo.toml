@@ -14,6 +14,7 @@ serde.workspace = true
 serde_bytes.workspace = true
 sha2.workspace = true
 sha3.workspace = true
+shake.workspace = true
 thiserror.workspace = true
 rand.workspace = true
 rmp.workspace = true
@@ -26,4 +27,4 @@ scrypt.workspace = true
 [dev-dependencies]
 hex.workspace = true
 serde_json.workspace = true
-rand_chacha = "0.3"
+rand_chacha = "0.10"

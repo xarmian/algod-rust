@@ -30,7 +30,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rand::RngCore;
+use rand::TryRng;
 use subtle::ConstantTimeEq;
 
 use crate::error::{Error, Result};
@@ -86,7 +86,7 @@ pub fn get_and_validate_api_token(data_dir: &Path) -> Result<String> {
 /// hex encoding to produce a 64-char token.
 pub fn generate_api_token(data_dir: &Path) -> Result<String> {
     let mut entropy = vec![0u8; ENTROPY_LEN];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut entropy)
         .map_err(|_| Error::RandBytes)?;
     let hex_token = hex_lowercase(&entropy);

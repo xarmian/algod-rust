@@ -387,7 +387,7 @@ fn shuffle_select(mut set: Vec<String>, n: usize) -> Vec<String> {
     if set.is_empty() {
         return set;
     }
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     if n >= set.len() || n == GET_ALL_ADDRESSES {
         set.shuffle(&mut rng);
         return set;
@@ -395,7 +395,7 @@ fn shuffle_select(mut set: Vec<String>, n: usize) -> Vec<String> {
     // Partial Fisher-Yates shuffle: pick n elements.
     // This mirrors Go's shuffleSelect which does a partial shuffle.
     for i in 0..n {
-        let j = i + rand::Rng::gen_range(&mut rng, 0..set.len() - i);
+        let j = i + rand::RngExt::random_range(&mut rng, 0..set.len() - i);
         set.swap(i, j);
     }
     set.truncate(n);

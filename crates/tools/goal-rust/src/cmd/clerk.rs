@@ -532,8 +532,8 @@ pub(crate) fn parse_note(note_b64: Option<&str>, note: Option<&str>) -> Result<V
         return Ok(text.as_bytes().to_vec());
     }
     let mut buf = [0u8; 8];
-    use rand::RngCore;
-    rand::thread_rng().fill_bytes(&mut buf);
+    use rand::Rng;
+    rand::rng().fill_bytes(&mut buf);
     Ok(buf.to_vec())
 }
 

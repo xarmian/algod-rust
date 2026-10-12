@@ -172,7 +172,7 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::time::{Duration, Instant};
 
-use rand::Rng;
+use rand::RngExt;
 
 /// Errors raised while consuming or managing capacity. Mirrors go's
 /// sentinel errors (`errConManDropped`, `errFailedConsume`,
@@ -634,7 +634,7 @@ impl<C: Eq + Hash + Clone> CongestionManager<C> for RedCongestionManager<C> {
         if arrival_rate == 0.0 || self.target_rate == 0.0 {
             return false;
         }
-        let r: f64 = rand::thread_rng().gen();
+        let r: f64 = rand::rng().random();
         (arrival_rate / self.target_rate).powf(self.exp) > r
     }
 }

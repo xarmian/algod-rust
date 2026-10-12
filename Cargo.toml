@@ -84,20 +84,21 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
 # Crypto
-ed25519-dalek = { version = "2", features = ["std", "zeroize"] }
-curve25519-dalek = { version = "4", features = ["alloc"] }
-k256 = { version = "0.13", features = ["ecdsa"] }
-p256 = { version = "0.13", features = ["ecdsa"] }
-sha2 = "0.10"
-sha3 = "0.10"
+ed25519-dalek = { version = "3", features = ["zeroize"] }
+curve25519-dalek = { version = "5", features = ["alloc"] }
+k256 = { version = "0.14", features = ["ecdsa"] }
+p256 = { version = "0.14", features = ["ecdsa"] }
+sha2 = "0.11"
+sha3 = "0.12"
+shake = "0.1"
 blake2 = "0.11"
 hex = "0.4"
 serde_bytes = "0.11"
 data-encoding = "2"
 base64 = "0.23"
-scrypt = { version = "0.11", default-features = false }
+scrypt = { version = "0.12", default-features = false }
 xsalsa20poly1305 = "0.9"
-hkdf = "0.12"
+hkdf = "0.13"
 
 # Storage
 rusqlite = { version = "0.40", features = ["bundled"] }
@@ -143,11 +144,11 @@ num-traits = "0.2"
 statrs = "0.19"
 
 # Elliptic curves (for AVM ec_* opcodes)
-ark-ff = "0.5"
-ark-ec = { version = "0.5", features = ["parallel"] }
-ark-bn254 = "0.5"
-ark-bls12-381 = "0.5"
-ark-serialize = "0.5"
+ark-ff = "0.6"
+ark-ec = { version = "0.6", features = ["parallel"] }
+ark-bn254 = "0.6"
+ark-bls12-381 = "0.6"
+ark-serialize = "0.6"
 
 # System info
 sysinfo = "0.39"
@@ -162,7 +163,7 @@ zstd = "0.14"
 tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
 futures-util = "0.3"
 parking_lot = "0.12"
-rand = "0.8"
+rand = "0.10"
 zeroize = "1"
 http = "1"
 url = "2"

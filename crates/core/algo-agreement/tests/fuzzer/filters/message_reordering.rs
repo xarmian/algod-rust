@@ -49,7 +49,7 @@
 // algorithm — stable across `rand_chacha` versions, so a recorded
 // fuzz seed replays identically after dependency upgrades.
 
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 use crate::fuzzer::filter::{Filter, FilterDecision};
@@ -155,7 +155,7 @@ impl ShufflePool {
         }
 
         // Pool is over-full — pick a random resident to emit.
-        let idx = self.rng.gen_range(0..self.pool.len());
+        let idx = self.rng.random_range(0..self.pool.len());
         let displaced = self.pool.swap_remove(idx);
         FilterDecision::Substitute {
             with: vec![displaced.message],

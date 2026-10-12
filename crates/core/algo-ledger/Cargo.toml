@@ -51,7 +51,7 @@ tempfile = "3"
 serde_json = { workspace = true }
 tracing-subscriber = { workspace = true }
 rand = { workspace = true }
-rand_chacha = "0.3"
+rand_chacha = "0.10"
 
 [[bench]]
 name = "ledger_bench"

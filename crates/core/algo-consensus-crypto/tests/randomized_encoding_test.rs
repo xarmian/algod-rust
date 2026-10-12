@@ -47,7 +47,7 @@ use algo_consensus_crypto::merklesig::{
     decode_state_proof_keys, FalconSigner, FalconVerifier, Secrets, Signature, SignerContext,
     Verifier, MERKLE_SIGNATURE_SCHEME_ROOT_SIZE,
 };
-use rand::{Rng, RngCore, SeedableRng};
+use rand::{RngExt, Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use std::fmt::Debug;
 
@@ -83,7 +83,7 @@ fn assert_randomized_roundtrip<T: PartialEq + Debug>(
 // ── Random-instance generators ──────────────────────────────────────────
 
 fn gen_hash_type(rng: &mut ChaCha20Rng) -> HashType {
-    match rng.gen_range(0..4) {
+    match rng.random_range(0..4) {
         0 => HashType::Sha512_256,
         1 => HashType::Sumhash,
         2 => HashType::Sha256,
@@ -99,19 +99,19 @@ fn gen_digest(rng: &mut ChaCha20Rng) -> GenericDigest {
     // Bounded well under MAX_HASH_DIGEST_SIZE — this exercises the codec's
     // variable-length bin/nil handling, not the allocation-bound rejection
     // path (that's covered separately by the DecodeBoundExceeded tests).
-    let len = rng.gen_range(0..=MAX_HASH_DIGEST_SIZE.min(64));
+    let len = rng.random_range(0..=MAX_HASH_DIGEST_SIZE.min(64));
     let mut v = vec![0u8; len];
     rng.fill_bytes(&mut v);
     v
 }
 
 fn gen_proof(rng: &mut ChaCha20Rng) -> Proof {
-    let path_len = rng.gen_range(0..=6);
+    let path_len = rng.random_range(0..=6);
     let path = (0..path_len).map(|_| gen_digest(rng)).collect();
     Proof {
         path,
         hash_factory: gen_hash_factory(rng),
-        tree_depth: rng.gen::<u8>(),
+        tree_depth: rng.random::<u8>(),
     }
 }
 
@@ -122,18 +122,18 @@ fn gen_single_leaf_proof(rng: &mut ChaCha20Rng) -> SingleLeafProof {
 }
 
 fn gen_tree(rng: &mut ChaCha20Rng) -> Tree {
-    let num_layers = rng.gen_range(0..=3);
+    let num_layers = rng.random_range(0..=3);
     let levels = (0..num_layers)
         .map(|_| {
-            let layer_len = rng.gen_range(0..=4);
+            let layer_len = rng.random_range(0..=4);
             (0..layer_len).map(|_| gen_digest(rng)).collect()
         })
         .collect();
     Tree {
         levels,
-        num_of_elements: rng.gen::<u64>(),
+        num_of_elements: rng.random::<u64>(),
         hash: gen_hash_factory(rng),
-        is_vector_commitment: rng.gen::<bool>(),
+        is_vector_commitment: rng.random::<bool>(),
     }
 }
 
@@ -155,17 +155,17 @@ fn gen_verifier(rng: &mut ChaCha20Rng) -> Verifier {
     rng.fill_bytes(&mut commitment);
     Verifier {
         commitment,
-        key_lifetime: rng.gen::<u64>(),
+        key_lifetime: rng.random::<u64>(),
     }
 }
 
 fn gen_signature(rng: &mut ChaCha20Rng) -> Signature {
-    let sig_len = rng.gen_range(0..=64);
+    let sig_len = rng.random_range(0..=64);
     let mut signature = vec![0u8; sig_len];
     rng.fill_bytes(&mut signature);
     Signature {
         signature,
-        vector_commitment_index: rng.gen::<u64>(),
+        vector_commitment_index: rng.random::<u64>(),
         proof: gen_single_leaf_proof(rng),
         verifying_key: gen_falcon_verifier(rng),
     }
@@ -173,8 +173,8 @@ fn gen_signature(rng: &mut ChaCha20Rng) -> Signature {
 
 fn gen_signer_context(rng: &mut ChaCha20Rng) -> SignerContext {
     SignerContext {
-        first_valid: rng.gen::<u64>(),
-        key_lifetime: rng.gen::<u64>(),
+        first_valid: rng.random::<u64>(),
+        key_lifetime: rng.random::<u64>(),
         tree: gen_tree(rng),
     }
 }
@@ -307,7 +307,7 @@ fn secrets_randomized_roundtrip() {
 fn key_round_pair_randomized_roundtrip() {
     assert_randomized_roundtrip(
         0x8261_000b,
-        |rng| (rng.gen::<u64>(), gen_falcon_signer(rng)),
+        |rng| (rng.random::<u64>(), gen_falcon_signer(rng)),
         |(round, signer)| encode_key_round_pair_wire(*round, signer),
         |data| {
             let mut decoded = decode_state_proof_keys(data).unwrap();

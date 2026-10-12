@@ -1161,20 +1161,20 @@ mod tests {
     /// pair, rather than a single hand-picked scenario.
     #[test]
     fn encode_eval_delta_randomized_roundtrip() {
-        use rand::{Rng, RngCore, SeedableRng};
+        use rand::{RngExt, Rng, SeedableRng};
         use rand_chacha::ChaCha20Rng;
 
         fn gen_bytes(rng: &mut ChaCha20Rng, min_len: usize, max_len: usize) -> Vec<u8> {
-            let len = rng.gen_range(min_len.max(1)..=max_len.max(min_len.max(1)));
+            let len = rng.random_range(min_len.max(1)..=max_len.max(min_len.max(1)));
             let mut v = vec![0u8; len];
             rng.fill_bytes(&mut v);
             v
         }
 
         fn gen_teal_value(rng: &mut ChaCha20Rng) -> Option<TealValue> {
-            match rng.gen_range(0..3) {
+            match rng.random_range(0..3) {
                 0 => None,
-                1 => Some(TealValue::Uint(rng.gen())),
+                1 => Some(TealValue::Uint(rng.random())),
                 _ => Some(TealValue::Bytes(gen_bytes(rng, 1, 24))),
             }
         }
@@ -1191,7 +1191,7 @@ mod tests {
         for i in 0..ITERATIONS {
             // Build a random set of `accounts[]` addresses on the txn so
             // local-delta account indices resolve deterministically.
-            let n_accounts = rng.gen_range(0..=3);
+            let n_accounts = rng.random_range(0..=3);
             let accounts: Vec<Address> = (0..n_accounts).map(|_| gen_address(&mut rng)).collect();
             let sender = gen_address(&mut rng);
             let txn = Transaction {
@@ -1204,19 +1204,19 @@ mod tests {
                 ..Default::default()
             };
 
-            let n_global = rng.gen_range(0..=4);
+            let n_global = rng.random_range(0..=4);
             let mut global_delta = HashMap::new();
             for _ in 0..n_global {
                 global_delta.insert(gen_bytes(&mut rng, 1, 8), gen_teal_value(&mut rng));
             }
 
-            let n_local_accts = rng.gen_range(0..=(1 + accounts.len()));
+            let n_local_accts = rng.random_range(0..=(1 + accounts.len()));
             let mut local_deltas = HashMap::new();
             let mut candidates = accounts.clone();
             candidates.push(sender);
             for _ in 0..n_local_accts {
-                let addr = candidates[rng.gen_range(0..candidates.len())];
-                let n_keys = rng.gen_range(0..=3);
+                let addr = candidates[rng.random_range(0..candidates.len())];
+                let n_keys = rng.random_range(0..=3);
                 let mut per_key = HashMap::new();
                 for _ in 0..n_keys {
                     per_key.insert(gen_bytes(&mut rng, 1, 8), gen_teal_value(&mut rng));
@@ -1224,10 +1224,10 @@ mod tests {
                 local_deltas.insert(addr, per_key);
             }
 
-            let n_logs = rng.gen_range(0..=3);
+            let n_logs = rng.random_range(0..=3);
             let logs: Vec<Vec<u8>> = (0..n_logs).map(|_| gen_bytes(&mut rng, 1, 16)).collect();
 
-            let n_inner = rng.gen_range(0..=2);
+            let n_inner = rng.random_range(0..=2);
             let inner: Vec<SignedTransaction> =
                 (0..n_inner).map(|_| SignedTransaction::default()).collect();
 

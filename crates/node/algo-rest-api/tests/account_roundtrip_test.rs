@@ -35,7 +35,7 @@
 
 use std::collections::BTreeMap;
 
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 use algo_codec::canonical_encode_account_data;
 use algo_rest_api::models::account_data_to_response;
@@ -424,18 +424,18 @@ fn account_json_exclude_all_omits_resources() {
 /// harness-internal bookkeeping this crate has no use for), just enough
 /// entropy to fuzz every field `account_data_to_response` reads.
 fn random_account_data(rng: &mut impl Rng) -> AccountData {
-    let status = match rng.gen_range(0..3) {
+    let status = match rng.random_range(0..3) {
         0 => AccountStatus::Offline,
         1 => AccountStatus::Online,
         _ => AccountStatus::NotParticipating,
     };
 
-    let has_participation = status == AccountStatus::Online && rng.gen_bool(0.7);
+    let has_participation = status == AccountStatus::Online && rng.random_bool(0.7);
     let (vote_id, selection_id, state_proof_id) = if has_participation {
         (
             Some(random_32(rng)),
             Some(random_32(rng)),
-            if rng.gen_bool(0.5) {
+            if rng.random_bool(0.5) {
                 Some(random_64(rng))
             } else {
                 None
@@ -445,35 +445,35 @@ fn random_account_data(rng: &mut impl Rng) -> AccountData {
         (None, None, None)
     };
 
-    let num_assets = rng.gen_range(0..4usize);
+    let num_assets = rng.random_range(0..4usize);
     let mut assets = BTreeMap::new();
     for i in 0..num_assets {
         assets.insert(
             100 + i as u64,
             AssetHolding {
-                amount: rng.gen_range(0..1_000_000_000u64),
-                frozen: rng.gen_bool(0.3),
+                amount: rng.random_range(0..1_000_000_000u64),
+                frozen: rng.random_bool(0.3),
             },
         );
     }
 
-    let num_created_assets = rng.gen_range(0..3usize);
+    let num_created_assets = rng.random_range(0..3usize);
     let mut asset_params = BTreeMap::new();
     for i in 0..num_created_assets {
         asset_params.insert(
             200 + i as u64,
             AssetParams {
-                total: rng.gen_range(1..1_000_000_000u64),
-                decimals: rng.gen_range(0..19u32),
+                total: rng.random_range(1..1_000_000_000u64),
+                decimals: rng.random_range(0..19u32),
                 unit_name: format!("U{i}").into_bytes(),
                 asset_name: format!("Asset {i}").into_bytes(),
                 url: format!("https://example.com/{i}").into_bytes(),
-                metadata_hash: if rng.gen_bool(0.5) {
+                metadata_hash: if rng.random_bool(0.5) {
                     Some(random_32(rng))
                 } else {
                     None
                 },
-                manager: if rng.gen_bool(0.7) {
+                manager: if rng.random_bool(0.7) {
                     Some(random_address(rng))
                 } else {
                     None
@@ -481,16 +481,16 @@ fn random_account_data(rng: &mut impl Rng) -> AccountData {
                 reserve: None,
                 freeze: None,
                 clawback: None,
-                default_frozen: rng.gen_bool(0.2),
+                default_frozen: rng.random_bool(0.2),
             },
         );
     }
 
-    let num_apps = rng.gen_range(0..3usize);
+    let num_apps = rng.random_range(0..3usize);
     let mut app_local_states = BTreeMap::new();
     for i in 0..num_apps {
         let mut key_value = BTreeMap::new();
-        key_value.insert(vec![b'k', i as u8], TealValue::Uint(rng.gen()));
+        key_value.insert(vec![b'k', i as u8], TealValue::Uint(rng.random()));
         app_local_states.insert(
             300 + i as u64,
             AppLocalState {
@@ -503,7 +503,7 @@ fn random_account_data(rng: &mut impl Rng) -> AccountData {
         );
     }
 
-    let num_created_apps = rng.gen_range(0..3usize);
+    let num_created_apps = rng.random_range(0..3usize);
     let mut app_params = BTreeMap::new();
     for i in 0..num_created_apps {
         app_params.insert(
@@ -515,24 +515,24 @@ fn random_account_data(rng: &mut impl Rng) -> AccountData {
                 global_state: BTreeMap::new(),
                 local_state_schema: StateSchema::default(),
                 global_state_schema: StateSchema::default(),
-                extra_program_pages: rng.gen_range(0..3u32),
+                extra_program_pages: rng.random_range(0..3u32),
                 ..Default::default()
             },
         );
     }
 
     AccountData {
-        micro_algos: rng.gen_range(0..100_000_000_000u64),
-        rewards_base: rng.gen_range(0..1000u64),
-        rewarded_micro_algos: rng.gen_range(0..1_000_000u64),
+        micro_algos: rng.random_range(0..100_000_000_000u64),
+        rewards_base: rng.random_range(0..1000u64),
+        rewarded_micro_algos: rng.random_range(0..1_000_000u64),
         status,
         vote_id,
         selection_id,
         state_proof_id,
-        vote_first_valid: rng.gen_range(0..1_000_000u64),
-        vote_last_valid: rng.gen_range(0..2_000_000u64),
-        vote_key_dilution: rng.gen_range(1..1000u64),
-        auth_addr: if rng.gen_bool(0.2) {
+        vote_first_valid: rng.random_range(0..1_000_000u64),
+        vote_last_valid: rng.random_range(0..2_000_000u64),
+        vote_key_dilution: rng.random_range(1..1000u64),
+        auth_addr: if rng.random_bool(0.2) {
             Some(random_address(rng))
         } else {
             None
@@ -541,7 +541,7 @@ fn random_account_data(rng: &mut impl Rng) -> AccountData {
         total_created_assets: asset_params.len() as u64,
         total_apps_opted_in: app_local_states.len() as u64,
         total_created_apps: app_params.len() as u64,
-        incentive_eligible: rng.gen_bool(0.3),
+        incentive_eligible: rng.random_bool(0.3),
         assets,
         asset_params,
         app_local_states,
@@ -589,7 +589,7 @@ fn account_data_to_response_random_fuzz_is_deterministic_and_consistent() {
         let addr = random_address(&mut rng);
         let lookup = AccountLookup {
             account_data: data.clone(),
-            last_round: rng.gen_range(1..10_000_000u64),
+            last_round: rng.random_range(1..10_000_000u64),
             amount_without_pending_rewards: data.micro_algos,
             assets: data.assets.clone(),
             created_assets: data.asset_params.clone(),
