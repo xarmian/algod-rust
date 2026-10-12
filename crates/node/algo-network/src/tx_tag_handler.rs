@@ -108,7 +108,7 @@
 //!    reencoded)` check (`:824-834`). In go this check is wired into the
 //!    libp2p/P2P entry point *only* — `processIncomingTxn` (WS-gossip)
 //!    never performs it (confirmed by re-reading `data/txHandler.go` at
-//!    the pinned `v5.0.2-stable`: `processIncomingTxn` decodes, dedups,
+//!    the pinned `v5.0.3-stable`: `processIncomingTxn` decodes, dedups,
 //!    app-rate-limits, and enqueues, with no `reencode`/`bytes.Equal`
 //!    call anywhere on that path).
 //!
@@ -1009,7 +1009,7 @@ impl TxTagHandler {
     /// `validateIncomingTxMessage` — the libp2p/P2P transport entry
     /// point *only*. go's WS-gossip entry point (`processIncomingTxn`)
     /// never performs this check at all (confirmed against
-    /// `data/txHandler.go` at the pinned `v5.0.2-stable`), so callers
+    /// `data/txHandler.go` at the pinned `v5.0.3-stable`), so callers
     /// registering a `TxTagHandler` on a WS-gossip transport must leave
     /// this unset (the default from [`Self::new`]) to stay in parity.
     ///
@@ -3231,7 +3231,7 @@ mod canonical_cache_wiring_tests {
     /// `processIncomingTxn` (the WS-gossip entry point), which never
     /// performs the `reencode`/`bytes.Equal` comparison at all
     /// (confirmed against `data/txHandler.go` at the pinned
-    /// `v5.0.2-stable`: only `validateIncomingTxMessage`, the P2P entry
+    /// `v5.0.3-stable`: only `validateIncomingTxMessage`, the P2P entry
     /// point, does). Pins the issue #1645 root-cause fix: a live
     /// `mainnet-node-soak.yml` dispatch (run 36441463837) showed a real
     /// mainnet WS-gossip relay's traffic tripping the previously

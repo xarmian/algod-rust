@@ -66,7 +66,7 @@ const MAX_BLOCK_BYTES: usize = 10 << 20;
 /// `crates/node/algo-network/src/connect.rs`'s `USER_AGENT` (the P2P/gossip
 /// WebSocket handshake's equivalent header) uses the same scheme — update
 /// both together.
-const USER_AGENT_VALUE: &str = concat!("algod-rust/5.0.2 (", env!("ALGO_BUILD_GIT_TAG"), ")");
+const USER_AGENT_VALUE: &str = concat!("algod-rust/5.0.3 (", env!("ALGO_BUILD_GIT_TAG"), ")");
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -409,7 +409,7 @@ mod tests {
     fn user_agent_value_has_app_version_and_build_ref() {
         // "algod-rust/<go-algorand parity version> (<short git ref>)".
         assert!(
-            USER_AGENT_VALUE.starts_with("algod-rust/5.0.2 ("),
+            USER_AGENT_VALUE.starts_with("algod-rust/5.0.3 ("),
             "unexpected USER_AGENT_VALUE: {USER_AGENT_VALUE}"
         );
         assert!(
@@ -417,7 +417,7 @@ mod tests {
             "unexpected USER_AGENT_VALUE: {USER_AGENT_VALUE}"
         );
         let git_ref = USER_AGENT_VALUE
-            .strip_prefix("algod-rust/5.0.2 (")
+            .strip_prefix("algod-rust/5.0.3 (")
             .and_then(|s| s.strip_suffix(')'))
             .unwrap();
         assert!(!git_ref.is_empty(), "git ref must not be empty");

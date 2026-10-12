@@ -281,7 +281,7 @@ Only a `stuck` or `node_failure` verdict files anything
 halted round; if found, it comments with the new run's link instead of
 opening a duplicate. Otherwise it creates one from
 `ops/mainnet-soak/issue_template.md`, labelled `bug`, `sync`,
-`conformance`, `mainnet-soak`, `algod:v5.0.2-stable`, `effort:medium`,
+`conformance`, `mainnet-soak`, `algod:v5.0.3-stable`, `effort:medium`,
 with the offline reproduction command
 (`algod-rust replay --network mainnet --start <N-1> --end <N> --compare`)
 and links to the run and its artifacts.
@@ -434,7 +434,7 @@ exit code `1`. Feeding that verdict through `file_issue.py --dry-run`
 with no pre-existing issue printed the exact would-be title
 (`sync: mainnet participation node halted at round 65409680 — nightly
 mainnet soak 2026-09-26`), the full label set
-(`bug, sync, conformance, mainnet-soak, algod:v5.0.2-stable,
+(`bug, sync, conformance, mainnet-soak, algod:v5.0.3-stable,
 effort:medium`), and a body rendered from `issue_template.md` with the
 round/phase/stalled-minutes/log-excerpt fields correctly substituted —
 `{"action": "dry_run_create", ...}`.

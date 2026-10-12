@@ -24,7 +24,7 @@
 //! A block stores each transaction as a `SignedTxnInBlock`: the header
 //! carries the genesis id/hash once and the per-transaction copies are
 //! stripped. go re-adds them in `BlockHeader.DecodeSignedTxn`
-//! (`data/bookkeeping/block.go:983-1020`, go-algorand v5.0.2-stable):
+//! (`data/bookkeeping/block.go:983-1020`, go-algorand v5.0.3-stable):
 //!
 //! * `GenesisID` is restored from the header **only** when the txn's
 //!   `HasGenesisID` (`hgi`) flag is set (an empty `gen` is otherwise a
@@ -186,7 +186,7 @@ pub fn reject_in_block_flags_one(
 }
 
 /// Why a payset entry is malformed for go's `BlockHeader.DecodeSignedTxn`
-/// (`data/bookkeeping/block.go:983-1020`, v5.0.2-stable).
+/// (`data/bookkeeping/block.go:983-1020`, v5.0.3-stable).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GenesisFieldError {
     /// The stripped txn still carries a non-empty `gen` (go: `GenesisID <%s> not empty`).
