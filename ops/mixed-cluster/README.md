@@ -684,3 +684,29 @@ Everything TASK-86 originally deferred has since shipped:
 Note that `docker/docker-compose.mixed-cluster.yml` is a *different*
 harness serving a different purpose — gossip / catchup interop testing
 (`make mixed-cluster-*`), not consensus agreement.
+
+## Late-joining online account (issue #1821)
+
+`scripts/late_join.py` exercises the balance-lookback policy of
+`LookupAgreement` (#1809/#1820) on the live cluster. On a running cluster it
+creates a fresh account, funds it with a slice of the supply (`--percent`,
+default 10), installs a participation key on go-node-1 and goes online, then
+waits for the *activation round* (keyreg round + `2 * SeedRefreshInterval *
+SeedLookback`, 320 by default) plus a margin and reports how many `VoteAccepted`
+records the Go nodes logged for the account before and after activation (must be
+0 before, > 0 after: the lookback rule seen from the Go side).
+
+```bash
+ops/mixed-cluster/scripts/start.sh
+python3 ops/mixed-cluster/scripts/late_join.py --out late_join.json
+# decisive check: Go certificates carrying the joiner's votes must verify under
+# the Rust verifier and the go-algorand verifier
+ops/mixed-cluster/scripts/verify-soak.sh --from-round <activation_round> --stride 1     --rust-account <account> --min-rust-vote-rounds 1
+```
+
+Known limitation: the verify-soak step reads the Rust node's ledger after the
+fact, and the Rust `onlineaccounts` history is retained for ~320 rounds
+(go keeps ~640), so on a run whose tip is past the activation round + ~130 the
+cert checks fail for an unrelated reason (issue #1854). Run the verify step
+as soon as the margin has passed, or after #1854 lands. Unit tests:
+`python3 ops/mixed-cluster/scripts/late_join_test.py`.
