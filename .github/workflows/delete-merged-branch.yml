@@ -56,7 +56,26 @@ jobs:
             exit 0
           fi
 
-          # Any other failure (403 permissions, 422 protected, ...) must fail
-          # the job so a silently surviving branch is visible.
-          gh api -X DELETE "repos/${REPO}/git/refs/heads/${ENC}"
-          echo "deleted ${BRANCH}"
+          # A branch other open PRs are stacked on must survive: deleting it
+          # would close those PRs unmerged (GitHub does not retarget them).
+          STACKED="$(gh pr list --repo "$REPO" --base "$BRANCH" --state open --json number --jq 'length')"
+          if [ "${STACKED:-0}" != "0" ]; then
+            echo "${BRANCH} is the base of ${STACKED} open PR(s): keeping it"
+            exit 0
+          fi
+
+          # 422 "Reference does not exist" = removed concurrently (e.g. by
+          # `gh pr merge --delete-branch`); a 422 about protection/rulesets
+          # means "keep". Anything else (403 permissions, 5xx) fails the job
+          # so a silently surviving branch stays visible.
+          if gh api -X DELETE "repos/${REPO}/git/refs/heads/${ENC}" 2>/tmp/err; then
+            echo "deleted ${BRANCH}"
+          elif grep -qiE 'Reference does not exist|HTTP 404' /tmp/err; then
+            echo "${BRANCH} already deleted"
+          elif grep -qiE 'protected|ruleset|rule violations|Cannot delete' /tmp/err; then
+            echo "${BRANCH} is protected by a rule: keeping it"
+            cat /tmp/err
+          else
+            cat /tmp/err
+            exit 1
+          fi
