@@ -434,7 +434,7 @@ impl MerkleTrie {
             return Ok(false);
         }
 
-        let new_root = self.node_add(root_id, element, &[])?;
+        let new_root = self.node_add(root_id, element, &mut Vec::new())?;
         // PLAN-144 TASK-149: `node_add` now refurbishes the old root
         // internally (via `MerkleTrieCache::refurbish`), which both
         // recycles the id AND records the old slot as removed. No
@@ -638,7 +638,8 @@ impl MerkleTrie {
 
     fn recompute_all_hashes(&mut self, root_id: u64) -> Result<(), AlgoError> {
         let mut path: Vec<u8> = Vec::new();
-        self.recompute_hash_at(root_id, &mut path)
+        let mut acc: Vec<u8> = Vec::new();
+        self.recompute_hash_at(root_id, &mut path, &mut acc)
     }
 
     /// Recompute `node_id`'s hash (and, recursively, any hash-stale
@@ -664,77 +665,80 @@ impl MerkleTrie {
     /// never a superset, of the unpruned traversal, so it cannot change
     /// which nodes get hashed, only how many redundant re-visits are
     /// skipped once some prefix of the trie has already been committed.
-    fn recompute_hash_at(&mut self, node_id: u64, path: &mut Vec<u8>) -> Result<(), AlgoError> {
-        let is_leaf = self
+    fn recompute_hash_at(
+        &mut self,
+        node_id: u64,
+        path: &mut Vec<u8>,
+        acc: &mut Vec<u8>,
+    ) -> Result<(), AlgoError> {
+        // Issue #1682: no per-node allocations. The children list is moved
+        // out of the node for the duration (instead of snapshotting a
+        // `Vec<(u8, u64)>`), and the accumulator / digest buffer is a single
+        // scratch Vec shared across the whole traversal (it is only filled
+        // after every descendant has been hashed, so recursion never
+        // observes it mid-use). The node's existing hash Vec is reused.
+        let node = self
             .cache
-            .get(node_id)?
-            .ok_or_else(|| missing_node(node_id))?
-            .is_leaf();
-        if is_leaf {
+            .get_mut(node_id)?
+            .ok_or_else(|| missing_node(node_id))?;
+        if node.is_leaf() {
             // Leaves never recompute — their `hash` is the element remainder
             // (or full element for a single-leaf root) and is set at
             // construction time.
             return Ok(());
         }
+        let children = std::mem::take(&mut node.children);
 
-        // Snapshot child descriptors so we can release the cache borrow
-        // before recursing (each recursive call needs `&mut self.cache`).
-        let child_descriptors: Vec<(u8, u64)> = self
-            .cache
-            .get(node_id)?
-            .ok_or_else(|| missing_node(node_id))?
-            .children
-            .iter()
-            .map(|c| (c.hash_index, c.child_id))
-            .collect();
-        for (hi, cid) in &child_descriptors {
-            if !self.cache.is_pending_created(*cid) {
-                // Unchanged since the last commit — its hash is already
-                // correct; don't recurse (this is the O(N²)-avoidance
-                // pruning described above).
-                continue;
+        let mut walk = || -> Result<(), AlgoError> {
+            for c in &children {
+                if !self.cache.is_pending_created(c.child_id) {
+                    // Unchanged since the last commit — its hash is already
+                    // correct; don't recurse (O(N^2)-avoidance pruning).
+                    continue;
+                }
+                path.push(c.hash_index);
+                let r = self.recompute_hash_at(c.child_id, path, acc);
+                path.pop();
+                r?;
             }
-            path.push(*hi);
-            self.recompute_hash_at(*cid, path)?;
-            path.pop();
-        }
 
-        // Compose the accumulator. Format mirrors Go `node.calculateHash`:
-        //   byte(len(path)) || path
-        //   for each child in order:
-        //     byte(0) if leaf else byte(1)
-        //     byte(len(child.hash))
-        //     child.hash_index
-        //     child.hash bytes
-        let mut acc: Vec<u8> = Vec::new();
-        debug_assert!(path.len() <= 255);
-        acc.push(path.len() as u8);
-        acc.extend_from_slice(path);
-
-        for (hi, cid) in &child_descriptors {
-            // Re-borrow per iteration so the cache mutation from any
-            // prior get's lazy-load is visible.
-            let child = self.cache.get(*cid)?.ok_or_else(|| missing_node(*cid))?;
-            if child.is_leaf() {
-                acc.push(0x00);
-            } else {
-                acc.push(0x01);
+            // Compose the accumulator. Format mirrors Go `node.calculateHash`:
+            //   byte(len(path)) || path
+            //   for each child in order:
+            //     byte(0) if leaf else byte(1)
+            //     byte(len(child.hash))
+            //     child.hash_index
+            //     child.hash bytes
+            acc.clear();
+            debug_assert!(path.len() <= 255);
+            acc.push(path.len() as u8);
+            acc.extend_from_slice(path);
+            for c in &children {
+                let child = self
+                    .cache
+                    .get(c.child_id)?
+                    .ok_or_else(|| missing_node(c.child_id))?;
+                acc.push(if child.is_leaf() { 0x00 } else { 0x01 });
+                debug_assert!(child.hash.len() <= 255);
+                acc.push(child.hash.len() as u8);
+                acc.push(c.hash_index);
+                acc.extend_from_slice(&child.hash);
             }
-            debug_assert!(child.hash.len() <= 255);
-            acc.push(child.hash.len() as u8);
-            acc.push(*hi);
-            acc.extend_from_slice(&child.hash);
-        }
+            Ok(())
+        };
+        let walked = walk();
 
-        let mut hasher = Sha512_256::new();
-        hasher.update(&acc);
-        let result = hasher.finalize();
-
+        // Always restore the children (also on error) before propagating.
         let node = self
             .cache
             .get_mut(node_id)?
             .ok_or_else(|| missing_node(node_id))?;
-        node.hash = result.to_vec();
+        node.children = children;
+        walked?;
+
+        let result = Sha512_256::digest(&*acc);
+        node.hash.clear();
+        node.hash.extend_from_slice(&result);
         Ok(())
     }
 
@@ -743,34 +747,25 @@ impl MerkleTrie {
     // -----------------------------------------------------------------------
 
     fn node_find(&mut self, node_id: u64, d: &[u8]) -> Result<bool, AlgoError> {
-        // Snapshot the data we need from the node, then release the
-        // borrow before recursing — the recursive call also needs
-        // `&mut self.cache`.
-        let (is_leaf, leaf_hash, bit_set, child_id_opt) = {
+        // Walk iteratively; each step borrows the cache only long enough to
+        // read what it needs (no per-level clone).
+        let mut node_id = node_id;
+        let mut d = d;
+        loop {
             let node = self
                 .cache
                 .get(node_id)?
                 .ok_or_else(|| missing_node(node_id))?;
             if node.is_leaf() {
-                (true, Some(node.hash.clone()), false, None)
-            } else if d.is_empty() {
-                // Shouldn't happen with fixed-length elements; guard anyway.
-                (false, None, false, None)
-            } else if !node.children_mask.bit(d[0]) {
-                (false, None, false, None)
-            } else {
-                let idx = node.index_of(d[0]);
-                (false, None, true, Some(node.children[idx].child_id))
+                return Ok(d == node.hash.as_slice());
             }
-        };
-
-        if is_leaf {
-            return Ok(d == leaf_hash.as_deref().unwrap_or(&[]));
+            // Shouldn't happen with fixed-length elements; guard anyway.
+            if d.is_empty() || !node.children_mask.bit(d[0]) {
+                return Ok(false);
+            }
+            node_id = node.children[node.index_of(d[0])].child_id;
+            d = &d[1..];
         }
-        if d.is_empty() || !bit_set {
-            return Ok(false);
-        }
-        self.node_find(child_id_opt.unwrap(), &d[1..])
     }
 
     // -----------------------------------------------------------------------
@@ -782,14 +777,26 @@ impl MerkleTrie {
     // root pointer).
     // -----------------------------------------------------------------------
 
-    fn node_add(&mut self, node_id: u64, d: &[u8], path: &[u8]) -> Result<u64, AlgoError> {
-        let node = self
-            .cache
-            .get(node_id)?
-            .ok_or_else(|| missing_node(node_id))?
-            .clone();
+    fn node_add(&mut self, node_id: u64, d: &[u8], path: &mut Vec<u8>) -> Result<u64, AlgoError> {
+        // Read only what this level needs instead of cloning the whole node
+        // (its `children` Vec in particular) on every descent — issue #1682.
+        let (leaf_hash, child): (Option<Vec<u8>>, Option<(usize, u64)>) = {
+            let node = self
+                .cache
+                .get(node_id)?
+                .ok_or_else(|| missing_node(node_id))?;
+            if node.is_leaf() {
+                (Some(node.hash.clone()), None)
+            } else if node.children_mask.bit(d[0]) {
+                let idx = node.index_of(d[0]);
+                (None, Some((idx, node.children[idx].child_id)))
+            } else {
+                (None, None)
+            }
+        };
 
-        if node.is_leaf() {
+        if let Some(leaf_hash) = leaf_hash {
+            let node = TrieNode::leaf(leaf_hash);
             // Find the first byte where this leaf's remainder and the new
             // element's bytes-from-here diverge.
             let mut idiff = 0usize;
@@ -875,7 +882,7 @@ impl MerkleTrie {
         }
 
         // Non-leaf: branch on d[0].
-        if !node.children_mask.bit(d[0]) {
+        let Some((child_idx, cur_child_id)) = child else {
             // No existing child at d[0]: insert a new leaf and refurbish
             // this internal node's id. Mirrors Go's no-existing-child
             // case at `node.go:162-181`: allocate the new leaf, then
@@ -905,20 +912,19 @@ impl MerkleTrie {
                     },
                 );
                 parent.children_mask.set_bit(d[0]);
-                parent.hash = path.to_vec();
+                parent.hash.clear();
+                parent.hash.extend_from_slice(path);
             }
             return Ok(self.refurbish_node(node_id));
-        }
+        };
 
         // Existing child at d[0]: recurse, mutate this node's child
         // entry, then refurbish. Mirrors Go's existing-child branch at
         // `node.go:184-217`.
-        let child_idx = node.index_of(d[0]);
-        let cur_child_id = node.children[child_idx].child_id;
-        let mut sub_path = Vec::with_capacity(path.len() + 1);
-        sub_path.extend_from_slice(path);
-        sub_path.push(d[0]);
-        let updated_child_id = self.node_add(cur_child_id, &d[1..], &sub_path)?;
+        path.push(d[0]);
+        let res = self.node_add(cur_child_id, &d[1..], path);
+        path.pop();
+        let updated_child_id = res?;
 
         // PLAN-144 TASK-149: in-place update + refurbish.
         {
@@ -927,7 +933,8 @@ impl MerkleTrie {
                 .get_mut(node_id)?
                 .ok_or_else(|| missing_node(node_id))?;
             parent.children[child_idx].child_id = updated_child_id;
-            parent.hash = path.to_vec();
+            parent.hash.clear();
+            parent.hash.extend_from_slice(path);
         }
         Ok(self.refurbish_node(node_id))
     }
