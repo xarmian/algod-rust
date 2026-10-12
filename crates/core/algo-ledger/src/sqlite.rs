@@ -809,7 +809,7 @@ fn vref_bytes<'a>(v: &rmpv::ValueRef<'a>) -> Option<&'a [u8]> {
     }
 }
 
-fn decode_account_data(data: &[u8]) -> Result<AccountData, AlgoError> {
+pub(crate) fn decode_account_data(data: &[u8]) -> Result<AccountData, AlgoError> {
     // Borrowed decode (`ValueRef`): no per-key/per-value allocation, which
     // matters for scans over every online account (issue #1817).
     let val: rmpv::ValueRef<'_> =
@@ -957,7 +957,7 @@ fn to_base_online_account_data(acct: &AccountData) -> algo_codec::BaseOnlineAcco
 /// means offline" convention `record_online_account_history` and Go's own
 /// `onlineAccountsNewRoundImpl` both use), so this reconstructs `status`
 /// from that rather than persisting it as a field.
-fn decode_online_account_data(data: &[u8]) -> Result<AccountData, AlgoError> {
+pub(crate) fn decode_online_account_data(data: &[u8]) -> Result<AccountData, AlgoError> {
     let base =
         crate::catchpoint::msgp_compat::decode_base_online_account_data(data).map_err(|e| {
             AlgoError::Ledger {
@@ -2273,6 +2273,9 @@ pub struct SqliteLedger {
     /// snapshot connections for point-in-time account lookups without holding
     /// the main ledger mutex.
     db_prefix: Option<std::path::PathBuf>,
+    /// Lock-free committed-state reader over the same tracker + block files
+    /// (issue #1764); `None` for in-memory ledgers. See [`crate::read_pool`].
+    read_pool: Option<std::sync::Arc<crate::read_pool::LedgerReadPool>>,
     /// In-memory lease table (leases are short-lived, no persistence needed).
     lease_table: LeaseTable,
     /// Snapshot of `lease_table` taken at `begin_block`, restored by
@@ -2730,7 +2733,19 @@ impl SqliteLedger {
         // not fail with `database is locked` (issue #1819). The node calls
         // [`Self::upgrade_legacy_online_history`] at startup and
         // `begin_block` runs it before the first block otherwise.
-        Self::init(conn, prefix)
+        let mut ledger = Self::init(conn, prefix)?;
+        ledger.read_pool = Some(std::sync::Arc::new(crate::read_pool::LedgerReadPool::new(
+            tracker_path.to_path_buf(),
+            block_path.to_path_buf(),
+        )));
+        Ok(ledger)
+    }
+
+    /// Lock-free committed-state reader over this ledger's files (issue
+    /// #1764), or `None` for an in-memory ledger. The `Arc` can be used
+    /// without holding the ledger mutex.
+    pub fn read_pool(&self) -> Option<std::sync::Arc<crate::read_pool::LedgerReadPool>> {
+        self.read_pool.clone()
     }
 
     /// Upgrade path for a database synced before the `onlineaccounts` history
@@ -3124,6 +3139,7 @@ impl SqliteLedger {
         Ok(Self {
             conn,
             db_prefix,
+            read_pool: None,
             lease_table: LeaseTable::new(),
             lease_snapshot: None,
             chain_snapshot: None,
@@ -16725,6 +16741,7 @@ mod tests {
         let SqliteLedger {
             conn: _,
             db_prefix: _,
+            read_pool: _, // separate read-only connections, no chain state
             lease_table: _, // restored via lease_snapshot
             lease_snapshot: _,
             chain_snapshot: _,
