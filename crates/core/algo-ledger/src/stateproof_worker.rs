@@ -520,7 +520,7 @@ pub mod db {
         conn.execute(
             "INSERT INTO sigs (sprnd, signer, sig, from_this_node) VALUES (?1, ?2, ?3, ?4)",
             params![
-                round,
+                round as i64,
                 psig.signer.0.as_slice(),
                 psig.sig.to_msgpack(),
                 psig.from_this_node,
@@ -531,7 +531,7 @@ pub mod db {
 
     /// Matches go's `deletePendingSigsBeforeRound` (`db.go:112`).
     pub fn delete_pending_sigs_before_round(conn: &Connection, round: u64) -> rusqlite::Result<()> {
-        conn.execute("DELETE FROM sigs WHERE sprnd < ?1", params![round])?;
+        conn.execute("DELETE FROM sigs WHERE sprnd < ?1", params![round as i64])?;
         Ok(())
     }
 
@@ -543,7 +543,7 @@ pub mod db {
     ) -> rusqlite::Result<bool> {
         let exists: i64 = conn.query_row(
             "SELECT EXISTS (SELECT 1 FROM sigs WHERE signer = ?1 AND sprnd = ?2)",
-            params![account.0.as_slice(), round],
+            params![account.0.as_slice(), round as i64],
             |row| row.get(0),
         )?;
         Ok(exists != 0)
@@ -587,8 +587,8 @@ pub mod db {
             query.push_str(" AND from_this_node = 1");
         }
         let mut stmt = conn.prepare(&query)?;
-        let rows = stmt.query_map(params![threshold, max_round], |row| {
-            let rnd: u64 = row.get(0)?;
+        let rows = stmt.query_map(params![threshold as i64, max_round as i64], |row| {
+            let rnd = row.get::<_, i64>(0)? as u64;
             let signer: Vec<u8> = row.get(1)?;
             let sigbuf: Vec<u8> = row.get(2)?;
             let from_this_node: bool = row.get(3)?;
@@ -612,7 +612,7 @@ pub mod db {
     ) -> rusqlite::Result<Vec<PendingSig>> {
         let mut stmt =
             conn.prepare("SELECT signer, sig, from_this_node FROM sigs WHERE sprnd = ?1")?;
-        let rows = stmt.query_map(params![round], |row| {
+        let rows = stmt.query_map(params![round as i64], |row| {
             let signer: Vec<u8> = row.get(0)?;
             let sigbuf: Vec<u8> = row.get(1)?;
             let from_this_node: bool = row.get(2)?;
@@ -635,7 +635,9 @@ pub mod db {
     ) -> rusqlite::Result<Vec<u64>> {
         let mut stmt =
             conn.prepare("SELECT DISTINCT sprnd FROM sigs WHERE (sprnd <= ?1 OR sprnd = ?2)")?;
-        let rows = stmt.query_map(params![threshold, max_round], |row| row.get::<_, u64>(0))?;
+        let rows = stmt.query_map(params![threshold as i64, max_round as i64], |row| {
+            row.get::<_, i64>(0).map(|v| v as u64)
+        })?;
         rows.collect()
     }
 
@@ -651,7 +653,7 @@ pub mod db {
     ) -> rusqlite::Result<Option<Address>> {
         conn.query_row(
             "SELECT signer FROM sigs WHERE sprnd = ?1 AND signer = ?2",
-            params![round, account.0.as_slice()],
+            params![round as i64, account.0.as_slice()],
             |row| row.get::<_, Vec<u8>>(0),
         )
         .optional()

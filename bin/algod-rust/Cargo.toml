@@ -29,7 +29,7 @@ algo-rest-api.workspace = true
 algo-txn-pipeline.workspace = true
 algo-p2p.workspace = true
 axum.workspace = true
-libp2p = { version = "0.56", features = ["tcp", "noise", "yamux", "tokio", "kad", "identify", "gossipsub", "macros"] }
+libp2p = { version = "0.57", features = ["tcp", "noise", "yamux", "tokio", "kad", "identify", "gossipsub", "macros"] }
 async-trait.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
@@ -47,7 +47,7 @@ rmp-serde.workspace = true
 rmp.workspace = true
 rusqlite.workspace = true
 tokio-util = { workspace = true, features = ["compat"] }
-toml = "0.8"
+toml = "1"
 reqwest.workspace = true
 rand.workspace = true
 sha2.workspace = true

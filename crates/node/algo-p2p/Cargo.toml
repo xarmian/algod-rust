@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-libp2p = { version = "0.56", features = [
+libp2p = { version = "0.57", features = [
     "tcp",
     "noise",
     "yamux",
@@ -23,7 +23,7 @@ libp2p = { version = "0.56", features = [
 # implements a different `NetworkBehaviour` trait than the one
 # `#[derive(NetworkBehaviour)]` on `P2pBehaviour` (host.rs) uses — a hard
 # compile error, not a version warning. Bump only in lockstep with `libp2p`.
-libp2p-stream = "0.4.0-alpha"
+libp2p-stream = "0.5.0-alpha"
 # Used to derive the raw Ed25519 signing key underlying a `libp2p::identity`
 # `Keypair`, for `identity::to_identity_signing_key` (issue #1133) — the
 # adapter that lets the P2P transport's own peer identity drive
