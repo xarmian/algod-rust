@@ -2327,6 +2327,10 @@ pub struct SqliteLedger {
     /// `validateForPayouts` (issue #1803). Set via [`Self::set_devmode_chain`].
     devmode_chain: bool,
 
+    /// The legacy online-history backfill has been checked (done or not
+    /// needed) by this instance; see [`Self::upgrade_legacy_online_history`].
+    online_history_checked: std::sync::atomic::AtomicBool,
+
     /// Accumulated `accounttotals` per-status money/reward-unit deltas for
     /// the block currently open between `begin_block`/`commit_block`.
     /// Populated incrementally by `set_account`/`remove_account` and
@@ -2660,9 +2664,12 @@ impl SqliteLedger {
                 block_path.display()
             ),
         })?;
-        let ledger = Self::init(conn, prefix)?;
-        ledger.backfill_legacy_online_history()?;
-        Ok(ledger)
+        // The legacy online-history backfill is NOT run here: it writes, and
+        // a tool or orchestrator reopening a database the node holds must
+        // not fail with `database is locked` (issue #1819). The node calls
+        // [`Self::upgrade_legacy_online_history`] at startup and
+        // `begin_block` runs it before the first block otherwise.
+        Self::init(conn, prefix)
     }
 
     /// Upgrade path for a database synced before the `onlineaccounts` history
@@ -2684,6 +2691,19 @@ impl SqliteLedger {
     /// stake 0. From balance round `tip` on, rows are real and the checks decide
     /// normally. Marker value 0 means nothing was synthesized (a fresh or
     /// catchpoint-imported database).
+    pub fn upgrade_legacy_online_history(&self) -> Result<(), AlgoError> {
+        if self
+            .online_history_checked
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        self.backfill_legacy_online_history()?;
+        self.online_history_checked
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
     fn backfill_legacy_online_history(&self) -> Result<(), AlgoError> {
         let done: Option<i64> = self
             .conn
@@ -3037,6 +3057,7 @@ impl SqliteLedger {
             }
         };
 
+        let db_prefix_is_none = db_prefix.is_none();
         Ok(Self {
             conn,
             db_prefix,
@@ -3067,6 +3088,8 @@ impl SqliteLedger {
             delta_cache: crate::delta_cache::DeltaCache::with_default_window(),
             group_delta_tracer: None,
             devmode_chain: false,
+            // An ephemeral (prefix-less) database has no legacy shape.
+            online_history_checked: std::sync::atomic::AtomicBool::new(db_prefix_is_none),
             pending_totals_delta: AccountTotalsDelta::default(),
             pending_online_touched: std::collections::HashSet::new(),
             rewards_cache: RewardsLevelCache::default(),
@@ -3366,6 +3389,10 @@ impl SqliteLedger {
 
     /// Begin a block-level transaction.
     pub fn begin_block(&mut self) -> Result<(), AlgoError> {
+        // A legacy database missing its online-account history is upgraded
+        // before the first block it applies (issue #1819), before this
+        // block's own write transaction starts.
+        self.upgrade_legacy_online_history()?;
         // Self-healing: finish an abort whose ROLLBACK failed earlier before
         // anything new starts (most callers ignore rollback_block's result).
         self.heal_pending_abort()?;
@@ -15667,6 +15694,48 @@ mod tests {
         (x, z)
     }
 
+    /// Issue #1819: opening a legacy database never writes, so a tool or
+    /// orchestrator reopening it while another process holds the write lock
+    /// does not fail with `database is locked`; the node upgrades it
+    /// explicitly (and `begin_block` does as a safety net).
+    #[test]
+    fn opening_a_legacy_database_does_not_write_or_block_on_the_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+        let _ = legacy_ledger_with_quiet_new_account(&prefix);
+
+        let holder = Connection::open(tracker_path_for_prefix(&prefix)).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let started = std::time::Instant::now();
+        let ledger = SqliteLedger::open_with_prefix(&prefix)
+            .expect("open must not need the write lock");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "open waited on the write lock"
+        );
+        holder.execute_batch("ROLLBACK").unwrap();
+        drop(holder);
+        assert_eq!(history_rows(&ledger), 0, "open itself synthesized nothing");
+
+        // The explicit upgrade step does the backfill ...
+        ledger.upgrade_legacy_online_history().unwrap();
+        assert_eq!(history_rows(&ledger), 2);
+    }
+
+    /// ... and the first block a legacy database applies runs it if nobody
+    /// did, so no applying path can proceed on a database missing its history.
+    #[test]
+    fn begin_block_upgrades_a_legacy_database_that_was_not_upgraded_explicitly() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+        let _ = legacy_ledger_with_quiet_new_account(&prefix);
+        let mut ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
+        assert_eq!(history_rows(&ledger), 0);
+        ledger.begin_block().unwrap();
+        ledger.rollback_block().unwrap();
+        assert_eq!(history_rows(&ledger), 2);
+    }
+
     fn history_rows(ledger: &SqliteLedger) -> i64 {
         ledger
             .conn
@@ -15690,6 +15759,7 @@ mod tests {
         let (x, z) = legacy_ledger_with_quiet_new_account(&prefix);
 
         let ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
+        ledger.upgrade_legacy_online_history().unwrap();
         assert_eq!(ledger.current_round().0, 400);
         assert_eq!(
             history_rows(&ledger),
@@ -15734,6 +15804,7 @@ mod tests {
             .unwrap();
         }
         let mut ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
+        ledger.upgrade_legacy_online_history().unwrap();
         assert_eq!(history_rows(&ledger), 1, "not backfilled again");
         // Put x's row back to continue (as the first open made it).
         ledger
@@ -15765,6 +15836,7 @@ mod tests {
     fn fresh_database_has_no_uncertain_history() {
         let dir = tempfile::tempdir().unwrap();
         let ledger = SqliteLedger::open_with_prefix(&dir.path().join("ledger")).unwrap();
+        ledger.upgrade_legacy_online_history().unwrap();
         let marker: i64 = ledger
             .conn
             .query_row(
@@ -16117,6 +16189,7 @@ mod tests {
             delta_cache: _,
             group_delta_tracer: _,
             devmode_chain: _,          // node-lifetime config, set once at open
+            online_history_checked: _, // upgrade-once flag, not chain state
             pending_totals_delta: _,   // reset by rollback
             pending_online_touched: _, // cleared by rollback
             rewards_cache: _,          // committed-header cache, immutable data

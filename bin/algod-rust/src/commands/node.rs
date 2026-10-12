@@ -288,6 +288,13 @@ async fn run_start(
     let mut sqlite_ledger = open_resource_ledger(&ledger_prefix, &file_config)
         .map_err(|e| anyhow::anyhow!("opening ledger at {}: {e}", ledger_prefix.display()))?;
 
+    // Explicit upgrade step for a database synced before the online-account
+    // history was kept (issue #1819): `open` no longer writes, so tools can
+    // reopen a live ledger without contending for the write lock.
+    sqlite_ledger
+        .upgrade_legacy_online_history()
+        .map_err(|e| anyhow::anyhow!("upgrading legacy online-account history: {e}"))?;
+
     let latest = sqlite_ledger.current_round().0;
     // A go devmode chain's blocks have no proposer, so sync-applied blocks
     // cannot be held to `validateForPayouts` (issue #1803).
