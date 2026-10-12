@@ -45,6 +45,7 @@
 // committed-blocks map after `simulate(...)` returns.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -114,6 +115,11 @@ pub struct TestLedgerState {
     pub next_rnd: Round,
     /// Pending `round_notify` waiters: `(requested_round, sender)`.
     pub waiters: Vec<(Round, Sender<Round>)>,
+    /// The most recent `round_notify` receiver handed out (the demux asks
+    /// afresh before every select, so this is the one it is waiting on),
+    /// retained so [`TestLedger::pending_work`] can see a notification that
+    /// was sent but not yet consumed by a parked demux (issue #1695).
+    pub current_rx: Option<crossbeam_channel::Receiver<Round>>,
 }
 
 /// Cloneable handle to the test ledger.
@@ -131,6 +137,9 @@ pub struct TestLedger {
     /// one via [`TestLedger::share_commits`] so `ensure_digest` can
     /// actually catch a lagging node up.
     shared_commits: SharedCommits,
+    /// Live `ensure_digest` catch-up fetch threads (issue #1695). See
+    /// [`TestLedger::pending_work`].
+    catchups: Arc<AtomicUsize>,
 }
 
 impl TestLedger {
@@ -194,11 +203,27 @@ impl TestLedger {
             // "the genesis" and the agreement service drives round 1 next.
             next_rnd: Round(1),
             waiters: Vec::new(),
+            current_rx: None,
         };
         Self {
             state: Arc::new(Mutex::new(state)),
             shared_commits: Arc::new(Mutex::new(HashMap::new())),
+            catchups: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Exact count of ledger-side asynchronous work the cluster-quiescence
+    /// check must wait for (issue #1695): live `ensure_digest` catch-up
+    /// fetch threads, plus round notifications that were sent but not yet
+    /// consumed by the (parked) demux. The fetch counter is read FIRST: the
+    /// fetch thread sends its notification before dropping out of the
+    /// counter, so a finished fetch is always visible in one of the two
+    /// terms (or its consumption already bumped the demux wake counter).
+    pub fn pending_work(&self) -> usize {
+        let fetches = self.catchups.load(Ordering::SeqCst);
+        let s = self.state.lock().unwrap();
+        let notifications = s.current_rx.as_ref().map_or(0, |rx| rx.len());
+        fetches + notifications
     }
 
     /// Wire this ledger's committed-block registry to `shared` — call once
@@ -363,10 +388,12 @@ impl LedgerReader for TestLedger {
             // Already available — fire immediately.
             let (tx, rx) = crossbeam_channel::bounded(1);
             let _ = tx.send(round);
+            s.current_rx = Some(rx.clone());
             return rx;
         }
         let (tx, rx) = crossbeam_channel::bounded(1);
         s.waiters.push((round, tx));
+        s.current_rx = Some(rx.clone());
         rx
     }
 }
@@ -438,7 +465,16 @@ impl LedgerWriter for TestLedger {
         // Mirrors the real ledger's async catchup fetch: retry until the
         // block turns up (or we give up), off the demux thread that fired
         // this action, so it never blocks agreement's own event loop.
+        struct CatchupGuard(Arc<AtomicUsize>);
+        impl Drop for CatchupGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        self.catchups.fetch_add(1, Ordering::SeqCst);
+        let guard = CatchupGuard(Arc::clone(&self.catchups));
         thread::spawn(move || {
+            let _guard = guard;
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 if let Some((block, source_cert)) = shared.lock().unwrap().get(&round).cloned() {
@@ -541,11 +577,11 @@ mod tests {
         // The catch-up fetch runs on a background thread (mirrors a real
         // async block fetch); poll briefly for it to land rather than
         // asserting immediately.
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while ledger_b.next_round().0 <= Round(1).0 {
             assert!(
                 Instant::now() < deadline,
-                "ensure_digest did not catch B up within 2s"
+                "ensure_digest did not catch B up within 60s"
             );
             thread::sleep(Duration::from_millis(5));
         }

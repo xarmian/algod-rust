@@ -114,6 +114,31 @@ impl TestingClock {
         entry.sender = None;
     }
 
+    /// Fire `timeout_type` on every clock in `clocks` as ONE atomic step
+    /// (issue #1695): all the clocks' state mutexes are taken before any
+    /// sender is dropped, and released only after the last one. A node
+    /// woken by its own fire cannot `zero()`/re-register (both need its
+    /// clock's mutex) until every clock has fired, so a fast-reacting node
+    /// can no longer clear its entries — or have its peers' timeouts
+    /// reordered behind its own broadcasts' effects on the clock state —
+    /// while the driver is still mid-loop. That window is what made a bare
+    /// `for clock { clock.fire() }` panic with "no timeout of type ..." and
+    /// let different nodes see the same global timeout at different points
+    /// of the cascade. Panics like [`Self::fire`] if any clock has nothing
+    /// registered for `timeout_type`.
+    pub fn fire_all(clocks: &[&Arc<TestingClock>], timeout_type: TimeoutType) {
+        let mut guards: Vec<_> = clocks
+            .iter()
+            .map(|c| c.state.lock().expect("TestingClock state poisoned"))
+            .collect();
+        for g in guards.iter_mut() {
+            let entry = g.entries.get_mut(&timeout_type).unwrap_or_else(|| {
+                panic!("TestingClock::fire_all: no timeout of type {timeout_type:?}")
+            });
+            entry.sender = None;
+        }
+    }
+
     /// Like [`Self::fire`], but a silent no-op instead of a panic when
     /// nothing is registered for `timeout_type` yet.
     ///

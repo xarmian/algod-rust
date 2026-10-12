@@ -395,6 +395,13 @@ where
         // errors (G8) and round re-sampling on interruption (G9).
         demux.set_network(network.clone() as Arc<dyn AgreementNetwork + Send + Sync>);
         demux.set_ledger(ledger.clone() as Arc<dyn LedgerReader + Send + Sync>);
+        // Exact-idleness probe for test harnesses (issue #1695); `None` for
+        // every production monitor.
+        if let Ok(m) = monitor.lock() {
+            if let Some(activity) = m.demux_activity() {
+                demux.set_activity(activity);
+            }
+        }
 
         // Create channels for communication between main loop and demux loop.
         // These mirror Go's `input`, `output`, and `ready` channels.
@@ -1650,6 +1657,20 @@ fn do_network_action<N: AgreementNetwork>(
         }
         ActionType::Relay => {
             if let Some((tag_str, data)) = encode_network_payload(na) {
+                // A relay with NO message handle is a locally originated
+                // message (Go: `relayAction` with a nil handle -- the
+                // proposer's own compound message; see player.rs "Relay as
+                // the proposer"). Fire the test-only checkpoint hook for it
+                // exactly as for a `Broadcast`, so the hook still sees every
+                // proposal payload this node originates (issue #1695: once
+                // payload tails of filtered votes are processed, proposers
+                // originate theirs through this path rather than only via
+                // the payload_ok `Broadcast`).
+                if tag_str == PROPOSAL_PAYLOAD_TAG && na.message_handle.is_none() {
+                    if let Some(hook) = propose_broadcast_hook {
+                        hook();
+                    }
+                }
                 let tag = Tag(tag_str);
                 if let Err(e) = network.relay(&na.message_handle, &tag, &data) {
                     warn!("failed to relay {}: {}", tag_str, e);
@@ -2733,7 +2754,7 @@ mod tests {
 
     /// The hook is scoped to a node's OWN proposal-payload broadcast only —
     /// it must not fire for a vote broadcast, nor for a RELAYED (not
-    /// locally-originated) proposal payload.
+    /// locally-originated, i.e. handle-carrying) proposal payload.
     #[test]
     fn do_network_action_hook_does_not_fire_for_votes_or_relays() {
         let network = StubNetwork::new();
@@ -2766,6 +2787,7 @@ mod tests {
         let relay_action = NetworkAction {
             t: ActionType::Relay,
             tag: PROPOSAL_PAYLOAD_TAG.to_string(),
+            message_handle: Some(Arc::new(7u64) as Arc<dyn std::any::Any + Send + Sync>),
             ..NetworkAction::default()
         };
         let hook = make_hook(&fired);
@@ -2776,6 +2798,22 @@ mod tests {
             Some(&hook),
         );
         assert_eq!(fired.load(Ordering::SeqCst), 0);
+
+        // ...but a relay with NO handle is a locally originated message (Go's
+        // nil-handle `relayAction`, the proposer's own compound message), so
+        // it is a node's own proposal-payload broadcast and DOES fire the
+        // hook (issue #1695).
+        let own_relay = NetworkAction {
+            message_handle: None,
+            ..relay_action.clone()
+        };
+        do_network_action(
+            &own_relay,
+            &network,
+            &ParticipationMetrics::new(),
+            Some(&hook),
+        );
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
     }
 
     /// `None` (every production call site) must behave exactly as before —

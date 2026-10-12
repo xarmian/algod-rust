@@ -83,6 +83,9 @@ const BUNDLE_PARALLELISM: usize = 2;
 struct InternalVoteRequest {
     request: CryptoVoteRequest,
     cancel: Arc<AtomicBool>,
+    /// Counts this request as outstanding from submission until the worker
+    /// has delivered its result (see `AsyncCryptoVerifier::outstanding_verifications`).
+    _outstanding: InFlightGuard,
 }
 
 /// Internal proposal request sent to the worker thread pool.
@@ -90,6 +93,9 @@ struct InternalVoteRequest {
 struct InternalProposalRequest {
     request: CryptoProposalRequest,
     cancel: Arc<AtomicBool>,
+    /// Counts this request as outstanding from submission until the worker
+    /// has delivered its result (see `AsyncCryptoVerifier::outstanding_verifications`).
+    _outstanding: InFlightGuard,
 }
 
 /// Internal bundle request sent to the worker thread pool.
@@ -97,6 +103,9 @@ struct InternalProposalRequest {
 struct InternalBundleRequest {
     request: CryptoBundleRequest,
     cancel: Arc<AtomicBool>,
+    /// Counts this request as outstanding from submission until the worker
+    /// has delivered its result (see `AsyncCryptoVerifier::outstanding_verifications`).
+    _outstanding: InFlightGuard,
 }
 
 // ---------------------------------------------------------------------------
@@ -392,6 +401,14 @@ pub struct AsyncCryptoVerifier<
     /// Count of vote and bundle requests a worker has dequeued but not yet
     /// handed to its output channel. See `in_flight_verifications`.
     in_flight_verifications: Arc<AtomicUsize>,
+
+    /// Count of ALL submitted vote/proposal/bundle requests whose result has
+    /// not yet been handed to the output channel: incremented in `verify_*`
+    /// BEFORE the request enters the input channel and decremented only when
+    /// the worker is done with it (after the result send, or on a drop).
+    /// Unlike `in_flight_verifications` there is no window between dequeue
+    /// and counting. See `outstanding_verifications`.
+    outstanding_verifications: Arc<AtomicUsize>,
 
     /// Marker for the validator type parameter.
     _validator: std::marker::PhantomData<BV>,
@@ -1156,6 +1173,7 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
             cancellation: Mutex::new(PendingRequestsContext::new()),
             pending_proposal_validations,
             in_flight_verifications,
+            outstanding_verifications: Arc::new(AtomicUsize::new(0)),
             _validator: std::marker::PhantomData,
         }
     }
@@ -1192,18 +1210,35 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
     pub fn in_flight_verifications(&self) -> usize {
         self.in_flight_verifications.load(Ordering::SeqCst)
     }
+
+    /// Exact count of submitted requests (votes, proposals, bundles) whose
+    /// result has not yet reached an output channel: in the input channel,
+    /// being verified, or blocked in the validator. Counted from inside
+    /// `verify_*` before the request is enqueued, so there is no window in
+    /// which a request is in neither this count, an input channel nor an
+    /// output channel (unlike [`Self::in_flight_verifications`], which
+    /// starts counting only after a worker has dequeued). Read this BEFORE
+    /// the output-channel lengths: a result is sent before the count drops.
+    pub fn outstanding_verifications(&self) -> usize {
+        self.outstanding_verifications.load(Ordering::SeqCst)
+    }
 }
 
 impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync + 'static>
     CryptoVerifier for AsyncCryptoVerifier<L, BV>
 {
     fn verify_vote(&self, request: CryptoVoteRequest) {
+        let outstanding = InFlightGuard::new(&self.outstanding_verifications);
         let cancel = {
             let mut ctx = self.cancellation.lock().unwrap();
             ctx.clear_stale_contexts(request.round, request.period, false, false);
             ctx.add_vote(request.round, request.period)
         };
-        let internal = InternalVoteRequest { request, cancel };
+        let internal = InternalVoteRequest {
+            request,
+            cancel,
+            _outstanding: outstanding,
+        };
         // Clone the sender out of the mutex before sending so that quit()
         // can acquire the lock even if this send blocks on a full channel.
         let tx = {
@@ -1234,12 +1269,17 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
     }
 
     fn verify_proposal(&self, request: CryptoProposalRequest) {
+        let outstanding = InFlightGuard::new(&self.outstanding_verifications);
         let cancel = {
             let mut ctx = self.cancellation.lock().unwrap();
             ctx.clear_stale_contexts(request.round, request.period, request.pinned, false);
             ctx.add_proposal(request.round, request.period, request.pinned)
         };
-        let internal = InternalProposalRequest { request, cancel };
+        let internal = InternalProposalRequest {
+            request,
+            cancel,
+            _outstanding: outstanding,
+        };
         // Clone the sender out of the mutex before sending so that quit()
         // can acquire the lock even if this send blocks on a full channel.
         let tx = {
@@ -1267,6 +1307,7 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
     }
 
     fn verify_bundle(&self, request: CryptoBundleRequest) {
+        let outstanding = InFlightGuard::new(&self.outstanding_verifications);
         let cancel = {
             let mut ctx = self.cancellation.lock().unwrap();
             // Bundle freshness constrains the round, but not future
@@ -1276,7 +1317,11 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
             ctx.clear_stale_contexts(request.round, Period(0), false, true);
             ctx.add_bundle(request.round)
         };
-        let internal = InternalBundleRequest { request, cancel };
+        let internal = InternalBundleRequest {
+            request,
+            cancel,
+            _outstanding: outstanding,
+        };
         // Clone the sender out of the mutex before sending so that quit()
         // can acquire the lock even if this send blocks on a full channel.
         let tx = {

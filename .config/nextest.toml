@@ -19,17 +19,17 @@ retries = 0
 # 60s are flagged SLOW in the log.
 slow-timeout = { period = "60s", terminate-after = 20 }
 
-# Retries (2) only for the known load-sensitive tests on the shared 4-core
-# runner. A retried pass is reported as FLAKY in the log (and surfaced in the
-# job summary by the workflow), so it stays visible.
-#   - real-thread multi-node agreement harness quiescence detection,
-#     service_multi_node_test (issues #1693, #1695). NOTE: that binary is
-#     filtered out of the PR job by the workflow (too slow in a debug build),
-#     but the override stays so running it with `--profile ci` is sane.
+# Retries (2) only for the known load-sensitive test below on the shared
+# 4-core runner. A retried pass is reported as FLAKY in the log (and surfaced
+# in the job summary by the workflow), so it stays visible.
 #   - lookback_prefetch bounded-lookahead timing assertion (issue #1723)
-# Same retry count as the scheduled Coverage workflow (PR #1694).
+# The real-thread multi-node agreement harness (service_multi_node_test,
+# issues #1693/#1695) NO LONGER has a retry override: its quiescence
+# detection is exact (no debounce) and a latent proposal-tail bug that made
+# fast_recovery_late/redo converge on the wrong block was fixed (#1695), so a
+# failure there is a real finding and must fail loudly.
 [[profile.ci.overrides]]
-filter = 'binary(service_multi_node_test) | test(/lookback_prefetch::/)'
+filter = 'test(/lookback_prefetch::/)'
 retries = 2
 
 # NOTE: the PR Unit Tests workflow EXCLUDES the `service_multi_node_test`

@@ -1312,6 +1312,73 @@ fn player_requests_payload_verification() {
     );
 }
 
+/// Issue #1695: Go's proposal-vote branch of `player.handleMessageEvent`
+/// processes the attached tail (a compound message's payload) from a
+/// `defer`, i.e. on EVERY return path -- including `voteFiltered`
+/// (`agreement/player.go:596-612`). The port returned early from the
+/// filtered / malformed branches and silently dropped the payload, so a
+/// compound message whose proposal-vote this node had already seen (and
+/// therefore filtered as a duplicate) never got its payload verified. In the
+/// multi-node harness that left most nodes without the pinned payload and
+/// made `fast_recovery_late_five_node` / `fast_recovery_redo_five_node`
+/// converge on the wrong block roughly one run in ten.
+#[test]
+fn player_processes_tail_of_filtered_duplicate_proposal_vote() {
+    let r = Round(201221);
+    let p = algo_agreement::Period(0);
+    let params = test_params();
+    let (_player, mut machine, mut helper) = setup_p(r, p, CERT, &params);
+    let payload = algo_agreement::test_support::make_random_proposal_payload(r);
+    let pv = payload.unauthenticated_proposal.value();
+
+    // The proposal-vote is seen (and accepted) first, on its own.
+    send_votes(&mut machine, &mut helper, 1, r, p, PROPOSE, pv);
+    assert!(
+        !machine.trace().contains_action_fn(
+            |a| matches!(a, Action::Crypto(ca) if ca.t == ActionType::VerifyPayload)
+        ),
+        "no payload yet, so nothing to verify"
+    );
+
+    // Now the same vote arrives again inside a compound message carrying the
+    // payload as its tail. The vote is a duplicate (filtered), but the tail
+    // must still be processed and the payload sent for verification.
+    let vote = helper.make_verified_vote(0, r, p, PROPOSE, pv);
+    let tail = MessageEvent {
+        t: EventType::PayloadPresent,
+        input: InternalMessage {
+            unauthenticated_proposal: payload.unauthenticated_proposal.clone(),
+            ..InternalMessage::default()
+        },
+        proto: proto_view(),
+        ..MessageEvent::default()
+    };
+    let msg = MessageEvent {
+        t: EventType::VotePresent,
+        input: InternalMessage {
+            unauthenticated_vote: vote.to_unauthenticated(),
+            ..InternalMessage::default()
+        },
+        tail: Some(Box::new(tail)),
+        proto: proto_view(),
+        ..MessageEvent::default()
+    };
+    machine
+        .transition(Event::Message(msg))
+        .expect("votePresent transition should not panic");
+
+    assert!(
+        machine.trace().contains_action_fn(|a| match a {
+            Action::Crypto(ca) =>
+                ca.t == ActionType::VerifyPayload && ca.round == r && ca.period == p,
+            _ => false,
+        }),
+        "the tail payload of a filtered duplicate vote must still be verified; trace:
+{}",
+        machine.trace()
+    );
+}
+
 #[test]
 fn player_requests_pipelined_payload_verification() {
     let r = Round(201221);
