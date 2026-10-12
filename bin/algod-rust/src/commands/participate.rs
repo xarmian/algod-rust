@@ -4216,6 +4216,12 @@ fn open_and_configure_participate_ledger(
             e
         )
     })?;
+    // Explicit upgrade step (issue #1819): `open_split` no longer backfills
+    // the legacy online-account history; agreement reads it before the first
+    // block is applied.
+    sqlite_ledger
+        .upgrade_legacy_online_history()
+        .map_err(|e| anyhow::anyhow!("upgrading legacy online-account history: {e}"))?;
 
     // Apply config-driven storage settings (issue #749):
     // `LedgerSynchronousMode` (SQLite `synchronous` pragma on the main
