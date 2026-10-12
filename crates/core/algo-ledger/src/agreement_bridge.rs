@@ -379,26 +379,18 @@ impl AgreementLedgerBridge {
             let elapsed = since.elapsed();
             if elapsed > Duration::from_secs(1) {
                 let elapsed_ms = elapsed.as_millis() as u64;
-                match apply_avm {
-                    Some(avm) => {
-                        let avm_ms = avm.as_millis() as u64;
-                        warn!(
-                            round = %block.round,
-                            stage,
-                            elapsed_ms,
-                            avm_ms,
-                            non_avm_ms = elapsed_ms.saturating_sub(avm_ms),
-                            txns = block.payset.len(),
-                            "try_commit_block: slow stage"
-                        );
-                    }
-                    None => warn!(
-                        round = %block.round,
-                        stage,
-                        elapsed_ms,
-                        "try_commit_block: slow stage"
-                    ),
-                }
+                // Only the apply stage has the AVM split; `Option` fields are
+                // simply omitted from the record when `None`.
+                let avm_ms = apply_avm.map(|avm| avm.as_millis() as u64);
+                warn!(
+                    round = %block.round,
+                    stage,
+                    elapsed_ms,
+                    avm_ms,
+                    non_avm_ms = avm_ms.map(|avm| elapsed_ms.saturating_sub(avm)),
+                    txns = apply_avm.map(|_| block.payset.len()),
+                    "try_commit_block: slow stage"
+                );
             }
         };
         let t = std::time::Instant::now();
@@ -409,7 +401,19 @@ impl AgreementLedgerBridge {
             Err(e) if ledger.has_pending_abort() => {
                 return Err(CommitFailure::new(CommitStage::Store, e));
             }
-            Err(_) => false,
+            // Any other failure means a transaction is already open (a
+            // caller managing its own); applying then joins it with NO chain
+            // snapshot of this block's own, so a failing apply is not rolled
+            // back here (issue #1768). Not expected on the follow path, so
+            // make it visible rather than silent.
+            Err(e) => {
+                warn!(
+                    round = %block.round,
+                    error = %e,
+                    "try_commit_block: begin_block failed; applying non-transactionally"
+                );
+                false
+            }
         };
         slow("begin_block", t, None);
 

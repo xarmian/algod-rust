@@ -3388,6 +3388,15 @@ impl SqliteLedger {
     }
 
     /// Begin a block-level transaction.
+    ///
+    /// Rollback state is kept by several mechanisms with different scopes
+    /// (issue #1768 asks for them to be unified; until then this is the map):
+    /// this method's SQL transaction plus the in-memory `chain_snapshot` /
+    /// `lease_snapshot` (the whole block); [`SqliteSnapshot`] SAVEPOINTs
+    /// (`snapshot` / `restore_snapshot`, used by per-group and end-of-block
+    /// rollback inside a block); the shadow-execute `ChainFields` and the
+    /// scratch group-delta capture (scratch applies rolled back inside an open
+    /// block). Each restores only what it captured.
     pub fn begin_block(&mut self) -> Result<(), AlgoError> {
         // A legacy database missing its online-account history is upgraded
         // before the first block it applies (issue #1819), before this
@@ -4722,8 +4731,14 @@ impl SqliteLedger {
     /// Drop the delta-cache / group-tracer entries of rounds above
     /// `committed_round`: they belong to a block that never committed and must
     /// not be served (nor shadow a different block retried at the same round).
-    /// Window evictions already performed by the failed block's inserts are not
-    /// undone (they only drop already-old entries).
+    /// `committed_round` is the ledger's committed round, so a cached round
+    /// above it is by definition uncommitted; entries at or below it are kept.
+    ///
+    /// Window evictions already performed by the failed block's inserts are
+    /// deliberately not undone (issue #1768): they only drop entries older
+    /// than `round - window + 1`, and the retry of the same round (the chain
+    /// cannot advance past a block that has not committed) evicts exactly the
+    /// same ones, so no entry is ever served that would otherwise have been.
     fn discard_uncommitted_deltas(&mut self, committed_round: u64) {
         self.delta_cache.remove_after(committed_round);
         if let Some(t) = self.group_delta_tracer.as_mut() {
@@ -7346,6 +7361,11 @@ impl LedgerStore for SqliteLedger {
         self.genesis_hash = hash;
     }
 
+    // The chain snapshot stores the protocol copy-on-write: it is captured
+    // here, by the first change inside a block. That is sound only because
+    // this method and `apply_chain_snapshot` (the restore) are the sole
+    // writers of `self.protocol` (pinned by
+    // `protocol_change_inside_a_block_is_rolled_back`; issue #1768).
     fn set_protocol(&mut self, protocol: String) {
         if protocol != self.protocol {
             if let Some(snap) = self.chain_snapshot.as_mut() {
@@ -16091,6 +16111,42 @@ mod tests {
         l.set_devmode_chain(true);
         l.begin_block().unwrap();
         l.apply_block_caching_delta(&no_proposer).unwrap();
+    }
+
+    /// Issue #1768: the copy-on-write protocol snapshot restores the protocol
+    /// a block changed, and a second change inside the same block still rolls
+    /// back to the pre-block value.
+    #[test]
+    fn protocol_change_inside_a_block_is_rolled_back() {
+        let mut l = SqliteLedger::open_in_memory().unwrap();
+        l.set_protocol("v1".to_string());
+        l.begin_block().unwrap();
+        l.set_protocol("v2".to_string());
+        l.set_protocol("v3".to_string());
+        l.rollback_block().unwrap();
+        assert_eq!(l.protocol(), "v1");
+    }
+
+    /// Issue #1768: `discard_uncommitted_deltas` keeps every cached round at
+    /// or below the committed round (including when the ledger's round is
+    /// below some cached ones) and drops every round above it, in both the
+    /// delta cache and the group tracer.
+    #[test]
+    fn discard_uncommitted_deltas_keeps_committed_rounds_and_drops_later_ones() {
+        let mut l = SqliteLedger::open_in_memory().unwrap();
+        for r in 1..=5u64 {
+            l.cache_state_delta(r, crate::state_delta::StateDelta::default());
+        }
+        l.discard_uncommitted_deltas(3);
+        for r in 1..=3u64 {
+            assert!(l.delta_cache.get(r).is_some(), "round {r} is committed");
+        }
+        for r in 4..=5u64 {
+            assert!(l.delta_cache.get(r).is_none(), "round {r} never committed");
+        }
+        // Nothing above the committed round: a no-op.
+        l.discard_uncommitted_deltas(10);
+        assert_eq!(l.delta_cache.len(), 3);
     }
 
     #[test]
