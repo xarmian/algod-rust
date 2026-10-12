@@ -139,7 +139,7 @@ algo-kmd-client = { path = "crates/node/algo-kmd-client" }
 algo-txn-pipeline = { path = "crates/node/algo-txn-pipeline" }
 algo-bench = { path = "crates/tools/algo-bench" }
 algo-build-info = { path = "crates/tools/algo-build-info" }
-num-bigint = "0.4"
+num-bigint = "0.5"
 num-traits = "0.2"
 statrs = "0.19"
 

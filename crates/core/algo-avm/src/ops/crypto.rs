@@ -1366,12 +1366,20 @@ fn mimc_bls12_381(data: &[u8]) -> Result<Vec<u8>, AlgoError> {
 
 /// Parse input bytes into field elements (big-endian, 32-byte chunks).
 fn parse_field_elements<F: ark_ff::PrimeField>(data: &[u8]) -> Result<Vec<F>, AlgoError> {
+    use ark_ff::BigInteger;
     let mut elements = Vec::with_capacity(data.len() / 32);
     for chunk in data.chunks_exact(32) {
-        let bi = F::BigInt::try_from(num_bigint::BigUint::from_bytes_be(chunk))
-            .map_err(|_| avm_err("field element exceeds modulus"))?;
-        let elem = F::from_bigint(bi)
-            .ok_or_else(|| avm_err("invalid mimc input: element exceeds modulus"))?;
+        // Reduce, then require the canonical encoding to round-trip: an
+        // element >= the modulus does not (arkworks' `from_bigint` rejects
+        // it the same way). Avoids handing num-bigint types to arkworks,
+        // which still depends on num-bigint 0.4 (issue #1876).
+        let elem = F::from_be_bytes_mod_order(chunk);
+        let canonical = elem.into_bigint().to_bytes_be();
+        let mut padded = vec![0u8; 32usize.saturating_sub(canonical.len())];
+        padded.extend_from_slice(&canonical);
+        if padded.as_slice() != chunk {
+            return Err(avm_err("invalid mimc input: element exceeds modulus"));
+        }
         elements.push(elem);
     }
     Ok(elements)
@@ -1390,8 +1398,7 @@ fn mimc_derive_constants<F: ark_ff::PrimeField>(num_rounds: usize) -> Vec<F> {
     for _ in 0..num_rounds {
         rnd = hasher.finalize_reset().to_vec();
         // gnark-crypto uses SetBytes which reduces mod p (big-endian)
-        let bi = num_bigint::BigUint::from_bytes_be(&rnd);
-        let fi = F::from(bi);
+        let fi = F::from_be_bytes_mod_order(&rnd);
         constants.push(fi);
         hasher.update(&rnd);
     }
@@ -1616,8 +1623,7 @@ fn poseidon2_round_keys<F: ark_ff::PrimeField>(seed: &str) -> Vec<Vec<F>> {
         let mut keys = Vec::with_capacity(width);
         for _ in 0..width {
             rnd = hasher.finalize_reset().to_vec();
-            let bi = num_bigint::BigUint::from_bytes_be(&rnd);
-            keys.push(F::from(bi));
+            keys.push(F::from_be_bytes_mod_order(&rnd));
             hasher.update(&rnd);
         }
         round_keys.push(keys);
@@ -4510,6 +4516,20 @@ mod tests {
             "12964111614552580241101202600014316932811348627866250816177200046290462797607",
             "BLS12-381 MiMC three-chunk hash mismatch"
         );
+    }
+
+    /// The modulus boundary of the MiMC input check (issue #1876 reworked the
+    /// check to a canonical round-trip): `r - 1` is the largest valid BN254 Fr
+    /// element and `r` itself must be rejected (go: `SetBytesCanonical`).
+    #[test]
+    fn test_mimc_bn254_modulus_boundary() {
+        let r_minus_1 = "30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000000";
+        let r = "30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001";
+        assert!(
+            mimc_bn254_direct(r_minus_1).is_ok(),
+            "r-1 is a valid element"
+        );
+        assert!(mimc_bn254_direct(r).is_err(), "r itself must be rejected");
     }
 
     #[test]

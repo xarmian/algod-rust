@@ -92,7 +92,7 @@ fn bytes_to_bn254_field(b: &[u8]) -> Result<BN254Fq, AlgoError> {
             v, modulus
         )));
     }
-    Ok(BN254Fq::from(v))
+    Ok(BN254Fq::from_be_bytes_mod_order(&v.to_bytes_be()))
 }
 
 /// Decode 64 bytes (big-endian x || y) into a BN254 G1 affine point.
@@ -236,7 +236,7 @@ fn bytes_to_bls12_field(b: &[u8]) -> Result<BLS12Fq, AlgoError> {
             v, modulus
         )));
     }
-    Ok(BLS12Fq::from(v))
+    Ok(BLS12Fq::from_be_bytes_mod_order(&v.to_bytes_be()))
 }
 
 fn bytes_to_bls12_g1(b: &[u8]) -> Result<BLS12G1Affine, AlgoError> {
@@ -1043,36 +1043,16 @@ fn bn254_g2_psi(p: &BN254G2) -> BN254G2 {
     use ark_ff::Field;
     // Constants from arkworks: TWIST_MUL_BY_Q_X and TWIST_MUL_BY_Q_Y
     let psi_x = BN254Fq2::new(
-        BN254Fq::from(
-            BigUint::parse_bytes(
-                b"21575463638280843010398324269430826099269044274347216827212613867836435027261",
-                10,
-            )
-            .unwrap(),
+        fq_from_dec(
+            "21575463638280843010398324269430826099269044274347216827212613867836435027261",
         ),
-        BN254Fq::from(
-            BigUint::parse_bytes(
-                b"10307601595873709700152284273816112264069230130616436755625194854815875713954",
-                10,
-            )
-            .unwrap(),
+        fq_from_dec(
+            "10307601595873709700152284273816112264069230130616436755625194854815875713954",
         ),
     );
     let psi_y = BN254Fq2::new(
-        BN254Fq::from(
-            BigUint::parse_bytes(
-                b"2821565182194536844548159561693502659359617185244120367078079554186484126554",
-                10,
-            )
-            .unwrap(),
-        ),
-        BN254Fq::from(
-            BigUint::parse_bytes(
-                b"3505843767911556378687030309984248845540243509899259641013678093033130930403",
-                10,
-            )
-            .unwrap(),
-        ),
+        fq_from_dec("2821565182194536844548159561693502659359617185244120367078079554186484126554"),
+        fq_from_dec("3505843767911556378687030309984248845540243509899259641013678093033130930403"),
     );
 
     let aff: BN254G2Affine = (*p).into();
@@ -1116,13 +1096,17 @@ fn bn254_g2_clear_cofactor(q: &BN254G2Affine) -> BN254G2Affine {
     result.into_affine()
 }
 
+/// Parse a decimal string (already reduced) into a BN254 base field element.
+/// Goes through arkworks' own `FromStr`, so no num-bigint value crosses into
+/// arkworks (which still uses num-bigint 0.4; issue #1876).
+fn fq_from_dec(s: &str) -> BN254Fq {
+    s.parse::<BN254Fq>()
+        .expect("valid canonical decimal field constant")
+}
+
 /// Construct a BN254 Fq2 element from two decimal strings.
 fn fq2_from_strs(a0: &str, a1: &str) -> BN254Fq2 {
-    let v0 = BigUint::parse_bytes(a0.as_bytes(), 10).unwrap();
-    let v1 = BigUint::parse_bytes(a1.as_bytes(), 10).unwrap();
-    let f0 = BN254Fq::from(v0);
-    let f1 = BN254Fq::from(v1);
-    BN254Fq2::new(f0, f1)
+    BN254Fq2::new(fq_from_dec(a0), fq_from_dec(a1))
 }
 
 /// sgn0 for BN254 Fq: returns the parity bit of the non-Montgomery representation.
