@@ -56,6 +56,7 @@ pub mod rewards;
 pub mod shadow_execute;
 pub mod simulation;
 pub mod sqlite;
+pub(crate) mod read_cache;
 pub mod state;
 pub mod state_delta;
 pub mod stateproof_message;

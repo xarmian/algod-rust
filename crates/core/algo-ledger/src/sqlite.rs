@@ -361,6 +361,33 @@ pub fn block_path_for_prefix(prefix: &Path) -> std::path::PathBuf {
     std::path::PathBuf::from(s)
 }
 
+/// Statement-cached `execute` / `query_row` (issue #1757): rusqlite's plain
+/// `Connection::execute` / `query_row` compile their SQL on every call, which
+/// the heavy-block profile showed to be a large share of the ~9k writes and
+/// the remaining reads of one block apply. These go through the connection's
+/// prepared-statement cache instead (same SQL text, same results).
+trait CachedConn {
+    fn execute_cached<P: rusqlite::Params>(&self, sql: &str, params: P) -> rusqlite::Result<usize>;
+    fn query_row_cached<T, P, F>(&self, sql: &str, params: P, f: F) -> rusqlite::Result<T>
+    where
+        P: rusqlite::Params,
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>;
+}
+
+impl CachedConn for Connection {
+    fn execute_cached<P: rusqlite::Params>(&self, sql: &str, params: P) -> rusqlite::Result<usize> {
+        self.prepare_cached(sql)?.execute(params)
+    }
+
+    fn query_row_cached<T, P, F>(&self, sql: &str, params: P, f: F) -> rusqlite::Result<T>
+    where
+        P: rusqlite::Params,
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    {
+        self.prepare_cached(sql)?.query_row(params, f)
+    }
+}
+
 /// Open a raw `rusqlite::Connection` against the ledger pair derived from
 /// `path` (a prefix or legacy `.sqlite`-suffixed path). The tracker file is
 /// opened as the `main` schema and the block file is attached as `blockdb`.
@@ -396,7 +423,7 @@ pub fn open_ledger_connection_with_sync_mode(
             tracker.display()
         ),
     })?;
-    conn.execute(
+    conn.execute_cached(
         "ATTACH DATABASE ?1 AS blockdb",
         params![block.to_string_lossy().as_ref()],
     )
@@ -516,7 +543,7 @@ const KVSTORE_NULL_NORM_MARKER: &str = "algod_rust_kvstore_null_norm_v1";
 /// either way.
 fn normalize_kvstore_nulls(conn: &Connection) -> rusqlite::Result<()> {
     let already_done: Option<i64> = conn
-        .query_row(
+        .query_row_cached(
             "SELECT intval FROM catchpointstate WHERE id = ?1",
             [KVSTORE_NULL_NORM_MARKER],
             |row| row.get(0),
@@ -536,14 +563,14 @@ fn normalize_kvstore_nulls(conn: &Connection) -> rusqlite::Result<()> {
     //     coerced to BLOB.
     // The `typeof(value) = 'text' AND length(value) = 0` predicate is
     // strict enough not to touch any non-empty TEXT.
-    conn.execute(
+    conn.execute_cached(
         "UPDATE kvstore
              SET value = x''
              WHERE value IS NULL
                 OR (typeof(value) = 'text' AND length(value) = 0)",
         [],
     )?;
-    conn.execute(
+    conn.execute_cached(
         "INSERT OR REPLACE INTO catchpointstate (id, intval) VALUES (?1, 1)",
         [KVSTORE_NULL_NORM_MARKER],
     )?;
@@ -564,7 +591,7 @@ const TXTAIL_RESTORED_TXID_MARKER: &str = "algod_rust_txtail_restored_txid_v1";
 /// decodes. The marker is written in the same transaction as the rebuilt rows.
 fn repair_txtail_restored_txids(conn: &Connection) -> rusqlite::Result<()> {
     let done: Option<i64> = conn
-        .query_row(
+        .query_row_cached(
             "SELECT intval FROM catchpointstate WHERE id = ?1",
             [TXTAIL_RESTORED_TXID_MARKER],
             |row| row.get(0),
@@ -575,7 +602,7 @@ fn repair_txtail_restored_txids(conn: &Connection) -> rusqlite::Result<()> {
     }
     let tx = conn.unchecked_transaction()?;
     let max_rnd: Option<i64> =
-        tx.query_row("SELECT MAX(rnd) FROM blockdb.blocks", [], |r| r.get(0))?;
+        tx.query_row_cached("SELECT MAX(rnd) FROM blockdb.blocks", [], |r| r.get(0))?;
     // Same inclusive window `TxTailDupCache::sync` reads:
     // `current - LOOKBACK_ROUNDS ..= current`.
     let mut all_repaired = true;
@@ -594,7 +621,7 @@ fn repair_txtail_restored_txids(conn: &Connection) -> rusqlite::Result<()> {
             it.collect::<rusqlite::Result<_>>()?
         };
         for rnd in rounds {
-            let blkdata: Vec<u8> = tx.query_row(
+            let blkdata: Vec<u8> = tx.query_row_cached(
                 "SELECT blkdata FROM blockdb.blocks WHERE rnd = ?1",
                 [rnd],
                 |r| r.get(0),
@@ -612,7 +639,7 @@ fn repair_txtail_restored_txids(conn: &Connection) -> rusqlite::Result<()> {
             let data = algo_codec::canonical_encode_txtail_round(
                 &algo_codec::build_txtail_from_block(&block),
             );
-            tx.execute(
+            tx.execute_cached(
                 "UPDATE txtail SET data = ?2 WHERE rnd = ?1",
                 params![rnd, data],
             )?;
@@ -621,7 +648,7 @@ fn repair_txtail_restored_txids(conn: &Connection) -> rusqlite::Result<()> {
     // The marker is only written when every row in the window was repaired,
     // so a skipped (undecodable) block is retried on the next open.
     if all_repaired {
-        tx.execute(
+        tx.execute_cached(
             "INSERT OR REPLACE INTO catchpointstate (id, intval) VALUES (?1, 1)",
             [TXTAIL_RESTORED_TXID_MARKER],
         )?;
@@ -654,7 +681,7 @@ fn migrate_resources_ctype_not_null(conn: &Connection) -> Result<(), AlgoError> 
     //   (c) `resources.ctype` exists but is nullable → pre-G5 Rust shape;
     //       rebuild the table to enforce NOT NULL DEFAULT -1.
     let table_exists: bool = conn
-        .query_row(
+        .query_row_cached(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='resources')",
             [],
             |row| row.get(0),
@@ -669,7 +696,7 @@ fn migrate_resources_ctype_not_null(conn: &Connection) -> Result<(), AlgoError> 
 
     // `pragma_table_info` returns rows {cid, name, type, notnull, dflt_value, pk}.
     let notnull: Option<i64> = conn
-        .query_row(
+        .query_row_cached(
             "SELECT \"notnull\" FROM pragma_table_info('resources') WHERE name='ctype'",
             [],
             |row| row.get(0),
@@ -1788,7 +1815,7 @@ pub(crate) fn set_blob_update_round(blob: &[u8], update_round: u64) -> Vec<u8> {
 /// legacy `accountbase`) stays closed.
 fn refuse_pre_v3_tracker_db(conn: &Connection) -> Result<(), AlgoError> {
     let has_accountbase: bool = conn
-        .query_row(
+        .query_row_cached(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='accountbase')",
             [],
             |row| row.get(0),
@@ -1801,7 +1828,7 @@ fn refuse_pre_v3_tracker_db(conn: &Connection) -> Result<(), AlgoError> {
     }
 
     let has_resources: bool = conn
-        .query_row(
+        .query_row_cached(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='resources')",
             [],
             |row| row.get(0),
@@ -1838,7 +1865,7 @@ fn refuse_pre_v3_tracker_db(conn: &Connection) -> Result<(), AlgoError> {
 ///    is a no-op on DBs that were never initialized by a pre-G6-part-3
 ///    binary).
 fn migrate_off_algod_rust_meta(conn: &Connection) -> rusqlite::Result<()> {
-    let exists: bool = conn.query_row(
+    let exists: bool = conn.query_row_cached(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='algod_rust_meta')",
         [],
         |row| row.get(0),
@@ -1849,7 +1876,7 @@ fn migrate_off_algod_rust_meta(conn: &Connection) -> rusqlite::Result<()> {
 
     // Step 1: mirror current_round → acctrounds.acctbase if missing.
     let legacy_round: Option<Vec<u8>> = conn
-        .query_row(
+        .query_row_cached(
             "SELECT value FROM algod_rust_meta WHERE key = 'current_round'",
             [],
             |row| row.get(0),
@@ -1859,7 +1886,7 @@ fn migrate_off_algod_rust_meta(conn: &Connection) -> rusqlite::Result<()> {
         if bytes.len() == 8 {
             let rnd = u64::from_le_bytes(bytes.try_into().unwrap()) as i64;
             let acctrounds_present: Option<i64> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT rnd FROM acctrounds WHERE id = 'acctbase'",
                     [],
                     |row| row.get(0),
@@ -1872,7 +1899,7 @@ fn migrate_off_algod_rust_meta(conn: &Connection) -> rusqlite::Result<()> {
                 Some(existing) => rnd > existing,
             };
             if should_mirror {
-                conn.execute(
+                conn.execute_cached(
                     "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', ?1)",
                     [rnd],
                 )?;
@@ -1897,7 +1924,7 @@ fn migrate_off_algod_rust_meta(conn: &Connection) -> rusqlite::Result<()> {
         ("sync_catchpoint_file", "algod_rust_sync_catchpoint_file"),
     ] {
         let val: Option<Vec<u8>> = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT value FROM algod_rust_meta WHERE key = ?1",
                 [legacy_key],
                 |row| row.get(0),
@@ -1905,7 +1932,7 @@ fn migrate_off_algod_rust_meta(conn: &Connection) -> rusqlite::Result<()> {
             .optional()?;
         if let Some(bytes) = val {
             let s = String::from_utf8(bytes).unwrap_or_default();
-            conn.execute(
+            conn.execute_cached(
                 "INSERT OR REPLACE INTO catchpointstate (id, strval) VALUES (?1, ?2)",
                 rusqlite::params![new_key, s],
             )?;
@@ -1915,7 +1942,7 @@ fn migrate_off_algod_rust_meta(conn: &Connection) -> rusqlite::Result<()> {
     // (set_sync_meta uses `value.as_bytes()` on `round.to_string()`); we
     // round-trip through string here.
     let round_str: Option<Vec<u8>> = conn
-        .query_row(
+        .query_row_cached(
             "SELECT value FROM algod_rust_meta WHERE key = 'sync_catchpoint_round'",
             [],
             |row| row.get(0),
@@ -1924,7 +1951,7 @@ fn migrate_off_algod_rust_meta(conn: &Connection) -> rusqlite::Result<()> {
     if let Some(bytes) = round_str {
         let s = String::from_utf8(bytes).unwrap_or_default();
         if let Ok(n) = s.parse::<i64>() {
-            conn.execute(
+            conn.execute_cached(
                 "INSERT OR REPLACE INTO catchpointstate (id, intval) VALUES (?1, ?2)",
                 rusqlite::params!["algod_rust_sync_catchpoint_round", n],
             )?;
@@ -1946,7 +1973,7 @@ fn migrate_off_algod_rust_meta(conn: &Connection) -> rusqlite::Result<()> {
     // target would refuse the drop on legitimate first-open scenarios
     // — there is no committed state there to protect.
     let legacy_round_value: Option<Vec<u8>> = conn
-        .query_row(
+        .query_row_cached(
             "SELECT value FROM algod_rust_meta WHERE key = 'current_round'",
             [],
             |row| row.get(0),
@@ -2041,7 +2068,7 @@ pub(crate) fn derive_chain_meta_from_latest_block(
     // `acctrounds` by `migrate_off_algod_rust_meta` before this helper
     // ever runs.
     let acctrounds_rnd: Option<i64> = conn
-        .query_row(
+        .query_row_cached(
             "SELECT rnd FROM acctrounds WHERE id = 'acctbase'",
             [],
             |row| row.get(0),
@@ -2067,7 +2094,7 @@ pub(crate) fn derive_chain_meta_from_latest_block(
         // exercised exclusively in tests; production catchpoints
         // never produce a round-0 acctbase.
         let header_at_zero: Option<Vec<u8>> = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT hdrdata FROM blockdb.blocks WHERE rnd = 0",
                 [],
                 |row| row.get(0),
@@ -2082,7 +2109,7 @@ pub(crate) fn derive_chain_meta_from_latest_block(
     }
 
     let hdrdata: Option<Vec<u8>> = conn
-        .query_row(
+        .query_row_cached(
             "SELECT hdrdata FROM blockdb.blocks WHERE rnd = ?1",
             params![rnd],
             |row| row.get(0),
@@ -2184,7 +2211,7 @@ impl ReadSnapshot {
     pub fn get_account(&self, addr: &Address) -> Option<AccountData> {
         let result: Option<Vec<u8>> = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT data FROM accountbase WHERE address = ?1",
                 params![addr.0.as_slice()],
                 |row| row.get(0),
@@ -2295,6 +2322,8 @@ pub struct SqliteLedger {
     savepoint_counter: AtomicU64,
     /// Whether we are inside a begin_block/commit_block transaction.
     in_block: bool,
+    /// Block-scoped read memo (issue #1757), see `read_cache`.
+    read_cache: crate::read_cache::BlockReadCache,
     /// Merkle trie for account/resource state tracking.
     trie: Option<crate::merkle_trie::MerkleTrie>,
     /// Pre-mutation records for trie updates.
@@ -2686,7 +2715,7 @@ impl SqliteLedger {
         // `last_committed_round()` and re-fetch any missing tail block. The
         // caller MUST NOT assume that "tracker says round N" implies
         // "blockdb contains round N's row".
-        conn.execute(
+        conn.execute_cached(
             "ATTACH DATABASE ?1 AS blockdb",
             params![block_path.to_string_lossy().as_ref()],
         )
@@ -2739,7 +2768,7 @@ impl SqliteLedger {
     fn backfill_legacy_online_history(&self) -> Result<(), AlgoError> {
         let done: Option<i64> = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT rnd FROM acctrounds WHERE id = 'onlinebackfill'",
                 [],
                 |row| row.get(0),
@@ -2802,7 +2831,7 @@ impl SqliteLedger {
         }
         let history_since = if missing.is_empty() { 0 } else { tip };
         self.conn
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('onlinebackfill', ?1)",
                 params![history_since as i64],
             )
@@ -2846,6 +2875,8 @@ impl SqliteLedger {
     }
 
     fn init(conn: Connection, db_prefix: Option<std::path::PathBuf>) -> Result<Self, AlgoError> {
+        // Issue #1757: room for every distinct hot statement (see `CachedConn`).
+        conn.set_prepared_statement_cache_capacity(256);
         // Enable WAL mode for better concurrent read performance. ATTACH-ed
         // databases inherit their own journal mode, so we explicitly switch
         // both schemas to WAL. (`PRAGMA blockdb.journal_mode=WAL` is a no-op
@@ -3041,7 +3072,7 @@ impl SqliteLedger {
                 // help. The dangerous, silent case issue #1633 hit is a
                 // genuinely absent row, not a malformed one.
                 let acctrounds_rnd: Option<i64> = conn
-                    .query_row(
+                    .query_row_cached(
                         "SELECT rnd FROM acctrounds WHERE id = 'acctbase'",
                         [],
                         |row| row.get(0),
@@ -3052,7 +3083,7 @@ impl SqliteLedger {
                     })?;
                 if let Some(rnd) = acctrounds_rnd.filter(|rnd| *rnd > 0) {
                     let header_row_exists: bool = conn
-                        .query_row(
+                        .query_row_cached(
                             "SELECT EXISTS(SELECT 1 FROM blockdb.blocks WHERE rnd = ?1)",
                             params![rnd],
                             |row| row.get(0),
@@ -3113,6 +3144,7 @@ impl SqliteLedger {
             txn_counter,
             savepoint_counter: AtomicU64::new(0),
             in_block: false,
+            read_cache: Default::default(),
             trie: None,
             pre_mutations: Vec::new(),
             trie_cache_target: None,
@@ -3181,6 +3213,13 @@ impl SqliteLedger {
             return None;
         }
         Some(ReadSnapshot { conn })
+    }
+
+    /// Root hash of the in-memory Merkle trie, `None` when the trie is not
+    /// enabled or cannot be hashed. Lets differential tests compare two
+    /// ledgers' committed state (issue #1757).
+    pub fn trie_root(&mut self) -> Option<[u8; 32]> {
+        self.trie.as_mut()?.root_hash().ok()
     }
 
     /// Load the trie from the paged `accounthashes` table, or rebuild from
@@ -3398,7 +3437,7 @@ impl SqliteLedger {
         if self.trie.is_some() {
             let old_blob = self.get_rowid(addr).and_then(|rowid| {
                 self.conn
-                    .query_row(
+                    .query_row_cached(
                         "SELECT data FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
                         params![rowid, index as i64, ctype],
                         |row| row.get::<_, Vec<u8>>(0),
@@ -3453,6 +3492,7 @@ impl SqliteLedger {
         self.lease_snapshot = Some(self.lease_table.clone());
         self.chain_snapshot = Some(self.capture_chain_snapshot(false));
         self.in_block = true;
+        self.read_cache.clear();
         // Issue #523: start this block's `accounttotals` delta accumulator
         // clean. Guards against `set_account`/`remove_account` calls made
         // outside any begin_block/commit_block span (a supported pattern in
@@ -3946,7 +3986,7 @@ impl SqliteLedger {
         let delta = std::mem::take(&mut self.pending_totals_delta);
         let row: Option<(i64, i64, i64, i64, i64, i64, i64)> = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT online, onlinerewardunits, offline, offlinerewardunits, \
                  notparticipating, notparticipatingrewardunits, rewardslevel \
                  FROM accounttotals WHERE id = ''",
@@ -3995,7 +4035,7 @@ impl SqliteLedger {
         let new_notpart = clamp(notpart, delta.not_participating_money);
         let new_notpart_ru = clamp(notpart_ru, delta.not_participating_reward_units);
         self.conn
-            .execute(
+            .execute_cached(
                 "UPDATE accounttotals SET online = ?1, onlinerewardunits = ?2, offline = ?3, \
                  offlinerewardunits = ?4, notparticipating = ?5, notparticipatingrewardunits = ?6, \
                  rewardslevel = ?7 WHERE id = ''",
@@ -4029,7 +4069,10 @@ impl SqliteLedger {
         // Hard bound on any scratch-apply undo journal left open by a panic
         // between save and restore: it must never survive a commit.
         self.lease_table.discard_undo();
+        // Issue #1757: the read memo never outlives the block it was filled in.
+        self.read_cache.clear();
         let result = self.commit_block_uncleaned();
+        self.read_cache.clear();
         match &result {
             Err(_) => self.reset_after_failed_commit(),
             Ok(()) => {
@@ -4291,7 +4334,7 @@ impl SqliteLedger {
     /// catchpoint files on disk.
     pub fn set_last_catchpoint_label(&self, label: &str) -> Result<(), AlgoError> {
         self.conn
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO catchpointstate(id, strval) VALUES(?1, ?2)",
                 params![crate::catchpoint::state_keys::LAST_CATCHPOINT, label],
             )
@@ -4307,7 +4350,7 @@ impl SqliteLedger {
     /// `catchpointTracker.lastCatchpointLabel` field defaults to the
     /// empty string until the first successful export.
     pub fn last_catchpoint_label(&self) -> Result<String, AlgoError> {
-        match self.conn.query_row(
+        match self.conn.query_row_cached(
             "SELECT strval FROM catchpointstate WHERE id = ?1",
             params![crate::catchpoint::state_keys::LAST_CATCHPOINT],
             |row| row.get(0),
@@ -4466,7 +4509,7 @@ impl SqliteLedger {
     fn block_header_digest_at_round(&self, round: u64) -> Result<[u8; 32], AlgoError> {
         let hdrdata: Vec<u8> = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT hdrdata FROM blockdb.blocks WHERE rnd = ?1",
                 params![round as i64],
                 |row| row.get(0),
@@ -4846,6 +4889,8 @@ impl SqliteLedger {
     /// `in_block` stays true) and a retried `rollback_block` can complete.
     /// Returns whether the transaction is gone.
     fn abort_block_state(&mut self, sql_rollback: &rusqlite::Result<()>) -> bool {
+        // Issue #1757: the SQL state is about to be (or was) rolled back.
+        self.read_cache.clear();
         let tx_gone = sql_rollback.is_ok() || self.conn.is_autocommit();
         if !tx_gone {
             // The next begin_block / commit_block completes the abort.
@@ -4886,7 +4931,7 @@ impl SqliteLedger {
     pub fn last_committed_round(&self) -> Result<Option<u64>, AlgoError> {
         let rnd: Option<i64> = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT rnd FROM acctrounds WHERE id = 'acctbase'",
                 [],
                 |row| row.get(0),
@@ -4921,7 +4966,7 @@ impl SqliteLedger {
         // so collect into Option<i64>.
         let raw: Option<i64> = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT MAX(rnd) FROM blockdb.blocks WHERE blkdata IS NOT NULL AND length(blkdata) > 0",
                 [],
                 |row| row.get(0),
@@ -4979,7 +5024,7 @@ impl SqliteLedger {
                 // the row-present check.
                 let row_present: bool = self
                     .conn
-                    .query_row(
+                    .query_row_cached(
                         "SELECT EXISTS(SELECT 1 FROM blockdb.blocks \
                          WHERE rnd = ?1 AND blkdata IS NOT NULL AND length(blkdata) > 0)",
                         params![t as i64],
@@ -5011,7 +5056,7 @@ impl SqliteLedger {
     pub fn has_account_totals(&self) -> Result<bool, AlgoError> {
         let count: i64 = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT COUNT(*) FROM accounttotals WHERE id = ''",
                 [],
                 |row| row.get(0),
@@ -5060,7 +5105,7 @@ impl SqliteLedger {
         not_participating_reward_units: u64,
     ) -> Result<(), AlgoError> {
         self.conn
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO accounttotals(id, online, onlinerewardunits, \
                  offline, offlinerewardunits, notparticipating, \
                  notparticipatingrewardunits, rewardslevel) \
@@ -5091,7 +5136,7 @@ impl SqliteLedger {
     pub fn online_stake(&self) -> Result<u64, AlgoError> {
         let result: Option<i64> = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT online FROM accounttotals WHERE id = ''",
                 [],
                 |row| row.get(0),
@@ -5114,7 +5159,7 @@ impl SqliteLedger {
     pub fn participating_money(&self) -> Result<u64, AlgoError> {
         let result: Option<(i64, i64)> = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT online, offline FROM accounttotals WHERE id = ''",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -5138,7 +5183,7 @@ impl SqliteLedger {
     pub fn total_reward_units(&self) -> Result<u64, AlgoError> {
         let result: Option<(i64, i64)> = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT onlinerewardunits, offlinerewardunits FROM accounttotals WHERE id = ''",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -5178,7 +5223,7 @@ impl SqliteLedger {
         use crate::state_delta::{AccountTotals, AlgoCount};
         let row: Option<(i64, i64, i64, i64, i64, i64, i64)> = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT online, onlinerewardunits, offline, offlinerewardunits, \
                  notparticipating, notparticipatingrewardunits, rewardslevel \
                  FROM accounttotals WHERE id = ''",
@@ -5236,7 +5281,7 @@ impl SqliteLedger {
     pub fn online_supply_at_round(&self, round: u64) -> Result<Option<u64>, AlgoError> {
         let data: Option<Vec<u8>> = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT data FROM onlineroundparamstail WHERE rnd = ?1",
                 params![round as i64],
                 |row| row.get(0),
@@ -5280,7 +5325,7 @@ impl SqliteLedger {
     pub fn put_online_supply_at_round(&self, round: u64, online: u64) -> Result<(), AlgoError> {
         let data = encode_mixed_map(&[("online", encode_msgpack_uint(online))]);
         self.conn
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO onlineroundparamstail (rnd, data) VALUES (?1, ?2)",
                 params![round as i64, data],
             )
@@ -5298,7 +5343,7 @@ impl SqliteLedger {
     /// onlineroundparamstail WHERE rnd < ?`.
     fn prune_online_supply_before(&self, before_round: u64) -> Result<(), AlgoError> {
         self.conn
-            .execute(
+            .execute_cached(
                 "DELETE FROM onlineroundparamstail WHERE rnd < ?1",
                 params![before_round as i64],
             )
@@ -5395,7 +5440,7 @@ impl SqliteLedger {
 
             let prev_blob: Option<Vec<u8>> = self
                 .conn
-                .query_row(
+                .query_row_cached(
                     "SELECT data FROM onlineaccounts WHERE address = ?1 \
                      ORDER BY updround DESC LIMIT 1",
                     params![addr.0.as_slice()],
@@ -5477,7 +5522,7 @@ impl SqliteLedger {
         let nob = account_nob_i64(account);
         let data = encode_online_account_data(account);
         self.conn
-            .execute(
+            .execute_cached(
                 "INSERT INTO onlineaccounts \
                  (address, updround, normalizedonlinebalance, votelastvalid, data) \
                  VALUES (?1, ?2, ?3, ?4, ?5) \
@@ -5511,7 +5556,7 @@ impl SqliteLedger {
         // Step 1: for each address, delete every row older than the window
         // except the single most recent one (still older than the window).
         self.conn
-            .execute(
+            .execute_cached(
                 "DELETE FROM onlineaccounts \
                  WHERE updround < ?1 \
                  AND updround < ( \
@@ -5559,7 +5604,7 @@ impl SqliteLedger {
         }
         for (addr_bytes, updround) in to_delete {
             self.conn
-                .execute(
+                .execute_cached(
                     "DELETE FROM onlineaccounts WHERE address = ?1 AND updround = ?2",
                     params![addr_bytes, updround],
                 )
@@ -5815,7 +5860,7 @@ impl SqliteLedger {
             message: format!("encode fixture header: {e}"),
         })?;
         self.conn
-            .execute(
+            .execute_cached(
                 "INSERT INTO blockdb.blocks (rnd, proto, hdrdata, blkdata) VALUES (?1, ?2, ?3, ?4) \
                  ON CONFLICT(rnd) DO UPDATE SET hdrdata=excluded.hdrdata",
                 params![round as i64, self.protocol, hdrdata, &[] as &[u8]],
@@ -5911,7 +5956,7 @@ impl SqliteLedger {
     ) -> Result<Option<AccountData>, AlgoError> {
         let data: Option<Vec<u8>> = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT data FROM onlineaccounts WHERE address = ?1 AND updround <= ?2 \
                  ORDER BY updround DESC LIMIT 1",
                 params![addr.0.as_slice(), round as i64],
@@ -5958,7 +6003,7 @@ impl SqliteLedger {
     ///     to lose.
     fn flush_chain_state(&self) -> Result<(), AlgoError> {
         self.conn
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', ?1)",
                 params![self.current_round.0 as i64],
             )
@@ -5987,7 +6032,7 @@ impl SqliteLedger {
             message: format!("encode synthesized flush header: {e}"),
         })?;
         self.conn
-            .execute(
+            .execute_cached(
                 "INSERT OR IGNORE INTO blockdb.blocks (rnd, proto, hdrdata, blkdata) \
                  VALUES (?1, ?2, ?3, ?4)",
                 params![
@@ -6109,7 +6154,7 @@ impl SqliteLedger {
     /// Get the rowid for an address in accountbase, or None.
     fn get_rowid(&self, addr: &Address) -> Option<i64> {
         self.conn
-            .query_row(
+            .query_row_cached(
                 "SELECT rowid FROM accountbase WHERE address = ?1",
                 params![addr.0.as_slice()],
                 |row| row.get(0),
@@ -6131,7 +6176,7 @@ impl SqliteLedger {
         let nob = account_nob_i64(&default_account);
         let default_data = encode_account_data(&default_account);
         self.conn
-            .execute(
+            .execute_cached(
                 "INSERT INTO accountbase (address, normalizedonlinebalance, data) VALUES (?1, ?2, ?3)",
                 params![addr.0.as_slice(), nob, default_data],
             )
@@ -6145,7 +6190,7 @@ impl SqliteLedger {
     /// Returns None if no row exists.
     fn get_app_resource_blob(&self, rowid: i64, app_id: u64) -> Option<Vec<u8>> {
         self.conn
-            .query_row(
+            .query_row_cached(
                 "SELECT data FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
                 params![rowid, app_id as i64, CTYPE_APP],
                 |row| row.get(0),
@@ -6161,7 +6206,7 @@ impl SqliteLedger {
     /// Returns None if no row exists.
     fn get_asset_resource_blob(&self, rowid: i64, asset_id: u64) -> Option<Vec<u8>> {
         self.conn
-            .query_row(
+            .query_row_cached(
                 "SELECT data FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
                 params![rowid, asset_id as i64, CTYPE_ASSET],
                 |row| row.get(0),
@@ -6177,7 +6222,7 @@ impl SqliteLedger {
     fn get_creator_from_assetcreators(&self, id: u64) -> Option<Address> {
         let result: Option<Vec<u8>> = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT creator FROM assetcreators WHERE asset = ?1",
                 params![id as i64],
                 |row| row.get(0),
@@ -6325,7 +6370,7 @@ pub fn initialize_meta_from_catchpoint(
     // arrives via lookback download. Downstream readers that hit the
     // payload before lookback completes already need to tolerate
     // missing transactions for the catchpoint round.
-    conn.execute(
+    conn.execute_cached(
         "INSERT INTO blockdb.blocks (rnd, proto, hdrdata, blkdata) \
          VALUES (?1, ?2, ?3, ?4) \
          ON CONFLICT(rnd) DO UPDATE SET proto=excluded.proto, hdrdata=excluded.hdrdata",
@@ -6335,7 +6380,7 @@ pub fn initialize_meta_from_catchpoint(
         message: format!("seed catchpoint block header: {e}"),
     })?;
 
-    conn.execute(
+    conn.execute_cached(
         "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', ?1)",
         params![round as i64],
     )
@@ -6481,16 +6526,28 @@ pub struct SqliteSnapshot {
     online_touched: std::collections::HashSet<Address>,
 }
 
-impl LedgerStore for SqliteLedger {
-    type Snapshot = SqliteSnapshot; // SAVEPOINT name + in-memory totals-delta state
+impl SqliteLedger {
+    /// The block-scoped read memo (issue #1757) is used only inside a block.
+    fn cache_active(&self) -> bool {
+        self.in_block && !self.pending_abort
+    }
 
-    // ---- Accounts ----
+    /// `(hits, misses)` of the block-scoped read memo; a miss is a store read
+    /// that went to SQL (issue #1757).
+    pub fn read_cache_stats(&self) -> (u64, u64) {
+        self.read_cache.stats()
+    }
 
-    fn get_account(&self, addr: &Address) -> Option<AccountData> {
-        let _st = crate::follow_timing::StateTimer::read();
+    /// Enables or disables the block-scoped read memo (default: enabled).
+    /// Exists for the differential tests and benchmarks.
+    pub fn set_read_cache_enabled(&mut self, enabled: bool) {
+        self.read_cache.set_enabled(enabled);
+    }
+
+    fn get_account_sql(&self, addr: &Address) -> Option<AccountData> {
         let result: Option<Vec<u8>> = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT data FROM accountbase WHERE address = ?1",
                 params![addr.0.as_slice()],
                 |row| row.get(0),
@@ -6504,8 +6561,7 @@ impl LedgerStore for SqliteLedger {
         result.and_then(|data| decode_account_data(&data).ok())
     }
 
-    fn set_account(&mut self, addr: &Address, account: AccountData) {
-        let _st = crate::follow_timing::StateTimer::write();
+    fn set_account_sql(&mut self, addr: &Address, account: AccountData) {
         let old = self.get_account(addr);
         // Issue #960: record this address as touched this block so
         // `record_online_account_history` (called from `commit_block`)
@@ -6537,7 +6593,7 @@ impl LedgerStore for SqliteLedger {
         // the rowid. INSERT OR REPLACE deletes and re-inserts, which changes the
         // rowid and orphans resources table entries that reference addrid.
         self.conn
-            .execute(
+            .execute_cached(
                 "INSERT INTO accountbase (address, normalizedonlinebalance, data) VALUES (?1, ?2, ?3) \
                  ON CONFLICT(address) DO UPDATE SET normalizedonlinebalance = excluded.normalizedonlinebalance, data = excluded.data",
                 params![addr.0.as_slice(), nob, data],
@@ -6545,8 +6601,7 @@ impl LedgerStore for SqliteLedger {
             .expect("set_account");
     }
 
-    fn remove_account(&mut self, addr: &Address) {
-        let _st = crate::follow_timing::StateTimer::write();
+    fn remove_account_sql(&mut self, addr: &Address) {
         let old = self.get_account(addr);
         // Issue #960: same reasoning as `set_account` — a closed account
         // that was previously online must still get an offline marker row.
@@ -6569,22 +6624,19 @@ impl LedgerStore for SqliteLedger {
         if let Some(rowid) = self.get_rowid(addr) {
             let _ = self
                 .conn
-                .execute("DELETE FROM resources WHERE addrid = ?1", params![rowid]);
+                .execute_cached("DELETE FROM resources WHERE addrid = ?1", params![rowid]);
         }
-        let _ = self.conn.execute(
+        let _ = self.conn.execute_cached(
             "DELETE FROM accountbase WHERE address = ?1",
             params![addr.0.as_slice()],
         );
     }
 
-    // ---- Asset Holdings ----
-
-    fn get_asset_holding(&self, addr: &Address, asset_id: u64) -> Option<AssetHolding> {
-        let _st = crate::follow_timing::StateTimer::read();
+    fn get_asset_holding_sql(&self, addr: &Address, asset_id: u64) -> Option<AssetHolding> {
         let rowid = self.get_rowid(addr)?;
         let data: Vec<u8> = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT data FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
                 params![rowid, asset_id as i64, CTYPE_ASSET],
                 |row| row.get(0),
@@ -6604,8 +6656,7 @@ impl LedgerStore for SqliteLedger {
         decode_asset_holding(&data).ok()
     }
 
-    fn set_asset_holding(&mut self, addr: &Address, asset_id: u64, holding: AssetHolding) {
-        let _st = crate::follow_timing::StateTimer::write();
+    fn set_asset_holding_sql(&mut self, addr: &Address, asset_id: u64, holding: AssetHolding) {
         self.record_resource_pre_mutation(addr, asset_id, CTYPE_ASSET);
         let rowid = self.get_or_insert_rowid(addr).expect("get_or_insert_rowid");
         let update_round = self.current_round.0;
@@ -6626,15 +6677,14 @@ impl LedgerStore for SqliteLedger {
         let data = set_blob_update_round(&data, update_round);
 
         self.conn
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO resources (addrid, aidx, data, ctype) VALUES (?1, ?2, ?3, ?4)",
                 params![rowid, asset_id as i64, data, CTYPE_ASSET],
             )
             .expect("set_asset_holding");
     }
 
-    fn remove_asset_holding(&mut self, addr: &Address, asset_id: u64) {
-        let _st = crate::follow_timing::StateTimer::write();
+    fn remove_asset_holding_sql(&mut self, addr: &Address, asset_id: u64) {
         self.record_resource_pre_mutation(addr, asset_id, CTYPE_ASSET);
         let update_round = self.current_round.0;
         if let Some(rowid) = self.get_rowid(addr) {
@@ -6645,14 +6695,14 @@ impl LedgerStore for SqliteLedger {
                     // Both flags set — strip holding, keep asset params.
                     if let Some(stripped) = strip_asset_holding_from_blob(&existing) {
                         let stripped = set_blob_update_round(&stripped, update_round);
-                        let _ = self.conn.execute(
+                        let _ = self.conn.execute_cached(
                             "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
                             params![stripped, rowid, asset_id as i64, CTYPE_ASSET],
                         );
                     }
                 } else {
                     // Only holding — delete the whole row.
-                    let _ = self.conn.execute(
+                    let _ = self.conn.execute_cached(
                         "DELETE FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
                         params![rowid, asset_id as i64, CTYPE_ASSET],
                     );
@@ -6661,13 +6711,7 @@ impl LedgerStore for SqliteLedger {
         }
     }
 
-    fn has_asset_holding(&self, addr: &Address, asset_id: u64) -> bool {
-        let _st = crate::follow_timing::StateTimer::read();
-        self.get_asset_holding(addr, asset_id).is_some()
-    }
-
-    fn remove_all_asset_holdings_for_asset(&mut self, asset_id: u64) {
-        let _st = crate::follow_timing::StateTimer::write();
+    fn remove_all_asset_holdings_for_asset_sql(&mut self, asset_id: u64) {
         // Find all (addrid, data, address) rows for this asset_id with a holding flag.
         let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = {
             let mut stmt = self
@@ -6709,14 +6753,14 @@ impl LedgerStore for SqliteLedger {
                 // Both flags set — strip holding, keep asset params.
                 if let Some(stripped) = strip_asset_holding_from_blob(data) {
                     let stripped = set_blob_update_round(&stripped, update_round);
-                    let _ = self.conn.execute(
+                    let _ = self.conn.execute_cached(
                         "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
                         params![stripped, rowid, asset_id as i64, CTYPE_ASSET],
                     );
                 }
             } else {
                 // Only holding — delete the whole row.
-                let _ = self.conn.execute(
+                let _ = self.conn.execute_cached(
                     "DELETE FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
                     params![rowid, asset_id as i64, CTYPE_ASSET],
                 );
@@ -6731,10 +6775,7 @@ impl LedgerStore for SqliteLedger {
         }
     }
 
-    // ---- Asset Params ----
-
-    fn get_asset_params(&self, asset_id: u64) -> Option<AssetParamsRecord> {
-        let _st = crate::follow_timing::StateTimer::read();
+    fn get_asset_params_sql(&self, asset_id: u64) -> Option<AssetParamsRecord> {
         // Get creator from assetcreators table.
         let creator = self.get_creator_from_assetcreators(asset_id)?;
 
@@ -6742,7 +6783,7 @@ impl LedgerStore for SqliteLedger {
         let rowid = self.get_rowid(&creator)?;
         let data: Vec<u8> = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT data FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
                 params![rowid, asset_id as i64, CTYPE_ASSET],
                 |row| row.get(0),
@@ -6763,8 +6804,7 @@ impl LedgerStore for SqliteLedger {
         Some(AssetParamsRecord { params, creator })
     }
 
-    fn set_asset_params(&mut self, asset_id: u64, record: AssetParamsRecord) {
-        let _st = crate::follow_timing::StateTimer::write();
+    fn set_asset_params_sql(&mut self, asset_id: u64, record: AssetParamsRecord) {
         self.record_resource_pre_mutation(&record.creator, asset_id, CTYPE_ASSET);
         let rowid = self
             .get_or_insert_rowid(&record.creator)
@@ -6788,7 +6828,7 @@ impl LedgerStore for SqliteLedger {
 
         // Upsert into resources.
         self.conn
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO resources (addrid, aidx, data, ctype) VALUES (?1, ?2, ?3, ?4)",
                 params![rowid, asset_id as i64, data, CTYPE_ASSET],
             )
@@ -6796,15 +6836,14 @@ impl LedgerStore for SqliteLedger {
 
         // Upsert into assetcreators.
         self.conn
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO assetcreators (asset, creator, ctype) VALUES (?1, ?2, ?3)",
                 params![asset_id as i64, record.creator.0.as_slice(), CTYPE_ASSET],
             )
             .expect("set_asset_params assetcreators");
     }
 
-    fn remove_asset_params(&mut self, asset_id: u64) {
-        let _st = crate::follow_timing::StateTimer::write();
+    fn remove_asset_params_sql(&mut self, asset_id: u64) {
         // Record pre-mutation for trie tracking.
         if self.trie.is_some() {
             if let Some(creator) = self.get_creator_from_assetcreators(asset_id) {
@@ -6822,14 +6861,14 @@ impl LedgerStore for SqliteLedger {
                         // Both flags set — strip params, keep holding.
                         if let Some(stripped) = strip_asset_params_from_blob(&existing) {
                             let stripped = set_blob_update_round(&stripped, update_round);
-                            let _ = self.conn.execute(
+                            let _ = self.conn.execute_cached(
                                 "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
                                 params![stripped, rowid, asset_id as i64, CTYPE_ASSET],
                             );
                         }
                     } else {
                         // Only ownership — delete the whole row.
-                        let _ = self.conn.execute(
+                        let _ = self.conn.execute_cached(
                             "DELETE FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
                             params![rowid, asset_id as i64, CTYPE_ASSET],
                         );
@@ -6838,34 +6877,18 @@ impl LedgerStore for SqliteLedger {
             }
         }
         // Always remove from assetcreators.
-        let _ = self.conn.execute(
+        let _ = self.conn.execute_cached(
             "DELETE FROM assetcreators WHERE asset = ?1",
             params![asset_id as i64],
         );
     }
 
-    fn has_asset_params(&self, asset_id: u64) -> bool {
-        let _st = crate::follow_timing::StateTimer::read();
-        let count: i64 = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM assetcreators WHERE asset = ?1 AND ctype = ?2",
-                params![asset_id as i64, CTYPE_ASSET],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        count > 0
-    }
-
-    // ---- App Params ----
-
-    fn get_app_params(&self, app_id: u64) -> Option<AppParams> {
-        let _st = crate::follow_timing::StateTimer::read();
+    fn get_app_params_sql(&self, app_id: u64) -> Option<AppParams> {
         let creator = self.get_creator_from_assetcreators(app_id)?;
         let rowid = self.get_rowid(&creator)?;
         let data: Vec<u8> = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT data FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
                 params![rowid, app_id as i64, CTYPE_APP],
                 |row| row.get(0),
@@ -6885,8 +6908,7 @@ impl LedgerStore for SqliteLedger {
         decode_app_params(&data, creator).ok()
     }
 
-    fn set_app_params(&mut self, app_id: u64, params: AppParams) {
-        let _st = crate::follow_timing::StateTimer::write();
+    fn set_app_params_sql(&mut self, app_id: u64, params: AppParams) {
         let creator = params.creator;
         self.record_resource_pre_mutation(&creator, app_id, CTYPE_APP);
         let rowid = self
@@ -6910,22 +6932,21 @@ impl LedgerStore for SqliteLedger {
         let data = set_blob_update_round(&data, update_round);
 
         self.conn
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO resources (addrid, aidx, data, ctype) VALUES (?1, ?2, ?3, ?4)",
                 params![rowid, app_id as i64, data, CTYPE_APP],
             )
             .expect("set_app_params resource");
 
         self.conn
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO assetcreators (asset, creator, ctype) VALUES (?1, ?2, ?3)",
                 params![app_id as i64, creator.0.as_slice(), CTYPE_APP],
             )
             .expect("set_app_params assetcreators");
     }
 
-    fn remove_app_params(&mut self, app_id: u64) {
-        let _st = crate::follow_timing::StateTimer::write();
+    fn remove_app_params_sql(&mut self, app_id: u64) {
         // Record pre-mutation for trie tracking.
         if self.trie.is_some() {
             if let Some(creator) = self.get_creator_from_assetcreators(app_id) {
@@ -6942,14 +6963,14 @@ impl LedgerStore for SqliteLedger {
                         // Both flags set — strip ownership, keep local state.
                         if let Some(stripped) = strip_ownership_from_blob(&existing) {
                             let stripped = set_blob_update_round(&stripped, update_round);
-                            let _ = self.conn.execute(
+                            let _ = self.conn.execute_cached(
                                 "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
                                 params![stripped, rowid, app_id as i64, CTYPE_APP],
                             );
                         }
                     } else {
                         // Only ownership — delete the whole row.
-                        let _ = self.conn.execute(
+                        let _ = self.conn.execute_cached(
                             "DELETE FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
                             params![rowid, app_id as i64, CTYPE_APP],
                         );
@@ -6957,61 +6978,13 @@ impl LedgerStore for SqliteLedger {
                 }
             }
         }
-        let _ = self.conn.execute(
+        let _ = self.conn.execute_cached(
             "DELETE FROM assetcreators WHERE asset = ?1 AND ctype = ?2",
             params![app_id as i64, CTYPE_APP],
         );
     }
 
-    fn has_app_params(&self, app_id: u64) -> bool {
-        let _st = crate::follow_timing::StateTimer::read();
-        let count: i64 = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM assetcreators WHERE asset = ?1 AND ctype = ?2",
-                params![app_id as i64, CTYPE_APP],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        count > 0
-    }
-
-    fn app_params_created_by(&self, creator: &Address) -> Vec<AppParams> {
-        let _st = crate::follow_timing::StateTimer::read();
-        let rowid = match self.get_rowid(creator) {
-            Some(r) => r,
-            None => return Vec::new(),
-        };
-
-        let mut stmt = self
-            .conn
-            .prepare("SELECT aidx, data FROM resources WHERE addrid = ?1 AND ctype = ?2")
-            .expect("prepare app_params_created_by");
-
-        let results: Vec<AppParams> = stmt
-            .query_map(params![rowid, CTYPE_APP], |row| {
-                let data: Vec<u8> = row.get(1)?;
-                Ok(data)
-            })
-            .expect("query app_params_created_by")
-            .filter_map(|r| r.ok())
-            .filter_map(|data| {
-                // Only include blobs with ownership flag.
-                let meta = inspect_resource_blob(&data);
-                if !meta.has_ownership {
-                    return None;
-                }
-                decode_app_params(&data, *creator).ok()
-            })
-            .collect();
-
-        results
-    }
-
-    // ---- App Local States ----
-
-    fn get_app_local_state(&self, addr: &Address, app_id: u64) -> Option<AppLocalState> {
-        let _st = crate::follow_timing::StateTimer::read();
+    fn get_app_local_state_sql(&self, addr: &Address, app_id: u64) -> Option<AppLocalState> {
         let rowid = self.get_rowid(addr)?;
         // Go stores both app params and app local state in the same resources
         // table — params under creator's addrid, local state under the user's addrid,
@@ -7019,7 +6992,7 @@ impl LedgerStore for SqliteLedger {
         // The resource blob's "y" flags distinguish them.
         let data: Vec<u8> = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT data FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
                 params![rowid, app_id as i64, CTYPE_APP],
                 |row| row.get(0),
@@ -7040,8 +7013,7 @@ impl LedgerStore for SqliteLedger {
         decode_app_local_state(&data).ok()
     }
 
-    fn set_app_local_state(&mut self, addr: &Address, app_id: u64, local_state: AppLocalState) {
-        let _st = crate::follow_timing::StateTimer::write();
+    fn set_app_local_state_sql(&mut self, addr: &Address, app_id: u64, local_state: AppLocalState) {
         self.record_resource_pre_mutation(addr, app_id, CTYPE_APP);
         let rowid = self.get_or_insert_rowid(addr).expect("get_or_insert_rowid");
         let update_round = self.current_round.0;
@@ -7062,15 +7034,14 @@ impl LedgerStore for SqliteLedger {
         let data = set_blob_update_round(&data, update_round);
 
         self.conn
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO resources (addrid, aidx, data, ctype) VALUES (?1, ?2, ?3, ?4)",
                 params![rowid, app_id as i64, data, CTYPE_APP],
             )
             .expect("set_app_local_state");
     }
 
-    fn remove_app_local_state(&mut self, addr: &Address, app_id: u64) {
-        let _st = crate::follow_timing::StateTimer::write();
+    fn remove_app_local_state_sql(&mut self, addr: &Address, app_id: u64) {
         self.record_resource_pre_mutation(addr, app_id, CTYPE_APP);
         let update_round = self.current_round.0;
         if let Some(rowid) = self.get_rowid(addr) {
@@ -7081,14 +7052,14 @@ impl LedgerStore for SqliteLedger {
                     // Both flags set — strip holding, keep app params.
                     if let Some(stripped) = strip_holding_from_blob(&existing) {
                         let stripped = set_blob_update_round(&stripped, update_round);
-                        let _ = self.conn.execute(
+                        let _ = self.conn.execute_cached(
                             "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
                             params![stripped, rowid, app_id as i64, CTYPE_APP],
                         );
                     }
                 } else {
                     // Only holding — delete the whole row.
-                    let _ = self.conn.execute(
+                    let _ = self.conn.execute_cached(
                         "DELETE FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
                         params![rowid, app_id as i64, CTYPE_APP],
                     );
@@ -7097,13 +7068,7 @@ impl LedgerStore for SqliteLedger {
         }
     }
 
-    fn has_app_local_state(&self, addr: &Address, app_id: u64) -> bool {
-        let _st = crate::follow_timing::StateTimer::read();
-        self.get_app_local_state(addr, app_id).is_some()
-    }
-
-    fn remove_all_app_local_states_for_app(&mut self, app_id: u64) {
-        let _st = crate::follow_timing::StateTimer::write();
+    fn remove_all_app_local_states_for_app_sql(&mut self, app_id: u64) {
         // Find all (addrid, data, address) rows for this app_id with a holding flag (local state).
         let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = {
             let mut stmt = self
@@ -7148,14 +7113,14 @@ impl LedgerStore for SqliteLedger {
                 // Both flags set — strip local state, keep app params.
                 if let Some(stripped) = strip_holding_from_blob(data) {
                     let stripped = set_blob_update_round(&stripped, update_round);
-                    let _ = self.conn.execute(
+                    let _ = self.conn.execute_cached(
                         "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
                         params![stripped, rowid, app_id as i64, CTYPE_APP],
                     );
                 }
             } else {
                 // Only local state — delete the whole row.
-                let _ = self.conn.execute(
+                let _ = self.conn.execute_cached(
                     "DELETE FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
                     params![rowid, app_id as i64, CTYPE_APP],
                 );
@@ -7169,6 +7134,289 @@ impl LedgerStore for SqliteLedger {
             acct.total_app_schema = acct.total_app_schema.sub_schema(&local_schema);
             self.set_account(&addr, acct);
         }
+    }
+
+    fn get_box_sql(&self, app_id: u64, key: &[u8]) -> Option<Vec<u8>> {
+        let full_key = make_box_key(app_id, key);
+        self.conn
+            .query_row_cached(
+                "SELECT value FROM kvstore WHERE key = ?1",
+                params![full_key],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .unwrap_or(None)
+    }
+
+    fn set_box_sql(&mut self, app_id: u64, key: &[u8], value: Vec<u8>) {
+        let full_key = make_box_key(app_id, key);
+
+        // Record pre-mutation for trie tracking.
+        if self.trie.is_some() {
+            let old_value = self
+                .conn
+                .query_row_cached(
+                    "SELECT value FROM kvstore WHERE key = ?1",
+                    params![full_key],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()
+                .unwrap_or(None);
+            self.pre_mutations.push(SqlitePreMutation::Kv {
+                full_key: full_key.clone(),
+                old_value,
+            });
+        }
+
+        self.conn
+            .execute_cached(
+                "INSERT INTO kvstore (key, value) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![full_key, value],
+            )
+            .expect("set_box upsert");
+    }
+
+    fn delete_box_sql(&mut self, app_id: u64, key: &[u8]) -> bool {
+        let full_key = make_box_key(app_id, key);
+
+        // Record pre-mutation for trie tracking.
+        if self.trie.is_some() {
+            let old_value = self
+                .conn
+                .query_row_cached(
+                    "SELECT value FROM kvstore WHERE key = ?1",
+                    params![full_key],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()
+                .unwrap_or(None);
+            if old_value.is_some() {
+                self.pre_mutations.push(SqlitePreMutation::Kv {
+                    full_key: full_key.clone(),
+                    old_value,
+                });
+            }
+        }
+
+        let rows = self
+            .conn
+            .execute_cached("DELETE FROM kvstore WHERE key = ?1", params![full_key])
+            .expect("delete_box");
+        rows > 0
+    }
+}
+
+impl LedgerStore for SqliteLedger {
+    type Snapshot = SqliteSnapshot; // SAVEPOINT name + in-memory totals-delta state
+
+    // ---- Accounts ----
+
+    fn get_account(&self, addr: &Address) -> Option<AccountData> {
+        let _st = crate::follow_timing::StateTimer::read();
+        self.read_cache.get_or_load(
+            self.cache_active(),
+            |m| &mut m.accounts,
+            *addr,
+            || self.get_account_sql(addr),
+        )
+    }
+
+    fn set_account(&mut self, addr: &Address, account: AccountData) {
+        let _st = crate::follow_timing::StateTimer::write();
+        // Write-through with exactly what a read of the stored blob returns.
+        let stored = self
+            .cache_active()
+            .then(|| decode_account_data(&encode_account_data(&account)).ok());
+        self.set_account_sql(addr, account);
+        match stored {
+            Some(v) => self.read_cache.put_account(addr, v),
+            None => self.read_cache.inv_account(addr),
+        }
+    }
+
+    fn remove_account(&mut self, addr: &Address) {
+        let _st = crate::follow_timing::StateTimer::write();
+        self.remove_account_sql(addr);
+        self.read_cache.clear();
+    }
+
+    // ---- Asset Holdings ----
+
+    fn get_asset_holding(&self, addr: &Address, asset_id: u64) -> Option<AssetHolding> {
+        let _st = crate::follow_timing::StateTimer::read();
+        self.read_cache.get_or_load(
+            self.cache_active(),
+            |m| &mut m.holdings,
+            (*addr, asset_id),
+            || self.get_asset_holding_sql(addr, asset_id),
+        )
+    }
+
+    fn set_asset_holding(&mut self, addr: &Address, asset_id: u64, holding: AssetHolding) {
+        let _st = crate::follow_timing::StateTimer::write();
+        self.set_asset_holding_sql(addr, asset_id, holding);
+        self.read_cache.inv_resource(addr, asset_id);
+    }
+
+    fn remove_asset_holding(&mut self, addr: &Address, asset_id: u64) {
+        let _st = crate::follow_timing::StateTimer::write();
+        self.remove_asset_holding_sql(addr, asset_id);
+        self.read_cache.inv_resource(addr, asset_id);
+    }
+
+    fn has_asset_holding(&self, addr: &Address, asset_id: u64) -> bool {
+        let _st = crate::follow_timing::StateTimer::read();
+        self.get_asset_holding(addr, asset_id).is_some()
+    }
+
+    fn remove_all_asset_holdings_for_asset(&mut self, asset_id: u64) {
+        let _st = crate::follow_timing::StateTimer::write();
+        self.remove_all_asset_holdings_for_asset_sql(asset_id);
+        self.read_cache.clear();
+    }
+
+    // ---- Asset Params ----
+
+    fn get_asset_params(&self, asset_id: u64) -> Option<AssetParamsRecord> {
+        let _st = crate::follow_timing::StateTimer::read();
+        self.read_cache.get_or_load(
+            self.cache_active(),
+            |m| &mut m.asset_params,
+            asset_id,
+            || self.get_asset_params_sql(asset_id),
+        )
+    }
+
+    fn set_asset_params(&mut self, asset_id: u64, record: AssetParamsRecord) {
+        let _st = crate::follow_timing::StateTimer::write();
+        let owner = record.creator;
+        self.set_asset_params_sql(asset_id, record);
+        self.read_cache.inv_resource(&owner, asset_id);
+    }
+
+    fn remove_asset_params(&mut self, asset_id: u64) {
+        let _st = crate::follow_timing::StateTimer::write();
+        self.remove_asset_params_sql(asset_id);
+        self.read_cache.clear();
+    }
+
+    fn has_asset_params(&self, asset_id: u64) -> bool {
+        let _st = crate::follow_timing::StateTimer::read();
+        let count: i64 = self
+            .conn
+            .query_row_cached(
+                "SELECT COUNT(*) FROM assetcreators WHERE asset = ?1 AND ctype = ?2",
+                params![asset_id as i64, CTYPE_ASSET],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        count > 0
+    }
+
+    // ---- App Params ----
+
+    fn get_app_params(&self, app_id: u64) -> Option<AppParams> {
+        let _st = crate::follow_timing::StateTimer::read();
+        self.read_cache.get_or_load(
+            self.cache_active(),
+            |m| &mut m.app_params,
+            app_id,
+            || self.get_app_params_sql(app_id),
+        )
+    }
+
+    fn set_app_params(&mut self, app_id: u64, params: AppParams) {
+        let _st = crate::follow_timing::StateTimer::write();
+        let owner = params.creator;
+        self.set_app_params_sql(app_id, params);
+        self.read_cache.inv_resource(&owner, app_id);
+    }
+
+    fn remove_app_params(&mut self, app_id: u64) {
+        let _st = crate::follow_timing::StateTimer::write();
+        self.remove_app_params_sql(app_id);
+        self.read_cache.clear();
+    }
+
+    fn has_app_params(&self, app_id: u64) -> bool {
+        let _st = crate::follow_timing::StateTimer::read();
+        let count: i64 = self
+            .conn
+            .query_row_cached(
+                "SELECT COUNT(*) FROM assetcreators WHERE asset = ?1 AND ctype = ?2",
+                params![app_id as i64, CTYPE_APP],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        count > 0
+    }
+
+    fn app_params_created_by(&self, creator: &Address) -> Vec<AppParams> {
+        let _st = crate::follow_timing::StateTimer::read();
+        let rowid = match self.get_rowid(creator) {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT aidx, data FROM resources WHERE addrid = ?1 AND ctype = ?2")
+            .expect("prepare app_params_created_by");
+
+        let results: Vec<AppParams> = stmt
+            .query_map(params![rowid, CTYPE_APP], |row| {
+                let data: Vec<u8> = row.get(1)?;
+                Ok(data)
+            })
+            .expect("query app_params_created_by")
+            .filter_map(|r| r.ok())
+            .filter_map(|data| {
+                // Only include blobs with ownership flag.
+                let meta = inspect_resource_blob(&data);
+                if !meta.has_ownership {
+                    return None;
+                }
+                decode_app_params(&data, *creator).ok()
+            })
+            .collect();
+
+        results
+    }
+
+    // ---- App Local States ----
+
+    fn get_app_local_state(&self, addr: &Address, app_id: u64) -> Option<AppLocalState> {
+        let _st = crate::follow_timing::StateTimer::read();
+        self.read_cache.get_or_load(
+            self.cache_active(),
+            |m| &mut m.local_states,
+            (*addr, app_id),
+            || self.get_app_local_state_sql(addr, app_id),
+        )
+    }
+
+    fn set_app_local_state(&mut self, addr: &Address, app_id: u64, local_state: AppLocalState) {
+        let _st = crate::follow_timing::StateTimer::write();
+        self.set_app_local_state_sql(addr, app_id, local_state);
+        self.read_cache.inv_resource(addr, app_id);
+    }
+
+    fn remove_app_local_state(&mut self, addr: &Address, app_id: u64) {
+        let _st = crate::follow_timing::StateTimer::write();
+        self.remove_app_local_state_sql(addr, app_id);
+        self.read_cache.inv_resource(addr, app_id);
+    }
+
+    fn has_app_local_state(&self, addr: &Address, app_id: u64) -> bool {
+        let _st = crate::follow_timing::StateTimer::read();
+        self.get_app_local_state(addr, app_id).is_some()
+    }
+
+    fn remove_all_app_local_states_for_app(&mut self, app_id: u64) {
+        let _st = crate::follow_timing::StateTimer::write();
+        self.remove_all_app_local_states_for_app_sql(app_id);
+        self.read_cache.clear();
     }
 
     fn app_local_states_for_addr(&self, addr: &Address) -> Vec<(u64, AppLocalState)> {
@@ -7318,75 +7566,31 @@ impl LedgerStore for SqliteLedger {
 
     fn get_box(&self, app_id: u64, key: &[u8]) -> Option<Vec<u8>> {
         let _st = crate::follow_timing::StateTimer::read();
-        let full_key = make_box_key(app_id, key);
-        self.conn
-            .query_row(
-                "SELECT value FROM kvstore WHERE key = ?1",
-                params![full_key],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()
-            .unwrap_or(None)
+        self.read_cache.get_or_load(
+            self.cache_active(),
+            |m| &mut m.boxes,
+            (app_id, key.to_vec()),
+            || self.get_box_sql(app_id, key),
+        )
     }
 
     fn set_box(&mut self, app_id: u64, key: &[u8], value: Vec<u8>) {
         let _st = crate::follow_timing::StateTimer::write();
-        let full_key = make_box_key(app_id, key);
-
-        // Record pre-mutation for trie tracking.
-        if self.trie.is_some() {
-            let old_value = self
-                .conn
-                .query_row(
-                    "SELECT value FROM kvstore WHERE key = ?1",
-                    params![full_key],
-                    |row| row.get::<_, Vec<u8>>(0),
-                )
-                .optional()
-                .unwrap_or(None);
-            self.pre_mutations.push(SqlitePreMutation::Kv {
-                full_key: full_key.clone(),
-                old_value,
-            });
+        let stored = self.cache_active().then(|| value.clone());
+        self.set_box_sql(app_id, key, value);
+        match stored {
+            Some(v) => self.read_cache.put_box(app_id, key, Some(v)),
+            None => self.read_cache.inv_box(app_id, key),
         }
-
-        self.conn
-            .execute(
-                "INSERT INTO kvstore (key, value) VALUES (?1, ?2) \
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![full_key, value],
-            )
-            .expect("set_box upsert");
     }
 
     fn delete_box(&mut self, app_id: u64, key: &[u8]) -> bool {
         let _st = crate::follow_timing::StateTimer::write();
-        let full_key = make_box_key(app_id, key);
-
-        // Record pre-mutation for trie tracking.
-        if self.trie.is_some() {
-            let old_value = self
-                .conn
-                .query_row(
-                    "SELECT value FROM kvstore WHERE key = ?1",
-                    params![full_key],
-                    |row| row.get::<_, Vec<u8>>(0),
-                )
-                .optional()
-                .unwrap_or(None);
-            if old_value.is_some() {
-                self.pre_mutations.push(SqlitePreMutation::Kv {
-                    full_key: full_key.clone(),
-                    old_value,
-                });
-            }
+        let result = self.delete_box_sql(app_id, key);
+        if self.cache_active() {
+            self.read_cache.put_box(app_id, key, None);
         }
-
-        let rows = self
-            .conn
-            .execute("DELETE FROM kvstore WHERE key = ?1", params![full_key])
-            .expect("delete_box");
-        rows > 0
+        result
     }
 
     fn box_keys_for_app(&self, app_id: u64) -> Vec<Vec<u8>> {
@@ -7638,6 +7842,8 @@ impl LedgerStore for SqliteLedger {
         // See `SqliteSnapshot`'s doc comment for the full rationale.
         self.pending_totals_delta = snapshot.totals_delta;
         self.pending_online_touched = snapshot.online_touched;
+        // Issue #1757: `ROLLBACK TO SAVEPOINT` reverted rows behind the memo.
+        self.read_cache.clear();
     }
 
     fn save_scratch_state(&mut self) -> Option<Box<dyn std::any::Any>> {
@@ -7665,6 +7871,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn restore_scratch_state(&mut self, saved: Box<dyn std::any::Any>) {
+        self.read_cache.clear();
         match saved.downcast::<usize>() {
             Ok(pre_mutations_len) => {
                 self.lease_table.rollback_undo();
@@ -7854,7 +8061,7 @@ impl LedgerStore for SqliteLedger {
                     // matching Go's ResourcesHashBuilderV6 which uses resData.UpdateRound.
                     let new_blob = self.get_rowid(&addr).and_then(|rowid| {
                         self.conn
-                            .query_row(
+                            .query_row_cached(
                                 "SELECT data FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
                                 params![rowid, index as i64, ctype],
                                 |row| row.get::<_, Vec<u8>>(0),
@@ -7886,7 +8093,7 @@ impl LedgerStore for SqliteLedger {
                     // Add new trie element if the key still exists in the kvstore.
                     let new_value: Option<Vec<u8>> = self
                         .conn
-                        .query_row(
+                        .query_row_cached(
                             "SELECT value FROM kvstore WHERE key = ?1",
                             params![full_key],
                             |row| row.get::<_, Vec<u8>>(0),
@@ -7932,7 +8139,7 @@ impl LedgerStore for SqliteLedger {
     ) -> Result<(), AlgoError> {
         let _st = crate::follow_timing::StateTimer::write();
         self.conn
-            .execute(
+            .execute_cached(
                 "INSERT INTO blockdb.blocks (rnd, proto, hdrdata, blkdata) VALUES (?1, ?2, ?3, ?4) \
                  ON CONFLICT(rnd) DO UPDATE SET proto=excluded.proto, hdrdata=excluded.hdrdata, blkdata=excluded.blkdata",
                 params![round as i64, proto, hdrdata, blkdata],
@@ -7946,7 +8153,7 @@ impl LedgerStore for SqliteLedger {
     fn get_block_data(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
         let _st = crate::follow_timing::StateTimer::read();
         self.conn
-            .query_row(
+            .query_row_cached(
                 "SELECT blkdata FROM blockdb.blocks WHERE rnd = ?1",
                 params![round as i64],
                 |row| row.get(0),
@@ -7960,7 +8167,7 @@ impl LedgerStore for SqliteLedger {
     fn get_block_header_data(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
         let _st = crate::follow_timing::StateTimer::read();
         self.conn
-            .query_row(
+            .query_row_cached(
                 "SELECT hdrdata FROM blockdb.blocks WHERE rnd = ?1",
                 params![round as i64],
                 |row| row.get(0),
@@ -7974,7 +8181,7 @@ impl LedgerStore for SqliteLedger {
     fn get_block_cert(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
         let _st = crate::follow_timing::StateTimer::read();
         self.conn
-            .query_row(
+            .query_row_cached(
                 "SELECT certdata FROM blockdb.blocks WHERE rnd = ?1",
                 params![round as i64],
                 |row| row.get::<_, Option<Vec<u8>>>(0),
@@ -7989,7 +8196,7 @@ impl LedgerStore for SqliteLedger {
     fn get_block_proto(&self, round: u64) -> Result<Option<String>, AlgoError> {
         let _st = crate::follow_timing::StateTimer::read();
         self.conn
-            .query_row(
+            .query_row_cached(
                 "SELECT proto FROM blockdb.blocks WHERE rnd = ?1",
                 params![round as i64],
                 |row| row.get(0),
@@ -8004,7 +8211,7 @@ impl LedgerStore for SqliteLedger {
         let _st = crate::follow_timing::StateTimer::write();
         let rows_affected = self
             .conn
-            .execute(
+            .execute_cached(
                 "UPDATE blockdb.blocks SET certdata = ?2 WHERE rnd = ?1",
                 params![round as i64, certdata],
             )
@@ -8024,7 +8231,7 @@ impl LedgerStore for SqliteLedger {
     fn put_txtail(&mut self, round: u64, data: &[u8]) -> Result<(), AlgoError> {
         let _st = crate::follow_timing::StateTimer::write();
         self.conn
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO txtail (rnd, data) VALUES (?1, ?2)",
                 params![round as i64, data],
             )
@@ -8037,7 +8244,7 @@ impl LedgerStore for SqliteLedger {
     fn get_txtail(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
         let _st = crate::follow_timing::StateTimer::read();
         self.conn
-            .query_row(
+            .query_row_cached(
                 "SELECT data FROM txtail WHERE rnd = ?1",
                 params![round as i64],
                 |row| row.get(0),
@@ -8053,7 +8260,7 @@ impl LedgerStore for SqliteLedger {
     fn forget_before(&mut self, round: u64) -> Result<(), AlgoError> {
         let _st = crate::follow_timing::StateTimer::write();
         self.conn
-            .execute(
+            .execute_cached(
                 "DELETE FROM blockdb.blocks WHERE rnd < ?1",
                 params![round as i64],
             )
@@ -8061,7 +8268,7 @@ impl LedgerStore for SqliteLedger {
                 message: format!("forget_before blocks error: {e}"),
             })?;
         self.conn
-            .execute("DELETE FROM txtail WHERE rnd < ?1", params![round as i64])
+            .execute_cached("DELETE FROM txtail WHERE rnd < ?1", params![round as i64])
             .map_err(|e| AlgoError::Ledger {
                 message: format!("forget_before txtail error: {e}"),
             })?;
@@ -8080,7 +8287,7 @@ impl LedgerStore for SqliteLedger {
         data: &[u8],
     ) -> Result<(), AlgoError> {
         self.conn
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO stateproofverification (lastattestedround, verificationcontext) VALUES (?1, ?2)",
                 params![last_attested_round as i64, data],
             )
@@ -8095,7 +8302,7 @@ impl LedgerStore for SqliteLedger {
         last_attested_round: u64,
     ) -> Result<Option<Vec<u8>>, AlgoError> {
         self.conn
-            .query_row(
+            .query_row_cached(
                 "SELECT verificationcontext FROM stateproofverification WHERE lastattestedround = ?1",
                 params![last_attested_round as i64],
                 |row| row.get(0),
@@ -8111,7 +8318,7 @@ impl LedgerStore for SqliteLedger {
         before_round: u64,
     ) -> Result<(), AlgoError> {
         self.conn
-            .execute(
+            .execute_cached(
                 "DELETE FROM stateproofverification WHERE lastattestedround < ?1",
                 params![before_round as i64],
             )
@@ -8280,7 +8487,7 @@ impl LedgerStore for SqliteLedger {
         online_total_weight: u64,
     ) -> Result<(), AlgoError> {
         self.conn
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO votersnapshot (round, voterscommitment, onlinetotalweight) VALUES (?1, ?2, ?3)",
                 params![round as i64, voters_commitment, online_total_weight as i64],
             )
@@ -8292,7 +8499,7 @@ impl LedgerStore for SqliteLedger {
 
     fn get_voters_snapshot(&self, round: u64) -> Result<Option<(Vec<u8>, u64)>, AlgoError> {
         self.conn
-            .query_row(
+            .query_row_cached(
                 "SELECT voterscommitment, onlinetotalweight FROM votersnapshot WHERE round = ?1",
                 params![round as i64],
                 |row| {
@@ -8331,7 +8538,7 @@ impl LedgerStore for SqliteLedger {
 
     fn delete_voters_snapshot(&mut self, round: u64) -> Result<(), AlgoError> {
         self.conn
-            .execute(
+            .execute_cached(
                 "DELETE FROM votersnapshot WHERE round = ?1",
                 params![round as i64],
             )
@@ -8353,7 +8560,7 @@ impl LedgerStore for SqliteLedger {
     ) -> Result<(), AlgoError> {
         let encoded = crate::voters::encode_participants(participants);
         self.conn
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO votersparticipants (round, participants) VALUES (?1, ?2)",
                 params![round as i64, encoded],
             )
@@ -8377,7 +8584,7 @@ impl LedgerStore for SqliteLedger {
     > {
         let blob: Option<Vec<u8>> = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT participants FROM votersparticipants WHERE round = ?1",
                 params![round as i64],
                 |row| row.get(0),
@@ -8400,7 +8607,7 @@ impl LedgerStore for SqliteLedger {
 
     fn delete_voters_participants(&mut self, round: u64) -> Result<(), AlgoError> {
         self.conn
-            .execute(
+            .execute_cached(
                 "DELETE FROM votersparticipants WHERE round = ?1",
                 params![round as i64],
             )
@@ -8451,7 +8658,7 @@ impl LedgerStore for SqliteLedger {
     fn absence_history_uncertain(&self, balance_round: u64) -> Result<bool, AlgoError> {
         let since: Option<i64> = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT rnd FROM acctrounds WHERE id = 'onlinebackfill'",
                 [],
                 |row| row.get(0),
@@ -8926,7 +9133,7 @@ mod tests {
         let ledger = SqliteLedger::open_in_memory().unwrap();
         ledger
             .conn
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO accounttotals(id, online, onlinerewardunits, \
                  offline, offlinerewardunits, notparticipating, \
                  notparticipatingrewardunits, rewardslevel) \
@@ -10142,7 +10349,7 @@ mod tests {
         ledger.flush_chain_state().unwrap();
         let acctbase: i64 = ledger
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT rnd FROM acctrounds WHERE id = 'acctbase'",
                 [],
                 |row| row.get(0),
@@ -10967,7 +11174,7 @@ mod tests {
 
         let rows: i64 = ledger
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT COUNT(*) FROM onlineaccounts WHERE address = ?1",
                 params![addr.0.as_slice()],
                 |row| row.get(0),
@@ -11016,7 +11223,7 @@ mod tests {
 
         let blob: Vec<u8> = ledger
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT data FROM onlineaccounts WHERE address = ?1",
                 params![addr.0.as_slice()],
                 |row| row.get(0),
@@ -11103,7 +11310,7 @@ mod tests {
 
         let rows: i64 = ledger
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT COUNT(*) FROM onlineaccounts WHERE address = ?1",
                 params![addr.0.as_slice()],
                 |row| row.get(0),
@@ -11263,7 +11470,7 @@ mod tests {
 
         let rows_addr: i64 = ledger
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT COUNT(*) FROM onlineaccounts WHERE address = ?1",
                 params![addr.0.as_slice()],
                 |row| row.get(0),
@@ -11302,7 +11509,7 @@ mod tests {
 
         let rows_addr2: i64 = ledger
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT COUNT(*) FROM onlineaccounts WHERE address = ?1",
                 params![addr2.0.as_slice()],
                 |row| row.get(0),
@@ -11364,7 +11571,7 @@ mod tests {
 
         let rows_after_round2: i64 = ledger
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT COUNT(*) FROM onlineaccounts WHERE address = ?1",
                 params![addr.0.as_slice()],
                 |row| row.get(0),
@@ -11395,7 +11602,7 @@ mod tests {
 
         let rows_after_round3: i64 = ledger
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT COUNT(*) FROM onlineaccounts WHERE address = ?1",
                 params![addr.0.as_slice()],
                 |row| row.get(0),
@@ -11465,13 +11672,13 @@ mod tests {
         let total_count = |ledger: &SqliteLedger| -> i64 {
             ledger
                 .conn
-                .query_row("SELECT COUNT(*) FROM onlineaccounts", [], |row| row.get(0))
+                .query_row_cached("SELECT COUNT(*) FROM onlineaccounts", [], |row| row.get(0))
                 .unwrap()
         };
         let history_len = |ledger: &SqliteLedger, addr: &Address| -> i64 {
             ledger
                 .conn
-                .query_row(
+                .query_row_cached(
                     "SELECT COUNT(*) FROM onlineaccounts WHERE address = ?1",
                     params![addr.0.as_slice()],
                     |row| row.get(0),
@@ -13403,7 +13610,7 @@ mod tests {
         let ledger = SqliteLedger::open_in_memory().unwrap();
         let legacy_count: i64 = ledger
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='merkle_trie'",
                 [],
                 |row| row.get(0),
@@ -13413,7 +13620,7 @@ mod tests {
 
         let paged_count: i64 = ledger
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='accounthashes'",
                 [],
                 |row| row.get(0),
@@ -13512,7 +13719,7 @@ mod tests {
         drop(l);
         rusqlite::Connection::open(tracker_path_for_prefix(&prefix))
             .unwrap()
-            .execute(
+            .execute_cached(
                 "DELETE FROM catchpointstate WHERE id = ?1",
                 [TXTAIL_RESTORED_TXID_MARKER],
             )
@@ -13529,7 +13736,7 @@ mod tests {
     fn txtail_marker_set(prefix: &std::path::Path) -> bool {
         rusqlite::Connection::open(tracker_path_for_prefix(prefix))
             .unwrap()
-            .query_row(
+            .query_row_cached(
                 "SELECT intval FROM catchpointstate WHERE id = ?1",
                 [TXTAIL_RESTORED_TXID_MARKER],
                 |r| r.get::<_, i64>(0),
@@ -13565,10 +13772,10 @@ mod tests {
         let tracker = tracker_path_for_prefix(&prefix);
         let block_conn = rusqlite::Connection::open(block_path_for_prefix(&prefix)).unwrap();
         let good: Vec<u8> = block_conn
-            .query_row("SELECT blkdata FROM blocks WHERE rnd = 7", [], |r| r.get(0))
+            .query_row_cached("SELECT blkdata FROM blocks WHERE rnd = 7", [], |r| r.get(0))
             .unwrap();
         block_conn
-            .execute("UPDATE blocks SET blkdata = x'c1' WHERE rnd = 7", [])
+            .execute_cached("UPDATE blocks SET blkdata = x'c1' WHERE rnd = 7", [])
             .unwrap();
         let _ = tracker;
 
@@ -13579,7 +13786,7 @@ mod tests {
         drop(l);
 
         block_conn
-            .execute("UPDATE blocks SET blkdata = ?1 WHERE rnd = 7", [good])
+            .execute_cached("UPDATE blocks SET blkdata = ?1 WHERE rnd = 7", [good])
             .unwrap();
         let l = SqliteLedger::open_with_prefix(&prefix).unwrap();
         assert_eq!(txtail_first_id(&l, 7), ids[0].0, "retried and repaired");
@@ -13638,7 +13845,7 @@ mod tests {
         // old rows: clear it to model a ledger created by an older build.
         rusqlite::Connection::open(tracker_path_for_prefix(&prefix))
             .unwrap()
-            .execute(
+            .execute_cached(
                 "DELETE FROM catchpointstate WHERE id = ?1",
                 [TXTAIL_RESTORED_TXID_MARKER],
             )
@@ -13708,7 +13915,7 @@ mod tests {
         // Verify cert via raw SQL since there's no get_block_cert method.
         let certdata: Option<Vec<u8>> = ledger
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT certdata FROM blockdb.blocks WHERE rnd = ?1",
                 params![7i64],
                 |row| row.get(0),
@@ -13825,7 +14032,7 @@ mod tests {
         }
         let total: i64 = ledger
             .conn
-            .query_row("SELECT COUNT(*) FROM blockdb.blocks", [], |row| row.get(0))
+            .query_row_cached("SELECT COUNT(*) FROM blockdb.blocks", [], |row| row.get(0))
             .unwrap();
         assert_eq!(
             total, 10,
@@ -13907,7 +14114,7 @@ mod tests {
         // files have the schemas we expect by opening each independently.
         let tracker_conn = Connection::open(&tracker_path).unwrap();
         let tracker_has_blocks: bool = tracker_conn
-            .query_row(
+            .query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='blocks')",
                 [],
                 |row| row.get(0),
@@ -13918,7 +14125,7 @@ mod tests {
             "tracker DB must not contain the `blocks` table (it lives in the block DB)"
         );
         let tracker_has_accountbase: bool = tracker_conn
-            .query_row(
+            .query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='accountbase')",
                 [],
                 |row| row.get(0),
@@ -13931,7 +14138,7 @@ mod tests {
 
         let block_conn = Connection::open(&block_path).unwrap();
         let block_has_blocks: bool = block_conn
-            .query_row(
+            .query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='blocks')",
                 [],
                 |row| row.get(0),
@@ -13939,7 +14146,7 @@ mod tests {
             .unwrap();
         assert!(block_has_blocks, "block DB must contain the `blocks` table");
         let block_has_accountbase: bool = block_conn
-            .query_row(
+            .query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='accountbase')",
                 [],
                 |row| row.get(0),
@@ -13982,7 +14189,7 @@ mod tests {
         // commit yet.
         writer.execute_batch("BEGIN IMMEDIATE").unwrap();
         writer
-            .execute(
+            .execute_cached(
                 "INSERT INTO accountbase (address, normalizedonlinebalance, data) VALUES (?1, ?2, ?3)",
                 params![vec![7u8; 32], 0i64, Vec::<u8>::new()],
             )
@@ -13995,7 +14202,7 @@ mod tests {
         // isolated from it.
         reader.execute_batch("BEGIN DEFERRED").unwrap();
         let count_before_commit: i64 = reader
-            .query_row("SELECT COUNT(*) FROM accountbase", [], |row| row.get(0))
+            .query_row_cached("SELECT COUNT(*) FROM accountbase", [], |row| row.get(0))
             .expect("concurrent read must not block or error under WAL");
         assert_eq!(
             count_before_commit, 0,
@@ -14010,7 +14217,7 @@ mod tests {
         // the committed row.
         reader.execute_batch("BEGIN DEFERRED").unwrap();
         let count_after_commit: i64 = reader
-            .query_row("SELECT COUNT(*) FROM accountbase", [], |row| row.get(0))
+            .query_row_cached("SELECT COUNT(*) FROM accountbase", [], |row| row.get(0))
             .unwrap();
         assert_eq!(
             count_after_commit, 1,
@@ -14047,7 +14254,7 @@ mod tests {
             "unfinishedcatchpoints",
         ] {
             let exists: bool = tracker_conn
-                .query_row(
+                .query_row_cached(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?)",
                     [table],
                     |row| row.get(0),
@@ -14059,20 +14266,20 @@ mod tests {
         // Smoke check: writing a row to each table with Go's column
         // shapes succeeds. This guards against type/NOT-NULL drift.
         tracker_conn
-            .execute(
+            .execute_cached(
                 "INSERT INTO storedcatchpoints (round, filename, catchpoint, filesize, pinned) \
                  VALUES (1, 'cp.tar', 'abc', 100, 0)",
                 [],
             )
             .expect("insert storedcatchpoints");
         tracker_conn
-            .execute(
+            .execute_cached(
                 "INSERT INTO catchpointfirststageinfo (round, info) VALUES (1, x'00')",
                 [],
             )
             .expect("insert catchpointfirststageinfo");
         tracker_conn
-            .execute(
+            .execute_cached(
                 "INSERT INTO unfinishedcatchpoints (round, blockhash) VALUES (1, x'00')",
                 [],
             )
@@ -14093,7 +14300,7 @@ mod tests {
 
         // Confirm pragma reports NOT NULL.
         let notnull: i64 = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT \"notnull\" FROM pragma_table_info('resources') WHERE name='ctype'",
                 [],
                 |row| row.get(0),
@@ -14103,7 +14310,7 @@ mod tests {
 
         // Confirm default is -1.
         let dflt: String = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT dflt_value FROM pragma_table_info('resources') WHERE name='ctype'",
                 [],
                 |row| row.get(0),
@@ -14113,7 +14320,7 @@ mod tests {
 
         // Explicit NULL insert is rejected.
         let err = conn
-            .execute(
+            .execute_cached(
                 "INSERT INTO resources (addrid, aidx, data, ctype) VALUES (1, 2, x'00', NULL)",
                 [],
             )
@@ -14125,13 +14332,13 @@ mod tests {
         );
 
         // Inserting without specifying ctype uses the default (-1).
-        conn.execute(
+        conn.execute_cached(
             "INSERT INTO resources (addrid, aidx, data) VALUES (1, 2, x'00')",
             [],
         )
         .unwrap();
         let ctype: i64 = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT ctype FROM resources WHERE addrid=1 AND aidx=2",
                 [],
                 |row| row.get(0),
@@ -14164,12 +14371,12 @@ mod tests {
                 ) WITHOUT ROWID;",
             )
             .unwrap();
-            conn.execute(
+            conn.execute_cached(
                 "INSERT INTO resources (addrid, aidx, data, ctype) VALUES (1, 2, x'aa', NULL)",
                 [],
             )
             .unwrap();
-            conn.execute(
+            conn.execute_cached(
                 "INSERT INTO resources (addrid, aidx, data, ctype) VALUES (3, 4, x'bb', 0)",
                 [],
             )
@@ -14185,7 +14392,7 @@ mod tests {
 
         // Schema now reports NOT NULL.
         let notnull: i64 = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT \"notnull\" FROM pragma_table_info('resources') WHERE name='ctype'",
                 [],
                 |row| row.get(0),
@@ -14195,7 +14402,7 @@ mod tests {
 
         // The previously-NULL row is now -1; the other row is untouched.
         let row1: i64 = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT ctype FROM resources WHERE addrid=1 AND aidx=2",
                 [],
                 |row| row.get(0),
@@ -14203,7 +14410,7 @@ mod tests {
             .unwrap();
         assert_eq!(row1, -1, "NULL ctype must be backfilled to -1");
         let row2: i64 = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT ctype FROM resources WHERE addrid=3 AND aidx=4",
                 [],
                 |row| row.get(0),
@@ -14216,7 +14423,7 @@ mod tests {
         let _ = SqliteLedger::open_with_prefix(&prefix).expect("reopen is idempotent");
         let conn = Connection::open(&tracker_path).unwrap();
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM resources", [], |row| row.get(0))
+            .query_row_cached("SELECT COUNT(*) FROM resources", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 2);
     }
@@ -14248,7 +14455,7 @@ mod tests {
                 ) WITHOUT ROWID;",
             )
             .unwrap();
-            conn.execute(
+            conn.execute_cached(
                 "INSERT INTO resources (addrid, aidx, data) VALUES (1, 2, x'cc')",
                 [],
             )
@@ -14300,21 +14507,21 @@ mod tests {
         let conn = Connection::open(&tracker_path).unwrap();
         // NULL row is now empty.
         let v1: Vec<u8> = conn
-            .query_row("SELECT value FROM kvstore WHERE key = x'01'", [], |row| {
+            .query_row_cached("SELECT value FROM kvstore WHERE key = x'01'", [], |row| {
                 row.get(0)
             })
             .unwrap();
         assert_eq!(v1, Vec::<u8>::new(), "NULL kvstore value must become empty");
         // Non-NULL row is untouched.
         let v2: Vec<u8> = conn
-            .query_row("SELECT value FROM kvstore WHERE key = x'02'", [], |row| {
+            .query_row_cached("SELECT value FROM kvstore WHERE key = x'02'", [], |row| {
                 row.get(0)
             })
             .unwrap();
         assert_eq!(v2, vec![0xaa, 0xbb], "non-NULL value must be preserved");
         // Marker is persisted so subsequent opens skip the table scan.
         let marker: i64 = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT intval FROM catchpointstate WHERE id = 'algod_rust_kvstore_null_norm_v1'",
                 [],
                 |row| row.get(0),
@@ -14325,13 +14532,13 @@ mod tests {
         // After the marker is set, a NULL written post-migration is NOT
         // auto-rewritten on reopen — confirming the marker actually
         // gates the UPDATE rather than the UPDATE running unconditionally.
-        conn.execute("INSERT INTO kvstore (key, value) VALUES (x'03', NULL)", [])
+        conn.execute_cached("INSERT INTO kvstore (key, value) VALUES (x'03', NULL)", [])
             .unwrap();
         drop(conn);
         let _ = SqliteLedger::open_with_prefix(&prefix).expect("reopen is idempotent");
         let conn = Connection::open(&tracker_path).unwrap();
         let v3: Option<Vec<u8>> = conn
-            .query_row("SELECT value FROM kvstore WHERE key = x'03'", [], |row| {
+            .query_row_cached("SELECT value FROM kvstore WHERE key = x'03'", [], |row| {
                 row.get(0)
             })
             .unwrap();
@@ -14384,7 +14591,7 @@ mod tests {
             // the committed round.
             ledger
                 .conn
-                .execute(
+                .execute_cached(
                     "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', 7)",
                     [],
                 )
@@ -14444,7 +14651,7 @@ mod tests {
             // inconsistency.
             ledger
                 .conn
-                .execute(
+                .execute_cached(
                     "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', 65409680)",
                     [],
                 )
@@ -14510,7 +14717,7 @@ mod tests {
                 .unwrap();
             ledger
                 .conn
-                .execute(
+                .execute_cached(
                     "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', 3)",
                     [],
                 )
@@ -14560,7 +14767,7 @@ mod tests {
             ledger.put_block(42, "v41", b"hdr", b"blk").unwrap();
             ledger
                 .conn
-                .execute(
+                .execute_cached(
                     "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', 42)",
                     [],
                 )
@@ -14616,7 +14823,7 @@ mod tests {
             // the time we reopen the row already points at 103.
             ledger
                 .conn
-                .execute(
+                .execute_cached(
                     "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', 103)",
                     [],
                 )
@@ -14669,7 +14876,7 @@ mod tests {
                 .unwrap();
             ledger
                 .conn
-                .execute(
+                .execute_cached(
                     "INSERT INTO algod_rust_meta (key, value) VALUES ('current_round', ?1)",
                     params![57u64.to_le_bytes().to_vec()],
                 )
@@ -14677,7 +14884,7 @@ mod tests {
             // Explicitly clear acctrounds — the migration must repopulate it.
             ledger
                 .conn
-                .execute("DELETE FROM acctrounds WHERE id = 'acctbase'", [])
+                .execute_cached("DELETE FROM acctrounds WHERE id = 'acctbase'", [])
                 .unwrap();
         }
 
@@ -14689,7 +14896,7 @@ mod tests {
         let conn = Connection::open(&tracker_path).unwrap();
         // Legacy table is gone.
         let table_exists: bool = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='algod_rust_meta')",
                 [],
                 |row| row.get(0),
@@ -14698,7 +14905,7 @@ mod tests {
         assert!(!table_exists, "algod_rust_meta must be dropped");
         // Tracker round was migrated.
         let acctbase: i64 = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT rnd FROM acctrounds WHERE id = 'acctbase'",
                 [],
                 |row| row.get(0),
@@ -14764,7 +14971,7 @@ mod tests {
         // downgrade or feed the DB through a pre-port Go binary.
         let conn = Connection::open(&tracker_path).unwrap();
         let still_exists: bool = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='accountbase')",
                 [],
                 |row| row.get(0),
@@ -14778,7 +14985,7 @@ mod tests {
         // `SCHEMA_TRACKER_SQL` after the refusal — refusal MUST
         // happen before schema creation.
         let resources_created: bool = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='resources')",
                 [],
                 |row| row.get(0),
@@ -14808,7 +15015,7 @@ mod tests {
             for t in ["accountbase", "resources"] {
                 let present: bool = ledger
                     .conn
-                    .query_row(
+                    .query_row_cached(
                         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
                         [t],
                         |row| row.get(0),
@@ -14882,7 +15089,7 @@ mod tests {
             // round check is what gates the refusal.
             ledger
                 .conn
-                .execute(
+                .execute_cached(
                     "INSERT INTO algod_rust_meta (key, value) VALUES ('current_round', ?1)",
                     params![0u64.to_le_bytes().to_vec()],
                 )
@@ -14894,7 +15101,7 @@ mod tests {
         let _ = SqliteLedger::open_with_prefix(&prefix).expect("reopen succeeds on genesis-only");
         let conn = Connection::open(tracker_path_for_prefix(&prefix)).unwrap();
         let still_exists: bool = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='algod_rust_meta')",
                 [],
                 |row| row.get(0),
@@ -14927,7 +15134,7 @@ mod tests {
         let hdrdata = rmp_serde::to_vec_named(&hdr).unwrap();
         ledger
             .conn
-            .execute(
+            .execute_cached(
                 "INSERT INTO blockdb.blocks (rnd, proto, hdrdata, blkdata) \
                  VALUES (?1, ?2, ?3, ?4)",
                 params![1000i64, "vSynth", hdrdata, &[] as &[u8]],
@@ -14935,7 +15142,7 @@ mod tests {
             .unwrap();
         ledger
             .conn
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', 1000)",
                 [],
             )
@@ -14957,7 +15164,7 @@ mod tests {
         // Once lookback writes a real payload, the state flips.
         ledger
             .conn
-            .execute(
+            .execute_cached(
                 "UPDATE blockdb.blocks SET blkdata = ?1 WHERE rnd = 1000",
                 params![b"realblock".as_ref()],
             )
@@ -14994,7 +15201,7 @@ mod tests {
             // current_round=99 in the legacy cache, but no block at 99.
             ledger
                 .conn
-                .execute(
+                .execute_cached(
                     "INSERT INTO algod_rust_meta (key, value) VALUES ('current_round', ?1)",
                     params![99u64.to_le_bytes().to_vec()],
                 )
@@ -15015,7 +15222,7 @@ mod tests {
         // downgrade or fix the gap.
         let conn = Connection::open(tracker_path_for_prefix(&prefix)).unwrap();
         let still_exists: bool = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='algod_rust_meta')",
                 [],
                 |row| row.get(0),
@@ -15053,7 +15260,7 @@ mod tests {
             .unwrap();
             // Sanity check: the seeded value really is TEXT.
             let stored_type: String = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT typeof(value) FROM kvstore WHERE key = x'01'",
                     [],
                     |row| row.get(0),
@@ -15068,7 +15275,7 @@ mod tests {
         let conn = Connection::open(&tracker_path).unwrap();
         // Empty TEXT was coerced to empty BLOB.
         let stored_type: String = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT typeof(value) FROM kvstore WHERE key = x'01'",
                 [],
                 |row| row.get(0),
@@ -15076,14 +15283,14 @@ mod tests {
             .unwrap();
         assert_eq!(stored_type, "blob");
         let v1: Vec<u8> = conn
-            .query_row("SELECT value FROM kvstore WHERE key = x'01'", [], |row| {
+            .query_row_cached("SELECT value FROM kvstore WHERE key = x'01'", [], |row| {
                 row.get(0)
             })
             .unwrap();
         assert_eq!(v1, Vec::<u8>::new());
         // Non-empty values are still untouched.
         let v2: Vec<u8> = conn
-            .query_row("SELECT value FROM kvstore WHERE key = x'02'", [], |row| {
+            .query_row_cached("SELECT value FROM kvstore WHERE key = x'02'", [], |row| {
                 row.get(0)
             })
             .unwrap();
@@ -15100,7 +15307,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(CATCHPOINT_STAGING_TABLES_SQL).unwrap();
         let notnull: i64 = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT \"notnull\" FROM pragma_table_info('catchpointresources') WHERE name='ctype'",
                 [],
                 |row| row.get(0),
@@ -15219,7 +15426,7 @@ mod tests {
         ledger.put_block(5, "v41", b"hdr", b"blk").unwrap();
         ledger
             .conn
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', 5)",
                 [],
             )
@@ -15234,7 +15441,7 @@ mod tests {
         // is the post-crash shape we must catch.
         ledger
             .conn
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', 7)",
                 [],
             )
@@ -15253,7 +15460,7 @@ mod tests {
         // refuses).
         ledger
             .conn
-            .execute("DELETE FROM blockdb.blocks", [])
+            .execute_cached("DELETE FROM blockdb.blocks", [])
             .unwrap();
         assert_eq!(
             ledger.reconcile_cross_file().unwrap(),
@@ -15265,7 +15472,7 @@ mod tests {
         ledger.put_block(10, "v41", b"hdr", b"blk").unwrap();
         ledger
             .conn
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', 8)",
                 [],
             )
@@ -15784,7 +15991,7 @@ mod tests {
         ledger.balance_round_total_online_stake(brnd, 701).unwrap();
         ledger
             .conn
-            .execute("DELETE FROM onlineroundparamstail", [])
+            .execute_cached("DELETE FROM onlineroundparamstail", [])
             .unwrap();
         assert!(ledger.online_supply_at_round(brnd).unwrap().is_none());
         let derived = ledger.balance_round_total_online_stake(brnd, 701).unwrap();
@@ -15847,7 +16054,7 @@ mod tests {
         // A marker left by an earlier legacy backfill (synthetic history).
         ledger
             .conn
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('onlinebackfill', 9000)",
                 [],
             )
@@ -15896,7 +16103,7 @@ mod tests {
         // Without the tail the imported rows still derive the total.
         ledger
             .conn
-            .execute("DELETE FROM onlineroundparamstail", [])
+            .execute_cached("DELETE FROM onlineroundparamstail", [])
             .unwrap();
         assert_eq!(
             ledger
@@ -16005,10 +16212,10 @@ mod tests {
         // Make it legacy-shaped: the history, the supply tail and the marker
         // never existed.
         let conn = Connection::open(tracker_path_for_prefix(prefix)).unwrap();
-        conn.execute("DELETE FROM onlineaccounts", []).unwrap();
-        conn.execute("DELETE FROM onlineroundparamstail", [])
+        conn.execute_cached("DELETE FROM onlineaccounts", []).unwrap();
+        conn.execute_cached("DELETE FROM onlineroundparamstail", [])
             .unwrap();
-        conn.execute("DELETE FROM acctrounds WHERE id = 'onlinebackfill'", [])
+        conn.execute_cached("DELETE FROM acctrounds WHERE id = 'onlinebackfill'", [])
             .unwrap();
         (x, z)
     }
@@ -16058,7 +16265,7 @@ mod tests {
     fn history_rows(ledger: &SqliteLedger) -> i64 {
         ledger
             .conn
-            .query_row("SELECT COUNT(*) FROM onlineaccounts", [], |r| r.get(0))
+            .query_row_cached("SELECT COUNT(*) FROM onlineaccounts", [], |r| r.get(0))
             .unwrap()
     }
 
@@ -16116,7 +16323,7 @@ mod tests {
         drop(ledger);
         {
             let conn = Connection::open(tracker_path_for_prefix(&prefix)).unwrap();
-            conn.execute(
+            conn.execute_cached(
                 "DELETE FROM onlineaccounts WHERE address = ?1",
                 params![x.0.as_slice()],
             )
@@ -16158,7 +16365,7 @@ mod tests {
         ledger.upgrade_legacy_online_history().unwrap();
         let marker: i64 = ledger
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT rnd FROM acctrounds WHERE id = 'onlinebackfill'",
                 [],
                 |r| r.get(0),
@@ -16181,7 +16388,7 @@ mod tests {
             vec![Address([9u8; 32])],
             "sanity: listed while the marker is readable"
         );
-        ledger.conn.execute("DROP TABLE acctrounds", []).unwrap();
+        ledger.conn.execute_cached("DROP TABLE acctrounds", []).unwrap();
         assert!(ledger.absence_history_uncertain(0).is_err());
         let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
         assert!(l.absent.is_empty(), "proposer: undecidable, nobody listed");
@@ -16537,6 +16744,7 @@ mod tests {
             txn_counter: _,                 // ChainSnapshot
             savepoint_counter: _,
             in_block: _,
+            read_cache: _, // dropped at every block boundary and rollback
             trie: _,          // reloaded by rollback
             pre_mutations: _, // cleared by rollback
             trie_cache_target: _,
