@@ -286,9 +286,8 @@ fn read_fixture(path: &Path) -> Vec<u8> {
             let mut zst = path.as_os_str().to_owned();
             zst.push(".zst");
             let zst = PathBuf::from(zst);
-            let compressed = std::fs::read(&zst).unwrap_or_else(|e| {
-                panic!("cannot read {path:?} ({plain_err}) or {zst:?} ({e})")
-            });
+            let compressed = std::fs::read(&zst)
+                .unwrap_or_else(|e| panic!("cannot read {path:?} ({plain_err}) or {zst:?} ({e})"));
             zstd::decode_all(compressed.as_slice())
                 .unwrap_or_else(|e| panic!("cannot decompress {zst:?}: {e}"))
         }
@@ -303,6 +302,13 @@ fn read_value(path: &PathBuf) -> Value {
 
 fn build_pre_state(round: u64, state: &Value) -> LedgerState {
     let mut ls = LedgerState::new();
+    fill_pre_state(&mut ls, round, state);
+    ls
+}
+
+/// Loads the recorded pre-state into any store (the in-memory `LedgerState`
+/// for the replay tests, a `SqliteLedger` for the apply-attribution profile).
+fn fill_pre_state<L: LedgerStore>(ls: &mut L, round: u64, state: &Value) {
     let hdr = get(state, "prev_hdr").expect("prev_hdr");
     let proto = String::from_utf8(bytes_of(hdr, "proto")).expect("proto");
     ls.set_rewards_level(num(hdr, "earn"));
@@ -360,11 +366,10 @@ fn build_pre_state(round: u64, state: &Value) -> LedgerState {
         for (k, v) in kv {
             let key = raw(k);
             if let Some(data) = get(v, "Data") {
-                set_box_by_kv_key(&mut ls, &key, raw(data));
+                set_box_by_kv_key(ls, &key, raw(data));
             }
         }
     }
-    ls
 }
 
 /// go's KV key for a box is `"bx:" || appID(8, BE) || name`.
@@ -378,7 +383,7 @@ fn split_box_key(key: &[u8]) -> (u64, &[u8]) {
     (u64::from_be_bytes(id), &key[11..])
 }
 
-fn set_box_by_kv_key(ls: &mut LedgerState, key: &[u8], value: Vec<u8>) {
+fn set_box_by_kv_key<L: LedgerStore>(ls: &mut L, key: &[u8], value: Vec<u8>) {
     let (app, name) = split_box_key(key);
     ls.set_box(app, name, value);
 }
@@ -387,14 +392,14 @@ fn set_box_by_kv_key(ls: &mut LedgerState, key: &[u8], value: Vec<u8>) {
 // The replay + compare
 // ---------------------------------------------------------------------------
 
-fn check_post_state(ls: &LedgerState, state: &Value, diffs: &mut Vec<String>) {
+fn check_post_state<L: LedgerStore>(ls: &L, state: &Value, diffs: &mut Vec<String>) {
     let post = get(state, "post").expect("post");
     for rec in arr(post, "Accts") {
         let addr = addr_of(rec, "Addr");
         let want = account_proj(&account_from(rec));
         let got = ls
             .get_account(&addr)
-            .map(account_proj)
+            .map(|a| account_proj(&a))
             .unwrap_or_else(|| "<absent>".into());
         // go keeps a fully-zero record only for accounts it did not delete;
         // an absent account and an all-zero one are equivalent here.
@@ -410,7 +415,7 @@ fn check_post_state(ls: &LedgerState, state: &Value, diffs: &mut Vec<String>) {
             Some(Some(p)) => {
                 let want = asset_params_from(p, addr);
                 let got = ls.get_asset_params(id);
-                if got != Some(&want) {
+                if got.as_ref() != Some(&want) {
                     diffs.push(format!(
                         "asset params {id}\n  go:   {want:?}\n  rust: {got:?}"
                     ));
@@ -425,7 +430,7 @@ fn check_post_state(ls: &LedgerState, state: &Value, diffs: &mut Vec<String>) {
             Some(Some(h)) => {
                 let want = holding_from(h);
                 let got = ls.get_asset_holding(&addr, id);
-                if got != Some(&want) {
+                if got.as_ref() != Some(&want) {
                     diffs.push(format!(
                         "holding {addr:?}/{id}\n  go:   {want:?}\n  rust: {got:?}"
                     ));
@@ -444,7 +449,7 @@ fn check_post_state(ls: &LedgerState, state: &Value, diffs: &mut Vec<String>) {
             Some(Some(p)) => {
                 let want = app_params_from(p, addr);
                 let got = ls.get_app_params(id);
-                if got != Some(&want) {
+                if got.as_ref() != Some(&want) {
                     diffs.push(format!(
                         "app params {id}\n  go:   {want:?}\n  rust: {got:?}"
                     ));
@@ -459,7 +464,7 @@ fn check_post_state(ls: &LedgerState, state: &Value, diffs: &mut Vec<String>) {
             Some(Some(s)) => {
                 let want = local_state_from(s);
                 let got = ls.get_app_local_state(&addr, id);
-                if got != Some(&want) {
+                if got.as_ref() != Some(&want) {
                     diffs.push(format!(
                         "local state {addr:?}/{id}\n  go:   {want:?}\n  rust: {got:?}"
                     ));
@@ -976,4 +981,122 @@ fn state_proof_block_next_round_is_derived_by_the_apply() {
             .any(|d| d.contains("StateProofNextRound: apply Some(65682944)")),
         "a header with the stale NextRound must be flagged: {diffs:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Apply-time attribution on the real SQLite store (issue #1765)
+// ---------------------------------------------------------------------------
+
+/// Applies corpus block `round` the way the follow path does (a `SqliteLedger`
+/// with the Merkle trie enabled, inside `begin_block`, through
+/// `apply_block_executing_app_calls`) and returns the wall time, the AVM time,
+/// the store-access split and the commit time. Also checks that go's post
+/// values are reproduced on that store.
+fn sqlite_apply_profile(
+    round: u64,
+) -> (
+    std::time::Duration,
+    Option<std::time::Duration>,
+    algo_ledger::follow_timing::StageTimes,
+    std::time::Duration,
+) {
+    use algo_ledger::follow_timing as ft;
+    let dir = corpus_dir();
+    let raw_block = read_fixture(&dir.join(format!("{round}.msgpack")));
+    let block = algo_codec::decode_block_response(&raw_block)
+        .unwrap_or_else(|e| panic!("cannot decode block {round}: {e}"))
+        .block;
+    let state = read_value(&dir.join(format!("{round}.state.msgpack")));
+    let mut ls = algo_ledger::SqliteLedger::open_in_memory().expect("open ledger");
+    fill_pre_state(&mut ls, round, &state);
+    ls.enable_trie();
+
+    ls.begin_block().expect("begin_block");
+    ft::reset_avm_time();
+    let t = std::time::Instant::now();
+    apply_block_capturing_state_proof_next(&mut ls, &block, ApplyMode::Execute).expect("apply");
+    let apply = t.elapsed();
+    let avm = ft::take_avm_time();
+    let stages = ft::take_stage_times();
+    let t = std::time::Instant::now();
+    ls.commit_block().expect("commit_block");
+    let commit = t.elapsed();
+
+    let mut diffs = Vec::new();
+    check_post_state(&ls, &state, &mut diffs);
+    assert!(
+        diffs.is_empty(),
+        "round {round}: SQLite store diverges from go:\n{}",
+        diffs.join("\n")
+    );
+    (apply, avm, stages, commit)
+}
+
+/// The attribution is internally consistent on the captured heavy block:
+/// the stages are disjoint and sum to the apply wall time, the block really
+/// accesses the store and runs programs.
+#[test]
+fn heavy_block_apply_attribution_is_consistent() {
+    let (apply, avm, st, _commit) = sqlite_apply_profile(65743637);
+    let avm = avm.expect("the heavy block runs programs");
+    assert!(st.read_calls > 0 && st.write_calls > 0, "{st:?}");
+    assert!(st.state_in_avm <= avm, "{st:?} vs avm {avm:?}");
+    assert!(st.state_in_avm <= st.state(), "{st:?}");
+    let (avm_only, state, other) = st.split(apply, Some(avm));
+    assert_eq!(avm_only + state + other, apply.max(avm_only + state));
+    assert!(
+        state <= apply,
+        "store time {state:?} exceeds apply {apply:?}"
+    );
+}
+
+/// Attribution report for the heavy blocks (run manually; the numbers are
+/// recorded in the PR for issue #1765):
+/// `cargo test --release -p algo-ledger --test mainnet_corpus_test profile_heavy -- --ignored --nocapture`
+#[test]
+#[ignore = "manual profiling report"]
+fn profile_heavy_block_apply_attribution() {
+    const ITERS: usize = 7;
+    for round in [65743637u64] {
+        println!("round {round}: {ITERS} cold applies on a fresh in-memory SqliteLedger");
+        for i in 0..ITERS {
+            let (apply, avm, st, commit) = sqlite_apply_profile(round);
+            let (avm_only, state, other) = st.split(apply, avm);
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+            println!(
+                "  #{i}: apply {:7.1} ms = avm_only {:7.1} + state_read {:7.1} + state_write {:7.1} + other {:7.1} \
+                 | avm(total) {:7.1} (of which store {:6.1}) | reads {} writes {} | commit {:6.1} ms",
+                ms(apply),
+                ms(avm_only),
+                ms(st.state_read),
+                ms(st.state_write),
+                ms(other),
+                ms(avm.unwrap_or_default()),
+                ms(st.state_in_avm),
+                st.read_calls,
+                st.write_calls,
+                ms(commit),
+            );
+            let _ = state;
+        }
+        // Same block on the in-memory store: the pure apply/AVM cost.
+        let dir = corpus_dir();
+        let raw_block = read_fixture(&dir.join(format!("{round}.msgpack")));
+        let block = algo_codec::decode_block_response(&raw_block).unwrap().block;
+        let state = read_value(&dir.join(format!("{round}.state.msgpack")));
+        for i in 0..3 {
+            let mut ls = build_pre_state(round, &state);
+            algo_ledger::follow_timing::reset_avm_time();
+            let t = std::time::Instant::now();
+            apply_block_capturing_state_proof_next(&mut ls, &block, ApplyMode::Execute).unwrap();
+            let apply = t.elapsed();
+            let avm = algo_ledger::follow_timing::take_avm_time().unwrap_or_default();
+            let _ = algo_ledger::follow_timing::take_stage_times();
+            println!(
+                "  in-memory #{i}: apply {:7.1} ms, avm {:7.1} ms",
+                apply.as_secs_f64() * 1e3,
+                avm.as_secs_f64() * 1e3
+            );
+        }
+    }
 }

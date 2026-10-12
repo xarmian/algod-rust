@@ -60,6 +60,16 @@
 //!   since processed more blocks than the earlier baseline. Compare it for
 //!   exact equality only.
 //!
+//! - `algod_rust_follow_block_state_read_seconds` /
+//!   `algod_rust_follow_block_state_write_seconds` (issue #1765): time inside
+//!   the ledger store's read (`get_*`, `has_*`, `*_for_addr`, box reads) and
+//!   write (`set_*`, `remove_*`, box writes) entry points during the apply,
+//!   SQLite queries and codec work included. Together with the AVM series
+//!   they split the apply into disjoint stages, see [`StageTimes`]; the
+//!   remainder (`apply - avm_only - state`) is the apply logic itself (delta
+//!   building, snapshots, cloning, block epilogue). The trie update runs in
+//!   the SQLite commit (`..._commit_seconds`), not in the apply.
+//!
 //! Sample populations differ: `apply`/`commit`/`ensure_block` are observed
 //! for every committed block, `avm` only for blocks that ran a top-level
 //! program (observed whether the apply then succeeded or failed).
@@ -87,6 +97,10 @@ pub struct FollowTiming {
     pub apply_failed: FixedHistogram,
     /// Top-level AVM program evaluation time, per block that ran programs.
     pub avm: FixedHistogram,
+    /// Time in ledger-store read entry points during the apply (#1765).
+    pub state_read: FixedHistogram,
+    /// Time in ledger-store write entry points during the apply (#1765).
+    pub state_write: FixedHistogram,
     /// SQLite commit time.
     pub commit: FixedHistogram,
     /// SQLite commit time of commits that returned an error.
@@ -119,6 +133,14 @@ static FOLLOW_TIMING: FollowTiming = FollowTiming {
     avm: FixedHistogram::new(
         "algod_rust_follow_block_avm_seconds",
         "Time spent evaluating top-level AVM programs while applying one block (blocks with app calls only; observed for failed applies too).",
+    ),
+    state_read: FixedHistogram::new(
+        "algod_rust_follow_block_state_read_seconds",
+        "Time spent in ledger-store read entry points (accounts, resources, app state, boxes) while applying one block (blocks with app calls only).",
+    ),
+    state_write: FixedHistogram::new(
+        "algod_rust_follow_block_state_write_seconds",
+        "Time spent in ledger-store write entry points (accounts, resources, app state, boxes) while applying one block (blocks with app calls only).",
     ),
     commit: FixedHistogram::new(
         "algod_rust_follow_block_commit_seconds",
@@ -166,6 +188,8 @@ pub fn follow_timing_prometheus_text() -> String {
     t.apply.write_prometheus(&mut out);
     t.apply_failed.write_prometheus(&mut out);
     t.avm.write_prometheus(&mut out);
+    t.state_read.write_prometheus(&mut out);
+    t.state_write.write_prometheus(&mut out);
     t.commit.write_prometheus(&mut out);
     t.commit_failed.write_prometheus(&mut out);
     t.wal_checkpoint.write_prometheus(&mut out);
@@ -222,11 +246,161 @@ thread_local! {
     /// paths (catchup replay, simulation) merely accumulate into the
     /// accumulator, which the next reset discards.
     static AVM_NANOS: Cell<u64> = const { Cell::new(0) };
+
+    /// Store-access attribution state (issue #1765), same thread discipline
+    /// as `AVM_NANOS`.
+    static STAGE: StageCells = const {
+        StageCells {
+            active: Cell::new(false),
+            read_nanos: Cell::new(0),
+            write_nanos: Cell::new(0),
+            read_calls: Cell::new(0),
+            write_calls: Cell::new(0),
+            in_avm_nanos: Cell::new(0),
+            depth: Cell::new(0),
+            avm_depth: Cell::new(0),
+        }
+    };
 }
 
-/// Clears this thread's AVM time accumulator (call before applying a block).
+/// Clears this thread's AVM time accumulator (call before applying a block)
+/// and starts the per-block store-access attribution (issue #1765): until
+/// [`take_stage_times`] the store entry points measured by [`StateTimer`] on
+/// this thread are accumulated. Other threads (REST readers) never measure.
 pub fn reset_avm_time() {
     AVM_NANOS.with(|c| c.set(0));
+    STAGE.with(|s| {
+        s.active.set(true);
+        s.read_nanos.set(0);
+        s.write_nanos.set(0);
+        s.read_calls.set(0);
+        s.write_calls.set(0);
+        s.in_avm_nanos.set(0);
+        s.depth.set(0);
+        s.avm_depth.set(0);
+    });
+}
+
+/// Store-access split of one block apply (issue #1765).
+///
+/// Disjoint stages of the apply wall time `apply`:
+/// `avm_only = avm - state_in_avm` (program evaluation without the store
+/// reads/writes the program itself triggers), `state = state_read +
+/// state_write` (every store access, in or out of the AVM) and
+/// `other = apply - avm_only - state` (apply logic outside the AVM and the
+/// store: delta building, snapshots, cloning, epilogue).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StageTimes {
+    /// Time in store read entry points.
+    pub state_read: Duration,
+    /// Time in store write entry points.
+    pub state_write: Duration,
+    /// The part of `state_read + state_write` that happened while a top-level
+    /// program was evaluating (it is also counted in the AVM time).
+    pub state_in_avm: Duration,
+    /// Number of outermost store read calls.
+    pub read_calls: u64,
+    /// Number of outermost store write calls.
+    pub write_calls: u64,
+}
+
+impl StageTimes {
+    /// `state_read + state_write`.
+    pub fn state(&self) -> Duration {
+        self.state_read + self.state_write
+    }
+
+    /// Splits `apply` given the (optional) AVM time into
+    /// `(avm_only, state, other)`; see the type docs.
+    pub fn split(&self, apply: Duration, avm: Option<Duration>) -> (Duration, Duration, Duration) {
+        let avm_only = avm.unwrap_or_default().saturating_sub(self.state_in_avm);
+        let state = self.state();
+        let other = apply.saturating_sub(avm_only).saturating_sub(state);
+        (avm_only, state, other)
+    }
+}
+
+/// Returns and clears this thread's store-access times since the last
+/// [`reset_avm_time`] and stops the attribution.
+pub fn take_stage_times() -> StageTimes {
+    STAGE.with(|s| {
+        s.active.set(false);
+        StageTimes {
+            state_read: Duration::from_nanos(s.read_nanos.replace(0)),
+            state_write: Duration::from_nanos(s.write_nanos.replace(0)),
+            state_in_avm: Duration::from_nanos(s.in_avm_nanos.replace(0)),
+            read_calls: s.read_calls.replace(0),
+            write_calls: s.write_calls.replace(0),
+        }
+    })
+}
+
+struct StageCells {
+    active: Cell<bool>,
+    read_nanos: Cell<u64>,
+    write_nanos: Cell<u64>,
+    read_calls: Cell<u64>,
+    write_calls: Cell<u64>,
+    in_avm_nanos: Cell<u64>,
+    /// Store-call nesting (`set_account` reads the old record through
+    /// `get_account`): only the outermost call is timed, so stages never
+    /// double count.
+    depth: Cell<u32>,
+    /// Top-level program evaluation nesting.
+    avm_depth: Cell<u32>,
+}
+
+/// Times one ledger-store entry point into the read or write stage of the
+/// block being applied on this thread (issue #1765). A no-op (one thread-local
+/// flag read) when no apply is being attributed, and for calls nested inside
+/// another timed store call.
+pub struct StateTimer(Option<(Instant, bool)>);
+
+impl StateTimer {
+    #[inline]
+    fn start(write: bool) -> Self {
+        STAGE.with(|s| {
+            if !s.active.get() || s.depth.get() != 0 {
+                return Self(None);
+            }
+            s.depth.set(1);
+            Self(Some((Instant::now(), write)))
+        })
+    }
+
+    /// Times a store read entry point (`get_*`, `has_*`, listings).
+    #[inline]
+    pub fn read() -> Self {
+        Self::start(false)
+    }
+
+    /// Times a store write entry point (`set_*`, `remove_*`).
+    #[inline]
+    pub fn write() -> Self {
+        Self::start(true)
+    }
+}
+
+impl Drop for StateTimer {
+    #[inline]
+    fn drop(&mut self) {
+        if let Some((t0, write)) = self.0 {
+            let n = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            STAGE.with(|s| {
+                s.depth.set(0);
+                let (nanos, calls) = if write {
+                    (&s.write_nanos, &s.write_calls)
+                } else {
+                    (&s.read_nanos, &s.read_calls)
+                };
+                nanos.set(nanos.get().saturating_add(n));
+                calls.set(calls.get() + 1);
+                if s.avm_depth.get() > 0 {
+                    s.in_avm_nanos.set(s.in_avm_nanos.get().saturating_add(n));
+                }
+            });
+        }
+    }
 }
 
 /// Returns and clears this thread's accumulated AVM time since the last
@@ -245,6 +419,7 @@ pub struct AvmTimer(Instant, ThreadId);
 impl AvmTimer {
     /// Starts timing a top-level program evaluation.
     pub fn start() -> Self {
+        STAGE.with(|s| s.avm_depth.set(s.avm_depth.get() + 1));
         Self(Instant::now(), std::thread::current().id())
     }
 }
@@ -258,6 +433,7 @@ impl Drop for AvmTimer {
         );
         let n = u64::try_from(self.0.elapsed().as_nanos()).unwrap_or(u64::MAX);
         AVM_NANOS.with(|c| c.set(c.get().saturating_add(n)));
+        STAGE.with(|s| s.avm_depth.set(s.avm_depth.get().saturating_sub(1)));
     }
 }
 
@@ -498,6 +674,55 @@ mod tests {
         let d = take_avm_time().expect("two evaluations ran");
         assert!(d >= Duration::from_millis(4), "{d:?}");
         assert!(take_avm_time().is_none(), "take clears the accumulator");
+    }
+
+    #[test]
+    fn state_timer_splits_reads_writes_and_avm_without_double_counting() {
+        // Inactive: nothing is measured.
+        {
+            let _t = StateTimer::read();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        reset_avm_time();
+        assert_eq!(take_stage_times(), StageTimes::default());
+        reset_avm_time();
+        {
+            // Outer write with a nested read (set_account -> get_account).
+            let _w = StateTimer::write();
+            let _r = StateTimer::read();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        {
+            let _r = StateTimer::read();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        {
+            let _avm = AvmTimer::start();
+            let _r = StateTimer::read();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let st = take_stage_times();
+        assert_eq!((st.read_calls, st.write_calls), (2, 1));
+        assert!(st.state_write >= Duration::from_millis(3), "{st:?}");
+        assert!(st.state_read >= Duration::from_millis(4), "{st:?}");
+        assert!(
+            st.state_in_avm >= Duration::from_millis(2) && st.state_in_avm <= st.state_read,
+            "{st:?}"
+        );
+        // Taking stops the attribution.
+        {
+            let _r = StateTimer::read();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(take_stage_times(), StageTimes::default());
+        let (avm_only, state, other) =
+            st.split(Duration::from_millis(20), Some(Duration::from_millis(5)));
+        assert_eq!(state, st.state());
+        assert_eq!(
+            avm_only,
+            Duration::from_millis(5).saturating_sub(st.state_in_avm)
+        );
+        assert_eq!(avm_only + state + other, Duration::from_millis(20));
     }
 
     #[test]
