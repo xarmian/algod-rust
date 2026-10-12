@@ -774,14 +774,24 @@ pub(crate) fn encode_account_data(acct: &AccountData) -> Vec<u8> {
     algo_codec::canonical_encode_base_account_data(acct)
 }
 
+/// `Value::as_slice` for the borrowed form: only msgpack `bin` counts.
+fn vref_bytes<'a>(v: &rmpv::ValueRef<'a>) -> Option<&'a [u8]> {
+    match v {
+        rmpv::ValueRef::Binary(b) => Some(b),
+        _ => None,
+    }
+}
+
 fn decode_account_data(data: &[u8]) -> Result<AccountData, AlgoError> {
-    let val: rmpv::Value =
-        rmpv::decode::read_value(&mut &data[..]).map_err(|e| AlgoError::Ledger {
+    // Borrowed decode (`ValueRef`): no per-key/per-value allocation, which
+    // matters for scans over every online account (issue #1817).
+    let val: rmpv::ValueRef<'_> =
+        rmpv::decode::read_value_ref(&mut &data[..]).map_err(|e| AlgoError::Ledger {
             message: format!("msgpack decode error: {e}"),
         })?;
 
     let map = match val {
-        rmpv::Value::Map(m) => m,
+        rmpv::ValueRef::Map(m) => m,
         _ => {
             return Err(AlgoError::Ledger {
                 message: "expected msgpack map for AccountData".into(),
@@ -792,14 +802,17 @@ fn decode_account_data(data: &[u8]) -> Result<AccountData, AlgoError> {
     let mut acct = AccountData::default();
 
     for (k, v) in map {
-        let key = k.as_str().unwrap_or("");
+        let key = match &k {
+            rmpv::ValueRef::String(s) => s.as_str().unwrap_or(""),
+            _ => "",
+        };
         match key {
             "a" => acct.status = AccountStatus::from(v.as_u64().unwrap_or(0) as u8),
             "b" => acct.micro_algos = v.as_u64().unwrap_or(0),
             "c" => acct.rewards_base = v.as_u64().unwrap_or(0),
             "d" => acct.rewarded_micro_algos = v.as_u64().unwrap_or(0),
             "e" => {
-                if let Some(bytes) = v.as_slice() {
+                if let Some(bytes) = vref_bytes(&v) {
                     if bytes.len() == 32 {
                         let mut arr = [0u8; 32];
                         arr.copy_from_slice(bytes);
@@ -816,11 +829,11 @@ fn decode_account_data(data: &[u8]) -> Result<AccountData, AlgoError> {
             "l" => acct.total_apps_opted_in = v.as_u64().unwrap_or(0),
             "m" => acct.total_boxes = v.as_u64().unwrap_or(0),
             "n" => acct.total_box_bytes = v.as_u64().unwrap_or(0),
-            "o" => acct.incentive_eligible = v.as_bool().unwrap_or(false),
+            "o" => acct.incentive_eligible = matches!(v, rmpv::ValueRef::Boolean(true)),
             "p" => acct.last_proposed = v.as_u64().unwrap_or(0),
             "q" => acct.last_heartbeat = v.as_u64().unwrap_or(0),
             "A" => {
-                if let Some(bytes) = v.as_slice() {
+                if let Some(bytes) = vref_bytes(&v) {
                     if bytes.len() == 32 {
                         let mut arr = [0u8; 32];
                         arr.copy_from_slice(bytes);
@@ -829,7 +842,7 @@ fn decode_account_data(data: &[u8]) -> Result<AccountData, AlgoError> {
                 }
             }
             "B" => {
-                if let Some(bytes) = v.as_slice() {
+                if let Some(bytes) = vref_bytes(&v) {
                     if bytes.len() == 32 {
                         let mut arr = [0u8; 32];
                         arr.copy_from_slice(bytes);
@@ -841,7 +854,7 @@ fn decode_account_data(data: &[u8]) -> Result<AccountData, AlgoError> {
             "D" => acct.vote_last_valid = v.as_u64().unwrap_or(0),
             "E" => acct.vote_key_dilution = v.as_u64().unwrap_or(0),
             "F" => {
-                if let Some(bytes) = v.as_slice() {
+                if let Some(bytes) = vref_bytes(&v) {
                     if bytes.len() == 64 {
                         let mut arr = [0u8; 64];
                         arr.copy_from_slice(bytes);
@@ -7972,6 +7985,57 @@ impl LedgerStore for SqliteLedger {
             }
         }
         out
+    }
+
+    fn for_each_online_account_ordered(&self, visit: &mut dyn FnMut(Address, AccountData) -> bool) {
+        // Stream in `accountbase_address_idx` order and stop early: no Vec of
+        // every decoded account, no sort (issue #1817).
+        let mut stmt = match self.conn.prepare(
+            "SELECT address, data FROM accountbase WHERE normalizedonlinebalance > 0 \
+             ORDER BY address",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("for_each_online_account_ordered: prepare error: {e}");
+                return;
+            }
+        };
+        let mut rows = match stmt.query([]) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("for_each_online_account_ordered: query error: {e}");
+                return;
+            }
+        };
+        loop {
+            let row = match rows.next() {
+                Ok(Some(r)) => r,
+                Ok(None) => return,
+                Err(e) => {
+                    tracing::error!("for_each_online_account_ordered: row read error: {e}");
+                    return;
+                }
+            };
+            let (Ok(addr_bytes), Ok(data)) = (row.get_ref(0), row.get_ref(1)) else {
+                continue;
+            };
+            let (Ok(addr_bytes), Ok(data)) = (addr_bytes.as_blob(), data.as_blob()) else {
+                continue;
+            };
+            let Ok(addr_arr) = <[u8; 32]>::try_from(addr_bytes) else {
+                tracing::error!("for_each_online_account_ordered: bad address length");
+                continue;
+            };
+            match decode_account_data(data) {
+                Ok(account) if account.status == AccountStatus::Online => {
+                    if !visit(Address(addr_arr), account) {
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => tracing::error!("for_each_online_account_ordered: decode error: {e}"),
+            }
+        }
     }
 
     fn put_voters_snapshot(
@@ -15727,8 +15791,8 @@ mod tests {
         let holder = Connection::open(tracker_path_for_prefix(&prefix)).unwrap();
         holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
         let started = std::time::Instant::now();
-        let ledger = SqliteLedger::open_with_prefix(&prefix)
-            .expect("open must not need the write lock");
+        let ledger =
+            SqliteLedger::open_with_prefix(&prefix).expect("open must not need the write lock");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
             "open waited on the write lock"

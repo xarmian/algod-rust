@@ -641,6 +641,10 @@ impl LedgerStore for OverlayStore<'_> {
         self.base.online_accounts()
     }
 
+    fn for_each_online_account_ordered(&self, visit: &mut dyn FnMut(Address, AccountData) -> bool) {
+        self.base.for_each_online_account_ordered(visit)
+    }
+
     fn voter_agreement_data_at_round(
         &self,
         round: u64,

@@ -1963,36 +1963,24 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
         return lists;
     }
 
-    // One scan of the online set; the payset's touched accounts overwrite the
-    // base data with their end-of-block state (go: `mods.Accts.GetData`). Like
-    // go, the online set is only a candidate source while suspensions are
-    // enabled (`if maxSuspensions > 0 { GetKnockOfflineCandidates }`);
-    // otherwise only the modified accounts are considered, and the scan is
-    // skipped.
-    let mut index: std::collections::HashMap<Address, usize> = std::collections::HashMap::new();
-    let mut candidates: Vec<(Address, algo_types::AccountData)> = Vec::new();
-    if max_absent > 0 {
-        for (addr, acct) in store.online_accounts() {
-            index.insert(addr, candidates.len());
-            candidates.push((addr, acct));
-        }
-    }
+    // The payset's touched accounts overwrite the base data with their
+    // end-of-block state (go: `mods.Accts.GetData`). Like go, the online set
+    // is only a candidate source while suspensions are enabled
+    // (`if maxSuspensions > 0 { GetKnockOfflineCandidates }`); otherwise only
+    // the modified accounts are considered and the online set is not read.
+    // The online set is streamed in ascending address order and merged with
+    // the (few) touched accounts, so the scan stops as soon as both lists are
+    // full instead of decoding and sorting every online account (issue #1817).
+    let mut touched_accts: std::collections::BTreeMap<Address, algo_types::AccountData> =
+        std::collections::BTreeMap::new();
     for addr in touched {
         if addr.is_zero() {
             continue;
         }
-        let Some(acct) = store.get_account(addr) else {
-            continue;
-        };
-        match index.get(addr) {
-            Some(&i) => candidates[i].1 = acct,
-            None => {
-                index.insert(*addr, candidates.len());
-                candidates.push((*addr, acct));
-            }
+        if let Some(acct) = store.get_account(addr) {
+            touched_accts.insert(*addr, acct);
         }
     }
-    candidates.sort_by_key(|(a, _)| a.0);
 
     // Absence inputs. The total online stake is the balance-round lookback
     // total on the same history basis as each account's stake
@@ -2052,9 +2040,9 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
     } else {
         crate::heartbeat::Challenge::default()
     };
-    for (addr, acct) in candidates {
+    let mut consider = |addr: Address, acct: algo_types::AccountData| -> bool {
         if lists.expired.len() >= max_expired && lists.absent.len() >= max_absent {
-            break; // both lists are full
+            return false; // both lists are full
         }
         // go skips `MicroAlgosWithRewards.IsZero()` (an account being
         // closed). Rewards are `(level - base) * (micro / unit)`, nonzero only
@@ -2062,18 +2050,18 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
         // rewards level (prior round for untouched candidates, post-payset for
         // touched ones) the figure is taken at.
         if acct.micro_algos == 0 || exclude.contains(&addr) {
-            continue;
+            return true;
         }
         let has_vote_key = acct.vote_id.is_some_and(|v| v != [0u8; 32]);
         if has_vote_key && acct.vote_last_valid < round && lists.expired.len() < max_expired {
             lists.expired.push(addr);
-            continue; // if marking expired, do not consider suspension
+            return true; // if marking expired, do not consider suspension
         }
         if lists.absent.len() >= max_absent {
-            continue; // no more room (more expiries may follow)
+            return true; // no more room (more expiries may follow)
         }
         if acct.status != AccountStatus::Online || !acct.incentive_eligible {
-            continue;
+            return true;
         }
         let last_seen = crate::heartbeat::last_seen(acct.last_proposed, acct.last_heartbeat);
         // The challenge test needs no lookup, and `is_absent` is false for a
@@ -2083,7 +2071,7 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
             if total(store).is_some() {
                 lists.absent.push(addr);
             }
-            continue;
+            return true;
         }
         // Cheap prefilter before any database access: the allowable lag is
         // `ABSENT_FACTOR * total / stake`, at least `ABSENT_FACTOR` whenever the
@@ -2091,21 +2079,55 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
         // `ABSENT_FACTOR` rounds is not absent. (Skipping a candidate only
         // shortens the list, which is always valid.)
         if history_uncertain || last_seen == 0 || last_seen.saturating_add(ABSENT_FACTOR) >= round {
-            continue;
+            return true;
         }
         let Some(total_online_stake) = total(store) else {
-            continue; // undecidable: the lag test is skipped
+            return true; // undecidable: the lag test is skipped
         };
         let stake = match lookback_voting_stake(store, round, consensus, &addr) {
             Ok(stake) => stake,
             Err(e) => {
                 // e.g. no block header at the balance round: undecidable.
                 note_undecidable_absence(round, brnd.0, &e);
-                continue;
+                return true;
             }
         };
         if is_absent(total_online_stake, stake, last_seen, round) {
             lists.absent.push(addr);
+        }
+        true
+    };
+    // Merge the ordered online stream with the touched accounts (which win on
+    // an address present in both).
+    let mut touched_iter = touched_accts.into_iter().peekable();
+    let mut done = false;
+    if max_absent > 0 {
+        store.for_each_online_account_ordered(&mut |addr, acct| {
+            while let Some((t_addr, _)) = touched_iter.peek() {
+                if t_addr.0 > addr.0 {
+                    break;
+                }
+                let (t_addr, t_acct) = touched_iter.next().expect("peeked");
+                if !consider(t_addr, t_acct) {
+                    done = true;
+                    return false;
+                }
+                if t_addr == addr {
+                    return true; // the touched record replaces the online one
+                }
+            }
+            if !consider(addr, acct) {
+                done = true;
+                return false;
+            }
+            true
+        });
+    }
+    if !done {
+        for (t_addr, t_acct) in touched_iter {
+            if !consider(t_addr, t_acct) {
+                break;
+            }
         }
     }
     lists
@@ -17454,5 +17476,381 @@ return
         let b = genesis_restore_block(CONSENSUS_V41, false, false);
         let r = restored_copy(&b).expect("gh restored");
         assert_eq!(r.payset[0].txn.genesis_hash, [9u8; 32]);
+    }
+
+    // ---- issue #1817: bounded, streaming knock-offline selection ----
+
+    /// The pre-#1817 implementation (collect + sort the whole online set,
+    /// then walk it), kept verbatim as the oracle the streaming selection
+    /// must reproduce list-for-list.
+    fn knock_offline_lists_full_scan_oracle<L: crate::store_trait::LedgerStore>(
+        store: &L,
+        round: u64,
+        consensus: &ConsensusParams,
+        exclude: &std::collections::HashSet<Address>,
+        touched: &[Address],
+    ) -> KnockOfflineLists {
+        let max_expired = consensus.max_proposed_expired_online_accounts;
+        let max_absent = consensus.payouts_max_mark_absent;
+        let mut lists = KnockOfflineLists::default();
+        if max_expired == 0 && max_absent == 0 {
+            return lists;
+        }
+
+        // One scan of the online set; the payset's touched accounts overwrite the
+        // base data with their end-of-block state (go: `mods.Accts.GetData`). Like
+        // go, the online set is only a candidate source while suspensions are
+        // enabled (`if maxSuspensions > 0 { GetKnockOfflineCandidates }`);
+        // otherwise only the modified accounts are considered, and the scan is
+        // skipped.
+        let mut index: std::collections::HashMap<Address, usize> = std::collections::HashMap::new();
+        let mut candidates: Vec<(Address, algo_types::AccountData)> = Vec::new();
+        if max_absent > 0 {
+            for (addr, acct) in store.online_accounts() {
+                index.insert(addr, candidates.len());
+                candidates.push((addr, acct));
+            }
+        }
+        for addr in touched {
+            if addr.is_zero() {
+                continue;
+            }
+            let Some(acct) = store.get_account(addr) else {
+                continue;
+            };
+            match index.get(addr) {
+                Some(&i) => candidates[i].1 = acct,
+                None => {
+                    index.insert(*addr, candidates.len());
+                    candidates.push((*addr, acct));
+                }
+            }
+        }
+        candidates.sort_by_key(|(a, _)| a.0);
+
+        // Absence inputs. The total online stake is the balance-round lookback
+        // total on the same history basis as each account's stake
+        // (`balance_round_total_online_stake`: supply snapshot, else derived from
+        // the `onlineaccounts` history), fetched lazily at the first candidate
+        // that needs the stake-based lag test. If it cannot be determined the lag
+        // test is undecidable and skipped -- an empty list is always valid -- and
+        // that is logged once per process, not per block. The challenge-failure
+        // test needs no stake and keeps working.
+        let brnd = algo_agreement::balance_round(algo_types::Round(round), consensus);
+        // Synthetic history rows (legacy-database upgrade): go's stake figures
+        // cannot be reproduced yet, so nobody is listed by lag.
+        // A marker read error is also "uncertain": never decide on rows that may
+        // be synthetic.
+        let history_uncertain = max_absent > 0
+            && match store.absence_history_uncertain(brnd.0) {
+                Ok(false) => false,
+                Ok(true) => {
+                    note_undecidable_absence(
+                        round,
+                        brnd.0,
+                        &AlgoError::Ledger {
+                            message: "online-account history was synthesized at upgrade"
+                                .to_string(),
+                        },
+                    );
+                    true
+                }
+                Err(e) => {
+                    note_undecidable_absence(round, brnd.0, &e);
+                    true
+                }
+            };
+        // go computes `onlineStake()` up front whenever it checks absences, and a
+        // block it cannot compute it for fails: so nothing is listed (challenge
+        // failures included) unless the total can be determined. Fetched lazily
+        // at the first account that would be listed.
+        let mut total_cache: Option<Option<u64>> = None;
+        let mut total = |store: &L| -> Option<u64> {
+            *total_cache.get_or_insert_with(|| {
+                match store.balance_round_total_online_stake(brnd.0, round) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        note_undecidable_absence(round, brnd.0, &e);
+                        None
+                    }
+                }
+            })
+        };
+        let challenge = if max_absent > 0 {
+            let provider = crate::heartbeat::StoreHeaderProvider { store };
+            crate::heartbeat::find_challenge(
+                consensus,
+                round,
+                &provider,
+                crate::heartbeat::ChallengePeriod::Active,
+            )
+        } else {
+            crate::heartbeat::Challenge::default()
+        };
+        for (addr, acct) in candidates {
+            if lists.expired.len() >= max_expired && lists.absent.len() >= max_absent {
+                break; // both lists are full
+            }
+            // go skips `MicroAlgosWithRewards.IsZero()` (an account being
+            // closed). Rewards are `(level - base) * (micro / unit)`, nonzero only
+            // for a nonzero balance, so this is `micro_algos == 0` whichever
+            // rewards level (prior round for untouched candidates, post-payset for
+            // touched ones) the figure is taken at.
+            if acct.micro_algos == 0 || exclude.contains(&addr) {
+                continue;
+            }
+            let has_vote_key = acct.vote_id.is_some_and(|v| v != [0u8; 32]);
+            if has_vote_key && acct.vote_last_valid < round && lists.expired.len() < max_expired {
+                lists.expired.push(addr);
+                continue; // if marking expired, do not consider suspension
+            }
+            if lists.absent.len() >= max_absent {
+                continue; // no more room (more expiries may follow)
+            }
+            if acct.status != AccountStatus::Online || !acct.incentive_eligible {
+                continue;
+            }
+            let last_seen = crate::heartbeat::last_seen(acct.last_proposed, acct.last_heartbeat);
+            // The challenge test needs no lookup, and `is_absent` is false for a
+            // never-seen account, so the (database) stake lookup is the last,
+            // rarest step.
+            if challenge.failed(&addr.0, last_seen) {
+                if total(store).is_some() {
+                    lists.absent.push(addr);
+                }
+                continue;
+            }
+            // Cheap prefilter before any database access: the allowable lag is
+            // `ABSENT_FACTOR * total / stake`, at least `ABSENT_FACTOR` whenever the
+            // stake does not exceed the total, so an account seen within the last
+            // `ABSENT_FACTOR` rounds is not absent. (Skipping a candidate only
+            // shortens the list, which is always valid.)
+            if history_uncertain
+                || last_seen == 0
+                || last_seen.saturating_add(ABSENT_FACTOR) >= round
+            {
+                continue;
+            }
+            let Some(total_online_stake) = total(store) else {
+                continue; // undecidable: the lag test is skipped
+            };
+            let stake = match lookback_voting_stake(store, round, consensus, &addr) {
+                Ok(stake) => stake,
+                Err(e) => {
+                    // e.g. no block header at the balance round: undecidable.
+                    note_undecidable_absence(round, brnd.0, &e);
+                    continue;
+                }
+            };
+            if is_absent(total_online_stake, stake, last_seen, round) {
+                lists.absent.push(addr);
+            }
+        }
+        lists
+    }
+    /// Deterministic address from an index (spread over the keyspace).
+    fn ko_addr(i: u32) -> Address {
+        let mut a = [0u8; 32];
+        let h = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        a[..8].copy_from_slice(&h.to_be_bytes());
+        a[8..12].copy_from_slice(&i.to_be_bytes());
+        Address(a)
+    }
+
+    /// A mix: expired (vote_last_valid < round), stale-heartbeat (absent
+    /// candidates), healthy, zero-balance and offline-with-keys accounts.
+    fn ko_populate<S: crate::store_trait::LedgerStore>(
+        store: &mut S,
+        n: u32,
+        expired_every: u32,
+        stale_every: u32,
+    ) {
+        for i in 0..n {
+            let expired = expired_every != 0 && i % expired_every == 0;
+            let stale = stale_every != 0 && i % stale_every == 1;
+            let acct = algo_types::AccountData {
+                micro_algos: if i % 97 == 5 { 0 } else { 5_000_000 },
+                status: if i % 89 == 7 {
+                    AccountStatus::Offline
+                } else {
+                    AccountStatus::Online
+                },
+                incentive_eligible: true,
+                last_heartbeat: if stale { 1 } else { 495 },
+                vote_id: Some([5u8; 32]),
+                vote_last_valid: if expired { 100 } else { 1_000_000 },
+                ..algo_types::AccountData::default()
+            };
+            store.set_account(&ko_addr(i), acct);
+        }
+    }
+
+    fn ko_consensus() -> ConsensusParams {
+        algo_types::consensus::consensus_params_for_version(algo_types::consensus::CONSENSUS_V41)
+            .unwrap()
+    }
+
+    #[test]
+    fn knock_offline_streaming_matches_full_scan_oracle_sqlite() {
+        use crate::sqlite::SqliteLedger;
+        use crate::store_trait::LedgerStore;
+
+        let consensus = ko_consensus();
+        // (n, expired_every, stale_every): lists overflow, partially fill,
+        // and stay empty.
+        for (n, ex, st) in [
+            (400u32, 3u32, 0u32),
+            (400, 0, 4),
+            (400, 40, 50),
+            (400, 0, 0),
+        ] {
+            let mut ledger = SqliteLedger::open_in_memory().unwrap();
+            ko_populate(&mut ledger, n, ex, st);
+            ledger.put_block_header_fixture(181, 0).unwrap();
+            ledger
+                .put_online_supply_at_round(181, 5_000_000 * 10)
+                .unwrap();
+            for i in 0..n {
+                let acct = ledger.get_account(&ko_addr(i)).unwrap();
+                if acct.status == AccountStatus::Online {
+                    ledger
+                        .put_online_account_at_round(&ko_addr(i), 0, &acct)
+                        .unwrap();
+                }
+            }
+            // Touched: an overwrite that expires an online account, one that
+            // takes a healthy account offline-with-keys expired, a brand-new
+            // account, an unknown address and the zero address; exclude two.
+            let mut touched = vec![ko_addr(1), ko_addr(2), ko_addr(n + 1), ko_addr(n + 2)];
+            touched.push(Address([0u8; 32]));
+            let mut t1 = ledger.get_account(&ko_addr(1)).unwrap();
+            t1.vote_last_valid = 7;
+            ledger.set_account(&ko_addr(1), t1);
+            let mut t2 = ledger.get_account(&ko_addr(2)).unwrap();
+            t2.status = AccountStatus::Offline;
+            t2.vote_last_valid = 7;
+            ledger.set_account(&ko_addr(2), t2);
+            ledger.set_account(
+                &ko_addr(n + 1),
+                algo_types::AccountData {
+                    micro_algos: 9,
+                    vote_id: Some([1u8; 32]),
+                    vote_last_valid: 3,
+                    ..algo_types::AccountData::default()
+                },
+            );
+            touched.sort_by_key(|a| a.0);
+            let mut exclude = std::collections::HashSet::new();
+            exclude.insert(ko_addr(3));
+            exclude.insert(ko_addr(6));
+            for t in [&[][..], &touched[..]] {
+                for ex_set in [&Default::default(), &exclude] {
+                    let want =
+                        knock_offline_lists_full_scan_oracle(&ledger, 501, &consensus, ex_set, t);
+                    let got = knock_offline_lists(&ledger, 501, &consensus, ex_set, t);
+                    assert_eq!(got, want, "n={n} ex={ex} st={st} touched={}", t.len());
+                    if ex != 0 || st != 0 {
+                        assert!(
+                            !got.expired.is_empty() || !got.absent.is_empty(),
+                            "fixture must exercise a list (n={n} ex={ex} st={st})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn knock_offline_streaming_matches_full_scan_oracle_default_store() {
+        use crate::store_trait::LedgerStore;
+
+        let consensus = ko_consensus();
+        for (ex, touched_n) in [(3u32, 0usize), (40, 3), (0, 3)] {
+            let mut state = LedgerState::new();
+            ko_populate(&mut state, 300, ex, 0);
+            let mut t = vec![ko_addr(1), ko_addr(2), ko_addr(5000)];
+            t.truncate(touched_n);
+            let mut acct = state.get_account(&ko_addr(1)).unwrap().clone();
+            acct.vote_last_valid = 7;
+            state.set_account(&ko_addr(1), acct);
+            t.sort_by_key(|a| a.0);
+            let want = knock_offline_lists_full_scan_oracle(
+                &state,
+                501,
+                &consensus,
+                &Default::default(),
+                &t,
+            );
+            let got = knock_offline_lists(&state, 501, &consensus, &Default::default(), &t);
+            assert_eq!(got, want, "ex={ex} touched={touched_n}");
+        }
+    }
+
+    /// The ordered visitor honours an early stop (the point of #1817: the
+    /// scan ends once both lists are full instead of decoding every account).
+    #[test]
+    fn knock_offline_ordered_visitor_stops_early_and_is_sorted() {
+        use crate::sqlite::SqliteLedger;
+
+        let consensus = ko_consensus();
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ko_populate(&mut ledger, 400, 1, 0); // everyone expired
+        let mut visited = Vec::new();
+        crate::store_trait::LedgerStore::for_each_online_account_ordered(&ledger, &mut |a, _| {
+            visited.push(a);
+            visited.len() < 5
+        });
+        assert_eq!(visited.len(), 5, "visitor stop is honoured");
+        assert!(visited.windows(2).all(|w| w[0].0 < w[1].0));
+        let lists = knock_offline_lists(&ledger, 501, &consensus, &Default::default(), &[]);
+        assert_eq!(
+            lists.expired.len(),
+            consensus.max_proposed_expired_online_accounts
+        );
+        let want = knock_offline_lists_full_scan_oracle(
+            &ledger,
+            501,
+            &consensus,
+            &Default::default(),
+            &[],
+        );
+        assert_eq!(lists, want);
+    }
+
+    /// Lock-hold measurement (issue #1817): run with
+    /// `cargo test -p algo-ledger --release knock_offline_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing measurement, not a correctness test"]
+    fn knock_offline_timing_100k_online() {
+        use crate::sqlite::SqliteLedger;
+
+        let consensus = ko_consensus();
+        let n = 100_000u32;
+        let dir = std::env::temp_dir().join(format!("ko_timing_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut ledger = SqliteLedger::open_with_prefix(&dir.join("ko")).unwrap();
+        for (label, ex) in [
+            ("sparse (lists never fill)", 0u32),
+            ("dense (fills early)", 1),
+        ] {
+            ledger.begin_block().unwrap();
+            ko_populate(&mut ledger, n, ex, 0);
+            ledger.commit_block().unwrap();
+            let t0 = std::time::Instant::now();
+            let old = knock_offline_lists_full_scan_oracle(
+                &ledger,
+                501,
+                &consensus,
+                &Default::default(),
+                &[],
+            );
+            let d_old = t0.elapsed();
+            let t1 = std::time::Instant::now();
+            let new = knock_offline_lists(&ledger, 501, &consensus, &Default::default(), &[]);
+            let d_new = t1.elapsed();
+            assert_eq!(old, new);
+            println!("KNOCK_OFFLINE_TIMING {label}: n={n} old={d_old:?} new={d_new:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

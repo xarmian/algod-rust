@@ -2194,7 +2194,10 @@ impl SimpleBlockEvaluator {
                 Ok(done) => {
                     let payset = Self::with_apply_data(&pristine, &done.apply_data);
                     // The exact size, measured here outside the ledger lock.
-                    let total: usize = payset.iter().map(Self::encoded_len).sum();
+                    // Per-transaction sizes are encoded once and reused by the
+                    // oversize branch below (issue #1817).
+                    let sizes: Vec<usize> = payset.iter().map(Self::encoded_len).collect();
+                    let total: usize = sizes.iter().sum();
                     if total <= self.max_txn_bytes {
                         self.txn_bytes = total;
                         let counted = done.final_txn_counter.saturating_sub(self.hdr.txn_counter);
@@ -2205,7 +2208,6 @@ impl SimpleBlockEvaluator {
                     }
                     // Largest fitting prefix of groups, from the sizes just
                     // measured; one more pass verifies it.
-                    let sizes: Vec<usize> = payset.iter().map(Self::encoded_len).collect();
                     let mut acc = 0usize;
                     let mut keep = 0usize;
                     for g in &groups {

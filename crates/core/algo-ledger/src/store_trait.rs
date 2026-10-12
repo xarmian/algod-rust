@@ -657,6 +657,22 @@ pub trait LedgerStore {
     /// backend.
     fn online_accounts(&self) -> Vec<(Address, AccountData)>;
 
+    /// Visit the online accounts (the same set as [`Self::online_accounts`])
+    /// in ascending address order, stopping as soon as `visit` returns
+    /// `false`. Lets a caller that needs only a bounded prefix (the proposer's
+    /// knock-offline lists, issue #1817) avoid materialising, decoding and
+    /// sorting the whole set. The default collects and sorts; a database
+    /// backend overrides it to stream in index order.
+    fn for_each_online_account_ordered(&self, visit: &mut dyn FnMut(Address, AccountData) -> bool) {
+        let mut all = self.online_accounts();
+        all.sort_by_key(|(a, _)| a.0);
+        for (addr, acct) in all {
+            if !visit(addr, acct) {
+                return;
+            }
+        }
+    }
+
     // ---- Balance-round-lookback online-participation queries (issue #1215) ----
     //
     // Both back the incentive-opcode pair `voter_params_get`/`online_stake`
