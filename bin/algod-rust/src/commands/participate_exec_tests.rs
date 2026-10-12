@@ -1643,7 +1643,7 @@ fn stale_first_pass_lists_do_not_survive_a_truncating_rerun() {
     assert_eq!(
         test_hooks::knock_offline_calls(),
         1,
-        "the discarded oversize pass must not pay for the O(online) scan"
+        "the discarded oversize pass must not pay for the scan"
     );
     assert_eq!(
         block.expired_participation_accounts.as_deref(),
@@ -1765,12 +1765,12 @@ fn empty_payset_with_a_stale_tip_gets_empty_lists() {
     assert!(block.absent_participation_accounts.is_none());
 }
 
-/// The size gate is an estimate. When it judges the kept pass too big although
-/// the exact size fits (here the limit is exactly the encoded size), the pass
-/// skips the scan and one ungated pass produces the lists: the proposal is
-/// still complete, and the scan ran exactly once.
+/// The lists are computed once, after the exact size check, from the kept
+/// pass's modified accounts (issue #1885): with the limit exactly the encoded
+/// size the proposal is complete and the scan ran exactly once, with no extra
+/// payset execution to produce it.
 #[test]
-fn lists_survive_a_size_estimate_that_overshoots_the_limit() {
+fn lists_are_computed_once_after_the_exact_size_check_at_the_limit() {
     let a = key(1);
     let b = key(2);
     let x = key(3);
@@ -1811,6 +1811,11 @@ fn lists_survive_a_size_estimate_that_overshoots_the_limit() {
     assert_eq!(
         test_hooks::knock_offline_calls(),
         1,
-        "one scan, whichever pass produced the lists"
+        "one scan, after the exact size check"
+    );
+    assert_eq!(
+        eval.exec.as_ref().unwrap().last_passes,
+        1,
+        "no second payset execution to produce the lists"
     );
 }

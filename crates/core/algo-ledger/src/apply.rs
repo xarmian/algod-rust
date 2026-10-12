@@ -1855,11 +1855,6 @@ pub struct ProbeRequest {
     /// proposer's own participating addresses, which go never lists. Only the
     /// proposer's final scratch apply asks.
     pub knock_offline_exclude: Option<std::sync::Arc<std::collections::HashSet<Address>>>,
-    /// Only compute the lists when this says the pass's `ApplyData`
-    /// leaves the payset within the block size limit, i.e. when the pass is
-    /// the one the proposer keeps. A pass that will be discarded as oversize
-    /// then never pays for the O(online accounts) scan (issue #1795).
-    pub knock_offline_gate: Option<FitsGate>,
 }
 
 /// What an apply reports back to its [`ExecProbe`] caller.
@@ -1884,36 +1879,32 @@ pub struct ProbeOutput {
     /// .AvailableBalance(&proto)` in `proposerPayout()` (issue #1794). Only
     /// set on success, and only when [`ProbeRequest::want_fee_sink_available`].
     pub final_fee_sink_available: Option<u64>,
-    /// Result of [`ProbeRequest::knock_offline_exclude`]; only set on success.
+    /// Result of [`ProbeRequest::knock_offline_exclude`] for a store that
+    /// cannot enumerate its modified accounts (computed in the pass); only
+    /// set on success.
     pub knock_offline_lists: Option<KnockOfflineLists>,
+    /// Result of [`ProbeRequest::knock_offline_exclude`] for a store that
+    /// can ([`crate::store_trait::LedgerStore::pending_modified_addresses`]):
+    /// the post-payset state of the modified accounts, from which the lists
+    /// are computed after the proposer has kept the payset (issue #1885). A
+    /// discarded (oversize / failed) pass costs only this small capture.
+    pub knock_offline_modified: Option<KnockOfflineModified>,
 }
 
-/// Estimates whether a scratch pass's payset, once its [`ApplyData`] is
-/// encoded, fits the block: the stripped transactions' already-measured
-/// encoded sizes plus an estimate of each `ApplyData`'s encoded size. It only
-/// gates the optional list scan (see [`ExecProbe::knock_offline_gate`]); the
-/// proposer still measures the exact size outside the ledger lock and never
-/// proposes an oversize block, so a wrong estimate costs a wasted scan or one
-/// extra pass, never correctness. Built from sizes computed outside the lock,
-/// so nothing is cloned or encoded under the mutex.
-#[derive(Debug, Clone)]
-pub struct FitsGate {
-    /// Encoded size of each stripped payset transaction (no ApplyData).
-    pub base_sizes: std::sync::Arc<[usize]>,
-    /// Estimated extra encoded bytes one `ApplyData` adds.
-    pub overhead_of: fn(&ApplyData) -> usize,
-    /// The block byte limit.
-    pub max: usize,
+/// The post-payset state of the accounts a payset modified, as captured by a
+/// scratch pass (see [`ProbeOutput::knock_offline_modified`]). `None` marks an
+/// account the payset removed.
+#[derive(Debug, Default, Clone)]
+pub struct KnockOfflineModified {
+    pub accounts: std::collections::BTreeMap<Address, Option<algo_types::AccountData>>,
 }
 
 /// What the proposer asks of its final scratch pass: the expired / absent
-/// lists, skipping its own participating addresses, and only when the pass
-/// fits ([`ExecProbe::knock_offline_gate`]).
+/// lists inputs, skipping its own participating addresses.
 #[derive(Debug, Clone, Default)]
 pub struct ListsRequest {
     /// Shared (not cloned under the ledger mutex).
     pub own_addresses: std::sync::Arc<std::collections::HashSet<Address>>,
-    pub fits: Option<FitsGate>,
 }
 
 /// The accounts a proposer lists in `ParticipationUpdates` (go
@@ -1956,12 +1947,41 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
     exclude: &std::collections::HashSet<Address>,
     touched: &[Address],
 ) -> KnockOfflineLists {
+    let mut modified = KnockOfflineModified::default();
+    for addr in touched {
+        if addr.is_zero() {
+            continue;
+        }
+        if let Some(acct) = store.get_account(addr) {
+            modified.accounts.insert(*addr, Some(acct));
+        }
+    }
+    knock_offline_lists_from_modified(store, round, consensus, exclude, &modified)
+}
+
+/// [`knock_offline_lists`] with the modified accounts' post-payset state
+/// given explicitly (captured by a scratch pass, see
+/// [`ProbeOutput::knock_offline_modified`]) and `store` being the committed
+/// ledger the payset was evaluated against. An account in `modified` replaces
+/// (or, when `None`, removes) its online-set entry, exactly as if the payset
+/// had been applied to `store`. This is what lets the proposer compute the
+/// lists once, after the exact size check, without re-executing the payset
+/// (issue #1885).
+pub fn knock_offline_lists_from_modified<L: crate::store_trait::LedgerStore>(
+    store: &L,
+    round: u64,
+    consensus: &ConsensusParams,
+    exclude: &std::collections::HashSet<Address>,
+    modified: &KnockOfflineModified,
+) -> KnockOfflineLists {
     let max_expired = consensus.max_proposed_expired_online_accounts;
     let max_absent = consensus.payouts_max_mark_absent;
     let mut lists = KnockOfflineLists::default();
     if max_expired == 0 && max_absent == 0 {
         return lists;
     }
+    #[cfg(any(test, feature = "test-hooks"))]
+    crate::shadow_execute::test_hooks::note_knock_offline();
 
     // The payset's touched accounts overwrite the base data with their
     // end-of-block state (go: `mods.Accts.GetData`). Like go, the online set
@@ -1971,16 +1991,7 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
     // The online set is streamed in ascending address order and merged with
     // the (few) touched accounts, so the scan stops as soon as both lists are
     // full instead of decoding and sorting every online account (issue #1817).
-    let mut touched_accts: std::collections::BTreeMap<Address, algo_types::AccountData> =
-        std::collections::BTreeMap::new();
-    for addr in touched {
-        if addr.is_zero() {
-            continue;
-        }
-        if let Some(acct) = store.get_account(addr) {
-            touched_accts.insert(*addr, acct);
-        }
-    }
+    let touched_accts = &modified.accounts;
 
     // Absence inputs. The total online stake is the balance-round lookback
     // total on the same history basis as each account's stake
@@ -2099,34 +2110,42 @@ pub fn knock_offline_lists<L: crate::store_trait::LedgerStore>(
     };
     // Merge the ordered online stream with the touched accounts (which win on
     // an address present in both).
-    let mut touched_iter = touched_accts.into_iter().peekable();
+    let mut touched_iter = touched_accts.iter().peekable();
     let mut done = false;
     if max_absent > 0 {
-        store.for_each_online_account_ordered(&mut |addr, acct| {
-            while let Some((t_addr, _)) = touched_iter.peek() {
-                if t_addr.0 > addr.0 {
-                    break;
+        store.for_each_knock_offline_candidate_ordered(
+            round,
+            challenge.round,
+            &mut |addr, acct| {
+                while let Some((t_addr, _)) = touched_iter.peek() {
+                    if t_addr.0 > addr.0 {
+                        break;
+                    }
+                    let (t_addr, t_acct) = touched_iter.next().expect("peeked");
+                    if let Some(t_acct) = t_acct {
+                        if !consider(*t_addr, t_acct.clone()) {
+                            done = true;
+                            return false;
+                        }
+                    }
+                    if *t_addr == addr {
+                        return true; // the touched record replaces the online one
+                    }
                 }
-                let (t_addr, t_acct) = touched_iter.next().expect("peeked");
-                if !consider(t_addr, t_acct) {
+                if !consider(addr, acct) {
                     done = true;
                     return false;
                 }
-                if t_addr == addr {
-                    return true; // the touched record replaces the online one
-                }
-            }
-            if !consider(addr, acct) {
-                done = true;
-                return false;
-            }
-            true
-        });
+                true
+            },
+        );
     }
     if !done {
         for (t_addr, t_acct) in touched_iter {
-            if !consider(t_addr, t_acct) {
-                break;
+            if let Some(t_acct) = t_acct {
+                if !consider(*t_addr, t_acct.clone()) {
+                    break;
+                }
             }
         }
     }
@@ -2215,18 +2234,6 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
     probe: Option<&mut ExecProbe>,
 ) -> Result<(), AlgoError> {
     let skip_epilogue = probe.as_ref().is_some_and(|p| p.request.skip_epilogue);
-    // The size gate reads the per-transaction ApplyData: without a place to
-    // collect it the gate would see an empty payset and wave everything
-    // through, so that combination is rejected up front, before any mutation.
-    if probe
-        .as_ref()
-        .is_some_and(|p| p.request.knock_offline_gate.is_some())
-        && apply_data_out.is_none()
-    {
-        return Err(AlgoError::Ledger {
-            message: "knock_offline_gate requires apply_data_out".to_string(),
-        });
-    }
     let check_payouts = validate || probe.as_ref().is_some_and(|p| p.request.validate_payouts);
     // Index of the transaction whose apply failed (see `ExecProbe`).
     let mut failed_txn: Option<usize> = None;
@@ -2604,32 +2611,33 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         if result.is_ok() {
             p.out.final_txn_counter = ctx.txn_counter.get();
             p.out.final_state_proof_next = final_state_proof_next;
-            let fits = match &p.request.knock_offline_gate {
-                Some(g) => {
-                    // `apply_data_out` is present (checked on entry).
-                    let ad = apply_data_out.as_deref().map(Vec::as_slice).unwrap_or(&[]);
-                    let estimate: usize = g
-                        .base_sizes
-                        .iter()
-                        .zip(ad)
-                        .map(|(base, a)| base + (g.overhead_of)(a))
-                        .sum();
-                    estimate <= g.max
-                }
-                None => true,
-            };
-            if let (Some(exclude), true) = (&p.request.knock_offline_exclude, fits) {
+            if let Some(exclude) = &p.request.knock_offline_exclude {
                 // After the payset, before the epilogue: go `endOfBlock`.
-                #[cfg(any(test, feature = "test-hooks"))]
-                crate::shadow_execute::test_hooks::note_knock_offline();
                 let touched = payset_touched_addresses(&block.payset);
-                p.out.knock_offline_lists = Some(knock_offline_lists(
-                    &*store,
-                    block.round.0,
-                    &consensus,
-                    exclude,
-                    &touched,
-                ));
+                match store.pending_modified_addresses() {
+                    Some(mut addrs) => {
+                        // Capture only (cheap): the lists are computed after
+                        // the proposer has kept the payset (issue #1885).
+                        addrs.extend(touched);
+                        let mut modified = KnockOfflineModified::default();
+                        for addr in addrs {
+                            if addr.is_zero() {
+                                continue;
+                            }
+                            modified.accounts.insert(addr, store.get_account(&addr));
+                        }
+                        p.out.knock_offline_modified = Some(modified);
+                    }
+                    None => {
+                        p.out.knock_offline_lists = Some(knock_offline_lists(
+                            &*store,
+                            block.round.0,
+                            &consensus,
+                            exclude,
+                            &touched,
+                        ));
+                    }
+                }
             }
             if p.request.want_fee_sink_available {
                 p.out.final_fee_sink_available = Some(crate::block_header::fee_sink_available(
@@ -3002,7 +3010,7 @@ fn reset_expired_online_accounts<L: crate::store_trait::LedgerStore>(
 /// online account becomes eligible for absentee suspension, scaled by the
 /// account's share of total online stake (go-algorand's `absentFactor`,
 /// `ledger/eval/eval.go`).
-const ABSENT_FACTOR: u64 = 20;
+pub(crate) const ABSENT_FACTOR: u64 = 20;
 
 /// Whether an online account should be considered absent (silent for
 /// suspiciously long, relative to its stake) as of `current`, mirroring
@@ -14785,47 +14793,6 @@ return
         assert!(err.to_string().contains("cannot determine"), "{err}");
     }
 
-    /// A size gate needs the per-transaction ApplyData it estimates from:
-    /// asking for one without an `apply_data_out` is rejected up front, never
-    /// silently treated as an empty payset that fits.
-    #[test]
-    fn knock_offline_gate_without_apply_data_out_is_rejected() {
-        use crate::sqlite::SqliteLedger;
-
-        let mut ledger = SqliteLedger::open_in_memory().unwrap();
-        let block = Block {
-            round: Round(1),
-            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
-            ..Block::default()
-        };
-        let mut probe = ExecProbe {
-            request: ProbeRequest {
-                knock_offline_exclude: Some(Default::default()),
-                knock_offline_gate: Some(FitsGate {
-                    base_sizes: std::sync::Arc::from(Vec::<usize>::new()),
-                    overhead_of: |_| 0,
-                    max: 1,
-                }),
-                ..ProbeRequest::default()
-            },
-            ..ExecProbe::default()
-        };
-        let err = apply_block_impl_probe(
-            &mut ledger,
-            &block,
-            ApplyMode::Execute,
-            false,
-            None,
-            None,
-            None,
-            None,
-            true,
-            Some(&mut probe),
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("requires apply_data_out"), "{err}");
-    }
-
     /// Phase 17 (e2e sweep batch 2): TestWhaleJoin / TestBigJoin /
     /// TestBigIncrease (`test/e2e-go/features/incentives/whalejoin_test.go`).
     ///
@@ -17829,13 +17796,15 @@ return
         let dir = std::env::temp_dir().join(format!("ko_timing_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let mut ledger = SqliteLedger::open_with_prefix(&dir.join("ko")).unwrap();
-        for (label, ex) in [
-            ("sparse (lists never fill)", 0u32),
-            ("dense (fills early)", 1),
+        for (label, ex, st) in [
+            ("sparse (lists never fill)", 0u32, 0u32),
+            ("sparse, 100 stale candidates", 0, 1000),
+            ("dense (fills early)", 1, 0),
         ] {
             ledger.begin_block().unwrap();
-            ko_populate(&mut ledger, n, ex, 0);
+            ko_populate(&mut ledger, n, ex, st);
             ledger.commit_block().unwrap();
+            ledger.knock_index_drop();
             let t0 = std::time::Instant::now();
             let old = knock_offline_lists_full_scan_oracle(
                 &ledger,
@@ -17845,12 +17814,273 @@ return
                 &[],
             );
             let d_old = t0.elapsed();
+            // Cold: includes the one-time index build (first proposal).
             let t1 = std::time::Instant::now();
+            let cold = knock_offline_lists(&ledger, 501, &consensus, &Default::default(), &[]);
+            let d_cold = t1.elapsed();
+            // Warm: every later proposal (the index is kept across blocks).
+            let t2 = std::time::Instant::now();
             let new = knock_offline_lists(&ledger, 501, &consensus, &Default::default(), &[]);
-            let d_new = t1.elapsed();
+            let d_new = t2.elapsed();
             assert_eq!(old, new);
-            println!("KNOCK_OFFLINE_TIMING {label}: n={n} old={d_old:?} new={d_new:?}");
+            assert_eq!(old, cold);
+            println!(
+                "KNOCK_OFFLINE_TIMING {label}: n={n} full_scan_oracle={d_old:?} index_cold={d_cold:?} index_warm={d_new:?}"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #1885: the candidate-index selection equals the full-scan oracle
+    /// over randomized online sets, through block commits, rollbacks, scratch
+    /// snapshot restores, removals, a dropped (rebuilt) index and out-of-block
+    /// writes, and the index itself never drifts from the account table.
+    #[test]
+    fn knock_offline_candidate_index_matches_full_scan_oracle_randomized() {
+        use crate::sqlite::SqliteLedger;
+        use crate::store_trait::LedgerStore;
+
+        let consensus = ko_consensus();
+        let mut seed = 0x1885_u64;
+        let mut rnd = move |m: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % m
+        };
+        let random_acct = |rnd: &mut dyn FnMut(u64) -> u64| {
+            let seen = |r: u64| match r {
+                0 => 0,
+                1 => 1,
+                2 => 480,
+                3 => 495,
+                _ => 150,
+            };
+            algo_types::AccountData {
+                micro_algos: if rnd(10) == 0 { 0 } else { 5_000_000 },
+                status: if rnd(8) == 0 {
+                    AccountStatus::Offline
+                } else {
+                    AccountStatus::Online
+                },
+                incentive_eligible: rnd(4) != 0,
+                last_proposed: seen(rnd(5)),
+                last_heartbeat: seen(rnd(5)),
+                vote_id: match rnd(5) {
+                    0 => None,
+                    1 => Some([0u8; 32]),
+                    _ => Some([7u8; 32]),
+                },
+                vote_last_valid: [0, 50, 300, 499, 500, 501, 1_000_000][rnd(7) as usize],
+                ..algo_types::AccountData::default()
+            }
+        };
+        let n = 250u32;
+        // 0: always the index; 16: the production threshold (this dense
+        // fixture then streams).
+        let mut compared_nonempty = 0usize;
+        for divisor in [0usize, 16] {
+            let mut ledger = SqliteLedger::open_in_memory().unwrap();
+            ledger.knock_index_set_fallback_divisor(divisor);
+            ledger.put_block_header_fixture(181, 0).unwrap();
+            ledger
+                .put_online_supply_at_round(181, 5_000_000 * 10)
+                .unwrap();
+            ledger.begin_block().unwrap();
+            for i in 0..n {
+                let a = random_acct(&mut rnd);
+                if a.status == AccountStatus::Online {
+                    ledger
+                        .put_online_account_at_round(&ko_addr(i), 0, &a)
+                        .unwrap();
+                }
+                ledger.set_account(&ko_addr(i), a);
+            }
+            ledger.commit_block().unwrap();
+
+            let mut exclude = std::collections::HashSet::new();
+            exclude.insert(ko_addr(3));
+            exclude.insert(ko_addr(9));
+            let mut check = |ledger: &SqliteLedger, touched: &[Address], what: &str| {
+                for round in [15u64, 300, 501, 700] {
+                    for ex_set in [&Default::default(), &exclude] {
+                        let want = knock_offline_lists_full_scan_oracle(
+                            ledger, round, &consensus, ex_set, touched,
+                        );
+                        let got = knock_offline_lists(ledger, round, &consensus, ex_set, touched);
+                        assert_eq!(got, want, "{what}: round={round}");
+                        if !want.expired.is_empty() || !want.absent.is_empty() {
+                            compared_nonempty += 1;
+                        }
+                    }
+                }
+            };
+            check(&ledger, &[], "initial");
+            for step in 0..40u32 {
+                let mode = step % 5; // commit, rollback, scratch restore, remove+commit, rebuild
+                ledger.begin_block().unwrap();
+                let mut touched = Vec::new();
+                let snap = (mode == 2).then(|| ledger.snapshot(&[]));
+                for _ in 0..(5 + rnd(20)) {
+                    let i = rnd(n as u64 + 20) as u32;
+                    touched.push(ko_addr(i));
+                    if mode == 3 && rnd(3) == 0 {
+                        ledger.remove_account(&ko_addr(i));
+                    } else {
+                        let a = random_acct(&mut rnd);
+                        ledger.set_account(&ko_addr(i), a);
+                    }
+                }
+                touched.sort_by_key(|a| a.0);
+                touched.dedup();
+                // In flight: the pending writes are visible to the selection.
+                check(&ledger, &[], "in-block");
+                check(&ledger, &touched, "in-block touched");
+                match mode {
+                    1 => ledger.rollback_block().unwrap(),
+                    2 => {
+                        ledger.restore_snapshot(snap.unwrap());
+                        ledger.commit_block().unwrap();
+                    }
+                    _ => ledger.commit_block().unwrap(),
+                }
+                if mode == 4 {
+                    ledger.knock_index_drop();
+                }
+                check(&ledger, &[], &format!("step {step} mode {mode}"));
+                ledger
+                    .knock_index_check()
+                    .unwrap_or_else(|e| panic!("step {step} mode {mode}: {e}"));
+                if step % 11 == 10 {
+                    // Out-of-block write (no begin_block), then a later commit.
+                    ledger.set_account(&ko_addr(1), random_acct(&mut rnd));
+                    check(&ledger, &[], "out-of-block write");
+                    ledger.begin_block().unwrap();
+                    ledger.commit_block().unwrap();
+                    ledger.knock_index_check().unwrap();
+                }
+            }
+        }
+        assert!(
+            compared_nonempty > 50,
+            "the fixture must exercise non-empty lists ({compared_nonempty})"
+        );
+    }
+
+    /// Issue #1885: an index built while a block's uncommitted writes are
+    /// visible must not keep what a rollback undoes.
+    #[test]
+    fn knock_offline_candidate_index_built_mid_block_survives_rollback() {
+        use crate::sqlite::SqliteLedger;
+        use crate::store_trait::LedgerStore;
+
+        let consensus = ko_consensus();
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.put_block_header_fixture(181, 0).unwrap();
+        ledger
+            .put_online_supply_at_round(181, 5_000_000 * 10)
+            .unwrap();
+        ko_populate(&mut ledger, 50, 0, 0);
+        ledger.begin_block().unwrap();
+        ledger.commit_block().unwrap();
+        ledger.begin_block().unwrap();
+        let mut a = ledger.get_account(&ko_addr(4)).unwrap();
+        a.vote_last_valid = 10; // would be expired at round 501
+        ledger.set_account(&ko_addr(4), a);
+        // First query ever: builds the index with the write visible.
+        let mid = knock_offline_lists(&ledger, 501, &consensus, &Default::default(), &[]);
+        assert!(mid.expired.contains(&ko_addr(4)));
+        ledger.rollback_block().unwrap();
+        let after = knock_offline_lists(&ledger, 501, &consensus, &Default::default(), &[]);
+        let want = knock_offline_lists_full_scan_oracle(
+            &ledger,
+            501,
+            &consensus,
+            &Default::default(),
+            &[],
+        );
+        assert_eq!(after, want);
+        assert!(!after.expired.contains(&ko_addr(4)));
+        ledger.begin_block().unwrap();
+        ledger.commit_block().unwrap();
+        ledger.knock_index_check().unwrap();
+    }
+
+    /// Issue #1885: the lists computed AFTER the payset from the captured
+    /// post-payset state of the modified accounts (on the committed ledger)
+    /// equal the lists computed over the ledger the payset was applied to,
+    /// including removed accounts and replaced ones.
+    #[test]
+    fn knock_offline_lists_from_modified_match_the_applied_state() {
+        use crate::sqlite::SqliteLedger;
+        use crate::store_trait::LedgerStore;
+
+        let consensus = ko_consensus();
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.put_block_header_fixture(181, 0).unwrap();
+        ledger
+            .put_online_supply_at_round(181, 5_000_000 * 10)
+            .unwrap();
+        ledger.begin_block().unwrap();
+        ko_populate(&mut ledger, 200, 7, 5);
+        for i in 0..200 {
+            let acct = ledger.get_account(&ko_addr(i)).unwrap();
+            if acct.status == AccountStatus::Online {
+                ledger
+                    .put_online_account_at_round(&ko_addr(i), 0, &acct)
+                    .unwrap();
+            }
+        }
+        ledger.commit_block().unwrap();
+        let mut exclude = std::collections::HashSet::new();
+        exclude.insert(ko_addr(14));
+
+        // The "payset": removes an expired online account, un-expires another,
+        // expires a healthy one, creates a new expired one.
+        let removed = ko_addr(0);
+        let renewed = ko_addr(7);
+        let expiring = ko_addr(2);
+        let created = ko_addr(500);
+        let mut modified = KnockOfflineModified::default();
+        let mut renewed_acct = ledger.get_account(&renewed).unwrap();
+        renewed_acct.vote_last_valid = 1_000_000;
+        let mut expiring_acct = ledger.get_account(&expiring).unwrap();
+        expiring_acct.vote_last_valid = 9;
+        let created_acct = algo_types::AccountData {
+            micro_algos: 7,
+            vote_id: Some([3u8; 32]),
+            vote_last_valid: 2,
+            ..algo_types::AccountData::default()
+        };
+        modified.accounts.insert(removed, None);
+        modified
+            .accounts
+            .insert(renewed, Some(renewed_acct.clone()));
+        modified
+            .accounts
+            .insert(expiring, Some(expiring_acct.clone()));
+        modified
+            .accounts
+            .insert(created, Some(created_acct.clone()));
+
+        // Deferred: computed on the committed ledger.
+        let deferred =
+            knock_offline_lists_from_modified(&ledger, 501, &consensus, &exclude, &modified);
+        // Direct: apply the payset's effects, then compute (and the oracle).
+        ledger.begin_block().unwrap();
+        ledger.remove_account(&removed);
+        ledger.set_account(&renewed, renewed_acct);
+        ledger.set_account(&expiring, expiring_acct);
+        ledger.set_account(&created, created_acct);
+        let touched = [removed, renewed, expiring, created];
+        let direct = knock_offline_lists(&ledger, 501, &consensus, &exclude, &touched);
+        let oracle =
+            knock_offline_lists_full_scan_oracle(&ledger, 501, &consensus, &exclude, &touched);
+        ledger.rollback_block().unwrap();
+        assert_eq!(direct, oracle);
+        assert_eq!(deferred, oracle);
+        assert!(!deferred.expired.contains(&removed));
+        assert!(!deferred.expired.contains(&renewed));
+        assert!(!deferred.expired.is_empty());
     }
 }

@@ -673,6 +673,36 @@ pub trait LedgerStore {
         }
     }
 
+    /// Visit, in ascending address order, a SUPERSET of the online accounts
+    /// that [`crate::apply::knock_offline_lists`] can list at `round`: every
+    /// online account holding a vote key with `vote_last_valid < round`, and
+    /// every `IncentiveEligible` one with `last_seen != 0 && last_seen + 20
+    /// < round` or `last_seen < challenge_round` (0 = no active challenge).
+    /// Returning more is always correct (the caller applies the exact
+    /// per-account tests); returning fewer is not. The default visits the
+    /// whole online set; a backend with a candidate index overrides it so the
+    /// per-proposal cost does not scale with the number of online accounts
+    /// (issue #1885).
+    fn for_each_knock_offline_candidate_ordered(
+        &self,
+        _round: u64,
+        _challenge_round: u64,
+        visit: &mut dyn FnMut(Address, AccountData) -> bool,
+    ) {
+        self.for_each_online_account_ordered(visit)
+    }
+
+    /// Every address written since the last commit (this block's, scratch
+    /// pass's and out-of-block writes), or `None` when the backend cannot
+    /// enumerate them. Lets the proposer's scratch pass hand the post-payset
+    /// state of exactly the modified accounts to a later
+    /// [`crate::apply::knock_offline_lists_from_modified`] run on the
+    /// committed ledger, so the lists need no second payset execution
+    /// (issue #1885). A superset is fine; a missing address is not.
+    fn pending_modified_addresses(&self) -> Option<Vec<Address>> {
+        None
+    }
+
     // ---- Balance-round-lookback online-participation queries (issue #1215) ----
     //
     // Both back the incentive-opcode pair `voter_params_get`/`online_stake`

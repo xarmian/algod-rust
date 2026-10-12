@@ -38,6 +38,7 @@ pub mod follow_timing;
 pub mod genesis;
 pub mod heartbeat;
 pub mod heartbeat_builder;
+pub mod knock_index;
 pub mod lease;
 pub mod merkle_cache;
 pub mod merkle_committer;

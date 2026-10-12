@@ -1615,30 +1615,11 @@ struct ExecState {
     /// The fee sink's available balance after the kept payset (go
     /// `proposerPayout()`); `None` while no payset has been evaluated.
     final_fee_sink_available: Option<u64>,
-    /// The expired / absent lists the final scratch apply computed over the
-    /// state after the kept payset (go `endOfBlock`, issue #1795); `None`
-    /// while no payset has been evaluated.
+    /// The expired / absent lists over the state after the kept payset (go
+    /// `endOfBlock`, issues #1795, #1885): computed once, after the exact
+    /// size check, from the kept pass's modified accounts; `None` while no
+    /// payset has been evaluated.
     final_knock_offline: Option<algo_ledger::apply::KnockOfflineLists>,
-}
-
-/// Counts the bytes written to it.
-struct CountingWriter(usize);
-
-impl std::io::Write for CountingWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0 += buf.len();
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Encoded msgpack length of `v`, without allocating the encoding.
-fn encoded_value_len(v: &rmpv::Value) -> usize {
-    let mut c = CountingWriter(0);
-    let _ = rmpv::encode::write_value(&mut c, v);
-    c.0
 }
 
 impl SimpleBlockEvaluator {
@@ -2042,32 +2023,6 @@ impl SimpleBlockEvaluator {
         out
     }
 
-    /// Estimated extra encoded bytes one `ApplyData` adds to its transaction:
-    /// at most ~21 bytes per nonzero numeric field (msgpack key + 9-byte
-    /// value) plus the encoded `eval_delta`. Only an estimate for the list
-    /// scan's size gate (see `ExecProbe::knock_offline_gate`); the exact size
-    /// is always measured outside the ledger lock before a payset is kept.
-    fn apply_data_overhead(ad: &algo_ledger::apply::ApplyData) -> usize {
-        const NUMERIC_FIELD: usize = 21;
-        let numeric = [
-            ad.closing_amount,
-            ad.asset_closing_amount,
-            ad.sender_rewards,
-            ad.receiver_rewards,
-            ad.close_rewards,
-            ad.config_asset,
-            ad.application_id,
-        ]
-        .iter()
-        .filter(|v| **v != 0)
-        .count();
-        let delta = ad
-            .eval_delta
-            .as_ref()
-            .map_or(0, |v| 8 + encoded_value_len(v));
-        numeric * NUMERIC_FIELD + delta
-    }
-
     /// One scratch evaluation of `payset` (groups described by `groups`)
     /// under the ledger mutex. The candidate carries the fees and load of the
     /// payset it holds, so the block epilogue sees the same inputs as the
@@ -2081,7 +2036,6 @@ impl SimpleBlockEvaluator {
         payset: &[algo_types::SignedTransaction],
         groups: &[ExecGroup],
         own_addresses: Option<&std::sync::Arc<std::collections::HashSet<algo_types::Address>>>,
-        gated: bool,
     ) -> Result<
         Result<
             algo_ledger::shadow_execute::ScratchPayset,
@@ -2092,36 +2046,21 @@ impl SimpleBlockEvaluator {
         let mut candidate = template.clone();
         candidate.payset = payset.to_vec();
         candidate.fees_collected = groups.iter().map(|g| g.fees).sum();
-        // Measured here, outside the ledger lock: feeds the load and the size
-        // gate, so nothing is cloned or encoded under the mutex.
-        // Only when something uses them: the load and the size gate (never on
-        // bisection probes, which ask for neither).
-        let base_sizes: std::sync::Arc<[usize]> =
-            if self.consensus_params.load_tracking || (own_addresses.is_some() && gated) {
-                payset.iter().map(Self::encoded_len).collect()
-            } else {
-                std::sync::Arc::from(Vec::<usize>::new())
-            };
+        // Measured here, outside the ledger lock, so nothing is encoded under
+        // the mutex. Only when the load needs it.
         if self.consensus_params.load_tracking {
-            let bytes: u64 = base_sizes.iter().map(|b| *b as u64).sum();
+            let bytes: u64 = payset.iter().map(|t| Self::encoded_len(t) as u64).sum();
             candidate.load =
                 algo_ledger::compute_load(bytes, self.consensus_params.max_txn_bytes_per_block);
         }
-        // The expired / absent lists scan every online account under the
-        // ledger lock, so only the pass the proposer keeps asks for them:
-        // bisection probes do not, and a pass whose ApplyData leaves the
-        // payset over the block limit (so it will be truncated and rerun) is
-        // estimated out inside the apply, before the scan. The request (an
-        // `Arc` share of the exclusion set and of the sizes) is built before
-        // the lock is taken.
-        let max = self.max_txn_bytes;
+        // Only the pass the proposer keeps asks for the expired / absent
+        // lists inputs (bisection probes do not). The pass itself only
+        // captures the post-payset state of the modified accounts; the lists
+        // are computed after the exact size check, on the committed ledger,
+        // without re-executing the payset (issue #1885). The request (an
+        // `Arc` share of the exclusion set) is built before the lock is taken.
         let request = own_addresses.map(|own| algo_ledger::apply::ListsRequest {
             own_addresses: own.clone(),
-            fits: gated.then(|| algo_ledger::apply::FitsGate {
-                base_sizes: base_sizes.clone(),
-                overhead_of: Self::apply_data_overhead,
-                max,
-            }),
         });
         let waited = std::time::Instant::now();
         let mut ledger = self
@@ -2186,10 +2125,10 @@ impl SimpleBlockEvaluator {
         let mut final_state_proof_next = None;
         let mut final_fee_sink_available = None;
         let mut final_knock_offline = None;
+        let mut final_modified = None;
         let result = loop {
             passes += 1;
-            let result =
-                self.scratch_pass(&template, &pristine, &groups, Some(own_addresses), true)?;
+            let result = self.scratch_pass(&template, &pristine, &groups, Some(own_addresses))?;
             match result {
                 Ok(done) => {
                     let payset = Self::with_apply_data(&pristine, &done.apply_data);
@@ -2204,6 +2143,7 @@ impl SimpleBlockEvaluator {
                         final_state_proof_next = done.final_state_proof_next;
                         final_fee_sink_available = done.final_fee_sink_available;
                         final_knock_offline = done.knock_offline_lists;
+                        final_modified = done.knock_offline_modified;
                         break (payset, counted);
                     }
                     // Largest fitting prefix of groups, from the sizes just
@@ -2287,22 +2227,14 @@ impl SimpleBlockEvaluator {
                 }
             }
         };
-        // The size gate is an estimate: if it judged the kept pass too big (the
-        // exact size fits, e.g. near the limit) the pass skipped the list scan.
-        // One more pass over the kept payset, ungated, produces the lists.
-        if final_knock_offline.is_none() && !result.0.is_empty() {
-            match self.scratch_pass(&template, &pristine, &groups, Some(own_addresses), false) {
-                Ok(Ok(done)) => final_knock_offline = done.knock_offline_lists,
-                Ok(Err(failure)) => warn!(
-                    ?failure,
-                    "block assembly: list pass over the kept payset failed; \
-                     using the ledger-tip lists"
-                ),
-                Err(e) => warn!(
-                    error = %e,
-                    "block assembly: list pass over the kept payset failed; \
-                     using the ledger-tip lists"
-                ),
+        // The kept pass captured the modified accounts; compute the lists now,
+        // once, over the committed ledger (the scratch pass was rolled back),
+        // with no second payset execution (issue #1885). A tip that is not
+        // this block's parent says nothing about it: the generate_block
+        // fallback then proposes empty lists.
+        if let (None, Some(modified)) = (&final_knock_offline, &final_modified) {
+            if !result.0.is_empty() {
+                final_knock_offline = self.knock_offline_from_modified(own_addresses, modified)?;
             }
         }
         if dropped > 0 {
@@ -2323,6 +2255,37 @@ impl SimpleBlockEvaluator {
             self.fees_collected = 0;
         }
         Ok(result)
+    }
+
+    /// The expired / absent lists over the committed ledger with the kept
+    /// payset's modified accounts overlaid (see `finalize_payset`); `None`
+    /// when the ledger tip is not this block's parent.
+    fn knock_offline_from_modified(
+        &self,
+        own_addresses: &std::sync::Arc<std::collections::HashSet<algo_types::Address>>,
+        modified: &algo_ledger::apply::KnockOfflineModified,
+    ) -> Result<Option<algo_ledger::apply::KnockOfflineLists>, algo_error::AlgoError> {
+        let waited = std::time::Instant::now();
+        let ledger = self
+            .ledger
+            .lock()
+            .map_err(|e| algo_error::AlgoError::Ledger {
+                message: format!("ledger lock poisoned: {e}"),
+            })?;
+        algo_ledger::proposal_eval::record_ledger_lock_wait(waited.elapsed());
+        if ledger.current_round().0.saturating_add(1) != self.hdr.round.0 {
+            return Ok(None);
+        }
+        let held = std::time::Instant::now();
+        let lists = algo_ledger::apply::knock_offline_lists_from_modified(
+            &*ledger,
+            self.hdr.round.0,
+            &self.consensus_params,
+            own_addresses,
+            modified,
+        );
+        algo_ledger::proposal_eval::record_ledger_lock_hold(held.elapsed());
+        Ok(Some(lists))
     }
 
     fn empty_payset_parts(&self) -> (Vec<algo_types::SignedTransaction>, u64) {
@@ -2368,7 +2331,7 @@ impl SimpleBlockEvaluator {
             let mid = (lo + hi).div_ceil(2);
             let end = groups[mid - 1].start + groups[mid - 1].len;
             *passes += 1;
-            match self.scratch_pass(template, &payset[..end], &groups[..mid], None, false)? {
+            match self.scratch_pass(template, &payset[..end], &groups[..mid], None)? {
                 Ok(_) => lo = mid,
                 Err(_) => hi = mid - 1,
             }
