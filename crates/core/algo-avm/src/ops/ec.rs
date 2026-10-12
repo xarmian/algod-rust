@@ -32,6 +32,8 @@
 use algo_error::AlgoError;
 use num_bigint::BigUint;
 
+use crate::ops::helpers::be_lt;
+
 use ark_bls12_381::{
     Bls12_381, Fq as BLS12Fq, Fq2 as BLS12Fq2, G1Affine as BLS12G1Affine, G1Projective as BLS12G1,
     G2Affine as BLS12G2Affine, G2Projective as BLS12G2,
@@ -89,15 +91,16 @@ const SCALAR_SIZE: usize = 32;
 /// Decode a big-endian byte slice into a BN254 base field element.
 /// Verifies the value is less than the field modulus.
 fn bytes_to_bn254_field(b: &[u8]) -> Result<BN254Fq, AlgoError> {
-    let v = BigUint::from_bytes_be(b);
-    let modulus = BigUint::from_bytes_be(&BN254Fq::MODULUS.to_bytes_be());
-    if v >= modulus {
+    let modulus = BN254Fq::MODULUS.to_bytes_be();
+    if !be_lt(b, &modulus) {
+        // Only the error path needs the decimal rendering.
         return Err(avm_err(format!(
             "field element {} larger than modulus {}",
-            v, modulus
+            BigUint::from_bytes_be(b),
+            BigUint::from_bytes_be(&modulus)
         )));
     }
-    Ok(BN254Fq::from_be_bytes_mod_order(&v.to_bytes_be()))
+    Ok(BN254Fq::from_be_bytes_mod_order(b))
 }
 
 /// Decode 64 bytes (big-endian x || y) into a BN254 G1 affine point.
@@ -233,15 +236,15 @@ fn bn254_g2_to_bytes(p: &BN254G2Affine) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 fn bytes_to_bls12_field(b: &[u8]) -> Result<BLS12Fq, AlgoError> {
-    let v = BigUint::from_bytes_be(b);
-    let modulus = BigUint::from_bytes_be(&BLS12Fq::MODULUS.to_bytes_be());
-    if v >= modulus {
+    let modulus = BLS12Fq::MODULUS.to_bytes_be();
+    if !be_lt(b, &modulus) {
         return Err(avm_err(format!(
             "field element {} larger than modulus {}",
-            v, modulus
+            BigUint::from_bytes_be(b),
+            BigUint::from_bytes_be(&modulus)
         )));
     }
-    Ok(BLS12Fq::from_be_bytes_mod_order(&v.to_bytes_be()))
+    Ok(BLS12Fq::from_be_bytes_mod_order(b))
 }
 
 fn bytes_to_bls12_g1(b: &[u8]) -> Result<BLS12G1Affine, AlgoError> {

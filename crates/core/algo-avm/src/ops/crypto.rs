@@ -32,7 +32,7 @@ use crate::bytecode::Instruction;
 use crate::context::AvmContext;
 use crate::fields::{Base64Encoding, EcdsaCurve, JSONRefType, VrfStandard};
 use crate::machine::{AvmMachine, AvmValue};
-use crate::ops::helpers::get_uint8;
+use crate::ops::helpers::{be_lt, get_uint8};
 
 fn avm_err(msg: impl Into<String>) -> AlgoError {
     AlgoError::Avm {
@@ -1362,14 +1362,6 @@ fn mimc_bls12_381(data: &[u8]) -> Result<Vec<u8>, AlgoError> {
     let start = 32usize.saturating_sub(bytes.len());
     out[start..].copy_from_slice(&bytes[..bytes.len().min(32)]);
     Ok(out)
-}
-
-/// `a < b` for two big-endian unsigned integers of any lengths (leading zero
-/// bytes ignored).
-fn be_lt(a: &[u8], b: &[u8]) -> bool {
-    let a = &a[a.iter().position(|&x| x != 0).unwrap_or(a.len())..];
-    let b = &b[b.iter().position(|&x| x != 0).unwrap_or(b.len())..];
-    a.len() < b.len() || (a.len() == b.len() && a < b)
 }
 
 /// Parse input bytes into field elements (big-endian, 32-byte chunks).
