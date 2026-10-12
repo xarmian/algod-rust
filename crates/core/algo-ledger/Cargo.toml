@@ -11,6 +11,7 @@ test-hooks = []
 
 [dependencies]
 algo-types = { workspace = true }
+algo-metrics = { workspace = true }
 algo-error = { workspace = true }
 algo-avm = { workspace = true }
 algo-agreement = { workspace = true }

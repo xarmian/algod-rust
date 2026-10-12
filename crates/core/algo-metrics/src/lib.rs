@@ -56,6 +56,7 @@
 mod couge;
 
 pub mod counter;
+pub mod fixed;
 pub mod gauge;
 pub mod histogram;
 pub mod registry;
