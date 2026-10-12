@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use algo_error::AlgoError;
 use algo_types::{Block, SignedTransaction};
 
-use crate::apply::{apply_block_impl_probe, ApplyData, ApplyMode, ExecProbe};
+use crate::apply::{apply_block_impl_probe, ApplyData, ApplyMode, ExecProbe, ProbeRequest};
 use crate::pending_overlay::{OverlayStore, PendingOverlay};
 use crate::sqlite::SqliteLedger;
 
@@ -86,7 +86,10 @@ pub fn evaluate_group(
     overlay.begin_group();
     let mut ad: Vec<ApplyData> = Vec::with_capacity(group.len());
     let mut probe = ExecProbe {
-        skip_epilogue: true,
+        request: ProbeRequest {
+            skip_epilogue: true,
+            ..ProbeRequest::default()
+        },
         ..ExecProbe::default()
     };
     let res = {
@@ -108,15 +111,15 @@ pub fn evaluate_group(
     };
     match res {
         Ok(Ok(())) => {
-            overlay.commit_group(probe.final_txn_counter);
+            overlay.commit_group(probe.out.final_txn_counter);
             Ok(GroupEval {
                 apply_data: ad,
-                final_txn_counter: probe.final_txn_counter,
+                final_txn_counter: probe.out.final_txn_counter,
             })
         }
         Ok(Err(error)) => {
             overlay.rollback_group();
-            match probe.failed_txn_index {
+            match probe.out.failed_txn_index {
                 Some(index) if index < group.len() => Err(GroupEvalError::Txn { index, error }),
                 _ => Err(GroupEvalError::Other(error)),
             }

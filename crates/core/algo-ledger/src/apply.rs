@@ -335,7 +335,10 @@ pub fn apply_block_checking_payouts<L: crate::store_trait::LedgerStore>(
     mode: ApplyMode,
 ) -> Result<(), AlgoError> {
     let mut probe = ExecProbe {
-        validate_payouts: true,
+        request: ProbeRequest {
+            validate_payouts: true,
+            ..ProbeRequest::default()
+        },
         ..ExecProbe::default()
     };
     apply_block_impl_probe(
@@ -447,7 +450,7 @@ pub fn apply_block_capturing_state_proof_next<L: crate::store_trait::LedgerStore
         false,
         Some(&mut probe),
     )?;
-    Ok((out, probe.final_state_proof_next))
+    Ok((out, probe.out.final_state_proof_next))
 }
 
 /// Build a `StateDelta` balance record from an account's post-state, matching
@@ -891,7 +894,10 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
     // doc comment for why a pre-apply snapshot alone doesn't work here.
     let mut recording_store = crate::recording_store::RecordingStore::new(store);
     let mut probe = ExecProbe {
-        validate_payouts,
+        request: ProbeRequest {
+            validate_payouts,
+            ..ProbeRequest::default()
+        },
         ..ExecProbe::default()
     };
     apply_block_impl_probe(
@@ -1811,16 +1817,54 @@ pub(crate) fn apply_block_impl_ex<L: crate::store_trait::LedgerStore>(
     )
 }
 
-/// Side outputs of an apply that the proposer's evaluator needs but a plain
-/// apply has no reason to expose (block assembly, issue #1776).
+/// Side channel of an apply for the proposer's evaluator (block assembly,
+/// issue #1776): what it asks the apply to do ([`ProbeRequest`], set by the
+/// caller before the call) and what the apply reports back
+/// ([`ProbeOutput`], read by the caller after it). Kept in separate structs
+/// so an input is never mistaken for a result (issue #1799).
 #[derive(Debug, Default, Clone)]
 pub struct ExecProbe {
-    /// Input: apply only the transactions (go per-group `TransactionGroup`)
+    /// Inputs.
+    pub request: ProbeRequest,
+    /// Outputs; only meaningful after the apply returned.
+    pub out: ProbeOutput,
+}
+
+/// What an apply is asked to do beyond a plain apply (see [`ExecProbe`]).
+#[derive(Debug, Default, Clone)]
+pub struct ProbeRequest {
+    /// Apply only the transactions (go per-group `TransactionGroup`)
     /// and skip the block epilogue (end-of-block participation updates,
     /// proposer payout, `record_proposal`, round / protocol / txn-counter
     /// bookkeeping, lease purge). The proposer runs that epilogue exactly
     /// once, in the final scratch apply of the whole payset.
     pub skip_epilogue: bool,
+    /// Compute [`ProbeOutput::final_fee_sink_available`]. Only the proposer's
+    /// final scratch apply asks; per-group overlay runs and plain applies
+    /// skip the account read and min-balance scan.
+    pub want_fee_sink_available: bool,
+    /// Run go's `validateForPayouts` (see `validate_proposer_payout`)
+    /// in the end-of-block step even though the rest of the apply is not in
+    /// validating mode. Used by the scratch proposal check so a peer's
+    /// payout / fees / proposer header fields are judged against the
+    /// pre-block state without turning on every other validate-mode check.
+    pub validate_payouts: bool,
+    /// Compute go's expired / absent participation lists from the state
+    /// the payset leaves behind (go `generateKnockOfflineAccountsList` runs in
+    /// `endOfBlock`, after every transaction; issue #1795). The set holds the
+    /// proposer's own participating addresses, which go never lists. Only the
+    /// proposer's final scratch apply asks.
+    pub knock_offline_exclude: Option<std::sync::Arc<std::collections::HashSet<Address>>>,
+    /// Only compute the lists when this says the pass's `ApplyData`
+    /// leaves the payset within the block size limit, i.e. when the pass is
+    /// the one the proposer keeps. A pass that will be discarded as oversize
+    /// then never pays for the O(online accounts) scan (issue #1795).
+    pub knock_offline_gate: Option<FitsGate>,
+}
+
+/// What an apply reports back to its [`ExecProbe`] caller.
+#[derive(Debug, Default, Clone)]
+pub struct ProbeOutput {
     /// Payset index of the transaction whose apply failed. `None` when the
     /// apply did not fail, or failed in a group-level step that no single
     /// transaction owns.
@@ -1838,30 +1882,9 @@ pub struct ExecProbe {
     /// at 0, rewards NOT applied) once every transaction of the block has been
     /// applied, before the epilogue: go `eval.state.lookup(FeeSink)
     /// .AvailableBalance(&proto)` in `proposerPayout()` (issue #1794). Only
-    /// set on success.
+    /// set on success, and only when [`ProbeRequest::want_fee_sink_available`].
     pub final_fee_sink_available: Option<u64>,
-    /// Input: compute `final_fee_sink_available`. Only the proposer's final
-    /// scratch apply asks; per-group overlay runs and plain applies skip the
-    /// account read and min-balance scan.
-    pub want_fee_sink_available: bool,
-    /// Input: run go's `validateForPayouts` (see `validate_proposer_payout`)
-    /// in the end-of-block step even though the rest of the apply is not in
-    /// validating mode. Used by the scratch proposal check so a peer's
-    /// payout / fees / proposer header fields are judged against the
-    /// pre-block state without turning on every other validate-mode check.
-    pub validate_payouts: bool,
-    /// Input: compute go's expired / absent participation lists from the state
-    /// the payset leaves behind (go `generateKnockOfflineAccountsList` runs in
-    /// `endOfBlock`, after every transaction; issue #1795). The set holds the
-    /// proposer's own participating addresses, which go never lists. Only the
-    /// proposer's final scratch apply asks.
-    pub knock_offline_exclude: Option<std::sync::Arc<std::collections::HashSet<Address>>>,
-    /// Input: only compute the lists when this says the pass's `ApplyData`
-    /// leaves the payset within the block size limit, i.e. when the pass is
-    /// the one the proposer keeps. A pass that will be discarded as oversize
-    /// then never pays for the O(online accounts) scan (issue #1795).
-    pub knock_offline_gate: Option<FitsGate>,
-    /// Output of [`Self::knock_offline_exclude`]; only set on success.
+    /// Result of [`ProbeRequest::knock_offline_exclude`]; only set on success.
     pub knock_offline_lists: Option<KnockOfflineLists>,
 }
 
@@ -2169,20 +2192,20 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
     scratch: bool,
     probe: Option<&mut ExecProbe>,
 ) -> Result<(), AlgoError> {
-    let skip_epilogue = probe.as_ref().is_some_and(|p| p.skip_epilogue);
+    let skip_epilogue = probe.as_ref().is_some_and(|p| p.request.skip_epilogue);
     // The size gate reads the per-transaction ApplyData: without a place to
     // collect it the gate would see an empty payset and wave everything
     // through, so that combination is rejected up front, before any mutation.
     if probe
         .as_ref()
-        .is_some_and(|p| p.knock_offline_gate.is_some())
+        .is_some_and(|p| p.request.knock_offline_gate.is_some())
         && apply_data_out.is_none()
     {
         return Err(AlgoError::Ledger {
             message: "knock_offline_gate requires apply_data_out".to_string(),
         });
     }
-    let check_payouts = validate || probe.as_ref().is_some_and(|p| p.validate_payouts);
+    let check_payouts = validate || probe.as_ref().is_some_and(|p| p.request.validate_payouts);
     // Index of the transaction whose apply failed (see `ExecProbe`).
     let mut failed_txn: Option<usize> = None;
     // A block's payset stores each transaction without the genesis id/hash
@@ -2555,11 +2578,11 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         advanced => Some(advanced),
     };
     if let Some(p) = probe {
-        p.failed_txn_index = if result.is_err() { failed_txn } else { None };
+        p.out.failed_txn_index = if result.is_err() { failed_txn } else { None };
         if result.is_ok() {
-            p.final_txn_counter = ctx.txn_counter.get();
-            p.final_state_proof_next = final_state_proof_next;
-            let fits = match &p.knock_offline_gate {
+            p.out.final_txn_counter = ctx.txn_counter.get();
+            p.out.final_state_proof_next = final_state_proof_next;
+            let fits = match &p.request.knock_offline_gate {
                 Some(g) => {
                     // `apply_data_out` is present (checked on entry).
                     let ad = apply_data_out.as_deref().map(Vec::as_slice).unwrap_or(&[]);
@@ -2573,12 +2596,12 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
                 }
                 None => true,
             };
-            if let (Some(exclude), true) = (&p.knock_offline_exclude, fits) {
+            if let (Some(exclude), true) = (&p.request.knock_offline_exclude, fits) {
                 // After the payset, before the epilogue: go `endOfBlock`.
                 #[cfg(any(test, feature = "test-hooks"))]
                 crate::shadow_execute::test_hooks::note_knock_offline();
                 let touched = payset_touched_addresses(&block.payset);
-                p.knock_offline_lists = Some(knock_offline_lists(
+                p.out.knock_offline_lists = Some(knock_offline_lists(
                     &*store,
                     block.round.0,
                     &consensus,
@@ -2586,8 +2609,8 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
                     &touched,
                 ));
             }
-            if p.want_fee_sink_available {
-                p.final_fee_sink_available = Some(crate::block_header::fee_sink_available(
+            if p.request.want_fee_sink_available {
+                p.out.final_fee_sink_available = Some(crate::block_header::fee_sink_available(
                     store,
                     &block.fee_sink,
                     0,
@@ -9907,7 +9930,10 @@ mod tests {
         let run = |want: bool| {
             let (mut state, block, _, _) = payout_case(sink_start, 0, 0);
             let mut probe = ExecProbe {
-                want_fee_sink_available: want,
+                request: ProbeRequest {
+                    want_fee_sink_available: want,
+                    ..ProbeRequest::default()
+                },
                 ..ExecProbe::default()
             };
             apply_block_impl_probe(
@@ -9923,7 +9949,7 @@ mod tests {
                 Some(&mut probe),
             )
             .unwrap();
-            probe.final_fee_sink_available
+            probe.out.final_fee_sink_available
         };
         let skipped = run(false);
         assert_eq!(skipped, None, "default probe must not read the fee sink");
@@ -14751,12 +14777,15 @@ return
             ..Block::default()
         };
         let mut probe = ExecProbe {
-            knock_offline_exclude: Some(Default::default()),
-            knock_offline_gate: Some(FitsGate {
-                base_sizes: std::sync::Arc::from(Vec::<usize>::new()),
-                overhead_of: |_| 0,
-                max: 1,
-            }),
+            request: ProbeRequest {
+                knock_offline_exclude: Some(Default::default()),
+                knock_offline_gate: Some(FitsGate {
+                    base_sizes: std::sync::Arc::from(Vec::<usize>::new()),
+                    overhead_of: |_| 0,
+                    max: 1,
+                }),
+                ..ProbeRequest::default()
+            },
             ..ExecProbe::default()
         };
         let err = apply_block_impl_probe(
