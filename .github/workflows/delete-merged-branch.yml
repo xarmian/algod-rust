@@ -1,0 +1,81 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: Delete merged branch
+
+# Issue #1679: ~190 merged branches piled up because the repository setting
+# "Automatically delete head branches" needs an admin. This workflow gives the
+# same behavior without it: when a pull request from a branch in THIS
+# repository is MERGED, its head branch is deleted. Fork branches, the default
+# branch and any branch GitHub reports as protected are never touched; the
+# branch of a PR that was closed WITHOUT merging is deliberately kept.
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+
+jobs:
+  delete-branch:
+    name: Delete merged head branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref != github.event.repository.default_branch
+    steps:
+      - name: Delete the merged head branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -eu
+          # Percent-encode every path segment but keep the '/' separators
+          # (feature/x stays feature/x; '#', '?', '%' etc. are escaped).
+          ENC="$(jq -rn --arg b "$BRANCH" '$b | split("/") | map(@uri) | join("/")')"
+
+          # `gh pr merge --delete-branch` or Dependabot may have removed it
+          # already: only a 404 on this lookup means "already gone".
+          if ! INFO="$(gh api "repos/${REPO}/branches/${ENC}" 2>/tmp/err)"; then
+            if grep -q 'Branch not found' /tmp/err; then
+              echo "${BRANCH} already deleted"
+              exit 0
+            fi
+            cat /tmp/err
+            exit 1
+          fi
+
+          # Never delete a branch GitHub says is protected.
+          if [ "$(printf '%s' "$INFO" | jq -r '.protected')" = "true" ]; then
+            echo "${BRANCH} is protected: keeping it"
+            exit 0
+          fi
+
+          # A branch other open PRs are stacked on must survive: deleting it
+          # would close those PRs unmerged (GitHub does not retarget them).
+          STACKED="$(gh pr list --repo "$REPO" --base "$BRANCH" --state open --json number --jq 'length')"
+          if [ "${STACKED:-0}" != "0" ]; then
+            echo "${BRANCH} is the base of ${STACKED} open PR(s): keeping it"
+            exit 0
+          fi
+
+          # 422 "Reference does not exist" = removed concurrently (e.g. by
+          # `gh pr merge --delete-branch`); a 422 about protection/rulesets
+          # means "keep". Anything else (403 permissions, 5xx) fails the job
+          # so a silently surviving branch stays visible.
+          if gh api -X DELETE "repos/${REPO}/git/refs/heads/${ENC}" 2>/tmp/err; then
+            echo "deleted ${BRANCH}"
+          elif grep -qiE 'Reference does not exist' /tmp/err; then
+            echo "${BRANCH} already deleted"
+          elif grep -qiE 'protected branch|ruleset|rule violations' /tmp/err; then
+            echo "${BRANCH} is protected by a rule: keeping it"
+            cat /tmp/err
+          else
+            cat /tmp/err
+            exit 1
+          fi
