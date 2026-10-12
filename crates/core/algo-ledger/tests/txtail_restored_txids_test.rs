@@ -47,7 +47,7 @@ fn block(proto: &str, hgh: bool) -> Block {
     stx.txn.last_valid = Round(1000);
     stx.has_genesis_id = true;
     stx.has_genesis_hash = hgh;
-    Block {
+    algo_ledger::block_header::with_valid_payout_header(Block {
         round: Round(1),
         genesis_id: GENESIS_ID.to_string(),
         genesis_hash: GENESIS_HASH,
@@ -56,7 +56,7 @@ fn block(proto: &str, hgh: bool) -> Block {
         txn_counter: 1001,
         payset: vec![stx],
         ..Block::default()
-    }
+    })
 }
 
 fn state() -> LedgerState {

@@ -47,7 +47,7 @@ const GENESIS_ID: &str = "test-net-v1";
 const GENESIS_HASH: [u8; 32] = [7u8; 32];
 
 fn stripped_block(proto: &str, payset: Vec<SignedTransaction>) -> Block {
-    Block {
+    algo_ledger::block_header::with_valid_payout_header(Block {
         round: Round(1),
         genesis_id: GENESIS_ID.to_string(),
         genesis_hash: GENESIS_HASH,
@@ -56,7 +56,7 @@ fn stripped_block(proto: &str, payset: Vec<SignedTransaction>) -> Block {
         txn_counter: 1001,
         payset,
         ..Block::default()
-    }
+    })
 }
 
 fn stripped_stx(txn_type: &str, sender: Address) -> SignedTransaction {

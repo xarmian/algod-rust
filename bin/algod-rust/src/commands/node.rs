@@ -289,6 +289,9 @@ async fn run_start(
         .map_err(|e| anyhow::anyhow!("opening ledger at {}: {e}", ledger_prefix.display()))?;
 
     let latest = sqlite_ledger.current_round().0;
+    // A go devmode chain's blocks have no proposer, so sync-applied blocks
+    // cannot be held to `validateForPayouts` (issue #1803).
+    sqlite_ledger.set_devmode_chain(genesis.devmode);
     // "Already seeded" is the presence of the accounttotals row, not nonzero
     // online stake (a network with every allocation offline legitimately has
     // online=0 after seeding). Mirrors the relay command's check.

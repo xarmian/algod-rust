@@ -293,7 +293,11 @@ fn sqlite_ledger_feeds_group_tracer_when_enabled() {
     ledger.enable_group_delta_tracer(8);
     assert!(ledger.group_delta_tracer_enabled());
 
-    let block = minimal_block(fee_sink, 1, vec![pay_txn(a, b, 100_000, [0u8; 32])]);
+    let block = algo_ledger::block_header::with_valid_payout_header(minimal_block(
+        fee_sink,
+        1,
+        vec![pay_txn(a, b, 100_000, [0u8; 32])],
+    ));
     ledger.apply_block_caching_delta(&block).unwrap();
 
     // The block committed once (a debited amount + fee), not twice — the scratch
@@ -345,7 +349,8 @@ fn group_tracer_does_not_poison_lease_table() {
 
     let mut txn = pay_txn(a, b, 100_000, [0u8; 32]);
     txn.txn.lease = [0x42u8; 32];
-    let block = minimal_block(fee_sink, 1, vec![txn]);
+    let block =
+        algo_ledger::block_header::with_valid_payout_header(minimal_block(fee_sink, 1, vec![txn]));
 
     // Must not be rejected as a duplicate lease.
     ledger

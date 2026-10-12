@@ -320,6 +320,25 @@ pub fn payset_fees_collected(payset: &[algo_types::SignedTransaction], fee_sink:
         .fold(0u64, |acc, stx| acc.saturating_add(stx.txn.fee))
 }
 
+/// Test helper: give a synthetic block a header that passes go's
+/// `validateForPayouts` -- a proposer, and `fees_collected` equal to the fees
+/// its payset paid (a no-op before payouts) -- so tests that sync-apply hand-built blocks (issue #1803)
+/// don't each restate it.
+#[doc(hidden)]
+pub fn with_valid_payout_header(mut block: algo_types::Block) -> algo_types::Block {
+    let payouts_enabled =
+        algo_types::consensus::consensus_params_for_version(&block.current_protocol)
+            .is_some_and(|p| p.payouts_enabled);
+    if !payouts_enabled {
+        return block;
+    }
+    if block.proposer.is_zero() {
+        block.proposer = Address([0xAB; 32]);
+    }
+    block.fees_collected = payset_fees_collected(&block.payset, &block.fee_sink);
+    block
+}
+
 /// go's `AccountData.IsZero`: a closed (all-default) account. Shared by
 /// `recordProposal` and the payout validation.
 pub fn is_closed_account(acct: &algo_types::AccountData) -> bool {
