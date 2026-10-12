@@ -46,7 +46,7 @@ rusqlite = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
 serde_json = { workspace = true }
 tracing-subscriber = { workspace = true }
