@@ -34,7 +34,7 @@ jobs:
           REPO: ${{ github.repository }}
           BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |
-          set -u
+          set -eu
           # Percent-encode every path segment but keep the '/' separators
           # (feature/x stays feature/x; '#', '?', '%' etc. are escaped).
           ENC="$(jq -rn --arg b "$BRANCH" '$b | split("/") | map(@uri) | join("/")')"
@@ -42,7 +42,7 @@ jobs:
           # `gh pr merge --delete-branch` or Dependabot may have removed it
           # already: only a 404 on this lookup means "already gone".
           if ! INFO="$(gh api "repos/${REPO}/branches/${ENC}" 2>/tmp/err)"; then
-            if grep -qE 'HTTP 404' /tmp/err; then
+            if grep -q 'Branch not found' /tmp/err; then
               echo "${BRANCH} already deleted"
               exit 0
             fi
@@ -70,9 +70,9 @@ jobs:
           # so a silently surviving branch stays visible.
           if gh api -X DELETE "repos/${REPO}/git/refs/heads/${ENC}" 2>/tmp/err; then
             echo "deleted ${BRANCH}"
-          elif grep -qiE 'Reference does not exist|HTTP 404' /tmp/err; then
+          elif grep -qiE 'Reference does not exist' /tmp/err; then
             echo "${BRANCH} already deleted"
-          elif grep -qiE 'protected|ruleset|rule violations|Cannot delete' /tmp/err; then
+          elif grep -qiE 'protected branch|ruleset|rule violations' /tmp/err; then
             echo "${BRANCH} is protected by a rule: keeping it"
             cat /tmp/err
           else
