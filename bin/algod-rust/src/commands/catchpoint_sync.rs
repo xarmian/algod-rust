@@ -508,12 +508,7 @@ async fn collect_block_range(
         return BatchFetch::complete(blocks);
     }
     if cancel.is_cancelled() {
-        return BatchFetch::failed(
-            blocks,
-            AlgoError::Ledger {
-                message: format!("block fetch for rounds {start}..={end} cancelled"),
-            },
-        );
+        return BatchFetch::cancelled(blocks, start, end);
     }
     let next_needed = start + blocks.len() as u64;
     let cause = first_error.lock().ok().and_then(|mut slot| slot.take());
@@ -1449,8 +1444,13 @@ fn catchup_gossip_block_fetch_timeout_from_node_config(
 /// network tip because the peer could not serve the remaining blocks (the
 /// ledger is consistent at `Stopped early`'s round, but the node is behind),
 /// `0` when the run reached its target. Failures are errors (exit status 1).
-pub(crate) fn exit_code(result: &algo_ledger::sync::SyncResult) -> u8 {
-    if result.stopped_early.is_some() {
+///
+/// A hand-off is a successful outcome, so it exits `0` unless the operator
+/// opted into the distinct status with `--stopped-short-exit-status`
+/// (`opt_in`): a non-zero status on success breaks `set -e` scripts and
+/// systemd `Restart=on-failure` supervisors (issue #1755).
+pub(crate) fn exit_code(result: &algo_ledger::sync::SyncResult, opt_in: bool) -> u8 {
+    if opt_in && result.stopped_early.is_some() {
         EXIT_CODE_STOPPED_SHORT
     } else {
         0
@@ -1462,6 +1462,19 @@ pub(crate) fn exit_code(result: &algo_ledger::sync::SyncResult) -> u8 {
 /// so scripts can tell "applied the catchpoint but still far behind; run
 /// `sync`/a normal catchup next" apart from both.
 pub(crate) const EXIT_CODE_STOPPED_SHORT: u8 = 3;
+
+/// The single place a stopped-short run is reported (summary line plus one
+/// warning naming the exit status), issue #1755.
+fn report_stopped_early(result: &algo_ledger::sync::SyncResult, opt_in: bool) {
+    let Some(stop) = &result.stopped_early else {
+        return;
+    };
+    println!("Stopped early:      {stop}");
+    warn!(
+        exit_code = exit_code(result, opt_in),
+        "catchpoint applied but replay stopped short of the network tip: {stop}; hand off to a normal sync"
+    );
+}
 
 /// Run the catchpoint sync path: build a SyncConfig from CLI args, construct
 /// a SyncOrchestrator, and drive it through all phases.
@@ -1500,6 +1513,7 @@ pub async fn run(
     catchup_ledger_download_retry_attempts: i64,
     catchup_http_block_fetch_timeout_sec: i64,
     catchup_gossip_block_fetch_timeout_sec: i64,
+    stopped_short_exit_status: bool,
 ) -> anyhow::Result<u8> {
     // Determine the catchpoint label to use.
     let label = match (catchpoint_label, catchpoint_auto) {
@@ -1654,16 +1668,9 @@ pub async fn run(
     println!("Accounts imported:  {}", result.accounts_imported);
     println!("Blocks replayed:    {}", result.blocks_replayed);
     println!("Duration:           {:.1}s", result.duration.as_secs_f64());
-    if let Some(stop) = &result.stopped_early {
-        println!("Stopped early:      {stop}");
-        warn!(
-            exit_code = EXIT_CODE_STOPPED_SHORT,
-            "catchpoint applied but replay stopped short of the network tip: {stop}; \
-             exiting with status {EXIT_CODE_STOPPED_SHORT} (0 means caught up)"
-        );
-    }
+    report_stopped_early(&result, stopped_short_exit_status);
 
-    Ok(exit_code(&result))
+    Ok(exit_code(&result, stopped_short_exit_status))
 }
 
 // ---------------------------------------------------------------------------
@@ -2074,12 +2081,15 @@ mod tests {
             duration: std::time::Duration::ZERO,
             stopped_early: None,
         };
-        assert_eq!(exit_code(&result), 0);
+        assert_eq!(exit_code(&result, true), 0);
         result.stopped_early = Some(ReplayStoppedEarly {
             stopped_at_round: 1320,
             target_round: 1421,
         });
-        assert_eq!(exit_code(&result), EXIT_CODE_STOPPED_SHORT);
+        // A hand-off succeeded: 0 by default, the distinct status only on
+        // request (issue #1755).
+        assert_eq!(exit_code(&result, false), 0);
+        assert_eq!(exit_code(&result, true), EXIT_CODE_STOPPED_SHORT);
         assert_eq!(EXIT_CODE_STOPPED_SHORT, 3);
     }
 
@@ -2278,6 +2288,7 @@ mod tests {
 
     #[tokio::test]
     async fn gossip_sync_backend_fetch_blocks_batch_empty_range() {
+        use algo_ledger::sync::SyncBackendExt;
         // fetch_blocks_batch with start > end should return empty vec.
         let gossip = Arc::new(GossipBlockSource::new(vec![]));
         let http = HttpBlockFetcher::new("http://localhost:4001", "test-v1.0").unwrap();

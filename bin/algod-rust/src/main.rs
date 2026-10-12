@@ -143,6 +143,7 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
             trie,
             catchpoint,
             catchpoint_auto,
+            stopped_short_exit_status,
             follow,
             compare,
             trie_path,
@@ -198,10 +199,11 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
                     node_config.catchup_ledger_download_retry_attempts,
                     node_config.catchup_http_block_fetch_timeout_sec,
                     node_config.catchup_gossip_block_fetch_timeout_sec,
+                    stopped_short_exit_status,
                 )
                 .await?;
                 // Issue #1725: a catchpoint sync whose replay stopped short of
-                // the tip exits non-zero so scripts can tell.
+                // the tip exits 3 when `--stopped-short-exit-status` is given, else 0.
                 exit_status = std::process::ExitCode::from(exit_code);
             } else {
                 // Genesis-based sync path.
