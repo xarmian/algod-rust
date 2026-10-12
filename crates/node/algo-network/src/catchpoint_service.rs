@@ -142,7 +142,7 @@ impl CatchpointService {
 
         Router::new()
             .route(
-                "/:version_seg/:genesis_id/ledger/:round",
+                "/{version_seg}/{genesis_id}/ledger/{round}",
                 get(serve_catchpoint),
             )
             .with_state(state)

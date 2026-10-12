@@ -369,7 +369,7 @@ impl BlockService {
         // capture the `v1` segment as `:version_seg` and parse out the
         // version in the handler.
         Router::new()
-            .route("/:version_seg/:genesis_id/block/:round", get(serve_block))
+            .route("/{version_seg}/{genesis_id}/block/{round}", get(serve_block))
             .with_state(state)
     }
 
