@@ -1364,23 +1364,28 @@ fn mimc_bls12_381(data: &[u8]) -> Result<Vec<u8>, AlgoError> {
     Ok(out)
 }
 
+/// `a < b` for two big-endian unsigned integers of any lengths (leading zero
+/// bytes ignored).
+fn be_lt(a: &[u8], b: &[u8]) -> bool {
+    let a = &a[a.iter().position(|&x| x != 0).unwrap_or(a.len())..];
+    let b = &b[b.iter().position(|&x| x != 0).unwrap_or(b.len())..];
+    a.len() < b.len() || (a.len() == b.len() && a < b)
+}
+
 /// Parse input bytes into field elements (big-endian, 32-byte chunks).
 fn parse_field_elements<F: ark_ff::PrimeField>(data: &[u8]) -> Result<Vec<F>, AlgoError> {
     use ark_ff::BigInteger;
     let mut elements = Vec::with_capacity(data.len() / 32);
+    // Numeric range check against the field modulus (any width), then the
+    // value is already canonical so the reduction below is a plain decode.
+    // No num-bigint value is handed to arkworks, which still depends on
+    // num-bigint 0.4 (issue #1876).
+    let modulus = F::MODULUS.to_bytes_be();
     for chunk in data.chunks_exact(32) {
-        // Reduce, then require the canonical encoding to round-trip: an
-        // element >= the modulus does not (arkworks' `from_bigint` rejects
-        // it the same way). Avoids handing num-bigint types to arkworks,
-        // which still depends on num-bigint 0.4 (issue #1876).
-        let elem = F::from_be_bytes_mod_order(chunk);
-        let canonical = elem.into_bigint().to_bytes_be();
-        let mut padded = vec![0u8; 32usize.saturating_sub(canonical.len())];
-        padded.extend_from_slice(&canonical);
-        if padded.as_slice() != chunk {
+        if !be_lt(chunk, &modulus) {
             return Err(avm_err("invalid mimc input: element exceeds modulus"));
         }
-        elements.push(elem);
+        elements.push(F::from_be_bytes_mod_order(chunk));
     }
     Ok(elements)
 }
@@ -4516,6 +4521,32 @@ mod tests {
             "12964111614552580241101202600014316932811348627866250816177200046290462797607",
             "BLS12-381 MiMC three-chunk hash mismatch"
         );
+    }
+
+    /// `parse_field_elements` is generic over the field: a valid 32-byte chunk
+    /// must parse for a field whose modulus is wider than 32 bytes (BLS12-381
+    /// Fq is 48 bytes) and the numeric range check must be width independent.
+    #[test]
+    fn test_parse_field_elements_is_width_independent() {
+        use ark_bls12_381::Fq;
+        let mut chunk = [0u8; 32];
+        chunk[31] = 7;
+        let got = super::parse_field_elements::<Fq>(&chunk).expect("small value is valid");
+        assert_eq!(got, vec![Fq::from(7u64)]);
+        // 2^256 - 1 is below the 381-bit Fq modulus, so it is valid there...
+        assert!(super::parse_field_elements::<Fq>(&[0xff; 32]).is_ok());
+        // ...but not for the 254-bit BN254 Fr.
+        assert!(super::parse_field_elements::<ark_bn254::Fr>(&[0xff; 32]).is_err());
+    }
+
+    #[test]
+    fn test_be_lt_ignores_leading_zeros() {
+        assert!(super::be_lt(&[0, 0, 5], &[6]));
+        assert!(!super::be_lt(&[6], &[0, 0, 5]));
+        assert!(!super::be_lt(&[0, 5], &[5]));
+        assert!(super::be_lt(&[], &[1]));
+        assert!(!super::be_lt(&[], &[0]));
+        assert!(super::be_lt(&[0xff], &[1, 0]));
     }
 
     /// The modulus boundary of the MiMC input check (issue #1876 reworked the

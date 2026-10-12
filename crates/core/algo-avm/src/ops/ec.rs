@@ -1164,6 +1164,20 @@ fn legendre_negative_fq2(x: BN254Fq2) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The G2 endomorphism constants are parsed with `fq_from_dec` (panics on a
+    /// malformed or non-canonical constant): exercise the whole path and check
+    /// the images stay on the curve (issue #1876 review).
+    #[test]
+    fn bn254_g2_psi_constants_parse_and_map_onto_the_curve() {
+        use ark_ec::{AffineRepr, CurveGroup};
+        let g = BN254G2::from(BN254G2Affine::generator());
+        let psi_g = bn254_g2_psi(&g).into_affine();
+        assert!(psi_g.is_on_curve());
+        assert!(psi_g.is_in_correct_subgroup_assuming_on_curve());
+        let psi2_g = bn254_g2_psi(&bn254_g2_psi(&g)).into_affine();
+        assert!(psi2_g.is_on_curve());
+    }
+
     use super::*;
     use crate::bytecode;
     use crate::context::NullContext;
