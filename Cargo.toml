@@ -100,7 +100,7 @@ xsalsa20poly1305 = "0.9"
 hkdf = "0.12"
 
 # Storage
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # System (Unix rlimit/FD accounting — see `algo_network::fd_limits`)
 libc = "0.2"
