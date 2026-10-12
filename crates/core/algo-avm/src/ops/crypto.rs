@@ -4547,16 +4547,6 @@ mod tests {
         assert!(super::parse_field_elements::<ark_bn254::Fr>(&[0xff; 32]).is_err());
     }
 
-    #[test]
-    fn test_be_lt_ignores_leading_zeros() {
-        assert!(super::be_lt(&[0, 0, 5], &[6]));
-        assert!(!super::be_lt(&[6], &[0, 0, 5]));
-        assert!(!super::be_lt(&[0, 5], &[5]));
-        assert!(super::be_lt(&[], &[1]));
-        assert!(!super::be_lt(&[], &[0]));
-        assert!(super::be_lt(&[0xff], &[1, 0]));
-    }
-
     /// The modulus boundary of the MiMC input check (a numeric comparison
     /// against the field modulus, issue #1876): `r - 1` is the largest valid
     /// BN254 Fr element and `r` itself must be rejected (go:

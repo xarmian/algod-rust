@@ -1179,6 +1179,23 @@ mod tests {
     use crate::ops::helpers::prog;
     use crate::ops::hex_decode;
 
+    /// `to_le_u64_limbs` (scalar -> `mul_bigint` limbs) across the num-bigint
+    /// 0.4 -> 0.5 bump: zero must yield no non-zero limb, and limb boundaries
+    /// must stay little-endian (issue #1876 review).
+    #[test]
+    fn scalar_limbs_zero_and_limb_boundaries() {
+        assert!(to_le_u64_limbs(&BigUint::from(0u32))
+            .iter()
+            .all(|&l| l == 0));
+        assert_eq!(to_le_u64_limbs(&BigUint::from(1u32)), vec![1]);
+        assert_eq!(to_le_u64_limbs(&BigUint::from(u64::MAX)), vec![u64::MAX]);
+        assert_eq!(to_le_u64_limbs(&(BigUint::from(1u8) << 64)), vec![0, 1]);
+        assert_eq!(
+            to_le_u64_limbs(&((BigUint::from(1u8) << 128) - 1u8)),
+            vec![u64::MAX, u64::MAX]
+        );
+    }
+
     /// The G2 endomorphism constants are parsed with `fq_from_dec` (panics on a
     /// malformed or non-canonical constant): exercise the whole path and check
     /// the images stay on the curve (issue #1876 review).

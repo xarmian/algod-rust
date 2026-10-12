@@ -99,3 +99,24 @@ pub(crate) fn be_lt(a: &[u8], b: &[u8]) -> bool {
     let b = &b[b.iter().position(|&x| x != 0).unwrap_or(b.len())..];
     a.len() < b.len() || (a.len() == b.len() && a < b)
 }
+
+#[cfg(test)]
+mod be_lt_tests {
+    use super::be_lt;
+
+    #[test]
+    fn be_lt_ignores_leading_zeros() {
+        assert!(be_lt(&[0, 0, 5], &[6]));
+        assert!(!be_lt(&[6], &[0, 0, 5]));
+        assert!(!be_lt(&[0, 5], &[5]));
+        assert!(be_lt(&[], &[1]));
+        assert!(!be_lt(&[], &[0]));
+        assert!(be_lt(&[0xff], &[1, 0]));
+    }
+
+    #[test]
+    fn be_lt_is_strict() {
+        assert!(!be_lt(&[7, 7], &[7, 7]));
+        assert!(be_lt(&[7, 6], &[7, 7]));
+    }
+}
