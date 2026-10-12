@@ -58,7 +58,7 @@ use algo_ledger::simulation::{
     TxnResult,
 };
 use algo_ledger::store_trait::LedgerStore;
-use algo_ledger::{SqliteLedger, StateDelta, StateDeltaSubset};
+use algo_ledger::{PoolRead, SqliteLedger, StateDelta, StateDeltaSubset};
 use algo_network::gossip_node::{GossipNode, PeerOption};
 use algo_network::local_tx_broadcast::{LocalTxBroadcaster, LocalTxError};
 use algo_pool::TransactionPool;
@@ -434,6 +434,12 @@ pub struct AlgodNodeInterface {
     /// `AlgorandFollowerNode` being a distinct node type from
     /// `AlgorandFullNode` rather than a runtime flag on one type.
     follower_sync_round: Option<Arc<FollowerSyncRoundState>>,
+    /// Lock-free committed-state reads (issue #1764): `get_block`,
+    /// `get_block_header`, `get_block_hash`, `get_block_raw_msgpack` and the
+    /// account lookups are served from read-only connections so they never
+    /// wait behind a block apply holding `ledger`. Resolves to `None` for
+    /// in-memory ledgers, which keep the locked path.
+    read_pool: algo_ledger::LazyReadPool,
 }
 
 impl AlgodNodeInterface {
@@ -444,6 +450,7 @@ impl AlgodNodeInterface {
     /// [`Self::with_pool`] / [`Self::with_broadcaster`].
     pub fn new(ledger: Arc<Mutex<SqliteLedger>>, config: NodeInterfaceConfig) -> Self {
         Self {
+            read_pool: algo_ledger::LazyReadPool::primed(&ledger),
             ledger,
             pool: None,
             broadcaster: None,
@@ -477,6 +484,11 @@ impl AlgodNodeInterface {
             catchup_manager: None,
             follower_sync_round: None,
         }
+    }
+
+    /// The lock-free read pool, or `None` for an in-memory ledger.
+    fn read_pool(&self) -> Option<&Arc<algo_ledger::LedgerReadPool>> {
+        self.read_pool.get(&self.ledger)
     }
 
     /// Attach the agreement service's participation metrics so
@@ -985,6 +997,13 @@ impl AlgodNodeInterface {
     /// `last_round` and `account_data` on the same round even if agreement
     /// commits while the handler is running.
     fn read_account_snapshot(&self, addr: &Address) -> Result<(u64, AccountData), NodeError> {
+        // Issue #1764: one statement against the committed tracker snapshot,
+        // no ledger mutex. Any read-pool error takes the locked path.
+        if let Some(pool) = self.read_pool() {
+            if let Ok((last_round, account)) = pool.account_snapshot(addr) {
+                return Ok((last_round, account.unwrap_or_default()));
+            }
+        }
         let ledger = self.lock_ledger("lookup_account")?;
         let last_round = ledger
             .last_committed_round()
@@ -1272,11 +1291,15 @@ impl NodeInterface for AlgodNodeInterface {
     // ---- Block lookup ----
 
     async fn get_block(&self, round: u64) -> Result<Block, NodeError> {
-        let bytes = {
-            let ledger = self.lock_ledger("get_block")?;
-            ledger
-                .get_block_data(round)
-                .map_err(|e| NodeError::Internal(format!("get_block_data({round}): {e}")))?
+        let bytes = match self.read_pool().map(|p| p.block_data(round)) {
+            Some(PoolRead::Found(b)) => Some(b),
+            Some(PoolRead::NotFound) => None,
+            Some(PoolRead::Fallback) | None => {
+                let ledger = self.lock_ledger("get_block")?;
+                ledger
+                    .get_block_data(round)
+                    .map_err(|e| NodeError::Internal(format!("get_block_data({round}): {e}")))?
+            }
         }
         .ok_or_else(|| NodeError::NotFound(format!("block round {round} not found")))?;
 
@@ -1285,10 +1308,22 @@ impl NodeInterface for AlgodNodeInterface {
     }
 
     async fn get_block_header(&self, round: u64) -> Result<BlockHeader, NodeError> {
-        let ledger = self.lock_ledger("get_block_header")?;
-        ledger
-            .get_block_header(round)
-            .map_err(|e| NodeError::Internal(format!("get_block_header({round}): {e}")))?
+        // Same decode as `LedgerStore::get_block_header` over the stored
+        // header bytes, served without the ledger mutex when committed.
+        let header = match self.read_pool().map(|p| p.block_header_data(round)) {
+            Some(PoolRead::Found(data)) => Some(
+                BlockHeader::decode_from_reader(&mut data.as_slice())
+                    .map_err(|e| NodeError::Internal(format!("get_block_header({round}): {e}")))?,
+            ),
+            Some(PoolRead::NotFound) => None,
+            Some(PoolRead::Fallback) | None => {
+                let ledger = self.lock_ledger("get_block_header")?;
+                ledger
+                    .get_block_header(round)
+                    .map_err(|e| NodeError::Internal(format!("get_block_header({round}): {e}")))?
+            }
+        };
+        header
             .ok_or_else(|| NodeError::NotFound(format!("block header for round {round} not found")))
     }
 
@@ -1301,15 +1336,28 @@ impl NodeInterface for AlgodNodeInterface {
         // with empty `hdrdata`. The pre-refactor impl hashed via
         // `compute_block_digest(&block)`, which kept relay-populated rows
         // hashable; this fallback preserves that behavior.
-        let (hdr_bytes_opt, blk_bytes_opt) = {
-            let ledger = self.lock_ledger("get_block_hash")?;
-            let h = ledger
-                .get_block_header_data(round)
-                .map_err(|e| NodeError::Internal(format!("get_block_header_data({round}): {e}")))?;
-            let b = ledger
-                .get_block_data(round)
-                .map_err(|e| NodeError::Internal(format!("get_block_data({round}): {e}")))?;
-            (h, b)
+        // Issue #1764: committed rows are read without the ledger mutex; a
+        // half-found pair (one row visible, the other not) or any pool error
+        // takes the locked path.
+        let pooled = self.read_pool().and_then(|p| {
+            match (p.block_header_data(round), p.block_data(round)) {
+                (PoolRead::Found(h), PoolRead::Found(b)) => Some((Some(h), Some(b))),
+                (PoolRead::NotFound, PoolRead::NotFound) => Some((None, None)),
+                _ => None,
+            }
+        });
+        let (hdr_bytes_opt, blk_bytes_opt) = match pooled {
+            Some(pair) => pair,
+            None => {
+                let ledger = self.lock_ledger("get_block_hash")?;
+                let h = ledger.get_block_header_data(round).map_err(|e| {
+                    NodeError::Internal(format!("get_block_header_data({round}): {e}"))
+                })?;
+                let b = ledger
+                    .get_block_data(round)
+                    .map_err(|e| NodeError::Internal(format!("get_block_data({round}): {e}")))?;
+                (h, b)
+            }
         };
 
         // Row completely absent → Ok(None) (matches the trait's documented
@@ -1366,16 +1414,34 @@ impl NodeInterface for AlgodNodeInterface {
         // `algo_network::block_service::encode_pre_encoded_block_cert` which
         // uses the same hand-rolled pattern for P2P block responses —
         // consolidating the two into a shared helper is a follow-up.
-        let (block_bytes, cert_bytes_opt) = {
-            let ledger = self.lock_ledger("get_block_raw_msgpack")?;
-            let blk = ledger
-                .get_block_data(round)
-                .map_err(|e| NodeError::Internal(format!("get_block_data({round}): {e}")))?
-                .ok_or_else(|| NodeError::NotFound(format!("no block for round {round}")))?;
-            let cert = ledger
-                .get_block_cert(round)
-                .map_err(|e| NodeError::Internal(format!("get_block_cert({round}): {e}")))?;
-            (blk, cert)
+        // Issue #1764: served from committed rows without the ledger mutex
+        // (block and certificate are one row, committed together).
+        let pooled = match self.read_pool() {
+            Some(p) => match p.block_data(round) {
+                PoolRead::Found(blk) => match p.block_cert(round) {
+                    PoolRead::Found(cert) => Some(Ok((blk, cert))),
+                    _ => None,
+                },
+                PoolRead::NotFound => Some(Err(NodeError::NotFound(format!(
+                    "no block for round {round}"
+                )))),
+                PoolRead::Fallback => None,
+            },
+            None => None,
+        };
+        let (block_bytes, cert_bytes_opt) = match pooled {
+            Some(res) => res?,
+            None => {
+                let ledger = self.lock_ledger("get_block_raw_msgpack")?;
+                let blk = ledger
+                    .get_block_data(round)
+                    .map_err(|e| NodeError::Internal(format!("get_block_data({round}): {e}")))?
+                    .ok_or_else(|| NodeError::NotFound(format!("no block for round {round}")))?;
+                let cert = ledger
+                    .get_block_cert(round)
+                    .map_err(|e| NodeError::Internal(format!("get_block_cert({round}): {e}")))?;
+                (blk, cert)
+            }
         };
 
         // go's `rpcs.EncodedBlockCert` (`Block bookkeeping.Block "codec:\"block\""`,
@@ -7847,5 +7913,156 @@ mod tests {
             .find(|p| p.network_address == "10.0.0.9:4166")
             .expect("p2p peer present");
         assert_eq!(p2p_entry.network_type, PeerNetworkType::P2p);
+    }
+
+    // -- Issue #1764: lock-free committed reads ---------------------------
+
+    /// A file-backed ledger with rounds 1..=2 committed (real encoded block
+    /// and header bytes) and an account written at round 2.
+    fn file_backed_ledger_with_blocks() -> (tempfile::TempDir, Arc<Mutex<SqliteLedger>>, Address) {
+        use algo_codec::{canonical_encode_block_header_from_block, encode_block};
+        let dir = tempfile::tempdir().unwrap();
+        let mut l = SqliteLedger::open_with_prefix(&dir.path().join("ledger")).unwrap();
+        let who = Address([0x33; 32]);
+        for r in 1..=2u64 {
+            let block = Block {
+                round: Round(r),
+                current_protocol: CONSENSUS_V41.to_string(),
+                ..Block::default()
+            };
+            l.begin_block().unwrap();
+            l.set_current_round(Round(r));
+            l.put_block(
+                r,
+                CONSENSUS_V41,
+                &canonical_encode_block_header_from_block(&block),
+                &encode_block(&block).unwrap(),
+            )
+            .unwrap();
+            l.put_block_cert(r, &[0x80]).unwrap();
+            if r == 2 {
+                l.set_account(
+                    &who,
+                    AccountData {
+                        micro_algos: 777,
+                        ..Default::default()
+                    },
+                );
+            }
+            l.commit_block().unwrap();
+        }
+        (dir, Arc::new(Mutex::new(l)), who)
+    }
+
+    /// Hold the ledger mutex on another thread (a slow apply) while `f`'s
+    /// future runs; returns how long it took.
+    async fn timed_while_ledger_locked<F: std::future::Future<Output = ()>>(
+        ledger: &Arc<Mutex<SqliteLedger>>,
+        f: F,
+    ) -> Duration {
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let ledger = Arc::clone(ledger);
+            std::thread::spawn(move || {
+                let _g = ledger.lock().unwrap();
+                locked_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(20));
+            })
+        };
+        locked_rx.recv().unwrap();
+        let t = std::time::Instant::now();
+        f.await;
+        let elapsed = t.elapsed();
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        elapsed
+    }
+
+    #[tokio::test]
+    async fn block_and_account_reads_do_not_wait_for_a_held_ledger_mutex() {
+        let (_dir, ledger, who) = file_backed_ledger_with_blocks();
+        // Constructed while the mutex is free, as at node start.
+        let adapter = make_adapter_with_ledger(ledger.clone());
+        let elapsed = timed_while_ledger_locked(&ledger, async {
+            assert_eq!(adapter.get_block(2).await.unwrap().round, Round(2));
+            assert_eq!(adapter.get_block_header(1).await.unwrap().round, Round(1));
+            assert!(adapter.get_block_hash(2).await.unwrap().is_some());
+            assert_eq!(adapter.get_block_hash(9).await.unwrap(), None);
+            assert!(!adapter.get_block_raw_msgpack(2).await.unwrap().is_empty());
+            assert!(matches!(
+                adapter.get_block(9).await,
+                Err(NodeError::NotFound(_))
+            ));
+            assert!(matches!(
+                adapter.get_block_header(9).await,
+                Err(NodeError::NotFound(_))
+            ));
+            let acct = adapter.lookup_account(&who).await.unwrap();
+            assert_eq!((acct.last_round, acct.account_data.micro_algos), (2, 777));
+        })
+        .await;
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "REST reads waited behind the held ledger mutex: {elapsed:?}"
+        );
+    }
+
+    /// The lock-free REST answers are identical to the ledger's own.
+    #[tokio::test]
+    async fn lock_free_block_reads_equal_the_locked_accessors() {
+        let (_dir, ledger, who) = file_backed_ledger_with_blocks();
+        let adapter = make_adapter_with_ledger(ledger.clone());
+        let (hdr1, blk2, cert2, acct) = {
+            let l = ledger.lock().unwrap();
+            (
+                l.get_block_header(1).unwrap().unwrap(),
+                l.get_block_data(2).unwrap().unwrap(),
+                l.get_block_cert(2).unwrap().unwrap(),
+                l.get_account(&who).unwrap(),
+            )
+        };
+        assert_eq!(adapter.get_block_header(1).await.unwrap(), hdr1);
+        assert_eq!(
+            adapter.get_block(2).await.unwrap(),
+            Block::decode_from_bytes(&blk2).unwrap()
+        );
+        let raw = adapter.get_block_raw_msgpack(2).await.unwrap();
+        assert!(raw.windows(blk2.len()).any(|w| w == blk2.as_slice()));
+        assert!(raw.ends_with(&cert2));
+        assert_eq!(
+            adapter.lookup_account(&who).await.unwrap().account_data,
+            acct
+        );
+        // A rolled-back/open block is never visible through the lock-free path.
+        {
+            let mut l = ledger.lock().unwrap();
+            l.begin_block().unwrap();
+            l.set_current_round(Round(3));
+            l.put_block(3, CONSENSUS_V41, b"x", b"y").unwrap();
+            l.set_account(
+                &who,
+                AccountData {
+                    micro_algos: 1,
+                    ..Default::default()
+                },
+            );
+        }
+        // (the block above is open and the mutex is free here only because the
+        // guard dropped; reads still see committed state)
+        assert!(matches!(
+            adapter.get_block(3).await,
+            Err(NodeError::NotFound(_))
+        ));
+        assert_eq!(
+            adapter
+                .lookup_account(&who)
+                .await
+                .unwrap()
+                .account_data
+                .micro_algos,
+            777
+        );
+        ledger.lock().unwrap().rollback_block().unwrap();
     }
 }

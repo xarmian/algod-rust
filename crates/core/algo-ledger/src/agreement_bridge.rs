@@ -43,6 +43,7 @@ use algo_types::{Address, ConsensusParams, Digest, Round};
 
 use algo_error::AlgoError;
 
+use crate::read_pool::PoolRead;
 use crate::sqlite::SqliteLedger;
 use crate::store_trait::LedgerStore;
 
@@ -104,6 +105,12 @@ pub struct AgreementLedgerBridge {
     /// [`Self::with_apply_stall_tracker`] across bridge rebuilds and with the
     /// REST/metrics adapter.
     apply_stall: Arc<crate::ApplyStallTracker>,
+    /// Lock-free committed-state reads (issue #1764): `seed`,
+    /// `lookup_digest`, `lookup_agreement` and the per-round protocol
+    /// lookups are served from read-only connections so they do not wait
+    /// behind a block apply holding `ledger`. `None` inside for in-memory
+    /// ledgers, which keep the locked path.
+    read_pool: crate::read_pool::LazyReadPool,
 }
 
 /// SQLite messages that mean "try again": a locked/busy database. One shared
@@ -232,6 +239,7 @@ impl AgreementLedgerBridge {
     /// This is suitable for tests and for callers that don't need catchup.
     pub fn new(ledger: Arc<Mutex<SqliteLedger>>) -> Self {
         Self {
+            read_pool: crate::read_pool::LazyReadPool::primed(&ledger),
             ledger,
             round_advanced: Arc::new(Condvar::new()),
             pending_cert_tx: None,
@@ -255,6 +263,7 @@ impl AgreementLedgerBridge {
         round_advanced: Arc<Condvar>,
     ) -> Self {
         Self {
+            read_pool: crate::read_pool::LazyReadPool::primed(&ledger),
             ledger,
             round_advanced,
             pending_cert_tx: None,
@@ -319,6 +328,7 @@ impl AgreementLedgerBridge {
     ) {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let bridge = Self {
+            read_pool: crate::read_pool::LazyReadPool::primed(&ledger),
             ledger,
             round_advanced,
             pending_cert_tx: Some(tx),
@@ -493,6 +503,16 @@ impl AgreementLedgerBridge {
     /// Helper: get the protocol version string for a given round by reading
     /// the block header's proto field from the blocks table.
     fn protocol_for_round(&self, round: Round) -> Result<String, LedgerError> {
+        // Issue #1764: committed rounds are served without the ledger mutex.
+        if round.0 > 0 {
+            if let Some(pool) = self.read_pool.get(&self.ledger) {
+                match pool.block_proto(round.0) {
+                    PoolRead::Found(proto) => return Ok(proto),
+                    PoolRead::NotFound => return Err(LedgerError::RoundNotAvailable(round)),
+                    PoolRead::Fallback => {}
+                }
+            }
+        }
         let ledger = self
             .ledger
             .lock()
@@ -506,6 +526,59 @@ impl AgreementLedgerBridge {
         ledger
             .get_block_proto(round.0)
             .map_err(|e| LedgerError::Other(format!("get_block_proto: {e}")))?
+            .ok_or(LedgerError::RoundNotAvailable(round))
+    }
+}
+
+impl AgreementLedgerBridge {
+    /// Lock-free form of the future-round deduction in `consensus_version`:
+    /// `None` means "cannot answer authoritatively, use the locked path"
+    /// (round 0, a missing/unreadable latest header, a race with a commit).
+    fn deduce_version_lock_free(
+        pool: &crate::read_pool::LedgerReadPool,
+        round: Round,
+    ) -> Option<Result<String, LedgerError>> {
+        let latest = pool.committed_round().ok().flatten()?;
+        if latest == 0 {
+            return None;
+        }
+        if round.0 < latest {
+            return Some(Err(LedgerError::RoundNotAvailable(round)));
+        }
+        let PoolRead::Found(latest_proto) = pool.block_proto(latest) else {
+            return None;
+        };
+        let PoolRead::Found(hdr_bytes) = pool.block_header_data(latest) else {
+            return None;
+        };
+        let hdr = algo_types::BlockHeader::decode_from_reader(&mut hdr_bytes.as_slice()).ok()?;
+        if hdr.next_protocol_switch_on.0 == 0 || round.0 < hdr.next_protocol_switch_on.0 {
+            Some(Ok(latest_proto))
+        } else if !hdr.next_protocol.is_empty() {
+            Some(Ok(hdr.next_protocol.clone()))
+        } else {
+            Some(Err(LedgerError::RoundNotAvailable(round)))
+        }
+    }
+
+    /// The stored header bytes for `round`: lock-free for a committed round
+    /// (issue #1764), else (miss at a committed round, error, in-memory
+    /// ledger) through the ledger mutex. `RoundNotAvailable` when absent.
+    fn header_data(&self, round: Round) -> Result<Vec<u8>, LedgerError> {
+        if let Some(pool) = self.read_pool.get(&self.ledger) {
+            match pool.block_header_data(round.0) {
+                PoolRead::Found(h) => return Ok(h),
+                PoolRead::NotFound => return Err(LedgerError::RoundNotAvailable(round)),
+                PoolRead::Fallback => {}
+            }
+        }
+        let ledger = self
+            .ledger
+            .lock()
+            .map_err(|e| LedgerError::Other(format!("ledger lock poisoned: {e}")))?;
+        ledger
+            .get_block_header_data(round.0)
+            .map_err(|e| LedgerError::Other(format!("get_block_header_data: {e}")))?
             .ok_or(LedgerError::RoundNotAvailable(round))
     }
 }
@@ -524,17 +597,9 @@ impl LedgerReader for AgreementLedgerBridge {
     }
 
     fn seed(&self, round: Round) -> Result<Seed, LedgerError> {
-        let ledger = self
-            .ledger
-            .lock()
-            .map_err(|e| LedgerError::Other(format!("ledger lock poisoned: {e}")))?;
-
         // The seed is stored in the block header. We need to decode the block
         // header for the given round and extract the seed field.
-        let hdr_data = ledger
-            .get_block_header_data(round.0)
-            .map_err(|e| LedgerError::Other(format!("get_block_header_data: {e}")))?
-            .ok_or(LedgerError::RoundNotAvailable(round))?;
+        let hdr_data = self.header_data(round)?;
 
         // Parse the msgpack block header to extract the seed.
         // The seed is stored under codec key "seed" as a 32-byte binary.
@@ -548,6 +613,15 @@ impl LedgerReader for AgreementLedgerBridge {
         round: Round,
         addr: &Address,
     ) -> Result<OnlineAccountData, LedgerError> {
+        // Issue #1764: served without the ledger mutex when the round is
+        // committed; anything else (round beyond the commit, unreadable
+        // inputs, no pool) takes the locked path below.
+        if let Some(pool) = self.read_pool.get(&self.ledger) {
+            if let PoolRead::Found(acct) = pool.lookup_agreement_account(addr, round.0) {
+                return Ok(online_account_data(acct));
+            }
+        }
+
         let ledger = self
             .ledger
             .lock()
@@ -564,25 +638,11 @@ impl LedgerReader for AgreementLedgerBridge {
         // online then, with the rewards pending at `round`'s level folded in
         // (issue #1654). No fallback to the current account state: a late
         // joiner has no stake until the lookback passes it.
-        let Some(acct) = ledger
+        let acct = ledger
             .lookup_agreement_account(addr, round.0)
-            .map_err(|e| LedgerError::Other(format!("lookup_agreement_account: {e}")))?
-        else {
-            return Ok(OnlineAccountData::default());
-        };
+            .map_err(|e| LedgerError::Other(format!("lookup_agreement_account: {e}")))?;
 
-        Ok(OnlineAccountData {
-            micro_algos: acct.micro_algos,
-            vote_id: acct.vote_id.unwrap_or([0u8; 32]),
-            selection_id: acct.selection_id.unwrap_or([0u8; 32]),
-            vote_first_valid: Round(acct.vote_first_valid),
-            vote_last_valid: Round(acct.vote_last_valid),
-            vote_key_dilution: acct.vote_key_dilution,
-            incentive_eligible: acct.incentive_eligible,
-            last_proposed: Round(acct.last_proposed),
-            last_heartbeat: Round(acct.last_heartbeat),
-            state_proof_id: acct.state_proof_id.unwrap_or([0u8; 64]),
-        })
+        Ok(online_account_data(acct))
     }
 
     fn circulation(&self, rnd: Round, vote_rnd: Round) -> Result<u64, LedgerError> {
@@ -605,15 +665,7 @@ impl LedgerReader for AgreementLedgerBridge {
     }
 
     fn lookup_digest(&self, round: Round) -> Result<Digest, LedgerError> {
-        let ledger = self
-            .ledger
-            .lock()
-            .map_err(|e| LedgerError::Other(format!("ledger lock poisoned: {e}")))?;
-
-        let hdr_data = ledger
-            .get_block_header_data(round.0)
-            .map_err(|e| LedgerError::Other(format!("get_block_header_data: {e}")))?
-            .ok_or(LedgerError::RoundNotAvailable(round))?;
+        let hdr_data = self.header_data(round)?;
 
         // The block digest is the SHA512/256 hash of the canonical header encoding
         // with the "BH" domain separator.
@@ -644,6 +696,14 @@ impl LedgerReader for AgreementLedgerBridge {
         // the binary consensus version" every round and ran the whole
         // player on the binary's built-in params rather than the network's
         // (issue #478).
+        //
+        // Issue #1764: this runs on every round, so deduce from the committed
+        // latest header without the ledger mutex when possible.
+        if let Some(pool) = self.read_pool.get(&self.ledger) {
+            if let Some(res) = Self::deduce_version_lock_free(pool, round) {
+                return res;
+            }
+        }
         let ledger = self
             .ledger
             .lock()
@@ -1152,6 +1212,27 @@ impl crate::catchup_service::CatchupLedger for AgreementLedgerBridge {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Map a `lookup_agreement_account` result (`None` = no online record) to
+/// agreement's `OnlineAccountData`. Shared by the locked and lock-free paths
+/// so both produce the same value.
+fn online_account_data(acct: Option<algo_types::AccountData>) -> OnlineAccountData {
+    let Some(acct) = acct else {
+        return OnlineAccountData::default();
+    };
+    OnlineAccountData {
+        micro_algos: acct.micro_algos,
+        vote_id: acct.vote_id.unwrap_or([0u8; 32]),
+        selection_id: acct.selection_id.unwrap_or([0u8; 32]),
+        vote_first_valid: Round(acct.vote_first_valid),
+        vote_last_valid: Round(acct.vote_last_valid),
+        vote_key_dilution: acct.vote_key_dilution,
+        incentive_eligible: acct.incentive_eligible,
+        last_proposed: Round(acct.last_proposed),
+        last_heartbeat: Round(acct.last_heartbeat),
+        state_proof_id: acct.state_proof_id.unwrap_or([0u8; 64]),
+    }
+}
 
 /// Extract the committee seed from a msgpack-encoded block header.
 ///
@@ -2339,3 +2420,7 @@ mod tests {
         assert_eq!(ledger.lock().unwrap().current_round().0, 1);
     }
 }
+
+#[cfg(test)]
+#[path = "agreement_bridge_read_tests.rs"]
+mod read_tests;
