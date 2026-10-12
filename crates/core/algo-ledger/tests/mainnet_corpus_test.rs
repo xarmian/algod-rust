@@ -42,7 +42,7 @@
 //!    become more approximate.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use algo_ledger::apply::apply_block_capturing_state_proof_next;
 use algo_ledger::shadow_execute::compare_recorded_apply_data;
@@ -276,8 +276,27 @@ fn corpus_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/mainnet_corpus")
 }
 
+/// Reads a corpus fixture, falling back to its zstd-compressed `<name>.zst`
+/// twin: entries over the 200 KB per-fixture budget (e.g. the heavy #1757
+/// block) are stored compressed (README).
+fn read_fixture(path: &Path) -> Vec<u8> {
+    match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(plain_err) => {
+            let mut zst = path.as_os_str().to_owned();
+            zst.push(".zst");
+            let zst = PathBuf::from(zst);
+            let compressed = std::fs::read(&zst).unwrap_or_else(|e| {
+                panic!("cannot read {path:?} ({plain_err}) or {zst:?} ({e})")
+            });
+            zstd::decode_all(compressed.as_slice())
+                .unwrap_or_else(|e| panic!("cannot decompress {zst:?}: {e}"))
+        }
+    }
+}
+
 fn read_value(path: &PathBuf) -> Value {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("cannot read {path:?}: {e}"));
+    let bytes = read_fixture(path);
     rmpv::decode::read_value(&mut bytes.as_slice())
         .unwrap_or_else(|e| panic!("cannot decode {path:?}: {e}"))
 }
@@ -684,8 +703,7 @@ fn run_entry_with_block(
     mutate_block: &dyn Fn(&mut algo_types::Block),
 ) -> Vec<String> {
     let dir = corpus_dir();
-    let raw_block = std::fs::read(dir.join(format!("{round}.msgpack")))
-        .unwrap_or_else(|e| panic!("missing corpus block {round}: {e}"));
+    let raw_block = read_fixture(&dir.join(format!("{round}.msgpack")));
     let block = algo_codec::decode_block_response(&raw_block)
         .unwrap_or_else(|e| panic!("cannot decode block {round}: {e}"))
         .block;
@@ -794,6 +812,10 @@ corpus! {
     /// apply's NextRound must equal go's header value. The transaction's
     /// ~300 KB proof body is stripped from the fixture (README).
     round_65682823_state_proof_advances_next_round => 65682823, approx (0, 1, 3, 2);
+    /// #1757: the heavy app-call block (~530 KB, many app calls with large
+    /// args/logs). Too big for the 200 KB per-fixture budget as plain msgpack,
+    /// so both files are stored zstd-compressed (`*.msgpack.zst`, README).
+    round_65743637_heavy_app_call_block => 65743637, approx (7, 118, 18, 1273);
 }
 
 /// Every fixture needs a test and every test a fixture (both directions).
@@ -804,6 +826,8 @@ fn every_corpus_block_has_state_and_is_wired() {
     let mut states = Vec::new();
     for e in std::fs::read_dir(&dir).expect("corpus dir") {
         let name = e.unwrap().file_name().to_string_lossy().into_owned();
+        // A compressed twin (`*.zst`) counts as the fixture it stands for.
+        let name = name.strip_suffix(".zst").unwrap_or(&name).to_owned();
         if let Some(stem) = name.strip_suffix(".state.msgpack") {
             states.push(stem.parse::<u64>().expect("round"));
         } else if let Some(stem) = name.strip_suffix(".msgpack") {

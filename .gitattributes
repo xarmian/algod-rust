@@ -35,6 +35,7 @@ docker/localnet-rust/data/algod.admin.token text eol=lf
 
 # Binary fixture formats: exempt from all text/eol handling.
 *.msgpack binary
+*.zst binary
 *.keyfile binary
 *.tx binary
 *.db binary

@@ -130,3 +130,17 @@ Not captured (tracked as follow-ups of #1675): 65743637 (heavy app-call block of
 state from ~12M rounds back, where the deleted apps and closed-out local states
 it references cannot be reconstructed cheaply (its `itx` bytes already exist as
 `../mainnet_53000003_txn3_itx.hex`).
+
+
+## Compressed entries (`*.msgpack.zst`)
+
+A fixture over the 200 KB per-fixture budget is stored zstd-compressed
+(`zstd -19 <file>`, keeping the original file name plus `.zst`); the test loader
+(`read_fixture` in `mainnet_corpus_test.rs`) transparently falls back to the
+`.zst` twin and the wiring check treats it as the fixture it stands for.
+Round 65743637 (the #1757 heavy app-call block, 530 KB block + 1.2 MB state
+uncompressed -> 146 KB + 116 KB) is stored this way. Its pre-state is more
+approximate than the other entries because the block touches ~130 accounts and
+~1,300 resource parts whose last write predates cheap delta walks: 7 unresolved
+accounts, 118 tip-approximated accounts, 18 and 1273 resource parts (pinned
+exactly by the `corpus!` allow-list, so a re-capture cannot silently drift).
