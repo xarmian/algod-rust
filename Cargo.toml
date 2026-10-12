@@ -144,11 +144,11 @@ num-traits = "0.2"
 statrs = "0.19"
 
 # Elliptic curves (for AVM ec_* opcodes)
-ark-ff = "0.5"
-ark-ec = { version = "0.5", features = ["parallel"] }
-ark-bn254 = "0.5"
-ark-bls12-381 = "0.5"
-ark-serialize = "0.5"
+ark-ff = "0.6"
+ark-ec = { version = "0.6", features = ["parallel"] }
+ark-bn254 = "0.6"
+ark-bls12-381 = "0.6"
+ark-serialize = "0.6"
 
 # System info
 sysinfo = "0.39"

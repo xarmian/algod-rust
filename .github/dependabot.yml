@@ -16,39 +16,12 @@ updates:
     groups:
       cargo-minor-patch:
         update-types: [minor, patch]
-    # Major bumps that need a coordinated migration (issue #1839): rand 0.10
-    # renames the whole API and moves rand_core, which the seeded
-    # rand_chacha 0.3 test RNGs and the key-generation paths in
-    # algo-consensus-crypto depend on; the ark-* crates (BN254/BLS12-381 AVM
-    # ops) must move together. Re-enable when that migration is scheduled.
+    # Held (issue #1828): hickory-resolver 0.26.3 validates the mainnet SRV
+    # set unreliably; the ignored live test
+    # `live_mainnet_srv_validates_with_default_resolver` guards the next
+    # release. Everything else (rand 0.10, RustCrypto digest 0.11 train,
+    # ark-* 0.6, ...) moved in issue #1869.
     ignore:
-      - dependency-name: "rand"
-        update-types: ["version-update:semver-major"]
-      - dependency-name: "rand_chacha"
-        update-types: ["version-update:semver-major"]
-      - dependency-name: "ark-*"
-        update-types: ["version-update:semver-major"]
-      # statrs 0.19 (and nalgebra/wide/safe_arch) need rustc 1.89 > MSRV 1.88.
-      - dependency-name: "statrs"
-        update-types: ["version-update:semver-minor", "version-update:semver-major"]
-      # RustCrypto digest 0.11 train (sha2 0.11, hkdf 0.13, ...): the
-      # dependent crates (hmac, blake2, sha3, ed25519-dalek, ...) must move
-      # together or trait bounds (CoreProxy/FixedOutput) mismatch.
-      - dependency-name: "sha2"
-        update-types: ["version-update:semver-minor", "version-update:semver-major"]
-      - dependency-name: "hkdf"
-        update-types: ["version-update:semver-minor", "version-update:semver-major"]
-      # k256/p256/sha3 0.14/0.12 break the AVM ecdsa and Falcon/SHAKE call
-      # sites (to_encoded_point, sha3::Shake256) and belong to the same
-      # RustCrypto elliptic-curve/digest train as sha2/hkdf above.
-      - dependency-name: "k256"
-        update-types: ["version-update:semver-minor", "version-update:semver-major"]
-      - dependency-name: "p256"
-        update-types: ["version-update:semver-minor", "version-update:semver-major"]
-      - dependency-name: "sha3"
-        update-types: ["version-update:semver-minor", "version-update:semver-major"]
-      # hickory-resolver 0.26.3 validates the mainnet SRV set unreliably
-      # (issue #1828); the ignored live test guards the next release.
       - dependency-name: "hickory-resolver"
         update-types: ["version-update:semver-minor", "version-update:semver-major"]
   - package-ecosystem: github-actions
