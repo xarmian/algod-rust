@@ -1442,6 +1442,12 @@ pub(crate) fn collect_txn_addresses(
             addrs.insert(*a);
         }
     }
+    // Heartbeat target: the account whose last-heartbeat the transaction sets.
+    if let Some(ref hb) = txn.heartbeat {
+        if !hb.address.is_zero() {
+            addrs.insert(hb.address);
+        }
+    }
 }
 
 /// Apply one atomic transaction group's transactions against `store`, in
@@ -2121,21 +2127,12 @@ fn note_undecidable_absence(round: u64, balance_round: u64, err: &AlgoError) {
 /// touched is not offered for expiry), and validators accept any valid
 /// subset, so the omission is always safe.
 pub fn payset_touched_addresses(payset: &[algo_types::SignedTransaction]) -> Vec<Address> {
-    let mut out = Vec::new();
+    let mut addrs = std::collections::HashSet::new();
     for stx in payset {
-        let t = &stx.txn;
-        out.extend([t.sender, t.receiver, t.close_remainder_to]);
-        out.extend(t.asset_sender);
-        out.extend(t.asset_receiver);
-        out.extend(t.asset_close_to);
-        out.extend(t.freeze_account);
-        out.extend(t.heartbeat.as_ref().map(|hb| hb.address));
-        if let Some(accts) = &t.accounts {
-            out.extend(accts.iter().copied());
-        }
+        collect_txn_addresses(&stx.txn, &mut addrs);
     }
+    let mut out: Vec<Address> = addrs.into_iter().collect();
     out.sort_by_key(|a| a.0);
-    out.dedup();
     out
 }
 
@@ -14510,6 +14507,36 @@ return
             payset_touched_addresses_bounded(std::slice::from_ref(&appl)).is_none(),
             "appl: inner transactions can modify any account"
         );
+    }
+
+    /// `collect_txn_addresses` is the one per-transaction-type address table
+    /// (issue #1819): it names the heartbeat target too, and the sorted
+    /// `payset_touched_addresses` is exactly its set over the payset.
+    #[test]
+    fn collect_txn_addresses_covers_every_named_account_incl_heartbeat() {
+        use algo_types::{HeartbeatTxnFields, TxnType};
+        let a = |n: u8| Address([n; 32]);
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = TxnType::Hb;
+        stx.txn.sender = a(1);
+        stx.txn.receiver = a(2);
+        stx.txn.close_remainder_to = a(3);
+        stx.txn.asset_sender = Some(a(4));
+        stx.txn.asset_receiver = Some(a(5));
+        stx.txn.asset_close_to = Some(a(6));
+        stx.txn.freeze_account = Some(a(7));
+        stx.txn.accounts = Some(vec![a(8)]);
+        stx.txn.heartbeat = Some(HeartbeatTxnFields {
+            address: a(9),
+            ..Default::default()
+        });
+        let mut got = std::collections::HashSet::new();
+        collect_txn_addresses(&stx.txn, &mut got);
+        let want: std::collections::HashSet<Address> = (1..=9).map(a).collect();
+        assert_eq!(got, want);
+        // Duplicate-free, sorted, and zero addresses are not named.
+        let touched = payset_touched_addresses(&[stx.clone(), stx]);
+        assert_eq!(touched, (1..=9).map(a).collect::<Vec<_>>());
     }
 
     /// A challenge-failed account is proposed (and accepted) as absent even
