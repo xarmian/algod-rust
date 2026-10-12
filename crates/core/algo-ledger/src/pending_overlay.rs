@@ -102,19 +102,19 @@ pub struct PendingOverlay {
 
 impl PendingOverlay {
     /// An empty overlay on top of `base`'s current committed state.
-    pub fn new(base: &SqliteLedger) -> Self {
+    pub fn new<B: OverlayBase + ?Sized>(base: &B) -> Self {
         let chain = Chain {
-            round: base.current_round(),
-            rewards_level: base.rewards_level(),
-            rewards_rate: base.rewards_rate(),
-            rewards_residue: base.rewards_residue(),
-            rewards_recalculation_round: base.rewards_recalculation_round(),
-            fee_sink: base.fee_sink(),
-            rewards_pool: base.rewards_pool(),
-            genesis_id: base.genesis_id().to_string(),
-            genesis_hash: *base.genesis_hash(),
-            protocol: base.protocol().to_string(),
-            txn_counter: base.txn_counter(),
+            round: base.base_current_round(),
+            rewards_level: base.base_rewards_level(),
+            rewards_rate: base.base_rewards_rate(),
+            rewards_residue: base.base_rewards_residue(),
+            rewards_recalculation_round: base.base_rewards_recalculation_round(),
+            fee_sink: base.base_fee_sink(),
+            rewards_pool: base.base_rewards_pool(),
+            genesis_id: base.base_genesis_id(),
+            genesis_hash: base.base_genesis_hash(),
+            protocol: base.base_protocol(),
+            txn_counter: base.base_txn_counter(),
         };
         Self {
             accounts: HashMap::new(),
@@ -206,16 +206,166 @@ fn restore<K: std::hash::Hash + Eq, V>(map: &mut HashMap<K, V>, k: K, prev: Opti
     }
 }
 
+/// The reads an [`OverlayStore`] falls through to for every key the pending
+/// groups did not touch: the committed ledger, as seen by one evaluation.
+///
+/// [`SqliteLedger`] is the plain implementation (the caller holds whatever
+/// lock protects it). [`crate::locked_base::LockedBase`] takes the ledger mutex
+/// per read instead, so the evaluation does not hold it across AVM execution
+/// (issue #1781); it reports a ledger that moved under it through
+/// [`Self::base_is_stale`].
+pub trait OverlayBase {
+    /// Whether any read so far saw a ledger that is not at the round the
+    /// evaluation started from. A stale evaluation's result must be dropped.
+    fn base_is_stale(&self) -> bool {
+        false
+    }
+    fn base_current_round(&self) -> Round;
+    fn base_rewards_level(&self) -> u64;
+    fn base_rewards_rate(&self) -> u64;
+    fn base_rewards_residue(&self) -> u64;
+    fn base_rewards_recalculation_round(&self) -> u64;
+    fn base_fee_sink(&self) -> Address;
+    fn base_rewards_pool(&self) -> Address;
+    fn base_genesis_id(&self) -> String;
+    fn base_genesis_hash(&self) -> [u8; 32];
+    fn base_protocol(&self) -> String;
+    fn base_txn_counter(&self) -> u64;
+    fn base_get_account(&self, addr: &Address) -> Option<AccountData>;
+    fn base_get_asset_holding(&self, addr: &Address, asset_id: u64) -> Option<AssetHolding>;
+    fn base_get_asset_params(&self, asset_id: u64) -> Option<AssetParamsRecord>;
+    fn base_get_app_params(&self, app_id: u64) -> Option<AppParams>;
+    fn base_get_app_local_state(&self, addr: &Address, app_id: u64) -> Option<AppLocalState>;
+    fn base_get_box(&self, app_id: u64, key: &[u8]) -> Option<Vec<u8>>;
+    fn base_created_apps_for_addr(&self, addr: &Address) -> Vec<(u64, AppParams)>;
+    fn base_created_assets_for_addr(&self, addr: &Address) -> Vec<(u64, AssetParamsRecord)>;
+    fn base_app_local_states_for_addr(&self, addr: &Address) -> Vec<(u64, AppLocalState)>;
+    fn base_asset_holdings_for_addr(&self, addr: &Address) -> Vec<(u64, AssetHolding)>;
+    fn base_box_keys_for_app(&self, app_id: u64) -> Vec<Vec<u8>>;
+    fn base_check_lease(
+        &self,
+        sender: &Address,
+        lease: &[u8; 32],
+        current_round: u64,
+    ) -> Result<(), AlgoError>;
+    fn base_account_totals(&self) -> crate::state_delta::AccountTotals;
+    fn base_get_block_data(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError>;
+    fn base_get_block_header_data(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError>;
+    fn base_get_block_header(&self, round: u64) -> Result<Option<BlockHeader>, AlgoError>;
+    fn base_get_block_proto(&self, round: u64) -> Result<Option<String>, AlgoError>;
+    fn base_get_txtail(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError>;
+    fn base_get_state_proof_verification_context(
+        &self,
+        last_attested_round: u64,
+    ) -> Result<Option<Vec<u8>>, AlgoError>;
+    fn base_get_voters_snapshot(&self, round: u64) -> Result<Option<(Vec<u8>, u64)>, AlgoError>;
+    fn base_online_accounts(&self) -> Vec<(Address, AccountData)>;
+    fn base_for_each_online_account_ordered(
+        &self,
+        visit: &mut dyn FnMut(Address, AccountData) -> bool,
+    );
+    fn base_for_each_knock_offline_candidate_ordered(
+        &self,
+        round: u64,
+        challenge_round: u64,
+        visit: &mut dyn FnMut(Address, AccountData) -> bool,
+    );
+    fn base_voter_agreement_data_at_round(
+        &self,
+        round: u64,
+        addr: &Address,
+    ) -> Result<VoterAgreementData, AlgoError>;
+    fn base_online_stake_at_round(&self, round: u64, vote_rnd: u64) -> Result<u64, AlgoError>;
+    fn base_balance_round_total_online_stake(
+        &self,
+        balance_round: u64,
+        vote_rnd: u64,
+    ) -> Result<u64, AlgoError>;
+    fn base_absence_history_uncertain(&self, balance_round: u64) -> Result<bool, AlgoError>;
+}
+
+macro_rules! ledger_store_base {
+    ($($name:ident ( $($arg:ident : $ty:ty),* ) -> $ret:ty = $m:ident;)*) => {
+        $(
+            fn $name(&self $(, $arg: $ty)*) -> $ret {
+                LedgerStore::$m(self $(, $arg)*)
+            }
+        )*
+    };
+}
+
+impl OverlayBase for SqliteLedger {
+    ledger_store_base! {
+        base_current_round() -> Round = current_round;
+        base_rewards_level() -> u64 = rewards_level;
+        base_rewards_rate() -> u64 = rewards_rate;
+        base_rewards_residue() -> u64 = rewards_residue;
+        base_rewards_recalculation_round() -> u64 = rewards_recalculation_round;
+        base_fee_sink() -> Address = fee_sink;
+        base_rewards_pool() -> Address = rewards_pool;
+        base_txn_counter() -> u64 = txn_counter;
+        base_get_account(addr: &Address) -> Option<AccountData> = get_account;
+        base_get_asset_holding(addr: &Address, asset_id: u64) -> Option<AssetHolding> = get_asset_holding;
+        base_get_asset_params(asset_id: u64) -> Option<AssetParamsRecord> = get_asset_params;
+        base_get_app_params(app_id: u64) -> Option<AppParams> = get_app_params;
+        base_get_app_local_state(addr: &Address, app_id: u64) -> Option<AppLocalState> = get_app_local_state;
+        base_get_box(app_id: u64, key: &[u8]) -> Option<Vec<u8>> = get_box;
+        base_created_apps_for_addr(addr: &Address) -> Vec<(u64, AppParams)> = created_apps_for_addr;
+        base_created_assets_for_addr(addr: &Address) -> Vec<(u64, AssetParamsRecord)> = created_assets_for_addr;
+        base_app_local_states_for_addr(addr: &Address) -> Vec<(u64, AppLocalState)> = app_local_states_for_addr;
+        base_asset_holdings_for_addr(addr: &Address) -> Vec<(u64, AssetHolding)> = asset_holdings_for_addr;
+        base_box_keys_for_app(app_id: u64) -> Vec<Vec<u8>> = box_keys_for_app;
+        base_check_lease(sender: &Address, lease: &[u8; 32], current_round: u64) -> Result<(), AlgoError> = check_lease;
+        base_account_totals() -> crate::state_delta::AccountTotals = account_totals;
+        base_get_block_data(round: u64) -> Result<Option<Vec<u8>>, AlgoError> = get_block_data;
+        base_get_block_header_data(round: u64) -> Result<Option<Vec<u8>>, AlgoError> = get_block_header_data;
+        base_get_block_header(round: u64) -> Result<Option<BlockHeader>, AlgoError> = get_block_header;
+        base_get_block_proto(round: u64) -> Result<Option<String>, AlgoError> = get_block_proto;
+        base_get_txtail(round: u64) -> Result<Option<Vec<u8>>, AlgoError> = get_txtail;
+        base_get_state_proof_verification_context(round: u64) -> Result<Option<Vec<u8>>, AlgoError> = get_state_proof_verification_context;
+        base_get_voters_snapshot(round: u64) -> Result<Option<(Vec<u8>, u64)>, AlgoError> = get_voters_snapshot;
+        base_online_accounts() -> Vec<(Address, AccountData)> = online_accounts;
+        base_voter_agreement_data_at_round(round: u64, addr: &Address) -> Result<VoterAgreementData, AlgoError> = voter_agreement_data_at_round;
+        base_online_stake_at_round(round: u64, vote_rnd: u64) -> Result<u64, AlgoError> = online_stake_at_round;
+        base_balance_round_total_online_stake(balance_round: u64, vote_rnd: u64) -> Result<u64, AlgoError> = balance_round_total_online_stake;
+        base_absence_history_uncertain(balance_round: u64) -> Result<bool, AlgoError> = absence_history_uncertain;
+    }
+
+    fn base_genesis_id(&self) -> String {
+        LedgerStore::genesis_id(self).to_string()
+    }
+    fn base_genesis_hash(&self) -> [u8; 32] {
+        *LedgerStore::genesis_hash(self)
+    }
+    fn base_protocol(&self) -> String {
+        LedgerStore::protocol(self).to_string()
+    }
+    fn base_for_each_online_account_ordered(
+        &self,
+        visit: &mut dyn FnMut(Address, AccountData) -> bool,
+    ) {
+        LedgerStore::for_each_online_account_ordered(self, visit)
+    }
+    fn base_for_each_knock_offline_candidate_ordered(
+        &self,
+        round: u64,
+        challenge_round: u64,
+        visit: &mut dyn FnMut(Address, AccountData) -> bool,
+    ) {
+        LedgerStore::for_each_knock_offline_candidate_ordered(self, round, challenge_round, visit)
+    }
+}
+
 /// A [`LedgerStore`] view of `base` + `overlay` for one evaluation call.
-pub struct OverlayStore<'a> {
-    base: &'a SqliteLedger,
+pub struct OverlayStore<'a, B: OverlayBase + ?Sized = SqliteLedger> {
+    base: &'a B,
     st: &'a mut PendingOverlay,
 }
 
-impl<'a> OverlayStore<'a> {
+impl<'a, B: OverlayBase + ?Sized> OverlayStore<'a, B> {
     /// Layer `overlay` on `base`. `base` must be the ledger the overlay was
     /// created from, still at the same committed round.
-    pub fn new(base: &'a SqliteLedger, overlay: &'a mut PendingOverlay) -> Self {
+    pub fn new(base: &'a B, overlay: &'a mut PendingOverlay) -> Self {
         Self { base, st: overlay }
     }
 }
@@ -228,7 +378,7 @@ macro_rules! put {
     }};
 }
 
-impl LedgerStore for OverlayStore<'_> {
+impl<B: OverlayBase + ?Sized> LedgerStore for OverlayStore<'_, B> {
     /// Mark = journal length; restoring unwinds the journal to it.
     type Snapshot = usize;
 
@@ -237,7 +387,7 @@ impl LedgerStore for OverlayStore<'_> {
     fn get_account(&self, addr: &Address) -> Option<AccountData> {
         match self.st.accounts.get(addr) {
             Some(v) => v.clone(),
-            None => self.base.get_account(addr),
+            None => self.base.base_get_account(addr),
         }
     }
 
@@ -261,7 +411,7 @@ impl LedgerStore for OverlayStore<'_> {
     fn get_asset_holding(&self, addr: &Address, asset_id: u64) -> Option<AssetHolding> {
         match self.st.holdings.get(&(*addr, asset_id)) {
             Some(v) => v.clone(),
-            None => self.base.get_asset_holding(addr, asset_id),
+            None => self.base.base_get_asset_holding(addr, asset_id),
         }
     }
 
@@ -300,7 +450,7 @@ impl LedgerStore for OverlayStore<'_> {
     fn get_asset_params(&self, asset_id: u64) -> Option<AssetParamsRecord> {
         match self.st.asset_params.get(&asset_id) {
             Some(v) => v.clone(),
-            None => self.base.get_asset_params(asset_id),
+            None => self.base.base_get_asset_params(asset_id),
         }
     }
 
@@ -317,7 +467,7 @@ impl LedgerStore for OverlayStore<'_> {
     fn get_app_params(&self, app_id: u64) -> Option<AppParams> {
         match self.st.app_params.get(&app_id) {
             Some(v) => v.clone(),
-            None => self.base.get_app_params(app_id),
+            None => self.base.base_get_app_params(app_id),
         }
     }
 
@@ -332,7 +482,7 @@ impl LedgerStore for OverlayStore<'_> {
     fn app_params_created_by(&self, creator: &Address) -> Vec<AppParams> {
         let mut out: Vec<AppParams> = self
             .base
-            .created_apps_for_addr(creator)
+            .base_created_apps_for_addr(creator)
             .into_iter()
             .filter(|(id, _)| !self.st.app_params.contains_key(id))
             .map(|(_, p)| p)
@@ -353,7 +503,7 @@ impl LedgerStore for OverlayStore<'_> {
     fn get_app_local_state(&self, addr: &Address, app_id: u64) -> Option<AppLocalState> {
         match self.st.locals.get(&(*addr, app_id)) {
             Some(v) => v.clone(),
-            None => self.base.get_app_local_state(addr, app_id),
+            None => self.base.base_get_app_local_state(addr, app_id),
         }
     }
 
@@ -387,7 +537,7 @@ impl LedgerStore for OverlayStore<'_> {
     fn app_local_states_for_addr(&self, addr: &Address) -> Vec<(u64, AppLocalState)> {
         let mut out: Vec<(u64, AppLocalState)> = self
             .base
-            .app_local_states_for_addr(addr)
+            .base_app_local_states_for_addr(addr)
             .into_iter()
             .filter(|(id, _)| !self.st.locals.contains_key(&(*addr, *id)))
             .collect();
@@ -404,7 +554,7 @@ impl LedgerStore for OverlayStore<'_> {
     fn asset_holdings_for_addr(&self, addr: &Address) -> Vec<(u64, AssetHolding)> {
         let mut out: Vec<(u64, AssetHolding)> = self
             .base
-            .asset_holdings_for_addr(addr)
+            .base_asset_holdings_for_addr(addr)
             .into_iter()
             .filter(|(id, _)| !self.st.holdings.contains_key(&(*addr, *id)))
             .collect();
@@ -421,7 +571,7 @@ impl LedgerStore for OverlayStore<'_> {
     fn created_assets_for_addr(&self, addr: &Address) -> Vec<(u64, AssetParamsRecord)> {
         let mut out: Vec<(u64, AssetParamsRecord)> = self
             .base
-            .created_assets_for_addr(addr)
+            .base_created_assets_for_addr(addr)
             .into_iter()
             .filter(|(id, _)| !self.st.asset_params.contains_key(id))
             .collect();
@@ -438,7 +588,7 @@ impl LedgerStore for OverlayStore<'_> {
     fn created_apps_for_addr(&self, addr: &Address) -> Vec<(u64, AppParams)> {
         let mut out: Vec<(u64, AppParams)> = self
             .base
-            .created_apps_for_addr(addr)
+            .base_created_apps_for_addr(addr)
             .into_iter()
             .filter(|(id, _)| !self.st.app_params.contains_key(id))
             .collect();
@@ -457,7 +607,7 @@ impl LedgerStore for OverlayStore<'_> {
     fn get_box(&self, app_id: u64, key: &[u8]) -> Option<Vec<u8>> {
         match self.st.boxes.get(&(app_id, key.to_vec())) {
             Some(v) => v.clone(),
-            None => self.base.get_box(app_id, key),
+            None => self.base.base_get_box(app_id, key),
         }
     }
 
@@ -476,7 +626,7 @@ impl LedgerStore for OverlayStore<'_> {
     fn box_keys_for_app(&self, app_id: u64) -> Vec<Vec<u8>> {
         let mut out: Vec<Vec<u8>> = self
             .base
-            .box_keys_for_app(app_id)
+            .base_box_keys_for_app(app_id)
             .into_iter()
             .filter(|k| !self.st.boxes.contains_key(&(app_id, k.clone())))
             .collect();
@@ -497,7 +647,7 @@ impl LedgerStore for OverlayStore<'_> {
         current_round: u64,
     ) -> Result<(), AlgoError> {
         self.st.leases.check(sender, lease, current_round)?;
-        self.base.check_lease(sender, lease, current_round)
+        self.base.base_check_lease(sender, lease, current_round)
     }
 
     fn record_lease(&mut self, sender: &Address, lease: &[u8; 32], last_valid: u64) {
@@ -546,7 +696,7 @@ impl LedgerStore for OverlayStore<'_> {
         self.st.chain.txn_counter
     }
     fn account_totals(&self) -> crate::state_delta::AccountTotals {
-        self.base.account_totals()
+        self.base.base_account_totals()
     }
 
     fn set_current_round(&mut self, round: Round) {
@@ -606,23 +756,23 @@ impl LedgerStore for OverlayStore<'_> {
     // ---- History reads fall through to the committed ledger ----
 
     fn get_block_data(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
-        self.base.get_block_data(round)
+        self.base.base_get_block_data(round)
     }
 
     fn get_block_header_data(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
-        self.base.get_block_header_data(round)
+        self.base.base_get_block_header_data(round)
     }
 
     fn get_block_header(&self, round: u64) -> Result<Option<BlockHeader>, AlgoError> {
-        self.base.get_block_header(round)
+        self.base.base_get_block_header(round)
     }
 
     fn get_block_proto(&self, round: u64) -> Result<Option<String>, AlgoError> {
-        self.base.get_block_proto(round)
+        self.base.base_get_block_proto(round)
     }
 
     fn get_txtail(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
-        self.base.get_txtail(round)
+        self.base.base_get_txtail(round)
     }
 
     fn get_state_proof_verification_context(
@@ -630,19 +780,26 @@ impl LedgerStore for OverlayStore<'_> {
         last_attested_round: u64,
     ) -> Result<Option<Vec<u8>>, AlgoError> {
         self.base
-            .get_state_proof_verification_context(last_attested_round)
+            .base_get_state_proof_verification_context(last_attested_round)
     }
 
     fn get_voters_snapshot(&self, round: u64) -> Result<Option<(Vec<u8>, u64)>, AlgoError> {
-        self.base.get_voters_snapshot(round)
+        self.base.base_get_voters_snapshot(round)
+    }
+
+    /// Every account the pending groups wrote (a tombstone included): what a
+    /// payset evaluated on this store modified, for the proposer's expired /
+    /// absent lists (issue #1885).
+    fn pending_modified_addresses(&self) -> Option<Vec<Address>> {
+        Some(self.st.accounts.keys().copied().collect())
     }
 
     fn online_accounts(&self) -> Vec<(Address, AccountData)> {
-        self.base.online_accounts()
+        self.base.base_online_accounts()
     }
 
     fn for_each_online_account_ordered(&self, visit: &mut dyn FnMut(Address, AccountData) -> bool) {
-        self.base.for_each_online_account_ordered(visit)
+        self.base.base_for_each_online_account_ordered(visit)
     }
 
     fn for_each_knock_offline_candidate_ordered(
@@ -652,7 +809,7 @@ impl LedgerStore for OverlayStore<'_> {
         visit: &mut dyn FnMut(Address, AccountData) -> bool,
     ) {
         self.base
-            .for_each_knock_offline_candidate_ordered(round, challenge_round, visit)
+            .base_for_each_knock_offline_candidate_ordered(round, challenge_round, visit)
     }
 
     fn voter_agreement_data_at_round(
@@ -660,11 +817,11 @@ impl LedgerStore for OverlayStore<'_> {
         round: u64,
         addr: &Address,
     ) -> Result<VoterAgreementData, AlgoError> {
-        self.base.voter_agreement_data_at_round(round, addr)
+        self.base.base_voter_agreement_data_at_round(round, addr)
     }
 
     fn online_stake_at_round(&self, round: u64, vote_rnd: u64) -> Result<u64, AlgoError> {
-        self.base.online_stake_at_round(round, vote_rnd)
+        self.base.base_online_stake_at_round(round, vote_rnd)
     }
 
     fn balance_round_total_online_stake(
@@ -673,10 +830,10 @@ impl LedgerStore for OverlayStore<'_> {
         vote_rnd: u64,
     ) -> Result<u64, AlgoError> {
         self.base
-            .balance_round_total_online_stake(balance_round, vote_rnd)
+            .base_balance_round_total_online_stake(balance_round, vote_rnd)
     }
 
     fn absence_history_uncertain(&self, balance_round: u64) -> Result<bool, AlgoError> {
-        self.base.absence_history_uncertain(balance_round)
+        self.base.base_absence_history_uncertain(balance_round)
     }
 }

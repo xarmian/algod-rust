@@ -510,3 +510,156 @@ fn overlay_matches_sqlite_ledger_on_random_group_sequences() {
     assert!(ok >= 40, "too few accepted groups: {ok}");
     assert!(rej >= 40, "too few rejected groups: {rej}");
 }
+
+// ---- issue #1781: the whole-payset evaluation on a per-read-locked overlay ----
+
+/// [`setup`] plus an online account with an expired voting key (actor 3) and a
+/// second, untouched one (0x40), so the expired / absent lists are not empty.
+fn setup_with_online() -> SqliteLedger {
+    let mut l = setup();
+    for a in [addr(3), addr(0x40)] {
+        let mut acct = l.get_account(&a).unwrap_or(AccountData {
+            micro_algos: 20_000_000,
+            ..Default::default()
+        });
+        acct.status = algo_types::AccountStatus::Online;
+        acct.vote_id = Some([7u8; 32]);
+        acct.vote_last_valid = 0;
+        l.set_account(&a, acct);
+    }
+    l
+}
+
+/// Run `payset` through the legacy locked scratch apply and through the
+/// overlay evaluation over a `LockedBase`, and require identical results.
+fn assert_payset_passes_agree(seed: u64, payset: Vec<SignedTransaction>) -> bool {
+    use crate::apply::{knock_offline_lists_from_modified, ListsRequest};
+    use crate::locked_base::LockedBase;
+    use crate::proposal_eval::evaluate_payset;
+    use crate::shadow_execute::scratch_execute_payset;
+
+    let own = std::sync::Arc::new(std::collections::HashSet::new());
+    let request = || {
+        Some(ListsRequest {
+            own_addresses: own.clone(),
+        })
+    };
+
+    let mut reference = setup_with_online();
+    let mut block = template(&reference);
+    block.payset = payset;
+    let old = scratch_execute_payset(&mut reference, &block, request());
+
+    let shared = std::sync::Mutex::new(setup_with_online());
+    let base = LockedBase::new(&shared, Round(0));
+    let new = evaluate_payset(&base, &block, request());
+    assert!(!base.is_stale(), "seed {seed}: nothing advanced the ledger");
+    assert!(
+        base.stats().acquisitions > 0,
+        "seed {seed}: reads went through the mutex"
+    );
+
+    match (old, new) {
+        (Ok(o), Ok(n)) => {
+            assert_eq!(o.apply_data, n.apply_data, "seed {seed}: ApplyData");
+            assert_eq!(
+                o.final_txn_counter, n.final_txn_counter,
+                "seed {seed}: txn counter"
+            );
+            assert_eq!(
+                o.final_state_proof_next, n.final_state_proof_next,
+                "seed {seed}: state proof next round"
+            );
+            assert_eq!(
+                o.final_fee_sink_available, n.final_fee_sink_available,
+                "seed {seed}: fee sink available"
+            );
+            // The lists computed from each pass's modified accounts agree.
+            let consensus =
+                algo_types::consensus::consensus_params_for_version(CONSENSUS_V41).unwrap();
+            let committed = setup_with_online();
+            let lists = |m: Option<crate::apply::KnockOfflineModified>| {
+                knock_offline_lists_from_modified(
+                    &committed,
+                    block.round.0,
+                    &consensus,
+                    &own,
+                    &m.expect("modified accounts captured"),
+                )
+            };
+            // The legacy pass reports a superset (every write since the last
+            // commit); every account the overlay pass reports must agree with it.
+            let (om, nm) = (
+                o.knock_offline_modified.clone().unwrap(),
+                n.knock_offline_modified.clone().unwrap(),
+            );
+            for (a, v) in &nm.accounts {
+                assert_eq!(om.accounts.get(a), Some(v), "seed {seed}: modified {a:?}");
+            }
+            let (ol, nl) = (
+                lists(o.knock_offline_modified),
+                lists(n.knock_offline_modified),
+            );
+            assert_eq!(ol, nl, "seed {seed}: expired / absent lists");
+            !nl.expired.is_empty()
+        }
+        (Err(o), Err(n)) => {
+            use crate::shadow_execute::ScratchFailure as F;
+            match (o, n) {
+                (F::Txn { index: i, .. }, F::Txn { index: j, .. }) => {
+                    assert_eq!(i, j, "seed {seed}: failing transaction");
+                    false
+                }
+                (o, n) => panic!("seed {seed}: failure kinds differ: {o:?} vs {n:?}"),
+            }
+        }
+        (o, n) => panic!("seed {seed}: verdicts differ: legacy {o:?} vs overlay {n:?}"),
+    }
+}
+
+#[test]
+fn overlay_payset_pass_matches_the_locked_scratch_apply() {
+    let (mut checked, mut total, mut listed) = (0usize, 0usize, false);
+    for seed in 0..24u64 {
+        let mut rng = ChaCha8Rng::seed_from_u64(1_000 + seed);
+        let base = setup_with_online();
+        let t = template(&base);
+        let mut overlay = PendingOverlay::new(&base);
+        let mut known = Known::default();
+        let mut payset: Vec<SignedTransaction> = Vec::new();
+        for _ in 0..45 {
+            let group = random_group(&mut rng, &known);
+            if let Ok(ev) = evaluate_group(&base, &mut overlay, &t, &group) {
+                for d in &ev.apply_data {
+                    if d.config_asset != 0 {
+                        known.assets.push(d.config_asset);
+                    }
+                    if d.application_id != 0 {
+                        known.apps.push(d.application_id);
+                    }
+                }
+                payset.extend(group);
+            }
+        }
+        // Every few seeds a group the evaluator never admitted is smuggled
+        // in: both passes must blame the same transaction.
+        if seed % 4 == 3 {
+            let mut bad = base_txn(addr(1), "pay");
+            bad.receiver = addr(2);
+            bad.amount = 1_000_000_000_000;
+            payset.push(SignedTransaction {
+                txn: bad,
+                ..Default::default()
+            });
+        }
+        total += payset.len();
+        checked += 1;
+        listed |= assert_payset_passes_agree(seed, payset);
+    }
+    assert_eq!(checked, 24);
+    assert!(listed, "no seed produced an expired-account list");
+    assert!(
+        total > 300,
+        "the generator produced too few transactions: {total}"
+    );
+}

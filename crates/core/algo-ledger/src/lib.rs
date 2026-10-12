@@ -46,6 +46,7 @@ pub mod merkle_page;
 pub mod merkle_trie;
 pub mod params;
 pub mod participation;
+pub mod locked_base;
 pub mod pending_overlay;
 #[cfg(test)]
 mod pending_overlay_differential_test;

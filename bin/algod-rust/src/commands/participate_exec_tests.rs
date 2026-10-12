@@ -1819,3 +1819,339 @@ fn lists_are_computed_once_after_the_exact_size_check_at_the_limit() {
         "no second payset execution to produce the lists"
     );
 }
+
+// ---- #1781: the ledger mutex is not held across evaluation ----
+
+/// A background thread that repeatedly takes the ledger mutex the way the
+/// commit path / REST handlers do and records the longest wait it saw.
+struct LockProber {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: std::thread::JoinHandle<Duration>,
+}
+
+impl LockProber {
+    fn start(ledger: &Arc<Mutex<SqliteLedger>>) -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (l, s) = (ledger.clone(), stop.clone());
+        let handle = std::thread::spawn(move || {
+            let mut worst = Duration::ZERO;
+            while !s.load(std::sync::atomic::Ordering::Relaxed) {
+                let t = Instant::now();
+                let g = l.lock().unwrap();
+                worst = worst.max(t.elapsed());
+                drop(g);
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            worst
+        });
+        Self { stop, handle }
+    }
+
+    fn finish(self) -> Duration {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.handle.join().unwrap()
+    }
+}
+
+/// A ledger with four rich senders, a loop-heavy app (id 1000) and a primed
+/// evaluator.
+fn rich_fixture() -> (Arc<Mutex<SqliteLedger>>, SimpleBlockEvaluator, Vec<Key>) {
+    let senders: Vec<Key> = (1..=4).map(key).collect();
+    let b = key(9);
+    let mut accounts: Vec<(Address, AccountData)> = senders
+        .iter()
+        .map(|k| (k.0, funded(5_000_000_000_000)))
+        .collect();
+    accounts.push((b.0, funded(1_000_000)));
+    let (ledger, _pool) = fixture(&accounts, &[]);
+    put_app(
+        &ledger,
+        1_000,
+        senders[0].0,
+        concat!(
+            "#pragma version 8
+",
+            "int 0
+",
+            "loop:
+",
+            "int 1
+",
+            "+
+",
+            "dup
+",
+            "int 80
+",
+            "<
+",
+            "bnz loop
+",
+            "pop
+",
+            "int 1
+",
+        ),
+    );
+    let eval = PoolLedgerAdapter::new(ledger.clone())
+        .start_simple_evaluator(genesis_header(), 0, 0)
+        .expect("start_evaluator");
+    (ledger, eval, senders)
+}
+
+/// Admit `payments` payments and `calls` loop-heavy app calls.
+fn admit_rich(eval: &mut SimpleBlockEvaluator, senders: &[Key], payments: u64, calls: u64) {
+    let b = key(9);
+    for i in 0..payments {
+        let s = &senders[(i % 4) as usize];
+        let mut t = base_txn(s.0, TxnType::Pay);
+        t.receiver = b.0;
+        t.amount = 1 + i;
+        eval.transaction_group(&[sign(t, &s.1)]).unwrap();
+    }
+    for i in 0..calls {
+        let s = &senders[(i % 4) as usize];
+        let mut t = base_txn(s.0, TxnType::Appl);
+        t.application_id = 1_000;
+        t.note = serde_bytes::ByteBuf::from(i.to_be_bytes().to_vec());
+        eval.transaction_group(&[sign(t, &s.1)]).unwrap();
+    }
+}
+
+#[test]
+fn assembly_does_not_block_other_ledger_users_across_evaluation() {
+    let (ledger, mut eval, senders) = rich_fixture();
+    let prober = LockProber::start(&ledger);
+    let started = Instant::now();
+    admit_rich(&mut eval, &senders, 500, 60);
+    let admitted = started.elapsed();
+    let started = Instant::now();
+    let block = eval.generate_block(&[]).expect("generate_block");
+    let assembled = started.elapsed();
+    let worst = prober.finish();
+    eprintln!(
+        "rich workload: {} txns; admission {admitted:?}, generate_block {assembled:?};          worst wait of a concurrent ledger user {worst:?}
+{}",
+        block.payset.len(),
+        algo_ledger::proposal_eval::proposal_metrics_prometheus_text()
+    );
+    assert_eq!(block.payset.len(), 560);
+    // Debug build: the old whole-pass hold of the mutex was ~75 ms here; one
+    // read is microseconds.
+    assert!(
+        worst < Duration::from_millis(40),
+        "a concurrent ledger user waited {worst:?} behind pool evaluation"
+    );
+    let exec = eval.exec.as_ref().unwrap();
+    assert!(
+        exec.lock_hold_max.get() < Duration::from_millis(20),
+        "longest single hold of the ledger mutex: {:?}",
+        exec.lock_hold_max.get()
+    );
+    assert!(
+        exec.lock_acquisitions.get() > 560,
+        "reads take the mutex one by one"
+    );
+}
+
+/// Issue #1781: a concurrent block commit while the proposal is being
+/// evaluated drops the proposal instead of building it on the old parent.
+#[test]
+fn proposal_is_dropped_when_the_ledger_advances_during_assembly() {
+    let (ledger, mut eval, senders) = rich_fixture();
+    admit_rich(&mut eval, &senders, 400, 40);
+    let stale_before = algo_ledger::proposal_eval::stale_base_total();
+    // The assembly pass starts while a block commit is in progress: it blocks
+    // on its first read, the commit completes (the round moves), and the pass
+    // then reads the new state. The mid-evaluation case is covered by
+    // `payset_evaluated_while_the_ledger_advances_is_stale_and_returns_nothing`.
+    let guard = ledger.lock().unwrap();
+    let assembler = std::thread::spawn(move || {
+        let res = eval.generate_block(&[]);
+        (res, eval)
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    // What a block commit does to the base: the round moves.
+    let mut guard = guard;
+    guard.set_current_round(Round(1));
+    drop(guard);
+    let (res, _eval) = assembler.join().unwrap();
+    let err = res.expect_err("a proposal evaluated across a commit must be dropped");
+    assert!(err.to_string().contains("ledger advanced"), "{err}");
+    assert!(algo_ledger::proposal_eval::stale_base_total() > stale_before);
+}
+
+/// Issue #1781: the default (overlay) assembly pass and the legacy locked
+/// SAVEPOINT pass produce identical blocks over random payment / close / app
+/// call mixes, including a smuggled un-applyable group and byte-limit
+/// trimming.
+#[test]
+fn overlay_assembly_equals_the_locked_scratch_pass_over_random_mixes() {
+    fn mix(seed: u64, locked: bool, limit_num: usize) -> (algo_types::Block, usize, usize) {
+        let senders: Vec<Key> = (1..=4).map(key).collect();
+        let closers: Vec<Key> = (20..30).map(key).collect();
+        let c = key(6);
+        let b = key(9);
+        let mut accounts: Vec<(Address, AccountData)> = senders
+            .iter()
+            .map(|k| (k.0, funded(5_000_000_000_000)))
+            .collect();
+        accounts.push((b.0, funded(1_000_000)));
+        accounts.push((c.0, holder(5_000_000)));
+        accounts.extend(closers.iter().map(|k| (k.0, funded(5_000_000))));
+        let (ledger, _pool) = fixture(&accounts, &[(c.0, 77)]);
+        put_app(
+            &ledger,
+            1_000,
+            senders[0].0,
+            "#pragma version 8\nint 0\nloop:\nint 1\n+\ndup\nint 20\n<\nbnz loop\npop\nint 1\n",
+        );
+        let mut eval = PoolLedgerAdapter::new(ledger.clone())
+            .start_simple_evaluator(genesis_header(), 0, 0)
+            .expect("start_evaluator");
+        eval.exec.as_mut().unwrap().locked_scratch = locked;
+        let mut state = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        let mut closed = 0usize;
+        for i in 0..60u64 {
+            let s = &senders[next() % 4];
+            let admitted = match next() % 6 {
+                0..=2 => {
+                    let mut t = base_txn(s.0, TxnType::Pay);
+                    t.receiver = b.0;
+                    t.amount = 1 + i;
+                    eval.transaction_group(&[sign(t, &s.1)])
+                }
+                3 if closed < closers.len() => {
+                    closed += 1;
+                    eval.transaction_group(&[pay(&closers[closed - 1], s.0, 0, Some(s.0))])
+                }
+                4 => {
+                    let mut t = base_txn(s.0, TxnType::Appl);
+                    t.application_id = 1_000;
+                    t.note = serde_bytes::ByteBuf::from(i.to_be_bytes().to_vec());
+                    eval.transaction_group(&[sign(t, &s.1)])
+                }
+                _ => {
+                    // A group go refuses: admission rejects it.
+                    let _ = eval.transaction_group(&[pay(&c, s.0, 0, Some(s.0))]);
+                    continue;
+                }
+            };
+            admitted.expect("valid group admitted");
+        }
+        // Smuggle an un-applyable group past admission at a random position.
+        let bad = {
+            let mut stib = pay(&c, senders[0].0, 0, Some(senders[0].0));
+            eval.genesis_rule().strip(&mut stib);
+            stib
+        };
+        let pos = next() % (eval.exec.as_ref().unwrap().groups.len() + 1);
+        let at = eval
+            .exec
+            .as_ref()
+            .unwrap()
+            .groups
+            .get(pos)
+            .map(|g| g.start)
+            .unwrap_or(eval.included_txns.len());
+        eval.included_txns.insert(at, bad);
+        for g in eval.exec.as_mut().unwrap().groups.iter_mut().skip(pos) {
+            g.start += 1;
+        }
+        eval.exec.as_mut().unwrap().groups.insert(
+            pos,
+            ExecGroup {
+                start: at,
+                len: 1,
+                fees: 1_000,
+            },
+        );
+        eval.fees_collected += 1_000;
+        if limit_num > 0 {
+            let total: usize = eval
+                .included_txns
+                .iter()
+                .map(SimpleBlockEvaluator::encoded_len)
+                .sum();
+            eval.max_txn_bytes = total * limit_num / 10;
+        }
+        let block = eval.generate_block(&[]).expect("generate_block");
+        let passes = eval.exec.as_ref().unwrap().last_passes;
+        (block, passes, closed)
+    }
+
+    let mut trimmed = 0usize;
+    for seed in 0..8u64 {
+        for limit in [0usize, 6] {
+            let (ov, ov_passes, _) = mix(seed, false, limit);
+            let (lk, lk_passes, _) = mix(seed, true, limit);
+            assert_eq!(
+                format!("{:?}", ov.payset),
+                format!("{:?}", lk.payset),
+                "seed {seed} limit {limit}: payset (ApplyData included)"
+            );
+            assert_eq!(ov.txn_counter, lk.txn_counter, "seed {seed}: txn counter");
+            assert_eq!(ov.fees_collected, lk.fees_collected, "seed {seed}: fees");
+            assert_eq!(ov.load, lk.load, "seed {seed}: load");
+            assert_eq!(
+                ov.proposer_payout, lk.proposer_payout,
+                "seed {seed}: payout"
+            );
+            assert_eq!(
+                ov.expired_participation_accounts, lk.expired_participation_accounts,
+                "seed {seed}: expired list"
+            );
+            assert_eq!(
+                ov.absent_participation_accounts, lk.absent_participation_accounts,
+                "seed {seed}: absent list"
+            );
+            assert_eq!(
+                format!("{:?}", ov.state_proof_tracking),
+                format!("{:?}", lk.state_proof_tracking)
+            );
+            assert_eq!(
+                ov_passes, lk_passes,
+                "seed {seed} limit {limit}: pass count"
+            );
+            assert!(!ov.payset.is_empty());
+            if limit > 0 {
+                trimmed += 1;
+            }
+        }
+    }
+    assert!(trimmed > 0);
+}
+
+/// Release-build measurement for issue #1781:
+/// `cargo test --release -p algod-rust --bin algod-rust lock_hold_report -- --ignored --nocapture`
+#[test]
+#[ignore = "measurement, run explicitly in a release build"]
+fn lock_hold_report_large_workload() {
+    let (ledger, mut eval, senders) = rich_fixture();
+    let prober = LockProber::start(&ledger);
+    let started = Instant::now();
+    admit_rich(&mut eval, &senders, 3_000, 600);
+    let admitted = started.elapsed();
+    let started = Instant::now();
+    let block = eval.generate_block(&[]).expect("generate_block");
+    let assembled = started.elapsed();
+    let worst = prober.finish();
+    eprintln!(
+        "LOCK-HOLD-REPORT {} txns: admission {admitted:?}, generate_block {assembled:?}, \
+         worst wait of a concurrent ledger user {worst:?}",
+        block.payset.len()
+    );
+    for line in algo_ledger::proposal_eval::proposal_metrics_prometheus_text().lines() {
+        if !line.starts_with('#') {
+            eprintln!("LOCK-HOLD-REPORT {line}");
+        }
+    }
+}
