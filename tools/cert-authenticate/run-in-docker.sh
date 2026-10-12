@@ -111,6 +111,17 @@ MSYS_NO_PATHCONV=1 docker run --rm \
 set -euo pipefail
 CLONE=/work/go-algorand
 if [ "$REBUILD" = "1" ]; then rm -rf "$CLONE"; fi
+# A cached clone from an earlier pin (the named volume outlives a version
+# upgrade) is rebuilt automatically instead of failing the verify-soak run
+# on every pin bump (found during the Phase 20 / #1869 verification).
+if [ -d "$CLONE/.git" ]; then
+    git config --global --add safe.directory '"'"'*'"'"'
+    CACHED_PIN="$(git -C "$CLONE" describe --tags --exact-match 2>/dev/null || echo unknown)"
+    if [ "$CACHED_PIN" != "$GO_ALGORAND_PIN" ]; then
+        echo "    (cached go-algorand clone is at $CACHED_PIN, expected $GO_ALGORAND_PIN: rebuilding)"
+        rm -rf "$CLONE"
+    fi
+fi
 if [ ! -x "$CLONE/crypto/libs/linux/amd64/lib/libsodium.a" ] \
         && [ ! -f "$CLONE/crypto/libs/linux/amd64/lib/libsodium.a" ]; then
     echo "    (first run) preparing a clean go-algorand clone + libsodium"
