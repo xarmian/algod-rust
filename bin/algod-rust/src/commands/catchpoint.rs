@@ -293,8 +293,9 @@ pub async fn run_import(
             .query_row(
                 "SELECT COALESCE(MAX(asset), 0) FROM assetcreators",
                 [],
-                |row| row.get(0),
+                |row| row.get::<_, i64>(0),
             )
+            .map(|v| v as u64)
             .unwrap_or(0);
 
         if txn_counter > 0 {

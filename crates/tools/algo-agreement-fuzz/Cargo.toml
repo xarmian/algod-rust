@@ -37,7 +37,7 @@ hex.workspace = true
 # here only for the plain `Multiaddr`/`PeerId`/`SwarmEvent` types this
 # crate's P2P injector uses to drive `algo_p2p::P2pHost` directly, mirroring
 # `bin/algod-rust/src/commands/p2p_transport.rs`.
-libp2p = { version = "0.56", features = [
+libp2p = { version = "0.57", features = [
     "tcp",
     "noise",
     "yamux",

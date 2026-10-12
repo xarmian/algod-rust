@@ -48,7 +48,7 @@ codegen-units = 1
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
@@ -65,7 +65,7 @@ rmpv = { version = "1", features = ["with-serde"] }
 
 # HTTP
 axum = { version = "0.8", features = ["ws"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
 tower = { version = "0.5", features = ["limit", "util"] }
 tower-http = { version = "0.7", features = ["cors", "trace", "compression-gzip", "timeout"] }
 hyper = { version = "1", features = ["server", "http1"] }
@@ -100,7 +100,7 @@ xsalsa20poly1305 = "0.9"
 hkdf = "0.12"
 
 # Storage
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # System (Unix rlimit/FD accounting — see `algo_network::fd_limits`)
 libc = "0.2"
@@ -110,7 +110,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Testing
 proptest = "1"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 # Workspace crates
 algo-error = { path = "crates/core/algo-error" }
@@ -140,7 +140,7 @@ algo-bench = { path = "crates/tools/algo-bench" }
 algo-build-info = { path = "crates/tools/algo-build-info" }
 num-bigint = "0.4"
 num-traits = "0.2"
-statrs = "0.18"
+statrs = "0.19"
 
 # Elliptic curves (for AVM ec_* opcodes)
 ark-ff = "0.5"
@@ -150,7 +150,7 @@ ark-bls12-381 = "0.5"
 ark-serialize = "0.5"
 
 # System info
-sysinfo = "0.33"
+sysinfo = "0.39"
 
 # Compression / archive
 snap = "1"

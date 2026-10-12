@@ -444,6 +444,18 @@ impl WalletDb {
         secret_key_encrypted: &[u8],
         key_idx: Option<u64>,
     ) -> Result<()> {
+        // rusqlite 0.40 dropped `ToSql for u64` (SQLite integers are i64);
+        // 0.31 rejected values above i64::MAX at bind time, so keep that.
+        let key_idx = key_idx
+            .map(|k| {
+                i64::try_from(k).map_err(|_| {
+                    rusqlite::Error::ToSqlConversionFailure(
+                        format!("key_idx {k} exceeds i64::MAX").into(),
+                    )
+                })
+            })
+            .transpose()
+            .map_err(map_constraint_error)?;
         self.conn
             .execute(
                 "INSERT INTO keys (address, secret_key_encrypted, key_idx) VALUES (?1, ?2, ?3)",
