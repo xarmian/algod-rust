@@ -56,5 +56,28 @@ class Parsing(unittest.TestCase):
         self.assertEqual(after, 4)    # rounds >= 460
 
 
+class VerifyLoop(unittest.TestCase):
+    def test_returns_attempt_count_of_first_success(self):
+        calls = []
+        rcs = iter([2, 2, 0])
+
+        def runner(cmd):
+            calls.append(cmd)
+            return next(rcs)
+
+        n = lj.verify_latest("ACCT", tries=5, runner=runner, outdir="/o", sleep=lambda s: None)
+        self.assertEqual(n, 3)
+        self.assertEqual(len(calls), 3)
+        cmd = calls[0]
+        self.assertIn("--cert-latest", cmd)
+        self.assertEqual(cmd[cmd.index("--cert-latest") + 1], "1")
+        self.assertEqual(cmd[cmd.index("--rust-account") + 1], "ACCT")
+        self.assertEqual(cmd[cmd.index("--min-rust-vote-rounds") + 1], "1")
+
+    def test_gives_up_after_tries(self):
+        n = lj.verify_latest("A", tries=3, runner=lambda c: 2, outdir="/o", sleep=lambda s: None)
+        self.assertIsNone(n)
+
+
 if __name__ == "__main__":
     unittest.main()

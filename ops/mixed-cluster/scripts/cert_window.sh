@@ -34,6 +34,49 @@ probe_earliest_file() {
     return 0
 }
 
+# Highest block round in a (snapshot) block database, or nothing (issue #1821).
+probe_latest_file() {
+    local f="$1" out=""
+    [ -s "$f" ] || return 0
+    if command -v sqlite3 >/dev/null 2>&1; then
+        out="$(sqlite3 "$f" 'SELECT MAX(rnd) FROM blocks' 2>/dev/null | tr -d '' || true)"
+    fi
+    if ! _is_round "$out" && command -v python3 >/dev/null 2>&1; then
+        out="$(python3 -c 'import sqlite3, sys; print(sqlite3.connect(sys.argv[1]).execute("SELECT MAX(rnd) FROM blocks").fetchone()[0])' "$f" 2>/dev/null | tr -d '' || true)"
+    fi
+    if _is_round "$out"; then
+        echo "$out"
+    fi
+    return 0
+}
+
+# resolve_cert_latest <from> <snapshot_tip> <n>   (issue #1821)
+#
+# Clamp the cert pass to the NEWEST n rounds of the Rust snapshot (sets
+# CERT_FROM / CERT_TO). Verifying the cert of round r needs the online-account
+# state at r - BalanceLookback, and the Rust ledger (like go's non-archival
+# nodes) only keeps `onlineaccounts` history back to ~tip - MaxBalLookback, so
+# a post-hoc pass can only cover the snapshot's own newest rounds (n = 1 is
+# exact; each extra round risks a voter row that changed inside the pruned
+# gap). n = 0 leaves the range alone; a missing snapshot tip is an error.
+resolve_cert_latest() {
+    local frm="$1" tip="$2" n="${3:-0}"
+    if ! _is_round "$n"; then
+        echo "error: --cert-latest must be a non-negative integer (got '$n')" >&2
+        return 2
+    fi
+    [ "$n" -eq 0 ] && return 0
+    if ! _is_round "$tip"; then
+        echo "error: cannot determine the snapshot's newest round for --cert-latest" >&2
+        return 2
+    fi
+    CERT_TO="$tip"
+    CERT_FROM=$((tip - n + 1))
+    if [ "$CERT_FROM" -lt "$frm" ]; then CERT_FROM="$frm"; fi
+    echo "CERT_LATEST=$n cert cross-verify covers ${CERT_FROM}..${CERT_TO} (newest rounds of the ledger snapshot)"
+    return 0
+}
+
 probe_earliest_container() {
     local ctr="$1" path="$2" out=""
     out="$(docker exec "$ctr" sqlite3 "$path" 'SELECT MIN(rnd) FROM blocks' 2>/dev/null | tr -d '\r' || true)"

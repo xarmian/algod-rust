@@ -90,6 +90,7 @@ CERT_LEDGER_OVERRIDE=""
 # issue #470 §2 — Rust → Go direction.
 RUST_ACCOUNT="${RUST_ACCOUNT:-}"
 MIN_RUST_VOTE_ROUNDS="${MIN_RUST_VOTE_ROUNDS:-1}"
+CERT_LATEST="${CERT_LATEST:-0}"
 RUN_GO_AUTH=1
 # issue #1674 — raw block bytes, go vs algod-rust.
 RUN_BLOCKCOMPARE=0
@@ -127,6 +128,12 @@ Options:
   --rust-account ADDR    (#470 §2) Address of the Rust participant.
                          Enables the vote-in-certificate assertion and
                          the Go-side re-authentication step.
+  --cert-latest N        (#1821) Verify only the newest N rounds OF THE LEDGER
+                         SNAPSHOT (taken first): online-account history is kept
+                         back to ~tip-320 only (as in go), so a post-hoc pass
+                         can re-verify just the snapshot's newest rounds. N=1
+                         is exact; use it to check a late-joining account
+                         (see late_join.py). Default 0 = whole range.
   --min-rust-vote-rounds N
                          Fail unless at least N sampled certificates
                          contain a vote from --rust-account (default 1).
@@ -168,6 +175,7 @@ while [ $# -gt 0 ]; do
         --cert-ledger)            need_arg "$@"; CERT_LEDGER_OVERRIDE="$2"; shift 2 ;;
         --rust-account)           need_arg "$@"; RUST_ACCOUNT="$2"; shift 2 ;;
         --min-rust-vote-rounds)   need_arg "$@"; MIN_RUST_VOTE_ROUNDS="$2"; shift 2 ;;
+        --cert-latest)            need_arg "$@"; CERT_LATEST="$2"; shift 2 ;;
         --no-go-authenticate)     RUN_GO_AUTH=0; shift ;;
         --blockcompare)           RUN_BLOCKCOMPARE=1; shift ;;
         --blockcompare-jsonl)     need_arg "$@"; BLOCKCOMPARE_JSONL="$2"; shift 2 ;;
@@ -403,7 +411,13 @@ if [ "$RUN_CERT" = "1" ]; then
     fi
     # An unknown earliest round is never silently unclamped (cert_window.py
     # falls back to CERT_WINDOW, else the last 900 rounds).
-    resolve_cert_window "$FROM_ROUND" "$TO_ROUND" "${RUST_EARLIEST:-}" || exit 2
+    if [ "$CERT_LATEST" != "0" ]; then
+        CERT_TO="$TO_ROUND"
+        resolve_cert_latest "$FROM_ROUND" "$(probe_latest_file "${BLOCK_PATH:-}")" "$CERT_LATEST" || exit 2
+    else
+        resolve_cert_window "$FROM_ROUND" "$TO_ROUND" "${RUST_EARLIEST:-}" || exit 2
+        CERT_TO="$TO_ROUND"
+    fi
     CERT_FROM="${CERT_FROM:?}"
     set +e
     "$CERT_BIN" \
@@ -411,7 +425,7 @@ if [ "$RUN_CERT" = "1" ]; then
         --token-file "$TOKEN_FILE" \
         --ledger-sqlite "$CERT_LEDGER_PATH" \
         --from-round "$CERT_FROM" \
-        --to-round "$TO_ROUND" \
+        --to-round "$CERT_TO" \
         --stride "$STRIDE" \
         --jsonl-out "$CERT_OUT" \
         "${CERT_EXTRA_ARGS[@]+"${CERT_EXTRA_ARGS[@]}"}"
