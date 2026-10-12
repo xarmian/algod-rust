@@ -64,136 +64,20 @@
 //! for every committed block, `avm` only for blocks that ran a top-level
 //! program (observed whether the apply then succeeded or failed).
 //!
-//! These cannot reuse `algo_metrics::Histogram`: that type keeps its series
-//! in a `Mutex<HashMap>` (a lock per observation, plus allocation for label
-//! canonicalisation), is not `const`-constructible so cannot be a plain
-//! `static`, renders `_bucket` as `counter`, and `algo-ledger` does not
-//! depend on `algo-metrics`. The follow path needs a branch-free atomic
-//! increment next to the SQLite commit; this fixed-bucket variant is the
-//! lock-free equivalent and emits the standard `histogram` text format.
+//! These use `algo_metrics::fixed`, not `algo_metrics::Histogram`: that type
+//! keeps its series in a `Mutex<HashMap>` (a lock per observation), so the
+//! follow path uses the lock-free fixed-bucket variant next to the SQLite
+//! commit (issue #1815 moved it into `algo-metrics`).
 //!
 //! Recording is a handful of relaxed atomic increments; no lock is taken, so
 //! nothing here can be held across the SQLite commit.
 
 use std::cell::Cell;
 use std::ffi::{c_char, c_int, c_void};
-use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
-/// Upper bounds (seconds) of the fixed histogram buckets; an implicit
-/// `+Inf` bucket follows. Spans 1 ms to 30 s: sub-10 ms is a healthy block,
-/// and the 1 s boundary matches the existing slow-stage warnings.
-pub const BUCKET_BOUNDS_SECS: [f64; 14] = [
-    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
-];
-const N_BUCKETS: usize = BUCKET_BOUNDS_SECS.len();
-
-/// A lock-free histogram with the fixed [`BUCKET_BOUNDS_SECS`] buckets.
-///
-/// See the module docs for why `algo_metrics::Histogram` is not reused.
-pub struct FixedHistogram {
-    name: &'static str,
-    help: &'static str,
-    /// Non-cumulative per-bucket counts; the last slot is the `+Inf` bucket.
-    buckets: [AtomicU64; N_BUCKETS + 1],
-    sum_nanos: AtomicU64,
-}
-
-impl FixedHistogram {
-    /// A histogram named `name` (no observations yet).
-    pub const fn new(name: &'static str, help: &'static str) -> Self {
-        Self {
-            name,
-            help,
-            buckets: [const { AtomicU64::new(0) }; N_BUCKETS + 1],
-            sum_nanos: AtomicU64::new(0),
-        }
-    }
-
-    /// Records one observation.
-    pub fn observe(&self, d: Duration) {
-        let secs = d.as_secs_f64();
-        let idx = BUCKET_BOUNDS_SECS
-            .iter()
-            .position(|&b| secs <= b)
-            .unwrap_or(N_BUCKETS);
-        self.buckets[idx].fetch_add(1, Ordering::Relaxed);
-        let nanos = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
-        self.sum_nanos.fetch_add(nanos, Ordering::Relaxed);
-    }
-
-    /// Total number of observations.
-    pub fn count(&self) -> u64 {
-        self.buckets.iter().map(|b| b.load(Ordering::Relaxed)).sum()
-    }
-
-    /// Sum of all observations in seconds.
-    pub fn sum_secs(&self) -> f64 {
-        self.sum_nanos.load(Ordering::Relaxed) as f64 / 1e9
-    }
-
-    /// Appends the Prometheus text exposition (`histogram` type, cumulative
-    /// buckets, `+Inf`, `_sum`, `_count`) to `out`.
-    pub fn write_prometheus(&self, out: &mut String) {
-        let counts: Vec<u64> = self
-            .buckets
-            .iter()
-            .map(|b| b.load(Ordering::Relaxed))
-            .collect();
-        let total: u64 = counts.iter().sum();
-        let _ = writeln!(out, "# HELP {} {}", self.name, self.help);
-        let _ = writeln!(out, "# TYPE {} histogram", self.name);
-        let mut cumulative = 0u64;
-        for (bound, c) in BUCKET_BOUNDS_SECS.iter().zip(&counts) {
-            cumulative += c;
-            let _ = writeln!(
-                out,
-                "{}_bucket{{le=\"{}\"}} {}",
-                self.name, bound, cumulative
-            );
-        }
-        let _ = writeln!(out, "{}_bucket{{le=\"+Inf\"}} {}", self.name, total);
-        let _ = writeln!(out, "{}_sum {}", self.name, self.sum_secs());
-        let _ = writeln!(out, "{}_count {}", self.name, total);
-    }
-}
-
-/// A monotonically increasing lock-free counter (`counter` text format).
-pub struct FixedCounter {
-    name: &'static str,
-    help: &'static str,
-    value: AtomicU64,
-}
-
-impl FixedCounter {
-    /// A counter named `name` starting at zero.
-    pub const fn new(name: &'static str, help: &'static str) -> Self {
-        Self {
-            name,
-            help,
-            value: AtomicU64::new(0),
-        }
-    }
-
-    /// Adds one.
-    pub fn inc(&self) {
-        self.value.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Current value.
-    pub fn get(&self) -> u64 {
-        self.value.load(Ordering::Relaxed)
-    }
-
-    /// Appends the Prometheus text exposition to `out`.
-    pub fn write_prometheus(&self, out: &mut String) {
-        let _ = writeln!(out, "# HELP {} {}", self.name, self.help);
-        let _ = writeln!(out, "# TYPE {} counter", self.name);
-        let _ = writeln!(out, "{} {}", self.name, self.get());
-    }
-}
+pub use algo_metrics::fixed::{FixedCounter, FixedHistogram, BUCKET_BOUNDS_SECS};
 
 /// The follow-path histograms and counters.
 pub struct FollowTiming {
