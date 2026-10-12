@@ -32,7 +32,7 @@ use crate::bytecode::Instruction;
 use crate::context::AvmContext;
 use crate::fields::{Base64Encoding, EcdsaCurve, JSONRefType, VrfStandard};
 use crate::machine::{AvmMachine, AvmValue};
-use crate::ops::helpers::get_uint8;
+use crate::ops::helpers::{be_lt, get_uint8};
 
 fn avm_err(msg: impl Into<String>) -> AlgoError {
     AlgoError::Avm {
@@ -1365,14 +1365,23 @@ fn mimc_bls12_381(data: &[u8]) -> Result<Vec<u8>, AlgoError> {
 }
 
 /// Parse input bytes into field elements (big-endian, 32-byte chunks).
+///
+/// The 32-byte chunk width is the opcode's *encoding* (go-algorand's `mimc`
+/// consumes 32-byte big-endian words), not a property of the field: every
+/// chunk must be numerically below the field modulus, whatever its width.
 fn parse_field_elements<F: ark_ff::PrimeField>(data: &[u8]) -> Result<Vec<F>, AlgoError> {
+    use ark_ff::BigInteger;
     let mut elements = Vec::with_capacity(data.len() / 32);
+    // Numeric range check against the field modulus (any width), then the
+    // value is already canonical so the reduction below is a plain decode.
+    // No num-bigint value is handed to arkworks, which still depends on
+    // num-bigint 0.4 (issue #1876).
+    let modulus = F::MODULUS.to_bytes_be();
     for chunk in data.chunks_exact(32) {
-        let bi = F::BigInt::try_from(num_bigint::BigUint::from_bytes_be(chunk))
-            .map_err(|_| avm_err("field element exceeds modulus"))?;
-        let elem = F::from_bigint(bi)
-            .ok_or_else(|| avm_err("invalid mimc input: element exceeds modulus"))?;
-        elements.push(elem);
+        if !be_lt(chunk, &modulus) {
+            return Err(avm_err("invalid mimc input: element exceeds modulus"));
+        }
+        elements.push(F::from_be_bytes_mod_order(chunk));
     }
     Ok(elements)
 }
@@ -1390,8 +1399,7 @@ fn mimc_derive_constants<F: ark_ff::PrimeField>(num_rounds: usize) -> Vec<F> {
     for _ in 0..num_rounds {
         rnd = hasher.finalize_reset().to_vec();
         // gnark-crypto uses SetBytes which reduces mod p (big-endian)
-        let bi = num_bigint::BigUint::from_bytes_be(&rnd);
-        let fi = F::from(bi);
+        let fi = F::from_be_bytes_mod_order(&rnd);
         constants.push(fi);
         hasher.update(&rnd);
     }
@@ -1616,8 +1624,7 @@ fn poseidon2_round_keys<F: ark_ff::PrimeField>(seed: &str) -> Vec<Vec<F>> {
         let mut keys = Vec::with_capacity(width);
         for _ in 0..width {
             rnd = hasher.finalize_reset().to_vec();
-            let bi = num_bigint::BigUint::from_bytes_be(&rnd);
-            keys.push(F::from(bi));
+            keys.push(F::from_be_bytes_mod_order(&rnd));
             hasher.update(&rnd);
         }
         round_keys.push(keys);
@@ -4510,6 +4517,49 @@ mod tests {
             "12964111614552580241101202600014316932811348627866250816177200046290462797607",
             "BLS12-381 MiMC three-chunk hash mismatch"
         );
+    }
+
+    /// `parse_field_elements` is generic over the field: a valid 32-byte chunk
+    /// must parse for a field whose modulus is wider than 32 bytes (BLS12-381
+    /// Fq is 48 bytes) and the numeric range check must be width independent.
+    #[test]
+    fn test_mimc_bls12_modulus_boundary() {
+        // BLS12-381 Fr modulus r = 0x73eda753...00000001.
+        let r_minus_1 = "73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000000";
+        let r = "73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001";
+        assert!(
+            mimc_bls12_direct(r_minus_1).is_ok(),
+            "r-1 is a valid element"
+        );
+        assert!(mimc_bls12_direct(r).is_err(), "r itself must be rejected");
+    }
+
+    #[test]
+    fn test_parse_field_elements_is_width_independent() {
+        use ark_bls12_381::Fq;
+        let mut chunk = [0u8; 32];
+        chunk[31] = 7;
+        let got = super::parse_field_elements::<Fq>(&chunk).expect("small value is valid");
+        assert_eq!(got, vec![Fq::from(7u64)]);
+        // 2^256 - 1 is below the 381-bit Fq modulus, so it is valid there...
+        assert!(super::parse_field_elements::<Fq>(&[0xff; 32]).is_ok());
+        // ...but not for the 254-bit BN254 Fr.
+        assert!(super::parse_field_elements::<ark_bn254::Fr>(&[0xff; 32]).is_err());
+    }
+
+    /// The modulus boundary of the MiMC input check (a numeric comparison
+    /// against the field modulus, issue #1876): `r - 1` is the largest valid
+    /// BN254 Fr element and `r` itself must be rejected (go:
+    /// `SetBytesCanonical`).
+    #[test]
+    fn test_mimc_bn254_modulus_boundary() {
+        let r_minus_1 = "30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000000";
+        let r = "30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001";
+        assert!(
+            mimc_bn254_direct(r_minus_1).is_ok(),
+            "r-1 is a valid element"
+        );
+        assert!(mimc_bn254_direct(r).is_err(), "r itself must be rejected");
     }
 
     #[test]

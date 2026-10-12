@@ -23,9 +23,16 @@
 //!
 //! Supports four groups: BN254g1, BN254g2, BLS12-381g1, BLS12-381g2.
 //! Matches go-algorand's gnark-crypto-based implementation.
+//!
+//! num-bigint boundary: arkworks (even 0.6) depends on num-bigint 0.4 while the
+//! workspace is on 0.5 (issue #1876). Never hand a workspace `BigUint` to an
+//! arkworks API; convert through bytes (`from_be_bytes_mod_order`) or arkworks'
+//! own `FromStr`. A mismatch is a compile error, not a silent bug.
 
 use algo_error::AlgoError;
 use num_bigint::BigUint;
+
+use crate::ops::helpers::be_lt;
 
 use ark_bls12_381::{
     Bls12_381, Fq as BLS12Fq, Fq2 as BLS12Fq2, G1Affine as BLS12G1Affine, G1Projective as BLS12G1,
@@ -84,15 +91,16 @@ const SCALAR_SIZE: usize = 32;
 /// Decode a big-endian byte slice into a BN254 base field element.
 /// Verifies the value is less than the field modulus.
 fn bytes_to_bn254_field(b: &[u8]) -> Result<BN254Fq, AlgoError> {
-    let v = BigUint::from_bytes_be(b);
-    let modulus = BigUint::from_bytes_be(&BN254Fq::MODULUS.to_bytes_be());
-    if v >= modulus {
+    let modulus = BN254Fq::MODULUS.to_bytes_be();
+    if !be_lt(b, &modulus) {
+        // Only the error path needs the decimal rendering.
         return Err(avm_err(format!(
             "field element {} larger than modulus {}",
-            v, modulus
+            BigUint::from_bytes_be(b),
+            BigUint::from_bytes_be(&modulus)
         )));
     }
-    Ok(BN254Fq::from(v))
+    Ok(BN254Fq::from_be_bytes_mod_order(b))
 }
 
 /// Decode 64 bytes (big-endian x || y) into a BN254 G1 affine point.
@@ -228,15 +236,15 @@ fn bn254_g2_to_bytes(p: &BN254G2Affine) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 fn bytes_to_bls12_field(b: &[u8]) -> Result<BLS12Fq, AlgoError> {
-    let v = BigUint::from_bytes_be(b);
-    let modulus = BigUint::from_bytes_be(&BLS12Fq::MODULUS.to_bytes_be());
-    if v >= modulus {
+    let modulus = BLS12Fq::MODULUS.to_bytes_be();
+    if !be_lt(b, &modulus) {
         return Err(avm_err(format!(
             "field element {} larger than modulus {}",
-            v, modulus
+            BigUint::from_bytes_be(b),
+            BigUint::from_bytes_be(&modulus)
         )));
     }
-    Ok(BLS12Fq::from(v))
+    Ok(BLS12Fq::from_be_bytes_mod_order(b))
 }
 
 fn bytes_to_bls12_g1(b: &[u8]) -> Result<BLS12G1Affine, AlgoError> {
@@ -1043,36 +1051,16 @@ fn bn254_g2_psi(p: &BN254G2) -> BN254G2 {
     use ark_ff::Field;
     // Constants from arkworks: TWIST_MUL_BY_Q_X and TWIST_MUL_BY_Q_Y
     let psi_x = BN254Fq2::new(
-        BN254Fq::from(
-            BigUint::parse_bytes(
-                b"21575463638280843010398324269430826099269044274347216827212613867836435027261",
-                10,
-            )
-            .unwrap(),
+        fq_from_dec(
+            "21575463638280843010398324269430826099269044274347216827212613867836435027261",
         ),
-        BN254Fq::from(
-            BigUint::parse_bytes(
-                b"10307601595873709700152284273816112264069230130616436755625194854815875713954",
-                10,
-            )
-            .unwrap(),
+        fq_from_dec(
+            "10307601595873709700152284273816112264069230130616436755625194854815875713954",
         ),
     );
     let psi_y = BN254Fq2::new(
-        BN254Fq::from(
-            BigUint::parse_bytes(
-                b"2821565182194536844548159561693502659359617185244120367078079554186484126554",
-                10,
-            )
-            .unwrap(),
-        ),
-        BN254Fq::from(
-            BigUint::parse_bytes(
-                b"3505843767911556378687030309984248845540243509899259641013678093033130930403",
-                10,
-            )
-            .unwrap(),
-        ),
+        fq_from_dec("2821565182194536844548159561693502659359617185244120367078079554186484126554"),
+        fq_from_dec("3505843767911556378687030309984248845540243509899259641013678093033130930403"),
     );
 
     let aff: BN254G2Affine = (*p).into();
@@ -1116,13 +1104,17 @@ fn bn254_g2_clear_cofactor(q: &BN254G2Affine) -> BN254G2Affine {
     result.into_affine()
 }
 
+/// Parse a decimal string (already reduced) into a BN254 base field element.
+/// Goes through arkworks' own `FromStr`, so no num-bigint value crosses into
+/// arkworks (which still uses num-bigint 0.4; issue #1876).
+fn fq_from_dec(s: &str) -> BN254Fq {
+    s.parse::<BN254Fq>()
+        .expect("valid canonical decimal field constant")
+}
+
 /// Construct a BN254 Fq2 element from two decimal strings.
 fn fq2_from_strs(a0: &str, a1: &str) -> BN254Fq2 {
-    let v0 = BigUint::parse_bytes(a0.as_bytes(), 10).unwrap();
-    let v1 = BigUint::parse_bytes(a1.as_bytes(), 10).unwrap();
-    let f0 = BN254Fq::from(v0);
-    let f1 = BN254Fq::from(v1);
-    BN254Fq2::new(f0, f1)
+    BN254Fq2::new(fq_from_dec(a0), fq_from_dec(a1))
 }
 
 /// sgn0 for BN254 Fq: returns the parity bit of the non-Montgomery representation.
@@ -1186,6 +1178,37 @@ mod tests {
     use crate::machine::{AvmMachine, AvmValue, ExecMode};
     use crate::ops::helpers::prog;
     use crate::ops::hex_decode;
+
+    /// `to_le_u64_limbs` (scalar -> `mul_bigint` limbs) across the num-bigint
+    /// 0.4 -> 0.5 bump: zero must yield no non-zero limb, and limb boundaries
+    /// must stay little-endian (issue #1876 review).
+    #[test]
+    fn scalar_limbs_zero_and_limb_boundaries() {
+        assert!(to_le_u64_limbs(&BigUint::from(0u32))
+            .iter()
+            .all(|&l| l == 0));
+        assert_eq!(to_le_u64_limbs(&BigUint::from(1u32)), vec![1]);
+        assert_eq!(to_le_u64_limbs(&BigUint::from(u64::MAX)), vec![u64::MAX]);
+        assert_eq!(to_le_u64_limbs(&(BigUint::from(1u8) << 64)), vec![0, 1]);
+        assert_eq!(
+            to_le_u64_limbs(&((BigUint::from(1u8) << 128) - 1u8)),
+            vec![u64::MAX, u64::MAX]
+        );
+    }
+
+    /// The G2 endomorphism constants are parsed with `fq_from_dec` (panics on a
+    /// malformed or non-canonical constant): exercise the whole path and check
+    /// the images stay on the curve (issue #1876 review).
+    #[test]
+    fn bn254_g2_psi_constants_parse_and_map_onto_the_curve() {
+        use ark_ec::{AffineRepr, CurveGroup};
+        let g = BN254G2::from(BN254G2Affine::generator());
+        let psi_g = bn254_g2_psi(&g).into_affine();
+        assert!(psi_g.is_on_curve());
+        assert!(psi_g.is_in_correct_subgroup_assuming_on_curve());
+        let psi2_g = bn254_g2_psi(&bn254_g2_psi(&g)).into_affine();
+        assert!(psi2_g.is_on_curve());
+    }
 
     /// Helper: step machine through N instructions.
     fn step_n(

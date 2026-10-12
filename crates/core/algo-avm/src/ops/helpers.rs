@@ -90,3 +90,33 @@ pub fn prog(version: u8, code: &[u8]) -> Vec<u8> {
     p.extend_from_slice(code);
     p
 }
+
+/// `a < b` for two big-endian unsigned integers of any lengths (leading zero
+/// bytes ignored). Used for field-modulus range checks without building
+/// num-bigint values (issue #1876).
+pub(crate) fn be_lt(a: &[u8], b: &[u8]) -> bool {
+    let a = &a[a.iter().position(|&x| x != 0).unwrap_or(a.len())..];
+    let b = &b[b.iter().position(|&x| x != 0).unwrap_or(b.len())..];
+    a.len() < b.len() || (a.len() == b.len() && a < b)
+}
+
+#[cfg(test)]
+mod be_lt_tests {
+    use super::be_lt;
+
+    #[test]
+    fn be_lt_ignores_leading_zeros() {
+        assert!(be_lt(&[0, 0, 5], &[6]));
+        assert!(!be_lt(&[6], &[0, 0, 5]));
+        assert!(!be_lt(&[0, 5], &[5]));
+        assert!(be_lt(&[], &[1]));
+        assert!(!be_lt(&[], &[0]));
+        assert!(be_lt(&[0xff], &[1, 0]));
+    }
+
+    #[test]
+    fn be_lt_is_strict() {
+        assert!(!be_lt(&[7, 7], &[7, 7]));
+        assert!(be_lt(&[7, 6], &[7, 7]));
+    }
+}
