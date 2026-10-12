@@ -999,6 +999,7 @@ fn sqlite_apply_profile(
     Option<std::time::Duration>,
     algo_ledger::follow_timing::StageTimes,
     std::time::Duration,
+    (u64, u64),
 ) {
     use algo_ledger::follow_timing as ft;
     let dir = corpus_dir();
@@ -1012,6 +1013,7 @@ fn sqlite_apply_profile(
     ls.enable_trie();
 
     ls.begin_block().expect("begin_block");
+    let (h0, m0) = ls.read_cache_stats();
     ft::reset_avm_time();
     let t = std::time::Instant::now();
     apply_block_capturing_state_proof_next(&mut ls, &block, ApplyMode::Execute).expect("apply");
@@ -1021,6 +1023,7 @@ fn sqlite_apply_profile(
     let t = std::time::Instant::now();
     ls.commit_block().expect("commit_block");
     let commit = t.elapsed();
+    let (h1, m1) = ls.read_cache_stats();
 
     let mut diffs = Vec::new();
     check_post_state(&ls, &state, &mut diffs);
@@ -1029,7 +1032,7 @@ fn sqlite_apply_profile(
         "round {round}: SQLite store diverges from go:\n{}",
         diffs.join("\n")
     );
-    (apply, avm, stages, commit)
+    (apply, avm, stages, commit, (h1 - h0, m1 - m0))
 }
 
 /// The attribution is internally consistent on the captured heavy block:
@@ -1037,7 +1040,7 @@ fn sqlite_apply_profile(
 /// accesses the store and runs programs.
 #[test]
 fn heavy_block_apply_attribution_is_consistent() {
-    let (apply, avm, st, _commit) = sqlite_apply_profile(65743637);
+    let (apply, avm, st, _commit, _reads) = sqlite_apply_profile(65743637);
     let avm = avm.expect("the heavy block runs programs");
     assert!(st.read_calls > 0 && st.write_calls > 0, "{st:?}");
     assert!(st.state_in_avm <= avm, "{st:?} vs avm {avm:?}");
@@ -1050,6 +1053,39 @@ fn heavy_block_apply_attribution_is_consistent() {
     );
 }
 
+/// Issue #1757 regression: the heavy block's store reads are served from the
+/// block-scoped read memo instead of ~27k SQL round-trips (before the memo
+/// every one of the 30282 reads, 26959 outermost, went to SQLite and the apply took ~530 ms in
+/// release). The query-count bound is deterministic; the wall-time bound is
+/// deliberately generous (release builds only: a debug build is far slower
+/// than the 1.5 s budget the follow path is held to).
+#[test]
+fn heavy_block_store_reads_are_memoised() {
+    let (apply, _avm, st, _commit, (hits, misses)) = sqlite_apply_profile(65743637);
+    // Reads nested in writes (`set_account` looks up the old record) are
+    // memoised reads too, so the memo sees at least the outermost reads.
+    assert!(hits + misses >= st.read_calls);
+    // ~1.2k distinct keys are read in this block (5.8k SQL reads measured,
+    // 30.3k without the memo); allow slack for reads that follow a write to
+    // the same key.
+    assert!(
+        misses < 8_000,
+        "{misses} of {} store reads went to SQL ({hits} memo hits); the memo must serve the repeats",
+        hits + misses
+    );
+    if !cfg!(debug_assertions) {
+        // Best of three: a noisy host can double a single run. Measured
+        // ~220 ms (was ~530 ms before the memo and statement cache).
+        let best = (0..2)
+            .map(|_| sqlite_apply_profile(65743637).0)
+            .fold(apply, |a, b| a.min(b));
+        assert!(
+            best < std::time::Duration::from_millis(400),
+            "apply took {best:?} (best of 3); it took ~530 ms before the memo"
+        );
+    }
+}
+
 /// Attribution report for the heavy blocks (run manually; the numbers are
 /// recorded in the PR for issue #1765):
 /// `cargo test --release -p algo-ledger --test mainnet_corpus_test profile_heavy -- --ignored --nocapture`
@@ -1060,7 +1096,7 @@ fn profile_heavy_block_apply_attribution() {
     for round in [65743637u64] {
         println!("round {round}: {ITERS} cold applies on a fresh in-memory SqliteLedger");
         for i in 0..ITERS {
-            let (apply, avm, st, commit) = sqlite_apply_profile(round);
+            let (apply, avm, st, commit, (hits, misses)) = sqlite_apply_profile(round);
             let (avm_only, state, other) = st.split(apply, avm);
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
             println!(
@@ -1077,6 +1113,7 @@ fn profile_heavy_block_apply_attribution() {
                 st.write_calls,
                 ms(commit),
             );
+            println!("      read memo: {hits} hits, {misses} SQL reads");
             let _ = state;
         }
         // Same block on the in-memory store: the pure apply/AVM cost.
