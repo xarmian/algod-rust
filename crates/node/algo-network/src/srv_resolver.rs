@@ -1970,6 +1970,69 @@ mod tests {
         );
     }
 
+    /// Root trust-anchor parity (issue #1863, go-algorand v5.0.3-stable
+    /// `tools/network/dnssec/anchor.go`, PR #6764). go ships the IANA anchor
+    /// set KSK-2017 (key tag 20326) and KSK-2024 (key tag 38696) --
+    /// `TestParseRootTrustAnchor` / `TestQueryWrapper` assert exactly these
+    /// two live entries (algorithm 8, digest type 2, the digests below; the
+    /// 2010 key 19036 is `validUntil` 2019 and is not trusted). algod-rust
+    /// delegates DNSSEC validation to hickory, so this derives the DS digest
+    /// and key tag (RFC 4034 section 5.1.4 / appendix B) of every anchor
+    /// hickory's validator trusts by default and requires the same set, so a
+    /// hickory change that drops KSK-2024 (breaking validation after the
+    /// root key rollover) fails here instead of in production.
+    #[test]
+    fn default_root_trust_anchors_match_go_v5_0_3_anchor_set() {
+        use hickory_resolver::proto::dnssec::{Algorithm, PublicKey, TrustAnchors};
+        use sha2::{Digest, Sha256};
+
+        let anchors = TrustAnchors::default();
+        let mut got: Vec<(u16, String)> = Vec::new();
+        for i in 0..anchors.len() {
+            let key = anchors.get(i).expect("index in range");
+            assert_eq!(key.algorithm(), Algorithm::RSASHA256, "anchor {i}");
+            // DNSKEY RDATA for a root KSK: flags 257 (zone + SEP), protocol 3,
+            // algorithm 8, public key.
+            let mut rdata = vec![0x01, 0x01, 3, 8];
+            rdata.extend_from_slice(key.public_bytes());
+            // Key tag: RFC 4034 appendix B (algorithm != 1).
+            let mut acc: u32 = 0;
+            for (n, b) in rdata.iter().enumerate() {
+                acc += if n % 2 == 0 {
+                    u32::from(*b) << 8
+                } else {
+                    u32::from(*b)
+                };
+            }
+            acc += (acc >> 16) & 0xFFFF;
+            let key_tag = (acc & 0xFFFF) as u16;
+            // DS digest type 2 (SHA-256) over owner name "." (a single zero
+            // octet) followed by the DNSKEY RDATA.
+            let mut input = vec![0u8];
+            input.extend_from_slice(&rdata);
+            let digest: String = Sha256::digest(&input)
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect();
+            got.push((key_tag, digest));
+        }
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    20326,
+                    "E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D".to_string()
+                ),
+                (
+                    38696,
+                    "683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16".to_string()
+                ),
+            ],
+            "root trust anchors differ from go-algorand v5.0.3-stable's anchor set"
+        );
+    }
+
     /// Live check (needs internet): a validating default resolver resolves
     /// the real, DNSSEC-signed mainnet bootstrap SRV set quickly. Guards
     /// hickory upgrades: 0.26.3 failed this intermittently (DnssecBogus /
