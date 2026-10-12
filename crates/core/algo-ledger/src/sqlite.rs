@@ -6487,6 +6487,7 @@ impl LedgerStore for SqliteLedger {
     // ---- Accounts ----
 
     fn get_account(&self, addr: &Address) -> Option<AccountData> {
+        let _st = crate::follow_timing::StateTimer::read();
         let result: Option<Vec<u8>> = self
             .conn
             .query_row(
@@ -6504,6 +6505,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn set_account(&mut self, addr: &Address, account: AccountData) {
+        let _st = crate::follow_timing::StateTimer::write();
         let old = self.get_account(addr);
         // Issue #960: record this address as touched this block so
         // `record_online_account_history` (called from `commit_block`)
@@ -6544,6 +6546,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn remove_account(&mut self, addr: &Address) {
+        let _st = crate::follow_timing::StateTimer::write();
         let old = self.get_account(addr);
         // Issue #960: same reasoning as `set_account` — a closed account
         // that was previously online must still get an offline marker row.
@@ -6577,6 +6580,7 @@ impl LedgerStore for SqliteLedger {
     // ---- Asset Holdings ----
 
     fn get_asset_holding(&self, addr: &Address, asset_id: u64) -> Option<AssetHolding> {
+        let _st = crate::follow_timing::StateTimer::read();
         let rowid = self.get_rowid(addr)?;
         let data: Vec<u8> = self
             .conn
@@ -6601,6 +6605,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn set_asset_holding(&mut self, addr: &Address, asset_id: u64, holding: AssetHolding) {
+        let _st = crate::follow_timing::StateTimer::write();
         self.record_resource_pre_mutation(addr, asset_id, CTYPE_ASSET);
         let rowid = self.get_or_insert_rowid(addr).expect("get_or_insert_rowid");
         let update_round = self.current_round.0;
@@ -6629,6 +6634,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn remove_asset_holding(&mut self, addr: &Address, asset_id: u64) {
+        let _st = crate::follow_timing::StateTimer::write();
         self.record_resource_pre_mutation(addr, asset_id, CTYPE_ASSET);
         let update_round = self.current_round.0;
         if let Some(rowid) = self.get_rowid(addr) {
@@ -6656,10 +6662,12 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn has_asset_holding(&self, addr: &Address, asset_id: u64) -> bool {
+        let _st = crate::follow_timing::StateTimer::read();
         self.get_asset_holding(addr, asset_id).is_some()
     }
 
     fn remove_all_asset_holdings_for_asset(&mut self, asset_id: u64) {
+        let _st = crate::follow_timing::StateTimer::write();
         // Find all (addrid, data, address) rows for this asset_id with a holding flag.
         let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = {
             let mut stmt = self
@@ -6726,6 +6734,7 @@ impl LedgerStore for SqliteLedger {
     // ---- Asset Params ----
 
     fn get_asset_params(&self, asset_id: u64) -> Option<AssetParamsRecord> {
+        let _st = crate::follow_timing::StateTimer::read();
         // Get creator from assetcreators table.
         let creator = self.get_creator_from_assetcreators(asset_id)?;
 
@@ -6755,6 +6764,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn set_asset_params(&mut self, asset_id: u64, record: AssetParamsRecord) {
+        let _st = crate::follow_timing::StateTimer::write();
         self.record_resource_pre_mutation(&record.creator, asset_id, CTYPE_ASSET);
         let rowid = self
             .get_or_insert_rowid(&record.creator)
@@ -6794,6 +6804,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn remove_asset_params(&mut self, asset_id: u64) {
+        let _st = crate::follow_timing::StateTimer::write();
         // Record pre-mutation for trie tracking.
         if self.trie.is_some() {
             if let Some(creator) = self.get_creator_from_assetcreators(asset_id) {
@@ -6834,6 +6845,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn has_asset_params(&self, asset_id: u64) -> bool {
+        let _st = crate::follow_timing::StateTimer::read();
         let count: i64 = self
             .conn
             .query_row(
@@ -6848,6 +6860,7 @@ impl LedgerStore for SqliteLedger {
     // ---- App Params ----
 
     fn get_app_params(&self, app_id: u64) -> Option<AppParams> {
+        let _st = crate::follow_timing::StateTimer::read();
         let creator = self.get_creator_from_assetcreators(app_id)?;
         let rowid = self.get_rowid(&creator)?;
         let data: Vec<u8> = self
@@ -6873,6 +6886,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn set_app_params(&mut self, app_id: u64, params: AppParams) {
+        let _st = crate::follow_timing::StateTimer::write();
         let creator = params.creator;
         self.record_resource_pre_mutation(&creator, app_id, CTYPE_APP);
         let rowid = self
@@ -6911,6 +6925,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn remove_app_params(&mut self, app_id: u64) {
+        let _st = crate::follow_timing::StateTimer::write();
         // Record pre-mutation for trie tracking.
         if self.trie.is_some() {
             if let Some(creator) = self.get_creator_from_assetcreators(app_id) {
@@ -6949,6 +6964,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn has_app_params(&self, app_id: u64) -> bool {
+        let _st = crate::follow_timing::StateTimer::read();
         let count: i64 = self
             .conn
             .query_row(
@@ -6961,6 +6977,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn app_params_created_by(&self, creator: &Address) -> Vec<AppParams> {
+        let _st = crate::follow_timing::StateTimer::read();
         let rowid = match self.get_rowid(creator) {
             Some(r) => r,
             None => return Vec::new(),
@@ -6994,6 +7011,7 @@ impl LedgerStore for SqliteLedger {
     // ---- App Local States ----
 
     fn get_app_local_state(&self, addr: &Address, app_id: u64) -> Option<AppLocalState> {
+        let _st = crate::follow_timing::StateTimer::read();
         let rowid = self.get_rowid(addr)?;
         // Go stores both app params and app local state in the same resources
         // table — params under creator's addrid, local state under the user's addrid,
@@ -7023,6 +7041,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn set_app_local_state(&mut self, addr: &Address, app_id: u64, local_state: AppLocalState) {
+        let _st = crate::follow_timing::StateTimer::write();
         self.record_resource_pre_mutation(addr, app_id, CTYPE_APP);
         let rowid = self.get_or_insert_rowid(addr).expect("get_or_insert_rowid");
         let update_round = self.current_round.0;
@@ -7051,6 +7070,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn remove_app_local_state(&mut self, addr: &Address, app_id: u64) {
+        let _st = crate::follow_timing::StateTimer::write();
         self.record_resource_pre_mutation(addr, app_id, CTYPE_APP);
         let update_round = self.current_round.0;
         if let Some(rowid) = self.get_rowid(addr) {
@@ -7078,10 +7098,12 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn has_app_local_state(&self, addr: &Address, app_id: u64) -> bool {
+        let _st = crate::follow_timing::StateTimer::read();
         self.get_app_local_state(addr, app_id).is_some()
     }
 
     fn remove_all_app_local_states_for_app(&mut self, app_id: u64) {
+        let _st = crate::follow_timing::StateTimer::write();
         // Find all (addrid, data, address) rows for this app_id with a holding flag (local state).
         let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = {
             let mut stmt = self
@@ -7150,6 +7172,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn app_local_states_for_addr(&self, addr: &Address) -> Vec<(u64, AppLocalState)> {
+        let _st = crate::follow_timing::StateTimer::read();
         let rowid = match self.get_rowid(addr) {
             Some(r) => r,
             None => return Vec::new(),
@@ -7183,6 +7206,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn asset_holdings_for_addr(&self, addr: &Address) -> Vec<(u64, AssetHolding)> {
+        let _st = crate::follow_timing::StateTimer::read();
         let rowid = match self.get_rowid(addr) {
             Some(r) => r,
             None => return Vec::new(),
@@ -7216,6 +7240,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn created_assets_for_addr(&self, addr: &Address) -> Vec<(u64, AssetParamsRecord)> {
+        let _st = crate::follow_timing::StateTimer::read();
         let rowid = match self.get_rowid(addr) {
             Some(r) => r,
             None => return Vec::new(),
@@ -7255,6 +7280,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn created_apps_for_addr(&self, addr: &Address) -> Vec<(u64, AppParams)> {
+        let _st = crate::follow_timing::StateTimer::read();
         let rowid = match self.get_rowid(addr) {
             Some(r) => r,
             None => return Vec::new(),
@@ -7291,6 +7317,7 @@ impl LedgerStore for SqliteLedger {
     // ---- Box Storage ----
 
     fn get_box(&self, app_id: u64, key: &[u8]) -> Option<Vec<u8>> {
+        let _st = crate::follow_timing::StateTimer::read();
         let full_key = make_box_key(app_id, key);
         self.conn
             .query_row(
@@ -7303,6 +7330,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn set_box(&mut self, app_id: u64, key: &[u8], value: Vec<u8>) {
+        let _st = crate::follow_timing::StateTimer::write();
         let full_key = make_box_key(app_id, key);
 
         // Record pre-mutation for trie tracking.
@@ -7332,6 +7360,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn delete_box(&mut self, app_id: u64, key: &[u8]) -> bool {
+        let _st = crate::follow_timing::StateTimer::write();
         let full_key = make_box_key(app_id, key);
 
         // Record pre-mutation for trie tracking.
@@ -7361,6 +7390,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn box_keys_for_app(&self, app_id: u64) -> Vec<Vec<u8>> {
+        let _st = crate::follow_timing::StateTimer::read();
         // Build the prefix: "bx:" + big-endian app_id
         let prefix = make_box_key(app_id, b"");
         let prefix_len = prefix.len();
@@ -7408,14 +7438,17 @@ impl LedgerStore for SqliteLedger {
         lease: &[u8; 32],
         current_round: u64,
     ) -> Result<(), AlgoError> {
+        let _st = crate::follow_timing::StateTimer::read();
         self.lease_table.check(sender, lease, current_round)
     }
 
     fn record_lease(&mut self, sender: &Address, lease: &[u8; 32], last_valid: u64) {
+        let _st = crate::follow_timing::StateTimer::write();
         self.lease_table.record(sender, lease, last_valid);
     }
 
     fn purge_expired_leases(&mut self, current_round: u64) {
+        let _st = crate::follow_timing::StateTimer::write();
         self.lease_table.purge_expired(current_round);
     }
 
@@ -7547,6 +7580,7 @@ impl LedgerStore for SqliteLedger {
     // change.
 
     fn snapshot(&self, _addrs: &[Address]) -> SqliteSnapshot {
+        let _st = crate::follow_timing::StateTimer::write();
         let n = self.savepoint_counter.fetch_add(1, Ordering::Relaxed);
         let name = format!("sp_{n}");
         self.conn
@@ -7568,11 +7602,13 @@ impl LedgerStore for SqliteLedger {
         _asset_ids: &[u64],
         _app_ids: &[u64],
     ) -> SqliteSnapshot {
+        let _st = crate::follow_timing::StateTimer::write();
         // SQLite SAVEPOINTs capture all changes, no need to filter by addr/id.
         self.snapshot(_addrs)
     }
 
     fn restore_snapshot(&mut self, snapshot: SqliteSnapshot) {
+        let _st = crate::follow_timing::StateTimer::write();
         // `ROLLBACK TO SAVEPOINT` reverts the changes made since the savepoint
         // but does NOT remove the savepoint from the transaction stack — the
         // savepoint (and, when it is the outermost one with no enclosing
@@ -7894,6 +7930,7 @@ impl LedgerStore for SqliteLedger {
         hdrdata: &[u8],
         blkdata: &[u8],
     ) -> Result<(), AlgoError> {
+        let _st = crate::follow_timing::StateTimer::write();
         self.conn
             .execute(
                 "INSERT INTO blockdb.blocks (rnd, proto, hdrdata, blkdata) VALUES (?1, ?2, ?3, ?4) \
@@ -7907,6 +7944,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn get_block_data(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
+        let _st = crate::follow_timing::StateTimer::read();
         self.conn
             .query_row(
                 "SELECT blkdata FROM blockdb.blocks WHERE rnd = ?1",
@@ -7920,6 +7958,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn get_block_header_data(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
+        let _st = crate::follow_timing::StateTimer::read();
         self.conn
             .query_row(
                 "SELECT hdrdata FROM blockdb.blocks WHERE rnd = ?1",
@@ -7933,6 +7972,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn get_block_cert(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
+        let _st = crate::follow_timing::StateTimer::read();
         self.conn
             .query_row(
                 "SELECT certdata FROM blockdb.blocks WHERE rnd = ?1",
@@ -7947,6 +7987,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn get_block_proto(&self, round: u64) -> Result<Option<String>, AlgoError> {
+        let _st = crate::follow_timing::StateTimer::read();
         self.conn
             .query_row(
                 "SELECT proto FROM blockdb.blocks WHERE rnd = ?1",
@@ -7960,6 +8001,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn put_block_cert(&mut self, round: u64, certdata: &[u8]) -> Result<(), AlgoError> {
+        let _st = crate::follow_timing::StateTimer::write();
         let rows_affected = self
             .conn
             .execute(
@@ -7980,6 +8022,7 @@ impl LedgerStore for SqliteLedger {
     // ---- TxTail Storage ----
 
     fn put_txtail(&mut self, round: u64, data: &[u8]) -> Result<(), AlgoError> {
+        let _st = crate::follow_timing::StateTimer::write();
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO txtail (rnd, data) VALUES (?1, ?2)",
@@ -7992,6 +8035,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn get_txtail(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
+        let _st = crate::follow_timing::StateTimer::read();
         self.conn
             .query_row(
                 "SELECT data FROM txtail WHERE rnd = ?1",
@@ -8007,6 +8051,7 @@ impl LedgerStore for SqliteLedger {
     // ---- Pruning ----
 
     fn forget_before(&mut self, round: u64) -> Result<(), AlgoError> {
+        let _st = crate::follow_timing::StateTimer::write();
         self.conn
             .execute(
                 "DELETE FROM blockdb.blocks WHERE rnd < ?1",

@@ -375,24 +375,36 @@ impl AgreementLedgerBridge {
         // (`apply_avm` is `Some` only for that stage) so a heavy round is
         // attributed from the log alone, in the same single warning with a
         // single elapsed reading.
-        let slow = |stage: &str, since: std::time::Instant, apply_avm: Option<Duration>| {
-            let elapsed = since.elapsed();
-            if elapsed > Duration::from_secs(1) {
-                let elapsed_ms = elapsed.as_millis() as u64;
-                // Only the apply stage has the AVM split; `Option` fields are
-                // simply omitted from the record when `None`.
-                let avm_ms = apply_avm.map(|avm| avm.as_millis() as u64);
-                warn!(
-                    round = %block.round,
-                    stage,
-                    elapsed_ms,
-                    avm_ms,
-                    non_avm_ms = avm_ms.map(|avm| elapsed_ms.saturating_sub(avm)),
-                    txns = apply_avm.map(|_| block.payset.len()),
-                    "try_commit_block: slow stage"
-                );
-            }
-        };
+        let slow =
+            |stage: &str,
+             since: std::time::Instant,
+             apply_split: Option<(Duration, crate::follow_timing::StageTimes)>| {
+                let elapsed = since.elapsed();
+                if elapsed > Duration::from_secs(1) {
+                    let elapsed_ms = elapsed.as_millis() as u64;
+                    // Only the apply stage has the split; `Option` fields are
+                    // simply omitted from the record when `None`.
+                    let avm_ms = apply_split.map(|(avm, _)| avm.as_millis() as u64);
+                    // Issue #1765: disjoint stages of the apply (AVM without its
+                    // own store access / store reads / store writes / the rest).
+                    let split = apply_split.map(|(avm, st)| st.split(elapsed, Some(avm)));
+                    warn!(
+                        round = %block.round,
+                        stage,
+                        elapsed_ms,
+                        avm_ms,
+                        non_avm_ms = avm_ms.map(|avm| elapsed_ms.saturating_sub(avm)),
+                        avm_only_ms = split.map(|(a, _, _)| a.as_millis() as u64),
+                        state_read_ms = apply_split.map(|(_, st)| st.state_read.as_millis() as u64),
+                        state_write_ms = apply_split.map(|(_, st)| st.state_write.as_millis() as u64),
+                        other_ms = split.map(|(_, _, o)| o.as_millis() as u64),
+                        state_reads = apply_split.map(|(_, st)| st.read_calls),
+                        state_writes = apply_split.map(|(_, st)| st.write_calls),
+                        txns = apply_split.map(|_| block.payset.len()),
+                        "try_commit_block: slow stage"
+                    );
+                }
+            };
         let t = std::time::Instant::now();
         let in_txn = match ledger.begin_block() {
             Ok(()) => true,
@@ -436,15 +448,20 @@ impl AgreementLedgerBridge {
             let applied = crate::apply::apply_block_executing_app_calls(ledger, block);
             let timing = crate::follow_timing::follow_timing();
             let avm = crate::follow_timing::take_avm_time();
+            let stages = crate::follow_timing::take_stage_times();
             if let Some(avm) = avm {
                 timing.avm.observe(avm);
+                // Issue #1765: store access of blocks that ran programs only,
+                // the same population as the AVM series.
+                timing.state_read.observe(stages.state_read);
+                timing.state_write.observe(stages.state_write);
             }
             match &applied {
                 Ok(()) => timing.apply.observe(t.elapsed()),
                 Err(_) => timing.apply_failed.observe(t.elapsed()),
             }
             // Also for a failed apply: a slow rejection is just as relevant.
-            slow("apply_block", t, Some(avm.unwrap_or_default()));
+            slow("apply_block", t, Some((avm.unwrap_or_default(), stages)));
             applied.map_err(|e| CommitFailure::new(CommitStage::Apply, e))?;
             Ok(())
         })();
