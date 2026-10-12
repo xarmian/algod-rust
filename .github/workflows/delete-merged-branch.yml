@@ -1,0 +1,47 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: Delete merged branch
+
+# Issue #1679: ~190 merged branches piled up because the repository setting
+# "Automatically delete head branches" needs an admin. This workflow gives the
+# same behavior without it: when a pull request from a branch in THIS
+# repository is merged, its head branch is deleted. Fork branches, the default
+# branch and protected-looking names are never touched.
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+
+jobs:
+  delete-branch:
+    name: Delete merged head branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref != github.event.repository.default_branch &&
+      !startsWith(github.event.pull_request.head.ref, 'release/') &&
+      !startsWith(github.event.pull_request.head.ref, 'gh-pages')
+    steps:
+      - name: Delete ${{ github.event.pull_request.head.ref }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          # `gh pr merge --delete-branch` (and Dependabot's own cleanup) may
+          # already have removed it: a 404/422 here is success, not failure.
+          if gh api -X DELETE "repos/${REPO}/git/refs/heads/${BRANCH}" 2>/tmp/err; then
+            echo "deleted ${BRANCH}"
+          elif grep -qiE "Reference does not exist|Not Found|422" /tmp/err; then
+            echo "${BRANCH} already deleted"
+          else
+            cat /tmp/err
+            exit 1
+          fi
