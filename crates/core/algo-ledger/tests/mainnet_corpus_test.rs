@@ -1073,6 +1073,7 @@ fn heavy_block_store_reads_are_memoised() {
         "{misses} of {} store reads went to SQL ({hits} memo hits); the memo must serve the repeats",
         hits + misses
     );
+    // debug-assertions-ok: only the wall-time bound is release-only (a debug build is far slower); the read-count bound above runs in both profiles.
     if !cfg!(debug_assertions) {
         // Best of three: a noisy host can double a single run. Measured
         // ~220 ms (was ~530 ms before the memo and statement cache).
