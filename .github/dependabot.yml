@@ -24,6 +24,11 @@ updates:
     ignore:
       - dependency-name: "hickory-resolver"
         update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      # num-bigint 0.5: arkworks (even ark-ff 0.6) still depends on
+      # num-bigint 0.4 and the AVM field/EC ops hand BigUints across that
+      # boundary, so the two must move together (issue #1869).
+      - dependency-name: "num-bigint"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
