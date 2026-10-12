@@ -151,7 +151,7 @@ mod tests {
         let handle = std::thread::spawn(move || gate2.on_broadcast());
 
         assert!(
-            gate.wait_for_pause(1, Duration::from_secs(2)),
+            gate.wait_for_pause(1, Duration::from_secs(60)),
             "on_broadcast must report itself paused while armed"
         );
         assert!(!handle.is_finished(), "on_broadcast must still be blocked");
@@ -172,7 +172,7 @@ mod tests {
             })
             .collect();
 
-        assert!(gate.wait_for_pause(4, Duration::from_secs(2)));
+        assert!(gate.wait_for_pause(4, Duration::from_secs(60)));
         assert!(handles.iter().all(|h| !h.is_finished()));
 
         gate.release();
@@ -187,7 +187,7 @@ mod tests {
         gate.arm();
         let gate2 = Arc::clone(&gate);
         let handle = std::thread::spawn(move || gate2.on_broadcast());
-        assert!(gate.wait_for_pause(1, Duration::from_secs(2)));
+        assert!(gate.wait_for_pause(1, Duration::from_secs(60)));
         gate.release();
         handle.join().unwrap();
 

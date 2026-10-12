@@ -30,6 +30,9 @@
 // - RandomSource: random number generator for sortition timing
 // - CryptoVerifier: async cryptographic verification of votes, proposals, bundles
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::Arc;
+
 use algo_types::{Address, Block, Round};
 
 use crate::certificate::Certificate;
@@ -505,6 +508,70 @@ pub trait EventsProcessingMonitor {
     ///
     /// Mirrors Go's `UpdateEventsQueue(queueName string, queueLength int)`.
     fn update_events_queue(&self, queue_name: &str, queue_length: usize);
+
+    /// Optional exact-idleness probe for this service's demux thread.
+    ///
+    /// When a monitor returns `Some`, `Service::start` installs the handle
+    /// into the node's `Demux`, which then maintains it around its blocking
+    /// `Select` (see [`DemuxActivity`]). The default (`None`) leaves the
+    /// production select path completely untouched. algod-rust-specific:
+    /// Go's `coserviceListener` achieves the same exact accounting through
+    /// per-goroutine `inc`/`dec` calls.
+    fn demux_activity(&self) -> Option<Arc<DemuxActivity>> {
+        None
+    }
+}
+
+/// Exact "this node's demux thread is blocked and inert" signal, used by
+/// test harnesses to detect cluster quiescence without any debounce window
+/// (issue #1695).
+///
+/// The demux thread is the only thread that turns inputs (network
+/// messages, verified-crypto results, ledger round changes, clock
+/// timeouts) into work: the main loop, action execution and pseudonode
+/// actions all run in lockstep with it, so while it is parked in its
+/// blocking `Select` with every input channel empty, the node can neither
+/// produce messages nor submit verification requests.
+///
+/// Protocol (all `SeqCst`): the demux first tries a non-blocking select;
+/// only when nothing is ready does it call [`Self::mark_parked`], block,
+/// and on return call [`Self::mark_woken`] BEFORE popping whatever woke it.
+/// An observer therefore reads [`Self::wake_count`] first, then
+/// [`Self::is_parked`] and the channel lengths, then `wake_count` again: an
+/// unchanged count proves the node stayed parked (and so inert) for the
+/// whole observation window.
+#[derive(Debug, Default)]
+pub struct DemuxActivity {
+    parked: AtomicBool,
+    wakes: AtomicU64,
+}
+
+impl DemuxActivity {
+    /// New handle: not parked (a node is busy until its first blocking select).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The demux thread is about to block in its `Select`.
+    pub fn mark_parked(&self) {
+        self.parked.store(true, AtomicOrdering::SeqCst);
+    }
+
+    /// The demux thread's blocking `Select` returned (call before popping).
+    pub fn mark_woken(&self) {
+        self.parked.store(false, AtomicOrdering::SeqCst);
+        self.wakes.fetch_add(1, AtomicOrdering::SeqCst);
+    }
+
+    /// True while the demux thread is blocked with nothing ready.
+    pub fn is_parked(&self) -> bool {
+        self.parked.load(AtomicOrdering::SeqCst)
+    }
+
+    /// Number of times the blocking select has returned.
+    pub fn wake_count(&self) -> u64 {
+        self.wakes.load(AtomicOrdering::SeqCst)
+    }
 }
 
 // ---------------------------------------------------------------------------

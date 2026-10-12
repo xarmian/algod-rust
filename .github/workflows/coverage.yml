@@ -67,13 +67,14 @@ jobs:
       # heavier integration/proptest suites inside the job budget.
       #
       # Runs under cargo-nextest (`cargo llvm-cov nextest`) with `--retries 2`
-      # and `--no-fail-fast`: the real-thread multi-node agreement suites
-      # (`crates/core/algo-agreement/tests/service_multi_node_test.rs`) and
-      # a few timing-based sync tests are inherently sensitive to CPU
-      # contention on a shared 4-core runner (a different test of that
-      # suite flaked intermittently; issue #1693), so a test that
+      # and `--no-fail-fast`: a few timing-based sync tests (issue #1723) are
+      # sensitive to CPU contention on a shared 4-core runner, so a test that
       # fails once is retried and only fails the job if it
-      # fails every attempt. nextest lists such tests as FLAKY in the log,
+      # fails every attempt. The multi-node agreement suite
+      # (`crates/core/algo-agreement/tests/service_multi_node_test.rs`) no
+      # longer needs this since #1695 (exact quiescence accounting); the
+      # retries are kept here only until the scheduled runs show no FLAKY
+      # entries (tracked on #1823). nextest lists such tests as FLAKY in the log,
       # so they stay visible. `--no-fail-fast` makes one log show every
       # failing test instead of stopping at the first failing binary.
       # nextest does not run doctests, matching the previous

@@ -1355,8 +1355,48 @@ impl Player {
         delegated_e: FilterableMessageEvent,
         params: &ConsensusParams,
     ) -> Vec<Action> {
+        // Mirrors the `defer` at the top of Go's proposal-vote branch in
+        // `player.handleMessageEvent` (agreement/player.go:596-612): the
+        // attached tail (a compound message's payload) is processed on
+        // EVERY return path of the proposal-vote handling, including the
+        // malformed / filtered early returns, unless the vote was handed
+        // off for verification (`votePresent` -> `doneProcessing = false`;
+        // its tail then rides the `Pending` table to `voteVerified`).
+        // Issue #1695: the early returns used to skip it, so a compound
+        // message whose vote this node had already seen (and so filtered as
+        // a duplicate) silently lost its proposal payload.
+        let tail = e.tail.clone();
+        let event_type = e.t;
+        let task_index = e.task_index;
+        let mut done_processing = true;
+        let mut actions =
+            self.handle_proposal_vote_inner(router, e, delegated_e, params, &mut done_processing);
+        if done_processing {
+            let tail_to_process = if event_type == EventType::VoteVerified {
+                self.pending.pop(task_index).or(tail)
+            } else {
+                tail
+            };
+            if let Some(tail_event) = tail_to_process {
+                let ev = *tail_event;
+                let suffix = self.handle(router, Event::Message(ev), params);
+                actions.extend(suffix);
+            }
+        }
+        actions
+    }
+
+    /// Body of [`Self::handle_proposal_vote`]; clears `done_processing`
+    /// when the vote is handed to the crypto verifier (tail deferred).
+    fn handle_proposal_vote_inner(
+        &mut self,
+        router: &mut RootRouter,
+        e: MessageEvent,
+        delegated_e: FilterableMessageEvent,
+        params: &ConsensusParams,
+        done_processing: &mut bool,
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
-        let done_processing = true;
 
         let ef = router.dispatch(
             self,
@@ -1414,7 +1454,7 @@ impl Player {
         }
 
         if e.t == EventType::VotePresent {
-            let _ = done_processing; // suppress unused assignment warning
+            *done_processing = false;
             let seq = self.pending.push(e.tail.clone());
             let uv = &e.input.unauthenticated_vote;
             actions.push(crate::actions::verify_vote_action(
@@ -1475,21 +1515,6 @@ impl Player {
                         message_handle: crate::actions::handle_of(&e),
                         ..NetworkAction::default()
                     })));
-                }
-            }
-
-            // Process tail if present
-            if done_processing {
-                let tail_to_process = if e.t == EventType::VoteVerified {
-                    self.pending.pop(e.task_index).or(e.tail.clone())
-                } else {
-                    e.tail.clone()
-                };
-
-                if let Some(tail_event) = tail_to_process {
-                    let ev = *tail_event;
-                    let suffix = self.handle(router, Event::Message(ev), params);
-                    actions.extend(suffix);
                 }
             }
         }

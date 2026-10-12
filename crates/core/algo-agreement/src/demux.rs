@@ -47,7 +47,7 @@ use crate::events::{
 };
 use crate::ledger_reader::LedgerReader;
 use crate::traits::{
-    AgreementNetwork, CryptoResult, CryptoVerifier, CryptoVoteVerifyResult, Message,
+    AgreementNetwork, CryptoResult, CryptoVerifier, CryptoVoteVerifyResult, DemuxActivity, Message,
     AGREEMENT_VOTE_TAG, PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
 };
 use crate::types::{Deadline, TimeoutType};
@@ -299,6 +299,10 @@ pub struct Demux {
     /// `Clock` so tests can advance deterministically. Mirrors Go's
     /// `demux.s.Clock` access pattern.
     clock: Arc<dyn Clock>,
+
+    /// Optional exact-idleness probe (see [`DemuxActivity`]); `None` in
+    /// production, so the blocking select path is unchanged there.
+    activity: Option<Arc<DemuxActivity>>,
 }
 
 impl std::fmt::Debug for Demux {
@@ -340,7 +344,13 @@ impl Demux {
             network: None,
             ledger: None,
             clock,
+            activity: None,
         }
+    }
+
+    /// Install an exact-idleness probe (issue #1695); see [`DemuxActivity`].
+    pub fn set_activity(&mut self, activity: Arc<DemuxActivity>) {
+        self.activity = Some(activity);
     }
 
     /// Set the network reference used for disconnecting peers on decode errors.
@@ -505,7 +515,23 @@ impl Demux {
             // so this is an intentional alignment rather than a regression. The
             // "both already elapsed" tie is also far rarer now that `do_rezero_action`
             // re-zeros the active clock on `Action::Rezero`.
-            let oper = sel.select();
+            //
+            // With an idleness probe installed (test harnesses only), try a
+            // non-blocking select first and publish "parked" only when
+            // nothing is ready, so "parked" always means "blocked with every
+            // input empty" (issue #1695).
+            let oper = match &self.activity {
+                None => sel.select(),
+                Some(activity) => match sel.try_select() {
+                    Ok(oper) => oper,
+                    Err(_) => {
+                        activity.mark_parked();
+                        let oper = sel.select();
+                        activity.mark_woken();
+                        oper
+                    }
+                },
+            };
             let index = oper.index();
 
             // -- Deadline timeouts (clock-provided) --

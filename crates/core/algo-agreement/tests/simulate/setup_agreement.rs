@@ -46,8 +46,8 @@ use std::sync::Arc;
 use algo_agreement::stubs::StubBlockValidator;
 use algo_agreement::{
     AccountSigningKeys, AsyncCryptoVerifier, Clock, CryptoVerifier, NoOpValidator, Parameters,
-    ProposeBroadcastHook, RandomSource, Service, ServiceHandle, AGREEMENT_VOTE_TAG,
-    PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
+    ProposeBroadcastHook, RandomSource, Service, ServiceHandle, PROPOSAL_PAYLOAD_TAG,
+    VOTE_BUNDLE_TAG,
 };
 use algo_types::{ConsensusParams, Round};
 
@@ -109,55 +109,47 @@ impl<BV: algo_agreement::BlockValidator + Send + Sync + 'static> AgreementCluste
             .map(|v| v.pending_proposal_validations())
             .sum()
     }
-    /// Block until every node's demux/pseudonode-reported queues, every
-    /// network channel, AND every node's crypto-verifier output channels
-    /// (votes/proposals/bundles verified but not yet drained by that node's
-    /// demux thread) are empty and stay empty for the debounce window.
+    /// Block until the cluster is EXACTLY quiet (issue #1695): every node's
+    /// demux thread is parked in its blocking select with nothing ready,
+    /// every network channel is empty, and every verifier has no
+    /// outstanding request and empty output channels, all inside one
+    /// window in which no node woke. No debounce, no dependence on
+    /// scheduling speed; see `activity_monitor.rs`'s module comment for the
+    /// argument.
     ///
-    /// Root-cause note (issue #920): this previously folded in a stubbed
-    /// `|| 0` for the verifier-backlog term, even though
-    /// `ActivityMonitor::wait_for_quiet`'s own doc comment claimed to check
-    /// it. Under real-thread scheduling, a proposal payload can finish
-    /// async verification (landing in `AsyncCryptoVerifier`'s output
-    /// channel) in the same narrow window the poll sees every OTHER queue
-    /// at zero, so `wait_for_quiet` returned before that node's demux
-    /// thread actually drained and processed the result — i.e. before
-    /// `staged_value` reflected it. `fast_recovery_late_five_node`/
-    /// `fast_recovery_redo_five_node` (multi-fire fast-recovery scenarios
-    /// spanning several settle points in quick succession) hit this gap
-    /// often enough to be genuinely flaky; folding the verifiers' output
-    /// channels into the quiescence check closes it.
+    /// History: issue #920 added the verifier output channels to the old
+    /// channel-length heuristic, #825 `pending_proposal_validations`, and
+    /// #1693/#1694 an in-flight counter; each closed one window between
+    /// "dequeued" and "counted" but the heuristic stayed load-sensitive.
+    /// `outstanding_verifications` counts from before enqueue until the
+    /// result is in an output channel, subsuming all of those.
     ///
-    /// Also folds in `pending_proposal_validations()` (issue #825's
-    /// coservice-count-equivalent primitive, added for the `8ba23942`
-    /// investigation): a request that has been dequeued from
-    /// `proposal_in_rx` but not yet resolved to `proposal_out_rx` (e.g.
-    /// blocked inside a [`super::suspendable_validator::SuspendableBlockValidator`])
-    /// is invisible to every OTHER term here (it has left the input
-    /// channel but hasn't reached the output channel yet), so without this
-    /// a driver that suspends validation mid-scenario would see a false
-    /// "quiet" instead of the genuine stall. A caller that deliberately
-    /// suspends a validator and wants to keep making progress elsewhere
-    /// must poll `pending_proposal_validations()` directly instead of
-    /// calling `wait_for_quiet()` during the suspended window — this method
-    /// will now correctly refuse to report quiescence until resumed.
+    /// A request blocked inside a
+    /// [`super::suspendable_validator::SuspendableBlockValidator`] stays
+    /// outstanding, so this correctly refuses to report quiescence until the
+    /// validator is resumed. A caller that deliberately suspends a validator
+    /// and wants to keep making progress elsewhere must poll
+    /// `pending_proposal_validations()` directly instead of calling this
+    /// during the suspended window.
     pub fn wait_for_quiet(&self) {
         self.monitor
             .wait_for_quiet(&self.network, &self.clocks, || {
-                self.verifiers
-                    .iter()
-                    .map(|v| {
-                        v.verified_votes().len()
-                            + v.verified(PROPOSAL_PAYLOAD_TAG).len()
-                            + v.verified(VOTE_BUNDLE_TAG).len()
-                            + v.pending_proposal_validations()
-                            + v.in_flight_verifications()
-                            + (v.channel_full(AGREEMENT_VOTE_TAG)
-                                || v.channel_full(PROPOSAL_PAYLOAD_TAG)
-                                || v.channel_full(VOTE_BUNDLE_TAG))
-                                as usize
-                    })
-                    .sum()
+                let ledger_work: usize = self.ledgers.iter().map(|l| l.pending_work()).sum();
+                ledger_work
+                    + self
+                        .verifiers
+                        .iter()
+                        .map(|v| {
+                            // ORDER MATTERS: outstanding first, then the output
+                            // channels. A worker sends its result before the
+                            // outstanding count drops, so a result is always visible
+                            // in at least one of the two (issue #1695).
+                            v.outstanding_verifications()
+                                + v.verified_votes().len()
+                                + v.verified(PROPOSAL_PAYLOAD_TAG).len()
+                                + v.verified(VOTE_BUNDLE_TAG).len()
+                        })
+                        .sum::<usize>()
             });
     }
 

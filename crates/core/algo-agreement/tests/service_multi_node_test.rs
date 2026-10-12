@@ -150,9 +150,8 @@ fn trigger_global_timeout<BV: algo_agreement::BlockValidator + Send + Sync + 'st
     cluster: &AgreementCluster<BV>,
     timeout_type: TimeoutType,
 ) {
-    for clock in &cluster.clocks {
-        clock.fire(timeout_type);
-    }
+    let clocks: Vec<_> = cluster.clocks.iter().collect();
+    crate::simulate::testing_clock::TestingClock::fire_all(&clocks, timeout_type);
     cluster.wait_for_quiet();
 }
 
@@ -162,9 +161,8 @@ fn trigger_subset_timeout(
     indices: &[usize],
     timeout_type: TimeoutType,
 ) {
-    for &i in indices {
-        cluster.clocks[i].fire(timeout_type);
-    }
+    let clocks: Vec<_> = indices.iter().map(|&i| &cluster.clocks[i]).collect();
+    crate::simulate::testing_clock::TestingClock::fire_all(&clocks, timeout_type);
     cluster.wait_for_quiet();
 }
 
