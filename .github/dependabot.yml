@@ -38,6 +38,19 @@ updates:
         update-types: ["version-update:semver-minor", "version-update:semver-major"]
       - dependency-name: "hkdf"
         update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      # k256/p256/sha3 0.14/0.12 break the AVM ecdsa and Falcon/SHAKE call
+      # sites (to_encoded_point, sha3::Shake256) and belong to the same
+      # RustCrypto elliptic-curve/digest train as sha2/hkdf above.
+      - dependency-name: "k256"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "p256"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "sha3"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      # hickory-resolver 0.26.3 validates the mainnet SRV set unreliably
+      # (issue #1828); the ignored live test guards the next release.
+      - dependency-name: "hickory-resolver"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
