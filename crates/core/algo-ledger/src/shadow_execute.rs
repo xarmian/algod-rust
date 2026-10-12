@@ -43,7 +43,7 @@ use std::sync::OnceLock;
 use algo_error::AlgoError;
 use algo_types::{AccountData, Address, Block, Transaction};
 
-use crate::apply::{apply_block_impl_ex, ApplyData, ApplyMode, ExecProbe, KvModsMap};
+use crate::apply::{apply_block_impl_ex, ApplyData, ApplyMode, ExecProbe, KvModsMap, ProbeRequest};
 use crate::eval_delta::{parse_eval_delta, EvalDelta, ValueDelta};
 use crate::recording_store::{RecordingStore, ResourceTouches};
 use crate::store_trait::LedgerStore;
@@ -879,9 +879,12 @@ pub fn scratch_execute_payset<L: LedgerStore>(
     // Input flag (reviewed, intentional): only this final epilogue apply
     // needs the post-payset sink balance.
     let mut probe = ExecProbe {
-        want_fee_sink_available: true,
-        knock_offline_exclude: lists.as_ref().map(|l| l.own_addresses.clone()),
-        knock_offline_gate: lists.and_then(|l| l.fits),
+        request: ProbeRequest {
+            want_fee_sink_available: true,
+            knock_offline_exclude: lists.as_ref().map(|l| l.own_addresses.clone()),
+            knock_offline_gate: lists.and_then(|l| l.fits),
+            ..Default::default()
+        },
         ..Default::default()
     };
     scratch_execute_with(store, block, &mut probe)
@@ -912,7 +915,10 @@ pub enum PayoutCheck {
 /// [`PayoutCheck::NoVerdict`].
 pub fn scratch_validate_payouts<L: LedgerStore>(store: &mut L, block: &Block) -> PayoutCheck {
     let mut probe = ExecProbe {
-        validate_payouts: true,
+        request: ProbeRequest {
+            validate_payouts: true,
+            ..Default::default()
+        },
         ..Default::default()
     };
     match scratch_execute_with(store, block, &mut probe) {
@@ -981,16 +987,16 @@ fn scratch_execute_with<L: LedgerStore>(
         Err(_) => Err(ScratchFailure::Other(AlgoError::Ledger {
             message: "scratch Execute evaluation panicked".into(),
         })),
-        Ok(Err(error)) => match probe.failed_txn_index {
+        Ok(Err(error)) => match probe.out.failed_txn_index {
             Some(index) if index < block.payset.len() => Err(ScratchFailure::Txn { index, error }),
             _ => Err(ScratchFailure::Other(error)),
         },
         Ok(Ok(())) => Ok(ScratchPayset {
             apply_data: ad,
-            final_txn_counter: probe.final_txn_counter,
-            final_state_proof_next: probe.final_state_proof_next,
-            final_fee_sink_available: probe.final_fee_sink_available,
-            knock_offline_lists: probe.knock_offline_lists.take(),
+            final_txn_counter: probe.out.final_txn_counter,
+            final_state_proof_next: probe.out.final_state_proof_next,
+            final_fee_sink_available: probe.out.final_fee_sink_available,
+            knock_offline_lists: probe.out.knock_offline_lists.take(),
         }),
     }
 }

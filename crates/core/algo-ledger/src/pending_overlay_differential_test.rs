@@ -49,7 +49,7 @@ use algo_types::{
     CONSENSUS_V41,
 };
 
-use crate::apply::{apply_block_impl_probe, ApplyData, ApplyMode, ExecProbe};
+use crate::apply::{apply_block_impl_probe, ApplyData, ApplyMode, ExecProbe, ProbeRequest};
 use crate::pending_overlay::{OverlayStore, PendingOverlay};
 use crate::proposal_eval::evaluate_group;
 use crate::sqlite::SqliteLedger;
@@ -111,7 +111,10 @@ fn apply_direct(
     block.payset = group.to_vec();
     let mut ad = Vec::new();
     let mut probe = ExecProbe {
-        skip_epilogue: true,
+        request: ProbeRequest {
+            skip_epilogue: true,
+            ..ProbeRequest::default()
+        },
         ..ExecProbe::default()
     };
     apply_block_impl_probe(
@@ -126,8 +129,8 @@ fn apply_direct(
         true,
         Some(&mut probe),
     )?;
-    l.set_txn_counter(probe.final_txn_counter);
-    Ok((ad, probe.final_txn_counter))
+    l.set_txn_counter(probe.out.final_txn_counter);
+    Ok((ad, probe.out.final_txn_counter))
 }
 
 fn approval_program() -> Vec<u8> {
