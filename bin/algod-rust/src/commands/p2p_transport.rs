@@ -3456,7 +3456,12 @@ impl GossipNode for P2pTransport {
         // second overwriting the first.
         let mut guard = self.http_router.lock().expect("http_router mutex poisoned");
         let existing = std::mem::replace(&mut *guard, Router::new());
-        *guard = existing.nest(path, handler);
+        // axum 0.8 rejects `nest("/", ..)`; a root mount is a merge.
+        *guard = if path == "/" || path.is_empty() {
+            existing.merge(handler)
+        } else {
+            existing.nest(path, handler)
+        };
     }
 }
 

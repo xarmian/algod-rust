@@ -134,7 +134,7 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
     let authenticated = Router::new()
         .route("/v2/status", get(handlers::get_status::<N>))
         .route(
-            "/v2/status/wait-for-block-after/:round",
+            "/v2/status/wait-for-block-after/{round}",
             get(handlers::wait_for_block::<N>),
         )
         .route(
@@ -142,11 +142,11 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             get(handlers::transaction_params::<N>),
         )
         .route(
-            "/v2/accounts/:address",
+            "/v2/accounts/{address}",
             get(handlers::account_information::<N>),
         )
         .route(
-            "/v2/accounts/:address/assets/:asset-id",
+            "/v2/accounts/{address}/assets/{asset-id}",
             get(handlers::account_asset_information::<N>),
         )
         // go-algorand v4.6.0-stable (PR #6559) moved this endpoint out of
@@ -155,11 +155,11 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
         // generated/nonparticipating/public/routes.go`), unconditionally
         // serving it regardless of `EnableExperimentalAPI` — see issue #506.
         .route(
-            "/v2/accounts/:address/assets",
+            "/v2/accounts/{address}/assets",
             get(handlers::account_assets_information::<N>),
         )
         .route(
-            "/v2/accounts/:address/applications/:application-id",
+            "/v2/accounts/{address}/applications/{application-id}",
             get(handlers::account_application_information::<N>),
         )
         // New in go-algorand v4.6.0-stable (PR #6552) — registered in the
@@ -167,29 +167,29 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
         // the analogous `/assets` pagination endpoint now lives (#506).
         // See issue #505.
         .route(
-            "/v2/accounts/:address/applications",
+            "/v2/accounts/{address}/applications",
             get(handlers::account_applications_information::<N>),
         )
         .route(
-            "/v2/applications/:application-id",
+            "/v2/applications/{application-id}",
             get(handlers::get_application_by_id::<N>),
         )
-        .route("/v2/assets/:asset-id", get(handlers::get_asset_by_id::<N>))
+        .route("/v2/assets/{asset-id}", get(handlers::get_asset_by_id::<N>))
         .route(
-            "/v2/applications/:application-id/box",
+            "/v2/applications/{application-id}/box",
             get(handlers::get_application_box_by_name::<N>),
         )
         .route(
-            "/v2/applications/:application-id/boxes",
+            "/v2/applications/{application-id}/boxes",
             get(handlers::get_application_boxes::<N>),
         )
-        .route("/v2/blocks/:round", get(handlers::get_block::<N>))
-        .route("/v2/blocks/:round/hash", get(handlers::get_block_hash::<N>))
+        .route("/v2/blocks/{round}", get(handlers::get_block::<N>))
+        .route("/v2/blocks/{round}/hash", get(handlers::get_block_hash::<N>))
         .route(
-            "/v2/blocks/:round/txids",
+            "/v2/blocks/{round}/txids",
             get(handlers::get_block_txids::<N>),
         )
-        .route("/v2/blocks/:round/logs", get(handlers::get_block_logs::<N>))
+        .route("/v2/blocks/{round}/logs", get(handlers::get_block_logs::<N>))
         .route("/v2/transactions", post(handlers::raw_transaction::<N>))
         .route(
             "/v2/transactions/simulate",
@@ -200,33 +200,33 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             get(handlers::get_pending_transactions::<N>),
         )
         .route(
-            "/v2/transactions/pending/:txid",
+            "/v2/transactions/pending/{txid}",
             get(handlers::pending_transaction_information::<N>),
         )
         .route(
-            "/v2/accounts/:address/transactions/pending",
+            "/v2/accounts/{address}/transactions/pending",
             get(handlers::get_pending_transactions_by_address::<N>),
         )
         .route(
-            "/v2/blocks/:round/transactions/:txid/proof",
+            "/v2/blocks/{round}/transactions/{txid}/proof",
             get(handlers::get_transaction_proof::<N>),
         )
         .route(
-            "/v2/blocks/:round/lightheader/proof",
+            "/v2/blocks/{round}/lightheader/proof",
             get(handlers::get_light_block_header_proof::<N>),
         )
         .route("/v2/ledger/supply", get(handlers::get_supply::<N>))
         .route(
-            "/v2/stateproofs/:round",
+            "/v2/stateproofs/{round}",
             get(handlers::get_state_proof::<N>),
         )
-        .route("/v2/deltas/:round", get(handlers::get_state_delta::<N>))
+        .route("/v2/deltas/{round}", get(handlers::get_state_delta::<N>))
         .route(
-            "/v2/deltas/txn/group/:id",
+            "/v2/deltas/txn/group/{id}",
             get(handlers::get_txn_group_delta::<N>),
         )
         .route(
-            "/v2/deltas/:round/txn/group",
+            "/v2/deltas/{round}/txn/group",
             get(handlers::get_txn_group_deltas_for_round::<N>),
         )
         .route("/v2/teal/compile", post(handlers::teal_compile::<N>))
@@ -248,7 +248,7 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             get(handlers::get_block_timestamp_offset::<N>),
         )
         .route(
-            "/v2/devmode/blocks/offset/:offset",
+            "/v2/devmode/blocks/offset/{offset}",
             post(handlers::set_block_timestamp_offset::<N>),
         );
     // `MaxRequestBodyBytes` (issue #953): applied unconditionally, exactly
@@ -272,7 +272,7 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
     // Admin routes (admin API token required)
     let admin = Router::new()
         .route(
-            "/v2/catchup/:catchpoint",
+            "/v2/catchup/{catchpoint}",
             post(handlers::start_catchup::<N>).delete(handlers::abort_catchup::<N>),
         )
         .route("/v2/shutdown", post(handlers::shutdown_node::<N>))
@@ -298,11 +298,11 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             get(handlers::get_participation_keys::<N>).post(handlers::add_participation_key::<N>),
         )
         .route(
-            "/v2/participation/generate/:address",
+            "/v2/participation/generate/{address}",
             post(handlers::generate_participation_keys::<N>),
         )
         .route(
-            "/v2/participation/:participation-id",
+            "/v2/participation/{participation-id}",
             get(handlers::get_participation_key_by_id::<N>)
                 .delete(handlers::delete_participation_key_by_id::<N>)
                 .post(handlers::append_keys::<N>),
@@ -338,7 +338,7 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
                 get(handlers::get_sync_round::<N>).delete(handlers::unset_sync_round::<N>),
             )
             .route(
-                "/v2/ledger/sync/:round",
+                "/v2/ledger/sync/{round}",
                 post(handlers::set_sync_round::<N>),
             )
             .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES));

@@ -1690,7 +1690,7 @@ impl WebsocketNetwork {
     /// Includes the gossip WebSocket upgrade endpoint, the health service,
     /// and any routes registered via [`GossipNode::register_http_handler`].
     fn build_relay_router(self: &Arc<Self>) -> Router {
-        let gossip_path = "/v1/:genesis_id/gossip";
+        let gossip_path = "/v1/{genesis_id}/gossip";
 
         let mut app = Router::new()
             .route(gossip_path, axum::routing::get(gossip_upgrade_handler))
@@ -1708,7 +1708,12 @@ impl WebsocketNetwork {
             std::mem::take(&mut *guard)
         };
         for (path, handler) in handlers {
-            app = app.nest(&path, handler);
+            // axum 0.8 rejects `nest("/", ..)`; a root mount is a merge.
+            app = if path == "/" || path.is_empty() {
+                app.merge(handler)
+            } else {
+                app.nest(&path, handler)
+            };
         }
 
         // Issue #1088 / go's `EnableRequestLogger`: log every incoming HTTP

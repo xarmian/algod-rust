@@ -95,7 +95,7 @@ pub const TX_SYNC_RESPONSE_CONTENT_TYPE: &str = "application/x-algorand-ptx-v1";
 
 /// go's real path: `TxServiceHTTPPath = "/v1/{genesisID}/txsync"`
 /// (`rpcs/txService.go`).
-const TX_SYNC_HTTP_PATH: &str = "/v1/:genesis_id/txsync";
+const TX_SYNC_HTTP_PATH: &str = "/v1/{genesis_id}/txsync";
 
 /// Hard cap on the request body size read by the HTTP layer before this
 /// handler ever sees it. A legitimate Bloom filter (even sized for a
@@ -327,7 +327,7 @@ impl TxSyncService {
 
     /// Build an [`axum::Router`] for the HTTP tx-sync endpoint.
     ///
-    /// Registers `POST /v1/:genesis_id/txsync` — go's real path
+    /// Registers `POST /v1/{genesis_id}/txsync` — go's real path
     /// (`TxServiceHTTPPath`). When a [`TxSyncPeerLimiter`] is installed,
     /// requests are identified by the caller's source IP via axum's
     /// `ConnectInfo<SocketAddr>` extractor — the router must therefore be

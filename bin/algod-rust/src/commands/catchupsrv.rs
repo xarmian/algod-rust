@@ -163,7 +163,7 @@ async fn serve_block(
 /// route (`/v{version}/{genesisID}/block/{round}`) from `dir`.
 pub fn router(dir: PathBuf) -> Router {
     Router::new()
-        .route("/v:version/:genesis_id/block/:round", get(serve_block))
+        .route("/v{version}/{genesis_id}/block/{round}", get(serve_block))
         .with_state(ServerState { dir })
 }
 
