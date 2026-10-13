@@ -740,7 +740,9 @@ fn circulation_matches_locked_path() {
 /// Run with `--nocapture` to see them.
 #[test]
 fn new_pool_reads_do_not_wait_for_a_held_ledger_mutex() {
-    const HOLD: Duration = Duration::from_millis(300);
+    // 1 s: keeps the `HOLD / 2` bound wide when the test thread is
+    // descheduled under heavy parallel load (failed once at 300 ms).
+    const HOLD: Duration = Duration::from_millis(1000);
     let (_d, mut l) = circulation_ledger();
     stage_ops(&mut l, 6, |l| {
         l.set_asset_params(1, asset_record(1, 10));

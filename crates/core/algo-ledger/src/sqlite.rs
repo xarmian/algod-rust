@@ -6122,6 +6122,78 @@ impl SqliteLedger {
         self.knock_dirty.clear();
     }
 
+    /// The addresses of the online accounts strictly after `after`, ascending.
+    ///
+    /// Read from the covering partial index `onlineaccountbals`
+    /// (`normalizedonlinebalance, address, data WHERE normalizedonlinebalance>0`)
+    /// and sorted in memory: a query that asks the planner for
+    /// `ORDER BY address LIMIT n` instead walks the whole `accountbase` in
+    /// address order and filters, which on a mainnet-sized table (22M accounts,
+    /// ~0.1% online) held the ledger mutex for minutes (nightly soak
+    /// 38364863591, issue #1909 follow-up). The online set is small, so the
+    /// index scan plus sort is a few milliseconds.
+    fn online_addresses_after(&self, after: Option<&Address>) -> Vec<[u8; 32]> {
+        let mut out: Vec<[u8; 32]> = Vec::new();
+        let sql = if after.is_some() {
+            "SELECT address FROM accountbase WHERE normalizedonlinebalance > 0 AND address > ?1"
+        } else {
+            "SELECT address FROM accountbase WHERE normalizedonlinebalance > 0"
+        };
+        let mut stmt = match self.conn.prepare_cached(sql) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("online_addresses_after: prepare error: {e}");
+                return out;
+            }
+        };
+        fn read_addr(r: &rusqlite::Row<'_>) -> rusqlite::Result<Vec<u8>> {
+            r.get::<_, Vec<u8>>(0)
+        }
+        let mut push = |row: rusqlite::Result<Vec<u8>>| match row
+            .map(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        {
+            Ok(Some(a)) => out.push(a),
+            Ok(None) => tracing::error!("online_addresses_after: bad address length"),
+            Err(e) => tracing::error!("online_addresses_after: row read error: {e}"),
+        };
+        match after {
+            Some(a) => match stmt.query_map(params![a.0.to_vec()], read_addr) {
+                Ok(rows) => rows.for_each(&mut push),
+                Err(e) => tracing::error!("online_addresses_after: query error: {e}"),
+            },
+            None => match stmt.query_map([], read_addr) {
+                Ok(rows) => rows.for_each(&mut push),
+                Err(e) => tracing::error!("online_addresses_after: query error: {e}"),
+            },
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// The `Online` account stored at `addr` (a point lookup on the unique
+    /// address index), `None` when absent, not online or undecodable.
+    fn online_account_at(&self, addr: &[u8; 32]) -> Option<AccountData> {
+        let data: Option<Vec<u8>> = self
+            .conn
+            .prepare_cached("SELECT data FROM accountbase WHERE address = ?1")
+            .and_then(|mut st| {
+                st.query_row(params![addr.as_slice()], |r| r.get::<_, Option<Vec<u8>>>(0))
+                    .optional()
+            })
+            .map_err(|e| tracing::error!("online_account_at: lookup error: {e}"))
+            .ok()
+            .flatten()
+            .flatten();
+        match decode_account_data(&data?) {
+            Ok(account) if account.status == AccountStatus::Online => Some(account),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::error!("online_account_at: decode error: {e}");
+                None
+            }
+        }
+    }
+
     /// Keyset page of the ordered online stream (issue #1895): the online
     /// accounts with an address strictly after `after`, scanning at most
     /// `max_rows` rows. `Some(last address scanned)` when more rows remain,
@@ -6132,61 +6204,20 @@ impl SqliteLedger {
         max_rows: usize,
         visit: &mut dyn FnMut(Address, AccountData) -> bool,
     ) -> Option<Address> {
-        // One extra row tells whether more remain without a trailing empty page.
-        let limit = i64::try_from(max_rows.saturating_add(1)).unwrap_or(i64::MAX);
-        let after_bytes: Vec<u8> = after.map(|a| a.0.to_vec()).unwrap_or_default();
-        let mut stmt = match self.conn.prepare(
-            "SELECT address, data FROM accountbase WHERE normalizedonlinebalance > 0              AND address > ?1 ORDER BY address LIMIT ?2",
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("online_account_page: prepare error: {e}");
-                return None;
-            }
-        };
-        let mut rows = match stmt.query(params![after_bytes, limit]) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("online_account_page: query error: {e}");
-                return None;
-            }
-        };
-        let mut scanned = 0usize;
+        let addrs = self.online_addresses_after(after);
         let mut last: Option<Address> = None;
-        loop {
-            let row = match rows.next() {
-                Ok(Some(r)) => r,
-                Ok(None) => return None,
-                Err(e) => {
-                    tracing::error!("online_account_page: row read error: {e}");
+        for (scanned, addr) in addrs.iter().enumerate() {
+            if scanned >= max_rows {
+                return last; // more remain
+            }
+            last = Some(Address(*addr));
+            if let Some(account) = self.online_account_at(addr) {
+                if !visit(Address(*addr), account) {
                     return None;
                 }
-            };
-            if scanned >= max_rows {
-                return last; // the lookahead row: more remain
-            }
-            scanned += 1;
-            let (Ok(addr_bytes), Ok(data)) = (row.get_ref(0), row.get_ref(1)) else {
-                continue;
-            };
-            let (Ok(addr_bytes), Ok(data)) = (addr_bytes.as_blob(), data.as_blob()) else {
-                continue;
-            };
-            let Ok(addr_arr) = <[u8; 32]>::try_from(addr_bytes) else {
-                tracing::error!("online_account_page: bad address length");
-                continue;
-            };
-            last = Some(Address(addr_arr));
-            match decode_account_data(data) {
-                Ok(account) if account.status == AccountStatus::Online => {
-                    if !visit(Address(addr_arr), account) {
-                        return None;
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => tracing::error!("online_account_page: decode error: {e}"),
             }
         }
+        None
     }
 
     fn knock_pending_addresses(&self) -> std::collections::HashSet<Address> {
@@ -8490,52 +8521,15 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn for_each_online_account_ordered(&self, visit: &mut dyn FnMut(Address, AccountData) -> bool) {
-        // Stream in `accountbase_address_idx` order and stop early: no Vec of
-        // every decoded account, no sort (issue #1817).
-        let mut stmt = match self.conn.prepare(
-            "SELECT address, data FROM accountbase WHERE normalizedonlinebalance > 0 \
-             ORDER BY address",
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("for_each_online_account_ordered: prepare error: {e}");
-                return;
-            }
-        };
-        let mut rows = match stmt.query([]) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("for_each_online_account_ordered: query error: {e}");
-                return;
-            }
-        };
-        loop {
-            let row = match rows.next() {
-                Ok(Some(r)) => r,
-                Ok(None) => return,
-                Err(e) => {
-                    tracing::error!("for_each_online_account_ordered: row read error: {e}");
+        // Ascending address order with early exit (issue #1817): the online
+        // addresses come from the covering partial index and are sorted in
+        // memory, the account rows are point-looked-up lazily (see
+        // `online_addresses_after` for why not `ORDER BY address`).
+        for addr in self.online_addresses_after(None) {
+            if let Some(account) = self.online_account_at(&addr) {
+                if !visit(Address(addr), account) {
                     return;
                 }
-            };
-            let (Ok(addr_bytes), Ok(data)) = (row.get_ref(0), row.get_ref(1)) else {
-                continue;
-            };
-            let (Ok(addr_bytes), Ok(data)) = (addr_bytes.as_blob(), data.as_blob()) else {
-                continue;
-            };
-            let Ok(addr_arr) = <[u8; 32]>::try_from(addr_bytes) else {
-                tracing::error!("for_each_online_account_ordered: bad address length");
-                continue;
-            };
-            match decode_account_data(data) {
-                Ok(account) if account.status == AccountStatus::Online => {
-                    if !visit(Address(addr_arr), account) {
-                        return;
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => tracing::error!("for_each_online_account_ordered: decode error: {e}"),
             }
         }
     }
@@ -16755,6 +16749,95 @@ mod tests {
         // Once ROLLBACK works again the ledger heals.
         l.begin_block().unwrap();
         assert_eq!(chain_fields(&l), before);
+    }
+
+    /// Issue #1910: the online-set stream must be answered from the covering
+    /// partial index, not by walking `accountbase` in address order (which
+    /// scanned a whole mainnet-sized table while holding the ledger mutex).
+    #[test]
+    fn online_address_queries_use_the_covering_partial_index() {
+        let l = SqliteLedger::open_in_memory().unwrap();
+        for sql in [
+            "SELECT address FROM accountbase WHERE normalizedonlinebalance > 0",
+            "SELECT address FROM accountbase WHERE normalizedonlinebalance > 0 AND address > x'00'",
+        ] {
+            let plan: Vec<String> = l
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            let plan = plan.join(" | ");
+            assert!(
+                plan.contains("onlineaccountbals"),
+                "plan for `{sql}` must use the partial index, got: {plan}"
+            );
+        }
+    }
+
+    /// Issue #1910: mainnet-like density (many offline accounts, few online):
+    /// the ordered stream and the keyset pages return exactly the online
+    /// accounts in ascending address order, and stay fast.
+    #[test]
+    fn ordered_online_stream_on_a_sparse_online_table_is_complete_sorted_and_fast() {
+        let mut l = SqliteLedger::open_in_memory().unwrap();
+        let mut online: Vec<Address> = Vec::new();
+        l.begin_block().unwrap();
+        for n in 0..20_000u32 {
+            let mut a = [0u8; 32];
+            a[..4].copy_from_slice(&n.wrapping_mul(2_654_435_761).to_be_bytes());
+            a[4..8].copy_from_slice(&n.to_be_bytes());
+            let addr = Address(a);
+            let acct = if n % 200 == 0 {
+                online.push(addr);
+                AccountData {
+                    micro_algos: 5_000_000,
+                    status: AccountStatus::Online,
+                    vote_id: Some([7u8; 32]),
+                    selection_id: Some([8u8; 32]),
+                    vote_last_valid: 1_000_000,
+                    ..Default::default()
+                }
+            } else {
+                AccountData {
+                    micro_algos: 1_000_000,
+                    ..Default::default()
+                }
+            };
+            l.set_account(&addr, acct);
+        }
+        l.commit_block().unwrap();
+        online.sort();
+
+        let started = std::time::Instant::now();
+        let mut streamed = Vec::new();
+        l.for_each_online_account_ordered(&mut |a, _| {
+            streamed.push(a);
+            true
+        });
+        assert_eq!(streamed, online);
+
+        // Keyset pages of 7 rows reproduce the same sequence.
+        let mut paged = Vec::new();
+        let mut cursor: Option<Address> = None;
+        loop {
+            let next = l.online_account_page(cursor.as_ref(), 7, &mut |a, _| {
+                paged.push(a);
+                true
+            });
+            match next {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(paged, online);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "online stream too slow: {:?}",
+            started.elapsed()
+        );
     }
 
     fn trivial_block(round: u64, fee_sink: u8) -> algo_types::Block {
