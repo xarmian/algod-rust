@@ -154,3 +154,23 @@ semicolon-separated list of full multiaddrs (including a trailing
 `network/p2p/peerstore.PeerInfoFromAddr`/`AddrInfoFromP2pAddr`), which
 seeds that node's DHT routing table and phonebook with exactly one
 directly-known peer.
+
+## Cert verification on long soaks: `--cert-latest N` (issue #1913)
+
+Verifying the certificate of round `r` needs the online-account state at
+`r - BalanceLookback` (320), and both go-algorand and algod-rust trim
+`onlineaccounts` history to about `tip - 320`. A post-hoc
+`scripts/verify-soak.sh` pass over the early rounds of a soak longer than
+~320 rounds therefore fails for want of voter rows. That is a harness
+timing limit, not a node divergence. `verify-soak.sh --cert-latest N` (or
+`CERT_LATEST=N`) takes the ledger snapshot first and verifies only the
+snapshot's own newest N rounds (N=1 is exact); the fork detector still
+covers the whole range. `consensus-soak.sh` defaults `CERT_LATEST=1` when
+`ROUNDS > 320` (override with `CERT_LATEST=0` or another N), and
+`.github/workflows/p2p-consensus-soak.yml` sets it explicitly for such
+runs. `make p2p-interop-verify CERT_LATEST=N` forwards it for a running
+cluster. Shell test (no Docker):
+`bash ops/mixed-cluster-p2p/scripts/verify_soak_cert_latest_shell_test.sh`
+(also run by `make consensus-cluster-analyzer`). See
+`docs/MIXED_CLUSTER_RUNBOOK.md` ("Cert verification must happen within
+~320 rounds").

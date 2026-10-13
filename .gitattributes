@@ -54,3 +54,7 @@ crates/**/fixtures/**/*.sqlite binary
 # Raw captured canonical-msgpack block data (issue #632's genuine
 # state-proof fixture) -- binary for the same reason as above.
 crates/**/fixtures/**/*.bin binary
+
+# Ops shell scripts must keep LF endings: a CRLF checkout (Windows,
+# core.autocrlf=true) breaks bash ("\r: command not found") (#1913).
+*.sh text eol=lf

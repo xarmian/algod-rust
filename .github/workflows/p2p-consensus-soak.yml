@@ -318,6 +318,12 @@ jobs:
         env:
           OUT_DIR: ${{ github.workspace }}/p2p-soak-artifacts
           ROUNDS: ${{ github.event.inputs.rounds || '200' }}
+          # Issue #1913: post-hoc cert verification only reaches back ~320
+          # rounds (onlineaccounts retention, same as go), so runs longer
+          # than that verify the ledger snapshot's newest round
+          # (verify-soak.sh --cert-latest 1) instead of failing on pruned
+          # voter rows. Shorter runs keep the whole-range pass.
+          CERT_LATEST: ${{ fromJSON(github.event.inputs.rounds || '200') > 320 && '1' || '0' }}
           VERIFY_STAGE: "1"
           RESTART_SCENARIOS: "1"
           NEGATIVE_CASES: "1"

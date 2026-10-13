@@ -792,6 +792,7 @@ consensus-cluster-analyzer: ## Unit-test the #470 soak-analyzer logic (no Docker
 	python3 $(PHASE6_CLUSTER)/scripts/rust_config_merge_test.py
 	bash $(PHASE6_CLUSTER)/scripts/cert_window_shell_test.sh
 	python3 ops/mixed-cluster-p2p/scripts/archival_wiring_test.py
+	bash ops/mixed-cluster-p2p/scripts/verify_soak_cert_latest_shell_test.sh
 
 ## ops/mixed-cluster-p2p harness (issues #543, #560, #564, #589) — three
 ## real go-algorand v5.0.3-stable nodes in plain P2P mode, chain-bootstrapped
@@ -880,7 +881,7 @@ p2p-interop-soak-test: ## Run the #594 soak suite (up + soak + analyze + down); 
 
 p2p-interop-verify: ## Run the #596 fork-detector + bidirectional cert cross-verify stage against a RUNNING P2P cluster
 	cargo build -p algo-fork-detector -p algo-cert-crossverify
-	$(P2P_INTEROP_CLUSTER)/scripts/verify-soak.sh --stride $(or $(CERT_STRIDE),20)
+	$(P2P_INTEROP_CLUSTER)/scripts/verify-soak.sh --stride $(or $(CERT_STRIDE),20) --cert-latest $(or $(CERT_LATEST),0)
 
 p2p-interop-restart: ## Run the #596 restart/rejoin scenarios against a RUNNING P2P cluster
 	cargo build -p algo-fork-detector
