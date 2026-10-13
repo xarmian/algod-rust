@@ -463,14 +463,13 @@ impl AgreementLedgerBridge {
                 .map_err(|e| CommitFailure::new(CommitStage::Store, e))?;
             slow("put_block_cert", t, None);
             let t = std::time::Instant::now();
-            // Issue #1678: per-block follow-path timing. The AVM accumulator
-            // is reset here and taken right after the apply (the only
-            // reset/take site), on this one thread.
-            crate::follow_timing::reset_avm_time();
+            // Issue #1678: per-block follow-path timing. Each apply times its
+            // AVM programs in its own context (issue #1815); the scope only
+            // collects what the apply publishes and the store timers.
+            let scope = crate::follow_timing::FollowScope::begin();
             let applied = crate::apply::apply_block_executing_app_calls(ledger, block);
             let timing = crate::follow_timing::follow_timing();
-            let avm = crate::follow_timing::take_avm_time();
-            let stages = crate::follow_timing::take_stage_times();
+            let (avm, stages) = scope.finish();
             if let Some(avm) = avm {
                 timing.avm.observe(avm);
                 // Issue #1765: store access of blocks that ran programs only,

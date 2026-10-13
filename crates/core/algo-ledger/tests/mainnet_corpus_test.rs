@@ -1014,12 +1014,11 @@ fn sqlite_apply_profile(
 
     ls.begin_block().expect("begin_block");
     let (h0, m0) = ls.read_cache_stats();
-    ft::reset_avm_time();
+    let scope = ft::FollowScope::begin();
     let t = std::time::Instant::now();
     apply_block_capturing_state_proof_next(&mut ls, &block, ApplyMode::Execute).expect("apply");
     let apply = t.elapsed();
-    let avm = ft::take_avm_time();
-    let stages = ft::take_stage_times();
+    let (avm, stages) = scope.finish();
     let t = std::time::Instant::now();
     ls.commit_block().expect("commit_block");
     let commit = t.elapsed();
@@ -1124,12 +1123,11 @@ fn profile_heavy_block_apply_attribution() {
         let state = read_value(&dir.join(format!("{round}.state.msgpack")));
         for i in 0..3 {
             let mut ls = build_pre_state(round, &state);
-            algo_ledger::follow_timing::reset_avm_time();
+            let scope = algo_ledger::follow_timing::FollowScope::begin();
             let t = std::time::Instant::now();
             apply_block_capturing_state_proof_next(&mut ls, &block, ApplyMode::Execute).unwrap();
             let apply = t.elapsed();
-            let avm = algo_ledger::follow_timing::take_avm_time().unwrap_or_default();
-            let _ = algo_ledger::follow_timing::take_stage_times();
+            let avm = scope.finish().0.unwrap_or_default();
             println!(
                 "  in-memory #{i}: apply {:7.1} ms, avm {:7.1} ms",
                 apply.as_secs_f64() * 1e3,

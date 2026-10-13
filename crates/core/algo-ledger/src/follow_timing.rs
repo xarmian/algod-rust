@@ -234,51 +234,202 @@ pub fn process_start_time_prometheus_text() -> String {
     )
 }
 
-thread_local! {
-    /// Accumulated top-level AVM evaluation time of the block currently
-    /// being applied *on this thread*. Single-thread assumption: block
-    /// apply (and therefore every top-level program evaluation, including
-    /// the inner transactions it spawns) runs synchronously on the one
-    /// thread that holds the ledger lock, so a thread-local needs no
-    /// synchronisation. Invariant: the only reset/take site is
-    /// `try_commit_block`, which calls `reset_avm_time` immediately before
-    /// and `take_avm_time` immediately after the apply; applies from other
-    /// paths (catchup replay, simulation) merely accumulate into the
-    /// accumulator, which the next reset discards.
-    static AVM_NANOS: Cell<u64> = const { Cell::new(0) };
+/// Per-apply accumulator of top-level AVM program evaluation time (issue
+/// #1815). Owned by the apply's `ApplyContext` and handed to every
+/// [`AvmTimer`], so each apply has its own state: nested or interleaved
+/// applies on one thread (a scratch apply inside an outer apply, a replay
+/// after an abandoned apply) cannot corrupt each other, and approval and
+/// ClearState programs are measured by the same RAII mechanism.
+///
+/// Inner app calls run inside a top-level program and are not timed
+/// separately, so nothing is counted twice.
+#[derive(Debug, Default)]
+pub struct AvmTiming {
+    nanos: Cell<u64>,
+}
 
-    /// Store-access attribution state (issue #1765), same thread discipline
-    /// as `AVM_NANOS`.
-    static STAGE: StageCells = const {
-        StageCells {
-            active: Cell::new(false),
-            read_nanos: Cell::new(0),
-            write_nanos: Cell::new(0),
-            read_calls: Cell::new(0),
-            write_calls: Cell::new(0),
-            in_avm_nanos: Cell::new(0),
-            depth: Cell::new(0),
-            avm_depth: Cell::new(0),
+impl AvmTiming {
+    /// Total top-level evaluation time so far; `None` when no program ran.
+    pub fn total(&self) -> Option<Duration> {
+        let n = self.nanos.get();
+        (n > 0).then(|| Duration::from_nanos(n))
+    }
+}
+
+/// Guard that adds its lifetime to an [`AvmTiming`] when dropped.
+///
+/// Dropped on every exit path (success, `?`, panic unwind), which is why the
+/// approval and ClearState call sites need no explicit `drop`.
+pub struct AvmTimer<'a> {
+    timing: &'a AvmTiming,
+    start: Instant,
+    thread: ThreadId,
+    /// The scope whose program nesting counter this timer incremented.
+    scope_id: Option<u64>,
+}
+
+impl<'a> AvmTimer<'a> {
+    /// Starts timing a top-level program evaluation into `timing`.
+    pub fn start(timing: &'a AvmTiming) -> Self {
+        let scope_id = SCOPE.with(|c| {
+            let mut s = c.get();
+            if s.id != 0 {
+                s.avm_depth += 1;
+                c.set(s);
+            }
+            (s.id != 0).then_some(s.id)
+        });
+        Self {
+            timing,
+            start: Instant::now(),
+            thread: std::thread::current().id(),
+            scope_id,
         }
+    }
+}
+
+impl Drop for AvmTimer<'_> {
+    fn drop(&mut self) {
+        debug_assert_eq!(
+            self.thread,
+            std::thread::current().id(),
+            "AVM evaluation must start and finish on the apply thread"
+        );
+        let n = u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.timing
+            .nanos
+            .set(self.timing.nanos.get().saturating_add(n));
+        if let Some(id) = self.scope_id {
+            SCOPE.with(|c| {
+                let mut s = c.get();
+                if s.id == id {
+                    s.avm_depth = s.avm_depth.saturating_sub(1);
+                }
+                c.set(s);
+            });
+        }
+    }
+}
+
+/// Publishes an apply's AVM total to the active [`FollowScope`] of this
+/// thread when dropped. The apply entry point holds one for the whole apply,
+/// so every exit path (including errors) reports.
+pub struct AvmPublishGuard<'a>(pub &'a AvmTiming);
+
+impl Drop for AvmPublishGuard<'_> {
+    fn drop(&mut self) {
+        let n = self.0.nanos.get();
+        if n == 0 {
+            return;
+        }
+        SCOPE.with(|c| {
+            let mut s = c.get();
+            if s.id != 0 {
+                s.avm_nanos = s.avm_nanos.saturating_add(n);
+                c.set(s);
+            }
+        });
+    }
+}
+
+/// Thread-local state of the active [`FollowScope`]: the store-access
+/// attribution (issue #1765) and the AVM total published by the applies that
+/// ran inside the scope.
+///
+/// This part has to stay thread-local: the store timers sit on `SqliteLedger`
+/// entry points (`get_*`/`set_*`), which have no handle to the apply context.
+/// Block apply runs synchronously on the one thread holding the ledger lock,
+/// so a thread-local needs no synchronisation, and REST reader threads (no
+/// scope) never measure. Pairing and nesting are enforced by [`FollowScope`]
+/// itself (it saves and restores the previous state), not by call-site
+/// discipline.
+#[derive(Clone, Copy)]
+struct ScopeState {
+    /// Identity of the scope (0 = none): timers started in one scope never
+    /// record into another, even if they outlive it.
+    id: u64,
+    avm_nanos: u64,
+    read_nanos: u64,
+    write_nanos: u64,
+    read_calls: u64,
+    write_calls: u64,
+    in_avm_nanos: u64,
+    /// Store-call nesting (`set_account` reads the old record through
+    /// `get_account`): only the outermost call is timed, so stages never
+    /// double count.
+    depth: u32,
+    /// Top-level program evaluation nesting.
+    avm_depth: u32,
+}
+
+impl ScopeState {
+    const IDLE: Self = Self {
+        id: 0,
+        avm_nanos: 0,
+        read_nanos: 0,
+        write_nanos: 0,
+        read_calls: 0,
+        write_calls: 0,
+        in_avm_nanos: 0,
+        depth: 0,
+        avm_depth: 0,
     };
 }
 
-/// Clears this thread's AVM time accumulator (call before applying a block)
-/// and starts the per-block store-access attribution (issue #1765): until
-/// [`take_stage_times`] the store entry points measured by [`StateTimer`] on
-/// this thread are accumulated. Other threads (REST readers) never measure.
-pub fn reset_avm_time() {
-    AVM_NANOS.with(|c| c.set(0));
-    STAGE.with(|s| {
-        s.active.set(true);
-        s.read_nanos.set(0);
-        s.write_nanos.set(0);
-        s.read_calls.set(0);
-        s.write_calls.set(0);
-        s.in_avm_nanos.set(0);
-        s.depth.set(0);
-        s.avm_depth.set(0);
-    });
+/// Source of scope identities (never 0).
+static NEXT_SCOPE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+thread_local! {
+    static SCOPE: Cell<ScopeState> = const { Cell::new(ScopeState::IDLE) };
+}
+
+/// Measures the applies run on this thread while it is alive (issues #1815,
+/// #1765): the AVM time they publish and the store read/write time of the
+/// ledger entry points measured by [`StateTimer`].
+///
+/// Replaces the former `reset_avm_time` / `take_avm_time` /
+/// `take_stage_times` trio, whose correctness depended on exactly one
+/// reset/take pair. A scope starts from zero, [`FollowScope::finish`] reads
+/// the result, and dropping it (finished or not, e.g. on an early return)
+/// restores the enclosing scope's state, so scopes nest and a forgotten
+/// `finish` cannot leak into the next block.
+pub struct FollowScope {
+    prev: ScopeState,
+}
+
+impl FollowScope {
+    /// Starts measuring on this thread.
+    pub fn begin() -> Self {
+        let id = NEXT_SCOPE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let prev = SCOPE.with(|c| {
+            c.replace(ScopeState {
+                id,
+                ..ScopeState::IDLE
+            })
+        });
+        Self { prev }
+    }
+
+    /// Returns the AVM time (`None` when no program ran) and store-access
+    /// times accumulated since [`FollowScope::begin`], ending the scope.
+    pub fn finish(self) -> (Option<Duration>, StageTimes) {
+        let s = SCOPE.with(Cell::get);
+        let avm = (s.avm_nanos > 0).then(|| Duration::from_nanos(s.avm_nanos));
+        let stages = StageTimes {
+            state_read: Duration::from_nanos(s.read_nanos),
+            state_write: Duration::from_nanos(s.write_nanos),
+            state_in_avm: Duration::from_nanos(s.in_avm_nanos),
+            read_calls: s.read_calls,
+            write_calls: s.write_calls,
+        };
+        (avm, stages)
+    }
+}
+
+impl Drop for FollowScope {
+    fn drop(&mut self) {
+        SCOPE.with(|c| c.set(self.prev));
+    }
 }
 
 /// Store-access split of one block apply (issue #1765).
@@ -320,51 +471,23 @@ impl StageTimes {
     }
 }
 
-/// Returns and clears this thread's store-access times since the last
-/// [`reset_avm_time`] and stops the attribution.
-pub fn take_stage_times() -> StageTimes {
-    STAGE.with(|s| {
-        s.active.set(false);
-        StageTimes {
-            state_read: Duration::from_nanos(s.read_nanos.replace(0)),
-            state_write: Duration::from_nanos(s.write_nanos.replace(0)),
-            state_in_avm: Duration::from_nanos(s.in_avm_nanos.replace(0)),
-            read_calls: s.read_calls.replace(0),
-            write_calls: s.write_calls.replace(0),
-        }
-    })
-}
-
-struct StageCells {
-    active: Cell<bool>,
-    read_nanos: Cell<u64>,
-    write_nanos: Cell<u64>,
-    read_calls: Cell<u64>,
-    write_calls: Cell<u64>,
-    in_avm_nanos: Cell<u64>,
-    /// Store-call nesting (`set_account` reads the old record through
-    /// `get_account`): only the outermost call is timed, so stages never
-    /// double count.
-    depth: Cell<u32>,
-    /// Top-level program evaluation nesting.
-    avm_depth: Cell<u32>,
-}
-
 /// Times one ledger-store entry point into the read or write stage of the
-/// block being applied on this thread (issue #1765). A no-op (one thread-local
-/// flag read) when no apply is being attributed, and for calls nested inside
+/// active [`FollowScope`] on this thread (issue #1765). A no-op (one
+/// thread-local read) when no scope is active, and for calls nested inside
 /// another timed store call.
-pub struct StateTimer(Option<(Instant, bool)>);
+pub struct StateTimer(Option<(Instant, bool, u64)>);
 
 impl StateTimer {
     #[inline]
     fn start(write: bool) -> Self {
-        STAGE.with(|s| {
-            if !s.active.get() || s.depth.get() != 0 {
+        SCOPE.with(|c| {
+            let mut s = c.get();
+            if s.id == 0 || s.depth != 0 {
                 return Self(None);
             }
-            s.depth.set(1);
-            Self(Some((Instant::now(), write)))
+            s.depth = 1;
+            c.set(s);
+            Self(Some((Instant::now(), write, s.id)))
         })
     }
 
@@ -384,56 +507,27 @@ impl StateTimer {
 impl Drop for StateTimer {
     #[inline]
     fn drop(&mut self) {
-        if let Some((t0, write)) = self.0 {
+        if let Some((t0, write, id)) = self.0 {
             let n = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            STAGE.with(|s| {
-                s.depth.set(0);
-                let (nanos, calls) = if write {
-                    (&s.write_nanos, &s.write_calls)
-                } else {
-                    (&s.read_nanos, &s.read_calls)
-                };
-                nanos.set(nanos.get().saturating_add(n));
-                calls.set(calls.get() + 1);
-                if s.avm_depth.get() > 0 {
-                    s.in_avm_nanos.set(s.in_avm_nanos.get().saturating_add(n));
+            SCOPE.with(|c| {
+                let mut s = c.get();
+                if s.id != id {
+                    return;
                 }
+                s.depth = 0;
+                if write {
+                    s.write_nanos = s.write_nanos.saturating_add(n);
+                    s.write_calls += 1;
+                } else {
+                    s.read_nanos = s.read_nanos.saturating_add(n);
+                    s.read_calls += 1;
+                }
+                if s.avm_depth > 0 {
+                    s.in_avm_nanos = s.in_avm_nanos.saturating_add(n);
+                }
+                c.set(s);
             });
         }
-    }
-}
-
-/// Returns and clears this thread's accumulated AVM time since the last
-/// [`reset_avm_time`]; `None` when no program ran.
-pub fn take_avm_time() -> Option<Duration> {
-    let n = AVM_NANOS.with(|c| c.replace(0));
-    (n > 0).then(|| Duration::from_nanos(n))
-}
-
-/// Adds the lifetime of this guard to the thread's AVM time accumulator.
-///
-/// Must be dropped on the thread that created it (debug-asserted): the
-/// accumulator is thread-local, see the `AVM_NANOS` docs.
-pub struct AvmTimer(Instant, ThreadId);
-
-impl AvmTimer {
-    /// Starts timing a top-level program evaluation.
-    pub fn start() -> Self {
-        STAGE.with(|s| s.avm_depth.set(s.avm_depth.get() + 1));
-        Self(Instant::now(), std::thread::current().id())
-    }
-}
-
-impl Drop for AvmTimer {
-    fn drop(&mut self) {
-        debug_assert_eq!(
-            self.1,
-            std::thread::current().id(),
-            "AVM evaluation must start and finish on the apply thread"
-        );
-        let n = u64::try_from(self.0.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        AVM_NANOS.with(|c| c.set(c.get().saturating_add(n)));
-        STAGE.with(|s| s.avm_depth.set(s.avm_depth.get().saturating_sub(1)));
     }
 }
 
@@ -660,20 +754,52 @@ mod tests {
     }
 
     #[test]
-    fn avm_timer_accumulates_per_thread_and_resets() {
-        reset_avm_time();
-        assert!(take_avm_time().is_none());
+    fn avm_timer_accumulates_per_apply_timing() {
+        let timing = AvmTiming::default();
+        assert!(timing.total().is_none());
         {
-            let _g = AvmTimer::start();
+            let _g = AvmTimer::start(&timing);
             std::thread::sleep(Duration::from_millis(2));
         }
         {
-            let _g = AvmTimer::start();
+            let _g = AvmTimer::start(&timing);
             std::thread::sleep(Duration::from_millis(2));
         }
-        let d = take_avm_time().expect("two evaluations ran");
-        assert!(d >= Duration::from_millis(4), "{d:?}");
-        assert!(take_avm_time().is_none(), "take clears the accumulator");
+        assert!(timing.total().expect("two evaluations ran") >= Duration::from_millis(4));
+        // A different apply's timing is independent.
+        assert!(AvmTiming::default().total().is_none());
+    }
+
+    #[test]
+    fn scopes_nest_and_a_dropped_scope_leaks_nothing() {
+        let outer = FollowScope::begin();
+        let t1 = AvmTiming::default();
+        {
+            let _g = AvmTimer::start(&t1);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        drop(AvmPublishGuard(&t1));
+        {
+            // An inner scope never finished (early return): dropped.
+            let inner = FollowScope::begin();
+            let t2 = AvmTiming::default();
+            {
+                let _g = AvmTimer::start(&t2);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            drop(AvmPublishGuard(&t2));
+            let _r = StateTimer::read();
+            drop(inner);
+        }
+        // A new scope starts from zero despite the abandoned one.
+        let (avm, st) = FollowScope::begin().finish();
+        assert!(avm.is_none());
+        assert_eq!(st, StageTimes::default());
+        // The outer scope kept exactly its own program time.
+        let (avm, st) = outer.finish();
+        let avm = avm.expect("outer ran a program");
+        assert!(avm >= Duration::from_millis(2), "{avm:?}");
+        assert_eq!(st.read_calls, 0);
     }
 
     #[test]
@@ -683,9 +809,8 @@ mod tests {
             let _t = StateTimer::read();
             std::thread::sleep(Duration::from_millis(1));
         }
-        reset_avm_time();
-        assert_eq!(take_stage_times(), StageTimes::default());
-        reset_avm_time();
+        assert_eq!(FollowScope::begin().finish().1, StageTimes::default());
+        let scope = FollowScope::begin();
         {
             // Outer write with a nested read (set_account -> get_account).
             let _w = StateTimer::write();
@@ -697,11 +822,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         {
-            let _avm = AvmTimer::start();
+            let timing = AvmTiming::default();
+            let _avm = AvmTimer::start(&timing);
             let _r = StateTimer::read();
             std::thread::sleep(Duration::from_millis(2));
         }
-        let st = take_stage_times();
+        let (_, st) = scope.finish();
         assert_eq!((st.read_calls, st.write_calls), (2, 1));
         assert!(st.state_write >= Duration::from_millis(3), "{st:?}");
         assert!(st.state_read >= Duration::from_millis(4), "{st:?}");
@@ -709,12 +835,12 @@ mod tests {
             st.state_in_avm >= Duration::from_millis(2) && st.state_in_avm <= st.state_read,
             "{st:?}"
         );
-        // Taking stops the attribution.
+        // Finishing ends the attribution.
         {
             let _r = StateTimer::read();
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(take_stage_times(), StageTimes::default());
+        assert_eq!(FollowScope::begin().finish().1, StageTimes::default());
         let (avm_only, state, other) =
             st.split(Duration::from_millis(20), Some(Duration::from_millis(5)));
         assert_eq!(state, st.state());
