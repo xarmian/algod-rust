@@ -44,7 +44,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use algo_ledger::apply::apply_block_capturing_state_proof_next;
+use algo_ledger::apply::{
+    apply_block_capturing_probe_output, apply_block_capturing_state_proof_next,
+};
 use algo_ledger::shadow_execute::compare_recorded_apply_data;
 use algo_ledger::{ApplyMode, LedgerState, LedgerStore};
 use algo_types::{
@@ -720,11 +722,12 @@ fn run_entry_with_block(
     let mut ls = build_pre_state(round, &state);
     let before = Snapshot::of(&ls);
 
-    let (computed, final_state_proof_next) =
-        match apply_block_capturing_state_proof_next(&mut ls, &block, ApplyMode::Execute) {
+    let (computed, probe_out) =
+        match apply_block_capturing_probe_output(&mut ls, &block, ApplyMode::Execute) {
             Ok(c) => c,
             Err(e) => return vec![format!("Execute-mode apply failed: {e}")],
         };
+    let final_state_proof_next = probe_out.final_state_proof_next;
 
     let mut diffs: Vec<String> = compare_recorded_apply_data(&block, &computed)
         .iter()
@@ -743,6 +746,23 @@ fn run_entry_with_block(
     if final_state_proof_next.unwrap_or(prev_next) != header_next {
         diffs.push(format!(
             "StateProofNextRound: apply {final_state_proof_next:?} (carried {prev_next}), go header {header_next}"
+        ));
+    }
+    // Issue #1908: the header's FeesCollected is what the apply paid --
+    // top-level AND inner-transaction fees, excluding fee-sink senders (go
+    // `takeFee`). Before payouts go leaves the header field zero.
+    let payouts_enabled =
+        algo_types::consensus::consensus_params_for_version(&block.current_protocol)
+            .is_some_and(|p| p.payouts_enabled);
+    let want_fees = if payouts_enabled {
+        probe_out.final_fees_collected
+    } else {
+        0
+    };
+    if block.fees_collected != want_fees {
+        diffs.push(format!(
+            "FeesCollected: go header {} != apply {} (payouts enabled: {payouts_enabled})",
+            block.fees_collected, want_fees
         ));
     }
     check_post_state(&ls, &state, &mut diffs);
@@ -825,6 +845,10 @@ corpus! {
     /// apps were later deleted); its itx bytes oracle also lives in
     /// `fixtures/mainnet_53000003_txn3_itx.hex`.
     round_53000003_inner_txns => 53000003, approx (0, 1, 0, 6);
+    /// #1908: a block whose app calls pay inner-transaction fees. go's header
+    /// `FeesCollected` (61307) counts them; the top-level fees alone sum to
+    /// 33000, which broke fast catchup (`fees collected wrong: 61307 != 33000`).
+    round_65929681_inner_transaction_fees_collected => 65929681, approx (4, 1, 11, 26);
 }
 
 /// Every fixture needs a test and every test a fixture (both directions).
@@ -1135,4 +1159,61 @@ fn profile_heavy_block_apply_attribution() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// FeesCollected parity (issue #1908)
+// ---------------------------------------------------------------------------
+
+/// Apply `round`'s block with go's `validateForPayouts` (the fast-catchup /
+/// sync path, `apply_block_checking_payouts`) in `mode`, optionally with a
+/// tampered `FeesCollected`.
+fn payout_checked_apply(
+    round: u64,
+    mode: ApplyMode,
+    fees_delta: i64,
+) -> Result<(), algo_error::AlgoError> {
+    let dir = corpus_dir();
+    let raw_block = read_fixture(&dir.join(format!("{round}.msgpack")));
+    let mut block = algo_codec::decode_block_response(&raw_block)
+        .expect("decode block")
+        .block;
+    block.fees_collected = block.fees_collected.wrapping_add_signed(fees_delta);
+    let state = read_value(&dir.join(format!("{round}.state.msgpack")));
+    let mut ls = build_pre_state(round, &state);
+    algo_ledger::apply::apply_block_checking_payouts(&mut ls, &block, mode)
+}
+
+/// The mainnet block that broke fast catchup (`fees collected wrong: 61307 !=
+/// 33000`): go's FeesCollected includes the inner-transaction fees, so the
+/// recorded-delta replay (the live catch-up path) and the Execute path must
+/// both accept the header, and each must reject a header off by one.
+#[test]
+fn round_65929681_payout_validation_counts_inner_fees_in_replay_and_execute() {
+    for mode in [ApplyMode::Replay, ApplyMode::Execute] {
+        payout_checked_apply(65929681, mode, 0)
+            .unwrap_or_else(|e| panic!("{mode:?}: go's header must validate: {e}"));
+        for delta in [-1i64, 1] {
+            let err = payout_checked_apply(65929681, mode, delta)
+                .expect_err("a FeesCollected off by one must be rejected");
+            assert!(
+                err.to_string().contains("fees collected wrong"),
+                "{mode:?} {delta}: {err}"
+            );
+        }
+    }
+}
+
+/// The fixture really has inner fees: the header value exceeds the top-level
+/// fee sum (the old, wrong definition).
+#[test]
+fn round_65929681_has_inner_transaction_fees() {
+    let raw_block = read_fixture(&corpus_dir().join("65929681.msgpack"));
+    let block = algo_codec::decode_block_response(&raw_block)
+        .expect("decode block")
+        .block;
+    let top_level =
+        algo_ledger::block_header::payset_fees_collected(&block.payset, &block.fee_sink);
+    assert_eq!(top_level, 33_000);
+    assert_eq!(block.fees_collected, 61_307);
 }

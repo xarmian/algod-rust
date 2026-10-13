@@ -451,6 +451,20 @@ pub fn apply_block_capturing_state_proof_next<L: crate::store_trait::LedgerStore
     block: &Block,
     mode: ApplyMode,
 ) -> Result<(Vec<ApplyData>, Option<u64>), AlgoError> {
+    let (out, probe) = apply_block_capturing_probe_output(store, block, mode)?;
+    Ok((out, probe.final_state_proof_next))
+}
+
+/// [`apply_block_capturing_apply_data`] plus everything the apply reports in
+/// its [`ProbeOutput`] (final transaction counter, `StateProofNextRound`, and
+/// the fees the payset paid -- top-level AND inner, go `feesCollected`, issue
+/// #1908). The mainnet corpus asserts the latter equals the header's
+/// `FeesCollected`.
+pub fn apply_block_capturing_probe_output<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+    mode: ApplyMode,
+) -> Result<(Vec<ApplyData>, ProbeOutput), AlgoError> {
     let mut out = Vec::with_capacity(block.payset.len());
     let mut probe = ExecProbe::default();
     apply_block_impl_probe(
@@ -465,7 +479,7 @@ pub fn apply_block_capturing_state_proof_next<L: crate::store_trait::LedgerStore
         false,
         Some(&mut probe),
     )?;
-    Ok((out, probe.out.final_state_proof_next))
+    Ok((out, probe.out))
 }
 
 /// Build a `StateDelta` balance record from an account's post-state, matching
