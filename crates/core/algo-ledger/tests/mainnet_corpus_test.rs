@@ -1097,7 +1097,10 @@ fn heavy_block_store_reads_are_memoised() {
         hits + misses
     );
     // debug-assertions-ok: only the wall-time bound is release-only (a debug build is far slower); the read-count bound above runs in both profiles.
-    if !cfg!(debug_assertions) {
+    // Also skipped under cargo-llvm-cov (it sets LLVM_PROFILE_FILE): the
+    // instrumented build applies this block ~3.5x slower (786 ms in the
+    // scheduled Coverage run), which says nothing about the memo.
+    if !cfg!(debug_assertions) && std::env::var_os("LLVM_PROFILE_FILE").is_none() {
         // Best of three: a noisy host can double a single run. Measured
         // ~220 ms (was ~530 ms before the memo and statement cache).
         let best = (0..2)
