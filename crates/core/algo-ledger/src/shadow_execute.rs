@@ -931,7 +931,15 @@ pub fn scratch_validate_payouts<L: LedgerStore>(store: &mut L, block: &Block) ->
         },
         ..Default::default()
     };
-    match scratch_execute_with(store, block, &mut probe) {
+    payout_check_from(scratch_execute_with(store, block, &mut probe))
+}
+
+/// Map a `validate_payouts` evaluation outcome to its [`PayoutCheck`]; shared
+/// by the locked ([`scratch_validate_payouts`]) and overlay
+/// ([`crate::proposal_eval::evaluate_validate_payouts`]) paths so their
+/// verdicts cannot diverge.
+pub(crate) fn payout_check_from<T>(result: Result<T, ScratchFailure>) -> PayoutCheck {
+    match result {
         Ok(_) => PayoutCheck::Valid,
         Err(failure) => match failure {
             // The only verdict: go's `validateForPayouts` rejected the header.

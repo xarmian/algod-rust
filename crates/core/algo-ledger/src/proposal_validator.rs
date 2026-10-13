@@ -41,19 +41,25 @@
 // and carries a bad payout) is closed by #1803, the validating apply on the
 // commit path.
 //
-// Known cost (tracked in #1781): the ledger mutex is held for the whole
-// scratch Execute of the payset, the same way the proposer's own scratch
-// evaluation holds it. The guard is dropped before any post-processing.
+// Lock use (issue #1895, follow-up of #1781): the ledger mutex is held only
+// for the initial busy / round probe and then once per read by the overlay
+// evaluation (`LockedBase`), never across the AVM evaluation of the payset,
+// so agreement commits and REST reads are not queued behind a peer proposal.
+// A commit that lands mid-evaluation makes the base stale and the check a
+// transient no-verdict (retried against the new tip, which then reports the
+// round as already final), exactly as the old busy-ledger case.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use algo_agreement::{AgreementError, BlockValidator, ValidatedBlock};
-use algo_types::Block;
+use algo_types::{Block, Round};
 use tracing::warn;
 
-use crate::shadow_execute::{scratch_validate_payouts, PayoutCheck};
+use crate::locked_base::LockedBase;
+use crate::proposal_eval::evaluate_validate_payouts;
+use crate::shadow_execute::PayoutCheck;
 use crate::sqlite::SqliteLedger;
 use crate::store_trait::LedgerStore;
 
@@ -102,7 +108,7 @@ impl<V: BlockValidator> PayoutCheckingValidator<V> {
     }
 
     fn attempt(&self, block: &Block) -> Attempt {
-        let mut ledger = match self.ledger.try_lock() {
+        let ledger = match self.ledger.try_lock() {
             Ok(guard) => guard,
             Err(TryLockError::WouldBlock) => {
                 return Attempt::NoVerdict {
@@ -134,9 +140,17 @@ impl<V: BlockValidator> PayoutCheckingValidator<V> {
                 retry: true,
             };
         }
-        // The guard is held only for the scratch evaluation itself and is
-        // dropped when this function returns, before any post-processing.
-        match scratch_validate_payouts(&mut *ledger, block) {
+        // Probe done: release the mutex, the evaluation takes it per read.
+        drop(ledger);
+        let base = LockedBase::new(&self.ledger, Round(block.round.0 - 1));
+        let check = evaluate_validate_payouts(&base, block);
+        if base.is_poisoned() {
+            return Attempt::NoVerdict {
+                reason: "ledger lock poisoned".into(),
+                retry: false,
+            };
+        }
+        match check {
             PayoutCheck::Valid => Attempt::Verdict(Ok(())),
             PayoutCheck::Violation(v) => Attempt::Verdict(Err(v)),
             PayoutCheck::NoVerdict { reason, transient } => Attempt::NoVerdict {
@@ -182,6 +196,7 @@ impl<V: BlockValidator> BlockValidator for PayoutCheckingValidator<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shadow_execute::scratch_validate_payouts;
     use algo_agreement::StubBlockValidator;
     use algo_types::consensus::CONSENSUS_V41;
     use algo_types::{Address, Round};
@@ -225,20 +240,21 @@ mod tests {
         v.validate(&proposal(1, 0)).map(|_| ()).expect("payout 0");
     }
 
-    /// A scratch apply that cannot run (an open lease journal makes the
-    /// store refuse to roll back) is not a verdict: the proposal is accepted
-    /// on the stateless result, counted and warned about.
+    /// An open lease journal makes the locked scratch apply refuse to roll
+    /// back (a `NoVerdict`, accepted on the stateless result). The overlay
+    /// evaluation (issue #1895) never writes to the live connection, so it
+    /// needs no rollback and still reaches the genuine verdict: a payout that
+    /// is over the allowance is rejected, a valid one passes.
     #[test]
-    fn unsupported_scratch_does_not_reject_a_valid_proposal() {
+    fn open_lease_journal_does_not_stop_the_overlay_check() {
         let ledger = ledger_at(0);
         let _leaked = ledger.lock().unwrap().save_scratch_state().expect("open");
         let before = payout_check_fallbacks();
         let v = validator(&ledger, Duration::from_millis(100));
-        // Even a payout that WOULD be rejected passes: no verdict was reached.
-        v.validate(&proposal(1, 5))
-            .map(|_| ())
-            .expect("must fall back to the stateless verdict");
-        assert!(payout_check_fallbacks() > before);
+        let err = v.validate(&proposal(1, 5)).err().expect("over allowance");
+        assert!(err.to_string().contains("5 payout, 0 is allowed"), "{err}");
+        v.validate(&proposal(1, 0)).map(|_| ()).expect("payout 0");
+        assert_eq!(payout_check_fallbacks(), before);
     }
 
     /// A proposal for a round past the next one waits for the ledger to reach

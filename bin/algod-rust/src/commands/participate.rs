@@ -1620,26 +1620,10 @@ struct ExecState {
     /// size check, from the kept pass's modified accounts; `None` while no
     /// payset has been evaluated.
     final_knock_offline: Option<algo_ledger::apply::KnockOfflineLists>,
-    /// Issue #1781: run the assembly verification pass the old way, as a
-    /// SAVEPOINT scratch apply on the live connection under the ledger mutex
-    /// (`ALGOD_RUST_LOCKED_SCRATCH=1`). The default evaluates the payset on a
-    /// fresh overlay taking the mutex per read.
-    locked_scratch: bool,
     /// Longest single hold of the ledger mutex by this evaluator's
     /// evaluations, and how many times it took the mutex (diagnostics, tests).
     lock_hold_max: std::cell::Cell<Duration>,
     lock_acquisitions: std::cell::Cell<u64>,
-}
-
-/// Whether `ALGOD_RUST_LOCKED_SCRATCH` selects the legacy locked scratch
-/// apply for block assembly (issue #1781), read once.
-fn locked_scratch_from_env() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("ALGOD_RUST_LOCKED_SCRATCH")
-            .map(|v| !v.is_empty() && v != "0")
-            .unwrap_or(false)
-    })
 }
 
 impl SimpleBlockEvaluator {
@@ -2082,35 +2066,19 @@ impl SimpleBlockEvaluator {
         let request = own_addresses.map(|own| algo_ledger::apply::ListsRequest {
             own_addresses: own.clone(),
         });
-        if !self.exec.as_ref().is_some_and(|e| e.locked_scratch) {
-            // Issue #1781: evaluate the payset on a fresh overlay that takes
-            // the ledger mutex per read, so agreement commits and REST reads
-            // are not blocked behind the whole AVM evaluation. A ledger that
-            // advanced meanwhile is reported as `Stale` and the result is
-            // dropped.
-            let base = algo_ledger::locked_base::LockedBase::new(
-                &self.ledger,
-                algo_types::Round(template.round.0.saturating_sub(1)),
-            );
-            let r = algo_ledger::proposal_eval::evaluate_payset(&base, &candidate, request);
-            self.note_lock_use(&base);
-            if base.is_poisoned() {
-                return Err(algo_ledger::locked_base::LockedBase::poison_error());
-            }
-            return Ok(r);
+        // Issue #1781: evaluate the payset on a fresh overlay that takes the
+        // ledger mutex per read, so agreement commits and REST reads are not
+        // blocked behind the whole AVM evaluation. A ledger that advanced
+        // meanwhile is reported as `Stale` and the result is dropped.
+        let base = algo_ledger::locked_base::LockedBase::new(
+            &self.ledger,
+            algo_types::Round(template.round.0.saturating_sub(1)),
+        );
+        let r = algo_ledger::proposal_eval::evaluate_payset(&base, &candidate, request);
+        self.note_lock_use(&base);
+        if base.is_poisoned() {
+            return Err(algo_ledger::locked_base::LockedBase::poison_error());
         }
-        let waited = std::time::Instant::now();
-        let mut ledger = self
-            .ledger
-            .lock()
-            .map_err(|e| algo_error::AlgoError::Ledger {
-                message: format!("ledger lock poisoned: {e}"),
-            })?;
-        algo_ledger::proposal_eval::record_ledger_lock_wait(waited.elapsed());
-        let held = std::time::Instant::now();
-        let r =
-            algo_ledger::shadow_execute::scratch_execute_payset(&mut *ledger, &candidate, request);
-        algo_ledger::proposal_eval::record_ledger_lock_hold(held.elapsed());
         Ok(r)
     }
 
@@ -3818,7 +3786,6 @@ impl PoolLedgerAdapter {
                 final_state_proof_next: None,
                 final_fee_sink_available: None,
                 final_knock_offline: None,
-                locked_scratch: locked_scratch_from_env(),
                 lock_hold_max: std::cell::Cell::new(Duration::ZERO),
                 lock_acquisitions: std::cell::Cell::new(0),
             }
@@ -5269,6 +5236,19 @@ pub async fn run(
     // Issue #1066: the CLI-derived placeholders resolved above must not be
     // trusted once the ledger has a real genesis on disk. See
     // `resolve_effective_genesis_expectations`'s doc comment for why.
+    // Issue #1895: build the knock-offline candidate index now, before the
+    // ledger is shared, rather than inside the first proposal's ledger-mutex
+    // hold (a full online-set scan, ~0.2 s at 100k online accounts).
+    {
+        let started = std::time::Instant::now();
+        let indexed = sqlite_ledger.warm_knock_index();
+        info!(
+            indexed,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "warmed the knock-offline candidate index"
+        );
+    }
+
     (resolved_genesis_id, genesis_hash) = resolve_effective_genesis_expectations(
         resolved_genesis_id,
         genesis_hash,
