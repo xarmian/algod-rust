@@ -39,10 +39,10 @@ probe_latest_file() {
     local f="$1" out=""
     [ -s "$f" ] || return 0
     if command -v sqlite3 >/dev/null 2>&1; then
-        out="$(sqlite3 "$f" 'SELECT MAX(rnd) FROM blocks' 2>/dev/null | tr -d '' || true)"
+        out="$(sqlite3 "$f" 'SELECT MAX(rnd) FROM blocks' 2>/dev/null | tr -d '\r' || true)"
     fi
     if ! _is_round "$out" && command -v python3 >/dev/null 2>&1; then
-        out="$(python3 -c 'import sqlite3, sys; print(sqlite3.connect(sys.argv[1]).execute("SELECT MAX(rnd) FROM blocks").fetchone()[0])' "$f" 2>/dev/null | tr -d '' || true)"
+        out="$(python3 -c 'import sqlite3, sys; print(sqlite3.connect(sys.argv[1]).execute("SELECT MAX(rnd) FROM blocks").fetchone()[0])' "$f" 2>/dev/null | tr -d '\r' || true)"
     fi
     if _is_round "$out"; then
         echo "$out"
