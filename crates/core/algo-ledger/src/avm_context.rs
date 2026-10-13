@@ -2588,7 +2588,9 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
                 );
                 own
             }
-            (None, Some(_)) => self.cached_txid(&self.group[self.group_index].txn, self.group_index),
+            (None, Some(_)) => {
+                self.cached_txid(&self.group[self.group_index].txn, self.group_index)
+            }
             (None, None) => algo_codec::compute_txn_id(&self.group[self.group_index].txn),
         }
     }
@@ -13630,7 +13632,8 @@ mod tests {
             ctx.consensus.unify_inner_tx_ids = unify;
             let parent = algo_codec::compute_txn_id(&txn.txn);
             let mut amount = 1u64;
-            for _ in 0..8 {
+            // 3 submits of 1..=4 txns stay within the 16-inner-txn call limit.
+            for _ in 0..3 {
                 let n = 1 + next(4) as usize;
                 ctx.itxn_begin().unwrap();
                 for k in 0..n {
@@ -13648,9 +13651,10 @@ mod tests {
                 let total: usize = ctx.inner_txns().iter().map(|g| g.len()).sum();
                 let base = total - n;
                 let group = ctx.inner_txns().last().unwrap().clone();
-                for gi in 0..n {
+                for (gi, member) in group.iter().enumerate().take(n) {
                     let got = ctx.last_itxn_group_field(gi, 23, None).unwrap();
-                    let want = algo_avm::itxn::compute_inner_txn_id(&parent, base + gi, &group[gi].txn);
+                    let want =
+                        algo_avm::itxn::compute_inner_txn_id(&parent, base + gi, &member.txn);
                     if unify {
                         assert_eq!(got, TealValue::Bytes(want.0.to_vec()), "gitxn {gi}");
                         assert_eq!(ctx.inner_txn_ids().last().unwrap()[gi], want);
