@@ -17846,6 +17846,89 @@ return
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Issue #1895: `warm_knock_index` builds the index up front, is
+    /// idempotent, counts exactly the indexed (online, non-zero stake)
+    /// accounts, and the lists computed after it equal the cold-start ones.
+    #[test]
+    fn warm_knock_index_matches_lazy_build() {
+        use crate::sqlite::SqliteLedger;
+
+        let consensus = ko_consensus();
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.begin_block().unwrap();
+        ko_populate(&mut ledger, 2_000, 3, 50);
+        ledger.commit_block().unwrap();
+        ledger.knock_index_drop();
+        let cold = knock_offline_lists(&ledger, 501, &consensus, &Default::default(), &[]);
+        ledger.knock_index_drop();
+        let warmed = ledger.warm_knock_index();
+        assert!(warmed > 0);
+        assert_eq!(ledger.warm_knock_index(), warmed, "idempotent");
+        assert_eq!(ledger.knock_index_check().unwrap(), warmed);
+        let warm = knock_offline_lists(&ledger, 501, &consensus, &Default::default(), &[]);
+        assert_eq!(cold, warm);
+    }
+
+    /// Lock-hold measurement for issue #1895: the exact computation
+    /// `SimpleBlockEvaluator::knock_offline_from_modified` runs under the
+    /// ledger mutex (`knock_offline_lists_from_modified` over a small modified
+    /// set), with the candidate index cold and warm, on sparse / dense /
+    /// worst-case (every candidate excluded, so the scan cannot stop early)
+    /// candidate sets. Run with
+    /// `cargo test -p algo-ledger --release knock_offline_from_modified_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing measurement, not a correctness test"]
+    fn knock_offline_from_modified_timing_100k_online() {
+        use crate::sqlite::SqliteLedger;
+        use crate::store_trait::LedgerStore;
+
+        let consensus = ko_consensus();
+        let n = 100_000u32;
+        let dir = std::env::temp_dir().join(format!("ko_mod_timing_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut ledger = SqliteLedger::open_with_prefix(&dir.join("ko")).unwrap();
+        // (label, expired_every, stale_every, exclude_every): `exclude_every`
+        // excludes every candidate of that stride (own participation keys), so
+        // the lists stay empty and the scan visits every candidate.
+        for (label, ex, st, excl) in [
+            ("sparse (no candidates)", 0u32, 0u32, 0u32),
+            ("sparse, 100 stale candidates", 0, 1000, 0),
+            ("dense (fills early)", 1, 0, 0),
+            ("5% candidates all excluded (point lookups)", 20, 0, 20),
+            ("10% candidates all excluded (streamed fallback)", 10, 0, 10),
+        ] {
+            ledger.begin_block().unwrap();
+            ko_populate(&mut ledger, n, ex, st);
+            ledger.commit_block().unwrap();
+            let exclude: std::sync::Arc<std::collections::HashSet<Address>> = std::sync::Arc::new(
+                (0..n)
+                    .filter(|i| excl != 0 && i % excl == 0)
+                    .map(ko_addr)
+                    .collect(),
+            );
+            let mut modified = KnockOfflineModified::default();
+            for i in (1..n).step_by(5_000) {
+                let mut acct = ledger.get_account(&ko_addr(i)).unwrap();
+                acct.micro_algos += 1;
+                modified.accounts.insert(ko_addr(i), Some(acct));
+            }
+            ledger.knock_index_drop();
+            let t0 = std::time::Instant::now();
+            let cold =
+                knock_offline_lists_from_modified(&ledger, 501, &consensus, &exclude, &modified);
+            let d_cold = t0.elapsed();
+            let t1 = std::time::Instant::now();
+            let warm =
+                knock_offline_lists_from_modified(&ledger, 501, &consensus, &exclude, &modified);
+            let d_warm = t1.elapsed();
+            assert_eq!(cold, warm);
+            println!(
+                "KNOCK_OFFLINE_FROM_MODIFIED_TIMING {label}: n={n} index_cold={d_cold:?} index_warm={d_warm:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Issue #1885: the candidate-index selection equals the full-scan oracle
     /// over randomized online sets, through block commits, rollbacks, scratch
     /// snapshot restores, removals, a dropped (rebuilt) index and out-of-block

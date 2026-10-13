@@ -663,3 +663,142 @@ fn overlay_payset_pass_matches_the_locked_scratch_apply() {
         "the generator produced too few transactions: {total}"
     );
 }
+
+/// Issue #1895: `evaluate_validate_payouts` (overlay over a `LockedBase`, no
+/// mutex held across the evaluation) returns exactly the verdict of the
+/// locked `scratch_validate_payouts` over random paysets with valid, wrong
+/// and missing payout / fee / proposer header fields.
+#[test]
+fn overlay_payout_validation_matches_the_locked_scratch_validation() {
+    use crate::locked_base::LockedBase;
+    use crate::proposal_eval::evaluate_validate_payouts;
+    use crate::shadow_execute::{scratch_validate_payouts, PayoutCheck};
+
+    let (mut valid, mut violation, mut other, mut compared) = (0usize, 0usize, 0usize, 0usize);
+    for seed in 0..24u64 {
+        let mut rng = ChaCha8Rng::seed_from_u64(7_000 + seed);
+        let base = setup_with_online();
+        let t = template(&base);
+        let mut overlay = PendingOverlay::new(&base);
+        let mut known = Known::default();
+        let mut payset: Vec<SignedTransaction> = Vec::new();
+        for _ in 0..30 {
+            let group = random_group(&mut rng, &known);
+            if let Ok(ev) = evaluate_group(&base, &mut overlay, &t, &group) {
+                for d in &ev.apply_data {
+                    if d.config_asset != 0 {
+                        known.assets.push(d.config_asset);
+                    }
+                    if d.application_id != 0 {
+                        known.apps.push(d.application_id);
+                    }
+                }
+                payset.extend(group);
+            }
+        }
+        if seed % 6 == 5 {
+            // A payset transaction no Execute pass can apply: no verdict.
+            let mut bad = base_txn(addr(1), "pay");
+            bad.receiver = addr(2);
+            bad.amount = 1_000_000_000_000;
+            payset.push(SignedTransaction {
+                txn: bad,
+                ..Default::default()
+            });
+        }
+        let true_fees = crate::block_header::payset_fees_collected(&payset, &addr(0xF1));
+        for variant in 0..8u64 {
+            let mut block = template(&base);
+            block.payset = payset.clone();
+            block.fees_collected = match variant % 4 {
+                3 => true_fees + 1,
+                _ => true_fees,
+            };
+            block.proposer = match variant % 5 {
+                0 => addr(3),
+                1 => Address::ZERO,
+                2 => addr(0x77),
+                _ => addr(0x40),
+            };
+            block.proposer_payout = match variant {
+                0 | 1 => 0,
+                2 => 1,
+                3 => 1_000,
+                4 => 10_000_000,
+                5 => u64::MAX,
+                _ => rng.random_range(0..2_000_000u64),
+            };
+            let mut reference = setup_with_online();
+            let locked = scratch_validate_payouts(&mut reference, &block);
+
+            let shared = std::sync::Mutex::new(setup_with_online());
+            let lbase = LockedBase::new(&shared, Round(0));
+            let overlay_check = evaluate_validate_payouts(&lbase, &block);
+            assert!(!lbase.is_stale());
+            assert_eq!(
+                locked, overlay_check,
+                "seed {seed} variant {variant}: verdicts differ"
+            );
+            compared += 1;
+            match locked {
+                PayoutCheck::Valid => valid += 1,
+                PayoutCheck::Violation(_) => violation += 1,
+                PayoutCheck::NoVerdict { .. } => other += 1,
+            }
+        }
+    }
+    assert!(compared > 150);
+    assert!(valid > 0, "no valid verdict exercised");
+    assert!(violation > 0, "no violation exercised");
+    assert!(other > 0, "no no-verdict exercised");
+}
+
+/// Issue #1895: a commit landing in the middle of the overlay payout
+/// validation yields a transient no-verdict (never a verdict computed across
+/// two states), the same classification the locked path gives a busy or
+/// advanced ledger.
+#[test]
+fn overlay_payout_validation_is_a_transient_no_verdict_when_the_ledger_advances() {
+    use crate::locked_base::LockedBase;
+    use crate::proposal_eval::evaluate_validate_payouts;
+    use crate::shadow_execute::PayoutCheck;
+    use std::sync::{Arc, Mutex};
+
+    let shared = Arc::new(Mutex::new(setup_with_online()));
+    let mut block = template(&shared.lock().unwrap());
+    block.proposer = addr(3);
+    block.payset = (0..50u64)
+        .map(|i| {
+            let mut p = base_txn(addr(1), "pay");
+            p.receiver = addr(2);
+            p.amount = 100_000 + i;
+            p.note = serde_bytes::ByteBuf::from(i.to_be_bytes().to_vec());
+            SignedTransaction {
+                txn: p,
+                ..Default::default()
+            }
+        })
+        .collect();
+    block.fees_collected = crate::block_header::payset_fees_collected(&block.payset, &addr(0xF1));
+    let lbase = LockedBase::new(&shared, Round(0));
+    let m = shared.clone();
+    lbase.before_acquisition(10, move || {
+        m.lock().unwrap().set_current_round(Round(1));
+    });
+    match evaluate_validate_payouts(&lbase, &block) {
+        PayoutCheck::NoVerdict { transient, .. } => assert!(transient),
+        other => panic!("expected a transient no-verdict, got {other:?}"),
+    }
+    assert!(lbase.is_stale());
+    // And a base already at another round is the same transient no-verdict.
+    let ahead = Mutex::new(setup_with_online());
+    ahead.lock().unwrap().set_current_round(Round(5));
+    let stale = LockedBase::new(&ahead, Round(0));
+    assert!(matches!(
+        evaluate_validate_payouts(&stale, &block),
+        PayoutCheck::NoVerdict {
+            transient: true,
+            ..
+        }
+    ));
+}

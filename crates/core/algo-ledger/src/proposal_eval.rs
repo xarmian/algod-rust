@@ -37,7 +37,7 @@ use crate::apply::{
     apply_block_impl_probe, ApplyData, ApplyMode, ExecProbe, ListsRequest, ProbeRequest,
 };
 use crate::pending_overlay::{OverlayBase, OverlayStore, PendingOverlay};
-use crate::shadow_execute::{ScratchFailure, ScratchPayset};
+use crate::shadow_execute::{payout_check_from, PayoutCheck, ScratchFailure, ScratchPayset};
 
 /// Successful evaluation of one group.
 #[derive(Debug)]
@@ -168,10 +168,6 @@ pub fn evaluate_payset<B: OverlayBase + ?Sized>(
             message: "injected transient scratch failure".into(),
         }));
     }
-    let mut overlay = PendingOverlay::new(base);
-    if base.base_is_stale() || block.round.0 != overlay.base_round().0 + 1 {
-        return Err(ScratchFailure::Stale);
-    }
     let mut probe = ExecProbe {
         request: ProbeRequest {
             skip_epilogue: true,
@@ -181,6 +177,56 @@ pub fn evaluate_payset<B: OverlayBase + ?Sized>(
         },
         ..Default::default()
     };
+    let ad = evaluate_block_on_overlay(base, block, &mut probe)?;
+    Ok(ScratchPayset {
+        apply_data: ad,
+        final_txn_counter: probe.out.final_txn_counter,
+        final_state_proof_next: probe.out.final_state_proof_next,
+        final_fee_sink_available: probe.out.final_fee_sink_available,
+        knock_offline_lists: probe.out.knock_offline_lists.take(),
+        knock_offline_modified: probe.out.knock_offline_modified.take(),
+    })
+}
+
+/// Judge a peer proposal's payout header fields (go `validateForPayouts`,
+/// issue #1798) on a **fresh** overlay over `base`, without a SAVEPOINT on the
+/// live connection and without holding the ledger mutex across the
+/// evaluation (issue #1895). Identical verdicts to
+/// [`crate::shadow_execute::scratch_validate_payouts`]: the whole block is
+/// evaluated in [`ApplyMode::Execute`] *including* the epilogue (participation
+/// lists, payout validation, payout application) with only the payout
+/// validation switched on. A base that is not at `block.round - 1`, or that
+/// advanced while evaluating, is a transient
+/// [`PayoutCheck::NoVerdict`] (the caller retries), never a verdict.
+pub fn evaluate_validate_payouts<B: OverlayBase + ?Sized>(base: &B, block: &Block) -> PayoutCheck {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if crate::shadow_execute::test_hooks::should_fail(block.payset.len()) {
+        return payout_check_from::<()>(Err(ScratchFailure::Other(AlgoError::Ledger {
+            message: "injected transient scratch failure".into(),
+        })));
+    }
+    let mut probe = ExecProbe {
+        request: ProbeRequest {
+            validate_payouts: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    payout_check_from(evaluate_block_on_overlay(base, block, &mut probe))
+}
+
+/// Evaluate `block` in [`ApplyMode::Execute`] on a fresh overlay over `base`
+/// with `probe`, returning the per-transaction apply data. Shared by
+/// [`evaluate_payset`] and [`evaluate_validate_payouts`].
+fn evaluate_block_on_overlay<B: OverlayBase + ?Sized>(
+    base: &B,
+    block: &Block,
+    probe: &mut ExecProbe,
+) -> Result<Vec<ApplyData>, ScratchFailure> {
+    let mut overlay = PendingOverlay::new(base);
+    if base.base_is_stale() || block.round.0 != overlay.base_round().0 + 1 {
+        return Err(ScratchFailure::Stale);
+    }
     let mut ad: Vec<ApplyData> = Vec::with_capacity(block.payset.len());
     overlay.begin_group();
     let res = {
@@ -196,7 +242,7 @@ pub fn evaluate_payset<B: OverlayBase + ?Sized>(
                 Some(&mut ad),
                 None,
                 true,
-                Some(&mut probe),
+                Some(&mut *probe),
             )
         }))
     };
@@ -211,14 +257,7 @@ pub fn evaluate_payset<B: OverlayBase + ?Sized>(
             Some(index) if index < block.payset.len() => Err(ScratchFailure::Txn { index, error }),
             _ => Err(ScratchFailure::Other(error)),
         },
-        Ok(Ok(())) => Ok(ScratchPayset {
-            apply_data: ad,
-            final_txn_counter: probe.out.final_txn_counter,
-            final_state_proof_next: probe.out.final_state_proof_next,
-            final_fee_sink_available: probe.out.final_fee_sink_available,
-            knock_offline_lists: probe.out.knock_offline_lists.take(),
-            knock_offline_modified: probe.out.knock_offline_modified.take(),
-        }),
+        Ok(Ok(())) => Ok(ad),
     }
 }
 

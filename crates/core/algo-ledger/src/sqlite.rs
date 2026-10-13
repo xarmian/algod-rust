@@ -6154,6 +6154,17 @@ impl SqliteLedger {
         }
     }
 
+    /// Build the knock-offline candidate index now instead of lazily at the
+    /// first proposal (issue #1895): the cold build is a full online-set scan
+    /// (~0.13-0.2 s at 100k online accounts) that would otherwise run inside
+    /// the first proposal's ledger-mutex hold. Idempotent; the index is then
+    /// kept up to date incrementally by every commit. Returns the number of
+    /// indexed accounts.
+    pub fn warm_knock_index(&self) -> usize {
+        self.ensure_knock_index();
+        self.knock_index.borrow().as_ref().map_or(0, |i| i.len())
+    }
+
     /// Test/diagnostic: tune (0 = never) the candidate-fraction threshold
     /// beyond which the full ordered stream replaces per-candidate lookups.
     #[cfg(any(test, feature = "test-hooks"))]

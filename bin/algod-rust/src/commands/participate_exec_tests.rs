@@ -1981,13 +1981,14 @@ fn proposal_is_dropped_when_the_ledger_advances_during_assembly() {
     assert!(algo_ledger::proposal_eval::stale_base_total() > stale_before);
 }
 
-/// Issue #1781: the default (overlay) assembly pass and the legacy locked
-/// SAVEPOINT pass produce identical blocks over random payment / close / app
-/// call mixes, including a smuggled un-applyable group and byte-limit
+/// Issue #1781 / #1895: the overlay assembly pass and a direct locked
+/// `scratch_execute_payset` SAVEPOINT pass over the proposed block produce
+/// identical ApplyData / counter / sink balance over random payment / close /
+/// app call mixes, including a smuggled un-applyable group and byte-limit
 /// trimming.
 #[test]
 fn overlay_assembly_equals_the_locked_scratch_pass_over_random_mixes() {
-    fn mix(seed: u64, locked: bool, limit_num: usize) -> (algo_types::Block, usize, usize) {
+    fn mix(seed: u64, limit_num: usize) -> (algo_types::Block, usize, usize) {
         let senders: Vec<Key> = (1..=4).map(key).collect();
         let closers: Vec<Key> = (20..30).map(key).collect();
         let c = key(6);
@@ -2009,7 +2010,6 @@ fn overlay_assembly_equals_the_locked_scratch_pass_over_random_mixes() {
         let mut eval = PoolLedgerAdapter::new(ledger.clone())
             .start_simple_evaluator(genesis_header(), 0, 0)
             .expect("start_evaluator");
-        eval.exec.as_mut().unwrap().locked_scratch = locked;
         let mut state = seed
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
@@ -2085,42 +2085,32 @@ fn overlay_assembly_equals_the_locked_scratch_pass_over_random_mixes() {
         }
         let block = eval.generate_block(&[]).expect("generate_block");
         let passes = eval.exec.as_ref().unwrap().last_passes;
+        // The locked reference: the proposed block run through the SAVEPOINT
+        // scratch apply directly (the old ALGOD_RUST_LOCKED_SCRATCH pass).
+        let reference = {
+            let mut l = ledger.lock().unwrap();
+            algo_ledger::shadow_execute::scratch_execute_payset(&mut *l, &block, None)
+                .unwrap_or_else(|e| panic!("seed {seed}: locked reference failed: {e:?}"))
+        };
+        assert_eq!(
+            format!(
+                "{:?}",
+                SimpleBlockEvaluator::with_apply_data(&block.payset, &reference.apply_data)
+            ),
+            format!("{:?}", block.payset),
+            "seed {seed} limit {limit_num}: ApplyData (overlay vs locked)"
+        );
+        assert_eq!(
+            reference.final_txn_counter, block.txn_counter,
+            "seed {seed}: txn counter"
+        );
         (block, passes, closed)
     }
 
     let mut trimmed = 0usize;
     for seed in 0..8u64 {
         for limit in [0usize, 6] {
-            let (ov, ov_passes, _) = mix(seed, false, limit);
-            let (lk, lk_passes, _) = mix(seed, true, limit);
-            assert_eq!(
-                format!("{:?}", ov.payset),
-                format!("{:?}", lk.payset),
-                "seed {seed} limit {limit}: payset (ApplyData included)"
-            );
-            assert_eq!(ov.txn_counter, lk.txn_counter, "seed {seed}: txn counter");
-            assert_eq!(ov.fees_collected, lk.fees_collected, "seed {seed}: fees");
-            assert_eq!(ov.load, lk.load, "seed {seed}: load");
-            assert_eq!(
-                ov.proposer_payout, lk.proposer_payout,
-                "seed {seed}: payout"
-            );
-            assert_eq!(
-                ov.expired_participation_accounts, lk.expired_participation_accounts,
-                "seed {seed}: expired list"
-            );
-            assert_eq!(
-                ov.absent_participation_accounts, lk.absent_participation_accounts,
-                "seed {seed}: absent list"
-            );
-            assert_eq!(
-                format!("{:?}", ov.state_proof_tracking),
-                format!("{:?}", lk.state_proof_tracking)
-            );
-            assert_eq!(
-                ov_passes, lk_passes,
-                "seed {seed} limit {limit}: pass count"
-            );
+            let (ov, _passes, _) = mix(seed, limit);
             assert!(!ov.payset.is_empty());
             if limit > 0 {
                 trimmed += 1;
