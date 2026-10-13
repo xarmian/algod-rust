@@ -104,7 +104,7 @@ pub use rewards::{
     apply_rewards, compute_pending_rewards, next_rewards_state, normalized_online_balance,
     RewardsState, REWARD_UNITS,
 };
-pub use read_pool::{LazyReadPool, LedgerReadPool, PoolRead};
+pub use read_pool::{LazyReadPool, LedgerReadPool, PoolRead, PoolReader, ResourceReads};
 pub use sqlite::{
     block_path_for_prefix, derive_ledger_prefix, ledger_exists, open_ledger_connection,
     open_ledger_connection_with_sync_mode, remove_ledger_files, tracker_path_for_prefix,

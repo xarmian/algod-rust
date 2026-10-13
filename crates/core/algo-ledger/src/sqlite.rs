@@ -528,8 +528,8 @@ pub fn remove_ledger_files(path: &Path) -> std::io::Result<()> {
 }
 
 // Resource ctype constants (matches Go's `basics.AssetCreatable = 0`, `basics.AppCreatable = 1`)
-const CTYPE_ASSET: i64 = 0;
-const CTYPE_APP: i64 = 1;
+pub(crate) const CTYPE_ASSET: i64 = 0;
+pub(crate) const CTYPE_APP: i64 = 1;
 
 /// Marker key written to `catchpointstate` after the G13 kvstore NULL
 /// normalization has run. Namespaced with `algod_rust_` so it cannot
@@ -1017,7 +1017,7 @@ pub fn encode_asset_holding_with_round(h: &AssetHolding, update_round: u64) -> V
     algo_codec::canonical_encode_resources_data(&rd)
 }
 
-fn decode_asset_holding(data: &[u8]) -> Result<AssetHolding, AlgoError> {
+pub(crate) fn decode_asset_holding(data: &[u8]) -> Result<AssetHolding, AlgoError> {
     let val: rmpv::Value =
         rmpv::decode::read_value(&mut &data[..]).map_err(|e| AlgoError::Ledger {
             message: format!("msgpack decode: {e}"),
@@ -1076,7 +1076,7 @@ pub fn encode_asset_params_with_round(
     algo_codec::canonical_encode_resources_data(&rd)
 }
 
-fn decode_asset_params(data: &[u8]) -> Result<AssetParams, AlgoError> {
+pub(crate) fn decode_asset_params(data: &[u8]) -> Result<AssetParams, AlgoError> {
     let val: rmpv::Value =
         rmpv::decode::read_value(&mut &data[..]).map_err(|e| AlgoError::Ledger {
             message: format!("msgpack decode: {e}"),
@@ -1287,7 +1287,7 @@ pub fn build_app_resource_data(
     rd
 }
 
-fn decode_app_params(data: &[u8], creator: Address) -> Result<AppParams, AlgoError> {
+pub(crate) fn decode_app_params(data: &[u8], creator: Address) -> Result<AppParams, AlgoError> {
     let val: rmpv::Value =
         rmpv::decode::read_value(&mut &data[..]).map_err(|e| AlgoError::Ledger {
             message: format!("msgpack decode: {e}"),
@@ -1386,7 +1386,7 @@ pub fn encode_app_local_state_with_round(s: &AppLocalState, update_round: u64) -
     algo_codec::canonical_encode_resources_data(&rd)
 }
 
-fn decode_app_local_state(data: &[u8]) -> Result<AppLocalState, AlgoError> {
+pub(crate) fn decode_app_local_state(data: &[u8]) -> Result<AppLocalState, AlgoError> {
     let val: rmpv::Value =
         rmpv::decode::read_value(&mut &data[..]).map_err(|e| AlgoError::Ledger {
             message: format!("msgpack decode: {e}"),
