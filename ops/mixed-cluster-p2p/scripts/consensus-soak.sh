@@ -84,6 +84,10 @@
 #                         why — the same 30/30/30/10 stake split applies)
 #   VERIFY_STAGE           1 = run fork-detector + bidirectional cert
 #                         cross-verify after the soak        (default 0)
+#   CERT_LATEST           verify only the newest N rounds of the ledger
+#                         snapshot in the VERIFY_STAGE cert pass (#1913);
+#                         default: 1 when ROUNDS > 320 (history window),
+#                         else 0 = whole range
 #   RESTART_SCENARIOS     1 = also run the P2P restart/rejoin stage
 #                         after the soak (graceful restart, SIGKILL,
 #                         restart-as-proposer)                (default 0)
@@ -372,7 +376,17 @@ if [ "$VERIFY_STAGE" = "1" ]; then
     echo "==> verify-soak.sh (fork detector + cert cross-verify both directions)"
     TOOLS_DIR="${TOOLS_DIR:-$REPO_ROOT/target/debug}"
     verify_rc=0
+    # Issue #1913: the Rust ledger keeps onlineaccounts history only back to
+    # ~tip-320 (as go does), so a post-hoc cert pass over a run longer than
+    # that cannot reach the early rounds. Default CERT_LATEST to 1 (verify the
+    # snapshot's newest round, exact) for such runs; CERT_LATEST=0 forces the
+    # whole-range pass, any N>1 widens the newest-N window.
+    if [ -z "${CERT_LATEST:-}" ]; then
+        if [ "$ROUNDS" -gt 320 ]; then CERT_LATEST=1; else CERT_LATEST=0; fi
+    fi
+    echo "    cert pass: CERT_LATEST=$CERT_LATEST (ROUNDS=$ROUNDS)"
     "$HERE/verify-soak.sh" \
+        --cert-latest "$CERT_LATEST" \
         --stride "$CERT_STRIDE" \
         --tools-dir "$TOOLS_DIR" \
         --out-dir "$OUT_DIR" \

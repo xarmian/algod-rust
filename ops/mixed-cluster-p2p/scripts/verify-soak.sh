@@ -34,6 +34,7 @@
 #                  [--no-cert-crossverify] [--cert-ledger PATH]
 #                  [--skip-preflight] [--rust-account ADDR]
 #                  [--min-rust-vote-rounds N] [--no-go-authenticate]
+#                  [--cert-latest N]
 #
 # Exit codes: identical semantics to ops/mixed-cluster/scripts/verify-soak.sh
 #   0 — every tool that ran reported clean
@@ -65,6 +66,7 @@ RUN_CERT=1
 CERT_LEDGER_OVERRIDE=""
 RUST_ACCOUNT="${RUST_ACCOUNT:-}"
 MIN_RUST_VOTE_ROUNDS="${MIN_RUST_VOTE_ROUNDS:-1}"
+CERT_LATEST="${CERT_LATEST:-0}"
 RUN_GO_AUTH=1
 
 RUST_CONTAINER=p2pinterop-rust-node-4
@@ -77,6 +79,7 @@ usage: $(basename "$0") [--from-round N] [--to-round M] [--stride S]
                         [--no-cert-crossverify] [--cert-ledger PATH]
                         [--skip-preflight] [--rust-account ADDR]
                         [--min-rust-vote-rounds N] [--no-go-authenticate]
+                        [--cert-latest N]
 
 Options:
   --from-round N         First round to verify (default: 1).
@@ -103,6 +106,12 @@ Options:
                          contain a vote from --rust-account (default 1).
   --no-go-authenticate   Skip the go-algorand-side authentication even
                          when --rust-account is given.
+  --cert-latest N        (#1913) Verify only the newest N rounds OF THE LEDGER
+                         SNAPSHOT (taken first): online-account history is kept
+                         back to ~tip-320 only (as in go), so a post-hoc pass
+                         over a run longer than ~320 rounds can re-verify just
+                         the snapshot's newest rounds. N=1 is exact. Default
+                         0 = whole range (env: CERT_LATEST).
   -h, --help             Show this help.
 
 Artifacts written:
@@ -131,6 +140,7 @@ while [ $# -gt 0 ]; do
         --cert-ledger)            need_arg "$@"; CERT_LEDGER_OVERRIDE="$2"; shift 2 ;;
         --rust-account)           need_arg "$@"; RUST_ACCOUNT="$2"; shift 2 ;;
         --min-rust-vote-rounds)   need_arg "$@"; MIN_RUST_VOTE_ROUNDS="$2"; shift 2 ;;
+        --cert-latest)            need_arg "$@"; CERT_LATEST="$2"; shift 2 ;;
         --no-go-authenticate)     RUN_GO_AUTH=0; shift ;;
         --no-cert-crossverify)    RUN_CERT=0; shift ;;
         --skip-preflight)         SKIP_PREFLIGHT=1; shift ;;
@@ -324,7 +334,16 @@ if [ "$RUN_CERT" = "1" ]; then
     if [ -z "${RUST_EARLIEST:-}" ]; then
         RUST_EARLIEST="$(probe_earliest_file "${BLOCK_PATH:-}")"
     fi
-    resolve_cert_window "$FROM_ROUND" "$TO_ROUND" "${RUST_EARLIEST:-}" || exit 2
+    # Issue #1913 (P2P analogue of #1821): --cert-latest N clamps the pass to the
+    # newest N rounds of the snapshot just taken, since onlineaccounts history is
+    # only retained back to ~tip-320 (go-algorand does the same).
+    if [ "$CERT_LATEST" != "0" ]; then
+        CERT_TO="$TO_ROUND"
+        resolve_cert_latest "$FROM_ROUND" "$(probe_latest_file "${BLOCK_PATH:-}")" "$CERT_LATEST" || exit 2
+    else
+        resolve_cert_window "$FROM_ROUND" "$TO_ROUND" "${RUST_EARLIEST:-}" || exit 2
+        CERT_TO="$TO_ROUND"
+    fi
     CERT_FROM="${CERT_FROM:?}"
     set +e
     "$CERT_BIN" \
@@ -332,7 +351,7 @@ if [ "$RUN_CERT" = "1" ]; then
         --token-file "$TOKEN_FILE" \
         --ledger-sqlite "$CERT_LEDGER_PATH" \
         --from-round "$CERT_FROM" \
-        --to-round "$TO_ROUND" \
+        --to-round "$CERT_TO" \
         --stride "$STRIDE" \
         --jsonl-out "$CERT_OUT" \
         "${CERT_EXTRA_ARGS[@]+"${CERT_EXTRA_ARGS[@]}"}"
