@@ -1224,7 +1224,8 @@ fn proposal_fees_collected_includes_inner_transaction_fees() {
         .err()
         .expect("the top-level-only sum is wrong");
     assert!(
-        err.to_string().contains("fees collected wrong: 1000 != 2000"),
+        err.to_string()
+            .contains("fees collected wrong: 1000 != 2000"),
         "{err}"
     );
 }

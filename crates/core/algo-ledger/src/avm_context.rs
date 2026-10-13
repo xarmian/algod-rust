@@ -7110,8 +7110,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                         // accounts for any nested inner txns it created.
                         current_counter = ad.txn_counter;
                         self.txn_counter = current_counter;
-                        self.fees_collected =
-                            self.fees_collected.saturating_add(ad.fees_collected);
+                        self.fees_collected = self.fees_collected.saturating_add(ad.fees_collected);
 
                         // H1: Restore box budget state from inner context.
                         if let Some(bs) = ad.box_state {

@@ -6339,8 +6339,11 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     // Inner fees count only when the program approved: go
                     // swallows a failed ClearState and drops its child cow.
                     if result.approved {
-                        ctx.fees_collected
-                            .set(ctx.fees_collected.get().saturating_add(avm_ctx.fees_collected));
+                        ctx.fees_collected.set(
+                            ctx.fees_collected
+                                .get()
+                                .saturating_add(avm_ctx.fees_collected),
+                        );
                     }
                     // Record EvalDelta comparison (clear-state).
                     record_eval_delta_comparison(
@@ -6512,8 +6515,11 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 ctx.fee_residue.set(avm_ctx.fee_residue);
                 // Inner-transaction fees (go `takeFee` in `Perform`); a rejected
                 // program fails the transaction, so the cell is restored anyway.
-                ctx.fees_collected
-                    .set(ctx.fees_collected.get().saturating_add(avm_ctx.fees_collected));
+                ctx.fees_collected.set(
+                    ctx.fees_collected
+                        .get()
+                        .saturating_add(avm_ctx.fees_collected),
+                );
 
                 // Record EvalDelta comparison (approval program).
                 record_eval_delta_comparison(stx, &result, ctx.round, ctx.txn_index.get(), app_id);
@@ -12319,7 +12325,9 @@ return
         let err = apply_block_executing_app_calls(&mut state, &block).unwrap_err();
         assert!(
             matches!(err, AlgoError::PayoutViolation { .. })
-                && err.to_string().contains("fees collected wrong: 1000 != 2000"),
+                && err
+                    .to_string()
+                    .contains("fees collected wrong: 1000 != 2000"),
             "{err}"
         );
     }
@@ -12362,7 +12370,8 @@ return
         let err =
             apply_block_checking_payouts(&mut state, &recorded, ApplyMode::Replay).unwrap_err();
         assert!(
-            err.to_string().contains("fees collected wrong: 1000 != 2000"),
+            err.to_string()
+                .contains("fees collected wrong: 1000 != 2000"),
             "{err}"
         );
     }
@@ -12378,10 +12387,18 @@ return
         ctx.rewards_level = 0;
         for depth in [0u32, 1] {
             apply_transaction(&mut store, &pay_txn(sink, other, 10, 1_000), &ctx, depth).unwrap();
-            assert_eq!(ctx.fees_collected.get(), 0, "sink-paid fee at depth {depth}");
+            assert_eq!(
+                ctx.fees_collected.get(),
+                0,
+                "sink-paid fee at depth {depth}"
+            );
         }
         apply_transaction(&mut store, &pay_txn(other, sink, 10, 1_000), &ctx, 1).unwrap();
-        assert_eq!(ctx.fees_collected.get(), 1_000, "inner fee of a normal sender");
+        assert_eq!(
+            ctx.fees_collected.get(),
+            1_000,
+            "inner fee of a normal sender"
+        );
     }
 
     /// (e) Issue #1731: an app account closed out by an inner `pay` (amount 0,
