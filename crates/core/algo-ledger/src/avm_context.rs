@@ -1201,6 +1201,11 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     /// Mirrors go-algorand's `Counter()` — incremented before each inner txn
     /// execution so that `txn_counter + 1` yields a unique creatable ID.
     pub txn_counter: u64,
+    /// Fees paid by the inner transactions this context submitted (its own
+    /// and, via [`crate::apply::InnerApplyData::fees_collected`], nested
+    /// children's), excluding fee-sink senders: the delta the caller adds to
+    /// its `fees_collected` (go `takeFee`, issue #1908).
+    pub fees_collected: u64,
     /// Fee sink address for inner transaction fee deduction.
     pub fee_sink: Address,
     /// Block rewards level that inner transactions' rewards pass brings every
@@ -2433,6 +2438,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             fee_credit: 0,
             fee_residue: 0,
             txn_counter: 0,
+            fees_collected: 0,
             fee_sink: Address::ZERO,
             rewards_level,
             opcode_budget: 0,
@@ -4797,6 +4803,7 @@ fn execute_inner_appl<L: LedgerStore>(
     let child_fee_credit = inner_ctx.fee_credit;
     let child_fee_residue = inner_ctx.fee_residue;
     let child_txn_counter = inner_ctx.txn_counter;
+    let child_fees_collected = inner_ctx.fees_collected;
     // P1-3: Capture all asset/app IDs created by nested inner txns so the
     // parent can track them for snapshot rollback.
     let child_created_assets = inner_ctx.created_assets.clone();
@@ -4854,6 +4861,7 @@ fn execute_inner_appl<L: LedgerStore>(
     ad.fee_credit = child_fee_credit;
     ad.fee_residue = child_fee_residue;
     ad.txn_counter = child_txn_counter;
+    ad.fees_collected = child_fees_collected;
     // P1-3: Propagate all nested created resources so the parent's
     // rollback can clean them up if a later sibling txn fails.
     ad.nested_created_assets = child_created_assets;
@@ -6932,6 +6940,9 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 let mut sink_acct = self.store.get_or_default_account(&fee_sink);
                 sink_acct.micro_algos += fee;
                 self.store.set_account(&fee_sink, sink_acct);
+                if sender != fee_sink {
+                    self.fees_collected = self.fees_collected.saturating_add(fee);
+                }
             }
 
             // Handle RekeyTo BEFORE type-specific dispatch (matches
@@ -7099,6 +7110,8 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                         // accounts for any nested inner txns it created.
                         current_counter = ad.txn_counter;
                         self.txn_counter = current_counter;
+                        self.fees_collected =
+                            self.fees_collected.saturating_add(ad.fees_collected);
 
                         // H1: Restore box budget state from inner context.
                         if let Some(bs) = ad.box_state {

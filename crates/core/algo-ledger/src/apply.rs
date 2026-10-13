@@ -116,6 +116,14 @@ pub struct ApplyContext {
     /// Uses `Cell` for interior mutability — the context is shared via `&`
     /// across all transactions in a block.
     pub txn_counter: Cell<u64>,
+    /// Fees collected by this apply (issue #1908): go's
+    /// `roundCowState.feesCollected`, which the header's `FeesCollected` must
+    /// equal. Every paid fee adds to it -- top-level AND inner-transaction
+    /// fees (`takeFee`, `ledger/eval/applications.go` `Perform`) -- except fees
+    /// whose sender is the fee sink (no net algos reach the sink). A failed
+    /// group / ClearState program discards what it added, as go drops the
+    /// child cow.
+    pub fees_collected: Cell<u64>,
     /// The ledger's `StateProofNextRound` as this block's transactions
     /// advance it (issue #1791).
     ///
@@ -227,6 +235,7 @@ impl ApplyContext {
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
+            fees_collected: Cell::new(0),
             state_proof_next: Cell::new(0),
             prev_header: RefCell::new(None),
             fee_credit: Cell::new(0),
@@ -1566,6 +1575,7 @@ pub(crate) fn check_authorizer<L: crate::store_trait::LedgerStore>(
 struct GroupCells {
     state_proof_next: u64,
     txn_counter: u64,
+    fees_collected: u64,
     txn_index: usize,
     fee_credit: u64,
     fee_residue: u64,
@@ -1582,6 +1592,7 @@ impl GroupCells {
         Self {
             state_proof_next: ctx.state_proof_next.get(),
             txn_counter: ctx.txn_counter.get(),
+            fees_collected: ctx.fees_collected.get(),
             txn_index: ctx.txn_index.get(),
             fee_credit: ctx.fee_credit.get(),
             fee_residue: ctx.fee_residue.get(),
@@ -1598,6 +1609,7 @@ impl GroupCells {
     ) {
         ctx.state_proof_next.set(self.state_proof_next);
         ctx.txn_counter.set(self.txn_counter);
+        ctx.fees_collected.set(self.fees_collected);
         ctx.txn_index.set(self.txn_index);
         ctx.fee_credit.set(self.fee_credit);
         ctx.fee_residue.set(self.fee_residue);
@@ -1873,6 +1885,10 @@ pub struct ProbeOutput {
     /// The transaction counter after every top-level and inner transaction
     /// of the block (go's `block.TxnCounter`); only set on success.
     pub final_txn_counter: u64,
+    /// The fees the block's transactions paid, top-level and inner, excluding
+    /// fee-sink senders (go `eval.state.feesCollected`, issue #1908); only set
+    /// on success. The header's `FeesCollected` must equal it.
+    pub final_fees_collected: u64,
     /// The `StateProofNextRound` after every state proof transaction of the
     /// block (go `cow.GetStateProofNextRound()` at `endOfBlock`, issue
     /// #1791); only set on success. `Some(n)`: a state proof was applied and
@@ -2517,6 +2533,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
             .unwrap_or(block.timestamp as u64),
         genesis_hash: gh,
         txn_counter: Cell::new(base_txn_counter),
+        fees_collected: Cell::new(0),
         state_proof_next: Cell::new(0),
         prev_header: RefCell::new(None),
         fee_credit: Cell::new(0),
@@ -2775,6 +2792,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         p.out.failed_txn_index = if result.is_err() { failed_txn } else { None };
         if result.is_ok() {
             p.out.final_txn_counter = ctx.txn_counter.get();
+            p.out.final_fees_collected = ctx.fees_collected.get();
             p.out.final_state_proof_next = final_state_proof_next;
             if let Some(exclude) = &p.request.knock_offline_exclude {
                 // After the payset, before the epilogue: go `endOfBlock`.
@@ -2876,7 +2894,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
             suspend_absent_accounts(store, block, &consensus)?;
             // go order: `validateForPayouts` precedes the state proof checks.
             if check_payouts {
-                validate_proposer_payout(store, block, &consensus)?;
+                validate_proposer_payout(store, block, &consensus, ctx.fees_collected.get())?;
             }
             if ctx.validate {
                 validate_state_proof_tracking(store, &ctx, block, &consensus)?;
@@ -3602,9 +3620,9 @@ fn suspend_absent_accounts<L: crate::store_trait::LedgerStore>(
 ///
 /// * Payouts disabled: `FeesCollected`, `Proposer` and `ProposerPayout` must
 ///   all be zero.
-/// * Payouts enabled: `FeesCollected` must equal the fees the payset paid
-///   (fees paid by the fee sink itself add no net algos and are not counted,
-///   go `takeFee`); `ProposerPayout` must not exceed `min(percent% *
+/// * Payouts enabled: `FeesCollected` must equal `paid`, the fees the payset
+///   paid -- top-level AND inner transactions (fees paid by the fee sink itself
+///   add no net algos and are not counted, go `takeFee`); `ProposerPayout` must not exceed `min(percent% *
 ///   FeesCollected + Bonus, fee-sink balance above MinBalance)` (a lower
 ///   payout is fine: a proposer may be altruistic); the proposer must be set,
 ///   and must not be a closed account when a payout is expected.
@@ -3612,6 +3630,7 @@ fn validate_proposer_payout<L: crate::store_trait::LedgerStore>(
     store: &L,
     block: &Block,
     consensus: &ConsensusParams,
+    paid: u64,
 ) -> Result<(), AlgoError> {
     let err = |message: String| Err(AlgoError::PayoutViolation { message });
     if !consensus.payouts_enabled {
@@ -3636,7 +3655,8 @@ fn validate_proposer_payout<L: crate::store_trait::LedgerStore>(
         return Ok(());
     }
 
-    let paid = crate::block_header::payset_fees_collected(&block.payset, &block.fee_sink);
+    // `paid` is the apply's own accumulator (top-level + inner fees, go
+    // `eval.state.feesCollected`), complete here: the payset loop has run.
     if block.fees_collected != paid {
         return err(format!(
             "fees collected wrong: {} != {}",
@@ -4619,12 +4639,12 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
         // Dispatch by transaction type and capture InnerApplyData.
         match txn.txn_type.as_str() {
             "pay" => {
-                apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink, &ctx.consensus)?;
+                apply_fee(store, &txn.sender, txn.fee, ctx)?;
                 let ad = apply_pay(store, &stx.txn, ctx.rewards_level)?;
                 apply_data.closing_amount = ad.closing_amount;
             }
             "acfg" => {
-                apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink, &ctx.consensus)?;
+                apply_fee(store, &txn.sender, txn.fee, ctx)?;
                 // Replaying a committed block: the block records the created
                 // asset id (`caid`), which is authoritative. Deriving it from
                 // the running counter is off by one for an inner create (the
@@ -4642,12 +4662,12 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
                 apply_data.config_asset = ad.config_asset;
             }
             "axfer" => {
-                apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink, &ctx.consensus)?;
+                apply_fee(store, &txn.sender, txn.fee, ctx)?;
                 let ad = apply_axfer(store, &stx.txn, &ctx.consensus)?;
                 apply_data.asset_closing_amount = ad.asset_closing_amount;
             }
             "afrz" => {
-                apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink, &ctx.consensus)?;
+                apply_fee(store, &txn.sender, txn.fee, ctx)?;
                 apply_afrz(store, &stx.txn)?;
             }
             "appl" => {
@@ -4691,7 +4711,7 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
                 }
             }
             "keyreg" => {
-                apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink, &ctx.consensus)?;
+                apply_fee(store, &txn.sender, txn.fee, ctx)?;
                 apply_keyreg(store, &stx.txn, ctx.round, &ctx.consensus)?;
             }
             "hb" => {
@@ -4700,7 +4720,7 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
                         message: "heartbeat transaction not supported".to_string(),
                     });
                 }
-                apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink, &ctx.consensus)?;
+                apply_fee(store, &txn.sender, txn.fee, ctx)?;
                 apply_heartbeat(store, &stx.txn, ctx.round, &ctx.consensus)?;
             }
             other => {
@@ -4895,13 +4915,17 @@ fn collect_inner_participants(eval_delta: &rmpv::Value, out: &mut Vec<Address>, 
 }
 
 /// Debit fee from sender and credit to fee_sink.
+///
+/// Also counts the fee into `ctx.fees_collected` (go `takeFee`), unless the
+/// sender is the fee sink itself.
 fn apply_fee<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     sender: &Address,
     fee: u64,
-    fee_sink: &Address,
-    consensus: &ConsensusParams,
+    ctx: &ApplyContext,
 ) -> Result<(), AlgoError> {
+    let fee_sink = &ctx.fee_sink;
+    let consensus = &ctx.consensus;
     let sender_account_before = store.get_or_default_account(sender);
     if sender_account_before.micro_algos < fee {
         return Err(AlgoError::Ledger {
@@ -4931,6 +4955,10 @@ fn apply_fee<L: crate::store_trait::LedgerStore>(
     fee_sink_account.micro_algos += fee;
     store.set_account(fee_sink, fee_sink_account);
 
+    if sender != fee_sink {
+        ctx.fees_collected
+            .set(ctx.fees_collected.get().saturating_add(fee));
+    }
     Ok(())
 }
 
@@ -6070,7 +6098,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
     let mut captured_eval_delta: Option<rmpv::Value> = None;
 
     // Debit fee first.
-    apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink, &ctx.consensus)?;
+    apply_fee(store, &txn.sender, txn.fee, ctx)?;
 
     let is_create = txn.application_id == 0;
     let app_id = if is_create {
@@ -6294,6 +6322,12 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     ctx.txn_counter.set(avm_ctx.txn_counter);
                     ctx.fee_credit.set(avm_ctx.fee_credit);
                     ctx.fee_residue.set(avm_ctx.fee_residue);
+                    // Inner fees count only when the program approved: go
+                    // swallows a failed ClearState and drops its child cow.
+                    if result.approved {
+                        ctx.fees_collected
+                            .set(ctx.fees_collected.get().saturating_add(avm_ctx.fees_collected));
+                    }
                     // Record EvalDelta comparison (clear-state).
                     record_eval_delta_comparison(
                         stx,
@@ -6462,6 +6496,10 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 ctx.txn_counter.set(avm_ctx.txn_counter);
                 ctx.fee_credit.set(avm_ctx.fee_credit);
                 ctx.fee_residue.set(avm_ctx.fee_residue);
+                // Inner-transaction fees (go `takeFee` in `Perform`); a rejected
+                // program fails the transaction, so the cell is restored anyway.
+                ctx.fees_collected
+                    .set(ctx.fees_collected.get().saturating_add(avm_ctx.fees_collected));
 
                 // Record EvalDelta comparison (approval program).
                 record_eval_delta_comparison(stx, &result, ctx.round, ctx.txn_index.get(), app_id);
@@ -6968,6 +7006,9 @@ pub struct InnerApplyData {
     /// Final transaction counter after inner app call execution.
     /// Propagated back so the parent can sync its txn_counter.
     pub txn_counter: u64,
+    /// Fees paid by this inner app call's own inner transactions (nested
+    /// included), for the parent to add to its `fees_collected` (issue #1908).
+    pub fees_collected: u64,
     /// All asset IDs created by this inner app call and any nested inner txns.
     /// Used by the parent to track resources for snapshot rollback (P1-3).
     pub nested_created_assets: Vec<u64>,
@@ -10771,6 +10812,7 @@ mod tests {
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
+            fees_collected: Cell::new(0),
             state_proof_next: Cell::new(0),
             prev_header: RefCell::new(None),
             fee_credit: Cell::new(0),
@@ -11479,6 +11521,7 @@ mod tests {
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
+            fees_collected: Cell::new(0),
             state_proof_next: Cell::new(0),
             prev_header: RefCell::new(None),
             fee_credit: Cell::new(0),
@@ -11665,6 +11708,7 @@ mod tests {
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
+            fees_collected: Cell::new(0),
             state_proof_next: Cell::new(0),
             prev_header: RefCell::new(None),
             fee_credit: Cell::new(0),
@@ -11690,6 +11734,7 @@ mod tests {
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
+            fees_collected: Cell::new(0),
             state_proof_next: Cell::new(0),
             prev_header: RefCell::new(None),
             fee_credit: Cell::new(0),
@@ -12165,6 +12210,164 @@ return
                 .unwrap_or(true),
             "app account must have been closed out"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // FeesCollected counts inner-transaction fees (issue #1908)
+    // ---------------------------------------------------------------------
+
+    /// State at round 2 holding an app that, when called, pays a 1_000 inner
+    /// fee (inner `pay` of 1 microAlgo to the caller), plus the round-3 call
+    /// block: top-level fee 1_000 + inner fee 1_000 = 2_000 collected.
+    fn issue_1908_fixture() -> (LedgerState, Block) {
+        let creator = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([9u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(creator, 20_000_000), (fee_sink, 0), (rewards_pool, 0)],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+        let approval = algo_avm::assembler::assemble_string(
+            "#pragma version 8
+            txn ApplicationID
+            bz approve
+            itxn_begin
+            int pay
+            itxn_field TypeEnum
+            txn Sender
+            itxn_field Receiver
+            int 1
+            itxn_field Amount
+            int 1000
+            itxn_field Fee
+            itxn_submit
+            approve:
+            int 1
+            return
+",
+        )
+        .expect("approval must assemble")
+        .program;
+        let clear = algo_avm::assembler::assemble_string(
+            "#pragma version 8
+int 1
+return
+",
+        )
+        .expect("clear must assemble")
+        .program;
+        let mk_block = |round: u64, payset: Vec<SignedTransaction>| Block {
+            round: Round(round),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset,
+            ..Block::default()
+        };
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = creator;
+        create.txn.fee = 1_000;
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        let delta1 =
+            apply_block_with_delta_mode(&mut state, &mk_block(1, vec![create]), ApplyMode::Execute)
+                .unwrap();
+        let (&app_id, _) = delta1.creatables.iter().next().unwrap();
+        let app_addr = Address(crate::avm_context::app_address(app_id));
+        let fund = pay_txn(creator, app_addr, 300_000, 1_000);
+        apply_block_with_delta_mode(&mut state, &mk_block(2, vec![fund]), ApplyMode::Execute)
+            .unwrap();
+
+        let mut call = SignedTransaction::default();
+        call.txn.txn_type = "appl".into();
+        call.txn.sender = creator;
+        call.txn.fee = 1_000;
+        call.txn.application_id = app_id;
+        let mut block = mk_block(3, vec![call]);
+        block.proposer = Address([0xAB; 32]);
+        block.fees_collected = 2_000;
+        (state, block)
+    }
+
+    /// go `takeFee` also counts every paid inner-transaction fee: the header
+    /// carrying top-level + inner fees passes the sync-apply
+    /// `validateForPayouts`, the top-level sum alone is rejected.
+    #[test]
+    fn issue_1908_sync_apply_counts_inner_transaction_fees() {
+        let (mut state, block) = issue_1908_fixture();
+        apply_block_executing_app_calls(&mut state, &block)
+            .expect("FeesCollected = top-level + inner fees must be accepted");
+
+        let (mut state, mut block) = issue_1908_fixture();
+        block.fees_collected = 1_000; // the top-level-only sum (the old bug)
+        let err = apply_block_executing_app_calls(&mut state, &block).unwrap_err();
+        assert!(
+            matches!(err, AlgoError::PayoutViolation { .. })
+                && err.to_string().contains("fees collected wrong: 1000 != 2000"),
+            "{err}"
+        );
+    }
+
+    /// The same holds when the block is replayed from its recorded ApplyData
+    /// (`ApplyMode::Replay`, which applies the recorded inner transactions):
+    /// the live fast-catchup path of mainnet block 65929681.
+    #[test]
+    fn issue_1908_replay_counts_inner_transaction_fees() {
+        let (mut exec_state, block) = issue_1908_fixture();
+        let mut ad: Vec<ApplyData> = Vec::new();
+        let mut probe = ExecProbe::default();
+        apply_block_impl_probe(
+            &mut exec_state,
+            &block,
+            ApplyMode::Execute,
+            false,
+            None,
+            None,
+            Some(&mut ad),
+            None,
+            true,
+            Some(&mut probe),
+        )
+        .unwrap();
+        assert_eq!(probe.out.final_fees_collected, 2_000);
+        // Record the executed ApplyData the way the proposer puts it in a block.
+        let mut recorded = block.clone();
+        for (stx, ad) in recorded.payset.iter_mut().zip(&ad) {
+            stx.eval_delta = ad.eval_delta.clone();
+        }
+        assert!(recorded.payset[0].eval_delta.is_some());
+
+        let (mut state, _) = issue_1908_fixture();
+        apply_block_checking_payouts(&mut state, &recorded, ApplyMode::Replay)
+            .expect("replayed FeesCollected must include the recorded inner fee");
+
+        let (mut state, _) = issue_1908_fixture();
+        recorded.fees_collected = 1_000;
+        let err =
+            apply_block_checking_payouts(&mut state, &recorded, ApplyMode::Replay).unwrap_err();
+        assert!(
+            err.to_string().contains("fees collected wrong: 1000 != 2000"),
+            "{err}"
+        );
+    }
+
+    /// Fees whose sender is the fee sink are not collected, top-level or inner
+    /// (go `takeFee`: no net algos reach the sink).
+    #[test]
+    fn issue_1908_fee_sink_sender_fees_are_not_collected() {
+        let sink = Address([3u8; 32]);
+        let other = Address([1u8; 32]);
+        let mut store = make_state_with_accounts(&[(sink, 5_000_000), (other, 5_000_000)], sink);
+        let mut ctx = apply_context_for_version(sink, 1, algo_types::consensus::CONSENSUS_V41);
+        ctx.rewards_level = 0;
+        for depth in [0u32, 1] {
+            apply_transaction(&mut store, &pay_txn(sink, other, 10, 1_000), &ctx, depth).unwrap();
+            assert_eq!(ctx.fees_collected.get(), 0, "sink-paid fee at depth {depth}");
+        }
+        apply_transaction(&mut store, &pay_txn(other, sink, 10, 1_000), &ctx, 1).unwrap();
+        assert_eq!(ctx.fees_collected.get(), 1_000, "inner fee of a normal sender");
     }
 
     /// (e) Issue #1731: an app account closed out by an inner `pay` (amount 0,
@@ -13146,6 +13349,7 @@ return
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
+            fees_collected: Cell::new(0),
             state_proof_next: Cell::new(0),
             prev_header: RefCell::new(None),
             fee_credit: Cell::new(0),
@@ -15091,6 +15295,7 @@ return
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
+            fees_collected: Cell::new(0),
             state_proof_next: Cell::new(0),
             prev_header: RefCell::new(None),
             fee_credit: Cell::new(0),

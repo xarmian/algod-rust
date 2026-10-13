@@ -574,6 +574,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             latest_timestamp,
             genesis_hash: *self.store.genesis_hash(),
             txn_counter: Cell::new(self.store.txn_counter()),
+            fees_collected: Cell::new(0),
             state_proof_next: Cell::new(0),
             prev_header: RefCell::new(None),
             fee_credit: Cell::new(fee_credit),

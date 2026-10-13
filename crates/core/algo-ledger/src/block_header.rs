@@ -307,12 +307,18 @@ impl std::fmt::Display for PayoutOverflow {
 
 impl std::error::Error for PayoutOverflow {}
 
-/// The fees a payset contributes to the header's `FeesCollected` (go
-/// `takeFee`): every top-level transaction's fee, except those paid BY the
-/// fee sink (no net algos reach the sink). The single definition shared by
-/// block validation and the proposer. Saturating where go wraps (`OAddA`
-/// ignores the overflow flag): unreachable, the fees of a payset cannot sum
-/// past the max supply.
+/// The TOP-LEVEL fees of a payset: every top-level transaction's fee, except
+/// those paid BY the fee sink (no net algos reach the sink).
+///
+/// This is NOT the header's `FeesCollected`: go's `takeFee` also counts the
+/// fee of every paid INNER transaction (`ledger/eval/applications.go`
+/// `Perform`), which is only known by applying the payset. The apply
+/// accumulates the real value (`ApplyContext::fees_collected`, surfaced as
+/// `ProbeOutput::final_fees_collected`) and block validation / the proposer
+/// use that (issue #1908). This function equals it only for a payset without
+/// inner-transaction fees (e.g. payment-only test blocks). Saturating where go
+/// wraps (`OAddA` ignores the overflow flag): unreachable, the fees of a
+/// payset cannot sum past the max supply.
 pub fn payset_fees_collected(payset: &[algo_types::SignedTransaction], fee_sink: &Address) -> u64 {
     payset
         .iter()
@@ -322,8 +328,10 @@ pub fn payset_fees_collected(payset: &[algo_types::SignedTransaction], fee_sink:
 
 /// Test helper: give a synthetic block a header that passes go's
 /// `validateForPayouts` -- a proposer, and `fees_collected` equal to the fees
-/// its payset paid (a no-op before payouts) -- so tests that sync-apply hand-built blocks (issue #1803)
-/// don't each restate it.
+/// its payset paid (a no-op before payouts) -- so tests that sync-apply
+/// hand-built blocks (issue #1803) don't each restate it. Top-level fees only
+/// ([`payset_fees_collected`]): for payment-only blocks; a payset whose app
+/// calls pay inner-transaction fees must set `fees_collected` itself (#1908).
 #[doc(hidden)]
 pub fn with_valid_payout_header(mut block: algo_types::Block) -> algo_types::Block {
     let payouts_enabled =

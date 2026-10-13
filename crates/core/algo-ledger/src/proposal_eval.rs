@@ -46,6 +46,9 @@ pub struct GroupEval {
     pub apply_data: Vec<ApplyData>,
     /// The transaction counter after the group (top-level and inner).
     pub final_txn_counter: u64,
+    /// The fees the group paid, top-level and inner transactions, excluding
+    /// fee-sink senders (go `takeFee`, issue #1908).
+    pub fees_collected: u64,
 }
 
 /// Why [`evaluate_group`] did not produce a [`GroupEval`].
@@ -125,6 +128,7 @@ pub fn evaluate_group<B: OverlayBase + ?Sized>(
             Ok(GroupEval {
                 apply_data: ad,
                 final_txn_counter: probe.out.final_txn_counter,
+                fees_collected: probe.out.final_fees_collected,
             })
         }
         Ok(Err(error)) => {
@@ -181,6 +185,7 @@ pub fn evaluate_payset<B: OverlayBase + ?Sized>(
     Ok(ScratchPayset {
         apply_data: ad,
         final_txn_counter: probe.out.final_txn_counter,
+        final_fees_collected: probe.out.final_fees_collected,
         final_state_proof_next: probe.out.final_state_proof_next,
         final_fee_sink_available: probe.out.final_fee_sink_available,
         knock_offline_lists: probe.out.knock_offline_lists.take(),

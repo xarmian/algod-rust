@@ -1140,6 +1140,95 @@ fn proposal_validation_entry_point_enforces_validate_for_payouts() {
     assert!(err.to_string().contains("proposer missing"), "{err}");
 }
 
+/// Issue #1908: go's `FeesCollected` also counts every paid INNER transaction
+/// fee (`takeFee` in `ledger/eval/applications.go`). The proposer must emit
+/// top-level + inner fees (and derive the payout from that), the overlay
+/// proposal validator and the validating apply must accept it, and the
+/// top-level-only sum must be rejected.
+#[test]
+fn proposal_fees_collected_includes_inner_transaction_fees() {
+    let s = key(3);
+    let d = key(4);
+    let app_id = 902u64;
+    let app_addr = Address(algo_ledger::avm_context::app_address(app_id));
+    let build = || {
+        let (ledger, mut eval) = evaluator(&[
+            (s.0, funded(50_000_000)),
+            (d.0, funded(1_000_000)),
+            (app_addr, funded(10_000_000)),
+        ]);
+        put_app(
+            &ledger,
+            app_id,
+            s.0,
+            concat!(
+                "#pragma version 8
+",
+                "itxn_begin
+",
+                "int pay
+",
+                "itxn_field TypeEnum
+",
+                "txn Accounts 1
+",
+                "itxn_field Receiver
+",
+                "int 1
+",
+                "itxn_field Amount
+",
+                "int 1000
+",
+                "itxn_field Fee
+",
+                "itxn_submit
+",
+                "int 1
+",
+            ),
+        );
+        eval.transaction_group(&[app_call(&s, app_id, vec![d.0], 1_000)])
+            .expect("app call with a paid inner fee");
+        let mut block = eval.generate_block(&[]).expect("generate_block");
+        // agreement sets the proposer after generation (go `WithProposer`).
+        block.proposer = s.0;
+        (ledger, eval, block)
+    };
+
+    let (ledger, eval, block) = build();
+    assert_eq!(
+        block.fees_collected, 2_000,
+        "top-level 1_000 + inner 1_000, not the top-level sum"
+    );
+    assert_eq!(
+        block.proposer_payout,
+        expected_payout(&ledger, &eval, &block),
+        "the payout is derived from the full FeesCollected"
+    );
+    assert!(block.proposer_payout > 0);
+    payout_validator(&ledger)
+        .validate(&block)
+        .map(|_| ())
+        .expect("the overlay proposal validation must accept the proposer's own block");
+    {
+        let mut l = ledger.lock().unwrap();
+        algo_ledger::apply_block_validating(&mut *l, &block)
+            .expect("the validating apply must accept it");
+    }
+
+    let (ledger, _eval, mut top_level_only) = build();
+    top_level_only.fees_collected = 1_000;
+    let err = payout_validator(&ledger)
+        .validate(&top_level_only)
+        .err()
+        .expect("the top-level-only sum is wrong");
+    assert!(
+        err.to_string().contains("fees collected wrong: 1000 != 2000"),
+        "{err}"
+    );
+}
+
 /// go fails block generation outright when `incentive + Bonus` overflows;
 /// the node must not propose that round (a payout of 0 would instead be
 /// rejected by its own `validateForPayouts`).
