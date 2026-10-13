@@ -305,17 +305,21 @@ mod tests {
 
     #[test]
     fn wait_for_quiet_tolerates_slow_but_changing_progress() {
-        // extra_pending counts down 50 -> 0, one tick every 30ms — several
-        // times slower than the 100ms `quiet_timeout` used here, so a flat
+        // extra_pending counts down 20 -> 0, one tick every 100ms; the whole
+        // countdown (2s) is twice the 1s `quiet_timeout` used here, so a flat
         // from-the-start budget would panic partway through. Because each
         // tick is a *change*, the progress-based stall watchdog never fires.
+        // The 10x margin between tick and stall timeout keeps the test from
+        // flaking when the polling thread is descheduled under heavy CPU
+        // contention (issue #1900: a 30ms tick vs 100ms timeout failed 1 in
+        // 100 loaded runs).
         // This is the shape of a genuinely busy (not stuck) cluster under
         // heavy CPU contention: settling takes a while, but there's
         // continuous, if slow, forward motion (issue #986).
         let monitor = parked_monitor();
         let network = TestingNetwork::new(1, 8);
 
-        let remaining = AtomicUsize::new(50);
+        let remaining = AtomicUsize::new(20);
         let started = Instant::now();
         let last_tick = std::sync::Mutex::new(Instant::now());
 
@@ -324,7 +328,7 @@ mod tests {
             &no_clocks(),
             || {
                 let mut last = last_tick.lock().unwrap();
-                if last.elapsed() >= Duration::from_millis(30) {
+                if last.elapsed() >= Duration::from_millis(100) {
                     let prev = remaining.load(Ordering::SeqCst);
                     if prev > 0 {
                         remaining.store(prev - 1, Ordering::SeqCst);
@@ -333,12 +337,12 @@ mod tests {
                 }
                 remaining.load(Ordering::SeqCst)
             },
-            Duration::from_millis(100),
+            Duration::from_secs(1),
             Duration::from_secs(30),
         );
 
         assert!(
-            started.elapsed() >= Duration::from_millis(500),
+            started.elapsed() >= Duration::from_millis(1500),
             "expected the countdown to take a while, took {:?}",
             started.elapsed()
         );
