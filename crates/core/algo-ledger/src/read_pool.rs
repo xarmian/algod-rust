@@ -64,10 +64,18 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use algo_error::AlgoError;
-use algo_types::{AccountData, AccountStatus, Address, BlockHeader};
+use algo_types::{
+    AccountData, AccountStatus, Address, AppLocalState, AppParams, AssetHolding, AssetParamsRecord,
+    BlockHeader,
+};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
-use crate::sqlite::{decode_account_data, decode_online_account_data, SqliteLedger};
+use crate::sqlite::{
+    decode_account_data, decode_app_local_state, decode_app_params, decode_asset_holding,
+    decode_asset_params, decode_online_account_data, inspect_resource_blob, make_box_key,
+    SqliteLedger, CTYPE_APP, CTYPE_ASSET,
+};
+use crate::store_trait::{BoxPage, LedgerStore};
 
 /// Idle connections kept for reuse; bursts above this open (and later close)
 /// extra connections rather than queueing.
@@ -347,6 +355,495 @@ impl LedgerReadPool {
         }
         PoolRead::Found(Some(acct))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Resource reads (issue #1893)
+// ---------------------------------------------------------------------------
+
+/// The ledger reads behind the REST resource lookups (`lookup_asset_resource`,
+/// `lookup_app_resource`, `lookup_application`, `lookup_asset_by_id`,
+/// `lookup_assets`, `lookup_applications`, the box/kv lookups and
+/// `total_boxes`).
+///
+/// Implemented by every [`LedgerStore`] (the locked path) and by
+/// [`PoolReader`] (one read snapshot on a pooled connection), so the REST
+/// adapter writes each lookup ONCE, generically, and both paths run the same
+/// composition over the same SQL and decoders.
+pub trait ResourceReads {
+    fn get_account(&self, addr: &Address) -> Option<AccountData>;
+    fn get_asset_holding(&self, addr: &Address, asset_id: u64) -> Option<AssetHolding>;
+    fn get_asset_params(&self, asset_id: u64) -> Option<AssetParamsRecord>;
+    fn get_app_params(&self, app_id: u64) -> Option<AppParams>;
+    fn get_app_local_state(&self, addr: &Address, app_id: u64) -> Option<AppLocalState>;
+    fn app_local_states_for_addr(&self, addr: &Address) -> Vec<(u64, AppLocalState)>;
+    fn asset_holdings_for_addr(&self, addr: &Address) -> Vec<(u64, AssetHolding)>;
+    fn created_apps_for_addr(&self, addr: &Address) -> Vec<(u64, AppParams)>;
+    fn get_box(&self, app_id: u64, key: &[u8]) -> Option<Vec<u8>>;
+    fn box_keys_for_app(&self, app_id: u64) -> Vec<Vec<u8>>;
+    fn box_keys_by_prefix_paginated(
+        &self,
+        app_id: u64,
+        prefix: &[u8],
+        cursor: Option<&[u8]>,
+        limit: Option<u64>,
+        include_values: bool,
+    ) -> (BoxPage, bool);
+}
+
+impl<T: LedgerStore + ?Sized> ResourceReads for T {
+    fn get_account(&self, addr: &Address) -> Option<AccountData> {
+        LedgerStore::get_account(self, addr)
+    }
+    fn get_asset_holding(&self, addr: &Address, asset_id: u64) -> Option<AssetHolding> {
+        LedgerStore::get_asset_holding(self, addr, asset_id)
+    }
+    fn get_asset_params(&self, asset_id: u64) -> Option<AssetParamsRecord> {
+        LedgerStore::get_asset_params(self, asset_id)
+    }
+    fn get_app_params(&self, app_id: u64) -> Option<AppParams> {
+        LedgerStore::get_app_params(self, app_id)
+    }
+    fn get_app_local_state(&self, addr: &Address, app_id: u64) -> Option<AppLocalState> {
+        LedgerStore::get_app_local_state(self, addr, app_id)
+    }
+    fn app_local_states_for_addr(&self, addr: &Address) -> Vec<(u64, AppLocalState)> {
+        LedgerStore::app_local_states_for_addr(self, addr)
+    }
+    fn asset_holdings_for_addr(&self, addr: &Address) -> Vec<(u64, AssetHolding)> {
+        LedgerStore::asset_holdings_for_addr(self, addr)
+    }
+    fn created_apps_for_addr(&self, addr: &Address) -> Vec<(u64, AppParams)> {
+        LedgerStore::created_apps_for_addr(self, addr)
+    }
+    fn get_box(&self, app_id: u64, key: &[u8]) -> Option<Vec<u8>> {
+        LedgerStore::get_box(self, app_id, key)
+    }
+    fn box_keys_for_app(&self, app_id: u64) -> Vec<Vec<u8>> {
+        LedgerStore::box_keys_for_app(self, app_id)
+    }
+    fn box_keys_by_prefix_paginated(
+        &self,
+        app_id: u64,
+        prefix: &[u8],
+        cursor: Option<&[u8]>,
+        limit: Option<u64>,
+        include_values: bool,
+    ) -> (BoxPage, bool) {
+        LedgerStore::box_keys_by_prefix_paginated(
+            self,
+            app_id,
+            prefix,
+            cursor,
+            limit,
+            include_values,
+        )
+    }
+}
+
+/// Resource reads over one pooled read snapshot (see
+/// [`LedgerReadPool::read_resources`]). The SQL and decoders are the ones the
+/// locked [`SqliteLedger`] accessors use. The locked accessors log a SQL error
+/// and answer `None`/empty; here the FIRST SQL error is recorded instead and
+/// makes the whole snapshot fail, so the caller falls back to the locked path
+/// rather than serving a silently truncated answer.
+pub struct PoolReader<'a> {
+    conn: &'a Connection,
+    err: std::cell::Cell<Option<rusqlite::Error>>,
+}
+
+impl PoolReader<'_> {
+    fn ok<T>(&self, r: Result<T, rusqlite::Error>) -> Option<T> {
+        match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                let first = self.err.take();
+                self.err.set(first.or(Some(e)));
+                None
+            }
+        }
+    }
+
+    fn rowid(&self, addr: &Address) -> Option<i64> {
+        self.ok(self
+            .conn
+            .prepare_cached("SELECT rowid FROM accountbase WHERE address = ?1")
+            .and_then(|mut s| {
+                s.query_row(params![addr.0.as_slice()], |row| row.get(0))
+                    .optional()
+            }))
+        .flatten()
+    }
+
+    fn creator_of(&self, id: u64) -> Option<Address> {
+        let bytes: Vec<u8> = self
+            .ok(self
+                .conn
+                .prepare_cached("SELECT creator FROM assetcreators WHERE asset = ?1")
+                .and_then(|mut s| s.query_row(params![id as i64], |row| row.get(0)).optional()))
+            .flatten()?;
+        let arr: [u8; 32] = bytes.try_into().ok()?;
+        Some(Address(arr))
+    }
+
+    fn resource_blob(&self, rowid: i64, aidx: u64, ctype: i64) -> Option<Vec<u8>> {
+        self.ok(self
+            .conn
+            .prepare_cached(
+                "SELECT data FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
+            )
+            .and_then(|mut s| {
+                s.query_row(params![rowid, aidx as i64, ctype], |row| row.get(0))
+                    .optional()
+            }))
+        .flatten()
+    }
+
+    fn resource_rows(&self, addr: &Address, ctype: i64) -> Vec<(u64, Vec<u8>)> {
+        let Some(rowid) = self.rowid(addr) else {
+            return Vec::new();
+        };
+        self.ok(self
+            .conn
+            .prepare_cached("SELECT aidx, data FROM resources WHERE addrid = ?1 AND ctype = ?2")
+            .and_then(|mut s| {
+                let rows = s.query_map(params![rowid, ctype], |row| {
+                    Ok((row.get::<_, i64>(0)? as u64, row.get::<_, Vec<u8>>(1)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
+            }))
+        .unwrap_or_default()
+    }
+
+    fn kv_keys_in(&self, lower: Vec<u8>, upper: Vec<u8>) -> Vec<Vec<u8>> {
+        self.ok(self
+            .conn
+            .prepare_cached("SELECT key FROM kvstore WHERE key >= ?1 AND key < ?2")
+            .and_then(|mut s| {
+                let rows = s.query_map(params![lower, upper], |row| row.get::<_, Vec<u8>>(0))?;
+                rows.collect::<Result<Vec<_>, _>>()
+            }))
+        .unwrap_or_default()
+    }
+}
+
+impl ResourceReads for PoolReader<'_> {
+    fn get_account(&self, addr: &Address) -> Option<AccountData> {
+        let data: Vec<u8> = self
+            .ok(self
+                .conn
+                .prepare_cached("SELECT data FROM accountbase WHERE address = ?1")
+                .and_then(|mut s| {
+                    s.query_row(params![addr.0.as_slice()], |row| row.get(0))
+                        .optional()
+                }))
+            .flatten()?;
+        decode_account_data(&data).ok()
+    }
+
+    fn get_asset_holding(&self, addr: &Address, asset_id: u64) -> Option<AssetHolding> {
+        let rowid = self.rowid(addr)?;
+        let data = self.resource_blob(rowid, asset_id, CTYPE_ASSET)?;
+        if !inspect_resource_blob(&data).has_holding {
+            return None;
+        }
+        decode_asset_holding(&data).ok()
+    }
+
+    fn get_asset_params(&self, asset_id: u64) -> Option<AssetParamsRecord> {
+        let creator = self.creator_of(asset_id)?;
+        let rowid = self.rowid(&creator)?;
+        let data = self.resource_blob(rowid, asset_id, CTYPE_ASSET)?;
+        if !inspect_resource_blob(&data).has_ownership {
+            return None;
+        }
+        let params = decode_asset_params(&data).ok()?;
+        Some(AssetParamsRecord { params, creator })
+    }
+
+    fn get_app_params(&self, app_id: u64) -> Option<AppParams> {
+        let creator = self.creator_of(app_id)?;
+        let rowid = self.rowid(&creator)?;
+        let data = self.resource_blob(rowid, app_id, CTYPE_APP)?;
+        if !inspect_resource_blob(&data).has_ownership {
+            return None;
+        }
+        decode_app_params(&data, creator).ok()
+    }
+
+    fn get_app_local_state(&self, addr: &Address, app_id: u64) -> Option<AppLocalState> {
+        let rowid = self.rowid(addr)?;
+        let data = self.resource_blob(rowid, app_id, CTYPE_APP)?;
+        if !inspect_resource_blob(&data).has_holding {
+            return None;
+        }
+        decode_app_local_state(&data).ok()
+    }
+
+    fn app_local_states_for_addr(&self, addr: &Address) -> Vec<(u64, AppLocalState)> {
+        self.resource_rows(addr, CTYPE_APP)
+            .into_iter()
+            .filter_map(|(aidx, data)| {
+                if !inspect_resource_blob(&data).has_holding {
+                    return None;
+                }
+                Some((aidx, decode_app_local_state(&data).ok()?))
+            })
+            .collect()
+    }
+
+    fn asset_holdings_for_addr(&self, addr: &Address) -> Vec<(u64, AssetHolding)> {
+        self.resource_rows(addr, CTYPE_ASSET)
+            .into_iter()
+            .filter_map(|(aidx, data)| {
+                if !inspect_resource_blob(&data).has_holding {
+                    return None;
+                }
+                Some((aidx, decode_asset_holding(&data).ok()?))
+            })
+            .collect()
+    }
+
+    fn created_apps_for_addr(&self, addr: &Address) -> Vec<(u64, AppParams)> {
+        self.resource_rows(addr, CTYPE_APP)
+            .into_iter()
+            .filter_map(|(aidx, data)| {
+                if !inspect_resource_blob(&data).has_ownership {
+                    return None;
+                }
+                Some((aidx, decode_app_params(&data, *addr).ok()?))
+            })
+            .collect()
+    }
+
+    fn get_box(&self, app_id: u64, key: &[u8]) -> Option<Vec<u8>> {
+        let full_key = make_box_key(app_id, key);
+        self.ok(self
+            .conn
+            .prepare_cached("SELECT value FROM kvstore WHERE key = ?1")
+            .and_then(|mut s| {
+                s.query_row(params![full_key], |row| row.get::<_, Vec<u8>>(0))
+                    .optional()
+            }))
+        .flatten()
+    }
+
+    fn box_keys_for_app(&self, app_id: u64) -> Vec<Vec<u8>> {
+        let prefix = make_box_key(app_id, b"");
+        let prefix_len = prefix.len();
+        // Same bounds as `SqliteLedger::box_keys_for_app`, including the
+        // `u64::MAX` edge (upper bound `"by:"`).
+        let upper = if app_id == u64::MAX {
+            b"by:".to_vec()
+        } else {
+            make_box_key(app_id + 1, b"")
+        };
+        self.kv_keys_in(prefix, upper)
+            .into_iter()
+            .map(|full_key| full_key[prefix_len..].to_vec())
+            .collect()
+    }
+
+    // The same algorithm as `LedgerStore::box_keys_by_prefix_paginated`'s
+    // default (which `SqliteLedger` uses), over this snapshot's accessors.
+    fn box_keys_by_prefix_paginated(
+        &self,
+        app_id: u64,
+        prefix: &[u8],
+        cursor: Option<&[u8]>,
+        limit: Option<u64>,
+        include_values: bool,
+    ) -> (BoxPage, bool) {
+        let mut names: Vec<Vec<u8>> = self
+            .box_keys_for_app(app_id)
+            .into_iter()
+            .filter(|name| name.starts_with(prefix))
+            .filter(|name| match cursor {
+                Some(c) => name.as_slice() > c,
+                None => true,
+            })
+            .collect();
+        names.sort();
+        let more_data = match limit {
+            Some(l) => (names.len() as u64) > l,
+            None => false,
+        };
+        if let Some(l) = limit {
+            names.truncate(l as usize);
+        }
+        let results = names
+            .into_iter()
+            .map(|name| {
+                let value = if include_values {
+                    self.get_box(app_id, &name)
+                } else {
+                    None
+                };
+                (name, value)
+            })
+            .collect();
+        (results, more_data)
+    }
+}
+
+impl LedgerReadPool {
+    /// Run `f` against ONE read snapshot of the committed tracker state and
+    /// return it with the committed round (`acctrounds.acctbase`, `0` on a
+    /// never-initialised database, like the locked
+    /// `last_committed_round().unwrap_or(0)`) read in the same snapshot, so
+    /// the round and the data can never tear across a concurrent commit.
+    ///
+    /// The snapshot is a short read transaction that ends before this call
+    /// returns (the WAL is never pinned). Any SQL error, in `f`'s reads or
+    /// the bookkeeping, is `Err` and the caller takes the locked path. A
+    /// resource that is absent from the snapshot is an authoritative miss:
+    /// the tracker tables live in one file and commit atomically.
+    pub fn read_resources<T>(
+        &self,
+        f: impl FnOnce(&PoolReader<'_>) -> T,
+    ) -> Result<(u64, T), AlgoError> {
+        self.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+            let rnd: Option<i64> = tx
+                .prepare_cached("SELECT rnd FROM acctrounds WHERE id = 'acctbase'")?
+                .query_row([], |row| row.get(0))
+                .optional()?;
+            let reader = PoolReader {
+                conn: &tx,
+                err: std::cell::Cell::new(None),
+            };
+            let out = f(&reader);
+            if let Some(e) = reader.err.take() {
+                return Err(e);
+            }
+            drop(reader);
+            tx.commit()?;
+            Ok((rnd.map(|v| v.max(0) as u64).unwrap_or(0), out))
+        })
+    }
+
+    /// Lock-free `SqliteLedger::online_circulation_at_round` (go's
+    /// `onlineCirculation`): the per-round supply snapshot else the current
+    /// aggregate, less the stake expired by `vote_rnd` when the committed
+    /// tip's protocol excludes it. Everything is read in one snapshot.
+    ///
+    /// [`PoolRead::Fallback`] when the answer is not certain to equal the
+    /// locked one: `round` above the committed round, no committed tip block
+    /// to take the protocol from, an unreadable header or row, or any SQL
+    /// error. The locked path then decides (and reports its own errors).
+    pub fn online_circulation_at_round(&self, round: u64, vote_rnd: u64) -> PoolRead<u64> {
+        let res = self.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+            let v = circulation_in_snapshot(&tx, round, vote_rnd)?;
+            tx.commit()?;
+            Ok(v)
+        });
+        match res {
+            Ok(Some(v)) => PoolRead::Found(v),
+            _ => PoolRead::Fallback,
+        }
+    }
+}
+
+/// `Ok(None)` = cannot answer authoritatively (see
+/// [`LedgerReadPool::online_circulation_at_round`]).
+fn circulation_in_snapshot(
+    c: &Connection,
+    round: u64,
+    vote_rnd: u64,
+) -> Result<Option<u64>, rusqlite::Error> {
+    let committed: Option<i64> = c
+        .prepare_cached("SELECT rnd FROM acctrounds WHERE id = 'acctbase'")?
+        .query_row([], |row| row.get(0))
+        .optional()?;
+    let committed = match committed {
+        Some(v) if round <= v.max(0) as u64 => v.max(0) as u64,
+        _ => return Ok(None),
+    };
+
+    // Per-round supply snapshot, else the current aggregate.
+    let tail: Option<Vec<u8>> = c
+        .prepare_cached("SELECT data FROM onlineroundparamstail WHERE rnd = ?1")?
+        .query_row(params![round as i64], |row| row.get(0))
+        .optional()?;
+    let total = match tail {
+        Some(data) => {
+            let Ok(value) = rmpv::decode::read_value(&mut &data[..]) else {
+                return Ok(None);
+            };
+            let mut online = 0u64;
+            if let Some(map) = value.as_map() {
+                for (k, v) in map {
+                    if k.as_str() == Some("online") {
+                        online = v.as_u64().unwrap_or(0);
+                        break;
+                    }
+                }
+            }
+            online
+        }
+        None => {
+            let online: Option<i64> = c
+                .prepare_cached("SELECT online FROM accounttotals WHERE id = ''")?
+                .query_row([], |row| row.get(0))
+                .optional()?;
+            online.unwrap_or(0).max(0) as u64
+        }
+    };
+
+    // The ledger's current protocol is the committed tip block's.
+    let proto: Option<String> = c
+        .prepare_cached("SELECT proto FROM blockdb.blocks WHERE rnd = ?1")?
+        .query_row(params![committed as i64], |row| row.get(0))
+        .optional()?;
+    let Some(proto) = proto else {
+        return Ok(None);
+    };
+    let exclude = algo_types::consensus::consensus_params_for_version(&proto)
+        .map(|p| p.exclude_expired_circulation)
+        .unwrap_or(false);
+    if !exclude || round == 0 {
+        return Ok(Some(total));
+    }
+
+    let hdr: Option<Vec<u8>> = c
+        .prepare_cached("SELECT hdrdata FROM blockdb.blocks WHERE rnd = ?1")?
+        .query_row(params![round as i64], |row| row.get(0))
+        .optional()?;
+    let Some(rewards_level) = hdr
+        .and_then(|h| BlockHeader::decode_from_bytes(&h).ok())
+        .map(|h| h.rewards_level)
+    else {
+        return Ok(None);
+    };
+
+    let mut stmt = c.prepare_cached(
+        "SELECT o.data FROM onlineaccounts o \
+         WHERE o.votelastvalid != 0 AND o.votelastvalid < ?2 \
+           AND o.updround = (SELECT MAX(i.updround) FROM onlineaccounts i \
+                             WHERE i.address = o.address AND i.updround <= ?1)",
+    )?;
+    let rows = stmt.query_map(params![round as i64, vote_rnd as i64], |row| {
+        row.get::<_, Vec<u8>>(0)
+    })?;
+    let mut expired: u64 = 0;
+    for row in rows {
+        let data = row?;
+        let Ok(mut account) = decode_online_account_data(&data) else {
+            return Ok(None);
+        };
+        if account.vote_last_valid == 0 || vote_rnd <= account.vote_last_valid {
+            continue;
+        }
+        if rewards_level >= account.rewards_base {
+            crate::rewards::apply_rewards(&mut account, rewards_level);
+        }
+        let Some(sum) = expired.checked_add(account.micro_algos) else {
+            return Ok(None);
+        };
+        expired = sum;
+    }
+    Ok(Some(total.saturating_sub(expired)))
 }
 
 /// Lazily resolved handle to a ledger's [`LedgerReadPool`], held by the REST

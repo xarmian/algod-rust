@@ -347,17 +347,29 @@ impl AgreementLedgerBridge {
     /// Returns an error if no certificate is stored for the round or if
     /// decoding fails.
     pub fn get_cert_for_round(&self, round: Round) -> Result<Certificate, LedgerError> {
-        let ledger = self
-            .ledger
-            .lock()
-            .map_err(|e| LedgerError::Other(format!("ledger lock poisoned: {e}")))?;
-
-        let cert_bytes = ledger
-            .get_block_cert(round.0)
-            .map_err(|e| LedgerError::Other(format!("get_block_cert: {e}")))?
-            .ok_or_else(|| {
-                LedgerError::Other(format!("no certificate stored for round {round}"))
-            })?;
+        let no_cert = || LedgerError::Other(format!("no certificate stored for round {round}"));
+        // Issue #1893: a committed certificate is served without the ledger
+        // mutex. A row without a certificate, or a round beyond the commit,
+        // is the same "no certificate" the locked accessor reports; a miss at
+        // a committed round or an error takes the locked path below.
+        let pooled = self
+            .read_pool
+            .get(&self.ledger)
+            .map(|pool| pool.block_cert(round.0));
+        let cert_bytes = match pooled {
+            Some(PoolRead::Found(Some(bytes))) => bytes,
+            Some(PoolRead::Found(None)) | Some(PoolRead::NotFound) => return Err(no_cert()),
+            Some(PoolRead::Fallback) | None => {
+                let ledger = self
+                    .ledger
+                    .lock()
+                    .map_err(|e| LedgerError::Other(format!("ledger lock poisoned: {e}")))?;
+                ledger
+                    .get_block_cert(round.0)
+                    .map_err(|e| LedgerError::Other(format!("get_block_cert: {e}")))?
+                    .ok_or_else(no_cert)?
+            }
+        };
 
         let bundle = algo_agreement::codec::decode_bundle(&cert_bytes)
             .map_err(|e| LedgerError::Other(format!("decode_bundle: {e}")))?;
@@ -646,6 +658,14 @@ impl LedgerReader for AgreementLedgerBridge {
     }
 
     fn circulation(&self, rnd: Round, vote_rnd: Round) -> Result<u64, LedgerError> {
+        // Issue #1893: served from one committed snapshot without the ledger
+        // mutex; anything it cannot answer authoritatively (round beyond the
+        // commit, unreadable rows, no pool) takes the locked path below.
+        if let Some(pool) = self.read_pool.get(&self.ledger) {
+            if let PoolRead::Found(v) = pool.online_circulation_at_round(rnd.0, vote_rnd.0) {
+                return Ok(v);
+            }
+        }
         let ledger = self
             .ledger
             .lock()
