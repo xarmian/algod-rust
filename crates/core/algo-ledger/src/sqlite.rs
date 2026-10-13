@@ -5867,9 +5867,24 @@ impl SqliteLedger {
         round: u64,
         rewards_level: u64,
     ) -> Result<(), AlgoError> {
+        self.put_block_header_fixture_with_seed(round, rewards_level, [0u8; 32], "")
+    }
+
+    /// [`Self::put_block_header_fixture`] with the header's `seed` and
+    /// `current_protocol` set (what a payout challenge reads, issue #1895).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn put_block_header_fixture_with_seed(
+        &self,
+        round: u64,
+        rewards_level: u64,
+        seed: [u8; 32],
+        protocol: &str,
+    ) -> Result<(), AlgoError> {
         let hdr = algo_types::BlockHeader {
             round: Round(round),
             rewards_level,
+            seed,
+            current_protocol: protocol.to_string(),
             ..algo_types::BlockHeader::default()
         };
         let hdrdata = rmp_serde::to_vec_named(&hdr).map_err(|e| AlgoError::Ledger {
@@ -6105,6 +6120,73 @@ impl SqliteLedger {
         }
         *self.knock_index.get_mut() = taken;
         self.knock_dirty.clear();
+    }
+
+    /// Keyset page of the ordered online stream (issue #1895): the online
+    /// accounts with an address strictly after `after`, scanning at most
+    /// `max_rows` rows. `Some(last address scanned)` when more rows remain,
+    /// `None` when the stream ended or `visit` stopped it.
+    fn online_account_page(
+        &self,
+        after: Option<&Address>,
+        max_rows: usize,
+        visit: &mut dyn FnMut(Address, AccountData) -> bool,
+    ) -> Option<Address> {
+        // One extra row tells whether more remain without a trailing empty page.
+        let limit = i64::try_from(max_rows.saturating_add(1)).unwrap_or(i64::MAX);
+        let after_bytes: Vec<u8> = after.map(|a| a.0.to_vec()).unwrap_or_default();
+        let mut stmt = match self.conn.prepare(
+            "SELECT address, data FROM accountbase WHERE normalizedonlinebalance > 0              AND address > ?1 ORDER BY address LIMIT ?2",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("online_account_page: prepare error: {e}");
+                return None;
+            }
+        };
+        let mut rows = match stmt.query(params![after_bytes, limit]) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("online_account_page: query error: {e}");
+                return None;
+            }
+        };
+        let mut scanned = 0usize;
+        let mut last: Option<Address> = None;
+        loop {
+            let row = match rows.next() {
+                Ok(Some(r)) => r,
+                Ok(None) => return None,
+                Err(e) => {
+                    tracing::error!("online_account_page: row read error: {e}");
+                    return None;
+                }
+            };
+            if scanned >= max_rows {
+                return last; // the lookahead row: more remain
+            }
+            scanned += 1;
+            let (Ok(addr_bytes), Ok(data)) = (row.get_ref(0), row.get_ref(1)) else {
+                continue;
+            };
+            let (Ok(addr_bytes), Ok(data)) = (addr_bytes.as_blob(), data.as_blob()) else {
+                continue;
+            };
+            let Ok(addr_arr) = <[u8; 32]>::try_from(addr_bytes) else {
+                tracing::error!("online_account_page: bad address length");
+                continue;
+            };
+            last = Some(Address(addr_arr));
+            match decode_account_data(data) {
+                Ok(account) if account.status == AccountStatus::Online => {
+                    if !visit(Address(addr_arr), account) {
+                        return None;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => tracing::error!("online_account_page: decode error: {e}"),
+            }
+        }
     }
 
     fn knock_pending_addresses(&self) -> std::collections::HashSet<Address> {
@@ -8460,6 +8542,58 @@ impl LedgerStore for SqliteLedger {
 
     fn pending_modified_addresses(&self) -> Option<Vec<Address>> {
         Some(self.knock_pending_addresses().into_iter().collect())
+    }
+
+    fn for_each_knock_offline_candidate_page(
+        &self,
+        round: u64,
+        challenge_round: u64,
+        after: Option<&Address>,
+        max_rows: usize,
+        visit: &mut dyn FnMut(Address, AccountData) -> bool,
+    ) -> Option<Address> {
+        // Issue #1895: keyset-paginated twin of
+        // `for_each_knock_offline_candidate_ordered` (same selection, same
+        // order, resumable strictly after `after`), so the proposer can drop
+        // the ledger mutex between bounded chunks.
+        let max_rows = max_rows.max(1);
+        self.ensure_knock_index();
+        let mut overlay = self.knock_pending_addresses();
+        let candidates = {
+            let guard = self.knock_index.borrow();
+            let index = guard.as_ref().expect("built above");
+            overlay.extend(index.unsettled.iter().copied());
+            let limit = match self.knock_fallback_divisor {
+                0 => usize::MAX,
+                d => index.len() / d,
+            };
+            index.candidates(round, challenge_round, &overlay, limit)
+        };
+        let Some(mut order) = candidates else {
+            return self.online_account_page(after, max_rows, visit);
+        };
+        order.extend(overlay.iter().map(|a| a.0));
+        use std::ops::Bound;
+        let lower = after.map_or(Bound::Unbounded, |a| Bound::Excluded(a.0));
+        let mut last: Option<Address> = None;
+        for (scanned, &a) in order.range((lower, Bound::Unbounded)).enumerate() {
+            if scanned >= max_rows {
+                return last;
+            }
+            let addr = Address(a);
+            last = Some(addr);
+            let Some(acct) = self.get_account(&addr) else {
+                continue;
+            };
+            // Same membership as the full ordered stream.
+            if account_nob_i64(&acct) <= 0 || acct.status != AccountStatus::Online {
+                continue;
+            }
+            if !visit(addr, acct) {
+                return None;
+            }
+        }
+        None
     }
 
     fn for_each_knock_offline_candidate_ordered(
@@ -16239,7 +16373,8 @@ mod tests {
         // Make it legacy-shaped: the history, the supply tail and the marker
         // never existed.
         let conn = Connection::open(tracker_path_for_prefix(prefix)).unwrap();
-        conn.execute_cached("DELETE FROM onlineaccounts", []).unwrap();
+        conn.execute_cached("DELETE FROM onlineaccounts", [])
+            .unwrap();
         conn.execute_cached("DELETE FROM onlineroundparamstail", [])
             .unwrap();
         conn.execute_cached("DELETE FROM acctrounds WHERE id = 'onlinebackfill'", [])
@@ -16415,7 +16550,10 @@ mod tests {
             vec![Address([9u8; 32])],
             "sanity: listed while the marker is readable"
         );
-        ledger.conn.execute_cached("DROP TABLE acctrounds", []).unwrap();
+        ledger
+            .conn
+            .execute_cached("DROP TABLE acctrounds", [])
+            .unwrap();
         assert!(ledger.absence_history_uncertain(0).is_err());
         let l = lists(&ledger, 101, &consensus_v41(), &Default::default(), &[]);
         assert!(l.absent.is_empty(), "proposer: undecidable, nobody listed");
@@ -16752,7 +16890,7 @@ mod tests {
         let SqliteLedger {
             conn: _,
             db_prefix: _,
-            read_pool: _, // separate read-only connections, no chain state
+            read_pool: _,   // separate read-only connections, no chain state
             lease_table: _, // restored via lease_snapshot
             lease_snapshot: _,
             chain_snapshot: _,
@@ -16772,7 +16910,7 @@ mod tests {
             txn_counter: _,                 // ChainSnapshot
             savepoint_counter: _,
             in_block: _,
-            read_cache: _, // dropped at every block boundary and rollback
+            read_cache: _,    // dropped at every block boundary and rollback
             trie: _,          // reloaded by rollback
             pre_mutations: _, // cleared by rollback
             trie_cache_target: _,

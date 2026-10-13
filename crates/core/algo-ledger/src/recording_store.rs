@@ -616,6 +616,23 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
             .for_each_knock_offline_candidate_ordered(round, challenge_round, visit)
     }
 
+    fn for_each_knock_offline_candidate_page(
+        &self,
+        round: u64,
+        challenge_round: u64,
+        after: Option<&Address>,
+        max_rows: usize,
+        visit: &mut dyn FnMut(Address, AccountData) -> bool,
+    ) -> Option<Address> {
+        self.inner.for_each_knock_offline_candidate_page(
+            round,
+            challenge_round,
+            after,
+            max_rows,
+            visit,
+        )
+    }
+
     fn put_voters_snapshot(
         &mut self,
         round: u64,
