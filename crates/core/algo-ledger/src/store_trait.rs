@@ -692,6 +692,49 @@ pub trait LedgerStore {
         self.for_each_online_account_ordered(visit)
     }
 
+    /// A bounded, resumable slice of
+    /// [`Self::for_each_knock_offline_candidate_ordered`] (issue #1895): visit
+    /// the candidates with an address strictly greater than `after` (`None`:
+    /// from the start), in ascending order, scanning at most `max_rows` rows
+    /// (at least one). Returns `Some(resume)` when rows remain: pass it as
+    /// `after` to continue (it is the last row SCANNED, which may precede the
+    /// last row visited when the backend skips non-members, so a page always
+    /// makes progress). Returns `None` when the stream is exhausted or `visit`
+    /// returned `false`. Resuming over an unchanged state yields exactly the
+    /// concatenation of the unbounded stream. The default re-walks the stream
+    /// (correct, O(n) per call); a database backend overrides it with keyset
+    /// pagination so each call costs O(`max_rows`).
+    fn for_each_knock_offline_candidate_page(
+        &self,
+        round: u64,
+        challenge_round: u64,
+        after: Option<&Address>,
+        max_rows: usize,
+        visit: &mut dyn FnMut(Address, AccountData) -> bool,
+    ) -> Option<Address> {
+        let max_rows = max_rows.max(1);
+        let mut scanned = 0usize;
+        let mut last: Option<Address> = None;
+        let mut more = false;
+        self.for_each_knock_offline_candidate_ordered(round, challenge_round, &mut |a, acct| {
+            if after.is_some_and(|x| a.0 <= x.0) {
+                return true;
+            }
+            if scanned >= max_rows {
+                more = true;
+                return false;
+            }
+            scanned += 1;
+            last = Some(a);
+            visit(a, acct)
+        });
+        if more {
+            last
+        } else {
+            None
+        }
+    }
+
     /// Every address written since the last commit (this block's, scratch
     /// pass's and out-of-block writes), or `None` when the backend cannot
     /// enumerate them. Lets the proposer's scratch pass hand the post-payset

@@ -1980,85 +1980,174 @@ pub fn knock_offline_lists_from_modified<L: crate::store_trait::LedgerStore>(
     exclude: &std::collections::HashSet<Address>,
     modified: &KnockOfflineModified,
 ) -> KnockOfflineLists {
-    let max_expired = consensus.max_proposed_expired_online_accounts;
-    let max_absent = consensus.payouts_max_mark_absent;
-    let mut lists = KnockOfflineLists::default();
-    if max_expired == 0 && max_absent == 0 {
-        return lists;
-    }
-    #[cfg(any(test, feature = "test-hooks"))]
-    crate::shadow_execute::test_hooks::note_knock_offline();
+    let mut scan = KnockOfflineScan::new(store, round, consensus, exclude, modified);
+    while scan.step(store, usize::MAX) == KnockScanProgress::More {}
+    scan.into_lists()
+}
 
-    // The payset's touched accounts overwrite the base data with their
-    // end-of-block state (go: `mods.Accts.GetData`). Like go, the online set
-    // is only a candidate source while suspensions are enabled
-    // (`if maxSuspensions > 0 { GetKnockOfflineCandidates }`); otherwise only
-    // the modified accounts are considered and the online set is not read.
-    // The online set is streamed in ascending address order and merged with
-    // the (few) touched accounts, so the scan stops as soon as both lists are
-    // full instead of decoding and sorting every online account (issue #1817).
-    let touched_accts = &modified.accounts;
+/// Candidate rows one ledger-mutex hold may scan in the proposer's chunked
+/// knock-offline selection (issue #1895); see
+/// [`knock_offline_lists_from_modified_chunked`].
+pub const KNOCK_SCAN_CHUNK_ROWS: usize = 1_024;
 
-    // Absence inputs. The total online stake is the balance-round lookback
-    // total on the same history basis as each account's stake
-    // (`balance_round_total_online_stake`: supply snapshot, else derived from
-    // the `onlineaccounts` history), fetched lazily at the first candidate
-    // that needs the stake-based lag test. If it cannot be determined the lag
-    // test is undecidable and skipped -- an empty list is always valid -- and
-    // that is logged once per process, not per block. The challenge-failure
-    // test needs no stake and keeps working.
-    let brnd = algo_agreement::balance_round(algo_types::Round(round), consensus);
-    // Synthetic history rows (legacy-database upgrade): go's stake figures
-    // cannot be reproduced yet, so nobody is listed by lag.
-    // A marker read error is also "uncertain": never decide on rows that may
-    // be synthetic.
-    let history_uncertain = max_absent > 0
-        && match store.absence_history_uncertain(brnd.0) {
-            Ok(false) => false,
-            Ok(true) => {
-                note_undecidable_absence(
-                    round,
-                    brnd.0,
-                    &AlgoError::Ledger {
-                        message: "online-account history was synthesized at upgrade".to_string(),
-                    },
-                );
-                true
-            }
-            Err(e) => {
-                note_undecidable_absence(round, brnd.0, &e);
-                true
-            }
+/// Whether a [`KnockOfflineScan`] has more work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnockScanProgress {
+    /// Call [`KnockOfflineScan::step`] again.
+    More,
+    /// The lists are final ([`KnockOfflineScan::into_lists`]).
+    Done,
+}
+
+/// A resumable [`knock_offline_lists_from_modified`] (issue #1895). The
+/// candidate stream is address-ordered, so the scan keeps the last address it
+/// passed (`cursor`) and each [`Self::step`] resumes strictly after it. This
+/// lets the proposer re-take the ledger mutex between bounded chunks instead
+/// of holding it for the whole online-set walk. The scan holds no reference to
+/// the store: the caller must hand every step the SAME committed state (it
+/// checks the ledger round is unchanged between chunks and abandons the scan
+/// otherwise), so the lists are never computed from mixed states.
+pub struct KnockOfflineScan<'a> {
+    round: u64,
+    consensus: &'a ConsensusParams,
+    exclude: &'a std::collections::HashSet<Address>,
+    touched: std::iter::Peekable<
+        std::collections::btree_map::Iter<'a, Address, Option<algo_types::AccountData>>,
+    >,
+    lists: KnockOfflineLists,
+    max_expired: usize,
+    max_absent: usize,
+    /// Balance round whose history the stake figures come from.
+    brnd: u64,
+    history_uncertain: bool,
+    /// Lazily fetched balance-round total online stake (outer `None`: not yet
+    /// fetched; inner `None`: undeterminable).
+    total_cache: Option<Option<u64>>,
+    challenge: crate::heartbeat::Challenge,
+    /// Last candidate address passed; the next chunk starts after it.
+    cursor: Option<Address>,
+    finished: bool,
+}
+
+impl<'a> KnockOfflineScan<'a> {
+    /// Set up the scan: the cheap per-proposal reads (history marker,
+    /// active challenge) happen here, under the caller's first hold.
+    pub fn new<L: crate::store_trait::LedgerStore>(
+        store: &L,
+        round: u64,
+        consensus: &'a ConsensusParams,
+        exclude: &'a std::collections::HashSet<Address>,
+        modified: &'a KnockOfflineModified,
+    ) -> Self {
+        let max_expired = consensus.max_proposed_expired_online_accounts;
+        let max_absent = consensus.payouts_max_mark_absent;
+        // The payset's touched accounts overwrite the base data with their
+        // end-of-block state (go: `mods.Accts.GetData`). Like go, the online
+        // set is only a candidate source while suspensions are enabled
+        // (`if maxSuspensions > 0 { GetKnockOfflineCandidates }`); otherwise
+        // only the modified accounts are considered and the online set is not
+        // read. The online set is streamed in ascending address order and
+        // merged with the (few) touched accounts, so the scan stops as soon as
+        // both lists are full instead of decoding and sorting every online
+        // account (issue #1817).
+        let mut scan = KnockOfflineScan {
+            round,
+            consensus,
+            exclude,
+            touched: modified.accounts.iter().peekable(),
+            lists: KnockOfflineLists::default(),
+            max_expired,
+            max_absent,
+            brnd: 0,
+            history_uncertain: false,
+            total_cache: None,
+            challenge: crate::heartbeat::Challenge::default(),
+            cursor: None,
+            finished: max_expired == 0 && max_absent == 0,
         };
-    // go computes `onlineStake()` up front whenever it checks absences, and a
-    // block it cannot compute it for fails: so nothing is listed (challenge
-    // failures included) unless the total can be determined. Fetched lazily
-    // at the first account that would be listed.
-    let mut total_cache: Option<Option<u64>> = None;
-    let mut total = |store: &L| -> Option<u64> {
-        *total_cache.get_or_insert_with(|| {
-            match store.balance_round_total_online_stake(brnd.0, round) {
-                Ok(t) => Some(t),
+        if scan.finished {
+            return scan;
+        }
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::shadow_execute::test_hooks::note_knock_offline();
+
+        // Absence inputs. The total online stake is the balance-round lookback
+        // total on the same history basis as each account's stake
+        // (`balance_round_total_online_stake`: supply snapshot, else derived
+        // from the `onlineaccounts` history), fetched lazily at the first
+        // candidate that needs the stake-based lag test. If it cannot be
+        // determined the lag test is undecidable and skipped -- an empty list
+        // is always valid -- and that is logged once per process, not per
+        // block. The challenge-failure test needs no stake and keeps working.
+        let brnd = algo_agreement::balance_round(algo_types::Round(round), consensus);
+        scan.brnd = brnd.0;
+        // Synthetic history rows (legacy-database upgrade): go's stake figures
+        // cannot be reproduced yet, so nobody is listed by lag.
+        // A marker read error is also "uncertain": never decide on rows that
+        // may be synthetic.
+        scan.history_uncertain = max_absent > 0
+            && match store.absence_history_uncertain(brnd.0) {
+                Ok(false) => false,
+                Ok(true) => {
+                    note_undecidable_absence(
+                        round,
+                        brnd.0,
+                        &AlgoError::Ledger {
+                            message: "online-account history was synthesized at upgrade"
+                                .to_string(),
+                        },
+                    );
+                    true
+                }
                 Err(e) => {
                     note_undecidable_absence(round, brnd.0, &e);
+                    true
+                }
+            };
+        if max_absent > 0 {
+            let provider = crate::heartbeat::StoreHeaderProvider { store };
+            scan.challenge = crate::heartbeat::find_challenge(
+                consensus,
+                round,
+                &provider,
+                crate::heartbeat::ChallengePeriod::Active,
+            );
+        }
+        scan
+    }
+
+    /// The lists (final once [`Self::step`] returned `Done`).
+    pub fn into_lists(self) -> KnockOfflineLists {
+        self.lists
+    }
+
+    /// go computes `onlineStake()` up front whenever it checks absences, and a
+    /// block it cannot compute it for fails: so nothing is listed (challenge
+    /// failures included) unless the total can be determined. Fetched lazily
+    /// at the first account that would be listed.
+    fn total<L: crate::store_trait::LedgerStore>(&mut self, store: &L) -> Option<u64> {
+        let (round, brnd) = (self.round, self.brnd);
+        *self.total_cache.get_or_insert_with(|| {
+            match store.balance_round_total_online_stake(brnd, round) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    note_undecidable_absence(round, brnd, &e);
                     None
                 }
             }
         })
-    };
-    let challenge = if max_absent > 0 {
-        let provider = crate::heartbeat::StoreHeaderProvider { store };
-        crate::heartbeat::find_challenge(
-            consensus,
-            round,
-            &provider,
-            crate::heartbeat::ChallengePeriod::Active,
-        )
-    } else {
-        crate::heartbeat::Challenge::default()
-    };
-    let mut consider = |addr: Address, acct: algo_types::AccountData| -> bool {
-        if lists.expired.len() >= max_expired && lists.absent.len() >= max_absent {
+    }
+
+    /// One candidate; `false` once both lists are full (stop the scan).
+    fn consider<L: crate::store_trait::LedgerStore>(
+        &mut self,
+        store: &L,
+        addr: Address,
+        acct: algo_types::AccountData,
+    ) -> bool {
+        let round = self.round;
+        let lists = &mut self.lists;
+        if lists.expired.len() >= self.max_expired && lists.absent.len() >= self.max_absent {
             return false; // both lists are full
         }
         // go skips `MicroAlgosWithRewards.IsZero()` (an account being
@@ -2066,15 +2155,15 @@ pub fn knock_offline_lists_from_modified<L: crate::store_trait::LedgerStore>(
         // for a nonzero balance, so this is `micro_algos == 0` whichever
         // rewards level (prior round for untouched candidates, post-payset for
         // touched ones) the figure is taken at.
-        if acct.micro_algos == 0 || exclude.contains(&addr) {
+        if acct.micro_algos == 0 || self.exclude.contains(&addr) {
             return true;
         }
         let has_vote_key = acct.vote_id.is_some_and(|v| v != [0u8; 32]);
-        if has_vote_key && acct.vote_last_valid < round && lists.expired.len() < max_expired {
+        if has_vote_key && acct.vote_last_valid < round && lists.expired.len() < self.max_expired {
             lists.expired.push(addr);
             return true; // if marking expired, do not consider suspension
         }
-        if lists.absent.len() >= max_absent {
+        if lists.absent.len() >= self.max_absent {
             return true; // no more room (more expiries may follow)
         }
         if acct.status != AccountStatus::Online || !acct.incentive_eligible {
@@ -2084,9 +2173,9 @@ pub fn knock_offline_lists_from_modified<L: crate::store_trait::LedgerStore>(
         // The challenge test needs no lookup, and `is_absent` is false for a
         // never-seen account, so the (database) stake lookup is the last,
         // rarest step.
-        if challenge.failed(&addr.0, last_seen) {
-            if total(store).is_some() {
-                lists.absent.push(addr);
+        if self.challenge.failed(&addr.0, last_seen) {
+            if self.total(store).is_some() {
+                self.lists.absent.push(addr);
             }
             return true;
         }
@@ -2095,67 +2184,133 @@ pub fn knock_offline_lists_from_modified<L: crate::store_trait::LedgerStore>(
         // stake does not exceed the total, so an account seen within the last
         // `ABSENT_FACTOR` rounds is not absent. (Skipping a candidate only
         // shortens the list, which is always valid.)
-        if history_uncertain || last_seen == 0 || last_seen.saturating_add(ABSENT_FACTOR) >= round {
+        if self.history_uncertain
+            || last_seen == 0
+            || last_seen.saturating_add(ABSENT_FACTOR) >= round
+        {
             return true;
         }
-        let Some(total_online_stake) = total(store) else {
+        let Some(total_online_stake) = self.total(store) else {
             return true; // undecidable: the lag test is skipped
         };
-        let stake = match lookback_voting_stake(store, round, consensus, &addr) {
+        let stake = match lookback_voting_stake(store, round, self.consensus, &addr) {
             Ok(stake) => stake,
             Err(e) => {
                 // e.g. no block header at the balance round: undecidable.
-                note_undecidable_absence(round, brnd.0, &e);
+                note_undecidable_absence(round, self.brnd, &e);
                 return true;
             }
         };
         if is_absent(total_online_stake, stake, last_seen, round) {
-            lists.absent.push(addr);
+            self.lists.absent.push(addr);
         }
         true
-    };
-    // Merge the ordered online stream with the touched accounts (which win on
-    // an address present in both).
-    let mut touched_iter = touched_accts.iter().peekable();
-    let mut done = false;
-    if max_absent > 0 {
-        store.for_each_knock_offline_candidate_ordered(
-            round,
-            challenge.round,
-            &mut |addr, acct| {
-                while let Some((t_addr, _)) = touched_iter.peek() {
-                    if t_addr.0 > addr.0 {
-                        break;
-                    }
-                    let (t_addr, t_acct) = touched_iter.next().expect("peeked");
-                    if let Some(t_acct) = t_acct {
-                        if !consider(*t_addr, t_acct.clone()) {
-                            done = true;
-                            return false;
+    }
+
+    /// Scan at most `max_rows` further candidate rows of `store` (merging in
+    /// the touched accounts that fall in the range scanned). `usize::MAX`
+    /// finishes the scan in one call.
+    pub fn step<L: crate::store_trait::LedgerStore>(
+        &mut self,
+        store: &L,
+        max_rows: usize,
+    ) -> KnockScanProgress {
+        if self.finished {
+            return KnockScanProgress::Done;
+        }
+        // Merge the ordered online stream with the touched accounts (which
+        // win on an address present in both).
+        if self.max_absent > 0 {
+            let after = self.cursor;
+            let (round, challenge_round) = (self.round, self.challenge.round);
+            let next = store.for_each_knock_offline_candidate_page(
+                round,
+                challenge_round,
+                after.as_ref(),
+                max_rows,
+                &mut |addr, acct| {
+                    while let Some((t_addr, _)) = self.touched.peek() {
+                        if t_addr.0 > addr.0 {
+                            break;
+                        }
+                        let (t_addr, t_acct) = self.touched.next().expect("peeked");
+                        if let Some(t_acct) = t_acct {
+                            if !self.consider(store, *t_addr, t_acct.clone()) {
+                                self.finished = true;
+                                return false;
+                            }
+                        }
+                        if *t_addr == addr {
+                            return true; // the touched record replaces the online one
                         }
                     }
-                    if *t_addr == addr {
-                        return true; // the touched record replaces the online one
+                    if !self.consider(store, addr, acct) {
+                        self.finished = true;
+                        return false;
                     }
-                }
-                if !consider(addr, acct) {
-                    done = true;
-                    return false;
-                }
-                true
-            },
-        );
-    }
-    if !done {
-        for (t_addr, t_acct) in touched_iter {
+                    true
+                },
+            );
+            if self.finished {
+                return KnockScanProgress::Done;
+            }
+            if let Some(resume) = next {
+                self.cursor = Some(resume);
+                return KnockScanProgress::More;
+            }
+        }
+        // The stream is exhausted: the touched accounts past its last address.
+        let rest: Vec<_> = self.touched.by_ref().collect();
+        for (t_addr, t_acct) in rest {
             if let Some(t_acct) = t_acct {
-                if !consider(*t_addr, t_acct.clone()) {
+                if !self.consider(store, *t_addr, t_acct.clone()) {
                     break;
                 }
             }
         }
+        self.finished = true;
+        KnockScanProgress::Done
     }
-    lists
+}
+
+/// [`knock_offline_lists_from_modified`] in bounded ledger holds (issue
+/// #1895): `acquire` takes the ledger (a mutex guard) and returns `Ok(None)`
+/// when the state the lists must be computed from is gone (the caller's stale
+/// check -- a commit landed since the previous chunk); the guard is dropped
+/// between chunks of `chunk_rows` candidate rows, and `record_hold` receives
+/// each chunk's hold time. Any `Ok(None)` abandons the scan -- lists are never
+/// computed from mixed states. With `chunk_rows == usize::MAX` this is one
+/// hold, identical to [`knock_offline_lists_from_modified`].
+pub fn knock_offline_lists_from_modified_chunked<L, G, E>(
+    round: u64,
+    consensus: &ConsensusParams,
+    exclude: &std::collections::HashSet<Address>,
+    modified: &KnockOfflineModified,
+    chunk_rows: usize,
+    mut acquire: impl FnMut() -> Result<Option<G>, E>,
+    mut record_hold: impl FnMut(std::time::Duration),
+) -> Result<Option<KnockOfflineLists>, E>
+where
+    L: crate::store_trait::LedgerStore,
+    G: std::ops::Deref<Target = L>,
+{
+    let mut scan: Option<KnockOfflineScan<'_>> = None;
+    loop {
+        let Some(guard) = acquire()? else {
+            return Ok(None);
+        };
+        let held = std::time::Instant::now();
+        let progress = scan
+            .get_or_insert_with(|| {
+                KnockOfflineScan::new(&*guard, round, consensus, exclude, modified)
+            })
+            .step(&*guard, chunk_rows);
+        record_hold(held.elapsed());
+        drop(guard);
+        if progress == KnockScanProgress::Done {
+            return Ok(scan.map(KnockOfflineScan::into_lists));
+        }
+    }
 }
 
 /// Log that the stake-based absence test is undecidable (the balance-round
@@ -17672,6 +17827,56 @@ return
             .unwrap()
     }
 
+    /// Chunk sizes (candidate rows per ledger hold) the chunked scan must
+    /// reproduce the oracle at (issue #1895).
+    const KO_CHUNKS: [usize; 5] = [1, 2, 7, 64, usize::MAX];
+
+    /// [`knock_offline_lists`] computed by stepping a [`KnockOfflineScan`]
+    /// `chunk` rows at a time.
+    fn ko_chunked<L: crate::store_trait::LedgerStore>(
+        store: &L,
+        round: u64,
+        consensus: &ConsensusParams,
+        exclude: &std::collections::HashSet<Address>,
+        touched: &[Address],
+        chunk: usize,
+    ) -> KnockOfflineLists {
+        let mut modified = KnockOfflineModified::default();
+        for addr in touched {
+            if addr.is_zero() {
+                continue;
+            }
+            if let Some(acct) = store.get_account(addr) {
+                modified.accounts.insert(*addr, Some(acct));
+            }
+        }
+        let mut scan = KnockOfflineScan::new(store, round, consensus, exclude, &modified);
+        let mut steps = 0usize;
+        while scan.step(store, chunk) == KnockScanProgress::More {
+            steps += 1;
+            assert!(steps < 1_000_000, "chunked scan makes no progress");
+        }
+        scan.into_lists()
+    }
+
+    /// The chunked scan equals `want` (the oracle) at every chunk size in `chunks`.
+    #[allow(clippy::too_many_arguments)]
+    fn ko_assert_chunked<L: crate::store_trait::LedgerStore>(
+        store: &L,
+        round: u64,
+        consensus: &ConsensusParams,
+        exclude: &std::collections::HashSet<Address>,
+        touched: &[Address],
+        want: &KnockOfflineLists,
+        chunks: &[usize],
+        what: &str,
+    ) {
+        for &chunk in chunks {
+            let got = ko_chunked(store, round, consensus, exclude, touched, chunk);
+            assert_eq!(&got, want, "{what}: chunk={chunk}");
+        }
+    }
+
     #[test]
     fn knock_offline_streaming_matches_full_scan_oracle_sqlite() {
         use crate::sqlite::SqliteLedger;
@@ -17731,6 +17936,16 @@ return
                         knock_offline_lists_full_scan_oracle(&ledger, 501, &consensus, ex_set, t);
                     let got = knock_offline_lists(&ledger, 501, &consensus, ex_set, t);
                     assert_eq!(got, want, "n={n} ex={ex} st={st} touched={}", t.len());
+                    ko_assert_chunked(
+                        &ledger,
+                        501,
+                        &consensus,
+                        ex_set,
+                        t,
+                        &want,
+                        &KO_CHUNKS,
+                        &format!("sqlite n={n} ex={ex} st={st} touched={}", t.len()),
+                    );
                     if ex != 0 || st != 0 {
                         assert!(
                             !got.expired.is_empty() || !got.absent.is_empty(),
@@ -17765,6 +17980,16 @@ return
             );
             let got = knock_offline_lists(&state, 501, &consensus, &Default::default(), &t);
             assert_eq!(got, want, "ex={ex} touched={touched_n}");
+            ko_assert_chunked(
+                &state,
+                501,
+                &consensus,
+                &Default::default(),
+                &t,
+                &want,
+                &KO_CHUNKS,
+                &format!("default store ex={ex} touched={touched_n}"),
+            );
         }
     }
 
@@ -17846,6 +18071,213 @@ return
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Issue #1895: with a challenge active (round 2300, challenge round
+    /// 2000) the chunked scan equals the oracle at every chunk size, with the
+    /// candidate index warm, cold, and falling back to the stream.
+    #[test]
+    fn knock_offline_chunked_with_active_challenge_matches_oracle() {
+        use crate::sqlite::SqliteLedger;
+        use crate::store_trait::LedgerStore;
+
+        let consensus = ko_consensus();
+        let round = 2_300u64;
+        let brnd = algo_agreement::balance_round(algo_types::Round(round), &consensus).0;
+        for divisor in [0usize, 16] {
+            for cold in [false, true] {
+                let mut ledger = SqliteLedger::open_in_memory().unwrap();
+                ledger.knock_index_set_fallback_divisor(divisor);
+                ledger
+                    .put_block_header_fixture_with_seed(
+                        2_000,
+                        0,
+                        [0u8; 32],
+                        algo_types::consensus::CONSENSUS_V41,
+                    )
+                    .unwrap();
+                ledger.put_block_header_fixture(brnd, 0).unwrap();
+                ledger
+                    .put_online_supply_at_round(brnd, 5_000_000 * 10)
+                    .unwrap();
+                ledger.begin_block().unwrap();
+                ko_populate(&mut ledger, 300, 0, 4);
+                for i in 0..300 {
+                    let acct = ledger.get_account(&ko_addr(i)).unwrap();
+                    if acct.status == AccountStatus::Online {
+                        ledger
+                            .put_online_account_at_round(&ko_addr(i), 0, &acct)
+                            .unwrap();
+                    }
+                }
+                ledger.commit_block().unwrap();
+                if cold {
+                    ledger.knock_index_drop();
+                }
+                let provider = crate::heartbeat::StoreHeaderProvider { store: &ledger };
+                let challenge = crate::heartbeat::find_challenge(
+                    &consensus,
+                    round,
+                    &provider,
+                    crate::heartbeat::ChallengePeriod::Active,
+                );
+                assert!(
+                    !challenge.is_zero(),
+                    "the fixture must have an active challenge"
+                );
+                let touched = [ko_addr(1), ko_addr(2), ko_addr(400)];
+                let want = knock_offline_lists_full_scan_oracle(
+                    &ledger,
+                    round,
+                    &consensus,
+                    &Default::default(),
+                    &touched,
+                );
+                assert!(!want.absent.is_empty(), "the challenge must list accounts");
+                ko_assert_chunked(
+                    &ledger,
+                    round,
+                    &consensus,
+                    &Default::default(),
+                    &touched,
+                    &want,
+                    &KO_CHUNKS,
+                    &format!("challenge divisor={divisor} cold={cold}"),
+                );
+            }
+        }
+    }
+
+    /// Issue #1895: the chunked driver re-acquires the ledger per chunk, its
+    /// result equals the oracle, and every hold is bounded by the chunk (many
+    /// holds, none covering the whole set).
+    #[test]
+    fn knock_offline_chunked_driver_bounds_each_hold() {
+        use crate::sqlite::SqliteLedger;
+        use crate::store_trait::LedgerStore;
+
+        let consensus = ko_consensus();
+        let n = 3_000u32;
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.knock_index_set_fallback_divisor(1_000_000); // always stream
+        ledger.put_block_header_fixture(181, 0).unwrap();
+        ledger
+            .put_online_supply_at_round(181, 5_000_000 * 10)
+            .unwrap();
+        ledger.begin_block().unwrap();
+        ko_populate(&mut ledger, n, 2, 0);
+        ledger.commit_block().unwrap();
+        // Everything is excluded, so the lists stay empty and the scan has to
+        // walk the whole online set.
+        let exclude: std::collections::HashSet<Address> = (0..n).map(ko_addr).collect();
+        let mut modified = KnockOfflineModified::default();
+        let mut touched_acct = ledger.get_account(&ko_addr(5)).unwrap();
+        touched_acct.micro_algos += 1;
+        modified.accounts.insert(ko_addr(5), Some(touched_acct));
+        let want = knock_offline_lists_from_modified(&ledger, 501, &consensus, &exclude, &modified);
+        let mut acquired = 0usize;
+        let mut holds = 0usize;
+        let got = knock_offline_lists_from_modified_chunked(
+            501,
+            &consensus,
+            &exclude,
+            &modified,
+            64,
+            || {
+                acquired += 1;
+                Ok::<_, ()>(Some(&ledger))
+            },
+            |_| holds += 1,
+        )
+        .unwrap()
+        .expect("not stale");
+        assert_eq!(got, want);
+        assert_eq!(acquired, holds);
+        assert!(
+            holds >= (n as usize - n as usize / 97) / 64,
+            "a 64-row chunk must need many holds, got {holds}"
+        );
+        // An unbounded chunk is one hold.
+        let mut holds_one = 0usize;
+        let one = knock_offline_lists_from_modified_chunked(
+            501,
+            &consensus,
+            &exclude,
+            &modified,
+            usize::MAX,
+            || Ok::<_, ()>(Some(&ledger)),
+            |_| holds_one += 1,
+        )
+        .unwrap()
+        .expect("not stale");
+        assert_eq!(holds_one, 1);
+        assert_eq!(one, want);
+    }
+
+    /// Issue #1895: a commit landing between two chunks (the caller's stale
+    /// check failing at a later `acquire`) abandons the scan: no lists, never
+    /// lists computed from mixed states; a commit before the first chunk does
+    /// the same.
+    #[test]
+    fn knock_offline_chunked_commit_between_chunks_is_stale() {
+        use crate::sqlite::SqliteLedger;
+
+        let consensus = ko_consensus();
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.put_block_header_fixture(181, 0).unwrap();
+        ledger
+            .put_online_supply_at_round(181, 5_000_000 * 10)
+            .unwrap();
+        ledger.begin_block().unwrap();
+        ko_populate(&mut ledger, 400, 1, 0); // every account is a candidate
+        ledger.commit_block().unwrap();
+        let exclude: std::collections::HashSet<Address> = (0..400).map(ko_addr).collect();
+        let modified = KnockOfflineModified::default();
+        for stale_at in [1usize, 2, 4] {
+            // The tip the proposal was built on; the "commit" bumps it, exactly
+            // what the proposer's `current_round() + 1 != hdr.round` sees.
+            let tip = std::cell::Cell::new(10u64);
+            let mut calls = 0usize;
+            let got = knock_offline_lists_from_modified_chunked(
+                501,
+                &consensus,
+                &exclude,
+                &modified,
+                16,
+                || {
+                    calls += 1;
+                    if calls == stale_at {
+                        tip.set(tip.get() + 1); // a block commits between chunks
+                    }
+                    Ok::<_, ()>((tip.get() == 10).then_some(&ledger))
+                },
+                |_| {},
+            )
+            .unwrap();
+            assert_eq!(got, None, "stale_at={stale_at}");
+            assert_eq!(calls, stale_at, "the scan stops at the first stale chunk");
+        }
+        // No commit: the same call completes with the oracle's lists.
+        let got = knock_offline_lists_from_modified_chunked(
+            501,
+            &consensus,
+            &Default::default(),
+            &modified,
+            16,
+            || Ok::<_, ()>(Some(&ledger)),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            Some(knock_offline_lists_full_scan_oracle(
+                &ledger,
+                501,
+                &consensus,
+                &Default::default(),
+                &[],
+            ))
+        );
+    }
+
     /// Issue #1895: `warm_knock_index` builds the index up front, is
     /// idempotent, counts exactly the indexed (online, non-zero stake)
     /// accounts, and the lists computed after it equal the cold-start ones.
@@ -17925,6 +18357,32 @@ return
             println!(
                 "KNOCK_OFFLINE_FROM_MODIFIED_TIMING {label}: n={n} index_cold={d_cold:?} index_warm={d_warm:?}"
             );
+            // Issue #1895: the same scan in bounded holds; the longest single
+            // hold is what the proposer's ledger mutex waiters see.
+            for chunk in [512usize, 1_024, 2_048, usize::MAX] {
+                let mut longest = std::time::Duration::ZERO;
+                let mut holds = 0usize;
+                let t2 = std::time::Instant::now();
+                let chunked = knock_offline_lists_from_modified_chunked(
+                    501,
+                    &consensus,
+                    &exclude,
+                    &modified,
+                    chunk,
+                    || Ok::<_, ()>(Some(&ledger)),
+                    |d| {
+                        holds += 1;
+                        longest = longest.max(d);
+                    },
+                )
+                .unwrap()
+                .expect("not stale");
+                let total = t2.elapsed();
+                assert_eq!(chunked, warm);
+                println!(
+                    "KNOCK_OFFLINE_CHUNKED_TIMING {label}: chunk={chunk} holds={holds} longest_hold={longest:?} total={total:?}"
+                );
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -18007,6 +18465,16 @@ return
                         );
                         let got = knock_offline_lists(ledger, round, &consensus, ex_set, touched);
                         assert_eq!(got, want, "{what}: round={round}");
+                        ko_assert_chunked(
+                            ledger,
+                            round,
+                            &consensus,
+                            ex_set,
+                            touched,
+                            &want,
+                            &[1, 7, 64],
+                            &format!("{what}: round={round}"),
+                        );
                         if !want.expired.is_empty() || !want.absent.is_empty() {
                             compared_nonempty += 1;
                         }

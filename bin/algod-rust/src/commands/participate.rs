@@ -2310,27 +2310,33 @@ impl SimpleBlockEvaluator {
         own_addresses: &std::sync::Arc<std::collections::HashSet<algo_types::Address>>,
         modified: &algo_ledger::apply::KnockOfflineModified,
     ) -> Result<Option<algo_ledger::apply::KnockOfflineLists>, algo_error::AlgoError> {
-        let waited = std::time::Instant::now();
-        let ledger = self
-            .ledger
-            .lock()
-            .map_err(|e| algo_error::AlgoError::Ledger {
-                message: format!("ledger lock poisoned: {e}"),
-            })?;
-        algo_ledger::proposal_eval::record_ledger_lock_wait(waited.elapsed());
-        if ledger.current_round().0.saturating_add(1) != self.hdr.round.0 {
-            return Ok(None);
-        }
-        let held = std::time::Instant::now();
-        let lists = algo_ledger::apply::knock_offline_lists_from_modified(
-            &*ledger,
+        // Issue #1895: the candidate scan runs in bounded chunks, re-taking
+        // the ledger mutex between them so no single hold scales with the
+        // online-set size. Every chunk re-checks the tip is still this block's
+        // parent: a commit in between abandons the scan (stale), never mixing
+        // states.
+        algo_ledger::apply::knock_offline_lists_from_modified_chunked(
             self.hdr.round.0,
             &self.consensus_params,
             own_addresses,
             modified,
-        );
-        algo_ledger::proposal_eval::record_ledger_lock_hold(held.elapsed());
-        Ok(Some(lists))
+            algo_ledger::apply::KNOCK_SCAN_CHUNK_ROWS,
+            || {
+                let waited = std::time::Instant::now();
+                let ledger = self
+                    .ledger
+                    .lock()
+                    .map_err(|e| algo_error::AlgoError::Ledger {
+                        message: format!("ledger lock poisoned: {e}"),
+                    })?;
+                algo_ledger::proposal_eval::record_ledger_lock_wait(waited.elapsed());
+                if ledger.current_round().0.saturating_add(1) != self.hdr.round.0 {
+                    return Ok(None);
+                }
+                Ok(Some(ledger))
+            },
+            algo_ledger::proposal_eval::record_ledger_lock_hold,
+        )
     }
 
     fn empty_payset_parts(&self) -> (Vec<algo_types::SignedTransaction>, u64) {
