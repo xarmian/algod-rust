@@ -33,12 +33,12 @@ use std::net::IpAddr;
 use std::pin::Pin;
 use std::time::Duration;
 
-use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
-use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::config::{ResolverConfig, ResolverOpts, ServerGroup, CLOUDFLARE, GOOGLE};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::net::{DnsError, NetError as ResolveError};
 use hickory_resolver::proto::op::ResponseCode;
-use hickory_resolver::proto::rr::RecordType;
-use hickory_resolver::proto::ProtoErrorKind;
-use hickory_resolver::{ResolveError, TokioResolver};
+use hickory_resolver::proto::rr::{RData, RecordType};
+use hickory_resolver::TokioResolver;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -343,6 +343,16 @@ fn apply_resolver_opts(opts: &mut ResolverOpts, validate: bool) {
     opts.validate = validate;
     opts.try_tcp_on_error = true;
     opts.edns0 = true;
+    // hickory 0.26 (issue #1828): with the default `num_concurrent_reqs = 2`
+    // the pool races two name servers; when a large DNSSEC answer (root or
+    // `network.` DNSKEY, the SRV set) is truncated over UDP, the TCP retry of
+    // one racer can lose to the other racer's still-in-flight truncated UDP
+    // reply, which then fails the lookup with "response was truncated; TCP
+    // already tried" and surfaces as `DnssecBogus` on the DS/DNSKEY chain.
+    // Querying one name server at a time (falling through to the next only on
+    // error) makes the TCP retry deterministic. Reproduced live against the
+    // mainnet SRV set with 0.26.3; 0.25 did not race this way.
+    opts.num_concurrent_reqs = 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -402,10 +412,12 @@ impl HickorySrvResolver {
     /// Build a hickory [`TokioResolver`] with the given config, enabling
     /// DNSSEC validation only when `validate` is set.
     fn build_resolver(config: ResolverConfig, validate: bool) -> TokioResolver {
-        let provider = TokioConnectionProvider::default();
+        let provider = TokioRuntimeProvider::default();
         let mut builder = TokioResolver::builder_with_config(config, provider);
         apply_resolver_opts(builder.options_mut(), validate);
-        builder.build()
+        builder
+            .build()
+            .expect("resolver build only fails on invalid TLS/QUIC config; ours is plain UDP/TCP")
     }
 
     /// Build a system resolver (uses OS DNS configuration).
@@ -418,7 +430,7 @@ impl HickorySrvResolver {
             e
         })?;
         apply_resolver_opts(builder.options_mut(), validate);
-        Ok(builder.build())
+        builder.build()
     }
 
     /// Build the [`ResolverConfig`] for a fallback resolver targeting a
@@ -441,8 +453,13 @@ impl HickorySrvResolver {
                 return None;
             }
         };
-        let group = NameServerConfigGroup::from_ips_clear(&[ip], 53, true);
-        Some(ResolverConfig::from_parts(None, vec![], group))
+        let ips = [ip];
+        let group = ServerGroup {
+            ips: &ips,
+            server_name: "",
+            path: "",
+        };
+        Some(ResolverConfig::udp_and_tcp(&group))
     }
 
     /// Build a fallback resolver targeting a specific DNS server IP.
@@ -459,9 +476,9 @@ impl HickorySrvResolver {
     /// [`Self::fallback_resolver_config`].
     fn default_resolver_config() -> ResolverConfig {
         // Combine Cloudflare and Google name servers for redundancy.
-        let mut group = NameServerConfigGroup::cloudflare();
-        group.merge(NameServerConfigGroup::google());
-        ResolverConfig::from_parts(None, vec![], group)
+        let mut name_servers: Vec<_> = CLOUDFLARE.udp_and_tcp().collect();
+        name_servers.extend(GOOGLE.udp_and_tcp());
+        ResolverConfig::from_name_servers(name_servers)
     }
 
     /// Build a default resolver using well-known public DNS servers
@@ -486,9 +503,14 @@ impl HickorySrvResolver {
     ) -> Result<Vec<SrvRecord>, ResolveError> {
         let lookup = resolver.srv_lookup(srv_name).await?;
         let mut records: Vec<SrvRecord> = lookup
+            .answers()
             .iter()
+            .filter_map(|record| match &record.data {
+                RData::SRV(srv) => Some(srv),
+                _ => None,
+            })
             .filter_map(|srv| {
-                let mut target = srv.target().to_string();
+                let mut target = srv.target.to_string();
                 if target.is_empty() || target == "." {
                     return None;
                 }
@@ -501,9 +523,9 @@ impl HickorySrvResolver {
                 }
                 Some(SrvRecord {
                     target,
-                    port: srv.port(),
-                    priority: srv.priority(),
-                    weight: srv.weight(),
+                    port: srv.port,
+                    priority: srv.priority,
+                    weight: srv.weight,
                 })
             })
             .collect();
@@ -584,12 +606,12 @@ impl HickorySrvResolver {
     /// therefore get the single (cheap, 200 ms-paused) retry, which cannot
     /// turn a failure into a success unless the resolver answers properly.
     fn probe_error_is_transient(e: &ResolveError) -> bool {
-        match e.proto().map(|p| p.kind()) {
-            Some(ProtoErrorKind::NoRecordsFound { response_code, .. }) => !matches!(
-                response_code,
+        match e {
+            ResolveError::Dns(DnsError::NoRecordsFound(no_records)) => !matches!(
+                no_records.response_code,
                 ResponseCode::NoError | ResponseCode::NXDomain
             ),
-            Some(ProtoErrorKind::Nsec { .. }) => false,
+            ResolveError::Dns(DnsError::Nsec { .. }) => false,
             _ => true,
         }
     }
@@ -1231,8 +1253,12 @@ mod tests {
         // address; every entry must point at exactly this address and port.
         assert!(!servers.is_empty());
         for ns in servers {
-            assert_eq!(ns.socket_addr.ip().to_string(), "127.0.0.1");
-            assert_eq!(ns.socket_addr.port(), 53);
+            assert_eq!(ns.ip.to_string(), "127.0.0.1");
+            // `udp_and_tcp` entries carry the default DNS port (53).
+            assert!(!ns.connections.is_empty());
+            for conn in &ns.connections {
+                assert_eq!(conn.port, 53);
+            }
         }
     }
 
@@ -1265,7 +1291,7 @@ mod tests {
         let ips: Vec<String> = config
             .name_servers()
             .iter()
-            .map(|ns| ns.socket_addr.ip().to_string())
+            .map(|ns| ns.ip.to_string())
             .collect();
         assert!(!ips.is_empty());
         // Cloudflare's well-known resolver address.
@@ -1333,6 +1359,10 @@ mod tests {
              'exceeded max validation depth')"
         );
         assert!(opts.try_tcp_on_error, "TCP fallback must stay enabled");
+        assert_eq!(
+            opts.num_concurrent_reqs, 1,
+            "parallel name-server racing must stay off (hickory 0.26 truncation race, #1828)"
+        );
     }
 
     /// The same EDNS0 fix must apply even when DNSSEC validation itself is
@@ -1723,11 +1753,14 @@ mod tests {
     // upgrade.
     mod fake_dns {
         use hickory_resolver::proto::dnssec::crypto::EcdsaSigningKey;
+        use hickory_resolver::proto::dnssec::rdata::SigInput;
         use hickory_resolver::proto::dnssec::rdata::{DNSSECRData, DNSKEY, RRSIG};
-        use hickory_resolver::proto::dnssec::tbs::TBS;
-        use hickory_resolver::proto::dnssec::{Algorithm, SigSigner, SigningKey, TrustAnchors};
+        use hickory_resolver::proto::dnssec::{
+            Algorithm, DnssecSigner, SigningKey, TrustAnchors, TBS,
+        };
         use hickory_resolver::proto::op::{Message, MessageType, ResponseCode};
         use hickory_resolver::proto::rr::rdata::{A, SRV};
+        use hickory_resolver::proto::rr::{DNSClass, SerialNumber};
         use hickory_resolver::proto::rr::{Name, RData, Record, RecordType};
         use std::net::{Ipv4Addr, SocketAddr};
         use std::str::FromStr;
@@ -1759,6 +1792,40 @@ mod tests {
             pub anchor: TrustAnchors,
             dnskey: Record,
             rrsig: Record,
+            signer: DnssecSigner,
+            key_tag: u16,
+            alg: Algorithm,
+        }
+
+        impl SignedRoot {
+            /// RRSIG (signer: the root, i.e. directly under the trust anchor)
+            /// over the RRset `records` (all of one owner name and type).
+            /// hickory 0.26 rejects unsigned data as bogus unless an NSEC
+            /// proof of an insecure delegation exists, which a stub cannot
+            /// fabricate, so the stub signs everything it serves.
+            fn sign_rrset(&self, name: &Name, rtype: RecordType, records: &[Record]) -> Record {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as u32;
+                let input = SigInput {
+                    type_covered: rtype,
+                    algorithm: self.alg,
+                    num_labels: name.num_labels(),
+                    original_ttl: 300,
+                    sig_expiration: SerialNumber::new(now + 3600),
+                    sig_inception: SerialNumber::new(now - 3600),
+                    key_tag: self.key_tag,
+                    signer_name: Name::root(),
+                };
+                let tbs = TBS::from_input(name, DNSClass::IN, &input, records.iter()).unwrap();
+                let sig = self.signer.sign(&tbs).unwrap();
+                Record::from_rdata(
+                    name.clone(),
+                    300,
+                    RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::from_sig(input, sig))),
+                )
+            }
         }
 
         /// A signed root DNSKEY RRset (DNSKEY + RRSIG) plus the trust anchor
@@ -1772,7 +1839,7 @@ mod tests {
             let mut anchor = TrustAnchors::empty();
             anchor.insert(&public);
 
-            let signer = SigSigner::dnssec(
+            let signer = DnssecSigner::new(
                 dnskey_rdata.clone(),
                 Box::new(key),
                 Name::root(),
@@ -1790,21 +1857,20 @@ mod tests {
             // One RRSIG parameter set: built empty to derive the TBS, then
             // rebuilt with the signature.
             let key_tag = signer.calculate_key_tag().unwrap();
-            let rrsig_with = |sig: Vec<u8>| {
-                RRSIG::new(
-                    RecordType::DNSKEY,
-                    alg,
-                    0,
-                    3600,
-                    now + 3600,
-                    now - 3600,
-                    key_tag,
-                    Name::root(),
-                    sig,
-                )
+            let input = SigInput {
+                type_covered: RecordType::DNSKEY,
+                algorithm: alg,
+                num_labels: 0,
+                original_ttl: 3600,
+                sig_expiration: SerialNumber::new(now + 3600),
+                sig_inception: SerialNumber::new(now - 3600),
+                key_tag,
+                signer_name: Name::root(),
             };
-            let tbs = TBS::from_rrsig(
-                &Record::from_rdata(Name::root(), 3600, rrsig_with(vec![])),
+            let tbs = TBS::from_input(
+                &Name::root(),
+                DNSClass::IN,
+                &input,
                 std::iter::once(&dnskey),
             )
             .unwrap();
@@ -1812,12 +1878,15 @@ mod tests {
             let rrsig = Record::from_rdata(
                 Name::root(),
                 3600,
-                RData::DNSSEC(DNSSECRData::RRSIG(rrsig_with(sig))),
+                RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::from_sig(input, sig))),
             );
             SignedRoot {
                 anchor,
                 dnskey,
                 rrsig,
+                signer,
+                key_tag,
+                alg,
             }
         }
 
@@ -1847,14 +1916,12 @@ mod tests {
                         continue;
                     };
                     q2.fetch_add(1, Ordering::SeqCst);
-                    let mut resp = Message::new();
-                    resp.set_id(req.id());
-                    resp.set_message_type(MessageType::Response);
-                    resp.set_op_code(req.op_code());
-                    resp.set_recursion_desired(true);
-                    resp.set_recursion_available(true);
-                    resp.set_response_code(ResponseCode::NoError);
-                    if let Some(q) = req.queries().first() {
+                    let mut resp =
+                        Message::new(req.metadata.id, MessageType::Response, req.metadata.op_code);
+                    resp.metadata.recursion_desired = true;
+                    resp.metadata.recursion_available = true;
+                    resp.metadata.response_code = ResponseCode::NoError;
+                    if let Some(q) = req.queries.first() {
                         resp.add_query(q.clone());
                         if q.query_type() == RecordType::DNSKEY && q.name().is_root() {
                             dk2.fetch_add(1, Ordering::SeqCst);
@@ -1870,29 +1937,53 @@ mod tests {
                                         resp.add_answer(root.rrsig.clone());
                                     } else {
                                         servfail_sent = true;
-                                        resp.set_response_code(ResponseCode::ServFail);
+                                        resp.metadata.response_code = ResponseCode::ServFail;
                                     }
                                 }
                                 Dnskey::Empty => {}
                             }
                         }
                         if q.query_type() == RecordType::SRV {
+                            let signing = match &dnskey {
+                                Dnskey::Signed(root) | Dnskey::ServFailOnce(root) => {
+                                    Some(root.clone())
+                                }
+                                _ => None,
+                            };
+                            let mut srv_set = Vec::new();
                             for i in 0..n_targets {
                                 let t = Name::from_str(&format!("r{i}.example.test.")).unwrap();
-                                resp.add_answer(Record::from_rdata(
+                                let srv = Record::from_rdata(
                                     q.name().clone(),
                                     300,
                                     RData::SRV(SRV::new(1, 1, 4160, t.clone())),
-                                ));
-                                resp.add_additional(Record::from_rdata(
-                                    t,
+                                );
+                                srv_set.push(srv.clone());
+                                resp.add_answer(srv);
+                                let glue = Record::from_rdata(
+                                    t.clone(),
                                     300,
                                     RData::A(A(Ipv4Addr::new(10, 0, 0, 1))),
+                                );
+                                resp.add_additional(glue.clone());
+                                if let Some(root) = &signing {
+                                    resp.add_additional(root.sign_rrset(
+                                        &t,
+                                        RecordType::A,
+                                        std::slice::from_ref(&glue),
+                                    ));
+                                }
+                            }
+                            if let Some(root) = &signing {
+                                resp.add_answer(root.sign_rrset(
+                                    q.name(),
+                                    RecordType::SRV,
+                                    &srv_set,
                                 ));
                             }
                         }
                     }
-                    if let Some(edns) = req.extensions().clone() {
+                    if let Some(edns) = req.edns.clone() {
                         resp.set_edns(edns);
                     }
                     let bytes = resp.to_vec().unwrap();
@@ -1919,18 +2010,20 @@ mod tests {
             validate: bool,
             anchor: Option<&TrustAnchors>,
         ) -> super::TokioResolver {
-            use super::{apply_resolver_opts, TokioConnectionProvider};
-            use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig};
-            let group =
-                NameServerConfigGroup::from_ips_clear(&[fake.addr.ip()], fake.addr.port(), true);
-            let cfg = ResolverConfig::from_parts(None, vec![], group);
+            use super::{apply_resolver_opts, TokioRuntimeProvider};
+            use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+            let mut ns = NameServerConfig::udp_and_tcp(fake.addr.ip());
+            for conn in &mut ns.connections {
+                conn.port = fake.addr.port();
+            }
+            let cfg = ResolverConfig::from_name_servers(vec![ns]);
             let mut b =
-                super::TokioResolver::builder_with_config(cfg, TokioConnectionProvider::default());
+                super::TokioResolver::builder_with_config(cfg, TokioRuntimeProvider::default());
             apply_resolver_opts(b.options_mut(), validate);
             if let Some(a) = anchor {
                 b = b.with_trust_anchor(Arc::new(a.clone()));
             }
-            b.build()
+            b.build().expect("test resolver")
         }
     }
 
@@ -1944,30 +2037,48 @@ mod tests {
         probe_attempt: Duration::from_millis(300),
     };
 
-    /// Diagnostic: a validating lookup's sub-query count grows with the
-    /// additional-section size (documents the #1702 root cause; may need
-    /// updating on hickory upgrade).
+    /// Diagnostic (hickory 0.26, issue #1828): a validating lookup of a
+    /// fully signed response succeeds and costs more queries than a
+    /// non-validating one (DNSKEY chain), while the same records served
+    /// unsigned are rejected as bogus rather than accepted as insecure (0.25
+    /// accepted them; 0.26 requires a proven insecure delegation). May need
+    /// updating on hickory upgrade.
     #[tokio::test]
-    async fn validated_lookup_queries_grow_with_additional_section() {
-        async fn queries(targets: usize, validate: bool) -> usize {
-            let fake = fake_dns::spawn(targets, Dnskey::Empty).await;
-            let r = fake_dns::resolver(&fake, validate, None);
-            let res = HickorySrvResolver::bound(
-                HickorySrvResolver::do_lookup(&r, SRV_NAME),
-                Duration::from_secs(20),
-            )
-            .await
-            .expect("stub lookup");
-            assert_eq!(res.len(), targets);
-            fake.queries.load(std::sync::atomic::Ordering::SeqCst)
-        }
-        assert_eq!(queries(10, false).await, 1);
-        let small = queries(5, true).await;
-        let large = queries(20, true).await;
-        assert!(
-            large > small && small > 1,
-            "validating sub-queries should grow with glue names: {small} -> {large}"
-        );
+    async fn validated_lookup_requires_signed_data_and_costs_extra_queries() {
+        use std::sync::atomic::Ordering;
+        let targets = 5;
+
+        let plain = fake_dns::spawn(targets, Dnskey::Empty).await;
+        let r = fake_dns::resolver(&plain, false, None);
+        let res = HickorySrvResolver::bound(
+            HickorySrvResolver::do_lookup(&r, SRV_NAME),
+            Duration::from_secs(20),
+        )
+        .await
+        .expect("non-validating stub lookup");
+        assert_eq!(res.len(), targets);
+        assert_eq!(plain.queries.load(Ordering::SeqCst), 1);
+
+        let root = std::sync::Arc::new(fake_dns::signed_root());
+        let signed = fake_dns::spawn(targets, Dnskey::Signed(root.clone())).await;
+        let r = fake_dns::resolver(&signed, true, Some(&root.anchor));
+        let res = HickorySrvResolver::bound(
+            HickorySrvResolver::do_lookup(&r, SRV_NAME),
+            Duration::from_secs(20),
+        )
+        .await
+        .expect("validating lookup of signed data");
+        assert_eq!(res.len(), targets);
+        assert!(signed.queries.load(Ordering::SeqCst) > 1);
+
+        let unsigned = fake_dns::spawn(targets, Dnskey::Empty).await;
+        let r = fake_dns::resolver(&unsigned, true, None);
+        let res = HickorySrvResolver::bound(
+            HickorySrvResolver::do_lookup(&r, SRV_NAME),
+            Duration::from_secs(20),
+        )
+        .await;
+        assert!(res.is_err(), "unsigned data must not validate: {res:?}");
     }
 
     /// Root trust-anchor parity (issue #1863, go-algorand v5.0.3-stable
@@ -2178,27 +2289,17 @@ mod tests {
     /// negative response) get the one retry.
     #[test]
     fn probe_error_classification() {
+        use hickory_resolver::net::NoRecords;
         use hickory_resolver::proto::op::Query;
-        use hickory_resolver::proto::ProtoError;
         fn no_records(code: ResponseCode) -> ResolveError {
-            ResolveError::from(ProtoError::from(ProtoErrorKind::NoRecordsFound {
-                query: Box::new(Query::new()),
-                soa: None,
-                ns: None,
-                negative_ttl: None,
-                response_code: code,
-                trusted: false,
-                authorities: None,
-            }))
+            ResolveError::from(NoRecords::new(Query::new(), code))
         }
         let transient = HickorySrvResolver::probe_error_is_transient;
         assert!(transient(&no_records(ResponseCode::ServFail)));
-        assert!(transient(&ResolveError::from(ProtoError::from(
-            ProtoErrorKind::Timeout
-        ))));
-        assert!(transient(&ResolveError::from(ProtoError::from(
+        assert!(transient(&ResolveError::Timeout));
+        assert!(transient(&ResolveError::from(
             "could not validate negative response missing SOA"
-        ))));
+        )));
         assert!(!transient(&no_records(ResponseCode::NoError)));
         assert!(!transient(&no_records(ResponseCode::NXDomain)));
     }

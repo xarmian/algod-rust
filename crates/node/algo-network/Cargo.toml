@@ -42,7 +42,6 @@ crossbeam-channel.workspace = true
 hickory-resolver.workspace = true
 regex.workspace = true
 tokio-rustls.workspace = true
-rustls-pemfile.workspace = true
 # HTTP client for the TxSyncer pull protocol's peer client (issue #774):
 # `TxSyncService`'s HTTP server already needed axum; the peer-side client
 # needs an HTTP client, and `reqwest` was already a vetted workspace
