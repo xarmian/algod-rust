@@ -593,6 +593,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             },
             failed_eval_delta: Cell::new(None),
             kv_mods_recorder: None,
+            avm_timing: Default::default(),
         };
 
         // --- Execute the transaction group ---

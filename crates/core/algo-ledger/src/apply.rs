@@ -186,6 +186,11 @@ pub struct ApplyContext {
     /// `Replay` mode never mutates box storage (box mutations only happen
     /// inside AVM execution), so there is nothing to record there.
     pub kv_mods_recorder: Option<crate::avm_context::KvModsRecorder>,
+    /// This apply's own top-level AVM time accumulator (issue #1815). Both
+    /// the approval and the ClearState call sites time into it through
+    /// `follow_timing::AvmTimer`; the apply entry point publishes the total
+    /// to the active `follow_timing::FollowScope` when the apply ends.
+    pub avm_timing: crate::follow_timing::AvmTiming,
 }
 
 /// AVM evaluation overrides applied by the simulation engine.
@@ -231,6 +236,7 @@ impl ApplyContext {
             avm_overrides: AvmEvalOverrides::default(),
             failed_eval_delta: Cell::new(None),
             kv_mods_recorder: None,
+            avm_timing: Default::default(),
         }
     }
 
@@ -2365,7 +2371,11 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         avm_overrides: Default::default(),
         failed_eval_delta: Cell::new(None),
         kv_mods_recorder: kv_mods_recorder.clone(),
+        avm_timing: Default::default(),
     };
+    // Publishes this apply's AVM total to the follow scope on every exit
+    // path (issue #1815); declared after `ctx` so it drops first.
+    let _avm_publish = crate::follow_timing::AvmPublishGuard(&ctx.avm_timing);
 
     // Re-borrow the tracer per iteration with `Option::as_deref_mut` so
     // each `apply_transaction_with_budget` call gets its own short-lived
@@ -6093,7 +6103,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                             empty
                         }
                         Ok(()) => {
-                            let _avm_timer = crate::follow_timing::AvmTimer::start();
+                            let _avm_timer = crate::follow_timing::AvmTimer::start(&ctx.avm_timing);
                             if let Some(ref mut t) = tracer {
                                 run_clear_state_program_with_tracer(
                                     &clear_program,
@@ -6260,13 +6270,12 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 // makes every call after this one a no-op.
                 avm_ctx.ensure_boxes_initialized();
                 avm_ctx.check_read_budget()?;
-                let avm_timer = crate::follow_timing::AvmTimer::start();
+                let _avm_timer = crate::follow_timing::AvmTimer::start(&ctx.avm_timing);
                 let mut result = if let Some(ref mut t) = tracer {
                     run_approval_program_with_tracer(&approval_program, &mut avm_ctx, budget, *t)?
                 } else {
                     run_approval_program(&approval_program, &mut avm_ctx, budget)?
                 };
-                drop(avm_timer);
                 // Mirrors go-algorand's `EvalContract`
                 // (`data/transactions/logic/eval.go:1353-1358`): `err == nil
                 // && pass` gates `considerBudgetProgramWrites`, and a
@@ -10616,6 +10625,7 @@ mod tests {
             avm_overrides: Default::default(),
             failed_eval_delta: Cell::new(None),
             kv_mods_recorder: None,
+            avm_timing: Default::default(),
         }
     }
 
@@ -11323,6 +11333,7 @@ mod tests {
             avm_overrides: Default::default(),
             failed_eval_delta: Cell::new(None),
             kv_mods_recorder: None,
+            avm_timing: Default::default(),
         };
         let stx = heartbeat_txn(sender, target, vote_id, 10, 1_000);
         let result = apply_transaction(&mut state, &stx, &ctx, 0);
@@ -11508,6 +11519,7 @@ mod tests {
             avm_overrides: Default::default(),
             failed_eval_delta: Cell::new(None),
             kv_mods_recorder: None,
+            avm_timing: Default::default(),
         }
     }
 
@@ -11532,6 +11544,7 @@ mod tests {
             avm_overrides: Default::default(),
             failed_eval_delta: Cell::new(None),
             kv_mods_recorder: None,
+            avm_timing: Default::default(),
         }
     }
 
@@ -12987,6 +13000,7 @@ return
             avm_overrides: Default::default(),
             failed_eval_delta: Cell::new(None),
             kv_mods_recorder: None,
+            avm_timing: Default::default(),
         }
     }
 
@@ -14931,6 +14945,7 @@ return
             avm_overrides: Default::default(),
             failed_eval_delta: Cell::new(None),
             kv_mods_recorder: None,
+            avm_timing: Default::default(),
         };
 
         apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
@@ -18082,5 +18097,104 @@ return
         assert!(!deferred.expired.contains(&removed));
         assert!(!deferred.expired.contains(&renewed));
         assert!(!deferred.expired.is_empty());
+    }
+
+    /// Issue #1815: the approval and ClearState paths time into the same
+    /// per-apply `AvmTiming` owned by the `ApplyContext`, and one apply's
+    /// time never shows up in another's (no thread-local accumulator, no
+    /// reset/take pairing to get wrong).
+    #[test]
+    fn issue_1815_approval_and_clear_state_share_the_apply_timer_and_applies_are_isolated() {
+        use crate::follow_timing::{AvmPublishGuard, FollowScope};
+
+        let creator = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut state = make_state_with_accounts(&[(creator, 50_000_000), (fee_sink, 0)], fee_sink);
+
+        // Identical bounded loop (~500 opcodes) as approval and as clear.
+        let src = "#pragma version 6\n\
+            int 0\n\
+            loop:\n\
+            int 1\n\
+            +\n\
+            dup\n\
+            int 100\n\
+            <\n\
+            bnz loop\n\
+            pop\n\
+            int 1\n\
+            return\n";
+        let program = algo_avm::assembler::assemble_string(src)
+            .expect("loop program must assemble")
+            .program;
+        let mut create = appl_create_txn(creator, 1_000, 0);
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(program.clone()));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(program));
+
+        let exec_ctx = || {
+            let mut ctx = ApplyContext::new_replay(0, fee_sink, 1);
+            ctx.mode = ApplyMode::Execute;
+            ctx
+        };
+
+        // Create runs the approval program once.
+        let create_ctx = exec_ctx();
+        apply_transaction(&mut state, &create, &create_ctx, 0).expect("create");
+        let create_time = create_ctx.avm_timing.total().expect("approval is timed");
+
+        // Opt in (approval), then ClearState (clear program), each in its own
+        // context with the identical program.
+        let mut opt_in = SignedTransaction::default();
+        opt_in.txn.txn_type = "appl".into();
+        opt_in.txn.sender = creator;
+        opt_in.txn.fee = 1_000;
+        opt_in.txn.application_id = 1;
+        opt_in.txn.on_completion = ON_COMPLETION_OPT_IN;
+        let opt_ctx = exec_ctx();
+        apply_transaction(&mut state, &opt_in, &opt_ctx, 0).expect("opt in");
+        let approval_time = opt_ctx.avm_timing.total().expect("approval is timed");
+
+        let mut clear = opt_in.clone();
+        clear.txn.on_completion = ON_COMPLETION_CLEAR_STATE;
+        let clear_ctx = exec_ctx();
+        apply_transaction(&mut state, &clear, &clear_ctx, 0).expect("clear state");
+        let clear_time = clear_ctx
+            .avm_timing
+            .total()
+            .expect("ClearState is timed into the same accumulator");
+
+        // Same work, same mechanism: neither is orders of magnitude off.
+        for (a, b) in [(approval_time, clear_time), (clear_time, create_time)] {
+            assert!(a < b * 200 && b < a * 200, "{a:?} vs {b:?}");
+        }
+
+        // Isolation: a scratch apply running while another apply's context is
+        // live on the same thread leaves that context's timer untouched.
+        let outer_ctx = exec_ctx();
+        let before = outer_ctx.avm_timing.total();
+        let scope = FollowScope::begin();
+        let inner_ctx = exec_ctx();
+        let mut noop = opt_in.clone();
+        noop.txn.on_completion = 0;
+        apply_transaction(&mut state, &noop, &inner_ctx, 0).expect("scratch noop");
+        drop(AvmPublishGuard(&inner_ctx.avm_timing));
+        assert_eq!(outer_ctx.avm_timing.total(), before);
+        let (published, _) = scope.finish();
+        assert_eq!(
+            published,
+            inner_ctx.avm_timing.total(),
+            "the scope sees exactly the apply that ran inside it"
+        );
+
+        // A scope abandoned without `finish` (the old missing-take case)
+        // leaks nothing into the next block's measurement.
+        let abandoned = FollowScope::begin();
+        let leak_ctx = exec_ctx();
+        let mut noop = opt_in.clone();
+        noop.txn.on_completion = 0;
+        apply_transaction(&mut state, &noop, &leak_ctx, 0).expect("noop");
+        drop(AvmPublishGuard(&leak_ctx.avm_timing));
+        drop(abandoned);
+        assert_eq!(FollowScope::begin().finish().0, None);
     }
 }
