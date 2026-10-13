@@ -367,12 +367,14 @@ fn lookup_agreement_matches_locked_path() {
     );
 }
 
-/// Before/after latency under a held ledger mutex (a simulated 400 ms block
-/// apply): the locked accessor waits out the hold, the pool does not.
+/// Before/after latency under a held ledger mutex (a simulated 1 s block
+/// apply): the locked accessor waits out the hold, the pool does not. The
+/// hold is long so the `HOLD / 2` bound keeps a wide margin when the test
+/// thread is descheduled under heavy parallel load (it failed once at 400 ms).
 /// Run with `--nocapture` to see the numbers recorded in the PR body.
 #[test]
 fn latency_under_a_held_ledger_mutex_before_and_after() {
-    const HOLD: Duration = Duration::from_millis(400);
+    const HOLD: Duration = Duration::from_millis(1000);
     let (_d, mut l) = file_ledger();
     commit(&mut l, 1, 1, 100);
     let ledger = Arc::new(Mutex::new(l));
