@@ -97,7 +97,7 @@ serde_bytes = "0.11"
 data-encoding = "2"
 base64 = "0.23"
 scrypt = { version = "0.12", default-features = false }
-xsalsa20poly1305 = "0.9"
+crypto_secretbox = "0.1"
 hkdf = "0.13"
 
 # Storage
@@ -167,10 +167,9 @@ rand = "0.10"
 zeroize = "1"
 http = "1"
 url = "2"
-hickory-resolver = { version = "0.25", features = ["dnssec-ring", "tokio"] }
+hickory-resolver = { version = "0.26", features = ["dnssec-ring", "tokio"] }
 regex = "1"
 crossbeam-channel = "0.5"
 
 # TLS
 tokio-rustls = "0.26"
-rustls-pemfile = "2"

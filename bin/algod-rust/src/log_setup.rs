@@ -35,7 +35,7 @@
 //! events pass untouched.
 //!
 //! Only an explicit `RUST_LOG` directive whose target is the noisy target or
-//! a string prefix of it (`hickory_proto=debug`, `hickory=trace`) at
+//! a string prefix of it (`hickory_net=debug`, `hickory=trace`) at
 //! trace/debug (or with no level) disables the limiter. A bare global level
 //! (`RUST_LOG=debug`) does not: debugging everything must not bring back the
 //! flood from this one target. Everything else about `RUST_LOG` handling is
@@ -68,13 +68,13 @@ const SUMMARY_TICK: Duration = Duration::from_secs(1);
 /// limited yet impossible to override (an unlisted new path is simply not
 /// limited).
 ///
-/// Only hickory-proto 0.25.x logs `exceeded max validation depth` (via
-/// `error!` in `src/dnssec/dnssec_dns_handle/mod.rs`). The 0.24.4 copy in
-/// the lockfile (`xfer::dnssec_dns_handle`) returns it as a `ProtoError`
-/// and never logs it, so it has no entry here. The test
-/// `locked_hickory_versions_match_the_pinned_noisy_path` fails when the
-/// locked hickory-proto versions change, to force re-checking this path.
-const NOISY_TARGET_PATHS: [&str; 1] = ["hickory_proto::dnssec::dnssec_dns_handle"];
+/// hickory 0.26 logs `exceeded max validation depth` (via `error!` in
+/// hickory-net `src/dnssec/mod.rs`, `DnssecDnsHandle::send`; before the 0.26
+/// split of hickory-proto it was `hickory_proto::dnssec::dnssec_dns_handle`,
+/// issue #1828). The test `locked_hickory_versions_match_the_pinned_noisy_path`
+/// fails when the locked hickory-net/-proto versions change, to force
+/// re-checking this path.
+const NOISY_TARGET_PATHS: [&str; 1] = ["hickory_net::dnssec"];
 
 /// Whether an event target is the noisy target.
 fn is_noisy_target(target: &str) -> bool {
@@ -147,7 +147,7 @@ fn level_is_verbose(level: Option<&str>) -> bool {
 
 /// True when `spec` has an explicit directive asking for verbose (trace or
 /// debug) output on the noisy target. Targets match like `EnvFilter` matches
-/// them, by plain string prefix (`hickory`, `hickory_p`, `hickory_proto::dnssec`
+/// them, by plain string prefix (`hickory`, `hickory_p`, `hickory_net::dnssec`
 /// all cover it); the most specific (longest) such directive decides, later
 /// winning ties. Bare global levels are ignored (see the module docs).
 fn names_noisy_target(spec: &str) -> bool {
@@ -291,12 +291,12 @@ fn spawn_summary_ticker(
 
 /// Text of the suppression notice. The hint tells operators to append the
 /// directive to their current `RUST_LOG` rather than replace it: a bare
-/// `RUST_LOG=hickory_proto=debug` would drop every other target to the
+/// `RUST_LOG=hickory_net=debug` would drop every other target to the
 /// default level. The count covers every ended window not yet reported.
 fn summary_message(dropped: u64) -> String {
     format!(
         "rate-limited hickory dnssec_dns_handle errors: suppressed {dropped} events since the \
-         last report (append ,hickory_proto=debug to your current RUST_LOG to see all)"
+         last report (append ,hickory_net=debug to your current RUST_LOG to see all)"
     )
 }
 
@@ -407,25 +407,25 @@ mod tests {
     fn override_matrix_only_explicit_trace_debug_directives_disable_the_limiter() {
         for spec in [
             // trace/debug (or numeric 5/4) on the target or any string prefix
-            "hickory_proto=trace",
-            "hickory_proto=debug",
-            "hickory_proto=DEBUG",
-            "hickory_proto=5",
-            "hickory_proto=4",
-            "hickory_proto::dnssec=trace",
-            "hickory_proto::dnssec::dnssec_dns_handle=debug",
+            "hickory_net=trace",
+            "hickory_net=debug",
+            "hickory_net=DEBUG",
+            "hickory_net=5",
+            "hickory_net=4",
+            "hickory_net::dnssec=trace",
+            "hickory_net::dnssec=debug",
             // EnvFilter matches targets by plain string prefix
             "hickory=debug",
-            "hickory_p=trace",
+            "hickory_n=trace",
             // no level means trace
-            "hickory_proto",
-            "info,hickory_proto=debug",
-            " info , hickory_proto::dnssec=debug ",
+            "hickory_net",
+            "info,hickory_net=debug",
+            " info , hickory_net::dnssec=debug ",
             // commas inside span/field filters must not confuse the parse
-            "info,foo[span{a=1,b=2}]=debug,hickory_proto=debug",
+            "info,foo[span{a=1,b=2}]=debug,hickory_net=debug",
             // the most specific explicit directive wins
-            "warn,hickory_proto=debug",
-            "info,hickory_proto::dnssec=debug,hickory_proto=warn",
+            "warn,hickory_net=debug",
+            "info,hickory_net::dnssec=debug,hickory_net=warn",
         ] {
             assert!(names_noisy_target(spec), "{spec} must disable the limiter");
         }
@@ -439,19 +439,19 @@ mod tests {
             "warn,debug",
             "debug,algod_rust=info",
             // info is the default and the flood is ERROR: the limiter stays on
-            "hickory_proto=info",
-            "hickory_proto=INFO",
-            "hickory_proto=3",
-            "hickory_proto::dnssec::dnssec_dns_handle=info",
+            "hickory_net=info",
+            "hickory_net=INFO",
+            "hickory_net=3",
+            "hickory_net::dnssec=info",
             // quieting directives keep the limiter
-            "hickory_proto=warn",
-            "hickory_proto=error",
-            "hickory_proto=off",
-            "hickory_proto=1",
-            " info , hickory_proto::dnssec=warn ",
+            "hickory_net=warn",
+            "hickory_net=error",
+            "hickory_net=off",
+            "hickory_net=1",
+            " info , hickory_net::dnssec=warn ",
             // the more specific directive beats a verbose less specific one
-            "hickory_proto=debug,hickory_proto::dnssec=error",
-            "debug,hickory_proto=info",
+            "hickory_net=debug,hickory_net::dnssec=error",
+            "debug,hickory_net=info",
             // non-verbose globals
             "info",
             "warn",
@@ -460,9 +460,9 @@ mod tests {
             // unrelated targets
             "algod_rust=debug",
             "hickory_resolver=debug",
-            "hickory_proto::dnssec_other=trace",
-            "hickory_proto::dnssec::dnssec_dns_handle::deeper=trace",
-            "hickory_proto::udp=trace",
+            "hickory_net::dnssec_other=trace",
+            "hickory_net::dnssec::deeper=trace",
+            "hickory_net::udp=trace",
             "info,foo[span{a=1,b=2}]=debug",
         ] {
             assert!(!names_noisy_target(spec), "{spec} must keep the limiter");
@@ -472,18 +472,18 @@ mod tests {
     #[test]
     fn splitter_respects_bracket_and_brace_nesting() {
         assert_eq!(
-            split_directives("info,foo[span{a=1,b=2}]=debug,hickory_proto=debug"),
-            vec!["info", "foo[span{a=1,b=2}]=debug", "hickory_proto=debug"]
+            split_directives("info,foo[span{a=1,b=2}]=debug,hickory_net=debug"),
+            vec!["info", "foo[span{a=1,b=2}]=debug", "hickory_net=debug"]
         );
         assert_eq!(split_directives(""), Vec::<&str>::new());
     }
 
     #[test]
     fn noisy_target_predicate_matches_the_logging_hickory_path_only() {
-        assert!(is_noisy_target("hickory_proto::dnssec::dnssec_dns_handle"));
+        assert!(is_noisy_target("hickory_net::dnssec"));
         // 0.24.4 never logs this error, so its path is not limited.
-        assert!(!is_noisy_target("hickory_proto::xfer::dnssec_dns_handle"));
-        assert!(!is_noisy_target("hickory_proto::dnssec::verifier"));
+        assert!(!is_noisy_target("hickory_net::xfer::dnssec_dns_handle"));
+        assert!(!is_noisy_target("hickory_net::dnssec::verifier"));
         assert!(!is_noisy_target("hickory_resolver::dnssec_dns_handle"));
         assert!(!is_noisy_target("algo_network::srv_resolver"));
     }
@@ -524,7 +524,7 @@ mod tests {
         let s = LogSetup::resolve(Some("warn"));
         assert!(s.rate_limit);
         assert!(!passes(s.filter, false), "warn drops info");
-        let s = LogSetup::resolve(Some("info,hickory_proto=trace"));
+        let s = LogSetup::resolve(Some("info,hickory_net=trace"));
         assert!(!s.rate_limit);
         let s = LogSetup::resolve(Some("debug"));
         assert!(s.rate_limit, "global debug keeps the limiter");
@@ -566,11 +566,11 @@ mod tests {
         }
     }
 
-    /// Pins the noisy path to the locked hickory-proto versions: 0.25.2 (the copy
-    /// `hickory-resolver` 0.25 uses for our SRV/dnsaddr lookups) logs the
-    /// error at `hickory_proto::dnssec::dnssec_dns_handle`; 0.26.3 is only
-    /// pulled in by libp2p-mdns (no DNSSEC validation, #1869). A bump changes the set and fails here, prompting a
-    /// re-check of `NOISY_TARGET_PATHS`.
+    /// Pins the noisy path to the locked hickory versions: hickory-net 0.26.3
+    /// (used by `hickory-resolver` 0.26 for our SRV/dnsaddr lookups, and the
+    /// only hickory-proto copy, shared with libp2p-mdns) logs the error at
+    /// `hickory_net::dnssec`. A bump changes the set and fails here,
+    /// prompting a re-check of `NOISY_TARGET_PATHS`.
     #[test]
     fn locked_hickory_versions_match_the_pinned_noisy_path() {
         let lock =
@@ -579,25 +579,25 @@ mod tests {
         let lock = lock.replace("\r\n", "\n");
         let mut versions: Vec<&str> = lock
             .split("[[package]]")
-            .filter(|b| b.lines().any(|l| l == "name = \"hickory-proto\""))
+            .filter(|b| b.lines().any(|l| l == "name = \"hickory-net\""))
             .filter_map(|b| b.lines().find_map(|l| l.strip_prefix("version = \"")))
             .map(|v| v.trim_end_matches('"'))
             .collect();
         versions.sort_unstable();
         assert_eq!(
             versions,
-            ["0.25.2", "0.26.3"],
-            "locked hickory-proto versions changed: re-check where `exceeded max validation              depth` is logged and update NOISY_TARGET_PATHS"
+            ["0.26.3"],
+            "locked hickory-net versions changed: re-check where `exceeded max validation              depth` is logged and update NOISY_TARGET_PATHS"
         );
     }
 
-    /// The notice's hint must be safe to copy: the bare `hickory_proto=debug`
+    /// The notice's hint must be safe to copy: the bare `hickory_net=debug`
     /// form would drop every other target to the default level.
     #[test]
     fn summary_message_has_a_safe_hint_and_honest_wording() {
         let m = summary_message(42);
         assert!(
-            m.contains("append ,hickory_proto=debug to your current RUST_LOG"),
+            m.contains("append ,hickory_net=debug to your current RUST_LOG"),
             "{m}"
         );
         assert!(!m.contains("RUST_LOG=info"), "{m}");
@@ -703,7 +703,7 @@ mod tests {
     }
 
     /// The summary is an error-volume notice: it must survive a filter that
-    /// only lets ERROR through (`RUST_LOG=error`, `hickory_proto=error`).
+    /// only lets ERROR through (`RUST_LOG=error`, `hickory_net=error`).
     #[test]
     fn summary_passes_an_error_only_filter() {
         let seen = Arc::new(AtomicUsize::new(0));
@@ -743,7 +743,7 @@ mod tests {
         );
         tracing::subscriber::with_default(sub, || {
             for _ in 0..10 {
-                tracing::error!(target: "hickory_proto::dnssec::dnssec_dns_handle", "depth");
+                tracing::error!(target: "hickory_net::dnssec", "depth");
             }
             for _ in 0..3 {
                 tracing::error!(target: "algo_network::srv_resolver", "other");
@@ -788,12 +788,12 @@ mod tests {
         ));
         tracing::subscriber::with_default(sub, || {
             for _ in 0..4 {
-                tracing::warn!(target: "hickory_proto::dnssec::dnssec_dns_handle", "w");
-                tracing::info!(target: "hickory_proto::dnssec::dnssec_dns_handle", "i");
-                tracing::debug!(target: "hickory_proto::dnssec::dnssec_dns_handle", "d");
+                tracing::warn!(target: "hickory_net::dnssec", "w");
+                tracing::info!(target: "hickory_net::dnssec", "i");
+                tracing::debug!(target: "hickory_net::dnssec", "d");
             }
             for _ in 0..4 {
-                tracing::error!(target: "hickory_proto::dnssec::dnssec_dns_handle", "e");
+                tracing::error!(target: "hickory_net::dnssec", "e");
             }
         });
         // 12 untouched non-errors + 1 admitted error; 3 errors dropped.
@@ -850,7 +850,7 @@ mod tests {
         let sub = tracing_subscriber::registry().with(Share(cap.clone()));
         tracing::subscriber::with_default(
             sub,
-            || tracing::error!(target: "hickory_proto::dnssec::dnssec_dns_handle", "capture"),
+            || tracing::error!(target: "hickory_net::dnssec", "capture"),
         );
         let noisy = cap.0.lock().unwrap().expect("captured metadata");
         let active = NoisyTargetLimiter {

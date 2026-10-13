@@ -38,9 +38,11 @@ use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
 
-use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig};
-use hickory_resolver::name_server::TokioConnectionProvider;
-use hickory_resolver::{ResolveError, TokioResolver};
+use hickory_resolver::config::{ResolverConfig, ServerGroup, CLOUDFLARE, GOOGLE};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::net::NetError as ResolveError;
+use hickory_resolver::proto::rr::RData;
+use hickory_resolver::TokioResolver;
 use libp2p::multiaddr::Protocol;
 use libp2p::Multiaddr;
 use thiserror::Error;
@@ -103,12 +105,14 @@ impl HickoryDnsaddrResolver {
     }
 
     fn build_resolver(config: ResolverConfig) -> TokioResolver {
-        let provider = TokioConnectionProvider::default();
+        let provider = TokioRuntimeProvider::default();
         let mut builder = TokioResolver::builder_with_config(config, provider);
         let opts = builder.options_mut();
         opts.validate = true;
         opts.try_tcp_on_error = true;
-        builder.build()
+        builder
+            .build()
+            .expect("resolver build only fails on invalid TLS/QUIC config; ours is plain UDP/TCP")
     }
 
     fn system_resolver() -> Result<TokioResolver, ResolveError> {
@@ -116,30 +120,40 @@ impl HickoryDnsaddrResolver {
         let opts = builder.options_mut();
         opts.validate = true;
         opts.try_tcp_on_error = true;
-        Ok(builder.build())
+        builder.build()
     }
 
     fn fallback_resolver(addr: &str) -> Option<TokioResolver> {
         let ip: IpAddr = addr.parse().ok()?;
-        let group = NameServerConfigGroup::from_ips_clear(&[ip], 53, true);
-        let config = ResolverConfig::from_parts(None, vec![], group);
+        let ips = [ip];
+        let group = ServerGroup {
+            ips: &ips,
+            server_name: "",
+            path: "",
+        };
+        let config = ResolverConfig::udp_and_tcp(&group);
         Some(Self::build_resolver(config))
     }
 
     fn default_resolver() -> TokioResolver {
-        let mut group = NameServerConfigGroup::cloudflare();
-        group.merge(NameServerConfigGroup::google());
-        let config = ResolverConfig::from_parts(None, vec![], group);
+        let mut name_servers: Vec<_> = CLOUDFLARE.udp_and_tcp().collect();
+        name_servers.extend(GOOGLE.udp_and_tcp());
+        let config = ResolverConfig::from_name_servers(name_servers);
         Self::build_resolver(config)
     }
 
     async fn do_lookup(resolver: &TokioResolver, name: &str) -> Result<Vec<String>, ResolveError> {
         let lookup = resolver.txt_lookup(name).await?;
         let values = lookup
+            .answers()
             .iter()
+            .filter_map(|record| match &record.data {
+                RData::TXT(txt) => Some(txt),
+                _ => None,
+            })
             .filter_map(|txt| {
                 let bytes: Vec<u8> = txt
-                    .txt_data()
+                    .txt_data
                     .iter()
                     .flat_map(|c| c.iter().copied())
                     .collect();

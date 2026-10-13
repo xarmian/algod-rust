@@ -39,12 +39,12 @@
 //! (`typedPlaintext`, `encryptedDBBlob`). HKDF-based key derivation
 //! (`extractKeyWithIndex`, sqlite_crypto.go:234) belongs to TASK-205.
 
-use rand::TryRng;
-use serde::{Deserialize, Serialize};
-use xsalsa20poly1305::{
+use crypto_secretbox::{
     aead::{Aead, KeyInit},
     Key, Nonce, XSalsa20Poly1305,
 };
+use rand::TryRng;
+use serde::{Deserialize, Serialize};
 
 use crate::config::ScryptParams;
 use crate::error::{Error, Result};

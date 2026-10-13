@@ -1745,9 +1745,13 @@ impl WebsocketNetwork {
         let cert_file = &mut std::io::BufReader::new(std::fs::File::open(&cert_path)?);
         let key_file = &mut std::io::BufReader::new(std::fs::File::open(&key_path)?);
 
-        let certs: Vec<_> = rustls_pemfile::certs(cert_file).collect::<Result<_, _>>()?;
-        let key =
-            rustls_pemfile::private_key(key_file)?.ok_or("no private key found in TLS key file")?;
+        // `rustls-pemfile` is unmaintained (RUSTSEC-2025-0134); rustls-pki-types'
+        // `PemObject` is its upstream replacement.
+        use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+        let certs: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_reader_iter(cert_file).collect::<Result<_, _>>()?;
+        let key = PrivateKeyDer::from_pem_reader(key_file)
+            .map_err(|e| format!("no usable private key found in TLS key file: {e}"))?;
 
         let server_config = tokio_rustls::rustls::ServerConfig::builder()
             .with_no_client_auth()
