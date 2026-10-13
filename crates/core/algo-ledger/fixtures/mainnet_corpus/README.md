@@ -124,6 +124,7 @@ Adding an entry also needs one `corpus_entry!` line and the round in the
 | 65703970 | 61148 / 51737 | DeltaAction numbering SetBytes=1 / SetUint=2 (#1698, #1708) |
 | 65723764 | 100975 / 117217 | zero-amount close into a new account stamps rewards_base (#1729, #1730) |
 | 65723784 | 88258 / 119428 | smoke replay (green before the #1729 fix too, because its pre-state comes from go; the real #1729 guard is 65723764). Kept as the fixed-code spend-from-new-account check and for its inner txns / nested eval deltas (#1742 encoding) |
+| 65929681 | 91790 / 109863 | inner-transaction fees in FeesCollected: header 61307 vs 33000 top-level (#1908) |
 
 Not captured (tracked as follow-ups of #1675): 65743637 (heavy app-call block of
 #1757) is ~530 KB, over the 200 KB per-fixture budget; 53000003 (#1742) needs

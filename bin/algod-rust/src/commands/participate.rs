@@ -2049,6 +2049,9 @@ impl SimpleBlockEvaluator {
     > {
         let mut candidate = template.clone();
         candidate.payset = payset.to_vec();
+        // A scratch-pass input only: the header fees the epilogue would see.
+        // The proposed `FeesCollected` comes from the pass's own
+        // `final_fees_collected` (see `finalize_payset`).
         candidate.fees_collected = groups.iter().map(|g| g.fees).sum();
         // Measured here, outside the ledger lock, so nothing is encoded under
         // the mutex. Only when the load needs it.
@@ -2137,6 +2140,11 @@ impl SimpleBlockEvaluator {
         // Admitted transactions in payset form, with no ApplyData yet.
         let mut pristine = std::mem::take(&mut self.included_txns);
         let Some(exec) = self.exec.as_mut() else {
+            // No evaluator state: nothing evaluated the payset, so
+            // `self.fees_collected` is the admission-time TOP-LEVEL fee sum
+            // and cannot see inner-transaction fees (issue #1908). Production
+            // evaluators always carry exec state; this legacy path is only
+            // correct for payment-only paysets.
             let n = pristine.len() as u64;
             return Ok((pristine, n));
         };
@@ -2155,6 +2163,7 @@ impl SimpleBlockEvaluator {
         let mut retried = false;
         let mut bisected = false;
         let mut final_state_proof_next = None;
+        let mut final_fees_collected = None;
         let mut final_fee_sink_available = None;
         let mut final_knock_offline = None;
         let mut final_modified = None;
@@ -2173,6 +2182,7 @@ impl SimpleBlockEvaluator {
                         self.txn_bytes = total;
                         let counted = done.final_txn_counter.saturating_sub(self.hdr.txn_counter);
                         final_state_proof_next = done.final_state_proof_next;
+                        final_fees_collected = Some(done.final_fees_collected);
                         final_fee_sink_available = done.final_fee_sink_available;
                         final_knock_offline = done.knock_offline_lists;
                         final_modified = done.knock_offline_modified;
@@ -2288,7 +2298,13 @@ impl SimpleBlockEvaluator {
                 "block assembly dropped groups the evaluator rejected or that no longer fit"
             );
         }
-        self.fees_collected = groups.iter().map(|g| g.fees).sum();
+        // The header's FeesCollected (and the payout derived from it) is what
+        // the kept evaluation paid -- top-level AND inner-transaction fees, go
+        // `eval.state.feesCollected` (issue #1908) -- not the sum of the
+        // groups' top-level fees. The group sum is only the fallback when no
+        // kept pass exists (the payset is empty then).
+        self.fees_collected =
+            final_fees_collected.unwrap_or_else(|| groups.iter().map(|g| g.fees).sum());
         if let Some(exec) = self.exec.as_mut() {
             exec.last_passes = passes;
             exec.final_state_proof_next = final_state_proof_next;
@@ -2417,18 +2433,18 @@ impl SimpleBlockEvaluator {
         &mut self,
         stibs: &[algo_types::SignedTransaction],
         restored: &[algo_types::SignedTransaction],
-    ) -> Result<(), algo_error::AlgoError> {
+    ) -> Result<Option<u64>, algo_error::AlgoError> {
         use algo_ledger::proposal_eval::GroupEvalError;
 
         let Some(exec) = self.exec.as_mut() else {
-            return Ok(());
+            return Ok(None);
         };
         if exec.incomplete {
-            return Ok(());
+            return Ok(None);
         }
         if exec.spent >= EXEC_ADMISSION_BUDGET {
             exec.incomplete = true;
-            return Ok(());
+            return Ok(None);
         }
         // Issue #1781: the ledger mutex is taken per read, not across the AVM
         // evaluation of the group. Only the time spent evaluating is charged to
@@ -2464,13 +2480,13 @@ impl SimpleBlockEvaluator {
         match outcome {
             Ok(eval) => {
                 debug_assert_eq!(eval.apply_data.len(), stibs.len());
-                Ok(())
+                Ok(Some(eval.fees_collected))
             }
             Err(GroupEvalError::Txn { index, error }) => Err(go_rejection(&txid_of(index), error)),
             Err(GroupEvalError::Stale) => {
                 algo_ledger::proposal_eval::count_stale_base();
                 exec.incomplete = true;
-                Ok(())
+                Ok(None)
             }
             Err(GroupEvalError::Other(e)) => Err(go_rejection(&txid_of(0), e)),
         }
@@ -3076,10 +3092,17 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         // failing inner transaction or a rejecting program; this can.
         // Evaluated once here; the result also feeds the ApplyData of the
         // proposed block.
-        if let Err(e) = self.exec_group(&stibs, &restored) {
-            self.overlay.restore(checkpoint);
-            self.fees_collected = fees_collected_checkpoint;
-            return Err(e);
+        match self.exec_group(&stibs, &restored) {
+            // The evaluated fees include inner-transaction fees (issue #1908).
+            Ok(Some(fees)) => {
+                self.fees_collected = fees_collected_checkpoint.saturating_add(fees);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.overlay.restore(checkpoint);
+                self.fees_collected = fees_collected_checkpoint;
+                return Err(e);
+            }
         }
         let group_fees = self.fees_collected - fees_collected_checkpoint;
         if let Some(exec) = self.exec.as_mut() {

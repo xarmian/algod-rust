@@ -836,6 +836,11 @@ pub struct ScratchPayset {
     /// The transaction counter after every top-level and inner transaction
     /// (go `block.TxnCounter`).
     pub final_txn_counter: u64,
+    /// The fees the payset paid -- top-level and inner transactions, excluding
+    /// fee-sink senders (go `eval.state.feesCollected`, issue #1908). The
+    /// proposed header's `FeesCollected` (and the payout derived from it) must
+    /// be this, not the sum of the top-level fees.
+    pub final_fees_collected: u64,
     /// The `StateProofNextRound` after the payset's state proof transactions
     /// (go `cow.GetStateProofNextRound()`): `Some(n)` when a state proof was
     /// applied, `None` when none was (the template value stands). The proposed
@@ -1016,6 +1021,7 @@ fn scratch_execute_with<L: LedgerStore>(
         Ok(Ok(())) => Ok(ScratchPayset {
             apply_data: ad,
             final_txn_counter: probe.out.final_txn_counter,
+            final_fees_collected: probe.out.final_fees_collected,
             final_state_proof_next: probe.out.final_state_proof_next,
             final_fee_sink_available: probe.out.final_fee_sink_available,
             knock_offline_lists: probe.out.knock_offline_lists.take(),
