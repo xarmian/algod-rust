@@ -14,14 +14,12 @@ node must resolve its voting key and weight from its own `onlineaccounts`
 history.  A Rust node that counted the stake too early (current-state fallback)
 or never would reject/mis-weigh those certificates.
 
-This script only drives the scenario and records what the Go nodes saw.  The
-decisive check is run afterwards, over the post-activation window, with
-
-    verify-soak.sh --rust-account <NEW> --min-rust-vote-rounds 1 \
-                   --from-round <ACTIVATION> --stride 1
-
-which verifies Go certificates carrying the late joiner's votes under the Rust
-verifier and the go-algorand verifier (see ops/mixed-cluster/README.md).
+After the activation round it records what the Go nodes saw and then runs the
+decisive check itself: `verify-soak.sh --cert-latest 1 --rust-account <NEW>
+--min-rust-vote-rounds 1`, retried until the newest certificate carries the
+joiner's vote and verifies under the Rust verifier AND the go-algorand verifier
+(post-hoc verification can only cover the ledger snapshot's newest round, see
+ops/mixed-cluster/README.md and issue #1854).
 
 Usage (cluster already running from start.sh):
   late_join.py --out late_join.json [--percent 10] [--margin 12]
@@ -86,6 +84,35 @@ def split_votes(votes, activation):
     return before, after
 
 
+def verify_latest(account, tries, runner, outdir, sleep=time.sleep, wait_s=20):
+    """Re-verify the NEWEST certificate under the Rust and go-algorand verifiers.
+
+    Post-hoc verification can only cover the snapshot's newest round (the Rust
+    ledger keeps online-account history back to ~tip - MaxBalLookback, like go),
+    and a given round's cert carries the late joiner's vote only some of the
+    time, so retry until one that does verifies.  Returns the attempt number of
+    the first success, or None.
+    """
+    cmd = [
+        # LATE_JOIN_BASH selects the bash (on Windows `bash` on PATH can be WSL's,
+        # which cannot see C:/ paths; point it at Git Bash). Forward slashes:
+        # a path with backslashes loses them in bash.
+        os.environ.get("LATE_JOIN_BASH", "bash"), os.path.join(HERE, "verify-soak.sh").replace("\\", "/"),
+        "--stride", "1", "--cert-latest", "1",
+        "--rust-account", account, "--min-rust-vote-rounds", "1",
+        "--out-dir", outdir.replace("\\", "/"),
+    ]
+    for attempt in range(1, tries + 1):
+        if runner(cmd) == 0:
+            return attempt
+        sleep(wait_s)
+    return None
+
+
+def _run(cmd):
+    return subprocess.call(cmd)
+
+
 def consensus_params(netroot, protocol="future"):
     path = os.path.join(netroot, "Node1", "consensus.json")
     try:
@@ -98,10 +125,22 @@ def consensus_params(netroot, protocol="future"):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--percent", type=int, default=10)
+    ap.add_argument("--percent", type=int, default=18,
+                    help="slice of the supply to fund the joiner with; a 10% account is almost never needed to reach the 74% cert threshold, 18% usually is")
     ap.add_argument("--margin", type=int, default=12, help="rounds to keep running after activation")
+    ap.add_argument("--verify-tries", type=int, default=12,
+                    help="attempts at the final newest-cert verification (0 = skip)")
+    ap.add_argument("--verify-outdir", default=os.path.join(os.path.dirname(HERE), "late-join-verify"))
+    ap.add_argument("--verify-only", metavar="ACCOUNT",
+                    help="skip the scenario; only run the final newest-cert verification for ACCOUNT")
     ap.add_argument("--netroot", default=os.path.join(os.path.dirname(HERE), "netroot"))
     a = ap.parse_args(argv)
+
+    if a.verify_only:
+        os.makedirs(a.verify_outdir, exist_ok=True)
+        n = verify_latest(a.verify_only, max(a.verify_tries, 1), _run, a.verify_outdir)
+        print(json.dumps({"account": a.verify_only, "cert_verify_attempt": n}), flush=True)
+        return 0 if n is not None else 3
 
     import workload as wl
 
@@ -175,10 +214,19 @@ def main(argv=None):
             votes[r] = votes.get(r, 0) + n
     before, after = split_votes(votes, activation)
     summary.update({"final_round": env.current_round(), "go_votes_before_activation": before, "go_votes_after_activation": after})
+    verified = None
+    if a.verify_tries > 0 and after > 0:
+        os.makedirs(a.verify_outdir, exist_ok=True)
+        verified = verify_latest(new, a.verify_tries, _run, a.verify_outdir)
+    summary["cert_verify_attempt"] = verified
     with open(a.out, "w", encoding="utf-8") as f:
         json.dump(summary, f)
     print(json.dumps(summary), flush=True)
-    return 0 if after > 0 else 1
+    if after == 0:
+        return 1
+    if a.verify_tries > 0 and verified is None:
+        return 3
+    return 0
 
 
 if __name__ == "__main__":

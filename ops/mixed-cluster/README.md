@@ -690,7 +690,7 @@ harness serving a different purpose — gossip / catchup interop testing
 `scripts/late_join.py` exercises the balance-lookback policy of
 `LookupAgreement` (#1809/#1820) on the live cluster. On a running cluster it
 creates a fresh account, funds it with a slice of the supply (`--percent`,
-default 10), installs a participation key on go-node-1 and goes online, then
+default 18), installs a participation key on go-node-1 and goes online, then
 waits for the *activation round* (keyreg round + `2 * SeedRefreshInterval *
 SeedLookback`, 320 by default) plus a margin and reports how many `VoteAccepted`
 records the Go nodes logged for the account before and after activation (must be
@@ -704,9 +704,16 @@ python3 ops/mixed-cluster/scripts/late_join.py --out late_join.json
 ops/mixed-cluster/scripts/verify-soak.sh --from-round <activation_round> --stride 1     --rust-account <account> --min-rust-vote-rounds 1
 ```
 
-Known limitation: the verify-soak step reads the Rust node's ledger after the
-fact, and the Rust `onlineaccounts` history is retained for ~320 rounds
-(go keeps ~640), so on a run whose tip is past the activation round + ~130 the
-cert checks fail for an unrelated reason (issue #1854). Run the verify step
-as soon as the margin has passed, or after #1854 lands. Unit tests:
-`python3 ops/mixed-cluster/scripts/late_join_test.py`.
+Post-hoc certificate verification and online-account history: verifying the
+cert of round `r` needs the online-account state at `r - BalanceLookback`
+(320), and the Rust ledger -- like a go node, whose `onlineaccounts` trimming
+keeps `MaxBalLookback` rounds behind the committed DB round
+(`ledger/acctonline.go` `onlineAccountsDelete`, `MaxAcctLookback` = 4) -- only
+retains that history back to about `tip - 320`. A `verify-soak.sh` pass over an
+old range therefore fails on any run whose tip is more than ~320 rounds past
+the sampled rounds (the voters' earlier rows are gone), which is NOT a node
+divergence (issue #1854). `verify-soak.sh --cert-latest N` takes the ledger
+snapshot first and verifies only the snapshot's own newest N rounds (N=1 is
+exact); `late_join.py` uses it and retries until a cert that carries the late
+joiner's vote verifies under both the Rust and go-algorand verifiers (exit 3 if
+none does). Unit tests: `python3 ops/mixed-cluster/scripts/late_join_test.py`.
