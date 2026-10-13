@@ -150,6 +150,13 @@ fn trigger_global_timeout<BV: algo_agreement::BlockValidator + Send + Sync + 'st
     cluster: &AgreementCluster<BV>,
     timeout_type: TimeoutType,
 ) {
+    // Settle BEFORE firing too (issue #1900): a driver that just delivered
+    // messages (e.g. `replay_all`) may reach here while a node is between its
+    // round `zero()` (which clears every clock entry) and its demux
+    // re-registering `Deadline`; firing then panics with "no timeout of
+    // type". With exact quiescence a quiet cluster has every node parked on
+    // its registered timers, so settle first, then fire.
+    cluster.wait_for_quiet();
     let clocks: Vec<_> = cluster.clocks.iter().collect();
     crate::simulate::testing_clock::TestingClock::fire_all(&clocks, timeout_type);
     cluster.wait_for_quiet();
@@ -161,6 +168,8 @@ fn trigger_subset_timeout(
     indices: &[usize],
     timeout_type: TimeoutType,
 ) {
+    // Settle before firing (see `trigger_global_timeout`, issue #1900).
+    cluster.wait_for_quiet();
     let clocks: Vec<_> = indices.iter().map(|&i| &cluster.clocks[i]).collect();
     crate::simulate::testing_clock::TestingClock::fire_all(&clocks, timeout_type);
     cluster.wait_for_quiet();
