@@ -159,7 +159,7 @@ P2P="$HERE/../../mixed-cluster-p2p/scripts/verify-soak.sh"
 n="$(grep -c '^ *TRACKER_PATH=' "$HERE/verify-soak.sh")"
 if [ "$n" -ge 2 ]; then ok "mixed-cluster verify-soak sets TRACKER_PATH in both ledger branches"; else bad "mixed-cluster verify-soak sets TRACKER_PATH in both ledger branches (found $n)"; fi
 n="$(grep -c '^ *TRACKER_PATH=' "$P2P")"
-if [ "$n" -ge 1 ]; then ok "p2p verify-soak sets TRACKER_PATH"; else bad "p2p verify-soak sets TRACKER_PATH (found $n)"; fi
+if [ "$n" -ge 2 ]; then ok "p2p verify-soak sets TRACKER_PATH in both ledger branches"; else bad "p2p verify-soak sets TRACKER_PATH in both ledger branches (found $n)"; fi
 if grep -q 'snapshot_tip' "$P2P"; then ok "p2p verify-soak uses snapshot_tip"; else bad "p2p verify-soak uses snapshot_tip"; fi
 
 if [ "$FAILS" -ne 0 ]; then

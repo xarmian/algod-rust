@@ -259,6 +259,7 @@ if [ "$RUN_CERT" = "1" ]; then
         CERT_LEDGER_PATH="$CERT_PREFIX_CANDIDATE"
         # So the earliest retained round is probed for the cert window (#1782).
         BLOCK_PATH="${CERT_PREFIX_CANDIDATE}.block.sqlite"
+        TRACKER_PATH="${CERT_PREFIX_CANDIDATE}.tracker.sqlite"
         echo "==> cert cross-verify (Go-produced → Rust verifier), stride $STRIDE"
         echo "    ledger: $CERT_LEDGER_PATH (--cert-ledger override)"
     else
