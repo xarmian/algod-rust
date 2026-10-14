@@ -632,6 +632,10 @@ FOLLOW_TIMING_KEYS = (
     "ensure_block_failed",
 )
 PROCESS_START_KEY = "process_start_time_seconds"
+# Sentinel key carrying the node's `algod_transaction_messages_*` counters
+# alongside the histograms in a `follow_timing` scrape (issue #1919).
+TX_COUNTERS_KEY = "tx_pool_counters"
+TX_COUNTERS_PREFIX = "algod_transaction_messages_"
 PROCESS_START_METRIC = "algod_rust_process_start_time_seconds"
 STALL_GAUGE_METRIC = "algod_rust_sync_stalled_on_invalid_block"
 STALL_ROUND_METRIC = "algod_rust_sync_stalled_block_round"
@@ -679,6 +683,24 @@ def fetch_stall_gauge(base_url: str, timeout: float = 1.0):
         return parse_stall_gauge(_scrape_metrics_text(base_url, timeout))
     except Exception:  # noqa: BLE001 -- the gauge is a fallback signal only
         return None
+
+
+def parse_tx_counters(text: str) -> dict:
+    """The node's `algod_transaction_messages_*` counters (go's
+    `transactionMessages*` family, incl. the per-class
+    `..._txpool_remember_err_*` rejections of gossiped groups) as
+    {name-without-prefix: value}. Rejections are logged at debug like go, so
+    these counters are the durable record (issue #1919)."""
+    out = {}
+    for line in text.splitlines():
+        if not line.startswith(TX_COUNTERS_PREFIX):
+            continue
+        series, _, value = line.rpartition(" ")
+        try:
+            out[series[len(TX_COUNTERS_PREFIX):]] = float(value)
+        except ValueError:
+            continue
+    return out
 
 
 def parse_follow_timing(text: str) -> dict:
@@ -741,6 +763,9 @@ def fetch_follow_timing(base_url: str, timeout: float = FOLLOW_TIMING_SCRAPE_TIM
         start = parse_process_start_time(text)
         if parsed and start is not None:
             parsed[PROCESS_START_KEY] = start
+        counters = parse_tx_counters(text)
+        if parsed and counters:
+            parsed[TX_COUNTERS_KEY] = counters
     except Exception as e:  # noqa: BLE001 -- reporting must never fail a run
         parsed, error = None, str(e)
     st = _follow_scrape_state
@@ -893,6 +918,8 @@ def summarize_follow_timing(samples: list, first_tip_ts=None) -> dict:
             "p95_s": _histogram_quantile(buckets, count, 0.95),
             "max_s": _histogram_max(buckets, count),
         }
+    if last.get(TX_COUNTERS_KEY):
+        out["tx_pool_counters"] = dict(last[TX_COUNTERS_KEY])
     return out
 
 
