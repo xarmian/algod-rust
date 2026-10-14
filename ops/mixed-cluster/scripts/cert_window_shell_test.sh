@@ -131,7 +131,8 @@ c.execute("INSERT INTO acctrounds VALUES (?, ?)", ("acctbase", 2701))
 c.commit()' "$TDB"
 check "probe_tracker_round reads acctbase" 2701 "$(probe_tracker_round "$TDB")"
 check "snapshot_tip is the older of block (2702) and tracker (2701)" 2701 "$(snapshot_tip "$DB" "$TDB")"
-check "snapshot_tip without a tracker falls back to the block file" 2702 "$(snapshot_tip "$DB" "$TMP/nope.sqlite")"
+check "snapshot_tip with no tracker path falls back to the block file" 2702 "$(snapshot_tip "$DB" "")"
+check "snapshot_tip with a given but missing tracker fails closed" "" "$(snapshot_tip "$DB" "$TMP/nope.sqlite" 2>/dev/null)"
 check "snapshot_tip with nothing is empty" "" "$(snapshot_tip "$TMP/nope.sqlite" "$TMP/nope2.sqlite")"
 # tracker AHEAD of the block file: the block round wins (still the older)
 TDB_AHEAD="$TMP/tracker_ahead.sqlite"
@@ -153,13 +154,16 @@ out="$(snapshot_tip "$DB" "$TDB_EMPTY" 2>/dev/null)"; rc=$?
 check "unreadable tracker round fails closed (no block-round fallback)" "" "$out"
 snapshot_tip "$DB" "$TDB_EMPTY" >/dev/null 2>&1
 check "unreadable tracker round returns non-zero" 1 "$?"
-# the verify-soak wiring: every ledger branch must set TRACKER_PATH (the
-# --cert-ledger override branch used to leave it unset, #1917 review)
+# the verify-soak wiring: the --cert-ledger override branch must set
+# TRACKER_PATH right after BLOCK_PATH (it used to leave it unset, #1917 review)
 P2P="$HERE/../../mixed-cluster-p2p/scripts/verify-soak.sh"
-n="$(grep -c '^ *TRACKER_PATH=' "$HERE/verify-soak.sh")"
-if [ "$n" -ge 2 ]; then ok "mixed-cluster verify-soak sets TRACKER_PATH in both ledger branches"; else bad "mixed-cluster verify-soak sets TRACKER_PATH in both ledger branches (found $n)"; fi
-n="$(grep -c '^ *TRACKER_PATH=' "$P2P")"
-if [ "$n" -ge 2 ]; then ok "p2p verify-soak sets TRACKER_PATH in both ledger branches"; else bad "p2p verify-soak sets TRACKER_PATH in both ledger branches (found $n)"; fi
+for f in "$HERE/verify-soak.sh" "$P2P"; do
+    if grep -A2 'BLOCK_PATH="${CERT_PREFIX_CANDIDATE}.block.sqlite"' "$f" | grep -q 'TRACKER_PATH="${CERT_PREFIX_CANDIDATE}.tracker.sqlite"'; then
+        ok "$(basename "$(dirname "$(dirname "$f")")"): --cert-ledger branch sets TRACKER_PATH"
+    else
+        bad "$f: --cert-ledger branch must set TRACKER_PATH next to BLOCK_PATH"
+    fi
+done
 if grep -q 'snapshot_tip' "$P2P"; then ok "p2p verify-soak uses snapshot_tip"; else bad "p2p verify-soak uses snapshot_tip"; fi
 
 if [ "$FAILS" -ne 0 ]; then

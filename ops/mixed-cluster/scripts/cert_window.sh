@@ -54,10 +54,11 @@ snapshot_tip() {
     local blk trk
     blk="$(probe_latest_file "$1")"
     trk="$(probe_tracker_round "${2:-}")"
-    # An existing tracker file whose applied round cannot be read must NOT
+    # A tracker path that was GIVEN but whose applied round cannot be read
+    # (missing, empty, corrupt, no acctbase row) must NOT
     # degrade to the (possibly newer) block round: fail closed so the caller's
     # "cannot determine the snapshot's newest round" error fires.
-    if [ -n "${2:-}" ] && [ -s "$2" ] && ! _is_round "$trk"; then
+    if [ -n "${2:-}" ] && ! _is_round "$trk"; then
         echo "error: cannot read the tracker snapshot's applied round ($2)" >&2
         return 1
     fi
