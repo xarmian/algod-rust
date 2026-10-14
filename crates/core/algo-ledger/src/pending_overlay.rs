@@ -165,6 +165,21 @@ impl PendingOverlay {
         self.chain = self.chain_base.clone();
     }
 
+    /// The authorizer of `addr` according to the pending groups, if one of
+    /// them touched the account: `Some(Some(a))` rekeyed to `a`,
+    /// `Some(None)` its own authorizer (never rekeyed, rekeyed back to self by
+    /// any transaction - top-level or inner - or removed), `None` no pending
+    /// group touched it (consult the committed ledger). Unlike a tracker of
+    /// top-level `rekey_to` fields this sees rekeys done by inner
+    /// transactions of an application (issue #1919).
+    pub fn pending_account_auth(&self, addr: &Address) -> Option<Option<Address>> {
+        self.accounts.get(addr).map(|acct| {
+            acct.as_ref()
+                .and_then(|a| a.auth_addr)
+                .filter(|a| !a.is_zero())
+        })
+    }
+
     /// Number of overlay entries (diagnostics and tests).
     pub fn len(&self) -> usize {
         self.accounts.len()
