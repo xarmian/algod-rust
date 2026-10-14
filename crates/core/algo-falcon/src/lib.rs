@@ -50,8 +50,8 @@
 //!
 //! - [`FalconBackend::C`] (cargo feature `c-backend`, on by default): the
 //!   vendored C sources in `falcon-c/`, compiled by `build.rs`.
-//! - [`FalconBackend::Rust`]: the pure-Rust port (`backend::rust`, landing
-//!   module by module in Phase 21, epic #1926).
+//! - [`FalconBackend::Rust`] (the default): the pure-Rust port
+//!   (`backend::rust` over `rs::det1024`, Phase 21, epic #1926).
 //!
 //! The process-wide backend is chosen once with [`set_falcon_backend`]
 //! (the node does this from `config.json` at startup) and read with
@@ -100,18 +100,16 @@ pub const FALCON_SEED_SIZE: usize = 32;
 ///
 /// DIVERGENCE DIV-001: this selector has no go-algorand counterpart.
 ///
-/// The default is [`FalconBackend::C`] while the Rust port is being landed
-/// and flips to [`FalconBackend::Rust`] in Phase 21 stage 11 (#1937); without
-/// the `c-backend` feature the only variant is `Rust`.
+/// The default is [`FalconBackend::Rust`] (since Phase 21 stage 11, #1937);
+/// without the `c-backend` feature it is the only variant.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum FalconBackend {
     /// The pure-Rust implementation (`src/rs/`).
-    #[cfg_attr(not(feature = "c-backend"), default)]
+    #[default]
     Rust,
     /// The vendored C library (`falcon-c/`, github.com/algorand/falcon v0.1.0).
     #[cfg(feature = "c-backend")]
-    #[default]
     C,
 }
 
@@ -371,7 +369,8 @@ pub enum FalconError {
     /// Salt-version extraction returned a negative error code.
     SaltVersionFailed(i32),
     /// The selected backend has no implementation of this operation in this
-    /// build (the Rust port while it is being landed in Phase 21).
+    /// build. Not produced by any current backend; kept for forward
+    /// compatibility of the `#[non_exhaustive]` enum.
     BackendUnavailable(FalconBackend),
 }
 
@@ -461,42 +460,45 @@ mod backend_tests {
         assert_eq!(falcon_backend(), d);
     }
 
-    /// Flips in Phase 21 stage 11 (#1937): until the port has landed, asking
-    /// the Rust backend to do anything must fail loudly, never fall back.
+    /// Every compiled backend produces identical keys, signatures, CT forms
+    /// and verify decisions from the same inputs (the corpus test in
+    /// `tests/falcon_vectors.rs` is the full-scale version of this).
     #[test]
-    fn rust_backend_reports_unavailable_until_ported() {
-        let seed = [0u8; FALCON_SEED_SIZE];
-        let unavailable = FalconError::BackendUnavailable(FalconBackend::Rust);
-        assert_eq!(
-            falcon_keygen_with(FalconBackend::Rust, &seed).unwrap_err(),
-            unavailable
-        );
-        let pk = vec![0u8; FALCON_DET1024_PUBKEY_SIZE];
-        let sk = vec![0u8; FALCON_DET1024_PRIVKEY_SIZE];
-        let sig = vec![0xba, 0x00, 0x00];
-        assert_eq!(
-            falcon_verify_with(FalconBackend::Rust, &pk, &sig, b"x").unwrap_err(),
-            unavailable
-        );
-        assert_eq!(
-            falcon_sign_with(FalconBackend::Rust, &sk, b"x").unwrap_err(),
-            unavailable
-        );
-        assert_eq!(
-            falcon_convert_compressed_to_ct_with(FalconBackend::Rust, &sig).unwrap_err(),
-            unavailable
-        );
-        assert_eq!(
-            falcon_salt_version_with(FalconBackend::Rust, &sig).unwrap_err(),
-            unavailable
-        );
+    fn all_backends_agree_on_keygen_sign_verify() {
+        let seed = [0x42u8; FALCON_SEED_SIZE];
+        let msg = b"all backends agree";
+        let results: Vec<_> = FalconBackend::all()
+            .iter()
+            .map(|&b| {
+                let (pk, sk) = falcon_keygen_with(b, &seed).unwrap();
+                let sig = falcon_sign_with(b, &sk, msg).unwrap();
+                let ok = falcon_verify_with(b, &pk, &sig, msg).unwrap();
+                let bad = falcon_verify_with(b, &pk, &sig, b"tampered").unwrap();
+                let ct = falcon_convert_compressed_to_ct_with(b, &sig).unwrap();
+                let salt = falcon_salt_version_with(b, &sig).unwrap();
+                (pk, sk, sig, ok, bad, ct.to_vec(), salt)
+            })
+            .collect();
+        for (b, r) in FalconBackend::all().iter().zip(&results) {
+            assert!(r.3 && !r.4, "{b}: verify decisions");
+            assert_eq!(
+                r,
+                &results[0],
+                "{b} differs from {}",
+                FalconBackend::all()[0]
+            );
+        }
         // Size validation happens before dispatch, identically for every backend.
-        assert_eq!(
-            falcon_verify_with(FalconBackend::Rust, &pk[1..], &sig, b"x"),
-            Err(FalconError::InvalidPubkeySize(
-                FALCON_DET1024_PUBKEY_SIZE - 1
-            ))
-        );
+        let pk = vec![0u8; FALCON_DET1024_PUBKEY_SIZE];
+        let sig = vec![0xba, 0x00, 0x00];
+        for &b in FalconBackend::all() {
+            assert_eq!(
+                falcon_verify_with(b, &pk[1..], &sig, b"x"),
+                Err(FalconError::InvalidPubkeySize(
+                    FALCON_DET1024_PUBKEY_SIZE - 1
+                ))
+            );
+        }
     }
 
     #[test]
@@ -521,10 +523,9 @@ mod backend_tests {
     }
 }
 
-// These exercise the default backend end to end. Until the Rust port is
-// complete (#1937) only the C backend can run them; from then on they run
-// under both feature sets.
-#[cfg(all(test, feature = "c-backend"))]
+// These exercise the default (Rust) backend end to end; the C backend is
+// covered by `all_backends_agree_on_keygen_sign_verify` and the corpus test.
+#[cfg(test)]
 mod tests {
     use super::*;
 

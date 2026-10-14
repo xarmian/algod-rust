@@ -52,17 +52,17 @@ consensus-compatible. It exists for three readers:
 
 | ID | Title | Area | Status | Since | Wire / consensus impact | algod-rust files | Upstream files | Proof |
 |---|---|---|---|---|---|---|---|---|
-| DIV-001 | Falcon-1024 `det1024` implemented in pure Rust; vendored C kept as a runtime-selectable backend (`config.json` `FalconBackend`) | crypto / state proofs / PQ accounts / AVM `falcon_verify` | in-progress | 2026-10-14 | none (bit-identical keys, signatures, verify decisions, CT conversion) | `crates/core/algo-falcon/`, `crates/node/algo-config/src/lib.rs` (`FalconBackend`), `bin/algod-rust/src/commands/node.rs`, `crates/tools/algokey-rust` | `crypto/falconWrapper.go`, module `github.com/algorand/falcon` v0.1.0 (`falcon.go`, `deterministic.c`, Pornin's reference C) | Go-generated vector corpus diffed in CI, per-function differential tests vs the vendored C, fuzz target (epic #1926) |
+| DIV-001 | Falcon-1024 `det1024` implemented in pure Rust; vendored C kept as a runtime-selectable backend (`config.json` `FalconBackend`) | crypto / state proofs / PQ accounts / AVM `falcon_verify` | landed | 2026-10-14 | none (bit-identical keys, signatures, verify decisions, CT conversion) | `crates/core/algo-falcon/`, `crates/node/algo-config/src/lib.rs` (`FalconBackend`), `bin/algod-rust/src/commands/node.rs`, `crates/tools/algokey-rust` | `crypto/falconWrapper.go`, module `github.com/algorand/falcon` v0.1.0 (`falcon.go`, `deterministic.c`, Pornin's reference C) | Go-generated vector corpus diffed in CI, per-function differential tests vs the vendored C, fuzz target (epic #1926) |
 
 ## Entries
 
 ### DIV-001 — Falcon-1024 `det1024` in pure Rust, C kept as a selectable backend
 
-**Status:** in-progress — backend selector, config field and vector corpus landed; the Rust modules follow. Tracked by epic
-[#1926](https://github.com/xarmian/algod-rust/issues/1926) (Phase 21,
-`docs/PHASE21_PROPOSAL.md`). This section is filled in stage by stage; the
-final text lands with the close-out issue of that epic and the long-form
-engineering notes live in `docs/falcon/FALCON_RUST_PORT.md`.
+**Status:** landed — the pure-Rust backend is the default since Phase 21
+stage 11 (#1937); epic
+[#1926](https://github.com/xarmian/algod-rust/issues/1926),
+`docs/PHASE21_PROPOSAL.md`. Long-form engineering notes:
+`docs/falcon/FALCON_RUST_PORT.md`.
 
 **What go-algorand does.** `crypto/falconWrapper.go` wraps the Go module
 `github.com/algorand/falcon` v0.1.0, which is Thomas Pornin's reference
@@ -70,7 +70,8 @@ Falcon C implementation plus Algorand's deterministic `det1024` layer
 (`deterministic.c`: seed-derived keygen via SHAKE256, deterministic signing
 with a 1-byte salt version instead of a 40-byte random salt, header `0xBA`
 for compressed and `0xDA` for CT signatures, `FALCON_FPEMU=1` emulated
-floating point, `FALCON_KG_CHACHA20=1`). The C is called through cgo.
+floating point; `FALCON_KG_CHACHA20` is left disabled so key generation
+samples directly from SHAKE256). The C is called through cgo.
 
 **What algod-rust does instead.** The same `det1024` algorithm is
 implemented in Rust (`crates/core/algo-falcon/src/rs/`), module for module

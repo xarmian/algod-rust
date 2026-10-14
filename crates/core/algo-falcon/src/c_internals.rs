@@ -270,6 +270,18 @@ extern "C" {
         tmp: *mut u8,
     );
 
+    // keygen.c
+    pub(crate) fn falcon_inner_keygen(
+        rng: *mut CInnerShake256,
+        f: *mut i8,
+        g: *mut i8,
+        F: *mut i8,
+        G: *mut i8,
+        h: *mut u16,
+        logn: u32,
+        tmp: *mut u8,
+    );
+
     // common.c
     pub(crate) fn falcon_inner_hash_to_point_vartime(
         sc: *mut CInnerShake256,
@@ -304,6 +316,48 @@ pub(crate) mod shim {
 
         pub(crate) fn falcon_shim_x_prng_get_u64(p: *mut super::CPrng) -> u64;
         pub(crate) fn falcon_shim_x_prng_get_u8(p: *mut super::CPrng) -> u32;
+
+        pub(crate) fn falcon_shim_x_mkgauss(rng: *mut super::CInnerShake256, logn: u32) -> i32;
+        pub(crate) fn falcon_shim_x_poly_small_mkgauss(
+            rng: *mut super::CInnerShake256,
+            f: *mut i8,
+            logn: u32,
+        );
+        pub(crate) fn falcon_shim_x_poly_small_sqnorm(f: *const i8, logn: u32) -> u32;
+        pub(crate) fn falcon_shim_x_solve_NTRU(
+            logn: u32,
+            F: *mut i8,
+            G: *mut i8,
+            f: *const i8,
+            g: *const i8,
+            lim: i32,
+            tmp: *mut u32,
+        ) -> i32;
+        pub(crate) fn falcon_shim_x_solve_NTRU_deepest(
+            logn_top: u32,
+            f: *const i8,
+            g: *const i8,
+            tmp: *mut u32,
+        ) -> i32;
+        pub(crate) fn falcon_shim_x_solve_NTRU_intermediate(
+            logn_top: u32,
+            f: *const i8,
+            g: *const i8,
+            depth: u32,
+            tmp: *mut u32,
+        ) -> i32;
+        pub(crate) fn falcon_shim_x_solve_NTRU_binary_depth1(
+            logn_top: u32,
+            f: *const i8,
+            g: *const i8,
+            tmp: *mut u32,
+        ) -> i32;
+        pub(crate) fn falcon_shim_x_solve_NTRU_binary_depth0(
+            logn: u32,
+            f: *const i8,
+            g: *const i8,
+            tmp: *mut u32,
+        ) -> i32;
     }
 }
 

@@ -33,9 +33,11 @@ Tracking epic: [#1926](https://github.com/xarmian/algod-rust/issues/1926)
 
 ### Facts that shape the design (verified in `crates/core/algo-falcon/falcon-c/`)
 
-- `config.h:232` sets `FALCON_KG_CHACHA20 1`: keygen samples f, g through
-  the ChaCha20 `prng` (rng.c) seeded from SHAKE256 — `rng.rs` is a
-  prerequisite for both sign and keygen.
+- The `#define FALCON_KG_CHACHA20 1` in `config.h` is inside a comment
+  block, so the vendored build has it **off**: keygen samples f, g directly
+  from the SHAKE256 context (8 little-endian bytes per draw); only signing
+  uses the ChaCha20 `prng` (rng.c). An earlier draft of this proposal stated
+  the opposite; the differential test against `mkgauss` settled it.
 - `FALCON_FPEMU=1`. The emulated FP equals strict IEEE-754 binary64
   round-to-nearest-even for `add/sub/mul/div/sqrt/rint/floor/trunc/of/
   scaled/lt`, **but `fpr_expm_p63` (`fpr.c:1287`) is a 64-bit fixed-point

@@ -38,16 +38,15 @@
 //! This is the acceptance test for `DIV-001` (`docs/DIVERGENCES.md`): the
 //! pure-Rust port must pass it unchanged.
 
-// Runs against the default backend; until the Rust port is complete (#1937)
-// only a build with the C backend has one. From then on it runs for every
-// backend in `FalconBackend::all()`.
-#![cfg(feature = "c-backend")]
+// Every test runs once per compiled backend (`FalconBackend::all()`: Rust,
+// and C when the `c-backend` feature is on).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use algo_falcon::{
-    falcon_convert_compressed_to_ct, falcon_keygen, falcon_salt_version, falcon_sign, falcon_verify,
+    falcon_convert_compressed_to_ct_with, falcon_keygen_with, falcon_salt_version_with,
+    falcon_sign_with, falcon_verify_with, FalconBackend,
 };
 use serde_json::Value;
 
@@ -148,11 +147,14 @@ fn corpus_has_the_expected_shape() {
 
 #[test]
 fn keygen_matches_corpus() {
-    for rec in of_kind(&load(), "key") {
-        let name = s(rec, "name");
-        let (pk, sk) = falcon_keygen(&h(rec, "seed")).expect("keygen");
-        assert_bytes(name, "pubkey", &h(rec, "pubkey"), &pk);
-        assert_bytes(name, "privkey", &h(rec, "privkey"), &sk);
+    let recs = load();
+    for &b in FalconBackend::all() {
+        for rec in of_kind(&recs, "key") {
+            let name = format!("{b}/{}", s(rec, "name"));
+            let (pk, sk) = falcon_keygen_with(b, &h(rec, "seed")).expect("keygen");
+            assert_bytes(&name, "pubkey", &h(rec, "pubkey"), &pk);
+            assert_bytes(&name, "privkey", &h(rec, "privkey"), &sk);
+        }
     }
 }
 
@@ -160,19 +162,21 @@ fn keygen_matches_corpus() {
 fn sign_matches_corpus() {
     let recs = load();
     let keys = keys(&recs);
-    for rec in of_kind(&recs, "sig") {
-        let name = s(rec, "name");
-        let (_, sk) = &keys[s(rec, "seed")];
-        let msg = h(rec, "msg");
-        let sig = falcon_sign(sk, &msg).expect("sign");
-        assert_bytes(name, "sig_compressed", &h(rec, "sig_compressed"), &sig);
-        assert_eq!(
-            falcon_salt_version(&sig).expect("salt version") as u64,
-            rec["salt_version"].as_u64().expect("salt_version"),
-            "{name}: salt version"
-        );
-        let ct = falcon_convert_compressed_to_ct(&sig).expect("convert to CT");
-        assert_bytes(name, "sig_ct", &h(rec, "sig_ct"), &ct);
+    for &b in FalconBackend::all() {
+        for rec in of_kind(&recs, "sig") {
+            let name = format!("{b}/{}", s(rec, "name"));
+            let (_, sk) = &keys[s(rec, "seed")];
+            let msg = h(rec, "msg");
+            let sig = falcon_sign_with(b, sk, &msg).expect("sign");
+            assert_bytes(&name, "sig_compressed", &h(rec, "sig_compressed"), &sig);
+            assert_eq!(
+                falcon_salt_version_with(b, &sig).expect("salt version") as u64,
+                rec["salt_version"].as_u64().expect("salt_version"),
+                "{name}: salt version"
+            );
+            let ct = falcon_convert_compressed_to_ct_with(b, &sig).expect("convert to CT");
+            assert_bytes(&name, "sig_ct", &h(rec, "sig_ct"), &ct);
+        }
     }
 }
 
@@ -180,31 +184,39 @@ fn sign_matches_corpus() {
 fn verify_accepts_corpus_signatures() {
     let recs = load();
     let keys = keys(&recs);
-    for rec in of_kind(&recs, "sig") {
-        let (pk, _) = &keys[s(rec, "seed")];
-        let ok = falcon_verify(pk, &h(rec, "sig_compressed"), &h(rec, "msg"));
-        assert!(ok.expect("verify"), "{}: must verify", s(rec, "name"));
+    for &b in FalconBackend::all() {
+        for rec in of_kind(&recs, "sig") {
+            let (pk, _) = &keys[s(rec, "seed")];
+            let ok = falcon_verify_with(b, pk, &h(rec, "sig_compressed"), &h(rec, "msg"));
+            assert!(ok.expect("verify"), "{b}/{}: must verify", s(rec, "name"));
+        }
     }
 }
 
 #[test]
 fn verify_rejects_negative_corpus() {
-    for rec in of_kind(&load(), "negative") {
-        assert_eq!(s(rec, "expect"), "reject");
-        let r = falcon_verify(&h(rec, "pubkey"), &h(rec, "sig"), &h(rec, "msg"));
-        assert!(
-            !matches!(r, Ok(true)),
-            "{}: must be rejected, got {r:?}",
-            s(rec, "name")
-        );
+    let recs = load();
+    for &b in FalconBackend::all() {
+        for rec in of_kind(&recs, "negative") {
+            assert_eq!(s(rec, "expect"), "reject");
+            let r = falcon_verify_with(b, &h(rec, "pubkey"), &h(rec, "sig"), &h(rec, "msg"));
+            assert!(
+                !matches!(r, Ok(true)),
+                "{b}/{}: must be rejected, got {r:?}",
+                s(rec, "name")
+            );
+        }
     }
 }
 
 #[test]
 fn verify_accepts_go_algorand_hard_coded_vector() {
-    for rec in of_kind(&load(), "verify_only") {
-        assert_eq!(s(rec, "expect"), "accept");
-        let r = falcon_verify(&h(rec, "pubkey"), &h(rec, "sig"), &h(rec, "msg"));
-        assert!(r.expect("verify"), "{}: must verify", s(rec, "name"));
+    let recs = load();
+    for &b in FalconBackend::all() {
+        for rec in of_kind(&recs, "verify_only") {
+            assert_eq!(s(rec, "expect"), "accept");
+            let r = falcon_verify_with(b, &h(rec, "pubkey"), &h(rec, "sig"), &h(rec, "msg"));
+            assert!(r.expect("verify"), "{b}/{}: must verify", s(rec, "name"));
+        }
     }
 }

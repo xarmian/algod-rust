@@ -36,8 +36,8 @@
 //! | `fft.c`           | `fft`        | #1933    |
 //! | `vrfy.c`          | `vrfy`       | #1934    |
 //! | `common.c`        | `common`     | #1934    |
-//! | `falcon.c`        | `falcon`     | #1935+   |
-//! | `deterministic.c` | `det1024`    | #1935+   |
+//! | `falcon.c`        | `falcon`     | #1937    |
+//! | `deterministic.c` | `det1024`    | #1937    |
 //! | `rng.c`           | `rng`        | #1936    |
 //! | `sign.c`          | `sign`       | #1936    |
 //! | `keygen.c`        | `keygen`     | #1937    |
@@ -47,15 +47,19 @@
 //! `as` casts; everything else is plain arithmetic that the debug-profile
 //! tests (overflow checks on) and the differential tests keep honest.
 
-// Modules are wired into `backend::rust` as the port reaches each milestone
-// (#1935 verify, #1936 sign, #1937 keygen); until then they are test-only.
+// A few C functions are ported for completeness but unreachable from the
+// det1024 API (e.g. verify_recover, is_invertible, prng_get_bytes).
 #![allow(dead_code)]
 
 pub(crate) mod codec;
 pub(crate) mod common;
+pub(crate) mod det1024;
+pub(crate) mod falcon;
 pub(crate) mod fft;
 pub(crate) mod fpr;
 pub(crate) mod fpr_tables;
+pub(crate) mod keygen;
+pub(crate) mod keygen_tables;
 pub(crate) mod ntt_tables;
 pub(crate) mod rng;
 pub(crate) mod shake256;

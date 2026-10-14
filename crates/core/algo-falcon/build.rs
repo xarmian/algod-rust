@@ -81,7 +81,7 @@ fn main() {
     // vendored C file whose `static` internals the differential tests need.
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_C_INTERNALS_TEST");
     if std::env::var_os("CARGO_FEATURE_C_INTERNALS_TEST").is_some() {
-        let shims = ["shim_fpr.c", "shim_rng.c"];
+        let shims = ["shim_fpr.c", "shim_rng.c", "shim_keygen.c"];
         let mut shim_build = cc::Build::new();
         shim_build
             .include(falcon_dir)
