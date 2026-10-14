@@ -752,6 +752,20 @@ pub trait NodeInterface: Send + Sync + 'static {
         &self,
         round: u64,
     ) -> Result<(u64, u64), NodeError> {
+        let stxn = self.find_state_proof_transaction(round).await?;
+        let msg = stxn.txn.state_proof_message.unwrap_or_default();
+        Ok((msg.first_attested_round, msg.last_attested_round))
+    }
+
+    /// The state proof transaction (its `StateProofMessage` present) whose
+    /// attested range covers `round`: the shared scan behind
+    /// [`NodeInterface::get_state_proof_transaction_for_round`] and
+    /// [`NodeInterface::get_state_proof_for_round`] (go
+    /// `GetStateProofTransactionForRound`).
+    async fn find_state_proof_transaction(
+        &self,
+        round: u64,
+    ) -> Result<SignedTransaction, NodeError> {
         let hdr = self.get_block_header(round).await?;
         let consensus = algo_types::consensus::consensus_params_for_version(&hdr.current_protocol)
             .ok_or_else(|| {
@@ -792,7 +806,7 @@ pub trait NodeInterface: Send + Sync + 'static {
                     continue;
                 };
                 if msg.first_attested_round <= round && round <= msg.last_attested_round {
-                    return Ok((msg.first_attested_round, msg.last_attested_round));
+                    return Ok(stxn.clone());
                 }
             }
         }
@@ -812,8 +826,21 @@ pub trait NodeInterface: Send + Sync + 'static {
     ///
     /// Mirrors go-algorand's `GetStateProof` handler which finds the state
     /// proof transaction covering the round and extracts all message fields.
-    async fn get_state_proof_for_round(&self, _round: u64) -> Result<StateProofData, NodeError> {
-        Err(NodeError::NotImplemented("get_state_proof_for_round"))
+    async fn get_state_proof_for_round(&self, round: u64) -> Result<StateProofData, NodeError> {
+        let stxn = self.find_state_proof_transaction(round).await?;
+        let msg = stxn.txn.state_proof_message.clone().unwrap_or_default();
+        // go: `protocol.Encode(&tx.StateProof)`.
+        let state_proof = algo_codec::canonical_encode_state_proof_body(
+            &stxn.txn.state_proof.clone().unwrap_or_default(),
+        );
+        Ok(StateProofData {
+            state_proof,
+            block_headers_commitment: msg.block_headers_commitment.to_vec(),
+            voters_commitment: msg.voters_commitment.to_vec(),
+            ln_proven_weight: msg.ln_proven_weight,
+            first_attested_round: msg.first_attested_round,
+            last_attested_round: msg.last_attested_round,
+        })
     }
 
     /// Return raw block+cert bytes for a given round (msgpack pass-through).
@@ -1446,6 +1473,73 @@ mod tests {
 
         let result = node.get_state_proof_transaction_for_round(10).await;
         assert_eq!(result.unwrap(), (1, 16));
+    }
+
+    /// Issue #1952: `GET /v2/stateproofs/{round}` served 404 on algod-rust
+    /// because the node never implemented `get_state_proof_for_round`; the
+    /// default now locates the covering `stpf` like go's
+    /// `GetStateProofTransactionForRound` and returns the proof (canonical
+    /// msgpack of the state proof body) plus the message fields.
+    #[tokio::test]
+    async fn get_state_proof_for_round_returns_the_covering_proof_and_message() {
+        let mut node = MinimalNode::new(100);
+        for r in 0..=100 {
+            node.block_headers.insert(r, header_at(r));
+        }
+        let mut stxn = state_proof_txn(Address::STATE_PROOF_SENDER, 1, 16);
+        {
+            let msg = stxn.txn.state_proof_message.as_mut().unwrap();
+            msg.block_headers_commitment = serde_bytes::ByteBuf::from(vec![0xAA; 64]);
+            msg.voters_commitment = serde_bytes::ByteBuf::from(vec![0xBB; 64]);
+            msg.ln_proven_weight = 4242;
+        }
+        let body = algo_types::StateProofBody {
+            sig_commit: serde_bytes::ByteBuf::from(vec![0xCC; 64]),
+            signed_weight: 77,
+            ..Default::default()
+        };
+        stxn.txn.state_proof = Some(body.clone());
+        node.blocks.insert(
+            20,
+            Block {
+                round: algo_types::Round(20),
+                payset: vec![stxn],
+                ..Default::default()
+            },
+        );
+
+        let data = node.get_state_proof_for_round(10).await.unwrap();
+        assert_eq!(data.block_headers_commitment, vec![0xAA; 64]);
+        assert_eq!(data.voters_commitment, vec![0xBB; 64]);
+        assert_eq!(data.ln_proven_weight, 4242);
+        assert_eq!(
+            (data.first_attested_round, data.last_attested_round),
+            (1, 16)
+        );
+        assert_eq!(
+            data.state_proof,
+            algo_codec::canonical_encode_state_proof_body(&body),
+            "go: protocol.Encode(&tx.StateProof)"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_state_proof_for_round_not_found_when_no_covering_proof() {
+        let mut node = MinimalNode::new(100);
+        for r in 0..=100 {
+            node.block_headers.insert(r, header_at(r));
+            node.blocks.insert(
+                r,
+                Block {
+                    round: algo_types::Round(r),
+                    ..Default::default()
+                },
+            );
+        }
+        assert!(matches!(
+            node.get_state_proof_for_round(10).await,
+            Err(NodeError::NotFound(_))
+        ));
     }
 
     #[tokio::test]
