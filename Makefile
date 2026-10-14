@@ -790,6 +790,7 @@ consensus-cluster-negative: ## Run the #472 negative conformance suite (up + inj
 
 consensus-cluster-analyzer: ## Unit-test the #470 soak-analyzer logic (no Docker needed)
 	python3 $(PHASE6_CLUSTER)/scripts/analyze_test.py
+	python3 $(PHASE6_CLUSTER)/scripts/stateproof_check_test.py
 	python3 $(PHASE6_CLUSTER)/scripts/blockcompare_test.py
 	python3 $(PHASE6_CLUSTER)/scripts/workload_test.py
 	python3 $(PHASE6_CLUSTER)/scripts/cert_window_test.py

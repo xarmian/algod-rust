@@ -302,6 +302,31 @@ if [ -f "$RUST_DATA_DIR/config.json" ] || [ "$RUST_ARCHIVAL" = "1" ]; then
     mv "$RUST_DATA_DIR/config.json.new" "$RUST_DATA_DIR/config.json"
 fi
 
+# -- 4f. Falcon backend of the Rust node (Phase 21, DIV-001, issue #1948) ---
+# PHASE6_FALCON_BACKEND=rust|c writes `"FalconBackend"` into the Rust node's
+# config.json (the algod-rust-only key that selects the Falcon-1024
+# implementation: the pure-Rust port or the vendored go-algorand C library).
+# Unset => the key is REMOVED, so the node runs the crate default (rust) and a
+# config.json kept by REUSE_NETROOT=1 can never carry a stale choice. Merged
+# with whatever the blocks above wrote.
+EXISTING_CFG="{}"
+[ -f "$RUST_DATA_DIR/config.json" ] && EXISTING_CFG="$(cat "$RUST_DATA_DIR/config.json")"
+if [ -n "${PHASE6_FALCON_BACKEND:-}" ] || [ -f "$RUST_DATA_DIR/config.json" ]; then
+    [ -n "${PHASE6_FALCON_BACKEND:-}" ] && echo "==> rust-node-4 FalconBackend=$PHASE6_FALCON_BACKEND"
+    python3 -c "
+import json, sys
+text = sys.argv[1].strip()
+cfg = json.loads(text) if text else {}
+backend = sys.argv[2]
+if backend:
+    cfg['FalconBackend'] = backend
+else:
+    cfg.pop('FalconBackend', None)
+print(json.dumps(cfg))
+" "$EXISTING_CFG" "${PHASE6_FALCON_BACKEND:-}" | tr -d '' > "$RUST_DATA_DIR/config.json.new"
+    mv "$RUST_DATA_DIR/config.json.new" "$RUST_DATA_DIR/config.json"
+fi
+
 # -- 5. Start the Go nodes, then the Rust node -----------------------------
 cd "$ROOT"
 export PHASE6_GENESIS_ID="$GENESIS_ID"

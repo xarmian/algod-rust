@@ -49,6 +49,40 @@ pub(crate) fn hash_to_point_vartime(sc: &mut Shake256, x: &mut [u16], logn: u32)
     }
 }
 
+/// Bulk-extraction form of [`hash_to_point_vartime`], used by verification
+/// and signing (Phase 21 optimisation pass, #1938).
+///
+/// It produces exactly the same output vector: the SHAKE256 output stream is
+/// consumed in the same order, two bytes per candidate word, rejecting
+/// `w >= 61445` and reducing the rest mod q. The only difference is *how*
+/// the bytes are pulled from the context — one `extract` of every word
+/// still needed instead of one per word — which removes the per-word call
+/// overhead (about half of this function's cost). It therefore leaves the
+/// SHAKE context positioned past the last accepted word by up to the size
+/// of the final over-read, which no caller uses (verification discards the
+/// context and signing restores it from a saved copy before each attempt);
+/// the faithful function above is what the stream-position test compares.
+pub(crate) fn hash_to_point_vartime_bulk(sc: &mut Shake256, x: &mut [u16], logn: u32) {
+    let n = 1usize << logn;
+    let mut i = 0usize;
+    let mut buf = [0u8; 2048];
+    while i < n {
+        let need = n - i;
+        let bytes = &mut buf[..2 * need];
+        sc.extract(bytes);
+        for pair in bytes.as_chunks::<2>().0 {
+            let mut w = (u32::from(pair[0]) << 8) | u32::from(pair[1]);
+            if w < 61445 {
+                while w >= 12289 {
+                    w -= 12289;
+                }
+                x[i] = w as u16;
+                i += 1;
+            }
+        }
+    }
+}
+
 /// `hash_to_point_ct`: constant-time hash-to-point. Squeezes `n + over`
 /// words, reduces each to `[0, q)` or marks it rejected (`0xFFFF`), then
 /// compacts the accepted ones to the front with a data-oblivious network.
@@ -183,6 +217,27 @@ mod tests {
         assert!(!is_short(&huge, &huge, logn)); // overflows u32: must reject
         assert!(is_short_half(0, &s2, logn));
         assert!(!is_short_half(1u32 << 31, &s2, logn));
+    }
+
+    #[test]
+    fn bulk_hash_to_point_equals_the_faithful_one() {
+        for logn in 1..=10u32 {
+            let n = 1usize << logn;
+            for msg_len in [0usize, 1, 40, 72, 1000] {
+                let msg: Vec<u8> = (0..msg_len)
+                    .map(|i| (i * 13 + logn as usize) as u8)
+                    .collect();
+                let mut a = Shake256::new();
+                a.inject(&msg);
+                a.flip();
+                let mut b = a.clone();
+                let mut x = vec![0u16; n];
+                let mut y = vec![0u16; n];
+                hash_to_point_vartime(&mut a, &mut x, logn);
+                hash_to_point_vartime_bulk(&mut b, &mut y, logn);
+                assert_eq!(x, y, "logn={logn} msg_len={msg_len}");
+            }
+        }
     }
 
     #[test]

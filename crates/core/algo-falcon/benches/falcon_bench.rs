@@ -38,7 +38,8 @@ fn bench_falcon(c: &mut Criterion) {
     let msg1000: Vec<u8> = (0..1000u32).map(|i| (i * 7) as u8).collect();
 
     let mut group = c.benchmark_group("falcon");
-    group.sample_size(20);
+    group.sample_size(60);
+    group.measurement_time(std::time::Duration::from_secs(8));
     for &b in FalconBackend::all() {
         let (pk, sk) = falcon_keygen_with(b, &seed).unwrap();
         let sig32 = falcon_sign_with(b, &sk, &msg32).unwrap();

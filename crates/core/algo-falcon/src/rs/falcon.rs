@@ -39,7 +39,7 @@ use super::codec::{
     comp_decode, comp_encode, modq_decode, modq_encode, trim_i8_decode, trim_i8_encode,
     MAX_FG_BITS, MAX_FG_BITS_BIG,
 };
-use super::common::hash_to_point_vartime;
+use super::common::hash_to_point_vartime_bulk;
 use super::keygen::keygen;
 use super::shake256::Shake256;
 use super::sign::sign_dyn;
@@ -243,7 +243,7 @@ pub(crate) fn sign_dyn_finish_compressed(
     hash_data.flip();
     let mut hm = vec![0u16; n];
     let mut sv = vec![0i16; n];
-    hash_to_point_vartime(hash_data, &mut hm, logn);
+    hash_to_point_vartime_bulk(hash_data, &mut hm, logn);
     sign_dyn(&mut sv, rng, &f, &g, &big_f, &big_g, &hm, logn);
     let es = &mut sig[..es_len];
     es[1..41].copy_from_slice(nonce);
@@ -302,7 +302,7 @@ pub(crate) fn verify_compressed(sig: &[u8], pubkey: &[u8], data: &[u8]) -> i32 {
         return FALCON_ERR_FORMAT;
     }
     hd.flip();
-    hash_to_point_vartime(&mut hd, &mut hm, logn);
+    hash_to_point_vartime_bulk(&mut hd, &mut hm, logn);
     to_ntt_monty(&mut h, logn);
     if !verify_raw(&hm, &sv, &h, logn) {
         return FALCON_ERR_BADSIG;
