@@ -625,6 +625,75 @@ the capture environment is broken, not the corpus.
   used to feed raw alpha through `sk.Prove` in the capture tool)
 - IETF draft-irtf-cfrg-vrf-03 §A.4 — TV1 / TV2 anchor vectors
 
+## Falcon det1024 Vector Regeneration
+
+Deterministic Falcon-1024 (`det1024`: state-proof signatures, native PQ
+accounts, the AVM `falcon_verify` opcode) is implemented in pure Rust in
+`crates/core/algo-falcon` with the vendored C library
+(`github.com/algorand/falcon` v0.1.0) kept as a selectable backend — the
+first registered intended divergence from go-algorand, `DIV-001` in
+`docs/DIVERGENCES.md` (Phase 21, epic #1926). Its acceptance test is a
+byte-level corpus that three independent generators must reproduce
+identically: go-algorand's `crypto` package, the vendored C, and the Rust
+port.
+
+### Fixture location
+
+- `crates/core/algo-falcon/tests/fixtures/falcon/vectors.jsonl` — JSONL,
+  hex fields, fixed field and record order. Record kinds: `key` (seed →
+  pubkey, privkey; 12 seeds), `sig` (seed, msg → compressed signature, CT
+  signature, salt version; 6 messages per seed), `negative` (malformed or
+  mismatched inputs that must be rejected; 14 cases × 2 key pairs) and one
+  `verify_only` record carrying the signature go-algorand hard-codes in
+  `data/transactions/logic/crypto_test.go` (`falcon_verify` benchmark;
+  note the Go comments label the signature "public key" and vice versa).
+- Consumer: `crates/core/algo-falcon/tests/falcon_vectors.rs`
+  (`cargo test -p algo-falcon --test falcon_vectors`, also step θ of
+  `conformance-parity.yml`).
+
+### Regenerating
+
+Two generators, defined verbatim in both languages (seeds, messages,
+negative cases, JSON written by hand with a fixed field order):
+
+```bash
+# From the vendored C library (no Go needed; this is what Windows dev
+# machines use):
+cargo run -p algo-falcon --example gen_vectors
+
+# From go-algorand itself (Linux; needs `make libsodium` in ../go-algorand
+# first, see the VRF section above):
+cd tools/falcon-vector-capture && go run .
+```
+
+Both self-check every record before writing it (keys regenerate, every
+positive signature verifies, every negative case is rejected, the
+go-algorand vector verifies). CI (`.github/workflows/falcon-vectors.yml`)
+runs the Go tool against a fresh `v5.0.3-stable` clone on every PR that
+touches `crates/core/algo-falcon/**` or the tool, and fails on any byte
+difference to the committed file — so a committed corpus is, by
+construction, what go-algorand produces. The Go tool refuses to run unless
+`../go-algorand` is at exactly the pinned tag with a clean `crypto/` tree
+(`--allow-unpinned` overrides).
+
+### When to regenerate
+
+- Extending the corpus (new seeds/messages/negative cases): change **both**
+  generators in the same PR, append only, keep names stable.
+- A go-algorand pin bump that touches `crypto/falconWrapper.go` or the
+  `github.com/algorand/falcon` module version: regenerate with the Go tool
+  and investigate any diff before committing — a changed signature byte is
+  a consensus-relevant upstream change, not a fixture refresh.
+
+### References
+
+- go-algorand `crypto/falconWrapper.go` — `GenerateFalconSigner`,
+  `SignBytes`, `VerifyBytes`, `GetFixedLengthHashableRepresentation` (CT
+  form), `IsSaltVersionEqual`
+- `crates/core/algo-falcon/falcon-c/deterministic.c` — `det1024` keygen /
+  sign / verify / CT conversion the corpus pins
+- `docs/DIVERGENCES.md` `DIV-001`, `docs/PHASE21_PROPOSAL.md`
+
 ## Sortition Vector Regeneration
 
 Rust's `algo_consensus_crypto::sortition::select` must agree with Go's
