@@ -1937,7 +1937,7 @@ impl SimpleBlockEvaluator {
         // own rekey takes effect for the members after it (go `apply.Rekey`:
         // `RekeyTo == Sender` clears the auth address).
         let mut in_group_auth: HashMap<Address, Address> = HashMap::new();
-        for stx in txgroup {
+        for (member, stx) in txgroup.iter().enumerate() {
             let sender = &stx.txn.sender;
             let correct_authorizer = match in_group_auth.get(sender) {
                 Some(addr) => *addr,
@@ -1951,9 +1951,16 @@ impl SimpleBlockEvaluator {
             };
 
             if txn_authorizer != correct_authorizer {
+                // go: `transaction %v: should have been authorized by %v but
+                // was actually authorized by %v` (txid first). The txid is
+                // read from the restored copy (genesis fields populated).
+                let txid = restored
+                    .get(member)
+                    .map(|r| algo_codec::compute_txn_id(&r.txn).to_string())
+                    .unwrap_or_default();
                 return Err(algo_error::AlgoError::Validation {
                     message: format!(
-                        "transaction should have been authorized by {} but was actually authorized by {}",
+                        "transaction {txid}: should have been authorized by {} but was actually authorized by {}",
                         correct_authorizer, txn_authorizer,
                     ),
                 });
