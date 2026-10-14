@@ -169,6 +169,11 @@ for f in "$HERE/verify-soak.sh" "$P2P"; do
 done
 if grep -q 'snapshot_tip' "$P2P"; then ok "p2p verify-soak uses snapshot_tip"; else bad "p2p verify-soak uses snapshot_tip"; fi
 
+check "cert_latest_normalize 00 -> 0" 0 "$(cert_latest_normalize 00)"
+check "cert_latest_normalize 007 -> 7" 7 "$(cert_latest_normalize 007)"
+check "cert_latest_normalize leaves non-numeric alone" abc "$(cert_latest_normalize abc)"
+check "cert_latest_normalize empty stays empty" "" "$(cert_latest_normalize "")"
+
 if [ "$FAILS" -ne 0 ]; then
     echo "$FAILS failure(s)"
     exit 1

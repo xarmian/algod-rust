@@ -114,6 +114,11 @@ t.execute("UPDATE acctrounds SET rnd = 500 WHERE id = 'acctbase'")
 t.commit()
 EOF2
 
+# 3c. 00 is zero (whole range), not a broken "latest" mode.
+run --cert-latest 00
+check "latest 00: exit 0" 0 "$RC"
+check "latest 00: cert to-round is the requested one" 900 "$(arg_of --to-round)"
+
 # 4. CERT_LATEST env is equivalent to the flag.
 CERT_LATEST=2 run
 check "env CERT_LATEST=2: from-round" 499 "$(arg_of --from-round)"

@@ -72,6 +72,13 @@ snapshot_tip() {
     return 0
 }
 
+# Normalize a --cert-latest value: 00 / 000 -> 0 (so the literal-"0" guards in
+# the callers hold); anything non-numeric is returned unchanged and rejected
+# by resolve_cert_latest.
+cert_latest_normalize() {
+    if _is_round "${1:-}"; then echo $((10#$1)); else echo "${1:-}"; fi
+}
+
 # resolve_cert_latest <from> <snapshot_tip> <n>   (issue #1821)
 #
 # Clamp the cert pass to the NEWEST n rounds of the Rust snapshot (sets

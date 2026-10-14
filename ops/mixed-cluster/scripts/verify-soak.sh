@@ -414,9 +414,8 @@ if [ "$RUN_CERT" = "1" ]; then
     # falls back to CERT_WINDOW, else the last 900 rounds).
     # normalize 00 / 000 -> 0 (a non-numeric value stays as is and is rejected
     # by resolve_cert_latest)
-    if _is_round "$CERT_LATEST"; then CERT_LATEST=$((10#$CERT_LATEST)); fi
+    CERT_LATEST="$(cert_latest_normalize "$CERT_LATEST")"
     if [ "$CERT_LATEST" != "0" ]; then
-        CERT_TO="$TO_ROUND"
         resolve_cert_latest "$FROM_ROUND" "$(snapshot_tip "${BLOCK_PATH:-}" "${TRACKER_PATH:-}")" "$CERT_LATEST" || exit 2
     else
         resolve_cert_window "$FROM_ROUND" "$TO_ROUND" "${RUST_EARLIEST:-}" || exit 2
