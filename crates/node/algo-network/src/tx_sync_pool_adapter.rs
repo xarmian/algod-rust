@@ -46,7 +46,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use algo_codec::compute_txn_id;
 use algo_pool::TransactionPool;
@@ -142,7 +142,9 @@ impl SolicitedTxHandler for PoolSolicitedTxHandler {
                 Ok(())
             }
             Err(PoolIngestError::Rejected(e) | PoolIngestError::Internal(e)) => {
-                warn!(error = %e, "PoolSolicitedTxHandler: pool rejected pulled TX group");
+                // go: `logging.Base().Debugf("could not remember tx: %v", err)`
+                // (data/txHandler.go) - routine, not a warning (issue #1919).
+                debug!(error = %e, "PoolSolicitedTxHandler: pool rejected pulled TX group");
                 Err(TxSyncError::Handler(e))
             }
         }
