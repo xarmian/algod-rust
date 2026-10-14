@@ -1,0 +1,91 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: Falcon det1024 vector corpus drift check
+
+# Issue #1928 (Phase 21, epic #1926, DIV-001): the committed deterministic
+# Falcon-1024 parity corpus
+# (crates/core/algo-falcon/tests/fixtures/falcon/vectors.jsonl) must be
+# exactly what go-algorand's own crypto package produces. The corpus is
+# generated locally from the vendored C library
+# (`cargo run -p algo-falcon --example gen_vectors`), and this job is the
+# only place that re-derives it from real go-algorand source
+# (tools/falcon-vector-capture, linking github.com/algorand/go-algorand/crypto
+# -> github.com/algorand/falcon via cgo) and diffs it byte-for-byte. Together
+# with `cargo test -p algo-falcon --test falcon_vectors` this proves
+# go-algorand == vendored C == (from stage 11) the pure-Rust port.
+#
+# Building go-algorand's crypto package requires cgo + the vendored
+# libsodium fork (see CLAUDE.md's CI Workflows section) -- `make libsodium`
+# below, same as rewards-innertxid-oracle.yml.
+
+on:
+  pull_request:
+    paths:
+      - "tools/falcon-vector-capture/**"
+      - "crates/core/algo-falcon/**"
+      - ".github/workflows/falcon-vectors.yml"
+  push:
+    branches: [main]
+    paths:
+      - "tools/falcon-vector-capture/**"
+      - "crates/core/algo-falcon/**"
+      - ".github/workflows/falcon-vectors.yml"
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: falcon-vectors-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Pin go-algorand to the same rev the rest of the repo references.
+  GO_ALGORAND_REV: "v5.0.3-stable"
+
+jobs:
+  corpus-drift-check:
+    name: Regenerate falcon corpus from real go-algorand and diff
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Go toolchain
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      - name: Build go-algorand's libsodium fork
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake libtool build-essential
+          # Clone as a *sibling* of the checked-out repo: the tool's go.mod
+          # `replace` directive and its own pin check resolve go-algorand at
+          # `../../../go-algorand` relative to the tool source, matching the
+          # local-dev convention. Full clone so `git describe --exact-match`
+          # finds the tag.
+          git clone --branch "$GO_ALGORAND_REV" \
+            https://github.com/algorand/go-algorand.git \
+            "$(dirname "$GITHUB_WORKSPACE")/go-algorand"
+          cd "$(dirname "$GITHUB_WORKSPACE")/go-algorand"
+          make libsodium
+
+      - name: Run the capture tool and diff against the committed corpus
+        run: |
+          set -euo pipefail
+          cd tools/falcon-vector-capture
+          go vet ./...
+          go run .
+          cd "$GITHUB_WORKSPACE"
+          git diff --exit-code -- crates/core/algo-falcon/tests/fixtures/falcon/vectors.jsonl || {
+            echo "::error::committed falcon vectors.jsonl differs from what go-algorand produces -- if the corpus definition changed, regenerate with 'cd tools/falcon-vector-capture && go run .' (or the Rust example) and commit; if it did not, the vendored C / Rust port and go-algorand disagree and that is a parity bug"
+            exit 1
+          }

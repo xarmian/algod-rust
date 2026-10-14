@@ -82,3 +82,11 @@ jobs:
       # Corpus: crates/core/algo-agreement/tests/fixtures/lookback/lookback_boundaries.json
       - name: η — Lookback boundary parity vs go-algorand
         run: cargo test --release -p algo-agreement --test lookback_boundary
+
+      # θ — Deterministic Falcon-1024 (det1024) byte-level parity vs the
+      # go-algorand-generated corpus (keys from seeds, compressed + CT
+      # signatures, negative cases, go-algorand's hard-coded verify vector).
+      # Corpus: crates/core/algo-falcon/tests/fixtures/falcon/vectors.jsonl
+      # (regenerated from real go-algorand and diffed by falcon-vectors.yml).
+      - name: θ — Falcon det1024 parity vs go-algorand
+        run: cargo test --release -p algo-falcon --test falcon_vectors
