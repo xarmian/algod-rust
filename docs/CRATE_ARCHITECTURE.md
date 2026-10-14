@@ -66,6 +66,11 @@ These crates should have minimal dependencies and be safe to run in test harness
 - Exposes constant-time operations where applicable.
 - Wrap audited libs; keep API stable.
 
+**`core/algo-falcon`**
+- Deterministic Falcon-1024 (`det1024`) as used by state proofs, native PQ accounts and the AVM `falcon_verify` opcode.
+- Pure-Rust implementation (`src/rs/`, ported module-for-module from the vendored C) with the vendored C kept behind the `c-backend` feature and selectable at runtime via `config.json` `FalconBackend` — registered as `DIV-001` in `docs/DIVERGENCES.md`.
+- Proven bit-identical by a Go-generated vector corpus and per-function differential tests (Phase 21).
+
 **`core/algo-constants`**
 - Protocol constants, limits, fee rules, min balances, etc. (versioned where needed).
 
