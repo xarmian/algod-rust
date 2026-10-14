@@ -114,9 +114,17 @@ pub enum PoolIngestError {
     /// judged.
     #[error("{0}")]
     CatchingUp(String),
-    /// The pool (or its evaluator) rejected the group.
+    /// The pool (or its evaluator) rejected the group on STATE (duplicate,
+    /// expired, authorizer / balance / teal state, full pool, ...): go
+    /// `Remember` failures, which the network handlers ignore.
     #[error("{0}")]
     Rejected(String),
+    /// The group is invalid on its own (not well formed, bad group id,
+    /// oversize): go's `network.Disconnect` verdict from `processDecoded`,
+    /// the only rejection a solicited (tx-sync) handler reports as an error
+    /// (issue #1920).
+    #[error("{0}")]
+    Invalid(String),
     /// The pool could not even examine the group because of a node-side
     /// fault (its block evaluator cannot be rebuilt): 500-class, not the
     /// submitter's fault.
@@ -173,6 +181,13 @@ impl PoolIngest for PoolIngestAdapter {
                     PoolIngestError::CatchingUp(e.to_string())
                 } else if e.is_evaluator_rebuild_failed() {
                     PoolIngestError::Internal(e.to_string())
+                } else if matches!(
+                    algo_pool::classify_pool_error(&e),
+                    algo_pool::PoolErrorTag::NotWell
+                        | algo_pool::PoolErrorTag::GroupId
+                        | algo_pool::PoolErrorTag::TooLarge
+                ) {
+                    PoolIngestError::Invalid(e.to_string())
                 } else {
                     PoolIngestError::Rejected(e.to_string())
                 }
@@ -307,7 +322,7 @@ impl LocalTxBroadcaster {
                 debug!(error = %e, "LocalTxBroadcaster: node is catching up; group not admitted");
                 return Err(LocalTxError::CatchingUp(e));
             }
-            Err(PoolIngestError::Rejected(e)) => {
+            Err(PoolIngestError::Rejected(e) | PoolIngestError::Invalid(e)) => {
                 warn!(error = %e, "LocalTxBroadcaster: pool rejected local group");
                 return Err(LocalTxError::Pool(e));
             }
