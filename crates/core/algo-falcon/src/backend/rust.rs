@@ -18,41 +18,76 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! The pure-Rust backend adapter.
+//! The pure-Rust backend adapter over `crate::rs::det1024`.
 //!
 //! DIVERGENCE DIV-001: go-algorand calls the C library through cgo; algod-rust
-//! implements deterministic Falcon-1024 in Rust (`crate::rs`, landing module by
-//! module in Phase 21, epic #1926) and keeps the C library as a selectable
-//! backend. See `docs/DIVERGENCES.md`.
-//!
-//! Until the port lands (verify: #1935, sign: #1936, keygen: #1937) every
-//! entry point reports [`FalconError::BackendUnavailable`], so selecting the
-//! Rust backend fails loudly instead of silently falling back to C.
+//! implements deterministic Falcon-1024 in Rust (`crate::rs`, Phase 21, epic
+//! #1926) and keeps the C library as a selectable backend. The functions
+//! here mirror `backend::c` one for one, returning the same numeric codes
+//! (`FALCON_ERR_*`) in the same `FalconError` variants, so the two backends
+//! are observationally identical. See `docs/DIVERGENCES.md`.
 
-use crate::{FalconBackend, FalconError, FALCON_DET1024_SIG_CT_SIZE};
+use crate::rs::det1024;
+use crate::rs::shake256::Shake256;
+use crate::{
+    FalconError, FALCON_DET1024_PRIVKEY_SIZE, FALCON_DET1024_PUBKEY_SIZE,
+    FALCON_DET1024_SIG_COMPRESSED_MAXSIZE, FALCON_DET1024_SIG_CT_SIZE,
+};
 
-fn unavailable<T>() -> Result<T, FalconError> {
-    Err(FalconError::BackendUnavailable(FalconBackend::Rust))
+/// `falcon_det1024_verify_compressed`. Sizes are pre-validated by the caller.
+pub(crate) fn verify(pubkey: &[u8], sig: &[u8], data: &[u8]) -> Result<bool, FalconError> {
+    debug_assert_eq!(pubkey.len(), FALCON_DET1024_PUBKEY_SIZE);
+    debug_assert!(sig.len() >= 2 && sig.len() <= FALCON_DET1024_SIG_COMPRESSED_MAXSIZE);
+    Ok(det1024::verify_compressed_det(sig, pubkey, data) == 0)
 }
 
-pub(crate) fn verify(_pubkey: &[u8], _sig: &[u8], _data: &[u8]) -> Result<bool, FalconError> {
-    unavailable()
+/// `shake256_init_prng_from_seed` + `falcon_det1024_keygen`.
+pub(crate) fn keygen(seed: &[u8]) -> Result<(Vec<u8>, Vec<u8>), FalconError> {
+    let mut rng = Shake256::prng_from_seed(seed);
+    let mut pubkey = vec![0u8; FALCON_DET1024_PUBKEY_SIZE];
+    let mut privkey = vec![0u8; FALCON_DET1024_PRIVKEY_SIZE];
+    let rc = det1024::keygen(&mut rng, &mut privkey, &mut pubkey);
+    if rc != 0 {
+        return Err(FalconError::KeygenFailed(rc));
+    }
+    Ok((pubkey, privkey))
 }
 
-pub(crate) fn keygen(_seed: &[u8]) -> Result<(Vec<u8>, Vec<u8>), FalconError> {
-    unavailable()
+/// `falcon_det1024_sign_compressed`. The private key size is pre-validated.
+pub(crate) fn sign(privkey: &[u8], data: &[u8]) -> Result<Vec<u8>, FalconError> {
+    debug_assert_eq!(privkey.len(), FALCON_DET1024_PRIVKEY_SIZE);
+    let mut sig = vec![0u8; FALCON_DET1024_SIG_COMPRESSED_MAXSIZE];
+    let mut sig_len = FALCON_DET1024_SIG_COMPRESSED_MAXSIZE;
+    let rc = det1024::sign_compressed(&mut sig, &mut sig_len, privkey, data);
+    if rc != 0 {
+        return Err(FalconError::SignFailed(rc));
+    }
+    sig.truncate(sig_len);
+    Ok(sig)
 }
 
-pub(crate) fn sign(_privkey: &[u8], _data: &[u8]) -> Result<Vec<u8>, FalconError> {
-    unavailable()
-}
-
+/// `falcon_det1024_convert_compressed_to_ct`. The signature size is
+/// pre-validated.
 pub(crate) fn convert_compressed_to_ct(
-    _sig_compressed: &[u8],
+    sig_compressed: &[u8],
 ) -> Result<[u8; FALCON_DET1024_SIG_CT_SIZE], FalconError> {
-    unavailable()
+    debug_assert!(
+        sig_compressed.len() >= 2 && sig_compressed.len() <= FALCON_DET1024_SIG_COMPRESSED_MAXSIZE
+    );
+    let mut sig_ct = [0u8; FALCON_DET1024_SIG_CT_SIZE];
+    let rc = det1024::convert_compressed_to_ct(&mut sig_ct, sig_compressed);
+    if rc != 0 {
+        return Err(FalconError::ConvertToCtFailed(rc));
+    }
+    Ok(sig_ct)
 }
 
-pub(crate) fn salt_version(_sig: &[u8]) -> Result<u8, FalconError> {
-    unavailable()
+/// `falcon_det1024_get_salt_version` (the caller guarantees `sig.len() >= 2`).
+pub(crate) fn salt_version(sig: &[u8]) -> Result<u8, FalconError> {
+    debug_assert!(sig.len() >= 2);
+    let rc = det1024::get_salt_version(sig);
+    if rc < 0 {
+        return Err(FalconError::SaltVersionFailed(rc));
+    }
+    Ok(rc as u8)
 }

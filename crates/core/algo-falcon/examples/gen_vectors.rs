@@ -32,7 +32,7 @@
 //! library choice can change a byte.
 //!
 //! Usage:
-//!   cargo run -p algo-falcon --example gen_vectors -- [--out PATH]
+//!   cargo run -p algo-falcon --example gen_vectors -- [--out PATH] [--backend rust|c]
 //!
 //! Every record is self-checked before it is written (keys regenerate, every
 //! positive signature verifies, every negative case is rejected, the
@@ -43,8 +43,8 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use algo_falcon::{
-    falcon_convert_compressed_to_ct, falcon_keygen, falcon_salt_version, falcon_sign,
-    falcon_verify, FALCON_DET1024_SIG_COMPRESSED_MAXSIZE,
+    falcon_convert_compressed_to_ct_with, falcon_keygen_with, falcon_salt_version_with,
+    falcon_sign_with, falcon_verify_with, FalconBackend, FALCON_DET1024_SIG_COMPRESSED_MAXSIZE,
 };
 use sha2::{Digest, Sha256};
 
@@ -156,22 +156,36 @@ fn negatives(sig: &[u8], msg: &[u8], other_pubkey: &[u8]) -> Vec<Negative> {
     v
 }
 
-fn rejected(pk: &[u8], sig: &[u8], msg: &[u8]) -> bool {
-    !matches!(falcon_verify(pk, sig, msg), Ok(true))
+fn rejected(b: FalconBackend, pk: &[u8], sig: &[u8], msg: &[u8]) -> bool {
+    !matches!(falcon_verify_with(b, pk, sig, msg), Ok(true))
 }
 
 fn main() {
     let mut out: Option<PathBuf> = None;
+    let mut backend = FalconBackend::default();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--out" => out = Some(PathBuf::from(args.next().expect("--out needs a path"))),
+            "--backend" => {
+                backend = args
+                    .next()
+                    .expect("--backend needs rust|c")
+                    .parse()
+                    .unwrap_or_else(|e| {
+                        eprintln!("{e}");
+                        std::process::exit(2)
+                    })
+            }
             other => {
-                eprintln!("unknown argument {other}\nusage: gen_vectors [--out PATH]");
+                eprintln!(
+                    "unknown argument {other}\nusage: gen_vectors [--out PATH] [--backend rust|c]"
+                );
                 std::process::exit(2);
             }
         }
     }
+    let b = backend;
     let out = out.unwrap_or_else(|| {
         let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         p.push("tests/fixtures/falcon/vectors.jsonl");
@@ -186,8 +200,8 @@ fn main() {
     let mut neg_inputs: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new(); // (name prefix, pubkey, sig)
 
     for (si, (sname, seed)) in seeds.iter().enumerate() {
-        let (pk, sk) = falcon_keygen(seed).expect("keygen");
-        let (pk2, sk2) = falcon_keygen(seed).expect("keygen");
+        let (pk, sk) = falcon_keygen_with(b, seed).expect("keygen");
+        let (pk2, sk2) = falcon_keygen_with(b, seed).expect("keygen");
         assert!(
             pk == pk2 && sk == sk2,
             "{sname}: keygen is not deterministic"
@@ -201,19 +215,19 @@ fn main() {
         )
         .unwrap();
         for (mname, msg) in &messages {
-            let sig = falcon_sign(&sk, msg).expect("sign");
+            let sig = falcon_sign_with(b, &sk, msg).expect("sign");
             assert_eq!(
-                falcon_sign(&sk, msg).expect("sign"),
+                falcon_sign_with(b, &sk, msg).expect("sign"),
                 sig,
                 "{sname}/{mname}: signing is not deterministic"
             );
             assert!(
-                matches!(falcon_verify(&pk, &sig, msg), Ok(true)),
+                matches!(falcon_verify_with(b, &pk, &sig, msg), Ok(true)),
                 "{sname}/{mname}: self-verify failed"
             );
-            let salt = falcon_salt_version(&sig).expect("salt version");
+            let salt = falcon_salt_version_with(b, &sig).expect("salt version");
             assert_eq!(salt, 0, "{sname}/{mname}: unexpected salt version");
-            let ct = falcon_convert_compressed_to_ct(&sig).expect("CT conversion");
+            let ct = falcon_convert_compressed_to_ct_with(b, &sig).expect("CT conversion");
             writeln!(
                 text,
                 "{{\"kind\":\"sig\",\"name\":\"{sname}/{mname}\",\"seed\":\"{}\",\"msg\":\"{}\",\"sig_compressed\":\"{}\",\"sig_ct\":\"{}\",\"salt_version\":{salt}}}",
@@ -237,7 +251,7 @@ fn main() {
         for (case, bad_sig, bad_msg, bad_pk) in negatives(sig, &msg32, other) {
             let pk_used = bad_pk.as_deref().unwrap_or(pk);
             assert!(
-                rejected(pk_used, &bad_sig, &bad_msg),
+                rejected(b, pk_used, &bad_sig, &bad_msg),
                 "{prefix}/{case}: must be rejected"
             );
             writeln!(
@@ -255,7 +269,7 @@ fn main() {
     let go_sig = hex::decode(GO_SIG).unwrap();
     let go_msg = hex::decode(GO_MSG).unwrap();
     assert!(
-        matches!(falcon_verify(&go_pk, &go_sig, &go_msg), Ok(true)),
+        matches!(falcon_verify_with(b, &go_pk, &go_sig, &go_msg), Ok(true)),
         "go-algorand hard-coded vector must verify"
     );
     writeln!(
@@ -268,5 +282,9 @@ fn main() {
         std::fs::create_dir_all(dir).expect("mkdir");
     }
     std::fs::write(&out, text.as_bytes()).expect("write corpus");
-    eprintln!("wrote {} ({} bytes)", out.display(), text.len());
+    eprintln!(
+        "wrote {} ({} bytes) with the {b} backend",
+        out.display(),
+        text.len()
+    );
 }

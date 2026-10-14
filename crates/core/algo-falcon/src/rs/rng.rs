@@ -18,9 +18,10 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! The ChaCha20-based PRNG that the Gaussian sampler (signing) and, with
-//! `FALCON_KG_CHACHA20=1`, key generation draw from (`rng.c`, `prng` in
-//! `inner.h`).
+//! The ChaCha20-based PRNG that the Gaussian sampler (signing) draws from
+//! (`rng.c`, `prng` in `inner.h`). Key generation does *not* use it in the
+//! vendored build (`FALCON_KG_CHACHA20` is commented out in `config.h`);
+//! it samples from SHAKE256 directly.
 //!
 //! Ported from the Falcon reference implementation, `falcon-c/rng.c` and
 //! `falcon-c/inner.h` (Copyright (c) 2017-2019 Falcon Project, MIT License,

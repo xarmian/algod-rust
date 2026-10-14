@@ -291,6 +291,7 @@ name = "algo-falcon"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "criterion",
  "hex",
  "serde_json",
  "sha2 0.11.0",
