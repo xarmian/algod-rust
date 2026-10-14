@@ -46,7 +46,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use algo_codec::compute_txn_id;
 use algo_pool::TransactionPool;
@@ -141,10 +141,17 @@ impl SolicitedTxHandler for PoolSolicitedTxHandler {
                 debug!(error = %e, "PoolSolicitedTxHandler: node is catching up; pulled TX group dropped");
                 Ok(())
             }
-            Err(PoolIngestError::Rejected(e) | PoolIngestError::Internal(e)) => {
-                // go: `logging.Base().Debugf("could not remember tx: %v", err)`
-                // (data/txHandler.go) - routine, not a warning (issue #1919).
+            // go `solicitedTxHandler.Handle` errors only on a Disconnect
+            // verdict (stateless invalidity); a `Remember` failure is
+            // `Ignore`: `logging.Base().Debugf("could not remember tx: %v",
+            // err)` (data/txHandler.go) and the sync round carries on with
+            // the next group (issues #1919, #1920).
+            Err(PoolIngestError::Rejected(e)) => {
                 debug!(error = %e, "PoolSolicitedTxHandler: pool rejected pulled TX group");
+                Ok(())
+            }
+            Err(PoolIngestError::Invalid(e) | PoolIngestError::Internal(e)) => {
+                warn!(error = %e, "PoolSolicitedTxHandler: pulled TX group is invalid");
                 Err(TxSyncError::Handler(e))
             }
         }
@@ -248,23 +255,49 @@ mod tests {
         );
     }
 
+    /// go (`data/txHandler.go` `solicitedTxHandler.Handle`): only a
+    /// `network.Disconnect` verdict (stateless invalidity: malformed group,
+    /// bad group id, oversize) is an error; a `Remember` failure (duplicate,
+    /// expired, authorizer / balance / teal state, full pool) is `Ignore` -
+    /// logged at debug, counted, and the sync round carries on (issue #1920).
+    /// Not marked seen either way, so a later valid retry still goes through.
     #[tokio::test]
-    async fn pool_rejection_is_not_marked_seen() {
+    async fn ordinary_pool_rejection_is_ignored_and_not_marked_seen() {
         let ingest = Arc::new(FakeIngest {
             calls: Mutex::new(Vec::new()),
-            result: Err("bad txn".to_string()),
+            result: Err("transaction already in the pool".to_string()),
         });
         let seen = Arc::new(SeenTxCache::new(100));
         let handler = PoolSolicitedTxHandler::new(ingest.clone(), seen.clone());
 
         let tx = make_txn(11);
         let id = compute_txn_id(&tx.txn);
-        let err = handler.handle(vec![tx]).await.unwrap_err();
-        assert!(matches!(err, TxSyncError::Handler(_)));
+        handler
+            .handle(vec![tx])
+            .await
+            .expect("an ordinary Remember failure must not fail the sync round");
         assert!(
             !seen.contains(&id),
             "a rejected group must not suppress a future valid retry"
         );
+    }
+
+    #[tokio::test]
+    async fn stateless_invalid_group_still_fails_the_round() {
+        struct Invalid;
+        #[async_trait]
+        impl PoolIngest for Invalid {
+            async fn ingest(&self, _group: Vec<SignedTransaction>) -> Result<(), PoolIngestError> {
+                Err(PoolIngestError::Invalid("group id mismatch".into()))
+            }
+        }
+        let seen = Arc::new(SeenTxCache::new(100));
+        let handler = PoolSolicitedTxHandler::new(Arc::new(Invalid), seen.clone());
+        let tx = make_txn(12);
+        let id = compute_txn_id(&tx.txn);
+        let err = handler.handle(vec![tx]).await.unwrap_err();
+        assert!(matches!(err, TxSyncError::Handler(_)));
+        assert!(!seen.contains(&id));
     }
 
     #[tokio::test]
