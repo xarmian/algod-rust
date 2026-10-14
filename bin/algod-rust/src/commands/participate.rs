@@ -2625,6 +2625,19 @@ impl SimpleBlockEvaluator {
     /// Returns the address that must match `txn.Authorizer()` (i.e.,
     /// `stx.auth_addr` if set, else `stx.txn.sender`).
     fn expected_authorizer(&mut self, sender: &Address) -> Address {
+        // 0. The pending groups as the real evaluator left them (issue
+        // #1919): it applied every rekey, including those done by an
+        // application's INNER transactions (a bot rekeys its account to an
+        // app and the app rekeys it back in the same call), which the
+        // top-level `rekey_to` tracking below cannot see. Only while the
+        // evaluator is following this block (`incomplete` = it gave up).
+        if let Some(exec) = self.exec.as_ref() {
+            if !exec.incomplete {
+                if let Some(auth) = exec.overlay.pending_account_auth(sender) {
+                    return auth.unwrap_or(*sender);
+                }
+            }
+        }
         // 1. Check overlay for rekey delta from earlier in this block.
         if let Some(overlay_auth) = self.overlay.get_auth_addr(sender) {
             return match overlay_auth {

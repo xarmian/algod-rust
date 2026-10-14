@@ -318,6 +318,62 @@ fn pool_rejects_an_app_call_whose_inner_close_fails() {
     assert!(pool.pending_tx_groups().is_empty());
 }
 
+/// Issue #1919 (the real cause of the ~47k authorizer rejections in the
+/// mainnet soaks): a hot bot sends `appl` calls from S with `rekey_to =
+/// <app account>`; the app, now S's authorizer, rekeys S back to itself with an
+/// INNER transaction during the same call. go's pending state therefore shows S
+/// as its own authorizer afterwards and S's next call (signed by S, no
+/// auth-addr) is valid. The pool tracked only the top-level `rekey_to`, so
+/// after the first admitted call it believed S was still rekeyed to the app and
+/// rejected every following call ("should have been authorized by <app> but
+/// was actually authorized by <S>").
+#[test]
+fn inner_rekey_back_to_self_is_seen_by_the_next_group() {
+    let s = key(5);
+    let app_id = 910u64;
+    let app_addr = Address(algo_ledger::avm_context::app_address(app_id));
+    let (ledger, pool) = fixture(
+        &[(s.0, funded(5_000_000)), (app_addr, holder(1_000_000))],
+        &[],
+    );
+    put_app(
+        &ledger,
+        app_id,
+        s.0,
+        concat!(
+            "#pragma version 8\n",
+            // An inner payment FROM the caller (authorized by the app, S's new
+            // auth-addr) that rekeys the caller back to itself.
+            "itxn_begin\n",
+            "int pay\n",
+            "itxn_field TypeEnum\n",
+            "txn Sender\n",
+            "itxn_field Sender\n",
+            "txn Sender\n",
+            "itxn_field Receiver\n",
+            "txn Sender\n",
+            "itxn_field RekeyTo\n",
+            "int 0\n",
+            "itxn_field Fee\n",
+            "itxn_submit\n",
+            "int 1\n",
+        ),
+    );
+    let call = |fee: u64, rekey: Option<Address>| {
+        let mut t = base_txn(s.0, TxnType::Appl);
+        t.application_id = app_id;
+        t.fee = fee;
+        t.rekey_to = rekey;
+        sign(t, &s.1)
+    };
+    // Call 1: S rekeys itself to the app; the app rekeys it back inside the call.
+    pool.remember_one(call(3_000, Some(app_addr)))
+        .expect("first call (rekey to the app, app rekeys back)");
+    // Call 2: signed by S alone - valid, S is its own authorizer again.
+    pool.remember_one(call(3_001, Some(app_addr)))
+        .expect("second call must be admitted: the inner rekey-back is part of the pending state");
+}
+
 #[test]
 fn pool_rejects_a_rejecting_approval_program() {
     let s = key(3);
