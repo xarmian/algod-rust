@@ -83,6 +83,11 @@ on:
         description: "Set ALGOD_SHADOW_EXECUTE=1: re-evaluate every Replay-applied block in Execute mode on a rolled-back scratch apply and log shadow_execute_mismatch (issue #1673; hard tier, costs follow-path CPU)"
         type: boolean
         default: false
+      rust_log:
+        description: "Optional RUST_LOG for the node (e.g. 'info,algo_network::tx_tag_handler=debug' to see every gossip pool rejection, which go and algod-rust log at debug). Empty = the default filter"
+        required: false
+        type: string
+        default: ""
       shadow_execute_sample_every:
         description: "With shadow_execute: check only every Nth Replay-applied block (ALGOD_SHADOW_EXECUTE_SAMPLE_EVERY; 1 = every block)"
         type: string
@@ -328,8 +333,15 @@ jobs:
           # Issue #1673: opt-in Replay-vs-Execute differential check.
           ALGOD_SHADOW_EXECUTE: ${{ steps.params.outputs.shadow_execute }}
           ALGOD_SHADOW_EXECUTE_SAMPLE_EVERY: ${{ steps.params.outputs.shadow_execute_sample_every }}
+          IN_RUST_LOG: ${{ github.event.inputs.rust_log }}
         run: |
           set -euo pipefail
+          # Optional diagnostics filter (workflow_dispatch `rust_log`); unset
+          # unless given so the default log filter is untouched.
+          if [ -n "${IN_RUST_LOG:-}" ]; then
+            export RUST_LOG="$IN_RUST_LOG"
+            echo "RUST_LOG=$RUST_LOG"
+          fi
           mkdir -p mainnet-soak-artifacts
           mkdir -p /tmp/mainnet-soak-ledger /tmp/mainnet-soak-partkeys /tmp/mainnet-soak-data
 
