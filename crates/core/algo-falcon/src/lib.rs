@@ -18,8 +18,8 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! FFI bindings and safe Rust wrappers for the Algorand deterministic Falcon-1024
-//! C library (github.com/algorand/falcon v0.1.0).
+//! Algorand's deterministic Falcon-1024 (`det1024`), with two interchangeable
+//! backends behind one API.
 //!
 //! **Important**: This is Algorand's custom *deterministic* Falcon-1024, NOT the
 //! standard NIST Falcon submission. Key differences from standard Falcon:
@@ -29,8 +29,8 @@
 //!   (currently version 0), reducing signature overhead.
 //! - Custom header byte `0xBA` (compressed format: `0x3A | 0x80`) instead of
 //!   the standard Falcon compressed header, signalling deterministic mode.
-//! - Uses emulated floating-point (`FALCON_FPEMU=1`) to guarantee cross-platform
-//!   determinism.
+//! - The C library uses emulated floating-point (`FALCON_FPEMU=1`) to
+//!   guarantee cross-platform determinism.
 //!
 //! Wire format sizes:
 //! - Public key: 1793 bytes
@@ -38,9 +38,31 @@
 //! - Private key: 2305 bytes (not used on-chain, only for signing)
 //!
 //! Only the compressed-format deterministic variant is used on-chain.
-//! The library is compiled from vendored C sources in `falcon-c/`.
+//!
+//! # Backends
+//!
+//! DIVERGENCE DIV-001: go-algorand links the C library
+//! (`github.com/algorand/falcon` v0.1.0) through cgo; algod-rust implements the
+//! same algorithm in pure Rust and keeps the vendored C as a runtime-selectable
+//! backend ([`FalconBackend`], `config.json` `FalconBackend`). Both must be
+//! byte-identical — see `docs/DIVERGENCES.md` and
+//! `tests/fixtures/falcon/vectors.jsonl`.
+//!
+//! - [`FalconBackend::C`] (cargo feature `c-backend`, on by default): the
+//!   vendored C sources in `falcon-c/`, compiled by `build.rs`.
+//! - [`FalconBackend::Rust`]: the pure-Rust port (`backend::rust`, landing
+//!   module by module in Phase 21, epic #1926).
+//!
+//! The process-wide backend is chosen once with [`set_falcon_backend`]
+//! (the node does this from `config.json` at startup) and read with
+//! [`falcon_backend`]; the plain `falcon_*` functions use it, the `*_with`
+//! variants take an explicit backend (benchmarks, tests, generators).
 
-use std::os::raw::{c_int, c_void};
+use std::fmt;
+use std::str::FromStr;
+use std::sync::OnceLock;
+
+mod backend;
 
 // ---------------------------------------------------------------------------
 // Constants (computed from the C macros with logn=10)
@@ -68,163 +90,213 @@ pub const FALCON_DET1024_SIG_CT_SIZE: usize = 1538;
 pub const FALCON_SEED_SIZE: usize = 32;
 
 // ---------------------------------------------------------------------------
-// Internal types and FFI
+// Backend selection
 // ---------------------------------------------------------------------------
 
-/// Size of the SHAKE256 context structure (26 * u64 = 208 bytes).
-const SHAKE256_CONTEXT_SIZE: usize = 26;
-
-/// Opaque SHAKE256 context (matches the C `shake256_context` struct).
+/// Which implementation of `det1024` the `falcon_*` functions run.
 ///
-/// The `[u64; 26]` layout comes from `falcon.h` line 402:
-/// `uint64_t opaque_contents[26]` (208 bytes total).
-#[repr(C)]
-struct Shake256Context {
-    opaque_contents: [u64; SHAKE256_CONTEXT_SIZE],
+/// DIVERGENCE DIV-001: this selector has no go-algorand counterpart.
+///
+/// The default is [`FalconBackend::C`] while the Rust port is being landed
+/// and flips to [`FalconBackend::Rust`] in Phase 21 stage 11 (#1937); without
+/// the `c-backend` feature the only variant is `Rust`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum FalconBackend {
+    /// The pure-Rust implementation (`src/rs/`).
+    #[cfg_attr(not(feature = "c-backend"), default)]
+    Rust,
+    /// The vendored C library (`falcon-c/`, github.com/algorand/falcon v0.1.0).
+    #[cfg(feature = "c-backend")]
+    #[default]
+    C,
 }
 
-extern "C" {
-    fn shake256_init_prng_from_seed(sc: *mut Shake256Context, seed: *const c_void, seed_len: usize);
+impl FalconBackend {
+    /// The config-file / CLI spelling of this backend (`"rust"` / `"c"`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            FalconBackend::Rust => "rust",
+            #[cfg(feature = "c-backend")]
+            FalconBackend::C => "c",
+        }
+    }
 
-    fn falcon_det1024_keygen(
-        rng: *mut Shake256Context,
-        privkey: *mut c_void,
-        pubkey: *mut c_void,
-    ) -> c_int;
+    /// Every backend compiled into this build.
+    pub const fn all() -> &'static [FalconBackend] {
+        #[cfg(feature = "c-backend")]
+        {
+            &[FalconBackend::C, FalconBackend::Rust]
+        }
+        #[cfg(not(feature = "c-backend"))]
+        {
+            &[FalconBackend::Rust]
+        }
+    }
+}
 
-    fn falcon_det1024_sign_compressed(
-        sig: *mut c_void,
-        sig_len: *mut usize,
-        privkey: *const c_void,
-        data: *const c_void,
-        data_len: usize,
-    ) -> c_int;
+impl fmt::Display for FalconBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
-    fn falcon_det1024_verify_compressed(
-        sig: *const c_void,
-        sig_len: usize,
-        pubkey: *const c_void,
-        data: *const c_void,
-        data_len: usize,
-    ) -> c_int;
+/// Error from parsing a [`FalconBackend`] name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnknownFalconBackend(pub String);
 
-    fn falcon_det1024_convert_compressed_to_ct(
-        sig_ct: *mut c_void,
-        sig_compressed: *const c_void,
-        sig_compressed_len: usize,
-    ) -> c_int;
+impl fmt::Display for UnknownFalconBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let known: Vec<&str> = FalconBackend::all().iter().map(|b| b.as_str()).collect();
+        write!(
+            f,
+            "unknown falcon backend {:?} (this build supports: {})",
+            self.0,
+            known.join(", ")
+        )
+    }
+}
 
-    fn falcon_det1024_get_salt_version(sig: *const c_void) -> c_int;
+impl std::error::Error for UnknownFalconBackend {}
+
+impl FromStr for FalconBackend {
+    type Err = UnknownFalconBackend;
+
+    /// Case-insensitive: `"rust"` or `"c"`. A name that is a real backend but
+    /// not compiled into this build (`"c"` without the `c-backend` feature)
+    /// is an error too, so a node never silently runs a different backend
+    /// than its `config.json` asks for.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let lower = s.trim().to_ascii_lowercase();
+        FalconBackend::all()
+            .iter()
+            .copied()
+            .find(|b| b.as_str() == lower)
+            .ok_or_else(|| UnknownFalconBackend(s.to_string()))
+    }
+}
+
+static BACKEND: OnceLock<FalconBackend> = OnceLock::new();
+
+/// The process-wide backend used by the plain `falcon_*` functions.
+/// Initialises to [`FalconBackend::default`] on first use.
+pub fn falcon_backend() -> FalconBackend {
+    *BACKEND.get_or_init(FalconBackend::default)
+}
+
+/// Choose the process-wide backend. Write-once: call it at startup, before
+/// any `falcon_*` function runs (a `falcon_*` call pins the default). Setting
+/// the backend that is already in effect is a no-op `Ok`; asking for a
+/// different one returns `Err(current)` so the caller can fail loudly rather
+/// than run with a backend other than the one it asked for.
+pub fn set_falcon_backend(backend: FalconBackend) -> Result<(), FalconBackend> {
+    let current = *BACKEND.get_or_init(|| backend);
+    if current == backend {
+        Ok(())
+    } else {
+        Err(current)
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Safe Rust wrappers
+// Public API: validate once, dispatch to the selected backend
 // ---------------------------------------------------------------------------
 
-/// Verify a deterministic Falcon-1024 compressed-format signature.
+fn check_pubkey(pubkey: &[u8]) -> Result<(), FalconError> {
+    if pubkey.len() != FALCON_DET1024_PUBKEY_SIZE {
+        return Err(FalconError::InvalidPubkeySize(pubkey.len()));
+    }
+    Ok(())
+}
+
+fn check_privkey(privkey: &[u8]) -> Result<(), FalconError> {
+    if privkey.len() != FALCON_DET1024_PRIVKEY_SIZE {
+        return Err(FalconError::InvalidPrivkeySize(privkey.len()));
+    }
+    Ok(())
+}
+
+/// Signatures must be 2..=1423 bytes: at least header + salt version, at
+/// most the compressed maximum. `falcon_salt_version` relies on this bound
+/// too — the C implementation reads `sig[1]` without a length check of its
+/// own, and `sig` is attacker-controlled (decoded straight off an untrusted
+/// block's wire bytes).
+fn check_sig(sig: &[u8]) -> Result<(), FalconError> {
+    if sig.len() < 2 || sig.len() > FALCON_DET1024_SIG_COMPRESSED_MAXSIZE {
+        return Err(FalconError::InvalidSignatureSize(sig.len()));
+    }
+    Ok(())
+}
+
+/// Verify a deterministic Falcon-1024 compressed-format signature with the
+/// process-wide backend.
 ///
 /// Returns `Ok(true)` if the signature is valid, `Ok(false)` if verification
 /// fails (bad signature), or `Err` if the inputs are malformed (wrong sizes).
 pub fn falcon_verify(pubkey: &[u8], sig: &[u8], data: &[u8]) -> Result<bool, FalconError> {
-    if pubkey.len() != FALCON_DET1024_PUBKEY_SIZE {
-        return Err(FalconError::InvalidPubkeySize(pubkey.len()));
-    }
-    if sig.len() < 2 || sig.len() > FALCON_DET1024_SIG_COMPRESSED_MAXSIZE {
-        return Err(FalconError::InvalidSignatureSize(sig.len()));
-    }
-
-    let data_ptr = if data.is_empty() {
-        std::ptr::null()
-    } else {
-        data.as_ptr() as *const c_void
-    };
-
-    let rc = unsafe {
-        falcon_det1024_verify_compressed(
-            sig.as_ptr() as *const c_void,
-            sig.len(),
-            pubkey.as_ptr() as *const c_void,
-            data_ptr,
-            data.len(),
-        )
-    };
-
-    Ok(rc == 0)
+    falcon_verify_with(falcon_backend(), pubkey, sig, data)
 }
 
-/// Generate a Falcon-1024 keypair from the given seed.
+/// [`falcon_verify`] with an explicit backend.
+pub fn falcon_verify_with(
+    backend: FalconBackend,
+    pubkey: &[u8],
+    sig: &[u8],
+    data: &[u8],
+) -> Result<bool, FalconError> {
+    check_pubkey(pubkey)?;
+    check_sig(sig)?;
+    match backend {
+        FalconBackend::Rust => backend::rust::verify(pubkey, sig, data),
+        #[cfg(feature = "c-backend")]
+        FalconBackend::C => backend::c::verify(pubkey, sig, data),
+    }
+}
+
+/// Generate a Falcon-1024 keypair `(pubkey, privkey)` from the given seed
+/// with the process-wide backend.
 ///
 /// The seed is used to initialize a SHAKE256 PRNG, producing deterministic keys
 /// for a given seed value. Use a cryptographically random seed in production.
 pub fn falcon_keygen(seed: &[u8]) -> Result<(Vec<u8>, Vec<u8>), FalconError> {
-    let mut rng = Shake256Context {
-        opaque_contents: [0u64; SHAKE256_CONTEXT_SIZE],
-    };
+    falcon_keygen_with(falcon_backend(), seed)
+}
 
-    let seed_ptr = if seed.is_empty() {
-        std::ptr::null()
-    } else {
-        seed.as_ptr() as *const c_void
-    };
-
-    unsafe {
-        shake256_init_prng_from_seed(&mut rng, seed_ptr, seed.len());
+/// [`falcon_keygen`] with an explicit backend.
+pub fn falcon_keygen_with(
+    backend: FalconBackend,
+    seed: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), FalconError> {
+    match backend {
+        FalconBackend::Rust => backend::rust::keygen(seed),
+        #[cfg(feature = "c-backend")]
+        FalconBackend::C => backend::c::keygen(seed),
     }
-
-    let mut pubkey = vec![0u8; FALCON_DET1024_PUBKEY_SIZE];
-    let mut privkey = vec![0u8; FALCON_DET1024_PRIVKEY_SIZE];
-
-    let rc = unsafe {
-        falcon_det1024_keygen(
-            &mut rng,
-            privkey.as_mut_ptr() as *mut c_void,
-            pubkey.as_mut_ptr() as *mut c_void,
-        )
-    };
-
-    if rc != 0 {
-        return Err(FalconError::KeygenFailed(rc));
-    }
-
-    Ok((pubkey, privkey))
 }
 
 /// Sign data with a Falcon-1024 private key, producing a compressed-format
-/// deterministic signature.
+/// deterministic signature, with the process-wide backend.
 pub fn falcon_sign(privkey: &[u8], data: &[u8]) -> Result<Vec<u8>, FalconError> {
-    if privkey.len() != FALCON_DET1024_PRIVKEY_SIZE {
-        return Err(FalconError::InvalidPrivkeySize(privkey.len()));
+    falcon_sign_with(falcon_backend(), privkey, data)
+}
+
+/// [`falcon_sign`] with an explicit backend.
+pub fn falcon_sign_with(
+    backend: FalconBackend,
+    privkey: &[u8],
+    data: &[u8],
+) -> Result<Vec<u8>, FalconError> {
+    check_privkey(privkey)?;
+    match backend {
+        FalconBackend::Rust => backend::rust::sign(privkey, data),
+        #[cfg(feature = "c-backend")]
+        FalconBackend::C => backend::c::sign(privkey, data),
     }
-
-    let mut sig = vec![0u8; FALCON_DET1024_SIG_COMPRESSED_MAXSIZE];
-    let mut sig_len: usize = FALCON_DET1024_SIG_COMPRESSED_MAXSIZE;
-
-    let data_ptr = if data.is_empty() {
-        std::ptr::null()
-    } else {
-        data.as_ptr() as *const c_void
-    };
-
-    let rc = unsafe {
-        falcon_det1024_sign_compressed(
-            sig.as_mut_ptr() as *mut c_void,
-            &mut sig_len,
-            privkey.as_ptr() as *const c_void,
-            data_ptr,
-            data.len(),
-        )
-    };
-
-    if rc != 0 {
-        return Err(FalconError::SignFailed(rc));
-    }
-
-    sig.truncate(sig_len);
-    Ok(sig)
 }
 
 /// Convert a compressed-format deterministic Falcon-1024 signature to the
-/// fixed-width "CT" (constant-time-decodable) representation.
+/// fixed-width "CT" (constant-time-decodable) representation, with the
+/// process-wide backend.
 ///
 /// This is the byte sequence go-algorand's `crypto.FalconSignature.
 /// GetFixedLengthHashableRepresentation` (`crypto/falconWrapper.go:117`) feeds
@@ -236,54 +308,50 @@ pub fn falcon_sign(privkey: &[u8], data: &[u8]) -> Result<Vec<u8>, FalconError> 
 pub fn falcon_convert_compressed_to_ct(
     sig_compressed: &[u8],
 ) -> Result<[u8; FALCON_DET1024_SIG_CT_SIZE], FalconError> {
-    if sig_compressed.len() < 2 || sig_compressed.len() > FALCON_DET1024_SIG_COMPRESSED_MAXSIZE {
-        return Err(FalconError::InvalidSignatureSize(sig_compressed.len()));
+    falcon_convert_compressed_to_ct_with(falcon_backend(), sig_compressed)
+}
+
+/// [`falcon_convert_compressed_to_ct`] with an explicit backend.
+pub fn falcon_convert_compressed_to_ct_with(
+    backend: FalconBackend,
+    sig_compressed: &[u8],
+) -> Result<[u8; FALCON_DET1024_SIG_CT_SIZE], FalconError> {
+    check_sig(sig_compressed)?;
+    match backend {
+        FalconBackend::Rust => backend::rust::convert_compressed_to_ct(sig_compressed),
+        #[cfg(feature = "c-backend")]
+        FalconBackend::C => backend::c::convert_compressed_to_ct(sig_compressed),
     }
-
-    let mut sig_ct = [0u8; FALCON_DET1024_SIG_CT_SIZE];
-    let rc = unsafe {
-        falcon_det1024_convert_compressed_to_ct(
-            sig_ct.as_mut_ptr() as *mut c_void,
-            sig_compressed.as_ptr() as *const c_void,
-            sig_compressed.len(),
-        )
-    };
-
-    if rc != 0 {
-        return Err(FalconError::ConvertToCtFailed(rc));
-    }
-
-    Ok(sig_ct)
 }
 
 /// Return the salt version embedded in a Falcon signature (compressed or CT
 /// form), matching go-algorand's `crypto.FalconSignature.IsSaltVersionEqual`
 /// (`crypto/falconWrapper.go:127`), which compares this value against an
-/// expected version.
+/// expected version. Uses the process-wide backend.
 pub fn falcon_salt_version(sig: &[u8]) -> Result<u8, FalconError> {
-    // The C implementation (`falcon_det1024_get_salt_version`,
-    // `falcon-c/deterministic.c:167`) unconditionally reads `sig[1]` with no
-    // length check of its own -- it trusts the caller to have validated the
-    // buffer first. `sig` here is attacker-controlled (decoded straight off
-    // an untrusted block's wire bytes), so this bound must actually be
-    // enforced on the Rust side or a `sig.len() == 1` input is an
-    // out-of-bounds read. Match `falcon_verify`'s existing minimum.
-    if sig.len() < 2 || sig.len() > FALCON_DET1024_SIG_COMPRESSED_MAXSIZE {
-        return Err(FalconError::InvalidSignatureSize(sig.len()));
+    falcon_salt_version_with(falcon_backend(), sig)
+}
+
+/// [`falcon_salt_version`] with an explicit backend.
+pub fn falcon_salt_version_with(backend: FalconBackend, sig: &[u8]) -> Result<u8, FalconError> {
+    check_sig(sig)?;
+    match backend {
+        FalconBackend::Rust => backend::rust::salt_version(sig),
+        #[cfg(feature = "c-backend")]
+        FalconBackend::C => backend::c::salt_version(sig),
     }
-    let rc = unsafe { falcon_det1024_get_salt_version(sig.as_ptr() as *const c_void) };
-    if rc < 0 {
-        return Err(FalconError::SaltVersionFailed(rc));
-    }
-    Ok(rc as u8)
 }
 
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
 
-/// Errors from the Falcon FFI layer.
-#[derive(Debug, Clone)]
+/// Errors from the Falcon layer. The numeric codes are the C library's
+/// (`FALCON_ERR_*`, `falcon-c/falcon.h`): `-1` size, `-2` format, `-3`
+/// bad signature, `-4` bad argument, `-5` internal; the Rust backend reports
+/// the same codes for the same conditions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FalconError {
     /// Public key has wrong length (expected 1793 bytes).
     InvalidPubkeySize(usize),
@@ -292,17 +360,20 @@ pub enum FalconError {
     /// Signature has invalid length (must be 2..=1423 bytes).
     InvalidSignatureSize(usize),
     /// Key generation returned a non-zero error code.
-    KeygenFailed(c_int),
+    KeygenFailed(i32),
     /// Signing returned a non-zero error code.
-    SignFailed(c_int),
+    SignFailed(i32),
     /// Compressed-to-CT conversion returned a non-zero error code.
-    ConvertToCtFailed(c_int),
+    ConvertToCtFailed(i32),
     /// Salt-version extraction returned a negative error code.
-    SaltVersionFailed(c_int),
+    SaltVersionFailed(i32),
+    /// The selected backend has no implementation of this operation in this
+    /// build (the Rust port while it is being landed in Phase 21).
+    BackendUnavailable(FalconBackend),
 }
 
-impl std::fmt::Display for FalconError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for FalconError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             FalconError::InvalidPubkeySize(n) => {
                 write!(
@@ -341,6 +412,9 @@ impl std::fmt::Display for FalconError {
             FalconError::SaltVersionFailed(rc) => {
                 write!(f, "falcon salt version extraction failed with code {}", rc)
             }
+            FalconError::BackendUnavailable(b) => {
+                write!(f, "falcon backend {b} is not available in this build")
+            }
         }
     }
 }
@@ -350,6 +424,99 @@ impl std::error::Error for FalconError {}
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod backend_tests {
+    use super::*;
+
+    #[test]
+    fn backend_names_round_trip_and_unknown_is_rejected() {
+        for b in FalconBackend::all() {
+            assert_eq!(b.as_str().parse::<FalconBackend>(), Ok(*b));
+            assert_eq!(
+                b.to_string().to_uppercase().parse::<FalconBackend>(),
+                Ok(*b)
+            );
+        }
+        let err = "emulated".parse::<FalconBackend>().unwrap_err();
+        assert_eq!(err, UnknownFalconBackend("emulated".to_string()));
+        assert!(err.to_string().contains("rust"));
+        #[cfg(not(feature = "c-backend"))]
+        assert!("c".parse::<FalconBackend>().is_err());
+    }
+
+    #[test]
+    fn set_falcon_backend_is_write_once_and_idempotent() {
+        // Other tests in this binary may already have pinned the default by
+        // calling a `falcon_*` function; the contract is the same either way.
+        let d = falcon_backend();
+        assert_eq!(set_falcon_backend(d), Ok(()));
+        assert_eq!(set_falcon_backend(d), Ok(()));
+        for other in FalconBackend::all().iter().copied().filter(|b| *b != d) {
+            assert_eq!(set_falcon_backend(other), Err(d));
+        }
+        assert_eq!(falcon_backend(), d);
+    }
+
+    /// Flips in Phase 21 stage 11 (#1937): until the port has landed, asking
+    /// the Rust backend to do anything must fail loudly, never fall back.
+    #[test]
+    fn rust_backend_reports_unavailable_until_ported() {
+        let seed = [0u8; FALCON_SEED_SIZE];
+        let unavailable = FalconError::BackendUnavailable(FalconBackend::Rust);
+        assert_eq!(
+            falcon_keygen_with(FalconBackend::Rust, &seed).unwrap_err(),
+            unavailable
+        );
+        let pk = vec![0u8; FALCON_DET1024_PUBKEY_SIZE];
+        let sk = vec![0u8; FALCON_DET1024_PRIVKEY_SIZE];
+        let sig = vec![0xba, 0x00, 0x00];
+        assert_eq!(
+            falcon_verify_with(FalconBackend::Rust, &pk, &sig, b"x").unwrap_err(),
+            unavailable
+        );
+        assert_eq!(
+            falcon_sign_with(FalconBackend::Rust, &sk, b"x").unwrap_err(),
+            unavailable
+        );
+        assert_eq!(
+            falcon_convert_compressed_to_ct_with(FalconBackend::Rust, &sig).unwrap_err(),
+            unavailable
+        );
+        assert_eq!(
+            falcon_salt_version_with(FalconBackend::Rust, &sig).unwrap_err(),
+            unavailable
+        );
+        // Size validation happens before dispatch, identically for every backend.
+        assert_eq!(
+            falcon_verify_with(FalconBackend::Rust, &pk[1..], &sig, b"x"),
+            Err(FalconError::InvalidPubkeySize(
+                FALCON_DET1024_PUBKEY_SIZE - 1
+            ))
+        );
+    }
+
+    #[test]
+    fn explicit_c_backend_matches_default_dispatch() {
+        #[cfg(feature = "c-backend")]
+        {
+            let seed = [7u8; FALCON_SEED_SIZE];
+            let (pk, sk) = falcon_keygen_with(FalconBackend::C, &seed).unwrap();
+            assert_eq!(falcon_keygen(&seed).unwrap(), (pk.clone(), sk.clone()));
+            let sig = falcon_sign_with(FalconBackend::C, &sk, b"msg").unwrap();
+            assert_eq!(falcon_sign(&sk, b"msg").unwrap(), sig);
+            assert_eq!(
+                falcon_verify_with(FalconBackend::C, &pk, &sig, b"msg"),
+                Ok(true)
+            );
+            assert_eq!(falcon_salt_version_with(FalconBackend::C, &sig), Ok(0));
+            assert_eq!(
+                falcon_convert_compressed_to_ct_with(FalconBackend::C, &sig).unwrap(),
+                falcon_convert_compressed_to_ct(&sig).unwrap()
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

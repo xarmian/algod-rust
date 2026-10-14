@@ -49,6 +49,17 @@ use clap::{Args, Parser, Subcommand};
     version
 )]
 pub struct Cli {
+    /// Which Falcon-1024 implementation to use for `pq` keys: "rust" (the
+    /// pure-Rust port) or "c" (the vendored go-algorand C library).
+    ///
+    /// DIVERGENCE DIV-001: algod-rust-only flag (`docs/DIVERGENCES.md`).
+    #[arg(
+        long = "falcon-backend",
+        global = true,
+        default_value_t = algo_falcon::FalconBackend::default()
+    )]
+    pub falcon_backend: algo_falcon::FalconBackend,
+
     #[command(subcommand)]
     pub command: Command,
 }

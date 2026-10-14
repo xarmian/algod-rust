@@ -129,7 +129,7 @@ algo-consensus-crypto = { path = "crates/core/algo-consensus-crypto" }
 algo-agreement = { path = "crates/core/algo-agreement" }
 algo-pool = { path = "crates/core/algo-pool" }
 algo-abi = { path = "crates/core/algo-abi" }
-algo-falcon = { path = "crates/core/algo-falcon" }
+algo-falcon = { path = "crates/core/algo-falcon", default-features = false }
 algo-network = { path = "crates/node/algo-network" }
 algo-p2p = { path = "crates/node/algo-p2p" }
 algo-rest-api = { path = "crates/node/algo-rest-api" }

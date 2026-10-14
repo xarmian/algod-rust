@@ -83,6 +83,7 @@ pub async fn run_import(
 ) -> anyhow::Result<()> {
     let timer = Instant::now();
     let node_config = load_node_config(data_dir);
+    crate::falcon_backend::apply_falcon_backend(&node_config)?;
 
     // Step 1: Open database connection. `db_path` is a ledger prefix (or
     // legacy `.sqlite`-suffixed path); the helper opens the tracker file
@@ -401,6 +402,7 @@ pub async fn run_verify(
     data_dir: Option<&Path>,
 ) -> anyhow::Result<()> {
     let node_config = load_node_config(data_dir);
+    crate::falcon_backend::apply_falcon_backend(&node_config)?;
     // Open via the split-ledger helper so the verify pass sees the same data
     // (tracker + attached `blockdb`) that import/sync wrote.
     let conn = open_ledger_connection_with_sync_mode(
@@ -481,6 +483,7 @@ pub async fn run_export(
     data_dir: Option<&Path>,
 ) -> anyhow::Result<()> {
     let node_config = load_node_config(data_dir);
+    crate::falcon_backend::apply_falcon_backend(&node_config)?;
     let conn = open_ledger_connection_with_sync_mode(
         db_path,
         node_config.accounts_rebuild_synchronous_mode,
@@ -595,6 +598,7 @@ pub async fn run_download(
     data_dir: Option<&Path>,
 ) -> anyhow::Result<()> {
     let node_config = load_node_config(data_dir);
+    crate::falcon_backend::apply_falcon_backend(&node_config)?;
     let output = resolve_catchpoint_output_path(
         output,
         &node_config.catchpoint_dir,

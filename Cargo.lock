@@ -668,6 +668,7 @@ dependencies = [
  "algo-conformance",
  "algo-consensus-crypto",
  "algo-error",
+ "algo-falcon",
  "algo-fixtures",
  "algo-ledger",
  "algo-network",

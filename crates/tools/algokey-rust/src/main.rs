@@ -38,6 +38,13 @@ use crate::cli::{Cli, Command, MultisigSub, PartSub, PqSub};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Err(current) = algo_falcon::set_falcon_backend(cli.falcon_backend) {
+        eprintln!(
+            "--falcon-backend {}: this process already pinned the {current} backend",
+            cli.falcon_backend
+        );
+        return ExitCode::FAILURE;
+    }
     match cli.command {
         Command::Generate(args) => commands::generate::run(args),
         Command::Import(args) => commands::import::run(args),

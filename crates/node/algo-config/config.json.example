@@ -122,6 +122,7 @@
   "RunHosted": false,
   "StateproofDir": "",
   "StorageEngine": "sqlite",
+  "FalconBackend": "c",
   "SuggestedFeeBlockHistory": 3,
   "SuggestedFeeSlidingWindowSize": 50,
   "TLSCertFile": "",

@@ -42,7 +42,7 @@ base64 = { workspace = true }
 
 [dev-dependencies]
 algo-codec = { workspace = true }
-algo-falcon = { workspace = true }
+algo-falcon = { workspace = true, features = ["c-backend"] }
 rmpv = { workspace = true }
 zstd = { workspace = true }
 rusqlite = { workspace = true }

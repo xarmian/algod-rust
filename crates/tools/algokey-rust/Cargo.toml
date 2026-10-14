@@ -14,6 +14,10 @@ path = "src/main.rs"
 # (`make localnet-up`). Default `cargo test -p algokey-rust` runs in-process
 # unit tests only — no docker required.
 e2e = []
+# DIV-001 (docs/DIVERGENCES.md): the vendored Falcon C library as a selectable
+# backend (`--falcon-backend c`). On by default.
+default = ["falcon-c-backend"]
+falcon-c-backend = ["algo-falcon/c-backend"]
 
 [dependencies]
 clap = { workspace = true }

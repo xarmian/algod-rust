@@ -30,6 +30,13 @@
 //   - FALCON_FMA=0      — disable FMA (known non-determinism risk)
 
 fn main() {
+    // DIVERGENCE DIV-001: the C library is one of two selectable backends;
+    // without the `c-backend` feature the crate is pure Rust and needs no C
+    // compiler at all.
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_C_BACKEND");
+    if std::env::var_os("CARGO_FEATURE_C_BACKEND").is_none() {
+        return;
+    }
     let falcon_dir = "falcon-c";
 
     let c_files = [

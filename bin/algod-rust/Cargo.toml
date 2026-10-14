@@ -9,7 +9,15 @@ license.workspace = true
 name = "algod-rust"
 path = "src/main.rs"
 
+[features]
+# DIV-001 (docs/DIVERGENCES.md): the vendored Falcon C library is a selectable
+# backend of `algo-falcon`. On by default so every build can honour
+# `FalconBackend = "c"`; a pure-Rust build disables it.
+default = ["falcon-c-backend"]
+falcon-c-backend = ["algo-falcon/c-backend"]
+
 [dependencies]
+algo-falcon.workspace = true
 algo-types.workspace = true
 algo-codec.workspace = true
 algo-error.workspace = true
