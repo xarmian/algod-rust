@@ -1675,7 +1675,13 @@ async fn ingest_group(
             );
         }
         Ok(Err(e)) => {
-            warn!(
+            // go logs every `Remember` failure at Debugf (`data/txHandler.go`
+            // `postProcessCheckedTxn`: "could not remember tx") and counts it
+            // by class (below): rejections of gossiped groups are routine
+            // (duplicates from many peers, expired, full pool) and at relay
+            // rates a WARN here produced ~80k lines in a 2.5 h mainnet soak
+            // (issue #1919).
+            debug!(
                 sender = %sender,
                 error = %e,
                 "TxTagHandler: pool rejected inbound TX group",

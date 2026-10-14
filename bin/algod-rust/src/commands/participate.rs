@@ -1929,9 +1929,20 @@ impl SimpleBlockEvaluator {
         // We iterate `txgroup` (not `restored`) here because `auth_addr`
         // lives on SignedTransaction and is unaffected by genesis field
         // restoration.
+        //
+        // Sequential within the group (issue #1919): go checks each member
+        // against the state AFTER the earlier members applied
+        // (`eval.transaction` per member, `cow.lookup(sender).AuthAddr`), so
+        // a group `[rekey S->A, spend by A, rekey A->S]` is valid. A member's
+        // own rekey takes effect for the members after it (go `apply.Rekey`:
+        // `RekeyTo == Sender` clears the auth address).
+        let mut in_group_auth: HashMap<Address, Address> = HashMap::new();
         for stx in txgroup {
             let sender = &stx.txn.sender;
-            let correct_authorizer = self.expected_authorizer(sender);
+            let correct_authorizer = match in_group_auth.get(sender) {
+                Some(addr) => *addr,
+                None => self.expected_authorizer(sender),
+            };
 
             // The transaction's claimed authorizer (Go's txn.Authorizer()).
             let txn_authorizer = match &stx.auth_addr {
@@ -1946,6 +1957,12 @@ impl SimpleBlockEvaluator {
                         correct_authorizer, txn_authorizer,
                     ),
                 });
+            }
+
+            if let Some(rekey_to) = stx.txn.rekey_to {
+                if rekey_to != Address::default() {
+                    in_group_auth.insert(*sender, rekey_to);
+                }
             }
         }
 
@@ -1962,30 +1979,52 @@ impl SimpleBlockEvaluator {
         // Only payment transactions include the `amount` field in the Algo
         // cost. Other transaction types (axfer, acfg, afrz, appl, keyreg,
         // stpf, hb) only cost the fee in Algos.
-        let mut group_costs: HashMap<Address, u64> = HashMap::new();
+        //
+        // Sequential within the group (issue #1919): go applies the members
+        // in order, so a credit from an earlier member (`[X pays F, F pays
+        // R]`, F brand new) funds a later one. Track the in-group balance
+        // movements per address: `credits` (received so far) and `spent`
+        // (cumulative cost of the sender's members so far).
+        let mut credits: HashMap<Address, u64> = HashMap::new();
+        let mut spent: HashMap<Address, u64> = HashMap::new();
         for stx in txgroup {
-            let sender = &stx.txn.sender;
-            let cost = if stx.txn.txn_type == TxnType::Pay {
+            let sender = stx.txn.sender;
+            let is_pay = stx.txn.txn_type == TxnType::Pay;
+            let cost = if is_pay {
                 stx.txn.fee.saturating_add(stx.txn.amount)
             } else {
                 stx.txn.fee
             };
-            let entry = group_costs.entry(*sender).or_insert(0);
-            *entry = entry.saturating_add(cost);
-        }
-
-        for (sender, required) in &group_costs {
-            // Check overlay first for cumulative effects of earlier groups,
-            // then fall back to the ledger snapshot.
-            let bal = self.effective_balance(sender);
-
-            if bal < *required {
+            // Overlay first for the cumulative effects of earlier groups,
+            // then the ledger snapshot.
+            let base = self.effective_balance(&sender);
+            let credited = credits.get(&sender).copied().unwrap_or(0);
+            let already_spent = spent.get(&sender).copied().unwrap_or(0);
+            let required = already_spent.saturating_add(cost);
+            let available = base.saturating_add(credited);
+            if available < required {
                 return Err(algo_error::AlgoError::Validation {
                     message: format!(
                         "sender {} has insufficient balance: need {} microAlgos, have {}",
-                        sender, required, bal,
+                        sender, required, available,
                     ),
                 });
+            }
+            spent.insert(sender, required);
+            if is_pay {
+                let receiver = stx.txn.receiver;
+                let entry = credits.entry(receiver).or_insert(0);
+                *entry = entry.saturating_add(stx.txn.amount);
+                // A close-out sends everything that remains to the close
+                // target (go `apply.Payment`): credit it and zero the sender.
+                if stx.txn.close_remainder_to != Address::default() {
+                    let remaining = available.saturating_sub(required);
+                    let entry = credits.entry(stx.txn.close_remainder_to).or_insert(0);
+                    *entry = entry.saturating_add(remaining);
+                    // Everything the sender had is now gone: later members of
+                    // the sender can only spend later credits.
+                    spent.insert(sender, available);
+                }
             }
         }
 
@@ -11134,6 +11173,183 @@ mod tests {
             eval.transaction_group(&[stx3]).is_ok(),
             "after rekeying back to self, original key should work"
         );
+    }
+
+    // ====================================================================
+    // Issue #1919: rekeys and credits INSIDE a group apply to later members
+    // ====================================================================
+
+    /// One member of a hand-built group: a payment `from -> to` signed by
+    /// `signer` (`auth` is the declared `auth_addr`), optionally rekeying.
+    struct GroupMember<'a> {
+        from: Address,
+        to: Address,
+        amount: u64,
+        rekey_to: Option<Address>,
+        signer: &'a SigningKey,
+        auth: Option<Address>,
+    }
+
+    fn member<'a>(
+        from: Address,
+        to: Address,
+        amount: u64,
+        rekey_to: Option<Address>,
+        signer: &'a SigningKey,
+        auth: Option<Address>,
+    ) -> GroupMember<'a> {
+        GroupMember {
+            from,
+            to,
+            amount,
+            rekey_to,
+            signer,
+            auth,
+        }
+    }
+
+    /// Stamp a group id over `members` and sign each one (go
+    /// `transactions.Txgroup` semantics).
+    fn make_group(members: &[GroupMember<'_>]) -> Vec<SignedTransaction> {
+        let mut txns: Vec<Transaction> = members
+            .iter()
+            .map(|m| Transaction {
+                txn_type: TxnType::Pay,
+                sender: m.from,
+                receiver: m.to,
+                amount: m.amount,
+                fee: 1000,
+                first_valid: Round(100),
+                last_valid: Round(1100),
+                genesis_id: "test-v1".to_string(),
+                genesis_hash: [0xAA; 32],
+                rekey_to: m.rekey_to,
+                ..Default::default()
+            })
+            .collect();
+        let gid = algo_validate::rules::compute_group_id(&txns);
+        for t in &mut txns {
+            t.group = *gid.as_bytes();
+        }
+        txns.into_iter()
+            .zip(members)
+            .map(|(txn, m)| {
+                let sig = sign_txn(&txn, m.signer);
+                SignedTransaction {
+                    txn,
+                    sig,
+                    auth_addr: m.auth,
+                    ..Default::default()
+                }
+            })
+            .collect()
+    }
+
+    /// go checks each member's authorizer against the state AFTER the earlier
+    /// members of the group applied (`eval.transaction` per member): a group
+    /// `[rekey S->A, spend by A]` is valid. The pool precheck judged every
+    /// member against the pre-group state and rejected it ("should have been
+    /// authorized by S but was actually authorized by A"): 51k+ gossip
+    /// rejections in the nightly mainnet soak 38543123094.
+    #[test]
+    fn group_rekey_then_spend_by_the_new_key_is_admitted() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (s_addr, s_key) = test_keypair(190);
+        let (r, _) = test_keypair(191);
+        let (a, a_key) = test_keypair(192);
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(s_addr, 10_000_000)]);
+        let group = make_group(&[
+            member(s_addr, r, 0, Some(a), &s_key, None),
+            member(s_addr, r, 200_000, None, &a_key, Some(a)),
+        ]);
+        eval.transaction_group(&group)
+            .expect("rekey then spend by the new key, in one group, is valid in go");
+    }
+
+    /// The full bot pattern: rekey out, act as the new key, rekey back.
+    #[test]
+    fn group_rekey_spend_rekey_back_is_admitted() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (s_addr, s_key) = test_keypair(193);
+        let (r, _) = test_keypair(194);
+        let (a, a_key) = test_keypair(195);
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(s_addr, 10_000_000)]);
+        let group = make_group(&[
+            member(s_addr, r, 0, Some(a), &s_key, None),
+            member(s_addr, r, 200_000, None, &a_key, Some(a)),
+            member(s_addr, r, 0, Some(s_addr), &a_key, Some(a)),
+        ]);
+        eval.transaction_group(&group)
+            .expect("rekey / spend / rekey back");
+        // The sender is its own authorizer again afterwards.
+        let after = make_signed_pay_with_auth(&s_key, &s_addr, &r, 0, 1000, 100, None);
+        eval.transaction_group(&[after])
+            .expect("rekeyed back to self");
+    }
+
+    /// The in-group rekey is sequential, not retroactive: using the NEW key
+    /// BEFORE the rekey, or the OLD key AFTER it, is still rejected (as in go).
+    #[test]
+    fn group_wrong_signer_around_an_in_group_rekey_is_rejected() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (s_addr, s_key) = test_keypair(196);
+        let (r, _) = test_keypair(197);
+        let (a, a_key) = test_keypair(198);
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(s_addr, 10_000_000)]);
+
+        // New key before the rekey member.
+        let early = make_group(&[
+            member(s_addr, r, 200_000, None, &a_key, Some(a)),
+            member(s_addr, r, 0, Some(a), &s_key, None),
+        ]);
+        let err = eval.transaction_group(&early).unwrap_err();
+        assert!(
+            err.to_string().contains("should have been authorized by"),
+            "{err}"
+        );
+
+        // Old key after the rekey member.
+        let late = make_group(&[
+            member(s_addr, r, 0, Some(a), &s_key, None),
+            member(s_addr, r, 200_000, None, &s_key, None),
+        ]);
+        let err = eval.transaction_group(&late).unwrap_err();
+        assert!(
+            err.to_string().contains("should have been authorized by"),
+            "{err}"
+        );
+    }
+
+    /// Credits earlier in the group fund later members (go applies them
+    /// sequentially): `[X pays F, F pays R]` with F brand new is valid; the
+    /// balance precheck must not judge F against its pre-group balance.
+    #[test]
+    fn group_member_funded_earlier_in_the_group_can_spend() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (x, x_key) = test_keypair(199);
+        let (f, f_key) = test_keypair(200);
+        let (r, _) = test_keypair(201);
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(x, 10_000_000)]);
+        let group = make_group(&[
+            member(x, f, 500_000, None, &x_key, None),
+            member(f, r, 100_000, None, &f_key, None),
+        ]);
+        eval.transaction_group(&group)
+            .expect("a member funded by an earlier member can spend");
+        // Still rejected when the earlier credit is too small.
+        let (f2, f2_key) = test_keypair(202);
+        let (x2, x2_key) = test_keypair(203);
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(x2, 10_000_000)]);
+        let poor = make_group(&[
+            member(x2, f2, 100_000, None, &x2_key, None),
+            member(f2, r, 100_000, None, &f2_key, None),
+        ]);
+        let err = eval.transaction_group(&poor).unwrap_err();
+        assert!(err.to_string().contains("insufficient balance"), "{err}");
     }
 
     // ====================================================================
