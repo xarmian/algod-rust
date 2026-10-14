@@ -55,10 +55,10 @@ probe_tracker_round() {
     local f="$1" out=""
     [ -s "$f" ] || return 0
     if command -v sqlite3 >/dev/null 2>&1; then
-        out="$(sqlite3 "$f" "SELECT rnd FROM acctrounds WHERE id='acctbase'" 2>/dev/null | tr -d '' || true)"
+        out="$(sqlite3 "$f" "SELECT rnd FROM acctrounds WHERE id='acctbase'" 2>/dev/null | tr -d '\r' || true)"
     fi
     if ! _is_round "$out" && command -v python3 >/dev/null 2>&1; then
-        out="$(python3 -c 'import sqlite3, sys; r = sqlite3.connect(sys.argv[1]).execute("SELECT rnd FROM acctrounds WHERE id=?", ("acctbase",)).fetchone(); print(r[0] if r else "")' "$f" 2>/dev/null | tr -d '' || true)"
+        out="$(python3 -c 'import sqlite3, sys; r = sqlite3.connect(sys.argv[1]).execute("SELECT rnd FROM acctrounds WHERE id=?", ("acctbase",)).fetchone(); print(r[0] if r else "")' "$f" 2>/dev/null | tr -d '\r' || true)"
     fi
     if _is_round "$out"; then
         echo "$out"
@@ -74,6 +74,11 @@ snapshot_tip() {
     local blk trk
     blk="$(probe_latest_file "$1")"
     trk="$(probe_tracker_round "$2")"
+    # An existing tracker file whose applied round cannot be read must not
+    # silently degrade to the (possibly newer) block round.
+    if [ -n "${2:-}" ] && [ -s "${2:-}" ] && ! _is_round "$trk"; then
+        echo "warning: cannot read the tracker snapshot's applied round; using the newest block round" >&2
+    fi
     if _is_round "$blk" && _is_round "$trk"; then
         if [ "$blk" -lt "$trk" ]; then echo "$blk"; else echo "$trk"; fi
     elif _is_round "$trk"; then

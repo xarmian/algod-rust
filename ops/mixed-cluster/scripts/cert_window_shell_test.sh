@@ -133,6 +133,23 @@ check "probe_tracker_round reads acctbase" 2701 "$(probe_tracker_round "$TDB")"
 check "snapshot_tip is the older of block (2702) and tracker (2701)" 2701 "$(snapshot_tip "$DB" "$TDB")"
 check "snapshot_tip without a tracker falls back to the block file" 2702 "$(snapshot_tip "$DB" "$TMP/nope.sqlite")"
 check "snapshot_tip with nothing is empty" "" "$(snapshot_tip "$TMP/nope.sqlite" "$TMP/nope2.sqlite")"
+# tracker AHEAD of the block file: the block round wins (still the older)
+TDB_AHEAD="$TMP/tracker_ahead.sqlite"
+python3 -c 'import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("CREATE TABLE acctrounds (id TEXT PRIMARY KEY, rnd INTEGER)")
+c.execute("INSERT INTO acctrounds VALUES (?, ?)", ("acctbase", 2703))
+c.commit()' "$TDB_AHEAD"
+check "snapshot_tip with the tracker ahead is the block round" 2702 "$(snapshot_tip "$DB" "$TDB_AHEAD")"
+# tracker file with NO acctbase row: falls back to the block round but warns
+TDB_EMPTY="$TMP/tracker_empty.sqlite"
+python3 -c 'import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("CREATE TABLE acctrounds (id TEXT PRIMARY KEY, rnd INTEGER)")
+c.commit()' "$TDB_EMPTY"
+err="$(snapshot_tip "$DB" "$TDB_EMPTY" 2>&1 >/dev/null)"
+case "$err" in *"cannot read the tracker snapshot"*) ok "unreadable tracker round is warned about" ;; *) bad "unreadable tracker round is warned about: '$err'" ;; esac
+check "unreadable tracker round falls back to the block round" 2702 "$(snapshot_tip "$DB" "$TDB_EMPTY" 2>/dev/null)"
 
 if [ "$FAILS" -ne 0 ]; then
     echo "$FAILS failure(s)"
