@@ -77,6 +77,24 @@ fn main() {
 
     build.compile("falcon");
 
+    // Test-only shims (feature `c-internals-test`): one translation unit per
+    // vendored C file whose `static` internals the differential tests need.
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_C_INTERNALS_TEST");
+    if std::env::var_os("CARGO_FEATURE_C_INTERNALS_TEST").is_some() {
+        let shims = ["shim_fpr.c"];
+        let mut shim_build = cc::Build::new();
+        shim_build
+            .include(falcon_dir)
+            .opt_level(2)
+            .flag_if_supported("-Wno-unused-function")
+            .flag_if_supported("-Wno-unused-parameter");
+        for file in &shims {
+            shim_build.file(format!("falcon-c-test/{}", file));
+            println!("cargo:rerun-if-changed=falcon-c-test/{}", file);
+        }
+        shim_build.compile("falcon_shims");
+    }
+
     // Rerun if any source file changes.
     println!("cargo:rerun-if-changed={}", falcon_dir);
     for file in &c_files {

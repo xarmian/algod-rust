@@ -101,6 +101,33 @@ extern "C" {
     pub(crate) static falcon_inner_max_fg_bits: [u8; 11];
     pub(crate) static falcon_inner_max_FG_bits: [u8; 11];
     pub(crate) static falcon_inner_max_sig_bits: [u8; 11];
+
+    // fpr.c (FALCON_FPEMU: `fpr` is a u64 bit pattern)
+    pub(crate) fn falcon_inner_fpr_add(x: u64, y: u64) -> u64;
+    pub(crate) fn falcon_inner_fpr_mul(x: u64, y: u64) -> u64;
+    pub(crate) fn falcon_inner_fpr_div(x: u64, y: u64) -> u64;
+    pub(crate) fn falcon_inner_fpr_sqrt(x: u64) -> u64;
+    pub(crate) fn falcon_inner_fpr_expm_p63(x: u64, ccs: u64) -> u64;
+    pub(crate) static falcon_inner_fpr_gm_tab: [u64; 2048];
+    pub(crate) static falcon_inner_fpr_p2_tab: [u64; 11];
+}
+
+/// `static inline` helpers re-exported by `falcon-c-test/shim_*.c`.
+#[cfg(feature = "c-internals-test")]
+pub(crate) mod shim {
+    extern "C" {
+        pub(crate) fn falcon_shim_x_fpr_rint(x: u64) -> i64;
+        pub(crate) fn falcon_shim_x_fpr_floor(x: u64) -> i64;
+        pub(crate) fn falcon_shim_x_fpr_trunc(x: u64) -> i64;
+        pub(crate) fn falcon_shim_x_fpr_lt(x: u64, y: u64) -> i32;
+        pub(crate) fn falcon_shim_x_fpr_of(i: i64) -> u64;
+        pub(crate) fn falcon_shim_x_fpr_neg(x: u64) -> u64;
+        pub(crate) fn falcon_shim_x_fpr_half(x: u64) -> u64;
+        pub(crate) fn falcon_shim_x_fpr_double(x: u64) -> u64;
+        pub(crate) fn falcon_shim_x_fpr_sub(x: u64, y: u64) -> u64;
+        pub(crate) fn falcon_shim_x_fpr_sqr(x: u64) -> u64;
+        pub(crate) fn falcon_shim_x_fpr_inv(x: u64) -> u64;
+    }
 }
 
 impl CInnerShake256 {

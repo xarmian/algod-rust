@@ -52,4 +52,6 @@
 #![allow(dead_code)]
 
 pub(crate) mod codec;
+pub(crate) mod fpr;
+pub(crate) mod fpr_tables;
 pub(crate) mod shake256;

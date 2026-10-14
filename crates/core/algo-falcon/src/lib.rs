@@ -521,7 +521,10 @@ mod backend_tests {
     }
 }
 
-#[cfg(test)]
+// These exercise the default backend end to end. Until the Rust port is
+// complete (#1937) only the C backend can run them; from then on they run
+// under both feature sets.
+#[cfg(all(test, feature = "c-backend"))]
 mod tests {
     use super::*;
 
