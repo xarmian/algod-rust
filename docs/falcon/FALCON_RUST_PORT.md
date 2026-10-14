@@ -130,26 +130,19 @@ value.
 
 ## Benchmarks
 
-`cargo bench -p algo-falcon` (criterion, `benches/falcon_bench.rs`),
-Falcon-1024, same seed/key/message for both backends, release profile.
+Full methodology, both platforms, raw data and interpretation:
+[`BENCHMARK_RUST_VS_C.md`](BENCHMARK_RUST_VS_C.md). In short (Criterion
+medians, `cargo bench -p algo-falcon`):
 
-| Operation | C (`FALCON_FPEMU`) | Rust (native `f64`) | Rust / C |
-|---|---|---|---|
-| keygen (seed → key pair) | 31.6 ms | 14.8 ms | 2.1× faster |
-| sign, 32-byte message | 9.17 ms | 0.585 ms | 15.7× faster |
-| sign, 1000-byte message | 9.56 ms | 0.625 ms | 15.3× faster |
-| verify, 32-byte message | 71.7 µs | 59.5 µs | 1.2× faster |
-| verify, 1000-byte message | 72.6 µs | 64.3 µs | 1.1× faster |
-| compressed → CT | 5.34 µs | 6.44 µs | 0.8× (C faster; ~1 µs, allocation-bound) |
+| Operation | Windows / MSVC | Linux / gcc |
+|---|---|---|
+| sign (32 B / 1000 B) | Rust **16.5× / 16.3×** faster | Rust **15.2× / 14.7×** faster |
+| keygen | Rust **2.20×** faster | Rust **1.85×** faster |
+| verify (32 B / 1000 B) | Rust 1.32× / 1.26× faster | **C 7% / 8% faster** (essentially parity) |
+| compressed → CT | C 12% faster (~0.5 µs) | Rust 4% faster |
 
-Criterion mean estimates, 2026-10-14, Windows 11 / x86-64 desktop (MSVC
-`cl` for the C with `/O2`, `rustc` 1.99 release profile with thin LTO).
-The signing gap is the emulated floating point: the C spends almost all
-of its time in `FALCON_FPEMU` add/mul/div/sqrt, which the Rust does in
-hardware. Verification is integer NTT in both and roughly on par; the
-remaining difference there is allocation and bounds-checked indexing, left
-as a possible follow-up. Re-run `cargo bench -p algo-falcon` to compare on
-your hardware.
+The signing/keygen gain is the emulated floating point in the C; verification
+is pure integer work, so there the winner is decided by the C compiler.
 
 ## Regenerating the evidence
 

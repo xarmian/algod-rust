@@ -39,7 +39,7 @@ Runs `cargo bench --workspace`, which executes Criterion benchmarks across multi
 | `algo-validate` | SHA-512/256 (various sizes), ed25519 verification, Merkle root (1-64 txns), vector commitment (SHA-256/SHA-512), full block validation |
 | `algo-avm` | TEAL bytecode parsing (simple/large), arithmetic execution, concat, sha256/keccak256 chained hashing |
 | `algo-ledger` | SQLite open, account read/write, block storage put/get, apply_pay (SQLite vs in-memory) |
-| `algo-falcon` | Falcon-1024 `det1024` keygen / sign (32 B, 1000 B) / verify / CT conversion, for every compiled backend (`rust` vs the vendored `c`) — see `docs/falcon/FALCON_RUST_PORT.md` for the recorded numbers (DIV-001) |
+| `algo-falcon` | Falcon-1024 `det1024` keygen / sign (32 B, 1000 B) / verify / CT conversion, for every compiled backend (`rust` vs the vendored `c`) — see `docs/falcon/BENCHMARK_RUST_VS_C.md` for the recorded numbers and method (DIV-001) |
 
 Criterion automatically handles warm-up, statistical sampling, and outlier detection. Results are saved to `target/criterion/` with HTML reports.
 
