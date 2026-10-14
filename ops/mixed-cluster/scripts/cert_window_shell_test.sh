@@ -148,8 +148,19 @@ c = sqlite3.connect(sys.argv[1])
 c.execute("CREATE TABLE acctrounds (id TEXT PRIMARY KEY, rnd INTEGER)")
 c.commit()' "$TDB_EMPTY"
 err="$(snapshot_tip "$DB" "$TDB_EMPTY" 2>&1 >/dev/null)"
-case "$err" in *"cannot read the tracker snapshot"*) ok "unreadable tracker round is warned about" ;; *) bad "unreadable tracker round is warned about: '$err'" ;; esac
-check "unreadable tracker round falls back to the block round" 2702 "$(snapshot_tip "$DB" "$TDB_EMPTY" 2>/dev/null)"
+case "$err" in *"cannot read the tracker snapshot"*) ok "unreadable tracker round is reported" ;; *) bad "unreadable tracker round is reported: '$err'" ;; esac
+out="$(snapshot_tip "$DB" "$TDB_EMPTY" 2>/dev/null)"; rc=$?
+check "unreadable tracker round fails closed (no block-round fallback)" "" "$out"
+snapshot_tip "$DB" "$TDB_EMPTY" >/dev/null 2>&1
+check "unreadable tracker round returns non-zero" 1 "$?"
+# the verify-soak wiring: every ledger branch must set TRACKER_PATH (the
+# --cert-ledger override branch used to leave it unset, #1917 review)
+P2P="$HERE/../../mixed-cluster-p2p/scripts/verify-soak.sh"
+n="$(grep -c '^ *TRACKER_PATH=' "$HERE/verify-soak.sh")"
+if [ "$n" -ge 2 ]; then ok "mixed-cluster verify-soak sets TRACKER_PATH in both ledger branches"; else bad "mixed-cluster verify-soak sets TRACKER_PATH in both ledger branches (found $n)"; fi
+n="$(grep -c '^ *TRACKER_PATH=' "$P2P")"
+if [ "$n" -ge 1 ]; then ok "p2p verify-soak sets TRACKER_PATH"; else bad "p2p verify-soak sets TRACKER_PATH (found $n)"; fi
+if grep -q 'snapshot_tip' "$P2P"; then ok "p2p verify-soak uses snapshot_tip"; else bad "p2p verify-soak uses snapshot_tip"; fi
 
 if [ "$FAILS" -ne 0 ]; then
     echo "$FAILS failure(s)"

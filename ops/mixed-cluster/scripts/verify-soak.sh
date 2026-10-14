@@ -303,6 +303,7 @@ if [ "$RUN_CERT" = "1" ]; then
         fi
         CERT_LEDGER_PATH="$CERT_PREFIX_CANDIDATE"
         BLOCK_PATH="${CERT_PREFIX_CANDIDATE}.block.sqlite"
+        TRACKER_PATH="${CERT_PREFIX_CANDIDATE}.tracker.sqlite"
         echo "==> cert cross-verify (Go-produced → Rust verifier), stride $STRIDE"
         echo "    ledger: $CERT_LEDGER_PATH (--cert-ledger override)"
     else
