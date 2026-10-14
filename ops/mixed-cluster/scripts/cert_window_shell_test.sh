@@ -120,6 +120,9 @@ resolve_cert_latest 1 500 x >/dev/null 2>&1
 check "non-numeric latest rejected" 2 "$?"
 resolve_cert_latest 1 "" 2 >/dev/null 2>&1
 check "unknown snapshot tip is an error, never silently unclamped" 2 "$?"
+resolve_cert_latest 5000 4000 1 >/dev/null 2>&1
+check "snapshot tip below --from-round is an error (no inverted range)" 2 "$?"
+
 
 # 7. issue #1821: with the raw-copy fallback the block file can be a round ahead
 # of the tracker file; the usable snapshot tip is the OLDER of the two.

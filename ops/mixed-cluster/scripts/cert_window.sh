@@ -92,6 +92,10 @@ resolve_cert_latest() {
         echo "error: cannot determine the snapshot's newest round for --cert-latest" >&2
         return 2
     fi
+    if [ "$tip" -lt "$frm" ]; then
+        echo "error: the snapshot's newest round ($tip) is below --from-round ($frm)" >&2
+        return 2
+    fi
     CERT_TO="$tip"
     CERT_FROM=$((tip - n + 1))
     if [ "$CERT_FROM" -lt "$frm" ]; then CERT_FROM="$frm"; fi

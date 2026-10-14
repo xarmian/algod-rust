@@ -74,6 +74,19 @@ class VerifyLoop(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--rust-account") + 1], "ACCT")
         self.assertEqual(cmd[cmd.index("--min-rust-vote-rounds") + 1], "1")
 
+    def test_setup_failure_is_not_retried(self):
+        # verify-soak exits 4 when the ledger snapshot cannot be taken: retrying
+        # for minutes cannot help, so fail fast.
+        calls = []
+
+        def runner(cmd):
+            calls.append(cmd)
+            return 4
+
+        n = lj.verify_latest("A", tries=12, runner=runner, outdir="/o", sleep=lambda s: None)
+        self.assertIsNone(n)
+        self.assertEqual(len(calls), 1)
+
     def test_gives_up_after_tries(self):
         n = lj.verify_latest("A", tries=3, runner=lambda c: 2, outdir="/o", sleep=lambda s: None)
         self.assertIsNone(n)
