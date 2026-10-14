@@ -110,6 +110,111 @@ extern "C" {
     pub(crate) fn falcon_inner_fpr_expm_p63(x: u64, ccs: u64) -> u64;
     pub(crate) static falcon_inner_fpr_gm_tab: [u64; 2048];
     pub(crate) static falcon_inner_fpr_p2_tab: [u64; 11];
+
+    // fft.c (`fpr *` = `u64 *` bit patterns under FALCON_FPEMU)
+    pub(crate) fn falcon_inner_FFT(f: *mut u64, logn: u32);
+    pub(crate) fn falcon_inner_iFFT(f: *mut u64, logn: u32);
+    pub(crate) fn falcon_inner_poly_add(a: *mut u64, b: *const u64, logn: u32);
+    pub(crate) fn falcon_inner_poly_sub(a: *mut u64, b: *const u64, logn: u32);
+    pub(crate) fn falcon_inner_poly_neg(a: *mut u64, logn: u32);
+    pub(crate) fn falcon_inner_poly_adj_fft(a: *mut u64, logn: u32);
+    pub(crate) fn falcon_inner_poly_mul_fft(a: *mut u64, b: *const u64, logn: u32);
+    pub(crate) fn falcon_inner_poly_muladj_fft(a: *mut u64, b: *const u64, logn: u32);
+    pub(crate) fn falcon_inner_poly_mulselfadj_fft(a: *mut u64, logn: u32);
+    pub(crate) fn falcon_inner_poly_mulconst(a: *mut u64, x: u64, logn: u32);
+    pub(crate) fn falcon_inner_poly_div_fft(a: *mut u64, b: *const u64, logn: u32);
+    pub(crate) fn falcon_inner_poly_invnorm2_fft(
+        d: *mut u64,
+        a: *const u64,
+        b: *const u64,
+        logn: u32,
+    );
+    pub(crate) fn falcon_inner_poly_add_muladj_fft(
+        d: *mut u64,
+        F: *const u64,
+        G: *const u64,
+        f: *const u64,
+        g: *const u64,
+        logn: u32,
+    );
+    pub(crate) fn falcon_inner_poly_mul_autoadj_fft(a: *mut u64, b: *const u64, logn: u32);
+    pub(crate) fn falcon_inner_poly_div_autoadj_fft(a: *mut u64, b: *const u64, logn: u32);
+    pub(crate) fn falcon_inner_poly_LDL_fft(
+        g00: *const u64,
+        g01: *mut u64,
+        g11: *mut u64,
+        logn: u32,
+    );
+    pub(crate) fn falcon_inner_poly_LDLmv_fft(
+        d11: *mut u64,
+        l10: *mut u64,
+        g00: *const u64,
+        g01: *const u64,
+        g11: *const u64,
+        logn: u32,
+    );
+    pub(crate) fn falcon_inner_poly_split_fft(f0: *mut u64, f1: *mut u64, f: *const u64, logn: u32);
+    pub(crate) fn falcon_inner_poly_merge_fft(
+        f: *mut u64,
+        f0: *const u64,
+        f1: *const u64,
+        logn: u32,
+    );
+
+    // vrfy.c
+    pub(crate) fn falcon_inner_mq_NTT(a: *mut u16, logn: u32);
+    pub(crate) fn falcon_inner_mq_iNTT(a: *mut u16, logn: u32);
+    pub(crate) fn falcon_inner_mq_poly_montymul_ntt(f: *mut u16, g: *const u16, logn: u32);
+    pub(crate) fn falcon_inner_mq_poly_sub(f: *mut u16, g: *const u16, logn: u32);
+    pub(crate) fn falcon_inner_mq_sub(x: u32, y: u32) -> u32;
+    pub(crate) fn falcon_inner_to_ntt_monty(h: *mut u16, logn: u32);
+    pub(crate) fn falcon_inner_verify_raw(
+        c0: *const u16,
+        s2: *const i16,
+        h: *const u16,
+        logn: u32,
+        tmp: *mut u8,
+    ) -> i32;
+    pub(crate) fn falcon_inner_compute_public(
+        h: *mut u16,
+        f: *const i8,
+        g: *const i8,
+        logn: u32,
+        tmp: *mut u8,
+    ) -> i32;
+    pub(crate) fn falcon_inner_complete_private(
+        G: *mut i8,
+        f: *const i8,
+        g: *const i8,
+        F: *const i8,
+        logn: u32,
+        tmp: *mut u8,
+    ) -> i32;
+    pub(crate) fn falcon_inner_is_invertible(s2: *const i16, logn: u32, tmp: *mut u8) -> i32;
+    pub(crate) fn falcon_inner_verify_recover(
+        h: *mut u16,
+        c0: *const u16,
+        s1: *const i16,
+        s2: *const i16,
+        logn: u32,
+        tmp: *mut u8,
+    ) -> i32;
+    pub(crate) fn falcon_inner_count_nttzero(sig: *const i16, logn: u32, tmp: *mut u8) -> i32;
+
+    // common.c
+    pub(crate) fn falcon_inner_hash_to_point_vartime(
+        sc: *mut CInnerShake256,
+        x: *mut u16,
+        logn: u32,
+    );
+    pub(crate) fn falcon_inner_hash_to_point_ct(
+        sc: *mut CInnerShake256,
+        x: *mut u16,
+        logn: u32,
+        tmp: *mut u8,
+    );
+    pub(crate) fn falcon_inner_is_short(s1: *const i16, s2: *const i16, logn: u32) -> i32;
+    pub(crate) fn falcon_inner_is_short_half(sqn: u32, s2: *const i16, logn: u32) -> i32;
 }
 
 /// `static inline` helpers re-exported by `falcon-c-test/shim_*.c`.

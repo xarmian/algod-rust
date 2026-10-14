@@ -52,6 +52,10 @@
 #![allow(dead_code)]
 
 pub(crate) mod codec;
+pub(crate) mod common;
+pub(crate) mod fft;
 pub(crate) mod fpr;
 pub(crate) mod fpr_tables;
+pub(crate) mod ntt_tables;
 pub(crate) mod shake256;
+pub(crate) mod vrfy;
