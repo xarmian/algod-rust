@@ -24,6 +24,10 @@
 //! byte-identical to the C it replaces (DIV-001). Compiled only for tests
 //! with the `c-backend` feature.
 
+// Which bindings a given feature set exercises varies (some are only used
+// by tests behind `c-internals-test`); they are declarations, not code.
+#![allow(dead_code)]
+
 use std::os::raw::c_void;
 
 use crate::backend::c::{shake256_init_prng_from_seed, Shake256Context};
