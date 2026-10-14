@@ -120,7 +120,7 @@ pub(crate) fn convert_compressed_to_ct(sig_ct: &mut [u8], sig_compressed: &[u8])
     if sig_compressed[0] != SIG_COMPRESSED_HEADER {
         return FALCON_ERR_BADSIG;
     }
-    let mut coeffs = vec![0i16; 1 << LOGN];
+    let mut coeffs = [0i16; 1 << LOGN];
     let v = comp_decode(&mut coeffs, LOGN, &sig_compressed[2..]);
     if v == 0 {
         return FALCON_ERR_SIZE;

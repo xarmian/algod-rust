@@ -1,0 +1,95 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: Falcon backend parity (Rust vs vendored C)
+
+# Phase 21 / DIV-001 (epic #1926, issue #1948). crates/core/algo-falcon ships
+# two interchangeable det1024 implementations -- the pure-Rust port (default)
+# and the vendored go-algorand C library -- and requires them to be
+# bit-identical. `tests/falcon_vectors.rs` pins both to a go-algorand-
+# generated corpus on every PR; `tests/backend_parity.rs` goes further by
+# feeding both backends the SAME inputs (many seeds, odd seed lengths, a
+# large verify-mutation differential, random bytes through the CT/salt
+# paths, malformed private keys) and requiring the whole observable result,
+# including error codes, to match. Verification decisions are consensus-
+# critical, so any single disagreement is a fork risk.
+#
+# Two budgets, same test binary, scaled by environment variables:
+#   pull_request (algo-falcon paths)  moderate  ~ a few minutes in --release
+#   schedule / workflow_dispatch      heavy     ~ tens of minutes in --release
+#
+# This is a separate workflow (not part of nightly-fuzz.yml) because that
+# workflow's failure handler opens "new proptest regression seeds" PRs, which
+# would misreport a parity failure.
+
+on:
+  pull_request:
+    paths:
+      - "crates/core/algo-falcon/**"
+      - ".github/workflows/falcon-parity.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/core/algo-falcon/**"
+      - ".github/workflows/falcon-parity.yml"
+  schedule:
+    - cron: "43 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "FALCON_PARITY_SEEDS"
+        default: "1200"
+      mutations:
+        description: "FALCON_PARITY_MUTATIONS"
+        default: "1500000"
+      random_sigs:
+        description: "FALCON_PARITY_RANDOM_SIGS"
+        default: "300000"
+
+concurrency:
+  group: falcon-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  parity:
+    name: Rust vs C backend parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: falcon-parity
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Choose the parity budget
+        run: |
+          set -euo pipefail
+          case "${{ github.event_name }}" in
+            pull_request|push)
+              echo "FALCON_PARITY_SEEDS=60" >> "$GITHUB_ENV"
+              echo "FALCON_PARITY_MUTATIONS=150000" >> "$GITHUB_ENV"
+              echo "FALCON_PARITY_RANDOM_SIGS=40000" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "FALCON_PARITY_SEEDS=${{ github.event.inputs.seeds || '1200' }}" >> "$GITHUB_ENV"
+              echo "FALCON_PARITY_MUTATIONS=${{ github.event.inputs.mutations || '1500000' }}" >> "$GITHUB_ENV"
+              echo "FALCON_PARITY_RANDOM_SIGS=${{ github.event.inputs.random_sigs || '300000' }}" >> "$GITHUB_ENV"
+              ;;
+          esac
+
+      - name: Backend parity (--release)
+        run: cargo test --release --locked -p algo-falcon --test backend_parity -- --nocapture
+
+      - name: Backend parity, per-module differential tests (--release)
+        run: cargo test --release --locked -p algo-falcon --features c-internals-test
