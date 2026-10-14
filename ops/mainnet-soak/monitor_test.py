@@ -1302,6 +1302,48 @@ class LagBeforeStallTest(unittest.TestCase):
         self.assertIn("Stall window", text)
 
 
+class TxPoolCountersTest(unittest.TestCase):
+    """Issue #1919: pool rejections of gossiped groups are logged at debug
+    (as in go), so the soak's log-line `gossip_tx_rejections` no longer sees
+    them; the node's own per-class counters are the durable record."""
+
+    TEXT = (
+        "# TYPE algod_transaction_messages_txpool_remember_err_tx_id counter\n"
+        "algod_transaction_messages_txpool_remember_err_tx_id 25864\n"
+        "algod_transaction_messages_txpool_remember_err_eval_generic 51157\n"
+        "algod_transaction_messages_remember 120\n"
+        "algod_rust_follow_block_apply_seconds_count 3\n"
+        "unrelated_metric 7\n"
+    )
+
+    def test_parse_tx_counters_keeps_only_the_transaction_message_series(self):
+        got = monitor.parse_tx_counters(self.TEXT)
+        self.assertEqual(
+            got,
+            {
+                "txpool_remember_err_tx_id": 25864.0,
+                "txpool_remember_err_eval_generic": 51157.0,
+                "remember": 120.0,
+            },
+        )
+        self.assertEqual(monitor.parse_tx_counters("nothing 1\n"), {})
+
+    def test_summary_reports_the_last_scrapes_tx_counters(self):
+        samples = [node_follow(1.0, 5, 5), node_follow(2.0, 6, 6)]
+        for i, s in enumerate(samples):
+            ft = {
+                "apply": {
+                    "buckets": [[0.001, 1]],
+                    "count": 1,
+                    "sum": 0.0005,
+                }
+            }
+            ft[monitor.TX_COUNTERS_KEY] = {"txpool_remember_err_tx_id": float(10 * (i + 1))}
+            s["follow_timing"] = ft
+        out = monitor.summarize(samples)["follow_block_timing"]
+        self.assertEqual(out["tx_pool_counters"], {"txpool_remember_err_tx_id": 20.0})
+
+
 class FollowTimingLeftoversTest(unittest.TestCase):
     """Issue #1761 follow-ups."""
 
