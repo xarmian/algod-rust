@@ -52,13 +52,13 @@ consensus-compatible. It exists for three readers:
 
 | ID | Title | Area | Status | Since | Wire / consensus impact | algod-rust files | Upstream files | Proof |
 |---|---|---|---|---|---|---|---|---|
-| DIV-001 | Falcon-1024 `det1024` implemented in pure Rust; vendored C kept as a runtime-selectable backend (`config.json` `FalconBackend`) | crypto / state proofs / PQ accounts / AVM `falcon_verify` | reserved | 2026-10-14 | none (bit-identical keys, signatures, verify decisions, CT conversion) | `crates/core/algo-falcon/`, `crates/node/algo-config/src/lib.rs` (`FalconBackend`), `bin/algod-rust/src/commands/node.rs`, `crates/tools/algokey-rust` | `crypto/falconWrapper.go`, module `github.com/algorand/falcon` v0.1.0 (`falcon.go`, `deterministic.c`, Pornin's reference C) | Go-generated vector corpus diffed in CI, per-function differential tests vs the vendored C, fuzz target (epic #1926) |
+| DIV-001 | Falcon-1024 `det1024` implemented in pure Rust; vendored C kept as a runtime-selectable backend (`config.json` `FalconBackend`) | crypto / state proofs / PQ accounts / AVM `falcon_verify` | in-progress | 2026-10-14 | none (bit-identical keys, signatures, verify decisions, CT conversion) | `crates/core/algo-falcon/`, `crates/node/algo-config/src/lib.rs` (`FalconBackend`), `bin/algod-rust/src/commands/node.rs`, `crates/tools/algokey-rust` | `crypto/falconWrapper.go`, module `github.com/algorand/falcon` v0.1.0 (`falcon.go`, `deterministic.c`, Pornin's reference C) | Go-generated vector corpus diffed in CI, per-function differential tests vs the vendored C, fuzz target (epic #1926) |
 
 ## Entries
 
 ### DIV-001 — Falcon-1024 `det1024` in pure Rust, C kept as a selectable backend
 
-**Status:** reserved — tracked by epic
+**Status:** in-progress — backend selector, config field and vector corpus landed; the Rust modules follow. Tracked by epic
 [#1926](https://github.com/xarmian/algod-rust/issues/1926) (Phase 21,
 `docs/PHASE21_PROPOSAL.md`). This section is filled in stage by stage; the
 final text lands with the close-out issue of that epic and the long-form

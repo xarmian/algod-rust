@@ -5,6 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# The vendored C library (falcon-c/, github.com/algorand/falcon v0.1.0) as a
+# runtime-selectable backend. On by default so `FalconBackend = "c"` works;
+# `--no-default-features` builds the pure-Rust crate without a C compiler
+# (DIV-001, docs/DIVERGENCES.md).
+default = ["c-backend"]
+c-backend = []
+
 [dependencies]
 
 [dev-dependencies]

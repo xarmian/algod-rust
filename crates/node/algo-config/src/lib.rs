@@ -1182,6 +1182,23 @@ static RUN_HOSTED: VersionedDefault<bool> = VersionedDefault::new(&[(3, || false
 static STORAGE_ENGINE: VersionedDefault<String> =
     VersionedDefault::new(&[(28, || "sqlite".to_string())]);
 
+/// **algod-rust-only** (no go-algorand equivalent; the first such field —
+/// see `docs/DIVERGENCES.md` `DIV-001`). Selects the Falcon-1024 `det1024`
+/// implementation: `"rust"` (the pure-Rust port) or `"c"` (the vendored
+/// `github.com/algorand/falcon` C library go-algorand itself links). The
+/// default is a literal, deliberately independent of cargo features:
+/// `"c"` while the Rust port is being landed in Phase 21, flipped to
+/// `"rust"` in stage 11 (#1937) once the port is proven bit-identical
+/// (operators who never set the field follow the flip, because a minimized
+/// `config.json` only stores non-default values). Applied once at startup by
+/// `bin/algod-rust`'s `apply_falcon_backend`; an unknown value, or `"c"` in
+/// a build without the C backend, is a startup error. Single version-0
+/// entry per the rust-only-field rule.
+///
+/// DIVERGENCE DIV-001: configuration selector for the Rust Falcon port.
+static FALCON_BACKEND: VersionedDefault<String> =
+    VersionedDefault::new(&[(0, || "c".to_string())]);
+
 /// Go: `SuggestedFeeBlockHistory int` `version[0]:"3"` (`localTemplate.go:234-235`,
 /// go's own comment: "SuggestedFeeBlockHistory is deprecated and unused").
 /// **Formally retired as a no-op** (issue #1149): deprecated-and-unused
@@ -2079,6 +2096,9 @@ fn default_run_hosted() -> bool {
 }
 fn default_storage_engine() -> String {
     STORAGE_ENGINE.at(LATEST_VERSION)
+}
+fn default_falcon_backend() -> String {
+    FALCON_BACKEND.at(LATEST_VERSION)
 }
 fn default_suggested_fee_block_history() -> i64 {
     SUGGESTED_FEE_BLOCK_HISTORY.at(LATEST_VERSION)
@@ -3027,6 +3047,11 @@ pub struct Local {
     #[serde(rename = "StorageEngine", default = "default_storage_engine")]
     pub storage_engine: String,
 
+    /// algod-rust-only: Falcon-1024 implementation selector (`"rust"` /
+    /// `"c"`) — see [`FALCON_BACKEND`]'s doc comment and `DIV-001`.
+    #[serde(rename = "FalconBackend", default = "default_falcon_backend")]
+    pub falcon_backend: String,
+
     /// Go: `SuggestedFeeBlockHistory`. **Formally retired as a no-op**
     /// (issue #1149) — deprecated-and-unused upstream too, see
     /// [`SUGGESTED_FEE_BLOCK_HISTORY`]'s doc comment.
@@ -3549,6 +3574,7 @@ impl Local {
             reconnect_time: RECONNECT_TIME.at(version),
             run_hosted: RUN_HOSTED.at(version),
             storage_engine: STORAGE_ENGINE.at(version),
+            falcon_backend: FALCON_BACKEND.at(version),
             suggested_fee_block_history: SUGGESTED_FEE_BLOCK_HISTORY.at(version),
             suggested_fee_sliding_window_size: SUGGESTED_FEE_SLIDING_WINDOW_SIZE.at(version),
             enable_assemble_stats: ENABLE_ASSEMBLE_STATS.at(version),
@@ -4051,6 +4077,7 @@ impl Local {
             migrate_field(&mut self.reconnect_time, &RECONNECT_TIME, cur, next);
             migrate_field(&mut self.run_hosted, &RUN_HOSTED, cur, next);
             migrate_field(&mut self.storage_engine, &STORAGE_ENGINE, cur, next);
+            migrate_field(&mut self.falcon_backend, &FALCON_BACKEND, cur, next);
             migrate_field(
                 &mut self.suggested_fee_block_history,
                 &SUGGESTED_FEE_BLOCK_HISTORY,
@@ -7145,6 +7172,32 @@ mod tests {
             Local::default_at_version(34).p2p_hybrid_incoming_connections_limit,
             1_200
         );
+    }
+
+    // --- FalconBackend (DIV-001, issue #1929) -----------------------------
+
+    /// The first algod-rust-only config field: defaults to `"c"` (flips to
+    /// `"rust"` in #1937), round-trips through JSON, and is absent from a
+    /// minimized save when unset.
+    #[test]
+    fn falcon_backend_defaults_to_c_and_round_trips() {
+        let cfg = Local::default();
+        assert_eq!(cfg.falcon_backend, "c");
+        assert_eq!(Local::default_at_version(0).falcon_backend, cfg.falcon_backend);
+        assert_eq!(Local::default_at_version(27).falcon_backend, cfg.falcon_backend);
+
+        let loaded = Local::load_from_str(r#"{"FalconBackend": "rust"}"#).expect("loads");
+        assert_eq!(loaded.falcon_backend, "rust");
+        let full: serde_json::Value =
+            serde_json::from_str(&loaded.to_json_full().expect("serializes")).unwrap();
+        assert_eq!(full["FalconBackend"], "rust");
+
+        let minimized = cfg.to_json_minimized().expect("serializes");
+        assert!(!minimized.contains("FalconBackend"), "{minimized}");
+        assert_eq!(crate::algocfg::get_property(&cfg, "FalconBackend").unwrap(), cfg.falcon_backend);
+        let mut edited = cfg.clone();
+        crate::algocfg::set_property(&mut edited, "FalconBackend", "rust").unwrap();
+        assert_eq!(edited.falcon_backend, "rust");
     }
 
     // --- config.json.example regression check (issue #1086) --------------

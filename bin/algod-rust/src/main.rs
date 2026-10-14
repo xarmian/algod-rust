@@ -22,6 +22,7 @@ mod cli;
 mod commands;
 mod config;
 mod dev_producer;
+mod falcon_backend;
 mod live_catchup;
 mod log_setup;
 mod node_interface_impl;
@@ -172,6 +173,7 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
                     }),
                     None => algo_config::Local::default(),
                 };
+                falcon_backend::apply_falcon_backend(&node_config)?;
                 // Catchpoint sync path.
                 let exit_code = commands::catchpoint_sync::run(
                     net_name,
@@ -375,6 +377,7 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
                 },
                 None => algo_config::Local::default(),
             };
+            falcon_backend::apply_falcon_backend(&node_config)?;
             // Go: `daemon/algod/server.go:172-200`'s FD-pressure connection-
             // limit rebalancing (`Local.AdjustConnectionLimits`, issue #949)
             // — must run before `network_opts.resolve`/`rest_opts` read
@@ -525,6 +528,7 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
                 },
                 None => algo_config::Local::default(),
             };
+            falcon_backend::apply_falcon_backend(&node_config)?;
             // Go: `daemon/algod/server.go:172-200`'s FD-pressure connection-
             // limit rebalancing (`Local.AdjustConnectionLimits`, issue #949)
             // — must run before `rest_opts`/`network_opts` below capture

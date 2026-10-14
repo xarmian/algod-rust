@@ -274,6 +274,7 @@ async fn run_start(
             algo_config::Local::default()
         }
     };
+    crate::falcon_backend::apply_falcon_backend(&file_config)?;
 
     // -----------------------------------------------------------------------
     // 2. Open the ledger (Go layout: <datadir>/<genesisID>/ledger.*), seeding
