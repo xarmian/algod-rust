@@ -50,6 +50,40 @@ probe_latest_file() {
     return 0
 }
 
+# Applied round recorded in a tracker snapshot (`acctrounds.acctbase`), or nothing.
+probe_tracker_round() {
+    local f="$1" out=""
+    [ -s "$f" ] || return 0
+    if command -v sqlite3 >/dev/null 2>&1; then
+        out="$(sqlite3 "$f" "SELECT rnd FROM acctrounds WHERE id='acctbase'" 2>/dev/null | tr -d '' || true)"
+    fi
+    if ! _is_round "$out" && command -v python3 >/dev/null 2>&1; then
+        out="$(python3 -c 'import sqlite3, sys; r = sqlite3.connect(sys.argv[1]).execute("SELECT rnd FROM acctrounds WHERE id=?", ("acctbase",)).fetchone(); print(r[0] if r else "")' "$f" 2>/dev/null | tr -d '' || true)"
+    fi
+    if _is_round "$out"; then
+        echo "$out"
+    fi
+    return 0
+}
+
+# The newest round a ledger snapshot can actually serve: the OLDER of the block
+# file's newest block and the tracker's applied round (the raw-copy fallback is
+# not atomic, so the block file can be a round ahead of the tracker). Nothing
+# if neither can be read.
+snapshot_tip() {
+    local blk trk
+    blk="$(probe_latest_file "$1")"
+    trk="$(probe_tracker_round "$2")"
+    if _is_round "$blk" && _is_round "$trk"; then
+        if [ "$blk" -lt "$trk" ]; then echo "$blk"; else echo "$trk"; fi
+    elif _is_round "$trk"; then
+        echo "$trk"
+    elif _is_round "$blk"; then
+        echo "$blk"
+    fi
+    return 0
+}
+
 # resolve_cert_latest <from> <snapshot_tip> <n>   (issue #1821)
 #
 # Clamp the cert pass to the NEWEST n rounds of the Rust snapshot (sets
