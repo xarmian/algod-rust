@@ -38,6 +38,11 @@
 //! This is the acceptance test for `DIV-001` (`docs/DIVERGENCES.md`): the
 //! pure-Rust port must pass it unchanged.
 
+// Runs against the default backend; until the Rust port is complete (#1937)
+// only a build with the C backend has one. From then on it runs for every
+// backend in `FalconBackend::all()`.
+#![cfg(feature = "c-backend")]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 

@@ -12,6 +12,10 @@ license.workspace = true
 # (DIV-001, docs/DIVERGENCES.md).
 default = ["c-backend"]
 c-backend = []
+# Test-only: also compiles falcon-c-test/shim_*.c, which re-export the C
+# library's `static` internals so the per-module differential tests in
+# src/rs/ can diff the Rust port against them. Never used by a release build.
+c-internals-test = ["c-backend"]
 
 [dependencies]
 
