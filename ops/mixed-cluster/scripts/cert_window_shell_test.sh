@@ -120,6 +120,59 @@ resolve_cert_latest 1 500 x >/dev/null 2>&1
 check "non-numeric latest rejected" 2 "$?"
 resolve_cert_latest 1 "" 2 >/dev/null 2>&1
 check "unknown snapshot tip is an error, never silently unclamped" 2 "$?"
+resolve_cert_latest 5000 4000 1 >/dev/null 2>&1
+check "snapshot tip below --from-round is an error (no inverted range)" 2 "$?"
+
+
+# 7. issue #1821: with the raw-copy fallback the block file can be a round ahead
+# of the tracker file; the usable snapshot tip is the OLDER of the two.
+TDB="$TMP/tracker.sqlite"
+python3 -c 'import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("CREATE TABLE acctrounds (id TEXT PRIMARY KEY, rnd INTEGER)")
+c.execute("INSERT INTO acctrounds VALUES (?, ?)", ("acctbase", 2701))
+c.commit()' "$TDB"
+check "probe_tracker_round reads acctbase" 2701 "$(probe_tracker_round "$TDB")"
+check "snapshot_tip is the older of block (2702) and tracker (2701)" 2701 "$(snapshot_tip "$DB" "$TDB")"
+check "snapshot_tip with no tracker path falls back to the block file" 2702 "$(snapshot_tip "$DB" "")"
+check "snapshot_tip with a given but missing tracker fails closed" "" "$(snapshot_tip "$DB" "$TMP/nope.sqlite" 2>/dev/null)"
+check "snapshot_tip with nothing is empty" "" "$(snapshot_tip "$TMP/nope.sqlite" "$TMP/nope2.sqlite")"
+# tracker AHEAD of the block file: the block round wins (still the older)
+TDB_AHEAD="$TMP/tracker_ahead.sqlite"
+python3 -c 'import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("CREATE TABLE acctrounds (id TEXT PRIMARY KEY, rnd INTEGER)")
+c.execute("INSERT INTO acctrounds VALUES (?, ?)", ("acctbase", 2703))
+c.commit()' "$TDB_AHEAD"
+check "snapshot_tip with the tracker ahead is the block round" 2702 "$(snapshot_tip "$DB" "$TDB_AHEAD")"
+# tracker file with NO acctbase row: falls back to the block round but warns
+TDB_EMPTY="$TMP/tracker_empty.sqlite"
+python3 -c 'import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("CREATE TABLE acctrounds (id TEXT PRIMARY KEY, rnd INTEGER)")
+c.commit()' "$TDB_EMPTY"
+err="$(snapshot_tip "$DB" "$TDB_EMPTY" 2>&1 >/dev/null)"
+case "$err" in *"cannot read the tracker snapshot"*) ok "unreadable tracker round is reported" ;; *) bad "unreadable tracker round is reported: '$err'" ;; esac
+out="$(snapshot_tip "$DB" "$TDB_EMPTY" 2>/dev/null)"; rc=$?
+check "unreadable tracker round fails closed (no block-round fallback)" "" "$out"
+snapshot_tip "$DB" "$TDB_EMPTY" >/dev/null 2>&1
+check "unreadable tracker round returns non-zero" 1 "$?"
+# the verify-soak wiring: the --cert-ledger override branch must set
+# TRACKER_PATH right after BLOCK_PATH (it used to leave it unset, #1917 review)
+P2P="$HERE/../../mixed-cluster-p2p/scripts/verify-soak.sh"
+for f in "$HERE/verify-soak.sh" "$P2P"; do
+    if grep -A2 'BLOCK_PATH="${CERT_PREFIX_CANDIDATE}.block.sqlite"' "$f" | grep -q 'TRACKER_PATH="${CERT_PREFIX_CANDIDATE}.tracker.sqlite"'; then
+        ok "$(basename "$(dirname "$(dirname "$f")")"): --cert-ledger branch sets TRACKER_PATH"
+    else
+        bad "$f: --cert-ledger branch must set TRACKER_PATH next to BLOCK_PATH"
+    fi
+done
+if grep -q 'snapshot_tip' "$P2P"; then ok "p2p verify-soak uses snapshot_tip"; else bad "p2p verify-soak uses snapshot_tip"; fi
+
+check "cert_latest_normalize 00 -> 0" 0 "$(cert_latest_normalize 00)"
+check "cert_latest_normalize 007 -> 7" 7 "$(cert_latest_normalize 007)"
+check "cert_latest_normalize leaves non-numeric alone" abc "$(cert_latest_normalize abc)"
+check "cert_latest_normalize empty stays empty" "" "$(cert_latest_normalize "")"
 
 if [ "$FAILS" -ne 0 ]; then
     echo "$FAILS failure(s)"

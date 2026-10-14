@@ -19,14 +19,17 @@ CERT_WINDOW_DIR="${CERT_WINDOW_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd
 
 _is_round() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 
-probe_earliest_file() {
-    local f="$1" out=""
+# Run one single-value SELECT against a (snapshot) database through the sqlite3
+# CLI, falling back to python's sqlite3 module; prints the value only when it is
+# a round number. Shared by every probe below so a fix lands everywhere.
+_probe_sql() {
+    local f="$1" sql="$2" out=""
     [ -s "$f" ] || return 0
     if command -v sqlite3 >/dev/null 2>&1; then
-        out="$(sqlite3 "$f" 'SELECT MIN(rnd) FROM blocks' 2>/dev/null | tr -d '\r' || true)"
+        out="$(sqlite3 "$f" "$sql" 2>/dev/null | tr -d '\r' || true)"
     fi
     if ! _is_round "$out" && command -v python3 >/dev/null 2>&1; then
-        out="$(python3 -c 'import sqlite3, sys; print(sqlite3.connect(sys.argv[1]).execute("SELECT MIN(rnd) FROM blocks").fetchone()[0])' "$f" 2>/dev/null | tr -d '\r' || true)"
+        out="$(python3 -c 'import sqlite3, sys; r = sqlite3.connect(sys.argv[1]).execute(sys.argv[2]).fetchone(); print(r[0] if r else "")' "$f" "$sql" 2>/dev/null | tr -d '\r' || true)"
     fi
     if _is_round "$out"; then
         echo "$out"
@@ -34,20 +37,46 @@ probe_earliest_file() {
     return 0
 }
 
-# Highest block round in a (snapshot) block database, or nothing (issue #1821).
-probe_latest_file() {
-    local f="$1" out=""
-    [ -s "$f" ] || return 0
-    if command -v sqlite3 >/dev/null 2>&1; then
-        out="$(sqlite3 "$f" 'SELECT MAX(rnd) FROM blocks' 2>/dev/null | tr -d '\r' || true)"
+# Lowest block round of a block database, or nothing (#1777).
+probe_earliest_file() { _probe_sql "$1" 'SELECT MIN(rnd) FROM blocks'; }
+
+# Highest block round in a (snapshot) block database, or nothing (#1821).
+probe_latest_file() { _probe_sql "$1" 'SELECT MAX(rnd) FROM blocks'; }
+
+# Applied round recorded in a tracker snapshot (`acctrounds.acctbase`), or nothing.
+probe_tracker_round() { _probe_sql "$1" "SELECT rnd FROM acctrounds WHERE id='acctbase'"; }
+
+# The newest round a ledger snapshot can actually serve: the OLDER of the block
+# file's newest block and the tracker's applied round (the raw-copy fallback is
+# not atomic, so the block file can be a round ahead of the tracker). Nothing
+# if neither can be read.
+snapshot_tip() {
+    local blk trk
+    blk="$(probe_latest_file "$1")"
+    trk="$(probe_tracker_round "${2:-}")"
+    # A tracker path that was GIVEN but whose applied round cannot be read
+    # (missing, empty, corrupt, no acctbase row) must NOT
+    # degrade to the (possibly newer) block round: fail closed so the caller's
+    # "cannot determine the snapshot's newest round" error fires.
+    if [ -n "${2:-}" ] && ! _is_round "$trk"; then
+        echo "error: cannot read the tracker snapshot's applied round ($2)" >&2
+        return 1
     fi
-    if ! _is_round "$out" && command -v python3 >/dev/null 2>&1; then
-        out="$(python3 -c 'import sqlite3, sys; print(sqlite3.connect(sys.argv[1]).execute("SELECT MAX(rnd) FROM blocks").fetchone()[0])' "$f" 2>/dev/null | tr -d '\r' || true)"
-    fi
-    if _is_round "$out"; then
-        echo "$out"
+    if _is_round "$blk" && _is_round "$trk"; then
+        if [ "$blk" -lt "$trk" ]; then echo "$blk"; else echo "$trk"; fi
+    elif _is_round "$trk"; then
+        echo "$trk"
+    elif _is_round "$blk"; then
+        echo "$blk"
     fi
     return 0
+}
+
+# Normalize a --cert-latest value: 00 / 000 -> 0 (so the literal-"0" guards in
+# the callers hold); anything non-numeric is returned unchanged and rejected
+# by resolve_cert_latest.
+cert_latest_normalize() {
+    if _is_round "${1:-}"; then echo $((10#$1)); else echo "${1:-}"; fi
 }
 
 # resolve_cert_latest <from> <snapshot_tip> <n>   (issue #1821)
@@ -68,6 +97,10 @@ resolve_cert_latest() {
     [ "$n" -eq 0 ] && return 0
     if ! _is_round "$tip"; then
         echo "error: cannot determine the snapshot's newest round for --cert-latest" >&2
+        return 2
+    fi
+    if [ "$tip" -lt "$frm" ]; then
+        echo "error: the snapshot's newest round ($tip) is below --from-round ($frm)" >&2
         return 2
     fi
     CERT_TO="$tip"

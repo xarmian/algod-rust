@@ -259,6 +259,7 @@ if [ "$RUN_CERT" = "1" ]; then
         CERT_LEDGER_PATH="$CERT_PREFIX_CANDIDATE"
         # So the earliest retained round is probed for the cert window (#1782).
         BLOCK_PATH="${CERT_PREFIX_CANDIDATE}.block.sqlite"
+        TRACKER_PATH="${CERT_PREFIX_CANDIDATE}.tracker.sqlite"
         echo "==> cert cross-verify (Go-produced → Rust verifier), stride $STRIDE"
         echo "    ledger: $CERT_LEDGER_PATH (--cert-ledger override)"
     else
@@ -337,9 +338,9 @@ if [ "$RUN_CERT" = "1" ]; then
     # Issue #1913 (P2P analogue of #1821): --cert-latest N clamps the pass to the
     # newest N rounds of the snapshot just taken, since onlineaccounts history is
     # only retained back to ~tip-320 (go-algorand does the same).
+    CERT_LATEST="$(cert_latest_normalize "$CERT_LATEST")"
     if [ "$CERT_LATEST" != "0" ]; then
-        CERT_TO="$TO_ROUND"
-        resolve_cert_latest "$FROM_ROUND" "$(probe_latest_file "${BLOCK_PATH:-}")" "$CERT_LATEST" || exit 2
+        resolve_cert_latest "$FROM_ROUND" "$(snapshot_tip "${BLOCK_PATH:-}" "${TRACKER_PATH:-}")" "$CERT_LATEST" || exit 2
     else
         resolve_cert_window "$FROM_ROUND" "$TO_ROUND" "${RUST_EARLIEST:-}" || exit 2
         CERT_TO="$TO_ROUND"

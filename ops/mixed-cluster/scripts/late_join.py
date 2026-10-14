@@ -37,6 +37,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+# verify-soak.sh exit code for "cannot snapshot the Rust ledger" (not retryable)
+SETUP_FAILURE_RC = 4
 COMMITTED_RE = re.compile(r"committed in round (\d+)")
 
 
@@ -103,8 +105,12 @@ def verify_latest(account, tries, runner, outdir, sleep=time.sleep, wait_s=20):
         "--out-dir", outdir.replace("\\", "/"),
     ]
     for attempt in range(1, tries + 1):
-        if runner(cmd) == 0:
+        rc = runner(cmd)
+        if rc == 0:
             return attempt
+        if rc == SETUP_FAILURE_RC:
+            # the ledger snapshot / tooling is broken; waiting cannot fix it
+            return None
         sleep(wait_s)
     return None
 
