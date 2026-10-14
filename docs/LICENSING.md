@@ -231,7 +231,12 @@ during this audit. The surrounding Rust FFI integration
 (`crates/core/algo-falcon/src/lib.rs`, `build.rs`) is classified AGPL as
 part of algod-rust's consensus-critical integration work (see
 `docs/LICENSING_AUDIT.md`), but the vendored C library it wraps keeps
-its own, narrower MIT license standing on its own.
+its own, narrower MIT license standing on its own. Since Phase 21
+(`DIV-001`, `docs/DIVERGENCES.md`) the crate also contains a pure-Rust port
+of that C under `src/rs/`: AGPL as part of algod-rust, with each file's
+module doc attributing the Falcon Project / Algorand, Inc. MIT sources it
+ports and pointing at `falcon-c/LICENSE` — the same localized-attribution
+pattern as `sumhash.rs` and the poseidon2 opcode.
 
 ### Nothing else identified
 

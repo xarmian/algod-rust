@@ -23,6 +23,11 @@ c-internals-test = ["c-backend"]
 sha2.workspace = true
 hex.workspace = true
 serde_json.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "falcon_bench"
+harness = false
 
 [build-dependencies]
 cc = "1"

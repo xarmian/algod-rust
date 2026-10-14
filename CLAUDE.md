@@ -250,7 +250,14 @@ Full Rust reimplementation of go-algorand — a production-grade Algorand node. 
   register row + section, the markers, and a green checker. Wire/consensus
   impact must be `none` and the section must say how that is proven.
   The first entry is `DIV-001`, the pure-Rust Falcon-1024 `det1024` port
-  (Phase 21, epic #1926, `docs/PHASE21_PROPOSAL.md`).
+  (Phase 21, epic #1926, `docs/PHASE21_PROPOSAL.md`,
+  `docs/falcon/FALCON_RUST_PORT.md`): `crates/core/algo-falcon/src/rs/` is
+  the default backend, the vendored C stays behind the default-on
+  `c-backend` feature and `config.json` `FalconBackend: "c"`, and
+  `cargo test -p algo-falcon --features c-internals-test` runs the
+  per-module differential tests against the C. Any change to Falcon
+  behaviour must keep `tests/fixtures/falcon/vectors.jsonl` (go-algorand
+  generated, CI-diffed) passing on every backend.
 
 ## Phase 17 test-parity tracking (docs/PHASE17_TEST_PARITY.md)
 
