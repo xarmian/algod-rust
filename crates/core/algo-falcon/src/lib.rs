@@ -63,6 +63,9 @@ use std::str::FromStr;
 use std::sync::OnceLock;
 
 mod backend;
+#[cfg(all(test, feature = "c-backend"))]
+mod c_internals;
+mod rs;
 
 // ---------------------------------------------------------------------------
 // Constants (computed from the C macros with logn=10)

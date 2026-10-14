@@ -42,12 +42,24 @@ const SHAKE256_CONTEXT_SIZE: usize = 26;
 /// The `[u64; 26]` layout comes from `falcon.h` line 402:
 /// `uint64_t opaque_contents[26]` (208 bytes total).
 #[repr(C)]
-struct Shake256Context {
+pub(crate) struct Shake256Context {
     opaque_contents: [u64; SHAKE256_CONTEXT_SIZE],
 }
 
+impl Shake256Context {
+    pub(crate) fn zeroed() -> Self {
+        Shake256Context {
+            opaque_contents: [0u64; SHAKE256_CONTEXT_SIZE],
+        }
+    }
+}
+
 extern "C" {
-    fn shake256_init_prng_from_seed(sc: *mut Shake256Context, seed: *const c_void, seed_len: usize);
+    pub(crate) fn shake256_init_prng_from_seed(
+        sc: *mut Shake256Context,
+        seed: *const c_void,
+        seed_len: usize,
+    );
 
     fn falcon_det1024_keygen(
         rng: *mut Shake256Context,
@@ -106,9 +118,7 @@ pub(crate) fn verify(pubkey: &[u8], sig: &[u8], data: &[u8]) -> Result<bool, Fal
 
 /// `shake256_init_prng_from_seed` + `falcon_det1024_keygen`.
 pub(crate) fn keygen(seed: &[u8]) -> Result<(Vec<u8>, Vec<u8>), FalconError> {
-    let mut rng = Shake256Context {
-        opaque_contents: [0u64; SHAKE256_CONTEXT_SIZE],
-    };
+    let mut rng = Shake256Context::zeroed();
     unsafe {
         shake256_init_prng_from_seed(&mut rng, ptr_or_null(seed), seed.len());
     }
