@@ -1566,6 +1566,32 @@ impl MessageHandler for TxTagHandler {
     }
 }
 
+/// One-line description of a gossiped group for debug logs: per member the
+/// type, sender / declared authorizer / rekey target (last 6 chars of the
+/// base32 addresses), amount and fee. Only used for diagnostics.
+fn summarize_group(group: &[SignedTransaction]) -> String {
+    fn short(a: &algo_types::Address) -> String {
+        let s = a.to_string();
+        s[s.len().saturating_sub(6)..].to_string()
+    }
+    let parts: Vec<String> = group
+        .iter()
+        .map(|stx| {
+            let t = &stx.txn;
+            format!(
+                "{}(snd={} auth={} rekey={} amt={} fee={})",
+                t.txn_type.as_str(),
+                short(&t.sender),
+                stx.auth_addr.as_ref().map_or("-".to_string(), short),
+                t.rekey_to.as_ref().map_or("-".to_string(), short),
+                t.amount,
+                t.fee,
+            )
+        })
+        .collect();
+    format!("[{}]", parts.join(", "))
+}
+
 /// Submit `group` to `pool` on the blocking executor and apply the
 /// success/failure post-processing every ingestion path shares: record
 /// `txids` in `seen` on success, or penalize `app_limiter` (if attached)
@@ -1602,6 +1628,10 @@ async fn ingest_group(
     // `appLimiter.penalizeEvalError(wi.unverifiedTxGroup, ...)` on a
     // `Remember` failure.
     let group_for_penalty = app_limiter.is_some().then(|| group.clone());
+    // Only built when debug logging is on (go logs every `Remember` failure
+    // at Debugf): a compact description of the group for diagnosing rejected
+    // gossip (issue #1919).
+    let group_summary = tracing::enabled!(tracing::Level::DEBUG).then(|| summarize_group(&group));
     // Cloned only when relay is attached: go re-encodes
     // (`reencode(verifiedTxGroup)`) and relays the group to other peers
     // only *after* `pool.Remember` succeeds — see the `Ok(Ok(()))` arm
@@ -1684,6 +1714,7 @@ async fn ingest_group(
             debug!(
                 sender = %sender,
                 error = %e,
+                group = group_summary.as_deref().unwrap_or(""),
                 "TxTagHandler: pool rejected inbound TX group",
             );
             // Issue #1134: mirrors go's `postProcessCheckedTxn` calling
