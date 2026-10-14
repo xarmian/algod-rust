@@ -31,8 +31,23 @@ OPERATIONS = [
 ]
 
 
+def find_dir(parent, name):
+    """Case-insensitive child lookup: Criterion keeps the case of the benchmark
+    id on Linux (`sign_32B`) but lower-cases it on Windows (`sign_32b`)."""
+    if not os.path.isdir(parent):
+        return None
+    for entry in os.listdir(parent):
+        if entry.lower() == name.lower():
+            return os.path.join(parent, entry)
+    return None
+
+
 def load(criterion_dir, op, backend):
-    path = os.path.join(criterion_dir, "falcon", op, backend, "new", "estimates.json")
+    op_dir = find_dir(os.path.join(criterion_dir, "falcon"), op)
+    backend_dir = find_dir(op_dir, backend) if op_dir else None
+    if backend_dir is None:
+        return None
+    path = os.path.join(backend_dir, "new", "estimates.json")
     if not os.path.isfile(path):
         return None
     with open(path, encoding="utf-8") as f:
