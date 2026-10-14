@@ -69,6 +69,14 @@ impl CPrng {
     }
 }
 
+/// `sampler_context` (`inner.h`): the PRNG plus `sigma_min` (an `fpr`, i.e.
+/// a u64 bit pattern under FALCON_FPEMU).
+#[repr(C)]
+pub(crate) struct CSamplerContext {
+    pub(crate) p: CPrng,
+    pub(crate) sigma_min: u64,
+}
+
 /// `inner_shake256_context` (`inner.h`): 25 lanes + the byte pointer.
 #[repr(C)]
 pub(crate) struct CInnerShake256 {
@@ -246,6 +254,21 @@ extern "C" {
     pub(crate) fn falcon_inner_prng_init(p: *mut CPrng, src: *mut CInnerShake256);
     pub(crate) fn falcon_inner_prng_refill(p: *mut CPrng);
     pub(crate) fn falcon_inner_prng_get_bytes(p: *mut CPrng, dst: *mut u8, len: usize);
+
+    // sign.c
+    pub(crate) fn falcon_inner_gaussian0_sampler(p: *mut CPrng) -> i32;
+    pub(crate) fn falcon_inner_sampler(ctx: *mut c_void, mu: u64, isigma: u64) -> i32;
+    pub(crate) fn falcon_inner_sign_dyn(
+        sig: *mut i16,
+        rng: *mut CInnerShake256,
+        f: *const i8,
+        g: *const i8,
+        F: *const i8,
+        G: *const i8,
+        hm: *const u16,
+        logn: u32,
+        tmp: *mut u8,
+    );
 
     // common.c
     pub(crate) fn falcon_inner_hash_to_point_vartime(
