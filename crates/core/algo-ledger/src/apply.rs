@@ -5286,9 +5286,10 @@ pub fn apply_axfer<L: crate::store_trait::LedgerStore>(
         });
     }
 
-    let asset_receiver = txn.asset_receiver.ok_or_else(|| AlgoError::Ledger {
-        message: "axfer: asset_receiver (arcv) is missing".to_string(),
-    })?;
+    // An omitted receiver IS the zero address (go `AssetTransfer`): a zero
+    // transfer to it is a no-op, so a close-out can carry only `AssetCloseTo`
+    // (issue #1943).
+    let asset_receiver = txn.asset_receiver.unwrap_or(Address::ZERO);
 
     let clawback_source = txn.asset_sender.filter(|a| !a.is_zero());
     let from_addr = clawback_source.unwrap_or(txn.sender);
@@ -8668,6 +8669,64 @@ mod tests {
         apply_axfer(&mut state, &txn, &consensus).unwrap();
         use crate::store_trait::LedgerStore;
         assert!(state.has_asset_holding(&user, 42));
+    }
+
+    /// Issue #1943: an asset close-out whose only meaningful field is
+    /// `AssetCloseTo` has a zero (omitted) receiver. go allows it
+    /// (`ledger/apply/asset.go`: "it's fine to have a zero transfer to an
+    /// all-zero address (e.g., when the only meaningful part of the
+    /// transaction is the close-to address)"); mainnet block 65981549 closes
+    /// out an app's holding this way through an inner `axfer`. algod-rust
+    /// failed it with "asset_receiver (arcv) is missing" and the node stalled.
+    #[test]
+    fn test_axfer_close_out_with_zero_receiver() {
+        use crate::store_trait::LedgerStore;
+        let creator = Address([1u8; 32]);
+        let holder = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(creator, 10_000_000), (holder, 10_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
+        create_asset_in_state(
+            &mut state,
+            &ctx,
+            creator,
+            42,
+            AssetParams {
+                total: 1_000,
+                manager: Some(creator),
+                ..Default::default()
+            },
+        );
+        // The holder owns 0 of the asset and closes the holding out to the
+        // creator, with NO receiver and NO amount.
+        state.asset_holdings.insert(
+            (holder, 42),
+            AssetHolding {
+                amount: 0,
+                frozen: false,
+            },
+        );
+        state
+            .get_or_default_account_mut(&holder)
+            .total_assets_opted_in = 1;
+        let txn = algo_types::Transaction {
+            txn_type: "axfer".into(),
+            sender: holder,
+            xaid: 42,
+            asset_receiver: None,
+            asset_close_to: Some(creator),
+            ..Default::default()
+        };
+        apply_axfer(&mut state, &txn, &ConsensusParams::default())
+            .expect("a zero-receiver close-out is valid in go");
+        assert!(!state.has_asset_holding(&holder, 42), "holding closed");
+        assert_eq!(
+            state.get_or_default_account(&holder).total_assets_opted_in,
+            0
+        );
     }
 
     #[test]
