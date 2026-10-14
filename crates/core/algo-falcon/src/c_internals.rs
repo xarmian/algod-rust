@@ -28,6 +28,43 @@ use std::os::raw::c_void;
 
 use crate::backend::c::{shake256_init_prng_from_seed, Shake256Context};
 
+/// `prng` (`inner.h`): the 512-byte ChaCha20 output buffer, the read
+/// pointer, the 256-byte state area and the (unused) type field. The two
+/// byte arrays are unions with a `u64` in C, hence 8-byte alignment.
+#[repr(C)]
+pub(crate) struct CPrng {
+    buf: Aligned512,
+    ptr: usize,
+    state: Aligned256,
+    typ: i32,
+}
+
+#[repr(C, align(8))]
+pub(crate) struct Aligned512([u8; 512]);
+#[repr(C, align(8))]
+pub(crate) struct Aligned256([u8; 256]);
+
+impl CPrng {
+    pub(crate) fn init(src: &mut CInnerShake256) -> Self {
+        let mut p = CPrng {
+            buf: Aligned512([0u8; 512]),
+            ptr: 0,
+            state: Aligned256([0u8; 256]),
+            typ: 0,
+        };
+        unsafe { falcon_inner_prng_init(&mut p, src) };
+        p
+    }
+
+    pub(crate) fn buf(&self) -> &[u8; 512] {
+        &self.buf.0
+    }
+
+    pub(crate) fn state(&self) -> &[u8; 256] {
+        &self.state.0
+    }
+}
+
 /// `inner_shake256_context` (`inner.h`): 25 lanes + the byte pointer.
 #[repr(C)]
 pub(crate) struct CInnerShake256 {
@@ -201,6 +238,11 @@ extern "C" {
     ) -> i32;
     pub(crate) fn falcon_inner_count_nttzero(sig: *const i16, logn: u32, tmp: *mut u8) -> i32;
 
+    // rng.c
+    pub(crate) fn falcon_inner_prng_init(p: *mut CPrng, src: *mut CInnerShake256);
+    pub(crate) fn falcon_inner_prng_refill(p: *mut CPrng);
+    pub(crate) fn falcon_inner_prng_get_bytes(p: *mut CPrng, dst: *mut u8, len: usize);
+
     // common.c
     pub(crate) fn falcon_inner_hash_to_point_vartime(
         sc: *mut CInnerShake256,
@@ -232,6 +274,9 @@ pub(crate) mod shim {
         pub(crate) fn falcon_shim_x_fpr_sub(x: u64, y: u64) -> u64;
         pub(crate) fn falcon_shim_x_fpr_sqr(x: u64) -> u64;
         pub(crate) fn falcon_shim_x_fpr_inv(x: u64) -> u64;
+
+        pub(crate) fn falcon_shim_x_prng_get_u64(p: *mut super::CPrng) -> u64;
+        pub(crate) fn falcon_shim_x_prng_get_u8(p: *mut super::CPrng) -> u32;
     }
 }
 

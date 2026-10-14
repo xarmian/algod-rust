@@ -57,5 +57,6 @@ pub(crate) mod fft;
 pub(crate) mod fpr;
 pub(crate) mod fpr_tables;
 pub(crate) mod ntt_tables;
+pub(crate) mod rng;
 pub(crate) mod shake256;
 pub(crate) mod vrfy;
