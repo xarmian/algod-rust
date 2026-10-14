@@ -121,6 +121,19 @@ check "non-numeric latest rejected" 2 "$?"
 resolve_cert_latest 1 "" 2 >/dev/null 2>&1
 check "unknown snapshot tip is an error, never silently unclamped" 2 "$?"
 
+# 7. issue #1821: with the raw-copy fallback the block file can be a round ahead
+# of the tracker file; the usable snapshot tip is the OLDER of the two.
+TDB="$TMP/tracker.sqlite"
+python3 -c 'import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("CREATE TABLE acctrounds (id TEXT PRIMARY KEY, rnd INTEGER)")
+c.execute("INSERT INTO acctrounds VALUES (?, ?)", ("acctbase", 2701))
+c.commit()' "$TDB"
+check "probe_tracker_round reads acctbase" 2701 "$(probe_tracker_round "$TDB")"
+check "snapshot_tip is the older of block (2702) and tracker (2701)" 2701 "$(snapshot_tip "$DB" "$TDB")"
+check "snapshot_tip without a tracker falls back to the block file" 2702 "$(snapshot_tip "$DB" "$TMP/nope.sqlite")"
+check "snapshot_tip with nothing is empty" "" "$(snapshot_tip "$TMP/nope.sqlite" "$TMP/nope2.sqlite")"
+
 if [ "$FAILS" -ne 0 ]; then
     echo "$FAILS failure(s)"
     exit 1
