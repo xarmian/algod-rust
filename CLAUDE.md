@@ -224,6 +224,34 @@ Full Rust reimplementation of go-algorand — a production-grade Algorand node. 
 
 - Do NOT chain test runs hoping for different results. If a test fails, diagnose the issue first.
 
+## Intended divergences from go-algorand (docs/DIVERGENCES.md)
+
+- `docs/DIVERGENCES.md` is the **single register of places where
+  algod-rust deliberately differs from go-algorand** (a different
+  implementation of the same algorithm, an algod-rust-only config field, a
+  different build/dependency choice) while staying wire- and
+  consensus-compatible. Each entry has a stable id (`DIV-001`, `DIV-002`,
+  ...), a summary-table row and a `### DIV-NNN` section written so that a
+  go-algorand maintainer can see exactly what changed and port it.
+- **Consult it in every parity sweep, `algod-version-upgrade` pass, Phase 17
+  test-parity audit, conformance investigation and code review.** A
+  registered divergence is intended: never file it as a bug, never "fix"
+  it back to the go-algorand shape, never classify its tests as parity
+  gaps. If an upstream change touches a registered area, re-verify that
+  entry's "How parity is proven" evidence instead.
+- Every code site that embodies a divergence carries a marker comment
+  `DIVERGENCE DIV-NNN: <one line>` (any comment style), so
+  `grep -rn "DIVERGENCE DIV-"` finds the code from the doc and the doc from
+  the code. `python3 scripts/check_divergences.py` (CI job
+  `divergence-register` in `license-compliance.yml`, and `make lint`)
+  asserts markers and register rows/sections match, ids are sequential, and
+  every non-`reserved` entry has at least one marker.
+- **Introducing a new deliberate difference** requires, in the same PR: a
+  register row + section, the markers, and a green checker. Wire/consensus
+  impact must be `none` and the section must say how that is proven.
+  The first entry is `DIV-001`, the pure-Rust Falcon-1024 `det1024` port
+  (Phase 21, epic #1926, `docs/PHASE21_PROPOSAL.md`).
+
 ## Phase 17 test-parity tracking (docs/PHASE17_TEST_PARITY.md)
 
 - `docs/PHASE17_TEST_PARITY.md` (index/aggregate table) and the 15 per-area

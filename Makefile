@@ -53,7 +53,11 @@ fmt-check:
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
 
-lint: fmt-check clippy
+divergences:
+	python3 scripts/check_divergences_test.py
+	python3 scripts/check_divergences.py
+
+lint: fmt-check clippy divergences
 
 deny:
 	cargo deny check

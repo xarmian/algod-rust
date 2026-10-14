@@ -18,6 +18,7 @@ Every issue goes through these nine steps, in order. Do not skip a step because 
 - Read `../go-algorand`'s real behavior for the relevant area before forming a hypothesis — this repo's bar is byte-level/behavioral parity with go-algorand v5.0.3-stable, not "something reasonable." Cite the specific go file/function once you have a root-cause theory.
 - Identify where to start reading in this repo, but treat it as a starting point, not a conclusion — don't anchor on the first suspicious function.
 - For consensus/ledger/network issues, decide up front whether a live multi-node repro is needed (`ops/mixed-cluster/`, `docker/scripts/bench-stress.sh`) to actually observe the bug, rather than guessing from code reading alone.
+- **Check `docs/DIVERGENCES.md` first.** If the issue's area is a registered intended divergence (`DIV-NNN`, see CLAUDE.md "Intended divergences"), the fix must keep that divergence (re-verify its proof instead of restoring the go-algorand shape), and if the fix itself introduces a new deliberate difference, the register row + section and `DIVERGENCE DIV-NNN:` markers are part of this PR (`python3 scripts/check_divergences.py` must stay green).
 
 ### 2. TDD: write a failing test first
 

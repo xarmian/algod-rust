@@ -486,6 +486,14 @@ The project does **not** attempt to:
 
 The goal is strict **protocol compatibility**.
 
+Strict compatibility is about the wire, the ledger and consensus — not
+about being a line-by-line translation. Where algod-rust deliberately
+differs in *how* something is implemented, built or configured (for
+example the pure-Rust Falcon-1024 port, `DIV-001`), the difference is
+recorded in `docs/DIVERGENCES.md` with a stable id, source markers, and
+the evidence that proves the wire/consensus result is unchanged; parity
+sweeps treat those entries as intended.
+
 ---
 
 # 8. Long‑Term Opportunities

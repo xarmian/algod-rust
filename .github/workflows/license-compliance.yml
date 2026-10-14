@@ -27,6 +27,10 @@ name: License Compliance
 #                          otherwise invisible until a live soak run fails.
 #                          scripts/check_ci_go_algorand_dir.py, pure PyYAML,
 #                          no build.
+#   divergence-register  - issue #1927: docs/DIVERGENCES.md (the register of
+#                          intended differences from go-algorand) and the
+#                          `DIVERGENCE DIV-NNN:` source markers stay in
+#                          sync. scripts/check_divergences.py, pure Python.
 
 on:
   pull_request:
@@ -109,3 +113,17 @@ jobs:
 
       - name: Check GO_ALGORAND_DIR wiring in Tier 2 workflow steps
         run: python3 scripts/check_ci_go_algorand_dir.py
+
+  divergence-register:
+    name: Divergence Register Consistency
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Check docs/DIVERGENCES.md against DIVERGENCE markers
+        run: |
+          python3 scripts/check_divergences_test.py
+          python3 scripts/check_divergences.py

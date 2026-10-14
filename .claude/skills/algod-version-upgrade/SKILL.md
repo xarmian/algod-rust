@@ -24,6 +24,8 @@ This is a large, multi-session effort. Work through the stages in order; stages 
 
 Goal: an exhaustive, classified list of behavioral changes. Two complementary passes:
 
+**Before either pass, read `docs/DIVERGENCES.md`** (the register of intended differences from go-algorand, see CLAUDE.md "Intended divergences"). An upstream change that touches a registered area (e.g. `DIV-001`: Falcon-1024 is implemented in Rust, `crypto/falconWrapper.go` / `github.com/algorand/falcon` changes map onto `crates/core/algo-falcon/src/rs/`) is classified like any other, but its sub-issue must re-verify the entry's "How parity is proven" evidence (regenerate the vector corpus, re-run the differential tests) rather than re-port the Go/C shape — and it must never be filed as "algod-rust diverges here" when the register already says so on purpose.
+
 **Pass A — merge-level history** (feature granularity, ≈ one entry per upstream PR):
 
 ```bash
