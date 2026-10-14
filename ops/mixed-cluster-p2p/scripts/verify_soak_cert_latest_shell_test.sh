@@ -56,7 +56,10 @@ export STUB_DIR="$TMP"
 python3 - "$TMP/snap" <<'EOF'
 import sqlite3, sys
 p = sys.argv[1]
-sqlite3.connect(p + ".tracker.sqlite").execute("CREATE TABLE t(x)").connection.commit()
+t = sqlite3.connect(p + ".tracker.sqlite")
+t.execute("CREATE TABLE acctrounds(id TEXT PRIMARY KEY, rnd INTEGER)")
+t.execute("INSERT INTO acctrounds VALUES ('acctbase', 500)")
+t.commit()
 c = sqlite3.connect(p + ".block.sqlite")
 c.execute("CREATE TABLE blocks(rnd INTEGER)")
 c.executemany("INSERT INTO blocks VALUES (?)", [(i,) for i in range(1, 501)])
@@ -93,6 +96,23 @@ case "$OUT" in *"CERT_LATEST=1 cert cross-verify covers 500..500"*) ok "latest 1
 run --cert-latest 3
 check "latest 3: from-round" 498 "$(arg_of --from-round)"
 check "latest 3: to-round" 500 "$(arg_of --to-round)"
+
+# 3b. Raw-copy snapshot race (#1917): the tracker is a round BEHIND the block
+# file, so the usable tip is the tracker's applied round, not the newest block.
+python3 - "$TMP/snap" <<'EOF2'
+import sqlite3, sys
+t = sqlite3.connect(sys.argv[1] + ".tracker.sqlite")
+t.execute("UPDATE acctrounds SET rnd = 499 WHERE id = 'acctbase'")
+t.commit()
+EOF2
+run --cert-latest 1
+check "tracker behind block: to-round = tracker round" 499 "$(arg_of --to-round)"
+python3 - "$TMP/snap" <<'EOF2'
+import sqlite3, sys
+t = sqlite3.connect(sys.argv[1] + ".tracker.sqlite")
+t.execute("UPDATE acctrounds SET rnd = 500 WHERE id = 'acctbase'")
+t.commit()
+EOF2
 
 # 4. CERT_LATEST env is equivalent to the flag.
 CERT_LATEST=2 run
