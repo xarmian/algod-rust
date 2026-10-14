@@ -46,14 +46,58 @@ extern "C" {
     fn shake256_extract(sc: *mut Shake256Context, out: *mut c_void, len: usize);
 
     // codec.c
-    pub(crate) fn falcon_inner_modq_encode(out: *mut u8, max_out_len: usize, x: *const u16, logn: u32) -> usize;
-    pub(crate) fn falcon_inner_modq_decode(x: *mut u16, logn: u32, input: *const u8, max_in_len: usize) -> usize;
-    pub(crate) fn falcon_inner_trim_i16_encode(out: *mut u8, max_out_len: usize, x: *const i16, logn: u32, bits: u32) -> usize;
-    pub(crate) fn falcon_inner_trim_i16_decode(x: *mut i16, logn: u32, bits: u32, input: *const u8, max_in_len: usize) -> usize;
-    pub(crate) fn falcon_inner_trim_i8_encode(out: *mut u8, max_out_len: usize, x: *const i8, logn: u32, bits: u32) -> usize;
-    pub(crate) fn falcon_inner_trim_i8_decode(x: *mut i8, logn: u32, bits: u32, input: *const u8, max_in_len: usize) -> usize;
-    pub(crate) fn falcon_inner_comp_encode(out: *mut u8, max_out_len: usize, x: *const i16, logn: u32) -> usize;
-    pub(crate) fn falcon_inner_comp_decode(x: *mut i16, logn: u32, input: *const u8, max_in_len: usize) -> usize;
+    pub(crate) fn falcon_inner_modq_encode(
+        out: *mut u8,
+        max_out_len: usize,
+        x: *const u16,
+        logn: u32,
+    ) -> usize;
+    pub(crate) fn falcon_inner_modq_decode(
+        x: *mut u16,
+        logn: u32,
+        input: *const u8,
+        max_in_len: usize,
+    ) -> usize;
+    pub(crate) fn falcon_inner_trim_i16_encode(
+        out: *mut u8,
+        max_out_len: usize,
+        x: *const i16,
+        logn: u32,
+        bits: u32,
+    ) -> usize;
+    pub(crate) fn falcon_inner_trim_i16_decode(
+        x: *mut i16,
+        logn: u32,
+        bits: u32,
+        input: *const u8,
+        max_in_len: usize,
+    ) -> usize;
+    pub(crate) fn falcon_inner_trim_i8_encode(
+        out: *mut u8,
+        max_out_len: usize,
+        x: *const i8,
+        logn: u32,
+        bits: u32,
+    ) -> usize;
+    pub(crate) fn falcon_inner_trim_i8_decode(
+        x: *mut i8,
+        logn: u32,
+        bits: u32,
+        input: *const u8,
+        max_in_len: usize,
+    ) -> usize;
+    pub(crate) fn falcon_inner_comp_encode(
+        out: *mut u8,
+        max_out_len: usize,
+        x: *const i16,
+        logn: u32,
+    ) -> usize;
+    pub(crate) fn falcon_inner_comp_decode(
+        x: *mut i16,
+        logn: u32,
+        input: *const u8,
+        max_in_len: usize,
+    ) -> usize;
     pub(crate) static falcon_inner_max_fg_bits: [u8; 11];
     pub(crate) static falcon_inner_max_FG_bits: [u8; 11];
     pub(crate) static falcon_inner_max_sig_bits: [u8; 11];
