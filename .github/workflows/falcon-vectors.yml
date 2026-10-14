@@ -82,9 +82,16 @@ jobs:
         run: |
           set -euo pipefail
           cd tools/falcon-vector-capture
-          go vet ./...
-          go run .
+          # -mod=mod: the tool's go.mod was seeded from tools/vrf-vector-capture
+          # on a machine without Go (#1928); let the toolchain tidy the module
+          # graph for this tool's own import set. The resulting go.mod/go.sum
+          # diff is printed below so it can be committed back verbatim.
+          go vet -mod=mod ./...
+          go run -mod=mod .
           cd "$GITHUB_WORKSPACE"
+          echo "::group::go.mod / go.sum changes made by -mod=mod (commit these back)"
+          git --no-pager diff -- tools/falcon-vector-capture/go.mod tools/falcon-vector-capture/go.sum || true
+          echo "::endgroup::"
           git diff --exit-code -- crates/core/algo-falcon/tests/fixtures/falcon/vectors.jsonl || {
             echo "::error::committed falcon vectors.jsonl differs from what go-algorand produces -- if the corpus definition changed, regenerate with 'cd tools/falcon-vector-capture && go run .' (or the Rust example) and commit; if it did not, the vendored C / Rust port and go-algorand disagree and that is a parity bug"
             exit 1
