@@ -40,6 +40,13 @@ class BodiesTest(unittest.TestCase):
         self.assertEqual(stxn["txn"]["type"], "pay")
 
 
+class KnownGapsTest(unittest.TestCase):
+    def test_known_gaps_name_real_cases_and_an_issue(self):
+        for name, why in sfp.KNOWN_GAPS.items():
+            self.assertIn(name, sfp.cases())
+            self.assertRegex(why, r"^#[0-9]+: ")
+
+
 class CompareTest(unittest.TestCase):
     GO = "At least one signature didn't pass verification"
 
