@@ -33,6 +33,8 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=ports.sh
+source "$HERE/ports.sh"  # PHASE6_HOST_PORT_BASE -> PHASE6_*_PORT (issue #1956)
 ROOT="$(cd "$HERE/.." && pwd)"
 
 NETROOT="$ROOT/netroot"
@@ -46,6 +48,17 @@ ALGOD_TOKEN="${ALGOD_TOKEN:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 # --data-dir` writes algod.token / algod.admin.token / algod.net there;
 # the netroot bind mount itself is read-only.
 RUST_DATA_DIR="$NETROOT/rust-node-4-data"
+
+# Fail before any of the bootstrap work below, naming the port and the
+# override, when a host port is already bound by something other than the
+# node's own (still running) container -- an AlgoKit localnet sits on
+# 4001/4002 by default (issue #1956).
+PORT_CHECK_NODES=(go-node-1 go-node-2 go-node-3 rust-node-4)
+if [ "${PHASE6_ENABLE_CATCHPOINT_INTEROP:-0}" = "1" ]; then
+    PORT_CHECK_NODES+=(go-node-5)
+fi
+phase6_check_cluster_ports_free "${PORT_CHECK_NODES[@]}"
+echo "==> host ports: base $PHASE6_HOST_PORT_BASE (go-node-1..3 on $PHASE6_GO1_PORT..$PHASE6_GO3_PORT, rust-node-4 on $PHASE6_RUST_PORT)"
 
 # Git Bash / MSYS rewrites both sides of a `docker run -v` argument: the
 # container path `/netroot` becomes `C:/Program Files/Git/netroot` and the
@@ -338,7 +351,7 @@ echo "==> waiting for go-node-1 to answer /v2/status"
 GENESIS_HASH=""
 for _ in $(seq 1 60); do
     PARAMS="$(curl -sf -H "X-Algo-API-Token: $ALGOD_TOKEN" \
-        http://127.0.0.1:4001/v2/transactions/params 2>/dev/null || true)"
+        "http://127.0.0.1:$PHASE6_GO1_PORT/v2/transactions/params" 2>/dev/null || true)"
     if [ -n "$PARAMS" ]; then
         GENESIS_HASH="$(python3 -c "
 import base64, json, sys
@@ -349,7 +362,7 @@ print(base64.b64decode(json.loads(sys.argv[1])['genesis-hash']).hex())
     sleep 2
 done
 if [ -z "$GENESIS_HASH" ]; then
-    echo "error: could not read the genesis hash from go-node-1 (port 4001)" >&2
+    echo "error: could not read the genesis hash from go-node-1 (port $PHASE6_GO1_PORT)" >&2
     echo "       check: docker logs phase6-go-node-1" >&2
     exit 1
 fi
@@ -359,6 +372,7 @@ echo "==> genesis hash: $GENESIS_HASH"
 cat > "$ENV_FILE" <<EOF
 PHASE6_GENESIS_ID=$GENESIS_ID
 PHASE6_GENESIS_HASH=$GENESIS_HASH
+PHASE6_HOST_PORT_BASE=$PHASE6_HOST_PORT_BASE
 EOF
 
 # PHASE6_SKIP_BUILD=1 uses whatever `algod-rust-phase6:local` already
