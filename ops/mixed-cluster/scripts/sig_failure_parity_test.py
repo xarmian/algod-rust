@@ -31,7 +31,8 @@ class BodiesTest(unittest.TestCase):
         self.assertEqual(set(cases), {"submit", "simulate_msgpack", "simulate_json",
                                       "submit_early", "submit_dead", "submit_bad_sig_and_early",
                                       "submit_low_fee", "submit_low_fee_and_early",
-                                      "submit_low_fee_and_dead", "submit_low_fee_bad_sig"})
+                                      "submit_low_fee_and_dead", "submit_low_fee_bad_sig",
+                                      "submit_wrong_genesis_hash"})
         for name, c in cases.items():
             self.assertTrue(c["path"].startswith("/v2/transactions"), name)
             self.assertTrue(c["body"], name)

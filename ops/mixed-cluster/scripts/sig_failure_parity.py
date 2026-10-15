@@ -72,12 +72,12 @@ def stxn_json():
     }
 
 
-def _signed_window_stxn(first_valid, last_valid, valid_signature=True, fee=1000):
+def _signed_window_stxn(first_valid, last_valid, valid_signature=True, fee=1000, genesis_hash=None):
     """A payment from SEED's account with the given window and fee, really signed (or not)."""
     snd = ed.public_key(SEED)
     txn = ufp._map([
         ("amt", ufp._uint(1000)), ("fee", ufp._uint(fee)), ("fv", ufp._uint(first_valid)),
-        ("gh", ufp._bin(bytes([3]) * 32)), ("lv", ufp._uint(last_valid)), ("rcv", ufp._bin(bytes([2]) * 32)),
+        ("gh", ufp._bin(genesis_hash or bytes([3]) * 32)), ("lv", ufp._uint(last_valid)), ("rcv", ufp._bin(bytes([2]) * 32)),
         ("snd", ufp._bin(snd)), ("type", ufp._s("pay")),
     ])
     sig = ed.sign(SEED, b"TX" + txn) if valid_signature else bytes([7]) * 64
@@ -89,13 +89,14 @@ def normalise(message):
     return re.sub(r"round \d+ outside", "round N outside", message)
 
 
-def window_cases(current_round=0):
+def window_cases(current_round=0, genesis_hash=None):
     """The validity-window cases: name -> (body, what go answers, after normalise()).
 
     `current_round` places the not-yet-valid window 1000 rounds ahead, so the
     cases stay valid on a cluster that has been running for a while.
     """
     fv, lv = current_round + 1000, current_round + 1900
+    gh = genesis_hash  # the cluster's real genesis hash, or a placeholder for offline tests
     msg = "TransactionPool.Remember: txn dead: round N outside of {}--{}"
     return {
         "submit_early": (_signed_window_stxn(fv, lv), msg.format(fv, lv)),
@@ -105,21 +106,26 @@ def window_cases(current_round=0):
         # must be at most 1000 rounds wide and cover the next round, or go calls the
         # transaction malformed first)
         "submit_low_fee": (
-            _signed_window_stxn(max(current_round, 1), current_round + 900, fee=1),
+            _signed_window_stxn(max(current_round, 1), current_round + 900, fee=1, genesis_hash=gh),
             "TransactionPool.Remember: txgroup with 1uA fees is less than 1mA (usage=1.000000 * base=1mA)",
         ),
         "submit_low_fee_and_early": (_signed_window_stxn(fv, lv, fee=1), msg.format(fv, lv)),
         "submit_low_fee_and_dead": (_signed_window_stxn(1, 2, fee=1), msg.format(1, 2)),
-        "submit_low_fee_bad_sig": (_signed_window_stxn(max(current_round, 1), current_round + 900, valid_signature=False, fee=1), GO_MESSAGE),
+        # go checks the genesis hash right after the window (BlockHeader.Alive), before the fees
+        "submit_wrong_genesis_hash": (
+            _signed_window_stxn(max(current_round, 1), current_round + 900, genesis_hash=bytes([3]) * 32),
+            "TransactionPool.Remember: tx.GenesisHash <" + base64.b32encode(bytes([3]) * 32).decode().rstrip("=") + "> does not match expected <GENESIS>",
+        ),
+        "submit_low_fee_bad_sig": (_signed_window_stxn(max(current_round, 1), current_round + 900, valid_signature=False, fee=1, genesis_hash=gh), GO_MESSAGE),
     }
 
 
-def cases(current_round=0):
+def cases(current_round=0, genesis_hash=None):
     """name -> {path, content_type, body}."""
     mp_request = ufp._map([("txn-groups", bytes([0x91]) + ufp._map([("txns", bytes([0x91]) + _stxn_msgpack())]))])
     window = {
         name: {"path": "/v2/transactions", "content_type": "application/x-binary", "body": body}
-        for name, (body, _) in window_cases(current_round).items()
+        for name, (body, _) in window_cases(current_round, genesis_hash).items()
     }
     return {
         **window,
@@ -131,9 +137,12 @@ def cases(current_round=0):
     }
 
 
-def expected_message(name, current_round=0):
-    window = window_cases(current_round)
-    return window[name][1] if name in window else GO_MESSAGE
+def expected_message(name, current_round=0, genesis_hash=None):
+    window = window_cases(current_round, genesis_hash)
+    message = window[name][1] if name in window else GO_MESSAGE
+    if genesis_hash is not None:
+        message = message.replace("<GENESIS>", "<" + base64.b32encode(genesis_hash).decode().rstrip("=") + ">")
+    return message
 
 
 def compare(name, go, rust):
@@ -144,6 +153,14 @@ def compare(name, go, rust):
     if g != r:
         problems.append("{}: message go={!r} rust={!r}".format(name, g, r))
     return problems
+
+
+def genesis_hash_of(node):
+    """The cluster's 32-byte genesis hash, from /v2/transactions/params."""
+    req = urllib.request.Request(
+        "http://127.0.0.1:{}/v2/transactions/params".format(ports.node_port(node)), headers={"X-Algo-API-Token": TOKEN})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return base64.b64decode(json.loads(r.read())["genesis-hash"])
 
 
 def wait_for_round(nodes, minimum, timeout=120):
@@ -188,13 +205,14 @@ def main(argv=None):
     if current is None:
         print("FAIL the cluster did not reach round 4")
         return 1
-    for name, case in sorted(cases(current).items()):
+    genesis = genesis_hash_of(a.go)
+    for name, case in sorted(cases(current, genesis).items()):
         if name in KNOWN_GAPS and not a.include_known_gaps:
             print("skip {} (known gap, {})".format(name, KNOWN_GAPS[name]))
             continue
         go, rust = post(a.go, case), post(a.rust, case)
         found = compare(name, go, rust)
-        want = expected_message(name, current)
+        want = expected_message(name, current, genesis)
         for who, answer in (("go", go), ("rust", rust)):
             if name in ("submit_early", "submit_dead", "submit_low_fee_and_early", "submit_low_fee_and_dead") \
                     and not DEAD_RE.match(ufp.message_of(answer[1])):
@@ -203,7 +221,7 @@ def main(argv=None):
             found.append("{}: go answered {!r}, expected {!r}".format(name, normalise(ufp.message_of(go[1])), want))
         print("{} {}".format("FAIL" if found else "ok  ", name), "; ".join(found))
         problems += found
-    print(json.dumps({"event": "sig_failure_parity", "ok": not problems, "cases": len([n for n in cases(current) if a.include_known_gaps or n not in KNOWN_GAPS]),
+    print(json.dumps({"event": "sig_failure_parity", "ok": not problems, "cases": len([n for n in cases(current, genesis) if a.include_known_gaps or n not in KNOWN_GAPS]),
                       "skipped": {} if a.include_known_gaps else KNOWN_GAPS, "problems": problems}))
     return 0 if not problems else 1
 
