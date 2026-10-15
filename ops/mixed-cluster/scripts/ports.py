@@ -15,6 +15,7 @@ ports. ``ports.sh`` is the shell twin of this module; ``docker-compose.yml``
 takes the per-node ``PHASE6_*_PORT`` variables the shell side exports.
 """
 import os
+import sys
 
 ENV_VAR = "PHASE6_HOST_PORT_BASE"
 DEFAULT_BASE = 4000
@@ -31,6 +32,7 @@ NODE_NUMBERS = {
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_ENV_FILE = os.path.join(os.path.dirname(_HERE), "netroot", ".phase6-env")
+ENV_FILE_VAR = "PHASE6_ENV_FILE"  # same path override ports.sh honours
 
 
 def parse_base(raw):
@@ -61,8 +63,11 @@ def _read_env_file(path):
 
 def host_port_base(environ=None, env_file=DEFAULT_ENV_FILE):
     """PHASE6_HOST_PORT_BASE from the environment, else from the env file
-    start.sh wrote, else DEFAULT_BASE."""
+    start.sh wrote (PHASE6_ENV_FILE overrides its path, as in ports.sh),
+    else DEFAULT_BASE."""
     environ = os.environ if environ is None else environ
+    if env_file is DEFAULT_ENV_FILE and environ.get(ENV_FILE_VAR):
+        env_file = environ[ENV_FILE_VAR]
     raw = environ.get(ENV_VAR) or _read_env_file(env_file)
     if raw is None:
         return DEFAULT_BASE
@@ -85,6 +90,17 @@ def nodes(names, base=None):
     """((name, port), ...) in the given order."""
     base = host_port_base() if base is None else base
     return tuple((name, base + NODE_NUMBERS[name]) for name in names)
+
+
+def table(names):
+    """nodes(names) for a checker's module-level table: an invalid base
+    (a hand-edited netroot/.phase6-env, a bad variable) is one clean
+    `error:` line on stderr and exit 2, not an import-time traceback."""
+    try:
+        return nodes(names)
+    except ValueError as e:
+        print("error: {}".format(e), file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":

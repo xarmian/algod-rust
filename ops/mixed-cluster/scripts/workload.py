@@ -63,7 +63,7 @@ DATA_DIR = "/algod/data"
 WORK_DIR = "/tmp/w"
 TOKEN = os.environ.get("ALGOD_TOKEN", "a" * 64)
 # name -> REST host port (docker-compose.yml, PHASE6_HOST_PORT_BASE; issue #1956)
-NODE_PORTS = {n: ports.node_port(n) for n in ("go-node-1", "go-node-2", "go-node-3", "rust-node-4")}
+NODE_PORTS = dict(ports.table(("go-node-1", "go-node-2", "go-node-3", "rust-node-4")))
 NEGATIVE_TARGETS = ("go-node-1", "rust-node-4")
 
 TXID_RE = re.compile(r"\b[A-Z2-7]{52}\b")

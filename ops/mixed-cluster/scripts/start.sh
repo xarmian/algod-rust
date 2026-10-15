@@ -49,6 +49,17 @@ ALGOD_TOKEN="${ALGOD_TOKEN:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 # the netroot bind mount itself is read-only.
 RUST_DATA_DIR="$NETROOT/rust-node-4-data"
 
+# Fail before any of the bootstrap work below, naming the port and the
+# override, when a host port is already bound by something other than the
+# node's own (still running) container -- an AlgoKit localnet sits on
+# 4001/4002 by default (issue #1956).
+PORT_CHECK_NODES=(go-node-1 go-node-2 go-node-3 rust-node-4)
+if [ "${PHASE6_ENABLE_CATCHPOINT_INTEROP:-0}" = "1" ]; then
+    PORT_CHECK_NODES+=(go-node-5)
+fi
+phase6_check_cluster_ports_free "${PORT_CHECK_NODES[@]}"
+echo "==> host ports: base $PHASE6_HOST_PORT_BASE (go-node-1..3 on $PHASE6_GO1_PORT..$PHASE6_GO3_PORT, rust-node-4 on $PHASE6_RUST_PORT)"
+
 # Git Bash / MSYS rewrites both sides of a `docker run -v` argument: the
 # container path `/netroot` becomes `C:/Program Files/Git/netroot` and the
 # host path stays an unusable `/c/...`. Emit a Windows-style host path and
@@ -333,21 +344,6 @@ fi
 cd "$ROOT"
 export PHASE6_GENESIS_ID="$GENESIS_ID"
 
-# Fail early, with the port and the override named, when a host port is
-# already bound by something that is not our own (still running) container
-# -- an AlgoKit localnet sits on 4001/4002 by default (issue #1956).
-running_containers="$(docker ps --format '{{.Names}}' 2>/dev/null || true)"
-ports_to_check=()
-for node in go-node-1 go-node-2 go-node-3 rust-node-4; do
-    if ! grep -qx "phase6-$node" <<<"$running_containers"; then
-        ports_to_check+=("$node=$(phase6_node_port "$node")")
-    fi
-done
-if [ "${#ports_to_check[@]}" -gt 0 ]; then
-    phase6_check_ports_free "${ports_to_check[@]}"
-fi
-
-echo "==> host ports: base $PHASE6_HOST_PORT_BASE (go-node-1..3 on $PHASE6_GO1_PORT..$PHASE6_GO3_PORT, rust-node-4 on $PHASE6_RUST_PORT)"
 echo "==> docker compose up -d go-node-1 go-node-2 go-node-3"
 docker compose up -d go-node-1 go-node-2 go-node-3
 

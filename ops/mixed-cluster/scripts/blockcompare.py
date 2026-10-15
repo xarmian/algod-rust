@@ -46,7 +46,7 @@ import ports  # noqa: E402
 
 TOKEN = os.environ.get("ALGOD_TOKEN", "a" * 64)
 # host ports from PHASE6_HOST_PORT_BASE (issue #1956), default 4001..4004
-NODES = ports.nodes(("go-node-1", "go-node-2", "go-node-3", "rust-node-4"))
+NODES = ports.table(("go-node-1", "go-node-2", "go-node-3", "rust-node-4"))
 REFERENCE = "go-node-1"
 
 

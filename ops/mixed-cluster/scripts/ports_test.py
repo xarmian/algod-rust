@@ -40,6 +40,20 @@ class HostPortBase(unittest.TestCase):
             self.assertEqual(
                 ports.host_port_base(environ={"PHASE6_HOST_PORT_BASE": "7000"}, env_file=f), 7000)
 
+    def test_leading_zeros_are_decimal(self):
+        # ports.sh normalises with $((10#...)); both sides must agree
+        self.assertEqual(
+            ports.host_port_base(environ={"PHASE6_HOST_PORT_BASE": "04000"}, env_file=None), 4000)
+
+    def test_env_file_path_override_matches_ports_sh(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "elsewhere.env")
+            with open(f, "w") as fh:
+                fh.write("PHASE6_HOST_PORT_BASE=6000" + chr(10))
+            self.assertEqual(ports.host_port_base(environ={"PHASE6_ENV_FILE": f}), 6000)
+            # an explicit env_file argument is not overridden
+            self.assertEqual(ports.host_port_base(environ={"PHASE6_ENV_FILE": f}, env_file=None), 4000)
+
     def test_missing_env_file_is_default(self):
         self.assertEqual(ports.host_port_base(environ={}, env_file="/nonexistent/.phase6-env"), 4000)
 
@@ -49,6 +63,19 @@ class HostPortBase(unittest.TestCase):
                 ports.host_port_base(environ={"PHASE6_HOST_PORT_BASE": bad}, env_file=None)
         self.assertEqual(ports.parse_base("65530"), 65530)
         self.assertEqual(ports.parse_base("1"), 1)
+
+
+class CliTable(unittest.TestCase):
+    def test_invalid_base_is_a_clean_error_not_a_traceback(self):
+        import subprocess
+        here = os.path.dirname(os.path.abspath(__file__))
+        env = dict(os.environ, PHASE6_HOST_PORT_BASE="65531")
+        for script in ("blockcompare.py", "stateproof_check.py", "workload.py", "metrics.py"):
+            p = subprocess.run([sys.executable, os.path.join(here, script), "--help"],
+                               env=env, capture_output=True, text=True)
+            self.assertEqual(p.returncode, 2, script)
+            self.assertIn("error: PHASE6_HOST_PORT_BASE='65531'", p.stderr, script)
+            self.assertNotIn("Traceback", p.stderr, script)
 
 
 class NodeTable(unittest.TestCase):

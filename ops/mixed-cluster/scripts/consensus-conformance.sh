@@ -270,6 +270,8 @@ if [ "$SKIP_START" != "1" ]; then
         echo "fatal: cluster did not start" >&2
         exit 1
     }
+    # the base start.sh used (netroot/.phase6-env was just rewritten)
+    source "$HERE/ports.sh"
 else
     echo "==> SKIP_START=1 — using the running cluster"
 fi

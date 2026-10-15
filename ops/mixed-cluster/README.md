@@ -559,11 +559,14 @@ to move the whole cluster — e.g. `PHASE6_HOST_PORT_BASE=5000` publishes
 go-node-1..3 on `5001..5003`, rust-node-4 on `5004` and the
 catchpoint-interop go-node-5 on `5005` — when another service (an AlgoKit
 localnet sits on 4001/4002 by default) owns the defaults (issue #1956).
-`start.sh` refuses to start, naming the port and the override, when a
-required port is already bound, and records the base it used in
+`start.sh` refuses to start -- before any bootstrap work, naming the port
+and the override -- when a required port is bound by anything other than
+that node's own running container, and records the base it used in
 `netroot/.phase6-env`, so every later script (`status.sh`, `verify-soak.sh`,
 the Python checkers) finds the running cluster without the variable being
-re-exported. `scripts/ports.sh` / `scripts/ports.py` are the single source
+re-exported. That file is part of the netroot: a purge (`stop.sh --purge`,
+which the soak entry points do first) resets the base to the default, and
+only a base given in the environment is passed down to `start.sh`. `scripts/ports.sh` / `scripts/ports.py` are the single source
 of the table; `docker-compose.yml` interpolates the per-node
 `PHASE6_GO1_PORT`, `PHASE6_GO2_PORT`, `PHASE6_GO3_PORT`, `PHASE6_RUST_PORT`
 and `PHASE6_GO5_PORT` variables `ports.sh` exports (the literal defaults

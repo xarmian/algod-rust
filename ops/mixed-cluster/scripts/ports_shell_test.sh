@@ -59,6 +59,23 @@ export PHASE6_HOST_PORT_BASE=7000
 source "$HERE/ports.sh"
 check "env var beats env file" 7001 "$PHASE6_GO1_PORT"
 
+# 3b. leading zeros are decimal (bash arithmetic would read 04000 as octal)
+export PHASE6_HOST_PORT_BASE=04000
+source "$HERE/ports.sh"
+check "leading-zero base is decimal" 4001 "$PHASE6_GO1_PORT"
+check "leading-zero base normalised" 4000 "$PHASE6_HOST_PORT_BASE"
+
+# 3c. only a base from the environment is exported to children; a file-derived
+# one is not, so a child start.sh after a purge does not inherit it
+unset PHASE6_HOST_PORT_BASE
+export PHASE6_ENV_FILE="$TMP/env"
+source "$HERE/ports.sh"
+check "file-derived base not exported" unset "$(bash -c 'echo "${PHASE6_HOST_PORT_BASE:-unset}"')"
+check "per-node ports exported regardless" 6001 "$(bash -c 'echo "$PHASE6_GO1_PORT"')"
+export PHASE6_HOST_PORT_BASE=7000
+source "$HERE/ports.sh"
+check "env base exported" 7000 "$(bash -c 'echo "${PHASE6_HOST_PORT_BASE:-unset}"')"
+
 # 4. invalid values are rejected (sourcing returns non-zero, message names the var)
 for bad_val in abc 0 65531 -5; do
     out="$(PHASE6_HOST_PORT_BASE="$bad_val" bash -c "source '$HERE/ports.sh'" 2>&1)"
@@ -89,6 +106,16 @@ check "bound port detected" 0 "$(phase6_port_in_use "$BUSY"; echo $?)"
 FREE="$(free_port)"
 check "free port not flagged" 1 "$(phase6_port_in_use "$FREE"; echo $?)"
 
+# 5b. an unusable python3 (the Windows Store alias stub exits 9009) must not
+# turn the probe into "everything is free": the /dev/tcp probe takes over
+mkdir -p "$TMP/stubbin"
+printf '#!/usr/bin/env bash
+exit 9009
+' > "$TMP/stubbin/python3"
+chmod +x "$TMP/stubbin/python3"
+check "bound port detected without a working python3" 0     "$(PATH="$TMP/stubbin:$PATH" phase6_port_in_use "$BUSY"; echo $?)"
+check "free port not flagged without a working python3" 1     "$(PATH="$TMP/stubbin:$PATH" phase6_port_in_use "$FREE"; echo $?)"
+
 # 6. phase6_check_ports_free: fails on the busy port, names it and the override
 out="$(phase6_check_ports_free "go-node-2=$BUSY" "rust-node-4=$FREE" 2>&1)"
 rc=$?
@@ -100,6 +127,33 @@ out="$(phase6_check_ports_free "go-node-2=$FREE" 2>&1)"
 rc=$?
 check "check_ports_free passes on free ports" 0 "$rc"
 check "no output on free ports" "" "$out"
+
+# 7. phase6_check_cluster_ports_free: the node's own container publishing the
+# port exempts it; a container on another port, or none, means a real probe
+mkdir -p "$TMP/fakedocker"
+cat > "$TMP/fakedocker/docker" <<'EOF'
+#!/usr/bin/env bash
+# docker port phase6-<node> 8080 -> $FAKE_PORT_<node-with-dashes-as-underscores>
+[ "$1" = "port" ] || exit 1
+var="FAKE_PORT_${2#phase6-}"; var="${var//-/_}"
+val="${!var:-}"
+[ -n "$val" ] || exit 1
+printf '127.0.0.1:%s\n[::]:%s\n' "$val" "$val"
+EOF
+chmod +x "$TMP/fakedocker/docker"
+export PHASE6_HOST_PORT_BASE="$((BUSY - 2))"   # go-node-2 lands on the busy port
+export PHASE6_ENV_FILE="$TMP/does-not-exist"
+source "$HERE/ports.sh"
+check "go-node-2 maps to the busy port" "$BUSY" "$PHASE6_GO2_PORT"
+out="$(PATH="$TMP/fakedocker:$PATH" FAKE_PORT_go_node_2="$BUSY" phase6_check_cluster_ports_free go-node-2 2>&1)"
+check "own container on that port is exempt" 0 "$?"
+check "no output when exempt" "" "$out"
+out="$(PATH="$TMP/fakedocker:$PATH" FAKE_PORT_go_node_2="$((BUSY + 1000))" phase6_check_cluster_ports_free go-node-2 2>&1)"
+check "own container on another base does not mask the conflict" 1 "$?"
+case "$out" in *"$BUSY"*go-node-2*) ok "conflict message names node and port" ;; *) bad "conflict message: $out" ;; esac
+out="$(PATH="$TMP/fakedocker:$PATH" phase6_check_cluster_ports_free go-node-2 2>&1)"
+check "no container -> probed -> conflict" 1 "$?"
+check "unknown node fails" 1 "$(phase6_check_cluster_ports_free no-such-node 2>/dev/null; echo $?)"
 
 echo
 if [ "$FAILS" -eq 0 ]; then

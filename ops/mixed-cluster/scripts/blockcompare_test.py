@@ -324,7 +324,8 @@ class RunLoopTest(unittest.TestCase):
         import types
         seen = []
         orig = (bc.node_round, bc.compare_round)
-        rounds = {4001: 5, 4002: 5, 4003: 6, 4004: None}
+        port = dict(bc.NODES)  # host ports follow PHASE6_HOST_PORT_BASE (issue #1956)
+        rounds = {port["go-node-1"]: 5, port["go-node-2"]: 5, port["go-node-3"]: 6, port["rust-node-4"]: None}
         bc.node_round = lambda port: rounds[port]
 
         def fake(rnd, **kw):

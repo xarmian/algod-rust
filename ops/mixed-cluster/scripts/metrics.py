@@ -67,8 +67,9 @@ import ports  # noqa: E402
 TOKEN = "a" * 64  # matches docker-compose.yml; harness is local-only.
 
 # host ports from PHASE6_HOST_PORT_BASE (issue #1956), default 4001..4004
+_PORTS = dict(ports.table(("go-node-1", "go-node-2", "go-node-3", "rust-node-4")))
 NODES_REST = [
-    {"name": n, "container": "phase6-" + n, "host": "127.0.0.1", "port": ports.node_port(n)}
+    {"name": n, "container": "phase6-" + n, "host": "127.0.0.1", "port": _PORTS[n]}
     for n in ("go-node-1", "go-node-2", "go-node-3")
 ]
 
@@ -81,7 +82,7 @@ NODES_NOREST = [
 # is what makes the Rust node's participation machine-readable instead of
 # log-scraped.
 NODES_PARTICIPATION = [
-    {"name": "rust-node-4", "host": "127.0.0.1", "port": ports.node_port("rust-node-4")},
+    {"name": "rust-node-4", "host": "127.0.0.1", "port": _PORTS["rust-node-4"]},
 ]
 
 # Best-effort log regex for the Rust node. The Rust relay today does not
