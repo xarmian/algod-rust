@@ -3289,14 +3289,20 @@ pub async fn simulate_transaction<N: NodeInterface>(
     // request carries `null` placeholders and each transaction's own msgpack
     // bytes travel alongside in `raw_txns`.
     use crate::simulate_strict::{parse_msgpack_request, MsgpackSimulate, GO_MSGPACK_REJECTION};
-    let (mut request, is_msgpack, raw_txns) = match parse_msgpack_request(&body) {
+    let (mut request, has_raw_txns, raw_txns) = match parse_msgpack_request(&body) {
         MsgpackSimulate::Decoded(d) => (d.request, true, d.raw_txns),
         MsgpackSimulate::Rejected => return error::bad_request(GO_MSGPACK_REJECTION),
-        MsgpackSimulate::NotMsgpack => match serde_json::from_slice::<models::SimulateRequest>(&body) {
-            Ok(req) => (req, false, Vec::new()),
-            Err(e) => {
-                return error::bad_request(format!("could not decode simulate request: {e}"));
-            }
+        // JSON: go's own JSON form (base64 bytes, address strings) goes
+        // through the same pipeline as msgpack (issue #1972); anything else
+        // keeps the older serde-form handling.
+        MsgpackSimulate::NotMsgpack => match crate::simulate_strict::parse_json_request(&body) {
+            Some(d) => (d.request, true, d.raw_txns),
+            None => match serde_json::from_slice::<models::SimulateRequest>(&body) {
+                Ok(req) => (req, false, Vec::new()),
+                Err(e) => {
+                    return error::bad_request(format!("could not decode simulate request: {e}"));
+                }
+            },
         },
     };
 
@@ -3320,15 +3326,15 @@ pub async fn simulate_transaction<N: NodeInterface>(
         }
     }
 
-    // Decode each serde_json::Value transaction to SignedTransaction.
-    // For msgpack requests, re-serialize each Value to msgpack bytes and decode
-    // with rmp_serde (serde_json::Value cannot represent msgpack binary data).
-    // For JSON requests, use serde_json::from_value directly.
+    // Decode each transaction to SignedTransaction. A msgpack body, and a JSON
+    // body in go's own JSON form, carry each transaction's msgpack bytes in
+    // `raw_txns` (a `serde_json::Value` cannot hold a msgpack binary); any other
+    // JSON body falls back to `serde_json::from_value` on the Rust serde form.
     let mut decoded_groups = Vec::with_capacity(request.txn_groups.len());
     for (i, group) in request.txn_groups.iter().enumerate() {
         let mut decoded_txns = Vec::with_capacity(group.txns.len());
         for (j, txn_val) in group.txns.iter().enumerate() {
-            let decode_result = if is_msgpack {
+            let decode_result = if has_raw_txns {
                 match raw_txns.get(i).and_then(|g| g.get(j)) {
                     Some(bytes) => rmp_serde::from_slice::<algo_types::SignedTransaction>(bytes)
                         .map_err(|e| e.to_string()),

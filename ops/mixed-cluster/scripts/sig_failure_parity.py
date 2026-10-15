@@ -34,7 +34,7 @@ import unknown_field_parity as ufp  # noqa: E402
 
 TOKEN = os.environ.get("ALGOD_TOKEN", "a" * 64)
 # Cases algod-rust cannot pass yet, with the issue that tracks them.
-KNOWN_GAPS = {"simulate_json": "#1972: go's JSON form of a SignedTxn is not decodable"}
+KNOWN_GAPS = {}
 GO_MESSAGE = "At least one signature didn't pass verification"
 # go's bookkeeping.TxnDeadError text, behind the pool's Remember frame; the
 # round is the node's pending block round, so it is normalised before comparing.

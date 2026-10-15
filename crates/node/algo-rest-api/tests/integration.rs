@@ -8291,6 +8291,61 @@ async fn simulate_msgpack_unknown_key_returns_gos_fixed_text() {
     assert_ne!(resp.status(), 400, "{}", resp.text().await.unwrap());
 }
 
+/// Issue #1972: a JSON simulate request in go's JSON form (base64 `sig`,
+/// checksummed address strings) decodes to the same transaction as its
+/// msgpack encoding; Rust's own serde form (numbers for bytes) still works.
+#[tokio::test]
+async fn simulate_json_in_gos_form_decodes_like_msgpack() {
+    use base64::Engine;
+    let stxn = make_test_signed_txn();
+    let node = MockNode::synced();
+    let log = node.simulate_log.clone();
+    let server = TestServer::start(node).await;
+
+    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    let addr = |a: &algo_types::Address| {
+        use sha2::{Digest, Sha512_256};
+        let mut raw = a.0.to_vec();
+        raw.extend_from_slice(&Sha512_256::digest(a.0)[28..32]);
+        data_encoding::BASE32_NOPAD.encode(&raw)
+    };
+    let go_json = serde_json::json!({
+        "txn-groups": [{"txns": [{
+            "sig": b64(&stxn.sig),
+            "txn": {
+                "type": "pay",
+                "snd": addr(&stxn.txn.sender),
+                "rcv": addr(&stxn.txn.receiver),
+                "amt": stxn.txn.amount, "fee": stxn.txn.fee,
+                "fv": stxn.txn.first_valid.0, "lv": stxn.txn.last_valid.0,
+                "gh": b64(&stxn.txn.genesis_hash),
+            }
+        }]}],
+        "round": 7,
+    });
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions/simulate"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/json")
+        .body(serde_json::to_vec(&go_json).unwrap())
+        .send()
+        .await
+        .unwrap();
+    // the mock has no simulate result (500), but the decode must have succeeded
+    assert_ne!(resp.status(), 400, "{}", resp.text().await.unwrap());
+
+    let seen = log.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].round, Some(7));
+    let got = &seen[0].decoded_txn_groups[0][0];
+    assert_eq!(got.sig, stxn.sig);
+    assert_eq!(got.txn.sender, stxn.txn.sender);
+    assert_eq!(got.txn.receiver, stxn.txn.receiver);
+    assert_eq!(got.txn.amount, stxn.txn.amount);
+    assert_eq!(got.txn.genesis_hash, stxn.txn.genesis_hash);
+}
+
 /// Issue #1968: a msgpack request carries binary addresses and signatures,
 /// which `serde_json::Value` cannot hold; the Rust node answered 400 "could
 /// not decode simulate request" while go decodes it. The msgpack and JSON
