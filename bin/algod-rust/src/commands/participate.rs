@@ -2062,7 +2062,7 @@ impl SimpleBlockEvaluator {
                     (balance_now - fee, stx.txn.amount, true)
                 };
                 let message =
-                    self.overspend_message(&txid, &sender, data_balance, tried, after_fee, balance_now);
+                    self.overspend_message(&txid, &sender, data_balance, tried, after_fee, balance_now, already_spent > 0);
                 return Err(algo_error::AlgoError::Rejected {
                     source: None,
                     message,
@@ -2107,9 +2107,16 @@ impl SimpleBlockEvaluator {
         tried: u64,
         after_fee: bool,
         balance_now: u64,
+        earlier_in_group: bool,
     ) -> String {
         let mut data = self.get_account_data(sender).unwrap_or_default();
-        if after_fee {
+        // go's cow already holds the sender when an earlier transaction of this
+        // group, or of an earlier group in the block, moved it: pending rewards
+        // were applied then, and a rekey is visible.
+        let touched = earlier_in_group || self.overlay.get_balance(sender).is_some();
+        let auth = self.expected_authorizer(sender);
+        data.auth_addr = if auth == *sender { None } else { Some(auth) };
+        if after_fee || touched {
             algo_ledger::apply_rewards(&mut data, self.hdr.rewards_level);
             data.micro_algos = data_balance;
         } else {
