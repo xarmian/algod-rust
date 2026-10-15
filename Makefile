@@ -795,6 +795,7 @@ consensus-cluster-analyzer: ## Unit-test the #470 soak-analyzer logic (no Docker
 	python3 $(PHASE6_CLUSTER)/scripts/blockcompare_test.py
 	python3 $(PHASE6_CLUSTER)/scripts/workload_test.py
 	python3 $(PHASE6_CLUSTER)/scripts/pq_evidence_test.py
+	python3 $(PHASE6_CLUSTER)/scripts/unknown_field_parity_test.py
 	python3 $(PHASE6_CLUSTER)/scripts/cert_window_test.py
 	python3 $(PHASE6_CLUSTER)/scripts/rust_config_merge_test.py
 	bash $(PHASE6_CLUSTER)/scripts/cert_window_shell_test.sh

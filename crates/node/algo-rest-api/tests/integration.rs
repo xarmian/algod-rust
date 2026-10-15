@@ -6586,9 +6586,14 @@ async fn raw_transaction_in_block_only_field_returns_400() {
         assert_eq!(resp.status(), 400, "{field}");
         let json: serde_json::Value = resp.json().await.unwrap();
         let msg = json["message"].as_str().unwrap();
+        // go-algorand v5.0.3-stable answers `msgpack decode error [pos N]: no
+        // matching struct field found when decoding stream map with key hgi`
+        // (captured live; issue #1962 corrected the wording of #1727).
         assert!(
-            msg.contains("could not decode transaction")
-                && msg.contains(&format!("Unknown field: {field}")),
+            msg.starts_with("msgpack decode error [pos ")
+                && msg.ends_with(&format!(
+                    "]: no matching struct field found when decoding stream map with key {field}"
+                )),
             "{msg}"
         );
     }
@@ -6615,7 +6620,70 @@ async fn raw_transaction_async_in_block_only_field_returns_400() {
     assert_eq!(resp.status(), 400);
     let json: serde_json::Value = resp.json().await.unwrap();
     let msg = json["message"].as_str().unwrap();
-    assert!(msg.contains("Unknown field: hgi"), "{msg}");
+    assert!(
+        msg.starts_with("msgpack decode error [pos ")
+            && msg.ends_with(
+                "]: no matching struct field found when decoding stream map with key hgi"
+            ),
+        "{msg}"
+    );
+}
+
+/// Issue #1962: a key the target struct lacks is a 400 with go's exact text and
+/// offset (captured from a go-algorand v5.0.3-stable node for these bytes: a
+/// one-entry map `{"zzz": 1}` is `[pos 5]`; the same key as the third entry of
+/// a second transaction in a group counts from the start of the whole body).
+#[tokio::test]
+async fn raw_transaction_unknown_field_returns_go_text_with_group_offset() {
+    let server = TestServer::start(MockNode::synced()).await;
+    let ok = encode_signed_txn_for_post(&make_test_signed_txn());
+    let bad: Vec<u8> = vec![0x81, 0xa3, b'z', b'z', b'z', 0x01];
+
+    for (body, pos) in [
+        (bad.clone(), 5usize),
+        ([ok.clone(), bad.clone()].concat(), ok.len() + 5),
+    ] {
+        let resp = server
+            .client
+            .post(server.url("/v2/transactions"))
+            .header("X-Algo-API-Token", &server.api_token)
+            .header("Content-Type", "application/x-binary")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let json: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            json["message"].as_str().unwrap(),
+            format!(
+                "msgpack decode error [pos {pos}]: no matching struct field found when decoding stream map with key zzz"
+            )
+        );
+    }
+}
+
+/// The strict mode must not stay on after a request: a later well-formed
+/// submit on the same worker thread is still accepted.
+#[tokio::test]
+async fn raw_transaction_strict_mode_does_not_leak_between_requests() {
+    let server = TestServer::start(MockNode::synced()).await;
+    let bad: Vec<u8> = vec![0x81, 0xa3, b'z', b'z', b'z', 0x01];
+    let ok = encode_signed_txn_for_post(&make_test_signed_txn());
+    for _ in 0..3 {
+        for (body, status) in [(bad.clone(), 400), (ok.clone(), 200)] {
+            let resp = server
+                .client
+                .post(server.url("/v2/transactions"))
+                .header("X-Algo-API-Token", &server.api_token)
+                .header("Content-Type", "application/x-binary")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), status);
+        }
+    }
 }
 
 #[tokio::test]

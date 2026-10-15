@@ -2620,6 +2620,52 @@ pub struct RawTransactionParams {
     pub skip_pq_address_check: Option<bool>,
 }
 
+/// Decode a request body of concatenated msgpack `SignedTxn` objects the way
+/// go's `decodeTxGroup` does (`daemon/algod/api/server/v2/handlers.go:1172`):
+/// with `protocol.NewDecoder`, whose `ErrorIfNoField = true` turns a key the
+/// target struct lacks -- at any nesting level, and including the block-only
+/// `hgi`/`hgh`/ApplyData keys -- into a 400 reading
+/// `msgpack decode error [pos N]: no matching struct field found when
+/// decoding stream map with key K` (N counts from the start of the body).
+/// Synchronous on purpose: the strict mode is thread-local and must not be
+/// held across an `.await` (issues #1727, #1962).
+#[allow(clippy::result_large_err)]
+fn decode_tx_group(
+    body: &[u8],
+    max_group_size: usize,
+) -> Result<Vec<algo_types::SignedTransaction>, Response> {
+    let _strict = algo_types::strict_unknown_fields(body);
+    let mut txgroup: Vec<algo_types::SignedTransaction> = Vec::new();
+    let mut cursor = body;
+    while !cursor.is_empty() {
+        match algo_types::SignedTransaction::decode_from_reader(&mut cursor) {
+            Ok(stxn) => {
+                txgroup.push(stxn);
+                if txgroup.len() > max_group_size {
+                    return Err(error::bad_request(format!(
+                        "max group size is {}",
+                        max_group_size
+                    )));
+                }
+            }
+            Err(algo_error::AlgoError::Codec { source, .. })
+                if source.is::<algo_types::UnknownFieldError>() =>
+            {
+                return Err(error::bad_request(source.to_string()));
+            }
+            Err(e) => {
+                return Err(error::bad_request(format!(
+                    "could not decode transaction: {e}"
+                )));
+            }
+        }
+    }
+    if txgroup.is_empty() {
+        return Err(error::bad_request("empty txgroup"));
+    }
+    Ok(txgroup)
+}
+
 /// Submit a raw transaction (or transaction group) to the network.
 ///
 /// Accepts a msgpack-encoded `SignedTxn` (or concatenated group of SignedTxns)
@@ -2653,32 +2699,10 @@ pub async fn raw_transaction<N: NodeInterface>(
 
     // Decode concatenated msgpack SignedTxn objects
     let max_group_size = node.max_tx_group_size();
-    let mut txgroup: Vec<algo_types::SignedTransaction> = Vec::new();
-    let mut cursor = &body[..];
-
-    while !cursor.is_empty() {
-        match algo_types::SignedTransaction::decode_from_reader(&mut cursor) {
-            Ok(stxn) => {
-                txgroup.push(stxn);
-                if txgroup.len() > max_group_size {
-                    return error::bad_request(format!("max group size is {}", max_group_size));
-                }
-            }
-            Err(e) => {
-                return error::bad_request(format!("could not decode transaction: {e}"));
-            }
-        }
-    }
-
-    if txgroup.is_empty() {
-        return error::bad_request("empty txgroup");
-    }
-    // go's `SignedTxn` has no hgi/hgh; its decoder rejects them as unknown
-    // fields and `decodeTxGroup` returns that straight to `badRequest`
-    // (handlers.go:1172-1183, :1259-1262; issue #1727).
-    if let Err(e) = algo_types::genesis_restore::reject_in_block_flags(&txgroup) {
-        return in_block_flag_bad_request(e, None);
-    }
+    let txgroup = match decode_tx_group(&body, max_group_size) {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
 
     if let Err(e) =
         crate::pq_compliance::enforce_pq_compliance(&txgroup, params.skip_pq_address_check)
@@ -4827,32 +4851,10 @@ pub async fn raw_transaction_async<N: NodeInterface>(
     }
 
     let max_group_size = node.max_tx_group_size();
-    let mut txgroup: Vec<algo_types::SignedTransaction> = Vec::new();
-    let mut cursor = &body[..];
-
-    while !cursor.is_empty() {
-        match algo_types::SignedTransaction::decode_from_reader(&mut cursor) {
-            Ok(stxn) => {
-                txgroup.push(stxn);
-                if txgroup.len() > max_group_size {
-                    return error::bad_request(format!("max group size is {}", max_group_size));
-                }
-            }
-            Err(e) => {
-                return error::bad_request(format!("could not decode transaction: {e}"));
-            }
-        }
-    }
-
-    if txgroup.is_empty() {
-        return error::bad_request("empty txgroup");
-    }
-    // go's `SignedTxn` has no hgi/hgh; its decoder rejects them as unknown
-    // fields and `decodeTxGroup` returns that straight to `badRequest`
-    // (handlers.go:1172-1183, :1259-1262; issue #1727).
-    if let Err(e) = algo_types::genesis_restore::reject_in_block_flags(&txgroup) {
-        return in_block_flag_bad_request(e, None);
-    }
+    let txgroup = match decode_tx_group(&body, max_group_size) {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
 
     if let Err(e) =
         crate::pq_compliance::enforce_pq_compliance(&txgroup, params.skip_pq_address_check)
