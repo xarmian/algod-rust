@@ -407,6 +407,9 @@ fn classify_evaluator_message(msg: &str) -> PoolErrorTag {
         PoolErrorTag::TealErr
     } else if msg.contains("approval program rejected transaction") {
         PoolErrorTag::TealReject
+    } else if msg.contains(": overspend (account ") {
+        // go: `ledgercore.OverspendError` (the algo balance is short)
+        PoolErrorTag::Overspend
     } else if msg.contains("insufficient for transfer") {
         PoolErrorTag::AssetBalance
     } else if msg.contains("below minimum balance") {
@@ -472,6 +475,13 @@ mod tests {
         assert_eq!(
             classify_pool_error(&typed("transaction X: something else")),
             PoolErrorTag::EvalGeneric
+        );
+        // go tags an overspend `overspend`
+        assert_eq!(
+            classify_pool_error(&typed(
+                "transaction T: overspend (account A, data {AccountBaseData:{}}, tried to spend 1uA)"
+            )),
+            PoolErrorTag::Overspend
         );
         // go tags an insufficient group fee `fee`
         assert_eq!(

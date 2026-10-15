@@ -1835,26 +1835,6 @@ impl SimpleBlockEvaluator {
             }
         }
 
-        // 7. Group fee total check. Go's `CheckGroupFees`/`SummarizeFees`
-        // (`ledger/eval/eval.go`) run unconditionally for every top-level group
-        // -- a size-1 (ungrouped) submission included, which is where the pooled
-        // LogicSig-program surcharge is folded in (issue #703) -- and only after
-        // signatures (`verify.TxnGroup`) and the validity window (`Alive`), so a
-        // group wrong in several ways is reported in that order (issue #1976).
-        // The error is `TxGroupMalformedError`'s text, behind only the pool's
-        // `Remember` frame:
-        // `txgroup with 1uA fees is less than 1mA (usage=1.000000 * base=1mA)`.
-        {
-            let refs: Vec<&algo_types::SignedTransaction> = txgroup.iter().collect();
-            algo_validate::fee::check_submitted_group_fees(&refs, params).map_err(|message| {
-                algo_error::AlgoError::Rejected {
-                    source: None,
-                    message,
-                    class: algo_error::RejectClass::Other,
-                }
-            })?;
-        }
-
         // The returned group (txid computation, block assembly) has its genesis
         // fields restored from the header, exactly what the block's stripped
         // STIB form restores to (strip then restore sets `hgi`/`hgh` from
@@ -1877,7 +1857,31 @@ impl SimpleBlockEvaluator {
         &self,
         txgroup: &[algo_types::SignedTransaction],
     ) -> Result<(), algo_error::AlgoError> {
-        self.validate_group_stateless_inner(txgroup).map(|_| ())
+        self.validate_group_stateless_inner(txgroup)?;
+        self.check_group_fees(txgroup)
+    }
+
+    /// Go's `CheckGroupFees`/`SummarizeFees` (`ledger/eval/eval.go`) run
+    /// unconditionally for every submitted group -- a size-1 submission
+    /// included, which is where the pooled LogicSig-program surcharge is
+    /// folded in (issue #703) -- and LAST: after signatures, the validity
+    /// window, genesis, and (on the full path) every transaction's own
+    /// application, where a short balance surfaces as `overspend` (issues
+    /// #1976, #1979). The error is `TxGroupMalformedError`'s text, behind only
+    /// the pool's `Remember` frame:
+    /// `txgroup with 1uA fees is less than 1mA (usage=1.000000 * base=1mA)`.
+    fn check_group_fees(
+        &self,
+        txgroup: &[algo_types::SignedTransaction],
+    ) -> Result<(), algo_error::AlgoError> {
+        let refs: Vec<&algo_types::SignedTransaction> = txgroup.iter().collect();
+        algo_validate::fee::check_submitted_group_fees(&refs, &self.consensus_params).map_err(
+            |message| algo_error::AlgoError::Rejected {
+                source: None,
+                message,
+                class: algo_error::RejectClass::Other,
+            },
+        )
     }
 
     /// Validate a transaction group using both stateless and stateful checks.
@@ -2033,10 +2037,11 @@ impl SimpleBlockEvaluator {
         for stx in txgroup {
             let sender = stx.txn.sender;
             let is_pay = stx.txn.txn_type == TxnType::Pay;
+            let fee = stx.txn.fee;
             let cost = if is_pay {
-                stx.txn.fee.saturating_add(stx.txn.amount)
+                fee.saturating_add(stx.txn.amount)
             } else {
-                stx.txn.fee
+                fee
             };
             // Overlay first for the cumulative effects of earlier groups,
             // then the ledger snapshot.
@@ -2046,11 +2051,22 @@ impl SimpleBlockEvaluator {
             let required = already_spent.saturating_add(cost);
             let available = base.saturating_add(credited);
             if available < required {
-                return Err(algo_error::AlgoError::Validation {
-                    message: format!(
-                        "sender {} has insufficient balance: need {} microAlgos, have {}",
-                        sender, required, available,
-                    ),
+                // go's `eval.transaction` moves the fee first, then the amount;
+                // each failing `Move` is a `ledgercore.OverspendError` carrying
+                // the sender as the cow state stood before THAT move.
+                let balance_now = available.saturating_sub(already_spent);
+                let txid = algo_types::Digest(compute_txid(&stx.txn)).to_string();
+                let (data_balance, tried, after_fee) = if balance_now < fee {
+                    (balance_now, fee, false)
+                } else {
+                    (balance_now - fee, stx.txn.amount, true)
+                };
+                let message =
+                    self.overspend_message(&txid, &sender, data_balance, tried, after_fee, balance_now);
+                return Err(algo_error::AlgoError::Rejected {
+                    source: None,
+                    message,
+                    class: algo_error::RejectClass::Other,
                 });
             }
             spent.insert(sender, required);
@@ -2071,7 +2087,38 @@ impl SimpleBlockEvaluator {
             }
         }
 
+        // 10. Group fees, after every transaction's own state checks (go).
+        self.check_group_fees(txgroup)?;
+
         Ok(restored)
+    }
+
+    /// go's `OverspendError` text for `sender` (see `algo_validate::overspend`).
+    /// `data_balance` is the balance the error prints; `after_fee` selects the
+    /// account state go prints for the amount move (pending rewards applied by
+    /// the fee move that already happened) rather than the stored account the
+    /// fee move saw; `balance_now` is the sender's balance before the failing
+    /// transaction, pending rewards included.
+    fn overspend_message(
+        &mut self,
+        txid: &str,
+        sender: &Address,
+        data_balance: u64,
+        tried: u64,
+        after_fee: bool,
+        balance_now: u64,
+    ) -> String {
+        let mut data = self.get_account_data(sender).unwrap_or_default();
+        if after_fee {
+            algo_ledger::apply_rewards(&mut data, self.hdr.rewards_level);
+            data.micro_algos = data_balance;
+        } else {
+            // the stored account: `balance_now` counts pending rewards the
+            // fee move would only apply to its copy
+            let pending = algo_ledger::compute_pending_rewards(&data, self.hdr.rewards_level);
+            data.micro_algos = balance_now.saturating_sub(pending);
+        }
+        algo_validate::overspend::overspend_message(txid, sender, &data, tried)
     }
 }
 
@@ -9467,6 +9514,54 @@ mod tests {
         }
     }
 
+    /// Issue #1979, against go-algorand v5.0.3-stable's captured behaviour:
+    /// a transaction's own state checks (fee move, then the amount) come
+    /// BEFORE the group-fee check, and a short balance is a
+    /// `ledgercore.OverspendError` whose text prints the account.
+    #[test]
+    fn a_short_balance_is_gos_overspend_error_reported_before_the_group_fee() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(70);
+        let (receiver, _) = test_keypair(71);
+        let sender_text = sender.to_algorand_string();
+
+        // funded 1.5 Algo, tries to pay 5 Algo with fee 1000: the AMOUNT move
+        // overspends; the account is shown after the fee move (1.499 Algo)
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 1_500_000)]);
+        let mut stx = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
+        stx.txn.amount = 5_000_000;
+        stx.sig = sign_txn(&stx.txn, &key);
+        let txid = algo_types::Digest(compute_txid(&stx.txn)).to_string();
+        let err = eval.transaction_group(&[stx]).unwrap_err();
+        let want_prefix = format!(
+            "transaction {txid}: overspend (account {sender_text}, data {{AccountBaseData:{{Status:Offline MicroAlgos:1.499000A RewardsBase:0 RewardedMicroAlgos:0.0A "
+        );
+        assert!(err.to_string().starts_with(&want_prefix), "{err}");
+        assert!(err.to_string().ends_with(", tried to spend 5A)"), "{err}");
+        assert!(matches!(err, algo_error::AlgoError::Rejected { .. }), "{err:?}");
+
+        // unfunded, fee 1: the FEE move overspends with the stored (empty)
+        // account, before the group fee (1uA < 1mA) is ever looked at
+        let mut eval = make_evaluator(&ledger, &params, 100, &[]);
+        let mut low = pay_with_fee_and_window(&key, sender, receiver, 1, 1, 1000);
+        low.sig = sign_txn(&low.txn, &key);
+        let err = eval.transaction_group(&[low]).unwrap_err();
+        assert!(err.to_string().contains(": overspend (account "), "{err}");
+        assert!(err.to_string().contains("MicroAlgos:0.0A RewardsBase:0"), "{err}");
+        assert!(err.to_string().ends_with(", tried to spend 1uA)"), "{err}");
+
+        // funded, fee 1: the transaction applies, so the GROUP fee is what fails
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+        let mut low = pay_with_fee_and_window(&key, sender, receiver, 1, 1, 1000);
+        low.sig = sign_txn(&low.txn, &key);
+        let err = eval.transaction_group(&[low]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "txgroup with 1uA fees is less than 1mA (usage=1.000000 * base=1mA)"
+        );
+    }
+
     #[test]
     fn missing_signature_rejected() {
         let ledger = test_ledger();
@@ -9654,9 +9749,12 @@ mod tests {
 
         let stx = make_signed_pay(&key, &sender, &receiver, 100, 1000, 100);
         let err = eval.transaction_group(&[stx]).unwrap_err();
+        // go: `ledgercore.OverspendError` (issue #1979); the 500 microAlgos do
+        // not even cover the 1000 fee, so the fee move is what overspends
         assert!(
-            err.to_string().contains("insufficient balance"),
-            "expected insufficient balance, got: {err}"
+            err.to_string().contains(": overspend (account ")
+                && err.to_string().ends_with(", tried to spend 1mA)"),
+            "expected overspend of the fee, got: {err}"
         );
     }
 
@@ -11637,7 +11735,7 @@ mod tests {
             member(f2, r, 100_000, None, &f2_key, None),
         ]);
         let err = eval.transaction_group(&poor).unwrap_err();
-        assert!(err.to_string().contains("insufficient balance"), "{err}");
+        assert!(err.to_string().contains(": overspend (account "), "{err}");
     }
 
     // ====================================================================

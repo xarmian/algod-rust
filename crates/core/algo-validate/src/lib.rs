@@ -23,6 +23,7 @@ pub mod block;
 pub mod checks;
 pub mod fee;
 pub mod merkle;
+pub mod overspend;
 pub mod rules;
 pub mod signature;
 pub mod verified_txn_cache;
