@@ -42,8 +42,7 @@ phase6_backup_db() {
         # 126/127: the exec could not run sqlite3 at all (missing or not
         # executable); no number of retries changes that.
         if [ "$rc" = 126 ] || [ "$rc" = 127 ]; then
-            echo "    sqlite3 is not runnable in $ctr (exit $rc): $(printf '%s' "$out" | tr '
-' '  ')" >&2
+            echo "    sqlite3 is not runnable in $ctr (exit $rc): $(printf '%s' "$out" | tr '\r\n' '  ')" >&2
             return 1
         fi
         echo "    sqlite3 .backup of $src failed (attempt $i/$attempts): $(printf '%s' "$out" | tr '\r\n' '  ')" >&2

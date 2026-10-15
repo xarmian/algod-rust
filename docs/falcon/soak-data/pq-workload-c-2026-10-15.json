@@ -1,0 +1,48 @@
+{
+ "ok": true,
+ "falcon_backend": "c (control, FalconBackend \"c\")",
+ "commit": "5a7ba8d4",
+ "command": "ROUNDS=200 WORKLOAD=rich PHASE6_HOST_PORT_BASE=5000 PHASE6_FALCON_BACKEND=c bash ops/mixed-cluster/scripts/consensus-conformance.sh",
+ "pq_steps": [
+  {
+   "op": "pq_pay_via_go-node-1",
+   "outcome": "confirmed",
+   "ok": true,
+   "round": 162,
+   "txids": [
+    "FKJZ4KOON5DPGSGT43RKCG2EQCCCGPKQ64XYTDU646FHMTC3U53A"
+   ],
+   "submit_status": [
+    200
+   ]
+  },
+  {
+   "op": "pq_pay_via_rust-node-4",
+   "outcome": "confirmed",
+   "ok": true,
+   "round": 164,
+   "txids": [
+    "K3MUIA5YSXQOCMLCNB4M7XJWRNWGIE5OKVYGO6ZLTHATW4C6NWJA"
+   ],
+   "submit_status": [
+    200
+   ]
+  }
+ ],
+ "workload": {
+  "steps": 92,
+  "confirmed": 82,
+  "rejected": 10,
+  "unexpected": 0,
+  "submit_divergence": 0
+ },
+ "block_compare": {
+  "rounds": 200,
+  "not_identical_or_incomplete": 0
+ },
+ "conformance": {
+  "result": "PASS",
+  "checks_total": 18,
+  "checks_failed": 0
+ }
+}

@@ -72,6 +72,15 @@ ROUND_RE = re.compile(r"committed in round (\d+)")
 APP_ID_RE = re.compile(r"Created app with app index (\d+)")
 ASSET_ID_RE = re.compile(r"Created asset with asset index (\d+)")
 NEW_ACCOUNT_RE = re.compile(r"Created new account with address (\S+)")
+# `algokey pq generate` prints "PQ address: <addr>" (issue #1958)
+PQ_ADDR_RE = re.compile(r"PQ address: ([A-Z2-7]{58})")
+# A Falcon-1024 authorized txn pays 2 extra basic min fees (config.ConsensusParams.
+# PQSchemeFeeContribution) which `goal clerk send` does not add; pay this multiple of
+# the node's min fee (overpaying is harmless).
+PQ_FEE_FACTOR = 20
+PQ_PAY_AMOUNT = 123456
+# Poll budget (x 2 s) for a submitted PQ payment to be confirmed.
+PQ_CONFIRM_POLLS = 45
 
 # Order of the first pass.  Every scenario runs once, in this order, before
 # the seeded random mix starts, so even a 20-round smoke covers each op.
@@ -89,6 +98,7 @@ SCENARIO_ORDER = (
     "group",
     "account_close",
     "app_close_delete",
+    "pq",
 )
 SCENARIO_WEIGHTS = {
     "pay": 3,
@@ -100,6 +110,7 @@ SCENARIO_WEIGHTS = {
     "group": 2,
     "account_close": 1,
     "app_close_delete": 1,
+    "pq": 1,
 }
 
 
@@ -779,6 +790,96 @@ class Workload:
         self.run("account_close", "clerk send -f {} -t {} -a 0 --close-to {}".format(x, b, b), must=True)
         self.run("send_from_closed_account", "clerk send -f {} -t {} -a 1".format(x, b), expect="rejected")
 
+    def pq_confirmed_round(self, txid, node):
+        """Poll `txid` until it is confirmed: first on the node it was
+        submitted to, then on go-node-1 (a node that lags or cannot answer must
+        not make a committed payment look rejected).  Its round, else None."""
+        nodes = [node] + (["go-node-1"] if node != "go-node-1" else [])
+        for _ in range(PQ_CONFIRM_POLLS):
+            for n in nodes:
+                try:
+                    info = self.env.rest_json("/v2/transactions/pending/{}".format(txid), node=n)
+                except (urllib.error.URLError, OSError, ValueError):
+                    continue
+                if int(info.get("confirmed-round") or 0) > 0:
+                    return int(info["confirmed-round"])
+            self.env.sleep(2)
+        return None
+
+    def pq_fee(self):
+        """A Falcon-1024 payment pays 2 extra basic min fees on top of its own
+        (config.ConsensusParams.PQSchemeFeeContribution), which `goal clerk
+        send` does not add: pay PQ_FEE_FACTOR x the node's min fee (1000 when
+        /v2/transactions/params is unavailable)."""
+        try:
+            min_fee = int(self.env.rest_json("/v2/transactions/params").get("min-fee") or 1000)
+        except (urllib.error.URLError, OSError, ValueError):
+            min_fee = 1000
+        return min_fee * PQ_FEE_FACTOR
+
+    def pq_post(self, node, raw):
+        """POST once, and once more after a transient failure (connect error
+        or 5xx); a 4xx is an admission verdict and is never retried."""
+        status, body = self.env.post_txn(node, raw)
+        if status == 0 or status >= 500:
+            self.env.sleep(2)
+            status, body = self.env.post_txn(node, raw)
+        return status, body
+
+    def sc_pq(self):
+        """Falcon-1024 (PQ) account payments, issue #1958: one PQ account
+        (created on first use with go-algorand's `algokey pq`, then reused and
+        topped up) pays an actor twice -- the first signed payment is
+        submitted through a Go node, the second through the Rust node (REST).
+        Both must be admitted and committed; the rich soak's block comparison
+        then proves every node applied the Falcon-signed blocks
+        byte-identically."""
+        if getattr(self, "pq_account", None) is None:
+            key = "{}/pq.key".format(WORK_DIR)
+            rc, out = self.env.sh("mkdir -p {} && algokey pq generate -k {}".format(WORK_DIR, key))
+            m = PQ_ADDR_RE.search(out) if rc == 0 else None
+            if not m:
+                raise ScenarioAbort("algokey pq generate failed (rc={}): {}".format(rc, out[-200:]))
+            self.pq_account = (key, m.group(1))
+            self.fund(m.group(1), 2000000)
+        key, pq = self.pq_account
+        self.ensure_balance(pq, 1000000)
+        self.seq_pq = getattr(self, "seq_pq", 0) + 1
+        dest = self.actors[self.rng.choice(sorted(self.actors))]
+        fee = self.pq_fee()
+        for node in ("go-node-1", "rust-node-4"):
+            op = "pq_pay_via_" + node
+            unsigned = "{}/pq{}-{}.txn".format(WORK_DIR, self.seq_pq, node)
+            signed = "{}/pq{}-{}.stxn".format(WORK_DIR, self.seq_pq, node)
+            self.gate()
+            rc, out = self.env.goal("clerk send -f {} -t {} -a {} --fee {} --note {} -o {}".format(
+                pq, dest, PQ_PAY_AMOUNT, fee, self.note(op), unsigned))
+            if rc == 0:
+                rc, out = self.env.sh("algokey pq sign -k {} -t {} -o {}".format(key, unsigned, signed))
+            if rc != 0:
+                self.record_step(op, "error", "confirmed", {}, "build/sign failed (rc={}): {}".format(rc, out),
+                                 submissions=[])
+                raise ScenarioAbort("{}: build/sign failed: {}".format(op, out[-200:]))
+            rc, b64 = self.env.fetch_file_b64(signed)
+            if rc != 0 or not b64:
+                self.record_step(op, "error", "confirmed", {}, "could not read the signed transaction " + signed,
+                                 submissions=[])
+                raise ScenarioAbort("could not read " + signed)
+            status, body = self.pq_post(node, base64.b64decode(b64))
+            subs = [{"node": node, "status": status, "body": body[-160:]}]
+            txids, rnd = [], None
+            if status == 200:
+                try:
+                    txids = [json.loads(body)["txId"]]
+                except (ValueError, KeyError, TypeError):
+                    txids = TXID_RE.findall(body)[:1]
+                rnd = self.pq_confirmed_round(txids[0], node) if txids else None
+            outcome = "confirmed" if rnd is not None else "rejected"
+            rec = self.record_step(op, outcome, "confirmed", {"txids": txids, "round": rnd},
+                                   json.dumps(subs), submissions=subs)
+            if not rec["ok"]:
+                raise ScenarioAbort("{} was not committed: {}".format(op, json.dumps(subs)[-200:]))
+
     SCENARIOS = {
         "pay": sc_pay,
         "min_balance": sc_min_balance,
@@ -789,6 +890,7 @@ class Workload:
         "group": sc_group,
         "account_close": sc_account_close,
         "app_close_delete": sc_app_close_delete,
+        "pq": sc_pq,
     }
 
     # -- driver ---------------------------------------------------------
