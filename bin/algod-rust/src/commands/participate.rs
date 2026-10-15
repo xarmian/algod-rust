@@ -1744,33 +1744,15 @@ impl SimpleBlockEvaluator {
         // and its `TestGroupTransactions` (see issue #1034).
         algo_validate::validate_transaction_group_strict(txgroup)?;
 
-        // 5. Signature verification.
-        // Restore genesis fields before verification — signatures are computed
-        // over the ORIGINAL transaction (with genesis_id and genesis_hash), but
-        // the pool receives transactions with these fields present. For pool
-        // transactions the genesis fields should already be populated, but we
-        // ensure they're set matching the block header, mirroring the pattern
-        // from block.rs.
-        //
-        // Signatures are verified over the group AS SUBMITTED (go's
-        // `verify.TxnGroup`), not over the restored copy below: restoring an
-        // empty genesis hash from the header on a `RequireGenesisHash`
-        // protocol changed the signed bytes and reported a signature failure
-        // where go reports `required tx.GenesisHash is missing` (issue #1981).
-        // For every transaction that carries its genesis fields the two are
-        // identical.
-        //
-        // The group was checked flag-free above, so restoring from the
-        // header yields exactly what the block's stripped STIB form restores
-        // to (strip then restore sets `hgi`/`hgh` from scratch).
-        let mut restored: Vec<algo_types::SignedTransaction> = txgroup.to_vec();
-        debug_assert!(txgroup
-            .iter()
-            .all(|s| !s.has_genesis_id && !s.has_genesis_hash));
-        for stx in &mut restored {
-            self.restore_genesis_fields(stx);
-        }
-
+        // 5. Signature verification, over the group AS SUBMITTED (go's
+        // `verify.TxnGroup`). Restoring genesis fields first, as the block
+        // path does for stripped payset entries, would change the signed
+        // bytes of a submission signed with an empty genesis hash on a
+        // `RequireGenesisHash` protocol and report a signature failure where
+        // go reports `required tx.GenesisHash is missing` (issue #1981). A
+        // submission is flag-free, so the restore rule only ever fills a zero
+        // genesis hash on such a protocol, which step 6 rejects: for every
+        // accepted transaction the submitted and restored forms are identical.
         // Issue #1017: consult the shared `VerifiedTransactionCache` when one
         // is available -- this is the gossip/mempool-admission call site
         // (`TransactionPool::remember` -> `BlockEvaluator::test_transaction_group`
@@ -1873,6 +1855,18 @@ impl SimpleBlockEvaluator {
             })?;
         }
 
+        // The returned group (txid computation, block assembly) has its genesis
+        // fields restored from the header, exactly what the block's stripped
+        // STIB form restores to (strip then restore sets `hgi`/`hgh` from
+        // scratch). Signatures were verified over the submitted form above;
+        // see step 5 for why the two coincide for every accepted transaction.
+        let mut restored: Vec<algo_types::SignedTransaction> = txgroup.to_vec();
+        debug_assert!(txgroup
+            .iter()
+            .all(|s| !s.has_genesis_id && !s.has_genesis_hash));
+        for stx in &mut restored {
+            self.restore_genesis_fields(stx);
+        }
         Ok(restored)
     }
 
@@ -9451,17 +9445,26 @@ mod tests {
         assert!(params.require_genesis_hash, "the fixture protocol requires the hash");
         let (sender, key) = test_keypair(68);
         let (receiver, _) = test_keypair(69);
-        let eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+        // both the plain branch and the shared-cache branch (production)
+        for with_cache in [false, true] {
+            let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+            if with_cache {
+                eval.verified_txn_cache = Some(Arc::new(algo_validate::VerifiedTransactionCache::new(64)));
+            }
 
-        let mut no_hash = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
-        no_hash.txn.genesis_hash = [0u8; 32];
-        no_hash.sig = sign_txn(&no_hash.txn, &key);
-        let err = eval.test_transaction_group(&[no_hash.clone()]).unwrap_err();
-        assert_eq!(err.to_string(), "required tx.GenesisHash is missing");
+            let mut no_hash = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
+            no_hash.txn.genesis_hash = [0u8; 32];
+            no_hash.sig = sign_txn(&no_hash.txn, &key);
+            let err = eval.test_transaction_group(&[no_hash.clone()]).unwrap_err();
+            assert_eq!(err.to_string(), "required tx.GenesisHash is missing", "cache={with_cache}");
 
-        // a genuinely bad signature on the same transaction is still reported first
-        no_hash.sig = [7u8; 64];
-        assert!(eval.test_transaction_group(&[no_hash]).unwrap_err().is_batch_sig_failure());
+            // a genuinely bad signature on the same transaction is still reported first
+            no_hash.sig = [7u8; 64];
+            assert!(
+                eval.test_transaction_group(&[no_hash]).unwrap_err().is_batch_sig_failure(),
+                "cache={with_cache}"
+            );
+        }
     }
 
     #[test]
