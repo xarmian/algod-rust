@@ -21,11 +21,14 @@ import base64
 import hashlib
 import json
 import os
+import re
 import sys
+import time
 import urllib.error
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ed25519_py as ed  # noqa: E402
 import ports  # noqa: E402
 import unknown_field_parity as ufp  # noqa: E402
 
@@ -33,6 +36,10 @@ TOKEN = os.environ.get("ALGOD_TOKEN", "a" * 64)
 # Cases algod-rust cannot pass yet, with the issue that tracks them.
 KNOWN_GAPS = {"simulate_json": "#1972: go's JSON form of a SignedTxn is not decodable"}
 GO_MESSAGE = "At least one signature didn't pass verification"
+# go's bookkeeping.TxnDeadError text, behind the pool's Remember frame; the
+# round is the node's pending block round, so it is normalised before comparing.
+DEAD_RE = re.compile(r"^TransactionPool\.Remember: txn dead: round (\d+) outside of (\d+)--(\d+)$")
+SEED = bytes([42]) * 32
 
 
 def address(key32):
@@ -65,10 +72,41 @@ def _stxn_json():
     }
 
 
+def _signed_window_stxn(first_valid, last_valid, valid_signature=True):
+    """A payment from SEED's account with the given window, really signed (or not)."""
+    snd = ed.public_key(SEED)
+    txn = ufp._map([
+        ("amt", ufp._uint(1000)), ("fee", ufp._uint(1000)), ("fv", ufp._uint(first_valid)),
+        ("gh", ufp._bin(bytes([3]) * 32)), ("lv", ufp._uint(last_valid)), ("rcv", ufp._bin(bytes([2]) * 32)),
+        ("snd", ufp._bin(snd)), ("type", ufp._s("pay")),
+    ])
+    sig = ed.sign(SEED, b"TX" + txn) if valid_signature else bytes([7]) * 64
+    return ufp._map([("sig", ufp._bin(sig)), ("txn", txn)])
+
+
+def normalise(message):
+    """Replace the node-dependent round of a txn-dead message."""
+    return re.sub(r"round \d+ outside", "round N outside", message)
+
+
+def window_cases():
+    """The validity-window cases: name -> (body, what go answers, after normalise())."""
+    return {
+        "submit_early": (_signed_window_stxn(500, 900), "TransactionPool.Remember: txn dead: round N outside of 500--900"),
+        "submit_dead": (_signed_window_stxn(1, 2), "TransactionPool.Remember: txn dead: round N outside of 1--2"),
+        "submit_bad_sig_and_early": (_signed_window_stxn(500, 900, valid_signature=False), GO_MESSAGE),
+    }
+
+
 def cases():
     """name -> {path, content_type, body}."""
     mp_request = ufp._map([("txn-groups", bytes([0x91]) + ufp._map([("txns", bytes([0x91]) + _stxn_msgpack())]))])
+    window = {
+        name: {"path": "/v2/transactions", "content_type": "application/x-binary", "body": body}
+        for name, (body, _) in window_cases().items()
+    }
     return {
+        **window,
         "submit": {"path": "/v2/transactions", "content_type": "application/x-binary", "body": _stxn_msgpack()},
         "simulate_msgpack": {"path": "/v2/transactions/simulate", "content_type": "application/msgpack",
                              "body": mp_request},
@@ -77,13 +115,37 @@ def cases():
     }
 
 
+def expected_message(name):
+    return window_cases()[name][1] if name in window_cases() else GO_MESSAGE
+
+
 def compare(name, go, rust):
     problems = []
     if go[0] != rust[0]:
         problems.append("{}: status go={} rust={}".format(name, go[0], rust[0]))
-    if ufp.message_of(go[1]) != ufp.message_of(rust[1]):
-        problems.append("{}: message go={!r} rust={!r}".format(name, ufp.message_of(go[1]), ufp.message_of(rust[1])))
+    g, r = normalise(ufp.message_of(go[1])), normalise(ufp.message_of(rust[1]))
+    if g != r:
+        problems.append("{}: message go={!r} rust={!r}".format(name, g, r))
     return problems
+
+
+def wait_for_round(nodes, minimum, timeout=120):
+    """Block until every node's /v2/status last-round is at least `minimum`."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            rounds = []
+            for n in nodes:
+                req = urllib.request.Request(
+                    "http://127.0.0.1:{}/v2/status".format(ports.node_port(n)), headers={"X-Algo-API-Token": TOKEN})
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    rounds.append(json.loads(r.read())["last-round"])
+            if min(rounds) >= minimum:
+                return True
+        except (urllib.error.URLError, OSError, ValueError, KeyError):
+            pass
+        time.sleep(2)
+    return False
 
 
 def post(node, case):
@@ -104,14 +166,18 @@ def main(argv=None):
     ap.add_argument("--include-known-gaps", action="store_true", help="also run the cases listed in KNOWN_GAPS")
     a = ap.parse_args(argv)
     problems = []
+    if not wait_for_round([a.go, a.rust], 4):
+        print("FAIL the cluster did not reach round 4")
+        return 1
     for name, case in sorted(cases().items()):
         if name in KNOWN_GAPS and not a.include_known_gaps:
             print("skip {} (known gap, {})".format(name, KNOWN_GAPS[name]))
             continue
         go, rust = post(a.go, case), post(a.rust, case)
         found = compare(name, go, rust)
-        if ufp.message_of(go[1]) != GO_MESSAGE:
-            found.append("{}: go answered {!r}, expected {!r}".format(name, ufp.message_of(go[1]), GO_MESSAGE))
+        want = expected_message(name)
+        if normalise(ufp.message_of(go[1])) != want:
+            found.append("{}: go answered {!r}, expected {!r}".format(name, normalise(ufp.message_of(go[1])), want))
         print("{} {}".format("FAIL" if found else "ok  ", name), "; ".join(found))
         problems += found
     print(json.dumps({"event": "sig_failure_parity", "ok": not problems, "cases": len([n for n in cases() if a.include_known_gaps or n not in KNOWN_GAPS]),

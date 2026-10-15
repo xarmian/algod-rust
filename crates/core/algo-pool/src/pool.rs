@@ -753,11 +753,17 @@ impl TransactionPool {
         };
         for txn in txgroup {
             if txn.txn.last_valid < effective_round {
-                let txid = compute_txn_id(&txn.txn);
-                return Err(PoolError::Evaluator(format!(
-                    "{} expired, LastValid {} before effective round {}",
-                    txid, txn.txn.last_valid, effective_round
-                )));
+                // go: `&bookkeeping.TxnDeadError{Round: r, FirstValid, LastValid,
+                // Early: false}` (data/pools/transactionPool.go:596), whose text
+                // `Remember` wraps with only its own frame (issue #1974).
+                return Err(PoolError::TxnRejected {
+                    message: format!(
+                        "txn dead: round {} outside of {}--{}",
+                        effective_round.0, txn.txn.first_valid.0, txn.txn.last_valid.0
+                    ),
+                    class: algo_error::RejectClass::Other,
+                    detail: None,
+                });
             }
         }
 
@@ -3858,15 +3864,15 @@ mod tests {
             guard.evaluator = Some(Box::new(ErrEvaluator {
                 round: Round(2),
                 make: || AlgoError::Validation {
-                    message: "transaction round window [100, 1100] does not cover block round 3"
+                    message: "transaction has too many foreign references"
                         .to_string(),
                 },
             }));
         }
-        let err = pool.remember(vec![make_test_txn(9)]).expect_err("window");
+        let err = pool.remember(vec![make_test_txn(9)]).expect_err("validation");
         assert_eq!(
             err.to_string(),
-            "TransactionPool.Remember: TransactionPool.ingest: validation error: transaction round window [100, 1100] does not cover block round 3"
+            "TransactionPool.Remember: TransactionPool.ingest: validation error: transaction has too many foreign references"
         );
     }
 }

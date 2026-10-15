@@ -396,7 +396,9 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
 ///   matches go's `ClassifyTxPoolError`'s `ErrNoSpace` text match, should a
 ///   future evaluator error surface this message through a different path.
 fn classify_evaluator_message(msg: &str) -> PoolErrorTag {
-    if msg.contains("approval program rejected transaction:") {
+    if let Some(tag) = classify_txn_dead(msg) {
+        tag
+    } else if msg.contains("approval program rejected transaction:") {
         PoolErrorTag::TealErr
     } else if msg.contains("approval program rejected transaction") {
         PoolErrorTag::TealReject
@@ -413,9 +415,54 @@ fn classify_evaluator_message(msg: &str) -> PoolErrorTag {
     }
 }
 
+/// go's `bookkeeping.TxnDeadError` text, `txn dead: round R outside of F--L`,
+/// is tagged by its `Early` flag, i.e. whether `R < F`.
+fn classify_txn_dead(msg: &str) -> Option<PoolErrorTag> {
+    let rest = msg.strip_prefix("txn dead: round ")?;
+    let (round, rest) = rest.split_once(" outside of ")?;
+    let (first, _last) = rest.split_once("--")?;
+    let (round, first): (u64, u64) = (round.parse().ok()?, first.parse().ok()?);
+    Some(if round < first {
+        PoolErrorTag::TxnEarly
+    } else {
+        PoolErrorTag::TxnDead
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #1974: go tags a transaction outside its window `txn_early` /
+    /// `txn_dead` by the `Early` flag of `bookkeeping.TxnDeadError`; the
+    /// Rust message carries the same three numbers.
+    #[test]
+    fn txn_dead_messages_are_classified_early_or_dead() {
+        let typed = |message: &str| PoolError::TxnRejected {
+            message: message.to_string(),
+            class: algo_error::RejectClass::Other,
+            detail: None,
+        };
+        assert_eq!(
+            classify_pool_error(&typed("txn dead: round 3 outside of 500--900")),
+            PoolErrorTag::TxnEarly
+        );
+        assert_eq!(
+            classify_pool_error(&typed("txn dead: round 9 outside of 1--2")),
+            PoolErrorTag::TxnDead
+        );
+        assert_eq!(
+            classify_pool_error(&PoolError::Evaluator(
+                "txn dead: round 9 outside of 1--2".to_string()
+            )),
+            PoolErrorTag::TxnDead
+        );
+        // not a window message
+        assert_eq!(
+            classify_pool_error(&typed("transaction X: something else")),
+            PoolErrorTag::EvalGeneric
+        );
+    }
 
     #[test]
     fn error_string_pending_queue_full() {
