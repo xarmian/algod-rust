@@ -240,7 +240,7 @@ pub fn verify_single_sig(stx: &SignedTransaction) -> Result<(), AlgoError> {
         Ok(())
     } else {
         Err(AlgoError::Validation {
-            message: "ed25519 signature verification failed".into(),
+            message: algo_error::BATCH_HAS_FAILED_SIGS.into(),
         })
     }
 }
@@ -503,7 +503,7 @@ fn verify_multisig_subsigs(msig: &MultisigSig, msg: &[u8], context: &str) -> Res
 
         if !ed25519_bv_compatible_verify(&subsig.public_key, msg, &subsig.signature) {
             return Err(AlgoError::Validation {
-                message: format!("{context} subsig verification failed"),
+                message: algo_error::BATCH_HAS_FAILED_SIGS.into(),
             });
         }
 
@@ -630,7 +630,7 @@ pub fn logicsig_sanity_check(stx: &SignedTransaction, lsig: &LogicSig) -> Result
         program_msg.extend_from_slice(&lsig.logic);
         if !ed25519_bv_compatible_verify(&authorizer.0, &program_msg, &lsig.sig) {
             return Err(AlgoError::Validation {
-                message: "logicsig delegated signature verification failed".into(),
+                message: algo_error::BATCH_HAS_FAILED_SIGS.into(),
             });
         }
     } else if let Some(msig) = &lsig.msig {
@@ -797,7 +797,7 @@ pub fn verify_logicsig_with_tracer(
 
         if !ed25519_bv_compatible_verify(&authorizer.0, &program_msg, &sig_bytes) {
             return Err(AlgoError::Validation {
-                message: "logicsig delegated signature verification failed".into(),
+                message: algo_error::BATCH_HAS_FAILED_SIGS.into(),
             });
         }
     } else if let Some(msig) = &lsig.msig {
@@ -1760,7 +1760,12 @@ mod tests {
         };
 
         let err = verify_single_sig(&stx).unwrap_err();
-        assert!(err.to_string().contains("signature verification failed"));
+        // go's batch verifier text, not a per-signature message (issue #1969)
+        assert!(err.is_batch_sig_failure(), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "validation error: At least one signature didn't pass verification"
+        );
     }
 
     #[test]
@@ -1783,8 +1788,7 @@ mod tests {
         // Sender 0xAA..AA is not a valid ed25519 public key, so this should fail.
         let err = verify_single_sig(&stx).unwrap_err();
         assert!(
-            err.to_string().contains("invalid public key")
-                || err.to_string().contains("signature verification failed")
+            err.to_string().contains("invalid public key") || err.is_batch_sig_failure()
         );
     }
 
@@ -2603,8 +2607,7 @@ mod tests {
         // so verification should fail.
         let err = verify_multisig(&stx, stx.msig.as_ref().unwrap()).unwrap_err();
         assert!(
-            err.to_string().contains("public key")
-                || err.to_string().contains("verification failed"),
+            err.to_string().contains("public key") || err.is_batch_sig_failure(),
             "expected public key error, got: {err}"
         );
     }
@@ -2741,7 +2744,7 @@ mod tests {
         // Should fail because lmsig signatures were made with wrong_addr
         let err = verify_lsig(&stx, stx.lsig.as_ref().unwrap()).unwrap_err();
         assert!(
-            err.to_string().contains("verification failed"),
+            err.is_batch_sig_failure(),
             "expected verification failure, got: {err}"
         );
     }

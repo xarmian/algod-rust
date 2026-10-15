@@ -153,6 +153,14 @@ pub enum PoolError {
         in_block_evaluator: bool,
     },
 
+    /// A signature of the group does not verify. go checks signatures before
+    /// the pool ever sees the group (`verify.TxnGroup` in
+    /// `node.broadcastSignedTxGroup`) and returns the batch verifier's error
+    /// as is, so it carries neither the `TransactionPool.Remember` nor the
+    /// `TransactionPool.ingest` frame (issue #1969).
+    #[error("{}", algo_error::BATCH_HAS_FAILED_SIGS)]
+    SignatureBatchFailed,
+
     /// Wraps an inner error with `"TransactionPool.Remember: "` prefix,
     /// matching Go's `fmt.Errorf("TransactionPool.Remember: %w", err)`.
     #[error("TransactionPool.Remember: {0}")]
@@ -354,6 +362,9 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
                 PoolErrorTag::Lease
             }
         }
+        // Classified as before (a generic evaluator rejection), so the
+        // metrics and the gossip handlers' peer handling do not change.
+        PoolError::SignatureBatchFailed => PoolErrorTag::EvalGeneric,
         PoolError::Remember(inner) => classify_pool_error(inner),
     }
 }

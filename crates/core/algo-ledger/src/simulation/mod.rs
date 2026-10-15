@@ -1236,7 +1236,14 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             // the delta at 0.
             logicsig_budgets[i] = (budget_before - budget.remaining()).max(0) as u64;
             if let Err(e) = result {
-                let message = e.to_string();
+                // go's batch verifier reports a cryptographic failure as its
+                // bare error text (issue #1969), not as a wrapped validation
+                // error.
+                let message = if e.is_batch_sig_failure() {
+                    algo_error::BATCH_HAS_FAILED_SIGS.to_string()
+                } else {
+                    e.to_string()
+                };
                 // Signature-*format* failures (no signature at all, more
                 // than one signature category present) are per-transaction
                 // attributable in go-algorand (`checkTxnSigTypeCounts`

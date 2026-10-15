@@ -221,7 +221,20 @@ pub struct AvmErrorDetail {
     pub eval_states: Vec<AvmEvalStateDump>,
 }
 
+/// go-algorand's `crypto.ErrBatchHasFailedSigs` text
+/// (`crypto/batchverifier.go:70`). go verifies every ed25519 signature of a
+/// group through one batch verifier and reports any failure with exactly this
+/// message, with no transaction attribution and no wrapping.
+pub const BATCH_HAS_FAILED_SIGS: &str = "At least one signature didn't pass verification";
+
 impl AlgoError {
+    /// Whether this is go's batch signature-verification failure
+    /// ([`BATCH_HAS_FAILED_SIGS`]): a signature (plain, rekeyed, delegated
+    /// LogicSig or multisig sub-signature) that does not verify.
+    pub fn is_batch_sig_failure(&self) -> bool {
+        matches!(self, AlgoError::Validation { message } if message == BATCH_HAS_FAILED_SIGS)
+    }
+
     /// Extract this error's structured AVM diagnostics, if it is (or wraps,
     /// via `source()`) an [`AlgoError::AvmLogicSig`]. Mirrors go's
     /// `errors.As(internal, &se)` unwrap in `returnError()`
@@ -246,6 +259,30 @@ impl AlgoError {
                 });
             }
             cur = cur.source()?;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_sig_failure_is_recognised_only_for_gos_exact_text() {
+        let e = AlgoError::Validation {
+            message: BATCH_HAS_FAILED_SIGS.to_string(),
+        };
+        assert!(e.is_batch_sig_failure());
+        assert_eq!(BATCH_HAS_FAILED_SIGS, "At least one signature didn't pass verification");
+        for other in [
+            AlgoError::Validation {
+                message: "transaction has no signature".into(),
+            },
+            AlgoError::Ledger {
+                message: BATCH_HAS_FAILED_SIGS.to_string(),
+            },
+        ] {
+            assert!(!other.is_batch_sig_failure(), "{other}");
         }
     }
 }
