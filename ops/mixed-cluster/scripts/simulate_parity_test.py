@@ -41,6 +41,7 @@ class BodiesTest(unittest.TestCase):
         broken = (400, '{"message":"could not decode simulate request: x"}')
         self.assertTrue(sp.compare("clean", go, broken))
         self.assertTrue(sp.compare("clean", broken, rust))
+        self.assertTrue(sp.compare("clean", go, (400, "")), "an empty body proves nothing")
 
 
 if __name__ == "__main__":

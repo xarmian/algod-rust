@@ -73,60 +73,17 @@ fn map_keys_within<'a>(
         .collect()
 }
 
-fn signed_txn_is_valid(stxn: &Value) -> bool {
+/// Strictly decode one `SignedTxn` value; its msgpack bytes when go's
+/// strict decode would accept it.
+fn strict_signed_txn_bytes(stxn: &Value) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
-    if rmpv::encode::write_value(&mut bytes, stxn).is_err() {
-        return false;
-    }
+    rmpv::encode::write_value(&mut bytes, stxn).ok()?;
     // Synchronous: the strict mode is thread-local and never held across an await.
-    let _strict = strict_unknown_fields(&bytes);
+    let strict = strict_unknown_fields(&bytes);
     let mut cursor = &bytes[..];
-    SignedTransaction::decode_from_reader(&mut cursor).is_ok() && cursor.is_empty()
-}
-
-fn group_is_valid(group: &Value) -> bool {
-    let Some(pairs) = group.as_map() else {
-        return false;
-    };
-    let Some(fields) = map_keys_within(pairs, &["txns"]) else {
-        return false;
-    };
-    fields.iter().all(|(_, txns)| match txns.as_array() {
-        Some(list) => list.iter().all(signed_txn_is_valid),
-        None => txns.is_nil(),
-    })
-}
-
-fn request_is_valid(pairs: &[(Value, Value)]) -> bool {
-    let Some(fields) = map_keys_within(pairs, REQUEST_KEYS) else {
-        return false;
-    };
-    fields.iter().all(|(name, v)| match *name {
-        "txn-groups" => match v.as_array() {
-            Some(groups) => groups.iter().all(group_is_valid),
-            None => v.is_nil(),
-        },
-        "exec-trace-config" => match v.as_map() {
-            Some(p) => map_keys_within(p, TRACE_CONFIG_KEYS).is_some(),
-            None => v.is_nil(),
-        },
-        _ => true,
-    })
-}
-
-/// `Some(go's text)` when `body` is a msgpack map that go's strict msgpack
-/// decode of a `PreEncodedSimulateRequest` would reject; `None` when it
-/// would accept it, or when the body is not a msgpack map at all (JSON text
-/// and garbage keep their existing handling).
-pub fn go_msgpack_rejection(body: &[u8]) -> Option<&'static str> {
-    let mut rd = body;
-    let value = rmpv::decode::read_value(&mut rd).ok()?;
-    let pairs = value.as_map()?;
-    if request_is_valid(pairs) {
-        None
-    } else {
-        Some(GO_MSGPACK_REJECTION)
-    }
+    let ok = SignedTransaction::decode_from_reader(&mut cursor).is_ok() && cursor.is_empty();
+    drop(strict);
+    ok.then_some(bytes)
 }
 
 /// A msgpack simulate request split the way the handler needs it.
@@ -134,65 +91,102 @@ pub struct DecodedMsgpackRequest {
     /// The request with every transaction replaced by `null` (the group and
     /// transaction counts are preserved for the size checks).
     pub request: crate::models::SimulateRequest,
-    /// The msgpack bytes of each `SignedTxn`, per group, binary fields intact.
+    /// The msgpack bytes of each `SignedTxn`, per group (aligned with
+    /// `request.txn_groups`), binary fields intact.
     pub raw_txns: Vec<Vec<Vec<u8>>>,
 }
 
-/// Decode a msgpack `SimulateRequest` without routing transactions through
-/// `serde_json::Value`, which cannot hold a msgpack `bin` (issue #1968: every
-/// real request has binary addresses and signatures). `None` when `body` is
-/// not a msgpack map or does not fit the request model, so JSON text keeps
-/// its own path.
-pub fn decode_msgpack_request(body: &[u8]) -> Option<DecodedMsgpackRequest> {
+/// The outcome of parsing a simulate body as go's strict msgpack decode would.
+pub enum MsgpackSimulate {
+    /// Not a msgpack map (JSON text, garbage): the JSON path handles it.
+    NotMsgpack,
+    /// A msgpack map go's strict decode rejects: an unknown key at any level,
+    /// a field of the wrong type, a malformed transaction. The answer is
+    /// [`GO_MSGPACK_REJECTION`].
+    Rejected,
+    Decoded(DecodedMsgpackRequest),
+}
+
+/// Parse and strictly validate a msgpack `SimulateRequest` in one pass.
+///
+/// Transactions are never routed through `serde_json::Value`, which cannot
+/// hold a msgpack `bin` (issue #1968: every real request has binary
+/// addresses and signatures); each keeps its own msgpack bytes.
+pub fn parse_msgpack_request(body: &[u8]) -> MsgpackSimulate {
     let mut rd = body;
-    let value = rmpv::decode::read_value(&mut rd).ok()?;
-    let Value::Map(pairs) = value else {
-        return None;
+    let Ok(Value::Map(pairs)) = rmpv::decode::read_value(&mut rd) else {
+        return MsgpackSimulate::NotMsgpack;
     };
+    parse_request_pairs(pairs).map_or(MsgpackSimulate::Rejected, MsgpackSimulate::Decoded)
+}
+
+fn parse_request_pairs(pairs: Vec<(Value, Value)>) -> Option<DecodedMsgpackRequest> {
+    map_keys_within(&pairs, REQUEST_KEYS)?;
     let mut raw_txns: Vec<Vec<Vec<u8>>> = Vec::new();
     let mut stripped = Vec::with_capacity(pairs.len());
     for (k, v) in pairs {
-        if k.as_str() != Some("txn-groups") {
-            stripped.push((k, v));
-            continue;
-        }
-        let Value::Array(groups) = v else {
-            stripped.push((k, v));
-            continue;
-        };
-        let mut new_groups = Vec::with_capacity(groups.len());
-        for group in groups {
-            let Value::Map(gpairs) = group else {
-                new_groups.push(group);
-                continue;
-            };
-            let mut raw_group = Vec::new();
-            let mut new_gpairs = Vec::with_capacity(gpairs.len());
-            for (gk, gv) in gpairs {
-                match (gk.as_str() == Some("txns"), gv) {
-                    (true, Value::Array(txns)) => {
-                        for t in &txns {
-                            let mut bytes = Vec::new();
-                            rmpv::encode::write_value(&mut bytes, t).ok()?;
-                            raw_group.push(bytes);
+        match (k.as_str(), v) {
+            (Some("txn-groups"), Value::Array(groups)) => {
+                let mut new_groups = Vec::with_capacity(groups.len());
+                for group in groups {
+                    let Value::Map(gpairs) = group else {
+                        return None;
+                    };
+                    map_keys_within(&gpairs, &["txns"])?;
+                    let mut raw_group = Vec::new();
+                    let mut new_gpairs = Vec::with_capacity(gpairs.len());
+                    for (gk, gv) in gpairs {
+                        match gv {
+                            Value::Array(txns) => {
+                                for t in &txns {
+                                    raw_group.push(strict_signed_txn_bytes(t)?);
+                                }
+                                new_gpairs.push((gk, Value::Array(vec![Value::Nil; txns.len()])));
+                            }
+                            other => new_gpairs.push((gk, other)),
                         }
-                        new_gpairs.push((gk, Value::Array(vec![Value::Nil; txns.len()])));
                     }
-                    (_, gv) => new_gpairs.push((gk, gv)),
+                    raw_txns.push(raw_group);
+                    new_groups.push(Value::Map(new_gpairs));
                 }
+                stripped.push((k, Value::Array(new_groups)));
             }
-            raw_txns.push(raw_group);
-            new_groups.push(Value::Map(new_gpairs));
+            (Some("exec-trace-config"), Value::Map(cfg)) => {
+                map_keys_within(&cfg, TRACE_CONFIG_KEYS)?;
+                stripped.push((k, Value::Map(cfg)));
+            }
+            (_, v) => stripped.push((k, v)),
         }
-        stripped.push((k, Value::Array(new_groups)));
     }
-    let request = rmpv::ext::from_value::<crate::models::SimulateRequest>(Value::Map(stripped)).ok()?;
-    Some(DecodedMsgpackRequest { request, raw_txns })
+    let request =
+        rmpv::ext::from_value::<crate::models::SimulateRequest>(Value::Map(stripped)).ok()?;
+    // The typed model is the final word on shape: group and transaction
+    // counts must line up with the raw bytes collected above.
+    let aligned = request.txn_groups.len() == raw_txns.len()
+        && request
+            .txn_groups
+            .iter()
+            .zip(&raw_txns)
+            .all(|(g, r)| g.txns.len() == r.len());
+    aligned.then_some(DecodedMsgpackRequest { request, raw_txns })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rejection(body: &[u8]) -> Option<&'static str> {
+        match parse_msgpack_request(body) {
+            MsgpackSimulate::Rejected => Some(GO_MSGPACK_REJECTION),
+            _ => None,
+        }
+    }
+    fn decode(body: &[u8]) -> Option<DecodedMsgpackRequest> {
+        match parse_msgpack_request(body) {
+            MsgpackSimulate::Decoded(d) => Some(d),
+            _ => None,
+        }
+    }
 
     fn s(x: &str) -> Value {
         Value::String(x.into())
@@ -239,7 +233,7 @@ mod tests {
     #[test]
     fn a_clean_request_is_accepted() {
         let ok = request(vec![stxn(vec![], vec![])], vec![], vec![]);
-        assert_eq!(go_msgpack_rejection(&ok), None);
+        assert_eq!(rejection(&ok), None);
     }
 
     #[test]
@@ -262,7 +256,7 @@ mod tests {
             ),
         ];
         let ok = request(vec![stxn(vec![], vec![])], vec![], top);
-        assert_eq!(go_msgpack_rejection(&ok), None);
+        assert_eq!(rejection(&ok), None);
     }
 
     /// Each body below is rejected by a live go-algorand v5.0.3-stable node with
@@ -306,7 +300,7 @@ mod tests {
         ];
         for (name, body) in bodies {
             assert_eq!(
-                go_msgpack_rejection(&body),
+                rejection(&body),
                 Some(GO_MSGPACK_REJECTION),
                 "{name}"
             );
@@ -315,10 +309,10 @@ mod tests {
 
     #[test]
     fn json_text_and_garbage_are_left_to_the_existing_handling() {
-        assert_eq!(go_msgpack_rejection(br#"{"txn-groups":[],"zzz":1}"#), None);
-        assert_eq!(go_msgpack_rejection(b""), None);
-        assert_eq!(go_msgpack_rejection(&[0xc1, 0xff]), None);
-        assert_eq!(go_msgpack_rejection(&[0x91, 0x01]), None); // an array, not a map
+        assert_eq!(rejection(br#"{"txn-groups":[],"zzz":1}"#), None);
+        assert_eq!(rejection(b""), None);
+        assert_eq!(rejection(&[0xc1, 0xff]), None);
+        assert_eq!(rejection(&[0x91, 0x01]), None); // an array, not a map
     }
 
     #[test]
@@ -329,7 +323,7 @@ mod tests {
             vec![],
             vec![("round", Value::from(77u64)), ("allow-empty-signatures", Value::Boolean(true))],
         );
-        let d = decode_msgpack_request(&body).expect("decodes");
+        let d = decode(&body).expect("decodes");
         assert_eq!(d.request.round, Some(77));
         assert_eq!(d.request.allow_empty_signatures, Some(true));
         assert_eq!(d.request.txn_groups.len(), 1);
@@ -347,15 +341,50 @@ mod tests {
 
     #[test]
     fn decode_is_none_for_json_text_and_non_maps() {
-        assert!(decode_msgpack_request(br#"{"txn-groups":[]}"#).is_none());
-        assert!(decode_msgpack_request(b"").is_none());
-        assert!(decode_msgpack_request(&[0x91, 0x01]).is_none());
+        assert!(decode(br#"{"txn-groups":[]}"#).is_none());
+        assert!(decode(b"").is_none());
+        assert!(decode(&[0x91, 0x01]).is_none());
+    }
+
+    /// go's strict msgpack decode also fails on a wrongly typed field or a
+    /// malformed group, and the JSON fallback then gives the same fixed text.
+    #[test]
+    fn wrongly_typed_fields_and_malformed_groups_are_rejected_too() {
+        let st = stxn(vec![], vec![]);
+        let bad_round = request(vec![st.clone()], vec![], vec![("round", s("seven"))]);
+        assert_eq!(rejection(&bad_round), Some(GO_MSGPACK_REJECTION));
+        let neg_budget = request(
+            vec![st.clone()],
+            vec![],
+            vec![("extra-opcode-budget", Value::from(-5i64))],
+        );
+        assert_eq!(rejection(&neg_budget), None, "a signed int is a valid Go int");
+        let mut out = Vec::new();
+        let not_a_map_group = map(vec![("txn-groups", Value::Array(vec![Value::Nil]))]);
+        rmpv::encode::write_value(&mut out, &not_a_map_group).unwrap();
+        assert_eq!(rejection(&out), Some(GO_MSGPACK_REJECTION));
+    }
+
+    #[test]
+    fn raw_transactions_stay_aligned_with_the_groups_across_several_groups() {
+        let g = |n: usize| map(vec![("txns", Value::Array(vec![stxn(vec![], vec![]); n]))]);
+        let mut body = Vec::new();
+        rmpv::encode::write_value(
+            &mut body,
+            &map(vec![("txn-groups", Value::Array(vec![g(1), g(3), g(2)]))]),
+        )
+        .unwrap();
+        let d = decode(&body).expect("decodes");
+        let counts: Vec<usize> = d.raw_txns.iter().map(Vec::len).collect();
+        assert_eq!(counts, vec![1, 3, 2]);
+        let model: Vec<usize> = d.request.txn_groups.iter().map(|g| g.txns.len()).collect();
+        assert_eq!(model, counts);
     }
 
     #[test]
     fn a_nested_unknown_key_deep_in_the_transaction_is_found() {
         let boxes = Value::Array(vec![map(vec![("zzz", Value::from(1u64))])]);
         let body = request(vec![stxn(vec![], vec![("apbx", boxes)])], vec![], vec![]);
-        assert_eq!(go_msgpack_rejection(&body), Some(GO_MSGPACK_REJECTION));
+        assert_eq!(rejection(&body), Some(GO_MSGPACK_REJECTION));
     }
 }

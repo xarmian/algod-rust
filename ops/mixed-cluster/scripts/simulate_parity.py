@@ -79,7 +79,10 @@ def compare(name, go, rust):
         problems.append("{}: status go={} rust={}".format(name, go[0], rust[0]))
     if name == "clean":
         for who, r in (("go", go), ("rust", rust)):
-            if is_decode_error(ufp.message_of(r[1])):
+            msg = ufp.message_of(r[1])
+            if not msg:
+                problems.append("{}: {} answered with an empty body".format(name, who))
+            elif is_decode_error(msg):
                 problems.append("{}: {} could not decode a well-formed request: {!r}".format(name, who, ufp.message_of(r[1])))
     elif ufp.message_of(go[1]) != ufp.message_of(rust[1]):
         problems.append("{}: message go={!r} rust={!r}".format(name, ufp.message_of(go[1]), ufp.message_of(rust[1])))

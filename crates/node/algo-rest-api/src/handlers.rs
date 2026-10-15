@@ -3282,30 +3282,23 @@ pub async fn simulate_transaction<N: NodeInterface>(
     }
 
     // go decodes the body into `PreEncodedSimulateRequest` with the strict
-    // msgpack handle (`ErrorIfNoField`) before its JSON fallback; a msgpack
-    // body it rejects always ends in the same fixed JSON-decoder text
-    // (issue #1967, `simulate_strict`).
-    if let Some(msg) = crate::simulate_strict::go_msgpack_rejection(&body) {
-        return error::bad_request(msg);
-    }
-
-    // Decode request body: try msgpack first, then JSON.
-    // Track the input format so we can decode individual transactions
-    // correctly (msgpack binary data cannot round-trip through serde_json::Value).
-    // A msgpack body is parsed with `rmpv` so its binary fields survive
-    // (`serde_json::Value` cannot hold a `bin`; issue #1968): the request
-    // carries `null` placeholders and the transactions' own msgpack bytes
-    // travel alongside in `raw_txns`.
-    let (mut request, is_msgpack, raw_txns) =
-        match crate::simulate_strict::decode_msgpack_request(&body) {
-            Some(d) => (d.request, true, d.raw_txns),
-            None => match serde_json::from_slice::<models::SimulateRequest>(&body) {
-                Ok(req) => (req, false, Vec::new()),
-                Err(e) => {
-                    return error::bad_request(format!("could not decode simulate request: {e}"));
-                }
-            },
-        };
+    // msgpack handle (`ErrorIfNoField`) before its JSON fallback: a msgpack
+    // body it rejects always ends in the same fixed JSON-decoder text (issue
+    // #1967). A msgpack body is parsed with `rmpv` so its binary fields
+    // survive (`serde_json::Value` cannot hold a `bin`; issue #1968): the
+    // request carries `null` placeholders and each transaction's own msgpack
+    // bytes travel alongside in `raw_txns`.
+    use crate::simulate_strict::{parse_msgpack_request, MsgpackSimulate, GO_MSGPACK_REJECTION};
+    let (mut request, is_msgpack, raw_txns) = match parse_msgpack_request(&body) {
+        MsgpackSimulate::Decoded(d) => (d.request, true, d.raw_txns),
+        MsgpackSimulate::Rejected => return error::bad_request(GO_MSGPACK_REJECTION),
+        MsgpackSimulate::NotMsgpack => match serde_json::from_slice::<models::SimulateRequest>(&body) {
+            Ok(req) => (req, false, Vec::new()),
+            Err(e) => {
+                return error::bad_request(format!("could not decode simulate request: {e}"));
+            }
+        },
+    };
 
     // Validate: must have at least one transaction group
     if request.txn_groups.is_empty() {
