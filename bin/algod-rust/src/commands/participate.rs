@@ -1802,16 +1802,40 @@ impl SimpleBlockEvaluator {
         // ways is reported for its signature; the error is
         // `bookkeeping.TxnDeadError`, `txn dead: round R outside of F--L`,
         // for a not-yet-valid and an expired transaction alike (issue #1974).
+        // go's `BlockHeader.Alive` goes on, per transaction, to the genesis ID and
+        // the genesis hash; a mismatch is a plain `fmt.Errorf`, behind only the
+        // pool's `Remember` frame. (A transaction that omits the genesis ID or
+        // hash is accepted: they are restored from the header.)
+        let rejected = |message: String| algo_error::AlgoError::Rejected {
+            source: None,
+            message,
+            class: algo_error::RejectClass::Other,
+        };
         for stx in txgroup {
             if round < stx.txn.first_valid || round > stx.txn.last_valid {
-                return Err(algo_error::AlgoError::Rejected {
-                    source: None,
-                    message: format!(
-                        "txn dead: round {} outside of {}--{}",
-                        round.0, stx.txn.first_valid.0, stx.txn.last_valid.0,
-                    ),
-                    class: algo_error::RejectClass::Other,
-                });
+                return Err(rejected(format!(
+                    "txn dead: round {} outside of {}--{}",
+                    round.0, stx.txn.first_valid.0, stx.txn.last_valid.0,
+                )));
+            }
+            if !stx.txn.genesis_id.is_empty() && stx.txn.genesis_id != self.hdr.genesis_id {
+                return Err(rejected(format!(
+                    "tx.GenesisID <{}> does not match expected <{}>",
+                    stx.txn.genesis_id, self.hdr.genesis_id,
+                )));
+            }
+            if params.support_genesis_hash {
+                let zero = [0u8; 32];
+                if stx.txn.genesis_hash != zero && stx.txn.genesis_hash != self.hdr.genesis_hash {
+                    return Err(rejected(format!(
+                        "tx.GenesisHash <{}> does not match expected <{}>",
+                        algo_types::Digest(stx.txn.genesis_hash),
+                        algo_types::Digest(self.hdr.genesis_hash),
+                    )));
+                }
+                if params.require_genesis_hash && stx.txn.genesis_hash == zero {
+                    return Err(rejected("required tx.GenesisHash is missing".to_string()));
+                }
             }
         }
 
@@ -9334,6 +9358,72 @@ mod tests {
         // a fee-only problem stays a fee error, and a sufficient fee passes
         let ok = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
         assert!(eval.test_transaction_group(&[ok]).is_ok());
+    }
+
+    /// Issue #1976: after the validity window go's `BlockHeader.Alive` checks
+    /// the genesis ID and hash (`tx.GenesisID <..> does not match expected
+    /// <..>`, `tx.GenesisHash <..> does not match expected <..>`, captured
+    /// live), before the group fees and after signatures. The pool path used
+    /// to admit a validly signed transaction with the wrong genesis hash.
+    #[test]
+    fn a_wrong_genesis_id_or_hash_is_rejected_like_gos_alive_check() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(66);
+        let (receiver, _) = test_keypair(67);
+        let eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+
+        // wrong genesis hash (the fixture's header hash is [0xAA; 32])
+        let mut wrong = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
+        wrong.txn.genesis_hash = [3u8; 32];
+        wrong.sig = sign_txn(&wrong.txn, &key);
+        let err = eval.test_transaction_group(&[wrong]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "tx.GenesisHash <{}> does not match expected <{}>",
+                algo_types::Digest([3u8; 32]),
+                algo_types::Digest([0xAA; 32])
+            )
+        );
+        assert!(matches!(err, algo_error::AlgoError::Rejected { .. }), "{err:?}");
+
+        // wrong genesis ID
+        let mut wrong = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
+        wrong.txn.genesis_id = "other-net".to_string();
+        wrong.sig = sign_txn(&wrong.txn, &key);
+        let err = eval.test_transaction_group(&[wrong]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "tx.GenesisID <other-net> does not match expected <test-v1>"
+        );
+
+        // order: signature, then window, then genesis, then fees
+        let mut bad_sig = pay_with_fee_and_window(&key, sender, receiver, 1, 1, 1000);
+        bad_sig.txn.genesis_hash = [3u8; 32];
+        bad_sig.sig = [7u8; 64];
+        assert!(eval.test_transaction_group(&[bad_sig]).unwrap_err().is_batch_sig_failure());
+
+        let mut dead = pay_with_fee_and_window(&key, sender, receiver, 1, 500, 900);
+        dead.txn.genesis_hash = [3u8; 32];
+        dead.sig = sign_txn(&dead.txn, &key);
+        let err = eval.test_transaction_group(&[dead]).unwrap_err();
+        assert!(err.to_string().starts_with("txn dead:"), "{err}");
+
+        let mut low_fee = pay_with_fee_and_window(&key, sender, receiver, 1, 1, 1000);
+        low_fee.txn.genesis_hash = [3u8; 32];
+        low_fee.sig = sign_txn(&low_fee.txn, &key);
+        let err = eval.test_transaction_group(&[low_fee]).unwrap_err();
+        assert!(err.to_string().starts_with("tx.GenesisHash <"), "{err}");
+
+        // an omitted genesis ID / hash is restored from the header, not an error
+        let mut omitted = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
+        omitted.txn.genesis_id = String::new();
+        omitted.txn.genesis_hash = [0u8; 32];
+        omitted.sig = sign_txn(&omitted.txn, &key);
+        if let Err(e) = eval.test_transaction_group(&[omitted]) {
+            assert!(!e.to_string().contains("Genesis"), "not on genesis grounds: {e}");
+        }
     }
 
     #[test]
