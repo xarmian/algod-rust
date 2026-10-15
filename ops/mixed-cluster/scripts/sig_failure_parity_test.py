@@ -28,7 +28,8 @@ class AddressTest(unittest.TestCase):
 class BodiesTest(unittest.TestCase):
     def test_every_case_has_a_body_a_path_and_a_content_type(self):
         cases = sfp.cases()
-        self.assertEqual(set(cases), {"submit", "simulate_msgpack", "simulate_json"})
+        self.assertEqual(set(cases), {"submit", "simulate_msgpack", "simulate_json",
+                                      "submit_early", "submit_dead", "submit_bad_sig_and_early"})
         for name, c in cases.items():
             self.assertTrue(c["path"].startswith("/v2/transactions"), name)
             self.assertTrue(c["body"], name)
@@ -38,6 +39,33 @@ class BodiesTest(unittest.TestCase):
         stxn = body["txn-groups"][0]["txns"][0]
         self.assertEqual(base64.b64decode(stxn["sig"]), bytes([7]) * 64)
         self.assertEqual(stxn["txn"]["type"], "pay")
+
+
+class WindowCasesTest(unittest.TestCase):
+    def test_bodies_are_signed_by_the_seed_account_and_the_bogus_one_is_not(self):
+        import ed25519_py as ed
+        good = sfp.window_cases()["submit_early"][0]
+        bad = sfp.window_cases()["submit_bad_sig_and_early"][0]
+        pk = ed.public_key(sfp.SEED)
+        self.assertIn(pk, good)
+        self.assertIn(pk, bad)
+        # the txn bytes are identical; only the signature differs
+        self.assertNotEqual(good, bad)
+        self.assertIn(bytes([7]) * 64, bad)
+        self.assertNotIn(bytes([7]) * 64, good)
+
+    def test_the_round_of_a_txn_dead_message_is_normalised(self):
+        msg = "TransactionPool.Remember: txn dead: round 17 outside of 1000--1900"
+        self.assertEqual(sfp.normalise(msg), "TransactionPool.Remember: txn dead: round N outside of 1000--1900")
+        self.assertTrue(sfp.DEAD_RE.match(msg))
+
+    def test_expectations(self):
+        self.assertEqual(sfp.expected_message("submit"), sfp.GO_MESSAGE)
+        self.assertEqual(sfp.expected_message("submit_bad_sig_and_early"), sfp.GO_MESSAGE)
+        self.assertIn("1000--1900", sfp.expected_message("submit_early"))
+        self.assertIn("1250--2150", sfp.expected_message("submit_early", current_round=250))
+        # the not-yet-valid window follows the cluster's round
+        self.assertNotEqual(sfp.window_cases(0)["submit_early"][0], sfp.window_cases(250)["submit_early"][0])
 
 
 class KnownGapsTest(unittest.TestCase):

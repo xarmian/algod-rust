@@ -753,11 +753,17 @@ impl TransactionPool {
         };
         for txn in txgroup {
             if txn.txn.last_valid < effective_round {
-                let txid = compute_txn_id(&txn.txn);
-                return Err(PoolError::Evaluator(format!(
-                    "{} expired, LastValid {} before effective round {}",
-                    txid, txn.txn.last_valid, effective_round
-                )));
+                // go: `&bookkeeping.TxnDeadError{Round: r, FirstValid, LastValid,
+                // Early: false}` (data/pools/transactionPool.go:596), whose text
+                // `Remember` wraps with only its own frame (issue #1974).
+                return Err(PoolError::TxnRejected {
+                    message: format!(
+                        "txn dead: round {} outside of {}--{}",
+                        effective_round.0, txn.txn.first_valid.0, txn.txn.last_valid.0
+                    ),
+                    class: algo_error::RejectClass::Other,
+                    detail: None,
+                });
             }
         }
 
@@ -3858,15 +3864,36 @@ mod tests {
             guard.evaluator = Some(Box::new(ErrEvaluator {
                 round: Round(2),
                 make: || AlgoError::Validation {
-                    message: "transaction round window [100, 1100] does not cover block round 3"
+                    message: "transaction has too many foreign references"
                         .to_string(),
                 },
             }));
         }
-        let err = pool.remember(vec![make_test_txn(9)]).expect_err("window");
+        let err = pool.remember(vec![make_test_txn(9)]).expect_err("validation");
         assert_eq!(
             err.to_string(),
-            "TransactionPool.Remember: TransactionPool.ingest: validation error: transaction round window [100, 1100] does not cover block round 3"
+            "TransactionPool.Remember: TransactionPool.ingest: validation error: transaction has too many foreign references"
+        );
+    }
+
+    /// Issue #1974: the pool's own expiry pre-check is go's `TxnDeadError`
+    /// (`data/pools/transactionPool.go:596`): `txn dead: round R outside of
+    /// F--L` behind only the `Remember` frame, tagged `txn_dead`. Its text is
+    /// what `classify_txn_dead` parses, so this pins the two together.
+    #[test]
+    fn an_expired_transaction_is_gos_txn_dead_error_and_tagged_txn_dead() {
+        let pool = make_pool_with_evaluator(1000); // evaluator round 2
+        let mut txn = make_test_txn(9);
+        txn.txn.first_valid = Round(1);
+        txn.txn.last_valid = Round(1); // < effective round 2
+        let err = pool.remember(vec![txn]).expect_err("expired");
+        assert_eq!(
+            err.to_string(),
+            "TransactionPool.Remember: txn dead: round 2 outside of 1--1"
+        );
+        assert_eq!(
+            crate::error::classify_pool_error(&err),
+            crate::error::PoolErrorTag::TxnDead
         );
     }
 }

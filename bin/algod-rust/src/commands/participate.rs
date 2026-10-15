@@ -1650,7 +1650,7 @@ impl SimpleBlockEvaluator {
     }
 
     /// Perform stateless validation only (well-formedness, group ID, fees,
-    /// signatures). Returns the group with genesis fields restored so that
+    /// signatures, validity window). Returns the group with genesis fields restored so that
     /// `validate_group` can reuse it for txid computation without cloning
     /// the group a second time.
     ///
@@ -1729,16 +1729,6 @@ impl SimpleBlockEvaluator {
                 params,
                 None, // SpecialAddresses not available without ledger lookup
             )?;
-
-            // Check that the transaction's round window covers this block's round.
-            if round < stx.txn.first_valid || round > stx.txn.last_valid {
-                return Err(algo_error::AlgoError::Validation {
-                    message: format!(
-                        "transaction round window [{}, {}] does not cover block round {}",
-                        stx.txn.first_valid.0, stx.txn.last_valid.0, round.0,
-                    ),
-                });
-            }
         }
 
         // 3. Group ID consistency. This is fresh-submission (pool-admission)
@@ -1828,6 +1818,25 @@ impl SimpleBlockEvaluator {
                     &mut lsig_budget,
                     params,
                 )?;
+            }
+        }
+
+        // 6. Validity window. go runs `verify.TxnGroup` (well-formedness and
+        // signatures) first and only then lets the pool test the window
+        // (`ledger.eval` -> `BlockHeader.Alive`), so a group wrong in both
+        // ways is reported for its signature; the error is
+        // `bookkeeping.TxnDeadError`, `txn dead: round R outside of F--L`,
+        // for a not-yet-valid and an expired transaction alike (issue #1974).
+        for stx in txgroup {
+            if round < stx.txn.first_valid || round > stx.txn.last_valid {
+                return Err(algo_error::AlgoError::Rejected {
+                    source: None,
+                    message: format!(
+                        "txn dead: round {} outside of {}--{}",
+                        round.0, stx.txn.first_valid.0, stx.txn.last_valid.0,
+                    ),
+                    class: algo_error::RejectClass::Other,
+                });
             }
         }
 
@@ -9197,6 +9206,83 @@ mod tests {
             "a genuinely different signature must still be verified for real and rejected, \
              got: {err}"
         );
+    }
+
+    /// A validly signed payment with the given validity window.
+    fn windowed_pay(
+        key: &SigningKey,
+        sender: Address,
+        receiver: Address,
+        first_valid: u64,
+        last_valid: u64,
+    ) -> SignedTransaction {
+        let txn = Transaction {
+            txn_type: TxnType::Pay,
+            sender,
+            receiver,
+            amount: 1000,
+            fee: 1000,
+            first_valid: Round(first_valid),
+            last_valid: Round(last_valid),
+            genesis_id: "test-v1".to_string(),
+            genesis_hash: [0xAA; 32],
+            ..Default::default()
+        };
+        let sig = sign_txn(&txn, key);
+        SignedTransaction {
+            txn,
+            sig,
+            ..Default::default()
+        }
+    }
+
+    /// Issue #1974: go reports a transaction outside its validity window as
+    /// `txn dead: round R outside of F--L` (`bookkeeping.TxnDeadError`), for
+    /// a not-yet-valid and an expired one alike, with only the pool's
+    /// `Remember` frame in front of it (no `ingest` frame, no
+    /// "validation error:" prefix). Captured from a go-algorand
+    /// v5.0.3-stable node with validly signed transactions.
+    #[test]
+    fn a_transaction_outside_its_window_is_gos_txn_dead_error() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(60);
+        let (receiver, _) = test_keypair(61);
+        let eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+
+        let early = windowed_pay(&key, sender, receiver, 500, 900);
+        let err = eval.test_transaction_group(&[early]).unwrap_err();
+        assert_eq!(err.to_string(), "txn dead: round 100 outside of 500--900");
+        assert!(
+            matches!(err, algo_error::AlgoError::Rejected { .. }),
+            "typed, so the pool prints it bare: {err:?}"
+        );
+
+        let expired = windowed_pay(&key, sender, receiver, 1, 50);
+        let err = eval.test_transaction_group(&[expired]).unwrap_err();
+        assert_eq!(err.to_string(), "txn dead: round 100 outside of 1--50");
+    }
+
+    /// Issue #1974: go runs `verify.TxnGroup` (signatures) before the pool
+    /// tests the window, so a group wrong in both ways is reported for its
+    /// signature.
+    #[test]
+    fn a_bad_signature_is_reported_before_the_validity_window() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(62);
+        let (receiver, _) = test_keypair(63);
+        let eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+
+        let mut both = windowed_pay(&key, sender, receiver, 500, 900);
+        both.sig = [7u8; 64]; // does not verify
+        let err = eval.test_transaction_group(&[both]).unwrap_err();
+        assert!(err.is_batch_sig_failure(), "{err}");
+
+        // window-only problem still gets the window error
+        let only_window = windowed_pay(&key, sender, receiver, 500, 900);
+        let err = eval.test_transaction_group(&[only_window]).unwrap_err();
+        assert!(err.to_string().starts_with("txn dead:"), "{err}");
     }
 
     #[test]
