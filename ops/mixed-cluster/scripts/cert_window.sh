@@ -16,6 +16,8 @@
 # back to CERT_WINDOW (else the last 900 rounds) and report "earliest unknown".
 
 CERT_WINDOW_DIR="${CERT_WINDOW_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+# shellcheck source=db_snapshot.sh
+source "$CERT_WINDOW_DIR/db_snapshot.sh"  # phase6_docker_exec (no MSYS path rewrite, #1963)
 
 _is_round() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 
@@ -112,7 +114,7 @@ resolve_cert_latest() {
 
 probe_earliest_container() {
     local ctr="$1" path="$2" out=""
-    out="$(docker exec "$ctr" sqlite3 "$path" 'SELECT MIN(rnd) FROM blocks' 2>/dev/null | tr -d '\r' || true)"
+    out="$(phase6_docker_exec "$ctr" sqlite3 "$path" 'SELECT MIN(rnd) FROM blocks' 2>/dev/null | tr -d '\r' || true)"
     if _is_round "$out"; then
         echo "$out"
     fi

@@ -474,6 +474,9 @@ fi
     > "$OUT_DIR/verify.log" 2>&1 || verify_rc=$?
 tail -20 "$OUT_DIR/verify.log" || true
 
+if grep -q "SNAPSHOT_INCONSISTENT=1" "$OUT_DIR/verify.log"; then
+    record "snapshot_inconsistent" warn "$(grep -m1 'SNAPSHOT_INCONSISTENT=1' "$OUT_DIR/verify.log" | sed 's/^ *//')"
+fi
 if grep -q "CERT_WINDOW_CLAMPED=1" "$OUT_DIR/verify.log"; then
     record "cert_window_clamped" warn "$(grep -m1 'CERT_WINDOW_CLAMPED=1' "$OUT_DIR/verify.log" | sed 's/^ *//')"
 fi

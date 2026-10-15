@@ -74,6 +74,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/ports.sh"  # PHASE6_HOST_PORT_BASE -> PHASE6_*_PORT (issue #1956)
 # shellcheck source=cert_window.sh
 source "$HERE/cert_window.sh"
+# shellcheck source=db_snapshot.sh
+source "$HERE/db_snapshot.sh"
 ROOT="$(cd "$HERE/.." && pwd)"
 REPO_ROOT="$(cd "$ROOT/../.." && pwd)"
 
@@ -337,10 +339,8 @@ if [ "$RUN_CERT" = "1" ]; then
         # warning if `.backup` isn't available (e.g. slim images built
         # in CI without sqlite3).
         echo "    snapshotting Rust tracker + block databases via SQLite backup API"
-        if docker exec phase6-rust-node-4 sqlite3 /app/ledger.tracker.sqlite \
-                    ".backup '/app/verify-soak-tracker.sqlite'" >/dev/null 2>&1 \
-                && docker exec phase6-rust-node-4 sqlite3 /app/ledger.block.sqlite \
-                    ".backup '/app/verify-soak-block.sqlite'" >/dev/null 2>&1; then
+        if phase6_backup_db phase6-rust-node-4 /app/ledger.tracker.sqlite /app/verify-soak-tracker.sqlite \
+                && phase6_backup_db phase6-rust-node-4 /app/ledger.block.sqlite /app/verify-soak-block.sqlite; then
             if ! docker cp phase6-rust-node-4:/app/verify-soak-tracker.sqlite \
                     "$TRACKER_PATH" 2>/dev/null; then
                 echo "error: failed to docker cp the tracker snapshot." >&2
@@ -355,13 +355,16 @@ if [ "$RUN_CERT" = "1" ]; then
             RUST_EARLIEST="$(probe_earliest_container phase6-rust-node-4 /app/verify-soak-block.sqlite)"
             # Clean up the in-container snapshots; don't leak volume
             # space across runs. `rm -f` is safe even if a file vanished.
-            docker exec phase6-rust-node-4 rm -f \
+            phase6_docker_exec phase6-rust-node-4 rm -f \
                     /app/verify-soak-tracker.sqlite \
                     /app/verify-soak-block.sqlite \
                 >/dev/null 2>&1 || true
         else
-            echo "    warning: sqlite3 .backup unavailable in container;" >&2
+            echo "    warning: sqlite3 .backup failed or is unavailable in the container;" >&2
             echo "    falling back to raw docker cp (may be racy under heavy writes)" >&2
+            phase6_announce_inconsistent_snapshot "sqlite3 .backup did not succeed"
+            # a tracker snapshot made before the block backup failed would be stale
+            phase6_docker_exec phase6-rust-node-4 rm -f /app/verify-soak-tracker.sqlite /app/verify-soak-block.sqlite >/dev/null 2>&1 || true
             if ! docker cp phase6-rust-node-4:/app/ledger.tracker.sqlite \
                     "$TRACKER_PATH" 2>/dev/null; then
                 echo "error: failed to docker cp the tracker DB." >&2
