@@ -3421,7 +3421,7 @@ impl AlgodNodeInterface {
     fn map_simulator_error(err: SimulatorError) -> NodeError {
         match err {
             // go reports a failed signature as the batch verifier's bare text.
-            SimulatorError::InvalidRequest(e) if e.to_string() == algo_error::BATCH_HAS_FAILED_SIGS => {
+            SimulatorError::InvalidRequest(e) if e.is_batch_sig_failure() => {
                 NodeError::BadRequest(algo_error::BATCH_HAS_FAILED_SIGS.to_string())
             }
             SimulatorError::InvalidRequest(e) => {

@@ -114,7 +114,8 @@ def main(argv=None):
             found.append("{}: go answered {!r}, expected {!r}".format(name, ufp.message_of(go[1]), GO_MESSAGE))
         print("{} {}".format("FAIL" if found else "ok  ", name), "; ".join(found))
         problems += found
-    print(json.dumps({"event": "sig_failure_parity", "ok": not problems, "cases": len([n for n in cases() if a.include_known_gaps or n not in KNOWN_GAPS]), "problems": problems}))
+    print(json.dumps({"event": "sig_failure_parity", "ok": not problems, "cases": len([n for n in cases() if a.include_known_gaps or n not in KNOWN_GAPS]),
+                      "skipped": {} if a.include_known_gaps else KNOWN_GAPS, "problems": problems}))
     return 0 if not problems else 1
 
 
