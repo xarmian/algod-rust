@@ -11,10 +11,6 @@
 
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=ports.sh
-source "$HERE/ports.sh"  # PHASE6_HOST_PORT_BASE -> PHASE6_*_PORT (issue #1956)
-
 ALGOD_TOKEN="${ALGOD_TOKEN:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
 
 # Exit non-zero if any node's round lags > LAG_TOLERANCE behind the max.
@@ -25,10 +21,10 @@ LAG_TOLERANCE="${LAG_TOLERANCE:-5}"
 # same algod v2 `/v2/status` endpoint as the Go nodes' — no log-scrape
 # or container-state-only fallback.
 declare -a ROWS=(
-    "go-node-1|phase6-go-node-1|$PHASE6_GO1_PORT"
-    "go-node-2|phase6-go-node-2|$PHASE6_GO2_PORT"
-    "go-node-3|phase6-go-node-3|$PHASE6_GO3_PORT"
-    "rust-node-4|phase6-rust-node-4|$PHASE6_RUST_PORT"
+    "go-node-1|phase6-go-node-1|4001"
+    "go-node-2|phase6-go-node-2|4002"
+    "go-node-3|phase6-go-node-3|4003"
+    "rust-node-4|phase6-rust-node-4|4004"
 )
 
 # ------------------------------------------------------------------ helpers

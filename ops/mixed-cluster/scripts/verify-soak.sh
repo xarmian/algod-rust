@@ -70,8 +70,6 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=ports.sh
-source "$HERE/ports.sh"  # PHASE6_HOST_PORT_BASE -> PHASE6_*_PORT (issue #1956)
 # shellcheck source=cert_window.sh
 source "$HERE/cert_window.sh"
 ROOT="$(cd "$HERE/.." && pwd)"
@@ -252,7 +250,7 @@ FORK_OUT="$OUT_DIR/verify-fork-$(date +%s).jsonl"
 echo "==> fork detector: $FROM_ROUND..$TO_ROUND"
 set +e
 "$FORK_BIN" \
-    --nodes "go-node-1=http://127.0.0.1:$PHASE6_GO1_PORT,go-node-2=http://127.0.0.1:$PHASE6_GO2_PORT,go-node-3=http://127.0.0.1:$PHASE6_GO3_PORT" \
+    --nodes "go-node-1=http://127.0.0.1:4001,go-node-2=http://127.0.0.1:4002,go-node-3=http://127.0.0.1:4003" \
     --from-round "$FROM_ROUND" \
     --to-round "$TO_ROUND" \
     --token-file "$TOKEN_FILE" \
@@ -426,7 +424,7 @@ if [ "$RUN_CERT" = "1" ]; then
     CERT_FROM="${CERT_FROM:?}"
     set +e
     "$CERT_BIN" \
-        --node "http://127.0.0.1:$PHASE6_GO1_PORT" \
+        --node http://127.0.0.1:4001 \
         --token-file "$TOKEN_FILE" \
         --ledger-sqlite "$CERT_LEDGER_PATH" \
         --from-round "$CERT_FROM" \

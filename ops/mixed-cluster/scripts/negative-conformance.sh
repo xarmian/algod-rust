@@ -62,8 +62,6 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=ports.sh
-source "$HERE/ports.sh"  # PHASE6_HOST_PORT_BASE -> PHASE6_*_PORT (issue #1956)
 ROOT="$(cd "$HERE/.." && pwd)"
 REPO_ROOT="$(cd "$ROOT/../.." && pwd)"
 
@@ -81,9 +79,9 @@ OUT_DIR="${OUT_DIR:-$ROOT/negative-$RUN_ID}"
 SUMMARY_JSON="${SUMMARY_JSON:-$OUT_DIR/negative-summary.json}"
 
 TARGET_CONTAINER=phase6-go-node-1
-TARGET_REST="http://127.0.0.1:$PHASE6_GO1_PORT"
+TARGET_REST=http://127.0.0.1:4001
 TARGET_GOSSIP=127.0.0.1:4161
-GO_PORTS=("$PHASE6_GO1_PORT" "$PHASE6_GO2_PORT" "$PHASE6_GO3_PORT")
+GO_PORTS=(4001 4002 4003)
 
 # Under Git Bash the shell hands out MSYS paths (/c/...) that neither the
 # Windows `algo-agreement-fuzz.exe` nor a Windows python3 can open. Convert to
@@ -248,7 +246,7 @@ run_case() {  # run_case <case>
             raised=1
             local wd=$(( $(date +%s) + 90 ))
             while [ "$(date +%s)" -lt "$wd" ]; do
-                [[ "$(node_round "$PHASE6_GO1_PORT")" =~ ^[0-9]+$ ]] && break
+                [[ "$(node_round 4001)" =~ ^[0-9]+$ ]] && break
                 sleep 2
             done
             since="$(date +%s)"

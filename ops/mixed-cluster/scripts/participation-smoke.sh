@@ -42,8 +42,6 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=ports.sh
-source "$HERE/ports.sh"  # PHASE6_HOST_PORT_BASE -> PHASE6_*_PORT (issue #1956)
 
 SMOKE_ROUNDS="${SMOKE_ROUNDS:-30}"
 SMOKE_TIMEOUT="${SMOKE_TIMEOUT:-900}"
@@ -56,10 +54,10 @@ ALGOD_TOKEN="${ALGOD_TOKEN:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 # `participate --rest-listen 0.0.0.0:8080` (issue #469); before that it
 # had no REST at all, which is why this test could not exist.
 NODES=(
-    "go-node-1|phase6-go-node-1|$PHASE6_GO1_PORT"
-    "go-node-2|phase6-go-node-2|$PHASE6_GO2_PORT"
-    "go-node-3|phase6-go-node-3|$PHASE6_GO3_PORT"
-    "rust-node-4|phase6-rust-node-4|$PHASE6_RUST_PORT"
+    "go-node-1|phase6-go-node-1|4001"
+    "go-node-2|phase6-go-node-2|4002"
+    "go-node-3|phase6-go-node-3|4003"
+    "rust-node-4|phase6-rust-node-4|4004"
 )
 GO_CONTAINERS=(phase6-go-node-1 phase6-go-node-2 phase6-go-node-3)
 RUST_CONTAINER=phase6-rust-node-4
@@ -154,7 +152,7 @@ wait_all_rest
 # The Rust node's status must be served by the Rust node itself — assert
 # it looks like our build rather than an accidentally-mapped Go port.
 RUST_VERSIONS="$(curl -sf -H "X-Algo-API-Token: $ALGOD_TOKEN" \
-    "http://127.0.0.1:$PHASE6_RUST_PORT/v2/status" 2>/dev/null || true)"
+    http://127.0.0.1:4004/v2/status 2>/dev/null || true)"
 if [ -z "$RUST_VERSIONS" ]; then
     echo "FAIL: rust-node-4 /v2/status is empty" >&2
     exit 1
@@ -285,10 +283,9 @@ if [ -n "$RUST_ACCOUNT" ]; then
     PROPOSED="$(python3 -c "
 import json, sys, urllib.request
 tok, acct, lo, hi = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
-port = sys.argv[5]
 def blk(r):
     req = urllib.request.Request(
-        'http://127.0.0.1:{}/v2/blocks/{}?format=json'.format(port, r),
+        'http://127.0.0.1:4001/v2/blocks/{}?format=json'.format(r),
         headers={'X-Algo-API-Token': tok})
     return json.loads(urllib.request.urlopen(req, timeout=15).read())
 n = 0
@@ -299,7 +296,7 @@ for r in range(max(lo, 1), hi + 1):
     except Exception:
         pass
 print(n)
-" "$ALGOD_TOKEN" "$RUST_ACCOUNT" "$BASE_MAX" "$MAX" "$PHASE6_GO1_PORT" | tr -d '\r')"
+" "$ALGOD_TOKEN" "$RUST_ACCOUNT" "$BASE_MAX" "$MAX" | tr -d '\r')"
     echo "    blocks proposed in rounds $BASE_MAX..$MAX: $PROPOSED (expected ≈10% of the window)"
 fi
 

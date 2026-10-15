@@ -64,17 +64,6 @@ Notes:
 * Native Windows Python cannot take MSYS `C:/...` output paths from Git Bash; pass an
   absolute `/c/...` path to `--out`.
 
-### Host ports
-
-The nodes' REST APIs are published on `127.0.0.1:` `PHASE6_HOST_PORT_BASE` + node
-number (default base 4000: go-node-1..3 on 4001..4003, rust-node-4 on 4004,
-go-node-5 on 4005). When those are taken — an AlgoKit localnet occupies 4001/4002
-by default — `start.sh` stops before `docker compose up` and names the bound port;
-re-run with e.g. `PHASE6_HOST_PORT_BASE=5000 bash ops/mixed-cluster/scripts/consensus-conformance.sh`.
-The base is recorded in `netroot/.phase6-env`, so `status.sh`, `verify-soak.sh` and
-the Python checkers find the cluster afterwards without the variable (issue #1956;
-table in `ops/mixed-cluster/scripts/ports.sh` / `ports.py`).
-
 ## Run it in CI
 
 `Nightly Consensus Cluster` (`consensus-cluster.yml`):
