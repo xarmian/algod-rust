@@ -1521,7 +1521,7 @@ impl StateSchema {
             match rmp_decode::read_key_bytes(rd)? {
                 b"nui" => s.num_uint = rmp_decode::read_u64(rd)?,
                 b"nbs" => s.num_byte_slice = rmp_decode::read_u64(rd)?,
-                _ => rmp_decode::skip_value(rd)?,
+                other => rmp_decode::unknown_key(rd, other)?,
             }
         }
         Ok(s)
@@ -1542,7 +1542,7 @@ impl BoxRef {
             match rmp_decode::read_key_bytes(rd)? {
                 b"i" => s.index = rmp_decode::read_u64(rd)?,
                 b"n" => s.name = rmp_decode::read_optional(rd, rmp_decode::read_bytes_as_bytebuf)?,
-                _ => rmp_decode::skip_value(rd)?,
+                other => rmp_decode::unknown_key(rd, other)?,
             }
         }
         Ok(s)
@@ -1577,7 +1577,7 @@ impl AssetParams {
                 b"r" => s.reserve = rmp_decode::read_optional(rd, rmp_decode::read_address)?,
                 b"f" => s.freeze = rmp_decode::read_optional(rd, rmp_decode::read_address)?,
                 b"c" => s.clawback = rmp_decode::read_optional(rd, rmp_decode::read_address)?,
-                _ => rmp_decode::skip_value(rd)?,
+                other => rmp_decode::unknown_key(rd, other)?,
             }
         }
         Ok(s)
@@ -1597,7 +1597,7 @@ impl MultisigSubsig {
             match rmp_decode::read_key_bytes(rd)? {
                 b"pk" => s.public_key = rmp_decode::read_fixed_bytes::<32>(rd)?,
                 b"s" => s.signature = rmp_decode::read_fixed_bytes::<64>(rd)?,
-                _ => rmp_decode::skip_value(rd)?,
+                other => rmp_decode::unknown_key(rd, other)?,
             }
         }
         Ok(s)
@@ -1620,7 +1620,7 @@ impl MultisigSig {
                 b"subsig" => {
                     s.subsigs = rmp_decode::read_vec(rd, MultisigSubsig::decode_from_reader)?
                 }
-                _ => rmp_decode::skip_value(rd)?,
+                other => rmp_decode::unknown_key(rd, other)?,
             }
         }
         // go-algorand v4.7.2-stable marks Version/Threshold/Subsigs `codec:",required"`:
@@ -1675,7 +1675,7 @@ impl LogicSig {
                 b"pqsig" => {
                     s.pqsig = rmp_decode::read_optional(rd, crate::pq::PQSig::decode_from_reader)?
                 }
-                _ => rmp_decode::skip_value(rd)?,
+                other => rmp_decode::unknown_key(rd, other)?,
             }
         }
         if !has_logic {
@@ -1704,7 +1704,7 @@ impl HeartbeatProof {
                 b"p2" => s.pk2 = rmp_decode::read_fixed_bytes::<32>(rd)?,
                 b"p1s" => s.pk1_sig = rmp_decode::read_fixed_bytes::<64>(rd)?,
                 b"p2s" => s.pk2_sig = rmp_decode::read_fixed_bytes::<64>(rd)?,
-                _ => rmp_decode::skip_value(rd)?,
+                other => rmp_decode::unknown_key(rd, other)?,
             }
         }
         Ok(s)
@@ -1730,7 +1730,7 @@ impl HeartbeatTxnFields {
                 b"vid" => s.vote_id = rmp_decode::read_fixed_bytes::<32>(rd)?,
                 b"kd" => s.key_dilution = rmp_decode::read_u64(rd)?,
                 b"c" => s.hb_challenge_discount = rmp_decode::read_bool(rd)?,
-                _ => rmp_decode::skip_value(rd)?,
+                other => rmp_decode::unknown_key(rd, other)?,
             }
         }
         Ok(s)
@@ -1749,7 +1749,7 @@ impl HashFactory {
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
                 b"t" => s.hash_type = rmp_decode::read_u16(rd)?,
-                _ => rmp_decode::skip_value(rd)?,
+                other => rmp_decode::unknown_key(rd, other)?,
             }
         }
         Ok(s)
@@ -1777,7 +1777,7 @@ impl MerkleProof {
                     s.hash_factory = rmp_decode::read_optional(rd, HashFactory::decode_from_reader)?
                 }
                 b"td" => s.tree_depth = rmp_decode::read_u8_val(rd)?,
-                _ => rmp_decode::skip_value(rd)?,
+                other => rmp_decode::unknown_key(rd, other)?,
             }
         }
         Ok(s)
@@ -1796,7 +1796,7 @@ impl FalconVerifier {
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
                 b"k" => s.public_key = rmp_decode::read_bytes_as_bytebuf(rd)?,
-                _ => rmp_decode::skip_value(rd)?,
+                other => rmp_decode::unknown_key(rd, other)?,
             }
         }
         Ok(s)
@@ -1821,7 +1821,7 @@ impl MerkleSignature {
                     s.verifying_key =
                         rmp_decode::read_optional(rd, FalconVerifier::decode_from_reader)?
                 }
-                _ => rmp_decode::skip_value(rd)?,
+                other => rmp_decode::unknown_key(rd, other)?,
             }
         }
         Ok(s)
@@ -1841,7 +1841,7 @@ impl SigSlotCommit {
             match rmp_decode::read_key_bytes(rd)? {
                 b"s" => s.sig = rmp_decode::read_optional(rd, MerkleSignature::decode_from_reader)?,
                 b"l" => s.l = rmp_decode::read_u64(rd)?,
-                _ => rmp_decode::skip_value(rd)?,
+                other => rmp_decode::unknown_key(rd, other)?,
             }
         }
         Ok(s)
@@ -1861,7 +1861,7 @@ impl MerkleSignatureVerifier {
             match rmp_decode::read_key_bytes(rd)? {
                 b"cmt" => s.commitment = rmp_decode::read_fixed_bytes::<64>(rd)?,
                 b"lf" => s.key_lifetime = rmp_decode::read_u64(rd)?,
-                _ => rmp_decode::skip_value(rd)?,
+                other => rmp_decode::unknown_key(rd, other)?,
             }
         }
         Ok(s)
@@ -1884,7 +1884,7 @@ impl Participant {
                         rmp_decode::read_optional(rd, MerkleSignatureVerifier::decode_from_reader)?
                 }
                 b"w" => s.weight = rmp_decode::read_u64(rd)?,
-                _ => rmp_decode::skip_value(rd)?,
+                other => rmp_decode::unknown_key(rd, other)?,
             }
         }
         // go-algorand v4.7.2-stable marks `basics.Participant.PK` `codec:",required"`: the
@@ -1918,7 +1918,7 @@ impl Reveal {
                     s.sig_slot = rmp_decode::read_optional(rd, SigSlotCommit::decode_from_reader)?
                 }
                 b"p" => s.part = rmp_decode::read_optional(rd, Participant::decode_from_reader)?,
-                _ => rmp_decode::skip_value(rd)?,
+                other => rmp_decode::unknown_key(rd, other)?,
             }
         }
         // go-algorand v4.7.2-stable marks `stateproof.Reveal.Part` `codec:",required"`. The
@@ -1964,7 +1964,7 @@ impl StateProofBody {
                 b"pr" => {
                     s.positions_to_reveal = rmp_decode::read_optional_vec(rd, rmp_decode::read_u64)?
                 }
-                _ => rmp_decode::skip_value(rd)?,
+                other => rmp_decode::unknown_key(rd, other)?,
             }
         }
         Ok(s)
@@ -1987,7 +1987,7 @@ impl StateProofMessage {
                 b"P" => s.ln_proven_weight = rmp_decode::read_u64(rd)?,
                 b"f" => s.first_attested_round = rmp_decode::read_u64(rd)?,
                 b"l" => s.last_attested_round = rmp_decode::read_u64(rd)?,
-                _ => rmp_decode::skip_value(rd)?,
+                other => rmp_decode::unknown_key(rd, other)?,
             }
         }
         Ok(s)
@@ -2007,7 +2007,7 @@ impl HoldingRef {
             match rmp_decode::read_key_bytes(rd)? {
                 b"d" => s.address = rmp_decode::read_u64(rd)?,
                 b"s" => s.asset = rmp_decode::read_u64(rd)?,
-                _ => rmp_decode::skip_value(rd)?,
+                other => rmp_decode::unknown_key(rd, other)?,
             }
         }
         Ok(s)
@@ -2027,7 +2027,7 @@ impl LocalsRef {
             match rmp_decode::read_key_bytes(rd)? {
                 b"d" => s.address = rmp_decode::read_u64(rd)?,
                 b"p" => s.app = rmp_decode::read_u64(rd)?,
-                _ => rmp_decode::skip_value(rd)?,
+                other => rmp_decode::unknown_key(rd, other)?,
             }
         }
         Ok(s)
@@ -2051,7 +2051,7 @@ impl ResourceRef {
                 b"h" => s.holding = rmp_decode::read_optional(rd, HoldingRef::decode_from_reader)?,
                 b"l" => s.locals = rmp_decode::read_optional(rd, LocalsRef::decode_from_reader)?,
                 b"b" => s.box_ref = rmp_decode::read_optional(rd, BoxRef::decode_from_reader)?,
-                _ => rmp_decode::skip_value(rd)?,
+                other => rmp_decode::unknown_key(rd, other)?,
             }
         }
         Ok(s)
@@ -2207,7 +2207,7 @@ impl Transaction {
                     b"asnd" => {
                         t.asset_sender = rmp_decode::read_optional(rd, rmp_decode::read_address)?
                     }
-                    _ => rmp_decode::skip_value(rd)?,
+                    _ => rmp_decode::unknown_key(rd, key)?,
                 },
                 (4, b'c') if key == b"caid" => t.config_asset = rmp_decode::read_u64(rd)?,
                 (4, b'f') if key == b"fadd" => {
@@ -2253,10 +2253,10 @@ impl Transaction {
                             rmp_decode::read_optional(rd, rmp_decode::read_fixed_bytes::<32>)?
                     }
                     b"votelst" => t.vote_last = rmp_decode::read_u64(rd)?,
-                    _ => rmp_decode::skip_value(rd)?,
+                    _ => rmp_decode::unknown_key(rd, key)?,
                 },
                 // Unknown fields are skipped
-                _ => rmp_decode::skip_value(rd)?,
+                _ => rmp_decode::unknown_key(rd, key)?,
             }
         }
         // go-algorand v4.7.2-stable marks `type`/`snd` `codec:",required"`: the generated
@@ -2298,6 +2298,15 @@ impl SignedTransaction {
         let mut has_txn = false;
         for _ in 0..len {
             let key = rmp_decode::read_key_bytes(rd)?;
+            // Block-only keys (ApplyData and the genesis flags): go's SignedTxn
+            // has no such field, so a REST submit carrying one is an unknown
+            // key (strict mode only; blocks keep reading them).
+            if matches!(
+                key,
+                b"ca" | b"dt" | b"rs" | b"rr" | b"rc" | b"aca" | b"hgi" | b"hgh" | b"apid" | b"caid"
+            ) {
+                rmp_decode::reject_when_strict(rd, key)?;
+            }
             match (key.len(), key.first().copied().unwrap_or(0)) {
                 (2, b'c') if key == b"ca" => s.closing_amount = rmp_decode::read_u64(rd)?,
                 (2, b'd') if key == b"dt" => s.eval_delta = rmp_decode::read_optional_rmpv(rd)?,
@@ -2305,13 +2314,13 @@ impl SignedTransaction {
                     b"rs" => s.sender_rewards = rmp_decode::read_u64(rd)?,
                     b"rr" => s.receiver_rewards = rmp_decode::read_u64(rd)?,
                     b"rc" => s.close_rewards = rmp_decode::read_u64(rd)?,
-                    _ => rmp_decode::skip_value(rd)?,
+                    _ => rmp_decode::unknown_key(rd, key)?,
                 },
                 (3, b'a') if key == b"aca" => s.asset_closing_amount = rmp_decode::read_u64(rd)?,
                 (3, b'h') => match key {
                     b"hgi" => s.has_genesis_id = rmp_decode::read_bool(rd)?,
                     b"hgh" => s.has_genesis_hash = rmp_decode::read_bool(rd)?,
-                    _ => rmp_decode::skip_value(rd)?,
+                    _ => rmp_decode::unknown_key(rd, key)?,
                 },
                 (3, b's') if key == b"sig" => s.sig = rmp_decode::read_fixed_bytes::<64>(rd)?,
                 (3, b't') if key == b"txn" => {
@@ -2336,7 +2345,7 @@ impl SignedTransaction {
                 (4, b's') if key == b"sgnr" => {
                     s.auth_addr = rmp_decode::read_optional(rd, rmp_decode::read_address)?
                 }
-                _ => rmp_decode::skip_value(rd)?,
+                _ => rmp_decode::unknown_key(rd, key)?,
             }
         }
         // The serde path requires `txn` (no #[serde(default)]), so validate here.

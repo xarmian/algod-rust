@@ -110,6 +110,94 @@ pub fn check_msgpack_depth(bytes: &[u8]) -> Result<()> {
     skip_value(&mut rd)
 }
 
+// ── Strict unknown-field mode (issue #1962) ────────────────────────────
+//
+// go-algorand's `POST /v2/transactions` decodes with `protocol.NewDecoder`
+// (`ErrorIfNoField = true`): a key the target struct does not have is a 400
+// whose text carries the stream offset just after that key. The hand-written
+// readers below skip unknown keys (blocks and catchup depend on that), so the
+// REST handlers switch the strict mode on for the duration of one synchronous
+// group decode with [`strict_unknown_fields`]. The mode is thread-local and
+// scoped by the returned guard; it must not be held across an `.await`.
+
+use std::cell::Cell;
+
+thread_local! {
+    /// Address of the first byte of the body being decoded in strict mode.
+    static STRICT_BASE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// go's rejection of a key its struct lacks: `pos` is the offset, from the
+/// start of the whole request body, just after the key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownFieldError {
+    pub pos: usize,
+    pub key: String,
+}
+
+impl std::fmt::Display for UnknownFieldError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "msgpack decode error [pos {}]: no matching struct field found when decoding stream map with key {}",
+            self.pos, self.key
+        )
+    }
+}
+
+impl std::error::Error for UnknownFieldError {}
+
+/// Guard returned by [`strict_unknown_fields`]; restores the previous mode on drop.
+#[must_use = "strict mode ends when the guard is dropped"]
+pub struct StrictUnknownFieldsGuard {
+    prev: Option<usize>,
+}
+
+impl Drop for StrictUnknownFieldsGuard {
+    fn drop(&mut self) {
+        STRICT_BASE.with(|c| c.set(self.prev));
+    }
+}
+
+/// Reject unknown keys (as go's REST decoder does) while the guard is alive.
+/// `body` is the whole request body; the readers must be driven with slices
+/// of it so that positions count from its start.
+pub fn strict_unknown_fields(body: &[u8]) -> StrictUnknownFieldsGuard {
+    let prev = STRICT_BASE.with(|c| c.replace(Some(body.as_ptr() as usize)));
+    StrictUnknownFieldsGuard { prev }
+}
+
+fn unknown_field_error(rd: &[u8], key: &[u8], base: usize) -> AlgoError {
+    let e = UnknownFieldError {
+        pos: (rd.as_ptr() as usize).saturating_sub(base),
+        key: String::from_utf8_lossy(key).into_owned(),
+    };
+    AlgoError::Codec {
+        context: e.to_string(),
+        source: Box::new(e),
+    }
+}
+
+/// The fallback arm of every reader's key match: skip the value, or fail in
+/// strict mode. `rd` must point just after the already-read `key`.
+#[inline]
+pub fn unknown_key(rd: &mut &[u8], key: &[u8]) -> Result<()> {
+    match STRICT_BASE.with(Cell::get) {
+        Some(base) => Err(unknown_field_error(rd, key, base)),
+        None => skip_value(rd),
+    }
+}
+
+/// For keys a reader understands only because blocks carry them (go's
+/// `SignedTxn` has no such field): an error in strict mode, otherwise `Ok`.
+#[inline]
+pub fn reject_when_strict(rd: &[u8], key: &[u8]) -> Result<()> {
+    match STRICT_BASE.with(Cell::get) {
+        Some(base) => Err(unknown_field_error(rd, key, base)),
+        None => Ok(()),
+    }
+}
+
 /// Skip any msgpack value (handles all types, including arbitrarily
 /// nested containers).
 ///

@@ -134,7 +134,7 @@ impl PQSig {
                 b"slt" => s.salt = PQAddressSalt(crate::rmp_decode::read_u8_val(rd)?),
                 b"pk" => s.public_key = crate::rmp_decode::read_bytes_as_bytebuf(rd)?,
                 b"sig" => s.signature = crate::rmp_decode::read_bytes_as_bytebuf(rd)?,
-                _ => crate::rmp_decode::skip_value(rd)?,
+                other => crate::rmp_decode::unknown_key(rd, other)?,
             }
         }
         Ok(s)

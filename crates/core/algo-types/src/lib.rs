@@ -51,6 +51,7 @@ pub use pq::{
     PQ_SCHEME_FALCON1024,
 };
 pub use rmp_decode::check_msgpack_depth;
+pub use rmp_decode::{strict_unknown_fields, StrictUnknownFieldsGuard, UnknownFieldError};
 pub use round::Round;
 pub use transaction::{
     AssetParams, BoxRef, FalconVerifier, HashFactory, HeartbeatProof, HeartbeatTxnFields,
