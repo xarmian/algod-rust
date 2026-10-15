@@ -187,6 +187,44 @@ fn in_block_only_keys_are_unknown_in_strict_mode() {
     check(&map(vec![("hgh", vec![0xc3]), ("hgi", vec![0xc3]), sig(), t()]), 5, "hgh");
 }
 
+/// Every key the SignedTransaction reader accepts only because blocks carry it.
+#[test]
+fn every_block_only_key_is_unknown_in_strict_mode() {
+    for key in ["ca", "dt", "rs", "rr", "rc", "aca", "hgi", "hgh", "apid", "caid"] {
+        let body = map(vec![(key, uint(1)), sig(), ("txn", txn(None))]);
+        let u = unknown(decode_strict(&body).expect_err(key));
+        assert_eq!(u.key, key);
+        assert_eq!(u.pos, 2 + key.len(), "{key}: just after the first key");
+        assert_eq!(u.to_string(), go_text(2 + key.len(), key));
+    }
+}
+
+/// The nested readers of a transaction (asset params, state schemas, boxes,
+/// heartbeat) are strict too, not just the SignedTxn envelope.
+#[test]
+fn unknown_key_inside_nested_transaction_structs_is_rejected() {
+    let nested = |outer: &'static str, inner: Vec<u8>| {
+        map(vec![("txn", txn(Some((outer, inner)))), sig()])
+    };
+    let bad_map = || map(vec![("zzz", uint(1))]);
+    let cases = vec![
+        ("apar", bad_map()),
+        ("apgs", bad_map()),
+        ("apls", bad_map()),
+        ("hb", bad_map()),
+        ("apbx", {
+            let mut v = vec![0x91];
+            v.extend(bad_map());
+            v
+        }),
+    ];
+    for (outer, inner) in cases {
+        let u = unknown(decode_strict(&nested(outer, inner)).expect_err(outer));
+        assert_eq!(u.key, "zzz", "{outer}");
+        assert!(u.pos > 0, "{outer}");
+    }
+}
+
 /// Outside strict mode the readers still skip unknown keys (blocks, catchup).
 #[test]
 fn without_the_guard_unknown_keys_are_still_skipped() {

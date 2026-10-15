@@ -2300,7 +2300,9 @@ impl SignedTransaction {
             let key = rmp_decode::read_key_bytes(rd)?;
             // Block-only keys (ApplyData and the genesis flags): go's SignedTxn
             // has no such field, so a REST submit carrying one is an unknown
-            // key (strict mode only; blocks keep reading them).
+            // key (strict mode only; blocks keep reading them). Keep this list
+            // equal to the block-only arms below;
+            // `every_block_only_key_is_unknown_in_strict_mode` covers all ten.
             if matches!(
                 key,
                 b"ca" | b"dt" | b"rs" | b"rr" | b"rc" | b"aca" | b"hgi" | b"hgh" | b"apid" | b"caid"

@@ -22,7 +22,7 @@ class BodiesTest(unittest.TestCase):
         bodies = up.bodies()
         self.assertEqual(set(bodies), set(GO_POS))
         for name, (body, key) in bodies.items():
-            end = body.index(key.encode()) + len(key)
+            end = body.index(bytes([0xA0 + len(key)]) + key.encode()) + 1 + len(key)
             self.assertEqual(end, GO_POS[name], name)
 
     def test_expected_message_matches_go_text(self):

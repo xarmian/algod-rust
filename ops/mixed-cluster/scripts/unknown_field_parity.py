@@ -120,7 +120,7 @@ def main(argv=None):
     for name, (body, key) in sorted(bodies().items()):
         go, rust = post(a.go, body), post(a.rust, body)
         found = compare(name, go, rust)
-        pos = body.index(key.encode()) + len(key)
+        pos = body.index(_s(key)) + 1 + len(key)  # the key's fixstr header, then the key
         if message_of(go[1]) != expected_message(pos, key):
             found.append("{}: go answered {!r}, expected {!r}".format(name, message_of(go[1]), expected_message(pos, key)))
         print("{} {}".format("FAIL" if found else "ok  ", name), "" if not found else "; ".join(found))

@@ -123,8 +123,8 @@ pub fn check_msgpack_depth(bytes: &[u8]) -> Result<()> {
 use std::cell::Cell;
 
 thread_local! {
-    /// Address of the first byte of the body being decoded in strict mode.
-    static STRICT_BASE: Cell<Option<usize>> = const { Cell::new(None) };
+    /// (address of the first byte, length) of the body being decoded in strict mode.
+    static STRICT_BASE: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
 }
 
 /// go's rejection of a key its struct lacks: `pos` is the offset, from the
@@ -150,7 +150,10 @@ impl std::error::Error for UnknownFieldError {}
 /// Guard returned by [`strict_unknown_fields`]; restores the previous mode on drop.
 #[must_use = "strict mode ends when the guard is dropped"]
 pub struct StrictUnknownFieldsGuard {
-    prev: Option<usize>,
+    prev: Option<(usize, usize)>,
+    /// `!Send`: the mode is per-thread, so a guard held across an `.await`
+    /// (which may resume on another worker) must not compile.
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl Drop for StrictUnknownFieldsGuard {
@@ -163,13 +166,23 @@ impl Drop for StrictUnknownFieldsGuard {
 /// `body` is the whole request body; the readers must be driven with slices
 /// of it so that positions count from its start.
 pub fn strict_unknown_fields(body: &[u8]) -> StrictUnknownFieldsGuard {
-    let prev = STRICT_BASE.with(|c| c.replace(Some(body.as_ptr() as usize)));
-    StrictUnknownFieldsGuard { prev }
+    let prev = STRICT_BASE.with(|c| c.replace(Some((body.as_ptr() as usize, body.len()))));
+    StrictUnknownFieldsGuard {
+        prev,
+        _not_send: std::marker::PhantomData,
+    }
 }
 
-fn unknown_field_error(rd: &[u8], key: &[u8], base: usize) -> AlgoError {
+fn unknown_field_error(rd: &[u8], key: &[u8], (base, len): (usize, usize)) -> AlgoError {
+    let at = rd.as_ptr() as usize;
+    // The reader must be driven by slices of the body the guard was given;
+    // anything else would print a meaningless offset.
+    debug_assert!(
+        at >= base && at <= base + len,
+        "strict-mode reader is not inside the guarded body"
+    );
     let e = UnknownFieldError {
-        pos: (rd.as_ptr() as usize).saturating_sub(base),
+        pos: at.saturating_sub(base),
         key: String::from_utf8_lossy(key).into_owned(),
     };
     AlgoError::Codec {
