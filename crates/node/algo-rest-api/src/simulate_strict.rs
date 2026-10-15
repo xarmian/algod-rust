@@ -175,18 +175,12 @@ fn parse_request_pairs(pairs: Vec<(Value, Value)>) -> Option<DecodedMsgpackReque
 /// JSON string leaves that are text in go's structs (`string`, not `[]byte`).
 const TEXT_KEYS: &[&str] = &["type", "gen", "an", "un", "au"];
 
-/// Decode a checksummed 58-character Algorand address to its 32 bytes.
+/// Decode a checksummed 58-character Algorand address to its 32 bytes, with
+/// the canonical parser (checksum included).
 fn address_from_base32(text: &str) -> Option<[u8; 32]> {
-    use sha2::{Digest, Sha512_256};
-    let raw = data_encoding::BASE32_NOPAD.decode(text.as_bytes()).ok()?;
-    if raw.len() != 36 {
-        return None;
-    }
-    let (addr, checksum) = raw.split_at(32);
-    if Sha512_256::digest(addr)[28..32] != *checksum {
-        return None;
-    }
-    addr.try_into().ok()
+    algo_types::Address::from_algorand_string(text)
+        .ok()
+        .map(|a| a.0)
 }
 
 /// Convert go's JSON encoding of a request (`protocol.JSONStrictHandle`:
@@ -196,6 +190,13 @@ fn address_from_base32(text: &str) -> Option<[u8; 32]> {
 /// the same key tables decide which strings are addresses. `None` for
 /// anything that is not go's JSON form (a string that is not valid base64 or
 /// a checksummed address where bytes are expected, a non-integral number).
+///
+/// The key tables are `block_json`'s: go renders a `[]byte` as base64 and a
+/// `basics.Address` as base32 by Go type, which this crate recovers from the
+/// codec key; `address_keys_round_trip_through_block_json_rendering` pins the
+/// two directions together. A key the tables do not know is treated as
+/// base64 bytes, and a string that is not valid base64 makes the request fall
+/// back to the older handling rather than be misread.
 pub fn json_to_msgpack(v: &serde_json::Value, key: &str, parent: &str) -> Option<Value> {
     use base64::Engine;
     Some(match v {
@@ -523,6 +524,36 @@ mod tests {
             Value::Binary(vec![9u8; 32])
         );
         assert_eq!(json_to_msgpack(&serde_json::json!("AQID"), "m", "").unwrap(), Value::Binary(vec![1, 2, 3]));
+    }
+
+    /// The decoder shares `block_json`'s key tables with the encoder: every
+    /// address key renders (via `address_to_base32`) to a string that converts
+    /// back to the same 32 bytes, the asset-params letters only under `apar`.
+    #[test]
+    fn address_keys_round_trip_through_block_json_rendering() {
+        let bytes = [0x5Au8; 32];
+        let text = serde_json::json!(crate::block_json::address_to_base32(&bytes));
+        for key in crate::block_json::ADDRESS_KEYS {
+            assert_eq!(
+                json_to_msgpack(&text, key, "").unwrap(),
+                Value::Binary(bytes.to_vec()),
+                "{key}"
+            );
+        }
+        for key in crate::block_json::APAR_ADDRESS_KEYS {
+            assert_eq!(
+                json_to_msgpack(&text, key, "apar").unwrap(),
+                Value::Binary(bytes.to_vec()),
+                "{key} under apar"
+            );
+            // elsewhere the same letter is plain base64 bytes: a base32
+            // address string is not valid base64 of the same bytes
+            assert_ne!(
+                json_to_msgpack(&text, key, "").map(|v| v == Value::Binary(bytes.to_vec())),
+                Some(true),
+                "{key} outside apar"
+            );
+        }
     }
 
     #[test]
