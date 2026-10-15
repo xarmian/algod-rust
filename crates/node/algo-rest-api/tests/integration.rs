@@ -152,6 +152,8 @@ struct MockNode {
     pending_txn_lookup: BTreeMap<[u8; 32], TxnWithStatus>,
     /// Broadcast result: None = success, Some(msg) = error.
     broadcast_result: Option<String>,
+    /// Every group `broadcast_signed_tx_group` received (shared across clones).
+    broadcast_log: std::sync::Arc<std::sync::Mutex<Vec<Vec<SignedTransaction>>>>,
     /// Simulate result to return (None = use default NotImplemented).
     simulate_result: Option<algo_rest_api::models::SimulateResponse>,
     /// State deltas by round.
@@ -248,6 +250,7 @@ impl Clone for MockNode {
             pending_txns: self.pending_txns.clone(),
             pending_txn_lookup: self.pending_txn_lookup.clone(),
             broadcast_result: self.broadcast_result.clone(),
+            broadcast_log: self.broadcast_log.clone(),
             simulate_result: self.simulate_result.clone(),
             state_deltas: self.state_deltas.clone(),
             enable_developer_api: self.enable_developer_api,
@@ -364,6 +367,7 @@ impl MockNode {
             pending_txns: Vec::new(),
             pending_txn_lookup: BTreeMap::new(),
             broadcast_result: None,
+            broadcast_log: Default::default(),
             simulate_result: None,
             state_deltas: BTreeMap::new(),
             enable_developer_api: false,
@@ -1015,8 +1019,9 @@ impl NodeInterface for MockNode {
 
     async fn broadcast_signed_tx_group(
         &self,
-        _tx_group: Vec<SignedTransaction>,
+        tx_group: Vec<SignedTransaction>,
     ) -> Result<(), NodeError> {
+        self.broadcast_log.lock().unwrap().push(tx_group);
         match &self.broadcast_result {
             None => Ok(()),
             // Issue #1683: the pool is paused for a live catchup.
@@ -6503,6 +6508,47 @@ async fn raw_transaction_returns_txid() {
 
     let json: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(json["txId"].as_str().unwrap(), expected_txid);
+}
+
+/// Issue #1960: `POST /v2/transactions` decodes with the hand-written
+/// msgpack reader, which used to drop `pqsig`; the pool then saw an unsigned
+/// transaction. Real go-algorand `algokey pq sign` bytes (sender == the PQ
+/// address) must reach the broadcast intact, signature and all.
+#[tokio::test]
+async fn raw_transaction_keeps_the_pqsig_of_a_go_signed_pq_account_payment() {
+    let node = MockNode::synced();
+    let log = node.broadcast_log.clone();
+    let server = TestServer::start(node).await;
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+        "../../core/algo-codec/tests/fixtures/pqsig/signed_txn_pq_sender_is_signer.canonical.hex",
+    );
+    let hex_text = std::fs::read_to_string(&path).unwrap();
+    let body: Vec<u8> = hex_text
+        .trim()
+        .as_bytes()
+        .chunks(2)
+        .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap())
+        .collect();
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/x-binary")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+
+    let groups = log.lock().unwrap();
+    assert_eq!(groups.len(), 1);
+    let pq = groups[0][0]
+        .pqsig
+        .as_ref()
+        .expect("pqsig must survive the REST decode");
+    assert!(!pq.blank());
 }
 
 /// Round-3 review of #1727: go's `SignedTxn` msgp decoder rejects unknown
