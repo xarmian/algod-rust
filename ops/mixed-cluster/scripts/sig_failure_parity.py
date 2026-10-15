@@ -101,14 +101,16 @@ def window_cases(current_round=0):
         "submit_early": (_signed_window_stxn(fv, lv), msg.format(fv, lv)),
         "submit_dead": (_signed_window_stxn(1, 2), msg.format(1, 2)),
         "submit_bad_sig_and_early": (_signed_window_stxn(fv, lv, valid_signature=False), GO_MESSAGE),
-        # issue #1976: signatures, then the window, then the group fees
+        # issue #1976: signatures, then the window, then the group fees (the window
+        # must be at most 1000 rounds wide and cover the next round, or go calls the
+        # transaction malformed first)
         "submit_low_fee": (
-            _signed_window_stxn(1, current_round + 900, fee=1),
+            _signed_window_stxn(max(current_round, 1), current_round + 900, fee=1),
             "TransactionPool.Remember: txgroup with 1uA fees is less than 1mA (usage=1.000000 * base=1mA)",
         ),
         "submit_low_fee_and_early": (_signed_window_stxn(fv, lv, fee=1), msg.format(fv, lv)),
         "submit_low_fee_and_dead": (_signed_window_stxn(1, 2, fee=1), msg.format(1, 2)),
-        "submit_low_fee_bad_sig": (_signed_window_stxn(1, current_round + 900, valid_signature=False, fee=1), GO_MESSAGE),
+        "submit_low_fee_bad_sig": (_signed_window_stxn(max(current_round, 1), current_round + 900, valid_signature=False, fee=1), GO_MESSAGE),
     }
 
 
