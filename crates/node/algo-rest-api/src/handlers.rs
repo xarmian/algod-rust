@@ -3292,11 +3292,17 @@ pub async fn simulate_transaction<N: NodeInterface>(
     let (mut request, is_msgpack, raw_txns) = match parse_msgpack_request(&body) {
         MsgpackSimulate::Decoded(d) => (d.request, true, d.raw_txns),
         MsgpackSimulate::Rejected => return error::bad_request(GO_MSGPACK_REJECTION),
-        MsgpackSimulate::NotMsgpack => match serde_json::from_slice::<models::SimulateRequest>(&body) {
-            Ok(req) => (req, false, Vec::new()),
-            Err(e) => {
-                return error::bad_request(format!("could not decode simulate request: {e}"));
-            }
+        // JSON: go's own JSON form (base64 bytes, address strings) goes
+        // through the same pipeline as msgpack (issue #1972); anything else
+        // keeps the older serde-form handling.
+        MsgpackSimulate::NotMsgpack => match crate::simulate_strict::parse_json_request(&body) {
+            Some(d) => (d.request, true, d.raw_txns),
+            None => match serde_json::from_slice::<models::SimulateRequest>(&body) {
+                Ok(req) => (req, false, Vec::new()),
+                Err(e) => {
+                    return error::bad_request(format!("could not decode simulate request: {e}"));
+                }
+            },
         },
     };
 

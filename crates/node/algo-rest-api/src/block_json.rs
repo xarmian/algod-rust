@@ -56,7 +56,7 @@ use sha2::{Digest, Sha512_256};
 /// instead; the remaining short keys here (`a`, `d`) only collide with `uint64`
 /// fields, which decode as integers, not binary, so they are unambiguous for a
 /// binary leaf.
-const ADDRESS_KEYS: &[&str] = &[
+pub(crate) const ADDRESS_KEYS: &[&str] = &[
     "a",
     "aclose",
     "apat",
@@ -81,14 +81,14 @@ const ADDRESS_KEYS: &[&str] = &[
 /// These single letters collide with binary non-address fields elsewhere — most
 /// notably `c` is also `StateProof.SigCommit` (a 32-byte digest → base64) — so
 /// they are only treated as addresses when nested directly under `apar`.
-const APAR_ADDRESS_KEYS: &[&str] = &["c", "f", "m", "r"];
+pub(crate) const APAR_ADDRESS_KEYS: &[&str] = &["c", "f", "m", "r"];
 
 /// Codec keys whose binary value is a `bookkeeping.BlockHash`, rendered as
 /// `blk-` + base32 (no checksum).
 const BLOCKHASH_KEYS: &[&str] = &["prev"];
 
 /// Render 32 address bytes as a checksummed base32 Algorand address.
-fn address_to_base32(addr: &[u8; 32]) -> String {
+pub(crate) fn address_to_base32(addr: &[u8; 32]) -> String {
     let hash = Sha512_256::digest(addr);
     let mut payload = [0u8; 36];
     payload[..32].copy_from_slice(addr);

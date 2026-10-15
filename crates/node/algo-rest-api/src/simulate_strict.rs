@@ -36,7 +36,8 @@
 //! ```
 //!
 //! JSON bodies are a separate go path with their own offsets and are not
-//! handled here (see the follow-up issue linked from #1967).
+//! handled here (see #1971). They are decoded here only in go's JSON form
+//! (see [`parse_json_request`], issue #1972).
 
 use algo_types::{strict_unknown_fields, SignedTransaction};
 use rmpv::Value;
@@ -169,6 +170,87 @@ fn parse_request_pairs(pairs: Vec<(Value, Value)>) -> Option<DecodedMsgpackReque
             .zip(&raw_txns)
             .all(|(g, r)| g.txns.len() == r.len());
     aligned.then_some(DecodedMsgpackRequest { request, raw_txns })
+}
+
+/// JSON string leaves that are text in go's structs (`string`, not `[]byte`).
+const TEXT_KEYS: &[&str] = &["type", "gen", "an", "un", "au"];
+
+/// Decode a checksummed 58-character Algorand address to its 32 bytes.
+fn address_from_base32(text: &str) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha512_256};
+    let raw = data_encoding::BASE32_NOPAD.decode(text.as_bytes()).ok()?;
+    if raw.len() != 36 {
+        return None;
+    }
+    let (addr, checksum) = raw.split_at(32);
+    if Sha512_256::digest(addr)[28..32] != *checksum {
+        return None;
+    }
+    addr.try_into().ok()
+}
+
+/// Convert go's JSON encoding of a request (`protocol.JSONStrictHandle`:
+/// addresses as checksummed base32, other `[]byte` as base64, text as text,
+/// the same short keys as msgpack) into the msgpack value tree the strict
+/// parser works on. The inverse of `block_json`'s key-driven rendering, so
+/// the same key tables decide which strings are addresses. `None` for
+/// anything that is not go's JSON form (a string that is not valid base64 or
+/// a checksummed address where bytes are expected, a non-integral number).
+pub fn json_to_msgpack(v: &serde_json::Value, key: &str, parent: &str) -> Option<Value> {
+    use base64::Engine;
+    Some(match v {
+        serde_json::Value::Null => Value::Nil,
+        serde_json::Value::Bool(b) => Value::Boolean(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                Value::from(u)
+            } else {
+                Value::from(n.as_i64()?)
+            }
+        }
+        serde_json::Value::String(text) => {
+            if TEXT_KEYS.contains(&key) {
+                Value::String(text.as_str().into())
+            } else if crate::block_json::ADDRESS_KEYS.contains(&key)
+                || (crate::block_json::APAR_ADDRESS_KEYS.contains(&key) && parent == "apar")
+            {
+                Value::Binary(address_from_base32(text)?.to_vec())
+            } else {
+                Value::Binary(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(text.as_bytes())
+                        .ok()?,
+                )
+            }
+        }
+        serde_json::Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|i| json_to_msgpack(i, key, parent))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        serde_json::Value::Object(map) => Value::Map(
+            map.iter()
+                .map(|(k, val)| Some((Value::String(k.as_str().into()), json_to_msgpack(val, k, key)?)))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+    })
+}
+
+/// Parse a JSON simulate body written in go's JSON form (issue #1972) with
+/// the same strict pipeline as a msgpack body. `None` when the body is not
+/// JSON, is not go's JSON form, or the strict pipeline rejects it; the
+/// caller then keeps its older serde-form handling.
+pub fn parse_json_request(body: &[u8]) -> Option<DecodedMsgpackRequest> {
+    let json: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let serde_json::Value::Object(map) = &json else {
+        return None;
+    };
+    let pairs = map
+        .iter()
+        .map(|(k, v)| Some((Value::String(k.as_str().into()), json_to_msgpack(v, k, "")?)))
+        .collect::<Option<Vec<_>>>()?;
+    parse_request_pairs(pairs)
 }
 
 #[cfg(test)]
@@ -379,6 +461,85 @@ mod tests {
         assert_eq!(counts, vec![1, 3, 2]);
         let model: Vec<usize> = d.request.txn_groups.iter().map(|g| g.txns.len()).collect();
         assert_eq!(model, counts);
+    }
+
+    /// go's JSON form of the same transaction `stxn()` builds in msgpack:
+    /// addresses as checksummed base32, other bytes as base64, text as text.
+    fn go_json_stxn() -> serde_json::Value {
+        use base64::Engine;
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        serde_json::json!({
+            "sig": b64(&[7u8; 64]),
+            "txn": {
+                "type": "pay",
+                "snd": crate::block_json::address_to_base32(&[1u8; 32]),
+                "rcv": crate::block_json::address_to_base32(&[2u8; 32]),
+                "amt": 1000, "fee": 1000, "fv": 100, "lv": 1100,
+                "gh": b64(&[3u8; 32]),
+            }
+        })
+    }
+
+    fn json_request(stxns: Vec<serde_json::Value>, extra: serde_json::Value) -> Vec<u8> {
+        let mut req = serde_json::json!({ "txn-groups": [{ "txns": stxns }] });
+        if let (Some(r), Some(e)) = (req.as_object_mut(), extra.as_object()) {
+            r.extend(e.clone());
+        }
+        serde_json::to_vec(&req).unwrap()
+    }
+
+    /// Issue #1972: go's JSON form of a SignedTxn (base64 `sig`, address
+    /// strings) decodes to exactly the transaction the msgpack form does.
+    #[test]
+    fn go_json_form_decodes_to_the_same_transaction_as_msgpack() {
+        let from_json = parse_json_request(&json_request(
+            vec![go_json_stxn()],
+            serde_json::json!({"round": 9, "allow-empty-signatures": true}),
+        ))
+        .expect("go's JSON form decodes");
+        let from_msgpack = decode(&request(vec![stxn(vec![], vec![])], vec![], vec![])).unwrap();
+
+        let a: SignedTransaction = rmp_serde::from_slice(&from_json.raw_txns[0][0]).unwrap();
+        let b: SignedTransaction = rmp_serde::from_slice(&from_msgpack.raw_txns[0][0]).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.sig, [7u8; 64]);
+        assert_eq!(a.txn.sender.0, [1u8; 32]);
+        assert_eq!(a.txn.receiver.0, [2u8; 32]);
+        assert_eq!(a.txn.txn_type, "pay");
+        assert_eq!(from_json.request.round, Some(9));
+        assert_eq!(from_json.request.allow_empty_signatures, Some(true));
+    }
+
+    #[test]
+    fn json_text_keys_stay_text_and_other_strings_are_bytes() {
+        let t = |v: serde_json::Value, key: &str| json_to_msgpack(&v, key, "").unwrap();
+        assert_eq!(t(serde_json::json!("pay"), "type"), Value::String("pay".into()));
+        assert_eq!(t(serde_json::json!("My Asset"), "an"), Value::String("My Asset".into()));
+        assert_eq!(t(serde_json::json!("AQID"), "note"), Value::Binary(vec![1, 2, 3]));
+        // asset-params letters are addresses only under `apar`
+        let addr = crate::block_json::address_to_base32(&[9u8; 32]);
+        assert_eq!(
+            json_to_msgpack(&serde_json::json!(addr), "m", "apar").unwrap(),
+            Value::Binary(vec![9u8; 32])
+        );
+        assert_eq!(json_to_msgpack(&serde_json::json!("AQID"), "m", "").unwrap(), Value::Binary(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn json_that_is_not_go_form_is_none() {
+        // an address with a bad checksum, bytes that are not base64, a float
+        let bad_addr = "A".repeat(58);
+        assert!(json_to_msgpack(&serde_json::json!(bad_addr), "snd", "txn").is_none());
+        assert!(json_to_msgpack(&serde_json::json!("not base64!"), "sig", "").is_none());
+        assert!(json_to_msgpack(&serde_json::json!(1.5), "amt", "").is_none());
+        // Rust's own serde form (numbers for bytes) is not go's JSON form either
+        let serde_form = serde_json::to_vec(&serde_json::json!({
+            "txn-groups": [{"txns": [{"sig": vec![0u8; 64]}]}]
+        }))
+        .unwrap();
+        assert!(parse_json_request(&serde_form).is_none());
+        assert!(parse_json_request(b"[]").is_none());
+        assert!(parse_json_request(b"not json").is_none());
     }
 
     #[test]
