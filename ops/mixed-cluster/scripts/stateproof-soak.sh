@@ -45,6 +45,8 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=ports.sh
+source "$HERE/ports.sh"  # PHASE6_HOST_PORT_BASE -> PHASE6_*_PORT (issue #1956)
 ROOT="$(cd "$HERE/.." && pwd)"
 
 SP_ROUND="${SP_ROUND:-512}"
@@ -120,7 +122,7 @@ RUST_SUBMITTED="$(grep -c 'stateproof: submitted StateProofTx' "$OUT_DIR/rust-no
 rm -f "$OUT_DIR"/phase6-go-node-*.log.full
 RUST_FALCON_ERR="$(grep -i 'falcon' "$OUT_DIR/rust-node.log" | grep -ci 'error\|fail\|invalid' || true)"
 RUST_BACKEND_LINE="$(grep -i 'falcon-1024 backend selected' "$OUT_DIR/rust-node.log" | tail -1 | tr -d '\r' || true)"
-RUST_LAST_ROUND="$(curl -sf -H "X-Algo-API-Token: ${ALGOD_TOKEN:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" http://127.0.0.1:4004/v2/status 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('last-round'))" 2>/dev/null | tr -d '\r' || true)"
+RUST_LAST_ROUND="$(curl -sf -H "X-Algo-API-Token: ${ALGOD_TOKEN:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" "http://127.0.0.1:$PHASE6_RUST_PORT/v2/status" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('last-round'))" 2>/dev/null | tr -d '\r' || true)"
 
 SUMMARY_OK=false
 if [ "$CHECK_RC" = "0" ] && [ "${RUST_FALCON_ERR:-0}" = "0" ] && [ "${RUST_SIGNED:-0}" -ge 1 ] \

@@ -12,7 +12,11 @@
 #
 # The 4 nodes talk to each other via the `phase6net` bridge network using
 # container-DNS hostnames. Every node's REST API is exposed on a distinct
-# host port (4001-4003 for Go, 4004 for Rust) for off-cluster inspection.
+# host port (4001-4003 for Go, 4004 for Rust, 4005 for the catchpoint-interop
+# Go client) for off-cluster inspection. The host ports are
+# PHASE6_HOST_PORT_BASE + node number; scripts/ports.sh exports the per-node
+# PHASE6_*_PORT variables interpolated below (issue #1956: an AlgoKit
+# localnet occupies 4001/4002 by default).
 #
 # Scope (issue #469 — Epic 42b):
 #   - All 4 nodes start, see each other as peers, share one genesis.
@@ -61,7 +65,7 @@ services:
       # Bound to 127.0.0.1 so the harness REST stays local-only even
       # though the committed token is the trivial "aaaa..." value. Use
       # `docker compose exec` or edit the binding for off-host access.
-      - "127.0.0.1:4001:8080"
+      - "127.0.0.1:${PHASE6_GO1_PORT:-4001}:8080"
       # Gossip listener, published for go-node-1 only so the issue-#472
       # negative-conformance injector (`algo-agreement-fuzz`) can open a
       # normal gossip connection from the host and send a single malformed
@@ -99,7 +103,7 @@ services:
       - ADMIN_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - PEER_ADDRESS=go-node-1:4161;go-node-3:4161
     ports:
-      - "127.0.0.1:4002:8080"
+      - "127.0.0.1:${PHASE6_GO2_PORT:-4002}:8080"
     volumes:
       - ./netroot/Node2:/algod/data
     healthcheck:
@@ -127,7 +131,7 @@ services:
       - ADMIN_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - PEER_ADDRESS=go-node-1:4161;go-node-2:4161
     ports:
-      - "127.0.0.1:4003:8080"
+      - "127.0.0.1:${PHASE6_GO3_PORT:-4003}:8080"
     volumes:
       - ./netroot/Node3:/algod/data
     healthcheck:
@@ -227,7 +231,7 @@ services:
       - --rest-listen=0.0.0.0:8080
       - --data-dir=/data
     ports:
-      - "127.0.0.1:4004:8080"
+      - "127.0.0.1:${PHASE6_RUST_PORT:-4004}:8080"
     volumes:
       - rust-node-4-data:/app
       - ./netroot:/netroot:ro
@@ -273,7 +277,7 @@ services:
       # algod-rust's `CatchpointService`.
       - PEER_ADDRESS=rust-node-4:4162
     ports:
-      - "127.0.0.1:4005:8080"
+      - "127.0.0.1:${PHASE6_GO5_PORT:-4005}:8080"
     volumes:
       - ./netroot/Node5Go:/algod/data
     depends_on:

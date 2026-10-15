@@ -51,6 +51,9 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ports  # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 WORKLOAD_DIR = os.path.join(ROOT, "workload")
@@ -59,8 +62,8 @@ GO_CONTAINER = "phase6-go-node-1"
 DATA_DIR = "/algod/data"
 WORK_DIR = "/tmp/w"
 TOKEN = os.environ.get("ALGOD_TOKEN", "a" * 64)
-# name -> REST port (matches docker-compose.yml)
-NODE_PORTS = {"go-node-1": 4001, "go-node-2": 4002, "go-node-3": 4003, "rust-node-4": 4004}
+# name -> REST host port (docker-compose.yml, PHASE6_HOST_PORT_BASE; issue #1956)
+NODE_PORTS = {n: ports.node_port(n) for n in ("go-node-1", "go-node-2", "go-node-3", "rust-node-4")}
 NEGATIVE_TARGETS = ("go-node-1", "rust-node-4")
 
 TXID_RE = re.compile(r"\b[A-Z2-7]{52}\b")

@@ -114,6 +114,8 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=ports.sh
+source "$HERE/ports.sh"  # PHASE6_HOST_PORT_BASE -> PHASE6_*_PORT (issue #1956)
 ROOT="$(cd "$HERE/.." && pwd)"
 REPO_ROOT="$(cd "$ROOT/../.." && pwd)"
 
@@ -277,7 +279,7 @@ deadline=$(( $(date +%s) + 300 ))
 all_up=0
 while [ "$(date +%s)" -lt "$deadline" ]; do
     all_up=1
-    for port in 4001 4002 4003 4004; do
+    for port in "$PHASE6_GO1_PORT" "$PHASE6_GO2_PORT" "$PHASE6_GO3_PORT" "$PHASE6_RUST_PORT"; do
         r="$(node_round "$port")"
         [[ "$r" =~ ^[0-9]+$ ]] || all_up=0
     done
@@ -309,7 +311,7 @@ record "rust_account_discovered" pass "$RUST_ACCOUNT"
 NEXT_STEP_PHASE="skipped"
 if [ "$FORCE_NEXT_STEP" = "1" ]; then
     echo "==> forcing period advancement: pausing $PAUSE_TARGET for ${PAUSE_SECONDS}s"
-    before_round="$(node_round 4004)"
+    before_round="$(node_round "$PHASE6_RUST_PORT")"
     if docker pause "$PAUSE_TARGET" >/dev/null 2>&1; then
         sleep "$PAUSE_SECONDS"
         docker unpause "$PAUSE_TARGET" >/dev/null 2>&1 || true
@@ -320,7 +322,7 @@ if [ "$FORCE_NEXT_STEP" = "1" ]; then
         while [ "$(date +%s)" -lt "$rdeadline" ]; do
             spread_ok=1
             mx=-1; mn=-1
-            for port in 4001 4002 4003 4004; do
+            for port in "$PHASE6_GO1_PORT" "$PHASE6_GO2_PORT" "$PHASE6_GO3_PORT" "$PHASE6_RUST_PORT"; do
                 r="$(node_round "$port")"
                 if ! [[ "$r" =~ ^[0-9]+$ ]]; then
                     spread_ok=0

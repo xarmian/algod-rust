@@ -44,6 +44,8 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=ports.sh
+source "$HERE/ports.sh"  # PHASE6_HOST_PORT_BASE -> PHASE6_*_PORT (issue #1956)
 ROOT="$(cd "$HERE/.." && pwd)"
 
 ROUNDS=200
@@ -159,12 +161,12 @@ fi
 WORKLOAD_PID=""
 BLOCKCOMPARE_PID=""
 if [ "$WORKLOAD" = "rich" ]; then
-    START_JSON="$(curl -sf -H "X-Algo-API-Token: $ALGOD_TOKEN" http://127.0.0.1:4001/v2/status || true)"
+    START_JSON="$(curl -sf -H "X-Algo-API-Token: $ALGOD_TOKEN" "http://127.0.0.1:$PHASE6_GO1_PORT/v2/status" || true)"
     START_ROUND="$(printf '%s' "$START_JSON" \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["last-round"])' 2>/dev/null || true)"
     START_ROUND="${START_ROUND//$'\r'/}"
     if ! [[ "$START_ROUND" =~ ^[0-9]+$ ]]; then
-        echo "error: could not read the start round from go-node-1 (GET http://127.0.0.1:4001/v2/status failed or returned no last-round)" >&2
+        echo "error: could not read the start round from go-node-1 (GET http://127.0.0.1:$PHASE6_GO1_PORT/v2/status failed or returned no last-round)" >&2
         exit 2
     fi
     echo "==> rich workload: seed=$WORKLOAD_SEED start_round=$START_ROUND"

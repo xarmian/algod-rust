@@ -73,6 +73,8 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=ports.sh
+source "$HERE/ports.sh"  # PHASE6_HOST_PORT_BASE -> PHASE6_*_PORT (issue #1956)
 ROOT="$(cd "$HERE/.." && pwd)"
 REPO_ROOT="$(cd "$ROOT/../.." && pwd)"
 
@@ -92,9 +94,9 @@ OUT_DIR="${OUT_DIR:-$ROOT/restart-$RUN_ID}"
 SUMMARY_JSON="${SUMMARY_JSON:-$OUT_DIR/restart-summary.json}"
 
 GO_CONTAINERS=(phase6-go-node-1 phase6-go-node-2 phase6-go-node-3)
-GO_PORTS=(4001 4002 4003)
+GO_PORTS=("$PHASE6_GO1_PORT" "$PHASE6_GO2_PORT" "$PHASE6_GO3_PORT")
 RUST_CONTAINER=phase6-rust-node-4
-RUST_PORT=4004
+RUST_PORT="$PHASE6_RUST_PORT"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -409,7 +411,7 @@ run_scenario() {  # run_scenario <name> <graceful|kill|proposer>
     local fork_rc=0
     if [ -x "$FORK_BIN" ] && [ "$fork_to" -gt "$fork_from" ]; then
         "$FORK_BIN" \
-            --nodes "go-node-1=http://127.0.0.1:4001,go-node-2=http://127.0.0.1:4002,go-node-3=http://127.0.0.1:4003,rust-node-4=http://127.0.0.1:4004" \
+            --nodes "go-node-1=http://127.0.0.1:$PHASE6_GO1_PORT,go-node-2=http://127.0.0.1:$PHASE6_GO2_PORT,go-node-3=http://127.0.0.1:$PHASE6_GO3_PORT,rust-node-4=http://127.0.0.1:$PHASE6_RUST_PORT" \
             --from-round "$fork_from" --to-round "$fork_to" \
             --token-file "$TOKEN_FILE" --jsonl-out "$fork_out" \
             > "$OUT_DIR/$scen.fork.log" 2>&1 || fork_rc=$?
@@ -435,7 +437,7 @@ run_scenario() {  # run_scenario <name> <graceful|kill|proposer>
     if [ -n "$proposal_round" ]; then
         local winner
         winner="$(curl -sf --max-time 5 -H "X-Algo-API-Token: $ALGOD_TOKEN" \
-            "http://127.0.0.1:4001/v2/blocks/$proposal_round?format=json" 2>/dev/null \
+            "http://127.0.0.1:$PHASE6_GO1_PORT/v2/blocks/$proposal_round?format=json" 2>/dev/null \
             | python3 -c "
 import json, sys
 try:
