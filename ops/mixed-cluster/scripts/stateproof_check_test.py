@@ -96,14 +96,14 @@ class CheckTest(unittest.TestCase):
         self.assertFalse(checks["state_proof_identical_on_go_nodes"]["ok"])
         self.assertIn("2 distinct", checks["state_proof_identical_on_go_nodes"]["detail"])
 
-    def test_rust_endpoint_gap_is_informational_not_a_failure(self):
+    def test_rust_endpoint_not_served_is_a_failure(self):
         proofs = {n: PROOF for n in NODES}
         del proofs["rust-node-4"]  # 404, issue #1952
         checks = by_name(sc.run_checks(fake(proofs=proofs), NODES, 512, 2))
         self.assertTrue(checks["state_proof_served_by_go_nodes"]["ok"])
         c = checks["rust_state_proof_endpoint_rust-node-4"]
-        self.assertTrue(c["ok"])
-        self.assertIn("1952", c["detail"])
+        self.assertFalse(c["ok"])
+        self.assertIn("not served", c["detail"])
 
     def test_rust_endpoint_serving_the_same_proof_is_reported(self):
         checks = by_name(sc.run_checks(fake(), NODES, 512, 2))

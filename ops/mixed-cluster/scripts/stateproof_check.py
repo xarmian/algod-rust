@@ -29,10 +29,7 @@ every node. This script waits for that proof and asserts:
      rejected, or forked over, the block that carries the proof;
   5. the header tracking is identical on every node at that last round;
   6. `GET /v2/stateproofs/{round}` returns the identical state-proof message
-     and proof bytes on every go-algorand node. algod-rust does not serve this
-     endpoint yet (always 404, issue #1952): its result is reported but is not
-     a failure, because checks 3-5 already prove the Rust node holds the same
-     committed proof.
+     and proof bytes on every node, algod-rust included (issue #1952).
 
 Output is one JSON object (`stateproof_check`) on stdout; exit codes: 0 all
 checks passed, 2 a check failed, 3 timed out / nodes unreachable.
@@ -192,7 +189,7 @@ def run_checks(fetch, nodes, proof_round, margin, commit_round=None, fetch_raw=N
             "{} distinct block encoding(s) at round {}".format(len(distinct_blocks), commit_round),
         )
 
-    # 3. the REST endpoint: required of the go-algorand nodes, informational for algod-rust
+    # 3. the REST endpoint: required of every node, algod-rust included (issue #1952)
     proofs = {}
     for node in nodes:
         status, body = fetch(node, "/v2/stateproofs/{}".format(proof_round))
@@ -216,9 +213,9 @@ def run_checks(fetch, nodes, proof_round, margin, commit_round=None, fetch_raw=N
             same = payload is not None and payload in distinct
             add(
                 "rust_state_proof_endpoint_" + node,
-                True,  # informational until issue #1952 is fixed
+                same,
                 "HTTP {}; {}".format(status, "identical to the Go nodes'" if same
-                                     else "not served (known gap, issue #1952)"),
+                                     else "not served or differs from the Go nodes'"),
             )
 
     # 3. identical block hashes from the proven round through the commit + margin
