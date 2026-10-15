@@ -48,6 +48,10 @@ class FakeEnv:
         self.wallet = None
         self.pq_keys = 0
         self.pending_confirmed = True  # /v2/transactions/pending/<id> reports a confirmed round
+        self.pending_broken_on = ()  # nodes whose pending endpoint raises
+        self.rest_calls = []
+        self.min_fee = None  # reported by /v2/transactions/params when set
+        self.signed_file_unreadable = False
 
     def _next_tx(self):
         self.n += 1
@@ -61,7 +65,7 @@ class FakeEnv:
         if "algokey pq generate" in cmd:
             self.pq_keys += 1
             return 0, ("PQ private key mnemonic: a b c\nPQ scheme: falcon-1024\nPQ public key: AAAA\n"
-                       "PQ address salt: 0\nPQ address: {}\n").format(("P%057d" % self.pq_keys).replace("0", "A").replace("1", "B").replace("2", "C"))
+                       "PQ address salt: 0\nPQ address: {}\n").format("P" + "A" * 56 + "ABCDEFGHIJ"[self.pq_keys])
         t = self._next_tx()
         if "rawsend" in cmd:
             self.round += 1
@@ -103,16 +107,26 @@ class FakeEnv:
             addr = path.rsplit("/", 1)[-1]
             return {"amount": self.balances.get(addr, self.default_balance), "min-balance": 100000,
                     "created-assets": [{"index": self.asset}], "created-apps": [{"id": self.app}]}
+        self.rest_calls.append((node, path))
+        if path == "/v2/transactions/params" and self.min_fee is not None:
+            return {"min-fee": self.min_fee, "last-round": self.round}
         if "/v2/transactions/pending/" in path:
+            if node in self.pending_broken_on:
+                raise OSError("pending lookup failed on " + node)
             self.pending_polls = getattr(self, "pending_polls", 0) + 1
             return {"confirmed-round": self.round + 1 if self.pending_confirmed else 0}
         return {"last-round": self.round}
 
     def post_txn(self, node, raw):
         self.posts.append((node, raw))
-        return self.post_status[node], json.dumps({"txId": txid(900 + len(self.posts))})
+        st = self.post_status[node]
+        if isinstance(st, list):  # scripted per-call statuses; the last one repeats
+            st = st.pop(0) if len(st) > 1 else st[0]
+        return st, json.dumps({"txId": txid(900 + len(self.posts))})
 
     def fetch_file_b64(self, path):
+        if self.signed_file_unreadable:
+            return 1, ""
         return 0, base64.b64encode(b"signed-bytes").decode()
 
     def put_file(self, local, remote):
@@ -421,6 +435,83 @@ class PqScenarioTest(unittest.TestCase):
         bad = [s for s in self.steps(out) if s["op"].startswith("pq_pay_via_")]
         self.assertEqual((bad[0]["outcome"], bad[0]["ok"]), ("rejected", False))
         self.assertLessEqual(env.pending_polls, wl.PQ_CONFIRM_POLLS)
+
+    def test_the_pq_account_is_created_once_and_reused_across_draws(self):
+        env = FakeEnv(post_status=dict(ACCEPT))
+        w, out = self.run_pq(env)
+        w.sc_pq()
+        w.sc_pq()
+        self.assertEqual(sum("algokey pq generate" in c for c in env.cmds), 1)
+        self.assertEqual(len(env.posts), 4)
+        pq_addr = "P" + "A" * 56 + "B"
+        funding = [c for c in env.cmds if "clerk send" in c and "-t " + pq_addr in c]
+        self.assertEqual(len(funding), 1, "an adequately funded reused account is not funded again")
+
+    def test_a_drained_reused_pq_account_is_topped_up(self):
+        env = FakeEnv(post_status=dict(ACCEPT))
+        w, out = self.run_pq(env)
+        w.sc_pq()
+        env.balances["P" + "A" * 56 + "B"] = 1000  # drained (below its min balance)
+        w.sc_pq()
+        pq_addr = "P" + "A" * 56 + "B"
+        funding = [c for c in env.cmds if "clerk send" in c and "-t " + pq_addr in c]
+        self.assertEqual(len(funding), 2)
+
+    def test_confirmation_is_polled_on_the_submitting_node(self):
+        env = FakeEnv(post_status=dict(ACCEPT))
+        w, out = self.run_pq(env)
+        w.sc_pq()
+        polled = [n for n, p in env.rest_calls if "/v2/transactions/pending/" in p]
+        self.assertIn("rust-node-4", polled)
+        self.assertIn("go-node-1", polled)
+
+    def test_confirmation_falls_back_to_go_node_when_the_submitter_cannot_answer(self):
+        env = FakeEnv(post_status=dict(ACCEPT))
+        env.pending_broken_on = ("rust-node-4",)
+        w, out = self.run_pq(env)
+        w.sc_pq()
+        pq = [s for s in self.steps(out) if s["op"].startswith("pq_pay_via_")]
+        self.assertTrue(all(s["ok"] for s in pq))
+
+    def test_a_transient_submit_failure_is_retried_once(self):
+        env = FakeEnv(post_status={"go-node-1": 200, "rust-node-4": [503, 200]})
+        w, out = self.run_pq(env)
+        w.sc_pq()
+        self.assertEqual([n for n, _ in env.posts], ["go-node-1", "rust-node-4", "rust-node-4"])
+        self.assertEqual(w.counters["unexpected"], 0)
+
+    def test_a_connect_error_is_retried_but_a_real_rejection_is_not(self):
+        env = FakeEnv(post_status={"go-node-1": [0, 200], "rust-node-4": 400})
+        w, out = self.run_pq(env)
+        with self.assertRaises(wl.ScenarioAbort):
+            w.sc_pq()
+        self.assertEqual([n for n, _ in env.posts], ["go-node-1", "go-node-1", "rust-node-4"])
+
+    def test_an_unreadable_signed_file_is_a_recorded_failed_step(self):
+        env = FakeEnv(post_status=dict(ACCEPT))
+        env.signed_file_unreadable = True
+        w, out = self.run_pq(env)
+        with self.assertRaises(wl.ScenarioAbort):
+            w.sc_pq()
+        bad = [s for s in self.steps(out) if s["op"].startswith("pq_pay_via_")]
+        self.assertEqual((bad[0]["outcome"], bad[0]["ok"]), ("error", False))
+        self.assertEqual(w.counters["unexpected"], 1)
+        self.assertEqual(env.posts, [])
+
+    def test_the_fee_scales_with_the_nodes_min_fee(self):
+        env = FakeEnv(post_status=dict(ACCEPT))
+        env.min_fee = 2000
+        w, out = self.run_pq(env)
+        w.sc_pq()
+        builds = [c for c in env.cmds if "clerk send -f P" in c and " -o " in c]
+        self.assertTrue(builds and all("--fee 40000" in c for c in builds), builds)
+
+    def test_the_fee_defaults_to_the_historical_min_fee_when_params_are_unavailable(self):
+        env = FakeEnv(post_status=dict(ACCEPT))
+        w, out = self.run_pq(env)
+        w.sc_pq()
+        builds = [c for c in env.cmds if "clerk send -f P" in c and " -o " in c]
+        self.assertTrue(all("--fee 20000" in c for c in builds), builds)
 
     def test_key_generation_failure_aborts_before_anything_is_submitted(self):
         env = FakeEnv(fail=("pq generate",), post_status=dict(ACCEPT))
