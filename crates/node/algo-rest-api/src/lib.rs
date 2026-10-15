@@ -38,6 +38,7 @@ pub mod pq_compliance;
 pub mod process_metrics;
 pub mod router;
 pub mod server;
+pub mod simulate_strict;
 pub mod source_header;
 
 // Re-export key types for convenience.

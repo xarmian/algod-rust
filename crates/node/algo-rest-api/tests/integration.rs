@@ -156,6 +156,8 @@ struct MockNode {
     broadcast_log: std::sync::Arc<std::sync::Mutex<Vec<Vec<SignedTransaction>>>>,
     /// Simulate result to return (None = use default NotImplemented).
     simulate_result: Option<algo_rest_api::models::SimulateResponse>,
+    /// Every request `simulate` received (shared across clones).
+    simulate_log: std::sync::Arc<std::sync::Mutex<Vec<algo_rest_api::models::SimulateRequest>>>,
     /// State deltas by round.
     state_deltas: BTreeMap<u64, StateDelta>,
     /// Whether the developer API is enabled.
@@ -252,6 +254,7 @@ impl Clone for MockNode {
             broadcast_result: self.broadcast_result.clone(),
             broadcast_log: self.broadcast_log.clone(),
             simulate_result: self.simulate_result.clone(),
+            simulate_log: self.simulate_log.clone(),
             state_deltas: self.state_deltas.clone(),
             enable_developer_api: self.enable_developer_api,
             enable_experimental_api: self.enable_experimental_api,
@@ -369,6 +372,7 @@ impl MockNode {
             broadcast_result: None,
             broadcast_log: Default::default(),
             simulate_result: None,
+            simulate_log: Default::default(),
             state_deltas: BTreeMap::new(),
             enable_developer_api: false,
             enable_experimental_api: false,
@@ -1045,8 +1049,9 @@ impl NodeInterface for MockNode {
 
     async fn simulate(
         &self,
-        _request: algo_rest_api::models::SimulateRequest,
+        request: algo_rest_api::models::SimulateRequest,
     ) -> Result<algo_rest_api::models::SimulateResponse, NodeError> {
+        self.simulate_log.lock().unwrap().push(request);
         match &self.simulate_result {
             Some(resp) => Ok(resp.clone()),
             None => Err(NodeError::NotImplemented("simulate")),
@@ -8241,6 +8246,120 @@ async fn simulate_in_block_only_field_returns_400() {
             && msg.contains("Unknown field: hgi"),
         "{msg}"
     );
+}
+
+/// Issue #1967: a msgpack simulate body with a key go's structs lack is a 400
+/// with go's fixed text (captured from a go-algorand v5.0.3-stable node).
+#[tokio::test]
+async fn simulate_msgpack_unknown_key_returns_gos_fixed_text() {
+    use rmpv::Value;
+    let s = |x: &str| Value::String(x.into());
+    // the canonical msgpack encoding is what a client would send
+    let ok_stxn = algo_codec::canonical_encode_signed_transaction(&make_test_signed_txn());
+    let ok_val = rmpv::decode::read_value(&mut &ok_stxn[..]).unwrap();
+    let request = |top_extra: Vec<(Value, Value)>| {
+        let mut p = vec![(
+            s("txn-groups"),
+            Value::Array(vec![Value::Map(vec![(s("txns"), Value::Array(vec![ok_val.clone()]))])]),
+        )];
+        p.extend(top_extra);
+        let mut out = Vec::new();
+        rmpv::encode::write_value(&mut out, &Value::Map(p)).unwrap();
+        out
+    };
+    let server = TestServer::start(MockNode::synced()).await;
+    let post = |body: Vec<u8>| {
+        server
+            .client
+            .post(server.url("/v2/transactions/simulate"))
+            .header("X-Algo-API-Token", &server.api_token)
+            .header("Content-Type", "application/msgpack")
+            .body(body)
+            .send()
+    };
+
+    let resp = post(request(vec![(s("zzz"), Value::from(1u64))])).await.unwrap();
+    assert_eq!(resp.status(), 400);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        json["message"].as_str().unwrap(),
+        "failed to decode object: json decode error [pos 1]: only encoded map or array can be decoded into a struct"
+    );
+
+    // a clean request is not rejected by the decoder (the mock has no simulate result: 500)
+    let resp = post(request(vec![])).await.unwrap();
+    assert_ne!(resp.status(), 400, "{}", resp.text().await.unwrap());
+}
+
+/// Issue #1968: a msgpack request carries binary addresses and signatures,
+/// which `serde_json::Value` cannot hold; the Rust node answered 400 "could
+/// not decode simulate request" while go decodes it. The msgpack and JSON
+/// encodings of the same request must reach `Node::simulate` as the same
+/// transactions.
+#[tokio::test]
+async fn simulate_msgpack_with_binary_fields_decodes_like_json() {
+    use rmpv::Value;
+    let stxn = make_test_signed_txn();
+    let node = MockNode::synced();
+    let log = node.simulate_log.clone();
+    let server = TestServer::start(node).await;
+
+    let bytes = algo_codec::canonical_encode_signed_transaction(&stxn);
+    let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+    let mut mp = Vec::new();
+    rmpv::encode::write_value(
+        &mut mp,
+        &Value::Map(vec![
+            (
+                Value::String("txn-groups".into()),
+                Value::Array(vec![Value::Map(vec![(
+                    Value::String("txns".into()),
+                    Value::Array(vec![val.clone(), val]),
+                )])]),
+            ),
+            (Value::String("round".into()), Value::from(42u64)),
+            (Value::String("fix-signers".into()), Value::Boolean(true)),
+        ]),
+    )
+    .unwrap();
+    // the in-block-only flags are not part of go's SignedTxn (a 400 on submit)
+    let mut jv = serde_json::to_value(&stxn).unwrap();
+    jv.as_object_mut().unwrap().retain(|k, _| k != "hgi" && k != "hgh");
+    let json_body = serde_json::to_vec(&serde_json::json!({
+        "txn-groups": [{"txns": [jv.clone(), jv]}],
+        "round": 42,
+        "fix-signers": true,
+    }))
+    .unwrap();
+
+    for (content_type, body) in [("application/msgpack", mp), ("application/json", json_body)] {
+        let resp = server
+            .client
+            .post(server.url("/v2/transactions/simulate"))
+            .header("X-Algo-API-Token", &server.api_token)
+            .header("Content-Type", content_type)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        // the mock has no simulate result (500), but the decode must have succeeded
+        assert_ne!(resp.status(), 400, "{content_type}: {}", resp.text().await.unwrap());
+    }
+
+    let seen = log.lock().unwrap();
+    assert_eq!(seen.len(), 2, "both encodings reached Node::simulate");
+    for (i, req) in seen.iter().enumerate() {
+        assert_eq!(req.round, Some(42), "request {i}");
+        assert_eq!(req.fix_signers, Some(true), "request {i}");
+        assert_eq!(req.decoded_txn_groups.len(), 1, "request {i}");
+        assert_eq!(req.decoded_txn_groups[0].len(), 2, "request {i}");
+    }
+    assert_eq!(
+        seen[0].decoded_txn_groups, seen[1].decoded_txn_groups,
+        "msgpack and JSON decode to the same transactions"
+    );
+    assert_eq!(seen[0].decoded_txn_groups[0][0].txn, stxn.txn);
+    assert_eq!(seen[0].decoded_txn_groups[0][0].sig, stxn.sig);
 }
 
 #[tokio::test]

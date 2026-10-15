@@ -3281,13 +3281,19 @@ pub async fn simulate_transaction<N: NodeInterface>(
         return error::bad_request("request body too large");
     }
 
-    // Decode request body: try msgpack first, then JSON.
-    // Track the input format so we can decode individual transactions
-    // correctly (msgpack binary data cannot round-trip through serde_json::Value).
-    let (mut request, is_msgpack) = match rmp_serde::from_slice::<models::SimulateRequest>(&body) {
-        Ok(req) => (req, true),
-        Err(_) => match serde_json::from_slice::<models::SimulateRequest>(&body) {
-            Ok(req) => (req, false),
+    // go decodes the body into `PreEncodedSimulateRequest` with the strict
+    // msgpack handle (`ErrorIfNoField`) before its JSON fallback: a msgpack
+    // body it rejects always ends in the same fixed JSON-decoder text (issue
+    // #1967). A msgpack body is parsed with `rmpv` so its binary fields
+    // survive (`serde_json::Value` cannot hold a `bin`; issue #1968): the
+    // request carries `null` placeholders and each transaction's own msgpack
+    // bytes travel alongside in `raw_txns`.
+    use crate::simulate_strict::{parse_msgpack_request, MsgpackSimulate, GO_MSGPACK_REJECTION};
+    let (mut request, is_msgpack, raw_txns) = match parse_msgpack_request(&body) {
+        MsgpackSimulate::Decoded(d) => (d.request, true, d.raw_txns),
+        MsgpackSimulate::Rejected => return error::bad_request(GO_MSGPACK_REJECTION),
+        MsgpackSimulate::NotMsgpack => match serde_json::from_slice::<models::SimulateRequest>(&body) {
+            Ok(req) => (req, false, Vec::new()),
             Err(e) => {
                 return error::bad_request(format!("could not decode simulate request: {e}"));
             }
@@ -3323,12 +3329,11 @@ pub async fn simulate_transaction<N: NodeInterface>(
         let mut decoded_txns = Vec::with_capacity(group.txns.len());
         for (j, txn_val) in group.txns.iter().enumerate() {
             let decode_result = if is_msgpack {
-                rmp_serde::to_vec(txn_val)
-                    .map_err(|e| e.to_string())
-                    .and_then(|bytes| {
-                        rmp_serde::from_slice::<algo_types::SignedTransaction>(&bytes)
-                            .map_err(|e| e.to_string())
-                    })
+                match raw_txns.get(i).and_then(|g| g.get(j)) {
+                    Some(bytes) => rmp_serde::from_slice::<algo_types::SignedTransaction>(bytes)
+                        .map_err(|e| e.to_string()),
+                    None => Err("transaction bytes missing".to_string()),
+                }
             } else {
                 serde_json::from_value::<algo_types::SignedTransaction>(txn_val.clone())
                     .map_err(|e| e.to_string())
