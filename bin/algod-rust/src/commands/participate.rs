@@ -1752,6 +1752,14 @@ impl SimpleBlockEvaluator {
         // ensure they're set matching the block header, mirroring the pattern
         // from block.rs.
         //
+        // Signatures are verified over the group AS SUBMITTED (go's
+        // `verify.TxnGroup`), not over the restored copy below: restoring an
+        // empty genesis hash from the header on a `RequireGenesisHash`
+        // protocol changed the signed bytes and reported a signature failure
+        // where go reports `required tx.GenesisHash is missing` (issue #1981).
+        // For every transaction that carries its genesis fields the two are
+        // identical.
+        //
         // The group was checked flag-free above, so restoring from the
         // header yields exactly what the block's stripped STIB form restores
         // to (strip then restore sets `hgi`/`hgh` from scratch).
@@ -1780,15 +1788,15 @@ impl SimpleBlockEvaluator {
                 },
                 consensus_version: self.hdr.current_protocol.clone(),
             };
-            algo_validate::verify_transaction_group_cached(&restored, &context, params, cache)?;
+            algo_validate::verify_transaction_group_cached(txgroup, &context, params, cache)?;
         } else {
             // Create a per-group LogicSig budget for logicsig evaluation.
-            let mut lsig_budget = GroupBudget::for_logicsig(restored.len());
+            let mut lsig_budget = GroupBudget::for_logicsig(txgroup.len());
 
-            for (intra_group_idx, stx) in restored.iter().enumerate() {
+            for (intra_group_idx, stx) in txgroup.iter().enumerate() {
                 verify_transaction_signature(
                     stx,
-                    &restored,
+                    txgroup,
                     intra_group_idx,
                     &mut lsig_budget,
                     params,
@@ -9429,6 +9437,31 @@ mod tests {
         omitted.sig = sign_txn(&omitted.txn, &key);
         eval.test_transaction_group(&[omitted])
             .expect("a transaction signed without a genesis ID is accepted");
+    }
+
+    /// Issue #1981: a submission is verified over the transaction as submitted
+    /// (go's `verify.TxnGroup`), so one signed with an empty genesis hash on a
+    /// protocol that requires it is rejected for the missing hash
+    /// (`required tx.GenesisHash is missing`, from `Alive`) and not for a
+    /// signature failure caused by restoring the hash from the header first.
+    #[test]
+    fn a_submission_without_a_genesis_hash_is_judged_as_submitted() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        assert!(params.require_genesis_hash, "the fixture protocol requires the hash");
+        let (sender, key) = test_keypair(68);
+        let (receiver, _) = test_keypair(69);
+        let eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+
+        let mut no_hash = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
+        no_hash.txn.genesis_hash = [0u8; 32];
+        no_hash.sig = sign_txn(&no_hash.txn, &key);
+        let err = eval.test_transaction_group(&[no_hash.clone()]).unwrap_err();
+        assert_eq!(err.to_string(), "required tx.GenesisHash is missing");
+
+        // a genuinely bad signature on the same transaction is still reported first
+        no_hash.sig = [7u8; 64];
+        assert!(eval.test_transaction_group(&[no_hash]).unwrap_err().is_batch_sig_failure());
     }
 
     #[test]
