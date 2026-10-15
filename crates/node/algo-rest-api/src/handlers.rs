@@ -3296,13 +3296,22 @@ pub async fn simulate_transaction<N: NodeInterface>(
         // through the same pipeline as msgpack (issue #1972); anything else
         // keeps the older serde-form handling.
         MsgpackSimulate::NotMsgpack => match crate::simulate_strict::parse_json_request(&body) {
-            Some(d) => (d.request, true, d.raw_txns),
-            None => match serde_json::from_slice::<models::SimulateRequest>(&body) {
-                Ok(req) => (req, false, Vec::new()),
-                Err(e) => {
-                    return error::bad_request(format!("could not decode simulate request: {e}"));
+            crate::simulate_strict::JsonSimulate::Decoded(d) => (d.request, true, d.raw_txns),
+            // go's strict JSON decode names the first unknown key and its offset
+            // (issue #1971).
+            crate::simulate_strict::JsonSimulate::UnknownField(u) => {
+                return error::bad_request(u.message());
+            }
+            crate::simulate_strict::JsonSimulate::NotGoForm => {
+                match serde_json::from_slice::<models::SimulateRequest>(&body) {
+                    Ok(req) => (req, false, Vec::new()),
+                    Err(e) => {
+                        return error::bad_request(format!(
+                            "could not decode simulate request: {e}"
+                        ));
+                    }
                 }
-            },
+            }
         },
     };
 

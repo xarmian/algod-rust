@@ -23,6 +23,27 @@ class BodiesTest(unittest.TestCase):
             self.assertIn(b"\xa3zzz", bodies[name], name)
         self.assertIn(b"\xa3hgi", bodies["hgi"])
 
+    def test_json_bodies_are_compact_json_with_the_unknown_key_in_stream_order(self):
+        cases = sp.json_cases()
+        self.assertEqual(set(cases), {"json_request", "json_group", "json_stxn", "json_txn", "json_hgi",
+                                      "json_first_wins"})
+        for name, (body, key) in cases.items():
+            self.assertIn(('"%s":' % key).encode(), body, name)
+            self.assertNotIn(b": ", body, name)  # compact separators
+
+    def test_json_offset_is_just_after_the_colon_following_the_key(self):
+        # the shape and offsets go reported for the same text (see simulate_strict tests)
+        body = b'{"txn-groups":[{"txns":[{"txn":{"type":"pay"},"zzz":1}]}]}'
+        status, message = sp.json_expected(body, "zzz")
+        self.assertEqual(status, 400)
+        self.assertIn("[pos 52]", message)
+        self.assertTrue(message.endswith("key zzz"))
+
+    def test_json_first_unknown_key_in_text_order_is_expected(self):
+        body, key = sp.json_cases()["json_first_wins"]
+        self.assertEqual(key, "aaa")
+        self.assertLess(body.index(b'"aaa":'), body.index(b'"ccc":'))
+
     def test_expectation_is_go_fixed_text_for_every_rejected_body(self):
         for name in ("request", "group", "stxn", "txn", "hgi"):
             self.assertEqual(sp.expected(name), (400, sp.GO_REJECTION), name)

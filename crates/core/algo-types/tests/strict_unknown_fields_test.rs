@@ -33,7 +33,9 @@
 //! which blocks and catchup rely on.
 
 use algo_error::AlgoError;
-use algo_types::{strict_unknown_fields, SignedTransaction, UnknownFieldError};
+use algo_types::{
+    strict_unknown_fields, strict_unknown_fields_scan, SignedTransaction, UnknownFieldError,
+};
 
 fn s(x: &str) -> Vec<u8> {
     assert!(x.len() < 32);
@@ -223,6 +225,59 @@ fn unknown_key_inside_nested_transaction_structs_is_rejected() {
         assert_eq!(u.key, "zzz", "{outer}");
         assert!(u.pos > 0, "{outer}");
     }
+}
+
+/// go's JSON decoder enforces no required fields, so for a JSON body it
+/// reaches an unknown key that follows an object missing `snd` / `type`
+/// (issue #1971). The msgpack-style readers stop at the missing field first;
+/// scan mode skips those checks so the unknown key can be located.
+#[test]
+fn scan_mode_reaches_an_unknown_key_after_an_object_missing_required_fields() {
+    // {"txn": {"type": "pay"}, "zzz": 1}: no sender
+    let body = map(vec![
+        ("txn", map(vec![("type", s("pay"))])),
+        ("zzz", uint(1)),
+    ]);
+
+    // plain strict mode: the missing required field is the first error
+    let err = decode_strict(&body).expect_err("missing snd");
+    assert!(matches!(&err, AlgoError::Codec { source, .. } if !source.is::<UnknownFieldError>()), "{err}");
+
+    // scan mode runs on to the unknown key, at go's key position
+    let _guard = strict_unknown_fields_scan(&body);
+    let mut cur = &body[..];
+    let u = unknown(SignedTransaction::decode_from_reader(&mut cur).expect_err("unknown key"));
+    assert_eq!(u.key, "zzz");
+    drop(_guard);
+
+    // and the mode is scoped: required checks are back afterwards
+    let _strict = strict_unknown_fields(&body);
+    let mut cur = &body[..];
+    assert!(SignedTransaction::decode_from_reader(&mut cur).is_err());
+}
+
+/// A plain strict guard created inside a scan guard enforces required fields
+/// again, and dropping it restores scan mode for the outer guard.
+#[test]
+fn a_nested_strict_guard_does_not_inherit_scan_mode() {
+    let body = map(vec![
+        ("txn", map(vec![("type", s("pay"))])),
+        ("zzz", uint(1)),
+    ]);
+    let _scan = strict_unknown_fields_scan(&body);
+    {
+        let _strict = strict_unknown_fields(&body);
+        let mut cur = &body[..];
+        let err = SignedTransaction::decode_from_reader(&mut cur).expect_err("missing snd");
+        assert!(
+            matches!(&err, AlgoError::Codec { source, .. } if !source.is::<UnknownFieldError>()),
+            "{err}"
+        );
+    }
+    // back in the outer scan guard: the unknown key is reached again
+    let mut cur = &body[..];
+    let u = unknown(SignedTransaction::decode_from_reader(&mut cur).expect_err("unknown key"));
+    assert_eq!(u.key, "zzz");
 }
 
 /// Outside strict mode the readers still skip unknown keys (blocks, catchup).
