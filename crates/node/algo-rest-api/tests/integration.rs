@@ -6536,12 +6536,15 @@ async fn raw_transaction_keeps_the_pqsig_of_a_go_signed_pq_account_payment() {
         .post(server.url("/v2/transactions"))
         .header("X-Algo-API-Token", &server.api_token)
         .header("Content-Type", "application/x-binary")
-        .body(body)
+        .body(body.clone())
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
 
+    // The whole signed transaction (public key and signature bytes included)
+    // must equal what the serde decoder, used for blocks and gossip, reads.
+    let oracle: SignedTransaction = rmp_serde::from_slice(&body).unwrap();
     let groups = log.lock().unwrap();
     assert_eq!(groups.len(), 1);
     let pq = groups[0][0]
@@ -6549,6 +6552,7 @@ async fn raw_transaction_keeps_the_pqsig_of_a_go_signed_pq_account_payment() {
         .as_ref()
         .expect("pqsig must survive the REST decode");
     assert!(!pq.blank());
+    assert_eq!(groups[0][0], oracle);
 }
 
 /// Round-3 review of #1727: go's `SignedTxn` msgp decoder rejects unknown

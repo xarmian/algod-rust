@@ -84,17 +84,42 @@ fn hand_decoder_keeps_the_logicsig_pqsig() {
     );
 }
 
+/// Every field of the envelope survives, including a non-zero salt (the Go
+/// fixtures all use salt 0, which is omitted on the wire).
 #[test]
-fn hand_decoder_ignores_unknown_pqsig_keys_and_tolerates_blank_envelopes() {
-    // {"txn": <pay>, "pqsig": {"zzz": 1}}: unknown inner key skipped, envelope blank.
+fn hand_decoder_keeps_every_pqsig_field_including_a_non_zero_salt() {
     let mut stx = SignedTransaction::default();
     stx.txn.txn_type = "pay".into();
     stx.txn.sender = algo_types::Address([1u8; 32]);
-    let mut bytes = canonical_encode_signed_transaction(&stx);
-    // append an extra `pqsig` entry: bump the map header (fixmap) and add the pair
-    assert_eq!(bytes[0] & 0xf0, 0x80, "fixmap expected");
-    bytes[0] += 1;
-    bytes.extend_from_slice(b"\xa5pqsig\x81\xa3zzz\x01");
+    stx.pqsig = Some(algo_types::PQSig {
+        scheme: *b"f1",
+        salt: algo_types::PQAddressSalt(7),
+        public_key: serde_bytes::ByteBuf::from(vec![0xAA; 33]),
+        signature: serde_bytes::ByteBuf::from(vec![0xBB; 65]),
+    });
+    let bytes = canonical_encode_signed_transaction(&stx);
+    let oracle: SignedTransaction = rmp_serde::from_slice(&bytes).expect("serde decode");
     let hand = SignedTransaction::decode_from_bytes(&bytes).expect("hand decode");
-    assert!(hand.pqsig.as_ref().is_none_or(|p| p.blank()));
+    assert_eq!(hand.pqsig, stx.pqsig);
+    assert_eq!(hand, oracle);
+}
+
+/// A pqsig map with an extra key: the known fields are still decoded (the
+/// sibling hand decoders skip unknown keys too; see the follow-up issue
+/// about go rejecting unknown fields on submit).
+#[test]
+fn hand_decoder_pqsig_decodes_known_fields_next_to_an_unknown_key() {
+    let mut raw: Vec<u8> = vec![0x85];
+    raw.extend_from_slice(b"\xa3sch\xc4\x02f1");
+    raw.extend_from_slice(b"\xa3slt\x03");
+    raw.extend_from_slice(b"\xa2pk\xc4\x02\x01\x02");
+    raw.extend_from_slice(b"\xa3sig\xc4\x01\x09");
+    raw.extend_from_slice(b"\xa3zzz\x01");
+    let mut rd: &[u8] = &raw;
+    let pq = algo_types::PQSig::decode_from_reader(&mut rd).expect("decode");
+    assert!(rd.is_empty());
+    assert_eq!(pq.scheme, *b"f1");
+    assert_eq!(pq.salt, algo_types::PQAddressSalt(3));
+    assert_eq!(pq.public_key.as_slice(), &[1u8, 2]);
+    assert_eq!(pq.signature.as_slice(), &[9u8]);
 }
