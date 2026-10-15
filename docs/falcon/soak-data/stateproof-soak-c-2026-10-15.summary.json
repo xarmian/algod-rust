@@ -1,0 +1,16 @@
+{
+  "event": "stateproof_soak",
+  "ok": true,
+  "falcon_backend_requested": "c",
+  "rust_backend_log_line": "2026-10-15T08:24:30.653481Z  INFO algod_rust::falcon_backend: falcon-1024 backend selected falcon_backend=c",
+  "state_proof_round": 512,
+  "stateproof_check_exit": 0,
+  "rust_log_state_proof_lines": 624,
+  "rust_log_state_proof_sign_lines": 1,
+  "rust_log_falcon_errors": 0,
+  "rust_accepted_peer_signatures": 2,
+  "rust_submitted_state_proof_txns": 1,
+  "go_nodes_gathering_signatures_lines": 3,
+  "go_stateproof_warn_or_error_lines": 4,
+  "rust_last_round": "616"
+}

@@ -1,0 +1,45 @@
+{
+  "event": "stateproof_check",
+  "ok": true,
+  "state_proof_round": 512,
+  "commit_round": 600,
+  "commit_delay_rounds": 88,
+  "margin": 8,
+  "checks": [
+    {
+      "name": "commit_block_carries_state_proof_txn_on_every_node",
+      "ok": true,
+      "detail": "txn types per node at round 600: {'go-node-1': {'stpf': 1}, 'go-node-2': {'stpf': 1}, 'go-node-3': {'stpf': 1}, 'rust-node-4': {'stpf': 1}}"
+    },
+    {
+      "name": "commit_block_bytes_identical_on_every_node",
+      "ok": true,
+      "detail": "1 distinct block encoding(s) at round 600"
+    },
+    {
+      "name": "state_proof_served_by_go_nodes",
+      "ok": true,
+      "detail": "round 512"
+    },
+    {
+      "name": "state_proof_identical_on_go_nodes",
+      "ok": true,
+      "detail": "1 distinct proof payload(s) across 3 go-algorand nodes"
+    },
+    {
+      "name": "rust_state_proof_endpoint_rust-node-4",
+      "ok": true,
+      "detail": "HTTP 200; identical to the Go nodes'"
+    },
+    {
+      "name": "block_hashes_identical_around_proof",
+      "ok": true,
+      "detail": "rounds 512..608 (97 rounds) identical on 4 nodes"
+    },
+    {
+      "name": "state_proof_tracking_advanced_identically",
+      "ok": true,
+      "detail": "header spt.n at round 608: {'go-node-1': 768, 'go-node-2': 768, 'go-node-3': 768, 'rust-node-4': 768}"
+    }
+  ]
+}
