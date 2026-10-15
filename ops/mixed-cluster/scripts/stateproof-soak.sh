@@ -84,6 +84,8 @@ if [ "$SKIP_START" != "1" ]; then
         echo "start.sh failed — see $OUT_DIR/start.log" >&2
         exit 1
     }
+    # the base start.sh used (netroot/.phase6-env was just rewritten)
+    source "$HERE/ports.sh"
 fi
 
 echo "==> waiting for round $SP_ROUND (${SP_TIMEOUT}s), then for its state proof to be committed (${SP_PROOF_TIMEOUT}s)"
