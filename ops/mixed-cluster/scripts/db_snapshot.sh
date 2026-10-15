@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+# Sourced by verify-soak.sh (issue #1963): a consistent snapshot of the live
+# Rust node's SQLite ledger files.
+#
+#   phase6_backup_db <container> <src-db> <dst-db>   sqlite3 .backup inside the
+#       container, with a busy timeout and a bounded retry; sqlite3's stderr of
+#       every failed attempt goes to stderr. 0 on success, 1 when all attempts
+#       failed.
+#   phase6_announce_inconsistent_snapshot <reason>   prints the grep-able
+#       `SNAPSHOT_INCONSISTENT=1` line that consensus-conformance.sh turns
+#       into a summary WARN, and that marks a cert failure as inconclusive.
+#
+# Env: PHASE6_BACKUP_ATTEMPTS (default 6), PHASE6_BACKUP_SLEEP seconds between
+# attempts (default 3), PHASE6_BACKUP_TIMEOUT_MS sqlite busy timeout (default
+# 30000). `.backup` holds a read lock while the node keeps writing; without a
+# busy timeout it fails at once with SQLITE_BUSY and the script used to fall
+# back to a raw copy of a WAL-mode database, which is not consistent.
+
+phase6_backup_db() {
+    local ctr="$1" src="$2" dst="$3"
+    local attempts="${PHASE6_BACKUP_ATTEMPTS:-6}" sleep_s="${PHASE6_BACKUP_SLEEP:-3}"
+    local timeout_ms="${PHASE6_BACKUP_TIMEOUT_MS:-30000}" i out
+    for ((i = 1; i <= attempts; i++)); do
+        if out="$(docker exec "$ctr" sqlite3 "$src" ".timeout $timeout_ms" ".backup '$dst'" 2>&1)"; then
+            return 0
+        fi
+        echo "    sqlite3 .backup of $src failed (attempt $i/$attempts): $(printf '%s' "$out" | tr '\r\n' '  ')" >&2
+        [ "$i" -lt "$attempts" ] && sleep "$sleep_s"
+    done
+    return 1
+}
+
+phase6_announce_inconsistent_snapshot() {
+    echo "    SNAPSHOT_INCONSISTENT=1 the Rust ledger could not be snapshotted consistently ($1);" \
+         "a cert failure below may be a snapshot artefact, not a node bug"
+}
