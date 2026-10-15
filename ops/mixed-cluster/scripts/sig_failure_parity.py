@@ -72,11 +72,11 @@ def stxn_json():
     }
 
 
-def _signed_window_stxn(first_valid, last_valid, valid_signature=True):
-    """A payment from SEED's account with the given window, really signed (or not)."""
+def _signed_window_stxn(first_valid, last_valid, valid_signature=True, fee=1000):
+    """A payment from SEED's account with the given window and fee, really signed (or not)."""
     snd = ed.public_key(SEED)
     txn = ufp._map([
-        ("amt", ufp._uint(1000)), ("fee", ufp._uint(1000)), ("fv", ufp._uint(first_valid)),
+        ("amt", ufp._uint(1000)), ("fee", ufp._uint(fee)), ("fv", ufp._uint(first_valid)),
         ("gh", ufp._bin(bytes([3]) * 32)), ("lv", ufp._uint(last_valid)), ("rcv", ufp._bin(bytes([2]) * 32)),
         ("snd", ufp._bin(snd)), ("type", ufp._s("pay")),
     ])
@@ -101,6 +101,14 @@ def window_cases(current_round=0):
         "submit_early": (_signed_window_stxn(fv, lv), msg.format(fv, lv)),
         "submit_dead": (_signed_window_stxn(1, 2), msg.format(1, 2)),
         "submit_bad_sig_and_early": (_signed_window_stxn(fv, lv, valid_signature=False), GO_MESSAGE),
+        # issue #1976: signatures, then the window, then the group fees
+        "submit_low_fee": (
+            _signed_window_stxn(1, current_round + 900, fee=1),
+            "TransactionPool.Remember: txgroup with 1uA fees is less than 1mA (usage=1.000000 * base=1mA)",
+        ),
+        "submit_low_fee_and_early": (_signed_window_stxn(fv, lv, fee=1), msg.format(fv, lv)),
+        "submit_low_fee_and_dead": (_signed_window_stxn(1, 2, fee=1), msg.format(1, 2)),
+        "submit_low_fee_bad_sig": (_signed_window_stxn(1, current_round + 900, valid_signature=False, fee=1), GO_MESSAGE),
     }
 
 
@@ -186,7 +194,8 @@ def main(argv=None):
         found = compare(name, go, rust)
         want = expected_message(name, current)
         for who, answer in (("go", go), ("rust", rust)):
-            if name in ("submit_early", "submit_dead") and not DEAD_RE.match(ufp.message_of(answer[1])):
+            if name in ("submit_early", "submit_dead", "submit_low_fee_and_early", "submit_low_fee_and_dead") \
+                    and not DEAD_RE.match(ufp.message_of(answer[1])):
                 found.append("{}: {} answered {!r}, not a txn-dead message".format(name, who, ufp.message_of(answer[1])))
         if normalise(ufp.message_of(go[1])) != want:
             found.append("{}: go answered {!r}, expected {!r}".format(name, normalise(ufp.message_of(go[1])), want))

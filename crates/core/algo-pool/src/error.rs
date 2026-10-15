@@ -398,6 +398,9 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
 fn classify_evaluator_message(msg: &str) -> PoolErrorTag {
     if let Some(tag) = classify_txn_dead(msg) {
         tag
+    } else if msg.starts_with("txgroup with ") || msg == "txgroup required fee overflow" {
+        // go: `TxGroupMalformedError` with `TxGroupErrorReasonInvalidFee`
+        PoolErrorTag::Fee
     } else if msg.contains("approval program rejected transaction:") {
         PoolErrorTag::TealErr
     } else if msg.contains("approval program rejected transaction") {
@@ -467,6 +470,17 @@ mod tests {
         assert_eq!(
             classify_pool_error(&typed("transaction X: something else")),
             PoolErrorTag::EvalGeneric
+        );
+        // go tags an insufficient group fee `fee`
+        assert_eq!(
+            classify_pool_error(&typed(
+                "txgroup with 1uA fees is less than 1mA (usage=1.000000 * base=1mA)"
+            )),
+            PoolErrorTag::Fee
+        );
+        assert_eq!(
+            classify_pool_error(&typed("txgroup required fee overflow")),
+            PoolErrorTag::Fee
         );
     }
 

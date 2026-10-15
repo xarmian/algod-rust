@@ -1649,8 +1649,8 @@ impl SimpleBlockEvaluator {
         )
     }
 
-    /// Perform stateless validation only (well-formedness, group ID, fees,
-    /// signatures, validity window). Returns the group with genesis fields restored so that
+    /// Perform stateless validation only (well-formedness, group ID,
+    /// signatures, validity window, group fees -- go's order, issue #1976). Returns the group with genesis fields restored so that
     /// `validate_group` can reuse it for txid computation without cloning
     /// the group a second time.
     ///
@@ -1720,12 +1720,16 @@ impl SimpleBlockEvaluator {
         // program), `block.rs`'s block-level `verify_heartbeat_proof` call,
         // and `apply::apply_heartbeat`'s challenge/vote-ID/seed checks.
 
-        // 2. Per-transaction well-formedness.
-        let in_group = txgroup.len() > 1;
+        // 2. Per-transaction well-formedness. go's `Transaction.WellFormed` has
+        // no fee check at all (fee pooling is unconditional since v28): the fee
+        // is judged for the whole submitted group by `CheckGroupFees` (step 7),
+        // a singleton included, after the signatures and the validity window.
+        // Passing `allow_fee_pooling = true` skips the legacy per-transaction
+        // minimum, which fired first and with other wording (issue #1976).
         for stx in txgroup {
             algo_validate::validate_transaction_wellformed(
                 &stx.txn,
-                in_group && params.enable_fee_pooling,
+                true,
                 params,
                 None, // SpecialAddresses not available without ledger lookup
             )?;
@@ -1739,35 +1743,6 @@ impl SimpleBlockEvaluator {
         // `TxnGroup`/`TxnGroupWithTracer` (`data/transactions/verify/txn.go`)
         // and its `TestGroupTransactions` (see issue #1034).
         algo_validate::validate_transaction_group_strict(txgroup)?;
-
-        // 4. Group fee total check. Go's `CheckGroupFees`/`SummarizeFees`
-        // (`ledger/eval/eval.go`) run unconditionally for every top-level
-        // group -- including a size-1 (ungrouped) submission -- not just
-        // "multi-txn groups with pooling enabled"; `EnableFeePooling` was a
-        // real config flag pre-v28 but go-algorand has since removed it
-        // entirely (see `ledger/eval_simple_test.go`'s `TestFeePooling`:
-        // "FeePooling was added in v28, but we have now removed the
-        // consensus flag"), and never gated whether the group-total *size-
-        // pricing surcharge* (v42+) gets computed at all. Gating this call
-        // on `in_group` (issue #703's live-parity testing surfaced this: a
-        // single oversized-LogicSig transaction, submitted ungrouped, was
-        // wrongly accepted underpaid) skipped the only place
-        // `logic_sig_program_fee_contribution`'s pooled program-byte
-        // surcharge is folded into the required fee -- note/app-args/
-        // app-program surcharges are covered by `txn_fee_factor` inside the
-        // per-transaction well-formedness check above regardless of
-        // grouping, but the LogicSig surcharge is pooled across the group
-        // and only visible to `summarize_fees`. `block.rs`'s block-level
-        // validation already calls this unconditionally (see 4b there);
-        // this matches that established, correct pattern.
-        {
-            let refs: Vec<&algo_types::SignedTransaction> = txgroup.iter().collect();
-            algo_validate::validate_group_fees_with_params(&refs, params).map_err(|e| {
-                algo_error::AlgoError::Validation {
-                    message: format!("group fee validation failed: {e}"),
-                }
-            })?;
-        }
 
         // 5. Signature verification.
         // Restore genesis fields before verification — signatures are computed
@@ -1838,6 +1813,26 @@ impl SimpleBlockEvaluator {
                     class: algo_error::RejectClass::Other,
                 });
             }
+        }
+
+        // 7. Group fee total check. Go's `CheckGroupFees`/`SummarizeFees`
+        // (`ledger/eval/eval.go`) run unconditionally for every top-level group
+        // -- a size-1 (ungrouped) submission included, which is where the pooled
+        // LogicSig-program surcharge is folded in (issue #703) -- and only after
+        // signatures (`verify.TxnGroup`) and the validity window (`Alive`), so a
+        // group wrong in several ways is reported in that order (issue #1976).
+        // The error is `TxGroupMalformedError`'s text, behind only the pool's
+        // `Remember` frame:
+        // `txgroup with 1uA fees is less than 1mA (usage=1.000000 * base=1mA)`.
+        {
+            let refs: Vec<&algo_types::SignedTransaction> = txgroup.iter().collect();
+            algo_validate::fee::check_submitted_group_fees(&refs, params).map_err(|message| {
+                algo_error::AlgoError::Rejected {
+                    source: None,
+                    message,
+                    class: algo_error::RejectClass::Other,
+                }
+            })?;
         }
 
         Ok(restored)
@@ -9283,6 +9278,62 @@ mod tests {
         let only_window = windowed_pay(&key, sender, receiver, 500, 900);
         let err = eval.test_transaction_group(&[only_window]).unwrap_err();
         assert!(err.to_string().starts_with("txn dead:"), "{err}");
+    }
+
+    /// A validly signed payment with the given fee and validity window.
+    fn pay_with_fee_and_window(
+        key: &SigningKey,
+        sender: Address,
+        receiver: Address,
+        fee: u64,
+        first_valid: u64,
+        last_valid: u64,
+    ) -> SignedTransaction {
+        let mut stx = windowed_pay(key, sender, receiver, first_valid, last_valid);
+        stx.txn.fee = fee;
+        stx.sig = sign_txn(&stx.txn, key);
+        stx
+    }
+
+    /// Issue #1976: go checks, in this order, signatures, the validity window,
+    /// then the group fees (`verify.TxnGroup`, `Alive`, `CheckGroupFees`).
+    /// Captured live from go-algorand v5.0.3-stable with validly signed
+    /// transactions of fee 1: a valid window gives
+    /// `txgroup with 1uA fees is less than 1mA (usage=1.000000 * base=1mA)`,
+    /// an out-of-window one `txn dead: ...` (the window wins).
+    #[test]
+    fn group_fees_are_checked_after_signatures_and_the_window() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(64);
+        let (receiver, _) = test_keypair(65);
+        let eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+
+        // low fee, valid window: go's group-fee text, typed so the pool prints it bare
+        let low = pay_with_fee_and_window(&key, sender, receiver, 1, 1, 1000);
+        let err = eval.test_transaction_group(&[low]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "txgroup with 1uA fees is less than 1mA (usage=1.000000 * base=1mA)"
+        );
+        assert!(matches!(err, algo_error::AlgoError::Rejected { .. }), "{err:?}");
+
+        // low fee and out of window (early or expired): the window wins
+        for (fv, lv) in [(500, 900), (1, 50)] {
+            let low = pay_with_fee_and_window(&key, sender, receiver, 1, fv, lv);
+            let err = eval.test_transaction_group(&[low]).unwrap_err();
+            assert!(err.to_string().starts_with("txn dead:"), "{fv}--{lv}: {err}");
+        }
+
+        // low fee and a bad signature: the signature wins
+        let mut bad = pay_with_fee_and_window(&key, sender, receiver, 1, 1, 1000);
+        bad.sig = [7u8; 64];
+        let err = eval.test_transaction_group(&[bad]).unwrap_err();
+        assert!(err.is_batch_sig_failure(), "{err}");
+
+        // a fee-only problem stays a fee error, and a sufficient fee passes
+        let ok = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
+        assert!(eval.test_transaction_group(&[ok]).is_ok());
     }
 
     #[test]
