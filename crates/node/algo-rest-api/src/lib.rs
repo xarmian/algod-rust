@@ -32,6 +32,7 @@ pub mod error;
 pub mod error_envelope;
 pub mod format;
 pub mod handlers;
+pub mod json_scan;
 pub mod models;
 pub mod node;
 pub mod pq_compliance;

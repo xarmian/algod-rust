@@ -8241,11 +8241,58 @@ async fn simulate_in_block_only_field_returns_400() {
     assert_eq!(resp.status(), 400);
     let json: serde_json::Value = resp.json().await.unwrap();
     let msg = json["message"].as_str().unwrap();
+    // go's strict JSON decode names the first unknown key and its offset
+    // (issue #1971); a SignedTransaction's serde form carries block-only keys
+    // other than `hgi`, and whichever comes first in the text is reported.
     assert!(
-        msg.contains("could not decode transaction 1 in group 0")
-            && msg.contains("Unknown field: hgi"),
+        msg.starts_with("failed to decode object: json decode error [pos ")
+            && msg.contains("]: no matching struct field found when decoding stream map with key "),
         "{msg}"
     );
+}
+
+/// Issue #1971: a JSON simulate body with a key go's structs lack is a 400
+/// with go's exact text and offset (captured from a go-algorand v5.0.3-stable
+/// node for these bodies: just after the colon that follows the key).
+#[tokio::test]
+async fn simulate_json_unknown_key_returns_go_text_with_offset() {
+    let server = TestServer::start(MockNode::synced()).await;
+    for (body, pos, key) in [
+        (
+            r#"{"txn-groups":[{"txns":[{"txn":{"type":"pay"},"zzz":1}]}]}"#,
+            52,
+            "zzz",
+        ),
+        (
+            r#"{"zzz":1,"txn-groups":[{"txns":[{"txn":{"type":"pay"}}]}]}"#,
+            7,
+            "zzz",
+        ),
+        (
+            r#"{"txn-groups":[{"txns":[{"txn":{"type":"pay","aaa":1,"bbb":2}}]}],"ccc":3}"#,
+            51,
+            "aaa",
+        ),
+    ] {
+        let resp = server
+            .client
+            .post(server.url("/v2/transactions/simulate"))
+            .header("X-Algo-API-Token", &server.api_token)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "{body}");
+        let json: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            json["message"].as_str().unwrap(),
+            format!(
+                "failed to decode object: json decode error [pos {pos}]: no matching struct field found when decoding stream map with key {key}"
+            ),
+            "{body}"
+        );
+    }
 }
 
 /// Issue #1967: a msgpack simulate body with a key go's structs lack is a 400

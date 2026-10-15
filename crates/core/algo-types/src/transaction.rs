@@ -1626,19 +1626,19 @@ impl MultisigSig {
         // go-algorand v4.7.2-stable marks Version/Threshold/Subsigs `codec:",required"`:
         // the generated decoder rejects the field's zero value regardless of key presence
         // on the wire, so check the decoded value rather than an on-key-seen flag.
-        if s.version == 0 {
+        if rmp_decode::required_fields_checked() && s.version == 0 {
             return Err(algo_error::AlgoError::Codec {
                 source: "missing required field 'v'".into(),
                 context: "rmp_decode".into(),
             });
         }
-        if s.threshold == 0 {
+        if rmp_decode::required_fields_checked() && s.threshold == 0 {
             return Err(algo_error::AlgoError::Codec {
                 source: "missing required field 'thr'".into(),
                 context: "rmp_decode".into(),
             });
         }
-        if s.subsigs.is_empty() {
+        if rmp_decode::required_fields_checked() && s.subsigs.is_empty() {
             return Err(algo_error::AlgoError::Codec {
                 source: "missing required field 'subsig'".into(),
                 context: "rmp_decode".into(),
@@ -1678,7 +1678,7 @@ impl LogicSig {
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
-        if !has_logic {
+        if rmp_decode::required_fields_checked() && !has_logic {
             return Err(algo_error::AlgoError::Codec {
                 source: "missing required field 'l'".into(),
                 context: "rmp_decode".into(),
@@ -1890,9 +1890,10 @@ impl Participant {
         // go-algorand v4.7.2-stable marks `basics.Participant.PK` `codec:",required"`: the
         // generated decoder rejects `PK.MsgIsZero()` regardless of key presence on the wire,
         // so also reject an explicit-but-all-zero verifier, not just an absent "p" key.
-        if s.pk
-            .as_ref()
-            .is_none_or(|pk| *pk == MerkleSignatureVerifier::default())
+        if rmp_decode::required_fields_checked()
+            && s.pk
+                .as_ref()
+                .is_none_or(|pk| *pk == MerkleSignatureVerifier::default())
         {
             return Err(algo_error::AlgoError::Codec {
                 source: "missing required field 'p'".into(),
@@ -1924,7 +1925,7 @@ impl Reveal {
         // go-algorand v4.7.2-stable marks `stateproof.Reveal.Part` `codec:",required"`. The
         // "PK present but zero" sub-case is already caught above by Participant's own
         // required-PK check, propagated through the `?` on the `read_optional` call.
-        if s.part.is_none() {
+        if rmp_decode::required_fields_checked() && s.part.is_none() {
             return Err(algo_error::AlgoError::Codec {
                 source: "missing required field 'p'".into(),
                 context: "rmp_decode".into(),
@@ -2264,13 +2265,13 @@ impl Transaction {
         // on the wire (`Type.MsgIsZero()` / `Sender.MsgIsZero()`), not merely its absence.
         // A value check (rather than an on-key-seen presence flag) catches an explicit
         // zero-valued "type"/"snd" too, not just an omitted key.
-        if t.txn_type.is_empty() {
+        if rmp_decode::required_fields_checked() && t.txn_type.is_empty() {
             return Err(algo_error::AlgoError::Codec {
                 source: "missing required field 'type'".into(),
                 context: "rmp_decode".into(),
             });
         }
-        if t.sender.is_zero() {
+        if rmp_decode::required_fields_checked() && t.sender.is_zero() {
             return Err(algo_error::AlgoError::Codec {
                 source: "missing required field 'snd'".into(),
                 context: "rmp_decode".into(),
@@ -2351,7 +2352,7 @@ impl SignedTransaction {
             }
         }
         // The serde path requires `txn` (no #[serde(default)]), so validate here.
-        if !has_txn {
+        if rmp_decode::required_fields_checked() && !has_txn {
             return Err(algo_error::AlgoError::Codec {
                 source: "SignedTransaction: missing required 'txn' field".into(),
                 context: "rmp_decode".into(),

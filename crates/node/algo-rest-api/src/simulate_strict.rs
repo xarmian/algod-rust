@@ -42,6 +42,8 @@
 use algo_types::{strict_unknown_fields, SignedTransaction};
 use rmpv::Value;
 
+use crate::json_scan::{parse_ordered, Member, Node};
+
 /// go's response for a msgpack simulate body that its strict msgpack decode rejects.
 pub const GO_MSGPACK_REJECTION: &str = "failed to decode object: json decode error [pos 1]: only encoded map or array can be decoded into a struct";
 
@@ -183,33 +185,21 @@ fn address_from_base32(text: &str) -> Option<[u8; 32]> {
         .map(|a| a.0)
 }
 
-/// Convert go's JSON encoding of a request (`protocol.JSONStrictHandle`:
-/// addresses as checksummed base32, other `[]byte` as base64, text as text,
-/// the same short keys as msgpack) into the msgpack value tree the strict
-/// parser works on. The inverse of `block_json`'s key-driven rendering, so
-/// the same key tables decide which strings are addresses. `None` for
-/// anything that is not go's JSON form (a string that is not valid base64 or
-/// a checksummed address where bytes are expected, a non-integral number).
-///
-/// The key tables are `block_json`'s: go renders a `[]byte` as base64 and a
-/// `basics.Address` as base32 by Go type, which this crate recovers from the
-/// codec key; `address_keys_round_trip_through_block_json_rendering` pins the
-/// two directions together. A key the tables do not know is treated as
-/// base64 bytes, and a string that is not valid base64 makes the request fall
-/// back to the older handling rather than be misread.
-pub fn json_to_msgpack(v: &serde_json::Value, key: &str, parent: &str) -> Option<Value> {
+/// A JSON scalar as the msgpack value go's structs hold: text for
+/// [`TEXT_KEYS`], a 32-byte address for the address keys, base64 bytes for any
+/// other string, integers as integers. `None` for anything that is not go's
+/// JSON form (a string that is not valid base64 or a checksummed address where
+/// bytes are expected, a non-integral number).
+fn scalar_to_value(node: &Node, key: &str, parent: &str) -> Option<Value> {
     use base64::Engine;
-    Some(match v {
-        serde_json::Value::Null => Value::Nil,
-        serde_json::Value::Bool(b) => Value::Boolean(*b),
-        serde_json::Value::Number(n) => {
-            if let Some(u) = n.as_u64() {
-                Value::from(u)
-            } else {
-                Value::from(n.as_i64()?)
-            }
-        }
-        serde_json::Value::String(text) => {
+    Some(match node {
+        Node::Null => Value::Nil,
+        Node::Bool(b) => Value::Boolean(*b),
+        Node::Number(n) => match n.as_u64() {
+            Some(u) => Value::from(u),
+            None => Value::from(n.as_i64()?),
+        },
+        Node::Str(text) => {
             if TEXT_KEYS.contains(&key) {
                 Value::String(text.as_str().into())
             } else if crate::block_json::ADDRESS_KEYS.contains(&key)
@@ -224,34 +214,241 @@ pub fn json_to_msgpack(v: &serde_json::Value, key: &str, parent: &str) -> Option
                 )
             }
         }
-        serde_json::Value::Array(items) => Value::Array(
+        Node::Array(_) | Node::Object(_) => return None,
+    })
+}
+
+/// Convert go's JSON encoding of a request (`protocol.JSONStrictHandle`:
+/// addresses as checksummed base32, other `[]byte` as base64, text as text,
+/// the same short keys as msgpack) into the msgpack value tree the strict
+/// parser works on. The inverse of `block_json`'s key-driven rendering, so the
+/// same key tables decide which strings are addresses; a key the tables do not
+/// know is treated as base64 bytes, and a string that is not valid base64 makes
+/// the whole conversion `None` (the caller then falls back to older handling)
+/// instead of being misread. `address_keys_round_trip_through_block_json_rendering`
+/// pins the two directions together.
+pub fn json_to_msgpack(node: &Node, key: &str, parent: &str) -> Option<Value> {
+    match node {
+        Node::Array(items) => Some(Value::Array(
             items
                 .iter()
                 .map(|i| json_to_msgpack(i, key, parent))
                 .collect::<Option<Vec<_>>>()?,
-        ),
-        serde_json::Value::Object(map) => Value::Map(
-            map.iter()
-                .map(|(k, val)| Some((Value::String(k.as_str().into()), json_to_msgpack(val, k, key)?)))
+        )),
+        Node::Object(members) => Some(Value::Map(
+            members
+                .iter()
+                .map(|m| {
+                    Some((
+                        Value::String(m.key.as_str().into()),
+                        json_to_msgpack(&m.value, &m.key, key)?,
+                    ))
+                })
                 .collect::<Option<Vec<_>>>()?,
-        ),
-    })
+        )),
+        scalar => scalar_to_value(scalar, key, parent),
+    }
 }
 
-/// Parse a JSON simulate body written in go's JSON form (issue #1972) with
-/// the same strict pipeline as a msgpack body. `None` when the body is not
-/// JSON, is not go's JSON form, or the strict pipeline rejects it; the
-/// caller then keeps its older serde-form handling.
-pub fn parse_json_request(body: &[u8]) -> Option<DecodedMsgpackRequest> {
-    let json: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let serde_json::Value::Object(map) = &json else {
-        return None;
+/// Where a key's bytes end in an encoded transaction, and where that key sits
+/// in the JSON text, to turn the strict reader's byte offset into go's JSON one.
+struct KeyMark {
+    end: usize,
+    after_colon: usize,
+    key: String,
+}
+
+fn write_len(out: &mut Vec<u8>, n: usize, fix: u8, b16: u8, b32: u8) {
+    if n < 16 {
+        out.push(fix | n as u8);
+    } else if n <= u16::MAX as usize {
+        out.push(b16);
+        out.extend_from_slice(&(n as u16).to_be_bytes());
+    } else {
+        out.push(b32);
+        out.extend_from_slice(&(n as u32).to_be_bytes());
+    }
+}
+
+/// Encode `node` (as [`json_to_msgpack`] would) while recording every map key's
+/// end offset, in stream order. A scalar that does not convert (the value of an
+/// unknown key can be anything) is written as `nil` and sets `lossy`: a scan
+/// that stops at an unknown key before reaching it is still right, one that
+/// gets past it is not to be trusted.
+fn encode_node(
+    node: &Node,
+    key: &str,
+    parent: &str,
+    out: &mut Vec<u8>,
+    marks: &mut Vec<KeyMark>,
+    lossy: &mut bool,
+) -> Option<()> {
+    match node {
+        Node::Object(members) => {
+            write_len(out, members.len(), 0x80, 0xde, 0xdf);
+            for m in members {
+                rmpv::encode::write_value(out, &Value::String(m.key.as_str().into())).ok()?;
+                marks.push(KeyMark {
+                    end: out.len(),
+                    after_colon: m.after_colon,
+                    key: m.key.clone(),
+                });
+                encode_node(&m.value, &m.key, key, out, marks, lossy)?;
+            }
+            Some(())
+        }
+        Node::Array(items) => {
+            write_len(out, items.len(), 0x90, 0xdc, 0xdd);
+            items
+                .iter()
+                .try_for_each(|i| encode_node(i, key, parent, out, marks, lossy))
+        }
+        scalar => {
+            let value = scalar_to_value(scalar, key, parent).unwrap_or_else(|| {
+                *lossy = true;
+                Value::Nil
+            });
+            rmpv::encode::write_value(out, &value).ok()
+        }
+    }
+}
+
+/// An unknown key as go reports it for a JSON body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonUnknownField {
+    /// Byte offset just after the colon that follows the key.
+    pub pos: usize,
+    pub key: String,
+}
+
+impl JsonUnknownField {
+    /// go's response text.
+    pub fn message(&self) -> String {
+        format!(
+            "failed to decode object: json decode error [pos {}]: no matching struct field found when decoding stream map with key {}",
+            self.pos, self.key
+        )
+    }
+}
+
+fn unknown_at(m: &Member) -> JsonUnknownField {
+    JsonUnknownField {
+        pos: m.after_colon,
+        key: m.key.clone(),
+    }
+}
+
+/// The first unknown key inside one `SignedTxn` node, in stream order, found by
+/// running the strict reader over its msgpack form in scan mode (go's JSON
+/// decoder enforces no required fields, so the scan must not stop on them).
+/// `Err(())`: the node is not go's JSON form, or fails for another reason.
+fn signed_txn_unknown(node: &Node) -> Result<Option<JsonUnknownField>, ()> {
+    let mut bytes = Vec::new();
+    let mut marks = Vec::new();
+    let mut lossy = false;
+    encode_node(node, "", "", &mut bytes, &mut marks, &mut lossy).ok_or(())?;
+    let _scan = algo_types::strict_unknown_fields_scan(&bytes);
+    let mut cursor = &bytes[..];
+    match SignedTransaction::decode_from_reader(&mut cursor) {
+        // no unknown key found, but a value was replaced by a placeholder:
+        // this is not go's JSON form and the scan cannot vouch for it
+        Ok(_) if lossy => Err(()),
+        Ok(_) => Ok(None),
+        Err(algo_error::AlgoError::Codec { source, .. }) => {
+            let Some(u) = source.downcast_ref::<algo_types::UnknownFieldError>() else {
+                return Err(());
+            };
+            let mark = marks.iter().find(|m| m.end == u.pos).ok_or(())?;
+            Ok(Some(JsonUnknownField {
+                pos: mark.after_colon,
+                key: mark.key.clone(),
+            }))
+        }
+        Err(_) => Err(()),
+    }
+}
+
+/// The first unknown key of a request in stream order: request keys, then each
+/// group's keys, each transaction's keys at every nesting level, the trace
+/// config's keys, in the order the text has them (go's decoder stops at the
+/// first one it meets).
+fn first_unknown(members: &[Member]) -> Result<Option<JsonUnknownField>, ()> {
+    for m in members {
+        if !REQUEST_KEYS.contains(&m.key.as_str()) {
+            return Ok(Some(unknown_at(m)));
+        }
+        match (m.key.as_str(), &m.value) {
+            ("txn-groups", Node::Array(groups)) => {
+                for group in groups {
+                    let Node::Object(gm) = group else {
+                        continue;
+                    };
+                    for g in gm {
+                        if g.key != "txns" {
+                            return Ok(Some(unknown_at(g)));
+                        }
+                        if let Node::Array(txns) = &g.value {
+                            for t in txns {
+                                if let Some(u) = signed_txn_unknown(t)? {
+                                    return Ok(Some(u));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ("exec-trace-config", Node::Object(cfg)) => {
+                if let Some(c) = cfg
+                    .iter()
+                    .find(|c| !TRACE_CONFIG_KEYS.contains(&c.key.as_str()))
+                {
+                    return Ok(Some(unknown_at(c)));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+/// The outcome of parsing a JSON simulate body.
+pub enum JsonSimulate {
+    /// Not JSON, or not go's JSON form, or it fails for a reason other than an
+    /// unknown key: the caller keeps its older serde-form handling.
+    NotGoForm,
+    /// go's strict JSON decode rejects the body at this key (issue #1971).
+    UnknownField(JsonUnknownField),
+    Decoded(DecodedMsgpackRequest),
+}
+
+/// Parse a JSON simulate body written in go's JSON form (issues #1972, #1971):
+/// an unknown key anywhere is reported with go's offset and text, otherwise the
+/// body goes through the same pipeline as a msgpack one.
+pub fn parse_json_request(body: &[u8]) -> JsonSimulate {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return JsonSimulate::NotGoForm;
     };
-    let pairs = map
+    let Some(Node::Object(members)) = parse_ordered(text) else {
+        return JsonSimulate::NotGoForm;
+    };
+    match first_unknown(&members) {
+        Ok(Some(u)) => return JsonSimulate::UnknownField(u),
+        Ok(None) => {}
+        Err(()) => return JsonSimulate::NotGoForm,
+    }
+    let Some(pairs) = members
         .iter()
-        .map(|(k, v)| Some((Value::String(k.as_str().into()), json_to_msgpack(v, k, "")?)))
-        .collect::<Option<Vec<_>>>()?;
-    parse_request_pairs(pairs)
+        .map(|m| {
+            Some((
+                Value::String(m.key.as_str().into()),
+                json_to_msgpack(&m.value, &m.key, "")?,
+            ))
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return JsonSimulate::NotGoForm;
+    };
+    parse_request_pairs(pairs).map_or(JsonSimulate::NotGoForm, JsonSimulate::Decoded)
 }
 
 #[cfg(test)]
@@ -466,38 +663,51 @@ mod tests {
 
     /// go's JSON form of the same transaction `stxn()` builds in msgpack:
     /// addresses as checksummed base32, other bytes as base64, text as text.
-    fn go_json_stxn() -> serde_json::Value {
+    fn go_json_stxn_text() -> String {
         use base64::Engine;
         let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
-        serde_json::json!({
-            "sig": b64(&[7u8; 64]),
-            "txn": {
-                "type": "pay",
-                "snd": crate::block_json::address_to_base32(&[1u8; 32]),
-                "rcv": crate::block_json::address_to_base32(&[2u8; 32]),
-                "amt": 1000, "fee": 1000, "fv": 100, "lv": 1100,
-                "gh": b64(&[3u8; 32]),
-            }
-        })
+        format!(
+            r#"{{"sig":"{}","txn":{{"type":"pay","snd":"{}","rcv":"{}","amt":1000,"fee":1000,"fv":100,"lv":1100,"gh":"{}"}}}}"#,
+            b64(&[7u8; 64]),
+            crate::block_json::address_to_base32(&[1u8; 32]),
+            crate::block_json::address_to_base32(&[2u8; 32]),
+            b64(&[3u8; 32]),
+        )
     }
 
-    fn json_request(stxns: Vec<serde_json::Value>, extra: serde_json::Value) -> Vec<u8> {
-        let mut req = serde_json::json!({ "txn-groups": [{ "txns": stxns }] });
-        if let (Some(r), Some(e)) = (req.as_object_mut(), extra.as_object()) {
-            r.extend(e.clone());
+    fn json_request(stxns: &[String], extra: &str) -> Vec<u8> {
+        format!(
+            r#"{{"txn-groups":[{{"txns":[{}]}}]{}}}"#,
+            stxns.join(","),
+            extra
+        )
+        .into_bytes()
+    }
+
+    fn decoded_json(body: &[u8]) -> DecodedMsgpackRequest {
+        match parse_json_request(body) {
+            JsonSimulate::Decoded(d) => d,
+            JsonSimulate::UnknownField(u) => panic!("unknown field: {}", u.message()),
+            JsonSimulate::NotGoForm => panic!("not go's JSON form"),
         }
-        serde_json::to_vec(&req).unwrap()
+    }
+
+    fn unknown_of(text: &str) -> JsonUnknownField {
+        match parse_json_request(text.as_bytes()) {
+            JsonSimulate::UnknownField(u) => u,
+            JsonSimulate::Decoded(_) => panic!("accepted: {text}"),
+            JsonSimulate::NotGoForm => panic!("not go's JSON form: {text}"),
+        }
     }
 
     /// Issue #1972: go's JSON form of a SignedTxn (base64 `sig`, address
     /// strings) decodes to exactly the transaction the msgpack form does.
     #[test]
     fn go_json_form_decodes_to_the_same_transaction_as_msgpack() {
-        let from_json = parse_json_request(&json_request(
-            vec![go_json_stxn()],
-            serde_json::json!({"round": 9, "allow-empty-signatures": true}),
-        ))
-        .expect("go's JSON form decodes");
+        let from_json = decoded_json(&json_request(
+            &[go_json_stxn_text()],
+            r#","round":9,"allow-empty-signatures":true"#,
+        ));
         let from_msgpack = decode(&request(vec![stxn(vec![], vec![])], vec![], vec![])).unwrap();
 
         let a: SignedTransaction = rmp_serde::from_slice(&from_json.raw_txns[0][0]).unwrap();
@@ -511,19 +721,19 @@ mod tests {
         assert_eq!(from_json.request.allow_empty_signatures, Some(true));
     }
 
+    fn convert(text: &str, key: &str, parent: &str) -> Option<Value> {
+        json_to_msgpack(&parse_ordered(text).unwrap(), key, parent)
+    }
+
     #[test]
     fn json_text_keys_stay_text_and_other_strings_are_bytes() {
-        let t = |v: serde_json::Value, key: &str| json_to_msgpack(&v, key, "").unwrap();
-        assert_eq!(t(serde_json::json!("pay"), "type"), Value::String("pay".into()));
-        assert_eq!(t(serde_json::json!("My Asset"), "an"), Value::String("My Asset".into()));
-        assert_eq!(t(serde_json::json!("AQID"), "note"), Value::Binary(vec![1, 2, 3]));
+        assert_eq!(convert(r#""pay""#, "type", ""), Some(Value::String("pay".into())));
+        assert_eq!(convert(r#""My Asset""#, "an", ""), Some(Value::String("My Asset".into())));
+        assert_eq!(convert(r#""AQID""#, "note", ""), Some(Value::Binary(vec![1, 2, 3])));
         // asset-params letters are addresses only under `apar`
-        let addr = crate::block_json::address_to_base32(&[9u8; 32]);
-        assert_eq!(
-            json_to_msgpack(&serde_json::json!(addr), "m", "apar").unwrap(),
-            Value::Binary(vec![9u8; 32])
-        );
-        assert_eq!(json_to_msgpack(&serde_json::json!("AQID"), "m", "").unwrap(), Value::Binary(vec![1, 2, 3]));
+        let addr = format!("\"{}\"", crate::block_json::address_to_base32(&[9u8; 32]));
+        assert_eq!(convert(&addr, "m", "apar"), Some(Value::Binary(vec![9u8; 32])));
+        assert_eq!(convert(r#""AQID""#, "m", ""), Some(Value::Binary(vec![1, 2, 3])));
     }
 
     /// The decoder shares `block_json`'s key tables with the encoder: every
@@ -532,45 +742,94 @@ mod tests {
     #[test]
     fn address_keys_round_trip_through_block_json_rendering() {
         let bytes = [0x5Au8; 32];
-        let text = serde_json::json!(crate::block_json::address_to_base32(&bytes));
+        let text = format!("\"{}\"", crate::block_json::address_to_base32(&bytes));
         for key in crate::block_json::ADDRESS_KEYS {
-            assert_eq!(
-                json_to_msgpack(&text, key, "").unwrap(),
-                Value::Binary(bytes.to_vec()),
-                "{key}"
-            );
+            assert_eq!(convert(&text, key, ""), Some(Value::Binary(bytes.to_vec())), "{key}");
         }
         for key in crate::block_json::APAR_ADDRESS_KEYS {
             assert_eq!(
-                json_to_msgpack(&text, key, "apar").unwrap(),
-                Value::Binary(bytes.to_vec()),
+                convert(&text, key, "apar"),
+                Some(Value::Binary(bytes.to_vec())),
                 "{key} under apar"
             );
             // elsewhere the same letter is plain base64 bytes: a base32
-            // address string is not valid base64 of the same bytes
+            // address string is not base64 of the same bytes
             assert_ne!(
-                json_to_msgpack(&text, key, "").map(|v| v == Value::Binary(bytes.to_vec())),
-                Some(true),
+                convert(&text, key, ""),
+                Some(Value::Binary(bytes.to_vec())),
                 "{key} outside apar"
             );
         }
     }
 
     #[test]
-    fn json_that_is_not_go_form_is_none() {
+    fn json_that_is_not_go_form_is_not_go_form() {
+        let not_go = |text: &str| matches!(parse_json_request(text.as_bytes()), JsonSimulate::NotGoForm);
         // an address with a bad checksum, bytes that are not base64, a float
         let bad_addr = "A".repeat(58);
-        assert!(json_to_msgpack(&serde_json::json!(bad_addr), "snd", "txn").is_none());
-        assert!(json_to_msgpack(&serde_json::json!("not base64!"), "sig", "").is_none());
-        assert!(json_to_msgpack(&serde_json::json!(1.5), "amt", "").is_none());
+        assert!(not_go(&format!(r#"{{"txn-groups":[{{"txns":[{{"txn":{{"snd":"{bad_addr}"}}}}]}}]}}"#)));
+        assert!(not_go(r#"{"txn-groups":[{"txns":[{"sig":"not base64!"}]}]}"#));
+        assert!(not_go(r#"{"txn-groups":[{"txns":[{"txn":{"amt":1.5}}]}]}"#));
         // Rust's own serde form (numbers for bytes) is not go's JSON form either
-        let serde_form = serde_json::to_vec(&serde_json::json!({
-            "txn-groups": [{"txns": [{"sig": vec![0u8; 64]}]}]
-        }))
-        .unwrap();
-        assert!(parse_json_request(&serde_form).is_none());
-        assert!(parse_json_request(b"[]").is_none());
-        assert!(parse_json_request(b"not json").is_none());
+        assert!(not_go(&format!(r#"{{"txn-groups":[{{"txns":[{{"sig":{:?}}}]}}]}}"#, vec![0u8; 64])));
+        assert!(not_go("[]"));
+        assert!(not_go("not json"));
+    }
+
+    /// Positions captured from a real go-algorand v5.0.3-stable node
+    /// (`curl -X POST -H 'Content-Type: application/json' --data-binary @body
+    /// /v2/transactions/simulate`): go reports the first unknown key in stream
+    /// order with the offset just after the colon that follows it.
+    #[test]
+    fn unknown_keys_get_gos_offset_and_text() {
+        let samples: &[(&str, usize, &str)] = &[
+            (r#"{"txn-groups":[{"txns":[{"txn":{"type":"pay"},"z":1}]}]}"#, 50, "z"),
+            (r#"{"txn-groups":[{"txns":[{"txn":{"type":"pay"},"zzz":1}]}]}"#, 52, "zzz"),
+            (r#"{"txn-groups":[{"txns":[{"txn":{"type":"pay"},"zzzzzzzz":1}]}]}"#, 57, "zzzzzzzz"),
+            (r#"{"txn-groups":[{"txns":[{"txn":{"type":"pay"},"zzz":"hello"}]}]}"#, 52, "zzz"),
+            (r#"{"txn-groups":[{"txns":[{"txn":{"type":"pay"},"zzz":1234567890}]}]}"#, 52, "zzz"),
+            (r#"{ "txn-groups" : [ { "txns" : [ { "txn" : { "type" : "pay" } , "zzz" : 1 } ] } ] }"#, 70, "zzz"),
+            (r#"{"txn-groups":[{"txns":[{"zzz":1,"txn":{"type":"pay"}}]}]}"#, 31, "zzz"),
+            (r#"{"zzz":1,"txn-groups":[{"txns":[{"txn":{"type":"pay"}}]}]}"#, 7, "zzz"),
+            (r#"{"txn-groups":[{"zzz":1,"txns":[{"txn":{"type":"pay"}}]}]}"#, 22, "zzz"),
+            (r#"{"txn-groups":[{"txns":[{"txn":{"type":"pay"}}]}],"zzz":1}"#, 56, "zzz"),
+            (r#"{"txn-groups":[{"txns":[{"txn":{"type":"pay"},"lsig":{"l":"BoEB","zzz":1}}]}]}"#, 71, "zzz"),
+            (r#"{"txn-groups":[{"txns":[{"txn":{"type":"pay"},"msig":{"subsig":[{"pk":"AAAA","zzz":1}],"thr":1,"v":1}}]}]}"#, 83, "zzz"),
+            (r#"{"txn-groups":[{"txns":[{"txn":{"type":"pay"},"pqsig":{"sch":"ZjE=","zzz":1}}]}]}"#, 74, "zzz"),
+            (r#"{"txn-groups":[{"txns":[{"hgi":true,"txn":{"type":"pay"}}]}]}"#, 31, "hgi"),
+            (r#"{"txn-groups":[{"txns":[{"txn":{"type":"pay"}}]}],"exec-trace-config":{"zzz":true}}"#, 77, "zzz"),
+            (r#"{"txn-groups":[{"txns":[{"txn":{"type":"acfg","apar":{"zzz":1}}}]}]}"#, 60, "zzz"),
+            // the first unknown key in stream order, not the last
+            (r#"{"txn-groups":[{"txns":[{"txn":{"type":"pay","aaa":1,"bbb":2}}]}],"ccc":3}"#, 51, "aaa"),
+            (r#"{"txn-groups":[{"txns":[{"txn":{"type":"pay"}},{"txn":{"type":"pay"},"zzz":1}]}]}"#, 75, "zzz"),
+            // the key is reported with its escapes decoded
+            (r#"{"txn-groups":[{"txns":[{"txn":{"type":"pay"},"zAz":1}]}]}"#, 52, "zAz"),
+            // python's json.dumps spacing
+            (r#"{"txn-groups": [{"txns": [{"txn": {"type": "pay"}, "zzz": 1}]}]}"#, 57, "zzz"),
+            (r#"{"txn-groups": [{"txns": [{"txn": {"type": "pay", "zzz": 1}}]}]}"#, 56, "zzz"),
+        ];
+        for (text, pos, key) in samples {
+            let u = unknown_of(text);
+            assert_eq!((u.pos, u.key.as_str()), (*pos, *key), "{text}");
+            assert_eq!(
+                u.message(),
+                format!(
+                    "failed to decode object: json decode error [pos {pos}]: no matching struct field found when decoding stream map with key {key}"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn a_clean_go_form_body_has_no_unknown_field() {
+        let body = json_request(&[go_json_stxn_text()], "");
+        assert!(matches!(parse_json_request(&body), JsonSimulate::Decoded(_)));
+        // a missing sender is not an unknown field (go's JSON decoder enforces
+        // no required fields); the body then fails the typed pipeline instead
+        assert!(matches!(
+            parse_json_request(br#"{"txn-groups":[{"txns":[{"txn":{"type":"pay"}}]}]}"#),
+            JsonSimulate::NotGoForm
+        ));
     }
 
     #[test]

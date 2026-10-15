@@ -123,6 +123,9 @@ pub fn check_msgpack_depth(bytes: &[u8]) -> Result<()> {
 use std::cell::Cell;
 
 thread_local! {
+    /// Scan mode: required-field checks are skipped (see
+    /// [`strict_unknown_fields_scan`]).
+    static SCAN_ONLY: Cell<bool> = const { Cell::new(false) };
     /// (address of the first byte, length) of the body being decoded in strict mode.
     static STRICT_BASE: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
 }
@@ -151,6 +154,7 @@ impl std::error::Error for UnknownFieldError {}
 #[must_use = "strict mode ends when the guard is dropped"]
 pub struct StrictUnknownFieldsGuard {
     prev: Option<(usize, usize)>,
+    prev_scan: bool,
     /// `!Send`: the mode is per-thread, so a guard held across an `.await`
     /// (which may resume on another worker) must not compile.
     _not_send: std::marker::PhantomData<*const ()>,
@@ -159,6 +163,7 @@ pub struct StrictUnknownFieldsGuard {
 impl Drop for StrictUnknownFieldsGuard {
     fn drop(&mut self) {
         STRICT_BASE.with(|c| c.set(self.prev));
+        SCAN_ONLY.with(|c| c.set(self.prev_scan));
     }
 }
 
@@ -167,10 +172,30 @@ impl Drop for StrictUnknownFieldsGuard {
 /// of it so that positions count from its start.
 pub fn strict_unknown_fields(body: &[u8]) -> StrictUnknownFieldsGuard {
     let prev = STRICT_BASE.with(|c| c.replace(Some((body.as_ptr() as usize, body.len()))));
+    let prev_scan = SCAN_ONLY.with(Cell::get);
     StrictUnknownFieldsGuard {
         prev,
+        prev_scan,
         _not_send: std::marker::PhantomData,
     }
+}
+
+/// [`strict_unknown_fields`] that also skips the readers' required-field
+/// checks, so a decode runs on to the first unknown key even when an earlier
+/// object is missing a field such as `snd`. go's JSON decoder
+/// (`protocol.JSONStrictHandle`, reflection based) enforces no required
+/// fields, so it reaches the unknown key where the msgpack-style readers would
+/// stop first. For locating unknown keys only: the decoded value is not valid.
+pub fn strict_unknown_fields_scan(body: &[u8]) -> StrictUnknownFieldsGuard {
+    let guard = strict_unknown_fields(body);
+    SCAN_ONLY.with(|c| c.set(true));
+    guard
+}
+
+/// Whether the readers enforce `codec:",required"` fields (false in scan mode).
+#[inline]
+pub fn required_fields_checked() -> bool {
+    !SCAN_ONLY.with(Cell::get)
 }
 
 fn unknown_field_error(rd: &[u8], key: &[u8], (base, len): (usize, usize)) -> AlgoError {
@@ -673,6 +698,12 @@ pub fn read_fixed_bytes<const N: usize>(rd: &mut &[u8]) -> Result<[u8; N]> {
     let len = rmp::decode::read_bin_len(rd)
         .map_err(|e| codec_err(format!("read_fixed_bytes bin_len: {e}")))? as usize;
     if len != N {
+        // Scan mode (go's JSON decoder does not enforce fixed lengths while
+        // it walks to an unknown key): consume the payload and yield zeros.
+        if !required_fields_checked() && rd.len() >= len {
+            *rd = &rd[len..];
+            return Ok([0u8; N]);
+        }
         return Err(codec_err(format!(
             "read_fixed_bytes: expected {N} bytes, got {len}"
         )));

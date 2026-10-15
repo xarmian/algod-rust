@@ -16,6 +16,11 @@ Rust node of the running mixed cluster and require identical answers
   go's strict msgpack decode fails, its JSON fallback then fails on the msgpack
   map marker, and the answer is one fixed text (captured from a go-algorand
   v5.0.3-stable node).
+* `json_*`: the same, as a JSON body in go's JSON form (issue #1971). go's
+  strict JSON decode names the first unknown key in stream order and the byte
+  offset just after the colon that follows it:
+  `failed to decode object: json decode error [pos N]: no matching struct
+  field found when decoding stream map with key K`.
 
     python3 simulate_parity.py [--go go-node-1] [--rust rust-node-4]
 
@@ -30,6 +35,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ports  # noqa: E402
+import sig_failure_parity as sfp  # noqa: E402
 import unknown_field_parity as ufp  # noqa: E402
 
 TOKEN = os.environ.get("ALGOD_TOKEN", "a" * 64)
@@ -62,6 +68,38 @@ def bodies():
     }
 
 
+def json_cases():
+    """name -> (JSON body, the first unknown key) for go's JSON form."""
+    stxn = sfp._stxn_json()
+
+    def text(request):
+        return json.dumps(request, separators=(",", ":")).encode()
+
+    def req(stxn_value, group=None, top=None):
+        group_obj = {**(group or {}), "txns": [stxn_value]}
+        return {"txn-groups": [group_obj], **(top or {})}
+
+    with_key = lambda value, **extra: {**value, **extra}  # noqa: E731
+    txn_with = dict(stxn, txn=with_key(stxn["txn"], zzz=1))
+    return {
+        "json_request": (text(req(stxn, top={"zzz": 1})), "zzz"),
+        "json_group": (text(req(stxn, group={"zzz": 1})), "zzz"),
+        "json_stxn": (text(req(with_key(stxn, zzz=1))), "zzz"),
+        "json_txn": (text(req(txn_with)), "zzz"),
+        "json_hgi": (text(req(with_key(stxn, hgi=True))), "hgi"),
+        "json_first_wins": (text(req(dict(stxn, txn=with_key(stxn["txn"], aaa=1, bbb=2)), top={"ccc": 3})), "aaa"),
+    }
+
+
+def json_expected(body, key):
+    """go's answer for a JSON body whose first unknown key is `key`: the offset
+    is just after the colon following the key's first occurrence as a key."""
+    token = ('"%s":' % key).encode()
+    pos = body.index(token) + len(token)
+    return (400, "failed to decode object: json decode error [pos %d]: no matching struct field found "
+                 "when decoding stream map with key %s" % (pos, key))
+
+
 def expected(name):
     """(status, exact message) go answers; message None = only 'not a decode error'."""
     if name == "clean":
@@ -89,10 +127,10 @@ def compare(name, go, rust):
     return problems
 
 
-def post(node, body):
+def post(node, body, content_type="application/msgpack"):
     req = urllib.request.Request(
         "http://127.0.0.1:{}/v2/transactions/simulate".format(ports.node_port(node)), data=body, method="POST",
-        headers={"X-Algo-API-Token": TOKEN, "Content-Type": "application/msgpack"})
+        headers={"X-Algo-API-Token": TOKEN, "Content-Type": content_type})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             return r.status, r.read().decode("utf-8", "replace")
@@ -106,15 +144,16 @@ def main(argv=None):
     ap.add_argument("--rust", default="rust-node-4")
     a = ap.parse_args(argv)
     problems = []
-    for name, body in sorted(bodies().items()):
-        go, rust = post(a.go, body), post(a.rust, body)
+    todo = [(n, b, "application/msgpack", expected(n)) for n, b in bodies().items()]
+    todo += [(n, b, "application/json", json_expected(b, k)) for n, (b, k) in json_cases().items()]
+    for name, body, content_type, want in sorted(todo, key=lambda t: t[0]):
+        go, rust = post(a.go, body, content_type), post(a.rust, body, content_type)
         found = compare(name, go, rust)
-        want = expected(name)
         if (go[0], ufp.message_of(go[1]) if want[1] is not None else None) != want:
             found.append("{}: go answered {} {!r}, expected {} {!r}".format(name, go[0], ufp.message_of(go[1]), *want))
         print("{} {}".format("FAIL" if found else "ok  ", name), "; ".join(found))
         problems += found
-    print(json.dumps({"event": "simulate_parity", "ok": not problems, "bodies": len(bodies()), "problems": problems}))
+    print(json.dumps({"event": "simulate_parity", "ok": not problems, "bodies": len(todo), "problems": problems}))
     return 0 if not problems else 1
 
 
