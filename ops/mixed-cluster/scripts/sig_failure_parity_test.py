@@ -29,7 +29,10 @@ class BodiesTest(unittest.TestCase):
     def test_every_case_has_a_body_a_path_and_a_content_type(self):
         cases = sfp.cases()
         self.assertEqual(set(cases), {"submit", "simulate_msgpack", "simulate_json",
-                                      "submit_early", "submit_dead", "submit_bad_sig_and_early"})
+                                      "submit_early", "submit_dead", "submit_bad_sig_and_early",
+                                      "submit_low_fee", "submit_low_fee_and_early",
+                                      "submit_low_fee_and_dead", "submit_low_fee_bad_sig",
+                                      "submit_wrong_genesis_hash"})
         for name, c in cases.items():
             self.assertTrue(c["path"].startswith("/v2/transactions"), name)
             self.assertTrue(c["body"], name)
@@ -58,6 +61,14 @@ class WindowCasesTest(unittest.TestCase):
         msg = "TransactionPool.Remember: txn dead: round 17 outside of 1000--1900"
         self.assertEqual(sfp.normalise(msg), "TransactionPool.Remember: txn dead: round N outside of 1000--1900")
         self.assertTrue(sfp.DEAD_RE.match(msg))
+
+    def test_low_fee_bodies_differ_from_the_normal_fee_ones_only_in_the_fee(self):
+        cases = sfp.window_cases(0)
+        self.assertIn("txgroup with 1uA fees is less than 1mA", cases["submit_low_fee"][1])
+        self.assertEqual(cases["submit_low_fee_and_early"][1], cases["submit_early"][1])
+        self.assertEqual(cases["submit_low_fee_and_dead"][1], cases["submit_dead"][1])
+        self.assertEqual(cases["submit_low_fee_bad_sig"][1], sfp.GO_MESSAGE)
+        self.assertNotEqual(cases["submit_low_fee_and_early"][0], cases["submit_early"][0])
 
     def test_expectations(self):
         self.assertEqual(sfp.expected_message("submit"), sfp.GO_MESSAGE)

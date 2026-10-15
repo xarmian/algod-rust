@@ -408,6 +408,61 @@ pub fn required_fee_for_txn(txn: &Transaction, params: &ConsensusParams) -> (u64
     required_fee_for_usage(txn_fee_factor(txn, params), params)
 }
 
+/// go's `basics.MicroAlgos.String()` (`data/basics/units.go`): `0.0A`, `<n>uA`
+/// below a thousand, `<n>[.<mmm>]mA` below a million, `<n>[.<mmmmmm>]A` above.
+pub fn format_micro_algos(raw: u64) -> String {
+    if raw == 0 {
+        return "0.0A".to_string();
+    }
+    if raw < 1_000 {
+        return format!("{raw}uA");
+    }
+    if raw < 1_000_000 {
+        let (millis, fraction) = (raw / 1_000, raw % 1_000);
+        return if fraction == 0 {
+            format!("{millis}mA")
+        } else {
+            format!("{millis}.{fraction:03}mA")
+        };
+    }
+    let (whole, fraction) = (raw / 1_000_000, raw % 1_000_000);
+    if fraction == 0 {
+        format!("{whole}A")
+    } else {
+        format!("{whole}.{fraction:06}A")
+    }
+}
+
+/// go's `basics.Micros.String()`: a fixed-point number with six digits.
+pub fn format_micros(micros: u64) -> String {
+    format!("{}.{:06}", micros / 1_000_000, micros % 1_000_000)
+}
+
+/// go's `eval.CheckGroupFees` applied to a submitted group
+/// (`ledger/eval/eval.go:1007`): the group's top-level fees must cover its
+/// summed usage at the minimum fee. The error text is go's
+/// `ledgercore.TxGroupMalformedError` message.
+pub fn check_submitted_group_fees(
+    group: &[&SignedTransaction],
+    params: &ConsensusParams,
+) -> Result<(), String> {
+    let (usage, paid) = summarize_fees(group, params);
+    let (needed, overflow) = required_fee_for_usage(usage, params);
+    if overflow {
+        return Err("txgroup required fee overflow".to_string());
+    }
+    if paid < needed {
+        return Err(format!(
+            "txgroup with {} fees is less than {} (usage={} * base={})",
+            format_micro_algos(paid),
+            format_micro_algos(needed),
+            format_micros(usage),
+            format_micro_algos(params.min_txn_fee),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,6 +574,59 @@ mod tests {
 
     // ── fee_for_usage ────────────────────────────────────────────
     // Ported directly from go's TestFeeForUsage (data/basics/units_test.go).
+
+    #[test]
+    fn micro_algos_format_like_go() {
+        // data/basics/units.go MicroAlgos.String()
+        for (raw, want) in [
+            (0, "0.0A"),
+            (1, "1uA"),
+            (999, "999uA"),
+            (1_000, "1mA"),
+            (1_500, "1.500mA"),
+            (1_001, "1.001mA"),
+            (999_999, "999.999mA"),
+            (1_000_000, "1A"),
+            (1_234_567, "1.234567A"),
+            (2_000_000, "2A"),
+        ] {
+            assert_eq!(format_micro_algos(raw), want, "{raw}");
+        }
+        assert_eq!(format_micros(1_000_000), "1.000000");
+        assert_eq!(format_micros(1_500_000), "1.500000");
+        assert_eq!(format_micros(2_000_001), "2.000001");
+    }
+
+    /// The text go-algorand v5.0.3-stable answers for a validly signed payment
+    /// with fee 1 (captured live):
+    /// `txgroup with 1uA fees is less than 1mA (usage=1.000000 * base=1mA)`.
+    #[test]
+    fn a_low_fee_group_reads_like_gos_check_group_fees() {
+        let params = ConsensusParams::default();
+        let mut low = SignedTransaction::default();
+        low.txn.fee = 1;
+        let err = check_submitted_group_fees(&[&low], &params).unwrap_err();
+        assert_eq!(
+            err,
+            "txgroup with 1uA fees is less than 1mA (usage=1.000000 * base=1mA)"
+        );
+
+        let mut ok = SignedTransaction::default();
+        ok.txn.fee = params.min_txn_fee;
+        assert_eq!(check_submitted_group_fees(&[&ok], &params), Ok(()));
+
+        // two members pay for each other: 1500 + 600 covers 2 * 1000? no, 2100 >= 2000
+        let mut a = SignedTransaction::default();
+        a.txn.fee = 1_500;
+        let mut b = SignedTransaction::default();
+        b.txn.fee = 600;
+        assert_eq!(check_submitted_group_fees(&[&a, &b], &params), Ok(()));
+        b.txn.fee = 400;
+        assert_eq!(
+            check_submitted_group_fees(&[&a, &b], &params).unwrap_err(),
+            "txgroup with 1.900mA fees is less than 2mA (usage=2.000000 * base=1mA)"
+        );
+    }
 
     #[test]
     fn fee_for_usage_no_residue_is_ceiling() {

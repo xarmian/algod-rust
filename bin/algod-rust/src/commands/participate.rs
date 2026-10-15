@@ -1649,8 +1649,8 @@ impl SimpleBlockEvaluator {
         )
     }
 
-    /// Perform stateless validation only (well-formedness, group ID, fees,
-    /// signatures, validity window). Returns the group with genesis fields restored so that
+    /// Perform stateless validation only (well-formedness, group ID,
+    /// signatures, validity window, group fees -- go's order, issue #1976). Returns the group with genesis fields restored so that
     /// `validate_group` can reuse it for txid computation without cloning
     /// the group a second time.
     ///
@@ -1720,12 +1720,16 @@ impl SimpleBlockEvaluator {
         // program), `block.rs`'s block-level `verify_heartbeat_proof` call,
         // and `apply::apply_heartbeat`'s challenge/vote-ID/seed checks.
 
-        // 2. Per-transaction well-formedness.
-        let in_group = txgroup.len() > 1;
+        // 2. Per-transaction well-formedness. go's `Transaction.WellFormed` has
+        // no fee check at all (fee pooling is unconditional since v28): the fee
+        // is judged for the whole submitted group by `CheckGroupFees` (step 7),
+        // a singleton included, after the signatures and the validity window.
+        // Passing `allow_fee_pooling = true` skips the legacy per-transaction
+        // minimum, which fired first and with other wording (issue #1976).
         for stx in txgroup {
             algo_validate::validate_transaction_wellformed(
                 &stx.txn,
-                in_group && params.enable_fee_pooling,
+                true,
                 params,
                 None, // SpecialAddresses not available without ledger lookup
             )?;
@@ -1739,35 +1743,6 @@ impl SimpleBlockEvaluator {
         // `TxnGroup`/`TxnGroupWithTracer` (`data/transactions/verify/txn.go`)
         // and its `TestGroupTransactions` (see issue #1034).
         algo_validate::validate_transaction_group_strict(txgroup)?;
-
-        // 4. Group fee total check. Go's `CheckGroupFees`/`SummarizeFees`
-        // (`ledger/eval/eval.go`) run unconditionally for every top-level
-        // group -- including a size-1 (ungrouped) submission -- not just
-        // "multi-txn groups with pooling enabled"; `EnableFeePooling` was a
-        // real config flag pre-v28 but go-algorand has since removed it
-        // entirely (see `ledger/eval_simple_test.go`'s `TestFeePooling`:
-        // "FeePooling was added in v28, but we have now removed the
-        // consensus flag"), and never gated whether the group-total *size-
-        // pricing surcharge* (v42+) gets computed at all. Gating this call
-        // on `in_group` (issue #703's live-parity testing surfaced this: a
-        // single oversized-LogicSig transaction, submitted ungrouped, was
-        // wrongly accepted underpaid) skipped the only place
-        // `logic_sig_program_fee_contribution`'s pooled program-byte
-        // surcharge is folded into the required fee -- note/app-args/
-        // app-program surcharges are covered by `txn_fee_factor` inside the
-        // per-transaction well-formedness check above regardless of
-        // grouping, but the LogicSig surcharge is pooled across the group
-        // and only visible to `summarize_fees`. `block.rs`'s block-level
-        // validation already calls this unconditionally (see 4b there);
-        // this matches that established, correct pattern.
-        {
-            let refs: Vec<&algo_types::SignedTransaction> = txgroup.iter().collect();
-            algo_validate::validate_group_fees_with_params(&refs, params).map_err(|e| {
-                algo_error::AlgoError::Validation {
-                    message: format!("group fee validation failed: {e}"),
-                }
-            })?;
-        }
 
         // 5. Signature verification.
         // Restore genesis fields before verification — signatures are computed
@@ -1827,17 +1802,67 @@ impl SimpleBlockEvaluator {
         // ways is reported for its signature; the error is
         // `bookkeeping.TxnDeadError`, `txn dead: round R outside of F--L`,
         // for a not-yet-valid and an expired transaction alike (issue #1974).
+        // go's `BlockHeader.Alive` goes on, per transaction, to the genesis ID and
+        // the genesis hash; a mismatch is a plain `fmt.Errorf`, behind only the
+        // pool's `Remember` frame. (A transaction that omits the genesis ID or
+        // hash is accepted: they are restored from the header.)
+        let rejected = |message: String| algo_error::AlgoError::Rejected {
+            source: None,
+            message,
+            class: algo_error::RejectClass::Other,
+        };
         for stx in txgroup {
             if round < stx.txn.first_valid || round > stx.txn.last_valid {
-                return Err(algo_error::AlgoError::Rejected {
-                    source: None,
-                    message: format!(
-                        "txn dead: round {} outside of {}--{}",
-                        round.0, stx.txn.first_valid.0, stx.txn.last_valid.0,
-                    ),
-                    class: algo_error::RejectClass::Other,
-                });
+                return Err(rejected(format!(
+                    "txn dead: round {} outside of {}--{}",
+                    round.0, stx.txn.first_valid.0, stx.txn.last_valid.0,
+                )));
             }
+            if !stx.txn.genesis_id.is_empty() && stx.txn.genesis_id != self.hdr.genesis_id {
+                return Err(rejected(format!(
+                    "tx.GenesisID <{}> does not match expected <{}>",
+                    stx.txn.genesis_id, self.hdr.genesis_id,
+                )));
+            }
+            if params.support_genesis_hash {
+                let zero = [0u8; 32];
+                if stx.txn.genesis_hash != zero && stx.txn.genesis_hash != self.hdr.genesis_hash {
+                    return Err(rejected(format!(
+                        "tx.GenesisHash <{}> does not match expected <{}>",
+                        algo_types::Digest(stx.txn.genesis_hash),
+                        algo_types::Digest(self.hdr.genesis_hash),
+                    )));
+                }
+                if params.require_genesis_hash && stx.txn.genesis_hash == zero {
+                    return Err(rejected("required tx.GenesisHash is missing".to_string()));
+                }
+            } else if stx.txn.genesis_hash != [0u8; 32] {
+                // a protocol that predates genesis hashes allows none
+                return Err(rejected(format!(
+                    "tx.GenesisHash <{}> not allowed",
+                    algo_types::Digest(stx.txn.genesis_hash),
+                )));
+            }
+        }
+
+        // 7. Group fee total check. Go's `CheckGroupFees`/`SummarizeFees`
+        // (`ledger/eval/eval.go`) run unconditionally for every top-level group
+        // -- a size-1 (ungrouped) submission included, which is where the pooled
+        // LogicSig-program surcharge is folded in (issue #703) -- and only after
+        // signatures (`verify.TxnGroup`) and the validity window (`Alive`), so a
+        // group wrong in several ways is reported in that order (issue #1976).
+        // The error is `TxGroupMalformedError`'s text, behind only the pool's
+        // `Remember` frame:
+        // `txgroup with 1uA fees is less than 1mA (usage=1.000000 * base=1mA)`.
+        {
+            let refs: Vec<&algo_types::SignedTransaction> = txgroup.iter().collect();
+            algo_validate::fee::check_submitted_group_fees(&refs, params).map_err(|message| {
+                algo_error::AlgoError::Rejected {
+                    source: None,
+                    message,
+                    class: algo_error::RejectClass::Other,
+                }
+            })?;
         }
 
         Ok(restored)
@@ -9283,6 +9308,127 @@ mod tests {
         let only_window = windowed_pay(&key, sender, receiver, 500, 900);
         let err = eval.test_transaction_group(&[only_window]).unwrap_err();
         assert!(err.to_string().starts_with("txn dead:"), "{err}");
+    }
+
+    /// A validly signed payment with the given fee and validity window.
+    fn pay_with_fee_and_window(
+        key: &SigningKey,
+        sender: Address,
+        receiver: Address,
+        fee: u64,
+        first_valid: u64,
+        last_valid: u64,
+    ) -> SignedTransaction {
+        let mut stx = windowed_pay(key, sender, receiver, first_valid, last_valid);
+        stx.txn.fee = fee;
+        stx.sig = sign_txn(&stx.txn, key);
+        stx
+    }
+
+    /// Issue #1976: go checks, in this order, signatures, the validity window,
+    /// then the group fees (`verify.TxnGroup`, `Alive`, `CheckGroupFees`).
+    /// Captured live from go-algorand v5.0.3-stable with validly signed
+    /// transactions of fee 1: a valid window gives
+    /// `txgroup with 1uA fees is less than 1mA (usage=1.000000 * base=1mA)`,
+    /// an out-of-window one `txn dead: ...` (the window wins).
+    #[test]
+    fn group_fees_are_checked_after_signatures_and_the_window() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(64);
+        let (receiver, _) = test_keypair(65);
+        let eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+
+        // low fee, valid window: go's group-fee text, typed so the pool prints it bare
+        let low = pay_with_fee_and_window(&key, sender, receiver, 1, 1, 1000);
+        let err = eval.test_transaction_group(&[low]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "txgroup with 1uA fees is less than 1mA (usage=1.000000 * base=1mA)"
+        );
+        assert!(matches!(err, algo_error::AlgoError::Rejected { .. }), "{err:?}");
+
+        // low fee and out of window (early or expired): the window wins
+        for (fv, lv) in [(500, 900), (1, 50)] {
+            let low = pay_with_fee_and_window(&key, sender, receiver, 1, fv, lv);
+            let err = eval.test_transaction_group(&[low]).unwrap_err();
+            assert!(err.to_string().starts_with("txn dead:"), "{fv}--{lv}: {err}");
+        }
+
+        // low fee and a bad signature: the signature wins
+        let mut bad = pay_with_fee_and_window(&key, sender, receiver, 1, 1, 1000);
+        bad.sig = [7u8; 64];
+        let err = eval.test_transaction_group(&[bad]).unwrap_err();
+        assert!(err.is_batch_sig_failure(), "{err}");
+
+        // a fee-only problem stays a fee error, and a sufficient fee passes
+        let ok = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
+        assert!(eval.test_transaction_group(&[ok]).is_ok());
+    }
+
+    /// Issue #1976: after the validity window go's `BlockHeader.Alive` checks
+    /// the genesis ID and hash (`tx.GenesisID <..> does not match expected
+    /// <..>`, `tx.GenesisHash <..> does not match expected <..>`, captured
+    /// live), before the group fees and after signatures. The pool path used
+    /// to admit a validly signed transaction with the wrong genesis hash.
+    #[test]
+    fn a_wrong_genesis_id_or_hash_is_rejected_like_gos_alive_check() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(66);
+        let (receiver, _) = test_keypair(67);
+        let eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+
+        // wrong genesis hash (the fixture's header hash is [0xAA; 32])
+        let mut wrong = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
+        wrong.txn.genesis_hash = [3u8; 32];
+        wrong.sig = sign_txn(&wrong.txn, &key);
+        let err = eval.test_transaction_group(&[wrong]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "tx.GenesisHash <{}> does not match expected <{}>",
+                algo_types::Digest([3u8; 32]),
+                algo_types::Digest([0xAA; 32])
+            )
+        );
+        assert!(matches!(err, algo_error::AlgoError::Rejected { .. }), "{err:?}");
+
+        // wrong genesis ID
+        let mut wrong = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
+        wrong.txn.genesis_id = "other-net".to_string();
+        wrong.sig = sign_txn(&wrong.txn, &key);
+        let err = eval.test_transaction_group(&[wrong]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "tx.GenesisID <other-net> does not match expected <test-v1>"
+        );
+
+        // order: signature, then window, then genesis, then fees
+        let mut bad_sig = pay_with_fee_and_window(&key, sender, receiver, 1, 1, 1000);
+        bad_sig.txn.genesis_hash = [3u8; 32];
+        bad_sig.sig = [7u8; 64];
+        assert!(eval.test_transaction_group(&[bad_sig]).unwrap_err().is_batch_sig_failure());
+
+        let mut dead = pay_with_fee_and_window(&key, sender, receiver, 1, 500, 900);
+        dead.txn.genesis_hash = [3u8; 32];
+        dead.sig = sign_txn(&dead.txn, &key);
+        let err = eval.test_transaction_group(&[dead]).unwrap_err();
+        assert!(err.to_string().starts_with("txn dead:"), "{err}");
+
+        let mut low_fee = pay_with_fee_and_window(&key, sender, receiver, 1, 1, 1000);
+        low_fee.txn.genesis_hash = [3u8; 32];
+        low_fee.sig = sign_txn(&low_fee.txn, &key);
+        let err = eval.test_transaction_group(&[low_fee]).unwrap_err();
+        assert!(err.to_string().starts_with("tx.GenesisHash <"), "{err}");
+
+        // an omitted genesis ID (the hash present and right) is accepted: go
+        // verifies the signature over the transaction as submitted
+        let mut omitted = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
+        omitted.txn.genesis_id = String::new();
+        omitted.sig = sign_txn(&omitted.txn, &key);
+        eval.test_transaction_group(&[omitted])
+            .expect("a transaction signed without a genesis ID is accepted");
     }
 
     #[test]
