@@ -46,6 +46,8 @@ class FakeEnv:
         self.posts = []
         self.accounts = 0
         self.wallet = None
+        self.pq_keys = 0
+        self.pending_confirmed = True  # /v2/transactions/pending/<id> reports a confirmed round
 
     def _next_tx(self):
         self.n += 1
@@ -56,6 +58,10 @@ class FakeEnv:
         for f in self.fail:
             if f in cmd:
                 return 1, "goal: boom ({})".format(f)
+        if "algokey pq generate" in cmd:
+            self.pq_keys += 1
+            return 0, ("PQ private key mnemonic: a b c\nPQ scheme: falcon-1024\nPQ public key: AAAA\n"
+                       "PQ address salt: 0\nPQ address: {}\n").format(("P%057d" % self.pq_keys).replace("0", "A").replace("1", "B").replace("2", "C"))
         t = self._next_tx()
         if "rawsend" in cmd:
             self.round += 1
@@ -97,11 +103,14 @@ class FakeEnv:
             addr = path.rsplit("/", 1)[-1]
             return {"amount": self.balances.get(addr, self.default_balance), "min-balance": 100000,
                     "created-assets": [{"index": self.asset}], "created-apps": [{"id": self.app}]}
+        if "/v2/transactions/pending/" in path:
+            self.pending_polls = getattr(self, "pending_polls", 0) + 1
+            return {"confirmed-round": self.round + 1 if self.pending_confirmed else 0}
         return {"last-round": self.round}
 
     def post_txn(self, node, raw):
         self.posts.append((node, raw))
-        return self.post_status[node], "{}"
+        return self.post_status[node], json.dumps({"txId": txid(900 + len(self.posts))})
 
     def fetch_file_b64(self, path):
         return 0, base64.b64encode(b"signed-bytes").decode()
@@ -190,7 +199,7 @@ class ScenarioTest(unittest.TestCase):
 
     def test_every_scenario_runs_against_a_cooperative_node(self):
         for name in wl.SCENARIO_ORDER:
-            env = FakeEnv()
+            env = FakeEnv(post_status={"go-node-1": 200, "rust-node-4": 200} if name == "pq" else None)
             w, out = make(env)
             w.actors = {k: ("%s" % k) * 58 for k in "ABCD"}
             w.scenario = name
@@ -328,6 +337,105 @@ class ScenarioTest(unittest.TestCase):
             w.sc_asset()
         # the failure is still recorded as a step
         self.assertTrue(any(r.get("outcome") == "rejected" for r in records(out)))
+
+
+ACCEPT = {"go-node-1": 200, "rust-node-4": 200}
+
+
+class PqScenarioTest(unittest.TestCase):
+    """Issue #1958: Falcon-signed (PQ account) payments submitted through a Go
+    node and through the Rust node must both commit."""
+
+    def run_pq(self, env):
+        w, out = make(env)
+        w.actors = {k: ("%s" % k) * 58 for k in "ABCD"}
+        w.scenario = "pq"
+        return w, out
+
+    def steps(self, out):
+        return [r for r in records(out) if r["kind"] == "workload_step"]
+
+    def test_pq_addr_regex_reads_algokey_output(self):
+        m = wl.PQ_ADDR_RE.search("PQ address salt: 0\nPQ address: " + ADDR + "\n")
+        self.assertEqual(m.group(1), ADDR)
+
+    def test_pq_is_in_the_standard_mix(self):
+        self.assertIn("pq", wl.SCENARIO_ORDER)
+        self.assertIn("pq", wl.SCENARIO_WEIGHTS)
+        self.assertIn("pq", wl.Workload.SCENARIOS)
+
+    def test_one_pq_payment_through_each_node_and_both_confirm(self):
+        env = FakeEnv(post_status=dict(ACCEPT))
+        w, out = self.run_pq(env)
+        w.sc_pq()
+        self.assertEqual([n for n, _ in env.posts], ["go-node-1", "rust-node-4"])
+        steps = self.steps(out)
+        pq = [s for s in steps if s["op"].startswith("pq_pay_via_")]
+        self.assertEqual([s["op"] for s in pq], ["pq_pay_via_go-node-1", "pq_pay_via_rust-node-4"])
+        for s in pq:
+            self.assertEqual((s["outcome"], s["ok"]), ("confirmed", True))
+            self.assertEqual(len(s["txids"]), 1)
+            self.assertIsNotNone(s["round"])
+        # distinct transactions
+        self.assertNotEqual(pq[0]["txids"], pq[1]["txids"])
+        self.assertEqual(w.counters["unexpected"], 0)
+
+    def test_pq_account_is_created_funded_then_signs_with_algokey(self):
+        env = FakeEnv(post_status=dict(ACCEPT))
+        w, out = self.run_pq(env)
+        w.sc_pq()
+        cmds = env.cmds
+        gen = [i for i, c in enumerate(cmds) if "algokey pq generate" in c]
+        self.assertEqual(len(gen), 1)
+        pq_addr = "P" + "A" * 56 + "B"
+        fund = [i for i, c in enumerate(cmds) if "clerk send" in c and "-t " + pq_addr in c]
+        self.assertTrue(fund, cmds)
+        self.assertGreater(fund[0], gen[0])
+        builds = [i for i, c in enumerate(cmds) if "clerk send -f " + pq_addr in c and " -o " in c]
+        signs = [i for i, c in enumerate(cmds) if "algokey pq sign" in c]
+        self.assertEqual(len(builds), 2)
+        self.assertEqual(len(signs), 2)
+        self.assertGreater(builds[0], fund[0])
+        self.assertGreater(signs[0], builds[0])
+        # the unsigned build carries an explicit fee: goal does not know the PQ fee contribution
+        self.assertTrue(all("--fee" in cmds[i] for i in builds))
+
+    def test_a_node_rejecting_a_pq_payment_is_an_unexpected_step_and_aborts(self):
+        env = FakeEnv(post_status={"go-node-1": 200, "rust-node-4": 400})
+        w, out = self.run_pq(env)
+        with self.assertRaises(wl.ScenarioAbort):
+            w.sc_pq()
+        bad = [s for s in self.steps(out) if s["op"] == "pq_pay_via_rust-node-4"]
+        self.assertEqual(len(bad), 1)
+        self.assertEqual((bad[0]["outcome"], bad[0]["ok"]), ("rejected", False))
+        self.assertEqual(bad[0]["submissions"][0]["node"], "rust-node-4")
+        self.assertEqual(bad[0]["submissions"][0]["status"], 400)
+        self.assertEqual(w.counters["unexpected"], 1)
+
+    def test_a_pq_payment_that_never_confirms_is_unexpected(self):
+        env = FakeEnv(post_status=dict(ACCEPT))
+        env.pending_confirmed = False
+        w, out = self.run_pq(env)
+        with self.assertRaises(wl.ScenarioAbort):
+            w.sc_pq()
+        bad = [s for s in self.steps(out) if s["op"].startswith("pq_pay_via_")]
+        self.assertEqual((bad[0]["outcome"], bad[0]["ok"]), ("rejected", False))
+        self.assertLessEqual(env.pending_polls, wl.PQ_CONFIRM_POLLS)
+
+    def test_key_generation_failure_aborts_before_anything_is_submitted(self):
+        env = FakeEnv(fail=("pq generate",), post_status=dict(ACCEPT))
+        w, out = self.run_pq(env)
+        with self.assertRaises(wl.ScenarioAbort):
+            w.sc_pq()
+        self.assertEqual(env.posts, [])
+
+    def test_signing_failure_aborts_without_submitting(self):
+        env = FakeEnv(fail=("pq sign",), post_status=dict(ACCEPT))
+        w, out = self.run_pq(env)
+        with self.assertRaises(wl.ScenarioAbort):
+            w.sc_pq()
+        self.assertEqual(env.posts, [])
+        self.assertTrue(any(s["outcome"] == "error" for s in self.steps(out)))
 
 
 class RobustnessTest(unittest.TestCase):
