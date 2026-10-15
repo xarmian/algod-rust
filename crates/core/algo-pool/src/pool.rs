@@ -3875,4 +3875,25 @@ mod tests {
             "TransactionPool.Remember: TransactionPool.ingest: validation error: transaction has too many foreign references"
         );
     }
+
+    /// Issue #1974: the pool's own expiry pre-check is go's `TxnDeadError`
+    /// (`data/pools/transactionPool.go:596`): `txn dead: round R outside of
+    /// F--L` behind only the `Remember` frame, tagged `txn_dead`. Its text is
+    /// what `classify_txn_dead` parses, so this pins the two together.
+    #[test]
+    fn an_expired_transaction_is_gos_txn_dead_error_and_tagged_txn_dead() {
+        let pool = make_pool_with_evaluator(1000); // evaluator round 2
+        let mut txn = make_test_txn(9);
+        txn.txn.first_valid = Round(1);
+        txn.txn.last_valid = Round(1); // < effective round 2
+        let err = pool.remember(vec![txn]).expect_err("expired");
+        assert_eq!(
+            err.to_string(),
+            "TransactionPool.Remember: txn dead: round 2 outside of 1--1"
+        );
+        assert_eq!(
+            crate::error::classify_pool_error(&err),
+            crate::error::PoolErrorTag::TxnDead
+        );
+    }
 }

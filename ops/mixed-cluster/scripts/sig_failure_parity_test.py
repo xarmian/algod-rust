@@ -55,14 +55,17 @@ class WindowCasesTest(unittest.TestCase):
         self.assertNotIn(bytes([7]) * 64, good)
 
     def test_the_round_of_a_txn_dead_message_is_normalised(self):
-        msg = "TransactionPool.Remember: txn dead: round 17 outside of 500--900"
-        self.assertEqual(sfp.normalise(msg), "TransactionPool.Remember: txn dead: round N outside of 500--900")
+        msg = "TransactionPool.Remember: txn dead: round 17 outside of 1000--1900"
+        self.assertEqual(sfp.normalise(msg), "TransactionPool.Remember: txn dead: round N outside of 1000--1900")
         self.assertTrue(sfp.DEAD_RE.match(msg))
 
     def test_expectations(self):
         self.assertEqual(sfp.expected_message("submit"), sfp.GO_MESSAGE)
         self.assertEqual(sfp.expected_message("submit_bad_sig_and_early"), sfp.GO_MESSAGE)
-        self.assertIn("500--900", sfp.expected_message("submit_early"))
+        self.assertIn("1000--1900", sfp.expected_message("submit_early"))
+        self.assertIn("1250--2150", sfp.expected_message("submit_early", current_round=250))
+        # the not-yet-valid window follows the cluster's round
+        self.assertNotEqual(sfp.window_cases(0)["submit_early"][0], sfp.window_cases(250)["submit_early"][0])
 
 
 class KnownGapsTest(unittest.TestCase):

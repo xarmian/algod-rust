@@ -417,6 +417,12 @@ fn classify_evaluator_message(msg: &str) -> PoolErrorTag {
 
 /// go's `bookkeeping.TxnDeadError` text, `txn dead: round R outside of F--L`,
 /// is tagged by its `Early` flag, i.e. whether `R < F`.
+///
+/// Coupled to the two places that produce this text: the pool's expiry
+/// pre-check (`pool.rs`, tested by
+/// `an_expired_transaction_is_gos_txn_dead_error_and_tagged_txn_dead`) and the
+/// evaluator's window check (`participate.rs`, tested by
+/// `a_transaction_outside_its_window_is_gos_txn_dead_error`).
 fn classify_txn_dead(msg: &str) -> Option<PoolErrorTag> {
     let rest = msg.strip_prefix("txn dead: round ")?;
     let (round, rest) = rest.split_once(" outside of ")?;

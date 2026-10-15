@@ -3,9 +3,15 @@
 # SPDX-License-Identifier: MIT
 # See the LICENSE-MIT file in the repository root for the full license text.
 
-"""Pure-python ed25519 (RFC 8032 section 6, the reference algorithm) so the
-mixed-cluster harness can produce validly signed transactions with the
-standard library only (issue #1974). Test/harness use; not constant time."""
+"""Pure-python ed25519 so the mixed-cluster harness can produce validly signed
+transactions with the standard library only (issue #1974); a pure-python
+signer avoids a third-party dependency in CI. Test/harness use: not constant
+time and slow (about 0.1 s per signature).
+
+Third-party attribution: the algorithm is the public-domain reference
+`ed25519.py` by D. J. Bernstein, N. Duif, T. Lange, P. Schwabe and B.-Y. Yang
+(https://ed25519.cr.yp.to/python/ed25519.py), also reproduced in RFC 8032
+section 6; checked against the RFC 8032 test vectors in ed25519_py_test.py."""
 import hashlib
 
 _P = 2 ** 255 - 19
