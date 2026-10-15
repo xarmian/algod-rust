@@ -117,6 +117,14 @@ pub struct InvalidRequestError {
     pub message: String,
 }
 
+impl InvalidRequestError {
+    /// go's batch signature-verification failure, which go reports bare
+    /// (issue #1969).
+    pub fn is_batch_sig_failure(&self) -> bool {
+        self.message == algo_error::BATCH_HAS_FAILED_SIGS
+    }
+}
+
 impl fmt::Display for InvalidRequestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.message)
@@ -1286,6 +1294,15 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                         logicsig_budgets,
                     });
                 }
+                // go's batch verifier reports a cryptographic failure as its
+                // bare error text (issue #1969), not as a wrapped validation
+                // error. Decided on the error type, after the format-failure
+                // classification above has used the original message.
+                let message = if e.is_batch_sig_failure() {
+                    algo_error::BATCH_HAS_FAILED_SIGS.to_string()
+                } else {
+                    message
+                };
                 return Err(SimulatorError::InvalidRequest(InvalidRequestError {
                     message,
                 }));

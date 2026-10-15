@@ -3420,6 +3420,10 @@ impl AlgodNodeInterface {
     /// underlying cause.
     fn map_simulator_error(err: SimulatorError) -> NodeError {
         match err {
+            // go reports a failed signature as the batch verifier's bare text.
+            SimulatorError::InvalidRequest(e) if e.is_batch_sig_failure() => {
+                NodeError::BadRequest(algo_error::BATCH_HAS_FAILED_SIGS.to_string())
+            }
             SimulatorError::InvalidRequest(e) => {
                 NodeError::BadRequest(format!("simulate: invalid request: {e}"))
             }
@@ -5502,6 +5506,20 @@ mod tests {
         match invalid {
             NodeError::BadRequest(m) => {
                 assert_eq!(m, "simulate: invalid request: no groups")
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        // Issue #1969: go's batch verifier text is the whole message, with no
+        // `simulate: invalid request:` prefix.
+        let bad_sig = AlgodNodeInterface::map_simulator_error(SimulatorError::InvalidRequest(
+            InvalidRequestError {
+                message: algo_error::BATCH_HAS_FAILED_SIGS.into(),
+            },
+        ));
+        match bad_sig {
+            NodeError::BadRequest(m) => {
+                assert_eq!(m, "At least one signature didn't pass verification")
             }
             other => panic!("expected BadRequest, got {other:?}"),
         }

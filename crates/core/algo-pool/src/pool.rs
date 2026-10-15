@@ -768,6 +768,9 @@ impl TransactionPool {
                 // diagnostics before `e` is consumed by `to_string()` below
                 // -- see `AlgoError::avm_eval_detail` (issue #1135), which
                 // walks `e`'s source chain for an `AlgoError::AvmLogicSig`.
+                if e.is_batch_sig_failure() {
+                    return PoolError::SignatureBatchFailed;
+                }
                 let detail = e.avm_eval_detail();
                 let message = e.to_string();
                 // The evaluator reports a refused transaction as the typed
@@ -855,6 +858,11 @@ impl TransactionPool {
         // evaluator validation, store.
         let result = self.ingest(&tx_group, &mut guard);
         if let Err(e) = result {
+            // go's signature check runs before `Remember` and its error is
+            // returned unwrapped (issue #1969).
+            if matches!(e, PoolError::SignatureBatchFailed) {
+                return Err(e);
+            }
             return Err(PoolError::Remember(Box::new(e)));
         }
 
@@ -891,7 +899,13 @@ impl TransactionPool {
         if let Some(ref evaluator) = inner.evaluator {
             evaluator
                 .test_transaction_group(tx_group)
-                .map_err(|e| PoolError::Evaluator(e.to_string()))?;
+                .map_err(|e| {
+                    if e.is_batch_sig_failure() {
+                        PoolError::SignatureBatchFailed
+                    } else {
+                        PoolError::Evaluator(e.to_string())
+                    }
+                })?;
             Ok(())
         } else {
             Err(Self::no_evaluator_error(&inner))
@@ -3805,5 +3819,54 @@ mod tests {
             .add_to_pending_block_evaluator_once(&txgroup, &mut guard, false)
             .expect_err("lease");
         assert!(matches!(err, PoolError::LeaseConflict { .. }), "{err:?}");
+    }
+
+    /// Issue #1969: a signature that does not verify is go's batch verifier
+    /// text, bare -- no `TransactionPool.Remember` / `TransactionPool.ingest`
+    /// frames (go checks signatures before the pool sees the group) -- and is
+    /// still classified as a generic evaluator rejection.
+    #[test]
+    fn a_failed_signature_is_gos_bare_batch_error_through_remember_and_test() {
+        let pool = make_pool_with_evaluator(1000);
+        let txgroup = vec![make_test_txn(9)];
+        {
+            let mut guard = pool.mu.lock();
+            guard.evaluator = Some(Box::new(ErrEvaluator {
+                round: Round(2),
+                make: || AlgoError::Validation {
+                    message: algo_error::BATCH_HAS_FAILED_SIGS.to_string(),
+                },
+            }));
+        }
+        let err = pool.remember(txgroup.clone()).expect_err("bad signature");
+        assert!(matches!(err, PoolError::SignatureBatchFailed), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "At least one signature didn't pass verification"
+        );
+        assert_eq!(
+            crate::error::classify_pool_error(&err),
+            crate::error::PoolErrorTag::EvalGeneric
+        );
+    }
+
+    #[test]
+    fn other_validation_errors_keep_their_pool_frames() {
+        let pool = make_pool_with_evaluator(1000);
+        {
+            let mut guard = pool.mu.lock();
+            guard.evaluator = Some(Box::new(ErrEvaluator {
+                round: Round(2),
+                make: || AlgoError::Validation {
+                    message: "transaction round window [100, 1100] does not cover block round 3"
+                        .to_string(),
+                },
+            }));
+        }
+        let err = pool.remember(vec![make_test_txn(9)]).expect_err("window");
+        assert_eq!(
+            err.to_string(),
+            "TransactionPool.Remember: TransactionPool.ingest: validation error: transaction round window [100, 1100] does not cover block round 3"
+        );
     }
 }
