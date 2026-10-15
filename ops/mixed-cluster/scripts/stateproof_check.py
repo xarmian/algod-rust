@@ -48,14 +48,11 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import blockcompare as bc  # noqa: E402  (msgpack slicing/decoding shared with the block comparator)
+import ports  # noqa: E402
 
 TOKEN = os.environ.get("ALGOD_TOKEN", "a" * 64)
-NODES = (
-    ("go-node-1", 4001),
-    ("go-node-2", 4002),
-    ("go-node-3", 4003),
-    ("rust-node-4", 4004),
-)
+# host ports from PHASE6_HOST_PORT_BASE (issue #1956), default 4001..4004
+NODES = ports.nodes(("go-node-1", "go-node-2", "go-node-3", "rust-node-4"))
 
 
 def http_get_json(host, port, path, timeout=10):

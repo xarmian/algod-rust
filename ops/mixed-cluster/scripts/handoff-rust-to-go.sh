@@ -41,7 +41,11 @@ set -euo pipefail
 # Tunables
 # ---------------------------------------------------------------------------
 HANDOFF_ROUNDS="${HANDOFF_ROUNDS:-20}"
-GO_NODE_REST="${GO_NODE_REST:-http://localhost:4001}"
+# default: go-node-1 of the mixed cluster, on its PHASE6_HOST_PORT_BASE port
+_handoff_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=ports.sh
+source "$_handoff_dir/ports.sh"  # issue #1956
+GO_NODE_REST="${GO_NODE_REST:-http://localhost:$PHASE6_GO1_PORT}"
 GO_NODE_TOKEN="${GO_NODE_TOKEN:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
 ALGOD_IMG="${ALGOD_IMG:-algorand/algod:5.0.3-stable}"
 KEEP_HANDOFF="${KEEP_HANDOFF:-0}"

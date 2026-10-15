@@ -61,12 +61,15 @@ from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ports  # noqa: E402
+
 TOKEN = "a" * 64  # matches docker-compose.yml; harness is local-only.
 
+# host ports from PHASE6_HOST_PORT_BASE (issue #1956), default 4001..4004
 NODES_REST = [
-    {"name": "go-node-1", "container": "phase6-go-node-1", "host": "127.0.0.1", "port": 4001},
-    {"name": "go-node-2", "container": "phase6-go-node-2", "host": "127.0.0.1", "port": 4002},
-    {"name": "go-node-3", "container": "phase6-go-node-3", "host": "127.0.0.1", "port": 4003},
+    {"name": n, "container": "phase6-" + n, "host": "127.0.0.1", "port": ports.node_port(n)}
+    for n in ("go-node-1", "go-node-2", "go-node-3")
 ]
 
 NODES_NOREST = [
@@ -78,7 +81,7 @@ NODES_NOREST = [
 # is what makes the Rust node's participation machine-readable instead of
 # log-scraped.
 NODES_PARTICIPATION = [
-    {"name": "rust-node-4", "host": "127.0.0.1", "port": 4004},
+    {"name": "rust-node-4", "host": "127.0.0.1", "port": ports.node_port("rust-node-4")},
 ]
 
 # Best-effort log regex for the Rust node. The Rust relay today does not
