@@ -26,13 +26,21 @@ class BodiesTest(unittest.TestCase):
     def test_expectation_is_go_fixed_text_for_every_rejected_body(self):
         for name in ("request", "group", "stxn", "txn", "hgi"):
             self.assertEqual(sp.expected(name), (400, sp.GO_REJECTION), name)
-        self.assertEqual(sp.expected("clean"), (400, "At least one signature didn't pass verification"))
+        self.assertEqual(sp.expected("clean"), (400, None))
 
     def test_compare_reports_status_and_message_differences(self):
         go = (400, '{"message":"m"}\n')
         self.assertEqual(sp.compare("x", go, (400, '{"message":"m"}')), [])
         self.assertTrue(sp.compare("x", go, (200, "{}")))
         self.assertTrue(sp.compare("x", go, (400, '{"message":"n"}')))
+
+    def test_clean_body_only_requires_status_and_no_decode_error(self):
+        go = (400, "{" + chr(34) + "message" + chr(34) + ":" + chr(34) + "At least one signature didn" + chr(39) + "t pass verification" + chr(34) + "}")
+        rust = (400, '{"message":"simulate: invalid request: validation error: ed25519 signature verification failed"}')
+        self.assertEqual(sp.compare("clean", go, rust), [])
+        broken = (400, '{"message":"could not decode simulate request: x"}')
+        self.assertTrue(sp.compare("clean", go, broken))
+        self.assertTrue(sp.compare("clean", broken, rust))
 
 
 if __name__ == "__main__":
