@@ -76,8 +76,6 @@ source "$HERE/ports.sh"  # PHASE6_HOST_PORT_BASE -> PHASE6_*_PORT (issue #1956)
 source "$HERE/cert_window.sh"
 # shellcheck source=db_snapshot.sh
 source "$HERE/db_snapshot.sh"
-# shellcheck source=db_snapshot.sh
-source "$HERE/db_snapshot.sh"
 ROOT="$(cd "$HERE/.." && pwd)"
 REPO_ROOT="$(cd "$ROOT/../.." && pwd)"
 
@@ -365,6 +363,8 @@ if [ "$RUN_CERT" = "1" ]; then
             echo "    warning: sqlite3 .backup failed or is unavailable in the container;" >&2
             echo "    falling back to raw docker cp (may be racy under heavy writes)" >&2
             phase6_announce_inconsistent_snapshot "sqlite3 .backup did not succeed"
+            # a tracker snapshot made before the block backup failed would be stale
+            phase6_docker_exec phase6-rust-node-4 rm -f /app/verify-soak-tracker.sqlite /app/verify-soak-block.sqlite >/dev/null 2>&1 || true
             if ! docker cp phase6-rust-node-4:/app/ledger.tracker.sqlite \
                     "$TRACKER_PATH" 2>/dev/null; then
                 echo "error: failed to docker cp the tracker DB." >&2

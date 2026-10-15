@@ -32,10 +32,19 @@ phase6_docker_exec() {
 phase6_backup_db() {
     local ctr="$1" src="$2" dst="$3"
     local attempts="${PHASE6_BACKUP_ATTEMPTS:-6}" sleep_s="${PHASE6_BACKUP_SLEEP:-3}"
-    local timeout_ms="${PHASE6_BACKUP_TIMEOUT_MS:-30000}" i out
+    local timeout_ms="${PHASE6_BACKUP_TIMEOUT_MS:-30000}" i out rc
     for ((i = 1; i <= attempts; i++)); do
-        if out="$(phase6_docker_exec "$ctr" sqlite3 "$src" ".timeout $timeout_ms" ".backup '$dst'" 2>&1)"; then
+        out="$(phase6_docker_exec "$ctr" sqlite3 "$src" ".timeout $timeout_ms" ".backup '$dst'" 2>&1)"
+        rc=$?
+        if [ "$rc" = 0 ]; then
             return 0
+        fi
+        # 126/127: the exec could not run sqlite3 at all (missing or not
+        # executable); no number of retries changes that.
+        if [ "$rc" = 126 ] || [ "$rc" = 127 ]; then
+            echo "    sqlite3 is not runnable in $ctr (exit $rc): $(printf '%s' "$out" | tr '
+' '  ')" >&2
+            return 1
         fi
         echo "    sqlite3 .backup of $src failed (attempt $i/$attempts): $(printf '%s' "$out" | tr '\r\n' '  ')" >&2
         [ "$i" -lt "$attempts" ] && sleep "$sleep_s"

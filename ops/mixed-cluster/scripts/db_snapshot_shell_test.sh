@@ -55,7 +55,7 @@ case "$(cat "$FAKE_DOCKER_LOG")" in *".backup '/app/x.snap'"*) ok "backup target
 # 1b. Git Bash rewrites /app/... in docker exec arguments to
 # C:/Program Files/Git/app/... unless MSYS_NO_PATHCONV=1 (that made every
 # .backup fail on Windows, #1963): the helper must disable the conversion
-check "path conversion disabled for docker exec" "MSYS_NO_PATHCONV=1" "$(head -1 "$FAKE_DOCKER_ENV_LOG")"
+check "path conversion disabled for every docker exec" "MSYS_NO_PATHCONV=1" "$(sort -u "$FAKE_DOCKER_ENV_LOG")"
 check "probe helper disables it too" "MSYS_NO_PATHCONV=1"     "$(: > "$FAKE_DOCKER_ENV_LOG"; phase6_docker_exec ctr rm -f /app/x.snap; head -1 "$FAKE_DOCKER_ENV_LOG")"
 
 # 2. busy twice then success -> consistent snapshot, three attempts
@@ -71,6 +71,19 @@ phase6_backup_db ctr /app/x.sqlite /app/x.snap 2>"$TMP/err"; rc=$?
 check "always busy fails" 1 "$rc"
 check "bounded attempts" 4 "$(grep -c sqlite3 "$FAKE_DOCKER_LOG")"
 unset PHASE6_BACKUP_ATTEMPTS
+
+# 3b. sqlite3 missing (docker exec exit 127) is not retried
+cat > "$TMP/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$FAKE_DOCKER_LOG"
+echo "OCI runtime exec failed: sqlite3: executable file not found" >&2
+exit 127
+STUB
+: > "$FAKE_DOCKER_LOG"
+phase6_backup_db ctr /app/x.sqlite /app/x.snap 2>"$TMP/err"; rc=$?
+check "missing sqlite3 fails" 1 "$rc"
+check "missing sqlite3 is tried once" 1 "$(grep -c sqlite3 "$FAKE_DOCKER_LOG")"
+case "$(cat "$TMP/err")" in *"not runnable"*) ok "missing sqlite3 is reported as such" ;; *) bad "report: $(cat "$TMP/err")" ;; esac
 
 # 4. the inconsistent-snapshot announcement is grep-able like CERT_WINDOW_CLAMPED
 out="$(phase6_announce_inconsistent_snapshot "tracker backup failed" 2>&1)"
