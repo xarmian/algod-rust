@@ -399,7 +399,9 @@ fn classify_evaluator_message(msg: &str) -> PoolErrorTag {
     if let Some(tag) = classify_txn_dead(msg) {
         tag
     } else if msg.starts_with("txgroup with ") || msg == "txgroup required fee overflow" {
-        // go: `TxGroupMalformedError` with `TxGroupErrorReasonInvalidFee`
+        // go: `TxGroupMalformedError` with `TxGroupErrorReasonInvalidFee`. Coupled
+        // to `algo_validate::fee::check_submitted_group_fees`, whose test
+        // `a_low_fee_group_reads_like_gos_check_group_fees` pins the text.
         PoolErrorTag::Fee
     } else if msg.contains("approval program rejected transaction:") {
         PoolErrorTag::TealErr

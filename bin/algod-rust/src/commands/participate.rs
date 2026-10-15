@@ -1836,6 +1836,12 @@ impl SimpleBlockEvaluator {
                 if params.require_genesis_hash && stx.txn.genesis_hash == zero {
                     return Err(rejected("required tx.GenesisHash is missing".to_string()));
                 }
+            } else if stx.txn.genesis_hash != [0u8; 32] {
+                // a protocol that predates genesis hashes allows none
+                return Err(rejected(format!(
+                    "tx.GenesisHash <{}> not allowed",
+                    algo_types::Digest(stx.txn.genesis_hash),
+                )));
             }
         }
 
@@ -9416,14 +9422,13 @@ mod tests {
         let err = eval.test_transaction_group(&[low_fee]).unwrap_err();
         assert!(err.to_string().starts_with("tx.GenesisHash <"), "{err}");
 
-        // an omitted genesis ID / hash is restored from the header, not an error
+        // an omitted genesis ID (the hash present and right) is accepted: go
+        // verifies the signature over the transaction as submitted
         let mut omitted = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
         omitted.txn.genesis_id = String::new();
-        omitted.txn.genesis_hash = [0u8; 32];
         omitted.sig = sign_txn(&omitted.txn, &key);
-        if let Err(e) = eval.test_transaction_group(&[omitted]) {
-            assert!(!e.to_string().contains("Genesis"), "not on genesis grounds: {e}");
-        }
+        eval.test_transaction_group(&[omitted])
+            .expect("a transaction signed without a genesis ID is accepted");
     }
 
     #[test]
