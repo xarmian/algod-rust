@@ -357,7 +357,7 @@ if [ "$RUN_CERT" = "1" ]; then
             RUST_EARLIEST="$(probe_earliest_container phase6-rust-node-4 /app/verify-soak-block.sqlite)"
             # Clean up the in-container snapshots; don't leak volume
             # space across runs. `rm -f` is safe even if a file vanished.
-            docker exec phase6-rust-node-4 rm -f \
+            phase6_docker_exec phase6-rust-node-4 rm -f \
                     /app/verify-soak-tracker.sqlite \
                     /app/verify-soak-block.sqlite \
                 >/dev/null 2>&1 || true

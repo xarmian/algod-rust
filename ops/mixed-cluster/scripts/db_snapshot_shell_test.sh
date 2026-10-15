@@ -28,6 +28,7 @@ mkdir -p "$TMP/bin"
 cat > "$TMP/bin/docker" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "$FAKE_DOCKER_LOG"
+echo "MSYS_NO_PATHCONV=${MSYS_NO_PATHCONV:-unset}" >> "$FAKE_DOCKER_ENV_LOG"
 n=$(grep -c sqlite3 "$FAKE_DOCKER_LOG")
 if [ "$n" -le "${FAKE_BUSY_ATTEMPTS:-0}" ]; then
     echo "Error: database is locked" >&2
@@ -37,7 +38,7 @@ exit 0
 STUB
 chmod +x "$TMP/bin/docker"
 export PATH="$TMP/bin:$PATH"
-export FAKE_DOCKER_LOG="$TMP/docker.log"
+export FAKE_DOCKER_LOG="$TMP/docker.log" FAKE_DOCKER_ENV_LOG="$TMP/docker.env.log"
 export PHASE6_BACKUP_SLEEP=0
 
 # shellcheck source=db_snapshot.sh
@@ -50,6 +51,12 @@ check "immediate success" 0 "$rc"
 check "one attempt" 1 "$(grep -c sqlite3 "$FAKE_DOCKER_LOG")"
 case "$(cat "$FAKE_DOCKER_LOG")" in *".timeout"*) ok "busy timeout is set" ;; *) bad "busy timeout is set: $(cat "$FAKE_DOCKER_LOG")" ;; esac
 case "$(cat "$FAKE_DOCKER_LOG")" in *".backup '/app/x.snap'"*) ok "backup target passed" ;; *) bad "backup target: $(cat "$FAKE_DOCKER_LOG")" ;; esac
+
+# 1b. Git Bash rewrites /app/... in docker exec arguments to
+# C:/Program Files/Git/app/... unless MSYS_NO_PATHCONV=1 (that made every
+# .backup fail on Windows, #1963): the helper must disable the conversion
+check "path conversion disabled for docker exec" "MSYS_NO_PATHCONV=1" "$(head -1 "$FAKE_DOCKER_ENV_LOG")"
+check "probe helper disables it too" "MSYS_NO_PATHCONV=1"     "$(: > "$FAKE_DOCKER_ENV_LOG"; phase6_docker_exec ctr rm -f /app/x.snap; head -1 "$FAKE_DOCKER_ENV_LOG")"
 
 # 2. busy twice then success -> consistent snapshot, three attempts
 : > "$FAKE_DOCKER_LOG"; export FAKE_BUSY_ATTEMPTS=2

@@ -6,6 +6,8 @@
 # Sourced by verify-soak.sh (issue #1963): a consistent snapshot of the live
 # Rust node's SQLite ledger files.
 #
+#   phase6_docker_exec <args...>                     docker exec without MSYS
+#       path conversion of container paths.
 #   phase6_backup_db <container> <src-db> <dst-db>   sqlite3 .backup inside the
 #       container, with a busy timeout and a bounded retry; sqlite3's stderr of
 #       every failed attempt goes to stderr. 0 on success, 1 when all attempts
@@ -20,12 +22,19 @@
 # busy timeout it fails at once with SQLITE_BUSY and the script used to fall
 # back to a raw copy of a WAL-mode database, which is not consistent.
 
+# `docker exec` with container paths. Git Bash (MSYS) rewrites an argument
+# like /app/x.sqlite into C:/Program Files/Git/app/x.sqlite, so on Windows
+# the container never saw the right path (#1963). Harmless elsewhere.
+phase6_docker_exec() {
+    MSYS_NO_PATHCONV=1 docker exec "$@"
+}
+
 phase6_backup_db() {
     local ctr="$1" src="$2" dst="$3"
     local attempts="${PHASE6_BACKUP_ATTEMPTS:-6}" sleep_s="${PHASE6_BACKUP_SLEEP:-3}"
     local timeout_ms="${PHASE6_BACKUP_TIMEOUT_MS:-30000}" i out
     for ((i = 1; i <= attempts; i++)); do
-        if out="$(docker exec "$ctr" sqlite3 "$src" ".timeout $timeout_ms" ".backup '$dst'" 2>&1)"; then
+        if out="$(phase6_docker_exec "$ctr" sqlite3 "$src" ".timeout $timeout_ms" ".backup '$dst'" 2>&1)"; then
             return 0
         fi
         echo "    sqlite3 .backup of $src failed (attempt $i/$attempts): $(printf '%s' "$out" | tr '\r\n' '  ')" >&2

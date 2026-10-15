@@ -112,7 +112,7 @@ resolve_cert_latest() {
 
 probe_earliest_container() {
     local ctr="$1" path="$2" out=""
-    out="$(docker exec "$ctr" sqlite3 "$path" 'SELECT MIN(rnd) FROM blocks' 2>/dev/null | tr -d '\r' || true)"
+    out="$(MSYS_NO_PATHCONV=1 docker exec "$ctr" sqlite3 "$path" 'SELECT MIN(rnd) FROM blocks' 2>/dev/null | tr -d '\r' || true)"
     if _is_round "$out"; then
         echo "$out"
     fi
