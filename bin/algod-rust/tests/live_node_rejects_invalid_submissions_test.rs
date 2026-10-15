@@ -240,8 +240,8 @@ async fn live_node_rejects_payment_from_empty_account_over_the_wire() {
         rejected.body
     );
     assert!(
-        rejected.body.contains("insufficient balance"),
-        "expected an insufficient-balance rejection reason, got: {}",
+        rejected.body.contains(": overspend (account "),
+        "expected go's overspend rejection reason, got: {}",
         rejected.body
     );
 }

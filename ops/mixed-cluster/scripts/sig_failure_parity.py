@@ -34,15 +34,14 @@ import unknown_field_parity as ufp  # noqa: E402
 
 TOKEN = os.environ.get("ALGOD_TOKEN", "a" * 64)
 # Cases algod-rust cannot pass yet, with the issue that tracks them.
-KNOWN_GAPS = {
-    # the harness sender is unfunded: go reports overspend before the fee text
-    "submit_low_fee": "#1979: go reports overspend (state) before the group-fee check; Rust words it differently",
-}
+KNOWN_GAPS = {}
 GO_MESSAGE = "At least one signature didn't pass verification"
 # go's bookkeeping.TxnDeadError text, behind the pool's Remember frame; the
 # round is the node's pending block round, so it is normalised before comparing.
 DEAD_RE = re.compile(r"^TransactionPool\.Remember: txn dead: round (\d+) outside of (\d+)--(\d+)$")
 SEED = bytes([42]) * 32
+# go's ledgercore.OverspendError text behind the Remember frame (the account data is compared go vs Rust)
+OVERSPEND_RE = re.compile(r"^TransactionPool\.Remember: transaction [A-Z2-7]{52}: overspend \(account [A-Z2-7]{58}, data \{AccountBaseData:\{.*\}\}, tried to spend 1uA\)$")
 
 
 def address(key32):
@@ -108,9 +107,11 @@ def window_cases(current_round=0, genesis_hash=None):
         # issue #1976: signatures, then the window, then the group fees (the window
         # must be at most 1000 rounds wide and cover the next round, or go calls the
         # transaction malformed first)
+        # the harness sender is unfunded: go's fee move overspends before the group fee is looked at
+        # (issue #1979; the text prints the account and the txid, so it is matched by shape)
         "submit_low_fee": (
             _signed_window_stxn(max(current_round, 1), current_round + 900, fee=1, genesis_hash=gh),
-            "TransactionPool.Remember: txgroup with 1uA fees is less than 1mA (usage=1.000000 * base=1mA)",
+            "OVERSPEND",
         ),
         "submit_low_fee_and_early": (_signed_window_stxn(fv, lv, fee=1), msg.format(fv, lv)),
         "submit_low_fee_and_dead": (_signed_window_stxn(1, 2, fee=1), msg.format(1, 2)),
@@ -220,7 +221,10 @@ def main(argv=None):
             if name in ("submit_early", "submit_dead", "submit_low_fee_and_early", "submit_low_fee_and_dead") \
                     and not DEAD_RE.match(ufp.message_of(answer[1])):
                 found.append("{}: {} answered {!r}, not a txn-dead message".format(name, who, ufp.message_of(answer[1])))
-        if normalise(ufp.message_of(go[1])) != want:
+        if want == "OVERSPEND":
+            if not OVERSPEND_RE.match(ufp.message_of(go[1])):
+                found.append("{}: go answered {!r}, not an overspend".format(name, ufp.message_of(go[1])[:200]))
+        elif normalise(ufp.message_of(go[1])) != want:
             found.append("{}: go answered {!r}, expected {!r}".format(name, normalise(ufp.message_of(go[1])), want))
         print("{} {}".format("FAIL" if found else "ok  ", name), "; ".join(found))
         problems += found

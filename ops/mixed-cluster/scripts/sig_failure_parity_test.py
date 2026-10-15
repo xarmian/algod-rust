@@ -64,7 +64,8 @@ class WindowCasesTest(unittest.TestCase):
 
     def test_low_fee_bodies_differ_from_the_normal_fee_ones_only_in_the_fee(self):
         cases = sfp.window_cases(0)
-        self.assertIn("txgroup with 1uA fees is less than 1mA", cases["submit_low_fee"][1])
+        # the harness sender is unfunded, so go's fee move overspends first (#1979)
+        self.assertEqual(cases["submit_low_fee"][1], "OVERSPEND")
         self.assertEqual(cases["submit_low_fee_and_early"][1], cases["submit_early"][1])
         self.assertEqual(cases["submit_low_fee_and_dead"][1], cases["submit_dead"][1])
         self.assertEqual(cases["submit_low_fee_bad_sig"][1], sfp.GO_MESSAGE)
@@ -77,6 +78,16 @@ class WindowCasesTest(unittest.TestCase):
         self.assertIn("1250--2150", sfp.expected_message("submit_early", current_round=250))
         # the not-yet-valid window follows the cluster's round
         self.assertNotEqual(sfp.window_cases(0)["submit_early"][0], sfp.window_cases(250)["submit_early"][0])
+
+
+class OverspendTest(unittest.TestCase):
+    def test_the_overspend_shape_matches_a_captured_go_message(self):
+        msg = ("TransactionPool.Remember: transaction OEAWIVYPTO2XPMB32G6LKW43P47HYQJZ2PLWZU3N2RACI254YUPQ: "
+               "overspend (account DF7WWI7BNSCTFRVLZA4PVTK6U6E34DDWWKJAGNADTP5IWPJWRVQZRC323I, data "
+               "{AccountBaseData:{Status:Offline MicroAlgos:0.0A} VotingData:{}}, tried to spend 1uA)")
+        self.assertTrue(sfp.OVERSPEND_RE.match(msg))
+        self.assertFalse(sfp.OVERSPEND_RE.match(msg.replace("overspend", "something")))
+        self.assertEqual(sfp.expected_message("submit_low_fee"), "OVERSPEND")
 
 
 class KnownGapsTest(unittest.TestCase):
