@@ -119,6 +119,27 @@ impl PQSig {
             && self.signature.is_empty()
     }
 
+    /// Hand-rolled msgpack decode for the raw-reader paths (`POST
+    /// /v2/transactions` decodes `SignedTransaction`/`LogicSig` this way, not
+    /// through serde). Same wire shape as the serde derive: `sch` (2-byte
+    /// bin), `slt` (uint8), `pk`/`sig` (bin); unknown keys are skipped.
+    /// Without this arm `pqsig` fell into `skip_value` and every PQ-account
+    /// transaction submitted over REST looked unsigned (issue #1960).
+    pub fn decode_from_reader(rd: &mut &[u8]) -> Result<Self, algo_error::AlgoError> {
+        let len = crate::rmp_decode::read_map_len(rd)?;
+        let mut s = Self::default();
+        for _ in 0..len {
+            match crate::rmp_decode::read_key_bytes(rd)? {
+                b"sch" => s.scheme = crate::rmp_decode::read_fixed_bytes::<2>(rd)?,
+                b"slt" => s.salt = PQAddressSalt(crate::rmp_decode::read_u8_val(rd)?),
+                b"pk" => s.public_key = crate::rmp_decode::read_bytes_as_bytebuf(rd)?,
+                b"sig" => s.signature = crate::rmp_decode::read_bytes_as_bytebuf(rd)?,
+                _ => crate::rmp_decode::skip_value(rd)?,
+            }
+        }
+        Ok(s)
+    }
+
     /// Mirrors go's `PQSig.Address()`: the authorizer address derived from
     /// this PQSig's scheme, salt, and public key.
     pub fn address(&self) -> Address {

@@ -34,3 +34,21 @@ git diff crates/core/algo-codec/tests/fixtures/pqsig/  # should be empty
 ```
 
 Consumed by `crates/core/algo-codec/tests/pqsig_canonical_test.rs`.
+
+## `signed_txn_pq_sender_is_signer.canonical.hex` (issue #1960)
+
+Real go-algorand `v5.0.3-stable` `algokey pq sign` output for the shape the
+live mixed-cluster workload submits (#1958): a `pay` transaction whose
+`snd` **is** the PQ address, so the map carries no `sgnr`. The key is a
+throwaway from `algokey pq generate` (the signature is not meant to be
+verified, only decoded), signed over a hand-built transaction wrapped in
+`{"txn": ...}`:
+
+```
+docker run --rm -v <dir>:/out --entrypoint sh algorand/algod:5.0.3-stable -c   '/node/bin/algokey pq generate -k /tmp/k.key >/dev/null;    /node/bin/algokey pq sign -k /tmp/k.key -t /out/unsigned.txn -o /out/signed.stxn'
+```
+
+`pqsig_hand_decoder_test.rs` decodes all three fixtures with the hand-written
+reader and with serde and requires identical values and byte-identical
+re-encoding.
+

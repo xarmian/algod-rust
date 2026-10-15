@@ -1672,6 +1672,9 @@ impl LogicSig {
                 b"lmsig" => {
                     s.lmsig = rmp_decode::read_optional(rd, MultisigSig::decode_from_reader)?
                 }
+                b"pqsig" => {
+                    s.pqsig = rmp_decode::read_optional(rd, crate::pq::PQSig::decode_from_reader)?
+                }
                 _ => rmp_decode::skip_value(rd)?,
             }
         }
@@ -2326,6 +2329,9 @@ impl SignedTransaction {
                 }
                 (4, b'm') if key == b"msig" => {
                     s.msig = rmp_decode::read_optional(rd, MultisigSig::decode_from_reader)?
+                }
+                (5, b'p') if key == b"pqsig" => {
+                    s.pqsig = rmp_decode::read_optional(rd, crate::pq::PQSig::decode_from_reader)?
                 }
                 (4, b's') if key == b"sgnr" => {
                     s.auth_addr = rmp_decode::read_optional(rd, rmp_decode::read_address)?
