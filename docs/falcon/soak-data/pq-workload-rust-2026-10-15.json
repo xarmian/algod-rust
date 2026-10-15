@@ -1,14 +1,16 @@
 {
- "run": "consensus-conformance WORKLOAD=rich ROUNDS=200 PHASE6_HOST_PORT_BASE=5000",
+ "ok": true,
  "falcon_backend": "rust (default)",
+ "commit": "5a7ba8d4",
+ "command": "ROUNDS=200 WORKLOAD=rich PHASE6_HOST_PORT_BASE=5000 bash ops/mixed-cluster/scripts/consensus-conformance.sh",
  "pq_steps": [
   {
    "op": "pq_pay_via_go-node-1",
    "outcome": "confirmed",
    "ok": true,
-   "round": 155,
+   "round": 160,
    "txids": [
-    "ZADENMPA7GQRUUSPR5SNLGOTCUDDVMB73MZBHKQNUKAKQSDN7RBA"
+    "V5MGGG3FU6EYECNUDJIPKOGWGAUGKJD2AIVIX6U7MBMLMTOBF3ZA"
    ],
    "submit_status": [
     200
@@ -18,9 +20,9 @@
    "op": "pq_pay_via_rust-node-4",
    "outcome": "confirmed",
    "ok": true,
-   "round": 157,
+   "round": 163,
    "txids": [
-    "CFU2XDHYDG2E3CMTOT2AIDW2AHNWKFRX4DBPGMV7INUOGN26CIWQ"
+    "SZEJW5VDSHPYRVSE4VU25QLR3J323XB7GXRK45JUTWTPNEFE572A"
    ],
    "submit_status": [
     200
@@ -28,9 +30,9 @@
   }
  ],
  "workload": {
-  "steps": 96,
-  "confirmed": 85,
-  "rejected": 11,
+  "steps": 91,
+  "confirmed": 81,
+  "rejected": 10,
   "unexpected": 0,
   "submit_divergence": 0
  },
