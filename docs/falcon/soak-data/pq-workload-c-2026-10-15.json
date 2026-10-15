@@ -1,0 +1,46 @@
+{
+ "run": "consensus-conformance WORKLOAD=rich ROUNDS=200 PHASE6_HOST_PORT_BASE=5000",
+ "falcon_backend": "c (control)",
+ "pq_steps": [
+  {
+   "op": "pq_pay_via_go-node-1",
+   "outcome": "confirmed",
+   "ok": true,
+   "round": 154,
+   "txids": [
+    "KTZHTQKGKHTUJWPWS3YQSJUGMGUW7LKL7KBZY2V7VEQK5YPOKRYA"
+   ],
+   "submit_status": [
+    200
+   ]
+  },
+  {
+   "op": "pq_pay_via_rust-node-4",
+   "outcome": "confirmed",
+   "ok": true,
+   "round": 156,
+   "txids": [
+    "X4STC544ZUH727N6SLBGKNVJOOTS57KVMJ4NELS6IPKEE2HKPYOA"
+   ],
+   "submit_status": [
+    200
+   ]
+  }
+ ],
+ "workload": {
+  "steps": 97,
+  "confirmed": 86,
+  "rejected": 11,
+  "unexpected": 0,
+  "submit_divergence": 0
+ },
+ "block_compare": {
+  "rounds": 200,
+  "not_identical_or_incomplete": 0
+ },
+ "conformance": {
+  "result": "PASS",
+  "checks_total": 18,
+  "checks_failed": 0
+ }
+}
