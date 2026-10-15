@@ -70,7 +70,7 @@ def bodies():
 
 def json_cases():
     """name -> (JSON body, the first unknown key) for go's JSON form."""
-    stxn = sfp._stxn_json()
+    stxn = sfp.stxn_json()
 
     def text(request):
         return json.dumps(request, separators=(",", ":")).encode()
@@ -95,6 +95,9 @@ def json_expected(body, key):
     """go's answer for a JSON body whose first unknown key is `key`: the offset
     is just after the colon following the key's first occurrence as a key."""
     token = ('"%s":' % key).encode()
+    # the bodies are built so that the unknown key's name occurs once: a known
+    # key of the same name would make the offset ambiguous
+    assert body.count(token) == 1, (key, body)
     pos = body.index(token) + len(token)
     return (400, "failed to decode object: json decode error [pos %d]: no matching struct field found "
                  "when decoding stream map with key %s" % (pos, key))

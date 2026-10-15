@@ -256,6 +256,30 @@ fn scan_mode_reaches_an_unknown_key_after_an_object_missing_required_fields() {
     assert!(SignedTransaction::decode_from_reader(&mut cur).is_err());
 }
 
+/// A plain strict guard created inside a scan guard enforces required fields
+/// again, and dropping it restores scan mode for the outer guard.
+#[test]
+fn a_nested_strict_guard_does_not_inherit_scan_mode() {
+    let body = map(vec![
+        ("txn", map(vec![("type", s("pay"))])),
+        ("zzz", uint(1)),
+    ]);
+    let _scan = strict_unknown_fields_scan(&body);
+    {
+        let _strict = strict_unknown_fields(&body);
+        let mut cur = &body[..];
+        let err = SignedTransaction::decode_from_reader(&mut cur).expect_err("missing snd");
+        assert!(
+            matches!(&err, AlgoError::Codec { source, .. } if !source.is::<UnknownFieldError>()),
+            "{err}"
+        );
+    }
+    // back in the outer scan guard: the unknown key is reached again
+    let mut cur = &body[..];
+    let u = unknown(SignedTransaction::decode_from_reader(&mut cur).expect_err("unknown key"));
+    assert_eq!(u.key, "zzz");
+}
+
 /// Outside strict mode the readers still skip unknown keys (blocks, catchup).
 #[test]
 fn without_the_guard_unknown_keys_are_still_skipped() {

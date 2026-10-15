@@ -61,7 +61,7 @@ def _stxn_msgpack():
     return ufp._map([("txn", _txn_msgpack()), ("sig", ufp._bin(bytes([7]) * 64))])
 
 
-def _stxn_json():
+def stxn_json():
     b64 = lambda b: base64.b64encode(b).decode()  # noqa: E731
     return {
         "txn": {
@@ -117,7 +117,7 @@ def cases(current_round=0):
         "simulate_msgpack": {"path": "/v2/transactions/simulate", "content_type": "application/msgpack",
                              "body": mp_request},
         "simulate_json": {"path": "/v2/transactions/simulate", "content_type": "application/json",
-                          "body": json.dumps({"txn-groups": [{"txns": [_stxn_json()]}]}).encode()},
+                          "body": json.dumps({"txn-groups": [{"txns": [stxn_json()]}]}).encode()},
     }
 
 

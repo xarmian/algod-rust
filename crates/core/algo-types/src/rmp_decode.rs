@@ -172,7 +172,9 @@ impl Drop for StrictUnknownFieldsGuard {
 /// of it so that positions count from its start.
 pub fn strict_unknown_fields(body: &[u8]) -> StrictUnknownFieldsGuard {
     let prev = STRICT_BASE.with(|c| c.replace(Some((body.as_ptr() as usize, body.len()))));
-    let prev_scan = SCAN_ONLY.with(Cell::get);
+    // a plain strict guard always enforces required fields, even when it is
+    // created while a scan guard is alive
+    let prev_scan = SCAN_ONLY.with(|c| c.replace(false));
     StrictUnknownFieldsGuard {
         prev,
         prev_scan,
