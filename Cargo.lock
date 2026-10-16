@@ -2590,6 +2590,7 @@ dependencies = [
  "data-encoding",
  "ed25519-dalek",
  "hex",
+ "libc",
  "rand 0.10.3",
  "reqwest",
  "rmp",
