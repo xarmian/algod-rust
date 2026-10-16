@@ -2061,8 +2061,17 @@ impl SimpleBlockEvaluator {
                 } else {
                     (balance_now - fee, stx.txn.amount, true)
                 };
-                let message =
-                    self.overspend_message(&txid, &sender, data_balance, tried, after_fee, balance_now, already_spent > 0);
+                let message = self.overspend_message(
+                    &txid,
+                    &sender,
+                    tried,
+                    OverspendContext {
+                        data_balance,
+                        after_fee,
+                        balance_now,
+                        earlier_in_group: already_spent > 0,
+                    },
+                );
                 return Err(algo_error::AlgoError::Rejected {
                     source: None,
                     message,
@@ -2103,12 +2112,15 @@ impl SimpleBlockEvaluator {
         &mut self,
         txid: &str,
         sender: &Address,
-        data_balance: u64,
         tried: u64,
-        after_fee: bool,
-        balance_now: u64,
-        earlier_in_group: bool,
+        ctx: OverspendContext,
     ) -> String {
+        let OverspendContext {
+            data_balance,
+            after_fee,
+            balance_now,
+            earlier_in_group,
+        } = ctx;
         let mut data = self.get_account_data(sender).unwrap_or_default();
         // go's cow already holds the sender when an earlier transaction of this
         // group, or of an earlier group in the block, moved it: pending rewards
@@ -2127,6 +2139,19 @@ impl SimpleBlockEvaluator {
         }
         algo_validate::overspend::overspend_message(txid, sender, &data, tried)
     }
+}
+
+/// What [`SimpleBlockEvaluator::overspend_message`] needs to print the sender
+/// the way go's cow holds it (issue #1979).
+struct OverspendContext {
+    /// Balance the error prints.
+    data_balance: u64,
+    /// The failing move is the amount move (the fee move already happened).
+    after_fee: bool,
+    /// Sender balance before the failing transaction, pending rewards included.
+    balance_now: u64,
+    /// An earlier transaction of the same group already moved the sender.
+    earlier_in_group: bool,
 }
 
 impl SimpleBlockEvaluator {

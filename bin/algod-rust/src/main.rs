@@ -47,7 +47,63 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
 
     let cli = Cli::parse();
 
-    match cli.command {
+    // `algod -d <dir>` (issue #1990) is a front-end: it resolves go-style flags
+    // against the data directory into the equivalent `participate` command
+    // line, then runs that through the normal dispatch below. The guard holds
+    // `algod.lock`/`algod.pid` until `main` returns.
+    let mut _algod_instance: Option<commands::algod::InstanceGuard> = None;
+    let command = match cli.command {
+        Commands::Algod {
+            data_dir,
+            genesis,
+            print_genesis_id,
+            version,
+            init_and_exit,
+            peers,
+            listen,
+            ..
+        } => {
+            let args = commands::algod::AlgodArgs {
+                data_dir,
+                genesis,
+                print_genesis_id,
+                version,
+                init_and_exit,
+                peers,
+                listen,
+            };
+            let env_data = std::env::var("ALGORAND_DATA").ok();
+            match commands::algod::plan(&args, env_data.as_deref()) {
+                Err(message) => {
+                    eprintln!("{message}");
+                    return Ok(std::process::ExitCode::from(1));
+                }
+                Ok(commands::algod::Outcome::Print(text)) => {
+                    println!("{text}");
+                    return Ok(std::process::ExitCode::SUCCESS);
+                }
+                Ok(commands::algod::Outcome::Launch(plan)) => {
+                    match commands::algod::InstanceGuard::acquire(&plan.data_dir) {
+                        Ok(guard) => _algod_instance = Some(guard),
+                        Err(message) => {
+                            eprintln!("{message}");
+                            return Ok(std::process::ExitCode::from(1));
+                        }
+                    }
+                    tracing::info!(
+                        genesis_id = %plan.genesis_id,
+                        data_dir = %plan.data_dir.display(),
+                        "algod: starting the node from the data directory"
+                    );
+                    Cli::try_parse_from(&plan.participate_argv)?.command
+                }
+            }
+        }
+        other => other,
+    };
+
+    match command {
+        Commands::Algod { .. } => unreachable!("`algod` is resolved to `participate` above"),
         Commands::Capture {
             algod_url,
             algod_token,
