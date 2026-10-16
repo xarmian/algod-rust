@@ -762,6 +762,57 @@ pub enum Commands {
         catchup_peer_token: String,
     },
 
+    /// go-compatible `algod -d <datadir>` launcher (issue #1990): derives the
+    /// ledger, participation registry, genesis, peers and listen addresses
+    /// from a go-style data directory and runs the node (`participate`), with
+    /// go's `algod.lock` single-instance guard and `algod.pid` file.
+    Algod {
+        /// Root Algorand daemon data path (default `$ALGORAND_DATA`).
+        #[arg(short = 'd', long = "data-dir")]
+        data_dir: Option<PathBuf>,
+
+        /// Genesis configuration file (default `<data-dir>/genesis.json`).
+        #[arg(short = 'g', long = "genesis")]
+        genesis: Option<PathBuf>,
+
+        /// Print the genesis ID and exit.
+        #[arg(short = 'G')]
+        print_genesis_id: bool,
+
+        /// Display the build version and exit.
+        #[arg(short = 'v')]
+        version: bool,
+
+        /// Initialize the ledger and exit (not supported by algod-rust).
+        #[arg(short = 'x')]
+        init_and_exit: bool,
+
+        /// Write logs to stdout (algod-rust always logs to stdout/stderr;
+        /// accepted for go compatibility).
+        #[arg(short = 'o')]
+        log_to_stdout: bool,
+
+        /// Override the phonebook with `ip:port` (or `;`-separated list).
+        #[arg(short = 'p')]
+        peers: Option<String>,
+
+        /// Override `EndpointAddress` (REST listening address) with `ip:port`.
+        #[arg(short = 'l')]
+        listen: Option<String>,
+
+        /// Telemetry session GUID (accepted and ignored: no telemetry).
+        #[arg(short = 's')]
+        session_guid: Option<String>,
+
+        /// Telemetry override (accepted and ignored: no telemetry).
+        #[arg(short = 't')]
+        telemetry: Option<String>,
+
+        /// Input to the math/rand seed (accepted and ignored).
+        #[arg(long)]
+        seed: Option<String>,
+    },
+
     /// Follow mode: continuously validate new blocks as they arrive.
     ///
     /// **Architectural decision recorded (issue #751):** go-algorand's

@@ -159,8 +159,8 @@ pub async fn run(
 
     info!("observe mode active — press Ctrl+C to stop");
 
-    // Wait for Ctrl+C.
-    tokio::signal::ctrl_c().await?;
+    // Wait for Ctrl+C or SIGTERM.
+    super::wait_for_shutdown_signal().await?;
 
     info!("shutting down...");
     net.stop().await;

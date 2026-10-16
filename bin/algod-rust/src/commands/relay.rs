@@ -951,8 +951,8 @@ pub async fn run(
         "relay node active — press Ctrl+C to stop"
     );
 
-    // Wait for Ctrl+C.
-    tokio::signal::ctrl_c().await?;
+    // Wait for Ctrl+C or SIGTERM.
+    super::wait_for_shutdown_signal().await?;
 
     info!("shutting down relay node...");
     catchup_cancel.cancel();
