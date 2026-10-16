@@ -279,6 +279,7 @@ do_restart() {  # do_restart <graceful|kill>
             sleep 0.5
         done
         echo "docker kill -s KILL + docker start (container did not report Running)"
+        return 1
     fi
 }
 
