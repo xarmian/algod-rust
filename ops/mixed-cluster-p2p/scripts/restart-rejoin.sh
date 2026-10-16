@@ -195,17 +195,31 @@ do_restart() {  # do_restart <graceful|kill>
         docker restart -t 20 "$RUST_CONTAINER" >/dev/null
         echo "docker restart (SIGTERM)"
     else
+        # Issue #1984 (same fix as ops/mixed-cluster's #1574): `restart:
+        # unless-stopped` does not revive an explicitly killed container on
+        # the GitHub runners, so the old 60 s poll was pure downtime -- a
+        # 25-round gap that left the node chasing certificates ("round N
+        # concluded without block") and made `resumed_voting` a coin flip.
+        # Poll only briefly, then always `docker start` ourselves.
         docker kill --signal=KILL "$RUST_CONTAINER" >/dev/null
-        local deadline=$(( $(date +%s) + 60 ))
+        local deadline=$(( $(date +%s) + 3 ))
         while [ "$(date +%s)" -lt "$deadline" ]; do
             if [ "$(docker inspect -f '{{.State.Running}}' "$RUST_CONTAINER" 2>/dev/null)" = "true" ]; then
                 echo "docker kill -s KILL (restart policy revived it)"
                 return 0
             fi
-            sleep 1
+            sleep 0.2
         done
-        docker start "$RUST_CONTAINER" >/dev/null
-        echo "docker kill -s KILL + docker start"
+        docker start "$RUST_CONTAINER" >/dev/null 2>&1 || true
+        local confirm_deadline=$(( $(date +%s) + 20 ))
+        while [ "$(date +%s)" -lt "$confirm_deadline" ]; do
+            if [ "$(docker inspect -f '{{.State.Running}}' "$RUST_CONTAINER" 2>/dev/null)" = "true" ]; then
+                echo "docker kill -s KILL + docker start"
+                return 0
+            fi
+            sleep 0.5
+        done
+        echo "docker kill -s KILL + docker start (container did not report Running)"
     fi
 }
 
