@@ -231,12 +231,16 @@ fn parse_host_or_url_or_multiaddr(addr: &str) -> Result<(), &'static str> {
     // "[::]:4601" -> go retries as "http://[::]:4601"
     if addr.starts_with('[') {
         return match addr.split_once("]:") {
-            Some((v6, port))
-                if v6.len() > 1 && !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) =>
-            {
-                Ok(())
+            Some((v6, rest)) => {
+                // go retries as "http://[::1]:4160/x", where a path is fine
+                let port = rest.split('/').next().unwrap_or("");
+                if v6.len() > 1 && !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+                    Ok(())
+                } else {
+                    Err("invalid port")
+                }
             }
-            _ => Err("invalid port"),
+            None => Err("invalid port"),
         };
     }
     Err("could not parse a host from url")
@@ -1111,6 +1115,9 @@ mod tests {
             "1.2.3.4:4160",
             "relay.example.com:4160",
             "[::1]:4160",
+            "[::1]:4160/x",
+            "http://relay.example.com",
+            "/ip4/1.2.3.4",
             "http://relay.example.com:4160",
             "/ip4/1.2.3.4/tcp/4190/p2p/12D3KooWabc",
             "/dnsaddr/example.com",
@@ -1121,6 +1128,7 @@ mod tests {
         for bad in [
             "bogus",
             "host:",
+            "host:4160/path",
             ":4160",
             "host:port",
             "/x",

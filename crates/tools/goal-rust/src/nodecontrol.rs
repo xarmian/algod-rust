@@ -158,6 +158,9 @@ impl NodeController {
         if self.algod_running() {
             return Ok(true);
         }
+        // the new daemon rewrites algod.net; a leftover from a previous run
+        // could otherwise answer the health probe for some other service
+        let _ = fs::remove_file(self.data_dir.join("algod.net"));
         let out = open_log(&self.data_dir.join(STD_OUT_FILENAME));
         let err = open_log(&self.data_dir.join(STD_ERR_FILENAME));
         let mut cmd = Command::new(&self.program);
@@ -213,7 +216,7 @@ impl NodeController {
                 "stopping a node is only supported on unix platforms".to_string(),
             ));
         }
-        if !process_alive(pid) || !looks_like_algod(pid) {
+        if !process_alive(pid) || !(looks_like_algod(pid) || lock_is_held(&self.data_dir)) {
             // stale pid file (the process is gone, or the pid was reused by
             // something that is not algod): nothing to signal
             let _ = fs::remove_file(&pid_file);
@@ -314,10 +317,11 @@ fn http_health_ok(data_dir: &Path) -> bool {
     if addr.is_empty() {
         return false;
     }
-    let Some(sock) = addr.to_socket_addrs().ok().and_then(|mut a| a.next()) else {
-        return false;
-    };
-    let Ok(mut stream) = TcpStream::connect_timeout(&sock, Duration::from_secs(2)) else {
+    let Some(mut stream) = addr.to_socket_addrs().ok().and_then(|addrs| {
+        addrs
+            .filter_map(|a| TcpStream::connect_timeout(&a, Duration::from_secs(2)).ok())
+            .next()
+    }) else {
         return false;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
@@ -328,9 +332,11 @@ fn http_health_ok(data_dir: &Path) -> bool {
     {
         return false;
     }
-    let mut head = [0u8; 16];
-    let n = stream.read(&mut head).unwrap_or(0);
-    std::str::from_utf8(&head[..n]).is_ok_and(|s| s.starts_with("HTTP/1.1 200") || s.starts_with("HTTP/1.0 200"))
+    let mut head = [0u8; 12];
+    if stream.read_exact(&mut head).is_err() {
+        return false;
+    }
+    std::str::from_utf8(&head).is_ok_and(|s| s == "HTTP/1.1 200" || s == "HTTP/1.0 200")
 }
 
 enum Signal {
@@ -348,10 +354,37 @@ fn process_alive(pid: i64) -> bool {
     }
     // SAFETY: signal 0 only checks that the process exists.
     if unsafe { libc::kill(pid, 0) } == 0 {
-        return true;
+        // kill(pid, 0) also succeeds for a zombie that nobody has reaped yet
+        return !is_zombie(pid);
     }
     // EPERM: the process exists but belongs to someone else.
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Linux: `/proc/<pid>/stat` state `Z`. Elsewhere we cannot tell.
+#[cfg(unix)]
+fn is_zombie(pid: i32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // "<pid> (<comm>) <state> ..." -- comm may contain spaces and parentheses
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.trim_start().chars().next())
+        == Some('Z')
+}
+
+/// Is `<dir>/algod.lock` held by another process? Every algod (go's and
+/// algod-rust's) holds it for its whole life, so this identifies a daemon
+/// that was started under a different executable name.
+pub fn lock_is_held(data_dir: &Path) -> bool {
+    let Ok(file) = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(data_dir.join("algod.lock"))
+    else {
+        return false;
+    };
+    matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
 }
 
 /// Does `pid` look like an algod? On Linux the command line says so; where
@@ -382,9 +415,22 @@ fn cmdline_is_algod(cmdline: &[u8]) -> bool {
     };
     let mut name = base(&first);
     if ["sh", "bash", "dash", "env", "python", "python3"].contains(&name.as_str()) {
-        // skip options of the interpreter, take the script
-        let script = args.find(|a| !a.starts_with('-'));
-        name = script.map(|a| base(&a)).unwrap_or_default();
+        let rest: Vec<String> = args.collect();
+        // `sh -c "/opt/algod/bin/algod -d /data"`: judge the command string's
+        // first word
+        let command_string = rest
+            .iter()
+            .position(|a| a == "-c" || a == "-lc")
+            .and_then(|i| rest.get(i + 1));
+        name = match command_string {
+            Some(cmd) => base(cmd.split_whitespace().next().unwrap_or("")),
+            // otherwise skip options and `VAR=value` words, take the script
+            None => rest
+                .iter()
+                .find(|a| !a.starts_with('-') && !a.contains('='))
+                .map(|a| base(a))
+                .unwrap_or_default(),
+        };
     }
     name.starts_with("algod")
 }
@@ -487,6 +533,40 @@ mod tests {
             }
         });
         addr
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interpreter_launches_are_judged_by_the_command_they_run() {
+        let line = |parts: &[&str]| parts.join("\0").into_bytes();
+        assert!(cmdline_is_algod(&line(&["sh", "-c", "/opt/algod/bin/algod -d /data"])));
+        assert!(cmdline_is_algod(&line(&["env", "FOO=1", "algod", "-d", "/d"])));
+        assert!(!cmdline_is_algod(&line(&["bash", "-c", "tail -f /algod/data/node.log"])));
+    }
+
+    #[test]
+    fn the_lock_file_tells_whether_a_daemon_holds_the_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!lock_is_held(tmp.path()), "no lock file");
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(tmp.path().join("algod.lock"))
+            .unwrap();
+        held.try_lock().unwrap();
+        assert!(lock_is_held(tmp.path()), "a live daemon's flock is visible");
+        drop(held);
+        assert!(!lock_is_held(tmp.path()), "released");
+    }
+
+    #[test]
+    fn localhost_is_probed_on_every_address_it_resolves_to() {
+        let tmp = tempfile::tempdir().unwrap();
+        let addr = health_stub("HTTP/1.1 200 OK");
+        let port = addr.rsplit(':').next().unwrap();
+        fs::write(tmp.path().join("algod.net"), format!("localhost:{port}")).unwrap();
+        assert!(http_health_ok(tmp.path()), "stub listens on 127.0.0.1 only");
     }
 
     #[cfg(unix)]
@@ -695,6 +775,34 @@ mod tests {
             std::thread::sleep(Duration::from_millis(200));
             assert!(!data.join("algod.pid").exists(), "pid file removed after SIGKILL");
             let _ = pid;
+        }
+
+        #[test]
+        fn an_unreaped_zombie_is_not_alive() {
+            let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+            let pid = i64::from(child.id());
+            // let it exit; it stays a zombie until we wait on it
+            let start = Instant::now();
+            while process_alive(pid) && start.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(!process_alive(pid), "zombie must not count as alive");
+            child.wait().unwrap();
+        }
+
+        #[test]
+        fn a_stale_algod_net_is_cleared_before_a_start() {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("data");
+            fs::create_dir(&data).unwrap();
+            fs::write(data.join("algod.net"), "stale-from-a-previous-run\n").unwrap();
+            let mut nc = NodeController::with_program(&data, fake_daemon(tmp.path(), false), Vec::new());
+            // healthy only once the daemon has rewritten algod.net
+            nc.healthy = Box::new(|d| {
+                fs::read_to_string(d.join("algod.net")).is_ok_and(|t| t.trim() == "127.0.0.1:1")
+            });
+            assert_eq!(nc.start_algod(&StartArgs::default()), Ok(false));
+            nc.stop_algod().expect("stop");
         }
 
         #[test]
