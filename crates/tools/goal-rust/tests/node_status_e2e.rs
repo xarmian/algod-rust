@@ -352,44 +352,63 @@ fn node_generatetoken_refuses_when_algod_unreachable_ambiguously() {
     );
 }
 
+fn goal_node(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+    Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(dir)
+        .arg("node")
+        .args(args)
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .unwrap_or_else(|e| panic!("run goal-rust node {args:?}: {e}"))
+}
+
+/// Issue #1992: `goal node stop|start|restart` are real now (go's
+/// `nodecontrol`), no longer advisory stubs. The deterministic, daemon-free
+/// parts: go's messages and exit codes.
 #[test]
-fn node_start_stop_restart_print_advisory_on_stderr_and_exit_zero() {
-    // Phase A's advisory stubs (TASK-225): start / stop / restart
-    // delegate to the host supervisor and print guidance. They MUST
-    // exit 0 (running them isn't a usage error) and the text MUST go
-    // to stderr (so scripts that grep stdout don't trip).
+fn node_stop_without_a_running_node_is_gos_error() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    for sub in ["start", "stop", "restart"] {
-        let out = Command::new(GOAL_RUST_BIN)
-            .arg("-d")
-            .arg(tmp.path())
-            .args(["node", sub])
-            .env_remove("ALGORAND_DATA")
-            .output()
-            .unwrap_or_else(|e| panic!("run goal-rust node {sub}: {e}"));
+    let out = goal_node(tmp.path(), &["stop"]);
+    assert_eq!(out.status.code(), Some(1), "go's reportErrorf exits 1");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "Cannot kill node: no running node in directory '{}'",
+            tmp.path().display()
+        )),
+        "unexpected stderr: {stderr:?}"
+    );
+}
+
+#[test]
+fn node_start_and_restart_reject_a_malformed_peer_like_go() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for sub in ["start", "restart"] {
+        let out = goal_node(tmp.path(), &[sub, "-p", "bogus"]);
+        assert_eq!(out.status.code(), Some(1), "node {sub}");
         assert!(
-            out.status.success(),
-            "node {sub} must exit 0 (advisory); got exit={:?}, stderr={}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr),
-        );
-        assert!(
-            out.stdout.is_empty(),
-            "node {sub} must not write to stdout; got {:?}",
-            String::from_utf8_lossy(&out.stdout),
-        );
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains("goal-rust does"),
-            "node {sub} stderr must carry the advisory text; got {stderr:?}",
-        );
-        // Sanity: the resolved data dir is embedded for
-        // copy-paste convenience.
-        assert!(
-            stderr.contains(&tmp.path().display().to_string()),
-            "node {sub} stderr must embed the data dir; got {stderr:?}",
+            String::from_utf8_lossy(&out.stderr)
+                .contains("Provided peer 'bogus' is not a valid peer address"),
+            "node {sub}: {:?}",
+            String::from_utf8_lossy(&out.stderr)
         );
     }
+}
+
+#[test]
+fn node_restart_of_a_stopped_node_says_so_and_tries_to_start_anyway() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = goal_node(tmp.path(), &["restart"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Algorand node does not appear to be running: "),
+        "stdout: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("Attempting to start the Algorand node anyway..."),
+        "stdout: {stdout:?}"
+    );
 }
 
 #[test]

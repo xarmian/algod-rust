@@ -169,59 +169,201 @@ async fn get_status(data_dir: &Path, watch_ms: u64) -> Result<(), ()> {
     Ok(())
 }
 
-/// Phase-A advisory: `goal-rust node start` delegates process
-/// supervision to the host's supervisor. Prints guidance to stderr
-/// and exits 0 (advisory, not an error).
-///
-/// Go's `startCmd` (node.go:235-289) forks `algod`, writes
-/// `algod.pid`, and runs as a supervisor — that's a heavy port we've
-/// scoped out of Phase A. A follow-up Idea tracks the full port.
-pub fn run_start(cli_d: Vec<PathBuf>) -> ExitCode {
-    advisory_supervision(
-        &cli_d,
-        "goal-rust does not yet manage the algod process directly. \
-        Start algod via your supervisor (systemd, supervisord, or \
-        'algod -d {dir}' as a child of your shell).",
-    )
+/// `messages.go` strings used by start/stop/restart.
+const INFO_NODE_START: &str = "Algorand node successfully started!";
+const INFO_NODE_ALREADY_STARTED: &str = "Algorand node was already started!";
+const INFO_NODE_DID_NOT_RESTART: &str = "Algorand node did not restart. The node is still running!";
+const INFO_NODE_SUCCESSFULLY_STOPPED: &str = "The node was successfully stopped.";
+const ERROR_NODE_NOT_DETECTED: &str = "Algorand node does not appear to be running: ";
+const ERROR_NODE_FAILED_TO_START: &str = "Algorand node failed to start: ";
+const ERROR_KILL: &str = "Cannot kill node: ";
+
+/// go: `verifyPeerDialArg` -- every `;`-separated entry must parse as
+/// `network/addr.ParseHostOrURLOrMultiaddr`: a multiaddr, `host:port`
+/// (`^[-a-zA-Z0-9.]+:\d+$`), a URL with a host, or a bracketed IPv6
+/// `[addr]:port`. Returns go's error text for the offending entry.
+pub fn verify_peer_dial_arg(peers: &str) -> Result<(), String> {
+    for peer in peers.split(';') {
+        if let Err(why) = parse_host_or_url_or_multiaddr(peer) {
+            return Err(format!(
+                "Provided peer '{peer}' is not a valid peer address : {why}"
+            ));
+        }
+    }
+    Ok(())
 }
 
-/// Phase-A advisory: `goal-rust node stop`. Counterpart to
-/// [`run_start`] — guidance + exit 0.
-pub fn run_stop(cli_d: Vec<PathBuf>) -> ExitCode {
-    advisory_supervision(
-        &cli_d,
-        "goal-rust does not manage the algod process. Stop algod via \
-        your supervisor or SIGTERM the PID in {dir}/algod.pid.",
-    )
+fn parse_host_or_url_or_multiaddr(addr: &str) -> Result<(), &'static str> {
+    // a multiaddr starts with '/' but not '//' (scheme-relative URL)
+    if addr.starts_with('/') && !addr.starts_with("//") {
+        const PROTOS: [&str; 8] = [
+            "ip4", "ip6", "dns", "dns4", "dns6", "dnsaddr", "tcp", "udp",
+        ];
+        let mut parts = addr.split('/').skip(1);
+        let first_ok = parts.next().is_some_and(|p| PROTOS.contains(&p));
+        let value_ok = parts.next().is_some_and(|v| !v.is_empty());
+        return if first_ok && value_ok {
+            Ok(())
+        } else {
+            Err("failed to parse multiaddr")
+        };
+    }
+    let is_host_port = |s: &str| {
+        s.rsplit_once(':').is_some_and(|(host, port)| {
+            !host.is_empty()
+                && host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+                && !port.is_empty()
+                && port.chars().all(|c| c.is_ascii_digit())
+        })
+    };
+    if is_host_port(addr) {
+        return Ok(());
+    }
+    if let Some((_, rest)) = addr.split_once("://") {
+        return if rest.is_empty() || rest.starts_with('/') {
+            Err("could not parse a host from url")
+        } else {
+            Ok(())
+        };
+    }
+    // "[::]:4601" -> go retries as "http://[::]:4601"
+    if addr.starts_with('[') {
+        return match addr.split_once("]:") {
+            Some((v6, rest)) => {
+                // go retries as "http://[::1]:4160/x", where a path is fine
+                let port = rest.split('/').next().unwrap_or("");
+                if v6.len() > 1 && !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+                    Ok(())
+                } else {
+                    Err("invalid port")
+                }
+            }
+            None => Err("invalid port"),
+        };
+    }
+    Err("could not parse a host from url")
 }
 
-/// Phase-A advisory: `goal-rust node restart`. Combined stop/start
-/// guidance.
-pub fn run_restart(cli_d: Vec<PathBuf>) -> ExitCode {
-    advisory_supervision(
-        &cli_d,
-        "goal-rust does not manage the algod process. Restart algod \
-        via your supervisor: stop the PID in {dir}/algod.pid, then \
-        start a fresh 'algod -d {dir}'.",
-    )
+fn start_args(flags: &crate::groups::node::StartFlags) -> crate::nodecontrol::StartArgs {
+    crate::nodecontrol::StartArgs {
+        peer_address: flags.peer.clone(),
+        listen_ip: flags.listen.clone(),
+        telemetry_override: flags.telemetry.clone(),
+    }
 }
 
-/// Shared advisory printer. Substitutes `{dir}` with each resolved
-/// data dir and emits one line per dir to stderr. Returns exit 0
-/// because invoking the command isn't a usage error — the operator
-/// can read the message and act.
-fn advisory_supervision(cli_d: &[PathBuf], template: &str) -> ExitCode {
-    // We don't *require* a data dir to be set (the message is still
-    // useful without one), but if `-d` / `$ALGORAND_DATA` resolves to
-    // a real path, embed it in the message for copy-paste convenience.
-    let dirs = crate::data_dir::resolve_data_dirs(cli_d)
-        .unwrap_or_else(|_| vec![PathBuf::from("<data-dir>")]);
+/// Port of `startCmd` (`node.go:236-278`).
+pub fn run_start(flags: crate::groups::node::StartFlags, cli_d: Vec<PathBuf>) -> ExitCode {
+    if let Err(e) = preflight_start(&flags) {
+        eprintln!("{e}");
+        return ExitCode::from(1);
+    }
+    let dirs = match crate::data_dir::resolve_data_dirs(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let multi = dirs.len() > 1;
     for dir in &dirs {
-        let dir_str = dir.display().to_string();
-        let msg = template.replace("{dir}", &dir_str);
-        eprintln!("{msg}");
+        if multi {
+            println!("{}{}]", crate::data_dir::INFO_DATA_DIR_FMT, dir.display());
+        }
+        let nc = crate::nodecontrol::NodeController::new(dir);
+        match nc.start_algod(&start_args(&flags)) {
+            Ok(true) => println!("{INFO_NODE_ALREADY_STARTED}"),
+            Ok(false) => println!("{INFO_NODE_START}"),
+            Err(e) => {
+                eprintln!("{ERROR_NODE_FAILED_TO_START}{e}");
+                return ExitCode::from(1);
+            }
+        }
     }
     ExitCode::SUCCESS
+}
+
+/// Port of `stopCmd` (`node.go:289-315`).
+pub fn run_stop(cli_d: Vec<PathBuf>) -> ExitCode {
+    let dirs = match crate::data_dir::resolve_data_dirs(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let multi = dirs.len() > 1;
+    for dir in &dirs {
+        if multi {
+            println!("{}{}]", crate::data_dir::INFO_DATA_DIR_FMT, dir.display());
+        }
+        let nc = crate::nodecontrol::NodeController::new(dir);
+        if let Err(e) = nc.stop_algod() {
+            eprintln!("{ERROR_KILL}{e}");
+            return ExitCode::from(1);
+        }
+        println!("{INFO_NODE_SUCCESSFULLY_STOPPED}");
+    }
+    ExitCode::SUCCESS
+}
+
+/// Port of `restartCmd` (`node.go:317-378`): stop (if a pid is found), pause
+/// a second, then start.
+pub fn run_restart(flags: crate::groups::node::StartFlags, cli_d: Vec<PathBuf>) -> ExitCode {
+    if let Err(e) = preflight_start(&flags) {
+        eprintln!("{e}");
+        return ExitCode::from(1);
+    }
+    let dirs = match crate::data_dir::resolve_data_dirs(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let multi = dirs.len() > 1;
+    for dir in &dirs {
+        if multi {
+            println!("{}{}]", crate::data_dir::INFO_DATA_DIR_FMT, dir.display());
+        }
+        let nc = crate::nodecontrol::NodeController::new(dir);
+        match nc.algod_pid() {
+            Err(e) => {
+                println!("{ERROR_NODE_NOT_DETECTED}{e}");
+                println!("Attempting to start the Algorand node anyway...");
+            }
+            Ok(_) => match nc.stop_algod() {
+                Err(e) => {
+                    println!("{ERROR_KILL}{e}");
+                    println!("Attempting to start the Algorand node anyway...");
+                }
+                Ok(()) => println!("{INFO_NODE_SUCCESSFULLY_STOPPED}"),
+            },
+        }
+        // brief sleep to allow the node to finish shutting down
+        std::thread::sleep(Duration::from_secs(1));
+        match nc.start_algod(&start_args(&flags)) {
+            Ok(true) => println!("{INFO_NODE_DID_NOT_RESTART}"),
+            Ok(false) => println!("{INFO_NODE_START}"),
+            Err(e) => {
+                eprintln!("{ERROR_NODE_FAILED_TO_START}{e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn preflight_start(flags: &crate::groups::node::StartFlags) -> Result<(), String> {
+    if let Some(peers) = flags.peer.as_deref().filter(|p| !p.is_empty()) {
+        verify_peer_dial_arg(peers)?;
+    }
+    if flags.hosted {
+        return Err("Running algod hosted by algoh (-H) is not supported by algod-rust".to_string());
+    }
+    Ok(())
 }
 
 /// Port of `lastroundCmd` (`node.go:519-534`). Per-data-dir, calls
@@ -965,5 +1107,41 @@ mod tests {
         let url = spawn_mock_http("HTTP/1.1 200 OK", "not a catchpoint label");
         let err = get_missing_catchpoint_label(&url).await.unwrap_err();
         assert!(err.contains("not a valid catchpoint label"), "got: {err}");
+    }
+
+    #[test]
+    fn peer_addresses_are_validated_like_gos_parse_host_or_url_or_multiaddr() {
+        for good in [
+            "1.2.3.4:4160",
+            "relay.example.com:4160",
+            "[::1]:4160",
+            "[::1]:4160/x",
+            "http://relay.example.com",
+            "/ip4/1.2.3.4",
+            "http://relay.example.com:4160",
+            "/ip4/1.2.3.4/tcp/4190/p2p/12D3KooWabc",
+            "/dnsaddr/example.com",
+            "1.2.3.4:4160;relay.example.com:4160",
+        ] {
+            assert!(verify_peer_dial_arg(good).is_ok(), "{good} must be accepted");
+        }
+        for bad in [
+            "bogus",
+            "host:",
+            "host:4160/path",
+            ":4160",
+            "host:port",
+            "/x",
+            "/bogus/1.2.3.4",
+            "http://",
+            "1.2.3.4:4160;bogus",
+            "",
+        ] {
+            let err = verify_peer_dial_arg(bad).expect_err(bad);
+            assert!(
+                err.starts_with("Provided peer '") && err.contains("is not a valid peer address : "),
+                "{bad}: {err}"
+            );
+        }
     }
 }
