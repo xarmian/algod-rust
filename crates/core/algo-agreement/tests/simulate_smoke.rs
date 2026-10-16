@@ -75,6 +75,52 @@ impl AgreementKeyManager for EmptyKeyManager {
     fn record(&self, _account: &Address, _round: Round, _action: ParticipationAction) {}
 }
 
+/// Issue #1986: `simulate_zero_rounds_returns_immediately` hung for 1200 s in CI.
+/// With `n = 0` the driver calls `clock.shutdown()` right after `service.start()`.
+/// `shutdown()` drains a pending `zero()` rendezvous only ONCE, so a service
+/// thread that reaches `zero()` AFTER that drain parked forever on the capacity-0
+/// `Z1` send and `handle.shutdown()` never returned. The interleaving is forced
+/// here deterministically: shut down first, then call `zero()`.
+#[test]
+fn zero_after_shutdown_does_not_block_the_service() {
+    let clock = InstantClock::new();
+    clock.shutdown();
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let c = Arc::clone(&clock);
+    thread::spawn(move || {
+        use algo_agreement::Clock;
+        c.zero();
+        let _ = done_tx.send(());
+    });
+    assert!(
+        done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+        "Clock::zero() blocked after InstantClock::shutdown(): the service thread would never \n         exit and handle.shutdown() would hang"
+    );
+}
+
+/// The other ordering: `zero()` is already parked on the rendezvous when
+/// `shutdown()` runs; it must be released too (a clock is single-use after
+/// `shutdown()`, so a stale buffered `Z0` token is never observed).
+#[test]
+fn zero_blocked_before_shutdown_is_released() {
+    let clock = InstantClock::new();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let c = Arc::clone(&clock);
+    thread::spawn(move || {
+        use algo_agreement::Clock;
+        c.zero();
+        let _ = done_tx.send(());
+    });
+    // let the thread reach the blocking Z1 send
+    thread::sleep(Duration::from_millis(200));
+    clock.shutdown();
+    assert!(
+        done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+        "a zero() parked before shutdown() was never released"
+    );
+}
+
 #[test]
 fn simulate_zero_rounds_returns_immediately() {
     // With n=0 the driver should never invoke `run_round` — it simply starts

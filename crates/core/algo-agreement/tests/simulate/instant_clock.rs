@@ -119,6 +119,15 @@ pub struct InstantClock {
     /// When set, `timeout_at` returns a pre-disconnected receiver so every
     /// post-shutdown request surfaces as immediately ready.
     shutting_down: AtomicBool,
+
+    /// Disconnects when `shutdown()` runs (its sender is dropped). `zero()`
+    /// selects on it alongside its blocking `Z0`/`Z1` sends, so a service
+    /// thread that reaches `zero()` AFTER the driver's one-shot `Z1` drain in
+    /// `shutdown()` is released instead of parking forever on the capacity-0
+    /// rendezvous (issue #1986: `simulate_zero_rounds_returns_immediately`
+    /// hung 1200 s in CI when the service thread was scheduled late).
+    shutdown_tx: Mutex<Option<Sender<()>>>,
+    shutdown_rx: Receiver<()>,
 }
 
 impl InstantClock {
@@ -129,6 +138,7 @@ impl InstantClock {
         let (z0_tx, z0_rx) = bounded(1);
         let (z1_tx, z1_rx) = bounded(0);
         let (toa_tx, toa_rx) = bounded(0);
+        let (shutdown_tx, shutdown_rx) = bounded(0);
         Arc::new(Self {
             state: Mutex::new(InstantState {
                 events_queues: HashMap::new(),
@@ -142,6 +152,8 @@ impl InstantClock {
             first_timeout_seen: AtomicBool::new(false),
             active_senders: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
+            shutdown_tx: Mutex::new(Some(shutdown_tx)),
+            shutdown_rx,
         })
     }
 
@@ -185,6 +197,11 @@ impl InstantClock {
             .lock()
             .expect("InstantClock active_senders mutex poisoned")
             .clear();
+        // Release every `zero()` that is blocked now OR arrives later.
+        *self
+            .shutdown_tx
+            .lock()
+            .expect("InstantClock shutdown_tx mutex poisoned") = None;
         // Drain a pending `zero()` rendezvous, if any.
         let _ = self.z1_rx.try_recv();
     }
@@ -280,10 +297,17 @@ impl Clock for InstantClock {
         // Using `try_send` here silently dropped the marker and caused
         // run_round's `z0_rx.recv()` to deadlock on subsequent rounds
         // (Codex round-1 finding).
-        let _ = self.z0_tx.send(());
+        // Both sends also wake on shutdown (issue #1986).
+        crossbeam_channel::select! {
+            send(self.z0_tx, ()) -> _ => {}
+            recv(self.shutdown_rx) -> _ => return,
+        }
         // Rendezvous on Z1 (cap 0) — blocks until `run_round` reads.
         // Mirrors Go's `instant.Zero()` in simulate.go:77-82.
-        let _ = self.z1_tx.send(());
+        crossbeam_channel::select! {
+            send(self.z1_tx, ()) -> _ => {}
+            recv(self.shutdown_rx) -> _ => {}
+        }
     }
 }
 
