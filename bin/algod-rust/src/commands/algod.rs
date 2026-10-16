@@ -140,9 +140,12 @@ pub fn plan(args: &AlgodArgs, algorand_data_env: Option<&str>) -> Result<Outcome
     // `canonicalize` yields a verbatim (`\\?\`) path on Windows; keep the plain form.
     let abs = strip_verbatim(abs);
     let genesis_dir = abs.join(&genesis_id);
+    // go: `log.Fatalf("Cannot load config: %v", err)` for anything but a
+    // missing file. `participate` itself would only warn and use defaults.
+    validate_config(&abs)?;
     let genesis_abs = match args.genesis.as_deref() {
         None => abs.join("genesis.json"),
-        Some(g) => genesis_path_abs(g, &abs),
+        Some(g) => genesis_path_abs(g),
     };
 
     let mut argv: Vec<String> = vec![
@@ -167,8 +170,15 @@ pub fn plan(args: &AlgodArgs, algorand_data_env: Option<&str>) -> Result<Outcome
     // `-p` replaces the phonebook (and, in go, disables DNS bootstrap, which
     // `participate` only consults when `--peers` is empty).
     if let Some(peers) = args.peers.as_deref().filter(|p| !p.is_empty()) {
-        argv.push("--peers".into());
-        argv.push(peers.split(';').collect::<Vec<_>>().join(","));
+        let list: Vec<&str> = peers
+            .split(';')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .collect();
+        if !list.is_empty() {
+            argv.push("--peers".into());
+            argv.push(list.join(","));
+        }
     }
     // `-l` overrides `EndpointAddress`; otherwise `participate` reads it from
     // `<data-dir>/config.json` itself.
@@ -197,13 +207,17 @@ fn path_str(p: &Path) -> String {
 }
 
 /// The genesis file as an absolute path (`-g` may be relative to the cwd).
-fn genesis_path_abs(genesis_path: &Path, abs_data_dir: &Path) -> PathBuf {
+fn genesis_path_abs(genesis_path: &Path) -> PathBuf {
     if genesis_path.is_absolute() {
         return genesis_path.to_path_buf();
     }
     std::fs::canonicalize(genesis_path)
         .map(strip_verbatim)
-        .unwrap_or_else(|_| abs_data_dir.join("genesis.json"))
+        .unwrap_or_else(|_| {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(genesis_path))
+                .unwrap_or_else(|_| genesis_path.to_path_buf())
+        })
 }
 
 #[cfg(windows)]
@@ -218,6 +232,22 @@ fn strip_verbatim(p: PathBuf) -> PathBuf {
 #[cfg(not(windows))]
 fn strip_verbatim(p: PathBuf) -> PathBuf {
     p
+}
+
+/// go refuses to start on a `config.json` it cannot load (`cmd/algod/main.go`);
+/// a missing file is fine. `NetAddress` must be a string when present.
+fn validate_config(data_dir: &Path) -> Result<(), String> {
+    if let Err(e) = algo_config::Local::load_from_data_dir(data_dir) {
+        return Err(format!("Cannot load config: {e}"));
+    }
+    if let Ok(text) = std::fs::read_to_string(data_dir.join("config.json")) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+            if value.get("NetAddress").is_some_and(|v| !v.is_string()) {
+                return Err("Cannot load config: NetAddress must be a string".to_string());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `NetAddress` from `<data-dir>/config.json`, normalised to `host:port`
@@ -488,6 +518,62 @@ mod tests {
         assert_eq!(
             flag_value(&p.participate_argv, "--listen-address"),
             Some("127.0.0.1:4161")
+        );
+    }
+
+    #[test]
+    fn dash_p_drops_empty_segments_and_trims_whitespace() {
+        let dir = data_dir(None);
+        let args = AlgodArgs {
+            peers: Some(" 10.0.0.1:4160 ;; 10.0.0.2:4160;".into()),
+            ..args_for(dir.path())
+        };
+        let p = launch(&args);
+        assert_eq!(
+            flag_value(&p.participate_argv, "--peers"),
+            Some("10.0.0.1:4160,10.0.0.2:4160")
+        );
+    }
+
+    #[test]
+    fn a_malformed_config_json_refuses_to_start_like_go() {
+        // go: `log.Fatalf("Cannot load config: %v", err)` unless the file is absent
+        let dir = data_dir(Some("{ this is not json"));
+        let err = plan(&args_for(dir.path()), None).unwrap_err();
+        assert!(err.starts_with("Cannot load config: "), "{err}");
+
+        // a NetAddress that is not a string is a config error too
+        let dir = data_dir(Some(r#"{"NetAddress": 4161}"#));
+        let err = plan(&args_for(dir.path()), None).unwrap_err();
+        assert!(err.starts_with("Cannot load config: "), "{err}");
+
+        // a missing config.json is fine (defaults)
+        let dir = data_dir(None);
+        plan(&args_for(dir.path()), None).expect("no config.json is not an error");
+    }
+
+    #[test]
+    fn a_relative_dash_g_is_resolved_against_the_cwd_not_the_data_dir() {
+        let dir = data_dir(None);
+        // a file name that exists only relative to the current directory
+        let name = format!("algod-launcher-test-genesis-{}.json", std::process::id());
+        let cwd = std::env::current_dir().expect("cwd");
+        let path = cwd.join(&name);
+        std::fs::write(&path, GENESIS).expect("genesis in cwd");
+        let args = AlgodArgs {
+            genesis: Some(PathBuf::from(&name)),
+            ..args_for(dir.path())
+        };
+        let result = plan(&args, None);
+        let _ = std::fs::remove_file(&path);
+        let p = match result.expect("plan") {
+            Outcome::Launch(p) => p,
+            other => panic!("{other:?}"),
+        };
+        let got = flag_value(&p.participate_argv, "--genesis-json").expect("flag");
+        assert!(
+            Path::new(got).is_absolute() && got.ends_with(&name),
+            "relative -g must become an absolute path to that file, got {got}"
         );
     }
 
