@@ -178,23 +178,68 @@ const ERROR_NODE_NOT_DETECTED: &str = "Algorand node does not appear to be runni
 const ERROR_NODE_FAILED_TO_START: &str = "Algorand node failed to start: ";
 const ERROR_KILL: &str = "Cannot kill node: ";
 
-/// go: `verifyPeerDialArg` -- every `;`-separated entry must look like a host
-/// (`host:port`), a URL or a multiaddr. Returns the offending entry.
+/// go: `verifyPeerDialArg` -- every `;`-separated entry must parse as
+/// `network/addr.ParseHostOrURLOrMultiaddr`: a multiaddr, `host:port`
+/// (`^[-a-zA-Z0-9.]+:\d+$`), a URL with a host, or a bracketed IPv6
+/// `[addr]:port`. Returns go's error text for the offending entry.
 pub fn verify_peer_dial_arg(peers: &str) -> Result<(), String> {
     for peer in peers.split(';') {
-        let ok = !peer.is_empty()
-            && (peer.starts_with('/')
-                || peer.contains("://")
-                || peer
-                    .rsplit_once(':')
-                    .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok()));
-        if !ok {
+        if let Err(why) = parse_host_or_url_or_multiaddr(peer) {
             return Err(format!(
-                "Provided peer '{peer}' is not a valid peer address : invalid peer address"
+                "Provided peer '{peer}' is not a valid peer address : {why}"
             ));
         }
     }
     Ok(())
+}
+
+fn parse_host_or_url_or_multiaddr(addr: &str) -> Result<(), &'static str> {
+    // a multiaddr starts with '/' but not '//' (scheme-relative URL)
+    if addr.starts_with('/') && !addr.starts_with("//") {
+        const PROTOS: [&str; 8] = [
+            "ip4", "ip6", "dns", "dns4", "dns6", "dnsaddr", "tcp", "udp",
+        ];
+        let mut parts = addr.split('/').skip(1);
+        let first_ok = parts.next().is_some_and(|p| PROTOS.contains(&p));
+        let value_ok = parts.next().is_some_and(|v| !v.is_empty());
+        return if first_ok && value_ok {
+            Ok(())
+        } else {
+            Err("failed to parse multiaddr")
+        };
+    }
+    let is_host_port = |s: &str| {
+        s.rsplit_once(':').is_some_and(|(host, port)| {
+            !host.is_empty()
+                && host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+                && !port.is_empty()
+                && port.chars().all(|c| c.is_ascii_digit())
+        })
+    };
+    if is_host_port(addr) {
+        return Ok(());
+    }
+    if let Some((_, rest)) = addr.split_once("://") {
+        return if rest.is_empty() || rest.starts_with('/') {
+            Err("could not parse a host from url")
+        } else {
+            Ok(())
+        };
+    }
+    // "[::]:4601" -> go retries as "http://[::]:4601"
+    if addr.starts_with('[') {
+        return match addr.split_once("]:") {
+            Some((v6, port))
+                if v6.len() > 1 && !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) =>
+            {
+                Ok(())
+            }
+            _ => Err("invalid port"),
+        };
+    }
+    Err("could not parse a host from url")
 }
 
 fn start_args(flags: &crate::groups::node::StartFlags) -> crate::nodecontrol::StartArgs {
@@ -1058,5 +1103,37 @@ mod tests {
         let url = spawn_mock_http("HTTP/1.1 200 OK", "not a catchpoint label");
         let err = get_missing_catchpoint_label(&url).await.unwrap_err();
         assert!(err.contains("not a valid catchpoint label"), "got: {err}");
+    }
+
+    #[test]
+    fn peer_addresses_are_validated_like_gos_parse_host_or_url_or_multiaddr() {
+        for good in [
+            "1.2.3.4:4160",
+            "relay.example.com:4160",
+            "[::1]:4160",
+            "http://relay.example.com:4160",
+            "/ip4/1.2.3.4/tcp/4190/p2p/12D3KooWabc",
+            "/dnsaddr/example.com",
+            "1.2.3.4:4160;relay.example.com:4160",
+        ] {
+            assert!(verify_peer_dial_arg(good).is_ok(), "{good} must be accepted");
+        }
+        for bad in [
+            "bogus",
+            "host:",
+            ":4160",
+            "host:port",
+            "/x",
+            "/bogus/1.2.3.4",
+            "http://",
+            "1.2.3.4:4160;bogus",
+            "",
+        ] {
+            let err = verify_peer_dial_arg(bad).expect_err(bad);
+            assert!(
+                err.starts_with("Provided peer '") && err.contains("is not a valid peer address : "),
+                "{bad}: {err}"
+            );
+        }
     }
 }

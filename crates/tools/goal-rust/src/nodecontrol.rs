@@ -162,6 +162,11 @@ impl NodeController {
         let err = open_log(&self.data_dir.join(STD_ERR_FILENAME));
         let mut cmd = Command::new(&self.program);
         cmd.args(self.algod_args(args)).stdin(Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            cmd.process_group(0);
+        }
         cmd.stdout(out.map_or_else(Stdio::null, Stdio::from));
         cmd.stderr(err.map_or_else(Stdio::null, Stdio::from));
         let mut child = cmd
@@ -203,8 +208,14 @@ impl NodeController {
         let Ok(pid) = read_pid(&self.data_dir) else {
             return Err(StopError::NotRunning(self.data_dir.display().to_string()));
         };
-        if !process_alive(pid) {
-            // stale pid file: nothing to signal
+        if !cfg!(unix) {
+            return Err(StopError::Other(
+                "stopping a node is only supported on unix platforms".to_string(),
+            ));
+        }
+        if !process_alive(pid) || !looks_like_algod(pid) {
+            // stale pid file (the process is gone, or the pid was reused by
+            // something that is not algod): nothing to signal
             let _ = fs::remove_file(&pid_file);
             return Ok(());
         }
@@ -228,7 +239,13 @@ impl NodeController {
 pub fn read_pid(data_dir: &Path) -> Result<i64, String> {
     let text = fs::read_to_string(data_dir.join("algod.pid")).map_err(|e| e.to_string())?;
     let line = text.lines().next().unwrap_or("").trim();
-    line.parse::<i64>().map_err(|e| e.to_string())
+    let pid = line.parse::<i64>().map_err(|e| e.to_string())?;
+    // kill(2) treats 0 and negative pids as process groups / "everything":
+    // a corrupt pid file must never turn into that.
+    if pid <= 0 || pid > i64::from(i32::MAX) {
+        return Err(format!("invalid pid {pid} in algod.pid"));
+    }
+    Ok(pid)
 }
 
 fn open_log(path: &Path) -> Option<File> {
@@ -271,19 +288,29 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// The address to probe for the `algod.net` value: a node listening on all
+/// interfaces writes `0.0.0.0:port` / `[::]:port`, which is not connectable
+/// everywhere, so it is probed on loopback.
+fn probe_addr(net: &str) -> String {
+    let addr = net
+        .trim()
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    if let Some(port) = addr.strip_prefix("0.0.0.0:") {
+        return format!("127.0.0.1:{port}");
+    }
+    if let Some(port) = addr.strip_prefix("[::]:") {
+        return format!("[::1]:{port}");
+    }
+    addr.to_string()
+}
+
 /// go: `HealthCheck` -- `GET /health` on the address in `algod.net`.
 fn http_health_ok(data_dir: &Path) -> bool {
     let Ok(net) = fs::read_to_string(data_dir.join("algod.net")) else {
         return false;
     };
-    let addr = net
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .trim_start_matches("http://")
-        .trim_end_matches('/')
-        .to_string();
+    let addr = probe_addr(net.lines().next().unwrap_or(""));
     if addr.is_empty() {
         return false;
     }
@@ -316,8 +343,26 @@ fn process_alive(pid: i64) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
         return false;
     };
+    if pid <= 0 {
+        return false;
+    }
     // SAFETY: signal 0 only checks that the process exists.
-    unsafe { libc::kill(pid, 0) == 0 }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    // EPERM: the process exists but belongs to someone else.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Does `pid` look like an algod? On Linux the command line says so; where
+/// `/proc` is not available we cannot tell and give the pid file the benefit
+/// of the doubt (as go does).
+#[cfg(unix)]
+fn looks_like_algod(pid: i64) -> bool {
+    match fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).contains("algod"),
+        Err(_) => true,
+    }
 }
 
 #[cfg(unix)]
@@ -337,6 +382,11 @@ fn send_signal(pid: i64, sig: Signal) -> Result<(), String> {
 
 #[cfg(not(unix))]
 fn process_alive(_pid: i64) -> bool {
+    false
+}
+
+#[cfg(not(unix))]
+fn looks_like_algod(_pid: i64) -> bool {
     false
 }
 
@@ -413,6 +463,37 @@ mod tests {
             }
         });
         addr
+    }
+
+    #[test]
+    fn a_pid_must_be_a_positive_process_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        for bad in ["0", "-1", "-4242", "99999999999", "x"] {
+            fs::write(tmp.path().join("algod.pid"), format!("{bad}\n")).unwrap();
+            assert!(read_pid(tmp.path()).is_err(), "{bad} must be rejected");
+        }
+        fs::write(tmp.path().join("algod.pid"), "1\n").unwrap();
+        assert_eq!(read_pid(tmp.path()), Ok(1));
+    }
+
+    #[test]
+    fn a_bind_all_address_is_probed_on_loopback() {
+        assert_eq!(probe_addr("0.0.0.0:8080\n"), "127.0.0.1:8080");
+        assert_eq!(probe_addr("[::]:8080"), "[::1]:8080");
+        assert_eq!(probe_addr("http://127.0.0.1:4001/"), "127.0.0.1:4001");
+        assert_eq!(probe_addr("10.1.2.3:99"), "10.1.2.3:99");
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn stop_never_claims_success_where_it_cannot_signal() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("algod.pid"), "4242\n").unwrap();
+        assert!(matches!(
+            controller(tmp.path()).stop_algod(),
+            Err(StopError::Other(_))
+        ));
+        assert!(tmp.path().join("algod.pid").exists(), "pid file must stay");
     }
 
     #[test]
@@ -563,6 +644,26 @@ mod tests {
             std::thread::sleep(Duration::from_millis(200));
             assert!(!data.join("algod.pid").exists(), "pid file removed after SIGKILL");
             let _ = pid;
+        }
+
+        #[test]
+        fn a_process_owned_by_someone_else_still_counts_as_alive() {
+            // pid 1 exists on every unix box; unprivileged kill(1, 0) is EPERM
+            assert!(process_alive(1));
+        }
+
+        #[test]
+        fn a_reused_pid_that_is_not_algod_is_never_signalled() {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("data");
+            fs::create_dir(&data).unwrap();
+            // this very test process is alive and is not an algod
+            let me = std::process::id();
+            fs::write(data.join("algod.pid"), format!("{me}\n")).unwrap();
+            let nc = controller(&data);
+            assert_eq!(nc.stop_algod(), Ok(()), "treated as a stale pid file");
+            assert!(!data.join("algod.pid").exists());
+            assert!(process_alive(i64::from(me)), "must not have been signalled");
         }
 
         #[test]
