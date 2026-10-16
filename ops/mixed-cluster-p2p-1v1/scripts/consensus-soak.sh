@@ -26,6 +26,10 @@
 # Env:
 #   ROUNDS                 rounds to soak                    (default 100)
 #   SOAK_STALL_TIMEOUT     abort if no node advances for Ns   (default 90)
+#   GENESIS_SETTLE_TIMEOUT allowance for the FIRST block, which needs
+#                          several agreement periods because the two
+#                          nodes cannot start in the same instant
+#                          (issue #1987)                       (default 300)
 #   LAG_TOLERANCE          max round spread across 2 nodes    (default 5)
 #   SKIP_START=1            use an already-running cluster
 #   KEEP_CLUSTER=1          leave the cluster up on exit
@@ -39,6 +43,7 @@ ROOT="$(cd "$HERE/.." && pwd)"
 
 ROUNDS="${ROUNDS:-100}"
 SOAK_STALL_TIMEOUT="${SOAK_STALL_TIMEOUT:-90}"
+GENESIS_SETTLE_TIMEOUT="${GENESIS_SETTLE_TIMEOUT:-300}"
 LAG_TOLERANCE="${LAG_TOLERANCE:-5}"
 SKIP_START="${SKIP_START:-0}"
 KEEP_CLUSTER="${KEEP_CLUSTER:-0}"
@@ -93,6 +98,9 @@ except Exception:
     print('parse-error')
 " | tr -d '\r'
 }
+
+# shellcheck source=genesis_settle.sh
+source "$HERE/genesis_settle.sh"
 
 rust_account() {
     docker logs "$RUST_CONTAINER" 2>&1 \
@@ -151,6 +159,17 @@ record "rust_account_discovered" pass "$RUST_ACCOUNT"
 
 BASELINE_ROUND="$(node_round 5101)"
 echo "==> baseline round (go-node-1): $BASELINE_ROUND"
+
+# -- 1b. Genesis settle (issue #1987) --------------------------------------
+# Round 1 needs both nodes' votes, which miss each other in period 0 because
+# the nodes start seconds apart; the pair settles after a few periods (60-110 s
+# measured). Give that its own allowance so the collector's stall timeout
+# below only judges the steady state.
+if settle_secs="$(wait_for_first_block 5101 "$GENESIS_SETTLE_TIMEOUT")"; then
+    record "genesis_settled" pass "first block after ${settle_secs}s (allowance ${GENESIS_SETTLE_TIMEOUT}s)"
+else
+    record "genesis_settled" fail "no first block within ${settle_secs}s (allowance ${GENESIS_SETTLE_TIMEOUT}s) -- the 1-1 network never closed round 1"
+fi
 
 # -- 2. Soak ---------------------------------------------------------------
 SOAK_JSONL="$OUT_DIR/soak.jsonl"
