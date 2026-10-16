@@ -87,7 +87,7 @@ teardown() {
 
 node_round() {
     local body
-    body="$(curl -sf -H "X-Algo-API-Token: $ALGOD_TOKEN" \
+    body="$(curl -sf --max-time 5 -H "X-Algo-API-Token: $ALGOD_TOKEN" \
         "http://127.0.0.1:$1/v2/status" 2>/dev/null || true)"
     [ -z "$body" ] && { echo "unreachable"; return; }
     printf '%s' "$body" | python3 -c "
@@ -165,7 +165,9 @@ echo "==> baseline round (go-node-1): $BASELINE_ROUND"
 # the nodes start seconds apart; the pair settles after a few periods (60-110 s
 # measured). Give that its own allowance so the collector's stall timeout
 # below only judges the steady state.
+SETTLED=0
 if settle_secs="$(wait_for_first_block 5101 "$GENESIS_SETTLE_TIMEOUT")"; then
+    SETTLED=1
     record "genesis_settled" pass "first block after ${settle_secs}s (allowance ${GENESIS_SETTLE_TIMEOUT}s)"
 else
     record "genesis_settled" fail "no first block within ${settle_secs}s (allowance ${GENESIS_SETTLE_TIMEOUT}s) -- the 1-1 network never closed round 1"
@@ -180,9 +182,16 @@ print((datetime.datetime.now(datetime.timezone.utc)
        - datetime.timedelta(minutes=10)).strftime('%Y-%m-%dT%H:%M:%SZ'))
 " | tr -d '\r')"
 soak_rc=0
-"$HERE/soak.sh" --rounds "$ROUNDS" --out "$SOAK_JSONL" \
-    --stall-timeout "$SOAK_STALL_TIMEOUT" \
-    > "$OUT_DIR/soak.log" 2>&1 || soak_rc=$?
+if [ "$SETTLED" = "1" ]; then
+    "$HERE/soak.sh" --rounds "$ROUNDS" --out "$SOAK_JSONL" \
+        --stall-timeout "$SOAK_STALL_TIMEOUT" \
+        > "$OUT_DIR/soak.log" 2>&1 || soak_rc=$?
+else
+    # the network never closed round 1: another stall timeout on top would
+    # only delay the verdict
+    soak_rc=99
+    : > "$OUT_DIR/soak.log"
+fi
 if [ "$soak_rc" -eq 0 ]; then
     record "soak_completed" pass "$ROUNDS rounds observed (see $SOAK_JSONL)"
 else

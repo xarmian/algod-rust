@@ -210,7 +210,7 @@ do_restart() {  # do_restart <graceful|kill>
             fi
             sleep 0.2
         done
-        docker start "$RUST_CONTAINER" >/dev/null 2>&1 || true
+        docker start "$RUST_CONTAINER" >/dev/null || true
         local confirm_deadline=$(( $(date +%s) + 20 ))
         while [ "$(date +%s)" -lt "$confirm_deadline" ]; do
             if [ "$(docker inspect -f '{{.State.Running}}' "$RUST_CONTAINER" 2>/dev/null)" = "true" ]; then
@@ -220,6 +220,7 @@ do_restart() {  # do_restart <graceful|kill>
             sleep 0.5
         done
         echo "docker kill -s KILL + docker start (container did not report Running)"
+        return 1
     fi
 }
 

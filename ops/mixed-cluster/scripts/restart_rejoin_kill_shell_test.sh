@@ -36,6 +36,7 @@ REVIVE_AT_MS=-1      # when the restart policy "revives" the container (-1: neve
 KILLED_AT_MS=-1
 STARTED_AT_MS=-1
 START_CALLS=0
+START_FAILS=0        # 1: `docker start` leaves the container not running
 
 date() {  # only `date +%s` is used by do_restart
     echo $(( FAKE_MS / 1000 ))
@@ -52,7 +53,7 @@ docker() {
         start)
             START_CALLS=$(( START_CALLS + 1 ))
             STARTED_AT_MS=$FAKE_MS
-            RUNNING=true
+            [ "$START_FAILS" = 1 ] || RUNNING=true
             ;;
         inspect)
             if [ "$REVIVE_AT_MS" -ge 0 ] && [ "$FAKE_MS" -ge "$REVIVE_AT_MS" ]; then RUNNING=true; fi
@@ -79,6 +80,7 @@ run_case() {  # run_case <script> <revive_after_ms|never> -> sets OUT
     FAKE_MS=1000000
     if [ "$revive" = never ]; then REVIVE_AT_MS=-1; else REVIVE_AT_MS=$(( FAKE_MS + revive )); fi
     do_restart kill > "$TMP/out.txt"
+    RC=$?
     OUT="$(cat "$TMP/out.txt")"
 }
 
@@ -102,6 +104,14 @@ for harness in ops/mixed-cluster ops/mixed-cluster-p2p; do
     run_case "$script" 1000
     check "$name: no docker start when the policy revived it" 0 "$START_CALLS"
     check "$name: reports the policy revival" "docker kill -s KILL (restart policy revived it)" "$OUT"
+
+    # 3. `docker start` does not bring the container up: fail loudly instead of
+    #    carrying on with a dead node.
+    START_FAILS=1
+    run_case "$script" never
+    START_FAILS=0
+    check "$name: a container that never comes up is a failure" 1 "$RC"
+    check "$name: reports it" "docker kill -s KILL + docker start (container did not report Running)" "$OUT"
 done
 
 if [ "$FAILS" -ne 0 ]; then
