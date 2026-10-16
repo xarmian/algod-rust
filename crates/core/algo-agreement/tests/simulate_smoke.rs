@@ -95,7 +95,29 @@ fn zero_after_shutdown_does_not_block_the_service() {
     });
     assert!(
         done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
-        "Clock::zero() blocked after InstantClock::shutdown() -- the service thread          would never exit and handle.shutdown() would hang"
+        "Clock::zero() blocked after InstantClock::shutdown(): the service thread would never \n         exit and handle.shutdown() would hang"
+    );
+}
+
+/// The other ordering: `zero()` is already parked on the rendezvous when
+/// `shutdown()` runs; it must be released too (a clock is single-use after
+/// `shutdown()`, so a stale buffered `Z0` token is never observed).
+#[test]
+fn zero_blocked_before_shutdown_is_released() {
+    let clock = InstantClock::new();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let c = Arc::clone(&clock);
+    thread::spawn(move || {
+        use algo_agreement::Clock;
+        c.zero();
+        let _ = done_tx.send(());
+    });
+    // let the thread reach the blocking Z1 send
+    thread::sleep(Duration::from_millis(200));
+    clock.shutdown();
+    assert!(
+        done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+        "a zero() parked before shutdown() was never released"
     );
 }
 
