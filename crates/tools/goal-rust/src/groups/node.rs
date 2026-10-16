@@ -30,7 +30,14 @@ use crate::unimplemented;
 #[derive(Subcommand, Debug)]
 pub enum NodeCmd {
     /// Catchup the Algorand node to a specific catchpoint.
-    Catchup,
+    ///
+    /// Catchup allows making large jumps over round ranges without the need
+    /// to incrementally validate each individual round. Using external
+    /// catchpoints is not a secure practice and should not be done for
+    /// consensus participating nodes. If no catchpoint is provided, this
+    /// command attempts to lookup the latest catchpoint from
+    /// algorand-catchpoints.s3.us-east-2.amazonaws.com.
+    Catchup(CatchupArgs),
     /// Clone the specified node to create another node.
     Clone,
     /// Create a node at the desired data directory for the desired
@@ -44,7 +51,11 @@ pub enum NodeCmd {
     /// Print the last round number.
     Lastround,
     /// Get a snapshot of current pending transactions on this node.
-    Pendingtxns,
+    ///
+    /// Cut off at MAX transactions (-m), default 0. If MAX=0, fetches as
+    /// many transactions as possible. Transactions are printed in the REST
+    /// API's JSON form (DIV-002).
+    Pendingtxns(PendingTxnsArgs),
     /// Stop, and then start, the specified Algorand node.
     Restart(StartFlags),
     /// Initialize the specified Algorand node.
@@ -53,8 +64,8 @@ pub enum NodeCmd {
     Status(StatusArgs),
     /// Stop the specified Algorand node.
     Stop,
-    /// Waits for the node to make progress.
-    Wait,
+    /// Waits for the node to make progress, which includes catching up.
+    Wait(WaitArgs),
 }
 
 /// Flags shared by `goal node start` and `goal node restart`
@@ -75,6 +86,40 @@ pub struct StartFlags {
     pub telemetry: Option<String>,
 }
 
+/// `catchupCmd` flags (`cmd/goal/node.go:117-119`).
+#[derive(Args, Debug, Default)]
+pub struct CatchupArgs {
+    /// The catchpoint label (`<round>#<hash>`); looked up when omitted.
+    pub catchpoint: Vec<String>,
+    /// Aborts the current catchup process.
+    #[arg(short = 'x', long = "abort")]
+    pub abort: bool,
+    /// Forces fast catchup with implicit catchpoint to start without a
+    /// consent prompt.
+    #[arg(long = "force")]
+    pub force: bool,
+    /// Catchup only if the catchpoint would advance the node by the
+    /// specified minimum number of rounds.
+    #[arg(short = 'm', long = "min", default_value_t = 0)]
+    pub min: u64,
+}
+
+/// `pendingTxnsCmd` flags (`cmd/goal/node.go:113`).
+#[derive(Args, Debug, Default)]
+pub struct PendingTxnsArgs {
+    /// Cap the number of txns to fetch.
+    #[arg(short = 'm', long = "maxPendingTxn", default_value_t = 0)]
+    pub max: u64,
+}
+
+/// `waitCmd` flags (`cmd/goal/node.go:114`).
+#[derive(Args, Debug)]
+pub struct WaitArgs {
+    /// Time (in seconds) to wait for node to make progress.
+    #[arg(short = 'w', long = "waittime", default_value_t = 5)]
+    pub waittime: u32,
+}
+
 #[derive(Args, Debug, Default)]
 pub struct StatusArgs {
     /// Repeat poll every N milliseconds; 0 = single shot. Mirrors
@@ -87,18 +132,18 @@ pub struct StatusArgs {
 
 pub fn run(cmd: NodeCmd) -> ExitCode {
     match cmd {
-        NodeCmd::Catchup => unimplemented("node", "catchup"),
+        NodeCmd::Catchup(a) => crate::cmd::node::run_catchup(a, datadirs_from_cli()),
         NodeCmd::Clone => unimplemented("node", "clone"),
         NodeCmd::Create => unimplemented("node", "create"),
         NodeCmd::GenerateP2pid => unimplemented("node", "generate-p2pid"),
         NodeCmd::Generatetoken => crate::cmd::node::run_generate_token(datadirs_from_cli()),
         NodeCmd::Lastround => crate::cmd::node::run_lastround(datadirs_from_cli()),
-        NodeCmd::Pendingtxns => unimplemented("node", "pendingtxns"),
+        NodeCmd::Pendingtxns(a) => crate::cmd::node::run_pendingtxns(a, datadirs_from_cli()),
         NodeCmd::Restart(f) => crate::cmd::node::run_restart(f, datadirs_from_cli()),
         NodeCmd::Start(f) => crate::cmd::node::run_start(f, datadirs_from_cli()),
         NodeCmd::Status(args) => crate::cmd::node::run_status(args, datadirs_from_cli()),
         NodeCmd::Stop => crate::cmd::node::run_stop(datadirs_from_cli()),
-        NodeCmd::Wait => unimplemented("node", "wait"),
+        NodeCmd::Wait(a) => crate::cmd::node::run_wait(a, datadirs_from_cli()),
     }
 }
 

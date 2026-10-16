@@ -53,6 +53,7 @@ consensus-compatible. It exists for three readers:
 | ID | Title | Area | Status | Since | Wire / consensus impact | algod-rust files | Upstream files | Proof |
 |---|---|---|---|---|---|---|---|---|
 | DIV-001 | Falcon-1024 `det1024` implemented in pure Rust; vendored C kept as a runtime-selectable backend (`config.json` `FalconBackend`) | crypto / state proofs / PQ accounts / AVM `falcon_verify` | landed | 2026-10-14 | none (bit-identical keys, signatures, verify decisions, CT conversion) | `crates/core/algo-falcon/`, `crates/node/algo-config/src/lib.rs` (`FalconBackend`), `bin/algod-rust/src/commands/node.rs`, `crates/tools/algokey-rust` | `crypto/falconWrapper.go`, module `github.com/algorand/falcon` v0.1.0 (`falcon.go`, `deterministic.c`, Pornin's reference C) | Go-generated vector corpus diffed in CI, per-function differential tests vs the vendored C, fuzz target (epic #1926) |
+| DIV-002 | `goal node pendingtxns` prints each pending transaction in the REST API's JSON form instead of Go's `encoding/json` dump of its decoded `SignedTxn` structs | goal-rust CLI output | landed | 2026-10-17 | none (client-side formatting of data the node already serves) | `crates/tools/goal-rust/src/cmd/node.rs` (`format_pending_txns`) | `cmd/goal/node.go` (`pendingTxnsCmd`), `libgoal/libgoal.go` (`GetParsedPendingTransactions`) | unit test of the exact text for the empty and non-empty pool, mock-node end-to-end test |
 
 ## Entries
 
@@ -118,3 +119,42 @@ one trap is floating point: Go's `float64` is strict IEEE-754 for
 statements), `math.Sqrt` is correctly rounded, and `expm_p63` must be the
 fixed-point integer version. See `docs/falcon/FALCON_RUST_PORT.md` once it
 lands.
+
+### DIV-002 — `goal node pendingtxns` prints the REST JSON form of each transaction
+
+**Status:** landed (#1992).
+
+**What go-algorand does.** `goal node pendingtxns` fetches
+`/v2/transactions/pending?format=msgpack`, decodes the response into Go
+`transactions.SignedTxn` structs and prints each one with
+`json.MarshalIndent(txn, "", "    ")`. Those structs carry only `codec:` tags,
+so `encoding/json` falls back to the Go field names (`Sig`, `Msig`, `Txn`,
+`Type`, `Header`, ...) and renders byte arrays and addresses according to
+each type's `MarshalText` / array rules. The shape is an accident of the Go
+struct layout rather than a documented format.
+
+**What algod-rust does instead.** It fetches `format=json` and prints each
+entry of `top-transactions` exactly as the REST API serves it (lowercase
+canonical keys such as `txn`, `sig`, `type`), indented with the same four
+spaces. The header line (`Pending Transactions (Truncated max=N, Total in
+pool=M): `) and the `None` line for an empty pool are byte-identical to go.
+
+**What is identical.** The header, the empty-pool text, the `-m/--maxPendingTxn`
+flag and its semantics, the 4-space indentation, one document per
+transaction, error messages and exit codes.
+
+**Why.** Reproducing `encoding/json` over Go's struct layout would mean
+re-implementing the Go field-name and `MarshalText` rules for every
+transaction type to print data the node already serves in a documented,
+stable JSON form that other tooling (the SDKs, `goal clerk inspect`) uses.
+
+**How parity is proven.** Not applicable to the transaction bodies (that is
+the divergence); `format_pending_txns` has unit tests for the header, the
+empty-pool text and the indentation, and `node_ops_e2e.rs` runs the command
+against a mock node.
+
+**How to switch back.** There is no switch; the command line is unchanged.
+
+**How go-algorand could port it.** Print `GetRawPendingTransactions` with
+`format=json` instead of decoding to structs, if a stable JSON form is
+preferred over the struct dump.

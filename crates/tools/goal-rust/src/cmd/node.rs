@@ -366,6 +366,340 @@ fn preflight_start(flags: &crate::groups::node::StartFlags) -> Result<(), String
     Ok(())
 }
 
+// ---- catchup / wait / pendingtxns (issue #1992) ----------------------------------
+
+const ERROR_TOO_MANY_CATCHPOINT_LABELS: &str = "The catchup command expect a single catchpoint";
+const ERROR_CATCHPOINT_LABEL_PARSING_FAILED: &str = "The provided catchpoint is not a valid one";
+const ERROR_CATCHPOINT_LABEL_MISSING: &str = "A catchpoint argument is needed: ";
+const ERROR_UNABLE_TO_LOOKUP_CATCHPOINT_LABEL: &str = "Unable to fetch catchpoint label";
+const ERROR_ABORTED_PER_USER_REQUEST: &str = "Aborted";
+const CATCHPOINT_URL: &str =
+    "https://algorand-catchpoints.s3.us-east-2.amazonaws.com/channel/{}/latest.catchpoint";
+const NODE_CONFIRM_IMPLICIT_CATCHPOINT: &str = "Fast catchup to {} is about to start.\nUsing external catchpoints is not a secure practice and should not be done for consensus participating nodes.\nType 'yes' to accept the risk and continue: ";
+const INFO_NODE_PENDING_TXNS_DESCRIPTION: &str =
+    "Pending Transactions (Truncated max={}, Total in pool={}): ";
+const INFO_NODE_NO_PENDING_TXNS_DESCRIPTION: &str = "None";
+const ERROR_TIMED_OUT_WAITING: &str = "Timed out waiting for node to make progress";
+
+/// go: `catchpointCmdArgument` -- at most one positional, and it must be a
+/// well-formed catchpoint label. Returns the label, if given.
+pub fn validate_catchpoint_args(args: &[String]) -> Result<Option<String>, String> {
+    let mut label: Option<String> = None;
+    for arg in args {
+        if !is_valid_catchpoint_label(arg) {
+            return Err(ERROR_CATCHPOINT_LABEL_PARSING_FAILED.to_string());
+        }
+        if label.is_some() {
+            return Err(ERROR_TOO_MANY_CATCHPOINT_LABELS.to_string());
+        }
+        label = Some(arg.clone());
+    }
+    Ok(label)
+}
+
+/// go: `fmt.Sprintf(catchpointURL, genesis)` with `genesis` the part of the
+/// genesis ID before the first `-`.
+pub fn catchpoint_lookup_url(genesis_id: &str) -> String {
+    let channel = genesis_id.split('-').next().unwrap_or("");
+    CATCHPOINT_URL.replacen("{}", channel, 1)
+}
+
+/// go: `submitForm(... "/v2/catchup/<label>", catchupParams{Min})` -- `min`
+/// is only sent when non-zero. The label's `#` is percent-encoded as go's
+/// `url.URL{Path: ...}` does; sent raw it would start a URL fragment and cut
+/// off the hash and the query.
+pub fn catchup_path(label: &str, min: u64) -> String {
+    let label = label.replace('#', "%23");
+    if min == 0 {
+        format!("/v2/catchup/{label}")
+    } else {
+        format!("/v2/catchup/{label}?min={min}")
+    }
+}
+
+/// The text `goal node pendingtxns` prints for the REST API's
+/// `{"top-transactions": [...], "total-transactions": N}` document.
+pub fn format_pending_txns(doc: &serde_json::Value, max: u64) -> String {
+    let total = doc
+        .get("total-transactions")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let mut out = format_message(
+        INFO_NODE_PENDING_TXNS_DESCRIPTION,
+        &[&max.to_string(), &total.to_string()],
+    );
+    out.push('\n');
+    let txns = doc
+        .get("top-transactions")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if txns.is_empty() {
+        out.push_str(INFO_NODE_NO_PENDING_TXNS_DESCRIPTION);
+        out.push('\n');
+    }
+    for txn in txns {
+        // DIVERGENCE DIV-002: go prints `json.MarshalIndent` of its decoded
+        // SignedTxn structs (Go field names); this prints the REST API's JSON
+        // form of the same transaction, indented the same way (4 spaces).
+        out.push_str(&indent4(txn));
+        out.push('\n');
+    }
+    out
+}
+
+fn indent4(v: &serde_json::Value) -> String {
+    use serde::Serialize as _;
+    let mut buf = Vec::new();
+    let fmt = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+    let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
+    if v.serialize(&mut ser).is_err() {
+        return v.to_string();
+    }
+    String::from_utf8(buf).unwrap_or_else(|_| v.to_string())
+}
+
+fn runtime() -> Result<tokio::runtime::Runtime, ExitCode> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            eprintln!("tokio runtime: {e}");
+            ExitCode::from(1)
+        })
+}
+
+fn http() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .unwrap_or_default()
+}
+
+fn node_status_error(e: &str) -> String {
+    format_message(ERROR_NODE_STATUS, &[e])
+}
+
+/// Port of `catchupCmd` (`node.go:155-212`).
+pub fn run_catchup(args: crate::groups::node::CatchupArgs, cli_d: Vec<PathBuf>) -> ExitCode {
+    let label_arg = match validate_catchpoint_args(&args.catchpoint) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let dirs = match crate::data_dir::resolve_data_dirs(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let rt = match runtime() {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    let multi = dirs.len() > 1;
+    for dir in &dirs {
+        if multi {
+            println!("{}{}]", crate::data_dir::INFO_DATA_DIR_FMT, dir.display());
+        }
+        let Ok(client) = build_client(dir) else {
+            return ExitCode::from(1);
+        };
+        let Ok((url, token)) = endpoint(dir) else {
+            return ExitCode::from(1);
+        };
+        let http = http();
+
+        if args.abort {
+            // go: libgoal AbortCatchup -- only when a catchup is running
+            let status = match rt.block_on(client.get_status()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("{}", node_status_error(&e.to_string()));
+                    return ExitCode::from(1);
+                }
+            };
+            let Some(label) = status.catchpoint.filter(|c| !c.is_empty()) else {
+                continue; // not catching up: no error
+            };
+            // (the request future must be created inside the runtime: reqwest's
+            // timeout needs the reactor at construction)
+            let res = rt.block_on(async {
+                http.delete(format!("{url}{}", catchup_path(&label, 0)))
+                    .header("X-Algo-API-Token", &token)
+                    .send()
+                    .await
+            });
+            if let Err(e) = res.and_then(reqwest::Response::error_for_status) {
+                eprintln!("{}", node_status_error(&e.to_string()));
+                return ExitCode::from(1);
+            }
+            continue;
+        }
+
+        let catchpoint = match &label_arg {
+            Some(l) => l.clone(),
+            None => {
+                // lookup the latest catchpoint for this network
+                let versions = match rt.block_on(client.get_versions()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("{}", node_status_error(&e.to_string()));
+                        return ExitCode::from(1);
+                    }
+                };
+                let lookup = catchpoint_lookup_url(&versions.genesis_id);
+                let label = match rt.block_on(get_missing_catchpoint_label(&lookup)) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!(
+                            "{ERROR_CATCHPOINT_LABEL_MISSING}{ERROR_UNABLE_TO_LOOKUP_CATCHPOINT_LABEL}: {e}"
+                        );
+                        return ExitCode::from(1);
+                    }
+                };
+                if !args.force {
+                    print!("{}", format_message(NODE_CONFIRM_IMPLICIT_CATCHPOINT, &[&label]));
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    let mut line = String::new();
+                    let _ = std::io::stdin().read_line(&mut line);
+                    if line.replace('\n', "") != "yes" {
+                        eprintln!("{ERROR_ABORTED_PER_USER_REQUEST}");
+                        return ExitCode::from(1);
+                    }
+                }
+                label
+            }
+        };
+
+        let sent = rt.block_on(async {
+            http.post(format!("{url}{}", catchup_path(&catchpoint, args.min)))
+                .header("X-Algo-API-Token", &token)
+                .send()
+                .await
+        });
+        let resp = match sent {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("{}", node_status_error(&e.to_string()));
+                return ExitCode::from(1);
+            }
+        };
+        let status = resp.status();
+        let body = rt.block_on(resp.text()).unwrap_or_default();
+        if !status.is_success() {
+            eprintln!("{}", node_status_error(&format!("HTTP {status}: {}", body.trim())));
+            return ExitCode::from(1);
+        }
+        let message = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("catchup-message").and_then(|m| m.as_str().map(String::from)))
+            .unwrap_or_default();
+        if message != catchpoint {
+            println!("node response: {message}");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Port of `waitCmd` (`node.go:618-647`): exit 0 as soon as the last round
+/// differs from the first one read, error after `waittime` seconds.
+pub fn run_wait(args: crate::groups::node::WaitArgs, cli_d: Vec<PathBuf>) -> ExitCode {
+    let dir = match crate::data_dir::ensure_single_data_dir(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let Ok(client) = build_client(&dir) else {
+        return ExitCode::from(1);
+    };
+    let rt = match runtime() {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    let start_round = match rt.block_on(client.get_status()) {
+        Ok(s) => s.last_round,
+        Err(e) => {
+            eprintln!("{}", node_status_error(&e.to_string()));
+            return ExitCode::from(1);
+        }
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(u64::from(args.waittime));
+    loop {
+        if std::time::Instant::now() >= deadline {
+            eprintln!("{ERROR_TIMED_OUT_WAITING}");
+            return ExitCode::from(1);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        match rt.block_on(client.get_status()) {
+            Ok(s) if s.last_round != start_round => return ExitCode::SUCCESS,
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("{}", node_status_error(&e.to_string()));
+                return ExitCode::from(1);
+            }
+        }
+    }
+}
+
+/// Port of `pendingTxnsCmd` (`node.go:584-616`).
+pub fn run_pendingtxns(args: crate::groups::node::PendingTxnsArgs, cli_d: Vec<PathBuf>) -> ExitCode {
+    let dirs = match crate::data_dir::resolve_data_dirs(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let rt = match runtime() {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    let multi = dirs.len() > 1;
+    for dir in &dirs {
+        if multi {
+            println!("{}{}]", crate::data_dir::INFO_DATA_DIR_FMT, dir.display());
+        }
+        let (url, token) = match endpoint(dir) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("{}", node_status_error(&e));
+                return ExitCode::from(1);
+            }
+        };
+        let fetched = rt.block_on(async {
+            let resp = http()
+                .get(format!(
+                    "{url}/v2/transactions/pending?max={}&format=json",
+                    args.max
+                ))
+                .header("X-Algo-API-Token", &token)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            let status = resp.status();
+            let body = resp.text().await.map_err(|e| e.to_string())?;
+            if !status.is_success() {
+                return Err(format!("HTTP {status}: {}", body.trim()));
+            }
+            serde_json::from_str::<serde_json::Value>(&body).map_err(|e| e.to_string())
+        });
+        match fetched {
+            Ok(doc) => print!("{}", format_pending_txns(&doc, args.max)),
+            Err(e) => {
+                eprintln!("{}", node_status_error(&e));
+                return ExitCode::from(1);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 /// Port of `lastroundCmd` (`node.go:519-534`). Per-data-dir, calls
 /// `client.CurrentRound()` and prints `{round}\n`.
 pub fn run_lastround(cli_d: Vec<PathBuf>) -> ExitCode {
@@ -587,7 +921,6 @@ fn write_token(path: &Path, token: &str) -> std::io::Result<()> {
 /// scope here. Ported ahead of that work so `TestGetMissingCatchpointLabel`
 /// parity is pinned now; the future `catchup` port should call this
 /// directly rather than re-deriving it.
-#[allow(dead_code)]
 pub(crate) async fn get_missing_catchpoint_label(url: &str) -> Result<String, String> {
     let resp = reqwest::get(url).await.map_err(|e| e.to_string())?;
     let status = resp.status();
@@ -623,14 +956,10 @@ fn is_valid_catchpoint_label(label: &str) -> bool {
         .is_ok_and(|bytes| bytes.len() <= 32)
 }
 
-fn build_client(data_dir: &Path) -> Result<AlgodClient, ()> {
-    let net = match read_algod_net(data_dir) {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("{}", format_message(ERROR_NODE_STATUS, &[&e.to_string()]));
-            return Err(());
-        }
-    };
+/// go: `ensureAlgodClient` -- the REST base URL from `algod.net` and the
+/// admin token (else the regular one).
+fn endpoint(data_dir: &Path) -> Result<(String, String), String> {
+    let net = read_algod_net(data_dir).map_err(|e| e.to_string())?;
     let url = if net.starts_with("http://") || net.starts_with("https://") {
         net
     } else {
@@ -638,15 +967,19 @@ fn build_client(data_dir: &Path) -> Result<AlgodClient, ()> {
     };
     let token = match read_algod_admin_token(data_dir) {
         Ok(t) if !t.is_empty() => t,
-        _ => match read_algod_token(data_dir) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("{}", format_message(ERROR_NODE_STATUS, &[&e.to_string()]));
-                return Err(());
-            }
-        },
+        _ => read_algod_token(data_dir).map_err(|e| e.to_string())?,
     };
-    Ok(AlgodClient::new(url, token))
+    Ok((url, token))
+}
+
+fn build_client(data_dir: &Path) -> Result<AlgodClient, ()> {
+    match endpoint(data_dir) {
+        Ok((url, token)) => Ok(AlgodClient::new(url, token)),
+        Err(e) => {
+            eprintln!("{}", format_message(ERROR_NODE_STATUS, &[&e]));
+            Err(())
+        }
+    }
 }
 
 /// Pure formatter — covers the three Go branches at `node.go:455-516`.
@@ -1143,5 +1476,54 @@ mod tests {
                 "{bad}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn catchpoint_arguments_are_validated_like_gos_catchpoint_cmd_argument() {
+        let good = "6500000#2YMHX6VN6SNZXF5HD6JDBTVCA4F2AE4PHMEHLFL6Q2X7N3NQX4MA".to_string();
+        assert_eq!(validate_catchpoint_args(&[]), Ok(None));
+        assert_eq!(
+            validate_catchpoint_args(std::slice::from_ref(&good)),
+            Ok(Some(good.clone()))
+        );
+        assert_eq!(
+            validate_catchpoint_args(&["nonsense".to_string()]),
+            Err("The provided catchpoint is not a valid one".to_string())
+        );
+        assert_eq!(
+            validate_catchpoint_args(&[good.clone(), good]),
+            Err("The catchup command expect a single catchpoint".to_string())
+        );
+    }
+
+    #[test]
+    fn the_lookup_url_and_catchup_path_match_go() {
+        assert_eq!(
+            catchpoint_lookup_url("mainnet-v1.0"),
+            "https://algorand-catchpoints.s3.us-east-2.amazonaws.com/channel/mainnet/latest.catchpoint"
+        );
+        assert_eq!(
+            catchpoint_lookup_url("testnet-v1.0"),
+            "https://algorand-catchpoints.s3.us-east-2.amazonaws.com/channel/testnet/latest.catchpoint"
+        );
+        assert_eq!(catchup_path("1#AB", 0), "/v2/catchup/1%23AB");
+        assert_eq!(catchup_path("1#AB", 50), "/v2/catchup/1%23AB?min=50");
+    }
+
+    #[test]
+    fn pending_txns_print_gos_header_none_and_indented_json() {
+        let empty = serde_json::json!({"top-transactions": [], "total-transactions": 0});
+        assert_eq!(
+            format_pending_txns(&empty, 0),
+            "Pending Transactions (Truncated max=0, Total in pool=0): \nNone\n"
+        );
+        let two = serde_json::json!({
+            "top-transactions": [{"txn": {"type": "pay"}}],
+            "total-transactions": 7
+        });
+        assert_eq!(
+            format_pending_txns(&two, 1),
+            "Pending Transactions (Truncated max=1, Total in pool=7): \n{\n    \"txn\": {\n        \"type\": \"pay\"\n    }\n}\n"
+        );
     }
 }
