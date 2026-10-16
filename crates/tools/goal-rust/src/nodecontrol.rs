@@ -360,9 +360,33 @@ fn process_alive(pid: i64) -> bool {
 #[cfg(unix)]
 fn looks_like_algod(pid: i64) -> bool {
     match fs::read(format!("/proc/{pid}/cmdline")) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).contains("algod"),
+        Ok(bytes) => cmdline_is_algod(&bytes),
         Err(_) => true,
     }
+}
+
+/// Is the NUL-separated `/proc/<pid>/cmdline` an algod? Judged by the
+/// executable's file name only (`algod`, `algod-rust`, ...): matching anywhere
+/// in the line would also match a checkout path such as `.../algod-rust/...`
+/// or a test name. A script run through an interpreter is judged by the
+/// script's name.
+#[cfg(unix)]
+fn cmdline_is_algod(cmdline: &[u8]) -> bool {
+    let mut args = cmdline
+        .split(|b| *b == 0)
+        .filter(|a| !a.is_empty())
+        .map(|a| String::from_utf8_lossy(a).to_string());
+    let base = |a: &str| a.rsplit('/').next().unwrap_or("").to_string();
+    let Some(first) = args.next() else {
+        return false;
+    };
+    let mut name = base(&first);
+    if ["sh", "bash", "dash", "env", "python", "python3"].contains(&name.as_str()) {
+        // skip options of the interpreter, take the script
+        let script = args.find(|a| !a.starts_with('-'));
+        name = script.map(|a| base(&a)).unwrap_or_default();
+    }
+    name.starts_with("algod")
 }
 
 #[cfg(unix)]
@@ -465,6 +489,33 @@ mod tests {
         addr
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn only_a_process_named_algod_is_taken_for_algod() {
+        let line = |parts: &[&str]| parts.join("\0").into_bytes();
+        for yes in [
+            line(&["/usr/local/bin/algod", "-d", "/data"]),
+            line(&["algod-rust", "algod", "-d", "/data"]),
+            line(&["/algod/bin/algod", "-o"]),
+            line(&["/bin/sh", "/tmp/algod-fake", "-d", "/data"]),
+            line(&["sh", "-e", "/opt/algod", "-d", "/d"]),
+        ] {
+            assert!(cmdline_is_algod(&yes), "{:?}", String::from_utf8_lossy(&yes));
+        }
+        for no in [
+            // the checkout path and the test name both contain "algod"
+            line(&[
+                "/home/runner/work/algod-rust/algod-rust/target/debug/deps/goal_rust-1a2b",
+                "nodecontrol::tests::a_reused_pid_that_is_not_algod",
+            ]),
+            line(&["/usr/bin/vim", "algod.log"]),
+            line(&["bash", "-lc", "tail -f /algod/data/node.log"]),
+            Vec::new(),
+        ] {
+            assert!(!cmdline_is_algod(&no), "{:?}", String::from_utf8_lossy(&no));
+        }
+    }
+
     #[test]
     fn a_pid_must_be_a_positive_process_id() {
         let tmp = tempfile::tempdir().unwrap();
@@ -563,7 +614,7 @@ mod tests {
         /// SIGTERM (removing its pid file, as algod does) -- or ignores SIGTERM
         /// when `ignore_term` is set.
         fn fake_daemon(dir: &Path, ignore_term: bool) -> PathBuf {
-            let script = dir.join("fake-algod");
+            let script = dir.join("algod-fake");
             let trap = if ignore_term {
                 "trap '' TERM".to_string()
             } else {
