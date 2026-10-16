@@ -45,6 +45,27 @@ pub mod sync;
 pub(crate) mod test_support;
 pub mod validate;
 
+/// Block until the process is asked to stop: Ctrl+C (SIGINT) or, on unix,
+/// SIGTERM. SIGTERM is what `docker stop`, systemd and `goal node stop` send;
+/// go's `algod` shuts down gracefully on it (closes its ledger, removes
+/// `algod.pid`), whereas the default SIGTERM disposition kills the process
+/// with no cleanup (issue #1990).
+pub async fn wait_for_shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate())?;
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => r,
+            _ = term.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
 /// Resolve a network name to an (algod_url, algod_token, network_name) tuple.
 ///
 /// Known networks ("mainnet", "testnet") use public Nodely endpoints.

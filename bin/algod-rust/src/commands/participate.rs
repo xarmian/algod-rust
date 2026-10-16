@@ -6802,9 +6802,9 @@ pub async fn run(
     );
 
     // -----------------------------------------------------------------------
-    // 7. Wait for shutdown signal (Ctrl+C).
+    // 7. Wait for a shutdown signal (Ctrl+C or SIGTERM).
     // -----------------------------------------------------------------------
-    tokio::signal::ctrl_c().await?;
+    super::wait_for_shutdown_signal().await?;
 
     info!("shutting down consensus participation...");
 

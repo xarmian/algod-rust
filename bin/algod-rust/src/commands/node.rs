@@ -666,7 +666,7 @@ async fn run_start(
     //    #937), rather than a directly-held `JoinHandle` — `pause()`
     //    cancels and joins it exactly like the old direct-join code did.
     // -----------------------------------------------------------------------
-    if let Err(e) = tokio::signal::ctrl_c().await {
+    if let Err(e) = super::wait_for_shutdown_signal().await {
         warn!("failed to listen for Ctrl-C ({e}); shutting down");
     }
     info!("shutdown requested");
