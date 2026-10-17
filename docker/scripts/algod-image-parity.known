@@ -1,0 +1,3 @@
+data_layout|go's image also has consensus.json (written by goal network create), goal.cache (goal's cache) and logging.config (telemetry); algod-rust writes none of them (no telemetry, no consensus overrides, no goal cache)
+goal_kmd_lifecycle|right after 'goal kmd stop', go's 'goal kmd start' says 'kmd is already running' (its new kmd loses a race against the exiting one); algod-rust starts a fresh kmd and says 'Successfully started kmd'
+goal_node_lifecycle|in a DEV_MODE container go's 'goal node stop' fails with 'Cannot kill node: node was killed' (rc 1); algod-rust stops the node ('The node was successfully stopped.', rc 0)

@@ -51,6 +51,34 @@ Build it with `docker build -f docker/Dockerfile --target algod .`.
 * `goal node pendingtxns` prints each transaction in the REST API's JSON form
   ([DIV-002](DIVERGENCES.md)).
 * `goal node start|restart -H` (algoh) is rejected: there is no `algoh`.
+* The data directory has no `consensus.json`, `goal.cache` or `logging.config`
+  (no consensus overrides, no goal cache, no telemetry).
+* `goal kmd start` right after `goal kmd stop` starts kmd and says
+  `Successfully started kmd` (go's says `kmd is already running` because its new
+  kmd loses a race against the exiting one).
+* `goal node stop` in a `DEV_MODE` container stops the node (go's fails with
+  `Cannot kill node: node was killed`).
+* Multi-node private-network templates are not supported yet
+  ([#2002](https://github.com/xarmian/algod-rust/issues/2002)).
+
+## Published tags
+
+The go-compatible image is published next to the `follow` image with go's tag
+scheme and an `-algod` suffix: `latest-algod`, `stable-algod`, `5.0.3-stable-algod`
+(the pinned go-algorand version), `beta-algod`, `nightly-algod`, and
+`<X.Y.Z>-algod` for releases, on `ghcr.io/xarmian/algod-rust` (and Docker Hub when
+configured). To switch from go, change `algorand/algod:5.0.3-stable` to
+`ghcr.io/xarmian/algod-rust:5.0.3-stable-algod`.
+
+## Checking parity
+
+`docker/scripts/algod-image-parity.sh <algod-rust-image> [go-image]` runs both
+images side by side (`DEV_MODE=1`, `START_KMD=1`) and diffs the data layout,
+`goal node/network status`, `goal account list`, the REST status shapes, the
+lifecycle messages and `docker restart`/`docker stop` behaviour. The known
+differences above live in `docker/scripts/algod-image-parity.known`; the
+`Docker image parity vs algorand/algod` workflow runs it on every relevant PR
+and nightly.
 
 See [DIVERGENCES.md](DIVERGENCES.md) for the register of intended differences
 and `docker/algod/run.sh` for the entrypoint itself.

@@ -31,6 +31,15 @@ cargo test --workspace
 make help          # localnet, fixtures, conformance, replay, benchmarks
 ```
 
+## Docker: drop-in for `algorand/algod`
+
+The `-algod` image tags (`ghcr.io/xarmian/algod-rust:stable-algod`, `5.0.3-stable-algod`, ...)
+honour the same environment variables, `/etc/algorand` overrides, ports and `/algod/data`
+layout as `algorand/algod`, and `goal node status|start|stop|restart|catchup`,
+`goal network ...` and `goal kmd ...` work inside the container. Switching is a change of the
+image name; see [docs/DOCKER_MIGRATION.md](docs/DOCKER_MIGRATION.md) for the (few) intentional
+differences.
+
 ## Documentation
 
 - [docs/CRATE_ARCHITECTURE.md](docs/CRATE_ARCHITECTURE.md) — workspace crate design

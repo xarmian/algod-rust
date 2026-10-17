@@ -525,7 +525,7 @@ pub fn generate_genesis_files(
     g.insert("network".into(), json!(genesis.network_name));
     g.insert("proto".into(), json!(proto));
     g.insert("rwd".into(), json!(Address(rewards_pool).to_algorand_string()));
-    g.insert("timestamp".into(), json!(0));
+    // (go omits a zero timestamp: its genesis.json has no "timestamp" key)
 
     let genesis_path = out_dir.join("genesis.json");
     let mut text = serde_json::to_string_pretty(&Value::Object(g))
@@ -739,5 +739,19 @@ mod tests {
         assert_eq!(second.part_keys_created, 0);
         assert_eq!(first.addresses["A"], second.addresses["A"]);
         assert!(String::from_utf8_lossy(&log).contains("Reusing existing wallet"));
+    }
+
+    #[test]
+    fn the_genesis_has_exactly_gos_top_level_keys() {
+        let genesis = genesis_with(&[("A", 100.0, true)]);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut log: Vec<u8> = Vec::new();
+        let out = generate_genesis_files(&genesis, tmp.path(), &mut log).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.genesis_path).unwrap()).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        // as written by `goal network create` in algorand/algod:5.0.3-stable
+        assert_eq!(keys, ["alloc", "fees", "id", "network", "proto", "rwd"]);
     }
 }

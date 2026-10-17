@@ -42,6 +42,15 @@ name: Docker Image
 #                                                  see docker/Dockerfile)
 #   ghcr.io/xarmian/algod-rust:<tag>-localnet   — `localnet` target (single
 #                                                  node dev-mode network)
+#   ghcr.io/xarmian/algod-rust:<tag>-algod      — `algod` target (issue #1994):
+#                                                  the drop-in for
+#                                                  `algorand/algod`, with go's
+#                                                  tag scheme (`latest-algod`,
+#                                                  `stable-algod`,
+#                                                  `5.0.3-stable-algod`,
+#                                                  `beta-algod`,
+#                                                  `nightly-algod`); see
+#                                                  docs/DOCKER_MIGRATION.md
 #
 # The same two images are **also** mirrored to Docker Hub, at
 # `docker.io/<DOCKERHUB_USERNAME>/algod-rust[:<tag>[-localnet]]` — same
@@ -232,7 +241,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [runtime, localnet]
+        target: [runtime, localnet, algod]
         platform: [amd64, arm64]
         include:
           # Native runners, not QEMU emulation: an emulated arm64 release
@@ -251,6 +260,8 @@ jobs:
             suffix: ""
           - target: localnet
             suffix: "-localnet"
+          - target: algod
+            suffix: "-algod"
     permissions:
       contents: read
       packages: write
@@ -352,12 +363,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [runtime, localnet]
+        target: [runtime, localnet, algod]
         include:
           - target: runtime
             suffix: ""
           - target: localnet
             suffix: "-localnet"
+          - target: algod
+            suffix: "-algod"
     permissions:
       contents: read
       packages: write
@@ -593,6 +606,13 @@ jobs:
           IMAGE="ghcr.io/${{ env.IMAGE_NAME }}:sha-$(echo "${{ github.sha }}" | cut -c1-7)"
           docker pull "$IMAGE"
           docker run --rm "$IMAGE" --version
+
+      - name: Pull the go-compatible algod image (GHCR)
+        run: |
+          IMAGE="ghcr.io/${{ env.IMAGE_NAME }}:sha-$(echo "${{ github.sha }}" | cut -c1-7)-algod"
+          docker pull "$IMAGE"
+          docker run --rm --entrypoint algod "$IMAGE" -v
+          docker run --rm --entrypoint goal "$IMAGE" --help >/dev/null
 
       - name: Log in to Docker Hub
         if: needs.prepare.outputs.has_dockerhub == 'true'

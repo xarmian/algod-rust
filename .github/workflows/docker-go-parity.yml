@@ -1,0 +1,76 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: Docker image parity vs algorand/algod
+
+# Issue #1994 (epic #1989): runs the algod-rust `algod` image and
+# `algorand/algod:<pin>` side by side with the same environment and diffs
+# what an operator observes (see docker/scripts/algod-image-parity.sh). Keeps
+# "swap only the image name" true as either side changes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      go_image:
+        description: "go-algorand image to compare against"
+        required: false
+        default: "algorand/algod:5.0.3-stable"
+  pull_request:
+    paths:
+      - "docker/algod/**"
+      - "docker/scripts/algod-image-parity.sh"
+      - "docker/scripts/algod-image-parity.known"
+      - "docker/Dockerfile"
+      - ".github/workflows/docker-go-parity.yml"
+      - "crates/tools/goal-rust/**"
+      - "crates/tools/algo-netdeploy/**"
+      - "bin/algod-rust/**"
+      - "bin/kmd-rust/**"
+      - "crates/node/algo-rest-api/**"
+      - "crates/node/algo-kmd/**"
+  schedule:
+    - cron: "30 5 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  parity:
+    name: algod image parity vs algorand/algod
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build the algod-rust algod image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: algod
+          load: true
+          tags: algod-rust-parity:algod
+          cache-from: type=gha,scope=docker-image-algod-amd64
+          cache-to: type=gha,mode=max,scope=docker-image-algod-amd64
+
+      - name: Pull the go image
+        env:
+          GO_IMAGE: ${{ inputs.go_image || 'algorand/algod:5.0.3-stable' }}
+        run: docker pull "$GO_IMAGE"
+
+      - name: Compare the two images
+        run: |
+          OUT="$RUNNER_TEMP/parity" bash docker/scripts/algod-image-parity.sh \
+            algod-rust-parity:algod "${{ inputs.go_image || 'algorand/algod:5.0.3-stable' }}"
+
+      - name: Upload comparison artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: algod-image-parity
+          path: ${{ runner.temp }}/parity
+          retention-days: 7

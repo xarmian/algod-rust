@@ -98,12 +98,26 @@ pub enum DataDirError {
     GenesisParse { path: PathBuf, message: String },
 }
 
+/// How go's `os` package words an I/O error: lower-case, without Rust's
+/// `(os error N)` suffix (`open /x/algod.net: no such file or directory`).
+fn go_os_error(e: &io::Error) -> String {
+    let text = e.to_string();
+    let text = text.split(" (os error").next().unwrap_or(&text);
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(c) => c.to_lowercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 impl std::fmt::Display for DataDirError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoDataDirectory => f.write_str(ERROR_NO_DATA_DIRECTORY),
             Self::OnlyOneDataDirSupported => f.write_str(ERROR_ONE_DATA_DIR_SUPPORTED),
-            Self::Io { path, source } => write!(f, "{}: {}", path.display(), source),
+            Self::Io { path, source } => {
+                write!(f, "open {}: {}", path.display(), go_os_error(source))
+            }
             Self::GenesisParse { path, message } => {
                 write!(f, "{}: invalid genesis.json: {}", path.display(), message)
             }
@@ -657,5 +671,15 @@ mod tests {
                 "first -d entry must preserve the symlink path",
             );
         }
+    }
+
+    #[test]
+    fn io_errors_read_like_gos_os_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = read_algod_net(dir.path()).unwrap_err().to_string();
+        let expected = format!("open {}: ", dir.path().join("algod.net").display());
+        assert!(e.starts_with(&expected), "{e}");
+        assert!(!e.contains("os error"), "{e}");
+        assert!(e[expected.len()..].chars().next().unwrap().is_lowercase(), "{e}");
     }
 }

@@ -253,6 +253,25 @@ impl ApiServer {
         }
     }
 
+    /// go: `os.Remove(s.netFile)` in `Server.Stop` -- once the node is down,
+    /// `algod.net` must not point `goal` at a dead address (it then says
+    /// "open .../algod.net: no such file", which is how scripts tell that the
+    /// node is not running).
+    ///
+    /// Only a file that still names `addr` is removed: a node restarted in the
+    /// same data directory may already have written its own.
+    fn remove_net_file(data_dir: &Path, addr: SocketAddr) {
+        let path = data_dir.join(NET_FILE);
+        if std::fs::read_to_string(&path).is_ok_and(|text| text.trim() != addr.to_string()) {
+            return;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(err = %e, "failed to remove algod.net"),
+        }
+    }
+
     /// Start serving HTTP requests.
     ///
     /// This method:
@@ -352,12 +371,17 @@ impl ApiServer {
         tracing::info!(addr = %local_addr, "REST API server listening");
         log_source_banner();
 
+        let net_file_dir = self.config.data_dir.clone();
+        let net_file_addr = local_addr;
         let handle = tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, router)
                 .with_graceful_shutdown(shutdown)
                 .await
             {
                 tracing::error!(err = %e, "REST API server failed");
+            }
+            if let Some(dir) = net_file_dir {
+                Self::remove_net_file(&dir, net_file_addr);
             }
         });
 
@@ -766,5 +790,19 @@ mod tests {
             .await
             .expect("bind_listener must succeed for an explicit non-zero port");
         assert_eq!(listener.local_addr().unwrap(), explicit_addr);
+    }
+
+    #[test]
+    fn remove_net_file_deletes_algod_net_and_tolerates_its_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        ApiServer::write_net_file(dir.path(), addr);
+        assert!(dir.path().join("algod.net").is_file());
+        // a file naming another (newer) server's address is left alone
+        ApiServer::remove_net_file(dir.path(), "127.0.0.1:9999".parse().unwrap());
+        assert!(dir.path().join("algod.net").is_file());
+        ApiServer::remove_net_file(dir.path(), addr);
+        assert!(!dir.path().join("algod.net").exists());
+        ApiServer::remove_net_file(dir.path(), addr); // already gone: no panic
     }
 }
