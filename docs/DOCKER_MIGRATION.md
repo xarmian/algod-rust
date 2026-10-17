@@ -34,7 +34,7 @@ Build it with `docker build -f docker/Dockerfile --target algod .`.
 | `ALGOD_PORT` | yes (default 8080) |
 | `START_KMD`, `KMD_TOKEN`, `KMD_PORT` | yes: `kmd-rust serve` on `0.0.0.0:${KMD_PORT}` with the same `kmd-v0.5` directory layout |
 | `TELEMETRY_NAME`, `TELEMETRY_URL` | accepted and ignored: algod-rust has no telemetry (`diagcfg` is a no-op) |
-| `DEV_MODE`, `NUM_ROUNDS`, a missing `NETWORK` (private network) | **not yet**: they need `goal network create`, tracked in [#1993](https://github.com/xarmian/algod-rust/issues/1993); the container exits with a message that says so |
+| `DEV_MODE`, `NUM_ROUNDS`, a missing `NETWORK` (private network), `/etc/algorand/template.json`, `/etc/algorand/keys` | yes for single-node templates (the image's `template.json` and `devmode_template.json`, `goal network create/start` inside the container, wallets imported into kmd). **Multi-node templates are not supported yet**: starting them needs the relay listening address, tracked in [#2002](https://github.com/xarmian/algod-rust/issues/2002). `docker stop` stops the network cleanly (go just `tail -f`s `node.log`) |
 | `DEBUG=1` | yes (`set -x`) |
 
 ## Intentional differences

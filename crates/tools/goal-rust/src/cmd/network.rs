@@ -64,8 +64,7 @@ fn absolute(p: &Path) -> PathBuf {
 
 /// go: `util.FileExists(dir) && !util.IsEmpty(dir)`.
 fn exists_and_not_empty(dir: &Path) -> bool {
-    dir.exists()
-        && std::fs::read_dir(dir).map_or(true, |mut d| d.next().is_some())
+    dir.exists() && !algo_netdeploy::create::is_empty(dir)
 }
 
 /// go: `util.CopyFolder`.
@@ -377,7 +376,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         assert!(!exists_and_not_empty(&tmp.path().join("missing")));
         assert!(!exists_and_not_empty(tmp.path()));
-        std::fs::write(tmp.path().join("f"), "x").unwrap();
+        // go's IsEmpty only counts files: the image's empty /algod/data is "empty"
+        std::fs::create_dir_all(tmp.path().join("data/sub")).unwrap();
+        assert!(!exists_and_not_empty(tmp.path()));
+        std::fs::write(tmp.path().join("data/sub/f"), "x").unwrap();
         assert!(exists_and_not_empty(tmp.path()));
     }
 

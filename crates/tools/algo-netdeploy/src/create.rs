@@ -216,7 +216,27 @@ fn copy_file(from: &Path, to: &Path) -> Result<(), CreateError> {
 }
 
 fn dir_is_empty(dir: &Path) -> bool {
-    std::fs::read_dir(dir).map_or(true, |mut d| d.next().is_none())
+    is_empty(dir)
+}
+
+/// go: `util.IsEmpty` -- true when the tree under `path` holds no files
+/// (directories alone do not count; an unreadable tree is not empty).
+pub fn is_empty(path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return !path.exists();
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { return false };
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => {
+                if !is_empty(&entry.path()) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// go: `CreateNetworkFromTemplate` (key import into kmd is the caller's step).
@@ -525,5 +545,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let e = load_network(tmp.path()).unwrap_err();
         assert!(e.to_string().contains("network.json"), "{e}");
+    }
+
+    #[test]
+    fn emptiness_counts_files_not_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(is_empty(tmp.path()));
+        assert!(is_empty(&tmp.path().join("missing")));
+        std::fs::create_dir_all(tmp.path().join("a/b")).unwrap();
+        assert!(is_empty(tmp.path()), "empty directories are empty");
+        std::fs::write(tmp.path().join("a/b/f"), "x").unwrap();
+        assert!(!is_empty(tmp.path()));
     }
 }
