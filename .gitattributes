@@ -58,3 +58,9 @@ crates/**/fixtures/**/*.bin binary
 # Ops shell scripts must keep LF endings: a CRLF checkout (Windows,
 # core.autocrlf=true) breaks bash ("\r: command not found") (#1913).
 *.sh text eol=lf
+
+# Entrypoint and command wrappers copied into the algod image: they must be LF
+# on every checkout (a CRLF shebang line breaks `exec` in the container).
+docker/algod/run.sh text eol=lf
+docker/algod/bin/* text eol=lf
+docker/algod/genesis/** text eol=lf

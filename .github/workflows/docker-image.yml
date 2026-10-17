@@ -87,6 +87,7 @@ on:
     tags: ["v*.*.*"]
     paths:
       - "docker/Dockerfile"
+      - "docker/algod/**"
       - "crates/**"
       - "bin/**"
       - "Cargo.toml"
@@ -96,6 +97,7 @@ on:
   pull_request:
     paths:
       - "docker/Dockerfile"
+      - "docker/algod/**"
       - "crates/**"
       - "bin/**"
       - "Cargo.toml"
@@ -469,7 +471,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [runtime, localnet]
+        target: [runtime, localnet, algod]
     permissions:
       contents: read
     env:
@@ -498,12 +500,50 @@ jobs:
           target: ${{ matrix.target }}
           platforms: linux/amd64
           push: false
+          # only the algod image is run (smoke test below)
+          load: ${{ matrix.target == 'algod' }}
+          tags: algod-rust-pr-check:${{ matrix.target }}
           build-args: |
             GIT_TAG=pr-check
           # Same cache scope as the amd64 leg of the real `build` job, so PR
           # checks and push builds warm each other's cache.
           cache-from: type=gha,scope=docker-image-${{ matrix.target }}-amd64
           cache-to: type=gha,mode=max,scope=docker-image-${{ matrix.target }}-amd64
+
+      # Issue #1991: the go-compatible `algod` image must behave like
+      # algorand/algod -- the commands exist, the entrypoint refuses what it
+      # cannot do with a clear message, and a real node starts, answers
+      # `goal node status` from `docker exec`, and stops promptly on SIGTERM.
+      - name: Smoke test the algod image
+        if: ${{ matrix.target == 'algod' }}
+        run: |
+          set -euo pipefail
+          img=algod-rust-pr-check:algod
+          # always show what the node said and remove the container
+          trap 'docker logs algod-smoke 2>&1 | tail -40 || true; docker rm -f algod-smoke >/dev/null 2>&1 || true' EXIT
+          docker run --rm --entrypoint sh "$img" -c \
+            'for c in algod goal kmd algokey algocfg diagcfg; do command -v $c; done; id algorand; test -d /algod/data'
+          docker run --rm --entrypoint algod "$img" -v
+          # an unknown network and a private network are refused clearly
+          out="$(docker run --rm -e NETWORK=nope "$img" 2>&1 || true)"
+          echo "$out" | grep -q "No genesis file for 'nope' is available."
+          out="$(docker run --rm "$img" 2>&1 || true)"
+          echo "$out" | grep -q "goal network create"
+          # a real testnet node: REST up, goal works inside, SIGTERM is prompt
+          docker run -d --name algod-smoke -e NETWORK=testnet -e TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            -p 18080:8080 "$img"
+          for i in $(seq 1 90); do
+            if curl -sf http://127.0.0.1:18080/health >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -sf http://127.0.0.1:18080/health
+          docker exec algod-smoke goal node status
+          docker exec algod-smoke sh -c 'test -s /algod/data/algod.pid && test -s /algod/data/genesis.json'
+          start=$(date +%s)
+          docker stop -t 30 algod-smoke
+          took=$(( $(date +%s) - start ))
+          echo "docker stop took ${took}s"
+          test "$took" -lt 20
 
   smoke-test:
     name: Smoke test published image

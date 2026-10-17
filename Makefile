@@ -808,6 +808,7 @@ consensus-cluster-analyzer: ## Unit-test the #470 soak-analyzer logic (no Docker
 	bash ops/mixed-cluster-p2p/scripts/verify_soak_cert_latest_shell_test.sh
 	bash $(PHASE6_CLUSTER)/scripts/restart_rejoin_kill_shell_test.sh
 	bash ops/mixed-cluster-p2p-1v1/scripts/genesis_settle_shell_test.sh
+	bash docker/algod/run_sh_test.sh
 
 ## ops/mixed-cluster-p2p harness (issues #543, #560, #564, #589) — three
 ## real go-algorand v5.0.3-stable nodes in plain P2P mode, chain-bootstrapped

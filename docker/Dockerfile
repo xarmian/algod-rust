@@ -67,6 +67,46 @@ ENTRYPOINT ["algod-rust"]
 # contents.
 CMD ["node", "start", "-d", "/algod/data", "--dev", "-l", "0.0.0.0:8080"]
 
+# Stage 4: the go-compatible `algod` image (issue #1991, epic #1989)
+#
+# A drop-in for `algorand/algod`: same environment variables (NETWORK, TOKEN,
+# ADMIN_TOKEN, FAST_CATCHUP, PEER_ADDRESS, GOSSIP_PORT, START_KMD, ...), same
+# `/etc/algorand` override files, same `/algod/data` data directory and ports
+# (8080 REST, 7833 kmd, 4160/4161 gossip), the `algorand` user (UID/GID 999),
+# and the same commands on PATH: `algod`, `goal`, `kmd`, `algokey`, `algocfg`,
+# `diagcfg` -- so `docker exec <container> goal node status` works. The
+# entrypoint is docker/algod/run.sh (see docs/DOCKER_MIGRATION.md).
+#
+# Opt-in via `--target algod`; the harness images keep using `runtime`.
+FROM builder AS builder-tools
+# the node, the CLI tools and kmd in one invocation so cargo unifies features
+# once and reuses everything the `builder` stage already compiled
+RUN cargo build --release --bin algod-rust --bin goal-rust --bin algokey-rust --bin kmd-rust
+
+FROM debian:bookworm-slim AS algod
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl sqlite3 gosu \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -g 999 algorand \
+    && useradd -u 999 -g 999 -d /algod -s /bin/bash algorand \
+    && mkdir -p /algod/data /node/bin /node/run/genesis \
+    && chown -R algorand:algorand /algod
+COPY --from=builder-tools /build/target/release/algod-rust /node/bin/algod-rust
+COPY --from=builder-tools /build/target/release/goal-rust /node/bin/goal-rust
+COPY --from=builder-tools /build/target/release/algokey-rust /node/bin/algokey-rust
+COPY --from=builder-tools /build/target/release/kmd-rust /node/bin/kmd-rust
+COPY docker/algod/bin/ /node/bin/
+COPY docker/algod/genesis/ /node/run/genesis/
+COPY docker/algod/run.sh /node/run/run.sh
+RUN chmod +x /node/bin/* /node/run/run.sh
+ENV PATH=/node/bin:$PATH \
+    ALGORAND_DATA=/algod/data \
+    ALGOD_PORT=8080 \
+    KMD_PORT=7833 \
+    MALLOC_ARENA_MAX=2
+WORKDIR /algod
+EXPOSE 8080 7833 4160 4161
+ENTRYPOINT ["/node/run/run.sh"]
+
 # Final stage: keep `runtime` (the `follow` default) as the image a plain
 # `docker build -f docker/Dockerfile .` produces. The `localnet` stage is opt-in
 # via `--target localnet` (see docker-compose.localnet-rust.yml).

@@ -35,7 +35,7 @@ R="$TMP/repo"
 P2P="$R/ops/mixed-cluster-p2p"
 mkdir -p "$P2P/scripts" "$R/ops/mixed-cluster/scripts" "$P2P/netroot/Node1" "$TMP/bin" "$TMP/out"
 cp "$SRC_P2P/scripts/verify-soak.sh" "$P2P/scripts/"
-cp "$SRC_MIXED/scripts/cert_window.sh" "$SRC_MIXED/scripts/cert_window.py" "$R/ops/mixed-cluster/scripts/"
+for f in cert_window.sh cert_window.py db_snapshot.sh; do cp "$SRC_MIXED/scripts/$f" "$R/ops/mixed-cluster/scripts/"; done
 echo aaaa > "$P2P/netroot/Node1/algod.token"
 
 # Stub verifiers: record argv; exit codes controllable.

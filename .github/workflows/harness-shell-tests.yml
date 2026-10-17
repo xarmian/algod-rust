@@ -1,0 +1,42 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: Harness Shell Tests
+
+# The Docker-free tests of the mixed-cluster / P2P soak harness scripts and of
+# the algod image's entrypoint (issues #1956, #1984, #1987, #1991): stubbed
+# `docker`/`goal`/`algod` and fake clocks, no cluster. They live in
+# `make consensus-cluster-analyzer` but no other workflow ran that target, so a
+# harness-script regression was only found by a nightly soak. They take
+# seconds, hence no build and a path filter that keeps them off unrelated PRs.
+
+on:
+  pull_request:
+    paths:
+      - "ops/**"
+      - "docker/algod/**"
+      - "docker/Dockerfile"
+      - "Makefile"
+      - ".github/workflows/harness-shell-tests.yml"
+  push:
+    branches: [main]
+    paths:
+      - "ops/**"
+      - "docker/algod/**"
+      - "docker/Dockerfile"
+      - "Makefile"
+      - ".github/workflows/harness-shell-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  harness-shell-tests:
+    name: Harness + image entrypoint shell tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run the Docker-free harness tests
+        run: make consensus-cluster-analyzer
