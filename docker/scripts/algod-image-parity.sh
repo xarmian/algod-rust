@@ -207,7 +207,7 @@ for f in "$OUT"/go/*.txt; do
 done
 if [ -s "$OUT/rust/testnet_container.log" ] && ! diff -q "$OUT/go/testnet_catchup_started.txt" "$OUT/rust/testnet_catchup_started.txt" >/dev/null 2>&1; then
     echo "---- rust testnet container log (tail) ----"
-    sed 's/\[[0-9;]*m//g' "$OUT/rust/testnet_container.log" | grep -iE "catchup|catchpoint|dns|peer|error|warn" | tail -25
+    sed 's/\[[0-9;]*m//g' "$OUT/rust/testnet_container.log" | grep -v "gossip_block_source" | grep -iE "catchup|catchpoint|dns|discovery|phonebook|peers|error|warn" | head -40
 fi
 echo "docker stop: go $(cat "$OUT/go/stop_seconds.txt")s, rust $(cat "$OUT/rust/stop_seconds.txt")s"
 if [ "$(cat "$OUT/rust/stop_seconds.txt")" -ge 20 ]; then
