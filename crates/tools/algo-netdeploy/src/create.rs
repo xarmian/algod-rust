@@ -83,6 +83,55 @@ impl Network {
     }
 }
 
+impl Network {
+    /// go: `RelayDataDirs` -- the relay node directories, in creation order.
+    pub fn relay_data_dirs(&self) -> Vec<PathBuf> {
+        self.cfg.relay_dirs.iter().map(|d| self.root_dir.join(d)).collect()
+    }
+
+    /// go: `NodeDataDirs` -- the non-relay node directories, by node name.
+    pub fn node_data_dirs(&self) -> Vec<PathBuf> {
+        self.node_dirs.values().map(|d| self.root_dir.join(d)).collect()
+    }
+
+    /// go: `GetNodeDir` -- the directory of the relay or node called `name`.
+    pub fn node_dir(&self, name: &str) -> Option<PathBuf> {
+        self.node_dirs
+            .get(name)
+            .map(String::as_str)
+            .or_else(|| self.cfg.relay_dirs.iter().map(String::as_str).find(|d| *d == name))
+            .map(|d| self.root_dir.join(d))
+    }
+}
+
+/// go: `netdeploy.LoadNetwork` -- read `<root>/network.json`.
+pub fn load_network(root_dir: &Path) -> Result<Network, CreateError> {
+    let path = root_dir.join(NETWORK_CONFIG_FILE);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| CreateError::Msg(format!("open {}: {e}", path.display())))?;
+    let cfg: NetworkCfg = serde_json::from_str(&text)
+        .map_err(|e| CreateError::Msg(format!("{}: {e}", path.display())))?;
+    let node_dirs = cfg
+        .template
+        .nodes
+        .iter()
+        .filter(|n| !n.is_relay)
+        .map(|n| (n.name.clone(), n.name.clone()))
+        .collect();
+    let node_has_wallet = cfg
+        .template
+        .nodes
+        .iter()
+        .map(|n| (n.name.clone(), !n.wallets.is_empty()))
+        .collect();
+    Ok(Network {
+        root_dir: root_dir.to_path_buf(),
+        cfg,
+        node_dirs,
+        node_has_wallet,
+    })
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CreateOptions {
     /// `--network`; falls back to the template's `Genesis.NetworkName`.
@@ -450,5 +499,31 @@ mod tests {
         std::fs::write(tmp.path().join("net/Node/stale"), "x").unwrap();
         let e = create(tmp.path(), DEFAULT_TEMPLATE, &CreateOptions::default()).unwrap_err();
         assert!(e.to_string().starts_with("duplicate node directory detected: "), "{e}");
+    }
+
+    #[test]
+    fn a_created_network_loads_back_with_its_relays_and_nodes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("net");
+        let json = r#"{"Genesis": {"NetworkName": "loadnet", "FirstPartKeyRound": 0, "LastPartKeyRound": 20,
+            "Wallets": [{"Name": "W1", "Stake": 100, "Online": true}]},
+            "Nodes": [{"Name": "Relay", "IsRelay": true, "Wallets": []},
+                      {"Name": "N1", "Wallets": [{"Name": "W1"}]}]}"#;
+        let mut sink: Vec<u8> = Vec::new();
+        let created = create_network_from_template(&root, json, &CreateOptions::default(), &mut sink).unwrap();
+        let loaded = load_network(&root).unwrap();
+        assert_eq!(loaded.name(), created.name());
+        assert_eq!(loaded.relay_data_dirs(), vec![root.join("Relay")]);
+        assert_eq!(loaded.node_data_dirs(), vec![root.join("N1")]);
+        assert_eq!(loaded.node_dir("Relay"), Some(root.join("Relay")));
+        assert_eq!(loaded.node_dir("N1"), Some(root.join("N1")));
+        assert_eq!(loaded.node_dir("nope"), None);
+    }
+
+    #[test]
+    fn loading_a_directory_without_network_json_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = load_network(tmp.path()).unwrap_err();
+        assert!(e.to_string().contains("network.json"), "{e}");
     }
 }

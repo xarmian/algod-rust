@@ -167,3 +167,41 @@ fn algod_without_a_data_dir_fails_with_gos_message() {
         "Data directory not specified.  Please use -d or set $ALGORAND_DATA in your environment."
     ));
 }
+
+/// A `"devmode": true` genesis (what `goal network create --devMode` writes,
+/// and the Docker image's `DEV_MODE=1`) has no agreement; `algod -d` must run
+/// it as the instant-block dev node, still with go's files and SIGTERM stop.
+#[test]
+fn algod_dash_d_runs_a_devmode_genesis_as_the_dev_node() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_data_dir(dir);
+    let genesis = std::fs::read_to_string(dir.join("genesis.json")).unwrap();
+    std::fs::write(
+        dir.join("genesis.json"),
+        genesis.replacen('{', "{\"devmode\":true,", 1),
+    )
+    .unwrap();
+
+    let node = NodeGuard(
+        algod(dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn algod-rust algod"),
+    );
+    let pid = node.0.id();
+    let net = wait_for(&dir.join("algod.net"), "algod.net");
+    assert!(net.contains(':'), "{net:?}");
+    assert_eq!(wait_for(&dir.join("algod.pid"), "algod.pid"), pid.to_string());
+    assert!(dir.join("launcher-v1").is_dir());
+
+    sigterm(pid);
+    let mut node = node;
+    let start = Instant::now();
+    while node.0.try_wait().expect("wait").is_none() {
+        assert!(start.elapsed() < Duration::from_secs(60), "no exit within 60s of SIGTERM");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!dir.join("algod.pid").exists());
+}

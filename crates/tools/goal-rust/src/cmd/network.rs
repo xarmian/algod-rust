@@ -29,12 +29,16 @@ use algo_netdeploy::genesis_gen::generate_genesis_files;
 use algo_netdeploy::template::NetworkTemplate;
 use algo_netdeploy::DEFAULT_NETWORK_TEMPLATE;
 
-use crate::groups::network::{CreateArgs, PregenArgs};
+use crate::groups::network::{CreateArgs, PregenArgs, StartArgs};
 
 /// `messages.go`.
 const INFO_NETWORK_ALREADY_EXISTS: &str = "Network Root Directory '{}' already exists and is not empty";
 const ERROR_CREATE_NETWORK: &str = "Error creating private network: ";
 const INFO_NETWORK_CREATED: &str = "Network {} created under {}";
+const ERROR_LOADING_NETWORK: &str = "Error loading deployed network: ";
+const ERROR_STARTING_NETWORK: &str = "Error starting deployed network: ";
+const ERROR_NODE_FAILED_TO_START: &str = "Algorand node failed to start: ";
+const INFO_NODE_START: &str = "Algorand node successfully started!";
 
 fn fail(message: impl AsRef<str>) -> ExitCode {
     eprintln!("{}", message.as_ref());
@@ -92,10 +96,6 @@ pub fn run_create(rootdir: Option<PathBuf>, args: CreateArgs) -> ExitCode {
         Ok(r) => r,
         Err(code) => return code,
     };
-    // (refused before anything is read or created)
-    if args.start {
-        return fail("--start is not supported yet: run 'goal network start' after creating the network (issue #1993)");
-    }
     let template_text = match read_template(args.template.as_deref()) {
         Ok(t) => t,
         Err(e) => return fail(format!("{ERROR_CREATE_NETWORK}{e}")),
@@ -147,6 +147,9 @@ pub fn run_create(rootdir: Option<PathBuf>, args: CreateArgs) -> ExitCode {
             .replacen("{}", network.name(), 1)
             .replacen("{}", &root.display().to_string(), 1)
     );
+    if args.start {
+        return start_all(&network);
+    }
     ExitCode::SUCCESS
 }
 
@@ -185,6 +188,146 @@ fn import_root_keys(network: &algo_netdeploy::create::Network) -> Result<(), Str
         }
     }
     Ok(())
+}
+
+/// go: `getNetworkAndBinDir`.
+fn load_deployed(rootdir: Option<PathBuf>) -> Result<algo_netdeploy::create::Network, ExitCode> {
+    let root = require_rootdir(rootdir)?;
+    algo_netdeploy::create::load_network(&root)
+        .map_err(|e| fail(format!("{ERROR_LOADING_NETWORK}{e}")))
+}
+
+/// Relays first, then the other nodes (go: `Network.Start`).
+fn start_order(network: &algo_netdeploy::create::Network) -> Vec<PathBuf> {
+    let mut dirs = network.relay_data_dirs();
+    dirs.extend(network.node_data_dirs());
+    dirs
+}
+
+/// go's `Start` hands every node the listening address of the relays
+/// (`algod-listen.net`), which algod-rust does not write. A network of one
+/// node needs no peers; anything larger would start disconnected, so it is
+/// refused instead.
+fn peers_supported(network: &algo_netdeploy::create::Network) -> Result<(), String> {
+    let n = network.relay_data_dirs().len() + network.node_data_dirs().len();
+    if n > 1 {
+        return Err(format!(
+            "this network has {n} nodes; starting a multi-node network needs the relay listening address (algod-listen.net), which algod-rust does not write yet (issue #2002). Start the nodes yourself with 'goal node start -d <node dir> -p <relay address>'"
+        ));
+    }
+    Ok(())
+}
+
+fn start_one(dir: &Path) -> Result<(), String> {
+    crate::nodecontrol::NodeController::new(dir)
+        .start_algod(&crate::nodecontrol::StartArgs::default())
+        .map(|_| ())
+}
+
+/// Port of `networkStartCmd` (`network.go:204-225`).
+pub fn run_start(rootdir: Option<PathBuf>, args: StartArgs) -> ExitCode {
+    let network = match load_deployed(rootdir) {
+        Ok(n) => n,
+        Err(code) => return code,
+    };
+    if let Some(name) = args.node.as_deref().filter(|n| !n.is_empty()) {
+        // (a lone node of a multi-node network would run disconnected)
+        if let Err(e) = peers_supported(&network) {
+            return fail(format!("{ERROR_NODE_FAILED_TO_START}{e}"));
+        }
+        let Some(dir) = network.node_dir(name) else {
+            return fail(format!("{ERROR_NODE_FAILED_TO_START}node {name} not found"));
+        };
+        if let Err(e) = start_one(&dir) {
+            return fail(format!("{ERROR_NODE_FAILED_TO_START}{e}"));
+        }
+        println!("{INFO_NODE_START}");
+        return ExitCode::SUCCESS;
+    }
+    start_all(&network)
+}
+
+fn start_all(network: &algo_netdeploy::create::Network) -> ExitCode {
+    if let Err(e) = peers_supported(network) {
+        return fail(format!("{ERROR_STARTING_NETWORK}{e}"));
+    }
+    for dir in start_order(network) {
+        if let Err(e) = start_one(&dir) {
+            return fail(format!("{ERROR_STARTING_NETWORK}{e}"));
+        }
+    }
+    println!("Network Started under {}", network.root_dir.display());
+    ExitCode::SUCCESS
+}
+
+/// go: `Network.Stop` -- every node, errors ignored, relays last.
+fn stop_all(network: &algo_netdeploy::create::Network) {
+    let mut dirs = network.node_data_dirs();
+    dirs.extend(network.relay_data_dirs());
+    for dir in dirs {
+        let _ = crate::nodecontrol::NodeController::new(&dir).stop_algod();
+    }
+}
+
+/// Port of `networkStopCmd` (`network.go:242-251`).
+pub fn run_stop(rootdir: Option<PathBuf>) -> ExitCode {
+    let network = match load_deployed(rootdir) {
+        Ok(n) => n,
+        Err(code) => return code,
+    };
+    stop_all(&network);
+    println!("Network Stopped under {}", network.root_dir.display());
+    ExitCode::SUCCESS
+}
+
+/// Port of `networkRestartCmd` (`network.go:227-240`).
+pub fn run_restart(rootdir: Option<PathBuf>) -> ExitCode {
+    let network = match load_deployed(rootdir) {
+        Ok(n) => n,
+        Err(code) => return code,
+    };
+    // (nothing is stopped for a network that could not be started again)
+    if let Err(e) = peers_supported(&network) {
+        return fail(format!("{ERROR_STARTING_NETWORK}{e}"));
+    }
+    stop_all(&network);
+    start_all(&network)
+}
+
+/// Port of `networkStatusCmd` (`network.go:253-270`): the first node that
+/// cannot be reached is an error, as in go.
+pub fn run_status(rootdir: Option<PathBuf>) -> ExitCode {
+    let network = match load_deployed(rootdir) {
+        Ok(n) => n,
+        Err(code) => return code,
+    };
+    for dir in start_order(&network) {
+        let name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        match crate::cmd::node::status_text(&dir) {
+            Ok(text) => print!("\n[{name}]\n{text}\n"),
+            Err(e) => return fail(format!("\n[{name}]\n ** Error getting status: {e} **\n")),
+        }
+    }
+    println!();
+    ExitCode::SUCCESS
+}
+
+/// Port of `networkDeleteCmd` (`network.go:272-286`): stop everything, then
+/// remove the network root.
+pub fn run_delete(rootdir: Option<PathBuf>) -> ExitCode {
+    let network = match load_deployed(rootdir) {
+        Ok(n) => n,
+        Err(code) => return code,
+    };
+    stop_all(&network);
+    if let Err(e) = std::fs::remove_dir_all(&network.root_dir) {
+        return fail(format!("Error stopping or deleting network: {e}\n"));
+    }
+    println!("Network Deleted under {}", network.root_dir.display());
+    ExitCode::SUCCESS
 }
 
 /// Port of `networkPregenCmd` (`network.go:296-347`).

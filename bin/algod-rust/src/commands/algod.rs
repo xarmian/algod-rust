@@ -148,6 +148,31 @@ pub fn plan(args: &AlgodArgs, algorand_data_env: Option<&str>) -> Result<Outcome
         Some(g) => genesis_path_abs(g),
     };
 
+    // A devmode genesis (`goal network create --devMode`, the image's
+    // `DEV_MODE=1`) has no agreement: go's algod runs it with an instant
+    // block per transaction group, which is what `node start` does for such a
+    // genesis (the config's EndpointAddress is read by `node` itself).
+    if genesis.devmode {
+        let mut argv: Vec<String> = vec![
+            "algod-rust".into(),
+            "node".into(),
+            "start".into(),
+            "-d".into(),
+            path_str(&abs),
+            "-g".into(),
+            path_str(&genesis_abs),
+        ];
+        if let Some(listen) = args.listen.as_deref().filter(|l| !l.is_empty()) {
+            argv.push("-l".into());
+            argv.push(listen.to_string());
+        }
+        return Ok(Outcome::Launch(LaunchPlan {
+            data_dir: abs,
+            genesis_id,
+            participate_argv: argv,
+        }));
+    }
+
     let mut argv: Vec<String> = vec![
         "algod-rust".into(),
         "participate".into(),
@@ -322,11 +347,19 @@ mod tests {
 
     const GENESIS: &str = include_str!("../../../../docker/localnet-rust/data/genesis.json");
 
+    /// The fixture is a devmode chain (instant blocks, no agreement); most of
+    /// these tests are about the `participate` command line, so they use the
+    /// same genesis with devmode off.
+    fn participating_genesis() -> String {
+        assert!(GENESIS.contains("\"devmode\": true"));
+        GENESIS.replace("\"devmode\": true", "\"devmode\": false")
+    }
+
     /// A data dir holding a go-layout `genesis.json` (and optionally a
     /// `config.json`).
     fn data_dir(config: Option<&str>) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("genesis.json"), GENESIS).expect("genesis");
+        std::fs::write(dir.path().join("genesis.json"), participating_genesis()).expect("genesis");
         if let Some(c) = config {
             std::fs::write(dir.path().join("config.json"), c).expect("config");
         }
@@ -406,7 +439,7 @@ mod tests {
     fn a_nonexistent_data_dir_is_rejected_after_the_genesis_loads() {
         let elsewhere = tempfile::tempdir().expect("tempdir");
         let genesis = elsewhere.path().join("g.json");
-        std::fs::write(&genesis, GENESIS).expect("genesis");
+        std::fs::write(&genesis, participating_genesis()).expect("genesis");
         let args = AlgodArgs {
             data_dir: Some(elsewhere.path().join("nope")),
             genesis: Some(genesis),
@@ -425,6 +458,25 @@ mod tests {
         };
         let err = plan(&args, None).unwrap_err();
         assert!(err.contains("-x"), "{err}");
+    }
+
+    #[test]
+    fn a_devmode_genesis_launches_the_dev_node_not_participate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("genesis.json"), GENESIS).expect("genesis");
+        let mut args = args_for(dir.path());
+        args.listen = Some("0.0.0.0:8080".into());
+        let p = launch(&args);
+        let argv = &p.participate_argv;
+        assert_eq!(&argv[1..3], ["node", "start"], "{argv:?}");
+        let abs = strip_verbatim(std::fs::canonicalize(dir.path()).expect("abs"));
+        assert_eq!(flag_value(argv, "-d").map(Path::new), Some(abs.as_path()));
+        assert_eq!(
+            flag_value(argv, "-g").map(Path::new),
+            Some(abs.join("genesis.json").as_path())
+        );
+        assert_eq!(flag_value(argv, "-l"), Some("0.0.0.0:8080"));
+        assert!(Cli::try_parse_from(argv).is_ok(), "argv parses: {argv:?}");
     }
 
     #[test]
@@ -470,7 +522,7 @@ mod tests {
         let dir = data_dir(None);
         let other = tempfile::tempdir().expect("tempdir");
         let g = other.path().join("custom.json");
-        std::fs::write(&g, GENESIS).expect("genesis");
+        std::fs::write(&g, participating_genesis()).expect("genesis");
         let args = AlgodArgs {
             genesis: Some(g.clone()),
             ..args_for(dir.path())
@@ -559,7 +611,7 @@ mod tests {
         let name = format!("algod-launcher-test-genesis-{}.json", std::process::id());
         let cwd = std::env::current_dir().expect("cwd");
         let path = cwd.join(&name);
-        std::fs::write(&path, GENESIS).expect("genesis in cwd");
+        std::fs::write(&path, participating_genesis()).expect("genesis in cwd");
         let args = AlgodArgs {
             genesis: Some(PathBuf::from(&name)),
             ..args_for(dir.path())
