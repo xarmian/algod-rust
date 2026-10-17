@@ -251,7 +251,7 @@ pub fn read_pid(data_dir: &Path) -> Result<i64, String> {
     Ok(pid)
 }
 
-pub(crate) fn open_log(path: &Path) -> Option<File> {
+fn open_log(path: &Path) -> Option<File> {
     match File::create(path) {
         Ok(f) => Some(f),
         Err(e) => {

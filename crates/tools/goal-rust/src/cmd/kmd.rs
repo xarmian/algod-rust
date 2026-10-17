@@ -20,8 +20,6 @@
 
 //! `goal kmd` — port of `../go-algorand/cmd/goal/kmd.go`.
 
-//! `goal kmd start | stop` -- port of `cmd/goal/kmd.go` (issue #1993).
-
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -61,7 +59,10 @@ pub fn run_start(args: StartArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<Path
     };
     for kmd_dir in dirs {
         let nc = KmdController::new(&kmd_dir);
-        let _ = nc.stop();
+        if let Err(e) = nc.stop() {
+            eprintln!("{ERROR_KMD_FAILED_TO_STOP}{e}");
+            return ExitCode::from(1);
+        }
         match nc.start(args.timeout) {
             Ok(true) => println!("{INFO_KMD_ALREADY_STARTED}"),
             Ok(false) => println!("{INFO_KMD_STARTED}"),

@@ -165,7 +165,8 @@ fn import_root_keys(network: &algo_netdeploy::create::Network) -> Result<(), Str
         let node_dir = network.root_dir.join(dir);
         let kmd_dir = node_dir.join(crate::data_dir::DEFAULT_KMD_DATA_DIR);
         let controller = KmdController::new(&kmd_dir);
-        controller
+        // (a kmd that was already running is left running)
+        let we_started = !controller
             .start(crate::kmdcontrol::DEFAULT_KMD_TIMEOUT_SECS)
             .map_err(|e| format!("failed to start kmd for node {name}: {e}"))?;
         let code = crate::cmd::account::run_importrootkey(
@@ -173,11 +174,14 @@ fn import_root_keys(network: &algo_netdeploy::create::Network) -> Result<(), Str
             vec![node_dir],
             Some(kmd_dir),
         );
-        let stopped = controller.stop();
+        let stopped = if we_started { controller.stop().map(|_| ()) } else { Ok(()) };
         if code != ExitCode::SUCCESS {
             return Err(format!("failed to import the root keys of node {name}"));
         }
-        stopped.map_err(|e| format!("failed to stop kmd for node {name}: {e}"))?;
+        if let Err(e) = stopped {
+            // the keys are in; a kmd we cannot stop (e.g. on Windows) is not fatal
+            eprintln!("warning: could not stop kmd for node {name}: {e}");
+        }
     }
     Ok(())
 }

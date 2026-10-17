@@ -53,6 +53,8 @@ pub struct KmdController {
     prefix_args: Vec<String>,
     healthy: HealthFn,
     term_wait: Duration,
+    /// How long `start` waits for kmd to answer before giving up.
+    start_wait: Duration,
 }
 
 /// Locate kmd next to `goal` (go: `binDir/kmd`), preferring a real `kmd`, then
@@ -124,7 +126,14 @@ impl KmdController {
             prefix_args,
             healthy: Box::new(kmd_http_ok),
             term_wait: Duration::from_secs(30),
+            start_wait: Duration::from_secs(120),
         }
+    }
+
+    #[cfg(all(test, unix))]
+    fn with_start_wait(mut self, wait: Duration) -> Self {
+        self.start_wait = wait;
+        self
     }
 
     #[cfg(all(test, unix))]
@@ -192,6 +201,7 @@ impl KmdController {
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("{}: {e}", self.program.display()))?;
+        let deadline = Instant::now() + self.start_wait;
 
         loop {
             match child.try_wait() {
@@ -199,6 +209,9 @@ impl KmdController {
                     if status.code() == Some(EXIT_CODE_KMD_ALREADY_RUNNING) {
                         // somebody else's kmd holds the directory: wait for it to answer
                         while !(self.healthy)(&self.data_dir) {
+                            if Instant::now() >= deadline {
+                                return Err(self.not_answering());
+                            }
                             std::thread::sleep(Duration::from_millis(100));
                         }
                         return Ok(true);
@@ -216,7 +229,21 @@ impl KmdController {
                 });
                 return Ok(false);
             }
+            if Instant::now() >= deadline {
+                // a kmd that never answers must not hang the caller (or linger)
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(self.not_answering());
+            }
         }
+    }
+
+    fn not_answering(&self) -> String {
+        format!(
+            "kmd did not answer within {}s (see {})",
+            self.start_wait.as_secs(),
+            self.data_dir.join("kmd-err.log").display()
+        )
     }
 
     /// go: `StopKMD`. `Ok(true)` means "already stopped".
@@ -228,8 +255,9 @@ impl KmdController {
             return Err("stopping kmd is only supported on unix platforms".to_string());
         }
         if !self.kmd_alive() {
+            // stale pid file (dead process, or a pid reused by something else)
             let _ = fs::remove_file(self.pid_path());
-            return Ok(false);
+            return Ok(true);
         }
         send_signal(pid, Signal::Term)?;
         let deadline = Instant::now() + self.term_wait;
@@ -448,6 +476,22 @@ mod tests {
         }
 
         #[test]
+        fn a_kmd_that_never_answers_is_killed_and_reported() {
+            let tmp = tempfile::tempdir().unwrap();
+            let kmd_dir = tmp.path().join("kmd-v0.5");
+            let script = tmp.path().join("kmd-mute");
+            fs::write(&script, "#!/bin/sh
+exec sleep 30
+").unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            let mut nc = KmdController::with_program(&kmd_dir, script, Vec::new())
+                .with_start_wait(Duration::from_millis(500));
+            nc.healthy = Box::new(|_| false);
+            let e = nc.start(0).unwrap_err();
+            assert!(e.starts_with("kmd did not answer within 0s"), "{e}");
+        }
+
+        #[test]
         fn exit_code_4_means_another_kmd_already_holds_the_directory() {
             let tmp = tempfile::tempdir().unwrap();
             let kmd_dir = tmp.path().join("kmd-v0.5");
@@ -486,7 +530,7 @@ mod tests {
             fs::set_permissions(&kmd_dir, fs::Permissions::from_mode(0o700)).unwrap();
             fs::write(kmd_dir.join("kmd.pid"), "2147483646\n").unwrap();
             let nc = nc_with(&kmd_dir, fake_kmd(tmp.path(), false));
-            assert_eq!(nc.stop(), Ok(false));
+            assert_eq!(nc.stop(), Ok(true), "a stale pid is `not running`, not `stopped`");
             assert!(!kmd_dir.join("kmd.pid").exists());
             fs::write(kmd_dir.join("kmd.pid"), "2147483646\n").unwrap();
             assert_eq!(nc.start(0), Ok(false), "stale pid does not mean running");
