@@ -486,6 +486,16 @@ fn http() -> reqwest::Client {
         .unwrap_or_default()
 }
 
+/// go: `HTTPError.Error()` is `HTTP <status>: <message>`, where the message is
+/// the `message` field of the node's JSON error body when there is one.
+pub fn http_error_text(status: reqwest::StatusCode, body: &str) -> String {
+    let message = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("message").and_then(|m| m.as_str().map(String::from)))
+        .unwrap_or_else(|| body.trim().to_string());
+    format!("HTTP {status}: {message}")
+}
+
 fn node_status_error(e: &str) -> String {
     format_message(ERROR_NODE_STATUS, &[e])
 }
@@ -553,10 +563,7 @@ pub fn run_catchup(args: crate::groups::node::CatchupArgs, cli_d: Vec<PathBuf>) 
                 Ok(resp) if !resp.status().is_success() => {
                     let status = resp.status();
                     let body = rt.block_on(resp.text()).unwrap_or_default();
-                    eprintln!(
-                        "{}",
-                        node_status_error(&format!("HTTP {status}: {}", body.trim()))
-                    );
+                    eprintln!("{}", node_status_error(&http_error_text(status, &body)));
                     return ExitCode::from(1);
                 }
                 Ok(_) => {}
@@ -615,7 +622,7 @@ pub fn run_catchup(args: crate::groups::node::CatchupArgs, cli_d: Vec<PathBuf>) 
         let status = resp.status();
         let body = rt.block_on(resp.text()).unwrap_or_default();
         if !status.is_success() {
-            eprintln!("{}", node_status_error(&format!("HTTP {status}: {}", body.trim())));
+            eprintln!("{}", node_status_error(&http_error_text(status, &body)));
             return ExitCode::from(1);
         }
         let message = serde_json::from_str::<serde_json::Value>(&body)
@@ -709,7 +716,7 @@ pub fn run_pendingtxns(args: crate::groups::node::PendingTxnsArgs, cli_d: Vec<Pa
             let status = resp.status();
             let body = resp.text().await.map_err(|e| e.to_string())?;
             if !status.is_success() {
-                return Err(format!("HTTP {status}: {}", body.trim()));
+                return Err(http_error_text(status, &body));
             }
             let doc = serde_json::from_str::<serde_json::Value>(&body).map_err(|e| e.to_string())?;
             if doc.get("total-transactions").is_none() {
@@ -984,7 +991,13 @@ pub fn parse_catchpoint_label(label: &str) -> Result<(), CatchpointLabelError> {
     let (Some(round), Some(hash), None) = (parts.next(), parts.next(), parts.next()) else {
         return Err(CatchpointLabelError::ParsingFailed);
     };
-    if let Err(e) = round.parse::<u64>() {
+    let parsed = if round.starts_with('+') {
+        // Go's strconv.ParseUint accepts no sign at all; Rust's parse takes '+'
+        "x".parse::<u64>()
+    } else {
+        round.parse::<u64>()
+    };
+    if let Err(e) = parsed {
         use std::num::IntErrorKind;
         let why = match e.kind() {
             IntErrorKind::PosOverflow => "value out of range",
@@ -994,7 +1007,7 @@ pub fn parse_catchpoint_label(label: &str) -> Result<(), CatchpointLabelError> {
             "strconv.ParseUint: parsing \"{round}\": {why}"
         )));
     }
-    match data_encoding::BASE32_NOPAD.decode(hash.as_bytes()) {
+    match go_base32().decode(hash.as_bytes()) {
         Ok(bytes) if bytes.len() > 32 => Err(CatchpointLabelError::ParsingFailed),
         Ok(_) => Ok(()),
         Err(e) => Err(CatchpointLabelError::Other(format!(
@@ -1002,6 +1015,16 @@ pub fn parse_catchpoint_label(label: &str) -> Result<(), CatchpointLabelError> {
             e.position
         ))),
     }
+}
+
+/// Go's `base32.StdEncoding.WithPadding(NoPadding)` decoder: like
+/// `BASE32_NOPAD`, but it skips `\r` / `\n` and does not insist that the
+/// unused trailing bits are zero.
+fn go_base32() -> data_encoding::Encoding {
+    let mut spec = data_encoding::BASE32_NOPAD.specification();
+    spec.check_trailing_bits = false;
+    spec.ignore = "\r\n".to_string();
+    spec.encoding().expect("a valid base32 specification")
 }
 
 /// How a catchpoint label failed to parse.
@@ -1619,6 +1642,33 @@ mod tests {
         assert_eq!(
             format_message(NODE_CONFIRM_IMPLICIT_CATCHPOINT, &["1#AB"]),
             "Fast catchup to 1#AB is about to start.\nUsing external catchpoints is not a secure practice and should not be done for consensus participating nodes.\nType 'yes' to accept the risk and continue: "
+        );
+    }
+
+    #[test]
+    fn the_label_parser_matches_go_for_signs_and_lenient_base32() {
+        let hash = "2YMHX6VN6SNZXF5HD6JDBTVCA4F2AE4PHMEHLFL6Q2X7N3NQX4MA";
+        // strconv.ParseUint takes no sign
+        assert_eq!(
+            validate_catchpoint_args(&[format!("+6500000#{hash}")]),
+            Err("strconv.ParseUint: parsing \"+6500000\": invalid syntax".to_string())
+        );
+        // Go's decoder ignores \r \n and does not check trailing bits:
+        // "AB" has nonzero bits in the last quantum yet decodes in Go
+        assert!(parse_catchpoint_label("1#AB").is_ok());
+        assert!(parse_catchpoint_label("1#AB\n").is_ok());
+    }
+
+    #[test]
+    fn rejected_requests_read_like_gos_http_error() {
+        use reqwest::StatusCode;
+        assert_eq!(
+            http_error_text(StatusCode::BAD_REQUEST, r#"{"message":"no catchup in progress"}"#),
+            "HTTP 400 Bad Request: no catchup in progress"
+        );
+        assert_eq!(
+            http_error_text(StatusCode::INTERNAL_SERVER_ERROR, "plain text body\n"),
+            "HTTP 500 Internal Server Error: plain text body"
         );
     }
 }
