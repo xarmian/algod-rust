@@ -49,10 +49,14 @@ TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
 
 declare -A PORT=([go]=18090 [rust]=18091)
+declare -A TPORT=([go]=18092 [rust]=18093)
 declare -A IMAGE=([go]="$GO_IMAGE" [rust]="$RUST_IMAGE")
 
 cleanup() {
-    for l in go rust; do docker rm -f "parity-$l" >/dev/null 2>&1; done
+    for l in go rust; do
+        docker rm -f "parity-$l" "parity-$l-t" >/dev/null 2>&1
+        docker volume rm -f "parity-$l-vol" >/dev/null 2>&1
+    done
 }
 trap cleanup EXIT
 cleanup
@@ -127,15 +131,53 @@ print(len(g['alloc']))" >"$d/genesis_shape.txt" 2>&1
     docker logs "$c" >"$d/container.log" 2>&1
 }
 
+# A public network first start with FAST_CATCHUP=1 on a named volume, then a
+# second start on the same volume (go's "existing data directory" branch). The
+# node is only observed -- it is not synced to the head of testnet.
+collect_testnet() {  # collect_testnet <go|rust>
+    local l="$1" d="$OUT/$1"; mkdir -p "$d"
+    local c="parity-$l-t" p="${TPORT[$l]}" vol="parity-$l-vol"
+    docker volume create "$vol" >/dev/null
+    local run=(docker run -d --name "$c" -e NETWORK=testnet -e FAST_CATCHUP=1 -e TOKEN="$TOKEN"
+        -p "$p:8080" -v "$vol:/algod/data" "${IMAGE[$l]}")
+    "${run[@]}" >/dev/null || return 1
+    if ! wait_health "$p" 240; then
+        echo "FAIL: $l testnet did not become healthy" >&2; docker logs "$c" 2>&1 | tail -30 >&2; return 1
+    fi
+    sleep 15   # FAST_CATCHUP issues `goal node catchup` after CATCHUP_DELAY
+    local x="docker exec $c"
+    $x ls -A /algod/data | grep -Ev '^(.*\.log|algod\.(lock|pid|net)|node\.archive|.*-v1|testnet-v1)$' | sort >"$d/testnet_data_layout.txt"
+    $x sh -c 'ls -ln /algod/data/genesis.json | awk "{print \$3, \$4}"' >"$d/testnet_genesis_owner.txt"
+    $x goal node status 2>&1 | grep -E '^(Genesis ID|Last consensus protocol)' >"$d/testnet_node_status.txt"
+    curl -s -o /dev/null -w '%{http_code}
+' "http://127.0.0.1:$p/health" >"$d/testnet_health_code.txt"
+    curl -s -H "X-Algo-API-Token: $TOKEN" "http://127.0.0.1:$p/v2/status"         | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('last-version'), d.get('catchpoint') != '' or d.get('catchup-time') is not None)" >"$d/testnet_catchup_started.txt" 2>&1
+    local t0 t1
+    t0=$(date +%s); docker stop -t 30 "$c" >/dev/null; t1=$(date +%s)
+    echo $((t1 - t0)) >"$d/testnet_stop_seconds.txt"
+    docker rm "$c" >/dev/null
+    # second start on the same volume: the existing data directory is reused
+    docker run -d --name "$c" -e TOKEN="$TOKEN" -p "$p:8080" -v "$vol:/algod/data" "${IMAGE[$l]}" >/dev/null || return 1
+    if wait_health "$p" 180; then echo "resumed" >"$d/testnet_reuse.txt"; else echo "NOT resumed" >"$d/testnet_reuse.txt"; fi
+    $x goal node status 2>&1 | grep -E '^Genesis ID' >>"$d/testnet_reuse.txt"
+    docker stop -t 30 "$c" >/dev/null
+    docker rm "$c" >/dev/null
+}
+
 echo "== running $GO_IMAGE and $RUST_IMAGE (output in $OUT)"
 collect go || exit 2
 collect rust || exit 2
+if [ "${SKIP_TESTNET:-0}" != "1" ]; then
+    echo "== public network (testnet, FAST_CATCHUP=1) and data directory reuse"
+    collect_testnet go || exit 2
+    collect_testnet rust || exit 2
+fi
 
 # ---- compare ---------------------------------------------------------------
 fails=0
 for f in "$OUT"/go/*.txt; do
     name="$(basename "$f" .txt)"
-    case "$name" in stop_seconds) continue ;; esac
+    case "$name" in stop_seconds | testnet_stop_seconds) continue ;; esac
     if diff -u "$OUT/go/$name.txt" "$OUT/rust/$name.txt" >"$OUT/$name.diff"; then
         if grep -q "^$name|" "$KNOWN" 2>/dev/null; then
             echo "STALE  $name is listed in $KNOWN but no longer differs"; fails=$((fails + 1))
@@ -153,6 +195,12 @@ done
 echo "docker stop: go $(cat "$OUT/go/stop_seconds.txt")s, rust $(cat "$OUT/rust/stop_seconds.txt")s"
 if [ "$(cat "$OUT/rust/stop_seconds.txt")" -ge 20 ]; then
     echo "DIFF   rust docker stop took too long"; fails=$((fails + 1))
+fi
+if [ -f "$OUT/rust/testnet_stop_seconds.txt" ]; then
+    echo "docker stop (testnet): go $(cat "$OUT/go/testnet_stop_seconds.txt")s, rust $(cat "$OUT/rust/testnet_stop_seconds.txt")s"
+    if [ "$(cat "$OUT/rust/testnet_stop_seconds.txt")" -ge 20 ]; then
+        echo "DIFF   rust testnet docker stop took too long"; fails=$((fails + 1))
+    fi
 fi
 
 if [ "$fails" -ne 0 ]; then
