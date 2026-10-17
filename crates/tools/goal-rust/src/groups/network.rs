@@ -25,7 +25,6 @@ use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
 
-
 #[derive(Subcommand, Debug)]
 pub enum NetworkCmd {
     /// Create a private named network from a template.

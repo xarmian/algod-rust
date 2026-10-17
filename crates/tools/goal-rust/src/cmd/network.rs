@@ -231,6 +231,10 @@ pub fn run_start(rootdir: Option<PathBuf>, args: StartArgs) -> ExitCode {
         Err(code) => return code,
     };
     if let Some(name) = args.node.as_deref().filter(|n| !n.is_empty()) {
+        // (a lone node of a multi-node network would run disconnected)
+        if let Err(e) = peers_supported(&network) {
+            return fail(format!("{ERROR_NODE_FAILED_TO_START}{e}"));
+        }
         let Some(dir) = network.node_dir(name) else {
             return fail(format!("{ERROR_NODE_FAILED_TO_START}node {name} not found"));
         };
@@ -282,6 +286,10 @@ pub fn run_restart(rootdir: Option<PathBuf>) -> ExitCode {
         Ok(n) => n,
         Err(code) => return code,
     };
+    // (nothing is stopped for a network that could not be started again)
+    if let Err(e) = peers_supported(&network) {
+        return fail(format!("{ERROR_STARTING_NETWORK}{e}"));
+    }
     stop_all(&network);
     start_all(&network)
 }

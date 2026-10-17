@@ -301,6 +301,11 @@ fn a_multi_node_network_is_refused_until_relay_addresses_exist() {
     let root = tmp.path().join("net").display().to_string();
     let out = goal(&["network", "create", "-r", &root, "-t", &template]);
     assert!(out.status.success(), "{}", stderr(&out));
+    for args in [vec!["network", "restart", "-r", &root], vec!["network", "start", "-r", &root, "-n", "N1"]] {
+        let out = goal(&args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert!(stderr(&out).contains("this network has 2 nodes"), "{args:?}: {}", stderr(&out));
+    }
     let out = goal(&["network", "start", "-r", &root]);
     assert_eq!(out.status.code(), Some(1));
     assert!(
