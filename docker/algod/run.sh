@@ -247,7 +247,7 @@ follow_private_network() {
   # -F: the logs may not exist yet, and are recreated on restart
   tail -F node.log algod-out.log algod-err.log 2>/dev/null &
   TAIL_PID=$!
-  trap 'goal network stop -r "$root"; kill "$TAIL_PID" 2>/dev/null; exit 0' TERM INT
+  trap 'goal network stop -r "$root"; kill "$TAIL_PID" ${KMD_PID:-} 2>/dev/null; exit 0' TERM INT
   wait "$TAIL_PID"
   # (only reached when tail died: the network is still up, so this is an error)
   exit 1
@@ -256,6 +256,7 @@ follow_private_network() {
 start_private_network() {
   configure_data_dir
   start_kmd &
+  KMD_PID=$!
 
   goal network start -r "${ALGORAND_DATA}/.."
   follow_private_network
@@ -272,6 +273,8 @@ start_new_private_network() {
 
   # Check if keys are mounted, and if so, use them as the pregenerated keys
   if [ -d "$ETC_DIR/keys" ]; then
+    # (a restart after a failed first start must not nest keys/keys)
+    rm -rf "$RUN_DIR/keys"
     cp -r "$ETC_DIR/keys" "$RUN_DIR/keys"
     goal network create --noclean -n dockernet -r "${ALGORAND_DATA}/.." -t "$RUN_DIR/$TEMPLATE" -p "$RUN_DIR/keys"
   else

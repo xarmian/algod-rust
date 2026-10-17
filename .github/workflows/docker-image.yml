@@ -520,7 +520,7 @@ jobs:
           set -euo pipefail
           img=algod-rust-pr-check:algod
           # always show what the node said and remove the container
-          trap 'docker logs algod-smoke 2>&1 | tail -40 || true; docker rm -f algod-smoke >/dev/null 2>&1 || true' EXIT
+          trap 'docker logs algod-smoke 2>&1 | tail -40 || true; docker logs algod-dev 2>&1 | tail -60 || true; docker rm -f algod-smoke algod-dev >/dev/null 2>&1 || true' EXIT
           docker run --rm --entrypoint sh "$img" -c \
             'for c in algod goal kmd algokey algocfg diagcfg; do command -v $c; done; id algorand; test -d /algod/data'
           docker run --rm --entrypoint algod "$img" -v
@@ -545,7 +545,6 @@ jobs:
 
           # Issue #1993: DEV_MODE=1 creates and starts a private devmode network
           # (like algorand/algod), with kmd holding the generated wallets.
-          trap 'docker logs algod-dev 2>&1 | tail -60 || true; docker rm -f algod-dev >/dev/null 2>&1 || true' EXIT
           docker run -d --name algod-dev -e DEV_MODE=1 -e START_KMD=1 -e NUM_ROUNDS=1000             -e TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa             -p 18081:8080 "$img"
           for i in $(seq 1 120); do
             if curl -sf http://127.0.0.1:18081/health >/dev/null; then break; fi
