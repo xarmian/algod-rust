@@ -138,28 +138,40 @@ collect_testnet() {  # collect_testnet <go|rust>
     local l="$1" d="$OUT/$1"; mkdir -p "$d"
     local c="parity-$l-t" p="${TPORT[$l]}" vol="parity-$l-vol"
     docker volume create "$vol" >/dev/null
-    local run=(docker run -d --name "$c" -e NETWORK=testnet -e FAST_CATCHUP=1 -e TOKEN="$TOKEN"
-        -p "$p:8080" -v "$vol:/algod/data" "${IMAGE[$l]}")
-    "${run[@]}" >/dev/null || return 1
+    docker run -d --name "$c" -e NETWORK=testnet -e FAST_CATCHUP=1 -e TOKEN="$TOKEN" \
+        -p "$p:8080" -v "$vol:/algod/data" "${IMAGE[$l]}" >/dev/null || return 1
     if ! wait_health "$p" 240; then
         echo "FAIL: $l testnet did not become healthy" >&2; docker logs "$c" 2>&1 | tail -30 >&2; return 1
     fi
-    sleep 15   # FAST_CATCHUP issues `goal node catchup` after CATCHUP_DELAY
     local x="docker exec $c"
-    $x ls -A /algod/data | grep -Ev '^(.*\.log|algod\.(lock|pid|net)|node\.archive|.*-v1|testnet-v1)$' | sort >"$d/testnet_data_layout.txt"
+    # FAST_CATCHUP issues `goal node catchup` after CATCHUP_DELAY: wait (bounded)
+    # until the node reports a catchpoint it is catching up to
+    local started=False i
+    for i in $(seq 1 45); do
+        if curl -s -H "X-Algo-API-Token: $TOKEN" "http://127.0.0.1:$p/v2/status" \
+            | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get('catchpoint') else 1)" 2>/dev/null; then
+            started=True; break
+        fi
+        sleep 2
+    done
+    echo "$started" >"$d/testnet_catchup_started.txt"
+    $x ls -A /algod/data | grep -Ev '^(.*\.log|algod\.(lock|pid|net)|node\.archive|.*-v1)$' | sort >"$d/testnet_data_layout.txt"
     $x sh -c 'ls -ln /algod/data/genesis.json | awk "{print \$3, \$4}"' >"$d/testnet_genesis_owner.txt"
     $x goal node status 2>&1 | grep -E '^(Genesis ID|Last consensus protocol)' >"$d/testnet_node_status.txt"
-    curl -s -o /dev/null -w '%{http_code}
-' "http://127.0.0.1:$p/health" >"$d/testnet_health_code.txt"
-    curl -s -H "X-Algo-API-Token: $TOKEN" "http://127.0.0.1:$p/v2/status"         | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('last-version'), d.get('catchpoint') != '' or d.get('catchup-time') is not None)" >"$d/testnet_catchup_started.txt" 2>&1
+    curl -s -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:$p/health" >"$d/testnet_health_code.txt"
     local t0 t1
     t0=$(date +%s); docker stop -t 30 "$c" >/dev/null; t1=$(date +%s)
     echo $((t1 - t0)) >"$d/testnet_stop_seconds.txt"
     docker rm "$c" >/dev/null
     # second start on the same volume: the existing data directory is reused
     docker run -d --name "$c" -e TOKEN="$TOKEN" -p "$p:8080" -v "$vol:/algod/data" "${IMAGE[$l]}" >/dev/null || return 1
-    if wait_health "$p" 180; then echo "resumed" >"$d/testnet_reuse.txt"; else echo "NOT resumed" >"$d/testnet_reuse.txt"; fi
-    $x goal node status 2>&1 | grep -E '^Genesis ID' >>"$d/testnet_reuse.txt"
+    if wait_health "$p" 180; then
+        echo "resumed" >"$d/testnet_reuse.txt"
+        $x goal node status 2>&1 | grep -E '^Genesis ID' >>"$d/testnet_reuse.txt"
+    else
+        echo "NOT resumed" >"$d/testnet_reuse.txt"
+        docker logs "$c" 2>&1 | tail -20 >&2
+    fi
     docker stop -t 30 "$c" >/dev/null
     docker rm "$c" >/dev/null
 }
