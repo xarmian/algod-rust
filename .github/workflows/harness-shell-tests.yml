@@ -24,7 +24,9 @@ on:
     paths:
       - "ops/**"
       - "docker/algod/**"
+      - "docker/Dockerfile"
       - "Makefile"
+      - ".github/workflows/harness-shell-tests.yml"
 
 permissions:
   contents: read

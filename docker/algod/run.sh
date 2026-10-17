@@ -54,6 +54,10 @@ if [ "$DEBUG" = "1" ]; then
   set -x
 fi
 
+set_or_not() {
+  if [ -n "$1" ]; then echo "Set"; else echo "Not Set"; fi
+}
+
 die() {
   echo "$*" >&2
   exit 1
@@ -189,7 +193,7 @@ start_new_public_network() {
     # download genesis file from peer
     echo "Attempting to download genesis file from $GENESIS_ADDRESS"
     curl "$GENESIS_ADDRESS/genesis" -o genesis.json
-  elif [ -d "$GENESIS_DIR/${NETWORK}" ]; then
+  elif [ -n "$NETWORK" ] && [ -d "$GENESIS_DIR/${NETWORK}" ]; then
     echo "Installing genesis file for ${NETWORK}"
     cp "$GENESIS_DIR/${NETWORK}/genesis.json" genesis.json
   else
@@ -242,9 +246,12 @@ main() {
   echo "   DEV_MODE:        $DEV_MODE"
   echo "   START_KMD:       ${START_KMD:-"Not Set"}"
   echo "   FAST_CATCHUP:    $FAST_CATCHUP"
-  echo "   TOKEN:           ${TOKEN:-"Not Set"}"
-  echo "   ADMIN_TOKEN:     ${ADMIN_TOKEN:-"Not Set"}"
-  echo "   KMD_TOKEN:       ${KMD_TOKEN:-"Not Set"}"
+  # (go prints the token values; the admin token is full control of the node
+  # and `docker logs` is routinely shipped, so only whether they are set)
+  echo "   TOKEN:           $(set_or_not "$TOKEN")"
+  echo "   ADMIN_TOKEN:     $(set_or_not "$ADMIN_TOKEN")"
+  echo "   KMD_TOKEN:       $(set_or_not "$KMD_TOKEN")"
+
   echo "   TELEMETRY_NAME:  $TELEMETRY_NAME"
   echo "   TELEMETRY_URL:   $TELEMETRY_URL"
   echo "   NUM_ROUNDS:      $NUM_ROUNDS"

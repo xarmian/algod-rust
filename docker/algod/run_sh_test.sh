@@ -191,6 +191,26 @@ echo '{"id":"x"}' >"$DATA/genesis.json"
 ) >/dev/null 2>&1
 has "start_kmd runs kmd serve on KMD_PORT" "^kmd serve -d $DATA/kmd-v0\.5 -a 0\.0\.0\.0:7833 --allow-origin \*\$" "$CALLS"
 
+# ---- 7b. secrets never reach the log ----------------------------------------------------------
+new_case
+echo '{"id":"x"}' >"$DATA/genesis.json"
+export TOKEN=supersecrettoken ADMIN_TOKEN=supersecretadmin KMD_TOKEN=supersecretkmd
+run_main
+hasnt "no token value in the startup banner" 'supersecret' "$D/out.log"
+has "the banner says the tokens are set" 'TOKEN:           Set' "$D/out.log"
+has "ADMIN_TOKEN is reported as set" 'ADMIN_TOKEN:     Set' "$D/out.log"
+new_case
+echo '{"id":"x"}' >"$DATA/genesis.json"
+run_main
+has "unset tokens read Not Set" 'TOKEN:           Not Set' "$D/out.log"
+
+# ---- 7c. PEER_ADDRESS without NETWORK or GENESIS_ADDRESS ----------------------------------------
+new_case
+export PEER_ADDRESS="1.2.3.4:4160"
+run_main
+[ "$RC" = 1 ] && ok "PEER_ADDRESS alone exits 1" || bad "PEER_ADDRESS alone exit code $RC"
+has "PEER_ADDRESS alone gets go's message, not a cp error" "No genesis file for '' is available\." "$D/out.log"
+
 # ---- 8. private networks are refused clearly -----------------------------------------------
 new_case
 run_main

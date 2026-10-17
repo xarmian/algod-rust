@@ -14,7 +14,7 @@ Build it with `docker build -f docker/Dockerfile --target algod .`.
 | | algorand/algod | algod-rust `algod` image |
 |---|---|---|
 | data directory | `/algod/data` (`ALGORAND_DATA`) | same |
-| REST API / kmd / gossip | 8080 / 7833 / `GOSSIP_PORT` | same (`EXPOSE 8080 7833 4160`) |
+| REST API / kmd / gossip | 8080 / 7833 / `GOSSIP_PORT` | same (`EXPOSE 8080 7833 4160 4161`) |
 | user | `algorand` (UID/GID 999); the entrypoint fixes the ownership of a mounted data directory, then drops root | same |
 | commands on `PATH` | `algod goal kmd algokey algocfg diagcfg` | same names (Rust implementations) |
 | override files | `/etc/algorand/{config.json,algod.token,algod.admin.token,logging.config,kmd_config.json}` | same |
@@ -42,6 +42,8 @@ Build it with `docker build -f docker/Dockerfile --target algod .`.
 * `algod` is `exec`ed by the entrypoint so that `docker stop`'s SIGTERM reaches
   it (go's script keeps bash as PID 1). The node shuts down on SIGTERM and
   removes `algod.pid`.
+* The startup banner prints `Set` / `Not Set` for `TOKEN`, `ADMIN_TOKEN` and `KMD_TOKEN`
+  instead of their values (go logs them in clear text; `docker logs` is routinely shipped).
 * The entrypoint calls `algocfg set -p KEY -v VALUE -d DIR` (data directory
   last); the `algocfg` on `PATH` also accepts go's `algocfg -d DIR set ...`.
 * `kmd` started as `kmd -d DIR` is translated to `kmd-rust serve -d DIR`.

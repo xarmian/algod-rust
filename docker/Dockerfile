@@ -104,7 +104,7 @@ ENV PATH=/node/bin:$PATH \
     KMD_PORT=7833 \
     MALLOC_ARENA_MAX=2
 WORKDIR /algod
-EXPOSE 8080 7833 4160
+EXPOSE 8080 7833 4160 4161
 ENTRYPOINT ["/node/run/run.sh"]
 
 # Final stage: keep `runtime` (the `follow` default) as the image a plain
