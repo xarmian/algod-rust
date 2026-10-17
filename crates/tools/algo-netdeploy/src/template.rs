@@ -173,6 +173,9 @@ impl NetworkTemplate {
         let mut total = 0.0_f64;
         let mut accounts = std::collections::HashSet::new();
         for wallet in &self.genesis.wallets {
+            if !wallet.stake.is_finite() {
+                return invalid(format!("non-finite stake on Genesis account {}", wallet.name));
+            }
             if wallet.stake < 0.0 {
                 return invalid(format!(
                     "negative stake on Genesis account {}",
@@ -190,6 +193,21 @@ impl NetworkTemplate {
             return invalid(format!(
                 "Genesis account allocations must total 100 (actual {total})"
             ));
+        }
+
+        // Node names become directories under the network root: they must stay
+        // inside it and must not collide with the generated files.
+        for node in &self.nodes {
+            let n = node.name.as_str();
+            if n.is_empty()
+                || n == "."
+                || n == ".."
+                || n.contains(['/', '\\'])
+                || n == "genesis.json"
+                || n == "network.json"
+            {
+                return invalid(format!("invalid node name '{n}'"));
+            }
         }
 
         // No wallet can be assigned to more than one node.
@@ -374,6 +392,24 @@ mod tests {
         let tpl = t(r#"{"Genesis": {"DevMode": true, "Wallets": [{"Name": "W", "Stake": 100}]},
             "Nodes": [{"Name": "a", "IsRelay": true}, {"Name": "b", "ConfigJSONOverride": "{\"EnableFollowMode\": true}"}]}"#);
         tpl.validate().expect("relay + follower");
+    }
+
+    #[test]
+    fn node_names_cannot_leave_the_network_root_or_clobber_generated_files() {
+        for bad in ["../x", "a/b", "a\\b", "..", ".", "", "genesis.json", "network.json"] {
+            let json = format!(
+                r#"{{"Genesis": {{"Wallets": [{{"Name": "W", "Stake": 100}}]}}, "Nodes": [{{"Name": {}}}]}}"#,
+                serde_json::to_string(bad).unwrap()
+            );
+            assert_eq!(
+                err_of(&t(&json)),
+                format!("invalid template: invalid node name '{bad}'"),
+                "{bad:?}"
+            );
+        }
+        t(r#"{"Genesis": {"Wallets": [{"Name": "W", "Stake": 100}]}, "Nodes": [{"Name": "Primary-1"}]}"#)
+            .validate()
+            .expect("ordinary names are fine");
     }
 
     #[test]

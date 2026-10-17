@@ -104,24 +104,14 @@ pub fn setup_allocations(
         })
         .collect();
 
-    let mut sum: u64 = allocation.iter().map(|a| a.stake).sum();
+    let sum: u64 = allocation.iter().map(|a| a.stake).sum();
     if sum != TOTAL_MONEY {
         let fsum = sum as f64;
         let ftot = TOTAL_MONEY as f64;
         if ((fsum - ftot) / ftot).abs() < 0.01 && sum.abs_diff(TOTAL_MONEY) < 10_000 {
             // wallet stake is a float and round-off might happen but we are
             // close enough to do a fixup
-            let mut i = 0;
-            while sum != TOTAL_MONEY {
-                if sum < TOTAL_MONEY {
-                    allocation[i].stake += 1;
-                    sum += 1;
-                } else if allocation[i].stake > params.min_balance {
-                    allocation[i].stake -= 1;
-                    sum -= 1;
-                }
-                i = (i + 1) % allocation.len();
-            }
+            fixup_round_off(&mut allocation, params.min_balance, TOTAL_MONEY)?;
         } else {
             return err(format!(
                 "Amounts don't add up to TotalMoney - off by {}",
@@ -130,6 +120,38 @@ pub fn setup_allocations(
         }
     }
     Ok((proto, params, allocation))
+}
+
+/// go's round-off fixup: nudge stakes one microAlgo at a time until they add up
+/// to `target`. go loops until the sum matches, which never happens when every
+/// wallet already sits at the minimum balance; this one is bounded.
+fn fixup_round_off(
+    allocation: &mut [Allocation],
+    min_balance: u64,
+    target: u64,
+) -> Result<(), GenError> {
+    let mut sum: u64 = allocation.iter().map(|a| a.stake).sum();
+    let max_steps = (sum.abs_diff(target) + 1) * allocation.len() as u64 + 16;
+    let mut steps = 0u64;
+    let mut i = 0;
+    while sum != target {
+        if steps > max_steps {
+            return err(format!(
+                "Amounts don't add up to TotalMoney - off by {}",
+                target as i128 - sum as i128
+            ));
+        }
+        steps += 1;
+        if sum < target {
+            allocation[i].stake += 1;
+            sum += 1;
+        } else if allocation[i].stake > min_balance {
+            allocation[i].stake -= 1;
+            sum -= 1;
+        }
+        i = (i + 1) % allocation.len();
+    }
+    Ok(())
 }
 
 /// The keys of one generated wallet.
@@ -281,6 +303,13 @@ fn make_wallet(
             None
         };
         let part = match reused {
+            Some(p) if p.parent.0 != address => {
+                return err(format!(
+                    "participation file {} belongs to a different account than {}",
+                    part_path.display(),
+                    root_path.display()
+                ));
+            }
             Some(p) => {
                 say(format!(
                     "Reusing existing wallet: {} {}",
@@ -333,39 +362,8 @@ fn make_wallet(
 }
 
 fn b64(bytes: &[u8]) -> String {
-    use base64_std::encode;
-    encode(bytes)
-}
-
-/// Minimal standard-alphabet base64 (padding included), so the crate needs no
-/// extra dependency for the handful of fields genesis.json carries.
-mod base64_std {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    pub fn encode(input: &[u8]) -> String {
-        let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-        for chunk in input.chunks(3) {
-            let b = [
-                chunk[0],
-                chunk.get(1).copied().unwrap_or(0),
-                chunk.get(2).copied().unwrap_or(0),
-            ];
-            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-            out.push(ALPHABET[(n >> 18) as usize & 63] as char);
-            out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-            out.push(if chunk.len() > 1 {
-                ALPHABET[(n >> 6) as usize & 63] as char
-            } else {
-                '='
-            });
-            out.push(if chunk.len() > 2 {
-                ALPHABET[n as usize & 63] as char
-            } else {
-                '='
-            });
-        }
-        out
-    }
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 fn parse_address(text: &str, default: [u8; 32]) -> Result<[u8; 32], GenError> {
@@ -592,12 +590,46 @@ mod tests {
     }
 
     #[test]
-    fn base64_matches_the_standard_alphabet() {
+    fn genesis_keys_are_standard_padded_base64() {
         assert_eq!(b64(b""), "");
         assert_eq!(b64(b"f"), "Zg==");
-        assert_eq!(b64(b"fo"), "Zm8=");
-        assert_eq!(b64(b"foo"), "Zm9v");
         assert_eq!(b64(b"foob"), "Zm9vYg==");
+    }
+
+    #[test]
+    fn the_round_off_fixup_adds_and_removes_single_microalgos_and_is_bounded() {
+        let mk = |stakes: &[u64]| -> Vec<Allocation> {
+            stakes
+                .iter()
+                .enumerate()
+                .map(|(i, s)| Allocation { name: format!("W{i}"), stake: *s, online: false })
+                .collect()
+        };
+        // short by 2: first two wallets get +1
+        let mut a = mk(&[10, 10, 10]);
+        fixup_round_off(&mut a, 1, 32).unwrap();
+        assert_eq!(a.iter().map(|x| x.stake).collect::<Vec<_>>(), vec![11, 11, 10]);
+        // over by 2: removed from wallets above the minimum
+        let mut a = mk(&[10, 10, 10]);
+        fixup_round_off(&mut a, 1, 28).unwrap();
+        assert_eq!(a.iter().map(|x| x.stake).sum::<u64>(), 28);
+        // over, but every wallet is at the minimum: go spins forever, this errors
+        let mut a = mk(&[5, 5]);
+        let e = fixup_round_off(&mut a, 5, 8).unwrap_err();
+        assert!(e.to_string().starts_with("Amounts don't add up to TotalMoney - off by "), "{e}");
+    }
+
+    #[test]
+    fn a_reused_partkey_of_another_account_is_refused() {
+        let mut genesis = genesis_with(&[("A", 50.0, true), ("B", 50.0, true)]);
+        genesis.last_part_key_round = 30;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut log: Vec<u8> = Vec::new();
+        generate_genesis_files(&genesis, tmp.path(), &mut log).unwrap();
+        // swap B's partkey in as A's
+        std::fs::copy(tmp.path().join("B.0.30.partkey"), tmp.path().join("A.0.30.partkey")).unwrap();
+        let e = generate_genesis_files(&genesis, tmp.path(), &mut log).unwrap_err();
+        assert!(e.to_string().contains("belongs to a different account"), "{e}");
     }
 
     #[test]

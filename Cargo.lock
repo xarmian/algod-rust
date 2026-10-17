@@ -449,6 +449,7 @@ version = "0.1.0"
 dependencies = [
  "algo-ledger",
  "algo-types",
+ "base64 0.23.1",
  "ed25519-dalek",
  "rand 0.10.3",
  "rmpv",

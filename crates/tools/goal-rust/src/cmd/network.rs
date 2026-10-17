@@ -123,7 +123,9 @@ pub fn run_create(rootdir: Option<PathBuf>, args: CreateArgs) -> ExitCode {
                 println!(" ** failed ** - Preserving network rootdir '{}'", root.display());
             } else {
                 // don't leave a partial network directory if create failed
-                let _ = std::fs::remove_dir_all(&root);
+                if let Err(rm) = std::fs::remove_dir_all(&root) {
+                    eprintln!("warning: could not remove the partial network at {}: {rm}", root.display());
+                }
             }
             return fail(format!("{ERROR_CREATE_NETWORK}{e}"));
         }

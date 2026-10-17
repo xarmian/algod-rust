@@ -12,6 +12,7 @@ license.workspace = true
 [dependencies]
 algo-types.workspace = true
 algo-ledger.workspace = true
+base64.workspace = true
 ed25519-dalek.workspace = true
 rand.workspace = true
 rmpv.workspace = true
