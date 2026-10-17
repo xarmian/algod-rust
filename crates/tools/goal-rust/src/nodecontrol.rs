@@ -419,7 +419,7 @@ pub(crate) fn looks_like(pid: i64, prefix: &str) -> bool {
 /// in the line would also match a checkout path such as `.../algod-rust/...`
 /// or a test name. A script run through an interpreter is judged by the
 /// script's name.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn cmdline_is_algod(cmdline: &[u8]) -> bool {
     cmdline_has_prefix(cmdline, "algod")
 }
