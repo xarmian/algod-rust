@@ -256,7 +256,7 @@ fn unimplemented_leaf_exits_with_code_two_and_message() {
         (&["node", "generate-p2pid"], "node generate-p2pid"),
         // All `wallet` leaves are implemented (TASK-226/227/228);
         // use a still-stubbed `node` leaf as the spot check.
-        (&["node", "catchup"], "node catchup"),
+        (&["node", "clone"], "node clone"),
     ];
     for (argv, expected) in cases {
         let out = Command::new(GOAL_RUST_BIN)
