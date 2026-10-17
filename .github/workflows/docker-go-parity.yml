@@ -26,6 +26,9 @@ on:
       - "crates/tools/goal-rust/**"
       - "crates/tools/algo-netdeploy/**"
       - "bin/algod-rust/**"
+      - "bin/kmd-rust/**"
+      - "crates/node/algo-rest-api/**"
+      - "crates/node/algo-kmd/**"
   schedule:
     - cron: "30 5 * * *"
 
@@ -55,7 +58,9 @@ jobs:
           cache-to: type=gha,mode=max,scope=docker-image-algod-amd64
 
       - name: Pull the go image
-        run: docker pull "${{ inputs.go_image || 'algorand/algod:5.0.3-stable' }}"
+        env:
+          GO_IMAGE: ${{ inputs.go_image || 'algorand/algod:5.0.3-stable' }}
+        run: docker pull "$GO_IMAGE"
 
       - name: Compare the two images
         run: |
