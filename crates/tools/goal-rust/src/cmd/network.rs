@@ -162,7 +162,8 @@ fn import_root_keys(network: &algo_netdeploy::create::Network) -> Result<(), Str
         if !network.node_has_wallet.get(name).copied().unwrap_or(false) {
             continue;
         }
-        let node_dir = network.root_dir.join(dir);
+        // (kmd insists on an absolute data dir; `-r` may be relative)
+        let node_dir = absolute(&network.root_dir).join(dir);
         let kmd_dir = node_dir.join(crate::data_dir::DEFAULT_KMD_DATA_DIR);
         let controller = KmdController::new(&kmd_dir);
         // (a kmd that was already running is left running)

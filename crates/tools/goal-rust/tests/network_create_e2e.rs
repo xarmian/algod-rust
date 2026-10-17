@@ -254,3 +254,20 @@ fn create_imports_the_root_keys_into_the_unencrypted_default_wallet() {
     assert!(!stdout(&out).contains("Imported"));
     assert!(!root2.join("Primary").join("kmd-v0.5").exists());
 }
+
+// unix only, see above
+#[cfg(unix)]
+#[test]
+fn create_with_a_relative_rootdir_still_imports_the_keys() {
+    ensure_kmd_next_to_goal();
+    let tmp = tempfile::tempdir().unwrap();
+    let template = write_template(tmp.path(), TEMPLATE);
+    let out = Command::new(GOAL_RUST_BIN)
+        .current_dir(tmp.path())
+        .args(["network", "create", "-r", "relnet", "-t", &template])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{} {}", stdout(&out), stderr(&out));
+    assert!(stdout(&out).contains("Imported 2 keys"), "{}", stdout(&out));
+}
