@@ -30,6 +30,7 @@ members = [
     "crates/tools/algo-cert-crossverify",
     "crates/tools/algo-agreement-fuzz",
     "crates/tools/algokey-rust",
+    "crates/tools/algo-netdeploy",
     "crates/tools/goal-rust",
     "bin/algod-rust",
     "bin/kmd-rust",
@@ -124,6 +125,7 @@ algo-fixtures = { path = "crates/tools/algo-fixtures" }
 algo-conformance = { path = "crates/tools/algo-conformance" }
 algo-validate = { path = "crates/core/algo-validate" }
 algo-ledger = { path = "crates/core/algo-ledger" }
+algo-netdeploy = { path = "crates/tools/algo-netdeploy" }
 algo-avm = { path = "crates/core/algo-avm" }
 algo-consensus-crypto = { path = "crates/core/algo-consensus-crypto" }
 algo-agreement = { path = "crates/core/algo-agreement" }

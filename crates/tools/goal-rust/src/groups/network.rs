@@ -20,20 +20,29 @@
 
 //! `goal network` — port of `../go-algorand/cmd/goal/network.go`.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 
 use crate::unimplemented;
 
 #[derive(Subcommand, Debug)]
 pub enum NetworkCmd {
     /// Create a private named network from a template.
-    Create,
+    ///
+    /// Creates a collection of folders under the specified root directory
+    /// that make up the entire private network named 'private'
+    /// (simplifying cleanup).
+    Create(CreateArgs),
     /// Stops and Deletes a deployed private network.
     Delete,
     /// Pregenerate private network.
-    Pregen,
+    ///
+    /// Pregenerates the root and participation keys for a private network.
+    /// The pregen directory can then be passed to the 'goal network create'
+    /// to start the network more quickly.
+    Pregen(PregenArgs),
     /// Restart a deployed private network.
     Restart,
     /// Start a deployed private network.
@@ -44,15 +53,57 @@ pub enum NetworkCmd {
     Stop,
 }
 
-pub fn run(cmd: NetworkCmd) -> ExitCode {
-    let leaf = match cmd {
-        NetworkCmd::Create => "create",
-        NetworkCmd::Delete => "delete",
-        NetworkCmd::Pregen => "pregen",
-        NetworkCmd::Restart => "restart",
-        NetworkCmd::Start => "start",
-        NetworkCmd::Status => "status",
-        NetworkCmd::Stop => "stop",
-    };
-    unimplemented("network", leaf)
+/// `networkCreateCmd` flags (`cmd/goal/network.go:40-47`).
+#[derive(Args, Debug, Default)]
+pub struct CreateArgs {
+    /// Specify the name to use for the private network.
+    #[arg(short = 'n', long = "network")]
+    pub network: Option<String>,
+    /// Specify the path to the template file for the network.
+    #[arg(short = 't', long = "template")]
+    pub template: Option<PathBuf>,
+    /// Do not import root keys when creating the network (by default will
+    /// import).
+    #[arg(short = 'K', long = "noimportkeys")]
+    pub noimportkeys: bool,
+    /// Prevents auto-cleanup on error - for diagnosing problems.
+    #[arg(long = "noclean")]
+    pub noclean: bool,
+    /// Forces the configuration to enable DevMode, returns an error if the
+    /// template is not compatible with DevMode.
+    #[arg(long = "devMode")]
+    pub dev_mode: bool,
+    /// Automatically start the network after creating it.
+    #[arg(short = 's', long = "start")]
+    pub start: bool,
+    /// Specify the path to the directory with pregenerated genesis.json,
+    /// root and partkeys to import into the network directory. By default,
+    /// the genesis.json and keys will be generated on start. This should
+    /// only be used on private networks.
+    #[arg(short = 'p', long = "pregendir")]
+    pub pregendir: Option<PathBuf>,
+}
+
+/// `networkPregenCmd` flags (`cmd/goal/network.go:70-71`).
+#[derive(Args, Debug, Default)]
+pub struct PregenArgs {
+    /// Specify the path to the template file for the network.
+    #[arg(short = 't', long = "template")]
+    pub template: Option<PathBuf>,
+    /// Specify the path to the directory to export genesis.json, root and
+    /// partkey files. This should only be used on private networks.
+    #[arg(short = 'p', long = "pregendir")]
+    pub pregendir: Option<PathBuf>,
+}
+
+pub fn run(cmd: NetworkCmd, rootdir: Option<PathBuf>) -> ExitCode {
+    match cmd {
+        NetworkCmd::Create(args) => crate::cmd::network::run_create(rootdir, args),
+        NetworkCmd::Pregen(args) => crate::cmd::network::run_pregen(rootdir, args),
+        NetworkCmd::Delete => unimplemented("network", "delete"),
+        NetworkCmd::Restart => unimplemented("network", "restart"),
+        NetworkCmd::Start => unimplemented("network", "start"),
+        NetworkCmd::Status => unimplemented("network", "status"),
+        NetworkCmd::Stop => unimplemented("network", "stop"),
+    }
 }
