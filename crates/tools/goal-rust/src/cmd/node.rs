@@ -1052,6 +1052,21 @@ fn endpoint(data_dir: &Path) -> Result<(String, String), String> {
     Ok((url, token))
 }
 
+/// go: `makeStatusString(client.Status())` for one node -- what
+/// `goal network status` prints per node.
+pub(crate) fn status_text(data_dir: &Path) -> Result<String, String> {
+    let (url, token) = endpoint(data_dir)?;
+    let client = AlgodClient::new(url, token);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let stat = runtime
+        .block_on(client.get_status())
+        .map_err(|e| e.to_string())?;
+    Ok(make_status_string(&stat))
+}
+
 fn build_client(data_dir: &Path) -> Result<AlgodClient, ()> {
     match endpoint(data_dir) {
         Ok((url, token)) => Ok(AlgodClient::new(url, token)),

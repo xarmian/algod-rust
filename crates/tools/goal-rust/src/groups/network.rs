@@ -25,7 +25,6 @@ use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
 
-use crate::unimplemented;
 
 #[derive(Subcommand, Debug)]
 pub enum NetworkCmd {
@@ -46,11 +45,21 @@ pub enum NetworkCmd {
     /// Restart a deployed private network.
     Restart,
     /// Start a deployed private network.
-    Start,
+    ///
+    /// Start a deployed private network by starting each individual node.
+    Start(StartArgs),
     /// Prints status for all nodes in a deployed private network.
     Status,
     /// Stop a deployed private network.
     Stop,
+}
+
+/// `networkStartCmd` flags (`cmd/goal/network.go:60`).
+#[derive(Args, Debug, Default)]
+pub struct StartArgs {
+    /// Specify the name of a specific node to start.
+    #[arg(short = 'n', long = "node")]
+    pub node: Option<String>,
 }
 
 /// `networkCreateCmd` flags (`cmd/goal/network.go:40-47`).
@@ -100,10 +109,10 @@ pub fn run(cmd: NetworkCmd, rootdir: Option<PathBuf>) -> ExitCode {
     match cmd {
         NetworkCmd::Create(args) => crate::cmd::network::run_create(rootdir, args),
         NetworkCmd::Pregen(args) => crate::cmd::network::run_pregen(rootdir, args),
-        NetworkCmd::Delete => unimplemented("network", "delete"),
-        NetworkCmd::Restart => unimplemented("network", "restart"),
-        NetworkCmd::Start => unimplemented("network", "start"),
-        NetworkCmd::Status => unimplemented("network", "status"),
-        NetworkCmd::Stop => unimplemented("network", "stop"),
+        NetworkCmd::Delete => crate::cmd::network::run_delete(rootdir),
+        NetworkCmd::Restart => crate::cmd::network::run_restart(rootdir),
+        NetworkCmd::Start(args) => crate::cmd::network::run_start(rootdir, args),
+        NetworkCmd::Status => crate::cmd::network::run_status(rootdir),
+        NetworkCmd::Stop => crate::cmd::network::run_stop(rootdir),
     }
 }

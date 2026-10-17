@@ -271,3 +271,100 @@ fn create_with_a_relative_rootdir_still_imports_the_keys() {
     assert!(out.status.success(), "{} {}", stdout(&out), stderr(&out));
     assert!(stdout(&out).contains("Imported 2 keys"), "{}", stdout(&out));
 }
+
+// ---- lifecycle: start / stop / status / restart / delete (issue #1993) ----
+
+const RELAY_TEMPLATE: &str = r#"{
+  "Genesis": {"NetworkName": "relaynet", "FirstPartKeyRound": 0, "LastPartKeyRound": 20,
+    "Wallets": [{"Name": "W1", "Stake": 100, "Online": true}]},
+  "Nodes": [{"Name": "Relay", "IsRelay": true, "Wallets": []},
+            {"Name": "N1", "Wallets": [{"Name": "W1"}]}]
+}"#;
+
+#[test]
+fn lifecycle_commands_need_a_deployed_network() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("nothing").display().to_string();
+    for cmd in ["start", "stop", "status", "restart", "delete"] {
+        let out = goal(&["network", cmd, "-r", &root]);
+        assert_eq!(out.status.code(), Some(1), "{cmd}");
+        assert!(stderr(&out).contains("Error loading deployed network: "), "{cmd}: {}", stderr(&out));
+    }
+    let out = goal(&["network", "stop"]);
+    assert!(stderr(&out).contains("required flag(s) \"rootdir\" not set"), "{}", stderr(&out));
+}
+
+#[test]
+fn a_multi_node_network_is_refused_until_relay_addresses_exist() {
+    let tmp = tempfile::tempdir().unwrap();
+    let template = write_template(tmp.path(), RELAY_TEMPLATE);
+    let root = tmp.path().join("net").display().to_string();
+    let out = goal(&["network", "create", "-r", &root, "-t", &template]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = goal(&["network", "start", "-r", &root]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("Error starting deployed network: this network has 2 nodes"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn stop_and_delete_report_like_go_and_delete_removes_the_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let template = write_template(tmp.path(), TEMPLATE);
+    let root = tmp.path().join("net");
+    let r = root.display().to_string();
+    assert!(goal(&["network", "create", "-r", &r, "-t", &template]).status.success());
+    let out = goal(&["network", "stop", "-r", &r]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains(&format!("Network Stopped under {r}")), "{}", stdout(&out));
+    let out = goal(&["network", "delete", "-r", &r]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains(&format!("Network Deleted under {r}")), "{}", stdout(&out));
+    assert!(!root.exists());
+}
+
+// unix only: starting and stopping real daemons
+#[cfg(unix)]
+#[test]
+fn a_devmode_network_starts_reports_status_restarts_and_deletes() {
+    let dir = ensure_kmd_next_to_goal();
+    let algod = format!("algod-rust{}", std::env::consts::EXE_SUFFIX);
+    if !dir.join(&algod).is_file() {
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let st = Command::new(cargo).args(["build", "-p", "algod-rust"]).status().unwrap();
+        assert!(st.success());
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let template = write_template(tmp.path(), TEMPLATE);
+    let root = tmp.path().join("net");
+    let r = root.display().to_string();
+    let out = goal(&["network", "create", "-r", &r, "-t", &template, "--devMode"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let out = goal(&["network", "start", "-r", &r]);
+    assert!(out.status.success(), "{} {}", stdout(&out), stderr(&out));
+    assert!(stdout(&out).contains(&format!("Network Started under {r}")));
+
+    let out = goal(&["network", "status", "-r", &r]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("[Primary]"), "{}", stdout(&out));
+    assert!(stdout(&out).contains("Last committed block:"), "{}", stdout(&out));
+
+    let out = goal(&["network", "restart", "-r", &r]);
+    assert!(out.status.success(), "{} {}", stdout(&out), stderr(&out));
+
+    let out = goal(&["network", "delete", "-r", &r]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!root.exists());
+
+    // create --start does both
+    let out = goal(&["network", "create", "-r", &r, "-t", &template, "--devMode", "--start"]);
+    assert!(out.status.success(), "{} {}", stdout(&out), stderr(&out));
+    assert!(stdout(&out).contains(&format!("Network Started under {r}")), "{}", stdout(&out));
+    let out = goal(&["network", "delete", "-r", &r]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!root.exists());
+}
