@@ -386,8 +386,12 @@ const ERROR_TIMED_OUT_WAITING: &str = "Timed out waiting for node to make progre
 pub fn validate_catchpoint_args(args: &[String]) -> Result<Option<String>, String> {
     let mut label: Option<String> = None;
     for arg in args {
-        if !is_valid_catchpoint_label(arg) {
-            return Err(ERROR_CATCHPOINT_LABEL_PARSING_FAILED.to_string());
+        match parse_catchpoint_label(arg) {
+            Ok(()) => {}
+            Err(CatchpointLabelError::ParsingFailed) => {
+                return Err(ERROR_CATCHPOINT_LABEL_PARSING_FAILED.to_string());
+            }
+            Err(CatchpointLabelError::Other(e)) => return Err(e),
         }
         if label.is_some() {
             return Err(ERROR_TOO_MANY_CATCHPOINT_LABELS.to_string());
@@ -448,6 +452,12 @@ pub fn format_pending_txns(doc: &serde_json::Value, max: u64) -> String {
     out
 }
 
+/// go: `strings.ReplaceAll(text, "\n", "") == "yes"`; a Windows console also
+/// delivers the `\r`.
+fn consent_given(line: &str) -> bool {
+    line.trim_end_matches(['\n', '\r']) == "yes"
+}
+
 fn indent4(v: &serde_json::Value) -> String {
     use serde::Serialize as _;
     let mut buf = Vec::new();
@@ -505,12 +515,14 @@ pub fn run_catchup(args: crate::groups::node::CatchupArgs, cli_d: Vec<PathBuf>) 
         if multi {
             println!("{}{}]", crate::data_dir::INFO_DATA_DIR_FMT, dir.display());
         }
-        let Ok(client) = build_client(dir) else {
-            return ExitCode::from(1);
+        let (url, token) = match endpoint(dir) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("{}", node_status_error(&e));
+                return ExitCode::from(1);
+            }
         };
-        let Ok((url, token)) = endpoint(dir) else {
-            return ExitCode::from(1);
-        };
+        let client = AlgodClient::new(url.clone(), token.clone());
         let http = http();
 
         if args.abort {
@@ -533,9 +545,21 @@ pub fn run_catchup(args: crate::groups::node::CatchupArgs, cli_d: Vec<PathBuf>) 
                     .send()
                     .await
             });
-            if let Err(e) = res.and_then(reqwest::Response::error_for_status) {
-                eprintln!("{}", node_status_error(&e.to_string()));
-                return ExitCode::from(1);
+            match res {
+                Err(e) => {
+                    eprintln!("{}", node_status_error(&e.to_string()));
+                    return ExitCode::from(1);
+                }
+                Ok(resp) if !resp.status().is_success() => {
+                    let status = resp.status();
+                    let body = rt.block_on(resp.text()).unwrap_or_default();
+                    eprintln!(
+                        "{}",
+                        node_status_error(&format!("HTTP {status}: {}", body.trim()))
+                    );
+                    return ExitCode::from(1);
+                }
+                Ok(_) => {}
             }
             continue;
         }
@@ -566,7 +590,7 @@ pub fn run_catchup(args: crate::groups::node::CatchupArgs, cli_d: Vec<PathBuf>) 
                     let _ = std::io::Write::flush(&mut std::io::stdout());
                     let mut line = String::new();
                     let _ = std::io::stdin().read_line(&mut line);
-                    if line.replace('\n', "") != "yes" {
+                    if !consent_given(&line) {
                         eprintln!("{ERROR_ABORTED_PER_USER_REQUEST}");
                         return ExitCode::from(1);
                     }
@@ -687,7 +711,11 @@ pub fn run_pendingtxns(args: crate::groups::node::PendingTxnsArgs, cli_d: Vec<Pa
             if !status.is_success() {
                 return Err(format!("HTTP {status}: {}", body.trim()));
             }
-            serde_json::from_str::<serde_json::Value>(&body).map_err(|e| e.to_string())
+            let doc = serde_json::from_str::<serde_json::Value>(&body).map_err(|e| e.to_string())?;
+            if doc.get("total-transactions").is_none() {
+                return Err("unexpected pending transactions response".to_string());
+            }
+            Ok(doc)
         });
         match fetched {
             Ok(doc) => print!("{}", format_pending_txns(&doc, args.max)),
@@ -922,7 +950,7 @@ fn write_token(path: &Path, token: &str) -> std::io::Result<()> {
 /// parity is pinned now; the future `catchup` port should call this
 /// directly rather than re-deriving it.
 pub(crate) async fn get_missing_catchpoint_label(url: &str) -> Result<String, String> {
-    let resp = reqwest::get(url).await.map_err(|e| e.to_string())?;
+    let resp = http().get(url).send().await.map_err(|e| e.to_string())?;
     let status = resp.status();
     if status.as_u16() != 200 {
         // Mirrors Go's `resp.Status` format: "404 Not Found".
@@ -944,16 +972,45 @@ pub(crate) async fn get_missing_catchpoint_label(url: &str) -> Result<String, St
 /// well-formedness check `get_missing_catchpoint_label` needs, without
 /// pulling in `algo-ledger`.
 fn is_valid_catchpoint_label(label: &str) -> bool {
+    parse_catchpoint_label(label).is_ok()
+}
+
+/// `ledgercore.ParseCatchpointLabel` with go's error texts: the sentinel
+/// `ErrCatchpointParsingFailed` for a wrong shape or an over-long hash, the raw
+/// `strconv` / `base32` error for a bad round or bad hash characters (go's
+/// `catchpointCmdArgument` only maps the sentinel to a friendlier message).
+pub fn parse_catchpoint_label(label: &str) -> Result<(), CatchpointLabelError> {
     let mut parts = label.split('#');
     let (Some(round), Some(hash), None) = (parts.next(), parts.next(), parts.next()) else {
-        return false;
+        return Err(CatchpointLabelError::ParsingFailed);
     };
-    if round.parse::<u64>().is_err() {
-        return false;
+    if let Err(e) = round.parse::<u64>() {
+        use std::num::IntErrorKind;
+        let why = match e.kind() {
+            IntErrorKind::PosOverflow => "value out of range",
+            _ => "invalid syntax",
+        };
+        return Err(CatchpointLabelError::Other(format!(
+            "strconv.ParseUint: parsing \"{round}\": {why}"
+        )));
     }
-    data_encoding::BASE32_NOPAD
-        .decode(hash.as_bytes())
-        .is_ok_and(|bytes| bytes.len() <= 32)
+    match data_encoding::BASE32_NOPAD.decode(hash.as_bytes()) {
+        Ok(bytes) if bytes.len() > 32 => Err(CatchpointLabelError::ParsingFailed),
+        Ok(_) => Ok(()),
+        Err(e) => Err(CatchpointLabelError::Other(format!(
+            "illegal base32 data at input byte {}",
+            e.position
+        ))),
+    }
+}
+
+/// How a catchpoint label failed to parse.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CatchpointLabelError {
+    /// go: `ledgercore.ErrCatchpointParsingFailed`.
+    ParsingFailed,
+    /// go: the underlying `strconv` / `base32` error text.
+    Other(String),
 }
 
 /// go: `ensureAlgodClient` -- the REST base URL from `algod.net` and the
@@ -1524,6 +1581,44 @@ mod tests {
         assert_eq!(
             format_pending_txns(&two, 1),
             "Pending Transactions (Truncated max=1, Total in pool=7): \n{\n    \"txn\": {\n        \"type\": \"pay\"\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn catchpoint_label_errors_use_gos_texts() {
+        let hash = "2YMHX6VN6SNZXF5HD6JDBTVCA4F2AE4PHMEHLFL6Q2X7N3NQX4MA";
+        // wrong shape and an over-long hash are go's sentinel
+        assert_eq!(parse_catchpoint_label("nohash"), Err(CatchpointLabelError::ParsingFailed));
+        assert_eq!(
+            parse_catchpoint_label(&format!("1#{hash}AAAAAAAA")),
+            Err(CatchpointLabelError::ParsingFailed)
+        );
+        // a bad round / bad base32 are the raw library errors, which go prints unchanged
+        assert_eq!(
+            validate_catchpoint_args(&[format!("abc#{hash}")]),
+            Err("strconv.ParseUint: parsing \"abc\": invalid syntax".to_string())
+        );
+        assert_eq!(
+            validate_catchpoint_args(&["99999999999999999999#AA".to_string()]),
+            Err("strconv.ParseUint: parsing \"99999999999999999999\": value out of range".to_string())
+        );
+        assert_eq!(
+            validate_catchpoint_args(&["1#AB1".to_string()]),
+            Err("illegal base32 data at input byte 2".to_string())
+        );
+    }
+
+    #[test]
+    fn the_consent_prompt_accepts_exactly_yes_even_with_crlf() {
+        assert!(consent_given("yes\n"));
+        assert!(consent_given("yes\r\n"));
+        assert!(consent_given("yes"));
+        assert!(!consent_given("y\n"));
+        assert!(!consent_given("Yes\n"));
+        assert!(!consent_given("\n"));
+        assert_eq!(
+            format_message(NODE_CONFIRM_IMPLICIT_CATCHPOINT, &["1#AB"]),
+            "Fast catchup to 1#AB is about to start.\nUsing external catchpoints is not a secure practice and should not be done for consensus participating nodes.\nType 'yes' to accept the risk and continue: "
         );
     }
 }

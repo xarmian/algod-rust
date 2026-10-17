@@ -196,6 +196,31 @@ fn pendingtxns_asks_for_json_with_the_cap_and_prints_go_s_header() {
 }
 
 #[test]
+fn pendingtxns_does_not_report_none_for_an_unexpected_response() {
+    let (port, _) = mock(|_, _| (200, r#"{"something": "else"}"#.to_string()));
+    let dir = data_dir(port);
+    let out = goal(dir.path(), &["pendingtxns"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Cannot contact Algorand node: "));
+    assert!(out.stdout.is_empty(), "must not print None");
+}
+
+#[test]
+fn catchup_abort_surfaces_the_node_message_on_failure() {
+    let (port, _) = mock(|line, _| {
+        if line.starts_with("GET /v2/status") {
+            (200, status(10, "1#ABC"))
+        } else {
+            (400, r#"{"message":"no catchup in progress"}"#.to_string())
+        }
+    });
+    let dir = data_dir(port);
+    let out = goal(dir.path(), &["catchup", "--abort"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no catchup in progress"));
+}
+
+#[test]
 fn wait_succeeds_as_soon_as_the_round_advances() {
     let (port, _) = mock(|_, n| (200, status(100 + n as u64, "")));
     let dir = data_dir(port);
