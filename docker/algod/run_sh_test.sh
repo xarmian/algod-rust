@@ -99,6 +99,7 @@ echo '{"id":"x"}' >"$DATA/genesis.json"
 export ALGOD_PORT=9090 PEER_ADDRESS="1.2.3.4:4160;5.6.7.8:4160" GOSSIP_PORT=4161 PROFILE=participation
 run_main
 has "ALGOD_PORT sets EndpointAddress" '^algocfg set -p EndpointAddress -v 0.0.0.0:9090 -d \.$' "$CALLS"
+has "the peers are announced on their own line" '^Using peer\(s\): 1\.2\.3\.4:4160;5\.6\.7\.8:4160$' "$D/out.log"
 has "PEER_ADDRESS is handed to algod -p" '^algod -o -p 1.2.3.4:4160;5.6.7.8:4160$' "$CALLS"
 has "GOSSIP_PORT sets NetAddress" '^algocfg set -p NetAddress -v 0.0.0.0:4161 -d \.$' "$CALLS"
 has "GOSSIP_PORT enables networking" '^algocfg set -p DisableNetworking -v false -d \.$' "$CALLS"
@@ -111,6 +112,16 @@ echo '{"id":"x"}' >"$DATA/genesis.json"
 export TOKEN=aaaa ADMIN_TOKEN=bbbb
 run_main
 [ "$(cat "$DATA/algod.token" 2>/dev/null)" = "aaaa" ] && ok "TOKEN written to algod.token" || bad "TOKEN not written"
+# a token that echo would treat as an option or escape is stored verbatim
+new_case
+echo '{"id":"x"}' >"$DATA/genesis.json"
+export TOKEN='-n\tx'
+run_main
+[ "$(cat "$DATA/algod.token" 2>/dev/null)" = '-n\tx' ] && ok "an echo-hostile TOKEN is stored verbatim" || bad "TOKEN mangled: $(cat "$DATA/algod.token" 2>/dev/null)"
+new_case
+echo '{"id":"x"}' >"$DATA/genesis.json"
+export TOKEN=aaaa ADMIN_TOKEN=bbbb
+run_main
 [ "$(cat "$DATA/algod.admin.token" 2>/dev/null)" = "bbbb" ] && ok "ADMIN_TOKEN written to algod.admin.token" || bad "ADMIN_TOKEN not written"
 
 # ---- 4. /etc/algorand overrides -----------------------------------------------------
@@ -154,14 +165,41 @@ has "unknown network says so" "No genesis file for 'nope' is available\." "$D/ou
 new_case
 export NETWORK=testnet GENESIS_ADDRESS="http://peer:8080"
 run_main
-has "GENESIS_ADDRESS downloads the genesis from the peer" '^curl http://peer:8080/genesis -o genesis\.json$' "$CALLS"
+has "GENESIS_ADDRESS downloads the genesis from the peer" '^curl -fsS http://peer:8080/genesis -o genesis\.json$' "$CALLS"
 [ "$(cat "$DATA/genesis.json")" = "downloaded" ] && ok "downloaded genesis is used" || bad "downloaded genesis not used"
+
+# a failed download leaves no genesis.json behind and exits 1
+new_case
+export NETWORK=testnet GENESIS_ADDRESS="http://peer:8080"
+cat >"$BIN/curl" <<'EOF2'
+#!/usr/bin/env bash
+echo "curl $*" >>"$CALLS"
+while [ $# -gt 0 ]; do
+    if [ "$1" = "-o" ]; then echo "<html>404</html>" >"$2"; fi
+    shift
+done
+exit 22
+EOF2
+run_main
+[ "$RC" = 1 ] && ok "a failed genesis download exits 1" || bad "failed download exit code $RC"
+[ ! -e "$DATA/genesis.json" ] && ok "a failed download leaves no genesis.json" || bad "error page kept as genesis.json"
+has "a failed download says so" 'Unable to download the genesis file from http://peer:8080' "$D/out.log"
+# restore the working stub
+cat >"$BIN/curl" <<'EOF2'
+#!/usr/bin/env bash
+echo "curl $*" >>"$CALLS"
+while [ $# -gt 0 ]; do
+    if [ "$1" = "-o" ]; then echo downloaded >"$2"; fi
+    shift
+done
+EOF2
 
 # ---- 6. telemetry options are accepted --------------------------------------------------
 new_case
 echo '{"id":"x"}' >"$DATA/genesis.json"
 export TELEMETRY_NAME=node1 TELEMETRY_URL=https://t.example
 run_main
+has "TELEMETRY_NAME warns that it is ignored" 'TELEMETRY_NAME is accepted but ignored' "$D/out.log"
 has "TELEMETRY_NAME is passed to diagcfg" "^diagcfg telemetry name -n node1 -d $DATA\$" "$CALLS"
 has "TELEMETRY_URL is passed to diagcfg" "^diagcfg telemetry endpoint -e https://t\.example -d $DATA\$" "$CALLS"
 has "telemetry is enabled" "^diagcfg telemetry enable -d $DATA\$" "$CALLS"

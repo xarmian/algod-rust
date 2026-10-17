@@ -127,15 +127,16 @@ configure_data_dir() {
   # set token overrides
   for dir in "${ALGORAND_DATA}"/../*/; do
     if [ "$TOKEN" != "" ]; then
-      echo "$TOKEN" >"$dir/algod.token"
+      printf '%s\n' "$TOKEN" >"$dir/algod.token"
     fi
     if [ "$ADMIN_TOKEN" != "" ]; then
-      echo "$ADMIN_TOKEN" >"$dir/algod.admin.token"
+      printf '%s\n' "$ADMIN_TOKEN" >"$dir/algod.admin.token"
     fi
   done
 
   # configure telemetry (accepted for compatibility; algod-rust has none)
   if [ "$TELEMETRY_NAME" != "" ]; then
+    echo "TELEMETRY_NAME is accepted but ignored: algod-rust has no telemetry." >&2
     diagcfg telemetry name -n "$TELEMETRY_NAME" -d "$ALGORAND_DATA"
     if [ "$TELEMETRY_URL" != "" ]; then
       diagcfg telemetry endpoint -e "$TELEMETRY_URL" -d "$ALGORAND_DATA"
@@ -159,7 +160,7 @@ configure_data_dir() {
     fi
 
     if [ "$KMD_TOKEN" != "" ]; then
-      echo "$KMD_TOKEN" >kmd.token
+      printf '%s\n' "$KMD_TOKEN" >kmd.token
     fi
     cd "$ALGORAND_DATA"
   fi
@@ -176,7 +177,7 @@ start_public_network() {
   fi
 
   if [ "$PEER_ADDRESS" != "" ]; then
-    printf '%s' "$PEER_ADDRESS"
+    echo "Using peer(s): $PEER_ADDRESS"
     exec_algod -o -p "$PEER_ADDRESS"
   else
     # redirect output to stdout
@@ -192,7 +193,13 @@ start_new_public_network() {
   if [ "$GENESIS_ADDRESS" != "" ]; then
     # download genesis file from peer
     echo "Attempting to download genesis file from $GENESIS_ADDRESS"
-    curl "$GENESIS_ADDRESS/genesis" -o genesis.json
+    # -f: an HTTP error must not leave an error page behind as genesis.json
+    # (every later start would take the "existing data dir" branch with it)
+    if ! curl -fsS "$GENESIS_ADDRESS/genesis" -o genesis.json; then
+      rm -f genesis.json
+      echo "Unable to download the genesis file from $GENESIS_ADDRESS" >&2
+      exit 1
+    fi
   elif [ -n "$NETWORK" ] && [ -d "$GENESIS_DIR/${NETWORK}" ]; then
     echo "Installing genesis file for ${NETWORK}"
     cp "$GENESIS_DIR/${NETWORK}/genesis.json" genesis.json

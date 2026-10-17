@@ -500,7 +500,8 @@ jobs:
           target: ${{ matrix.target }}
           platforms: linux/amd64
           push: false
-          load: true
+          # only the algod image is run (smoke test below)
+          load: ${{ matrix.target == 'algod' }}
           tags: algod-rust-pr-check:${{ matrix.target }}
           build-args: |
             GIT_TAG=pr-check
@@ -518,6 +519,8 @@ jobs:
         run: |
           set -euo pipefail
           img=algod-rust-pr-check:algod
+          # always show what the node said and remove the container
+          trap 'docker logs algod-smoke 2>&1 | tail -40 || true; docker rm -f algod-smoke >/dev/null 2>&1 || true' EXIT
           docker run --rm --entrypoint sh "$img" -c \
             'for c in algod goal kmd algokey algocfg diagcfg; do command -v $c; done; id algorand; test -d /algod/data'
           docker run --rm --entrypoint algod "$img" -v
@@ -541,7 +544,6 @@ jobs:
           took=$(( $(date +%s) - start ))
           echo "docker stop took ${took}s"
           test "$took" -lt 20
-          docker logs algod-smoke 2>&1 | tail -20
 
   smoke-test:
     name: Smoke test published image
