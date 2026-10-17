@@ -4599,6 +4599,32 @@ pub struct CatchupPeerOptions {
     pub token: String,
 }
 
+/// How many relay addresses from the phonebook are offered as catchpoint
+/// sources when no `--catchup-peer` is given.
+const DEFAULT_CATCHUP_PEER_CANDIDATES: usize = 8;
+
+/// go's `CatchpointCatchupService` downloads over the gossip network from
+/// whichever relays the node is connected to; algod-rust's catchup is
+/// REST-based, but a relay serves the catchpoint files and blocks on its
+/// gossip port over plain HTTP. Turns the phonebook's `host:port` relay
+/// addresses into such URLs: the first becomes the catchup peer, the rest the
+/// ranked extra catchpoint-file candidates (issue #2006). Addresses that are
+/// already URLs are kept as given; blanks are dropped.
+fn catchup_urls_from_relay_addresses(addresses: &[String]) -> Vec<String> {
+    addresses
+        .iter()
+        .map(|a| a.trim())
+        .filter(|a| !a.is_empty())
+        .map(|a| {
+            if a.starts_with("http://") || a.starts_with("https://") {
+                a.to_string()
+            } else {
+                format!("http://{a}")
+            }
+        })
+        .collect()
+}
+
 /// CLI overrides for the networking `config.json` fields wired into
 /// `algo-network` (issue #748). Each `None` means "not explicitly passed
 /// on the CLI" — the loaded `algo_config::Local` value applies instead
@@ -5791,7 +5817,7 @@ pub async fn run(
         ..Default::default()
     };
 
-    let gossip_node = Arc::new(WebsocketNetwork::new(net_config, phonebook));
+    let gossip_node = Arc::new(WebsocketNetwork::new(net_config, phonebook.clone()));
 
     // -------------------------------------------------------------------
     // Construct the transaction pool early and register the inbound TX
@@ -6539,7 +6565,29 @@ pub async fn run(
     // `node start --follow`, which already has one). Also skipped on an
     // archival node, mirroring go's own refusal
     // (`AlgorandFullNode.StartCatchup`) and `node.rs`'s `--follow` wiring.
-    let catchup_manager = match catchup_opts.url.as_deref() {
+    //
+    // Issue #2006: without `--catchup-peer` the catchup source is taken from
+    // the relays this node's phonebook knows (`--peers` or DNS discovery),
+    // like go which catches up over its gossip connections, so
+    // `POST /v2/catchup` (and the image's `FAST_CATCHUP=1`) works on every
+    // node started by `algod -d`.
+    let (catchup_url, extra_catchup_urls) = match catchup_opts.url.clone() {
+        Some(url) => (Some(url), Vec::new()),
+        None if ws_active => {
+            let mut urls = catchup_urls_from_relay_addresses(
+                &phonebook.get_addresses(DEFAULT_CATCHUP_PEER_CANDIDATES, RELAY_ROLE),
+            );
+            if urls.is_empty() {
+                (None, Vec::new())
+            } else {
+                let first = urls.remove(0);
+                info!(peer = %first, extra = urls.len(), "catchup source taken from the gossip phonebook");
+                (Some(first), urls)
+            }
+        }
+        None => (None, Vec::new()),
+    };
+    let catchup_manager = match catchup_url.as_deref() {
         Some(url) if !node_config.archival => {
             let live_catchup_params = crate::live_catchup::LiveCatchupParams {
                 algod_url: url.to_string(),
@@ -6548,7 +6596,7 @@ pub async fn run(
                 genesis_id: resolved_genesis_id.clone(),
                 genesis_hash,
                 concurrency: 8,
-                catchpoint_peer_urls: Vec::new(),
+                catchpoint_peer_urls: extra_catchup_urls,
                 // Issue #1130: hand the live catchup fetcher this node's
                 // own running P2P transport (if P2P is enabled and
                 // connected) so `AlgodSyncBackend`'s `RankedCatchpointSource`
@@ -6900,6 +6948,26 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
+    // ── Issue #2006: catchup source from the gossip phonebook ───────────
+    #[test]
+    fn relay_addresses_become_http_catchup_urls_first_is_the_peer() {
+        let urls = catchup_urls_from_relay_addresses(&[
+            "r-aa.algorand-testnet.network:4160".to_string(),
+            " ".to_string(),
+            "https://relay.example:443".to_string(),
+            "10.0.0.2:4161".to_string(),
+        ]);
+        assert_eq!(
+            urls,
+            vec![
+                "http://r-aa.algorand-testnet.network:4160",
+                "https://relay.example:443",
+                "http://10.0.0.2:4161",
+            ]
+        );
+        assert!(catchup_urls_from_relay_addresses(&[]).is_empty());
+    }
+
     use super::*;
     use algo_pool::traits::BlockEvaluator;
     use algo_types::{
