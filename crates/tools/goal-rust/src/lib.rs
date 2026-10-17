@@ -161,6 +161,9 @@ pub enum RootCommand {
 
     /// Create and manage private, multi-node, locally-hosted networks.
     Network {
+        /// Root directory for the private network directories.
+        #[arg(short = 'r', long = "rootdir", global = true)]
+        rootdir: Option<std::path::PathBuf>,
         #[command(subcommand)]
         cmd: Option<groups::network::NetworkCmd>,
     },
@@ -251,8 +254,11 @@ pub fn run() -> ExitCode {
         RootCommand::Ledger { cmd: Some(c) } => groups::ledger::run(c),
         RootCommand::Ledger { cmd: None } => print_group_help(&["ledger"]),
         RootCommand::License => unimplemented("", "license"),
-        RootCommand::Network { cmd: Some(c) } => groups::network::run(c),
-        RootCommand::Network { cmd: None } => print_group_help(&["network"]),
+        RootCommand::Network {
+            rootdir,
+            cmd: Some(c),
+        } => groups::network::run(c, rootdir),
+        RootCommand::Network { cmd: None, .. } => print_group_help(&["network"]),
         RootCommand::Node { cmd: Some(c) } => groups::node::run(c),
         RootCommand::Node { cmd: None } => print_group_help(&["node"]),
         RootCommand::Protocols => unimplemented("", "protocols"),

@@ -444,6 +444,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "algo-netdeploy"
+version = "0.1.0"
+dependencies = [
+ "algo-ledger",
+ "algo-types",
+ "base64 0.23.1",
+ "ed25519-dalek",
+ "rand 0.10.3",
+ "rmpv",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "algo-network"
 version = "0.1.0"
 dependencies = [
@@ -2581,6 +2598,7 @@ dependencies = [
  "algo-error",
  "algo-kmd-api-types",
  "algo-kmd-client",
+ "algo-netdeploy",
  "algo-rest-client",
  "algo-txn-pipeline",
  "algo-types",
