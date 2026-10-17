@@ -155,14 +155,14 @@ collect_testnet() {  # collect_testnet <go|rust>
         sleep 2
     done
     echo "$started" >"$d/testnet_catchup_started.txt"
-    if [ "$started" = False ]; then
-        # diagnostics for a catchup that never started: what does the command
-        # the entrypoint ran say when run by hand, and is it still running?
-        { echo "== ps"; docker exec "$c" sh -c 'ps aux 2>/dev/null || ls /proc | head -50';           echo "== goal node catchup"; timeout 90 docker exec "$c" goal node catchup --force --min 1000000 2>&1; echo "rc=$?"; }             >"$d/testnet_catchup_cmd.log" 2>&1
-    fi
     $x ls -A /algod/data | grep -Ev '^(.*\.log|algod\.(lock|pid|net)|node\.archive|.*-v1)$' | sort >"$d/testnet_data_layout.txt"
     $x sh -c 'ls -ln /algod/data/genesis.json | awk "{print \$3, \$4}"' >"$d/testnet_genesis_owner.txt"
     $x goal node status 2>&1 | grep -E '^(Genesis ID|Last consensus protocol)' >"$d/testnet_node_status.txt"
+    if [ "$started" = False ]; then
+        # (after every capture, it changes the node's state) diagnostics for a catchup that never started: what does the command
+        # the entrypoint ran say when run by hand, and is it still running?
+        { echo "== ps"; docker exec "$c" sh -c 'ps aux 2>/dev/null || ls /proc | head -50';           echo "== goal node catchup"; timeout 90 docker exec "$c" goal node catchup --force --min 1000000 2>&1; echo "rc=$?"; }             >"$d/testnet_catchup_cmd.log" 2>&1
+    fi
     curl -s -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:$p/health" >"$d/testnet_health_code.txt"
     docker logs "$c" >"$d/testnet_container.log" 2>&1   # (.log: kept as an artifact, not compared)
     local t0 t1

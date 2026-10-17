@@ -91,6 +91,9 @@ catchup() {
     goal node status >/dev/null 2>&1 && break
     sleep "${CATCHUP_WAIT_SLEEP:-2}"
   done
+  if ! goal node status >/dev/null 2>&1; then
+    echo "FAST_CATCHUP: the node did not answer in time; trying to start the catchup anyway" >&2
+  fi
   for i in 1 2 3 4 5; do
     goal node catchup --force --min 1000000 && return 0
     sleep "$CATCHUP_DELAY"

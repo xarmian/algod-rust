@@ -6571,27 +6571,30 @@ pub async fn run(
     // like go which catches up over its gossip connections, so
     // `POST /v2/catchup` (and the image's `FAST_CATCHUP=1`) works on every
     // node started by `algod -d`.
-    let (catchup_url, extra_catchup_urls) = match catchup_opts.url.clone() {
-        Some(url) => (Some(url), Vec::new()),
+    let catchup_token_for_derived_peer = String::new();
+    let (catchup_url, extra_catchup_urls, catchup_token) = match catchup_opts.url.clone() {
+        Some(url) => (Some(url), Vec::new(), catchup_opts.token.clone()),
         None if ws_active => {
             let mut urls = catchup_urls_from_relay_addresses(
                 &phonebook.get_addresses(DEFAULT_CATCHUP_PEER_CANDIDATES, RELAY_ROLE),
             );
             if urls.is_empty() {
-                (None, Vec::new())
+                (None, Vec::new(), String::new())
             } else {
                 let first = urls.remove(0);
                 info!(peer = %first, extra = urls.len(), "catchup source taken from the gossip phonebook");
-                (Some(first), urls)
+                // (the `--catchup-peer-token` belongs to the peer the operator
+                // named, not to relays picked from DNS)
+                (Some(first), urls, catchup_token_for_derived_peer)
             }
         }
-        None => (None, Vec::new()),
+        None => (None, Vec::new(), String::new()),
     };
     let catchup_manager = match catchup_url.as_deref() {
         Some(url) if !node_config.archival => {
             let live_catchup_params = crate::live_catchup::LiveCatchupParams {
                 algod_url: url.to_string(),
-                algod_token: catchup_opts.token.clone(),
+                algod_token: catchup_token,
                 db_path: ledger_path.to_path_buf(),
                 genesis_id: resolved_genesis_id.clone(),
                 genesis_hash,
