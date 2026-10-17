@@ -22,22 +22,28 @@
 
 use std::process::ExitCode;
 
-use clap::Subcommand;
-
-use crate::unimplemented;
+use clap::{Args, Subcommand};
 
 #[derive(Subcommand, Debug)]
 pub enum KmdCmd {
     /// Start the kmd process, or restart it with an updated timeout.
-    Start,
+    Start(StartArgs),
     /// Stop the kmd process if it is running.
     Stop,
 }
 
+/// `startKMDCmd` flags (`cmd/goal/kmd.go:31`).
+#[derive(Args, Debug, Default)]
+pub struct StartArgs {
+    /// Number of seconds after which to shut down kmd if there are no
+    /// requests; 0 means no timeout.
+    #[arg(short = 't', long = "timeout", default_value_t = 0)]
+    pub timeout: u64,
+}
+
 pub fn run(cmd: KmdCmd) -> ExitCode {
-    let leaf = match cmd {
-        KmdCmd::Start => "start",
-        KmdCmd::Stop => "stop",
-    };
-    unimplemented("kmd", leaf)
+    match cmd {
+        KmdCmd::Start(args) => crate::cmd::kmd::run_start(args, crate::cli_state::datadirs(), crate::cli_state::kmddir()),
+        KmdCmd::Stop => crate::cmd::kmd::run_stop(crate::cli_state::datadirs(), crate::cli_state::kmddir()),
+    }
 }

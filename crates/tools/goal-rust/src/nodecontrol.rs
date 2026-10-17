@@ -251,7 +251,7 @@ pub fn read_pid(data_dir: &Path) -> Result<i64, String> {
     Ok(pid)
 }
 
-fn open_log(path: &Path) -> Option<File> {
+pub(crate) fn open_log(path: &Path) -> Option<File> {
     match File::create(path) {
         Ok(f) => Some(f),
         Err(e) => {
@@ -284,7 +284,7 @@ pub fn resolve_algod(exe_dir: Option<&Path>) -> (PathBuf, Vec<String>) {
     (PathBuf::from("algod-rust"), vec!["algod".into()])
 }
 
-fn find_on_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|d| d.join(name))
@@ -294,7 +294,7 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 /// The address to probe for the `algod.net` value: a node listening on all
 /// interfaces writes `0.0.0.0:port` / `[::]:port`, which is not connectable
 /// everywhere, so it is probed on loopback.
-fn probe_addr(net: &str) -> String {
+pub(crate) fn probe_addr(net: &str) -> String {
     let addr = net
         .trim()
         .trim_start_matches("http://")
@@ -313,7 +313,14 @@ fn http_health_ok(data_dir: &Path) -> bool {
     let Ok(net) = fs::read_to_string(data_dir.join("algod.net")) else {
         return false;
     };
-    let addr = probe_addr(net.lines().next().unwrap_or(""));
+    http_get_ok(net.lines().next().unwrap_or(""), "/health", None)
+}
+
+/// Does `GET <path>` on `net` (an `algod.net` / `kmd.net` style address, probed
+/// on loopback when it is a bind-all address) answer 200? `header` is an
+/// optional `(name, value)` request header (kmd's API token).
+pub(crate) fn http_get_ok(net: &str, path: &str, header: Option<(&str, &str)>) -> bool {
+    let addr = probe_addr(net);
     if addr.is_empty() {
         return false;
     }
@@ -326,10 +333,12 @@ fn http_health_ok(data_dir: &Path) -> bool {
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-    if stream
-        .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .is_err()
-    {
+    let extra = header
+        .map(|(k, v)| format!("{k}: {v}\r\n"))
+        .unwrap_or_default();
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{extra}Connection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
         return false;
     }
     let mut head = [0u8; 12];
@@ -339,13 +348,13 @@ fn http_health_ok(data_dir: &Path) -> bool {
     std::str::from_utf8(&head).is_ok_and(|s| s == "HTTP/1.1 200" || s == "HTTP/1.0 200")
 }
 
-enum Signal {
+pub(crate) enum Signal {
     Term,
     Kill,
 }
 
 #[cfg(unix)]
-fn process_alive(pid: i64) -> bool {
+pub(crate) fn process_alive(pid: i64) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
         return false;
     };
@@ -392,8 +401,15 @@ pub fn lock_is_held(data_dir: &Path) -> bool {
 /// of the doubt (as go does).
 #[cfg(unix)]
 fn looks_like_algod(pid: i64) -> bool {
+    looks_like(pid, "algod")
+}
+
+/// Does `pid`'s executable (or interpreted script) name start with `prefix`?
+/// Where `/proc` is unavailable the pid file gets the benefit of the doubt.
+#[cfg(unix)]
+pub(crate) fn looks_like(pid: i64, prefix: &str) -> bool {
     match fs::read(format!("/proc/{pid}/cmdline")) {
-        Ok(bytes) => cmdline_is_algod(&bytes),
+        Ok(bytes) => cmdline_has_prefix(&bytes, prefix),
         Err(_) => true,
     }
 }
@@ -405,6 +421,11 @@ fn looks_like_algod(pid: i64) -> bool {
 /// script's name.
 #[cfg(unix)]
 fn cmdline_is_algod(cmdline: &[u8]) -> bool {
+    cmdline_has_prefix(cmdline, "algod")
+}
+
+#[cfg(unix)]
+fn cmdline_has_prefix(cmdline: &[u8], prefix: &str) -> bool {
     let mut args = cmdline
         .split(|b| *b == 0)
         .filter(|a| !a.is_empty())
@@ -432,11 +453,11 @@ fn cmdline_is_algod(cmdline: &[u8]) -> bool {
                 .unwrap_or_default(),
         };
     }
-    name.starts_with("algod")
+    name.starts_with(prefix)
 }
 
 #[cfg(unix)]
-fn send_signal(pid: i64, sig: Signal) -> Result<(), String> {
+pub(crate) fn send_signal(pid: i64, sig: Signal) -> Result<(), String> {
     let pid = i32::try_from(pid).map_err(|e| e.to_string())?;
     let signo = match sig {
         Signal::Term => libc::SIGTERM,
@@ -451,7 +472,7 @@ fn send_signal(pid: i64, sig: Signal) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-fn process_alive(_pid: i64) -> bool {
+pub(crate) fn process_alive(_pid: i64) -> bool {
     false
 }
 
@@ -461,7 +482,12 @@ fn looks_like_algod(_pid: i64) -> bool {
 }
 
 #[cfg(not(unix))]
-fn send_signal(_pid: i64, _sig: Signal) -> Result<(), String> {
+pub(crate) fn looks_like(_pid: i64, _prefix: &str) -> bool {
+    false
+}
+
+#[cfg(not(unix))]
+pub(crate) fn send_signal(_pid: i64, _sig: Signal) -> Result<(), String> {
     Err("stopping a node is only supported on unix platforms".to_string())
 }
 

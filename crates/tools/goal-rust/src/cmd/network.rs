@@ -137,9 +137,9 @@ pub fn run_create(rootdir: Option<PathBuf>, args: CreateArgs) -> ExitCode {
     };
 
     if !args.noimportkeys {
-        eprintln!(
-            "warning: the root keys were not imported into kmd (not implemented yet, issue #1993); use 'goal account importrootkey' once kmd is running"
-        );
+        if let Err(e) = import_root_keys(&network) {
+            return fail(format!("{ERROR_CREATE_NETWORK}{e}"));
+        }
     }
     println!(
         "{}",
@@ -148,6 +148,38 @@ pub fn run_create(rootdir: Option<PathBuf>, args: CreateArgs) -> ExitCode {
             .replacen("{}", &root.display().to_string(), 1)
     );
     ExitCode::SUCCESS
+}
+
+/// go: `netdeploy.Network.Start`'s key import -- for every node that owns
+/// wallets, start its (private) kmd, import the root keys into the
+/// `unencrypted-default-wallet` (what `goal account importrootkey -u` does),
+/// and stop kmd again.
+fn import_root_keys(network: &algo_netdeploy::create::Network) -> Result<(), String> {
+    use crate::groups::account::ImportRootKeyArgs;
+    use crate::kmdcontrol::KmdController;
+
+    for (name, dir) in &network.node_dirs {
+        if !network.node_has_wallet.get(name).copied().unwrap_or(false) {
+            continue;
+        }
+        let node_dir = network.root_dir.join(dir);
+        let kmd_dir = node_dir.join(crate::data_dir::DEFAULT_KMD_DATA_DIR);
+        let controller = KmdController::new(&kmd_dir);
+        controller
+            .start(crate::kmdcontrol::DEFAULT_KMD_TIMEOUT_SECS)
+            .map_err(|e| format!("failed to start kmd for node {name}: {e}"))?;
+        let code = crate::cmd::account::run_importrootkey(
+            ImportRootKeyArgs { unencrypted: true, wallet: None, password: None },
+            vec![node_dir],
+            Some(kmd_dir),
+        );
+        let stopped = controller.stop();
+        if code != ExitCode::SUCCESS {
+            return Err(format!("failed to import the root keys of node {name}"));
+        }
+        stopped.map_err(|e| format!("failed to stop kmd for node {name}: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Port of `networkPregenCmd` (`network.go:296-347`).
