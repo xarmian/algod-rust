@@ -173,6 +173,12 @@ impl NetworkTemplate {
         let mut total = 0.0_f64;
         let mut accounts = std::collections::HashSet::new();
         for wallet in &self.genesis.wallets {
+            // wallet names become `<Name>.rootkey` / `<Name>.<first>.<last>.partkey`
+            // in the network root: they must stay inside it
+            let w = wallet.name.as_str();
+            if w.is_empty() || w == "." || w == ".." || w.contains(['/', '\\']) {
+                return invalid(format!("invalid Genesis account name '{w}'"));
+            }
             if !wallet.stake.is_finite() {
                 return invalid(format!("non-finite stake on Genesis account {}", wallet.name));
             }
@@ -189,14 +195,26 @@ impl NetworkTemplate {
         }
         const EPSILON: f64 = 0.000_000_1;
         let total_int = total.trunc() as i64;
-        if total_int != 100 && !(total_int < 100 && total > 100.0 - EPSILON) {
+        // (go only compares the truncated total, so 100.5 passes `Validate` and
+        // then panics while allocating; failing here gives the clear message
+        // before anything is created)
+        if total_int != 100 && !(total_int < 100 && total > 100.0 - EPSILON)
+            || total >= 100.0 + EPSILON
+        {
             return invalid(format!(
                 "Genesis account allocations must total 100 (actual {total})"
             ));
         }
 
         // Node names become directories under the network root: they must stay
-        // inside it and must not collide with the generated files.
+        // inside it, must not collide with the generated files, and must be
+        // unique even on a case-insensitive filesystem.
+        let mut node_names = std::collections::HashSet::new();
+        for node in &self.nodes {
+            if !node_names.insert(node.name.to_lowercase()) {
+                return invalid(format!("duplicate node name '{}'", node.name));
+            }
+        }
         for node in &self.nodes {
             let n = node.name.as_str();
             if n.is_empty()
@@ -410,6 +428,37 @@ mod tests {
         t(r#"{"Genesis": {"Wallets": [{"Name": "W", "Stake": 100}]}, "Nodes": [{"Name": "Primary-1"}]}"#)
             .validate()
             .expect("ordinary names are fine");
+    }
+
+    #[test]
+    fn wallet_names_cannot_leave_the_network_root() {
+        for bad in ["../../evil", "a/b", "a\\b", "..", ".", ""] {
+            let json = format!(
+                r#"{{"Genesis": {{"Wallets": [{{"Name": {}, "Stake": 100}}]}}}}"#,
+                serde_json::to_string(bad).unwrap()
+            );
+            assert_eq!(
+                err_of(&t(&json)),
+                format!("invalid template: invalid Genesis account name '{bad}'"),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_names_are_unique_case_insensitively() {
+        let tpl = t(r#"{"Genesis": {"Wallets": [{"Name": "W", "Stake": 100}]},
+            "Nodes": [{"Name": "Node", "IsRelay": true}, {"Name": "node"}]}"#);
+        assert_eq!(err_of(&tpl), "invalid template: duplicate node name 'node'");
+    }
+
+    #[test]
+    fn a_total_above_100_fails_validation_not_allocation() {
+        let tpl = t(r#"{"Genesis": {"Wallets": [{"Name": "A", "Stake": 60}, {"Name": "B", "Stake": 40.5}]}}"#);
+        assert_eq!(
+            err_of(&tpl),
+            "invalid template: Genesis account allocations must total 100 (actual 100.5)"
+        );
     }
 
     #[test]

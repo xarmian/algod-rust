@@ -29,7 +29,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use algo_ledger::erasable_db::ErasableDb;
-use algo_ledger::participation::{fill_db_with_participation_keys, restore::restore_participation};
+use algo_ledger::participation::{
+    fill_db_with_participation_keys, restore::restore_participation, RestoreError,
+};
 use algo_types::consensus::{consensus_params_for_version, CONSENSUS_CURRENT_VERSION};
 use algo_types::{Address, ConsensusParams, Round};
 use rand::TryRng;
@@ -295,10 +297,27 @@ fn make_wallet(
 
     let mut participation = None;
     if alloc.online {
+        // go: a missing file or an unsupported schema means "generate"; any
+        // other failure to load an existing file is an error (never silently
+        // replace a user's key)
         let reused = if part_path.exists() {
-            ErasableDb::open(&part_path)
-                .ok()
-                .and_then(|db| restore_participation(&db).ok())
+            let db = ErasableDb::open(&part_path).map_err(|e| {
+                GenError::Msg(format!(
+                    "couldn't load existing participation file {}: {e}",
+                    part_path.display()
+                ))
+            })?;
+            match restore_participation(&db) {
+                Ok(p) => Some(p),
+                Err(RestoreError::Empty) => None,
+                Err(RestoreError::Sqlite(e)) if e.to_string().contains("no such table") => None,
+                Err(e) => {
+                    return err(format!(
+                        "couldn't restore existing participation file {}: {e}",
+                        part_path.display()
+                    ));
+                }
+            }
         } else {
             None
         };
@@ -411,27 +430,37 @@ pub fn generate_genesis_files(
             .unwrap_or(2)
             * 2;
         let next = std::sync::atomic::AtomicUsize::new(0);
+        let failed = std::sync::atomic::AtomicBool::new(false);
         let slots: Vec<std::sync::Mutex<Option<Result<WalletKeys, GenError>>>> =
             allocation.iter().map(|_| std::sync::Mutex::new(None)).collect();
         std::thread::scope(|scope| {
             for _ in 0..workers.min(allocation.len().max(1)) {
                 scope.spawn(|| loop {
+                    // stop picking up wallets once one has failed
+                    if failed.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(alloc) = allocation.get(i) else { return };
                     let r = make_wallet(out_dir, alloc, first, last, dilution, &counters, &log);
+                    if r.is_err() {
+                        failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     *slots[i].lock().expect("slot") = Some(r);
                 });
             }
         });
         slots
             .into_iter()
-            .map(|s| s.into_inner().expect("slot").expect("every wallet processed"))
+            .filter_map(|s| s.into_inner().expect("slot"))
             .collect()
     };
     let mut wallets = Vec::with_capacity(results.len());
     for r in results {
         wallets.push(r?);
     }
+    // (a failure returned above; on success every wallet was processed)
+    debug_assert_eq!(wallets.len(), allocation.len());
 
     // go: records + genesisAddrs, then FeeSink / RewardsPool
     let mut addresses: BTreeMap<String, [u8; 32]> = BTreeMap::new();
@@ -617,6 +646,24 @@ mod tests {
         let mut a = mk(&[5, 5]);
         let e = fixup_round_off(&mut a, 5, 8).unwrap_err();
         assert!(e.to_string().starts_with("Amounts don't add up to TotalMoney - off by "), "{e}");
+    }
+
+    #[test]
+    fn an_unreadable_existing_partkey_is_an_error_and_is_kept() {
+        let mut genesis = genesis_with(&[("A", 100.0, true)]);
+        genesis.last_part_key_round = 30;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut log: Vec<u8> = Vec::new();
+        generate_genesis_files(&genesis, tmp.path(), &mut log).unwrap();
+        let part = tmp.path().join("A.0.30.partkey");
+        // not a sqlite database at all
+        std::fs::write(&part, b"this is not a database").unwrap();
+        let e = generate_genesis_files(&genesis, tmp.path(), &mut log).unwrap_err();
+        assert!(
+            e.to_string().contains("existing participation file"),
+            "{e}"
+        );
+        assert_eq!(std::fs::read(&part).unwrap(), b"this is not a database", "the file is not destroyed");
     }
 
     #[test]

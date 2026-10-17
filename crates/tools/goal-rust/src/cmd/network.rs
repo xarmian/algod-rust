@@ -92,6 +92,10 @@ pub fn run_create(rootdir: Option<PathBuf>, args: CreateArgs) -> ExitCode {
         Ok(r) => r,
         Err(code) => return code,
     };
+    // (refused before anything is read or created)
+    if args.start {
+        return fail("--start is not supported yet: run 'goal network start' after creating the network (issue #1993)");
+    }
     let template_text = match read_template(args.template.as_deref()) {
         Ok(t) => t,
         Err(e) => return fail(format!("{ERROR_CREATE_NETWORK}{e}")),
@@ -100,14 +104,15 @@ pub fn run_create(rootdir: Option<PathBuf>, args: CreateArgs) -> ExitCode {
     if exists_and_not_empty(&root) {
         return fail(INFO_NETWORK_ALREADY_EXISTS.replacen("{}", &root.display().to_string(), 1));
     }
-    if args.start {
-        return fail("--start is not supported yet: run 'goal network start' after creating the network (issue #1993)");
-    }
 
     // pregendir: copy the pregenerated files in first
     if let Some(pregen) = &args.pregendir {
         if let Err(e) = copy_folder(&absolute(pregen), &root) {
-            return fail(format!("{e}"));
+            // a half-copied root would make the next attempt fail on "not empty"
+            if !args.noclean {
+                let _ = std::fs::remove_dir_all(&root);
+            }
+            return fail(format!("{ERROR_CREATE_NETWORK}{e}"));
         }
     }
 
