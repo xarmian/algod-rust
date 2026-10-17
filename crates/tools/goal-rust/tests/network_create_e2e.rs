@@ -43,7 +43,17 @@ const TEMPLATE: &str = r#"{
   ]
 }"#;
 
+/// Runs goal with `network create` skipping the kmd key import (`-K`), so
+/// these tests need no kmd binary; the import has its own test below.
 fn goal(args: &[&str]) -> Output {
+    let mut args = args.to_vec();
+    if args.starts_with(&["network", "create"]) && !args.contains(&"-K") {
+        args.push("-K");
+    }
+    goal_raw(&args)
+}
+
+fn goal_raw(args: &[&str]) -> Output {
     Command::new(GOAL_RUST_BIN)
         .args(args)
         .env_remove("ALGORAND_DATA")
@@ -199,4 +209,65 @@ fn pregen_refuses_a_rootdir_and_a_non_empty_target() {
     let out = goal(&["network", "pregen", "-t", &template, "-p", &p.display().to_string()]);
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains("already exists and is not empty"));
+}
+
+#[cfg(unix)]
+/// Put a built `kmd-rust` next to the `goal-rust` under test, where goal's
+/// kmd lookup (go: next to the goal executable) finds it.
+fn ensure_kmd_next_to_goal() -> std::path::PathBuf {
+    let exe = std::path::Path::new(GOAL_RUST_BIN);
+    let dir = exe.parent().unwrap().to_path_buf();
+    let name = format!("kmd-rust{}", std::env::consts::EXE_SUFFIX);
+    if !dir.join(&name).is_file() {
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let st = Command::new(cargo)
+            .args(["build", "-p", "kmd-rust"])
+            .status()
+            .expect("cargo build -p kmd-rust");
+        assert!(st.success());
+    }
+    assert!(dir.join(&name).is_file(), "kmd-rust missing in {}", dir.display());
+    dir
+}
+
+// unix only: goal cannot stop a daemon on Windows (same as `goal node stop`)
+#[cfg(unix)]
+#[test]
+fn create_imports_the_root_keys_into_the_unencrypted_default_wallet() {
+    let exe_dir = ensure_kmd_next_to_goal();
+    let tmp = tempfile::tempdir().unwrap();
+    let template = write_template(tmp.path(), TEMPLATE);
+    let root = tmp.path().join("net");
+    let out = goal_raw(&["network", "create", "-r", &root.display().to_string(), "-t", &template]);
+    assert!(out.status.success(), "{} {}", stdout(&out), stderr(&out));
+    let o = stdout(&out);
+    assert!(o.contains("Imported 2 keys"), "{o}");
+    let kmd_dir = root.join("Primary").join("kmd-v0.5");
+    assert!(kmd_dir.is_dir(), "kmd data dir created");
+    // kmd was stopped again
+    assert!(!kmd_dir.join("kmd.pid").exists(), "kmd still running: {}", exe_dir.display());
+
+    // -K skips the import
+    let root2 = tmp.path().join("net2");
+    let out = goal(&["network", "create", "-r", &root2.display().to_string(), "-t", &template, "-K"]);
+    assert!(out.status.success());
+    assert!(!stdout(&out).contains("Imported"));
+    assert!(!root2.join("Primary").join("kmd-v0.5").exists());
+}
+
+// unix only, see above
+#[cfg(unix)]
+#[test]
+fn create_with_a_relative_rootdir_still_imports_the_keys() {
+    ensure_kmd_next_to_goal();
+    let tmp = tempfile::tempdir().unwrap();
+    let template = write_template(tmp.path(), TEMPLATE);
+    let out = Command::new(GOAL_RUST_BIN)
+        .current_dir(tmp.path())
+        .args(["network", "create", "-r", "relnet", "-t", &template])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{} {}", stdout(&out), stderr(&out));
+    assert!(stdout(&out).contains("Imported 2 keys"), "{}", stdout(&out));
 }
