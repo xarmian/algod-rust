@@ -86,12 +86,12 @@ catchup() {
   # go's REST API answers within a second; algod-rust resolves its peers
   # first, so wait until the node answers before asking it to catch up, and
   # retry (a request refused while it is still starting is not a failure)
-  local i
+  local i ready=0
   for i in $(seq 1 "${CATCHUP_WAIT_TRIES:-150}"); do
-    goal node status >/dev/null 2>&1 && break
+    if goal node status >/dev/null 2>&1; then ready=1; break; fi
     sleep "${CATCHUP_WAIT_SLEEP:-2}"
   done
-  if ! goal node status >/dev/null 2>&1; then
+  if [ "$ready" = 0 ]; then
     echo "FAST_CATCHUP: the node did not answer in time; trying to start the catchup anyway" >&2
   fi
   for i in 1 2 3 4 5; do
