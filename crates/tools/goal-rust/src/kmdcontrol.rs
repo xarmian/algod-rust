@@ -455,7 +455,12 @@ mod tests {
             fs::write(&script, "#!/bin/sh\nexit 4\n").unwrap();
             fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
             let mut nc = KmdController::with_program(&kmd_dir, script, Vec::new());
-            nc.healthy = Box::new(|_| true);
+            // the other kmd only answers after a few probes, i.e. after the
+            // exit code 4 of our own child has been seen
+            let probes = std::sync::atomic::AtomicUsize::new(0);
+            nc.healthy = Box::new(move |_| {
+                probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 3
+            });
             assert_eq!(nc.start(0), Ok(true));
         }
 
