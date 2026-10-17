@@ -58,6 +58,8 @@ Build it with `docker build -f docker/Dockerfile --target algod .`.
   kmd loses a race against the exiting one).
 * `goal node stop` in a `DEV_MODE` container stops the node (go's fails with
   `Cannot kill node: node was killed`).
+* `FAST_CATCHUP=1` waits until the node answers (algod-rust resolves its peers before
+  its REST API is up; go's answers at once) and retries a refused `goal node catchup`.
 * Multi-node private-network templates are not supported yet
   ([#2002](https://github.com/xarmian/algod-rust/issues/2002)).
 
