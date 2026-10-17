@@ -97,7 +97,9 @@ COPY --from=builder-tools /build/target/release/kmd-rust /node/bin/kmd-rust
 COPY docker/algod/bin/ /node/bin/
 COPY docker/algod/genesis/ /node/run/genesis/
 COPY docker/algod/run.sh /node/run/run.sh
-RUN chmod +x /node/bin/* /node/run/run.sh
+COPY docker/algod/templates/ /node/run/
+# (private networks: the entrypoint rewrites the template and copies keys here)
+RUN chmod +x /node/bin/* /node/run/run.sh && chown -R algorand:algorand /node/run
 ENV PATH=/node/bin:$PATH \
     ALGORAND_DATA=/algod/data \
     ALGOD_PORT=8080 \

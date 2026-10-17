@@ -29,8 +29,10 @@
 #   * NODE_EXPORTER is not configured (algod-rust has none);
 #   * telemetry options are accepted and ignored (diagcfg is a no-op);
 #   * START_KMD=1 runs `kmd serve` directly (`goal kmd start` is not ported);
-#   * private networks (no NETWORK) need `goal network create`, which is not
-#     ported yet (issue #1993) -- the script says so and exits 1;
+#   * private networks (no NETWORK) are created and started with
+#     `goal network create/start` like go's script, but only single-node
+#     templates work (multi-node needs algod-listen.net, issue #2002), and the
+#     container stops the network on SIGTERM instead of `tail -f`-ing forever;
 #   * algod is `exec`ed so that `docker stop`'s SIGTERM reaches it.
 #
 # The script is also `source`d by its shell test (docker/algod/run_sh_test.sh),
@@ -44,6 +46,7 @@ set -e
 GENESIS_DIR="${GENESIS_DIR:-/node/run/genesis}"
 ETC_DIR="${ETC_DIR:-/etc/algorand}"
 CATCHUP_DELAY="${CATCHUP_DELAY:-5}"
+RUN_DIR="${RUN_DIR:-/node/run}"
 
 if [ "$ALGORAND_DATA" != "/algod/data" ] && [ -z "${ALGOD_ENTRYPOINT_TEST:-}" ]; then
   echo "Do not override 'ALGORAND_DATA' environment variable."
@@ -235,8 +238,47 @@ start_new_public_network() {
   start_public_network
 }
 
-private_network_unsupported() {
-  die "Private networks (no NETWORK, or an existing network.json) need 'goal network create/start', which algod-rust does not implement yet (issue #1993). Set NETWORK to mainnet, testnet, betanet, devnet, alphanet or fnet, or mount a data directory that contains genesis.json."
+# Follow the node's output until the container is told to stop, then stop the
+# network cleanly (go just `tail -f`s node.log and leaves it to docker to kill
+# the node).
+follow_private_network() {
+  local root="$ALGORAND_DATA/.."
+  cd "$ALGORAND_DATA"
+  # -F: the logs may not exist yet, and are recreated on restart
+  tail -F node.log algod-out.log algod-err.log 2>/dev/null &
+  TAIL_PID=$!
+  trap 'goal network stop -r "$root"; kill "$TAIL_PID" 2>/dev/null; exit 0' TERM INT
+  wait "$TAIL_PID"
+  # (only reached when tail died: the network is still up, so this is an error)
+  exit 1
+}
+
+start_private_network() {
+  configure_data_dir
+  start_kmd &
+
+  goal network start -r "${ALGORAND_DATA}/.."
+  follow_private_network
+}
+
+start_new_private_network() {
+  local TEMPLATE="template.json"
+  if [ -f "$ETC_DIR/template.json" ]; then
+    cp "$ETC_DIR/template.json" "$RUN_DIR/$TEMPLATE"
+  elif [ "$DEV_MODE" = "1" ]; then
+    TEMPLATE="devmode_template.json"
+  fi
+  sed -i "s/NUM_ROUNDS/${NUM_ROUNDS:-30000}/" "$RUN_DIR/$TEMPLATE"
+
+  # Check if keys are mounted, and if so, use them as the pregenerated keys
+  if [ -d "$ETC_DIR/keys" ]; then
+    cp -r "$ETC_DIR/keys" "$RUN_DIR/keys"
+    goal network create --noclean -n dockernet -r "${ALGORAND_DATA}/.." -t "$RUN_DIR/$TEMPLATE" -p "$RUN_DIR/keys"
+  else
+    goal network create --noclean -n dockernet -r "${ALGORAND_DATA}/.." -t "$RUN_DIR/$TEMPLATE"
+  fi
+
+  start_private_network
 }
 
 ##############
@@ -269,7 +311,8 @@ main() {
 
   # If the data directory is initialized, start the existing environment.
   if [ -f "$ALGORAND_DATA/../network.json" ]; then
-    private_network_unsupported
+    start_private_network
+    exit 1
   elif [ -f "$ALGORAND_DATA/genesis.json" ]; then
     start_public_network
     exit 1
@@ -277,7 +320,7 @@ main() {
 
   # Initialize and start the network.
   if [ "$NETWORK" == "" ] && [ "$PEER_ADDRESS" == "" ]; then
-    private_network_unsupported
+    start_new_private_network
   else
     start_new_public_network
   fi

@@ -249,11 +249,86 @@ run_main
 [ "$RC" = 1 ] && ok "PEER_ADDRESS alone exits 1" || bad "PEER_ADDRESS alone exit code $RC"
 has "PEER_ADDRESS alone gets go's message, not a cp error" "No genesis file for '' is available\." "$D/out.log"
 
-# ---- 8. private networks are refused clearly -----------------------------------------------
-new_case
-run_main
-[ "$RC" = 1 ] && ok "private network exits 1" || bad "private network exit code $RC"
-has "private network names the missing feature" 'goal network create' "$D/out.log"
+# ---- 8. private networks -------------------------------------------------------------------
+# (the real follow_private_network tails logs until told to stop; it has its own
+# test below, so here it is replaced by a recorder)
+run_private() {
+    (
+        set +u
+        # shellcheck disable=SC1090
+        source "$RUN"
+        exec_algod() { echo "algod $*" >>"$CALLS"; }
+        start_kmd() { if [ "${START_KMD:-}" = "1" ]; then echo "start_kmd" >>"$CALLS"; fi; }
+        follow_private_network() { echo "follow" >>"$CALLS"; }
+        main
+    ) >"$D/out.log" 2>&1
+    RC=$?
+}
+new_private_case() {
+    new_case
+    export RUN_DIR="$D/run"
+    mkdir -p "$RUN_DIR"
+    cp "$HERE"/templates/*.json "$RUN_DIR/"
+}
+
+new_private_case
+run_private
+has "private: the network is created in the parent of the data dir" "^goal network create --noclean -n dockernet -r $DATA/\.\. -t $RUN_DIR/template\.json\$" "$CALLS"
+has "private: the network is then started" "^goal network start -r $DATA/\.\.\$" "$CALLS"
+has "private: and followed" '^follow$' "$CALLS"
+hasnt "private: NUM_ROUNDS placeholder is replaced (default 30000)" 'NUM_ROUNDS' "$RUN_DIR/template.json"
+has "private: default NUM_ROUNDS is 30000" '"LastPartKeyRound": *30000' "$RUN_DIR/template.json"
+hasnt "private: no pregenerated keys" 'template\.json -p ' "$CALLS"
+
+new_private_case
+export DEV_MODE=1 NUM_ROUNDS=77
+run_private
+has "DEV_MODE uses the devmode template" "-t $RUN_DIR/devmode_template\.json\$" "$CALLS"
+has "NUM_ROUNDS fills the template" '"LastPartKeyRound": *77' "$RUN_DIR/devmode_template.json"
+
+new_private_case
+echo '{"Genesis":{"LastPartKeyRound": NUM_ROUNDS}}' >"$ETC_DIR/template.json"
+export DEV_MODE=1
+run_private
+has "a mounted template wins over DEV_MODE" "-t $RUN_DIR/template\.json\$" "$CALLS"
+has "the mounted template is the one used" '"LastPartKeyRound": 30000' "$RUN_DIR/template.json"
+
+new_private_case
+mkdir -p "$ETC_DIR/keys"
+echo k >"$ETC_DIR/keys/Wallet1.rootkey"
+run_private
+has "mounted keys are passed as the pregen dir" "-t $RUN_DIR/template\.json -p $RUN_DIR/keys\$" "$CALLS"
+[ -f "$RUN_DIR/keys/Wallet1.rootkey" ] && ok "mounted keys are copied" || bad "mounted keys not copied"
+
+new_private_case
+export START_KMD=1 TOKEN=privtok
+run_private
+has "private: START_KMD starts kmd" '^start_kmd$' "$CALLS"
+has "private: configure_data_dir ran (REST on all interfaces)" '^algocfg set -p EndpointAddress -v 0\.0\.0\.0:8080 -d \.$' "$CALLS"
+
+# an existing private network is only started
+new_private_case
+echo '{}' >"$D/network.json"
+run_private
+hasnt "existing network: no create" 'goal network create' "$CALLS"
+has "existing network: started" "^goal network start -r $DATA/\.\.\$" "$CALLS"
+[ "$RC" = 1 ] && ok "existing network: exit 1 if it ever returns" || bad "exit code $RC"
+
+# SIGTERM stops the network (docker stop) and exits 0
+new_private_case
+(
+    set +u
+    # shellcheck disable=SC1090
+    source "$RUN"
+    follow_private_network
+) >"$D/out.log" 2>&1 &
+FOLLOW=$!
+for _ in $(seq 1 50); do sleep 0.1; kill -0 "$FOLLOW" 2>/dev/null || break; [ -s "$CALLS" ] && break; kill -0 "$FOLLOW" 2>/dev/null && break; done
+sleep 0.5
+kill -TERM "$FOLLOW"
+wait "$FOLLOW"; rc=$?
+[ "$rc" = 0 ] && ok "SIGTERM exits 0" || bad "SIGTERM exit code $rc"
+has "SIGTERM stops the network" "^goal network stop -r $DATA/\.\.\$" "$CALLS"
 
 # ---- 9. ALGORAND_DATA may not be overridden -------------------------------------------------------
 out="$(env -u ALGOD_ENTRYPOINT_TEST ALGORAND_DATA=/tmp/elsewhere bash "$RUN" 2>&1)"; rc=$?
