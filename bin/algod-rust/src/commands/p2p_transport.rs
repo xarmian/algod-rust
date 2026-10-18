@@ -748,13 +748,32 @@ fn spawn_ws_peer(
                     // before `msg` (and thus `payload`) is moved into
                     // `mux.handle`.
                     let request_payload_for_hash = payload.clone();
+                    let payload_len_for_trace = payload.len();
                     let msg = IncomingMessage::new(
                         tag,
                         payload,
                         peer_id.to_string(),
                         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
                     );
+                    // Issue #1987 diagnostics: what arrived on the stream and what
+                    // the handler did with it (agreement traffic only; votes/
+                    // proposals/bundles are a handful of messages per round).
+                    let trace_tag = matches!(
+                        tag,
+                        Tag::AgreementVote | Tag::ProposalPayload | Tag::VoteBundle
+                    )
+                    .then_some(tag);
+                    let trace_len = payload_len_for_trace;
                     let out = mux.handle(msg).await;
+                    if let Some(t) = trace_tag {
+                        tracing::debug!(
+                            %peer_id,
+                            tag = %t,
+                            bytes = trace_len,
+                            action = ?out.action,
+                            "P2P algorand-ws stream: inbound agreement message dispatched"
+                        );
+                    }
 
                     // Issue #591: a handler that answers with
                     // `ForwardingPolicy::Respond` (e.g.
