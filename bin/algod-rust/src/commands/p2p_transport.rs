@@ -758,18 +758,16 @@ fn spawn_ws_peer(
                     // Issue #1987 diagnostics: what arrived on the stream and what
                     // the handler did with it (agreement traffic only; votes/
                     // proposals/bundles are a handful of messages per round).
-                    let trace_tag = matches!(
+                    let trace_agreement = matches!(
                         tag,
                         Tag::AgreementVote | Tag::ProposalPayload | Tag::VoteBundle
-                    )
-                    .then_some(tag);
-                    let trace_len = payload_len_for_trace;
+                    );
                     let out = mux.handle(msg).await;
-                    if let Some(t) = trace_tag {
+                    if trace_agreement {
                         tracing::debug!(
                             %peer_id,
-                            tag = %t,
-                            bytes = trace_len,
+                            %tag,
+                            bytes = payload_len_for_trace,
                             action = ?out.action,
                             "P2P algorand-ws stream: inbound agreement message dispatched"
                         );
@@ -2138,11 +2136,7 @@ impl P2pTransport {
         // Issue #1987: a go peer replays its current round's votes/proposal the
         // moment the stream opens, a few ms before the agreement service has
         // registered its handlers; hold them until it does.
-        let multiplexer = Arc::new(Multiplexer::with_early_hold(
-            &algo_network::handler::AGREEMENT_TAGS,
-            algo_network::handler::EARLY_HOLD_TTL,
-            algo_network::handler::EARLY_HOLD_MAX_PER_TAG,
-        ));
+        let multiplexer = Arc::new(Multiplexer::with_agreement_early_hold());
         let stream_peers: StreamPeers = Arc::new(Mutex::new(StreamManager::new()));
         // Monotonically increasing id handed to every `StreamPeerHandle`
         // installed via `spawn_ws_peer` — see `StreamPeerHandle::generation`'s
