@@ -229,6 +229,33 @@ echo '{"id":"x"}' >"$DATA/genesis.json"
 ) >/dev/null 2>&1
 has "start_kmd runs kmd serve on KMD_PORT" "^kmd serve -d $DATA/kmd-v0\.5 -a 0\.0\.0\.0:7833 --allow-origin \*\$" "$CALLS"
 
+# ---- 6b. catchup waits for the node and retries ---------------------------------------------------
+# algod-rust resolves its peers before its REST API answers (go's answers at
+# once): the forced catchup must not be fired at a node that is still starting
+new_case
+(
+    set +u
+    export CATCHUP_DELAY=0 CATCHUP_WAIT_SLEEP=0
+    # shellcheck disable=SC1090
+    source "$RUN"
+    N=0; C=0
+    goal() {
+        echo "goal $*" >>"$CALLS"
+        case "$2" in
+        status) N=$((N + 1)); [ "$N" -ge 4 ] ;;                  # answers from the 4th probe on
+        catchup) C=$((C + 1)); [ "$C" -ge 3 ] ;;                 # refused twice, then accepted
+        esac
+    }
+    catchup
+) >/dev/null 2>&1
+rc=$?
+[ "$rc" = 0 ] && ok "catchup succeeds once the node answers" || bad "catchup exit code $rc"
+[ "$(grep -c '^goal node status' "$CALLS")" = 4 ] && ok "catchup waits for the node (4 status probes)" || bad "status probes: $(grep -c '^goal node status' "$CALLS")"
+[ "$(grep -c '^goal node catchup' "$CALLS")" = 3 ] && ok "a refused catchup is retried" || bad "catchup attempts: $(grep -c '^goal node catchup' "$CALLS")"
+first_catchup=$(grep -n '^goal node catchup' "$CALLS" | head -1 | cut -d: -f1)
+last_status=$(grep -n '^goal node status' "$CALLS" | tail -1 | cut -d: -f1)
+[ "$first_catchup" -gt "$last_status" ] && ok "no catchup before the node answered" || bad "catchup fired before the node answered"
+
 # ---- 7b. secrets never reach the log ----------------------------------------------------------
 new_case
 echo '{"id":"x"}' >"$DATA/genesis.json"

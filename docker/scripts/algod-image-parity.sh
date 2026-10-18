@@ -158,7 +158,13 @@ collect_testnet() {  # collect_testnet <go|rust>
     $x ls -A /algod/data | grep -Ev '^(.*\.log|algod\.(lock|pid|net)|node\.archive|.*-v1)$' | sort >"$d/testnet_data_layout.txt"
     $x sh -c 'ls -ln /algod/data/genesis.json | awk "{print \$3, \$4}"' >"$d/testnet_genesis_owner.txt"
     $x goal node status 2>&1 | grep -E '^(Genesis ID|Last consensus protocol)' >"$d/testnet_node_status.txt"
+    if [ "$started" = False ]; then
+        # (after every capture, it changes the node's state) diagnostics for a catchup that never started: what does the command
+        # the entrypoint ran say when run by hand, and is it still running?
+        { echo "== ps"; docker exec "$c" sh -c 'ps aux 2>/dev/null || ls /proc | head -50';           echo "== goal node catchup"; timeout 90 docker exec "$c" goal node catchup --force --min 1000000 2>&1; echo "rc=$?"; }             >"$d/testnet_catchup_cmd.log" 2>&1
+    fi
     curl -s -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:$p/health" >"$d/testnet_health_code.txt"
+    docker logs "$c" >"$d/testnet_container.log" 2>&1   # (.log: kept as an artifact, not compared)
     local t0 t1
     t0=$(date +%s); docker stop -t 30 "$c" >/dev/null; t1=$(date +%s)
     echo $((t1 - t0)) >"$d/testnet_stop_seconds.txt"
@@ -204,6 +210,11 @@ for f in "$OUT"/go/*.txt; do
         fi
     fi
 done
+if [ -s "$OUT/rust/testnet_container.log" ] && ! diff -q "$OUT/go/testnet_catchup_started.txt" "$OUT/rust/testnet_catchup_started.txt" >/dev/null 2>&1; then
+    echo "---- rust testnet container log (tail) ----"
+    cat "$OUT/rust/testnet_catchup_cmd.log" 2>/dev/null | head -30
+    sed 's/\[[0-9;]*m//g' "$OUT/rust/testnet_container.log" | grep -v "gossip_block_source" | grep -iE "catchup|catchpoint|dns|discovery|phonebook|peers|error|warn" | head -40
+fi
 echo "docker stop: go $(cat "$OUT/go/stop_seconds.txt")s, rust $(cat "$OUT/rust/stop_seconds.txt")s"
 if [ "$(cat "$OUT/rust/stop_seconds.txt")" -ge 20 ]; then
     echo "DIFF   rust docker stop took too long"; fails=$((fails + 1))
