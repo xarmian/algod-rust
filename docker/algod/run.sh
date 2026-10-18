@@ -30,9 +30,8 @@
 #   * telemetry options are accepted and ignored (diagcfg is a no-op);
 #   * START_KMD=1 runs `kmd serve` directly (`goal kmd start` is not ported);
 #   * private networks (no NETWORK) are created and started with
-#     `goal network create/start` like go's script, but only single-node
-#     templates work (multi-node needs algod-listen.net, issue #2002), and the
-#     container stops the network on SIGTERM instead of `tail -f`-ing forever;
+#     `goal network create/start` like go's script, and the container stops
+#     the network on SIGTERM instead of `tail -f`-ing forever;
 #   * algod is `exec`ed so that `docker stop`'s SIGTERM reaches it.
 #
 # The script is also `source`d by its shell test (docker/algod/run_sh_test.sh),

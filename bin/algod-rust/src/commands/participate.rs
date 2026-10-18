@@ -4599,6 +4599,42 @@ pub struct CatchupPeerOptions {
     pub token: String,
 }
 
+/// go's `algod-listen.net` (`daemon/algod/server.go`): the gossip listener's
+/// address, written once it is bound so that `goal network start` (go's
+/// `netdeploy`) can hand a relay's address to the nodes that follow it.
+const LISTEN_NET_FILE: &str = "algod-listen.net";
+
+/// Writes `<data_dir>/algod-listen.net` (`addr` and a newline, like go).
+fn write_listen_net_file(data_dir: &Path, addr: &str) {
+    let path = data_dir.join(LISTEN_NET_FILE);
+    if let Err(e) = std::fs::write(&path, format!("{addr}
+")) {
+        warn!(file = %path.display(), err = %e, "failed to write algod-listen.net");
+    }
+}
+
+/// go removes the file when the server stops (`os.Remove(s.netListenFile)`);
+/// only if it still names this node's listener (a restarted node may have
+/// written its own already).
+fn remove_listen_net_file(data_dir: &Path, addr: &str) {
+    let path = data_dir.join(LISTEN_NET_FILE);
+    if std::fs::read_to_string(&path).is_ok_and(|text| text.trim() == addr) {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Removes `algod-listen.net` on every way out of `run` (early `?` returns
+/// and panics included), not only at the end of a clean shutdown.
+struct ListenNetFileGuard(Option<(PathBuf, String)>);
+
+impl Drop for ListenNetFileGuard {
+    fn drop(&mut self) {
+        if let Some((dir, addr)) = &self.0 {
+            remove_listen_net_file(dir, addr);
+        }
+    }
+}
+
 /// How many relay addresses from the phonebook are offered as catchpoint
 /// sources when no `--catchup-peer` is given.
 const DEFAULT_CATCHUP_PEER_CANDIDATES: usize = 8;
@@ -6148,6 +6184,16 @@ pub async fn run(
         .map_err(|e| anyhow::anyhow!("failed to start gossip network: {}", e))?;
 
     let (addr, listening) = gossip_node.address();
+    // Issue #2002: go's `algod-listen.net`, only when a listener is open.
+    let listen_net_file = if listening {
+        rest_opts.data_dir.clone().map(|dir| (dir, addr.clone()))
+    } else {
+        None
+    };
+    if let Some((dir, listen_addr)) = &listen_net_file {
+        write_listen_net_file(dir, listen_addr);
+    }
+    let _listen_net_file_guard = ListenNetFileGuard(listen_net_file);
     if listening {
         info!(address = %addr, "gossip network listening");
     } else {
@@ -6972,6 +7018,36 @@ mod tests {
     }
 
     use super::*;
+
+    // ── Issue #2002: algod-listen.net ────────────────────────────────────
+    #[test]
+    fn the_listen_net_guard_removes_the_file_on_any_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        write_listen_net_file(dir.path(), "127.0.0.1:4161");
+        {
+            let _guard = ListenNetFileGuard(Some((dir.path().to_path_buf(), "127.0.0.1:4161".into())));
+            assert!(dir.path().join("algod-listen.net").is_file());
+        } // dropped as an early `?` return would drop it
+        assert!(!dir.path().join("algod-listen.net").exists());
+        drop(ListenNetFileGuard(None)); // no listener: nothing to do
+    }
+
+    #[test]
+    fn listen_net_file_is_the_address_and_a_newline_and_is_removed_only_if_ours() {
+        let dir = tempfile::tempdir().unwrap();
+        write_listen_net_file(dir.path(), "127.0.0.1:4161");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("algod-listen.net")).unwrap(),
+            "127.0.0.1:4161
+"
+        );
+        // a restarted node's own file is not ours to remove
+        remove_listen_net_file(dir.path(), "127.0.0.1:9999");
+        assert!(dir.path().join("algod-listen.net").is_file());
+        remove_listen_net_file(dir.path(), "127.0.0.1:4161");
+        assert!(!dir.path().join("algod-listen.net").exists());
+        remove_listen_net_file(dir.path(), "127.0.0.1:4161"); // gone already: fine
+    }
     use algo_pool::traits::BlockEvaluator;
     use algo_types::{
         consensus::consensus_params_for_version, Address, ConsensusParams, Round,

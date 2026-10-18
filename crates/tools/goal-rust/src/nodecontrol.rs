@@ -161,6 +161,9 @@ impl NodeController {
         // the new daemon rewrites algod.net; a leftover from a previous run
         // could otherwise answer the health probe for some other service
         let _ = fs::remove_file(self.data_dir.join("algod.net"));
+        // (likewise the relay address a killed daemon left behind: netdeploy
+        // reads it to wire the nodes that follow, and must wait for the new one)
+        let _ = fs::remove_file(self.data_dir.join("algod-listen.net"));
         let out = open_log(&self.data_dir.join(STD_OUT_FILENAME));
         let err = open_log(&self.data_dir.join(STD_ERR_FILENAME));
         let mut cmd = Command::new(&self.program);
@@ -198,6 +201,18 @@ impl NodeController {
                 return Ok(false);
             }
         }
+    }
+
+    /// go: `GetListeningAddress` -- the first line of `algod-listen.net`,
+    /// which the daemon writes once its gossip listener is bound.
+    pub fn listening_address(&self) -> Result<String, String> {
+        let text = fs::read_to_string(self.data_dir.join("algod-listen.net"))
+            .map_err(|e| e.to_string())?;
+        let line = text.lines().next().unwrap_or("").trim();
+        if line.is_empty() {
+            return Err("algod-listen.net is empty".to_string());
+        }
+        Ok(line.to_string())
     }
 
     /// go: `StopAlgod`.
