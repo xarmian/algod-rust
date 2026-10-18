@@ -1,0 +1,54 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: P2P 1v1 go-vs-go control (issue #1987)
+
+# The 1v1 soak (1 go-algorand + 1 algod-rust, 50/50 stake) intermittently never
+# closes round 1 right after startup. This runs the same topology with a
+# go-algorand second participant started N seconds after the first, to tell a
+# go-algorand late-joiner race (harness problem) from an algod-rust one. See
+# ops/mixed-cluster-p2p-1v1/scripts/go-control.sh. Manual only; no go-algorand
+# build, just the published algorand/algod image.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "runs per skew"
+        required: false
+        default: "4"
+      skews:
+        description: "JSON list of start skews in seconds"
+        required: false
+        default: "[0, 60, 120]"
+
+permissions:
+  contents: read
+
+jobs:
+  control:
+    name: go-vs-go, skew ${{ matrix.skew }}s
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        skew: ${{ fromJSON(inputs.skews) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run the control
+        env:
+          RUNS: ${{ inputs.runs }}
+          SKEW: ${{ matrix.skew }}
+          OUT: ${{ runner.temp }}/go-control
+        run: bash ops/mixed-cluster-p2p-1v1/scripts/go-control.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: go-control-skew-${{ matrix.skew }}
+          path: ${{ runner.temp }}/go-control
+          retention-days: 14

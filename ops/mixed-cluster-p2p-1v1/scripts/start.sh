@@ -144,6 +144,25 @@ MULTIADDR_1_INTERNAL_IP="/ip4/172.29.0.11/tcp/4161/p2p/$PEER_ID_1"
 echo "$MULTIADDR_1_HOST" > "$NETROOT/.p2p-multiaddr-1"
 echo "==> go-node-1 P2P multiaddr (host-dialable): $MULTIADDR_1_HOST"
 
+# Issue #1987: delay the second participant to reproduce / control for the
+# late-joiner start skew (go-node-1 alone in round 1 cannot reach quorum).
+START_SKEW_SECS="${P2PINTEROP1V1_START_SKEW_SECS:-0}"
+
+# -- 3b. Control: the second participant is go-algorand (issue #1987) ---------
+if [ "${P2PINTEROP1V1_CONTROL_GO:-0}" = "1" ]; then
+    echo "==> CONTROL: second participant is go-algorand (go-vs-go, issue #1987)"
+    patch_p2p_config Node2Rust 4161 172.29.0.12
+    if [ "$START_SKEW_SECS" -gt 0 ]; then
+        echo "==> late-joiner skew: waiting ${START_SKEW_SECS}s before starting go-node-2"
+        sleep "$START_SKEW_SECS"
+    fi
+    GO_NODE_2_PEER_ADDRESS="$MULTIADDR_1_INTERNAL_IP" docker compose up -d go-node-2
+    wait_for_rest 5102 go-node-2
+    echo ""
+    echo "control cluster started: 2 go-algorand P2P nodes (50/50 stake)."
+    exit 0
+fi
+
 # -- 4. Start rust-node-2 ----------------------------------------------------
 if [ -f "$NETROOT/genesis.json" ]; then
     GENESIS_SRC="$NETROOT/genesis.json"
@@ -202,6 +221,10 @@ P2PINTEROP1V1_GENESIS_HASH=$GENESIS_HASH
 P2PINTEROP1V1_GO1_MULTIADDR=$MULTIADDR_1_INTERNAL_IP
 EOF
 
+if [ "$START_SKEW_SECS" -gt 0 ]; then
+    echo "==> late-joiner skew: waiting ${START_SKEW_SECS}s before starting rust-node-2"
+    sleep "$START_SKEW_SECS"
+fi
 if [ "${P2PINTEROP1V1_SKIP_BUILD:-0}" = "1" ]; then
     echo "==> docker compose up -d rust-node-2 (P2PINTEROP1V1_SKIP_BUILD=1, using algod-rust-p2pinterop1v1:local)"
     docker compose up -d rust-node-2
