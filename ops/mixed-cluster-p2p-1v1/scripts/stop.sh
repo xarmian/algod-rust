@@ -42,7 +42,7 @@ done
 
 cd "$ROOT"
 echo "==> docker compose down -v"
-docker compose down -v --remove-orphans
+docker compose --profile control down -v --remove-orphans
 
 if [ "$PURGE" = "1" ]; then
     echo "==> purging netroot/"

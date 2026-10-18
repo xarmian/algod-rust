@@ -16,6 +16,9 @@
 # should avoid the skew; a go-vs-go run that always settles quickly points at
 # algod-rust.
 #
+# (secs_to_* are measured from the moment the second node has started, i.e.
+# after the SKEW wait, so they are comparable across skews.)
+#
 # Output: one TSV line per run in $OUT/go-control.tsv (default
 # ./go-control-artifacts):
 #   run  skew_secs  secs_to_round1  secs_to_target  go1_round  go2_round  verdict
@@ -36,7 +39,8 @@ printf 'run\tskew_secs\tsecs_to_round1\tsecs_to_target\tgo1_round\tgo2_round\tve
 
 round_of() {  # round_of <host-port> -> last-round or -1
     curl -s -m 3 -H "X-Algo-API-Token: $TOKEN" "http://127.0.0.1:$1/v2/status" \
-        | python3 -c "import json,sys; print(json.load(sys.stdin).get('last-round', -1))" 2>/dev/null || echo -1
+        | python3 -c "import json,sys; r=json.load(sys.stdin).get('last-round'); print(r if isinstance(r, int) else -1)" 2>/dev/null \
+        || echo -1
 }
 
 stalls=0
@@ -45,6 +49,8 @@ for run in $(seq 1 "$RUNS"); do
     "$HERE/stop.sh" --purge >/dev/null 2>&1 || true
     NUM_ROUNDS=2000 P2PINTEROP1V1_CONTROL_GO=1 P2PINTEROP1V1_START_SKEW_SECS="$SKEW" \
         "$HERE/start.sh" >"$OUT/start-$run.log" 2>&1 || { echo "start failed (see $OUT/start-$run.log)"; \
+        docker logs p2pinterop1v1-go-node-1 >"$OUT/go-node-1-$run.log" 2>&1 || true; \
+        docker logs p2pinterop1v1-go-node-2 >"$OUT/go-node-2-$run.log" 2>&1 || true; \
         printf '%s\t%s\t-\t-\t-\t-\tSTART_FAILED\n' "$run" "$SKEW" >>"$TSV"; continue; }
     t0=$(date +%s)
     t_r1=""; t_target=""; r1=-1; r2=-1

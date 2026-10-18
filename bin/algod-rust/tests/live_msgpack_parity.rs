@@ -95,10 +95,6 @@ async fn get(client: &reqwest::Client, base: &str, path: &str) -> reqwest::Respo
         .unwrap_or_else(|e| panic!("GET {base}{path} failed: {e}"))
 }
 
-/// A recursive, order-independent diff over decoded msgpack values (reused
-/// as `rmpv::Value` rather than `serde_json::Value` since msgpack has no
-/// canonical JSON round-trip guarantee for every type go emits, e.g. binary
-/// blobs). Reports every field-level mismatch, not just the first.
 /// `block.ts` of a decoded `/v2/blocks/{round}` msgpack body.
 fn block_ts(v: &rmpv::Value) -> Option<i64> {
     let block = v
@@ -122,6 +118,10 @@ fn block_ts_within(go: &rmpv::Value, rust: &rmpv::Value, max_skew_secs: i64) -> 
     }
 }
 
+/// A recursive, order-independent diff over decoded msgpack values (reused
+/// as `rmpv::Value` rather than `serde_json::Value` since msgpack has no
+/// canonical JSON round-trip guarantee for every type go emits, e.g. binary
+/// blobs). Reports every field-level mismatch, not just the first.
 fn diff_msgpack(path: &str, expected: &rmpv::Value, actual: &rmpv::Value, out: &mut Vec<String>) {
     use rmpv::Value as V;
     match (expected, actual) {

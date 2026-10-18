@@ -70,6 +70,10 @@ services:
   # instead of rust-node-2 by `P2PINTEROP1V1_CONTROL_GO=1 scripts/start.sh` to
   # tell a go-algorand late-joiner startup race from an algod-rust one.
   go-node-2:
+    # (a profile: a plain `docker compose up` must not start the control node
+    # next to rust-node-2, which uses the same data dir; naming the service,
+    # as start.sh does, still starts it)
+    profiles: ["control"]
     image: algorand/algod:5.0.3-stable
     container_name: p2pinterop1v1-go-node-2
     environment:

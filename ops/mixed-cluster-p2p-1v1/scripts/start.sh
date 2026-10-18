@@ -147,6 +147,9 @@ echo "==> go-node-1 P2P multiaddr (host-dialable): $MULTIADDR_1_HOST"
 # Issue #1987: delay the second participant to reproduce / control for the
 # late-joiner start skew (go-node-1 alone in round 1 cannot reach quorum).
 START_SKEW_SECS="${P2PINTEROP1V1_START_SKEW_SECS:-0}"
+case "$START_SKEW_SECS" in
+    '' | *[!0-9]*) echo "error: P2PINTEROP1V1_START_SKEW_SECS must be a whole number of seconds, got '$START_SKEW_SECS'" >&2; exit 2 ;;
+esac
 
 # -- 3b. Control: the second participant is go-algorand (issue #1987) ---------
 if [ "${P2PINTEROP1V1_CONTROL_GO:-0}" = "1" ]; then
