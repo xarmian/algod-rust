@@ -2135,7 +2135,14 @@ impl P2pTransport {
 
         let listen_addrs: Arc<Mutex<Vec<Multiaddr>>> = Arc::new(Mutex::new(Vec::new()));
         let connected_peers: Arc<Mutex<Vec<PeerId>>> = Arc::new(Mutex::new(Vec::new()));
-        let multiplexer = Arc::new(Multiplexer::new());
+        // Issue #1987: a go peer replays its current round's votes/proposal the
+        // moment the stream opens, a few ms before the agreement service has
+        // registered its handlers; hold them until it does.
+        let multiplexer = Arc::new(Multiplexer::with_early_hold(
+            &algo_network::handler::AGREEMENT_TAGS,
+            algo_network::handler::EARLY_HOLD_TTL,
+            algo_network::handler::EARLY_HOLD_MAX_PER_TAG,
+        ));
         let stream_peers: StreamPeers = Arc::new(Mutex::new(StreamManager::new()));
         // Monotonically increasing id handed to every `StreamPeerHandle`
         // installed via `spawn_ws_peer` — see `StreamPeerHandle::generation`'s
