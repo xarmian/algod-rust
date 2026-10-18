@@ -124,7 +124,10 @@ pub(crate) const FPR_P2_TAB: [Fpr; 11] = table(P2_TAB_BITS);
 /// `fpr_of`: exact conversion of a small integer.
 #[inline(always)]
 pub(crate) fn fpr_of(i: i64) -> Fpr {
-    i as f64
+    let r = i as f64;
+    #[cfg(all(test, feature = "c-internals-test"))]
+    domain::note(r);
+    r
 }
 
 /// `fpr_ursh`: `x >> n` for `n` in `0..=63`, written as the C does (two
@@ -157,6 +160,8 @@ fn fpr_ulsh(mut x: u64, n: u32) -> u64 {
 /// implementation-defined — gives the C build's result.
 #[inline]
 pub(crate) fn fpr_rint(x: Fpr) -> i64 {
+    #[cfg(all(test, feature = "c-internals-test"))]
+    domain::note(x);
     let x = x.to_bits();
     let mut m: u64 = ((x << 10) | (1u64 << 62)) & ((1u64 << 63) - 1);
     let mut e: i32 = 1085 - ((x >> 52) as i32 & 0x7FF);
@@ -174,6 +179,8 @@ pub(crate) fn fpr_rint(x: Fpr) -> i64 {
 /// [`fpr_rint`]).
 #[inline]
 pub(crate) fn fpr_floor(x: Fpr) -> i64 {
+    #[cfg(all(test, feature = "c-internals-test"))]
+    domain::note(x);
     let x = x.to_bits();
     let e: i32 = (x >> 52) as i32 & 0x7FF;
     let t: u64 = x >> 63;
@@ -189,6 +196,8 @@ pub(crate) fn fpr_floor(x: Fpr) -> i64 {
 /// yields 0 for |x| >= 2^63, which `expm_p63` relies on when `ccs == 1`.
 #[inline]
 pub(crate) fn fpr_trunc(x: Fpr) -> i64 {
+    #[cfg(all(test, feature = "c-internals-test"))]
+    domain::note(x);
     let x = x.to_bits();
     let e: i32 = (x >> 52) as i32 & 0x7FF;
     let mut xu: u64 = ((x << 10) | (1u64 << 62)) & ((1u64 << 63) - 1);
@@ -208,7 +217,7 @@ pub(crate) fn fpr_trunc(x: Fpr) -> i64 {
 /// keygen and signing stay inside that domain. Thread-local so that the
 /// adversarial differential test, which deliberately leaves the domain,
 /// cannot pollute another test's measurement.
-#[cfg(test)]
+#[cfg(all(test, feature = "c-internals-test"))]
 pub(crate) mod domain {
     use std::cell::Cell;
 
@@ -294,7 +303,7 @@ pub(crate) mod domain {
 #[inline(always)]
 pub(crate) fn fpr_add(x: Fpr, y: Fpr) -> Fpr {
     let r = x + y;
-    #[cfg(test)]
+    #[cfg(all(test, feature = "c-internals-test"))]
     {
         domain::note(x);
         domain::note(y);
@@ -306,7 +315,7 @@ pub(crate) fn fpr_add(x: Fpr, y: Fpr) -> Fpr {
 #[inline(always)]
 pub(crate) fn fpr_sub(x: Fpr, y: Fpr) -> Fpr {
     let r = x - y;
-    #[cfg(test)]
+    #[cfg(all(test, feature = "c-internals-test"))]
     {
         domain::note(x);
         domain::note(y);
@@ -317,13 +326,19 @@ pub(crate) fn fpr_sub(x: Fpr, y: Fpr) -> Fpr {
 
 #[inline(always)]
 pub(crate) fn fpr_neg(x: Fpr) -> Fpr {
-    -x
+    let r = -x;
+    #[cfg(all(test, feature = "c-internals-test"))]
+    {
+        domain::note(x);
+        domain::note(r);
+    }
+    r
 }
 
 #[inline(always)]
 pub(crate) fn fpr_half(x: Fpr) -> Fpr {
     let r = x * 0.5;
-    #[cfg(test)]
+    #[cfg(all(test, feature = "c-internals-test"))]
     {
         domain::note_half(x);
         domain::note(x);
@@ -335,7 +350,7 @@ pub(crate) fn fpr_half(x: Fpr) -> Fpr {
 #[inline(always)]
 pub(crate) fn fpr_double(x: Fpr) -> Fpr {
     let r = x + x;
-    #[cfg(test)]
+    #[cfg(all(test, feature = "c-internals-test"))]
     {
         domain::note(x);
         domain::note(r);
@@ -346,7 +361,7 @@ pub(crate) fn fpr_double(x: Fpr) -> Fpr {
 #[inline(always)]
 pub(crate) fn fpr_mul(x: Fpr, y: Fpr) -> Fpr {
     let r = x * y;
-    #[cfg(test)]
+    #[cfg(all(test, feature = "c-internals-test"))]
     {
         domain::note(x);
         domain::note(y);
@@ -358,7 +373,7 @@ pub(crate) fn fpr_mul(x: Fpr, y: Fpr) -> Fpr {
 #[inline(always)]
 pub(crate) fn fpr_sqr(x: Fpr) -> Fpr {
     let r = x * x;
-    #[cfg(test)]
+    #[cfg(all(test, feature = "c-internals-test"))]
     {
         domain::note(x);
         domain::note(r);
@@ -369,7 +384,7 @@ pub(crate) fn fpr_sqr(x: Fpr) -> Fpr {
 #[inline(always)]
 pub(crate) fn fpr_inv(x: Fpr) -> Fpr {
     let r = 1.0 / x;
-    #[cfg(test)]
+    #[cfg(all(test, feature = "c-internals-test"))]
     {
         domain::note(x);
         domain::note(r);
@@ -380,7 +395,7 @@ pub(crate) fn fpr_inv(x: Fpr) -> Fpr {
 #[inline(always)]
 pub(crate) fn fpr_div(x: Fpr, y: Fpr) -> Fpr {
     let r = x / y;
-    #[cfg(test)]
+    #[cfg(all(test, feature = "c-internals-test"))]
     {
         domain::note_div(x, y);
         domain::note(x);
@@ -395,7 +410,7 @@ pub(crate) fn fpr_div(x: Fpr, y: Fpr) -> Fpr {
 #[inline(always)]
 pub(crate) fn fpr_sqrt(x: Fpr) -> Fpr {
     let r = x.sqrt();
-    #[cfg(test)]
+    #[cfg(all(test, feature = "c-internals-test"))]
     {
         domain::note(x);
         domain::note(r);
@@ -405,6 +420,11 @@ pub(crate) fn fpr_sqrt(x: Fpr) -> Fpr {
 
 #[inline(always)]
 pub(crate) fn fpr_lt(x: Fpr, y: Fpr) -> bool {
+    #[cfg(all(test, feature = "c-internals-test"))]
+    {
+        domain::note(x);
+        domain::note(y);
+    }
     x < y
 }
 

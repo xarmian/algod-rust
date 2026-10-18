@@ -105,12 +105,15 @@ the infinity encoding. Result:
   | zero sign | `fpr_div(0, negative) = -0`, `fpr_half(-0) = -0` | `+0` |
 
 - **Falcon cannot reach them.** `falcon_keygen_and_signing_stay_inside_the_bit_identical_domain`
-  instruments every arithmetic call in a debug build and runs keygen and
-  signing: across ~10^9 operations there is no subnormal and no non-finite value,
-  no `fpr_div(0, negative)` and no `fpr_half(-0)`, and the exponents span about
-  2^-572 .. 2^+572 (keygen's big-integer to floating-point conversions),
-  roughly 450 binades short of both limits (2^-1022, 2^1023), so neither
-  flush-to-zero nor the missing infinity can be triggered.
+  instruments every floating-point operation (arithmetic, comparisons,
+  conversions) in a `c-internals-test` build and runs keygen and signing.
+  Measured once over 24 keys x 24 messages (~1.2 x 10^9 operations): no
+  subnormal and no non-finite value, no `fpr_div(0, negative)` and no
+  `fpr_half(-0)`, and the exponents span about 2^-572 .. 2^+572 (keygen's
+  big-integer to floating-point conversions), roughly 450 binades short of
+  both limits (2^-1022, 2^1023), so neither flush-to-zero nor the missing
+  infinity can be triggered. The test itself runs 10 keys x 6 messages by
+  default (`FALCON_DOMAIN_SEEDS` / `FALCON_DOMAIN_MESSAGES` scale it).
 
 This is an empirical argument over keys and messages, not a proof; the
 signature-level differential tests (`backend_parity.rs`, scalable through

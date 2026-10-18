@@ -105,7 +105,15 @@ reproduced byte-for-byte by the vendored C and by the Rust port. (2)
 Per-function differential tests of every ported module against the C
 internals (feature `c-internals-test`). (3) A differential fuzz target for
 `falcon_verify`. (4) The existing go-algorand-ported unit tests run under
-both backends.
+both backends. (5) An adversarial differential hunt of the floating-point
+layer (`crates/core/algo-falcon/src/rs/fpr_adversarial.rs`, issue #2016)
+proves every operation is bit-identical to the `FALCON_FPEMU` C on normal
+finite operands, records the operand tuples where the two legitimately differ
+(underflow flush-to-zero, subnormal/non-finite operands, overflow without an
+infinity, the sign of zero for `fpr_div(0, negative)` and `fpr_half(-0)`) in
+`tests/fixtures/falcon/fpr_divergences.jsonl`, and a domain tracker shows
+keygen and signing never reach them
+(`docs/falcon/FALCON_RUST_PORT.md`).
 
 **How to switch back.** `"FalconBackend": "c"` in `config.json`
 (requires a build with the default `c-backend` feature). `algokey-rust

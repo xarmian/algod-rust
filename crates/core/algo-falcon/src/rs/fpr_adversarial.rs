@@ -120,20 +120,92 @@ fn is_nonfinite(x: f64) -> bool {
     !x.is_finite()
 }
 
-fn classify(ops: &[f64], native: f64, emulated: f64) -> Class {
+/// Whether the *exact* (infinitely precise) result of `op` on `ops` is below
+/// the smallest normal number, i.e. where the C emulation flushes to zero.
+/// Looking at the rounded result is not enough: a product just under
+/// `f64::MIN_POSITIVE` rounds *up to* it in native arithmetic, so the exact
+/// residual (a fused multiply-add is exact here) decides on which side of the
+/// boundary the true result lies.
+fn exact_result_underflows(op: &str, ops: &[f64], native: f64) -> bool {
+    const MIN: f64 = f64::MIN_POSITIVE;
+    // The residual of a product/quotient that is within an ulp of 2^-1022 is
+    // itself ~2^-1076, i.e. below the smallest subnormal and lost. Scaling one
+    // operand by 2^100 (exact: operands here are normal) moves the whole
+    // computation far from the boundary, where the residual is representable.
+    let scale = f64::from_bits((1023 + 100) << 52);
+    let threshold = MIN * scale;
+    match op {
+        "mul" | "sqr" => {
+            let (x, y) = if op == "mul" { (ops[0], ops[1]) } else { (ops[0], ops[0]) };
+            let xs = x * scale;
+            let p = xs * y;
+            if p.abs() < threshold {
+                return true;
+            }
+            if p.abs() == threshold {
+                let e = xs.mul_add(y, -p); // exact: xs*y - p
+                return e != 0.0 && e.is_sign_negative() != p.is_sign_negative();
+            }
+            false
+        }
+        "div" | "inv" => {
+            let (x, y) = if op == "div" { (ops[0], ops[1]) } else { (1.0, ops[0]) };
+            let xs = x * scale;
+            let q = xs / y;
+            if q.abs() < threshold {
+                return true;
+            }
+            if q.abs() == threshold {
+                let r = (-q).mul_add(y, xs); // exact: xs - q*y, so xs/y = q + r/y
+                if r == 0.0 {
+                    return false;
+                }
+                let delta_negative = r.is_sign_negative() != y.is_sign_negative();
+                return delta_negative != q.is_sign_negative();
+            }
+            false
+        }
+        // x * 0.5 is exact except in the subnormal range, where it can round
+        // up to the smallest normal
+        "half" => ops[0].abs() < 2.0 * MIN,
+        // sums/differences/doubling/negation/sqrt never round across the boundary
+        _ => native.abs() < MIN,
+    }
+}
+
+/// Classifies one mismatch. Each out-of-domain class has a *positive* test, so
+/// a real bug (normal operands, a result that should be a normal number, yet
+/// the two implementations disagree) can only end up as `InDomain`:
+///
+/// * `Overflow`: the true result exceeds the largest double (Rust gives
+///   infinity); the emulation has no infinity and produces wrapped garbage;
+/// * `ZeroSign`: both results are zero;
+/// * `Underflow`: the exact result is below the smallest normal number and the
+///   C flushed it (to zero, or to a stray subnormal).
+///
+/// `float_result` is false for operations returning an integer or a boolean
+/// (`lt`, `rint`, `floor`, `trunc`, `of`): their result is not a double, so
+/// only the operands can place them out of domain.
+fn classify(op: &str, ops: &[f64], native: u64, emulated: u64, float_result: bool) -> Class {
     if ops.iter().any(|&o| is_nonfinite(o)) {
         return Class::NonFiniteOperand;
     }
     if ops.iter().any(|&o| is_subnormal(o)) {
         return Class::SubnormalOperand;
     }
-    if is_nonfinite(native) || is_nonfinite(emulated) {
+    if !float_result {
+        return Class::InDomain;
+    }
+    let (n, c) = (f64::from_bits(native), f64::from_bits(emulated));
+    if n.is_infinite() {
         return Class::Overflow;
     }
-    if native == 0.0 && emulated == 0.0 {
+    if n == 0.0 && c == 0.0 {
         return Class::ZeroSign;
     }
-    if is_subnormal(native) || is_subnormal(emulated) || native == 0.0 || emulated == 0.0 {
+    // (the C normally flushes to exactly zero; for `half` just above the smallest
+    // normal it leaves a stray subnormal -- still "below the normal range")
+    if (c == 0.0 || c.is_subnormal()) && exact_result_underflows(op, ops, n) {
         return Class::Underflow;
     }
     Class::InDomain
@@ -168,6 +240,11 @@ pub(super) fn both(op: &str, a: u64, b: u64) -> (u64, u64) {
     }
 }
 
+/// Whether `op` returns a double (as opposed to a boolean or an integer).
+fn float_result(op: &str) -> bool {
+    !matches!(op, "lt" | "rint" | "floor" | "trunc" | "of")
+}
+
 const BINARY: [&str; 5] = ["add", "sub", "mul", "div", "lt"];
 const UNARY: [&str; 10] = ["inv", "sqr", "half", "double", "neg", "sqrt", "rint", "floor", "trunc", "of"];
 
@@ -196,7 +273,7 @@ impl Report {
         if native == emulated {
             return;
         }
-        let class = classify(ops, f64::from_bits(native), f64::from_bits(emulated));
+        let class = classify(op, ops, native, emulated, float_result(op));
         let entry = self.found.entry((op, class)).or_default();
         entry.0 += 1;
         if entry.0 <= RECORDS_PER_CLASS {
@@ -356,12 +433,17 @@ fn adversarial_operands_report() {
 fn falcon_keygen_and_signing_stay_inside_the_bit_identical_domain() {
     use super::fpr::domain;
 
+    // 10 keys x 6 messages in CI; scale up by hand for a heavier measurement
+    let env = |name: &str, default: u32| {
+        std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    };
+    let (seeds, messages) = (env("FALCON_DOMAIN_SEEDS", 10), env("FALCON_DOMAIN_MESSAGES", 6));
     domain::reset();
-    for seed in 0u32..10 {
+    for seed in 0u32..seeds {
         let seed_bytes = [seed as u8, (seed >> 8) as u8, 7, 7, 7, 7, 7, 7];
         let (pubkey, privkey) = crate::backend::rust::keygen(&seed_bytes).expect("keygen");
         assert_eq!(pubkey.len(), crate::FALCON_DET1024_PUBKEY_SIZE);
-        for m in 0u32..6 {
+        for m in 0u32..messages {
             let mut msg = vec![0u8; (m as usize) * 37 % 400];
             for (i, b) in msg.iter_mut().enumerate() {
                 *b = (i as u32).wrapping_mul(31).wrapping_add(m + seed) as u8;
@@ -371,7 +453,8 @@ fn falcon_keygen_and_signing_stay_inside_the_bit_identical_domain() {
     }
     let st = domain::take();
     println!("== falcon domain over keygen + signing: {st:?}");
-    assert!(st.ops > 1_000_000, "the run must actually exercise the fpr layer: {st:?}");
+    // (keygen alone is ~10^7 operations per key: this proves the layer is exercised)
+    assert!(st.ops > 10_000_000 * u64::from(seeds), "the run must exercise the fpr layer: {st:?}");
     assert_eq!(st.subnormal, 0, "{st:?}");
     assert_eq!(st.nonfinite, 0, "{st:?}");
     assert_eq!(st.div_zero_over_negative, 0, "fpr_div(0, negative) differs in the sign of zero: {st:?}");
