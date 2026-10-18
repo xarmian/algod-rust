@@ -31,6 +31,14 @@ RUNS="${RUNS:-5}"
 SKEW="${SKEW:-60}"
 TARGET_ROUND="${TARGET_ROUND:-5}"
 LIMIT_SECS="${LIMIT_SECS:-400}"
+# NODE2=go (default): the control; NODE2=rust: the same loop with the
+# algod-rust participant, for a like-for-like distribution to compare with.
+NODE2="${NODE2:-go}"
+case "$NODE2" in
+    go) CONTROL_GO=1; NODE2_CONTAINER=p2pinterop1v1-go-node-2 ;;
+    rust) CONTROL_GO=0; NODE2_CONTAINER=p2pinterop1v1-rust-node-2 ;;
+    *) echo "NODE2 must be go or rust" >&2; exit 2 ;;
+esac
 OUT="${OUT:-$PWD/go-control-artifacts}"
 TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 mkdir -p "$OUT"
@@ -47,10 +55,10 @@ stalls=0
 for run in $(seq 1 "$RUNS"); do
     echo "== control run $run/$RUNS (skew ${SKEW}s)"
     "$HERE/stop.sh" --purge >/dev/null 2>&1 || true
-    NUM_ROUNDS=2000 P2PINTEROP1V1_CONTROL_GO=1 P2PINTEROP1V1_START_SKEW_SECS="$SKEW" \
+    NUM_ROUNDS=2000 P2PINTEROP1V1_CONTROL_GO="$CONTROL_GO" P2PINTEROP1V1_START_SKEW_SECS="$SKEW" \
         "$HERE/start.sh" >"$OUT/start-$run.log" 2>&1 || { echo "start failed (see $OUT/start-$run.log)"; \
         docker logs p2pinterop1v1-go-node-1 >"$OUT/go-node-1-$run.log" 2>&1 || true; \
-        docker logs p2pinterop1v1-go-node-2 >"$OUT/go-node-2-$run.log" 2>&1 || true; \
+        docker logs "$NODE2_CONTAINER" >"$OUT/node2-$run.log" 2>&1 || true; \
         printf '%s\t%s\t-\t-\t-\t-\tSTART_FAILED\n' "$run" "$SKEW" >>"$TSV"; continue; }
     t0=$(date +%s)
     t_r1=""; t_target=""; r1=-1; r2=-1
@@ -64,11 +72,11 @@ for run in $(seq 1 "$RUNS"); do
     if [ -n "$t_target" ]; then verdict=SETTLED; else verdict=STALLED; stalls=$((stalls + 1)); fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$run" "$SKEW" "${t_r1:--}" "${t_target:--}" "$r1" "$r2" "$verdict" | tee -a "$TSV"
     docker logs p2pinterop1v1-go-node-1 >"$OUT/go-node-1-$run.log" 2>&1 || true
-    docker logs p2pinterop1v1-go-node-2 >"$OUT/go-node-2-$run.log" 2>&1 || true
+    docker logs "$NODE2_CONTAINER" >"$OUT/node2-$run.log" 2>&1 || true
 done
 "$HERE/stop.sh" --purge >/dev/null 2>&1 || true
 
-echo "== summary: $stalls of $RUNS go-vs-go runs stalled (skew ${SKEW}s)"
+echo "== summary: $stalls of $RUNS runs stalled (skew ${SKEW}s)"
 cat "$TSV"
 # informational: the answer is in the TSV, not in this script's exit code
 exit 0

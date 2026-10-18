@@ -22,13 +22,17 @@ on:
         description: "JSON list of start skews in seconds"
         required: false
         default: "[0, 60, 120]"
+      node2:
+        description: "second participant: go (control) or rust (the algod-rust arm)"
+        required: false
+        default: "go"
 
 permissions:
   contents: read
 
 jobs:
   control:
-    name: go-vs-go, skew ${{ matrix.skew }}s
+    name: ${{ inputs.node2 }} as 2nd node, skew ${{ matrix.skew }}s
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
@@ -42,6 +46,7 @@ jobs:
         env:
           RUNS: ${{ inputs.runs }}
           SKEW: ${{ matrix.skew }}
+          NODE2: ${{ inputs.node2 }}
           OUT: ${{ runner.temp }}/go-control
         run: bash ops/mixed-cluster-p2p-1v1/scripts/go-control.sh
 
@@ -49,6 +54,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: go-control-skew-${{ matrix.skew }}
+          name: control-${{ inputs.node2 }}-skew-${{ matrix.skew }}
           path: ${{ runner.temp }}/go-control
           retention-days: 14
