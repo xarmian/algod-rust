@@ -262,7 +262,7 @@ start_new_public_network() {
 # ends and Docker SIGKILLs it (issue #2018).
 stop_network_on_signal() {
   PRIVATE_NETWORK_ROOT="$ALGORAND_DATA/.."
-  trap 'goal network stop -r "$PRIVATE_NETWORK_ROOT" || true; kill ${TAIL_PID:-} ${KMD_PID:-} 2>/dev/null; exit 0' TERM INT
+  trap 'goal network stop -r "$PRIVATE_NETWORK_ROOT" || true; kill ${TAIL_PID:-} ${KMD_PID:-} 2>/dev/null || true; exit 0' TERM INT
 }
 
 follow_private_network() {
