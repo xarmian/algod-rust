@@ -357,6 +357,32 @@ wait "$FOLLOW"; rc=$?
 [ "$rc" = 0 ] && ok "SIGTERM exits 0" || bad "SIGTERM exit code $rc"
 has "SIGTERM stops the network" "^goal network stop -r $DATA/\.\.\$" "$CALLS"
 
+# SIGTERM *during* startup (issue #2018): the entrypoint is PID 1 in the container,
+# where a signal without a handler is dropped, so a `docker stop` that lands while
+# `goal network start` is still running must already be handled
+new_private_case
+echo '{}' >"$D/network.json"
+(
+    set +u
+    # shellcheck disable=SC1090
+    source "$RUN"
+    goal() {
+        echo "goal $*" >>"$CALLS"
+        if [ "$2" = start ]; then sleep 2; fi
+    }
+    start_kmd() { :; }
+    main
+) >"$D/out.log" 2>&1 &
+STARTING=$!
+sleep 0.5
+kill -TERM "$STARTING"
+t0=$SECONDS
+wait "$STARTING"; rc=$?
+took=$((SECONDS - t0))
+[ "$rc" = 0 ] && ok "SIGTERM during startup exits 0" || bad "SIGTERM during startup: exit code $rc"
+[ "$took" -le 4 ] && ok "SIGTERM during startup is handled promptly (${took}s)" || bad "SIGTERM during startup took ${took}s"
+has "SIGTERM during startup stops the network" "^goal network stop -r $DATA/\.\.\$" "$CALLS"
+
 # ---- 9. ALGORAND_DATA may not be overridden -------------------------------------------------------
 out="$(env -u ALGOD_ENTRYPOINT_TEST ALGORAND_DATA=/tmp/elsewhere bash "$RUN" 2>&1)"; rc=$?
 [ "$rc" = 1 ] && echo "$out" | grep -q "Do not override 'ALGORAND_DATA'" && ok "ALGORAND_DATA override is refused" || bad "ALGORAND_DATA override: rc=$rc out=$out"
