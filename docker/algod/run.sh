@@ -255,19 +255,29 @@ start_new_public_network() {
 # Follow the node's output until the container is told to stop, then stop the
 # network cleanly (go just `tail -f`s node.log and leaves it to docker to kill
 # the node).
+# Stop the network and exit when the container is told to stop. Installed before
+# the first long-running step (create / start): the entrypoint is PID 1 in the
+# container, where a signal without a handler is dropped, so a `docker stop`
+# landing during startup would otherwise be ignored until the grace period
+# ends and Docker SIGKILLs it (issue #2018).
+stop_network_on_signal() {
+  PRIVATE_NETWORK_ROOT="$ALGORAND_DATA/.."
+  trap 'goal network stop -r "$PRIVATE_NETWORK_ROOT" || true; kill ${TAIL_PID:-} ${KMD_PID:-} 2>/dev/null || true; exit 0' TERM INT
+}
+
 follow_private_network() {
-  local root="$ALGORAND_DATA/.."
   cd "$ALGORAND_DATA"
   # -F: the logs may not exist yet, and are recreated on restart
   tail -F node.log algod-out.log algod-err.log 2>/dev/null &
   TAIL_PID=$!
-  trap 'goal network stop -r "$root"; kill "$TAIL_PID" ${KMD_PID:-} 2>/dev/null; exit 0' TERM INT
+  stop_network_on_signal
   wait "$TAIL_PID"
   # (only reached when tail died: the network is still up, so this is an error)
   exit 1
 }
 
 start_private_network() {
+  stop_network_on_signal
   configure_data_dir
   start_kmd &
   KMD_PID=$!
@@ -277,6 +287,7 @@ start_private_network() {
 }
 
 start_new_private_network() {
+  stop_network_on_signal
   local TEMPLATE="template.json"
   if [ -f "$ETC_DIR/template.json" ]; then
     cp "$ETC_DIR/template.json" "$RUN_DIR/$TEMPLATE"
