@@ -200,6 +200,18 @@ impl NodeController {
         }
     }
 
+    /// go: `GetListeningAddress` -- the first line of `algod-listen.net`,
+    /// which the daemon writes once its gossip listener is bound.
+    pub fn listening_address(&self) -> Result<String, String> {
+        let text = fs::read_to_string(self.data_dir.join("algod-listen.net"))
+            .map_err(|e| e.to_string())?;
+        let line = text.lines().next().unwrap_or("").trim();
+        if line.is_empty() {
+            return Err("algod-listen.net is empty".to_string());
+        }
+        Ok(line.to_string())
+    }
+
     /// go: `StopAlgod`.
     pub fn stop_algod(&self) -> Result<(), StopError> {
         if !self.data_dir.is_dir() {

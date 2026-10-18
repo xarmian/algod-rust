@@ -274,6 +274,7 @@ fn create_with_a_relative_rootdir_still_imports_the_keys() {
 
 // ---- lifecycle: start / stop / status / restart / delete (issue #1993) ----
 
+#[cfg(unix)]
 const RELAY_TEMPLATE: &str = r#"{
   "Genesis": {"NetworkName": "relaynet", "FirstPartKeyRound": 0, "LastPartKeyRound": 20,
     "Wallets": [{"Name": "W1", "Stake": 100, "Online": true}]},
@@ -294,25 +295,38 @@ fn lifecycle_commands_need_a_deployed_network() {
     assert!(stderr(&out).contains("required flag(s) \"rootdir\" not set"), "{}", stderr(&out));
 }
 
+// unix only: starts real daemons (algod-rust must sit next to goal-rust)
+#[cfg(unix)]
 #[test]
-fn a_multi_node_network_is_refused_until_relay_addresses_exist() {
+fn a_relay_and_a_node_start_wired_together() {
+    let dir = ensure_kmd_next_to_goal();
+    let algod = format!("algod-rust{}", std::env::consts::EXE_SUFFIX);
+    if !dir.join(&algod).is_file() {
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        assert!(Command::new(cargo).args(["build", "-p", "algod-rust"]).status().unwrap().success());
+    }
     let tmp = tempfile::tempdir().unwrap();
     let template = write_template(tmp.path(), RELAY_TEMPLATE);
-    let root = tmp.path().join("net").display().to_string();
-    let out = goal(&["network", "create", "-r", &root, "-t", &template]);
+    let root = tmp.path().join("net");
+    let r = root.display().to_string();
+    assert!(goal(&["network", "create", "-r", &r, "-t", &template]).status.success());
+
+    let out = goal(&["network", "start", "-r", &r]);
+    assert!(out.status.success(), "{} {}", stdout(&out), stderr(&out));
+    assert!(stdout(&out).contains(&format!("Network Started under {r}")), "{}", stdout(&out));
+    // the relay published its gossip address, like go's algod-listen.net
+    let listen = std::fs::read_to_string(root.join("Relay/algod-listen.net")).unwrap();
+    assert!(listen.trim().contains(':'), "{listen:?}");
+
+    let out = goal(&["network", "status", "-r", &r]);
     assert!(out.status.success(), "{}", stderr(&out));
-    for args in [vec!["network", "restart", "-r", &root], vec!["network", "start", "-r", &root, "-n", "N1"]] {
-        let out = goal(&args);
-        assert_eq!(out.status.code(), Some(1), "{args:?}");
-        assert!(stderr(&out).contains("this network has 2 nodes"), "{args:?}: {}", stderr(&out));
-    }
-    let out = goal(&["network", "start", "-r", &root]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(
-        stderr(&out).contains("Error starting deployed network: this network has 2 nodes"),
-        "{}",
-        stderr(&out)
-    );
+    assert!(stdout(&out).contains("[Relay]") && stdout(&out).contains("[N1]"), "{}", stdout(&out));
+
+    let out = goal(&["network", "stop", "-r", &r]);
+    assert!(out.status.success());
+    assert!(!root.join("Relay/algod-listen.net").exists(), "removed on shutdown");
+    let out = goal(&["network", "delete", "-r", &r]);
+    assert!(out.status.success(), "{}", stderr(&out));
 }
 
 #[test]

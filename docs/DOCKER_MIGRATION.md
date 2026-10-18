@@ -34,7 +34,7 @@ Build it with `docker build -f docker/Dockerfile --target algod .`.
 | `ALGOD_PORT` | yes (default 8080) |
 | `START_KMD`, `KMD_TOKEN`, `KMD_PORT` | yes: `kmd-rust serve` on `0.0.0.0:${KMD_PORT}` with the same `kmd-v0.5` directory layout |
 | `TELEMETRY_NAME`, `TELEMETRY_URL` | accepted and ignored: algod-rust has no telemetry (`diagcfg` is a no-op) |
-| `DEV_MODE`, `NUM_ROUNDS`, a missing `NETWORK` (private network), `/etc/algorand/template.json`, `/etc/algorand/keys` | yes for single-node templates (the image's `template.json` and `devmode_template.json`, `goal network create/start` inside the container, wallets imported into kmd). **Multi-node templates are not supported yet**: starting them needs the relay listening address, tracked in [#2002](https://github.com/xarmian/algod-rust/issues/2002). `docker stop` stops the network cleanly (go just `tail -f`s `node.log`) |
+| `DEV_MODE`, `NUM_ROUNDS`, a missing `NETWORK` (private network), `/etc/algorand/template.json`, `/etc/algorand/keys` | yes (the image's `template.json` and `devmode_template.json`, `goal network create/start` inside the container, wallets imported into kmd; relays are started first and write `algod-listen.net`, which wires the other nodes). `docker stop` stops the network cleanly (go just `tail -f`s `node.log`) |
 | `DEBUG=1` | yes (`set -x`) |
 
 ## Intentional differences
@@ -60,8 +60,6 @@ Build it with `docker build -f docker/Dockerfile --target algod .`.
   `Cannot kill node: node was killed`).
 * `FAST_CATCHUP=1` waits until the node answers (algod-rust resolves its peers before
   its REST API is up; go's answers at once) and retries a refused `goal node catchup`.
-* Multi-node private-network templates are not supported yet
-  ([#2002](https://github.com/xarmian/algod-rust/issues/2002)).
 
 ## Published tags
 

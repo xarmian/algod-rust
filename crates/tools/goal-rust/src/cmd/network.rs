@@ -203,24 +203,77 @@ fn start_order(network: &algo_netdeploy::create::Network) -> Vec<PathBuf> {
     dirs
 }
 
-/// go's `Start` hands every node the listening address of the relays
-/// (`algod-listen.net`), which algod-rust does not write. A network of one
-/// node needs no peers; anything larger would start disconnected, so it is
-/// refused instead.
-fn peers_supported(network: &algo_netdeploy::create::Network) -> Result<(), String> {
-    let n = network.relay_data_dirs().len() + network.node_data_dirs().len();
-    if n > 1 {
-        return Err(format!(
-            "this network has {n} nodes; starting a multi-node network needs the relay listening address (algod-listen.net), which algod-rust does not write yet (issue #2002). Start the nodes yourself with 'goal node start -d <node dir> -p <relay address>'"
-        ));
+/// go: `strings.TrimPrefix(relayAddress, "http://")`, and a relay that
+/// listens on every interface is reached on loopback (go dials `[::]:port`,
+/// which the OS routes to this host; spelled out here so it holds for any
+/// resolver).
+fn relay_peer_address(listening: &str) -> String {
+    let addr = listening.trim().trim_start_matches("http://");
+    let Some((host, port)) = addr.rsplit_once(':') else {
+        return addr.to_string();
+    };
+    match host.trim_matches(|c| c == '[' || c == ']') {
+        "" | "0.0.0.0" | "::" => format!("127.0.0.1:{port}"),
+        _ => addr.to_string(),
     }
-    Ok(())
 }
 
-fn start_one(dir: &Path) -> Result<(), String> {
+/// The `-p` of a non-relay node (go: `startNodes`): every relay's address
+/// joined with `;`, or just the relays its template `PeerList` names.
+fn node_peer_arg(
+    peer_list: &str,
+    relays: &[(String, String)],
+) -> Result<Option<String>, String> {
+    if peer_list.is_empty() {
+        let all: Vec<&str> = relays.iter().map(|(_, a)| a.as_str()).collect();
+        return Ok((!all.is_empty()).then(|| all.join(";")));
+    }
+    let mut picked = Vec::new();
+    for name in peer_list.split(';') {
+        match relays.iter().find(|(n, _)| n == name) {
+            Some((_, addr)) => picked.push(addr.as_str()),
+            None => return Err(format!("relay {name} is not defined in the network")),
+        }
+    }
+    Ok(Some(picked.join(";")))
+}
+
+fn dir_name(dir: &Path) -> String {
+    dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+}
+
+fn start_one(dir: &Path, peer: Option<String>) -> Result<(), String> {
     crate::nodecontrol::NodeController::new(dir)
-        .start_algod(&crate::nodecontrol::StartArgs::default())
+        .start_algod(&crate::nodecontrol::StartArgs {
+            peer_address: peer,
+            ..Default::default()
+        })
         .map(|_| ())
+}
+
+/// go: `getRelayAddress` -- the daemon writes `algod-listen.net` a moment
+/// after it answers `/health`; retry for a while.
+fn wait_listening_address(dir: &Path) -> Result<String, String> {
+    let nc = crate::nodecontrol::NodeController::new(dir);
+    let mut last = String::new();
+    for _ in 0..300 {
+        match nc.listening_address() {
+            Ok(a) => return Ok(relay_peer_address(&a)),
+            Err(e) => last = e,
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err(last)
+}
+
+/// go: `GetPeerAddresses` -- the relays that currently publish an address.
+fn running_relay_addresses(network: &algo_netdeploy::create::Network) -> Vec<String> {
+    network
+        .relay_data_dirs()
+        .iter()
+        .filter_map(|d| crate::nodecontrol::NodeController::new(d).listening_address().ok())
+        .map(|a| relay_peer_address(&a))
+        .collect()
 }
 
 /// Port of `networkStartCmd` (`network.go:204-225`).
@@ -231,13 +284,13 @@ pub fn run_start(rootdir: Option<PathBuf>, args: StartArgs) -> ExitCode {
     };
     if let Some(name) = args.node.as_deref().filter(|n| !n.is_empty()) {
         // (a lone node of a multi-node network would run disconnected)
-        if let Err(e) = peers_supported(&network) {
-            return fail(format!("{ERROR_NODE_FAILED_TO_START}{e}"));
-        }
         let Some(dir) = network.node_dir(name) else {
             return fail(format!("{ERROR_NODE_FAILED_TO_START}node {name} not found"));
         };
-        if let Err(e) = start_one(&dir) {
+        // go: `StartNode` -- the relays that are up
+        let relays = running_relay_addresses(&network);
+        let peer = (!relays.is_empty()).then(|| relays.join(";"));
+        if let Err(e) = start_one(&dir, peer) {
             return fail(format!("{ERROR_NODE_FAILED_TO_START}{e}"));
         }
         println!("{INFO_NODE_START}");
@@ -246,12 +299,35 @@ pub fn run_start(rootdir: Option<PathBuf>, args: StartArgs) -> ExitCode {
     start_all(&network)
 }
 
+/// go: `Network.Start` -- relays first (each pointed at the previous one),
+/// then the other nodes pointed at the relays.
 fn start_all(network: &algo_netdeploy::create::Network) -> ExitCode {
-    if let Err(e) = peers_supported(network) {
-        return fail(format!("{ERROR_STARTING_NETWORK}{e}"));
+    let mut relays: Vec<(String, String)> = Vec::new();
+    for dir in network.relay_data_dirs() {
+        let previous = relays.last().map(|(_, a)| a.clone());
+        if let Err(e) = start_one(&dir, previous) {
+            return fail(format!("{ERROR_STARTING_NETWORK}{e}"));
+        }
+        match wait_listening_address(&dir) {
+            Ok(addr) => relays.push((dir_name(&dir), addr)),
+            Err(e) => return fail(format!("{ERROR_STARTING_NETWORK}{e}")),
+        }
     }
-    for dir in start_order(network) {
-        if let Err(e) = start_one(&dir) {
+    for dir in network.node_data_dirs() {
+        let name = dir_name(&dir);
+        let peer_list = network
+            .cfg
+            .template
+            .nodes
+            .iter()
+            .find(|n| n.name == name)
+            .map(|n| n.peer_list.as_str())
+            .unwrap_or("");
+        let peer = match node_peer_arg(peer_list, &relays) {
+            Ok(p) => p,
+            Err(e) => return fail(format!("{ERROR_STARTING_NETWORK}{e}")),
+        };
+        if let Err(e) = start_one(&dir, peer) {
             return fail(format!("{ERROR_STARTING_NETWORK}{e}"));
         }
     }
@@ -285,10 +361,6 @@ pub fn run_restart(rootdir: Option<PathBuf>) -> ExitCode {
         Ok(n) => n,
         Err(code) => return code,
     };
-    // (nothing is stopped for a network that could not be started again)
-    if let Err(e) = peers_supported(&network) {
-        return fail(format!("{ERROR_STARTING_NETWORK}{e}"));
-    }
     stop_all(&network);
     start_all(&network)
 }
@@ -369,6 +441,33 @@ mod tests {
         assert!(require_rootdir(None).is_err());
         assert!(require_rootdir(Some(PathBuf::new())).is_err());
         assert!(require_rootdir(Some(PathBuf::from("net"))).is_ok());
+    }
+
+    #[test]
+    fn relay_addresses_are_loopback_when_the_relay_listens_everywhere() {
+        assert_eq!(relay_peer_address("127.0.0.1:4161
+"), "127.0.0.1:4161");
+        assert_eq!(relay_peer_address("http://10.1.2.3:4160"), "10.1.2.3:4160");
+        assert_eq!(relay_peer_address("0.0.0.0:4161"), "127.0.0.1:4161");
+        assert_eq!(relay_peer_address("[::]:4161"), "127.0.0.1:4161");
+        assert_eq!(relay_peer_address(":4161"), "127.0.0.1:4161");
+        assert_eq!(relay_peer_address("relay.example:4161"), "relay.example:4161");
+    }
+
+    #[test]
+    fn nodes_get_every_relay_or_the_ones_their_peer_list_names() {
+        let relays = vec![
+            ("R1".to_string(), "127.0.0.1:1".to_string()),
+            ("R2".to_string(), "127.0.0.1:2".to_string()),
+        ];
+        assert_eq!(node_peer_arg("", &relays).unwrap().as_deref(), Some("127.0.0.1:1;127.0.0.1:2"));
+        assert_eq!(node_peer_arg("R2", &relays).unwrap().as_deref(), Some("127.0.0.1:2"));
+        assert_eq!(node_peer_arg("R2;R1", &relays).unwrap().as_deref(), Some("127.0.0.1:2;127.0.0.1:1"));
+        assert_eq!(node_peer_arg("", &[]).unwrap(), None);
+        assert_eq!(
+            node_peer_arg("Nope", &relays).unwrap_err(),
+            "relay Nope is not defined in the network"
+        );
     }
 
     #[test]
