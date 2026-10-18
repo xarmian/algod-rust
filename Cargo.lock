@@ -753,6 +753,7 @@ dependencies = [
  "reqwest",
  "rmp",
  "rmp-serde",
+ "rmpv",
  "serde",
  "serde_bytes",
  "serde_json",

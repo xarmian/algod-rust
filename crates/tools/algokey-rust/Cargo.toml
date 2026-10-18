@@ -45,6 +45,7 @@ algo-error.workspace = true
 algo-rest-client.workspace = true
 algo-validate.workspace = true
 assert_cmd = "2"
+rmpv.workspace = true
 base64.workspace = true
 reqwest.workspace = true
 serde.workspace = true
