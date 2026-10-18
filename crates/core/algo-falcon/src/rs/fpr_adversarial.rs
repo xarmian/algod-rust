@@ -128,6 +128,9 @@ fn is_nonfinite(x: f64) -> bool {
 /// boundary the true result lies.
 fn exact_result_underflows(op: &str, ops: &[f64], native: f64) -> bool {
     const MIN: f64 = f64::MIN_POSITIVE;
+    // (If the scaled operand overflows to infinity the true result cannot be
+    // below the normal range either -- that would need the other operand beyond
+    // the double range -- so `false` is right for that case.)
     // The residual of a product/quotient that is within an ulp of 2^-1022 is
     // itself ~2^-1076, i.e. below the smallest subnormal and lost. Scaling one
     // operand by 2^100 (exact: operands here are normal) moves the whole
@@ -187,6 +190,9 @@ fn exact_result_underflows(op: &str, ops: &[f64], native: f64) -> bool {
 /// (`lt`, `rint`, `floor`, `trunc`, `of`): their result is not a double, so
 /// only the operands can place them out of domain.
 fn classify(op: &str, ops: &[f64], native: u64, emulated: u64, float_result: bool) -> Class {
+    // An operand outside the domain (infinity/NaN/subnormal) excuses the
+    // mismatch by definition: Falcon never produces such a value, which the
+    // domain test below checks by counting them (zero) during keygen/signing.
     if ops.iter().any(|&o| is_nonfinite(o)) {
         return Class::NonFiniteOperand;
     }
@@ -269,6 +275,12 @@ struct Report {
 
 impl Report {
     fn compare(&mut self, op: &'static str, ops: &[f64], native: u64, emulated: u64) {
+        let a = ops.first().map_or(0, |o| o.to_bits());
+        self.compare_raw(op, ops, a, native, emulated);
+    }
+
+    /// `a` is the raw first operand to record (the integer itself for `of`).
+    fn compare_raw(&mut self, op: &'static str, ops: &[f64], a: u64, native: u64, emulated: u64) {
         *self.compared.entry(op).or_default() += 1;
         if native == emulated {
             return;
@@ -280,7 +292,7 @@ impl Report {
             self.records.push(Record {
                 op,
                 class,
-                a: ops.first().map_or(0, |o| o.to_bits()),
+                a,
                 b: ops.get(1).map_or(0, |o| o.to_bits()),
                 rust: native,
                 c: emulated,
@@ -411,7 +423,7 @@ fn run() -> Report {
         }
         for i in ints {
             let (rs, c) = both("of", i as u64, 0);
-            r.compare("of", &[], rs, c);
+            r.compare_raw("of", &[], i as u64, rs, c);
         }
     }
     r
@@ -421,6 +433,16 @@ fn run() -> Report {
 fn adversarial_operands_report() {
     let r = run();
     r.print();
+    // The domain test tracks the two operations whose sign of zero differs;
+    // make sure those are the only ones, so that tracking is complete.
+    for ((op, class), (n, _)) in &r.found {
+        if *class == Class::ZeroSign {
+            assert!(
+                matches!(*op, "div" | "half"),
+                "{n} sign-of-zero divergences in `{op}`: the domain tracker must cover it too"
+            );
+        }
+    }
     let in_domain = r.count(Class::InDomain);
     assert_eq!(in_domain, 0, "in-domain mismatches between the Rust fpr layer and the emulated C: see report above");
 }
@@ -453,8 +475,9 @@ fn falcon_keygen_and_signing_stay_inside_the_bit_identical_domain() {
     }
     let st = domain::take();
     println!("== falcon domain over keygen + signing: {st:?}");
-    // (keygen alone is ~10^7 operations per key: this proves the layer is exercised)
-    assert!(st.ops > 10_000_000 * u64::from(seeds), "the run must exercise the fpr layer: {st:?}");
+    // (counts operands and results: this only proves the layer was exercised;
+    // 10 keys x 6 messages measured ~1.6 x 10^8)
+    assert!(st.ops > 10_000_000, "the run must exercise the fpr layer: {st:?}");
     assert_eq!(st.subnormal, 0, "{st:?}");
     assert_eq!(st.nonfinite, 0, "{st:?}");
     assert_eq!(st.div_zero_over_negative, 0, "fpr_div(0, negative) differs in the sign of zero: {st:?}");
@@ -488,22 +511,47 @@ fn write_divergence_fixture() {
     if std::env::var_os("FALCON_WRITE_FPR_DIVERGENCES").is_none() {
         return;
     }
-    let r = run();
-    let mut lines = Vec::new();
-    for rec in &r.records {
-        lines.push(format!(
-            "{{\"op\":\"{}\",\"class\":\"{}\",\"a\":\"{:#018x}\",\"b\":\"{:#018x}\",\"rust\":\"{:#018x}\",\"c\":\"{:#018x}\"}}",
-            rec.op,
-            class_name(rec.class),
-            rec.a,
-            rec.b,
-            rec.rust,
-            rec.c
-        ));
-    }
-    lines.sort();
+    let lines = fixture_lines(&run());
     std::fs::write(FIXTURE, lines.join("\n") + "\n").unwrap();
     println!("wrote {} records to {FIXTURE}", lines.len());
+}
+
+fn fixture_lines(r: &Report) -> Vec<String> {
+    let mut lines: Vec<String> = r
+        .records
+        .iter()
+        .map(|rec| {
+            format!(
+                "{{\"op\":\"{}\",\"class\":\"{}\",\"a\":\"{:#018x}\",\"b\":\"{:#018x}\",\"rust\":\"{:#018x}\",\"c\":\"{:#018x}\"}}",
+                rec.op,
+                class_name(rec.class),
+                rec.a,
+                rec.b,
+                rec.rust,
+                rec.c
+            )
+        })
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// The committed fixture is exactly what a fresh hunt produces: a change to the
+/// operand generators, the classifier, or either implementation that is not
+/// reflected in the file fails here instead of leaving the fixture stale.
+#[test]
+fn the_committed_fixture_is_what_the_hunt_produces() {
+    if std::env::var_os("FALCON_WRITE_FPR_DIVERGENCES").is_some() {
+        return; // regenerating
+    }
+    let committed = std::fs::read_to_string(FIXTURE).expect("fpr_divergences.jsonl");
+    let committed: Vec<&str> = committed.lines().filter(|l| !l.trim().is_empty()).collect();
+    let fresh = fixture_lines(&run());
+    assert_eq!(
+        committed,
+        fresh.iter().map(String::as_str).collect::<Vec<_>>(),
+        "fixture is stale: regenerate with FALCON_WRITE_FPR_DIVERGENCES=1 cargo test -p algo-falcon --features c-internals-test --lib write_divergence_fixture"
+    );
 }
 
 fn hex_field(line: &str, key: &str) -> u64 {
