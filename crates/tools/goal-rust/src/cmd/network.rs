@@ -310,7 +310,12 @@ fn start_all(network: &algo_netdeploy::create::Network) -> ExitCode {
         }
         match wait_listening_address(&dir) {
             Ok(addr) => relays.push((dir_name(&dir), addr)),
-            Err(e) => return fail(format!("{ERROR_STARTING_NETWORK}{e}")),
+            Err(e) => {
+                return fail(format!(
+                    "{ERROR_STARTING_NETWORK}relay {} did not publish its listening address (algod-listen.net): {e}; does its config.json have a NetAddress?",
+                    dir_name(&dir)
+                ))
+            }
         }
     }
     for dir in network.node_data_dirs() {

@@ -161,6 +161,9 @@ impl NodeController {
         // the new daemon rewrites algod.net; a leftover from a previous run
         // could otherwise answer the health probe for some other service
         let _ = fs::remove_file(self.data_dir.join("algod.net"));
+        // (likewise the relay address a killed daemon left behind: netdeploy
+        // reads it to wire the nodes that follow, and must wait for the new one)
+        let _ = fs::remove_file(self.data_dir.join("algod-listen.net"));
         let out = open_log(&self.data_dir.join(STD_OUT_FILENAME));
         let err = open_log(&self.data_dir.join(STD_ERR_FILENAME));
         let mut cmd = Command::new(&self.program);

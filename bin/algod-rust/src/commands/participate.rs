@@ -4623,6 +4623,18 @@ fn remove_listen_net_file(data_dir: &Path, addr: &str) {
     }
 }
 
+/// Removes `algod-listen.net` on every way out of `run` (early `?` returns
+/// and panics included), not only at the end of a clean shutdown.
+struct ListenNetFileGuard(Option<(PathBuf, String)>);
+
+impl Drop for ListenNetFileGuard {
+    fn drop(&mut self) {
+        if let Some((dir, addr)) = &self.0 {
+            remove_listen_net_file(dir, addr);
+        }
+    }
+}
+
 /// How many relay addresses from the phonebook are offered as catchpoint
 /// sources when no `--catchup-peer` is given.
 const DEFAULT_CATCHUP_PEER_CANDIDATES: usize = 8;
@@ -6181,6 +6193,7 @@ pub async fn run(
     if let Some((dir, listen_addr)) = &listen_net_file {
         write_listen_net_file(dir, listen_addr);
     }
+    let _listen_net_file_guard = ListenNetFileGuard(listen_net_file);
     if listening {
         info!(address = %addr, "gossip network listening");
     } else {
@@ -6977,10 +6990,6 @@ pub async fn run(
         Err(e) => warn!(error = %e, "catchpoint-export shutdown wait task panicked"),
     }
 
-    if let Some((dir, listen_addr)) = &listen_net_file {
-        remove_listen_net_file(dir, listen_addr);
-    }
-
     info!("consensus participation stopped");
 
     Ok(())
@@ -7011,6 +7020,18 @@ mod tests {
     use super::*;
 
     // ── Issue #2002: algod-listen.net ────────────────────────────────────
+    #[test]
+    fn the_listen_net_guard_removes_the_file_on_any_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        write_listen_net_file(dir.path(), "127.0.0.1:4161");
+        {
+            let _guard = ListenNetFileGuard(Some((dir.path().to_path_buf(), "127.0.0.1:4161".into())));
+            assert!(dir.path().join("algod-listen.net").is_file());
+        } // dropped as an early `?` return would drop it
+        assert!(!dir.path().join("algod-listen.net").exists());
+        drop(ListenNetFileGuard(None)); // no listener: nothing to do
+    }
+
     #[test]
     fn listen_net_file_is_the_address_and_a_newline_and_is_removed_only_if_ours() {
         let dir = tempfile::tempdir().unwrap();
