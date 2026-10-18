@@ -99,6 +99,29 @@ async fn get(client: &reqwest::Client, base: &str, path: &str) -> reqwest::Respo
 /// as `rmpv::Value` rather than `serde_json::Value` since msgpack has no
 /// canonical JSON round-trip guarantee for every type go emits, e.g. binary
 /// blobs). Reports every field-level mismatch, not just the first.
+/// `block.ts` of a decoded `/v2/blocks/{round}` msgpack body.
+fn block_ts(v: &rmpv::Value) -> Option<i64> {
+    let block = v
+        .as_map()?
+        .iter()
+        .find(|(k, _)| k.as_str() == Some("block"))?
+        .1
+        .as_map()?;
+    block.iter().find(|(k, _)| k.as_str() == Some("ts"))?.1.as_i64()
+}
+
+/// Both nodes seal their own block for the (identical) transaction at their
+/// own wall-clock second, so `block.ts` of the two can legitimately differ by
+/// a second or two depending on when each node ran (this flaked CI whenever
+/// the two submissions straddled a second boundary). Anything beyond
+/// `max_skew_secs` is still a real divergence.
+fn block_ts_within(go: &rmpv::Value, rust: &rmpv::Value, max_skew_secs: i64) -> bool {
+    match (block_ts(go), block_ts(rust)) {
+        (Some(g), Some(r)) => (g - r).abs() <= max_skew_secs,
+        _ => false,
+    }
+}
+
 fn diff_msgpack(path: &str, expected: &rmpv::Value, actual: &rmpv::Value, out: &mut Vec<String>) {
     use rmpv::Value as V;
     match (expected, actual) {
@@ -301,7 +324,12 @@ async fn get_produced_block_msgpack_matches() {
     // `apply_upgrade_vote`, ports of go's `bookkeeping.ProcessUpgradeParams` /
     // `UpgradeState.applyUpgradeVote`), so the `next*`/`upgrade*` fields are
     // now asserted too — no carve-out remains beyond "rnd".
-    let allowed_prefixes = ["\"block\".\"rnd\""];
+    let mut allowed_prefixes = vec!["\"block\".\"rnd\""];
+    // "block"."ts": each node seals its own block at its own wall-clock second
+    // (tolerated up to 10 s; beyond that it is a real clock/timestamp bug).
+    if block_ts_within(&go_val, &rust_val, 10) {
+        allowed_prefixes.push("\"block\".\"ts\"");
+    }
     mismatches.retain(|m| {
         !allowed_prefixes
             .iter()
@@ -591,4 +619,18 @@ async fn uppercase_format_value_accepted_on_both() {
         200,
         "rust must accept uppercase MSGPACK, matching go's case-insensitive format parsing (issue #448)"
     );
+}
+
+#[test]
+fn block_ts_tolerance_accepts_small_skew_only() {
+    fn body(ts: i64) -> rmpv::Value {
+        rmpv::Value::Map(vec![(
+            rmpv::Value::from("block"),
+            rmpv::Value::Map(vec![(rmpv::Value::from("ts"), rmpv::Value::from(ts))]),
+        )])
+    }
+    assert!(block_ts_within(&body(1792285394), &body(1792285395), 10));
+    assert!(block_ts_within(&body(1792285395), &body(1792285394), 10));
+    assert!(!block_ts_within(&body(1792285394), &body(1792285420), 10));
+    assert!(!block_ts_within(&rmpv::Value::Nil, &body(1), 10), "no ts: not tolerated");
 }
