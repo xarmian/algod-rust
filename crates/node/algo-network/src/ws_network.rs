@@ -733,7 +733,9 @@ impl WebsocketNetwork {
             peers: Arc::new(RwLock::new(HashMap::new())),
             connecting: Mutex::new(HashSet::new()),
             phonebook,
-            multiplexer: Arc::new(Multiplexer::new()),
+            // agreement traffic a peer replays at connect time arrives before
+            // the agreement service has registered its handlers (issue #1987)
+            multiplexer: Arc::new(Multiplexer::with_agreement_early_hold()),
             incoming_message_filter,
             cancel: CancellationToken::new(),
             mesh_update_tx: Mutex::new(None),

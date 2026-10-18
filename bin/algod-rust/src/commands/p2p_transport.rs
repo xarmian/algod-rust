@@ -748,13 +748,30 @@ fn spawn_ws_peer(
                     // before `msg` (and thus `payload`) is moved into
                     // `mux.handle`.
                     let request_payload_for_hash = payload.clone();
+                    let payload_len_for_trace = payload.len();
                     let msg = IncomingMessage::new(
                         tag,
                         payload,
                         peer_id.to_string(),
                         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
                     );
+                    // Issue #1987 diagnostics: what arrived on the stream and what
+                    // the handler did with it (agreement traffic only; votes/
+                    // proposals/bundles are a handful of messages per round).
+                    let trace_agreement = matches!(
+                        tag,
+                        Tag::AgreementVote | Tag::ProposalPayload | Tag::VoteBundle
+                    );
                     let out = mux.handle(msg).await;
+                    if trace_agreement {
+                        tracing::debug!(
+                            %peer_id,
+                            %tag,
+                            bytes = payload_len_for_trace,
+                            action = ?out.action,
+                            "P2P algorand-ws stream: inbound agreement message dispatched"
+                        );
+                    }
 
                     // Issue #591: a handler that answers with
                     // `ForwardingPolicy::Respond` (e.g.
@@ -2116,7 +2133,10 @@ impl P2pTransport {
 
         let listen_addrs: Arc<Mutex<Vec<Multiaddr>>> = Arc::new(Mutex::new(Vec::new()));
         let connected_peers: Arc<Mutex<Vec<PeerId>>> = Arc::new(Mutex::new(Vec::new()));
-        let multiplexer = Arc::new(Multiplexer::new());
+        // Issue #1987: a go peer replays its current round's votes/proposal the
+        // moment the stream opens, a few ms before the agreement service has
+        // registered its handlers; hold them until it does.
+        let multiplexer = Arc::new(Multiplexer::with_agreement_early_hold());
         let stream_peers: StreamPeers = Arc::new(Mutex::new(StreamManager::new()));
         // Monotonically increasing id handed to every `StreamPeerHandle`
         // installed via `spawn_ws_peer` — see `StreamPeerHandle::generation`'s

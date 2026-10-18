@@ -29,8 +29,9 @@
 //! `go-algorand/network/gossipNode.go`.
 
 use std::any::Any;
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
@@ -130,7 +131,36 @@ pub struct TaggedMessageValidatorHandler {
 pub struct Multiplexer {
     handlers: RwLock<HashMap<Tag, Arc<dyn MessageHandler>>>,
     validator_handlers: RwLock<HashMap<Tag, Arc<dyn MessageValidatorHandler>>>,
+    /// Early-message hold (issue #1987); see [`Multiplexer::with_early_hold`].
+    early: Option<EarlyHold>,
 }
+
+/// Messages that arrive for a tag before its handler is registered.
+///
+/// go-algorand registers its agreement handlers before the network starts
+/// listening, so nothing a peer sends at connect time is lost. algod-rust
+/// starts the network first and builds the agreement service afterwards, and
+/// a go peer replays its current round's votes and proposal the instant it
+/// connects: those arrived a few milliseconds before the handlers existed and
+/// were dropped, which left a node that started within seconds of its peer
+/// waiting 60-120 s for the slow recovery steps (the p2p 1v1 soak stall).
+/// Holding a bounded number of them for a short time, and delivering them in
+/// order when the handler is registered, closes that window.
+struct EarlyHold {
+    tags: HashSet<Tag>,
+    ttl: Duration,
+    max_per_tag: usize,
+    held: Mutex<HashMap<Tag, VecDeque<(Instant, IncomingMessage)>>>,
+}
+
+/// Default hold for [`Multiplexer::with_early_hold`]: how long a message
+/// waits for its handler, and how many are kept per tag.
+pub const EARLY_HOLD_TTL: Duration = Duration::from_secs(30);
+pub const EARLY_HOLD_MAX_PER_TAG: usize = 128;
+
+/// The agreement traffic tags worth holding for an agreement service that has
+/// not started yet: votes, proposals and vote bundles.
+pub const AGREEMENT_TAGS: [Tag; 3] = [Tag::AgreementVote, Tag::ProposalPayload, Tag::VoteBundle];
 
 impl Default for Multiplexer {
     fn default() -> Self {
@@ -144,7 +174,86 @@ impl Multiplexer {
         Self {
             handlers: RwLock::new(HashMap::new()),
             validator_handlers: RwLock::new(HashMap::new()),
+            early: None,
         }
+    }
+
+    /// A multiplexer that keeps the last `max_per_tag` messages (at most
+    /// `ttl` old) for each of `tags` that arrive while no handler is
+    /// registered for them, and delivers them, oldest first, as soon as a
+    /// handler is. See [`EarlyHold`]. Messages are still reported as
+    /// `Ignore` to the caller that received them early, exactly as without a
+    /// hold.
+    pub fn with_early_hold(tags: &[Tag], ttl: Duration, max_per_tag: usize) -> Self {
+        let mut mux = Self::new();
+        mux.early = Some(EarlyHold {
+            tags: tags.iter().copied().collect(),
+            ttl,
+            max_per_tag,
+            held: Mutex::new(HashMap::new()),
+        });
+        mux
+    }
+
+    /// Takes the held, still-fresh messages for `tag` (oldest first).
+    fn take_held(&self, tag: Tag) -> Vec<IncomingMessage> {
+        let Some(early) = &self.early else {
+            return Vec::new();
+        };
+        let mut held = early.held.lock().expect("early hold lock poisoned");
+        let Some(queue) = held.remove(&tag) else {
+            return Vec::new();
+        };
+        let now = Instant::now();
+        queue
+            .into_iter()
+            .filter(|(at, _)| now.duration_since(*at) <= early.ttl)
+            .map(|(_, m)| m)
+            .collect()
+    }
+
+    /// Parks `msg` (if its tag is held and no handler has appeared in the
+    /// meantime). Returns the handler instead when one was registered between
+    /// the caller's lookup and now: the caller must dispatch to it.
+    fn hold_or_handler(&self, msg: &IncomingMessage) -> Option<Arc<dyn MessageHandler>> {
+        let early = self.early.as_ref()?;
+        if !early.tags.contains(&msg.tag) || early.max_per_tag == 0 {
+            return None;
+        }
+        let mut held = early.held.lock().expect("early hold lock poisoned");
+        // Re-check under the hold lock: `register_handlers` inserts the
+        // handler before it drains the hold (which takes this lock), so either
+        // we see the handler here or the drain sees our message.
+        if let Some(h) = self
+            .handlers
+            .read()
+            .expect("handler lock poisoned")
+            .get(&msg.tag)
+            .cloned()
+        {
+            return Some(h);
+        }
+        let now = Instant::now();
+        let queue = held.entry(msg.tag).or_default();
+        // (expire on insert too: a node that never registers an agreement
+        // handler must not keep stale payloads forever)
+        while queue
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) > early.ttl)
+        {
+            queue.pop_front();
+        }
+        while queue.len() >= early.max_per_tag {
+            queue.pop_front();
+        }
+        queue.push_back((now, msg.clone()));
+        None
+    }
+
+    /// The agreement-traffic hold both gossip transports use: see
+    /// [`EarlyHold`].
+    pub fn with_agreement_early_hold() -> Self {
+        Self::with_early_hold(&AGREEMENT_TAGS, EARLY_HOLD_TTL, EARLY_HOLD_MAX_PER_TAG)
     }
 
     // -- Registration -------------------------------------------------------
@@ -156,9 +265,43 @@ impl Multiplexer {
     /// (matching Go's behaviour).  Across separate calls the new handler
     /// overwrites the old one (last-write-wins).
     pub fn register_handlers(&self, handlers: Vec<TaggedMessageHandler>) {
-        let mut map = self.handlers.write().expect("handler lock poisoned");
-        for h in handlers {
-            map.insert(h.tag, h.handler);
+        let mut registered: Vec<(Tag, Arc<dyn MessageHandler>)> = Vec::new();
+        {
+            let mut map = self.handlers.write().expect("handler lock poisoned");
+            for h in handlers {
+                registered.push((h.tag, h.handler.clone()));
+                map.insert(h.tag, h.handler);
+            }
+        }
+        // Only now drain the hold: a `handle` that missed the handler just
+        // before the insert either parks its message first (drained here) or
+        // re-checks the handler map under the hold lock and finds it (see
+        // `handle`), so nothing is parked after the drain.
+        //
+        // Deliver what arrived before the handler existed (in order, off the
+        // caller's thread: `register_handlers` is synchronous, a handler is
+        // async). The handler's answer is not acted on -- these messages were
+        // already reported to their senders as `Ignore`; the point is that
+        // the local agreement service sees them.
+        for (tag, handler) in registered {
+            let held = self.take_held(tag);
+            if held.is_empty() {
+                continue;
+            }
+            match tokio::runtime::Handle::try_current() {
+                Ok(rt) => {
+                    rt.spawn(async move {
+                        for m in held {
+                            let _ = handler.handle(m).await;
+                        }
+                    });
+                }
+                Err(_) => tracing::warn!(
+                    %tag,
+                    count = held.len(),
+                    "early messages dropped: handler registered outside a tokio runtime"
+                ),
+            }
         }
     }
 
@@ -237,11 +380,15 @@ impl Multiplexer {
 
         match handler {
             Some(h) => h.handle(msg).await,
-            None => OutgoingMessage {
-                action: ForwardingPolicy::Ignore,
-                tag: msg.tag,
-                payload: Vec::new(),
-                topics: None,
+            None => match self.hold_or_handler(&msg) {
+                // a handler was registered between the lookup and the hold
+                Some(h) => h.handle(msg).await,
+                None => OutgoingMessage {
+                    action: ForwardingPolicy::Ignore,
+                    tag: msg.tag,
+                    payload: Vec::new(),
+                    topics: None,
+                },
             },
         }
     }
@@ -693,4 +840,135 @@ mod tests {
         dispatch_task.await.unwrap();
         register_task.await.unwrap();
     }
+
+    // ── Issue #1987: early-message hold ───────────────────────────────────
+    fn msg(tag: Tag, n: u8) -> IncomingMessage {
+        IncomingMessage::new(tag, vec![n], "peer".to_string(), 0)
+    }
+
+    /// Records the payload byte of every message it handles.
+    struct Recorder(Mutex<Vec<u8>>);
+
+    #[async_trait]
+    impl MessageHandler for Recorder {
+        async fn handle(&self, msg: IncomingMessage) -> OutgoingMessage {
+            self.0.lock().unwrap().push(msg.data[0]);
+            OutgoingMessage {
+                action: ForwardingPolicy::Ignore,
+                tag: msg.tag,
+                payload: Vec::new(),
+                topics: None,
+            }
+        }
+    }
+
+    /// Waits (bounded) for the spawned replay to deliver `n` messages, then a
+    /// little longer so an unexpected extra delivery would show up too.
+    async fn settle_until(rec: &Recorder, n: usize) {
+        for _ in 0..400 {
+            if rec.0.lock().unwrap().len() >= n {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+
+    #[tokio::test]
+    async fn early_messages_are_delivered_in_order_once_the_handler_exists() {
+        let mux = Multiplexer::with_early_hold(
+            &[Tag::AgreementVote],
+            Duration::from_secs(30),
+            128,
+        );
+        for n in 1..=3 {
+            let out = mux.handle(msg(Tag::AgreementVote, n)).await;
+            assert_eq!(out.action, ForwardingPolicy::Ignore, "still ignored for the caller");
+        }
+        let rec = Arc::new(Recorder(Mutex::new(Vec::new())));
+        mux.register_handlers(vec![TaggedMessageHandler {
+            tag: Tag::AgreementVote,
+            handler: rec.clone(),
+        }]);
+        settle_until(&rec, 3).await;
+        assert_eq!(*rec.0.lock().unwrap(), vec![1, 2, 3]);
+        // delivered once, not again on a later registration
+        mux.register_handlers(vec![TaggedMessageHandler {
+            tag: Tag::AgreementVote,
+            handler: rec.clone(),
+        }]);
+        settle_until(&rec, 3).await;
+        assert_eq!(rec.0.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn only_the_configured_tags_are_held() {
+        let mux = Multiplexer::with_early_hold(&[Tag::AgreementVote], Duration::from_secs(30), 8);
+        mux.handle(msg(Tag::Transaction, 9)).await;
+        let rec = Arc::new(Recorder(Mutex::new(Vec::new())));
+        mux.register_handlers(vec![TaggedMessageHandler { tag: Tag::Transaction, handler: rec.clone() }]);
+        settle_until(&rec, 1).await;
+        assert!(rec.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_hold_is_bounded_and_keeps_the_newest() {
+        let mux = Multiplexer::with_early_hold(&[Tag::AgreementVote], Duration::from_secs(30), 2);
+        for n in 1..=5 {
+            mux.handle(msg(Tag::AgreementVote, n)).await;
+        }
+        let rec = Arc::new(Recorder(Mutex::new(Vec::new())));
+        mux.register_handlers(vec![TaggedMessageHandler { tag: Tag::AgreementVote, handler: rec.clone() }]);
+        settle_until(&rec, 2).await;
+        assert_eq!(*rec.0.lock().unwrap(), vec![4, 5]);
+    }
+
+    #[tokio::test]
+    async fn stale_early_messages_are_not_delivered() {
+        let mux = Multiplexer::with_early_hold(&[Tag::AgreementVote], Duration::from_millis(10), 8);
+        mux.handle(msg(Tag::AgreementVote, 1)).await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let rec = Arc::new(Recorder(Mutex::new(Vec::new())));
+        mux.register_handlers(vec![TaggedMessageHandler { tag: Tag::AgreementVote, handler: rec.clone() }]);
+        settle_until(&rec, 1).await;
+        assert!(rec.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_plain_multiplexer_holds_nothing() {
+        let mux = Multiplexer::new();
+        mux.handle(msg(Tag::AgreementVote, 1)).await;
+        let rec = Arc::new(Recorder(Mutex::new(Vec::new())));
+        mux.register_handlers(vec![TaggedMessageHandler { tag: Tag::AgreementVote, handler: rec.clone() }]);
+        settle_until(&rec, 1).await;
+        assert!(rec.0.lock().unwrap().is_empty());
+    }
+
+
+    /// The race the review found: the handler appears between `handle`'s
+    /// lookup and its hold. `hold_or_handler` must hand the handler back so the
+    /// message is delivered rather than parked after the drain.
+    #[tokio::test]
+    async fn a_handler_registered_after_the_lookup_still_gets_the_message() {
+        let mux = Multiplexer::with_early_hold(&[Tag::AgreementVote], Duration::from_secs(30), 8);
+        let rec = Arc::new(Recorder(Mutex::new(Vec::new())));
+        mux.register_handlers(vec![TaggedMessageHandler { tag: Tag::AgreementVote, handler: rec.clone() }]);
+        // (the lookup in `handle` already missed; now the hold step runs)
+        let h = mux.hold_or_handler(&msg(Tag::AgreementVote, 7));
+        assert!(h.is_some(), "the registered handler must be returned, not the message parked");
+        h.unwrap().handle(msg(Tag::AgreementVote, 7)).await;
+        assert_eq!(*rec.0.lock().unwrap(), vec![7]);
+        assert!(mux.take_held(Tag::AgreementVote).is_empty(), "nothing parked");
+    }
+
+    #[tokio::test]
+    async fn stale_entries_are_dropped_when_new_ones_arrive() {
+        let mux = Multiplexer::with_early_hold(&[Tag::AgreementVote], Duration::from_millis(10), 8);
+        mux.handle(msg(Tag::AgreementVote, 1)).await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        mux.handle(msg(Tag::AgreementVote, 2)).await;
+        let held: Vec<u8> = mux.take_held(Tag::AgreementVote).iter().map(|m| m.data[0]).collect();
+        assert_eq!(held, vec![2], "the stale first message was evicted on insert");
+    }
+
 }
