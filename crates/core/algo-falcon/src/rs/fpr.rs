@@ -200,14 +200,119 @@ pub(crate) fn fpr_trunc(x: Fpr) -> i64 {
     xu as i64
 }
 
+/// Test-only record of the operand/result domain the Falcon algorithms
+/// actually reach (issue #2016): the Rust port computes with native `f64`
+/// while the C emulation (`FALCON_FPEMU`) differs from it only outside
+/// "normal finite numbers, exponent far from the limits, no `-0` in the two
+/// operations that treat it differently"; this proves, empirically, that
+/// keygen and signing stay inside that domain. Thread-local so that the
+/// adversarial differential test, which deliberately leaves the domain,
+/// cannot pollute another test's measurement.
+#[cfg(test)]
+pub(crate) mod domain {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct Stats {
+        pub ops: u64,
+        pub min_exp: i32,
+        pub max_exp: i32,
+        pub subnormal: u64,
+        pub nonfinite: u64,
+        /// `fpr_div` with a zero numerator and a negative divisor (Rust: -0, C: +0)
+        pub div_zero_over_negative: u64,
+        /// `fpr_half(-0)` (Rust: -0, C: +0)
+        pub half_negative_zero: u64,
+    }
+
+    impl Stats {
+        const fn new() -> Self {
+            Self {
+                ops: 0,
+                min_exp: i32::MAX,
+                max_exp: i32::MIN,
+                subnormal: 0,
+                nonfinite: 0,
+                div_zero_over_negative: 0,
+                half_negative_zero: 0,
+            }
+        }
+    }
+
+    thread_local! {
+        static STATS: Cell<Stats> = const { Cell::new(Stats::new()) };
+    }
+
+    pub(crate) fn reset() {
+        STATS.with(|s| s.set(Stats::new()));
+    }
+
+    pub(crate) fn take() -> Stats {
+        STATS.with(|s| s.get())
+    }
+
+    pub(crate) fn note(v: f64) {
+        STATS.with(|s| {
+            let mut st = s.get();
+            st.ops += 1;
+            if v == 0.0 {
+                // zero is in the domain
+            } else if !v.is_finite() {
+                st.nonfinite += 1;
+            } else if v.is_subnormal() {
+                st.subnormal += 1;
+            } else {
+                let e = ((v.to_bits() >> 52) & 0x7ff) as i32 - 1023;
+                st.min_exp = st.min_exp.min(e);
+                st.max_exp = st.max_exp.max(e);
+            }
+            s.set(st);
+        });
+    }
+
+    pub(crate) fn note_div(x: f64, y: f64) {
+        if x == 0.0 && y.is_sign_negative() {
+            STATS.with(|s| {
+                let mut st = s.get();
+                st.div_zero_over_negative += 1;
+                s.set(st);
+            });
+        }
+    }
+
+    pub(crate) fn note_half(x: f64) {
+        if x == 0.0 && x.is_sign_negative() {
+            STATS.with(|s| {
+                let mut st = s.get();
+                st.half_negative_zero += 1;
+                s.set(st);
+            });
+        }
+    }
+}
+
 #[inline(always)]
 pub(crate) fn fpr_add(x: Fpr, y: Fpr) -> Fpr {
-    x + y
+    let r = x + y;
+    #[cfg(test)]
+    {
+        domain::note(x);
+        domain::note(y);
+        domain::note(r);
+    }
+    r
 }
 
 #[inline(always)]
 pub(crate) fn fpr_sub(x: Fpr, y: Fpr) -> Fpr {
-    x - y
+    let r = x - y;
+    #[cfg(test)]
+    {
+        domain::note(x);
+        domain::note(y);
+        domain::note(r);
+    }
+    r
 }
 
 #[inline(always)]
@@ -217,39 +322,85 @@ pub(crate) fn fpr_neg(x: Fpr) -> Fpr {
 
 #[inline(always)]
 pub(crate) fn fpr_half(x: Fpr) -> Fpr {
-    x * 0.5
+    let r = x * 0.5;
+    #[cfg(test)]
+    {
+        domain::note_half(x);
+        domain::note(x);
+        domain::note(r);
+    }
+    r
 }
 
 #[inline(always)]
 pub(crate) fn fpr_double(x: Fpr) -> Fpr {
-    x + x
+    let r = x + x;
+    #[cfg(test)]
+    {
+        domain::note(x);
+        domain::note(r);
+    }
+    r
 }
 
 #[inline(always)]
 pub(crate) fn fpr_mul(x: Fpr, y: Fpr) -> Fpr {
-    x * y
+    let r = x * y;
+    #[cfg(test)]
+    {
+        domain::note(x);
+        domain::note(y);
+        domain::note(r);
+    }
+    r
 }
 
 #[inline(always)]
 pub(crate) fn fpr_sqr(x: Fpr) -> Fpr {
-    x * x
+    let r = x * x;
+    #[cfg(test)]
+    {
+        domain::note(x);
+        domain::note(r);
+    }
+    r
 }
 
 #[inline(always)]
 pub(crate) fn fpr_inv(x: Fpr) -> Fpr {
-    1.0 / x
+    let r = 1.0 / x;
+    #[cfg(test)]
+    {
+        domain::note(x);
+        domain::note(r);
+    }
+    r
 }
 
 #[inline(always)]
 pub(crate) fn fpr_div(x: Fpr, y: Fpr) -> Fpr {
-    x / y
+    let r = x / y;
+    #[cfg(test)]
+    {
+        domain::note_div(x, y);
+        domain::note(x);
+        domain::note(y);
+        domain::note(r);
+    }
+    r
 }
 
 /// `fpr_sqrt`: correctly rounded square root (`sqrtsd` on x86-64, `fsqrt`
 /// on AArch64, soft-float otherwise — all correctly rounded).
 #[inline(always)]
 pub(crate) fn fpr_sqrt(x: Fpr) -> Fpr {
-    x.sqrt()
+    let r = x.sqrt();
+    #[cfg(test)]
+    {
+        domain::note(x);
+        domain::note(r);
+    }
+    r
 }
 
 #[inline(always)]

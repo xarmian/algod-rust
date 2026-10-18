@@ -76,6 +76,47 @@ strict IEEE-754 (the compiler may fuse `x*y + z` on some architectures
 or keep operands in separate statements), `math.Sqrt` is correctly rounded,
 and `math.Float64frombits` gives the constants.
 
+### Where the two are *not* bit-identical, and why it cannot matter
+
+An adversarial hunt (issue #2016, `src/rs/fpr_adversarial.rs`, run with
+`--features c-internals-test`) feeds the Rust `fpr` layer and the emulated C
+about 2.5 million operand pairs built to hit what random operands never do:
+exact round-to-nearest-even ties (half-ulp additions, 54-bit products,
+exact and near-exact quotients), perfect squares and their neighbours, huge
+exponent gaps (sticky bits), mantissa patterns around the round bit, the
+`i64` boundaries through `fpr_of`, and exponents from the subnormal edge to
+the infinity encoding. Result:
+
+- **Every operation on normal finite operands with a normal finite result is
+  bit-identical** (add, sub, mul, div, sqrt, sqr, inv, half, double, neg, lt,
+  rint, floor, trunc, of). No in-domain mismatch exists; the test fails if one
+  ever does.
+- The mismatches that exist all lie **outside** that domain, and
+  `tests/fixtures/falcon/fpr_divergences.jsonl` records 198 of them as test data
+  (operands, Rust result, C result, class); `committed_divergences_are_still_divergent_and_out_of_domain`
+  replays them so a change on either side is noticed:
+
+  | class | Rust (native `f64`) | C (`FALCON_FPEMU`) |
+  |---|---|---|
+  | underflow | subnormal result | flushed to zero |
+  | subnormal operand | treated as the tiny number it is | treated as zero (flush) |
+  | overflow | `+-inf` | an out-of-range exponent (the emulation has no infinity) |
+  | non-finite operand | `inf`/`NaN` propagation | the encoding is just a huge number |
+  | zero sign | `fpr_div(0, negative) = -0`, `fpr_half(-0) = -0` | `+0` |
+
+- **Falcon cannot reach them.** `falcon_keygen_and_signing_stay_inside_the_bit_identical_domain`
+  instruments every arithmetic call in a debug build and runs keygen and
+  signing: across ~10^9 operations there is no subnormal and no non-finite value,
+  no `fpr_div(0, negative)` and no `fpr_half(-0)`, and the exponents span about
+  2^-572 .. 2^+572 (keygen's big-integer to floating-point conversions),
+  roughly 450 binades short of both limits (2^-1022, 2^1023), so neither
+  flush-to-zero nor the missing infinity can be triggered.
+
+This is an empirical argument over keys and messages, not a proof; the
+signature-level differential tests (`backend_parity.rs`, scalable through
+`FALCON_PARITY_*`) and the go-algorand-generated corpus cover the whole
+algorithm end to end.
+
 ## Key generation randomness
 
 `FALCON_KG_CHACHA20` is **off** in the vendored `config.h` (the `#define` is

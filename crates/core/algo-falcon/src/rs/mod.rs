@@ -57,6 +57,8 @@ pub(crate) mod det1024;
 pub(crate) mod falcon;
 pub(crate) mod fft;
 pub(crate) mod fpr;
+#[cfg(all(test, feature = "c-internals-test"))]
+mod fpr_adversarial;
 pub(crate) mod fpr_tables;
 pub(crate) mod keygen;
 pub(crate) mod keygen_tables;
