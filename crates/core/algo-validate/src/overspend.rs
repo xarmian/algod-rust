@@ -34,7 +34,7 @@
 //! (`eval.go` `Move`: `Data: fromBal`): for the fee move that is the stored
 //! account, for the amount move it is the state after the fee move
 //! (pending rewards applied, fee debited). The field order, names and
-//! formats below were captured from a go-algorand v5.0.3-stable node.
+//! formats below were captured from a go-algorand v5.0.4-stable node.
 
 use algo_types::{AccountData, AccountStatus, Address};
 
@@ -119,7 +119,7 @@ mod tests {
         (addr, data)
     }
 
-    /// Captured from go-algorand v5.0.3-stable (private network, validly
+    /// Captured from go-algorand v5.0.4-stable (private network, validly
     /// signed payment of 5 Algo from an account holding 1.5 Algo, fee 1000):
     const CAPTURED_5A: &str = "transaction OEAWIVYPTO2XPMB32G6LKW43P47HYQJZ2PLWZU3N2RACI254YUPQ: overspend (account E3EC3FBAHHXDCRGWFGPKDEXVJ2J4N25J7BUU4D6IAW7HNRSDOBSSJSJ4OA, data {AccountBaseData:{Status:Offline MicroAlgos:1.499000A RewardsBase:0 RewardedMicroAlgos:0.0A AuthAddr:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ IncentiveEligible:false TotalAppSchema:{NumUint:0 NumByteSlice:0} TotalExtraAppPages:0 TotalAppParams:0 TotalAppLocalStates:0 TotalAssetParams:0 TotalAssets:0 TotalBoxes:0 TotalBoxBytes:0 LastProposed:0 LastHeartbeat:0} VotingData:{VoteID:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] SelectionID:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] StateProofID:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] VoteFirstValid:0 VoteLastValid:0 VoteKeyDilution:0}}, tried to spend 5A)";
 

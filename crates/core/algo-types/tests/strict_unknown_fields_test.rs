@@ -27,7 +27,7 @@
 //!   msgpack decode error [pos N]: no matching struct field found when decoding stream map with key K
 //!
 //! The expected positions below were captured from a real go-algorand
-//! v5.0.3-stable node (`algorand/algod:5.0.3-stable`, private network,
+//! v5.0.4-stable node (`algorand/algod:5.0.4-stable`, private network,
 //! `curl -X POST --data-binary @body /v2/transactions`) for exactly these
 //! bodies. Without the strict guard the readers keep skipping unknown keys,
 //! which blocks and catchup rely on.

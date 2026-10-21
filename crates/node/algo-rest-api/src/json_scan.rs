@@ -25,7 +25,7 @@
 //! `json decode error [pos N]: no matching struct field found when decoding
 //! stream map with key K`, where `N` is the byte offset **just after the
 //! colon that follows the key** and `K` is the key with its escapes decoded
-//! (verified against a go-algorand v5.0.3-stable node on 22 bodies: varying
+//! (verified against a go-algorand v5.0.4-stable node on 22 bodies: varying
 //! key length, whitespace, nesting, escapes, arrays of transactions). The
 //! first such key in stream order wins, so the object members must keep their
 //! order, which `serde_json::Value` does not.

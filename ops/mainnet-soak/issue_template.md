@@ -39,7 +39,7 @@ See the LICENSE-MIT file in the repository root for the full license text.
   (or, if the halt was mid-catchup rather than a live-follow apply
   failure, re-run catchpoint import for label `{catchpoint_label}` and
   replay forward to round {round} — see `docs/MAINNET_SOAK.md`.)
-- Compare against `../go-algorand` at the pin (`v5.0.3-stable`) for the
+- Compare against `../go-algorand` at the pin (`v5.0.4-stable`) for the
   same round/block to find the specific behavioral divergence.
 
 ## Acceptance criteria

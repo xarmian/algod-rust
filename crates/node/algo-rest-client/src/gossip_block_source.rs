@@ -58,7 +58,7 @@ use algo_network::tag::Tag;
 use crate::{BlockSource, NodeStatus};
 
 /// go: `blockNotAvailableErrMsg = "requested block is not available"`
-/// (`rpcs/blockService.go:320` at v5.0.3-stable), the `Error` topic text a
+/// (`rpcs/blockService.go:320` at v5.0.4-stable), the `Error` topic text a
 /// block service answers with when it does not have the round. Matched with
 /// `contains`, not equality, so a peer that wraps or extends the text still
 /// classifies as "does not have the round".

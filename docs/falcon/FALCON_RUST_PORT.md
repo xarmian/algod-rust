@@ -155,7 +155,7 @@ value.
    generators define it verbatim and must agree byte for byte:
    `tools/falcon-vector-capture` (Go, linking go-algorand's `crypto`
    package — run in CI by `.github/workflows/falcon-vectors.yml` against a
-   fresh `v5.0.3-stable` clone and `git diff --exit-code`'d),
+   fresh `v5.0.4-stable` clone and `git diff --exit-code`'d),
    `cargo run -p algo-falcon --example gen_vectors -- --backend c`, and
    `--backend rust`. `tests/falcon_vectors.rs` runs the corpus against
    every compiled backend (`conformance-parity.yml` step θ).

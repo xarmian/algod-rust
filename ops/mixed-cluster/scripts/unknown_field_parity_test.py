@@ -11,7 +11,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import unknown_field_parity as up  # noqa: E402
 
-# Offsets captured from a real go-algorand v5.0.3-stable node for these bodies.
+# Offsets captured from a real go-algorand v5.0.4-stable node for these bodies.
 GO_POS = {"top": 226, "txn": 156, "lsig": 169, "msig": 216, "pqsig": 171,
           "group_ok_top": 448, "group_top_ok": 226, "group_ok_txn": 378,
           "hgi": 5, "hgh": 5, "ca": 4, "apid": 6, "both": 5}

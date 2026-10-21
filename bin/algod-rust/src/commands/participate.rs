@@ -9494,7 +9494,7 @@ mod tests {
     /// a not-yet-valid and an expired one alike, with only the pool's
     /// `Remember` frame in front of it (no `ingest` frame, no
     /// "validation error:" prefix). Captured from a go-algorand
-    /// v5.0.3-stable node with validly signed transactions.
+    /// v5.0.4-stable node with validly signed transactions.
     #[test]
     fn a_transaction_outside_its_window_is_gos_txn_dead_error() {
         let ledger = test_ledger();
@@ -9555,7 +9555,7 @@ mod tests {
 
     /// Issue #1976: go checks, in this order, signatures, the validity window,
     /// then the group fees (`verify.TxnGroup`, `Alive`, `CheckGroupFees`).
-    /// Captured live from go-algorand v5.0.3-stable with validly signed
+    /// Captured live from go-algorand v5.0.4-stable with validly signed
     /// transactions of fee 1: a valid window gives
     /// `txgroup with 1uA fees is less than 1mA (usage=1.000000 * base=1mA)`,
     /// an out-of-window one `txn dead: ...` (the window wins).
@@ -9693,7 +9693,7 @@ mod tests {
         }
     }
 
-    /// Issue #1979, against go-algorand v5.0.3-stable's captured behaviour:
+    /// Issue #1979, against go-algorand v5.0.4-stable's captured behaviour:
     /// a transaction's own state checks (fee move, then the amount) come
     /// BEFORE the group-fee check, and a short balance is a
     /// `ledgercore.OverspendError` whose text prints the account.

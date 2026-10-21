@@ -47,7 +47,7 @@ _handoff_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$_handoff_dir/ports.sh"  # issue #1956
 GO_NODE_REST="${GO_NODE_REST:-http://localhost:$PHASE6_GO1_PORT}"
 GO_NODE_TOKEN="${GO_NODE_TOKEN:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
-ALGOD_IMG="${ALGOD_IMG:-algorand/algod:5.0.3-stable}"
+ALGOD_IMG="${ALGOD_IMG:-algorand/algod:5.0.4-stable}"
 KEEP_HANDOFF="${KEEP_HANDOFF:-0}"
 SKIP_CLUSTER_START="${SKIP_CLUSTER_START:-0}"
 
@@ -191,7 +191,7 @@ echo "$GO_NODE_TOKEN" > "$GO_DATA_DIR/algod.admin.token"
 
 # Drop the Rust-produced ledger files into the location go-algorand
 # expects: `<datadir>/<genesisID>/ledger.{tracker,block}.sqlite`.
-# Reference: ../go-algorand/ledger/ledger.go:326,335 (v5.0.3-stable).
+# Reference: ../go-algorand/ledger/ledger.go:326,335 (v5.0.4-stable).
 cp "${LEDGER_PREFIX}.tracker.sqlite" "$GO_DATA_DIR/$GENESIS_ID/ledger.tracker.sqlite"
 cp "${LEDGER_PREFIX}.block.sqlite"   "$GO_DATA_DIR/$GENESIS_ID/ledger.block.sqlite"
 

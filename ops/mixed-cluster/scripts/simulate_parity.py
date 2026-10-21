@@ -15,7 +15,7 @@ Rust node of the running mixed cluster and require identical answers
 * `request` / `group` / `stxn` / `txn` / `hgi`: an unknown key at that level.
   go's strict msgpack decode fails, its JSON fallback then fails on the msgpack
   map marker, and the answer is one fixed text (captured from a go-algorand
-  v5.0.3-stable node).
+  v5.0.4-stable node).
 * `json_*`: the same, as a JSON body in go's JSON form (issue #1971). go's
   strict JSON decode names the first unknown key in stream order and the byte
   offset just after the colon that follows it:

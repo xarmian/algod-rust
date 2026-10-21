@@ -64,11 +64,11 @@ Build it with `docker build -f docker/Dockerfile --target algod .`.
 ## Published tags
 
 The go-compatible image is published next to the `follow` image with go's tag
-scheme and an `-algod` suffix: `latest-algod`, `stable-algod`, `5.0.3-stable-algod`
+scheme and an `-algod` suffix: `latest-algod`, `stable-algod`, `5.0.4-stable-algod`
 (the pinned go-algorand version), `beta-algod`, `nightly-algod`, and
 `<X.Y.Z>-algod` for releases, on `ghcr.io/xarmian/algod-rust` (and Docker Hub when
-configured). To switch from go, change `algorand/algod:5.0.3-stable` to
-`ghcr.io/xarmian/algod-rust:5.0.3-stable-algod`.
+configured). To switch from go, change `algorand/algod:5.0.4-stable` to
+`ghcr.io/xarmian/algod-rust:5.0.4-stable-algod`.
 
 ## Checking parity
 
