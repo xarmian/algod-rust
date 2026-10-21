@@ -15,7 +15,7 @@ on:
       go_image:
         description: "go-algorand image to compare against"
         required: false
-        default: "algorand/algod:5.0.3-stable"
+        default: "algorand/algod:5.0.4-stable"
   pull_request:
     paths:
       - "docker/algod/**"
@@ -59,13 +59,13 @@ jobs:
 
       - name: Pull the go image
         env:
-          GO_IMAGE: ${{ inputs.go_image || 'algorand/algod:5.0.3-stable' }}
+          GO_IMAGE: ${{ inputs.go_image || 'algorand/algod:5.0.4-stable' }}
         run: docker pull "$GO_IMAGE"
 
       - name: Compare the two images
         run: |
           OUT="$RUNNER_TEMP/parity" bash docker/scripts/algod-image-parity.sh \
-            algod-rust-parity:algod "${{ inputs.go_image || 'algorand/algod:5.0.3-stable' }}"
+            algod-rust-parity:algod "${{ inputs.go_image || 'algorand/algod:5.0.4-stable' }}"
 
       - name: Upload comparison artifacts
         if: always()

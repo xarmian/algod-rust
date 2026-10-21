@@ -28,7 +28,7 @@
 # behaviour across `docker restart` / `docker stop`.
 #
 # Usage: docker/scripts/algod-image-parity.sh <algod-rust-image> [go-image]
-#   go-image defaults to algorand/algod:5.0.3-stable
+#   go-image defaults to algorand/algod:5.0.4-stable
 #
 # Differences are expected to be listed in docker/scripts/algod-image-parity.known
 # (`check|reason`); an unlisted difference fails the run, and so does a listed
@@ -41,7 +41,7 @@ set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUST_IMAGE="${1:?usage: $0 <algod-rust-image> [go-image]}"
-GO_IMAGE="${2:-algorand/algod:5.0.3-stable}"
+GO_IMAGE="${2:-algorand/algod:5.0.4-stable}"
 KNOWN="${KNOWN:-$HERE/algod-image-parity.known}"
 OUT="${OUT:-$(mktemp -d)}"
 TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa

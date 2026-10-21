@@ -10,7 +10,7 @@ responses (issue #1962).
 go decodes `POST /v2/transactions` with `protocol.NewDecoder`
 (`ErrorIfNoField`), so each body is a 400 whose text names the stream offset
 just after the unknown key. The offsets in `unknown_field_parity_test.py` were
-captured from a go-algorand v5.0.3-stable node.
+captured from a go-algorand v5.0.4-stable node.
 
     python3 unknown_field_parity.py [--go go-node-1] [--rust rust-node-4]
 

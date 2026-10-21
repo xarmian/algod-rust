@@ -45,7 +45,7 @@ permissions:
 
 env:
   # Pin go-algorand to the same rev the rest of the repo references.
-  GO_ALGORAND_REV: "v5.0.3-stable"
+  GO_ALGORAND_REV: "v5.0.4-stable"
 
 jobs:
   corpus-drift-check:

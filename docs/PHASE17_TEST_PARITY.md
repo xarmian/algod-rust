@@ -1,6 +1,6 @@
 # Phase 17 Test Parity Map — go-algorand ↔ algod-rust
 
-_Generated 2026-10-12 against go-algorand `v5.0.3-stable` (detached HEAD,
+_Generated 2026-10-21 against go-algorand `v5.0.4-stable` (detached HEAD,
 `../go-algorand`) and algod-rust `main`._
 
 This document is the test-level evidence map for

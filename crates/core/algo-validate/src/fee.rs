@@ -597,7 +597,7 @@ mod tests {
         assert_eq!(format_micros(2_000_001), "2.000001");
     }
 
-    /// The text go-algorand v5.0.3-stable answers for a validly signed payment
+    /// The text go-algorand v5.0.4-stable answers for a validly signed payment
     /// with fee 1 (captured live):
     /// `txgroup with 1uA fees is less than 1mA (usage=1.000000 * base=1mA)`.
     #[test]

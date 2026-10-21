@@ -24,7 +24,7 @@ ROOT="$(cd "$HERE/.." && pwd)"
 
 NETROOT="$ROOT/netroot"
 TEMPLATE="$ROOT/template.json"
-ALGOD_IMG="${ALGOD_IMG:-algorand/algod:5.0.3-stable}"
+ALGOD_IMG="${ALGOD_IMG:-algorand/algod:5.0.4-stable}"
 NUM_ROUNDS="${NUM_ROUNDS:-30000}"
 ALGOD_TOKEN="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 

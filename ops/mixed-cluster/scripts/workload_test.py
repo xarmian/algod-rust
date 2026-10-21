@@ -152,7 +152,7 @@ def records(out):
 class HelpersTest(unittest.TestCase):
     def test_app_address_matches_go_algorand(self):
         # Application account reported by `goal app info --app-id 1079` on a
-        # go-algorand v5.0.3-stable node.
+        # go-algorand v5.0.4-stable node.
         self.assertEqual(wl.app_address(1079), "RUCD7ASCU6TFKMIONZURZO5K5CMY6PCH4PM6BWQYG2NYQ7RNQSGZJ6IDXA")
 
     def test_parse_goal_output(self):

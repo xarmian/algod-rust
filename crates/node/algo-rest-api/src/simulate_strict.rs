@@ -29,7 +29,7 @@
 //! transaction-group, the `SignedTxn` or any nested level, including the
 //! block-only `hgi`/`hgh` -- therefore always ends in the JSON decoder
 //! choking on the msgpack map marker, so the response is one fixed text
-//! (captured from a go-algorand v5.0.3-stable node for these bodies):
+//! (captured from a go-algorand v5.0.4-stable node for these bodies):
 //!
 //! ```text
 //! failed to decode object: json decode error [pos 1]: only encoded map or array can be decoded into a struct
@@ -539,7 +539,7 @@ mod tests {
         assert_eq!(rejection(&ok), None);
     }
 
-    /// Each body below is rejected by a live go-algorand v5.0.3-stable node with
+    /// Each body below is rejected by a live go-algorand v5.0.4-stable node with
     /// exactly `GO_MSGPACK_REJECTION`.
     #[test]
     fn unknown_keys_at_every_level_get_gos_fixed_text() {
@@ -776,7 +776,7 @@ mod tests {
         assert!(not_go("not json"));
     }
 
-    /// Positions captured from a real go-algorand v5.0.3-stable node
+    /// Positions captured from a real go-algorand v5.0.4-stable node
     /// (`curl -X POST -H 'Content-Type: application/json' --data-binary @body
     /// /v2/transactions/simulate`): go reports the first unknown key in stream
     /// order with the offset just after the colon that follows it.

@@ -1,6 +1,6 @@
 # Mixed-cluster runbook: go-algorand and algod-rust agreement under a rich workload
 
-Issue #1674. How to run, on demand, a soak in which three go-algorand v5.0.3-stable
+Issue #1674. How to run, on demand, a soak in which three go-algorand v5.0.4-stable
 nodes and one `algod-rust participate` node (30/30/30/10 online stake) stay in
 agreement over many rounds while the chain carries boxes, inner transactions,
 asset create / opt-in / transfer / close-out, application create / call / delete,

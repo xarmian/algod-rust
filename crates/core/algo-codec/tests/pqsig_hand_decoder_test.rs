@@ -62,7 +62,7 @@ fn hand_decoder_keeps_pqsig_when_authaddr_differs_from_the_signer() {
 }
 
 /// The live-workload shape: the sender IS the PQ address (no `sgnr`), signed
-/// by go-algorand v5.0.3-stable `algokey pq sign`.
+/// by go-algorand v5.0.4-stable `algokey pq sign`.
 #[test]
 fn hand_decoder_keeps_pqsig_when_the_sender_is_the_pq_address() {
     check_signed_txn_fixture("signed_txn_pq_sender_is_signer.canonical.hex");

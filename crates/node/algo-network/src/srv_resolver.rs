@@ -2081,7 +2081,7 @@ mod tests {
         assert!(res.is_err(), "unsigned data must not validate: {res:?}");
     }
 
-    /// Root trust-anchor parity (issue #1863, go-algorand v5.0.3-stable
+    /// Root trust-anchor parity (issue #1863, go-algorand v5.0.4-stable
     /// `tools/network/dnssec/anchor.go`, PR #6764). go ships the IANA anchor
     /// set KSK-2017 (key tag 20326) and KSK-2024 (key tag 38696) --
     /// `TestParseRootTrustAnchor` / `TestQueryWrapper` assert exactly these
@@ -2140,7 +2140,7 @@ mod tests {
                     "683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16".to_string()
                 ),
             ],
-            "root trust anchors differ from go-algorand v5.0.3-stable's anchor set"
+            "root trust anchors differ from go-algorand v5.0.4-stable's anchor set"
         );
     }
 

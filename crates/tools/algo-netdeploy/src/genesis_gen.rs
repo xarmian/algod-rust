@@ -751,7 +751,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(out.genesis_path).unwrap()).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
-        // as written by `goal network create` in algorand/algod:5.0.3-stable
+        // as written by `goal network create` in algorand/algod:5.0.4-stable
         assert_eq!(keys, ["alloc", "fees", "id", "network", "proto", "rwd"]);
     }
 }
