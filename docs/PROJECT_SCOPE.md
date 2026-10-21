@@ -427,6 +427,8 @@ The `v5.0.1-stable → v5.0.2-stable` sweep is a small safety/durability patch r
 
 The `v5.0.2-stable → v5.0.3-stable` sweep is a one-change patch release: the IANA root KSK-2024 (key tag 38696) trust anchor is added to go-algorand's DNSSEC root anchor set ahead of the root key rollover. algod-rust delegates DNSSEC validation to `hickory-resolver`, whose built-in anchors already include KSK-2024, so the work is proving and guarding that parity. See `docs/PHASE20_PROPOSAL.md` and epic issue [#1864](https://github.com/xarmian/algod-rust/issues/1864).
 
+The `v5.0.3-stable → v5.0.4-stable` sweep ships consensus version v43 (`CloseRequiresBaseMinBalance`: closing an account now requires its minimum balance to be exactly the base, closing a hole left by AppSizeUpdates size-sponsors), a generate-only (pool/assembly/simulation) close-out guard, and zstd decode support for agreement crash-recovery snapshots. See `docs/PHASE22_PROPOSAL.md` and epic issue [#2025](https://github.com/xarmian/algod-rust/issues/2025).
+
 ---
 
 ## Phase 15 — Licensing and Legal-Framework Compliance
