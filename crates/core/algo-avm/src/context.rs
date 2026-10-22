@@ -111,6 +111,27 @@ pub trait AvmContext {
         })
     }
 
+    /// Pre-v4 ("direct reference not yet enabled") asset reference, matching
+    /// go-algorand's `assetReference(ref, foreign=false)` for programs below
+    /// `directRefEnabledVersion` (4): the stack value *is* the asset ID, with
+    /// no availability check -- only the `AppForbidLowResources` low-ID gate.
+    /// Used by `asset_holding_get` in v2/v3 programs.
+    fn direct_asset_ref(&self, id: u64) -> Result<u64, AlgoError> {
+        Ok(id)
+    }
+
+    /// Pre-v4 app reference, matching go-algorand's
+    /// `appReference(ref, foreign=false)`: `0` is the current app, anything
+    /// else is the app ID itself with no availability check. Used by the
+    /// local-state read opcodes in v2/v3 programs.
+    fn direct_app_ref(&self, id: u64) -> Result<u64, AlgoError> {
+        if id == 0 {
+            Ok(self.current_app_id())
+        } else {
+            Ok(id)
+        }
+    }
+
     /// Resolve an `apfa` (foreign apps) array index to an app ID.
     /// Index 0 = current app.
     fn resolve_app(&self, index: u64) -> Result<u64, AlgoError> {

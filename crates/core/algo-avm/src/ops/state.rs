@@ -42,6 +42,11 @@ use super::helpers::{avm_to_teal, get_uint8, get_uint8_pair, teal_to_avm};
 /// (algo-avm) cannot depend on algo-ledger.
 const SHARED_RESOURCES_VERSION: u8 = 9;
 
+/// go-algorand's `directRefEnabledVersion`: below it, `asset_holding_get` and
+/// the local-state reads take a bare ID with no availability check
+/// (`assetReference`/`appReference` with `foreign=false`).
+const DIRECT_REF_ENABLED_VERSION: u8 = 4;
+
 /// Resolve a stack value to raw address bytes *without* checking
 /// availability, mirroring go-algorand's `resolveAccount`
 /// (`data/transactions/logic/eval.go`) as called from
@@ -125,7 +130,13 @@ fn holding_reference(
     }
     // Pre-v9: the rule is just that account and asset are each available.
     let addr = resolve_account(acct_val, ctx)?;
-    let asset = ctx.resolve_asset(asset_ref_raw)?;
+    // Pre-v4 the asset is a bare ID, never availability-checked (go's
+    // `assetReference(ref, false)`); v2/v3 programs on mainnet rely on it.
+    let asset = if version < DIRECT_REF_ENABLED_VERSION {
+        ctx.direct_asset_ref(asset_ref_raw)?
+    } else {
+        ctx.resolve_asset(asset_ref_raw)?
+    };
     Ok((addr, asset))
 }
 
@@ -178,7 +189,12 @@ fn locals_reference(
     }
     // Pre-v9: the rule is just that account and app are each available.
     let addr = resolve_account(acct_val, ctx)?;
-    let app_id = ctx.resolve_app(app_ref_raw)?;
+    // Pre-v4: bare app ID (0 = current app), no availability check.
+    let app_id = if version < DIRECT_REF_ENABLED_VERSION {
+        ctx.direct_app_ref(app_ref_raw)?
+    } else {
+        ctx.resolve_app(app_ref_raw)?
+    };
     Ok((addr, app_id))
 }
 
@@ -2338,6 +2354,51 @@ mod tests {
         // gate only exists via `is_account_available`, whose default is
         // permissive and unaffected by this test).
         step_n(&mut m, &mut ctx, 3).unwrap();
+    }
+
+    /// Issue #2021: below `directRefEnabledVersion` (4) `asset_holding_get`
+    /// takes a bare asset ID with no availability check (go's
+    /// `assetReference(ref, false)`). A v2 program reading a holding for an
+    /// asset that is not in `ForeignAssets` must succeed, while v4+ still
+    /// fails with "unavailable Asset".
+    #[test]
+    fn asset_holding_get_pre_v4_takes_direct_id_without_availability_check() {
+        let addr = test_addr(0x27);
+        for (version, ok) in [(3u8, true), (4, false), (8, false)] {
+            let mut code = vec![0x80, 0x20];
+            code.extend_from_slice(&addr);
+            code.push(0x81);
+            code.extend_from_slice(&encode_uvarint(626_283_733));
+            code.extend_from_slice(&[0x70, 0x00]); // asset_holding_get AssetBalance
+            let raw = prog(version, &code);
+            let program = bytecode::parse(&raw).unwrap();
+            let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+            let mut ctx = TestStateContext::new(100);
+            ctx.resolve_asset_fail.insert(626_283_733);
+            let res = step_n(&mut m, &mut ctx, 3);
+            if ok {
+                res.unwrap_or_else(|e| panic!("v{version} must not check availability: {e}"));
+            } else {
+                let msg = res.unwrap_err().to_string();
+                assert!(msg.contains("unavailable Asset 626283733"), "v{version}: {msg}");
+            }
+        }
+    }
+
+    /// Issue #2021 sibling: pre-v4 local-state reads take a bare app ID
+    /// (go's `appReference(ref, false)`), no availability check.
+    #[test]
+    fn locals_reference_pre_v4_takes_direct_app_id_without_availability_check() {
+        let addr = test_addr(0x28);
+        for (version, ok) in [(3u8, true), (4, false)] {
+            let raw = addr_and_uint_prog(addr, 777_777, 0x61, version);
+            let program = bytecode::parse(&raw).unwrap();
+            let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+            let mut ctx = TestStateContext::new(100);
+            ctx.resolve_app_fail.insert(777_777);
+            let res = step_n(&mut m, &mut ctx, 3);
+            assert_eq!(res.is_ok(), ok, "v{version}: {res:?}");
+        }
     }
 
     #[test]

@@ -5645,6 +5645,17 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         Ok(id)
     }
 
+    fn direct_asset_ref(&self, id: u64) -> Result<u64, AlgoError> {
+        self.check_forbidden_low_resource(id, "Asset")?;
+        Ok(id)
+    }
+
+    fn direct_app_ref(&self, id: u64) -> Result<u64, AlgoError> {
+        let id = if id == 0 { self.app_id } else { id };
+        self.check_forbidden_low_resource(id, "App")?;
+        Ok(id)
+    }
+
     fn resolve_app(&self, index: u64) -> Result<u64, AlgoError> {
         let id = self.resolve_app_unchecked(index)?;
         self.check_forbidden_low_resource(id, "App")?;
@@ -9563,6 +9574,26 @@ mod tests {
         let ctx = make_context(&mut store, vec![txn]);
         let err = ctx.resolve_asset(0).unwrap_err();
         assert!(err.to_string().contains("unavailable Asset 0"), "{err}");
+    }
+
+    /// Issue #2021 (mainnet round 66119736): go's pre-v4
+    /// `assetReference(ref, foreign=false)` / `appReference(ref, false)` take a
+    /// bare ID with no availability check, so a v2 program may name an asset
+    /// that no transaction in the group references.
+    #[test]
+    fn direct_refs_skip_availability_for_pre_v4_programs() {
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 3471862384, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_id = 3471862384;
+        // The availability-checked path rejects the unreferenced asset...
+        let err = ctx.resolve_asset(626283733).unwrap_err();
+        assert!(err.to_string().contains("unavailable Asset 626283733"), "{err}");
+        // ...the pre-v4 direct path does not.
+        assert_eq!(ctx.direct_asset_ref(626283733).unwrap(), 626283733);
+        assert_eq!(ctx.direct_app_ref(0).unwrap(), 3471862384);
+        assert_eq!(ctx.direct_app_ref(999999).unwrap(), 999999);
     }
 
     #[test]
