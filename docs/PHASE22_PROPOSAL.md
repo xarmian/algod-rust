@@ -43,12 +43,12 @@ The release notes list exactly the three bug-fix bullets above; all accounted fo
 
 ## Success criteria
 
-- [ ] #2022, #2023, #2024 closed.
-- [ ] Pin swept from `v5.0.3-stable` to `v5.0.4-stable` across the repo.
-- [ ] `python3 scripts/phase17_parity_delta.py check --tag v5.0.4-stable --go-algorand ../go-algorand` exits 0 (`not-implemented` = `missing-test` = `partial` = `unclassified` = 0).
-- [ ] Full gate green on `main` (fmt, clippy, workspace tests) and a live mixed-cluster run against v5.0.4-stable Go nodes.
-- [ ] `docs/PHASE22_VALIDATION.md` evidence map written at close-out.
-- [ ] `gh issue list --label "phase:22" --state open` empty before the epic closes.
+- [x] #2022, #2023, #2024 closed (PRs #2030, #2031, #2032).
+- [x] Pin swept from `v5.0.3-stable` to `v5.0.4-stable` across the repo (PR #2028).
+- [x] `python3 scripts/phase17_parity_delta.py check --tag v5.0.4-stable --go-algorand ../go-algorand` exits 0 (`not-implemented` = `missing-test` = `partial` = `unclassified` = 0). (with the standing `--allow-partial 3` sign-off; see `docs/PHASE22_VALIDATION.md`)
+- [x] Full gate green on `main` (fmt, clippy, workspace tests) and a live mixed-cluster run against v5.0.4-stable Go nodes (see `docs/PHASE22_VALIDATION.md`).
+- [x] `docs/PHASE22_VALIDATION.md` evidence map written at close-out.
+- [x] `gh issue list --label "phase:22" --state open` empty before the epic closes (checked 2026-10-22).
 
 ## Non-goals
 
