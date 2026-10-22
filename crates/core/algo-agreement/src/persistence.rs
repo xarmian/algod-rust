@@ -259,6 +259,28 @@ impl From<rusqlite::Error> for PersistenceError {
 /// `Service::start`'s `restore_crash_state` resets the row and
 /// bootstraps fresh, so the upgrade is a one-time loss of in-flight
 /// crash state and nothing more.
+/// go `snapshotCompressionLevel` / `compressSnapshots` / `zstdFrameMagic`
+/// (`agreement/persistence.go`, v5.0.4-stable). The persisted state can be
+/// zstd-compressed, which is very effective for votes and bundles that repeat
+/// the same proposal values, signatures and msgpack field names. Decoding
+/// support ships first, so `COMPRESS_SNAPSHOTS` can be turned on only once no
+/// node can roll back to a binary that cannot read a compressed state.
+const SNAPSHOT_COMPRESSION_LEVEL: i32 = 3;
+
+/// Whether [`encode`] compresses the state; see above.
+const COMPRESS_SNAPSHOTS: bool = false;
+
+/// Every zstd frame starts with this magic. A state persisted uncompressed
+/// starts with a msgpack map header, which cannot be this.
+const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
+/// Compress an encoded state (go `compressSnapshot`). Compressing a buffer
+/// cannot fail; should it, the state is returned as it is, which [`decode`]
+/// reads too.
+pub fn compress_snapshot(raw: Vec<u8>) -> Vec<u8> {
+    zstd::stream::encode_all(&raw[..], SNAPSHOT_COMPRESSION_LEVEL).unwrap_or(raw)
+}
+
 pub fn encode(
     router: &RootRouter,
     player: &Player,
@@ -302,10 +324,17 @@ pub fn encode(
         actions: encoded_actions,
     };
 
-    rmp_serde::to_vec_named(&disk_state).map_err(|e| PersistenceError::Encode(e.to_string()))
+    let raw = rmp_serde::to_vec_named(&disk_state)
+        .map_err(|e| PersistenceError::Encode(e.to_string()))?;
+    Ok(if COMPRESS_SNAPSHOTS {
+        compress_snapshot(raw)
+    } else {
+        raw
+    })
 }
 
-/// Decode persisted agreement state.
+/// Decode persisted agreement state, compressed (see [`compress_snapshot`])
+/// or not.
 ///
 /// Mirrors Go's `decode()` in persistence.go. Recreates
 /// `CredentialArrivalHistory` on the player since it is not faithfully
@@ -313,6 +342,18 @@ pub fn encode(
 pub fn decode(
     raw: &[u8],
 ) -> Result<(RootRouter, Player, ClockState, Vec<Action>), PersistenceError> {
+    let decompressed;
+    let raw = if raw.starts_with(&ZSTD_FRAME_MAGIC) {
+        decompressed = zstd::stream::decode_all(raw).map_err(|e| {
+            PersistenceError::Corrupt(format!(
+                "error decompressing retrieved state (len = {}): {e}",
+                raw.len()
+            ))
+        })?;
+        &decompressed[..]
+    } else {
+        raw
+    };
     let disk_state: DiskState =
         rmp_serde::from_slice(raw).map_err(|e| PersistenceError::Corrupt(e.to_string()))?;
 
@@ -1164,6 +1205,108 @@ mod tests {
         assert_eq!(router.children.len(), 2);
         assert!(router.children.contains_key(&Round(5)));
         assert!(router.children.contains_key(&Round(10)));
+    }
+
+    // -- Test: zstd-compressed snapshots (go `TestAgreementSnapshotCompression`,
+    //    v5.0.4-stable, issue #2024) ------------------------------------------
+
+    /// This release persists the state uncompressed and restores it
+    /// compressed, as the next release will persist it: a compressed state
+    /// decodes to the same state, through the crash database as well, and a
+    /// damaged one is rejected.
+    #[test]
+    fn agreement_snapshot_compression() {
+        let mut router = RootRouter::default();
+        for r in 100..110 {
+            let mut round_router = RoundRouter::default();
+            for p in 0..3 {
+                let mut period_router = PeriodRouter::default();
+                for s in 0..4 {
+                    period_router
+                        .children
+                        .insert(Step(s), StepRouter::default());
+                }
+                round_router.children.insert(Period(p), period_router);
+            }
+            router.children.insert(Round(r), round_router);
+        }
+        let player = Player {
+            round: Round(100),
+            period: Period(2),
+            step: Step(3),
+            ..Player::default()
+        };
+        let mut clock = ClockState::default();
+        clock
+            .deadlines
+            .insert(TimeoutType::Deadline, Duration::from_secs(5));
+        let actions = vec![Action::Noop(NoopAction)];
+
+        let uncompressed = encode(&router, &player, &clock, &actions).expect("encode");
+        assert!(
+            !uncompressed.starts_with(&ZSTD_FRAME_MAGIC),
+            "this release persists the state compressed"
+        );
+        let compressed = compress_snapshot(uncompressed.clone());
+        assert!(compressed.starts_with(&ZSTD_FRAME_MAGIC));
+        let round_trip = zstd::stream::decode_all(&compressed[..]).expect("zstd round trip");
+        assert_eq!(uncompressed, round_trip);
+
+        // The routers hold `HashMap`s, so compare their (sorted) shape rather
+        // than a `Debug` rendering whose map order is per-instance.
+        type RouterShape = Vec<(Round, Vec<(Period, Vec<Step>)>)>;
+        fn shape(r: &RootRouter) -> RouterShape {
+            let mut rounds: Vec<_> = r
+                .children
+                .iter()
+                .map(|(rnd, rr)| {
+                    let mut periods: Vec<_> = rr
+                        .children
+                        .iter()
+                        .map(|(p, pr)| {
+                            let mut steps: Vec<Step> = pr.children.keys().copied().collect();
+                            steps.sort();
+                            (*p, steps)
+                        })
+                        .collect();
+                    periods.sort();
+                    (*rnd, periods)
+                })
+                .collect();
+            rounds.sort();
+            rounds
+        }
+        let (rr1, p1, c1, a1) = decode(&compressed).expect("decode compressed");
+        let (rr2, p2, c2, a2) = decode(&uncompressed).expect("decode uncompressed");
+        assert_eq!(shape(&rr2), shape(&rr1));
+        assert_eq!(shape(&router), shape(&rr1));
+        assert_eq!(
+            (p2.round, p2.period, p2.step),
+            (p1.round, p1.period, p1.step)
+        );
+        assert_eq!(c2.deadlines, c1.deadlines);
+        assert_eq!(clock.deadlines, c1.deadlines);
+        assert_eq!(format!("{a2:?}"), format!("{a1:?}"));
+        assert_eq!(player.round, p1.round);
+
+        // through the crash database
+        let conn = mem_db();
+        persist(&conn, &compressed).expect("persist");
+        let restored = restore(&conn).expect("restore").expect("a row");
+        assert_eq!(compressed, restored);
+        let (rr3, p3, _, _) = decode(&restored).expect("decode restored");
+        assert_eq!(shape(&rr2), shape(&rr3));
+        assert_eq!(
+            (p2.round, p2.period, p2.step),
+            (p3.round, p3.period, p3.step)
+        );
+
+        // a truncated frame does not decode
+        let err = decode(&compressed[..compressed.len() / 2]).unwrap_err();
+        assert!(
+            matches!(&err, PersistenceError::Corrupt(m) if m.contains("decompressing")),
+            "{err:?}"
+        );
     }
 
     // -- Test: decode corrupt data ------------------------------------------
