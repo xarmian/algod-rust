@@ -328,7 +328,7 @@ impl GossipBlockSource {
 
         // Parse the response topics to get raw block+cert bytes.
         let data = parse_block_response(&response_topics)
-            .map_err(|e| classify_parse_error(round, &peer.get_address().to_string(), e))?;
+            .map_err(|e| classify_parse_error(round, peer.get_address(), e))?;
 
         // Decode block+cert from their raw msgpack bytes. decode_block_cert
         // borrows the data, so we can move block_data into the return tuple

@@ -3112,7 +3112,14 @@ mod tests {
 
     #[test]
     fn test_protocol_version_index_future() {
-        assert_eq!(protocol_version_index("future"), Some(36));
+        assert_eq!(protocol_version_index("future"), Some(37));
+    }
+
+    #[test]
+    fn test_protocol_version_index_v43() {
+        assert_eq!(protocol_version_index(
+            "https://github.com/algorandfoundation/specs/tree/73c43b4a9699390884c51e2a9598d49e28373d10"
+        ), Some(36));
     }
 
     #[test]

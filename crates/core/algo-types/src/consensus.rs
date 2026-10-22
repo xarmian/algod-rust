@@ -107,6 +107,8 @@ pub const CONSENSUS_V41: &str =
     "https://github.com/algorandfoundation/specs/tree/953304de35264fc3ef91bcd05c123242015eeaed";
 pub const CONSENSUS_V42: &str =
     "https://github.com/algorandfoundation/specs/tree/268b63433a907455d439995bf916f6b296018f4f";
+pub const CONSENSUS_V43: &str =
+    "https://github.com/algorandfoundation/specs/tree/73c43b4a9699390884c51e2a9598d49e28373d10";
 pub const CONSENSUS_FUTURE: &str = "future";
 pub const CONSENSUS_ALPHA1: &str = "alpha1";
 pub const CONSENSUS_ALPHA2: &str = "alpha2";
@@ -125,7 +127,7 @@ pub const CONSENSUS_VFNET3: &str = "fnet3";
 pub const CONSENSUS_VFNET4: &str = "fnet4";
 
 /// The current (latest release) consensus version.
-pub const CONSENSUS_CURRENT_VERSION: &str = CONSENSUS_V42;
+pub const CONSENSUS_CURRENT_VERSION: &str = CONSENSUS_V43;
 
 /// All protocol version strings recognised by go-algorand v4.6.0-stable.
 pub const KNOWN_PROTOCOL_VERSIONS: &[&str] = &[
@@ -167,6 +169,7 @@ pub const KNOWN_PROTOCOL_VERSIONS: &[&str] = &[
     CONSENSUS_V40,
     CONSENSUS_V41,
     CONSENSUS_V42,
+    CONSENSUS_V43,
     // Special versions
     CONSENSUS_FUTURE,
     CONSENSUS_ALPHA1,
@@ -244,6 +247,7 @@ pub const HISTORICAL_APPROVED_UPGRADES: &[(&str, &str, u64)] = &[
     (CONSENSUS_V39, CONSENSUS_V40, 208_000),
     (CONSENSUS_V40, CONSENSUS_V41, 208_000),
     (CONSENSUS_V41, CONSENSUS_V42, 208_000),
+    (CONSENSUS_V42, CONSENSUS_V43, 208_000),
 ];
 
 // ── ConsensusParams ─────────────────────────────────────────────────
@@ -351,6 +355,12 @@ pub struct ConsensusParams {
     /// and `algo-consensus-crypto::sortition::select_f128`)
     /// (Go: `EnableSelectF128`, v42+).
     pub enable_select_f128: bool,
+    /// An account can be closed (`CloseRemainderTo`) only if its minimum
+    /// balance requirement is exactly the base `MinBalance`. Replaces the
+    /// per-counter close checks, which miss MBR held by an `AppSizeUpdates`
+    /// size sponsor for globals / extra pages of apps it neither created nor
+    /// opted into (Go: `CloseRequiresBaseMinBalance`, v43+).
+    pub close_requires_base_min_balance: bool,
     /// LogicSig sizes pooled across a group (Go: `EnableLogicSigSizePooling`, v40+).
     pub enable_logicsig_size_pooling: bool,
     /// LogicSig costs pooled across a group (Go: `EnableLogicSigCostPooling`, v39+).
@@ -911,9 +921,9 @@ pub const PAYSET_COMMIT_FLAT: u8 = 1;
 pub const PAYSET_COMMIT_MERKLE: u8 = 2;
 
 impl Default for ConsensusParams {
-    /// Default returns V42 (current consensus) parameters.
+    /// Default returns V43 (current consensus) parameters.
     fn default() -> Self {
-        consensus_params_for_version(CONSENSUS_V42).expect("V42 must be a known protocol version")
+        consensus_params_for_version(CONSENSUS_V43).expect("V43 must be a known protocol version")
     }
 }
 
@@ -1100,6 +1110,7 @@ fn built_in_consensus_params(version: &str) -> Option<ConsensusParams> {
         allow_zero_local_app_ref: false,
         enable_pq_scheme_falcon1024: false,
         enable_select_f128: false,
+        close_requires_base_min_balance: false,
         enable_logicsig_size_pooling: false,
         enable_logicsig_cost_pooling: false,
         enable_app_cost_pooling: false,
@@ -1668,8 +1679,8 @@ fn built_in_consensus_params(version: &str) -> Option<ConsensusParams> {
     // consensus version v42 (#6677)"). v42 := v41 with ApprovedUpgrades
     // reset and the fields below overridden.
     let mut v42 = v41.clone();
-    // v42 resets ApprovedUpgrades to an empty map (no known approved upgrade
-    // beyond v42 yet) — go: `v42.ApprovedUpgrades = map[...]{}`.
+    // v42 resets ApprovedUpgrades to an empty map; v42 -> v43 is registered
+    // below once v43 is built (go: `v42.ApprovedUpgrades = map[...]{}`).
     v42.approved_upgrade = None;
     v42.logic_sig_version = 13;
     v42.app_size_updates = true;
@@ -1682,15 +1693,27 @@ fn built_in_consensus_params(version: &str) -> Option<ConsensusParams> {
     v42.max_absolute_total_arg_len = 16_384; // We _could_ make this as high as 16*4k
     v42.per_byte_txn_surcharge = 100; // Each charged byte adds 0.000100 of min fee
     v42.enable_select_f128 = true;
+    // v43 is a fix-only release (go: `v43 := v42; v43.ApprovedUpgrades = {};
+    // v43.CloseRequiresBaseMinBalance = true`) and keeps v42's
+    // LogicSigVersion. v42 can be upgraded to v43 with a 7d delay (208000 =
+    // 7 * 24 * 60 * 60 / ~2.9s), per
+    // `v42.ApprovedUpgrades[protocol.ConsensusV43] = 208000`.
+    let mut v43 = v42.clone();
+    v43.approved_upgrade = None;
+    v43.close_requires_base_min_balance = true;
+    v42.approved_upgrade = Some((CONSENSUS_V43, 208_000));
     if version == CONSENSUS_V42 {
         return Some(v42);
     }
+    if version == CONSENSUS_V43 {
+        return Some(v43);
+    }
 
     // ── future ──────────────────────────────────────────────────
-    // go: vFuture := v42; vFuture.LogicSigVersion = 14 (commit 88fe542f3
-    // moved vFuture's onward from v41 to v42 and bumped LogicSigVersion
+    // go: vFuture := v43; vFuture.LogicSigVersion = 14 (v5.0.4-stable moved
+    // vFuture onward from v42 to v43; commit 88fe542f3 bumped LogicSigVersion
     // again for the next in-development AVM version).
-    let mut v_future = v42.clone();
+    let mut v_future = v43.clone();
     v_future.logic_sig_version = 14;
     if version == CONSENSUS_FUTURE {
         return Some(v_future);
@@ -1931,6 +1954,7 @@ pub struct ConsensusParamsOverride {
     #[serde(rename = "EnablePQSchemeFalcon1024")]
     pub enable_pq_scheme_falcon1024: bool,
     pub enable_select_f128: bool,
+    pub close_requires_base_min_balance: bool,
     /// Same rationale as `enable_fee_pooling` above: go removed
     /// `EnableLogicSigSizePooling` from its live struct once it became
     /// permanently on (v40+), so it is never present in a real
@@ -2136,6 +2160,7 @@ impl ConsensusParamsOverride {
             allow_zero_local_app_ref: self.allow_zero_local_app_ref,
             enable_pq_scheme_falcon1024: self.enable_pq_scheme_falcon1024,
             enable_select_f128: self.enable_select_f128,
+            close_requires_base_min_balance: self.close_requires_base_min_balance,
             enable_logicsig_size_pooling: self.enable_logicsig_size_pooling.0,
             enable_logicsig_cost_pooling: self.enable_logicsig_cost_pooling,
             enable_app_cost_pooling: self.enable_app_cost_pooling,
@@ -2731,10 +2756,43 @@ mod tests {
     }
 
     #[test]
-    fn test_v42_has_no_further_approved_upgrade() {
-        // v42 resets ApprovedUpgrades to {} — nothing beyond it is known yet.
+    fn test_v42_approves_v43_upgrade() {
+        // go (v5.0.4-stable): `v42.ApprovedUpgrades[protocol.ConsensusV43] = 208000`.
         let v42 = consensus_params_for_version(CONSENSUS_V42).unwrap();
-        assert_eq!(v42.approved_upgrade, None);
+        assert_eq!(v42.approved_upgrade, Some((CONSENSUS_V43, 208_000)));
+    }
+
+    #[test]
+    fn test_v43_is_v42_plus_close_requires_base_min_balance() {
+        // go: `v43 := v42; v43.ApprovedUpgrades = {}; v43.CloseRequiresBaseMinBalance = true`.
+        let v42 = consensus_params_for_version(CONSENSUS_V42).unwrap();
+        let v43 = consensus_params_for_version(CONSENSUS_V43).unwrap();
+        assert!(!v42.close_requires_base_min_balance);
+        assert!(v43.close_requires_base_min_balance);
+        assert_eq!(
+            v43.approved_upgrade, None,
+            "nothing beyond v43 is known yet"
+        );
+        assert_eq!(
+            v43.logic_sig_version, v42.logic_sig_version,
+            "fix-only release"
+        );
+        let mut expected = v42.clone();
+        expected.approved_upgrade = None;
+        expected.close_requires_base_min_balance = true;
+        assert_eq!(v43, expected);
+    }
+
+    #[test]
+    fn test_v43_is_current_and_future_derives_from_it() {
+        assert_eq!(CONSENSUS_CURRENT_VERSION, CONSENSUS_V43);
+        assert!(KNOWN_PROTOCOL_VERSIONS.contains(&CONSENSUS_V43));
+        assert_eq!(
+            ConsensusParams::default(),
+            consensus_params_for_version(CONSENSUS_V43).unwrap()
+        );
+        let future = consensus_params_for_version(CONSENSUS_FUTURE).unwrap();
+        assert!(future.close_requires_base_min_balance);
     }
 
     #[test]
@@ -2745,7 +2803,7 @@ mod tests {
         // successors — assert the actual inherited chain values here).
         // MinUpgradeWaitRounds=10000/MaxUpgradeWaitRounds=150000 (v22+),
         // MaxUpgradeWaitRounds=250000 (v39+, supersedes v22's 150000).
-        for version in [CONSENSUS_V41, CONSENSUS_V42] {
+        for version in [CONSENSUS_V41, CONSENSUS_V42, CONSENSUS_V43] {
             let p = consensus_params_for_version(version).unwrap();
             assert_eq!(p.upgrade_vote_rounds, 10_000, "version {version}");
             assert_eq!(p.upgrade_threshold, 9_000, "version {version}");

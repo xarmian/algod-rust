@@ -3292,3 +3292,210 @@ fn test_local_access_in_new_apps() {
          available), got: {err2}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// v43 `CloseRequiresBaseMinBalance` end-to-end (go-algorand v5.0.4-stable
+// `TestSponsorCannotClose`, `ledger/applications_test.go`): an account that
+// became an app's SizeSponsor through a non-creator resize holds MBR for the
+// app's extra pages while having created and opted into nothing, so only
+// the v43 base-MBR rule stops it closing. Deleting the app releases the MBR
+// and the close is accepted again.
+// ---------------------------------------------------------------------------
+
+const SPONSOR_UPDATER_SRC: &str = "\
+#pragma version 8
+txn ApplicationID
+bz end
+txn NumAppArgs
+bnz close
+itxn_begin
+int appl
+itxn_field TypeEnum
+txn Applications 1
+itxn_field ApplicationID
+int UpdateApplication
+itxn_field OnCompletion
+txn Applications 1
+app_params_get AppApprovalProgram
+assert
+itxn_field ApprovalProgram
+txn Applications 1
+app_params_get AppClearStateProgram
+assert
+itxn_field ClearStateProgram
+int 1
+itxn_field ExtraProgramPages
+itxn_submit
+b end
+close:
+itxn_begin
+int pay
+itxn_field TypeEnum
+txn Accounts 1
+itxn_field Receiver
+txn Accounts 1
+itxn_field CloseRemainderTo
+itxn_submit
+end:
+int 1
+";
+
+struct SponsorScenario {
+    state: LedgerState,
+    fee_sink: Address,
+    creator: Address,
+    caller: Address,
+    small_id: u64,
+    updater_id: u64,
+    updater_addr: Address,
+    next_round: u64,
+}
+
+impl SponsorScenario {
+    fn block(&mut self, proto: &str, payset: Vec<SignedTransaction>) -> Block {
+        let mut b = minimal_block(self.fee_sink, self.next_round, payset);
+        b.current_protocol = proto.to_string();
+        self.next_round += 1;
+        b
+    }
+
+    /// Creates smallID and the updater app, then has the updater (a non-creator)
+    /// resize smallID so the updater's app account becomes its SizeSponsor.
+    fn new(proto: &str) -> Self {
+        let creator = Address([21u8; 32]);
+        let updater_creator = Address([22u8; 32]);
+        let caller = Address([23u8; 32]);
+        let fee_sink = Address([24u8; 32]);
+        let (small_id, updater_id) = (960u64, 961u64);
+        let updater_addr = Address(algo_ledger::avm_context::app_address(updater_id));
+        let state = make_state(
+            &[
+                (creator, 50_000_000),
+                (updater_creator, 50_000_000),
+                (caller, 50_000_000),
+                (fee_sink, 0),
+                (updater_addr, 3_000_000),
+            ],
+            fee_sink,
+        );
+        let mut s = Self {
+            state,
+            fee_sink,
+            creator,
+            caller,
+            small_id,
+            updater_id,
+            updater_addr,
+            next_round: 1,
+        };
+        let small_create = appl_create(
+            creator,
+            1_000,
+            small_id,
+            APPROVE_SRC,
+            APPROVE_SRC,
+            None,
+            None,
+            None,
+        );
+        let b = s.block(proto, vec![small_create]);
+        apply_block_capturing_apply_data(&mut s.state, &b, ApplyMode::Execute)
+            .expect("smallID creation");
+        let updater_create = appl_create(
+            updater_creator,
+            1_000,
+            updater_id,
+            SPONSOR_UPDATER_SRC,
+            APPROVE_SRC,
+            None,
+            None,
+            None,
+        );
+        let b = s.block(proto, vec![updater_create]);
+        apply_block_capturing_apply_data(&mut s.state, &b, ApplyMode::Execute)
+            .expect("updater creation");
+        let mut resize = appl_call(caller, 1_000, updater_id, 0, None);
+        resize.txn.foreign_apps = Some(vec![small_id]);
+        let b = s.block(proto, vec![resize]);
+        apply_block_capturing_apply_data(&mut s.state, &b, ApplyMode::Execute)
+            .expect("non-creator resize");
+        let acct = s.state.get_account(&updater_addr).unwrap();
+        assert_eq!(
+            acct.total_extra_app_pages, 1,
+            "precondition: sponsor charged"
+        );
+        assert_eq!(
+            acct.total_created_apps, 0,
+            "precondition: sponsor created nothing"
+        );
+        assert_eq!(
+            acct.total_apps_opted_in, 0,
+            "precondition: sponsor opted into nothing"
+        );
+        s
+    }
+
+    /// Calls the updater so its app account closes itself out to `creator`.
+    fn close_sponsor(&mut self, proto: &str) -> Result<(), String> {
+        let mut call = appl_call(self.caller, 1_000, self.updater_id, 0, None);
+        call.txn.app_arguments = Some(vec![Some(serde_bytes::ByteBuf::from(vec![1u8]))]);
+        call.txn.accounts = Some(vec![self.creator]);
+        let b = self.block(proto, vec![call]);
+        let res = apply_block_capturing_apply_data(&mut self.state, &b, ApplyMode::Execute)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        if res.is_err() {
+            // A rejected block is not applied, so its round is reused.
+            self.next_round -= 1;
+        }
+        res
+    }
+}
+
+#[test]
+fn sponsor_cannot_close_v43_but_can_pre_v43() {
+    use algo_types::consensus::{CONSENSUS_V42, CONSENSUS_V43};
+
+    let mut s = SponsorScenario::new(CONSENSUS_V43);
+    let err = s.close_sponsor(CONSENSUS_V43).unwrap_err();
+    assert!(
+        err.contains("cannot close: min balance"),
+        "v43 must refuse to close a size sponsor, got: {err}"
+    );
+    assert!(err.contains("1 extra pages"), "{err}");
+
+    // Pre-v43 the legacy per-counter checks miss the sponsor's MBR (the bug
+    // v43 fixes), so historical blocks that did this keep replaying.
+    let mut s = SponsorScenario::new(CONSENSUS_V42);
+    s.close_sponsor(CONSENSUS_V42)
+        .expect("pre-v43 close of a size sponsor is accepted");
+    let after = s.state.get_account(&s.updater_addr);
+    assert_eq!(
+        after.map(|a| a.micro_algos).unwrap_or(0),
+        0,
+        "account closed out"
+    );
+}
+
+#[test]
+fn sponsor_can_close_after_app_delete_releases_mbr_v43() {
+    use algo_types::consensus::CONSENSUS_V43;
+
+    let mut s = SponsorScenario::new(CONSENSUS_V43);
+    s.close_sponsor(CONSENSUS_V43).unwrap_err();
+
+    // Deleting the app releases the sponsor's MBR (see
+    // `diagnostic_delete_releases_sponsor_not_creator`).
+    let delete = appl_call(s.creator, 1_000, s.small_id, 5, None);
+    let b = s.block(CONSENSUS_V43, vec![delete]);
+    apply_block_capturing_apply_data(&mut s.state, &b, ApplyMode::Execute).expect("delete");
+    let acct = s.state.get_account(&s.updater_addr).unwrap();
+    assert_eq!(acct.total_extra_app_pages, 0);
+
+    s.close_sponsor(CONSENSUS_V43)
+        .expect("sponsor owing only the base MBR can close");
+    let after = s.state.get_account(&s.updater_addr);
+    assert!(after
+        .map(|a| a.micro_algos == 0 && a.total_extra_app_pages == 0)
+        .unwrap_or(true));
+}

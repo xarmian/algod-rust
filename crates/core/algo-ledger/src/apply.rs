@@ -4654,7 +4654,7 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
         match txn.txn_type.as_str() {
             "pay" => {
                 apply_fee(store, &txn.sender, txn.fee, ctx)?;
-                let ad = apply_pay(store, &stx.txn, ctx.rewards_level)?;
+                let ad = apply_pay(store, &stx.txn, ctx.rewards_level, &ctx.consensus)?;
                 apply_data.closing_amount = ad.closing_amount;
             }
             "acfg" => {
@@ -4976,6 +4976,58 @@ fn apply_fee<L: crate::store_trait::LedgerStore>(
     Ok(())
 }
 
+/// The close-out rules before `CloseRequiresBaseMinBalance` (v43): texts and
+/// check order are go's `legacyCloseChecks` (`ledger/apply/payment.go`).
+fn legacy_close_checks(sender: &algo_types::AccountData) -> Result<(), AlgoError> {
+    if sender.total_assets_opted_in > 0 {
+        return Err(AlgoError::Eval {
+            message: format!(
+                "cannot close: {} outstanding assets",
+                sender.total_assets_opted_in,
+            ),
+        });
+    }
+    if sender.total_created_assets > 0 {
+        return Err(AlgoError::Eval {
+            message: format!(
+                "cannot close: {} outstanding created assets",
+                sender.total_created_assets,
+            ),
+        });
+    }
+    if sender.total_apps_opted_in > 0 {
+        return Err(AlgoError::Eval {
+            message: format!(
+                "cannot close: {} outstanding applications opted in. Please opt out or clear them",
+                sender.total_apps_opted_in,
+            ),
+        });
+    }
+    if sender.total_boxes > 0 {
+        return Err(AlgoError::Eval {
+            message: format!("cannot close: {} outstanding boxes", sender.total_boxes),
+        });
+    }
+    if sender.total_box_bytes > 0 {
+        return Err(AlgoError::Eval {
+            message: format!(
+                "cannot close: {} outstanding box bytes",
+                sender.total_box_bytes,
+            ),
+        });
+    }
+    if sender.total_created_apps > 0 {
+        return Err(AlgoError::Eval {
+            message: format!(
+                "cannot close: {} outstanding created applications",
+                sender.total_created_apps,
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 /// Apply a payment transaction (core state mutation only).
 ///
 /// Debits `amount` from sender, credits `amount` to receiver.
@@ -4999,6 +5051,7 @@ pub fn apply_pay<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     txn: &algo_types::Transaction,
     rewards_level: u64,
+    consensus: &ConsensusParams,
 ) -> Result<InnerApplyData, AlgoError> {
     let mut ad = InnerApplyData::default();
 
@@ -5040,53 +5093,36 @@ pub fn apply_pay<L: crate::store_trait::LedgerStore>(
         let close_amount = sender.micro_algos;
         ad.closing_amount = close_amount;
 
-        // Cannot close an account that still carries asset/app/box state.
-        // Texts and check order are go's `apply.Payment`
-        // (`ledger/apply/payment.go`).
-        if sender.total_assets_opted_in > 0 {
-            return Err(AlgoError::Eval {
-                message: format!(
-                    "cannot close: {} outstanding assets",
-                    sender.total_assets_opted_in,
-                ),
-            });
-        }
-        if sender.total_created_assets > 0 {
-            return Err(AlgoError::Eval {
-                message: format!(
-                    "cannot close: {} outstanding created assets",
-                    sender.total_created_assets,
-                ),
-            });
-        }
-        if sender.total_apps_opted_in > 0 {
-            return Err(AlgoError::Eval {
-                message: format!(
-                    "cannot close: {} outstanding applications opted in. Please opt out or clear them",
-                    sender.total_apps_opted_in,
-                ),
-            });
-        }
-        if sender.total_boxes > 0 {
-            return Err(AlgoError::Eval {
-                message: format!("cannot close: {} outstanding boxes", sender.total_boxes),
-            });
-        }
-        if sender.total_box_bytes > 0 {
-            return Err(AlgoError::Eval {
-                message: format!(
-                    "cannot close: {} outstanding box bytes",
-                    sender.total_box_bytes,
-                ),
-            });
-        }
-        if sender.total_created_apps > 0 {
-            return Err(AlgoError::Eval {
-                message: format!(
-                    "cannot close: {} outstanding created applications",
-                    sender.total_created_apps,
-                ),
-            });
+        // Go `apply.Payment` (`ledger/apply/payment.go`): from
+        // `CloseRequiresBaseMinBalance` (v43) the account may only be closed
+        // when it owes nothing beyond the base MBR -- the per-counter checks
+        // miss MBR an `AppSizeUpdates` size sponsor holds for globals / extra
+        // pages of apps it neither created nor opted into. Older protocols
+        // keep the legacy checks so historical blocks replay unchanged.
+        if consensus.close_requires_base_min_balance {
+            let mbr = crate::params::min_balance(&sender);
+            if mbr != consensus.min_balance {
+                return Err(AlgoError::Eval {
+                    message: format!(
+                        concat!(
+                            "cannot close: min balance {} exceeds base {}: ",
+                            "{} outstanding assets, {} created apps, {} opted-in apps, ",
+                            "{} boxes, {} extra pages, {}/{} globals/locals (uint/bytes)"
+                        ),
+                        mbr,
+                        consensus.min_balance,
+                        sender.total_assets_opted_in,
+                        sender.total_created_apps,
+                        sender.total_apps_opted_in,
+                        sender.total_boxes,
+                        sender.total_extra_app_pages,
+                        sender.total_app_schema.num_uint,
+                        sender.total_app_schema.num_byte_slice,
+                    ),
+                });
+            }
+        } else {
+            legacy_close_checks(&sender)?;
         }
 
         // Go calls CloseAccount() which zeros the entire account record.
