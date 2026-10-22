@@ -7217,7 +7217,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             } else {
                 let stxn = &mut txns[i];
                 let result = match stxn.txn.txn_type.as_str() {
-                    "pay" => apply_pay(self.store, &stxn.txn, self.rewards_level),
+                    "pay" => apply_pay(self.store, &stxn.txn, self.rewards_level, &self.consensus),
                     "axfer" => apply_axfer(self.store, &stxn.txn, &self.consensus),
                     "acfg" => apply_acfg(self.store, &stxn.txn, self.txn_counter, &self.consensus),
                     "afrz" => apply_afrz(self.store, &stxn.txn),

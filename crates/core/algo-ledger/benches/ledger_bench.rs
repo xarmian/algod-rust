@@ -22,6 +22,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;
 
 use algo_ledger::{apply_pay, LedgerStore, SqliteLedger};
+use algo_types::consensus::ConsensusParams;
 use algo_types::{AccountData, Address, SignedTransaction};
 
 // ---------------------------------------------------------------------------
@@ -178,7 +179,13 @@ fn bench_apply_pay(c: &mut Criterion) {
         b.iter(|| {
             // Reset sender balance each iteration to avoid exhaustion.
             ledger.set_account(&sender, make_account(1_000_000_000));
-            let _ = apply_pay(black_box(&mut ledger), black_box(&stx.txn), 0).expect("apply_pay");
+            let _ = apply_pay(
+                black_box(&mut ledger),
+                black_box(&stx.txn),
+                0,
+                &ConsensusParams::default(),
+            )
+            .expect("apply_pay");
         });
     });
 
@@ -194,7 +201,13 @@ fn bench_apply_pay(c: &mut Criterion) {
 
         b.iter(|| {
             state.set_account(&sender, make_account(1_000_000_000));
-            let _ = apply_pay(black_box(&mut state), black_box(&stx.txn), 0).expect("apply_pay");
+            let _ = apply_pay(
+                black_box(&mut state),
+                black_box(&stx.txn),
+                0,
+                &ConsensusParams::default(),
+            )
+            .expect("apply_pay");
         });
     });
 }

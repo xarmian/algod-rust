@@ -878,7 +878,7 @@ pub fn make_next_block_header(
 mod tests {
     use super::*;
     use algo_types::consensus::CONSENSUS_V40;
-    use algo_types::{CONSENSUS_V41, CONSENSUS_V42};
+    use algo_types::{CONSENSUS_V41, CONSENSUS_V42, CONSENSUS_V43};
 
     fn v41_params() -> ConsensusParams {
         consensus_params_for_version(CONSENSUS_V41).expect("v41 params")
@@ -986,11 +986,11 @@ mod tests {
 
     #[test]
     fn no_pending_upgrade_and_no_approved_target_carries_empty_state() {
-        // v42 is the current build's own latest known version (its own
+        // v43 is the current build's own latest known version (its own
         // `approved_upgrade` is None — nothing newer is known yet), so no
         // default proposal is cast.
         let prev = BlockHeader {
-            current_protocol: CONSENSUS_V42.to_string(),
+            current_protocol: CONSENSUS_V43.to_string(),
             ..prev_header()
         };
         let hdr = make_next_block_header(&prev, 1500, rewards(), Default::default()).unwrap();
@@ -1000,6 +1000,19 @@ mod tests {
         assert_eq!(hdr.next_protocol_switch_on, Round(0));
         assert!(hdr.upgrade_propose.is_empty());
         assert!(!hdr.upgrade_approve);
+    }
+
+    #[test]
+    fn v42_proposes_v43_by_default() {
+        // go (v5.0.4-stable): `v42.ApprovedUpgrades[protocol.ConsensusV43] = 208000`.
+        let prev = BlockHeader {
+            current_protocol: CONSENSUS_V42.to_string(),
+            ..prev_header()
+        };
+        let hdr = make_next_block_header(&prev, 1500, rewards(), Default::default()).unwrap();
+        assert_eq!(hdr.upgrade_propose, CONSENSUS_V43);
+        assert_eq!(hdr.next_protocol, CONSENSUS_V43);
+        assert!(hdr.upgrade_approve);
     }
 
     // ── Default upgrade proposal/vote (issue #681) ───────────────

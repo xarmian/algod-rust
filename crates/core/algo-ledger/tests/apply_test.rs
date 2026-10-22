@@ -24,7 +24,10 @@ use algo_ledger::{
     apply_block, apply_transaction, apply_transaction_with_budget, ApplyContext, ApplyMode,
     BoxBudgetState, GroupInfo, LedgerState, LedgerStore,
 };
-use algo_types::{AccountStatus, Address, AssetParams, Block, Round, SignedTransaction, TealValue};
+use algo_types::consensus::{consensus_params_for_version, CONSENSUS_V42, CONSENSUS_V43};
+use algo_types::{
+    AccountStatus, Address, AssetParams, Block, Round, SignedTransaction, StateSchema, TealValue,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -529,7 +532,10 @@ fn test_close_with_opted_in_apps_fails() {
         .get_or_default_account_mut(&sender)
         .total_apps_opted_in = 2;
 
-    let ctx = ApplyContext::new_replay(0, fee_sink, 1);
+    // Pre-v43 protocols keep go's legacy per-counter close checks
+    // (`legacyCloseChecks`) so historical blocks replay unchanged.
+    let mut ctx = ApplyContext::new_replay(0, fee_sink, 1);
+    ctx.consensus = consensus_params_for_version(CONSENSUS_V42).unwrap();
     let mut stx = pay_txn(sender, receiver, 0, 1_000);
     stx.txn.close_remainder_to = close_to;
 
@@ -541,6 +547,99 @@ fn test_close_with_opted_in_apps_fails() {
         "go's apply.Payment text expected, got: {}",
         err_msg,
     );
+}
+
+// ---------------------------------------------------------------------------
+// 8b. v43 `CloseRequiresBaseMinBalance` (go-algorand v5.0.4-stable,
+//     `ledger/apply/payment.go`; parity with `TestSponsorCannotClose`)
+// ---------------------------------------------------------------------------
+
+/// Closes `sender` (seeded by `seed`) under `version`; returns the error text.
+fn close_result(
+    version: &str,
+    seed: impl FnOnce(&mut algo_types::AccountData),
+) -> Result<(), String> {
+    let sender = Address([1u8; 32]);
+    let receiver = Address([2u8; 32]);
+    let close_to = Address([4u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let mut state = make_state(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
+    seed(state.get_or_default_account_mut(&sender));
+
+    let mut ctx = ApplyContext::new_replay(0, fee_sink, 1);
+    ctx.consensus = consensus_params_for_version(version).unwrap();
+    let mut stx = pay_txn(sender, receiver, 0, 1_000);
+    stx.txn.close_remainder_to = close_to;
+    apply_transaction(&mut state, &stx, &ctx, 0)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// An AppSizeUpdates size sponsor: holds MBR for global state without having
+/// created or opted into any app, so none of the legacy counters see it.
+fn make_sponsor(acct: &mut algo_types::AccountData) {
+    acct.total_app_schema = StateSchema {
+        num_uint: 1,
+        num_byte_slice: 2,
+    };
+}
+
+#[test]
+fn test_v43_sponsor_cannot_close() {
+    let err = close_result(CONSENSUS_V43, make_sponsor).unwrap_err();
+    // MBR = 100000 + 25000*3 entries + 3500*1 uint + 25000*2 bytes (go's three-tier schema cost).
+    assert_eq!(
+        err,
+        concat!(
+            "cannot close: min balance 228500 exceeds base 100000: ",
+            "0 outstanding assets, 0 created apps, 0 opted-in apps, ",
+            "0 boxes, 0 extra pages, 1/2 globals/locals (uint/bytes)"
+        )
+    );
+}
+
+#[test]
+fn test_pre_v43_sponsor_close_is_accepted() {
+    // The legacy checks miss the sponsor's MBR; replay of old blocks must
+    // keep accepting it.
+    close_result(CONSENSUS_V42, make_sponsor).expect("legacy rules accept a sponsor close");
+}
+
+#[test]
+fn test_v43_close_reports_every_counter() {
+    let err = close_result(CONSENSUS_V43, |a| {
+        a.total_assets_opted_in = 1;
+        a.total_created_apps = 2;
+        a.total_apps_opted_in = 3;
+        a.total_boxes = 4;
+        a.total_box_bytes = 100;
+        a.total_extra_app_pages = 5;
+    })
+    .unwrap_err();
+    assert!(
+        err.starts_with("cannot close: min balance ") && err.contains(" exceeds base 100000: "),
+        "{err}"
+    );
+    assert!(
+        err.ends_with(concat!(
+            "1 outstanding assets, 2 created apps, 3 opted-in apps, ",
+            "4 boxes, 5 extra pages, 0/0 globals/locals (uint/bytes)"
+        )),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_v43_opted_in_app_and_extra_pages_cannot_close() {
+    let err = close_result(CONSENSUS_V43, |a| a.total_apps_opted_in = 1).unwrap_err();
+    assert!(err.contains("1 opted-in apps"), "{err}");
+    let err = close_result(CONSENSUS_V43, |a| a.total_extra_app_pages = 1).unwrap_err();
+    assert!(err.contains("1 extra pages"), "{err}");
+}
+
+#[test]
+fn test_v43_base_min_balance_account_closes() {
+    close_result(CONSENSUS_V43, |_| {}).expect("an account owing only the base MBR can close");
 }
 
 // ---------------------------------------------------------------------------
