@@ -102,6 +102,11 @@ pub struct ApplyContext {
     /// checks, vote key checks, etc.). When false (replay/catchup), only
     /// the apply-side state transitions run.
     pub validate: bool,
+    /// Mirrors go `roundCowState.generate` (`ledger/eval/cow.go`): true while
+    /// generating a block (pool admission, block assembly, simulation), false
+    /// while validating one. Policies that must never affect validation
+    /// consult it; see [`check_close_min_balance`].
+    pub generate: bool,
     /// Latest confirmed timestamp (for AVM context).
     pub latest_timestamp: u64,
     /// Genesis hash (for AVM context).
@@ -232,6 +237,7 @@ impl ApplyContext {
             round,
             mode: ApplyMode::Replay,
             validate: false,
+            generate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
@@ -1881,6 +1887,12 @@ pub struct ProbeRequest {
     /// payout / fees / proposer header fields are judged against the
     /// pre-block state without turning on every other validate-mode check.
     pub validate_payouts: bool,
+    /// Evaluate as a block *generator* (pool admission, block assembly):
+    /// go `EvaluatorOptions.Generate` / `roundCowState.generate`, carried
+    /// into [`ApplyContext::generate`]. Policies that must never affect
+    /// validation (see [`check_close_min_balance`]) consult it; no
+    /// validation path sets it.
+    pub generate: bool,
     /// Compute go's expired / absent participation lists from the state
     /// the payset leaves behind (go `generateKnockOfflineAccountsList` runs in
     /// `endOfBlock`, after every transaction; issue #1795). The set holds the
@@ -2425,6 +2437,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
     probe: Option<&mut ExecProbe>,
 ) -> Result<(), AlgoError> {
     let skip_epilogue = probe.as_ref().is_some_and(|p| p.request.skip_epilogue);
+    let generate = probe.as_ref().is_some_and(|p| p.request.generate);
     let check_payouts = validate || probe.as_ref().is_some_and(|p| p.request.validate_payouts);
     // Index of the transaction whose apply failed (see `ExecProbe`).
     let mut failed_txn: Option<usize> = None;
@@ -2534,6 +2547,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         round: block.round.0,
         mode,
         validate,
+        generate,
         // `global LatestTimestamp` is the *previous* block's timestamp in go
         // (`roundCowState.PrevTimestamp`, `ledger/eval/cow.go`), never the
         // block being applied. Fall back to the block's own timestamp only
@@ -4653,8 +4667,10 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
         // Dispatch by transaction type and capture InnerApplyData.
         match txn.txn_type.as_str() {
             "pay" => {
+                let closing = closing_record(store, &stx.txn, ctx.generate);
                 apply_fee(store, &txn.sender, txn.fee, ctx)?;
                 let ad = apply_pay(store, &stx.txn, ctx.rewards_level, &ctx.consensus)?;
+                check_close_min_balance(closing.as_ref(), &txn.sender, &ctx.consensus)?;
                 apply_data.closing_amount = ad.closing_amount;
             }
             "acfg" => {
@@ -4972,6 +4988,46 @@ fn apply_fee<L: crate::store_trait::LedgerStore>(
     if sender != fee_sink {
         ctx.fees_collected
             .set(ctx.fees_collected.get().saturating_add(fee));
+    }
+    Ok(())
+}
+
+/// go `roundCowState.closingRecord` (`ledger/eval/eval.go`): the sender's
+/// record before a payment that would close its account, captured only while
+/// generating so [`check_close_min_balance`] can judge it once the payment has
+/// been applied (the apply zeroes the record). `None` when there is nothing
+/// to check. Inner payments use it too.
+pub(crate) fn closing_record<L: crate::store_trait::LedgerStore>(
+    store: &L,
+    txn: &algo_types::Transaction,
+    generate: bool,
+) -> Option<algo_types::AccountData> {
+    if !generate || txn.txn_type != "pay" || txn.close_remainder_to.is_zero() {
+        return None;
+    }
+    Some(store.get_or_default_account(&txn.sender))
+}
+
+/// go `checkCloseMinBalance` (`ledger/eval/eval.go`, v5.0.4-stable): refuse to
+/// *assemble* a close-out of an account that still carried a minimum balance
+/// requirement above the base amount. `apply_pay` checks the individual
+/// counters (or, from v43, the base MBR); this catches anything those checks
+/// do not. It runs only while generating (pool admission, block assembly,
+/// simulation) and never while validating, so it cannot make this node vote
+/// differently from its peers.
+pub(crate) fn check_close_min_balance(
+    closing: Option<&algo_types::AccountData>,
+    sender: &Address,
+    consensus: &ConsensusParams,
+) -> Result<(), AlgoError> {
+    let Some(rec) = closing else {
+        return Ok(());
+    };
+    let mbr = crate::params::min_balance(rec);
+    if mbr > consensus.min_balance {
+        return Err(AlgoError::Eval {
+            message: format!("cannot close: account {sender} requires a minimum balance of {mbr}"),
+        });
     }
     Ok(())
 }
@@ -6267,6 +6323,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                         ctx.consensus.clone(),
                         ctx.rewards_level,
                     );
+                    avm_ctx.generate = ctx.generate;
                     avm_ctx.set_program_version(
                         algo_avm::bytecode::parse(&clear_program)
                             .map(|p| p.version)
@@ -6453,6 +6510,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     ctx.consensus.clone(),
                     ctx.rewards_level,
                 );
+                avm_ctx.generate = ctx.generate;
                 avm_ctx.set_program_version(
                     algo_avm::bytecode::parse(&approval_program)
                         .map(|p| p.version)
@@ -10924,6 +10982,7 @@ mod tests {
             round,
             mode: ApplyMode::Replay,
             validate: false,
+            generate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
@@ -11633,6 +11692,7 @@ mod tests {
             round: 100,
             mode: ApplyMode::Replay,
             validate: false,
+            generate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
@@ -11820,6 +11880,7 @@ mod tests {
             round,
             mode: ApplyMode::Replay,
             validate: false,
+            generate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
@@ -11846,6 +11907,7 @@ mod tests {
             round,
             mode: ApplyMode::Replay,
             validate: false,
+            generate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
@@ -13472,6 +13534,7 @@ return
             round,
             mode: ApplyMode::Replay,
             validate: false,
+            generate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
@@ -15418,6 +15481,7 @@ return
             round: 1,
             mode: ApplyMode::Replay,
             validate: false,
+            generate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),

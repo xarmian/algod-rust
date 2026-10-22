@@ -579,6 +579,8 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             round: sim_round.0,
             mode: ApplyMode::Execute,
             validate: true,
+            // go `simulator.go`: `Generate: true, Validate: true`.
+            generate: true,
             latest_timestamp,
             genesis_hash: *self.store.genesis_hash(),
             txn_counter: Cell::new(self.store.txn_counter()),

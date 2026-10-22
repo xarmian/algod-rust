@@ -1214,6 +1214,10 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     /// Callers constructing a context for real execution must set it from the
     /// block/apply context; it is inherited by nested inner app calls.
     pub rewards_level: u64,
+    /// go `roundCowState.generate`, inherited by nested inner app calls: true
+    /// while generating a block, never while validating one. See
+    /// [`crate::apply::check_close_min_balance`].
+    pub generate: bool,
     /// Opcode budget shared between the AVM machine and inner app call
     /// execution. Updated by `set_opcode_budget` / `get_opcode_budget`
     /// before and after `itxn_submit`.
@@ -2446,6 +2450,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             fees_collected: 0,
             fee_sink: Address::ZERO,
             rewards_level,
+            generate: false,
             opcode_budget: 0,
             inner_txn_ids: Vec::new(),
             txid_cache: GroupTxidCache::default(),
@@ -4476,6 +4481,8 @@ struct InnerCallEnv {
     /// Block rewards level every participant of an inner transaction is
     /// brought up to (go's `roundCowState.rewardsLevel()`).
     rewards_level: u64,
+    /// See [`LedgerAvmContext::generate`].
+    generate: bool,
 }
 
 /// Execute an inner `appl` (application call) transaction by running the
@@ -4550,6 +4557,7 @@ fn execute_inner_appl<L: LedgerStore>(
         txn_counter,
         fee_sink,
         rewards_level,
+        generate,
     } = env;
     let mut ad = crate::apply::InnerApplyData::default();
     let called_app_id = stxn.txn.application_id;
@@ -4677,6 +4685,7 @@ fn execute_inner_appl<L: LedgerStore>(
         consensus.clone(),
         rewards_level,
     );
+    inner_ctx.generate = generate;
     inner_ctx.set_program_version(
         algo_avm::bytecode::parse(&program)
             .map(|p| p.version)
@@ -7108,6 +7117,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                         txn_counter: self.txn_counter,
                         fee_sink: self.fee_sink,
                         rewards_level: self.rewards_level,
+                        generate: self.generate,
                     },
                     &mut self.opcode_budget,
                     appl_inner_id,
@@ -7217,7 +7227,19 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             } else {
                 let stxn = &mut txns[i];
                 let result = match stxn.txn.txn_type.as_str() {
-                    "pay" => apply_pay(self.store, &stxn.txn, self.rewards_level, &self.consensus),
+                    "pay" => {
+                        let closing =
+                            crate::apply::closing_record(&*self.store, &stxn.txn, self.generate);
+                        apply_pay(self.store, &stxn.txn, self.rewards_level, &self.consensus)
+                            .and_then(|ad| {
+                                crate::apply::check_close_min_balance(
+                                    closing.as_ref(),
+                                    &stxn.txn.sender,
+                                    &self.consensus,
+                                )?;
+                                Ok(ad)
+                            })
+                    }
                     "axfer" => apply_axfer(self.store, &stxn.txn, &self.consensus),
                     "acfg" => apply_acfg(self.store, &stxn.txn, self.txn_counter, &self.consensus),
                     "afrz" => apply_afrz(self.store, &stxn.txn),
