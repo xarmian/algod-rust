@@ -113,6 +113,7 @@ fn apply_direct(
     let mut probe = ExecProbe {
         request: ProbeRequest {
             skip_epilogue: true,
+            generate: true,
             ..ProbeRequest::default()
         },
         ..ExecProbe::default()

@@ -95,6 +95,7 @@ pub fn evaluate_group<B: OverlayBase + ?Sized>(
     let mut probe = ExecProbe {
         request: ProbeRequest {
             skip_epilogue: true,
+            generate: true,
             ..ProbeRequest::default()
         },
         ..ExecProbe::default()
@@ -175,6 +176,7 @@ pub fn evaluate_payset<B: OverlayBase + ?Sized>(
     let mut probe = ExecProbe {
         request: ProbeRequest {
             skip_epilogue: true,
+            generate: true,
             want_fee_sink_available: true,
             knock_offline_exclude: lists.as_ref().map(|l| l.own_addresses.clone()),
             ..Default::default()

@@ -896,6 +896,7 @@ pub fn scratch_execute_payset<L: LedgerStore>(
     // needs the post-payset sink balance.
     let mut probe = ExecProbe {
         request: ProbeRequest {
+            generate: true,
             want_fee_sink_available: true,
             knock_offline_exclude: lists.as_ref().map(|l| l.own_addresses.clone()),
             ..Default::default()
