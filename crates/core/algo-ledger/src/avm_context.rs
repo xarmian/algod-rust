@@ -4507,6 +4507,7 @@ fn execute_inner_appl<L: LedgerStore>(
     box_state: crate::apply::BoxBudgetState,
     family_chain: Vec<FamilyFrame>,
     created_apps_snapshot: Vec<u64>,
+    created_assets_snapshot: Vec<u64>,
     group_resources_snapshot: GroupResources,
     consensus: ConsensusParams,
     mut tracer: Option<&mut dyn algo_avm::tracer::EvalTracer>,
@@ -4735,7 +4736,11 @@ fn execute_inner_appl<L: LedgerStore>(
     inner_ctx.unnamed_access = box_state.unnamed_access;
     inner_ctx.pooled_inners = box_state.pooled_inners;
     // Inherit created_apps so newAppAccess fallback works for apps created earlier.
+    // Likewise for assets: go's `createdAsas` is one group-wide set.
+    let inherited_apps = created_apps_snapshot.len();
+    let inherited_assets = created_assets_snapshot.len();
     inner_ctx.created_apps = created_apps_snapshot;
+    inner_ctx.created_assets = created_assets_snapshot;
     // Issue #1322: inherit the TOP-LEVEL group's resource-sharing catalog
     // (accounts/assets/apps named via Accounts/ForeignApps/ForeignAssets/
     // Access on ANY sibling of the outermost atomic group, plus the
@@ -4871,8 +4876,23 @@ fn execute_inner_appl<L: LedgerStore>(
     let child_fees_collected = inner_ctx.fees_collected;
     // P1-3: Capture all asset/app IDs created by nested inner txns so the
     // parent can track them for snapshot rollback.
-    let child_created_assets = inner_ctx.created_assets.clone();
-    let child_created_apps = inner_ctx.created_apps.clone();
+    // Only the ids the child (or its descendants) newly created: the
+    // inherited prefix is the caller's own and is not rollback-relevant.
+    debug_assert!(
+        inner_ctx.created_assets.len() >= inherited_assets
+            && inner_ctx.created_apps.len() >= inherited_apps,
+        "created_* must only grow inside a child call"
+    );
+    let child_created_assets = inner_ctx
+        .created_assets
+        .get(inherited_assets..)
+        .unwrap_or_default()
+        .to_vec();
+    let child_created_apps = inner_ctx
+        .created_apps
+        .get(inherited_apps..)
+        .unwrap_or_default()
+        .to_vec();
 
     // H1: Capture box budget state to propagate back to the parent.
     //
@@ -7135,6 +7155,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     caller_box_state,
                     child_family_chain,
                     self.created_apps.clone(),
+                    self.created_assets.clone(),
                     self.group_resources.clone(),
                     self.consensus.clone(),
                     tracer_ref,
@@ -7182,6 +7203,21 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                         for &nested_id in &ad.nested_created_apps {
                             if !snapshotted_app_ids.contains(&nested_id) {
                                 extra_created_app_ids.push(nested_id);
+                            }
+                        }
+                        // go-algorand shares a single `available` set across
+                        // the whole group, so resources created deep in a
+                        // nested call stay available to every ancestor after
+                        // it returns (#2036). The child started from a
+                        // snapshot of ours, so only add the new ones.
+                        for &nested_id in &ad.nested_created_assets {
+                            if !self.created_assets.contains(&nested_id) {
+                                self.created_assets.push(nested_id);
+                            }
+                        }
+                        for &nested_id in &ad.nested_created_apps {
+                            if !self.created_apps.contains(&nested_id) {
+                                self.created_apps.push(nested_id);
                             }
                         }
                         // Propagate fee_credit, fee_residue, and txn_counter back from child (H5/H6).
@@ -20537,6 +20573,99 @@ mod inner_group_id_tests {
                 }
             }
         }
+    }
+
+    /// go-algorand shares one `available` resource set (incl. `createdApps`)
+    /// across the whole group, so an app created by a *nested* inner call
+    /// stays available to its ancestors after the nested call returns
+    /// (mainnet round 66241043 halt, #2036).
+    #[test]
+    fn nested_inner_created_app_is_available_to_ancestor() {
+        let mut store = fresh_store();
+        // B creates a new app via an inner appl create.
+        let mut create = pushint(6);
+        create.extend(field(16));
+        create.extend(pushbytes(&prog(vec![0x81, 1])));
+        create.extend(field(30));
+        create.extend(pushbytes(&prog(vec![0x81, 1])));
+        create.extend(field(31));
+        let b = submit_groups(&[vec![create]]);
+        seed(&mut store, B, prog(b));
+
+        let outer = outer_txn();
+        let mut ctx = LedgerAvmContext::new(
+            &mut store,
+            vec![outer],
+            0,
+            100,
+            50000,
+            A,
+            [1u8; 32],
+            true,
+            [0u8; 32],
+            [0u8; 32],
+            ConsensusParams::default(),
+            0,
+        );
+        ctx.set_program_version(6);
+        ctx.fee_sink = Address([0xFE; 32]);
+        ctx.store.get_or_default_account_mut(&Address([0xFE; 32]));
+        ctx.fee_credit = 1_000_000;
+        ctx.txn_counter = 300;
+        let program = parse(&prog(submit_groups(&[vec![appl_fields(B)]]))).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20_000);
+        assert!(m.run(&mut ctx).unwrap(), "app A must approve");
+
+        // B's inner create allocates the first id after the txn counter.
+        let created = (300..320)
+            .find(|id| ctx.store.has_app_params(*id))
+            .expect("B's inner create must have run");
+        assert!(
+            ctx.created_apps.contains(&created),
+            "nested-created app {created} must be recorded on the ancestor"
+        );
+        assert!(ctx.is_app_available(created));
+    }
+
+    /// Same as above for assets (`createdAsas`), at depth three: A -> B -> C,
+    /// C inner-creates an asset; the id must propagate through B to the root.
+    #[test]
+    fn nested_inner_created_asset_is_available_to_all_ancestors() {
+        const C: u64 = 300;
+        let mut store = fresh_store();
+        let mut create = pushint(3);
+        create.extend(field(16));
+        create.extend(pushint(100));
+        create.extend(field(34)); // ConfigAssetTotal
+        seed(&mut store, C, prog(submit_groups(&[vec![create]])));
+        seed(&mut store, B, prog(submit_groups(&[vec![appl_fields(C)]])));
+
+        let mut ctx = LedgerAvmContext::new(
+            &mut store,
+            vec![outer_txn()],
+            0,
+            100,
+            50000,
+            A,
+            [1u8; 32],
+            true,
+            [0u8; 32],
+            [0u8; 32],
+            ConsensusParams::default(),
+            0,
+        );
+        ctx.set_program_version(6);
+        ctx.fee_sink = Address([0xFE; 32]);
+        ctx.store.get_or_default_account_mut(&Address([0xFE; 32]));
+        ctx.fee_credit = 1_000_000;
+        ctx.txn_counter = 400;
+        let program = parse(&prog(submit_groups(&[vec![appl_fields(B)]]))).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20_000);
+        assert!(m.run(&mut ctx).unwrap(), "app A must approve");
+
+        assert_eq!(ctx.created_assets.len(), 1, "{:?}", ctx.created_assets);
+        let created = ctx.created_assets[0];
+        assert!(ctx.is_asset_available(created));
     }
 
     #[test]
