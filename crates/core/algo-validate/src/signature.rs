@@ -1283,16 +1283,8 @@ pub fn logic_sig_group_size_check(
     for stx in group {
         let lsig = stx.lsig.as_ref();
         let has_program = lsig.is_some_and(|l| !l.logic.is_empty());
-        let is_blank = match lsig {
-            None => true,
-            Some(l) => {
-                l.logic.is_empty()
-                    && l.sig == [0u8; 64]
-                    && l.msig.is_none()
-                    && l.args.is_none()
-                    && l.lmsig.is_none()
-            }
-        };
+        // Go: `lsig.Blank()` (includes `PQsig.Blank()` and `len(Args) == 0`).
+        let is_blank = lsig.is_none_or(|l| l.is_blank());
 
         if !has_program {
             if !is_blank && reject_orphan_lsig_content {

@@ -1052,13 +1052,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             // is reserved for real block validation (`block.rs`).
             if consensus.per_byte_txn_surcharge != 0 {
                 if let Some(lsig) = &stx.lsig {
-                    let has_program = !lsig.logic.is_empty();
-                    let is_blank = lsig.logic.is_empty()
-                        && lsig.sig == [0u8; 64]
-                        && lsig.msig.is_none()
-                        && lsig.args.is_none()
-                        && lsig.lmsig.is_none();
-                    if !has_program && !is_blank {
+                    if !lsig.has_program() && !lsig.is_blank() {
                         return Ok(CheckOutcome::RecoverableFailure {
                             index: i,
                             message: "LogicSig fields without LogicSig program".to_string(),
