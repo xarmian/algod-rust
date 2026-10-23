@@ -4507,6 +4507,7 @@ fn execute_inner_appl<L: LedgerStore>(
     box_state: crate::apply::BoxBudgetState,
     family_chain: Vec<FamilyFrame>,
     created_apps_snapshot: Vec<u64>,
+    created_assets_snapshot: Vec<u64>,
     group_resources_snapshot: GroupResources,
     consensus: ConsensusParams,
     mut tracer: Option<&mut dyn algo_avm::tracer::EvalTracer>,
@@ -4735,7 +4736,11 @@ fn execute_inner_appl<L: LedgerStore>(
     inner_ctx.unnamed_access = box_state.unnamed_access;
     inner_ctx.pooled_inners = box_state.pooled_inners;
     // Inherit created_apps so newAppAccess fallback works for apps created earlier.
+    // Likewise for assets: go's `createdAsas` is one group-wide set.
+    let inherited_apps = created_apps_snapshot.len();
+    let inherited_assets = created_assets_snapshot.len();
     inner_ctx.created_apps = created_apps_snapshot;
+    inner_ctx.created_assets = created_assets_snapshot;
     // Issue #1322: inherit the TOP-LEVEL group's resource-sharing catalog
     // (accounts/assets/apps named via Accounts/ForeignApps/ForeignAssets/
     // Access on ANY sibling of the outermost atomic group, plus the
@@ -4871,8 +4876,10 @@ fn execute_inner_appl<L: LedgerStore>(
     let child_fees_collected = inner_ctx.fees_collected;
     // P1-3: Capture all asset/app IDs created by nested inner txns so the
     // parent can track them for snapshot rollback.
-    let child_created_assets = inner_ctx.created_assets.clone();
-    let child_created_apps = inner_ctx.created_apps.clone();
+    // Only the ids the child (or its descendants) newly created: the
+    // inherited prefix is the caller's own and is not rollback-relevant.
+    let child_created_assets = inner_ctx.created_assets[inherited_assets..].to_vec();
+    let child_created_apps = inner_ctx.created_apps[inherited_apps..].to_vec();
 
     // H1: Capture box budget state to propagate back to the parent.
     //
@@ -7135,6 +7142,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     caller_box_state,
                     child_family_chain,
                     self.created_apps.clone(),
+                    self.created_assets.clone(),
                     self.group_resources.clone(),
                     self.consensus.clone(),
                     tracer_ref,
@@ -9604,10 +9612,7 @@ mod tests {
         ctx.app_id = 3471862384;
         // The availability-checked path rejects the unreferenced asset...
         let err = ctx.resolve_asset(626283733).unwrap_err();
-        assert!(
-            err.to_string().contains("unavailable Asset 626283733"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("unavailable Asset 626283733"), "{err}");
         // ...the pre-v4 direct path does not.
         assert_eq!(ctx.direct_asset_ref(626283733).unwrap(), 626283733);
         assert_eq!(ctx.direct_app_ref(0).unwrap(), 3471862384);
@@ -20607,6 +20612,47 @@ mod inner_group_id_tests {
             "nested-created app {created} must be recorded on the ancestor"
         );
         assert!(ctx.is_app_available(created));
+    }
+
+    /// Same as above for assets (`createdAsas`), at depth three: A -> B -> C,
+    /// C inner-creates an asset.
+    #[test]
+    fn nested_inner_created_asset_is_available_to_all_ancestors() {
+        const C: u64 = 300;
+        let mut store = fresh_store();
+        let mut create = pushint(3);
+        create.extend(field(16));
+        create.extend(pushint(100));
+        create.extend(field(34)); // ConfigAssetTotal
+        seed(&mut store, C, prog(submit_groups(&[vec![create]])));
+        seed(&mut store, B, prog(submit_groups(&[vec![appl_fields(C)]])));
+
+        let mut ctx = LedgerAvmContext::new(
+            &mut store,
+            vec![outer_txn()],
+            0,
+            100,
+            50000,
+            A,
+            [1u8; 32],
+            true,
+            [0u8; 32],
+            [0u8; 32],
+            ConsensusParams::default(),
+            0,
+        );
+        ctx.set_program_version(6);
+        ctx.fee_sink = Address([0xFE; 32]);
+        ctx.store.get_or_default_account_mut(&Address([0xFE; 32]));
+        ctx.fee_credit = 1_000_000;
+        ctx.txn_counter = 400;
+        let program = parse(&prog(submit_groups(&[vec![appl_fields(B)]]))).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20_000);
+        assert!(m.run(&mut ctx).unwrap(), "app A must approve");
+
+        assert_eq!(ctx.created_assets.len(), 1, "{:?}", ctx.created_assets);
+        let created = ctx.created_assets[0];
+        assert!(ctx.is_asset_available(created));
     }
 
     #[test]
