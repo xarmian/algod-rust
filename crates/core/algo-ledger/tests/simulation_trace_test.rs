@@ -668,6 +668,60 @@ fn simulation_rejects_underpaid_group() {
     assert_eq!(group.failed_at, Some(vec![0]));
 }
 
+/// On a fee failure go returns the full tracer-populated result: after
+/// `Simulate` maps the `EvalFailureError` to `FailureMessage`/`FailedAt` it
+/// still runs `populateFeeUsage`, finalises `UnnamedResourcesAccessed` and
+/// returns the tracer's state, with nothing cleared (`simulator.go:394-460`;
+/// only `Block` stays nil). The transactions did run, so their initial states
+/// are reported -- and nothing is fabricated for features not requested.
+#[test]
+fn simulation_fee_failure_keeps_tracer_state_and_reports_no_unrequested_data() {
+    let sender = Address([0xAA; 32]);
+    let app_id = 100;
+    let mut state = setup_state_with_global(sender, app_id, global_read_program());
+    let mut txn = make_appl_txn(sender, app_id);
+    txn.txn.fee = 0;
+
+    let request = SimulationRequest {
+        txn_groups: vec![vec![txn]],
+        allow_empty_signatures: true,
+        trace_config: ExecTraceConfig {
+            enable: true,
+            stack: false,
+            scratch: false,
+            state: true,
+        },
+        ..Default::default()
+    };
+    let mut simulator = Simulator::new_with_developer_api(&mut state);
+    let result = simulator
+        .simulate(request)
+        .expect("an underpaid group is an evaluation failure, not an invalid request");
+    let group = &result.txn_groups[0];
+    assert_eq!(
+        group.failure_message.as_deref(),
+        Some("txgroup with 0.0A fees is less than 1mA (usage=1.000000 * base=1mA)")
+    );
+    // The program ran before the fee check: its state read is reported.
+    let initial = result
+        .initial_states
+        .as_ref()
+        .expect("state tracing was requested");
+    let app_entry = initial
+        .app_initial_states
+        .iter()
+        .find(|(id, _)| *id == app_id)
+        .expect("the app that ran appears in initial states");
+    assert_eq!(app_entry.1.global_state.len(), 1);
+    // Not requested, so absent (go only sets it under AllowUnnamedResources).
+    assert!(group.unnamed_resources_accessed.is_none());
+    // Fee usage is still populated from the evaluated group (go's
+    // `populateFeeUsage` runs on the failure path too).
+    assert_eq!(group.txn_results[0].fees_paid, 0);
+    assert!(group.group_usage > 0);
+    assert_eq!(group.group_fees_paid, 0);
+}
+
 /// Two-transaction group where the pooled total meets `MinTxnFee * count`
 /// even though one transaction pays zero: `check()` must accept it (matching
 /// go-algorand's `verify.TxnGroup`, `txn.go:253-270`, which sums fees across
@@ -934,42 +988,13 @@ fn simulation_evaluation_failure_takes_precedence_over_underpaid_group_fee() {
 }
 
 // ---------------------------------------------------------------------------
-// Free transactions still pass the group fee check (issue #2040)
+// Free transactions and the group fee check (issue #2040)
 //
-// The removed `is_free_heartbeat`/`stpf` exemption loop is subsumed by
-// `txn_fee_factor` (stpf -> 0; singleton heartbeat -> 0 pre-v42; explicit
-// `HbChallengeDiscount` -> 0 post-v42), which is also go's `FeeFactor`.
+// Heartbeat / mixed-group fee behaviour is unit-tested against
+// `group_fee_failure` in `simulation/mod.rs`: a bare ledger cannot evaluate a
+// heartbeat to success (no live challenge), so an end-to-end test would stop
+// at the evaluation failure before the fee check ever ran.
 // ---------------------------------------------------------------------------
-
-/// A minimal heartbeat transaction (fee 0) in an otherwise empty ledger.
-fn heartbeat_txn(sender: Address, discount: bool) -> SignedTransaction {
-    use algo_types::{HeartbeatProof, HeartbeatTxnFields};
-    SignedTransaction {
-        txn: Transaction {
-            txn_type: "hb".into(),
-            sender,
-            fee: 0,
-            first_valid: 0.into(),
-            last_valid: 1000.into(),
-            heartbeat: Some(HeartbeatTxnFields {
-                address: Address([2u8; 32]),
-                proof: Some(HeartbeatProof {
-                    sig: [0xAA; 64],
-                    pk: [0xBB; 32],
-                    pk2: [0xCC; 32],
-                    pk1_sig: [0xDD; 64],
-                    pk2_sig: [0xEE; 64],
-                }),
-                seed: [0x11; 32],
-                vote_id: [0x22; 32],
-                key_dilution: 10000,
-                hb_challenge_discount: discount,
-            }),
-            ..Default::default()
-        },
-        ..Default::default()
-    }
-}
 
 fn state_for(protocol: &str, funded: &[Address]) -> LedgerState {
     let mut state = LedgerState::new();
@@ -985,82 +1010,6 @@ fn state_for(protocol: &str, funded: &[Address]) -> LedgerState {
         );
     }
     state
-}
-
-/// Simulate `group`, asserting it is accepted by `check()` (an `Ok` result)
-/// and that the outcome is not the group-fee error. The heartbeat itself may
-/// still fail later (it answers no real challenge); only the fee check is
-/// under test.
-fn assert_passes_fee_check(state: &mut LedgerState, group: Vec<SignedTransaction>) {
-    let request = SimulationRequest {
-        txn_groups: vec![group],
-        allow_empty_signatures: true,
-        ..Default::default()
-    };
-    let mut simulator = Simulator::new(state);
-    let result = simulator
-        .simulate(request)
-        .expect("a free transaction must pass check()");
-    if let Some(msg) = &result.txn_groups[0].failure_message {
-        assert!(
-            !msg.contains("fees is less than"),
-            "unexpected fee error: {msg}"
-        );
-    }
-}
-
-#[test]
-fn simulation_fee_check_accepts_ungrouped_free_heartbeat_pre_v42() {
-    let sender = Address([0xAA; 32]);
-    let mut state = state_for(algo_types::consensus::CONSENSUS_V41, &[sender]);
-    // Pre-v42 any ungrouped heartbeat is discounted to zero, flag unset.
-    assert_passes_fee_check(&mut state, vec![heartbeat_txn(sender, false)]);
-}
-
-#[test]
-fn simulation_fee_check_accepts_discounted_free_heartbeat_v42() {
-    let sender = Address([0xAA; 32]);
-    let mut state = state_for(algo_types::consensus::CONSENSUS_V42, &[sender]);
-    // Post-v42 the discount is claimed explicitly via HbChallengeDiscount.
-    assert_passes_fee_check(&mut state, vec![heartbeat_txn(sender, true)]);
-}
-
-#[test]
-fn simulation_fee_check_rejects_undiscounted_zero_fee_heartbeat_v42() {
-    let sender = Address([0xAA; 32]);
-    let mut state = state_for(algo_types::consensus::CONSENSUS_V42, &[sender]);
-    let request = SimulationRequest {
-        txn_groups: vec![vec![heartbeat_txn(sender, false)]],
-        allow_empty_signatures: true,
-        ..Default::default()
-    };
-    let mut simulator = Simulator::new(&mut state);
-    // Without the explicit flag a heartbeat owes the normal fee -- either the
-    // fee check or an earlier well-formedness rule rejects it, never accepts.
-    if let Ok(result) = simulator.simulate(request) {
-        assert!(
-            result.txn_groups[0].failure_message.is_some(),
-            "an undiscounted zero-fee heartbeat must not be accepted"
-        );
-    }
-}
-
-/// A mixed group: a discounted free heartbeat pooled with a normally priced
-/// payment. The payment's 1000 covers its own requirement; the heartbeat
-/// contributes zero usage.
-#[test]
-fn simulation_fee_check_accepts_mixed_group_with_free_heartbeat_v42() {
-    let sender = Address([0xAA; 32]);
-    let other = Address([0xBB; 32]);
-    let receiver = Address([0x20; 32]);
-    let mut state = state_for(algo_types::consensus::CONSENSUS_V42, &[sender, other]);
-
-    let mut hb = heartbeat_txn(sender, true);
-    let mut pay = pay_txn(other, receiver);
-    let gid = algo_codec::compute_group_id(&[hb.txn.clone(), pay.txn.clone()]);
-    hb.txn.group = gid.0;
-    pay.txn.group = gid.0;
-    assert_passes_fee_check(&mut state, vec![hb, pay]);
 }
 
 /// go's `Simulator.check()` refuses StateProof transactions outright
