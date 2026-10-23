@@ -4878,8 +4878,16 @@ fn execute_inner_appl<L: LedgerStore>(
     // parent can track them for snapshot rollback.
     // Only the ids the child (or its descendants) newly created: the
     // inherited prefix is the caller's own and is not rollback-relevant.
-    let child_created_assets = inner_ctx.created_assets[inherited_assets..].to_vec();
-    let child_created_apps = inner_ctx.created_apps[inherited_apps..].to_vec();
+    let child_created_assets = inner_ctx
+        .created_assets
+        .get(inherited_assets..)
+        .unwrap_or_default()
+        .to_vec();
+    let child_created_apps = inner_ctx
+        .created_apps
+        .get(inherited_apps..)
+        .unwrap_or_default()
+        .to_vec();
 
     // H1: Capture box budget state to propagate back to the parent.
     //
@@ -20615,7 +20623,7 @@ mod inner_group_id_tests {
     }
 
     /// Same as above for assets (`createdAsas`), at depth three: A -> B -> C,
-    /// C inner-creates an asset.
+    /// C inner-creates an asset; the id must propagate through B to the root.
     #[test]
     fn nested_inner_created_asset_is_available_to_all_ancestors() {
         const C: u64 = 300;
