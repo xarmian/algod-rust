@@ -4878,6 +4878,11 @@ fn execute_inner_appl<L: LedgerStore>(
     // parent can track them for snapshot rollback.
     // Only the ids the child (or its descendants) newly created: the
     // inherited prefix is the caller's own and is not rollback-relevant.
+    debug_assert!(
+        inner_ctx.created_assets.len() >= inherited_assets
+            && inner_ctx.created_apps.len() >= inherited_apps,
+        "created_* must only grow inside a child call"
+    );
     let child_created_assets = inner_ctx
         .created_assets
         .get(inherited_assets..)
