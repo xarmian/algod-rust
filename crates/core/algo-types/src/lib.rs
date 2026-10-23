@@ -18,6 +18,9 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+// Issue #2042: no `unsafe` anywhere in this crate (serde_raw_str was the last).
+#![forbid(unsafe_code)]
+
 mod account;
 mod address;
 mod block;

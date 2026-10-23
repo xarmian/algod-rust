@@ -272,14 +272,12 @@ pub mod serde_bytes_64_opt {
 ///
 /// **Encode** (`serialize`): for a non-human-readable format (msgpack, the
 /// only wire format this module's callers use for real protocol bytes) this
-/// reproduces go's exact output by writing the msgpack "str" format for the
-/// raw bytes, using the same technique and safety argument as
-/// `algo_ledger::state_delta::serialize_kv_mods`:
-/// `serde::Serializer::serialize_str` only accepts `&str`, so the raw bytes
-/// are tunnelled through a `&str` built via `from_utf8_unchecked`. This is
-/// sound because `rmp_serde`'s `serialize_str` never inspects the string's
-/// characters -- it only copies `data.len()` and `data.as_bytes()` onto the
-/// wire, so no code ever observes the (possibly invalid) `&str` as text. For
+/// writes the msgpack "str" format for valid UTF-8 (byte-identical to go).
+/// `serde::Serializer::serialize_str` only accepts `&str`, and a `&str` over
+/// invalid UTF-8 is undefined behaviour (issue #2042), so bytes that are not
+/// valid UTF-8 are written as msgpack `bin` instead (lossless; `deserialize`
+/// accepts it). That path is not consensus wire output: the canonical
+/// encoders in `algo-codec` write the real `str` for block / txn bytes. For
 /// a human-readable format (JSON, used by the REST API surface) this emits a
 /// lossy UTF-8 string instead; REST callers that need the exact bytes should
 /// use a `_b64`-suffixed sibling field, matching go's own
@@ -309,15 +307,18 @@ pub mod serde_raw_str {
 
     pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
         if s.is_human_readable() {
-            s.serialize_str(&String::from_utf8_lossy(v))
-        } else {
-            // SAFETY: see module doc comment -- `rmp_serde`'s msgpack
-            // `serialize_str` only copies `str::len()`/`str::as_bytes()`
-            // onto the wire; it never inspects the string's characters, so
-            // constructing a `&str` from bytes that may not be valid UTF-8
-            // is sound here (the invariant is never relied upon).
-            let raw = unsafe { std::str::from_utf8_unchecked(v) };
-            s.serialize_str(raw)
+            return s.serialize_str(&String::from_utf8_lossy(v));
+        }
+        match std::str::from_utf8(v) {
+            // Valid UTF-8 (every real-world value): msgpack `str`,
+            // byte-identical to go.
+            Ok(text) => s.serialize_str(text),
+            // Not representable as a Rust `&str`; constructing one would be
+            // UB (issue #2042), so fall back to msgpack `bin` with the raw
+            // bytes. The consensus wire bytes are produced by the canonical
+            // encoders (`algo-codec`), not this serde path, and `deserialize`
+            // below accepts `bin`, so this round-trips losslessly.
+            Err(_) => s.serialize_bytes(v),
         }
     }
 
@@ -355,5 +356,52 @@ pub mod serde_raw_str {
     /// zero-length string/byte field.
     pub fn is_empty(v: &[u8]) -> bool {
         v.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod serde_raw_str_tests {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct W {
+        #[serde(with = "super::serde_raw_str")]
+        un: Vec<u8>,
+    }
+
+    fn rmp(v: &[u8]) -> Vec<u8> {
+        rmp_serde::to_vec_named(&W { un: v.to_vec() }).unwrap()
+    }
+
+    // Issue #2042: no `&str` over invalid UTF-8 may ever be built.
+    #[test]
+    fn valid_utf8_msgpack_is_str_byte_identical() {
+        #[derive(Serialize)]
+        struct S {
+            un: String,
+        }
+        let expected = rmp_serde::to_vec_named(&S { un: "USDC".into() }).unwrap();
+        assert_eq!(rmp(b"USDC"), expected);
+    }
+
+    #[test]
+    fn non_utf8_msgpack_roundtrips_without_ub() {
+        let bytes = rmp(&[0xff, 0xfe]);
+        let back: W = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(back.un, vec![0xff, 0xfe]);
+    }
+
+    #[test]
+    fn json_is_defined_for_valid_and_invalid_utf8() {
+        let j = serde_json::to_string(&W {
+            un: b"abc".to_vec(),
+        })
+        .unwrap();
+        assert_eq!(j, r#"{"un":"abc"}"#);
+        let j = serde_json::to_string(&W {
+            un: vec![0xff, 0xfe],
+        })
+        .unwrap();
+        assert_eq!(j, "{\"un\":\"\u{fffd}\u{fffd}\"}");
     }
 }
