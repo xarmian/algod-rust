@@ -1,0 +1,3 @@
+# Proof-of-concept artefacts (tests, vectors, scripts, TEAL) for audit reports.
+# One subdirectory per report: <report-id> = report filename without .md
+# Nothing here is compiled into the workspace. See ../instructions.md section 7.1.

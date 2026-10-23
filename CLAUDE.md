@@ -368,9 +368,9 @@ Workspace crates:
 
 ## Security Audits (`do new audit`)
 
-- When the user says **"do new audit"** (or asks to run/perform a new security audit), invoke the `algod-security-audit` skill and follow `audits/instructions.md` end-to-end:
-  1. Read `audits/instructions.md`, `audits/risks.md`, and existing reports in `audits/reports/` to select the next priority audit scope (or the user-specified scope).
-  2. Perform a multi-methodology security and `go-algorand` parity audit (`M1`–`M6` in `audits/instructions.md`).
-  3. Create a new chronologically named report in `audits/reports/YYYY-MM-DD_HHMMSS_<auditor-tag>_<git-short-hash>.md` (containing UTC timestamp, auditor tag, and current `git rev-parse --short HEAD`).
-  4. Update `audits/risks.md` with any newly identified or updated risks (under controllable `RISK-INT-NNN` or uncontrollable `RISK-EXT-NNN`) and append the run to the **Audit History & Synchronization Log** table.
-
+- When the user says **"do new audit"** (or asks to run/perform a new security audit, optionally naming a scope), invoke the `algod-security-audit` skill and follow `audits/instructions.md` (v2.0) §10 end-to-end:
+  1. Read `audits/instructions.md`, `audits/risks.md`, `audits/coverage.md` and the two most recent reports in `audits/reports/`; pick 2–4 audit areas (`A-NN`) by the §5 rule (never-audited → changed since last audit → oldest; Tier 1 first), always plus `A-00 Delta`.
+  2. Apply at least four of methodologies `M1`–`M8` (M1 differential Go↔Rust and M2 panic/`unsafe`/soundness are mandatory for Tier 1); walk the §3.2 smart-contract rule catalogue for any AVM/ledger area; every finding and verified invariant cites `path:Lx-Ly` re-read in this run plus the go-algorand oracle. Critical needs a Confirmed PoC (in `audits/poc/<report-id>/`, never in `crates/`).
+  3. Write `audits/reports/YYYY-MM-DD_HHMMSS_<auditor-tag>_<git-short-hash>.md` (UTC; the tag identifies the model/person, e.g. `claude-fable-5-1`) with all nine sections of §7.2.
+  4. Update `audits/risks.md` (`RISK-INT-NNN`/`RISK-EXT-NNN` rows, `Linked Audit Findings`, Audit History row) and the rows you covered in `audits/coverage.md`.
+  5. **Embargo:** the repo is public. A Critical/High finding with Confirmed confidence is written but **not committed, pushed or filed as an issue**; tell the user which ids are embargoed so the report can be delivered privately (§8). Everything else: one `security`-labelled issue per Medium+ finding via `algod-issue-create`.
