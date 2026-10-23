@@ -1094,7 +1094,8 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             // Handle empty signatures when allowed.
             let has_sig = stx.sig != [0u8; 64];
             let has_msig = stx.msig.is_some();
-            let has_lsig = stx.lsig.is_some();
+            // Go: `SignedTxn.HasSignature()` uses `!Lsig.Blank()`.
+            let has_lsig = stx.lsig.as_ref().is_some_and(|l| !l.is_blank());
             let has_pqsig = stx.pqsig.as_ref().is_some_and(|p| !p.blank());
             if allow_empty_signatures && !has_sig && !has_msig && !has_lsig && !has_pqsig {
                 // Proxy-sign: create a valid ed25519 signature so verification
@@ -1339,7 +1340,7 @@ fn txn_has_no_signature(stx: &SignedTransaction) -> bool {
 fn is_placeholder_pqsig(stx: &SignedTransaction) -> bool {
     let has_sig = stx.sig != [0u8; 64];
     let has_msig = stx.msig.is_some();
-    let has_lsig = stx.lsig.is_some();
+    let has_lsig = stx.lsig.as_ref().is_some_and(|l| !l.is_blank());
     match &stx.pqsig {
         Some(pq) if !pq.blank() && pq.signature.is_empty() => !has_sig && !has_msig && !has_lsig,
         _ => false,
@@ -1652,7 +1653,7 @@ mod tests {
     // go's three assertions on a default (fully blank) `SignedTxn`, a
     // `LogicSig` carrying only `Args`, and a `LogicSig` carrying only a
     // (non-blank) delegated `Sig` -- in both LogicSig cases go's
-    // `LogicSig.Blank()` (and this crate's analogous `lsig.is_some()` gate)
+    // `LogicSig.Blank()` (and this crate's analogous `!lsig.is_blank()` gate)
     // treats the LogicSig as a present signature category, independent of
     // which specific field is set.
 

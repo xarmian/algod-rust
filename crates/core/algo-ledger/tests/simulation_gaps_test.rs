@@ -2209,14 +2209,13 @@ fn programless_logicsig_pqsig_is_orphan_and_empty_args_is_blank() {
             ..Default::default()
         },
     );
-    if let Ok(r) = result {
-        if let Some(msg) = r.txn_groups[0].failure_message.as_ref() {
-            assert!(
-                !msg.contains("LogicSig fields without LogicSig program"),
-                "blank LogicSig must not be orphan content: {msg}"
-            );
-        }
-    }
+    // go's HasSignature() uses !Lsig.Blank(), so a blank LogicSig is
+    // proxy-signed under allow_empty_signatures and the group succeeds.
+    let r = result.expect("a blank LogicSig must simulate cleanly");
+    assert_eq!(
+        r.txn_groups[0].failure_message, None,
+        "blank LogicSig must not be orphan content"
+    );
 }
 
 /// Port of `TestPartialMissingSignatures`: a group where only *some*

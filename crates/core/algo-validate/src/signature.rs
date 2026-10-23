@@ -1194,7 +1194,7 @@ pub fn verify_transaction_signature_with_tracer(
         return verify_multisig(stx, msig);
     }
 
-    if let Some(lsig) = stx.lsig.as_ref().filter(|_| has_lsig) {
+    if let Some(lsig) = stx.lsig.as_ref().filter(|l| l.has_program()) {
         return verify_logicsig_with_tracer(
             stx,
             lsig,
