@@ -365,3 +365,12 @@ Workspace crates:
 
 ### Binary
 - `bin/algod-rust` — CLI binary (sync, serve, etc.)
+
+## Security Audits (`do new audit`)
+
+- When the user says **"do new audit"** (or asks to run/perform a new security audit), invoke the `algod-security-audit` skill and follow `audits/instructions.md` end-to-end:
+  1. Read `audits/instructions.md`, `audits/risks.md`, and existing reports in `audits/reports/` to select the next priority audit scope (or the user-specified scope).
+  2. Perform a multi-methodology security and `go-algorand` parity audit (`M1`–`M6` in `audits/instructions.md`).
+  3. Create a new chronologically named report in `audits/reports/YYYY-MM-DD_HHMMSS_<auditor-tag>_<git-short-hash>.md` (containing UTC timestamp, auditor tag, and current `git rev-parse --short HEAD`).
+  4. Update `audits/risks.md` with any newly identified or updated risks (under controllable `RISK-INT-NNN` or uncontrollable `RISK-EXT-NNN`) and append the run to the **Audit History & Synchronization Log** table.
+
