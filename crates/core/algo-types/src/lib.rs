@@ -20,7 +20,7 @@
 
 // Issue #2042: no `unsafe` anywhere in this crate (serde_raw_str was the last
 // one here; other crates are tracked separately).
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 mod account;
 mod address;

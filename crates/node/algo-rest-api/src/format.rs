@@ -100,7 +100,7 @@ pub fn encode_response<T: Serialize>(value: &T, format: ResponseFormat) -> Respo
                 error::internal_error("failed to encode response")
             }
         },
-        ResponseFormat::Msgpack => match rmp_serde::to_vec_named(value) {
+        ResponseFormat::Msgpack => match algo_codec::to_vec_named_str_preserving(value) {
             Ok(bytes) => (
                 StatusCode::OK,
                 [("content-type", ResponseFormat::Msgpack.content_type())],

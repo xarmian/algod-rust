@@ -275,9 +275,12 @@ pub mod serde_bytes_64_opt {
 /// writes the msgpack "str" format for valid UTF-8 (byte-identical to go).
 /// `serde::Serializer::serialize_str` only accepts `&str`, and a `&str` over
 /// invalid UTF-8 is undefined behaviour (issue #2042), so bytes that are not
-/// valid UTF-8 are written as msgpack `bin` instead (lossless; `deserialize`
-/// accepts it). That path is not consensus wire output: the canonical
-/// encoders in `algo-codec` write the real `str` for block / txn bytes. For
+/// valid UTF-8 are written as a placeholder msgpack ext (tag
+/// `RAW_STR_EXT_TAG`) and a thread-local flag is raised; edges that need
+/// byte-exact `str` output call `algo_codec::to_vec_named_str_preserving`,
+/// which rewrites the ext into a `str` (see [`rewrite_ext_to_str`]).
+/// `deserialize` accepts the ext, so plain serde round trips are lossless.
+/// The canonical encoders in `algo-codec` write the real `str` directly. For
 /// a human-readable format (JSON, used by the REST API surface) this emits a
 /// lossy UTF-8 string instead; REST callers that need the exact bytes should
 /// use a `_b64`-suffixed sibling field, matching go's own
@@ -314,12 +317,97 @@ pub mod serde_raw_str {
             // byte-identical to go.
             Ok(text) => s.serialize_str(text),
             // Not representable as a Rust `&str`; constructing one would be
-            // UB (issue #2042), so fall back to msgpack `bin` with the raw
-            // bytes. The consensus wire bytes are produced by the canonical
-            // encoders (`algo-codec`), not this serde path, and `deserialize`
-            // below accepts `bin`, so this round-trips losslessly.
-            Err(_) => s.serialize_bytes(v),
+            // UB (issue #2042). A generic serde `Serializer` cannot write a
+            // msgpack `str` over such bytes, so emit a msgpack ext
+            // (`_ExtStruct`, tag `RAW_STR_EXT_TAG`) carrying the raw bytes and
+            // raise a thread-local flag. Byte-exact `str` edges
+            // (`algo_codec::to_vec_named_str_preserving`) rewrite the ext
+            // back into a `str`; `deserialize` below accepts the ext too.
+            Err(_) => {
+                RAW_STR_EXT_EMITTED.with(|f| f.set(true));
+                s.serialize_newtype_struct(
+                    "_ExtStruct",
+                    &(RAW_STR_EXT_TAG, serde_bytes::Bytes::new(v)),
+                )
+            }
         }
+    }
+
+    /// Msgpack ext type used as an in-band placeholder for a non-UTF-8 `str`.
+    pub const RAW_STR_EXT_TAG: i8 = 0x5a;
+
+    thread_local! {
+        static RAW_STR_EXT_EMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Returns (and clears) whether this thread's `serialize` emitted a
+    /// non-UTF-8 placeholder ext since the last call.
+    pub fn take_ext_emitted() -> bool {
+        RAW_STR_EXT_EMITTED.with(|f| f.replace(false))
+    }
+
+    /// Rewrite every `RAW_STR_EXT_TAG` ext in msgpack `bytes` into a msgpack
+    /// `str` holding the same raw bytes (what go writes).
+    pub fn rewrite_ext_to_str(bytes: &[u8]) -> Result<Vec<u8>, String> {
+        // `rmpv::encode::write_value` writes a non-UTF-8 string as `bin`, so
+        // write the tree with `rmp` directly.
+        fn put_str(out: &mut Vec<u8>, b: &[u8]) -> Result<(), String> {
+            let len = u32::try_from(b.len()).map_err(|_| "str too long".to_string())?;
+            rmp::encode::write_str_len(out, len).map_err(|e| e.to_string())?;
+            out.extend_from_slice(b);
+            Ok(())
+        }
+        fn put(out: &mut Vec<u8>, v: &rmpv::Value) -> Result<(), String> {
+            use rmpv::Value;
+            let e = |e: rmp::encode::ValueWriteError| e.to_string();
+            match v {
+                Value::Nil => rmp::encode::write_nil(out).map_err(|e| e.to_string())?,
+                Value::Boolean(b) => rmp::encode::write_bool(out, *b).map_err(|e| e.to_string())?,
+                Value::Integer(i) => {
+                    if let Some(u) = i.as_u64() {
+                        rmp::encode::write_uint(out, u).map_err(e)?;
+                    } else if let Some(n) = i.as_i64() {
+                        rmp::encode::write_sint(out, n).map_err(e)?;
+                    } else {
+                        return Err("unsupported integer".into());
+                    }
+                }
+                Value::F32(f) => rmp::encode::write_f32(out, *f).map_err(e)?,
+                Value::F64(f) => rmp::encode::write_f64(out, *f).map_err(e)?,
+                Value::String(s) => put_str(out, s.as_bytes())?,
+                Value::Binary(b) => {
+                    let len = u32::try_from(b.len()).map_err(|_| "bin too long".to_string())?;
+                    rmp::encode::write_bin_len(out, len).map_err(e)?;
+                    out.extend_from_slice(b);
+                }
+                Value::Array(a) => {
+                    let len = u32::try_from(a.len()).map_err(|_| "array too long".to_string())?;
+                    rmp::encode::write_array_len(out, len).map_err(e)?;
+                    for x in a {
+                        put(out, x)?;
+                    }
+                }
+                Value::Map(m) => {
+                    let len = u32::try_from(m.len()).map_err(|_| "map too long".to_string())?;
+                    rmp::encode::write_map_len(out, len).map_err(e)?;
+                    for (k, x) in m {
+                        put(out, k)?;
+                        put(out, x)?;
+                    }
+                }
+                Value::Ext(t, data) if *t == RAW_STR_EXT_TAG => put_str(out, data)?,
+                Value::Ext(t, data) => {
+                    let len = u32::try_from(data.len()).map_err(|_| "ext too long".to_string())?;
+                    rmp::encode::write_ext_meta(out, len, *t).map_err(e)?;
+                    out.extend_from_slice(data);
+                }
+            }
+            Ok(())
+        }
+        let v = rmpv::decode::read_value(&mut &bytes[..]).map_err(|e| e.to_string())?;
+        let mut out = Vec::with_capacity(bytes.len());
+        put(&mut out, &v)?;
+        Ok(out)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
@@ -346,6 +434,37 @@ pub mod serde_raw_str {
 
             fn visit_byte_buf<E: de::Error>(self, v: Vec<u8>) -> Result<Vec<u8>, E> {
                 Ok(v)
+            }
+
+            // rmp_serde surfaces a msgpack ext as a newtype struct holding
+            // `(i8 tag, bytes)`; accept our own non-UTF-8 placeholder.
+            fn visit_newtype_struct<D2: Deserializer<'de>>(
+                self,
+                d: D2,
+            ) -> Result<Vec<u8>, D2::Error> {
+                struct ExtVisitor;
+                impl<'de> Visitor<'de> for ExtVisitor {
+                    type Value = Vec<u8>;
+                    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                        f.write_str("a raw-str ext (tag, bytes)")
+                    }
+                    fn visit_seq<A: de::SeqAccess<'de>>(
+                        self,
+                        mut seq: A,
+                    ) -> Result<Vec<u8>, A::Error> {
+                        let tag: i8 = seq
+                            .next_element()?
+                            .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+                        if tag != RAW_STR_EXT_TAG {
+                            return Err(de::Error::custom("unexpected msgpack ext type"));
+                        }
+                        let data: serde_bytes::ByteBuf = seq
+                            .next_element()?
+                            .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+                        Ok(data.into_vec())
+                    }
+                }
+                d.deserialize_tuple(2, ExtVisitor)
             }
         }
 
@@ -387,8 +506,36 @@ mod serde_raw_str_tests {
     #[test]
     fn non_utf8_msgpack_roundtrips_without_ub() {
         let bytes = rmp(&[0xff, 0xfe]);
+        // Placeholder ext (fixext 2 = 0xd5, tag 0x5a), never `str`/`bin`.
+        assert!(bytes.windows(2).any(|w| w == [0xd5, 0x5a]), "{bytes:x?}");
+        assert!(super::serde_raw_str::take_ext_emitted());
         let back: W = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(back.un, vec![0xff, 0xfe]);
+    }
+
+    #[test]
+    fn rewrite_ext_to_str_emits_exact_str_bytes() {
+        let bytes = rmp(&[0xff, 0xfe]);
+        let fixed = super::serde_raw_str::rewrite_ext_to_str(&bytes).unwrap();
+        let valid = rmp(b"ab");
+        let mut expected = valid.clone();
+        let pos = expected.windows(2).position(|w| w == b"ab").unwrap();
+        expected[pos] = 0xff;
+        expected[pos + 1] = 0xfe;
+        assert_eq!(fixed, expected);
+    }
+
+    #[test]
+    fn asset_params_non_utf8_roundtrip() {
+        let p = crate::AssetParams {
+            unit_name: vec![0xff, 0xfe],
+            asset_name: b"ok".to_vec(),
+            url: vec![0x80],
+            ..Default::default()
+        };
+        let bytes = rmp_serde::to_vec_named(&p).unwrap();
+        let back: crate::AssetParams = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(back, p);
     }
 
     #[test]
