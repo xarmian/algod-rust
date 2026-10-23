@@ -7184,6 +7184,21 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                                 extra_created_app_ids.push(nested_id);
                             }
                         }
+                        // go-algorand shares a single `available` set across
+                        // the whole group, so resources created deep in a
+                        // nested call stay available to every ancestor after
+                        // it returns (#2036). The child started from a
+                        // snapshot of ours, so only add the new ones.
+                        for &nested_id in &ad.nested_created_assets {
+                            if !self.created_assets.contains(&nested_id) {
+                                self.created_assets.push(nested_id);
+                            }
+                        }
+                        for &nested_id in &ad.nested_created_apps {
+                            if !self.created_apps.contains(&nested_id) {
+                                self.created_apps.push(nested_id);
+                            }
+                        }
                         // Propagate fee_credit, fee_residue, and txn_counter back from child (H5/H6).
                         self.fee_credit = ad.fee_credit;
                         self.fee_residue = ad.fee_residue;
@@ -9589,7 +9604,10 @@ mod tests {
         ctx.app_id = 3471862384;
         // The availability-checked path rejects the unreferenced asset...
         let err = ctx.resolve_asset(626283733).unwrap_err();
-        assert!(err.to_string().contains("unavailable Asset 626283733"), "{err}");
+        assert!(
+            err.to_string().contains("unavailable Asset 626283733"),
+            "{err}"
+        );
         // ...the pre-v4 direct path does not.
         assert_eq!(ctx.direct_asset_ref(626283733).unwrap(), 626283733);
         assert_eq!(ctx.direct_app_ref(0).unwrap(), 3471862384);
@@ -20537,6 +20555,58 @@ mod inner_group_id_tests {
                 }
             }
         }
+    }
+
+    /// go-algorand shares one `available` resource set (incl. `createdApps`)
+    /// across the whole group, so an app created by a *nested* inner call
+    /// stays available to its ancestors after the nested call returns
+    /// (mainnet round 66241043 halt, #2036).
+    #[test]
+    fn nested_inner_created_app_is_available_to_ancestor() {
+        let mut store = fresh_store();
+        // B creates a new app via an inner appl create.
+        let mut create = pushint(6);
+        create.extend(field(16));
+        create.extend(pushbytes(&prog(vec![0x81, 1])));
+        create.extend(field(30));
+        create.extend(pushbytes(&prog(vec![0x81, 1])));
+        create.extend(field(31));
+        let b = submit_groups(&[vec![create]]);
+        seed(&mut store, B, prog(b));
+
+        let outer = outer_txn();
+        let mut ctx = LedgerAvmContext::new(
+            &mut store,
+            vec![outer],
+            0,
+            100,
+            50000,
+            A,
+            [1u8; 32],
+            true,
+            [0u8; 32],
+            [0u8; 32],
+            ConsensusParams::default(),
+            0,
+        );
+        ctx.set_program_version(6);
+        ctx.fee_sink = Address([0xFE; 32]);
+        ctx.store.get_or_default_account_mut(&Address([0xFE; 32]));
+        ctx.fee_credit = 1_000_000;
+        ctx.txn_counter = 300;
+        let program = parse(&prog(submit_groups(&[vec![appl_fields(B)]]))).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20_000);
+        assert!(m.run(&mut ctx).unwrap(), "app A must approve");
+
+        // B's inner create allocates the first id after the txn counter.
+        let created = (300..320)
+            .find(|id| ctx.store.has_app_params(*id))
+            .expect("B's inner create must have run");
+        assert!(
+            ctx.created_apps.contains(&created),
+            "nested-created app {created} must be recorded on the ancestor"
+        );
+        assert!(ctx.is_app_available(created));
     }
 
     #[test]
