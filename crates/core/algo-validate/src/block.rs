@@ -1266,6 +1266,65 @@ mod tests {
         validate_block(block, Some(90), "test-v1", &test_genesis_hash(), None)
     }
 
+    /// Issue #2041: `genesis_strict_block` with an extra programless
+    /// ("orphan") LogicSig carrying `args` attached to the (valid) `sig`.
+    fn orphan_lsig_block(proto: &str) -> Block {
+        let mut b = genesis_strict_block(proto);
+        b.payset[0].lsig = Some(algo_types::LogicSig {
+            args: Some(vec![serde_bytes::ByteBuf::from(vec![7u8])]),
+            ..Default::default()
+        });
+        b.txn_commitment = compute_payset_merkle_root(&b);
+        set_expected_load(&mut b);
+        b
+    }
+
+    fn orphan_errors(r: &BlockValidationResult) -> Vec<String> {
+        r.errors
+            .iter()
+            .filter(|e| format!("{e:?}").contains("LogicSig fields without LogicSig program"))
+            .map(|e| format!("{e:?}"))
+            .collect()
+    }
+
+    /// Pre-v42 (`PerByteTxnSurcharge == 0`): go's `checkTxnSigTypeCounts`
+    /// counts only `Lsig.HasProgram()`, so `sig` + a programless LogicSig is
+    /// one signature category, and `logicSigGroupSizeCheck` only rejects
+    /// orphan content under size pricing. go therefore accepts the block;
+    /// the block must validate exactly like its no-lsig baseline.
+    #[test]
+    fn block_pre_v42_sig_plus_orphan_lsig_matches_go() {
+        let proto = algo_types::consensus::CONSENSUS_V41;
+        let baseline = run_strict(&genesis_strict_block(proto));
+        let with_orphan = run_strict(&orphan_lsig_block(proto));
+        assert!(
+            orphan_errors(&with_orphan).is_empty(),
+            "{:?}",
+            with_orphan.errors
+        );
+        let no_sig_err = with_orphan
+            .errors
+            .iter()
+            .any(|e| format!("{e:?}").contains("signature"));
+        assert!(!no_sig_err, "{:?}", with_orphan.errors);
+        assert_eq!(
+            baseline.is_valid, with_orphan.is_valid,
+            "{:?}",
+            with_orphan.errors
+        );
+    }
+
+    /// v42+ (size pricing): the same block is rejected by
+    /// `logicSigGroupSizeCheck` with go's message.
+    #[test]
+    fn block_v42_sig_plus_orphan_lsig_rejected() {
+        let r = run_strict(&orphan_lsig_block("future"));
+        assert!(!r.is_valid);
+        assert!(!orphan_errors(&r).is_empty(), "{:?}", r.errors);
+        // No-lsig baseline has no such error.
+        assert!(orphan_errors(&run_strict(&genesis_strict_block("future"))).is_empty());
+    }
+
     #[test]
     fn strict_genesis_valid_stripped_forms_not_flagged() {
         for (proto, hgi, hgh) in [

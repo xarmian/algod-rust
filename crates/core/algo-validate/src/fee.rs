@@ -951,6 +951,35 @@ mod tests {
         assert_eq!(signature_fee_contribution(&stx, &p), 0);
     }
 
+    /// Issue #2041: go's `signatureFeeContribution` keys on
+    /// `!Lsig.PQsig.Blank()` with no `HasProgram()` condition, and
+    /// `logicSigProgramFeeContribution` counts only `len(Lsig.Logic)`
+    /// (args ignored): a programless LogicSig with PQ + args is charged the PQ
+    /// scheme fee and contributes zero program bytes.
+    #[test]
+    fn programless_lsig_fee_accounting_matches_go() {
+        let p = v42();
+        let mut stx = make_stxn("pay", 1000);
+        stx.lsig = Some(algo_types::LogicSig {
+            args: Some(vec![serde_bytes::ByteBuf::from(vec![9u8; 5000])]),
+            pqsig: Some(algo_types::pq::PQSig {
+                scheme: algo_types::pq::PQ_SCHEME_FALCON1024,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            signature_fee_contribution(&stx, &p),
+            p.pq_scheme_fee_contribution(algo_types::pq::PQ_SCHEME_FALCON1024)
+        );
+        // program_bytes (0) - free allowance (1 * LogicSigMaxSize) is negative;
+        // the args do not enter the program-byte surcharge.
+        let with_args = logic_sig_program_fee_contribution(&[&stx], &p);
+        let mut plain = make_stxn("pay", 1000);
+        plain.lsig = None;
+        assert_eq!(with_args, logic_sig_program_fee_contribution(&[&plain], &p));
+    }
+
     #[test]
     fn signature_fee_contribution_unknown_pq_scheme_is_zero() {
         let p = v42();

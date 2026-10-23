@@ -584,7 +584,7 @@ pub struct MultisigSig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogicSig {
     /// TEAL program bytes (variable length).
-    #[serde(rename = "l", default)]
+    #[serde(rename = "l", default, skip_serializing_if = "is_empty_bytes")]
     pub logic: ByteBuf,
 
     /// Delegated signature (ed25519Signature = [64]byte in Go).
@@ -2308,6 +2308,21 @@ impl Transaction {
 // ── SignedTransaction decoder ──────────────────────────────────
 
 impl SignedTransaction {
+    /// Go: `SignedTxn.HasSignature()` (`data/transactions/signedtxn.go`) --
+    /// `!Sig.Blank() || !Msig.Blank() || !Lsig.Blank() || !PQsig.Blank()`.
+    /// A merely *present* but blank Msig/Lsig/PQsig is not a signature.
+    pub fn has_signature(&self) -> bool {
+        self.has_non_pq_signature() || self.pqsig.as_ref().is_some_and(|p| !p.blank())
+    }
+
+    /// The `Sig`/`Msig`/`Lsig` half of go's `HasSignature()` (every category
+    /// except the top-level `PQsig`), used by go's `isPlaceholderPQSig`.
+    pub fn has_non_pq_signature(&self) -> bool {
+        self.sig != [0u8; 64]
+            || self.msig.as_ref().is_some_and(|m| !m.blank())
+            || self.lsig.as_ref().is_some_and(|l| !l.is_blank())
+    }
+
     /// Decode a SignedTransaction (SignedTxnInBlock) from a msgpack map using raw rmp.
     ///
     /// Uses two-level key dispatch: (key_len, first_byte) for fast routing.
@@ -2787,13 +2802,86 @@ mod logicsig_blank_tests {
     /// Mirrors go's `LogicSig.Blank()`:
     /// `len(Logic) == 0 && len(Args) == 0 && Sig.Blank() && Msig.Blank() &&
     /// LMsig.Blank() && PQsig.Blank()`.
+    ///
+    /// Deliberately restated field-by-field (independent of the production
+    /// `LogicSig::is_blank`) so the tests below pin go's definition, and a
+    /// final test asserts the production method agrees on every case.
     fn logicsig_blank(lsig: &LogicSig) -> bool {
-        lsig.is_blank()
+        let multisig_blank =
+            |m: &MultisigSig| m.version == 0 && m.threshold == 0 && m.subsigs.is_empty();
+        lsig.logic.is_empty()
+            && lsig.args.as_ref().is_none_or(|a| a.is_empty())
+            && lsig.sig.iter().all(|b| *b == 0)
+            && lsig.msig.as_ref().is_none_or(multisig_blank)
+            && lsig.lmsig.as_ref().is_none_or(multisig_blank)
+            && lsig.pqsig.as_ref().is_none_or(|p| {
+                p.scheme == [0u8; 2]
+                    && p.salt.0 == 0
+                    && p.public_key.is_empty()
+                    && p.signature.is_empty()
+            })
     }
 
     /// Mirrors go's `LogicSig.HasProgram()`: `len(Logic) != 0`.
     fn logicsig_has_program(lsig: &LogicSig) -> bool {
-        lsig.has_program()
+        !lsig.logic.is_empty()
+    }
+
+    #[test]
+    fn production_is_blank_agrees_with_independent_oracle() {
+        let mut sig = [0u8; 64];
+        sig[63] = 1;
+        let nb_ms = MultisigSig {
+            version: 1,
+            threshold: 0,
+            subsigs: Vec::new(),
+        };
+        let cases = vec![
+            LogicSig::default(),
+            LogicSig {
+                logic: ByteBuf::from(vec![1u8]),
+                ..Default::default()
+            },
+            LogicSig {
+                args: Some(Vec::new()),
+                ..Default::default()
+            },
+            LogicSig {
+                args: Some(vec![ByteBuf::new()]),
+                ..Default::default()
+            },
+            LogicSig {
+                sig,
+                ..Default::default()
+            },
+            LogicSig {
+                msig: Some(nb_ms.clone()),
+                ..Default::default()
+            },
+            LogicSig {
+                lmsig: Some(nb_ms),
+                ..Default::default()
+            },
+            LogicSig {
+                msig: Some(MultisigSig::default()),
+                ..Default::default()
+            },
+            LogicSig {
+                pqsig: Some(crate::pq::PQSig::default()),
+                ..Default::default()
+            },
+            LogicSig {
+                pqsig: Some(crate::pq::PQSig {
+                    scheme: crate::pq::PQ_SCHEME_FALCON1024,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ];
+        for c in &cases {
+            assert_eq!(c.is_blank(), logicsig_blank(c), "{c:?}");
+            assert_eq!(c.has_program(), logicsig_has_program(c), "{c:?}");
+        }
     }
 
     /// Issue #2041: go's `Blank()` uses `len(Args) == 0`, so an explicit

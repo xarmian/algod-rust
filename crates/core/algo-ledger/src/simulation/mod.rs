@@ -1092,12 +1092,8 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             }
 
             // Handle empty signatures when allowed.
-            let has_sig = stx.sig != [0u8; 64];
-            let has_msig = stx.msig.as_ref().is_some_and(|m| !m.blank());
-            // Go: `SignedTxn.HasSignature()` uses `!Lsig.Blank()`.
-            let has_lsig = stx.lsig.as_ref().is_some_and(|l| !l.is_blank());
-            let has_pqsig = stx.pqsig.as_ref().is_some_and(|p| !p.blank());
-            if allow_empty_signatures && !has_sig && !has_msig && !has_lsig && !has_pqsig {
+            // Go: `!stxn.HasSignature()`.
+            if allow_empty_signatures && !stx.has_signature() {
                 // Proxy-sign: create a valid ed25519 signature so verification
                 // passes. Mirrors go-algorand's `Transaction.Sign()` which
                 // sets `AuthAddr` to the signing key's public key when it
@@ -1328,10 +1324,7 @@ fn group_fee_failure(
 /// Whether a signed transaction carries no signature of any kind
 /// (go-algorand's `txnHasNoSignature`).
 fn txn_has_no_signature(stx: &SignedTransaction) -> bool {
-    stx.sig == [0u8; 64]
-        && stx.msig.as_ref().is_none_or(|m| m.blank())
-        && stx.lsig.as_ref().is_none_or(|l| l.is_blank())
-        && stx.pqsig.as_ref().map(|p| p.blank()).unwrap_or(true)
+    !stx.has_signature()
 }
 
 /// Whether `stx` carries a placeholder top-level `PQSig`: a non-blank PQ
@@ -1340,11 +1333,8 @@ fn txn_has_no_signature(stx: &SignedTransaction) -> bool {
 /// simulator.go`, issue #835) -- used for fee/budget-estimation simulation
 /// without a real Falcon-1024 signature.
 fn is_placeholder_pqsig(stx: &SignedTransaction) -> bool {
-    let has_sig = stx.sig != [0u8; 64];
-    let has_msig = stx.msig.as_ref().is_some_and(|m| !m.blank());
-    let has_lsig = stx.lsig.as_ref().is_some_and(|l| !l.is_blank());
     match &stx.pqsig {
-        Some(pq) if !pq.blank() && pq.signature.is_empty() => !has_sig && !has_msig && !has_lsig,
+        Some(pq) if !pq.blank() && pq.signature.is_empty() => !stx.has_non_pq_signature(),
         _ => false,
     }
 }
@@ -1355,10 +1345,10 @@ fn is_placeholder_pqsig(stx: &SignedTransaction) -> bool {
 /// or the LogicSig. Matches go-algorand's `isPlaceholderDelegatedPQSig`
 /// (`ledger/simulation/simulator.go`, issue #835).
 fn is_placeholder_delegated_pqsig(stx: &SignedTransaction) -> bool {
-    let has_sig = stx.sig != [0u8; 64];
-    let has_msig = stx.msig.as_ref().is_some_and(|m| !m.blank());
+    // Go: `Sig.Blank() && Msig.Blank() && PQsig.Blank()` (the Lsig is
+    // checked field-by-field below).
     let has_top_pqsig = stx.pqsig.as_ref().is_some_and(|p| !p.blank());
-    if has_sig || has_msig || has_top_pqsig {
+    if stx.sig != [0u8; 64] || stx.msig.as_ref().is_some_and(|m| !m.blank()) || has_top_pqsig {
         return false;
     }
     match &stx.lsig {
