@@ -718,7 +718,8 @@ fn simulation_group_pooled_fees_cover_underpaid_transaction() {
 
 /// Two-transaction group whose pooled total is still short of
 /// `MinTxnFee * count`: `check()` must reject it with go-algorand's exact
-/// error format (`eval.CheckGroupFees`, `ledger/eval/eval.go:1026`), proving the group-level check aggregates across
+/// error format (`eval.CheckGroupFees`, `ledger/eval/eval.go:1004`), proving
+/// the group-level check aggregates across
 /// multiple transactions rather than only catching a single zero-fee
 /// transaction. Issue #213.
 #[test]
@@ -799,14 +800,52 @@ fn simulation_check_rejects_v42_big_note_underpaid_fee() {
     let mut simulator = Simulator::new(&mut state);
     match simulator.simulate(request) {
         Err(SimulatorError::InvalidRequest(e)) => {
-            assert!(
-                e.message.starts_with("txgroup with 1mA fees is less than "),
-                "unexpected message: {}",
-                e.message
+            // Required fee 1298 microAlgos (1.2976 usage * 1mA base, rounded
+            // up by `FeeForUsage`).
+            assert_eq!(
+                e.message,
+                "txgroup with 1mA fees is less than 1.298mA (usage=1.297600 * base=1mA)"
             );
         }
         other => panic!("expected InvalidRequest fee error, got {other:?}"),
     }
+}
+
+/// Ordering vs go-algorand: `Simulator.check()` verifies signatures
+/// (`verify.TxnGroupWithTracer`) before `eval.TransactionGroup` runs
+/// `CheckGroupFees` (`ledger/eval/eval.go:1182-1183`). A group that is both
+/// underpaid and unsigned therefore reports the (recoverable) missing-signature
+/// failure, not the group-fee error (issue #2040).
+#[test]
+fn simulation_signature_failure_takes_precedence_over_underpaid_group_fee() {
+    let sender = Address([0xAA; 32]);
+    let receiver = Address([0x20; 32]);
+    let mut state = LedgerState::new();
+    state.set_account(
+        &sender,
+        AccountData {
+            micro_algos: 10_000_000,
+            ..Default::default()
+        },
+    );
+
+    let mut txn = pay_txn(sender, receiver);
+    txn.txn.fee = 0;
+
+    let request = SimulationRequest {
+        txn_groups: vec![vec![txn]],
+        allow_empty_signatures: false,
+        ..Default::default()
+    };
+    let mut simulator = Simulator::new(&mut state);
+    let result = simulator
+        .simulate(request)
+        .expect("a missing signature is a recoverable per-txn failure, not a fee error");
+    let msg = result.txn_groups[0]
+        .failure_message
+        .as_deref()
+        .expect("failure message expected");
+    assert!(msg.contains("no signature"), "unexpected message: {msg}");
 }
 
 /// Approval program (v8) that reads global key "g", pops it, and approves.

@@ -1156,19 +1156,6 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             })
         })?;
 
-        // Group-level fee validation: go-algorand's simulator runs the
-        // submitted group through `eval.TransactionGroup`, which calls
-        // `transactions.SummarizeFees` + `eval.CheckGroupFees`
-        // (`ledger/eval/eval.go:1183`). The submitted group is a single fee
-        // pool whose required fee is `FeeForUsage(MinTxnFee, usage)`, where
-        // usage includes v42+ note/app-arg/program size surcharges, LogicSig
-        // program-byte surcharges and PQ signature surcharges; state proofs
-        // and discounted heartbeats contribute zero. Top-level only: inner
-        // fees are checked during AVM execution (issue #2040).
-        let fee_group: Vec<&SignedTransaction> = txn_group.iter().collect();
-        algo_validate::fee::check_submitted_group_fees(&fee_group, consensus)
-            .map_err(|message| SimulatorError::InvalidRequest(InvalidRequestError { message }))?;
-
         // Pass 2: verify signatures on the (possibly proxy-signed) group.
         // When tracing is enabled, capture each LogicSig program's opcode trace
         // here — the LogicSig runs during signature verification, before the
@@ -1286,6 +1273,30 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 }));
             }
         }
+
+        // Group-level fee validation. go-algorand's simulator runs
+        // `verify.TxnGroupWithTracer` (signatures) in `check()` first and only
+        // then `eval.TransactionGroup`, which calls `transactions.SummarizeFees`
+        // + `eval.CheckGroupFees` (`ledger/eval/eval.go:1182-1183`;
+        // `CheckGroupFees` is defined at `eval.go:1004`). So an underpaid group
+        // with a bad signature reports the signature error, and a recoverable
+        // per-transaction signature failure (returned above) never reaches the
+        // fee check -- hence it runs only after every signature has verified.
+        //
+        // The submitted group is a single fee pool whose required fee is
+        // `FeeForUsage(MinTxnFee, usage)`, where usage includes v42+
+        // note/app-arg/program size surcharges, LogicSig program-byte
+        // surcharges and PQ signature surcharges; state proofs and discounted
+        // heartbeats contribute zero. Top-level only: inner fees are checked
+        // during AVM execution (issue #2040).
+        //
+        // MUST use the original `txn_group`, NOT `verify_group`/`eval_group`:
+        // placeholder PQSigs are stripped (`pqsig = None`) and replaced by a
+        // proxy Ed25519 signature in `verify_group`, which would silently drop
+        // the Falcon surcharge from the required fee.
+        let fee_group: Vec<&SignedTransaction> = txn_group.iter().collect();
+        algo_validate::fee::check_submitted_group_fees(&fee_group, consensus)
+            .map_err(|message| SimulatorError::InvalidRequest(InvalidRequestError { message }))?;
 
         Ok(CheckOutcome::Passed {
             logicsig_traces,

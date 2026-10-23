@@ -79,15 +79,18 @@ fn dummy_pq_identity(fill_byte: u8) -> (Vec<u8>, PQAddressSalt, Address) {
     (pk, salt, addr)
 }
 
-fn make_pay_txn(sender: Address, receiver: Address) -> Transaction {
+/// Fee for a Falcon-1024 (placeholder or real) signed payment: 1.0 base fee
+/// factor + 2.0 Falcon-1024 surcharge. go's `eval.CheckGroupFees` (issue
+/// #2040) requires 3 * MinTxnFee even for placeholder PQ sigs
+/// (`PQSig.Blank()` is false once a scheme is set).
+const FALCON_PAY_FEE: u64 = 3000;
+
+fn make_pay_txn(sender: Address, receiver: Address, fee: u64) -> Transaction {
     Transaction {
         txn_type: "pay".into(),
         sender,
         receiver,
-        // 1.0 base fee factor + 2.0 Falcon-1024 surcharge: go's
-        // `CheckGroupFees` (issue #2040) requires 3 * MinTxnFee even for
-        // placeholder PQ sigs (`PQSig.Blank()` is false once a scheme is set).
-        fee: 3000,
+        fee,
         first_valid: 0.into(),
         last_valid: 1000.into(),
         ..Default::default()
@@ -115,7 +118,7 @@ fn scheme_only_placeholder_pqsig_accepted() {
     let mut state = setup_state(sender);
 
     let stx = SignedTransaction {
-        txn: make_pay_txn(sender, receiver),
+        txn: make_pay_txn(sender, receiver, FALCON_PAY_FEE),
         pqsig: Some(PQSig {
             scheme: PQ_SCHEME_FALCON1024,
             salt: PQAddressSalt(0),
@@ -150,7 +153,7 @@ fn full_placeholder_pqsig_matching_authorizer_accepted() {
     let mut state = setup_state(addr);
 
     let stx = SignedTransaction {
-        txn: make_pay_txn(addr, receiver),
+        txn: make_pay_txn(addr, receiver, FALCON_PAY_FEE),
         pqsig: Some(PQSig {
             scheme: PQ_SCHEME_FALCON1024,
             salt,
@@ -186,7 +189,7 @@ fn full_placeholder_pqsig_mismatched_authorizer_rejected() {
     let mut state = setup_state(sender);
 
     let stx = SignedTransaction {
-        txn: make_pay_txn(sender, receiver),
+        txn: make_pay_txn(sender, receiver, FALCON_PAY_FEE),
         pqsig: Some(PQSig {
             scheme: PQ_SCHEME_FALCON1024,
             salt,
@@ -227,7 +230,7 @@ fn delegated_placeholder_pqsig_matching_authorizer_accepted() {
     let program = vec![0x06, 0x81, 0x01, 0x43];
 
     let stx = SignedTransaction {
-        txn: make_pay_txn(addr, receiver),
+        txn: make_pay_txn(addr, receiver, FALCON_PAY_FEE),
         lsig: Some(LogicSig {
             logic: ByteBuf::from(program),
             pqsig: Some(PQSig {
@@ -266,7 +269,7 @@ fn delegated_placeholder_pqsig_mismatched_authorizer_rejected() {
     let program = vec![0x06, 0x81, 0x01, 0x43];
 
     let stx = SignedTransaction {
-        txn: make_pay_txn(sender, receiver),
+        txn: make_pay_txn(sender, receiver, FALCON_PAY_FEE),
         lsig: Some(LogicSig {
             logic: ByteBuf::from(program),
             pqsig: Some(PQSig {
@@ -309,7 +312,7 @@ fn non_placeholder_pqsig_with_wrong_authorizer_is_not_silently_proxy_signed() {
     let mut state = setup_state(sender);
 
     let stx = SignedTransaction {
-        txn: make_pay_txn(sender, receiver),
+        txn: make_pay_txn(sender, receiver, FALCON_PAY_FEE),
         pqsig: Some(PQSig {
             scheme: PQ_SCHEME_FALCON1024,
             salt,
@@ -338,6 +341,11 @@ fn non_placeholder_pqsig_with_wrong_authorizer_is_not_silently_proxy_signed() {
 
 #[test]
 fn pqsig_with_flat_min_fee_fails_check_group_fees() {
+    // The fee check MUST use the original submitted group: in `check()` the
+    // placeholder PQSig is stripped (`pqsig = None`) and replaced by a proxy
+    // Ed25519 signature, so a fee check over the post-swap group would see a
+    // plain payment and accept fee 1000. This test fails if that regresses.
+    //
     // go's `eval.CheckGroupFees` over `SummarizeFees`: a Falcon-1024 signed
     // top-level transaction owes `signatureFeeContribution` (2.0 fee
     // factors) on top of its own 1.0, so a flat MinTxnFee of 1000 is short.
@@ -345,8 +353,7 @@ fn pqsig_with_flat_min_fee_fails_check_group_fees() {
     let receiver = Address([0xBB; 32]);
     let mut state = setup_state(sender);
 
-    let mut txn = make_pay_txn(sender, receiver);
-    txn.fee = 1000;
+    let txn = make_pay_txn(sender, receiver, 1000);
     let stx = SignedTransaction {
         txn,
         pqsig: Some(PQSig {
