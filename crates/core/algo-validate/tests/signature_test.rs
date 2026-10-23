@@ -957,7 +957,7 @@ fn sig_plus_orphan_lsig_counts_one_category_like_go() {
 /// plain contract account, not an ambiguous or multisig-delegated one.
 #[test]
 fn logicsig_sanity_check_ignores_blank_msig_and_lmsig() {
-    let program = valid_program_of_size(10);
+    let program = valid_program_of_size(200);
     let mut stx = make_contract_account_txn(&program);
     let blank = algo_types::MultisigSig::default();
     {
