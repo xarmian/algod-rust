@@ -1150,7 +1150,7 @@ pub fn verify_transaction_signature_with_tracer(
     // mutually-exclusive signature category alongside sig/msig/lsig/
     // state-proof-txn (Go: `checkTxnSigTypeCounts`, commit `569ae3d4b`).
     let has_sig = stx.sig != [0u8; 64];
-    let has_msig = stx.msig.is_some();
+    let has_msig = stx.msig.as_ref().is_some_and(|m| !m.blank());
     // Go counts `Lsig.HasProgram()`, not a merely-present LogicSig: an orphan
     // or blank LogicSig is not a signature category (it is rejected, where
     // applicable, by `logic_sig_group_size_check`). Issue #2041.

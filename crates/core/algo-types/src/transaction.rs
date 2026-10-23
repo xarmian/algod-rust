@@ -1610,6 +1610,11 @@ impl MultisigSubsig {
 }
 
 impl MultisigSig {
+    /// Go: `MultisigSig.Blank()` -- version 0, threshold 0, no subsigs.
+    pub fn blank(&self) -> bool {
+        self.version == 0 && self.threshold == 0 && self.subsigs.is_empty()
+    }
+
     pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
         let len = rmp_decode::read_map_len(rd)?;
         let mut s = Self::default();
@@ -1658,13 +1663,11 @@ impl LogicSig {
     /// `len(Logic) == 0 && len(Args) == 0 && Sig.Blank() && Msig.Blank() &&
     /// LMsig.Blank() && PQsig.Blank()`.
     pub fn is_blank(&self) -> bool {
-        let multisig_blank =
-            |m: &MultisigSig| m.version == 0 && m.threshold == 0 && m.subsigs.is_empty();
         self.logic.is_empty()
             && self.args.as_ref().is_none_or(|a| a.is_empty())
             && is_zero_64(&self.sig)
-            && self.msig.as_ref().is_none_or(multisig_blank)
-            && self.lmsig.as_ref().is_none_or(multisig_blank)
+            && self.msig.as_ref().is_none_or(|m| m.blank())
+            && self.lmsig.as_ref().is_none_or(|m| m.blank())
             && self.pqsig.as_ref().is_none_or(|p| p.blank())
     }
 

@@ -1093,7 +1093,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
 
             // Handle empty signatures when allowed.
             let has_sig = stx.sig != [0u8; 64];
-            let has_msig = stx.msig.is_some();
+            let has_msig = stx.msig.as_ref().is_some_and(|m| !m.blank());
             // Go: `SignedTxn.HasSignature()` uses `!Lsig.Blank()`.
             let has_lsig = stx.lsig.as_ref().is_some_and(|l| !l.is_blank());
             let has_pqsig = stx.pqsig.as_ref().is_some_and(|p| !p.blank());
@@ -1211,7 +1211,9 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         let sig_block_source = StoreSigBlockSource::new(&*self.store);
         for (i, stx) in verify_group.iter().enumerate() {
             let budget_before = budget.remaining();
-            let result = if trace_config.is_enabled() && stx.lsig.is_some() {
+            let result = if trace_config.is_enabled()
+                && stx.lsig.as_ref().is_some_and(|l| l.has_program())
+            {
                 let mut lsig_tracer = SimulationTracer::new(trace_config.clone());
                 let r = verify_transaction_signature_with_tracer(
                     stx,
@@ -1327,8 +1329,8 @@ fn group_fee_failure(
 /// (go-algorand's `txnHasNoSignature`).
 fn txn_has_no_signature(stx: &SignedTransaction) -> bool {
     stx.sig == [0u8; 64]
-        && stx.msig.is_none()
-        && stx.lsig.is_none()
+        && stx.msig.as_ref().is_none_or(|m| m.blank())
+        && stx.lsig.as_ref().is_none_or(|l| l.is_blank())
         && stx.pqsig.as_ref().map(|p| p.blank()).unwrap_or(true)
 }
 
@@ -1339,7 +1341,7 @@ fn txn_has_no_signature(stx: &SignedTransaction) -> bool {
 /// without a real Falcon-1024 signature.
 fn is_placeholder_pqsig(stx: &SignedTransaction) -> bool {
     let has_sig = stx.sig != [0u8; 64];
-    let has_msig = stx.msig.is_some();
+    let has_msig = stx.msig.as_ref().is_some_and(|m| !m.blank());
     let has_lsig = stx.lsig.as_ref().is_some_and(|l| !l.is_blank());
     match &stx.pqsig {
         Some(pq) if !pq.blank() && pq.signature.is_empty() => !has_sig && !has_msig && !has_lsig,
