@@ -951,6 +951,25 @@ fn sig_plus_orphan_lsig_counts_one_category_like_go() {
     assert!(algo_validate::signature::logic_sig_group_size_check(&group, &v42()).is_err());
 }
 
+/// go's LogicSig sanity check counts `!Msig.Blank()` / `!LMsig.Blank()`: a
+/// contract-account LogicSig carrying present-but-empty msig/lmsig envelopes
+/// (reachable via the serde/JSON path; strict wire decode rejects them) is a
+/// plain contract account, not an ambiguous or multisig-delegated one.
+#[test]
+fn logicsig_sanity_check_ignores_blank_msig_and_lmsig() {
+    let program = valid_program_of_size(10);
+    let mut stx = make_contract_account_txn(&program);
+    let blank = algo_types::MultisigSig::default();
+    {
+        let lsig = stx.lsig.as_mut().unwrap();
+        lsig.msig = Some(blank.clone());
+        lsig.lmsig = Some(blank);
+    }
+    let lsig = stx.lsig.clone().unwrap();
+    algo_validate::signature::logicsig_sanity_check(&stx, &lsig)
+        .expect("blank msig/lmsig must not count as delegation signatures");
+}
+
 /// A present-but-blank multisig envelope inside a LogicSig is blank (go
 /// `Msig.Blank()`), so it is not orphan content.
 #[test]

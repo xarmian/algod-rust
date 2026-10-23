@@ -2074,7 +2074,7 @@ fn run_group_inner(args: GroupArgs) -> Result<(), String> {
                 "Transaction #{idx} with ID of {id} is already part of a group."
             ));
         }
-        if stxn.sig != [0u8; 64] || stxn.msig.is_some() {
+        if stxn.sig != [0u8; 64] || stxn.msig.as_ref().is_some_and(|m| !m.blank()) {
             let id = compute_txn_id(&stxn.txn);
             return Err(format!(
                 "Transaction #{idx} with ID of {id} is already signed"

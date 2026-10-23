@@ -596,8 +596,11 @@ pub fn logicsig_sanity_check(stx: &SignedTransaction, lsig: &LogicSig) -> Result
     }
 
     let has_sig = lsig.sig != [0u8; 64];
-    let has_msig = lsig.msig.is_some();
-    let has_lmsig = lsig.lmsig.is_some();
+    // Go: `!Msig.Blank()` / `!LMsig.Blank()` (a present-but-empty envelope is
+    // not a delegation signature). Strict wire decode already rejects an
+    // empty multisig, but the serde/JSON path can produce one.
+    let has_msig = lsig.msig.as_ref().is_some_and(|m| !m.blank());
+    let has_lmsig = lsig.lmsig.as_ref().is_some_and(|m| !m.blank());
     let num_sigs = has_sig as u8 + has_msig as u8 + has_lmsig as u8;
 
     if num_sigs > 1 {
@@ -633,12 +636,12 @@ pub fn logicsig_sanity_check(stx: &SignedTransaction, lsig: &LogicSig) -> Result
                 message: algo_error::BATCH_HAS_FAILED_SIGS.into(),
             });
         }
-    } else if let Some(msig) = &lsig.msig {
+    } else if let Some(msig) = lsig.msig.as_ref().filter(|m| !m.blank()) {
         let mut program_msg = Vec::with_capacity(PROGRAM_PREFIX.len() + lsig.logic.len());
         program_msg.extend_from_slice(PROGRAM_PREFIX);
         program_msg.extend_from_slice(&lsig.logic);
         verify_logicsig_multisig(stx, msig, &program_msg)?;
-    } else if let Some(lmsig) = &lsig.lmsig {
+    } else if let Some(lmsig) = lsig.lmsig.as_ref().filter(|m| !m.blank()) {
         let mut lmsig_msg = Vec::with_capacity(MSIG_PROGRAM_PREFIX.len() + 32 + lsig.logic.len());
         lmsig_msg.extend_from_slice(MSIG_PROGRAM_PREFIX);
         lmsig_msg.extend_from_slice(&authorizer.0);
@@ -743,8 +746,8 @@ pub fn verify_logicsig_with_tracer(
     // (matches Go's `logicSigSanityCheckBatchPrep`, which added `PQsig` to
     // this same mutual-exclusivity count in commit `ef838f4e9`).
     let has_sig = lsig.sig != [0u8; 64];
-    let has_msig = lsig.msig.is_some();
-    let has_lmsig = lsig.lmsig.is_some();
+    let has_msig = lsig.msig.as_ref().is_some_and(|m| !m.blank());
+    let has_lmsig = lsig.lmsig.as_ref().is_some_and(|m| !m.blank());
     let has_pqsig = lsig.pqsig.as_ref().is_some_and(|p| !p.blank());
     let num_sigs = has_sig as u8 + has_msig as u8 + has_lmsig as u8 + has_pqsig as u8;
 
@@ -800,7 +803,7 @@ pub fn verify_logicsig_with_tracer(
                 message: algo_error::BATCH_HAS_FAILED_SIGS.into(),
             });
         }
-    } else if let Some(msig) = &lsig.msig {
+    } else if let Some(msig) = lsig.msig.as_ref().filter(|m| !m.blank()) {
         // Mode 2: Delegated multisig — verify multisig on "Program" || logic.
         // Gated on `LogicSigMsig` (Go: `data/transactions/verify/txn.go`'s
         // `logicSigSanityCheckBatchPrep`, v18+, retired at v41 in favor of
@@ -814,7 +817,7 @@ pub fn verify_logicsig_with_tracer(
         program_msg.extend_from_slice(PROGRAM_PREFIX);
         program_msg.extend_from_slice(&lsig.logic);
         verify_logicsig_multisig(stx, msig, &program_msg)?;
-    } else if let Some(lmsig) = &lsig.lmsig {
+    } else if let Some(lmsig) = lsig.lmsig.as_ref().filter(|m| !m.blank()) {
         // Mode 3: Delegated logic-multisig (lmsig). Gated on `LogicSigLMsig`
         // (Go: same function, v41+ -- see issue #752).
         if !consensus.logic_sig_lmsig {
@@ -1190,7 +1193,7 @@ pub fn verify_transaction_signature_with_tracer(
         return verify_single_sig(stx);
     }
 
-    if let Some(msig) = stx.msig.as_ref().filter(|_| has_msig) {
+    if let Some(msig) = stx.msig.as_ref().filter(|m| !m.blank()) {
         return verify_multisig(stx, msig);
     }
 

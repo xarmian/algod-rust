@@ -1104,6 +1104,13 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 msg.extend_from_slice(&canonical);
                 let sig = proxy_key.sign(&msg);
                 stx.sig = sig.to_bytes();
+                // Go replaces the whole SignedTxn with `Txn.Sign(...)`, a
+                // fresh envelope carrying only `Sig`/`AuthAddr`: any
+                // present-but-blank msig/lsig/pqsig envelope is dropped from
+                // the verification copy (blank ones add no size or fee).
+                stx.msig = None;
+                stx.lsig = None;
+                stx.pqsig = None;
 
                 // Set auth_addr to proxy key's public key so the verifier
                 // checks the signature against the correct key.

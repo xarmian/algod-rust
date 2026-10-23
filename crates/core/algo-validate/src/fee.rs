@@ -980,6 +980,22 @@ mod tests {
         assert_eq!(with_args, logic_sig_program_fee_contribution(&[&plain], &p));
     }
 
+    /// A blank orphan LogicSig (empty arg list, blank PQ envelope) carries no
+    /// priced content: group fee usage is identical to the no-LogicSig group
+    /// at v42 (go: `Lsig.Logic` empty, `Lsig.PQsig.Blank()`).
+    #[test]
+    fn blank_orphan_lsig_group_fee_usage_equals_no_lsig_at_v42() {
+        let p = v42();
+        let plain = make_stxn("pay", 1000);
+        let mut blank = make_stxn("pay", 1000);
+        blank.lsig = Some(algo_types::LogicSig {
+            args: Some(Vec::new()),
+            pqsig: Some(algo_types::pq::PQSig::default()),
+            ..Default::default()
+        });
+        assert_eq!(summarize_fees(&[&blank], &p), summarize_fees(&[&plain], &p));
+    }
+
     #[test]
     fn signature_fee_contribution_unknown_pq_scheme_is_zero() {
         let p = v42();
