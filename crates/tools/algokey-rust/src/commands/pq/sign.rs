@@ -42,7 +42,7 @@ const TX_PREFIX: &[u8] = b"TX";
 
 /// Mirrors `SignedTxn.HasSignature()` (`data/transactions/signedtxn.go:115-117`).
 fn has_signature(stxn: &SignedTransaction) -> bool {
-    stxn.sig != [0u8; 64] || stxn.msig.is_some() || stxn.lsig.is_some() || stxn.pqsig.is_some()
+    stxn.has_signature()
 }
 
 /// Mirrors `clearSignedTxnAuthorization` (`pq.go:431-437`).

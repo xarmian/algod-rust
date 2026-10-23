@@ -2144,6 +2144,80 @@ fn optional_signatures_programless_logicsig_content() {
     assert_eq!(group.failed_at, Some(vec![0]));
 }
 
+/// Issue #2041 (FIND-ba9c86e5-05): go's `LogicSig.Blank()` includes
+/// `PQsig.Blank()`, so a programless LogicSig carrying only a non-blank PQ
+/// envelope is orphan content, while an explicit empty arg list is blank.
+#[test]
+fn programless_logicsig_pqsig_is_orphan_and_empty_args_is_blank() {
+    let sender_key = SigningKey::from_bytes(&[0x67; 32]);
+    let sender_addr = Address(sender_key.verifying_key().to_bytes());
+    let mut state = base_state();
+    state.protocol = algo_types::consensus::CONSENSUS_V42.to_string();
+    fund(&mut state, sender_addr, 20_000_000);
+
+    let mk = |lsig: LogicSig| SignedTransaction {
+        txn: Transaction {
+            txn_type: "pay".into(),
+            sender: sender_addr,
+            receiver: sender_addr,
+            amount: 0,
+            fee: 1000,
+            first_valid: 0.into(),
+            last_valid: 1000.into(),
+            ..Default::default()
+        },
+        lsig: Some(lsig),
+        ..Default::default()
+    };
+
+    // Non-blank PQ envelope, no program: orphan content.
+    let orphan = mk(LogicSig {
+        pqsig: Some(algo_types::pq::PQSig {
+            scheme: algo_types::pq::PQ_SCHEME_FALCON1024,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let result = simulate(
+        &mut state,
+        SimulationRequest {
+            txn_groups: vec![vec![orphan]],
+            allow_empty_signatures: true,
+            ..Default::default()
+        },
+    )
+    .expect("orphan pqsig must be a recoverable failure, not a hard error");
+    let msg = result.txn_groups[0]
+        .failure_message
+        .as_ref()
+        .expect("orphan pqsig-only LogicSig must fail the group");
+    assert!(
+        msg.contains("LogicSig fields without LogicSig program"),
+        "unexpected message: {msg}"
+    );
+
+    // Blank LogicSig (empty arg list): must NOT trip the orphan check.
+    let blank = mk(LogicSig {
+        args: Some(Vec::new()),
+        ..Default::default()
+    });
+    let result = simulate(
+        &mut state,
+        SimulationRequest {
+            txn_groups: vec![vec![blank]],
+            allow_empty_signatures: true,
+            ..Default::default()
+        },
+    );
+    // go's HasSignature() uses !Lsig.Blank(), so a blank LogicSig is
+    // proxy-signed under allow_empty_signatures and the group succeeds.
+    let r = result.expect("a blank LogicSig must simulate cleanly");
+    assert_eq!(
+        r.txn_groups[0].failure_message, None,
+        "blank LogicSig must not be orphan content"
+    );
+}
+
 /// Port of `TestPartialMissingSignatures`: a group where only *some*
 /// transactions carry a signature must still simulate successfully under
 /// `allow_empty_signatures` -- the unsigned member is proxy-signed, the
@@ -2202,6 +2276,73 @@ fn partial_missing_signatures() {
     assert_eq!(group.txn_results.len(), 2);
     assert!(group.txn_results[0].apply_data.is_some());
     assert!(group.txn_results[1].apply_data.is_some());
+}
+
+/// Issue #2041, pre-v42 (`PerByteTxnSurcharge == 0`): go's
+/// `checkTxnSigTypeCounts` counts `Lsig.HasProgram()`, so a genuine `sig` plus
+/// a programless LogicSig carrying args is ONE category and
+/// `logicSigGroupSizeCheck` only rejects orphan content under size pricing --
+/// simulate succeeds. With NO real signature, the non-blank orphan LogicSig
+/// counts as `HasSignature()` (so it is not proxy-signed) but is zero
+/// categories, giving go's "no signature" failure instead of the orphan one.
+#[test]
+fn pre_v42_orphan_lsig_with_sig_succeeds_without_sig_fails_no_signature() {
+    let sender_key = SigningKey::from_bytes(&[0x68; 32]);
+    let sender_addr = Address(sender_key.verifying_key().to_bytes());
+    let mut state = base_state();
+    state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
+    fund(&mut state, sender_addr, 20_000_000);
+
+    let txn = Transaction {
+        txn_type: "pay".into(),
+        sender: sender_addr,
+        receiver: sender_addr,
+        amount: 0,
+        fee: 1000,
+        first_valid: 0.into(),
+        last_valid: 1000.into(),
+        ..Default::default()
+    };
+    let orphan = LogicSig {
+        args: Some(vec![serde_bytes::ByteBuf::from(vec![1u8])]),
+        ..Default::default()
+    };
+
+    let mut signed = sign(txn.clone(), &sender_key);
+    signed.lsig = Some(orphan.clone());
+    let r = simulate(
+        &mut state,
+        SimulationRequest {
+            txn_groups: vec![vec![signed]],
+            allow_empty_signatures: false,
+            ..Default::default()
+        },
+    )
+    .expect("sig + orphan lsig must simulate pre-v42");
+    assert_eq!(r.txn_groups[0].failure_message, None);
+
+    let unsigned = SignedTransaction {
+        txn,
+        lsig: Some(orphan),
+        ..Default::default()
+    };
+    let r = simulate(
+        &mut state,
+        SimulationRequest {
+            txn_groups: vec![vec![unsigned]],
+            allow_empty_signatures: true,
+            ..Default::default()
+        },
+    );
+    let msg = match r {
+        Ok(r) => r.txn_groups[0].failure_message.clone().unwrap_or_default(),
+        Err(e) => format!("{e:?}"),
+    };
+    assert!(msg.contains("no signature"), "unexpected: {msg}");
+    assert!(
+        !msg.contains("LogicSig fields without LogicSig program"),
+        "{msg}"
+    );
 }
 
 // ---------------------------------------------------------------------------

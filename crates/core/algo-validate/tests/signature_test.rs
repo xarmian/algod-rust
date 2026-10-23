@@ -807,3 +807,195 @@ fn verify_transaction_signature_with_tracer_fires_only_for_logicsig_member() {
          approving), and nothing for member 1 (plain-signed, no LogicSig program)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #2041 (FIND-ba9c86e5-05): LogicSig.Blank() parity + orphan-LogicSig
+// rejection now that decode no longer requires `l`.
+// ---------------------------------------------------------------------------
+
+fn orphan_lsig_txn(lsig: LogicSig) -> SignedTransaction {
+    SignedTransaction {
+        txn: Transaction {
+            txn_type: "pay".into(),
+            sender: Address([0x30; 32]),
+            fee: 1_000,
+            first_valid: Round(1),
+            last_valid: Round(100),
+            receiver: Address([0x40; 32]),
+            amount: 0,
+            ..Default::default()
+        },
+        lsig: Some(lsig),
+        ..Default::default()
+    }
+}
+
+fn v42() -> ConsensusParams {
+    let c =
+        algo_types::consensus::consensus_params_for_version(algo_types::consensus::CONSENSUS_V42)
+            .expect("v42 must be a known protocol version");
+    assert_ne!(c.per_byte_txn_surcharge, 0);
+    c
+}
+
+/// go `LogicSig.Blank()` includes `PQsig.Blank()`: a programless LogicSig
+/// carrying only a non-blank PQ envelope is orphan content.
+#[test]
+fn group_size_check_rejects_programless_lsig_with_only_pqsig() {
+    let lsig = LogicSig {
+        pqsig: Some(algo_types::pq::PQSig {
+            scheme: algo_types::pq::PQ_SCHEME_FALCON1024,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let group = vec![orphan_lsig_txn(lsig)];
+    let err = algo_validate::signature::logic_sig_group_size_check(&group, &v42())
+        .expect_err("pqsig-only programless LogicSig is orphan content");
+    assert!(
+        err.to_string()
+            .contains("LogicSig fields without LogicSig program"),
+        "{err}"
+    );
+}
+
+/// go `Blank()` uses `len(Args) == 0`: an explicit empty arg list (and a
+/// blank PQ envelope) is still a blank LogicSig, not orphan content.
+#[test]
+fn group_size_check_accepts_blank_lsig_with_empty_args_list() {
+    let lsig = LogicSig {
+        args: Some(Vec::new()),
+        pqsig: Some(algo_types::pq::PQSig::default()),
+        ..Default::default()
+    };
+    let group = vec![orphan_lsig_txn(lsig)];
+    assert!(algo_validate::signature::logic_sig_group_size_check(&group, &v42()).is_ok());
+}
+
+/// A LogicSig wire map without `l` decodes (go's `UnmarshalMsgWithState` has
+/// no required-`l` check) and is then rejected on every validation path:
+/// block group check (size pricing), and the per-transaction signature
+/// check used by block validation (pre-pricing) and pool/gossip admission.
+#[test]
+fn decoded_lsig_without_l_is_rejected_by_group_and_signature_checks() {
+    // {"arg": [bin(7)]}
+    let wire: Vec<u8> = vec![0x81, 0xa3, b'a', b'r', b'g', 0x91, 0xc4, 0x01, 0x07];
+    let lsig = LogicSig::decode_from_bytes(&wire).expect("missing l must decode");
+    let group = vec![orphan_lsig_txn(lsig)];
+
+    // Block validation, size pricing enabled.
+    let err = algo_validate::signature::logic_sig_group_size_check(&group, &v42())
+        .expect_err("orphan args must be rejected under size pricing");
+    assert!(
+        err.to_string()
+            .contains("LogicSig fields without LogicSig program"),
+        "{err}"
+    );
+
+    // Pre-pricing consensus: the per-transaction signature check rejects a
+    // programless LogicSig.
+    let v41 =
+        algo_types::consensus::consensus_params_for_version(algo_types::consensus::CONSENSUS_V41)
+            .unwrap();
+    let mut budget = GroupBudget::for_logicsig(1);
+    assert!(verify_transaction_signature(&group[0], &group, 0, &mut budget, &v41).is_err());
+
+    // Pool/gossip admission.
+    let cache = algo_validate::VerifiedTransactionCache::new(10);
+    let ctx = algo_validate::VerificationContext {
+        spec_addrs: Default::default(),
+        consensus_version: algo_types::consensus::CONSENSUS_V42.to_string(),
+    };
+    let err = algo_validate::verify_transaction_group_cached(&group, &ctx, &v42(), &cache)
+        .expect_err("pool admission must reject an orphan LogicSig");
+    assert!(err.to_string().contains("no signature"), "{err}");
+}
+
+/// go's `checkTxnSigTypeCounts` counts `Lsig.HasProgram()`, not a merely
+/// present LogicSig: a valid `sig` plus an orphan/blank LogicSig is ONE
+/// signature category and passes the per-txn signature check (pre-size-
+/// pricing); under size pricing the group check rejects the orphan content.
+#[test]
+fn sig_plus_orphan_lsig_counts_one_category_like_go() {
+    use ed25519_dalek::{Signer, SigningKey};
+    let key = SigningKey::from_bytes(&[0x21; 32]);
+    let sender = Address(key.verifying_key().to_bytes());
+    let txn = Transaction {
+        txn_type: "pay".into(),
+        sender,
+        fee: 1_000,
+        first_valid: Round(1),
+        last_valid: Round(100),
+        receiver: Address([0x40; 32]),
+        ..Default::default()
+    };
+    let mut msg = b"TX".to_vec();
+    msg.extend_from_slice(&algo_codec::canonical_encode_transaction(&txn));
+    let sig = key.sign(&msg).to_bytes();
+    let stx = SignedTransaction {
+        txn,
+        sig,
+        lsig: Some(LogicSig {
+            args: Some(vec![serde_bytes::ByteBuf::from(vec![7u8])]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let group = vec![stx];
+    let v41 =
+        algo_types::consensus::consensus_params_for_version(algo_types::consensus::CONSENSUS_V41)
+            .unwrap();
+    let mut budget = GroupBudget::for_logicsig(1);
+    verify_transaction_signature(&group[0], &group, 0, &mut budget, &v41)
+        .expect("sig + orphan lsig is one signature category in go");
+    assert!(algo_validate::signature::logic_sig_group_size_check(&group, &v42()).is_err());
+}
+
+/// go's LogicSig sanity check counts `!Msig.Blank()` / `!LMsig.Blank()`: a
+/// contract-account LogicSig carrying present-but-empty msig/lmsig envelopes
+/// (reachable via the serde/JSON path; strict wire decode rejects them) is a
+/// plain contract account, not an ambiguous or multisig-delegated one.
+#[test]
+fn logicsig_sanity_check_ignores_blank_msig_and_lmsig() {
+    let program = valid_program_of_size(200);
+    let mut stx = make_contract_account_txn(&program);
+    let blank = algo_types::MultisigSig::default();
+    {
+        let lsig = stx.lsig.as_mut().unwrap();
+        lsig.msig = Some(blank.clone());
+        lsig.lmsig = Some(blank);
+    }
+    let lsig = stx.lsig.clone().unwrap();
+    algo_validate::signature::logicsig_sanity_check(&stx, &lsig)
+        .expect("blank msig/lmsig must not count as delegation signatures");
+}
+
+/// A present-but-blank multisig envelope inside a LogicSig is blank (go
+/// `Msig.Blank()`), so it is not orphan content.
+#[test]
+fn group_size_check_treats_blank_multisig_envelope_as_blank() {
+    let blank_msig = algo_types::MultisigSig {
+        version: 0,
+        threshold: 0,
+        subsigs: Vec::new(),
+    };
+    let lsig = LogicSig {
+        msig: Some(blank_msig.clone()),
+        lmsig: Some(blank_msig),
+        ..Default::default()
+    };
+    let group = vec![orphan_lsig_txn(lsig)];
+    assert!(algo_validate::signature::logic_sig_group_size_check(&group, &v42()).is_ok());
+    let real = LogicSig {
+        msig: Some(algo_types::MultisigSig {
+            version: 1,
+            threshold: 1,
+            subsigs: Vec::new(),
+        }),
+        ..Default::default()
+    };
+    assert!(
+        algo_validate::signature::logic_sig_group_size_check(&[orphan_lsig_txn(real)], &v42())
+            .is_err()
+    );
+}

@@ -3401,6 +3401,70 @@ mod tests {
         assert_eq!(decoded.pqsig, Some(pqsig));
     }
 
+    /// Issue #2041: go's `LogicSig` is `omitempty`, so a programless LogicSig
+    /// must not carry an `l` key on either encoder, and the serde encoding
+    /// must carry exactly the same key/value set as the canonical encoder
+    /// (map key order is the only permitted difference).
+    #[test]
+    fn programless_logicsig_serde_matches_canonical_key_set() {
+        fn as_sorted_map(bytes: &[u8]) -> Vec<(String, rmpv::Value)> {
+            let v = rmpv::decode::read_value(&mut &bytes[..]).expect("decode value");
+            let mut m: Vec<(String, rmpv::Value)> = v
+                .as_map()
+                .expect("map")
+                .iter()
+                .map(|(k, v)| (k.as_str().expect("str key").to_string(), v.clone()))
+                .collect();
+            m.sort_by(|a, b| a.0.cmp(&b.0));
+            m
+        }
+        let programless = [
+            LogicSig {
+                args: Some(vec![serde_bytes::ByteBuf::from(vec![7u8])]),
+                ..LogicSig::default()
+            },
+            LogicSig {
+                pqsig: Some(PQSig {
+                    scheme: *b"f1",
+                    salt: algo_types::PQAddressSalt(1),
+                    public_key: serde_bytes::ByteBuf::from(vec![0x03; 8]),
+                    signature: serde_bytes::ByteBuf::new(),
+                }),
+                ..LogicSig::default()
+            },
+            LogicSig::default(),
+        ];
+        for lsig in &programless {
+            let serde_bytes = rmp_serde::to_vec_named(lsig).expect("serde encode");
+            let canon = canonical_encode_logicsig(lsig);
+            let (s, c) = (as_sorted_map(&serde_bytes), as_sorted_map(&canon));
+            assert!(s.iter().all(|(k, _)| k != "l"), "serde emitted l: {s:?}");
+            assert!(c.iter().all(|(k, _)| k != "l"), "canonical emitted l");
+            // Same top-level key set. (The serde representation of nested
+            // `pqsig.sch` is a pre-existing, unrelated array-vs-bin
+            // difference, so nested pqsig values are not compared.)
+            let keys = |m: &[(String, rmpv::Value)]| -> Vec<String> {
+                m.iter().map(|(k, _)| k.clone()).collect()
+            };
+            assert_eq!(keys(&s), keys(&c), "serde vs canonical top-level keys");
+            for ((k, sv), (_, cv)) in s.iter().zip(c.iter()) {
+                if k != "pqsig" {
+                    assert_eq!(sv, cv, "value of {k}");
+                }
+            }
+        }
+        // A non-empty program is unchanged: `l` present on both encoders.
+        let with_prog = LogicSig {
+            logic: serde_bytes::ByteBuf::from(vec![0x06, 0x81, 0x01]),
+            args: Some(vec![serde_bytes::ByteBuf::from(vec![1u8])]),
+            ..LogicSig::default()
+        };
+        let s = as_sorted_map(&rmp_serde::to_vec_named(&with_prog).unwrap());
+        let c = as_sorted_map(&canonical_encode_logicsig(&with_prog));
+        assert!(s.iter().any(|(k, _)| k == "l"));
+        assert_eq!(s, c, "non-empty program encodings must be unchanged");
+    }
+
     // ── Randomized round-trip: state-proof wire types (issue #956) ─────────
     //
     // Mirrors go-algorand's `TestRandomizedEncodingReveal`,

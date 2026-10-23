@@ -1296,7 +1296,7 @@ fn populate_method_call_txn_args(
             ));
         }
         let stxn = stxns.into_iter().next().expect("checked len == 1");
-        if stxn.sig != [0u8; 64] || stxn.msig.is_some() {
+        if stxn.sig != [0u8; 64] || stxn.msig.as_ref().is_some_and(|m| !m.blank()) {
             return Err(format!("Transaction from {path} has already been signed"));
         }
         if stxn.txn.group != [0u8; 32] {
