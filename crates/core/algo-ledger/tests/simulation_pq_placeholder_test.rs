@@ -84,7 +84,10 @@ fn make_pay_txn(sender: Address, receiver: Address) -> Transaction {
         txn_type: "pay".into(),
         sender,
         receiver,
-        fee: 1000,
+        // 1.0 base fee factor + 2.0 Falcon-1024 surcharge: go's
+        // `CheckGroupFees` (issue #2040) requires 3 * MinTxnFee even for
+        // placeholder PQ sigs (`PQSig.Blank()` is false once a scheme is set).
+        fee: 3000,
         first_valid: 0.into(),
         last_valid: 1000.into(),
         ..Default::default()
@@ -327,4 +330,43 @@ fn non_placeholder_pqsig_with_wrong_authorizer_is_not_silently_proxy_signed() {
         result.is_err(),
         "a non-placeholder (non-empty-signature) pqsig must not be silently proxy-signed"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Group fee check includes the PQ signature surcharge (issue #2040)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pqsig_with_flat_min_fee_fails_check_group_fees() {
+    // go's `eval.CheckGroupFees` over `SummarizeFees`: a Falcon-1024 signed
+    // top-level transaction owes `signatureFeeContribution` (2.0 fee
+    // factors) on top of its own 1.0, so a flat MinTxnFee of 1000 is short.
+    let sender = Address([0xAA; 32]);
+    let receiver = Address([0xBB; 32]);
+    let mut state = setup_state(sender);
+
+    let mut txn = make_pay_txn(sender, receiver);
+    txn.fee = 1000;
+    let stx = SignedTransaction {
+        txn,
+        pqsig: Some(PQSig {
+            scheme: PQ_SCHEME_FALCON1024,
+            salt: PQAddressSalt(0),
+            public_key: ByteBuf::new(),
+            signature: ByteBuf::new(),
+        }),
+        ..Default::default()
+    };
+    let request = SimulationRequest {
+        txn_groups: vec![vec![stx]],
+        allow_empty_signatures: true,
+        ..Default::default()
+    };
+    match simulate(&mut state, request) {
+        Err(SimulatorError::InvalidRequest(e)) => assert_eq!(
+            e.message,
+            "txgroup with 1mA fees is less than 3mA (usage=3.000000 * base=1mA)"
+        ),
+        other => panic!("expected InvalidRequest fee error, got {other:?}"),
+    }
 }

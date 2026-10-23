@@ -718,8 +718,7 @@ fn simulation_group_pooled_fees_cover_underpaid_transaction() {
 
 /// Two-transaction group whose pooled total is still short of
 /// `MinTxnFee * count`: `check()` must reject it with go-algorand's exact
-/// error format (`txgroup had %d in fees, which is less than the minimum
-/// %d * %d`, `txn.go:262`), proving the group-level check aggregates across
+/// error format (`eval.CheckGroupFees`, `ledger/eval/eval.go:1026`), proving the group-level check aggregates across
 /// multiple transactions rather than only catching a single zero-fee
 /// transaction. Issue #213.
 #[test]
@@ -758,8 +757,52 @@ fn simulation_group_pooled_fees_reject_insufficient_total() {
     match simulator.simulate(request) {
         Err(SimulatorError::InvalidRequest(e)) => {
             assert_eq!(
-                e.message, "txgroup had 1000 in fees, which is less than the minimum 2 * 1000",
-                "error message must match go-algorand's verify.TxnGroup format byte-for-byte"
+                e.message, "txgroup with 1mA fees is less than 2mA (usage=2.000000 * base=1mA)",
+                "error message must match go-algorand's eval.CheckGroupFees format byte-for-byte"
+            );
+        }
+        other => panic!("expected InvalidRequest fee error, got {other:?}"),
+    }
+}
+
+/// v42 size pricing: a payment with a 4000-byte note pays more than the flat
+/// MinTxnFee, so `check()` must reject fee 1000 via go's
+/// `eval.CheckGroupFees` (issue #2040, FIND-ba9c86e5-04).
+#[test]
+fn simulation_check_rejects_v42_big_note_underpaid_fee() {
+    let sender = Address([0xAA; 32]);
+    let receiver = Address([0x20; 32]);
+    let fee_sink = Address([0xFE; 32]);
+
+    let mut state = LedgerState::new();
+    state.fee_sink = fee_sink;
+    state.protocol = algo_types::consensus::CONSENSUS_V42.to_string();
+    for addr in [sender, fee_sink] {
+        state.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+    }
+
+    let mut txn = pay_txn(sender, receiver);
+    txn.txn.note = vec![7u8; 4000].into();
+    assert_eq!(txn.txn.fee, 1000);
+
+    let request = SimulationRequest {
+        txn_groups: vec![vec![txn]],
+        allow_empty_signatures: true,
+        ..Default::default()
+    };
+    let mut simulator = Simulator::new(&mut state);
+    match simulator.simulate(request) {
+        Err(SimulatorError::InvalidRequest(e)) => {
+            assert!(
+                e.message.starts_with("txgroup with 1mA fees is less than "),
+                "unexpected message: {}",
+                e.message
             );
         }
         other => panic!("expected InvalidRequest fee error, got {other:?}"),

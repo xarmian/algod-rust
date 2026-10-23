@@ -56,7 +56,7 @@ use algo_error::AlgoError;
 use algo_types::consensus::{consensus_params_for_version, ConsensusParams};
 use algo_types::{Address, Round, SignedTransaction};
 use algo_validate::{
-    check_txn_group, is_free_heartbeat, validate_pqsig_envelope, validate_pqsig_scheme,
+    check_txn_group, validate_pqsig_envelope, validate_pqsig_scheme,
     validate_transaction_wellformed, verify_transaction_signature_with_tracer, SpecialAddresses,
 };
 use ed25519_dalek::{Signer, SigningKey};
@@ -1156,42 +1156,18 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             })
         })?;
 
-        // Group-level fee validation (matches go-algorand's verify.TxnGroup,
-        // txn.go): the submitted group is a single fee pool — total fees must
-        // cover MinTxnFee for each non-exempt transaction. State proofs and
-        // ungrouped heartbeats are exempt. Without this, an underpaid group
-        // would only fail later during apply rather than as a clean check()
-        // error (this is the check() phase, before evaluation).
-        let mut fees_paid: u64 = 0;
-        let mut min_fee_count: u64 = 0;
-        for stx in &verify_group {
-            fees_paid = fees_paid.saturating_add(stx.txn.fee);
-            // State proofs are always free.
-            if stx.txn.txn_type == "stpf" {
-                continue;
-            }
-            // Ungrouped heartbeats are free when heartbeats are enabled.
-            if is_free_heartbeat(&stx.txn, consensus) {
-                continue;
-            }
-            min_fee_count += 1;
-        }
-        let fee_needed = consensus
-            .min_txn_fee
-            .checked_mul(min_fee_count)
-            .ok_or_else(|| {
-                SimulatorError::InvalidRequest(InvalidRequestError {
-                    message: "txgroup fee overflow".to_string(),
-                })
-            })?;
-        if fees_paid < fee_needed {
-            return Err(SimulatorError::InvalidRequest(InvalidRequestError {
-                message: format!(
-                    "txgroup had {fees_paid} in fees, which is less than the minimum {min_fee_count} * {}",
-                    consensus.min_txn_fee
-                ),
-            }));
-        }
+        // Group-level fee validation: go-algorand's simulator runs the
+        // submitted group through `eval.TransactionGroup`, which calls
+        // `transactions.SummarizeFees` + `eval.CheckGroupFees`
+        // (`ledger/eval/eval.go:1183`). The submitted group is a single fee
+        // pool whose required fee is `FeeForUsage(MinTxnFee, usage)`, where
+        // usage includes v42+ note/app-arg/program size surcharges, LogicSig
+        // program-byte surcharges and PQ signature surcharges; state proofs
+        // and discounted heartbeats contribute zero. Top-level only: inner
+        // fees are checked during AVM execution (issue #2040).
+        let fee_group: Vec<&SignedTransaction> = txn_group.iter().collect();
+        algo_validate::fee::check_submitted_group_fees(&fee_group, consensus)
+            .map_err(|message| SimulatorError::InvalidRequest(InvalidRequestError { message }))?;
 
         // Pass 2: verify signatures on the (possibly proxy-signed) group.
         // When tracing is enabled, capture each LogicSig program's opcode trace
