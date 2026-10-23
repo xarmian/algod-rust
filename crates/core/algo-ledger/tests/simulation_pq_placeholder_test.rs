@@ -79,12 +79,18 @@ fn dummy_pq_identity(fill_byte: u8) -> (Vec<u8>, PQAddressSalt, Address) {
     (pk, salt, addr)
 }
 
-fn make_pay_txn(sender: Address, receiver: Address) -> Transaction {
+/// Fee for a Falcon-1024 (placeholder or real) signed payment: 1.0 base fee
+/// factor + 2.0 Falcon-1024 surcharge. go's `eval.CheckGroupFees` (issue
+/// #2040) requires 3 * MinTxnFee even for placeholder PQ sigs
+/// (`PQSig.Blank()` is false once a scheme is set).
+const FALCON_PAY_FEE: u64 = 3000;
+
+fn make_pay_txn(sender: Address, receiver: Address, fee: u64) -> Transaction {
     Transaction {
         txn_type: "pay".into(),
         sender,
         receiver,
-        fee: 1000,
+        fee,
         first_valid: 0.into(),
         last_valid: 1000.into(),
         ..Default::default()
@@ -112,7 +118,7 @@ fn scheme_only_placeholder_pqsig_accepted() {
     let mut state = setup_state(sender);
 
     let stx = SignedTransaction {
-        txn: make_pay_txn(sender, receiver),
+        txn: make_pay_txn(sender, receiver, FALCON_PAY_FEE),
         pqsig: Some(PQSig {
             scheme: PQ_SCHEME_FALCON1024,
             salt: PQAddressSalt(0),
@@ -147,7 +153,7 @@ fn full_placeholder_pqsig_matching_authorizer_accepted() {
     let mut state = setup_state(addr);
 
     let stx = SignedTransaction {
-        txn: make_pay_txn(addr, receiver),
+        txn: make_pay_txn(addr, receiver, FALCON_PAY_FEE),
         pqsig: Some(PQSig {
             scheme: PQ_SCHEME_FALCON1024,
             salt,
@@ -183,7 +189,7 @@ fn full_placeholder_pqsig_mismatched_authorizer_rejected() {
     let mut state = setup_state(sender);
 
     let stx = SignedTransaction {
-        txn: make_pay_txn(sender, receiver),
+        txn: make_pay_txn(sender, receiver, FALCON_PAY_FEE),
         pqsig: Some(PQSig {
             scheme: PQ_SCHEME_FALCON1024,
             salt,
@@ -224,7 +230,7 @@ fn delegated_placeholder_pqsig_matching_authorizer_accepted() {
     let program = vec![0x06, 0x81, 0x01, 0x43];
 
     let stx = SignedTransaction {
-        txn: make_pay_txn(addr, receiver),
+        txn: make_pay_txn(addr, receiver, FALCON_PAY_FEE),
         lsig: Some(LogicSig {
             logic: ByteBuf::from(program),
             pqsig: Some(PQSig {
@@ -263,7 +269,7 @@ fn delegated_placeholder_pqsig_mismatched_authorizer_rejected() {
     let program = vec![0x06, 0x81, 0x01, 0x43];
 
     let stx = SignedTransaction {
-        txn: make_pay_txn(sender, receiver),
+        txn: make_pay_txn(sender, receiver, FALCON_PAY_FEE),
         lsig: Some(LogicSig {
             logic: ByteBuf::from(program),
             pqsig: Some(PQSig {
@@ -306,7 +312,7 @@ fn non_placeholder_pqsig_with_wrong_authorizer_is_not_silently_proxy_signed() {
     let mut state = setup_state(sender);
 
     let stx = SignedTransaction {
-        txn: make_pay_txn(sender, receiver),
+        txn: make_pay_txn(sender, receiver, FALCON_PAY_FEE),
         pqsig: Some(PQSig {
             scheme: PQ_SCHEME_FALCON1024,
             salt,
@@ -326,5 +332,87 @@ fn non_placeholder_pqsig_with_wrong_authorizer_is_not_silently_proxy_signed() {
     assert!(
         result.is_err(),
         "a non-placeholder (non-empty-signature) pqsig must not be silently proxy-signed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Group fee check includes the PQ signature surcharge (issue #2040)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pqsig_with_flat_min_fee_fails_check_group_fees() {
+    // The fee check MUST use the original submitted group: in `check()` the
+    // placeholder PQSig is stripped (`pqsig = None`) and replaced by a proxy
+    // Ed25519 signature, so a fee check over the post-swap group would see a
+    // plain payment and accept fee 1000. This test fails if that regresses.
+    //
+    // go's `eval.CheckGroupFees` over `SummarizeFees`: a Falcon-1024 signed
+    // top-level transaction owes `signatureFeeContribution` (2.0 fee
+    // factors) on top of its own 1.0, so a flat MinTxnFee of 1000 is short.
+    let sender = Address([0xAA; 32]);
+    let receiver = Address([0xBB; 32]);
+    let mut state = setup_state(sender);
+
+    let txn = make_pay_txn(sender, receiver, 1000);
+    let stx = SignedTransaction {
+        txn,
+        pqsig: Some(PQSig {
+            scheme: PQ_SCHEME_FALCON1024,
+            salt: PQAddressSalt(0),
+            public_key: ByteBuf::new(),
+            signature: ByteBuf::new(),
+        }),
+        ..Default::default()
+    };
+    let request = SimulationRequest {
+        txn_groups: vec![vec![stx]],
+        allow_empty_signatures: true,
+        ..Default::default()
+    };
+    // go reports this as an evaluation failure (`EvalFailureError`), i.e. a
+    // group `failure-message` with HTTP 200, not an `InvalidRequestError`.
+    let result = simulate(&mut state, request).expect("fee shortfall is not an invalid request");
+    let group = &result.txn_groups[0];
+    assert_eq!(
+        group.failure_message.as_deref(),
+        Some("txgroup with 1mA fees is less than 3mA (usage=3.000000 * base=1mA)")
+    );
+    assert_eq!(group.failed_at, Some(vec![0]));
+}
+
+#[test]
+fn delegated_placeholder_pqsig_with_flat_min_fee_fails_check_group_fees() {
+    // Same rule for the delegated (LogicSig-nested) placeholder: `check()`
+    // strips `lsig.pqsig` and authorizes via the program hash, but go's
+    // `evaluate` (and `SummarizeFees`/`signatureFeeContribution`, which reads
+    // `Lsig.PQsig`) runs on the ORIGINAL submitted group, so the Falcon
+    // surcharge (2.0) is still owed on top of the base 1.0.
+    let (pk, salt, addr) = dummy_pq_identity(0x55);
+    let receiver = Address([0xBB; 32]);
+    let mut state = setup_state(addr);
+
+    let stx = SignedTransaction {
+        txn: make_pay_txn(addr, receiver, 1000),
+        lsig: Some(LogicSig {
+            logic: ByteBuf::from(vec![0x06, 0x81, 0x01, 0x43]),
+            pqsig: Some(PQSig {
+                scheme: PQ_SCHEME_FALCON1024,
+                salt,
+                public_key: ByteBuf::from(pk),
+                signature: ByteBuf::new(),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let request = SimulationRequest {
+        txn_groups: vec![vec![stx]],
+        allow_empty_signatures: true,
+        ..Default::default()
+    };
+    let result = simulate(&mut state, request).expect("fee shortfall is not an invalid request");
+    assert_eq!(
+        result.txn_groups[0].failure_message.as_deref(),
+        Some("txgroup with 1mA fees is less than 3mA (usage=3.000000 * base=1mA)")
     );
 }

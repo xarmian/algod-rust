@@ -439,7 +439,7 @@ pub fn format_micros(micros: u64) -> String {
 }
 
 /// go's `eval.CheckGroupFees` applied to a submitted group
-/// (`ledger/eval/eval.go:1007`): the group's top-level fees must cover its
+/// (`ledger/eval/eval.go:1004`): the group's top-level fees must cover its
 /// summed usage at the minimum fee. The error text is go's
 /// `ledgercore.TxGroupMalformedError` message.
 pub fn check_submitted_group_fees(

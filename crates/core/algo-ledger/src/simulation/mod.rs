@@ -56,7 +56,7 @@ use algo_error::AlgoError;
 use algo_types::consensus::{consensus_params_for_version, ConsensusParams};
 use algo_types::{Address, Round, SignedTransaction};
 use algo_validate::{
-    check_txn_group, is_free_heartbeat, validate_pqsig_envelope, validate_pqsig_scheme,
+    check_txn_group, validate_pqsig_envelope, validate_pqsig_scheme,
     validate_transaction_wellformed, verify_transaction_signature_with_tracer, SpecialAddresses,
 };
 use ed25519_dalek::{Signer, SigningKey};
@@ -848,6 +848,41 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             }
         }
 
+        // Group-level fee validation, mirroring go-algorand's ordering and
+        // error surface. `eval.TransactionGroup` evaluates every transaction
+        // first and only then runs `transactions.SummarizeFees` +
+        // `eval.CheckGroupFees` (`ledger/eval/eval.go:1182-1183`;
+        // `CheckGroupFees` is defined at `eval.go:1004`). So:
+        //   * a signature / LogicSig failure from `check()` (a recoverable
+        //     `precheck_failure`) and any per-transaction evaluation failure
+        //     both take precedence over the fee error;
+        //   * the fee error is an `EvalFailureError` in go
+        //     (`simulator.go:266`), i.e. NOT an `InvalidRequest` (HTTP 400):
+        //     it surfaces as the group's `failure-message` with the
+        //     transactions' results populated, and `failed-at` is the cursor
+        //     the tracer's `AfterTxnGroup` -> `handleError` sees, i.e. the
+        //     last top-level transaction (`tracer.go:181`).
+        //
+        // The submitted group is a single fee pool whose required fee is
+        // `FeeForUsage(MinTxnFee, usage)`, where usage includes v42+
+        // note/app-arg/program size surcharges, LogicSig program-byte
+        // surcharges and PQ signature surcharges; state proofs and discounted
+        // heartbeats contribute zero. Top-level only: inner fees are checked
+        // during AVM execution (issue #2040).
+        //
+        // MUST use the original `txn_group`, NOT `verify_group`/`eval_group`:
+        // `check()` strips placeholder PQSigs (`pqsig = None`, replaced by a
+        // proxy Ed25519 signature or an escrow-style LogicSig) in
+        // `verify_group`, which would silently drop the Falcon surcharge from
+        // the required fee. go's `evaluate` likewise runs on the original
+        // group, not the signature-verification copy (`simulator.go:343`).
+        if failure_message.is_none() {
+            if let Some(message) = group_fee_failure(txn_group, &apply_ctx.consensus) {
+                failure_message = Some(message);
+                failed_at = Some(vec![txn_group.len() - 1]);
+            }
+        }
+
         // Full (public-key-set) PQ placeholders need the final `auth_addr`
         // after `fix_signers` has run through evaluation: `check()`'s
         // placeholder validation used a possibly-not-final `auth_addr` (or
@@ -1156,43 +1191,6 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             })
         })?;
 
-        // Group-level fee validation (matches go-algorand's verify.TxnGroup,
-        // txn.go): the submitted group is a single fee pool — total fees must
-        // cover MinTxnFee for each non-exempt transaction. State proofs and
-        // ungrouped heartbeats are exempt. Without this, an underpaid group
-        // would only fail later during apply rather than as a clean check()
-        // error (this is the check() phase, before evaluation).
-        let mut fees_paid: u64 = 0;
-        let mut min_fee_count: u64 = 0;
-        for stx in &verify_group {
-            fees_paid = fees_paid.saturating_add(stx.txn.fee);
-            // State proofs are always free.
-            if stx.txn.txn_type == "stpf" {
-                continue;
-            }
-            // Ungrouped heartbeats are free when heartbeats are enabled.
-            if is_free_heartbeat(&stx.txn, consensus) {
-                continue;
-            }
-            min_fee_count += 1;
-        }
-        let fee_needed = consensus
-            .min_txn_fee
-            .checked_mul(min_fee_count)
-            .ok_or_else(|| {
-                SimulatorError::InvalidRequest(InvalidRequestError {
-                    message: "txgroup fee overflow".to_string(),
-                })
-            })?;
-        if fees_paid < fee_needed {
-            return Err(SimulatorError::InvalidRequest(InvalidRequestError {
-                message: format!(
-                    "txgroup had {fees_paid} in fees, which is less than the minimum {min_fee_count} * {}",
-                    consensus.min_txn_fee
-                ),
-            }));
-        }
-
         // Pass 2: verify signatures on the (possibly proxy-signed) group.
         // When tracing is enabled, capture each LogicSig program's opcode trace
         // here — the LogicSig runs during signature verification, before the
@@ -1316,6 +1314,18 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             logicsig_budgets,
         })
     }
+}
+
+/// go's `transactions.SummarizeFees` + `eval.CheckGroupFees` over the
+/// submitted (original, pre-proxy-signing) top-level group: `Some(message)`
+/// when the group underpays. See the call site in `simulate` for the
+/// ordering and error-surface rationale (issue #2040).
+fn group_fee_failure(
+    txn_group: &[SignedTransaction],
+    consensus: &ConsensusParams,
+) -> Option<String> {
+    let fee_group: Vec<&SignedTransaction> = txn_group.iter().collect();
+    algo_validate::fee::check_submitted_group_fees(&fee_group, consensus).err()
 }
 
 /// Whether a signed transaction carries no signature of any kind
@@ -1651,6 +1661,100 @@ mod tests {
     // `LogicSig.Blank()` (and this crate's analogous `lsig.is_some()` gate)
     // treats the LogicSig as a present signature category, independent of
     // which specific field is set.
+
+    // ── group_fee_failure: free transactions (issue #2040) ──────────────
+    //
+    // A real heartbeat cannot be evaluated to success in a bare ledger (it
+    // answers no live challenge), so end-to-end simulate() tests would stop
+    // at the evaluation failure before the fee check. These call the exact
+    // function `simulate()` runs after evaluation, so the fee path is
+    // genuinely exercised. The removed `is_free_heartbeat`/`stpf` exemption
+    // loop is subsumed by `txn_fee_factor` (go's `FeeFactor`).
+
+    fn params(version: &str) -> ConsensusParams {
+        consensus_params_for_version(version).expect("known consensus version")
+    }
+
+    fn hb_stx(discount: bool, group: [u8; 32], fee: u64) -> SignedTransaction {
+        SignedTransaction {
+            txn: algo_types::Transaction {
+                txn_type: "hb".into(),
+                sender: Address([0xAA; 32]),
+                fee,
+                group,
+                heartbeat: Some(algo_types::HeartbeatTxnFields {
+                    hb_challenge_discount: discount,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn pay_stx(fee: u64, group: [u8; 32]) -> SignedTransaction {
+        SignedTransaction {
+            txn: algo_types::Transaction {
+                txn_type: "pay".into(),
+                sender: Address([0xBB; 32]),
+                fee,
+                group,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    const NO_FEE_MSG: &str = "txgroup with 0.0A fees is less than 1mA (usage=1.000000 * base=1mA)";
+
+    #[test]
+    fn group_fee_failure_free_ungrouped_heartbeat_pre_v42() {
+        let p = params(algo_types::consensus::CONSENSUS_V41);
+        assert_eq!(group_fee_failure(&[hb_stx(false, [0; 32], 0)], &p), None);
+    }
+
+    #[test]
+    fn group_fee_failure_discounted_heartbeat_v42_free_and_control_pays() {
+        let p = params(algo_types::consensus::CONSENSUS_V42);
+        assert_eq!(group_fee_failure(&[hb_stx(true, [0; 32], 0)], &p), None);
+        // Control: the identical heartbeat without the discount owes a fee.
+        assert_eq!(
+            group_fee_failure(&[hb_stx(false, [0; 32], 0)], &p).as_deref(),
+            Some(NO_FEE_MSG)
+        );
+    }
+
+    #[test]
+    fn group_fee_failure_mixed_group_with_free_heartbeat_v42() {
+        let p = params(algo_types::consensus::CONSENSUS_V42);
+        let gid = [0x77; 32];
+        // The discounted heartbeat adds no usage; the payment's 1000 covers
+        // its own single unit.
+        assert_eq!(
+            group_fee_failure(&[hb_stx(true, gid, 0), pay_stx(1000, gid)], &p),
+            None
+        );
+        // Control: same group, payment underpaid by 1 microAlgo.
+        assert_eq!(
+            group_fee_failure(&[hb_stx(true, gid, 0), pay_stx(999, gid)], &p).as_deref(),
+            Some("txgroup with 999uA fees is less than 1mA (usage=1.000000 * base=1mA)")
+        );
+    }
+
+    #[test]
+    fn group_fee_failure_state_proof_contributes_no_usage() {
+        // (simulate() itself rejects stpf in check(), matching go; this pins
+        // that the fee summary alone would also treat it as free.)
+        let p = params(algo_types::consensus::CONSENSUS_V41);
+        let gid = [0x55; 32];
+        let mut stpf = pay_stx(0, gid);
+        stpf.txn.txn_type = "stpf".into();
+        assert_eq!(
+            group_fee_failure(&[stpf.clone(), pay_stx(1000, gid)], &p),
+            None
+        );
+        assert_eq!(group_fee_failure(&[stpf], &p), None);
+    }
 
     #[test]
     fn txn_has_no_signature_true_for_fully_blank_txn() {
