@@ -369,11 +369,50 @@ fn pqsig_with_flat_min_fee_fails_check_group_fees() {
         allow_empty_signatures: true,
         ..Default::default()
     };
-    match simulate(&mut state, request) {
-        Err(SimulatorError::InvalidRequest(e)) => assert_eq!(
-            e.message,
-            "txgroup with 1mA fees is less than 3mA (usage=3.000000 * base=1mA)"
-        ),
-        other => panic!("expected InvalidRequest fee error, got {other:?}"),
-    }
+    // go reports this as an evaluation failure (`EvalFailureError`), i.e. a
+    // group `failure-message` with HTTP 200, not an `InvalidRequestError`.
+    let result = simulate(&mut state, request).expect("fee shortfall is not an invalid request");
+    let group = &result.txn_groups[0];
+    assert_eq!(
+        group.failure_message.as_deref(),
+        Some("txgroup with 1mA fees is less than 3mA (usage=3.000000 * base=1mA)")
+    );
+    assert_eq!(group.failed_at, Some(vec![0]));
+}
+
+#[test]
+fn delegated_placeholder_pqsig_with_flat_min_fee_fails_check_group_fees() {
+    // Same rule for the delegated (LogicSig-nested) placeholder: `check()`
+    // strips `lsig.pqsig` and authorizes via the program hash, but go's
+    // `evaluate` (and `SummarizeFees`/`signatureFeeContribution`, which reads
+    // `Lsig.PQsig`) runs on the ORIGINAL submitted group, so the Falcon
+    // surcharge (2.0) is still owed on top of the base 1.0.
+    let (pk, salt, addr) = dummy_pq_identity(0x55);
+    let receiver = Address([0xBB; 32]);
+    let mut state = setup_state(addr);
+
+    let stx = SignedTransaction {
+        txn: make_pay_txn(addr, receiver, 1000),
+        lsig: Some(LogicSig {
+            logic: ByteBuf::from(vec![0x06, 0x81, 0x01, 0x43]),
+            pqsig: Some(PQSig {
+                scheme: PQ_SCHEME_FALCON1024,
+                salt,
+                public_key: ByteBuf::from(pk),
+                signature: ByteBuf::new(),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let request = SimulationRequest {
+        txn_groups: vec![vec![stx]],
+        allow_empty_signatures: true,
+        ..Default::default()
+    };
+    let result = simulate(&mut state, request).expect("fee shortfall is not an invalid request");
+    assert_eq!(
+        result.txn_groups[0].failure_message.as_deref(),
+        Some("txgroup with 1mA fees is less than 3mA (usage=3.000000 * base=1mA)")
+    );
 }

@@ -848,6 +848,44 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             }
         }
 
+        // Group-level fee validation, mirroring go-algorand's ordering and
+        // error surface. `eval.TransactionGroup` evaluates every transaction
+        // first and only then runs `transactions.SummarizeFees` +
+        // `eval.CheckGroupFees` (`ledger/eval/eval.go:1182-1183`;
+        // `CheckGroupFees` is defined at `eval.go:1004`). So:
+        //   * a signature / LogicSig failure from `check()` (a recoverable
+        //     `precheck_failure`) and any per-transaction evaluation failure
+        //     both take precedence over the fee error;
+        //   * the fee error is an `EvalFailureError` in go
+        //     (`simulator.go:266`), i.e. NOT an `InvalidRequest` (HTTP 400):
+        //     it surfaces as the group's `failure-message` with the
+        //     transactions' results populated, and `failed-at` is the cursor
+        //     the tracer's `AfterTxnGroup` -> `handleError` sees, i.e. the
+        //     last top-level transaction (`tracer.go:181`).
+        //
+        // The submitted group is a single fee pool whose required fee is
+        // `FeeForUsage(MinTxnFee, usage)`, where usage includes v42+
+        // note/app-arg/program size surcharges, LogicSig program-byte
+        // surcharges and PQ signature surcharges; state proofs and discounted
+        // heartbeats contribute zero. Top-level only: inner fees are checked
+        // during AVM execution (issue #2040).
+        //
+        // MUST use the original `txn_group`, NOT `verify_group`/`eval_group`:
+        // `check()` strips placeholder PQSigs (`pqsig = None`, replaced by a
+        // proxy Ed25519 signature or an escrow-style LogicSig) in
+        // `verify_group`, which would silently drop the Falcon surcharge from
+        // the required fee. go's `evaluate` likewise runs on the original
+        // group, not the signature-verification copy (`simulator.go:343`).
+        if failure_message.is_none() {
+            let fee_group: Vec<&SignedTransaction> = txn_group.iter().collect();
+            if let Err(message) =
+                algo_validate::fee::check_submitted_group_fees(&fee_group, &apply_ctx.consensus)
+            {
+                failure_message = Some(message);
+                failed_at = Some(vec![txn_group.len() - 1]);
+            }
+        }
+
         // Full (public-key-set) PQ placeholders need the final `auth_addr`
         // after `fix_signers` has run through evaluation: `check()`'s
         // placeholder validation used a possibly-not-final `auth_addr` (or
@@ -1273,30 +1311,6 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 }));
             }
         }
-
-        // Group-level fee validation. go-algorand's simulator runs
-        // `verify.TxnGroupWithTracer` (signatures) in `check()` first and only
-        // then `eval.TransactionGroup`, which calls `transactions.SummarizeFees`
-        // + `eval.CheckGroupFees` (`ledger/eval/eval.go:1182-1183`;
-        // `CheckGroupFees` is defined at `eval.go:1004`). So an underpaid group
-        // with a bad signature reports the signature error, and a recoverable
-        // per-transaction signature failure (returned above) never reaches the
-        // fee check -- hence it runs only after every signature has verified.
-        //
-        // The submitted group is a single fee pool whose required fee is
-        // `FeeForUsage(MinTxnFee, usage)`, where usage includes v42+
-        // note/app-arg/program size surcharges, LogicSig program-byte
-        // surcharges and PQ signature surcharges; state proofs and discounted
-        // heartbeats contribute zero. Top-level only: inner fees are checked
-        // during AVM execution (issue #2040).
-        //
-        // MUST use the original `txn_group`, NOT `verify_group`/`eval_group`:
-        // placeholder PQSigs are stripped (`pqsig = None`) and replaced by a
-        // proxy Ed25519 signature in `verify_group`, which would silently drop
-        // the Falcon surcharge from the required fee.
-        let fee_group: Vec<&SignedTransaction> = txn_group.iter().collect();
-        algo_validate::fee::check_submitted_group_fees(&fee_group, consensus)
-            .map_err(|message| SimulatorError::InvalidRequest(InvalidRequestError { message }))?;
 
         Ok(CheckOutcome::Passed {
             logicsig_traces,
