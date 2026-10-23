@@ -706,14 +706,16 @@ pub enum TxTagError {
         field: &'static str,
     },
 
-    /// msgpack decode failed.
-    #[error("msgpack decode failed at offset {offset}: {source}")]
-    Decode {
-        /// Byte offset within the payload where decoding failed.
+    /// Strict `SignedTxn` decode failed (unknown/block-only key, nesting
+    /// deeper than 255, malformed msgpack or a missing required field) --
+    /// go's `SignedTxn.UnmarshalMsgWithState` (`AllowableDepth` 255,
+    /// `ErrNoField`).
+    #[error("strict SignedTxn decode failed at offset {offset}: {message}")]
+    Strict {
+        /// Byte offset of the failing element within the payload.
         offset: u64,
-        /// Underlying decoder error.
-        #[source]
-        source: rmp_serde::decode::Error,
+        /// Decoder error text.
+        message: String,
     },
 }
 
@@ -753,8 +755,21 @@ pub fn decode_tx_message(data: &[u8]) -> Result<Vec<SignedTransaction>, TxTagErr
         }
 
         let offset = cursor.position();
-        match rmp_serde::from_read::<_, SignedTransaction>(&mut cursor) {
+        let pos = offset as usize;
+        // Clean end-of-stream: the previous element exactly exhausted the
+        // buffer. A truncated tail is not this case and fails below.
+        if pos == data.len() {
+            break;
+        }
+        // Decode like go's `SignedTxn` msgp decoder (issue #2039): depth
+        // cap 255, unknown keys rejected, required fields enforced.
+        let _strict = algo_types::strict_unknown_fields(data);
+        let mut rd = &data[pos..];
+        let res = algo_types::check_msgpack_depth(rd)
+            .and_then(|_| SignedTransaction::decode_from_reader(&mut rd));
+        match res {
             Ok(tx) => {
+                cursor.set_position((data.len() - rd.len()) as u64);
                 // go decodes gossip txns as `SignedTxn`, whose decoder
                 // rejects the in-block-only hgi/hgh as unknown fields
                 // (issue #1727) -- on the element itself, before any later
@@ -763,19 +778,10 @@ pub fn decode_tx_message(data: &[u8]) -> Result<Vec<SignedTransaction>, TxTagErr
                 group.push(tx);
             }
             Err(e) => {
-                // Clean end-of-stream means we *started* the read at
-                // EOF — i.e. the previous decode exactly exhausted the
-                // buffer. Checking where the cursor *landed* after an
-                // `UnexpectedEof` is wrong: a truncated trailing
-                // object (e.g. a valid txn followed by a partial
-                // msgpack prefix that consumes the remaining bytes)
-                // can also end with the cursor at `data.len()`, and
-                // that case must be rejected as malformed — not
-                // silently accepted with the partial tail dropped.
-                if is_eof_like(&e) && (offset as usize) == data.len() {
-                    break;
-                }
-                return Err(TxTagError::Decode { offset, source: e });
+                return Err(TxTagError::Strict {
+                    offset,
+                    message: e.to_string(),
+                });
             }
         }
     }
@@ -785,11 +791,6 @@ pub fn decode_tx_message(data: &[u8]) -> Result<Vec<SignedTransaction>, TxTagErr
     }
 
     Ok(group)
-}
-
-fn is_eof_like(err: &rmp_serde::decode::Error) -> bool {
-    use rmp_serde::decode::Error::*;
-    matches!(err, InvalidMarkerRead(e) | InvalidDataRead(e) if e.kind() == std::io::ErrorKind::UnexpectedEof)
 }
 
 /// Multiplexer handler for the TX tag.
@@ -1885,7 +1886,10 @@ mod tests {
             encoded.extend_from_slice(&algo_codec::canonical_encode_signed_txn_in_block(&stx));
             let err = decode_tx_message(&encoded).unwrap_err();
             assert!(
-                matches!(err, TxTagError::InBlockOnlyField { index: 1, .. }),
+                matches!(
+                    err,
+                    TxTagError::InBlockOnlyField { index: 1, .. } | TxTagError::Strict { .. }
+                ),
                 "expected InBlockOnlyField, got {err:?}",
             );
         }
@@ -1905,7 +1909,11 @@ mod tests {
         garbage_tail.extend_from_slice(&[0xC1, 0xC1]);
         let err = decode_tx_message(&garbage_tail).unwrap_err();
         assert!(
-            matches!(err, TxTagError::InBlockOnlyField { index: 0, .. }),
+            matches!(
+                err,
+                TxTagError::InBlockOnlyField { index: 0, .. }
+                    | TxTagError::Strict { offset: 0, .. }
+            ),
             "flagged first element must win over a malformed tail, got {err:?}",
         );
 
@@ -1915,9 +1923,62 @@ mod tests {
         }
         let err = decode_tx_message(&overlong).unwrap_err();
         assert!(
-            matches!(err, TxTagError::InBlockOnlyField { index: 0, .. }),
+            matches!(
+                err,
+                TxTagError::InBlockOnlyField { index: 0, .. }
+                    | TxTagError::Strict { offset: 0, .. }
+            ),
             "flagged first element must win over trailing bytes, got {err:?}",
         );
+    }
+
+    /// Append `key: value` to a canonical msgpack fixmap.
+    fn with_extra_key(encoded: &[u8], key: &str, value: &[u8]) -> Vec<u8> {
+        assert_eq!(encoded[0] & 0xF0, 0x80, "fixmap expected");
+        let n = (encoded[0] & 0x0F) + 1;
+        assert!(n < 16 && key.len() < 32);
+        let mut out = vec![0x80 | n];
+        out.extend_from_slice(&encoded[1..]);
+        out.push(0xA0 | key.len() as u8);
+        out.extend_from_slice(key.as_bytes());
+        out.extend_from_slice(value);
+        out
+    }
+
+    /// Issue #2039: a 300-deep nested value under a block-only key (`dt`)
+    /// must be a decode error (go: AllowableDepth 255 / `ErrNoField`).
+    #[test]
+    fn decode_deeply_nested_block_only_key_is_error() {
+        let base = encode_group(&[make_signed_txn(1)]);
+        let mut deep = vec![0x91u8; 300];
+        deep.push(0xC0);
+        let encoded = with_extra_key(&base, "dt", &deep);
+        assert!(decode_tx_message(&encoded).is_err());
+    }
+
+    /// Issue #2039: block-only / unknown keys are `ErrNoField` in go's
+    /// `SignedTxn` decoder.
+    #[test]
+    fn decode_unknown_and_block_only_keys_are_errors() {
+        let base = encode_group(&[make_signed_txn(1)]);
+        for key in ["dt", "ca", "zz"] {
+            let encoded = with_extra_key(&base, key, &[0x01]);
+            assert!(decode_tx_message(&encoded).is_err(), "key {key} accepted");
+        }
+        let mut g = base.clone();
+        g.extend_from_slice(&with_extra_key(&base, "zz", &[0x01]));
+        assert!(decode_tx_message(&g).is_err());
+    }
+
+    /// Issue #2039: `type` and `snd` are `codec:",required"` in go.
+    #[test]
+    fn decode_missing_required_fields_is_error() {
+        let mut no_sender = make_signed_txn(1);
+        no_sender.txn.sender = algo_types::Address([0u8; 32]);
+        assert!(decode_tx_message(&encode_group(&[no_sender])).is_err());
+        let mut no_type = make_signed_txn(1);
+        no_type.txn.txn_type = algo_types::TxnType::default();
+        assert!(decode_tx_message(&encode_group(&[no_type])).is_err());
     }
 
     #[test]
@@ -1925,8 +1986,8 @@ mod tests {
         // 0xC1 is "never used" in msgpack and decodes to an error.
         let err = decode_tx_message(&[0xC1, 0xC1, 0xC1]).unwrap_err();
         assert!(
-            matches!(err, TxTagError::Decode { .. }),
-            "expected Decode, got {err:?}",
+            matches!(err, TxTagError::Strict { .. }),
+            "expected Strict, got {err:?}",
         );
     }
 
@@ -1946,7 +2007,7 @@ mod tests {
 
         let err = decode_tx_message(&truncated).unwrap_err();
         assert!(
-            matches!(err, TxTagError::Decode { .. }),
+            matches!(err, TxTagError::Strict { .. }),
             "expected Decode error for truncated tail, got {err:?}",
         );
     }
