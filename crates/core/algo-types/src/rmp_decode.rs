@@ -672,21 +672,11 @@ pub fn read_str_bytes(rd: &mut &[u8]) -> Result<Vec<u8>> {
     Ok(v)
 }
 
-/// Length of a byte-array value, accepting a `bin` marker or -- like go's
-/// algorand/msgp ("go-codec compat: decode string encodings into byte
-/// arrays", `ReadBytesBytesHeader` / `ReadExactBytes`) -- a `str` marker.
-fn read_bin_or_str_len(rd: &mut &[u8]) -> std::result::Result<u32, String> {
-    match rd.first() {
-        Some(0xa0..=0xbf | 0xd9..=0xdb) => rmp::decode::read_str_len(rd).map_err(|e| e.to_string()),
-        _ => rmp::decode::read_bin_len(rd).map_err(|e| e.to_string()),
-    }
-}
-
 /// Read a msgpack bin as owned Vec<u8>.
 #[inline]
 pub fn read_bytes(rd: &mut &[u8]) -> Result<Vec<u8>> {
-    let len = read_bin_or_str_len(rd).map_err(|e| codec_err(format!("read_bytes bin_len: {e}")))?
-        as usize;
+    let len = rmp::decode::read_bin_len(rd)
+        .map_err(|e| codec_err(format!("read_bytes bin_len: {e}")))? as usize;
     if rd.len() < len {
         return Err(codec_err(format!(
             "read_bytes: need {len} bytes, have {}",
@@ -707,7 +697,7 @@ pub fn read_bytes_as_bytebuf(rd: &mut &[u8]) -> Result<ByteBuf> {
 /// Read a msgpack bin and verify it has exactly N bytes, returning a fixed array.
 #[inline]
 pub fn read_fixed_bytes<const N: usize>(rd: &mut &[u8]) -> Result<[u8; N]> {
-    let len = read_bin_or_str_len(rd)
+    let len = rmp::decode::read_bin_len(rd)
         .map_err(|e| codec_err(format!("read_fixed_bytes bin_len: {e}")))? as usize;
     if len != N {
         // Scan mode (go's JSON decoder does not enforce fixed lengths while

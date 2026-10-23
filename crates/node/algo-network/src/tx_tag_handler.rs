@@ -96,7 +96,14 @@
 //! anti-spam/anti-DoS measure), not just a per-message drop:
 //!
 //! 1. **Malformed/oversized msgpack decode failure** — [`decode_tx_message`]
-//!    returning any [`TxTagError`] variant. Mirrors `decodeMsg` returning
+//!    returning any [`TxTagError`] variant. Decoding is a single strict
+//!    stage (issue #2039): each element goes through
+//!    `SignedTransaction::decode_from_reader` under
+//!    `strict_unknown_fields`, i.e. go's `SignedTxn` msgp decoder --
+//!    unknown/block-only keys (incl. `hgi`/`hgh`) are `ErrNoField`,
+//!    `type`/`snd` are required, skipped-value nesting is capped at 255 --
+//!    surfacing as [`TxTagError::Strict`] with the element's absolute byte
+//!    offset. Mirrors `decodeMsg` returning
 //!    `invalid` (`data/txHandler.go:663-703`), checked in *both* of go's
 //!    transport entry points (`processIncomingTxn` for WS-gossip,
 //!    `validateIncomingTxMessage` for libp2p/P2P — `:770-773`,
@@ -698,22 +705,30 @@ pub enum TxTagError {
     /// msgpack, nesting past 255, or a missing required field -- go's
     /// `SignedTxn.UnmarshalMsgWithState`. `decodeMsg` flags the message
     /// invalid (`data/txHandler.go:674-679`) and the peer is disconnected.
-    #[error("strict SignedTxn decode failed in element starting at byte {offset}: {}", error_chain(.source))]
+    ///
+    /// `Display` carries the full cause text (the handler logs `%e`); the
+    /// cause is deliberately not a `#[source]`, so walking the error chain
+    /// does not print it a second time.
+    #[error("strict SignedTxn decode failed in element starting at byte {offset}: {}", error_chain(.cause))]
     Strict {
         /// Absolute byte offset (into the payload) where the failing
         /// element starts.
         offset: usize,
         /// Underlying decoder error.
-        #[source]
-        source: algo_error::AlgoError,
+        cause: algo_error::AlgoError,
     },
 }
 
 /// `AlgoError`'s own `Display` is only "codec error: <context>"; walk the
 /// source chain so logs carry the offending key / reason.
 fn error_chain(e: &algo_error::AlgoError) -> String {
-    let mut out = e.to_string();
-    let mut cur = std::error::Error::source(e);
+    // `Codec { context, source }` repeats the source text in `context`, so
+    // print the innermost-first chain only when a source exists.
+    let Some(first) = std::error::Error::source(e) else {
+        return e.to_string();
+    };
+    let mut out = first.to_string();
+    let mut cur = first.source();
     while let Some(s) = cur {
         out.push_str(": ");
         out.push_str(&s.to_string());
@@ -729,6 +744,10 @@ fn error_chain(e: &algo_error::AlgoError) -> String {
 /// we read values back-to-back until either the buffer is exhausted
 /// (Ok) or a decode error occurs. An empty group is rejected as Go
 /// does.
+///
+/// Synchronous by design: the strict-unknown-fields mode it enables is
+/// thread-local and must never be held across an `.await` (callers invoke
+/// this to completion before any await point).
 pub fn decode_tx_message(data: &[u8]) -> Result<Vec<SignedTransaction>, TxTagError> {
     if data.is_empty() {
         return Err(TxTagError::EmptyGroup);
@@ -753,7 +772,7 @@ pub fn decode_tx_message(data: &[u8]) -> Result<Vec<SignedTransaction>, TxTagErr
         let offset = data.len() - rd.len();
         match SignedTransaction::decode_from_reader(&mut rd) {
             Ok(tx) => group.push(tx),
-            Err(source) => return Err(TxTagError::Strict { offset, source }),
+            Err(cause) => return Err(TxTagError::Strict { offset, cause }),
         }
     }
 
@@ -2076,7 +2095,7 @@ mod tests {
         match err {
             TxTagError::Strict {
                 offset: 0,
-                source: algo_error::AlgoError::Codec { source, .. },
+                cause: algo_error::AlgoError::Codec { source, .. },
             } => assert!(
                 source.is::<algo_types::UnknownFieldError>(),
                 "expected UnknownFieldError, got {source}"
@@ -2115,6 +2134,18 @@ mod tests {
         let msg = decode_tx_message(&g).unwrap_err().to_string();
         assert!(msg.contains(&format!("byte {}", base.len())), "{msg}");
         assert!(msg.contains("zz"), "{msg}");
+
+        // Walking the full chain (as an error reporter would) must print
+        // the key exactly once: the cause is in Display, not a `#[source]`.
+        let err = decode_tx_message(&g).unwrap_err();
+        let mut full = err.to_string();
+        let mut cur = std::error::Error::source(&err);
+        while let Some(s) = cur {
+            full.push_str(": ");
+            full.push_str(&s.to_string());
+            cur = s.source();
+        }
+        assert_eq!(full.matches("zz").count(), 1, "{full}");
     }
 
     /// (B) non-canonical encodings go's msgp accepts must decode here too.
@@ -2126,14 +2157,14 @@ mod tests {
         let g = decode_tx_message(&named).expect("to_vec_named output");
         assert_eq!(g[0].txn.fee, 1000);
 
-        // Hand-built: str markers for byte arrays (go-codec compat) and
-        // non-minimal integer widths (u64 marker for small values).
+        // Hand-built: non-minimal integer widths (u64 marker for a small
+        // value). No str-as-bin leniency: the shared readers stay bin-only.
         let mut b = vec![0x81, 0xA3, b't', b'x', b'n', 0x83];
         b.extend_from_slice(&[0xA4, b't', b'y', b'p', b'e', 0xA3, b'p', b'a', b'y']);
-        b.extend_from_slice(&[0xA3, b's', b'n', b'd', 0xD9, 0x20]); // str8 len 32
+        b.extend_from_slice(&[0xA3, b's', b'n', b'd', 0xC4, 0x20]); // bin8 len 32
         b.extend_from_slice(&[0xABu8; 32]);
         b.extend_from_slice(&[0xA3, b'f', b'e', b'e', 0xCF, 0, 0, 0, 0, 0, 0, 0x03, 0xE8]);
-        let g = decode_tx_message(&b).expect("str-as-bin / wide ints");
+        let g = decode_tx_message(&b).expect("wide ints");
         assert_eq!(g[0].txn.fee, 1000);
         assert_eq!(g[0].txn.sender.0, [0xABu8; 32]);
         assert_eq!(g[0].txn.txn_type, algo_types::TxnType::Pay);
