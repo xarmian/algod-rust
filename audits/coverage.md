@@ -10,17 +10,17 @@
 
 | Id | Area | Crate(s) | Last audited (UTC) | Commit | Auditor tag | Methodologies | Depth | Report |
 |---|---|---|---|---|---|---|---|---|
-| A-00 | Delta review of `crates/core/**` since previous report | all | — | — | — | — | — | — |
-| A-01 | Canonical msgpack | `algo-codec` | — | — | — | — | — | — |
-| A-02 | Protocol primitives, hashing, consensus tables | `algo-types` | — | — | — | — | — | — |
-| A-03 | Stateless validation | `algo-validate` | — | — | — | — | — | — |
+| A-00 | Delta review of `crates/core/**` since previous report | all | `2026-10-23` | `ba9c86e5` | `claude-opus-4-8` | `M1, M2, M7` | `deep` | `2026-10-23_105644_claude-opus-4-8_ba9c86e5.md` |
+| A-01 | Canonical msgpack | `algo-codec` | `2026-10-23` | `ba9c86e5` | `claude-opus-4-8` | `M1, M2, M3, M7` | `deep` | `2026-10-23_105644_claude-opus-4-8_ba9c86e5.md` |
+| A-02 | Protocol primitives, hashing, consensus tables | `algo-types` | `2026-10-23` | `ba9c86e5` | `claude-opus-4-8` | `M1, M2, M3, M7` | `deep` | `2026-10-23_105644_claude-opus-4-8_ba9c86e5.md` |
+| A-03 | Stateless validation | `algo-validate` | `2026-10-23` | `ba9c86e5` | `claude-opus-4-8` | `M1, M2, M3, M6, M7, M8` | `poc` | `2026-10-23_105644_claude-opus-4-8_ba9c86e5.md` |
 | A-04 | Ledger apply & block evaluation | `algo-ledger` | — | — | — | — | — | — |
 | A-05 | Block assembly & proposal | `algo-ledger`, `algo-pool`, `algo-agreement` | — | — | — | — | — | — |
 | A-06 | AVM core: parser, flow, stack, budgets | `algo-avm` | — | — | — | — | — | — |
 | A-07 | AVM state, resources, boxes, inner txns | `algo-avm`, `algo-ledger` | — | — | — | — | — | — |
 | A-08 | AVM arithmetic & bytes | `algo-avm` | — | — | — | — | — | — |
 | A-09 | AVM cryptographic opcodes | `algo-avm`, `algo-consensus-crypto`, `algo-falcon` | — | — | — | — | — | — |
-| A-10 | ARC-4 ABI | `algo-abi` | — | — | — | — | — | — |
+| A-10 | ARC-4 ABI | `algo-abi` | `2026-10-23` | `ba9c86e5` | `claude-opus-4-8` | `M1, M2, M6, M7` | `poc` | `2026-10-23_105644_claude-opus-4-8_ba9c86e5.md` |
 | A-11 | Agreement `BA*` | `algo-agreement` | — | — | — | — | — | — |
 | A-12 | Sortition, VRF, participation keys, state proofs | `algo-consensus-crypto` | — | — | — | — | — | — |
 | A-13 | Falcon-1024 `det1024` (`DIV-001`) | `algo-falcon` | — | — | — | — | — | — |
@@ -53,8 +53,8 @@ Tick a rule only when a report's §5 "Verified invariants" table carries file:li
 
 | # | Rule | Last verified (report) | Status |
 |---|---|---|---|
-| 1 | Authorization (`Sender`/`AuthAddr`/rekey/LogicSig/multisig/inner sender) | — | not verified |
-| 2 | Fees and fee pooling | — | not verified |
+| 1 | Authorization (`Sender`/`AuthAddr`/rekey/LogicSig/multisig/inner sender) | `2026-10-23_105644_claude-opus-4-8_ba9c86e5.md` | partial (stateless `algo-validate` verified; see `FIND-ba9c86e5-01`; inner sender pending `A-07`) |
+| 2 | Fees and fee pooling | `2026-10-23_105644_claude-opus-4-8_ba9c86e5.md` | partial (stateless `fee.rs` verified; `simulate` precheck gap `FIND-ba9c86e5-04`) |
 | 3 | Minimum balance requirement incl. v43 `CloseRequiresBaseMinBalance` | — | not verified |
 | 4 | Group atomicity and rollback | — | not verified |
 | 5 | Opt-in / close-out / clear-state | — | not verified |
@@ -65,5 +65,5 @@ Tick a rule only when a report's §5 "Verified invariants" table carries file:li
 | 10 | Global / transaction / block fields per version | — | not verified |
 | 11 | Opcode budget and pooling | — | not verified |
 | 12 | Determinism of program-visible data | — | not verified |
-| 13 | Program versioning | — | not verified |
-| 14 | Developer-tooling fidelity (`simulate`/`dryrun`) | — | not verified |
+| 13 | Program versioning | `2026-10-23_105644_claude-opus-4-8_ba9c86e5.md` | partial (`check_contract_versions` in `rules.rs` verified; AVM `validator.rs` pending `A-06`) |
+| 14 | Developer-tooling fidelity (`simulate`/`dryrun`) | `2026-10-23_105644_claude-opus-4-8_ba9c86e5.md` | finding (`FIND-ba9c86e5-01`, `FIND-ba9c86e5-04`) |

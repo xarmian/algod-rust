@@ -330,8 +330,13 @@ Per methodology: exact commands (fenced), files and line ranges read, go-algoran
 ## 4. Findings
 Ordered by severity, then confidence. Ids `FIND-<git-short-hash>-01`, `-02`, …
 
+Every finding **must** explicitly state in its metadata header (`Affected implementations`) and in its `Description & root cause` whether the issue exists:
+- **`algod-rust only`** — a divergence, regression, or Rust-specific flaw where `go-algorand` (`v5.0.4-stable`) behaves safely/correctly, OR
+- **`both go-algorand and algod-rust`** — a shared upstream protocol/implementation flaw present in both `go-algorand` (`v5.0.4-stable` or its Go dependencies such as `avm-abi`) and `algod-rust` (see §8.4 and `RISK-EXT-001` for handling rules: never unilaterally break consensus parity to fix a shared consensus bug).
+
 ### [FIND-<hash>-01] <Title: what breaks, in one line>
 - **Severity:** 🔴/🟠/🟡/🔵/⚪ · **Impact:** … · **Likelihood:** … · **Confidence:** Confirmed / Likely
+- **Affected implementations:** `algod-rust only` | `both go-algorand and algod-rust`
 - **Property:** P1–P9 · **Adversary:** T1–T9 · **Area:** A-NN · **Category:** Consensus parity / Cryptography / Panic DoS / Resource DoS / Contract rule / Memory safety / Concurrency / Persistence / Auth / Tooling fidelity / Supply chain
 - **Location:** `crates/.../file.rs:L10-L42` (function `name`)
 - **Upstream reference:** `../go-algorand/path/file.go:L100-L130` (function `Name`)
@@ -340,7 +345,7 @@ Ordered by severity, then confidence. Ids `FIND-<git-short-hash>-01`, `-02`, …
 - **Status:** Open / Acknowledged / Mitigated
 
 #### Description & root cause
-What the code does, what the reference does, why they differ or why the code is unsafe. Quote the decisive lines of both.
+State clearly upfront whether this issue exists **only in `algod-rust`** or **in both `go-algorand` and `algod-rust`**. Explain what the Rust code does, what the Go reference does, and why they differ (if `algod-rust only`) or why both implementations share the vulnerability (if `both go-algorand and algod-rust`). Quote the decisive lines of both.
 
 #### Exploit scenario / proof of concept
 Concrete steps or a test in `audits/poc/<report-id>/`. For P1: the input bytes or TEAL, the go-algorand result, the algod-rust result. For DoS: the input and the observed effect (panic message, memory, time). For Likely: the line-by-line trace that stands in for a PoC and what prevented building one.
@@ -370,6 +375,7 @@ Speculative observations (Confidence: Speculative), areas you intended to cover 
 ### 7.3 Quality bar (reports failing these are returned)
 
 - Every location is a real path and line range at the audited commit, re-read during the run.
+- Every finding explicitly states whether the issue exists **only in `algod-rust`** (`algod-rust only`) or **in both `go-algorand` and `algod-rust`** (`both go-algorand and algod-rust`), with `go-algorand` file:line evidence verifying upstream's behavior.
 - No finding without a Confidence rating; no Critical without Confirmed.
 - No "may", "could potentially", "it is possible that" in a finding's title or description without the concrete condition under which it happens; speculative material belongs in §9.
 - No fabricated commands, outputs, or test names. If a command could not be run (e.g. no go-algorand binary on the machine), say so.

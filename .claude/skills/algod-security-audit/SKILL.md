@@ -12,7 +12,7 @@ The authoritative procedure is `audits/instructions.md` §10. This skill is a ch
 ## Non-negotiables
 
 - **You audit the code yourself.** Do not delegate the audit to a sub-agent. Read the Rust and the pinned go-algorand side by side.
-- **Evidence only.** Every finding and every verified invariant cites a real `path:Lx-Ly` re-read from the working tree in this run, plus the go-algorand oracle location where parity is the question. No recalled line numbers, no fabricated commands or outputs.
+- **Evidence only.** Every finding and every verified invariant cites a real `path:Lx-Ly` re-read from the working tree in this run, plus the go-algorand oracle location where parity is the question. Every finding must explicitly state whether the issue exists **only in `algod-rust`** (`algod-rust only`) or **in both `go-algorand` and `algod-rust`** (`both go-algorand and algod-rust`). No recalled line numbers, no fabricated commands or outputs.
 - **Observe, don't modify.** Never edit `crates/`, `bin/`, `fuzz/`, or `docs/` during an audit. PoCs go in `audits/poc/<report-id>/`.
 - **Confidence drives severity.** Critical requires a Confirmed PoC. High reported as Open requires Confirmed, or Likely with a line-by-line trace. Speculative items go to the report's §9, not to Findings.
 - **Public repo — embargo rule.** If any finding is Critical or High with Confirmed confidence, write the report but **do not commit, push, or open a GitHub issue** for it. End your turn by telling the user which finding ids are embargoed and that they must deliver the report privately (instructions §8).

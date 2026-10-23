@@ -1,0 +1,5 @@
+# Security audit reports are stored in this directory.
+# Naming convention: YYYY-MM-DD_HHMMSS_<auditor-tag>_<git-short-hash>.md
+# <auditor-tag> must identify the model or person (e.g. claude-fable-5-1, trailofbits-jdoe).
+# PoC artefacts for a report live in ../poc/<report-id>/.
+# See ../instructions.md for the full methodology, report template and disclosure rule.

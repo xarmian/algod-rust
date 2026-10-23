@@ -10,7 +10,6 @@ tools/*-vector-capture/*-vector-capture
 bench-results/
 **/bench-results/
 /fixtures/
-reports/
 docker/data/
 *.swp
 *.swo
