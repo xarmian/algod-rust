@@ -1151,7 +1151,10 @@ pub fn verify_transaction_signature_with_tracer(
     // state-proof-txn (Go: `checkTxnSigTypeCounts`, commit `569ae3d4b`).
     let has_sig = stx.sig != [0u8; 64];
     let has_msig = stx.msig.is_some();
-    let has_lsig = stx.lsig.is_some();
+    // Go counts `Lsig.HasProgram()`, not a merely-present LogicSig: an orphan
+    // or blank LogicSig is not a signature category (it is rejected, where
+    // applicable, by `logic_sig_group_size_check`). Issue #2041.
+    let has_lsig = stx.lsig.as_ref().is_some_and(|l| l.has_program());
     let has_pqsig = stx_pqsig_present;
     let count = has_sig as u8 + has_msig as u8 + has_lsig as u8 + has_pqsig as u8;
     if count == 0 {
@@ -1191,7 +1194,7 @@ pub fn verify_transaction_signature_with_tracer(
         return verify_multisig(stx, msig);
     }
 
-    if let Some(lsig) = &stx.lsig {
+    if let Some(lsig) = stx.lsig.as_ref().filter(|_| has_lsig) {
         return verify_logicsig_with_tracer(
             stx,
             lsig,
@@ -1282,7 +1285,7 @@ pub fn logic_sig_group_size_check(
 
     for stx in group {
         let lsig = stx.lsig.as_ref();
-        let has_program = lsig.is_some_and(|l| !l.logic.is_empty());
+        let has_program = lsig.is_some_and(|l| l.has_program());
         // Go: `lsig.Blank()` (includes `PQsig.Blank()` and `len(Args) == 0`).
         let is_blank = lsig.is_none_or(|l| l.is_blank());
 

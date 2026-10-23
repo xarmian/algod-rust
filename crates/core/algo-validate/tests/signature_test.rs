@@ -908,5 +908,75 @@ fn decoded_lsig_without_l_is_rejected_by_group_and_signature_checks() {
     };
     let err = algo_validate::verify_transaction_group_cached(&group, &ctx, &v42(), &cache)
         .expect_err("pool admission must reject an orphan LogicSig");
-    assert!(err.to_string().contains("LogicSig.Logic empty"), "{err}");
+    assert!(err.to_string().contains("no signature"), "{err}");
+}
+
+/// go's `checkTxnSigTypeCounts` counts `Lsig.HasProgram()`, not a merely
+/// present LogicSig: a valid `sig` plus an orphan/blank LogicSig is ONE
+/// signature category and passes the per-txn signature check (pre-size-
+/// pricing); under size pricing the group check rejects the orphan content.
+#[test]
+fn sig_plus_orphan_lsig_counts_one_category_like_go() {
+    use ed25519_dalek::{Signer, SigningKey};
+    let key = SigningKey::from_bytes(&[0x21; 32]);
+    let sender = Address(key.verifying_key().to_bytes());
+    let txn = Transaction {
+        txn_type: "pay".into(),
+        sender,
+        fee: 1_000,
+        first_valid: Round(1),
+        last_valid: Round(100),
+        receiver: Address([0x40; 32]),
+        ..Default::default()
+    };
+    let mut msg = b"TX".to_vec();
+    msg.extend_from_slice(&algo_codec::canonical_encode_transaction(&txn));
+    let sig = key.sign(&msg).to_bytes();
+    let stx = SignedTransaction {
+        txn,
+        sig,
+        lsig: Some(LogicSig {
+            args: Some(vec![serde_bytes::ByteBuf::from(vec![7u8])]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let group = vec![stx];
+    let v41 =
+        algo_types::consensus::consensus_params_for_version(algo_types::consensus::CONSENSUS_V41)
+            .unwrap();
+    let mut budget = GroupBudget::for_logicsig(1);
+    verify_transaction_signature(&group[0], &group, 0, &mut budget, &v41)
+        .expect("sig + orphan lsig is one signature category in go");
+    assert!(algo_validate::signature::logic_sig_group_size_check(&group, &v42()).is_err());
+}
+
+/// A present-but-blank multisig envelope inside a LogicSig is blank (go
+/// `Msig.Blank()`), so it is not orphan content.
+#[test]
+fn group_size_check_treats_blank_multisig_envelope_as_blank() {
+    let blank_msig = algo_types::MultisigSig {
+        version: 0,
+        threshold: 0,
+        subsigs: Vec::new(),
+    };
+    let lsig = LogicSig {
+        msig: Some(blank_msig.clone()),
+        lmsig: Some(blank_msig),
+        ..Default::default()
+    };
+    let group = vec![orphan_lsig_txn(lsig)];
+    assert!(algo_validate::signature::logic_sig_group_size_check(&group, &v42()).is_ok());
+    let real = LogicSig {
+        msig: Some(algo_types::MultisigSig {
+            version: 1,
+            threshold: 1,
+            subsigs: Vec::new(),
+        }),
+        ..Default::default()
+    };
+    assert!(
+        algo_validate::signature::logic_sig_group_size_check(&[orphan_lsig_txn(real)], &v42())
+            .is_err()
+    );
 }
