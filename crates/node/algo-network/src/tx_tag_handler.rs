@@ -698,7 +698,7 @@ pub enum TxTagError {
     /// msgpack, nesting past 255, or a missing required field -- go's
     /// `SignedTxn.UnmarshalMsgWithState`. `decodeMsg` flags the message
     /// invalid (`data/txHandler.go:674-679`) and the peer is disconnected.
-    #[error("strict SignedTxn decode failed in element starting at byte {offset}: {source}")]
+    #[error("strict SignedTxn decode failed in element starting at byte {offset}: {}", error_chain(.source))]
     Strict {
         /// Absolute byte offset (into the payload) where the failing
         /// element starts.
@@ -707,6 +707,19 @@ pub enum TxTagError {
         #[source]
         source: algo_error::AlgoError,
     },
+}
+
+/// `AlgoError`'s own `Display` is only "codec error: <context>"; walk the
+/// source chain so logs carry the offending key / reason.
+fn error_chain(e: &algo_error::AlgoError) -> String {
+    let mut out = e.to_string();
+    let mut cur = std::error::Error::source(e);
+    while let Some(s) = cur {
+        out.push_str(": ");
+        out.push_str(&s.to_string());
+        cur = s.source();
+    }
+    out
 }
 
 /// Decode a TX-tag payload as a streaming concatenation of
@@ -2032,10 +2045,10 @@ mod tests {
     fn decode_truncated_tail_is_error() {
         // A valid txn followed by a truncated msgpack object must be
         // rejected, not silently accepted with the partial tail
-        // dropped. Regression for a prior bug where the EOF-check
-        // keyed off the cursor *after* an UnexpectedEof, which could
+        // dropped. Regression for a prior bug where the EOF-check keyed
+        // off the reader position *after* an UnexpectedEof, which could
         // land at `data.len()` when the partial object consumed the
-        // remaining bytes.
+        // remaining bytes; the error must point at the 2nd element.
         let good = encode_group(&[make_signed_txn(42)]);
         let mut truncated = good.clone();
         // Append a msgpack "map of 3 entries" header (0x83) with no
@@ -2044,9 +2057,86 @@ mod tests {
 
         let err = decode_tx_message(&truncated).unwrap_err();
         assert!(
-            matches!(err, TxTagError::Strict { .. }),
-            "expected Decode error for truncated tail, got {err:?}",
+            matches!(err, TxTagError::Strict { offset, .. } if offset == good.len()),
+            "expected Strict error at the truncated 2nd element, got {err:?}",
         );
+    }
+
+    /// Issue #2039 (A): in strict mode a deep value under a block-only key
+    /// is rejected as an unknown field *before* its value is read, so the
+    /// 255 cap is not reachable through the strict path (the only
+    /// `skip_value` calls are for unknown keys, which strict mode turns
+    /// into errors first). Pin that exact kind here ...
+    #[test]
+    fn deep_value_under_block_only_key_is_rejected_as_unknown_field() {
+        let base = encode_group(&[make_signed_txn(1)]);
+        let mut deep = vec![0x91u8; 300];
+        deep.push(0xC0);
+        let err = decode_tx_message(&with_extra_key(&base, "dt", &deep)).unwrap_err();
+        match err {
+            TxTagError::Strict {
+                offset: 0,
+                source: algo_error::AlgoError::Codec { source, .. },
+            } => assert!(
+                source.is::<algo_types::UnknownFieldError>(),
+                "expected UnknownFieldError, got {source}"
+            ),
+            other => panic!("unexpected error {other:?}"),
+        }
+    }
+
+    /// ... and exercise the real 255 cap through the same reader on the
+    /// non-strict skip path (`unknown_key` -> `skip_value`).
+    #[test]
+    fn signed_txn_reader_caps_skipped_value_depth_at_255() {
+        let base = encode_group(&[make_signed_txn(1)]);
+        let mut deep = vec![0x91u8; 300];
+        deep.push(0xC0);
+        let bytes = with_extra_key(&base, "zz", &deep);
+        let mut rd = &bytes[..];
+        let err = SignedTransaction::decode_from_reader(&mut rd).unwrap_err();
+        let msg = error_chain(&err);
+        assert!(msg.contains("nesting depth exceeds 255"), "got: {msg}");
+
+        // 200 levels (under the cap) is skipped fine.
+        let mut ok_deep = vec![0x91u8; 200];
+        ok_deep.push(0xC0);
+        let bytes = with_extra_key(&base, "zz", &ok_deep);
+        let mut rd = &bytes[..];
+        SignedTransaction::decode_from_reader(&mut rd).expect("under the cap");
+    }
+
+    /// (C) the logged error names the offending key and element offset.
+    #[test]
+    fn strict_error_display_names_key_and_offset() {
+        let base = encode_group(&[make_signed_txn(1)]);
+        let mut g = base.clone();
+        g.extend_from_slice(&with_extra_key(&base, "zz", &[0x01]));
+        let msg = decode_tx_message(&g).unwrap_err().to_string();
+        assert!(msg.contains(&format!("byte {}", base.len())), "{msg}");
+        assert!(msg.contains("zz"), "{msg}");
+    }
+
+    /// (B) non-canonical encodings go's msgp accepts must decode here too.
+    #[test]
+    fn decode_accepts_go_accepted_non_canonical_encodings() {
+        let tx = make_signed_txn(1000);
+        // serde's to_vec_named output (field order, not sorted keys).
+        let named = rmp_serde::to_vec_named(&tx).expect("encode");
+        let g = decode_tx_message(&named).expect("to_vec_named output");
+        assert_eq!(g[0].txn.fee, 1000);
+
+        // Hand-built: str markers for byte arrays (go-codec compat) and
+        // non-minimal integer widths (u64 marker for small values).
+        let mut b = vec![0x81, 0xA3, b't', b'x', b'n', 0x83];
+        b.extend_from_slice(&[0xA4, b't', b'y', b'p', b'e', 0xA3, b'p', b'a', b'y']);
+        b.extend_from_slice(&[0xA3, b's', b'n', b'd', 0xD9, 0x20]); // str8 len 32
+        b.extend_from_slice(&[0xABu8; 32]);
+        b.extend_from_slice(&[0xA3, b'f', b'e', b'e', 0xCF, 0, 0, 0, 0, 0, 0, 0x03, 0xE8]);
+        let g = decode_tx_message(&b).expect("str-as-bin / wide ints");
+        assert_eq!(g[0].txn.fee, 1000);
+        assert_eq!(g[0].txn.sender.0, [0xABu8; 32]);
+        assert_eq!(g[0].txn.txn_type, algo_types::TxnType::Pay);
     }
 
     #[test]
