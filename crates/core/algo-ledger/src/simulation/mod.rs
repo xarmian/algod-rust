@@ -1356,17 +1356,17 @@ fn is_placeholder_pqsig(stx: &SignedTransaction) -> bool {
 /// (`ledger/simulation/simulator.go`, issue #835).
 fn is_placeholder_delegated_pqsig(stx: &SignedTransaction) -> bool {
     let has_sig = stx.sig != [0u8; 64];
-    let has_msig = stx.msig.is_some();
+    let has_msig = stx.msig.as_ref().is_some_and(|m| !m.blank());
     let has_top_pqsig = stx.pqsig.as_ref().is_some_and(|p| !p.blank());
     if has_sig || has_msig || has_top_pqsig {
         return false;
     }
     match &stx.lsig {
         Some(lsig)
-            if !lsig.logic.is_empty()
+            if lsig.has_program()
                 && lsig.sig == [0u8; 64]
-                && lsig.msig.is_none()
-                && lsig.lmsig.is_none() =>
+                && lsig.msig.as_ref().is_none_or(|m| m.blank())
+                && lsig.lmsig.as_ref().is_none_or(|m| m.blank()) =>
         {
             matches!(&lsig.pqsig, Some(pq) if !pq.blank() && pq.signature.is_empty())
         }

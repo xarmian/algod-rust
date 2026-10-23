@@ -1190,7 +1190,7 @@ pub fn verify_transaction_signature_with_tracer(
         return verify_single_sig(stx);
     }
 
-    if let Some(msig) = &stx.msig {
+    if let Some(msig) = stx.msig.as_ref().filter(|_| has_msig) {
         return verify_multisig(stx, msig);
     }
 
