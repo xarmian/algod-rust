@@ -304,7 +304,6 @@
 //! [`TxSyncer`]: crate::tx_syncer::TxSyncer
 //! [`canonical_encode_signed_transaction`]: algo_codec::canonical_encode_signed_transaction
 
-use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -693,39 +692,21 @@ pub enum TxTagError {
     #[error("trailing bytes after TX group")]
     TrailingBytes,
 
-    /// A transaction carried an in-block-only field (`hgi`/`hgh`), which
-    /// go's `SignedTxn` decoder rejects as unknown (`msgp.ErrNoField`,
-    /// `data/transactions/msgp_gen.go:5644-5647`); `decodeMsg` flags the
-    /// message invalid (`data/txHandler.go:674-679`) and the peer is
-    /// disconnected (`:772-776`).
-    #[error("txn {index}: Unknown field: {field}")]
-    InBlockOnlyField {
-        /// Position within the decoded group.
-        index: usize,
-        /// `"hgi"` or `"hgh"`.
-        field: &'static str,
-    },
-
-    /// Strict `SignedTxn` decode failed (unknown/block-only key, nesting
-    /// deeper than 255, malformed msgpack or a missing required field) --
-    /// go's `SignedTxn.UnmarshalMsgWithState` (`AllowableDepth` 255,
-    /// `ErrNoField`).
-    #[error("strict SignedTxn decode failed at offset {offset}: {message}")]
+    /// Strict `SignedTxn` decode failed: unknown or block-only key (incl.
+    /// the in-block `hgi`/`hgh`, go `msgp.ErrNoField`,
+    /// `data/transactions/msgp_gen.go:5644-5647`), malformed/truncated
+    /// msgpack, nesting past 255, or a missing required field -- go's
+    /// `SignedTxn.UnmarshalMsgWithState`. `decodeMsg` flags the message
+    /// invalid (`data/txHandler.go:674-679`) and the peer is disconnected.
+    #[error("strict SignedTxn decode failed in element starting at byte {offset}: {source}")]
     Strict {
-        /// Byte offset of the failing element within the payload.
-        offset: u64,
-        /// Decoder error text.
-        message: String,
+        /// Absolute byte offset (into the payload) where the failing
+        /// element starts.
+        offset: usize,
+        /// Underlying decoder error.
+        #[source]
+        source: algo_error::AlgoError,
     },
-}
-
-impl From<algo_types::genesis_restore::InBlockOnlyFieldError> for TxTagError {
-    fn from(e: algo_types::genesis_restore::InBlockOnlyFieldError) -> Self {
-        TxTagError::InBlockOnlyField {
-            index: e.index,
-            field: e.field,
-        }
-    }
 }
 
 /// Decode a TX-tag payload as a streaming concatenation of
@@ -740,49 +721,26 @@ pub fn decode_tx_message(data: &[u8]) -> Result<Vec<SignedTransaction>, TxTagErr
         return Err(TxTagError::EmptyGroup);
     }
 
-    let mut cursor = Cursor::new(data);
     let mut group: Vec<SignedTransaction> = Vec::with_capacity(1);
+    // Decode like go's `SignedTxn` msgp decoder (issues #1727, #1745,
+    // #2039): unknown keys (incl. block-only hgi/hgh/ApplyData) are
+    // rejected -- which also bounds nesting, as unknown values are only
+    // ever skipped via `skip_value`'s 255 cap -- and required fields are
+    // enforced. The guard is based on `data` so error offsets are absolute.
+    let _strict = algo_types::strict_unknown_fields(data);
+    let mut rd = data;
 
-    loop {
+    while !rd.is_empty() {
         // Cap the group at MAX_TX_GROUP_SIZE. If more values remain in
         // the buffer, that's an overflow — matches Go's `dec.Remaining()
         // > 0` check after MaxTxGroupSize.
         if group.len() == MAX_TX_GROUP_SIZE {
-            if (cursor.position() as usize) < data.len() {
-                return Err(TxTagError::TrailingBytes);
-            }
-            break;
+            return Err(TxTagError::TrailingBytes);
         }
-
-        let offset = cursor.position();
-        let pos = offset as usize;
-        // Clean end-of-stream: the previous element exactly exhausted the
-        // buffer. A truncated tail is not this case and fails below.
-        if pos == data.len() {
-            break;
-        }
-        // Decode like go's `SignedTxn` msgp decoder (issue #2039): depth
-        // cap 255, unknown keys rejected, required fields enforced.
-        let _strict = algo_types::strict_unknown_fields(data);
-        let mut rd = &data[pos..];
-        let res = algo_types::check_msgpack_depth(rd)
-            .and_then(|_| SignedTransaction::decode_from_reader(&mut rd));
-        match res {
-            Ok(tx) => {
-                cursor.set_position((data.len() - rd.len()) as u64);
-                // go decodes gossip txns as `SignedTxn`, whose decoder
-                // rejects the in-block-only hgi/hgh as unknown fields
-                // (issue #1727) -- on the element itself, before any later
-                // bytes are looked at (issue #1745).
-                algo_types::genesis_restore::reject_in_block_flags_one(&tx, group.len())?;
-                group.push(tx);
-            }
-            Err(e) => {
-                return Err(TxTagError::Strict {
-                    offset,
-                    message: e.to_string(),
-                });
-            }
+        let offset = data.len() - rd.len();
+        match SignedTransaction::decode_from_reader(&mut rd) {
+            Ok(tx) => group.push(tx),
+            Err(source) => return Err(TxTagError::Strict { offset, source }),
         }
     }
 
@@ -1884,13 +1842,11 @@ mod tests {
             // (STIB) shape.
             let mut encoded = encode_group(&[make_signed_txn(1)]);
             encoded.extend_from_slice(&algo_codec::canonical_encode_signed_txn_in_block(&stx));
+            let first_len = encode_group(&[make_signed_txn(1)]).len();
             let err = decode_tx_message(&encoded).unwrap_err();
             assert!(
-                matches!(
-                    err,
-                    TxTagError::InBlockOnlyField { index: 1, .. } | TxTagError::Strict { .. }
-                ),
-                "expected InBlockOnlyField, got {err:?}",
+                matches!(err, TxTagError::Strict { offset, .. } if offset == first_len),
+                "expected Strict at the 2nd element (byte {first_len}), got {err:?}",
             );
         }
     }
@@ -1909,11 +1865,7 @@ mod tests {
         garbage_tail.extend_from_slice(&[0xC1, 0xC1]);
         let err = decode_tx_message(&garbage_tail).unwrap_err();
         assert!(
-            matches!(
-                err,
-                TxTagError::InBlockOnlyField { index: 0, .. }
-                    | TxTagError::Strict { offset: 0, .. }
-            ),
+            matches!(err, TxTagError::Strict { offset: 0, .. }),
             "flagged first element must win over a malformed tail, got {err:?}",
         );
 
@@ -1923,11 +1875,7 @@ mod tests {
         }
         let err = decode_tx_message(&overlong).unwrap_err();
         assert!(
-            matches!(
-                err,
-                TxTagError::InBlockOnlyField { index: 0, .. }
-                    | TxTagError::Strict { offset: 0, .. }
-            ),
+            matches!(err, TxTagError::Strict { offset: 0, .. }),
             "flagged first element must win over trailing bytes, got {err:?}",
         );
     }
@@ -1979,6 +1927,95 @@ mod tests {
         let mut no_type = make_signed_txn(1);
         no_type.txn.txn_type = algo_types::TxnType::default();
         assert!(decode_tx_message(&encode_group(&[no_type])).is_err());
+    }
+
+    /// Explicit `snd` key holding 32 zero bytes: go's `required` check is
+    /// value-based (`Sender.MsgIsZero()`), so key presence does not help.
+    #[test]
+    fn decode_explicit_zero_sender_is_error() {
+        let ok = encode_group(&[make_signed_txn(1)]);
+        // Find "snd" + bin8(32) of 0xAB and zero it in place.
+        let mut bad = ok.clone();
+        let pat: Vec<u8> = [&[0xA3u8, b's', b'n', b'd', 0xC4, 0x20][..], &[0xABu8; 32]].concat();
+        let at = ok
+            .windows(pat.len())
+            .position(|w| w == pat.as_slice())
+            .expect("snd present");
+        bad[at + 6..at + 38].fill(0);
+        assert!(decode_tx_message(&ok).is_ok());
+        let err = decode_tx_message(&bad).unwrap_err();
+        assert!(
+            matches!(err, TxTagError::Strict { offset: 0, .. }),
+            "{err:?}"
+        );
+    }
+
+    /// Issue #2039: strict mode must still accept every field go's
+    /// `SignedTxn` accepts -- a fully featured app call (boxes, resources,
+    /// schemas), multisig, logicsig and keyreg all decode and round-trip
+    /// byte-for-byte.
+    #[test]
+    fn decode_fully_featured_valid_txns_under_strict_mode() {
+        use algo_types::{Address, BoxRef, StateSchema, TxnType};
+        use serde_bytes::ByteBuf;
+
+        let mut app = make_signed_txn(2000);
+        app.txn.txn_type = TxnType::Appl;
+        app.txn.application_id = 77;
+        app.txn.on_completion = 1;
+        app.txn.approval_program = Some(ByteBuf::from(vec![8, 0x81, 1]));
+        app.txn.clear_state_program = Some(ByteBuf::from(vec![8, 0x81, 1]));
+        app.txn.app_arguments = Some(vec![Some(ByteBuf::from(vec![1, 2, 3]))]);
+        app.txn.accounts = Some(vec![Address([3u8; 32])]);
+        app.txn.foreign_apps = Some(vec![5, 6]);
+        app.txn.foreign_assets = Some(vec![9]);
+        app.txn.boxes = Some(vec![BoxRef {
+            index: 0,
+            name: Some(ByteBuf::from(b"box1".to_vec())),
+        }]);
+        app.txn.global_state_schema = Some(StateSchema {
+            num_uint: 1,
+            num_byte_slice: 2,
+        });
+        app.txn.local_state_schema = Some(StateSchema {
+            num_uint: 3,
+            num_byte_slice: 4,
+        });
+        app.txn.extra_program_pages = 1;
+        app.auth_addr = Some(Address([4u8; 32]));
+        app.sig = [7u8; 64];
+
+        let mut msig = make_signed_txn(3000);
+        msig.msig = Some(algo_types::MultisigSig {
+            version: 1,
+            threshold: 1,
+            subsigs: vec![algo_types::MultisigSubsig {
+                public_key: [5u8; 32],
+                signature: [6u8; 64],
+            }],
+        });
+
+        let mut lsig = make_signed_txn(4000);
+        lsig.lsig = Some(algo_types::LogicSig {
+            logic: ByteBuf::from(vec![8, 0x81, 1]),
+            args: Some(vec![ByteBuf::from(vec![9, 9])]),
+            ..Default::default()
+        });
+
+        let mut keyreg = make_signed_txn(5000);
+        keyreg.txn.txn_type = TxnType::Keyreg;
+        keyreg.txn.vote_pk = Some([1u8; 32]);
+        keyreg.txn.selection_pk = Some([2u8; 32]);
+        keyreg.txn.state_proof_pk = Some([3u8; 64]);
+        keyreg.txn.vote_first = 1;
+        keyreg.txn.vote_last = 100;
+        keyreg.txn.vote_key_dilution = 10;
+
+        let group_in = vec![app, msig, lsig, keyreg];
+        let encoded = encode_group(&group_in);
+        let group = decode_tx_message(&encoded).expect("strict decode of valid txns");
+        assert_eq!(group.len(), 4);
+        assert_eq!(encode_group(&group), encoded, "round-trip must be lossless");
     }
 
     #[test]
