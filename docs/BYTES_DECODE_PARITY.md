@@ -117,11 +117,8 @@ the rule is "reject nothing go accepts".
 
 ## Not changed / left open
 
-* go decodes *structs* from a msgpack array as well as a map
-  (`SignedTxn.UnmarshalMsgWithState` "struct-from-array" branch) and every
-  generated unsigned-integer read (`ReadUint64Bytes`) maps nil to 0; Rust's
-  `read_u64` and the struct readers reject both. This is a separate, wider
-  non-canonical-encoding class than byte fields (tracked in #2063).
+* (Closed by issue #2065, see "Issue #2065: final disposition" below: nil ->
+  zero implemented; struct-from-array registered as DIV-004.)
 * Remaining raw decoders: see "Issue #2063: other crates" below.
 * The go side was verified by reading `read_bytes.go` and the generated
   decoders; the Go oracle binaries cannot be executed on the audit machine
@@ -167,3 +164,103 @@ bin and str by design, internal blob).
 **(a) PQSig / FalconVerifier in `algo-types`** were already done in #2046
 (see the rows above); verified `PQSig.pk/sig` are `[]byte`
 (`data/transactions/pqsig.go`) and `FalconVerifier.k` is `[1793]byte`.
+
+## Issue #2065: final disposition (end of the #2046 -> #2063 -> #2065 chain)
+
+Every item left open by #2063 is resolved below; no follow-up issue is needed.
+Go side verified in algorand/msgp v1.1.64 `read_bytes.go` and the generated
+`data/transactions/msgp_gen.go` (`SignedTxn.UnmarshalMsgWithState`, line
+~5520 at `v5.0.4-stable`).
+
+### 1. nil -> zero, struct-from-array
+
+* **nil -> zero: implemented.** `ReadUint64Bytes` (and through it
+  `ReadUint32/16/8Bytes`), `ReadInt64Bytes`, `ReadBoolBytes` and
+  `ReadMapHeaderBytes` all map `0xc0` to the zero value / an empty struct
+  (the map header additionally sets `isnil`, after which the generated code
+  does `(*z) = T{}`). The shared readers `read_u64` / `read_u32` / `read_u16`
+  / `read_u8_val` / `read_i64` / `read_bool` / `read_map_len` in
+  `algo-types/src/rmp_decode.rs` now do the same (one extra match arm each;
+  `read_map_len` one slice-pattern check). Every hand-written struct decoder
+  (blocks, headers, transactions, heartbeat, state proofs, PQ) goes through
+  these, so the change is central. Tests: `rmp_decode::tests::
+  nil_reads_as_zero_like_go_msgp`, `tests/go_msgp_nil_scalars_test.rs`. Only the
+  unit test was observed failing on the old code; the integration tests were
+  not run before the fix (the run aborted at the first failing target), so
+  they are regression pins for the struct-level paths.
+  Out of scope (own, non-shared readers): `algo-agreement` `codec.rs`
+  `read_uint64`/`read_bool` and `catchpoint/msgp_compat.rs` `read_u64`/
+  `read_bool` keep their local semantics; the agreement ones only see
+  go-encoded canonical votes (go's encoder omits zero fields, never emits
+  nil), the catchpoint ones read go-written files.
+* **struct-from-array: verified accepted by go, NOT implemented; registered
+  as `DIV-004`.** Every generated struct decoder first calls
+  `ReadMapHeaderBytes` and, on a `TypeError`, retries `ReadArrayHeaderBytes`
+  and decodes fields positionally in Go struct-declaration order. Supporting
+  it would need a per-struct positional field table in every one of the ~100
+  hand-written readers (the order is go's declaration order, not the sorted
+  wire-key order, and nothing in the Rust structs records it), i.e. a
+  large feature, not a shared-reader tweak. Not required for consensus: (a)
+  go's encoder never emits the array form (every `MarshalMsg` writes a map),
+  so honest go peers never produce it; (b) IDs, group IDs, block digests and
+  certificates are hashes of the canonical re-encode of the decoded struct in
+  both implementations, so a non-canonical wrapper cannot change a hash and
+  there is no safety (fork) impact; (c) catchup serves canonical blocks from
+  go archivers; (d) the worst case is an adversary hand-crafting an
+  array-form proposal/transaction that go decodes and algod-rust rejects,
+  which costs algod-rust that one proposal payload for the round (liveness
+  for one round, repaired by catchup) or that one gossiped transaction.
+  Severity low.
+
+### 2. Duplicate map keys
+
+go's generated decoder (see `SignedTxn` above) has **no duplicate-key
+detection**: it loops `for zb0001 > 0`, switches on the key, and decodes into
+the existing struct. Scalar repeats are last-wins (Rust identical). A
+repeated nested-struct key (`txn` twice) decodes *into* the already-populated
+struct (a merge), and a repeated fixed-size byte key with a shorter value
+keeps the earlier tail (`ReadExactBytes` copies `min(len, N)`); Rust replaces
+the nested struct / zero-fills. Not implemented: it needs merge-into-existing
+decoding in every struct reader, which is the same shape as the array-form
+change, and is observable only for inputs no encoder emits. Registered in
+`DIV-004` together with the array form (same impact argument: decoded-struct
+re-encode drives all hashes; go has no rejection either, so the divergence is
+only "which weird duplicate input decodes to which struct").
+
+### 3. Local participation secrets
+
+`onetimesig.rs` subkeys / `OneTimeSignatureSecrets`, `merklesig.rs`
+`FalconSigner` (and the sk blobs) keep the strict `bin`/exact-length readers
+**intentionally**. They are never wire data: they are the participation DB
+blobs written only by go's own encoder or ours (always `bin`, exact length),
+read at startup from the operator's own disk. Accepting `str`/nil/array/
+wrong-length forms would only make a corrupt key file load as a silently
+zero-padded secret, which is strictly worse than failing; there is no
+interoperability case to serve. Not a consensus decode path; no change.
+
+### 4. serde (`rmp_serde`) decode audit
+
+`vpack.rs` (`algo-network`) has **no serde decode**: it is a hand-written
+byte-level parser/compressor that mirrors go's own `vpack` (also strict: go
+falls back to sending the vote uncompressed when it cannot parse a form, and
+the decompressed output is then decoded by `algo-agreement`'s `codec.rs`).
+Production `rmp_serde` decodes and their reachability:
+
+| Site | Input source | Untrusted consensus input? | Outcome |
+|---|---|---|---|
+| `algo-codec` `decode_block` / `decode_block_response`; used by `algo-rest-client` `gossip_block_source::decode_block_cert` and `client.rs get_block` | catchup blocks from peers (WS / REST) | yes, but cert-verified: block digest = hash of the canonical re-encode, cert covers it | **documented** (DIV-004): derived-serde `Deserialize` rejects nil-for-zero and accepts/misreads array form; a peer serving a non-canonical but go-acceptable encoding is dropped and another peer is used (per-peer liveness only, no safety) |
+| `algo-ledger` `apply.rs`, `heartbeat.rs`, `sqlite.rs`, `sync/mod.rs` `decode_block` | our own stored/canonical blobs (`blockdb`, catchpoint-written) | no (local DB; written by our canonical encoder) | none |
+| `algo-agreement` proposal / vote / bundle decode | gossip | yes | **hand-written** decoders (`codec.rs`, `Block::decode_from_bytes`), covered by #2062/#2063 and this issue's shared-reader change; not serde |
+| `algo-network` `tx_sync_client.rs` `Vec<SignedTransaction>` | peer txn-sync response | transaction gossip, not block/consensus input | same serde limitation, DIV-004; failure rejects one peer's response |
+| `algo-network` `identity.rs`, `algo-p2p` `wsproto.rs` (`peerMetaHeaders`) | peer handshake | no (identity challenge / headers; go-encoded canonical; no consensus effect) | none |
+| `algo-rest-api` `handlers.rs` (txn submit), `simulate_strict.rs`, `format.rs` | local REST clients | no | none (go's REST `protocol.Decode` is the model; strict-unknown-field guard already present) |
+| `algo-ledger` `eval_delta.rs` inner-txn rebuild, `state_delta.rs`, `catchpoint/types.rs` | our own re-encoded values / go catchpoint files | no / file | none |
+| `algo-codec` `decode_logicsig` / `decode_multisig` / `decode_signed_txn_stream`, `decode_state_proof_verification_context` | `goal`/kmd CLI blobs, own DB, catchpoint file | no | none |
+
+The one remaining observation in the other direction: the hand-written
+readers skip unknown map keys by default while go's generated decoders
+return `ErrNoField`. That is the strict-unknown-field mode (`StrictUnknownFieldsGuard`) already used for
+REST submission; for consensus input the acceptance of an extra key cannot
+change any hash (the key is dropped on re-encode) and only matters for a
+proposal that go would have rejected outright, which cannot gather a quorum
+of go votes. Not a regression of this work; recorded for completeness.

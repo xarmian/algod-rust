@@ -39,6 +39,14 @@ fn codec_err(msg: impl Into<String>) -> AlgoError {
 /// Read a msgpack map header, returning the number of key-value pairs.
 #[inline]
 pub fn read_map_len(rd: &mut &[u8]) -> Result<u32> {
+    // nil: go's ReadMapHeaderBytes decodes nil as an empty map / zeroed struct
+    // (issue #2065).
+    // DIVERGENCE DIV-004: only the map form is read; go's struct-from-array
+    // branch (ReadArrayHeaderBytes fallback) is intentionally not supported.
+    if let [0xc0, rest @ ..] = *rd {
+        *rd = rest;
+        return Ok(0);
+    }
     rmp::decode::read_map_len(rd).map_err(|e| codec_err(format!("read_map_len: {e}")))
 }
 
@@ -555,6 +563,8 @@ pub fn read_u64(rd: &mut &[u8]) -> Result<u64> {
                 Err(codec_err(format!("read_u64: negative i64 value {v}")))
             }
         }
+        // nil: go's ReadUint64Bytes maps nil to 0 (issue #2065)
+        0xc0 => Ok(0),
         other => Err(codec_err(format!(
             "read_u64: not an integer: 0x{other:02x}"
         ))),
@@ -594,6 +604,8 @@ pub fn read_i64(rd: &mut &[u8]) -> Result<i64> {
         0xd2 => Ok(read_data_i32(rd)? as i64),
         // i64
         0xd3 => read_data_i64_raw(rd),
+        // nil: go's ReadInt64Bytes maps nil to 0 (issue #2065)
+        0xc0 => Ok(0),
         other => Err(codec_err(format!(
             "read_i64: not an integer: 0x{other:02x}"
         ))),
@@ -630,7 +642,8 @@ pub fn read_bool(rd: &mut &[u8]) -> Result<bool> {
     let b = rd[0];
     *rd = &rd[1..];
     match b {
-        0xc2 => Ok(false),
+        // 0xc0 nil: go's ReadBoolBytes maps nil to false (issue #2065)
+        0xc2 | 0xc0 => Ok(false),
         0xc3 => Ok(true),
         _ => Err(codec_err(format!(
             "read_bool: expected bool marker, got 0x{b:02x}"
@@ -1330,6 +1343,31 @@ mod tests {
                 "i64 marker + {len} data bytes must be rejected, not accepted or panic"
             );
         }
+    }
+
+    /// Issue #2065: go's `ReadUint64Bytes` / `ReadInt64Bytes` /
+    /// `ReadBoolBytes` / `ReadMapHeaderBytes` map nil to the zero value.
+    #[test]
+    fn nil_reads_as_zero_like_go_msgp() {
+        let data = [0xc0u8, 0x05];
+        let mut rd = &data[..];
+        assert_eq!(read_u64(&mut rd).unwrap(), 0);
+        assert_eq!(rd, &[0x05]);
+        let mut rd = &data[..];
+        assert_eq!(read_i64(&mut rd).unwrap(), 0);
+        assert_eq!(rd, &[0x05]);
+        let mut rd = &data[..];
+        assert_eq!(read_u32(&mut rd).unwrap(), 0);
+        let mut rd = &data[..];
+        assert_eq!(read_u16(&mut rd).unwrap(), 0);
+        let mut rd = &data[..];
+        assert_eq!(read_u8_val(&mut rd).unwrap(), 0);
+        let mut rd = &data[..];
+        assert!(!read_bool(&mut rd).unwrap());
+        assert_eq!(rd, &[0x05]);
+        let mut rd = &data[..];
+        assert_eq!(read_map_len(&mut rd).unwrap(), 0);
+        assert_eq!(rd, &[0x05]);
     }
 
     #[test]
