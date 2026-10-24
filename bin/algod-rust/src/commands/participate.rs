@@ -9452,6 +9452,19 @@ mod tests {
                 .expect_err("2000 arg bytes exceed the 1000 byte pool");
             assert!(err.to_string().contains(want), "cached={cached}: {err}");
 
+            // Orphan LogicSig content (args, no program) once size pricing is on.
+            let mut orphan = make_escrow_with_arg(9, 10);
+            orphan.lsig.as_mut().unwrap().logic = Default::default();
+            orphan.txn.sender = Address([0x31; 32]);
+            let err = eval
+                .test_transaction_group(&[orphan])
+                .expect_err("orphan LogicSig content must be rejected at v42");
+            assert!(
+                err.to_string()
+                    .contains("LogicSig fields without LogicSig program"),
+                "cached={cached}: {err}"
+            );
+
             // Pooled across the group: 1500 arg bytes fit 2 * 1000. (Group-id
             // and fee checks run later/independently; only assert the size
             // check does not fire.)
