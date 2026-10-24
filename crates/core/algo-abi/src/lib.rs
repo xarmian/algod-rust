@@ -318,7 +318,7 @@ fn parse_static_array(s: &str, depth: usize) -> Result<AbiType, String> {
 // DIVERGENCE DIV-003: type_of rejects ABI types whose head size overflows usize
 fn check_static_size(t: AbiType) -> Result<AbiType, String> {
     if t.head_len().is_none() {
-        return Err(format!("ABI type \"{t}\" is too large to encode"));
+        return Err("ABI type is too large to encode: head size overflows".into());
     }
     Ok(t)
 }
