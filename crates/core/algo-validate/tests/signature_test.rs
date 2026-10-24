@@ -908,7 +908,13 @@ fn decoded_lsig_without_l_is_rejected_by_group_and_signature_checks() {
     };
     let err = algo_validate::verify_transaction_group_cached(&group, &ctx, &v42(), &cache)
         .expect_err("pool admission must reject an orphan LogicSig");
-    assert!(err.to_string().contains("no signature"), "{err}");
+    // Since #2054 the group-level check runs first (go: `txnGroupBatchPrep`
+    // calls `logicSigGroupSizeCheck` before any per-txn signature prep).
+    assert!(
+        err.to_string()
+            .contains("LogicSig fields without LogicSig program"),
+        "{err}"
+    );
 }
 
 /// go's `checkTxnSigTypeCounts` counts `Lsig.HasProgram()`, not a merely
@@ -997,5 +1003,99 @@ fn group_size_check_treats_blank_multisig_envelope_as_blank() {
     assert!(
         algo_validate::signature::logic_sig_group_size_check(&[orphan_lsig_txn(real)], &v42())
             .is_err()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #2054 (FIND-ba9c86e5-01 Part A): the group-level LogicSig size check
+// must run on the cached/pool/gossip verification path, not only in block
+// validation (go: `txnGroupBatchPrep` -> `logicSigGroupSizeCheck`).
+// ---------------------------------------------------------------------------
+
+/// Escrow-style LogicSig txn (`int 1`, contract account as sender) carrying
+/// one argument of `arg_len` bytes; `salt` makes the program (and so the
+/// sender / txid) unique per group member.
+fn escrow_txn_with_arg(salt: u8, arg_len: usize) -> SignedTransaction {
+    let program = prog(6, &[0x81, 0x01, 0x48, 0x81, salt, 0x48, 0x81, 0x01]);
+    let mut stx = make_contract_account_txn(&program);
+    stx.txn.note = serde_bytes::ByteBuf::from(vec![salt]);
+    if arg_len > 0 {
+        stx.lsig.as_mut().unwrap().args =
+            Some(vec![serde_bytes::ByteBuf::from(vec![7u8; arg_len])]);
+    }
+    stx
+}
+
+fn cache_ctx() -> algo_validate::VerificationContext {
+    algo_validate::VerificationContext {
+        spec_addrs: algo_validate::SpecialAddresses::default(),
+        consensus_version: "issue-2054".to_string(),
+    }
+}
+
+fn verify_cached(
+    group: &[SignedTransaction],
+    consensus: &ConsensusParams,
+) -> Result<(), algo_error::AlgoError> {
+    let cache = algo_validate::VerifiedTransactionCache::new(100);
+    algo_validate::verify_transaction_group_cached(group, &cache_ctx(), consensus, &cache)
+}
+
+fn v41() -> ConsensusParams {
+    algo_types::consensus::consensus_params_for_version(algo_types::consensus::CONSENSUS_V41)
+        .unwrap()
+}
+
+#[test]
+fn cached_verify_rejects_oversize_lsig_args_v42() {
+    let group = vec![escrow_txn_with_arg(1, 2000)];
+    let err = verify_cached(&group, &v42()).expect_err("2000 arg bytes exceed the 1000 pool");
+    assert!(
+        err.to_string().contains(
+            "txgroup had 2000 bytes of LogicSig args, more than the available size pool of 1000 bytes"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn cached_verify_accepts_pooled_lsig_args_v42_and_plain_valid_group() {
+    // 1500 arg bytes in one member, pool = 2 * 1000.
+    let group = vec![escrow_txn_with_arg(1, 1500), escrow_txn_with_arg(2, 0)];
+    verify_cached(&group, &v42()).expect("pooled args fit the group pool");
+    // Ordinary single LogicSig txn still verifies.
+    verify_cached(&[escrow_txn_with_arg(3, 10)], &v42()).expect("valid group");
+}
+
+#[test]
+fn cached_verify_pre_v42_pooled_size() {
+    // v41: program + args are pooled; one txn => 1000 bytes available.
+    let err = verify_cached(&[escrow_txn_with_arg(1, 1000)], &v41())
+        .expect_err("program+args exceed the 1000 byte pool");
+    assert!(
+        err.to_string()
+            .contains("more than the available pool of 1000 bytes"),
+        "{err}"
+    );
+    assert!(err.to_string().contains("bytes of LogicSigs"), "{err}");
+    // Two members: pool 2000 covers 1500 arg bytes + programs.
+    let group = vec![escrow_txn_with_arg(1, 1500), escrow_txn_with_arg(2, 0)];
+    verify_cached(&group, &v41()).expect("pooled size fits");
+}
+
+#[test]
+fn cached_verify_rejects_orphan_lsig_content_v42() {
+    let err = verify_cached(
+        &[orphan_lsig_txn(LogicSig {
+            args: Some(vec![serde_bytes::ByteBuf::from(vec![1u8])]),
+            ..Default::default()
+        })],
+        &v42(),
+    )
+    .expect_err("orphan content");
+    assert!(
+        err.to_string()
+            .contains("LogicSig fields without LogicSig program"),
+        "{err}"
     );
 }

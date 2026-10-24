@@ -3084,3 +3084,114 @@ int 1
         "the (account, asset) pair must be tracked: {unnamed:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #2054 (FIND-ba9c86e5-01 Part A): Simulator::check must run go's full
+// `logicSigGroupSizeCheck` (pooled args / pre-v42 pooled size), not only the
+// orphan-content branch.
+// ---------------------------------------------------------------------------
+
+fn escrow_with_arg(state: &mut LedgerState, salt: u8, arg_len: usize) -> SignedTransaction {
+    let program = assemble(&format!(
+        "#pragma version 6\nint 1\npop\nint {salt}\npop\nint 1\n"
+    ));
+    let sender = contract_account_address(&program);
+    fund(state, sender, 20_000_000);
+    SignedTransaction {
+        txn: Transaction {
+            txn_type: "pay".into(),
+            sender,
+            receiver: sender,
+            amount: 0,
+            fee: 1000,
+            first_valid: 0.into(),
+            last_valid: 1000.into(),
+            note: serde_bytes::ByteBuf::from(vec![salt]),
+            ..Default::default()
+        },
+        lsig: Some(LogicSig {
+            logic: serde_bytes::ByteBuf::from(program),
+            args: if arg_len == 0 {
+                None
+            } else {
+                Some(vec![serde_bytes::ByteBuf::from(vec![7u8; arg_len])])
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn simulate_rejects_oversize_lsig_args_v42() {
+    let mut state = base_state();
+    state.protocol = algo_types::consensus::CONSENSUS_V42.to_string();
+    let stx = escrow_with_arg(&mut state, 1, 2000);
+    let err = simulate(
+        &mut state,
+        SimulationRequest {
+            txn_groups: vec![vec![stx]],
+            ..Default::default()
+        },
+    )
+    .expect_err("pool overflow is an unattributable group error (go GroupIndex -1)");
+    match err {
+        SimulatorError::InvalidRequest(e) => assert!(
+            e.message.contains(
+                "txgroup had 2000 bytes of LogicSig args, more than the available size pool of 1000 bytes"
+            ),
+            "{}",
+            e.message
+        ),
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+}
+
+#[test]
+fn simulate_pre_v42_pooled_size_rejected_and_pooled_args_accepted() {
+    // v41 (base_state): program + args pooled; 1 txn => 1000 bytes.
+    let mut state = base_state();
+    let stx = escrow_with_arg(&mut state, 1, 1000);
+    let err = simulate(
+        &mut state,
+        SimulationRequest {
+            txn_groups: vec![vec![stx]],
+            ..Default::default()
+        },
+    )
+    .expect_err("program+args exceed the 1000 byte pool");
+    match err {
+        SimulatorError::InvalidRequest(e) => assert!(
+            e.message
+                .contains("bytes of LogicSigs, more than the available pool of 1000 bytes"),
+            "{}",
+            e.message
+        ),
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+
+    // Two members: 1500 arg bytes fit the 2000 byte pool (v41 and v42).
+    for proto in [
+        algo_types::consensus::CONSENSUS_V41,
+        algo_types::consensus::CONSENSUS_V42,
+    ] {
+        let mut state = base_state();
+        state.protocol = proto.to_string();
+        let a = escrow_with_arg(&mut state, 1, 1500);
+        let b = escrow_with_arg(&mut state, 2, 0);
+        let result = simulate(
+            &mut state,
+            SimulationRequest {
+                txn_groups: vec![vec![a, b]],
+                ..Default::default()
+            },
+        );
+        if let Err(SimulatorError::InvalidRequest(e)) = &result {
+            assert!(
+                !e.message.contains("bytes of LogicSig"),
+                "{proto}: {}",
+                e.message
+            );
+        }
+    }
+}

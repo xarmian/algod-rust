@@ -1772,6 +1772,12 @@ impl SimpleBlockEvaluator {
             };
             algo_validate::verify_transaction_group_cached(txgroup, &context, params, cache)?;
         } else {
+            // Group-level LogicSig size check (go: `txnGroupBatchPrep` ->
+            // `logicSigGroupSizeCheck`). The cached branch above performs it
+            // inside `verify_transaction_group_cached`; this uncached branch
+            // must do it itself, before any signature work (issue #2054).
+            algo_validate::logic_sig_group_size_check(txgroup, params)?;
+
             // Create a per-group LogicSig budget for logicsig evaluation.
             let mut lsig_budget = GroupBudget::for_logicsig(txgroup.len());
 
@@ -9393,6 +9399,81 @@ mod tests {
             err.to_string().contains("signature"),
             "expected signature error, got: {err}"
         );
+    }
+
+    /// Escrow LogicSig payment (`int 1` program, contract account sender)
+    /// with one `arg_len`-byte argument; `salt` makes members unique.
+    fn make_escrow_with_arg(salt: u8, arg_len: usize) -> SignedTransaction {
+        // version 6: pushint 1; pop; pushint salt; pop; pushint 1
+        let program = vec![6u8, 0x81, 0x01, 0x48, 0x81, salt, 0x48, 0x81, 0x01];
+        let sender = algo_validate::hash_program(&program);
+        let txn = Transaction {
+            txn_type: TxnType::Pay,
+            sender,
+            receiver: sender,
+            amount: 0,
+            fee: 1000,
+            first_valid: Round(100),
+            last_valid: Round(1100),
+            genesis_id: "test-v1".to_string(),
+            genesis_hash: [0xAA; 32],
+            note: serde_bytes::ByteBuf::from(vec![salt]),
+            ..Default::default()
+        };
+        SignedTransaction {
+            txn,
+            lsig: Some(algo_types::LogicSig {
+                logic: serde_bytes::ByteBuf::from(program),
+                args: (arg_len > 0).then(|| vec![serde_bytes::ByteBuf::from(vec![7u8; arg_len])]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Issue #2054 (FIND-ba9c86e5-01): pool admission must run go's
+    /// `logicSigGroupSizeCheck`, both on the uncached path and (through
+    /// `verify_transaction_group_cached`) on the cached path.
+    #[test]
+    fn pool_admission_enforces_logicsig_group_size_check() {
+        let ledger = test_ledger();
+        let v42 = consensus_params_for_version(algo_types::consensus::CONSENSUS_V42).unwrap();
+        let v41 = v41_params();
+        let want = "txgroup had 2000 bytes of LogicSig args, more than the available size pool of 1000 bytes";
+
+        for cached in [false, true] {
+            let mut eval = make_evaluator(&ledger, &v42, 100, &[]);
+            if cached {
+                eval.verified_txn_cache =
+                    Some(Arc::new(algo_validate::VerifiedTransactionCache::new(100)));
+            }
+            let err = eval
+                .test_transaction_group(&[make_escrow_with_arg(1, 2000)])
+                .expect_err("2000 arg bytes exceed the 1000 byte pool");
+            assert!(err.to_string().contains(want), "cached={cached}: {err}");
+
+            // Pooled across the group: 1500 arg bytes fit 2 * 1000. (Group-id
+            // and fee checks run later/independently; only assert the size
+            // check does not fire.)
+            let group = [make_escrow_with_arg(2, 1500), make_escrow_with_arg(3, 0)];
+            if let Err(e) = eval.test_transaction_group(&group) {
+                assert!(
+                    !e.to_string().contains("bytes of LogicSig"),
+                    "cached={cached}: {e}"
+                );
+            }
+
+            // Pre-v42: program + args are pooled.
+            let eval41 = make_evaluator(&ledger, &v41, 100, &[]);
+            let err = eval41
+                .test_transaction_group(&[make_escrow_with_arg(4, 1000)])
+                .expect_err("program+args exceed the 1000 byte pool");
+            assert!(
+                err.to_string()
+                    .contains("bytes of LogicSigs, more than the available pool of 1000 bytes"),
+                "{err}"
+            );
+        }
     }
 
     /// Issue #1017: gossip/mempool-admission wiring. When a

@@ -438,6 +438,15 @@ fn verify_transaction_group_cached_inner(
         return Ok(());
     }
 
+    // Group-level LogicSig size check (go: `txnGroupBatchPrep` ->
+    // `logicSigGroupSizeCheck`, `data/transactions/verify/txn.go`), run after
+    // the cache lookup (a cached group already passed it under this exact
+    // context) and before any signature work, like go. Without it a group
+    // whose LogicSig args exceed the pool would be admitted to the pool and
+    // proposed in a block that block validation (and go peers) reject
+    // (issue #2054, FIND-ba9c86e5-01).
+    crate::signature::logic_sig_group_size_check(txgroup, consensus)?;
+
     // No `SigBlockSource` is threaded through here (issue #1116): pool
     // admission has no `LedgerStore` reference in scope at all -- this
     // module, like `block.rs`, is deliberately stateless (Go's pool

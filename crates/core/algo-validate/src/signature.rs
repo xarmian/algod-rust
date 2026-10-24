@@ -1278,6 +1278,19 @@ pub fn logic_sig_group_size_check(
     group: &[SignedTransaction],
     consensus: &ConsensusParams,
 ) -> Result<(), AlgoError> {
+    logic_sig_group_size_check_indexed(group, consensus).map_err(|(_, e)| e)
+}
+
+/// [`logic_sig_group_size_check`] that also reports go's
+/// `TxGroupError.GroupIndex`: `Some(i)` for the orphan-content rejection
+/// (attributable to member `i`), `None` (go's `-1`) for the group-level pool
+/// rejections. Simulation needs the distinction (`Simulator.Simulate`
+/// reports an indexed error as the group's `FailedAt`, an unindexed one as a
+/// hard request error).
+pub fn logic_sig_group_size_check_indexed(
+    group: &[SignedTransaction],
+    consensus: &ConsensusParams,
+) -> Result<(), (Option<usize>, AlgoError)> {
     let mut lsig_pooled_size: u64 = 0;
     let mut lsig_args_size: u64 = 0;
     let mut lsig_args_need_size_pooling = false;
@@ -1286,7 +1299,7 @@ pub fn logic_sig_group_size_check(
     let pool_orphan_lsig_args =
         consensus.max_absolute_logic_sig_program_size > consensus.logic_sig_max_size;
 
-    for stx in group {
+    for (i, stx) in group.iter().enumerate() {
         let lsig = stx.lsig.as_ref();
         let has_program = lsig.is_some_and(|l| l.has_program());
         // Go: `lsig.Blank()` (includes `PQsig.Blank()` and `len(Args) == 0`).
@@ -1294,9 +1307,12 @@ pub fn logic_sig_group_size_check(
 
         if !has_program {
             if !is_blank && reject_orphan_lsig_content {
-                return Err(AlgoError::Validation {
-                    message: "LogicSig fields without LogicSig program".into(),
-                });
+                return Err((
+                    Some(i),
+                    AlgoError::Validation {
+                        message: "LogicSig fields without LogicSig program".into(),
+                    },
+                ));
             }
             if !pool_orphan_lsig_args {
                 continue;
@@ -1321,22 +1337,28 @@ pub fn logic_sig_group_size_check(
     // Protocols without per-byte surcharge cannot pay for LogicSig bytes above
     // the group pool: keep those protocols on the legacy total LogicSig size check.
     if !reject_orphan_lsig_content && lsig_pooled_size > lsig_available_pool {
-        return Err(AlgoError::Validation {
-            message: format!(
-                "txgroup had {lsig_pooled_size} bytes of LogicSigs, more than the available pool of {lsig_available_pool} bytes"
-            ),
-        });
+        return Err((
+            None,
+            AlgoError::Validation {
+                message: format!(
+                    "txgroup had {lsig_pooled_size} bytes of LogicSigs, more than the available pool of {lsig_available_pool} bytes"
+                ),
+            },
+        ));
     }
     // LogicSig args are unpriced. Each LogicSig may carry up to LogicSigMaxSize
     // without pooling; larger args are allowed only when the group's pool
     // covers the group's total args.
     if lsig_args_need_size_pooling && lsig_args_size > lsig_available_pool {
-        return Err(AlgoError::Validation {
-            message: format!(
-                "txgroup had {lsig_args_size} bytes of LogicSig args, more than the available size pool of {lsig_available_pool} bytes (per-LogicSig allowance is {})",
-                consensus.logic_sig_max_size
-            ),
-        });
+        return Err((
+            None,
+            AlgoError::Validation {
+                message: format!(
+                    "txgroup had {lsig_args_size} bytes of LogicSig args, more than the available size pool of {lsig_available_pool} bytes (per-LogicSig allowance is {})",
+                    consensus.logic_sig_max_size
+                ),
+            },
+        ));
     }
 
     Ok(())
