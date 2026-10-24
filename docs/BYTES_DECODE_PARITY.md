@@ -122,14 +122,48 @@ the rule is "reject nothing go accepts".
   generated unsigned-integer read (`ReadUint64Bytes`) maps nil to 0; Rust's
   `read_u64` and the struct readers reject both. This is a separate, wider
   non-canonical-encoding class than byte fields (tracked in #2063).
-* Other decoders with their own readers are outside this issue and unaudited:
-  `algo-agreement` `codec.rs`, `algo-consensus-crypto` (`onetimesig`,
-  `merklesig`), the serde (`rmp_serde`) paths of `algo-types`, and
-  `algo-ledger` catchpoint `msgp_compat.rs` (already accepts bin/str/nil for
-  slices; its fixed reader is length-strict).
+* Remaining raw decoders: see "Issue #2063: other crates" below.
 * The go side was verified by reading `read_bytes.go` and the generated
   decoders; the Go oracle binaries cannot be executed on the audit machine
   (blocked exec), so the differential vectors in
   `crates/core/algo-types/src/rmp_decode.rs` (`go_compat_*`) and
   `crates/core/algo-types/tests/go_msgp_bytes_compat_*.rs` pin the
   source-derived expectations, not runtime go output.
+
+## Issue #2063: other crates, fast path, string-reader audit
+
+Follow-up to #2046. Go readers are the same two as above (`ReadExactBytes`
+for `[N]byte`, `ReadBytesBytes` for `[]byte`); `algo_types::go_msgp` now
+exports the go-compat readers so other crates reuse them.
+
+| Rust site | go type / reader | Wire? | Outcome |
+|---|---|---|---|
+| `algo-agreement` `codec.rs` `read_bin_fixed` (all `[N]byte`: `oprop`, `sdpf`, `dig`, `encdig`, `snd`, `pf`, `h`, `m`, `v`, OTS `p`/`p1s`/`p2`/`p2s`/`ps`/`s`) | `Address`/`Digest`/`VrfProof`/`OneTimeSignature` -> `ReadExactBytes` | gossip | **changed**: go-compat (was bin + exact length only) |
+| `algo-consensus-crypto` `merklesig.rs` `FalconVerifier.k` | `FalconPublicKey [1793]byte` -> `ReadExactBytes` | state-proof sig (peer) | **changed** |
+| `merklesig.rs` `Verifier.cmt`, `Signature.sig` | `Commitment [64]byte`, `FalconSignature []byte` | state-proof sig (peer) | **changed** |
+| `algo-ledger` `stateproof_worker.rs` `SigFromAddr` `a` | `basics.Address` -> `ReadExactBytes` | gossip (`stateproof_service`) | **changed**; also no longer silently zeroes a non-container |
+| `algo-ledger` `catchpoint/msgp_compat.rs` `read_bytes_fixed`, `read_bytes_vec` | catchpoint blobs are `protocol.Decode`d by go: `ReadExactBytes`/`ReadBytesBytes`, length not enforced | go-written file | **changed** (was length-strict; array form added) |
+| `merklesig.rs` `FalconSigner` pk/sk; `onetimesig.rs` subkey `PK`/`SK`/`PKSig`/`sig2`, `OneTimeSignatureSecrets` verifier/`offpk2`/`offpk2sig` | go reads these with `ReadExactBytes` too | **no**: local participation-DB secrets, only ever written by go's/our encoder (always `bin`, exact length) | unchanged; strictness is harmless and no producer exists for other forms (follow-up issue) |
+| `algo-ledger` `voters.rs` `decode_participants` | algod-rust-internal LE-prefixed cache format | no | unchanged (not go format) |
+| `algo-kmd`, `algokey-rust`, `participation/restore.rs` `read_bin` | key files / wallet formats, local operator input | no | unchanged |
+
+**(c) array-form amplification**: elements of the uint8-array form were
+decoded one at a time through the generic integer reader. The decoder now
+takes positive-fixint and `uint8` elements through an inline fast path
+(identical results; every other form falls through to the old reader).
+The allocation was already bounded by remaining input (`rd.len() < n` check
+before `Vec::with_capacity`), and go has the same input-size-bound shape, so
+no additional cap was added (a cap smaller than the message limit would
+reject input go accepts).
+
+**(d) `read_string` / `read_str_bytes` nil acceptance**: `rmp_decode` is
+`pub(crate)`, so there are no callers outside `algo-types`. Every in-crate
+caller is a go `string` (or `protocol.TxType`/`ConsensusVersion`, string
+typed) field: `gen`, `proto`, `nextproto`, `upgradeprop`, `type`, AssetParams
+`un`/`an`/`au`. No non-string field uses them; nothing needed a stricter
+variant. The catchpoint `read_string` has its own implementation (accepts
+bin and str by design, internal blob).
+
+**(a) PQSig / FalconVerifier in `algo-types`** were already done in #2046
+(see the rows above); verified `PQSig.pk/sig` are `[]byte`
+(`data/transactions/pqsig.go`) and `FalconVerifier.k` is `[1793]byte`.

@@ -323,16 +323,11 @@ impl FalconVerifier {
 
             match key {
                 "k" => {
-                    let (val, rest) =
-                        read_bin(cur).map_err(|e| format!("FalconVerifier k: {e}"))?;
-                    if val.len() != FALCON_DET1024_PUBKEY_SIZE {
-                        return Err(format!(
-                            "FalconVerifier k: expected {} bytes, got {}",
-                            FALCON_DET1024_PUBKEY_SIZE,
-                            val.len()
-                        ));
-                    }
-                    result.k.copy_from_slice(val);
+                    // go `FalconPublicKey [1793]byte` -> `ReadExactBytes`
+                    // (issue #2063): bin/str/nil/uint8-array, min-copy.
+                    let (val, rest) = read_exact_go::<FALCON_DET1024_PUBKEY_SIZE>(cur)
+                        .map_err(|e| format!("FalconVerifier k: {e}"))?;
+                    result.k = val;
                     cur = rest;
                 }
                 _ => {
@@ -428,15 +423,10 @@ impl Verifier {
 
             match key {
                 "cmt" => {
-                    let (val, rest) = read_bin(cur).map_err(|e| format!("Verifier cmt: {e}"))?;
-                    if val.len() != MERKLE_SIGNATURE_SCHEME_ROOT_SIZE {
-                        return Err(format!(
-                            "Verifier cmt: expected {} bytes, got {}",
-                            MERKLE_SIGNATURE_SCHEME_ROOT_SIZE,
-                            val.len()
-                        ));
-                    }
-                    result.commitment.copy_from_slice(val);
+                    // go `Commitment [64]byte` -> `ReadExactBytes` (issue #2063).
+                    let (val, rest) = read_exact_go::<MERKLE_SIGNATURE_SCHEME_ROOT_SIZE>(cur)
+                        .map_err(|e| format!("Verifier cmt: {e}"))?;
+                    result.commitment = val;
                     cur = rest;
                 }
                 "lf" => {
@@ -663,8 +653,11 @@ impl Signature {
                     cur = &cur[consumed..];
                 }
                 "sig" => {
-                    let (val, rest) = read_bin(cur).map_err(|e| format!("Signature sig: {e}"))?;
-                    result.signature = val.to_vec();
+                    // go `FalconSignature []byte` -> `ReadBytesBytes`
+                    // (issue #2063): bin/str/nil/uint8-array.
+                    let (val, rest) =
+                        read_bytes_go(cur).map_err(|e| format!("Signature sig: {e}"))?;
+                    result.signature = val;
                     cur = rest;
                 }
                 "vkey" => {
@@ -1343,6 +1336,21 @@ fn read_str(data: &[u8]) -> Result<(&str, &[u8]), String> {
     Ok((s, &rest[len..]))
 }
 
+/// go `msgp.ReadExactBytes` for a `[N]byte` field (issue #2063).
+fn read_exact_go<const N: usize>(data: &[u8]) -> Result<([u8; N], &[u8]), String> {
+    let mut rd = data;
+    let v =
+        algo_types::go_msgp::read_fixed_bytes_go_compat::<N>(&mut rd).map_err(|e| e.to_string())?;
+    Ok((v, rd))
+}
+
+/// go `msgp.ReadBytesBytes` for a `[]byte` field (issue #2063).
+fn read_bytes_go(data: &[u8]) -> Result<(Vec<u8>, &[u8]), String> {
+    let mut rd = data;
+    let v = algo_types::go_msgp::read_bytes_go_compat(&mut rd).map_err(|e| e.to_string())?;
+    Ok((v, rd))
+}
+
 /// Read a msgpack binary blob, returning (&[u8], remaining_bytes).
 fn read_bin(data: &[u8]) -> Result<(&[u8], &[u8]), String> {
     if data.is_empty() {
@@ -1804,6 +1812,43 @@ mod tests {
         let (decoded, rest) = FalconVerifier::from_msgpack(&encoded).unwrap();
         assert!(rest.is_empty());
         assert_eq!(decoded.k, fv.k);
+    }
+
+    /// Issue #2063: wire-reachable merklesig structs decode like go's
+    /// `ReadExactBytes` / `ReadBytesBytes` (str/nil/uint8-array forms and
+    /// wrong-length `[N]byte` min-copy). The old reader accepted only
+    /// exact-length `bin`.
+    #[test]
+    fn test_go_msgp_byte_forms_for_wire_structs() {
+        // FalconVerifier.k [1793]byte: short bin zero-pads, long str truncates,
+        // nil zeroes, short uint8 array zero-pads.
+        let fv = |body: &[u8]| {
+            let mut enc = vec![0x81, 0xa1, b'k'];
+            enc.extend_from_slice(body);
+            FalconVerifier::from_msgpack(&enc).map(|(v, _)| v)
+        };
+        let v = fv(&[0xc4, 2, 7, 8]).unwrap();
+        assert_eq!(&v.k[..3], &[7, 8, 0]);
+        let mut long = vec![0xda];
+        long.extend_from_slice(&((FALCON_DET1024_PUBKEY_SIZE + 5) as u16).to_be_bytes());
+        long.extend(std::iter::repeat_n(9u8, FALCON_DET1024_PUBKEY_SIZE + 5));
+        assert!(fv(&long).unwrap().k.iter().all(|&b| b == 9));
+        assert!(fv(&[0xc0]).unwrap().is_zero());
+        let v = fv(&[0x92, 7, 8]).unwrap();
+        assert_eq!(&v.k[..3], &[7, 8, 0]);
+        assert!(fv(&[0x05]).is_err());
+
+        // Verifier.cmt [64]byte as a short str.
+        let mut enc = vec![0x81, 0xa3, b'c', b'm', b't', 0xa2, 1, 2];
+        let (ver, _) = Verifier::from_msgpack(&enc).unwrap();
+        assert_eq!(&ver.commitment[..3], &[1, 2, 0]);
+        // Signature.sig []byte as str and as nil (empty).
+        enc = vec![0x81, 0xa3, b's', b'i', b'g', 0xa2, 1, 2];
+        let (sig, _) = Signature::from_msgpack(&enc).unwrap();
+        assert_eq!(sig.signature, vec![1, 2]);
+        enc = vec![0x81, 0xa3, b's', b'i', b'g', 0xc0];
+        let (sig, _) = Signature::from_msgpack(&enc).unwrap();
+        assert!(sig.signature.is_empty());
     }
 
     #[test]

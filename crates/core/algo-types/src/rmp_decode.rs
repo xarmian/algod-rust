@@ -765,6 +765,22 @@ fn read_go_byte_container<'a>(rd: &mut &'a [u8]) -> Result<GoBytes<'a>> {
             }
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
+                // Fast path (issue #2063): positive fixint and uint8 are the
+                // forms every encoder emits for a byte element; take them
+                // without the generic integer decoder. Identical result.
+                match rd.first() {
+                    Some(&b) if b < 0x80 => {
+                        v.push(b);
+                        *rd = &rd[1..];
+                        continue;
+                    }
+                    Some(&0xcc) if rd.len() >= 2 => {
+                        v.push(rd[1]);
+                        *rd = &rd[2..];
+                        continue;
+                    }
+                    _ => {}
+                }
                 // go ReadUint8Bytes = ReadUint64Bytes (fixint, uint8-64,
                 // non-negative int8-64, nil -> 0) + a > 255 overflow check.
                 let e = if rd.first() == Some(&0xc0) {
@@ -1160,6 +1176,27 @@ mod tests {
         }
         // A huge array header must not allocate before the bound check.
         let mut rd: &[u8] = &[0xdd, 0xff, 0xff, 0xff, 0xff, 1];
+        assert!(read_bytes_go_compat(&mut rd).is_err());
+    }
+
+    #[test]
+    fn go_compat_array_fast_path_matches_generic_decoder() {
+        // Large uint8 array (fixint + uint8 elements): same bytes as bin form.
+        let want: Vec<u8> = (0..70_000u32).map(|i| (i % 256) as u8).collect();
+        let mut enc = vec![0xdd];
+        enc.extend_from_slice(&(want.len() as u32).to_be_bytes());
+        for &b in &want {
+            if b < 0x80 {
+                enc.push(b);
+            } else {
+                enc.extend_from_slice(&[0xcc, b]);
+            }
+        }
+        let mut rd = &enc[..];
+        assert_eq!(read_bytes_go_compat(&mut rd).unwrap(), want);
+        assert!(rd.is_empty());
+        // Truncated uint8 element still errors (fast path must not read past).
+        let mut rd: &[u8] = &[0x92, 0x01, 0xcc];
         assert!(read_bytes_go_compat(&mut rd).is_err());
     }
 
