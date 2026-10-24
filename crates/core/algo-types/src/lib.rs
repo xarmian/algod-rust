@@ -54,7 +54,7 @@ pub use pq::{
     canonical_pq_address_salt, pq_address, PQAddressSalt, PQDelegatedProgram, PQSig,
     PQ_SCHEME_FALCON1024,
 };
-pub use rmp_decode::check_msgpack_depth;
+pub use rmp_decode::{check_msgpack_depth, msgpack_value_len};
 pub use rmp_decode::{
     strict_unknown_fields, strict_unknown_fields_scan, StrictUnknownFieldsGuard, UnknownFieldError,
 };
