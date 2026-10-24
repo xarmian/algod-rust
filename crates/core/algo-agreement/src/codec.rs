@@ -653,24 +653,20 @@ fn read_uint64(cursor: &mut Cursor<&[u8]>) -> Result<u64, CodecError> {
     }
 }
 
-/// Read a binary value and copy into a fixed-size array.
+/// Read a `[N]byte` field exactly like go's generated agreement decoders
+/// (`msgp.ReadExactBytes`, issue #2063): accepts `bin`, `str`, `nil` (zeroed)
+/// and an array of uint8, and copies `min(encoded, N)` bytes without a length
+/// check. See `docs/BYTES_DECODE_PARITY.md`.
 fn read_bin_fixed<const N: usize>(cursor: &mut Cursor<&[u8]>) -> Result<[u8; N], CodecError> {
-    let val =
-        rmpv::decode::read_value(cursor).map_err(|e| CodecError::Decode(format!("bin: {e}")))?;
-    match val {
-        rmpv::Value::Binary(b) => {
-            if b.len() != N {
-                return Err(CodecError::Format(format!(
-                    "expected {N} bytes, got {}",
-                    b.len()
-                )));
-            }
-            let mut arr = [0u8; N];
-            arr.copy_from_slice(&b);
-            Ok(arr)
-        }
-        _ => Err(CodecError::Format(format!("expected binary, got {val:?}"))),
-    }
+    let buf: &[u8] = cursor.get_ref();
+    let pos = (cursor.position() as usize).min(buf.len());
+    let mut rd = &buf[pos..];
+    let before = rd.len();
+    let arr = algo_types::go_msgp::read_fixed_bytes_go_compat::<N>(&mut rd)
+        .map_err(|e| CodecError::Decode(format!("bin: {e}")))?;
+    let consumed = before - rd.len();
+    cursor.set_position((pos + consumed) as u64);
+    Ok(arr)
 }
 
 /// Read a msgpack bool value.
@@ -2168,6 +2164,35 @@ mod tests {
         let mut cursor = Cursor::new(encoded.as_slice());
         let decoded = decode_unauthenticated_credential(&mut cursor).unwrap();
         assert_eq!(decoded.proof, [0xbb; VRF_PROOF_SIZE]);
+    }
+
+    /// Issue #2063: `[N]byte` fields decode like go's `ReadExactBytes`
+    /// (bin/str/nil/uint8-array, `min(len, N)` copy, no length check). The
+    /// old strict `bin`-of-exact-length reader rejected all of these.
+    #[test]
+    fn fixed_byte_fields_decode_like_go_read_exact_bytes() {
+        let decode = |pf: &[u8]| {
+            let mut enc = vec![0x81, 0xa2, b'p', b'f'];
+            enc.extend_from_slice(pf);
+            let mut cursor = Cursor::new(enc.as_slice());
+            decode_unauthenticated_credential(&mut cursor).map(|c| c.proof)
+        };
+        let mut want = [0u8; VRF_PROOF_SIZE];
+        want[0] = 1;
+        want[1] = 2;
+        // short bin, short str, short array: tail stays zero
+        assert_eq!(decode(&[0xc4, 2, 1, 2]).unwrap(), want);
+        assert_eq!(decode(&[0xa2, 1, 2]).unwrap(), want);
+        assert_eq!(decode(&[0x92, 1, 2]).unwrap(), want);
+        // nil -> zeroed
+        assert_eq!(decode(&[0xc0]).unwrap(), [0u8; VRF_PROOF_SIZE]);
+        // long bin is truncated
+        let mut long = vec![0xc4, (VRF_PROOF_SIZE + 3) as u8];
+        long.extend((0..VRF_PROOF_SIZE + 3).map(|i| i as u8));
+        let got = decode(&long).unwrap();
+        assert_eq!(got[VRF_PROOF_SIZE - 1], (VRF_PROOF_SIZE - 1) as u8);
+        // go still rejects a non-container
+        assert!(decode(&[0x05]).is_err());
     }
 
     // ── Edge case tests ─────────────────────────────────────────────────
