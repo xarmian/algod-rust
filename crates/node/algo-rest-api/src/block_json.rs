@@ -191,10 +191,9 @@ fn write_json_string(out: &mut String, bytes: &[u8]) {
             }
             Err(e) => {
                 let upto = e.valid_up_to();
-                // SAFETY: `from_utf8` reported the first `upto` bytes as valid.
-                write_escaped_str(out, unsafe {
-                    std::str::from_utf8_unchecked(&bytes[i..i + upto])
-                });
+                if let Ok(valid) = std::str::from_utf8(&bytes[i..i + upto]) {
+                    write_escaped_str(out, valid);
+                }
                 i += upto;
                 // Emit exactly one replacement escape per invalid byte and
                 // re-decode from the next byte. Go's `utf8.DecodeRune` returns

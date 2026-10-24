@@ -113,3 +113,34 @@ fn no_unreviewed_direct_serde_msgpack_encode_in_production_code() {
         offenders.join("\n")
     );
 }
+
+/// Issues #2042 / #2051: constructing an invalid `&str` is UB; production code
+/// must not use `from_utf8_unchecked`.
+#[test]
+fn no_from_utf8_unchecked_in_production_code() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let mut files = Vec::new();
+    for sub in ["crates", "bin", "tools"] {
+        walk(&root.join(sub), &mut files);
+    }
+    assert!(files.len() > 100);
+    let mut offenders = Vec::new();
+    for f in files {
+        let Ok(src) = std::fs::read_to_string(&f) else {
+            continue;
+        };
+        for (i, line) in src.lines().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("#[cfg(test)]") {
+                break;
+            }
+            if t.starts_with("//") {
+                continue;
+            }
+            if line.contains("from_utf8_unchecked") {
+                offenders.push(format!("{}:{}: {}", f.display(), i + 1, t));
+            }
+        }
+    }
+    assert!(offenders.is_empty(), "{}", offenders.join("\n"));
+}
