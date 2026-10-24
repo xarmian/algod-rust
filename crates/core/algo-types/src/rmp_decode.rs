@@ -263,7 +263,7 @@ pub fn reject_when_strict(rd: &[u8], key: &[u8]) -> Result<()> {
 /// catchable error instead.
 #[inline]
 pub fn skip_value(rd: &mut &[u8]) -> Result<()> {
-    let mut remaining: Vec<u32> = vec![1];
+    let mut remaining: Vec<u64> = vec![1];
     while let Some(count) = remaining.last_mut() {
         if *count == 0 {
             remaining.pop();
@@ -284,9 +284,9 @@ pub fn skip_value(rd: &mut &[u8]) -> Result<()> {
             // positive fixint (0x00..=0x7f) — no data bytes
             0x00..=0x7f => {}
             // fixmap (0x80..=0x8f) — len 0..15 key-value pairs
-            0x80..=0x8f => remaining.push(((b & 0x0f) as u32) * 2),
+            0x80..=0x8f => remaining.push(((b & 0x0f) as u64) * 2),
             // fixarray (0x90..=0x9f) — len 0..15 elements
-            0x90..=0x9f => remaining.push((b & 0x0f) as u32),
+            0x90..=0x9f => remaining.push((b & 0x0f) as u64),
             // fixstr (0xa0..=0xbf) — len 0..31
             0xa0..=0xbf => skip_bytes(rd, (b & 0x1f) as usize)?,
             // nil, false, true
@@ -370,22 +370,24 @@ pub fn skip_value(rd: &mut &[u8]) -> Result<()> {
             }
             // array16
             0xdc => {
-                let len = read_data_u16(rd)? as u32;
+                let len = read_data_u16(rd)? as u64;
                 remaining.push(len);
             }
             // array32
             0xdd => {
-                let len = read_data_u32_raw(rd)?;
+                let len = read_data_u32_raw(rd)? as u64;
                 remaining.push(len);
             }
             // map16
             0xde => {
-                let len = read_data_u16(rd)? as u32;
+                let len = read_data_u16(rd)? as u64;
                 remaining.push(len * 2);
             }
             // map32
             0xdf => {
-                let len = read_data_u32_raw(rd)?;
+                // u64 accounting: a map32 length near u32::MAX doubled
+                // overflows u32 (and usize on 32-bit targets).
+                let len = read_data_u32_raw(rd)? as u64;
                 remaining.push(len * 2);
             }
             // negative fixint (0xe0..=0xff) — no data bytes
@@ -1166,6 +1168,25 @@ mod tests {
         let mut rd = &data[..];
         skip_value(&mut rd).unwrap();
         assert!(rd.is_empty());
+    }
+
+    #[test]
+    fn skip_value_huge_container_headers_error_without_overflow() {
+        // map32 / array32 claiming 0xFFFF_FFFF entries with no body: must
+        // be a clean EOF error (previously `len * 2` overflowed u32).
+        for hdr in [0xdfu8, 0xdd] {
+            let mut data = vec![hdr];
+            data.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+            let mut rd = &data[..];
+            assert!(skip_value(&mut rd).is_err());
+            assert!(msgpack_value_len(&data).is_err());
+        }
+        // Same with a little body so the loop runs a few iterations.
+        let mut data = vec![0xdfu8];
+        data.extend_from_slice(&0x8000_0000u32.to_be_bytes());
+        data.extend_from_slice(&[0x01, 0x02, 0x03]);
+        let mut rd = &data[..];
+        assert!(skip_value(&mut rd).is_err());
     }
 
     #[test]
