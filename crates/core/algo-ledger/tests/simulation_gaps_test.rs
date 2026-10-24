@@ -3144,6 +3144,34 @@ fn simulate_rejects_oversize_lsig_args_v42() {
     }
 }
 
+/// go's `Simulator.check` (`ledger/simulation/simulator.go:175-237`) always
+/// runs `verify.TxnGroupWithTracer`; `AllowEmptySignatures` only swaps
+/// signature-less members for proxy-signed copies. An escrow LogicSig member
+/// has a (non-blank) signature, so it is not swapped and the pool-size check
+/// still rejects it with `AllowEmptySignatures` set.
+#[test]
+fn simulate_oversize_lsig_args_rejected_with_allow_empty_signatures() {
+    let mut state = base_state();
+    state.protocol = algo_types::consensus::CONSENSUS_V42.to_string();
+    let stx = escrow_with_arg(&mut state, 1, 2000);
+    let err = simulate(
+        &mut state,
+        SimulationRequest {
+            txn_groups: vec![vec![stx]],
+            allow_empty_signatures: true,
+            ..Default::default()
+        },
+    )
+    .expect_err("size check is independent of AllowEmptySignatures");
+    match err {
+        SimulatorError::InvalidRequest(e) => assert_eq!(
+            e.message,
+            "txgroup had 2000 bytes of LogicSig args, more than the available size pool of 1000 bytes (per-LogicSig allowance is 1000)"
+        ),
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+}
+
 /// Orphan-LogicSig member (args, no program) with the given fee.
 fn orphan_lsig_member(
     state: &mut LedgerState,

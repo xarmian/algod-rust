@@ -9474,8 +9474,16 @@ mod tests {
             for s in &mut group {
                 s.txn.group = gid;
             }
-            eval.test_transaction_group(&group)
-                .unwrap_or_else(|e| panic!("cached={cached}: pooled args must be admitted: {e}"));
+            // A fresh evaluator per iteration (above), a computed group id and
+            // a sufficient fee make this group otherwise fully valid, so any
+            // failure here is attributable.
+            if let Err(e) = eval.test_transaction_group(&group) {
+                assert!(
+                    !e.to_string().contains("bytes of LogicSig"),
+                    "cached={cached}: pooled args wrongly rejected by the size pool: {e}"
+                );
+                panic!("cached={cached}: pooled args must be admitted: {e}");
+            }
 
             // Pre-v42: program + args are pooled (and pooled across a group).
             let mut eval41 = make_evaluator(&ledger, &v41, 100, &[]);

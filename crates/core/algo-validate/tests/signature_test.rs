@@ -898,9 +898,28 @@ fn decoded_lsig_without_l_is_rejected_by_group_and_signature_checks() {
         algo_types::consensus::consensus_params_for_version(algo_types::consensus::CONSENSUS_V41)
             .unwrap();
     let mut budget = GroupBudget::for_logicsig(1);
-    assert!(verify_transaction_signature(&group[0], &group, 0, &mut budget, &v41).is_err());
+    let err = verify_transaction_signature(&group[0], &group, 0, &mut budget, &v41)
+        .expect_err("per-transaction check must reject a programless LogicSig");
+    assert!(err.to_string().contains("no signature"), "{err}");
+    // The per-transaction path is independent of the group check, so it
+    // rejects the same way under v42 when called directly.
+    let mut budget = GroupBudget::for_logicsig(1);
+    let err = verify_transaction_signature(&group[0], &group, 0, &mut budget, &v42())
+        .expect_err("per-transaction check must reject a programless LogicSig at v42");
+    assert!(err.to_string().contains("no signature"), "{err}");
 
-    // Pool/gossip admission.
+    // Pool/gossip admission, pre-pricing (v41): no group-level orphan
+    // rejection exists, so the per-transaction check is what rejects.
+    let cache41 = algo_validate::VerifiedTransactionCache::new(10);
+    let ctx41 = algo_validate::VerificationContext {
+        spec_addrs: Default::default(),
+        consensus_version: algo_types::consensus::CONSENSUS_V41.to_string(),
+    };
+    let err = algo_validate::verify_transaction_group_cached(&group, &ctx41, &v41, &cache41)
+        .expect_err("pre-pricing pool admission must reject an orphan LogicSig");
+    assert!(err.to_string().contains("no signature"), "{err}");
+
+    // Pool/gossip admission, size pricing (v42).
     let cache = algo_validate::VerifiedTransactionCache::new(10);
     let ctx = algo_validate::VerificationContext {
         spec_addrs: Default::default(),
