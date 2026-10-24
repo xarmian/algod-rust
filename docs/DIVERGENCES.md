@@ -55,6 +55,7 @@ consensus-compatible. It exists for three readers:
 | DIV-001 | Falcon-1024 `det1024` implemented in pure Rust; vendored C kept as a runtime-selectable backend (`config.json` `FalconBackend`) | crypto / state proofs / PQ accounts / AVM `falcon_verify` | landed | 2026-10-14 | none (bit-identical keys, signatures, verify decisions, CT conversion) | `crates/core/algo-falcon/`, `crates/node/algo-config/src/lib.rs` (`FalconBackend`), `bin/algod-rust/src/commands/node.rs`, `crates/tools/algokey-rust` | `crypto/falconWrapper.go`, module `github.com/algorand/falcon` v0.1.0 (`falcon.go`, `deterministic.c`, Pornin's reference C) | Go-generated vector corpus diffed in CI, per-function differential tests vs the vendored C, fuzz target (epic #1926) |
 | DIV-002 | `goal node pendingtxns` prints each pending transaction in the REST API's JSON form instead of Go's `encoding/json` dump of its decoded `SignedTxn` structs | goal-rust CLI output | landed | 2026-10-17 | none (client-side formatting of data the node already serves) | `crates/tools/goal-rust/src/cmd/node.rs` (`format_pending_txns`) | `cmd/goal/node.go` (`pendingTxnsCmd`), `libgoal/libgoal.go` (`GetParsedPendingTransactions`) | unit test of the exact text for the empty and non-empty pool, mock-node end-to-end test |
 | DIV-003 | `algo-abi` rejects ABI types whose encoded head size overflows `usize` at parse time, and caps zero-size array element expansion in `decode` | ABI type parsing / decoding (REST `abi:` box names, goal CLI) | landed | 2026-10-24 | none (no such type can be encoded; valid ARC-4 vectors byte-identical) | `crates/core/algo-abi/src/lib.rs` (`check_static_size`, `MAX_ZERO_SIZE_ELEMS`) | `github.com/algorand/avm-abi` `abi/abi_type.go` (`TypeOf`, `GetEncodedSize`), `abi/abi_encode.go` | `algo-abi` unit tests (overflow/huge-array/zero-size cases) plus the unchanged ARC-4 vector suite (#2057) |
+| DIV-004 | Hand-written msgpack struct readers decode the map form only (go also decodes struct-from-array) and replace, rather than merge into, a struct/array on a duplicated key | wire decoding of non-canonical msgpack (blocks, transactions, heartbeat, state proof, PQ structs) | landed | 2026-10-24 | none for canonical encodings (go's encoder never emits the array form or duplicate keys; hashes are over the canonical re-encode); only non-canonical input go accepts is rejected or decoded differently | `crates/core/algo-types/src/rmp_decode.rs` (`read_map_len`), the `decode_from_reader` struct readers in `crates/core/algo-types/src/{transaction,block,header,pq}.rs` | `data/transactions/msgp_gen.go` (`SignedTxn.UnmarshalMsgWithState` struct-from-array branch and key loop), algorand/msgp `msgp/read_bytes.go` | `docs/BYTES_DECODE_PARITY.md` "Issue #2065: final disposition"; `go_msgp_nil_scalars_test.rs` pins the parts that were implemented (nil -> zero) |
 
 ## Entries
 
@@ -200,3 +201,44 @@ unchanged and green; new unit tests cover the rejected cases and the boundary
 
 **How go-algorand could port it.** Use overflow-checked multiplication in the
 size computation and validate `len*minElemSize <= len(data)` before decoding.
+
+### DIV-004 — Map-form-only struct readers; no merge-into-existing on duplicate keys
+
+**Status:** landed (#2065; audit chain #2046 -> #2063 -> #2065).
+
+**What go-algorand does.** Every generated `UnmarshalMsgWithState` first
+calls `msgp.ReadMapHeaderBytes`; on a `TypeError` it retries
+`ReadArrayHeaderBytes` and decodes the fields positionally in Go declaration
+order ("struct-from-array", `ErrTooManyArrayFields` on excess). In the map
+branch there is no duplicate-key detection: a repeated key decodes into the
+already-populated field, so a repeated nested struct merges and a repeated
+fixed-size byte value shorter than the array keeps the earlier tail.
+
+**What algod-rust does instead.** The hand-written `decode_from_reader`
+struct readers accept the map form (and nil, as go does, since #2065) but not
+the array form, and a repeated key replaces the field (nested struct /
+fixed-size array zero-filled) instead of merging. The derived-serde path used
+for catchup `decode_block*` and transaction-sync responses behaves likewise.
+
+**What is identical.** All canonical input (go's encoder always writes a
+map with unique keys), nil -> zero for integers/bools/map headers, every
+byte-field form (`docs/BYTES_DECODE_PARITY.md`), unknown-key handling, and
+every hash, ID and signature input (all are over the canonical re-encode of
+the decoded struct in both implementations).
+
+**Why.** Positional decoding needs a per-struct field-order table for ~100
+readers and merge-on-duplicate needs decode-into-existing everywhere; the
+only inputs that benefit are hand-crafted non-canonical encodings that no
+node emits.
+
+**How parity is proven / impact.** No safety impact: a non-canonical wrapper
+cannot change a hash, so no fork. Worst case an adversary makes algod-rust
+drop one proposal payload or gossiped transaction, or one catchup peer, that
+go would decode (one-round liveness, repaired by catchup or another peer).
+Reasoning and the source citations are in `docs/BYTES_DECODE_PARITY.md`
+("Issue #2065: final disposition").
+
+**How to switch back.** No switch.
+
+**How go-algorand could port it.** Not applicable (go is the more permissive
+side).
