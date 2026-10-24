@@ -124,18 +124,29 @@ impl AbiType {
     /// rejects such types, so `None` for a non-dynamic type only arises from
     /// hand-built `AbiType` values.
     pub fn byte_len(&self) -> Option<usize> {
+        if self.is_dynamic() {
+            None
+        } else {
+            self.head_len()
+        }
+    }
+
+    /// Bytes this type contributes to an enclosing head: the full encoded
+    /// size for static types, 2 (the offset) for dynamic ones. For a dynamic
+    /// type itself this is the size of its own head. `None` on overflow.
+    pub fn head_len(&self) -> Option<usize> {
         match self {
             AbiType::Uint(n) | AbiType::Ufixed(n, _) => Some(*n as usize / 8),
             AbiType::Bool => Some(1),
             AbiType::Byte => Some(1),
             AbiType::Address => Some(32),
-            AbiType::String | AbiType::ArrayDynamic(_) => None,
+            AbiType::String | AbiType::ArrayDynamic(_) => Some(2),
             AbiType::ArrayStatic(elem, len) => {
                 if **elem == AbiType::Bool {
                     // Bool arrays are bit-packed.
                     Some((*len).div_ceil(8))
                 } else {
-                    elem.byte_len()?.checked_mul(*len)
+                    elem.child_head_len()?.checked_mul(*len)
                 }
             }
             AbiType::Tuple(children) => {
@@ -153,12 +164,20 @@ impl AbiType {
                         size = size.checked_add(bool_count.div_ceil(8))?;
                         i += bool_count;
                     } else {
-                        size = size.checked_add(children[i].byte_len()?)?;
+                        size = size.checked_add(children[i].child_head_len()?)?;
                         i += 1;
                     }
                 }
                 Some(size)
             }
+        }
+    }
+
+    fn child_head_len(&self) -> Option<usize> {
+        if self.is_dynamic() {
+            Some(2)
+        } else {
+            self.head_len()
         }
     }
 }
@@ -297,7 +316,7 @@ fn parse_static_array(s: &str, depth: usize) -> Result<AbiType, String> {
 /// #2057). go-algorand's `int` byteLen wraps silently here; no such type can
 /// be encoded, so refusing it at parse time changes no valid behaviour.
 fn check_static_size(t: AbiType) -> Result<AbiType, String> {
-    if !t.is_dynamic() && t.byte_len().is_none() {
+    if t.head_len().is_none() {
         return Err(format!("ABI type \"{t}\" is too large to encode"));
     }
     Ok(t)
@@ -1003,9 +1022,9 @@ fn decode_tuple_types(children: &[AbiType], data: &[u8]) -> Result<Vec<AbiValue>
             pos += 2;
             i += 1;
         } else {
-            let len = children[i].byte_len().ok_or_else(|| {
-                "cannot decode abi tuple: static type missing byte_len".to_string()
-            })?;
+            let len = children[i]
+                .byte_len()
+                .ok_or_else(|| "cannot decode abi tuple: static type size overflows".to_string())?;
             if pos.checked_add(len).is_none_or(|end| end > data.len()) {
                 return Err("cannot decode abi tuple: static field out of bounds".into());
             }
@@ -3512,8 +3531,13 @@ mod tests {
         assert!(type_of(&format!("({OVERFLOW_TYPE},uint8)")).is_err());
         // Large-but-representable static types still parse.
         assert!(type_of("uint8[65535][65535]").is_ok());
-        // Dynamic types are unaffected.
+        // An overflowing static element makes the enclosing dynamic array invalid too.
         assert!(type_of("uint64[65535][65535][65535][65535][65535][]").is_err());
+        // Dynamic tuple whose static head parts sum past usize.
+        let big = "uint8[65535][65535][65535][65535]";
+        let tup = format!("({big},{big},{big},{big},{big},{big},{big},{big},string)");
+        assert!(type_of(&tup).is_err());
+        assert!(type_of(&format!("({big},string)")).is_ok());
         assert!(type_of("string[65535][65535][65535][65535][65535]").is_ok());
     }
 

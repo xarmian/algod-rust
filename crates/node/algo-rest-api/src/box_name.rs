@@ -261,7 +261,7 @@ mod tests {
         // FIND-ba9c86e5-03 (#2057): must be a clean error, not a panic/alloc.
         let name = "abi:uint64[65535][65535][65535][65535][65535]:[]";
         assert!(parse_box_name(name).is_err());
-        assert!(parse_box_name("abi:uint8[65535][65535][65535][65535]:[]").is_err());
+        assert!(parse_box_name("abi:(uint8[65535][65535][65535][65535],uint8[65535][65535][65535][65535],uint8[65535][65535][65535][65535],uint8[65535][65535][65535][65535],uint8[65535][65535][65535][65535],uint8[65535][65535][65535][65535],uint8[65535][65535][65535][65535],uint8[65535][65535][65535][65535],string):[]").is_err());
     }
 
     #[test]
