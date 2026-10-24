@@ -133,13 +133,37 @@ pub fn decode_block_response_fast(bytes: &[u8]) -> Result<BlockResponse> {
     BlockResponse::decode_from_bytes(bytes)
 }
 
+/// `rmp_serde::to_vec_named` that keeps go's exact msgpack `str` bytes for
+/// non-UTF-8 `AssetParams` `un`/`an`/`au` (issue #2042).
+///
+/// `serde_raw_str::serialize` cannot write such a `str` through the generic
+/// serde `Serializer` without `unsafe`, so it emits a placeholder ext and
+/// raises a thread-local flag; this rewrites the ext back into a `str`. Use
+/// at every serde-msgpack edge whose bytes leave the process or are fed to a
+/// hand decoder. Valid-UTF-8 values take the unchanged `to_vec_named` bytes.
+pub fn to_vec_named_str_preserving<T: serde::Serialize + ?Sized>(
+    value: &T,
+) -> std::result::Result<Vec<u8>, rmp_serde::encode::Error> {
+    use algo_types::serde_bytes_array::serde_raw_str as raw;
+    // Save/restore the flag so an enclosing serialization (or a stale value
+    // from a direct serde call) is neither consumed nor relied upon.
+    let prev = raw::replace_ext_emitted(false);
+    let res = rmp_serde::to_vec_named(value);
+    let emitted = raw::replace_ext_emitted(prev);
+    let bytes = res?;
+    if !emitted {
+        return Ok(bytes);
+    }
+    raw::rewrite_ext_to_str(&bytes).map_err(rmp_serde::encode::Error::Syntax)
+}
+
 /// Encode a block to msgpack bytes.
 ///
 /// Note: Phase 0 uses `rmp-serde` named encoding. This does NOT produce
 /// Algorand canonical encoding (sorted keys, omitted zero-values).
 /// See `canonical.rs` for the roadmap to canonical encoding.
 pub fn encode_block(block: &Block) -> Result<Vec<u8>> {
-    rmp_serde::to_vec_named(block).map_err(|e| AlgoError::Codec {
+    to_vec_named_str_preserving(block).map_err(|e| AlgoError::Codec {
         source: Box::new(e),
         context: "failed to encode block to msgpack".into(),
     })

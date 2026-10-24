@@ -597,7 +597,7 @@ impl BlockSource for GossipBlockSource {
         // envelope format. Instead, fetch the block and re-encode it. This is
         // less efficient than the REST path but satisfies the trait contract.
         let block_response = self.get_block(round).await?;
-        rmp_serde::to_vec_named(&block_response).map_err(|e| AlgoError::Codec {
+        algo_codec::to_vec_named_str_preserving(&block_response).map_err(|e| AlgoError::Codec {
             source: Box::new(e),
             context: format!("re-encoding block response for round {round}"),
         })
