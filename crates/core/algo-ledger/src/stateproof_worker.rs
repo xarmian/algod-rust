@@ -291,12 +291,15 @@ impl SigFromAddr {
         for (key, val) in fields {
             match key.as_str() {
                 Some("a") => {
-                    if let Some(bytes) = val.as_slice() {
-                        let mut addr = [0u8; 32];
-                        let n = bytes.len().min(32);
-                        addr[..n].copy_from_slice(&bytes[..n]);
-                        signer_address = Address(addr);
-                    }
+                    // go `Address` -> `ReadExactBytes` (issue #2063): bin/str/
+                    // nil/uint8-array, min-copy; a non-container is an error
+                    // (previously silently dropped to the zero address).
+                    let mut raw = Vec::new();
+                    rmpv::encode::write_value(&mut raw, &val)
+                        .map_err(|e| format!("SigFromAddr: re-encode a: {e}"))?;
+                    let mut rd: &[u8] = &raw;
+                    signer_address = algo_types::go_msgp::read_address_go_compat(&mut rd)
+                        .map_err(|e| format!("SigFromAddr: a: {e}"))?;
                 }
                 Some("r") => round = val.as_u64().unwrap_or(0),
                 Some("s") => {
@@ -2518,6 +2521,25 @@ mod tests {
             decoded.sig.vector_commitment_index,
             sig.vector_commitment_index
         );
+    }
+
+    /// Issue #2063: the signer address decodes like go's `ReadExactBytes`
+    /// (str/array/short forms accepted); a non-container is an error instead
+    /// of silently becoming the zero address.
+    #[test]
+    fn sig_from_addr_signer_address_go_msgp_forms() {
+        let dec = |body: &[u8]| {
+            let mut w = vec![0x81, 0xa1, b'a'];
+            w.extend_from_slice(body);
+            SigFromAddr::from_msgpack(&w).map(|s| s.signer_address)
+        };
+        let mut want = [0u8; 32];
+        want[0] = 4;
+        want[1] = 5;
+        assert_eq!(dec(&[0xa2, 4, 5]).unwrap(), Address(want)); // short str
+        assert_eq!(dec(&[0x92, 4, 5]).unwrap(), Address(want)); // uint8 array
+        assert_eq!(dec(&[0xc0]).unwrap(), Address::default()); // nil
+        assert!(dec(&[0x05]).is_err());
     }
 
     #[test]

@@ -187,129 +187,20 @@ fn read_bool(rd: &mut &[u8]) -> Result<bool, CatchpointError> {
     }
 }
 
-/// Read a msgpack binary value and copy into a fixed-size array.
-/// If the value is nil, returns a zeroed array.
+/// Read a `[N]byte` field like go's generated decoders (`msgp.ReadExactBytes`,
+/// issue #2063): `bin`/`str`/`nil` (zeroed)/uint8-array, and `min(len, N)`
+/// bytes are copied -- go does not enforce the length (the strict check is
+/// commented out in `read_bytes.go`), so a wrong-length value is not an error.
 fn read_bytes_fixed<const N: usize>(rd: &mut &[u8]) -> Result<[u8; N], CatchpointError> {
-    let marker = peek_byte(rd)?;
-    if marker == 0xc0 {
-        // nil
-        *rd = &rd[1..];
-        return Ok([0u8; N]);
-    }
-    let data = read_bytes_vec(rd)?;
-    if data.len() != N {
-        return Err(CatchpointError::DecodeError(format!(
-            "expected {} bytes, got {}",
-            N,
-            data.len()
-        )));
-    }
-    let mut arr = [0u8; N];
-    arr.copy_from_slice(&data);
-    Ok(arr)
+    algo_types::go_msgp::read_fixed_bytes_go_compat::<N>(rd)
+        .map_err(|e| CatchpointError::DecodeError(e.to_string()))
 }
 
-/// Read a msgpack binary or string value as a byte vector.
+/// Read a `[]byte` field like go's `msgp.ReadBytesBytes` (issue #2063):
+/// `bin`, `str`, `nil` (empty), uint8-array.
 fn read_bytes_vec(rd: &mut &[u8]) -> Result<Vec<u8>, CatchpointError> {
-    let marker = peek_byte(rd)?;
-    match marker {
-        // nil
-        0xc0 => {
-            *rd = &rd[1..];
-            Ok(Vec::new())
-        }
-        // bin8
-        0xc4 => {
-            if rd.len() < 2 {
-                return Err(CatchpointError::DecodeError("truncated bin8".into()));
-            }
-            let len = rd[1] as usize;
-            if rd.len() < 2 + len {
-                return Err(CatchpointError::DecodeError("truncated bin8 data".into()));
-            }
-            let data = rd[2..2 + len].to_vec();
-            *rd = &rd[2 + len..];
-            Ok(data)
-        }
-        // bin16
-        0xc5 => {
-            if rd.len() < 3 {
-                return Err(CatchpointError::DecodeError("truncated bin16".into()));
-            }
-            let len = u16::from_be_bytes([rd[1], rd[2]]) as usize;
-            if rd.len() < 3 + len {
-                return Err(CatchpointError::DecodeError("truncated bin16 data".into()));
-            }
-            let data = rd[3..3 + len].to_vec();
-            *rd = &rd[3 + len..];
-            Ok(data)
-        }
-        // bin32
-        0xc6 => {
-            if rd.len() < 5 {
-                return Err(CatchpointError::DecodeError("truncated bin32".into()));
-            }
-            let len = u32::from_be_bytes([rd[1], rd[2], rd[3], rd[4]]) as usize;
-            if rd.len() < 5 + len {
-                return Err(CatchpointError::DecodeError("truncated bin32 data".into()));
-            }
-            let data = rd[5..5 + len].to_vec();
-            *rd = &rd[5 + len..];
-            Ok(data)
-        }
-        // fixstr (0xa0..=0xbf) -- Go's msgp sometimes encodes short byte sequences as str
-        m @ 0xa0..=0xbf => {
-            let len = (m & 0x1f) as usize;
-            if rd.len() < 1 + len {
-                return Err(CatchpointError::DecodeError("truncated fixstr".into()));
-            }
-            let data = rd[1..1 + len].to_vec();
-            *rd = &rd[1 + len..];
-            Ok(data)
-        }
-        // str8
-        0xd9 => {
-            if rd.len() < 2 {
-                return Err(CatchpointError::DecodeError("truncated str8".into()));
-            }
-            let len = rd[1] as usize;
-            if rd.len() < 2 + len {
-                return Err(CatchpointError::DecodeError("truncated str8 data".into()));
-            }
-            let data = rd[2..2 + len].to_vec();
-            *rd = &rd[2 + len..];
-            Ok(data)
-        }
-        // str16
-        0xda => {
-            if rd.len() < 3 {
-                return Err(CatchpointError::DecodeError("truncated str16".into()));
-            }
-            let len = u16::from_be_bytes([rd[1], rd[2]]) as usize;
-            if rd.len() < 3 + len {
-                return Err(CatchpointError::DecodeError("truncated str16 data".into()));
-            }
-            let data = rd[3..3 + len].to_vec();
-            *rd = &rd[3 + len..];
-            Ok(data)
-        }
-        // str32
-        0xdb => {
-            if rd.len() < 5 {
-                return Err(CatchpointError::DecodeError("truncated str32".into()));
-            }
-            let len = u32::from_be_bytes([rd[1], rd[2], rd[3], rd[4]]) as usize;
-            if rd.len() < 5 + len {
-                return Err(CatchpointError::DecodeError("truncated str32 data".into()));
-            }
-            let data = rd[5..5 + len].to_vec();
-            *rd = &rd[5 + len..];
-            Ok(data)
-        }
-        _ => Err(CatchpointError::DecodeError(format!(
-            "expected bin/str, got marker 0x{marker:02x}"
-        ))),
-    }
+    algo_types::go_msgp::read_bytes_go_compat(rd)
+        .map_err(|e| CatchpointError::DecodeError(e.to_string()))
 }
 
 /// Read a msgpack string value.
@@ -1841,11 +1732,22 @@ mod tests {
 
     #[test]
     fn read_bytes_fixed_wrong_size() {
+        // go ReadExactBytes copies min(len, N) and does not enforce the
+        // length (issue #2063): short input zero-pads, long input truncates.
         let mut data = vec![0xc4, 16]; // bin8 with 16 bytes
         data.extend_from_slice(&[0xBB; 16]);
         let mut rd: &[u8] = &data;
-        let result = read_bytes_fixed::<32>(&mut rd);
-        assert!(result.is_err());
+        let result = read_bytes_fixed::<32>(&mut rd).unwrap();
+        assert_eq!(&result[..16], &[0xBB; 16]);
+        assert_eq!(&result[16..], &[0u8; 16]);
+        // str form and uint8-array form (go accepts both)
+        let mut rd: &[u8] = &[0xa2, 1, 2];
+        assert_eq!(&read_bytes_fixed::<4>(&mut rd).unwrap(), &[1, 2, 0, 0]);
+        let mut rd: &[u8] = &[0x92, 1, 2];
+        assert_eq!(&read_bytes_fixed::<4>(&mut rd).unwrap(), &[1, 2, 0, 0]);
+        // a non-container is still an error
+        let mut rd: &[u8] = &[0x05];
+        assert!(read_bytes_fixed::<4>(&mut rd).is_err());
     }
 
     #[test]
