@@ -110,6 +110,17 @@ pub fn check_msgpack_depth(bytes: &[u8]) -> Result<()> {
     skip_value(&mut rd)
 }
 
+/// Like [`check_msgpack_depth`], but on success returns the byte length of
+/// the (first) msgpack value, so a caller walking a concatenated stream can
+/// slice off exactly one element and advance in a single scan (issue #2043).
+/// Errors (depth > 255, truncated, malformed) are identical to
+/// [`check_msgpack_depth`]'s.
+pub fn msgpack_value_len(bytes: &[u8]) -> Result<usize> {
+    let mut rd = bytes;
+    skip_value(&mut rd)?;
+    Ok(bytes.len() - rd.len())
+}
+
 // ── Strict unknown-field mode (issue #1962) ────────────────────────────
 //
 // go-algorand's `POST /v2/transactions` decodes with `protocol.NewDecoder`
@@ -1185,6 +1196,21 @@ mod tests {
             check_msgpack_depth(&nested_fixarray_payload(MAX_MSGPACK_DECODE_DEPTH - 1)).is_ok()
         );
         assert!(check_msgpack_depth(&nested_fixarray_payload(MAX_MSGPACK_DECODE_DEPTH)).is_err());
+    }
+
+    #[test]
+    fn msgpack_value_len_returns_first_value_length_and_same_errors() {
+        // Two concatenated values: [0x91 0x00] then fixint 7.
+        let data = [0x91u8, 0x00, 0x07];
+        assert_eq!(msgpack_value_len(&data).unwrap(), 2);
+        assert_eq!(msgpack_value_len(&data[2..]).unwrap(), 1);
+        // Truncated array (claims one element, none present).
+        assert!(msgpack_value_len(&[0x91]).is_err());
+        assert!(msgpack_value_len(&[]).is_err());
+        // Depth boundary matches check_msgpack_depth.
+        let ok = nested_fixarray_payload(MAX_MSGPACK_DECODE_DEPTH - 1);
+        assert_eq!(msgpack_value_len(&ok).unwrap(), ok.len());
+        assert!(msgpack_value_len(&nested_fixarray_payload(MAX_MSGPACK_DECODE_DEPTH)).is_err());
     }
 
     #[test]

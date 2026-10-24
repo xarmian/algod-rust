@@ -47,7 +47,8 @@ pub use digest::{
 
 use algo_error::{AlgoError, Result};
 use algo_types::{
-    check_msgpack_depth, Block, BlockResponse, LogicSig, MultisigSig, SignedTransaction,
+    check_msgpack_depth, msgpack_value_len, Block, BlockResponse, LogicSig, MultisigSig,
+    SignedTransaction,
 };
 
 /// Decode a single msgpack-encoded `LogicSig`, as produced by `goal clerk
@@ -83,17 +84,17 @@ pub fn decode_multisig(bytes: &[u8]) -> Result<MultisigSig> {
 pub fn decode_signed_txn_stream(mut bytes: &[u8]) -> Result<Vec<SignedTransaction>> {
     let mut out = Vec::new();
     while !bytes.is_empty() {
-        check_msgpack_depth(bytes)?;
-        let mut cursor = std::io::Cursor::new(bytes);
-        let mut de = rmp_serde::Deserializer::new(&mut cursor);
+        // One scan: depth-check and find this element's exact extent, then
+        // decode from that slice and advance by its length (issue #2043).
+        let len = msgpack_value_len(bytes)?;
+        debug_assert!(len > 0, "a msgpack value is at least one byte");
+        let (elem, rest) = bytes.split_at(len);
         let stxn: SignedTransaction =
-            serde::Deserialize::deserialize(&mut de).map_err(|e| AlgoError::Codec {
+            rmp_serde::from_slice(elem).map_err(|e| AlgoError::Codec {
                 source: Box::new(e),
                 context: "failed to decode SignedTransaction from msgpack stream".into(),
             })?;
-        let consumed = cursor.position() as usize;
-        debug_assert!(consumed > 0, "decoder must advance the stream");
-        bytes = &bytes[consumed..];
+        bytes = rest;
         out.push(stxn);
     }
     Ok(out)
@@ -466,6 +467,46 @@ mod tests {
     #[test]
     fn decode_signed_txn_stream_rejects_too_deep_payload() {
         assert!(decode_signed_txn_stream(&too_deep_payload()).is_err());
+    }
+
+    fn one_stxn_bytes() -> Vec<u8> {
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = algo_types::TxnType::Pay;
+        stx.txn.sender = algo_types::Address([0x22u8; 32]);
+        canonical_encode_signed_transaction(&stx)
+    }
+
+    /// Pins the stream decoder's error behavior (issue #2043): the
+    /// single-pass rewrite must reject exactly what the two-pass one did.
+    #[test]
+    fn decode_signed_txn_stream_error_cases_are_pinned() {
+        let one = one_stxn_bytes();
+
+        // Truncated trailing value.
+        let mut truncated = one.clone();
+        truncated.extend_from_slice(&one[..one.len() - 1]);
+        assert!(decode_signed_txn_stream(&truncated).is_err());
+
+        // Trailing garbage (0xc1 is a reserved, never-valid msgpack byte).
+        let mut garbage = one.clone();
+        garbage.push(0xc1);
+        assert!(decode_signed_txn_stream(&garbage).is_err());
+
+        // Too-deep value after a valid one.
+        let mut deep = one.clone();
+        deep.extend_from_slice(&too_deep_payload());
+        assert!(decode_signed_txn_stream(&deep).is_err());
+
+        // A well-formed msgpack value that is not a SignedTransaction.
+        let mut wrong_shape = one.clone();
+        wrong_shape.push(0x00);
+        assert!(decode_signed_txn_stream(&wrong_shape).is_err());
+
+        // Sanity: two valid values still decode, empty input is empty.
+        let mut two = one.clone();
+        two.extend_from_slice(&one);
+        assert_eq!(decode_signed_txn_stream(&two).unwrap().len(), 2);
+        assert!(decode_signed_txn_stream(&[]).unwrap().is_empty());
     }
 
     /// go: `TestMsgpDecode` (`protocol/codec_test.go`) round-trips a stream
