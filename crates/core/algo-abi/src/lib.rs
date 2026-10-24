@@ -872,7 +872,7 @@ pub fn decode(abi_type: &AbiType, data: &[u8]) -> Result<AbiValue, String> {
 /// only ones not bounded by the input length, so `()[65535][65535]` would
 /// otherwise expand billions of values from empty data.
 // DIVERGENCE DIV-003: cap on zero-size ABI array element expansion in decode
-const MAX_ZERO_SIZE_ELEMS: usize = u16::MAX as usize;
+const MAX_ZERO_SIZE_ELEMS: usize = 1 << 20;
 
 fn decode_inner(abi_type: &AbiType, data: &[u8], budget: &mut usize) -> Result<AbiValue, String> {
     match abi_type {

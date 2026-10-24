@@ -181,11 +181,13 @@ wraps silently and nested zero-size arrays can expand without limit.
 arithmetic; `type_of` returns an error for any type whose head size overflows
 `usize`; `decode` checks the minimum encoded size before expanding an array
 and caps the total number of zero-byte array elements expanded per call at
-65535.
+1,048,576 (2^20, aggregate across the call).
 
 **What is identical.** Every type with a representable size parses, encodes
-and decodes byte-for-byte as before; error behaviour for malformed data is
-unchanged apart from earlier detection.
+and decodes byte-for-byte as before, except values that contain more than
+2^20 zero-byte array elements in total (e.g. `()[65535][65535]`), which are
+rejected; error behaviour for malformed data is otherwise unchanged apart
+from earlier detection. Overflow boundaries assume a 64-bit `usize`.
 
 **Why.** Closes a REST/CLI-reachable panic (debug) / wrap (release) and
 allocation amplification. Not consensus-affecting.
