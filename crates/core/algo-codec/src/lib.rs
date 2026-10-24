@@ -89,11 +89,25 @@ pub fn decode_signed_txn_stream(mut bytes: &[u8]) -> Result<Vec<SignedTransactio
         let len = msgpack_value_len(bytes)?;
         debug_assert!(len > 0, "a msgpack value is at least one byte");
         let (elem, rest) = bytes.split_at(len);
+        let mut cursor = std::io::Cursor::new(elem);
+        let mut de = rmp_serde::Deserializer::new(&mut cursor);
         let stxn: SignedTransaction =
-            rmp_serde::from_slice(elem).map_err(|e| AlgoError::Codec {
+            serde::Deserialize::deserialize(&mut de).map_err(|e| AlgoError::Codec {
                 source: Box::new(e),
                 context: "failed to decode SignedTransaction from msgpack stream".into(),
             })?;
+        // The scan and the serde decoder must agree on the element's extent;
+        // never silently drop bytes the decoder did not consume.
+        if cursor.position() as usize != len {
+            return Err(AlgoError::Codec {
+                source: format!(
+                    "decoder consumed {} of {len} bytes of the stream element",
+                    cursor.position()
+                )
+                .into(),
+                context: "failed to decode SignedTransaction from msgpack stream".into(),
+            });
+        }
         bytes = rest;
         out.push(stxn);
     }

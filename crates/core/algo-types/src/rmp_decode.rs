@@ -106,8 +106,7 @@ pub(crate) const MAX_MSGPACK_DECODE_DEPTH: usize = 255;
 /// entry points, whose decoders have no depth cap of their own. Run this
 /// as a pre-scan before handing the bytes to them.
 pub fn check_msgpack_depth(bytes: &[u8]) -> Result<()> {
-    let mut rd = bytes;
-    skip_value(&mut rd)
+    msgpack_value_len(bytes).map(|_| ())
 }
 
 /// Like [`check_msgpack_depth`], but on success returns the byte length of
