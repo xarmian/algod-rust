@@ -3136,15 +3136,94 @@ fn simulate_rejects_oversize_lsig_args_v42() {
     )
     .expect_err("pool overflow is an unattributable group error (go GroupIndex -1)");
     match err {
-        SimulatorError::InvalidRequest(e) => assert!(
-            e.message.contains(
-                "txgroup had 2000 bytes of LogicSig args, more than the available size pool of 1000 bytes"
-            ),
-            "{}",
-            e.message
+        SimulatorError::InvalidRequest(e) => assert_eq!(
+            e.message,
+            "txgroup had 2000 bytes of LogicSig args, more than the available size pool of 1000 bytes (per-LogicSig allowance is 1000)"
         ),
         other => panic!("expected InvalidRequest, got {other:?}"),
     }
+}
+
+/// Orphan-LogicSig member (args, no program) with the given fee.
+fn orphan_lsig_member(
+    state: &mut LedgerState,
+    seed: u8,
+    fee: u64,
+    valid: (u64, u64),
+) -> SignedTransaction {
+    let key = SigningKey::from_bytes(&[seed; 32]);
+    let addr = Address(key.verifying_key().to_bytes());
+    fund(state, addr, 20_000_000);
+    SignedTransaction {
+        txn: Transaction {
+            txn_type: "pay".into(),
+            sender: addr,
+            receiver: addr,
+            amount: 0,
+            fee,
+            first_valid: valid.0.into(),
+            last_valid: valid.1.into(),
+            ..Default::default()
+        },
+        lsig: Some(LogicSig {
+            args: Some(vec![serde_bytes::ByteBuf::from(vec![1u8])]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// go order (`txnGroupBatchPrep`): well-formedness of every member, then
+/// `CheckTxnGroup`, then `logicSigGroupSizeCheck`, then signatures, with the
+/// group fee check last. So an orphan LogicSig loses to a malformed member
+/// (reported at the malformed member's index) but wins over an underpaid fee.
+#[test]
+fn simulate_orphan_lsig_ordering_matches_go() {
+    let mut state = base_state();
+    state.protocol = algo_types::consensus::CONSENSUS_V42.to_string();
+
+    // Plain orphan with a zero fee: orphan error wins over the fee check.
+    let orphan = orphan_lsig_member(&mut state, 0x71, 0, (0, 1000));
+    let result = simulate(
+        &mut state,
+        SimulationRequest {
+            txn_groups: vec![vec![orphan]],
+            allow_empty_signatures: true,
+            ..Default::default()
+        },
+    )
+    .expect("orphan is a recoverable failure");
+    assert_eq!(
+        result.txn_groups[0].failure_message.as_deref(),
+        Some("LogicSig fields without LogicSig program")
+    );
+    assert_eq!(result.txn_groups[0].failed_at, Some(vec![0]));
+
+    // Orphan at 0, malformed member at 1 (last_valid < first_valid):
+    // well-formedness of member 1 is reported, not the orphan at 0.
+    let gid_txns = |a: &SignedTransaction, b: &SignedTransaction| {
+        algo_validate::rules::compute_group_id(&[a.txn.clone(), b.txn.clone()]).0
+    };
+    let mut a = orphan_lsig_member(&mut state, 0x72, 1000, (0, 1000));
+    let mut b = orphan_lsig_member(&mut state, 0x73, 1000, (500, 100));
+    let gid = gid_txns(&a, &b);
+    a.txn.group = gid;
+    b.txn.group = gid;
+    b.lsig = None;
+    let result = simulate(
+        &mut state,
+        SimulationRequest {
+            txn_groups: vec![vec![a, b]],
+            allow_empty_signatures: true,
+            ..Default::default()
+        },
+    )
+    .expect("well-formedness failure is recoverable at its index");
+    assert_eq!(result.txn_groups[0].failed_at, Some(vec![1]));
+    assert_ne!(
+        result.txn_groups[0].failure_message.as_deref(),
+        Some("LogicSig fields without LogicSig program")
+    );
 }
 
 #[test]
@@ -3152,6 +3231,7 @@ fn simulate_pre_v42_pooled_size_rejected_and_pooled_args_accepted() {
     // v41 (base_state): program + args pooled; 1 txn => 1000 bytes.
     let mut state = base_state();
     let stx = escrow_with_arg(&mut state, 1, 1000);
+    let pooled = stx.lsig.as_ref().unwrap().logic.len() + 1000;
     let err = simulate(
         &mut state,
         SimulationRequest {
@@ -3161,11 +3241,11 @@ fn simulate_pre_v42_pooled_size_rejected_and_pooled_args_accepted() {
     )
     .expect_err("program+args exceed the 1000 byte pool");
     match err {
-        SimulatorError::InvalidRequest(e) => assert!(
-            e.message
-                .contains("bytes of LogicSigs, more than the available pool of 1000 bytes"),
-            "{}",
-            e.message
+        SimulatorError::InvalidRequest(e) => assert_eq!(
+            e.message,
+            format!(
+                "txgroup had {pooled} bytes of LogicSigs, more than the available pool of 1000 bytes"
+            )
         ),
         other => panic!("expected InvalidRequest, got {other:?}"),
     }
@@ -3177,21 +3257,27 @@ fn simulate_pre_v42_pooled_size_rejected_and_pooled_args_accepted() {
     ] {
         let mut state = base_state();
         state.protocol = proto.to_string();
-        let a = escrow_with_arg(&mut state, 1, 1500);
-        let b = escrow_with_arg(&mut state, 2, 0);
+        let mut a = escrow_with_arg(&mut state, 1, 1500);
+        let mut b = escrow_with_arg(&mut state, 2, 0);
+        let gid = algo_validate::rules::compute_group_id(&[a.txn.clone(), b.txn.clone()]).0;
+        a.txn.group = gid;
+        b.txn.group = gid;
         let result = simulate(
             &mut state,
             SimulationRequest {
                 txn_groups: vec![vec![a, b]],
                 ..Default::default()
             },
+        )
+        .unwrap_or_else(|e| panic!("{proto}: pooled args must pass the size check: {e:?}"));
+        assert!(
+            !result.txn_groups[0]
+                .failure_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("bytes of LogicSig"),
+            "{proto}: {:?}",
+            result.txn_groups[0].failure_message
         );
-        if let Err(SimulatorError::InvalidRequest(e)) = &result {
-            assert!(
-                !e.message.contains("bytes of LogicSig"),
-                "{proto}: {}",
-                e.message
-            );
-        }
     }
 }

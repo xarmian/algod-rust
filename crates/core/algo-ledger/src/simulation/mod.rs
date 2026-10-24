@@ -1176,21 +1176,17 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         // pool-overflow rejections carry go's `GroupIndex = -1`, which
         // `Simulator.Simulate` surfaces as a hard request error (issue
         // #2054, FIND-ba9c86e5-01).
-        if let Err((index, e)) =
-            algo_validate::logic_sig_group_size_check_indexed(&verify_group, consensus)
+        if let Err(e) = algo_validate::logic_sig_group_size_check_indexed(&verify_group, consensus)
         {
-            return match index {
+            return match e.group_index {
                 Some(i) => Ok(CheckOutcome::RecoverableFailure {
                     index: i,
-                    message: match e {
-                        algo_error::AlgoError::Validation { message } => message,
-                        other => other.to_string(),
-                    },
+                    message: e.message,
                     logicsig_traces: vec![None; verify_group.len()],
                     logicsig_budgets: vec![0; verify_group.len()],
                 }),
                 None => Err(SimulatorError::InvalidRequest(InvalidRequestError {
-                    message: e.to_string(),
+                    message: e.message,
                 })),
             };
         }

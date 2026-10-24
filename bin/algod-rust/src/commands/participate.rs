@@ -9474,14 +9474,8 @@ mod tests {
             for s in &mut group {
                 s.txn.group = gid;
             }
-            if let Err(e) = eval.test_transaction_group(&group) {
-                // Admission may still fail later (fees at v42 pricing), but
-                // never on the LogicSig size pool.
-                assert!(
-                    !e.to_string().contains("bytes of LogicSig"),
-                    "cached={cached}: {e}"
-                );
-            }
+            eval.test_transaction_group(&group)
+                .unwrap_or_else(|e| panic!("cached={cached}: pooled args must be admitted: {e}"));
 
             // Pre-v42: program + args are pooled (and pooled across a group).
             let mut eval41 = make_evaluator(&ledger, &v41, 100, &[]);

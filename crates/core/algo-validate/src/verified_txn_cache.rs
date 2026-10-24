@@ -430,6 +430,15 @@ fn verify_transaction_group_cached_inner(
         });
     }
 
+    // Group-level LogicSig size check (go: `txnGroupBatchPrep` ->
+    // `logicSigGroupSizeCheck`, `data/transactions/verify/txn.go`), run
+    // before the cache lookup (cheap, O(group)) so a cache hit can never skip
+    // it, and before any signature work, like go. Without it a group whose
+    // LogicSig args exceed the pool would be admitted to the pool and
+    // proposed in a block that block validation (and go peers) reject
+    // (issue #2054, FIND-ba9c86e5-01).
+    crate::signature::logic_sig_group_size_check(txgroup, consensus)?;
+
     let owned_group = txgroup.to_vec();
     let unverified =
         cache.get_unverified_transaction_groups(std::slice::from_ref(&owned_group), context);
@@ -437,15 +446,6 @@ fn verify_transaction_group_cached_inner(
         // The whole group is already verified under this exact context.
         return Ok(());
     }
-
-    // Group-level LogicSig size check (go: `txnGroupBatchPrep` ->
-    // `logicSigGroupSizeCheck`, `data/transactions/verify/txn.go`), run after
-    // the cache lookup (a cached group already passed it under this exact
-    // context) and before any signature work, like go. Without it a group
-    // whose LogicSig args exceed the pool would be admitted to the pool and
-    // proposed in a block that block validation (and go peers) reject
-    // (issue #2054, FIND-ba9c86e5-01).
-    crate::signature::logic_sig_group_size_check(txgroup, consensus)?;
 
     // No `SigBlockSource` is threaded through here (issue #1116): pool
     // admission has no `LedgerStore` reference in scope at all -- this

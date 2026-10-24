@@ -1278,19 +1278,30 @@ pub fn logic_sig_group_size_check(
     group: &[SignedTransaction],
     consensus: &ConsensusParams,
 ) -> Result<(), AlgoError> {
-    logic_sig_group_size_check_indexed(group, consensus).map_err(|(_, e)| e)
+    logic_sig_group_size_check_indexed(group, consensus)
+        .map_err(|e| AlgoError::Validation { message: e.message })
+}
+
+/// A rejection from [`logic_sig_group_size_check_indexed`], mirroring go's
+/// `TxGroupError` for `logicSigGroupSizeCheck`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogicSigGroupSizeError {
+    /// go's `TxGroupError.GroupIndex`: `Some(i)` for the orphan-content
+    /// rejection (attributable to member `i`); `None` (go's `-1`) for the
+    /// group-level pool rejections.
+    pub group_index: Option<usize>,
+    /// Bare go-style message (no `validation error:` prefix).
+    pub message: String,
 }
 
 /// [`logic_sig_group_size_check`] that also reports go's
-/// `TxGroupError.GroupIndex`: `Some(i)` for the orphan-content rejection
-/// (attributable to member `i`), `None` (go's `-1`) for the group-level pool
-/// rejections. Simulation needs the distinction (`Simulator.Simulate`
-/// reports an indexed error as the group's `FailedAt`, an unindexed one as a
-/// hard request error).
+/// `TxGroupError.GroupIndex`. Simulation needs the distinction
+/// (`Simulator.Simulate` reports an indexed error as the group's `FailedAt`,
+/// an unindexed one as a hard request error).
 pub fn logic_sig_group_size_check_indexed(
     group: &[SignedTransaction],
     consensus: &ConsensusParams,
-) -> Result<(), (Option<usize>, AlgoError)> {
+) -> Result<(), LogicSigGroupSizeError> {
     let mut lsig_pooled_size: u64 = 0;
     let mut lsig_args_size: u64 = 0;
     let mut lsig_args_need_size_pooling = false;
@@ -1307,12 +1318,10 @@ pub fn logic_sig_group_size_check_indexed(
 
         if !has_program {
             if !is_blank && reject_orphan_lsig_content {
-                return Err((
-                    Some(i),
-                    AlgoError::Validation {
-                        message: "LogicSig fields without LogicSig program".into(),
-                    },
-                ));
+                return Err(LogicSigGroupSizeError {
+                    group_index: Some(i),
+                    message: "LogicSig fields without LogicSig program".into(),
+                });
             }
             if !pool_orphan_lsig_args {
                 continue;
@@ -1337,28 +1346,24 @@ pub fn logic_sig_group_size_check_indexed(
     // Protocols without per-byte surcharge cannot pay for LogicSig bytes above
     // the group pool: keep those protocols on the legacy total LogicSig size check.
     if !reject_orphan_lsig_content && lsig_pooled_size > lsig_available_pool {
-        return Err((
-            None,
-            AlgoError::Validation {
-                message: format!(
-                    "txgroup had {lsig_pooled_size} bytes of LogicSigs, more than the available pool of {lsig_available_pool} bytes"
-                ),
-            },
-        ));
+        return Err(LogicSigGroupSizeError {
+            group_index: None,
+            message: format!(
+                "txgroup had {lsig_pooled_size} bytes of LogicSigs, more than the available pool of {lsig_available_pool} bytes"
+            ),
+        });
     }
     // LogicSig args are unpriced. Each LogicSig may carry up to LogicSigMaxSize
     // without pooling; larger args are allowed only when the group's pool
     // covers the group's total args.
     if lsig_args_need_size_pooling && lsig_args_size > lsig_available_pool {
-        return Err((
-            None,
-            AlgoError::Validation {
-                message: format!(
-                    "txgroup had {lsig_args_size} bytes of LogicSig args, more than the available size pool of {lsig_available_pool} bytes (per-LogicSig allowance is {})",
-                    consensus.logic_sig_max_size
-                ),
-            },
-        ));
+        return Err(LogicSigGroupSizeError {
+            group_index: None,
+            message: format!(
+                "txgroup had {lsig_args_size} bytes of LogicSig args, more than the available size pool of {lsig_available_pool} bytes (per-LogicSig allowance is {})",
+                consensus.logic_sig_max_size
+            ),
+        });
     }
 
     Ok(())
