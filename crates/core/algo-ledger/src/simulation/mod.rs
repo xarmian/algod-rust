@@ -1182,7 +1182,10 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             return match index {
                 Some(i) => Ok(CheckOutcome::RecoverableFailure {
                     index: i,
-                    message: "LogicSig fields without LogicSig program".to_string(),
+                    message: match e {
+                        algo_error::AlgoError::Validation { message } => message,
+                        other => other.to_string(),
+                    },
                     logicsig_traces: vec![None; verify_group.len()],
                     logicsig_budgets: vec![0; verify_group.len()],
                 }),

@@ -9455,16 +9455,36 @@ mod tests {
             // Pooled across the group: 1500 arg bytes fit 2 * 1000. (Group-id
             // and fee checks run later/independently; only assert the size
             // check does not fire.)
-            let group = [make_escrow_with_arg(2, 1500), make_escrow_with_arg(3, 0)];
+            let mut group = [make_escrow_with_arg(2, 1500), make_escrow_with_arg(3, 0)];
+            let txns: Vec<Transaction> = group.iter().map(|s| s.txn.clone()).collect();
+            let gid = algo_validate::rules::compute_group_id(&txns).0;
+            for s in &mut group {
+                s.txn.group = gid;
+            }
             if let Err(e) = eval.test_transaction_group(&group) {
+                // Admission may still fail later (fees at v42 pricing), but
+                // never on the LogicSig size pool.
                 assert!(
                     !e.to_string().contains("bytes of LogicSig"),
                     "cached={cached}: {e}"
                 );
             }
 
-            // Pre-v42: program + args are pooled.
-            let eval41 = make_evaluator(&ledger, &v41, 100, &[]);
+            // Pre-v42: program + args are pooled (and pooled across a group).
+            let mut eval41 = make_evaluator(&ledger, &v41, 100, &[]);
+            if cached {
+                eval41.verified_txn_cache =
+                    Some(Arc::new(algo_validate::VerifiedTransactionCache::new(100)));
+            }
+            let mut group41 = [make_escrow_with_arg(5, 1500), make_escrow_with_arg(6, 0)];
+            let txns: Vec<Transaction> = group41.iter().map(|s| s.txn.clone()).collect();
+            let gid = algo_validate::rules::compute_group_id(&txns).0;
+            for s in &mut group41 {
+                s.txn.group = gid;
+            }
+            eval41
+                .test_transaction_group(&group41)
+                .expect("pre-v42 pooled size fits 2 * 1000");
             let err = eval41
                 .test_transaction_group(&[make_escrow_with_arg(4, 1000)])
                 .expect_err("program+args exceed the 1000 byte pool");
