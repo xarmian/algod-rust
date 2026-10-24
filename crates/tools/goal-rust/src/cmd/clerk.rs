@@ -2074,7 +2074,7 @@ fn run_group_inner(args: GroupArgs) -> Result<(), String> {
                 "Transaction #{idx} with ID of {id} is already part of a group."
             ));
         }
-        if stxn.sig != [0u8; 64] || stxn.msig.as_ref().is_some_and(|m| !m.blank()) {
+        if group_input_already_signed(stxn) {
             let id = compute_txn_id(&stxn.txn);
             return Err(format!(
                 "Transaction #{idx} with ID of {id} is already signed"
@@ -2438,11 +2438,43 @@ pub(crate) fn kmd_msg(e: &KmdError) -> String {
     }
 }
 
+/// Go `clerk group` (`cmd/goal/clerk.go`): `!Sig.Blank() || !Msig.Blank() ||
+/// !PQsig.Blank()`. The LogicSig is deliberately NOT part of the check (it is
+/// preserved so the group can be verified by a logicsig arg).
+fn group_input_already_signed(stxn: &SignedTransaction) -> bool {
+    stxn.sig != [0u8; 64]
+        || stxn.msig.as_ref().is_some_and(|m| !m.blank())
+        || stxn.pqsig.as_ref().is_some_and(|p| !p.blank())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use algo_types::{Transaction, TxnType};
     use tempfile::TempDir;
+
+    #[test]
+    fn group_input_already_signed_matches_go_sig_msig_pqsig() {
+        let mut s = SignedTransaction::default();
+        assert!(!group_input_already_signed(&s));
+        s.msig = Some(Default::default());
+        assert!(!group_input_already_signed(&s), "blank msig is not a sig");
+        // Go rejects a top-level PQsig as already signed.
+        s.pqsig = Some(algo_types::pq::PQSig {
+            scheme: *b"f1",
+            ..Default::default()
+        });
+        assert!(group_input_already_signed(&s));
+        // LogicSig is preserved by go, never "already signed".
+        let l = SignedTransaction {
+            lsig: Some(algo_types::LogicSig {
+                logic: serde_bytes::ByteBuf::from(vec![2, 0x20, 1, 1, 0x22]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!group_input_already_signed(&l));
+    }
 
     fn sample_payment(amount: u64, receiver: [u8; 32]) -> Transaction {
         Transaction {

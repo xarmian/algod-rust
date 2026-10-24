@@ -71,9 +71,9 @@ fn is_escrow_logic_sig(stxn: &SignedTransaction) -> bool {
     };
     let authorizer = stxn.auth_addr.as_ref().unwrap_or(&stxn.txn.sender);
     lsig.sig == [0u8; 64]
-        && lsig.msig.is_none()
-        && lsig.lmsig.is_none()
-        && lsig.pqsig.as_ref().map(|s| s.blank()).unwrap_or(true)
+        && lsig.msig.as_ref().is_none_or(|m| m.blank())
+        && lsig.lmsig.as_ref().is_none_or(|m| m.blank())
+        && lsig.pqsig.as_ref().is_none_or(|s| s.blank())
         && *authorizer == hash_program(&lsig.logic)
 }
 
@@ -258,6 +258,27 @@ mod tests {
             ..Default::default()
         };
         assert!(!is_escrow_logic_sig(&stxn));
+    }
+
+    #[test]
+    fn is_escrow_logic_sig_true_when_envelopes_present_but_blank() {
+        // Go: `Msig.Blank()`/`LMsig.Blank()`/`PQsig.Blank()` -- a present but
+        // blank envelope (serde/JSON path) is not a delegated signature.
+        let program = vec![0x02u8, 0x20, 0x01, 0x01, 0x22];
+        let addr = hash_program(&program);
+        let lsig = LogicSig {
+            logic: ByteBuf::from(program),
+            msig: Some(Default::default()),
+            lmsig: Some(Default::default()),
+            pqsig: Some(Default::default()),
+            ..Default::default()
+        };
+        let stxn = SignedTransaction {
+            txn: minimal_pay_txn(addr),
+            lsig: Some(lsig),
+            ..Default::default()
+        };
+        assert!(is_escrow_logic_sig(&stxn));
     }
 
     #[test]
