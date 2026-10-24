@@ -51,10 +51,11 @@ pub use rules::{
     MAX_TXN_BYTES_PER_BLOCK_V32, MAX_TXN_BYTES_PER_BLOCK_V33, MAX_TXN_LIFE, MIN_TXN_FEE,
 };
 pub use signature::{
-    hash_program, logic_sig_group_size_check, logicsig_sanity_check, validate_pqsig_envelope,
-    validate_pqsig_scheme, verify_auth_addr_sender_diff, verify_group_logicsig_size,
-    verify_heartbeat_proof, verify_rekeying_supported, verify_single_sig,
-    verify_transaction_signature, verify_transaction_signature_with_tracer,
+    hash_program, logic_sig_group_size_check, logic_sig_group_size_check_indexed,
+    logicsig_sanity_check, validate_pqsig_envelope, validate_pqsig_scheme,
+    verify_auth_addr_sender_diff, verify_group_logicsig_size, verify_heartbeat_proof,
+    verify_rekeying_supported, verify_single_sig, verify_transaction_signature,
+    verify_transaction_signature_with_tracer, LogicSigGroupSizeError,
 };
 pub use verified_txn_cache::{
     verify_transaction_group_cached, GroupContext, VerificationContext, VerifiedTransactionCache,

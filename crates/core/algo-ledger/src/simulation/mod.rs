@@ -1041,28 +1041,6 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 }));
             }
 
-            // A LogicSig carrying fields (args/msig/lmsig/sig) but no program
-            // is "orphaned": go-algorand's `logicSigGroupSizeCheck`
-            // (`verify/txn.go:266`) rejects it once size pricing is enabled,
-            // attributed to this transaction's `GroupIndex` -- a recoverable
-            // check failure, not a hard request error. Mirrors
-            // `algo_validate::logic_sig_group_size_check`'s orphan-content
-            // branch, duplicated here (rather than called) because that
-            // group-level helper has no per-transaction index to report and
-            // is reserved for real block validation (`block.rs`).
-            if consensus.per_byte_txn_surcharge != 0 {
-                if let Some(lsig) = &stx.lsig {
-                    if !lsig.has_program() && !lsig.is_blank() {
-                        return Ok(CheckOutcome::RecoverableFailure {
-                            index: i,
-                            message: "LogicSig fields without LogicSig program".to_string(),
-                            logicsig_traces: vec![None; verify_group.len()],
-                            logicsig_budgets: vec![0; verify_group.len()],
-                        });
-                    }
-                }
-            }
-
             // Check well-formedness. Pass `allow_fee_pooling = enable_fee_pooling`
             // so that on pre-fee-pooling protocols (before v28) each transaction
             // is held to the per-transaction minimum fee, matching go-algorand's
@@ -1188,6 +1166,30 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 message: e.to_string(),
             })
         })?;
+
+        // Group-level LogicSig size check (go: `txnGroupBatchPrep` ->
+        // `logicSigGroupSizeCheck`, `verify/txn.go`), run after
+        // well-formedness and `CheckTxnGroup` and before any signature work,
+        // on the proxy-signed verification copy like go. An orphan
+        // LogicSig (content but no program, size pricing on) is attributed
+        // to its member -- a recoverable failure at that `GroupIndex`; the
+        // pool-overflow rejections carry go's `GroupIndex = -1`, which
+        // `Simulator.Simulate` surfaces as a hard request error (issue
+        // #2054, FIND-ba9c86e5-01).
+        if let Err(e) = algo_validate::logic_sig_group_size_check_indexed(&verify_group, consensus)
+        {
+            return match e.group_index {
+                Some(i) => Ok(CheckOutcome::RecoverableFailure {
+                    index: i,
+                    message: e.message,
+                    logicsig_traces: vec![None; verify_group.len()],
+                    logicsig_budgets: vec![0; verify_group.len()],
+                }),
+                None => Err(SimulatorError::InvalidRequest(InvalidRequestError {
+                    message: e.message,
+                })),
+            };
+        }
 
         // Pass 2: verify signatures on the (possibly proxy-signed) group.
         // When tracing is enabled, capture each LogicSig program's opcode trace
