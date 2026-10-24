@@ -277,6 +277,7 @@ fn test_gtxn_effects_created_asset_id_visible_to_sibling_appl() {
     let ran_program = RefCell::new(vec![false; group_refs.len()]);
     let scratch = RefCell::new(vec![None; group_refs.len()]);
     let group_txid_cache = algo_ledger::GroupTxidCache::default();
+    let group_created = algo_ledger::GroupCreatedResources::default();
     let mut budget = GroupBudget::new(1);
 
     let gi0 = GroupInfo {
@@ -285,6 +286,7 @@ fn test_gtxn_effects_created_asset_id_visible_to_sibling_appl() {
         ran_program: &ran_program,
         scratch: &scratch,
         txid_cache: &group_txid_cache,
+        created: &group_created,
     };
     apply_transaction_with_budget(
         &mut state,
@@ -312,6 +314,7 @@ fn test_gtxn_effects_created_asset_id_visible_to_sibling_appl() {
         ran_program: &ran_program,
         scratch: &scratch,
         txid_cache: &group_txid_cache,
+        created: &group_created,
     };
     apply_transaction_with_budget(
         &mut state,
@@ -482,6 +485,7 @@ int 1
     let ran_program = RefCell::new(vec![false; group_refs.len()]);
     let scratch = RefCell::new(vec![None; group_refs.len()]);
     let group_txid_cache = algo_ledger::GroupTxidCache::default();
+    let group_created = algo_ledger::GroupCreatedResources::default();
     let mut budget = GroupBudget::new(1);
 
     let gi0 = GroupInfo {
@@ -490,6 +494,7 @@ int 1
         ran_program: &ran_program,
         scratch: &scratch,
         txid_cache: &group_txid_cache,
+        created: &group_created,
     };
     apply_transaction_with_budget(
         &mut state,
@@ -509,6 +514,7 @@ int 1
         ran_program: &ran_program,
         scratch: &scratch,
         txid_cache: &group_txid_cache,
+        created: &group_created,
     };
     apply_transaction_with_budget(
         &mut state,
