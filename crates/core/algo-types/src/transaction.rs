@@ -1793,9 +1793,28 @@ impl HashFactory {
     }
 }
 
-/// Helper to read an optional ByteBuf that may be nil.
+/// Element reader for go `[][]byte` / `[]GenericDigest` lists.
+///
+/// go's `ReadBytesBytes` decodes a nil element as an empty slice, which
+/// re-encodes as `bin` len 0 -- NOT as nil. Returning `None` here would
+/// re-encode as nil and change TxIDs / group IDs / Merkle leaves (#2046).
 fn read_optional_bytebuf(rd: &mut &[u8]) -> DecodeResult<Option<ByteBuf>> {
-    rmp_decode::read_optional(rd, rmp_decode::read_bytes_as_bytebuf_go_compat)
+    rmp_decode::read_bytes_as_bytebuf_go_compat(rd).map(Some)
+}
+
+/// go `crypto.FalconPublicKey` is `[FalconPublicKeySize]byte`
+/// (`crypto/falconWrapper.go`), read with `ReadExactBytes`: any encoded
+/// length is padded/truncated to this size, and an all-zero key is the zero
+/// value (omitted on encode, i.e. an empty `ByteBuf` here).
+const FALCON_PUBLIC_KEY_SIZE: usize = 1793;
+
+fn read_falcon_public_key(rd: &mut &[u8]) -> DecodeResult<ByteBuf> {
+    let k = rmp_decode::read_fixed_bytes_go_compat::<FALCON_PUBLIC_KEY_SIZE>(rd)?;
+    Ok(if k.iter().all(|&b| b == 0) {
+        ByteBuf::new()
+    } else {
+        ByteBuf::from(k.to_vec())
+    })
 }
 
 impl MerkleProof {
@@ -1827,7 +1846,7 @@ impl FalconVerifier {
         let mut s = Self::default();
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
-                b"k" => s.public_key = rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?,
+                b"k" => s.public_key = read_falcon_public_key(rd)?,
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }

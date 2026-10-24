@@ -30,7 +30,7 @@ Before: `read_bytes` / `read_fixed_bytes` / `read_address` accepted only `bin`
 `read_str_bytes` rejected `nil`. After: every consensus struct call site uses
 `read_bytes_go_compat` / `read_bytes_as_bytebuf_go_compat` /
 `read_fixed_bytes_go_compat` / `read_address_go_compat`, which reproduce the
-table above (except the interleaved-map corner, still rejected). The strict
+table above. The strict
 readers had no remaining caller and were removed. `read_string` /
 `read_str_bytes` now map `nil` to empty like go; they still reject `bin`
 exactly like go.
@@ -67,7 +67,8 @@ Rust before = no, Rust after = yes.
 | Participant / Reveal / StateProofBody `c`; StateProofMessage `b`,`v` | `GenericDigest` / `[]byte` commitments | ReadBytesBytes |
 | HoldingRef / LocalsRef / ResourceRef `d`,`a` | `Address` | ReadExactBytes |
 | pq.rs PQSig `sch` | `PQScheme [2]byte` | ReadExactBytes |
-| pq.rs PQSig `pk`, `sig` | byte slices | ReadBytesBytes (go slice type not re-verified field by field) |
+| pq.rs PQSig `pk`, `sig` | `PublicKey`, `Signature []byte` (`data/transactions/pqsig.go`, verified) | ReadBytesBytes |
+| Falcon `FalconVerifier.k` | `FalconPublicKey [1793]byte` (`crypto/falconWrapper.go:49`) | ReadExactBytes: Rust now pads/truncates to 1793, all-zero = empty |
 | `gen`, `proto`, `nextproto`, `upgradeprop`, `type`, AssetParams `un`/`an`/`au` | `string` fields | ReadStringBytes: nil now accepted; bin still rejected |
 
 ## Severity assessment
@@ -83,15 +84,44 @@ decode one proposal payload go nodes accept (a liveness blip for that round,
 repaired by catchup of the canonical block). Severity: low; fixed because
 the rule is "reject nothing go accepts".
 
+## List elements, arrays, duplicate keys (review follow-ups)
+
+* **nil elements of `[]byte` lists** (`apaa`, MerkleProof `pth`, LogicSig
+  `arg`): go's `ReadBytesBytes(nil)` yields an empty slice, which re-encodes
+  as `bin` len 0. Rust's `Option<ByteBuf>` list readers previously mapped a
+  nil element to `None` (re-encoded as nil: a different TxID / group ID /
+  Merkle leaf). Fixed: the element reader returns `Some(empty)`.
+  Tests: `go_msgp_bytes_compat_lists_test.rs`.
+* **Explicit-array form**: elements are read like go `ReadUint8Bytes`
+  (`ReadUint64Bytes` + `> 255` overflow check): fixint, uint8..64,
+  non-negative int8..64 and nil (as 0); negative values and > 255 are
+  rejected. Header forms: fixarray/array16/array32 and, because go's
+  `ReadArrayHeaderBytes` flattens maps, fixmap/map16/map32 (2n elements).
+  For `[N]byte`, go's `readExactBytesSlow` rejects more than N elements
+  (`ArrayError`) while fewer leave the tail untouched; Rust does the same.
+* **Duplicate map keys**: go's generated decoders loop over the map and
+  `copy` into the existing struct, so a repeated key with a *shorter*
+  `bin`/`str` keeps the earlier value's tail (and a zero-length value leaves
+  the array unchanged). Rust's fresh-array reader zero-fills instead. This is
+  observable only with a duplicated key AND a wrong-length value; no encoder
+  produces either, hashes are over the re-encoded decoded struct, and go
+  itself has no duplicate-key rejection. Judged benign and not changed
+  (tracked in #2063).
+* **`read_string` / `read_str_bytes` nil**: all callers are in `algo-types`
+  (the readers are `pub(crate)`; no other crate uses them). Their go fields
+  are `string` (`GenesisID`, `UnitName`, ...) read with `ReadStringBytes`
+  (nil -> ""), or `protocol.TxType` / `protocol.ConsensusVersion`, whose
+  `UnmarshalMsgWithState` does `ReadBytesBytesHeader` (size check only) then
+  `ReadStringBytes`, so the same nil-accepted / bin-rejected behaviour.
+  Nothing needed a stricter variant.
+
 ## Not changed / left open
 
-* go's "decode a map as an interleaved key/value array" corner of
-  `readBytesBytesSlow` / `readExactBytesSlow` is still rejected (no evidence it
-  is reachable from any real encoder).
-* `ReadExactBytes` normalises a wrong-length value to the array size.
-  Fields Rust models as variable `ByteBuf` where go has a fixed array
-  (`FalconVerifier.k` = `FalconPublicKey [N]byte`) accept str/nil now but keep
-  the encoded length instead of padding/truncating.
+* go decodes *structs* from a msgpack array as well as a map
+  (`SignedTxn.UnmarshalMsgWithState` "struct-from-array" branch) and every
+  generated unsigned-integer read (`ReadUint64Bytes`) maps nil to 0; Rust's
+  `read_u64` and the struct readers reject both. This is a separate, wider
+  non-canonical-encoding class than byte fields (tracked in #2063).
 * Other decoders with their own readers are outside this issue and unaudited:
   `algo-agreement` `codec.rs`, `algo-consensus-crypto` (`onetimesig`,
   `merklesig`), the serde (`rmp_serde`) paths of `algo-types`, and
@@ -101,5 +131,5 @@ the rule is "reject nothing go accepts".
   decoders; the Go oracle binaries cannot be executed on the audit machine
   (blocked exec), so the differential vectors in
   `crates/core/algo-types/src/rmp_decode.rs` (`go_compat_*`) and
-  `crates/core/algo-types/tests/go_msgp_bytes_compat_test.rs` pin the
+  `crates/core/algo-types/tests/go_msgp_bytes_compat_*.rs` pin the
   source-derived expectations, not runtime go output.
