@@ -385,8 +385,8 @@ fn deserialize_kv_bytes<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Ve
 //   bytes are binary, the lossy conversion corrupted the key for ordinary
 //   ASCII box names too, any time the app_id's bytes formed an invalid
 //   partial UTF-8 sequence. Fixed by tunneling the raw bytes through an
-//   unchecked `&str` for the non-human-readable path — see the `unsafe`
-//   block's safety comment below.
+//   `serde_raw_str` ext placeholder for the non-human-readable path (no
+//   `unsafe`, issue #2051); see the comment in the loop below.
 fn serialize_kv_mods<S: Serializer>(
     map: &HashMap<Vec<u8>, KvValueDelta>,
     serializer: S,
@@ -405,19 +405,19 @@ fn serialize_kv_mods<S: Serializer>(
         if human_readable {
             m.serialize_entry(&String::from_utf8_lossy(k), v)?;
         } else {
-            // SAFETY: msgpack's "str" format has no UTF-8 validity
-            // requirement for its payload (unlike JSON strings), and this
-            // branch only runs for non-human-readable formats (msgpack, via
-            // `rmp_serde`, the only such format this crate feeds through
-            // this function). `serde::Serializer::serialize_str` only
-            // accepts `&str`, so we tunnel the raw key bytes through a
-            // `&str` that may not be valid UTF-8; `rmp_serde` copies the
-            // `&str`'s bytes directly onto the wire without revalidating
-            // them, so this reproduces go's exact msgpack output — the
-            // `str` type here never has its characters inspected, only its
-            // raw byte buffer written out.
-            let raw = unsafe { std::str::from_utf8_unchecked(k) };
-            m.serialize_entry(raw, v)?;
+            // Issue #2051: no `unsafe`. Valid UTF-8 keys are a plain msgpack
+            // `str`; a non-UTF-8 key (ordinary box names / binary app-id
+            // prefixes) goes through `serde_raw_str::serialize`, which emits
+            // a placeholder ext that `algo_codec::to_vec_named_str_preserving`
+            // rewrites into go's exact raw `str` bytes (same design as
+            // #2042 / PR #2050).
+            struct RawKey<'a>(&'a [u8]);
+            impl Serialize for RawKey<'_> {
+                fn serialize<S2: Serializer>(&self, s: S2) -> Result<S2::Ok, S2::Error> {
+                    algo_types::serde_bytes_array::serde_raw_str::serialize(self.0, s)
+                }
+            }
+            m.serialize_entry(&RawKey(k), v)?;
         }
     }
     m.end()
@@ -1903,7 +1903,7 @@ mod kv_value_delta_wire_format_tests {
             ..Default::default()
         };
 
-        let bytes = rmp_serde::to_vec_named(&delta).expect("serialize");
+        let bytes = algo_codec::to_vec_named_str_preserving(&delta).expect("serialize");
         let decoded: rmpv::Value =
             rmpv::decode::read_value(&mut &bytes[..]).expect("decode as rmpv");
         let kv_mods_val = decoded
@@ -1913,6 +1913,14 @@ mod kv_value_delta_wire_format_tests {
             .expect("StateDelta must have a KvMods entry");
         let map = kv_mods_val.as_map().expect("KvMods encodes as a map");
         assert_eq!(map.len(), 1);
+        // Issue #2051: a real msgpack fixstr (0xa0 | 18), never the 0x5a ext
+        // placeholder.
+        assert_eq!(key.len(), 18);
+        let pos = bytes
+            .windows(key.len())
+            .position(|w| w == key.as_slice())
+            .expect("raw key bytes on the wire");
+        assert_eq!(bytes[pos - 1], 0xa0 | 18, "fixstr header");
         let (wire_key, _) = &map[0];
         // `Value::as_slice()` returns the raw payload bytes for a String
         // value even when it isn't valid UTF-8 (unlike `as_str()`, which
@@ -1925,6 +1933,21 @@ mod kv_value_delta_wire_format_tests {
             raw_key_bytes, key,
             "msgpack KvMods key must be the exact raw bytes, not a lossy-UTF8 substitution"
         );
+    }
+
+    /// Issue #2051: valid-UTF-8 keys are unchanged (plain str, no ext).
+    #[test]
+    fn msgpack_kv_mods_valid_utf8_key_is_plain_str() {
+        let mut kv_mods = HashMap::new();
+        kv_mods.insert(b"box".to_vec(), KvValueDelta::default());
+        let delta = StateDelta {
+            kv_mods,
+            ..Default::default()
+        };
+        let a = algo_codec::to_vec_named_str_preserving(&delta).unwrap();
+        let b = rmp_serde::to_vec_named(&delta).unwrap();
+        assert_eq!(a, b);
+        assert!(a.windows(4).any(|w| w == [0xa3, b'b', b'o', b'x']));
     }
 
     /// Regression: `#[serde(flatten)]`'s *deserialize* side (used by

@@ -597,8 +597,8 @@ fn app_local_state_record(s: &AppLocalState) -> crate::state_delta::AppLocalStat
 /// the "string" is a raw-byte state key reinterpreted as a Go string (Go
 /// strings are byte sequences with no UTF-8 validity requirement). This
 /// repo's msgpack encoder already tunnels genuinely non-UTF-8 keys through
-/// safely for `KvMods` (see `state_delta::serialize_kv_mods`'s `unsafe`
-/// `from_utf8_unchecked` for the non-human-readable path); app/local state
+/// safely for `KvMods` (see `state_delta::serialize_kv_mods`'s
+/// `serde_raw_str` ext placeholder for the non-human-readable path); app/local state
 /// keys go through ordinary (lossy) `String` conversion here instead,
 /// matching this function's `HashMap<String, _>` value type and this PR's
 /// scope (real state keys are overwhelmingly ASCII in practice) — a
