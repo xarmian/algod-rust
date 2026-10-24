@@ -322,7 +322,7 @@ impl Block {
                 (2, b'c') if key == b"ct" => b.congestion_tax = rmp_decode::read_u64(rd)?,
                 (2, b'f') if key == b"fc" => b.fees_collected = rmp_decode::read_u64(rd)?,
                 (2, b'g') if key == b"gh" => {
-                    b.genesis_hash = rmp_decode::read_fixed_bytes::<32>(rd)?
+                    b.genesis_hash = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
                 }
                 (2, b'l') if key == b"ld" => b.load = rmp_decode::read_u64(rd)?,
                 (2, b'p') if key == b"pp" => b.proposer_payout = rmp_decode::read_u64(rd)?,
@@ -333,7 +333,7 @@ impl Block {
                 },
                 // ── 3-byte keys ──────────────────────────────────
                 (3, b'g') if key == b"gen" => b.genesis_id = rmp_decode::read_string(rd)?,
-                (3, b'p') if key == b"prp" => b.proposer = rmp_decode::read_address(rd)?,
+                (3, b'p') if key == b"prp" => b.proposer = rmp_decode::read_address_go_compat(rd)?,
                 (3, b'r') => match key {
                     // Canonically/omitempty-encoded blocks omit "rnd"
                     // entirely at round 0 (e.g. the genesis block, since
@@ -341,25 +341,29 @@ impl Block {
                     // `Self::default()`, so there is no missing-field case
                     // to reject here.
                     b"rnd" => b.round = Round(rmp_decode::read_u64(rd)?),
-                    b"rwd" => b.rewards_pool = rmp_decode::read_address(rd)?,
+                    b"rwd" => b.rewards_pool = rmp_decode::read_address_go_compat(rd)?,
                     _ => rmp_decode::skip_value(rd)?,
                 },
                 (3, b's') if key == b"spt" => {
                     b.state_proof_tracking = rmp_decode::read_optional_rmpv(rd)?
                 }
                 (3, b't') if key == b"txn" => {
-                    b.txn_commitment = rmp_decode::read_fixed_bytes::<32>(rd)?
+                    b.txn_commitment = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
                 }
                 // ── 4-byte keys ──────────────────────────────────
                 (4, b'e') if key == b"earn" => b.rewards_level = rmp_decode::read_u64(rd)?,
                 (4, b'f') => match key {
-                    b"fees" => b.fee_sink = rmp_decode::read_address(rd)?,
+                    b"fees" => b.fee_sink = rmp_decode::read_address_go_compat(rd)?,
                     b"frac" => b.rewards_residue = rmp_decode::read_u64(rd)?,
                     _ => rmp_decode::skip_value(rd)?,
                 },
-                (4, b'p') if key == b"prev" => b.branch = rmp_decode::read_fixed_bytes::<32>(rd)?,
+                (4, b'p') if key == b"prev" => {
+                    b.branch = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
+                }
                 (4, b'r') if key == b"rate" => b.rewards_rate = rmp_decode::read_u64(rd)?,
-                (4, b's') if key == b"seed" => b.seed = rmp_decode::read_fixed_bytes::<32>(rd)?,
+                (4, b's') if key == b"seed" => {
+                    b.seed = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
+                }
                 (4, b't') if key == b"txns" => {
                     b.payset = rmp_decode::read_vec(rd, SignedTransaction::decode_from_reader)?
                 }
@@ -370,8 +374,8 @@ impl Block {
                     b.rewards_recalculation_round = Round(rmp_decode::read_u64(rd)?)
                 }
                 (6, b't') => match key {
-                    b"txn256" => b.txn256 = rmp_decode::read_fixed_bytes::<32>(rd)?,
-                    b"txn512" => b.txn512 = rmp_decode::read_fixed_bytes::<64>(rd)?,
+                    b"txn256" => b.txn256 = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?,
+                    b"txn512" => b.txn512 = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?,
                     _ => rmp_decode::skip_value(rd)?,
                 },
                 // ── 7-byte keys ──────────────────────────────────
@@ -380,7 +384,7 @@ impl Block {
                     _ => rmp_decode::skip_value(rd)?,
                 },
                 (7, b'p') if key == b"prev512" => {
-                    b.prev512 = rmp_decode::read_fixed_bytes::<64>(rd)?
+                    b.prev512 = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?
                 }
                 // ── 9-byte keys ──────────────────────────────────
                 (9, b'n') => match key {
@@ -396,11 +400,11 @@ impl Block {
                 (10, b'p') => match key {
                     b"partupdrmv" => {
                         b.expired_participation_accounts =
-                            rmp_decode::read_optional_vec(rd, rmp_decode::read_address)?
+                            rmp_decode::read_optional_vec(rd, rmp_decode::read_address_go_compat)?
                     }
                     b"partupdabs" => {
                         b.absent_participation_accounts =
-                            rmp_decode::read_optional_vec(rd, rmp_decode::read_address)?
+                            rmp_decode::read_optional_vec(rd, rmp_decode::read_address_go_compat)?
                     }
                     _ => rmp_decode::skip_value(rd)?,
                 },

@@ -1541,7 +1541,10 @@ impl BoxRef {
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
                 b"i" => s.index = rmp_decode::read_u64(rd)?,
-                b"n" => s.name = rmp_decode::read_optional(rd, rmp_decode::read_bytes_as_bytebuf)?,
+                b"n" => {
+                    s.name =
+                        rmp_decode::read_optional(rd, rmp_decode::read_bytes_as_bytebuf_go_compat)?
+                }
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
@@ -1571,12 +1574,20 @@ impl AssetParams {
                 b"au" => s.url = rmp_decode::read_str_bytes(rd)?,
                 b"am" => {
                     s.metadata_hash =
-                        rmp_decode::read_optional(rd, rmp_decode::read_fixed_bytes::<32>)?
+                        rmp_decode::read_optional(rd, rmp_decode::read_fixed_bytes_go_compat::<32>)?
                 }
-                b"m" => s.manager = rmp_decode::read_optional(rd, rmp_decode::read_address)?,
-                b"r" => s.reserve = rmp_decode::read_optional(rd, rmp_decode::read_address)?,
-                b"f" => s.freeze = rmp_decode::read_optional(rd, rmp_decode::read_address)?,
-                b"c" => s.clawback = rmp_decode::read_optional(rd, rmp_decode::read_address)?,
+                b"m" => {
+                    s.manager = rmp_decode::read_optional(rd, rmp_decode::read_address_go_compat)?
+                }
+                b"r" => {
+                    s.reserve = rmp_decode::read_optional(rd, rmp_decode::read_address_go_compat)?
+                }
+                b"f" => {
+                    s.freeze = rmp_decode::read_optional(rd, rmp_decode::read_address_go_compat)?
+                }
+                b"c" => {
+                    s.clawback = rmp_decode::read_optional(rd, rmp_decode::read_address_go_compat)?
+                }
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
@@ -1595,8 +1606,8 @@ impl MultisigSubsig {
         let mut s = Self::default();
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
-                b"pk" => s.public_key = rmp_decode::read_fixed_bytes::<32>(rd)?,
-                b"s" => s.signature = rmp_decode::read_fixed_bytes::<64>(rd)?,
+                b"pk" => s.public_key = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?,
+                b"s" => s.signature = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?,
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
@@ -1686,12 +1697,15 @@ impl LogicSig {
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
                 b"l" => {
-                    s.logic = rmp_decode::read_bytes_as_bytebuf(rd)?;
+                    s.logic = rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?;
                 }
-                b"sig" => s.sig = rmp_decode::read_fixed_bytes::<64>(rd)?,
+                b"sig" => s.sig = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?,
                 b"msig" => s.msig = rmp_decode::read_optional(rd, MultisigSig::decode_from_reader)?,
                 b"arg" => {
-                    s.args = rmp_decode::read_optional_vec(rd, rmp_decode::read_bytes_as_bytebuf)?
+                    s.args = rmp_decode::read_optional_vec(
+                        rd,
+                        rmp_decode::read_bytes_as_bytebuf_go_compat,
+                    )?
                 }
                 b"lmsig" => {
                     s.lmsig = rmp_decode::read_optional(rd, MultisigSig::decode_from_reader)?
@@ -1717,11 +1731,11 @@ impl HeartbeatProof {
         let mut s = Self::default();
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
-                b"s" => s.sig = rmp_decode::read_fixed_bytes::<64>(rd)?,
-                b"p" => s.pk = rmp_decode::read_fixed_bytes::<32>(rd)?,
-                b"p2" => s.pk2 = rmp_decode::read_fixed_bytes::<32>(rd)?,
-                b"p1s" => s.pk1_sig = rmp_decode::read_fixed_bytes::<64>(rd)?,
-                b"p2s" => s.pk2_sig = rmp_decode::read_fixed_bytes::<64>(rd)?,
+                b"s" => s.sig = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?,
+                b"p" => s.pk = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?,
+                b"p2" => s.pk2 = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?,
+                b"p1s" => s.pk1_sig = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?,
+                b"p2s" => s.pk2_sig = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?,
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
@@ -1740,12 +1754,12 @@ impl HeartbeatTxnFields {
         let mut s = Self::default();
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
-                b"a" => s.address = rmp_decode::read_address(rd)?,
+                b"a" => s.address = rmp_decode::read_address_go_compat(rd)?,
                 b"prf" => {
                     s.proof = rmp_decode::read_optional(rd, HeartbeatProof::decode_from_reader)?
                 }
-                b"sd" => s.seed = rmp_decode::read_fixed_bytes::<32>(rd)?,
-                b"vid" => s.vote_id = rmp_decode::read_fixed_bytes::<32>(rd)?,
+                b"sd" => s.seed = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?,
+                b"vid" => s.vote_id = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?,
                 b"kd" => s.key_dilution = rmp_decode::read_u64(rd)?,
                 b"c" => s.hb_challenge_discount = rmp_decode::read_bool(rd)?,
                 other => rmp_decode::unknown_key(rd, other)?,
@@ -1781,7 +1795,7 @@ impl HashFactory {
 
 /// Helper to read an optional ByteBuf that may be nil.
 fn read_optional_bytebuf(rd: &mut &[u8]) -> DecodeResult<Option<ByteBuf>> {
-    rmp_decode::read_optional(rd, rmp_decode::read_bytes_as_bytebuf)
+    rmp_decode::read_optional(rd, rmp_decode::read_bytes_as_bytebuf_go_compat)
 }
 
 impl MerkleProof {
@@ -1813,7 +1827,7 @@ impl FalconVerifier {
         let mut s = Self::default();
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
-                b"k" => s.public_key = rmp_decode::read_bytes_as_bytebuf(rd)?,
+                b"k" => s.public_key = rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?,
                 other => rmp_decode::unknown_key(rd, other)?,
             }
         }
@@ -1832,7 +1846,7 @@ impl MerkleSignature {
         let mut s = Self::default();
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
-                b"sig" => s.signature = rmp_decode::read_bytes_as_bytebuf(rd)?,
+                b"sig" => s.signature = rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?,
                 b"idx" => s.vector_commitment_index = rmp_decode::read_u64(rd)?,
                 b"prf" => s.proof = rmp_decode::read_optional(rd, MerkleProof::decode_from_reader)?,
                 b"vkey" => {
@@ -1877,7 +1891,7 @@ impl MerkleSignatureVerifier {
         let mut s = Self::default();
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
-                b"cmt" => s.commitment = rmp_decode::read_fixed_bytes::<64>(rd)?,
+                b"cmt" => s.commitment = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?,
                 b"lf" => s.key_lifetime = rmp_decode::read_u64(rd)?,
                 other => rmp_decode::unknown_key(rd, other)?,
             }
@@ -1964,7 +1978,7 @@ impl StateProofBody {
         let mut s = Self::default();
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
-                b"c" => s.sig_commit = rmp_decode::read_bytes_as_bytebuf(rd)?,
+                b"c" => s.sig_commit = rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?,
                 b"w" => s.signed_weight = rmp_decode::read_u64(rd)?,
                 b"S" => {
                     s.sig_proofs = rmp_decode::read_optional(rd, MerkleProof::decode_from_reader)?
@@ -2001,8 +2015,10 @@ impl StateProofMessage {
         let mut s = Self::default();
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
-                b"b" => s.block_headers_commitment = rmp_decode::read_bytes_as_bytebuf(rd)?,
-                b"v" => s.voters_commitment = rmp_decode::read_bytes_as_bytebuf(rd)?,
+                b"b" => {
+                    s.block_headers_commitment = rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?
+                }
+                b"v" => s.voters_commitment = rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?,
                 b"P" => s.ln_proven_weight = rmp_decode::read_u64(rd)?,
                 b"f" => s.first_attested_round = rmp_decode::read_u64(rd)?,
                 b"l" => s.last_attested_round = rmp_decode::read_u64(rd)?,
@@ -2064,7 +2080,7 @@ impl ResourceRef {
         let mut s = Self::default();
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
-                b"d" => s.address = rmp_decode::read_address(rd)?,
+                b"d" => s.address = rmp_decode::read_address_go_compat(rd)?,
                 b"s" => s.asset = rmp_decode::read_u64(rd)?,
                 b"p" => s.app = rmp_decode::read_u64(rd)?,
                 b"h" => s.holding = rmp_decode::read_optional(rd, HoldingRef::decode_from_reader)?,
@@ -2158,14 +2174,16 @@ impl Transaction {
                 }
                 (2, b'f') if key == b"fv" => t.first_valid = Round(rmp_decode::read_u64(rd)?),
                 (2, b'g') if key == b"gh" => {
-                    t.genesis_hash = rmp_decode::read_fixed_bytes::<32>(rd)?
+                    t.genesis_hash = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
                 }
                 (2, b'h') if key == b"hb" => {
                     t.heartbeat =
                         rmp_decode::read_optional(rd, HeartbeatTxnFields::decode_from_reader)?
                 }
                 (2, b'l') if key == b"lv" => t.last_valid = Round(rmp_decode::read_u64(rd)?),
-                (2, b'l') if key == b"lx" => t.lease = rmp_decode::read_fixed_bytes::<32>(rd)?,
+                (2, b'l') if key == b"lx" => {
+                    t.lease = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
+                }
                 (2, b's') if key == b"sp" => {
                     t.state_proof =
                         rmp_decode::read_optional(rd, StateProofBody::decode_from_reader)?
@@ -2174,9 +2192,11 @@ impl Transaction {
                 (3, b'a') if key == b"amt" => t.amount = rmp_decode::read_u64(rd)?,
                 (3, b'f') if key == b"fee" => t.fee = rmp_decode::read_u64(rd)?,
                 (3, b'g') if key == b"gen" => t.genesis_id = rmp_decode::read_string(rd)?,
-                (3, b'g') if key == b"grp" => t.group = rmp_decode::read_fixed_bytes::<32>(rd)?,
-                (3, b'r') if key == b"rcv" => t.receiver = rmp_decode::read_address(rd)?,
-                (3, b's') if key == b"snd" => t.sender = rmp_decode::read_address(rd)?,
+                (3, b'g') if key == b"grp" => {
+                    t.group = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
+                }
+                (3, b'r') if key == b"rcv" => t.receiver = rmp_decode::read_address_go_compat(rd)?,
+                (3, b's') if key == b"snd" => t.sender = rmp_decode::read_address_go_compat(rd)?,
                 // ── 4-byte keys ──────────────────────────────────
                 (4, b'a') => match key {
                     b"aamt" => t.asset_amount = rmp_decode::read_u64(rd)?,
@@ -2186,8 +2206,10 @@ impl Transaction {
                     }
                     b"apan" => t.on_completion = rmp_decode::read_u64(rd)?,
                     b"apap" => {
-                        t.approval_program =
-                            rmp_decode::read_optional(rd, rmp_decode::read_bytes_as_bytebuf)?
+                        t.approval_program = rmp_decode::read_optional(
+                            rd,
+                            rmp_decode::read_bytes_as_bytebuf_go_compat,
+                        )?
                     }
                     b"apar" => {
                         t.asset_params =
@@ -2197,7 +2219,8 @@ impl Transaction {
                         t.foreign_assets = rmp_decode::read_optional_vec(rd, rmp_decode::read_u64)?
                     }
                     b"apat" => {
-                        t.accounts = rmp_decode::read_optional_vec(rd, rmp_decode::read_address)?
+                        t.accounts =
+                            rmp_decode::read_optional_vec(rd, rmp_decode::read_address_go_compat)?
                     }
                     b"apbx" => {
                         t.boxes = rmp_decode::read_optional_vec(rd, BoxRef::decode_from_reader)?
@@ -2217,33 +2240,40 @@ impl Transaction {
                     }
                     b"aprv" => t.reject_version = rmp_decode::read_u64(rd)?,
                     b"apsu" => {
-                        t.clear_state_program =
-                            rmp_decode::read_optional(rd, rmp_decode::read_bytes_as_bytebuf)?
+                        t.clear_state_program = rmp_decode::read_optional(
+                            rd,
+                            rmp_decode::read_bytes_as_bytebuf_go_compat,
+                        )?
                     }
                     b"arcv" => {
-                        t.asset_receiver = rmp_decode::read_optional(rd, rmp_decode::read_address)?
+                        t.asset_receiver =
+                            rmp_decode::read_optional(rd, rmp_decode::read_address_go_compat)?
                     }
                     b"asnd" => {
-                        t.asset_sender = rmp_decode::read_optional(rd, rmp_decode::read_address)?
+                        t.asset_sender =
+                            rmp_decode::read_optional(rd, rmp_decode::read_address_go_compat)?
                     }
                     _ => rmp_decode::unknown_key(rd, key)?,
                 },
                 (4, b'c') if key == b"caid" => t.config_asset = rmp_decode::read_u64(rd)?,
                 (4, b'f') if key == b"fadd" => {
-                    t.freeze_account = rmp_decode::read_optional(rd, rmp_decode::read_address)?
+                    t.freeze_account =
+                        rmp_decode::read_optional(rd, rmp_decode::read_address_go_compat)?
                 }
                 (4, b'f') if key == b"faid" => t.freeze_asset = rmp_decode::read_u64(rd)?,
-                (4, b'n') if key == b"note" => t.note = rmp_decode::read_bytes_as_bytebuf(rd)?,
+                (4, b'n') if key == b"note" => {
+                    t.note = rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?
+                }
                 (4, b't') if key == b"type" => {
                     t.txn_type = TxnType::from(rmp_decode::read_string(rd)?)
                 }
                 (4, b'x') if key == b"xaid" => t.xaid = rmp_decode::read_u64(rd)?,
                 // ── 5-byte keys ──────────────────────────────────
                 (5, b'c') if key == b"close" => {
-                    t.close_remainder_to = rmp_decode::read_address(rd)?
+                    t.close_remainder_to = rmp_decode::read_address_go_compat(rd)?
                 }
                 (5, b'r') if key == b"rekey" => {
-                    t.rekey_to = rmp_decode::read_optional(rd, rmp_decode::read_address)?
+                    t.rekey_to = rmp_decode::read_optional(rd, rmp_decode::read_address_go_compat)?
                 }
                 (5, b's') if key == b"spmsg" => {
                     t.state_proof_message =
@@ -2251,11 +2281,12 @@ impl Transaction {
                 }
                 // ── 6-byte keys ──────────────────────────────────
                 (6, b'a') if key == b"aclose" => {
-                    t.asset_close_to = rmp_decode::read_optional(rd, rmp_decode::read_address)?
+                    t.asset_close_to =
+                        rmp_decode::read_optional(rd, rmp_decode::read_address_go_compat)?
                 }
                 (6, b's') if key == b"selkey" => {
                     t.selection_pk =
-                        rmp_decode::read_optional(rd, rmp_decode::read_fixed_bytes::<32>)?
+                        rmp_decode::read_optional(rd, rmp_decode::read_fixed_bytes_go_compat::<32>)?
                 }
                 (6, b's') if key == b"sptype" => t.state_proof_type = rmp_decode::read_u64(rd)?,
                 (6, b'v') if key == b"votekd" => t.vote_key_dilution = rmp_decode::read_u64(rd)?,
@@ -2263,13 +2294,15 @@ impl Transaction {
                 (7, b'n') if key == b"nonpart" => t.non_participation = rmp_decode::read_bool(rd)?,
                 (7, b's') if key == b"sprfkey" => {
                     t.state_proof_pk =
-                        rmp_decode::read_optional(rd, rmp_decode::read_fixed_bytes::<64>)?
+                        rmp_decode::read_optional(rd, rmp_decode::read_fixed_bytes_go_compat::<64>)?
                 }
                 (7, b'v') => match key {
                     b"votefst" => t.vote_first = rmp_decode::read_u64(rd)?,
                     b"votekey" => {
-                        t.vote_pk =
-                            rmp_decode::read_optional(rd, rmp_decode::read_fixed_bytes::<32>)?
+                        t.vote_pk = rmp_decode::read_optional(
+                            rd,
+                            rmp_decode::read_fixed_bytes_go_compat::<32>,
+                        )?
                     }
                     b"votelst" => t.vote_last = rmp_decode::read_u64(rd)?,
                     _ => rmp_decode::unknown_key(rd, key)?,
@@ -2339,7 +2372,16 @@ impl SignedTransaction {
             // `every_block_only_key_is_unknown_in_strict_mode` covers all ten.
             if matches!(
                 key,
-                b"ca" | b"dt" | b"rs" | b"rr" | b"rc" | b"aca" | b"hgi" | b"hgh" | b"apid" | b"caid"
+                b"ca"
+                    | b"dt"
+                    | b"rs"
+                    | b"rr"
+                    | b"rc"
+                    | b"aca"
+                    | b"hgi"
+                    | b"hgh"
+                    | b"apid"
+                    | b"caid"
             ) {
                 rmp_decode::reject_when_strict(rd, key)?;
             }
@@ -2358,7 +2400,9 @@ impl SignedTransaction {
                     b"hgh" => s.has_genesis_hash = rmp_decode::read_bool(rd)?,
                     _ => rmp_decode::unknown_key(rd, key)?,
                 },
-                (3, b's') if key == b"sig" => s.sig = rmp_decode::read_fixed_bytes::<64>(rd)?,
+                (3, b's') if key == b"sig" => {
+                    s.sig = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?
+                }
                 (3, b't') if key == b"txn" => {
                     s.txn = Transaction::decode_from_reader(rd)?;
                     has_txn = true;
@@ -2379,7 +2423,7 @@ impl SignedTransaction {
                     s.pqsig = rmp_decode::read_optional(rd, crate::pq::PQSig::decode_from_reader)?
                 }
                 (4, b's') if key == b"sgnr" => {
-                    s.auth_addr = rmp_decode::read_optional(rd, rmp_decode::read_address)?
+                    s.auth_addr = rmp_decode::read_optional(rd, rmp_decode::read_address_go_compat)?
                 }
                 _ => rmp_decode::unknown_key(rd, key)?,
             }
