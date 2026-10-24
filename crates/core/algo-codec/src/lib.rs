@@ -144,13 +144,17 @@ pub fn decode_block_response_fast(bytes: &[u8]) -> Result<BlockResponse> {
 pub fn to_vec_named_str_preserving<T: serde::Serialize + ?Sized>(
     value: &T,
 ) -> std::result::Result<Vec<u8>, rmp_serde::encode::Error> {
-    algo_types::serde_bytes_array::serde_raw_str::take_ext_emitted();
-    let bytes = rmp_serde::to_vec_named(value)?;
-    if !algo_types::serde_bytes_array::serde_raw_str::take_ext_emitted() {
+    use algo_types::serde_bytes_array::serde_raw_str as raw;
+    // Save/restore the flag so an enclosing serialization (or a stale value
+    // from a direct serde call) is neither consumed nor relied upon.
+    let prev = raw::replace_ext_emitted(false);
+    let res = rmp_serde::to_vec_named(value);
+    let emitted = raw::replace_ext_emitted(prev);
+    let bytes = res?;
+    if !emitted {
         return Ok(bytes);
     }
-    algo_types::serde_bytes_array::serde_raw_str::rewrite_ext_to_str(&bytes)
-        .map_err(rmp_serde::encode::Error::Syntax)
+    raw::rewrite_ext_to_str(&bytes).map_err(rmp_serde::encode::Error::Syntax)
 }
 
 /// Encode a block to msgpack bytes.

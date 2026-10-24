@@ -346,6 +346,33 @@ pub mod serde_raw_str {
         RAW_STR_EXT_EMITTED.with(|f| f.replace(false))
     }
 
+    /// Sets the flag to `v`, returning the previous value. Wrappers use this
+    /// to save/restore around a nested serialization (nesting-safe).
+    pub fn replace_ext_emitted(v: bool) -> bool {
+        RAW_STR_EXT_EMITTED.with(|f| f.replace(v))
+    }
+
+    thread_local! {
+        static EXT_ACCEPTED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Run `f` with `deserialize` accepting the placeholder ext. Only for
+    /// decoding bytes this process itself wrote via plain serde (local crash
+    /// persistence). Untrusted ingress uses the hand decoders
+    /// (`decode_from_reader` / `read_str_bytes`), which reject an ext, and
+    /// any serde decode outside this scope rejects it too.
+    pub fn with_ext_accepted<R>(f: impl FnOnce() -> R) -> R {
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                EXT_ACCEPTED.with(|c| c.set(c.get() - 1));
+            }
+        }
+        EXT_ACCEPTED.with(|c| c.set(c.get() + 1));
+        let _g = Guard;
+        f()
+    }
+
     /// Rewrite every `RAW_STR_EXT_TAG` ext in msgpack `bytes` into a msgpack
     /// `str` holding the same raw bytes (what go writes).
     pub fn rewrite_ext_to_str(bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -442,6 +469,11 @@ pub mod serde_raw_str {
                 self,
                 d: D2,
             ) -> Result<Vec<u8>, D2::Error> {
+                if EXT_ACCEPTED.with(|c| c.get()) == 0 {
+                    return Err(de::Error::custom(
+                        "msgpack ext (0x5a) is not valid in a string field",
+                    ));
+                }
                 struct ExtVisitor;
                 impl<'de> Visitor<'de> for ExtVisitor {
                     type Value = Vec<u8>;
@@ -509,8 +541,28 @@ mod serde_raw_str_tests {
         // Placeholder ext (fixext 2 = 0xd5, tag 0x5a), never `str`/`bin`.
         assert!(bytes.windows(2).any(|w| w == [0xd5, 0x5a]), "{bytes:x?}");
         assert!(super::serde_raw_str::take_ext_emitted());
-        let back: W = rmp_serde::from_slice(&bytes).unwrap();
+        // Untrusted-style serde decode (no scope) rejects the ext.
+        assert!(rmp_serde::from_slice::<W>(&bytes).is_err());
+        let back: W =
+            super::serde_raw_str::with_ext_accepted(|| rmp_serde::from_slice(&bytes)).unwrap();
         assert_eq!(back.un, vec![0xff, 0xfe]);
+        // Scope is released afterwards, even on the success path.
+        assert!(rmp_serde::from_slice::<W>(&bytes).is_err());
+    }
+
+    #[test]
+    fn flag_save_restore_is_nesting_safe() {
+        use super::serde_raw_str::{replace_ext_emitted, take_ext_emitted};
+        take_ext_emitted();
+        let _ = rmp(&[0xff]); // direct serde leaks the flag
+        assert!(replace_ext_emitted(false), "leaked flag set");
+        // Nested save/restore: outer value survives an inner scope.
+        let outer = replace_ext_emitted(true);
+        let inner_prev = replace_ext_emitted(false);
+        assert!(inner_prev);
+        assert!(!replace_ext_emitted(inner_prev));
+        assert!(take_ext_emitted());
+        assert!(!outer);
     }
 
     #[test]
@@ -534,7 +586,8 @@ mod serde_raw_str_tests {
             ..Default::default()
         };
         let bytes = rmp_serde::to_vec_named(&p).unwrap();
-        let back: crate::AssetParams = rmp_serde::from_slice(&bytes).unwrap();
+        let back: crate::AssetParams =
+            super::serde_raw_str::with_ext_accepted(|| rmp_serde::from_slice(&bytes)).unwrap();
         assert_eq!(back, p);
     }
 

@@ -342,6 +342,15 @@ pub fn encode(
 pub fn decode(
     raw: &[u8],
 ) -> Result<(RootRouter, Player, ClockState, Vec<Action>), PersistenceError> {
+    // Local crash state written by plain serde (non-UTF-8 AssetParams
+    // un/an/au are stored as the #2042 placeholder ext): the only place the
+    // serde `Deserialize` is allowed to accept it.
+    algo_types::serde_bytes_array::serde_raw_str::with_ext_accepted(|| decode_inner(raw))
+}
+
+fn decode_inner(
+    raw: &[u8],
+) -> Result<(RootRouter, Player, ClockState, Vec<Action>), PersistenceError> {
     let decompressed;
     let raw = if raw.starts_with(&ZSTD_FRAME_MAGIC) {
         decompressed = zstd::stream::decode_all(raw).map_err(|e| {

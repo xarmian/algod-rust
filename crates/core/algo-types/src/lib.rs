@@ -18,8 +18,8 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Issue #2042: no `unsafe` anywhere in this crate (serde_raw_str was the last
-// one here; other crates are tracked separately).
+// Issue #2042: this crate (algo-types only) contains no `unsafe`; the
+// `from_utf8_unchecked` sites in other crates are tracked in #2051.
 #![deny(unsafe_code)]
 
 mod account;
