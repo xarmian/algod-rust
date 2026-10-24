@@ -2218,6 +2218,58 @@ fn programless_logicsig_pqsig_is_orphan_and_empty_args_is_blank() {
     );
 }
 
+/// Issue #2049: the simulate LogicSig tracer gate is `HasProgram()` (go
+/// `verify/txn.go`), so with exec-trace enabled an orphan (programless)
+/// LogicSig is not executed -- it fails the group with go's orphan-content
+/// message rather than erroring or panicking in the tracer path.
+#[test]
+fn exec_trace_enabled_orphan_logicsig_fails_cleanly() {
+    let sender_key = SigningKey::from_bytes(&[0x68; 32]);
+    let sender_addr = Address(sender_key.verifying_key().to_bytes());
+    let mut state = base_state();
+    state.protocol = algo_types::consensus::CONSENSUS_V42.to_string();
+    fund(&mut state, sender_addr, 20_000_000);
+
+    let orphan = SignedTransaction {
+        txn: Transaction {
+            txn_type: "pay".into(),
+            sender: sender_addr,
+            receiver: sender_addr,
+            amount: 0,
+            fee: 1000,
+            first_valid: 0.into(),
+            last_valid: 1000.into(),
+            ..Default::default()
+        },
+        lsig: Some(LogicSig {
+            args: Some(vec![vec![1u8].into()]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let result = simulate(
+        &mut state,
+        SimulationRequest {
+            txn_groups: vec![vec![orphan]],
+            allow_empty_signatures: true,
+            trace_config: ExecTraceConfig {
+                enable: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .expect("orphan lsig must be a recoverable failure, not a hard error");
+    let msg = result.txn_groups[0]
+        .failure_message
+        .as_ref()
+        .expect("orphan LogicSig must fail the group");
+    assert!(
+        msg.contains("LogicSig fields without LogicSig program"),
+        "unexpected message: {msg}"
+    );
+}
+
 /// Port of `TestPartialMissingSignatures`: a group where only *some*
 /// transactions carry a signature must still simulate successfully under
 /// `allow_empty_signatures` -- the unsigned member is proxy-signed, the

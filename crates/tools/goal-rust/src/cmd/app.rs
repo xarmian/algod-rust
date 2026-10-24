@@ -1552,7 +1552,7 @@ fn run_method_inner(args: MethodArgs, wallet: Option<String>) -> Result<ExitCode
     for (i, unsigned_txn) in group.iter().enumerate() {
         if i < loaded_txn_args.len() {
             let arg_stxn = &loaded_txn_args[i];
-            if arg_stxn.lsig.is_some() {
+            if arg_has_logicsig(arg_stxn) {
                 signed_group.push(SignedTransaction {
                     txn: unsigned_txn.clone(),
                     lsig: arg_stxn.lsig.clone(),
@@ -1861,10 +1861,28 @@ fn should_stop_after_page(limit_flag: u64, explicit_next: &str) -> bool {
     limit_flag > 0 || !explicit_next.is_empty()
 }
 
+/// Go `goal app method` (`cmd/goal/application.go`): `!txnFromArgs.Lsig.Blank()`.
+fn arg_has_logicsig(stxn: &SignedTransaction) -> bool {
+    stxn.lsig.as_ref().is_some_and(|l| !l.is_blank())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use algo_abi::{parse_method_signature, TransactionType};
+
+    #[test]
+    fn arg_has_logicsig_is_blank_aware() {
+        let mut s = SignedTransaction::default();
+        assert!(!arg_has_logicsig(&s));
+        s.lsig = Some(algo_types::LogicSig::default());
+        assert!(!arg_has_logicsig(&s), "blank lsig is not a logicsig");
+        s.lsig = Some(algo_types::LogicSig {
+            logic: serde_bytes::ByteBuf::from(vec![2, 0x20, 1, 1, 0x22]),
+            ..Default::default()
+        });
+        assert!(arg_has_logicsig(&s));
+    }
 
     // --- apps.AppCallBytes-form parsing ---
 
