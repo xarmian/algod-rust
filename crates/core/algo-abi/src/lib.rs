@@ -315,6 +315,7 @@ fn parse_static_array(s: &str, depth: usize) -> Result<AbiType, String> {
 /// Reject a static type whose encoded size overflows `usize` (FIND-ba9c86e5-03,
 /// #2057). go-algorand's `int` byteLen wraps silently here; no such type can
 /// be encoded, so refusing it at parse time changes no valid behaviour.
+// DIVERGENCE DIV-003: type_of rejects ABI types whose head size overflows usize
 fn check_static_size(t: AbiType) -> Result<AbiType, String> {
     if t.head_len().is_none() {
         return Err(format!("ABI type \"{t}\" is too large to encode"));
@@ -862,6 +863,18 @@ pub fn parse_and_encode_abi(type_str: &str, value_str: &str) -> Result<Vec<u8>, 
 /// `string`/dynamic arrays, and the tuple head/tail (with consecutive-bool
 /// bit-packing) scheme for tuples and arrays — see [`decode_tuple_types`].
 pub fn decode(abi_type: &AbiType, data: &[u8]) -> Result<AbiValue, String> {
+    let mut budget = MAX_ZERO_SIZE_ELEMS;
+    decode_inner(abi_type, data, &mut budget)
+}
+
+/// Total number of zero-byte array elements one [`decode`] call may expand.
+/// Elements that occupy no bytes (`()`, `uint8[0]`, nesting thereof) are the
+/// only ones not bounded by the input length, so `()[65535][65535]` would
+/// otherwise expand billions of values from empty data.
+// DIVERGENCE DIV-003: cap on zero-size ABI array element expansion in decode
+const MAX_ZERO_SIZE_ELEMS: usize = u16::MAX as usize;
+
+fn decode_inner(abi_type: &AbiType, data: &[u8], budget: &mut usize) -> Result<AbiValue, String> {
     match abi_type {
         AbiType::Uint(bits) => {
             let byte_len = *bits as usize / 8;
@@ -924,9 +937,9 @@ pub fn decode(abi_type: &AbiType, data: &[u8]) -> Result<AbiValue, String> {
             Ok(AbiValue::String(data[2..].to_vec()))
         }
         AbiType::ArrayStatic(elem, len) => {
-            check_repeated_min_len(elem, *len, data.len())?;
+            check_repeated_min_len(elem, *len, data.len(), budget)?;
             let child_types: Vec<AbiType> = vec![(**elem).clone(); *len];
-            let values = decode_tuple_types(&child_types, data)?;
+            let values = decode_tuple_types(&child_types, data, budget)?;
             Ok(AbiValue::ArrayStatic(values, (**elem).clone()))
         }
         AbiType::ArrayDynamic(elem) => {
@@ -934,13 +947,13 @@ pub fn decode(abi_type: &AbiType, data: &[u8]) -> Result<AbiValue, String> {
                 return Err("decode dynamic array: missing 2-byte length prefix".into());
             }
             let len = u16::from_be_bytes([data[0], data[1]]) as usize;
-            check_repeated_min_len(elem, len, data.len() - 2)?;
+            check_repeated_min_len(elem, len, data.len() - 2, budget)?;
             let child_types: Vec<AbiType> = vec![(**elem).clone(); len];
-            let values = decode_tuple_types(&child_types, &data[2..])?;
+            let values = decode_tuple_types(&child_types, &data[2..], budget)?;
             Ok(AbiValue::ArrayDynamic(values, (**elem).clone()))
         }
         AbiType::Tuple(children) => {
-            let values = decode_tuple_types(children, data)?;
+            let values = decode_tuple_types(children, data, budget)?;
             Ok(AbiValue::Tuple(values))
         }
     }
@@ -961,8 +974,20 @@ fn repeated_min_len(elem: &AbiType, len: usize) -> Option<usize> {
 
 /// Reject `len` copies of `elem` before expanding them when `available` bytes
 /// cannot possibly hold even their heads (FIND-ba9c86e5-03, #2057).
-fn check_repeated_min_len(elem: &AbiType, len: usize, available: usize) -> Result<(), String> {
+fn check_repeated_min_len(
+    elem: &AbiType,
+    len: usize,
+    available: usize,
+    budget: &mut usize,
+) -> Result<(), String> {
     match repeated_min_len(elem, len) {
+        Some(0) => {
+            // Zero-byte elements are not bounded by the input length.
+            *budget = budget.checked_sub(len).ok_or_else(|| {
+                "cannot decode abi array: too many zero-size elements".to_string()
+            })?;
+            Ok(())
+        }
         Some(min) if min <= available => Ok(()),
         Some(min) => Err(format!(
             "cannot decode abi array: need at least {min} bytes for {len} elements, got {available}"
@@ -982,7 +1007,11 @@ fn check_repeated_min_len(elem: &AbiType, len: usize, available: usize) -> Resul
 /// `data` for the last dynamic child — offsets are non-decreasing because
 /// `encode` appends tails in child order), and static non-bool children read
 /// their fixed byte length directly from the head.
-fn decode_tuple_types(children: &[AbiType], data: &[u8]) -> Result<Vec<AbiValue>, String> {
+fn decode_tuple_types(
+    children: &[AbiType],
+    data: &[u8],
+    budget: &mut usize,
+) -> Result<Vec<AbiValue>, String> {
     let n = children.len();
     let mut segments: Vec<Vec<u8>> = vec![Vec::new(); n];
     let mut dynamic_indices: Vec<usize> = Vec::new();
@@ -1049,7 +1078,7 @@ fn decode_tuple_types(children: &[AbiType], data: &[u8]) -> Result<Vec<AbiValue>
 
     let mut values = Vec::with_capacity(n);
     for (idx, child) in children.iter().enumerate() {
-        values.push(decode(child, &segments[idx])?);
+        values.push(decode_inner(child, &segments[idx], budget)?);
     }
     Ok(values)
 }
@@ -3559,8 +3588,13 @@ mod tests {
         assert!(decode(&t, &[0u8; 8]).is_err());
         let t = type_of("string[]").unwrap();
         assert!(decode(&t, &[0xFF, 0xFF, 0, 0]).is_err());
-        // Zero-sized elements legitimately decode from empty data.
+        // Zero-sized elements legitimately decode from empty data...
         let t = type_of("()[65535]").unwrap();
+        assert!(decode(&t, &[]).is_ok());
+        // ...but nested zero-size expansion is capped, not 4.3e9 values.
+        let t = type_of("()[65535][65535]").unwrap();
+        assert!(decode(&t, &[]).is_err());
+        let t = type_of("()[3][4]").unwrap();
         assert!(decode(&t, &[]).is_ok());
     }
 }
