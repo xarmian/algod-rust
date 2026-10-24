@@ -77,7 +77,7 @@ pub use apply::{
     apply_block_validating, apply_block_with_comparison, apply_block_with_delta,
     apply_block_with_delta_mode, apply_block_with_mode, apply_keyreg, apply_pay, apply_transaction,
     apply_transaction_with_budget, apply_transaction_with_tracer, ApplyContext, ApplyData,
-    ApplyMode, BoxBudgetState, GroupInfo, InnerApplyData,
+    ApplyMode, BoxBudgetState, GroupCreatedResources, GroupInfo, InnerApplyData,
 };
 pub use avm_context::{type_enum, GroupTxidCache, LedgerAvmContext};
 pub use block_header::{compute_load, make_next_block_header, next_bonus, next_congestion_tax};

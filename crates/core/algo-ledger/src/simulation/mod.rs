@@ -704,6 +704,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         let ran_program = std::cell::RefCell::new(vec![false; eval_group.len()]);
         let scratch = std::cell::RefCell::new(vec![None; eval_group.len()]);
         let group_txid_cache = crate::avm_context::GroupTxidCache::default();
+        let group_created = crate::apply::GroupCreatedResources::default();
 
         for i in 0..eval_group.len() {
             if precheck_failure.is_some() {
@@ -756,6 +757,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                         ran_program: &ran_program,
                         scratch: &scratch,
                         txid_cache: &group_txid_cache,
+                        created: &group_created,
                     };
                     apply_transaction_with_budget(
                         self.store,

@@ -1690,6 +1690,7 @@ fn apply_group_transactions_inner<S: crate::store_trait::LedgerStore>(
     let ran_program = RefCell::new(vec![false; group.len()]);
     let scratch = RefCell::new(vec![None; group.len()]);
     let group_txid_cache = crate::avm_context::GroupTxidCache::default();
+    let group_created = crate::apply::GroupCreatedResources::default();
     for (gi_idx, stx) in group.iter().enumerate() {
         ctx.txn_index.set(*global_txn_idx);
         if ctx.validate {
@@ -1706,6 +1707,7 @@ fn apply_group_transactions_inner<S: crate::store_trait::LedgerStore>(
             ran_program: &ran_program,
             scratch: &scratch,
             txid_cache: &group_txid_cache,
+            created: &group_created,
         };
         if stx.txn.txn_type == "appl" {
             // App-call opcode budget is pooled across the whole atomic
@@ -4033,6 +4035,39 @@ fn seed_avm_created_resources_from_group<L: crate::store_trait::LedgerStore>(
                 avm_ctx.created_apps.push(sibling.apply_data_application_id);
             }
         }
+        // Ids created inside earlier members' inner-call trees (#2038).
+        for &id in gi.created.apps.borrow().iter() {
+            if !avm_ctx.created_apps.contains(&id) {
+                avm_ctx.created_apps.push(id);
+            }
+        }
+        for &id in gi.created.assets.borrow().iter() {
+            if !avm_ctx.created_assets.contains(&id) {
+                avm_ctx.created_assets.push(id);
+            }
+        }
+    }
+}
+
+/// After a top-level program run, publish everything its context knows to
+/// have been created (at any inner depth) to the group-wide record.
+fn record_group_created_resources<L: crate::store_trait::LedgerStore>(
+    group_info: Option<&GroupInfo<'_>>,
+    avm_ctx: &LedgerAvmContext<'_, L>,
+) {
+    if let Some(gi) = group_info {
+        let mut apps = gi.created.apps.borrow_mut();
+        for &id in &avm_ctx.created_apps {
+            if !apps.contains(&id) {
+                apps.push(id);
+            }
+        }
+        let mut assets = gi.created.assets.borrow_mut();
+        for &id in &avm_ctx.created_assets {
+            if !assets.contains(&id) {
+                assets.push(id);
+            }
+        }
     }
 }
 
@@ -4163,6 +4198,23 @@ pub struct GroupInfo<'a> {
     /// instance. Seeded into each member's `LedgerAvmContext` by
     /// `seed_avm_txid_cache_from_group`.
     pub txid_cache: &'a crate::avm_context::GroupTxidCache,
+    /// Group-wide record of every app/asset id created so far by earlier
+    /// members' programs, including ids created deep inside their inner-call
+    /// trees (issue #2038). Same lifetime/ownership rules as `txid_cache`.
+    pub created: &'a GroupCreatedResources,
+}
+
+/// go-algorand keeps a single `available.createdApps`/`createdAsas` set on the
+/// group's shared `EvalParams` (`data/transactions/logic/resources.go`,
+/// `eval.go` `addInnerTxn`/`EvalContract`), so an app/asset created at any
+/// depth of one top-level member's inner-call tree stays an available
+/// resource to every later member of the group. Populated after each
+/// top-level program run by `record_group_created_resources`, read by
+/// `seed_avm_created_resources_from_group`.
+#[derive(Debug, Default)]
+pub struct GroupCreatedResources {
+    apps: RefCell<Vec<u64>>,
+    assets: RefCell<Vec<u64>>,
 }
 
 /// Apply a single signed transaction with a group budget for AVM execution.
@@ -6426,6 +6478,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     // space so a sibling's `gload` sees the actual values
                     // written, not a zero-filled placeholder (issue #686).
                     record_group_member_scratch(group_info, &result.scratch);
+                    record_group_created_resources(group_info, &avm_ctx);
                     // Propagate updated counters back to context.
                     ctx.txn_counter.set(avm_ctx.txn_counter);
                     ctx.fee_credit.set(avm_ctx.fee_credit);
@@ -6603,6 +6656,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 // of whether this program approved, rejected, or errored
                 // (see `AvmResult::scratch`'s doc).
                 record_group_member_scratch(group_info, &result.scratch);
+                record_group_created_resources(group_info, &avm_ctx);
 
                 // Propagate updated counters back to context.
                 ctx.txn_counter.set(avm_ctx.txn_counter);
