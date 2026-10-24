@@ -3579,6 +3579,83 @@ mod tests {
     }
 
     #[test]
+    fn test_bool_array_sizes_do_not_wrap() {
+        // avm-abi#24: u16 rounding wrapped bool[65535] to 0.
+        assert_eq!(type_of("bool[65535]").unwrap().byte_len(), Some(8192));
+        assert_eq!(
+            type_of("(bool[65535],uint8)").unwrap().byte_len(),
+            Some(8193)
+        );
+    }
+
+    #[test]
+    fn test_decode_short_input_never_panics() {
+        for (ty, data) in [
+            ("uint64[3]", &[0u8, 0][..]),
+            ("(bool,uint8)", &[][..]),
+            ("uint8[65534]", &[0u8, 0][..]),
+            ("uint8[3][3][3]", &[1u8][..]),
+            ("(string,uint64)", &[0u8][..]),
+        ] {
+            assert!(decode(&type_of(ty).unwrap(), data).is_err(), "{ty}");
+        }
+    }
+
+    #[test]
+    fn test_decode_truncation_and_mutation_no_panic() {
+        let types = [
+            "uint64",
+            "string",
+            "bool[11]",
+            "uint16[]",
+            "string[]",
+            "(uint8,bool,bool,string,uint64[2],address)",
+            "(string,(bool,uint32[]),byte[3])[2]",
+            "ufixed64x10[]",
+        ];
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for ts in types {
+            let t = type_of(ts).unwrap();
+            // Build a valid encoding where possible via zeroed buffers of many lengths.
+            for len in 0..80usize {
+                let data: Vec<u8> = (0..len).map(|i| (i * 7) as u8).collect();
+                for cut in 0..=len {
+                    let _ = decode(&t, &data[..cut]);
+                }
+                for _ in 0..40 {
+                    let mut m = data.clone();
+                    for b in m.iter_mut() {
+                        if next() % 4 == 0 {
+                            *b = next() as u8;
+                        }
+                    }
+                    let _ = decode(&t, &m);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_type_of_wide_and_deep_parse_is_fast() {
+        let start = std::time::Instant::now();
+        let wide = format!("({})", vec!["uint8"; 20000].join(","));
+        let _ = type_of(&wide);
+        let wide_nested = format!("({})", vec!["(uint8,bool)"; 5000].join(","));
+        let _ = type_of(&wide_nested);
+        let deep = format!("{}uint8{}", "(".repeat(5000), ")".repeat(5000));
+        assert!(type_of(&deep).is_err());
+        let deep_arr = format!("uint8{}", "[2]".repeat(5000));
+        assert!(type_of(&deep_arr).is_err());
+        assert!(start.elapsed().as_secs() < 5, "{:?}", start.elapsed());
+    }
+
+    #[test]
     fn test_decode_huge_static_array_tiny_data_rejected_early() {
         let t = type_of("uint64[65535]").unwrap();
         assert!(decode(&t, &[0u8; 8]).is_err());
