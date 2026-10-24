@@ -118,19 +118,35 @@ impl AbiType {
     /// Returns the byte length for static types, or `None` for dynamic types.
     ///
     /// For tuples, consecutive bool fields are packed into bytes (matching Go).
+    ///
+    /// Arithmetic is checked: a static type whose encoded size overflows
+    /// `usize` also yields `None` (never wraps or panics). [`type_of`]
+    /// rejects such types, so `None` for a non-dynamic type only arises from
+    /// hand-built `AbiType` values.
     pub fn byte_len(&self) -> Option<usize> {
+        if self.is_dynamic() {
+            None
+        } else {
+            self.head_len()
+        }
+    }
+
+    /// Bytes this type contributes to an enclosing head: the full encoded
+    /// size for static types, 2 (the offset) for dynamic ones. For a dynamic
+    /// type itself this is the size of its own head. `None` on overflow.
+    pub fn head_len(&self) -> Option<usize> {
         match self {
             AbiType::Uint(n) | AbiType::Ufixed(n, _) => Some(*n as usize / 8),
             AbiType::Bool => Some(1),
             AbiType::Byte => Some(1),
             AbiType::Address => Some(32),
-            AbiType::String | AbiType::ArrayDynamic(_) => None,
+            AbiType::String | AbiType::ArrayDynamic(_) => Some(2),
             AbiType::ArrayStatic(elem, len) => {
                 if **elem == AbiType::Bool {
                     // Bool arrays are bit-packed.
                     Some((*len).div_ceil(8))
                 } else {
-                    Some(elem.byte_len()? * len)
+                    elem.child_head_len()?.checked_mul(*len)
                 }
             }
             AbiType::Tuple(children) => {
@@ -145,15 +161,23 @@ impl AbiType {
                         {
                             bool_count += 1;
                         }
-                        size += bool_count.div_ceil(8);
+                        size = size.checked_add(bool_count.div_ceil(8))?;
                         i += bool_count;
                     } else {
-                        size += children[i].byte_len()?;
+                        size = size.checked_add(children[i].child_head_len()?)?;
                         i += 1;
                     }
                 }
                 Some(size)
             }
+        }
+    }
+
+    fn child_head_len(&self) -> Option<usize> {
+        if self.is_dynamic() {
+            Some(2)
+        } else {
+            self.head_len()
         }
     }
 }
@@ -251,7 +275,7 @@ fn type_of_inner(s: &str, depth: usize) -> Result<AbiType, String> {
         if types.len() >= u16::MAX as usize {
             return Err("tuple type child type number larger than maximum uint16 error".into());
         }
-        return Ok(AbiType::Tuple(types));
+        return check_static_size(AbiType::Tuple(types));
     }
 
     Err(format!("cannot convert the string \"{s}\" to an ABI type"))
@@ -285,7 +309,18 @@ fn parse_static_array(s: &str, depth: usize) -> Result<AbiType, String> {
     let elem_str = &s[..bracket_pos];
     let elem = type_of_inner(elem_str, depth + 1)?;
 
-    Ok(AbiType::ArrayStatic(Box::new(elem), array_len))
+    check_static_size(AbiType::ArrayStatic(Box::new(elem), array_len))
+}
+
+/// Reject a static type whose encoded size overflows `usize` (FIND-ba9c86e5-03,
+/// #2057). go-algorand's `int` byteLen wraps silently here; no such type can
+/// be encoded, so refusing it at parse time changes no valid behaviour.
+// DIVERGENCE DIV-003: type_of rejects ABI types whose head size overflows usize
+fn check_static_size(t: AbiType) -> Result<AbiType, String> {
+    if t.head_len().is_none() {
+        return Err("ABI type is too large to encode: head size overflows".into());
+    }
+    Ok(t)
 }
 
 /// Parse the `<N>x<M>` part of a `ufixed<N>x<M>` type string.
@@ -828,6 +863,18 @@ pub fn parse_and_encode_abi(type_str: &str, value_str: &str) -> Result<Vec<u8>, 
 /// `string`/dynamic arrays, and the tuple head/tail (with consecutive-bool
 /// bit-packing) scheme for tuples and arrays — see [`decode_tuple_types`].
 pub fn decode(abi_type: &AbiType, data: &[u8]) -> Result<AbiValue, String> {
+    let mut budget = MAX_ZERO_SIZE_ELEMS;
+    decode_inner(abi_type, data, &mut budget)
+}
+
+/// Total number of zero-byte array elements one [`decode`] call may expand.
+/// Elements that occupy no bytes (`()`, `uint8[0]`, nesting thereof) are the
+/// only ones not bounded by the input length, so `()[65535][65535]` would
+/// otherwise expand billions of values from empty data.
+// DIVERGENCE DIV-003: cap on zero-size ABI array element expansion in decode
+const MAX_ZERO_SIZE_ELEMS: usize = 1 << 20;
+
+fn decode_inner(abi_type: &AbiType, data: &[u8], budget: &mut usize) -> Result<AbiValue, String> {
     match abi_type {
         AbiType::Uint(bits) => {
             let byte_len = *bits as usize / 8;
@@ -890,8 +937,9 @@ pub fn decode(abi_type: &AbiType, data: &[u8]) -> Result<AbiValue, String> {
             Ok(AbiValue::String(data[2..].to_vec()))
         }
         AbiType::ArrayStatic(elem, len) => {
+            check_repeated_min_len(elem, *len, data.len(), budget)?;
             let child_types: Vec<AbiType> = vec![(**elem).clone(); *len];
-            let values = decode_tuple_types(&child_types, data)?;
+            let values = decode_tuple_types(&child_types, data, budget)?;
             Ok(AbiValue::ArrayStatic(values, (**elem).clone()))
         }
         AbiType::ArrayDynamic(elem) => {
@@ -899,14 +947,52 @@ pub fn decode(abi_type: &AbiType, data: &[u8]) -> Result<AbiValue, String> {
                 return Err("decode dynamic array: missing 2-byte length prefix".into());
             }
             let len = u16::from_be_bytes([data[0], data[1]]) as usize;
+            check_repeated_min_len(elem, len, data.len() - 2, budget)?;
             let child_types: Vec<AbiType> = vec![(**elem).clone(); len];
-            let values = decode_tuple_types(&child_types, &data[2..])?;
+            let values = decode_tuple_types(&child_types, &data[2..], budget)?;
             Ok(AbiValue::ArrayDynamic(values, (**elem).clone()))
         }
         AbiType::Tuple(children) => {
-            let values = decode_tuple_types(children, data)?;
+            let values = decode_tuple_types(children, data, budget)?;
             Ok(AbiValue::Tuple(values))
         }
+    }
+}
+
+/// Minimum encoded size of `len` copies of `elem`: the head only (packed
+/// bools, 2-byte offsets for dynamic children, full size for static ones).
+/// `None` on arithmetic overflow.
+fn repeated_min_len(elem: &AbiType, len: usize) -> Option<usize> {
+    if *elem == AbiType::Bool {
+        Some(len.div_ceil(8))
+    } else if elem.is_dynamic() {
+        len.checked_mul(2)
+    } else {
+        elem.byte_len()?.checked_mul(len)
+    }
+}
+
+/// Reject `len` copies of `elem` before expanding them when `available` bytes
+/// cannot possibly hold even their heads (FIND-ba9c86e5-03, #2057).
+fn check_repeated_min_len(
+    elem: &AbiType,
+    len: usize,
+    available: usize,
+    budget: &mut usize,
+) -> Result<(), String> {
+    match repeated_min_len(elem, len) {
+        Some(0) => {
+            // Zero-byte elements are not bounded by the input length.
+            *budget = budget.checked_sub(len).ok_or_else(|| {
+                "cannot decode abi array: too many zero-size elements".to_string()
+            })?;
+            Ok(())
+        }
+        Some(min) if min <= available => Ok(()),
+        Some(min) => Err(format!(
+            "cannot decode abi array: need at least {min} bytes for {len} elements, got {available}"
+        )),
+        None => Err("cannot decode abi array: encoded size overflows".into()),
     }
 }
 
@@ -921,7 +1007,11 @@ pub fn decode(abi_type: &AbiType, data: &[u8]) -> Result<AbiValue, String> {
 /// `data` for the last dynamic child — offsets are non-decreasing because
 /// `encode` appends tails in child order), and static non-bool children read
 /// their fixed byte length directly from the head.
-fn decode_tuple_types(children: &[AbiType], data: &[u8]) -> Result<Vec<AbiValue>, String> {
+fn decode_tuple_types(
+    children: &[AbiType],
+    data: &[u8],
+    budget: &mut usize,
+) -> Result<Vec<AbiValue>, String> {
     let n = children.len();
     let mut segments: Vec<Vec<u8>> = vec![Vec::new(); n];
     let mut dynamic_indices: Vec<usize> = Vec::new();
@@ -961,10 +1051,10 @@ fn decode_tuple_types(children: &[AbiType], data: &[u8]) -> Result<Vec<AbiValue>
             pos += 2;
             i += 1;
         } else {
-            let len = children[i].byte_len().ok_or_else(|| {
-                "cannot decode abi tuple: static type missing byte_len".to_string()
-            })?;
-            if pos + len > data.len() {
+            let len = children[i]
+                .byte_len()
+                .ok_or_else(|| "cannot decode abi tuple: static type size overflows".to_string())?;
+            if pos.checked_add(len).is_none_or(|end| end > data.len()) {
                 return Err("cannot decode abi tuple: static field out of bounds".into());
             }
             segments[i] = data[pos..pos + len].to_vec();
@@ -988,7 +1078,7 @@ fn decode_tuple_types(children: &[AbiType], data: &[u8]) -> Result<Vec<AbiValue>
 
     let mut values = Vec::with_capacity(n);
     for (idx, child) in children.iter().enumerate() {
-        values.push(decode(child, &segments[idx])?);
+        values.push(decode_inner(child, &segments[idx], budget)?);
     }
     Ok(values)
 }
@@ -3427,5 +3517,161 @@ mod tests {
         let types = types_of(&["uint64"]);
         assert!(encode_method_args(&types, &[]).is_err());
         assert!(encode_method_args(&[], &["1"]).is_err());
+    }
+
+    // --- FIND-ba9c86e5-03 (#2057): byte_len overflow / unbounded expansion ---
+
+    const OVERFLOW_TYPE: &str = "uint64[65535][65535][65535][65535][65535]";
+
+    fn nested_overflow_type() -> AbiType {
+        let mut t = AbiType::Uint(64);
+        for _ in 0..5 {
+            t = AbiType::ArrayStatic(Box::new(t), u16::MAX as usize);
+        }
+        t
+    }
+
+    #[test]
+    fn test_byte_len_nested_static_overflow_is_none() {
+        assert_eq!(nested_overflow_type().byte_len(), None);
+        // A tuple summing two near-max children must not wrap either.
+        let big = AbiType::ArrayStatic(
+            Box::new(AbiType::ArrayStatic(
+                Box::new(AbiType::ArrayStatic(
+                    Box::new(AbiType::ArrayStatic(
+                        Box::new(AbiType::Uint(8)),
+                        u16::MAX as usize,
+                    )),
+                    u16::MAX as usize,
+                )),
+                u16::MAX as usize,
+            )),
+            u16::MAX as usize,
+        );
+        // 65535^4 < 2^64: representable, so Some on 64-bit.
+        assert!(big.byte_len().is_some());
+        let tup = AbiType::Tuple(vec![big.clone(); 8]);
+        assert_eq!(tup.byte_len(), None);
+    }
+
+    #[test]
+    fn test_type_of_rejects_overflowing_static_size() {
+        assert!(type_of(OVERFLOW_TYPE).is_err());
+        assert!(type_of(&format!("({OVERFLOW_TYPE},uint8)")).is_err());
+        // Large-but-representable static types still parse.
+        assert!(type_of("uint8[65535][65535]").is_ok());
+        // An overflowing static element makes the enclosing dynamic array invalid too.
+        assert!(type_of("uint64[65535][65535][65535][65535][65535][]").is_err());
+        // Dynamic tuple whose static head parts sum past usize.
+        let big = "uint8[65535][65535][65535][65535]";
+        let tup = format!("({big},{big},{big},{big},{big},{big},{big},{big},string)");
+        assert!(type_of(&tup).is_err());
+        assert!(type_of(&format!("({big},string)")).is_ok());
+        assert!(type_of("string[65535][65535][65535][65535][65535]").is_ok());
+    }
+
+    #[test]
+    fn test_decode_overflowing_static_type_errors_without_panic() {
+        let t = nested_overflow_type();
+        assert!(decode(&t, &[0u8; 8]).is_err());
+        let t = AbiType::ArrayStatic(Box::new(t), 2);
+        assert!(decode(&t, &[0u8; 8]).is_err());
+    }
+
+    #[test]
+    fn test_bool_array_sizes_do_not_wrap() {
+        // avm-abi#24: u16 rounding wrapped bool[65535] to 0.
+        assert_eq!(type_of("bool[65535]").unwrap().byte_len(), Some(8192));
+        assert_eq!(
+            type_of("(bool[65535],uint8)").unwrap().byte_len(),
+            Some(8193)
+        );
+    }
+
+    #[test]
+    fn test_decode_short_input_never_panics() {
+        for (ty, data) in [
+            ("uint64[3]", &[0u8, 0][..]),
+            ("(bool,uint8)", &[][..]),
+            ("uint8[65534]", &[0u8, 0][..]),
+            ("uint8[3][3][3]", &[1u8][..]),
+            ("(string,uint64)", &[0u8][..]),
+        ] {
+            assert!(decode(&type_of(ty).unwrap(), data).is_err(), "{ty}");
+        }
+    }
+
+    #[test]
+    fn test_decode_truncation_and_mutation_no_panic() {
+        let types = [
+            "uint64",
+            "string",
+            "bool[11]",
+            "uint16[]",
+            "string[]",
+            "(uint8,bool,bool,string,uint64[2],address)",
+            "(string,(bool,uint32[]),byte[3])[2]",
+            "ufixed64x10[]",
+        ];
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for ts in types {
+            let t = type_of(ts).unwrap();
+            // Build a valid encoding where possible via zeroed buffers of many lengths.
+            for len in 0..80usize {
+                let data: Vec<u8> = (0..len).map(|i| (i * 7) as u8).collect();
+                for cut in 0..=len {
+                    let _ = decode(&t, &data[..cut]);
+                }
+                for _ in 0..40 {
+                    let mut m = data.clone();
+                    for b in m.iter_mut() {
+                        if next() % 4 == 0 {
+                            *b = next() as u8;
+                        }
+                    }
+                    let _ = decode(&t, &m);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_type_of_wide_and_deep_parse_is_fast() {
+        let start = std::time::Instant::now();
+        let wide = format!("({})", vec!["uint8"; 20000].join(","));
+        let _ = type_of(&wide);
+        let wide_nested = format!("({})", vec!["(uint8,bool)"; 5000].join(","));
+        let _ = type_of(&wide_nested);
+        let deep = format!("{}uint8{}", "(".repeat(5000), ")".repeat(5000));
+        assert!(type_of(&deep).is_err());
+        let deep_arr = format!("uint8{}", "[2]".repeat(5000));
+        assert!(type_of(&deep_arr).is_err());
+        assert!(start.elapsed().as_secs() < 5, "{:?}", start.elapsed());
+    }
+
+    #[test]
+    fn test_decode_huge_static_array_tiny_data_rejected_early() {
+        let t = type_of("uint64[65535]").unwrap();
+        assert!(decode(&t, &[0u8; 8]).is_err());
+        let t = type_of("string[65535]").unwrap();
+        assert!(decode(&t, &[0u8; 8]).is_err());
+        let t = type_of("bool[65535]").unwrap();
+        assert!(decode(&t, &[0u8; 8]).is_err());
+        let t = type_of("string[]").unwrap();
+        assert!(decode(&t, &[0xFF, 0xFF, 0, 0]).is_err());
+        // Zero-sized elements legitimately decode from empty data...
+        let t = type_of("()[65535]").unwrap();
+        assert!(decode(&t, &[]).is_ok());
+        // ...but nested zero-size expansion is capped, not 4.3e9 values.
+        let t = type_of("()[65535][65535]").unwrap();
+        assert!(decode(&t, &[]).is_err());
+        let t = type_of("()[3][4]").unwrap();
+        assert!(decode(&t, &[]).is_ok());
     }
 }

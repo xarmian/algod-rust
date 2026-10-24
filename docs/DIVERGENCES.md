@@ -54,6 +54,7 @@ consensus-compatible. It exists for three readers:
 |---|---|---|---|---|---|---|---|---|
 | DIV-001 | Falcon-1024 `det1024` implemented in pure Rust; vendored C kept as a runtime-selectable backend (`config.json` `FalconBackend`) | crypto / state proofs / PQ accounts / AVM `falcon_verify` | landed | 2026-10-14 | none (bit-identical keys, signatures, verify decisions, CT conversion) | `crates/core/algo-falcon/`, `crates/node/algo-config/src/lib.rs` (`FalconBackend`), `bin/algod-rust/src/commands/node.rs`, `crates/tools/algokey-rust` | `crypto/falconWrapper.go`, module `github.com/algorand/falcon` v0.1.0 (`falcon.go`, `deterministic.c`, Pornin's reference C) | Go-generated vector corpus diffed in CI, per-function differential tests vs the vendored C, fuzz target (epic #1926) |
 | DIV-002 | `goal node pendingtxns` prints each pending transaction in the REST API's JSON form instead of Go's `encoding/json` dump of its decoded `SignedTxn` structs | goal-rust CLI output | landed | 2026-10-17 | none (client-side formatting of data the node already serves) | `crates/tools/goal-rust/src/cmd/node.rs` (`format_pending_txns`) | `cmd/goal/node.go` (`pendingTxnsCmd`), `libgoal/libgoal.go` (`GetParsedPendingTransactions`) | unit test of the exact text for the empty and non-empty pool, mock-node end-to-end test |
+| DIV-003 | `algo-abi` rejects ABI types whose encoded head size overflows `usize` at parse time, and caps zero-size array element expansion in `decode` | ABI type parsing / decoding (REST `abi:` box names, goal CLI) | landed | 2026-10-24 | none (no such type can be encoded; valid ARC-4 vectors byte-identical) | `crates/core/algo-abi/src/lib.rs` (`check_static_size`, `MAX_ZERO_SIZE_ELEMS`) | `github.com/algorand/avm-abi` `abi/abi_type.go` (`TypeOf`, `GetEncodedSize`), `abi/abi_encode.go` | `algo-abi` unit tests (overflow/huge-array/zero-size cases) plus the unchanged ARC-4 vector suite (#2057) |
 
 ## Entries
 
@@ -166,3 +167,36 @@ against a mock node.
 **How go-algorand could port it.** Print `GetRawPendingTransactions` with
 `format=json` instead of decoding to structs, if a stable JSON form is
 preferred over the struct dump.
+
+### DIV-003 — `algo-abi` bounds oversized ABI types and zero-size expansion
+
+**Status:** landed (#2057, audit FIND-ba9c86e5-03).
+
+**What go-algorand does.** `avm-abi` computes static type sizes with plain
+`int` arithmetic and expands `[N]T` arrays during decode without bounding the
+work by the input length, so `uint64[65535][65535][65535][65535][65535]`
+wraps silently and nested zero-size arrays can expand without limit.
+
+**What algod-rust does instead.** `AbiType::byte_len`/`head_len` use checked
+arithmetic; `type_of` returns an error for any type whose head size overflows
+`usize`; `decode` checks the minimum encoded size before expanding an array
+and caps the total number of zero-byte array elements expanded per call at
+1,048,576 (2^20, aggregate across the call).
+
+**What is identical.** Every type with a representable size parses, encodes
+and decodes byte-for-byte as before, except values that contain more than
+2^20 zero-byte array elements in total (e.g. `()[65535][65535]`), which are
+rejected; error behaviour for malformed data is otherwise unchanged apart
+from earlier detection. Overflow boundaries assume a 64-bit `usize`.
+
+**Why.** Closes a REST/CLI-reachable panic (debug) / wrap (release) and
+allocation amplification. Not consensus-affecting.
+
+**How parity is proven.** The whole existing `algo-abi` ARC-4 vector suite is
+unchanged and green; new unit tests cover the rejected cases and the boundary
+(`uint8[65535]^4` still parses, `()[65535]` still decodes).
+
+**How to switch back.** No switch.
+
+**How go-algorand could port it.** Use overflow-checked multiplication in the
+size computation and validate `len*minElemSize <= len(data)` before decoding.

@@ -257,6 +257,14 @@ mod tests {
     }
 
     #[test]
+    fn test_abi_overflowing_static_type_rejected() {
+        // FIND-ba9c86e5-03 (#2057): must be a clean error, not a panic/alloc.
+        let name = "abi:uint64[65535][65535][65535][65535][65535]:[]";
+        assert!(parse_box_name(name).is_err());
+        assert!(parse_box_name("abi:(uint8[65535][65535][65535][65535],uint8[65535][65535][65535][65535],uint8[65535][65535][65535][65535],uint8[65535][65535][65535][65535],uint8[65535][65535][65535][65535],uint8[65535][65535][65535][65535],uint8[65535][65535][65535][65535],uint8[65535][65535][65535][65535],string):[]").is_err());
+    }
+
+    #[test]
     fn test_abi_tuple() {
         // Tuple type: (uint8,uint16) with JSON array value [1,256]
         let result = parse_box_name("abi:(uint8,uint16):[1,256]").unwrap();
