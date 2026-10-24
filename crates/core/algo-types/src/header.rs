@@ -310,7 +310,7 @@ impl BlockHeader {
                 (2, b'c') if key == b"ct" => h.congestion_tax = rmp_decode::read_u64(rd)?,
                 (2, b'f') if key == b"fc" => h.fees_collected = rmp_decode::read_u64(rd)?,
                 (2, b'g') if key == b"gh" => {
-                    h.genesis_hash = rmp_decode::read_fixed_bytes::<32>(rd)?
+                    h.genesis_hash = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
                 }
                 (2, b'l') if key == b"ld" => h.load = rmp_decode::read_u64(rd)?,
                 (2, b'p') if key == b"pp" => h.proposer_payout = rmp_decode::read_u64(rd)?,
@@ -321,30 +321,34 @@ impl BlockHeader {
                 },
                 // ── 3-byte keys ──────────────────────────────────
                 (3, b'g') if key == b"gen" => h.genesis_id = rmp_decode::read_string(rd)?,
-                (3, b'p') if key == b"prp" => h.proposer = rmp_decode::read_address(rd)?,
+                (3, b'p') if key == b"prp" => h.proposer = rmp_decode::read_address_go_compat(rd)?,
                 (3, b'r') => match key {
                     b"rnd" => {
                         h.round = Round(rmp_decode::read_u64(rd)?);
                     }
-                    b"rwd" => h.rewards_pool = rmp_decode::read_address(rd)?,
+                    b"rwd" => h.rewards_pool = rmp_decode::read_address_go_compat(rd)?,
                     _ => rmp_decode::skip_value(rd)?,
                 },
                 (3, b's') if key == b"spt" => {
                     h.state_proof_tracking = rmp_decode::read_optional_rmpv(rd)?
                 }
                 (3, b't') if key == b"txn" => {
-                    h.txn_commitment = rmp_decode::read_fixed_bytes::<32>(rd)?
+                    h.txn_commitment = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
                 }
                 // ── 4-byte keys ──────────────────────────────────
                 (4, b'e') if key == b"earn" => h.rewards_level = rmp_decode::read_u64(rd)?,
                 (4, b'f') => match key {
-                    b"fees" => h.fee_sink = rmp_decode::read_address(rd)?,
+                    b"fees" => h.fee_sink = rmp_decode::read_address_go_compat(rd)?,
                     b"frac" => h.rewards_residue = rmp_decode::read_u64(rd)?,
                     _ => rmp_decode::skip_value(rd)?,
                 },
-                (4, b'p') if key == b"prev" => h.branch = rmp_decode::read_fixed_bytes::<32>(rd)?,
+                (4, b'p') if key == b"prev" => {
+                    h.branch = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
+                }
                 (4, b'r') if key == b"rate" => h.rewards_rate = rmp_decode::read_u64(rd)?,
-                (4, b's') if key == b"seed" => h.seed = rmp_decode::read_fixed_bytes::<32>(rd)?,
+                (4, b's') if key == b"seed" => {
+                    h.seed = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?
+                }
                 // ── 5-byte keys ──────────────────────────────────
                 (5, b'p') if key == b"proto" => h.current_protocol = rmp_decode::read_string(rd)?,
                 // ── 6-byte keys ──────────────────────────────────
@@ -352,8 +356,8 @@ impl BlockHeader {
                     h.rewards_recalculation_round = Round(rmp_decode::read_u64(rd)?)
                 }
                 (6, b't') => match key {
-                    b"txn256" => h.txn256 = rmp_decode::read_fixed_bytes::<32>(rd)?,
-                    b"txn512" => h.txn512 = rmp_decode::read_fixed_bytes::<64>(rd)?,
+                    b"txn256" => h.txn256 = rmp_decode::read_fixed_bytes_go_compat::<32>(rd)?,
+                    b"txn512" => h.txn512 = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?,
                     _ => rmp_decode::skip_value(rd)?,
                 },
                 // ── 7-byte keys ──────────────────────────────────
@@ -361,7 +365,7 @@ impl BlockHeader {
                     h.next_protocol_approvals = rmp_decode::read_u64(rd)?
                 }
                 (7, b'p') if key == b"prev512" => {
-                    h.prev512 = rmp_decode::read_fixed_bytes::<64>(rd)?
+                    h.prev512 = rmp_decode::read_fixed_bytes_go_compat::<64>(rd)?
                 }
                 // ── 9-byte keys ──────────────────────────────────
                 (9, b'n') if key == b"nextproto" => h.next_protocol = rmp_decode::read_string(rd)?,
@@ -374,11 +378,11 @@ impl BlockHeader {
                 (10, b'p') => match key {
                     b"partupdrmv" => {
                         h.expired_participation_accounts =
-                            rmp_decode::read_optional_vec(rd, rmp_decode::read_address)?
+                            rmp_decode::read_optional_vec(rd, rmp_decode::read_address_go_compat)?
                     }
                     b"partupdabs" => {
                         h.absent_participation_accounts =
-                            rmp_decode::read_optional_vec(rd, rmp_decode::read_address)?
+                            rmp_decode::read_optional_vec(rd, rmp_decode::read_address_go_compat)?
                     }
                     _ => rmp_decode::skip_value(rd)?,
                 },

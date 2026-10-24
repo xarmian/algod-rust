@@ -130,10 +130,10 @@ impl PQSig {
         let mut s = Self::default();
         for _ in 0..len {
             match crate::rmp_decode::read_key_bytes(rd)? {
-                b"sch" => s.scheme = crate::rmp_decode::read_fixed_bytes::<2>(rd)?,
+                b"sch" => s.scheme = crate::rmp_decode::read_fixed_bytes_go_compat::<2>(rd)?,
                 b"slt" => s.salt = PQAddressSalt(crate::rmp_decode::read_u8_val(rd)?),
-                b"pk" => s.public_key = crate::rmp_decode::read_bytes_as_bytebuf(rd)?,
-                b"sig" => s.signature = crate::rmp_decode::read_bytes_as_bytebuf(rd)?,
+                b"pk" => s.public_key = crate::rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?,
+                b"sig" => s.signature = crate::rmp_decode::read_bytes_as_bytebuf_go_compat(rd)?,
                 other => crate::rmp_decode::unknown_key(rd, other)?,
             }
         }
