@@ -56,6 +56,7 @@ consensus-compatible. It exists for three readers:
 | DIV-002 | `goal node pendingtxns` prints each pending transaction in the REST API's JSON form instead of Go's `encoding/json` dump of its decoded `SignedTxn` structs | goal-rust CLI output | landed | 2026-10-17 | none (client-side formatting of data the node already serves) | `crates/tools/goal-rust/src/cmd/node.rs` (`format_pending_txns`) | `cmd/goal/node.go` (`pendingTxnsCmd`), `libgoal/libgoal.go` (`GetParsedPendingTransactions`) | unit test of the exact text for the empty and non-empty pool, mock-node end-to-end test |
 | DIV-003 | `algo-abi` rejects ABI types whose encoded head size overflows `usize` at parse time, and caps zero-size array element expansion in `decode` | ABI type parsing / decoding (REST `abi:` box names, goal CLI) | landed | 2026-10-24 | none (no such type can be encoded; valid ARC-4 vectors byte-identical) | `crates/core/algo-abi/src/lib.rs` (`check_static_size`, `MAX_ZERO_SIZE_ELEMS`) | `github.com/algorand/avm-abi` `abi/abi_type.go` (`TypeOf`, `GetEncodedSize`), `abi/abi_encode.go` | `algo-abi` unit tests (overflow/huge-array/zero-size cases) plus the unchanged ARC-4 vector suite (#2057) |
 | DIV-004 | Hand-written msgpack struct readers decode the map form only (go also decodes struct-from-array) and replace, rather than merge into, a struct/array on a duplicated key | wire decoding of non-canonical msgpack (blocks, transactions, heartbeat, state proof, PQ structs) | landed | 2026-10-24 | none for canonical encodings (go's encoder never emits the array form or duplicate keys; hashes are over the canonical re-encode); only non-canonical input go accepts is rejected or decoded differently | `crates/core/algo-types/src/rmp_decode.rs` (`read_map_len`), the `decode_from_reader` struct readers in `crates/core/algo-types/src/{transaction,block,header,pq}.rs` | `data/transactions/msgp_gen.go` (`SignedTxn.UnmarshalMsgWithState` struct-from-array branch and key loop), algorand/msgp `msgp/read_bytes.go` | `docs/BYTES_DECODE_PARITY.md` "Issue #2065: final disposition"; `go_msgp_nil_scalars_test.rs` pins the parts that were implemented (nil -> zero) |
+| DIV-005 | `algokey keyreg` and the `--network` presets accept `voimain` (Voi mainnet), a network absent from go-algorand's `validNetworks` map | network presets / algokey genesis-hash table | landed | 2026-10-25 | none (additive preset; the four go networks resolve exactly as before) | `crates/core/algo-types/src/networks.rs`, `bin/algod-rust/src/commands/network_common.rs` | `cmd/algokey/keyreg.go` (`validNetworks`) | genesis-hash pin tests (`networks_parity`, `genesis_test::test_voimain_genesis_hash_matches_fixture`) against the live Voi `/genesis` and `/versions` (epic #2068, #2069) |
 
 ## Entries
 
@@ -242,3 +243,31 @@ Reasoning and the source citations are in `docs/BYTES_DECODE_PARITY.md`
 
 **How go-algorand could port it.** Not applicable (go is the more permissive
 side).
+
+### DIV-005 — `voimain` network preset
+
+**Status:** landed (#2069, epic #2068).
+
+**What go-algorand does.** `algokey keyreg --network` only accepts the four
+Algorand networks in `validNetworks`; go-algorand has no notion of Voi.
+
+**What algod-rust does instead.** Adds a `voimain` preset (genesis id
+`voimain-v1.0`, hash `r20fSQI8gWe/kFZziNonSPCXLwcQmH/nxROvnnueWOk=`, vendored
+genesis, Voi REST endpoint, Voi DNS bootstrap template) to `--network` and to
+the algokey hash table. See `docs/NETWORK_PRESETS.md`.
+
+**What is identical.** Voi mainnet runs standard Algorand consensus versions;
+all four go networks, their hashes, and the unknown-network error text
+(which still lists only Go's four networks) are unchanged.
+
+**Why.** Following Voi mainnet is a supported use case.
+
+**How parity is proven.** Pinned-hash tests plus a byte-exact genesis fixture
+from the live Voi node (hash recomputed and compared to `/versions`).
+
+**Help text.** `algokey keyreg --network` help lists `voimain` while the
+unknown-network error text deliberately does not (kept Go-identical).
+
+**How to switch back.** Remove the preset row and enum variant.
+
+**How go-algorand could port it.** Add the hash to `validNetworks`.

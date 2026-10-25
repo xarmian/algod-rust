@@ -47,6 +47,11 @@ pub enum Network {
     Testnet,
     Betanet,
     Devnet,
+    // DIVERGENCE DIV-005: voimain is not in go-algorand's validNetworks.
+    /// Voi mainnet (`voimain-v1.0`), a go-algorand fork chain using the
+    /// standard Algorand consensus versions. algod-rust extension: not in
+    /// go-algorand's `validNetworks` map.
+    Voimain,
 }
 
 /// Returned when a network name doesn't match any of the four known
@@ -63,8 +68,11 @@ impl fmt::Display for UnknownNetwork {
             f,
             "unknown network '{}' provided. Supported networks: {}",
             self.name,
+            // Go's `validNetworks` only: `voimain` (DIV-005) is deliberately
+            // not listed so the error text stays byte-identical to Go's.
             Network::all()
                 .iter()
+                .filter(|n| **n != Network::Voimain)
                 .map(|n| n.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -109,6 +117,9 @@ const MAINNET_B64: &str = "wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8=";
 const TESTNET_B64: &str = "SGO1GKSzyE7IEPItTxCByw9x8FmnrCDexi9/cOUJOiI=";
 const BETANET_B64: &str = "mFgazF+2uRS1tMiL9dsj01hJGySEmPN28B/TjjvpVW0=";
 const DEVNET_B64: &str = "sjkznd5fmOPzTzMi6BAHa2Ir9DyOxu5H7NH3ratQG1w=";
+// Voi mainnet; verified against `https://mainnet-api.voi.nodely.dev/versions`
+// and the SHA512/256 genesis hash of the vendored `voimain-genesis.json`.
+const VOIMAIN_B64: &str = "r20fSQI8gWe/kFZziNonSPCXLwcQmH/nxROvnnueWOk=";
 
 /// Name of the environment variable Go honors as a digest override.
 /// Same string as Go's `os.Getenv("ALGOKEY_GENESIS_HASH")` at
@@ -124,6 +135,7 @@ impl Network {
             Self::Testnet => "testnet",
             Self::Betanet => "betanet",
             Self::Devnet => "devnet",
+            Self::Voimain => "voimain",
         }
     }
 
@@ -135,6 +147,7 @@ impl Network {
             "testnet" => Ok(Self::Testnet),
             "betanet" => Ok(Self::Betanet),
             "devnet" => Ok(Self::Devnet),
+            "voimain" => Ok(Self::Voimain),
             _ => Err(UnknownNetwork {
                 name: s.to_string(),
             }),
@@ -148,6 +161,7 @@ impl Network {
             Self::Testnet => TESTNET_B64,
             Self::Betanet => BETANET_B64,
             Self::Devnet => DEVNET_B64,
+            Self::Voimain => VOIMAIN_B64,
         };
         Digest(
             decode_b64_digest(b64)
@@ -155,7 +169,7 @@ impl Network {
         )
     }
 
-    /// All four networks, in Go's `validNetworkList` order. (Go derives
+    /// All networks (Go's four, then algod-rust's `voimain`), in Go's `validNetworkList` order. (Go derives
     /// the list from `maps.Keys` which is unordered, but the error
     /// message lists them; we pin a stable order so the error wording
     /// is reproducible.)
@@ -165,6 +179,7 @@ impl Network {
             Network::Testnet,
             Network::Betanet,
             Network::Devnet,
+            Network::Voimain,
         ]
     }
 }
@@ -236,6 +251,7 @@ mod tests {
             ("testnet", Network::Testnet),
             ("BETANET", Network::Betanet),
             ("DevNet", Network::Devnet),
+            ("VoiMain", Network::Voimain),
         ] {
             assert_eq!(Network::from_str_ci(input).unwrap(), expected);
         }
@@ -282,6 +298,7 @@ mod tests {
             (Network::Testnet, TESTNET_B64),
             (Network::Betanet, BETANET_B64),
             (Network::Devnet, DEVNET_B64),
+            (Network::Voimain, VOIMAIN_B64),
         ] {
             let bytes = net.genesis_hash().0;
             let re_encoded = BASE64.encode(&bytes);

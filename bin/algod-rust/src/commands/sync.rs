@@ -33,7 +33,9 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::commands::network_common::{genesis_id_for, DNS_BOOTSTRAP_TEMPLATE};
+use crate::commands::network_common::{
+    effective_dns_bootstrap, genesis_id_for, DNS_BOOTSTRAP_TEMPLATE,
+};
 
 // ---------------------------------------------------------------------------
 // FallbackBlockSource — tries gossip, then REST
@@ -159,20 +161,21 @@ pub(crate) async fn setup_gossip_network(
         // Explicit --relay-addr flags take priority; skip DNS discovery.
         phonebook.replace_peer_list(relay_addrs_cli, "cli", RELAY_ROLE);
         info!(count = relay_addrs_cli.len(), "added CLI relay addresses");
-    } else if matches!(network, "mainnet" | "testnet" | "devnet" | "betanet") {
+    } else if genesis_id_for(network).is_some() {
         // Known networks: discover relay peers via DNS SRV. `--dns-bootstrap`
         // generalizes `algo_config::Local::dns_bootstrap_id`
         // (go: `config.Local.DNSBootstrapID`) to gossip-mode sync, which
         // previously always used the hardcoded template (issue #748 — this
         // knob was confined to the `observe` subcommand before).
-        let dns_template = dns_bootstrap_override.unwrap_or(DNS_BOOTSTRAP_TEMPLATE);
+        let (dns_template, dns_overridden) =
+            effective_dns_bootstrap(network, dns_bootstrap_override, DNS_BOOTSTRAP_TEMPLATE);
         let resolver = Box::new(HickorySrvResolver::new(None));
         let discovery = Discovery::new(
             phonebook.clone(),
             resolver,
             dns_template,
             network,
-            dns_bootstrap_override.is_some(),
+            dns_overridden,
         )?;
         discovery.refresh_phonebook_addresses().await;
         info!("DNS discovery complete");

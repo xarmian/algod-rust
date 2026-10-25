@@ -24,6 +24,163 @@
 pub const DNS_BOOTSTRAP_TEMPLATE: &str =
     "<network>.algorand.network?backup=<network>.algorand.net&dedup=<name>.algorand-<network>.(network|net)";
 
+/// A built-in network preset: everything `--network <name>` needs to know
+/// about a chain, kept in one table ([`PRESETS`]) so adding a chain (voimain,
+/// aramidmain, ...) is one row plus its fixtures rather than a hunt through
+/// every `match network { "mainnet" => ... }` (issue #2069, epic #2068).
+///
+/// The genesis *hash* is deliberately not duplicated here: it lives in
+/// [`algo_types::Network`] (the algokey keyreg table) and is reached via
+/// [`NetworkPreset::genesis_hash`]; a test pins that it equals the hash of
+/// the embedded genesis JSON.
+#[derive(Debug, Clone, Copy)]
+pub struct NetworkPreset {
+    /// `--network` value (lower-case).
+    pub name: &'static str,
+    /// Full genesis id (`"{network}-{id}"`, the string in block headers).
+    pub genesis_id: &'static str,
+    /// Whether `genesis_id` is fixed network-wide (a catchup preset). False
+    /// for `devnet`, whose real genesis id varies per deployment.
+    pub fixed_genesis_id: bool,
+    /// Byte-exact genesis.json for this chain, if vendored in the repo.
+    pub genesis_json: Option<&'static str>,
+    /// Default public algod REST endpoint used for catchup/follow.
+    pub rest_url: Option<&'static str>,
+    /// `DNSBootstrapID` template; `None` means go-algorand's default
+    /// ([`DNS_BOOTSTRAP_TEMPLATE`]).
+    pub dns_bootstrap_id: Option<&'static str>,
+    /// Static `latest.catchpoint` index (go's `goal node catchup NETWORK`
+    /// source); `None` when the chain has none and the peer's
+    /// `/v2/status.last-catchpoint` is the only discovery source.
+    pub catchpoint_index_url: Option<&'static str>,
+    /// Bundled `consensus.json` for chains with custom consensus protocols
+    /// (none yet; reserved for aramidmain, issue #2070).
+    #[allow(dead_code)] // first consumer lands with aramidmain (#2070)
+    pub consensus_json: Option<&'static str>,
+}
+
+#[cfg(test)]
+impl NetworkPreset {
+    /// 32-byte genesis hash (from the shared [`algo_types::Network`] table).
+    pub fn genesis_hash(&self) -> Option<[u8; 32]> {
+        algo_types::Network::from_str_ci(self.name)
+            .ok()
+            .map(|n| n.genesis_hash().0)
+    }
+}
+
+/// All built-in presets. See [`NetworkPreset`].
+pub const PRESETS: &[NetworkPreset] = &[
+    NetworkPreset {
+        name: "mainnet",
+        genesis_id: "mainnet-v1.0",
+        fixed_genesis_id: true,
+        genesis_json: None,
+        rest_url: Some("https://mainnet-api.4160.nodely.dev"),
+        dns_bootstrap_id: None,
+        catchpoint_index_url: Some(
+            "https://algorand-catchpoints.s3.us-east-2.amazonaws.com/channel/mainnet/latest.catchpoint",
+        ),
+        consensus_json: None,
+    },
+    NetworkPreset {
+        name: "testnet",
+        genesis_id: "testnet-v1.0",
+        fixed_genesis_id: true,
+        genesis_json: None,
+        rest_url: Some("https://testnet-api.4160.nodely.dev"),
+        dns_bootstrap_id: None,
+        catchpoint_index_url: Some(
+            "https://algorand-catchpoints.s3.us-east-2.amazonaws.com/channel/testnet/latest.catchpoint",
+        ),
+        consensus_json: None,
+    },
+    NetworkPreset {
+        name: "betanet",
+        genesis_id: "betanet-v1.0",
+        fixed_genesis_id: true,
+        genesis_json: None,
+        rest_url: None,
+        dns_bootstrap_id: None,
+        catchpoint_index_url: Some(
+            "https://algorand-catchpoints.s3.us-east-2.amazonaws.com/channel/betanet/latest.catchpoint",
+        ),
+        consensus_json: None,
+    },
+    NetworkPreset {
+        name: "devnet",
+        genesis_id: "devnet-v1.0",
+        fixed_genesis_id: false,
+        genesis_json: None,
+        rest_url: None,
+        dns_bootstrap_id: None,
+        catchpoint_index_url: None,
+        consensus_json: None,
+    },
+    // DIVERGENCE DIV-005: voimain preset (Voi mainnet) is algod-rust-only.
+    // Voi mainnet. The DNS bootstrap template is the `DNSBootstrapID` of the
+    // Voi node image's own config (VoiNetwork/voi-node
+    // `configuration/mainnet/participation/config.json`);
+    // `_algobootstrap._tcp.voimain.mainnet-voi.network` resolves to
+    // `r-eu-*.mainnet-voi.network:5011` relays. No static catchpoint index
+    // exists; the public algod advertises `last-catchpoint` in /v2/status.
+    NetworkPreset {
+        name: "voimain",
+        genesis_id: "voimain-v1.0",
+        fixed_genesis_id: true,
+        genesis_json: Some(include_str!(
+            "../../genesis/voimain-genesis.json"
+        )),
+        rest_url: Some("https://mainnet-api.voi.nodely.dev"),
+        dns_bootstrap_id: Some(
+            "<network>.mainnet-voi.network?backup=<network>.mainnet-voi.net&dedup=<name>.mainnet-voi.(network|net)",
+        ),
+        catchpoint_index_url: None,
+        consensus_json: None,
+    },
+];
+
+/// Look up a preset by `--network` name.
+pub fn preset(name: &str) -> Option<&'static NetworkPreset> {
+    PRESETS.iter().find(|p| p.name == name)
+}
+
+/// The preset's vendored genesis.json, but only when it is the genesis of
+/// the chain the ledger actually runs: `resolved_genesis_id` is the id
+/// resolved from the opened ledger (not the raw `--genesis-id`), so a node
+/// started with `--network voimain` on a different genesis (custom
+/// `--genesis-json`, other `--genesis-id`) never serves the wrong document.
+pub fn vendored_genesis_json(network: &str, resolved_genesis_id: &str) -> Option<&'static str> {
+    preset(network)
+        .filter(|p| p.genesis_id == resolved_genesis_id)
+        .and_then(|p| p.genesis_json)
+}
+
+/// The DNS bootstrap template to use for `network`: an explicit CLI override
+/// wins; else a preset-specific template when `configured` is still
+/// go-algorand's stock default (an operator-customised `DNSBootstrapID` in
+/// `config.json` is respected); else `configured`.
+///
+/// The returned flag is the `default_template_overridden` argument for
+/// [`algo_network::Discovery::new`]: true for a CLI override or a preset
+/// template (so the hardcoded devnet/betanet override map is not consulted),
+/// otherwise `cli_override.is_some()` semantics are unchanged.
+pub fn effective_dns_bootstrap<'a>(
+    network: &str,
+    cli_override: Option<&'a str>,
+    configured: &'a str,
+) -> (&'a str, bool) {
+    if let Some(o) = cli_override {
+        return (o, true);
+    }
+    if configured == DNS_BOOTSTRAP_TEMPLATE {
+        if let Some(t) = preset(network).and_then(|p| p.dns_bootstrap_id) {
+            return (t, true);
+        }
+    }
+    (configured, false)
+}
+
 /// Translate a go-style signed connection-limit field (where a negative
 /// value, per go's own `version[N]:"-1"` defaults, means "unbounded") into
 /// `algo-network`'s unsigned representation. Negative becomes
@@ -190,18 +347,166 @@ pub fn resolve_fallback_dns_resolver(fallback_dns_resolver_address: &str) -> Opt
 ///
 /// Returns `None` for unknown networks.
 pub fn genesis_id_for(network: &str) -> Option<&'static str> {
-    match network {
-        "mainnet" => Some("mainnet-v1.0"),
-        "testnet" => Some("testnet-v1.0"),
-        "devnet" => Some("devnet-v1.0"),
-        "betanet" => Some("betanet-v1.0"),
-        _ => None,
-    }
+    preset(network).map(|p| p.genesis_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every preset's name/genesis id/hash/embedded genesis are mutually
+    /// consistent, and the shared algokey table knows every preset.
+    #[test]
+    fn presets_are_internally_consistent() {
+        let mut seen = std::collections::HashSet::new();
+        for p in PRESETS {
+            assert!(seen.insert(p.name), "duplicate preset {}", p.name);
+            assert!(p.genesis_id.starts_with(&format!("{}-", p.name)));
+            assert!(p.genesis_hash().is_some(), "{}: no genesis hash", p.name);
+            if let Some(json) = p.genesis_json {
+                let g = algo_ledger::genesis::parse_genesis_json(json).unwrap();
+                assert_eq!(format!("{}-{}", g.network, g.id), p.genesis_id);
+                assert_eq!(
+                    Some(algo_ledger::genesis::genesis_hash(&g)),
+                    p.genesis_hash(),
+                    "{}: embedded genesis hash != preset hash",
+                    p.name
+                );
+            }
+            if let Some(t) = p.dns_bootstrap_id {
+                algo_network::dns_bootstrap::parse_dns_bootstrap(t, p.name, true)
+                    .unwrap_or_else(|e| panic!("{}: bad DNS template: {e}", p.name));
+            }
+        }
+    }
+
+    #[test]
+    fn vendored_genesis_only_served_for_matching_resolved_id() {
+        let g = vendored_genesis_json("voimain", "voimain-v1.0").expect("voimain genesis");
+        assert!(g.contains("voimain"));
+        // Mismatch (e.g. custom genesis under --network voimain): never served.
+        assert_eq!(vendored_genesis_json("voimain", "mychain-v1"), None);
+        assert_eq!(vendored_genesis_json("voimain", ""), None);
+        // Presets without a vendored genesis, and unknown networks.
+        assert_eq!(vendored_genesis_json("mainnet", "mainnet-v1.0"), None);
+        assert_eq!(vendored_genesis_json("nope", "voimain-v1.0"), None);
+    }
+
+    #[test]
+    fn voimain_preset_matches_live_chain_facts() {
+        let p = preset("voimain").expect("voimain preset");
+        assert_eq!(p.genesis_id, "voimain-v1.0");
+        assert_eq!(
+            data_encoding::BASE64.encode(&p.genesis_hash().unwrap()),
+            "r20fSQI8gWe/kFZziNonSPCXLwcQmH/nxROvnnueWOk="
+        );
+        assert_eq!(p.rest_url, Some("https://mainnet-api.voi.nodely.dev"));
+        assert!(p.genesis_json.is_some());
+        assert!(p.catchpoint_index_url.is_none());
+        assert_eq!(genesis_id_for("voimain"), Some("voimain-v1.0"));
+    }
+
+    /// `--network voimain` parses on the subcommands that take a network.
+    #[test]
+    fn cli_accepts_voimain_network() {
+        use crate::cli::{Cli, Commands};
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "algod-rust",
+            "participate",
+            "--ledger-path",
+            "l",
+            "--partkey-path",
+            "p",
+            "--network",
+            "voimain",
+        ]);
+        match cli.map(|c| c.command) {
+            Ok(Commands::Participate { network, .. }) => assert_eq!(network, "voimain"),
+            other => panic!(
+                "participate --network voimain did not parse: {:?}",
+                other.err()
+            ),
+        }
+        assert!(Cli::try_parse_from(["algod-rust", "observe", "--network", "voimain"]).is_ok());
+        // replay, sync (genesis and catchpoint modes) and relay.
+        match Cli::try_parse_from([
+            "algod-rust",
+            "replay",
+            "--network",
+            "voimain",
+            "--start",
+            "1",
+            "--end",
+            "2",
+        ])
+        .map(|c| c.command)
+        {
+            Ok(Commands::Replay { network, .. }) => assert_eq!(network, "voimain"),
+            other => panic!("replay --network voimain did not parse: {:?}", other.err()),
+        }
+        match Cli::try_parse_from(["algod-rust", "sync", "--network", "voimain"]).map(|c| c.command)
+        {
+            Ok(Commands::Sync { network, .. }) => assert_eq!(network, "voimain"),
+            other => panic!("sync --network voimain did not parse: {:?}", other.err()),
+        }
+        match Cli::try_parse_from([
+            "algod-rust",
+            "sync",
+            "--network",
+            "voimain",
+            "--catchpoint-auto",
+            "--follow",
+        ])
+        .map(|c| c.command)
+        {
+            Ok(Commands::Sync {
+                network,
+                catchpoint_auto,
+                ..
+            }) => {
+                assert_eq!(network, "voimain");
+                assert!(catchpoint_auto);
+            }
+            other => panic!("sync --catchpoint-auto did not parse: {:?}", other.err()),
+        }
+        match Cli::try_parse_from([
+            "algod-rust",
+            "relay",
+            "--bind-address",
+            "127.0.0.1:0",
+            "--ledger-path",
+            "l",
+            "--network",
+            "voimain",
+        ])
+        .map(|c| c.command)
+        {
+            Ok(Commands::Relay { network, .. }) => assert_eq!(network, "voimain"),
+            other => panic!("relay --network voimain did not parse: {:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn effective_dns_bootstrap_precedence() {
+        let voi = preset("voimain").unwrap().dns_bootstrap_id.unwrap();
+        assert_eq!(
+            effective_dns_bootstrap("voimain", None, DNS_BOOTSTRAP_TEMPLATE),
+            (voi, true)
+        );
+        assert_eq!(
+            effective_dns_bootstrap("voimain", Some("x.example"), DNS_BOOTSTRAP_TEMPLATE),
+            ("x.example", true)
+        );
+        assert_eq!(
+            effective_dns_bootstrap("voimain", None, "custom.example"),
+            ("custom.example", false)
+        );
+        assert_eq!(
+            effective_dns_bootstrap("mainnet", None, DNS_BOOTSTRAP_TEMPLATE),
+            (DNS_BOOTSTRAP_TEMPLATE, false)
+        );
+    }
 
     #[test]
     fn genesis_id_for_known_networks() {

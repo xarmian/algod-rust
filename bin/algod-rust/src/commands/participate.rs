@@ -1728,9 +1728,7 @@ impl SimpleBlockEvaluator {
         // minimum, which fired first and with other wording (issue #1976).
         for stx in txgroup {
             algo_validate::validate_transaction_wellformed(
-                &stx.txn,
-                true,
-                params,
+                &stx.txn, true, params,
                 None, // SpecialAddresses not available without ledger lookup
             )?;
         }
@@ -4613,8 +4611,13 @@ const LISTEN_NET_FILE: &str = "algod-listen.net";
 /// Writes `<data_dir>/algod-listen.net` (`addr` and a newline, like go).
 fn write_listen_net_file(data_dir: &Path, addr: &str) {
     let path = data_dir.join(LISTEN_NET_FILE);
-    if let Err(e) = std::fs::write(&path, format!("{addr}
-")) {
+    if let Err(e) = std::fs::write(
+        &path,
+        format!(
+            "{addr}
+"
+        ),
+    ) {
         warn!(file = %path.display(), err = %e, "failed to write algod-listen.net");
     }
 }
@@ -5280,6 +5283,39 @@ fn seed_ledger_from_genesis(
     genesis_path: &Path,
     latest: u64,
 ) -> anyhow::Result<()> {
+    let source = genesis_path.display().to_string();
+    // The file is read lazily: an already-seeded ledger never touches it.
+    seed_ledger_from_genesis_with(ledger, &source, latest, || {
+        std::fs::read_to_string(genesis_path).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to read genesis.json at {}: {}",
+                genesis_path.display(),
+                e
+            )
+        })
+    })
+}
+
+/// [`seed_ledger_from_genesis`] on an in-memory genesis document (`source`
+/// is only for logs). Used to seed a fresh ledger from a preset's vendored
+/// genesis when no `--genesis-json` is given (issue #2069).
+fn seed_ledger_from_genesis_str(
+    ledger: &mut SqliteLedger,
+    genesis_str: &str,
+    source: &str,
+    latest: u64,
+) -> anyhow::Result<()> {
+    seed_ledger_from_genesis_with(ledger, source, latest, || Ok(genesis_str.to_string()))
+}
+
+/// Shared seeding core: `load_genesis` runs only when the ledger actually
+/// needs seeding.
+fn seed_ledger_from_genesis_with(
+    ledger: &mut SqliteLedger,
+    source: &str,
+    latest: u64,
+    load_genesis: impl FnOnce() -> anyhow::Result<String>,
+) -> anyhow::Result<()> {
     let already_seeded = ledger.has_account_totals().unwrap_or(false);
     if already_seeded {
         info!(
@@ -5294,13 +5330,7 @@ fn seed_ledger_from_genesis(
              re-seed genesis over accumulated history. Delete the ledger DB pair and restart."
         );
     }
-    let genesis_str = std::fs::read_to_string(genesis_path).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to read genesis.json at {}: {}",
-            genesis_path.display(),
-            e
-        )
-    })?;
+    let genesis_str = load_genesis()?;
     let genesis = parse_genesis_json(&genesis_str)
         .map_err(|e| anyhow::anyhow!("failed to parse genesis.json: {}", e))?;
     ledger
@@ -5333,7 +5363,7 @@ fn seed_ledger_from_genesis(
         .commit_block()
         .map_err(|e| anyhow::anyhow!("commit_block during genesis seed: {}", e))?;
     info!(
-        genesis_path = %genesis_path.display(),
+        genesis_path = %source,
         allocations = genesis.alloc.len(),
         online_stake = ledger.online_stake().unwrap_or(0),
         "seeded ledger from genesis (accountbase + accounttotals + block 0)"
@@ -5502,6 +5532,16 @@ pub async fn run(
     // participation node needs it even more than a relay does.
     if let Some(genesis_path) = genesis_json_path {
         seed_ledger_from_genesis(&mut sqlite_ledger, genesis_path, latest)?;
+    } else if latest == 0 {
+        // Issue #2069: a fresh ledger on a preset that vendors its genesis
+        // (voimain) is seeded from the embedded document, so `--genesis-json`
+        // is optional there. Only when the placeholder genesis id is the
+        // preset's own; any other `--genesis-id` needs an explicit file.
+        if let Some(g) =
+            crate::commands::network_common::vendored_genesis_json(network, &resolved_genesis_id)
+        {
+            seed_ledger_from_genesis_str(&mut sqlite_ledger, g, "embedded preset genesis", latest)?;
+        }
     }
 
     // Issue #1066: the CLI-derived placeholders resolved above must not be
@@ -5719,7 +5759,12 @@ pub async fn run(
         // was previously entirely absent from `participate`, which had no
         // way to find peers besides an explicit --peers list).
         if let Some(network_name) = genesis_id_for(network).map(|_| network) {
-            let dns_template = dns_bootstrap_override.unwrap_or(&node_config.dns_bootstrap_id);
+            let (dns_template, dns_overridden) =
+                crate::commands::network_common::effective_dns_bootstrap(
+                    network_name,
+                    dns_bootstrap_override,
+                    &node_config.dns_bootstrap_id,
+                );
             match algo_network::Discovery::new(
                 phonebook.clone(),
                 Box::new(
@@ -5730,7 +5775,7 @@ pub async fn run(
                 ),
                 dns_template,
                 network_name,
-                dns_bootstrap_override.is_some(),
+                dns_overridden,
             ) {
                 Ok(discovery) => {
                     discovery.refresh_phonebook_addresses().await;
@@ -6676,6 +6721,15 @@ pub async fn run(
     let rest_cfg = rest_opts.resolve(default_data_dir.as_deref())?;
     let rest_server_handle = if let Some(cfg) = rest_cfg {
         let genesis_json = load_genesis_json(cfg.genesis_path.as_deref(), cfg.data_dir.as_deref())?
+            .or_else(|| {
+                // Presets that vendor their genesis (voimain, ...) serve the
+                // byte-exact document rather than a stub.
+                crate::commands::network_common::vendored_genesis_json(
+                    network,
+                    &resolved_genesis_id,
+                )
+                .map(str::to_string)
+            })
             .unwrap_or_else(|| {
                 warn!(
                     "no genesis.json found; synthesizing a minimal stub for the /genesis endpoint"
@@ -7031,7 +7085,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_listen_net_file(dir.path(), "127.0.0.1:4161");
         {
-            let _guard = ListenNetFileGuard(Some((dir.path().to_path_buf(), "127.0.0.1:4161".into())));
+            let _guard =
+                ListenNetFileGuard(Some((dir.path().to_path_buf(), "127.0.0.1:4161".into())));
             assert!(dir.path().join("algod-listen.net").is_file());
         } // dropped as an early `?` return would drop it
         assert!(!dir.path().join("algod-listen.net").exists());
@@ -9690,13 +9745,19 @@ mod tests {
             err.to_string(),
             "txgroup with 1uA fees is less than 1mA (usage=1.000000 * base=1mA)"
         );
-        assert!(matches!(err, algo_error::AlgoError::Rejected { .. }), "{err:?}");
+        assert!(
+            matches!(err, algo_error::AlgoError::Rejected { .. }),
+            "{err:?}"
+        );
 
         // low fee and out of window (early or expired): the window wins
         for (fv, lv) in [(500, 900), (1, 50)] {
             let low = pay_with_fee_and_window(&key, sender, receiver, 1, fv, lv);
             let err = eval.test_transaction_group(&[low]).unwrap_err();
-            assert!(err.to_string().starts_with("txn dead:"), "{fv}--{lv}: {err}");
+            assert!(
+                err.to_string().starts_with("txn dead:"),
+                "{fv}--{lv}: {err}"
+            );
         }
 
         // low fee and a bad signature: the signature wins
@@ -9736,7 +9797,10 @@ mod tests {
                 algo_types::Digest([0xAA; 32])
             )
         );
-        assert!(matches!(err, algo_error::AlgoError::Rejected { .. }), "{err:?}");
+        assert!(
+            matches!(err, algo_error::AlgoError::Rejected { .. }),
+            "{err:?}"
+        );
 
         // wrong genesis ID
         let mut wrong = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
@@ -9752,7 +9816,10 @@ mod tests {
         let mut bad_sig = pay_with_fee_and_window(&key, sender, receiver, 1, 1, 1000);
         bad_sig.txn.genesis_hash = [3u8; 32];
         bad_sig.sig = [7u8; 64];
-        assert!(eval.test_transaction_group(&[bad_sig]).unwrap_err().is_batch_sig_failure());
+        assert!(eval
+            .test_transaction_group(&[bad_sig])
+            .unwrap_err()
+            .is_batch_sig_failure());
 
         let mut dead = pay_with_fee_and_window(&key, sender, receiver, 1, 500, 900);
         dead.txn.genesis_hash = [3u8; 32];
@@ -9784,26 +9851,36 @@ mod tests {
     fn a_submission_without_a_genesis_hash_is_judged_as_submitted() {
         let ledger = test_ledger();
         let params = v41_params();
-        assert!(params.require_genesis_hash, "the fixture protocol requires the hash");
+        assert!(
+            params.require_genesis_hash,
+            "the fixture protocol requires the hash"
+        );
         let (sender, key) = test_keypair(68);
         let (receiver, _) = test_keypair(69);
         // both the plain branch and the shared-cache branch (production)
         for with_cache in [false, true] {
             let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
             if with_cache {
-                eval.verified_txn_cache = Some(Arc::new(algo_validate::VerifiedTransactionCache::new(64)));
+                eval.verified_txn_cache =
+                    Some(Arc::new(algo_validate::VerifiedTransactionCache::new(64)));
             }
 
             let mut no_hash = pay_with_fee_and_window(&key, sender, receiver, 1_000, 1, 1000);
             no_hash.txn.genesis_hash = [0u8; 32];
             no_hash.sig = sign_txn(&no_hash.txn, &key);
             let err = eval.test_transaction_group(&[no_hash.clone()]).unwrap_err();
-            assert_eq!(err.to_string(), "required tx.GenesisHash is missing", "cache={with_cache}");
+            assert_eq!(
+                err.to_string(),
+                "required tx.GenesisHash is missing",
+                "cache={with_cache}"
+            );
 
             // a genuinely bad signature on the same transaction is still reported first
             no_hash.sig = [7u8; 64];
             assert!(
-                eval.test_transaction_group(&[no_hash]).unwrap_err().is_batch_sig_failure(),
+                eval.test_transaction_group(&[no_hash])
+                    .unwrap_err()
+                    .is_batch_sig_failure(),
                 "cache={with_cache}"
             );
         }
@@ -9834,7 +9911,10 @@ mod tests {
         );
         assert!(err.to_string().starts_with(&want_prefix), "{err}");
         assert!(err.to_string().ends_with(", tried to spend 5A)"), "{err}");
-        assert!(matches!(err, algo_error::AlgoError::Rejected { .. }), "{err:?}");
+        assert!(
+            matches!(err, algo_error::AlgoError::Rejected { .. }),
+            "{err:?}"
+        );
 
         // unfunded, fee 1: the FEE move overspends with the stored (empty)
         // account, before the group fee (1uA < 1mA) is ever looked at
@@ -9843,7 +9923,10 @@ mod tests {
         low.sig = sign_txn(&low.txn, &key);
         let err = eval.transaction_group(&[low]).unwrap_err();
         assert!(err.to_string().contains(": overspend (account "), "{err}");
-        assert!(err.to_string().contains("MicroAlgos:0.0A RewardsBase:0"), "{err}");
+        assert!(
+            err.to_string().contains("MicroAlgos:0.0A RewardsBase:0"),
+            "{err}"
+        );
         assert!(err.to_string().ends_with(", tried to spend 1uA)"), "{err}");
 
         // funded, fee 1: the transaction applies, so the GROUP fee is what fails
@@ -13568,3 +13651,31 @@ mod exec_admission_tests;
 #[cfg(test)]
 #[path = "participate_wal_pin_tests.rs"]
 mod wal_pin_tests;
+
+#[cfg(test)]
+mod preset_genesis_seed_tests {
+    use super::*;
+
+    /// Issue #2069: a fresh ledger is seeded from a preset's embedded genesis
+    /// (no `--genesis-json`), and a second call is a no-op.
+    #[test]
+    fn fresh_ledger_seeds_from_embedded_voimain_genesis() {
+        let g = crate::commands::network_common::vendored_genesis_json("voimain", "voimain-v1.0")
+            .expect("voimain genesis");
+        let mut l = SqliteLedger::open_in_memory().expect("ledger");
+        assert!(!l.has_account_totals().unwrap());
+        seed_ledger_from_genesis_str(&mut l, g, "test", 0).expect("seed");
+        assert!(l.has_account_totals().unwrap());
+        assert!(l.online_stake().unwrap() > 0);
+        assert_eq!(l.current_round().0, 0);
+        // Restart against the populated ledger: no-op, not an error.
+        seed_ledger_from_genesis_str(&mut l, g, "test", 0).expect("re-seed no-op");
+    }
+
+    #[test]
+    fn mismatched_genesis_id_gets_no_embedded_seed() {
+        assert!(
+            crate::commands::network_common::vendored_genesis_json("voimain", "other-v1").is_none()
+        );
+    }
+}

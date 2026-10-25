@@ -49,6 +49,11 @@ const FIXTURES: &[(Network, &str)] = &[
         Network::Devnet,
         "b239339dde5f98e3f34f3322e810076b622bf43c8ec6ee47ecd1f7adab501b5c",
     ),
+    (
+        // Voi mainnet (issue #2069); live /versions genesis_hash_b64.
+        Network::Voimain,
+        "af6d1f49023c8167bf90567388da2748f0972f0710987fe7c513af9e7b9e58e9",
+    ),
 ];
 
 fn hex_to_32(s: &str) -> [u8; 32] {
