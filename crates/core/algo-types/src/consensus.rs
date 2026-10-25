@@ -2595,6 +2595,21 @@ pub fn preload_consensus_protocols_with_bundle(
     }
 }
 
+/// Protocol versions in the `bundled` document that [`preload_consensus_protocols_with_bundle`]
+/// ignores because `base` already defines them (DIV-006), sorted. Callers log
+/// these so the filter is never silent. An unparsable bundle yields none (the
+/// merge itself reports that error).
+pub fn bundled_protocols_already_defined(
+    base: &HashMap<String, ConsensusParams>,
+    bundled: &str,
+) -> Vec<String> {
+    let mut v: Vec<String> = parse_consensus_overrides(bundled)
+        .map(|o| o.into_keys().filter(|k| base.contains_key(k)).collect())
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
 /// Write (or, for an empty override map, delete) `<data_dir>/consensus.json`,
 /// mirroring go-algorand's `SaveConfigurableConsensus` (`config/config.go`
 /// ~line 314).

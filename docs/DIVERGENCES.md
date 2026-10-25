@@ -288,7 +288,10 @@ go-algorand.
 (`bin/algod-rust/consensus/aramidmain-consensus.json`) and merges only the
 protocol versions the binary does not already define (the three custom ones).
 A `<data_dir>/consensus.json` is then merged on top exactly like go (wholesale,
-wins per version).
+wins per version). The bundle applies only when the genesis network name
+AND (where known) genesis id and hash equal the preset's, so a private net
+reusing the name `aramidmain` gets none; skipped versions are logged at
+startup (warn).
 
 **What is identical.** The three custom protocols are loaded field-for-field
 like go; every field they set is modelled or is permanently on in algod-rust

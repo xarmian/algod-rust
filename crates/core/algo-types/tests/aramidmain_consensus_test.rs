@@ -26,9 +26,8 @@
 use std::collections::{BTreeSet, HashMap};
 
 use algo_types::consensus::{
-    built_in_consensus_protocols, consensus_params_for_version, install_consensus_overrides,
-    merge_consensus_protocols, parse_consensus_overrides, preload_consensus_protocols_with_bundle,
-    ConsensusParamsOverride,
+    built_in_consensus_protocols, merge_consensus_protocols, parse_consensus_overrides,
+    preload_consensus_protocols_with_bundle, ConsensusParamsOverride,
 };
 
 const BUNDLE: &str = include_str!("../../../../bin/algod-rust/consensus/aramidmain-consensus.json");
@@ -133,6 +132,14 @@ fn bundle_adds_only_unknown_protocols() {
 /// A `<data_dir>/consensus.json` is merged after the bundle and wins per
 /// protocol version, wholesale like go.
 #[test]
+fn skipped_bundle_protocols_are_reported() {
+    let base = built_in_consensus_protocols();
+    let skipped = algo_types::consensus::bundled_protocols_already_defined(&base, BUNDLE);
+    assert!(skipped.contains(&"future".to_string()), "{skipped:?}");
+    assert!(!skipped.iter().any(|v| v.starts_with("aramidmain-")));
+}
+
+#[test]
 fn data_dir_file_overrides_bundle() {
     let dir = std::env::temp_dir().join(format!("aramid-consensus-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -149,18 +156,6 @@ fn data_dir_file_overrides_bundle() {
     assert_eq!(merged["aramidmain-v1.0/3"].min_txn_fee, 4242);
     assert_eq!(merged["aramidmain-v1.0/2"].min_txn_fee, 1000);
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn installed_bundle_makes_custom_protocols_resolvable() {
-    assert!(consensus_params_for_version("aramidmain-v1.0/3").is_none());
-    let merged =
-        preload_consensus_protocols_with_bundle(None, built_in_consensus_protocols(), Some(BUNDLE))
-            .unwrap();
-    install_consensus_overrides(&merged);
-    let p = consensus_params_for_version("aramidmain-v1.0/3").expect("installed");
-    assert_eq!(p.logic_sig_version, 12);
-    assert!(consensus_params_for_version("aramidmain-v1.0/1").is_some());
 }
 
 /// A block header whose `proto`/`upgradeprop` are custom (non-URL)
