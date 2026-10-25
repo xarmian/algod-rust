@@ -129,7 +129,7 @@ pub const PRESETS: &[NetworkPreset] = &[
         genesis_id: "voimain-v1.0",
         fixed_genesis_id: true,
         genesis_json: Some(include_str!(
-            "../../../../crates/core/algo-ledger/tests/fixtures/voimain-genesis.json"
+            "../../genesis/voimain-genesis.json"
         )),
         rest_url: Some("https://mainnet-api.voi.nodely.dev"),
         dns_bootstrap_id: Some(
@@ -143,6 +143,17 @@ pub const PRESETS: &[NetworkPreset] = &[
 /// Look up a preset by `--network` name.
 pub fn preset(name: &str) -> Option<&'static NetworkPreset> {
     PRESETS.iter().find(|p| p.name == name)
+}
+
+/// The preset's vendored genesis.json, but only when it is the genesis of
+/// the chain the ledger actually runs: `resolved_genesis_id` is the id
+/// resolved from the opened ledger (not the raw `--genesis-id`), so a node
+/// started with `--network voimain` on a different genesis (custom
+/// `--genesis-json`, other `--genesis-id`) never serves the wrong document.
+pub fn vendored_genesis_json(network: &str, resolved_genesis_id: &str) -> Option<&'static str> {
+    preset(network)
+        .filter(|p| p.genesis_id == resolved_genesis_id)
+        .and_then(|p| p.genesis_json)
 }
 
 /// The DNS bootstrap template to use for `network`: an explicit CLI override
@@ -367,6 +378,18 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{}: bad DNS template: {e}", p.name));
             }
         }
+    }
+
+    #[test]
+    fn vendored_genesis_only_served_for_matching_resolved_id() {
+        let g = vendored_genesis_json("voimain", "voimain-v1.0").expect("voimain genesis");
+        assert!(g.contains("voimain"));
+        // Mismatch (e.g. custom genesis under --network voimain): never served.
+        assert_eq!(vendored_genesis_json("voimain", "mychain-v1"), None);
+        assert_eq!(vendored_genesis_json("voimain", ""), None);
+        // Presets without a vendored genesis, and unknown networks.
+        assert_eq!(vendored_genesis_json("mainnet", "mainnet-v1.0"), None);
+        assert_eq!(vendored_genesis_json("nope", "voimain-v1.0"), None);
     }
 
     #[test]

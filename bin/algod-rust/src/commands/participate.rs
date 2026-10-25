@@ -6684,10 +6684,11 @@ pub async fn run(
             .or_else(|| {
                 // Presets that vendor their genesis (voimain, ...) serve the
                 // byte-exact document rather than a stub.
-                crate::commands::network_common::preset(network)
-                    .and_then(|p| p.genesis_json)
-                    .filter(|_| genesis_id.is_none_or(|g| g == resolved_genesis_id))
-                    .map(str::to_string)
+                crate::commands::network_common::vendored_genesis_json(
+                    network,
+                    &resolved_genesis_id,
+                )
+                .map(str::to_string)
             })
             .unwrap_or_else(|| {
                 warn!(

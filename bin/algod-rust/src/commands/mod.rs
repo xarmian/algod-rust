@@ -68,7 +68,8 @@ pub async fn wait_for_shutdown_signal() -> std::io::Result<()> {
 
 /// Resolve a network name to an (algod_url, algod_token, network_name) tuple.
 ///
-/// Known networks ("mainnet", "testnet") use public Nodely endpoints.
+/// Presets with a public REST endpoint ("mainnet", "testnet", "voimain";
+/// see `network_common::PRESETS`) use that endpoint.
 /// "custom" requires an explicit `--algod-url`.
 pub fn resolve_network(
     network: &str,

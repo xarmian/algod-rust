@@ -257,8 +257,8 @@ genesis, Voi REST endpoint, Voi DNS bootstrap template) to `--network` and to
 the algokey hash table. See `docs/NETWORK_PRESETS.md`.
 
 **What is identical.** Voi mainnet runs standard Algorand consensus versions;
-all four go networks, their hashes, and the unknown-network error shape are
-unchanged (the error just lists `voimain` too).
+all four go networks, their hashes, and the unknown-network error text
+(which still lists only Go's four networks) are unchanged.
 
 **Why.** Following Voi mainnet is a supported use case.
 

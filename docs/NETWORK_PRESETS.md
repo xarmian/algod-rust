@@ -2,7 +2,19 @@
 
 `--network <name>` is backed by one table, `PRESETS` in
 `bin/algod-rust/src/commands/network_common.rs` (`NetworkPreset`). Adding a chain
-is one row plus its fixtures; nothing else matches on network-name strings.
+is one row plus its fixtures. Network-name strings are still matched in a few
+places outside the table; a new chain (e.g. aramidmain, #2070) must review each:
+
+- `crates/node/algo-network/src/dns_bootstrap.rs` (`network_bootstrap_override`:
+  hardcoded devnet/betanet/alphanet bootstrap hosts, bypassed when a template
+  is overridden, which presets with their own `dns_bootstrap_id` do).
+- `crates/core/algo-types/src/consensus.rs` (`SHORTER_UPGRADE_ROUNDS_NETWORKS`:
+  devnet/betanet/fnet upgrade-delay shortening).
+- `docker/algod/run.sh` (`NETWORK` -> `DNSBootstrapID`) and `docs/DOCKER_MIGRATION.md`.
+- `crates/core/algo-types/src/networks.rs` (`Network`, algokey hash table).
+
+The preset -> `Network` hash linkage is currently enforced by tests only
+(`presets_are_internally_consistent`), not by the type system.
 
 | Field | Meaning |
 |---|---|
@@ -23,7 +35,7 @@ names) and is pinned against the fixture by
 ## voimain (Voi mainnet)
 
 - Genesis id `voimain-v1.0`, genesis hash `r20fSQI8gWe/kFZziNonSPCXLwcQmH/nxROvnnueWOk=`.
-- Vendored genesis: `crates/core/algo-ledger/tests/fixtures/voimain-genesis.json`
+- Vendored genesis: `bin/algod-rust/genesis/voimain-genesis.json`
   (provenance in `voimain-genesis.README.md`).
 - REST: `https://mainnet-api.voi.nodely.dev` (go-algorand 5.0.4-based build,
   standard Algorand consensus versions).

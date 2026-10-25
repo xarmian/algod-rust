@@ -68,8 +68,11 @@ impl fmt::Display for UnknownNetwork {
             f,
             "unknown network '{}' provided. Supported networks: {}",
             self.name,
+            // Go's `validNetworks` only: `voimain` (DIV-005) is deliberately
+            // not listed so the error text stays byte-identical to Go's.
             Network::all()
                 .iter()
+                .filter(|n| **n != Network::Voimain)
                 .map(|n| n.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -166,7 +169,7 @@ impl Network {
         )
     }
 
-    /// All four networks, in Go's `validNetworkList` order. (Go derives
+    /// All networks (Go's four, then algod-rust's `voimain`), in Go's `validNetworkList` order. (Go derives
     /// the list from `maps.Keys` which is unordered, but the error
     /// message lists them; we pin a stable order so the error wording
     /// is reproducible.)
@@ -261,7 +264,7 @@ mod tests {
         let err = Network::from_str_ci("private-relay").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("unknown network 'private-relay'"));
-        for known in ["mainnet", "testnet", "betanet", "devnet", "voimain"] {
+        for known in ["mainnet", "testnet", "betanet", "devnet"] {
             assert!(
                 msg.contains(known),
                 "error should list `{known}` in supported list: {msg}"

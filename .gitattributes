@@ -65,3 +65,7 @@ crates/**/fixtures/**/*.stxn binary
 docker/algod/run.sh text eol=lf
 docker/algod/bin/* text eol=lf
 docker/algod/genesis/** text eol=lf
+
+# Voi mainnet genesis embedded into the algod-rust binary (include_str!) and
+# served byte-for-byte on /genesis; must keep exact committed bytes.
+bin/algod-rust/genesis/** text eol=lf
