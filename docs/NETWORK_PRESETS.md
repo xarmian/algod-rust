@@ -3,7 +3,7 @@
 `--network <name>` is backed by one table, `PRESETS` in
 `bin/algod-rust/src/commands/network_common.rs` (`NetworkPreset`). Adding a chain
 is one row plus its fixtures. Network-name strings are still matched in a few
-places outside the table; a new chain (e.g. aramidmain, #2070) must review each:
+places outside the table; a new chain must review each:
 
 - `crates/node/algo-network/src/dns_bootstrap.rs` (`network_bootstrap_override`:
   hardcoded devnet/betanet/alphanet bootstrap hosts, bypassed when a template
@@ -24,7 +24,7 @@ The preset -> `Network` hash linkage is currently enforced by tests only
 | `rest_url` | default public algod REST endpoint for catchup/follow (`resolve_network`) |
 | `dns_bootstrap_id` | chain-specific `DNSBootstrapID`; used when `config.json` still has go's stock default and no `--dns-bootstrap` is given |
 | `catchpoint_index_url` | static `latest.catchpoint` index; `None` falls back to the peer's `/v2/status.last-catchpoint` |
-| `consensus_json` | bundled custom consensus protocols (reserved, aramidmain #2070) |
+| `consensus_json` | bundled custom consensus protocols (aramidmain, #2070); only versions the binary does not already define are merged (DIV-006), a `<data_dir>/consensus.json` is merged on top |
 
 The genesis hash is not duplicated in the table: it comes from
 `algo_types::Network` (the algokey keyreg table, which also accepts the preset
@@ -75,3 +75,25 @@ names) and is pinned against the fixture by
   customise `DNSBootstrapID`" by string equality with go's stock template.
   This is a heuristic: an operator who explicitly sets the stock value in
   `config.json` still gets the preset's template. `--dns-bootstrap` always wins.
+
+## aramidmain (Aramid mainnet)
+
+- Genesis id `aramidmain-v1.0` (proto `aramidmain-v1.0/1`), genesis hash
+  `PgeQVJJgx/LYKJfIEz7dbfNPuXmDyJ+O7FwQ4XL9tE8=`. Vendored genesis:
+  `bin/algod-rust/genesis/aramidmain-genesis.json` (provenance in
+  `aramidmain-genesis.README.md`).
+- Custom consensus protocols `aramidmain-v1.0/1..3` exist only in the vendored
+  `bin/algod-rust/consensus/aramidmain-consensus.json` (provenance README next
+  to it). `load_consensus_table` / `install_consensus_for_network` merge them
+  at startup for `node`, `participate`, `sync`, `replay` and `relay`; a
+  `<data_dir>/consensus.json` is merged on top (DIV-006).
+- REST: `https://algod.aramidmain.a-wallet.net` (go-algorand 4.7.3 build).
+- Relay discovery: `DNSBootstrapID` `aramidmain.a-wallet.net`
+  (`_algobootstrap._tcp.aramidmain.a-wallet.net` SRV -> `de-k4-s1.a-wallet.net:14161`,
+  `fi-k1-s3.biatec.io:14160`). `--relay-addr`/`--peers` override.
+- Catchup: no static catchpoint index; the public gateway does not serve the
+  catchpoint file (`HEAD /v1/aramidmain-v1.0/ledger/<r>` -> 404), so give relays:
+
+  ```
+  algod-rust sync --network aramidmain --catchpoint <last-catchpoint from /v2/status> --follow     --catchpoint-peer-url http://de-k4-s1.a-wallet.net:14161     --catchpoint-peer-url http://fi-k1-s3.biatec.io:14160
+  ```

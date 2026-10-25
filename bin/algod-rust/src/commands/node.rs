@@ -378,11 +378,18 @@ async fn run_start(
     // override is merged on top, mirroring go-algorand's exact call order in
     // `cmd/algod/main.go:204-212` ("the configurable consensus protocols file
     // takes precedence over network-specific overrides").
-    let mut consensus_base = algo_types::consensus::built_in_consensus_protocols();
-    algo_types::consensus::apply_shorter_upgrade_rounds_for_dev_networks(
-        &mut consensus_base,
-        &genesis.network,
-    );
+    let consensus_base = {
+        let mut base = algo_types::consensus::built_in_consensus_protocols();
+        algo_types::consensus::apply_shorter_upgrade_rounds_for_dev_networks(
+            &mut base,
+            &genesis.network,
+        );
+        base
+    };
+    // A preset chain's bundled custom protocols (aramidmain, #2070) are
+    // merged before the data-dir file, which still wins per version.
+    let bundled_consensus =
+        crate::commands::network_common::preset(&genesis.network).and_then(|p| p.consensus_json);
 
     // Load `<data_dir>/consensus.json` (if present) and merge it onto the
     // (possibly network-shortened) consensus table (issue #750; Go:
@@ -405,12 +412,12 @@ async fn run_start(
     // thread-safety contract this relies on.
     let consensus_overrides_path =
         data_dir.join(algo_types::consensus::CONFIGURABLE_CONSENSUS_PROTOCOLS_FILENAME);
-    let consensus_protocols =
-        algo_types::consensus::preload_configurable_consensus_protocols_with_base(
-            data_dir,
-            consensus_base,
-        )
-        .map_err(|e| anyhow::anyhow!("loading {}: {e}", consensus_overrides_path.display()))?;
+    let consensus_protocols = algo_types::consensus::preload_consensus_protocols_with_bundle(
+        Some(data_dir),
+        consensus_base,
+        bundled_consensus,
+    )
+    .map_err(|e| anyhow::anyhow!("loading {}: {e}", consensus_overrides_path.display()))?;
     algo_types::consensus::install_consensus_overrides(&consensus_protocols);
     if consensus_overrides_path.exists() {
         info!(path = %consensus_overrides_path.display(), "loaded consensus-parameter overrides");

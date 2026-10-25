@@ -255,3 +255,37 @@ fn test_voimain_genesis_loads() {
         .expect("failed to load voimain genesis.json");
     assert_eq!(state.genesis_id, "voimain-v1.0");
 }
+
+// ── Aramid mainnet (aramidmain) genesis (issue #2070) ────────
+
+fn aramidmain_genesis_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../bin/algod-rust/genesis/aramidmain-genesis.json")
+}
+
+/// The vendored `aramidmain-genesis.json` (byte-exact from the
+/// scholtz/AlgorandNodes aramidmain context) must hash to the genesis hash
+/// the public aramidmain algod advertises, which is also the hash
+/// `algo_types::Network::Aramidmain` carries.
+#[test]
+fn test_aramidmain_genesis_hash_matches_fixture() {
+    let json = std::fs::read_to_string(aramidmain_genesis_path())
+        .expect("aramidmain-genesis.json fixture missing");
+    let genesis = algo_ledger::genesis::parse_genesis_json(&json).unwrap();
+    assert_eq!(genesis.network, "aramidmain");
+    assert_eq!(genesis.id, "v1.0");
+    assert_eq!(genesis.proto, "aramidmain-v1.0/1");
+    let hash = algo_ledger::genesis::genesis_hash(&genesis);
+    assert_eq!(
+        data_encoding::BASE64.encode(&hash),
+        "PgeQVJJgx/LYKJfIEz7dbfNPuXmDyJ+O7FwQ4XL9tE8=",
+    );
+    assert_eq!(hash, algo_types::Network::Aramidmain.genesis_hash().0);
+}
+
+#[test]
+fn test_aramidmain_genesis_loads() {
+    let state = LedgerState::from_genesis(&aramidmain_genesis_path())
+        .expect("failed to load aramidmain genesis.json");
+    assert_eq!(state.genesis_id, "aramidmain-v1.0");
+}

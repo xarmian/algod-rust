@@ -54,6 +54,11 @@ const FIXTURES: &[(Network, &str)] = &[
         Network::Voimain,
         "af6d1f49023c8167bf90567388da2748f0972f0710987fe7c513af9e7b9e58e9",
     ),
+    (
+        // Aramid mainnet (issue #2070); live /versions genesis_hash_b64.
+        Network::Aramidmain,
+        "3e0790549260c7f2d82897c8133edd6df34fb97983c89f8eec5c10e172fdb44f",
+    ),
 ];
 
 fn hex_to_32(s: &str) -> [u8; 32] {

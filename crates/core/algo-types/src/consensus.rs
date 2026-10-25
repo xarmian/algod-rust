@@ -2547,10 +2547,52 @@ pub fn preload_configurable_consensus_protocols_with_base(
         }
     };
 
-    let overrides: ConsensusOverrides = serde_json::from_str(&contents)
+    let overrides = parse_consensus_overrides(&contents)
         .map_err(|e| algo_error::AlgoError::Config(format!("parsing {}: {e}", path.display())))?;
 
     Ok(merge_consensus_protocols(base, overrides))
+}
+
+/// Parse a `consensus.json` document (the file go-algorand's
+/// `PreloadConfigurableConsensusProtocols` reads) into overrides.
+pub fn parse_consensus_overrides(json: &str) -> Result<ConsensusOverrides, serde_json::Error> {
+    serde_json::from_str(json)
+}
+
+/// Like [`preload_configurable_consensus_protocols_with_base`], but first
+/// merges a `bundled` `consensus.json` document (a network preset's embedded
+/// custom protocols, e.g. aramidmain, issue #2070) onto `base`; the
+/// `<data_dir>/consensus.json` file (when `data_dir` is given and the file
+/// exists) is then merged on top, so an operator-supplied file still wins
+/// per protocol version. The bundle only contributes protocol versions
+/// absent from `base` (DIV-006). With `bundled == None` and `data_dir == None` the
+/// base table is returned unchanged.
+pub fn preload_consensus_protocols_with_bundle(
+    data_dir: Option<&Path>,
+    base: HashMap<String, ConsensusParams>,
+    bundled: Option<&str>,
+) -> algo_error::Result<HashMap<String, ConsensusParams>> {
+    let base = match bundled {
+        Some(json) => {
+            let overrides = parse_consensus_overrides(json).map_err(|e| {
+                algo_error::AlgoError::Config(format!("parsing bundled consensus.json: {e}"))
+            })?;
+            // Only protocols the binary does not already define: the vendored
+            // file also carries stale copies of the standard versions
+            // (`future`, v7..v12, spec URLs) that must not replace ours
+            // (DIVERGENCE DIV-006: bundle supplies unknown protocols only).
+            let overrides = overrides
+                .into_iter()
+                .filter(|(version, _)| !base.contains_key(version))
+                .collect();
+            merge_consensus_protocols(base, overrides)
+        }
+        None => base,
+    };
+    match data_dir {
+        Some(dir) => preload_configurable_consensus_protocols_with_base(dir, base),
+        None => Ok(base),
+    }
 }
 
 /// Write (or, for an empty override map, delete) `<data_dir>/consensus.json`,

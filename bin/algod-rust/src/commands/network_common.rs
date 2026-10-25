@@ -54,8 +54,9 @@ pub struct NetworkPreset {
     /// `/v2/status.last-catchpoint` is the only discovery source.
     pub catchpoint_index_url: Option<&'static str>,
     /// Bundled `consensus.json` for chains with custom consensus protocols
-    /// (none yet; reserved for aramidmain, issue #2070).
-    #[allow(dead_code)] // first consumer lands with aramidmain (#2070)
+    /// (aramidmain, issue #2070). Only protocol versions the binary does not
+    /// already define are taken from it (DIV-006); a `<data_dir>/consensus.json`
+    /// is merged on top.
     pub consensus_json: Option<&'static str>,
 }
 
@@ -138,6 +139,24 @@ pub const PRESETS: &[NetworkPreset] = &[
         catchpoint_index_url: None,
         consensus_json: None,
     },
+    // DIVERGENCE DIV-005: aramidmain preset (Aramid mainnet) is algod-rust-only.
+    // DIVERGENCE DIV-006: the bundled consensus.json supplies only protocols
+    // the binary does not already define.
+    // Aramid mainnet: custom consensus protocols `aramidmain-v1.0/1..3`
+    // exist only in the vendored consensus.json (source: scholtz/AlgorandNodes
+    // `docker/algod-relay/aramidmain/context-aramid`). `DNSBootstrapID` is
+    // that image's own `config.json` value. No static catchpoint index; the
+    // public algod advertises `last-catchpoint` in /v2/status.
+    NetworkPreset {
+        name: "aramidmain",
+        genesis_id: "aramidmain-v1.0",
+        fixed_genesis_id: true,
+        genesis_json: Some(include_str!("../../genesis/aramidmain-genesis.json")),
+        rest_url: Some("https://algod.aramidmain.a-wallet.net"),
+        dns_bootstrap_id: Some("aramidmain.a-wallet.net"),
+        catchpoint_index_url: None,
+        consensus_json: Some(include_str!("../../consensus/aramidmain-consensus.json")),
+    },
 ];
 
 /// Look up a preset by `--network` name.
@@ -179,6 +198,36 @@ pub fn effective_dns_bootstrap<'a>(
         }
     }
     (configured, false)
+}
+
+/// The consensus table for `network`: the built-in table (with the
+/// dev-network upgrade-round shortening applied first, as go's
+/// `cmd/algod/main.go` does), then the preset's bundled `consensus.json`
+/// protocols (aramidmain, #2070), then `<data_dir>/consensus.json` if
+/// `data_dir` is given and the file exists (it wins per version, like go's
+/// `PreloadConfigurableConsensusProtocols`).
+pub fn load_consensus_table(
+    network: &str,
+    data_dir: Option<&std::path::Path>,
+) -> anyhow::Result<std::collections::HashMap<String, algo_types::consensus::ConsensusParams>> {
+    let mut base = algo_types::consensus::built_in_consensus_protocols();
+    algo_types::consensus::apply_shorter_upgrade_rounds_for_dev_networks(&mut base, network);
+    let bundled = preset(network).and_then(|p| p.consensus_json);
+    algo_types::consensus::preload_consensus_protocols_with_bundle(data_dir, base, bundled)
+        .map_err(|e| anyhow::anyhow!("loading consensus.json: {e}"))
+}
+
+/// [`load_consensus_table`] + [`algo_types::consensus::install_consensus_overrides`]
+/// (write-once; call at startup before any consensus evaluation). Used by
+/// commands that follow a chain without going through `node`/`participate`
+/// (`sync`, `replay`, `relay`), so custom protocol names resolve there too.
+pub fn install_consensus_for_network(
+    network: &str,
+    data_dir: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let table = load_consensus_table(network, data_dir)?;
+    algo_types::consensus::install_consensus_overrides(&table);
+    Ok(())
 }
 
 /// Translate a go-style signed connection-limit field (where a negative
@@ -390,6 +439,46 @@ mod tests {
         // Presets without a vendored genesis, and unknown networks.
         assert_eq!(vendored_genesis_json("mainnet", "mainnet-v1.0"), None);
         assert_eq!(vendored_genesis_json("nope", "voimain-v1.0"), None);
+    }
+
+    #[test]
+    fn aramidmain_preset_matches_live_chain_facts() {
+        let p = preset("aramidmain").expect("aramidmain preset");
+        assert_eq!(p.genesis_id, "aramidmain-v1.0");
+        assert_eq!(
+            data_encoding::BASE64.encode(&p.genesis_hash().unwrap()),
+            "PgeQVJJgx/LYKJfIEz7dbfNPuXmDyJ+O7FwQ4XL9tE8="
+        );
+        assert_eq!(p.rest_url, Some("https://algod.aramidmain.a-wallet.net"));
+        assert_eq!(p.dns_bootstrap_id, Some("aramidmain.a-wallet.net"));
+        assert!(p.genesis_json.is_some() && p.consensus_json.is_some());
+        assert_eq!(genesis_id_for("aramidmain"), Some("aramidmain-v1.0"));
+        assert!(vendored_genesis_json("aramidmain", "aramidmain-v1.0").is_some());
+    }
+
+    /// Preset resolution loads the bundled custom protocols; non-custom
+    /// presets leave the table untouched.
+    #[test]
+    fn bundled_consensus_loads_only_for_aramidmain() {
+        let t = load_consensus_table("aramidmain", None).unwrap();
+        for n in 1..=3 {
+            assert!(t.contains_key(&format!("aramidmain-v1.0/{n}")));
+        }
+        let base = algo_types::consensus::built_in_consensus_protocols();
+        for net in ["mainnet", "voimain", "custom"] {
+            assert_eq!(load_consensus_table(net, None).unwrap().len(), base.len());
+        }
+        assert_eq!(t.len(), base.len() + 3);
+    }
+
+    /// The preset's DNS bootstrap template expands to the relay SRV name.
+    #[test]
+    fn aramidmain_dns_bootstrap_srv_name() {
+        let (tpl, overridden) = effective_dns_bootstrap("aramidmain", None, DNS_BOOTSTRAP_TEMPLATE);
+        assert!(overridden);
+        let parsed =
+            algo_network::dns_bootstrap::parse_dns_bootstrap(tpl, "aramidmain", true).unwrap();
+        assert_eq!(parsed.primary_srv_bootstrap, "aramidmain.a-wallet.net");
     }
 
     #[test]

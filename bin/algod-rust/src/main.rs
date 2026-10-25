@@ -152,6 +152,8 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
         } => {
             let (resolved_url, resolved_token, net_name) =
                 commands::resolve_network(&network, algod_url.as_deref(), &algod_token)?;
+            // Preset chains with custom protocols (aramidmain, #2070).
+            commands::network_common::install_consensus_for_network(net_name, None)?;
 
             if stateful {
                 commands::replay::run_stateful(
@@ -213,6 +215,9 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
         } => {
             let (resolved_url, resolved_token, net_name) =
                 commands::resolve_network(&network, algod_url.as_deref(), &algod_token)?;
+            // Preset chains with custom protocols (aramidmain, #2070); a
+            // `<data-dir>/consensus.json` is merged on top like go.
+            commands::network_common::install_consensus_for_network(net_name, data_dir.as_deref())?;
 
             if catchpoint.is_some() || catchpoint_auto {
                 // Load `<data-dir>/config.json` for
@@ -434,6 +439,8 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
                 None => algo_config::Local::default(),
             };
             falcon_backend::apply_falcon_backend(&node_config)?;
+            // Preset chains with custom protocols (aramidmain, #2070).
+            commands::network_common::install_consensus_for_network(&network, data_dir.as_deref())?;
             // Go: `daemon/algod/server.go:172-200`'s FD-pressure connection-
             // limit rebalancing (`Local.AdjustConnectionLimits`, issue #949)
             // — must run before `network_opts.resolve`/`rest_opts` read

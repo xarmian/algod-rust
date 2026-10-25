@@ -5422,19 +5422,29 @@ pub async fn run(
             &mut consensus_base,
             network,
         );
+        // A preset chain's bundled custom protocols (aramidmain, #2070); the
+        // data-dir file is merged on top and still wins per version.
+        let bundled_consensus =
+            crate::commands::network_common::preset(network).and_then(|p| p.consensus_json);
 
         let consensus_overrides_path =
             data_dir.join(algo_types::consensus::CONFIGURABLE_CONSENSUS_PROTOCOLS_FILENAME);
-        let consensus_protocols =
-            algo_types::consensus::preload_configurable_consensus_protocols_with_base(
-                data_dir,
-                consensus_base,
-            )
-            .map_err(|e| anyhow::anyhow!("loading {}: {e}", consensus_overrides_path.display()))?;
+        let consensus_protocols = algo_types::consensus::preload_consensus_protocols_with_bundle(
+            Some(data_dir),
+            consensus_base,
+            bundled_consensus,
+        )
+        .map_err(|e| anyhow::anyhow!("loading {}: {e}", consensus_overrides_path.display()))?;
         algo_types::consensus::install_consensus_overrides(&consensus_protocols);
         if consensus_overrides_path.exists() {
             info!(path = %consensus_overrides_path.display(), "loaded consensus-parameter overrides");
         }
+    } else if crate::commands::network_common::preset(network)
+        .is_some_and(|p| p.consensus_json.is_some())
+    {
+        // No data dir, but the preset chain (aramidmain, #2070) needs its
+        // bundled custom protocols to resolve its own block headers.
+        crate::commands::network_common::install_consensus_for_network(network, None)?;
     }
 
     let resolved_p2p = p2p_opts.resolve();

@@ -56,7 +56,8 @@ consensus-compatible. It exists for three readers:
 | DIV-002 | `goal node pendingtxns` prints each pending transaction in the REST API's JSON form instead of Go's `encoding/json` dump of its decoded `SignedTxn` structs | goal-rust CLI output | landed | 2026-10-17 | none (client-side formatting of data the node already serves) | `crates/tools/goal-rust/src/cmd/node.rs` (`format_pending_txns`) | `cmd/goal/node.go` (`pendingTxnsCmd`), `libgoal/libgoal.go` (`GetParsedPendingTransactions`) | unit test of the exact text for the empty and non-empty pool, mock-node end-to-end test |
 | DIV-003 | `algo-abi` rejects ABI types whose encoded head size overflows `usize` at parse time, and caps zero-size array element expansion in `decode` | ABI type parsing / decoding (REST `abi:` box names, goal CLI) | landed | 2026-10-24 | none (no such type can be encoded; valid ARC-4 vectors byte-identical) | `crates/core/algo-abi/src/lib.rs` (`check_static_size`, `MAX_ZERO_SIZE_ELEMS`) | `github.com/algorand/avm-abi` `abi/abi_type.go` (`TypeOf`, `GetEncodedSize`), `abi/abi_encode.go` | `algo-abi` unit tests (overflow/huge-array/zero-size cases) plus the unchanged ARC-4 vector suite (#2057) |
 | DIV-004 | Hand-written msgpack struct readers decode the map form only (go also decodes struct-from-array) and replace, rather than merge into, a struct/array on a duplicated key | wire decoding of non-canonical msgpack (blocks, transactions, heartbeat, state proof, PQ structs) | landed | 2026-10-24 | none for canonical encodings (go's encoder never emits the array form or duplicate keys; hashes are over the canonical re-encode); only non-canonical input go accepts is rejected or decoded differently | `crates/core/algo-types/src/rmp_decode.rs` (`read_map_len`), the `decode_from_reader` struct readers in `crates/core/algo-types/src/{transaction,block,header,pq}.rs` | `data/transactions/msgp_gen.go` (`SignedTxn.UnmarshalMsgWithState` struct-from-array branch and key loop), algorand/msgp `msgp/read_bytes.go` | `docs/BYTES_DECODE_PARITY.md` "Issue #2065: final disposition"; `go_msgp_nil_scalars_test.rs` pins the parts that were implemented (nil -> zero) |
-| DIV-005 | `algokey keyreg` and the `--network` presets accept `voimain` (Voi mainnet), a network absent from go-algorand's `validNetworks` map | network presets / algokey genesis-hash table | landed | 2026-10-25 | none (additive preset; the four go networks resolve exactly as before) | `crates/core/algo-types/src/networks.rs`, `bin/algod-rust/src/commands/network_common.rs` | `cmd/algokey/keyreg.go` (`validNetworks`) | genesis-hash pin tests (`networks_parity`, `genesis_test::test_voimain_genesis_hash_matches_fixture`) against the live Voi `/genesis` and `/versions` (epic #2068, #2069) |
+| DIV-005 | `algokey keyreg` and the `--network` presets accept `voimain` (Voi mainnet) and `aramidmain` (Aramid mainnet), networks absent from go-algorand's `validNetworks` map | network presets / algokey genesis-hash table | landed | 2026-10-25 | none (additive preset; the four go networks resolve exactly as before) | `crates/core/algo-types/src/networks.rs`, `bin/algod-rust/src/commands/network_common.rs` | `cmd/algokey/keyreg.go` (`validNetworks`) | genesis-hash pin tests (`networks_parity`, `genesis_test::test_voimain_genesis_hash_matches_fixture`) against the live Voi `/genesis` and `/versions` (epic #2068, #2069, #2070) |
+| DIV-006 | A network preset's bundled `consensus.json` (aramidmain) contributes only protocol versions the binary does not already define; go loads every entry of a `consensus.json` wholesale | `--network aramidmain` consensus table | landed | 2026-10-25 | none (the aramidmain chain only ever uses `aramidmain-v1.0/1..3`, which are loaded exactly as go loads them; the file's stale copies of `future`/`v7`..`v12`/spec-URL protocols are never used by that chain) | `crates/core/algo-types/src/consensus.rs` (`preload_consensus_protocols_with_bundle`), `bin/algod-rust/src/commands/network_common.rs` | `config/config.go` (`PreloadConfigurableConsensusProtocols`), `config/consensus.go` (`ConsensusProtocols.Merge`) | `aramidmain_consensus_test.rs` (`custom_protocols_merge_like_go`, `bundle_adds_only_unknown_protocols`, `data_dir_file_overrides_bundle`) and the live aramidmain catchup + follow (#2070) |
 
 ## Entries
 
@@ -271,3 +272,36 @@ unknown-network error text deliberately does not (kept Go-identical).
 **How to switch back.** Remove the preset row and enum variant.
 
 **How go-algorand could port it.** Add the hash to `validNetworks`.
+
+### DIV-006 — preset-bundled `consensus.json` adds unknown protocols only
+
+**Status:** landed (#2070, epic #2068).
+
+**What go-algorand does.** `PreloadConfigurableConsensusProtocols` reads
+`<data_dir>/consensus.json` and `ConsensusProtocols.Merge` replaces (or deletes)
+every version named in the file wholesale. The aramidmain operators ship a
+`consensus.json` that, besides the custom `aramidmain-v1.0/1..3`, carries stale
+copies of `future`, `v7`..`v12` and the spec-URL protocols from an older
+go-algorand.
+
+**What algod-rust does instead.** `--network aramidmain` embeds that file
+(`bin/algod-rust/consensus/aramidmain-consensus.json`) and merges only the
+protocol versions the binary does not already define (the three custom ones).
+A `<data_dir>/consensus.json` is then merged on top exactly like go (wholesale,
+wins per version).
+
+**What is identical.** The three custom protocols are loaded field-for-field
+like go; every field they set is modelled or is permanently on in algod-rust
+(`ApplyData`, `TxnCounter`, and fields go itself no longer has). The standard
+protocols the file also lists are never used by the aramidmain chain.
+
+**Why.** Replacing `future` with a years-old definition would silently
+downgrade this node's own `future` protocol for no benefit.
+
+**How parity is proven.** `aramidmain_consensus_test.rs` plus live catchup and
+follow against the public aramidmain network with zero apply failures.
+
+**How to switch back.** Drop the `!base.contains_key` filter in
+`preload_consensus_protocols_with_bundle`.
+
+**How go-algorand could port it.** Not applicable (go has no network presets).
