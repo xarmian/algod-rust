@@ -1142,7 +1142,7 @@ def collect(
             time.sleep(poll_interval_s)
 
 
-def render_step_summary_lines(r: dict) -> list:
+def render_step_summary_lines(r: dict, network: str = "mainnet") -> list:
     """The workflow step-summary markdown (verdict, metrics table, follow
     timing rows with their `baseline`/`restarted` flags, then the nodelog
     sections) for a `summary.json` dict. Lives here, not inline in the
@@ -1158,7 +1158,7 @@ def render_step_summary_lines(r: dict) -> list:
         )
 
     lines = [
-        "# Mainnet node soak",
+        f"# {network.capitalize()} node soak",
         "",
         f"**Verdict:** `{r.get('status')}` \u2014 {nodelog.sanitize_text(r.get('message') or '', 700)}",
         "",

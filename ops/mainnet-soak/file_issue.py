@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: MIT
 # See the LICENSE-MIT file in the repository root for the full license text.
 
-# Issue #1598 -- file (or comment on) a GitHub issue for a mainnet-soak
+# Issue #1598 -- file (or comment on) a GitHub issue for a node-soak
 # halt verdict from `monitor.py`. Dedups against an already-open issue for
 # the same round before ever creating a new one, exactly the same
 # discipline `algod-issue-create` requires of a human filing one by hand.
@@ -18,6 +18,11 @@
 # calling `gh`, so the whole path is testable without touching the
 # tracker. Real (non-dry-run) calls shell out to the `gh` CLI, which must
 # already be authenticated (the workflow sets `GH_TOKEN`).
+#
+# Issue #2071: everything network-specific (title, labels, dedup label and
+# dedup marker, template text) derives from `--network` (default
+# `mainnet`, which reproduces the historical output byte-for-byte), so a
+# voimain/aramidmain halt can never dedup against a mainnet issue.
 
 import argparse
 import json
@@ -30,8 +35,18 @@ import nodelog
 
 FILED_STATUSES = ("stuck", "node_failure", "invalid_block_stall")
 
+DEFAULT_NETWORK = "mainnet"
 DEDUP_LABEL = "mainnet-soak"
 ISSUE_LABELS = ["bug", "sync", "conformance", "mainnet-soak", "algod:v5.0.4-stable", "effort:medium"]
+
+
+def dedup_label(network: str = DEFAULT_NETWORK) -> str:
+    """Per-network label; also the prefix of the body dedup marker."""
+    return f"{network}-soak"
+
+
+def issue_labels(network: str = DEFAULT_NETWORK) -> list:
+    return [dedup_label(network) if label == DEDUP_LABEL else label for label in ISSUE_LABELS]
 
 
 class _SafeDict(dict):
@@ -50,7 +65,14 @@ def render_template(template_path: str, fields: dict) -> str:
     return Formatter().vformat(template, (), _SafeDict(fields))
 
 
-def build_fields(verdict: dict, run_url: str, artifacts_url: str, log_excerpt: str, peer_url: str) -> dict:
+def build_fields(
+    verdict: dict,
+    run_url: str,
+    artifacts_url: str,
+    log_excerpt: str,
+    peer_url: str,
+    network: str = DEFAULT_NETWORK,
+) -> dict:
     round_ = verdict.get("round")
     phase = verdict.get("phase") or "unknown"
     stalled_s = verdict.get("stalled_since_s")
@@ -69,6 +91,9 @@ def build_fields(verdict: dict, run_url: str, artifacts_url: str, log_excerpt: s
             "`/v2/status` proved the network was alive and ahead the whole time."
         )
     return {
+        "network": network,
+        "soak_name": dedup_label(network),
+        "soak_workflow": f"{network}-node-soak.yml",
         "halt_intro": halt_intro,
         "invalid_block_stall_line": (
             "\n- Node `/v2/status` `stalled-on-invalid-block` (as reported by the node): "
@@ -94,19 +119,19 @@ def build_fields(verdict: dict, run_url: str, artifacts_url: str, log_excerpt: s
     }
 
 
-def issue_title(round_) -> str:
+def issue_title(round_, network: str = DEFAULT_NETWORK) -> str:
     r = round_ if round_ is not None else "unknown"
     from datetime import date
 
-    return f"sync: mainnet participation node halted at round {r} — nightly mainnet soak {date.today().isoformat()}"
+    return f"sync: {network} participation node halted at round {r} — nightly {network} soak {date.today().isoformat()}"
 
 
-def find_existing_issue(repo: str, round_) -> dict | None:
-    """Search open issues labelled `mainnet-soak` for the dedup marker for
+def find_existing_issue(repo: str, round_, network: str = DEFAULT_NETWORK) -> dict | None:
+    """Search open issues labelled `<network>-soak` for the dedup marker for
     this round. Returns the matching issue's {"number", "url"} or None."""
     if round_ is None:
         return None
-    marker = f"mainnet-soak:round={round_}"
+    marker = f"{dedup_label(network)}:round={round_}"
     result = subprocess.run(
         [
             "gh",
@@ -115,7 +140,7 @@ def find_existing_issue(repo: str, round_) -> dict | None:
             "--repo",
             repo,
             "--label",
-            DEDUP_LABEL,
+            dedup_label(network),
             "--state",
             "open",
             "--search",
@@ -135,7 +160,9 @@ def find_existing_issue(repo: str, round_) -> dict | None:
         issues = json.loads(result.stdout or "[]")
     except json.JSONDecodeError:
         return None
-    marker_re = re.compile(re.escape(marker))
+    # Anchored on the comment opener so "net-soak" can't match inside
+    # "mainnet-soak" (and no network matches another's marker).
+    marker_re = re.compile(r"<!--\s*" + re.escape(marker) + r"(?!\d)")
     for issue in issues:
         if marker_re.search(issue.get("body") or ""):
             return {"number": issue["number"], "url": issue["url"]}
@@ -151,17 +178,18 @@ def file_or_comment(
     log_excerpt: str,
     peer_url: str,
     dry_run: bool,
+    network: str = DEFAULT_NETWORK,
 ) -> dict:
     """Returns {"action": "created"|"commented"|"dry_run_create"|
     "dry_run_comment", "number": int|None, "url": str|None}."""
     round_ = verdict.get("round")
-    fields = build_fields(verdict, run_url, artifacts_url, log_excerpt, peer_url)
+    fields = build_fields(verdict, run_url, artifacts_url, log_excerpt, peer_url, network)
     body = render_template(template_path, fields)
-    title = issue_title(round_)
+    title = issue_title(round_, network)
 
-    existing = find_existing_issue(repo, round_)
+    existing = find_existing_issue(repo, round_, network)
     comment_body = (
-        f"Another nightly mainnet soak run hit the same halt.\n\n"
+        f"Another nightly {network} soak run hit the same halt.\n\n"
         f"- Run: {run_url}\n"
         f"- Artifacts: {artifacts_url}\n"
         f"- Phase: {verdict.get('phase')}, stalled for "
@@ -182,13 +210,13 @@ def file_or_comment(
     if dry_run:
         print(f"[dry-run] would CREATE issue:")
         print(f"  title: {title}")
-        print(f"  labels: {', '.join(ISSUE_LABELS)}")
+        print(f"  labels: {', '.join(issue_labels(network))}")
         print("  body:")
         print(body)
         return {"action": "dry_run_create", "number": None, "url": None}
 
     args = ["gh", "issue", "create", "--repo", repo, "--title", title, "--body", body]
-    for label in ISSUE_LABELS:
+    for label in issue_labels(network):
         args += ["--label", label]
     result = subprocess.run(args, check=True, capture_output=True, text=True)
     url = result.stdout.strip()
@@ -208,6 +236,7 @@ def main(argv=None) -> int:
     parser.add_argument("--artifacts-url", required=True)
     parser.add_argument("--log-excerpt-file", default=None)
     parser.add_argument("--peer-url", default="(see workflow inputs)")
+    parser.add_argument("--network", default=DEFAULT_NETWORK, help="soaked network (scopes title/labels/dedup)")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
@@ -239,6 +268,7 @@ def main(argv=None) -> int:
         log_excerpt=log_excerpt,
         peer_url=args.peer_url,
         dry_run=args.dry_run,
+        network=args.network,
     )
     print(json.dumps(result, indent=2))
     return 0

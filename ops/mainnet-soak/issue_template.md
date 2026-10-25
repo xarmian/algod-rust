@@ -1,4 +1,4 @@
-<!-- mainnet-soak:round={round} -->
+<!-- {soak_name}:round={round} -->
 <!--
 Copyright (c) 2026 Algod DAO
 SPDX-License-Identifier: MIT
@@ -6,9 +6,9 @@ See the LICENSE-MIT file in the repository root for the full license text.
 -->
 ## Root cause / Upstream change
 
-- The nightly mainnet node soak (`.github/workflows/mainnet-node-soak.yml`,
-  issue #1598) ran a single `algod-rust participate --network mainnet`
-  process against real mainnet, bootstrapped with fast catchup from
+- The nightly {network} node soak (`.github/workflows/{soak_workflow}`,
+  issue #1598) ran a single `algod-rust participate --network {network}`
+  process against real {network}, bootstrapped with fast catchup from
   `{peer_url}`, and it {halt_intro}
 - Round: **{round}**{catchpoint_line}{invalid_block_stall_line}
 - Node `/v2/status` just before the halt: `last-round={node_last_round}`,
@@ -29,10 +29,10 @@ See the LICENSE-MIT file in the repository root for the full license text.
   `algo-agreement`/`algo-rest-api` the reproduction below implicates —
   narrow this once the actual failing operation is known.
 - Reproduce offline against the pinned reference, without needing to
-  re-run a live mainnet soak:
+  re-run a live {network} soak:
 
   ```
-  cargo run --release --bin algod-rust -- replay --network mainnet \
+  cargo run --release --bin algod-rust -- replay --network {network} \
       --start {repro_start} --end {round} --compare
   ```
 
@@ -50,5 +50,5 @@ See the LICENSE-MIT file in the repository root for the full license text.
 - [ ] Parity: fixture/oracle comparison against go-algorand at round
       {round}.
 - [ ] `cargo fmt` / `clippy -D warnings` / full workspace suite green.
-- [ ] Live verification: the next scheduled mainnet-node-soak run gets
+- [ ] Live verification: the next scheduled {network}-node-soak run gets
       past round {round} without halting.
