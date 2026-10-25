@@ -90,6 +90,15 @@ pub fn resolve_network(
                 .filter(|p| p.rest_url.is_some())
                 .map(|p| p.name)
                 .collect();
+            if network_common::preset(network).is_some() {
+                // A real preset (betanet, devnet) that just has no public
+                // default REST endpoint: not an "unknown network".
+                anyhow::bail!(
+                    "network '{}' has no default REST endpoint: use {}, or custom with --algod-url",
+                    network,
+                    known.join(", ")
+                );
+            }
             anyhow::bail!(
                 "unknown network '{}': use {}, or custom",
                 network,
@@ -121,6 +130,15 @@ mod resolve_network_tests {
             resolve_network("testnet", None, "").unwrap().0,
             "https://testnet-api.4160.nodely.dev"
         );
+    }
+
+    #[test]
+    fn preset_without_rest_endpoint_is_not_called_unknown() {
+        for n in ["betanet", "devnet"] {
+            let e = resolve_network(n, None, "").unwrap_err().to_string();
+            assert!(!e.contains("unknown network"), "{e}");
+            assert!(e.contains(n) && e.contains("--algod-url"), "{e}");
+        }
     }
 
     #[test]
