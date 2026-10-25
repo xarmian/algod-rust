@@ -59,6 +59,10 @@ names) and is pinned against the fixture by
   (Use the REST backend, i.e. without `--gossip`: the gossip backend ignores
   `--catchpoint-peer-url`, tracked in #2076. Relays that return 404 for the
   catchpoint are simply ranked down.)
+- Voi's catchpoints are file version V7 (no `onlineaccounts` data). The importer
+  rebuilds `onlineaccounts` from `accountbase` at cutover, as go-algorand's
+  v7 DB migration does (#2088); without it every post-catchpoint vote failed
+  `OTS signature verification failed`.
 - Live evidence (2026-10-25): catchup from `23900000#KFAWCWWDOOSID3YYDJZOWIYYVW2KEKLMVPF5BHBLY6CFRCARJFMA`,
   replay of 4388 blocks, then follow mode with zero apply failures (see the
   PR for the log excerpt).

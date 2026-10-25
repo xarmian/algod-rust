@@ -45,6 +45,7 @@ use rusqlite::{Connection, OptionalExtension};
 use super::checkpoint::ImportCheckpoint;
 use super::msgp_compat::{decode_base_account_data, decode_resources_data};
 use super::parser::{self, CatchpointEntry};
+use super::types::CATCHPOINT_FILE_VERSION_V8;
 use super::types::{
     BalanceRecordV6, CatchpointError, CatchpointFileHeader, CatchpointSnapshotChunkV6,
     CatchpointStateProofVerificationWrapper, KVRecordV6, OnlineAccountRecordV6,
@@ -523,6 +524,20 @@ impl<'a> CatchpointImporter<'a> {
 
             let staging = staging_for_live(live);
             tx.execute_batch(&format!("ALTER TABLE {staging} RENAME TO {live};"))?;
+        }
+
+        // Pre-V8 files (V6/V7, e.g. voimain's) carry no `onlineaccounts`
+        // data. go-algorand restores them at DB schema v6 and its normal
+        // migration to v7 (`performOnlineAccountsTableMigration`) rebuilds the
+        // table from `accountbase`; do the same, or the agreement lookback
+        // finds no voting keys and every vote fails OTS verification (#2088).
+        if header.version < CATCHPOINT_FILE_VERSION_V8 {
+            let rebuilt = rebuild_online_accounts_from_balances(&tx)?;
+            tracing::info!(
+                accounts = rebuilt,
+                version = header.version,
+                "catchpoint file has no onlineaccounts data: rebuilt it from accountbase"
+            );
         }
 
         // Step 2: capture prior acctrounds rows, then reconstruct.
@@ -1289,6 +1304,41 @@ pub fn import_catchpoint_file_with_progress(
 // ---------------------------------------------------------------------------
 // Resource flag helpers (mirrors Go's resourcesData methods)
 // ---------------------------------------------------------------------------
+
+/// Rebuild `onlineaccounts` from `accountbase`: one row per `Online` account,
+/// dated at the account's own `UpdateRound`, holding its
+/// `BaseOnlineAccountData`. Mirrors go-algorand's
+/// `performOnlineAccountsTableMigration`
+/// (`ledger/store/trackerdb/sqlitedriver/schema.go`), which runs after a
+/// pre-V8 catchpoint is applied. Returns the number of rows written.
+fn rebuild_online_accounts_from_balances(conn: &Connection) -> Result<u64, CatchpointError> {
+    let mut select =
+        conn.prepare("SELECT address, normalizedonlinebalance, data FROM accountbase")?;
+    let mut insert = conn.prepare(
+        "INSERT OR REPLACE INTO onlineaccounts(address, updround, normalizedonlinebalance, votelastvalid, data) VALUES(?1, ?2, ?3, ?4, ?5)",
+    )?;
+    let mut rows = select.query([])?;
+    let mut count = 0u64;
+    while let Some(row) = rows.next()? {
+        let address: Vec<u8> = row.get(0)?;
+        let nob: Option<i64> = row.get(1)?;
+        let data: Vec<u8> = row.get(2)?;
+        let acct = crate::sqlite::decode_account_data(&data)
+            .map_err(|e| CatchpointError::ImportError(format!("decode accountbase row: {e}")))?;
+        if acct.status != AccountStatus::Online {
+            continue;
+        }
+        insert.execute(rusqlite::params![
+            address,
+            acct.update_round as i64,
+            nob.unwrap_or(0),
+            acct.vote_last_valid as i64,
+            crate::sqlite::encode_online_account_data(&acct),
+        ])?;
+        count += 1;
+    }
+    Ok(count)
+}
 
 /// Returns `true` if the ownership bit is set.
 fn is_owning(flags: u8) -> bool {
@@ -2219,6 +2269,73 @@ mod tests {
         assert_eq!(nopart, 3_000_000);
         assert_eq!(nopart_ru, 30);
         assert_eq!(rwdlvl, 42);
+    }
+
+    /// Issue #2088: a V6/V7 catchpoint file (voimain's) carries no
+    /// `onlineaccounts` chunk data. go-algorand's DB migration to v7
+    /// (`performOnlineAccountsTableMigration`) rebuilds the table from
+    /// `accountbase`, one row per online account dated at the account's own
+    /// `UpdateRound`. Without it the agreement lookback finds no stake/keys
+    /// and every vote fails "OTS signature verification failed".
+    #[test]
+    fn atomic_cutover_rebuilds_onlineaccounts_for_pre_v8_catchpoint() {
+        use algo_types::{AccountData, AccountStatus};
+
+        let conn = mem_conn();
+        let mut importer = CatchpointImporter::new(&conn, "test#label".to_string(), REWARD_UNITS);
+        importer.prepare_staging().unwrap();
+
+        let online = AccountData {
+            status: AccountStatus::Online,
+            micro_algos: 5_000_000,
+            vote_id: Some([7u8; 32]),
+            selection_id: Some([8u8; 32]),
+            vote_first_valid: 10,
+            vote_last_valid: 9_000_000,
+            vote_key_dilution: 10_000,
+            update_round: 123,
+            ..Default::default()
+        };
+        let offline = AccountData {
+            micro_algos: 1_000_000,
+            ..Default::default()
+        };
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        importer
+            .import_balance_record(&make_balance_record(
+                [1u8; 32],
+                crate::sqlite::encode_account_data(&online),
+                HashMap::new(),
+            ))
+            .unwrap();
+        importer
+            .import_balance_record(&make_balance_record(
+                [2u8; 32],
+                crate::sqlite::encode_account_data(&offline),
+                HashMap::new(),
+            ))
+            .unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+
+        let mut header = make_test_header(1_000);
+        header.version = 130; // V7: no online-accounts data in the file
+        importer.atomic_cutover(&header).unwrap();
+
+        let rows: Vec<(Vec<u8>, i64)> = conn
+            .prepare("SELECT address, updround FROM onlineaccounts")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows, vec![([1u8; 32].to_vec(), 123)]);
+
+        let data: Vec<u8> = conn
+            .query_row("SELECT data FROM onlineaccounts", [], |r| r.get(0))
+            .unwrap();
+        let decoded = crate::sqlite::decode_online_account_data(&data).unwrap();
+        assert_eq!(decoded.vote_id, Some([7u8; 32]));
+        assert_eq!(decoded.vote_key_dilution, 10_000);
     }
 
     #[test]
