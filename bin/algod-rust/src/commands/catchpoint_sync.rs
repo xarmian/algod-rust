@@ -1194,7 +1194,9 @@ fn build_catchpoint_backend(
 // Genesis info resolution
 // ---------------------------------------------------------------------------
 
-/// Known genesis IDs for well-known networks.
+/// Known genesis IDs for well-known catchup networks. Unlike
+/// `network_common::genesis_id_for` this excludes `devnet`, whose genesis id
+/// varies per deployment (`fixed_genesis_id == false`).
 fn genesis_id_for_network(network: &str) -> Option<&'static str> {
     preset(network)
         .filter(|p| p.fixed_genesis_id)

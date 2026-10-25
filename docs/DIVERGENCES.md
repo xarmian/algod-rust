@@ -265,6 +265,9 @@ all four go networks, their hashes, and the unknown-network error text
 **How parity is proven.** Pinned-hash tests plus a byte-exact genesis fixture
 from the live Voi node (hash recomputed and compared to `/versions`).
 
+**Help text.** `algokey keyreg --network` help lists `voimain` while the
+unknown-network error text deliberately does not (kept Go-identical).
+
 **How to switch back.** Remove the preset row and enum variant.
 
 **How go-algorand could port it.** Add the hash to `validNetworks`.

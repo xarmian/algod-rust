@@ -5280,6 +5280,39 @@ fn seed_ledger_from_genesis(
     genesis_path: &Path,
     latest: u64,
 ) -> anyhow::Result<()> {
+    // Skip the file read entirely for an already-seeded ledger.
+    if ledger.has_account_totals().unwrap_or(false) {
+        return seed_ledger_from_genesis_str(
+            ledger,
+            "",
+            &genesis_path.display().to_string(),
+            latest,
+        );
+    }
+    let genesis_str = std::fs::read_to_string(genesis_path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to read genesis.json at {}: {}",
+            genesis_path.display(),
+            e
+        )
+    })?;
+    seed_ledger_from_genesis_str(
+        ledger,
+        &genesis_str,
+        &genesis_path.display().to_string(),
+        latest,
+    )
+}
+
+/// [`seed_ledger_from_genesis`] on an in-memory genesis document (`source`
+/// is only for logs). Also used to seed a fresh ledger from a preset's
+/// vendored genesis when no `--genesis-json` is given (issue #2069).
+fn seed_ledger_from_genesis_str(
+    ledger: &mut SqliteLedger,
+    genesis_str: &str,
+    source: &str,
+    latest: u64,
+) -> anyhow::Result<()> {
     let already_seeded = ledger.has_account_totals().unwrap_or(false);
     if already_seeded {
         info!(
@@ -5294,14 +5327,7 @@ fn seed_ledger_from_genesis(
              re-seed genesis over accumulated history. Delete the ledger DB pair and restart."
         );
     }
-    let genesis_str = std::fs::read_to_string(genesis_path).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to read genesis.json at {}: {}",
-            genesis_path.display(),
-            e
-        )
-    })?;
-    let genesis = parse_genesis_json(&genesis_str)
+    let genesis = parse_genesis_json(genesis_str)
         .map_err(|e| anyhow::anyhow!("failed to parse genesis.json: {}", e))?;
     ledger
         .begin_block()
@@ -5333,7 +5359,7 @@ fn seed_ledger_from_genesis(
         .commit_block()
         .map_err(|e| anyhow::anyhow!("commit_block during genesis seed: {}", e))?;
     info!(
-        genesis_path = %genesis_path.display(),
+        genesis_path = %source,
         allocations = genesis.alloc.len(),
         online_stake = ledger.online_stake().unwrap_or(0),
         "seeded ledger from genesis (accountbase + accounttotals + block 0)"
@@ -5502,6 +5528,16 @@ pub async fn run(
     // participation node needs it even more than a relay does.
     if let Some(genesis_path) = genesis_json_path {
         seed_ledger_from_genesis(&mut sqlite_ledger, genesis_path, latest)?;
+    } else if latest == 0 {
+        // Issue #2069: a fresh ledger on a preset that vendors its genesis
+        // (voimain) is seeded from the embedded document, so `--genesis-json`
+        // is optional there. Only when the placeholder genesis id is the
+        // preset's own; any other `--genesis-id` needs an explicit file.
+        if let Some(g) =
+            crate::commands::network_common::vendored_genesis_json(network, &resolved_genesis_id)
+        {
+            seed_ledger_from_genesis_str(&mut sqlite_ledger, g, "embedded preset genesis", latest)?;
+        }
     }
 
     // Issue #1066: the CLI-derived placeholders resolved above must not be
@@ -13582,3 +13618,31 @@ mod exec_admission_tests;
 #[cfg(test)]
 #[path = "participate_wal_pin_tests.rs"]
 mod wal_pin_tests;
+
+#[cfg(test)]
+mod preset_genesis_seed_tests {
+    use super::*;
+
+    /// Issue #2069: a fresh ledger is seeded from a preset's embedded genesis
+    /// (no `--genesis-json`), and a second call is a no-op.
+    #[test]
+    fn fresh_ledger_seeds_from_embedded_voimain_genesis() {
+        let g = crate::commands::network_common::vendored_genesis_json("voimain", "voimain-v1.0")
+            .expect("voimain genesis");
+        let mut l = SqliteLedger::open_in_memory().expect("ledger");
+        assert!(!l.has_account_totals().unwrap());
+        seed_ledger_from_genesis_str(&mut l, g, "test", 0).expect("seed");
+        assert!(l.has_account_totals().unwrap());
+        assert!(l.online_stake().unwrap() > 0);
+        assert_eq!(l.current_round().0, 0);
+        // Restart against the populated ledger: no-op, not an error.
+        seed_ledger_from_genesis_str(&mut l, g, "test", 0).expect("re-seed no-op");
+    }
+
+    #[test]
+    fn mismatched_genesis_id_gets_no_embedded_seed() {
+        assert!(
+            crate::commands::network_common::vendored_genesis_json("voimain", "other-v1").is_none()
+        );
+    }
+}

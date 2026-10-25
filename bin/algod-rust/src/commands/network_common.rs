@@ -429,6 +429,62 @@ mod tests {
             ),
         }
         assert!(Cli::try_parse_from(["algod-rust", "observe", "--network", "voimain"]).is_ok());
+        // replay, sync (genesis and catchpoint modes) and relay.
+        match Cli::try_parse_from([
+            "algod-rust",
+            "replay",
+            "--network",
+            "voimain",
+            "--start",
+            "1",
+            "--end",
+            "2",
+        ])
+        .map(|c| c.command)
+        {
+            Ok(Commands::Replay { network, .. }) => assert_eq!(network, "voimain"),
+            other => panic!("replay --network voimain did not parse: {:?}", other.err()),
+        }
+        match Cli::try_parse_from(["algod-rust", "sync", "--network", "voimain"]).map(|c| c.command)
+        {
+            Ok(Commands::Sync { network, .. }) => assert_eq!(network, "voimain"),
+            other => panic!("sync --network voimain did not parse: {:?}", other.err()),
+        }
+        match Cli::try_parse_from([
+            "algod-rust",
+            "sync",
+            "--network",
+            "voimain",
+            "--catchpoint-auto",
+            "--follow",
+        ])
+        .map(|c| c.command)
+        {
+            Ok(Commands::Sync {
+                network,
+                catchpoint_auto,
+                ..
+            }) => {
+                assert_eq!(network, "voimain");
+                assert!(catchpoint_auto);
+            }
+            other => panic!("sync --catchpoint-auto did not parse: {:?}", other.err()),
+        }
+        match Cli::try_parse_from([
+            "algod-rust",
+            "relay",
+            "--bind-address",
+            "127.0.0.1:0",
+            "--ledger-path",
+            "l",
+            "--network",
+            "voimain",
+        ])
+        .map(|c| c.command)
+        {
+            Ok(Commands::Relay { network, .. }) => assert_eq!(network, "voimain"),
+            other => panic!("relay --network voimain did not parse: {:?}", other.err()),
+        }
     }
 
     #[test]

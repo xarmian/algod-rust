@@ -62,3 +62,16 @@ names) and is pinned against the fixture by
 - Live evidence (2026-10-25): catchup from `23900000#KFAWCWWDOOSID3YYDJZOWIYYVW2KEKLMVPF5BHBLY6CFRCARJFMA`,
   replay of 4388 blocks, then follow mode with zero apply failures (see the
   PR for the log excerpt).
+
+## Scope of the preset behaviours (read before adding a chain)
+
+- **Vendored genesis** (`genesis_json`) is used only by `participate`
+  (`vendored_genesis_json`): it serves `/genesis`, and seeds a fresh ledger
+  when `--genesis-json` is not given. It is used only when the genesis id
+  resolved from the ledger equals the preset's id. `sync`, `replay`,
+  `relay` and `catchpoint` do not use it (they take genesis from the peer or
+  an explicit `--genesis`/`--genesis-json`).
+- **DNS bootstrap** (`effective_dns_bootstrap`) decides "operator did not
+  customise `DNSBootstrapID`" by string equality with go's stock template.
+  This is a heuristic: an operator who explicitly sets the stock value in
+  `config.json` still gets the preset's template. `--dns-bootstrap` always wins.
