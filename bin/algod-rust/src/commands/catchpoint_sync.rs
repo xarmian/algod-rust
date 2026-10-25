@@ -355,23 +355,29 @@ impl AlgodSyncBackend {
             network,
         );
         if let Some(transport) = p2p_transport {
-            let http_transport: Arc<dyn HttpPeerTransport> =
-                Arc::new(P2pHttpPeerTransport::new(Arc::clone(transport)));
-            let peers = transport.get_peers(&[]);
-            let peer_count = peers.len();
-            for peer in peers {
-                backend
-                    .catchpoint_source
-                    .push_p2p_peer(peer.get_address().to_string(), Arc::clone(&http_transport));
-            }
-            if peer_count > 0 {
-                info!(
-                    peer_count,
-                    "wired connected P2P peer(s) into catchpoint download ranking"
-                );
-            }
+            push_connected_p2p_peers(&backend.catchpoint_source, transport);
         }
         backend
+    }
+}
+
+/// Push every peer `transport` is currently connected to into `source`'s
+/// ranked candidate pool (issues #1130, #2079). Shared by
+/// [`AlgodSyncBackend::with_catchpoint_peers_and_p2p`] and the `--gossip`
+/// [`GossipSyncBackend`] so both rank P2P peers identically.
+fn push_connected_p2p_peers(source: &RankedCatchpointSource, transport: &Arc<P2pTransport>) {
+    let http_transport: Arc<dyn HttpPeerTransport> =
+        Arc::new(P2pHttpPeerTransport::new(Arc::clone(transport)));
+    let peers = transport.get_peers(&[]);
+    let peer_count = peers.len();
+    for peer in peers {
+        source.push_p2p_peer(peer.get_address().to_string(), Arc::clone(&http_transport));
+    }
+    if peer_count > 0 {
+        info!(
+            peer_count,
+            "wired connected P2P peer(s) into catchpoint download ranking"
+        );
     }
 }
 
@@ -1138,6 +1144,10 @@ impl SyncBackend for CatchpointBackend {
 /// logic here — `gossip` on/off, and `GossipFirst` vs. `HttpOnly` depending
 /// on whether any peers are connected — is unit-testable without a live
 /// network (issue #1247's TDD requirement).
+///
+/// `p2p_transport`, when `Some`, pushes its currently-connected P2P peers
+/// into the `--gossip` backend's ranked catchpoint source (issue #2079),
+/// like [`AlgodSyncBackend::with_catchpoint_peers_and_p2p`].
 #[allow(clippy::too_many_arguments)]
 fn build_catchpoint_backend(
     gossip: bool,
@@ -1151,6 +1161,7 @@ fn build_catchpoint_backend(
     ledger_download_retry_attempts: usize,
     http_block_fetch_timeout: std::time::Duration,
     catchup_gossip_block_fetch_timeout: std::time::Duration,
+    p2p_transport: Option<&Arc<P2pTransport>>,
 ) -> anyhow::Result<CatchpointBackend> {
     if !gossip {
         return Ok(CatchpointBackend::Rest(
@@ -1201,6 +1212,17 @@ fn build_catchpoint_backend(
             |e| anyhow::anyhow!("failed to build HTTP block fetcher for gossip sync: {e}"),
         )?;
 
+    let catchpoint_source = ranked_catchpoint_source(
+        algod_url,
+        algod_token,
+        catchpoint_peer_urls,
+        download_config,
+        ledger_download_retry_attempts,
+    );
+    if let Some(transport) = p2p_transport {
+        push_connected_p2p_peers(&catchpoint_source, transport);
+    }
+
     Ok(CatchpointBackend::Gossip(
         GossipSyncBackend::with_network(
             gossip_source,
@@ -1209,13 +1231,7 @@ fn build_catchpoint_backend(
             algod_token,
             policy,
             concurrency,
-            ranked_catchpoint_source(
-                algod_url,
-                algod_token,
-                catchpoint_peer_urls,
-                download_config,
-                ledger_download_retry_attempts,
-            ),
+            catchpoint_source,
             network_name_for_genesis_id(genesis_id),
         )
         .with_worst_case_round_time(worst_case_round_time(
@@ -1669,6 +1685,7 @@ pub async fn run(
         ledger_download_retry_attempts,
         http_block_fetch_timeout,
         catchup_gossip_block_fetch_timeout,
+        None,
     )?;
     let mut orchestrator = SyncOrchestrator::with_backend(config, backend);
     orchestrator.set_cancel(cancel);
@@ -2564,6 +2581,7 @@ mod tests {
             algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
             std::time::Duration::from_secs(4),
             std::time::Duration::from_secs(4),
+            None,
         )
         .expect("gossip backend construction should succeed with zero peers");
         assert!(
@@ -2591,6 +2609,7 @@ mod tests {
             algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
             std::time::Duration::from_secs(4),
             std::time::Duration::from_secs(4),
+            None,
         )
         .expect("gossip backend construction should succeed");
         let CatchpointBackend::Gossip(b) = backend else {
@@ -2627,6 +2646,7 @@ mod tests {
             retry_attempts,
             std::time::Duration::from_secs(4),
             std::time::Duration::from_secs(4),
+            None,
         )
         .expect("gossip backend construction should succeed");
         let CatchpointBackend::Gossip(b) = backend else {
@@ -2749,6 +2769,7 @@ mod tests {
             algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
             std::time::Duration::from_secs(4),
             std::time::Duration::from_secs(4),
+            None,
         )
         .expect("REST backend construction should succeed");
         assert!(matches!(backend, CatchpointBackend::Rest(_)));
@@ -2774,6 +2795,7 @@ mod tests {
             algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
             std::time::Duration::from_secs(4),
             std::time::Duration::from_secs(4),
+            None,
         )
         .expect("gossip backend construction should succeed with one peer");
         let CatchpointBackend::Gossip(gossip_backend) = backend else {
@@ -2800,6 +2822,7 @@ mod tests {
             algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
             std::time::Duration::from_secs(4),
             std::time::Duration::from_secs(4),
+            None,
         )
         .expect("gossip backend construction should succeed with zero peers");
         let CatchpointBackend::Gossip(gossip_backend) = backend else {
@@ -2899,6 +2922,39 @@ mod tests {
     /// `P2pTransport`'s peer is now also added, via
     /// `with_catchpoint_peers_and_p2p`/`build_algod_sync_backend`'s new
     /// `p2p_transport` parameter.
+    #[tokio::test]
+    async fn gossip_backend_wires_in_connected_p2p_peers() {
+        let (_listener, dialer) = connected_p2p_pair().await;
+        let dialer = Arc::new(dialer);
+        let build = |p2p: Option<&Arc<P2pTransport>>| {
+            let backend = build_catchpoint_backend(
+                true,
+                "http://localhost:19999",
+                "",
+                "test-genesis-v1.0",
+                vec![],
+                &[],
+                4,
+                algo_rest_client::CatchpointDownloadConfig::default(),
+                algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
+                std::time::Duration::from_secs(4),
+                std::time::Duration::from_secs(4),
+                p2p,
+            )
+            .expect("gossip backend construction should succeed");
+            let CatchpointBackend::Gossip(b) = backend else {
+                panic!("expected gossip backend");
+            };
+            b
+        };
+        assert_eq!(build(None).catchpoint_source.peer_count(), 1);
+        assert_eq!(
+            build(Some(&dialer)).catchpoint_source.peer_count(),
+            2,
+            "expected the HTTP peer plus the one connected P2P peer"
+        );
+    }
+
     #[tokio::test]
     async fn build_algod_sync_backend_wires_in_connected_p2p_peers() {
         let (listener, dialer) = connected_p2p_pair().await;
