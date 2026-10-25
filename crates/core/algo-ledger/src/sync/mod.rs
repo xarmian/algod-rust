@@ -1395,6 +1395,15 @@ impl SyncOrchestrator {
             }
         }
 
+        // go-algorand's post-restore DB migration also tidies StateProofIDs
+        // left on accounts without a SelectionID; that must follow (never
+        // precede) the label check above (#2088).
+        crate::catchpoint::importer::finish_pre_v8_catchpoint_migration(&conn).map_err(|e| {
+            AlgoError::Ledger {
+                message: format!("post-verification catchpoint migration failed: {e}"),
+            }
+        })?;
+
         tracing::info!(
             label = %verify_result.computed_label,
             accounts = verify_result.accounts_count,
