@@ -1540,6 +1540,23 @@ class RestartPreTipTest(unittest.TestCase):
         self.assertFalse(a["pre_tip_included"])
 
 
+class StepSummaryNetworkTitleTest(unittest.TestCase):
+    """Issue #2071: the step-summary heading names the soaked network;
+    the default stays the historical mainnet heading."""
+
+    def _result(self):
+        samples = [node_follow_stalled(1000.0, 103, 104, stall=None)]
+        return monitor.build_result(samples, monitor.classify(samples))
+
+    def test_default_heading_is_unchanged_mainnet(self):
+        self.assertEqual(monitor.render_step_summary_lines(self._result())[0], "# Mainnet node soak")
+
+    def test_heading_names_a_non_mainnet_network(self):
+        r = self._result()
+        self.assertEqual(monitor.render_step_summary_lines(r, network="voimain")[0], "# Voimain node soak")
+        self.assertEqual(monitor.render_step_summary_lines(r, network="aramidmain")[0], "# Aramidmain node soak")
+
+
 class StallTextEscapingTest(unittest.TestCase):
     NASTY = {
         "round": 7,

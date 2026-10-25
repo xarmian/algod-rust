@@ -19,6 +19,8 @@ on:
       - "docker/Dockerfile"
       - "Makefile"
       - ".github/workflows/harness-shell-tests.yml"
+      - ".github/workflows/*node-soak.yml"
+      - "scripts/test_node_soak_callers.py"
   push:
     branches: [main]
     paths:
@@ -27,6 +29,8 @@ on:
       - "docker/Dockerfile"
       - "Makefile"
       - ".github/workflows/harness-shell-tests.yml"
+      - ".github/workflows/*node-soak.yml"
+      - "scripts/test_node_soak_callers.py"
 
 permissions:
   contents: read
@@ -40,3 +44,19 @@ jobs:
       - uses: actions/checkout@v7
       - name: Run the Docker-free harness tests
         run: make consensus-cluster-analyzer
+
+  node-soak-scripts:
+    # Issue #2071: the network-parameterised node soak (ops/mainnet-soak/*
+    # python tooling + reusable workflow/caller interface) was previously
+    # only exercised inside the soak run itself.
+    name: Node-soak tooling + workflow interface tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install PyYAML
+        run: python3 -m pip install --quiet pyyaml
+      - name: Soak monitor / issue-filer self-test
+        run: python3 ops/mainnet-soak/monitor.py self-test
+      - name: Reusable soak workflow <-> caller interface
+        run: python3 scripts/test_node_soak_callers.py
