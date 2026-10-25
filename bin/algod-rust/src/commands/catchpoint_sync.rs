@@ -196,6 +196,27 @@ struct AlgodSyncBackend {
     http_block_fetcher: Option<HttpBlockFetcher>,
 }
 
+/// Builds the ranked catchpoint-download source shared by
+/// [`AlgodSyncBackend`] and [`GossipSyncBackend`] (issues #901, #2076):
+/// `algod_url` plus every `extra_catchpoint_peer_urls`, all with
+/// `algod_token`.
+fn ranked_catchpoint_source(
+    algod_url: &str,
+    algod_token: &str,
+    extra_catchpoint_peer_urls: &[String],
+    download_config: algo_rest_client::CatchpointDownloadConfig,
+    ledger_download_retry_attempts: usize,
+) -> RankedCatchpointSource {
+    let mut peers = vec![(algod_url.to_string(), algod_token.to_string())];
+    peers.extend(
+        extra_catchpoint_peer_urls
+            .iter()
+            .map(|u| (u.clone(), algod_token.to_string())),
+    );
+    RankedCatchpointSource::new(&peers, download_config)
+        .with_ledger_download_retry_attempts(ledger_download_retry_attempts)
+}
+
 impl AlgodSyncBackend {
     /// Enables the block-service fallback for [`Self::get_block_raw_bytes`]
     /// (issue #1650). Best-effort: a fetcher that cannot be built leaves the
@@ -256,14 +277,13 @@ impl AlgodSyncBackend {
         network: Option<&str>,
     ) -> Self {
         let client = AlgodClient::new(algod_url, algod_token);
-        let mut peers = vec![(algod_url.to_string(), algod_token.to_string())];
-        peers.extend(
-            extra_catchpoint_peer_urls
-                .iter()
-                .map(|u| (u.clone(), algod_token.to_string())),
+        let catchpoint_source = ranked_catchpoint_source(
+            algod_url,
+            algod_token,
+            extra_catchpoint_peer_urls,
+            download_config,
+            ledger_download_retry_attempts,
         );
-        let catchpoint_source = RankedCatchpointSource::new(&peers, download_config)
-            .with_ledger_download_retry_attempts(ledger_download_retry_attempts);
         let rt = tokio::runtime::Handle::current();
         Self {
             client,
@@ -784,30 +804,6 @@ impl GossipSyncBackend {
         self
     }
 
-    /// Rank `extra_catchpoint_peer_urls` alongside `algod_url` for the
-    /// catchpoint-file download (issue #2076) and apply the configured
-    /// ledger-download retry attempts. Needed where the REST gateway cannot
-    /// serve catchpoint files (e.g. voimain) and only a relay can.
-    #[must_use]
-    pub fn with_catchpoint_peers(
-        mut self,
-        algod_url: &str,
-        algod_token: &str,
-        extra_catchpoint_peer_urls: &[String],
-        download_config: algo_rest_client::CatchpointDownloadConfig,
-        ledger_download_retry_attempts: usize,
-    ) -> Self {
-        let mut peers = vec![(algod_url.to_string(), algod_token.to_string())];
-        peers.extend(
-            extra_catchpoint_peer_urls
-                .iter()
-                .map(|u| (u.clone(), algod_token.to_string())),
-        );
-        self.catchpoint_source = RankedCatchpointSource::new(&peers, download_config)
-            .with_ledger_download_retry_attempts(ledger_download_retry_attempts);
-        self
-    }
-
     /// Create a new `GossipSyncBackend`.
     ///
     /// # Arguments
@@ -818,10 +814,10 @@ impl GossipSyncBackend {
     /// * `algod_token` — REST API token.
     /// * `policy` — Source selection policy (default: `GossipFirst`).
     /// * `concurrency` — Number of concurrent fetches for batch operations.
-    /// * `download_config` — go's `MaxCatchpointDownloadDuration`/
-    ///   `MinCatchpointFileDownloadBytesPerSecond` (`config.Local`, issue
-    ///   #1289), sourced from a loaded `config.json` by the caller rather
-    ///   than left at [`algo_rest_client::CatchpointDownloadConfig::default`].
+    /// * `catchpoint_source` — ranked catchpoint-download source (algod_url
+    ///   plus any `--catchpoint-peer-url` peers, issue #2076), built with
+    ///   [`ranked_catchpoint_source`] from the `config.json` download
+    ///   settings (issue #1289).
     /// * `network` — the network preset name (e.g. `"mainnet"`), if
     ///   recognized (issue #1604), for [`Self::discover_catchpoint`]'s
     ///   static-index fallback. `None` keeps the pre-#1604 REST-only
@@ -834,14 +830,10 @@ impl GossipSyncBackend {
         algod_token: &str,
         policy: BlockSourcePolicy,
         concurrency: usize,
-        download_config: algo_rest_client::CatchpointDownloadConfig,
+        catchpoint_source: RankedCatchpointSource,
         network: Option<&str>,
     ) -> Self {
         let rest_client = AlgodClient::new(algod_url, algod_token);
-        let catchpoint_source = RankedCatchpointSource::new(
-            &[(algod_url.to_string(), algod_token.to_string())],
-            download_config,
-        );
         let rt = tokio::runtime::Handle::current();
         Self {
             gossip,
@@ -1217,15 +1209,14 @@ fn build_catchpoint_backend(
             algod_token,
             policy,
             concurrency,
-            download_config.clone(),
+            ranked_catchpoint_source(
+                algod_url,
+                algod_token,
+                catchpoint_peer_urls,
+                download_config,
+                ledger_download_retry_attempts,
+            ),
             network_name_for_genesis_id(genesis_id),
-        )
-        .with_catchpoint_peers(
-            algod_url,
-            algod_token,
-            catchpoint_peer_urls,
-            download_config,
-            ledger_download_retry_attempts,
         )
         .with_worst_case_round_time(worst_case_round_time(
             policy,
@@ -2307,6 +2298,16 @@ mod tests {
         assert_eq!(policy, copied2);
     }
 
+    fn test_catchpoint_source() -> RankedCatchpointSource {
+        ranked_catchpoint_source(
+            "http://localhost:4001",
+            "",
+            &[],
+            algo_rest_client::CatchpointDownloadConfig::default(),
+            RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
+        )
+    }
+
     // -- GossipSyncBackend construction tests ----------------------------
 
     #[tokio::test]
@@ -2323,7 +2324,7 @@ mod tests {
             "",
             BlockSourcePolicy::GossipFirst,
             4,
-            algo_rest_client::CatchpointDownloadConfig::default(),
+            test_catchpoint_source(),
             None,
         );
 
@@ -2344,7 +2345,7 @@ mod tests {
             "",
             BlockSourcePolicy::GossipFirst,
             4,
-            algo_rest_client::CatchpointDownloadConfig::default(),
+            test_catchpoint_source(),
             None,
         );
 
@@ -2368,7 +2369,7 @@ mod tests {
             "",
             BlockSourcePolicy::GossipFirst,
             4,
-            algo_rest_client::CatchpointDownloadConfig::default(),
+            test_catchpoint_source(),
             None,
         );
 
@@ -2389,7 +2390,7 @@ mod tests {
             "",
             BlockSourcePolicy::HttpOnly,
             4,
-            algo_rest_client::CatchpointDownloadConfig::default(),
+            test_catchpoint_source(),
             None,
         );
 
@@ -2410,7 +2411,7 @@ mod tests {
             "",
             BlockSourcePolicy::GossipOnly,
             4,
-            algo_rest_client::CatchpointDownloadConfig::default(),
+            test_catchpoint_source(),
             None,
         );
 
@@ -2434,7 +2435,7 @@ mod tests {
             "",
             BlockSourcePolicy::GossipFirst,
             4,
-            algo_rest_client::CatchpointDownloadConfig::default(),
+            test_catchpoint_source(),
             None,
         );
 
@@ -2461,7 +2462,7 @@ mod tests {
             "",
             BlockSourcePolicy::HttpOnly,
             4,
-            algo_rest_client::CatchpointDownloadConfig::default(),
+            test_catchpoint_source(),
             None,
         );
 
@@ -2596,6 +2597,140 @@ mod tests {
             panic!("expected gossip backend");
         };
         assert_eq!(b.catchpoint_source.peer_count(), 3);
+    }
+
+    fn fast_download_config() -> algo_rest_client::CatchpointDownloadConfig {
+        algo_rest_client::CatchpointDownloadConfig {
+            timeout: std::time::Duration::from_secs(5),
+            connect_timeout: std::time::Duration::from_secs(5),
+            chunk_size: 16,
+            max_retries: 0,
+            retry_delay: std::time::Duration::from_millis(1),
+            min_bytes_per_second: 0,
+        }
+    }
+
+    fn gossip_backend_for(
+        algod_url: &str,
+        peers: &[String],
+        retry_attempts: usize,
+    ) -> GossipSyncBackend {
+        let backend = build_catchpoint_backend(
+            true,
+            algod_url,
+            "",
+            "test-v1.0",
+            vec![],
+            peers,
+            4,
+            fast_download_config(),
+            retry_attempts,
+            std::time::Duration::from_secs(4),
+            std::time::Duration::from_secs(4),
+        )
+        .expect("gossip backend construction should succeed");
+        let CatchpointBackend::Gossip(b) = backend else {
+            panic!("expected gossip backend");
+        };
+        b
+    }
+
+    /// Issue #2076 (voimain shape): the REST gateway answers `HEAD` with 204
+    /// but `GET` with 404, only the `--catchpoint-peer-url` relay serves the
+    /// file. A `--gossip` download must fall back to the relay.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gossip_download_falls_back_to_extra_catchpoint_peer() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let gateway = MockServer::start().await;
+        let relay = MockServer::start().await;
+        let ledger_path = || path_regex(r"^/v1/test-v1\.0/ledger/.+$");
+        for (server, get_status) in [(&gateway, 404u16), (&relay, 200u16)] {
+            Mock::given(method("HEAD"))
+                .and(ledger_path())
+                .respond_with(ResponseTemplate::new(204))
+                .mount(server)
+                .await;
+            let mut get = ResponseTemplate::new(get_status);
+            if get_status == 200 {
+                get = get
+                    .insert_header("Content-Type", "application/x-algorand-ledger-v2.1")
+                    .set_body_bytes(b"catchpoint-file-bytes-0123456789".to_vec());
+            }
+            Mock::given(method("GET"))
+                .and(ledger_path())
+                .respond_with(get)
+                .mount(server)
+                .await;
+        }
+
+        let backend = gossip_backend_for(
+            &gateway.uri(),
+            &[relay.uri()],
+            algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
+        );
+        let dest = std::env::temp_dir().join(format!(
+            "algod-rust-gossip-catchpoint-fallback-{}/catchpoint.tar.gz",
+            std::process::id()
+        ));
+        backend
+            .download_catchpoint("test-v1.0", 1, &dest)
+            .expect("download should fall back to the relay peer");
+        assert_eq!(
+            std::fs::read(&dest).expect("downloaded file"),
+            b"catchpoint-file-bytes-0123456789"
+        );
+        let _ = std::fs::remove_dir_all(dest.parent().expect("parent"));
+    }
+
+    /// The configured ledger-download retry budget reaches the gossip
+    /// backend's ranked source: a permanently-404 sole candidate is probed
+    /// exactly that many times.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gossip_backend_honors_ledger_download_retry_attempts() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let missing = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&missing)
+            .await;
+        let backend = gossip_backend_for(&missing.uri(), &[], 3);
+        let dest = std::env::temp_dir().join(format!(
+            "algod-rust-gossip-catchpoint-retry-{}.tar.gz",
+            std::process::id()
+        ));
+        assert!(backend.download_catchpoint("test-v1.0", 1, &dest).is_err());
+        let probes = missing
+            .received_requests()
+            .await
+            .expect("request recording")
+            .len();
+        assert_eq!(probes, 3, "probe budget must equal the configured attempts");
+    }
+
+    /// Gossip-mode `discover_catchpoint` uses the same shared fallback
+    /// logic as the REST backend (peer `/v2/status`, then the preset's
+    /// static index), so the two modes cannot diverge (issue #2076).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gossip_backend_discovers_catchpoint_from_status() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let label = format!("999#{}", data_encoding::BASE32_NOPAD.encode(&[1u8; 32]));
+        Mock::given(method("GET"))
+            .and(path("/v2/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "last-round": 999,
+                "last-catchpoint": label,
+            })))
+            .mount(&server)
+            .await;
+        let backend = gossip_backend_for(&server.uri(), &[], 3);
+        assert_eq!(backend.discover_catchpoint().unwrap(), Some(label));
     }
 
     #[tokio::test]
