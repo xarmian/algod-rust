@@ -996,6 +996,18 @@ impl SyncOrchestrator {
         self.backend
             .download_catchpoint(genesis_id, round, &file_path)?;
 
+        // Issue #2084: fail fast on a file whose own header label differs
+        // from the requested one (see `check_label_matches_requested`,
+        // #2082) instead of paying the import-phase setup first. The
+        // rejected file is deleted so a rerun re-downloads. An unreadable
+        // header is left for the import phase to report as before.
+        if let Ok(header) = self.extract_header(&file_path) {
+            if let Err(e) = self.check_label_matches_requested(&header.catchpoint, "file label") {
+                let _ = std::fs::remove_file(&file_path);
+                return Err(e);
+            }
+        }
+
         self.catchpoint_file_path = Some(file_path.clone());
         self.progress.phase_progress = 1.0;
         self.notify_progress();
@@ -5652,13 +5664,22 @@ mod tests {
                 source_file: catchpoint_path,
             },
         );
-        orchestrator.run_download_ledger().unwrap();
-        let err = orchestrator.run_import_ledger().unwrap_err().to_string();
+        // Issue #2084: rejected already in the download phase, before import,
+        // and the rejected file is removed.
+        let err = orchestrator.run_download_ledger().unwrap_err().to_string();
         assert!(err.contains("catchpoint hash mismatch"), "{err}");
         assert!(
             err.contains(&requested) && err.contains(&export_result.label),
             "{err}"
         );
+        assert!(orchestrator.catchpoint_file_path.is_none());
+        assert!(!dir
+            .path()
+            .join(format!("catchpoint-{round}.tar.gz"))
+            .exists());
+        // The import-phase check remains as defence in depth.
+        let err = orchestrator.run_import_ledger().unwrap_err().to_string();
+        assert!(err.contains("no catchpoint file path"), "{err}");
         assert!(orchestrator.cutover_backup.is_none());
         // Rejected before touching the ledger: no imported state at all.
         let conn = orchestrator.open_db().unwrap();
