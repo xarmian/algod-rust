@@ -176,7 +176,6 @@ pub trait SyncBackend: Send + Sync {
         }
         BatchFetch::complete(blocks)
     }
-
 }
 
 /// Derived views over [`SyncBackend`]. A separate trait with a blanket impl,
@@ -1022,6 +1021,20 @@ impl SyncOrchestrator {
         Ok(())
     }
 
+    /// Fail with go-algorand's `catchpoint hash mismatch` error when `actual`
+    /// (the label recomputed from, or declared by, the downloaded file)
+    /// differs from the label this sync was asked for (issue #2082).
+    fn check_label_matches_requested(&self, actual: &str) -> Result<(), AlgoError> {
+        match self.resolved_label.as_deref() {
+            Some(requested) if requested != actual => Err(AlgoError::Ledger {
+                message: format!(
+                    "catchpoint hash mismatch; expected {requested}, calculated {actual}"
+                ),
+            }),
+            _ => Ok(()),
+        }
+    }
+
     /// Phase 2: Import the downloaded ledger into the local SQLite database.
     ///
     /// Uses `import_catchpoint_file` from Epic 26b which handles staging
@@ -1049,6 +1062,13 @@ impl SyncOrchestrator {
 
         // Extract header to get block_header_digest and rewards_level.
         let header = self.extract_header(&file_path)?;
+
+        // go-algorand's `SetLabel` stores the REQUESTED label and
+        // `VerifyCatchpoint` fails with `catchpoint hash mismatch` unless
+        // the file hashes to exactly that label. The file's own header label
+        // is attacker-controlled, so it must equal the requested one
+        // (issue #2082). Reject before touching the ledger database.
+        self.check_label_matches_requested(&header.catchpoint)?;
 
         // Store the account-snapshot round for post-import validation
         // (issue #1056) — this is what acctrounds('acctbase') gets stamped
@@ -1301,6 +1321,14 @@ impl SyncOrchestrator {
                     verify_result.expected_label, verify_result.computed_label
                 ),
             });
+        }
+
+        // The recomputed label must also equal the REQUESTED label, not just
+        // the file's self-declared one (issue #2082; covers the resume path
+        // where import ran in a previous process).
+        if let Err(e) = self.check_label_matches_requested(&verify_result.computed_label) {
+            self.rollback_cutover_on_failure(&conn, "catchpoint hash mismatch");
+            return Err(e);
         }
 
         // Verification passed: the cutover the import phase performed is
@@ -4548,12 +4576,11 @@ mod tests {
     fn batch_fetch_cancelled_names_the_range_and_keeps_the_prefix() {
         let f = BatchFetch::cancelled(vec![(5, Block::default())], 5, 9);
         assert_eq!(f.blocks.len(), 1);
-        assert!(
-            f.error
-                .unwrap()
-                .to_string()
-                .contains("block fetch for rounds 5..=9 cancelled")
-        );
+        assert!(f
+            .error
+            .unwrap()
+            .to_string()
+            .contains("block fetch for rounds 5..=9 cancelled"));
     }
 
     #[test]
@@ -5541,6 +5568,63 @@ mod tests {
         assert_eq!(data, vec![0xBB]);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #2082: a served file whose header label is internally
+    /// consistent but differs from the REQUESTED label must be rejected
+    /// (go: `catchpoint hash mismatch`) before any ledger state is touched.
+    #[test]
+    fn import_rejects_file_whose_label_differs_from_requested_label() {
+        use crate::catchpoint::writer::{export_catchpoint_file, ExportOptions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = Connection::open_in_memory().unwrap();
+        src.execute_batch(
+            "CREATE TABLE accountbase (addrid INTEGER PRIMARY KEY NOT NULL, address BLOB NOT NULL, data BLOB, normalizedonlinebalance INTEGER);
+            CREATE TABLE resources (addrid INTEGER NOT NULL, aidx INTEGER NOT NULL, data BLOB NOT NULL, ctype INTEGER NOT NULL DEFAULT -1, PRIMARY KEY (addrid, aidx)) WITHOUT ROWID;
+            CREATE TABLE kvstore (key BLOB PRIMARY KEY, value BLOB);
+            CREATE TABLE onlineaccounts (address BLOB NOT NULL, updround INTEGER NOT NULL, normalizedonlinebalance INTEGER NOT NULL, votelastvalid INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY (address, updround));
+            CREATE TABLE onlineroundparamstail (rnd INTEGER PRIMARY KEY NOT NULL, data BLOB NOT NULL);
+            CREATE TABLE stateproofverification (lastattestedround INTEGER PRIMARY KEY NOT NULL, verificationcontext BLOB NOT NULL);
+            CREATE TABLE accounttotals (id TEXT PRIMARY KEY, online INTEGER, onlinerewardunits INTEGER, offline INTEGER, offlinerewardunits INTEGER, notparticipating INTEGER, notparticipatingrewardunits INTEGER, rewardslevel INTEGER);
+            INSERT INTO accounttotals VALUES('', 0, 0, 0, 0, 0, 0, 0);",
+        )
+        .unwrap();
+        let catchpoint_path = dir.path().join("source-catchpoint.tar.gz");
+        let export_result = export_catchpoint_file(
+            &src,
+            &catchpoint_path,
+            &ExportOptions {
+                balances_round: 500,
+                blocks_round: 500,
+                block_header_digest: [7u8; 32],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Same round, different (still well-formed) hash part.
+        let (round, hash) = export_result.label.split_once('#').unwrap();
+        let first = if hash.starts_with('A') { 'B' } else { 'A' };
+        let requested = format!("{round}#{first}{}", &hash[1..]);
+        assert_ne!(requested, export_result.label);
+
+        let mut config = test_config(dir.path().join("ledger"), 1);
+        config.catchpoint_label = Some(requested.clone());
+        let mut orchestrator = SyncOrchestrator::with_backend(
+            config,
+            FakeFileCopyBackend {
+                source_file: catchpoint_path,
+            },
+        );
+        orchestrator.run_download_ledger().unwrap();
+        let err = orchestrator.run_import_ledger().unwrap_err().to_string();
+        assert!(err.contains("catchpoint hash mismatch"), "{err}");
+        assert!(
+            err.contains(&requested) && err.contains(&export_result.label),
+            "{err}"
+        );
+        assert!(orchestrator.cutover_backup.is_none());
     }
 
     #[test]
