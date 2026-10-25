@@ -1021,17 +1021,41 @@ impl SyncOrchestrator {
         Ok(())
     }
 
+    /// The label this sync was asked for: an explicit config label wins over
+    /// a persisted/discovered one so a resume can never silently adopt a
+    /// different label than the operator requested. Fails closed when no
+    /// requested label is known (issue #2082).
+    fn requested_label(&self) -> Result<&str, AlgoError> {
+        self.config
+            .catchpoint_label
+            .as_deref()
+            .or(self.resolved_label.as_deref())
+            .ok_or_else(|| AlgoError::Ledger {
+                message: "no requested catchpoint label is known; refusing to accept a \
+                          catchpoint file without one"
+                    .to_string(),
+            })
+    }
+
     /// Fail with go-algorand's `catchpoint hash mismatch` error when `actual`
-    /// (the label recomputed from, or declared by, the downloaded file)
-    /// differs from the label this sync was asked for (issue #2082).
-    fn check_label_matches_requested(&self, actual: &str) -> Result<(), AlgoError> {
-        match self.resolved_label.as_deref() {
-            Some(requested) if requested != actual => Err(AlgoError::Ledger {
-                message: format!(
-                    "catchpoint hash mismatch; expected {requested}, calculated {actual}"
-                ),
-            }),
-            _ => Ok(()),
+    /// (the label declared by, or recomputed from, the downloaded file;
+    /// `what` names which) differs from the requested label (issue #2082).
+    /// Labels are compared as parsed `(round, hash)`, not as strings.
+    fn check_label_matches_requested(&self, actual: &str, what: &str) -> Result<(), AlgoError> {
+        let requested = self.requested_label()?;
+        let same = match (
+            parse_catchpoint_label(requested.trim()),
+            parse_catchpoint_label(actual.trim()),
+        ) {
+            (Ok(r), Ok(a)) => r.round == a.round && r.hash == a.hash,
+            _ => false,
+        };
+        if same {
+            Ok(())
+        } else {
+            Err(AlgoError::Ledger {
+                message: format!("catchpoint hash mismatch; expected {requested}, {what} {actual}"),
+            })
         }
     }
 
@@ -1068,7 +1092,7 @@ impl SyncOrchestrator {
         // the file hashes to exactly that label. The file's own header label
         // is attacker-controlled, so it must equal the requested one
         // (issue #2082). Reject before touching the ledger database.
-        self.check_label_matches_requested(&header.catchpoint)?;
+        self.check_label_matches_requested(&header.catchpoint, "file label")?;
 
         // Store the account-snapshot round for post-import validation
         // (issue #1056) — this is what acctrounds('acctbase') gets stamped
@@ -1326,8 +1350,18 @@ impl SyncOrchestrator {
         // The recomputed label must also equal the REQUESTED label, not just
         // the file's self-declared one (issue #2082; covers the resume path
         // where import ran in a previous process).
-        if let Err(e) = self.check_label_matches_requested(&verify_result.computed_label) {
+        if let Err(e) =
+            self.check_label_matches_requested(&verify_result.computed_label, "calculated")
+        {
+            let had_backup = self.cutover_backup.is_some();
             self.rollback_cutover_on_failure(&conn, "catchpoint hash mismatch");
+            if !had_backup {
+                // Resumed from a prior process: nothing to roll back, so the
+                // imported data is still live. Drop the resume marker so a
+                // rerun re-downloads instead of re-verifying (and being
+                // resumed past) the rejected snapshot.
+                let _ = clear_sync_state(&conn);
+            }
             return Err(e);
         }
 
@@ -5626,6 +5660,99 @@ mod tests {
             "{err}"
         );
         assert!(orchestrator.cutover_backup.is_none());
+        // Rejected before touching the ledger: no imported state at all.
+        let conn = orchestrator.open_db().unwrap();
+        let n = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
+        assert_eq!(n("SELECT count(*) FROM accountbase"), 0);
+        assert_eq!(
+            n("SELECT count(*) FROM catchpointstate WHERE id = 'catchpointCatchupLabel'"),
+            0
+        );
+    }
+
+    /// Issue #2082: with no requested label known the check fails closed,
+    /// and with one known it compares parsed values (whitespace-tolerant).
+    #[test]
+    fn label_check_fails_closed_and_compares_parsed_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut o = SyncOrchestrator::with_backend(
+            test_config(dir.path().join("ledger"), 1),
+            FakeFileCopyBackend {
+                source_file: dir.path().join("none"),
+            },
+        );
+        let label = format!("500#{}", "A".repeat(52));
+        let err = o.check_label_matches_requested(&label, "file label");
+        assert!(err.unwrap_err().to_string().contains("no requested"));
+        o.resolved_label = Some(format!(" {label} "));
+        o.check_label_matches_requested(&label, "file label")
+            .unwrap();
+        let other = format!("500#B{}", "A".repeat(51));
+        let e = o.check_label_matches_requested(&other, "file label");
+        assert!(e
+            .unwrap_err()
+            .to_string()
+            .contains("catchpoint hash mismatch"));
+    }
+
+    /// Issue #2082: a cross-process resume at the verify phase (no in-memory
+    /// cutover backup) whose requested label differs from the verified file
+    /// must fail and drop the resume marker.
+    #[test]
+    fn resumed_verify_rejects_requested_label_mismatch_and_clears_marker() {
+        use crate::catchpoint::writer::{export_catchpoint_file, ExportOptions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = Connection::open_in_memory().unwrap();
+        src.execute_batch(
+            "CREATE TABLE accountbase (addrid INTEGER PRIMARY KEY NOT NULL, address BLOB NOT NULL, data BLOB, normalizedonlinebalance INTEGER);
+            CREATE TABLE resources (addrid INTEGER NOT NULL, aidx INTEGER NOT NULL, data BLOB NOT NULL, ctype INTEGER NOT NULL DEFAULT -1, PRIMARY KEY (addrid, aidx)) WITHOUT ROWID;
+            CREATE TABLE kvstore (key BLOB PRIMARY KEY, value BLOB);
+            CREATE TABLE onlineaccounts (address BLOB NOT NULL, updround INTEGER NOT NULL, normalizedonlinebalance INTEGER NOT NULL, votelastvalid INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY (address, updround));
+            CREATE TABLE onlineroundparamstail (rnd INTEGER PRIMARY KEY NOT NULL, data BLOB NOT NULL);
+            CREATE TABLE stateproofverification (lastattestedround INTEGER PRIMARY KEY NOT NULL, verificationcontext BLOB NOT NULL);
+            CREATE TABLE accounttotals (id TEXT PRIMARY KEY, online INTEGER, onlinerewardunits INTEGER, offline INTEGER, offlinerewardunits INTEGER, notparticipating INTEGER, notparticipatingrewardunits INTEGER, rewardslevel INTEGER);
+            INSERT INTO accounttotals VALUES('', 0, 0, 0, 0, 0, 0, 0);",
+        )
+        .unwrap();
+        let path = dir.path().join("source-catchpoint.tar.gz");
+        let exported = export_catchpoint_file(
+            &src,
+            &path,
+            &ExportOptions {
+                balances_round: 500,
+                blocks_round: 500,
+                block_header_digest: [7u8; 32],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut config = test_config(dir.path().join("ledger"), 1);
+        config.catchpoint_label = Some(exported.label.clone());
+        let mut o =
+            SyncOrchestrator::with_backend(config, FakeFileCopyBackend { source_file: path });
+        o.run_download_ledger().unwrap();
+        o.run_import_ledger().unwrap();
+        // Simulate a new process: no in-memory backup, a different requested label.
+        o.cutover_backup = None;
+        let (round, hash) = exported.label.split_once('#').unwrap();
+        let first = if hash.starts_with('A') { 'B' } else { 'A' };
+        o.config.catchpoint_label = Some(format!("{round}#{first}{}", &hash[1..]));
+        let conn = o.open_db().unwrap();
+        persist_sync_state(
+            &conn,
+            &SyncState::ImportingLedger,
+            Some(&exported.label),
+            Some(500),
+            None,
+        )
+        .unwrap();
+        let err = o.run_verify_ledger().unwrap_err().to_string();
+        assert!(
+            err.contains("catchpoint hash mismatch") && err.contains("calculated"),
+            "{err}"
+        );
+        assert!(restore_sync_state(&conn).unwrap().is_none());
     }
 
     #[test]
