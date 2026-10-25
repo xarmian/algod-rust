@@ -4576,11 +4576,12 @@ mod tests {
     fn batch_fetch_cancelled_names_the_range_and_keeps_the_prefix() {
         let f = BatchFetch::cancelled(vec![(5, Block::default())], 5, 9);
         assert_eq!(f.blocks.len(), 1);
-        assert!(f
-            .error
-            .unwrap()
-            .to_string()
-            .contains("block fetch for rounds 5..=9 cancelled"));
+        assert!(
+            f.error
+                .unwrap()
+                .to_string()
+                .contains("block fetch for rounds 5..=9 cancelled")
+        );
     }
 
     #[test]
