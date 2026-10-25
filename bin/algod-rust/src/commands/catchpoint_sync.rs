@@ -28,8 +28,8 @@ use algo_error::AlgoError;
 use algo_ledger::sync::{BatchFetch, SyncBackend, SyncConfig, SyncOrchestrator};
 use algo_network::GossipNode;
 use algo_rest_client::{
-    AlgodClient, BlockSource, CatchpointDownloader, GossipBlockSource, HttpBlockFetcher,
-    HttpPeerTransport, ParallelBlockFetcher, RankedCatchpointSource, DEFAULT_DRAIN_TIMEOUT,
+    AlgodClient, BlockSource, GossipBlockSource, HttpBlockFetcher, HttpPeerTransport,
+    ParallelBlockFetcher, RankedCatchpointSource, DEFAULT_DRAIN_TIMEOUT,
 };
 use algo_types::{Block, Round};
 use tokio_util::sync::CancellationToken;
@@ -756,8 +756,10 @@ pub struct GossipSyncBackend {
     /// REST client for operations that are inherently HTTP-only
     /// (catchpoint download, catchpoint discovery, status queries).
     rest_client: AlgodClient,
-    /// Catchpoint downloader for `download_catchpoint`.
-    downloader: CatchpointDownloader,
+    /// Ranked catchpoint source for `download_catchpoint` (issue #2076):
+    /// `algod_url` plus any `--catchpoint-peer-url` peers, as in
+    /// [`AlgodSyncBackend`].
+    catchpoint_source: RankedCatchpointSource,
     /// Tokio runtime handle for running async operations from sync context.
     rt: tokio::runtime::Handle,
     /// Source selection policy.
@@ -779,6 +781,30 @@ impl GossipSyncBackend {
     #[must_use]
     pub fn with_worst_case_round_time(mut self, worst_case: std::time::Duration) -> Self {
         self.worst_case_round_time = worst_case;
+        self
+    }
+
+    /// Rank `extra_catchpoint_peer_urls` alongside `algod_url` for the
+    /// catchpoint-file download (issue #2076) and apply the configured
+    /// ledger-download retry attempts. Needed where the REST gateway cannot
+    /// serve catchpoint files (e.g. voimain) and only a relay can.
+    #[must_use]
+    pub fn with_catchpoint_peers(
+        mut self,
+        algod_url: &str,
+        algod_token: &str,
+        extra_catchpoint_peer_urls: &[String],
+        download_config: algo_rest_client::CatchpointDownloadConfig,
+        ledger_download_retry_attempts: usize,
+    ) -> Self {
+        let mut peers = vec![(algod_url.to_string(), algod_token.to_string())];
+        peers.extend(
+            extra_catchpoint_peer_urls
+                .iter()
+                .map(|u| (u.clone(), algod_token.to_string())),
+        );
+        self.catchpoint_source = RankedCatchpointSource::new(&peers, download_config)
+            .with_ledger_download_retry_attempts(ledger_download_retry_attempts);
         self
     }
 
@@ -812,13 +838,16 @@ impl GossipSyncBackend {
         network: Option<&str>,
     ) -> Self {
         let rest_client = AlgodClient::new(algod_url, algod_token);
-        let downloader = CatchpointDownloader::with_config(algod_url, algod_token, download_config);
+        let catchpoint_source = RankedCatchpointSource::new(
+            &[(algod_url.to_string(), algod_token.to_string())],
+            download_config,
+        );
         let rt = tokio::runtime::Handle::current();
         Self {
             gossip,
             http_fetcher,
             rest_client,
-            downloader,
+            catchpoint_source,
             rt,
             policy,
             concurrency,
@@ -905,16 +934,18 @@ impl SyncBackend for GossipSyncBackend {
         round: u64,
         dest_path: &std::path::Path,
     ) -> Result<(), AlgoError> {
-        // Catchpoint download is always via REST.
+        // Catchpoint download is always via REST/HTTP, ranked across peers.
         tokio::task::block_in_place(|| {
             self.rt.block_on(async {
-                self.downloader
-                    .download::<fn(algo_rest_client::DownloadProgress)>(
-                        genesis_id, round, dest_path, None,
-                    )
+                self.catchpoint_source
+                    .download(genesis_id, round, dest_path, None)
                     .await
             })
         })
+    }
+
+    fn rank_last_catchpoint_peer_down(&self) {
+        self.catchpoint_source.rank_last_peer_down();
     }
 
     fn fetch_block_raw(&self, round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
@@ -1056,6 +1087,13 @@ impl SyncBackend for CatchpointBackend {
         }
     }
 
+    fn rank_last_catchpoint_peer_down(&self) {
+        match self {
+            Self::Rest(b) => b.rank_last_catchpoint_peer_down(),
+            Self::Gossip(b) => b.rank_last_catchpoint_peer_down(),
+        }
+    }
+
     fn fetch_block_raw(&self, round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
         match self {
             Self::Rest(b) => b.fetch_block_raw(round),
@@ -1179,8 +1217,15 @@ fn build_catchpoint_backend(
             algod_token,
             policy,
             concurrency,
-            download_config,
+            download_config.clone(),
             network_name_for_genesis_id(genesis_id),
+        )
+        .with_catchpoint_peers(
+            algod_url,
+            algod_token,
+            catchpoint_peer_urls,
+            download_config,
+            ledger_download_retry_attempts,
         )
         .with_worst_case_round_time(worst_case_round_time(
             policy,
@@ -2524,6 +2569,33 @@ mod tests {
             matches!(backend, CatchpointBackend::Gossip(_)),
             "--gossip must route block fetch through CatchpointBackend::Gossip, not REST-only"
         );
+    }
+
+    /// Issue #2076: `--gossip` must rank `--catchpoint-peer-url` peers for the
+    /// catchpoint download exactly like the non-gossip backend does.
+    #[tokio::test]
+    async fn gossip_backend_ranks_extra_catchpoint_peer_urls() {
+        let backend = build_catchpoint_backend(
+            true,
+            "http://localhost:19999",
+            "",
+            "test-genesis-v1.0",
+            vec![],
+            &[
+                "http://relay-a:5011".to_string(),
+                "http://relay-b:5011".to_string(),
+            ],
+            4,
+            algo_rest_client::CatchpointDownloadConfig::default(),
+            algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
+            std::time::Duration::from_secs(4),
+            std::time::Duration::from_secs(4),
+        )
+        .expect("gossip backend construction should succeed");
+        let CatchpointBackend::Gossip(b) = backend else {
+            panic!("expected gossip backend");
+        };
+        assert_eq!(b.catchpoint_source.peer_count(), 3);
     }
 
     #[tokio::test]
