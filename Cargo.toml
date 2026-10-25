@@ -164,7 +164,7 @@ zstd = "0.14"
 # Networking (WebSocket)
 tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
 futures-util = "0.3"
-parking_lot = "0.12"
+parking_lot = "0.13"
 rand = "0.10"
 zeroize = "1"
 http = "1"
