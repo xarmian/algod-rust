@@ -1168,7 +1168,15 @@ impl SyncOrchestrator {
 
         // Initialize chain metadata from catchpoint, following the same
         // pattern as the standalone catchpoint import command.
-        let protocol = extract_protocol_from_db(&conn);
+        // The tail row of a pre-V8 file has no protocol yet (its header is not
+        // in the DB until the lookback download); the block fetched early for
+        // the catchpoint round carries it.
+        let mut protocol = extract_protocol_from_db(&conn);
+        if protocol.is_empty() {
+            if let Some(cached) = self.cached_catchpoint_block.as_ref() {
+                protocol = cached.0.clone();
+            }
+        }
         let txn_counter = derive_txn_counter(&conn);
 
         crate::sqlite::initialize_meta_from_catchpoint(
@@ -1377,6 +1385,18 @@ impl SyncOrchestrator {
             return Err(e);
         }
 
+        // go-algorand's post-restore DB migration also tidies StateProofIDs
+        // left on accounts without a SelectionID (#2088). Like go it follows
+        // (never precedes) the label check, and it runs BEFORE the pre-cutover
+        // backup is dropped below so a failure rolls the whole cutover back
+        // (the step itself is one transaction and re-runnable on resume).
+        if let Err(e) = crate::catchpoint::importer::finish_pre_v8_catchpoint_migration(&conn) {
+            self.rollback_cutover_on_failure(&conn, "post-verification migration failed");
+            return Err(AlgoError::Ledger {
+                message: format!("post-verification catchpoint migration failed: {e}"),
+            });
+        }
+
         // Verification passed: the cutover the import phase performed is
         // now committed. Finalize it (drop the preserved pre-cutover backup
         // tables) rather than leaving them around indefinitely — issue
@@ -1394,15 +1414,6 @@ impl SyncOrchestrator {
                 tracing::warn!(error = %e, "failed to finalize catchpoint cutover backup cleanup");
             }
         }
-
-        // go-algorand's post-restore DB migration also tidies StateProofIDs
-        // left on accounts without a SelectionID; that must follow (never
-        // precede) the label check above (#2088).
-        crate::catchpoint::importer::finish_pre_v8_catchpoint_migration(&conn).map_err(|e| {
-            AlgoError::Ledger {
-                message: format!("post-verification catchpoint migration failed: {e}"),
-            }
-        })?;
 
         tracing::info!(
             label = %verify_result.computed_label,
@@ -1825,6 +1836,13 @@ impl SyncOrchestrator {
         })?;
 
         tracing::info!(blocks_downloaded, "lookback blocks downloaded");
+        // Complete the pre-V8 `onlineroundparamstail` row's protocol now that
+        // the balances round's header is stored.
+        crate::catchpoint::importer::fill_pre_v8_tail_protocol(&conn).map_err(|e| {
+            AlgoError::Ledger {
+                message: format!("fill online round params protocol: {e}"),
+            }
+        })?;
         // Should already equal `blocks_downloaded` from the incremental
         // counting above; re-assert it as the authoritative final value.
         self.progress.catchpoint_acquired_blocks = blocks_downloaded;
@@ -4631,12 +4649,11 @@ mod tests {
     fn batch_fetch_cancelled_names_the_range_and_keeps_the_prefix() {
         let f = BatchFetch::cancelled(vec![(5, Block::default())], 5, 9);
         assert_eq!(f.blocks.len(), 1);
-        assert!(
-            f.error
-                .unwrap()
-                .to_string()
-                .contains("block fetch for rounds 5..=9 cancelled")
-        );
+        assert!(f
+            .error
+            .unwrap()
+            .to_string()
+            .contains("block fetch for rounds 5..=9 cancelled"));
     }
 
     #[test]

@@ -52,7 +52,6 @@ use super::types::{
     RESOURCE_FLAGS_OWNERSHIP,
 };
 use super::types::{CATCHPOINT_FILE_VERSION_V5, CATCHPOINT_FILE_VERSION_V7};
-use super::verify::{encode_mixed_map, encode_msgpack_uint};
 use crate::rewards::normalized_online_balance;
 
 // ---------------------------------------------------------------------------
@@ -1334,7 +1333,17 @@ fn migrate_online_tables_from_balances(
         "INSERT OR REPLACE INTO onlineroundparamstail(rnd, data) VALUES(?1, ?2)",
         rusqlite::params![
             header.balances_round as i64,
-            encode_mixed_map(&[("online", encode_msgpack_uint(header.totals.online.money))]),
+            algo_codec::canonical_encode_online_round_params_data(
+                &algo_codec::OnlineRoundParamsData {
+                    online_supply: header.totals.online.money,
+                    rewards_level: header.totals.rewards_level,
+                    // go reads `CurrentProtocol` from the block header at this
+                    // round; the header is not in the DB yet, so it is filled in
+                    // by `fill_pre_v8_tail_protocol` right after the lookback
+                    // block download.
+                    current_protocol: String::new(),
+                }
+            ),
         ],
     )?;
 
@@ -1369,21 +1378,7 @@ fn migrate_online_tables_from_balances(
             }
             None => 0,
         };
-        let acct = algo_types::AccountData {
-            status: AccountStatus::Online,
-            micro_algos: ba.micro_algos,
-            rewards_base: ba.rewards_base,
-            vote_id: Some(ba.vote_id),
-            selection_id: Some(ba.selection_id),
-            vote_first_valid: ba.vote_first_valid,
-            vote_last_valid: ba.vote_last_valid,
-            vote_key_dilution: ba.vote_key_dilution,
-            state_proof_id: Some(ba.state_proof_id),
-            last_proposed: ba.last_proposed,
-            last_heartbeat: ba.last_heartbeat,
-            incentive_eligible: ba.incentive_eligible,
-            ..Default::default()
-        };
+        let acct = algo_types::AccountData::from(&ba);
         let inserted = insert.execute(rusqlite::params![
             address,
             ba.update_round as i64,
@@ -1406,6 +1401,27 @@ fn migrate_online_tables_from_balances(
     Ok(())
 }
 
+/// `catchpointstate.intval` for `key`; `None` when the table or row is absent
+/// (a ledger that never went through a catchpoint restore).
+fn catchpoint_state_int(conn: &Connection, key: &str) -> Result<Option<i64>, CatchpointError> {
+    let has_table: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'catchpointstate'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_table {
+        return Ok(None);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT intval FROM catchpointstate WHERE id = ?1",
+            rusqlite::params![key],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten())
+}
+
 /// The remainder of go's post-restore migration, run only AFTER the catchpoint
 /// label verified (go verifies the file contents first and migrates after):
 /// accounts with an empty `SelectionID` but a non-empty `StateProofID` (an old
@@ -1413,23 +1429,37 @@ fn migrate_online_tables_from_balances(
 /// removed from their `accountbase` blob, and `accounthashes` is rehashed
 /// (`performOnlineAccountsTableMigration`'s `acctRehash` stage, which go also
 /// skips when `accounthashes` is empty). The file's version comes from
-/// `catchpointstate`; V8 files and plain databases are untouched. Returns the
-/// number of tidied accounts.
+/// `catchpointstate`; V8 files and plain databases are untouched.
+///
+/// Everything happens in ONE transaction (go runs the whole migration in one
+/// `tx`), so a crash or error leaves `accountbase` and `accounthashes`
+/// consistent; the step is re-runnable (a finished migration finds no
+/// candidates). The sync driver runs it after verification but BEFORE the
+/// pre-cutover backup is dropped, so a failure still rolls the cutover back.
+/// Returns the number of tidied accounts.
 pub fn finish_pre_v8_catchpoint_migration(conn: &Connection) -> Result<u64, CatchpointError> {
     use super::state_keys;
-    let version: Option<i64> = conn
-        .query_row(
-            "SELECT intval FROM catchpointstate WHERE id = ?1",
-            rusqlite::params![state_keys::CATCHUP_VERSION],
-            |r| r.get(0),
-        )
-        .optional()?
-        .flatten();
+    let version = catchpoint_state_int(conn, state_keys::CATCHUP_VERSION)?;
     match version {
         Some(v) if v >= 0 && is_pre_v8_catchpoint_version(v as u64) => {}
         _ => return Ok(0),
     }
 
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = tidy_state_proof_ids(conn);
+    match result {
+        Ok(n) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(n)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+fn tidy_state_proof_ids(conn: &Connection) -> Result<u64, CatchpointError> {
     let mut fixes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     {
         let mut select = conn.prepare("SELECT address, data FROM accountbase")?;
@@ -1439,24 +1469,26 @@ pub fn finish_pre_v8_catchpoint_migration(conn: &Connection) -> Result<u64, Catc
             let data: Vec<u8> = row.get(1)?;
             let ba = decode_base_account_data(&data)?;
             if ba.selection_id == [0u8; 32] && ba.state_proof_id != [0u8; 64] {
-                fixes.push((address, strip_state_proof_id(&data)?));
+                fixes.push((address, strip_state_proof_id(&data, &ba)?));
             }
         }
     }
     if fixes.is_empty() {
         return Ok(0);
     }
-    let mut update = conn.prepare("UPDATE accountbase SET data = ?1 WHERE address = ?2")?;
-    for (address, data) in &fixes {
-        if update.execute(rusqlite::params![data, address])? != 1 {
-            return Err(CatchpointError::ImportError(
-                "number of affected rows is not 1 tidying accountbase".to_string(),
-            ));
+    {
+        let mut update = conn.prepare("UPDATE accountbase SET data = ?1 WHERE address = ?2")?;
+        for (address, data) in &fixes {
+            if update.execute(rusqlite::params![data, address])? != 1 {
+                return Err(CatchpointError::ImportError(
+                    "number of affected rows is not 1 tidying accountbase".to_string(),
+                ));
+            }
         }
     }
     let hashed: i64 = conn.query_row("SELECT COUNT(*) FROM accounthashes", [], |r| r.get(0))?;
     if hashed > 0 {
-        super::verify::rebuild_and_persist_trie(conn)?;
+        super::verify::rebuild_and_persist_trie_in_tx(conn)?;
     }
     tracing::info!(
         accounts = fixes.len(),
@@ -1465,24 +1497,101 @@ pub fn finish_pre_v8_catchpoint_migration(conn: &Connection) -> Result<u64, Catc
     Ok(fixes.len() as u64)
 }
 
-/// Remove the `"F"` (StateProofID) entry from a map-encoded `baseAccountData`.
-fn strip_state_proof_id(raw: &[u8]) -> Result<Vec<u8>, CatchpointError> {
+/// `accountbase` blob without its `StateProofID`: a map-encoded blob (what go
+/// writes) just loses its `"F"` entry, byte-for-byte otherwise; any other
+/// encoding the tolerant decoder accepts (array form) is re-encoded
+/// canonically from the decoded fields.
+fn strip_state_proof_id(
+    raw: &[u8],
+    decoded: &super::types::CatchpointBaseAccountData,
+) -> Result<Vec<u8>, CatchpointError> {
     let mut rd = raw;
-    let value = rmpv::decode::read_value(&mut rd)
-        .map_err(|e| CatchpointError::ImportError(format!("decode accountbase blob: {e}")))?;
-    let rmpv::Value::Map(entries) = value else {
-        return Err(CatchpointError::ImportError(
-            "accountbase blob is not a msgpack map".to_string(),
-        ));
+    if let Ok(rmpv::Value::Map(entries)) = rmpv::decode::read_value(&mut rd) {
+        let kept: Vec<_> = entries
+            .into_iter()
+            .filter(|(k, _)| k.as_str() != Some("F"))
+            .collect();
+        let mut out = Vec::new();
+        rmpv::encode::write_value(&mut out, &rmpv::Value::Map(kept))
+            .map_err(|e| CatchpointError::ImportError(format!("encode accountbase blob: {e}")))?;
+        return Ok(out);
+    }
+    let mut acct = algo_types::AccountData::from(decoded);
+    acct.state_proof_id = None;
+    Ok(algo_codec::canonical_encode_base_account_data(&acct))
+}
+
+/// After the lookback blocks are stored, complete the
+/// `onlineroundparamstail` row `migrate_online_tables_from_balances` wrote
+/// at the balances round with the `CurrentProtocol` from the block header at
+/// that round (go's `performOnlineRoundParamsTailMigration` reads it from
+/// `blockdb`). A no-op for V8 files, a missing row/header, or an already
+/// filled row. Returns whether the row was updated.
+pub fn fill_pre_v8_tail_protocol(conn: &Connection) -> Result<bool, CatchpointError> {
+    use super::state_keys;
+    match catchpoint_state_int(conn, state_keys::CATCHUP_VERSION)? {
+        Some(v) if v >= 0 && is_pre_v8_catchpoint_version(v as u64) => {}
+        _ => return Ok(false),
+    }
+    let Some(rnd) = catchpoint_state_int(conn, state_keys::CATCHUP_BALANCES_ROUND)? else {
+        return Ok(false);
     };
-    let kept: Vec<_> = entries
-        .into_iter()
-        .filter(|(k, _)| k.as_str() != Some("F"))
-        .collect();
-    let mut out = Vec::new();
-    rmpv::encode::write_value(&mut out, &rmpv::Value::Map(kept))
-        .map_err(|e| CatchpointError::ImportError(format!("encode accountbase blob: {e}")))?;
-    Ok(out)
+    let has_blocks: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM blockdb.sqlite_master WHERE type = 'table' AND name = 'blocks'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_blocks {
+        return Ok(false);
+    }
+    let proto: Option<String> = conn
+        .query_row(
+            "SELECT proto FROM blockdb.blocks WHERE rnd = ?1",
+            rusqlite::params![rnd],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(proto) = proto.filter(|p| !p.is_empty()) else {
+        return Ok(false);
+    };
+    let row: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT data FROM onlineroundparamstail WHERE rnd = ?1",
+            rusqlite::params![rnd],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let mut rd = &row[..];
+    let rmpv::Value::Map(entries) = rmpv::decode::read_value(&mut rd)
+        .map_err(|e| CatchpointError::ImportError(format!("decode tail row: {e}")))?
+    else {
+        return Ok(false);
+    };
+    let field = |name: &str| {
+        entries
+            .iter()
+            .find(|(k, _)| k.as_str() == Some(name))
+            .and_then(|(_, v)| v.as_u64())
+            .unwrap_or(0)
+    };
+    let data =
+        algo_codec::canonical_encode_online_round_params_data(&algo_codec::OnlineRoundParamsData {
+            online_supply: field("online"),
+            rewards_level: field("rwdlvl"),
+            current_protocol: proto,
+        });
+    if data == row {
+        return Ok(false);
+    }
+    conn.execute(
+        "UPDATE onlineroundparamstail SET data = ?1 WHERE rnd = ?2",
+        rusqlite::params![data, rnd],
+    )?;
+    Ok(true)
 }
 
 /// Returns `true` if the ownership bit is set.
@@ -2629,6 +2738,259 @@ mod tests {
         put_balance(&conn, &[4u8; 32], Some(0), &bad);
         importer.atomic_cutover(&header_v(131)).unwrap();
         assert_eq!(finish_pre_v8_catchpoint_migration(&conn).unwrap(), 0);
+    }
+
+    /// msgpack map `{F: 64 x 0x01, b: 5}` plus optional extra entries.
+    fn sp_only_blob(extra: &[(u8, u8)]) -> Vec<u8> {
+        let mut b = vec![0x82 + extra.len() as u8, 0xa1, b'F', 0xc4, 64];
+        b.extend(std::iter::repeat_n(1u8, 64));
+        b.extend([0xa1, b'b', 0x05]);
+        for (k, v) in extra {
+            b.extend([0xa1, *k, *v]);
+        }
+        b
+    }
+
+    fn map_keys(blob: &[u8]) -> Vec<String> {
+        let v = rmpv::decode::read_value(&mut &blob[..]).unwrap();
+        v.as_map()
+            .unwrap()
+            .iter()
+            .map(|(k, _)| k.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// go builds the `onlineaccounts` row from the PRE-tidy account (the
+    /// insert happens before `ba.StateProofID` is cleared) and an Online
+    /// account with an empty SelectionID but a StateProofID is a tidy
+    /// candidate.
+    #[test]
+    fn online_row_is_built_from_pre_tidy_blob() {
+        let conn = mem_conn();
+        let mut importer = CatchpointImporter::new(&conn, "test#label".to_string(), REWARD_UNITS);
+        importer.prepare_staging().unwrap();
+        // {F: ones, a: 1 (Online), b: 5}
+        put_balance(&conn, &[5u8; 32], Some(5), &sp_only_blob(&[(b'a', 1)]));
+        importer.atomic_cutover(&header_v(130)).unwrap();
+
+        let data: Vec<u8> = conn
+            .query_row("SELECT data FROM onlineaccounts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            crate::sqlite::decode_online_account_data(&data)
+                .unwrap()
+                .state_proof_id,
+            Some([1u8; 64])
+        );
+
+        assert_eq!(finish_pre_v8_catchpoint_migration(&conn).unwrap(), 1);
+        let acct: Vec<u8> = conn
+            .query_row("SELECT data FROM accountbase", [], |r| r.get(0))
+            .unwrap();
+        assert!(!map_keys(&acct).contains(&"F".to_string()));
+        // The online row keeps the pre-tidy StateProofID, as in go.
+        let data: Vec<u8> = conn
+            .query_row("SELECT data FROM onlineaccounts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            crate::sqlite::decode_online_account_data(&data)
+                .unwrap()
+                .state_proof_id,
+            Some([1u8; 64])
+        );
+    }
+
+    /// go omits an all-zero StateProofID (`omitempty`) from the stored
+    /// `BaseOnlineAccountData`; check the exact key set of the real voimain
+    /// account (its StateProofID stripped).
+    #[test]
+    fn online_row_omits_zero_state_proof_id() {
+        let conn = mem_conn();
+        let mut importer = CatchpointImporter::new(&conn, "test#label".to_string(), REWARD_UNITS);
+        importer.prepare_staging().unwrap();
+        let blob = unhex(VOI_ONLINE_BLOB);
+        let decoded = decode_base_account_data(&blob).unwrap();
+        let no_sp = strip_state_proof_id(&blob, &decoded).unwrap();
+        put_balance(
+            &conn,
+            &unhex(VOI_ONLINE_ACCOUNT),
+            Some(VOI_ONLINE_NOB),
+            &no_sp,
+        );
+        importer.atomic_cutover(&header_v(130)).unwrap();
+        let data: Vec<u8> = conn
+            .query_row("SELECT data FROM onlineaccounts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(map_keys(&data), vec!["A", "B", "C", "D", "E", "Y", "Z"]);
+        // ... and the same account with its StateProofID keeps "F".
+        let with_sp = {
+            let conn = mem_conn();
+            let mut imp = CatchpointImporter::new(&conn, "t#l".to_string(), REWARD_UNITS);
+            imp.prepare_staging().unwrap();
+            put_balance(
+                &conn,
+                &unhex(VOI_ONLINE_ACCOUNT),
+                Some(VOI_ONLINE_NOB),
+                &blob,
+            );
+            imp.atomic_cutover(&header_v(130)).unwrap();
+            conn.query_row("SELECT data FROM onlineaccounts", [], |r| {
+                r.get::<_, Vec<u8>>(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            map_keys(&with_sp),
+            vec!["A", "B", "C", "D", "E", "F", "Y", "Z"]
+        );
+    }
+
+    /// Array-encoded `baseAccountData` is accepted by the tolerant decoder
+    /// and so must also be tidied (re-encoded canonically), not abort.
+    #[test]
+    fn strip_state_proof_id_handles_array_encoded_blob() {
+        let mut blob = vec![0xdc, 0x00, 0x17, 0x00, 0x05, 0x00, 0x00, 0xc4, 32];
+        blob.extend([0u8; 32]); // auth_addr
+        blob.extend([0u8; 9]); // f..n
+        blob.extend([0xc2, 0x00, 0x00]); // o (bool), p, q
+        blob.extend([0xc4, 32]);
+        blob.extend([0u8; 32]); // vote_id
+        blob.extend([0xc4, 32]);
+        blob.extend([0u8; 32]); // selection_id
+        blob.extend([0x00, 0x00, 0x00]); // C, D, E
+        blob.extend([0xc4, 64]);
+        blob.extend(std::iter::repeat_n(1u8, 64)); // F
+        let decoded = decode_base_account_data(&blob).unwrap();
+        assert_eq!(decoded.state_proof_id, [1u8; 64]);
+        assert_eq!(
+            strip_state_proof_id(&blob, &decoded).unwrap(),
+            vec![0x81, 0xa1, b'b', 0x05]
+        );
+    }
+
+    /// The tail row gets go's RewardsLevel at cutover and the block header's
+    /// protocol once the lookback block at the balances round is stored.
+    #[test]
+    fn pre_v8_tail_row_gets_rewards_level_and_protocol() {
+        let conn = mem_conn();
+        conn.execute_batch(
+            "ATTACH DATABASE ':memory:' AS blockdb;
+             CREATE TABLE blockdb.blocks (rnd INTEGER PRIMARY KEY, proto TEXT, hdrdata BLOB, blkdata BLOB, certdata BLOB);",
+        )
+        .unwrap();
+        let mut importer = CatchpointImporter::new(&conn, "test#label".to_string(), REWARD_UNITS);
+        importer.prepare_staging().unwrap();
+        importer.atomic_cutover(&header_v(130)).unwrap();
+
+        let tail = |conn: &Connection| -> Vec<u8> {
+            conn.query_row(
+                "SELECT data FROM onlineroundparamstail WHERE rnd = 23909680",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        // Before the header exists: online + rwdlvl (42) only.
+        assert!(!fill_pre_v8_tail_protocol(&conn).unwrap());
+        assert_eq!(
+            tail(&conn),
+            algo_codec::canonical_encode_online_round_params_data(
+                &algo_codec::OnlineRoundParamsData {
+                    online_supply: 1_000_000,
+                    rewards_level: 42,
+                    current_protocol: String::new(),
+                }
+            )
+        );
+
+        conn.execute(
+            "INSERT INTO blockdb.blocks(rnd, proto, hdrdata, blkdata) VALUES(23909680, 'https://github.com/algorandfoundation/specs/tree/abc', X'80', X'80')",
+            [],
+        )
+        .unwrap();
+        assert!(fill_pre_v8_tail_protocol(&conn).unwrap());
+        assert_eq!(
+            tail(&conn),
+            algo_codec::canonical_encode_online_round_params_data(
+                &algo_codec::OnlineRoundParamsData {
+                    online_supply: 1_000_000,
+                    rewards_level: 42,
+                    current_protocol: "https://github.com/algorandfoundation/specs/tree/abc"
+                        .to_string(),
+                }
+            )
+        );
+        // Idempotent.
+        assert!(!fill_pre_v8_tail_protocol(&conn).unwrap());
+    }
+
+    /// The rehash branch: with a persisted (pre-tidy) `accounthashes` trie,
+    /// the tidy rewrites the blob and the persisted trie root becomes the
+    /// root of the post-tidy `accountbase`.
+    #[test]
+    fn finish_pre_v8_migration_rehashes_persisted_trie() {
+        use crate::catchpoint::verify::{rebuild_and_persist_trie_in_tx, rebuild_trie_from_db};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tracker.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        let mut importer = CatchpointImporter::new(&conn, "test#label".to_string(), REWARD_UNITS);
+        importer.prepare_staging().unwrap();
+        put_balance(&conn, &[4u8; 32], Some(0), &sp_only_blob(&[]));
+        put_balance(
+            &conn,
+            &unhex(VOI_ONLINE_ACCOUNT),
+            Some(VOI_ONLINE_NOB),
+            &unhex(VOI_ONLINE_BLOB),
+        );
+        importer.atomic_cutover(&header_v(130)).unwrap();
+        // What verification persists before the migration.
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        rebuild_and_persist_trie_in_tx(&conn).unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+        let pre_root = rebuild_trie_from_db(&conn).unwrap();
+
+        assert_eq!(finish_pre_v8_catchpoint_migration(&conn).unwrap(), 1);
+
+        let post_root = rebuild_trie_from_db(&conn).unwrap();
+        assert_ne!(pre_root, post_root, "the tidy must change the account hash");
+        let owned = crate::merkle_committer::OwnedSqliteCommitter::open_active(&path).unwrap();
+        let mut persisted = crate::merkle_trie::MerkleTrie::load(Box::new(owned))
+            .unwrap()
+            .expect("accounthashes holds a trie");
+        assert_eq!(persisted.root_hash().unwrap(), post_root);
+    }
+
+    /// One transaction: if the rehash fails, the tidied blob is rolled back
+    /// too (never `accountbase` tidied with `accounthashes` stale).
+    #[test]
+    fn finish_pre_v8_migration_is_atomic_when_rehash_fails() {
+        let conn = mem_conn();
+        let mut importer = CatchpointImporter::new(&conn, "test#label".to_string(), REWARD_UNITS);
+        importer.prepare_staging().unwrap();
+        // A 31-byte address makes the trie rebuild fail after the update.
+        put_balance(&conn, &[4u8; 31], Some(0), &sp_only_blob(&[]));
+        importer.atomic_cutover(&header_v(130)).unwrap();
+        conn.execute("INSERT INTO accounthashes(id, data) VALUES(1, X'00')", [])
+            .unwrap();
+
+        assert!(finish_pre_v8_catchpoint_migration(&conn).is_err());
+        let blob: Vec<u8> = conn
+            .query_row("SELECT data FROM accountbase", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            blob,
+            sp_only_blob(&[]),
+            "tidy must roll back with the rehash"
+        );
+        let hashes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM accounthashes WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(hashes, 1, "accounthashes must be untouched");
+        // Re-runnable once the cause is gone.
+        conn.execute("DELETE FROM accounthashes", []).unwrap();
+        assert_eq!(finish_pre_v8_catchpoint_migration(&conn).unwrap(), 1);
     }
 
     #[test]
