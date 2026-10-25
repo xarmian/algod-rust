@@ -54,12 +54,12 @@ pub struct NetworkPreset {
     /// `/v2/status.last-catchpoint` is the only discovery source.
     pub catchpoint_index_url: Option<&'static str>,
     /// Bundled `consensus.json` for chains with custom consensus protocols
-    /// (none yet; reserved for aramidmain, issue #2070).
-    #[allow(dead_code)] // first consumer lands with aramidmain (#2070)
+    /// (aramidmain, issue #2070). Only protocol versions the binary does not
+    /// already define are taken from it (DIV-006); a `<data_dir>/consensus.json`
+    /// is merged on top.
     pub consensus_json: Option<&'static str>,
 }
 
-#[cfg(test)]
 impl NetworkPreset {
     /// 32-byte genesis hash (from the shared [`algo_types::Network`] table).
     pub fn genesis_hash(&self) -> Option<[u8; 32]> {
@@ -138,6 +138,24 @@ pub const PRESETS: &[NetworkPreset] = &[
         catchpoint_index_url: None,
         consensus_json: None,
     },
+    // DIVERGENCE DIV-005: aramidmain preset (Aramid mainnet) is algod-rust-only.
+    // DIVERGENCE DIV-006: the bundled consensus.json supplies only protocols
+    // the binary does not already define.
+    // Aramid mainnet: custom consensus protocols `aramidmain-v1.0/1..3`
+    // exist only in the vendored consensus.json (source: scholtz/AlgorandNodes
+    // `docker/algod-relay/aramidmain/context-aramid`). `DNSBootstrapID` is
+    // that image's own `config.json` value. No static catchpoint index; the
+    // public algod advertises `last-catchpoint` in /v2/status.
+    NetworkPreset {
+        name: "aramidmain",
+        genesis_id: "aramidmain-v1.0",
+        fixed_genesis_id: true,
+        genesis_json: Some(include_str!("../../genesis/aramidmain-genesis.json")),
+        rest_url: Some("https://algod.aramidmain.a-wallet.net"),
+        dns_bootstrap_id: Some("aramidmain.a-wallet.net"),
+        catchpoint_index_url: None,
+        consensus_json: Some(include_str!("../../consensus/aramidmain-consensus.json")),
+    },
 ];
 
 /// Look up a preset by `--network` name.
@@ -179,6 +197,115 @@ pub fn effective_dns_bootstrap<'a>(
         }
     }
     (configured, false)
+}
+
+/// Which chain a command is about to follow, for consensus-table purposes.
+/// `genesis_id` / `genesis_hash` are `None` when the caller does not know them
+/// yet (a follower command driven purely by `--network`, whose genesis is the
+/// preset's own by construction).
+#[derive(Debug, Clone, Copy)]
+pub struct ChainId<'a> {
+    /// Network name: the `--network` value, or `genesis.json`'s `network`.
+    pub network: &'a str,
+    /// Full genesis id (`"{network}-{id}"`), when known.
+    pub genesis_id: Option<&'a str>,
+    /// Genesis hash, when known.
+    pub genesis_hash: Option<[u8; 32]>,
+}
+
+impl<'a> ChainId<'a> {
+    /// A chain identified by `--network` alone.
+    pub fn named(network: &'a str) -> Self {
+        Self {
+            network,
+            genesis_id: None,
+            genesis_hash: None,
+        }
+    }
+}
+
+/// The preset's bundled `consensus.json`, only when `chain` really is that
+/// preset's chain: the network name selects the preset, and any genesis id /
+/// hash the caller knows must also equal the preset's. A private network that
+/// merely reuses the name `aramidmain` (different hash) gets no bundle.
+pub fn bundled_consensus_for(chain: &ChainId<'_>) -> Option<&'static str> {
+    let p = preset(chain.network)?;
+    let json = p.consensus_json?;
+    if chain.genesis_id.is_some_and(|id| id != p.genesis_id) {
+        return None;
+    }
+    if chain
+        .genesis_hash
+        .is_some_and(|h| p.genesis_hash() != Some(h))
+    {
+        return None;
+    }
+    Some(json)
+}
+
+/// The single place a consensus table is built: the built-in table with the
+/// dev-network upgrade-round shortening applied first (as go's
+/// `cmd/algod/main.go` does), then the chain's bundled `consensus.json`
+/// protocols (aramidmain, #2070; unknown versions only, DIV-006, skipped ones
+/// are logged), then `<data_dir>/consensus.json` if `data_dir` is given and
+/// the file exists (it wins per version, like go's
+/// `PreloadConfigurableConsensusProtocols`).
+pub fn load_consensus_table(
+    chain: &ChainId<'_>,
+    data_dir: Option<&std::path::Path>,
+) -> anyhow::Result<std::collections::HashMap<String, algo_types::consensus::ConsensusParams>> {
+    let mut base = algo_types::consensus::built_in_consensus_protocols();
+    algo_types::consensus::apply_shorter_upgrade_rounds_for_dev_networks(&mut base, chain.network);
+    let bundled = bundled_consensus_for(chain);
+    if let Some(json) = bundled {
+        let skipped = algo_types::consensus::bundled_protocols_already_defined(&base, json);
+        if !skipped.is_empty() {
+            tracing::warn!(
+                network = chain.network,
+                skipped = ?skipped,
+                "bundled consensus.json protocol versions ignored: the binary already defines them (DIV-006)"
+            );
+        }
+    }
+    let path =
+        data_dir.map(|d| d.join(algo_types::consensus::CONFIGURABLE_CONSENSUS_PROTOCOLS_FILENAME));
+    let table =
+        algo_types::consensus::preload_consensus_protocols_with_bundle(data_dir, base, bundled)
+            .map_err(|e| match &path {
+                Some(p) => anyhow::anyhow!("loading {}: {e}", p.display()),
+                None => anyhow::anyhow!("loading bundled consensus.json: {e}"),
+            })?;
+    if path.as_ref().is_some_and(|p| p.exists()) {
+        tracing::info!(path = %path.unwrap().display(), "loaded consensus-parameter overrides");
+    }
+    Ok(table)
+}
+
+/// Whether [`install_consensus`] installs a table for chains without a bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallMode {
+    /// `node` / `participate`: always install (the data-dir `consensus.json`
+    /// is honoured for every network, as in go).
+    Always,
+    /// Follower/tool commands (`sync`, `replay`, `relay`, `observe`): install
+    /// only when the chain has a bundle, so every other network behaves
+    /// exactly as before (no `consensus.json` read, no new failure mode).
+    OnlyWithBundle,
+}
+
+/// [`load_consensus_table`] + [`algo_types::consensus::install_consensus_overrides`]
+/// (write-once; call at startup before any consensus evaluation).
+pub fn install_consensus(
+    chain: &ChainId<'_>,
+    data_dir: Option<&std::path::Path>,
+    mode: InstallMode,
+) -> anyhow::Result<()> {
+    if mode == InstallMode::OnlyWithBundle && bundled_consensus_for(chain).is_none() {
+        return Ok(());
+    }
+    let table = load_consensus_table(chain, data_dir)?;
+    algo_types::consensus::install_consensus_overrides(&table);
+    Ok(())
 }
 
 /// Translate a go-style signed connection-limit field (where a negative
@@ -390,6 +517,99 @@ mod tests {
         // Presets without a vendored genesis, and unknown networks.
         assert_eq!(vendored_genesis_json("mainnet", "mainnet-v1.0"), None);
         assert_eq!(vendored_genesis_json("nope", "voimain-v1.0"), None);
+    }
+
+    #[test]
+    fn aramidmain_preset_matches_live_chain_facts() {
+        let p = preset("aramidmain").expect("aramidmain preset");
+        assert_eq!(p.genesis_id, "aramidmain-v1.0");
+        assert_eq!(
+            data_encoding::BASE64.encode(&p.genesis_hash().unwrap()),
+            "PgeQVJJgx/LYKJfIEz7dbfNPuXmDyJ+O7FwQ4XL9tE8="
+        );
+        assert_eq!(p.rest_url, Some("https://algod.aramidmain.a-wallet.net"));
+        assert_eq!(p.dns_bootstrap_id, Some("aramidmain.a-wallet.net"));
+        assert!(p.genesis_json.is_some() && p.consensus_json.is_some());
+        assert_eq!(genesis_id_for("aramidmain"), Some("aramidmain-v1.0"));
+        assert!(vendored_genesis_json("aramidmain", "aramidmain-v1.0").is_some());
+    }
+
+    /// Preset resolution loads the bundled custom protocols; non-custom
+    /// presets leave the table untouched.
+    #[test]
+    fn bundled_consensus_loads_only_for_aramidmain() {
+        let t = load_consensus_table(&ChainId::named("aramidmain"), None).unwrap();
+        for n in 1..=3 {
+            assert!(t.contains_key(&format!("aramidmain-v1.0/{n}")));
+        }
+        let base = algo_types::consensus::built_in_consensus_protocols();
+        for net in ["mainnet", "voimain", "custom"] {
+            assert_eq!(
+                load_consensus_table(&ChainId::named(net), None)
+                    .unwrap()
+                    .len(),
+                base.len()
+            );
+        }
+        assert_eq!(t.len(), base.len() + 3);
+    }
+
+    #[test]
+    fn bundle_requires_matching_genesis_id_and_hash() {
+        let p = preset("aramidmain").unwrap();
+        let h = p.genesis_hash().unwrap();
+        let ok = ChainId {
+            network: "aramidmain",
+            genesis_id: Some(p.genesis_id),
+            genesis_hash: Some(h),
+        };
+        assert!(bundled_consensus_for(&ok).is_some());
+        assert!(bundled_consensus_for(&ChainId::named("aramidmain")).is_some());
+        // A private net that reuses the name with a different hash / id.
+        let mut other = h;
+        other[0] ^= 1;
+        let bad_hash = ChainId {
+            genesis_hash: Some(other),
+            ..ok
+        };
+        assert!(bundled_consensus_for(&bad_hash).is_none());
+        let bad_id = ChainId {
+            genesis_id: Some("aramidmain-private"),
+            ..ok
+        };
+        assert!(bundled_consensus_for(&bad_id).is_none());
+        let t = load_consensus_table(&bad_hash, None).unwrap();
+        assert!(!t.contains_key("aramidmain-v1.0/3"));
+        assert!(bundled_consensus_for(&ChainId::named("mainnet")).is_none());
+    }
+
+    #[test]
+    fn follower_mode_skips_chains_without_a_bundle() {
+        // OnlyWithBundle on a bundle-less chain is a pure no-op: it must not
+        // even read `<data_dir>/consensus.json` (a malformed one would
+        // otherwise abort a relay that never read it before).
+        let dir = std::env::temp_dir().join(format!("cons-nobundle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("consensus.json"), "{ not json").unwrap();
+        install_consensus(
+            &ChainId::named("mainnet"),
+            Some(&dir),
+            InstallMode::OnlyWithBundle,
+        )
+        .expect("no-op without a bundle");
+        // The same malformed file does fail where the file is honoured.
+        assert!(load_consensus_table(&ChainId::named("mainnet"), Some(&dir)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The preset's DNS bootstrap template expands to the relay SRV name.
+    #[test]
+    fn aramidmain_dns_bootstrap_srv_name() {
+        let (tpl, overridden) = effective_dns_bootstrap("aramidmain", None, DNS_BOOTSTRAP_TEMPLATE);
+        assert!(overridden);
+        let parsed =
+            algo_network::dns_bootstrap::parse_dns_bootstrap(tpl, "aramidmain", true).unwrap();
+        assert_eq!(parsed.primary_srv_bootstrap, "aramidmain.a-wallet.net");
     }
 
     #[test]

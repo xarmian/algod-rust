@@ -52,6 +52,10 @@ pub enum Network {
     /// standard Algorand consensus versions. algod-rust extension: not in
     /// go-algorand's `validNetworks` map.
     Voimain,
+    // DIVERGENCE DIV-005: aramidmain is not in go-algorand's validNetworks.
+    /// Aramid mainnet (`aramidmain-v1.0`), a go-algorand fork chain with custom
+    /// consensus protocols (`aramidmain-v1.0/N`). algod-rust extension.
+    Aramidmain,
 }
 
 /// Returned when a network name doesn't match any of the four known
@@ -72,7 +76,7 @@ impl fmt::Display for UnknownNetwork {
             // not listed so the error text stays byte-identical to Go's.
             Network::all()
                 .iter()
-                .filter(|n| **n != Network::Voimain)
+                .filter(|n| !matches!(**n, Network::Voimain | Network::Aramidmain))
                 .map(|n| n.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -120,6 +124,9 @@ const DEVNET_B64: &str = "sjkznd5fmOPzTzMi6BAHa2Ir9DyOxu5H7NH3ratQG1w=";
 // Voi mainnet; verified against `https://mainnet-api.voi.nodely.dev/versions`
 // and the SHA512/256 genesis hash of the vendored `voimain-genesis.json`.
 const VOIMAIN_B64: &str = "r20fSQI8gWe/kFZziNonSPCXLwcQmH/nxROvnnueWOk=";
+// Aramid mainnet; verified against the SHA512/256 genesis hash of the vendored
+// `aramidmain-genesis.json` and the public algod `/versions`.
+const ARAMIDMAIN_B64: &str = "PgeQVJJgx/LYKJfIEz7dbfNPuXmDyJ+O7FwQ4XL9tE8=";
 
 /// Name of the environment variable Go honors as a digest override.
 /// Same string as Go's `os.Getenv("ALGOKEY_GENESIS_HASH")` at
@@ -136,6 +143,7 @@ impl Network {
             Self::Betanet => "betanet",
             Self::Devnet => "devnet",
             Self::Voimain => "voimain",
+            Self::Aramidmain => "aramidmain",
         }
     }
 
@@ -148,6 +156,7 @@ impl Network {
             "betanet" => Ok(Self::Betanet),
             "devnet" => Ok(Self::Devnet),
             "voimain" => Ok(Self::Voimain),
+            "aramidmain" => Ok(Self::Aramidmain),
             _ => Err(UnknownNetwork {
                 name: s.to_string(),
             }),
@@ -162,6 +171,7 @@ impl Network {
             Self::Betanet => BETANET_B64,
             Self::Devnet => DEVNET_B64,
             Self::Voimain => VOIMAIN_B64,
+            Self::Aramidmain => ARAMIDMAIN_B64,
         };
         Digest(
             decode_b64_digest(b64)
@@ -180,6 +190,7 @@ impl Network {
             Network::Betanet,
             Network::Devnet,
             Network::Voimain,
+            Network::Aramidmain,
         ]
     }
 }
@@ -252,6 +263,7 @@ mod tests {
             ("BETANET", Network::Betanet),
             ("DevNet", Network::Devnet),
             ("VoiMain", Network::Voimain),
+            ("AramidMain", Network::Aramidmain),
         ] {
             assert_eq!(Network::from_str_ci(input).unwrap(), expected);
         }
@@ -299,6 +311,7 @@ mod tests {
             (Network::Betanet, BETANET_B64),
             (Network::Devnet, DEVNET_B64),
             (Network::Voimain, VOIMAIN_B64),
+            (Network::Aramidmain, ARAMIDMAIN_B64),
         ] {
             let bytes = net.genesis_hash().0;
             let re_encoded = BASE64.encode(&bytes);

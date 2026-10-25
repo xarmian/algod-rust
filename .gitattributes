@@ -69,3 +69,6 @@ docker/algod/genesis/** text eol=lf
 # Voi mainnet genesis embedded into the algod-rust binary (include_str!) and
 # served byte-for-byte on /genesis; must keep exact committed bytes.
 bin/algod-rust/genesis/** text eol=lf
+
+# Aramid mainnet consensus.json embedded into the binary (include_str!).
+bin/algod-rust/consensus/** text eol=lf

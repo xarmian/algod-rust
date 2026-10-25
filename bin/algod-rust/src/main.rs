@@ -152,6 +152,13 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
         } => {
             let (resolved_url, resolved_token, net_name) =
                 commands::resolve_network(&network, algod_url.as_deref(), &algod_token)?;
+            // Preset chains with custom protocols (aramidmain, #2070); a no-op
+            // for every other network.
+            commands::network_common::install_consensus(
+                &commands::network_common::ChainId::named(net_name),
+                None,
+                commands::network_common::InstallMode::OnlyWithBundle,
+            )?;
 
             if stateful {
                 commands::replay::run_stateful(
@@ -213,6 +220,13 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
         } => {
             let (resolved_url, resolved_token, net_name) =
                 commands::resolve_network(&network, algod_url.as_deref(), &algod_token)?;
+            // Preset chains with custom protocols (aramidmain, #2070); a
+            // `<data-dir>/consensus.json` is merged on top like go.
+            commands::network_common::install_consensus(
+                &commands::network_common::ChainId::named(net_name),
+                data_dir.as_deref(),
+                commands::network_common::InstallMode::OnlyWithBundle,
+            )?;
 
             if catchpoint.is_some() || catchpoint_auto {
                 // Load `<data-dir>/config.json` for
@@ -434,6 +448,12 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
                 None => algo_config::Local::default(),
             };
             falcon_backend::apply_falcon_backend(&node_config)?;
+            // Preset chains with custom protocols (aramidmain, #2070).
+            commands::network_common::install_consensus(
+                &commands::network_common::ChainId::named(&network),
+                data_dir.as_deref(),
+                commands::network_common::InstallMode::OnlyWithBundle,
+            )?;
             // Go: `daemon/algod/server.go:172-200`'s FD-pressure connection-
             // limit rebalancing (`Local.AdjustConnectionLimits`, issue #949)
             // — must run before `network_opts.resolve`/`rest_opts` read
@@ -486,6 +506,17 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
             genesis_id,
             dns_bootstrap,
         } => {
+            // Gossip proposals carry block headers; aramidmain's custom
+            // protocol names must resolve to be inspected (#2070).
+            commands::network_common::install_consensus(
+                &commands::network_common::ChainId {
+                    network: &network,
+                    genesis_id: genesis_id.as_deref(),
+                    genesis_hash: None,
+                },
+                None,
+                commands::network_common::InstallMode::OnlyWithBundle,
+            )?;
             commands::observe::run(
                 &network,
                 &relay_addr,

@@ -97,7 +97,7 @@ pub enum Commands {
 
     /// Replay blocks from a remote algod endpoint with stateless validation.
     Replay {
-        /// Network preset (mainnet, testnet, voimain, or custom).
+        /// Network preset (mainnet, testnet, voimain, aramidmain, or custom).
         #[arg(long, default_value = "custom")]
         network: String,
 
@@ -179,7 +179,7 @@ pub enum Commands {
     /// By default, syncs from genesis. Use --catchpoint or --catchpoint-auto
     /// to bootstrap from a catchpoint snapshot instead.
     Sync {
-        /// Network preset (mainnet, testnet, voimain, or custom).
+        /// Network preset (mainnet, testnet, voimain, aramidmain, or custom).
         #[arg(long, default_value = "custom")]
         network: String,
 
@@ -370,7 +370,7 @@ pub enum Commands {
         #[arg(long, short = 'g')]
         genesis_id: Option<String>,
 
-        /// Network name (mainnet, testnet, betanet, voimain).
+        /// Network name (mainnet, testnet, betanet, voimain, aramidmain).
         #[arg(long, short = 'n', default_value = "mainnet")]
         network: String,
 
@@ -449,7 +449,7 @@ pub enum Commands {
 
     /// Observe gossip traffic: connect to relay peers and log all messages as JSON lines.
     Observe {
-        /// Network preset (mainnet, testnet, devnet, betanet, voimain).
+        /// Network preset (mainnet, testnet, devnet, betanet, voimain, aramidmain).
         #[arg(long, default_value = "mainnet")]
         network: String,
 
@@ -532,7 +532,7 @@ pub enum Commands {
         #[arg(long, short = 'g')]
         genesis_id: Option<String>,
 
-        /// Network name (mainnet, testnet, betanet, voimain).
+        /// Network name (mainnet, testnet, betanet, voimain, aramidmain).
         #[arg(long, short = 'n', default_value = "mainnet")]
         network: String,
 

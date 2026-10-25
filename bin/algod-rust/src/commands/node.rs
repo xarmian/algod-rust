@@ -378,11 +378,13 @@ async fn run_start(
     // override is merged on top, mirroring go-algorand's exact call order in
     // `cmd/algod/main.go:204-212` ("the configurable consensus protocols file
     // takes precedence over network-specific overrides").
-    let mut consensus_base = algo_types::consensus::built_in_consensus_protocols();
-    algo_types::consensus::apply_shorter_upgrade_rounds_for_dev_networks(
-        &mut consensus_base,
-        &genesis.network,
-    );
+    // The bundle (aramidmain, #2070) applies only when genesis id AND hash
+    // match the preset, so a private net reusing the name gets none.
+    let chain_id = crate::commands::network_common::ChainId {
+        network: &genesis.network,
+        genesis_id: Some(genesis_id.as_str()),
+        genesis_hash: Some(gh),
+    };
 
     // Load `<data_dir>/consensus.json` (if present) and merge it onto the
     // (possibly network-shortened) consensus table (issue #750; Go:
@@ -403,18 +405,11 @@ async fn run_start(
     // ever evaluates a transaction or block -- see
     // `install_consensus_overrides`'s doc comment for the write-once /
     // thread-safety contract this relies on.
-    let consensus_overrides_path =
-        data_dir.join(algo_types::consensus::CONFIGURABLE_CONSENSUS_PROTOCOLS_FILENAME);
-    let consensus_protocols =
-        algo_types::consensus::preload_configurable_consensus_protocols_with_base(
-            data_dir,
-            consensus_base,
-        )
-        .map_err(|e| anyhow::anyhow!("loading {}: {e}", consensus_overrides_path.display()))?;
-    algo_types::consensus::install_consensus_overrides(&consensus_protocols);
-    if consensus_overrides_path.exists() {
-        info!(path = %consensus_overrides_path.display(), "loaded consensus-parameter overrides");
-    }
+    crate::commands::network_common::install_consensus(
+        &chain_id,
+        Some(data_dir),
+        crate::commands::network_common::InstallMode::Always,
+    )?;
 
     // Dev-mode block production derives committed txids by restoring the
     // genesis fields a block strips, through the shared protocol-aware
@@ -425,9 +420,8 @@ async fn run_start(
     // genesis hash, so dev mode still refuses legacy optional-genesis-hash
     // protocols rather than ship an untested configuration.
     if dev_mode {
-        let params = consensus_protocols
-            .get(&genesis.proto)
-            .cloned()
+        // Override-aware lookup (the table was installed just above).
+        let params = algo_types::consensus::consensus_params_for_version(&genesis.proto)
             .ok_or_else(|| {
                 anyhow::anyhow!("dev mode: unknown genesis protocol '{}'", genesis.proto)
             })?;

@@ -5405,36 +5405,32 @@ pub async fn run(
     // machinery below ever evaluates a transaction or block, matching
     // `node.rs`'s write-once/thread-safety contract (see
     // `install_consensus_overrides`'s doc comment).
-    if let Some(data_dir) = rest_opts.data_dir.as_deref() {
-        // Shorten per-upgrade wait-round delays for the Devnet/Betanet/Fnet
-        // genesis networks (issue #1138; Go:
-        // `ApplyShorterUpgradeRoundsForDevNetworks`, `config/config.go`), a
-        // no-op for every other network. `network` is the CLI `--network`
-        // value already used just below to resolve `genesis_id` -- the same
-        // proxy for the genesis network id `node.rs`'s `run_node` reads
-        // straight off a parsed `genesis.json`, since a real `genesis.json`
-        // is not necessarily parsed yet at this point in `participate::run`.
-        // Applied to the built-in table before any `consensus.json` override
-        // is merged on top, matching `node.rs`'s call order and
-        // go-algorand's own (`cmd/algod/main.go:204-212`).
-        let mut consensus_base = algo_types::consensus::built_in_consensus_protocols();
-        algo_types::consensus::apply_shorter_upgrade_rounds_for_dev_networks(
-            &mut consensus_base,
+    // One shared builder (`network_common::install_consensus`): dev-network
+    // shortening, the preset's bundle (aramidmain, #2070) and the data-dir
+    // file. `network` is the CLI `--network` value (the proxy for the genesis
+    // network id, as `node.rs` reads it off `genesis.json`); the bundle also
+    // needs any explicit `--genesis-id` / `--genesis-hash` to match the
+    // preset, so a private net reusing the name gets none. A data dir means
+    // the file is honoured for every network (#750/#762/#814); without one
+    // only bundled chains install anything.
+    {
+        use crate::commands::network_common::{install_consensus, ChainId, InstallMode};
+        let hash = genesis_hash_hex
+            .map(parse_genesis_hash)
+            .transpose()?
+            .filter(|h| *h != [0u8; 32]);
+        let chain = ChainId {
             network,
-        );
-
-        let consensus_overrides_path =
-            data_dir.join(algo_types::consensus::CONFIGURABLE_CONSENSUS_PROTOCOLS_FILENAME);
-        let consensus_protocols =
-            algo_types::consensus::preload_configurable_consensus_protocols_with_base(
-                data_dir,
-                consensus_base,
-            )
-            .map_err(|e| anyhow::anyhow!("loading {}: {e}", consensus_overrides_path.display()))?;
-        algo_types::consensus::install_consensus_overrides(&consensus_protocols);
-        if consensus_overrides_path.exists() {
-            info!(path = %consensus_overrides_path.display(), "loaded consensus-parameter overrides");
-        }
+            genesis_id: genesis_id.filter(|id| !id.is_empty()),
+            genesis_hash: hash,
+        };
+        let data_dir = rest_opts.data_dir.as_deref();
+        let mode = if data_dir.is_some() {
+            InstallMode::Always
+        } else {
+            InstallMode::OnlyWithBundle
+        };
+        install_consensus(&chain, data_dir, mode)?;
     }
 
     let resolved_p2p = p2p_opts.resolve();
