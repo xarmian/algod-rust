@@ -216,3 +216,36 @@ fn test_mainnet_specific_online_account() {
     assert_eq!(account.vote_last_valid, 3_000_000);
     assert_eq!(account.vote_key_dilution, 10_000);
 }
+
+// ── Voi mainnet (voimain) fixture (issue #2069) ──────────────
+
+/// The vendored `voimain-genesis.json` (byte-exact from
+/// `https://mainnet-api.voi.nodely.dev/genesis`) must hash to the genesis
+/// hash the live node advertises on `/versions` (`genesis_hash_b64`), which
+/// is also the hash `algo_types::Network::Voimain` carries.
+#[test]
+fn test_voimain_genesis_hash_matches_fixture() {
+    let json = std::fs::read_to_string(fixture_dir().join("voimain-genesis.json"))
+        .expect("voimain-genesis.json fixture missing");
+    let genesis = algo_ledger::genesis::parse_genesis_json(&json).unwrap();
+    assert_eq!(genesis.network, "voimain");
+    assert_eq!(genesis.id, "v1.0");
+    let hash = algo_ledger::genesis::genesis_hash(&genesis);
+    assert_eq!(
+        data_encoding::BASE64.encode(&hash),
+        "r20fSQI8gWe/kFZziNonSPCXLwcQmH/nxROvnnueWOk=",
+        "fixture hash differs from the live voimain /versions genesis_hash_b64"
+    );
+    assert_eq!(
+        hash,
+        algo_types::Network::Voimain.genesis_hash().0,
+        "Network::Voimain hash must equal the fixture's computed genesis hash"
+    );
+}
+
+#[test]
+fn test_voimain_genesis_loads() {
+    let state = LedgerState::from_genesis(&fixture_dir().join("voimain-genesis.json"))
+        .expect("failed to load voimain genesis.json");
+    assert_eq!(state.genesis_id, "voimain-v1.0");
+}

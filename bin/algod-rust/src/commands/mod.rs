@@ -75,27 +75,56 @@ pub fn resolve_network(
     algod_url: Option<&str>,
     algod_token: &str,
 ) -> anyhow::Result<(String, String, &'static str)> {
-    match network {
-        "mainnet" => Ok((
-            "https://mainnet-api.4160.nodely.dev".to_string(),
-            String::new(),
-            "mainnet",
-        )),
-        "testnet" => Ok((
-            "https://testnet-api.4160.nodely.dev".to_string(),
-            String::new(),
-            "testnet",
-        )),
-        "custom" => {
-            let url = algod_url
-                .ok_or_else(|| anyhow::anyhow!("--algod-url is required when --network=custom"))?;
-            Ok((url.to_string(), algod_token.to_string(), "custom"))
-        }
-        other => {
+    if network == "custom" {
+        let url = algod_url
+            .ok_or_else(|| anyhow::anyhow!("--algod-url is required when --network=custom"))?;
+        return Ok((url.to_string(), algod_token.to_string(), "custom"));
+    }
+    // Presets with a public REST endpoint (mainnet, testnet, voimain, ...).
+    match network_common::preset(network).and_then(|p| p.rest_url.map(|u| (p.name, u))) {
+        Some((name, url)) => Ok((url.to_string(), String::new(), name)),
+        None => {
+            let known: Vec<&str> = network_common::PRESETS
+                .iter()
+                .filter(|p| p.rest_url.is_some())
+                .map(|p| p.name)
+                .collect();
             anyhow::bail!(
-                "unknown network '{}': use mainnet, testnet, or custom",
-                other
+                "unknown network '{}': use {}, or custom",
+                network,
+                known.join(", ")
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod resolve_network_tests {
+    use super::resolve_network;
+
+    #[test]
+    fn voimain_resolves_to_public_voi_endpoint() {
+        let (url, token, name) = resolve_network("voimain", None, "").unwrap();
+        assert_eq!(url, "https://mainnet-api.voi.nodely.dev");
+        assert!(token.is_empty());
+        assert_eq!(name, "voimain");
+    }
+
+    #[test]
+    fn mainnet_testnet_unchanged() {
+        assert_eq!(
+            resolve_network("mainnet", None, "").unwrap().0,
+            "https://mainnet-api.4160.nodely.dev"
+        );
+        assert_eq!(
+            resolve_network("testnet", None, "").unwrap().0,
+            "https://testnet-api.4160.nodely.dev"
+        );
+    }
+
+    #[test]
+    fn unknown_network_lists_presets() {
+        let e = resolve_network("foonet", None, "").unwrap_err().to_string();
+        assert!(e.contains("voimain") && e.contains("mainnet"), "{e}");
     }
 }

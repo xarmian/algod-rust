@@ -295,7 +295,7 @@ pub struct KeyregArgs {
     #[arg(long = "lastvalid", default_value_t = 0)]
     pub lastvalid: u64,
     /// Network where the provided keys will be registered, one of
-    /// mainnet/testnet/betanet. Required (mirrors Go's
+    /// mainnet/testnet/betanet/devnet/voimain. Required (mirrors Go's
     /// `MarkFlagRequired("network")` at keyreg.go:84). Go documents a
     /// default of "mainnet" in help text, but the required-flag rule means
     /// the user must always pass `--network` explicitly.

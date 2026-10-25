@@ -35,6 +35,7 @@ use algo_types::{Block, Round};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::commands::network_common::{preset, PRESETS};
 use crate::commands::p2p_transport::{P2pHttpPeerTransport, P2pTransport};
 
 // ---------------------------------------------------------------------------
@@ -1195,12 +1196,9 @@ fn build_catchpoint_backend(
 
 /// Known genesis IDs for well-known networks.
 fn genesis_id_for_network(network: &str) -> Option<&'static str> {
-    match network {
-        "mainnet" => Some("mainnet-v1.0"),
-        "testnet" => Some("testnet-v1.0"),
-        "betanet" => Some("betanet-v1.0"),
-        _ => None,
-    }
+    preset(network)
+        .filter(|p| p.fixed_genesis_id)
+        .map(|p| p.genesis_id)
 }
 
 /// The reverse of [`genesis_id_for_network`] -- the network preset name a
@@ -1210,17 +1208,10 @@ fn genesis_id_for_network(network: &str) -> Option<&'static str> {
 /// `algorand-catchpoints.s3` channel to fall back to, at call sites that
 /// only have `genesis_id` in hand (not the original `--network` string).
 pub(crate) fn network_name_for_genesis_id(genesis_id: &str) -> Option<&'static str> {
-    for network in ["mainnet", "testnet", "betanet"] {
-        if genesis_id_for_network(network) == Some(genesis_id) {
-            return Some(match network {
-                "mainnet" => "mainnet",
-                "testnet" => "testnet",
-                "betanet" => "betanet",
-                _ => unreachable!(),
-            });
-        }
-    }
-    None
+    PRESETS
+        .iter()
+        .find(|p| p.fixed_genesis_id && p.genesis_id == genesis_id)
+        .map(|p| p.name)
 }
 
 /// go-algorand's own static, Algorand-maintained catchpoint index
@@ -1234,8 +1225,11 @@ pub(crate) fn network_name_for_genesis_id(genesis_id: &str) -> Option<&'static s
 /// preset) does not -- confirmed live against
 /// `https://mainnet-api.4160.nodely.dev`, whose `/v2/status` is healthy
 /// but always reports an empty `last-catchpoint`.
-fn static_catchpoint_index_url(network: &str) -> String {
-    format!("https://algorand-catchpoints.s3.us-east-2.amazonaws.com/channel/{network}/latest.catchpoint")
+///
+/// `None` for presets without a static index (e.g. voimain, whose peers
+/// advertise `last-catchpoint` instead; issue #2069).
+fn static_catchpoint_index_url(network: &str) -> Option<&'static str> {
+    preset(network).and_then(|p| p.catchpoint_index_url)
 }
 
 /// Validate (and trim) a catchpoint label fetched from the static index --
@@ -1286,7 +1280,10 @@ async fn discover_catchpoint_with_fallback(
     let Some(network) = network else {
         return Ok(None);
     };
-    fetch_static_catchpoint_label(&static_catchpoint_index_url(network)).await
+    let Some(url) = static_catchpoint_index_url(network) else {
+        return Ok(None);
+    };
+    fetch_static_catchpoint_label(url).await
 }
 
 /// Fetch and validate a catchpoint label from a static-index URL (the tail
@@ -2811,16 +2808,25 @@ mod tests {
         // `cmd/goal/node.go`'s `catchpointURL` template.
         assert_eq!(
             static_catchpoint_index_url("mainnet"),
-            "https://algorand-catchpoints.s3.us-east-2.amazonaws.com/channel/mainnet/latest.catchpoint"
+            Some("https://algorand-catchpoints.s3.us-east-2.amazonaws.com/channel/mainnet/latest.catchpoint")
         );
         assert_eq!(
             static_catchpoint_index_url("testnet"),
-            "https://algorand-catchpoints.s3.us-east-2.amazonaws.com/channel/testnet/latest.catchpoint"
+            Some("https://algorand-catchpoints.s3.us-east-2.amazonaws.com/channel/testnet/latest.catchpoint")
         );
         assert_eq!(
             static_catchpoint_index_url("betanet"),
-            "https://algorand-catchpoints.s3.us-east-2.amazonaws.com/channel/betanet/latest.catchpoint"
+            Some("https://algorand-catchpoints.s3.us-east-2.amazonaws.com/channel/betanet/latest.catchpoint")
         );
+        // Issue #2069: voimain has no static index (and no wrong guess).
+        assert_eq!(static_catchpoint_index_url("voimain"), None);
+        assert_eq!(static_catchpoint_index_url("devnet"), None);
+    }
+
+    #[test]
+    fn voimain_is_a_catchup_preset() {
+        assert_eq!(genesis_id_for_network("voimain"), Some("voimain-v1.0"));
+        assert_eq!(network_name_for_genesis_id("voimain-v1.0"), Some("voimain"));
     }
 
     #[test]

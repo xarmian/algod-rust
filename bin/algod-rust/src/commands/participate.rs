@@ -5719,7 +5719,12 @@ pub async fn run(
         // was previously entirely absent from `participate`, which had no
         // way to find peers besides an explicit --peers list).
         if let Some(network_name) = genesis_id_for(network).map(|_| network) {
-            let dns_template = dns_bootstrap_override.unwrap_or(&node_config.dns_bootstrap_id);
+            let (dns_template, dns_overridden) =
+                crate::commands::network_common::effective_dns_bootstrap(
+                    network_name,
+                    dns_bootstrap_override,
+                    &node_config.dns_bootstrap_id,
+                );
             match algo_network::Discovery::new(
                 phonebook.clone(),
                 Box::new(
@@ -5730,7 +5735,7 @@ pub async fn run(
                 ),
                 dns_template,
                 network_name,
-                dns_bootstrap_override.is_some(),
+                dns_overridden,
             ) {
                 Ok(discovery) => {
                     discovery.refresh_phonebook_addresses().await;
@@ -6676,6 +6681,14 @@ pub async fn run(
     let rest_cfg = rest_opts.resolve(default_data_dir.as_deref())?;
     let rest_server_handle = if let Some(cfg) = rest_cfg {
         let genesis_json = load_genesis_json(cfg.genesis_path.as_deref(), cfg.data_dir.as_deref())?
+            .or_else(|| {
+                // Presets that vendor their genesis (voimain, ...) serve the
+                // byte-exact document rather than a stub.
+                crate::commands::network_common::preset(network)
+                    .and_then(|p| p.genesis_json)
+                    .filter(|_| genesis_id.is_none_or(|g| g == resolved_genesis_id))
+                    .map(str::to_string)
+            })
             .unwrap_or_else(|| {
                 warn!(
                     "no genesis.json found; synthesizing a minimal stub for the /genesis endpoint"

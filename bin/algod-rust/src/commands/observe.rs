@@ -32,7 +32,9 @@ use chrono::Utc;
 use serde_json::json;
 use tracing::info;
 
-use crate::commands::network_common::{genesis_id_for, DNS_BOOTSTRAP_TEMPLATE};
+use crate::commands::network_common::{
+    effective_dns_bootstrap, genesis_id_for, DNS_BOOTSTRAP_TEMPLATE,
+};
 
 // ---------------------------------------------------------------------------
 // Catch-all message handler: logs every message as JSON
@@ -110,14 +112,15 @@ pub async fn run(
 
     // If no explicit relays were given, do DNS discovery.
     if relay_addrs.is_empty() {
-        let dns_template = dns_bootstrap_override.unwrap_or(DNS_BOOTSTRAP_TEMPLATE);
+        let (dns_template, dns_overridden) =
+            effective_dns_bootstrap(network, dns_bootstrap_override, DNS_BOOTSTRAP_TEMPLATE);
         let resolver = Box::new(HickorySrvResolver::new(None));
         let discovery = Discovery::new(
             phonebook.clone(),
             resolver,
             dns_template,
             network,
-            dns_bootstrap_override.is_some(),
+            dns_overridden,
         )?;
         discovery.refresh_phonebook_addresses().await;
         info!("DNS discovery complete");
