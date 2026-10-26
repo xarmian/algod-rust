@@ -10,7 +10,8 @@
 #   docker/scripts/network-image-smoke.sh <image> <genesis_id> [host_port]
 #
 # Environment: HEALTH_TIMEOUT (s, default 300), ROUND_TIMEOUT (s, default 1200:
-# the first round can take a fast catchup), ADVANCE_TIMEOUT (s, default 180).
+# the first round can take a fast catchup), ADVANCE_TIMEOUT (s, default 900: after the import the node
+# still downloads the lookback blocks before it follows).
 
 set -euo pipefail
 
@@ -22,7 +23,7 @@ TOKEN="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 BASE="http://127.0.0.1:${PORT}"
 
 # always show what the node said and remove the container
-trap 'docker logs "$NAME" 2>&1 | tail -80 || true; docker rm -f "$NAME" >/dev/null 2>&1 || true' EXIT
+trap 'docker logs "$NAME" 2>&1 | grep -v " WARN " | tail -80 || true; docker rm -f "$NAME" >/dev/null 2>&1 || true' EXIT
 
 get() { curl -sf -m 10 -H "X-Algo-API-Token: $TOKEN" "$BASE$1"; }
 last_round() { get /v2/status | grep -o '"last-round":[0-9]*' | cut -d: -f2; }
@@ -61,7 +62,7 @@ done
 echo "round $r1"
 
 echo "==> waiting for the round to advance"
-deadline=$(( $(date +%s) + ${ADVANCE_TIMEOUT:-180} ))
+deadline=$(( $(date +%s) + ${ADVANCE_TIMEOUT:-900} ))
 while :; do
   r2="$(last_round 2>/dev/null || echo 0)"
   [ "${r2:-0}" -gt "$r1" ] && break

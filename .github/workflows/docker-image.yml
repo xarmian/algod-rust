@@ -51,7 +51,7 @@ name: Docker Image
 #                                                  `beta-algod`,
 #                                                  `nightly-algod`); see
 #                                                  docs/DOCKER_MIGRATION.md
-#   ghcr.io/xarmian/algod-rust:<tag>-voimain    — `voimain` target (issue
+#   ghcr.io/xarmian/algod-rust:<tag>-voimain    â€” `voimain` target (issue
 #                                                  #2074): the `algod` image
 #                                                  following Voi mainnet
 #                                                  (embedded genesis, fast
@@ -494,7 +494,7 @@ jobs:
     name: PR build check (${{ matrix.target }})
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -610,7 +610,7 @@ jobs:
       # catchup). Needs the public network, like the soaks.
       - name: Smoke test the ${{ matrix.target }} network image
         if: ${{ matrix.genesis_id != '' }}
-        timeout-minutes: 30
+        timeout-minutes: 40
         run: |
           bash docker/scripts/network-image-smoke.sh algod-rust-pr-check:${{ matrix.target }} ${{ matrix.genesis_id }}
 
