@@ -588,6 +588,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
+    /// Issue #2095: the first candidate relay is unreachable (nothing
+    /// listens on its port, as with a dead SRV relay) -- the download must
+    /// fail over to the second candidate in the same call, whichever order
+    /// the ranker draws the two tied peers in.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unreachable_first_candidate_fails_over_to_the_second() {
+        const BODY: &[u8] = b"catchpoint-file-bytes-0123456789";
+        let dead_url = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+            // listener dropped here: connections are refused
+        };
+        let (good_url, good_requests) = spawn_always_succeeding_server(BODY).await;
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-ranked-catchpoint-dead-{}",
+            std::process::id()
+        ));
+        for round in 1..=3u64 {
+            let src = RankedCatchpointSource::new(
+                &[
+                    (dead_url.clone(), String::new()),
+                    (good_url.clone(), String::new()),
+                ],
+                fast_retry_config(),
+            );
+            let dest = tmp_dir.join(format!("catchpoint-{round}.tar.gz"));
+            src.download("test-v1.0", round, &dest, None)
+                .await
+                .unwrap_or_else(|e| panic!("round {round}: failover failed: {e}"));
+        }
+        assert!(good_requests.load(Ordering::SeqCst) >= 3);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
     // -- TestCatchpointServicePeerRank-equivalent: ranking must not panic
     //    when there is exactly one (already-local-equivalent) source and
     //    it fails, mirroring go's assertion that ranking a peer never
