@@ -50,8 +50,6 @@ name: Nightly Voimain Node Soak
 # reusable workflow's interface. Not on the PR path (schedule + dispatch only).
 
 on:
-  push:
-    branches: [feat/issue-2072-voimain-node-soak]
   schedule:
     - cron: "40 5 * * *"
   workflow_dispatch:
@@ -99,8 +97,8 @@ jobs:
       peer_url: ${{ github.event.inputs.algod_url || vars.VOIMAIN_ALGOD_URL || 'https://mainnet-api.voi.nodely.dev' }}
       relay_discovery: "srv:_algobootstrap._tcp.voimain.mainnet-voi.network"
       probe_catchpoint_file: "true"
-      duration_minutes: ${{ github.event.inputs.duration_minutes || '45' }}
-      follow_minutes: ${{ github.event.inputs.follow_minutes || '22' }}
+      duration_minutes: ${{ github.event.inputs.duration_minutes || '180' }}
+      follow_minutes: ${{ github.event.inputs.follow_minutes || '120' }}
       halt_minutes: ${{ github.event.inputs.halt_minutes || '5' }}
-      dry_run_issues: 'true'
+      dry_run_issues: ${{ github.event.inputs.dry_run_issues }}
       rust_log: ${{ github.event.inputs.rust_log }}
