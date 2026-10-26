@@ -28,7 +28,7 @@ use algo_error::AlgoError;
 use algo_ledger::sync::{BatchFetch, SyncBackend, SyncConfig, SyncOrchestrator};
 use algo_network::GossipNode;
 use algo_rest_client::{
-    AlgodClient, BlockSource, GossipBlockSource, HttpBlockFetcher, HttpPeerTransport,
+    AlgodClient, BlockSource, ClientConfig, GossipBlockSource, HttpBlockFetcher, HttpPeerTransport,
     ParallelBlockFetcher, RankedCatchpointSource, DEFAULT_DRAIN_TIMEOUT,
 };
 use algo_types::{Block, Round};
@@ -156,6 +156,12 @@ fn worst_case_round_time(
 // AlgodSyncBackend — real SyncBackend using AlgodClient
 // ---------------------------------------------------------------------------
 
+/// Default per-request timeout for one block fetch against one candidate
+/// peer (issue #2095). Short enough that a stalled relay is abandoned for the
+/// next candidate within seconds; go's `CatchupHTTPBlockFetchTimeoutSec`
+/// defaults to 4 s, and a Voi/Algorand block fits well within 10 s.
+const DEFAULT_BLOCK_PEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// A real [`SyncBackend`] implementation backed by [`AlgodClient`] and a
 /// [`RankedCatchpointSource`].
 ///
@@ -194,6 +200,26 @@ struct AlgodSyncBackend {
     /// matter how recent the round is. `None` when no genesis ID was
     /// supplied (pre-#1650 behavior: REST only).
     http_block_fetcher: Option<HttpBlockFetcher>,
+    /// Per-request timeout of one block fetch against one peer (issue #2095).
+    block_fetch_timeout: std::time::Duration,
+    /// Extra candidate peers (the ranked catchpoint candidates) the block
+    /// fetch rotates to when `algod_url` is stalled, unreachable or pruned
+    /// (issue #2095). Empty when only one peer is known.
+    extra_block_peers: Vec<BlockPeer>,
+    /// Index into `[primary] + extra_block_peers` of the peer that served the
+    /// last block; tried first next time. Not a ranker: go's catchup service
+    /// uses a `peerSelector` (`catchup/service.go`), this keeps the same
+    /// "stay on a peer that works, rotate on failure" behaviour with no state
+    /// beyond one index.
+    preferred_block_peer: std::sync::atomic::AtomicUsize,
+}
+
+/// One extra candidate for block fetching (see
+/// [`AlgodSyncBackend::extra_block_peers`]).
+struct BlockPeer {
+    url: String,
+    token: String,
+    http: Option<HttpBlockFetcher>,
 }
 
 /// Builds the ranked catchpoint-download source shared by
@@ -223,34 +249,117 @@ impl AlgodSyncBackend {
     /// REST-only behavior in place.
     fn with_http_block_fetcher(mut self, genesis_id: &str) -> Self {
         if !genesis_id.is_empty() {
-            self.http_block_fetcher =
-                HttpBlockFetcher::new(self.algod_url.clone(), genesis_id).ok();
+            self.http_block_fetcher = HttpBlockFetcher::with_timeout(
+                self.algod_url.clone(),
+                genesis_id,
+                self.block_fetch_timeout,
+            )
+            .ok();
+            for peer in &mut self.extra_block_peers {
+                peer.http =
+                    HttpBlockFetcher::with_timeout(&peer.url, genesis_id, self.block_fetch_timeout)
+                        .ok();
+            }
         }
         self
     }
 
-    /// Fetches the raw msgpack block(+cert) for `round`: REST
+    /// Fetches the raw msgpack block(+cert) for `round` from one peer: REST
     /// `/v2/blocks/{round}` first, then the peer's `/v1` block service if
     /// the REST call fails (issue #1650). Both return the same
     /// `{block, cert}` msgpack wrapper `decode_block_response` accepts.
-    async fn get_block_raw_bytes(&self, round: u64) -> Result<Vec<u8>, AlgoError> {
-        match self.client.get_block_raw(Round(round)).await {
+    async fn get_block_raw_from(
+        &self,
+        client: &AlgodClient,
+        http: Option<&HttpBlockFetcher>,
+        round: u64,
+    ) -> Result<Vec<u8>, AlgoError> {
+        match client.get_block_raw(Round(round)).await {
             Ok(raw) => Ok(raw),
-            Err(rest_err) => match &self.http_block_fetcher {
+            Err(rest_err) => match http {
                 Some(fetcher) => {
                     fetcher
                         .fetch_block(round)
                         .await
                         .map_err(|http_err| AlgoError::Network {
                             message: format!(
-                                "block {round}: REST /v2/blocks failed ({rest_err}); \
-                             /v1 block-service fallback failed ({http_err})"
+                                "block {round}: REST /v2/blocks failed ({rest_err});                              /v1 block-service fallback failed ({http_err})"
                             ),
                         })
                 }
                 None => Err(rest_err),
             },
         }
+    }
+
+    /// Fetches the raw block for `round`, rotating across the primary peer and
+    /// the extra candidate peers (issue #2095): the peer that served the last
+    /// block is tried first; if it is unreachable, stalls past the per-request
+    /// timeout, or answers "requested block is not available" (pruned), the
+    /// next candidate is tried, and the first that serves becomes preferred.
+    /// Each attempt is bounded by `block_fetch_timeout` (no client-level
+    /// retries), so one dead peer costs one timeout, not a retry ladder.
+    async fn get_block_raw_bytes(&self, round: u64) -> Result<Vec<u8>, AlgoError> {
+        use std::sync::atomic::Ordering;
+        let total = 1 + self.extra_block_peers.len();
+        let start = self.preferred_block_peer.load(Ordering::Relaxed) % total;
+        // With a single peer there is nobody to rotate to, so keep the
+        // client's own retries (pre-#2095 behaviour); with several, one
+        // bounded attempt per peer and rotate.
+        let retries = if total == 1 {
+            ClientConfig::default().max_retries
+        } else {
+            0
+        };
+        let mut errors: Vec<String> = Vec::new();
+        let mut last_err: Option<AlgoError> = None;
+        for step in 0..total {
+            let idx = (start + step) % total;
+            let result = if idx == 0 {
+                let client = block_peer_client(
+                    &self.algod_url,
+                    &self.algod_token,
+                    self.block_fetch_timeout,
+                    retries,
+                );
+                self.get_block_raw_from(&client, self.http_block_fetcher.as_ref(), round)
+                    .await
+            } else {
+                let peer = &self.extra_block_peers[idx - 1];
+                let client =
+                    block_peer_client(&peer.url, &peer.token, self.block_fetch_timeout, retries);
+                self.get_block_raw_from(&client, peer.http.as_ref(), round)
+                    .await
+            };
+            match result {
+                Ok(raw) => {
+                    self.preferred_block_peer.store(idx, Ordering::Relaxed);
+                    return Ok(raw);
+                }
+                Err(e) => {
+                    let url = if idx == 0 {
+                        &self.algod_url
+                    } else {
+                        &self.extra_block_peers[idx - 1].url
+                    };
+                    if total > 1 {
+                        warn!(round, peer = %url, error = %e, "block fetch failed, rotating to the next peer");
+                    }
+                    errors.push(format!("{url}: {e}"));
+                    last_err = Some(e);
+                }
+            }
+        }
+        if let (1, Some(e)) = (total, last_err) {
+            // Single peer: keep the original error class and text.
+            return Err(e);
+        }
+        Err(AlgoError::Network {
+            message: format!(
+                "block {round}: every candidate peer failed: {}",
+                errors.join(" | ")
+            ),
+        })
     }
 
     /// Ranks the catchpoint file download across `algod_url` plus
@@ -293,7 +402,24 @@ impl AlgodSyncBackend {
             algod_token: algod_token.to_string(),
             network: network.map(str::to_string),
             http_block_fetcher: None,
+            block_fetch_timeout: DEFAULT_BLOCK_PEER_TIMEOUT,
+            extra_block_peers: extra_catchpoint_peer_urls
+                .iter()
+                .map(|u| BlockPeer {
+                    url: u.clone(),
+                    token: algod_token.to_string(),
+                    http: None,
+                })
+                .collect(),
+            preferred_block_peer: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Overrides the per-peer, per-request block fetch timeout (issue #2095).
+    #[cfg(test)]
+    fn with_block_fetch_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.block_fetch_timeout = timeout;
+        self
     }
 
     /// Extends [`Self::with_catchpoint_peers`] with every peer a live,
@@ -379,6 +505,25 @@ fn push_connected_p2p_peers(source: &RankedCatchpointSource, transport: &Arc<P2p
             "wired connected P2P peer(s) into catchpoint download ranking"
         );
     }
+}
+
+/// A REST client for one block fetch: a single bounded attempt (no internal
+/// retry ladder) so a stalled peer costs one `timeout` before rotation.
+fn block_peer_client(
+    url: &str,
+    token: &str,
+    timeout: std::time::Duration,
+    max_retries: u32,
+) -> AlgodClient {
+    AlgodClient::with_config(
+        url,
+        token,
+        ClientConfig {
+            timeout,
+            max_retries,
+            ..Default::default()
+        },
+    )
 }
 
 impl SyncBackend for AlgodSyncBackend {
@@ -3051,6 +3196,103 @@ mod tests {
             .await
             .expect("v1 block-service fallback must serve the block");
         assert_eq!(raw, vec![1u8, 2, 3]);
+    }
+
+    // -- Issue #2095: lookback block fetch rotates across candidate peers --
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    async fn mount_block(server: &wiremock::MockServer, round: u64, body: Vec<u8>) {
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/blocks/{round}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/msgpack")
+                    .set_body_bytes(body),
+            )
+            .mount(server)
+            .await;
+    }
+
+    fn backend_with_peers(primary: &str, extra: &[String]) -> AlgodSyncBackend {
+        AlgodSyncBackend::with_catchpoint_peers_and_p2p(
+            primary,
+            "",
+            extra,
+            None,
+            algo_rest_client::CatchpointDownloadConfig::default(),
+            algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
+            None,
+        )
+        .with_block_fetch_timeout(std::time::Duration::from_millis(300))
+        .with_http_block_fetcher("test-genesis")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn block_fetch_rotates_past_a_stalled_peer_within_a_bounded_time() {
+        let stalled = wiremock::MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(20)))
+            .mount(&stalled)
+            .await;
+        let good = wiremock::MockServer::start().await;
+        mount_block(&good, 7, vec![7u8, 7, 7]).await;
+
+        let backend = backend_with_peers(&stalled.uri(), &[good.uri()]);
+        let started = std::time::Instant::now();
+        let raw = backend
+            .get_block_raw_bytes(7)
+            .await
+            .expect("must rotate to the second peer");
+        assert_eq!(raw, vec![7u8, 7, 7]);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "stalled peer must be abandoned after the per-request timeout, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn block_fetch_rotates_past_a_pruned_peer_and_stays_on_the_working_one() {
+        let pruned = wiremock::MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(
+                ResponseTemplate::new(404).set_body_string("requested block is not available"),
+            )
+            .mount(&pruned)
+            .await;
+        let good = wiremock::MockServer::start().await;
+        mount_block(&good, 5, vec![5u8]).await;
+        mount_block(&good, 6, vec![6u8]).await;
+
+        let backend = backend_with_peers(&pruned.uri(), &[good.uri()]);
+        assert_eq!(backend.get_block_raw_bytes(5).await.unwrap(), vec![5u8]);
+        let pruned_hits_after_first = pruned.received_requests().await.unwrap().len();
+        assert_eq!(backend.get_block_raw_bytes(6).await.unwrap(), vec![6u8]);
+        assert_eq!(
+            pruned.received_requests().await.unwrap().len(),
+            pruned_hits_after_first,
+            "the peer that served the last block is tried first"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn block_fetch_fails_boundedly_when_every_peer_fails() {
+        let a = wiremock::MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&a)
+            .await;
+        let b = wiremock::MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(20)))
+            .mount(&b)
+            .await;
+        let backend = backend_with_peers(&a.uri(), &[b.uri()]);
+        let started = std::time::Instant::now();
+        assert!(backend.get_block_raw_bytes(9).await.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
     // -- Issue #1604: --catchpoint-auto discovery static-index fallback ----
