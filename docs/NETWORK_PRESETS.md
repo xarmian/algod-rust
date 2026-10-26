@@ -80,6 +80,16 @@ names) and is pinned against the fixture by
 - Live evidence (2026-10-25): catchup from `23900000#KFAWCWWDOOSID3YYDJZOWIYYVW2KEKLMVPF5BHBLY6CFRCARJFMA`,
   replay of 4388 blocks, then follow mode with zero apply failures (see the
   PR for the log excerpt).
+- Live evidence (2026-10-26, issue #2095): the fast catchup works **without** pinning
+  serving relays. `algod-rust participate --network voimain` (no `--peers`, no
+  `--catchup-peer`; peers from SRV discovery) followed by
+  `POST /v2/catchup/23920000#IESXMNQKXXVFILC2L5W7WTUY4N5IRQMQZSZU6EWHAGHZPPS37BSA`
+  completed twice on fresh data directories (91 s and 102 s: catchpoint file download, import,
+  verify, 1001 lookback blocks, `catchpoint sync completed`), then the catchup service followed
+  the chain tip. The lookback download logged `block fetch failed, rotating to the next peer`
+  13 and 2 times for pruned relays ("requested block is not available") and served every
+  block from another candidate. The block fetch (single and range) and the `--gossip` backend's
+  HTTP fallback rotate across the candidate relays, one bounded attempt (10 s) per relay.
 
 ## Scope of the preset behaviours (read before adding a chain)
 
