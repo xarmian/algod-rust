@@ -858,6 +858,20 @@ fn persist_rebuilt_trie(
     }
 }
 
+/// Rebuild the account trie from the database and replace the persisted
+/// `accounthashes` content with it, inside the CALLER's open transaction (used
+/// after a post-verification edit of `accountbase`, see
+/// `importer::finish_pre_v8_catchpoint_migration`, so both land atomically).
+pub(crate) fn rebuild_and_persist_trie_in_tx(conn: &Connection) -> Result<(), CatchpointError> {
+    conn.execute_batch("DELETE FROM accounthashes")
+        .map_err(|e| CatchpointError::ImportError(format!("clear accounthashes: {e}")))?;
+    let mut trie = build_trie_from_db(conn)?;
+    let committer = crate::merkle_committer::SqliteMerkleCommitter::active(conn);
+    trie.commit(&committer)
+        .map_err(|e| CatchpointError::ImportError(format!("persist rebuilt trie: {e}")))?;
+    Ok(())
+}
+
 /// Elements held in memory per worker before a sorted run is spilled to disk
 /// (36 B each: 1M elements = 36 MiB per worker).
 const TRIE_REBUILD_RUN_CAPACITY: usize = 1 << 20;
