@@ -44,6 +44,9 @@ name: Network Node Soak (reusable)
 #                         catchup peer as-is.
 #   catchpoint_index_url  static latest.catchpoint index; empty -> the peer's
 #                         own /v2/status last-catchpoint.
+#   probe_catchpoint_file "true" -> only accept an SRV relay that actually
+#                         serves the latest catchpoint's ledger file (issue
+#                         #2072: on Voi only some relays do; default "false").
 #   consensus_json        optional repo-relative consensus.json copied into
 #                         the node data dir (custom-consensus chains).
 #   node_config_version   config.json "Version" pin (algo_config::LATEST_VERSION).
@@ -69,6 +72,9 @@ on:
       catchpoint_index_url:
         type: string
         default: ""
+      probe_catchpoint_file:
+        type: string
+        default: "false"
       consensus_json:
         type: string
         default: ""
@@ -197,6 +203,9 @@ jobs:
         env:
           RELAY_DISCOVERY: ${{ inputs.relay_discovery }}
           PEER_URL: ${{ steps.params.outputs.algod_url }}
+          PROBE_CATCHPOINT_FILE: ${{ inputs.probe_catchpoint_file }}
+          CATCHPOINT_INDEX_URL: ${{ inputs.catchpoint_index_url }}
+          GENESIS_ID: ${{ inputs.genesis_id }}
         run: |
           set -uo pipefail
 
@@ -251,6 +260,31 @@ jobs:
           fi
           echo "==> ${#SRV_RECORDS[@]} candidate relay(s) from SRV lookup"
 
+          # Issue #2072: on some networks (Voi) only a subset of the SRV
+          # relays serve the catchpoint file -- the others answer 404 or
+          # nothing at all, and the public REST gateway never serves it. With
+          # probe_catchpoint_file=true, only a relay that really answers the
+          # latest catchpoint's ledger file (GET /v1/<genesis>/ledger/<round in
+          # base 36>, what go's catchpoint service requests) is accepted.
+          PROBE_PATH=""
+          if [ "$PROBE_CATCHPOINT_FILE" = "true" ]; then
+            if [ -n "$CATCHPOINT_INDEX_URL" ]; then
+              PROBE_LABEL="$(curl -sf -m 20 "$CATCHPOINT_INDEX_URL" | tr -d '[:space:]')"
+            else
+              PROBE_LABEL="$(curl -sf -m 20 "$PEER_URL/v2/status" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("last-catchpoint") or "")')"
+            fi
+            PROBE_ROUND="${PROBE_LABEL%%#*}"
+            case "$PROBE_ROUND" in
+              ''|*[!0-9]*)
+                echo "fatal: probe_catchpoint_file needs a catchpoint label; got '$PROBE_LABEL'" >&2
+                exit 1
+                ;;
+            esac
+            PROBE_B36="$(python3 -c 'import string,sys; n=int(sys.argv[1]); d=string.digits+string.ascii_lowercase; s=[]; exec("while n: s.append(d[n%36]); n//=36"); print("".join(reversed(s)) or "0")' "$PROBE_ROUND")"
+            PROBE_PATH="/v1/$GENESIS_ID/ledger/$PROBE_B36"
+            echo "==> probing relays for the catchpoint file of $PROBE_LABEL ($PROBE_PATH)"
+          fi
+
           RELAY_URL=""
           for record in "${SRV_RECORDS[@]}"; do
             # SRV record format: <priority> <weight> <port> <target.>
@@ -260,6 +294,18 @@ jobs:
               continue
             fi
             CANDIDATE="http://$TARGET:$PORT"
+            if [ -n "$PROBE_PATH" ]; then
+              # The relay streams the whole file for a GET (Range is ignored),
+              # so cut the transfer after a few seconds; the status code is
+              # still reported.
+              FILE_CODE="$(curl -s -m 8 -o /dev/null -w '%{http_code}' "$CANDIDATE$PROBE_PATH")"
+              echo "==> probing $CANDIDATE (catchpoint file HTTP $FILE_CODE)"
+              if [ "$FILE_CODE" = "200" ]; then
+                RELAY_URL="$CANDIDATE"
+                break
+              fi
+              continue
+            fi
             HTTP_CODE="$(curl -s -m 10 -o /dev/null -w '%{http_code}' "$CANDIDATE/v2/status")"
             echo "==> trying $CANDIDATE (status endpoint HTTP $HTTP_CODE)"
             if [ "$HTTP_CODE" != "000" ]; then
@@ -347,6 +393,7 @@ jobs:
         env:
           ALGOD_URL: ${{ steps.params.outputs.algod_url }}
           CATCHUP_PEER_URL: ${{ steps.relay.outputs.catchup_peer_url }}
+          PROBE_CATCHPOINT_FILE: ${{ inputs.probe_catchpoint_file }}
           # Issue #1673: opt-in Replay-vs-Execute differential check.
           ALGOD_SHADOW_EXECUTE: ${{ steps.params.outputs.shadow_execute }}
           ALGOD_SHADOW_EXECUTE_SAMPLE_EVERY: ${{ steps.params.outputs.shadow_execute_sample_every }}
@@ -426,7 +473,20 @@ jobs:
           # node runs, gossips, and catches up, not that it votes (zero
           # stake, matching every other read-only/observer node this repo
           # already runs in CI).
+          # Issue #2072 (found live on voimain): the SRV relays that do NOT
+          # serve the catchpoint file are pruned too -- after catchup the
+          # follow path asked them for rounds just above the catchpoint and
+          # got "requested block is not available" ~650 times in 5 min,
+          # stalling at the catchpoint round. In probe mode the relay that
+          # proved it holds the catchpoint (and the blocks above it) is also
+          # pinned as the gossip peer.
+          PEER_ARGS=()
+          if [ "$PROBE_CATCHPOINT_FILE" = "true" ]; then
+            PEER_ARGS=(--peers "${CATCHUP_PEER_URL#http://}")
+            echo "==> probe mode: gossip peer pinned to ${CATCHUP_PEER_URL#http://}"
+          fi
           ./target/release/algod-rust participate \
+            "${PEER_ARGS[@]}" \
             --network "$NET" \
             --genesis-id "$GENESIS_ID" \
             --genesis-json "$GENESIS_PATH" \

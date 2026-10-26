@@ -63,7 +63,7 @@ class ReusableWorkflowTest(unittest.TestCase):
 
     def test_declares_the_network_inputs(self):
         for name in ("network", "genesis_id", "genesis_path", "peer_url", "relay_discovery",
-                     "catchpoint_index_url", "consensus_json"):
+                     "catchpoint_index_url", "consensus_json", "probe_catchpoint_file"):
             self.assertIn(name, self.inputs)
         for name in ("network", "genesis_id", "genesis_path", "peer_url", "relay_discovery"):
             self.assertTrue(self.inputs[name].get("required"), name)
@@ -96,6 +96,14 @@ class ReusableWorkflowTest(unittest.TestCase):
         self.assertIn("name: ${{ inputs.network }}-node-soak-${{ github.run_id }}", self.text)
         self.assertIn('--network "$NET"', self.text)
 
+    def test_catchpoint_probe_is_opt_in_and_uses_the_base36_ledger_path(self):
+        self.assertEqual(self.inputs["probe_catchpoint_file"]["default"], "false")
+        self.assertIn('PROBE_PATH="/v1/$GENESIS_ID/ledger/$PROBE_B36"', self.text)
+
+    def test_probe_mode_pins_the_proven_relay_as_gossip_peer(self):
+        self.assertIn('PEER_ARGS=(--peers "${CATCHUP_PEER_URL#http://}")', self.text)
+        self.assertIn('if [ "$PROBE_CATCHPOINT_FILE" = "true" ]', self.text)
+
     def test_file_issue_receives_the_network(self):
         self.assertRegex(self.text, r'file_issue\.py[\s\S]*?--network "\$NET"')
 
@@ -103,6 +111,38 @@ class ReusableWorkflowTest(unittest.TestCase):
 class CallerTest(unittest.TestCase):
     def test_at_least_the_mainnet_caller_exists(self):
         self.assertIn("mainnet-node-soak.yml", [c[0] for c in callers()])
+
+    def test_voimain_caller_parameters(self):
+        (_, _, spec, doc), = [c for c in callers() if c[0] == "voimain-node-soak.yml"]
+        w = spec["with"]
+        self.assertEqual(w["network"], "voimain")
+        self.assertEqual(w["genesis_id"], "voimain-v1.0")
+        self.assertEqual(w["genesis_path"], "bin/algod-rust/genesis/voimain-genesis.json")
+        self.assertEqual(w["relay_discovery"], "srv:_algobootstrap._tcp.voimain.mainnet-voi.network")
+        # the public gateway does not serve catchpoint files: relays must be probed
+        self.assertEqual(w["probe_catchpoint_file"], "true")
+        self.assertIn("https://mainnet-api.voi.nodely.dev", w["peer_url"])
+        self.assertIn("vars.VOIMAIN_ALGOD_URL", w["peer_url"])
+        self.assertEqual(doc["concurrency"]["group"], "voimain-node-soak")
+        t = triggers(doc)
+        self.assertIn("workflow_dispatch", t)
+        self.assertNotIn("pull_request", t)
+        self.assertNotIn("push", t)
+        self.assertEqual(t["schedule"], [{"cron": "40 5 * * *"}])
+
+    def test_schedules_are_staggered(self):
+        crons = []
+        for _, _, _, doc in callers():
+            crons += [s["cron"] for s in triggers(doc)["schedule"]]
+        self.assertEqual(len(crons), len(set(crons)))
+        # also distinct from every other scheduled workflow in the repo
+        others = set()
+        for path in glob.glob(os.path.join(WF_DIR, "*.yml")):
+            doc, _ = load(path)
+            if any(j.get("uses") == REUSABLE_USES for j in (doc.get("jobs") or {}).values()):
+                continue
+            others |= {s["cron"] for s in (triggers(doc) or {}).get("schedule", [])}
+        self.assertEqual(set(crons) & others, set())
 
     def test_every_caller_matches_the_reusable_interface(self):
         _, text = load(REUSABLE_PATH)

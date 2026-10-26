@@ -63,6 +63,17 @@ names) and is pinned against the fixture by
   rebuilds `onlineaccounts` from `accountbase` at cutover, as go-algorand's
   v7 DB migration does (#2088); without it every post-catchpoint vote failed
   `OTS signature verification failed`.
+- Nightly soak (issue #2072): `.github/workflows/voimain-node-soak.yml`
+  (05:40 UTC daily, plus `workflow_dispatch`; staggered after the 04:20
+  mainnet soak) calls the reusable `network-node-soak.yml` with
+  `probe_catchpoint_file: "true"`. Only some SRV relays serve the catchpoint
+  file (2 of 8 on 2026-10-25: r-na-1f40f6f89767, r-eu-6b7963e1f2ab), so the
+  soak probes each relay for `GET /v1/voimain-v1.0/ledger/<round base36>` and
+  uses the first 200 as `--catchup-peer`; the label comes from the gateway's
+  `/v2/status`. Voi block time measured at ~2.8 s, so mainnet's 5 min halt
+  threshold (~107 blocks) is unchanged. Auto-filed halt issues carry the
+  `voimain-soak` label and dedup only against it. Override the gateway with
+  the `VOIMAIN_ALGOD_URL` repo variable.
 - Live evidence (2026-10-25): catchup from `23900000#KFAWCWWDOOSID3YYDJZOWIYYVW2KEKLMVPF5BHBLY6CFRCARJFMA`,
   replay of 4388 blocks, then follow mode with zero apply failures (see the
   PR for the log excerpt).

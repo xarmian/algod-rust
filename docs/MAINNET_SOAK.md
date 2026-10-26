@@ -472,3 +472,15 @@ issue for a halt" step ran `file_issue.py --dry-run` and printed the
 would-be issue to the log rather than calling `gh issue create` — the
 exact same dry-run path demonstrated synthetically above, now also
 proven against a genuine live halt.
+
+## Sibling soaks (issue #2071 / #2072)
+
+The soak body is the reusable `.github/workflows/network-node-soak.yml`;
+`mainnet-node-soak.yml` (04:20 UTC) and `voimain-node-soak.yml` (05:40 UTC,
+issue #2072) are thin callers. The voimain soak differs only in parameters:
+Voi genesis, SRV `_algobootstrap._tcp.voimain.mainnet-voi.network`, catchpoint
+label from the gateway's `/v2/status`, and `probe_catchpoint_file: "true"`
+(only some relays serve the catchpoint file; see `docs/NETWORK_PRESETS.md`).
+Its issues use the `voimain-soak` label/title and dedup separately from
+`mainnet-soak`. Voi's block time (~2.8 s) matches mainnet, so thresholds are
+shared; the monitor has no block-cadence gate, only the no-progress halt gate.
