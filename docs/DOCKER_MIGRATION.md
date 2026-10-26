@@ -70,6 +70,45 @@ scheme and an `-algod` suffix: `latest-algod`, `stable-algod`, `5.0.4-stable-alg
 configured). To switch from go, change `algorand/algod:5.0.4-stable` to
 `ghcr.io/xarmian/algod-rust:5.0.4-stable-algod`.
 
+## Network images: `-voimain` (issue #2074)
+
+`ghcr.io/xarmian/algod-rust:<tag>-voimain` (`latest-voimain`, `stable-voimain`,
+`5.0.4-stable-voimain`, `nightly-voimain`, ...; multi-arch, Docker Hub mirror when
+configured) is the `algod` image with Voi mainnet baked in: `NETWORK=voimain`, the
+vendored genesis (`voimain-v1.0`), `FAST_CATCHUP=1`. Same ports (8080 REST, 4160/4161
+gossip, 7833 kmd) and environment variables as the `-algod` image:
+
+```
+docker run -d --name voi -p 8080:8080 -v voi-data:/algod/data   -e TOKEN=<token> ghcr.io/xarmian/algod-rust:latest-voimain
+curl -H "X-Algo-API-Token: <token>" localhost:8080/v2/status
+```
+
+* Relays come from the preset's DNS bootstrap (`_algobootstrap._tcp.voimain.mainnet-voi.network`).
+  Only some of them hold the catchpoint file and the blocks above it (2 of 8 on 2026-10-25), and a
+  node that uses the others stalls after the import, so with `FAST_CATCHUP=1` the entrypoint
+  probes each SRV relay for `GET /v1/voimain-v1.0/ledger/<round in base 36>` (the image ships `dig`)
+  and starts the node with `-p` set to the relays that answer 200; if none does, DNS discovery
+  stays in charge. An explicit `PEER_ADDRESS` is handed to `algod -p` as is and skips the probing.
+* The fast catchup needs a label, and Voi has no S3 index: the entrypoint reads
+  `last-catchpoint` from `https://mainnet-api.voi.nodely.dev/v2/status`
+  (`CATCHPOINT_STATUS_URL` overrides the gateway) and calls
+  `goal node catchup --force --min ${CATCHUP_MIN:-1000000} <label>`; the file itself is
+  downloaded from the relays the node discovered (only some Voi relays serve it; the
+  node ranks the others down). `CATCHPOINT=<label>` pins a label, `FAST_CATCHUP=0`
+  syncs block by block, a catchup that ends without a ledger (e.g. the relay it picked is
+  unreachable) is requested again, up to `CATCHUP_RETRIES` (20) times, and if the gateway advertises no label the node starts without a
+  catchup (and says so).
+* Mount `/algod/data` to keep the ledger. A restart asks for the catchup again, but the node
+  only accepts it when it is more than `CATCHUP_MIN` rounds behind the label, so a ledger
+  that is close to the head just resumes.
+* The image is the `voimain` stage of `docker/Dockerfile` (3 lines on top of `algod`; the
+  genesis is copied from `bin/algod-rust/genesis/`, so it cannot drift from the binary's).
+  Another network image is one more stage, one `docker-image.yml` matrix row per job and
+  an entry in `default_catchpoint_status_url` (`docker/algod/run.sh`).
+* CI: the PR build runs `docker/scripts/network-image-smoke.sh <image> voimain-v1.0`
+  (container up, `/health`, `/versions` `genesis_id=voimain-v1.0`, the round advances,
+  `docker stop` is prompt) and writes the image size to the job summary.
+
 ## Checking parity
 
 `docker/scripts/algod-image-parity.sh <algod-rust-image> [go-image]` runs both

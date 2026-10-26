@@ -63,6 +63,9 @@ names) and is pinned against the fixture by
   rebuilds `onlineaccounts` from `accountbase` at cutover, as go-algorand's
   v7 DB migration does (#2088); without it every post-catchpoint vote failed
   `OTS signature verification failed`.
+- Docker image (issue #2074): `ghcr.io/xarmian/algod-rust:<tag>-voimain` follows Voi out
+  of the box with fast catchup from the gateway's `last-catchpoint`; see
+  `docs/DOCKER_MIGRATION.md`.
 - Nightly soak (issue #2072): `.github/workflows/voimain-node-soak.yml`
   (05:40 UTC daily, plus `workflow_dispatch`; staggered after the 04:20
   mainnet soak) calls the reusable `network-node-soak.yml` with

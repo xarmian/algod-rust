@@ -31,22 +31,36 @@ hasnt() {
 # ---- stub commands ---------------------------------------------------------
 BIN="$TMP/bin"
 mkdir -p "$BIN"
-for cmd in algod algocfg diagcfg goal kmd; do
+for cmd in algod algocfg diagcfg goal kmd dig; do
     cat >"$BIN/$cmd" <<'EOF'
 #!/usr/bin/env bash
 echo "$(basename "$0") $*" >>"$CALLS"
 EOF
     chmod +x "$BIN/$cmd"
 done
+make_curl_stub() {  # (later cases replace the stub with their own; the relay probe case restores it)
 cat >"$BIN/curl" <<'EOF'
 #!/usr/bin/env bash
 echo "curl $*" >>"$CALLS"
+# a canned response body for `curl URL` (no -o), like the catchpoint-label lookup
+# `-w '%{http_code}'` (the relay probe): the code from $CURL_CODES ("<host:port> <code>" lines)
+case "$*" in
+*"-w"*)
+    url="${*: -1}"
+    code=404
+    while read -r hp c; do case "$url" in *"$hp"*) code="$c" ;; esac; done <"${CURL_CODES:-/dev/null}"
+    printf '%s' "$code"
+    ;;
+*) if [ -n "${CURL_BODY:-}" ]; then printf '%s' "$CURL_BODY"; fi ;;
+esac
 while [ $# -gt 0 ]; do
     if [ "$1" = "-o" ]; then echo downloaded >"$2"; fi
     shift
 done
 EOF
 chmod +x "$BIN/curl"
+}
+make_curl_stub
 export PATH="$BIN:$PATH"
 
 # ---- one scenario ----------------------------------------------------------
@@ -61,13 +75,14 @@ new_case() {  # sets D (case dir), DATA, CALLS and a clean environment
     export CALLS
     unset NETWORK PROFILE DEV_MODE START_KMD FAST_CATCHUP TOKEN ADMIN_TOKEN KMD_TOKEN \
         TELEMETRY_NAME TELEMETRY_URL NUM_ROUNDS GENESIS_ADDRESS PEER_ADDRESS GOSSIP_PORT \
-        ALGOD_PORT KMD_PORT DEBUG
+        ALGOD_PORT KMD_PORT DEBUG CATCHPOINT CATCHPOINT_STATUS_URL CATCHPOINT_LABEL_TRIES CATCHUP_MIN CATCHUP_WAIT_TRIES CATCHUP_RETRIES CURL_BODY CURL_CODES
     export ALGOD_ENTRYPOINT_TEST=1 ALGORAND_DATA="$DATA" ETC_DIR="$D/etc" \
-        GENESIS_DIR="$D/genesis" CATCHUP_DELAY=0
-    mkdir -p "$ETC_DIR" "$GENESIS_DIR/testnet" "$GENESIS_DIR/mainnet" "$GENESIS_DIR/fnet"
+        GENESIS_DIR="$D/genesis" CATCHUP_DELAY=0 CATCHUP_POLL=0
+    mkdir -p "$ETC_DIR" "$GENESIS_DIR/testnet" "$GENESIS_DIR/mainnet" "$GENESIS_DIR/fnet" "$GENESIS_DIR/voimain"
     echo '{"id":"testnet-genesis"}' >"$GENESIS_DIR/testnet/genesis.json"
     echo '{"id":"mainnet-genesis"}' >"$GENESIS_DIR/mainnet/genesis.json"
     echo '{"id":"fnet-genesis"}' >"$GENESIS_DIR/fnet/genesis.json"
+    echo '{"id":"voimain-genesis"}' >"$GENESIS_DIR/voimain/genesis.json"
 }
 
 # run main in a subshell with exec_algod / start_kmd stubbed; output -> $D/out.log
@@ -146,6 +161,38 @@ run_main
 has "FAST_CATCHUP starts a forced catchup" '^goal node catchup --force --min 1000000$' "$CALLS"
 has "a new network is started" '^algod -o$' "$CALLS"
 
+# ---- 5b. Voi mainnet (issue #2074): the label comes from the network's REST gateway ---
+new_case
+export NETWORK=voimain FAST_CATCHUP=1 CATCHUP_WAIT_TRIES=1
+export CURL_BODY='{"catchup-time":0,"last-catchpoint":"23900000#KFAWCWWDOOSID3YYDJZOWIYYVW2KEKLMVPF5BHBLY6CFRCARJFMA","last-round":5}'
+run_main
+[ "$(cat "$DATA/genesis.json")" = '{"id":"voimain-genesis"}' ] && ok "voimain installs its genesis.json" || bad "voimain genesis not installed"
+has "voimain asks the Voi gateway for the last catchpoint" '^curl .*https://mainnet-api\.voi\.nodely\.dev/v2/status' "$CALLS"
+has "voimain catches up to the gateway's last-catchpoint" '^goal node catchup --force --min 1000000 23900000#KFAWCWWDOOSID3YYDJZOWIYYVW2KEKLMVPF5BHBLY6CFRCARJFMA$' "$CALLS"
+hasnt "voimain does not override the preset's DNS bootstrap" 'DNSBootstrapID' "$CALLS"
+has "voimain node is started" '^algod -o$' "$CALLS"
+
+new_case
+export NETWORK=voimain FAST_CATCHUP=1 CATCHPOINT='24000000#ABC' CATCHUP_MIN=500 CATCHPOINT_STATUS_URL=
+run_main
+has "CATCHPOINT overrides the lookup (and CATCHUP_MIN applies)" '^goal node catchup --force --min 500 24000000#ABC$' "$CALLS"
+hasnt "CATCHPOINT skips the gateway request" '^curl .*v2/status' "$CALLS"
+
+new_case
+export NETWORK=voimain FAST_CATCHUP=1 CATCHPOINT_STATUS_URL=http://gw.example/v2/status CATCHPOINT_LABEL_TRIES=2
+export CURL_BODY='{"last-round":5}'
+run_main
+has "CATCHPOINT_STATUS_URL overrides the gateway" '^curl .*http://gw\.example/v2/status' "$CALLS"
+hasnt "no catchpoint advertised: no catchup is attempted" '^goal node catchup' "$CALLS"
+has "no catchpoint advertised: the node still starts and says why" 'no catchpoint label' "$D/out.log"
+has "no catchpoint advertised: node is started" '^algod -o$' "$CALLS"
+
+new_case
+export NETWORK=voimain PEER_ADDRESS="9.9.9.9:5011"
+run_main
+hasnt "PEER_ADDRESS on voimain keeps the preset DNS bootstrap" 'DNSBootstrapID' "$CALLS"
+has "PEER_ADDRESS on voimain is handed to algod -p" '^algod -o -p 9.9.9.9:5011$' "$CALLS"
+
 new_case
 export NETWORK=mainnet PEER_ADDRESS="9.9.9.9:4160"
 run_main
@@ -174,6 +221,8 @@ export NETWORK=testnet GENESIS_ADDRESS="http://peer:8080"
 cat >"$BIN/curl" <<'EOF2'
 #!/usr/bin/env bash
 echo "curl $*" >>"$CALLS"
+# a canned response body for `curl URL` (no -o), like the catchpoint-label lookup
+if [ -n "${CURL_BODY:-}" ]; then printf '%s' "$CURL_BODY"; fi
 while [ $# -gt 0 ]; do
     if [ "$1" = "-o" ]; then echo "<html>404</html>" >"$2"; fi
     shift
@@ -188,6 +237,8 @@ has "a failed download says so" 'Unable to download the genesis file from http:/
 cat >"$BIN/curl" <<'EOF2'
 #!/usr/bin/env bash
 echo "curl $*" >>"$CALLS"
+# a canned response body for `curl URL` (no -o), like the catchpoint-label lookup
+if [ -n "${CURL_BODY:-}" ]; then printf '%s' "$CURL_BODY"; fi
 while [ $# -gt 0 ]; do
     if [ "$1" = "-o" ]; then echo downloaded >"$2"; fi
     shift
@@ -242,7 +293,7 @@ new_case
     goal() {
         echo "goal $*" >>"$CALLS"
         case "$2" in
-        status) N=$((N + 1)); [ "$N" -ge 4 ] ;;                  # answers from the 4th probe on
+        status) N=$((N + 1)); [ "$N" -ge 4 ] && echo "Last committed block: 5" ;;                  # answers from the 4th probe on
         catchup) C=$((C + 1)); [ "$C" -ge 3 ] ;;                 # refused twice, then accepted
         esac
     }
@@ -250,11 +301,10 @@ new_case
 ) >/dev/null 2>&1
 rc=$?
 [ "$rc" = 0 ] && ok "catchup succeeds once the node answers" || bad "catchup exit code $rc"
-[ "$(grep -c '^goal node status' "$CALLS")" = 4 ] && ok "catchup waits for the node (4 status probes)" || bad "status probes: $(grep -c '^goal node status' "$CALLS")"
-[ "$(grep -c '^goal node catchup' "$CALLS")" = 3 ] && ok "a refused catchup is retried" || bad "catchup attempts: $(grep -c '^goal node catchup' "$CALLS")"
 first_catchup=$(grep -n '^goal node catchup' "$CALLS" | head -1 | cut -d: -f1)
-last_status=$(grep -n '^goal node status' "$CALLS" | tail -1 | cut -d: -f1)
-[ "$first_catchup" -gt "$last_status" ] && ok "no catchup before the node answered" || bad "catchup fired before the node answered"
+[ "$(head -n "$first_catchup" "$CALLS" | grep -c '^goal node status')" = 4 ] && ok "catchup waits for the node (4 status probes first)" || bad "status probes before the catchup: $(head -n "$first_catchup" "$CALLS" | grep -c '^goal node status')"
+[ "$(grep -c '^goal node catchup' "$CALLS")" = 3 ] && ok "a refused catchup is retried" || bad "catchup attempts: $(grep -c '^goal node catchup' "$CALLS")"
+[ "$(tail -n 1 "$CALLS")" = "goal node status" ] && ok "an accepted catchup is supervised (one more status poll)" || bad "no supervision poll"
 
 # ---- 7b. secrets never reach the log ----------------------------------------------------------
 new_case
@@ -421,6 +471,96 @@ has "algokey is algokey-rust" '^algokey-rust generate$' "$CALLS"
 has "kmd -d gets serve put in front" '^kmd-rust serve -d /k -t 0$' "$CALLS"
 has "kmd serve is passed through" '^kmd-rust serve -d /k$' "$CALLS"
 has "diagcfg is a successful no-op" '^diagcfg-exit 0$' "$CALLS"
+
+# ---- pin_serving_relays (issue #2074): only relays that hold the catchpoint become peers ----
+new_case
+export NETWORK=voimain FAST_CATCHUP=1 CATCHUP_WAIT_TRIES=1
+export CURL_BODY='{"last-catchpoint":"23920000#ABC"}'
+make_curl_stub
+printf 'good.example:5011 200
+bad.example:5011 404
+' >"$D/codes"
+export CURL_CODES="$D/codes"
+cat >"$BIN/dig" <<'EOF'
+#!/usr/bin/env bash
+echo "dig $*" >>"$CALLS"
+printf '1 1 5011 bad.example.
+1 1 5011 good.example.
+1 1 5011 down.example.
+'
+EOF
+run_main
+has "relays are discovered through the network's SRV name" '^dig \+short SRV _algobootstrap\._tcp\.voimain\.mainnet-voi\.network$' "$CALLS"
+has "the probe asks for the catchpoint round in base 36" 'http://good\.example:5011/v1/voimain-v1\.0/ledger/e8osg$' "$CALLS"
+has "only the relay that serves the file becomes the peer" '^algod -o -p good\.example:5011$' "$CALLS"
+has "the catchup uses the label the probe used" '^goal node catchup --force --min 1000000 23920000#ABC$' "$CALLS"
+
+new_case
+export NETWORK=voimain FAST_CATCHUP=1 CATCHUP_WAIT_TRIES=1
+export CURL_BODY='{"last-catchpoint":"23920000#ABC"}'
+: >"$D/codes"
+export CURL_CODES="$D/codes"
+run_main
+has "no relay serves the file: the node starts with DNS discovery" '^algod -o$' "$CALLS"
+
+new_case
+export NETWORK=voimain FAST_CATCHUP=0
+run_main
+hasnt "no FAST_CATCHUP: no relay probing" '^dig ' "$CALLS"
+
+new_case
+export NETWORK=testnet FAST_CATCHUP=1
+run_main
+hasnt "networks without an SRV name are not probed" '^dig ' "$CALLS"
+
+[ "$(set +u; source "$RUN"; base36 23920000)" = e8osg ] && ok "base36 matches go's catchpoint file name" || bad "base36"
+[ "$(set +u; source "$RUN"; base36 0)" = 0 ] && ok "base36 of 0" || bad "base36 0"
+
+# ---- supervise_catchup (issue #2074): a catchup that ends at round 0 is asked for again ----
+new_case
+(
+    set +u
+    source "$RUN"
+    # (`goal node status` runs in a command substitution: count in a file)
+    echo 0 >"$D/polls"
+    goal() {
+        echo "goal $*" >>"$CALLS"
+        if [ "$2" = status ]; then
+            S=$(( $(cat "$D/polls") + 1 ))
+            echo "$S" >"$D/polls"
+            # polls 1-2: catchup running; 3-4: ended at round 0 (a retry is due);
+            # 5: running again; 6+: a ledger exists
+            case "$S" in
+            1 | 2 | 5) printf 'Last committed block: 0
+Sync Time: 0.0s
+Catchpoint: 1#X
+' ;;
+            3 | 4) printf 'Last committed block: 0
+Time since last block: 0.0s
+' ;;
+            *) printf 'Last committed block: 23919680
+' ;;
+            esac
+        fi
+    }
+    supervise_catchup 23920000#LABEL
+) >/dev/null 2>&1
+rc=$?
+[ "$rc" = 0 ] && ok "supervise_catchup returns once the node has a ledger" || bad "supervise_catchup exit code $rc"
+[ "$(grep -c '^goal node catchup --force --min 1000000 23920000#LABEL$' "$CALLS")" = 1 ] && ok "a catchup that ended at round 0 is requested again, once" || bad "retries: $(grep -c '^goal node catchup' "$CALLS")"
+
+new_case
+(
+    set +u
+    source "$RUN"
+    export CATCHUP_RETRIES=3
+    goal() { echo "goal $*" >>"$CALLS"; [ "$2" = status ] && printf 'Last committed block: 0
+'; return 0; }
+    supervise_catchup ""
+) >/dev/null 2>&1
+rc=$?
+[ "$rc" = 1 ] && ok "supervise_catchup gives up after CATCHUP_RETRIES" || bad "give-up exit code $rc"
+[ "$(grep -c '^goal node catchup --force --min 1000000$' "$CALLS")" = 3 ] && ok "CATCHUP_RETRIES bounds the retries (no label: lookup by goal)" || bad "retries: $(grep -c '^goal node catchup' "$CALLS")"
 
 if [ "$FAILS" -ne 0 ]; then
     echo "$FAILS check(s) failed"

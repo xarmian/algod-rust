@@ -111,3 +111,19 @@ job's `platform`/`include` matrix to publish amd64-only instead. `merge`'s
 `imagetools create` step needs no edit: it globs whatever digest files
 `download-artifact` fetched, so it already adapts to however many platforms
 `build` actually produced.
+
+## Targets and the network images (issue #2074)
+
+The workflow builds four targets per platform: `runtime` (untagged suffix),
+`localnet` (`-localnet`), `algod` (`-algod`) and the network image `voimain`
+(`-voimain`). All of them go through the same `prepare` -> `build` (by digest, one
+native runner per platform) -> `merge` (manifest list per registry, same tag set plus
+the suffix) pipeline; a target is a row in the `build` and `merge` matrices.
+
+`pr-check` builds each target (amd64, no push). A matrix row with a `genesis_id`
+(`voimain`: `voimain-v1.0`) also loads the image and runs
+`docker/scripts/network-image-smoke.sh`, which needs the public network (like the
+nightly soaks): a flaky Voi relay can fail it, rerun the job before suspecting the
+image. The image size goes to the job summary. To add a network image (#2075,
+`aramidmain`): a Dockerfile stage, `build`/`merge`/`pr-check` matrix rows (`suffix`,
+`genesis_id`) and the gateway in `default_catchpoint_status_url` in `docker/algod/run.sh`.

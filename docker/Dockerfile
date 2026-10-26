@@ -109,6 +109,26 @@ WORKDIR /algod
 EXPOSE 8080 7833 4160 4161
 ENTRYPOINT ["/node/run/run.sh"]
 
+# Stage 5: network images (issue #2074, epic #2068): `algod` with a public
+# network baked in. The only per-network parts are NETWORK, the genesis file
+# (copied from the vendored preset genesis, so the image can't drift from the
+# binary's) and the entrypoint's per-network defaults (docker/algod/run.sh:
+# `default_catchpoint_status_url`). A further network (aramidmain, #2075) is
+# one more stage of the same three lines.
+#
+# `FAST_CATCHUP=1` is the default: Voi is >20M rounds, so a node that replays
+# from genesis is not "ready to run". The label comes from the network's REST
+# gateway (`last-catchpoint` of /v2/status; Voi has no S3 index), the file from
+# the relays the node discovers through the preset's DNS bootstrap. Override
+# with `-e FAST_CATCHUP=0`, `-e CATCHPOINT=<label>` or `-e PEER_ADDRESS=...`.
+# Opt-in via `--target voimain`.
+FROM algod AS voimain
+# `dig`: the entrypoint probes the network's SRV relays for the catchpoint file
+RUN apt-get update && apt-get install -y --no-install-recommends bind9-dnsutils && rm -rf /var/lib/apt/lists/*
+COPY bin/algod-rust/genesis/voimain-genesis.json /node/run/genesis/voimain/genesis.json
+ENV NETWORK=voimain
+ENV FAST_CATCHUP=1
+
 # Final stage: keep `runtime` (the `follow` default) as the image a plain
 # `docker build -f docker/Dockerfile .` produces. The `localnet` stage is opt-in
 # via `--target localnet` (see docker-compose.localnet-rust.yml).
