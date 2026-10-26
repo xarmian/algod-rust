@@ -129,6 +129,20 @@ COPY bin/algod-rust/genesis/voimain-genesis.json /node/run/genesis/voimain/genes
 ENV NETWORK=voimain
 ENV FAST_CATCHUP=1
 
+# Issue #2075 (epic #2068): the same for Aramid mainnet (`aramidmain-v1.0`).
+# The bundled custom consensus.json (aramidmain-v1.0/1..3, DIV-006) is compiled
+# into the binary (`include_str!`, bin/algod-rust/src/commands/network_common.rs),
+# so the genesis is the only file the image has to carry. Relays/DNS bootstrap
+# (`aramidmain.a-wallet.net`) come from the preset; fast catchup uses the
+# `last-catchpoint` of https://algod.aramidmain.a-wallet.net/v2/status.
+# Opt-in via `--target aramidmain`.
+FROM algod AS aramidmain
+# `dig`: the entrypoint probes the network's SRV relays for the catchpoint file
+RUN apt-get update && apt-get install -y --no-install-recommends bind9-dnsutils && rm -rf /var/lib/apt/lists/*
+COPY bin/algod-rust/genesis/aramidmain-genesis.json /node/run/genesis/aramidmain/genesis.json
+ENV NETWORK=aramidmain
+ENV FAST_CATCHUP=1
+
 # Final stage: keep `runtime` (the `follow` default) as the image a plain
 # `docker build -f docker/Dockerfile .` produces. The `localnet` stage is opt-in
 # via `--target localnet` (see docker-compose.localnet-rust.yml).

@@ -122,6 +122,7 @@ resolve_catchpoint_label() {
 default_srv_name() {
   case "$1" in
   voimain) echo "_algobootstrap._tcp.voimain.mainnet-voi.network" ;;
+  aramidmain) echo "_algobootstrap._tcp.aramidmain.a-wallet.net" ;;
   *) echo "" ;;
   esac
 }

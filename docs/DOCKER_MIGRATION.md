@@ -109,6 +109,41 @@ curl -H "X-Algo-API-Token: <token>" localhost:8080/v2/status
   (container up, `/health`, `/versions` `genesis_id=voimain-v1.0`, the round advances,
   `docker stop` is prompt) and writes the image size to the job summary.
 
+## Network images: `-aramidmain` (issue #2075)
+
+`ghcr.io/xarmian/algod-rust:<tag>-aramidmain` (`latest-aramidmain`, `stable-aramidmain`,
+`5.0.4-stable-aramidmain`, `nightly-aramidmain`, ...; multi-arch) is the same construction as
+`-voimain` for Aramid mainnet (`aramidmain-v1.0`): `NETWORK=aramidmain`, the vendored genesis
+(`/node/run/genesis/aramidmain/genesis.json`), `FAST_CATCHUP=1`. The custom consensus
+protocols (`aramidmain-v1.0/1..3`, DIV-006) and `DNSBootstrapID: aramidmain.a-wallet.net` are
+part of the `aramidmain` preset compiled into the binary, so the image needs no
+`consensus.json` or `config.json` mount (a `<data>/consensus.json` is still merged on top).
+
+```
+docker run -d --name aramid -p 8080:8080 -v aramid-data:/algod/data -e TOKEN=<token> ghcr.io/xarmian/algod-rust:latest-aramidmain
+curl -H "X-Algo-API-Token: <token>" localhost:8080/versions   # genesis_id aramidmain-v1.0
+```
+
+* Fast catchup label: `last-catchpoint` of `https://algod.aramidmain.a-wallet.net/v2/status`
+  (`CATCHPOINT_STATUS_URL` / `CATCHPOINT` override). That gateway does not serve the catchpoint
+  file, so (as for Voi) the entrypoint resolves `_algobootstrap._tcp.aramidmain.a-wallet.net`
+  and pins the relays that answer `GET /v1/aramidmain-v1.0/ledger/<round base 36>` with 200.
+* Migrating from `scholtz2/aramid-algo-node` / `scholtz2/aramid-algo-follow-node`
+  (official algod + shipped `consensus.json`/`genesis.json`; scholtz/AlgorandNodes
+  `docker/algod-follow/aramidmain`): REST stays on port 8080; gossip ports are unchanged
+  (4160/4161); the data directory is `/algod/data` (mount it as the volume). Those images
+  start `goal node start` from a script that copies `genesis.json`, `consensus.json` and a
+  `config.json` (`EnableFollowMode: true`, `EndpointAddress: 0.0.0.0:8080`,
+  `DNSBootstrapID: aramidmain.a-wallet.net`, `CatchupParallelBlocks: 64`,
+  `MaxAcctLookback: 1024`); the new image does the genesis, consensus and DNS bootstrap
+  itself. Mount a `config.json` at `/etc/algorand/config.json` to keep follow mode or other
+  settings (copied into the data directory at start). Same `TOKEN`, `ADMIN_TOKEN`,
+  `ALGOD_PORT`, `PEER_ADDRESS` variables as `-algod`. The old images' exact
+  workdir/user layout was not checked against a running container.
+* CI: the PR build runs `docker/scripts/network-image-smoke.sh <image> aramidmain-v1.0`
+  (`/health`, `/versions` `genesis_id=aramidmain-v1.0`, the round advances) and writes the image
+  size to the job summary.
+
 ## Checking parity
 
 `docker/scripts/algod-image-parity.sh <algod-rust-image> [go-image]` runs both
