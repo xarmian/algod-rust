@@ -1,0 +1,104 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: Nightly Voimain Node Soak
+
+# Issue #2072 (epic #2068): the Voi mainnet sibling of mainnet-node-soak.yml.
+# A thin caller of the reusable `network-node-soak.yml` (#2071): a single
+# `algod-rust participate --network voimain` node, fast-caught-up and then
+# followed on the GitHub-hosted runner; a `stuck` / `node_failure` /
+# `invalid_block_stall` verdict auto-files (or dedups into) a GitHub issue
+# titled and labelled for voimain (label `voimain-soak`, dedup scoped to it).
+#
+# ## Schedule
+#
+# 05:40 UTC daily. The other nightly jobs are consensus-cluster 02:41,
+# p2p-interop 03:05, p2p-consensus-soak 03:50 and mainnet-node-soak 04:20
+# (up to ~4 h); the stagger keeps the two soak runs off each other's
+# start-up (build, relay discovery, catchup) and the public Voi gateway /
+# relays from seeing two simultaneous bursts. `workflow_dispatch` runs
+# default to dry-run issue filing.
+#
+# ## Catchpoint access (how Voi differs from mainnet)
+#
+#   * Catchpoint label: no static index exists; the peer's own
+#     `/v2/status` `last-catchpoint` (https://mainnet-api.voi.nodely.dev,
+#     override with the `VOIMAIN_ALGOD_URL` repo variable or the dispatch
+#     input) provides it.
+#   * Catchpoint FILE: the public gateway answers 404 for
+#     `GET /v1/voimain-v1.0/ledger/<round-base36>`; only some relays from the
+#     SRV `_algobootstrap._tcp.voimain.mainnet-voi.network` serve it (live,
+#     2026-10-25: 2 of the 8 -- r-na-1f40f6f89767 and r-eu-6b7963e1f2ab --
+#     returned 200; five answered 404 and one was unreachable). The reusable
+#     workflow is
+#     therefore called with `probe_catchpoint_file: "true"`, which tries each
+#     SRV relay for the latest catchpoint's file and uses the first that
+#     returns 200 as `--catchup-peer`. If none does, the run fails loudly in
+#     the relay step (no issue is filed: that is a source problem).
+#
+# ## Thresholds
+#
+# Voi's real block time is ~2.8 s (measured over 100 blocks on 2026-10-25:
+# 278 s), the same as mainnet. `ops/mainnet-soak/monitor.py` has no
+# block-cadence gate, only a no-progress halt gate (`halt_minutes`, 5 min =
+# ~107 Voi blocks), so mainnet's defaults carry over; the follow window is
+# kept at 120 min and the cap shortened to 180 min because the Voi
+# catchpoint is small (tens of MB, replay of at most ~10000 blocks).
+#
+# `scripts/test_node_soak_callers.py` checks this caller against the
+# reusable workflow's interface. Not on the PR path (schedule + dispatch only).
+
+on:
+  schedule:
+    - cron: "40 5 * * *"
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "Hard cap on total poll time in minutes (catchup + follow window; max 315)"
+        default: "180"
+        required: false
+      follow_minutes:
+        description: "Minutes to keep following the tip after it is first reached (0 = stop at the duration cap only)"
+        default: "120"
+        required: false
+      algod_url:
+        description: "Catchup peer REST URL override (default: the VOIMAIN_ALGOD_URL variable, else the voimain preset gateway)"
+        required: false
+      halt_minutes:
+        description: "Minutes of no progress before a halt is declared"
+        default: "5"
+        required: false
+      dry_run_issues:
+        description: "Print the would-be issue instead of filing it"
+        type: boolean
+        default: true
+      rust_log:
+        description: "Optional RUST_LOG for the node. Empty = the default filter"
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: voimain-node-soak
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  voimain-node-soak:
+    uses: ./.github/workflows/network-node-soak.yml
+    with:
+      network: voimain
+      genesis_id: voimain-v1.0
+      genesis_path: bin/algod-rust/genesis/voimain-genesis.json
+      peer_url: ${{ github.event.inputs.algod_url || vars.VOIMAIN_ALGOD_URL || 'https://mainnet-api.voi.nodely.dev' }}
+      relay_discovery: "srv:_algobootstrap._tcp.voimain.mainnet-voi.network"
+      probe_catchpoint_file: "true"
+      duration_minutes: ${{ github.event.inputs.duration_minutes || '180' }}
+      follow_minutes: ${{ github.event.inputs.follow_minutes || '120' }}
+      halt_minutes: ${{ github.event.inputs.halt_minutes || '5' }}
+      dry_run_issues: ${{ github.event.inputs.dry_run_issues }}
+      rust_log: ${{ github.event.inputs.rust_log }}
