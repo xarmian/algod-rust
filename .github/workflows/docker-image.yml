@@ -59,7 +59,7 @@ name: Docker Image
 #                                                  `latest-voimain`,
 #                                                  `stable-voimain`,
 #                                                  `nightly-voimain`, ...
-#   ghcr.io/xarmian/algod-rust:<tag>-aramidmain — `aramidmain` target (issue
+#   ghcr.io/xarmian/algod-rust:<tag>-aramidmain â€” `aramidmain` target (issue
 #                                                  #2075): same for Aramid
 #                                                  mainnet (`aramidmain-v1.0`).
 #                                                  A further network image
