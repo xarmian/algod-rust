@@ -23,7 +23,7 @@ TOKEN="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 BASE="http://127.0.0.1:${PORT}"
 
 # always show what the node said and remove the container
-trap 'docker logs "$NAME" 2>&1 | grep -v " WARN " | tail -80 || true; docker rm -f "$NAME" >/dev/null 2>&1 || true' EXIT
+trap 'docker logs "$NAME" > /tmp/network-smoke.log 2>&1 || true; echo "--- entrypoint + first log lines"; head -40 /tmp/network-smoke.log; echo "--- catchup/sync lines"; grep -aiE "catchup|catchpoint|FAST_CATCHUP|lookback|ERROR" /tmp/network-smoke.log | grep -av "WS block fetch failed" | tail -40; echo "--- tail"; grep -av "WARN" /tmp/network-smoke.log | tail -40; docker rm -f "$NAME" >/dev/null 2>&1 || true' EXIT
 
 get() { curl -sf -m 10 -H "X-Algo-API-Token: $TOKEN" "$BASE$1"; }
 last_round() { get /v2/status | grep -o '"last-round":[0-9]*' | cut -d: -f2; }
