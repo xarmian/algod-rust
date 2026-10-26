@@ -117,6 +117,66 @@ resolve_catchpoint_label() {
   return 1
 }
 
+# SRV name of the network's relays, for networks where only some relays can
+# serve a fast catchup (see pin_serving_relays).
+default_srv_name() {
+  case "$1" in
+  voimain) echo "_algobootstrap._tcp.voimain.mainnet-voi.network" ;;
+  *) echo "" ;;
+  esac
+}
+
+# Prints a round in base 36, as go names the catchpoint file in
+# /v1/<genesis>/ledger/<round>.
+base36() {
+  local n="$1" digits=0123456789abcdefghijklmnopqrstuvwxyz out=""
+  if [ "$n" -le 0 ]; then
+    echo 0
+    return 0
+  fi
+  while [ "$n" -gt 0 ]; do
+    out="${digits:$((n % 36)):1}$out"
+    n=$((n / 36))
+  done
+  echo "$out"
+}
+
+# On Voi only a few of the SRV relays serve the catchpoint file and the blocks
+# above it; the others answer 404 or time out, and a node that discovers them
+# all stalls after the import while it downloads the lookback blocks (issue
+# #2072 found this on the soak, #2074 in the image smoke test). Like the soak,
+# probe the relays for the catchpoint file and use the ones that have it as
+# the node's peers. Only with FAST_CATCHUP=1, no PEER_ADDRESS and a network
+# with an SRV name; if no relay answers, DNS discovery stays in charge.
+pin_serving_relays() {
+  [ -z "${PEER_ADDRESS:-}" ] && [ "${FAST_CATCHUP:-}" = "1" ] || return 0
+  local srv label round path peers="" prio weight port target code
+  srv="$(default_srv_name "$NETWORK")"
+  [ -n "$srv" ] || return 0
+  label="$(resolve_catchpoint_label)" || label=""
+  round="${label%%#*}"
+  case "$round" in '' | *[!0-9]*) return 0 ;; esac
+  # (every preset's genesis id is <network>-v1.0)
+  path="/v1/${NETWORK}-v1.0/ledger/$(base36 "$round")"
+  while read -r prio weight port target; do
+    [ -n "$target" ] || continue
+    target="${target%.}"
+    code="$(curl -s -m 8 -o /dev/null -w '%{http_code}' "http://$target:$port$path" 2>/dev/null || true)"
+    echo "relay $target:$port: catchpoint file HTTP $code"
+    if [ "$code" = "200" ]; then
+      peers="${peers:+$peers;}$target:$port"
+    fi
+  done < <(dig +short SRV "$srv" 2>/dev/null)
+  if [ -n "$peers" ]; then
+    echo "Using the relays that serve the catchpoint: $peers"
+    PEER_ADDRESS="$peers"
+    # (the same label for the catchup that follows)
+    CATCHPOINT="$label"
+  else
+    echo "No relay answered with the catchpoint file; leaving the peers to DNS discovery." >&2
+  fi
+}
+
 catchup() {
   sleep "$CATCHUP_DELAY"
   # go's REST API answers within a second; algod-rust resolves its peers
@@ -277,6 +337,8 @@ start_public_network() {
 
   configure_data_dir
   start_kmd &
+
+  pin_serving_relays
 
   if [ "$FAST_CATCHUP" = "1" ]; then
     catchup &

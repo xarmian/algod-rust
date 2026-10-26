@@ -123,6 +123,8 @@ ENTRYPOINT ["/node/run/run.sh"]
 # with `-e FAST_CATCHUP=0`, `-e CATCHPOINT=<label>` or `-e PEER_ADDRESS=...`.
 # Opt-in via `--target voimain`.
 FROM algod AS voimain
+# `dig`: the entrypoint probes the network's SRV relays for the catchpoint file
+RUN apt-get update && apt-get install -y --no-install-recommends bind9-dnsutils && rm -rf /var/lib/apt/lists/*
 COPY bin/algod-rust/genesis/voimain-genesis.json /node/run/genesis/voimain/genesis.json
 ENV NETWORK=voimain
 ENV FAST_CATCHUP=1

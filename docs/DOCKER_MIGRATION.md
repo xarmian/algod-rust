@@ -83,8 +83,12 @@ docker run -d --name voi -p 8080:8080 -v voi-data:/algod/data   -e TOKEN=<token>
 curl -H "X-Algo-API-Token: <token>" localhost:8080/v2/status
 ```
 
-* Relays come from the preset's DNS bootstrap (`_algobootstrap._tcp.voimain.mainnet-voi.network`);
-  `PEER_ADDRESS` is handed to `algod -p` and leaves the preset's bootstrap in place.
+* Relays come from the preset's DNS bootstrap (`_algobootstrap._tcp.voimain.mainnet-voi.network`).
+  Only some of them hold the catchpoint file and the blocks above it (2 of 8 on 2026-10-25), and a
+  node that uses the others stalls after the import, so with `FAST_CATCHUP=1` the entrypoint
+  probes each SRV relay for `GET /v1/voimain-v1.0/ledger/<round in base 36>` (the image ships `dig`)
+  and starts the node with `-p` set to the relays that answer 200; if none does, DNS discovery
+  stays in charge. An explicit `PEER_ADDRESS` is handed to `algod -p` as is and skips the probing.
 * The fast catchup needs a label, and Voi has no S3 index: the entrypoint reads
   `last-catchpoint` from `https://mainnet-api.voi.nodely.dev/v2/status`
   (`CATCHPOINT_STATUS_URL` overrides the gateway) and calls

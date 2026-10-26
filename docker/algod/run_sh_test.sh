@@ -31,24 +31,36 @@ hasnt() {
 # ---- stub commands ---------------------------------------------------------
 BIN="$TMP/bin"
 mkdir -p "$BIN"
-for cmd in algod algocfg diagcfg goal kmd; do
+for cmd in algod algocfg diagcfg goal kmd dig; do
     cat >"$BIN/$cmd" <<'EOF'
 #!/usr/bin/env bash
 echo "$(basename "$0") $*" >>"$CALLS"
 EOF
     chmod +x "$BIN/$cmd"
 done
+make_curl_stub() {  # (later cases replace the stub with their own; the relay probe case restores it)
 cat >"$BIN/curl" <<'EOF'
 #!/usr/bin/env bash
 echo "curl $*" >>"$CALLS"
 # a canned response body for `curl URL` (no -o), like the catchpoint-label lookup
-if [ -n "${CURL_BODY:-}" ]; then printf '%s' "$CURL_BODY"; fi
+# `-w '%{http_code}'` (the relay probe): the code from $CURL_CODES ("<host:port> <code>" lines)
+case "$*" in
+*"-w"*)
+    url="${*: -1}"
+    code=404
+    while read -r hp c; do case "$url" in *"$hp"*) code="$c" ;; esac; done <"${CURL_CODES:-/dev/null}"
+    printf '%s' "$code"
+    ;;
+*) if [ -n "${CURL_BODY:-}" ]; then printf '%s' "$CURL_BODY"; fi ;;
+esac
 while [ $# -gt 0 ]; do
     if [ "$1" = "-o" ]; then echo downloaded >"$2"; fi
     shift
 done
 EOF
 chmod +x "$BIN/curl"
+}
+make_curl_stub
 export PATH="$BIN:$PATH"
 
 # ---- one scenario ----------------------------------------------------------
@@ -63,7 +75,7 @@ new_case() {  # sets D (case dir), DATA, CALLS and a clean environment
     export CALLS
     unset NETWORK PROFILE DEV_MODE START_KMD FAST_CATCHUP TOKEN ADMIN_TOKEN KMD_TOKEN \
         TELEMETRY_NAME TELEMETRY_URL NUM_ROUNDS GENESIS_ADDRESS PEER_ADDRESS GOSSIP_PORT \
-        ALGOD_PORT KMD_PORT DEBUG CATCHPOINT CATCHPOINT_STATUS_URL CATCHPOINT_LABEL_TRIES CATCHUP_MIN CATCHUP_WAIT_TRIES CATCHUP_RETRIES CURL_BODY
+        ALGOD_PORT KMD_PORT DEBUG CATCHPOINT CATCHPOINT_STATUS_URL CATCHPOINT_LABEL_TRIES CATCHUP_MIN CATCHUP_WAIT_TRIES CATCHUP_RETRIES CURL_BODY CURL_CODES
     export ALGOD_ENTRYPOINT_TEST=1 ALGORAND_DATA="$DATA" ETC_DIR="$D/etc" \
         GENESIS_DIR="$D/genesis" CATCHUP_DELAY=0 CATCHUP_POLL=0
     mkdir -p "$ETC_DIR" "$GENESIS_DIR/testnet" "$GENESIS_DIR/mainnet" "$GENESIS_DIR/fnet" "$GENESIS_DIR/voimain"
@@ -459,6 +471,50 @@ has "algokey is algokey-rust" '^algokey-rust generate$' "$CALLS"
 has "kmd -d gets serve put in front" '^kmd-rust serve -d /k -t 0$' "$CALLS"
 has "kmd serve is passed through" '^kmd-rust serve -d /k$' "$CALLS"
 has "diagcfg is a successful no-op" '^diagcfg-exit 0$' "$CALLS"
+
+# ---- pin_serving_relays (issue #2074): only relays that hold the catchpoint become peers ----
+new_case
+export NETWORK=voimain FAST_CATCHUP=1 CATCHUP_WAIT_TRIES=1
+export CURL_BODY='{"last-catchpoint":"23920000#ABC"}'
+make_curl_stub
+printf 'good.example:5011 200
+bad.example:5011 404
+' >"$D/codes"
+export CURL_CODES="$D/codes"
+cat >"$BIN/dig" <<'EOF'
+#!/usr/bin/env bash
+echo "dig $*" >>"$CALLS"
+printf '1 1 5011 bad.example.
+1 1 5011 good.example.
+1 1 5011 down.example.
+'
+EOF
+run_main
+has "relays are discovered through the network's SRV name" '^dig \+short SRV _algobootstrap\._tcp\.voimain\.mainnet-voi\.network$' "$CALLS"
+has "the probe asks for the catchpoint round in base 36" 'http://good\.example:5011/v1/voimain-v1\.0/ledger/e8osg$' "$CALLS"
+has "only the relay that serves the file becomes the peer" '^algod -o -p good\.example:5011$' "$CALLS"
+has "the catchup uses the label the probe used" '^goal node catchup --force --min 1000000 23920000#ABC$' "$CALLS"
+
+new_case
+export NETWORK=voimain FAST_CATCHUP=1 CATCHUP_WAIT_TRIES=1
+export CURL_BODY='{"last-catchpoint":"23920000#ABC"}'
+: >"$D/codes"
+export CURL_CODES="$D/codes"
+run_main
+has "no relay serves the file: the node starts with DNS discovery" '^algod -o$' "$CALLS"
+
+new_case
+export NETWORK=voimain FAST_CATCHUP=0
+run_main
+hasnt "no FAST_CATCHUP: no relay probing" '^dig ' "$CALLS"
+
+new_case
+export NETWORK=testnet FAST_CATCHUP=1
+run_main
+hasnt "networks without an SRV name are not probed" '^dig ' "$CALLS"
+
+[ "$(set +u; source "$RUN"; base36 23920000)" = e8osg ] && ok "base36 matches go's catchpoint file name" || bad "base36"
+[ "$(set +u; source "$RUN"; base36 0)" = 0 ] && ok "base36 of 0" || bad "base36 0"
 
 # ---- supervise_catchup (issue #2074): a catchup that ends at round 0 is asked for again ----
 new_case
