@@ -116,6 +116,10 @@ names) and is pinned against the fixture by
   algod-rust sync --network aramidmain --catchpoint <last-catchpoint from /v2/status> --follow     --catchpoint-peer-url http://de-k4-s1.a-wallet.net:14161     --catchpoint-peer-url http://fi-k1-s3.biatec.io:14160
   ```
 
+- Docker image (issue #2075): `ghcr.io/xarmian/algod-rust:<tag>-aramidmain` embeds the
+  genesis; the consensus protocols and DNS bootstrap come from the preset in the binary;
+  fast catchup via the gateway's `last-catchpoint` and SRV-pinned relays. See
+  `docs/DOCKER_MIGRATION.md` (incl. migration from `scholtz2/aramid-algo-node`).
 - Nightly soak (issue #2073): `.github/workflows/aramidmain-node-soak.yml`
   (07:20 UTC daily, plus `workflow_dispatch`; staggered after the mainnet
   04:20 and voimain 05:40 soaks) calls the reusable `network-node-soak.yml`

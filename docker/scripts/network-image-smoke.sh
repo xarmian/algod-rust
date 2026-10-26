@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: MIT
 # See the LICENSE-MIT file in the repository root for the full license text.
 
-# Smoke test of a network image (`voimain`, later `aramidmain`; issue #2074,
+# Smoke test of a network image (`voimain`, `aramidmain`; issue #2074,
 # epic #2068): run the container, wait for /health, check that /versions
 # reports the network's genesis id and that the round advances.
 #

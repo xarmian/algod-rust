@@ -44,8 +44,8 @@ cat >"$BIN/curl" <<'EOF'
 echo "curl $*" >>"$CALLS"
 # a canned response body for `curl URL` (no -o), like the catchpoint-label lookup
 # `-w '%{http_code}'` (the relay probe): the code from $CURL_CODES ("<host:port> <code>" lines)
-case "$*" in
-*"-w"*)
+case " $* " in
+*" -w "*)
     url="${*: -1}"
     code=404
     while read -r hp c; do case "$url" in *"$hp"*) code="$c" ;; esac; done <"${CURL_CODES:-/dev/null}"
@@ -78,11 +78,12 @@ new_case() {  # sets D (case dir), DATA, CALLS and a clean environment
         ALGOD_PORT KMD_PORT DEBUG CATCHPOINT CATCHPOINT_STATUS_URL CATCHPOINT_LABEL_TRIES CATCHUP_MIN CATCHUP_WAIT_TRIES CATCHUP_RETRIES CURL_BODY CURL_CODES
     export ALGOD_ENTRYPOINT_TEST=1 ALGORAND_DATA="$DATA" ETC_DIR="$D/etc" \
         GENESIS_DIR="$D/genesis" CATCHUP_DELAY=0 CATCHUP_POLL=0
-    mkdir -p "$ETC_DIR" "$GENESIS_DIR/testnet" "$GENESIS_DIR/mainnet" "$GENESIS_DIR/fnet" "$GENESIS_DIR/voimain"
+    mkdir -p "$ETC_DIR" "$GENESIS_DIR/testnet" "$GENESIS_DIR/mainnet" "$GENESIS_DIR/fnet" "$GENESIS_DIR/voimain" "$GENESIS_DIR/aramidmain"
     echo '{"id":"testnet-genesis"}' >"$GENESIS_DIR/testnet/genesis.json"
     echo '{"id":"mainnet-genesis"}' >"$GENESIS_DIR/mainnet/genesis.json"
     echo '{"id":"fnet-genesis"}' >"$GENESIS_DIR/fnet/genesis.json"
     echo '{"id":"voimain-genesis"}' >"$GENESIS_DIR/voimain/genesis.json"
+    echo '{"id":"aramidmain-genesis"}' >"$GENESIS_DIR/aramidmain/genesis.json"
 }
 
 # run main in a subshell with exec_algod / start_kmd stubbed; output -> $D/out.log
@@ -192,6 +193,24 @@ export NETWORK=voimain PEER_ADDRESS="9.9.9.9:5011"
 run_main
 hasnt "PEER_ADDRESS on voimain keeps the preset DNS bootstrap" 'DNSBootstrapID' "$CALLS"
 has "PEER_ADDRESS on voimain is handed to algod -p" '^algod -o -p 9.9.9.9:5011$' "$CALLS"
+
+# ---- 5c. Aramid mainnet (issue #2075) ---
+new_case
+make_curl_stub
+export NETWORK=aramidmain FAST_CATCHUP=1 CATCHUP_WAIT_TRIES=1
+export CURL_BODY='{"catchup-time":0,"last-catchpoint":"5000000#ARAMIDLABEL","last-round":5}'
+run_main
+[ "$(cat "$DATA/genesis.json")" = '{"id":"aramidmain-genesis"}' ] && ok "aramidmain installs its genesis.json" || bad "aramidmain genesis not installed"
+has "aramidmain asks the Aramid gateway for the last catchpoint" '^curl .*https://algod\.aramidmain\.a-wallet\.net/v2/status' "$CALLS"
+has "aramidmain catches up to the gateway's last-catchpoint" '^goal node catchup --force --min 1000000 5000000#ARAMIDLABEL$' "$CALLS"
+hasnt "aramidmain does not override the preset's DNS bootstrap" 'DNSBootstrapID' "$CALLS"
+has "aramidmain node is started" '^algod -o' "$CALLS"
+
+new_case
+export NETWORK=aramidmain PEER_ADDRESS="9.9.9.9:14161"
+run_main
+hasnt "PEER_ADDRESS on aramidmain keeps the preset DNS bootstrap" 'DNSBootstrapID' "$CALLS"
+has "PEER_ADDRESS on aramidmain is handed to algod -p" '^algod -o -p 9.9.9.9:14161$' "$CALLS"
 
 new_case
 export NETWORK=mainnet PEER_ADDRESS="9.9.9.9:4160"
@@ -494,6 +513,26 @@ has "relays are discovered through the network's SRV name" '^dig \+short SRV _al
 has "the probe asks for the catchpoint round in base 36" 'http://good\.example:5011/v1/voimain-v1\.0/ledger/e8osg$' "$CALLS"
 has "only the relay that serves the file becomes the peer" '^algod -o -p good\.example:5011$' "$CALLS"
 has "the catchup uses the label the probe used" '^goal node catchup --force --min 1000000 23920000#ABC$' "$CALLS"
+
+new_case
+export NETWORK=aramidmain FAST_CATCHUP=1 CATCHUP_WAIT_TRIES=1
+export CURL_BODY='{"last-catchpoint":"5000000#ABC"}'
+make_curl_stub
+printf 'good.example:14161 200
+bad.example:14161 404
+' >"$D/codes"
+export CURL_CODES="$D/codes"
+cat >"$BIN/dig" <<'EOF2'
+#!/usr/bin/env bash
+echo "dig $*" >>"$CALLS"
+printf '1 1 14161 bad.example.
+1 1 14161 good.example.
+'
+EOF2
+run_main
+has "aramidmain relays are discovered through its SRV name" '^dig \+short SRV _algobootstrap\._tcp\.aramidmain\.a-wallet\.net$' "$CALLS"
+has "aramidmain probes /v1/aramidmain-v1.0/ledger/<round base36>" 'http://good\.example:14161/v1/aramidmain-v1\.0/ledger/' "$CALLS"
+has "aramidmain pins only the serving relay" '^algod -o -p good\.example:14161$' "$CALLS"
 
 new_case
 export NETWORK=voimain FAST_CATCHUP=1 CATCHUP_WAIT_TRIES=1
