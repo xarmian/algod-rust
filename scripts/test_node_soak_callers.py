@@ -130,6 +130,26 @@ class CallerTest(unittest.TestCase):
         self.assertNotIn("push", t)
         self.assertEqual(t["schedule"], [{"cron": "40 5 * * *"}])
 
+    def test_aramidmain_caller_parameters(self):
+        (_, _, spec, doc), = [c for c in callers() if c[0] == "aramidmain-node-soak.yml"]
+        w = spec["with"]
+        self.assertEqual(w["network"], "aramidmain")
+        self.assertEqual(w["genesis_id"], "aramidmain-v1.0")
+        self.assertEqual(w["genesis_path"], "bin/algod-rust/genesis/aramidmain-genesis.json")
+        self.assertEqual(w["consensus_json"], "bin/algod-rust/consensus/aramidmain-consensus.json")
+        self.assertEqual(w["relay_discovery"], "srv:_algobootstrap._tcp.aramidmain.a-wallet.net")
+        self.assertEqual(w["probe_catchpoint_file"], "true")
+        self.assertIn("https://algod.aramidmain.a-wallet.net", w["peer_url"])
+        self.assertIn("vars.ARAMIDMAIN_ALGOD_URL", w["peer_url"])
+        self.assertEqual(doc["concurrency"]["group"], "aramidmain-node-soak")
+        t = triggers(doc)
+        self.assertIn("workflow_dispatch", t)
+        self.assertNotIn("pull_request", t)
+        self.assertNotIn("push", t)
+        self.assertEqual(t["schedule"], [{"cron": "20 7 * * *"}])
+        # ~3 s blocks: the 5 min no-progress gate is ~100 blocks
+        self.assertIn("'5'", w["halt_minutes"])
+
     def test_schedules_are_staggered(self):
         crons = []
         for _, _, _, doc in callers():
