@@ -136,9 +136,56 @@ catchup() {
     return 1
   fi
   for i in 1 2 3 4 5; do
-    goal node catchup --force --min "${CATCHUP_MIN:-1000000}" ${label:+"$label"} && return 0
+    if goal node catchup --force --min "${CATCHUP_MIN:-1000000}" ${label:+"$label"}; then
+      supervise_catchup "$label"
+      return $?
+    fi
     sleep "$CATCHUP_DELAY"
   done
+  return 1
+}
+
+# The node accepts a catchup and runs it in the background; one that ends
+# without a ledger (the catchpoint relay it picked was unreachable, a download
+# was cut off) leaves the node at round 0, where it can never sync block by
+# block on a network whose relays have no early blocks (Voi). The relay for
+# each catchup is drawn from the ranked candidates, so asking again usually
+# succeeds (issue #2074: seen on GitHub runners). `goal node status` prints a
+# `Catchpoint:` line while a catchup runs; a node still at round 0 without one,
+# on two consecutive polls, has none running, so request it again, at most
+# CATCHUP_RETRIES times.
+supervise_catchup() {
+  local label="$1" retries="${CATCHUP_RETRIES:-20}" idle=0 n=0 unknown=0 out
+  while [ "$n" -lt "$retries" ]; do
+    sleep "${CATCHUP_POLL:-20}"
+    out="$(goal node status 2>/dev/null)" || out=""
+    # (an unreachable node or unrecognised output: stop after 30 polls in a row)
+    case "$out" in
+    *"Last committed block: "*) unknown=0 ;;
+    *)
+      unknown=$((unknown + 1))
+      if [ "$unknown" -ge 30 ]; then return 1; fi
+      continue
+      ;;
+    esac
+    if printf '%s
+' "$out" | grep -q '^Catchpoint: '; then
+      idle=0
+    elif printf '%s
+' "$out" | grep -q '^Last committed block: [1-9]'; then
+      return 0
+    elif printf '%s
+' "$out" | grep -q '^Last committed block: 0$'; then
+      idle=$((idle + 1))
+      if [ "$idle" -ge 2 ]; then
+        idle=0
+        n=$((n + 1))
+        echo "FAST_CATCHUP: the catchup ended without a ledger; asking again ($n/$retries)" >&2
+        goal node catchup --force --min "${CATCHUP_MIN:-1000000}" ${label:+"$label"} || true
+      fi
+    fi
+  done
+  echo "FAST_CATCHUP: giving up after $retries retries" >&2
   return 1
 }
 

@@ -91,7 +91,8 @@ curl -H "X-Algo-API-Token: <token>" localhost:8080/v2/status
   `goal node catchup --force --min ${CATCHUP_MIN:-1000000} <label>`; the file itself is
   downloaded from the relays the node discovered (only some Voi relays serve it; the
   node ranks the others down). `CATCHPOINT=<label>` pins a label, `FAST_CATCHUP=0`
-  syncs block by block, and if the gateway advertises no label the node starts without a
+  syncs block by block, a catchup that ends without a ledger (e.g. the relay it picked is
+  unreachable) is requested again, up to `CATCHUP_RETRIES` (20) times, and if the gateway advertises no label the node starts without a
   catchup (and says so).
 * Mount `/algod/data` to keep the ledger. A restart asks for the catchup again, but the node
   only accepts it when it is more than `CATCHUP_MIN` rounds behind the label, so a ledger

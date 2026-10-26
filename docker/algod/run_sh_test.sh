@@ -63,9 +63,9 @@ new_case() {  # sets D (case dir), DATA, CALLS and a clean environment
     export CALLS
     unset NETWORK PROFILE DEV_MODE START_KMD FAST_CATCHUP TOKEN ADMIN_TOKEN KMD_TOKEN \
         TELEMETRY_NAME TELEMETRY_URL NUM_ROUNDS GENESIS_ADDRESS PEER_ADDRESS GOSSIP_PORT \
-        ALGOD_PORT KMD_PORT DEBUG CATCHPOINT CATCHPOINT_STATUS_URL CATCHPOINT_LABEL_TRIES CATCHUP_MIN CATCHUP_WAIT_TRIES CURL_BODY
+        ALGOD_PORT KMD_PORT DEBUG CATCHPOINT CATCHPOINT_STATUS_URL CATCHPOINT_LABEL_TRIES CATCHUP_MIN CATCHUP_WAIT_TRIES CATCHUP_RETRIES CURL_BODY
     export ALGOD_ENTRYPOINT_TEST=1 ALGORAND_DATA="$DATA" ETC_DIR="$D/etc" \
-        GENESIS_DIR="$D/genesis" CATCHUP_DELAY=0
+        GENESIS_DIR="$D/genesis" CATCHUP_DELAY=0 CATCHUP_POLL=0
     mkdir -p "$ETC_DIR" "$GENESIS_DIR/testnet" "$GENESIS_DIR/mainnet" "$GENESIS_DIR/fnet" "$GENESIS_DIR/voimain"
     echo '{"id":"testnet-genesis"}' >"$GENESIS_DIR/testnet/genesis.json"
     echo '{"id":"mainnet-genesis"}' >"$GENESIS_DIR/mainnet/genesis.json"
@@ -281,7 +281,7 @@ new_case
     goal() {
         echo "goal $*" >>"$CALLS"
         case "$2" in
-        status) N=$((N + 1)); [ "$N" -ge 4 ] ;;                  # answers from the 4th probe on
+        status) N=$((N + 1)); [ "$N" -ge 4 ] && echo "Last committed block: 5" ;;                  # answers from the 4th probe on
         catchup) C=$((C + 1)); [ "$C" -ge 3 ] ;;                 # refused twice, then accepted
         esac
     }
@@ -289,11 +289,10 @@ new_case
 ) >/dev/null 2>&1
 rc=$?
 [ "$rc" = 0 ] && ok "catchup succeeds once the node answers" || bad "catchup exit code $rc"
-[ "$(grep -c '^goal node status' "$CALLS")" = 4 ] && ok "catchup waits for the node (4 status probes)" || bad "status probes: $(grep -c '^goal node status' "$CALLS")"
-[ "$(grep -c '^goal node catchup' "$CALLS")" = 3 ] && ok "a refused catchup is retried" || bad "catchup attempts: $(grep -c '^goal node catchup' "$CALLS")"
 first_catchup=$(grep -n '^goal node catchup' "$CALLS" | head -1 | cut -d: -f1)
-last_status=$(grep -n '^goal node status' "$CALLS" | tail -1 | cut -d: -f1)
-[ "$first_catchup" -gt "$last_status" ] && ok "no catchup before the node answered" || bad "catchup fired before the node answered"
+[ "$(head -n "$first_catchup" "$CALLS" | grep -c '^goal node status')" = 4 ] && ok "catchup waits for the node (4 status probes first)" || bad "status probes before the catchup: $(head -n "$first_catchup" "$CALLS" | grep -c '^goal node status')"
+[ "$(grep -c '^goal node catchup' "$CALLS")" = 3 ] && ok "a refused catchup is retried" || bad "catchup attempts: $(grep -c '^goal node catchup' "$CALLS")"
+[ "$(tail -n 1 "$CALLS")" = "goal node status" ] && ok "an accepted catchup is supervised (one more status poll)" || bad "no supervision poll"
 
 # ---- 7b. secrets never reach the log ----------------------------------------------------------
 new_case
@@ -460,6 +459,52 @@ has "algokey is algokey-rust" '^algokey-rust generate$' "$CALLS"
 has "kmd -d gets serve put in front" '^kmd-rust serve -d /k -t 0$' "$CALLS"
 has "kmd serve is passed through" '^kmd-rust serve -d /k$' "$CALLS"
 has "diagcfg is a successful no-op" '^diagcfg-exit 0$' "$CALLS"
+
+# ---- supervise_catchup (issue #2074): a catchup that ends at round 0 is asked for again ----
+new_case
+(
+    set +u
+    source "$RUN"
+    # (`goal node status` runs in a command substitution: count in a file)
+    echo 0 >"$D/polls"
+    goal() {
+        echo "goal $*" >>"$CALLS"
+        if [ "$2" = status ]; then
+            S=$(( $(cat "$D/polls") + 1 ))
+            echo "$S" >"$D/polls"
+            # polls 1-2: catchup running; 3-4: ended at round 0 (a retry is due);
+            # 5: running again; 6+: a ledger exists
+            case "$S" in
+            1 | 2 | 5) printf 'Last committed block: 0
+Sync Time: 0.0s
+Catchpoint: 1#X
+' ;;
+            3 | 4) printf 'Last committed block: 0
+Time since last block: 0.0s
+' ;;
+            *) printf 'Last committed block: 23919680
+' ;;
+            esac
+        fi
+    }
+    supervise_catchup 23920000#LABEL
+) >/dev/null 2>&1
+rc=$?
+[ "$rc" = 0 ] && ok "supervise_catchup returns once the node has a ledger" || bad "supervise_catchup exit code $rc"
+[ "$(grep -c '^goal node catchup --force --min 1000000 23920000#LABEL$' "$CALLS")" = 1 ] && ok "a catchup that ended at round 0 is requested again, once" || bad "retries: $(grep -c '^goal node catchup' "$CALLS")"
+
+new_case
+(
+    set +u
+    source "$RUN"
+    export CATCHUP_RETRIES=3
+    goal() { echo "goal $*" >>"$CALLS"; [ "$2" = status ] && printf 'Last committed block: 0
+'; return 0; }
+    supervise_catchup ""
+) >/dev/null 2>&1
+rc=$?
+[ "$rc" = 1 ] && ok "supervise_catchup gives up after CATCHUP_RETRIES" || bad "give-up exit code $rc"
+[ "$(grep -c '^goal node catchup --force --min 1000000$' "$CALLS")" = 3 ] && ok "CATCHUP_RETRIES bounds the retries (no label: lookup by goal)" || bad "retries: $(grep -c '^goal node catchup' "$CALLS")"
 
 if [ "$FAILS" -ne 0 ]; then
     echo "$FAILS check(s) failed"

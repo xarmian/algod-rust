@@ -9,7 +9,7 @@
 #
 #   docker/scripts/network-image-smoke.sh <image> <genesis_id> [host_port]
 #
-# Environment: HEALTH_TIMEOUT (s, default 300), ROUND_TIMEOUT (s, default 1200:
+# Environment: HEALTH_TIMEOUT (s, default 300), ROUND_TIMEOUT (s, default 1500:
 # the first round can take a fast catchup), ADVANCE_TIMEOUT (s, default 900: after the import the node
 # still downloads the lookback blocks before it follows).
 
@@ -51,7 +51,7 @@ case "${versions//[[:space:]]/}" in
 esac
 
 echo "==> waiting for the first round (block sync or fast catchup)"
-deadline=$(( $(date +%s) + ${ROUND_TIMEOUT:-1200} ))
+deadline=$(( $(date +%s) + ${ROUND_TIMEOUT:-1500} ))
 r1=0
 while :; do
   r1="$(last_round 2>/dev/null || echo 0)"
