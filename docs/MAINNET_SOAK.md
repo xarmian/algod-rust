@@ -484,3 +484,13 @@ label from the gateway's `/v2/status`, and `probe_catchpoint_file: "true"`
 Its issues use the `voimain-soak` label/title and dedup separately from
 `mainnet-soak`. Voi's block time (~2.8 s) matches mainnet, so thresholds are
 shared; the monitor has no block-cadence gate, only the no-progress halt gate.
+
+The aramidmain soak (`aramidmain-node-soak.yml`, 07:20 UTC, issue #2073)
+likewise differs only in parameters: Aramid genesis, the bundled custom
+`consensus_json` (`aramidmain-v1.0/1..3`), SRV
+`_algobootstrap._tcp.aramidmain.a-wallet.net`, label from
+`https://algod.aramidmain.a-wallet.net/v2/status` and
+`probe_catchpoint_file: "true"` (both SRV relays served the file on
+2026-10-26). Block time measured at ~3.0 s (301 s over 100 blocks), so the 5
+min halt gate is ~100 blocks and shared. Issues use the `aramidmain-soak`
+label/title and dedup separately from `mainnet-soak`/`voimain-soak`.

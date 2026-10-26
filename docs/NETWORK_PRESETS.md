@@ -112,3 +112,14 @@ names) and is pinned against the fixture by
   ```
   algod-rust sync --network aramidmain --catchpoint <last-catchpoint from /v2/status> --follow     --catchpoint-peer-url http://de-k4-s1.a-wallet.net:14161     --catchpoint-peer-url http://fi-k1-s3.biatec.io:14160
   ```
+
+- Nightly soak (issue #2073): `.github/workflows/aramidmain-node-soak.yml`
+  (07:20 UTC daily, plus `workflow_dispatch`; staggered after the mainnet
+  04:20 and voimain 05:40 soaks) calls the reusable `network-node-soak.yml`
+  with the bundled `consensus_json`, SRV relay discovery and
+  `probe_catchpoint_file: "true"` (relays de-k4-s1.a-wallet.net:14161 and
+  fi-k1-s3.biatec.io:14160 both answered 200 for the catchpoint file on
+  2026-10-26; the gateway answers 404). Block time ~3.0 s, so the 5 min halt
+  threshold (~100 blocks) is unchanged. Halt issues carry the
+  `aramidmain-soak` label and dedup only against it. Override the gateway
+  with the `ARAMIDMAIN_ALGOD_URL` repo variable.

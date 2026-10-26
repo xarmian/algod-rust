@@ -1,0 +1,111 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: Nightly Aramidmain Node Soak
+
+# Issue #2073 (epic #2068): the Aramid mainnet sibling of mainnet-node-soak.yml
+# and voimain-node-soak.yml. A thin caller of the reusable
+# `network-node-soak.yml` (#2071): a single
+# `algod-rust participate --network aramidmain` node, fast-caught-up and then
+# followed on the GitHub-hosted runner; a `stuck` / `node_failure` /
+# `invalid_block_stall` verdict auto-files (or dedups into) a GitHub issue
+# titled and labelled for aramidmain (label `aramidmain-soak`, dedup scoped to
+# it).
+#
+# ## Schedule
+#
+# 07:20 UTC daily. Other nightly jobs: consensus-cluster 02:41, p2p-interop
+# 03:05, p2p-consensus-soak 03:50, mainnet-node-soak 04:20 (up to ~4 h),
+# voimain-node-soak 05:40 (up to ~3 h) and a 06:00 job. The stagger keeps the
+# soak runs off each other's start-up and the public gateways / relays from
+# seeing simultaneous bursts. `workflow_dispatch` runs default to dry-run
+# issue filing.
+#
+# ## Custom consensus
+#
+# Aramid runs custom consensus protocols `aramidmain-v1.0/1..3` that only
+# exist in `bin/algod-rust/consensus/aramidmain-consensus.json`; the node
+# merges the bundled copy itself, and the reusable workflow additionally
+# copies the same file into the data dir (`consensus_json`) so the soak
+# exercises the operator `<data_dir>/consensus.json` path too.
+#
+# ## Catchpoint access
+#
+#   * Label: no static index; the peer's own `/v2/status` `last-catchpoint`
+#     (https://algod.aramidmain.a-wallet.net, override with the
+#     `ARAMIDMAIN_ALGOD_URL` repo variable or the dispatch input).
+#   * File: the public gateway answers 404 for the ledger file, but both SRV
+#     relays of `_algobootstrap._tcp.aramidmain.a-wallet.net`
+#     (de-k4-s1.a-wallet.net:14161, fi-k1-s3.biatec.io:14160) served it
+#     (live, 2026-10-26: HTTP 200). `probe_catchpoint_file: "true"` keeps that
+#     verified rather than assumed -- a run whose relays stop serving the file
+#     fails loudly in the relay step (no issue is filed: a source problem).
+#
+# ## Thresholds
+#
+# Aramid's real block time is ~3.0 s (ts delta over 100 blocks, 2026-10-26:
+# 301 s; ~2.85 s/block by live round count over 60 s). `monitor.py` has no
+# block-cadence gate, only a no-progress halt gate (`halt_minutes`, 5 min =
+# ~100 Aramid blocks), so the 5 min default stays valid. Aramid is a small
+# chain (the catchpoint is small) so the cap is 180 min like Voi, follow 120.
+# Blocks keep being produced by the network's own proposers even when almost
+# empty, so "rounds advancing" is a valid liveness expectation.
+#
+# `scripts/test_node_soak_callers.py` checks this caller against the
+# reusable workflow's interface. Not on the PR path (schedule + dispatch only).
+
+on:
+  schedule:
+    - cron: "20 7 * * *"
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "Hard cap on total poll time in minutes (catchup + follow window; max 315)"
+        default: "180"
+        required: false
+      follow_minutes:
+        description: "Minutes to keep following the tip after it is first reached (0 = stop at the duration cap only)"
+        default: "120"
+        required: false
+      algod_url:
+        description: "Catchup peer REST URL override (default: the ARAMIDMAIN_ALGOD_URL variable, else the aramidmain preset gateway)"
+        required: false
+      halt_minutes:
+        description: "Minutes of no progress before a halt is declared"
+        default: "5"
+        required: false
+      dry_run_issues:
+        description: "Print the would-be issue instead of filing it"
+        type: boolean
+        default: true
+      rust_log:
+        description: "Optional RUST_LOG for the node. Empty = the default filter"
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: aramidmain-node-soak
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  aramidmain-node-soak:
+    uses: ./.github/workflows/network-node-soak.yml
+    with:
+      network: aramidmain
+      genesis_id: aramidmain-v1.0
+      genesis_path: bin/algod-rust/genesis/aramidmain-genesis.json
+      consensus_json: bin/algod-rust/consensus/aramidmain-consensus.json
+      peer_url: ${{ github.event.inputs.algod_url || vars.ARAMIDMAIN_ALGOD_URL || 'https://algod.aramidmain.a-wallet.net' }}
+      relay_discovery: "srv:_algobootstrap._tcp.aramidmain.a-wallet.net"
+      probe_catchpoint_file: "true"
+      duration_minutes: ${{ github.event.inputs.duration_minutes || '180' }}
+      follow_minutes: ${{ github.event.inputs.follow_minutes || '120' }}
+      halt_minutes: ${{ github.event.inputs.halt_minutes || '5' }}
+      dry_run_issues: ${{ github.event.inputs.dry_run_issues }}
+      rust_log: ${{ github.event.inputs.rust_log }}
