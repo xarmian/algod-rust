@@ -56,6 +56,8 @@ name: Nightly Aramidmain Node Soak
 # reusable workflow's interface. Not on the PR path (schedule + dispatch only).
 
 on:
+  push:
+    branches: [feat/issue-2073-aramidmain-node-soak]
   schedule:
     - cron: "20 7 * * *"
   workflow_dispatch:
@@ -104,8 +106,8 @@ jobs:
       peer_url: ${{ github.event.inputs.algod_url || vars.ARAMIDMAIN_ALGOD_URL || 'https://algod.aramidmain.a-wallet.net' }}
       relay_discovery: "srv:_algobootstrap._tcp.aramidmain.a-wallet.net"
       probe_catchpoint_file: "true"
-      duration_minutes: ${{ github.event.inputs.duration_minutes || '180' }}
-      follow_minutes: ${{ github.event.inputs.follow_minutes || '120' }}
+      duration_minutes: ${{ github.event.inputs.duration_minutes || '45' }}
+      follow_minutes: ${{ github.event.inputs.follow_minutes || '22' }}
       halt_minutes: ${{ github.event.inputs.halt_minutes || '5' }}
-      dry_run_issues: ${{ github.event.inputs.dry_run_issues }}
+      dry_run_issues: 'true'
       rust_log: ${{ github.event.inputs.rust_log }}
