@@ -149,6 +149,14 @@ base36() {
 # probe the relays for the catchpoint file and use the ones that have it as
 # the node's peers. Only with FAST_CATCHUP=1, no PEER_ADDRESS and a network
 # with an SRV name; if no relay answers, DNS discovery stays in charge.
+#
+# Issue #2095: the node no longer NEEDS this. Its catchpoint download fails
+# over across the ranked candidate relays, and the lookback-block download
+# rotates past stalled/pruned relays with a bounded per-request timeout, so a
+# bare `participate --network voimain` + POST /v2/catchup completed twice
+# against live Voi with every SRV relay (docs/NETWORK_PRESETS.md). The pin is
+# kept as a cheap optimisation (it skips the failed attempts) and because the
+# image-level smoke and aramidmain paths were not re-verified without it.
 pin_serving_relays() {
   [ -z "${PEER_ADDRESS:-}" ] && [ "${FAST_CATCHUP:-}" = "1" ] || return 0
   local srv label round path peers="" prio weight port target code
