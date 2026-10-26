@@ -51,6 +51,16 @@ name: Docker Image
 #                                                  `beta-algod`,
 #                                                  `nightly-algod`); see
 #                                                  docs/DOCKER_MIGRATION.md
+#   ghcr.io/xarmian/algod-rust:<tag>-voimain    — `voimain` target (issue
+#                                                  #2074): the `algod` image
+#                                                  following Voi mainnet
+#                                                  (embedded genesis, fast
+#                                                  catchup by default);
+#                                                  `latest-voimain`,
+#                                                  `stable-voimain`,
+#                                                  `nightly-voimain`, ...
+#                                                  A further network image
+#                                                  is one more matrix row.
 #
 # The same two images are **also** mirrored to Docker Hub, at
 # `docker.io/<DOCKERHUB_USERNAME>/algod-rust[:<tag>[-localnet]]` â€” same
@@ -241,7 +251,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [runtime, localnet, algod]
+        target: [runtime, localnet, algod, voimain]
         platform: [amd64, arm64]
         include:
           # Native runners, not QEMU emulation: an emulated arm64 release
@@ -262,6 +272,8 @@ jobs:
             suffix: "-localnet"
           - target: algod
             suffix: "-algod"
+          - target: voimain
+            suffix: "-voimain"
     permissions:
       contents: read
       packages: write
@@ -363,7 +375,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [runtime, localnet, algod]
+        target: [runtime, localnet, algod, voimain]
         include:
           - target: runtime
             suffix: ""
@@ -371,6 +383,8 @@ jobs:
             suffix: "-localnet"
           - target: algod
             suffix: "-algod"
+          - target: voimain
+            suffix: "-voimain"
     permissions:
       contents: read
       packages: write
@@ -484,7 +498,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [runtime, localnet, algod]
+        target: [runtime, localnet, algod, voimain]
+        include:
+          # Network images (issue #2074): `genesis_id` makes the job run the
+          # container and smoke-test it (docker/scripts/network-image-smoke.sh).
+          # A further network image (#2075) is one more row here.
+          - target: voimain
+            genesis_id: voimain-v1.0
     permissions:
       contents: read
     env:
@@ -513,8 +533,8 @@ jobs:
           target: ${{ matrix.target }}
           platforms: linux/amd64
           push: false
-          # only the algod image is run (smoke test below)
-          load: ${{ matrix.target == 'algod' }}
+          # only the algod image and the network images are run (smoke tests below)
+          load: ${{ matrix.target == 'algod' || matrix.genesis_id != '' }}
           tags: algod-rust-pr-check:${{ matrix.target }}
           build-args: |
             GIT_TAG=pr-check
@@ -584,6 +604,21 @@ jobs:
           echo "docker stop took ${took}s"
           test "$took" -lt 20
 
+      # Issue #2074: a network image must come up on its own network -- the
+      # container starts, /health answers, /versions reports the network's
+      # genesis id, and the round advances (block sync or the default fast
+      # catchup). Needs the public network, like the soaks.
+      - name: Smoke test the ${{ matrix.target }} network image
+        if: ${{ matrix.genesis_id != '' }}
+        timeout-minutes: 30
+        run: |
+          bash docker/scripts/network-image-smoke.sh algod-rust-pr-check:${{ matrix.target }} ${{ matrix.genesis_id }}
+
+      - name: Image size
+        if: ${{ matrix.genesis_id != '' }}
+        run: |
+          docker image inspect algod-rust-pr-check:${{ matrix.target }} --format 'image size: {{.Size}} bytes' | tee -a "$GITHUB_STEP_SUMMARY"
+
   smoke-test:
     name: Smoke test published image
     needs: [prepare, merge]
@@ -613,6 +648,13 @@ jobs:
           docker pull "$IMAGE"
           docker run --rm --entrypoint algod "$IMAGE" -v
           docker run --rm --entrypoint goal "$IMAGE" --help >/dev/null
+
+      - name: Pull the voimain network image (GHCR)
+        run: |
+          IMAGE="ghcr.io/${{ env.IMAGE_NAME }}:sha-$(echo "${{ github.sha }}" | cut -c1-7)-voimain"
+          docker pull "$IMAGE"
+          docker run --rm --entrypoint algod "$IMAGE" -v
+          docker run --rm --entrypoint sh "$IMAGE" -c 'test -s /node/run/genesis/voimain/genesis.json'
 
       - name: Log in to Docker Hub
         if: needs.prepare.outputs.has_dockerhub == 'true'

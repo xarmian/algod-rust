@@ -80,6 +80,43 @@ drop_privileges() {
 # Helper functions #
 ####################
 
+# The network's REST gateway that advertises `last-catchpoint` in /v2/status,
+# for networks without a static `latest.catchpoint` index (issue #2074; go's
+# `goal node catchup` only knows the Algorand S3 index). Add a network here to
+# give its image the same FAST_CATCHUP behaviour (see docs/NETWORK_PRESETS.md).
+default_catchpoint_status_url() {
+  case "$1" in
+  voimain) echo "https://mainnet-api.voi.nodely.dev/v2/status" ;;
+  aramidmain) echo "https://algod.aramidmain.a-wallet.net/v2/status" ;;
+  *) echo "" ;;
+  esac
+}
+
+# Prints the catchpoint label FAST_CATCHUP should use, or nothing to let
+# `goal node catchup` look the label up itself (Algorand networks). Order:
+# $CATCHPOINT, then the `last-catchpoint` of $CATCHPOINT_STATUS_URL (default:
+# the network's gateway above). With a status URL configured, a gateway that
+# does not answer or advertises no catchpoint yields no label and returns 1.
+resolve_catchpoint_label() {
+  if [ -n "${CATCHPOINT:-}" ]; then
+    echo "$CATCHPOINT"
+    return 0
+  fi
+  local url="${CATCHPOINT_STATUS_URL-$(default_catchpoint_status_url "$NETWORK")}"
+  [ -n "$url" ] || return 0
+  local i body label
+  for i in $(seq 1 "${CATCHPOINT_LABEL_TRIES:-5}"); do
+    body="$(curl -fsS -m 20 "$url" 2>/dev/null || true)"
+    label="$(printf '%s' "$body" | sed -n 's/.*"last-catchpoint"[[:space:]]*:[[:space:]]*"//p' | sed 's/".*$//')"
+    if [ -n "$label" ]; then
+      echo "$label"
+      return 0
+    fi
+    sleep "$CATCHUP_DELAY"
+  done
+  return 1
+}
+
 catchup() {
   sleep "$CATCHUP_DELAY"
   # go's REST API answers within a second; algod-rust resolves its peers
@@ -93,8 +130,13 @@ catchup() {
   if [ "$ready" = 0 ]; then
     echo "FAST_CATCHUP: the node did not answer in time; trying to start the catchup anyway" >&2
   fi
+  local label=""
+  if ! label="$(resolve_catchpoint_label)"; then
+    echo "FAST_CATCHUP: no catchpoint label could be fetched for '$NETWORK'; skipping the fast catchup (the node syncs from its peers; set CATCHPOINT=<label> to choose one)" >&2
+    return 1
+  fi
   for i in 1 2 3 4 5; do
-    goal node catchup --force --min 1000000 && return 0
+    goal node catchup --force --min "${CATCHUP_MIN:-1000000}" ${label:+"$label"} && return 0
     sleep "$CATCHUP_DELAY"
   done
   return 1
@@ -237,13 +279,18 @@ start_new_public_network() {
     alphanet) ID="<network>.algodev.network" ;;
     devnet) ID="<network>.algodev.network" ;;
     fnet) ID="<network>.algorand.tech" ;;
+    # algod-rust network presets carry their own DNS bootstrap template
+    # (docs/NETWORK_PRESETS.md); leave DNSBootstrapID at its default
+    voimain | aramidmain) ID="" ;;
     *)
       echo "Unknown network."
       exit 1
       ;;
     esac
-    echo Setting DNS Bootstrap ID to "$ID"
-    algocfg set -p DNSBootstrapID -v "$ID" -d "$ALGORAND_DATA"
+    if [ -n "$ID" ]; then
+      echo Setting DNS Bootstrap ID to "$ID"
+      algocfg set -p DNSBootstrapID -v "$ID" -d "$ALGORAND_DATA"
+    fi
   elif [ "$NETWORK" = "fnet" ]; then
     echo Setting FNet DNS Bootstrap ID
     algocfg set -p DNSBootstrapID -v "<network>.algorand.tech" -d "$ALGORAND_DATA"
@@ -323,6 +370,7 @@ main() {
   echo "   DEV_MODE:        $DEV_MODE"
   echo "   START_KMD:       ${START_KMD:-"Not Set"}"
   echo "   FAST_CATCHUP:    $FAST_CATCHUP"
+  echo "   CATCHPOINT:      ${CATCHPOINT:-}"
   # (go prints the token values; the admin token is full control of the node
   # and `docker logs` is routinely shipped, so only whether they are set)
   echo "   TOKEN:           $(set_or_not "$TOKEN")"

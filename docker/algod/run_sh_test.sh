@@ -41,6 +41,8 @@ done
 cat >"$BIN/curl" <<'EOF'
 #!/usr/bin/env bash
 echo "curl $*" >>"$CALLS"
+# a canned response body for `curl URL` (no -o), like the catchpoint-label lookup
+if [ -n "${CURL_BODY:-}" ]; then printf '%s' "$CURL_BODY"; fi
 while [ $# -gt 0 ]; do
     if [ "$1" = "-o" ]; then echo downloaded >"$2"; fi
     shift
@@ -61,13 +63,14 @@ new_case() {  # sets D (case dir), DATA, CALLS and a clean environment
     export CALLS
     unset NETWORK PROFILE DEV_MODE START_KMD FAST_CATCHUP TOKEN ADMIN_TOKEN KMD_TOKEN \
         TELEMETRY_NAME TELEMETRY_URL NUM_ROUNDS GENESIS_ADDRESS PEER_ADDRESS GOSSIP_PORT \
-        ALGOD_PORT KMD_PORT DEBUG
+        ALGOD_PORT KMD_PORT DEBUG CATCHPOINT CATCHPOINT_STATUS_URL CATCHPOINT_LABEL_TRIES CATCHUP_MIN CATCHUP_WAIT_TRIES CURL_BODY
     export ALGOD_ENTRYPOINT_TEST=1 ALGORAND_DATA="$DATA" ETC_DIR="$D/etc" \
         GENESIS_DIR="$D/genesis" CATCHUP_DELAY=0
-    mkdir -p "$ETC_DIR" "$GENESIS_DIR/testnet" "$GENESIS_DIR/mainnet" "$GENESIS_DIR/fnet"
+    mkdir -p "$ETC_DIR" "$GENESIS_DIR/testnet" "$GENESIS_DIR/mainnet" "$GENESIS_DIR/fnet" "$GENESIS_DIR/voimain"
     echo '{"id":"testnet-genesis"}' >"$GENESIS_DIR/testnet/genesis.json"
     echo '{"id":"mainnet-genesis"}' >"$GENESIS_DIR/mainnet/genesis.json"
     echo '{"id":"fnet-genesis"}' >"$GENESIS_DIR/fnet/genesis.json"
+    echo '{"id":"voimain-genesis"}' >"$GENESIS_DIR/voimain/genesis.json"
 }
 
 # run main in a subshell with exec_algod / start_kmd stubbed; output -> $D/out.log
@@ -146,6 +149,38 @@ run_main
 has "FAST_CATCHUP starts a forced catchup" '^goal node catchup --force --min 1000000$' "$CALLS"
 has "a new network is started" '^algod -o$' "$CALLS"
 
+# ---- 5b. Voi mainnet (issue #2074): the label comes from the network's REST gateway ---
+new_case
+export NETWORK=voimain FAST_CATCHUP=1 CATCHUP_WAIT_TRIES=1
+export CURL_BODY='{"catchup-time":0,"last-catchpoint":"23900000#KFAWCWWDOOSID3YYDJZOWIYYVW2KEKLMVPF5BHBLY6CFRCARJFMA","last-round":5}'
+run_main
+[ "$(cat "$DATA/genesis.json")" = '{"id":"voimain-genesis"}' ] && ok "voimain installs its genesis.json" || bad "voimain genesis not installed"
+has "voimain asks the Voi gateway for the last catchpoint" '^curl .*https://mainnet-api\.voi\.nodely\.dev/v2/status' "$CALLS"
+has "voimain catches up to the gateway's last-catchpoint" '^goal node catchup --force --min 1000000 23900000#KFAWCWWDOOSID3YYDJZOWIYYVW2KEKLMVPF5BHBLY6CFRCARJFMA$' "$CALLS"
+hasnt "voimain does not override the preset's DNS bootstrap" 'DNSBootstrapID' "$CALLS"
+has "voimain node is started" '^algod -o$' "$CALLS"
+
+new_case
+export NETWORK=voimain FAST_CATCHUP=1 CATCHPOINT='24000000#ABC' CATCHUP_MIN=500 CATCHPOINT_STATUS_URL=
+run_main
+has "CATCHPOINT overrides the lookup (and CATCHUP_MIN applies)" '^goal node catchup --force --min 500 24000000#ABC$' "$CALLS"
+hasnt "CATCHPOINT skips the gateway request" '^curl .*v2/status' "$CALLS"
+
+new_case
+export NETWORK=voimain FAST_CATCHUP=1 CATCHPOINT_STATUS_URL=http://gw.example/v2/status CATCHPOINT_LABEL_TRIES=2
+export CURL_BODY='{"last-round":5}'
+run_main
+has "CATCHPOINT_STATUS_URL overrides the gateway" '^curl .*http://gw\.example/v2/status' "$CALLS"
+hasnt "no catchpoint advertised: no catchup is attempted" '^goal node catchup' "$CALLS"
+has "no catchpoint advertised: the node still starts and says why" 'no catchpoint label' "$D/out.log"
+has "no catchpoint advertised: node is started" '^algod -o$' "$CALLS"
+
+new_case
+export NETWORK=voimain PEER_ADDRESS="9.9.9.9:5011"
+run_main
+hasnt "PEER_ADDRESS on voimain keeps the preset DNS bootstrap" 'DNSBootstrapID' "$CALLS"
+has "PEER_ADDRESS on voimain is handed to algod -p" '^algod -o -p 9.9.9.9:5011$' "$CALLS"
+
 new_case
 export NETWORK=mainnet PEER_ADDRESS="9.9.9.9:4160"
 run_main
@@ -174,6 +209,8 @@ export NETWORK=testnet GENESIS_ADDRESS="http://peer:8080"
 cat >"$BIN/curl" <<'EOF2'
 #!/usr/bin/env bash
 echo "curl $*" >>"$CALLS"
+# a canned response body for `curl URL` (no -o), like the catchpoint-label lookup
+if [ -n "${CURL_BODY:-}" ]; then printf '%s' "$CURL_BODY"; fi
 while [ $# -gt 0 ]; do
     if [ "$1" = "-o" ]; then echo "<html>404</html>" >"$2"; fi
     shift
@@ -188,6 +225,8 @@ has "a failed download says so" 'Unable to download the genesis file from http:/
 cat >"$BIN/curl" <<'EOF2'
 #!/usr/bin/env bash
 echo "curl $*" >>"$CALLS"
+# a canned response body for `curl URL` (no -o), like the catchpoint-label lookup
+if [ -n "${CURL_BODY:-}" ]; then printf '%s' "$CURL_BODY"; fi
 while [ $# -gt 0 ]; do
     if [ "$1" = "-o" ]; then echo downloaded >"$2"; fi
     shift
