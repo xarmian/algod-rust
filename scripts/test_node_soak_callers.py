@@ -107,6 +107,20 @@ class ReusableWorkflowTest(unittest.TestCase):
     def test_file_issue_receives_the_network(self):
         self.assertRegex(self.text, r'file_issue\.py[\s\S]*?--network "\$NET"')
 
+    def test_http_code_captures_survive_bash_e(self):
+        # Issue #2099: steps run under `bash -e`, so a curl that times out
+        # (exit 28 -- the expected outcome of the streaming catchpoint-file
+        # probe) or fails to connect must not abort the step before the
+        # captured `%{http_code}` is checked.
+        captures = list(re.finditer(r'[A-Z_]*CODE="\$\(curl\b', self.text))
+        self.assertGreaterEqual(len(captures), 5)
+        offenders = []
+        for m in captures:
+            end = self.text.index(')"', m.end())
+            if not self.text[end + 2:].startswith(" || true"):
+                offenders.append(self.text.count("\n", 0, m.start()) + 1)
+        self.assertEqual(offenders, [], "curl http_code captures without `|| true` at lines")
+
 
 class CallerTest(unittest.TestCase):
     def test_at_least_the_mainnet_caller_exists(self):

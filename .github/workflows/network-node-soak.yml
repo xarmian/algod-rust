@@ -297,8 +297,9 @@ jobs:
             if [ -n "$PROBE_PATH" ]; then
               # The relay streams the whole file for a GET (Range is ignored),
               # so cut the transfer after a few seconds; the status code is
-              # still reported.
-              FILE_CODE="$(curl -s -m 8 -o /dev/null -w '%{http_code}' "$CANDIDATE$PROBE_PATH")"
+              # still reported (curl exits 28 on the cut, hence `|| true` --
+              # issue #2099).
+              FILE_CODE="$(curl -s -m 8 -o /dev/null -w '%{http_code}' "$CANDIDATE$PROBE_PATH")" || true
               echo "==> probing $CANDIDATE (catchpoint file HTTP $FILE_CODE)"
               if [ "$FILE_CODE" = "200" ]; then
                 RELAY_URL="$CANDIDATE"
@@ -306,7 +307,7 @@ jobs:
               fi
               continue
             fi
-            HTTP_CODE="$(curl -s -m 10 -o /dev/null -w '%{http_code}' "$CANDIDATE/v2/status")"
+            HTTP_CODE="$(curl -s -m 10 -o /dev/null -w '%{http_code}' "$CANDIDATE/v2/status")" || true
             echo "==> trying $CANDIDATE (status endpoint HTTP $HTTP_CODE)"
             if [ "$HTTP_CODE" != "000" ]; then
               # Any real HTTP response (even a 4xx from a relay that
@@ -532,7 +533,7 @@ jobs:
           echo "==> checking the catchup peer's own /v2/status ($ALGOD_URL)"
           PEER_HTTP_CODE=""
           for attempt in 1 2 3 4 5; do
-            PEER_HTTP_CODE="$(curl -s -o /tmp/peer-status.json -w '%{http_code}' "$ALGOD_URL/v2/status")"
+            PEER_HTTP_CODE="$(curl -s -o /tmp/peer-status.json -w '%{http_code}' "$ALGOD_URL/v2/status")" || true
             if [ "$PEER_HTTP_CODE" = "200" ]; then
               break
             fi
@@ -581,7 +582,7 @@ jobs:
           fi
           for attempt in 1 2 3 4 5; do
             if [ -n "$LABEL" ] || [ "$USE_PEER_STATUS" = 1 ]; then break; fi
-            INDEX_HTTP_CODE="$(curl -s -o /tmp/catchpoint-label.txt -w '%{http_code}' "$CATCHPOINT_INDEX_URL")"
+            INDEX_HTTP_CODE="$(curl -s -o /tmp/catchpoint-label.txt -w '%{http_code}' "$CATCHPOINT_INDEX_URL")" || true
             if [ "$INDEX_HTTP_CODE" = "200" ]; then
               LABEL="$(tr -d '[:space:]' < /tmp/catchpoint-label.txt)"
               break
@@ -616,7 +617,7 @@ jobs:
           LABEL_URLENC="${LABEL//#/%23}"
           CATCHUP_HTTP_CODE="$(curl -s -o /tmp/catchup-response.json -w '%{http_code}' -X POST \
             -H "X-Algo-API-Token: $ALGOD_TOKEN" \
-            "http://127.0.0.1:8180/v2/catchup/$LABEL_URLENC")"
+            "http://127.0.0.1:8180/v2/catchup/$LABEL_URLENC")" || true
           if [ "$CATCHUP_HTTP_CODE" != "200" ] && [ "$CATCHUP_HTTP_CODE" != "201" ]; then
             echo "fatal: POST /v2/catchup/$LABEL on the node returned HTTP $CATCHUP_HTTP_CODE" >&2
             cat /tmp/catchup-response.json >&2 2>/dev/null || true
