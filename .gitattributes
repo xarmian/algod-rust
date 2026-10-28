@@ -88,3 +88,8 @@ scripts/bench/**/*.md text eol=lf
 # exact committed bytes, so no end-of-line conversion ever (binary).
 benchmarks/fixtures/** -text
 scripts/bench/testdata/** text eol=lf
+
+# Deterministic workload block corpus (issue #2104): MANIFEST.sha256 pins the
+# exact bytes of every file (corpus.json and genesis.json included) and the
+# Rust corpus test checks it, so no end-of-line conversion ever (binary).
+benchmarks/corpus/** -text

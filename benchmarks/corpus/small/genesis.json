@@ -1,0 +1,528 @@
+{
+  "alloc": [
+    {
+      "addr": "NRSBPA4WFKMVDUUQDBWIESR63RH2IGD5SQO2TMX3G4PTFFY2S54NT7664U",
+      "comment": "RewardsPool",
+      "state": {
+        "algo": 100000000000000,
+        "onl": 2
+      }
+    },
+    {
+      "addr": "NP5ZT666ZNHWZPGLWAFBGDNTXS4E4FGKIA6S2OEZR5DVLUMLFLJUTND6VQ",
+      "comment": "FeeSink",
+      "state": {
+        "algo": 100000,
+        "onl": 2
+      }
+    },
+    {
+      "addr": "JJJKQQTBJ3KCIQRC3IAFXH4BAARQSRMIGRISI7SGK3LNAJJASGX52PECPQ",
+      "comment": "validator-0",
+      "state": {
+        "algo": 100000000000000,
+        "onl": 1,
+        "sel": "EnYi7idN6dg9Hs1jAAaE6puRees5xwYVg8ZBnWFCt1Q=",
+        "stprf": "pQhrIe8Zh+ZWk9vgTDEGZAdllA3X8+0NQovI3+Xx8J7SPc6Ufl1SBZP9hAcSXIhbh7H65xpA2HTem/PsBnShHg==",
+        "vote": "+2d9x/4s4ZinJElU2NW5yV12m3+AbPC9p99PsYxo8Gg=",
+        "voteKD": 10000,
+        "voteLst": 10000000
+      }
+    },
+    {
+      "addr": "K4AV3GMKSQBJ3KYQGNFHCFVXI4R3LNW26WR7FGOFTBK6DN2LKYAF36BRXE",
+      "comment": "validator-1",
+      "state": {
+        "algo": 100000000000000,
+        "onl": 1,
+        "sel": "dEhJD7GgCIot9xPJeo9tCL2oCJ52esjqAAWz5/Um3jg=",
+        "stprf": "mztVmDRKjYK2r/6pRG1xcXj76nnja31qzl+sF6ZHDEsCuh9G41/n+dnL6MYCAibzh+QptOZjQKy30Hbv9dHwig==",
+        "vote": "Z6IxFfiGA6jhk4njM+VinLQvm22zpKVNJkwY2eH4Gns=",
+        "voteKD": 10000,
+        "voteLst": 10000000
+      }
+    },
+    {
+      "addr": "NFWMXNI6IS4QYNF6HF27OZIIGYMD4VMM3BZVOESIWRYHLMZJ7OTGVS4MCI",
+      "comment": "validator-2",
+      "state": {
+        "algo": 100000000000000,
+        "onl": 1,
+        "sel": "aG9O6RfXu7w5MOUlxEhhfbwbrJb07DskCX4sXeVUEOI=",
+        "stprf": "cHa9Xy1cRx3AQrFPEOkHXAgsWUVoaXDj0w/W+kHF8kCBRtBoyBzIk5CKh1NBO77KFXrG6NdmxoJaOfPia6DfdA==",
+        "vote": "ILJ0K33S7u1Ut3N/7CQES9xsOxtr4OeRCG2ffNNPbzo=",
+        "voteKD": 10000,
+        "voteLst": 10000000
+      }
+    },
+    {
+      "addr": "XRZHHHXHSO4LU3HF3GTNPI65A7HIQY36RZ27NGU7U3HB2KPAZXSVA7XXR4",
+      "comment": "validator-3",
+      "state": {
+        "algo": 100000000000000,
+        "onl": 1,
+        "sel": "2oGkaBpubEaR8qtvNh2Ygpwu0gdByiVJ2fy5G3dmHuc=",
+        "stprf": "GJTmvFk/huxWFKYyu6tTJG9YNWU5NTEXkyr5QZ5unUevelwRPuwjlf4UXtyHCi07wSNayuRKAjEv28GjbODn+w==",
+        "vote": "MLs6csDB+o408O9xQClvEUMQuFs2Uau6+KWE0OjwevM=",
+        "voteKD": 10000,
+        "voteLst": 10000000
+      }
+    },
+    {
+      "addr": "OPDQ742DANUQHC233JEAG6AOPXOJT3MPIPP66WN57NJDM3ZERJ4R4QV3CI",
+      "comment": "account-0",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "ICV66SQ4QAOFNPGCU44XY4BKB5VQQVJ5PMP4752KTBHZGQNJJBKWG7DUO4",
+      "comment": "account-1",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "HNFQLFW6GNUXAEOPCCBAF22RKQEDKYSRNT4UIFNRVPEJSZHV2UMLIFK3XU",
+      "comment": "account-2",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "5CEKX3KSIKI5365YFADSNFEFHPIJYTIL7BRYER5NOXHLU2MSBPNXPSC6LI",
+      "comment": "account-3",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "ZKWJC5CNMNW7NGYKISXPCNPJK4MFYLJSSUXBVASXFJ2DR22Q7TA5N5LC6M",
+      "comment": "account-4",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "66DYT4VQSISDJDVZIG73MA5AFZXF3LFUG3PVZY377HH3XJ3DTWP7OKRXH4",
+      "comment": "account-5",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "T4LASI2YLBLVUITAC7WMQK2VCCDLILMUYBZS4CIXBKZSHV5VLXAXARRLOQ",
+      "comment": "account-6",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "YAEEZUKTK5B2TF4Y6L742PNDS5HYIMDTRWK3Z3V4RFVT4NMNDX7HUBV7SI",
+      "comment": "account-7",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "2NTY52YAMD7TSEXFALIKHVLFLCZ4JJMTGCGYYYGAMSVJSZS24RMPF245CE",
+      "comment": "account-8",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "L3DCGBE3CDUCB3P3AEQ3HLYDEAF7Z4E7GVIZVI2YVLZHSWPR7Y5O62RFNY",
+      "comment": "account-9",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "PEIXABE2UV6LGVM2LREY3CFM7FGUFVHN32PFQC4KECHNZK4VK4TZAJY6O4",
+      "comment": "account-10",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "NL253OQ5TRZR4UT727PSVGCRQVWDJL4LPL2MGEXXI6VC7IK2SBOPIGAY6M",
+      "comment": "account-11",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "YB4ZEPXJLGNS4SA53GFRKHFXRQQRU4UESV3XXJBLHIJ3K3EXMXCLXJ2BQQ",
+      "comment": "account-12",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "Z64D627RFIMUUPM2FSCM7W2MWRXJ4JSQMCZGL56SE6JEJXUBEIGHRVZYFY",
+      "comment": "account-13",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "PEJ47FCIOVZSCVIOEM4G3GF7Q6L56GY5E4SKLUWW7VIY2MVX6QKPJ5YRS4",
+      "comment": "account-14",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "35U7AI3DWWXJB35MZRF3YDAIZQVB6GNUAMR3445HW3BUQOCRNMEYESLICY",
+      "comment": "account-15",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "OF6YNLMFE6OBKOHQBRZSPRF2DAXB7MS5WEH7A4OCCIREIKHAJO7ZT3ZZF4",
+      "comment": "account-16",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "RP6YIGOUJ76OFYVMY5RDCXDIKFI6TEDLYVDJJ4WDVUPYZKGZGJSEB3V2NM",
+      "comment": "account-17",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "D3CKAOHWSN3UUCEEWJVFW3RSHGRSNTKQEU6QRIHLBESJZBJRDPPCPQTT7Q",
+      "comment": "account-18",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "Z7HIIQHCQ4V6AKL4KLRL7ADKEC5PIPDSJWYKV63TZEDKWUVMRVPQGVVGBI",
+      "comment": "account-19",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "OOFYCXSLPIWAVDAATZCN3TJSNVIKXXKUZWRDT6PKAPXTBVAHOAX4L6IJKM",
+      "comment": "account-20",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "C5DFMWXNYQPIQGV56U5QGN36NRTJXRRFAVSFS4WEI6FUQLAKYXBPG22DCA",
+      "comment": "account-21",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "HFTGOACY6IZOY5XR2EGIGLPNHFYAT4XTKZWQ4IKG4KNUMDFNQDWS666CXU",
+      "comment": "account-22",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "A4KUVGQ3UJRYZ6JFPXL2ZK3ZUT3K3TRAWLGAA4U4KKOFAZ3ZZCSGBNKNTU",
+      "comment": "account-23",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "VYWG3T5UCRQKQP4OT7E5JNROLPJILMGNR4JC26II7TYQDWX6ZTJMI4NFZU",
+      "comment": "account-24",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "RDFPACWL2O5GVVUK6AUDGFMKARZYZ5BJFRYUJLWMJHAIU64V4NBEFRPDJA",
+      "comment": "account-25",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "SHKBZTHTYARVSM4IYVONMTRUHFQVEOJAXXHTLBIO4QARY2J7GTOEEMQZOM",
+      "comment": "account-26",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "D7LFEYYOUB7WD6WZPZW5HWY6TVC3SEEVZZZAEPNZH35K7PCUG5OITJ6GXY",
+      "comment": "account-27",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "IWZK2AGRZQDH5XVYI2IRGMJB5JISNM7WWOKNO275UPIP3O63LE5F3SZ65E",
+      "comment": "account-28",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "4XSYTXT233GADTX2DCNFT7VX4PGTWDFC7XMCNC63X67WHYKX6PITRIPEX4",
+      "comment": "account-29",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "RG4COBY7DVS2YWVE5CTX6B2ZXC4JLKBJPCVSXHFNLM2IPNNU4R3AQRGFV4",
+      "comment": "account-30",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "UXQCUSQSXCDOPLW6IRVVYA2MSUHHT7YRMNKLDEVUYJVKNK6SRV7EL6SPTQ",
+      "comment": "account-31",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "IMPJHJTTMEBING5NTNCWE7DNZVXKRWQ7VUWDDNMTXIXK2U3G7HOQT7HNYY",
+      "comment": "account-32",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "RQMEOQIUIHRFNUIL7TPWIJ7NPSKAVGCOIFOAHUMGEQ33BBMFKN56CALVUI",
+      "comment": "account-33",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "LJPLB74GAS2TB56IM7M7PUTNIPGS33EETKB63CIQLJXJYSAKY6FIS3I7ZM",
+      "comment": "account-34",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "TTHM4IDXLGTNGBJAXAQPQAJX6WJIA62VHGFCDRSKV3LNEGI3VJNPOQ3JB4",
+      "comment": "account-35",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "E6SQ5DQFFVHD4KWMWQRD6VMNR2ZDDOJ6WNIYY23KPL4Z3GO4MXQ3WOVJKQ",
+      "comment": "account-36",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "RRTQIQOOINW5O4VFZNOUP2VHSUUKI6XCFEIZ3UIBJWCD2AX7PFBOP7C6MI",
+      "comment": "account-37",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "RPTUOCKRQZASUYI7J7RNFIKB2W26EU3X2ZICZRQYIHMESOGROVSS5UAT4E",
+      "comment": "account-38",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "GNBLYED22DKCKPEUAF6CP3UYUPPZOF7U4H7227UIO5QFPD2YRGEYIM47FU",
+      "comment": "account-39",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "QMJ7JCCZCKUWCFPXPZUOIXRVK7MHG4I4OKCPZR5XR45SVDK3UCBX5Q6STU",
+      "comment": "account-40",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "YM2SMEGHLORVUU5QO7A47P557RRAVNIXNBDISSGMIBSJZO7UKRQ5IO5SYE",
+      "comment": "account-41",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "2EOBA7SL5T2ZBVTNI4OZ2RSBI4TWWC2OVPEIMJT5QXHWALAHY7JEEMZ4TI",
+      "comment": "account-42",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "BZC456YLHQFGI6N22CFX5LLSWMIVFOZMKH5NP6WWBWSQEQPH6ZXP4TDWBY",
+      "comment": "account-43",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "DCWICZL6KE27AGFUF4MWY5K5Q2Z4NZSD7NXDO5BISDOMCTUZZM2C7D5P5Y",
+      "comment": "account-44",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "A5IJZR6WCCWHAA4JJPRCRXXV3O63DYB6T4EBH6XOLJ44PLWG3KRTJIAPME",
+      "comment": "account-45",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "GOBHBNOEQ6QZFI7UHJ6EWSHYKZRUGS7GOC34HICVBAX355P4FL26RNJXEI",
+      "comment": "account-46",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "4A56QPRYTCZAQ7IGHN2SIYXMVUT6XCJSFNQ3SWDKHBSXOB33GVPGPES4D4",
+      "comment": "account-47",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "35E4JNNOQMTVS5T5UMUGVZRUBWKTE4QACADMLIVEVVK7ZC6XQJIHQBHPMQ",
+      "comment": "account-48",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "TMZASUCJUWAYWFNTROZ3OZGQVYPGIJDQSFFG2HIHBLT2YNLHW235XDZVOM",
+      "comment": "account-49",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "EKUAR45XFLM7SLHS36SFZLQBJ7SGBLAUUBVQUBAPGTQOMTXNE7P3YXMOJI",
+      "comment": "account-50",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "SUBW2EB33AKJ2HY76U3MFTRA2EJI2OSZVDAWQJACJDVPCTEYACMLZ42MOM",
+      "comment": "account-51",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "BGU6GRQQJVYIKLN666QQHES5FOW6BLFUKEO6C6KBXGH52X2X57FVCML52Y",
+      "comment": "account-52",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "OGDVDOCH3EKSTPRLQKQAL75K763FGR3JCRT72SJPT4FXNS3OOUX55U6SIU",
+      "comment": "account-53",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "5GT7I4XUQ7NHMA6JHZL35OLOJMIYFKSCLTZ2ZDTI7ITXKN2ZIBTZ6IAFLQ",
+      "comment": "account-54",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "KDRULD325CNSHEKZG4FZ5M5EQ34BYO5K3GCNEXMHWWPGCKGBCSQMYPJQ7E",
+      "comment": "account-55",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "KIL52ALZUU5PUZ6GN7RINWYNKKHZJJJFROZHJC3NXLI6KUOKTYIL2SHG3A",
+      "comment": "account-56",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "T3I4NEHCBAWCHGNTLPP7WXMG2745L4ZJ3TGRJXBLWX2MXKOR3E5HGYLC5E",
+      "comment": "account-57",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "6FQOWFXADSSSZHBSK5WNLTIP3LGM6R2WSFWJTTOVZPDILBNSULOLDTN5W4",
+      "comment": "account-58",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "LMQVYXGMOM2EH3VUJ6V45YLFAS4VQWFITKFQQI33FGQAR4HECQNX3MI6F4",
+      "comment": "account-59",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "KKGNLXKR7KMSJ3453GQX2WUAQBQP5VTMYKZTV5RBWDFJ74URVB63WR53BI",
+      "comment": "account-60",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "5X4IRKE47BMWJG65UUXI2CHXHQXKOFDLSNYHH3DHHMC3YCNM4MV6ECZXFA",
+      "comment": "account-61",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "G6L5BJAMCNNN67M63NE46K7KVISOKBFEZY5MMFDCE2KCR4GECK5R6FPQ24",
+      "comment": "account-62",
+      "state": {
+        "algo": 1000000000000
+      }
+    },
+    {
+      "addr": "Z7RPXSQO5PUXV5VQRBPM2QSP4P4EDOWLRFSGRQI55TBIUD5JS5IE26OVOI",
+      "comment": "account-63",
+      "state": {
+        "algo": 1000000000000
+      }
+    }
+  ],
+  "comment": "algod-rust deterministic benchmark corpus (issue #2104)",
+  "devmode": true,
+  "fees": "NP5ZT666ZNHWZPGLWAFBGDNTXS4E4FGKIA6S2OEZR5DVLUMLFLJUTND6VQ",
+  "id": "v1",
+  "network": "benchcorpus",
+  "proto": "https://github.com/algorandfoundation/specs/tree/73c43b4a9699390884c51e2a9598d49e28373d10",
+  "rwd": "NRSBPA4WFKMVDUUQDBWIESR63RH2IGD5SQO2TMX3G4PTFFY2S54NT7664U",
+  "timestamp": 1767225600
+}

@@ -17,6 +17,7 @@ P2P_INTEROP_1V1_CLUSTER := ops/mixed-cluster-p2p-1v1
 .PHONY: avm-replay avm-replay-mainnet
 .PHONY: bench-rust bench-decode bench-go bench-micro bench-micro-go bench-cluster benchmark
 .PHONY: bench-stress bench-stress-down bench-compare bench-compare-test bench-micro-equiv
+.PHONY: bench-corpus-small bench-corpus-large bench-corpus-fetch
 .PHONY: archival-up archival-down
 .PHONY: localnet-up localnet-down localnet-status localnet-logs algokey-e2e
 .PHONY: localnet-rust-up localnet-rust-down localnet-rust-status localnet-rust-logs localnet-rust-genesis
@@ -1066,6 +1067,18 @@ bench-compare-test: ## Unit-test the bench-compare harness (no Docker, no builds
 ## (needs go + a pinned go-algorand checkout, GO_ALGORAND_DIR).
 bench-micro-equiv: ## micro tier: run every Go/Rust pair once, fail if any output differs
 	python3 scripts/bench/micro_equiv.py
+
+## Issue #2104: the deterministic workload block corpus (input of the replay
+## tier). Generation needs Linux, go and the pinned go-algorand algod
+## (bash scripts/bench/build_both.sh --skip-rust); see docs/BENCHMARK_COMPARISON.md.
+bench-corpus-small: ## Regenerate benchmarks/corpus/small (byte-identical when nothing changed)
+	python3 scripts/bench/corpus/generate.py --preset small --out benchmarks/corpus/small --force
+
+bench-corpus-large: ## Generate the ~1M-txn large corpus into benchmarks/corpus/large (~35 min)
+	python3 scripts/bench/corpus/generate.py --preset large --out benchmarks/corpus/large --force
+
+bench-corpus-fetch: ## Download + verify the published large corpus into benchmarks/corpus/large
+	bash scripts/bench/fetch_corpus.sh
 
 ## ── Archival Node ───────────────────────────────────────────
 

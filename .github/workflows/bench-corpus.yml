@@ -1,0 +1,125 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: Bench Workload Corpus
+
+# Issue #2104 (epic #2101): the deterministic workload block corpus. The
+# generator (benchmarks/go-corpus, driven by scripts/bench/corpus/generate.py)
+# links go-algorand and runs the pinned go-algorand algod, which needs Linux +
+# the vendored libsodium, so it is proven here rather than on the Windows dev
+# boxes:
+#   * go vet / go test of the generator;
+#   * `corpusgen verify` of the committed small corpus (go-algorand's own
+#     decoder: prev-hash chain, histogram, txids, final block);
+#   * determinism: a tiny corpus generated twice from fresh networks must be
+#     byte-identical;
+#   * reproducibility: regenerating the small preset must reproduce the
+#     committed benchmarks/corpus/small byte for byte.
+# The Rust decode test of the small corpus runs in unit-tests.yml (default
+# `cargo test`), the Python tooling tests in harness-shell-tests.yml.
+
+on:
+  pull_request:
+    paths:
+      - "benchmarks/go-corpus/**"
+      - "benchmarks/corpus/**"
+      - "scripts/bench/corpus/**"
+      - "scripts/bench/fetch_corpus.sh"
+      - "scripts/bench/build_both.sh"
+      - "scripts/bench/go-algorand.pin"
+      - ".github/workflows/bench-corpus.yml"
+  push:
+    branches: [main]
+    paths:
+      - "benchmarks/go-corpus/**"
+      - "benchmarks/corpus/**"
+      - "scripts/bench/corpus/**"
+      - "scripts/bench/fetch_corpus.sh"
+      - "scripts/bench/build_both.sh"
+      - "scripts/bench/go-algorand.pin"
+      - ".github/workflows/bench-corpus.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  corpus:
+    name: corpus generator determinism + small corpus reproduction (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Locate the go-algorand checkout
+        run: |
+          echo "GO_ALGORAND_DIR=$RUNNER_TEMP/go-algorand" >> "$GITHUB_ENV"
+          echo "BENCH_BIN=$RUNNER_TEMP/bench-bin" >> "$GITHUB_ENV"
+      - name: Resolve the pinned tag and its go.mod
+        id: pin
+        run: |
+          set -euo pipefail
+          tag="$(grep -v '^[[:space:]]*#' scripts/bench/go-algorand.pin | grep -v '^[[:space:]]*$' | head -n1 | tr -d '[:space:]')"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/go-algorand-gomod"
+          # setup-go only parses a file literally named go.mod (else: plain version file).
+          curl -fsSL "https://raw.githubusercontent.com/algorand/go-algorand/${tag}/go.mod" \
+            -o "$RUNNER_TEMP/go-algorand-gomod/go.mod"
+          grep -E '^(go|toolchain) ' "$RUNNER_TEMP/go-algorand-gomod/go.mod"
+      - name: Install Go per go-algorand's go.mod
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: ${{ runner.temp }}/go-algorand-gomod/go.mod
+          cache-dependency-path: benchmarks/go-corpus/go.sum
+      - name: Install libsodium build tools
+        run: |
+          # go-algorand's crypto package links a vendored libsodium fork via cgo.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends autoconf automake libtool build-essential
+      - name: Build the pinned go-algorand algod (build_both.sh --clone --skip-rust)
+        run: |
+          bash scripts/bench/build_both.sh --clone --skip-rust \
+            --go-algorand "$GO_ALGORAND_DIR" --out "$RUNNER_TEMP/bench-build" --bin-dir "$BENCH_BIN"
+      - name: Generator - gofmt, vet, unit tests, build
+        run: |
+          set -euo pipefail
+          printf 'go 1.25.0\n\nuse %s/benchmarks/go-corpus\n\nreplace github.com/algorand/go-algorand => %s\n' \
+            "$PWD" "$GO_ALGORAND_DIR" > "$RUNNER_TEMP/go.work"
+          export GOWORK="$RUNNER_TEMP/go.work" GOFLAGS=-buildvcs=false
+          cd benchmarks/go-corpus
+          unformatted="$(gofmt -l .)"
+          [ -z "$unformatted" ] || { echo "::error::gofmt needed: $unformatted"; exit 1; }
+          go vet ./...
+          go test -count=1 -v ./...
+          go build -o "$BENCH_BIN/corpusgen" .
+      - name: Committed small corpus - go-algorand decode + manifest
+        run: |
+          set -euo pipefail
+          "$BENCH_BIN/corpusgen" verify -corpus benchmarks/corpus/small
+          python3 scripts/bench/corpus/corpus_tool.py verify benchmarks/corpus/small
+      - name: Determinism - tiny corpus generated twice
+        run: |
+          set -euo pipefail
+          for i in 1 2; do
+            python3 scripts/bench/corpus/generate.py --preset tiny --out "$RUNNER_TEMP/tiny$i" \
+              --algod "$BENCH_BIN/go/algod" --corpusgen "$BENCH_BIN/corpusgen"
+          done
+          python3 scripts/bench/corpus/corpus_tool.py compare "$RUNNER_TEMP/tiny1" "$RUNNER_TEMP/tiny2"
+      - name: Reproduce the committed small corpus byte for byte
+        run: |
+          set -euo pipefail
+          python3 scripts/bench/corpus/generate.py --preset small --out "$RUNNER_TEMP/small" \
+            --algod "$BENCH_BIN/go/algod" --corpusgen "$BENCH_BIN/corpusgen"
+          python3 scripts/bench/corpus/corpus_tool.py compare benchmarks/corpus/small "$RUNNER_TEMP/small"
+      - name: Report to job summary
+        if: always()
+        run: |
+          {
+            echo '### Workload corpus'
+            if [ -f "$RUNNER_TEMP/small/corpus.json" ]; then
+              python3 scripts/bench/corpus/corpus_tool.py summary "$RUNNER_TEMP/small"
+              echo '```'
+              cat "$RUNNER_TEMP/small/MANIFEST.sha256"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

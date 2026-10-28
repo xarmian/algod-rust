@@ -28,6 +28,7 @@ make bench-compare TIERS=selftest RUNS=5
 - [Pinned builds (`build_both.sh`)](#pinned-builds-build_bothsh)
 - [Tiers](#tiers)
 - [The `micro` tier](#the-micro-tier)
+- [Workload corpus](#workload-corpus)
 
 ## Quick start
 
@@ -340,7 +341,7 @@ whenever `build_both.sh` or the pin file changes. It asserts
 |---|---|---|
 | `selftest` | available (#2102) | The harness itself: both "sides" run the same Python sha256 workload. It checks the schema, pairing, statistics and report on any machine, and it is what CI runs. |
 | `micro` | available (#2103) | Paired Go `testing.B` / Rust criterion micro-benchmarks on identical fixture bytes: codec, crypto, commitments, AVM, agreement. See [The `micro` tier](#the-micro-tier). |
-| `replay` | planned (#2104, #2105) | Offline ledger replay of a deterministic block corpus, with a final-state equality gate. |
+| `replay` | planned (#2105); its input corpus is available (#2104) | Offline ledger replay of the deterministic block corpus, with a final-state equality gate. See [Workload corpus](#workload-corpus). |
 | `localnet` | planned (#2106) | All-Go vs all-Rust homogeneous localnet throughput under the same load. |
 | `rest` | planned (#2107) | REST API throughput against identical ledger state. |
 | `catchup` | planned (#2108) | Public-network fast catchup and follow. |
@@ -529,3 +530,250 @@ It also triggers on changes to the production crates the pairs measure
 `Cargo.lock`) and on the go-algorand pin. For a PR that touches only those,
 it runs the equivalence steps and skips the timing tier.
 CI runners are shared and noisy, so treat those ratios as indicative only.
+
+## Workload corpus
+
+The `replay` tier (#2105) needs a realistic block stream that is **fixed**:
+both implementations replay the same bytes offline, and the result can be
+checked against a known final state. Live networks are not reproducible and
+the localnet stress scripts send random load, so issue #2104 added a
+deterministic corpus generator and two corpora:
+
+| Corpus | Rounds | Txns (top-level / inner) | Size | Where |
+|---|---:|---:|---:|---|
+| `small` | 2,000 | 10,735 / 1,597 | 4.2 MB | committed: `benchmarks/corpus/small/` |
+| `large` | 50,000 | 1,017,999 / 150,394 | 300 MB (151 MB as `.tar.gz`) | release asset, `make bench-corpus-fetch` |
+
+```bash
+make bench-corpus-fetch     # download + verify large into benchmarks/corpus/large/
+make bench-corpus-small     # regenerate small (Linux; byte-identical to the committed one)
+make bench-corpus-large     # generate large locally instead of fetching (~35 min)
+python3 scripts/bench/corpus/corpus_tool.py verify benchmarks/corpus/small
+python3 scripts/bench/corpus/corpus_tool.py summary benchmarks/corpus/small
+```
+
+### How it is generated
+
+`scripts/bench/corpus/generate.py` (MIT) orchestrates;
+`benchmarks/go-corpus` (`corpusgen`, AGPL: it links go-algorand) does the
+work against the pinned go-algorand:
+
+1. `corpusgen genesis` writes a **DevMode** genesis and a fixed node
+   `config.json`. It does not use `goal network create`, which stamps the wall
+   clock into the genesis (CLAUDE.md, issue #1590). Every key comes from
+   `SHA-512/256("algod-rust/bench-corpus/v1|<seed>|<label>|<index>")`:
+   the workload accounts, the fee sink and rewards pool, four online
+   "validator" accounts, and the participation keys of genesis and keyreg
+   registrations. Nothing reads `crypto/rand`. The genesis timestamp is pinned
+   to `1767225600` (2026-01-01T00:00:00Z) and the protocol is the pinned
+   go-algorand's `ConsensusCurrentVersion` (v43 at `v5.0.4-stable`).
+2. `generate.py` starts the pinned go-algorand `algod` on that data dir
+   (`target/bench-compare/go/algod` from `build_both.sh --skip-rust`).
+3. `corpusgen drive` sets the DevMode block timestamp step
+   (`POST /v2/devmode/blocks/offset/3`), then builds every round from a
+   seeded PCG generator over a model of the ledger state. A round is a list
+   of groups: all but the last go to `POST /v2/transactions/async` (pool
+   only), and the generator waits until the pool holds each one before it
+   sends the next, which keeps the pool in plan order. The last group goes to
+   the synchronous `POST /v2/transactions`, which in DevMode assembles and
+   commits the block. Each txn has `FirstValid` = its round, `LastValid` =
+   round + 1000 and a unique 10-byte note `"bc" || u64 counter`.
+4. After each round the generator fetches the raw
+   `/v2/blocks/{r}?format=msgpack` bytes, decodes them with go-algorand's own
+   codec, checks that the payset is exactly the planned txids in planned
+   order and that `prev` is the previous block's hash, and appends the bytes
+   to `blocks.bin`. Created asset/app ids are read from the block's ApplyData.
+5. At the end it writes `corpus.json` (with the final state from
+   `/v2/ledger/supply` and `/v2/accounts`), copies `genesis.json` and the node
+   config, dumps the protocol's `ConsensusParams`, and `generate.py` writes
+   `MANIFEST.sha256` and verifies the corpus with both `corpusgen verify` and
+   `corpus_tool.py verify`.
+
+The workload covers payments and account close-outs, ASA create /
+reconfigure / destroy / opt-in / transfer / clawback / freeze / unfreeze /
+holding close, app create / call / opt-in / close-out / clear / update /
+delete with global, local and box state (box put and delete), atomic groups
+of 2 to 5 mixed txns, an app method that issues inner pay + axfer + appl
+(a call of a second app), rekey-to, txns signed by the rekeyed authorizer,
+rekey back, and keyreg online/offline. Multi-round lifecycles (rekey, freeze,
+close-out, keyreg, throwaway apps and assets) are scheduled into later rounds
+and reserve their accounts meanwhile. The presets:
+
+| Preset | `--rounds` | `--accounts` | `--txns-per-round` | Use |
+|---|---:|---:|---:|---|
+| `tiny` | 100 | 32 | 6 | CI determinism check |
+| `small` | 2000 | 64 | 5 | committed corpus (size cap 5 MB) |
+| `large` | 50000 | 1000 | 20 | release asset (~1M txns) |
+
+Any other size: `generate.py --rounds N --accounts A --txns-per-round K
+--seed S --out DIR`. Generation is client-bound at about 530 txn/s (26
+rounds/s with 20 txns per round) on a 24-thread WSL2 box, because each async
+group waits for the pool. The large preset takes about 33 minutes.
+
+### Layout
+
+| File | Content |
+|---|---|
+| `blocks.bin` | `ACRPBLK1` magic, then one record per round `0..=N`: `round` (u64 big-endian), `len` (u32 big-endian), then `len` bytes that are exactly the `/v2/blocks/{round}?format=msgpack` response body: msgpack map `{"block": Block, "cert": Certificate}`. Round 0 is the genesis block (empty cert). Uncompressed. |
+| `genesis.json` | The genesis the node ran (go-algorand `protocol.EncodeJSON`). |
+| `node-config.json` | The node's `config.json` (non-default values only). |
+| `consensus.json` | `{"version", "params"}`: the full `ConsensusParams` of the genesis protocol. |
+| `corpus.json` | Schema `algod-corpus/v1`: name, generator (version, seed, accounts, txns per round, timestamp step), go-algorand tag and commit, network (genesis id and hash, consensus version, devmode, genesis timestamp), file names, rounds, `txns`, `txids_sha256`, `histogram` and `final_state`. |
+| `MANIFEST.sha256` | `sha256sum` format (`<hex>  <name>`), every other file, sorted. |
+
+`histogram` counts top-level txns by `types` and `subtypes` (`pay.payment`,
+`pay.close`, `axfer.optin`, `axfer.transfer`, `axfer.clawback`,
+`axfer.close`, `acfg.create`, `acfg.reconfigure`, `acfg.destroy`,
+`afrz.freeze`, `afrz.unfreeze`, `appl.create`, `appl.call`, `appl.optin`,
+`appl.closeout`, `appl.clear`, `appl.update`, `appl.delete`,
+`keyreg.online`, `keyreg.offline`), inner txns by type at every nesting
+level (`inner_types`), and `features`: `groups`, `grouped_txns`,
+`rekey_txns`, `auth_addr_txns`, `inner_txns`, `app_global_delta_txns`,
+`app_local_delta_txns`, `app_box_ref_txns`. The definitions are in
+`benchmarks/go-corpus/record.go` and are mirrored in
+`crates/tools/algo-bench/src/corpus.rs`. `txids_sha256` is the sha256 of
+every top-level TxID (32 raw bytes each) in block order. `final_state` holds
+the last round, its block hash (`blk-...`), its txn counter, total and online
+money, and `accounts_sha256` over the sorted `"<address> <amount>\n"` lines of
+every account the generator knows (REST `amount`, so pending rewards are
+included).
+
+The repository's `.gitattributes` marks `benchmarks/corpus/**` as `-text`,
+so a Windows checkout never rewrites a byte. The manifest pins
+`corpus.json` and `genesis.json` too, and the Python and Rust checkers
+reject a manifest that contains CR.
+
+Census of both corpora (generator v1, seed `algod-rust-bench-corpus`):
+
+| kind | small | large |
+|---|---:|---:|
+| acfg.create | 83 | 8,328 |
+| acfg.destroy | 82 | 8,327 |
+| acfg.reconfigure | 82 | 8,327 |
+| afrz.freeze | 83 | 8,271 |
+| afrz.unfreeze | 83 | 8,271 |
+| appl.call | 3,084 | 294,353 |
+| appl.clear | 87 | 8,355 |
+| appl.closeout | 64 | 8,470 |
+| appl.create | 98 | 8,193 |
+| appl.delete | 96 | 8,190 |
+| appl.optin | 214 | 17,799 |
+| appl.update | 96 | 8,190 |
+| axfer.clawback | 169 | 16,547 |
+| axfer.close | 94 | 8,372 |
+| axfer.optin | 157 | 9,372 |
+| axfer.transfer | 2,121 | 203,345 |
+| keyreg.offline | 67 | 8,194 |
+| keyreg.online | 67 | 8,196 |
+| pay.close | 94 | 8,372 |
+| pay.payment | 3,814 | 360,527 |
+| inner appl | 532 | 50,131 |
+| inner axfer | 533 | 50,132 |
+| inner pay | 532 | 50,131 |
+| app_box_ref_txns | 752 | 75,000 |
+| app_global_delta_txns | 1,992 | 185,602 |
+| app_local_delta_txns | 1,917 | 178,829 |
+| auth_addr_txns | 192 | 16,817 |
+| grouped_txns | 2,448 | 233,673 |
+| groups | 695 | 66,849 |
+| inner_txns | 1,597 | 150,394 |
+| rekey_txns | 191 | 16,807 |
+| **top-level txns** | **10,735** | **1,017,999** |
+
+### Determinism
+
+Same seed, same parameters, same generator version and the same go-algorand
+build give a **byte-identical corpus**: every file, every block hash and
+every txid. Exact txid equality is therefore expected, with nothing masked.
+These are the inputs that would vary in a naive localnet run, and how each
+is pinned:
+
+| Would vary | Pinned by |
+|---|---|
+| Genesis timestamp (`goal network create` uses the wall clock) | `corpusgen genesis` writes the genesis itself, with `timestamp` = 1767225600. |
+| Account and participation keys (random) | Derived from the seed. |
+| Genesis hash, and with it every txid's `gh` | Follows from the two rows above. |
+| Block timestamps (wall clock) | DevMode timestamp offset: `ts` = previous `ts` + 3. |
+| Block seed | DevMode sets `seed` = `committee.Seed(prev.Hash())`. |
+| Which txns land in which block, and their order | No agreement: one block per synchronous submit, with the pool order held by waiting on each async group. Every block is checked against the plan. |
+| `FirstValid` / `LastValid` / notes | Fixed per round and txn counter, not read from "current round" at run time. |
+| Created asset/app ids | Follow from the deterministic txn counter. |
+| State-proof / heartbeat txns from the node | None. The node holds no participation keys, so it injects nothing into the pool. |
+
+Things that do change the bytes, on purpose: a different seed or parameters,
+a new generator version (bump `generatorVersion` in `main.go`; the pinned
+key-derivation test fails first), and a different go-algorand tag (protocol
+version, encodings, node config defaults). Build `corpusgen` with the Go
+toolchain from go-algorand's `go.mod` (what `generate.py` and CI use): the
+workload draws from `math/rand/v2`'s PCG, and Go does not promise that the
+stream of helpers like `IntN` stays the same across releases. The release tarball is not
+byte-reproducible across Python/zlib versions, so `large.ref` pins the
+sha256 of `MANIFEST.sha256`, not the tarball's.
+
+Evidence:
+
+- Locally (WSL2 Ubuntu, go1.25.3, go-algorand `v5.0.4-stable`): `tiny`
+  twice and `small` twice from fresh nodes, `corpus_tool.py compare`
+  reported byte-identical each time. The committed `small` is one of those
+  runs. The `large` run's MANIFEST sha256 is the one pinned in
+  `benchmarks/corpus/large.ref`.
+- CI (`.github/workflows/bench-corpus.yml`, Linux, path-filtered to the
+  generator, the corpus and the pin): gofmt, vet and `go test` of the
+  generator; `corpusgen verify` of the committed small corpus; `tiny`
+  generated twice and compared; and `small` regenerated and compared byte
+  for byte with `benchmarks/corpus/small`.
+
+### What DevMode means for replay
+
+The corpus comes from a single-node DevMode network. This keeps it
+deterministic and fast, but the replay tier has to account for it:
+
+- **Certificates are degenerate.** Each is `{"rnd": r}` with no votes, so the
+  corpus cannot benchmark certificate verification. Replay through the
+  ledger's block-apply path. go-algorand's `Ledger.AddBlock` does not check
+  the certificate. algod-rust needs `SqliteLedger::set_devmode_chain(true)`,
+  as `algod-rust node` sets for a `devmode` genesis.
+- **No proposer**, so no proposer payouts or absenteeism. Fees still go to
+  the fee sink and rewards still accrue from the rewards pool.
+- **No state proofs.** No node holds participation keys. Keyreg state-proof
+  keys are derived 64-byte values (go-algorand checks that they are present,
+  not what they commit to).
+
+`crates/tools/algo-bench/tests/corpus_small.rs` runs in the default `cargo
+test` (unit-tests CI). It verifies the manifest, decodes every block + cert
+with `algo_codec::decode_block_response` (and checks that the fast decoder
+agrees), checks `prev` / `prev512` against `algo_codec`'s header digests of
+the previous block, and recomputes the histogram, `txids_sha256`, final
+block hash and txn counter. It then replays all 2,000 blocks through
+algod-rust's `SqliteLedger` from its own genesis loader (same round-0 block
+hash as go served) to the recorded txn counter and total money, in about 8 s
+in a debug build. The Python tooling tests (`scripts/bench/test_corpus.py`:
+manifest, corpus.json arithmetic and coverage, compare, deterministic pack,
+`fetch_corpus.sh`) run in the `bench-compare-harness` job.
+
+### Fetching and publishing the large corpus
+
+`scripts/bench/fetch_corpus.sh` (`make bench-corpus-fetch`) downloads the
+asset named in `benchmarks/corpus/large.ref` (override with `--url` or
+`CORPUS_URL`, or install a local tarball with `--from FILE`). It extracts the
+asset and checks the sha256 of `MANIFEST.sha256` against the pin, every
+listed file against the manifest, and that no unlisted file came along. Only
+then does it install the corpus into `benchmarks/corpus/large/`, which git
+ignores. If the asset does not exist yet (HTTP 404 or unreachable), it exits
+3 and prints the commands that generate the corpus locally.
+
+Publishing is a manual step for a maintainer. No workflow creates releases:
+
+```bash
+bash scripts/bench/build_both.sh --skip-rust
+python3 scripts/bench/corpus/generate.py --preset large --out /tmp/corpus-large-v1
+sha256sum /tmp/corpus-large-v1/MANIFEST.sha256      # must equal large.ref's pin
+python3 scripts/bench/corpus/corpus_tool.py pack /tmp/corpus-large-v1 corpus-large-v1.tar.gz
+gh release create bench-corpus-large-v1 corpus-large-v1.tar.gz \
+  --title "Benchmark workload corpus: large (generator v1, go-algorand v5.0.4-stable)" \
+  --notes "Deterministic replay corpus, issue #2104. Verify with scripts/bench/fetch_corpus.sh."
+```
+
+After a generator or go-algorand pin change, regenerate both corpora,
+commit the new `small`, update `manifest_sha256` (and the tag/URL) in
+`large.ref`, and publish the new asset under a new tag.
