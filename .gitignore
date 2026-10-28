@@ -33,3 +33,5 @@ docker/.stress-template.rendered.json
 
 __pycache__/
 *.pyc
+# Fetched/generated large workload corpus (issue #2104, scripts/bench/fetch_corpus.sh).
+/benchmarks/corpus/large/

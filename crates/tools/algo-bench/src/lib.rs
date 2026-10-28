@@ -6,6 +6,7 @@
 //! `algo-bench` -- benchmark metrics collection, JSON output, and comparison
 //! table rendering for algod-rust vs. go-algorand performance comparisons.
 
+pub mod corpus;
 pub mod metrics;
 pub mod output;
 pub mod table;

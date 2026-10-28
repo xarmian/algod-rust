@@ -84,8 +84,10 @@ jobs:
         # fixture sha256s, recorded Go digests. The live `go test -list`
         # half needs go-algorand + libsodium and runs in bench-micro.yml.
         run: python3 scripts/bench/test_pairs.py -v
-      - name: build_both.sh syntax
-        run: bash -n scripts/bench/build_both.sh
+      - name: build_both.sh / fetch_corpus.sh syntax
+        run: |
+          bash -n scripts/bench/build_both.sh
+          bash -n scripts/bench/fetch_corpus.sh
       - name: make bench-compare TIERS=selftest
         run: |
           make bench-compare TIERS=selftest RUNS=6 BENCH_RUN_DIR=bench-results/ci-selftest

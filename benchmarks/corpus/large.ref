@@ -1,0 +1,10 @@
+# The `large` workload block corpus (issue #2104): where
+# scripts/bench/fetch_corpus.sh downloads it from, and the sha256 of its
+# MANIFEST.sha256 (which pins every file of the corpus). The generator is
+# deterministic, so a local
+#   python3 scripts/bench/corpus/generate.py --preset large --out DIR
+# with generator v1 against go-algorand v5.0.4-stable reproduces this pin.
+# Publishing the asset is a manual maintainer step: see "Workload corpus" in
+# docs/BENCHMARK_COMPARISON.md.
+url=https://github.com/xarmian/algod-rust/releases/download/bench-corpus-large-v1/corpus-large-v1.tar.gz
+manifest_sha256=506d6e131858ba98de11c1b3aa07cb7611516e66bae26ffbf4cd8d814141c26c

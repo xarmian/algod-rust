@@ -1,0 +1,93 @@
+{
+  "schema": "algod-corpus/v1",
+  "name": "small",
+  "generator": {
+    "name": "benchmarks/go-corpus",
+    "version": "1",
+    "seed": "algod-rust-bench-corpus",
+    "accounts": 64,
+    "txns_per_round": 5,
+    "timestamp_offset_s": 3
+  },
+  "go_algorand": {
+    "tag": "v5.0.4-stable",
+    "commit": "927ae0863cbb4cf29c6845c088a4ea4c439b10bb"
+  },
+  "network": {
+    "genesis_id": "benchcorpus-v1",
+    "genesis_hash": "fkDjWbnfVl9FiCYk1BWj4TnGBnvEhSfpS4e/OFEHqbc=",
+    "consensus_version": "https://github.com/algorandfoundation/specs/tree/73c43b4a9699390884c51e2a9598d49e28373d10",
+    "devmode": true,
+    "genesis_timestamp": 1767225600
+  },
+  "files": {
+    "blocks": "blocks.bin",
+    "consensus": "consensus.json",
+    "genesis": "genesis.json",
+    "node_config": "node-config.json"
+  },
+  "rounds": {
+    "first": 0,
+    "last": 2000,
+    "count": 2001
+  },
+  "txns": 10735,
+  "txids_sha256": "df3f6005427d93663a257a5e2d28d27001d7428decf501e9f83e63a073eb1f53",
+  "histogram": {
+    "types": {
+      "acfg": 247,
+      "afrz": 166,
+      "appl": 3739,
+      "axfer": 2541,
+      "keyreg": 134,
+      "pay": 3908
+    },
+    "subtypes": {
+      "acfg.create": 83,
+      "acfg.destroy": 82,
+      "acfg.reconfigure": 82,
+      "afrz.freeze": 83,
+      "afrz.unfreeze": 83,
+      "appl.call": 3084,
+      "appl.clear": 87,
+      "appl.closeout": 64,
+      "appl.create": 98,
+      "appl.delete": 96,
+      "appl.optin": 214,
+      "appl.update": 96,
+      "axfer.clawback": 169,
+      "axfer.close": 94,
+      "axfer.optin": 157,
+      "axfer.transfer": 2121,
+      "keyreg.offline": 67,
+      "keyreg.online": 67,
+      "pay.close": 94,
+      "pay.payment": 3814
+    },
+    "inner_types": {
+      "appl": 532,
+      "axfer": 533,
+      "pay": 532
+    },
+    "features": {
+      "app_box_ref_txns": 752,
+      "app_global_delta_txns": 1992,
+      "app_local_delta_txns": 1917,
+      "auth_addr_txns": 192,
+      "grouped_txns": 2448,
+      "groups": 695,
+      "inner_txns": 1597,
+      "rekey_txns": 191
+    }
+  },
+  "final_state": {
+    "round": 2000,
+    "block_hash": "blk-UWDNW4AWC4S7X3SFTXZ6WD3F43ARU2JS76L2QZ7DLISXMQARV43Q",
+    "txn_counter": 13332,
+    "total_money": 464399979197438,
+    "online_money": 400344800000000,
+    "accounts": 166,
+    "accounts_microalgos": 564000000100000,
+    "accounts_sha256": "db89c891cc8ba7de93a217a9876b13603fcd9d89f8ef134f0964ea96b1ba96c9"
+  }
+}

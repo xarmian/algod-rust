@@ -1,0 +1,17 @@
+{
+  "_comment": "Workload kinds every corpus must contain (issue #2104). Single source of truth for scripts/bench/corpus/corpus_tool.py and crates/tools/algo-bench/tests/corpus_small.rs; keys match corpus.json histogram sections.",
+  "subtypes": [
+    "pay.payment", "pay.close",
+    "axfer.optin", "axfer.transfer", "axfer.clawback", "axfer.close",
+    "afrz.freeze", "afrz.unfreeze",
+    "acfg.create", "acfg.reconfigure", "acfg.destroy",
+    "appl.create", "appl.call", "appl.optin", "appl.closeout", "appl.clear",
+    "appl.update", "appl.delete",
+    "keyreg.online", "keyreg.offline"
+  ],
+  "features": [
+    "groups", "grouped_txns", "inner_txns", "rekey_txns", "auth_addr_txns",
+    "app_global_delta_txns", "app_local_delta_txns", "app_box_ref_txns"
+  ],
+  "inner_types": ["pay", "axfer", "appl"]
+}
