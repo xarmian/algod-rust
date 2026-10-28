@@ -138,11 +138,16 @@ def main(argv=None):
     print(f"bench-compare: tiers={','.join(selected)} runs={args.runs} -> {run_dir}")
 
     expected_tag = os.environ.get("GO_ALGORAND_REV") or fingerprint.read_pin()
-    fp = fingerprint.collect(REPO_ROOT, args.go_algorand, expected_tag)
-    with open(os.path.join(run_dir, "fingerprint.json"), "w", encoding="utf-8", newline="\n") as f:
-        json.dump(fp, f, indent=2)
-        f.write("\n")
-    for w in fp["warnings"]:
+
+    def write_fingerprint():
+        fp = fingerprint.collect(REPO_ROOT, args.go_algorand, expected_tag)
+        with open(os.path.join(run_dir, "fingerprint.json"), "w", encoding="utf-8",
+                  newline="\n") as f:
+            json.dump(fp, f, indent=2)
+            f.write("\n")
+        return fp
+
+    for w in write_fingerprint()["warnings"]:
         print(f"  fairness warning: {w}")
 
     status = []
@@ -159,6 +164,8 @@ def main(argv=None):
         status.append({"tier": "build", "exit_code": rc,
                        "duration_s": round(time.monotonic() - t0, 3), "log": "logs/build.log"})
         built = rc == 0
+        if built:
+            write_fingerprint()  # the build may have cloned / checked out go-algorand
 
     for t in selected:
         out = os.path.join(run_dir, "results", t)

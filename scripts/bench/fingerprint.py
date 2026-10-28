@@ -190,7 +190,10 @@ def fairness_warnings(f):
         w.append("algod-rust working tree has uncommitted changes")
     if go.get("dirty"):
         w.append("go-algorand working tree has uncommitted changes")
-    if go.get("pin_ok") is False:
+    if go.get("present") is False:
+        w.append(f"no go-algorand checkout found: pin {go.get('expected_tag')} not verified "
+                 "(fine for tiers that need no Go build, e.g. selftest)")
+    elif go.get("pin_ok") is False:
         w.append(f"go-algorand checkout is at {go.get('describe')!r}, "
                  f"not the pinned {go.get('expected_tag')}")
     return w

@@ -213,6 +213,13 @@ class WarningsTest(unittest.TestCase):
         self.assertIn("uncommitted", w)
         self.assertIn("v5.0.4-stable", w)
 
+    def test_missing_go_checkout_is_a_note_not_a_pin_mismatch(self):
+        f = {"commits": {"go_algorand": {"present": False, "pin_ok": False,
+                                         "expected_tag": "v5.0.4-stable"}}}
+        w = fp.fairness_warnings(f)
+        self.assertEqual(len(w), 1)
+        self.assertIn("not verified", w[0])
+
     def test_no_warnings_when_clean(self):
         f = {
             "cpu": {"governor": "performance"},

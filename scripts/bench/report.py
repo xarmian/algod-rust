@@ -170,7 +170,9 @@ def build_report(results, fingerprint=None, build_info=None, tier_status=None,
         rows.append(row)
 
     for t in tier_status or []:
-        if t.get("exit_code") != 0:
+        if t.get("exit_code") == "skipped":
+            errors.append(f"tier {t.get('tier')} skipped: {t.get('reason', 'unknown reason')}")
+        elif t.get("exit_code") != 0:
             errors.append(f"tier {t.get('tier')} exited with status {t.get('exit_code')}")
 
     paired = [r for r in rows if r["status"] == "paired"]
