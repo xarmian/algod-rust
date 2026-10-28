@@ -21,6 +21,8 @@ on:
       # The workload corpus (#2104) has its own workflow (bench-corpus.yml).
       - "!benchmarks/corpus/**"
       - "!benchmarks/go-corpus/**"
+      # The replay tier (#2105) has its own workflow (bench-replay.yml).
+      - "!benchmarks/go-replay/**"
       - "scripts/bench/tiers/micro*"
       - "scripts/bench/micro_*.py"
       - "scripts/bench/test_pairs.py"
@@ -46,6 +48,8 @@ on:
       # The workload corpus (#2104) has its own workflow (bench-corpus.yml).
       - "!benchmarks/corpus/**"
       - "!benchmarks/go-corpus/**"
+      # The replay tier (#2105) has its own workflow (bench-replay.yml).
+      - "!benchmarks/go-replay/**"
       - "scripts/bench/tiers/micro*"
       - "scripts/bench/micro_*.py"
       - "scripts/bench/test_pairs.py"
@@ -89,7 +93,7 @@ jobs:
           if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || [ -z "$BASE" ] || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
             echo "timing=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          changed="$(git diff --name-only "$BASE" HEAD -- benchmarks ':!benchmarks/corpus' ':!benchmarks/go-corpus' scripts/bench/tiers/micro.py \
+          changed="$(git diff --name-only "$BASE" HEAD -- benchmarks ':!benchmarks/corpus' ':!benchmarks/go-corpus' ':!benchmarks/go-replay' scripts/bench/tiers/micro.py \
             scripts/bench/micro_convert.py scripts/bench/micro_equiv.py scripts/bench/test_pairs.py \
             scripts/bench/go-algorand.pin crates/tools/algo-bench-pairs .github/workflows/bench-micro.yml)"
           echo "micro-tier changes: ${changed:-<none>}"

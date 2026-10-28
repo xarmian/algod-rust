@@ -1053,9 +1053,11 @@ RUNS ?= 5
 BENCH_BUILD ?= auto
 BENCH_RUN_DIR ?=
 BENCH_CLEAN ?=
+## Issue #2105: the workload corpus the `replay` tier replays (small|large).
+CORPUS ?= small
 
 bench-compare: ## Go vs Rust comparison report (TIERS=a,b RUNS=N) -> bench-results/<utc-ts>/
-	python3 scripts/bench/run.py --tiers "$(TIERS)" --runs "$(RUNS)" \
+	BENCH_CORPUS="$(CORPUS)" python3 scripts/bench/run.py --tiers "$(TIERS)" --runs "$(RUNS)" \
 		--build "$(BENCH_BUILD)" --out-root "$(BENCH_OUTPUT)" \
 		$(if $(BENCH_RUN_DIR),--run-dir "$(BENCH_RUN_DIR)",) \
 		$(if $(filter 1,$(BENCH_CLEAN)),--clean,)
@@ -1209,6 +1211,7 @@ help:
 	@echo "  make bench-compare-test                    Unit-test the bench-compare harness"
 	@echo "  make bench-compare TIERS=micro RUNS=10     Paired Go/Rust micro-benchmarks (benchmarks/pairs.toml)"
 	@echo "  make bench-micro-equiv                     micro tier Go/Rust output-equivalence check only"
+	@echo "  make bench-compare TIERS=replay CORPUS=small|large RUNS=3  Offline ledger replay + final-state gate"
 	@echo ""
 	@echo "Benchmarks (fair comparison):"
 	@echo "  make bench-micro      Run Rust criterion microbenchmarks (fixture-based)"

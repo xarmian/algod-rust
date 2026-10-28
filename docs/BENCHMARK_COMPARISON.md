@@ -29,6 +29,7 @@ make bench-compare TIERS=selftest RUNS=5
 - [Tiers](#tiers)
 - [The `micro` tier](#the-micro-tier)
 - [Workload corpus](#workload-corpus)
+- [The `replay` tier](#the-replay-tier)
 
 ## Quick start
 
@@ -45,7 +46,7 @@ cd algod-rust
 
 make bench-compare-test                  # harness unit tests, a few seconds
 make bench-compare TIERS=selftest        # harness end-to-end, no builds
-make bench-compare TIERS=micro,replay RUNS=10   # real tiers (once they land)
+make bench-compare TIERS=micro,replay RUNS=10   # real tiers
 ```
 
 Variables:
@@ -341,7 +342,7 @@ whenever `build_both.sh` or the pin file changes. It asserts
 |---|---|---|
 | `selftest` | available (#2102) | The harness itself: both "sides" run the same Python sha256 workload. It checks the schema, pairing, statistics and report on any machine, and it is what CI runs. |
 | `micro` | available (#2103) | Paired Go `testing.B` / Rust criterion micro-benchmarks on identical fixture bytes: codec, crypto, commitments, AVM, agreement. See [The `micro` tier](#the-micro-tier). |
-| `replay` | planned (#2105); its input corpus is available (#2104) | Offline ledger replay of the deterministic block corpus, with a final-state equality gate. See [Workload corpus](#workload-corpus). |
+| `replay` | available (#2105) | Offline ledger replay of the deterministic block corpus (#2104) through go-algorand's ledger and algod-rust's production catchup path, with a final-state equality gate. See [The `replay` tier](#the-replay-tier). |
 | `localnet` | planned (#2106) | All-Go vs all-Rust homogeneous localnet throughput under the same load. |
 | `rest` | planned (#2107) | REST API throughput against identical ledger state. |
 | `catchup` | planned (#2108) | Public-network fast catchup and follow. |
@@ -790,3 +791,180 @@ gh release create bench-corpus-large-v1 corpus-large-v1.tar.gz \
 After a generator or go-algorand pin change, regenerate both corpora,
 commit the new `small`, update `manifest_sha256` (and the tag/URL) in
 `large.ref`, and publish the new asset under a new tag.
+
+## The `replay` tier
+
+```bash
+make bench-compare TIERS=replay RUNS=3                 # small corpus (committed)
+make bench-compare TIERS=replay CORPUS=large RUNS=3    # large corpus (fetched)
+BENCH_CORPUS_DIR=/path/to/corpus make bench-compare TIERS=replay RUNS=3
+```
+
+The tier (issue #2105) replays a [workload corpus](#workload-corpus)
+offline through go-algorand's ledger and through algod-rust's production
+catchup path. Both start from a fresh on-disk ledger and read the same bytes.
+The tier reports throughput and resource use with Rust/Go ratios, and it
+**fails if the two final states differ**, or if either state differs from the
+one go-algorand reported when it generated the corpus. It declares
+`bench-tier-needs: build`, so the runner builds `algod-rust` (release) with
+`build_both.sh` first. The Go harness is built against `GO_ALGORAND_DIR`
+(pinned tag enforced, libsodium built when missing) through a generated
+`go.work`. It needs Linux or macOS: the Go side links go-algorand's vendored
+libsodium.
+
+### What each side runs
+
+| | go-algorand | algod-rust |
+|---|---|---|
+| Harness | `benchmarks/go-replay` (`goreplay`, AGPL: it links go-algorand) | `algod-rust bench replay-corpus` (`bin/algod-rust/src/commands/bench_replay.rs`) |
+| Data directory | `config.json` (the corpus's `node-config.json`), `cfg.EnsureAndResolveGenesisDirs` and `data.LoadLedger`, as `node.MakeFull` does | `config.json`, then `participate`'s `open_and_configure_participate_ledger` and `seed_ledger_from_genesis_str`, plus `set_devmode_chain` for a devmode genesis (as `algod-rust node` does) |
+| Per block | The body of `catchup/service.go` `fetchAndWrite`: `processBlockBytes` (decode, round checks), `ContentsMatchHeader`, the certificate check, the `MaxBalLookback` backpressure wait, then `AddBlock` (default `CatchupBlockValidateMode` 0) or `Validate` + `AddValidatedBlock` | The catchup service's own sync pass, `CatchupService::sync_range` (`crates/core/algo-ledger/src/catchup_service.rs`). It runs parallel fetch workers, then in round order `authenticate_block`, `algo_validate::contents_match_header` and `AgreementLedgerBridge::ensure_block` (store the block and cert, apply, commit) |
+| Block source | `blocks.bin`, read record by record from the file | `CorpusBlockFetcher`, a `BlockFetcher` that reads `blocks.bin` per round and builds the `FetchedBlockCert` the way the gossip fetcher does (`decode_block_response`, raw payset blobs, `participate::fetched_certificate`) |
+| End of the timed section | `WaitForCommit(last)` (every block durable), then `Close()` (waits for an in-flight tracker commit and stops the writers) | the last commit (algod-rust commits each block synchronously), then the ledger is dropped |
+| Final state | read from the **reopened** ledger | read from the **reopened** ledger |
+
+Nothing on the Rust side is a benchmark-only shortcut. The only corpus-specific
+pieces are the block source and the DevMode certificate check (below). The
+unit test `small_corpus_replays_to_the_go_final_state` (in
+`bench_replay.rs`) runs this exact code in default CI and requires the Go
+state.
+
+**DevMode certificates.** A DevMode corpus certificate holds only its round
+(no votes, no proposal), so neither side can authenticate it.
+- go would call `cert.Authenticate`. `goreplay` instead requires the
+  degenerate form: the right round and no votes.
+- algod-rust's `CorpusCatchupLedger` delegates everything to the production
+  `AgreementLedgerBridge`, except `authenticate_block`, which runs the same
+  check (`check_devmode_certificate`).
+- A non-DevMode corpus is authenticated for real on both sides: go's
+  `cert.Authenticate` with an `AsyncVoteVerifier`, the bridge's
+  `Certificate::authenticate`.
+
+**DevMode payouts.** go's catchup `AddBlock` evaluates with
+`validate = false`, and `validateForPayouts` runs only inside `endOfBlock`'s
+`if eval.validate` (`ledger/eval/eval.go` L1551-L1571), so go never holds a
+fetched proposer-less DevMode block to the payout rules. algod-rust's
+catchup commit checks payouts (issue #1803) except on a devmode chain
+(`SqliteLedger::is_devmode_chain`, `apply_devmode_block_executing_app_calls`),
+the same rule its follow path already had.
+
+### What is measured
+
+The timed section starts after setup and ends as described in the table.
+Setup covers genesis seeding, an untimed pre-pass that indexes `blocks.bin`
+and counts the work, and the final-state computation.
+
+| Row | Unit | Definition |
+|---|---|---|
+| `<corpus>/blocks_per_s` | block/s | blocks replayed / wall time |
+| `<corpus>/txns_per_s` | txn/s | top-level + inner txns / wall time |
+| `<corpus>/wall_s` | s | wall time of the timed section |
+| `<corpus>/peak_rss_mb` | MB | `VmHWM` from `/proc/self/status` (process lifetime peak; the pre-pass streams the corpus, it never holds it in memory) |
+| `<corpus>/cpu_s` | s | `getrusage(RUSAGE_SELF)` user + sys over the timed section |
+| `<corpus>/write_mb` | MB | `/proc/self/io` `write_bytes` over the timed section; omitted where the kernel has no per-task I/O accounting (WSL2) |
+| `<corpus>/db_mb` | MB | size of the data directory after the close |
+
+Each run uses a fresh temporary data directory. The tier discards
+`BENCH_REPLAY_WARMUP` (default 1) warm-up rounds, then runs `RUNS` measured
+rounds and alternates which side goes first. Every result's `metadata`
+carries the corpus manifest sha256, `final_state_sha256` (canonical JSON of
+the final state), the final block hash, both commands and each side's
+effective config.
+
+### Config parity and the differences that remain
+
+Both sides run the corpus's `node-config.json` on top of their defaults:
+`Archival: true`, and the default `CatchupBlockValidateMode` 0,
+`CatchupParallelBlocks` 16, `MaxAcctLookback` 4, `LedgerSynchronousMode` 2
+and `CatchpointInterval` 10000. Each result's `config` lists the values it
+ran with. These differences remain, and they are part of what is measured:
+
+- **Write strategy.** go queues blocks in its block queue and flushes account
+  deltas to the tracker DB in batches, at most every ~5 s
+  (`balancesFlushInterval`). Up to that much state stays in memory and is
+  rebuilt from the blocks on restart. algod-rust commits block and state in
+  one SQLite transaction per block.
+- **Payout validation.** go's `AddBlock` skips `validateForPayouts`.
+  algod-rust's catchup checks it on non-devmode chains (#1803); the corpus is
+  devmode, so it is skipped here too.
+- **`MaxAcctLookback`.** go keeps 4 rounds of deltas. algod-rust's delta
+  cache never goes below 320 rounds (`set_delta_cache_window`).
+- **Catchpoints.** Neither side writes catchpoint files: algod-rust needs a
+  `CatchpointDir`, which the config leaves empty. go maintains its catchpoint
+  trie on archival nodes, and algod-rust maintains its account trie.
+- **Fetch pipeline.** go's harness writes blocks in order from one goroutine,
+  as `fetchAndWrite` does once the previous round is written; it does not run
+  go's network fetch pipeline. algod-rust runs its real sync pass, including
+  its fetch worker threads (`CatchupParallelBlocks`).
+
+### The final-state equality gate
+
+Both harnesses compute the same canonical document
+(`benchmarks/go-replay/state.go`, `crates/tools/algo-bench/src/replay_state.rs`;
+the line formats must stay identical). Every digest is the hex sha256 of the
+lines described below.
+
+| Field | Content |
+|---|---|
+| `round`, `block_hash`, `txn_counter` | the last block |
+| `total_money`, `online_money`, `totals` | the ledger's `AccountTotals` (online / offline / not-participating money and reward units, rewards level) |
+| `known_accounts` | `corpus.json`'s digest: `"<address> <amount>\n"` over the sorted account set the generator tracked, amounts with pending rewards (REST `amount`). The set is rebuilt from the corpus: the genesis allocations, every top-level payment receiver, and the accounts of the first two apps created |
+| `all_accounts` | every non-empty account: its stored base record (status, balance, rewards base, auth, totals, voting keys), then its asset holdings, created assets, app local states and created apps, including TEAL key/value state and program hashes |
+| `kv` | every box: `"<hex key> <hex value>\n"` sorted by key |
+
+The tier fails when any of these holds:
+- a run's Go and Rust states differ (the report names each differing field);
+- the runs disagree with each other;
+- a full replay's state differs from `corpus.json`'s `final_state` on round,
+  block hash, txn counter, money, account count or `accounts_sha256`.
+
+Each harness also checks `corpus.json` itself and exits 3 on a mismatch.
+`--dump-state DIR` (Rust) and `-dump-state DIR` (Go) write the digested lines,
+so a divergence can be diffed line by line. `--rounds N` / `-rounds N`
+(tier: `BENCH_REPLAY_ROUNDS`) replay a prefix, for bisecting the first
+diverging round. The gate's first finding was #2116: the rewards pool was
+never debited for accrued rewards. The first divergence was at round 3.
+
+**Recorded Go state.** `benchmarks/go-replay/testdata/small-final-state.json`
+is the Go harness's full final state on the `small` corpus. Two tests hold it
+in step: Go's `TestSmallCorpusFinalStateMatchesRecorded` and algod-rust's
+`small_corpus_replays_to_the_go_final_state`. So default `cargo test` checks
+the Rust state against Go's without Go installed. The `algo-bench` test
+`corpus_small.rs` additionally checks go-algorand's numbers along the way
+(round 3's not-participating money, the round-2000 pool balance and
+`corpus.json`'s `accounts_sha256`) through the follow path.
+
+**Negative tests.**
+- `BENCH_REPLAY_CORRUPT=txn` replays a copy of the corpus with one byte of a
+  txn note flipped. Both replays stop at that block (payset commitment
+  mismatch).
+- `BENCH_REPLAY_CORRUPT=expected` alters the expected `accounts_sha256`. Both
+  replays succeed, and the gate rejects the state.
+- In both cases the manifest is re-hashed, so the corpus still verifies.
+- Both must fail the tier. CI runs both. The Go tests
+  `TestCorruptedTxnFailsTheReplay` / `TestWrongExpectedStateExits3`, the Rust
+  test `corrupted_txn_fails_the_replay` and `scripts/bench/test_replay.py`
+  cover the same paths per side.
+
+### CI
+
+`.github/workflows/bench-replay.yml` (Linux) runs on changes to the harnesses,
+the corpus, the tier and the production ledger, validation and codec crates.
+It runs:
+- gofmt, vet and `go test` of `benchmarks/go-replay`;
+- the tier's Python tests;
+- `make bench-compare TIERS=replay CORPUS=small RUNS=3`, with `report.md`
+  appended to the job summary;
+- both negative tests.
+
+CI runners are noisy, so treat their ratios as indicative only.
+
+### Running it by hand
+
+```bash
+# Go side (Linux; GOWORK replacing go-algorand with the pinned checkout):
+go build -o goreplay ./benchmarks/go-replay
+./goreplay -corpus benchmarks/corpus/small -data /tmp/g -out /tmp/g.json
+# Rust side:
+algod-rust bench replay-corpus --corpus benchmarks/corpus/small --data-dir /tmp/r --output /tmp/r.json
+```

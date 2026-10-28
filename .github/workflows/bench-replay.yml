@@ -1,0 +1,182 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: Bench Ledger Replay
+
+# Issue #2105 (epic #2101): the offline ledger-replay tier on Linux. Both
+# go-algorand's ledger (benchmarks/go-replay) and algod-rust's production
+# catchup path (`algod-rust bench replay-corpus`) replay the committed `small`
+# workload corpus, and the tier fails unless both reach the same final state
+# and that state matches corpus.json. The steps:
+#   * gofmt / vet / go test of the go harness (its final state equals
+#     benchmarks/go-replay/testdata/small-final-state.json, plus the
+#     corrupted-corpus negative tests);
+#   * `make bench-compare TIERS=replay CORPUS=small RUNS=3`, report.md to
+#     the job summary;
+#   * the gate's negative tests: the tier re-run on a corrupted copy of the
+#     corpus (a flipped txn byte; a wrong expected state) must fail.
+# CI runners are noisy: the ratios are indicative only.
+
+on:
+  pull_request:
+    paths:
+      - "benchmarks/go-replay/**"
+      - "benchmarks/corpus/**"
+      - "scripts/bench/tiers/replay.py"
+      - "scripts/bench/test_replay.py"
+      - "scripts/bench/run.py"
+      - "scripts/bench/build_both.sh"
+      - "scripts/bench/go-algorand.pin"
+      - "bin/algod-rust/src/commands/bench_replay.rs"
+      - "crates/tools/algo-bench/**"
+      - ".github/workflows/bench-replay.yml"
+      # The production code the replay drives.
+      - "crates/core/algo-ledger/**"
+      - "crates/core/algo-validate/**"
+      - "crates/core/algo-codec/**"
+      - "crates/core/algo-types/**"
+      - "crates/core/algo-avm/**"
+      - "crates/core/algo-agreement/**"
+      - "Cargo.lock"
+  push:
+    branches: [main]
+    paths:
+      - "benchmarks/go-replay/**"
+      - "benchmarks/corpus/**"
+      - "scripts/bench/tiers/replay.py"
+      - "scripts/bench/test_replay.py"
+      - "scripts/bench/run.py"
+      - "scripts/bench/build_both.sh"
+      - "scripts/bench/go-algorand.pin"
+      - "bin/algod-rust/src/commands/bench_replay.rs"
+      - "crates/tools/algo-bench/**"
+      - ".github/workflows/bench-replay.yml"
+      - "crates/core/algo-ledger/**"
+      - "crates/core/algo-validate/**"
+      - "crates/core/algo-codec/**"
+      - "crates/core/algo-types/**"
+      - "crates/core/algo-avm/**"
+      - "crates/core/algo-agreement/**"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench-replay:
+    name: replay tier (small corpus, Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v7
+      - name: Locate the go-algorand checkout
+        # `runner` is not available in job-level env; export it for every later step.
+        run: |
+          echo "GO_ALGORAND_DIR=$RUNNER_TEMP/go-algorand" >> "$GITHUB_ENV"
+          echo "BENCH_BIN_DIR=$GITHUB_WORKSPACE/target/bench-compare" >> "$GITHUB_ENV"
+      - name: Resolve the pinned tag and its go.mod
+        id: pin
+        run: |
+          set -euo pipefail
+          tag="$(grep -v '^[[:space:]]*#' scripts/bench/go-algorand.pin | grep -v '^[[:space:]]*$' | head -n1 | tr -d '[:space:]')"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/go-algorand-gomod"
+          # setup-go only parses a file literally named go.mod (else: plain version file).
+          curl -fsSL "https://raw.githubusercontent.com/algorand/go-algorand/${tag}/go.mod" \
+            -o "$RUNNER_TEMP/go-algorand-gomod/go.mod"
+          grep -E '^(go|toolchain) ' "$RUNNER_TEMP/go-algorand-gomod/go.mod"
+      - name: Install Go per go-algorand's go.mod
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: ${{ runner.temp }}/go-algorand-gomod/go.mod
+          cache-dependency-path: benchmarks/go-replay/go.sum
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-replay
+      - name: Install libsodium build tools
+        run: |
+          # go-algorand's crypto package links a vendored libsodium fork via cgo.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends autoconf automake libtool build-essential
+      - name: Clone pinned go-algorand + make libsodium
+        env:
+          TAG: ${{ steps.pin.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 --branch "$TAG" https://github.com/algorand/go-algorand "$GO_ALGORAND_DIR"
+          make -C "$GO_ALGORAND_DIR" libsodium
+      - name: Tier unit tests (gate, negative corpora, result rows)
+        run: python3 -m unittest -v scripts/bench/test_replay.py
+      - name: Go harness - gofmt, vet, tests
+        run: |
+          set -euo pipefail
+          cd benchmarks/go-replay
+          unformatted="$(gofmt -l .)"
+          [ -z "$unformatted" ] || { echo "::error::gofmt needed: $unformatted"; exit 1; }
+          # go directive from go-replay's own go.mod, go-algorand replaced by the checkout.
+          {
+            grep -E '^go ' go.mod
+            echo
+            echo "use $PWD"
+            echo
+            echo "replace github.com/algorand/go-algorand => $GO_ALGORAND_DIR"
+          } > "$RUNNER_TEMP/replay.go.work"
+          export GOWORK="$RUNNER_TEMP/replay.go.work" GOFLAGS=-buildvcs=false
+          cat "$GOWORK"
+          go vet ./...
+          go test -count=1 -v ./...
+      - name: make bench-compare TIERS=replay CORPUS=small RUNS=3
+        run: |
+          set -euo pipefail
+          make bench-compare TIERS=replay CORPUS=small RUNS=3 BENCH_RUN_DIR=bench-results/ci-replay \
+            GO_ALGORAND_DIR="$GO_ALGORAND_DIR"
+          python3 - <<'PY'
+          import json
+          rep = json.load(open("bench-results/ci-replay/report.json"))
+          assert rep["ok"], rep["errors"]
+          rows = [r for r in rep["rows"] if r["tier"] == "replay"]
+          assert rows, "no replay rows"
+          missing = [r["name"] for r in rows if r.get("ratio") is None]
+          assert not missing, missing
+          print(f"{len(rows)} replay rows, every one with a Rust/Go ratio")
+          PY
+      - name: Negative tests - a corrupted corpus fails the tier
+        run: |
+          set -euo pipefail
+          # txn: both replays stop at the corrupted block; expected: both replay,
+          # then the gate rejects the state. Each must fail for that reason.
+          for kind in txn expected; do
+            out="$RUNNER_TEMP/neg-$kind"
+            mkdir -p "$out"
+            if BENCH_REPLAY_CORRUPT="$kind" BENCH_RUNS=1 BENCH_REPLAY_WARMUP=0 BENCH_OUT="$out" \
+                 BENCH_RUST_BIN_DIR="$BENCH_BIN_DIR/rust" BENCH_GO_ALGORAND_DIR="$GO_ALGORAND_DIR" \
+                 python3 scripts/bench/tiers/replay.py > "$out/log.txt" 2>&1; then
+              cat "$out/log.txt"
+              echo "::error::the replay tier passed on a corrupted corpus ($kind)"
+              exit 1
+            fi
+            tail -n 5 "$out/log.txt"
+            if [ "$kind" = txn ]; then want='replay exited 1'; else want='final-state gate FAILED'; fi
+            grep -q "$want" "$out/log.txt" || { echo "::error::$kind: failed, but not with '$want'"; exit 1; }
+            echo "corrupted corpus ($kind): the tier failed, as it must"
+          done
+      - name: Report to job summary
+        if: always()
+        run: |
+          if [ -s bench-results/ci-replay/report.md ]; then
+            cat bench-results/ci-replay/report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload run directory
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-replay-results
+          path: bench-results/ci-replay
+          if-no-files-found: ignore

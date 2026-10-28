@@ -348,6 +348,13 @@ pub fn apply_block_executing_app_calls<L: crate::store_trait::LedgerStore>(
 /// `SqliteLedger::apply_block_caching_delta` already does for the follow /
 /// sync path (issue #1803). Used by the catchup / agreement commit
 /// (`AgreementLedgerBridge::ensure_block`), issue #2105.
+///
+/// go: `validateForPayouts` runs only inside `endOfBlock`'s
+/// `if eval.validate { ... }` (`ledger/eval/eval.go` L1551-L1571), and go's
+/// catchup writes fetched blocks with `ledger.AddBlock`
+/// (`catchup/service.go` L479, the default `CatchupBlockValidateMode` 0),
+/// which evaluates with `validate = false`. So go never holds a fetched
+/// devmode block (no proposer) to the payout rules.
 pub fn apply_devmode_block_executing_app_calls<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     block: &Block,

@@ -624,7 +624,6 @@ mod tests {
     /// state the go replay harness recorded
     /// (benchmarks/go-replay/testdata/small-final-state.json).
     #[test]
-    #[ignore = "blocked on #2116: the rewards pool is not debited for accrued block rewards"]
     fn small_corpus_replays_to_the_go_final_state() {
         let tmp = tempfile::tempdir().unwrap();
         let res = replay_corpus(&ReplayCorpusArgs {
@@ -716,8 +715,10 @@ mod tests {
 
     #[test]
     fn devmode_certificate_check() {
-        let mut block = Block::default();
-        block.round = Round(5);
+        let block = Block {
+            round: Round(5),
+            ..Block::default()
+        };
         let cert = Certificate {
             round: Round(5),
             ..Certificate::default()
