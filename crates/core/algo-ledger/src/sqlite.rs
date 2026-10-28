@@ -3819,6 +3819,12 @@ impl SqliteLedger {
         self.devmode_chain = devmode;
     }
 
+    /// Whether [`Self::set_devmode_chain`] marked this ledger as following a
+    /// go `devmode` chain.
+    pub fn is_devmode_chain(&self) -> bool {
+        self.devmode_chain
+    }
+
     /// Whether the per-group delta tracer is enabled.
     pub fn group_delta_tracer_enabled(&self) -> bool {
         self.group_delta_tracer.is_some()

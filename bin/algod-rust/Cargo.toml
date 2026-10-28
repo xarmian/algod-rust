@@ -54,6 +54,8 @@ rmpv.workspace = true
 rmp-serde.workspace = true
 rmp.workspace = true
 rusqlite.workspace = true
+# `bench replay-corpus` (issue #2105): the catchup service's shutdown channel.
+crossbeam-channel.workspace = true
 tokio-util = { workspace = true, features = ["compat"] }
 toml = "1"
 reqwest.workspace = true
@@ -68,6 +70,10 @@ sha2.workspace = true
 # same pair is needed here too.
 hyper.workspace = true
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
+
+[target.'cfg(unix)'.dependencies]
+# `bench replay-corpus` (issue #2105): getrusage CPU time of the replay.
+libc.workspace = true
 
 [dev-dependencies]
 algo-ledger = { workspace = true, features = ["test-hooks"] }

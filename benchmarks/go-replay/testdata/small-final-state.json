@@ -1,0 +1,37 @@
+{
+  "round": 2000,
+  "block_hash": "blk-UWDNW4AWC4S7X3SFTXZ6WD3F43ARU2JS76L2QZ7DLISXMQARV43Q",
+  "txn_counter": 13332,
+  "total_money": 464399979197438,
+  "online_money": 400344800000000,
+  "totals": {
+    "online": {
+      "money": 400344800000000,
+      "reward_units": 400000000
+    },
+    "offline": {
+      "money": 64055179197438,
+      "reward_units": 64054888
+    },
+    "not_participating": {
+      "money": 99600020902562,
+      "reward_units": 99600020
+    },
+    "rewards_level": 862
+  },
+  "known_accounts": {
+    "count": 166,
+    "microalgos": 564000000100000,
+    "sha256": "db89c891cc8ba7de93a217a9876b13603fcd9d89f8ef134f0964ea96b1ba96c9"
+  },
+  "all_accounts": {
+    "count": 71,
+    "microalgos": 563654939888303,
+    "sha256": "f5ca38408953ff4164113aa1aab2adb1dc50e55566739277b90c22d4f7fa8868"
+  },
+  "kv": {
+    "count": 238,
+    "microalgos": 0,
+    "sha256": "e38c65b60405efa602e91ce31c1b3e5ac49f9eaed65463f4e4250984d5888ff7"
+  }
+}

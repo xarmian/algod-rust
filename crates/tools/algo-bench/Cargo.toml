@@ -21,6 +21,8 @@ algo-codec.workspace = true
 algo-types.workspace = true
 rmpv.workspace = true
 data-encoding.workspace = true
+# Replay final state (issue #2105): enumerates the tracker DB read-only.
+rusqlite.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

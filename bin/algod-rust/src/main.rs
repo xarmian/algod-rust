@@ -412,6 +412,26 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
             } => {
                 commands::bench::run_compare(&rust_json, &go_json, markdown)?;
             }
+            BenchAction::ReplayCorpus {
+                corpus,
+                data_dir,
+                output,
+                config,
+                rounds,
+                dump_state,
+            } => {
+                let args = commands::bench_replay::ReplayCorpusArgs {
+                    corpus,
+                    data_dir,
+                    config,
+                    rounds,
+                    dump_state,
+                };
+                tokio::task::spawn_blocking(move || {
+                    commands::bench_replay::run_replay_corpus(&args, &output)
+                })
+                .await??;
+            }
         },
         Commands::Relay {
             bind_address,

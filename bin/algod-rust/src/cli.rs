@@ -1322,4 +1322,41 @@ pub enum BenchAction {
         #[arg(long)]
         markdown: bool,
     },
+
+    /// Replay a workload block corpus offline through the production
+    /// catchup path (issue #2105): the `replay` tier of `make bench-compare`.
+    ///
+    /// Opens a fresh ledger in `--data-dir` the way `participate` does,
+    /// feeds every corpus block to the catchup service's sync pass
+    /// (`CatchupService::sync_range`: certificate check, payset commitment,
+    /// apply, commit), then writes timings, resource use and the canonical
+    /// final state as JSON. Exits 3 when the final state differs from the
+    /// corpus's `corpus.json`. See docs/BENCHMARK_COMPARISON.md.
+    ReplayCorpus {
+        /// Corpus directory (benchmarks/corpus/<name>).
+        #[arg(long)]
+        corpus: PathBuf,
+
+        /// Fresh node data directory to create (must be empty or absent).
+        #[arg(long)]
+        data_dir: PathBuf,
+
+        /// Result JSON file (bench-replay-run/v1).
+        #[arg(long, default_value = "bench-replay-corpus-rust.json")]
+        output: PathBuf,
+
+        /// config.json for the node (default: the corpus's node-config.json).
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Replay only rounds 1..=N (for bisecting a divergence).
+        #[arg(long)]
+        rounds: Option<u64>,
+
+        /// Also write the digested final-state lines (known_accounts.txt,
+        /// all_accounts.txt, kv.txt) into this directory, to diff a
+        /// divergence against go's `goreplay -dump-state`.
+        #[arg(long)]
+        dump_state: Option<PathBuf>,
+    },
 }

@@ -22,6 +22,7 @@ pub mod algocfg;
 pub mod algod;
 pub mod autopsy;
 pub mod bench;
+pub mod bench_replay;
 pub mod capture;
 pub mod capture_wire;
 pub mod catchpoint;

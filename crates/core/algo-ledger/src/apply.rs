@@ -342,6 +342,24 @@ pub fn apply_block_executing_app_calls<L: crate::store_trait::LedgerStore>(
     apply_block_checking_payouts(store, block, ApplyMode::Execute)
 }
 
+/// [`apply_block_executing_app_calls`] for a ledger following a go `devmode`
+/// chain (`SqliteLedger::set_devmode_chain`): its blocks carry no proposer,
+/// so they are applied without `validateForPayouts`, exactly like
+/// `SqliteLedger::apply_block_caching_delta` already does for the follow /
+/// sync path (issue #1803). Used by the catchup / agreement commit
+/// (`AgreementLedgerBridge::ensure_block`), issue #2105.
+pub fn apply_devmode_block_executing_app_calls<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+) -> Result<(), AlgoError> {
+    let mode = if block_has_app_call(block) {
+        ApplyMode::Execute
+    } else {
+        ApplyMode::Replay
+    };
+    apply_block_with_mode(store, block, mode)
+}
+
 /// Apply a certified block received from the network (follow / catch-up).
 ///
 /// go applies those through the validating evaluator, whose `endOfBlock`
