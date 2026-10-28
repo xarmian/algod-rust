@@ -1,0 +1,41 @@
+#pragma version 10
+pushbytes 0xb6d43ea34f2a1ac4b0e4dbb12a3c7c1c694b055cd5217ab595c19cabfa1d5ece
+store 0
+int 0
+store 1
+loop:
+load 0
+pushbytes 0xca04090c4914a5d800472dac26b16677075ab1fcac5e530efd9a7e941740b46f
+b^
+dup
+extract 16 16
+swap
+extract 0 16
+concat
+load 1
+itob
+b+
+pushint 32
+bzero
+b|
+dup
+len
+pushint 32
+-
+pushint 32
+extract3
+load 1
+itob
+replace2 8
+store 0
+load 1
+int 1
++
+dup
+store 1
+pushint 250
+<
+bnz loop
+load 0
+pushbytes 0x7b8a8653aa60ec1200000000000000f9a415bdac306b8c6300472dac26b16788
+==

@@ -1,0 +1,327 @@
+# Paired Go/Rust micro-benchmark registry (issue #2103, epic #2101).
+#
+# One [[pair]] per comparison. `make bench-compare TIERS=micro` runs the Go
+# benchmark `go_bench` (package `go_package`, module benchmarks/go-micro) and
+# the Rust criterion benchmark `rust_bench` (crate algo-bench-pairs, bench
+# target `pairs`) on the same `fixture` (benchmarks/fixtures/micro/<fixture>,
+# whose sha256 must equal `fixture_sha256`), and reports Rust/Go per `id`.
+# Before timing anything the tier runs every pair once on both sides and
+# requires identical output digests (scripts/bench/micro_equiv.py).
+#
+# `go_api` / `rust_api` name the production function each side measures.
+# go-algorand's own Benchmark* functions (crypto.BenchmarkHash,
+# BenchmarkVerify25519, BenchmarkBatchVerifier*, the logic package's
+# benchmarkOperation family, msgp_gen_test's BenchmarkUnmarshal*) were
+# reviewed first: every one of them draws its input from crypto.RandBytes /
+# protocol.RandomizeObject or an inline source the Rust side cannot read, so
+# none measures "the same thing on the same bytes". The pairs therefore use
+# thin testing.B wrappers in benchmarks/go-micro that call the same go-algorand
+# APIs on the shared fixtures.
+#
+# Checked by scripts/bench/test_pairs.py (also in CI: the static part runs in
+# the bench-compare-harness job, `go test -list` in the bench-micro job).
+# Regenerate fixtures with `go run ./cmd/genfixtures` in benchmarks/go-micro
+# and update the sha256s here; see docs/BENCHMARK_COMPARISON.md "micro tier".
+
+schema = 1
+fixture_dir = "benchmarks/fixtures/micro"
+go_module = "benchmarks/go-micro"
+rust_package = "algo-bench-pairs"
+rust_bench_target = "pairs"
+
+[[pair]]
+id = "codec/decode-block-small"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkCodecDecodeBlockSmall"
+go_api = "protocol.Decode(b, &bookkeeping.Block{})"
+rust_bench = "codec/decode-block-small"
+rust_api = "algo_codec::decode_block"
+fixture = "block-small.msgpack"
+fixture_sha256 = "3fce5949864b38b8a16fbfae183c7236b8a589e32240ed46c49ffd19f8250d5d"
+
+[[pair]]
+id = "codec/decode-block-large"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkCodecDecodeBlockLarge"
+go_api = "protocol.Decode(b, &bookkeeping.Block{})"
+rust_bench = "codec/decode-block-large"
+rust_api = "algo_codec::decode_block"
+fixture = "block-large.msgpack"
+fixture_sha256 = "b7a8652108bc09f3c98ab27f8e97610279c789e9742fd7fcc8202d6ebf32cd80"
+
+[[pair]]
+id = "codec/encode-block-small"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkCodecEncodeBlockSmall"
+go_api = "protocol.Encode(&block)"
+rust_bench = "codec/encode-block-small"
+rust_api = "algo_codec::canonical_encode_block"
+fixture = "block-small.msgpack"
+fixture_sha256 = "3fce5949864b38b8a16fbfae183c7236b8a589e32240ed46c49ffd19f8250d5d"
+
+[[pair]]
+id = "codec/encode-block-large"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkCodecEncodeBlockLarge"
+go_api = "protocol.Encode(&block)"
+rust_bench = "codec/encode-block-large"
+rust_api = "algo_codec::canonical_encode_block"
+fixture = "block-large.msgpack"
+fixture_sha256 = "b7a8652108bc09f3c98ab27f8e97610279c789e9742fd7fcc8202d6ebf32cd80"
+
+[[pair]]
+id = "codec/decode-stxn"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkCodecDecodeStxn"
+go_api = "protocol.Decode(b, &transactions.SignedTxn{})"
+rust_bench = "codec/decode-stxn"
+rust_api = "algo_types::SignedTransaction::decode_from_reader (one object)"
+fixture = "stxn-appl.msgpack"
+fixture_sha256 = "f8468073c465a7639a1332d07b9c60538e3f7df96f369488d0b7a9a27f2a013c"
+
+[[pair]]
+id = "codec/encode-stxn"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkCodecEncodeStxn"
+go_api = "protocol.Encode(&stxn)"
+rust_bench = "codec/encode-stxn"
+rust_api = "algo_codec::canonical_encode_signed_transaction"
+fixture = "stxn-appl.msgpack"
+fixture_sha256 = "f8468073c465a7639a1332d07b9c60538e3f7df96f369488d0b7a9a27f2a013c"
+
+[[pair]]
+id = "codec/txid"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkCodecTxid"
+go_api = "transactions.Transaction.ID"
+rust_bench = "codec/txid"
+rust_api = "algo_codec::compute_txn_id"
+fixture = "stxn-appl.msgpack"
+fixture_sha256 = "f8468073c465a7639a1332d07b9c60538e3f7df96f369488d0b7a9a27f2a013c"
+
+[[pair]]
+id = "codec/block-hash"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkCodecBlockHash"
+go_api = "bookkeeping.BlockHeader.Hash"
+rust_bench = "codec/block-hash"
+rust_api = "algo_codec::compute_block_digest"
+fixture = "block-large.msgpack"
+fixture_sha256 = "b7a8652108bc09f3c98ab27f8e97610279c789e9742fd7fcc8202d6ebf32cd80"
+
+[[pair]]
+id = "crypto/sha512_256-32B"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkCryptoSha512_256_32B"
+go_api = "crypto.Hash"
+rust_bench = "crypto/sha512_256-32B"
+rust_api = "sha2::Sha512_256::digest"
+fixture = "bytes-32.bin"
+fixture_sha256 = "4f7255784dc351922a7e10776122ec6c25ace9168e1837cba34b2c20bfdba4c8"
+
+[[pair]]
+id = "crypto/sha512_256-1KiB"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkCryptoSha512_256_1KiB"
+go_api = "crypto.Hash"
+rust_bench = "crypto/sha512_256-1KiB"
+rust_api = "sha2::Sha512_256::digest"
+fixture = "bytes-1k.bin"
+fixture_sha256 = "cb5ec7ce5a991641de1b83ff9d17779f52ecb7bce2d7fade0ac3deed73851891"
+
+[[pair]]
+id = "crypto/sha512_256-64KiB"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkCryptoSha512_256_64KiB"
+go_api = "crypto.Hash"
+rust_bench = "crypto/sha512_256-64KiB"
+rust_api = "sha2::Sha512_256::digest"
+fixture = "bytes-64k.bin"
+fixture_sha256 = "bb9d4d01de8cc063d1e49d5f4457442490c1a629f24bd61e0c07229af38f27bb"
+
+[[pair]]
+id = "crypto/ed25519-verify"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkCryptoEd25519Verify"
+go_api = "crypto.SignatureVerifier.Verify(txn, sig)"
+rust_bench = "crypto/ed25519-verify"
+rust_api = "algo_validate::verify_single_sig"
+fixture = "stxn-appl.msgpack"
+fixture_sha256 = "f8468073c465a7639a1332d07b9c60538e3f7df96f369488d0b7a9a27f2a013c"
+
+[[pair]]
+id = "crypto/ed25519-batch-64"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkCryptoEd25519Batch64"
+go_api = "crypto.BatchVerifier (EnqueueSignature x64 + VerifyWithFeedback)"
+rust_bench = "crypto/ed25519-batch-64"
+rust_api = "algo_validate::verify_single_sig x64 (no Rust batch verifier)"
+fixture = "stxns-64.msgpack"
+fixture_sha256 = "d62a17a363e1aafc672e14bc4f366941d48772fc0c8909dc4d034eb35b526d64"
+
+[[pair]]
+id = "crypto/ed25519-batch-1024"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkCryptoEd25519Batch1024"
+go_api = "crypto.BatchVerifier (EnqueueSignature x1024 + VerifyWithFeedback)"
+rust_bench = "crypto/ed25519-batch-1024"
+rust_api = "algo_validate::verify_single_sig x1024 (no Rust batch verifier)"
+fixture = "stxns-1024.msgpack"
+fixture_sha256 = "5df596cf38aed117f3c27b2e547492c10481a38889945afd65453d6802e88e0d"
+
+[[pair]]
+id = "crypto/vrf-verify"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkCryptoVrfVerify"
+go_api = "crypto.VrfPubkey.Verify"
+rust_bench = "crypto/vrf-verify"
+rust_api = "algo_consensus_crypto::vrf::vrf_verify"
+fixture = "vrf.frames"
+fixture_sha256 = "554a97399d7b27c361b653abc3b53d615678d2e1c234adeee36225ab26aa3bdc"
+
+[[pair]]
+id = "crypto/falcon-verify"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkCryptoFalconVerify"
+go_api = "crypto.FalconVerifier.VerifyBytes (C falcon)"
+rust_bench = "crypto/falcon-verify"
+rust_api = "algo_falcon::falcon_verify (default backend: pure Rust, DIV-001)"
+fixture = "falcon.frames"
+fixture_sha256 = "f07804cbe7a1f11690777d98791048ab3a895cb56d5a70bf4cc3f3ad5830ae40"
+
+[[pair]]
+id = "commit/txn-merkle-sha512_256"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkCommitTxnMerkle"
+go_api = "bookkeeping.Block.TxnMerkleTree().Root()"
+rust_bench = "commit/txn-merkle-sha512_256"
+rust_api = "algo_validate::merkle::compute_payset_merkle_root"
+fixture = "block-large.msgpack"
+fixture_sha256 = "b7a8652108bc09f3c98ab27f8e97610279c789e9742fd7fcc8202d6ebf32cd80"
+
+[[pair]]
+id = "commit/txn-vc-sha256"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkCommitTxnVcSha256"
+go_api = "bookkeeping.Block.TxnMerkleTreeSHA256().Root()"
+rust_bench = "commit/txn-vc-sha256"
+rust_api = "algo_validate::merkle::compute_vector_commitment(Sha256)"
+fixture = "block-large.msgpack"
+fixture_sha256 = "b7a8652108bc09f3c98ab27f8e97610279c789e9742fd7fcc8202d6ebf32cd80"
+
+[[pair]]
+id = "avm/lsig-arith-loop"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkAvmLsigArithLoop"
+go_api = "logic.NewSigEvalParams + logic.EvalSignature"
+rust_bench = "avm/lsig-arith-loop"
+rust_api = "LogicSigAvmContext + algo_avm::eval::run_logicsig_program"
+fixture = "avm-arith.bin"
+fixture_sha256 = "842c49e0c9beb8552b632e11ecdb93161efeb07f49cb4154749b28f4d0397a8b"
+
+[[pair]]
+id = "avm/lsig-hash-loop"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkAvmLsigHashLoop"
+go_api = "logic.NewSigEvalParams + logic.EvalSignature"
+rust_bench = "avm/lsig-hash-loop"
+rust_api = "LogicSigAvmContext + algo_avm::eval::run_logicsig_program"
+fixture = "avm-hash.bin"
+fixture_sha256 = "a5738ac5f44f6c305b75b8f87f97d75da969037c77df5209ed2c852aaa4654a2"
+
+[[pair]]
+id = "avm/lsig-bytes-ops"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkAvmLsigBytesOps"
+go_api = "logic.NewSigEvalParams + logic.EvalSignature"
+rust_bench = "avm/lsig-bytes-ops"
+rust_api = "LogicSigAvmContext + algo_avm::eval::run_logicsig_program"
+fixture = "avm-bytes.bin"
+fixture_sha256 = "b50283d017da8f9711de27af529a2a85699ccc310846263288bb08b944ea199e"
+
+[[pair]]
+id = "avm/app-state-box"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkAvmAppStateBox"
+go_api = "logic.NewAppEvalParams + logic.EvalContract (in-memory LedgerForLogic)"
+rust_bench = "avm/app-state-box"
+rust_api = "LedgerAvmContext<LedgerState> + algo_avm::eval::run_approval_program"
+fixture = "avm-app.bin"
+fixture_sha256 = "461c6586e7853588cf9bd4c9fa5246262448c406c17c02360b73f9b057268932"
+
+[[pair]]
+id = "agreement/sortition-select"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkAgreementSortitionSelect"
+go_api = "sortition.Select (float64, pre-v42)"
+rust_bench = "agreement/sortition-select"
+rust_api = "algo_consensus_crypto::sortition::select"
+fixture = "sortition.json"
+fixture_sha256 = "8ae3c98313c2b0080bf68eb453d0d9bf759e1050d16dc4785d71824f3651d741"
+
+[[pair]]
+id = "agreement/sortition-select-f128"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkAgreementSortitionSelectF128"
+go_api = "sortition.SelectF128 (v42+)"
+rust_bench = "agreement/sortition-select-f128"
+rust_api = "algo_consensus_crypto::sortition::select_f128"
+fixture = "sortition.json"
+fixture_sha256 = "8ae3c98313c2b0080bf68eb453d0d9bf759e1050d16dc4785d71824f3651d741"
+
+[[pair]]
+id = "agreement/credential-verify"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkAgreementCredentialVerify"
+go_api = "committee.UnauthenticatedCredential.Verify"
+rust_bench = "agreement/credential-verify"
+rust_api = "algo_agreement::UnauthenticatedCredential::verify"
+fixture = "credential.json"
+fixture_sha256 = "78dc3992d5f9976610373945fecbb10dc76adfca84045cf68cbaf1178e9bac3d"
+
+[[pair]]
+id = "agreement/decode-cert"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkAgreementDecodeCert"
+go_api = "protocol.Decode(b, &agreement.Certificate{})"
+rust_bench = "agreement/decode-cert"
+rust_api = "algo_agreement::codec::decode_bundle"
+fixture = "cert-20.msgpack"
+fixture_sha256 = "769dcfb30e7b0d778f681a8fc089b8d9c471d625f22b71a08d37e579e36629c3"
+
+[[pair]]
+id = "agreement/decode-proposal"
+unit = "ns/op"
+go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
+go_bench = "BenchmarkAgreementDecodeProposal"
+go_api = "protocol.Decode(b, &agreement.TransmittedPayload{})"
+rust_bench = "agreement/decode-proposal"
+rust_api = "algo_agreement::codec::decode_compound_message"
+fixture = "proposal.msgpack"
+fixture_sha256 = "2ad9927bcfeed39079540e4aa7eee4491e0df1c155a9270892ce3ebb124c8a06"

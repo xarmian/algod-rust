@@ -1,0 +1,39 @@
+#pragma version 10
+int 1
+store 0
+int 0
+store 2
+int 0
+store 1
+loop:
+load 0
+pushint 6364136223846793005
+mulw
+swap
+pop
+pushint 1442695040888963407
+addw
+swap
+pop
+dup
+store 0
+pushint 7
+%
+load 2
++
+store 2
+load 1
+int 1
++
+dup
+store 1
+pushint 500
+<
+bnz loop
+load 0
+load 2
+^
+store 0
+load 0
+pushint 18204142688415594951
+==

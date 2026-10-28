@@ -22,6 +22,8 @@ on:
       - ".github/workflows/*node-soak.yml"
       - "scripts/test_node_soak_callers.py"
       - "scripts/bench/**"
+      - "benchmarks/**"
+      - "crates/tools/algo-bench-pairs/src/lib.rs"
   push:
     branches: [main]
     paths:
@@ -33,6 +35,8 @@ on:
       - ".github/workflows/*node-soak.yml"
       - "scripts/test_node_soak_callers.py"
       - "scripts/bench/**"
+      - "benchmarks/**"
+      - "crates/tools/algo-bench-pairs/src/lib.rs"
 
 permissions:
   contents: read
@@ -75,6 +79,11 @@ jobs:
       - uses: actions/checkout@v7
       - name: Harness unit tests
         run: make bench-compare-test
+      - name: micro tier pair registry (static checks, issue #2103)
+        # benchmarks/pairs.toml <-> Go Benchmark functions <-> Rust cases,
+        # fixture sha256s, recorded Go digests. The live `go test -list`
+        # half needs go-algorand + libsodium and runs in bench-micro.yml.
+        run: python3 scripts/bench/test_pairs.py -v
       - name: build_both.sh syntax
         run: bash -n scripts/bench/build_both.sh
       - name: make bench-compare TIERS=selftest
