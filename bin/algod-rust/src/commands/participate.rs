@@ -191,7 +191,24 @@ async fn fetch_block_via_unicast_peers(
     // use the agreement codec's `decode_bundle` which understands
     // those tags, rather than rmp_serde which expects Rust field
     // names.
-    let cert = response.cert.and_then(|val| {
+    let cert = fetched_certificate(round, response.cert);
+    Ok(FetchedBlockCert {
+        block: response.block,
+        cert,
+        raw_payset_blobs,
+    })
+}
+
+/// Turn a fetched response's certificate (`rmpv::Value`, go codec tags)
+/// into a typed [`algo_agreement::Certificate`], or `None` when it does not
+/// parse. Shared by the gossip fetchers above and the offline corpus replay
+/// (`bench replay-corpus`, issue #2105), so both hand the catchup service a
+/// certificate built the same way.
+pub(crate) fn fetched_certificate(
+    round: Round,
+    cert: Option<rmpv::Value>,
+) -> Option<algo_agreement::Certificate> {
+    cert.and_then(|val| {
         let mut bytes = Vec::new();
         rmpv::encode::write_value(&mut bytes, &val).ok()?;
         match algo_agreement::codec::decode_bundle(&bytes) {
@@ -205,11 +222,6 @@ async fn fetch_block_via_unicast_peers(
                 None
             }
         }
-    });
-    Ok(FetchedBlockCert {
-        block: response.block,
-        cert,
-        raw_payset_blobs,
     })
 }
 
@@ -4427,7 +4439,7 @@ pub(crate) fn resolve_resource_paths(
 /// participation node signing votes, not just a liveness one. A full
 /// close-and-reopen rebuilds every cache the same way node startup does,
 /// which is the only way already proven not to leave stale state behind.
-fn open_and_configure_participate_ledger(
+pub(crate) fn open_and_configure_participate_ledger(
     ledger_path: &Path,
     resolved_paths: &ResolvedResourcePaths,
     node_config: &algo_config::Local,
@@ -5299,7 +5311,7 @@ fn seed_ledger_from_genesis(
 /// [`seed_ledger_from_genesis`] on an in-memory genesis document (`source`
 /// is only for logs). Used to seed a fresh ledger from a preset's vendored
 /// genesis when no `--genesis-json` is given (issue #2069).
-fn seed_ledger_from_genesis_str(
+pub(crate) fn seed_ledger_from_genesis_str(
     ledger: &mut SqliteLedger,
     genesis_str: &str,
     source: &str,

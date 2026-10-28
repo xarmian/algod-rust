@@ -330,16 +330,78 @@ pub fn apply_block_executing_app_calls<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     block: &Block,
 ) -> Result<(), AlgoError> {
-    if !block_has_app_call(block) {
-        if crate::shadow_execute::shadow_execute_enabled() {
-            return crate::shadow_execute::apply_replay_block_with_shadow(store, block);
-        }
-        return apply_block_checking_payouts(store, block, ApplyMode::Replay);
+    apply_block_executing_app_calls_for(store, block, true)
+}
+
+/// [`apply_block_executing_app_calls`] with the payout check chosen by the
+/// caller: the one entry point of every follow / sync / catchup apply.
+///
+/// `check_payouts` is `false` only for a ledger following a go `devmode`
+/// chain (`SqliteLedger::is_devmode_chain`), whose blocks carry no proposer.
+/// go: `validateForPayouts` runs only inside `endOfBlock`'s
+/// `if eval.validate { ... }` (`ledger/eval/eval.go` L1551-L1571), and go's
+/// catchup writes fetched blocks with `ledger.AddBlock`
+/// (`catchup/service.go` L479, the default `CatchupBlockValidateMode` 0),
+/// which evaluates with `validate = false`, so go never holds a fetched
+/// devmode block to the payout rules (issues #1803, #2105).
+///
+/// With `ALGOD_SHADOW_EXECUTE` set, the shadow-execute paths run as before,
+/// whatever `check_payouts` says (they apply with `validate = false`).
+pub fn apply_block_executing_app_calls_for<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+    check_payouts: bool,
+) -> Result<(), AlgoError> {
+    apply_block_executing_app_calls_with(
+        store,
+        block,
+        check_payouts,
+        crate::shadow_execute::shadow_execute_enabled(),
+    )
+}
+
+/// [`apply_block_executing_app_calls_for`] with the shadow-execute switch
+/// passed in (tests drive both branches without the process-wide env flag).
+pub(crate) fn apply_block_executing_app_calls_with<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+    check_payouts: bool,
+    shadow: bool,
+) -> Result<(), AlgoError> {
+    let has_app_call = block_has_app_call(block);
+    if shadow {
+        return if has_app_call {
+            crate::shadow_execute::apply_execute_block_with_apply_data_check(store, block)
+        } else {
+            crate::shadow_execute::apply_replay_block_with_shadow(store, block)
+        };
     }
-    if crate::shadow_execute::shadow_execute_enabled() {
-        return crate::shadow_execute::apply_execute_block_with_apply_data_check(store, block);
+    let mode = if has_app_call {
+        ApplyMode::Execute
+    } else {
+        ApplyMode::Replay
+    };
+    if check_payouts {
+        apply_block_checking_payouts(store, block, mode)
+    } else {
+        apply_block_with_mode(store, block, mode)
     }
-    apply_block_checking_payouts(store, block, ApplyMode::Execute)
+}
+
+/// [`apply_block_with_delta_mode`] or
+/// [`apply_block_with_delta_mode_checking_payouts`], by `check_payouts` (see
+/// [`apply_block_executing_app_calls_for`] for when it is `false`). The
+/// delta-producing follow path (`SqliteLedger::apply_block_caching_delta`);
+/// the shadow-execute paths produce no delta, so there is none here.
+pub fn apply_block_with_delta_mode_for<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+    mode: ApplyMode,
+    check_payouts: bool,
+) -> Result<crate::state_delta::StateDelta, AlgoError> {
+    let (delta, _apply_data) =
+        apply_block_with_delta_mode_and_apply_data(store, block, mode, false, check_payouts)?;
+    Ok(delta)
 }
 
 /// Apply a certified block received from the network (follow / catch-up).
@@ -8295,6 +8357,29 @@ mod tests {
                 "round {round}"
             );
         }
+    }
+
+    /// Issue #2105 review: the devmode (no payout check) apply keeps the
+    /// shadow-execute path, through the one helper every follow / catchup
+    /// call site uses.
+    #[test]
+    fn devmode_apply_still_runs_the_shadow_execute_path() {
+        use crate::shadow_execute::test_hooks::shadow_entries;
+        let (mut state, _, _, _) = issue_2116_state(100_000_000_000);
+        // A V41 block without a proposer, as a go devmode chain makes.
+        let b = issue_2116_block(1, 0, &state);
+        let before = shadow_entries();
+        apply_block_executing_app_calls_with(&mut state, &b, false, true).unwrap();
+        assert_eq!(shadow_entries(), before + 1, "shadow path not taken");
+
+        let (mut state, _, _, _) = issue_2116_state(100_000_000_000);
+        let before = shadow_entries();
+        apply_block_executing_app_calls_with(&mut state, &b, false, false).unwrap();
+        assert_eq!(shadow_entries(), before, "no shadow when it is off");
+
+        let (mut state, _, _, _) = issue_2116_state(100_000_000_000);
+        let err = apply_block_executing_app_calls_with(&mut state, &b, true, false).unwrap_err();
+        assert!(err.to_string().contains("proposer missing"), "{err}");
     }
 
     /// Issue #2116 review: a block that fails in the end-of-block epilogue

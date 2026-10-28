@@ -9,6 +9,7 @@
 pub mod corpus;
 pub mod metrics;
 pub mod output;
+pub mod replay_state;
 pub mod table;
 pub mod trie_replay;
 

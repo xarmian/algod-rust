@@ -467,7 +467,11 @@ impl AgreementLedgerBridge {
             // AVM programs in its own context (issue #1815); the scope only
             // collects what the apply publishes and the store timers.
             let scope = crate::follow_timing::FollowScope::begin();
-            let applied = crate::apply::apply_block_executing_app_calls(ledger, block);
+            // A go devmode chain's blocks have no proposer, so no payout
+            // check (see `apply_block_executing_app_calls_for`, issue #2105).
+            let check_payouts = !ledger.is_devmode_chain();
+            let applied =
+                crate::apply::apply_block_executing_app_calls_for(ledger, block, check_payouts);
             let timing = crate::follow_timing::follow_timing();
             let (avm, stages) = scope.finish();
             if let Some(avm) = avm {
@@ -1982,6 +1986,33 @@ mod tests {
         assert_eq!(recovered.period, cert.period);
         assert_eq!(recovered.proposal, cert.proposal);
         assert_eq!(recovered.votes.len(), cert.votes.len());
+    }
+
+    /// Issue #2105: the catchup / agreement commit holds a proposer-less
+    /// block to `validateForPayouts`, except on a devmode chain, whose
+    /// blocks never have a proposer (the follow path's rule, issue #1803).
+    #[test]
+    fn ensure_block_skips_payout_checks_only_on_a_devmode_chain() {
+        let mut no_proposer = make_round1_block();
+        no_proposer.proposer = Address::ZERO;
+        let cert = make_cert_with_proposal(1);
+
+        let ledger = Arc::new(Mutex::new(
+            crate::apply::pool_fixtures::funded_sqlite_ledger(),
+        ));
+        AgreementLedgerBridge::new(Arc::clone(&ledger)).ensure_block(&no_proposer, &cert);
+        assert_eq!(
+            ledger.lock().unwrap().current_round(),
+            Round(0),
+            "a proposer-less V41 block must be rejected on a normal chain"
+        );
+
+        let ledger = Arc::new(Mutex::new(
+            crate::apply::pool_fixtures::funded_sqlite_ledger(),
+        ));
+        ledger.lock().unwrap().set_devmode_chain(true);
+        AgreementLedgerBridge::new(Arc::clone(&ledger)).ensure_block(&no_proposer, &cert);
+        assert_eq!(ledger.lock().unwrap().current_round(), Round(1));
     }
 
     #[test]

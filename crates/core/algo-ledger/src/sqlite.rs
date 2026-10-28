@@ -3819,6 +3819,12 @@ impl SqliteLedger {
         self.devmode_chain = devmode;
     }
 
+    /// Whether [`Self::set_devmode_chain`] marked this ledger as following a
+    /// go `devmode` chain.
+    pub fn is_devmode_chain(&self) -> bool {
+        self.devmode_chain
+    }
+
     /// Whether the per-group delta tracer is enabled.
     pub fn group_delta_tracer_enabled(&self) -> bool {
         self.group_delta_tracer.is_some()
@@ -3921,11 +3927,10 @@ impl SqliteLedger {
             } else {
                 crate::apply::ApplyMode::Replay
             };
-            let delta = if self.devmode_chain {
-                crate::apply::apply_block_with_delta_mode(self, block, mode)?
-            } else {
-                crate::apply::apply_block_with_delta_mode_checking_payouts(self, block, mode)?
-            };
+            // No payout check on a go devmode chain (issues #1803, #2105).
+            let check_payouts = !self.devmode_chain;
+            let delta =
+                crate::apply::apply_block_with_delta_mode_for(self, block, mode, check_payouts)?;
             self.cache_state_delta(round, delta);
             Ok(())
         } else {
@@ -3949,17 +3954,12 @@ impl SqliteLedger {
             // comment for why `ApplyMode::Replay` can never observe them.
             // Blocks with no `appl` transaction (Acfg/Axfer/Afrz/Stpf/Hb)
             // cannot touch box storage, so they keep the cheaper Replay
-            // path.
-            let mode = if block_has_app_call(block) {
-                crate::apply::ApplyMode::Execute
-            } else {
-                crate::apply::ApplyMode::Replay
-            };
-            if self.devmode_chain {
-                crate::apply::apply_block_with_mode(self, block, mode)?;
-            } else {
-                crate::apply::apply_block_checking_payouts(self, block, mode)?;
-            }
+            // path. `apply_block_executing_app_calls_for` makes exactly that
+            // choice, honours the shadow-execute switch, and skips the payout
+            // check on a go devmode chain (issues #1803, #2105) -- the same
+            // entry point as the catchup / agreement commit.
+            let check_payouts = !self.devmode_chain;
+            crate::apply::apply_block_executing_app_calls_for(self, block, check_payouts)?;
             self.delta_cache.advance(block.round.0);
             Ok(())
         }
