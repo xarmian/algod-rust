@@ -1054,7 +1054,8 @@ BENCH_BUILD ?= auto
 BENCH_RUN_DIR ?=
 BENCH_CLEAN ?=
 ## Issue #2105: the workload corpus the `replay` tier replays (small|large).
-CORPUS ?= small
+## An exported BENCH_CORPUS is honoured when CORPUS is not given.
+CORPUS ?= $(or $(BENCH_CORPUS),small)
 
 bench-compare: ## Go vs Rust comparison report (TIERS=a,b RUNS=N) -> bench-results/<utc-ts>/
 	BENCH_CORPUS="$(CORPUS)" python3 scripts/bench/run.py --tiers "$(TIERS)" --runs "$(RUNS)" \

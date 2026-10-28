@@ -467,14 +467,11 @@ impl AgreementLedgerBridge {
             // AVM programs in its own context (issue #1815); the scope only
             // collects what the apply publishes and the store timers.
             let scope = crate::follow_timing::FollowScope::begin();
-            // A go devmode chain's blocks have no proposer: like the follow
-            // path (`apply_block_caching_delta`, issue #1803), skip
-            // `validateForPayouts` for them (issue #2105).
-            let applied = if ledger.is_devmode_chain() {
-                crate::apply::apply_devmode_block_executing_app_calls(ledger, block)
-            } else {
-                crate::apply::apply_block_executing_app_calls(ledger, block)
-            };
+            // A go devmode chain's blocks have no proposer, so no payout
+            // check (see `apply_block_executing_app_calls_for`, issue #2105).
+            let check_payouts = !ledger.is_devmode_chain();
+            let applied =
+                crate::apply::apply_block_executing_app_calls_for(ledger, block, check_payouts);
             let timing = crate::follow_timing::follow_timing();
             let (avm, stages) = scope.finish();
             if let Some(avm) = avm {

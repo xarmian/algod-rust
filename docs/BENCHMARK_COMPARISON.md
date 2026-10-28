@@ -800,6 +800,10 @@ make bench-compare TIERS=replay CORPUS=large RUNS=3    # large corpus (fetched)
 BENCH_CORPUS_DIR=/path/to/corpus make bench-compare TIERS=replay RUNS=3
 ```
 
+`CORPUS` picks the corpus by name. An exported `BENCH_CORPUS` is used when
+`CORPUS` is not given, and `BENCH_CORPUS_DIR` (an explicit directory) overrides
+both.
+
 The tier (issue #2105) replays a [workload corpus](#workload-corpus)
 offline through go-algorand's ledger and through algod-rust's production
 catchup path. Both start from a fresh on-disk ledger and read the same bytes.

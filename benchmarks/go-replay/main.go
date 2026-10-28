@@ -272,7 +272,8 @@ func main() {
 	if err != nil {
 		die("%v", err)
 	}
-	if err := json.Unmarshal(raw, &meta); err != nil {
+	// UseNumber: final_state values are compared exactly (no float64).
+	if err := decodeJSON(raw, &meta); err != nil {
 		die("corpus.json: %v", err)
 	}
 	if meta.Schema != "algod-corpus/v1" {

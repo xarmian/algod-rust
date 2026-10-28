@@ -8,9 +8,15 @@ benchmarks/go-replay's go tests, the Rust bench_replay tests and CI."""
 import copy
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover - CI runners ship PyYAML
+    yaml = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -74,6 +80,42 @@ class GateTest(unittest.TestCase):
         self.assertEqual(replay.state_sha256(self.state), replay.state_sha256(rev))
 
 
+class RunPairTest(unittest.TestCase):
+    """Both sides always run, so a corrupted corpus proves each side fails
+    on its own (issue #2105 review)."""
+
+    def test_a_rust_only_failure_is_reported_after_go_ran(self):
+        calls = []
+
+        def run(side):
+            calls.append(side)
+            if side == "rust":
+                raise replay.TierError("rust replay exited 1")
+            return {"side": side}
+
+        with self.assertRaises(replay.SideFailures) as cm:
+            replay.run_pair(("go", "rust"), run)
+        self.assertEqual(calls, ["go", "rust"])
+        self.assertEqual(sorted(cm.exception.failed), ["rust"])
+        self.assertIn("rust replay exited 1", str(cm.exception))
+
+    def test_a_go_failure_does_not_skip_the_rust_side(self):
+        calls = []
+
+        def run(side):
+            calls.append(side)
+            raise replay.TierError(f"{side} replay exited 1")
+
+        with self.assertRaises(replay.SideFailures) as cm:
+            replay.run_pair(("go", "rust"), run)
+        self.assertEqual(calls, ["go", "rust"])
+        self.assertEqual(sorted(cm.exception.failed), ["go", "rust"])
+
+    def test_both_sides_succeeding_returns_both_results(self):
+        r = replay.run_pair(("rust", "go"), lambda side: {"side": side})
+        self.assertEqual(r, {"go": {"side": "go"}, "rust": {"side": "rust"}})
+
+
 class CorruptCorpusTest(unittest.TestCase):
     def test_txn_corruption_flips_one_byte_and_rehashes_the_manifest(self):
         with tempfile.TemporaryDirectory() as t:
@@ -121,6 +163,66 @@ class ResultsTest(unittest.TestCase):
         cpu = next(r for r in rows if r["name"] == "small/cpu_s" and r["impl"] == "go")
         self.assertEqual(cpu["samples"], [2.0])
         self.assertEqual(cpu["better"], "lower")
+
+
+REPO = os.path.dirname(os.path.dirname(HERE))
+WORKFLOW = os.path.join(REPO, ".github", "workflows", "bench-replay.yml")
+
+
+def _glob_re(pattern):
+    """GitHub path-filter glob (`**` crosses directories, `*` does not)."""
+    out, i = "", 0
+    while i < len(pattern):
+        if pattern.startswith("**", i):
+            out += ".*"
+            i += 2
+        elif pattern[i] == "*":
+            out += "[^/]*"
+            i += 1
+        else:
+            out += re.escape(pattern[i])
+            i += 1
+    return re.compile(out + "$")
+
+
+@unittest.skipIf(yaml is None, "PyYAML not installed")
+class WorkflowPathsTest(unittest.TestCase):
+    """bench-replay.yml must fire on every file the tier imports or runs, and
+    on the production code the replay drives (issue #2105 review)."""
+
+    REQUIRED = [
+        "scripts/bench/tiers/replay.py", "scripts/bench/test_replay.py",
+        "scripts/bench/run.py", "scripts/bench/build_both.sh", "scripts/bench/micro_equiv.py",
+        "scripts/bench/fingerprint.py", "scripts/bench/bench_schema.py",
+        "scripts/bench/schema/result-v1.json", "scripts/bench/corpus/corpus_tool.py",
+        "scripts/bench/fetch_corpus.sh", "scripts/bench/go-algorand.pin", "Makefile",
+        "benchmarks/go-replay/main.go", "benchmarks/go-replay/state.go",
+        "benchmarks/go-replay/testdata/small-final-state.json",
+        "benchmarks/corpus/small/blocks.bin", "benchmarks/corpus/large.ref",
+        "bin/algod-rust/Cargo.toml", "bin/algod-rust/src/main.rs", "bin/algod-rust/src/cli.rs",
+        "bin/algod-rust/src/falcon_backend.rs", "bin/algod-rust/src/commands/bench_replay.rs",
+        "bin/algod-rust/src/commands/participate.rs",
+        "crates/tools/algo-bench/src/replay_state.rs", "crates/core/algo-ledger/src/apply.rs",
+        "crates/core/algo-ledger/src/catchup_service.rs", "crates/core/algo-validate/src/lib.rs",
+        "crates/core/algo-codec/src/lib.rs", "crates/node/algo-config/src/lib.rs", "Cargo.lock",
+        ".github/workflows/bench-replay.yml",
+    ]
+
+    def setUp(self):
+        with open(WORKFLOW, encoding="utf-8") as f:
+            doc = yaml.safe_load(f)
+        self.on = doc.get("on", doc.get(True))
+
+    def test_pull_request_and_push_filters_are_identical(self):
+        self.assertEqual(self.on["pull_request"]["paths"], self.on["push"]["paths"])
+
+    def test_every_dependency_triggers_the_workflow(self):
+        pats = [_glob_re(p) for p in self.on["pull_request"]["paths"] if not p.startswith("!")]
+        missing = [f for f in self.REQUIRED if not any(p.match(f) for p in pats)]
+        self.assertEqual(missing, [], "files that change the replay tier but do not trigger it")
+        for f in self.REQUIRED:
+            if "*" not in f:
+                self.assertTrue(os.path.exists(os.path.join(REPO, f)), f"stale entry {f}")
 
 
 if __name__ == "__main__":

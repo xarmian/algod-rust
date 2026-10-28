@@ -437,6 +437,16 @@ pub fn compute_final_state(
     fs.all_accounts.sha256 = sha_hex(lines.as_bytes());
     write_dump("all_accounts.txt", &lines)?;
 
+    let (kv, kv_lines) = box_digest(&conn)?;
+    fs.kv = kv;
+    lines = kv_lines;
+    write_dump("kv.txt", &lines)?;
+    Ok(fs)
+}
+
+/// The `kv` digest: every box (`bx:` key) of the tracker DB's `kvstore`, as
+/// `"<hex key> <hex value>\n"` sorted by key, with its lines.
+pub fn box_digest(conn: &rusqlite::Connection) -> Result<(DigestJson, String), String> {
     let mut stmt = conn
         .prepare("SELECT key, value FROM kvstore ORDER BY key")
         .map_err(|e| e.to_string())?;
@@ -445,19 +455,21 @@ pub fn compute_final_state(
             Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
         })
         .map_err(|e| e.to_string())?;
-    lines.clear();
+    let mut d = DigestJson::default();
+    let mut lines = String::new();
     for row in rows {
         let (k, v) = row.map_err(|e| e.to_string())?;
-        let Some(v) = v else { continue };
+        // go `LookupKeyValue`: an existing key with a NULL value is an empty
+        // box (`val = []byte{}`), not a missing one.
+        let v = v.unwrap_or_default();
         if !k.starts_with(BOX_PREFIX) {
             continue;
         }
-        fs.kv.count += 1;
+        d.count += 1;
         let _ = writeln!(lines, "{} {}", hex::encode(&k), hex::encode(&v));
     }
-    fs.kv.sha256 = sha_hex(lines.as_bytes());
-    write_dump("kv.txt", &lines)?;
-    Ok(fs)
+    d.sha256 = sha_hex(lines.as_bytes());
+    Ok((d, lines))
 }
 
 /// Check `fs` against `corpus.json`'s `final_state` (what the generating
@@ -498,6 +510,25 @@ mod tests {
         kv.insert(b"a".to_vec(), TealValue::Bytes(vec![0xff, 0x00]));
         assert_eq!(tkv(&kv), "61:bff00,62:u7");
         assert_eq!(tkv(&BTreeMap::new()), "");
+    }
+
+    /// go's `LookupKeyValue` returns a NULL-valued kvstore row as an
+    /// existing empty box (`val = []byte{}`), so the box digest must count
+    /// and hash it as empty, not skip it.
+    #[test]
+    fn box_digest_counts_null_values_as_empty_boxes() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE kvstore (key BLOB PRIMARY KEY, value BLOB);
+             INSERT INTO kvstore VALUES (x'62783a01', NULL);
+             INSERT INTO kvstore VALUES (x'62783a02', x'ff');
+             INSERT INTO kvstore VALUES (x'6f746865', x'01');",
+        )
+        .unwrap();
+        let (d, lines) = box_digest(&conn).unwrap();
+        assert_eq!(d.count, 2);
+        assert_eq!(lines, "62783a01 \n62783a02 ff\n");
+        assert_eq!(d.sha256, sha_hex(lines.as_bytes()));
     }
 
     #[test]

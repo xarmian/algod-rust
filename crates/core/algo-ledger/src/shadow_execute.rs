@@ -771,6 +771,7 @@ pub mod test_hooks {
     use std::cell::Cell;
 
     thread_local! {
+        static SHADOW_ENTRIES: Cell<u64> = const { Cell::new(0) };
         static FAIL_NEXT: Cell<u64> = const { Cell::new(0) };
         static FAIL_OVER: Cell<Option<usize>> = const { Cell::new(None) };
         static CALLS: Cell<u64> = const { Cell::new(0) };
@@ -784,6 +785,17 @@ pub mod test_hooks {
     /// not pay for (issues #1795, #1885).
     pub fn knock_offline_calls() -> u64 {
         KNOCK_CALLS.with(|c| c.get())
+    }
+
+    /// Number of follow-path shadow-execute entries
+    /// ([`super::apply_replay_block_with_shadow`],
+    /// [`super::apply_execute_block_with_apply_data_check`]) on this thread.
+    pub fn shadow_entries() -> u64 {
+        SHADOW_ENTRIES.with(|c| c.get())
+    }
+
+    pub(crate) fn note_shadow_entry() {
+        SHADOW_ENTRIES.with(|c| c.set(c.get() + 1));
     }
 
     /// Reset the per-thread list-computation counter.
@@ -1141,6 +1153,8 @@ pub fn apply_replay_block_with_shadow<L: LedgerStore>(
     store: &mut L,
     block: &Block,
 ) -> Result<(), AlgoError> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    test_hooks::note_shadow_entry();
     static SEEN: AtomicU64 = AtomicU64::new(0);
     if !sample_hit(SEEN.fetch_add(1, Ordering::Relaxed), sample_every()) {
         return apply_block_impl_ex(
@@ -1735,6 +1749,8 @@ pub fn apply_execute_block_with_apply_data_check<L: LedgerStore>(
     store: &mut L,
     block: &Block,
 ) -> Result<(), AlgoError> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    test_hooks::note_shadow_entry();
     let mut computed: Vec<ApplyData> = Vec::with_capacity(block.payset.len());
     apply_block_impl_ex(
         store,

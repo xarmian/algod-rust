@@ -32,10 +32,12 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/algorand/go-algorand/data"
@@ -400,12 +402,25 @@ func computeFinalState(l *data.Ledger, trackerDB string, known []basics.Address,
 	return fs, nil
 }
 
+// decodeJSON decodes with UseNumber, so integers above 2^53 keep every digit
+// (json.Number) instead of being rounded through float64.
+func decodeJSON(raw []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	return dec.Decode(v)
+}
+
 // compareWithCorpus checks the replayed state against corpus.json's
 // final_state (what the generating go-algorand node reported over REST).
 func compareWithCorpus(fs finalState, want map[string]any) []string {
+	// want comes from decodeJSON: integers are json.Number, parsed exactly.
 	num := func(k string) (uint64, bool) {
-		v, ok := want[k].(float64)
-		return uint64(v), ok
+		n, ok := want[k].(json.Number)
+		if !ok {
+			return 0, false
+		}
+		v, err := strconv.ParseUint(n.String(), 10, 64)
+		return v, err == nil
 	}
 	var mm []string
 	check := func(name string, got uint64) {

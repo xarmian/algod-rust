@@ -139,6 +139,9 @@ pub struct CorpusBlockFetcher {
     /// `(offset, len)` of the payload of round `i`.
     index: Vec<(u64, u32)>,
     last: u64,
+    /// The last fetch failure of a round the replay needs (the catchup
+    /// service only logs those at debug level), for the error message.
+    last_error: Mutex<Option<String>>,
 }
 
 impl CorpusBlockFetcher {
@@ -155,11 +158,13 @@ impl CorpusBlockFetcher {
     }
 }
 
-impl BlockFetcher for CorpusBlockFetcher {
-    fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
-        if round.0 == 0 || round.0 > self.last || round.0 as usize >= self.index.len() {
-            return Err(FetchError::NoBlockForRound { round });
-        }
+impl CorpusBlockFetcher {
+    /// The last recorded fetch failure, if any.
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error.lock().ok().and_then(|e| e.clone())
+    }
+
+    fn fetch(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
         let raw = self
             .read(round.0)
             .map_err(|e| FetchError::NetworkError(format!("blocks.bin round {round}: {e}")))?;
@@ -178,6 +183,22 @@ impl BlockFetcher for CorpusBlockFetcher {
             cert,
             raw_payset_blobs,
         })
+    }
+}
+
+impl BlockFetcher for CorpusBlockFetcher {
+    fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
+        // Past the last round is the normal end of a sync pass, not an error.
+        if round.0 == 0 || round.0 > self.last || round.0 as usize >= self.index.len() {
+            return Err(FetchError::NoBlockForRound { round });
+        }
+        let res = self.fetch(round);
+        if let Err(e) = &res {
+            if let Ok(mut last) = self.last_error.lock() {
+                *last = Some(format!("round {round}: {e}"));
+            }
+        }
+        res
     }
 }
 
@@ -443,11 +464,13 @@ pub fn replay_corpus(args: &ReplayCorpusArgs) -> anyhow::Result<ReplayResult> {
         }
     }
 
-    let fetcher: Arc<dyn BlockFetcher> = Arc::new(CorpusBlockFetcher {
+    let corpus_fetcher = Arc::new(CorpusBlockFetcher {
         file: Mutex::new(File::open(&blocks_path)?),
         index: pre.index.clone(),
         last,
+        last_error: Mutex::new(None),
     });
+    let fetcher: Arc<dyn BlockFetcher> = corpus_fetcher.clone();
     let parallel = node_config.catchup_parallel_blocks;
 
     let before = proc_stats();
@@ -471,9 +494,13 @@ pub fn replay_corpus(args: &ReplayCorpusArgs) -> anyhow::Result<ReplayResult> {
             }
             let reason = CatchupService::sync_range(&catchup, &fetcher, &stop_rx, parallel);
             if catchup.next_round().0 == next {
+                let fetch = corpus_fetcher
+                    .last_error()
+                    .map(|e| format!("; last fetch error: {e}"))
+                    .unwrap_or_default();
                 bail!(
                     "replay stopped at round {next}: the catchup sync pass ended ({}) \
-                     without committing it",
+                     without committing it{fetch}",
                     exit_reason_str(&reason)
                 );
             }
@@ -486,7 +513,9 @@ pub fn replay_corpus(args: &ReplayCorpusArgs) -> anyhow::Result<ReplayResult> {
             m.into_inner()
                 .map_err(|_| anyhow!("ledger lock poisoned"))?,
         ),
-        Err(_) => tracing::warn!("ledger still shared after the replay; not closed in time"),
+        // Something still holds the ledger, so it was not closed inside the
+        // timed section and the measurement would be wrong.
+        Err(_) => bail!("ledger still shared after the replay; it could not be closed"),
     }
     let end = Instant::now();
     let after = proc_stats();
@@ -681,6 +710,28 @@ mod tests {
                 .contains(&format!("replay stopped at round {round}")),
             "{err}"
         );
+    }
+
+    /// A fetch failure (here: a record that no longer decodes, e.g. the file
+    /// changed after the pre-pass) is kept for the "replay stopped" error,
+    /// since the catchup service only logs it at debug level. Rounds past
+    /// the replay's end are the normal end of a pass and are not recorded.
+    #[test]
+    fn fetcher_records_the_last_fetch_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("blocks.bin");
+        std::fs::write(&path, [0xc1u8, 0xc1, 0xc1, 0xc1]).unwrap();
+        let f = CorpusBlockFetcher {
+            file: Mutex::new(File::open(&path).unwrap()),
+            index: vec![(0, 0), (0, 4)],
+            last: 1,
+            last_error: Mutex::new(None),
+        };
+        assert!(f.fetch_block(Round(2)).is_err());
+        assert_eq!(f.last_error(), None, "past the end is not an error");
+        assert!(f.fetch_block(Round(1)).is_err());
+        let e = f.last_error().expect("recorded");
+        assert!(e.starts_with("round 1:"), "{e}");
     }
 
     /// Flip the last byte of the first txn note (`"bc" || u64`) in the first

@@ -108,7 +108,8 @@ func TestSmallCorpusFinalStateMatchesRecorded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(raw, &res); err != nil {
+	// json.Number on both sides: an exact comparison, not float64 maps.
+	if err := decodeJSON(raw, &res); err != nil {
 		t.Fatal(err)
 	}
 	if res.CorpusMatch == nil || !*res.CorpusMatch {
@@ -119,7 +120,7 @@ func TestSmallCorpusFinalStateMatchesRecorded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(rec, &want); err != nil {
+	if err := decodeJSON(rec, &want); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(res.FinalState, want) {
@@ -163,7 +164,18 @@ func TestWrongExpectedStateExits3(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b = bytes.Replace(b, []byte(`"accounts_sha256": "d`), []byte(`"accounts_sha256": "e`), 1)
+	// Flip the first hex digit, whatever it is (as replay.py's corrupt_corpus).
+	key := []byte(`"accounts_sha256": "`)
+	i := bytes.Index(b, key)
+	if i < 0 {
+		t.Fatal("no accounts_sha256 in corpus.json")
+	}
+	j := i + len(key)
+	if b[j] == '0' {
+		b[j] = '1'
+	} else {
+		b[j] = '0'
+	}
 	if err := os.WriteFile(path, b, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -171,5 +183,30 @@ func TestWrongExpectedStateExits3(t *testing.T) {
 	code, stderr := runReplay(t, "-corpus", corpus, "-data", filepath.Join(dir, "node"), "-out", filepath.Join(dir, "r.json"))
 	if code != 3 || !strings.Contains(stderr, "accounts_sha256") {
 		t.Fatalf("want exit 3 on a wrong expected state, got %d:\n%s", code, stderr)
+	}
+}
+
+// corpus.json numbers above 2^53 must compare exactly: decoded as float64,
+// 9007199254740993 would round to ...992 and a one-microalgo divergence
+// would pass the gate.
+func TestCompareWithCorpusIsExactAbove2Pow53(t *testing.T) {
+	const odd = uint64(9007199254740993) // 2^53 + 1, not a float64
+	var want map[string]any
+	raw := []byte(`{"round": 9007199254740993, "txn_counter": 9007199254740993,
+		"total_money": 9007199254740993, "online_money": 9007199254740993,
+		"accounts": 9007199254740993, "accounts_microalgos": 9007199254740993,
+		"block_hash": "blk-X", "accounts_sha256": "ab"}`)
+	if err := decodeJSON(raw, &want); err != nil {
+		t.Fatal(err)
+	}
+	fs := finalState{Round: odd, TxnCounter: odd, TotalMoney: odd, OnlineMoney: odd, BlockHash: "blk-X"}
+	fs.Known = digest{Count: odd, MicroAlgos: odd, SHA256: "ab"}
+	if mm := compareWithCorpus(fs, want); len(mm) != 0 {
+		t.Fatalf("exact values reported as mismatches: %v", mm)
+	}
+	fs.TotalMoney = odd - 1
+	mm := compareWithCorpus(fs, want)
+	if len(mm) != 1 || !strings.Contains(mm[0], "total_money") {
+		t.Fatalf("a one-unit difference above 2^53 must be caught, got %v", mm)
 	}
 }

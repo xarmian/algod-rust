@@ -66,6 +66,29 @@ class TierError(Exception):
     pass
 
 
+class SideFailures(TierError):
+    """One or both sides failed a replay; `failed` maps side -> message."""
+
+    def __init__(self, failed):
+        self.failed = failed
+        super().__init__("; ".join(f"{k}: {v}" for k, v in sorted(failed.items())))
+
+
+def run_pair(order, run):
+    """Run both sides in `order` with `run(side)`. A failing side never
+    stops the other one from running, so a corrupted corpus shows that each
+    side rejects it on its own. Raises SideFailures naming every failed side."""
+    out, failed = {}, {}
+    for side in order:
+        try:
+            out[side] = run(side)
+        except TierError as e:
+            failed[side] = str(e)
+    if failed:
+        raise SideFailures(failed)
+    return out
+
+
 # ---- final-state gate --------------------------------------------------------
 
 def state_diff(a, b, path=""):
@@ -302,7 +325,8 @@ def main():
             measured = []
             for i in range(warmup + runs):
                 order = ("go", "rust") if i % 2 == 0 else ("rust", "go")
-                r = {s: run_side(s, sides[s], corpus, work, f"{i}", rounds) for s in order}
+                r = run_pair(order, lambda s: run_side(s, sides[s], corpus, work, f"{i}",
+                                                       rounds))
                 kind = "warm-up" if i < warmup else f"run {i - warmup + 1}/{runs}"
                 print(f"replay: {kind}: go {r['go']['metrics']['wall_s']:.2f}s, "
                       f"rust {r['rust']['metrics']['wall_s']:.2f}s", flush=True)

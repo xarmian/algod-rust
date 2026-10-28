@@ -23,12 +23,16 @@ on:
     paths:
       - "benchmarks/go-replay/**"
       - "benchmarks/corpus/**"
-      - "scripts/bench/tiers/replay.py"
-      - "scripts/bench/test_replay.py"
-      - "scripts/bench/run.py"
-      - "scripts/bench/build_both.sh"
-      - "scripts/bench/go-algorand.pin"
+      # The tier and everything it imports or runs (run.py, build_both.sh,
+      # micro_equiv.py, corpus/corpus_tool.py, bench_schema.py, schema/).
+      - "scripts/bench/**"
+      - "Makefile"
+      - "bin/algod-rust/Cargo.toml"
+      - "bin/algod-rust/src/main.rs"
+      - "bin/algod-rust/src/cli.rs"
+      - "bin/algod-rust/src/falcon_backend.rs"
       - "bin/algod-rust/src/commands/bench_replay.rs"
+      - "bin/algod-rust/src/commands/participate.rs"
       - "crates/tools/algo-bench/**"
       - ".github/workflows/bench-replay.yml"
       # The production code the replay drives.
@@ -38,18 +42,23 @@ on:
       - "crates/core/algo-types/**"
       - "crates/core/algo-avm/**"
       - "crates/core/algo-agreement/**"
+      - "crates/node/algo-config/**"
       - "Cargo.lock"
   push:
     branches: [main]
     paths:
       - "benchmarks/go-replay/**"
       - "benchmarks/corpus/**"
-      - "scripts/bench/tiers/replay.py"
-      - "scripts/bench/test_replay.py"
-      - "scripts/bench/run.py"
-      - "scripts/bench/build_both.sh"
-      - "scripts/bench/go-algorand.pin"
+      # The tier and everything it imports or runs (run.py, build_both.sh,
+      # micro_equiv.py, corpus/corpus_tool.py, bench_schema.py, schema/).
+      - "scripts/bench/**"
+      - "Makefile"
+      - "bin/algod-rust/Cargo.toml"
+      - "bin/algod-rust/src/main.rs"
+      - "bin/algod-rust/src/cli.rs"
+      - "bin/algod-rust/src/falcon_backend.rs"
       - "bin/algod-rust/src/commands/bench_replay.rs"
+      - "bin/algod-rust/src/commands/participate.rs"
       - "crates/tools/algo-bench/**"
       - ".github/workflows/bench-replay.yml"
       - "crates/core/algo-ledger/**"
@@ -58,6 +67,7 @@ on:
       - "crates/core/algo-types/**"
       - "crates/core/algo-avm/**"
       - "crates/core/algo-agreement/**"
+      - "crates/node/algo-config/**"
       - "Cargo.lock"
   workflow_dispatch:
 
@@ -163,8 +173,16 @@ jobs:
               exit 1
             fi
             tail -n 5 "$out/log.txt"
-            if [ "$kind" = txn ]; then want='replay exited 1'; else want='final-state gate FAILED'; fi
-            grep -q "$want" "$out/log.txt" || { echo "::error::$kind: failed, but not with '$want'"; exit 1; }
+            # Each side must reject the corrupted corpus on its own (the tier
+            # runs both even when the first one fails).
+            if [ "$kind" = txn ]; then
+              wants=('go replay exited 1' 'rust replay exited 1')
+            else
+              wants=('final-state gate FAILED' 'run 0 go: final state differs from corpus.json'                      'run 0 rust: final state differs from corpus.json')
+            fi
+            for want in "${wants[@]}"; do
+              grep -qF "$want" "$out/log.txt" || { echo "::error::$kind: failed, but without '$want'"; exit 1; }
+            done
             echo "corrupted corpus ($kind): the tier failed, as it must"
           done
       - name: Report to job summary
