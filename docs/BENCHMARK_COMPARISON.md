@@ -609,9 +609,9 @@ and reserve their accounts meanwhile. The presets:
 | `large` | 50000 | 1000 | 20 | release asset (~1M txns) |
 
 Any other size: `generate.py --rounds N --accounts A --txns-per-round K
---seed S --out DIR`. Generation is client-bound at about 530 txn/s (26
+--seed S --out DIR`. Generation is client-bound at 500 to 530 txn/s (25 to 26
 rounds/s with 20 txns per round) on a 24-thread WSL2 box, because each async
-group waits for the pool. The large preset takes about 33 minutes.
+group waits for the pool. The large preset takes 33 to 35 minutes.
 
 ### Layout
 
@@ -718,8 +718,9 @@ Evidence:
 - Locally (WSL2 Ubuntu, go1.25.3, go-algorand `v5.0.4-stable`): `tiny`
   twice and `small` twice from fresh nodes, `corpus_tool.py compare`
   reported byte-identical each time. The committed `small` is one of those
-  runs. The `large` run's MANIFEST sha256 is the one pinned in
-  `benchmarks/corpus/large.ref`.
+  runs. `large` was also generated twice (about 33 minutes each), and both
+  runs were byte-identical. The second run used a freshly built `corpusgen`.
+  Their MANIFEST sha256 is the one pinned in `benchmarks/corpus/large.ref`.
 - CI (`.github/workflows/bench-corpus.yml`, Linux, path-filtered to the
   generator, the corpus and the pin): gofmt, vet and `go test` of the
   generator; `corpusgen verify` of the committed small corpus; `tiny`
