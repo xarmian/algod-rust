@@ -91,7 +91,8 @@ jobs:
           cd benchmarks/go-micro
           unformatted="$(gofmt -l .)"
           [ -z "$unformatted" ] || { echo "::error::gofmt needed: $unformatted"; exit 1; }
-          printf 'go 1.25.0\n\nuse .\n\nreplace github.com/algorand/go-algorand => %s\n' "$GO_ALGORAND_DIR" > "$RUNNER_TEMP/go.work"
+          # go.work paths are relative to the go.work file: use absolute ones.
+          printf 'go 1.25.0\n\nuse %s\n\nreplace github.com/algorand/go-algorand => %s\n' "$PWD" "$GO_ALGORAND_DIR" > "$RUNNER_TEMP/go.work"
           export GOWORK="$RUNNER_TEMP/go.work"
           go vet ./...
           go test -count=1 -run TestDigestsMatchRecorded -v .
