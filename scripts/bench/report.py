@@ -47,11 +47,39 @@ def median(xs):
     return statistics.median(xs)
 
 
-def _binom_cdf_half(k, n):
-    """P(X <= k) for X ~ Binomial(n, 1/2)."""
-    if k < 0:
-        return 0.0
-    return sum(math.comb(n, i) for i in range(0, min(k, n) + 1)) / (2 ** n)
+EXACT_CI_MAX_N = 1000
+
+
+def _median_ci_rank(n, alpha):
+    """Largest r with P(X <= r-1) <= alpha/2, X ~ Bin(n, 1/2), and its coverage.
+
+    Exact for n <= EXACT_CI_MAX_N: the CDF is accumulated incrementally with
+    integer binomial coefficients (O(n) big-int steps, not O(n^2)). Above
+    that, the normal approximation N(n/2, n/4) with continuity correction.
+    """
+    if n > EXACT_CI_MAX_N:
+        nd = statistics.NormalDist(n / 2, math.sqrt(n) / 2)
+        z = statistics.NormalDist().inv_cdf(1 - alpha / 2)
+        r = int(math.floor(n / 2 - z * math.sqrt(n) / 2))
+        # P(X <= r-1) ~ Phi(r - 1 + 0.5); step down if the approximation is too generous.
+        while r > 0 and nd.cdf(r - 0.5) > alpha / 2:
+            r -= 1
+        return r, (1 - 2 * nd.cdf(r - 0.5)) if r > 0 else None
+    total = 2 ** n
+    coef = 1  # C(n, k)
+    cum = 0   # sum_{i<=k-1} C(n, i) for the candidate r = k
+    r = 0
+    cum_at_r = 0
+    for k in range(0, n // 2):
+        cum += coef  # now cum = P(X <= k) * 2^n
+        if cum / total > alpha / 2:
+            break
+        r = k + 1
+        cum_at_r = cum
+        coef = coef * (n - k) // (k + 1)
+    if r == 0:
+        return 0, None
+    return r, 1 - 2 * (cum_at_r / total)
 
 
 def median_ci(xs, alpha=0.05):
@@ -64,12 +92,9 @@ def median_ci(xs, alpha=0.05):
     """
     s = sorted(xs)
     n = len(s)
-    r = 0
-    while r + 1 <= n // 2 and _binom_cdf_half(r, n) <= alpha / 2:
-        r += 1
+    r, coverage = _median_ci_rank(n, alpha)
     if r == 0:
         return None
-    coverage = 1 - 2 * _binom_cdf_half(r - 1, n)
     return s[r - 1], s[n - r], coverage
 
 
@@ -380,17 +405,39 @@ def _load_optional(path):
         return json.load(f)
 
 
+def load_run_results(run_dir):
+    """Load every results/<tier>/**/*.json of a run dir.
+
+    The directory a file sits in is authoritative: a result whose own `tier`
+    field disagrees with its results/<tier>/ directory (or a file not inside
+    any tier directory) is dropped and reported, so one tier can never inject
+    rows into another tier's table.
+    """
+    results, errors = [], []
+    for p in sorted(glob.glob(os.path.join(run_dir, "results", "**", "*.json"), recursive=True)):
+        rel = os.path.relpath(p, run_dir).replace(os.sep, "/")
+        parts = rel.split("/")
+        if len(parts) < 3:
+            errors.append(f"{rel}: result file is not inside a results/<tier>/ directory")
+            continue
+        dir_tier = parts[1]
+        rs, errs = bench_schema.load_result_file(p)
+        errors.extend(e.replace(p, rel, 1) for e in errs)
+        for r in rs:
+            if r["tier"] != dir_tier:
+                errors.append(f"{rel}: result {r['name']!r} declares tier {r['tier']!r} "
+                              f"but was written by tier {dir_tier!r}; dropped")
+            else:
+                results.append(r)
+    return results, errors
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("run_dir")
     args = ap.parse_args(argv)
     d = args.run_dir
-    results, load_errors = [], []
-    for p in sorted(glob.glob(os.path.join(d, "results", "**", "*.json"), recursive=True)):
-        rs, errs = bench_schema.load_result_file(p)
-        results.extend(rs)
-        rel = os.path.relpath(p, d).replace(os.sep, "/")
-        load_errors.extend(e.replace(p, rel, 1) for e in errs)
+    results, load_errors = load_run_results(d)
     extra_errors = []
     meta = {}
     for key, fname in (("fingerprint", "fingerprint.json"), ("build_info", "build-info.json"),
@@ -403,7 +450,7 @@ def main(argv=None):
     rep = build_report(results, load_errors=load_errors + extra_errors,
                        run_dir=os.path.basename(os.path.abspath(d)), **meta)
     with open(os.path.join(d, "report.json"), "w", encoding="utf-8", newline="\n") as f:
-        json.dump(rep, f, indent=2, sort_keys=False)
+        json.dump(rep, f, indent=2, allow_nan=False)
         f.write("\n")
     with open(os.path.join(d, "report.md"), "w", encoding="utf-8", newline="\n") as f:
         f.write(render_markdown(rep))

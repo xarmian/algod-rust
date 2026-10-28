@@ -57,7 +57,7 @@ tier contract in `BENCHMARK_COMPARISON.md`).
 
 | # | Issue | Deliverable | Tier |
 |---|---|---|---|
-| 1 | #2102 | Harness: `make bench-compare` (`TIERS=`, `RUNS=`), pinned `build_both.sh` (`git describe` check, `make libsodium`), `fingerprint.py`, `report.py`, result schema v1, built-in `selftest` tier, this proposal and the methodology doc. | `selftest` |
+| 1 | #2102 | Harness: `make bench-compare` (`TIERS=`, `RUNS=`), pinned `build_both.sh` (HEAD == tag commit check, `make libsodium`), `fingerprint.py`, `report.py`, result schema v1, built-in `selftest` tier, this proposal and the methodology doc. | `selftest` |
 | 2 | #2103 | Paired Go/Rust micro-benchmark suite (codec, crypto, commitments, AVM, sortition) with a pair registry mapping each Go `Benchmark*` to its criterion bench. | `micro` |
 | 3 | #2104 | Deterministic workload block corpus (pay / ASA / app / groups / inner txns) with a sha256 manifest. | (input for `replay`) |
 | 4 | #2105 | Offline ledger-replay macro benchmark (Go ledger vs algod-rust) with a final-state equality gate. | `replay` |

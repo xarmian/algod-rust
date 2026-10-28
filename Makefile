@@ -1051,11 +1051,13 @@ TIERS ?= selftest
 RUNS ?= 5
 BENCH_BUILD ?= auto
 BENCH_RUN_DIR ?=
+BENCH_CLEAN ?=
 
 bench-compare: ## Go vs Rust comparison report (TIERS=a,b RUNS=N) -> bench-results/<utc-ts>/
 	python3 scripts/bench/run.py --tiers "$(TIERS)" --runs "$(RUNS)" \
 		--build "$(BENCH_BUILD)" --out-root "$(BENCH_OUTPUT)" \
-		$(if $(BENCH_RUN_DIR),--run-dir "$(BENCH_RUN_DIR)",)
+		$(if $(BENCH_RUN_DIR),--run-dir "$(BENCH_RUN_DIR)",) \
+		$(if $(filter 1,$(BENCH_CLEAN)),--clean,)
 
 bench-compare-test: ## Unit-test the bench-compare harness (no Docker, no builds)
 	python3 -m unittest discover -s scripts/bench -p 'test_*.py'

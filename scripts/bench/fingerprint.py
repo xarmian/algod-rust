@@ -9,7 +9,7 @@ you know what each machine was, so every run writes fingerprint.json with:
 CPU model / sockets / cores / threads / max MHz / frequency governor /
 hypervisor, RAM, OS + kernel, rustc / go / docker / python versions, the
 algod-rust and go-algorand commits (and whether go-algorand sits exactly on
-the pinned tag, via `git describe --tags`), whether this is a CI runner, and
+the pinned tag: HEAD == TAG^{commit}; describe is informational), whether this is a CI runner, and
 a list of fairness warnings (governor not `performance`, CI runner, dirty
 trees, pin mismatch, virtualised CPU).
 
@@ -166,8 +166,14 @@ def detect_ci(env):
     }
 
 
-def pin_ok(describe, expected):
-    return describe is not None and describe == expected
+def pin_ok(head_commit, tag_commit):
+    """The checkout is on the pin iff HEAD is the tag's commit.
+
+    Compared by commit, not by `git describe` text: describe can print a
+    different tag that points at the same commit, and its output format is
+    not an interface. describe is kept in the fingerprint as information only.
+    """
+    return head_commit is not None and tag_commit is not None and head_commit == tag_commit
 
 
 def fairness_warnings(f):
@@ -194,8 +200,8 @@ def fairness_warnings(f):
         w.append(f"no go-algorand checkout found: pin {go.get('expected_tag')} not verified "
                  "(fine for tiers that need no Go build, e.g. selftest)")
     elif go.get("pin_ok") is False:
-        w.append(f"go-algorand checkout is at {go.get('describe')!r}, "
-                 f"not the pinned {go.get('expected_tag')}")
+        w.append(f"go-algorand checkout HEAD {go.get('commit')} ({go.get('describe')!r}) is not "
+                 f"the pinned {go.get('expected_tag')} commit {go.get('tag_commit')}")
     return w
 
 
@@ -307,26 +313,34 @@ def _toolchains():
     }
 
 
-def _git(repo):
+def git_info(repo, expected_tag=None):
     # No local path in the output: fingerprints get published (#2109) and a
     # path would only leak the operator's home directory.
     present = os.path.isdir(repo) and _run(["git", "-C", repo, "rev-parse", "--git-dir"]) is not None
     if not present:
-        return {"present": False, "commit": None, "describe": None, "dirty": None}
-    status = _run(["git", "-C", repo, "status", "--porcelain", "--untracked-files=no"])
-    return {
-        "present": True,
-        "commit": _run(["git", "-C", repo, "rev-parse", "HEAD"]),
-        "describe": _run(["git", "-C", repo, "describe", "--tags", "--always"]),
-        "dirty": bool(status),
-    }
+        info = {"present": False, "commit": None, "describe": None, "dirty": None}
+    else:
+        status = _run(["git", "-C", repo, "status", "--porcelain", "--untracked-files=no"])
+        info = {
+            "present": True,
+            "commit": _run(["git", "-C", repo, "rev-parse", "HEAD"]),
+            "describe": _run(["git", "-C", repo, "describe", "--tags", "--always"]),
+            "dirty": bool(status),
+        }
+    if expected_tag is not None:
+        tag_commit = None
+        if present:
+            tag_commit = _run(["git", "-C", repo, "rev-parse", "--verify", "--quiet",
+                               f"refs/tags/{expected_tag}^{{commit}}"])
+        info["expected_tag"] = expected_tag
+        info["tag_commit"] = tag_commit
+        info["pin_ok"] = pin_ok(info["commit"], tag_commit)
+    return info
 
 
 def collect(repo_root, go_algorand_dir, expected_tag, env=None):
     env = os.environ if env is None else env
-    go = _git(go_algorand_dir)
-    go["expected_tag"] = expected_tag
-    go["pin_ok"] = pin_ok(go["describe"], expected_tag)
+    go = git_info(go_algorand_dir, expected_tag)
     f = {
         "schema": SCHEMA,
         "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -334,7 +348,7 @@ def collect(repo_root, go_algorand_dir, expected_tag, env=None):
         "memory": {"total_bytes": _memory_bytes()},
         "os": _os(),
         "toolchains": _toolchains(),
-        "commits": {"algod_rust": _git(repo_root), "go_algorand": go},
+        "commits": {"algod_rust": git_info(repo_root), "go_algorand": go},
         "ci": detect_ci(env),
     }
     f["warnings"] = fairness_warnings(f)

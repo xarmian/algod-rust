@@ -68,6 +68,29 @@ class StatsTest(unittest.TestCase):
         self.assertEqual(s["spread_method"], "ci95-median")
         self.assertEqual((s["spread_low"], s["spread_high"]), (1.0, 7.0))
 
+    def test_median_ci_exact_matches_reference_up_to_1000(self):
+        # The incremental CDF must give the same r as the from-scratch sum.
+        import math
+        for n in (6, 7, 10, 50, 101, 500, 1000):
+            ref = 0
+            while ref + 1 <= n // 2 and sum(math.comb(n, i) for i in range(ref + 1)) / 2 ** n <= 0.025:
+                ref += 1
+            lo, hi, _ = report.median_ci(list(range(1, n + 1)))
+            self.assertEqual((lo, hi), (ref, n - ref + 1), n)
+
+    def test_median_ci_large_n_is_fast_and_sane(self):
+        import time
+        xs = [float(i) for i in range(20000)]
+        t0 = time.perf_counter()
+        lo, hi, cov = report.median_ci(xs)
+        self.assertLess(time.perf_counter() - t0, 1.0)
+        self.assertLess(lo, 10000)
+        self.assertGreater(hi, 10000)
+        self.assertGreaterEqual(cov, 0.95)
+        self.assertLess(cov, 0.96)
+        # normal approximation: half-width ~ 1.96 * sqrt(n)/2 ~ 138.6
+        self.assertAlmostEqual((hi - lo) / 2, 138.6, delta=2)
+
     def test_summarize_single_sample(self):
         s = report.summarize([5.0])
         self.assertEqual(s["median"], 5.0)
@@ -155,6 +178,26 @@ class SchemaTest(unittest.TestCase):
 
     def test_bad_tier_name(self):
         self.assertTrue(bench_schema.validate_result(result("a", "go", [1], tier="Bad Tier")))
+
+    def test_pattern_rejects_trailing_newline(self):
+        # re.search('^x$') matches 'x\n'; fullmatch must be used.
+        self.assertTrue(bench_schema.validate_result(result("a", "go", [1], tier="selftest\n")))
+        self.assertTrue(bench_schema.validate_result(result("a\n", "go", [1])))
+
+    def test_non_finite_samples_rejected_in_memory(self):
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            self.assertTrue(bench_schema.validate_result(result("a", "go", [1.0, bad])), bad)
+
+    def test_non_finite_samples_rejected_from_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            for i, tok in enumerate(("NaN", "Infinity", "-Infinity")):
+                p = os.path.join(d, f"r{i}.json")
+                with open(p, "w") as f:
+                    f.write('{"schema": "bench-result/v1", "tier": "t", "name": "a", '
+                            '"impl": "go", "unit": "s", "samples": [1, %s], "metadata": {}}' % tok)
+                rs, errs = bench_schema.load_result_file(p)
+                self.assertEqual(rs, [], tok)
+                self.assertEqual(len(errs), 1, tok)
 
     def test_load_file_object_array_and_garbage(self):
         with tempfile.TemporaryDirectory() as d:
@@ -285,6 +328,49 @@ class MainTest(unittest.TestCase):
             self.assertEqual(rep["schema"], "bench-report/v1")
             self.assertEqual(rep["rows"][0]["faster"], "rust")
             self.assertTrue(os.path.exists(os.path.join(d, "report.md")))
+
+    def _write(self, d, rel, obj):
+        p = os.path.join(d, *rel.split("/"))
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            json.dump(obj, f)
+
+    def test_tier_field_must_match_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            # a micro-tier file claiming to be selftest must not merge into selftest
+            self._write(d, "results/selftest/a.json", [result("p", "go", [2], tier="selftest")])
+            self._write(d, "results/micro/b.json", [result("p", "rust", [1], tier="selftest")])
+            rs, errs = report.load_run_results(d)
+            self.assertEqual(len(rs), 1)
+            self.assertEqual(rs[0]["impl"], "go")
+            self.assertEqual(len(errs), 1)
+            self.assertIn("results/micro/b.json", errs[0])
+            self.assertIn("micro", errs[0])
+            rc = report.main([d])
+            self.assertEqual(rc, 1)
+            with open(os.path.join(d, "report.json")) as f:
+                rep = json.load(f)
+            self.assertEqual(rep["rows"][0]["status"], "unpaired")
+
+    def test_result_outside_tier_directory_is_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write(d, "results/loose.json", [result("p", "go", [2])])
+            rs, errs = report.load_run_results(d)
+            self.assertEqual(rs, [])
+            self.assertEqual(len(errs), 1)
+
+    def test_report_json_is_strict_json(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write(d, "results/t/r.json", [result("p", "go", [0, 0, 0]),
+                                               result("p", "rust", [1, 1, 1])])
+            report.main([d])
+            with open(os.path.join(d, "report.json")) as f:
+                text = f.read()
+
+            def bad(tok):
+                raise ValueError(tok)
+            json.loads(text, parse_constant=bad)  # raises on NaN/Infinity
+            self.assertNotIn("NaN", text)
 
     def test_main_nonzero_on_invalid_result(self):
         with tempfile.TemporaryDirectory() as d:

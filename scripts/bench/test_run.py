@@ -58,6 +58,75 @@ class TierDiscoveryTest(unittest.TestCase):
                 run.discover_tiers(d)
 
 
+class RunDirReuseTest(unittest.TestCase):
+    """A reused run dir must never merge stale results into a new report."""
+
+    def _seed_stale(self, d):
+        os.makedirs(os.path.join(d, "results", "oldtier"))
+        with open(os.path.join(d, "results", "oldtier", "stale.json"), "w") as f:
+            json.dump({"schema": "bench-result/v1", "tier": "oldtier", "name": "stale",
+                       "impl": "go", "unit": "s", "samples": [1], "metadata": {}}, f)
+        with open(os.path.join(d, "build-info.json"), "w") as f:
+            json.dump({"schema": "bench-build-info/v1", "stale": True}, f)
+
+    def test_non_empty_run_dir_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._seed_stale(d)
+            rc = run.main(["--tiers", "selftest", "--runs", "1", "--run-dir", d,
+                           "--build", "never"])
+            self.assertEqual(rc, 2)
+            self.assertFalse(os.path.exists(os.path.join(d, "report.json")))
+
+    def test_clean_clears_stale_artifacts(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._seed_stale(d)
+            rc = run.main(["--tiers", "selftest", "--runs", "1", "--run-dir", d,
+                           "--build", "never", "--clean"])
+            self.assertEqual(rc, 0)
+            self.assertFalse(os.path.exists(os.path.join(d, "results", "oldtier")))
+            self.assertFalse(os.path.exists(os.path.join(d, "build-info.json")))
+            with open(os.path.join(d, "report.json")) as f:
+                rep = json.load(f)
+            self.assertNotIn("oldtier", {r["tier"] for r in rep["rows"]})
+            self.assertIsNone(rep["build_info"])
+
+    def test_two_runs_into_same_dir_do_not_merge(self):
+        with tempfile.TemporaryDirectory() as d:
+            for _ in range(2):
+                rc = run.main(["--tiers", "selftest", "--runs", "2", "--run-dir", d,
+                               "--build", "never", "--clean"])
+                self.assertEqual(rc, 0)
+            with open(os.path.join(d, "report.json")) as f:
+                rep = json.load(f)
+            row = [r for r in rep["rows"] if r["name"] == "sha256-1MiB"][0]
+            self.assertEqual(row["go"]["n"], 2)
+
+    def test_empty_existing_dir_is_fine(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc = run.main(["--tiers", "selftest", "--runs", "1", "--run-dir", d,
+                           "--build", "never"])
+            self.assertEqual(rc, 0)
+
+
+class RunsEnvTest(unittest.TestCase):
+    def test_bad_runs_env_ignored_when_flag_given(self):
+        old = os.environ.get("RUNS")
+        os.environ["RUNS"] = "not-a-number"
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                rc = run.main(["--tiers", "selftest", "--runs", "1", "--run-dir", d,
+                               "--build", "never"])
+                self.assertEqual(rc, 0)
+                with self.assertRaises(SystemExit) as cm:
+                    run.main(["--tiers", "selftest", "--run-dir", d, "--build", "never"])
+                self.assertEqual(cm.exception.code, 2)
+        finally:
+            if old is None:
+                del os.environ["RUNS"]
+            else:
+                os.environ["RUNS"] = old
+
+
 class SelftestEndToEndTest(unittest.TestCase):
     def test_selftest_writes_report(self):
         with tempfile.TemporaryDirectory() as d:

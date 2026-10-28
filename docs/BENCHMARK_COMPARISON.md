@@ -54,7 +54,8 @@ Variables:
 | `RUNS` | `5` | Measured runs per side for each benchmark (warm-up excluded). Use at least 6 to get a 95% confidence interval; 10 or more for publishable numbers. |
 | `BENCH_BUILD` | `auto` | `auto` runs `build_both.sh` only when a selected tier needs binaries; `always` / `never` force it. |
 | `BENCH_OUTPUT` | `bench-results` | Parent directory of the timestamped run directory. |
-| `BENCH_RUN_DIR` | (unset) | Exact run directory instead of `<BENCH_OUTPUT>/<utc-ts>`. |
+| `BENCH_RUN_DIR` | (unset) | Exact run directory instead of `<BENCH_OUTPUT>/<utc-ts>`. It must be empty or absent unless `BENCH_CLEAN=1`. |
+| `BENCH_CLEAN` | (unset) | `1` clears a reused `BENCH_RUN_DIR`'s previous run artifacts first (`--clean`). |
 | `GO_ALGORAND_DIR` | `../go-algorand` | go-algorand checkout. It must sit exactly on the pinned tag. |
 | `GO_ALGORAND_REV` | `scripts/bench/go-algorand.pin` | Override the pinned tag. Only do this for experiments; the report records it. |
 | `BENCH_BIN_DIR` | `target/bench-compare` | Where the built binaries go (`go/`, `rust/`). |
@@ -100,7 +101,10 @@ The comparison follows four rules from the epic. Every tier must keep them.
   interval `[x(r), x(n-r+1)]` with the largest `r` for which
   `P(Bin(n, 1/2) <= r-1) <= 0.025`, so it assumes nothing about the shape of
   the distribution. With n < 6 no order-statistic interval reaches 95%, so
-  the report shows the **min/max range** and labels it `range`.
+  the report shows the **min/max range** and labels it `range`. The
+  binomial tail is exact up to n = 1000; above that the report uses the
+  normal approximation `N(n/2, n/4)`, which is accurate to well under a
+  rank at that size.
 - **Rust/Go** is the ratio of the two medians.
 - **Faster** names a side only when the two spreads do not overlap, together
   with how many times faster it is (the larger median divided by the
@@ -129,7 +133,7 @@ Before you trust or publish a number:
   in each run (Go, Rust, then Rust, Go, ...), so slow drift such as heat or
   background jobs hits both sides equally.
 - **Pinned, clean builds.** `build_both.sh` refuses to build go-algorand
-  unless `git describe --tags` equals the pinned tag. The report shows both
+  unless the checkout's `HEAD` is the pinned tag's commit. The report shows both
   commits and flags uncommitted changes in either tree.
 - **Release builds with each project's own flags.** go-algorand is built
   with the tags, buildmode and ldflags from its own Makefile. algod-rust is
@@ -196,6 +200,18 @@ bench-results/20261028T084626Z/
 
 `bench-results/` is git-ignored. Regenerate the report from an existing run
 directory with `python3 scripts/bench/report.py bench-results/<ts>`.
+
+A run directory holds exactly one run. The runner refuses an existing,
+non-empty `--run-dir` / `BENCH_RUN_DIR`, because `report.py` merges every
+`results/**/*.json` it finds and would mix in an earlier run's results and
+`build-info.json`. Pass `--clean` (make: `BENCH_CLEAN=1`) to delete the
+previous run's artifacts (the entries listed above, and nothing else; it
+refuses if the directory holds anything else).
+
+The directory a result file sits in is authoritative. A result whose `tier`
+field differs from its `results/<tier>/` directory, or a file directly under
+`results/`, is dropped and reported as an error, so one tier cannot add
+rows to another tier's table.
 
 ## Tier contract (adding a tier)
 
@@ -278,7 +294,7 @@ against it using only the standard library.
 | `impl` | yes | `go` or `rust`. |
 | `unit` | yes | For example `ns/op`, `s`, `MB/s`, `txn/s`, `bytes`. |
 | `better` | no | `lower` or `higher`. Default: `higher` if `unit` ends in `/s`, else `lower`. |
-| `samples` | yes | Non-empty array of non-negative numbers, one per measured run. |
+| `samples` | yes | Non-empty array of finite, non-negative numbers, one per measured run. `NaN` / `Infinity` are rejected, and `report.json` is always strict JSON. |
 | `metadata` | yes | Object (may be empty): provenance such as inputs, hashes, command lines and iteration counts; `synthetic: true` for selftest rows. |
 
 No other top-level fields are allowed, so a typo fails validation instead of
@@ -292,16 +308,28 @@ their samples are merged.
 1. Reads the tag from `scripts/bench/go-algorand.pin` (`v5.0.4-stable`,
    swept with every other pin occurrence by `algod-version-upgrade`).
    `GO_ALGORAND_REV` overrides it.
-2. Checks that `git describe --tags` in the go-algorand checkout equals the
-   tag. If not, it exits 1 and prints the `git checkout` command to run.
+2. Checks that the go-algorand checkout's `git rev-parse HEAD` equals
+   `git rev-parse "$TAG^{commit}"`. If not, it exits 1 and prints the
+   `git checkout` command to run. `git describe --tags` is recorded only as
+   information, because it can name a different tag on the same commit.
    `--clone` clones the tag when no checkout exists.
 3. Runs `make libsodium` (go-algorand links its vendored libsodium fork),
    then builds `cmd/algod` and `cmd/goal` with go-algorand's own release
-   tags, buildmode and ldflags, which it reads from go-algorand's Makefile.
-4. Builds `algod-rust` with `cargo build --release --locked`.
+   tags, buildmode and ldflags. It reads all three from go-algorand's
+   Makefile in a single `make` parse.
+4. Builds `algod-rust` with `cargo build --release --locked` and takes the
+   binary's path from cargo's own JSON artifact message
+   (`scripts/bench/cargo_artifact.py`), so `CARGO_TARGET_DIR`,
+   `build.target-dir` and `--target` are honoured.
 5. Copies the binaries to `$BENCH_BIN_DIR/{go,rust}/` and writes
-   `build-info.json` (`bench-build-info/v1`): both commits, `describe`,
-   dirty flags, toolchain versions and the sha256 of every binary.
+   `build-info.json` (`bench-build-info/v1`): both commits, the tag commit,
+   `describe`, dirty flags, toolchain versions and the sha256 of every
+   binary.
+
+CI: the `bench-build-both` job in `.github/workflows/harness-shell-tests.yml`
+runs the go-algorand half for real (`--clone --skip-rust`) on Ubuntu
+whenever `build_both.sh` or the pin file changes. It asserts
+`built: true` and `pin_ok: true` and runs `algod -v`.
 
 `--skip-go` / `--skip-rust` build only one side.
 

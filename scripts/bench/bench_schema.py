@@ -15,6 +15,7 @@ CLI (for tier authors):
 exits 0 when every file is valid, 1 otherwise.
 """
 import json
+import math
 import os
 import re
 import sys
@@ -25,8 +26,10 @@ _TYPES = {
     "object": lambda v: isinstance(v, dict),
     "array": lambda v: isinstance(v, list),
     "string": lambda v: isinstance(v, str),
-    # bool is an int subclass in Python, but not a JSON number.
-    "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+    # bool is an int subclass in Python, but not a JSON number; NaN and
+    # +/-Infinity are not JSON numbers either (json.load accepts them).
+    "number": lambda v: (isinstance(v, (int, float)) and not isinstance(v, bool)
+                         and math.isfinite(v)),
     "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
     "boolean": lambda v: isinstance(v, bool),
     "null": lambda v: v is None,
@@ -58,7 +61,7 @@ def validate(value, schema, path="$"):
     if isinstance(value, str):
         if len(value) < schema.get("minLength", 0):
             errs.append(f"{path}: shorter than {schema['minLength']}")
-        if "pattern" in schema and not re.search(schema["pattern"], value):
+        if "pattern" in schema and not re.fullmatch(schema["pattern"], value):
             errs.append(f"{path}: {value!r} does not match {schema['pattern']}")
     if _TYPES["number"](value) and "minimum" in schema and value < schema["minimum"]:
         errs.append(f"{path}: {value} < minimum {schema['minimum']}")
@@ -81,6 +84,10 @@ def validate(value, schema, path="$"):
     return errs
 
 
+def _reject_constant(token):
+    raise ValueError(f"non-finite number {token} is not valid JSON")
+
+
 def validate_result(obj):
     return validate(obj, load_schema())
 
@@ -93,7 +100,7 @@ def load_result_file(path):
     """
     try:
         with open(path, encoding="utf-8") as f:
-            data = json.load(f)
+            data = json.load(f, parse_constant=_reject_constant)
     except (OSError, ValueError) as e:
         return [], [f"{path}: cannot load JSON: {e}"]
     items = data if isinstance(data, list) else [data]

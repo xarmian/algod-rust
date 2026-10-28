@@ -68,7 +68,7 @@ sha256_of() {
     else shasum -a 256 "$1" | cut -d' ' -f1; fi
 }
 
-GO_COMMIT="" GO_DESCRIBE="" GO_DIRTY="" GO_VERSION="" GO_BINS=""
+GO_COMMIT="" TAG_COMMIT="" GO_DESCRIBE="" GO_DIRTY="" GO_VERSION="" GO_BINS=""
 if [ "$SKIP_GO" = 0 ]; then
     if [ ! -d "$GO_DIR/.git" ] && [ ! -f "$GO_DIR/.git" ]; then
         [ "$CLONE" = 1 ] || die "no go-algorand checkout at $GO_DIR (pass --clone, or: git clone --branch $TAG https://github.com/algorand/go-algorand $GO_DIR)"
@@ -76,9 +76,14 @@ if [ "$SKIP_GO" = 0 ]; then
         git clone --quiet --depth 1 --branch "$TAG" https://github.com/algorand/go-algorand "$GO_DIR"
     fi
     GO_DIR="$(cd "$GO_DIR" && pwd)"
-    GO_DESCRIBE="$(git -C "$GO_DIR" describe --tags 2>/dev/null || true)"
-    [ "$GO_DESCRIBE" = "$TAG" ] || die "go-algorand at $GO_DIR is '$GO_DESCRIBE', not the pinned '$TAG' (git -C $GO_DIR checkout $TAG)"
+    # The pin is checked by commit: HEAD must be the tag's commit. `git
+    # describe` can name another tag on the same commit, so it is recorded
+    # for information only.
     GO_COMMIT="$(git -C "$GO_DIR" rev-parse HEAD)"
+    TAG_COMMIT="$(git -C "$GO_DIR" rev-parse --verify --quiet "refs/tags/$TAG^{commit}" || true)"
+    GO_DESCRIBE="$(git -C "$GO_DIR" describe --tags 2>/dev/null || true)"
+    [ -n "$TAG_COMMIT" ] || die "tag '$TAG' not found in $GO_DIR (git -C $GO_DIR fetch --tags)"
+    [ "$GO_COMMIT" = "$TAG_COMMIT" ] || die "go-algorand at $GO_DIR is at $GO_COMMIT ('$GO_DESCRIBE'), not the pinned '$TAG' commit $TAG_COMMIT (git -C $GO_DIR checkout $TAG)"
     if [ -n "$(git -C "$GO_DIR" status --porcelain --untracked-files=no)" ]; then
         GO_DIRTY=true
         echo "build_both: WARNING: go-algorand has uncommitted changes to tracked files" >&2
@@ -92,13 +97,15 @@ if [ "$SKIP_GO" = 0 ]; then
     make -C "$GO_DIR" libsodium
 
     # Read go-algorand's own release build flags from its Makefile, so the
-    # benchmarked binary is built like `make build` builds it.
+    # benchmarked binary is built like `make build` builds it. One target
+    # prints all three variables, one per line, in a single Makefile parse
+    # (go-algorand's Makefile runs several `go list` at parse time).
     FLAGS_MK="$(mktemp)"
     trap 'rm -f "$FLAGS_MK"' EXIT
-    printf 'bench-print-%s:\n\t@echo "$(%s)"\n' tags GOTAGSLIST mode GOBUILDMODE ldflags GOLDFLAGS > "$FLAGS_MK"
-    GOTAGSLIST="$(make -s -C "$GO_DIR" -f Makefile -f "$FLAGS_MK" bench-print-tags)"
-    GOBUILDMODE="$(make -s -C "$GO_DIR" -f Makefile -f "$FLAGS_MK" bench-print-mode)"
-    GOLDFLAGS="$(make -s -C "$GO_DIR" -f Makefile -f "$FLAGS_MK" bench-print-ldflags)"
+    printf 'bench-print-flags:\n\t@echo "$(GOTAGSLIST)"\n\t@echo "$(GOBUILDMODE)"\n\t@echo "$(GOLDFLAGS)"\n' > "$FLAGS_MK"
+    FLAGS_OUT="$(make -s -C "$GO_DIR" -f Makefile -f "$FLAGS_MK" bench-print-flags)"
+    [ "$(printf '%s\n' "$FLAGS_OUT" | wc -l)" -eq 3 ] || die "unexpected flag output from go-algorand's Makefile: $FLAGS_OUT"
+    { IFS= read -r GOTAGSLIST; IFS= read -r GOBUILDMODE; IFS= read -r GOLDFLAGS; } <<<"$FLAGS_OUT"
     echo "build_both: go tags='$GOTAGSLIST' buildmode='$GOBUILDMODE'"
 
     mkdir -p "$BIN_DIR/go"
@@ -123,15 +130,21 @@ if [ "$SKIP_RUST" = 0 ]; then
     fi
     RUST_VERSION="$(rustc -V)"
     echo "build_both: algod-rust $RUST_COMMIT, $RUST_VERSION"
-    (cd "$REPO_ROOT" && cargo build --release --locked --bin algod-rust)
+    # Ask cargo where it put the binary (honours CARGO_TARGET_DIR,
+    # build.target-dir and --target) instead of assuming ./target/release.
+    CARGO_MSGS="$(mktemp)"
+    (cd "$REPO_ROOT" && cargo build --release --locked --bin algod-rust \
+        --message-format=json-render-diagnostics) > "$CARGO_MSGS"
+    RUST_EXE="$(python3 "$HERE/cargo_artifact.py" algod-rust < "$CARGO_MSGS")" \
+        || die "cargo reported no executable for algod-rust"
+    rm -f "$CARGO_MSGS"
     mkdir -p "$BIN_DIR/rust"
-    exe=""
-    [ -f "$REPO_ROOT/target/release/algod-rust.exe" ] && exe=".exe"
-    cp "$REPO_ROOT/target/release/algod-rust$exe" "$BIN_DIR/rust/algod-rust$exe"
-    RUST_BINS="rust/algod-rust$exe:$(sha256_of "$BIN_DIR/rust/algod-rust$exe")"
+    exe_name="$(basename "$RUST_EXE")"
+    cp "$RUST_EXE" "$BIN_DIR/rust/$exe_name"
+    RUST_BINS="rust/$exe_name:$(sha256_of "$BIN_DIR/rust/$exe_name")"
 fi
 
-export TAG GO_COMMIT GO_DESCRIBE GO_DIRTY GO_VERSION GO_BINS
+export TAG TAG_COMMIT GO_COMMIT GO_DESCRIBE GO_DIRTY GO_VERSION GO_BINS
 export RUST_COMMIT RUST_DESCRIBE RUST_DIRTY RUST_VERSION RUST_BINS
 python3 - "$OUT/build-info.json" <<'PY'
 import datetime, json, os, sys
@@ -154,7 +167,8 @@ def side(prefix, built):
             "sha256": bins(e[prefix + "_BINS"])}
 go = side("GO", bool(e["GO_COMMIT"]))
 if go["built"]:
-    go.update({"tag": e["TAG"], "pin_ok": e["GO_DESCRIBE"] == e["TAG"]})
+    go.update({"tag": e["TAG"], "tag_commit": e["TAG_COMMIT"],
+               "pin_ok": bool(e["TAG_COMMIT"]) and e["GO_COMMIT"] == e["TAG_COMMIT"]})
 info = {
     "schema": "bench-build-info/v1",
     "built_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

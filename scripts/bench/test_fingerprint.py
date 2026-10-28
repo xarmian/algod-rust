@@ -8,7 +8,9 @@ The parsers are fed captured `lscpu`, `/proc/cpuinfo`, `/proc/meminfo` and
 `/etc/os-release` text so the tests run identically on any host.
 """
 import os
+import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -186,14 +188,40 @@ class CiDetectTest(unittest.TestCase):
 
 
 class PinTest(unittest.TestCase):
-    def test_exact_tag(self):
-        self.assertTrue(fp.pin_ok("v5.0.4-stable", "v5.0.4-stable"))
+    """The pin is checked by commit (HEAD == TAG^{commit}), not describe text."""
 
-    def test_commits_past_tag(self):
-        self.assertFalse(fp.pin_ok("v5.0.4-stable-3-g1234abcd", "v5.0.4-stable"))
+    def test_same_commit(self):
+        self.assertTrue(fp.pin_ok("a" * 40, "a" * 40))
+
+    def test_different_commit(self):
+        self.assertFalse(fp.pin_ok("a" * 40, "b" * 40))
 
     def test_missing(self):
-        self.assertFalse(fp.pin_ok(None, "v5.0.4-stable"))
+        self.assertFalse(fp.pin_ok(None, "a" * 40))
+        self.assertFalse(fp.pin_ok("a" * 40, None))
+        self.assertFalse(fp.pin_ok(None, None))
+
+    def _git(self, repo, *args):
+        subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t",
+                        "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", *args],
+                       check=True, capture_output=True)
+
+    def test_real_repo_two_tags_on_one_commit(self):
+        # describe may print the *other* tag; the commit comparison must not care.
+        with tempfile.TemporaryDirectory() as d:
+            self._git(d, "init", "-q")
+            self._git(d, "commit", "-q", "--allow-empty", "-m", "one")
+            self._git(d, "tag", "v5.0.4-stable")
+            self._git(d, "tag", "zz-other-tag")
+            g = fp.git_info(d, "v5.0.4-stable")
+            self.assertTrue(g["pin_ok"], g)
+            self.assertEqual(g["commit"], g["tag_commit"])
+            self._git(d, "commit", "-q", "--allow-empty", "-m", "two")
+            g = fp.git_info(d, "v5.0.4-stable")
+            self.assertFalse(g["pin_ok"], g)
+            g = fp.git_info(d, "v9.9.9-missing")
+            self.assertFalse(g["pin_ok"])
+            self.assertIsNone(g["tag_commit"])
 
 
 class WarningsTest(unittest.TestCase):

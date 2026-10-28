@@ -21,13 +21,14 @@ build or the report failed, 2 on a usage error (unknown tier, bad RUNS).
 
 Usage:
     python3 scripts/bench/run.py --tiers selftest --runs 5
-        [--run-dir DIR | --out-root bench-results] [--build auto|always|never]
+        [--run-dir DIR [--clean] | --out-root bench-results] [--build auto|always|never]
 """
 import argparse
 import datetime
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -79,6 +80,35 @@ def tier_needs_build(path):
     return False
 
 
+# Everything a run writes. --clean removes exactly these, nothing else.
+RUN_ARTIFACTS = ("results", "logs", "fingerprint.json", "build-info.json",
+                 "tier-status.json", "report.json", "report.md")
+
+
+def prepare_run_dir(run_dir, clean):
+    """Make sure no artifact of an earlier run can leak into this one.
+
+    report.py merges every results/**/*.json and reads build-info.json, so a
+    reused directory would silently mix two runs. A missing or empty
+    directory is fine; a non-empty one needs clean=True, which removes the
+    run artifacts (and refuses if anything else is in there).
+    """
+    if not os.path.isdir(run_dir) or not os.listdir(run_dir):
+        return
+    if not clean:
+        raise ValueError(f"run dir {run_dir} is not empty; pass --clean (make: BENCH_CLEAN=1) "
+                         "to clear the previous run, or choose another directory")
+    other = sorted(set(os.listdir(run_dir)) - set(RUN_ARTIFACTS))
+    if other:
+        raise ValueError(f"run dir {run_dir} contains non-run files {other}; refusing to clean it")
+    for name in RUN_ARTIFACTS:
+        p = os.path.join(run_dir, name)
+        if os.path.isdir(p):
+            shutil.rmtree(p)
+        elif os.path.exists(p):
+            os.remove(p)
+
+
 def _command(path):
     return [sys.executable, path] if path.endswith(".py") else ["bash", path]
 
@@ -105,8 +135,14 @@ def _stream(cmd, env, log_path, cwd):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--tiers", default=os.environ.get("TIERS", "selftest"))
-    ap.add_argument("--runs", type=int, default=int(os.environ.get("RUNS", "5")))
+    # The env default stays a string: argparse only converts it (type=int,
+    # exit 2 on garbage) when --runs is absent, so a bad RUNS env var cannot
+    # break an explicit --runs.
+    ap.add_argument("--runs", type=int, default=os.environ.get("RUNS", "5"))
     ap.add_argument("--run-dir", help="exact output directory (default <out-root>/<utc-ts>)")
+    ap.add_argument("--clean", action="store_true",
+                    help="clear a reused --run-dir's previous artifacts first "
+                         "(a non-empty run dir is refused otherwise)")
     ap.add_argument("--out-root", default=os.path.join(REPO_ROOT, "bench-results"))
     ap.add_argument("--build", choices=("auto", "always", "never"), default="auto")
     ap.add_argument("--tiers-dir", default=TIERS_DIR)
@@ -133,6 +169,11 @@ def main(argv=None):
 
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_dir = os.path.abspath(args.run_dir or os.path.join(args.out_root, ts))
+    try:
+        prepare_run_dir(run_dir, args.clean)
+    except ValueError as e:
+        print(f"bench-compare: {e}", file=sys.stderr)
+        return 2
     os.makedirs(os.path.join(run_dir, "logs"), exist_ok=True)
     os.makedirs(os.path.join(run_dir, "results"), exist_ok=True)
     print(f"bench-compare: tiers={','.join(selected)} runs={args.runs} -> {run_dir}")
