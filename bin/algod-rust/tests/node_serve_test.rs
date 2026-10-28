@@ -59,7 +59,7 @@ fn write_genesis(dir: &Path, funded: &str) {
     let fees = Address([0xFE; 32]).to_algorand_string();
     let rwd = Address([0xFD; 32]).to_algorand_string();
     let genesis = format!(
-        r#"{{"id":"v1","network":"localnet","proto":"future","fees":"{fees}","rwd":"{rwd}","timestamp":0,"alloc":[{{"addr":"{funded}","comment":"Wallet1","state":{{"algo":{FUNDED_AMOUNT},"onl":0}}}}]}}"#
+        r#"{{"id":"v1","network":"localnet","proto":"future","fees":"{fees}","rwd":"{rwd}","timestamp":0,"alloc":[{{"addr":"{rwd}","comment":"RewardsPool","state":{{"algo":100000,"onl":2}}}},{{"addr":"{funded}","comment":"Wallet1","state":{{"algo":{FUNDED_AMOUNT},"onl":0}}}}]}}"#
     );
     std::fs::write(dir.join("genesis.json"), genesis).unwrap();
 }
