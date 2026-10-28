@@ -63,9 +63,11 @@ use ed25519_dalek::{Signer, SigningKey};
 
 use crate::apply::{
     apply_transaction_with_budget, check_authorizer, compute_group_fee_credit_and_residue,
-    ApplyContext, ApplyMode, AvmEvalOverrides, BoxBudgetState, GroupInfo,
+    withdraw_block_rewards, ApplyContext, ApplyMode, AvmEvalOverrides, BlockRewardsWithdrawal,
+    BoxBudgetState, GroupInfo, TESTNET_BANK_ADDRESS, TESTNET_OVERSPENT_REWARDS_ROUNDS,
 };
 use crate::avm_context::{NamedGroupResources, StoreSigBlockSource, UnnamedCapacityTracker};
+use crate::rewards::{compute_pending_rewards, next_rewards_state, RewardsState};
 use crate::store_trait::LedgerStore;
 
 /// Fixed proxy signing key seed (first 32 bytes of go-algorand's `proxySigner`).
@@ -277,6 +279,71 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         Ok(())
     }
 
+    /// go `eval.StartEvaluator` for the simulated block `round` (built by
+    /// `bookkeeping.MakeBlock(prevHdr)` and evaluated with `Generate: true`,
+    /// `ledger/simulation/simulator.go`): advance the rewards state with
+    /// `prevHdr.NextRewardsState(round, proto, pool balance, prevTotals
+    /// .RewardUnits())`, then withdraw the block's rewards from the pool.
+    /// Returns the rewards level the simulated group runs at.
+    ///
+    /// The caller's snapshot must cover the rewards pool (and the testnet
+    /// bank on its hotfix rounds).
+    fn start_simulated_block(
+        &mut self,
+        round: u64,
+        consensus: &ConsensusParams,
+    ) -> Result<u64, AlgoError> {
+        let store = &mut *self.store;
+        let prev = RewardsState {
+            rewards_level: store.rewards_level(),
+            rewards_rate: store.rewards_rate(),
+            rewards_residue: store.rewards_residue(),
+            rewards_recalculation_round: store.rewards_recalculation_round(),
+        };
+        let pool = store.rewards_pool();
+        // With no rate refresh due, a zero rate and a zero residue, the state
+        // carries over unchanged whatever the pool balance and reward units
+        // are, so skip both reads.
+        let reads_ledger = round == prev.rewards_recalculation_round
+            || prev.rewards_rate != 0
+            || prev.rewards_residue != 0;
+        let (next, reward_units) = if reads_ledger {
+            // go `LookupWithoutRewards(pool).WithUpdatedRewards(prevLevel)`.
+            let pool_balance = store
+                .get_account(&pool)
+                .map(|acct| {
+                    compute_pending_rewards(&acct, prev.rewards_level)
+                        .saturating_add(acct.micro_algos)
+                })
+                .unwrap_or(0);
+            let totals = store.account_totals();
+            let units = totals
+                .online
+                .reward_units
+                .saturating_add(totals.offline.reward_units);
+            (
+                next_rewards_state(prev, round, consensus, pool_balance, units),
+                units,
+            )
+        } else {
+            (prev, 0)
+        };
+
+        let withdrawal = BlockRewardsWithdrawal {
+            round,
+            pool,
+            prev_rewards_level: prev.rewards_level,
+            rewards_level: next.rewards_level,
+            prev_reward_units: reward_units,
+            genesis_hash: *store.genesis_hash(),
+            min_balance: consensus.min_balance,
+        };
+        // Writes the pool only when it changes (never on a no-rewards chain
+        // such as mainnet); go's `MinBalance` check on the pool always runs.
+        withdraw_block_rewards(store, &withdrawal)?;
+        Ok(next.rewards_level)
+    }
+
     /// Simulate the given request and return results.
     ///
     /// The ledger store is left unchanged after simulation completes
@@ -350,6 +417,11 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         // Include the fee sink and rewards pool since apply_transaction
         // credits fees and distributes rewards through these accounts.
         let mut addrs: Vec<Address> = vec![self.store.fee_sink(), self.store.rewards_pool()];
+        // The block-start withdrawal moves the testnet bank on go's two
+        // `workaroundOverspentRewards` rounds.
+        if TESTNET_OVERSPENT_REWARDS_ROUNDS.contains(&(sim_round.0 + 1)) {
+            addrs.push(Address(TESTNET_BANK_ADDRESS));
+        }
         for stx in txn_group {
             addrs.push(stx.txn.sender);
             if stx.txn.receiver != Address::ZERO {
@@ -573,8 +645,24 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             )))
         });
 
+        // go `StartEvaluator` with `Generate: true` (issue #2118): the
+        // simulated block carries the next round's rewards state and
+        // withdraws its rewards from the pool before the group runs. go
+        // never starts the evaluator for a group that failed `check`.
+        let rewards_level = if precheck_failure.is_some() {
+            self.store.rewards_level()
+        } else {
+            match self.start_simulated_block(sim_round.0 + 1, &consensus) {
+                Ok(level) => level,
+                Err(e) => {
+                    self.store.restore_snapshot(snapshot);
+                    return Err(SimulatorError::Internal(e));
+                }
+            }
+        };
+
         let apply_ctx = ApplyContext {
-            rewards_level: self.store.rewards_level(),
+            rewards_level,
             fee_sink: self.store.fee_sink(),
             round: sim_round.0,
             mode: ApplyMode::Execute,

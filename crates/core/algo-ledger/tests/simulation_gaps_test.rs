@@ -34,6 +34,7 @@
 use std::collections::BTreeMap;
 
 use algo_codec::canonical_encode_transaction;
+use algo_ledger::apply::pool_fixtures::funded_ledger_state;
 use algo_ledger::simulation::{
     ExecTraceConfig, SimulationRequest, SimulationResult, Simulator, SimulatorError,
 };
@@ -91,7 +92,7 @@ fn sign(txn: Transaction, key: &SigningKey) -> SignedTransaction {
 
 /// A minimal `LedgerState` with a funded fee sink and no other accounts.
 fn base_state() -> LedgerState {
-    let mut state = LedgerState::new();
+    let mut state = funded_ledger_state();
     state.fee_sink = FEE_SINK;
     state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
     state.set_account(

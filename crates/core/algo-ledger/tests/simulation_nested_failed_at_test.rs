@@ -38,6 +38,7 @@
 
 use std::collections::BTreeMap;
 
+use algo_ledger::apply::pool_fixtures::funded_ledger_state;
 use algo_ledger::simulation::{SimulationRequest, Simulator, SimulatorError};
 use algo_ledger::{avm_context::app_address, LedgerState, LedgerStore};
 use algo_types::{AccountData, Address, AppParams, SignedTransaction, StateSchema, Transaction};
@@ -51,7 +52,7 @@ fn assemble(source: &str) -> Vec<u8> {
 }
 
 fn base_state() -> LedgerState {
-    let mut state = LedgerState::new();
+    let mut state = funded_ledger_state();
     state.fee_sink = FEE_SINK;
     state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
     state.set_account(

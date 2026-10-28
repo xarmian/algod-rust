@@ -49,6 +49,7 @@
 use std::collections::BTreeMap;
 
 use algo_codec::{canonical_encode_transaction, compute_group_id};
+use algo_ledger::apply::pool_fixtures::funded_ledger_state;
 use algo_ledger::simulation::{SimulationRequest, SimulationResult, Simulator, SimulatorError};
 use algo_ledger::{
     apply_transaction, avm_context::app_address, ApplyContext, ApplyMode, LedgerStore,
@@ -84,7 +85,7 @@ fn sign(txn: Transaction, key: &SigningKey) -> SignedTransaction {
 }
 
 fn base_state() -> algo_ledger::LedgerState {
-    let mut state = algo_ledger::LedgerState::new();
+    let mut state = funded_ledger_state();
     state.fee_sink = FEE_SINK;
     state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
     state.set_account(

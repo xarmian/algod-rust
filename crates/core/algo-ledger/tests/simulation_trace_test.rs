@@ -26,6 +26,7 @@
 
 use std::collections::BTreeMap;
 
+use algo_ledger::apply::pool_fixtures::funded_ledger_state;
 use algo_ledger::avm_context::app_address;
 use algo_ledger::simulation::{
     AvmValueTrace, ExecTraceConfig, SimulationRequest, Simulator, SimulatorError, StateChangeKind,
@@ -45,7 +46,7 @@ use sha2::{Digest, Sha512_256};
 fn setup_state(sender: Address, app_id: u64, approval_program: Vec<u8>) -> LedgerState {
     let fee_sink = Address([0xFE; 32]);
 
-    let mut state = LedgerState::new();
+    let mut state = funded_ledger_state();
     state.fee_sink = fee_sink;
     state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
 
@@ -734,7 +735,7 @@ fn simulation_group_pooled_fees_cover_underpaid_transaction() {
     let receiver = Address([0x20; 32]);
     let fee_sink = Address([0xFE; 32]);
 
-    let mut state = LedgerState::new();
+    let mut state = funded_ledger_state();
     state.fee_sink = fee_sink;
     state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
     for addr in [sender_a, sender_b, fee_sink] {
@@ -786,7 +787,7 @@ fn simulation_group_pooled_fees_reject_insufficient_total() {
     let receiver = Address([0x20; 32]);
     let fee_sink = Address([0xFE; 32]);
 
-    let mut state = LedgerState::new();
+    let mut state = funded_ledger_state();
     state.fee_sink = fee_sink;
     state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
     for addr in [sender_a, sender_b, fee_sink] {
@@ -837,7 +838,7 @@ fn simulation_rejects_v42_big_note_underpaid_fee() {
     let receiver = Address([0x20; 32]);
     let fee_sink = Address([0xFE; 32]);
 
-    let mut state = LedgerState::new();
+    let mut state = funded_ledger_state();
     state.fee_sink = fee_sink;
     state.protocol = algo_types::consensus::CONSENSUS_V42.to_string();
     for addr in [sender, fee_sink] {
@@ -881,7 +882,7 @@ fn simulation_rejects_v42_big_note_underpaid_fee() {
 fn simulation_signature_failure_takes_precedence_over_underpaid_group_fee() {
     let sender = Address([0xAA; 32]);
     let receiver = Address([0x20; 32]);
-    let mut state = LedgerState::new();
+    let mut state = funded_ledger_state();
     state.set_account(
         &sender,
         AccountData {
@@ -920,7 +921,7 @@ fn simulation_logicsig_rejection_takes_precedence_over_underpaid_group_fee() {
     // v6: pushint 0; return -- always rejects.
     let program = vec![0x06, 0x81, 0x00, 0x43];
     let escrow = algo_validate::hash_program(&program);
-    let mut state = LedgerState::new();
+    let mut state = funded_ledger_state();
     state.fee_sink = Address([0xFE; 32]);
     state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
     state.set_account(
@@ -997,7 +998,7 @@ fn simulation_evaluation_failure_takes_precedence_over_underpaid_group_fee() {
 // ---------------------------------------------------------------------------
 
 fn state_for(protocol: &str, funded: &[Address]) -> LedgerState {
-    let mut state = LedgerState::new();
+    let mut state = funded_ledger_state();
     state.fee_sink = Address([0xFE; 32]);
     state.protocol = protocol.to_string();
     for addr in funded {
@@ -1193,7 +1194,7 @@ fn simulation_trace_captures_logicsig_program() {
     let receiver = Address([0x20; 32]);
     let fee_sink = Address([0xFE; 32]);
 
-    let mut state = LedgerState::new();
+    let mut state = funded_ledger_state();
     state.fee_sink = fee_sink;
     state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
     state.set_account(
@@ -1303,7 +1304,7 @@ fn simulation_trace_inner_txn_spawned_inners() {
     ];
 
     let fee_sink = Address([0xFE; 32]);
-    let mut state = LedgerState::new();
+    let mut state = funded_ledger_state();
     state.fee_sink = fee_sink;
     state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
     state.set_account(
@@ -1460,7 +1461,7 @@ fn simulation_app_budget_added_includes_inner_app_calls() {
     ];
 
     let fee_sink = Address([0xFE; 32]);
-    let mut state = LedgerState::new();
+    let mut state = funded_ledger_state();
     state.fee_sink = fee_sink;
     state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
     state.set_account(
@@ -1588,7 +1589,7 @@ fn simulation_logicsig_budget_consumed_populated() {
     let sender = contract_account_address(&program);
     let fee_sink = Address([0xFE; 32]);
 
-    let mut state = LedgerState::new();
+    let mut state = funded_ledger_state();
     state.fee_sink = fee_sink;
     state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
     state.set_account(
@@ -1669,7 +1670,7 @@ fn simulation_logicsig_budget_set_for_txn_after_execution_failure() {
     let lsig_sender = contract_account_address(&lsig_program);
     let fee_sink = Address([0xFE; 32]);
 
-    let mut state = LedgerState::new();
+    let mut state = funded_ledger_state();
     state.fee_sink = fee_sink;
     state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
     state.set_account(

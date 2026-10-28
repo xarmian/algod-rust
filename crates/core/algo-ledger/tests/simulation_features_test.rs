@@ -27,6 +27,7 @@
 
 use std::collections::BTreeMap;
 
+use algo_ledger::apply::pool_fixtures::funded_ledger_state;
 use algo_ledger::simulation::{
     SimulationRequest, Simulator, SimulatorError, LOG_BYTES_LIMIT, MAX_EXTRA_OPCODE_BUDGET,
     SIMULATION_MAX_LOG_CALLS,
@@ -45,7 +46,7 @@ const FEE_SINK: Address = Address([0xFE; 32]);
 
 /// Build a minimal `LedgerState` with a funded sender and fee sink.
 fn setup_state(sender: Address) -> LedgerState {
-    let mut state = LedgerState::new();
+    let mut state = funded_ledger_state();
     state.fee_sink = FEE_SINK;
     state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
 

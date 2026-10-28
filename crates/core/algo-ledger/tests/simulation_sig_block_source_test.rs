@@ -38,6 +38,7 @@
 
 use algo_avm::logicsig_context::SigBlockSource;
 use algo_codec::canonical_encode_transaction;
+use algo_ledger::apply::pool_fixtures::funded_ledger_state;
 use algo_ledger::simulation::{SimulationRequest, Simulator, SimulatorError};
 use algo_ledger::{LedgerState, LedgerStore};
 use algo_types::{AccountData, Address, BlockHeader, LogicSig, SignedTransaction, Transaction};
@@ -67,7 +68,7 @@ fn contract_account_address(program: &[u8]) -> Address {
 /// at round 9 (`SEEDED_TIMESTAMP`), matching `FirstValid=10`'s
 /// `FirstValidTime` lookback target (`block(FirstValid - 1)`).
 fn base_state() -> LedgerState {
-    let mut state = LedgerState::new();
+    let mut state = funded_ledger_state();
     state.fee_sink = FEE_SINK;
     state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
     state.set_account(

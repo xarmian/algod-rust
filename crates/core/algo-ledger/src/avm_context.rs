@@ -5337,6 +5337,21 @@ fn read_txn_field(
 }
 
 impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
+    /// An account's balance as the AVM sees it: go `roundCowState.AccountData`
+    /// (`ledger/eval/applications.go`) is `Get(addr, true)`, the account
+    /// with its pending rewards at the block's rewards level (issue #2118).
+    /// A base at or above the level (only in synthetic test states) has none.
+    fn micro_algos_with_rewards(&self, acct: &algo_types::AccountData) -> u64 {
+        if acct.rewards_base >= self.rewards_level {
+            return acct.micro_algos;
+        }
+        acct.micro_algos
+            .saturating_add(crate::rewards::compute_pending_rewards(
+                acct,
+                self.rewards_level,
+            ))
+    }
+
     /// Compute the fee-credit-aware default fee for a new sub-transaction
     /// being added to `self.inner_building`, and push a fresh
     /// [`InnerTxnBuilder`] pre-populated with it.
@@ -5997,7 +6012,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         Ok(self
             .store
             .get_account(&addr)
-            .map(|a| a.micro_algos)
+            .map(|a| self.micro_algos_with_rewards(&a))
             .unwrap_or(0))
     }
 
@@ -6189,7 +6204,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             Some(acct) => {
                 let val = match field {
                     // AcctBalance
-                    0 => TealValue::Uint(acct.micro_algos),
+                    0 => TealValue::Uint(self.micro_algos_with_rewards(&acct)),
                     // AcctMinBalance
                     1 => TealValue::Uint(self.store.min_balance_with_state(&addr, &acct)),
                     // AcctAuthAddr
