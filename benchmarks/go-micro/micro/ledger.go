@@ -21,6 +21,8 @@
 package micro
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 
 	"github.com/algorand/go-algorand/data/basics"
@@ -53,10 +55,30 @@ func newAppLedger(appID basics.AppIndex, creator basics.Address) *appLedger {
 	}
 }
 
-// resetGlobals drops the global writes of the previous evaluation, so every
-// iteration starts from the same (empty) global state, like the Rust side,
-// whose writes stay in the per-evaluation context delta.
-func (l *appLedger) resetGlobals() { clear(l.globals) }
+// reset restores the starting state of an evaluation: no global state and
+// a zeroed box. Both sides' AVMs write globals and boxes straight into their
+// ledger (go: SetGlobal/SetBox here; Rust: LedgerAvmContext writes into its
+// LedgerState), so both reset at the start of every iteration.
+func (l *appLedger) reset() {
+	clear(l.globals)
+	b := l.boxes[AppBoxName]
+	if len(b) != AppBoxSize {
+		b = make([]byte, AppBoxSize)
+	}
+	clear(b)
+	l.boxes[AppBoxName] = b
+}
+
+// preState describes the state an evaluation starts from (part of the app
+// pair's digest, so a missing reset changes the digest).
+func (l *appLedger) preState() string {
+	box := "none"
+	if b, ok := l.boxes[AppBoxName]; ok {
+		h := sha256.Sum256(b)
+		box = hex.EncodeToString(h[:8])
+	}
+	return fmt.Sprintf("globals=%d,box=%s", len(l.globals), box)
+}
 
 var errNotHere = fmt.Errorf("not available in the micro-benchmark ledger")
 

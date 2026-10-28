@@ -48,6 +48,16 @@ func main() {
 		if err == nil {
 			out[id], err = c.Digest()
 		}
+		if err == nil {
+			// The digest must not drift across benchmark iterations.
+			for i := 0; i < 3; i++ {
+				c.BenchIteration()
+			}
+			var again string
+			if again, err = c.Digest(); err == nil && again != out[id] {
+				err = fmt.Errorf("digest drifts after repeated iterations: %q, fresh %q", again, out[id])
+			}
+		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "equiv: %s: %v\n", id, err)
 			out[id] = "error:" + err.Error()

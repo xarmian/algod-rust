@@ -4,7 +4,7 @@
   "agreement/decode-proposal": "sha256:2ad9927bcfeed39079540e4aa7eee4491e0df1c155a9270892ce3ebb124c8a06",
   "agreement/sortition-select": "weight:20",
   "agreement/sortition-select-f128": "weight:20",
-  "avm/app-state-box": "pass:true;cost:247;logs:dac014c5bfb51c56fad27f028bfd42508d60b3cadba338ca3efe45d016c9f26e,0000000000001f5c",
+  "avm/app-state-box": "pass:true;cost:247;pre:globals=0,box=f5a5fd42d16a2030;gdelta:6b0000000000000000=u1000,6b0000000000000001=u1001,6b0000000000000002=u1002,6b0000000000000003=u1003,6b0000000000000004=u1004,6b0000000000000005=u1005,6b0000000000000006=u1006,6b0000000000000007=u1007;logs:dac014c5bfb51c56fad27f028bfd42508d60b3cadba338ca3efe45d016c9f26e,0000000000001f5c",
   "avm/lsig-arith-loop": "pass:true;cost:12014",
   "avm/lsig-bytes-ops": "pass:true;cost:12757",
   "avm/lsig-hash-loop": "pass:true;cost:13207",

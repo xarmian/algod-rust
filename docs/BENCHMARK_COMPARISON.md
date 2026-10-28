@@ -386,7 +386,7 @@ text form that is the same in both languages. Examples:
 `sha256:<hex>` of the re-encoded bytes for codec pairs, `hex:<digest>` for
 hashes, `valid:<n>/<n>` for signature verification,
 `pass:true;cost:12014` for logicsigs, `weight:16;vrfout:<hex>` for a
-credential.
+credential, and `pass:..;cost:..;pre:..;gdelta:..;logs:..` for the app call.
 
 The tier then:
 
@@ -404,14 +404,35 @@ The tier then:
    `go test -run '^$' -bench '<every go_bench>' -benchmem -count=1`, which
    gives one ns/op per pair. A Rust round is one
    `cargo bench -p algo-bench-pairs --bench pairs -- --noplot`. Its sample
-   for a pair is the median of criterion's per-sample times
-   (`new/sample.json`: time divided by iterations, for every one of the 100
-   samples), read through each benchmark's `new/benchmark.json` `full_id`.
-   It falls back to `estimates.json`'s median. Each side therefore
-   contributes `RUNS` samples, one per interleaved round, which the report
-   turns into the median, the CI and the Rust/Go ratio. The Go B/op and
-   allocs/op, the criterion sample counts, both commands, the fixture and its
-   sha256 and the output digest go to each result's `metadata`.
+   for a pair is criterion's **mean** time per iteration over the whole run,
+   `sum(times) / sum(iters)` from `new/sample.json` (read through each
+   benchmark's `new/benchmark.json` `full_id`). That is the same statistic
+   as Go's ns/op, which is the total timed duration divided by `b.N`, so a
+   round of either side reports a mean. Without a usable `sample.json` the
+   converter falls back to `estimates.json`'s mean point estimate, warns,
+   and records the source in `metadata.sample_source`. The tier fails if a
+   pair's rounds came from different sources. Each side therefore
+   contributes `RUNS` per-round means, one per interleaved round, which the
+   report turns into the median, the CI and the Rust/Go ratio. The Go B/op
+   and allocs/op, criterion's per-sample median, the sample counts, both
+   commands, the fixture and its sha256 and the output digest go to each
+   result's `metadata`.
+
+**Stateful pairs.** `avm/app-state-box` writes global state and a box into
+its in-memory ledger on both sides. Its case therefore has a reset that
+restores the starting state (empty global state, a zeroed box), and every
+benchmark iteration on both sides is reset followed by the operation
+(`BenchIteration` / `bench_iteration`). The reset stays inside the timed
+region on purpose. It is tiny next to the app call: about 30 ns for an
+8-entry map clear and a 64-byte zero, against about 15 µs for the call.
+Go's only way to exclude it, `b.StopTimer` / `b.StartTimer` with
+`ReportAllocs`, runs `runtime.ReadMemStats` twice per iteration, which
+inflated the measured call by about 10-25% and has no criterion
+counterpart. Both sides' app digests include the starting state and the
+global-state delta (`pre:globals=0,box=…;gdelta:…`). Both equivalence checks
+(`cmd/equiv`, `micro-equiv`, `TestDigestsMatchRecorded` and
+`tests/equivalence.rs`) also run every pair three more times and require an
+unchanged digest, so a pair whose iterations drift apart fails the tier.
 
 Knobs: `BENCH_MICRO_FILTER` (a regex on pair ids, for example `^crypto/`),
 `BENCH_MICRO_GO_BENCHTIME` (Go `-benchtime`, default 1s),
@@ -438,7 +459,7 @@ same go-algorand APIs on the shared fixtures.
 | `codec/decode-block-small` | `block-small.msgpack` (round 6 of `algo-codec`'s `block_6.msgpack`, 1 app call) | `protocol.Decode(&bookkeeping.Block)` | `algo_codec::decode_block` |
 | `codec/decode-block-large` | `block-large.msgpack` (1025 txns) | `protocol.Decode(&bookkeeping.Block)` | `algo_codec::decode_block` |
 | `codec/encode-block-small` / `-large` | same | `protocol.Encode(&block)` | `algo_codec::canonical_encode_block` |
-| `codec/decode-stxn` / `encode-stxn` | `stxn-appl.msgpack` (signed app call) | `protocol.Decode` / `Encode` of `transactions.SignedTxn` | `decode_signed_txn_stream` / `canonical_encode_signed_transaction` |
+| `codec/decode-stxn` / `encode-stxn` | `stxn-appl.msgpack` (signed app call) | `protocol.Decode` / `Encode` of `transactions.SignedTxn` | `SignedTransaction::decode_from_reader` (one object, the gossip and payset decoder) / `canonical_encode_signed_transaction` |
 | `codec/txid` | `stxn-appl.msgpack` | `Transaction.ID` | `compute_txn_id` |
 | `codec/block-hash` | `block-large.msgpack` | `BlockHeader.Hash` | `compute_block_digest` |
 | `crypto/sha512_256-32B` / `-1KiB` / `-64KiB` | `bytes-*.bin` | `crypto.Hash` | `sha2::Sha512_256` |
@@ -502,4 +523,9 @@ by changes to `benchmarks/**`, the micro scripts or `algo-bench-pairs`)
 clones the pinned go-algorand, runs `go test -list`, the recorded-digest
 tests, the live equivalence check and `make bench-compare TIERS=micro RUNS=3`
 with short criterion settings, and appends `report.md` to the job summary.
+It also triggers on changes to the production crates the pairs measure
+(`algo-codec`, `algo-avm`, `algo-ledger`, `algo-agreement`,
+`algo-consensus-crypto`, `algo-validate`, `algo-falcon`, `algo-types`,
+`Cargo.lock`) and on the go-algorand pin. For a PR that touches only those,
+it runs the equivalence steps and skips the timing tier.
 CI runners are shared and noisy, so treat those ratios as indicative only.

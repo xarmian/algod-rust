@@ -68,7 +68,7 @@ class GoBenchTest(unittest.TestCase):
 
 
 class CriterionTest(unittest.TestCase):
-    def test_reads_full_ids_and_per_sample_median(self):
+    def test_reads_full_ids_and_per_round_mean(self):
         runs = mc.criterion_runs(os.path.join(TESTDATA, "criterion"))
         self.assertEqual(sorted(runs), ["codec/txid", "crypto/sha512_256-32B"])
         sha = runs["crypto/sha512_256-32B"]
@@ -77,15 +77,30 @@ class CriterionTest(unittest.TestCase):
         with open(os.path.join(TESTDATA, "criterion", "crypto", "sha512_256-32b", "new",
                                "sample.json"), encoding="utf-8") as f:
             s = json.load(f)
-        want = statistics.median(t / i for t, i in zip(s["times"], s["iters"]))
+        # A mean over every timed iteration, like go's ns/op (total time / b.N).
+        want = sum(s["times"]) / sum(s["iters"])
         self.assertAlmostEqual(sha["value"], want)
-        self.assertAlmostEqual(sha["value"], 177.95290282822805)
+        self.assertNotAlmostEqual(
+            sha["value"], statistics.median(t / i for t, i in zip(s["times"], s["iters"])),
+            places=6)
+        self.assertAlmostEqual(sha["median_per_sample"],
+                               statistics.median(t / i for t, i in zip(s["times"], s["iters"])))
         self.assertEqual(sha["total_iterations"], int(sum(s["iters"])))
 
-    def test_falls_back_to_estimates_median(self):
+    def test_falls_back_to_estimates_mean_and_says_so(self):
         runs = mc.criterion_runs(os.path.join(TESTDATA, "criterion"))
-        self.assertEqual(runs["codec/txid"]["source"], "estimates.json")
-        self.assertAlmostEqual(runs["codec/txid"]["value"], 2734.8506289308175)
+        txid = runs["codec/txid"]
+        self.assertEqual(txid["source"], "estimates.json")
+        with open(os.path.join(TESTDATA, "criterion", "codec", "txid", "new",
+                               "estimates.json"), encoding="utf-8") as f:
+            e = json.load(f)
+        self.assertAlmostEqual(txid["value"], e["mean"]["point_estimate"])
+
+    def test_sources_must_not_mix_across_rounds(self):
+        self.assertIsNone(mc.mixed_source_error("a/x", ["sample.json"] * 3))
+        err = mc.mixed_source_error("a/x", ["sample.json", "estimates.json", "sample.json"])
+        self.assertIn("a/x", err)
+        self.assertIn("estimates.json", err)
 
     def test_ignores_base_and_incomplete_dirs(self):
         d = tempfile.mkdtemp()

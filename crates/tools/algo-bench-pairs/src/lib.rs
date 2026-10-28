@@ -36,9 +36,11 @@
 //!   differs from Go's; `tests/equivalence.rs` checks them against the
 //!   Go-recorded `benchmarks/fixtures/micro/go-digests.json`.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use serde::Deserialize;
 use serde_bytes::ByteBuf;
@@ -48,7 +50,7 @@ use algo_agreement::codec::{
     decode_bundle, decode_compound_message, encode_bundle, encode_compound_message,
 };
 use algo_agreement::{Membership, Period, Seed, Selector, Step, UnauthenticatedCredential};
-use algo_avm::eval::{run_approval_program, run_logicsig_program};
+use algo_avm::eval::{run_approval_program, run_logicsig_program, AvmResult};
 use algo_avm::logicsig_context::LogicSigAvmContext;
 use algo_avm::GroupBudget;
 use algo_codec::{
@@ -58,7 +60,7 @@ use algo_codec::{
 use algo_ledger::{LedgerAvmContext, LedgerState};
 use algo_types::{
     consensus_params_for_version, Address, AppParams, Block, BoxRef, ConsensusParams, LogicSig,
-    Round, SignedTransaction, StateSchema, Transaction, CONSENSUS_CURRENT_VERSION,
+    Round, SignedTransaction, StateSchema, TealValue, Transaction, CONSENSUS_CURRENT_VERSION,
 };
 use algo_validate::merkle::{compute_payset_merkle_root, compute_vector_commitment, HashAlgo};
 use algo_validate::verify_single_sig;
@@ -116,17 +118,47 @@ pub struct Case {
     pub id: &'static str,
     op: Box<dyn FnMut()>,
     digest: Box<dyn FnMut() -> Result<String>>,
+    /// Restores the starting state of a stateful pair (only
+    /// `avm/app-state-box`). Every benchmark iteration on both sides is
+    /// reset + operation; see [`Case::bench_iteration`].
+    reset: Option<Box<dyn FnMut()>>,
 }
 
 impl Case {
-    /// Run the measured operation once. Panics if it fails: a failing
-    /// benchmark measures nothing.
+    /// Run the measured operation once (no reset). Panics if it fails: a
+    /// failing benchmark measures nothing.
     pub fn run(&mut self) {
         (self.op)()
     }
 
-    /// Run the operation once and describe its output.
+    /// Whether this case has per-iteration state to restore.
+    pub fn has_reset(&self) -> bool {
+        self.reset.is_some()
+    }
+
+    /// Restore the case's starting state (no-op for stateless cases).
+    pub fn reset(&mut self) {
+        if let Some(r) = self.reset.as_mut() {
+            r()
+        }
+    }
+
+    /// One benchmark iteration exactly as both sides time it: reset, then
+    /// the operation. The reset is inside the timed region on purpose, on
+    /// both sides: it is tiny (an 8-entry map clear and a 64-byte zero)
+    /// next to the ~15 us app call, while go's only way to exclude it,
+    /// `b.StopTimer`/`StartTimer` with `ReportAllocs`, runs
+    /// `runtime.ReadMemStats` twice per iteration and inflated the measured
+    /// call by ~10-25%.
+    pub fn bench_iteration(&mut self) {
+        self.reset();
+        self.run();
+    }
+
+    /// Evaluate once the way a benchmark iteration does (reset, then the
+    /// operation) and describe its output.
     pub fn digest(&mut self) -> Result<String> {
+        self.reset();
         (self.digest)()
     }
 }
@@ -146,6 +178,7 @@ pub fn build(dir: &Path, id: &str) -> Result<Case> {
         .copied()
         .find(|i| *i == id)
         .ok_or_else(|| format!("unknown pair {id:?}"))?;
+    let mut reset: Option<Box<dyn FnMut()>> = None;
     let (op, digest) = match id {
         "codec/decode-block-small" => decode_block_case(dir, "block-small.msgpack")?,
         "codec/decode-block-large" => decode_block_case(dir, "block-large.msgpack")?,
@@ -168,7 +201,11 @@ pub fn build(dir: &Path, id: &str) -> Result<Case> {
         "avm/lsig-arith-loop" => lsig_case(dir, "avm-arith.bin")?,
         "avm/lsig-hash-loop" => lsig_case(dir, "avm-hash.bin")?,
         "avm/lsig-bytes-ops" => lsig_case(dir, "avm-bytes.bin")?,
-        "avm/app-state-box" => app_case(dir, "avm-app.bin")?,
+        "avm/app-state-box" => {
+            let (op, digest, r) = app_case(dir, "avm-app.bin")?;
+            reset = r;
+            (op, digest)
+        }
         "agreement/sortition-select" => sortition_case(dir, false)?,
         "agreement/sortition-select-f128" => sortition_case(dir, true)?,
         "agreement/credential-verify" => credential_case(dir)?,
@@ -176,15 +213,34 @@ pub fn build(dir: &Path, id: &str) -> Result<Case> {
         "agreement/decode-proposal" => decode_proposal_case(dir)?,
         _ => return Err(format!("pair {id:?} has no Rust case")),
     };
-    Ok(Case { id, op, digest })
+    Ok(Case {
+        id,
+        op,
+        digest,
+        reset,
+    })
 }
 
-/// Every pair's digest, keyed by id (what `micro-equiv` prints).
+/// Every pair's digest, keyed by id (what `micro-equiv` prints). A pair whose
+/// digest changes after a few benchmark iterations reports `error:`.
 pub fn all_digests(dir: &Path) -> BTreeMap<String, String> {
     IDS.iter()
         .map(|id| {
             let d = build(dir, id)
-                .and_then(|mut c| c.digest())
+                .and_then(|mut c| {
+                    let fresh = c.digest()?;
+                    // The digest must not drift across benchmark iterations.
+                    for _ in 0..3 {
+                        c.bench_iteration();
+                    }
+                    let again = c.digest()?;
+                    if again != fresh {
+                        return Err(format!(
+                            "digest drifts after repeated iterations: {again:?}, fresh {fresh:?}"
+                        ));
+                    }
+                    Ok(fresh)
+                })
                 .unwrap_or_else(|e| format!("error:{e}"));
             (id.to_string(), d)
         })
@@ -281,18 +337,31 @@ fn encode_block_case(dir: &Path, file: &'static str) -> Result<Pair> {
     ))
 }
 
+/// Decode exactly one msgpack `SignedTransaction`, the way the gossip
+/// transaction handler and the in-block payset decoder do
+/// (`SignedTransaction::decode_from_reader`); the counterpart of go's
+/// `protocol.Decode(b, &transactions.SignedTxn{})`, which also rejects
+/// trailing bytes.
+pub fn decode_one_stxn(data: &[u8]) -> Result<SignedTransaction> {
+    let mut rd = data;
+    let s = SignedTransaction::decode_from_reader(&mut rd).map_err(|e| e.to_string())?;
+    if !rd.is_empty() {
+        return Err(format!("{} trailing bytes after the transaction", rd.len()));
+    }
+    Ok(s)
+}
+
 fn decode_stxn_case(dir: &Path) -> Result<Pair> {
     let data = read(dir, "stxn-appl.msgpack")?;
-    load_stxn(dir)?;
+    decode_one_stxn(&data)?;
     let d2 = data.clone();
     Ok((
         Box::new(move || {
-            black_box(decode_signed_txn_stream(black_box(&data)).expect("decode stxn"));
+            black_box(decode_one_stxn(black_box(&data)).expect("decode stxn"));
         }),
         Box::new(move || {
-            let v = decode_signed_txn_stream(&d2).map_err(|e| e.to_string())?;
-            let s = v.first().ok_or("no transaction")?;
-            Ok(sha256_hex(&canonical_encode_signed_transaction(s)))
+            let s = decode_one_stxn(&d2)?;
+            Ok(sha256_hex(&canonical_encode_signed_transaction(&s)))
         }),
     ))
 }
@@ -481,6 +550,12 @@ pub fn lsig_group(program: &[u8]) -> Vec<SignedTransaction> {
 
 /// Evaluate `program` as the logicsig of `group[0]` the way
 /// `algo_validate::verify_logicsig` does: returns (pass, opcode cost).
+///
+/// `LogicSigAvmContext::new` takes `ConsensusParams` by value (including
+/// its `approved_upgrades` map), so production (`signature.rs`,
+/// `consensus.clone()`) clones it on every logicsig evaluation; the clone
+/// stays in the timed body on purpose, as a real algod-rust cost (perf note
+/// for #2110 in #2114). go-algorand's `NewSigEvalParams` takes `&proto`.
 pub fn eval_lsig(
     group: &[SignedTransaction],
     program: &[u8],
@@ -532,12 +607,48 @@ pub fn app_group() -> Vec<SignedTransaction> {
 }
 
 /// Evaluates the app program against an in-memory `LedgerState` holding the
-/// application and its pre-existing box (Go: `micro.AppRunner`).
+/// application and its box (Go: `micro.AppRunner`).
+///
+/// `LedgerAvmContext::app_global_put` / `box_put` write straight into the
+/// store, so every evaluation leaves global state and the box behind.
+/// [`AppRunner::reset`] restores the starting state (empty global state, a
+/// zeroed box) and every benchmark iteration starts with it
+/// ([`Case::bench_iteration`]), exactly like the Go side's `Reset`.
 pub struct AppRunner {
     program: Vec<u8>,
     proto: ConsensusParams,
     group: Vec<SignedTransaction>,
     store: LedgerState,
+}
+
+/// One evaluation of the app pair, in the shared digest vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppOutcome {
+    /// Program approved.
+    pub pass: bool,
+    /// Opcode cost consumed.
+    pub cost: i64,
+    /// `globals=<n>,box=<sha256 prefix>`: the ledger state the evaluation
+    /// started from.
+    pub pre: String,
+    /// The global-state delta, `<hex key>=u<n>|b<hex>|del`, sorted by key.
+    pub gdelta: String,
+    /// Logs, hex.
+    pub logs: Vec<String>,
+}
+
+impl AppOutcome {
+    /// The pair's digest (same format as the Go side's).
+    pub fn digest(&self) -> String {
+        format!(
+            "pass:{};cost:{};pre:{};gdelta:{};logs:{}",
+            self.pass,
+            self.cost,
+            self.pre,
+            self.gdelta,
+            self.logs.join(",")
+        )
+    }
 }
 
 impl AppRunner {
@@ -567,9 +678,46 @@ impl AppRunner {
         })
     }
 
-    /// Evaluate once, as `algo_ledger::apply` does for a top-level app
-    /// call: returns (pass, opcode cost, logs as hex).
-    pub fn run(&mut self) -> Result<(bool, i64, Vec<String>)> {
+    /// Restore the starting state: no global state, a zeroed box.
+    pub fn reset(&mut self) {
+        if let Some(p) = self.store.app_params.get_mut(&APP_ID) {
+            p.global_state.clear();
+        }
+        let b = self
+            .store
+            .boxes
+            .entry((APP_ID, APP_BOX_NAME.to_vec()))
+            .or_default();
+        b.clear();
+        b.resize(APP_BOX_SIZE, 0);
+    }
+
+    fn pre_state(&self) -> String {
+        let globals = self
+            .store
+            .app_params
+            .get(&APP_ID)
+            .map_or(0, |p| p.global_state.len());
+        let bx = self
+            .store
+            .boxes
+            .get(&(APP_ID, APP_BOX_NAME.to_vec()))
+            .map(|b| hex::encode(&Sha256::digest(b)[..8]))
+            .unwrap_or_else(|| "none".into());
+        format!("globals={globals},box={bx}")
+    }
+
+    /// Evaluate once, as `algo_ledger::apply` does for a top-level app call,
+    /// from whatever state the store is in: the measured operation, no
+    /// digest bookkeeping. Returns the AVM result and the opcode cost.
+    ///
+    /// `LedgerAvmContext::new` takes the group and the consensus params by
+    /// value, so production (`apply.rs`, which builds the group with
+    /// `build_avm_group` and passes `ctx.consensus.clone()`) pays both
+    /// clones on every app call; they stay in the timed body on purpose
+    /// (perf note for #2110 in #2114). go-algorand's `NewAppEvalParams`
+    /// copies the group too (`copyWithClearAD`) but takes `&proto`.
+    pub fn eval(&mut self) -> Result<(AvmResult, i64)> {
         let mut ctx = LedgerAvmContext::new(
             &mut self.store,
             self.group.clone(),
@@ -590,11 +738,38 @@ impl AppRunner {
         let before = budget.remaining();
         let r = run_approval_program(&self.program, &mut ctx, &mut budget)
             .map_err(|e| e.to_string())?;
-        if let Some(e) = r.error {
-            return Err(e);
+        if let Some(e) = &r.error {
+            return Err(e.clone());
         }
-        let logs = r.logs.iter().map(hex::encode).collect();
-        Ok((r.approved, before - budget.remaining(), logs))
+        let cost = before - budget.remaining();
+        Ok((r, cost))
+    }
+
+    /// Evaluate once and describe the evaluation, including the state it
+    /// started from.
+    pub fn run(&mut self) -> Result<AppOutcome> {
+        let pre = self.pre_state();
+        let (r, cost) = self.eval()?;
+        let mut gdelta: Vec<String> = r
+            .global_delta
+            .iter()
+            .map(|(k, v)| {
+                let v = match v {
+                    Some(TealValue::Uint(u)) => format!("u{u}"),
+                    Some(TealValue::Bytes(b)) => format!("b{}", hex::encode(b)),
+                    None => "del".into(),
+                };
+                format!("{}={v}", hex::encode(k))
+            })
+            .collect();
+        gdelta.sort();
+        Ok(AppOutcome {
+            pass: r.approved,
+            cost,
+            pre,
+            gdelta: gdelta.join(","),
+            logs: r.logs.iter().map(hex::encode).collect(),
+        })
     }
 }
 
@@ -605,19 +780,25 @@ fn program_hash(program: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
-fn app_case(dir: &Path, file: &str) -> Result<Pair> {
-    let program = read(dir, file)?;
-    let mut r1 = AppRunner::new(program.clone())?;
-    let mut r2 = AppRunner::new(program)?;
+type AppPair = (
+    Box<dyn FnMut()>,
+    Box<dyn FnMut() -> Result<String>>,
+    Option<Box<dyn FnMut()>>,
+);
+
+fn app_case(dir: &Path, file: &str) -> Result<AppPair> {
+    // One runner shared by the op, the digest and the reset, so the
+    // digest sees whatever state the benchmark iterations left behind.
+    let runner = Rc::new(RefCell::new(AppRunner::new(read(dir, file)?)?));
+    let (r_op, r_digest, r_reset) = (runner.clone(), runner.clone(), runner);
     Ok((
         Box::new(move || {
-            let (pass, _, _) = r1.run().expect("app eval");
-            assert!(pass, "app call rejected");
+            let (r, _) = r_op.borrow_mut().eval().expect("app eval");
+            assert!(r.approved, "app call rejected");
+            black_box(r);
         }),
-        Box::new(move || {
-            let (pass, cost, logs) = r2.run()?;
-            Ok(format!("pass:{pass};cost:{cost};logs:{}", logs.join(",")))
-        }),
+        Box::new(move || Ok(r_digest.borrow_mut().run()?.digest())),
+        Some(Box::new(move || r_reset.borrow_mut().reset())),
     ))
 }
 

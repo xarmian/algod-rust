@@ -40,11 +40,11 @@ func run(b *testing.B, id string) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	c.Op() // fail fast (it panics) before timing
+	c.BenchIteration() // fail fast (it panics) before timing
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		c.Op()
+		c.BenchIteration() // Reset (stateful pairs only) + Op, as on the Rust side
 	}
 }
 
@@ -107,6 +107,19 @@ func TestDigestsMatchRecorded(t *testing.T) {
 		}
 		if got != want[id] {
 			t.Errorf("%s: digest %q, recorded %q", id, got, want[id])
+		}
+		// Every benchmark iteration must do the same work: after N
+		// iterations exactly as the benchmark runs them, the digest must
+		// still be the fresh one (catches state leaking between iterations).
+		for i := 0; i < 3; i++ {
+			c.BenchIteration()
+		}
+		again, err := c.Digest()
+		if err != nil {
+			t.Fatalf("%s: %v", id, err)
+		}
+		if again != got {
+			t.Errorf("%s: digest drifts after repeated iterations: %q, fresh %q", id, again, got)
 		}
 	}
 }

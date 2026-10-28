@@ -11,8 +11,9 @@
   ns/op, B/op, allocs/op samples (one per -count repetition).
 * criterion_runs(): a criterion output directory ($CRITERION_HOME or
   target/criterion) -> per-benchmark summary of one `cargo bench` run: the
-  median of the per-sample times in new/sample.json (time / iterations of
-  every sample), falling back to new/estimates.json's median.
+  mean time per iteration over all of new/sample.json (sum(times) /
+  sum(iters)), the statistic go's ns/op also is, falling back (loudly) to
+  new/estimates.json's mean.
 * compare_digests(): the per-pair output-equivalence check.
 * make_result(): one schema-v1 result object.
 
@@ -24,6 +25,7 @@ import json
 import os
 import re
 import statistics
+import sys
 
 PAIR_KEYS = ("id", "unit", "go_package", "go_bench", "go_api", "rust_bench",
              "rust_api", "fixture", "fixture_sha256")
@@ -178,20 +180,41 @@ def _read_json(path):
 
 
 def criterion_summary(new_dir):
-    """Summarise one criterion run of one benchmark (its `new/` directory)."""
+    """Summarise one criterion run of one benchmark (its `new/` directory).
+
+    `value` is a MEAN per iteration over the whole run, sum(times) /
+    sum(iters) from new/sample.json, the same statistic as go's ns/op
+    (total timed duration / b.N), so a round of either side reports a mean.
+    The per-sample median is kept as `median_per_sample` for reference.
+    Without sample.json it falls back to estimates.json's mean point
+    estimate, prints a warning and says so in `source`; the tier refuses to
+    mix sources across rounds (mixed_source_error)."""
     sample = os.path.join(new_dir, "sample.json")
     if os.path.isfile(sample):
         s = _read_json(sample)
         iters, times = s.get("iters") or [], s.get("times") or []
-        per_iter = [t / i for t, i in zip(times, iters) if i]
-        if per_iter:
-            return {"value": statistics.median(per_iter), "source": "sample.json",
-                    "samples": len(per_iter), "sampling_mode": s.get("sampling_mode"),
-                    "total_iterations": sum(int(i) for i in iters)}
+        pairs = [(t, i) for t, i in zip(times, iters) if i]
+        if pairs:
+            return {"value": sum(t for t, _ in pairs) / sum(i for _, i in pairs),
+                    "source": "sample.json",
+                    "median_per_sample": statistics.median(t / i for t, i in pairs),
+                    "samples": len(pairs), "sampling_mode": s.get("sampling_mode"),
+                    "total_iterations": sum(int(i) for _, i in pairs)}
     est = os.path.join(new_dir, "estimates.json")
     if os.path.isfile(est):
         e = _read_json(est)
-        return {"value": float(e["median"]["point_estimate"]), "source": "estimates.json"}
+        print(f"micro: WARNING: {new_dir}: no usable sample.json, using estimates.json's "
+              f"mean point estimate", file=sys.stderr)
+        return {"value": float(e["mean"]["point_estimate"]), "source": "estimates.json"}
+    return None
+
+
+def mixed_source_error(pair_id, sources):
+    """An error message when one pair's rounds came from different criterion
+    files (sample.json vs estimates.json), else None."""
+    if len(set(sources)) > 1:
+        return (f"{pair_id}: criterion sample sources differ across rounds "
+                f"{sources}; refusing to mix statistics")
     return None
 
 

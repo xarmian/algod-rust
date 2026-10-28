@@ -78,8 +78,34 @@ type Case struct {
 	// Op runs the measured operation once. It panics if the operation
 	// fails, since a failing benchmark measures nothing.
 	Op func()
-	// Digest runs the operation once and describes its output.
-	Digest func() (string, error)
+	// Describe runs the operation once and describes its output.
+	Describe func() (string, error)
+	// Reset, when non-nil, restores the starting state of a stateful pair
+	// (only avm/app-state-box). Every benchmark iteration on both sides is
+	// Reset + Op (see BenchIteration).
+	Reset func()
+}
+
+// BenchIteration is one benchmark iteration exactly as both sides time it:
+// Reset, then Op. The reset stays inside the timed region on purpose: it is
+// tiny (an 8-entry map clear and a 64-byte zero, ~30 ns against ~15 us for
+// the app call), whereas b.StopTimer/StartTimer with ReportAllocs runs
+// runtime.ReadMemStats (stop the world) twice per iteration, which made the
+// measured app call ~15-25% slower and has no criterion counterpart.
+func (c *Case) BenchIteration() {
+	if c.Reset != nil {
+		c.Reset()
+	}
+	c.Op()
+}
+
+// Digest evaluates once the way a benchmark iteration does (Reset, then
+// the operation) and describes the output.
+func (c *Case) Digest() (string, error) {
+	if c.Reset != nil {
+		c.Reset()
+	}
+	return c.Describe()
 }
 
 type builder func(dir string) (*Case, error)
@@ -242,7 +268,7 @@ func decodeBlock(file string) builder {
 				mustNoErr(protocol.Decode(data, &blk))
 				sinkU64 = uint64(blk.Round())
 			},
-			Digest: func() (string, error) {
+			Describe: func() (string, error) {
 				var blk bookkeeping.Block
 				if err := protocol.Decode(data, &blk); err != nil {
 					return "", err
@@ -260,8 +286,8 @@ func encodeBlock(file string) builder {
 			return nil, err
 		}
 		return &Case{
-			Op:     func() { sinkBytes = protocol.Encode(&blk) },
-			Digest: func() (string, error) { return sha256Hex(protocol.Encode(&blk)), nil },
+			Op:       func() { sinkBytes = protocol.Encode(&blk) },
+			Describe: func() (string, error) { return sha256Hex(protocol.Encode(&blk)), nil },
 		}, nil
 	}
 }
@@ -287,7 +313,7 @@ func decodeStxn(dir string) (*Case, error) {
 			mustNoErr(protocol.Decode(data, &s))
 			sinkU64 = s.Txn.Fee.Raw
 		},
-		Digest: func() (string, error) {
+		Describe: func() (string, error) {
 			var s transactions.SignedTxn
 			if err := protocol.Decode(data, &s); err != nil {
 				return "", err
@@ -303,8 +329,8 @@ func encodeStxn(dir string) (*Case, error) {
 		return nil, err
 	}
 	return &Case{
-		Op:     func() { sinkBytes = protocol.Encode(&s) },
-		Digest: func() (string, error) { return sha256Hex(protocol.Encode(&s)), nil },
+		Op:       func() { sinkBytes = protocol.Encode(&s) },
+		Describe: func() (string, error) { return sha256Hex(protocol.Encode(&s)), nil },
 	}, nil
 }
 
@@ -318,7 +344,7 @@ func txid(dir string) (*Case, error) {
 			id := s.Txn.ID()
 			sinkDigest = id
 		},
-		Digest: func() (string, error) {
+		Describe: func() (string, error) {
 			id := s.Txn.ID()
 			return "hex:" + hex.EncodeToString(id[:]), nil
 		},
@@ -335,7 +361,7 @@ func blockHash(dir string) (*Case, error) {
 			h := blk.BlockHeader.Hash()
 			sinkDigest = h
 		},
-		Digest: func() (string, error) {
+		Describe: func() (string, error) {
 			h := blk.BlockHeader.Hash()
 			return "hex:" + hex.EncodeToString(h[:]), nil
 		},
@@ -355,7 +381,7 @@ func sha512256(file string) builder {
 				h := crypto.Hash(data)
 				sinkDigest = h
 			},
-			Digest: func() (string, error) {
+			Describe: func() (string, error) {
 				h := crypto.Hash(data)
 				return "hex:" + hex.EncodeToString(h[:]), nil
 			},
@@ -375,7 +401,7 @@ func ed25519Verify(dir string) (*Case, error) {
 				panic("signature does not verify")
 			}
 		},
-		Digest: func() (string, error) { return fmt.Sprintf("valid:%t", verify()), nil },
+		Describe: func() (string, error) { return fmt.Sprintf("valid:%t", verify()), nil },
 	}, nil
 }
 
@@ -401,7 +427,7 @@ func ed25519Batch(file string) builder {
 				_, err := run()
 				mustNoErr(err)
 			},
-			Digest: func() (string, error) {
+			Describe: func() (string, error) {
 				failed, err := run()
 				if err != nil && !errors.Is(err, crypto.ErrBatchHasFailedSigs) {
 					return "", err
@@ -443,7 +469,7 @@ func vrfVerify(dir string) (*Case, error) {
 			}
 			sinkVrf = out
 		},
-		Digest: func() (string, error) {
+		Describe: func() (string, error) {
 			ok, out := pk.Verify(proof, alpha)
 			if !ok {
 				return "vrf:invalid", nil
@@ -470,8 +496,8 @@ func falconVerify(dir string) (*Case, error) {
 	sig := crypto.FalconSignature(f[1])
 	msg := f[2]
 	return &Case{
-		Op:     func() { mustNoErr(v.VerifyBytes(msg, sig)) },
-		Digest: func() (string, error) { return fmt.Sprintf("valid:%t", v.VerifyBytes(msg, sig) == nil), nil },
+		Op:       func() { mustNoErr(v.VerifyBytes(msg, sig)) },
+		Describe: func() (string, error) { return fmt.Sprintf("valid:%t", v.VerifyBytes(msg, sig) == nil), nil },
 	}, nil
 }
 
@@ -495,7 +521,7 @@ func txnMerkle(dir string) (*Case, error) {
 			mustNoErr(err)
 			sinkBytes = r
 		},
-		Digest: func() (string, error) {
+		Describe: func() (string, error) {
 			r, err := root()
 			return "hex:" + hex.EncodeToString(r), err
 		},
@@ -520,7 +546,7 @@ func txnVectorCommitment(dir string) (*Case, error) {
 			mustNoErr(err)
 			sinkBytes = r
 		},
-		Digest: func() (string, error) {
+		Describe: func() (string, error) {
 			r, err := root()
 			return "hex:" + hex.EncodeToString(r), err
 		},
@@ -590,7 +616,7 @@ func lsig(file string) builder {
 				}
 				sinkBool = pass
 			},
-			Digest: func() (string, error) {
+			Describe: func() (string, error) {
 				pass, cost, err := EvalLsig(group, &proto)
 				if err != nil {
 					return "", err
@@ -620,13 +646,32 @@ func AppGroup() []transactions.SignedTxnWithAD {
 	}}}
 }
 
-// AppRunner evaluates the app program against a fresh in-memory ledger
-// state (the box exists, global state is empty).
+// AppRunner evaluates the app program against an in-memory ledger holding
+// the application and its box. go-algorand's logic writes globals and boxes
+// straight into the ledger (SetGlobal, SetBox), so every evaluation leaves
+// state behind; Reset restores the starting state (empty global state, a
+// zeroed box) and every benchmark iteration starts with it, exactly like the
+// Rust side.
 type AppRunner struct {
 	program []byte
 	proto   config.ConsensusParams
 	group   []transactions.SignedTxnWithAD
 	ledger  *appLedger
+}
+
+// AppOutcome is one evaluation of the app pair.
+type AppOutcome struct {
+	Pass   bool
+	Cost   int
+	Pre    string // globals=<n>,box=<sha256 prefix>: the starting state
+	GDelta string // <hex key>=u<n>|b<hex>|del, sorted by key
+	Logs   []string
+}
+
+// Digest is the pair's digest (same format as the Rust side's).
+func (o AppOutcome) Digest() string {
+	return fmt.Sprintf("pass:%t;cost:%d;pre:%s;gdelta:%s;logs:%s", o.Pass, o.Cost, o.Pre, o.GDelta,
+		strings.Join(o.Logs, ","))
 }
 
 // NewAppRunner prepares program for repeated evaluation.
@@ -636,20 +681,48 @@ func NewAppRunner(program []byte) *AppRunner {
 	return &AppRunner{program: program, proto: CurrentProto(), group: AppGroup(), ledger: l}
 }
 
-// Run evaluates the program once.
-func (r *AppRunner) Run() (pass bool, cost int, logs []string, err error) {
-	r.ledger.resetGlobals()
+// Reset restores the starting state: no global state, a zeroed box.
+func (r *AppRunner) Reset() { r.ledger.reset() }
+
+// eval evaluates the program once, from whatever state the ledger is in.
+// It is the measured operation: no digest bookkeeping.
+func (r *AppRunner) eval() (bool, *logic.EvalContext, *logic.EvalParams, error) {
 	ep := logic.NewAppEvalParams(r.group, &r.proto, &transactions.SpecialAddresses{})
 	ep.Ledger = r.ledger
 	ep.SigLedger = logic.NoHeaderLedger{}
 	pass, cx, err := logic.EvalContract(r.program, 0, AppID, ep)
+	return pass, cx, ep, err
+}
+
+// Run evaluates the program once and describes the evaluation, including
+// the state it started from.
+func (r *AppRunner) Run() (AppOutcome, error) {
+	o := AppOutcome{Pre: r.ledger.preState()}
+	pass, cx, ep, err := r.eval()
+	o.Pass = pass
 	if cx != nil {
-		cost = cx.Cost()
+		o.Cost = cx.Cost()
 	}
-	for _, l := range ep.TxnGroup[0].EvalDelta.Logs {
-		logs = append(logs, hex.EncodeToString([]byte(l)))
+	ed := ep.TxnGroup[0].EvalDelta
+	for _, l := range ed.Logs {
+		o.Logs = append(o.Logs, hex.EncodeToString([]byte(l)))
 	}
-	return pass, cost, logs, err
+	var gd []string
+	for k, v := range ed.GlobalDelta {
+		var val string
+		switch v.Action {
+		case basics.SetUintAction:
+			val = fmt.Sprintf("u%d", v.Uint)
+		case basics.SetBytesAction:
+			val = "b" + hex.EncodeToString([]byte(v.Bytes))
+		default:
+			val = "del"
+		}
+		gd = append(gd, hex.EncodeToString([]byte(k))+"="+val)
+	}
+	sort.Strings(gd)
+	o.GDelta = strings.Join(gd, ",")
+	return o, err
 }
 
 func app(file string) builder {
@@ -661,20 +734,21 @@ func app(file string) builder {
 		r := NewAppRunner(program)
 		return &Case{
 			Op: func() {
-				pass, _, _, err := r.Run()
+				pass, _, _, err := r.eval()
 				mustNoErr(err)
 				if !pass {
 					panic("app call rejected")
 				}
 				sinkBool = pass
 			},
-			Digest: func() (string, error) {
-				pass, cost, logs, err := r.Run()
+			Describe: func() (string, error) {
+				o, err := r.Run()
 				if err != nil {
 					return "", err
 				}
-				return fmt.Sprintf("pass:%t;cost:%d;logs:%s", pass, cost, strings.Join(logs, ",")), nil
+				return o.Digest(), nil
 			},
+			Reset: r.Reset,
 		}, nil
 	}
 }
@@ -712,8 +786,8 @@ func sortitionSelect(f128 bool) builder {
 			return sortition.Select(in.Money, in.TotalMoney, float64(in.ExpectedSize), d)
 		}
 		return &Case{
-			Op:     func() { sinkU64 = sel() },
-			Digest: func() (string, error) { return fmt.Sprintf("weight:%d", sel()), nil },
+			Op:       func() { sinkU64 = sel() },
+			Describe: func() (string, error) { return fmt.Sprintf("weight:%d", sel()), nil },
 		}, nil
 	}
 }
@@ -792,7 +866,7 @@ func credentialVerify(dir string) (*Case, error) {
 			mustNoErr(err)
 			sinkU64 = c.Weight
 		},
-		Digest: func() (string, error) {
+		Describe: func() (string, error) {
 			c, err := cred.Verify(proto, m)
 			if err != nil {
 				return "credential:invalid", nil
@@ -813,7 +887,7 @@ func decodeCert(dir string) (*Case, error) {
 			mustNoErr(protocol.Decode(data, &c))
 			sinkU64 = uint64(c.Round)
 		},
-		Digest: func() (string, error) {
+		Describe: func() (string, error) {
 			var c agreement.Certificate
 			if err := protocol.Decode(data, &c); err != nil {
 				return "", err
@@ -834,7 +908,7 @@ func decodeProposal(dir string) (*Case, error) {
 			mustNoErr(protocol.Decode(data, &p))
 			sinkU64 = uint64(p.Round())
 		},
-		Digest: func() (string, error) {
+		Describe: func() (string, error) {
 			var p agreement.TransmittedPayload
 			if err := protocol.Decode(data, &p); err != nil {
 				return "", err

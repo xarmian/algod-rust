@@ -22,7 +22,7 @@ anywhere. That checkout must sit on the pinned tag
 needs go-algorand's vendored libsodium, which is built with `make
 libsodium` when missing.
 
-Usage: python3 scripts/bench/micro_equiv.py [--go-algorand DIR]
+Usage: python3 scripts/bench/micro_equiv.py [--go-algorand DIR] [--write-go-work DIR]
 """
 import argparse
 import json
@@ -139,7 +139,14 @@ def check(ids, go, rust, out=sys.stdout):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--go-algorand", default=default_go_algorand())
+    ap.add_argument("--write-go-work", metavar="DIR",
+                    help="only write DIR/go.work (benchmarks/go-micro against --go-algorand, "
+                         "go directive from its go.mod), print its path and exit")
     args = ap.parse_args(argv)
+    if args.write_go_work:
+        os.makedirs(args.write_go_work, exist_ok=True)
+        print(go_env(os.path.abspath(args.go_algorand), os.path.abspath(args.write_go_work))["GOWORK"])
+        return 0
     reg = mc.load_registry(REGISTRY)
     fixture_dir = os.path.join(REPO, reg["fixture_dir"])
     errors = mc.check_fixtures(reg, REPO)

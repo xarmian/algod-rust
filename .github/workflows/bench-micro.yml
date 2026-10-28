@@ -10,7 +10,9 @@ name: Bench Micro Pairs
 # `go test -list` check, the Go-recorded digests, the live Go/Rust output-
 # equivalence check (fails on any differing pair), then a short
 # `make bench-compare TIERS=micro RUNS=3` whose report.md goes to the job
-# summary. CI runners are noisy: the ratios are indicative only.
+# summary. CI runners are noisy: the ratios are indicative only. A PR that
+# only touches the production crates runs the equivalence steps but skips
+# the (slow, noisy) timing tier.
 
 on:
   pull_request:
@@ -19,8 +21,21 @@ on:
       - "scripts/bench/tiers/micro*"
       - "scripts/bench/micro_*.py"
       - "scripts/bench/test_pairs.py"
+      - "scripts/bench/go-algorand.pin"
       - "crates/tools/algo-bench-pairs/**"
       - ".github/workflows/bench-micro.yml"
+      # The production code the pairs measure: a change there must keep
+      # both sides' outputs equal (the equivalence steps always run; the
+      # timing tier only for micro-tier changes, see the gate step).
+      - "crates/core/algo-codec/**"
+      - "crates/core/algo-avm/**"
+      - "crates/core/algo-ledger/**"
+      - "crates/core/algo-agreement/**"
+      - "crates/core/algo-consensus-crypto/**"
+      - "crates/core/algo-validate/**"
+      - "crates/core/algo-falcon/**"
+      - "crates/core/algo-types/**"
+      - "Cargo.lock"
   push:
     branches: [main]
     paths:
@@ -28,8 +43,21 @@ on:
       - "scripts/bench/tiers/micro*"
       - "scripts/bench/micro_*.py"
       - "scripts/bench/test_pairs.py"
+      - "scripts/bench/go-algorand.pin"
       - "crates/tools/algo-bench-pairs/**"
       - ".github/workflows/bench-micro.yml"
+      # The production code the pairs measure: a change there must keep
+      # both sides' outputs equal (the equivalence steps always run; the
+      # timing tier only for micro-tier changes, see the gate step).
+      - "crates/core/algo-codec/**"
+      - "crates/core/algo-avm/**"
+      - "crates/core/algo-ledger/**"
+      - "crates/core/algo-agreement/**"
+      - "crates/core/algo-consensus-crypto/**"
+      - "crates/core/algo-validate/**"
+      - "crates/core/algo-falcon/**"
+      - "crates/core/algo-types/**"
+      - "Cargo.lock"
   workflow_dispatch:
 
 permissions:
@@ -44,6 +72,22 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Gate the timing tier on micro-tier changes
+        id: gate
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || [ -z "$BASE" ] || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            echo "timing=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          changed="$(git diff --name-only "$BASE" HEAD -- benchmarks scripts/bench/tiers/micro.py \
+            scripts/bench/micro_convert.py scripts/bench/micro_equiv.py scripts/bench/test_pairs.py \
+            scripts/bench/go-algorand.pin crates/tools/algo-bench-pairs .github/workflows/bench-micro.yml)"
+          echo "micro-tier changes: ${changed:-<none>}"
+          if [ -n "$changed" ]; then echo "timing=true" >> "$GITHUB_OUTPUT"; else echo "timing=false" >> "$GITHUB_OUTPUT"; fi
       - name: Locate the go-algorand checkout
         # `runner` is not available in job-level env; export it for every later step.
         run: echo "GO_ALGORAND_DIR=$RUNNER_TEMP/go-algorand" >> "$GITHUB_ENV"
@@ -91,9 +135,10 @@ jobs:
           cd benchmarks/go-micro
           unformatted="$(gofmt -l .)"
           [ -z "$unformatted" ] || { echo "::error::gofmt needed: $unformatted"; exit 1; }
-          # go.work paths are relative to the go.work file: use absolute ones.
-          printf 'go 1.25.0\n\nuse %s\n\nreplace github.com/algorand/go-algorand => %s\n' "$PWD" "$GO_ALGORAND_DIR" > "$RUNNER_TEMP/go.work"
-          export GOWORK="$RUNNER_TEMP/go.work"
+          # The same go.work the tier uses (go directive from go-micro's go.mod).
+          GOWORK="$(python3 ../../scripts/bench/micro_equiv.py --go-algorand "$GO_ALGORAND_DIR" --write-go-work "$RUNNER_TEMP/micro-work")"
+          export GOWORK
+          cat "$GOWORK"
           go vet ./...
           go test -count=1 -run TestDigestsMatchRecorded -v .
       - name: Rust side - recorded digests
@@ -101,6 +146,7 @@ jobs:
       - name: Output equivalence (live Go vs live Rust)
         run: python3 scripts/bench/micro_equiv.py --go-algorand "$GO_ALGORAND_DIR"
       - name: make bench-compare TIERS=micro RUNS=3
+        if: steps.gate.outputs.timing == 'true'
         env:
           BENCH_MICRO_GO_BENCHTIME: 300ms
           BENCH_MICRO_CRITERION_ARGS: --warm-up-time 0.5 --measurement-time 1

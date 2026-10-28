@@ -23,9 +23,11 @@ Steps (the tier fails at the first one that fails):
   4. BENCH_RUNS measured rounds, alternating which side goes first. A Go
      round is `go test -run '^$' -bench <regex> -benchmem -count=1`, one
      ns/op per pair; a Rust round is one `cargo bench`, whose sample per pair
-     is the median of criterion's per-sample times (new/sample.json, time /
-     iterations), so each side contributes BENCH_RUNS real samples measured
-     in interleaved rounds;
+     is criterion's mean time per iteration over the whole run
+     (new/sample.json: sum(times) / sum(iters)), the same statistic as go's
+     ns/op, so each side contributes BENCH_RUNS real per-round means
+     measured in interleaved rounds (a round that had to fall back to
+     estimates.json is recorded, and mixing sources fails the tier);
   5. results/micro/micro.json.
 
 Knobs: BENCH_MICRO_FILTER (regex on pair ids), BENCH_MICRO_GO_BENCHTIME (go
@@ -168,6 +170,13 @@ def main():
         print(f"micro: {e}", file=sys.stderr)
         return 1
 
+    mixed = [e for p in pairs
+             if (e := mc.mixed_source_error(
+                 p["id"], [r.get("source") for r in samples[p["id"]]["rust_runs"]]))]
+    if mixed:
+        print("micro: " + "\n  ".join(mixed), file=sys.stderr)
+        return 1
+
     results = []
     for p in pairs:
         s = samples[p["id"]]
@@ -177,6 +186,7 @@ def main():
         results.append(mc.make_result(p, "go", s["go"], dict(
             common, harness="go testing.B", package=p["go_package"], benchmark=p["go_bench"],
             api=p["go_api"], go_algorand_tag=tag, go_algorand_commit=go_commit,
+            sample_value="ns/op of the round (total timed duration / b.N)",
             command=commands["go"], benchtime=os.environ.get("BENCH_MICRO_GO_BENCHTIME", "1s"),
             iterations=[r["iterations"] for r in s["go_runs"]],
             bytes_per_op=[r["b_op"] for r in s["go_runs"]],
@@ -184,7 +194,9 @@ def main():
         results.append(mc.make_result(p, "rust", s["rust"], dict(
             common, harness="criterion", package="algo-bench-pairs", benchmark=p["rust_bench"],
             api=p["rust_api"], command=commands["rust"],
-            sample_value="median of new/sample.json per-iteration times",
+            sample_value="mean ns per iteration of the round: sum(times) / sum(iters)",
+            sample_source=[r.get("source") for r in s["rust_runs"]],
+            median_per_sample=[r.get("median_per_sample") for r in s["rust_runs"]],
             criterion_samples=[r.get("samples") for r in s["rust_runs"]],
             sampling_mode=[r.get("sampling_mode") for r in s["rust_runs"]])))
 

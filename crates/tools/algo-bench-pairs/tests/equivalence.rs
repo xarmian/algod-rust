@@ -78,9 +78,59 @@ fn every_case_runs() {
     let dir = algo_bench_pairs::fixture_dir();
     for id in algo_bench_pairs::IDS {
         let mut c = algo_bench_pairs::build(&dir, id).unwrap_or_else(|e| panic!("{e}"));
-        c.run();
-        c.run(); // repeatable: the benchmark calls it many times
+        c.bench_iteration();
+        c.bench_iteration(); // repeatable: the benchmark calls it many times
     }
+}
+
+/// A pair must do the same work on every benchmark iteration: after N
+/// iterations exactly as the bench runs them (per-iteration reset, then the
+/// operation), the digest must still equal a fresh case's digest. Catches
+/// state that leaks from one iteration into the next (e.g. app global state
+/// left behind in the ledger), which would make later iterations measure
+/// different work from the first one and from the Go side.
+#[test]
+fn digest_is_stable_after_repeated_bench_iterations() {
+    let dir = algo_bench_pairs::fixture_dir();
+    for id in algo_bench_pairs::IDS {
+        let fresh = algo_bench_pairs::build(&dir, id)
+            .and_then(|mut c| c.digest())
+            .unwrap_or_else(|e| panic!("{id}: {e}"));
+        let mut c = algo_bench_pairs::build(&dir, id).unwrap();
+        for _ in 0..3 {
+            c.bench_iteration();
+        }
+        let after = c.digest().unwrap_or_else(|e| panic!("{id}: {e}"));
+        assert_eq!(
+            after, fresh,
+            "{id}: digest drifts after repeated iterations"
+        );
+    }
+}
+
+/// The app pair's digest records the ledger state the evaluation started
+/// from, so a missing per-iteration reset shows up as a digest change.
+#[test]
+fn app_pair_digest_records_its_starting_state() {
+    let mut c =
+        algo_bench_pairs::build(&algo_bench_pairs::fixture_dir(), "avm/app-state-box").unwrap();
+    assert!(
+        c.has_reset(),
+        "the stateful app pair must reset between iterations"
+    );
+    let d = c.digest().unwrap();
+    assert!(d.contains(";pre:globals=0,box="), "{d}");
+    assert!(d.contains(";gdelta:"), "{d}");
+}
+
+#[test]
+fn decode_one_stxn_takes_exactly_one_transaction() {
+    let data = std::fs::read(algo_bench_pairs::fixture_dir().join("stxn-appl.msgpack")).unwrap();
+    assert!(algo_bench_pairs::decode_one_stxn(&data).is_ok());
+    let mut two = data.clone();
+    two.extend_from_slice(&data);
+    assert!(algo_bench_pairs::decode_one_stxn(&two).is_err());
+    assert!(algo_bench_pairs::decode_one_stxn(&data[..data.len() - 1]).is_err());
 }
 
 #[test]

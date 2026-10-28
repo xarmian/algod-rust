@@ -80,7 +80,7 @@ go_package = "github.com/xarmian/algod-rust/benchmarks/go-micro"
 go_bench = "BenchmarkCodecDecodeStxn"
 go_api = "protocol.Decode(b, &transactions.SignedTxn{})"
 rust_bench = "codec/decode-stxn"
-rust_api = "algo_codec::decode_signed_txn_stream"
+rust_api = "algo_types::SignedTransaction::decode_from_reader (one object)"
 fixture = "stxn-appl.msgpack"
 fixture_sha256 = "f8468073c465a7639a1332d07b9c60538e3f7df96f369488d0b7a9a27f2a013c"
 

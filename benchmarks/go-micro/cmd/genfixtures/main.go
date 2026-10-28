@@ -505,11 +505,11 @@ func main() {
 	lsigProgram(w, "avm-hash", strings.Replace(tealHash, "SEED32", seed32, 1))
 	lsigProgram(w, "avm-bytes", strings.NewReplacer("SEED32", seed32, "MASK32", hex.EncodeToString(mask[:])).Replace(tealBytes))
 	appProg := assemble(tealApp)
-	pass, cost, logs, err := micro.NewAppRunner(appProg).Run()
-	if err != nil || !pass {
-		log.Fatalf("avm-app: pass=%v err=%v", pass, err)
+	o, err := micro.NewAppRunner(appProg).Run()
+	if err != nil || !o.Pass {
+		log.Fatalf("avm-app: pass=%v err=%v", o.Pass, err)
 	}
-	fmt.Printf("  avm-app: cost %d, logs %v\n", cost, logs)
+	fmt.Printf("  avm-app: cost %d, logs %v\n", o.Cost, o.Logs)
 	w.put("avm-app.teal", []byte(tealApp))
 	w.put("avm-app.bin", appProg)
 }

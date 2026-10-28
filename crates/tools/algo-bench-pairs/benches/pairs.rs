@@ -32,10 +32,19 @@ fn bench_pairs(c: &mut Criterion) {
     let dir = algo_bench_pairs::fixture_dir();
     for id in algo_bench_pairs::IDS {
         let (group, name) = id.split_once('/').expect("pair ids are <group>/<name>");
-        let mut case = algo_bench_pairs::build(&dir, id).unwrap_or_else(|e| panic!("{e}"));
-        case.run(); // fail fast before timing
+        // Built lazily: criterion only calls the routine for benchmarks its
+        // filter selects, so a filtered run loads only those fixtures.
+        let mut case: Option<algo_bench_pairs::Case> = None;
         let mut g = c.benchmark_group(group);
-        g.bench_function(name, |b| b.iter(|| case.run()));
+        g.bench_function(name, |b| {
+            let case = case.get_or_insert_with(|| {
+                let mut c = algo_bench_pairs::build(&dir, id).unwrap_or_else(|e| panic!("{e}"));
+                c.bench_iteration(); // fail fast before timing
+                c
+            });
+            // Reset (stateful pairs only) + operation, as on the Go side.
+            b.iter(|| case.bench_iteration());
+        });
         g.finish();
     }
 }
