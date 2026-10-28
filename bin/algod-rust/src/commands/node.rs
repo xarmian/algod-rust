@@ -909,7 +909,7 @@ mod follow_loop_tests {
             blocks.insert(round, block);
         }
 
-        let store = SqliteLedger::open_in_memory().unwrap();
+        let store = crate::commands::test_support::funded_sqlite_ledger();
         let peer = Arc::new(MockPeer {
             blocks: RwLock::new(blocks),
             fetch_count: AtomicU64::new(0),

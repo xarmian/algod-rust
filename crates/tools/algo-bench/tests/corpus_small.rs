@@ -225,16 +225,86 @@ fn small_corpus_replays_through_the_rust_ledger() {
         algo_codec::compute_block_digest(&gblk),
         "algod-rust's genesis block differs from the round-0 block go-algorand served"
     );
+    // Issue #2116 oracle: go-algorand's ledger (benchmarks/go-replay on this
+    // corpus) withdraws each block's accrued rewards from the pool at the
+    // block start. Round 3 is the first block whose rewards level rises.
+    let pool = algo_types::Address::from_algorand_string(&genesis.rwd).unwrap();
+    // corpus.json's `accounts_sha256` account set (benchmarks/go-corpus
+    // `workload.known`): the genesis allocations, every top-level payment
+    // receiver and the accounts of the first two apps the corpus creates.
+    let mut known: Vec<algo_types::Address> = genesis
+        .alloc
+        .iter()
+        .map(|a| algo_types::Address::from_algorand_string(&a.addr).unwrap())
+        .collect();
+    let mut setup_apps = 0;
     for rec in &records[1..] {
         let block = algo_codec::decode_block_response(rec.payload)
             .unwrap()
             .block;
+        for st in &block.payset {
+            match st.txn.txn_type {
+                algo_types::TxnType::Pay => known.push(st.txn.receiver),
+                algo_types::TxnType::Appl if st.txn.application_id == 0 && setup_apps < 2 => {
+                    setup_apps += 1;
+                    known.push(algo_types::Address(algo_ledger::avm_context::app_address(
+                        st.apply_data_application_id,
+                    )));
+                }
+                _ => {}
+            }
+        }
         l.begin_block().unwrap();
         l.apply_block_caching_delta(&block)
             .unwrap_or_else(|e| panic!("round {}: {e}", rec.round));
         l.commit_block().unwrap();
+        if rec.round == 3 {
+            assert_eq!(
+                l.account_totals().not_participating.money,
+                99_999_536_103_001,
+                "round 3 not-participating money (go-algorand)"
+            );
+        }
     }
+    assert_eq!(
+        l.get_account(&pool).map(|a| a.micro_algos),
+        Some(99_600_008_470_562),
+        "rewards pool balance at round 2000 (go-algorand)"
+    );
+    let totals = l.account_totals();
+    assert_eq!(
+        totals.not_participating.money, 99_600_020_902_562,
+        "not-participating money at round 2000 (go-algorand)"
+    );
+    assert_eq!(totals.online.money, 400_344_800_000_000);
+    assert_eq!(totals.offline.money, 64_055_179_197_438);
+    assert_eq!(totals.rewards_level, 862);
     let fs_ = &meta["final_state"];
+    // go's REST `amount` (pending rewards applied) of every known account.
+    let mut lines: Vec<String> = Vec::new();
+    let mut known_algos = 0u64;
+    let mut seen = std::collections::HashSet::new();
+    known.retain(|a| seen.insert(*a));
+    for a in &known {
+        let amount = l.get_account(a).map_or(0, |mut acct| {
+            algo_ledger::rewards::apply_rewards(&mut acct, totals.rewards_level);
+            acct.micro_algos
+        });
+        known_algos += amount;
+        lines.push(format!("{a} {amount}\n"));
+    }
+    lines.sort();
+    assert_eq!(known.len() as u64, fs_["accounts"].as_u64().unwrap());
+    assert_eq!(
+        known_algos,
+        fs_["accounts_microalgos"].as_u64().unwrap(),
+        "known accounts' microalgos"
+    );
+    assert_eq!(
+        hex::encode(Sha256::digest(lines.concat().as_bytes())),
+        fs_["accounts_sha256"].as_str().unwrap(),
+        "corpus.json accounts_sha256 (go-algorand REST amounts)"
+    );
     assert_eq!(
         l.txn_counter(),
         fs_["txn_counter"].as_u64().unwrap(),

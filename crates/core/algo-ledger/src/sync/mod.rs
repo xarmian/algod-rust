@@ -4433,9 +4433,12 @@ mod tests {
             );",
         )
         .unwrap();
+        // Issue #2116: the blocks' (zero-address) rewards pool holds
+        // MinBalance, which go's block-start withdrawal requires.
+        const POOL_BALANCE: u64 = 100_000;
         src.execute(
             "INSERT INTO accounttotals VALUES('', 0, 0, ?1, 0, 0, 0, 0)",
-            rusqlite::params![payer_balance as i64],
+            rusqlite::params![(payer_balance + POOL_BALANCE) as i64],
         )
         .unwrap();
         // baseAccountData `{"b": payer_balance}` with the canonical (minimal
@@ -4462,6 +4465,14 @@ mod tests {
             "INSERT INTO accountbase(addrid, address, data, normalizedonlinebalance) \
              VALUES(1, ?1, ?2, 0)",
             rusqlite::params![payer.to_vec(), blob],
+        )
+        .unwrap();
+        // `{"b": 100000}` (uint32 width).
+        let mut pool_blob = vec![0x81, 0xa1, b'b', 0xce];
+        pool_blob.extend_from_slice(&(POOL_BALANCE as u32).to_be_bytes());
+        src.execute(
+            "INSERT INTO accountbase(addrid, address, data, normalizedonlinebalance)              VALUES(2, ?1, ?2, 0)",
+            rusqlite::params![vec![0u8; 32], pool_blob],
         )
         .unwrap();
         src

@@ -144,11 +144,13 @@ struct Harness {
 
 impl Harness {
     fn new(proto: &'static str, funded: &[(Address, u64)]) -> Self {
-        let mut l = SqliteLedger::open_in_memory().expect("ledger");
+        let mut l = SqliteLedger::open_in_memory().unwrap();
         let fee_sink = addr(0xF1);
         let rewards_pool = addr(0xF2);
         l.set_fee_sink(fee_sink);
         l.set_rewards_pool(rewards_pool);
+        // Issue #2116: the block-start withdrawal needs a pool at MinBalance.
+        fund_rewards_pool(&mut l);
         l.set_protocol(proto.to_string());
         for (a, amount) in funded {
             l.set_account(
@@ -350,4 +352,36 @@ fn close_min_balance_policy_v42() {
 #[test]
 fn close_min_balance_policy_v43() {
     close_min_balance_policy(CONSENSUS_V43);
+}
+
+/// Issue #2116: go `StartEvaluator` rejects a block whose rewards pool holds
+/// less than `MinBalance` after the block-start withdrawal, so test ledgers
+/// fund their (zero-address) pool as every real genesis does.
+#[allow(dead_code)]
+fn funded_sqlite_ledger() -> algo_ledger::SqliteLedger {
+    let mut l = algo_ledger::SqliteLedger::open_in_memory().expect("in-memory ledger");
+    fund_rewards_pool(&mut l);
+    l
+}
+
+#[allow(dead_code)]
+fn funded_ledger_state() -> algo_ledger::LedgerState {
+    let mut s = algo_ledger::LedgerState::new();
+    fund_rewards_pool(&mut s);
+    s
+}
+
+#[allow(dead_code)]
+fn fund_rewards_pool<L: algo_ledger::LedgerStore>(store: &mut L) {
+    let pool = store.rewards_pool();
+    if store.get_account(&pool).is_none() {
+        store.set_account(
+            &pool,
+            algo_types::AccountData {
+                micro_algos: 100_000,
+                status: algo_types::AccountStatus::NotParticipating,
+                ..algo_types::AccountData::default()
+            },
+        );
+    }
 }

@@ -7327,9 +7327,19 @@ mod tests {
 
     // ── Helper: create an in-memory ledger ──────────────────────────
     fn test_ledger() -> Arc<Mutex<SqliteLedger>> {
-        Arc::new(Mutex::new(
-            SqliteLedger::open_in_memory().expect("in-memory ledger"),
-        ))
+        // Issue #2116: go's block-start rewards withdrawal needs the pool at
+        // MinBalance: fund both the store's (zero-address) pool and the
+        // `Address([2u8; 32])` pool these tests' headers name.
+        let mut l = crate::commands::test_support::funded_sqlite_ledger();
+        l.set_account(
+            &Address([2u8; 32]),
+            AccountData {
+                micro_algos: 100_000,
+                status: algo_types::AccountStatus::NotParticipating,
+                ..AccountData::default()
+            },
+        );
+        Arc::new(Mutex::new(l))
     }
 
     // ── start_evaluator advances the header ─────────────────────────

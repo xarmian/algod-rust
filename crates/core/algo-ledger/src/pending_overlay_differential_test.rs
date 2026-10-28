@@ -67,9 +67,11 @@ fn app_addr(id: u64) -> Address {
 }
 
 fn setup() -> SqliteLedger {
-    let mut l = SqliteLedger::open_in_memory().expect("ledger");
+    let mut l = SqliteLedger::open_in_memory().unwrap();
     l.set_fee_sink(addr(0xF1));
     l.set_rewards_pool(addr(0xF2));
+    // Issue #2116: the block-start withdrawal needs a pool at MinBalance.
+    crate::apply::pool_fixtures::fund_test_rewards_pool(&mut l);
     l.set_protocol(CONSENSUS_V41.to_string());
     l.set_account(
         &addr(0xF1),

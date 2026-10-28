@@ -87,7 +87,7 @@ fn call(app_id: u64) -> SignedTransaction {
 
 /// Returns (app 0's `itxn TxID` log, app 1's `gtxn 0 TxID` log).
 fn run(proto: &str) -> (Vec<u8>, Vec<u8>) {
-    let mut s = LedgerState::new();
+    let mut s = funded_ledger_state();
     s.fee_sink = Address([0xFE; 32]);
     s.get_or_default_account_mut(&Address([0xAA; 32]))
         .micro_algos = 100_000_000;
@@ -148,7 +148,7 @@ fn v34_group_does_not_share_txid_cache() {
 /// and must share the cache across the group's app calls too.
 fn run_simulated(proto: &str) -> (Vec<u8>, Vec<u8>) {
     use algo_ledger::simulation::{SimulationRequest, Simulator};
-    let mut s = LedgerState::new();
+    let mut s = funded_ledger_state();
     s.fee_sink = Address([0xFE; 32]);
     s.protocol = proto.to_string();
     s.get_or_default_account_mut(&Address([0xAA; 32]))
@@ -192,4 +192,36 @@ fn simulate_pre_v34_group_shares_txid_cache_across_app_calls() {
 fn simulate_v34_group_does_not_share_txid_cache() {
     let (inner_id, gtxn0) = run_simulated(CONSENSUS_V34);
     assert_ne!(gtxn0, inner_id);
+}
+
+/// Issue #2116: go `StartEvaluator` rejects a block whose rewards pool holds
+/// less than `MinBalance` after the block-start withdrawal, so test ledgers
+/// fund their (zero-address) pool as every real genesis does.
+#[allow(dead_code)]
+fn funded_sqlite_ledger() -> algo_ledger::SqliteLedger {
+    let mut l = algo_ledger::SqliteLedger::open_in_memory().expect("in-memory ledger");
+    fund_rewards_pool(&mut l);
+    l
+}
+
+#[allow(dead_code)]
+fn funded_ledger_state() -> algo_ledger::LedgerState {
+    let mut s = algo_ledger::LedgerState::new();
+    fund_rewards_pool(&mut s);
+    s
+}
+
+#[allow(dead_code)]
+fn fund_rewards_pool<L: algo_ledger::LedgerStore>(store: &mut L) {
+    let pool = store.rewards_pool();
+    if store.get_account(&pool).is_none() {
+        store.set_account(
+            &pool,
+            algo_types::AccountData {
+                micro_algos: 100_000,
+                status: algo_types::AccountStatus::NotParticipating,
+                ..algo_types::AccountData::default()
+            },
+        );
+    }
 }

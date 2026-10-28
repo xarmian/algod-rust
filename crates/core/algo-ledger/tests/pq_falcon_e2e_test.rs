@@ -181,7 +181,7 @@ fn pq_rekeyed_address_authorization_full_e2e_succeeds() {
     let (falcon_salt, falcon_addr) = canonical_pq_address_salt(PQ_SCHEME_FALCON1024, &falcon_pk)
         .expect("a canonical PQ salt must exist");
 
-    let mut state = LedgerState::new();
+    let mut state = funded_ledger_state();
     state.fee_sink = fee_sink;
     state.get_or_default_account_mut(&ed_addr).micro_algos = 10_000_000;
     state.get_or_default_account_mut(&receiver).micro_algos = 100_000;
@@ -297,7 +297,7 @@ fn pq_rekeyed_address_stale_ed25519_authorizer_rejected_full_e2e() {
     let (_falcon_salt, falcon_addr) = canonical_pq_address_salt(PQ_SCHEME_FALCON1024, &falcon_pk)
         .expect("a canonical PQ salt must exist");
 
-    let mut state = LedgerState::new();
+    let mut state = funded_ledger_state();
     state.fee_sink = fee_sink;
     state.get_or_default_account_mut(&ed_addr).micro_algos = 10_000_000;
     state.get_or_default_account_mut(&receiver).micro_algos = 100_000;
@@ -410,7 +410,7 @@ fn pq_challenged_falcon_address_can_heartbeat_for_zero_fee_full_e2e() {
     let voting = OneTimeSignatureSecrets::generate(first_id.batch, num_batches);
     let vote_id = voting.verifier();
 
-    let mut state = LedgerState::new();
+    let mut state = funded_ledger_state();
     state.fee_sink = fee_sink;
     {
         let acct = state.get_or_default_account_mut(&pq_target);
@@ -511,4 +511,36 @@ fn store_header(state: &mut LedgerState, round: u64, seed: &[u8; 32], genesis_ha
     state
         .put_block(round, CONSENSUS_V42, &hdrdata, &blkdata)
         .expect("put_block");
+}
+
+/// Issue #2116: go `StartEvaluator` rejects a block whose rewards pool holds
+/// less than `MinBalance` after the block-start withdrawal, so test ledgers
+/// fund their (zero-address) pool as every real genesis does.
+#[allow(dead_code)]
+fn funded_sqlite_ledger() -> algo_ledger::SqliteLedger {
+    let mut l = algo_ledger::SqliteLedger::open_in_memory().expect("in-memory ledger");
+    fund_rewards_pool(&mut l);
+    l
+}
+
+#[allow(dead_code)]
+fn funded_ledger_state() -> algo_ledger::LedgerState {
+    let mut s = algo_ledger::LedgerState::new();
+    fund_rewards_pool(&mut s);
+    s
+}
+
+#[allow(dead_code)]
+fn fund_rewards_pool<L: algo_ledger::LedgerStore>(store: &mut L) {
+    let pool = store.rewards_pool();
+    if store.get_account(&pool).is_none() {
+        store.set_account(
+            &pool,
+            algo_types::AccountData {
+                micro_algos: 100_000,
+                status: algo_types::AccountStatus::NotParticipating,
+                ..algo_types::AccountData::default()
+            },
+        );
+    }
 }

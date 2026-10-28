@@ -1879,6 +1879,11 @@ pub struct ProbeRequest {
     /// bookkeeping, lease purge). The proposer runs that epilogue exactly
     /// once, in the final scratch apply of the whole payset.
     pub skip_epilogue: bool,
+    /// The block-start rewards-pool withdrawal ([`withdraw_block_rewards`])
+    /// is already part of the state this apply runs on: a later group of the
+    /// pool's pending block (`proposal_eval::evaluate_group`), where go's
+    /// single `BlockEvaluator` ran `StartEvaluator` once for the whole block.
+    pub pool_withdrawn: bool,
     /// Compute [`ProbeOutput::final_fee_sink_available`]. Only the proposer's
     /// final scratch apply asks; per-group overlay runs and plain applies
     /// skip the account read and min-balance scan.
@@ -2439,6 +2444,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
     probe: Option<&mut ExecProbe>,
 ) -> Result<(), AlgoError> {
     let skip_epilogue = probe.as_ref().is_some_and(|p| p.request.skip_epilogue);
+    let pool_withdrawn = probe.as_ref().is_some_and(|p| p.request.pool_withdrawn);
     let generate = probe.as_ref().is_some_and(|p| p.request.generate);
     let check_payouts = validate || probe.as_ref().is_some_and(|p| p.request.validate_payouts);
     // Index of the transaction whose apply failed (see `ExecProbe`).
@@ -2525,6 +2531,14 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
     let prev_rewards_recalc = store.rewards_recalculation_round();
     let prev_fee_sink = store.fee_sink();
     let prev_rewards_pool = store.rewards_pool();
+    // go `StartEvaluator` takes `prevTotals` from `l.LatestTotals()` before
+    // the block changes anything; only its reward units are needed.
+    let prev_reward_units = if pool_withdrawn {
+        0
+    } else {
+        let t = store.account_totals();
+        t.online.reward_units.saturating_add(t.offline.reward_units)
+    };
 
     // Update rewards state and reward addresses from block header.
     store.set_rewards_level(block.rewards_level);
@@ -2537,6 +2551,48 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
     let mut gh = [0u8; 32];
     if block.genesis_hash.len() == 32 {
         gh.copy_from_slice(&block.genesis_hash);
+    }
+
+    // go `StartEvaluator`: withdraw the rewards this block accrues from the
+    // pool, before any transaction (issue #2116). The pool is go's
+    // `prevHeader.RewardsPool`; a store that never learned it (a bare test
+    // store) falls back to the block's own field.
+    let withdrawal_pool = if prev_rewards_pool.is_zero() {
+        block.rewards_pool
+    } else {
+        prev_rewards_pool
+    };
+    // Snapshot only when the withdrawal writes: a block whose rewards level
+    // does not move (mainnet today) and that is not a testnet hotfix round
+    // leaves the pool unchanged.
+    let pool_writes = block.rewards_level != prev_rewards_level
+        || TESTNET_OVERSPENT_REWARDS_ROUNDS.contains(&block.round.0);
+    let pool_snapshot = (!pool_withdrawn && pool_writes)
+        .then(|| store.snapshot(&[withdrawal_pool, Address(TESTNET_BANK_ADDRESS)]));
+    if !pool_withdrawn {
+        if let Err(e) = withdraw_block_rewards(
+            store,
+            &BlockRewardsWithdrawal {
+                round: block.round.0,
+                pool: withdrawal_pool,
+                prev_rewards_level,
+                rewards_level: block.rewards_level,
+                prev_reward_units,
+                genesis_hash: gh,
+                min_balance: consensus.min_balance,
+            },
+        ) {
+            if let Some(s) = pool_snapshot {
+                store.restore_snapshot(s);
+            }
+            store.set_rewards_level(prev_rewards_level);
+            store.set_rewards_rate(prev_rewards_rate);
+            store.set_rewards_residue(prev_rewards_residue);
+            store.set_rewards_recalculation_round(prev_rewards_recalc);
+            store.set_fee_sink(prev_fee_sink);
+            store.set_rewards_pool(prev_rewards_pool);
+            return Err(e);
+        }
     }
 
     // Initialize txn_counter from the store's current value (= previous block's
@@ -2862,7 +2918,11 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         }
     }
     if result.is_err() {
-        // Restore rewards state and addresses on failure.
+        // Restore the block-start pool withdrawal, rewards state and
+        // addresses on failure.
+        if let Some(s) = pool_snapshot {
+            store.restore_snapshot(s);
+        }
         store.set_rewards_level(prev_rewards_level);
         store.set_rewards_rate(prev_rewards_rate);
         store.set_rewards_residue(prev_rewards_residue);
@@ -4251,7 +4311,7 @@ pub fn apply_transaction_with_budget<L: crate::store_trait::LedgerStore>(
 /// 1. Snapshot touched accounts, then apply rewards.
 /// 2. Handle rekey_to (before type-specific dispatch).
 /// 3. Dispatch by transaction type (fee + type-specific logic).
-/// 4. Debit rewards pool for any rewards distributed.
+/// 4. (Rewards leave the pool once per block, at block start: `withdraw_block_rewards`.)
 /// 5. Check min balance for all touched accounts.
 ///
 /// On error, touched account data is restored to pre-reward state.
@@ -4411,8 +4471,8 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
     }
 
     // Snapshot all accounts that may be mutated (touched + fee_sink + rewards_pool)
-    // for rollback. The rewards pool must be included because it is debited for
-    // distributed rewards, and a later min-balance check failure must restore it.
+    // for rollback. The rewards pool is included because a transaction may pay
+    // to or from it, and a later min-balance check failure must restore it.
     let mut snapshot_addrs = touched.clone();
     if !snapshot_addrs.contains(&ctx.fee_sink) {
         snapshot_addrs.push(ctx.fee_sink);
@@ -4549,24 +4609,119 @@ fn is_pay_credit_role(txn: &algo_types::Transaction, addr: &Address) -> bool {
         && (*addr == txn.receiver || *addr == txn.close_remainder_to)
 }
 
-/// Debit the rewards pool for rewards just distributed.
-pub(crate) fn debit_rewards_pool<L: crate::store_trait::LedgerStore>(
+/// Testnet genesis hash (`JBR3KGFEWPEE5SAQ6IWU6EEBZMHXD4CZU6WCBXWGF57XBZIJHIRA`),
+/// the only network go's `workaroundOverspentRewards` patches.
+pub(crate) const TESTNET_GENESIS_HASH: [u8; 32] = [
+    0x48, 0x63, 0xb5, 0x18, 0xa4, 0xb3, 0xc8, 0x4e, 0xc8, 0x10, 0xf2, 0x2d, 0x4f, 0x10, 0x81, 0xcb,
+    0x0f, 0x71, 0xf0, 0x59, 0xa7, 0xac, 0x20, 0xde, 0xc6, 0x2f, 0x7f, 0x70, 0xe5, 0x09, 0x3a, 0x22,
+];
+/// Testnet bank (dispenser) `GD64YIY3TWGDMCNPP553DZPPR6LDUSFQOIJVFDPPXWEG3FVOJCCDBBHU5A`.
+pub(crate) const TESTNET_BANK_ADDRESS: [u8; 32] = [
+    0x30, 0xfd, 0xcc, 0x23, 0x1b, 0x9d, 0x8c, 0x36, 0x09, 0xaf, 0x7f, 0x7b, 0xb1, 0xe5, 0xef, 0x8f,
+    0x96, 0x3a, 0x48, 0xb0, 0x72, 0x13, 0x52, 0x8d, 0xef, 0xbd, 0x88, 0x6d, 0x96, 0xae, 0x48, 0x84,
+];
+/// The two testnet stall rounds (08/26/2019, 11/07/2019) go's
+/// `workaroundOverspentRewards` refills the pool at.
+pub(crate) const TESTNET_OVERSPENT_REWARDS_ROUNDS: [u64; 2] = [1_499_995, 2_926_564];
+/// µAlgos go moves from the testnet bank to the pool at those rounds.
+pub(crate) const TESTNET_OVERSPENT_REWARDS_AMOUNT: u64 = 20_000_000_000;
+
+/// Inputs of [`withdraw_block_rewards`].
+pub(crate) struct BlockRewardsWithdrawal {
+    /// The block being evaluated.
+    pub round: u64,
+    /// go `eval.prevHeader.RewardsPool`.
+    pub pool: Address,
+    /// go `eval.prevHeader.RewardsLevel`.
+    pub prev_rewards_level: u64,
+    /// go `eval.block.BlockHeader.RewardsLevel`.
+    pub rewards_level: u64,
+    /// go `prevTotals.RewardUnits()` (online + offline reward units).
+    pub prev_reward_units: u64,
+    pub genesis_hash: [u8; 32],
+    /// The block protocol's `MinBalance`.
+    pub min_balance: u64,
+}
+
+/// go `BlockEvaluator.workaroundOverspentRewards` (`ledger/eval/eval.go`):
+/// on testnet at the two stall rounds, move 20,000 Algos from the testnet
+/// bank to the rewards pool (a `roundCowState.Move`, both sides brought up to
+/// the block's rewards level first).
+fn workaround_overspent_rewards<L: crate::store_trait::LedgerStore>(
     store: &mut L,
-    total_rewards: u64,
+    w: &BlockRewardsWithdrawal,
 ) -> Result<(), AlgoError> {
-    if total_rewards > 0 {
-        let rewards_pool_addr = store.rewards_pool();
-        let mut pool = store.get_or_default_account(&rewards_pool_addr);
-        if pool.micro_algos < total_rewards {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "rewards pool balance {} insufficient for {} in rewards",
-                    pool.micro_algos, total_rewards,
-                ),
-            });
-        }
-        pool.micro_algos -= total_rewards;
-        store.set_account(&rewards_pool_addr, pool);
+    if !TESTNET_OVERSPENT_REWARDS_ROUNDS.contains(&w.round)
+        || w.genesis_hash != TESTNET_GENESIS_HASH
+    {
+        return Ok(());
+    }
+    let bank_addr = Address(TESTNET_BANK_ADDRESS);
+    let amount = TESTNET_OVERSPENT_REWARDS_AMOUNT;
+    let fail = |why: String| AlgoError::Ledger {
+        message: format!("unable to move funds from testnet bank to incentive pool: {why}"),
+    };
+    let mut bank = store.get_or_default_account(&bank_addr);
+    crate::rewards::apply_rewards(&mut bank, w.rewards_level);
+    bank.micro_algos = bank.micro_algos.checked_sub(amount).ok_or_else(|| {
+        fail(format!(
+            "overspend (account {bank_addr}, data {}, tried to spend {amount})",
+            bank.micro_algos
+        ))
+    })?;
+    store.set_account(&bank_addr, bank);
+    let mut pool = store.get_or_default_account(&w.pool);
+    crate::rewards::apply_rewards(&mut pool, w.rewards_level);
+    pool.micro_algos = pool
+        .micro_algos
+        .checked_add(amount)
+        .ok_or_else(|| fail(format!("overflowed account balance of {}", w.pool)))?;
+    store.set_account(&w.pool, pool);
+    Ok(())
+}
+
+/// go `StartEvaluator` (`ledger/eval/eval.go` L826-L860, issue #2116): at the
+/// start of every block, withdraw from the rewards pool all rewards the
+/// block accrues, `prevTotals.RewardUnits() * (RewardsLevel -
+/// prevRewardsLevel)`, after `workaroundOverspentRewards`, and require that
+/// the pool keeps at least `MinBalance`.
+///
+/// This is the only place rewards leave the pool: when a transaction later
+/// brings an account up to the rewards level (go `WithUpdatedRewards` in
+/// `roundCowState.Move`), only that account's balance and rewards base
+/// change.
+pub(crate) fn withdraw_block_rewards<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    w: &BlockRewardsWithdrawal,
+) -> Result<(), AlgoError> {
+    let rewards_per_unit = w
+        .rewards_level
+        .checked_sub(w.prev_rewards_level)
+        .ok_or_else(|| AlgoError::Ledger {
+            message: format!(
+                "overflowed subtracting rewards({}, {}) levels for block {}",
+                w.rewards_level, w.prev_rewards_level, w.round
+            ),
+        })?;
+    workaround_overspent_rewards(store, w)?;
+    // go `eval.state.Get(poolAddr, true)`: the pool with its pending rewards.
+    let pool_old = store.get_or_default_account(&w.pool);
+    let mut pool = pool_old.clone();
+    crate::rewards::apply_rewards(&mut pool, w.rewards_level);
+    let withdrawal = w.prev_reward_units.checked_mul(rewards_per_unit);
+    pool.micro_algos = withdrawal
+        .and_then(|amt| pool.micro_algos.checked_sub(amt))
+        .ok_or_else(|| AlgoError::Ledger {
+            message: format!("overflowed subtracting reward unit for block {}", w.round),
+        })?;
+    if pool != pool_old {
+        store.set_account(&w.pool, pool.clone());
+    }
+    // "ensure that we have at least MinBalance after withdrawing rewards"
+    if pool.micro_algos < w.min_balance {
+        return Err(AlgoError::Ledger {
+            message: format!("overflowed subtracting rewards for block {}", w.round),
+        });
     }
     Ok(())
 }
@@ -4699,7 +4854,6 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
         let mut apply_data = ApplyData::default();
 
         let pass = apply_rewards_pass(store, txn, reward_addrs, ctx.rewards_level, &ctx.consensus);
-        let total_rewards = pass.total;
         apply_data.sender_rewards += pass.sender_rewards;
         apply_data.receiver_rewards += pass.receiver_rewards;
         apply_data.close_rewards += pass.close_rewards;
@@ -4826,9 +4980,6 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
         if ctx.mode == ApplyMode::Replay {
             apply_data.eval_delta = stx.eval_delta.clone();
         }
-
-        // Debit rewards pool for distributed rewards.
-        debit_rewards_pool(store, total_rewards)?;
 
         // Check min balance for all touched accounts after the transaction.
         // Go checks all modified accounts per-transaction (skipping FeeSink,
@@ -7229,8 +7380,64 @@ pub struct BoxBudgetState {
     pub pooled_inners: Option<usize>,
 }
 
+/// Test fixtures for the block-start rewards-pool withdrawal (issue #2116).
+#[cfg(test)]
+pub(crate) mod pool_fixtures {
+    /// Issue #2116: go `StartEvaluator` rejects every block whose rewards
+    /// pool would hold less than `MinBalance`, so a fixture whose pool
+    /// (`state.rewards_pool`, the zero address unless a test sets it) is not
+    /// one of its accounts gets a not-participating pool holding exactly the
+    /// minimum, like every real genesis funds it. A fixture that lists the
+    /// pool keeps its own balance.
+    pub(crate) fn fund_test_rewards_pool<L: crate::store_trait::LedgerStore>(store: &mut L) {
+        let pool = store.rewards_pool();
+        if store.get_account(&pool).is_none() {
+            store.set_account(
+                &pool,
+                algo_types::AccountData {
+                    micro_algos: TEST_POOL_MIN_BALANCE,
+                    status: algo_types::AccountStatus::NotParticipating,
+                    ..algo_types::AccountData::default()
+                },
+            );
+        }
+    }
+
+    /// [`fund_test_rewards_pool`] for the pool `block` names (a fixture
+    /// whose store never learned its pool withdraws from the block's).
+    pub(crate) fn fund_test_block_rewards_pool<L: crate::store_trait::LedgerStore>(
+        store: &mut L,
+        block: &algo_types::Block,
+    ) {
+        if store.rewards_pool().is_zero() {
+            store.set_rewards_pool(block.rewards_pool);
+        }
+        fund_test_rewards_pool(store);
+    }
+
+    /// The `MinBalance` of every protocol the tests run.
+    pub(crate) const TEST_POOL_MIN_BALANCE: u64 = 100_000;
+
+    /// An in-memory `SqliteLedger` whose (zero-address) rewards pool holds
+    /// `MinBalance`, as every real genesis funds it.
+    pub(crate) fn funded_sqlite_ledger() -> crate::sqlite::SqliteLedger {
+        let mut l = crate::sqlite::SqliteLedger::open_in_memory().expect("in-memory ledger");
+        fund_test_rewards_pool(&mut l);
+        l
+    }
+
+    /// A `LedgerState` whose (zero-address) rewards pool holds `MinBalance`.
+    #[allow(dead_code)]
+    pub(crate) fn funded_ledger_state() -> crate::state::LedgerState {
+        let mut s = crate::state::LedgerState::new();
+        fund_test_rewards_pool(&mut s);
+        s
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::pool_fixtures::*;
     use super::*;
 
     /// `block_with_restored_genesis_fields` with the rule resolved from `b`.
@@ -7296,6 +7503,7 @@ mod tests {
             let account = state.get_or_default_account_mut(addr);
             account.micro_algos = *balance;
         }
+        fund_test_rewards_pool(&mut state);
         state
     }
 
@@ -7833,8 +8041,233 @@ mod tests {
         assert_eq!(state.get_account(&sender).unwrap().micro_algos, 100_000);
     }
 
+    /// Issue #2116 fixture: an offline account of 64 Algos and an online one
+    /// of 400 Algos (464 reward units), a not-participating pool and fee
+    /// sink, at rewards level 0 and round 0.
+    fn issue_2116_state(pool_balance: u64) -> (LedgerState, Address, Address, Address) {
+        let offline = Address([0x21; 32]);
+        let online = Address([0x22; 32]);
+        let fee_sink = Address([0x23; 32]);
+        let pool = Address([0x24; 32]);
+        let mut state = LedgerState::new();
+        state.fee_sink = fee_sink;
+        state.rewards_pool = pool;
+        let acct = |micro_algos, status| algo_types::AccountData {
+            micro_algos,
+            status,
+            ..algo_types::AccountData::default()
+        };
+        state
+            .accounts
+            .insert(offline, acct(64_000_000, AccountStatus::Offline));
+        state
+            .accounts
+            .insert(online, acct(400_000_000, AccountStatus::Online));
+        state
+            .accounts
+            .insert(fee_sink, acct(1_000_000, AccountStatus::NotParticipating));
+        state
+            .accounts
+            .insert(pool, acct(pool_balance, AccountStatus::NotParticipating));
+        (state, offline, online, pool)
+    }
+
+    fn issue_2116_block(round: u64, rewards_level: u64, state: &LedgerState) -> Block {
+        Block {
+            round: Round(round),
+            rewards_level,
+            fee_sink: state.fee_sink,
+            rewards_pool: state.rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            ..Block::default()
+        }
+    }
+
+    /// Every µAlgo, pending rewards included: rewards only move between the
+    /// pool and the accounts, so this never changes.
+    fn issue_2116_money(state: &LedgerState) -> u64 {
+        let t = crate::store_trait::LedgerStore::account_totals(state);
+        t.online.money + t.offline.money + t.not_participating.money
+    }
+
+    /// Issue #2116, go `StartEvaluator` (`ledger/eval/eval.go` L826-L860): a
+    /// block that raises the rewards level withdraws
+    /// `prevTotals.RewardUnits() * (level - prevLevel)` from the pool before
+    /// any transaction, even when nobody claims anything, and the
+    /// not-participating totals drop by it.
     #[test]
-    fn test_rewards_pool_debited() {
+    fn issue_2116_block_start_withdraws_accrued_rewards_from_the_pool() {
+        let (mut state, offline, online, pool) = issue_2116_state(100_000_000_000);
+        let money = issue_2116_money(&state);
+        let notpart = crate::store_trait::LedgerStore::account_totals(&state)
+            .not_participating
+            .money;
+        {
+            let b = issue_2116_block(1, 3, &state);
+            apply_block(&mut state, &b)
+        }
+        .unwrap();
+        // 464 reward units * 3 levels.
+        assert_eq!(
+            state.get_account(&pool).unwrap().micro_algos,
+            100_000_000_000 - 1_392
+        );
+        let t = crate::store_trait::LedgerStore::account_totals(&state);
+        assert_eq!(t.not_participating.money, notpart - 1_392);
+        assert_eq!(t.online.money, 400_000_000 + 1_200);
+        assert_eq!(t.offline.money, 64_000_000 + 192);
+        assert_eq!(issue_2116_money(&state), money, "no µAlgo is minted");
+        // Nobody claimed: the accounts' stored balances are unchanged.
+        assert_eq!(state.get_account(&offline).unwrap().micro_algos, 64_000_000);
+        assert_eq!(state.get_account(&online).unwrap().micro_algos, 400_000_000);
+    }
+
+    /// Issue #2116: a claim in a later block moves only the claimant's
+    /// balance; the pool pays each level once, at the block start.
+    #[test]
+    fn issue_2116_later_claims_do_not_debit_the_pool_again() {
+        let (mut state, offline, online, pool) = issue_2116_state(100_000_000_000);
+        let money = issue_2116_money(&state);
+        {
+            let b = issue_2116_block(1, 1, &state);
+            apply_block(&mut state, &b)
+        }
+        .unwrap();
+        let mut b2 = issue_2116_block(2, 2, &state);
+        b2.payset = vec![pay_txn(offline, online, 1_000_000, 1_000)];
+        apply_block(&mut state, &b2).unwrap();
+        // Two blocks, one level each, 464 units: 928 µAlgos, and nothing for
+        // the offline account's claim of its 2 * 64 pending µAlgos.
+        assert_eq!(
+            state.get_account(&pool).unwrap().micro_algos,
+            100_000_000_000 - 928
+        );
+        let o = state.get_account(&offline).unwrap();
+        assert_eq!(o.rewarded_micro_algos, 128);
+        assert_eq!(o.rewards_base, 2);
+        assert_eq!(issue_2116_money(&state), money, "no µAlgo is minted");
+    }
+
+    /// Issue #2116: go fails the block when the pool cannot pay the
+    /// withdrawal ("overflowed subtracting reward unit") and leaves the state
+    /// as it was.
+    #[test]
+    fn issue_2116_pool_that_cannot_cover_the_withdrawal_fails_the_block() {
+        let (mut state, _, _, pool) = issue_2116_state(1_000);
+        let err = {
+            let b = issue_2116_block(1, 3, &state);
+            apply_block(&mut state, &b)
+        }
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("overflowed subtracting reward unit for block 1"),
+            "{err}"
+        );
+        assert_eq!(state.get_account(&pool).unwrap().micro_algos, 1_000);
+        assert_eq!(state.rewards_level, 0);
+        assert_eq!(state.current_round, Round(0));
+    }
+
+    /// Issue #2116: "ensure that we have at least MinBalance after
+    /// withdrawing rewards": a pool left below `MinBalance` fails the block,
+    /// with or without a withdrawal.
+    #[test]
+    fn issue_2116_pool_below_min_balance_after_the_withdrawal_fails_the_block() {
+        // 100_000 MinBalance + 1_392 withdrawal - 1.
+        let (mut state, _, _, pool) = issue_2116_state(101_391);
+        let err = {
+            let b = issue_2116_block(1, 3, &state);
+            apply_block(&mut state, &b)
+        }
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("overflowed subtracting rewards for block 1"),
+            "{err}"
+        );
+        assert_eq!(state.get_account(&pool).unwrap().micro_algos, 101_391);
+        // Exactly MinBalance left is fine.
+        let (mut state, _, _, pool) = issue_2116_state(101_392);
+        {
+            let b = issue_2116_block(1, 3, &state);
+            apply_block(&mut state, &b)
+        }
+        .unwrap();
+        assert_eq!(state.get_account(&pool).unwrap().micro_algos, 100_000);
+        // No withdrawal at all still needs the pool at MinBalance.
+        let (mut state, _, _, _) = issue_2116_state(99_999);
+        assert!({
+            let b = issue_2116_block(1, 0, &state);
+            apply_block(&mut state, &b)
+        }
+        .is_err());
+    }
+
+    /// Issue #2116: a rewards level that goes down fails like go's
+    /// `ot.Sub` overflow.
+    #[test]
+    fn issue_2116_decreasing_rewards_level_fails_the_block() {
+        let (mut state, _, _, _) = issue_2116_state(100_000_000_000);
+        state.rewards_level = 5;
+        let err = {
+            let b = issue_2116_block(1, 4, &state);
+            apply_block(&mut state, &b)
+        }
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("overflowed subtracting rewards(4, 5) levels for block 1"),
+            "{err}"
+        );
+    }
+
+    /// Issue #2116, go `workaroundOverspentRewards`: on testnet only, at
+    /// rounds 1499995 and 2926564, 20,000 Algos move from the testnet bank
+    /// to the pool before the withdrawal.
+    #[test]
+    fn issue_2116_testnet_overspent_rewards_workaround() {
+        let bank = Address(TESTNET_BANK_ADDRESS);
+        for (genesis, round, moved) in [
+            (TESTNET_GENESIS_HASH, 1_499_995u64, true),
+            (TESTNET_GENESIS_HASH, 2_926_564, true),
+            (TESTNET_GENESIS_HASH, 1_499_996, false),
+            ([7u8; 32], 1_499_995, false),
+        ] {
+            let (mut state, _, _, pool) = issue_2116_state(1_000_000);
+            state.current_round = Round(round - 1);
+            state.accounts.insert(
+                bank,
+                algo_types::AccountData {
+                    micro_algos: 30_000_000_000,
+                    status: AccountStatus::NotParticipating,
+                    ..algo_types::AccountData::default()
+                },
+            );
+            let mut b = issue_2116_block(round, 0, &state);
+            b.genesis_hash = genesis;
+            apply_block(&mut state, &b).unwrap();
+            let shift = if moved { 20_000_000_000 } else { 0 };
+            assert_eq!(
+                state.get_account(&bank).unwrap().micro_algos,
+                30_000_000_000 - shift,
+                "round {round}"
+            );
+            assert_eq!(
+                state.get_account(&pool).unwrap().micro_algos,
+                1_000_000 + shift,
+                "round {round}"
+            );
+        }
+    }
+
+    /// Issue #2116: claiming pending rewards inside a transaction (go
+    /// `WithUpdatedRewards` in `roundCowState.Move`) only moves the claiming
+    /// account's own balance and rewards base. The pool paid for those
+    /// rewards when the block started (`withdraw_block_rewards`), so the claim
+    /// must not debit it a second time.
+    #[test]
+    fn test_reward_claim_does_not_debit_the_pool() {
         let sender = Address([1u8; 32]);
         let receiver = Address([2u8; 32]);
         let fee_sink = Address([3u8; 32]);
@@ -7856,11 +8289,14 @@ mod tests {
 
         apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
 
-        // Sender had 5 Algos = 5 reward units. Pending = (10 - 0) * 5 = 50.
-        // Rewards pool should be debited by 50.
+        // Sender had 5 Algos = 5 reward units. Pending = (10 - 0) * 5 = 50,
+        // claimed by the sender; the pool is untouched by the claim.
+        let s = state.get_account(&sender).unwrap();
+        assert_eq!(s.rewarded_micro_algos, 50);
+        assert_eq!(s.micro_algos, 5_000_000 + 50 - 1_000 - 1_000);
         assert_eq!(
             state.get_account(&rewards_pool).unwrap().micro_algos,
-            10_000_000 - 50
+            10_000_000
         );
     }
 
@@ -12361,7 +12797,11 @@ mod tests {
         let fee_sink = Address([3u8; 32]);
         let rewards_pool = Address([9u8; 32]);
         let mut state = make_state_with_accounts(
-            &[(creator, 20_000_000), (fee_sink, 0), (rewards_pool, 0)],
+            &[
+                (creator, 20_000_000),
+                (fee_sink, 0),
+                (rewards_pool, TEST_POOL_MIN_BALANCE),
+            ],
             fee_sink,
         );
         state.rewards_pool = rewards_pool;
@@ -12415,6 +12855,7 @@ return
         create.txn.fee = 1_000;
         create.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
         create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        fund_test_rewards_pool(&mut state);
         let delta1 =
             apply_block_with_delta_mode(&mut state, &mk_block(1, vec![create]), ApplyMode::Execute)
                 .unwrap();
@@ -12455,7 +12896,11 @@ return
         let fee_sink = Address([3u8; 32]);
         let rewards_pool = Address([9u8; 32]);
         let mut state = make_state_with_accounts(
-            &[(creator, 20_000_000), (fee_sink, 0), (rewards_pool, 0)],
+            &[
+                (creator, 20_000_000),
+                (fee_sink, 0),
+                (rewards_pool, TEST_POOL_MIN_BALANCE),
+            ],
             fee_sink,
         );
         state.rewards_pool = rewards_pool;
@@ -12502,6 +12947,7 @@ return
         create.txn.fee = 1_000;
         create.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
         create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        fund_test_rewards_pool(&mut state);
         let delta1 =
             apply_block_with_delta_mode(&mut state, &mk_block(1, vec![create]), ApplyMode::Execute)
                 .unwrap();
@@ -12624,7 +13070,11 @@ return
         let fee_sink = Address([3u8; 32]);
         let rewards_pool = Address([9u8; 32]);
         let mut state = make_state_with_accounts(
-            &[(creator, 20_000_000), (fee_sink, 0), (rewards_pool, 0)],
+            &[
+                (creator, 20_000_000),
+                (fee_sink, 0),
+                (rewards_pool, 10_000_000_000),
+            ],
             fee_sink,
         );
         state.rewards_pool = rewards_pool;
@@ -12955,56 +13405,6 @@ return
         )
     }
 
-    /// Pool insufficiency during the inner rewards pass fails the call with
-    /// the same error as the top-level pass (go never lets the pool go
-    /// negative), instead of minting rewards from nothing.
-    #[test]
-    fn issue_1731_inner_pass_fails_when_rewards_pool_cannot_cover_rewards() {
-        let creator = Address([1u8; 32]);
-        let target = Address([5u8; 32]);
-        let fee_sink = Address([3u8; 32]);
-        let rewards_pool = Address([9u8; 32]);
-        let mut state = make_state_with_accounts(
-            &[
-                (creator, 20_000_000),
-                (target, 5_000_000),
-                (fee_sink, 0),
-                (rewards_pool, 0),
-            ],
-            fee_sink,
-        );
-        state.rewards_pool = rewards_pool;
-        issue_1729_set_base(&mut state, creator, 218_288);
-        issue_1729_set_base(&mut state, target, 218_000);
-        let (app_id, _) = issue_1731_deploy(
-            &mut state,
-            creator,
-            fee_sink,
-            rewards_pool,
-            &issue_1731_pay_program(&target),
-            2_500_000,
-            218_000,
-        );
-        let before_target = state.get_account(&target).unwrap().clone();
-        let err = apply_block_with_delta_mode(
-            &mut state,
-            &issue_1731_block(
-                3,
-                fee_sink,
-                rewards_pool,
-                vec![issue_1731_app_call(creator, app_id, 2_000)],
-                0,
-            ),
-            ApplyMode::Execute,
-        )
-        .expect_err("inner pass must fail with an empty rewards pool");
-        assert!(
-            err.to_string().contains("rewards pool balance"),
-            "unexpected error: {err}"
-        );
-        assert_eq!(state.get_account(&target).unwrap(), &before_target);
-    }
-
     /// A depth-2 inner payment (outer app -> inner app call -> inner pay)
     /// inherits the block's rewards level (`execute_inner_appl` propagation).
     #[test]
@@ -13148,8 +13548,8 @@ return
         assert_eq!(cb.rewarded_micro_algos, 1_000);
         assert_eq!(
             state.get_account(&rewards_pool).unwrap().micro_algos,
-            pool_before - 1_000,
-            "only the fee payer's reward leaves the pool"
+            pool_before,
+            "a claim never debits the pool (issue #2116)"
         );
         assert_eq!(
             issue_1731_rewards_view(state.get_account(&user).unwrap()),
@@ -13275,7 +13675,11 @@ return
         let fee_sink = Address([3u8; 32]);
         let rewards_pool = Address([9u8; 32]);
         let mut state = make_state_with_accounts(
-            &[(creator, 20_000_000), (fee_sink, 0), (rewards_pool, 0)],
+            &[
+                (creator, 20_000_000),
+                (fee_sink, 0),
+                (rewards_pool, TEST_POOL_MIN_BALANCE),
+            ],
             fee_sink,
         );
         state.rewards_pool = rewards_pool;
@@ -13323,6 +13727,7 @@ return
         create.txn.fee = 1_000;
         create.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
         create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        fund_test_rewards_pool(&mut state);
         let delta1 =
             apply_block_with_delta_mode(&mut state, &mk_block(1, vec![create]), ApplyMode::Execute)
                 .unwrap();
@@ -15495,6 +15900,7 @@ return
             ..Block::default()
         };
 
+        fund_test_block_rewards_pool(&mut ledger, &block);
         apply_block_validating(&mut ledger, &block)
             .expect("lookback total: the account is absent whatever the whale brings online");
         let whale = ledger.get_account(&whale_addr).unwrap();
@@ -15631,7 +16037,11 @@ return
         let rewards_pool = Address([9u8; 32]);
 
         let mut state = make_state_with_accounts(
-            &[(creator, 10_000_000), (fee_sink, 0), (rewards_pool, 0)],
+            &[
+                (creator, 10_000_000),
+                (fee_sink, 0),
+                (rewards_pool, TEST_POOL_MIN_BALANCE),
+            ],
             fee_sink,
         );
         state.rewards_pool = rewards_pool;
@@ -15656,6 +16066,7 @@ return
             ..Block::default()
         };
 
+        fund_test_block_rewards_pool(&mut state, &block);
         let delta = apply_block_with_delta(&mut state, &block).unwrap();
 
         assert_eq!(
@@ -15703,7 +16114,11 @@ return
         let rewards_pool = Address([9u8; 32]);
 
         let mut state = make_state_with_accounts(
-            &[(creator, 10_000_000), (fee_sink, 0), (rewards_pool, 0)],
+            &[
+                (creator, 10_000_000),
+                (fee_sink, 0),
+                (rewards_pool, TEST_POOL_MIN_BALANCE),
+            ],
             fee_sink,
         );
         state.rewards_pool = rewards_pool;
@@ -15729,6 +16144,7 @@ return
             payset: vec![create],
             ..Block::default()
         };
+        fund_test_block_rewards_pool(&mut state, &block1);
         apply_block_with_delta(&mut state, &block1).unwrap();
 
         // Round 2: destroy it (empty `AssetParams` signals destroy).
@@ -15789,7 +16205,11 @@ return
         let rewards_pool = Address([9u8; 32]);
 
         let mut state = make_state_with_accounts(
-            &[(creator, 10_000_000), (fee_sink, 0), (rewards_pool, 0)],
+            &[
+                (creator, 10_000_000),
+                (fee_sink, 0),
+                (rewards_pool, TEST_POOL_MIN_BALANCE),
+            ],
             fee_sink,
         );
         state.rewards_pool = rewards_pool;
@@ -15816,6 +16236,7 @@ return
             payset: vec![create],
             ..Block::default()
         };
+        fund_test_block_rewards_pool(&mut state, &block1);
         apply_block_with_delta(&mut state, &block1).unwrap();
 
         // Reconfigure with the exact same role addresses -- a real,
@@ -15880,7 +16301,11 @@ return
         let rewards_pool = Address([9u8; 32]);
 
         let mut state = make_state_with_accounts(
-            &[(creator, 10_000_000), (fee_sink, 0), (rewards_pool, 0)],
+            &[
+                (creator, 10_000_000),
+                (fee_sink, 0),
+                (rewards_pool, TEST_POOL_MIN_BALANCE),
+            ],
             fee_sink,
         );
         state.rewards_pool = rewards_pool;
@@ -15901,6 +16326,7 @@ return
             ..Block::default()
         };
 
+        fund_test_block_rewards_pool(&mut state, &block);
         let delta = apply_block_with_delta(&mut state, &block).unwrap();
 
         assert_eq!(
@@ -15940,7 +16366,7 @@ return
                 (sender, 5_000_000),
                 (receiver, 0),
                 (fee_sink, 0),
-                (rewards_pool, 0),
+                (rewards_pool, TEST_POOL_MIN_BALANCE),
             ],
             fee_sink,
         );
@@ -15958,6 +16384,7 @@ return
             ..Block::default()
         };
 
+        fund_test_block_rewards_pool(&mut state, &block);
         let delta = apply_block_with_delta(&mut state, &block).unwrap();
 
         // sender: 5_000_000 - 1_000_000 - 1_000 = 3_999_000; receiver:
@@ -16001,7 +16428,11 @@ return
         let rewards_pool = Address([9u8; 32]);
 
         let mut state = make_state_with_accounts(
-            &[(creator, 20_000_000), (fee_sink, 0), (rewards_pool, 0)],
+            &[
+                (creator, 20_000_000),
+                (fee_sink, 0),
+                (rewards_pool, TEST_POOL_MIN_BALANCE),
+            ],
             fee_sink,
         );
         state.rewards_pool = rewards_pool;
@@ -16050,6 +16481,7 @@ return
             payset: vec![create],
             ..Block::default()
         };
+        fund_test_block_rewards_pool(&mut state, &block1);
         let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute).unwrap();
         assert_eq!(delta1.creatables.len(), 1, "app create must be a creatable");
         let (&app_id, app_creatable) = delta1.creatables.iter().next().unwrap();
@@ -16159,7 +16591,11 @@ return
         let new_manager = Address([7u8; 32]);
 
         let mut state = make_state_with_accounts(
-            &[(creator, 20_000_000), (fee_sink, 0), (rewards_pool, 0)],
+            &[
+                (creator, 20_000_000),
+                (fee_sink, 0),
+                (rewards_pool, TEST_POOL_MIN_BALANCE),
+            ],
             fee_sink,
         );
         state.rewards_pool = rewards_pool;
@@ -16205,6 +16641,7 @@ return
             payset: vec![create],
             ..Block::default()
         };
+        fund_test_block_rewards_pool(&mut state, &block1);
         let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute).unwrap();
         let (&app_id, _) = delta1.creatables.iter().next().unwrap();
         let app_addr = Address(crate::avm_context::app_address(app_id));
@@ -16325,7 +16762,11 @@ return
         let new_manager = Address([7u8; 32]);
 
         let mut state = make_state_with_accounts(
-            &[(creator, 20_000_000), (fee_sink, 0), (rewards_pool, 0)],
+            &[
+                (creator, 20_000_000),
+                (fee_sink, 0),
+                (rewards_pool, TEST_POOL_MIN_BALANCE),
+            ],
             fee_sink,
         );
         state.rewards_pool = rewards_pool;
@@ -16404,6 +16845,7 @@ return
             payset: vec![create],
             ..Block::default()
         };
+        fund_test_block_rewards_pool(&mut state, &block1);
         let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute).unwrap();
         let (&app_id, _) = delta1.creatables.iter().next().unwrap();
         let app_addr = Address(crate::avm_context::app_address(app_id));
@@ -16764,6 +17206,7 @@ return
             ..Block::default()
         };
 
+        fund_test_block_rewards_pool(&mut state, &block);
         let err = apply_block_with_delta_mode(&mut state, &block, ApplyMode::Execute).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -16808,6 +17251,7 @@ return
             ..Block::default()
         };
 
+        fund_test_block_rewards_pool(&mut state, &block);
         let delta = apply_block_with_delta_mode(&mut state, &block, ApplyMode::Execute)
             .expect("enough io-bump box refs must satisfy the write budget");
         assert_eq!(
@@ -16841,6 +17285,7 @@ return
             payset: vec![create],
             ..Block::default()
         };
+        fund_test_block_rewards_pool(&mut state, &block1);
         let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute).unwrap();
         let &app_id = delta1
             .creatables
@@ -16920,6 +17365,7 @@ return
             payset: vec![create],
             ..Block::default()
         };
+        fund_test_block_rewards_pool(&mut state, &block1);
         let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute)
             .expect("oversized create with enough box bumps must succeed");
         let &app_id = delta1
@@ -16985,6 +17431,7 @@ return
             payset: vec![create],
             ..Block::default()
         };
+        fund_test_block_rewards_pool(&mut state, &block1);
         let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute)
             .expect("oversized create with enough box bumps must succeed");
         let &app_id = delta1
@@ -17044,6 +17491,7 @@ return
             payset: vec![create],
             ..Block::default()
         };
+        fund_test_block_rewards_pool(&mut state, &block1);
         let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute).unwrap();
         let &app_id = delta1
             .creatables
@@ -17106,6 +17554,7 @@ return
             payset: vec![create],
             ..Block::default()
         };
+        fund_test_block_rewards_pool(&mut state, &block1);
         let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute).unwrap();
         let &app_id = delta1
             .creatables
@@ -17173,6 +17622,7 @@ return
             payset: vec![create],
             ..Block::default()
         };
+        fund_test_block_rewards_pool(&mut state, &block1);
         let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute).unwrap();
         let &app_id = delta1
             .creatables
@@ -17243,6 +17693,7 @@ return
             payset: vec![create],
             ..Block::default()
         };
+        fund_test_block_rewards_pool(&mut state, &block1);
         let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute).unwrap();
         let &app_id = delta1
             .creatables
@@ -17321,6 +17772,7 @@ return
             payset: vec![create],
             ..Block::default()
         };
+        fund_test_block_rewards_pool(&mut state, &block1);
         let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute).unwrap();
         let &app_id = delta1
             .creatables
@@ -17391,6 +17843,7 @@ return
             payset: vec![create],
             ..Block::default()
         };
+        fund_test_block_rewards_pool(&mut state, &block1);
         let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute).unwrap();
         let &app_id = delta1
             .creatables
@@ -17465,6 +17918,7 @@ return
             payset: vec![create],
             ..Block::default()
         };
+        fund_test_block_rewards_pool(&mut state, &block1);
         let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute).unwrap();
         let &app_id = delta1
             .creatables

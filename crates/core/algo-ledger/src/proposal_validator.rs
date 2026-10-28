@@ -215,7 +215,7 @@ mod tests {
     }
 
     fn ledger_at(round: u64) -> Arc<Mutex<SqliteLedger>> {
-        let mut l = SqliteLedger::open_in_memory().unwrap();
+        let mut l = crate::apply::pool_fixtures::funded_sqlite_ledger();
         l.set_current_round(Round(round));
         Arc::new(Mutex::new(l))
     }

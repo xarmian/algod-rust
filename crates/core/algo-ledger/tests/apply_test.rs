@@ -34,7 +34,7 @@ use algo_types::{
 // ---------------------------------------------------------------------------
 
 fn make_state(balances: &[(Address, u64)], fee_sink: Address) -> LedgerState {
-    let mut state = LedgerState::new();
+    let mut state = funded_ledger_state();
     state.fee_sink = fee_sink;
     for (addr, bal) in balances {
         let acct = state.get_or_default_account_mut(addr);
@@ -543,7 +543,8 @@ fn test_close_with_opted_in_apps_fails() {
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg == "cannot close: 2 outstanding applications opted in. Please opt out or clear them",
+        err_msg
+            == "cannot close: 2 outstanding applications opted in. Please opt out or clear them",
         "go's apply.Payment text expected, got: {}",
         err_msg,
     );
@@ -2765,4 +2766,36 @@ fn write_budget_combined_oversized_create_calls_without_group_sharing_wrongly_ac
         "without group-wide box-budget sharing, app B's isolated dirty_bytes check \
          wrongly accepts a group whose combined program-write footprint exceeds its io_budget",
     );
+}
+
+/// Issue #2116: go `StartEvaluator` rejects a block whose rewards pool holds
+/// less than `MinBalance` after the block-start withdrawal, so test ledgers
+/// fund their (zero-address) pool as every real genesis does.
+#[allow(dead_code)]
+fn funded_sqlite_ledger() -> algo_ledger::SqliteLedger {
+    let mut l = algo_ledger::SqliteLedger::open_in_memory().expect("in-memory ledger");
+    fund_rewards_pool(&mut l);
+    l
+}
+
+#[allow(dead_code)]
+fn funded_ledger_state() -> algo_ledger::LedgerState {
+    let mut s = algo_ledger::LedgerState::new();
+    fund_rewards_pool(&mut s);
+    s
+}
+
+#[allow(dead_code)]
+fn fund_rewards_pool<L: algo_ledger::LedgerStore>(store: &mut L) {
+    let pool = store.rewards_pool();
+    if store.get_account(&pool).is_none() {
+        store.set_account(
+            &pool,
+            algo_types::AccountData {
+                micro_algos: 100_000,
+                status: algo_types::AccountStatus::NotParticipating,
+                ..algo_types::AccountData::default()
+            },
+        );
+    }
 }

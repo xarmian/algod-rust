@@ -24,12 +24,12 @@ use std::collections::HashSet;
 
 use algo_ledger::{
     apply_block_capturing_group_deltas, apply_block_with_delta, LedgerState, LedgerStore,
-    SqliteLedger, TxnGroupDeltaTracer,
+    TxnGroupDeltaTracer,
 };
 use algo_types::{AccountData, Address, Block, Digest, Round, SignedTransaction};
 
 fn make_state(balances: &[(Address, u64)], fee_sink: Address) -> LedgerState {
-    let mut state = LedgerState::new();
+    let mut state = funded_ledger_state();
     state.fee_sink = fee_sink;
     for (addr, bal) in balances {
         state.set_account(
@@ -275,7 +275,7 @@ fn sqlite_ledger_feeds_group_tracer_when_enabled() {
     let b = Address([2u8; 32]);
     let fee_sink = Address([3u8; 32]);
 
-    let mut ledger = SqliteLedger::open_in_memory().unwrap();
+    let mut ledger = funded_sqlite_ledger();
     ledger.set_account(
         &a,
         AccountData {
@@ -335,7 +335,7 @@ fn group_tracer_does_not_poison_lease_table() {
     let b = Address([2u8; 32]);
     let fee_sink = Address([3u8; 32]);
 
-    let mut ledger = SqliteLedger::open_in_memory().unwrap();
+    let mut ledger = funded_sqlite_ledger();
     ledger.set_account(
         &a,
         AccountData {
@@ -361,4 +361,36 @@ fn group_tracer_does_not_poison_lease_table() {
         5_000_000 - 100_000 - 1000
     );
     assert!(ledger.txn_group_deltas_for_round(1).is_some());
+}
+
+/// Issue #2116: go `StartEvaluator` rejects a block whose rewards pool holds
+/// less than `MinBalance` after the block-start withdrawal, so test ledgers
+/// fund their (zero-address) pool as every real genesis does.
+#[allow(dead_code)]
+fn funded_sqlite_ledger() -> algo_ledger::SqliteLedger {
+    let mut l = algo_ledger::SqliteLedger::open_in_memory().expect("in-memory ledger");
+    fund_rewards_pool(&mut l);
+    l
+}
+
+#[allow(dead_code)]
+fn funded_ledger_state() -> algo_ledger::LedgerState {
+    let mut s = algo_ledger::LedgerState::new();
+    fund_rewards_pool(&mut s);
+    s
+}
+
+#[allow(dead_code)]
+fn fund_rewards_pool<L: algo_ledger::LedgerStore>(store: &mut L) {
+    let pool = store.rewards_pool();
+    if store.get_account(&pool).is_none() {
+        store.set_account(
+            &pool,
+            algo_types::AccountData {
+                micro_algos: 100_000,
+                status: algo_types::AccountStatus::NotParticipating,
+                ..algo_types::AccountData::default()
+            },
+        );
+    }
 }
