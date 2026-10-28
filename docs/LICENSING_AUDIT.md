@@ -103,7 +103,8 @@ classification are out of scope for this PR — see "What's deferred" below.
 | `algo-agreement-fuzz` | (a) AGPL | Constructs agreement (consensus) protocol messages to test against go-algorand's own conformance acceptance — inherently structured around go-algorand's wire semantics. |
 | `algokey-rust` | (a) AGPL | Its own doc comment states it is a "Rust port of `../go-algorand/cmd/algokey`." |
 | `goal-rust` | (a) AGPL | CLI reimplementation of `goal`'s command surface and output formatting, parity-tested against go-algorand's `goal` binary output. |
-| `algo-bench` | (b) MIT | Benchmark metrics collection, JSON output, and comparison-table rendering. Original tooling: it formats and compares numbers produced by other (AGPL) crates and by go-algorand's own binaries, but embeds no ported algorithm or protocol logic itself. |
+| `algo-bench` | (a) AGPL as a crate, with MIT-eligible files | Since #2104 the crate also holds the workload-corpus reader (`src/corpus.rs`, `tests/corpus_small.rs`, AGPL headers). It mirrors the census of the AGPL `benchmarks/go-corpus/record.go` and embeds go-algorand's genesis-restore TxID rule (`DecodeSignedTxn`), so it is AGPL by the "when in doubt" rule, and the crate's `Cargo.toml` `license` is the workspace AGPL. The original metrics/JSON/table/trie-replay tooling (`src/metrics.rs`, `output.rs`, `table.rs`, `trie_replay.rs`, `lib.rs`, `src/bin/*`, `benches/*`) keeps its MIT headers and stays individually MIT-available: it formats and compares numbers and embeds no ported algorithm or protocol logic. |
+| `algo-bench-pairs` | (a) AGPL | Rust half of the paired Go/Rust micro-benchmarks (#2103): each case drives a production AGPL crate (`algo-codec`, `algo-avm`, `algo-ledger`, ...) on go-algorand-generated fixtures, digest-compared against `benchmarks/go-micro`. |
 
 ## `crates/tools/*-oracle` / `*-capture` (Go helper programs under `tools/`)
 
@@ -149,6 +150,9 @@ not import go-algorand itself and does not port node logic — see the
 | Path | Classification | Rationale |
 |---|---|---|
 | `benchmarks/go-decode/*` | (a) AGPL | Its own doc comment states it "benchmarks go-algorand's msgpack block decoding," and its `go.mod` requires `github.com/algorand/go-algorand` directly to invoke the node's own decode path for a head-to-head comparison. |
+| `benchmarks/go-micro/*` | (a) AGPL | Go half of the paired micro-benchmarks (#2103): `testing.B` benchmarks and fixture/digest generators that import go-algorand packages directly (and an in-memory `logic.LedgerForLogic` modelled on go-algorand's test ledger). |
+| `benchmarks/go-corpus/*` | (a) AGPL | The workload-corpus generator `corpusgen` (#2104): links go-algorand to build the genesis, assemble TEAL, build/sign transactions and decode blocks with go-algorand's own types and codec. |
+| `benchmarks/corpus/*`, `benchmarks/fixtures/*`, `benchmarks/pairs.toml` | data, no header | Recorded go-algorand output (blocks, genesis, consensus params) and registry/coverage data. JSON/binary data cannot carry a header; they are covered by the repository license like any other data file. |
 
 ## `tests/*`, `scripts/*` (repo-root)
 
@@ -157,6 +161,7 @@ not import go-algorand itself and does not port node logic — see the
 | `tests/golden/gen_agreement_vectors.go` | (a) AGPL | Its own header states it references unexported types from go-algorand's `agreement`/`committee` packages and is run *inside* the go-algorand source tree to produce golden vectors — a structural extension of go-algorand's own test code. |
 | `scripts/build-phase-b-fixtures.go` | (a) AGPL | Produces Go-signed transaction fixtures for `algokey-rust` parity tests; drives go-algorand's own signing code paths for comparison. |
 | `scripts/capture-algokey-fixtures.sh`, `scripts/capture-phase-b-fixtures.sh`, `scripts/capture-pqsig-fixtures.sh` | (b) MIT | Shell orchestration (build/run the above Go programs, arrange output) with no ported logic of its own. Note these scripts *invoke* AGPL-classified Go programs but are themselves thin process orchestration, matching the "isn't itself AGPL-derived just by proximity" carve-out — the substantive logic lives in the `.go` file, not the `.sh` wrapper. |
+| `scripts/bench/**` (`run.py`, `report.py`, `fingerprint.py`, `build_both.sh`, `micro_*.py`, `tiers/*`, `corpus/*.py`, `fetch_corpus.sh`, `test_*.py`) | (b) MIT | The Phase 23 bench-compare harness (#2102, #2103, #2104): process orchestration, statistics, manifests and report rendering. It runs the AGPL Go/Rust benchmark programs but embeds no ported logic. |
 
 ## `docker/`, `ops/` — infra and operational tooling
 
@@ -225,15 +230,17 @@ tests).
 ## Summary counts (directory/crate level)
 
 - **(a) AGPL-derived**: all 10 `crates/core/*` crates, all 8 `crates/node/*`
-  crates, 7 of 8 `crates/tools/*` Rust crates (all but `algo-bench`), both
+  crates, the `crates/tools/*` Rust crates listed above (`algo-bench` as a
+  crate, with its MIT-eligible files noted in its row), both
   `bin/*` binaries, all 21 Go programs under `tools/`,
-  `benchmarks/go-decode`, `tests/golden/gen_agreement_vectors.go`,
+  `benchmarks/go-decode`, `benchmarks/go-micro`, `benchmarks/go-corpus`, `tests/golden/gen_agreement_vectors.go`,
   `scripts/build-phase-b-fixtures.go`.
 - **(b) MIT-eligible**: repo-root tooling/config files, `README.md`,
   `CLAUDE.md`, all of `docs/*`, all of `.github/workflows/*`, all of
   `.claude/*`, all of `docker/*` except none (all verified MIT — including
-  `canonical-extract`), all of `ops/*`, `fuzz/*`, `algo-bench`, the shell
-  wrappers under `scripts/*.sh`.
+  `canonical-extract`), all of `ops/*`, `fuzz/*`, the original metrics/table files of
+  `algo-bench`, the shell wrappers under `scripts/*.sh`, and the
+  `scripts/bench/**` harness.
 - **(c) Third-party-derived** (layered on top of (a) classification):
   poseidon2 functions in `crates/core/algo-avm/src/ops/crypto.rs`
   (gnark-crypto v0.18.1, Apache-2.0); `crates/core/algo-consensus-crypto/src/sumhash.rs`

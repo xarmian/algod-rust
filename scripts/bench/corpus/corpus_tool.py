@@ -33,21 +33,21 @@ import tarfile
 MANIFEST = "MANIFEST.sha256"
 SCHEMA = "algod-corpus/v1"
 
-# Every workload kind issue #2104 requires in both corpora.
-REQUIRED_SUBTYPES = [
-    "pay.payment", "pay.close",
-    "axfer.optin", "axfer.transfer", "axfer.clawback", "axfer.close",
-    "afrz.freeze", "afrz.unfreeze",
-    "acfg.create", "acfg.reconfigure", "acfg.destroy",
-    "appl.create", "appl.call", "appl.optin", "appl.closeout", "appl.clear",
-    "appl.update", "appl.delete",
-    "keyreg.online", "keyreg.offline",
-]
-REQUIRED_FEATURES = [
-    "groups", "grouped_txns", "inner_txns", "rekey_txns", "auth_addr_txns",
-    "app_global_delta_txns", "app_local_delta_txns", "app_box_ref_txns",
-]
-REQUIRED_INNER = ["pay", "axfer", "appl"]
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
+# Every workload kind issue #2104 requires in every corpus. The single source
+# of truth, also read by crates/tools/algo-bench/tests/corpus_small.rs.
+COVERAGE_FILE = os.path.join(REPO, "benchmarks", "corpus", "coverage.json")
+
+
+def load_coverage(path=COVERAGE_FILE):
+    with open(path, encoding="utf-8") as f:
+        cov = json.load(f)
+    return cov["subtypes"], cov["features"], cov["inner_types"]
+
+
+REQUIRED_SUBTYPES, REQUIRED_FEATURES, REQUIRED_INNER = load_coverage()
+HEX_DIGITS = frozenset("0123456789abcdef")
 REQUIRED_FILES = ["blocks", "genesis", "node_config", "consensus"]
 
 
@@ -82,7 +82,12 @@ def parse_manifest(text):
         if not line.strip():
             continue
         digest, sep, name = line.partition("  ")
-        if not sep or len(digest) != 64 or not name or "/" in name or "\\" in name:
+        # Same rules as crates/tools/algo-bench/src/corpus.rs parse_manifest
+        # (shared vectors: scripts/bench/testdata/corpus/manifest_vectors.json):
+        # a lowercase sha256 hex digest, and a plain file name in the corpus
+        # directory itself.
+        if (not sep or len(digest) != 64 or not set(digest) <= HEX_DIGITS or not name
+                or "/" in name or "\\" in name or name in (".", "..", MANIFEST)):
             raise ValueError(f"{MANIFEST} line {i}: malformed: {line!r}")
         if name in entries:
             raise ValueError(f"{MANIFEST} line {i}: duplicate entry {name}")

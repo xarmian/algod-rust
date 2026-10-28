@@ -1,7 +1,22 @@
-// Copyright (c) 2026 Algod DAO
+// Copyright (C) 2019-2026 Algorand Foundation Ltd.
+// Modifications Copyright (C) 2026 Algod DAO
+// This file is part of algod-rust, a modified work based on go-algorand
+// (https://github.com/algorand/go-algorand).
 //
-// SPDX-License-Identifier: MIT
-// For the full license text, see LICENSE-MIT at the repository root.
+// algod-rust is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// algod-rust is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with algod-rust.  If not, see <https://www.gnu.org/licenses/>.
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Reader for the deterministic workload block corpus (issue #2104, epic
 //! #2101), the input of the `replay` bench tier.
@@ -75,6 +90,46 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+/// Parse `MANIFEST.sha256` text into `name -> digest`.
+///
+/// Accepts exactly what `scripts/bench/corpus/corpus_tool.py`
+/// `parse_manifest` accepts (shared vectors:
+/// `scripts/bench/testdata/corpus/manifest_vectors.json`): blank lines are
+/// skipped; every other line is a 64-char lowercase hex digest, two spaces
+/// and a plain file name of the corpus directory itself. A name containing
+/// `/` or `\`, the names `.` and `..`, the manifest itself and duplicate
+/// entries are rejected, so verification can never read outside the corpus.
+pub fn parse_manifest(text: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut listed = BTreeMap::new();
+    for (i, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let malformed = || format!("{MANIFEST} line {}: malformed: {line:?}", i + 1);
+        let (digest, name) = line.split_once("  ").ok_or_else(malformed)?;
+        let hex_ok = digest.len() == 64
+            && digest
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c));
+        let name_ok = !name.is_empty()
+            && !name.contains('/')
+            && !name.contains('\\')
+            && name != "."
+            && name != ".."
+            && name != MANIFEST;
+        if !hex_ok || !name_ok {
+            return Err(malformed());
+        }
+        if listed
+            .insert(name.to_string(), digest.to_string())
+            .is_some()
+        {
+            return Err(format!("{MANIFEST} line {}: duplicate entry {name}", i + 1));
+        }
+    }
+    Ok(listed)
+}
+
 /// Check every `MANIFEST.sha256` entry of `dir` and that no file is unlisted.
 pub fn verify_manifest(dir: &Path) -> Result<(), String> {
     let raw = fs::read(dir.join(MANIFEST)).map_err(|e| format!("{MANIFEST}: {e}"))?;
@@ -85,16 +140,15 @@ pub fn verify_manifest(dir: &Path) -> Result<(), String> {
         ));
     }
     let text = String::from_utf8(raw).map_err(|e| format!("{MANIFEST}: {e}"))?;
-    let mut listed = BTreeMap::new();
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let (digest, name) = line
-            .split_once("  ")
-            .ok_or_else(|| format!("{MANIFEST}: malformed line {line:?}"))?;
-        listed.insert(name.to_string(), digest.to_string());
-    }
+    let listed = parse_manifest(&text)?;
     let mut errors = Vec::new();
     for (name, digest) in &listed {
-        match fs::read(dir.join(name)) {
+        let path = dir.join(name);
+        if !path.is_file() {
+            errors.push(format!("{name}: listed in {MANIFEST} but missing"));
+            continue;
+        }
+        match fs::read(&path) {
             Ok(b) if &sha256_hex(&b) == digest => {}
             Ok(_) => errors.push(format!("{name}: sha256 mismatch")),
             Err(e) => errors.push(format!("{name}: {e}")),
@@ -105,7 +159,7 @@ pub fn verify_manifest(dir: &Path) -> Result<(), String> {
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if entry.path().is_file() && name != MANIFEST && !listed.contains_key(&name) {
-            errors.push(format!("{name}: not listed in {MANIFEST}"));
+            errors.push(format!("{name}: present but not listed in {MANIFEST}"));
         }
     }
     if errors.is_empty() {
@@ -330,6 +384,57 @@ mod tests {
             "truncated payload"
         );
         assert!(parse_blocks(b"NOTMAGIC").is_err(), "bad magic");
+    }
+
+    /// The vectors corpus_tool.py's tests run too: both parsers must accept
+    /// exactly the same manifests.
+    #[test]
+    fn parse_manifest_matches_the_shared_python_vectors() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../scripts/bench/testdata/corpus/manifest_vectors.json");
+        let v: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        let vectors = v["vectors"].as_array().unwrap();
+        assert!(vectors.len() > 10);
+        let hex64 = "0123456789abcdef".repeat(4);
+        for vec in vectors {
+            let name = vec["name"].as_str().unwrap();
+            let text: String = vec["text"]
+                .as_str()
+                .unwrap()
+                .split_inclusive('\n')
+                .map(|l| match l.strip_prefix("H ") {
+                    Some(rest) => format!("{hex64} {rest}"),
+                    None => l.to_string(),
+                })
+                .collect();
+            let got = parse_manifest(&text);
+            if vec["valid"].as_bool().unwrap() {
+                assert!(got.is_ok(), "{name}: rejected: {got:?}");
+            } else {
+                assert!(got.is_err(), "{name}: accepted {text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn verify_manifest_rejects_escape_and_unlisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("c");
+        fs::create_dir(&d).unwrap();
+        fs::write(d.join("a.bin"), b"abc").unwrap();
+        let line = format!("{}  a.bin\n", sha256_hex(b"abc"));
+        fs::write(d.join(MANIFEST), &line).unwrap();
+        assert_eq!(verify_manifest(&d), Ok(()));
+        // A file outside the corpus directory must never be consulted.
+        fs::write(dir.path().join("outside.bin"), b"x").unwrap();
+        let esc = format!("{line}{}  ../outside.bin\n", sha256_hex(b"x"));
+        fs::write(d.join(MANIFEST), esc).unwrap();
+        assert!(verify_manifest(&d).unwrap_err().contains("malformed"));
+        fs::write(d.join(MANIFEST), &line).unwrap();
+        fs::write(d.join("extra.bin"), b"1").unwrap();
+        assert!(verify_manifest(&d)
+            .unwrap_err()
+            .contains("extra.bin: present but not listed"));
     }
 
     #[test]

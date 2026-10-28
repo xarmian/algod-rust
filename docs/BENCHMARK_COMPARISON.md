@@ -547,6 +547,7 @@ deterministic corpus generator and two corpora:
 ```bash
 make bench-corpus-fetch     # download + verify large into benchmarks/corpus/large/
 make bench-corpus-small     # regenerate small (Linux; byte-identical to the committed one)
+                            # (--force: generated beside --out, swapped in only after it verifies)
 make bench-corpus-large     # generate large locally instead of fetching (~35 min)
 python3 scripts/bench/corpus/corpus_tool.py verify benchmarks/corpus/small
 python3 scripts/bench/corpus/corpus_tool.py summary benchmarks/corpus/small
@@ -579,7 +580,7 @@ work against the pinned go-algorand:
    about a committed block from the ledger's notifier goroutine, after the
    synchronous submit has already returned. The last group goes to
    the synchronous `POST /v2/transactions`, which in DevMode assembles and
-   commits the block. Each txn has `FirstValid` = its round, `LastValid` =
+   commits the block. Pool waits poll with a 1 to 8 ms backoff. Each txn has `FirstValid` = its round, `LastValid` =
    round + 1000 and a unique 10-byte note `"bc" || u64 counter`.
 4. After each round the generator fetches the raw
    `/v2/blocks/{r}?format=msgpack` bytes, decodes them with go-algorand's own
@@ -624,15 +625,13 @@ group waits for the pool. The large preset takes 33 to 35 minutes.
 | `corpus.json` | Schema `algod-corpus/v1`: name, generator (version, seed, accounts, txns per round, timestamp step), go-algorand tag and commit, network (genesis id and hash, consensus version, devmode, genesis timestamp), file names, rounds, `txns`, `txids_sha256`, `histogram` and `final_state`. |
 | `MANIFEST.sha256` | `sha256sum` format (`<hex>  <name>`), every other file, sorted. |
 
-`histogram` counts top-level txns by `types` and `subtypes` (`pay.payment`,
-`pay.close`, `axfer.optin`, `axfer.transfer`, `axfer.clawback`,
-`axfer.close`, `acfg.create`, `acfg.reconfigure`, `acfg.destroy`,
-`afrz.freeze`, `afrz.unfreeze`, `appl.create`, `appl.call`, `appl.optin`,
-`appl.closeout`, `appl.clear`, `appl.update`, `appl.delete`,
-`keyreg.online`, `keyreg.offline`), inner txns by type at every nesting
-level (`inner_types`), and `features`: `groups`, `grouped_txns`,
-`rekey_txns`, `auth_addr_txns`, `inner_txns`, `app_global_delta_txns`,
-`app_local_delta_txns`, `app_box_ref_txns`. The definitions are in
+`histogram` counts top-level txns by `types` and `type.subtype`
+(`subtypes`), inner txns by type at every nesting level
+(`inner_types`), and `features` (groups, grouped, rekey and
+rekeyed-signer txns, inner txns, app global/local deltas, box refs).
+The kinds every corpus must contain are listed once, in
+`benchmarks/corpus/coverage.json`, which both `corpus_tool.py verify`
+and the Rust corpus test read. The definitions are in
 `benchmarks/go-corpus/record.go` and are mirrored in
 `crates/tools/algo-bench/src/corpus.rs`. `txids_sha256` is the sha256 of
 every top-level TxID (32 raw bytes each) in block order. `final_state` holds
@@ -753,7 +752,17 @@ algod-rust's `SqliteLedger` from its own genesis loader (same round-0 block
 hash as go served) to the recorded txn counter and total money, in about 8 s
 in a debug build. The Python tooling tests (`scripts/bench/test_corpus.py`:
 manifest, corpus.json arithmetic and coverage, compare, deterministic pack,
-`fetch_corpus.sh`) run in the `bench-compare-harness` job.
+`fetch_corpus.sh`) run in the `bench-compare-harness` job. The manifest
+parsers in Python (`corpus_tool.py`), Rust (`algo_bench::corpus`) and
+`fetch_corpus.sh` follow one rule set:
+- each line is a lowercase 64-hex digest, two spaces, then a file name;
+- the name is a plain name in the corpus directory, with no `/` or `\`,
+  not `.` or `..`, and not the manifest itself;
+- no duplicate entries.
+
+The Python and Rust parsers both run the shared vectors in
+`scripts/bench/testdata/corpus/manifest_vectors.json`. The shell check
+matches names exactly, never as patterns.
 
 ### Fetching and publishing the large corpus
 

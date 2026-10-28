@@ -1,7 +1,22 @@
-// Copyright (c) 2026 Algod DAO
+// Copyright (C) 2019-2026 Algorand Foundation Ltd.
+// Modifications Copyright (C) 2026 Algod DAO
+// This file is part of algod-rust, a modified work based on go-algorand
+// (https://github.com/algorand/go-algorand).
 //
-// SPDX-License-Identifier: MIT
-// For the full license text, see LICENSE-MIT at the repository root.
+// algod-rust is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// algod-rust is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with algod-rust.  If not, see <https://www.gnu.org/licenses/>.
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! The committed `small` workload corpus (issue #2104) decodes with the
 //! production `algo-codec` decoder and matches its `corpus.json`:
@@ -140,53 +155,27 @@ fn small_corpus_decodes_and_matches_corpus_json() {
         fs_["block_hash"].as_str().unwrap()
     );
 
-    // Issue #2104: every workload kind is present.
-    for k in [
-        "pay.payment",
-        "pay.close",
-        "axfer.optin",
-        "axfer.transfer",
-        "axfer.clawback",
-        "axfer.close",
-        "afrz.freeze",
-        "afrz.unfreeze",
-        "acfg.create",
-        "acfg.reconfigure",
-        "acfg.destroy",
-        "appl.create",
-        "appl.call",
-        "appl.optin",
-        "appl.closeout",
-        "appl.clear",
-        "appl.update",
-        "appl.delete",
-        "keyreg.online",
-        "keyreg.offline",
-    ] {
-        assert!(
-            hist.subtypes.get(k).copied().unwrap_or(0) > 0,
-            "no {k} txns"
-        );
-    }
-    for k in [
-        "groups",
-        "inner_txns",
-        "rekey_txns",
-        "auth_addr_txns",
-        "app_global_delta_txns",
-        "app_local_delta_txns",
-        "app_box_ref_txns",
-    ] {
-        assert!(
-            hist.features.get(k).copied().unwrap_or(0) > 0,
-            "feature {k} is zero"
-        );
-    }
-    for k in ["pay", "axfer", "appl"] {
-        assert!(
-            hist.inner_types.get(k).copied().unwrap_or(0) > 0,
-            "no inner {k} txns"
-        );
+    // Issue #2104: every workload kind is present. The required kinds live in
+    // benchmarks/corpus/coverage.json, shared with corpus_tool.py.
+    let cov: serde_json::Value = serde_json::from_slice(
+        &fs::read(dir.join("../coverage.json")).expect("benchmarks/corpus/coverage.json"),
+    )
+    .unwrap();
+    let sections = [
+        ("subtypes", &hist.subtypes),
+        ("features", &hist.features),
+        ("inner_types", &hist.inner_types),
+    ];
+    for (section, counts) in sections {
+        let required = cov[section].as_array().expect(section);
+        assert!(!required.is_empty(), "coverage.json {section} is empty");
+        for k in required {
+            let k = k.as_str().unwrap();
+            assert!(
+                counts.get(k).copied().unwrap_or(0) > 0,
+                "{section}: no {k} in the small corpus"
+            );
+        }
     }
 }
 

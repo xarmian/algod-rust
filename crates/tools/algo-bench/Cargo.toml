@@ -3,7 +3,10 @@ name = "algo-bench"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
-license = "MIT"
+# Mixed crate: metrics/output/table/trie_replay are MIT; the corpus reader
+# (src/corpus.rs, tests/corpus_small.rs, #2104) is AGPL, so the crate as a
+# whole is AGPL (docs/LICENSING_AUDIT.md).
+license.workspace = true
 
 [dependencies]
 serde.workspace = true

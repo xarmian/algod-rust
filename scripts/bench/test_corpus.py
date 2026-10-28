@@ -19,10 +19,21 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(HERE, "corpus"))
 import corpus_tool as ct  # noqa: E402
+import generate as gen  # noqa: E402
 
 SMALL = os.path.join(REPO, "benchmarks", "corpus", "small")
 FETCH = os.path.join(HERE, "fetch_corpus.sh")
 SMALL_CAP = 5 * 1024 * 1024
+COVERAGE = os.path.join(REPO, "benchmarks", "corpus", "coverage.json")
+VECTORS = os.path.join(HERE, "testdata", "corpus", "manifest_vectors.json")
+RUST_TEST = os.path.join(REPO, "crates", "tools", "algo-bench", "tests", "corpus_small.rs")
+HEX64 = "0123456789abcdef" * 4
+
+
+def vector_text(text):
+    """manifest_vectors.json: a line starting with "H " gets a real digest."""
+    return "".join(HEX64 + line[1:] if line.startswith("H ") else line
+                   for line in text.splitlines(keepends=True))
 
 
 def sample_corpus_json():
@@ -103,6 +114,86 @@ class ManifestTest(unittest.TestCase):
             ct.parse_manifest("abc blocks.bin\n")
         with self.assertRaises(ValueError):
             ct.parse_manifest(("0" * 64) + "  ../x\n")
+
+
+class ManifestVectorsTest(unittest.TestCase):
+    """The shared parser vectors (the Rust checker runs the same file)."""
+
+    def test_vectors(self):
+        with open(VECTORS, encoding="utf-8") as f:
+            vectors = json.load(f)["vectors"]
+        self.assertGreater(len(vectors), 10)
+        for v in vectors:
+            with self.subTest(v["name"]):
+                text = vector_text(v["text"])
+                if v["valid"]:
+                    ct.parse_manifest(text)
+                else:
+                    with self.assertRaises(ValueError):
+                        ct.parse_manifest(text)
+
+
+class CoverageTest(unittest.TestCase):
+    """benchmarks/corpus/coverage.json is the only list of required kinds."""
+
+    def test_tool_reads_coverage_json(self):
+        with open(COVERAGE, encoding="utf-8") as f:
+            cov = json.load(f)
+        self.assertEqual(ct.REQUIRED_SUBTYPES, cov["subtypes"])
+        self.assertEqual(ct.REQUIRED_FEATURES, cov["features"])
+        self.assertEqual(ct.REQUIRED_INNER, cov["inner_types"])
+
+    def test_rust_test_has_no_private_copy(self):
+        with open(RUST_TEST, encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("coverage.json", src)
+        for k in ("keyreg.online", "app_box_ref_txns", "appl.update"):
+            self.assertNotIn(f'"{k}"', src, f"{k} hard-coded in corpus_small.rs")
+
+
+class GenerateSafetyTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_force_keeps_existing_corpus_when_setup_fails(self):
+        out = make_corpus(os.path.join(self.tmp, "small"))
+        before = ct.manifest_text(out)
+        rc = gen.main(["--preset", "tiny", "--out", out, "--force",
+                       "--algod", os.path.join(self.tmp, "no-such-algod")])
+        self.assertEqual(rc, 1)
+        self.assertEqual(ct.verify_manifest(out), [])
+        self.assertEqual(ct.manifest_text(out), before, "--force touched --out before succeeding")
+        self.assertEqual(sorted(os.listdir(self.tmp)), ["small"], "left a temp dir behind")
+
+    def test_install_replaces_atomically(self):
+        out = make_corpus(os.path.join(self.tmp, "c"))
+        with open(os.path.join(out, "stale.txt"), "w") as f:
+            f.write("old")
+        new = gen.staging_dir(out)
+        make_corpus(new)
+        gen.install(new, out)
+        self.assertFalse(os.path.exists(os.path.join(out, "stale.txt")))
+        self.assertEqual(ct.verify_manifest(out), [])
+        self.assertEqual(sorted(os.listdir(self.tmp)), ["c"])
+
+    def test_install_into_absent_out(self):
+        out = os.path.join(self.tmp, "fresh")
+        new = gen.staging_dir(out)
+        make_corpus(new)
+        gen.install(new, out)
+        self.assertEqual(ct.verify_manifest(out), [])
+        self.assertEqual(sorted(os.listdir(self.tmp)), ["fresh"])
+
+    def test_start_node_exec_error_is_setup_error(self):
+        node = os.path.join(self.tmp, "node")
+        os.makedirs(node)
+        log = os.path.join(self.tmp, "algod.out")
+        with self.assertRaises(gen.SetupError):
+            gen.start_node(os.path.join(self.tmp, "no-such-algod"), node, log)
+        os.remove(log)  # the handle was closed (Windows refuses to delete an open file)
 
 
 class CorpusJsonTest(unittest.TestCase):
@@ -210,6 +301,17 @@ class FetchCorpusTest(unittest.TestCase):
                        "--dest", os.path.join(self.tmp, "large"))
         self.assertEqual(p.returncode, 1)
         self.assertIn("blocks.bin: sha256 mismatch", p.stderr)
+
+    def test_unlisted_file_with_regex_metachars_rejected(self):
+        # "genesis.jso." as a regex matches the listed "genesis.json" line.
+        with open(os.path.join(self.src, "genesis.jso."), "wb") as f:
+            f.write(b"smuggled")
+        tar = ct.pack(self.src, os.path.join(self.tmp, "meta.tar.gz"))
+        dest = os.path.join(self.tmp, "large")
+        p = self.fetch("--ref", self.ref("unused", self.pin), "--from", tar, "--dest", dest)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("genesis.jso.: present but not listed", p.stderr)
+        self.assertFalse(os.path.exists(dest))
 
     @unittest.skipIf(shutil.which("curl") is None, "needs curl")
     def test_unpublished_asset_fails_cleanly(self):

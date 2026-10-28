@@ -103,20 +103,35 @@ cdir="$(dirname "$manifest")"
 got="$(sha256_of "$manifest")"
 [ "$got" = "$PIN" ] || die "MANIFEST.sha256 has sha256 $got, $REF pins $PIN (wrong or tampered asset)"
 
-# Every file listed must match, and nothing unlisted may ride along.
-while IFS= read -r line; do
+# Every file listed must match, and nothing unlisted may ride along. Entry
+# rules match corpus_tool.py / corpus.rs parse_manifest: a lowercase 64-hex
+# digest, two spaces, a plain file name (no '/', '\\', '.', '..', no
+# duplicates, not the manifest itself). Names are compared as exact strings,
+# never as patterns.
+: > "$TMP/listed"
+while IFS= read -r line || [ -n "$line" ]; do
     [ -n "$line" ] || continue
+    case "$line" in *"  "*) ;; *) die "bad manifest entry: $line" ;; esac
     digest="${line%%  *}"
     name="${line#*  }"
-    case "$name" in */*|..*|"") die "bad manifest entry: $line" ;; esac
+    case "$digest" in
+        *[!0-9a-f]*) die "bad manifest digest: $line" ;;
+    esac
+    [ "${#digest}" -eq 64 ] || die "bad manifest digest: $line"
+    case "$name" in
+        ""|.|..|MANIFEST.sha256|*/*|*\\*) die "bad manifest entry: $line" ;;
+    esac
+    if grep -qxF -- "$name" "$TMP/listed"; then die "duplicate manifest entry: $name"; fi
+    printf '%s\n' "$name" >> "$TMP/listed"
     [ -f "$cdir/$name" ] || die "$name: listed in MANIFEST.sha256 but missing"
     [ "$(sha256_of "$cdir/$name")" = "$digest" ] || die "$name: sha256 mismatch"
 done < "$manifest"
-for f in "$cdir"/*; do
+while IFS= read -r -d '' f; do
     n="$(basename "$f")"
     [ "$n" = MANIFEST.sha256 ] && continue
-    grep -q "  $n\$" "$manifest" || die "$n: present but not listed in MANIFEST.sha256"
-done
+    [ -f "$f" ] && [ ! -L "$f" ] || die "$n: not a regular file"
+    grep -qxF -- "$n" "$TMP/listed" || die "$n: present but not listed in MANIFEST.sha256"
+done < <(find "$cdir" -mindepth 1 -maxdepth 1 -print0)
 
 rm -rf "$DEST"
 mkdir -p "$(dirname "$DEST")"

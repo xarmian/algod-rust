@@ -159,23 +159,12 @@ func (c *algodClient) submitAsync(group []transactions.SignedTxn, want int) erro
 	if code != http.StatusOK {
 		return fmt.Errorf("POST /v2/transactions/async: HTTP %d: %s", code, b)
 	}
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		total, err := c.poolSize()
-		if err != nil {
-			return err
-		}
-		if total == want {
-			return nil
-		}
+	return c.waitPool(func(total int) (bool, error) {
 		if total > want {
-			return fmt.Errorf("pool holds %d txns, expected %d (unplanned transaction in the pool)", total, want)
+			return false, fmt.Errorf("pool holds %d txns, expected %d (unplanned transaction in the pool)", total, want)
 		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("async group not in the pool after 30s (pool %d, want %d): rejected by verification? see node.log", total, want)
-		}
-		time.Sleep(200 * time.Microsecond)
-	}
+		return total == want, nil
+	}, fmt.Sprintf("async group not in the pool after %v (want %d txns): rejected by verification? see node.log", poolWaitTimeout, want))
 }
 
 func (c *algodClient) poolSize() (int, error) {
@@ -192,19 +181,42 @@ func (c *algodClient) poolSize() (int, error) {
 // submit has already returned; until it has run, /v2/transactions/pending
 // still lists the committed txns and submitAsync's count would be off.
 func (c *algodClient) waitPoolEmpty() error {
-	deadline := time.Now().Add(30 * time.Second)
+	return c.waitPool(func(total int) (bool, error) { return total == 0, nil },
+		fmt.Sprintf("pool still not empty %v after the last block", poolWaitTimeout))
+}
+
+const (
+	poolWaitTimeout = 30 * time.Second
+	pollFirst       = 1 * time.Millisecond
+	pollMax         = 8 * time.Millisecond
+)
+
+// waitPool polls the pool size until done(size) is true: an immediate
+// check, then sleeps of 1, 2, 4, 8, 8, ... ms (the pool normally settles
+// within a couple of ms, so this costs little latency without spinning the
+// REST server).
+func (c *algodClient) waitPool(done func(int) (bool, error), timeoutMsg string) error {
+	deadline := time.Now().Add(poolWaitTimeout)
+	delay := pollFirst
 	for {
 		n, err := c.poolSize()
 		if err != nil {
 			return err
 		}
-		if n == 0 {
+		ok, err := done(n)
+		if err != nil {
+			return err
+		}
+		if ok {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("pool still holds %d txns 30s after the last block", n)
+			return fmt.Errorf("%s (pool holds %d)", timeoutMsg, n)
 		}
-		time.Sleep(200 * time.Microsecond)
+		time.Sleep(delay)
+		if delay < pollMax {
+			delay *= 2
+		}
 	}
 }
 

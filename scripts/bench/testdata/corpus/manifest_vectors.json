@@ -1,0 +1,20 @@
+{
+  "_comment": "MANIFEST.sha256 parser vectors (issue #2104). Both scripts/bench/corpus/corpus_tool.py parse_manifest and crates/tools/algo-bench/src/corpus.rs parse_manifest must accept exactly the `valid: true` texts. H = 64 lowercase hex chars, substituted by the tests.",
+  "vectors": [
+    {"name": "one entry", "valid": true, "text": "H  blocks.bin\n"},
+    {"name": "two entries, blank line", "valid": true, "text": "H  a.json\n\nH  b.bin\n"},
+    {"name": "no trailing newline", "valid": true, "text": "H  blocks.bin"},
+    {"name": "single space separator", "valid": false, "text": "H blocks.bin\n"},
+    {"name": "short digest", "valid": false, "text": "0123456789abcdef  blocks.bin\n"},
+    {"name": "non-hex digest", "valid": false, "text": "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg  blocks.bin\n"},
+    {"name": "uppercase digest", "valid": false, "text": "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789  blocks.bin\n"},
+    {"name": "empty name", "valid": false, "text": "H  \n"},
+    {"name": "slash in name", "valid": false, "text": "H  sub/blocks.bin\n"},
+    {"name": "parent traversal", "valid": false, "text": "H  ../x\n"},
+    {"name": "dot-dot name", "valid": false, "text": "H  ..\n"},
+    {"name": "dot name", "valid": false, "text": "H  .\n"},
+    {"name": "backslash in name", "valid": false, "text": "H  sub\\blocks.bin\n"},
+    {"name": "duplicate entry", "valid": false, "text": "H  blocks.bin\nH  blocks.bin\n"},
+    {"name": "manifest lists itself", "valid": false, "text": "H  MANIFEST.sha256\n"}
+  ]
+}

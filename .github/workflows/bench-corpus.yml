@@ -83,9 +83,12 @@ jobs:
       - name: Generator - gofmt, vet, unit tests, build
         run: |
           set -euo pipefail
-          printf 'go 1.25.0\n\nuse %s/benchmarks/go-corpus\n\nreplace github.com/algorand/go-algorand => %s\n' \
-            "$PWD" "$GO_ALGORAND_DIR" > "$RUNNER_TEMP/go.work"
-          export GOWORK="$RUNNER_TEMP/go.work" GOFLAGS=-buildvcs=false
+          # Same go.work generate.py builds with: go directive from
+          # benchmarks/go-corpus/go.mod, go-algorand replaced by the checkout.
+          GOWORK="$(python3 scripts/bench/corpus/generate.py --go-algorand "$GO_ALGORAND_DIR" \
+            --write-go-work "$RUNNER_TEMP/corpus-work")"
+          export GOWORK GOFLAGS=-buildvcs=false
+          cat "$GOWORK"
           cd benchmarks/go-corpus
           unformatted="$(gofmt -l .)"
           [ -z "$unformatted" ] || { echo "::error::gofmt needed: $unformatted"; exit 1; }
