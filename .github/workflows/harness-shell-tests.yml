@@ -21,6 +21,7 @@ on:
       - ".github/workflows/harness-shell-tests.yml"
       - ".github/workflows/*node-soak.yml"
       - "scripts/test_node_soak_callers.py"
+      - "scripts/bench/**"
   push:
     branches: [main]
     paths:
@@ -31,6 +32,7 @@ on:
       - ".github/workflows/harness-shell-tests.yml"
       - ".github/workflows/*node-soak.yml"
       - "scripts/test_node_soak_callers.py"
+      - "scripts/bench/**"
 
 permissions:
   contents: read
@@ -60,3 +62,24 @@ jobs:
         run: python3 ops/mainnet-soak/monitor.py self-test
       - name: Reusable soak workflow <-> caller interface
         run: python3 scripts/test_node_soak_callers.py
+
+  bench-compare-harness:
+    # Issue #2102 (epic #2101): the Go vs Rust bench-compare harness
+    # (scripts/bench/). Unit tests for the schema, report maths and
+    # fingerprint parsers, then the built-in selftest tier end to end via the
+    # real `make bench-compare` entry point. No builds, no Docker.
+    name: bench-compare harness tests + selftest tier
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Harness unit tests
+        run: make bench-compare-test
+      - name: build_both.sh syntax
+        run: bash -n scripts/bench/build_both.sh
+      - name: make bench-compare TIERS=selftest
+        run: |
+          make bench-compare TIERS=selftest RUNS=6 BENCH_RUN_DIR=bench-results/ci-selftest
+          test -s bench-results/ci-selftest/report.json
+          test -s bench-results/ci-selftest/report.md
+          cat bench-results/ci-selftest/report.md >> "$GITHUB_STEP_SUMMARY"

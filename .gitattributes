@@ -72,3 +72,7 @@ bin/algod-rust/genesis/** text eol=lf
 
 # Aramid mainnet consensus.json embedded into the binary (include_str!).
 bin/algod-rust/consensus/** text eol=lf
+
+# bench-compare harness (#2102): bash scripts and the pin file must stay LF
+# on Windows checkouts (core.autocrlf=true) or bash/the pin parser break.
+scripts/bench/** text eol=lf
