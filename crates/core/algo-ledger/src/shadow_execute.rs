@@ -1790,7 +1790,8 @@ mod tests {
     fn ledger() -> SqliteLedger {
         let mut l = SqliteLedger::open_in_memory().unwrap();
         l.begin_block().unwrap();
-        for (a, v) in [(SENDER, 10_000_000), (FEE_SINK, 1_000_000), (POOL, 0)] {
+        // Issue #2116: the block-start withdrawal needs a pool at MinBalance.
+        for (a, v) in [(SENDER, 10_000_000), (FEE_SINK, 1_000_000), (POOL, 100_000)] {
             l.set_account(
                 &a,
                 AccountData {

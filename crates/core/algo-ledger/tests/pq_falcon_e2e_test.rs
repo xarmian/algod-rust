@@ -181,7 +181,7 @@ fn pq_rekeyed_address_authorization_full_e2e_succeeds() {
     let (falcon_salt, falcon_addr) = canonical_pq_address_salt(PQ_SCHEME_FALCON1024, &falcon_pk)
         .expect("a canonical PQ salt must exist");
 
-    let mut state = LedgerState::new();
+    let mut state = algo_ledger::apply::pool_fixtures::funded_ledger_state();
     state.fee_sink = fee_sink;
     state.get_or_default_account_mut(&ed_addr).micro_algos = 10_000_000;
     state.get_or_default_account_mut(&receiver).micro_algos = 100_000;
@@ -297,7 +297,7 @@ fn pq_rekeyed_address_stale_ed25519_authorizer_rejected_full_e2e() {
     let (_falcon_salt, falcon_addr) = canonical_pq_address_salt(PQ_SCHEME_FALCON1024, &falcon_pk)
         .expect("a canonical PQ salt must exist");
 
-    let mut state = LedgerState::new();
+    let mut state = algo_ledger::apply::pool_fixtures::funded_ledger_state();
     state.fee_sink = fee_sink;
     state.get_or_default_account_mut(&ed_addr).micro_algos = 10_000_000;
     state.get_or_default_account_mut(&receiver).micro_algos = 100_000;
@@ -410,7 +410,7 @@ fn pq_challenged_falcon_address_can_heartbeat_for_zero_fee_full_e2e() {
     let voting = OneTimeSignatureSecrets::generate(first_id.batch, num_batches);
     let vote_id = voting.verifier();
 
-    let mut state = LedgerState::new();
+    let mut state = algo_ledger::apply::pool_fixtures::funded_ledger_state();
     state.fee_sink = fee_sink;
     {
         let acct = state.get_or_default_account_mut(&pq_target);

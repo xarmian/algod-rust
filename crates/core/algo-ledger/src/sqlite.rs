@@ -10706,7 +10706,7 @@ mod tests {
         let receiver = Address([2u8; 32]);
         let fee_sink = Address([3u8; 32]);
 
-        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let mut ledger = crate::apply::pool_fixtures::funded_sqlite_ledger();
         ledger.begin_block().unwrap();
         ledger.set_account(
             &sender,
@@ -10789,7 +10789,7 @@ mod tests {
         let fee_sink = Address([3u8; 32]);
         let proposer = Address([9u8; 32]);
 
-        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let mut ledger = crate::apply::pool_fixtures::funded_sqlite_ledger();
         ledger.begin_block().unwrap();
         ledger.set_account(
             &fee_sink,
@@ -10885,6 +10885,16 @@ mod tests {
                 ..Default::default()
             },
         );
+        // Issue #2116: the (zero-address) pool pays the 8 * 4 accrued
+        // µAlgos at the block start and keeps MinBalance.
+        ledger.set_account(
+            &Address::ZERO,
+            AccountData {
+                micro_algos: 1_000_000,
+                status: AccountStatus::NotParticipating,
+                ..Default::default()
+            },
+        );
         // 5 online reward units (5,000,000 microAlgos / 1,000,000 per unit)
         // and 3 offline reward units — chosen distinct so a bug that
         // conflates the two buckets would be caught.
@@ -10905,7 +10915,7 @@ mod tests {
             },
         );
         ledger
-            .put_account_totals_seed(5_000_000, 5, 3_000_000, 3, 100_000, 0)
+            .put_account_totals_seed(5_000_000, 5, 3_000_000, 3, 1_100_000, 0)
             .unwrap();
         ledger.discard_pending_account_totals_delta();
         ledger.commit_block().unwrap();
@@ -12912,7 +12922,7 @@ mod tests {
         };
 
         let committed_root = |tracer_on: bool| -> [u8; 32] {
-            let mut l = SqliteLedger::open_in_memory().unwrap();
+            let mut l = crate::apply::pool_fixtures::funded_sqlite_ledger();
             l.set_account(
                 &a,
                 AccountData {
@@ -13016,7 +13026,7 @@ mod tests {
         let fee_sink = Address([3u8; 32]);
         let app_id = 950u64;
 
-        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let mut ledger = crate::apply::pool_fixtures::funded_sqlite_ledger();
         ledger.set_account(
             &creator,
             AccountData {
@@ -13120,7 +13130,7 @@ mod tests {
         let fee_sink = Address([3u8; 32]);
         let app_id = 970u64;
 
-        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let mut ledger = crate::apply::pool_fixtures::funded_sqlite_ledger();
         ledger.set_account(
             &creator,
             AccountData {
@@ -13289,7 +13299,7 @@ mod tests {
         let inner_receiver = Address([9u8; 32]);
         let app_id = 971u64;
 
-        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let mut ledger = crate::apply::pool_fixtures::funded_sqlite_ledger();
         ledger.set_account(
             &creator,
             AccountData {
@@ -13426,7 +13436,7 @@ mod tests {
         let fee_sink = Address([3u8; 32]);
         let app_id = 900u64;
 
-        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let mut ledger = crate::apply::pool_fixtures::funded_sqlite_ledger();
         ledger.set_account(
             &creator,
             AccountData {
@@ -16854,14 +16864,14 @@ mod tests {
     /// chain, whose proposer-less blocks go itself never validates.
     #[test]
     fn apply_block_caching_delta_checks_payouts_except_on_devmode_chain() {
-        let mut l = SqliteLedger::open_in_memory().unwrap();
+        let mut l = crate::apply::pool_fixtures::funded_sqlite_ledger();
         l.begin_block().unwrap();
         let mut no_proposer = trivial_block(1, 3);
         no_proposer.proposer = Address::ZERO;
         let err = l.apply_block_caching_delta(&no_proposer).unwrap_err();
         assert!(matches!(err, AlgoError::PayoutViolation { .. }), "{err}");
 
-        let mut l = SqliteLedger::open_in_memory().unwrap();
+        let mut l = crate::apply::pool_fixtures::funded_sqlite_ledger();
         l.set_devmode_chain(true);
         l.begin_block().unwrap();
         l.apply_block_caching_delta(&no_proposer).unwrap();
@@ -16905,7 +16915,7 @@ mod tests {
 
     #[test]
     fn failed_commit_discards_the_cached_state_delta_for_the_uncommitted_round() {
-        let mut l = SqliteLedger::open_in_memory().unwrap();
+        let mut l = crate::apply::pool_fixtures::funded_sqlite_ledger();
         l.begin_block().unwrap();
         l.apply_block_caching_delta(&trivial_block(1, 3)).unwrap();
         assert!(l.delta_cache.get(1).is_some(), "delta cached during apply");
@@ -16925,7 +16935,7 @@ mod tests {
 
     #[test]
     fn rollback_discards_group_deltas_of_the_uncommitted_round() {
-        let mut l = SqliteLedger::open_in_memory().unwrap();
+        let mut l = crate::apply::pool_fixtures::funded_sqlite_ledger();
         l.enable_group_delta_tracer(8);
         l.begin_block().unwrap();
         l.apply_block_caching_delta(&trivial_block(1, 3)).unwrap();

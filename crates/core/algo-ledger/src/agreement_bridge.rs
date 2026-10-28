@@ -1738,7 +1738,9 @@ mod tests {
 
     #[test]
     fn committing_a_valid_block_clears_the_stall() {
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let ledger = Arc::new(Mutex::new(
+            crate::apply::pool_fixtures::funded_sqlite_ledger(),
+        ));
         let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
         let bad = make_unapplyable_round1_block();
         let cert = make_cert_with_proposal(1);
@@ -1844,7 +1846,9 @@ mod tests {
 
     #[test]
     fn stall_is_dropped_when_the_ledger_advances_by_another_path() {
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let ledger = Arc::new(Mutex::new(
+            crate::apply::pool_fixtures::funded_sqlite_ledger(),
+        ));
         let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
         let bad = make_unapplyable_round1_block();
         let cert = make_cert_with_proposal(1);
@@ -1884,7 +1888,9 @@ mod tests {
     #[test]
     fn ensure_block_failure_and_idempotent_paths_are_counted() {
         let t = crate::follow_timing::follow_timing();
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let ledger = Arc::new(Mutex::new(
+            crate::apply::pool_fixtures::funded_sqlite_ledger(),
+        ));
         let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
         let (apply_failed, failed) = (t.apply_failed.count(), t.ensure_block_failed.count());
         bridge.ensure_block(
@@ -1956,7 +1962,9 @@ mod tests {
     #[test]
     fn ensure_block_stores_cert_and_round_trip() {
         // Create a bridge with an in-memory ledger.
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let ledger = Arc::new(Mutex::new(
+            crate::apply::pool_fixtures::funded_sqlite_ledger(),
+        ));
         let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
 
         let block = make_round1_block();
@@ -1979,7 +1987,9 @@ mod tests {
     #[test]
     fn ensure_block_stores_cert_raw_bytes() {
         // Verify that get_block_cert returns Some(bytes) after ensure_block.
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let ledger = Arc::new(Mutex::new(
+            crate::apply::pool_fixtures::funded_sqlite_ledger(),
+        ));
         let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
 
         let block = make_round1_block();
@@ -2007,7 +2017,9 @@ mod tests {
     fn ensure_block_idempotent_retains_first_cert() {
         // Calling ensure_block twice for the same round should be a no-op the
         // second time: the first certificate is retained.
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let ledger = Arc::new(Mutex::new(
+            crate::apply::pool_fixtures::funded_sqlite_ledger(),
+        ));
         let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
 
         let block = make_round1_block();
@@ -2116,7 +2128,9 @@ mod tests {
             "return\n",
         ));
 
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let ledger = Arc::new(Mutex::new(
+            crate::apply::pool_fixtures::funded_sqlite_ledger(),
+        ));
         {
             let mut l = ledger.lock().unwrap();
             for (addr, bal) in [
@@ -2233,7 +2247,9 @@ mod tests {
         .expect("program must assemble")
         .program;
 
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let ledger = Arc::new(Mutex::new(
+            crate::apply::pool_fixtures::funded_sqlite_ledger(),
+        ));
         {
             let mut l = ledger.lock().unwrap();
             for (addr, bal) in [
@@ -2344,7 +2360,9 @@ mod tests {
         ))
         .expect("program must assemble")
         .program;
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let ledger = Arc::new(Mutex::new(
+            crate::apply::pool_fixtures::funded_sqlite_ledger(),
+        ));
         {
             let mut l = ledger.lock().unwrap();
             for (addr, bal) in [
@@ -2413,7 +2431,9 @@ mod tests {
 
     #[test]
     fn ensure_block_never_applies_on_top_of_a_block_whose_rollback_failed() {
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let ledger = Arc::new(Mutex::new(
+            crate::apply::pool_fixtures::funded_sqlite_ledger(),
+        ));
         let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
         {
             // A half-applied block whose ROLLBACK keeps failing (twice).

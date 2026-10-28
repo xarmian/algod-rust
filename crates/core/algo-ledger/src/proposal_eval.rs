@@ -96,6 +96,7 @@ pub fn evaluate_group<B: OverlayBase + ?Sized>(
         request: ProbeRequest {
             skip_epilogue: true,
             generate: true,
+            pool_withdrawn: overlay.pool_withdrawn(),
             ..ProbeRequest::default()
         },
         ..ExecProbe::default()
@@ -394,9 +395,11 @@ mod tests {
     }
 
     fn ledger(accounts: &[(Address, AccountData)]) -> SqliteLedger {
-        let mut l = SqliteLedger::open_in_memory().expect("ledger");
+        let mut l = SqliteLedger::open_in_memory().unwrap();
         l.set_fee_sink(addr(0xF1));
         l.set_rewards_pool(addr(0xF2));
+        // Issue #2116: the block-start withdrawal needs a pool at MinBalance.
+        crate::apply::pool_fixtures::fund_test_rewards_pool(&mut l);
         l.set_protocol(CONSENSUS_V41.to_string());
         l.set_account(
             &addr(0xF1),
@@ -491,6 +494,49 @@ mod tests {
             evaluate_group(&l, &mut ov, &t, &[pay(fresh, b, 50_000_000, None)]),
             Err(GroupEvalError::Txn { .. })
         ));
+    }
+
+    /// Issue #2116: go's pool evaluates a pending block with one
+    /// `BlockEvaluator`, so `StartEvaluator` withdraws the block's accrued
+    /// rewards from the pool once, however many groups follow.
+    #[test]
+    fn pending_block_withdraws_accrued_rewards_from_the_pool_once() {
+        let a = addr(1);
+        let b = addr(2);
+        let pool = addr(0xF2);
+        let mut l = ledger(&[
+            (a, funded(50_000_000)),
+            (b, funded(1_000_000)),
+            (
+                pool,
+                AccountData {
+                    micro_algos: 10_000_000,
+                    status: algo_types::AccountStatus::NotParticipating,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        l.put_account_totals_seed(0, 0, 61_000_000, 51, 10_000_000, 10)
+            .unwrap();
+        // go `prevTotals.RewardUnits()`: online + offline.
+        let units = {
+            let t = l.account_totals();
+            t.online.reward_units + t.offline.reward_units
+        };
+        assert!(units > 0);
+        let mut t = template(&l);
+        t.rewards_level = 2;
+        let mut ov = PendingOverlay::new(&l);
+        evaluate_group(&l, &mut ov, &t, &[pay(a, b, 1_000, None)]).expect("first");
+        evaluate_group(&l, &mut ov, &t, &[pay(b, a, 1_000, None)]).expect("second");
+        let store = OverlayStore::new(&l, &mut ov);
+        assert_eq!(
+            crate::store_trait::LedgerStore::get_account(&store, &pool)
+                .unwrap()
+                .micro_algos,
+            10_000_000 - units * 2,
+            "one withdrawal of {units} units * 2 levels, not one per group"
+        );
     }
 
     #[test]

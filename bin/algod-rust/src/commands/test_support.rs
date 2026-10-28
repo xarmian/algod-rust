@@ -55,9 +55,18 @@ fn deploy(l: &mut SqliteLedger, source: &str) {
     );
 }
 
+/// Issue #2116: test ledgers fund their rewards pool at `MinBalance`, which
+/// go's block-start withdrawal requires (the shared `algo-ledger` fixtures,
+/// `test-hooks`).
+#[allow(unused_imports)]
+pub use algo_ledger::apply::pool_fixtures::{
+    fund_test_rewards_pool as fund_rewards_pool, funded_ledger_state, funded_sqlite_ledger,
+    TEST_POOL_MIN_BALANCE,
+};
+
 /// In-memory ledger with a funded sender and a deployed box-writing app.
 pub fn ledger() -> SqliteLedger {
-    let mut l = SqliteLedger::open_in_memory().expect("in-memory ledger");
+    let mut l = funded_sqlite_ledger();
     l.set_fee_sink(Address([0xFE; 32]));
     l.set_account(
         &sender(),

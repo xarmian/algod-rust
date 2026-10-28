@@ -115,7 +115,7 @@ fn call(app_id: u64, fee: u64, foreign_apps: Option<Vec<u64>>) -> SignedTransact
 }
 
 fn setup(proto: &str, c_program: Vec<u8>) -> LedgerState {
-    let mut s = LedgerState::new();
+    let mut s = algo_ledger::apply::pool_fixtures::funded_ledger_state();
     s.fee_sink = Address([0xFE; 32]);
     s.protocol = proto.to_string();
     s.get_or_default_account_mut(&Address([0xAA; 32]))

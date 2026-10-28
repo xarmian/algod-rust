@@ -24,12 +24,12 @@ use std::collections::HashSet;
 
 use algo_ledger::{
     apply_block_capturing_group_deltas, apply_block_with_delta, LedgerState, LedgerStore,
-    SqliteLedger, TxnGroupDeltaTracer,
+    TxnGroupDeltaTracer,
 };
 use algo_types::{AccountData, Address, Block, Digest, Round, SignedTransaction};
 
 fn make_state(balances: &[(Address, u64)], fee_sink: Address) -> LedgerState {
-    let mut state = LedgerState::new();
+    let mut state = algo_ledger::apply::pool_fixtures::funded_ledger_state();
     state.fee_sink = fee_sink;
     for (addr, bal) in balances {
         state.set_account(
@@ -275,7 +275,7 @@ fn sqlite_ledger_feeds_group_tracer_when_enabled() {
     let b = Address([2u8; 32]);
     let fee_sink = Address([3u8; 32]);
 
-    let mut ledger = SqliteLedger::open_in_memory().unwrap();
+    let mut ledger = algo_ledger::apply::pool_fixtures::funded_sqlite_ledger();
     ledger.set_account(
         &a,
         AccountData {
@@ -335,7 +335,7 @@ fn group_tracer_does_not_poison_lease_table() {
     let b = Address([2u8; 32]);
     let fee_sink = Address([3u8; 32]);
 
-    let mut ledger = SqliteLedger::open_in_memory().unwrap();
+    let mut ledger = algo_ledger::apply::pool_fixtures::funded_sqlite_ledger();
     ledger.set_account(
         &a,
         AccountData {

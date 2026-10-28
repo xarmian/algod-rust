@@ -34,7 +34,7 @@ use algo_types::{
 // ---------------------------------------------------------------------------
 
 fn make_state(balances: &[(Address, u64)], fee_sink: Address) -> LedgerState {
-    let mut state = LedgerState::new();
+    let mut state = algo_ledger::apply::pool_fixtures::funded_ledger_state();
     state.fee_sink = fee_sink;
     for (addr, bal) in balances {
         let acct = state.get_or_default_account_mut(addr);
@@ -543,7 +543,8 @@ fn test_close_with_opted_in_apps_fails() {
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg == "cannot close: 2 outstanding applications opted in. Please opt out or clear them",
+        err_msg
+            == "cannot close: 2 outstanding applications opted in. Please opt out or clear them",
         "go's apply.Payment text expected, got: {}",
         err_msg,
     );

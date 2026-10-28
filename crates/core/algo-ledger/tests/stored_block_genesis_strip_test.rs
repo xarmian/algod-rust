@@ -71,7 +71,7 @@ fn stripped_stx(txn_type: &str, sender: Address) -> SignedTransaction {
 }
 
 fn funded_state(sender: Address) -> LedgerState {
-    let mut state = LedgerState::new();
+    let mut state = algo_ledger::apply::pool_fixtures::funded_ledger_state();
     state.fee_sink = Address([0xFE; 32]);
     state.get_or_default_account_mut(&sender).micro_algos = 100_000_000;
     state

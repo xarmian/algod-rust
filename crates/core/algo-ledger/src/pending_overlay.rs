@@ -98,6 +98,10 @@ pub struct PendingOverlay {
     /// Chain scalars as captured from the base, to reset between groups.
     chain_base: Chain,
     journal: Vec<Undo>,
+    /// A committed group already made the block-start rewards-pool
+    /// withdrawal (go runs `StartEvaluator` once per pending block, issue
+    /// #2116); later groups must not repeat it.
+    pool_withdrawn: bool,
 }
 
 impl PendingOverlay {
@@ -127,7 +131,14 @@ impl PendingOverlay {
             chain_base: chain.clone(),
             chain,
             journal: Vec::new(),
+            pool_withdrawn: false,
         }
+    }
+
+    /// Whether a committed group already holds the block-start rewards-pool
+    /// withdrawal (see [`crate::apply::ProbeRequest::pool_withdrawn`]).
+    pub fn pool_withdrawn(&self) -> bool {
+        self.pool_withdrawn
     }
 
     /// The committed round this overlay is layered on.
@@ -156,6 +167,7 @@ impl PendingOverlay {
         self.leases.discard_undo();
         self.chain_base.txn_counter = final_txn_counter;
         self.chain = self.chain_base.clone();
+        self.pool_withdrawn = true;
     }
 
     /// Undo every effect of the group in progress.

@@ -6988,18 +6988,9 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 txns[i].sender_rewards = pass.sender_rewards;
                 txns[i].receiver_rewards = pass.receiver_rewards;
                 txns[i].close_rewards = pass.close_rewards;
-                if let Err(e) = crate::apply::debit_rewards_pool(self.store, pass.total) {
-                    self.rollback_inner_group(
-                        snapshot,
-                        &extra_created_asset_ids,
-                        &extra_created_app_ids,
-                    );
-                    let err_msg = format!("inner tx {}: {}", i, e);
-                    if let Some(p) = self.tracer_ptr {
-                        unsafe { &mut *p }.after_txn_group(Some(&err_msg));
-                    }
-                    return Err(AlgoError::Avm { message: err_msg });
-                }
+                // The claim never touches the pool: go withdraws a block's
+                // rewards from it once, in `StartEvaluator` (issue #2116,
+                // `apply::withdraw_block_rewards`).
             }
 
             // Deduct fee from sender to fee_sink (matches go-algorand takeFee).
@@ -9625,7 +9616,10 @@ mod tests {
         ctx.app_id = 3471862384;
         // The availability-checked path rejects the unreferenced asset...
         let err = ctx.resolve_asset(626283733).unwrap_err();
-        assert!(err.to_string().contains("unavailable Asset 626283733"), "{err}");
+        assert!(
+            err.to_string().contains("unavailable Asset 626283733"),
+            "{err}"
+        );
         // ...the pre-v4 direct path does not.
         assert_eq!(ctx.direct_asset_ref(626283733).unwrap(), 626283733);
         assert_eq!(ctx.direct_app_ref(0).unwrap(), 3471862384);

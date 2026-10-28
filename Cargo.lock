@@ -430,6 +430,7 @@ dependencies = [
  "algo-consensus-crypto",
  "algo-error",
  "algo-falcon",
+ "algo-ledger",
  "algo-metrics",
  "algo-types",
  "algo-validate",

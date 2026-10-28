@@ -88,7 +88,7 @@ use algo_types::{Address, Block, Round, SignedTransaction, StateSchema};
 // ---------------------------------------------------------------------------
 
 fn make_state(balances: &[(Address, u64)], fee_sink: Address) -> LedgerState {
-    let mut state = LedgerState::new();
+    let mut state = algo_ledger::apply::pool_fixtures::funded_ledger_state();
     state.fee_sink = fee_sink;
     for (addr, bal) in balances {
         let acct = state.get_or_default_account_mut(addr);

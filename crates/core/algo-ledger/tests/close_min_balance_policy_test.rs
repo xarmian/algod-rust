@@ -144,11 +144,13 @@ struct Harness {
 
 impl Harness {
     fn new(proto: &'static str, funded: &[(Address, u64)]) -> Self {
-        let mut l = SqliteLedger::open_in_memory().expect("ledger");
+        let mut l = SqliteLedger::open_in_memory().unwrap();
         let fee_sink = addr(0xF1);
         let rewards_pool = addr(0xF2);
         l.set_fee_sink(fee_sink);
         l.set_rewards_pool(rewards_pool);
+        // Issue #2116: the block-start withdrawal needs a pool at MinBalance.
+        algo_ledger::apply::pool_fixtures::fund_test_rewards_pool(&mut l);
         l.set_protocol(proto.to_string());
         for (a, amount) in funded {
             l.set_account(

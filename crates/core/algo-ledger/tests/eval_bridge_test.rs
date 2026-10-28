@@ -1534,7 +1534,7 @@ fn apply_block_execute_mode_processes_appl_txn() {
     let fee_sink = Address([3u8; 32]);
     let rewards_pool = Address([4u8; 32]);
 
-    let mut state = LedgerState::new();
+    let mut state = algo_ledger::apply::pool_fixtures::funded_ledger_state();
     state.fee_sink = fee_sink;
     state.rewards_pool = rewards_pool;
     // Set current round to 0 so that block round=1 is expected.
@@ -1544,7 +1544,8 @@ fn apply_block_execute_mode_processes_appl_txn() {
     state.get_or_default_account_mut(&creator).micro_algos = 50_000_000;
     state.get_or_default_account_mut(&sender).micro_algos = 50_000_000;
     state.get_or_default_account_mut(&fee_sink).micro_algos = 0;
-    state.get_or_default_account_mut(&rewards_pool).micro_algos = 0;
+    state.get_or_default_account_mut(&rewards_pool).micro_algos =
+        algo_ledger::apply::pool_fixtures::TEST_POOL_MIN_BALANCE; // #2116
 
     // Create an app with an approval program that returns 1.
     let app_id = 100u64;
@@ -1592,7 +1593,8 @@ fn apply_block_execute_mode_rejects_failing_appl() {
     state.get_or_default_account_mut(&creator).micro_algos = 50_000_000;
     state.get_or_default_account_mut(&sender).micro_algos = 50_000_000;
     state.get_or_default_account_mut(&fee_sink).micro_algos = 0;
-    state.get_or_default_account_mut(&rewards_pool).micro_algos = 0;
+    state.get_or_default_account_mut(&rewards_pool).micro_algos =
+        algo_ledger::apply::pool_fixtures::TEST_POOL_MIN_BALANCE; // #2116
 
     // App with rejecting approval program.
     let app_id = 101u64;
@@ -1645,7 +1647,7 @@ fn apply_block_with_delta_execute_mode_populates_kv_mods_for_box_put() {
     let fee_sink = Address([3u8; 32]);
     let rewards_pool = Address([4u8; 32]);
 
-    let mut state = LedgerState::new();
+    let mut state = algo_ledger::apply::pool_fixtures::funded_ledger_state();
     state.fee_sink = fee_sink;
     state.rewards_pool = rewards_pool;
     state.current_round = Round(0);
@@ -1653,7 +1655,8 @@ fn apply_block_with_delta_execute_mode_populates_kv_mods_for_box_put() {
     state.get_or_default_account_mut(&creator).micro_algos = 50_000_000;
     state.get_or_default_account_mut(&sender).micro_algos = 50_000_000;
     state.get_or_default_account_mut(&fee_sink).micro_algos = 0;
-    state.get_or_default_account_mut(&rewards_pool).micro_algos = 0;
+    state.get_or_default_account_mut(&rewards_pool).micro_algos =
+        algo_ledger::apply::pool_fixtures::TEST_POOL_MIN_BALANCE; // #2116
 
     let app_id = 200u64;
     create_app(
@@ -1701,14 +1704,15 @@ fn apply_block_with_delta_execute_mode_populates_kv_mods_for_box_del_and_replay_
     let rewards_pool = Address([4u8; 32]);
 
     let make_funded_state_with_box = || {
-        let mut state = LedgerState::new();
+        let mut state = algo_ledger::apply::pool_fixtures::funded_ledger_state();
         state.fee_sink = fee_sink;
         state.rewards_pool = rewards_pool;
         state.current_round = Round(0);
         state.get_or_default_account_mut(&creator).micro_algos = 50_000_000;
         state.get_or_default_account_mut(&sender).micro_algos = 50_000_000;
         state.get_or_default_account_mut(&fee_sink).micro_algos = 0;
-        state.get_or_default_account_mut(&rewards_pool).micro_algos = 0;
+        state.get_or_default_account_mut(&rewards_pool).micro_algos =
+            algo_ledger::apply::pool_fixtures::TEST_POOL_MIN_BALANCE; // #2116
         algo_ledger::LedgerStore::set_box(&mut state, 201, b"mybox", b"hello".to_vec());
         let acct = state.get_or_default_account_mut(&creator);
         acct.total_boxes = 1;
@@ -1780,7 +1784,7 @@ fn apply_block_execute_mode_mixed_pay_and_appl() {
     let fee_sink = Address([3u8; 32]);
     let rewards_pool = Address([4u8; 32]);
 
-    let mut state = LedgerState::new();
+    let mut state = algo_ledger::apply::pool_fixtures::funded_ledger_state();
     state.fee_sink = fee_sink;
     state.rewards_pool = rewards_pool;
     state.current_round = Round(0);
@@ -1789,7 +1793,8 @@ fn apply_block_execute_mode_mixed_pay_and_appl() {
     state.get_or_default_account_mut(&sender).micro_algos = 50_000_000;
     state.get_or_default_account_mut(&receiver).micro_algos = 1_000_000;
     state.get_or_default_account_mut(&fee_sink).micro_algos = 0;
-    state.get_or_default_account_mut(&rewards_pool).micro_algos = 0;
+    state.get_or_default_account_mut(&rewards_pool).micro_algos =
+        algo_ledger::apply::pool_fixtures::TEST_POOL_MIN_BALANCE; // #2116
 
     let app_id = 102u64;
     create_app(

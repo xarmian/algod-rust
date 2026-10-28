@@ -60,7 +60,7 @@ fn block(proto: &str, hgh: bool) -> Block {
 }
 
 fn state() -> LedgerState {
-    let mut s = LedgerState::new();
+    let mut s = algo_ledger::apply::pool_fixtures::funded_ledger_state();
     s.fee_sink = Address([0xFE; 32]);
     s.get_or_default_account_mut(&Address([1u8; 32]))
         .micro_algos = 100_000_000;

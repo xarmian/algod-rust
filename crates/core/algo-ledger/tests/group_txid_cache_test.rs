@@ -87,7 +87,7 @@ fn call(app_id: u64) -> SignedTransaction {
 
 /// Returns (app 0's `itxn TxID` log, app 1's `gtxn 0 TxID` log).
 fn run(proto: &str) -> (Vec<u8>, Vec<u8>) {
-    let mut s = LedgerState::new();
+    let mut s = algo_ledger::apply::pool_fixtures::funded_ledger_state();
     s.fee_sink = Address([0xFE; 32]);
     s.get_or_default_account_mut(&Address([0xAA; 32]))
         .micro_algos = 100_000_000;
@@ -148,7 +148,7 @@ fn v34_group_does_not_share_txid_cache() {
 /// and must share the cache across the group's app calls too.
 fn run_simulated(proto: &str) -> (Vec<u8>, Vec<u8>) {
     use algo_ledger::simulation::{SimulationRequest, Simulator};
-    let mut s = LedgerState::new();
+    let mut s = algo_ledger::apply::pool_fixtures::funded_ledger_state();
     s.fee_sink = Address([0xFE; 32]);
     s.protocol = proto.to_string();
     s.get_or_default_account_mut(&Address([0xAA; 32]))

@@ -3541,7 +3541,9 @@ mod tests {
     /// had advanced.
     #[tokio::test]
     async fn status_time_since_last_round_reflects_commit_time_not_poll_time() {
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let ledger = Arc::new(Mutex::new(
+            crate::commands::test_support::funded_sqlite_ledger(),
+        ));
         let adapter = make_adapter_with_ledger(ledger.clone());
 
         let before = adapter.status().await.unwrap();
@@ -3892,7 +3894,7 @@ mod tests {
 
     fn make_adapter() -> AlgodNodeInterface {
         let ledger = Arc::new(Mutex::new(
-            SqliteLedger::open_in_memory().expect("in-memory ledger"),
+            crate::commands::test_support::funded_sqlite_ledger(),
         ));
         make_adapter_with_ledger(ledger)
     }
@@ -4219,7 +4221,8 @@ mod tests {
     #[tokio::test]
     async fn lookup_missing_account_returns_zero_data() {
         let adapter = make_adapter();
-        let addr = Address::default();
+        // Not the zero address: that is the fixture's funded rewards pool.
+        let addr = Address([0x5Au8; 32]);
         let lookup = adapter.lookup_account(&addr).await.expect("lookup ok");
         assert_eq!(lookup.account_data.micro_algos, 0);
         assert!(lookup.assets.is_empty());
@@ -4264,7 +4267,7 @@ mod tests {
         use algo_ledger::StateDelta;
 
         let ledger = Arc::new(Mutex::new(
-            SqliteLedger::open_in_memory().expect("in-memory ledger"),
+            crate::commands::test_support::funded_sqlite_ledger(),
         ));
         // Seed two rounds with sentinel deltas. We can't assert on the
         // *contents* without re-importing the whole StateDelta surface here,
@@ -4338,7 +4341,7 @@ mod tests {
         // Fields inside "block" that our typed Rust `Block` does not model
         // (e.g. `zzextra`) must survive the round trip.
         let ledger_arc = Arc::new(Mutex::new(
-            SqliteLedger::open_in_memory().expect("in-memory ledger"),
+            crate::commands::test_support::funded_sqlite_ledger(),
         ));
 
         // fixmap(2) + "rnd":1 + "zzextra":"keep"
@@ -4388,7 +4391,7 @@ mod tests {
         // canonically encodes to an empty map, not an omitted key (verified
         // live against go-algorand v4.6.0-stable, issue #448).
         let ledger_arc = Arc::new(Mutex::new(
-            SqliteLedger::open_in_memory().expect("in-memory ledger"),
+            crate::commands::test_support::funded_sqlite_ledger(),
         ));
         let stored_block: Vec<u8> = vec![0x81, 0xa3, b'r', b'n', b'd', 0x02]; // {rnd:2}
         {
@@ -4433,7 +4436,7 @@ mod tests {
         let blkdata = rmp_serde::to_vec_named(&block).expect("encode block");
 
         let ledger_arc = Arc::new(Mutex::new(
-            SqliteLedger::open_in_memory().expect("in-memory ledger"),
+            crate::commands::test_support::funded_sqlite_ledger(),
         ));
         {
             let mut ledger = ledger_arc.lock().expect("ledger lock");
@@ -4528,12 +4531,14 @@ mod tests {
         let rwd = Address([0xFDu8; 32]).to_algorand_string();
         let sender_b32 = sender.to_algorand_string();
         let genesis_json = format!(
-            r#"{{"id":"v1","network":"localnet","proto":"future","fees":"{fees}","rwd":"{rwd}","timestamp":0,"alloc":[{{"addr":"{sender_b32}","comment":"w1","state":{{"algo":{micro_algos},"onl":0}}}}]}}"#
+            r#"{{"id":"v1","network":"localnet","proto":"future","fees":"{fees}","rwd":"{rwd}","timestamp":0,"alloc":[{{"addr":"{sender_b32}","comment":"w1","state":{{"algo":{micro_algos},"onl":0}}}},{{"addr":"{rwd}","comment":"pool","state":{{"algo":100000,"onl":2}}}}]}}"#
         );
+        // Issue #2116: the rewards pool holds MinBalance, which go's
+        // block-start withdrawal requires of every block.
         let genesis = parse_genesis_json(&genesis_json).expect("parse genesis");
         let gh = genesis_hash(&genesis);
 
-        let mut l = SqliteLedger::open_in_memory().expect("ledger");
+        let mut l = crate::commands::test_support::funded_sqlite_ledger();
         l.begin_block().unwrap();
         populate_store(&mut l, &genesis).unwrap();
         seed_account_totals_from_genesis(&mut l, &genesis).unwrap();
@@ -5560,7 +5565,7 @@ mod tests {
         // propagating the panic into subsequent callers (which is what
         // `expect("ledger lock poisoned")` used to do).
         let ledger_arc = Arc::new(Mutex::new(
-            SqliteLedger::open_in_memory().expect("in-memory ledger"),
+            crate::commands::test_support::funded_sqlite_ledger(),
         ));
         // Poison by panicking inside a lock scope. `catch_unwind` keeps
         // the panic from escaping into the test harness.
@@ -5753,7 +5758,7 @@ mod tests {
         let blkdata = rmp_serde::to_vec_named(&block).expect("encode block");
 
         let ledger_arc = Arc::new(Mutex::new(
-            SqliteLedger::open_in_memory().expect("in-memory ledger"),
+            crate::commands::test_support::funded_sqlite_ledger(),
         ));
         {
             let mut ledger = ledger_arc.lock().expect("ledger lock");
@@ -6083,7 +6088,7 @@ mod tests {
     /// the status/account-lookup tests.
     fn adapter_with_seedable_ledger() -> (AlgodNodeInterface, Arc<Mutex<SqliteLedger>>) {
         let ledger_arc = Arc::new(Mutex::new(
-            SqliteLedger::open_in_memory().expect("in-memory ledger"),
+            crate::commands::test_support::funded_sqlite_ledger(),
         ));
         (adapter_with_ledger(Arc::clone(&ledger_arc)), ledger_arc)
     }
@@ -7650,7 +7655,7 @@ mod tests {
     #[tokio::test]
     async fn status_last_catchpoint_reflects_the_ledgers_own_generated_label() {
         let ledger = Arc::new(Mutex::new(
-            SqliteLedger::open_in_memory().expect("in-memory ledger"),
+            crate::commands::test_support::funded_sqlite_ledger(),
         ));
         ledger
             .lock()
@@ -7675,7 +7680,7 @@ mod tests {
     #[tokio::test]
     async fn status_last_catchpoint_is_empty_while_a_catchup_is_in_flight() {
         let ledger = Arc::new(Mutex::new(
-            SqliteLedger::open_in_memory().expect("in-memory ledger"),
+            crate::commands::test_support::funded_sqlite_ledger(),
         ));
         ledger
             .lock()
@@ -7751,7 +7756,9 @@ mod tests {
     /// `UnsetSyncRound` resets it to `0`.
     #[tokio::test]
     async fn follower_sync_round_initializes_set_and_unset_round_trip() {
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let ledger = Arc::new(Mutex::new(
+            crate::commands::test_support::funded_sqlite_ledger(),
+        ));
         let state = FollowerSyncRoundState::new(ledger.clone(), 4);
         let adapter = AlgodNodeInterface::new(
             ledger.clone(),
@@ -7784,7 +7791,9 @@ mod tests {
     /// #950) instead of silently resolving.
     #[tokio::test]
     async fn follower_sync_round_advances_ledger_earliest_round() {
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let ledger = Arc::new(Mutex::new(
+            crate::commands::test_support::funded_sqlite_ledger(),
+        ));
         let state = FollowerSyncRoundState::new(ledger.clone(), 4);
         let adapter = make_adapter_with_ledger(ledger.clone()).with_follower_mode(state);
 
@@ -7824,7 +7833,9 @@ mod tests {
     /// `handlers.rs::set_sync_round`'s substring match for a 400 response.
     #[tokio::test]
     async fn set_sync_round_rejects_round_behind_ledger() {
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let ledger = Arc::new(Mutex::new(
+            crate::commands::test_support::funded_sqlite_ledger(),
+        ));
         apply_one_trivial_block(&ledger, 1);
         // max_acct_lookback = 0 so the offset doesn't mask the comparison.
         let state = FollowerSyncRoundState::new(ledger.clone(), 0);
@@ -7864,7 +7875,9 @@ mod tests {
     /// `NodeInterface` trait methods.
     #[tokio::test]
     async fn fast_catchup_resume_resets_sync_round_to_ledger_round() {
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let ledger = Arc::new(Mutex::new(
+            crate::commands::test_support::funded_sqlite_ledger(),
+        ));
         let state = FollowerSyncRoundState::new(ledger.clone(), 0);
         let manager = crate::live_catchup::LiveCatchupManager::new(
             Arc::new(ImmediateRunner),
