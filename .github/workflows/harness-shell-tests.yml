@@ -133,14 +133,16 @@ jobs:
           set -euo pipefail
           tag="$(grep -v '^[[:space:]]*#' scripts/bench/go-algorand.pin | grep -v '^[[:space:]]*$' | head -n1 | tr -d '[:space:]')"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/go-algorand-gomod"
+          # setup-go only parses a file literally named go.mod (else: plain version file).
           curl -fsSL "https://raw.githubusercontent.com/algorand/go-algorand/${tag}/go.mod" \
-            -o "$RUNNER_TEMP/go-algorand.go.mod"
-          grep -E '^(go|toolchain) ' "$RUNNER_TEMP/go-algorand.go.mod"
+            -o "$RUNNER_TEMP/go-algorand-gomod/go.mod"
+          grep -E '^(go|toolchain) ' "$RUNNER_TEMP/go-algorand-gomod/go.mod"
       - name: Install Go per go-algorand's go.mod
         if: steps.gate.outputs.run == 'true'
         uses: actions/setup-go@v7
         with:
-          go-version-file: ${{ runner.temp }}/go-algorand.go.mod
+          go-version-file: ${{ runner.temp }}/go-algorand-gomod/go.mod
           cache: false
       - name: Install libsodium build tools
         if: steps.gate.outputs.run == 'true'
