@@ -2000,7 +2000,9 @@ mod tests {
         no_proposer.proposer = Address::ZERO;
         let cert = make_cert_with_proposal(1);
 
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let ledger = Arc::new(Mutex::new(
+            crate::apply::pool_fixtures::funded_sqlite_ledger(),
+        ));
         AgreementLedgerBridge::new(Arc::clone(&ledger)).ensure_block(&no_proposer, &cert);
         assert_eq!(
             ledger.lock().unwrap().current_round(),
@@ -2008,7 +2010,9 @@ mod tests {
             "a proposer-less V41 block must be rejected on a normal chain"
         );
 
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let ledger = Arc::new(Mutex::new(
+            crate::apply::pool_fixtures::funded_sqlite_ledger(),
+        ));
         ledger.lock().unwrap().set_devmode_chain(true);
         AgreementLedgerBridge::new(Arc::clone(&ledger)).ensure_block(&no_proposer, &cert);
         assert_eq!(ledger.lock().unwrap().current_round(), Round(1));
