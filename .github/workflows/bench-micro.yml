@@ -41,10 +41,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
-      GO_ALGORAND_DIR: ${{ runner.temp }}/go-algorand
       CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v7
+      - name: Locate the go-algorand checkout
+        # `runner` is not available in job-level env; export it for every later step.
+        run: echo "GO_ALGORAND_DIR=$RUNNER_TEMP/go-algorand" >> "$GITHUB_ENV"
       - name: Resolve the pinned tag and its go.mod
         id: pin
         run: |
