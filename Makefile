@@ -16,7 +16,7 @@ P2P_INTEROP_1V1_CLUSTER := ops/mixed-cluster-p2p-1v1
 .PHONY: replay-mainnet replay-testnet replay-stateful replay-mainnet-stateful replay-mainnet-1k
 .PHONY: avm-replay avm-replay-mainnet
 .PHONY: bench-rust bench-decode bench-go bench-micro bench-micro-go bench-cluster benchmark
-.PHONY: bench-stress bench-stress-down bench-compare bench-compare-test
+.PHONY: bench-stress bench-stress-down bench-compare bench-compare-test bench-micro-equiv
 .PHONY: archival-up archival-down
 .PHONY: localnet-up localnet-down localnet-status localnet-logs algokey-e2e
 .PHONY: localnet-rust-up localnet-rust-down localnet-rust-status localnet-rust-logs localnet-rust-genesis
@@ -1062,6 +1062,11 @@ bench-compare: ## Go vs Rust comparison report (TIERS=a,b RUNS=N) -> bench-resul
 bench-compare-test: ## Unit-test the bench-compare harness (no Docker, no builds)
 	python3 -m unittest discover -s scripts/bench -p 'test_*.py'
 
+## Issue #2103: per-pair Go/Rust output-equivalence check of the micro tier
+## (needs go + a pinned go-algorand checkout, GO_ALGORAND_DIR).
+bench-micro-equiv: ## micro tier: run every Go/Rust pair once, fail if any output differs
+	python3 scripts/bench/micro_equiv.py
+
 ## ── Archival Node ───────────────────────────────────────────
 
 archival-up: ## Start archival Go node
@@ -1189,6 +1194,8 @@ help:
 	@echo "Benchmarks (Go vs Rust comparison report — docs/BENCHMARK_COMPARISON.md):"
 	@echo "  make bench-compare TIERS=selftest RUNS=5   Run tiers -> bench-results/<utc-ts>/report.md"
 	@echo "  make bench-compare-test                    Unit-test the bench-compare harness"
+	@echo "  make bench-compare TIERS=micro RUNS=10     Paired Go/Rust micro-benchmarks (benchmarks/pairs.toml)"
+	@echo "  make bench-micro-equiv                     micro tier Go/Rust output-equivalence check only"
 	@echo ""
 	@echo "Benchmarks (fair comparison):"
 	@echo "  make bench-micro      Run Rust criterion microbenchmarks (fixture-based)"

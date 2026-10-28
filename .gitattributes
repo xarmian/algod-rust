@@ -82,3 +82,9 @@ scripts/bench/**/*.py text eol=lf
 scripts/bench/**/*.pin text eol=lf
 scripts/bench/**/*.json text eol=lf
 scripts/bench/**/*.md text eol=lf
+
+# Paired Go/Rust micro-benchmark fixtures (issue #2103): their sha256s are
+# pinned in benchmarks/pairs.toml and both implementations must read the
+# exact committed bytes, so no end-of-line conversion ever (binary).
+benchmarks/fixtures/** -text
+scripts/bench/testdata/** text eol=lf

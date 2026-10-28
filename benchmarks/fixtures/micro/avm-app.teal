@@ -1,0 +1,46 @@
+#pragma version 10
+int 0
+store 0
+int 0
+store 1
+loop:
+pushbytes "k"
+load 1
+itob
+concat
+load 1
+pushint 1000
++
+app_global_put
+pushbytes "k"
+load 1
+itob
+concat
+app_global_get
+load 0
++
+store 0
+load 1
+int 1
++
+dup
+store 1
+pushint 8
+<
+bnz loop
+pushbytes "box"
+load 0
+itob
+pushint 56
+bzero
+concat
+box_put
+pushbytes "box"
+box_get
+assert
+sha256
+log
+load 0
+itob
+log
+int 1

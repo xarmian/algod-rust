@@ -25,6 +25,7 @@ members = [
     "crates/node/algo-kmd-client",
     "crates/node/algo-txn-pipeline",
     "crates/tools/algo-bench",
+    "crates/tools/algo-bench-pairs",
     "crates/tools/algo-build-info",
     "crates/tools/algo-fork-detector",
     "crates/tools/algo-cert-crossverify",

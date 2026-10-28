@@ -1,0 +1,19 @@
+=== RUN   TestDigestsMatchRecorded
+--- PASS: TestDigestsMatchRecorded (0.15s)
+=== RUN   TestDigestsMatchRecorded
+--- PASS: TestDigestsMatchRecorded (0.16s)
+goos: linux
+goarch: amd64
+pkg: github.com/xarmian/algod-rust/benchmarks/go-micro
+cpu: 13th Gen Intel(R) Core(TM) i7-13700
+BenchmarkCodecTxid
+BenchmarkCodecTxid-24                       	  239557	       992.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCodecTxid-24                       	  240596	       980.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCryptoSha512_256_32B
+BenchmarkCryptoSha512_256_32B-24            	 1000000	       208.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCryptoSha512_256_32B-24            	 1000000	       208.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAgreementSortitionSelectF128
+BenchmarkAgreementSortitionSelectF128-24    	  267586	       841.0 ns/op	      96 B/op	       1 allocs/op
+BenchmarkAgreementSortitionSelectF128-24    	  310516	       789.6 ns/op	      96 B/op	       1 allocs/op
+PASS
+ok  	github.com/xarmian/algod-rust/benchmarks/go-micro	1.817s

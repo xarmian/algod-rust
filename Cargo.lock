@@ -180,6 +180,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "algo-bench-pairs"
+version = "0.1.0"
+dependencies = [
+ "algo-agreement",
+ "algo-avm",
+ "algo-codec",
+ "algo-consensus-crypto",
+ "algo-falcon",
+ "algo-ledger",
+ "algo-types",
+ "algo-validate",
+ "criterion",
+ "hex",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "sha2 0.11.1",
+]
+
+[[package]]
 name = "algo-build-info"
 version = "0.1.0"
 

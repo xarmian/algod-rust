@@ -27,6 +27,7 @@ make bench-compare TIERS=selftest RUNS=5
 - [Result schema v1](#result-schema-v1)
 - [Pinned builds (`build_both.sh`)](#pinned-builds-build_bothsh)
 - [Tiers](#tiers)
+- [The `micro` tier](#the-micro-tier)
 
 ## Quick start
 
@@ -338,7 +339,7 @@ whenever `build_both.sh` or the pin file changes. It asserts
 | Tier | Status | Measures |
 |---|---|---|
 | `selftest` | available (#2102) | The harness itself: both "sides" run the same Python sha256 workload. It checks the schema, pairing, statistics and report on any machine, and it is what CI runs. |
-| `micro` | planned (#2103) | Paired Go `testing.B` / Rust criterion micro-benchmarks: codec, crypto, commitments, AVM, sortition. |
+| `micro` | available (#2103) | Paired Go `testing.B` / Rust criterion micro-benchmarks on identical fixture bytes: codec, crypto, commitments, AVM, agreement. See [The `micro` tier](#the-micro-tier). |
 | `replay` | planned (#2104, #2105) | Offline ledger replay of a deterministic block corpus, with a final-state equality gate. |
 | `localnet` | planned (#2106) | All-Go vs all-Rust homogeneous localnet throughput under the same load. |
 | `rest` | planned (#2107) | REST API throughput against identical ledger state. |
@@ -346,3 +347,159 @@ whenever `build_both.sh` or the pin file changes. It asserts
 
 The CI workflow and the published baseline (`docs/BENCHMARK_RESULTS.md`)
 come with #2109.
+
+## The `micro` tier
+
+```bash
+make bench-compare TIERS=micro RUNS=10
+# a quicker, noisier look:
+BENCH_MICRO_GO_BENCHTIME=300ms BENCH_MICRO_CRITERION_ARGS="--warm-up-time 0.5 --measurement-time 1" \
+  make bench-compare TIERS=micro RUNS=3
+make bench-micro-equiv        # only the Go/Rust output-equivalence check
+```
+
+The tier compares one go-algorand function with its algod-rust counterpart
+per **pair**, both run on the same input bytes. It needs `go` (the version
+in go-algorand's `go.mod`), `cargo`, a go-algorand checkout on the pinned tag
+(`GO_ALGORAND_DIR`, default `../go-algorand`) and the libsodium build tools.
+It builds no `algod` binaries, so it does not declare
+`bench-tier-needs: build`.
+
+### How it works
+
+| Piece | Path | Role |
+|---|---|---|
+| Registry | [`benchmarks/pairs.toml`](../benchmarks/pairs.toml) | One `[[pair]]` per comparison: `id`, `unit`, the Go `go_package` + `go_bench`, the Rust `rust_bench` (always equal to `id`), the production function of each side (`go_api`, `rust_api`), the `fixture` file and its `fixture_sha256`. |
+| Fixtures | `benchmarks/fixtures/micro/` | The shared inputs. They are committed and checked out byte-exact (`.gitattributes`: `-text`). |
+| Fixture generator | `benchmarks/go-micro/cmd/genfixtures` | Writes every fixture deterministically (fixed seeds, no clock, no RNG) with go-algorand itself: msgpack encodings, ed25519 / VRF / Falcon signatures, assembled TEAL. The small block, the certificate and the proposal are re-encodings of fixtures already in the repo. |
+| Go side | `benchmarks/go-micro` (AGPL, links go-algorand) | `micro/cases.go` has one case per pair id. `micro_test.go` has one `Benchmark*` per pair (`go_bench`). `cmd/equiv` prints every pair's output digest. |
+| Rust side | `crates/tools/algo-bench-pairs` (AGPL) | `src/lib.rs` has one case per pair id. `benches/pairs.rs` is one criterion benchmark per id, named `<group>/<name>`. The `micro-equiv` binary prints every pair's output digest. |
+| Tier | `scripts/bench/tiers/micro.py` | Runs the steps below and writes `results/micro/micro.json`. |
+| Converters | `scripts/bench/micro_convert.py` | Parse `go test -bench -benchmem` output and criterion's `new/sample.json` / `estimates.json`, load the registry. Unit-tested on captured outputs of both frameworks (`scripts/bench/test_micro_convert.py`, `scripts/bench/testdata/micro/`). |
+| Equivalence | `scripts/bench/micro_equiv.py` | Runs `cmd/equiv` and `micro-equiv` and compares them pair by pair. |
+
+A case on either side is two functions that share one implementation of the
+operation: `Op` / `run` is the measured body (setup such as reading and
+decoding the fixture is done once, outside the timer), and `Digest` /
+`digest` runs the operation once and describes its output in a canonical
+text form that is the same in both languages. Examples:
+`sha256:<hex>` of the re-encoded bytes for codec pairs, `hex:<digest>` for
+hashes, `valid:<n>/<n>` for signature verification,
+`pass:true;cost:12014` for logicsigs, `weight:16;vrfout:<hex>` for a
+credential.
+
+The tier then:
+
+1. Checks every fixture's sha256 against the registry.
+2. **Output equivalence.** Runs every pair once on both sides and requires
+   identical digests. A pair whose digests differ means the two sides did
+   not do the same work on the same bytes, or one of them is wrong, so the
+   tier stops before timing anything. The same check also runs in
+   `cargo test`: `crates/tools/algo-bench-pairs/tests/equivalence.rs`
+   compares the Rust digests with `benchmarks/fixtures/micro/go-digests.json`,
+   which `go run ./cmd/equiv -write` recorded from go-algorand, and the Go
+   test `TestDigestsMatchRecorded` keeps that file in step with the Go side.
+3. Runs `BENCH_MICRO_WARMUP` (default 1) discarded warm-up rounds, then
+   `RUNS` measured rounds, alternating which side goes first. A Go round is
+   `go test -run '^$' -bench '<every go_bench>' -benchmem -count=1`, which
+   gives one ns/op per pair. A Rust round is one
+   `cargo bench -p algo-bench-pairs --bench pairs -- --noplot`. Its sample
+   for a pair is the median of criterion's per-sample times
+   (`new/sample.json`: time divided by iterations, for every one of the 100
+   samples), read through each benchmark's `new/benchmark.json` `full_id`.
+   It falls back to `estimates.json`'s median. Each side therefore
+   contributes `RUNS` samples, one per interleaved round, which the report
+   turns into the median, the CI and the Rust/Go ratio. The Go B/op and
+   allocs/op, the criterion sample counts, both commands, the fixture and its
+   sha256 and the output digest go to each result's `metadata`.
+
+Knobs: `BENCH_MICRO_FILTER` (a regex on pair ids, for example `^crypto/`),
+`BENCH_MICRO_GO_BENCHTIME` (Go `-benchtime`, default 1s),
+`BENCH_MICRO_CRITERION_ARGS` (extra criterion arguments, default criterion
+settings), `BENCH_MICRO_WARMUP`, and `BENCH_MICRO_ALLOW_UNPINNED=1` to accept
+a go-algorand checkout that is not on the pinned tag (the report's
+fingerprint still flags it).
+
+### Why not go-algorand's own `Benchmark*` functions
+
+The epic prefers go-algorand's own benchmarks where they measure the same
+thing on the same input. We reviewed `crypto.BenchmarkHash`,
+`BenchmarkVerify25519`, `BenchmarkBatchVerifier*`, the `logic` package's
+`benchmarkOperation` family and the generated `BenchmarkUnmarshal*`. Each one
+generates its input inside the benchmark (`crypto.RandBytes`,
+`protocol.RandomizeObject`, inline TEAL), so the Rust side cannot read the
+same bytes. The pairs therefore use thin `testing.B` wrappers that call the
+same go-algorand APIs on the shared fixtures.
+
+### Pairs
+
+| Pair | Fixture | go-algorand | algod-rust |
+|---|---|---|---|
+| `codec/decode-block-small` | `block-small.msgpack` (round 6 of `algo-codec`'s `block_6.msgpack`, 1 app call) | `protocol.Decode(&bookkeeping.Block)` | `algo_codec::decode_block` |
+| `codec/decode-block-large` | `block-large.msgpack` (1025 txns) | `protocol.Decode(&bookkeeping.Block)` | `algo_codec::decode_block` |
+| `codec/encode-block-small` / `-large` | same | `protocol.Encode(&block)` | `algo_codec::canonical_encode_block` |
+| `codec/decode-stxn` / `encode-stxn` | `stxn-appl.msgpack` (signed app call) | `protocol.Decode` / `Encode` of `transactions.SignedTxn` | `decode_signed_txn_stream` / `canonical_encode_signed_transaction` |
+| `codec/txid` | `stxn-appl.msgpack` | `Transaction.ID` | `compute_txn_id` |
+| `codec/block-hash` | `block-large.msgpack` | `BlockHeader.Hash` | `compute_block_digest` |
+| `crypto/sha512_256-32B` / `-1KiB` / `-64KiB` | `bytes-*.bin` | `crypto.Hash` | `sha2::Sha512_256` |
+| `crypto/ed25519-verify` | `stxn-appl.msgpack` | `SignatureVerifier.Verify(txn, sig)` | `algo_validate::verify_single_sig` |
+| `crypto/ed25519-batch-64` / `-1024` | `stxns-64.msgpack`, `stxns-1024.msgpack` | `crypto.BatchVerifier` | `verify_single_sig` per signature (no Rust batch verifier yet) |
+| `crypto/vrf-verify` | `vrf.frames` (pk, proof, selector bytes) | `VrfPubkey.Verify` | `algo_consensus_crypto::vrf::vrf_verify` |
+| `crypto/falcon-verify` | `falcon.frames` | `FalconVerifier.VerifyBytes` (C) | `algo_falcon::falcon_verify`, default pure-Rust backend ([DIV-001](DIVERGENCES.md)) |
+| `commit/txn-merkle-sha512_256` | `block-large.msgpack` | `Block.TxnMerkleTree().Root()` | `compute_payset_merkle_root` |
+| `commit/txn-vc-sha256` | `block-large.msgpack` | `Block.TxnMerkleTreeSHA256().Root()` | `compute_vector_commitment(Sha256)` |
+| `avm/lsig-arith-loop` | `avm-arith.bin` (500-iteration `mulw`/`addw`/`%` loop) | `NewSigEvalParams` + `EvalSignature` | `LogicSigAvmContext` + `run_logicsig_program` |
+| `avm/lsig-hash-loop` | `avm-hash.bin` (60 x `sha256`/`sha512_256`/`keccak256`) | same | same |
+| `avm/lsig-bytes-ops` | `avm-bytes.bin` (250 x `b^`/`extract`/`b+`/`b\|`/`replace2`) | same | same |
+| `avm/app-state-box` | `avm-app.bin` (8 global puts/gets, `box_put`/`box_get`, `log`) | `NewAppEvalParams` + `EvalContract`, in-memory `LedgerForLogic` | `LedgerAvmContext<LedgerState>` + `run_approval_program` |
+| `agreement/sortition-select` | `sortition.json` | `sortition.Select` (pre-v42 float path) | `sortition::select` |
+| `agreement/sortition-select-f128` | `sortition.json` | `sortition.SelectF128` (v42+) | `sortition::select_f128` |
+| `agreement/credential-verify` | `credential.json` (soft-vote selector) | `UnauthenticatedCredential.Verify` | `UnauthenticatedCredential::verify` |
+| `agreement/decode-cert` | `cert-20.msgpack` (20-vote certificate) | `protocol.Decode(&agreement.Certificate)` | `codec::decode_bundle` |
+| `agreement/decode-proposal` | `proposal.msgpack` (transmitted payload) | `protocol.Decode(&agreement.TransmittedPayload)` | `codec::decode_compound_message` |
+
+Notes on the pairs:
+
+- The logicsig programs check their own result. The generator first runs
+  each program in go-algorand, reads the result from scratch slot 0, and
+  then embeds it in a final `load 0; push <value>; ==`. The committed
+  program therefore only approves if the evaluator computes exactly
+  go-algorand's value. The digest also carries the opcode cost.
+- A single agreement vote cannot be decoded outside go-algorand's
+  `agreement` package (`unauthenticatedVote` is unexported). The exported
+  `Certificate` (a bundle of 20 votes) covers the vote decoding path. For
+  the same reason the credential pair uses a copy of the unexported
+  `agreement.selector` (`benchmarks/go-micro/micro/selector.go`) whose
+  `ToBeHashed` is the generated msgp encoder.
+- go-algorand's `logic.NewLedger` mock lives in a `_test.go` file, so the
+  app pair uses a minimal in-memory `LedgerForLogic`
+  (`benchmarks/go-micro/micro/ledger.go`). It is the counterpart of the Rust
+  side's in-memory `LedgerState`.
+
+### Adding a pair
+
+1. Pick an id `<group>/<name>` and the production function on each side.
+2. If it needs a new input, add it to `cmd/genfixtures`, then regenerate
+   the fixtures from `benchmarks/go-micro` (Linux, go-algorand checkout with
+   `make libsodium` done, `GOWORK` pointing at a `go.work` that replaces
+   `github.com/algorand/go-algorand` with that checkout):
+   `go run ./cmd/genfixtures -repo ../.. -out ../fixtures/micro`.
+3. Go: add the case to `builders` in `micro/cases.go` and a
+   `func BenchmarkX(b *testing.B) { run(b, "<id>") }` to `micro_test.go`.
+4. Rust: add the id to `IDS` (sorted) and a `build()` arm in
+   `crates/tools/algo-bench-pairs/src/lib.rs`. Use the same digest format
+   as the Go case.
+5. Record the Go digests with `go run ./cmd/equiv -write ../fixtures/micro/go-digests.json`.
+6. Add the `[[pair]]` to `benchmarks/pairs.toml` with the fixture's sha256
+   (`sha256sum benchmarks/fixtures/micro/<file>`).
+7. Run `python3 scripts/bench/test_pairs.py` (registry against both sides,
+   sha256s), `cargo test -p algo-bench-pairs` (Rust digests against Go's)
+   and `make bench-micro-equiv`.
+
+CI: the `bench-compare-harness` job in `harness-shell-tests.yml` runs the
+static registry checks. `.github/workflows/bench-micro.yml` (Linux, triggered
+by changes to `benchmarks/**`, the micro scripts or `algo-bench-pairs`)
+clones the pinned go-algorand, runs `go test -list`, the recorded-digest
+tests, the live equivalence check and `make bench-compare TIERS=micro RUNS=3`
+with short criterion settings, and appends `report.md` to the job summary.
+CI runners are shared and noisy, so treat those ratios as indicative only.

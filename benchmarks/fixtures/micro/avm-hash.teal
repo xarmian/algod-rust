@@ -1,0 +1,22 @@
+#pragma version 10
+pushbytes 0xb6d43ea34f2a1ac4b0e4dbb12a3c7c1c694b055cd5217ab595c19cabfa1d5ece
+store 0
+int 0
+store 1
+loop:
+load 0
+sha256
+sha512_256
+keccak256
+store 0
+load 1
+int 1
++
+dup
+store 1
+pushint 60
+<
+bnz loop
+load 0
+pushbytes 0xcc413ca886d97e8aea1e5918db4514f0a1d16dd76af4dcd9c7efa80fdce80d23
+==

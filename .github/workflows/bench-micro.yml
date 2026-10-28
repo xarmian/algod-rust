@@ -1,0 +1,130 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: Bench Micro Pairs
+
+# Issue #2103 (epic #2101): the paired Go/Rust micro-benchmark tier on Linux.
+# go-algorand's Go code links a vendored libsodium and cannot be built on the
+# Windows dev boxes, so this is where the Go half is proven: the registry's
+# `go test -list` check, the Go-recorded digests, the live Go/Rust output-
+# equivalence check (fails on any differing pair), then a short
+# `make bench-compare TIERS=micro RUNS=3` whose report.md goes to the job
+# summary. CI runners are noisy: the ratios are indicative only.
+
+on:
+  pull_request:
+    paths:
+      - "benchmarks/**"
+      - "scripts/bench/tiers/micro*"
+      - "scripts/bench/micro_*.py"
+      - "scripts/bench/test_pairs.py"
+      - "crates/tools/algo-bench-pairs/**"
+      - ".github/workflows/bench-micro.yml"
+  push:
+    branches: [main]
+    paths:
+      - "benchmarks/**"
+      - "scripts/bench/tiers/micro*"
+      - "scripts/bench/micro_*.py"
+      - "scripts/bench/test_pairs.py"
+      - "crates/tools/algo-bench-pairs/**"
+      - ".github/workflows/bench-micro.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench-micro:
+    name: micro tier (Go/Rust pairs, Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GO_ALGORAND_DIR: ${{ runner.temp }}/go-algorand
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v7
+      - name: Resolve the pinned tag and its go.mod
+        id: pin
+        run: |
+          set -euo pipefail
+          tag="$(grep -v '^[[:space:]]*#' scripts/bench/go-algorand.pin | grep -v '^[[:space:]]*$' | head -n1 | tr -d '[:space:]')"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/go-algorand-gomod"
+          # setup-go only parses a file literally named go.mod (else: plain version file).
+          curl -fsSL "https://raw.githubusercontent.com/algorand/go-algorand/${tag}/go.mod" \
+            -o "$RUNNER_TEMP/go-algorand-gomod/go.mod"
+          grep -E '^(go|toolchain) ' "$RUNNER_TEMP/go-algorand-gomod/go.mod"
+      - name: Install Go per go-algorand's go.mod
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: ${{ runner.temp }}/go-algorand-gomod/go.mod
+          cache-dependency-path: benchmarks/go-micro/go.sum
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-micro
+      - name: Install libsodium build tools
+        run: |
+          # go-algorand's crypto package links a vendored libsodium fork via cgo.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends autoconf automake libtool build-essential
+      - name: Clone pinned go-algorand + make libsodium
+        env:
+          TAG: ${{ steps.pin.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 --branch "$TAG" https://github.com/algorand/go-algorand "$GO_ALGORAND_DIR"
+          make -C "$GO_ALGORAND_DIR" libsodium
+      - name: Registry checks (static + go test -list)
+        env:
+          BENCH_MICRO_GO_LIST: "1"
+        run: python3 scripts/bench/test_pairs.py -v
+      - name: Go side - gofmt, vet, recorded digests
+        run: |
+          set -euo pipefail
+          cd benchmarks/go-micro
+          unformatted="$(gofmt -l .)"
+          [ -z "$unformatted" ] || { echo "::error::gofmt needed: $unformatted"; exit 1; }
+          printf 'go 1.25.0\n\nuse .\n\nreplace github.com/algorand/go-algorand => %s\n' "$GO_ALGORAND_DIR" > "$RUNNER_TEMP/go.work"
+          export GOWORK="$RUNNER_TEMP/go.work"
+          go vet ./...
+          go test -count=1 -run TestDigestsMatchRecorded -v .
+      - name: Rust side - recorded digests
+        run: cargo test --locked -p algo-bench-pairs
+      - name: Output equivalence (live Go vs live Rust)
+        run: python3 scripts/bench/micro_equiv.py --go-algorand "$GO_ALGORAND_DIR"
+      - name: make bench-compare TIERS=micro RUNS=3
+        env:
+          BENCH_MICRO_GO_BENCHTIME: 300ms
+          BENCH_MICRO_CRITERION_ARGS: --warm-up-time 0.5 --measurement-time 1
+        run: |
+          set -euo pipefail
+          make bench-compare TIERS=micro RUNS=3 BENCH_RUN_DIR=bench-results/ci-micro
+          python3 - <<'PY'
+          import json
+          rep = json.load(open("bench-results/ci-micro/report.json"))
+          assert rep["ok"], rep["errors"]
+          rows = [r for r in rep["rows"] if r["tier"] == "micro"]
+          pairs = [l for l in open("benchmarks/pairs.toml") if l.startswith("[[pair]]")]
+          missing = [r["name"] for r in rows if r.get("ratio") is None]
+          assert len(rows) == len(pairs), (len(rows), len(pairs))
+          assert not missing, missing
+          print(f"{len(rows)} micro pairs, every one with a Rust/Go ratio")
+          PY
+      - name: Report to job summary
+        if: always()
+        run: |
+          if [ -s bench-results/ci-micro/report.md ]; then
+            cat bench-results/ci-micro/report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload run directory
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-micro-results
+          path: bench-results/ci-micro
+          if-no-files-found: ignore
