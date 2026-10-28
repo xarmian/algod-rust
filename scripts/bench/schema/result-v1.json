@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xarmian/algod-rust/blob/main/scripts/bench/schema/result-v1.json",
+  "$comment": "Copyright (c) 2026 Algod DAO. SPDX-License-Identifier: MIT. bench-compare result schema v1 (issue #2102, epic #2101). A tier writes one or more *.json files into $BENCH_OUT; each file holds one result object or an array of them. Validated by scripts/bench/bench_schema.py, which implements the keyword subset used here (type, const, enum, pattern, required, properties, additionalProperties, items, minItems, minimum, minLength). See docs/BENCHMARK_COMPARISON.md 'Tier contract'.",
+  "title": "bench-compare result (v1)",
+  "type": "object",
+  "required": ["schema", "tier", "name", "impl", "unit", "samples", "metadata"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "description": "Schema id and version. A breaking change adds result-v2.json; it never edits this file.",
+      "const": "bench-result/v1"
+    },
+    "tier": {
+      "description": "Tier that produced the result; equals the tier script's basename.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*$"
+    },
+    "name": {
+      "description": "Benchmark name, identical for the Go and Rust halves of a pair (the pairing key is tier + name).",
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_./:+-]*$"
+    },
+    "impl": {
+      "description": "Which implementation was measured.",
+      "enum": ["go", "rust"]
+    },
+    "unit": {
+      "description": "Unit of every sample, e.g. ns/op, s, MB/s, txn/s, bytes. Both halves of a pair must use the same unit.",
+      "type": "string",
+      "minLength": 1
+    },
+    "better": {
+      "description": "Optional direction. Default: 'higher' when the unit ends in '/s', otherwise 'lower'.",
+      "enum": ["lower", "higher"]
+    },
+    "samples": {
+      "description": "One value per measured run (warm-up runs excluded), in run order.",
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "number", "minimum": 0}
+    },
+    "metadata": {
+      "description": "Free-form provenance: input corpus + sha256, binary or package, command line, iterations, final-state hash for macro tiers, synthetic=true for selftest rows.",
+      "type": "object"
+    }
+  }
+}

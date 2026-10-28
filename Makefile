@@ -16,7 +16,7 @@ P2P_INTEROP_1V1_CLUSTER := ops/mixed-cluster-p2p-1v1
 .PHONY: replay-mainnet replay-testnet replay-stateful replay-mainnet-stateful replay-mainnet-1k
 .PHONY: avm-replay avm-replay-mainnet
 .PHONY: bench-rust bench-decode bench-go bench-micro bench-micro-go bench-cluster benchmark
-.PHONY: bench-stress bench-stress-down
+.PHONY: bench-stress bench-stress-down bench-compare bench-compare-test
 .PHONY: archival-up archival-down
 .PHONY: localnet-up localnet-down localnet-status localnet-logs algokey-e2e
 .PHONY: localnet-rust-up localnet-rust-down localnet-rust-status localnet-rust-logs localnet-rust-genesis
@@ -1041,6 +1041,27 @@ bench-stress-down: ## Tear down a cluster left running by `bench-stress --keep-u
 benchmark: bench-micro bench-micro-go ## Run all microbenchmarks (Rust + Go)
 	@echo "Benchmark complete. For cluster comparison: make bench-cluster"
 
+## Issue #2102 (epic #2101, Phase 23): reproducible Go vs Rust comparison.
+## Runs the selected tiers (scripts/bench/tiers/<tier>.{py,sh}), building
+## go-algorand at the pinned tag + algod-rust --release first when a tier
+## needs binaries (BENCH_BUILD=auto|always|never), and writes
+## $(BENCH_OUTPUT)/<utc-ts>/report.{json,md}. See docs/BENCHMARK_COMPARISON.md.
+##   make bench-compare TIERS=selftest RUNS=5
+TIERS ?= selftest
+RUNS ?= 5
+BENCH_BUILD ?= auto
+BENCH_RUN_DIR ?=
+BENCH_CLEAN ?=
+
+bench-compare: ## Go vs Rust comparison report (TIERS=a,b RUNS=N) -> bench-results/<utc-ts>/
+	python3 scripts/bench/run.py --tiers "$(TIERS)" --runs "$(RUNS)" \
+		--build "$(BENCH_BUILD)" --out-root "$(BENCH_OUTPUT)" \
+		$(if $(BENCH_RUN_DIR),--run-dir "$(BENCH_RUN_DIR)",) \
+		$(if $(filter 1,$(BENCH_CLEAN)),--clean,)
+
+bench-compare-test: ## Unit-test the bench-compare harness (no Docker, no builds)
+	python3 -m unittest discover -s scripts/bench -p 'test_*.py'
+
 ## ── Archival Node ───────────────────────────────────────────
 
 archival-up: ## Start archival Go node
@@ -1164,6 +1185,10 @@ help:
 	@echo "  make p2p-interop-1v1-down       Tear down (append PURGE=1 to wipe netroot/)"
 	@echo "  make p2p-interop-1v1-soak-test  #1580 vote-acceptance gate (up + soak + check + down), ROUNDS=N"
 	@echo "  Runbook: ops/mixed-cluster-p2p-1v1/README.md"
+	@echo ""
+	@echo "Benchmarks (Go vs Rust comparison report — docs/BENCHMARK_COMPARISON.md):"
+	@echo "  make bench-compare TIERS=selftest RUNS=5   Run tiers -> bench-results/<utc-ts>/report.md"
+	@echo "  make bench-compare-test                    Unit-test the bench-compare harness"
 	@echo ""
 	@echo "Benchmarks (fair comparison):"
 	@echo "  make bench-micro      Run Rust criterion microbenchmarks (fixture-based)"

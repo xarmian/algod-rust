@@ -21,6 +21,7 @@ on:
       - ".github/workflows/harness-shell-tests.yml"
       - ".github/workflows/*node-soak.yml"
       - "scripts/test_node_soak_callers.py"
+      - "scripts/bench/**"
   push:
     branches: [main]
     paths:
@@ -31,6 +32,7 @@ on:
       - ".github/workflows/harness-shell-tests.yml"
       - ".github/workflows/*node-soak.yml"
       - "scripts/test_node_soak_callers.py"
+      - "scripts/bench/**"
 
 permissions:
   contents: read
@@ -60,3 +62,128 @@ jobs:
         run: python3 ops/mainnet-soak/monitor.py self-test
       - name: Reusable soak workflow <-> caller interface
         run: python3 scripts/test_node_soak_callers.py
+
+  bench-compare-harness:
+    # Issue #2102 (epic #2101): the Go vs Rust bench-compare harness
+    # (scripts/bench/). Unit tests for the schema, report maths and
+    # fingerprint parsers, then the built-in selftest tier end to end via the
+    # real `make bench-compare` entry point. No builds, no Docker.
+    name: bench-compare harness tests + selftest tier
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Harness unit tests
+        run: make bench-compare-test
+      - name: build_both.sh syntax
+        run: bash -n scripts/bench/build_both.sh
+      - name: make bench-compare TIERS=selftest
+        run: |
+          make bench-compare TIERS=selftest RUNS=6 BENCH_RUN_DIR=bench-results/ci-selftest
+          test -s bench-results/ci-selftest/report.json
+          test -s bench-results/ci-selftest/report.md
+          cat bench-results/ci-selftest/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: A reused run dir is refused, and --clean never merges two runs
+        run: |
+          set -euo pipefail
+          rc=0
+          python3 scripts/bench/run.py --tiers selftest --runs 3 --run-dir bench-results/ci-selftest || rc=$?
+          [ "$rc" -eq 2 ] || { echo "::error::reused non-empty run dir was not refused (exit $rc)"; exit 1; }
+          make bench-compare TIERS=selftest RUNS=3 BENCH_RUN_DIR=bench-results/ci-selftest BENCH_CLEAN=1
+          python3 - <<'PY'
+          import json
+          rep = json.load(open("bench-results/ci-selftest/report.json"))
+          row = [r for r in rep["rows"] if r["name"] == "sha256-1MiB"][0]
+          assert row["go"]["n"] == 3 and row["rust"]["n"] == 3, row
+          print("clean re-run has exactly one run's samples:", row["go"]["n"], row["rust"]["n"])
+          PY
+
+  bench-build-both:
+    # Issue #2102: really build go-algorand with build_both.sh on Linux (the
+    # pinned-tag commit check, `make libsodium`, go-algorand's own release
+    # flags), which no other job and no Windows dev box can do. It takes
+    # several minutes, so beyond the workflow-level path filter it is gated
+    # on a `git diff` that touches build_both.sh or the pin file itself.
+    # --skip-rust: the Rust release build is exercised by the workspace jobs.
+    name: build_both.sh builds pinned go-algorand (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Gate on build_both.sh / go-algorand.pin changes
+        id: gate
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BASE" ] || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            echo "base commit '$BASE' unavailable; running the build to be safe"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed="$(git diff --name-only "$BASE" HEAD -- scripts/bench/build_both.sh scripts/bench/go-algorand.pin)"
+          echo "changed: ${changed:-<none>}"
+          if [ -n "$changed" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; else echo "run=false" >> "$GITHUB_OUTPUT"; fi
+      - name: Resolve the pinned tag and its go.mod
+        if: steps.gate.outputs.run == 'true'
+        id: pin
+        run: |
+          set -euo pipefail
+          tag="$(grep -v '^[[:space:]]*#' scripts/bench/go-algorand.pin | grep -v '^[[:space:]]*$' | head -n1 | tr -d '[:space:]')"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/go-algorand-gomod"
+          # setup-go only parses a file literally named go.mod (else: plain version file).
+          curl -fsSL "https://raw.githubusercontent.com/algorand/go-algorand/${tag}/go.mod" \
+            -o "$RUNNER_TEMP/go-algorand-gomod/go.mod"
+          grep -E '^(go|toolchain) ' "$RUNNER_TEMP/go-algorand-gomod/go.mod"
+      - name: Install Go per go-algorand's go.mod
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: ${{ runner.temp }}/go-algorand-gomod/go.mod
+          cache: false
+      - name: Install libsodium build tools
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          # go-algorand's crypto package links a vendored libsodium fork via
+          # cgo; build_both.sh runs `make libsodium`, which needs these.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends autoconf automake libtool build-essential
+      - name: build_both.sh --clone --skip-rust
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          bash scripts/bench/build_both.sh --clone --skip-rust \
+            --go-algorand "$RUNNER_TEMP/go-algorand" \
+            --out "$RUNNER_TEMP/bench-build" --bin-dir "$RUNNER_TEMP/bench-bin"
+      - name: Assert build-info.json and run algod -v
+        if: steps.gate.outputs.run == 'true'
+        env:
+          TAG: ${{ steps.pin.outputs.tag }}
+        run: |
+          set -euo pipefail
+          info="$RUNNER_TEMP/bench-build/build-info.json"
+          cat "$info"
+          python3 - "$info" <<'PY'
+          import json, os, sys
+          b = json.load(open(sys.argv[1]))
+          g = b["go_algorand"]
+          assert g["built"] is True, g
+          assert g["pin_ok"] is True, g
+          assert g["tag"] == os.environ["TAG"], g
+          assert g["commit"] == g["tag_commit"], g
+          assert sorted(g["binaries"]) == ["go/algod", "go/goal"], g
+          assert b["algod_rust"] == {"built": False}, b
+          print("build-info OK:", g["tag"], g["commit"])
+          PY
+          "$RUNNER_TEMP/bench-bin/go/algod" -v | tee "$RUNNER_TEMP/algod-v.txt"
+          {
+            echo '### build_both.sh go-algorand build'
+            echo '```'
+            cat "$RUNNER_TEMP/algod-v.txt"
+            echo '```'
+            echo '```json'
+            cat "$info"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

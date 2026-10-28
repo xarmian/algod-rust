@@ -1,6 +1,13 @@
 # Benchmarks
 
-Performance measurement for algod-rust and comparison against go-algorand (v4.5.1-stable).
+Performance measurement for algod-rust and comparison against go-algorand (v5.0.4-stable, the repo-wide reference pin).
+
+> **Comparing Go and Rust?** Use `make bench-compare` and read
+> [`BENCHMARK_COMPARISON.md`](BENCHMARK_COMPARISON.md). It builds both
+> implementations at pinned commits, runs paired benchmark tiers on identical
+> inputs, and writes one report with an environment fingerprint, medians,
+> confidence intervals and Rust/Go ratios (Phase 23, epic #2101). This page
+> documents the individual benchmark suites that predate it.
 
 ## Overview
 

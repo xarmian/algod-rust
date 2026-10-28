@@ -1,0 +1,9 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+#
+# The go-algorand tag bench-compare builds and checks against (issue #2102).
+# Read by build_both.sh and fingerprint.py: the first non-comment line is the
+# tag. Keep it equal to the repo-wide reference pin (CLAUDE.md); the
+# algod-version-upgrade pin sweep updates it with every other occurrence.
+v5.0.4-stable
