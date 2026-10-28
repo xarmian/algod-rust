@@ -574,7 +574,10 @@ work against the pinned go-algorand:
    seeded PCG generator over a model of the ledger state. A round is a list
    of groups: all but the last go to `POST /v2/transactions/async` (pool
    only), and the generator waits until the pool holds each one before it
-   sends the next, which keeps the pool in plan order. The last group goes to
+   sends the next, which keeps the pool in plan order. Before each round it
+   also waits for the pool to drop the previous block's txns: the pool hears
+   about a committed block from the ledger's notifier goroutine, after the
+   synchronous submit has already returned. The last group goes to
    the synchronous `POST /v2/transactions`, which in DevMode assembles and
    commits the block. Each txn has `FirstValid` = its round, `LastValid` =
    round + 1000 and a unique 10-byte note `"bc" || u64 counter`.

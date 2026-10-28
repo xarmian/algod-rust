@@ -161,20 +161,48 @@ func (c *algodClient) submitAsync(group []transactions.SignedTxn, want int) erro
 	}
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		var p struct {
-			Total int `json:"total-transactions"`
-		}
-		if err := c.getJSON("/v2/transactions/pending?max=1", &p); err != nil {
+		total, err := c.poolSize()
+		if err != nil {
 			return err
 		}
-		if p.Total == want {
+		if total == want {
 			return nil
 		}
-		if p.Total > want {
-			return fmt.Errorf("pool holds %d txns, expected %d (unplanned transaction in the pool)", p.Total, want)
+		if total > want {
+			return fmt.Errorf("pool holds %d txns, expected %d (unplanned transaction in the pool)", total, want)
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("async group not in the pool after 30s (pool %d, want %d): rejected by verification? see node.log", p.Total, want)
+			return fmt.Errorf("async group not in the pool after 30s (pool %d, want %d): rejected by verification? see node.log", total, want)
+		}
+		time.Sleep(200 * time.Microsecond)
+	}
+}
+
+func (c *algodClient) poolSize() (int, error) {
+	var p struct {
+		Total int `json:"total-transactions"`
+	}
+	err := c.getJSON("/v2/transactions/pending?max=1", &p)
+	return p.Total, err
+}
+
+// waitPoolEmpty waits until the pool has dropped the previous block's
+// transactions. The pool learns about a committed block from the ledger's
+// block notifier, which runs on its own goroutine after the synchronous
+// submit has already returned; until it has run, /v2/transactions/pending
+// still lists the committed txns and submitAsync's count would be off.
+func (c *algodClient) waitPoolEmpty() error {
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		n, err := c.poolSize()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("pool still holds %d txns 30s after the last block", n)
 		}
 		time.Sleep(200 * time.Microsecond)
 	}

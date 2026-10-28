@@ -236,6 +236,9 @@ func cmdDrive(args []string) {
 	}
 	start := time.Now()
 	for r := uint64(1); r <= *rounds; r++ {
+		if err := cl.waitPoolEmpty(); err != nil {
+			die("round %d: %v", r, err)
+		}
 		w.round = r
 		groups := w.planRound(setup)
 		var planned []transactions.Txid
