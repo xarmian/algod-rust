@@ -35,10 +35,10 @@ const (
 	minFee  = 1000
 	txnLife = 1000 // LastValid = FirstValid + txnLife (MaxTxnLife)
 
-	appFunding   = 10_000_000_000      // 10k Algo into the main app account
-	appAssetFund = 1_000_000_000_000   // asset-A units held by the main app
-	assetATotal  = 10_000_000_000_000  // 1e13 units, held by the admin
-	optInGrant   = 1_000_000           // asset-A units granted after an opt-in
+	appFunding   = 10_000_000_000     // 10k Algo into the main app account
+	appAssetFund = 1_000_000_000_000  // asset-A units held by the main app
+	assetATotal  = 10_000_000_000_000 // 1e13 units, held by the admin
+	optInGrant   = 1_000_000          // asset-A units granted after an opt-in
 )
 
 // acct is the generator's model of one workload account. The model is
