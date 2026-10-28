@@ -55,37 +55,14 @@ fn deploy(l: &mut SqliteLedger, source: &str) {
     );
 }
 
-/// Issue #2116: go `StartEvaluator` rejects a block whose rewards pool holds
-/// less than `MinBalance` after the block-start withdrawal, so test ledgers
-/// fund their (zero-address unless set) pool as every real genesis does.
-pub fn fund_rewards_pool<L: algo_ledger::LedgerStore>(store: &mut L) {
-    let pool = store.rewards_pool();
-    if store.get_account(&pool).is_none() {
-        store.set_account(
-            &pool,
-            AccountData {
-                micro_algos: 100_000,
-                status: algo_types::AccountStatus::NotParticipating,
-                ..Default::default()
-            },
-        );
-    }
-}
-
-/// An in-memory ledger whose rewards pool holds `MinBalance`.
-pub fn funded_sqlite_ledger() -> SqliteLedger {
-    let mut l = SqliteLedger::open_in_memory().expect("in-memory ledger");
-    fund_rewards_pool(&mut l);
-    l
-}
-
-/// A `LedgerState` whose rewards pool holds `MinBalance`.
-#[allow(dead_code)]
-pub fn funded_ledger_state() -> algo_ledger::LedgerState {
-    let mut s = algo_ledger::LedgerState::new();
-    fund_rewards_pool(&mut s);
-    s
-}
+/// Issue #2116: test ledgers fund their rewards pool at `MinBalance`, which
+/// go's block-start withdrawal requires (the shared `algo-ledger` fixtures,
+/// `test-hooks`).
+#[allow(unused_imports)]
+pub use algo_ledger::apply::pool_fixtures::{
+    fund_test_rewards_pool as fund_rewards_pool, funded_ledger_state, funded_sqlite_ledger,
+    TEST_POOL_MIN_BALANCE,
+};
 
 /// In-memory ledger with a funded sender and a deployed box-writing app.
 pub fn ledger() -> SqliteLedger {

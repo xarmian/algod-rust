@@ -2532,8 +2532,10 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
     let prev_fee_sink = store.fee_sink();
     let prev_rewards_pool = store.rewards_pool();
     // go `StartEvaluator` takes `prevTotals` from `l.LatestTotals()` before
-    // the block changes anything; only its reward units are needed.
-    let prev_reward_units = if pool_withdrawn {
+    // the block changes anything; only its reward units are needed, and only
+    // when the level moves (the withdrawal is units * 0 otherwise, so a
+    // no-rewards network such as mainnet never reads the totals here).
+    let prev_reward_units = if pool_withdrawn || block.rewards_level == prev_rewards_level {
         0
     } else {
         let t = store.account_totals();
@@ -2555,33 +2557,27 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
 
     // go `StartEvaluator`: withdraw the rewards this block accrues from the
     // pool, before any transaction (issue #2116). The pool is go's
-    // `prevHeader.RewardsPool`; a store that never learned it (a bare test
-    // store) falls back to the block's own field.
-    let withdrawal_pool = if prev_rewards_pool.is_zero() {
-        block.rewards_pool
-    } else {
-        prev_rewards_pool
+    // `prevHeader.RewardsPool`, the one the ledger tracks.
+    let withdrawal = BlockRewardsWithdrawal {
+        round: block.round.0,
+        pool: prev_rewards_pool,
+        prev_rewards_level,
+        rewards_level: block.rewards_level,
+        prev_reward_units,
+        genesis_hash: *store.genesis_hash(),
+        min_balance: consensus.min_balance,
     };
-    // Snapshot only when the withdrawal writes: a block whose rewards level
-    // does not move (mainnet today) and that is not a testnet hotfix round
-    // leaves the pool unchanged.
-    let pool_writes = block.rewards_level != prev_rewards_level
-        || TESTNET_OVERSPENT_REWARDS_ROUNDS.contains(&block.round.0);
-    let pool_snapshot = (!pool_withdrawn && pool_writes)
-        .then(|| store.snapshot(&[withdrawal_pool, Address(TESTNET_BANK_ADDRESS)]));
+    // Snapshot exactly when the withdrawal can write (so a no-rewards block
+    // on mainnet takes none); the testnet bank only on its hotfix rounds.
+    let pool_snapshot = (!pool_withdrawn && withdrawal_writes(store, &withdrawal)).then(|| {
+        if withdrawal.is_testnet_hotfix_round() {
+            store.snapshot(&[withdrawal.pool, Address(TESTNET_BANK_ADDRESS)])
+        } else {
+            store.snapshot(&[withdrawal.pool])
+        }
+    });
     if !pool_withdrawn {
-        if let Err(e) = withdraw_block_rewards(
-            store,
-            &BlockRewardsWithdrawal {
-                round: block.round.0,
-                pool: withdrawal_pool,
-                prev_rewards_level,
-                rewards_level: block.rewards_level,
-                prev_reward_units,
-                genesis_hash: gh,
-                min_balance: consensus.min_balance,
-            },
-        ) {
+        if let Err(e) = withdraw_block_rewards(store, &withdrawal) {
             if let Some(s) = pool_snapshot {
                 store.restore_snapshot(s);
             }
@@ -2994,6 +2990,18 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         })();
         if eob_result.is_err() {
             store.restore_snapshot(eob_snapshot);
+            // Undo the block-start pool withdrawal and the rewards state as
+            // the payset-failure path does, so a retry does not withdraw
+            // twice (issue #2116).
+            if let Some(s) = pool_snapshot {
+                store.restore_snapshot(s);
+            }
+            store.set_rewards_level(prev_rewards_level);
+            store.set_rewards_rate(prev_rewards_rate);
+            store.set_rewards_residue(prev_rewards_residue);
+            store.set_rewards_recalculation_round(prev_rewards_recalc);
+            store.set_fee_sink(prev_fee_sink);
+            store.set_rewards_pool(prev_rewards_pool);
             return eob_result;
         }
     }
@@ -4471,8 +4479,10 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
     }
 
     // Snapshot all accounts that may be mutated (touched + fee_sink + rewards_pool)
-    // for rollback. The rewards pool is included because a transaction may pay
-    // to or from it, and a later min-balance check failure must restore it.
+    // for rollback. Claims never touch the pool any more (issue #2116), but an
+    // app's inner transaction may still pay it without the pool appearing in
+    // `touched` (a group-shared or foreign-app account), and address-scoped
+    // stores (`LedgerState`) only restore the accounts listed here.
     let mut snapshot_addrs = touched.clone();
     if !snapshot_addrs.contains(&ctx.fee_sink) {
         snapshot_addrs.push(ctx.fee_sink);
@@ -4638,9 +4648,35 @@ pub(crate) struct BlockRewardsWithdrawal {
     pub rewards_level: u64,
     /// go `prevTotals.RewardUnits()` (online + offline reward units).
     pub prev_reward_units: u64,
+    /// The ledger's genesis hash (go `eval.genesisHash`).
     pub genesis_hash: [u8; 32],
     /// The block protocol's `MinBalance`.
     pub min_balance: u64,
+}
+
+impl BlockRewardsWithdrawal {
+    /// go `workaroundOverspentRewards`'s guard: one of the two stall rounds,
+    /// on the ledger whose genesis is testnet's.
+    pub(crate) fn is_testnet_hotfix_round(&self) -> bool {
+        TESTNET_OVERSPENT_REWARDS_ROUNDS.contains(&self.round)
+            && self.genesis_hash == TESTNET_GENESIS_HASH
+    }
+}
+
+/// Whether [`withdraw_block_rewards`] can write any account for this block:
+/// the level moves (a withdrawal), a testnet hotfix round (the bank moves),
+/// or the pool's own pending rewards apply (go `Get(pool, true)` + `Put`: a
+/// participating pool whose rewards base is behind the level).
+pub(crate) fn withdrawal_writes<L: crate::store_trait::LedgerStore>(
+    store: &L,
+    w: &BlockRewardsWithdrawal,
+) -> bool {
+    w.rewards_level != w.prev_rewards_level
+        || w.is_testnet_hotfix_round()
+        || store.get_account(&w.pool).is_some_and(|p| {
+            p.status != algo_types::AccountStatus::NotParticipating
+                && p.rewards_base != w.rewards_level
+        })
 }
 
 /// go `BlockEvaluator.workaroundOverspentRewards` (`ledger/eval/eval.go`):
@@ -4651,9 +4687,7 @@ fn workaround_overspent_rewards<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     w: &BlockRewardsWithdrawal,
 ) -> Result<(), AlgoError> {
-    if !TESTNET_OVERSPENT_REWARDS_ROUNDS.contains(&w.round)
-        || w.genesis_hash != TESTNET_GENESIS_HASH
-    {
+    if !w.is_testnet_hotfix_round() {
         return Ok(());
     }
     let bank_addr = Address(TESTNET_BANK_ADDRESS);
@@ -4729,7 +4763,6 @@ pub(crate) fn withdraw_block_rewards<L: crate::store_trait::LedgerStore>(
 /// Rewards earned per role by one rewards pass.
 #[derive(Default, Clone, Copy)]
 pub(crate) struct RewardsPassOutcome {
-    pub total: u64,
     pub sender_rewards: u64,
     pub receiver_rewards: u64,
     pub close_rewards: u64,
@@ -4753,7 +4786,6 @@ pub(crate) fn apply_rewards_pass<L: crate::store_trait::LedgerStore>(
         let account_before = store.get_or_default_account(addr);
         let mut account = account_before.clone();
         let reward = apply_rewards(&mut account, rewards_level);
-        out.total += reward;
 
         // UnfundedSenders (go-algorand v34+, `config/consensus.go`):
         // don't force a zero-balance account into on-disk existence
@@ -7380,16 +7412,20 @@ pub struct BoxBudgetState {
     pub pooled_inners: Option<usize>,
 }
 
-/// Test fixtures for the block-start rewards-pool withdrawal (issue #2116).
-#[cfg(test)]
-pub(crate) mod pool_fixtures {
+/// Test fixtures for the block-start rewards-pool withdrawal (issue #2116):
+/// go `StartEvaluator` rejects every block whose rewards pool would hold less
+/// than `MinBalance`, so test ledgers fund their pool as every real genesis
+/// does. Shared by this crate's unit and integration tests and the
+/// `algod-rust` bin's tests (`test-hooks`).
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod pool_fixtures {
     /// Issue #2116: go `StartEvaluator` rejects every block whose rewards
     /// pool would hold less than `MinBalance`, so a fixture whose pool
     /// (`state.rewards_pool`, the zero address unless a test sets it) is not
     /// one of its accounts gets a not-participating pool holding exactly the
     /// minimum, like every real genesis funds it. A fixture that lists the
     /// pool keeps its own balance.
-    pub(crate) fn fund_test_rewards_pool<L: crate::store_trait::LedgerStore>(store: &mut L) {
+    pub fn fund_test_rewards_pool<L: crate::store_trait::LedgerStore>(store: &mut L) {
         let pool = store.rewards_pool();
         if store.get_account(&pool).is_none() {
             store.set_account(
@@ -7405,7 +7441,7 @@ pub(crate) mod pool_fixtures {
 
     /// [`fund_test_rewards_pool`] for the pool `block` names (a fixture
     /// whose store never learned its pool withdraws from the block's).
-    pub(crate) fn fund_test_block_rewards_pool<L: crate::store_trait::LedgerStore>(
+    pub fn fund_test_block_rewards_pool<L: crate::store_trait::LedgerStore>(
         store: &mut L,
         block: &algo_types::Block,
     ) {
@@ -7416,19 +7452,18 @@ pub(crate) mod pool_fixtures {
     }
 
     /// The `MinBalance` of every protocol the tests run.
-    pub(crate) const TEST_POOL_MIN_BALANCE: u64 = 100_000;
+    pub const TEST_POOL_MIN_BALANCE: u64 = 100_000;
 
     /// An in-memory `SqliteLedger` whose (zero-address) rewards pool holds
     /// `MinBalance`, as every real genesis funds it.
-    pub(crate) fn funded_sqlite_ledger() -> crate::sqlite::SqliteLedger {
+    pub fn funded_sqlite_ledger() -> crate::sqlite::SqliteLedger {
         let mut l = crate::sqlite::SqliteLedger::open_in_memory().expect("in-memory ledger");
         fund_test_rewards_pool(&mut l);
         l
     }
 
     /// A `LedgerState` whose (zero-address) rewards pool holds `MinBalance`.
-    #[allow(dead_code)]
-    pub(crate) fn funded_ledger_state() -> crate::state::LedgerState {
+    pub fn funded_ledger_state() -> crate::state::LedgerState {
         let mut s = crate::state::LedgerState::new();
         fund_test_rewards_pool(&mut s);
         s
@@ -8246,6 +8281,7 @@ mod tests {
             );
             let mut b = issue_2116_block(round, 0, &state);
             b.genesis_hash = genesis;
+            state.genesis_hash = genesis;
             apply_block(&mut state, &b).unwrap();
             let shift = if moved { 20_000_000_000 } else { 0 };
             assert_eq!(
@@ -8259,6 +8295,101 @@ mod tests {
                 "round {round}"
             );
         }
+    }
+
+    /// Issue #2116 review: a block that fails in the end-of-block epilogue
+    /// (here go's `validateForPayouts`: a V41 block without a proposer) after
+    /// the block-start withdrawal must leave the pool and the rewards state
+    /// as they were, so a retry does not withdraw twice.
+    #[test]
+    fn issue_2116_end_of_block_failure_restores_the_pool_withdrawal() {
+        let (mut state, _, _, pool) = issue_2116_state(100_000_000_000);
+        let b = issue_2116_block(1, 3, &state);
+        for _ in 0..2 {
+            let err = apply_block_checking_payouts(&mut state, &b, ApplyMode::Replay).unwrap_err();
+            assert!(
+                err.to_string().contains("proposer missing"),
+                "unexpected: {err}"
+            );
+            assert_eq!(
+                state.get_account(&pool).unwrap().micro_algos,
+                100_000_000_000
+            );
+            assert_eq!(state.rewards_level, 0);
+        }
+    }
+
+    /// Issue #2116 review: the withdrawal also writes the pool when only its
+    /// own pending rewards are applied (go `Get(pool, true)` + `Put`), e.g. an
+    /// offline pool whose rewards base is behind while the level does not
+    /// move. A payset failure must restore that write too.
+    #[test]
+    fn issue_2116_payset_failure_restores_a_pool_updated_only_by_its_own_rewards() {
+        let (mut state, offline, online, pool) = issue_2116_state(100_000_000_000);
+        state.rewards_level = 5;
+        state.accounts.get_mut(&pool).unwrap().status = AccountStatus::Offline;
+        let before = state.get_account(&pool).unwrap().clone();
+        let mut b = issue_2116_block(1, 5, &state);
+        // Overspends: the payset fails after the block-start pool update.
+        b.payset = vec![pay_txn(offline, online, 1_000_000_000, 1_000)];
+        assert!(apply_block(&mut state, &b).is_err());
+        assert_eq!(state.get_account(&pool).unwrap(), &before);
+    }
+
+    /// Issue #2116 review: go's `workaroundOverspentRewards` checks the
+    /// ledger's genesis hash (`eval.genesisHash`), not the block header's.
+    #[test]
+    fn issue_2116_testnet_workaround_uses_the_ledger_genesis_hash() {
+        let bank = Address(TESTNET_BANK_ADDRESS);
+        let (mut state, _, _, pool) = issue_2116_state(1_000_000);
+        state.genesis_hash = TESTNET_GENESIS_HASH;
+        state.current_round = Round(1_499_994);
+        state.accounts.insert(
+            bank,
+            algo_types::AccountData {
+                micro_algos: 30_000_000_000,
+                status: AccountStatus::NotParticipating,
+                ..algo_types::AccountData::default()
+            },
+        );
+        // A header without its genesis hash does not skip the hotfix.
+        let b = issue_2116_block(1_499_995, 0, &state);
+        assert_eq!(b.genesis_hash, [0u8; 32]);
+        apply_block(&mut state, &b).unwrap();
+        assert_eq!(
+            state.get_account(&pool).unwrap().micro_algos,
+            1_000_000 + 20_000_000_000
+        );
+    }
+
+    /// Issue #2116 review: at a testnet hotfix round the per-round state
+    /// delta carries the bank, whose balance the hotfix changes (go's delta
+    /// holds every account the cow touched).
+    #[test]
+    fn issue_2116_testnet_workaround_bank_is_in_the_state_delta() {
+        let bank = Address(TESTNET_BANK_ADDRESS);
+        let (mut state, _, _, pool) = issue_2116_state(1_000_000);
+        state.genesis_hash = TESTNET_GENESIS_HASH;
+        state.current_round = Round(2_926_563);
+        state.accounts.insert(
+            bank,
+            algo_types::AccountData {
+                micro_algos: 30_000_000_000,
+                status: AccountStatus::NotParticipating,
+                ..algo_types::AccountData::default()
+            },
+        );
+        let mut b = issue_2116_block(2_926_564, 0, &state);
+        b.genesis_hash = TESTNET_GENESIS_HASH;
+        let delta = apply_block_with_delta(&mut state, &b).unwrap();
+        let rec = delta
+            .accts
+            .accts
+            .iter()
+            .find(|r| r.addr == bank)
+            .expect("bank in the state delta");
+        assert_eq!(rec.addr, bank);
+        assert!(delta.accts.accts.iter().any(|r| r.addr == pool));
     }
 
     /// Issue #2116: claiming pending rewards inside a transaction (go

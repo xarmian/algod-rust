@@ -7334,7 +7334,7 @@ mod tests {
         l.set_account(
             &Address([2u8; 32]),
             AccountData {
-                micro_algos: 100_000,
+                micro_algos: crate::commands::test_support::TEST_POOL_MIN_BALANCE,
                 status: algo_types::AccountStatus::NotParticipating,
                 ..AccountData::default()
             },
