@@ -689,6 +689,10 @@ impl<B: OverlayBase + ?Sized> LedgerStore for OverlayStore<'_, B> {
         self.st.leases.record(sender, lease, last_valid);
     }
 
+    fn pending_block_lease(&self, sender: &Address, lease: &[u8; 32], round: u64) -> bool {
+        self.st.leases.check(sender, lease, round).is_err()
+    }
+
     fn purge_expired_leases(&mut self, current_round: u64) {
         // Expiry of the committed table is the base business; the overlay
         // table only ever holds leases of the current pending block.

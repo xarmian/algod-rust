@@ -86,9 +86,12 @@ pub fn evaluate_group<B: OverlayBase + ?Sized>(
     evaluate_group_with_txids(base, overlay, template, group, None)
 }
 
-/// [`evaluate_group`] with the group's txids (as the txtail records them)
-/// already computed by the caller, so `checkDup` does not hash the group
-/// again. `None` hashes them here.
+/// [`evaluate_group`] for pool admission, with the group's txids (as the
+/// txtail records them) already computed by the pool, so `checkDup` does not
+/// hash the group again (`None` hashes them here). With `Some`, the pool has
+/// also checked them against the ledger (`contains_confirmed_txid` on the
+/// same cache; a pending transaction is dropped once a block commits it), so
+/// `checkDup` skips its ledger txid lookup and the extra ledger lock.
 pub fn evaluate_group_with_txids<B: OverlayBase + ?Sized>(
     base: &B,
     overlay: &mut PendingOverlay,
@@ -114,6 +117,7 @@ pub fn evaluate_group_with_txids<B: OverlayBase + ?Sized>(
             // with Generate + Validate), so `Alive` and `checkDup` run
             // against the live ledger, not the pool's snapshot (issue #2127).
             check_dup: true,
+            ledger_txids_checked: txids.is_some(),
             txids,
             ..ProbeRequest::default()
         },

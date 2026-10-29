@@ -126,9 +126,8 @@ impl LeaseTable {
 
     /// Record the leases of one txtail row (go `txTail.loadFromDisk`'s
     /// `recent[rnd].txleases`) that are still in force at `active_at`
-    /// (their `last_valid >= active_at`). Rows are applied in ascending
-    /// round order, so a later lease for a pair replaces an earlier one, as
-    /// [`Self::record`] does during apply. Shared by the catchpoint
+    /// (their `last_valid >= active_at`). Like [`Self::record`], a pair keeps
+    /// the later expiry, whatever the order the rows are applied in. Shared by the catchpoint
     /// reconstruction, `SqliteLedger`'s rebuild on open and simulate's
     /// past-round lease window (issue #2125).
     pub fn record_txtail_round(&mut self, tail: &algo_types::TxTailRound, active_at: u64) {

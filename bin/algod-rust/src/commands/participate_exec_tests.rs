@@ -2419,12 +2419,30 @@ fn dev_mode_evicts_a_rejected_group_and_the_chain_advances() {
     assert_eq!(candidate.payset.len(), 2);
     let rejected_sender = candidate.payset[0].txn.sender;
 
+    let rejected_txid = algo_codec::block_txids_with_rule(
+        &candidate,
+        &algo_types::genesis_restore::GenesisRestoreRule::for_block(&candidate),
+    )[0];
+    let reason = algo_ledger::check_dup::lease_in_ledger_error(
+        rejected_txid,
+        &rejected_sender,
+        &[0x5D; 32],
+        false,
+    );
+    let lease_tag = algo_pool::error::PoolErrorTag::Lease;
+    let reevals_before = pool.reeval_counter().count(lease_tag);
     assert_eq!(
-        crate::dev_producer::evict_failed_group(&pool, &candidate, 0),
+        crate::dev_producer::evict_failed_group(&pool, &candidate, 0, &reason),
         1,
         "the failing transaction's group is dropped"
     );
     assert_eq!(pool.pending_count(), 1);
+    // `pending/{txid}` reports the rejection, and the re-evaluation counter
+    // counts it under the `lease` tag, as for any re-evaluation eviction.
+    let (_, status, found) = pool.lookup(&rejected_txid);
+    assert!(found);
+    assert_eq!(status, reason.to_string());
+    assert_eq!(pool.reeval_counter().count(lease_tag), reevals_before + 1);
 
     let (block, _) =
         crate::dev_producer::produce_dev_block(&pool, &ledger, None).expect("dev block");

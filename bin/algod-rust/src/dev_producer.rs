@@ -283,16 +283,14 @@ pub fn produce_dev_block(
             Err((e, failed_txn)) => {
                 let _ = l.rollback_block();
                 drop(l);
+                let message = format!("commit dev-mode block {}: {e}", block.round.0);
                 // go's `AssembleDevModeBlock` drops a group its evaluator
                 // rejects: drop the failing transaction's group from the pool
                 // so the next dev block does not stall on it.
                 if let Some(index) = failed_txn {
-                    evict_failed_group(pool, &block, index);
+                    evict_failed_group(pool, &block, index, &e);
                 }
-                return Err(anyhow::anyhow!(
-                    "commit dev-mode block {}: {e}",
-                    block.round.0
-                ));
+                return Err(anyhow::anyhow!(message));
             }
         }
     };
@@ -305,25 +303,36 @@ pub fn produce_dev_block(
 
 /// Evict from `pool` the group of `block.payset[index]` (payset form: the
 /// group's members share its group id; an ungrouped transaction is its own
-/// group). Returns how many pool groups were dropped.
-pub fn evict_failed_group(pool: &TransactionPool, block: &Block, index: usize) -> usize {
+/// group), with the commit's rejection `error`. Returns how many pool groups
+/// were dropped.
+pub fn evict_failed_group(
+    pool: &TransactionPool,
+    block: &Block,
+    index: usize,
+    error: &algo_error::AlgoError,
+) -> usize {
     let Some(failed) = block.payset.get(index) else {
         return 0;
     };
     let group = failed.txn.group;
-    let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(block);
-    let txid = |stx: &SignedTransaction| compute_txn_id(&rule.restored_txn(stx));
+    // The payset's txids as the txtail records them: hashed over the
+    // borrowed stripped transactions, nothing cloned.
+    let all = algo_codec::block_txids_with_rule(
+        block,
+        &algo_types::genesis_restore::GenesisRestoreRule::for_block(block),
+    );
     let txids: HashSet<Digest> = if group == [0u8; 32] {
-        std::iter::once(txid(failed)).collect()
+        std::iter::once(all[index]).collect()
     } else {
         block
             .payset
             .iter()
-            .filter(|stx| stx.txn.group == group)
-            .map(txid)
+            .zip(&all)
+            .filter(|(stx, _)| stx.txn.group == group)
+            .map(|(_, id)| *id)
             .collect()
     };
-    pool.evict_groups(&txids)
+    pool.evict_groups(&txids, error)
 }
 
 #[cfg(test)]

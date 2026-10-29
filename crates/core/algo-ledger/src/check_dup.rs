@@ -111,6 +111,9 @@ impl BlockDups {
 pub struct LedgerDups {
     round: u64,
     txids: Vec<Digest>,
+    /// The caller already checked the txids against the ledger (the pool's
+    /// `contains_confirmed_txid`): the txtail lookup is skipped.
+    txids_checked: bool,
     confirmed: Option<HashSet<Digest>>,
     past_leases: Option<crate::lease::LeaseTable>,
 }
@@ -122,6 +125,7 @@ impl LedgerDups {
         Self {
             round,
             txids,
+            txids_checked: false,
             confirmed: None,
             past_leases: None,
         }
@@ -139,6 +143,9 @@ impl LedgerDups {
         consensus: &ConsensusParams,
         txid: &Digest,
     ) -> bool {
+        if self.txids_checked {
+            return false;
+        }
         self.confirmed
             .get_or_insert_with(|| {
                 store.txtail_confirmed_txids(&self.txids, consensus.max_txn_life)
@@ -237,6 +244,11 @@ pub fn check_dup<L: LedgerStore + ?Sized>(
     {
         return Err(lease_in_ledger_error(txid, &txn.sender, &txn.lease, true));
     }
+    // go's block cow: a lease an earlier group of the same pending block
+    // holds (the pool's overlay) is an in-block conflict.
+    if leased && store.pending_block_lease(&txn.sender, &txn.lease, ledger.round) {
+        return Err(lease_in_ledger_error(txid, &txn.sender, &txn.lease, true));
+    }
     // go `txTail.checkDup`: `lastValid < t.lowWaterMark`. The low-water mark
     // is the last round flushed to the block store; algod-rust commits each
     // block synchronously, so it is the latest round. Only a past simulate
@@ -272,22 +284,49 @@ pub struct BlockCheckDup {
     /// The block header's genesis id and hash, for `Alive`.
     genesis_id: String,
     genesis_hash: [u8; 32],
+    /// Per payset transaction, which stripped genesis fields go's
+    /// `DecodeSignedTxn` restores from the header (the block's
+    /// `GenesisRestoreRule`, resolved once by the caller).
+    restores: Vec<(bool, bool)>,
     violation: Option<String>,
 }
 
 impl BlockCheckDup {
     /// The checks for a block of round `round` with header genesis
     /// `genesis_id` / `genesis_hash`, whose payset has the ids `txids` (as
-    /// the txtail records them).
+    /// the txtail records them) and the genesis-restore decisions
+    /// `restores` (`GenesisRestoreRule::restores`), one per transaction.
     #[must_use]
-    pub fn new(round: u64, txids: Vec<Digest>, genesis_id: String, genesis_hash: [u8; 32]) -> Self {
+    pub fn new(
+        round: u64,
+        txids: Vec<Digest>,
+        genesis_id: String,
+        genesis_hash: [u8; 32],
+        restores: Vec<(bool, bool)>,
+    ) -> Self {
         Self {
             block: BlockDups::new(),
             ledger: LedgerDups::new(round, txids),
             genesis_id,
             genesis_hash,
+            restores,
             violation: None,
         }
+    }
+
+    /// Skip the ledger txid lookup: the caller already rejected txids the
+    /// ledger holds (pool admission, whose `contains_confirmed_txid` ran on
+    /// the same cache under its own lock).
+    #[must_use]
+    pub fn with_ledger_txids_checked(mut self) -> Self {
+        self.ledger.txids_checked = true;
+        self
+    }
+
+    /// Record a rejection that follows `checkDup` in go's prologue (the
+    /// authorizer), so the proposal check renders it as a verdict too.
+    pub fn record_violation(&mut self, message: &str) {
+        self.violation.get_or_insert_with(|| message.to_owned());
     }
 
     /// The payset's txids, as the txtail records them.
@@ -313,12 +352,17 @@ impl BlockCheckDup {
                 message: format!("checkDup: no txid for payset index {index}"),
             });
         };
-        let rule = algo_types::genesis_restore::GenesisRestoreRule::with_params(
-            &self.genesis_id,
-            &self.genesis_hash,
-            consensus,
-        );
-        let (txn_genesis_id, txn_genesis_hash) = rule.restored_genesis(stx);
+        let (restore_id, restore_hash) = self.restores.get(index).copied().unwrap_or_default();
+        let txn_genesis_id = if restore_id {
+            self.genesis_id.as_str()
+        } else {
+            stx.txn.genesis_id.as_str()
+        };
+        let txn_genesis_hash = if restore_hash {
+            &self.genesis_hash
+        } else {
+            &stx.txn.genesis_hash
+        };
         if let Err(message) = algo_validate::block_alive_with_genesis(
             self.ledger.round,
             &self.genesis_id,

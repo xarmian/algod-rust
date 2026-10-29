@@ -156,6 +156,39 @@ struct PendingState {
     txids: HashMap<Digest, SignedTransaction>,
 }
 
+/// The [`PoolError`] for an evaluator's rejection `e` of a group.
+/// `reevaluating`: found while re-evaluating after a new block (go's
+/// `TxPoolErrTagLeaseEval` for an untyped lease conflict).
+fn pool_error_from_evaluator(e: &AlgoError, reevaluating: bool) -> PoolError {
+    // Capture structured pc/group-index/app-index/eval-states diagnostics
+    // -- see `AlgoError::avm_eval_detail` (issue #1135), which walks `e`'s
+    // source chain for an `AlgoError::AvmLogicSig`.
+    if e.is_batch_sig_failure() {
+        return PoolError::SignatureBatchFailed;
+    }
+    let detail = e.avm_eval_detail();
+    let message = e.to_string();
+    // The evaluator reports a refused transaction as the typed `Rejected`
+    // (go's `transaction <txid>: ...` text, issue #1776; go's typed
+    // `checkDup` errors, issue #2127): map the type, never the text.
+    if let AlgoError::Rejected { class, .. } = e {
+        PoolError::TxnRejected {
+            message,
+            class: *class,
+            detail,
+        }
+    } else if message.contains("duplicate lease") || message.contains("overlapping lease") {
+        PoolError::LeaseConflict {
+            message,
+            in_block_evaluator: reevaluating,
+        }
+    } else if let Some(detail) = detail {
+        PoolError::EvaluatorWithDetail(message, detail)
+    } else {
+        PoolError::Evaluator(message)
+    }
+}
+
 // ── Assembly state (behind `assembly_mu`) ────────────────────────
 
 /// State related to the block-assembly handshake between
@@ -769,38 +802,9 @@ impl TransactionPool {
 
         // Feed to the evaluator.
         if let Some(ref mut evaluator) = inner.evaluator {
-            evaluator.transaction_group(txgroup).map_err(|e| {
-                // Capture structured pc/group-index/app-index/eval-states
-                // diagnostics before `e` is consumed by `to_string()` below
-                // -- see `AlgoError::avm_eval_detail` (issue #1135), which
-                // walks `e`'s source chain for an `AlgoError::AvmLogicSig`.
-                if e.is_batch_sig_failure() {
-                    return PoolError::SignatureBatchFailed;
-                }
-                let detail = e.avm_eval_detail();
-                let message = e.to_string();
-                // The evaluator reports a refused transaction as the typed
-                // `Rejected` (go's `transaction <txid>: ...` text, issue
-                // #1776): map the type, never the text.
-                if let algo_error::AlgoError::Rejected { class, .. } = &e {
-                    PoolError::TxnRejected {
-                        message,
-                        class: *class,
-                        detail,
-                    }
-                } else if message.contains("duplicate lease")
-                    || message.contains("overlapping lease")
-                {
-                    PoolError::LeaseConflict {
-                        message,
-                        in_block_evaluator: reevaluating,
-                    }
-                } else if let Some(detail) = detail {
-                    PoolError::EvaluatorWithDetail(message, detail)
-                } else {
-                    PoolError::Evaluator(message)
-                }
-            })?;
+            evaluator
+                .transaction_group(txgroup)
+                .map_err(|e| pool_error_from_evaluator(&e, reevaluating))?;
             Ok(())
         } else {
             Err(PoolError::NoPendingBlockEvaluator)
@@ -1428,31 +1432,41 @@ impl TransactionPool {
         }
     }
 
-    /// Drop every pending or remembered group that contains one of
-    /// `txids`, returning how many groups were dropped. The dev-mode producer
-    /// evicts a group whose commit the ledger rejected, as go's
-    /// `AssembleDevModeBlock` drops a group its evaluator rejects, so the
-    /// dev chain keeps advancing (issue #2127).
-    pub fn evict_groups(&self, txids: &HashSet<Digest>) -> usize {
+    /// Drop the pending or remembered group made of `txids` (every member's
+    /// id: a group is evicted whole), with `error` as the reason, returning
+    /// how many groups were dropped. The dev-mode producer evicts a group
+    /// whose commit the ledger rejected, as go's `AssembleDevModeBlock` drops
+    /// a group its evaluator rejects, so the dev chain keeps advancing
+    /// (issue #2127). Like the re-evaluation eviction, it counts the
+    /// rejection per tag and records it in the status cache, so
+    /// `pending/{txid}` reports the pool-error text.
+    pub fn evict_groups(&self, txids: &HashSet<Digest>, error: &AlgoError) -> usize {
         let mut inner = self.mu.lock();
         let mut pending = self.pending_mu.write();
-        let hit =
-            |g: &Vec<SignedTransaction>| g.iter().any(|t| txids.contains(&compute_txn_id(&t.txn)));
-        let (dropped, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut pending.tx_groups)
-            .into_iter()
-            .partition(hit);
-        pending.tx_groups = kept;
-        for t in dropped.iter().flatten() {
-            pending.txids.remove(&compute_txn_id(&t.txn));
+        // The txid-keyed maps give the members without hashing anything.
+        let mut members: Vec<SignedTransaction> = Vec::new();
+        for id in txids {
+            members.extend(pending.txids.remove(id));
+            members.extend(inner.remembered_txids.remove(id));
         }
-        let (rdropped, rkept): (Vec<_>, Vec<_>) = std::mem::take(&mut inner.remembered_tx_groups)
-            .into_iter()
-            .partition(hit);
-        inner.remembered_tx_groups = rkept;
-        for t in rdropped.iter().flatten() {
-            inner.remembered_txids.remove(&compute_txn_id(&t.txn));
+        if members.is_empty() {
+            return 0;
         }
-        dropped.len() + rdropped.len()
+        let hit = |g: &Vec<SignedTransaction>| g.iter().any(|t| members.contains(t));
+        let before = pending.tx_groups.len() + inner.remembered_tx_groups.len();
+        pending.tx_groups.retain(|g| !hit(g));
+        inner.remembered_tx_groups.retain(|g| !hit(g));
+        let dropped = before - pending.tx_groups.len() - inner.remembered_tx_groups.len();
+        drop(pending);
+
+        let reason = pool_error_from_evaluator(error, true);
+        self.reeval_counter
+            .record(crate::error::classify_pool_error(&reason));
+        let text = reason.to_string();
+        for id in txids {
+            inner.status_cache.put(*id, text.clone());
+        }
+        dropped
     }
 
     /// Assemble a block in dev mode: recompute the evaluator and immediately

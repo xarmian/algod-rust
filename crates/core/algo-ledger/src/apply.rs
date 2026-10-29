@@ -817,17 +817,19 @@ pub fn apply_block_capturing_apply_data_with_delta_or_failed_txn<
 /// their zero values — computing those is tracked separately in #586, not
 /// something this function (or issue #581's dev-mode caching fix) is
 /// responsible for.
+///
+/// It applies a block the node generated (the dev-mode producer): go's dev
+/// block comes out of a Generate + Validate evaluator
+/// (`AssembleDevModeBlock`), so go's `Alive`, `checkDup` and authorizer run
+/// (issue #2127). See [`apply_block_capturing_apply_data_with_delta_or_failed_txn`]
+/// for the failing transaction's index.
 pub fn apply_block_capturing_apply_data_with_delta<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     block: &Block,
     mode: ApplyMode,
 ) -> Result<(Vec<ApplyData>, crate::state_delta::StateDelta), AlgoError> {
-    // Only the dev-mode producer commits through this: go's dev block comes
-    // out of a Generate + Validate evaluator (`AssembleDevModeBlock`), so
-    // `Alive` and `checkDup` run (issue #2127).
-    let (delta, apply_data) =
-        apply_block_with_delta_mode_and_apply_data(store, block, mode, true, false, true, None)?;
-    Ok((apply_data, delta))
+    apply_block_capturing_apply_data_with_delta_or_failed_txn(store, block, mode)
+        .map_err(|(error, _)| error)
 }
 
 fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore>(
@@ -1611,23 +1613,27 @@ pub(crate) fn collect_txn_addresses(
 }
 
 /// go `BlockEvaluator.transaction`'s prologue for top-level payset
-/// transaction `index`: under `Validate` (or a probe's check), go's
-/// `BlockHeader.Alive` and `checkDup` ([`crate::check_dup::BlockCheckDup`]),
-/// then, when validating, the authorizer. The one place both apply loops run
-/// it, so the order and the `Alive` implementation cannot drift.
+/// transaction `index`, run wherever go's evaluator validates (a validating
+/// apply, the proposal check, block generation: [`ApplyContext::checkdup`]
+/// is set): `BlockHeader.Alive` and `checkDup`
+/// ([`crate::check_dup::BlockCheckDup`]), then the authorizer. The one place
+/// both apply loops run it, so the order and the checks cannot drift; every
+/// rejection is the proposal check's verdict.
 fn txn_prologue<S: crate::store_trait::LedgerStore>(
     store: &S,
     ctx: &ApplyContext,
     stx: &SignedTransaction,
     index: usize,
 ) -> Result<(), AlgoError> {
-    if let Some(checkdup) = &ctx.checkdup {
-        checkdup
-            .borrow_mut()
-            .check(store, &ctx.consensus, stx, index)?;
-    }
-    if ctx.validate {
-        check_authorizer(store, stx)?;
+    let Some(checkdup) = &ctx.checkdup else {
+        return Ok(());
+    };
+    let mut checkdup = checkdup.borrow_mut();
+    checkdup.check(store, &ctx.consensus, stx, index)?;
+    let txid = checkdup.txids().get(index).copied();
+    if let Err(e) = check_authorizer_for(store, stx, txid) {
+        checkdup.record_violation(&e.to_string());
+        return Err(e);
     }
     Ok(())
 }
@@ -1659,6 +1665,17 @@ pub(crate) fn check_authorizer<L: crate::store_trait::LedgerStore>(
     store: &L,
     stx: &SignedTransaction,
 ) -> Result<(), AlgoError> {
+    check_authorizer_for(store, stx, None)
+}
+
+/// [`check_authorizer`] naming the transaction by `txid` when known (a
+/// block's stripped payset transaction hashes to the restored txid only
+/// with its genesis fields restored).
+fn check_authorizer_for<L: crate::store_trait::LedgerStore>(
+    store: &L,
+    stx: &SignedTransaction,
+    txid: Option<algo_types::Digest>,
+) -> Result<(), AlgoError> {
     let sender = stx.txn.sender;
     let correct_authorizer = store
         .get_account(&sender)
@@ -1666,12 +1683,16 @@ pub(crate) fn check_authorizer<L: crate::store_trait::LedgerStore>(
         .unwrap_or(sender);
     let actual_authorizer = stx.auth_addr.unwrap_or(sender);
     if actual_authorizer != correct_authorizer {
-        let txid = algo_codec::compute_txn_id(&stx.txn);
-        return Err(AlgoError::Ledger {
+        let txid = txid.unwrap_or_else(|| algo_codec::compute_txn_id(&stx.txn));
+        // go returns this text bare (`fmt.Errorf`), and simulate and the
+        // proposal check report it as is.
+        return Err(AlgoError::Rejected {
+            source: None,
             message: format!(
                 "transaction {}: should have been authorized by {} but was actually authorized by {}",
                 txid, correct_authorizer, actual_authorizer
             ),
+            class: algo_error::RejectClass::Other,
         });
     }
     Ok(())
@@ -2006,6 +2027,9 @@ pub struct ProbeRequest {
     /// The payset's txids (as the txtail records them), when the caller
     /// already hashed them; otherwise the apply hashes them for `checkDup`.
     pub txids: Option<Vec<algo_types::Digest>>,
+    /// The caller already rejected txids the ledger holds (pool admission):
+    /// `checkDup` skips its ledger txid lookup.
+    pub ledger_txids_checked: bool,
     /// Evaluate as a block *generator* (pool admission, block assembly):
     /// go `EvaluatorOptions.Generate` / `roundCowState.generate`, carried
     /// into [`ApplyContext::generate`]. Policies that must never affect
@@ -2624,6 +2648,51 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
     } else {
         block
     };
+    // go runs `Alive`, `checkDup` and the authorizer only in an evaluator
+    // with `Validate` set: proposal validation (`Ledger.Validate`) and block
+    // generation (`StartEvaluator` with Generate + Validate), never
+    // `Ledger.AddBlock` (catchup, certified blocks). Built before any state
+    // is touched, so a bad txid count fails the apply cleanly. The txids are
+    // the ones the txtail records, hashed once here (or handed over by the
+    // pool) and reused for the block's txtail row below (issue #2127).
+    let run_check_dup = validate || probe.as_ref().is_some_and(|p| p.request.check_dup);
+    let checkdup = if run_check_dup {
+        let txids_checked = probe
+            .as_ref()
+            .is_some_and(|p| p.request.ledger_txids_checked);
+        let txids = match probe.as_mut().and_then(|p| p.request.txids.take()) {
+            Some(txids) if txids.len() == stored_block.payset.len() => txids,
+            Some(txids) => {
+                return Err(AlgoError::Ledger {
+                    message: format!(
+                        "checkDup: {} txids for a payset of {}",
+                        txids.len(),
+                        stored_block.payset.len()
+                    ),
+                })
+            }
+            None => algo_codec::block_txids_with_rule(stored_block, &genesis_rule),
+        };
+        let restores = stored_block
+            .payset
+            .iter()
+            .map(|stx| genesis_rule.restores(stx))
+            .collect();
+        let check = crate::check_dup::BlockCheckDup::new(
+            block.round.0,
+            txids,
+            stored_block.genesis_id.clone(),
+            stored_block.genesis_hash,
+            restores,
+        );
+        Some(RefCell::new(if txids_checked {
+            check.with_ledger_txids_checked()
+        } else {
+            check
+        }))
+    } else {
+        None
+    };
     // Issue #570: only allocate the shared box-delta recorder when a caller
     // actually wants `kv_mods` back (Execute mode, via
     // `apply_block_with_delta_mode`) — this keeps the hot Replay-mode sync
@@ -2708,38 +2777,6 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
     // Initialize txn_counter from the store's current value (= previous block's
     // TxnCounter). This is the base for creatable ID generation.
     let base_txn_counter = store.txn_counter();
-
-    // go runs `checkDup` only in an evaluator with `Validate` set: proposal
-    // validation (`Ledger.Validate`) and block generation (`StartEvaluator`
-    // with Generate + Validate), never `Ledger.AddBlock` (catchup, certified
-    // blocks). The txids are the ones the txtail records, hashed once here
-    // and reused for the block's txtail row below (issue #2127).
-    let run_check_dup = validate || probe.as_ref().is_some_and(|p| p.request.check_dup);
-    let checkdup = if run_check_dup {
-        // A caller that already hashed the payset (the pool) hands its txids
-        // over instead of having them hashed again.
-        let txids = match probe.as_mut().and_then(|p| p.request.txids.take()) {
-            Some(txids) if txids.len() == stored_block.payset.len() => txids,
-            Some(txids) => {
-                return Err(AlgoError::Ledger {
-                    message: format!(
-                        "checkDup: {} txids for a payset of {}",
-                        txids.len(),
-                        stored_block.payset.len()
-                    ),
-                })
-            }
-            None => algo_codec::block_txids_with_rule(stored_block, &genesis_rule),
-        };
-        Some(RefCell::new(crate::check_dup::BlockCheckDup::new(
-            block.round.0,
-            txids,
-            stored_block.genesis_id.clone(),
-            stored_block.genesis_hash,
-        )))
-    } else {
-        None
-    };
 
     let ctx = ApplyContext {
         rewards_level: block.rewards_level,

@@ -1559,6 +1559,13 @@ fn go_rejection(txid: &str, error: algo_error::AlgoError) -> algo_error::AlgoErr
     {
         return error;
     }
+    // A rejection already framed as go frames it (`transaction <txid>: ...`,
+    // e.g. the authorizer check) is not framed twice.
+    if let algo_error::AlgoError::Rejected { message, .. } = &error {
+        if message.starts_with(&format!("transaction {txid}: ")) {
+            return error;
+        }
+    }
     let (reason, class) = pool_reason(&error);
     algo_error::AlgoError::Rejected {
         message: format!("transaction {txid}: {reason}"),
@@ -1942,7 +1949,15 @@ impl SimpleBlockEvaluator {
         //   c. The ledger snapshot (existing leases from prior blocks)
         // Mirrors Go's cow.checkDup() which checks mods.Txleases then
         // delegates to roundCowBase.checkDup -> ledger.CheckDup.
-        {
+        //
+        // When the real apply will evaluate this group (`exec_group`), its
+        // `checkDup` runs these same checks with go's typed errors, against
+        // the live ledger (issue #2127): skip this copy then.
+        let exec_checks_leases = self
+            .exec
+            .as_ref()
+            .is_some_and(|e| !e.incomplete && e.spent < EXEC_ADMISSION_BUDGET);
+        if !exec_checks_leases {
             let mut group_leases: HashSet<(Address, [u8; 32])> = HashSet::new();
             for stx in &restored {
                 if stx.txn.lease != [0u8; 32] {

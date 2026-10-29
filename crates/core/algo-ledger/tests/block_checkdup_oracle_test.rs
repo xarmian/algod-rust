@@ -376,3 +376,88 @@ fn validating_apply_and_generation_share_go_alive_text() {
         other => panic!("evaluate_group: {other:?}"),
     }
 }
+
+/// go's validating evaluator runs the authorizer check after `checkDup` on
+/// every path it validates, so the proposal check and block generation
+/// reject a payment signed by the sender's old key after a rekey: "should
+/// have been authorized by <new key>" (issue #2127).
+#[test]
+fn proposal_check_and_generation_run_the_authorizer_like_go() {
+    use algo_ledger::locked_base::LockedBase;
+    use algo_ledger::pending_overlay::PendingOverlay;
+    use algo_ledger::proposal_eval::{evaluate_group, GroupEvalError};
+    use algo_types::Round;
+
+    let o = load_oracle();
+    // A fresh payment from the funded sender (not a replay of block 1).
+    let mut candidate = block(&scenario(&o, "committed_txid").block);
+    candidate.payset[0].txn.note = serde_bytes::ByteBuf::from(b"after-rekey".to_vec());
+    let sender = candidate.payset[0].txn.sender;
+    let new_key = Address([0x4B; 32]);
+    let txid = algo_codec::block_txids_with_rule(
+        &candidate,
+        &algo_types::genesis_restore::GenesisRestoreRule::for_block(&candidate),
+    )[0];
+    let expected = format!(
+        "transaction {txid}: should have been authorized by {new_key} but was actually authorized by {sender}"
+    );
+
+    // The sender is rekeyed to `new_key` in the committed ledger.
+    let mut l = sqlite(&o);
+    let mut acct = l.get_account(&sender).expect("sender");
+    acct.auth_addr = Some(new_key);
+    l.set_account(&sender, acct);
+    let ledger = Arc::new(Mutex::new(l));
+
+    let validator = PayoutCheckingValidator::new(StubBlockValidator::accepting(), ledger.clone());
+    match validator.validate(&candidate).map(|_| ()) {
+        Err(AgreementError::ValidationFailed(message)) => assert_eq!(message, expected),
+        other => panic!("proposal check: expected go's authorizer verdict, got {other:?}"),
+    }
+
+    let base = LockedBase::new(&ledger, Round(1));
+    let mut template = candidate.clone();
+    template.payset.clear();
+    let mut overlay = PendingOverlay::new(&base);
+    match evaluate_group(&base, &mut overlay, &template, &candidate.payset) {
+        Err(GroupEvalError::Txn { index: 0, error }) => assert_eq!(error.to_string(), expected),
+        other => panic!("generation: {other:?}"),
+    }
+}
+
+/// A lease an earlier group of the same pending block holds is an in-block
+/// conflict (go's block cow: `InBlockEvaluator`, pool tag `lease_eval`),
+/// not a committed one (issue #2127).
+#[test]
+fn pending_block_lease_is_an_in_block_conflict() {
+    use algo_ledger::locked_base::LockedBase;
+    use algo_ledger::pending_overlay::PendingOverlay;
+    use algo_ledger::proposal_eval::{evaluate_group, GroupEvalError};
+    use algo_types::Round;
+
+    let o = load_oracle();
+    let sc = scenario(&o, "in_block_lease_conflict");
+    let candidate = block(&sc.block);
+    let shared = Arc::new(Mutex::new(sqlite(&o)));
+    let base = LockedBase::new(&shared, Round(1));
+    let mut template = candidate.clone();
+    template.payset.clear();
+    let mut overlay = PendingOverlay::new(&base);
+    evaluate_group(&base, &mut overlay, &template, &candidate.payset[..1]).expect("first group");
+    match evaluate_group(&base, &mut overlay, &template, &candidate.payset[1..]) {
+        Err(GroupEvalError::Txn { index: 0, error }) => {
+            assert_eq!(error.to_string(), sc.validate_error);
+            assert!(
+                matches!(
+                    error,
+                    algo_error::AlgoError::Rejected {
+                        class: algo_error::RejectClass::LeaseInLedger { in_block: true },
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+        }
+        other => panic!("second group: {other:?}"),
+    }
+}

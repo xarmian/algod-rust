@@ -403,6 +403,14 @@ impl<'a> GenesisRestoreRule<'a> {
         }
     }
 
+    /// Which of `stx`'s stripped genesis fields go's `DecodeSignedTxn`
+    /// restores from the header: `(genesis id, genesis hash)`.
+    #[inline]
+    #[must_use]
+    pub fn restores(&self, stx: &SignedTransaction) -> (bool, bool) {
+        self.decide(stx)
+    }
+
     /// The genesis id / hash `stx`'s transaction has once restored,
     /// borrowed (from `stx` or from the rule): hashing the stripped txn
     /// with these as overrides yields the TxID of the restored txn with no
