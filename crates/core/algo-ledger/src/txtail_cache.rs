@@ -62,31 +62,42 @@ use algo_types::Digest;
 /// `last_valid` would already have expired.
 pub const LOOKBACK_ROUNDS: u64 = 1000;
 
+/// How many absent rows [`TxTailDupCache`] fetches again per new round, at
+/// most (issue #2125): a row that never lands costs a bounded number of
+/// reads per block, not one per round of the window.
+pub const MAX_RETRIES_PER_ROUND: usize = 8;
+
 /// In-memory mirror of the ledger's recent txtail, for duplicate checks.
 ///
 /// Not internally synchronized — wrap in a mutex if shared. Callers must
 /// invoke [`sync`](Self::sync) under the same lock that serializes ledger
 /// commits (e.g. while holding the `SqliteLedger` mutex) so the cache
 /// can never observe a round without its txtail row.
+///
+/// Callers may ask for different windows (the pool and simulate, a protocol
+/// upgrade): the cache keeps the largest window it was asked for and
+/// answers a smaller one by filtering on the round a txid was committed in,
+/// so it only rebuilds when the window grows.
 #[derive(Debug, Default)]
 pub struct TxTailDupCache {
     /// Highest round whose txtail has been loaded (0 = nothing loaded).
     loaded_hi: u64,
-    /// The window size the cache was built for (0 = nothing loaded).
+    /// The largest window size the cache was asked for (0 = nothing loaded).
     lookback: u64,
     /// Per-round confirmed txids, ascending by round, covering the window
     /// `[lo, loaded_hi]`. A round whose row was absent is `missing` and is
-    /// fetched again on a later [`sync`](Self::sync) (issue #2125): a row
-    /// can land after its round (catchpoint lookback download). An
-    /// undecodable row is loaded as empty and not refetched.
+    /// fetched again on a later sync (a row can land after its round, e.g.
+    /// a catchpoint's lookback download), unless it lies below the
+    /// ledger's earliest txtail row. An undecodable row is loaded as empty
+    /// and not refetched.
     rounds: VecDeque<CachedRound>,
     /// The `current_round` of the last retry of `missing` rounds.
     retried_at: u64,
-    /// Membership index over `rounds`. Value is a reference count — txids
-    /// cannot legitimately repeat across rounds (that is exactly what the
-    /// dup check prevents), but counting keeps eviction correct even if a
-    /// duplicate ever slipped in upstream.
-    txids: HashMap<Digest, u32>,
+    /// Membership index over `rounds`: a reference count (txids cannot
+    /// legitimately repeat across rounds, but counting keeps eviction
+    /// correct even if a duplicate ever slipped in upstream) and the newest
+    /// round holding the txid (for answering a smaller window).
+    txids: HashMap<Digest, TxidEntry>,
 }
 
 #[derive(Debug)]
@@ -96,15 +107,30 @@ struct CachedRound {
     missing: bool,
 }
 
-/// The txids of a serialized `TxTailRound`, `None` when it does not decode.
-fn decode_ids(bytes: &[u8]) -> Option<Vec<Digest>> {
-    let tail = rmp_serde::from_slice::<algo_types::TxTailRound>(bytes).ok()?;
-    Some(
-        tail.txn_ids
-            .iter()
-            .filter_map(|id| <[u8; 32]>::try_from(id.as_ref()).ok().map(Digest))
-            .collect(),
-    )
+#[derive(Debug, Clone, Copy)]
+struct TxidEntry {
+    count: u32,
+    newest: u64,
+}
+
+/// The txids of a decoded `TxTailRound`.
+fn ids_of(tail: &algo_types::TxTailRound) -> Vec<Digest> {
+    tail.txn_ids
+        .iter()
+        .filter_map(|id| <[u8; 32]>::try_from(id.as_ref()).ok().map(Digest))
+        .collect()
+}
+
+/// Count `ids` (committed in `round`) into the membership index.
+fn index_ids(index: &mut HashMap<Digest, TxidEntry>, ids: &[Digest], round: u64) {
+    for id in ids {
+        let entry = index.entry(*id).or_insert(TxidEntry {
+            count: 0,
+            newest: round,
+        });
+        entry.count += 1;
+        entry.newest = entry.newest.max(round);
+    }
 }
 
 impl TxTailDupCache {
@@ -123,6 +149,15 @@ impl TxTailDupCache {
         self.sync_window(current_round, LOOKBACK_ROUNDS, fetch);
     }
 
+    /// [`sync_window_with`](Self::sync_window_with) with no earliest-row
+    /// bound and no row hook.
+    pub fn sync_window<F>(&mut self, current_round: u64, lookback: u64, fetch: F)
+    where
+        F: FnMut(u64) -> Option<Vec<u8>>,
+    {
+        self.sync_window_with(current_round, lookback, || None, fetch, |_, _| {});
+    }
+
     /// Bring the cache up to date with the committed ledger state, over
     /// the window `[current_round - lookback, current_round]` (floored at
     /// round 1). `lookback` is the active protocol's `MaxTxnLife`.
@@ -130,19 +165,32 @@ impl TxTailDupCache {
     /// `current_round` is the ledger's latest committed round;
     /// `fetch(round)` returns the serialized `TxTailRound` blob for a
     /// round (i.e. `LedgerStore::get_txtail`), or `None` when absent.
+    /// `earliest_row()` (asked only when absent rows are due a retry)
+    /// returns the ledger's earliest txtail round: absent rounds below it
+    /// can never land and leave the retry set for good. `on_row` sees every
+    /// row decoded, so a caller can derive more from the same pass (the
+    /// lease table on open).
     ///
     /// Fetches only rounds not yet loaded, plus, once per new
-    /// `current_round`, the rounds whose row was absent. Evicts rounds
-    /// older than the window. If the ledger moved *backwards* (e.g. a
-    /// catchup reset the database) or the window size changed, the cache
-    /// rebuilds from scratch.
-    pub fn sync_window<F>(&mut self, current_round: u64, lookback: u64, mut fetch: F)
-    where
+    /// `current_round`, up to [`MAX_RETRIES_PER_ROUND`] rounds whose row
+    /// was absent. Evicts rounds older than the window. If the ledger moved
+    /// *backwards* (e.g. a catchup reset the database) or the window grew,
+    /// the cache rebuilds from scratch.
+    pub fn sync_window_with<E, F, R>(
+        &mut self,
+        current_round: u64,
+        lookback: u64,
+        earliest_row: E,
+        mut fetch: F,
+        mut on_row: R,
+    ) where
+        E: FnOnce() -> Option<u64>,
         F: FnMut(u64) -> Option<Vec<u8>>,
+        R: FnMut(u64, &algo_types::TxTailRound),
     {
-        if current_round < self.loaded_hi || lookback != self.lookback {
+        if current_round < self.loaded_hi || lookback > self.lookback {
             // Ledger regressed (fresh/replaced database) or the window
-            // changed — rebuild.
+            // grew — rebuild.
             *self = Self {
                 lookback,
                 ..Self::default()
@@ -151,14 +199,15 @@ impl TxTailDupCache {
 
         // Same window the SQLite scan used: lo..=current, inclusive,
         // floored at round 1 (round 0 is genesis, no transactions).
-        let lo = current_round.saturating_sub(lookback).max(1);
+        let lo = current_round.saturating_sub(self.lookback).max(1);
 
-        // Evict rounds that fell out of the window.
+        // Evict rounds that fell out of the window (oldest first, so an
+        // entry's `newest` round stays valid while its count is > 0).
         while self.rounds.front().is_some_and(|r| r.round < lo) {
             let old = self.rounds.pop_front().expect("front checked above");
             for id in old.ids {
                 match self.txids.get_mut(&id) {
-                    Some(count) if *count > 1 => *count -= 1,
+                    Some(entry) if entry.count > 1 => entry.count -= 1,
                     _ => {
                         self.txids.remove(&id);
                     }
@@ -166,31 +215,48 @@ impl TxTailDupCache {
             }
         }
 
-        // Retry rounds whose row was absent, once per new round.
+        let mut decode = |round: u64, bytes: &[u8]| -> Vec<Digest> {
+            // Undecodable blob: the scan skipped it — so do we.
+            let Ok(tail) = rmp_serde::from_slice::<algo_types::TxTailRound>(bytes) else {
+                return Vec::new();
+            };
+            on_row(round, &tail);
+            ids_of(&tail)
+        };
+
+        // Retry rounds whose row was absent, once per new round, bounded.
         if current_round > self.retried_at {
-            for cached in self.rounds.iter_mut().filter(|r| r.missing) {
-                if let Some(bytes) = fetch(cached.round) {
-                    cached.ids = decode_ids(&bytes).unwrap_or_default();
-                    cached.missing = false;
-                    for id in &cached.ids {
-                        *self.txids.entry(*id).or_insert(0) += 1;
+            self.retried_at = current_round;
+            if self.rounds.iter().any(|r| r.missing) {
+                let earliest = earliest_row();
+                let mut retries = 0;
+                for cached in self.rounds.iter_mut().filter(|r| r.missing) {
+                    if earliest.is_some_and(|e| cached.round < e) {
+                        // Below the earliest row: it can never land.
+                        cached.missing = false;
+                        continue;
+                    }
+                    if retries == MAX_RETRIES_PER_ROUND {
+                        break;
+                    }
+                    retries += 1;
+                    if let Some(bytes) = fetch(cached.round) {
+                        cached.ids = decode(cached.round, &bytes);
+                        cached.missing = false;
+                        index_ids(&mut self.txids, &cached.ids, cached.round);
                     }
                 }
             }
-            self.retried_at = current_round;
         }
 
         // Load newly committed (or never-loaded) rounds.
         let start = (self.loaded_hi + 1).max(lo);
         for round in start..=current_round {
             let (ids, missing) = match fetch(round) {
-                // Undecodable blob: the scan skipped it — so do we.
-                Some(bytes) => (decode_ids(&bytes).unwrap_or_default(), false),
+                Some(bytes) => (decode(round, &bytes), false),
                 None => (Vec::new(), true),
             };
-            for id in &ids {
-                *self.txids.entry(*id).or_insert(0) += 1;
-            }
+            index_ids(&mut self.txids, &ids, round);
             self.rounds.push_back(CachedRound {
                 round,
                 ids,
@@ -200,12 +266,30 @@ impl TxTailDupCache {
         self.loaded_hi = self.loaded_hi.max(current_round);
     }
 
-    /// Whether `txid` was confirmed within the lookback window.
+    /// Whether `txid` was confirmed within the largest window synced.
     ///
     /// Call [`sync`](Self::sync) first; this is a pure in-memory lookup.
     #[must_use]
     pub fn contains(&self, txid: &Digest) -> bool {
         self.txids.contains_key(txid)
+    }
+
+    /// Whether `txid` was confirmed within the last `lookback` rounds of
+    /// the synced round. Allocates nothing.
+    #[must_use]
+    pub fn contains_within(&self, txid: &Digest, lookback: u64) -> bool {
+        let lo = self.loaded_hi.saturating_sub(lookback).max(1);
+        self.txids.get(txid).is_some_and(|e| e.newest >= lo)
+    }
+
+    /// The members of `txids` confirmed within the last `lookback` rounds.
+    #[must_use]
+    pub fn confirmed(&self, txids: &[Digest], lookback: u64) -> std::collections::HashSet<Digest> {
+        txids
+            .iter()
+            .filter(|t| self.contains_within(t, lookback))
+            .copied()
+            .collect()
     }
 
     /// Number of distinct txids currently tracked (for tests/diagnostics).
@@ -436,11 +520,6 @@ mod tests {
     /// (issue #2125).
     #[test]
     fn window_follows_max_txn_life_above_1000() {
-        fn rd(r: u64) -> Digest {
-            let mut d = [0u8; 32];
-            d[..8].copy_from_slice(&r.to_be_bytes());
-            Digest(d)
-        }
         let rows = |r: u64| Some(tail_bytes(r, &[rd(r)]));
         let life = 1500;
         let mut cache = TxTailDupCache::new();
@@ -455,6 +534,93 @@ mod tests {
         cache.sync_window(1400, 1000, rows);
         assert!(!cache.contains(&rd(399)));
         assert!(cache.contains(&rd(400)));
+    }
+
+    fn rd(r: u64) -> Digest {
+        let mut d = [0u8; 32];
+        d[..8].copy_from_slice(&r.to_be_bytes());
+        Digest(d)
+    }
+
+    /// Issue #2125: the pool and simulate may ask for different windows.
+    /// A smaller window is answered by filtering, without a rebuild; only
+    /// a larger one rebuilds.
+    #[test]
+    fn smaller_window_filters_without_rebuilding() {
+        let rows = |r: u64| Some(tail_bytes(r, &[rd(r)]));
+        let mut cache = TxTailDupCache::new();
+        cache.sync_window(1600, 1500, rows);
+        assert!(cache.contains_within(&rd(200), 1500));
+        assert!(
+            !cache.contains_within(&rd(200), 1000),
+            "outside 1000 rounds"
+        );
+        assert!(cache.contains_within(&rd(600), 1000));
+        // A smaller window at the next round fetches only the new round.
+        let mut fetched = Vec::new();
+        cache.sync_window(1601, 1000, |r| {
+            fetched.push(r);
+            Some(tail_bytes(r, &[rd(r)]))
+        });
+        assert_eq!(fetched, vec![1601], "no rebuild for a smaller window");
+        assert!(
+            cache.contains_within(&rd(200), 1500),
+            "the larger window is kept"
+        );
+        assert_eq!(
+            cache.confirmed(&[rd(200), rd(601), rd(7_000)], 1000),
+            [rd(601)].into_iter().collect()
+        );
+        // A larger window rebuilds.
+        let mut fetched = 0;
+        cache.sync_window(1601, 1600, |r| {
+            fetched += 1;
+            Some(tail_bytes(r, &[rd(r)]))
+        });
+        assert_eq!(fetched, 1601, "a larger window rebuilds: rounds 1..=1601");
+        assert!(cache.contains_within(&rd(1), 1600));
+    }
+
+    /// Issue #2125: retries of absent rows are bounded per round, and rows
+    /// below the ledger's earliest txtail round (e.g. before a catchpoint)
+    /// are never fetched again.
+    #[test]
+    fn absent_row_retries_are_bounded_and_skip_rows_below_the_earliest() {
+        let mut cache = TxTailDupCache::new();
+        // Rounds 1..=100 have no row; 101..=110 do.
+        let present = |r: u64| (r > 100).then(|| tail_bytes(r, &[rd(r)]));
+        cache.sync_window(110, 1000, present);
+        // Next round: the ledger's earliest row is 41, so 1..=40 leave the
+        // retry set for good, and at most MAX_RETRIES_PER_ROUND are tried.
+        let mut fetched = Vec::new();
+        cache.sync_window_with(
+            111,
+            1000,
+            || Some(41),
+            |r| {
+                fetched.push(r);
+                (r > 100).then(|| tail_bytes(r, &[rd(r)]))
+            },
+            |_, _| {},
+        );
+        let retried: Vec<u64> = fetched.iter().copied().filter(|&r| r <= 100).collect();
+        assert_eq!(
+            retried,
+            (41..41 + MAX_RETRIES_PER_ROUND as u64).collect::<Vec<_>>()
+        );
+        // Later rounds never ask for rounds below 41 again.
+        for round in 112..130 {
+            cache.sync_window_with(
+                round,
+                1000,
+                || Some(41),
+                |r| {
+                    assert!(r >= 41, "round {r} is below the earliest row");
+                    (r > 100).then(|| tail_bytes(r, &[rd(r)]))
+                },
+                |_, _| {},
+            );
+        }
     }
 
     #[test]

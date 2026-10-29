@@ -311,7 +311,10 @@ func checkDupOracle() {
 		// round): go's txTail cannot answer and fails the check.
 		{"past_round_last_valid_below_latest", pastRound, single(payIn("past-short", [32]byte{}, pastSim, pastSim))},
 		// Leased in round 2 = simulated round - MaxTxnLife, until round
-		// 2 + MaxTxnLife: inside the past-round window, in force.
+		// 2 + MaxTxnLife. The scan window [round - MaxTxnLife, round]
+		// would include it, but go's txTail.recent has already pruned
+		// round 2 (it keeps only latest - MaxTxnLife = 3 onward), so the
+		// lease is not seen and the payment succeeds.
 		{"past_window_lease_at_edge", pastRound, single(payIn("past-edge-new", edgeLease, pastSim, pastLast))},
 		// Leased in round 1, one round below the window: it expired at
 		// 1 + MaxTxnLife, so it is not in force.

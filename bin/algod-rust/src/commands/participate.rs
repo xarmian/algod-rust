@@ -3654,6 +3654,10 @@ pub(crate) struct PoolLedgerAdapter {
     /// round's header is immutable, so caching the last one read is
     /// trivially coherent.
     hdr_cache: Mutex<Option<(u64, BlockHeader)>>,
+    /// `MaxTxnLife` of the last protocol seen by `contains_confirmed_txid`,
+    /// so the per-submission duplicate check never clones a
+    /// `ConsensusParams` (issue #2125).
+    max_txn_life_cache: Mutex<Option<(String, u64)>>,
     /// Issue #1017: cache of recently-verified transaction groups, shared
     /// across every `BlockEvaluator` this adapter creates via
     /// `start_evaluator` -- one node-wide cache, exactly like go's single
@@ -3762,6 +3766,7 @@ impl PoolLedgerAdapter {
         Self {
             ledger,
             hdr_cache: Mutex::new(None),
+            max_txn_life_cache: Mutex::new(None),
             verified_txn_cache: Arc::new(algo_validate::VerifiedTransactionCache::new(cache_size)),
         }
     }
@@ -3836,7 +3841,7 @@ impl algo_pool::traits::PoolLedger for PoolLedgerAdapter {
         // expired).
         //
         // Like go's `txTail` tracker, the window lives in memory: the
-        // ledger's own `TxTailDupCache` (`txtail_confirmed_txids`), shared
+        // ledger's own `TxTailDupCache` (`txtail_contains_txid`), shared
         // with simulate (issue #2125), loaded from the txtail rows once and
         // advanced incrementally as blocks commit. Re-reading and decoding
         // every txtail blob per submission (~1.9 ms/call at 100 rounds × 420
@@ -3845,13 +3850,26 @@ impl algo_pool::traits::PoolLedger for PoolLedgerAdapter {
         let Ok(ledger) = self.ledger.lock() else {
             return false;
         };
-        let max_txn_life = algo_types::consensus::consensus_params_for_version(ledger.protocol())
-            .map_or(algo_ledger::txtail_cache::LOOKBACK_ROUNDS, |p| {
-                p.max_txn_life
-            });
-        ledger
-            .txtail_confirmed_txids(&[txid], max_txn_life)
-            .contains(&txid)
+        let max_txn_life = {
+            let mut cached = self
+                .max_txn_life_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match cached.as_ref() {
+                Some((protocol, life)) if protocol == ledger.protocol() => *life,
+                _ => {
+                    let life =
+                        algo_types::consensus::consensus_params_for_version(ledger.protocol())
+                            .map_or(algo_ledger::txtail_cache::LOOKBACK_ROUNDS, |p| {
+                                p.max_txn_life
+                            });
+                    *cached = Some((ledger.protocol().to_string(), life));
+                    life
+                }
+            }
+        };
+        // Allocation-free on `SqliteLedger` (`TxTailDupCache::contains_within`).
+        ledger.txtail_contains_txid(&txid, max_txn_life)
     }
 
     fn start_evaluator(

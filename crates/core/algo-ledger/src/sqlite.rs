@@ -3217,18 +3217,69 @@ impl SqliteLedger {
         let latest = self.current_round.0;
         let max_txn_life = algo_types::consensus::consensus_params_for_version(&self.protocol)
             .map_or(crate::txtail_cache::LOOKBACK_ROUNDS, |p| p.max_txn_life);
+        // One pass over the rows fills both the lease table and the txid
+        // cache, so the first duplicate check does not decode them again.
         let mut table = LeaseTable::new();
-        for round in latest.saturating_sub(max_txn_life).max(1)..=latest {
-            match self.get_txtail(round) {
-                Ok(Some(bytes)) => match rmp_serde::from_slice::<algo_types::TxTailRound>(&bytes) {
-                    Ok(tail) => table.record_txtail_round(&tail, latest),
-                    Err(e) => tracing::warn!(round, "lease rebuild: undecodable txtail row: {e}"),
-                },
-                Ok(None) => {}
-                Err(e) => tracing::warn!(round, "lease rebuild: txtail read failed: {e}"),
-            }
-        }
+        let mut cache = crate::txtail_cache::TxTailDupCache::new();
+        cache.sync_window_with(
+            latest,
+            max_txn_life,
+            || None,
+            |round| match self.get_txtail(round) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(round, "lease rebuild: txtail read failed: {e}");
+                    None
+                }
+            },
+            |_, tail| table.record_txtail_round(tail, latest),
+        );
         self.lease_table = table;
+        *self
+            .txtail_dups
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = cache;
+    }
+
+    /// Run `f` on the txid cache brought up to date with the committed
+    /// rows. Mid-block, `current_round` may run ahead of the rows written
+    /// so far: a throwaway cache answers then, leaving the shared one alone.
+    fn with_synced_txtail_cache<T>(
+        &self,
+        max_txn_life: u64,
+        f: impl FnOnce(&crate::txtail_cache::TxTailDupCache) -> T,
+    ) -> T {
+        let fetch = |r| self.get_txtail(r).ok().flatten();
+        if self.in_block {
+            let mut cache = crate::txtail_cache::TxTailDupCache::new();
+            cache.sync_window(self.current_round.0, max_txn_life, fetch);
+            return f(&cache);
+        }
+        // Absent rows below the earliest txtail row (e.g. before a
+        // catchpoint) can never land: the cache stops retrying them.
+        let earliest = || {
+            self.conn
+                .query_row("SELECT MIN(rnd) FROM txtail", [], |row| {
+                    row.get::<_, Option<i64>>(0)
+                })
+                .ok()
+                .flatten()
+                .and_then(|r| u64::try_from(r).ok())
+        };
+        // The cache only holds data re-derivable from the rows: a panic in
+        // another holder cannot leave it wrong, so poisoning is ignored.
+        let mut cache = self
+            .txtail_dups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.sync_window_with(
+            self.current_round.0,
+            max_txn_life,
+            earliest,
+            fetch,
+            |_, _| {},
+        );
+        f(&cache)
     }
 
     /// Return a reference to the in-memory lease table.
@@ -8449,29 +8500,13 @@ impl LedgerStore for SqliteLedger {
         txids: &[algo_types::Digest],
         max_txn_life: u64,
     ) -> std::collections::HashSet<algo_types::Digest> {
-        let fetch = |r| self.get_txtail(r).ok().flatten();
-        let found = |cache: &crate::txtail_cache::TxTailDupCache| {
-            txids
-                .iter()
-                .filter(|t| cache.contains(t))
-                .copied()
-                .collect()
-        };
-        // Mid-block, `current_round` may run ahead of the rows written so
-        // far: answer from the rows directly, without touching the cache.
-        if self.in_block {
-            let mut cache = crate::txtail_cache::TxTailDupCache::new();
-            cache.sync_window(self.current_round.0, max_txn_life, fetch);
-            return found(&cache);
-        }
-        // The cache only holds data re-derivable from the rows: a panic in
-        // another holder cannot leave it wrong, so poisoning is ignored.
-        let mut cache = self
-            .txtail_dups
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.sync_window(self.current_round.0, max_txn_life, fetch);
-        found(&cache)
+        self.with_synced_txtail_cache(max_txn_life, |cache| cache.confirmed(txids, max_txn_life))
+    }
+
+    fn txtail_contains_txid(&self, txid: &algo_types::Digest, max_txn_life: u64) -> bool {
+        self.with_synced_txtail_cache(max_txn_life, |cache| {
+            cache.contains_within(txid, max_txn_life)
+        })
     }
 
     // ---- Pruning ----

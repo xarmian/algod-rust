@@ -598,11 +598,15 @@ pub trait LedgerStore {
         cache.sync_window(self.current_round().0, max_txn_life, |r| {
             self.get_txtail(r).ok().flatten()
         });
-        txids
-            .iter()
-            .filter(|t| cache.contains(t))
-            .copied()
-            .collect()
+        cache.confirmed(txids, max_txn_life)
+    }
+
+    /// [`Self::txtail_confirmed_txids`] for one txid. `SqliteLedger`
+    /// answers it from its cache without allocating (the pool's per
+    /// submission check).
+    fn txtail_contains_txid(&self, txid: &algo_types::Digest, max_txn_life: u64) -> bool {
+        self.txtail_confirmed_txids(std::slice::from_ref(txid), max_txn_life)
+            .contains(txid)
     }
 
     // ---- Pruning ----
