@@ -37,7 +37,7 @@ use crate::apply::{
     apply_block_impl_probe, ApplyData, ApplyMode, ExecProbe, ListsRequest, ProbeRequest,
 };
 use crate::pending_overlay::{OverlayBase, OverlayStore, PendingOverlay};
-use crate::shadow_execute::{payout_check_from, PayoutCheck, ScratchFailure, ScratchPayset};
+use crate::shadow_execute::{PayoutCheck, ScratchFailure, ScratchPayset};
 
 /// Successful evaluation of one group.
 #[derive(Debug)]
@@ -210,9 +210,11 @@ pub fn evaluate_payset<B: OverlayBase + ?Sized>(
 pub fn evaluate_validate_payouts<B: OverlayBase + ?Sized>(base: &B, block: &Block) -> PayoutCheck {
     #[cfg(any(test, feature = "test-hooks"))]
     if crate::shadow_execute::test_hooks::should_fail(block.payset.len()) {
-        return payout_check_from::<()>(Err(ScratchFailure::Other(AlgoError::Ledger {
-            message: "injected transient scratch failure".into(),
-        })));
+        return crate::shadow_execute::payout_check_from::<()>(Err(ScratchFailure::Other(
+            AlgoError::Ledger {
+                message: "injected transient scratch failure".into(),
+            },
+        )));
     }
     let mut probe = crate::shadow_execute::proposal_check_probe();
     let result = evaluate_block_on_overlay(base, block, &mut probe);
