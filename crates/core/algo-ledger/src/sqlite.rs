@@ -2278,6 +2278,13 @@ pub struct SqliteLedger {
     read_pool: Option<std::sync::Arc<crate::read_pool::LedgerReadPool>>,
     /// In-memory lease table (leases are short-lived, no persistence needed).
     lease_table: LeaseTable,
+    /// In-memory mirror of the recent txtail txids for
+    /// [`LedgerStore::txtail_contains_txid`] (simulate's go `checkDup`,
+    /// issue #2125): loaded once, then advanced one row per committed round,
+    /// so a lookup never rescans the txtail table. Derived from committed
+    /// rows only and rebuilt when the ledger round goes backwards, so it
+    /// needs no block snapshot.
+    txtail_dups: std::sync::Mutex<crate::txtail_cache::TxTailDupCache>,
     /// Snapshot of `lease_table` taken at `begin_block`, restored by
     /// `rollback_block`. The SQLite/trie rollback does not cover the in-memory
     /// lease table, so without this a partially-applied-then-rolled-back block
@@ -3146,6 +3153,7 @@ impl SqliteLedger {
             db_prefix,
             read_pool: None,
             lease_table: LeaseTable::new(),
+            txtail_dups: std::sync::Mutex::new(crate::txtail_cache::TxTailDupCache::new()),
             lease_snapshot: None,
             chain_snapshot: None,
             pending_abort: false,
@@ -8402,6 +8410,25 @@ impl LedgerStore for SqliteLedger {
             .map_err(|e| AlgoError::Ledger {
                 message: format!("get_txtail error: {e}"),
             })
+    }
+
+    fn txtail_contains_txid(&self, txid: &algo_types::Digest) -> bool {
+        // Mid-block, `current_round` may run ahead of the rows written so
+        // far, and the cache would remember such a round as empty: answer
+        // from the rows directly then (the trait default).
+        if self.in_block {
+            let mut cache = crate::txtail_cache::TxTailDupCache::new();
+            cache.sync(self.current_round.0, |r| self.get_txtail(r).ok().flatten());
+            return cache.contains(txid);
+        }
+        // The cache only holds data re-derivable from the rows: a panic in
+        // another holder cannot leave it wrong, so poisoning is ignored.
+        let mut cache = self
+            .txtail_dups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.sync(self.current_round.0, |r| self.get_txtail(r).ok().flatten());
+        cache.contains(txid)
     }
 
     // ---- Pruning ----
@@ -16994,6 +17021,7 @@ mod tests {
             db_prefix: _,
             read_pool: _,   // separate read-only connections, no chain state
             lease_table: _, // restored via lease_snapshot
+            txtail_dups: _, // derived from committed txtail rows
             lease_snapshot: _,
             chain_snapshot: _,
             pending_abort: _,

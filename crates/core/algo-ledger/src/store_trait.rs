@@ -579,6 +579,24 @@ pub trait LedgerStore {
         Ok(None)
     }
 
+    /// Whether `txid` is in a block committed within the last
+    /// [`crate::txtail_cache::LOOKBACK_ROUNDS`] (`MaxTxnLife`) rounds: go's
+    /// `txTail.checkDup` txid lookup (`ledger/txtail.go`), used by
+    /// [`crate::check_dup::check_dup`].
+    ///
+    /// This default rebuilds a [`crate::txtail_cache::TxTailDupCache`] from
+    /// the txtail rows on every call, which suits small in-memory stores.
+    /// `SqliteLedger` keeps one cache and advances it incrementally. A
+    /// missing, unreadable or undecodable row adds no txids, as in
+    /// `TxTailDupCache::sync`.
+    fn txtail_contains_txid(&self, txid: &algo_types::Digest) -> bool {
+        let mut cache = crate::txtail_cache::TxTailDupCache::new();
+        cache.sync(self.current_round().0, |r| {
+            self.get_txtail(r).ok().flatten()
+        });
+        cache.contains(txid)
+    }
+
     // ---- Pruning ----
 
     /// Delete blocks and txtail entries before the given round.

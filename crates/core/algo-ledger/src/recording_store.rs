@@ -567,6 +567,10 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
         self.inner.get_txtail(round)
     }
 
+    fn txtail_contains_txid(&self, txid: &algo_types::Digest) -> bool {
+        self.inner.txtail_contains_txid(txid)
+    }
+
     // ---- Pruning ----
 
     fn forget_before(&mut self, round: u64) -> Result<(), AlgoError> {

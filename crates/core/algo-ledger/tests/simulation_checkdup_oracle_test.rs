@@ -28,17 +28,21 @@
 //! (sender, lease):(<sender>, <lease>)`.
 //!
 //! `tests/fixtures/simulate_checkdup/oracle.json` is the real go output
-//! (`tools/simulate-rewards-oracle`, `checkdup.go`): a genesis, one block
-//! go generated with two payments from A (one leased), and the simulate
-//! result of every scenario against that ledger. This test applies the same
-//! block to a Rust ledger and asserts the same failure message and
-//! `failed_at` for each scenario.
+//! (`tools/simulate-rewards-oracle`, `checkdup.go`): a genesis, the three
+//! blocks go generated, and the simulate result of every scenario. Stage A
+//! runs at latest = 3, some scenarios at the past round 1. Stage B appends
+//! empty blocks until the simulated round is `2 + MaxTxnLife`, so block 2
+//! sits on the `round - MaxTxnLife` boundary. This test applies the same
+//! blocks to a Rust ledger and asserts the same failure message and
+//! `failed_at` for each scenario, and that simulate leaves accounts, the
+//! lease table and the txtail exactly as they were.
 
 use std::path::PathBuf;
 
 use algo_ledger::simulation::{SimulationRequest, Simulator};
+use algo_ledger::sqlite::SqliteLedger;
 use algo_ledger::{LedgerState, LedgerStore};
-use algo_types::{AccountData, AccountStatus, Address};
+use algo_types::{AccountData, AccountStatus, Address, Block, Round};
 use base64::Engine as _;
 use serde::Deserialize;
 
@@ -52,6 +56,8 @@ struct OracleAccount {
 #[derive(Debug, Deserialize)]
 struct OracleScenario {
     name: String,
+    stage: String,
+    round: u64,
     group_msgpack: String,
     failure_message: String,
     failed_at: Vec<usize>,
@@ -64,8 +70,10 @@ struct Oracle {
     genesis_hash: String,
     fee_sink: String,
     rewards_pool: String,
+    max_txn_life: u64,
     genesis_accounts: Vec<OracleAccount>,
-    block: String,
+    blocks: Vec<String>,
+    stage_b_latest: u64,
     scenarios: Vec<OracleScenario>,
 }
 
@@ -86,22 +94,22 @@ fn load_oracle() -> Oracle {
     serde_json::from_str(&raw).expect("parse oracle fixture")
 }
 
-/// The go genesis, then go's block 1 applied through the real apply path
-/// (which records the block's txtail row and leases).
-fn ledger_after_block_1(o: &Oracle) -> LedgerState {
-    let mut state = LedgerState::new();
-    state.protocol = o.protocol.clone();
-    state.genesis_id = o.genesis_id.clone();
-    state.genesis_hash = b64(&o.genesis_hash).try_into().expect("genesis hash");
-    state.fee_sink = addr(&o.fee_sink);
-    state.rewards_pool = addr(&o.rewards_pool);
+/// The go genesis, then go's blocks applied through the real apply path
+/// (which records each block's txtail row and leases). Returns the last
+/// block.
+fn seed_go_blocks<L: LedgerStore>(store: &mut L, o: &Oracle) -> Block {
+    store.set_protocol(o.protocol.clone());
+    store.set_genesis_id(o.genesis_id.clone());
+    store.set_genesis_hash(b64(&o.genesis_hash).try_into().expect("genesis hash"));
+    store.set_fee_sink(addr(&o.fee_sink));
+    store.set_rewards_pool(addr(&o.rewards_pool));
     for a in &o.genesis_accounts {
         let status = match a.status.as_str() {
             "Offline" => AccountStatus::Offline,
             "Not Participating" => AccountStatus::NotParticipating,
             other => panic!("unknown status {other}"),
         };
-        state.set_account(
+        store.set_account(
             &addr(&a.addr),
             AccountData {
                 status,
@@ -110,39 +118,71 @@ fn ledger_after_block_1(o: &Oracle) -> LedgerState {
             },
         );
     }
-    let block = algo_codec::decode_block(&b64(&o.block)).expect("decode go block 1");
-    assert_eq!(block.round.0, 1);
-    assert_eq!(block.payset.len(), 2, "go block 1 has both payments");
-    algo_ledger::apply::apply_block(&mut state, &block).expect("apply go block 1");
-    assert_eq!(state.current_round().0, 1);
-    state
+    let mut last = None;
+    for (i, b) in o.blocks.iter().enumerate() {
+        let block = algo_codec::decode_block(&b64(b)).expect("decode go block");
+        assert_eq!(block.round.0, i as u64 + 1);
+        algo_ledger::apply::apply_block(store, &block).expect("apply go block");
+        last = Some(block);
+    }
+    assert_eq!(store.current_round().0, o.blocks.len() as u64);
+    last.expect("the fixture has blocks")
 }
 
-/// Every scenario matches go-algorand's simulate: the duplicate-txid and
-/// lease checks, their order (the lease before the txid, both before the
-/// authorizer), and the within-group cases.
-#[test]
-fn simulate_checkdup_matches_go() {
-    let o = load_oracle();
-    let mut state = ledger_after_block_1(&o);
-    assert!(
-        o.scenarios.iter().any(|s| s.failure_message.is_empty()),
-        "the fixture has a control scenario that succeeds"
-    );
-    for sc in &o.scenarios {
+/// Empty blocks up to the round go reached for stage B, so the simulated
+/// round is 2 + MaxTxnLife.
+fn extend_to_stage_b<L: LedgerStore>(store: &mut L, o: &Oracle, last: &Block) {
+    assert_eq!(o.stage_b_latest, 1 + o.max_txn_life);
+    for round in o.blocks.len() as u64 + 1..=o.stage_b_latest {
+        let block = Block {
+            round: Round(round),
+            timestamp: 1_700_000_000 + round as i64 * 5,
+            payset: Vec::new(),
+            ..last.clone()
+        };
+        algo_ledger::apply::apply_block(store, &block).expect("apply empty block");
+    }
+    assert_eq!(store.current_round().0, o.stage_b_latest);
+}
+
+/// Everything simulate must leave untouched: the accounts, the lease table
+/// (`lease_fp`) and every txtail row.
+type Fingerprint = (Vec<Option<AccountData>>, u64, Vec<Option<Vec<u8>>>);
+
+fn ledger_fingerprint<L: LedgerStore>(
+    store: &L,
+    o: &Oracle,
+    lease_fp: fn(&L) -> u64,
+) -> Fingerprint {
+    let accounts = o
+        .genesis_accounts
+        .iter()
+        .map(|a| store.get_account(&addr(&a.addr)))
+        .collect();
+    let txtail = (0..=store.current_round().0)
+        .map(|r| store.get_txtail(r).expect("get_txtail"))
+        .collect();
+    (accounts, lease_fp(store), txtail)
+}
+
+fn run_stage<L: LedgerStore>(store: &mut L, o: &Oracle, stage: &str, lease_fp: fn(&L) -> u64) {
+    let scenarios: Vec<_> = o.scenarios.iter().filter(|s| s.stage == stage).collect();
+    assert!(!scenarios.is_empty(), "stage {stage} has scenarios");
+    for sc in scenarios {
         let group = algo_codec::decode_signed_txn_stream(&b64(&sc.group_msgpack))
             .unwrap_or_else(|e| panic!("{}: decode group: {e}", sc.name));
-        let before = state.accounts.clone();
-        let result = Simulator::new(&mut state)
+        let before = ledger_fingerprint(store, o, lease_fp);
+        let result = Simulator::new(&mut *store)
             .simulate(SimulationRequest {
+                round: (sc.round != 0).then_some(Round(sc.round)),
                 txn_groups: vec![group],
                 allow_empty_signatures: true,
                 ..Default::default()
             })
             .unwrap_or_else(|e| panic!("{}: simulate: {e}", sc.name));
-        assert_eq!(
-            state.accounts, before,
-            "{}: simulate must not change the ledger",
+        assert!(
+            ledger_fingerprint(store, o, lease_fp) == before,
+            "{}: simulate must restore accounts, leases and txtail",
             sc.name
         );
         let g = &result.txn_groups[0];
@@ -159,4 +199,32 @@ fn simulate_checkdup_matches_go() {
             sc.name
         );
     }
+}
+
+fn run_oracle<L: LedgerStore>(store: &mut L, lease_fp: fn(&L) -> u64) {
+    let o = load_oracle();
+    let last = seed_go_blocks(store, &o);
+    run_stage(store, &o, "A", lease_fp);
+    extend_to_stage_b(store, &o, &last);
+    run_stage(store, &o, "B", lease_fp);
+}
+
+/// Every scenario matches go-algorand's simulate: the duplicate-txid and
+/// lease checks, their order (the lease before the txid, both before the
+/// authorizer), the within-group cases, a past `round`, and the
+/// `round - MaxTxnLife` edge of the scan window.
+#[test]
+fn simulate_checkdup_matches_go() {
+    run_oracle(&mut LedgerState::new(), |s| s.lease_table.fingerprint());
+}
+
+/// The same oracle on `SqliteLedger`, whose txid lookup goes through its
+/// incremental txtail cache rather than the trait's per-call rebuild.
+#[test]
+fn simulate_checkdup_matches_go_on_sqlite() {
+    let mut ledger = SqliteLedger::open_in_memory().expect("in-memory ledger");
+    run_oracle(&mut ledger, |l| {
+        l.scratch_invariant_fingerprint()
+            .expect("SqliteLedger fingerprints its lease table")
+    });
 }

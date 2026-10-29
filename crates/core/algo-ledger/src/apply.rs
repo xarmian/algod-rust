@@ -225,6 +225,12 @@ pub struct AvmEvalOverrides {
     /// `Some`.
     pub unnamed_capacity:
         Option<std::rc::Rc<std::cell::RefCell<crate::avm_context::UnnamedCapacityTracker>>>,
+    /// The caller runs go's `checkDup` itself and tracks the block's leases
+    /// ([`crate::check_dup`], simulate): apply then neither checks nor
+    /// records leases. Simulate's lease check must see only the rounds up
+    /// to the simulated one, and recording into the live lease table would
+    /// outlive the simulation (no snapshot covers it).
+    pub leases_checked_by_caller: bool,
 }
 
 impl ApplyContext {
@@ -4452,8 +4458,21 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
         })?
     };
 
-    // Check lease before any state changes.
-    store.check_lease(&txn.sender, &lease_arr, ctx.round)?;
+    // Check lease before any state changes. In validate mode the error is
+    // go's `LeaseInLedgerError` from `checkDup`.
+    if !ctx.avm_overrides.leases_checked_by_caller {
+        if let Err(e) = store.check_lease(&txn.sender, &lease_arr, ctx.round) {
+            return Err(if ctx.validate {
+                crate::check_dup::lease_in_ledger_error(
+                    algo_codec::compute_txn_id(txn),
+                    &txn.sender,
+                    &lease_arr,
+                )
+            } else {
+                e
+            });
+        }
+    }
 
     // Addresses go's `Move` brings up to the rewards level (see
     // `reward_participants`: strictly narrower than the touched set).
@@ -5138,7 +5157,9 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
         }
 
         // Record lease on success (no-op for empty/zero leases).
-        store.record_lease(&txn.sender, lease_arr, txn.last_valid.0);
+        if !ctx.avm_overrides.leases_checked_by_caller {
+            store.record_lease(&txn.sender, lease_arr, txn.last_valid.0);
+        }
 
         // Increment the running transaction counter for this top-level txn.
         // Mirrors go-algorand's `addTx` -> `incTxnCount()`. This ensures
