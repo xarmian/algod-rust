@@ -35,6 +35,7 @@ use std::collections::{HashMap, HashSet};
 
 use algo_error::{AlgoError, RejectClass};
 use algo_types::consensus::ConsensusParams;
+use algo_types::genesis_restore::GenesisRestoreRule;
 use algo_types::{Address, Digest, Transaction};
 
 use crate::store_trait::LedgerStore;
@@ -274,35 +275,17 @@ pub fn check_dup<L: LedgerStore + ?Sized>(
 pub struct BlockCheckDup {
     block: BlockDups,
     ledger: LedgerDups,
-    /// The block header's genesis id and hash, for `Alive`.
-    genesis_id: String,
-    genesis_hash: [u8; 32],
-    /// Per payset transaction, which stripped genesis fields go's
-    /// `DecodeSignedTxn` restores from the header (the block's
-    /// `GenesisRestoreRule`, resolved once by the caller).
-    restores: Vec<(bool, bool)>,
     violation: Option<String>,
 }
 
 impl BlockCheckDup {
-    /// The checks for a block of round `round` with header genesis
-    /// `genesis_id` / `genesis_hash`, whose payset has the ids `txids` (as
-    /// the txtail records them) and the genesis-restore decisions
-    /// `restores` (`GenesisRestoreRule::restores`), one per transaction.
+    /// The checks for a block of round `round` whose payset has the ids
+    /// `txids` (as the txtail records them).
     #[must_use]
-    pub fn new(
-        round: u64,
-        txids: Vec<Digest>,
-        genesis_id: String,
-        genesis_hash: [u8; 32],
-        restores: Vec<(bool, bool)>,
-    ) -> Self {
+    pub fn new(round: u64, txids: Vec<Digest>) -> Self {
         Self {
             block: BlockDups::new(),
             ledger: LedgerDups::new(round, txids),
-            genesis_id,
-            genesis_hash,
-            restores,
             violation: None,
         }
     }
@@ -320,14 +303,16 @@ impl BlockCheckDup {
     }
 
     /// go's `Alive` then `checkDup` for payset transaction `index`
-    /// (`stx` in payset form: its stripped genesis fields are restored the
-    /// way go's `DecodeSignedTxn` restores them), recording it in the block
-    /// when it passes (go `addTx`: a block that fails is discarded whole, so
-    /// recording before the transaction applies is equivalent).
+    /// (`stx` in payset form: `rule`, the block header's genesis rule,
+    /// restores its stripped genesis fields the way go's `DecodeSignedTxn`
+    /// does), recording it in the block when it passes (go `addTx`: a block
+    /// that fails is discarded whole, so recording before the transaction
+    /// applies is equivalent).
     pub fn check<L: LedgerStore + ?Sized>(
         &mut self,
         store: &L,
         consensus: &ConsensusParams,
+        rule: &GenesisRestoreRule<'_>,
         stx: &algo_types::SignedTransaction,
         index: usize,
     ) -> Result<(), AlgoError> {
@@ -336,21 +321,11 @@ impl BlockCheckDup {
                 message: format!("checkDup: no txid for payset index {index}"),
             });
         };
-        let (restore_id, restore_hash) = self.restores.get(index).copied().unwrap_or_default();
-        let txn_genesis_id = if restore_id {
-            self.genesis_id.as_str()
-        } else {
-            stx.txn.genesis_id.as_str()
-        };
-        let txn_genesis_hash = if restore_hash {
-            &self.genesis_hash
-        } else {
-            &stx.txn.genesis_hash
-        };
+        let (txn_genesis_id, txn_genesis_hash) = rule.restored_genesis(stx);
         if let Err(message) = algo_validate::block_alive_with_genesis(
             self.ledger.round,
-            &self.genesis_id,
-            &self.genesis_hash,
+            rule.genesis_id(),
+            rule.genesis_hash(),
             consensus,
             &stx.txn,
             txn_genesis_id,
@@ -374,11 +349,43 @@ impl BlockCheckDup {
         Ok(())
     }
 
-    /// The first `Alive` / `checkDup` rejection, if any (go's text).
+    /// The first prologue rejection (`Alive`, `checkDup`, or the authorizer
+    /// via [`Self::record_violation`]), if any (go's text).
     #[must_use]
     pub fn violation(&self) -> Option<&str> {
         self.violation.as_deref()
     }
+}
+
+/// go's `Alive` then `checkDup` over the WHOLE payset of `block` (stripped
+/// form) against `store` at `block.round - 1`, without executing anything:
+/// the first failing transaction in payset order, with go's text.
+///
+/// Neither check depends on what an earlier transaction did to the state
+/// (only on the block's txids and leases and the ledger's txtail), so a
+/// failure here means go's `Ledger.Validate` rejects the block whatever the
+/// payset's execution would do. The proposal check falls back on it when the
+/// execution could not reach a verdict (a transaction not evaluable here,
+/// the ledger busy throughout the budget). `None`: every transaction passes,
+/// or the block's protocol is unknown or its payset is not in valid stripped
+/// form (an evaluation error, not a `checkDup` verdict).
+pub fn prologue_prepass<L: LedgerStore + ?Sized>(
+    store: &L,
+    block: &algo_types::Block,
+) -> Option<String> {
+    let consensus = algo_types::consensus::consensus_params_for_version(&block.current_protocol)?;
+    let rule = GenesisRestoreRule::for_params(&consensus, block);
+    rule.check_payset(&block.payset).ok()?;
+    let mut check = BlockCheckDup::new(
+        block.round.0,
+        algo_codec::block_txids_with_rule(block, &rule),
+    );
+    for (index, stx) in block.payset.iter().enumerate() {
+        if check.check(store, &consensus, &rule, stx, index).is_err() {
+            return check.violation().map(str::to_owned);
+        }
+    }
+    None
 }
 
 #[cfg(test)]

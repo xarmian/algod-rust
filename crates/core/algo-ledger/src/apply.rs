@@ -1653,6 +1653,7 @@ pub(crate) fn collect_txn_addresses(
 pub(crate) fn txn_prologue<S: crate::store_trait::LedgerStore>(
     store: &S,
     ctx: &ApplyContext,
+    genesis_rule: &algo_types::genesis_restore::GenesisRestoreRule<'_>,
     stx: &SignedTransaction,
     index: usize,
 ) -> Result<(), AlgoError> {
@@ -1660,7 +1661,7 @@ pub(crate) fn txn_prologue<S: crate::store_trait::LedgerStore>(
         return Ok(());
     };
     let mut checkdup = checkdup.borrow_mut();
-    checkdup.check(store, &ctx.consensus, stx, index)?;
+    checkdup.check(store, &ctx.consensus, genesis_rule, stx, index)?;
     let txid = checkdup.txids().get(index).copied();
     if let Err(e) = check_authorizer_for(store, stx, txid) {
         checkdup.record_violation(&e.to_string());
@@ -1799,6 +1800,7 @@ fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
     store: &mut S,
     group: &[&SignedTransaction],
     ctx: &ApplyContext,
+    genesis_rule: &algo_types::genesis_restore::GenesisRestoreRule<'_>,
     group_budget: &mut GroupBudget,
     group_box_budget: &mut BoxBudgetState,
     tracer: Option<&mut dyn EvalTracer>,
@@ -1811,6 +1813,7 @@ fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
         store,
         group,
         ctx,
+        genesis_rule,
         group_budget,
         group_box_budget,
         tracer,
@@ -1829,6 +1832,7 @@ fn apply_group_transactions_inner<S: crate::store_trait::LedgerStore>(
     store: &mut S,
     group: &[&SignedTransaction],
     ctx: &ApplyContext,
+    genesis_rule: &algo_types::genesis_restore::GenesisRestoreRule<'_>,
     group_budget: &mut GroupBudget,
     group_box_budget: &mut BoxBudgetState,
     mut tracer: Option<&mut dyn EvalTracer>,
@@ -1846,7 +1850,7 @@ fn apply_group_transactions_inner<S: crate::store_trait::LedgerStore>(
     let group_created = crate::apply::GroupCreatedResources::default();
     for (gi_idx, stx) in group.iter().enumerate() {
         ctx.txn_index.set(*global_txn_idx);
-        txn_prologue(&*store, ctx, stx, *global_txn_idx).inspect_err(|_| {
+        txn_prologue(&*store, ctx, genesis_rule, stx, *global_txn_idx).inspect_err(|_| {
             *failed_txn = Some(*global_txn_idx);
         })?;
         let gi = GroupInfo {
@@ -2692,19 +2696,10 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
             }
             None => algo_codec::block_txids_with_rule(stored_block, &genesis_rule),
         };
-        let restores = stored_block
-            .payset
-            .iter()
-            .map(|stx| genesis_rule.restores(stx))
-            .collect();
-        let check = crate::check_dup::BlockCheckDup::new(
+        Some(RefCell::new(crate::check_dup::BlockCheckDup::new(
             block.round.0,
             txids,
-            stored_block.genesis_id.clone(),
-            stored_block.genesis_hash,
-            restores,
-        );
-        Some(RefCell::new(check))
+        )))
     } else {
         None
     };
@@ -2845,7 +2840,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
             ApplyMode::Replay => {
                 // Replay mode: process transactions individually (no AVM execution).
                 for (replay_idx, stx) in block.payset.iter().enumerate() {
-                    if let Err(e) = txn_prologue(&*store, &ctx, stx, replay_idx) {
+                    if let Err(e) = txn_prologue(&*store, &ctx, &genesis_rule, stx, replay_idx) {
                         failed_txn = Some(replay_idx);
                         break 'block Err(e);
                     }
@@ -2978,6 +2973,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
                             &mut recording_store,
                             group,
                             &ctx,
+                            &genesis_rule,
                             &mut group_budget,
                             &mut group_box_budget,
                             tracer_reborrow,
@@ -2992,6 +2988,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
                         store,
                         group,
                         &ctx,
+                        &genesis_rule,
                         &mut group_budget,
                         &mut group_box_budget,
                         tracer_reborrow,
@@ -15198,6 +15195,7 @@ return
         // The sender does not exist: this member fails.
         let bad_pay = pay_txn(Address([9u8; 32]), Address([8u8; 32]), 5_000_000, 1_000);
         let group = [&stpf, &bad_pay];
+        let rule = algo_types::genesis_restore::GenesisRestoreRule::unstripped("", &[0u8; 32]);
 
         ctx.fee_credit.set(11);
         ctx.fee_residue.set(12);
@@ -15210,6 +15208,7 @@ return
             &mut state,
             &group,
             &ctx,
+            &rule,
             &mut budget,
             &mut box_budget,
             None,
@@ -15245,6 +15244,7 @@ return
             &mut state,
             &ok_group,
             &ctx,
+            &rule,
             &mut budget,
             &mut box_budget,
             None,

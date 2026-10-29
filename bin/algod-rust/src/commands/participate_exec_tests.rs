@@ -2451,6 +2451,31 @@ fn dev_mode_evicts_a_rejected_group_and_the_chain_advances() {
     assert_ne!(block.payset[0].txn.sender, rejected_sender);
 }
 
+/// An eviction also rolls the pending-block evaluator back: it no longer
+/// holds the evicted group's txid, lease or balance changes, so the same
+/// transaction resubmitted afterwards is admitted again (issue #2127).
+#[test]
+fn a_group_evicted_in_dev_mode_can_be_resubmitted() {
+    let a = key(1);
+    let b = key(2);
+    let (_ledger, pool) = fixture(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))], &[]);
+    let stx = leased_pay(&a, b.0, [0x5F; 32], 7);
+    pool.remember_one(stx.clone()).expect("admitted");
+    let candidate = pool.assemble_dev_mode_block().expect("assemble");
+    assert_eq!(candidate.payset.len(), 1);
+    let reason = algo_error::AlgoError::Ledger {
+        message: "dev-mode commit rejected the group".into(),
+    };
+    assert_eq!(
+        crate::dev_producer::evict_failed_group(&pool, &candidate, 0, &reason),
+        1
+    );
+    assert_eq!(pool.pending_count(), 0);
+    pool.remember_one(stx)
+        .expect("the evicted transaction is admitted again");
+    assert_eq!(pool.pending_count(), 1);
+}
+
 /// The pool's own `checkDup` copy always runs, so a lease the snapshot holds
 /// is rejected even when the real apply cannot run (stale base): go's typed
 /// `LeaseInLedgerError`, tagged `lease` (issue #2127).

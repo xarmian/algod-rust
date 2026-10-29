@@ -925,7 +925,8 @@ pub fn scratch_execute_payset<L: LedgerStore>(
 pub enum ViolationKind {
     /// `validateForPayouts`: `FeesCollected` / `Proposer` / `ProposerPayout`.
     Payouts,
-    /// `BlockEvaluator.transaction`: `Alive` or `checkDup` (issue #2127).
+    /// `BlockEvaluator.transaction`'s prologue: `Alive`, `checkDup` or the
+    /// authorizer check (issue #2127).
     Transaction,
 }
 
@@ -933,7 +934,7 @@ impl std::fmt::Display for ViolationKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Payouts => "validateForPayouts",
-            Self::Transaction => "alive/checkDup",
+            Self::Transaction => "transaction validation",
         })
     }
 }
@@ -958,17 +959,45 @@ pub enum ProposalCheck {
 
 /// Judge a peer proposal's `FeesCollected` / `Proposer` / `ProposerPayout`
 /// header fields against the pre-block state (go `validateForPayouts`, issue
-/// #1798), and each transaction against go's `checkDup` (issue #2127): the
-/// whole block is evaluated in [`ApplyMode::Execute`] on a rolled-back
-/// scratch apply with only those two validations switched on, so nothing is
-/// persisted and no other validate-mode check can reject a block go would
-/// accept. `store` must be at `block.round - 1`. Only a payout, `Alive` or
-/// `checkDup` rejection is a [`ProposalCheck::Violation`]; every other failure is
-/// [`ProposalCheck::NoVerdict`].
+/// #1798), and each transaction against go's `BlockEvaluator.transaction`
+/// prologue (`Alive`, `checkDup`, the authorizer; issue #2127): the whole
+/// block is evaluated in [`ApplyMode::Execute`] on a rolled-back scratch
+/// apply with only those validations switched on, so nothing is persisted
+/// and no other validate-mode check can reject a block go would accept.
+/// `store` must be at `block.round - 1`. Only a payout or prologue rejection
+/// is a [`ProposalCheck::Violation`]; every other failure is
+/// [`ProposalCheck::NoVerdict`], unless the execution-free
+/// [`crate::check_dup::prologue_prepass`] over the whole payset still finds
+/// an `Alive` / `checkDup` rejection.
 pub fn scratch_proposal_check<L: LedgerStore>(store: &mut L, block: &Block) -> ProposalCheck {
     let mut probe = proposal_check_probe();
     let result = scratch_execute_with(store, block, &mut probe);
-    proposal_check_from(result, &probe)
+    let check = proposal_check_from(result, &probe);
+    if !matches!(check, ProposalCheck::NoVerdict { .. })
+        || store.current_round().0.checked_add(1) != Some(block.round.0)
+    {
+        return check;
+    }
+    with_prologue_prepass(check, crate::check_dup::prologue_prepass(&*store, block))
+}
+
+/// A proposal check that reached no verdict, settled by
+/// [`crate::check_dup::prologue_prepass`] (run against the pre-block state)
+/// when that finds a transaction go's prologue rejects. Only a no-verdict is
+/// ever replaced: when the execution reached a verdict, every transaction up
+/// to the failing one passed the same checks, so the pre-pass could only
+/// repeat it.
+pub(crate) fn with_prologue_prepass(
+    check: ProposalCheck,
+    prepass: Option<String>,
+) -> ProposalCheck {
+    match (check, prepass) {
+        (ProposalCheck::NoVerdict { .. }, Some(message)) => ProposalCheck::Violation {
+            kind: ViolationKind::Transaction,
+            message,
+        },
+        (check, _) => check,
+    }
 }
 
 /// The [`ExecProbe`] of a proposal check: go `Ledger.Validate`'s
@@ -985,8 +1014,8 @@ pub(crate) fn proposal_check_probe() -> ExecProbe {
 }
 
 /// Map a proposal-check evaluation to its [`ProposalCheck`]: when the
-/// evaluation failed on a transaction's `Alive` / `checkDup`, that is a
-/// verdict (go `Ledger.Validate` fails the block on it), unless the base
+/// evaluation failed on a transaction's prologue (`Alive`, `checkDup` or the
+/// authorizer), that is a verdict (go `Ledger.Validate` fails the block on it), unless the base
 /// moved during the evaluation; everything else as [`payout_check_from`].
 pub(crate) fn proposal_check_from<T>(
     result: Result<T, ScratchFailure>,

@@ -3260,7 +3260,10 @@ impl SqliteLedger {
         let (cache, committed) = self.synced_txtail_cache(max_txn_life);
         let mut found = cache.confirmed(txids, max_txn_life);
         drop(cache);
-        if self.in_block {
+        if self.in_block && committed < self.current_round.0 {
+            // One hash set per lookup: each in-span row is matched in O(1)
+            // per txid instead of scanning the queried ids.
+            let wanted: std::collections::HashSet<&algo_types::Digest> = txids.iter().collect();
             for round in committed + 1..=self.current_round.0 {
                 let Some(bytes) = self.get_txtail(round).ok().flatten() else {
                     continue;
@@ -3271,7 +3274,7 @@ impl SqliteLedger {
                 for id in &tail.txn_ids {
                     if let Ok(id) = <[u8; 32]>::try_from(id.as_ref()) {
                         let id = algo_types::Digest(id);
-                        if txids.contains(&id) {
+                        if wanted.contains(&id) {
                             found.insert(id);
                         }
                     }

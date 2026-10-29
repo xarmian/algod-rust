@@ -759,6 +759,12 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             test_hooks::maybe_panic_after_withdrawal();
         }
 
+        // The request's transactions are not stripped: `Alive` sees them as
+        // sent, against the simulated block's genesis.
+        let genesis_rule = algo_types::genesis_restore::GenesisRestoreRule::unstripped(
+            &block.block_genesis_id,
+            &block.block_genesis_hash,
+        );
         let apply_ctx = ApplyContext {
             rewards_level: block.rewards_level,
             fee_sink: block.fee_sink,
@@ -770,8 +776,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             caller_tracks_leases: true,
             // go `BlockEvaluator.transaction`'s `Alive` / `checkDup` /
             // authorizer prologue, shared with block validation
-            // (`crate::apply::txn_prologue`). The request's transactions are
-            // not stripped, so nothing is restored. Their txids are hashed
+            // (`crate::apply::txn_prologue`). The txids are hashed
             // only when evaluation will run, and kept apart from
             // `group_txid_cache` on purpose: that cache reproduces go's shared
             // `EvalParams.txidCache`, whose entries a nested program can fill
@@ -784,9 +789,6 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                         .iter()
                         .map(|stx| algo_codec::compute_txn_id(&stx.txn))
                         .collect(),
-                    block.block_genesis_id.clone(),
-                    block.block_genesis_hash,
-                    vec![(false, false); eval_group.len()],
                 ))
             }),
             // go `simulator.go`: `Generate: true, Validate: true`.
@@ -963,7 +965,8 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             // #2125), then the authorizer. go's simulate reports these error
             // texts bare (`EvalFailureError` wraps them without a prefix),
             // hence `Rejected`, whose display is the message itself.
-            let checked = crate::apply::txn_prologue(&*self.store, &apply_ctx, &eval_group[i], i);
+            let checked =
+                crate::apply::txn_prologue(&*self.store, &apply_ctx, &genesis_rule, &eval_group[i], i);
             let apply_result = match checked {
                 Err(e) => Err(e),
                 Ok(()) => {

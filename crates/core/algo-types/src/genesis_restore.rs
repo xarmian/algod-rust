@@ -403,12 +403,29 @@ impl<'a> GenesisRestoreRule<'a> {
         }
     }
 
-    /// Which of `stx`'s stripped genesis fields go's `DecodeSignedTxn`
-    /// restores from the header: `(genesis id, genesis hash)`.
+    /// Rule for a payset that was never stripped (a simulate request's
+    /// transactions): the header genesis is `genesis_id` / `genesis_hash`
+    /// and nothing is ever restored.
+    #[must_use]
+    pub fn unstripped(genesis_id: &'a str, genesis_hash: &'a [u8; 32]) -> Self {
+        Self {
+            supports_stripped: false,
+            ..Self::new(genesis_id, genesis_hash, false)
+        }
+    }
+
+    /// The header's genesis id.
     #[inline]
     #[must_use]
-    pub fn restores(&self, stx: &SignedTransaction) -> (bool, bool) {
-        self.decide(stx)
+    pub fn genesis_id(&self) -> &'a str {
+        self.genesis_id
+    }
+
+    /// The header's genesis hash.
+    #[inline]
+    #[must_use]
+    pub fn genesis_hash(&self) -> &'a [u8; 32] {
+        self.genesis_hash
     }
 
     /// The genesis id / hash `stx`'s transaction has once restored,

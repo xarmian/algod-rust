@@ -532,3 +532,76 @@ fn sqlite_txid_lookup_sees_rounds_applied_in_the_open_span() {
         "and after the commit"
     );
 }
+
+/// go's `Alive` / `checkDup` judge the whole payset whatever the execution
+/// does: a proposal whose first transaction cannot be evaluated here (an
+/// overspend, a no-verdict) and whose second replays a committed txid is
+/// still rejected with go's `checkDup` text, on the overlay check, on the
+/// locked scratch check, and on a ledger that stays busy past the budget
+/// (issue #2127).
+#[test]
+fn checkdup_verdict_survives_an_unevaluable_earlier_transaction() {
+    use algo_ledger::shadow_execute::{scratch_proposal_check, ProposalCheck, ViolationKind};
+    use std::time::Duration;
+
+    let o = load_oracle();
+    let sc = scenario(&o, "committed_txid");
+    let mut candidate = block(&sc.block);
+    let mut overspend = candidate.payset[0].clone();
+    overspend.txn.note = serde_bytes::ByteBuf::from(b"overspend".to_vec());
+    overspend.txn.amount = u64::MAX / 2;
+    candidate.payset.insert(0, overspend);
+
+    // The overspend alone is only a no-verdict: the payset cannot run here.
+    let mut alone = candidate.clone();
+    alone.payset.truncate(1);
+    let mut l = sqlite(&o);
+    assert!(
+        matches!(
+            scratch_proposal_check(&mut l, &alone),
+            ProposalCheck::NoVerdict { .. }
+        ),
+        "the overspend is not a prologue verdict"
+    );
+
+    // Locked scratch check.
+    assert_eq!(
+        scratch_proposal_check(&mut l, &candidate),
+        ProposalCheck::Violation {
+            kind: ViolationKind::Transaction,
+            message: sc.validate_error.clone(),
+        }
+    );
+    assert_eq!(l.current_round().0, 1);
+
+    // Overlay check, through the validator.
+    let ledger = Arc::new(Mutex::new(l));
+    let validator = PayoutCheckingValidator::new(StubBlockValidator::accepting(), ledger.clone());
+    match validator.validate(&candidate).map(|_| ()) {
+        Err(AgreementError::ValidationFailed(message)) => assert_eq!(message, sc.validate_error),
+        other => panic!("overlay check: expected go's checkDup verdict, got {other:?}"),
+    }
+
+    // A ledger busy for the whole budget: the fallback's pre-pass waits for
+    // the mutex and still judges the payset.
+    let validator = PayoutCheckingValidator::with_budget(
+        StubBlockValidator::accepting(),
+        ledger.clone(),
+        Duration::from_millis(30),
+    );
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let holder = {
+        let ledger = ledger.clone();
+        std::thread::spawn(move || {
+            let _guard = ledger.lock().unwrap();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        })
+    };
+    held_rx.recv().unwrap();
+    match validator.validate(&candidate).map(|_| ()) {
+        Err(AgreementError::ValidationFailed(message)) => assert_eq!(message, sc.validate_error),
+        other => panic!("busy ledger: expected go's checkDup verdict, got {other:?}"),
+    }
+    holder.join().unwrap();
+}

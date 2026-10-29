@@ -27,11 +27,13 @@
 // through the ledger evaluator (`validateForPayouts` in `endOfBlock`) before
 // voting for it. This wrapper adds that check, against the committed ledger
 // state, after the stateless validation. The same evaluation runs go's
-// `checkDup` on every transaction (issue #2127): a replayed committed txid,
-// a txid repeated in the block, or a lease still in force.
+// `BlockEvaluator.transaction` prologue on every transaction (issue #2127):
+// `Alive`, `checkDup` (a replayed committed txid, a txid repeated in the
+// block, or a lease still in force) and the authorizer check.
 //
-// Liveness: only a genuine `validateForPayouts` or `checkDup` verdict
-// rejects a proposal.
+// Liveness: only a genuine `validateForPayouts` or prologue verdict rejects
+// a proposal. `Alive` and `checkDup` need no execution, so a pre-pass over
+// the whole payset still judges them when the evaluation reaches no verdict.
 // Anything that merely prevents the check from running (ledger busy or not
 // yet at the previous round, no scratch rollback available, a payset
 // transaction not evaluable here) is waited out within a small bounded
@@ -75,7 +77,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 static FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
 /// Number of proposals accepted on the stateless verdict alone because the
-/// proposal check (payouts, alive/checkDup) could not be evaluated. A test and diagnostic counter only:
+/// proposal check (payouts, transaction validation) could not be evaluated.
+/// A test and diagnostic counter only:
 /// it is not exported to the node's metrics; the `warn!` emitted on every
 /// fallback is the operator-facing signal.
 pub fn payout_check_fallbacks() -> u64 {
@@ -172,6 +175,15 @@ impl<V: BlockValidator> PayoutCheckingValidator<V> {
             },
         }
     }
+
+    /// [`crate::proposal_eval::prologue_prepass`] against the ledger, when it
+    /// is at the proposal's parent round.
+    fn prologue_prepass(&self, block: &Block) -> Option<String> {
+        let parent = block.round.0.checked_sub(1)?;
+        let base = LockedBase::new(&self.ledger, Round(parent));
+        let verdict = crate::proposal_eval::prologue_prepass(&base, block);
+        (!base.is_poisoned()).then_some(verdict).flatten()
+    }
 }
 
 impl<V: BlockValidator> BlockValidator for PayoutCheckingValidator<V> {
@@ -189,11 +201,23 @@ impl<V: BlockValidator> BlockValidator for PayoutCheckingValidator<V> {
                         std::thread::sleep(POLL_INTERVAL);
                         continue;
                     }
+                    // Last resort before accepting: go's `Alive` / `checkDup`
+                    // over the whole payset need no execution, so they still
+                    // reach a verdict on a ledger that stayed busy (each read
+                    // waits for the mutex) or a payset that cannot run here.
+                    if let Some(violation) = self.prologue_prepass(block) {
+                        tracing::debug!(
+                            round = block.round.0,
+                            %violation,
+                            "proposal rejected by go's Ledger.Validate checks (prologue pre-pass)"
+                        );
+                        return Err(AgreementError::ValidationFailed(violation));
+                    }
                     FALLBACKS.fetch_add(1, Ordering::Relaxed);
                     warn!(
                         round = block.round.0,
                         %reason,
-                        "proposal check (payouts, alive/checkDup) could not be evaluated; accepting on the stateless verdict"
+                        "proposal check (payouts, transaction validation) could not be evaluated; accepting on the stateless verdict"
                     );
                     return Ok(validated);
                 }

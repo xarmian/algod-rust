@@ -240,7 +240,24 @@ pub fn evaluate_proposal_check<B: OverlayBase + ?Sized>(base: &B, block: &Block)
     }
     let mut probe = crate::shadow_execute::proposal_check_probe();
     let result = evaluate_block_on_overlay(base, block, &mut probe);
-    crate::shadow_execute::proposal_check_from(result, &probe)
+    let check = crate::shadow_execute::proposal_check_from(result, &probe);
+    if !matches!(check, ProposalCheck::NoVerdict { .. }) {
+        return check;
+    }
+    crate::shadow_execute::with_prologue_prepass(check, prologue_prepass(base, block))
+}
+
+/// [`crate::check_dup::prologue_prepass`] on a fresh overlay over `base`:
+/// go's `Alive` and `checkDup` over the whole payset, nothing executed. `None`
+/// (no verdict) when it passes, or when `base` is not at `block.round - 1` or
+/// advanced while it ran.
+pub fn prologue_prepass<B: OverlayBase + ?Sized>(base: &B, block: &Block) -> Option<String> {
+    let mut overlay = PendingOverlay::new(base);
+    if base.base_is_stale() || block.round.0 != overlay.base_round().0 + 1 {
+        return None;
+    }
+    let verdict = crate::check_dup::prologue_prepass(&OverlayStore::new(base, &mut overlay), block);
+    (!base.base_is_stale()).then_some(verdict).flatten()
 }
 
 /// Evaluate `block` in [`ApplyMode::Execute`] on a fresh overlay over `base`

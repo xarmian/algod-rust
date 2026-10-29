@@ -1488,6 +1488,13 @@ impl TransactionPool {
         for id in txids {
             inner.status_cache.put(*id, text.clone());
         }
+        // The pending-block evaluator still holds the evicted group's
+        // effects (its txids, leases and balance changes): rebuild it from
+        // the surviving groups, so a corrected resubmission is judged
+        // against the ledger, not against the group it replaces.
+        if dropped > 0 && inner.evaluator.is_some() {
+            self.recompute_block_evaluator(&mut inner, &HashSet::new());
+        }
         dropped
     }
 
