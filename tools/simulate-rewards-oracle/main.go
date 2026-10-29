@@ -30,11 +30,15 @@
 //
 // This tool builds a real in-memory go-algorand ledger whose genesis pool
 // funds a non-zero rewards rate, generates two empty blocks, then simulates
-// a two-transaction group through the real, unmodified `Simulator`:
+// a three-transaction group through the real, unmodified `Simulator`:
 //
 //	txn 0: B creates an app that logs balance(A), min_balance(A),
 //	       AcctBalance(pool), AcctBalance(A), balance(B);
-//	txn 1: A pays B 1 Algo and closes to C.
+//	txn 1: A pays B 1 Algo and closes to C;
+//	txn 2: valid only from round latest+1 (the simulated block), B creates
+//	       an app that logs, for the now-closed A, acct_params_get
+//	       AcctBalance (exists flag, value), AcctMinBalance (exists flag,
+//	       value) and balance, then global Round.
 //
 // It writes the ledger state the Rust test must seed (latest header rewards
 // state, account data without rewards, txn counter) plus the simulate
@@ -114,6 +118,29 @@ log
 int 1
 `
 
+const closedSrc = `#pragma version 10
+txna Accounts 1
+acct_params_get AcctBalance
+itob
+log
+itob
+log
+txna Accounts 1
+acct_params_get AcctMinBalance
+itob
+log
+itob
+log
+txna Accounts 1
+balance
+itob
+log
+global Round
+itob
+log
+int 1
+`
+
 const clearSrc = "#pragma version 10\nint 1\n"
 
 type rewardsState struct {
@@ -153,6 +180,7 @@ type fixture struct {
 	NextRewardsState rewardsState `json:"next_rewards_state"`
 	RewardUnits      uint64       `json:"reward_units"`
 	Accounts         []account    `json:"accounts"`
+	PrevHeader       string       `json:"prev_header"`
 	GroupMsgpack     string       `json:"group_msgpack"`
 	LastRound        uint64       `json:"last_round"`
 	FailureMessage   string       `json:"failure_message"`
@@ -204,7 +232,10 @@ func main() {
 	for i := 0; i < 2; i++ {
 		hdr, err := l.BlockHdr(l.Latest())
 		must(err)
-		ev, err := l.StartEvaluator(bookkeeping.MakeBlock(hdr).BlockHeader, 0, 0, nil)
+		next := bookkeeping.MakeBlock(hdr).BlockHeader
+		// A fixed timestamp keeps the recorded header deterministic.
+		next.TimeStamp = 1_700_000_000 + int64(next.Round)*5
+		ev, err := l.StartEvaluator(next, 0, 0, nil)
 		must(err)
 		ub, err := ev.GenerateBlock(nil)
 		must(err)
@@ -230,6 +261,7 @@ func main() {
 		RewardsState: rs(hdr.RewardsState),
 		RewardUnits:  totals.RewardUnits(),
 	}
+	f.PrevHeader = b64(protocol.Encode(&hdr))
 	poolData, _, err := l.LookupWithoutRewards(latest, pool)
 	must(err)
 	poolBal := poolData.WithUpdatedRewards(params.RewardUnit, hdr.RewardsLevel).MicroAlgos
@@ -250,6 +282,8 @@ func main() {
 	approval, err := logic.AssembleString(approvalSrc)
 	must(err)
 	clear, err := logic.AssembleString(clearSrc)
+	must(err)
+	closed, err := logic.AssembleString(closedSrc)
 	must(err)
 	header := transactions.Header{
 		Fee:         basics.MicroAlgos{Raw: params.MinTxnFee},
@@ -280,10 +314,23 @@ func main() {
 			CloseRemainderTo: acctC,
 		},
 	}
-	gid := crypto.HashObj(transactions.TxGroup{TxGroupHashes: []crypto.Digest{crypto.Digest(t0.ID()), crypto.Digest(t1.ID())}})
+	h2 := header
+	h2.Sender = acctB
+	h2.FirstValid = latest + 1
+	t2 := transactions.Transaction{
+		Type:   protocol.ApplicationCallTx,
+		Header: h2,
+		ApplicationCallTxnFields: transactions.ApplicationCallTxnFields{
+			ApprovalProgram:   closed.Program,
+			ClearStateProgram: clear.Program,
+			Accounts:          []basics.Address{acctA},
+		},
+	}
+	gid := crypto.HashObj(transactions.TxGroup{TxGroupHashes: []crypto.Digest{crypto.Digest(t0.ID()), crypto.Digest(t1.ID()), crypto.Digest(t2.ID())}})
 	t0.Group = gid
 	t1.Group = gid
-	group := []transactions.SignedTxn{{Txn: t0}, {Txn: t1}}
+	t2.Group = gid
+	group := []transactions.SignedTxn{{Txn: t0}, {Txn: t1}, {Txn: t2}}
 	var enc []byte
 	for i := range group {
 		enc = append(enc, protocol.Encode(&group[i])...)

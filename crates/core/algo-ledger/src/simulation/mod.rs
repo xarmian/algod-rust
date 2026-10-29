@@ -64,10 +64,11 @@ use ed25519_dalek::{Signer, SigningKey};
 use crate::apply::{
     apply_transaction_with_budget, check_authorizer, compute_group_fee_credit_and_residue,
     withdraw_block_rewards, ApplyContext, ApplyMode, AvmEvalOverrides, BlockRewardsWithdrawal,
-    BoxBudgetState, GroupInfo, TESTNET_BANK_ADDRESS, TESTNET_OVERSPENT_REWARDS_ROUNDS,
+    BoxBudgetState, GroupInfo, TESTNET_BANK_ADDRESS,
 };
 use crate::avm_context::{NamedGroupResources, StoreSigBlockSource, UnnamedCapacityTracker};
-use crate::rewards::{compute_pending_rewards, next_rewards_state, RewardsState};
+use crate::block_header::make_next_block_header;
+use crate::rewards::{balance_with_rewards, next_rewards_state, RewardsState};
 use crate::store_trait::LedgerStore;
 
 /// Fixed proxy signing key seed (first 32 bytes of go-algorand's `proxySigner`).
@@ -218,6 +219,21 @@ pub struct SimulationRequest {
 ///
 /// Runs transaction groups against a [`LedgerStore`] without committing
 /// changes. Uses snapshot/restore to ensure the store is left unchanged.
+/// The block a simulated group is evaluated in (see
+/// [`Simulator::prepare_simulated_block`]).
+struct SimulatedBlock {
+    /// `start + 1`: `global Round`, the validity window, voter lookups.
+    round: u64,
+    /// The block's protocol, after any upgrade switch.
+    consensus: ConsensusParams,
+    /// `prevHeader.TimeStamp` (`global LatestTimestamp`).
+    latest_timestamp: u64,
+    /// The block's rewards level (`NextRewardsState`).
+    rewards_level: u64,
+    /// The block-start pool withdrawal.
+    withdrawal: BlockRewardsWithdrawal,
+}
+
 pub struct Simulator<'a, L: LedgerStore> {
     /// The ledger store to simulate against.
     store: &'a mut L,
@@ -279,56 +295,71 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         Ok(())
     }
 
-    /// go `eval.StartEvaluator` for the simulated block `round` (built by
-    /// `bookkeeping.MakeBlock(prevHdr)` and evaluated with `Generate: true`,
-    /// `ledger/simulation/simulator.go`): advance the rewards state with
-    /// `prevHdr.NextRewardsState(round, proto, pool balance, prevTotals
-    /// .RewardUnits())`, then withdraw the block's rewards from the pool.
-    /// Returns the rewards level the simulated group runs at.
+    /// The block go's `Simulator.Simulate` evaluates the group in
+    /// (`ledger/simulation/simulator.go`): `bookkeeping.MakeBlock(prevHdr)`
+    /// for `prevHdr = BlockHdr(start)`, round `start + 1`, run through
+    /// `eval.StartEvaluator` with `Generate: true` (`ledger/eval/eval.go`),
+    /// which gives it `prevHdr.NextRewardsState(round, proto,
+    /// pool.WithUpdatedRewards(prevLevel), prevTotals.RewardUnits())` under
+    /// the protocol `MakeBlock` resolved (any upgrade switch applied), and
+    /// withdraws the block's rewards from the pool.
     ///
-    /// The caller's snapshot must cover the rewards pool (and the testnet
-    /// bank on its hotfix rounds).
-    fn start_simulated_block(
-        &mut self,
-        round: u64,
-        consensus: &ConsensusParams,
-    ) -> Result<u64, AlgoError> {
-        let store = &mut *self.store;
-        let prev = RewardsState {
-            rewards_level: store.rewards_level(),
-            rewards_rate: store.rewards_rate(),
-            rewards_residue: store.rewards_residue(),
-            rewards_recalculation_round: store.rewards_recalculation_round(),
+    /// Only reads: the withdrawal itself is applied after `check`.
+    ///
+    /// Without a header for `start` (unit-test stores only; a real ledger
+    /// always has its latest header) the store's chain fields stand in for
+    /// it. The pool and the reward units are the store's latest state: like
+    /// every account read in simulate, a historical `start` reads current
+    /// state rather than state as of `start` (issue #2123).
+    fn prepare_simulated_block(
+        &self,
+        start: Round,
+        prev_hdr: Option<&algo_types::BlockHeader>,
+    ) -> Result<SimulatedBlock, AlgoError> {
+        let store = &*self.store;
+        let round = start.0 + 1;
+        let (prev, pool, consensus, latest_timestamp) =
+            match prev_hdr {
+                Some(hdr) => {
+                    let prev = RewardsState {
+                        rewards_level: hdr.rewards_level,
+                        rewards_rate: hdr.rewards_rate,
+                        rewards_residue: hdr.rewards_residue,
+                        rewards_recalculation_round: hdr.rewards_recalculation_round.0,
+                    };
+                    // The next block's protocol, after `MakeBlock`'s upgrade
+                    // switch (go `config.Consensus[hdr.CurrentProtocol]`).
+                    let next = make_next_block_header(hdr, hdr.timestamp, prev, (Vec::new(), 0))?;
+                    let consensus = consensus_params_for_version(&next.current_protocol)
+                        .ok_or_else(|| AlgoError::Ledger {
+                            message: format!("unknown protocol '{}'", next.current_protocol),
+                        })?;
+                    // `global LatestTimestamp` is `prevHeader.TimeStamp`.
+                    (
+                        prev,
+                        hdr.rewards_pool,
+                        consensus,
+                        hdr.timestamp.max(0) as u64,
+                    )
+                }
+                None => (
+                    RewardsState {
+                        rewards_level: store.rewards_level(),
+                        rewards_rate: store.rewards_rate(),
+                        rewards_residue: store.rewards_residue(),
+                        rewards_recalculation_round: store.rewards_recalculation_round(),
+                    },
+                    store.rewards_pool(),
+                    consensus_params_for_version(store.protocol()).unwrap_or_default(),
+                    0,
+                ),
+            };
+        let pool_balance = match store.get_account(&pool) {
+            Some(acct) => balance_with_rewards(&acct, prev.rewards_level)?,
+            None => 0,
         };
-        let pool = store.rewards_pool();
-        // With no rate refresh due, a zero rate and a zero residue, the state
-        // carries over unchanged whatever the pool balance and reward units
-        // are, so skip both reads.
-        let reads_ledger = round == prev.rewards_recalculation_round
-            || prev.rewards_rate != 0
-            || prev.rewards_residue != 0;
-        let (next, reward_units) = if reads_ledger {
-            // go `LookupWithoutRewards(pool).WithUpdatedRewards(prevLevel)`.
-            let pool_balance = store
-                .get_account(&pool)
-                .map(|acct| {
-                    compute_pending_rewards(&acct, prev.rewards_level)
-                        .saturating_add(acct.micro_algos)
-                })
-                .unwrap_or(0);
-            let totals = store.account_totals();
-            let units = totals
-                .online
-                .reward_units
-                .saturating_add(totals.offline.reward_units);
-            (
-                next_rewards_state(prev, round, consensus, pool_balance, units),
-                units,
-            )
-        } else {
-            (prev, 0)
-        };
-
+        let reward_units = store.total_reward_units()?;
+        let next = next_rewards_state(prev, round, &consensus, pool_balance, reward_units);
         let withdrawal = BlockRewardsWithdrawal {
             round,
             pool,
@@ -338,10 +369,13 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             genesis_hash: *store.genesis_hash(),
             min_balance: consensus.min_balance,
         };
-        // Writes the pool only when it changes (never on a no-rewards chain
-        // such as mainnet); go's `MinBalance` check on the pool always runs.
-        withdraw_block_rewards(store, &withdrawal)?;
-        Ok(next.rewards_level)
+        Ok(SimulatedBlock {
+            round,
+            consensus,
+            latest_timestamp,
+            rewards_level: next.rewards_level,
+            withdrawal,
+        })
     }
 
     /// Simulate the given request and return results.
@@ -410,6 +444,57 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             max_log_size: request.allow_more_logging.then_some(LOG_BYTES_LIMIT),
         };
 
+        // --- Resolve the simulated block ---
+
+        // A requested round that predates the ledger's tracked history is a
+        // distinct failure from "round doesn't exist yet" -- go-algorand's
+        // accountupdates `RoundOffsetError` (`ledger/acctupdates.go`),
+        // surfaced verbatim through `Ledger.BlockHdr`/`trackerDBRound` as
+        // `"round %d before dbRound %d"`, a raw (non-`InvalidRequestError`)
+        // error that the REST handler propagates as a 500
+        // (`daemon/algod/api/server/v2/handlers.go`'s `SimulateTransaction`
+        // only special-cases `simulation.InvalidRequestError` as a 400).
+        // `TestSimulateStartRound` (`test/e2e-go/restAPI/simulate`) pins
+        // this for a follower node whose `dbRound` tracks its sync round --
+        // see [`crate::store_trait::LedgerStore::earliest_round`] for what
+        // this does and doesn't model. Checked ahead of the block-header
+        // lookup below since algod-rust does not actually evict old block
+        // headers (`forget_before` isn't wired into the normal apply path),
+        // so the header would otherwise still resolve.
+        if let Some(requested_round) = request.round {
+            let earliest = self.store.earliest_round();
+            if requested_round < earliest {
+                return Err(SimulatorError::Internal(AlgoError::Ledger {
+                    message: format!("round {} before dbRound {}", requested_round.0, earliest.0),
+                }));
+            }
+        }
+
+        // Fetch block header for consensus params and timestamp
+        let block_hdr = self.store.get_block_header(sim_round.0)?;
+        // An explicitly-requested round with no corresponding block header
+        // does not exist on this ledger (go-algorand: `s.ledger.BlockHdr`
+        // returns "ledger does not have entry N" from `simulatorLedger`'s
+        // embedded `data.Ledger`, propagated as a hard `Simulate` error --
+        // `TestStartRound`'s "1 round in the future" case). Only enforced
+        // when the caller supplied a round: the *default* round
+        // (`store.current_round()`) has no header in many unit tests that
+        // never call `put_block`, and go's own default (`s.ledger.Latest()`)
+        // is guaranteed to resolve on a real ledger, so silently falling
+        // back to the store's declared protocol there preserves existing
+        // behavior instead of newly rejecting it.
+        if request.round.is_some() && block_hdr.is_none() {
+            return Err(SimulatorError::InvalidRequest(InvalidRequestError {
+                message: format!("ledger does not have entry {}", sim_round.0),
+            }));
+        }
+        // go `MakeBlock(prevBlockHdr)` + `StartEvaluator`'s reads (issue
+        // #2118): the block the group is evaluated in, round `start + 1`.
+        let block = self
+            .prepare_simulated_block(sim_round, block_hdr.as_ref())
+            .map_err(SimulatorError::Internal)?;
+        let consensus = block.consensus.clone();
+
         // --- Snapshot the store before simulation ---
 
         // Collect all addresses involved in the transaction group for
@@ -419,7 +504,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         let mut addrs: Vec<Address> = vec![self.store.fee_sink(), self.store.rewards_pool()];
         // The block-start withdrawal moves the testnet bank on go's two
         // `workaroundOverspentRewards` rounds.
-        if TESTNET_OVERSPENT_REWARDS_ROUNDS.contains(&(sim_round.0 + 1)) {
+        if block.withdrawal.is_testnet_hotfix_round() {
             addrs.push(Address(TESTNET_BANK_ADDRESS));
         }
         for stx in txn_group {
@@ -518,59 +603,6 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
 
         // --- Build apply context ---
 
-        // A requested round that predates the ledger's tracked history is a
-        // distinct failure from "round doesn't exist yet" -- go-algorand's
-        // accountupdates `RoundOffsetError` (`ledger/acctupdates.go`),
-        // surfaced verbatim through `Ledger.BlockHdr`/`trackerDBRound` as
-        // `"round %d before dbRound %d"`, a raw (non-`InvalidRequestError`)
-        // error that the REST handler propagates as a 500
-        // (`daemon/algod/api/server/v2/handlers.go`'s `SimulateTransaction`
-        // only special-cases `simulation.InvalidRequestError` as a 400).
-        // `TestSimulateStartRound` (`test/e2e-go/restAPI/simulate`) pins
-        // this for a follower node whose `dbRound` tracks its sync round --
-        // see [`crate::store_trait::LedgerStore::earliest_round`] for what
-        // this does and doesn't model. Checked ahead of the block-header
-        // lookup below since algod-rust does not actually evict old block
-        // headers (`forget_before` isn't wired into the normal apply path),
-        // so the header would otherwise still resolve.
-        if let Some(requested_round) = request.round {
-            let earliest = self.store.earliest_round();
-            if requested_round < earliest {
-                self.store.restore_snapshot(snapshot);
-                return Err(SimulatorError::Internal(AlgoError::Ledger {
-                    message: format!("round {} before dbRound {}", requested_round.0, earliest.0),
-                }));
-            }
-        }
-
-        // Fetch block header for consensus params and timestamp
-        let block_hdr = self.store.get_block_header(sim_round.0)?;
-        // An explicitly-requested round with no corresponding block header
-        // does not exist on this ledger (go-algorand: `s.ledger.BlockHdr`
-        // returns "ledger does not have entry N" from `simulatorLedger`'s
-        // embedded `data.Ledger`, propagated as a hard `Simulate` error --
-        // `TestStartRound`'s "1 round in the future" case). Only enforced
-        // when the caller supplied a round: the *default* round
-        // (`store.current_round()`) has no header in many unit tests that
-        // never call `put_block`, and go's own default (`s.ledger.Latest()`)
-        // is guaranteed to resolve on a real ledger, so silently falling
-        // back to the store's declared protocol there preserves existing
-        // behavior instead of newly rejecting it.
-        if request.round.is_some() && block_hdr.is_none() {
-            self.store.restore_snapshot(snapshot);
-            return Err(SimulatorError::InvalidRequest(InvalidRequestError {
-                message: format!("ledger does not have entry {}", sim_round.0),
-            }));
-        }
-        let consensus = match &block_hdr {
-            Some(hdr) => consensus_params_for_version(&hdr.current_protocol).unwrap_or_default(),
-            None => consensus_params_for_version(self.store.protocol()).unwrap_or_default(),
-        };
-        let latest_timestamp = block_hdr
-            .as_ref()
-            .map(|h| h.timestamp.max(0) as u64)
-            .unwrap_or(0);
-
         // Run validation (signature verification + well-formedness) before
         // execution. When tracing is enabled, `check` also captures logic-sig
         // opcode traces, since LogicSig programs run during signature
@@ -645,31 +677,25 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             )))
         });
 
-        // go `StartEvaluator` with `Generate: true` (issue #2118): the
-        // simulated block carries the next round's rewards state and
-        // withdraws its rewards from the pool before the group runs. go
-        // never starts the evaluator for a group that failed `check`.
-        let rewards_level = if precheck_failure.is_some() {
-            self.store.rewards_level()
-        } else {
-            match self.start_simulated_block(sim_round.0 + 1, &consensus) {
-                Ok(level) => level,
-                Err(e) => {
-                    self.store.restore_snapshot(snapshot);
-                    return Err(SimulatorError::Internal(e));
-                }
+        // go `StartEvaluator`: withdraw the block's rewards from the pool
+        // before the group runs. go never starts the evaluator for a group
+        // that failed `check`.
+        if precheck_failure.is_none() {
+            if let Err(e) = withdraw_block_rewards(&mut *self.store, &block.withdrawal) {
+                self.store.restore_snapshot(snapshot);
+                return Err(SimulatorError::Internal(e));
             }
-        };
+        }
 
         let apply_ctx = ApplyContext {
-            rewards_level,
+            rewards_level: block.rewards_level,
             fee_sink: self.store.fee_sink(),
-            round: sim_round.0,
+            round: block.round,
             mode: ApplyMode::Execute,
             validate: true,
             // go `simulator.go`: `Generate: true, Validate: true`.
             generate: true,
-            latest_timestamp,
+            latest_timestamp: block.latest_timestamp,
             genesis_hash: *self.store.genesis_hash(),
             txn_counter: Cell::new(self.store.txn_counter()),
             fees_collected: Cell::new(0),
@@ -835,7 +861,9 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             // `allow_empty_signatures`, which only relaxes *signature*
             // verification, not this apply-time authorization fact
             // (TestWrongAuthorizerTxn, issue #974).
-            let apply_result = match check_authorizer(self.store, &eval_group[i]) {
+            let apply_result = match txn_alive_in(block.round, &eval_group[i])
+                .and_then(|()| check_authorizer(self.store, &eval_group[i]))
+            {
                 Err(e) => Err(e),
                 Ok(()) => {
                     let group_refs: Vec<&SignedTransaction> = eval_group.iter().collect();
@@ -1563,6 +1591,20 @@ fn set_fixed_auth_addr(stx: &mut SignedTransaction, auth: Address) {
 /// [`fix_unsigned_signers_after_app`] once each app call completes, since
 /// apps can rekey accounts). Mirrors go-algorand's `simulateWithTracer`
 /// (`ledger/simulation/simulator.go:219-260`).
+/// go `BlockHeader.Alive`'s round check (`data/bookkeeping/block.go`), the
+/// first thing `BlockEvaluator.transaction` does under `Validate: true`:
+/// the simulated block's round must lie in the transaction's validity
+/// window. The error text is go's `TxnDeadError`.
+fn txn_alive_in(round: u64, stx: &SignedTransaction) -> Result<(), AlgoError> {
+    let (first, last) = (stx.txn.first_valid.0, stx.txn.last_valid.0);
+    if round < first || round > last {
+        return Err(AlgoError::Ledger {
+            message: format!("txn dead: round {round} outside of {first}--{last}"),
+        });
+    }
+    Ok(())
+}
+
 fn fix_unsigned_signers_pre_eval<L: LedgerStore>(store: &L, group: &mut [SignedTransaction]) {
     let mut static_rekeys: HashMap<Address, Address> = HashMap::new();
     for stx in group.iter_mut() {

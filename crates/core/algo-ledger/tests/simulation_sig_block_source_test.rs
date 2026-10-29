@@ -64,8 +64,8 @@ fn contract_account_address(program: &[u8]) -> Address {
     Address(hasher.finalize().into())
 }
 
-/// A minimal `LedgerState` with a funded fee sink and a seeded block header
-/// at round 9 (`SEEDED_TIMESTAMP`), matching `FirstValid=10`'s
+/// A minimal `LedgerState` with a funded fee sink and a seeded latest block
+/// header at round 9 (`SEEDED_TIMESTAMP`), matching `FirstValid=10`'s
 /// `FirstValidTime` lookback target (`block(FirstValid - 1)`).
 fn base_state() -> LedgerState {
     let mut state = funded_ledger_state();
@@ -82,12 +82,16 @@ fn base_state() -> LedgerState {
     let hdr = BlockHeader {
         round: algo_types::Round(9),
         timestamp: SEEDED_TIMESTAMP,
+        current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
         ..BlockHeader::default()
     };
     let hdrdata = algo_codec::canonical_encode_block_header(&hdr);
     state
-        .put_block(9, "v41", &hdrdata, &[])
+        .put_block(9, &hdr.current_protocol, &hdrdata, &[])
         .expect("seed block header at round 9");
+    // The latest round is 9, so the simulated block is round 10, the first
+    // round `FirstValid = 10` is alive in (go `BlockHeader.Alive`).
+    state.set_current_round(algo_types::Round(9));
 
     state
 }

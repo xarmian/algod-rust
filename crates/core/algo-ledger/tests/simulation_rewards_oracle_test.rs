@@ -29,7 +29,10 @@
 //! with the ledger state it ran against; this test seeds that state and
 //! asserts the same ApplyData rewards (`rs`/`rr`/`rc`), closing amount and
 //! AVM-visible balances (`balance`, `min_balance`, `acct_params_get`,
-//! including the rewards pool after the block-start withdrawal).
+//! including the rewards pool after the block-start withdrawal). The last
+//! transaction is valid only from the simulated block's round (`start + 1`)
+//! and logs `global Round` and `acct_params_get`'s `exists` flag for the
+//! account the group just closed.
 
 use std::path::PathBuf;
 
@@ -92,6 +95,7 @@ struct Oracle {
     next_rewards_state: OracleRewardsState,
     reward_units: u64,
     accounts: Vec<OracleAccount>,
+    prev_header: String,
     group_msgpack: String,
     last_round: u64,
     failure_message: String,
@@ -130,6 +134,11 @@ fn seed_state(o: &Oracle) -> LedgerState {
     state.rewards_rate = o.rewards_state.rewards_rate;
     state.rewards_residue = o.rewards_state.rewards_residue;
     state.rewards_recalculation_round = o.rewards_state.rewards_recalculation_round;
+    // go's header for the latest round: `Simulate` builds the simulated
+    // block from it (`MakeBlock(prevBlockHdr)`).
+    state
+        .put_block(o.round, &o.protocol, &b64(&o.prev_header), &[])
+        .expect("store the latest header");
     for a in &o.accounts {
         let status = match a.status.as_str() {
             "Online" => AccountStatus::Online,
@@ -226,8 +235,7 @@ fn simulate_uses_next_rewards_state_like_go() {
             .collect();
         assert_eq!(
             logs, want.logs,
-            "txn {i} logs: balance(A), min_balance(A), AcctBalance(pool), \
-             AcctBalance(A), balance(B)"
+            "txn {i} logs (each program is in tools/simulate-rewards-oracle)"
         );
     }
 }

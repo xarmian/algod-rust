@@ -5340,16 +5340,8 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// An account's balance as the AVM sees it: go `roundCowState.AccountData`
     /// (`ledger/eval/applications.go`) is `Get(addr, true)`, the account
     /// with its pending rewards at the block's rewards level (issue #2118).
-    /// A base at or above the level (only in synthetic test states) has none.
-    fn micro_algos_with_rewards(&self, acct: &algo_types::AccountData) -> u64 {
-        if acct.rewards_base >= self.rewards_level {
-            return acct.micro_algos;
-        }
-        acct.micro_algos
-            .saturating_add(crate::rewards::compute_pending_rewards(
-                acct,
-                self.rewards_level,
-            ))
+    fn micro_algos_with_rewards(&self, acct: &algo_types::AccountData) -> Result<u64, AlgoError> {
+        crate::rewards::balance_with_rewards(acct, self.rewards_level)
     }
 
     /// Compute the fee-credit-aware default fee for a new sub-transaction
@@ -6009,11 +6001,10 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     fn balance(&self, account: &[u8; 32]) -> Result<u64, AlgoError> {
         self.note_account_access(account);
         let addr = Address(*account);
-        Ok(self
-            .store
-            .get_account(&addr)
-            .map(|a| self.micro_algos_with_rewards(&a))
-            .unwrap_or(0))
+        match self.store.get_account(&addr) {
+            Some(a) => self.micro_algos_with_rewards(&a),
+            None => Ok(0),
+        }
     }
 
     fn min_balance(&self, account: &[u8; 32]) -> Result<u64, AlgoError> {
@@ -6200,54 +6191,56 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     ) -> Result<(TealValue, bool), AlgoError> {
         self.note_account_access(account);
         let addr = Address(*account);
-        match self.store.get_account(&addr) {
-            Some(acct) => {
-                let val = match field {
-                    // AcctBalance
-                    0 => TealValue::Uint(self.micro_algos_with_rewards(&acct)),
-                    // AcctMinBalance
-                    1 => TealValue::Uint(self.store.min_balance_with_state(&addr, &acct)),
-                    // AcctAuthAddr
-                    2 => TealValue::Bytes(
-                        acct.auth_addr
-                            .as_ref()
-                            .map(|a| a.0.to_vec())
-                            .unwrap_or_else(|| vec![0u8; 32]),
-                    ),
-                    // AcctTotalNumUint
-                    3 => TealValue::Uint(acct.total_app_schema.num_uint),
-                    // AcctTotalNumByteSlice
-                    4 => TealValue::Uint(acct.total_app_schema.num_byte_slice),
-                    // AcctTotalExtraAppPages
-                    5 => TealValue::Uint(acct.total_extra_app_pages as u64),
-                    // AcctTotalAppsCreated
-                    6 => TealValue::Uint(acct.total_created_apps),
-                    // AcctTotalAppsOptedIn
-                    7 => TealValue::Uint(acct.total_apps_opted_in),
-                    // AcctTotalAssetsCreated
-                    8 => TealValue::Uint(acct.total_created_assets),
-                    // AcctTotalAssets
-                    9 => TealValue::Uint(acct.total_assets_opted_in),
-                    // AcctTotalBoxes
-                    10 => TealValue::Uint(acct.total_boxes),
-                    // AcctTotalBoxBytes
-                    11 => TealValue::Uint(acct.total_box_bytes),
-                    // AcctIncentiveEligible
-                    12 => TealValue::Uint(acct.incentive_eligible as u64),
-                    // AcctLastProposed
-                    13 => TealValue::Uint(acct.last_proposed),
-                    // AcctLastHeartbeat
-                    14 => TealValue::Uint(acct.last_heartbeat),
-                    _ => {
-                        return Err(AlgoError::Avm {
-                            message: format!("unknown AcctParamsField index: {field}"),
-                        })
-                    }
-                };
-                Ok((val, true))
+        // go `opAcctParamsGet` (`data/transactions/logic/eval.go`): every
+        // field comes from `AccountData(addr)` (the zero value for an absent
+        // account, pending rewards applied), and `exists` is
+        // `account.MicroAlgos.Raw > 0` on that balance -- false for an
+        // account a close emptied, even if a record is left behind.
+        let acct = self.store.get_account(&addr).unwrap_or_default();
+        let balance = self.micro_algos_with_rewards(&acct)?;
+        let val = match field {
+            // AcctBalance
+            0 => TealValue::Uint(balance),
+            // AcctMinBalance
+            1 => TealValue::Uint(self.store.min_balance_with_state(&addr, &acct)),
+            // AcctAuthAddr
+            2 => TealValue::Bytes(
+                acct.auth_addr
+                    .as_ref()
+                    .map(|a| a.0.to_vec())
+                    .unwrap_or_else(|| vec![0u8; 32]),
+            ),
+            // AcctTotalNumUint
+            3 => TealValue::Uint(acct.total_app_schema.num_uint),
+            // AcctTotalNumByteSlice
+            4 => TealValue::Uint(acct.total_app_schema.num_byte_slice),
+            // AcctTotalExtraAppPages
+            5 => TealValue::Uint(acct.total_extra_app_pages as u64),
+            // AcctTotalAppsCreated
+            6 => TealValue::Uint(acct.total_created_apps),
+            // AcctTotalAppsOptedIn
+            7 => TealValue::Uint(acct.total_apps_opted_in),
+            // AcctTotalAssetsCreated
+            8 => TealValue::Uint(acct.total_created_assets),
+            // AcctTotalAssets
+            9 => TealValue::Uint(acct.total_assets_opted_in),
+            // AcctTotalBoxes
+            10 => TealValue::Uint(acct.total_boxes),
+            // AcctTotalBoxBytes
+            11 => TealValue::Uint(acct.total_box_bytes),
+            // AcctIncentiveEligible
+            12 => TealValue::Uint(acct.incentive_eligible as u64),
+            // AcctLastProposed
+            13 => TealValue::Uint(acct.last_proposed),
+            // AcctLastHeartbeat
+            14 => TealValue::Uint(acct.last_heartbeat),
+            _ => {
+                return Err(AlgoError::Avm {
+                    message: format!("unknown AcctParamsField index: {field}"),
+                })
             }
-            None => Ok((TealValue::Uint(0), false)),
-        }
+        };
+        Ok((val, balance > 0))
     }
 
     // ---- Logging ----
@@ -10775,6 +10768,68 @@ mod tests {
         let (val, exists) = ctx.acct_params_get(&[99u8; 32], 0).unwrap();
         assert!(!exists);
         assert_eq!(val, TealValue::Uint(0));
+    }
+
+    /// Issue #2118: go `opAcctParamsGet` pushes `exists =
+    /// account.MicroAlgos.Raw > 0`, so a record a close left behind with a
+    /// zero balance does not exist, and an absent account still reports the
+    /// zero value's fields (its `MinBalance`, the zero `AuthAddr`).
+    #[test]
+    fn acct_params_get_exists_is_a_positive_balance() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        store.set_account(
+            &Address([98u8; 32]),
+            AccountData {
+                status: algo_types::AccountStatus::Offline,
+                ..Default::default()
+            },
+        );
+        let ctx = make_context(&mut store, vec![txn]);
+        for addr in [[98u8; 32], [99u8; 32]] {
+            let (val, exists) = ctx.acct_params_get(&addr, 0).unwrap();
+            assert_eq!((val, exists), (TealValue::Uint(0), false));
+            let (val, exists) = ctx.acct_params_get(&addr, 1).unwrap();
+            assert_eq!(
+                (val, exists),
+                (TealValue::Uint(ctx.consensus.min_balance), false)
+            );
+            let (val, _) = ctx.acct_params_get(&addr, 2).unwrap();
+            assert_eq!(val, TealValue::Bytes(vec![0u8; 32]));
+        }
+    }
+
+    /// Issue #2118: the AVM reads balances with pending rewards (go
+    /// `Get(addr, true)`); a rewards base above the block's level is go's
+    /// `WithUpdatedRewards` overflow panic, an eval error here.
+    #[test]
+    fn balance_includes_pending_rewards_and_rejects_a_base_above_the_level() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        let (behind, ahead) = (Address([97u8; 32]), Address([96u8; 32]));
+        store.set_account(
+            &behind,
+            AccountData {
+                status: algo_types::AccountStatus::Offline,
+                micro_algos: 5_000_000,
+                rewards_base: 90,
+                ..Default::default()
+            },
+        );
+        store.set_account(
+            &ahead,
+            AccountData {
+                status: algo_types::AccountStatus::Offline,
+                micro_algos: 5_000_000,
+                rewards_base: 101,
+                ..Default::default()
+            },
+        );
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.rewards_level = 100;
+        assert_eq!(ctx.balance(&behind.0).unwrap(), 5_000_000 + 5 * 10);
+        assert!(ctx.balance(&ahead.0).is_err());
+        assert!(ctx.acct_params_get(&ahead.0, 0).is_err());
     }
 
     // ---- voter_params_get / online_stake tests (issue #1215) ----

@@ -3929,13 +3929,10 @@ impl PoolLedgerAdapter {
         // Without this the evaluator would carry the previous header verbatim
         // (wrong round/branch and a stale rewards level).
         let next_round = hdr.round.0 + 1;
-        let pool_balance = snapshot
-            .get_account(&hdr.rewards_pool, &self.ledger)
-            .map(|acct| {
-                algo_ledger::compute_pending_rewards(&acct, hdr.rewards_level)
-                    .saturating_add(acct.micro_algos)
-            })
-            .unwrap_or(0);
+        let pool_balance = match snapshot.get_account(&hdr.rewards_pool, &self.ledger) {
+            Some(acct) => algo_ledger::rewards::balance_with_rewards(&acct, hdr.rewards_level)?,
+            None => 0,
+        };
         let (total_reward_units, voters_tracking) = {
             let l = self
                 .ledger

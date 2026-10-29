@@ -2600,8 +2600,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
     let prev_reward_units = if pool_withdrawn || block.rewards_level == prev_rewards_level {
         0
     } else {
-        let t = store.account_totals();
-        t.online.reward_units.saturating_add(t.offline.reward_units)
+        store.account_totals().reward_units()
     };
 
     // Update rewards state and reward addresses from block header.

@@ -343,6 +343,10 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
         self.inner.account_totals()
     }
 
+    fn total_reward_units(&self) -> Result<u64, algo_error::AlgoError> {
+        self.inner.total_reward_units()
+    }
+
     // ---- Chain-level state (setters) ----
 
     fn set_current_round(&mut self, round: Round) {

@@ -7850,6 +7850,10 @@ impl LedgerStore for SqliteLedger {
         SqliteLedger::account_totals(self)
     }
 
+    fn total_reward_units(&self) -> Result<u64, AlgoError> {
+        SqliteLedger::total_reward_units(self)
+    }
+
     // ---- Chain-level state (setters) ----
 
     fn set_current_round(&mut self, round: Round) {

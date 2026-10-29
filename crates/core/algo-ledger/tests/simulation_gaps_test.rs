@@ -2492,10 +2492,11 @@ fn simple_group_txn() {
     assert_eq!(state.get_account(&sender2).unwrap().micro_algos, 20_000_000);
 }
 
-/// Port of `TestStartRound`: `request.round` selects which historical round
-/// an app call's `global Round` opcode observes; the default (no round
-/// given) uses the current round; a round past the ledger's tip is
-/// rejected.
+/// Port of `TestStartRound`: `request.round` selects the round the
+/// simulated block builds on, and an app call's `global Round` observes the
+/// simulated block, `start + 1` (go asserts `latestRound+1` and
+/// `latestRound-i+1`, issue #2118); the default (no round given) builds on
+/// the current round; a round past the ledger's tip is rejected.
 #[test]
 fn start_round_selection() {
     let sender = Address([0xAA; 32]);
@@ -2560,11 +2561,11 @@ int 1
         u64::from_be_bytes(logs[0].as_slice().try_into().unwrap())
     };
 
-    // Default: uses the current (latest) round.
-    assert_eq!(read_round(&mut state, None), 3);
+    // Default: builds on the current (latest) round.
+    assert_eq!(read_round(&mut state, None), 4);
     // Explicit historical rounds.
-    assert_eq!(read_round(&mut state, Some(Round(2))), 2);
-    assert_eq!(read_round(&mut state, Some(Round(1))), 1);
+    assert_eq!(read_round(&mut state, Some(Round(2))), 3);
+    assert_eq!(read_round(&mut state, Some(Round(1))), 2);
 
     // A round past the ledger's tip must be rejected.
     let request = SimulationRequest {
@@ -2581,6 +2582,120 @@ int 1
         SimulatorError::Internal(_) | SimulatorError::InvalidRequest(_) => {}
         other => panic!("expected an error rejecting the future round, got {other:?}"),
     }
+}
+
+/// Issue #2118: the simulated block runs under the protocol go's
+/// `MakeBlock(prevBlockHdr)` resolves, i.e. after an upgrade switch due at
+/// `start + 1` (`StartEvaluator` reads `config.Consensus[hdr.CurrentProtocol]`
+/// of the new block). A v13 program is beyond v41's `LogicSigVersion` (12)
+/// but allowed by v42's (13), so it runs only once the switch is honoured.
+#[test]
+fn simulate_runs_under_the_protocol_after_an_upgrade_switch() {
+    let sender = Address([0xAA; 32]);
+    let app_id = 1001u64;
+    // `#pragma version 13; pushint 1`
+    let approval = vec![0x0d, 0x81, 0x01];
+    let clear = vec![0x0d, 0x81, 0x01];
+    let run = |switch_on: u64| {
+        let mut state = base_state();
+        fund(&mut state, sender, 20_000_000);
+        register_app(
+            &mut state,
+            sender,
+            app_id,
+            approval.clone(),
+            clear.clone(),
+            StateSchema::default(),
+            StateSchema::default(),
+        );
+        let hdr = algo_types::BlockHeader {
+            round: Round(5),
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            next_protocol: algo_types::consensus::CONSENSUS_V42.to_string(),
+            next_protocol_switch_on: Round(switch_on),
+            ..Default::default()
+        };
+        let hdr_bytes = algo_codec::canonical_encode_block_header(&hdr);
+        state
+            .put_block(5, &hdr.current_protocol, &hdr_bytes, &[])
+            .expect("put_block succeeds");
+        state.set_current_round(Round(5));
+        let request = SimulationRequest {
+            txn_groups: vec![vec![SignedTransaction {
+                txn: appl_txn(sender, app_id, 0),
+                ..Default::default()
+            }]],
+            allow_empty_signatures: true,
+            ..Default::default()
+        };
+        simulate(&mut state, request)
+            .expect("simulate")
+            .txn_groups
+            .remove(0)
+            .failure_message
+    };
+    // The switch is due in the simulated block (round 6): v42 applies.
+    assert_eq!(run(6), None);
+    // The switch is a round later: the block still runs v41.
+    let failure = run(7).expect("a v13 program must fail under v41");
+    assert!(failure.contains("version"), "{failure}");
+}
+
+/// Issue #2118: the simulated block is round `start + 1`, and go's
+/// `BlockEvaluator.transaction` (`Validate: true`) rejects a transaction
+/// whose validity window excludes it with `BlockHeader.Alive`'s
+/// `TxnDeadError` ("txn dead: round %d outside of %d--%d"). A transaction
+/// valid only from `start + 1` runs; one that expired at `start` fails.
+#[test]
+fn simulate_checks_the_validity_window_at_the_simulated_round() {
+    let sender = Address([0xAA; 32]);
+    let receiver = Address([0xBB; 32]);
+    let mut state = base_state();
+    fund(&mut state, sender, 20_000_000);
+    let hdr = algo_types::BlockHeader {
+        round: Round(5),
+        current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+        ..Default::default()
+    };
+    let hdr_bytes = algo_codec::canonical_encode_block_header(&hdr);
+    state
+        .put_block(5, &hdr.current_protocol, &hdr_bytes, &[])
+        .expect("put_block succeeds");
+    state.set_current_round(Round(5));
+    let mut pay = |first: u64, last: u64| {
+        let txn = Transaction {
+            txn_type: "pay".into(),
+            sender,
+            receiver,
+            amount: 200_000,
+            fee: 1000,
+            first_valid: first.into(),
+            last_valid: last.into(),
+            ..Default::default()
+        };
+        simulate(
+            &mut state,
+            SimulationRequest {
+                txn_groups: vec![vec![SignedTransaction {
+                    txn,
+                    ..Default::default()
+                }]],
+                allow_empty_signatures: true,
+                ..Default::default()
+            },
+        )
+        .expect("simulate")
+        .txn_groups
+        .remove(0)
+    };
+    assert_eq!(pay(6, 100).failure_message, None);
+    let expired = pay(1, 5);
+    let failure = expired.failure_message.expect("an expired txn must fail");
+    assert!(
+        failure.contains("txn dead: round 6 outside of 1--5"),
+        "{failure}"
+    );
+    assert_eq!(expired.failed_at, Some(vec![0]));
 }
 
 /// Port of `TestSimulateStartRound`

@@ -132,6 +132,31 @@ pub fn apply_rewards(account: &mut AccountData, rewards_level: u64) -> u64 {
     pending
 }
 
+/// An account's balance with its pending rewards at `rewards_level`: the
+/// `MicroAlgos` of go's `basics.WithUpdatedRewards` (`data/basics/userBalance.go`),
+/// which is what `roundCowState.Get(addr, true)` returns. A NotParticipating
+/// account is unchanged. A rewards base above the level, or an overflowing
+/// balance, is go's `OverflowTracker` panic; here it is an error.
+pub fn balance_with_rewards(
+    account: &AccountData,
+    rewards_level: u64,
+) -> Result<u64, algo_error::AlgoError> {
+    if account.status == AccountStatus::NotParticipating {
+        return Ok(account.micro_algos);
+    }
+    let units = account.micro_algos / REWARD_UNITS;
+    rewards_level
+        .checked_sub(account.rewards_base)
+        .and_then(|delta| units.checked_mul(delta))
+        .and_then(|rewards| account.micro_algos.checked_add(rewards))
+        .ok_or_else(|| algo_error::AlgoError::Ledger {
+            message: format!(
+                "AccountData.WithUpdatedRewards(): overflowed account balance when applying rewards {} + {}*({}-{})",
+                account.micro_algos, units, rewards_level, account.rewards_base
+            ),
+        })
+}
+
 /// The reward-relevant portion of a block header that advances via the rewards
 /// schedule, mirroring the calculation inputs/outputs of go-algorand's
 /// `bookkeeping.RewardsState.NextRewardsState`. `fee_sink`/`rewards_pool` are

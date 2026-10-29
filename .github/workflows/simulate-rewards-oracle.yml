@@ -44,10 +44,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Install Go toolchain
+      - name: Clone go-algorand
+        run: |
+          set -euo pipefail
+          # Sibling of the checkout: the tool's go.mod `replace` resolves
+          # go-algorand at ../../../go-algorand, the local-dev convention.
+          git clone --depth 1 --branch "$GO_ALGORAND_REV" \
+            https://github.com/algorand/go-algorand.git \
+            "$(dirname "$GITHUB_WORKSPACE")/go-algorand"
+          grep -E '^(go|toolchain) ' "$(dirname "$GITHUB_WORKSPACE")/go-algorand/go.mod"
+
+      - name: Install Go per go-algorand's go.mod
         uses: actions/setup-go@v7
         with:
-          go-version: stable
+          go-version-file: ${{ github.workspace }}/../go-algorand/go.mod
+          cache-dependency-path: tools/simulate-rewards-oracle/go.sum
 
       - name: Build go-algorand's libsodium fork
         run: |
@@ -55,11 +66,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             autoconf automake libtool build-essential
-          # Sibling of the checkout: the tool's go.mod `replace` resolves
-          # go-algorand at ../../../go-algorand, the local-dev convention.
-          git clone --depth 1 --branch "$GO_ALGORAND_REV" \
-            https://github.com/algorand/go-algorand.git \
-            "$(dirname "$GITHUB_WORKSPACE")/go-algorand"
           cd "$(dirname "$GITHUB_WORKSPACE")/go-algorand"
           make libsodium
 

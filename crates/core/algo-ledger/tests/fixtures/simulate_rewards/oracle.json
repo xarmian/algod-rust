@@ -57,7 +57,8 @@
       "rewarded_micro_algos": 0
     }
   ],
-  "group_msgpack": "gaN0eG6LpGFwYXDEJAo2HAFgFrA2HAF4FrA2HAJzAEQWsDYcAXMARBawMQBgFrCBAaRhcGF0ksQgCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgrEIO7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7upGFwc3XEAwqBAaNmZWXNA+iiZnYBo2dlbrpzaW11bGF0ZS1yZXdhcmRzLW9yYWNsZS12MaJnaMQg+jfj3EXJuFaV97Eb9/JVdtXkA8yybbKnwyRo3AKk9eSjZ3JwxCBpLesceKv2uEC1et+qeZ6vluV3j/At2ZArN1XcEOwKVKJsds0D6KNzbmTEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLpHR5cGWkYXBwbIGjdHhui6NhbXTOAA9CQKVjbG9zZcQgDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAyjZmVlzQPoomZ2AaNnZW66c2ltdWxhdGUtcmV3YXJkcy1vcmFjbGUtdjGiZ2jEIPo349xFybhWlfexG/fyVXbV5APMsm2yp8MkaNwCpPXko2dycMQgaS3rHHir9rhAtXrfqnmer5bld4/wLdmQKzdV3BDsClSibHbNA+ijcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEIAoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKpHR5cGWjcGF5",
+  "prev_header": "3gATomJpzgCYloCkZWFybs4ADy7QpGZlZXPEIP7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+pGZyYWPNBuCjZ2VuunNpbXVsYXRlLXJld2FyZHMtb3JhY2xlLXYxomdoxCD6N+PcRcm4VpX3sRv38lV21eQDzLJtsqfDJGjcAqT15KJwcM4ADbugpHByZXbEIJXvPmEg9pwXCsZiLHLpyN68hc9T9G7ZLoPCPuTOIGMgp3ByZXY1MTLEQPQKn/FfQ4Wy14/FY6tCA7hiMvqy8Xv8qPWi0PvzIPjn6bQ/L4l8DdwpOG1wMWudNNEQf1cVku6/jUxaBhI/I+6lcHJvdG/ZWWh0dHBzOi8vZ2l0aHViLmNvbS9hbGdvcmFuZGZvdW5kYXRpb24vc3BlY3MvdHJlZS83M2M0M2I0YTk2OTkzOTA4ODRjNTFlMmE5NTk4ZDQ5ZTI4MzczZDEwpHJhdGXOO5rKAKNybmQCpnJ3Y2Fscs4AB6Ego3J3ZMQg7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u6jc3B0gQCBoW7NAgCidGPNA+iidHPOZVPxCqZ0eG4yNTbEIB0J9vojI1iBUU2g5fj3iXZ+ayjnIfqLajCufxmqPqbnpnR4bjUxMsRA6pLkvdh1oF4mqCLDG6u3mSTUQWNNpCiN6idrSokhIPMraS11+/duMXXv+F0rooRAARrPTSDD6vvxRKVzecgTog==",
+  "group_msgpack": "gaN0eG6LpGFwYXDEJAo2HAFgFrA2HAF4FrA2HAJzAEQWsDYcAXMARBawMQBgFrCBAaRhcGF0ksQgCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgrEIO7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7upGFwc3XEAwqBAaNmZWXNA+iiZnYBo2dlbrpzaW11bGF0ZS1yZXdhcmRzLW9yYWNsZS12MaJnaMQg+jfj3EXJuFaV97Eb9/JVdtXkA8yybbKnwyRo3AKk9eSjZ3JwxCD3zzMv44MOuSI+9IWyyxoeE3jDHbAWuouYUP5t/TQav6Jsds0D6KNzbmTEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLpHR5cGWkYXBwbIGjdHhui6NhbXTOAA9CQKVjbG9zZcQgDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAyjZmVlzQPoomZ2AaNnZW66c2ltdWxhdGUtcmV3YXJkcy1vcmFjbGUtdjGiZ2jEIPo349xFybhWlfexG/fyVXbV5APMsm2yp8MkaNwCpPXko2dycMQg988zL+ODDrkiPvSFsssaHhN4wx2wFrqLmFD+bf00Gr+ibHbNA+ijcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEIAoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKpHR5cGWjcGF5gaN0eG6LpGFwYXDEHwo2HAFzABawFrA2HAFzARawFrA2HAFgFrAyBhawgQGkYXBhdJHEIAoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKpGFwc3XEAwqBAaNmZWXNA+iiZnYDo2dlbrpzaW11bGF0ZS1yZXdhcmRzLW9yYWNsZS12MaJnaMQg+jfj3EXJuFaV97Eb9/JVdtXkA8yybbKnwyRo3AKk9eSjZ3JwxCD3zzMv44MOuSI+9IWyyxoeE3jDHbAWuouYUP5t/TQav6Jsds0D6KNzbmTEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLpHR5cGWkYXBwbA==",
   "last_round": 2,
   "failure_message": "",
   "txns": [
@@ -82,6 +83,21 @@
       "closing_amount": 2491536000,
       "application_id": 0,
       "logs": []
+    },
+    {
+      "sender_rewards": 0,
+      "receiver_rewards": 0,
+      "close_rewards": 0,
+      "closing_amount": 0,
+      "application_id": 1003,
+      "logs": [
+        0,
+        0,
+        0,
+        100000,
+        0,
+        3
+      ]
     }
   ]
 }
