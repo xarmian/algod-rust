@@ -45,7 +45,7 @@ pub use trace::{
 pub use tracer::SimulationTracer;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -892,6 +892,27 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         let group_txid_cache = crate::avm_context::GroupTxidCache::default();
         let group_created = crate::apply::GroupCreatedResources::default();
 
+        // go `checkDup`'s inputs: each transaction's txid (`fix_signers`
+        // only changes `auth_addr`, which the txid does not cover) and which
+        // of them a committed block already holds. Skipped when `check`
+        // failed, because go never evaluates then.
+        let txids: Vec<algo_types::Digest> = eval_group
+            .iter()
+            .map(|stx| algo_codec::compute_txn_id(&stx.txn))
+            .collect();
+        let in_ledger = if precheck_failure.is_none() {
+            txids_in_ledger(
+                &*self.store,
+                &eval_group,
+                &txids,
+                block.round,
+                apply_ctx.consensus.max_txn_life,
+            )
+            .map_err(SimulatorError::Internal)?
+        } else {
+            HashSet::new()
+        };
+
         for i in 0..eval_group.len() {
             if precheck_failure.is_some() {
                 // `check()` already failed at a known index -- evaluation
@@ -935,11 +956,10 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             // (TestWrongAuthorizerTxn, issue #974).
             // Part of go `BlockEvaluator.transaction` under `Validate: true`:
             // `BlockHeader.Alive` (validity window, genesis ID and hash),
-            // then the authorizer. Its `checkDup` duplicate-txid half is not
-            // ported yet (issue #2125); the lease half is `apply`'s
-            // `check_lease`. go's simulate reports the `Alive` error text
-            // bare (`EvalFailureError` wraps it without a prefix), hence
-            // `Rejected`, whose display is the message itself.
+            // then `checkDup` (a duplicate txid or a live lease, issue
+            // #2125), then the authorizer. go's simulate reports these error
+            // texts bare (`EvalFailureError` wraps them without a prefix),
+            // hence `Rejected`, whose display is the message itself.
             let alive = algo_validate::block_alive(
                 block.round,
                 &block.block_genesis_id,
@@ -952,31 +972,43 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 message,
                 class: algo_error::RejectClass::Other,
             });
-            let apply_result =
-                match alive.and_then(|()| check_authorizer(self.store, &eval_group[i])) {
-                    Err(e) => Err(e),
-                    Ok(()) => {
-                        let group_refs: Vec<&SignedTransaction> = eval_group.iter().collect();
-                        let gi = GroupInfo {
-                            txns: &group_refs,
-                            index: i,
-                            ran_program: &ran_program,
-                            scratch: &scratch,
-                            txid_cache: &group_txid_cache,
-                            created: &group_created,
-                        };
-                        apply_transaction_with_budget(
-                            self.store,
-                            &eval_group[i],
-                            &apply_ctx,
-                            0,
-                            Some(&mut group_budget),
-                            Some(&mut group_box_budget),
-                            Some(&gi),
-                            Some(&mut tracer),
-                        )
-                    }
-                };
+            let checked = alive
+                .and_then(|()| {
+                    check_dup(
+                        &*self.store,
+                        &apply_ctx.consensus,
+                        block.round,
+                        &eval_group[i],
+                        txids[i],
+                        &txids[..i],
+                        &in_ledger,
+                    )
+                })
+                .and_then(|()| check_authorizer(self.store, &eval_group[i]));
+            let apply_result = match checked {
+                Err(e) => Err(e),
+                Ok(()) => {
+                    let group_refs: Vec<&SignedTransaction> = eval_group.iter().collect();
+                    let gi = GroupInfo {
+                        txns: &group_refs,
+                        index: i,
+                        ran_program: &ran_program,
+                        scratch: &scratch,
+                        txid_cache: &group_txid_cache,
+                        created: &group_created,
+                    };
+                    apply_transaction_with_budget(
+                        self.store,
+                        &eval_group[i],
+                        &apply_ctx,
+                        0,
+                        Some(&mut group_budget),
+                        Some(&mut group_box_budget),
+                        Some(&gi),
+                        Some(&mut tracer),
+                    )
+                }
+            };
             // Per-transaction app budget consumed = the sum of every approval /
             // clear-state program cost under this txn, including inner app calls,
             // accumulated by the tracer (go-algorand rolls each program's
@@ -1735,6 +1767,94 @@ fn fix_unsigned_signers_after_app<L: LedgerStore>(
             }
         }
     }
+}
+
+/// The txids of `txids` that a committed block already holds, read from the
+/// ledger's txtail rows: go's `txTail.checkDup` lookup (`ledger/txtail.go`).
+///
+/// A transaction committed in round `r` passed `Alive` there, so
+/// `first_valid <= r`; and the group can only pass `Alive` and `WellFormed`
+/// in `sim_round` if `first_valid >= sim_round - MaxTxnLife`. The scan
+/// therefore covers `[max(min first_valid, sim_round - MaxTxnLife, 1),
+/// latest]`, usually a handful of rounds. A missing or undecodable row adds
+/// no txids, as in `TxTailDupCache::sync`.
+fn txids_in_ledger<L: LedgerStore>(
+    store: &L,
+    group: &[SignedTransaction],
+    txids: &[algo_types::Digest],
+    sim_round: u64,
+    max_txn_life: u64,
+) -> Result<HashSet<algo_types::Digest>, AlgoError> {
+    let mut found = HashSet::new();
+    let Some(min_first_valid) = group.iter().map(|stx| stx.txn.first_valid.0).min() else {
+        return Ok(found);
+    };
+    let lo = min_first_valid
+        .max(sim_round.saturating_sub(max_txn_life))
+        .max(1);
+    for round in lo..=store.current_round().0 {
+        let Some(bytes) = store.get_txtail(round)? else {
+            continue;
+        };
+        let Ok(tail) = rmp_serde::from_slice::<algo_types::TxTailRound>(&bytes) else {
+            continue;
+        };
+        for id in &tail.txn_ids {
+            if let Ok(id) = <[u8; 32]>::try_from(id.as_ref()) {
+                let id = algo_types::Digest(id);
+                if txids.contains(&id) {
+                    found.insert(id);
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// go `cow.checkDup` (`ledger/eval/cow.go`, then `txTail.checkDup`), as
+/// `BlockEvaluator.transaction` runs it under `Validate: true`: the group's
+/// own earlier txids, then the lease, then the ledger's txids.
+///
+/// The lease half reads the store's lease table, which holds both the
+/// committed leases and the ones earlier group members recorded, so it
+/// covers go's in-block and ledger lease checks alike. go's simulate reports
+/// both error texts bare, hence `Rejected`.
+fn check_dup<L: LedgerStore>(
+    store: &L,
+    consensus: &ConsensusParams,
+    round: u64,
+    stx: &SignedTransaction,
+    txid: algo_types::Digest,
+    earlier_in_group: &[algo_types::Digest],
+    in_ledger: &HashSet<algo_types::Digest>,
+) -> Result<(), AlgoError> {
+    let rejected = |message: String| AlgoError::Rejected {
+        source: None,
+        message,
+        class: algo_error::RejectClass::Other,
+    };
+    // go `ledgercore.TransactionInLedgerError`.
+    let in_ledger_error = || rejected(format!("transaction already in ledger: {txid}"));
+    if earlier_in_group.contains(&txid) {
+        return Err(in_ledger_error());
+    }
+    let txn = &stx.txn;
+    if consensus.support_transaction_leases
+        && txn.lease != [0u8; 32]
+        && store.check_lease(&txn.sender, &txn.lease, round).is_err()
+    {
+        // go `ledgercore.LeaseInLedgerError`, which prints the lease as an
+        // address.
+        return Err(rejected(format!(
+            "transaction {txid} using an overlapping lease (sender, lease):({}, {})",
+            txn.sender,
+            Address(txn.lease)
+        )));
+    }
+    if in_ledger.contains(&txid) {
+        return Err(in_ledger_error());
+    }
+    Ok(())
 }
 
 /// Merge a logic-sig trace captured during `check()` into the execution-phase

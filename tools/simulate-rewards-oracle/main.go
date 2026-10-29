@@ -45,6 +45,9 @@
 // result to tests/fixtures/simulate_rewards/oracle.json. The Rust side is
 // crates/core/algo-ledger/tests/simulation_rewards_oracle_test.rs.
 //
+// The same run also writes the issue #2125 duplicate-txid / lease oracle,
+// tests/fixtures/simulate_checkdup/oracle.json (see checkdup.go).
+//
 // Regenerate (needs cgo + the vendored libsodium: `make libsodium` in the
 // go-algorand checkout first):
 //
@@ -368,4 +371,7 @@ func main() {
 	must(err)
 	must(os.WriteFile(out, append(js, '\n'), 0o644))
 	fmt.Println("wrote", out)
+
+	// The issue #2125 oracle (checkdup.go) shares this module.
+	checkDupOracle()
 }
