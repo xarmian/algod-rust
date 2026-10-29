@@ -557,9 +557,11 @@ impl ParticipateAgreementControl {
                 None
             }
         };
-        // Stateless validation plus go's `validateForPayouts` against the
-        // committed ledger (issue #1798): a peer proposal's FeesCollected /
-        // Proposer / ProposerPayout are judged before this node votes.
+        // Stateless validation plus go's `validateForPayouts` (issue #1798)
+        // and `checkDup` (issue #2127) against the committed ledger: a peer
+        // proposal's FeesCollected / Proposer / ProposerPayout, replayed or
+        // repeated txids and live-lease conflicts are judged before this
+        // node votes (go `Ledger.Validate`).
         let block_validator: Arc<PayoutCheckingValidator<BlockValidatorBridge>> =
             Arc::new(PayoutCheckingValidator::new(
                 BlockValidatorBridge::new(

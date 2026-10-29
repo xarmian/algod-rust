@@ -26,10 +26,10 @@
 //! go asks the block being evaluated first (`roundCowState.checkDup`,
 //! `ledger/eval/cow.go`: the txid, then the lease), then the ledger's txtail
 //! (`txTail.checkDup`, `ledger/txtail.go`: the lease, then the txid).
-//! [`check_dup`] keeps that order. Simulate uses it today (issue #2125); it
-//! takes the block's own state as a [`BlockDups`] and the ledger's as a
-//! [`LedgerDups`] so validate-mode block evaluation can reuse it (issue
-//! #2127).
+//! [`check_dup`] keeps that order. It takes the block's own state as a
+//! [`BlockDups`] and the ledger's as a [`LedgerDups`]: simulate uses it per
+//! group (issue #2125), and validate-mode block evaluation per block through
+//! [`BlockCheckDup`] (issue #2127).
 
 use std::collections::{HashMap, HashSet};
 
@@ -237,6 +237,63 @@ pub fn check_dup<L: LedgerStore + ?Sized>(
         return Err(transaction_in_ledger_error(txid));
     }
     Ok(())
+}
+
+/// go `checkDup` across one block evaluated with `Validate: true` (issue
+/// #2127): the block's own txids and leases so far ([`BlockDups`]) and the
+/// ledger half ([`LedgerDups`]) for the block's txids, indexed by payset
+/// position.
+///
+/// The first failure is kept in [`Self::violation`], so a caller that
+/// evaluates a block only for a verdict (the agreement proposal validator)
+/// can tell a `checkDup` rejection apart from any other evaluation error.
+#[derive(Debug)]
+pub struct BlockCheckDup {
+    block: BlockDups,
+    ledger: LedgerDups,
+    violation: Option<String>,
+}
+
+impl BlockCheckDup {
+    /// The check for a block of round `round` whose payset has the ids
+    /// `txids` (as the txtail records them).
+    #[must_use]
+    pub fn new(round: u64, txids: Vec<Digest>) -> Self {
+        Self {
+            block: BlockDups::new(),
+            ledger: LedgerDups::new(round, txids),
+            violation: None,
+        }
+    }
+
+    /// [`check_dup`] for payset transaction `index`, recording it in the
+    /// block when it passes (go `addTx`: a block that fails is discarded
+    /// whole, so recording before the transaction applies is equivalent).
+    pub fn check<L: LedgerStore + ?Sized>(
+        &mut self,
+        store: &L,
+        consensus: &ConsensusParams,
+        txn: &Transaction,
+        index: usize,
+    ) -> Result<(), AlgoError> {
+        let Some(&txid) = self.ledger.txids().get(index) else {
+            return Err(AlgoError::Ledger {
+                message: format!("checkDup: no txid for payset index {index}"),
+            });
+        };
+        if let Err(e) = check_dup(store, consensus, txn, txid, &self.block, &mut self.ledger) {
+            self.violation.get_or_insert_with(|| e.to_string());
+            return Err(e);
+        }
+        self.block.record(txn, txid);
+        Ok(())
+    }
+
+    /// The first `checkDup` rejection, if any.
+    #[must_use]
+    pub fn violation(&self) -> Option<&str> {
+        self.violation.as_deref()
+    }
 }
 
 #[cfg(test)]

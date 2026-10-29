@@ -935,21 +935,44 @@ pub enum PayoutCheck {
 
 /// Judge a peer proposal's `FeesCollected` / `Proposer` / `ProposerPayout`
 /// header fields against the pre-block state (go `validateForPayouts`, issue
-/// #1798): the whole block is evaluated in [`ApplyMode::Execute`] on a
-/// rolled-back scratch apply with only the payout validation switched on, so
-/// nothing is persisted and no other validate-mode check can reject a block
-/// go would accept. `store` must be at `block.round - 1`. Only a payout
+/// #1798), and each transaction against go's `checkDup` (issue #2127): the
+/// whole block is evaluated in [`ApplyMode::Execute`] on a rolled-back
+/// scratch apply with only those two validations switched on, so nothing is
+/// persisted and no other validate-mode check can reject a block go would
+/// accept. `store` must be at `block.round - 1`. Only a payout or `checkDup`
 /// rejection is a [`PayoutCheck::Violation`]; every other failure is
 /// [`PayoutCheck::NoVerdict`].
 pub fn scratch_validate_payouts<L: LedgerStore>(store: &mut L, block: &Block) -> PayoutCheck {
-    let mut probe = ExecProbe {
+    let mut probe = proposal_check_probe();
+    let result = scratch_execute_with(store, block, &mut probe);
+    proposal_check_from(result, &probe)
+}
+
+/// The [`ExecProbe`] of a proposal check: go `Ledger.Validate`'s
+/// `validateForPayouts` and `checkDup`, nothing else.
+pub(crate) fn proposal_check_probe() -> ExecProbe {
+    ExecProbe {
         request: ProbeRequest {
             validate_payouts: true,
+            check_dup: true,
             ..Default::default()
         },
         ..Default::default()
-    };
-    payout_check_from(scratch_execute_with(store, block, &mut probe))
+    }
+}
+
+/// Map a proposal-check evaluation to its [`PayoutCheck`]: a `checkDup`
+/// rejection is a verdict (go `Ledger.Validate` fails the block on it),
+/// unless the base moved during the evaluation; everything else as
+/// [`payout_check_from`].
+pub(crate) fn proposal_check_from<T>(
+    result: Result<T, ScratchFailure>,
+    probe: &ExecProbe,
+) -> PayoutCheck {
+    match (&result, &probe.out.dup_violation) {
+        (Err(ScratchFailure::Stale), _) | (_, None) => payout_check_from(result),
+        (_, Some(violation)) => PayoutCheck::Violation(violation.clone()),
+    }
 }
 
 /// Map a `validate_payouts` evaluation outcome to its [`PayoutCheck`]; shared

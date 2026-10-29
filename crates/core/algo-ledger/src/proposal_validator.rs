@@ -26,9 +26,12 @@
 // sink and proposer balances after the payset. go validates every proposal
 // through the ledger evaluator (`validateForPayouts` in `endOfBlock`) before
 // voting for it. This wrapper adds that check, against the committed ledger
-// state, after the stateless validation.
+// state, after the stateless validation. The same evaluation runs go's
+// `checkDup` on every transaction (issue #2127): a replayed committed txid,
+// a txid repeated in the block, or a lease still in force.
 //
-// Liveness: only a genuine `validateForPayouts` verdict rejects a proposal.
+// Liveness: only a genuine `validateForPayouts` or `checkDup` verdict
+// rejects a proposal.
 // Anything that merely prevents the check from running (ledger busy or not
 // yet at the previous round, no scratch rollback available, a payset
 // transaction not evaluable here) is waited out within a small bounded

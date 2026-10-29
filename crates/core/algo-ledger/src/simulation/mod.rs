@@ -767,6 +767,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             validate: true,
             // `check_dup` in the loop below owns the lease check (issue #2125).
             leases_checked_by_caller: true,
+            checkdup: None,
             // go `simulator.go`: `Generate: true, Validate: true`.
             generate: true,
             latest_timestamp: block.latest_timestamp,

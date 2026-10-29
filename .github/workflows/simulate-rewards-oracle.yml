@@ -11,7 +11,9 @@ name: Simulate rewards oracle drift check
 # byte-for-byte. `cargo test --workspace` reads only the committed fixture.
 # The same tool also writes the issue #2125 duplicate-txid / lease oracle
 # (crates/core/algo-ledger/tests/fixtures/simulate_checkdup/oracle.json,
-# tools/simulate-rewards-oracle/checkdup.go), diffed the same way.
+# tools/simulate-rewards-oracle/checkdup.go) and the issue #2127 block
+# validation oracle (fixtures/block_checkdup/oracle.json, blockdup.go),
+# diffed the same way.
 #
 # Building go-algorand's ledger requires cgo + the vendored libsodium fork
 # (see CLAUDE.md's CI Workflows section) -- `make libsodium` below.
@@ -22,6 +24,7 @@ on:
       - "tools/simulate-rewards-oracle/**"
       - "crates/core/algo-ledger/tests/fixtures/simulate_rewards/**"
       - "crates/core/algo-ledger/tests/fixtures/simulate_checkdup/**"
+      - "crates/core/algo-ledger/tests/fixtures/block_checkdup/**"
       - ".github/workflows/simulate-rewards-oracle.yml"
   push:
     branches: [main]
@@ -29,6 +32,7 @@ on:
       - "tools/simulate-rewards-oracle/**"
       - "crates/core/algo-ledger/tests/fixtures/simulate_rewards/**"
       - "crates/core/algo-ledger/tests/fixtures/simulate_checkdup/**"
+      - "crates/core/algo-ledger/tests/fixtures/block_checkdup/**"
       - ".github/workflows/simulate-rewards-oracle.yml"
   workflow_dispatch:
 
@@ -82,7 +86,8 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           git diff --exit-code -- \
             crates/core/algo-ledger/tests/fixtures/simulate_rewards/oracle.json \
-            crates/core/algo-ledger/tests/fixtures/simulate_checkdup/oracle.json || {
+            crates/core/algo-ledger/tests/fixtures/simulate_checkdup/oracle.json \
+            crates/core/algo-ledger/tests/fixtures/block_checkdup/oracle.json || {
             echo "::error::a committed oracle.json is stale -- regenerate via 'cd tools/simulate-rewards-oracle && go run .' against the pinned go-algorand checkout and commit the result"
             exit 1
           }

@@ -203,7 +203,8 @@ pub fn evaluate_payset<B: OverlayBase + ?Sized>(
 /// [`crate::shadow_execute::scratch_validate_payouts`]: the whole block is
 /// evaluated in [`ApplyMode::Execute`] *including* the epilogue (participation
 /// lists, payout validation, payout application) with only the payout
-/// validation switched on. A base that is not at `block.round - 1`, or that
+/// validation and go's `checkDup` (issue #2127) switched on; a `checkDup`
+/// rejection is a verdict too. A base that is not at `block.round - 1`, or that
 /// advanced while evaluating, is a transient
 /// [`PayoutCheck::NoVerdict`] (the caller retries), never a verdict.
 pub fn evaluate_validate_payouts<B: OverlayBase + ?Sized>(base: &B, block: &Block) -> PayoutCheck {
@@ -213,14 +214,9 @@ pub fn evaluate_validate_payouts<B: OverlayBase + ?Sized>(base: &B, block: &Bloc
             message: "injected transient scratch failure".into(),
         })));
     }
-    let mut probe = ExecProbe {
-        request: ProbeRequest {
-            validate_payouts: true,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    payout_check_from(evaluate_block_on_overlay(base, block, &mut probe))
+    let mut probe = crate::shadow_execute::proposal_check_probe();
+    let result = evaluate_block_on_overlay(base, block, &mut probe);
+    crate::shadow_execute::proposal_check_from(result, &probe)
 }
 
 /// Evaluate `block` in [`ApplyMode::Execute`] on a fresh overlay over `base`
@@ -621,9 +617,14 @@ mod tests {
             (template(&l),)
         };
         let mut block = t;
+        // Each payment funds a fresh receiver, so every transaction reads
+        // the base at least once (apply no longer reads the lease table per
+        // transaction, issue #2127).
         block.payset = (0..600u64)
             .map(|i| {
-                let mut p = pay(a, addr(2), 200_000 + i, None);
+                let mut to = [0u8; 32];
+                to[..8].copy_from_slice(&(1_000 + i).to_be_bytes());
+                let mut p = pay(a, Address(to), 200_000 + i, None);
                 p.txn.note = serde_bytes::ByteBuf::from(i.to_be_bytes().to_vec());
                 p
             })

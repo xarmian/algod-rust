@@ -1553,17 +1553,18 @@ fn test_lease_across_blocks() {
     let block1 = minimal_block(fee_sink, 1, vec![stx1]);
     apply_block(&mut state, &block1).unwrap();
 
-    // Block 2 at round 2: same sender, same lease — should be rejected.
+    // Block 2 at round 2: same sender, same lease — validation (go
+    // `Ledger.Validate`, `checkDup`) rejects it.
     let mut stx2 = pay_txn(sender, receiver, 1_000, 1_000);
     stx2.txn.lease = lease_val;
     stx2.txn.last_valid = Round(7);
     let block2 = minimal_block(fee_sink, 2, vec![stx2]);
-    let result = apply_block(&mut state, &block2);
+    let result = algo_ledger::apply_block_validating(&mut state, &block2);
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("duplicate lease"),
-        "expected duplicate lease error, got: {}",
+        err_msg.contains("overlapping lease"),
+        "expected the lease conflict, got: {}",
         err_msg,
     );
 
@@ -1574,6 +1575,51 @@ fn test_lease_across_blocks() {
         state.get_account(&receiver).unwrap().micro_algos,
         100_000 + 1_000,
         "rejected duplicate-lease block must not move any funds"
+    );
+
+    // Replaying the same block as a certified one (go `Ledger.AddBlock`,
+    // no `checkDup`) accepts it (issue #2127).
+    apply_block(&mut state, &block2).expect("replay does not check leases");
+    assert_eq!(
+        state.get_account(&receiver).unwrap().micro_algos,
+        100_000 + 2_000
+    );
+}
+
+/// In validate mode the lease conflict is go's `checkDup` error,
+/// `ledgercore.LeaseInLedgerError`, with its exact text (issues #2125,
+/// #2127).
+#[test]
+fn test_lease_across_blocks_validating_reports_go_lease_error() {
+    let sender = Address([1u8; 32]);
+    let receiver = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let mut state = make_state(
+        &[(sender, 10_000_000), (receiver, 100_000), (fee_sink, 0)],
+        fee_sink,
+    );
+    let lease_val: [u8; 32] = [0xDD; 32];
+
+    let mut stx1 = pay_txn(sender, receiver, 1_000, 1_000);
+    stx1.txn.lease = lease_val;
+    stx1.txn.first_valid = Round(1);
+    stx1.txn.last_valid = Round(6);
+    apply_block(&mut state, &minimal_block(fee_sink, 1, vec![stx1])).unwrap();
+
+    let mut stx2 = pay_txn(sender, receiver, 1_000, 1_000);
+    stx2.txn.lease = lease_val;
+    stx2.txn.first_valid = Round(1);
+    stx2.txn.last_valid = Round(7);
+    let txid = algo_codec::compute_txn_id(&stx2.txn);
+    let err =
+        algo_ledger::apply_block_validating(&mut state, &minimal_block(fee_sink, 2, vec![stx2]))
+            .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "transaction {txid} using an overlapping lease (sender, lease):({sender}, {})",
+            Address(lease_val)
+        )
     );
 }
 
@@ -1677,18 +1723,25 @@ fn test_overlapping_leases_second_blocked_until_first_expires() {
         stx2
     };
 
-    // Round 2 (right after tx1 confirmed): still rejected. `apply_block`
-    // fails the lease check during transaction processing, strictly before
+    // Round 2 (right after tx1 confirmed): still rejected. Validation
+    // (go `checkDup`; replay never checks leases, issue #2127) fails the
+    // lease check during transaction processing, strictly before
     // `set_current_round` runs (see apply.rs), so a rejected attempt never
     // advances `current_round` or leaks any balance change -- proven
     // separately by `test_lease_across_blocks`'s balance assertion above --
     // and the next block can still legitimately target the same round.
-    let result = apply_block(&mut state, &minimal_block(fee_sink, 2, vec![build_tx2()]));
+    let result = algo_ledger::apply_block_validating(
+        &mut state,
+        &minimal_block(fee_sink, 2, vec![build_tx2()]),
+    );
     assert!(
         result.is_err(),
         "lease still active right after tx1 confirms"
     );
-    assert!(result.unwrap_err().to_string().contains("duplicate lease"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("overlapping lease"));
 
     // Advance (with empty blocks) to the halfway point of tx1's lease
     // window: still rejected.
@@ -1696,12 +1749,15 @@ fn test_overlapping_leases_second_blocked_until_first_expires() {
     for r in 2..halfway_round {
         apply_block(&mut state, &minimal_block(fee_sink, r, vec![])).unwrap();
     }
-    let result = apply_block(
+    let result = algo_ledger::apply_block_validating(
         &mut state,
         &minimal_block(fee_sink, halfway_round, vec![build_tx2()]),
     );
     assert!(result.is_err(), "lease still active at the halfway point");
-    assert!(result.unwrap_err().to_string().contains("duplicate lease"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("overlapping lease"));
     apply_block(&mut state, &minimal_block(fee_sink, halfway_round, vec![])).unwrap();
 
     // Advance past tx1's lease expiry (last_valid = 1 + FIRST_TX_LEASE_LIFE):
@@ -1921,12 +1977,15 @@ fn test_lease_regression_faulty_first_valid_check_new_2f3880f7() {
     stx2.txn.lease = lease_val;
     stx2.txn.last_valid = Round(1000);
     let block2 = minimal_block(fee_sink, 2, vec![stx2]);
-    let result = apply_block(&mut state, &block2);
+    let result = algo_ledger::apply_block_validating(&mut state, &block2);
     assert!(
         result.is_err(),
         "a still-active lease must reject the duplicate regardless of FirstValid"
     );
-    assert!(result.unwrap_err().to_string().contains("duplicate lease"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("overlapping lease"));
 }
 
 // ---------------------------------------------------------------------------

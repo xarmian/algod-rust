@@ -266,8 +266,8 @@ fn simulate_checkdup_matches_go_on_archival_sqlite() {
 /// Issue #2125: the lease table is in memory only, so `SqliteLedger` must
 /// rebuild it from the persisted txtail rows when it is reopened (a
 /// restart, or `reload_ledger` after a catchpoint import), as go's
-/// `txTail.loadFromDisk` does. Otherwise both simulate and block apply
-/// accept a lease that go still holds in force.
+/// `txTail.loadFromDisk` does. Otherwise both simulate and block
+/// validation accept a lease that go still holds in force.
 #[test]
 fn reopened_sqlite_ledger_still_rejects_a_live_lease() {
     let o = load_oracle();
@@ -308,17 +308,17 @@ fn reopened_sqlite_ledger_still_rejects_a_live_lease() {
         "simulate after reopen"
     );
 
-    // Block apply: block 3's leased payment again in the next block (in
-    // go's block encoding) is a lease conflict.
+    // Block validation: block 3's leased payment again in the next block
+    // (in go's block encoding) is a lease conflict (go `checkDup`).
     let block = Block {
         round: Round(o.blocks.len() as u64 + 1),
         payset: last.payset.clone(),
         ..last
     };
-    let err = algo_ledger::apply::apply_block(&mut ledger, &block)
-        .expect_err("a block reusing a live lease must not apply after reopen");
+    let err = algo_ledger::apply_block_validating(&mut ledger, &block)
+        .expect_err("a block reusing a live lease must not validate after reopen");
     assert!(
-        err.to_string().contains("duplicate lease"),
+        err.to_string().contains("overlapping lease"),
         "expected the lease conflict, got: {err}"
     );
 }

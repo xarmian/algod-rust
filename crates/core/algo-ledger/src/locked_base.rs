@@ -265,6 +265,13 @@ impl OverlayBase for LockedBase<'_> {
     fn base_get_txtail(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
         via_ledger_store!(self, get_txtail(round))
     }
+    fn base_txtail_confirmed_txids(
+        &self,
+        txids: &[algo_types::Digest],
+        max_txn_life: u64,
+    ) -> std::collections::HashSet<algo_types::Digest> {
+        via_ledger_store!(self, txtail_confirmed_txids(txids, max_txn_life))
+    }
     fn base_get_state_proof_verification_context(
         &self,
         last_attested_round: u64,
