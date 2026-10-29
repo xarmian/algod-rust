@@ -2038,7 +2038,7 @@ impl SimpleBlockEvaluator {
             };
             // Overlay first for the cumulative effects of earlier groups,
             // then the ledger snapshot.
-            let base = self.effective_balance(&sender);
+            let base = self.try_effective_balance(&sender)?;
             let credited = credits.get(&sender).copied().unwrap_or(0);
             let already_spent = spent.get(&sender).copied().unwrap_or(0);
             let required = already_spent.saturating_add(cost);
@@ -2121,16 +2121,22 @@ impl SimpleBlockEvaluator {
         let touched = earlier_in_group || self.overlay.get_balance(sender).is_some();
         let auth = self.expected_authorizer(sender);
         data.auth_addr = if auth == *sender { None } else { Some(auth) };
-        if after_fee || touched {
-            // Only the printed account: an overflow leaves it as stored.
-            let _ = algo_ledger::apply_rewards(&mut data, self.hdr.rewards_level);
-            data.micro_algos = data_balance;
+        let rewards = if after_fee || touched {
+            algo_ledger::apply_rewards(&mut data, self.hdr.rewards_level).map(|_| {
+                data.micro_algos = data_balance;
+            })
         } else {
             // the stored account: `balance_now` counts pending rewards the
             // fee move would only apply to its copy
-            let pending =
-                algo_ledger::compute_pending_rewards(&data, self.hdr.rewards_level).unwrap_or(0);
-            data.micro_algos = balance_now.saturating_sub(pending);
+            algo_ledger::compute_pending_rewards(&data, self.hdr.rewards_level).map(|pending| {
+                data.micro_algos = balance_now.saturating_sub(pending);
+            })
+        };
+        // The account go would print cannot be computed (go panics in
+        // `WithUpdatedRewards` there): say why instead of printing stale
+        // fields.
+        if let Err(e) = rewards {
+            return format!("transaction {txid}: {e}");
         }
         algo_validate::overspend::overspend_message(txid, sender, &data, tried)
     }
@@ -2660,12 +2666,12 @@ impl SimpleBlockEvaluator {
     ///   rewards_delta = block.rewards_level - account.rewards_base
     ///   pending = reward_units * rewards_delta
     ///   adjusted = micro_algos + pending
-    fn balance_with_rewards(&self, acct: &AccountData) -> u64 {
-        // The snapshot is the state the block builds on and `hdr` is that
-        // block's (next) rewards level, so no base exceeds it; an overflow
-        // is go's `WithUpdatedRewards` panic.
+    ///
+    /// A rewards base above the level or an overflowing balance (go's
+    /// `WithUpdatedRewards` panic) is an error that rejects the group being
+    /// evaluated; it never panics block production.
+    fn balance_with_rewards(&self, acct: &AccountData) -> Result<u64, algo_error::AlgoError> {
         algo_ledger::rewards::balance_with_rewards(acct, self.hdr.rewards_level)
-            .expect("reward overflow: account rewards exceeded u64 max")
     }
 
     /// Get the effective balance for an address, checking the overlay first
@@ -2678,15 +2684,22 @@ impl SimpleBlockEvaluator {
     /// rewards using `balance_with_rewards()`, mirroring Go's
     /// `WithUpdatedRewards()` which is called in `Move()` and balance
     /// operations before any debit or credit.
-    fn effective_balance(&mut self, addr: &Address) -> u64 {
+    fn try_effective_balance(&mut self, addr: &Address) -> Result<u64, algo_error::AlgoError> {
         match self.overlay.get_balance(addr) {
-            Some(bal) => bal,
-            None => self
-                .snapshot
-                .get_account(addr, &self.ledger)
-                .map(|acct| self.balance_with_rewards(&acct))
-                .unwrap_or(0),
+            Some(bal) => Ok(bal),
+            None => match self.snapshot.get_account(addr, &self.ledger) {
+                Some(acct) => self.balance_with_rewards(&acct),
+                None => Ok(0),
+            },
         }
+    }
+
+    /// [`Self::try_effective_balance`] for tests, where the fixture
+    /// guarantees a consistent rewards state.
+    #[cfg(test)]
+    fn effective_balance(&mut self, addr: &Address) -> u64 {
+        self.try_effective_balance(addr)
+            .expect("test fixture rewards state is consistent")
     }
 
     /// Get the AccountData for an address, merging snapshot data with any
@@ -2912,7 +2925,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             // 3. If close_remainder_to is set, move remaining balance
             //    to close address and zero the sender (cow.CloseAccount)
             let sender = &stx.txn.sender;
-            let sender_balance = self.effective_balance(sender);
+            let sender_balance = self.try_effective_balance(sender)?;
 
             // Credit fee to FeeSink (mirrors Go's takeFee -> cow.Move).
             // Track fees_collected running total for the block header.
@@ -2930,7 +2943,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                 sender_balance
             } else {
                 if stx.txn.fee > 0 {
-                    let fee_sink_balance = self.effective_balance(&fee_sink);
+                    let fee_sink_balance = self.try_effective_balance(&fee_sink)?;
                     self.overlay.set_balance_tracked(
                         &fee_sink,
                         fee_sink_balance.saturating_add(stx.txn.fee),
@@ -2966,7 +2979,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                                 &mut checkpoint,
                             );
                         } else {
-                            let recv_balance = self.effective_balance(receiver);
+                            let recv_balance = self.try_effective_balance(receiver)?;
                             self.overlay.set_balance_tracked(
                                 receiver,
                                 recv_balance.saturating_add(stx.txn.amount),
@@ -2994,9 +3007,9 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                     // apply.Payment() -> cow.CloseAccount().
                     if !stx.txn.close_remainder_to.is_zero() {
                         let close_addr = &stx.txn.close_remainder_to;
-                        let remaining = self.effective_balance(sender);
+                        let remaining = self.try_effective_balance(sender)?;
                         if remaining > 0 && close_addr != sender {
-                            let close_balance = self.effective_balance(close_addr);
+                            let close_balance = self.try_effective_balance(close_addr)?;
                             self.overlay.set_balance_tracked(
                                 close_addr,
                                 close_balance.saturating_add(remaining),
@@ -3211,7 +3224,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                 continue;
             }
 
-            let balance = self.effective_balance(addr);
+            let balance = self.try_effective_balance(addr)?;
             // A zero balance is valid (account closed/deleted), matching
             // Go's `if data.IsZero() { continue }` in checkMinBalance.
             if balance == 0 {
@@ -12257,6 +12270,45 @@ mod tests {
         assert!(
             eval.transaction_group(&[stx]).is_ok(),
             "transfer should succeed with reward-adjusted balance"
+        );
+    }
+
+    /// Issue #2118: a sender whose rewards base is above the block's level
+    /// (go's `WithUpdatedRewards` overflow panic) rejects its group with an
+    /// error; it must never panic the proposer.
+    #[test]
+    fn rewards_base_above_the_level_rejects_the_group_without_panicking() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(1);
+        let (receiver, _) = test_keypair(2);
+        let fee_sink = Address([0xFE; 32]);
+        let acct = AccountData {
+            micro_algos: 5_000_000,
+            rewards_base: 30,
+            status: algo_types::AccountStatus::Online,
+            ..Default::default()
+        };
+        let fee_sink_acct = AccountData {
+            micro_algos: 10_000_000,
+            ..Default::default()
+        };
+        let mut eval = make_evaluator_with_rewards(
+            &ledger,
+            &params,
+            100,
+            20,
+            &[(sender, acct), (fee_sink, fee_sink_acct)],
+        );
+        eval.hdr.fee_sink = fee_sink;
+        let stx = make_signed_pay(&key, &sender, &receiver, 200_000, 1_000, 100);
+        let err = eval
+            .transaction_group(&[stx])
+            .expect_err("an inconsistent rewards base rejects the group");
+        assert!(
+            err.to_string()
+                .contains("overflowed account balance when applying rewards"),
+            "{err}"
         );
     }
 

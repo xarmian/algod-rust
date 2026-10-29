@@ -2713,10 +2713,11 @@ fn simulate_checks_the_validity_window_at_the_simulated_round() {
     };
     assert_eq!(pay(6, 100).failure_message, None);
     let expired = pay(1, 5);
-    let failure = expired.failure_message.expect("an expired txn must fail");
-    assert!(
-        failure.contains("txn dead: round 6 outside of 1--5"),
-        "{failure}"
+    // The exact `failure-message` the REST handler returns (it copies
+    // `TxnGroupResult::failure_message` verbatim): go's bare `TxnDeadError`.
+    assert_eq!(
+        expired.failure_message.as_deref(),
+        Some("txn dead: round 6 outside of 1--5")
     );
     assert_eq!(expired.failed_at, Some(vec![0]));
 }
@@ -2858,7 +2859,8 @@ fn simulate_restores_the_pool_when_evaluation_panics() {
 }
 
 /// Issue #2118 review: go's `BlockHeader.Alive` (`data/bookkeeping/block.go`)
-/// also rejects a transaction naming another network's genesis ID or hash.
+/// also rejects a transaction naming another network's genesis ID (the
+/// previous header's) or genesis hash (the ledger's).
 #[test]
 fn simulate_rejects_a_wrong_genesis_id_or_hash() {
     let sender = Address([0xAA; 32]);
@@ -2868,7 +2870,11 @@ fn simulate_rejects_a_wrong_genesis_id_or_hash() {
         round: Round(5),
         current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
         genesis_id: "net-v1".to_string(),
-        genesis_hash: TEST_GENESIS_HASH,
+        // go's `StartEvaluator` (`SupportGenesisHash`) replaces the copied
+        // header hash with the ledger's own, so `Alive` checks against
+        // `TEST_GENESIS_HASH` (the store's) even when the stored header
+        // disagrees.
+        genesis_hash: [0x22; 32],
         ..Default::default()
     };
     let hdr_bytes = algo_codec::canonical_encode_block_header(&hdr);
@@ -2894,20 +2900,22 @@ fn simulate_rejects_a_wrong_genesis_id_or_hash() {
         .failure_message
     };
     assert_eq!(run("net-v1", TEST_GENESIS_HASH), None);
-    let wrong_id = run("other-v1", TEST_GENESIS_HASH).expect("a wrong genesis ID fails");
-    assert!(
-        wrong_id.contains("tx.GenesisID <other-v1> does not match expected <net-v1>"),
-        "{wrong_id}"
+    // Exact `failure-message`s: go's bare `BlockHeader.Alive` texts.
+    assert_eq!(
+        run("other-v1", TEST_GENESIS_HASH).as_deref(),
+        Some("tx.GenesisID <other-v1> does not match expected <net-v1>")
     );
-    let wrong_hash = run("net-v1", [0x11; 32]).expect("a wrong genesis hash fails");
-    assert!(
-        wrong_hash.contains("tx.GenesisHash <") && wrong_hash.contains("does not match expected"),
-        "{wrong_hash}"
+    assert_eq!(
+        run("net-v1", [0x11; 32]),
+        Some(format!(
+            "tx.GenesisHash <{}> does not match expected <{}>",
+            algo_types::Digest([0x11; 32]),
+            algo_types::Digest(TEST_GENESIS_HASH)
+        ))
     );
-    let missing = run("net-v1", [0u8; 32]).expect("v41 requires the genesis hash");
-    assert!(
-        missing.contains("required tx.GenesisHash is missing"),
-        "{missing}"
+    assert_eq!(
+        run("net-v1", [0u8; 32]).as_deref(),
+        Some("required tx.GenesisHash is missing")
     );
 }
 

@@ -2224,12 +2224,12 @@ impl NodeInterface for AlgodNodeInterface {
 
         // Run the simulator under the ledger lock. `Simulator` takes
         // `&mut L: LedgerStore` and uses snapshot/restore to leave the
-        // store unchanged on both the `Ok` and `Err` paths. A panic
-        // *inside* the simulator bypasses the explicit restore (the
-        // snapshot is dropped mid-way) and poisons the `std::sync::Mutex`,
-        // so we handle poison here rather than `expect`-ing — an earlier
-        // panic does not cascade into the entire REST surface dying on
-        // subsequent requests. Long AVM simulations still stall other
+        // store unchanged on the `Ok` and `Err` paths, and on a panic too:
+        // `Simulator::simulate` restores its snapshot before re-raising one
+        // (issue #2118). A re-raised panic still poisons the
+        // `std::sync::Mutex`, so we handle poison here rather than
+        // `expect`-ing — an earlier panic does not cascade into the entire
+        // REST surface dying on subsequent requests. Long AVM simulations still stall other
         // ledger access and block the current Tokio worker;
         // `spawn_blocking` (or migrating to `tokio::sync::Mutex`) is
         // tracked as a refinement under PLAN-34 alongside the rest of

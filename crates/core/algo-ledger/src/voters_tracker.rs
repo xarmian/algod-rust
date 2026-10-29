@@ -270,8 +270,19 @@ fn total_online_stake(
     let mut expired: u128 = 0;
     let mut invalid_raw_stake: u128 = 0;
     let mut invalid_rewards: u128 = 0;
-    for (_, acct) in accounts {
-        let pending = compute_pending_rewards(acct, rewards_level)?;
+    for (addr, acct) in accounts {
+        // A hard error, as in go: its online-account reads
+        // (`BaseOnlineAccountData.GetOnlineAccountData`,
+        // `ledger/store/trackerdb/data.go`) bring every account to the level
+        // with `WithUpdatedRewards`, which panics on a rewards base above the
+        // level or an overflow. It is returned before
+        // `record_voters_snapshot` writes anything, so no partial snapshot
+        // is left; `apply` logs it like any voters-tracker failure.
+        let pending = compute_pending_rewards(acct, rewards_level).map_err(|e| {
+            ledger_err(format!(
+                "voters snapshot total weight: account {addr} at rewards level {rewards_level}: {e}"
+            ))
+        })?;
         let money = acct.micro_algos as u128 + pending as u128;
         total += money;
         let is_invalid = acct.vote_last_valid != 0 && vote_rnd > acct.vote_last_valid;

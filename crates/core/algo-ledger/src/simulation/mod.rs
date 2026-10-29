@@ -248,12 +248,34 @@ struct SimulatedBlock {
     latest_timestamp: u64,
     /// The block's rewards level (`NextRewardsState`).
     rewards_level: u64,
-    /// The block-start pool withdrawal.
+    /// The block-start pool withdrawal. Its `pool` is the block's rewards
+    /// pool and its `genesis_hash` the ledger's (the testnet hotfix key).
     withdrawal: BlockRewardsWithdrawal,
-    /// The block's genesis ID and hash (`MakeBlock` copies `prevHdr`'s),
-    /// which `BlockHeader.Alive` checks every transaction against.
-    genesis_id: String,
-    genesis_hash: [u8; 32],
+    /// The block's fee sink (`NextRewardsState` carries `prevHdr`'s).
+    fee_sink: Address,
+    /// The genesis identity, from go's two sources:
+    /// - `block_genesis_id` / `block_genesis_hash` are the simulated block
+    ///   header's, which `BlockHeader.Alive` checks every transaction
+    ///   against. `MakeBlock` copies both from `prevHdr`, and
+    ///   `StartEvaluator` (`Generate`, `SupportGenesisHash`) then overwrites
+    ///   the hash with the ledger's `eval.genesisHash`.
+    /// - `ledger_genesis_hash` is the ledger's own, which `global
+    ///   GenesisHash` reads and the testnet hotfix is keyed on.
+    block_genesis_id: String,
+    block_genesis_hash: [u8; 32],
+    ledger_genesis_hash: [u8; 32],
+}
+
+impl SimulatedBlock {
+    /// The block's own accounts a simulate may write: the fee sink, the
+    /// rewards pool and, on a testnet hotfix round, the testnet bank.
+    fn snapshot_addrs(&self) -> Vec<Address> {
+        let mut addrs = vec![self.fee_sink, self.withdrawal.pool];
+        if self.withdrawal.is_testnet_hotfix_round() {
+            addrs.push(Address(TESTNET_BANK_ADDRESS));
+        }
+        addrs
+    }
 }
 
 /// The simulation engine.
@@ -348,9 +370,10 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
     ) -> Result<SimulatedBlock, AlgoError> {
         let store = &*self.store;
         let round = start.0 + 1;
-        let (genesis_id, genesis_hash) = match prev_hdr {
+        let ledger_genesis_hash = *store.genesis_hash();
+        let (block_genesis_id, prev_genesis_hash) = match prev_hdr {
             Some(hdr) => (hdr.genesis_id.clone(), hdr.genesis_hash),
-            None => (store.genesis_id().to_string(), *store.genesis_hash()),
+            None => (store.genesis_id().to_string(), ledger_genesis_hash),
         };
         let (consensus, latest_timestamp) = match prev_hdr {
             Some(hdr) => {
@@ -386,8 +409,13 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             prev_rewards_level: prev.rewards_level,
             rewards_level: next.rewards_level,
             prev_reward_units: reward_units,
-            genesis_hash: *store.genesis_hash(),
+            genesis_hash: ledger_genesis_hash,
             min_balance: consensus.min_balance,
+        };
+        let block_genesis_hash = if consensus.support_genesis_hash {
+            ledger_genesis_hash
+        } else {
+            prev_genesis_hash
         };
         Ok(SimulatedBlock {
             round,
@@ -395,8 +423,10 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             latest_timestamp,
             rewards_level: next.rewards_level,
             withdrawal,
-            genesis_id,
-            genesis_hash,
+            fee_sink: store.fee_sink(),
+            block_genesis_id,
+            block_genesis_hash,
+            ledger_genesis_hash,
         })
     }
 
@@ -520,18 +550,10 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
 
         // Collect all addresses involved in the transaction group for
         // snapshotting. This ensures we can restore state after simulation.
-        // Include the fee sink and rewards pool since apply_transaction
-        // credits fees and distributes rewards through these accounts.
-        let mut addrs: Vec<Address> = vec![
-            self.store.fee_sink(),
-            self.store.rewards_pool(),
-            block.withdrawal.pool,
-        ];
-        // The block-start withdrawal moves the testnet bank on go's two
-        // `workaroundOverspentRewards` rounds.
-        if block.withdrawal.is_testnet_hotfix_round() {
-            addrs.push(Address(TESTNET_BANK_ADDRESS));
-        }
+        // The block's own accounts come first: the fee sink (fees), the
+        // rewards pool (the block-start withdrawal) and, on go's two
+        // `workaroundOverspentRewards` rounds, the testnet bank.
+        let mut addrs: Vec<Address> = block.snapshot_addrs();
         for stx in txn_group {
             addrs.push(stx.txn.sender);
             if stx.txn.receiver != Address::ZERO {
@@ -739,14 +761,14 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
 
         let apply_ctx = ApplyContext {
             rewards_level: block.rewards_level,
-            fee_sink: self.store.fee_sink(),
+            fee_sink: block.fee_sink,
             round: block.round,
             mode: ApplyMode::Execute,
             validate: true,
             // go `simulator.go`: `Generate: true, Validate: true`.
             generate: true,
             latest_timestamp: block.latest_timestamp,
-            genesis_hash: *self.store.genesis_hash(),
+            genesis_hash: block.ledger_genesis_hash,
             txn_counter: Cell::new(self.store.txn_counter()),
             fees_collected: Cell::new(0),
             state_proof_next: Cell::new(0),
@@ -911,17 +933,25 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             // `allow_empty_signatures`, which only relaxes *signature*
             // verification, not this apply-time authorization fact
             // (TestWrongAuthorizerTxn, issue #974).
-            // go `BlockEvaluator.transaction` under `Validate: true`:
-            // `BlockHeader.Alive` (validity window, genesis ID and hash)
-            // first, then the authorizer.
+            // Part of go `BlockEvaluator.transaction` under `Validate: true`:
+            // `BlockHeader.Alive` (validity window, genesis ID and hash),
+            // then the authorizer. Its `checkDup` duplicate-txid half is not
+            // ported yet (issue #2125); the lease half is `apply`'s
+            // `check_lease`. go's simulate reports the `Alive` error text
+            // bare (`EvalFailureError` wraps it without a prefix), hence
+            // `Rejected`, whose display is the message itself.
             let alive = algo_validate::block_alive(
                 block.round,
-                &block.genesis_id,
-                &block.genesis_hash,
+                &block.block_genesis_id,
+                &block.block_genesis_hash,
                 &apply_ctx.consensus,
                 &eval_group[i].txn,
             )
-            .map_err(|message| AlgoError::Ledger { message });
+            .map_err(|message| AlgoError::Rejected {
+                source: None,
+                message,
+                class: algo_error::RejectClass::Other,
+            });
             let apply_result =
                 match alive.and_then(|()| check_authorizer(self.store, &eval_group[i])) {
                     Err(e) => Err(e),
