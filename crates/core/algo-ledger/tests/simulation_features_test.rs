@@ -25,9 +25,9 @@
 //! - `allow_more_logging` AVM log-limit overrides
 //! - `allow_unnamed_resources` unnamed-resource tracking
 
+use algo_ledger::apply::pool_fixtures::{funded_simulation_state, TEST_GENESIS_HASH};
 use std::collections::BTreeMap;
 
-use algo_ledger::apply::pool_fixtures::funded_ledger_state;
 use algo_ledger::simulation::{
     SimulationRequest, Simulator, SimulatorError, LOG_BYTES_LIMIT, MAX_EXTRA_OPCODE_BUDGET,
     SIMULATION_MAX_LOG_CALLS,
@@ -46,7 +46,7 @@ const FEE_SINK: Address = Address([0xFE; 32]);
 
 /// Build a minimal `LedgerState` with a funded sender and fee sink.
 fn setup_state(sender: Address) -> LedgerState {
-    let mut state = funded_ledger_state();
+    let mut state = funded_simulation_state();
     state.fee_sink = FEE_SINK;
     state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
 
@@ -97,6 +97,7 @@ fn make_appl_txn(sender: Address, app_id: u64) -> SignedTransaction {
             last_valid: 1000.into(),
             application_id: app_id,
             on_completion: 0, // NoOp
+            genesis_hash: TEST_GENESIS_HASH,
             ..Default::default()
         },
         ..Default::default()
@@ -114,6 +115,7 @@ fn make_pay_txn(sender: Address) -> SignedTransaction {
             fee: 1000,
             first_valid: 0.into(),
             last_valid: 1000.into(),
+            genesis_hash: TEST_GENESIS_HASH,
             ..Default::default()
         },
         ..Default::default()

@@ -36,9 +36,9 @@
 //! outer app call whose inner app call itself makes a further inner app
 //! call, and the deepest (grand-inner) call is the one that actually fails.
 
+use algo_ledger::apply::pool_fixtures::{funded_simulation_state, TEST_GENESIS_HASH};
 use std::collections::BTreeMap;
 
-use algo_ledger::apply::pool_fixtures::funded_ledger_state;
 use algo_ledger::simulation::{SimulationRequest, Simulator, SimulatorError};
 use algo_ledger::{avm_context::app_address, LedgerState, LedgerStore};
 use algo_types::{AccountData, Address, AppParams, SignedTransaction, StateSchema, Transaction};
@@ -52,7 +52,7 @@ fn assemble(source: &str) -> Vec<u8> {
 }
 
 fn base_state() -> LedgerState {
-    let mut state = funded_ledger_state();
+    let mut state = funded_simulation_state();
     state.fee_sink = FEE_SINK;
     state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
     state.set_account(
@@ -98,6 +98,7 @@ fn appl_txn(sender: Address, app_id: u64) -> SignedTransaction {
             last_valid: 1000.into(),
             application_id: app_id,
             on_completion: 0, // NoOp
+            genesis_hash: TEST_GENESIS_HASH,
             ..Default::default()
         },
         ..Default::default()
@@ -261,6 +262,7 @@ int 1
             fee: 1000,
             first_valid: 0.into(),
             last_valid: 1000.into(),
+            genesis_hash: TEST_GENESIS_HASH,
             ..Default::default()
         },
         ..Default::default()

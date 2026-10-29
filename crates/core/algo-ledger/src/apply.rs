@@ -4757,7 +4757,7 @@ fn workaround_overspent_rewards<L: crate::store_trait::LedgerStore>(
         message: format!("unable to move funds from testnet bank to incentive pool: {why}"),
     };
     let mut bank = store.get_or_default_account(&bank_addr);
-    crate::rewards::apply_rewards(&mut bank, w.rewards_level);
+    crate::rewards::apply_rewards(&mut bank, w.rewards_level)?;
     bank.micro_algos = bank.micro_algos.checked_sub(amount).ok_or_else(|| {
         fail(format!(
             "overspend (account {bank_addr}, data {}, tried to spend {amount})",
@@ -4766,7 +4766,7 @@ fn workaround_overspent_rewards<L: crate::store_trait::LedgerStore>(
     })?;
     store.set_account(&bank_addr, bank);
     let mut pool = store.get_or_default_account(&w.pool);
-    crate::rewards::apply_rewards(&mut pool, w.rewards_level);
+    crate::rewards::apply_rewards(&mut pool, w.rewards_level)?;
     pool.micro_algos = pool
         .micro_algos
         .checked_add(amount)
@@ -4802,7 +4802,7 @@ pub(crate) fn withdraw_block_rewards<L: crate::store_trait::LedgerStore>(
     // go `eval.state.Get(poolAddr, true)`: the pool with its pending rewards.
     let pool_old = store.get_or_default_account(&w.pool);
     let mut pool = pool_old.clone();
-    crate::rewards::apply_rewards(&mut pool, w.rewards_level);
+    crate::rewards::apply_rewards(&mut pool, w.rewards_level)?;
     let withdrawal = w.prev_reward_units.checked_mul(rewards_per_unit);
     pool.micro_algos = withdrawal
         .and_then(|amt| pool.micro_algos.checked_sub(amt))
@@ -4841,12 +4841,12 @@ pub(crate) fn apply_rewards_pass<L: crate::store_trait::LedgerStore>(
     reward_addrs: &[Address],
     rewards_level: u64,
     consensus: &ConsensusParams,
-) -> RewardsPassOutcome {
+) -> Result<RewardsPassOutcome, AlgoError> {
     let mut out = RewardsPassOutcome::default();
     for addr in reward_addrs {
         let account_before = store.get_or_default_account(addr);
         let mut account = account_before.clone();
-        let reward = apply_rewards(&mut account, rewards_level);
+        let reward = apply_rewards(&mut account, rewards_level)?;
 
         // UnfundedSenders (go-algorand v34+, `config/consensus.go`):
         // don't force a zero-balance account into on-disk existence
@@ -4920,7 +4920,7 @@ pub(crate) fn apply_rewards_pass<L: crate::store_trait::LedgerStore>(
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Body of `apply_transaction_inner` extracted into a helper so the
@@ -4946,7 +4946,7 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
     {
         let mut apply_data = ApplyData::default();
 
-        let pass = apply_rewards_pass(store, txn, reward_addrs, ctx.rewards_level, &ctx.consensus);
+        let pass = apply_rewards_pass(store, txn, reward_addrs, ctx.rewards_level, &ctx.consensus)?;
         apply_data.sender_rewards += pass.sender_rewards;
         apply_data.receiver_rewards += pass.receiver_rewards;
         apply_data.close_rewards += pass.close_rewards;
@@ -5432,7 +5432,7 @@ pub fn apply_pay<L: crate::store_trait::LedgerStore>(
 
         if txn.amount > 0 {
             let mut receiver = store.get_or_default_account(&txn.receiver);
-            crate::rewards::apply_rewards(&mut receiver, rewards_level);
+            crate::rewards::apply_rewards(&mut receiver, rewards_level)?;
             receiver.micro_algos += txn.amount;
             store.set_account(&txn.receiver, receiver);
         }
@@ -5484,7 +5484,7 @@ pub fn apply_pay<L: crate::store_trait::LedgerStore>(
         // Credit close-to address.
         if close_amount > 0 {
             let mut close_to = store.get_or_default_account(&txn.close_remainder_to);
-            crate::rewards::apply_rewards(&mut close_to, rewards_level);
+            crate::rewards::apply_rewards(&mut close_to, rewards_level)?;
             close_to.micro_algos += close_amount;
             store.set_account(&txn.close_remainder_to, close_to);
         }
@@ -7521,6 +7521,19 @@ pub mod pool_fixtures {
         let mut l = crate::sqlite::SqliteLedger::open_in_memory().expect("in-memory ledger");
         fund_test_rewards_pool(&mut l);
         l
+    }
+
+    /// The genesis hash of [`funded_simulation_state`], which simulate test
+    /// transactions carry: go's `BlockHeader.Alive` requires every
+    /// transaction to name the block's genesis hash (`RequireGenesisHash`,
+    /// issue #2118).
+    pub const TEST_GENESIS_HASH: [u8; 32] = [0x6e; 32];
+
+    /// [`funded_ledger_state`] with genesis hash [`TEST_GENESIS_HASH`].
+    pub fn funded_simulation_state() -> crate::state::LedgerState {
+        let mut s = funded_ledger_state();
+        s.genesis_hash = TEST_GENESIS_HASH;
+        s
     }
 
     /// A `LedgerState` whose (zero-address) rewards pool holds `MinBalance`.
@@ -10468,7 +10481,7 @@ mod tests {
 
         // Verify pending rewards are > 0 at rewards_level=10.
         use crate::rewards::compute_pending_rewards;
-        let pending = compute_pending_rewards(state.get_account(&sender).unwrap(), 10);
+        let pending = compute_pending_rewards(state.get_account(&sender).unwrap(), 10).unwrap();
         assert!(pending > 0, "expected pending rewards > 0, got {}", pending);
 
         // Apply nonpart keyreg.
@@ -10480,7 +10493,7 @@ mod tests {
         assert_eq!(acct.status, AccountStatus::NotParticipating);
 
         // After becoming NotParticipating, compute_pending_rewards returns 0.
-        let pending_after = compute_pending_rewards(acct, 20);
+        let pending_after = compute_pending_rewards(acct, 20).unwrap();
         assert_eq!(pending_after, 0);
     }
 

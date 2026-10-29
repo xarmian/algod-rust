@@ -6986,13 +6986,27 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             // before the fee, like the top-level pass.
             {
                 let participants = crate::apply::reward_participants(&txns[i].txn);
-                let pass = crate::apply::apply_rewards_pass(
+                let pass = match crate::apply::apply_rewards_pass(
                     self.store,
                     &txns[i].txn,
                     &participants,
                     self.rewards_level,
                     &self.consensus,
-                );
+                ) {
+                    Ok(pass) => pass,
+                    Err(e) => {
+                        self.rollback_inner_group(
+                            snapshot,
+                            &extra_created_asset_ids,
+                            &extra_created_app_ids,
+                        );
+                        let err_msg = e.to_string();
+                        if let Some(p) = self.tracer_ptr {
+                            unsafe { &mut *p }.after_txn_group(Some(&err_msg));
+                        }
+                        return Err(e);
+                    }
+                };
                 txns[i].sender_rewards = pass.sender_rewards;
                 txns[i].receiver_rewards = pass.receiver_rewards;
                 txns[i].close_rewards = pass.close_rewards;

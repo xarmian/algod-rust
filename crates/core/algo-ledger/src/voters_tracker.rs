@@ -265,13 +265,13 @@ fn total_online_stake(
     vote_rnd: u64,
     exclude_expired: bool,
     exclude_rewards_for_invalid: bool,
-) -> u64 {
+) -> Result<u64, AlgoError> {
     let mut total: u128 = 0;
     let mut expired: u128 = 0;
     let mut invalid_raw_stake: u128 = 0;
     let mut invalid_rewards: u128 = 0;
     for (_, acct) in accounts {
-        let pending = compute_pending_rewards(acct, rewards_level);
+        let pending = compute_pending_rewards(acct, rewards_level)?;
         let money = acct.micro_algos as u128 + pending as u128;
         total += money;
         let is_invalid = acct.vote_last_valid != 0 && vote_rnd > acct.vote_last_valid;
@@ -285,7 +285,7 @@ fn total_online_stake(
         }
     }
     let total = total.min(u64::MAX as u128) as u64;
-    if exclude_expired {
+    Ok(if exclude_expired {
         let expired = expired.min(u64::MAX as u128) as u64;
         total.saturating_sub(expired)
     } else {
@@ -295,7 +295,7 @@ fn total_online_stake(
         }
         let subtract = subtract.min(u64::MAX as u128) as u64;
         total.saturating_sub(subtract)
-    }
+    })
 }
 
 /// Record a voters snapshot for the block just applied at `round`, if it's a
@@ -348,7 +348,7 @@ pub fn record_voters_snapshot<L: LedgerStore>(
         vote_rnd,
         params.exclude_expired_circulation,
         params.state_proof_exclude_total_weight_with_rewards,
-    );
+    )?;
 
     store.put_voters_snapshot(round, root, total_weight)?;
     // Full, address-tagged participant array (issue #912, extended by
@@ -611,7 +611,7 @@ mod tests {
             (Address([3u8; 32]), online_account(1_000_000)),
         ];
         assert_eq!(
-            total_online_stake(&accounts, 0, 100, false, false),
+            total_online_stake(&accounts, 0, 100, false, false).unwrap(),
             9_000_000
         );
     }
@@ -627,7 +627,7 @@ mod tests {
         // exclude_expired=true (v38+, ExcludeExpiredCirculation): the
         // expiring account's full stake is subtracted.
         assert_eq!(
-            total_online_stake(&accounts, 0, 100, true, false),
+            total_online_stake(&accounts, 0, 100, true, false).unwrap(),
             5_000_000
         );
         // exclude_expired=false (pre-v38 legacy branch): still always
@@ -635,11 +635,11 @@ mod tests {
         // (`ledger/acctonline.go:972-977`), independent of the rewards
         // sub-flag, matching the v38+ result here since rewards_level is 0.
         assert_eq!(
-            total_online_stake(&accounts, 0, 100, false, false),
+            total_online_stake(&accounts, 0, 100, false, false).unwrap(),
             5_000_000
         );
         assert_eq!(
-            total_online_stake(&accounts, 0, 100, false, true),
+            total_online_stake(&accounts, 0, 100, false, true).unwrap(),
             5_000_000
         );
     }
@@ -666,27 +666,27 @@ mod tests {
         let rewards_level = 100;
         let vote_rnd = 100;
 
-        let pending_on_expiring = compute_pending_rewards(&accounts[1].1, rewards_level);
+        let pending_on_expiring = compute_pending_rewards(&accounts[1].1, rewards_level).unwrap();
         assert!(
             pending_on_expiring > 0,
             "test fixture must exercise a nonzero rewards delta"
         );
 
         let raw_total = 9_000_000
-            + compute_pending_rewards(&accounts[0].1, rewards_level)
+            + compute_pending_rewards(&accounts[0].1, rewards_level).unwrap()
             + pending_on_expiring;
 
         // Without the rewards flag: only the expiring account's raw
         // 4_000_000 microAlgos is subtracted, its extrapolated rewards stay
         // in the total.
         assert_eq!(
-            total_online_stake(&accounts, rewards_level, vote_rnd, false, false),
+            total_online_stake(&accounts, rewards_level, vote_rnd, false, false).unwrap(),
             raw_total - 4_000_000
         );
         // With the rewards flag: the expiring account's rewards are
         // subtracted too.
         assert_eq!(
-            total_online_stake(&accounts, rewards_level, vote_rnd, false, true),
+            total_online_stake(&accounts, rewards_level, vote_rnd, false, true).unwrap(),
             raw_total - 4_000_000 - pending_on_expiring
         );
     }

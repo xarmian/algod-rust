@@ -2555,7 +2555,12 @@ impl AccountTotalsDelta {
     /// the extrapolation to the ledger's current `rewards_level` is just
     /// `compute_pending_rewards`.
     fn fold(&mut self, account: &AccountData, rewards_level: u64, sign: i128) {
-        let pending = crate::rewards::compute_pending_rewards(account, rewards_level);
+        // Every write lands at the ledger's current level, which no stored
+        // account's rewards base exceeds; an overflowing product cannot fit
+        // the u64 balance it is added to. Neither wraps: the extrapolation
+        // is dropped instead (the removal and the addition of the same
+        // write stay symmetric).
+        let pending = crate::rewards::compute_pending_rewards(account, rewards_level).unwrap_or(0);
         let money = sign * (account.micro_algos as i128 + pending as i128);
         let reward_units = sign * (account.micro_algos / crate::rewards::REWARD_UNITS) as i128;
         match account.status {
@@ -5747,7 +5752,7 @@ impl SqliteLedger {
                 continue;
             }
             let pending = if rewards_level >= acct.rewards_base {
-                crate::rewards::compute_pending_rewards(&acct, rewards_level)
+                crate::rewards::compute_pending_rewards(&acct, rewards_level)?
             } else {
                 0
             };
@@ -5801,7 +5806,7 @@ impl SqliteLedger {
                 continue;
             }
             if rewards_level >= account.rewards_base {
-                crate::rewards::apply_rewards(&mut account, rewards_level);
+                crate::rewards::apply_rewards(&mut account, rewards_level)?;
             }
             expired_stake = expired_stake
                 .checked_add(account.micro_algos)
@@ -5965,7 +5970,7 @@ impl SqliteLedger {
         }
         let rewards_level = self.rewards_level_at(round)?;
         if rewards_level >= acct.rewards_base {
-            let pending = crate::rewards::compute_pending_rewards(&acct, rewards_level);
+            let pending = crate::rewards::compute_pending_rewards(&acct, rewards_level)?;
             acct.micro_algos = acct.micro_algos.saturating_add(pending);
             acct.rewards_base = rewards_level;
         }

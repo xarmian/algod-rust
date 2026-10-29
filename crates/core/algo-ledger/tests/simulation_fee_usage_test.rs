@@ -27,9 +27,9 @@
 //! inner-transaction tree, matching go-algorand's `populateFeeUsage`
 //! (`ledger/simulation/trace.go`).
 
+use algo_ledger::apply::pool_fixtures::{funded_simulation_state, TEST_GENESIS_HASH};
 use std::collections::BTreeMap;
 
-use algo_ledger::apply::pool_fixtures::funded_ledger_state;
 use algo_ledger::simulation::{SimulationRequest, Simulator};
 use algo_ledger::{LedgerState, LedgerStore};
 use algo_types::{AccountData, Address, AppParams, SignedTransaction, StateSchema, Transaction};
@@ -43,7 +43,7 @@ fn app_address(app_id: u64) -> Address {
 }
 
 fn setup_state(sender: Address) -> LedgerState {
-    let mut state = funded_ledger_state();
+    let mut state = funded_simulation_state();
     state.fee_sink = FEE_SINK;
     state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
     state.set_account(
@@ -96,6 +96,7 @@ fn make_appl_txn(sender: Address, app_id: u64) -> SignedTransaction {
             last_valid: 1000.into(),
             application_id: app_id,
             on_completion: 0,
+            genesis_hash: TEST_GENESIS_HASH,
             ..Default::default()
         },
         ..Default::default()

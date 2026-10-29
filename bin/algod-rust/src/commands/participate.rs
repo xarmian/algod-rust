@@ -1818,37 +1818,14 @@ impl SimpleBlockEvaluator {
             class: algo_error::RejectClass::Other,
         };
         for stx in txgroup {
-            if round < stx.txn.first_valid || round > stx.txn.last_valid {
-                return Err(rejected(format!(
-                    "txn dead: round {} outside of {}--{}",
-                    round.0, stx.txn.first_valid.0, stx.txn.last_valid.0,
-                )));
-            }
-            if !stx.txn.genesis_id.is_empty() && stx.txn.genesis_id != self.hdr.genesis_id {
-                return Err(rejected(format!(
-                    "tx.GenesisID <{}> does not match expected <{}>",
-                    stx.txn.genesis_id, self.hdr.genesis_id,
-                )));
-            }
-            if params.support_genesis_hash {
-                let zero = [0u8; 32];
-                if stx.txn.genesis_hash != zero && stx.txn.genesis_hash != self.hdr.genesis_hash {
-                    return Err(rejected(format!(
-                        "tx.GenesisHash <{}> does not match expected <{}>",
-                        algo_types::Digest(stx.txn.genesis_hash),
-                        algo_types::Digest(self.hdr.genesis_hash),
-                    )));
-                }
-                if params.require_genesis_hash && stx.txn.genesis_hash == zero {
-                    return Err(rejected("required tx.GenesisHash is missing".to_string()));
-                }
-            } else if stx.txn.genesis_hash != [0u8; 32] {
-                // a protocol that predates genesis hashes allows none
-                return Err(rejected(format!(
-                    "tx.GenesisHash <{}> not allowed",
-                    algo_types::Digest(stx.txn.genesis_hash),
-                )));
-            }
+            algo_validate::block_alive(
+                round.0,
+                &self.hdr.genesis_id,
+                &self.hdr.genesis_hash,
+                params,
+                &stx.txn,
+            )
+            .map_err(rejected)?;
         }
 
         // The returned group (txid computation, block assembly) has its genesis
@@ -2145,12 +2122,14 @@ impl SimpleBlockEvaluator {
         let auth = self.expected_authorizer(sender);
         data.auth_addr = if auth == *sender { None } else { Some(auth) };
         if after_fee || touched {
-            algo_ledger::apply_rewards(&mut data, self.hdr.rewards_level);
+            // Only the printed account: an overflow leaves it as stored.
+            let _ = algo_ledger::apply_rewards(&mut data, self.hdr.rewards_level);
             data.micro_algos = data_balance;
         } else {
             // the stored account: `balance_now` counts pending rewards the
             // fee move would only apply to its copy
-            let pending = algo_ledger::compute_pending_rewards(&data, self.hdr.rewards_level);
+            let pending =
+                algo_ledger::compute_pending_rewards(&data, self.hdr.rewards_level).unwrap_or(0);
             data.micro_algos = balance_now.saturating_sub(pending);
         }
         algo_validate::overspend::overspend_message(txid, sender, &data, tried)
@@ -2682,8 +2661,10 @@ impl SimpleBlockEvaluator {
     ///   pending = reward_units * rewards_delta
     ///   adjusted = micro_algos + pending
     fn balance_with_rewards(&self, acct: &AccountData) -> u64 {
-        algo_ledger::compute_pending_rewards(acct, self.hdr.rewards_level)
-            .checked_add(acct.micro_algos)
+        // The snapshot is the state the block builds on and `hdr` is that
+        // block's (next) rewards level, so no base exceeds it; an overflow
+        // is go's `WithUpdatedRewards` panic.
+        algo_ledger::rewards::balance_with_rewards(acct, self.hdr.rewards_level)
             .expect("reward overflow: account rewards exceeded u64 max")
     }
 
@@ -3892,24 +3873,17 @@ impl PoolLedgerAdapter {
         _payset_hint: usize,
         max_txn_bytes_per_block: usize,
     ) -> Result<SimpleBlockEvaluator, algo_error::AlgoError> {
-        // `hdr` is the PREVIOUS (committed) block header. The consensus params
-        // for the round we're about to build are the previous protocol's unless
-        // a protocol switch occurs — and block production never crosses an
-        // upgrade (see make_next_block_header), so the previous protocol's
-        // params govern.
-        let consensus_params = algo_types::consensus::consensus_params_for_version(
-            &hdr.current_protocol,
-        )
-        .ok_or_else(|| {
-            // Go returns protocol.Error(hdr.CurrentProtocol) for unknown
-            // versions — do the same instead of silently falling back.
-            algo_error::AlgoError::Ledger {
-                message: format!(
-                    "unknown protocol version '{}' in block header",
-                    hdr.current_protocol
-                ),
-            }
-        })?;
+        // `hdr` is the PREVIOUS (committed) block header. go's
+        // `StartEvaluator` evaluates the new block (its `NextRewardsState`,
+        // the pool's `MinBalance`, every transaction) under
+        // `config.Consensus[hdr.CurrentProtocol]` of the block `MakeBlock`
+        // built, i.e. after the upgrade switch when one is due at this round
+        // (issue #2118), and returns `protocol.Error` for an unknown version.
+        let next_protocol = algo_ledger::next_block_protocol(&hdr)?;
+        let consensus_params = algo_types::consensus::consensus_params_for_version(&next_protocol)
+            .ok_or_else(|| algo_error::AlgoError::Ledger {
+                message: format!("unknown protocol version '{next_protocol}' in block header"),
+            })?;
 
         // Snapshot the committed state at the previous round — evaluation reads
         // balances as of the block we build on. This briefly acquires the mutex,
@@ -7396,6 +7370,51 @@ mod tests {
         assert_eq!(
             block.seed, [0u8; 32],
             "seed left for the producer/agreement"
+        );
+    }
+
+    /// Issue #2118: go's `StartEvaluator` runs the new block under
+    /// `config.Consensus[hdr.CurrentProtocol]` of the block `MakeBlock`
+    /// built, so at the upgrade switch round the next protocol's params (its
+    /// `NextRewardsState`, `MinBalance`, transaction rules) apply, not the
+    /// previous block's.
+    #[test]
+    fn start_evaluator_uses_the_protocol_after_an_upgrade_switch() {
+        let adapter = PoolLedgerAdapter::new(test_ledger());
+        let prev = |switch_on: u64| BlockHeader {
+            round: Round(5),
+            current_protocol: algo_types::CONSENSUS_V41.to_string(),
+            next_protocol: algo_types::consensus::CONSENSUS_V42.to_string(),
+            next_protocol_switch_on: Round(switch_on),
+            timestamp: 1000,
+            ..BlockHeader::default()
+        };
+        let v41 =
+            algo_types::consensus::consensus_params_for_version(algo_types::CONSENSUS_V41).unwrap();
+        let v42 = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V42,
+        )
+        .unwrap();
+        assert_ne!(v41.logic_sig_version, v42.logic_sig_version);
+        // The switch is due in the block being built (round 6).
+        let eval = adapter
+            .start_simple_evaluator(prev(6), 0, 0)
+            .expect("start_evaluator");
+        assert_eq!(
+            eval.hdr.current_protocol,
+            algo_types::consensus::CONSENSUS_V42
+        );
+        assert_eq!(
+            eval.consensus_params.logic_sig_version,
+            v42.logic_sig_version
+        );
+        // A round later: the block still runs the previous protocol.
+        let eval = adapter
+            .start_simple_evaluator(prev(7), 0, 0)
+            .expect("start_evaluator");
+        assert_eq!(
+            eval.consensus_params.logic_sig_version,
+            v41.logic_sig_version
         );
     }
 

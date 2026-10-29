@@ -1052,7 +1052,10 @@ impl crate::store_trait::LedgerStore for LedgerState {
             ..Default::default()
         };
         for account in self.accounts.values() {
-            let pending = crate::rewards::compute_pending_rewards(account, self.rewards_level);
+            // The in-memory test backend: a base above the level (a synthetic
+            // state only) adds no pending rewards rather than wrapping.
+            let pending =
+                crate::rewards::compute_pending_rewards(account, self.rewards_level).unwrap_or(0);
             let money = account.micro_algos.saturating_add(pending);
             let reward_units = account.micro_algos / crate::rewards::REWARD_UNITS;
             let bucket = match account.status {

@@ -38,7 +38,7 @@
 
 use algo_avm::logicsig_context::SigBlockSource;
 use algo_codec::canonical_encode_transaction;
-use algo_ledger::apply::pool_fixtures::funded_ledger_state;
+use algo_ledger::apply::pool_fixtures::{funded_simulation_state, TEST_GENESIS_HASH};
 use algo_ledger::simulation::{SimulationRequest, Simulator, SimulatorError};
 use algo_ledger::{LedgerState, LedgerStore};
 use algo_types::{AccountData, Address, BlockHeader, LogicSig, SignedTransaction, Transaction};
@@ -68,7 +68,7 @@ fn contract_account_address(program: &[u8]) -> Address {
 /// header at round 9 (`SEEDED_TIMESTAMP`), matching `FirstValid=10`'s
 /// `FirstValidTime` lookback target (`block(FirstValid - 1)`).
 fn base_state() -> LedgerState {
-    let mut state = funded_ledger_state();
+    let mut state = funded_simulation_state();
     state.fee_sink = FEE_SINK;
     state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
     state.set_account(
@@ -83,6 +83,7 @@ fn base_state() -> LedgerState {
         round: algo_types::Round(9),
         timestamp: SEEDED_TIMESTAMP,
         current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+        genesis_hash: TEST_GENESIS_HASH,
         ..BlockHeader::default()
     };
     let hdrdata = algo_codec::canonical_encode_block_header(&hdr);
@@ -120,6 +121,7 @@ fn make_group(lsig_addr: Address, program: Vec<u8>) -> Vec<SignedTransaction> {
         fee: 1000,
         first_valid: 10.into(),
         last_valid: 1000.into(),
+        genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     };
     // Contract-account LogicSig: no delegation signature, sender ==
