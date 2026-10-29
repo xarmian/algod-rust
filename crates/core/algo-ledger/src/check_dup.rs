@@ -27,8 +27,9 @@
 //! `ledger/eval/cow.go`: the txid, then the lease), then the ledger's txtail
 //! (`txTail.checkDup`, `ledger/txtail.go`: the lease, then the txid).
 //! [`check_dup`] keeps that order. Simulate uses it today (issue #2125); it
-//! takes the block's own state as a [`BlockDups`] so validate-mode block
-//! evaluation can reuse it (issue #2127).
+//! takes the block's own state as a [`BlockDups`] and the ledger's as a
+//! [`LedgerDups`] so validate-mode block evaluation can reuse it (issue
+//! #2127).
 
 use std::collections::{HashMap, HashSet};
 
@@ -85,78 +86,138 @@ impl BlockDups {
     }
 }
 
-/// go `checkDup` for `txn` (id `txid`) evaluated in block `round`, after the
-/// transactions in `block`.
+/// The ledger half of go `checkDup` for one group or block evaluated in
+/// `round`, loaded lazily and at most once (issue #2125): which of its
+/// `txids` the txtail already holds, and, for a past `round`, the leases in
+/// force in go's window.
+#[derive(Debug)]
+pub struct LedgerDups {
+    round: u64,
+    txids: Vec<Digest>,
+    confirmed: Option<HashSet<Digest>>,
+    past_leases: Option<crate::lease::LeaseTable>,
+}
+
+impl LedgerDups {
+    /// The ledger state for evaluating the transactions `txids` in `round`.
+    #[must_use]
+    pub fn new(round: u64, txids: Vec<Digest>) -> Self {
+        Self {
+            round,
+            txids,
+            confirmed: None,
+            past_leases: None,
+        }
+    }
+
+    /// The txids this was built for.
+    #[must_use]
+    pub fn txids(&self) -> &[Digest] {
+        &self.txids
+    }
+
+    fn txid_in_ledger<L: LedgerStore + ?Sized>(
+        &mut self,
+        store: &L,
+        consensus: &ConsensusParams,
+        txid: &Digest,
+    ) -> bool {
+        self.confirmed
+            .get_or_insert_with(|| {
+                store.txtail_confirmed_txids(&self.txids, consensus.max_txn_life)
+            })
+            .contains(txid)
+    }
+
+    /// go `txTail.checkDup`'s lease half: a committed transaction with this
+    /// (sender, lease) is still in force at `round`.
+    ///
+    /// go scans `recent[r]` for the rounds `[round - MaxTxnLife, round]`
+    /// (with `FixTransactionLeases`, set on every protocol since v18) for a
+    /// lease that expires at or after `round`; `recent` itself only keeps
+    /// the rounds `[latest - MaxTxnLife, latest]` (`txTail.committedUpTo`).
+    /// When `round` is the next block that is every committed round, so the
+    /// store's lease table (the latest expiry per pair) answers it. For a
+    /// past round (simulate's `round` parameter) the table also holds leases
+    /// committed after `round`, so the window's txtail rows are read once
+    /// into a table of their own
+    /// ([`crate::lease::LeaseTable::record_txtail_round`]). A missing,
+    /// unreadable or undecodable row adds no leases.
+    fn lease_in_ledger<L: LedgerStore + ?Sized>(
+        &mut self,
+        store: &L,
+        consensus: &ConsensusParams,
+        txn: &Transaction,
+    ) -> bool {
+        let round = self.round;
+        let latest = store.current_round().0;
+        if round > latest {
+            return store.check_lease(&txn.sender, &txn.lease, round).is_err();
+        }
+        self.past_leases
+            .get_or_insert_with(|| {
+                let mut table = crate::lease::LeaseTable::new();
+                let life = consensus.max_txn_life;
+                let first = round
+                    .saturating_sub(life)
+                    .max(latest.saturating_sub(life))
+                    .max(1);
+                for r in first..=round {
+                    let Some(bytes) = store.get_txtail(r).ok().flatten() else {
+                        continue;
+                    };
+                    if let Ok(tail) = rmp_serde::from_slice::<algo_types::TxTailRound>(&bytes) {
+                        table.record_txtail_round(&tail, round);
+                    }
+                }
+                table
+            })
+            .check(&txn.sender, &txn.lease, round)
+            .is_err()
+    }
+}
+
+/// go `checkDup` for `txn` (id `txid`) evaluated after the transactions in
+/// `block`, with `ledger` the ledger half for its round.
+///
+/// Order, as in go: the block's own txid, then its leases
+/// (`roundCowState.checkDup`); then the ledger's (`txTail.checkDup`): a
+/// `LastValid` below its low-water mark, the lease, the txid.
 pub fn check_dup<L: LedgerStore + ?Sized>(
     store: &L,
     consensus: &ConsensusParams,
-    round: u64,
     txn: &Transaction,
     txid: Digest,
     block: &BlockDups,
+    ledger: &mut LedgerDups,
 ) -> Result<(), AlgoError> {
     if block.txids.contains(&txid) {
         return Err(transaction_in_ledger_error(txid));
     }
-    if consensus.support_transaction_leases && txn.lease != [0u8; 32] {
-        let in_block = block
+    let leased = consensus.support_transaction_leases && txn.lease != [0u8; 32];
+    if leased
+        && block
             .leases
             .get(&(txn.sender, txn.lease))
-            .is_some_and(|&expires| round <= expires);
-        if in_block || ledger_lease_live(store, consensus, round, txn) {
-            return Err(lease_in_ledger_error(txid, &txn.sender, &txn.lease));
-        }
+            .is_some_and(|&expires| ledger.round <= expires)
+    {
+        return Err(lease_in_ledger_error(txid, &txn.sender, &txn.lease));
     }
-    if store.txtail_contains_txid(&txid) {
+    // go `txTail.checkDup`: `lastValid < t.lowWaterMark`. The low-water mark
+    // is the last round flushed to the block store; algod-rust commits each
+    // block synchronously, so it is the latest round. Only a past simulate
+    // round can reach this (`Alive` keeps `LastValid >= round` otherwise).
+    if txn.last_valid.0 < store.current_round().0 {
+        return Err(rejected(format!(
+            "txTail: tried to check for dup in missing round {}",
+            txn.last_valid.0
+        )));
+    }
+    if leased && ledger.lease_in_ledger(store, consensus, txn) {
+        return Err(lease_in_ledger_error(txid, &txn.sender, &txn.lease));
+    }
+    if ledger.txid_in_ledger(store, consensus, &txid) {
         return Err(transaction_in_ledger_error(txid));
     }
     Ok(())
-}
-
-/// go `txTail.checkDup`'s lease half: a committed transaction with this
-/// (sender, lease) is still in force at `round`.
-///
-/// go scans the rounds `[round - MaxTxnLife, round]` (`FixTransactionLeases`;
-/// `[FirstValid, LastValid]` before it) for a lease that expires at or after
-/// `round`. When `round` is the next block, every committed round is in that
-/// window, so the store's lease table (the latest expiry per pair) answers
-/// it. For a past round (simulate's `round` parameter) the table also holds
-/// leases committed after `round`, so the txtail rows of the window are
-/// scanned instead. A missing or undecodable row adds no leases, as in
-/// [`crate::txtail_cache::TxTailDupCache::sync`].
-fn ledger_lease_live<L: LedgerStore + ?Sized>(
-    store: &L,
-    consensus: &ConsensusParams,
-    round: u64,
-    txn: &Transaction,
-) -> bool {
-    let latest = store.current_round().0;
-    if round > latest {
-        return store.check_lease(&txn.sender, &txn.lease, round).is_err();
-    }
-    let (first, last) = if consensus.fix_transaction_leases {
-        (round.saturating_sub(consensus.max_txn_life), round)
-    } else {
-        (txn.first_valid.0, txn.last_valid.0)
-    };
-    for r in first.max(1)..=last.min(latest) {
-        let Some(bytes) = store.get_txtail(r).ok().flatten() else {
-            continue;
-        };
-        let Ok(tail) = rmp_serde::from_slice::<algo_types::TxTailRound>(&bytes) else {
-            continue;
-        };
-        let live = tail.leases.iter().any(|l| {
-            l.sender == txn.sender
-                && l.lease.as_ref() == txn.lease.as_slice()
-                && usize::try_from(l.txn_idx)
-                    .ok()
-                    .and_then(|i| tail.last_valid.get(i))
-                    .is_some_and(|&expires| round <= expires)
-        });
-        if live {
-            return true;
-        }
-    }
-    false
 }

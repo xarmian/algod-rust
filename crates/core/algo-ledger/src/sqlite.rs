@@ -2276,14 +2276,17 @@ pub struct SqliteLedger {
     /// Lock-free committed-state reader over the same tracker + block files
     /// (issue #1764); `None` for in-memory ledgers. See [`crate::read_pool`].
     read_pool: Option<std::sync::Arc<crate::read_pool::LedgerReadPool>>,
-    /// In-memory lease table (leases are short-lived, no persistence needed).
+    /// In-memory lease table. Not persisted: rebuilt from the txtail rows
+    /// when the ledger is opened (`rebuild_lease_table_from_txtail`).
     lease_table: LeaseTable,
     /// In-memory mirror of the recent txtail txids for
-    /// [`LedgerStore::txtail_contains_txid`] (simulate's go `checkDup`,
-    /// issue #2125): loaded once, then advanced one row per committed round,
-    /// so a lookup never rescans the txtail table. Derived from committed
-    /// rows only and rebuilt when the ledger round goes backwards, so it
-    /// needs no block snapshot.
+    /// [`LedgerStore::txtail_confirmed_txids`] (go `checkDup`'s txid half,
+    /// used by simulate and the pool, issue #2125): loaded once, then
+    /// advanced one row per committed round (absent rows are retried), so a
+    /// lookup never rescans the txtail table. Derived from committed rows
+    /// only and rebuilt when the ledger round goes backwards; a reopened
+    /// ledger (e.g. after a catchpoint import) starts a fresh one. It needs
+    /// no block snapshot.
     txtail_dups: std::sync::Mutex<crate::txtail_cache::TxTailDupCache>,
     /// Snapshot of `lease_table` taken at `begin_block`, restored by
     /// `rollback_block`. The SQLite/trie rollback does not cover the in-memory
@@ -3148,7 +3151,7 @@ impl SqliteLedger {
         };
 
         let db_prefix_is_none = db_prefix.is_none();
-        Ok(Self {
+        let mut ledger = Self {
             conn,
             db_prefix,
             read_pool: None,
@@ -3196,7 +3199,36 @@ impl SqliteLedger {
             acctupdates_stats_gate: crate::acctupdates_stats::AccountUpdatesStatsGate::default(),
             retention: crate::store_trait::RetentionConfig::default(),
             last_commit_wall_time: None,
-        })
+        };
+        ledger.rebuild_lease_table_from_txtail();
+        Ok(ledger)
+    }
+
+    /// Rebuild the in-memory lease table from the persisted txtail rows of
+    /// the last `MaxTxnLife` rounds, as go's `txTail.loadFromDisk`
+    /// (`ledger/txtail.go`) rebuilds its recent leases on every start.
+    ///
+    /// The table is never persisted. Without this, a restarted node, or one
+    /// reopened after a catchpoint import (`reload_ledger`), would accept a
+    /// transaction reusing a lease that is still in force, in block apply
+    /// and in simulate alike (issue #2125). A missing row adds no leases;
+    /// an unreadable or undecodable one is logged and skipped.
+    fn rebuild_lease_table_from_txtail(&mut self) {
+        let latest = self.current_round.0;
+        let max_txn_life = algo_types::consensus::consensus_params_for_version(&self.protocol)
+            .map_or(crate::txtail_cache::LOOKBACK_ROUNDS, |p| p.max_txn_life);
+        let mut table = LeaseTable::new();
+        for round in latest.saturating_sub(max_txn_life).max(1)..=latest {
+            match self.get_txtail(round) {
+                Ok(Some(bytes)) => match rmp_serde::from_slice::<algo_types::TxTailRound>(&bytes) {
+                    Ok(tail) => table.record_txtail_round(&tail, latest),
+                    Err(e) => tracing::warn!(round, "lease rebuild: undecodable txtail row: {e}"),
+                },
+                Ok(None) => {}
+                Err(e) => tracing::warn!(round, "lease rebuild: txtail read failed: {e}"),
+            }
+        }
+        self.lease_table = table;
     }
 
     /// Return a reference to the in-memory lease table.
@@ -8412,14 +8444,25 @@ impl LedgerStore for SqliteLedger {
             })
     }
 
-    fn txtail_contains_txid(&self, txid: &algo_types::Digest) -> bool {
+    fn txtail_confirmed_txids(
+        &self,
+        txids: &[algo_types::Digest],
+        max_txn_life: u64,
+    ) -> std::collections::HashSet<algo_types::Digest> {
+        let fetch = |r| self.get_txtail(r).ok().flatten();
+        let found = |cache: &crate::txtail_cache::TxTailDupCache| {
+            txids
+                .iter()
+                .filter(|t| cache.contains(t))
+                .copied()
+                .collect()
+        };
         // Mid-block, `current_round` may run ahead of the rows written so
-        // far, and the cache would remember such a round as empty: answer
-        // from the rows directly then (the trait default).
+        // far: answer from the rows directly, without touching the cache.
         if self.in_block {
             let mut cache = crate::txtail_cache::TxTailDupCache::new();
-            cache.sync(self.current_round.0, |r| self.get_txtail(r).ok().flatten());
-            return cache.contains(txid);
+            cache.sync_window(self.current_round.0, max_txn_life, fetch);
+            return found(&cache);
         }
         // The cache only holds data re-derivable from the rows: a panic in
         // another holder cannot leave it wrong, so poisoning is ignored.
@@ -8427,8 +8470,8 @@ impl LedgerStore for SqliteLedger {
             .txtail_dups
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.sync(self.current_round.0, |r| self.get_txtail(r).ok().flatten());
-        cache.contains(txid)
+        cache.sync_window(self.current_round.0, max_txn_life, fetch);
+        found(&cache)
     }
 
     // ---- Pruning ----

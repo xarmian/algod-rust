@@ -32,7 +32,9 @@
 //! blocks go generated, and the simulate result of every scenario. Stage A
 //! runs at latest = 3, some scenarios at the past round 1. Stage B appends
 //! empty blocks until the simulated round is `2 + MaxTxnLife`, so block 2
-//! sits on the `round - MaxTxnLife` boundary. This test applies the same
+//! sits on the `round - MaxTxnLife` boundary. Stage C adds two rounds and
+//! simulates that round again as a past round: the lease window edge, and
+//! go's txtail low-water-mark error. This test applies the same
 //! blocks to a Rust ledger and asserts the same failure message and
 //! `failed_at` for each scenario, and that simulate leaves accounts, the
 //! lease table and the txtail exactly as they were.
@@ -74,6 +76,7 @@ struct Oracle {
     genesis_accounts: Vec<OracleAccount>,
     blocks: Vec<String>,
     stage_b_latest: u64,
+    stage_c_latest: u64,
     scenarios: Vec<OracleScenario>,
 }
 
@@ -98,6 +101,17 @@ fn load_oracle() -> Oracle {
 /// (which records each block's txtail row and leases). Returns the last
 /// block.
 fn seed_go_blocks<L: LedgerStore>(store: &mut L, o: &Oracle) -> Block {
+    seed_go_blocks_with(store, o, |s, b| {
+        algo_ledger::apply::apply_block(s, b).expect("apply go block")
+    })
+}
+
+/// [`seed_go_blocks`], applying each block with `apply`.
+fn seed_go_blocks_with<L: LedgerStore>(
+    store: &mut L,
+    o: &Oracle,
+    mut apply: impl FnMut(&mut L, &Block),
+) -> Block {
     store.set_protocol(o.protocol.clone());
     store.set_genesis_id(o.genesis_id.clone());
     store.set_genesis_hash(b64(&o.genesis_hash).try_into().expect("genesis hash"));
@@ -122,18 +136,16 @@ fn seed_go_blocks<L: LedgerStore>(store: &mut L, o: &Oracle) -> Block {
     for (i, b) in o.blocks.iter().enumerate() {
         let block = algo_codec::decode_block(&b64(b)).expect("decode go block");
         assert_eq!(block.round.0, i as u64 + 1);
-        algo_ledger::apply::apply_block(store, &block).expect("apply go block");
+        apply(store, &block);
         last = Some(block);
     }
     assert_eq!(store.current_round().0, o.blocks.len() as u64);
     last.expect("the fixture has blocks")
 }
 
-/// Empty blocks up to the round go reached for stage B, so the simulated
-/// round is 2 + MaxTxnLife.
-fn extend_to_stage_b<L: LedgerStore>(store: &mut L, o: &Oracle, last: &Block) {
-    assert_eq!(o.stage_b_latest, 1 + o.max_txn_life);
-    for round in o.blocks.len() as u64 + 1..=o.stage_b_latest {
+/// Empty blocks up to `latest`, the round go reached for a stage.
+fn extend_to<L: LedgerStore>(store: &mut L, last: &Block, latest: u64) {
+    for round in store.current_round().0 + 1..=latest {
         let block = Block {
             round: Round(round),
             timestamp: 1_700_000_000 + round as i64 * 5,
@@ -142,7 +154,7 @@ fn extend_to_stage_b<L: LedgerStore>(store: &mut L, o: &Oracle, last: &Block) {
         };
         algo_ledger::apply::apply_block(store, &block).expect("apply empty block");
     }
-    assert_eq!(store.current_round().0, o.stage_b_latest);
+    assert_eq!(store.current_round().0, latest);
 }
 
 /// Everything simulate must leave untouched: the accounts, the lease table
@@ -205,8 +217,14 @@ fn run_oracle<L: LedgerStore>(store: &mut L, lease_fp: fn(&L) -> u64) {
     let o = load_oracle();
     let last = seed_go_blocks(store, &o);
     run_stage(store, &o, "A", lease_fp);
-    extend_to_stage_b(store, &o, &last);
+    // Stage B: the simulated round is 2 + MaxTxnLife.
+    assert_eq!(o.stage_b_latest, 1 + o.max_txn_life);
+    extend_to(store, &last, o.stage_b_latest);
     run_stage(store, &o, "B", lease_fp);
+    // Stage C: two more rounds; the same round simulated as a past round.
+    assert_eq!(o.stage_c_latest, 3 + o.max_txn_life);
+    extend_to(store, &last, o.stage_c_latest);
+    run_stage(store, &o, "C", lease_fp);
 }
 
 /// Every scenario matches go-algorand's simulate: the duplicate-txid and
@@ -227,4 +245,114 @@ fn simulate_checkdup_matches_go_on_sqlite() {
         l.scratch_invariant_fingerprint()
             .expect("SqliteLedger fingerprints its lease table")
     });
+}
+
+/// The same oracle on an archival `SqliteLedger`, like go's oracle ledger:
+/// every txtail row is kept, so only go's own window (`txTail.recent` keeps
+/// `[latest - MaxTxnLife, latest]`) hides the round-2 lease in stage C.
+#[test]
+fn simulate_checkdup_matches_go_on_archival_sqlite() {
+    let mut ledger = SqliteLedger::open_in_memory().expect("in-memory ledger");
+    ledger.configure_retention(algo_ledger::store_trait::RetentionConfig {
+        archival: true,
+        ..Default::default()
+    });
+    run_oracle(&mut ledger, |l| {
+        l.scratch_invariant_fingerprint()
+            .expect("SqliteLedger fingerprints its lease table")
+    });
+}
+
+/// Issue #2125: the lease table is in memory only, so `SqliteLedger` must
+/// rebuild it from the persisted txtail rows when it is reopened (a
+/// restart, or `reload_ledger` after a catchpoint import), as go's
+/// `txTail.loadFromDisk` does. Otherwise both simulate and block apply
+/// accept a lease that go still holds in force.
+#[test]
+fn reopened_sqlite_ledger_still_rejects_a_live_lease() {
+    let o = load_oracle();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let prefix = dir.path().join("ledger");
+    let last = {
+        let mut ledger = SqliteLedger::open_with_prefix(&prefix).expect("open ledger");
+        // Commit each block the way the node does, so it is on disk.
+        seed_go_blocks_with(&mut ledger, &o, |l, b| {
+            l.begin_block().expect("begin block");
+            algo_ledger::apply::apply_block(l, b).expect("apply go block");
+            l.commit_block().expect("commit block");
+        })
+    };
+    let mut ledger = SqliteLedger::open_with_prefix(&prefix).expect("reopen ledger");
+    assert_eq!(ledger.current_round().0, o.blocks.len() as u64);
+
+    // Simulate: go's lease error for a new payment reusing block 1's lease.
+    let sc = o
+        .scenarios
+        .iter()
+        .find(|s| s.name == "committed_lease")
+        .expect("committed_lease scenario");
+    let group = algo_codec::decode_signed_txn_stream(&b64(&sc.group_msgpack)).expect("group");
+    let result = Simulator::new(&mut ledger)
+        .simulate(SimulationRequest {
+            txn_groups: vec![group],
+            allow_empty_signatures: true,
+            ..Default::default()
+        })
+        .expect("simulate");
+    assert_eq!(
+        result.txn_groups[0]
+            .failure_message
+            .clone()
+            .unwrap_or_default(),
+        sc.failure_message,
+        "simulate after reopen"
+    );
+
+    // Block apply: block 3's leased payment again in the next block (in
+    // go's block encoding) is a lease conflict.
+    let block = Block {
+        round: Round(o.blocks.len() as u64 + 1),
+        payset: last.payset.clone(),
+        ..last
+    };
+    let err = algo_ledger::apply::apply_block(&mut ledger, &block)
+        .expect_err("a block reusing a live lease must not apply after reopen");
+    assert!(
+        err.to_string().contains("duplicate lease"),
+        "expected the lease conflict, got: {err}"
+    );
+}
+
+/// Issue #2125: `SqliteLedger`'s txid cache must not remember a round whose
+/// txtail row was absent as empty forever (a catchpoint's lookback rows
+/// land after their round): the next round retries it.
+#[test]
+fn sqlite_txid_lookup_retries_a_round_whose_row_landed_late() {
+    fn tail(round: u64, ids: &[algo_types::Digest]) -> Vec<u8> {
+        algo_codec::canonical_encode_txtail_round(&algo_types::TxTailRound {
+            txn_ids: ids
+                .iter()
+                .map(|id| serde_bytes::ByteBuf::from(id.0.to_vec()))
+                .collect(),
+            last_valid: ids.iter().map(|_| round + 1000).collect(),
+            leases: Vec::new(),
+            hdr: algo_types::BlockHeader {
+                round: Round(round),
+                ..Default::default()
+            },
+        })
+    }
+    let id = algo_types::Digest([0x42; 32]);
+    let mut l = SqliteLedger::open_in_memory().expect("in-memory ledger");
+    l.put_txtail(2, &tail(2, &[])).expect("put round 2");
+    l.set_current_round(Round(2));
+    // Round 1's row is not there yet.
+    assert!(l.txtail_confirmed_txids(&[id], 1000).is_empty());
+    l.put_txtail(1, &tail(1, &[id])).expect("put round 1");
+    l.put_txtail(3, &tail(3, &[])).expect("put round 3");
+    l.set_current_round(Round(3));
+    assert!(
+        l.txtail_confirmed_txids(&[id], 1000).contains(&id),
+        "the late row for round 1 is picked up"
+    );
 }

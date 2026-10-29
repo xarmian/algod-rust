@@ -32,7 +32,8 @@
 // This builds a real in-memory go-algorand ledger and commits three blocks
 // of payments from A:
 //
-//	block 1: "committed" (plain) and "committed-leased" (lease 0x11..)
+//	block 1: "committed" (plain), "committed-leased" (lease 0x11..) and
+//	         "below-leased" (lease 0x55.., valid until 1 + MaxTxnLife)
 //	block 2: "edge" (plain) and "edge-leased" (lease 0x44..), both valid
 //	         until round 2 + MaxTxnLife
 //	block 3: "late" (lease 0x33..)
@@ -40,7 +41,8 @@
 // Stage "A" simulates at latest = 3 (some scenarios at the past round 1).
 // Stage "B" first appends empty blocks up to round 2 + MaxTxnLife - 1, so
 // the simulated round is 2 + MaxTxnLife and block 2 sits exactly on the
-// round - MaxTxnLife boundary of go's lease scan. Every scenario goes
+// round - MaxTxnLife boundary of go's lease scan. Stage "C" adds two rounds
+// and simulates at that same round as a past round. Every scenario goes
 // through the real, unmodified `Simulator`. The result is written to
 // tests/fixtures/simulate_checkdup/oracle.json; the Rust side is
 // crates/core/algo-ledger/tests/simulation_checkdup_oracle_test.rs.
@@ -88,6 +90,7 @@ type checkDupFixture struct {
 	Accounts    []account          `json:"genesis_accounts"`
 	Blocks      []string           `json:"blocks"`
 	StageBLast  uint64             `json:"stage_b_latest"`
+	StageCLast  uint64             `json:"stage_c_latest"`
 	Scenarios   []checkDupScenario `json:"scenarios"`
 }
 
@@ -127,6 +130,7 @@ func checkDupOracle() {
 		return
 	}
 	lease, lease2, lateLease, edgeLease := leaseOf(0x11), leaseOf(0x22), leaseOf(0x33), leaseOf(0x44)
+	belowLease := leaseOf(0x55)
 	payIn := func(note string, l [32]byte, fv, lv basics.Round) transactions.Transaction {
 		return transactions.Transaction{
 			Type: protocol.PaymentTx,
@@ -152,6 +156,8 @@ func checkDupOracle() {
 	edge := payIn("edge", [32]byte{}, 2, 2+maxLife)
 	edgeLeased := payIn("edge-leased", edgeLease, 2, 2+maxLife)
 	late := pay("late", lateLease)
+	// Leased in round 1, in force until round 1 + MaxTxnLife.
+	belowLeased := payIn("below-leased", belowLease, 1, 1+maxLife)
 
 	// Each block is generated exactly as a proposer would.
 	addBlock := func(txns ...transactions.Transaction) bookkeeping.Block {
@@ -182,7 +188,7 @@ func checkDupOracle() {
 		RewardsPool: b64(pool[:]),
 		MaxTxnLife:  params.MaxTxnLife,
 	}
-	for _, txns := range [][]transactions.Transaction{{committed, committedLeased}, {edge, edgeLeased}, {late}} {
+	for _, txns := range [][]transactions.Transaction{{committed, committedLeased, belowLeased}, {edge, edgeLeased}, {late}} {
 		blk := addBlock(txns...)
 		f.Blocks = append(f.Blocks, b64(protocol.Encode(&blk)))
 	}
@@ -288,6 +294,28 @@ func checkDupOracle() {
 		// Leased in round 2, the first round of go's lease scan.
 		{"edge_lease", 0, single(payIn("edge-new", edgeLease, simRound, simRound))},
 		{"edge_fresh", 0, single(payIn("edge-fresh", [32]byte{}, simRound, simRound))},
+	})
+
+	// Stage C: two more rounds, then the past round 2 + MaxTxnLife - 1, so
+	// the simulated round is again 2 + MaxTxnLife (go only keeps a few
+	// rounds of account history for a past-round simulate).
+	for l.Latest() < 3+maxLife {
+		addBlock()
+	}
+	f.StageCLast = uint64(l.Latest())
+	pastRound := 1 + maxLife
+	pastSim := pastRound + 1
+	pastLast := pastSim + maxLife
+	run("C", []scenario{
+		// A LastValid below the txtail's low-water mark (the latest
+		// round): go's txTail cannot answer and fails the check.
+		{"past_round_last_valid_below_latest", pastRound, single(payIn("past-short", [32]byte{}, pastSim, pastSim))},
+		// Leased in round 2 = simulated round - MaxTxnLife, until round
+		// 2 + MaxTxnLife: inside the past-round window, in force.
+		{"past_window_lease_at_edge", pastRound, single(payIn("past-edge-new", edgeLease, pastSim, pastLast))},
+		// Leased in round 1, one round below the window: it expired at
+		// 1 + MaxTxnLife, so it is not in force.
+		{"past_window_lease_below_edge", pastRound, single(payIn("past-below-new", belowLease, pastSim, pastLast))},
 	})
 
 	path := filepath.Join("..", "..", "crates", "core", "algo-ledger", "tests", "fixtures", "simulate_checkdup", "oracle.json")

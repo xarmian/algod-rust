@@ -1577,43 +1577,6 @@ fn test_lease_across_blocks() {
     );
 }
 
-/// In validate mode the lease conflict is go's `checkDup` error,
-/// `ledgercore.LeaseInLedgerError` (issue #2125); replay keeps
-/// "duplicate lease" (above).
-#[test]
-fn test_lease_across_blocks_validating_reports_go_lease_error() {
-    let sender = Address([1u8; 32]);
-    let receiver = Address([2u8; 32]);
-    let fee_sink = Address([3u8; 32]);
-    let mut state = make_state(
-        &[(sender, 10_000_000), (receiver, 100_000), (fee_sink, 0)],
-        fee_sink,
-    );
-    let lease_val: [u8; 32] = [0xDD; 32];
-
-    let mut stx1 = pay_txn(sender, receiver, 1_000, 1_000);
-    stx1.txn.lease = lease_val;
-    stx1.txn.first_valid = Round(1);
-    stx1.txn.last_valid = Round(6);
-    apply_block(&mut state, &minimal_block(fee_sink, 1, vec![stx1])).unwrap();
-
-    let mut stx2 = pay_txn(sender, receiver, 1_000, 1_000);
-    stx2.txn.lease = lease_val;
-    stx2.txn.first_valid = Round(1);
-    stx2.txn.last_valid = Round(7);
-    let txid = algo_codec::compute_txn_id(&stx2.txn);
-    let err =
-        algo_ledger::apply_block_validating(&mut state, &minimal_block(fee_sink, 2, vec![stx2]))
-            .unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        format!(
-            "transaction {txid} using an overlapping lease (sender, lease):({sender}, {})",
-            Address(lease_val)
-        )
-    );
-}
-
 // ---------------------------------------------------------------------------
 // 15b. Lease across blocks — same sender, different lease — both succeed
 // (mirrors go-algorand's TestLeaseTransactionsSameSenderDifferentLease)

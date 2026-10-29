@@ -579,22 +579,30 @@ pub trait LedgerStore {
         Ok(None)
     }
 
-    /// Whether `txid` is in a block committed within the last
-    /// [`crate::txtail_cache::LOOKBACK_ROUNDS`] (`MaxTxnLife`) rounds: go's
-    /// `txTail.checkDup` txid lookup (`ledger/txtail.go`), used by
-    /// [`crate::check_dup::check_dup`].
+    /// The members of `txids` that a block committed in the last
+    /// `max_txn_life` rounds holds: go's `txTail.checkDup` txid lookup
+    /// (`ledger/txtail.go`), used by [`crate::check_dup`]. Callers pass the
+    /// active protocol's `MaxTxnLife` and every txid of a group at once.
     ///
-    /// This default rebuilds a [`crate::txtail_cache::TxTailDupCache`] from
-    /// the txtail rows on every call, which suits small in-memory stores.
-    /// `SqliteLedger` keeps one cache and advances it incrementally. A
-    /// missing, unreadable or undecodable row adds no txids, as in
-    /// `TxTailDupCache::sync`.
-    fn txtail_contains_txid(&self, txid: &algo_types::Digest) -> bool {
+    /// This default builds a [`crate::txtail_cache::TxTailDupCache`] from
+    /// the txtail rows on every call (once per group), which suits small
+    /// in-memory stores. `SqliteLedger` keeps one cache and advances it
+    /// incrementally. A missing, unreadable or undecodable row adds no
+    /// txids, as in `TxTailDupCache::sync`.
+    fn txtail_confirmed_txids(
+        &self,
+        txids: &[algo_types::Digest],
+        max_txn_life: u64,
+    ) -> std::collections::HashSet<algo_types::Digest> {
         let mut cache = crate::txtail_cache::TxTailDupCache::new();
-        cache.sync(self.current_round().0, |r| {
+        cache.sync_window(self.current_round().0, max_txn_life, |r| {
             self.get_txtail(r).ok().flatten()
         });
-        cache.contains(txid)
+        txids
+            .iter()
+            .filter(|t| cache.contains(t))
+            .copied()
+            .collect()
     }
 
     // ---- Pruning ----

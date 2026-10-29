@@ -567,8 +567,12 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
         self.inner.get_txtail(round)
     }
 
-    fn txtail_contains_txid(&self, txid: &algo_types::Digest) -> bool {
-        self.inner.txtail_contains_txid(txid)
+    fn txtail_confirmed_txids(
+        &self,
+        txids: &[algo_types::Digest],
+        max_txn_life: u64,
+    ) -> std::collections::HashSet<algo_types::Digest> {
+        self.inner.txtail_confirmed_txids(txids, max_txn_life)
     }
 
     // ---- Pruning ----

@@ -112,6 +112,30 @@ impl LeaseTable {
         }
     }
 
+    /// Record the leases of one txtail row (go `txTail.loadFromDisk`'s
+    /// `recent[rnd].txleases`) that are still in force at `active_at`
+    /// (their `last_valid >= active_at`). Rows are applied in ascending
+    /// round order, so a later lease for a pair replaces an earlier one, as
+    /// [`Self::record`] does during apply. Shared by the catchpoint
+    /// reconstruction, `SqliteLedger`'s rebuild on open and simulate's
+    /// past-round lease window (issue #2125).
+    pub fn record_txtail_round(&mut self, tail: &algo_types::TxTailRound, active_at: u64) {
+        for entry in &tail.leases {
+            let Ok(lease) = <[u8; 32]>::try_from(entry.lease.as_ref()) else {
+                continue;
+            };
+            let Some(&last_valid) = usize::try_from(entry.txn_idx)
+                .ok()
+                .and_then(|i| tail.last_valid.get(i))
+            else {
+                continue; // malformed entry, skip
+            };
+            if last_valid >= active_at {
+                self.record(&entry.sender, &lease, last_valid);
+            }
+        }
+    }
+
     /// Remove all entries whose `last_valid` is strictly less than
     /// `current_round`. These leases have expired and no longer need
     /// to block new transactions.

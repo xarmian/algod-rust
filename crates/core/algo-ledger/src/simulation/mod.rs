@@ -765,6 +765,8 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             round: block.round,
             mode: ApplyMode::Execute,
             validate: true,
+            // `check_dup` in the loop below owns the lease check (issue #2125).
+            leases_checked_by_caller: true,
             // go `simulator.go`: `Generate: true, Validate: true`.
             generate: true,
             latest_timestamp: block.latest_timestamp,
@@ -787,8 +789,6 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                     .allow_unnamed_resources
                     .then(|| Arc::new(NamedGroupResources::from_group(&eval_group))),
                 unnamed_capacity,
-                // `check_dup` in the loop below owns the lease check (issue #2125).
-                leases_checked_by_caller: true,
             },
             failed_eval_delta: Cell::new(None),
             kv_mods_recorder: None,
@@ -894,8 +894,11 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         let group_txid_cache = crate::avm_context::GroupTxidCache::default();
         let group_created = crate::apply::GroupCreatedResources::default();
 
-        // go `roundCowState`'s txids and leases for `checkDup`.
+        // go `roundCowState`'s txids and leases for `checkDup`, and the
+        // ledger half, built (txids hashed, txtail read) only once the first
+        // transaction passes `Alive`.
         let mut block_dups = crate::check_dup::BlockDups::new();
+        let mut ledger_dups: Option<crate::check_dup::LedgerDups> = None;
 
         for i in 0..eval_group.len() {
             if precheck_failure.is_some() {
@@ -956,16 +959,25 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 message,
                 class: algo_error::RejectClass::Other,
             });
-            let txid = algo_codec::compute_txn_id(&eval_group[i].txn);
             let checked = alive
                 .and_then(|()| {
+                    let ledger = ledger_dups.get_or_insert_with(|| {
+                        crate::check_dup::LedgerDups::new(
+                            block.round,
+                            eval_group
+                                .iter()
+                                .map(|stx| algo_codec::compute_txn_id(&stx.txn))
+                                .collect(),
+                        )
+                    });
+                    let txid = ledger.txids()[i];
                     crate::check_dup::check_dup(
                         &*self.store,
                         &apply_ctx.consensus,
-                        block.round,
                         &eval_group[i].txn,
                         txid,
                         &block_dups,
+                        ledger,
                     )
                 })
                 .and_then(|()| check_authorizer(self.store, &eval_group[i]));
@@ -1006,7 +1018,10 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
 
             match apply_result {
                 Ok(apply_data) => {
-                    block_dups.record(&eval_group[i].txn, txid);
+                    // `check_dup` ran, so the group's txids are built.
+                    if let Some(ledger) = &ledger_dups {
+                        block_dups.record(&eval_group[i].txn, ledger.txids()[i]);
+                    }
                     // Defensively drain `failed_eval_delta` even on success:
                     // nothing sets it on this path today, but a future change
                     // must not let a stale value from an earlier iteration
