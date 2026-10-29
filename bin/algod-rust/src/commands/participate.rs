@@ -3649,16 +3649,15 @@ impl algo_network::MessageHandler for ParticipateBlockRequestHandler {
 
 pub(crate) struct PoolLedgerAdapter {
     ledger: Arc<Mutex<SqliteLedger>>,
-    /// In-memory mirror of the recent txtail for duplicate checks —
-    /// go-algorand keeps the whole tail in memory (`ledger/txtail.go`)
-    /// and never re-reads it from SQLite per submission. See
-    /// [`algo_ledger::txtail_cache::TxTailDupCache`].
-    dup_cache: Mutex<algo_ledger::txtail_cache::TxTailDupCache>,
     /// Single-entry header cache: `block_hdr`/`consensus_params` are
     /// called for the latest round on every pool ingest; a committed
     /// round's header is immutable, so caching the last one read is
     /// trivially coherent.
     hdr_cache: Mutex<Option<(u64, BlockHeader)>>,
+    /// `MaxTxnLife` of the last protocol seen by `contains_confirmed_txid`,
+    /// so the per-submission duplicate check never clones a
+    /// `ConsensusParams` (issue #2125).
+    max_txn_life_cache: Mutex<Option<(String, u64)>>,
     /// Issue #1017: cache of recently-verified transaction groups, shared
     /// across every `BlockEvaluator` this adapter creates via
     /// `start_evaluator` -- one node-wide cache, exactly like go's single
@@ -3766,8 +3765,8 @@ impl PoolLedgerAdapter {
     ) -> Self {
         Self {
             ledger,
-            dup_cache: Mutex::new(algo_ledger::txtail_cache::TxTailDupCache::new()),
             hdr_cache: Mutex::new(None),
+            max_txn_life_cache: Mutex::new(None),
             verified_txn_cache: Arc::new(algo_validate::VerifiedTransactionCache::new(cache_size)),
         }
     }
@@ -3836,28 +3835,41 @@ impl algo_pool::traits::PoolLedger for PoolLedgerAdapter {
 
     fn contains_confirmed_txid(&self, txid: algo_types::Digest) -> bool {
         // Mirrors go's ledger txtail duplicate check (`ledger/txtail.go`'s
-        // `checkDup`): consult the recent-history window (go's `MaxTxnLife`,
-        // 1000 rounds) — a transaction older than that can never be a live
-        // duplicate (its own `last_valid` would already have expired).
+        // `checkDup`): consult the recent-history window (the active
+        // protocol's `MaxTxnLife`) — a transaction older than that can never
+        // be a live duplicate (its own `last_valid` would already have
+        // expired).
         //
-        // Like go's `txTail` tracker, the window lives in memory
-        // (`TxTailDupCache`), loaded from the ledger's txtail rows once and
-        // advanced incrementally as blocks commit. The pre-cache
-        // implementation re-read and decoded every txtail blob in the
-        // window from SQLite on every submission (~1.9 ms/call at 100
-        // rounds × 420 txns, measured) — the dominant CPU/allocation sink
-        // in the issue #100 stress bench. The cache answers identically
-        // (same rows, same window) in O(1).
+        // Like go's `txTail` tracker, the window lives in memory: the
+        // ledger's own `TxTailDupCache` (`txtail_contains_txid`), shared
+        // with simulate (issue #2125), loaded from the txtail rows once and
+        // advanced incrementally as blocks commit. Re-reading and decoding
+        // every txtail blob per submission (~1.9 ms/call at 100 rounds × 420
+        // txns, measured) was the dominant CPU sink in the issue #100 stress
+        // bench.
         let Ok(ledger) = self.ledger.lock() else {
             return false;
         };
-        let Ok(mut cache) = self.dup_cache.lock() else {
-            return false;
+        let max_txn_life = {
+            let mut cached = self
+                .max_txn_life_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match cached.as_ref() {
+                Some((protocol, life)) if protocol == ledger.protocol() => *life,
+                _ => {
+                    let life =
+                        algo_types::consensus::consensus_params_for_version(ledger.protocol())
+                            .map_or(algo_ledger::txtail_cache::LOOKBACK_ROUNDS, |p| {
+                                p.max_txn_life
+                            });
+                    *cached = Some((ledger.protocol().to_string(), life));
+                    life
+                }
+            }
         };
-        let current = ledger.current_round().0;
-        cache.sync(current, |round| ledger.get_txtail(round).ok().flatten());
-        drop(ledger);
-        cache.contains(&txid)
+        // Allocation-free on `SqliteLedger` (`TxTailDupCache::contains_within`).
+        ledger.txtail_contains_txid(&txid, max_txn_life)
     }
 
     fn start_evaluator(

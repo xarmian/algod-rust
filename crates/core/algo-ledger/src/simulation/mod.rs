@@ -765,6 +765,8 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             round: block.round,
             mode: ApplyMode::Execute,
             validate: true,
+            // `check_dup` in the loop below owns the lease check (issue #2125).
+            leases_checked_by_caller: true,
             // go `simulator.go`: `Generate: true, Validate: true`.
             generate: true,
             latest_timestamp: block.latest_timestamp,
@@ -892,6 +894,27 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         let group_txid_cache = crate::avm_context::GroupTxidCache::default();
         let group_created = crate::apply::GroupCreatedResources::default();
 
+        // go `roundCowState`'s txids and leases for `checkDup`, and the
+        // ledger half (which reads the txtail lazily, at most once). The
+        // txids are hashed only when evaluation will run. They are kept
+        // apart from `group_txid_cache` on purpose: that cache reproduces
+        // go's shared `EvalParams.txidCache`, whose entries a nested
+        // program can fill with an inner id (#1736), so seeding it with the
+        // top-level ids, or reading them back from it, would change what
+        // `txn TxID` returns.
+        let mut block_dups = crate::check_dup::BlockDups::new();
+        let mut ledger_dups = crate::check_dup::LedgerDups::new(
+            block.round,
+            if precheck_failure.is_none() {
+                eval_group
+                    .iter()
+                    .map(|stx| algo_codec::compute_txn_id(&stx.txn))
+                    .collect()
+            } else {
+                Vec::new()
+            },
+        );
+
         for i in 0..eval_group.len() {
             if precheck_failure.is_some() {
                 // `check()` already failed at a known index -- evaluation
@@ -935,11 +958,10 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             // (TestWrongAuthorizerTxn, issue #974).
             // Part of go `BlockEvaluator.transaction` under `Validate: true`:
             // `BlockHeader.Alive` (validity window, genesis ID and hash),
-            // then the authorizer. Its `checkDup` duplicate-txid half is not
-            // ported yet (issue #2125); the lease half is `apply`'s
-            // `check_lease`. go's simulate reports the `Alive` error text
-            // bare (`EvalFailureError` wraps it without a prefix), hence
-            // `Rejected`, whose display is the message itself.
+            // then `checkDup` (a duplicate txid or a live lease, issue
+            // #2125), then the authorizer. go's simulate reports these error
+            // texts bare (`EvalFailureError` wraps them without a prefix),
+            // hence `Rejected`, whose display is the message itself.
             let alive = algo_validate::block_alive(
                 block.round,
                 &block.block_genesis_id,
@@ -952,31 +974,43 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 message,
                 class: algo_error::RejectClass::Other,
             });
-            let apply_result =
-                match alive.and_then(|()| check_authorizer(self.store, &eval_group[i])) {
-                    Err(e) => Err(e),
-                    Ok(()) => {
-                        let group_refs: Vec<&SignedTransaction> = eval_group.iter().collect();
-                        let gi = GroupInfo {
-                            txns: &group_refs,
-                            index: i,
-                            ran_program: &ran_program,
-                            scratch: &scratch,
-                            txid_cache: &group_txid_cache,
-                            created: &group_created,
-                        };
-                        apply_transaction_with_budget(
-                            self.store,
-                            &eval_group[i],
-                            &apply_ctx,
-                            0,
-                            Some(&mut group_budget),
-                            Some(&mut group_box_budget),
-                            Some(&gi),
-                            Some(&mut tracer),
-                        )
-                    }
-                };
+            let checked = alive
+                .and_then(|()| {
+                    let txid = ledger_dups.txids()[i];
+                    crate::check_dup::check_dup(
+                        &*self.store,
+                        &apply_ctx.consensus,
+                        &eval_group[i].txn,
+                        txid,
+                        &block_dups,
+                        &mut ledger_dups,
+                    )
+                })
+                .and_then(|()| check_authorizer(self.store, &eval_group[i]));
+            let apply_result = match checked {
+                Err(e) => Err(e),
+                Ok(()) => {
+                    let group_refs: Vec<&SignedTransaction> = eval_group.iter().collect();
+                    let gi = GroupInfo {
+                        txns: &group_refs,
+                        index: i,
+                        ran_program: &ran_program,
+                        scratch: &scratch,
+                        txid_cache: &group_txid_cache,
+                        created: &group_created,
+                    };
+                    apply_transaction_with_budget(
+                        self.store,
+                        &eval_group[i],
+                        &apply_ctx,
+                        0,
+                        Some(&mut group_budget),
+                        Some(&mut group_box_budget),
+                        Some(&gi),
+                        Some(&mut tracer),
+                    )
+                }
+            };
             // Per-transaction app budget consumed = the sum of every approval /
             // clear-state program cost under this txn, including inner app calls,
             // accumulated by the tracer (go-algorand rolls each program's
@@ -990,6 +1024,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
 
             match apply_result {
                 Ok(apply_data) => {
+                    block_dups.record(&eval_group[i].txn, ledger_dups.txids()[i]);
                     // Defensively drain `failed_eval_delta` even on success:
                     // nothing sets it on this path today, but a future change
                     // must not let a stale value from an earlier iteration

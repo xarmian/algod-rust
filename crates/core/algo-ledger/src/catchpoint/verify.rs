@@ -1904,32 +1904,9 @@ pub fn reconstruct_lease_table(
         let txtail: algo_types::TxTailRound = rmp_serde::from_slice(&data)
             .map_err(|e| CatchpointError::VerificationError(format!("decode txtail entry: {e}")))?;
 
-        // Process each lease entry.
-        for lease_entry in &txtail.leases {
-            // Skip empty leases (all zeros).
-            if lease_entry.lease.len() != 32 {
-                continue;
-            }
-            let mut lease_bytes = [0u8; 32];
-            lease_bytes.copy_from_slice(&lease_entry.lease);
-
-            // All-zero lease is "no lease" — skip it.
-            if lease_bytes == [0u8; 32] {
-                continue;
-            }
-
-            // Look up the last_valid for this lease's transaction.
-            let idx = lease_entry.txn_idx as usize;
-            if idx >= txtail.last_valid.len() {
-                continue; // malformed entry, skip
-            }
-            let last_valid = txtail.last_valid[idx];
-
-            // Only record leases that are still active at current_round.
-            if last_valid >= current_round {
-                lease_table.record(&lease_entry.sender, &lease_bytes, last_valid);
-            }
-        }
+        // Record the leases still active at current_round (all-zero and
+        // malformed entries are skipped).
+        lease_table.record_txtail_round(&txtail, current_round);
     }
 
     Ok(lease_table)

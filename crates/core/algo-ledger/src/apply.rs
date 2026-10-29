@@ -102,6 +102,12 @@ pub struct ApplyContext {
     /// checks, vote key checks, etc.). When false (replay/catchup), only
     /// the apply-side state transitions run.
     pub validate: bool,
+    /// The caller runs go's `checkDup` itself and tracks the block's leases
+    /// ([`crate::check_dup`], simulate): apply then neither checks nor
+    /// records leases. Simulate's lease check must see only the rounds up
+    /// to the simulated one, and recording into the live lease table would
+    /// outlive the simulation (no snapshot covers it).
+    pub leases_checked_by_caller: bool,
     /// Mirrors go `roundCowState.generate` (`ledger/eval/cow.go`): true while
     /// generating a block (pool admission, block assembly, simulation), false
     /// while validating one. Policies that must never affect validation
@@ -237,6 +243,7 @@ impl ApplyContext {
             round,
             mode: ApplyMode::Replay,
             validate: false,
+            leases_checked_by_caller: false,
             generate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
@@ -2662,6 +2669,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         round: block.round.0,
         mode,
         validate,
+        leases_checked_by_caller: false,
         generate,
         // `global LatestTimestamp` is the *previous* block's timestamp in go
         // (`roundCowState.PrevTimestamp`, `ledger/eval/cow.go`), never the
@@ -4452,8 +4460,11 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
         })?
     };
 
-    // Check lease before any state changes.
-    store.check_lease(&txn.sender, &lease_arr, ctx.round)?;
+    // Check lease before any state changes, unless the caller runs go's
+    // `checkDup` itself (simulate).
+    if !ctx.leases_checked_by_caller {
+        store.check_lease(&txn.sender, &lease_arr, ctx.round)?;
+    }
 
     // Addresses go's `Move` brings up to the rewards level (see
     // `reward_participants`: strictly narrower than the touched set).
@@ -5138,7 +5149,9 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
         }
 
         // Record lease on success (no-op for empty/zero leases).
-        store.record_lease(&txn.sender, lease_arr, txn.last_valid.0);
+        if !ctx.leases_checked_by_caller {
+            store.record_lease(&txn.sender, lease_arr, txn.last_valid.0);
+        }
 
         // Increment the running transaction counter for this top-level txn.
         // Mirrors go-algorand's `addTx` -> `incTxnCount()`. This ensures
@@ -11700,6 +11713,7 @@ mod tests {
             round,
             mode: ApplyMode::Replay,
             validate: false,
+            leases_checked_by_caller: false,
             generate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
@@ -12410,6 +12424,7 @@ mod tests {
             round: 100,
             mode: ApplyMode::Replay,
             validate: false,
+            leases_checked_by_caller: false,
             generate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
@@ -12598,6 +12613,7 @@ mod tests {
             round,
             mode: ApplyMode::Replay,
             validate: false,
+            leases_checked_by_caller: false,
             generate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
@@ -12625,6 +12641,7 @@ mod tests {
             round,
             mode: ApplyMode::Replay,
             validate: false,
+            leases_checked_by_caller: false,
             generate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
@@ -14221,6 +14238,7 @@ return
             round,
             mode: ApplyMode::Replay,
             validate: false,
+            leases_checked_by_caller: false,
             generate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
@@ -16169,6 +16187,7 @@ return
             round: 1,
             mode: ApplyMode::Replay,
             validate: false,
+            leases_checked_by_caller: false,
             generate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
