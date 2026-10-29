@@ -1,0 +1,81 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: Simulate rewards oracle drift check
+
+# Issue #2118: verifies that the checked-in go-algorand simulate oracle
+# fixture (crates/core/algo-ledger/tests/fixtures/simulate_rewards/oracle.json)
+# is not stale -- i.e. that running `tools/simulate-rewards-oracle` against a
+# real, freshly-built go-algorand v5.0.4-stable reproduces the committed file
+# byte-for-byte. `cargo test --workspace` reads only the committed fixture.
+#
+# Building go-algorand's ledger requires cgo + the vendored libsodium fork
+# (see CLAUDE.md's CI Workflows section) -- `make libsodium` below.
+
+on:
+  pull_request:
+    paths:
+      - "tools/simulate-rewards-oracle/**"
+      - "crates/core/algo-ledger/tests/fixtures/simulate_rewards/**"
+      - ".github/workflows/simulate-rewards-oracle.yml"
+  push:
+    branches: [main]
+    paths:
+      - "tools/simulate-rewards-oracle/**"
+      - "crates/core/algo-ledger/tests/fixtures/simulate_rewards/**"
+      - ".github/workflows/simulate-rewards-oracle.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: simulate-rewards-oracle-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pin go-algorand to the same rev the rest of the repo references.
+  GO_ALGORAND_REV: "v5.0.4-stable"
+
+jobs:
+  oracle-drift-check:
+    name: Regenerate simulate oracle fixture from real go-algorand and diff
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Clone go-algorand
+        run: |
+          set -euo pipefail
+          # Sibling of the checkout: the tool's go.mod `replace` resolves
+          # go-algorand at ../../../go-algorand, the local-dev convention.
+          git clone --depth 1 --branch "$GO_ALGORAND_REV" \
+            https://github.com/algorand/go-algorand.git \
+            "$(dirname "$GITHUB_WORKSPACE")/go-algorand"
+          grep -E '^(go|toolchain) ' "$(dirname "$GITHUB_WORKSPACE")/go-algorand/go.mod"
+
+      - name: Install Go per go-algorand's go.mod
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: ${{ github.workspace }}/../go-algorand/go.mod
+          cache-dependency-path: tools/simulate-rewards-oracle/go.sum
+
+      - name: Build go-algorand's libsodium fork
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake libtool build-essential
+          cd "$(dirname "$GITHUB_WORKSPACE")/go-algorand"
+          make libsodium
+
+      - name: Run the oracle tool and diff against the committed fixture
+        run: |
+          set -euo pipefail
+          cd tools/simulate-rewards-oracle
+          go run .
+          cd "$GITHUB_WORKSPACE"
+          git diff --exit-code -- crates/core/algo-ledger/tests/fixtures/simulate_rewards/oracle.json || {
+            echo "::error::committed oracle.json is stale -- regenerate via 'cd tools/simulate-rewards-oracle && go run .' against the pinned go-algorand checkout and commit the result"
+            exit 1
+          }

@@ -46,6 +46,7 @@
 //! `TestUnnamedResourcesBoxIOBudget`/`TestUnnamedResourcesBigProgramReadBudget`/
 //! etc. exercise remains out of scope.
 
+use algo_ledger::apply::pool_fixtures::{funded_simulation_state, TEST_GENESIS_HASH};
 use std::collections::BTreeMap;
 
 use algo_codec::{canonical_encode_transaction, compute_group_id};
@@ -84,7 +85,7 @@ fn sign(txn: Transaction, key: &SigningKey) -> SignedTransaction {
 }
 
 fn base_state() -> algo_ledger::LedgerState {
-    let mut state = algo_ledger::LedgerState::new();
+    let mut state = funded_simulation_state();
     state.fee_sink = FEE_SINK;
     state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
     state.set_account(
@@ -135,6 +136,7 @@ fn appl_txn(sender: Address, app_id: u64, on_completion: u64) -> Transaction {
         last_valid: 1000.into(),
         application_id: app_id,
         on_completion,
+        genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     }
 }
@@ -272,6 +274,7 @@ fn pay_txn(sender: Address, note_byte: u8) -> Transaction {
         first_valid: 0.into(),
         last_valid: 1000.into(),
         note: serde_bytes::ByteBuf::from(vec![note_byte]),
+        genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     }
 }

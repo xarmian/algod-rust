@@ -31,6 +31,7 @@
 //! unless noted) and explains any deliberate simplification versus the
 //! upstream fixture.
 
+use algo_ledger::apply::pool_fixtures::{funded_simulation_state, TEST_GENESIS_HASH};
 use std::collections::BTreeMap;
 
 use algo_codec::canonical_encode_transaction;
@@ -91,7 +92,7 @@ fn sign(txn: Transaction, key: &SigningKey) -> SignedTransaction {
 
 /// A minimal `LedgerState` with a funded fee sink and no other accounts.
 fn base_state() -> LedgerState {
-    let mut state = LedgerState::new();
+    let mut state = funded_simulation_state();
     state.fee_sink = FEE_SINK;
     state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
     state.set_account(
@@ -146,6 +147,7 @@ fn appl_txn(sender: Address, app_id: u64, on_completion: u64) -> Transaction {
         last_valid: 1000.into(),
         application_id: app_id,
         on_completion,
+        genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     }
 }
@@ -352,6 +354,7 @@ fn logicsig_pc_and_stack_exposure() {
         fee: 1000,
         first_valid: 0.into(),
         last_valid: 1000.into(),
+        genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     };
     let mut appl = appl_txn(lsig_addr, app_id, 0);
@@ -469,6 +472,7 @@ fn invalid_logicsig_pc_and_stack() {
         fee: 1000,
         first_valid: 0.into(),
         last_valid: 1000.into(),
+        genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     };
     let mut appl = appl_txn(lsig_addr, app_id, 0);
@@ -564,6 +568,7 @@ fn invalid_app_with_passing_logicsig_and_trace() {
         fee: 1000,
         first_valid: 0.into(),
         last_valid: 1000.into(),
+        genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     };
     let mut appl = appl_txn(lsig_addr, app_id, 0);
@@ -1772,6 +1777,7 @@ fn wrong_authorizer_txn_both_signed_and_optional() {
             fee: 1000,
             first_valid: 0.into(),
             last_valid: 1000.into(),
+            genesis_hash: TEST_GENESIS_HASH,
             ..Default::default()
         };
 
@@ -1833,6 +1839,7 @@ fn default_signature_check() {
         fee: 1000,
         first_valid: 0.into(),
         last_valid: 1000.into(),
+        genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     };
 
@@ -1913,6 +1920,7 @@ fn invalid_tx_group_incentive_pool_sender() {
         fee: 1000,
         first_valid: 0.into(),
         last_valid: 1000.into(),
+        genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     };
 
@@ -1960,6 +1968,7 @@ fn simulate_multiple_groups_is_rejected() {
         fee: 1000,
         first_valid: 0.into(),
         last_valid: 1000.into(),
+        genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     };
 
@@ -2011,6 +2020,7 @@ fn optional_signatures_both_signed_and_unsigned() {
             fee: 1000,
             first_valid: 0.into(),
             last_valid: 1000.into(),
+            genesis_hash: TEST_GENESIS_HASH,
             ..Default::default()
         };
         let stx = if signed {
@@ -2060,6 +2070,7 @@ fn optional_signatures_incorrect_is_hard_error() {
         fee: 1000,
         first_valid: 0.into(),
         last_valid: 1000.into(),
+        genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     };
     let mut stx = sign(txn, &sender_key);
@@ -2108,6 +2119,7 @@ fn optional_signatures_programless_logicsig_content() {
         fee: 1000,
         first_valid: 0.into(),
         last_valid: 1000.into(),
+        genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     };
     let stx = SignedTransaction {
@@ -2164,6 +2176,7 @@ fn programless_logicsig_pqsig_is_orphan_and_empty_args_is_blank() {
             fee: 1000,
             first_valid: 0.into(),
             last_valid: 1000.into(),
+            genesis_hash: TEST_GENESIS_HASH,
             ..Default::default()
         },
         lsig: Some(lsig),
@@ -2239,6 +2252,7 @@ fn exec_trace_enabled_orphan_logicsig_fails_cleanly() {
             fee: 1000,
             first_valid: 0.into(),
             last_valid: 1000.into(),
+            genesis_hash: TEST_GENESIS_HASH,
             ..Default::default()
         },
         lsig: Some(LogicSig {
@@ -2290,6 +2304,7 @@ fn partial_missing_signatures() {
         fee: 1000,
         first_valid: 0.into(),
         last_valid: 1000.into(),
+        genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     };
     let txn1 = Transaction {
@@ -2300,6 +2315,7 @@ fn partial_missing_signatures() {
         fee: 1000,
         first_valid: 0.into(),
         last_valid: 1000.into(),
+        genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     };
 
@@ -2353,6 +2369,7 @@ fn pre_v42_orphan_lsig_with_sig_succeeds_without_sig_fails_no_signature() {
         fee: 1000,
         first_valid: 0.into(),
         last_valid: 1000.into(),
+        genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     };
     let orphan = LogicSig {
@@ -2411,6 +2428,7 @@ fn state_proof_txn_rejected() {
         txn_type: "stpf".into(),
         first_valid: 0.into(),
         last_valid: 1000.into(),
+        genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     };
 
@@ -2460,6 +2478,7 @@ fn simple_group_txn() {
         fee: 1000,
         first_valid: 0.into(),
         last_valid: 1000.into(),
+        genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     };
     let txn2 = Transaction {
@@ -2470,6 +2489,7 @@ fn simple_group_txn() {
         fee: 1000,
         first_valid: 0.into(),
         last_valid: 1000.into(),
+        genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     };
 
@@ -2491,10 +2511,11 @@ fn simple_group_txn() {
     assert_eq!(state.get_account(&sender2).unwrap().micro_algos, 20_000_000);
 }
 
-/// Port of `TestStartRound`: `request.round` selects which historical round
-/// an app call's `global Round` opcode observes; the default (no round
-/// given) uses the current round; a round past the ledger's tip is
-/// rejected.
+/// Port of `TestStartRound`: `request.round` selects the round the
+/// simulated block builds on, and an app call's `global Round` observes the
+/// simulated block, `start + 1` (go asserts `latestRound+1` and
+/// `latestRound-i+1`, issue #2118); the default (no round given) builds on
+/// the current round; a round past the ledger's tip is rejected.
 #[test]
 fn start_round_selection() {
     let sender = Address([0xAA; 32]);
@@ -2526,6 +2547,7 @@ int 1
         let hdr = algo_types::BlockHeader {
             round: Round(r),
             current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            genesis_hash: TEST_GENESIS_HASH,
             ..Default::default()
         };
         let hdr_bytes = algo_codec::canonical_encode_block_header(&hdr);
@@ -2559,11 +2581,11 @@ int 1
         u64::from_be_bytes(logs[0].as_slice().try_into().unwrap())
     };
 
-    // Default: uses the current (latest) round.
-    assert_eq!(read_round(&mut state, None), 3);
+    // Default: builds on the current (latest) round.
+    assert_eq!(read_round(&mut state, None), 4);
     // Explicit historical rounds.
-    assert_eq!(read_round(&mut state, Some(Round(2))), 2);
-    assert_eq!(read_round(&mut state, Some(Round(1))), 1);
+    assert_eq!(read_round(&mut state, Some(Round(2))), 3);
+    assert_eq!(read_round(&mut state, Some(Round(1))), 2);
 
     // A round past the ledger's tip must be rejected.
     let request = SimulationRequest {
@@ -2580,6 +2602,321 @@ int 1
         SimulatorError::Internal(_) | SimulatorError::InvalidRequest(_) => {}
         other => panic!("expected an error rejecting the future round, got {other:?}"),
     }
+}
+
+/// Issue #2118: the simulated block runs under the protocol go's
+/// `MakeBlock(prevBlockHdr)` resolves, i.e. after an upgrade switch due at
+/// `start + 1` (`StartEvaluator` reads `config.Consensus[hdr.CurrentProtocol]`
+/// of the new block). A v13 program is beyond v41's `LogicSigVersion` (12)
+/// but allowed by v42's (13), so it runs only once the switch is honoured.
+#[test]
+fn simulate_runs_under_the_protocol_after_an_upgrade_switch() {
+    let sender = Address([0xAA; 32]);
+    let app_id = 1001u64;
+    // `#pragma version 13; pushint 1`
+    let approval = vec![0x0d, 0x81, 0x01];
+    let clear = vec![0x0d, 0x81, 0x01];
+    let run = |switch_on: u64| {
+        let mut state = base_state();
+        fund(&mut state, sender, 20_000_000);
+        register_app(
+            &mut state,
+            sender,
+            app_id,
+            approval.clone(),
+            clear.clone(),
+            StateSchema::default(),
+            StateSchema::default(),
+        );
+        let hdr = algo_types::BlockHeader {
+            round: Round(5),
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            next_protocol: algo_types::consensus::CONSENSUS_V42.to_string(),
+            next_protocol_switch_on: Round(switch_on),
+            genesis_hash: TEST_GENESIS_HASH,
+            ..Default::default()
+        };
+        let hdr_bytes = algo_codec::canonical_encode_block_header(&hdr);
+        state
+            .put_block(5, &hdr.current_protocol, &hdr_bytes, &[])
+            .expect("put_block succeeds");
+        state.set_current_round(Round(5));
+        let request = SimulationRequest {
+            txn_groups: vec![vec![SignedTransaction {
+                txn: appl_txn(sender, app_id, 0),
+                ..Default::default()
+            }]],
+            allow_empty_signatures: true,
+            ..Default::default()
+        };
+        simulate(&mut state, request)
+            .expect("simulate")
+            .txn_groups
+            .remove(0)
+            .failure_message
+    };
+    // The switch is due in the simulated block (round 6): v42 applies.
+    assert_eq!(run(6), None);
+    // The switch is a round later: the block still runs v41.
+    let failure = run(7).expect("a v13 program must fail under v41");
+    assert!(failure.contains("version"), "{failure}");
+}
+
+/// Issue #2118: the simulated block is round `start + 1`, and go's
+/// `BlockEvaluator.transaction` (`Validate: true`) rejects a transaction
+/// whose validity window excludes it with `BlockHeader.Alive`'s
+/// `TxnDeadError` ("txn dead: round %d outside of %d--%d"). A transaction
+/// valid only from `start + 1` runs; one that expired at `start` fails.
+#[test]
+fn simulate_checks_the_validity_window_at_the_simulated_round() {
+    let sender = Address([0xAA; 32]);
+    let receiver = Address([0xBB; 32]);
+    let mut state = base_state();
+    fund(&mut state, sender, 20_000_000);
+    let hdr = algo_types::BlockHeader {
+        round: Round(5),
+        current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+        genesis_hash: TEST_GENESIS_HASH,
+        ..Default::default()
+    };
+    let hdr_bytes = algo_codec::canonical_encode_block_header(&hdr);
+    state
+        .put_block(5, &hdr.current_protocol, &hdr_bytes, &[])
+        .expect("put_block succeeds");
+    state.set_current_round(Round(5));
+    let mut pay = |first: u64, last: u64| {
+        let txn = Transaction {
+            txn_type: "pay".into(),
+            sender,
+            receiver,
+            amount: 200_000,
+            fee: 1000,
+            first_valid: first.into(),
+            last_valid: last.into(),
+            genesis_hash: TEST_GENESIS_HASH,
+            ..Default::default()
+        };
+        simulate(
+            &mut state,
+            SimulationRequest {
+                txn_groups: vec![vec![SignedTransaction {
+                    txn,
+                    ..Default::default()
+                }]],
+                allow_empty_signatures: true,
+                ..Default::default()
+            },
+        )
+        .expect("simulate")
+        .txn_groups
+        .remove(0)
+    };
+    assert_eq!(pay(6, 100).failure_message, None);
+    let expired = pay(1, 5);
+    // The exact `failure-message` the REST handler returns (it copies
+    // `TxnGroupResult::failure_message` verbatim): go's bare `TxnDeadError`.
+    assert_eq!(
+        expired.failure_message.as_deref(),
+        Some("txn dead: round 6 outside of 1--5")
+    );
+    assert_eq!(expired.failed_at, Some(vec![0]));
+}
+
+/// A ledger whose latest round is 3, rewards accruing at 250 µAlgo a round
+/// (level 30 at round 3, 10 at round 1), with an offline account touched at round 3 (rewards base
+/// 30) and a well-funded pool; headers for rounds 1..=3.
+fn rewards_state_with_history(sender: Address) -> LedgerState {
+    let mut state = base_state();
+    let pool = Address([0xEE; 32]);
+    state.rewards_pool = pool;
+    state.set_account(
+        &pool,
+        AccountData {
+            status: algo_types::AccountStatus::NotParticipating,
+            micro_algos: 10_000_000_000_000,
+            ..Default::default()
+        },
+    );
+    state.set_account(
+        &sender,
+        AccountData {
+            status: algo_types::AccountStatus::Offline,
+            micro_algos: 50_000_000,
+            rewards_base: 30,
+            ..Default::default()
+        },
+    );
+    for (r, level) in [(1u64, 10u64), (2, 20), (3, 30)] {
+        let hdr = algo_types::BlockHeader {
+            round: Round(r),
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            genesis_hash: TEST_GENESIS_HASH,
+            rewards_pool: pool,
+            rewards_level: level,
+            rewards_rate: 250,
+            rewards_recalculation_round: Round(500_000),
+            ..Default::default()
+        };
+        let hdr_bytes = algo_codec::canonical_encode_block_header(&hdr);
+        state
+            .put_block(r, &hdr.current_protocol, &hdr_bytes, &[])
+            .expect("put_block succeeds");
+    }
+    state.set_current_round(Round(3));
+    state.rewards_level = 30;
+    state.rewards_rate = 250;
+    state.rewards_recalculation_round = 500_000;
+    state
+}
+
+fn pay_group(sender: Address, receiver: Address) -> Vec<SignedTransaction> {
+    vec![SignedTransaction {
+        txn: Transaction {
+            txn_type: "pay".into(),
+            sender,
+            receiver,
+            amount: 200_000,
+            fee: 1000,
+            first_valid: 1.into(),
+            last_valid: 1000.into(),
+            genesis_hash: TEST_GENESIS_HASH,
+            ..Default::default()
+        },
+        ..Default::default()
+    }]
+}
+
+/// Issue #2118 review: a past `Request.Round` must not pair that round's
+/// (lower) rewards level with the latest account state, where an account
+/// touched since has a rewards base above it -- that wrapped
+/// `compute_pending_rewards` and panicked `apply_rewards` under the ledger
+/// mutex. Until historical state lands (#2123) the rewards inputs are the
+/// latest state's, consistent with every account simulate reads.
+#[test]
+fn simulate_at_a_past_round_keeps_the_rewards_state_consistent() {
+    let sender = Address([0xAA; 32]);
+    let mut state = rewards_state_with_history(sender);
+    let before = state.accounts.clone();
+    let result = simulate(
+        &mut state,
+        SimulationRequest {
+            txn_groups: vec![pay_group(sender, Address([0xBB; 32]))],
+            allow_empty_signatures: true,
+            round: Some(Round(1)),
+            ..Default::default()
+        },
+    )
+    .expect("a past round simulates without panicking");
+    let group = &result.txn_groups[0];
+    assert_eq!(group.failure_message, None);
+    // The claim is at the latest state's next level (30 + 250 / 50 units),
+    // from base 30. Round 1's header would give 10 + 5 = 15, below the base.
+    let ad = group.txn_results[0]
+        .apply_data
+        .as_ref()
+        .expect("apply data");
+    assert_eq!(ad.sender_rewards, 50 * 5);
+    assert_eq!(state.accounts, before, "the store is restored");
+}
+
+/// Issue #2118 review: the block-start withdrawal writes the live store, so
+/// a panic later in evaluation must still restore it -- otherwise the pool
+/// stays debited for the next real block.
+#[test]
+fn simulate_restores_the_pool_when_evaluation_panics() {
+    let sender = Address([0xAA; 32]);
+    let mut state = rewards_state_with_history(sender);
+    let before = state.accounts.clone();
+    algo_ledger::simulation::test_hooks::set_panic_after_withdrawal(true);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        simulate(
+            &mut state,
+            SimulationRequest {
+                txn_groups: vec![pay_group(sender, Address([0xBB; 32]))],
+                allow_empty_signatures: true,
+                ..Default::default()
+            },
+        )
+    }));
+    algo_ledger::simulation::test_hooks::set_panic_after_withdrawal(false);
+    assert!(outcome.is_err(), "the hook must panic");
+    assert_eq!(
+        state.accounts, before,
+        "the pool debit (and everything else) is rolled back on unwind"
+    );
+    // Sanity: without the hook the same simulate debits the pool inside
+    // its snapshot and still leaves the store unchanged.
+    simulate(
+        &mut state,
+        SimulationRequest {
+            txn_groups: vec![pay_group(sender, Address([0xBB; 32]))],
+            allow_empty_signatures: true,
+            ..Default::default()
+        },
+    )
+    .expect("simulate");
+    assert_eq!(state.accounts, before);
+}
+
+/// Issue #2118 review: go's `BlockHeader.Alive` (`data/bookkeeping/block.go`)
+/// also rejects a transaction naming another network's genesis ID (the
+/// previous header's) or genesis hash (the ledger's).
+#[test]
+fn simulate_rejects_a_wrong_genesis_id_or_hash() {
+    let sender = Address([0xAA; 32]);
+    let mut state = base_state();
+    fund(&mut state, sender, 20_000_000);
+    let hdr = algo_types::BlockHeader {
+        round: Round(5),
+        current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+        genesis_id: "net-v1".to_string(),
+        // go's `StartEvaluator` (`SupportGenesisHash`) replaces the copied
+        // header hash with the ledger's own, so `Alive` checks against
+        // `TEST_GENESIS_HASH` (the store's) even when the stored header
+        // disagrees.
+        genesis_hash: [0x22; 32],
+        ..Default::default()
+    };
+    let hdr_bytes = algo_codec::canonical_encode_block_header(&hdr);
+    state
+        .put_block(5, &hdr.current_protocol, &hdr_bytes, &[])
+        .expect("put_block succeeds");
+    state.set_current_round(Round(5));
+    let mut run = |genesis_id: &str, genesis_hash: [u8; 32]| {
+        let mut group = pay_group(sender, Address([0xBB; 32]));
+        group[0].txn.genesis_id = genesis_id.to_string();
+        group[0].txn.genesis_hash = genesis_hash;
+        simulate(
+            &mut state,
+            SimulationRequest {
+                txn_groups: vec![group],
+                allow_empty_signatures: true,
+                ..Default::default()
+            },
+        )
+        .expect("simulate")
+        .txn_groups
+        .remove(0)
+        .failure_message
+    };
+    assert_eq!(run("net-v1", TEST_GENESIS_HASH), None);
+    // Exact `failure-message`s: go's bare `BlockHeader.Alive` texts.
+    assert_eq!(
+        run("other-v1", TEST_GENESIS_HASH).as_deref(),
+        Some("tx.GenesisID <other-v1> does not match expected <net-v1>")
+    );
+    assert_eq!(
+        run("net-v1", [0x11; 32]),
+        Some(format!(
+            "tx.GenesisHash <{}> does not match expected <{}>",
+            algo_types::Digest([0x11; 32]),
+            algo_types::Digest(TEST_GENESIS_HASH)
+        ))
+    );
+    assert_eq!(
+        run("net-v1", [0u8; 32]).as_deref(),
+        Some("required tx.GenesisHash is missing")
+    );
 }
 
 /// Port of `TestSimulateStartRound`
@@ -2624,6 +2961,7 @@ int 1
         let hdr = algo_types::BlockHeader {
             round: Round(r),
             current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            genesis_hash: TEST_GENESIS_HASH,
             ..Default::default()
         };
         let hdr_bytes = algo_codec::canonical_encode_block_header(&hdr);
@@ -2803,6 +3141,7 @@ int 1
         fee: 1000,
         first_valid: 0.into(),
         last_valid: 1000.into(),
+        genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     };
 
@@ -2865,6 +3204,7 @@ fn rekey_within_group() {
         first_valid: 0.into(),
         last_valid: 1000.into(),
         rekey_to: Some(authority_addr),
+        genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     };
     let txn2 = Transaction {
@@ -2875,6 +3215,7 @@ fn rekey_within_group() {
         fee: 1000,
         first_valid: 0.into(),
         last_valid: 1000.into(),
+        genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     };
     txn1.group = [0u8; 32]; // no real group id needed; simulate doesn't verify it
@@ -3159,6 +3500,7 @@ fn escrow_with_arg(state: &mut LedgerState, salt: u8, arg_len: usize) -> SignedT
             first_valid: 0.into(),
             last_valid: 1000.into(),
             note: serde_bytes::ByteBuf::from(vec![salt]),
+            genesis_hash: TEST_GENESIS_HASH,
             ..Default::default()
         },
         lsig: Some(LogicSig {
@@ -3243,6 +3585,7 @@ fn orphan_lsig_member(
             fee,
             first_valid: valid.0.into(),
             last_valid: valid.1.into(),
+            genesis_hash: TEST_GENESIS_HASH,
             ..Default::default()
         },
         lsig: Some(LogicSig {

@@ -63,9 +63,12 @@ use ed25519_dalek::{Signer, SigningKey};
 
 use crate::apply::{
     apply_transaction_with_budget, check_authorizer, compute_group_fee_credit_and_residue,
-    ApplyContext, ApplyMode, AvmEvalOverrides, BoxBudgetState, GroupInfo,
+    withdraw_block_rewards, ApplyContext, ApplyMode, AvmEvalOverrides, BlockRewardsWithdrawal,
+    BoxBudgetState, GroupInfo, TESTNET_BANK_ADDRESS,
 };
 use crate::avm_context::{NamedGroupResources, StoreSigBlockSource, UnnamedCapacityTracker};
+use crate::block_header::next_block_protocol;
+use crate::rewards::{balance_with_rewards, next_rewards_state, RewardsState};
 use crate::store_trait::LedgerStore;
 
 /// Fixed proxy signing key seed (first 32 bytes of go-algorand's `proxySigner`).
@@ -212,6 +215,69 @@ pub struct SimulationRequest {
 // Simulator
 // ---------------------------------------------------------------------------
 
+/// Test-only fault injection for [`Simulator::simulate`] (issue #2118).
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PANIC_AFTER_WITHDRAWAL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Make this thread's next simulate panic right after the block-start
+    /// pool withdrawal, to prove the store is restored on unwind.
+    pub fn set_panic_after_withdrawal(on: bool) {
+        PANIC_AFTER_WITHDRAWAL.with(|c| c.set(on));
+    }
+
+    pub(super) fn maybe_panic_after_withdrawal() {
+        if PANIC_AFTER_WITHDRAWAL.with(|c| c.replace(false)) {
+            panic!("test hook: panic after the block-start withdrawal");
+        }
+    }
+}
+
+/// The block a simulated group is evaluated in (see
+/// [`Simulator::prepare_simulated_block`]).
+struct SimulatedBlock {
+    /// `start + 1`: `global Round`, the validity window, voter lookups.
+    round: u64,
+    /// The block's protocol, after any upgrade switch.
+    consensus: ConsensusParams,
+    /// `prevHeader.TimeStamp` (`global LatestTimestamp`).
+    latest_timestamp: u64,
+    /// The block's rewards level (`NextRewardsState`).
+    rewards_level: u64,
+    /// The block-start pool withdrawal. Its `pool` is the block's rewards
+    /// pool and its `genesis_hash` the ledger's (the testnet hotfix key).
+    withdrawal: BlockRewardsWithdrawal,
+    /// The block's fee sink (`NextRewardsState` carries `prevHdr`'s).
+    fee_sink: Address,
+    /// The genesis identity, from go's two sources:
+    /// - `block_genesis_id` / `block_genesis_hash` are the simulated block
+    ///   header's, which `BlockHeader.Alive` checks every transaction
+    ///   against. `MakeBlock` copies both from `prevHdr`, and
+    ///   `StartEvaluator` (`Generate`, `SupportGenesisHash`) then overwrites
+    ///   the hash with the ledger's `eval.genesisHash`.
+    /// - `ledger_genesis_hash` is the ledger's own, which `global
+    ///   GenesisHash` reads and the testnet hotfix is keyed on.
+    block_genesis_id: String,
+    block_genesis_hash: [u8; 32],
+    ledger_genesis_hash: [u8; 32],
+}
+
+impl SimulatedBlock {
+    /// The block's own accounts a simulate may write: the fee sink, the
+    /// rewards pool and, on a testnet hotfix round, the testnet bank.
+    fn snapshot_addrs(&self) -> Vec<Address> {
+        let mut addrs = vec![self.fee_sink, self.withdrawal.pool];
+        if self.withdrawal.is_testnet_hotfix_round() {
+            addrs.push(Address(TESTNET_BANK_ADDRESS));
+        }
+        addrs
+    }
+}
+
 /// The simulation engine.
 ///
 /// Runs transaction groups against a [`LedgerStore`] without committing
@@ -275,6 +341,93 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             }
         }
         Ok(())
+    }
+
+    /// The block go's `Simulator.Simulate` evaluates the group in
+    /// (`ledger/simulation/simulator.go`): `bookkeeping.MakeBlock(prevHdr)`
+    /// for `prevHdr = BlockHdr(start)`, round `start + 1`, under the protocol
+    /// `MakeBlock` resolves (any upgrade switch applied), run through
+    /// `eval.StartEvaluator` with `Generate: true` (`ledger/eval/eval.go`),
+    /// which gives it `prevHdr.NextRewardsState(round, proto,
+    /// pool.WithUpdatedRewards(prevLevel), prevTotals.RewardUnits())` and
+    /// withdraws the block's rewards from the pool.
+    ///
+    /// Only reads: the withdrawal itself is applied after `check`.
+    ///
+    /// The rewards inputs (the previous rewards state, the pool, the reward
+    /// units) are the store's own, i.e. the latest round's. For `start` =
+    /// latest that is exactly go's `BlockHdr(start)` / `Totals(start)`. For
+    /// a past `start` it keeps them consistent with the accounts simulate
+    /// reads, which are also the latest state (issue #2123): an older
+    /// header's level paired with newer rewards bases would be a base above
+    /// the level. Without a header for `start` (unit-test stores only; a
+    /// real ledger always has its latest header) the store's protocol stands
+    /// in.
+    fn prepare_simulated_block(
+        &self,
+        start: Round,
+        prev_hdr: Option<&algo_types::BlockHeader>,
+    ) -> Result<SimulatedBlock, AlgoError> {
+        let store = &*self.store;
+        let round = start.0 + 1;
+        let ledger_genesis_hash = *store.genesis_hash();
+        let (block_genesis_id, prev_genesis_hash) = match prev_hdr {
+            Some(hdr) => (hdr.genesis_id.clone(), hdr.genesis_hash),
+            None => (store.genesis_id().to_string(), ledger_genesis_hash),
+        };
+        let (consensus, latest_timestamp) = match prev_hdr {
+            Some(hdr) => {
+                let protocol = next_block_protocol(hdr)?;
+                let consensus =
+                    consensus_params_for_version(&protocol).ok_or_else(|| AlgoError::Ledger {
+                        message: format!("unknown protocol '{protocol}'"),
+                    })?;
+                // `global LatestTimestamp` is `prevHeader.TimeStamp`.
+                (consensus, hdr.timestamp.max(0) as u64)
+            }
+            None => (
+                consensus_params_for_version(store.protocol()).unwrap_or_default(),
+                0,
+            ),
+        };
+        let prev = RewardsState {
+            rewards_level: store.rewards_level(),
+            rewards_rate: store.rewards_rate(),
+            rewards_residue: store.rewards_residue(),
+            rewards_recalculation_round: store.rewards_recalculation_round(),
+        };
+        let pool = store.rewards_pool();
+        let pool_balance = match store.get_account(&pool) {
+            Some(acct) => balance_with_rewards(&acct, prev.rewards_level)?,
+            None => 0,
+        };
+        let reward_units = store.total_reward_units()?;
+        let next = next_rewards_state(prev, round, &consensus, pool_balance, reward_units);
+        let withdrawal = BlockRewardsWithdrawal {
+            round,
+            pool,
+            prev_rewards_level: prev.rewards_level,
+            rewards_level: next.rewards_level,
+            prev_reward_units: reward_units,
+            genesis_hash: ledger_genesis_hash,
+            min_balance: consensus.min_balance,
+        };
+        let block_genesis_hash = if consensus.support_genesis_hash {
+            ledger_genesis_hash
+        } else {
+            prev_genesis_hash
+        };
+        Ok(SimulatedBlock {
+            round,
+            consensus,
+            latest_timestamp,
+            rewards_level: next.rewards_level,
+            withdrawal,
+            fee_sink: store.fee_sink(),
+            block_genesis_id,
+            block_genesis_hash,
+            ledger_genesis_hash,
+        })
     }
 
     /// Simulate the given request and return results.
@@ -343,13 +496,64 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             max_log_size: request.allow_more_logging.then_some(LOG_BYTES_LIMIT),
         };
 
+        // --- Resolve the simulated block ---
+
+        // A requested round that predates the ledger's tracked history is a
+        // distinct failure from "round doesn't exist yet" -- go-algorand's
+        // accountupdates `RoundOffsetError` (`ledger/acctupdates.go`),
+        // surfaced verbatim through `Ledger.BlockHdr`/`trackerDBRound` as
+        // `"round %d before dbRound %d"`, a raw (non-`InvalidRequestError`)
+        // error that the REST handler propagates as a 500
+        // (`daemon/algod/api/server/v2/handlers.go`'s `SimulateTransaction`
+        // only special-cases `simulation.InvalidRequestError` as a 400).
+        // `TestSimulateStartRound` (`test/e2e-go/restAPI/simulate`) pins
+        // this for a follower node whose `dbRound` tracks its sync round --
+        // see [`crate::store_trait::LedgerStore::earliest_round`] for what
+        // this does and doesn't model. Checked ahead of the block-header
+        // lookup below since algod-rust does not actually evict old block
+        // headers (`forget_before` isn't wired into the normal apply path),
+        // so the header would otherwise still resolve.
+        if let Some(requested_round) = request.round {
+            let earliest = self.store.earliest_round();
+            if requested_round < earliest {
+                return Err(SimulatorError::Internal(AlgoError::Ledger {
+                    message: format!("round {} before dbRound {}", requested_round.0, earliest.0),
+                }));
+            }
+        }
+
+        // Fetch block header for consensus params and timestamp
+        let block_hdr = self.store.get_block_header(sim_round.0)?;
+        // An explicitly-requested round with no corresponding block header
+        // does not exist on this ledger (go-algorand: `s.ledger.BlockHdr`
+        // returns "ledger does not have entry N" from `simulatorLedger`'s
+        // embedded `data.Ledger`, propagated as a hard `Simulate` error --
+        // `TestStartRound`'s "1 round in the future" case). Only enforced
+        // when the caller supplied a round: the *default* round
+        // (`store.current_round()`) has no header in many unit tests that
+        // never call `put_block`, and go's own default (`s.ledger.Latest()`)
+        // is guaranteed to resolve on a real ledger, so silently falling
+        // back to the store's declared protocol there preserves existing
+        // behavior instead of newly rejecting it.
+        if request.round.is_some() && block_hdr.is_none() {
+            return Err(SimulatorError::InvalidRequest(InvalidRequestError {
+                message: format!("ledger does not have entry {}", sim_round.0),
+            }));
+        }
+        // go `MakeBlock(prevBlockHdr)` + `StartEvaluator`'s reads (issue
+        // #2118): the block the group is evaluated in, round `start + 1`.
+        let block = self
+            .prepare_simulated_block(sim_round, block_hdr.as_ref())
+            .map_err(SimulatorError::Internal)?;
+
         // --- Snapshot the store before simulation ---
 
         // Collect all addresses involved in the transaction group for
         // snapshotting. This ensures we can restore state after simulation.
-        // Include the fee sink and rewards pool since apply_transaction
-        // credits fees and distributes rewards through these accounts.
-        let mut addrs: Vec<Address> = vec![self.store.fee_sink(), self.store.rewards_pool()];
+        // The block's own accounts come first: the fee sink (fees), the
+        // rewards pool (the block-start withdrawal) and, on go's two
+        // `workaroundOverspentRewards` rounds, the testnet bank.
+        let mut addrs: Vec<Address> = block.snapshot_addrs();
         for stx in txn_group {
             addrs.push(stx.txn.sender);
             if stx.txn.receiver != Address::ZERO {
@@ -431,6 +635,35 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             self.store.snapshot_with_ids(&addrs, &asset_ids, &app_ids)
         };
 
+        // --- Evaluate, then restore the store ---
+
+        // The restore runs on every exit, a panic included: evaluation
+        // writes the live store (the block-start pool withdrawal first), and
+        // a panic that skipped the restore would leave those writes in place
+        // for the next real block (issue #2118). The panic is re-raised once
+        // the store is restored.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.evaluate_in_snapshot(&request, result, block)
+        }));
+        self.store.restore_snapshot(snapshot);
+        match outcome {
+            Ok(outcome) => outcome,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    /// The part of [`Self::simulate`] that runs inside its snapshot: check,
+    /// the block-start withdrawal, and the group's evaluation. It never
+    /// restores the snapshot itself; [`Self::simulate`] does, on every exit.
+    fn evaluate_in_snapshot(
+        &mut self,
+        request: &SimulationRequest,
+        mut result: SimulationResult,
+        block: SimulatedBlock,
+    ) -> Result<SimulationResult, SimulatorError> {
+        let txn_group = &request.txn_groups[0];
+        let consensus = block.consensus;
+
         // --- FixSigners: pre-evaluation signer correction ---
 
         // Working copy of the group used for verification and evaluation.
@@ -445,59 +678,6 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         }
 
         // --- Build apply context ---
-
-        // A requested round that predates the ledger's tracked history is a
-        // distinct failure from "round doesn't exist yet" -- go-algorand's
-        // accountupdates `RoundOffsetError` (`ledger/acctupdates.go`),
-        // surfaced verbatim through `Ledger.BlockHdr`/`trackerDBRound` as
-        // `"round %d before dbRound %d"`, a raw (non-`InvalidRequestError`)
-        // error that the REST handler propagates as a 500
-        // (`daemon/algod/api/server/v2/handlers.go`'s `SimulateTransaction`
-        // only special-cases `simulation.InvalidRequestError` as a 400).
-        // `TestSimulateStartRound` (`test/e2e-go/restAPI/simulate`) pins
-        // this for a follower node whose `dbRound` tracks its sync round --
-        // see [`crate::store_trait::LedgerStore::earliest_round`] for what
-        // this does and doesn't model. Checked ahead of the block-header
-        // lookup below since algod-rust does not actually evict old block
-        // headers (`forget_before` isn't wired into the normal apply path),
-        // so the header would otherwise still resolve.
-        if let Some(requested_round) = request.round {
-            let earliest = self.store.earliest_round();
-            if requested_round < earliest {
-                self.store.restore_snapshot(snapshot);
-                return Err(SimulatorError::Internal(AlgoError::Ledger {
-                    message: format!("round {} before dbRound {}", requested_round.0, earliest.0),
-                }));
-            }
-        }
-
-        // Fetch block header for consensus params and timestamp
-        let block_hdr = self.store.get_block_header(sim_round.0)?;
-        // An explicitly-requested round with no corresponding block header
-        // does not exist on this ledger (go-algorand: `s.ledger.BlockHdr`
-        // returns "ledger does not have entry N" from `simulatorLedger`'s
-        // embedded `data.Ledger`, propagated as a hard `Simulate` error --
-        // `TestStartRound`'s "1 round in the future" case). Only enforced
-        // when the caller supplied a round: the *default* round
-        // (`store.current_round()`) has no header in many unit tests that
-        // never call `put_block`, and go's own default (`s.ledger.Latest()`)
-        // is guaranteed to resolve on a real ledger, so silently falling
-        // back to the store's declared protocol there preserves existing
-        // behavior instead of newly rejecting it.
-        if request.round.is_some() && block_hdr.is_none() {
-            self.store.restore_snapshot(snapshot);
-            return Err(SimulatorError::InvalidRequest(InvalidRequestError {
-                message: format!("ledger does not have entry {}", sim_round.0),
-            }));
-        }
-        let consensus = match &block_hdr {
-            Some(hdr) => consensus_params_for_version(&hdr.current_protocol).unwrap_or_default(),
-            None => consensus_params_for_version(self.store.protocol()).unwrap_or_default(),
-        };
-        let latest_timestamp = block_hdr
-            .as_ref()
-            .map(|h| h.timestamp.max(0) as u64)
-            .unwrap_or(0);
 
         // Run validation (signature verification + well-formedness) before
         // execution. When tracing is enabled, `check` also captures logic-sig
@@ -533,10 +713,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 precheck_failure = Some((index, message));
                 (logicsig_traces, logicsig_budgets)
             }
-            Err(e) => {
-                self.store.restore_snapshot(snapshot);
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         };
 
         // Validate the extra opcode budget against the simulation limit.
@@ -544,7 +721,6 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         // matching go-algorand's `simulateWithTracer` ordering; the message
         // matches go byte-for-byte.
         if request.extra_opcode_budget > MAX_EXTRA_OPCODE_BUDGET {
-            self.store.restore_snapshot(snapshot);
             return Err(SimulatorError::InvalidRequest(InvalidRequestError {
                 message: format!(
                     "extra budget {} > simulation extra budget limit {}",
@@ -573,16 +749,26 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             )))
         });
 
+        // go `StartEvaluator`: withdraw the block's rewards from the pool
+        // before the group runs. go never starts the evaluator for a group
+        // that failed `check`.
+        if precheck_failure.is_none() {
+            withdraw_block_rewards(&mut *self.store, &block.withdrawal)
+                .map_err(SimulatorError::Internal)?;
+            #[cfg(any(test, feature = "test-hooks"))]
+            test_hooks::maybe_panic_after_withdrawal();
+        }
+
         let apply_ctx = ApplyContext {
-            rewards_level: self.store.rewards_level(),
-            fee_sink: self.store.fee_sink(),
-            round: sim_round.0,
+            rewards_level: block.rewards_level,
+            fee_sink: block.fee_sink,
+            round: block.round,
             mode: ApplyMode::Execute,
             validate: true,
             // go `simulator.go`: `Generate: true, Validate: true`.
             generate: true,
-            latest_timestamp,
-            genesis_hash: *self.store.genesis_hash(),
+            latest_timestamp: block.latest_timestamp,
+            genesis_hash: block.ledger_genesis_hash,
             txn_counter: Cell::new(self.store.txn_counter()),
             fees_collected: Cell::new(0),
             state_proof_next: Cell::new(0),
@@ -747,30 +933,50 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             // `allow_empty_signatures`, which only relaxes *signature*
             // verification, not this apply-time authorization fact
             // (TestWrongAuthorizerTxn, issue #974).
-            let apply_result = match check_authorizer(self.store, &eval_group[i]) {
-                Err(e) => Err(e),
-                Ok(()) => {
-                    let group_refs: Vec<&SignedTransaction> = eval_group.iter().collect();
-                    let gi = GroupInfo {
-                        txns: &group_refs,
-                        index: i,
-                        ran_program: &ran_program,
-                        scratch: &scratch,
-                        txid_cache: &group_txid_cache,
-                        created: &group_created,
-                    };
-                    apply_transaction_with_budget(
-                        self.store,
-                        &eval_group[i],
-                        &apply_ctx,
-                        0,
-                        Some(&mut group_budget),
-                        Some(&mut group_box_budget),
-                        Some(&gi),
-                        Some(&mut tracer),
-                    )
-                }
-            };
+            // Part of go `BlockEvaluator.transaction` under `Validate: true`:
+            // `BlockHeader.Alive` (validity window, genesis ID and hash),
+            // then the authorizer. Its `checkDup` duplicate-txid half is not
+            // ported yet (issue #2125); the lease half is `apply`'s
+            // `check_lease`. go's simulate reports the `Alive` error text
+            // bare (`EvalFailureError` wraps it without a prefix), hence
+            // `Rejected`, whose display is the message itself.
+            let alive = algo_validate::block_alive(
+                block.round,
+                &block.block_genesis_id,
+                &block.block_genesis_hash,
+                &apply_ctx.consensus,
+                &eval_group[i].txn,
+            )
+            .map_err(|message| AlgoError::Rejected {
+                source: None,
+                message,
+                class: algo_error::RejectClass::Other,
+            });
+            let apply_result =
+                match alive.and_then(|()| check_authorizer(self.store, &eval_group[i])) {
+                    Err(e) => Err(e),
+                    Ok(()) => {
+                        let group_refs: Vec<&SignedTransaction> = eval_group.iter().collect();
+                        let gi = GroupInfo {
+                            txns: &group_refs,
+                            index: i,
+                            ran_program: &ran_program,
+                            scratch: &scratch,
+                            txid_cache: &group_txid_cache,
+                            created: &group_created,
+                        };
+                        apply_transaction_with_budget(
+                            self.store,
+                            &eval_group[i],
+                            &apply_ctx,
+                            0,
+                            Some(&mut group_budget),
+                            Some(&mut group_box_budget),
+                            Some(&gi),
+                            Some(&mut tracer),
+                        )
+                    }
+                };
             // Per-transaction app budget consumed = the sum of every approval /
             // clear-state program cost under this txn, including inner app calls,
             // accumulated by the tracer (go-algorand rolls each program's
@@ -996,10 +1202,6 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         if request.trace_config.state {
             result.initial_states = Some(initial_states.into_resources_initial_states());
         }
-
-        // --- Restore the store to its pre-simulation state ---
-
-        self.store.restore_snapshot(snapshot);
 
         Ok(result)
     }

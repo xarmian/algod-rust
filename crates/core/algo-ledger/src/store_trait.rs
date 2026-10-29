@@ -397,6 +397,14 @@ pub trait LedgerStore {
         crate::state_delta::AccountTotals::default()
     }
 
+    /// go `prevTotals.RewardUnits()` as `eval.StartEvaluator` reads it
+    /// (`l.LatestTotals()`), with a read failure propagated rather than
+    /// degraded to zero. `SqliteLedger` reads its `accounttotals` row; the
+    /// default derives it from [`Self::account_totals`].
+    fn total_reward_units(&self) -> Result<u64, AlgoError> {
+        Ok(self.account_totals().reward_units())
+    }
+
     // ---- Chain-level state (setters) ----
 
     fn set_current_round(&mut self, round: Round);

@@ -27,6 +27,7 @@
 //! Group shape: `[txn0: A -> inner B -> inner create Y; txn1: C references Y]`.
 //! Run through both the block-apply path and the simulator.
 
+use algo_ledger::apply::pool_fixtures::{funded_simulation_state, TEST_GENESIS_HASH};
 use std::collections::BTreeMap;
 
 use algo_ledger::apply::{apply_block_capturing_apply_data, ApplyMode};
@@ -115,7 +116,7 @@ fn call(app_id: u64, fee: u64, foreign_apps: Option<Vec<u64>>) -> SignedTransact
 }
 
 fn setup(proto: &str, c_program: Vec<u8>) -> LedgerState {
-    let mut s = algo_ledger::apply::pool_fixtures::funded_ledger_state();
+    let mut s = funded_simulation_state();
     s.fee_sink = Address([0xFE; 32]);
     s.protocol = proto.to_string();
     s.get_or_default_account_mut(&Address([0xAA; 32]))
@@ -172,11 +173,21 @@ fn run_block(proto: &str, referenced: u64) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// The group as a client submits it to simulate: carrying the ledger's
+/// genesis hash (go `BlockHeader.Alive`, `RequireGenesisHash`), unlike the
+/// stripped payset form [`block`] applies.
+fn submitted(mut group: Vec<SignedTransaction>) -> Vec<SignedTransaction> {
+    for stx in &mut group {
+        stx.txn.genesis_hash = TEST_GENESIS_HASH;
+    }
+    group
+}
+
 fn run_simulated(proto: &str, referenced: u64) -> Result<(), String> {
     use algo_ledger::simulation::{SimulationRequest, Simulator};
     let mut s = setup(proto, references_program(referenced));
     let request = SimulationRequest {
-        txn_groups: vec![vec![txn0(), call(C, 1000, None)]],
+        txn_groups: vec![submitted(vec![txn0(), call(C, 1000, None)])],
         allow_empty_signatures: true,
         ..Default::default()
     };

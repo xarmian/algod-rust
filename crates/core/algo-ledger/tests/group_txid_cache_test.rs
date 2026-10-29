@@ -28,6 +28,7 @@
 //! reproduced bug-for-bug. Under v34+ the top-level reader never touches the
 //! cache, so app 1 sees the real id of txn 0.
 
+use algo_ledger::apply::pool_fixtures::{funded_simulation_state, TEST_GENESIS_HASH};
 use std::collections::BTreeMap;
 
 use algo_ledger::apply::{apply_block_capturing_apply_data, ApplyMode};
@@ -87,7 +88,7 @@ fn call(app_id: u64) -> SignedTransaction {
 
 /// Returns (app 0's `itxn TxID` log, app 1's `gtxn 0 TxID` log).
 fn run(proto: &str) -> (Vec<u8>, Vec<u8>) {
-    let mut s = algo_ledger::apply::pool_fixtures::funded_ledger_state();
+    let mut s = funded_simulation_state();
     s.fee_sink = Address([0xFE; 32]);
     s.get_or_default_account_mut(&Address([0xAA; 32]))
         .micro_algos = 100_000_000;
@@ -144,11 +145,21 @@ fn v34_group_does_not_share_txid_cache() {
     );
 }
 
+/// The group as a client submits it to simulate: carrying the ledger's
+/// genesis hash (go `BlockHeader.Alive`, `RequireGenesisHash`), unlike the
+/// stripped payset form [`block`] applies.
+fn submitted(mut group: Vec<SignedTransaction>) -> Vec<SignedTransaction> {
+    for stx in &mut group {
+        stx.txn.genesis_hash = TEST_GENESIS_HASH;
+    }
+    group
+}
+
 /// Same two-app group through the simulator: it drives `GroupInfo` itself
 /// and must share the cache across the group's app calls too.
 fn run_simulated(proto: &str) -> (Vec<u8>, Vec<u8>) {
     use algo_ledger::simulation::{SimulationRequest, Simulator};
-    let mut s = algo_ledger::apply::pool_fixtures::funded_ledger_state();
+    let mut s = funded_simulation_state();
     s.fee_sink = Address([0xFE; 32]);
     s.protocol = proto.to_string();
     s.get_or_default_account_mut(&Address([0xAA; 32]))
@@ -158,7 +169,7 @@ fn run_simulated(proto: &str) -> (Vec<u8>, Vec<u8>) {
     seed(&mut s, APP0, app0_program());
     seed(&mut s, APP1, app1_program());
     let request = SimulationRequest {
-        txn_groups: vec![vec![call(APP0), call(APP1)]],
+        txn_groups: vec![submitted(vec![call(APP0), call(APP1)])],
         allow_empty_signatures: true,
         ..Default::default()
     };

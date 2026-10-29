@@ -287,7 +287,7 @@ fn small_corpus_replays_through_the_rust_ledger() {
     known.retain(|a| seen.insert(*a));
     for a in &known {
         let amount = l.get_account(a).map_or(0, |mut acct| {
-            algo_ledger::rewards::apply_rewards(&mut acct, totals.rewards_level);
+            algo_ledger::rewards::apply_rewards(&mut acct, totals.rewards_level).unwrap();
             acct.micro_algos
         });
         known_algos += amount;

@@ -1818,37 +1818,14 @@ impl SimpleBlockEvaluator {
             class: algo_error::RejectClass::Other,
         };
         for stx in txgroup {
-            if round < stx.txn.first_valid || round > stx.txn.last_valid {
-                return Err(rejected(format!(
-                    "txn dead: round {} outside of {}--{}",
-                    round.0, stx.txn.first_valid.0, stx.txn.last_valid.0,
-                )));
-            }
-            if !stx.txn.genesis_id.is_empty() && stx.txn.genesis_id != self.hdr.genesis_id {
-                return Err(rejected(format!(
-                    "tx.GenesisID <{}> does not match expected <{}>",
-                    stx.txn.genesis_id, self.hdr.genesis_id,
-                )));
-            }
-            if params.support_genesis_hash {
-                let zero = [0u8; 32];
-                if stx.txn.genesis_hash != zero && stx.txn.genesis_hash != self.hdr.genesis_hash {
-                    return Err(rejected(format!(
-                        "tx.GenesisHash <{}> does not match expected <{}>",
-                        algo_types::Digest(stx.txn.genesis_hash),
-                        algo_types::Digest(self.hdr.genesis_hash),
-                    )));
-                }
-                if params.require_genesis_hash && stx.txn.genesis_hash == zero {
-                    return Err(rejected("required tx.GenesisHash is missing".to_string()));
-                }
-            } else if stx.txn.genesis_hash != [0u8; 32] {
-                // a protocol that predates genesis hashes allows none
-                return Err(rejected(format!(
-                    "tx.GenesisHash <{}> not allowed",
-                    algo_types::Digest(stx.txn.genesis_hash),
-                )));
-            }
+            algo_validate::block_alive(
+                round.0,
+                &self.hdr.genesis_id,
+                &self.hdr.genesis_hash,
+                params,
+                &stx.txn,
+            )
+            .map_err(rejected)?;
         }
 
         // The returned group (txid computation, block assembly) has its genesis
@@ -2061,7 +2038,7 @@ impl SimpleBlockEvaluator {
             };
             // Overlay first for the cumulative effects of earlier groups,
             // then the ledger snapshot.
-            let base = self.effective_balance(&sender);
+            let base = self.try_effective_balance(&sender)?;
             let credited = credits.get(&sender).copied().unwrap_or(0);
             let already_spent = spent.get(&sender).copied().unwrap_or(0);
             let required = already_spent.saturating_add(cost);
@@ -2144,14 +2121,22 @@ impl SimpleBlockEvaluator {
         let touched = earlier_in_group || self.overlay.get_balance(sender).is_some();
         let auth = self.expected_authorizer(sender);
         data.auth_addr = if auth == *sender { None } else { Some(auth) };
-        if after_fee || touched {
-            algo_ledger::apply_rewards(&mut data, self.hdr.rewards_level);
-            data.micro_algos = data_balance;
+        let rewards = if after_fee || touched {
+            algo_ledger::apply_rewards(&mut data, self.hdr.rewards_level).map(|_| {
+                data.micro_algos = data_balance;
+            })
         } else {
             // the stored account: `balance_now` counts pending rewards the
             // fee move would only apply to its copy
-            let pending = algo_ledger::compute_pending_rewards(&data, self.hdr.rewards_level);
-            data.micro_algos = balance_now.saturating_sub(pending);
+            algo_ledger::compute_pending_rewards(&data, self.hdr.rewards_level).map(|pending| {
+                data.micro_algos = balance_now.saturating_sub(pending);
+            })
+        };
+        // The account go would print cannot be computed (go panics in
+        // `WithUpdatedRewards` there): say why instead of printing stale
+        // fields.
+        if let Err(e) = rewards {
+            return format!("transaction {txid}: {e}");
         }
         algo_validate::overspend::overspend_message(txid, sender, &data, tried)
     }
@@ -2681,10 +2666,12 @@ impl SimpleBlockEvaluator {
     ///   rewards_delta = block.rewards_level - account.rewards_base
     ///   pending = reward_units * rewards_delta
     ///   adjusted = micro_algos + pending
-    fn balance_with_rewards(&self, acct: &AccountData) -> u64 {
-        algo_ledger::compute_pending_rewards(acct, self.hdr.rewards_level)
-            .checked_add(acct.micro_algos)
-            .expect("reward overflow: account rewards exceeded u64 max")
+    ///
+    /// A rewards base above the level or an overflowing balance (go's
+    /// `WithUpdatedRewards` panic) is an error that rejects the group being
+    /// evaluated; it never panics block production.
+    fn balance_with_rewards(&self, acct: &AccountData) -> Result<u64, algo_error::AlgoError> {
+        algo_ledger::rewards::balance_with_rewards(acct, self.hdr.rewards_level)
     }
 
     /// Get the effective balance for an address, checking the overlay first
@@ -2697,15 +2684,22 @@ impl SimpleBlockEvaluator {
     /// rewards using `balance_with_rewards()`, mirroring Go's
     /// `WithUpdatedRewards()` which is called in `Move()` and balance
     /// operations before any debit or credit.
-    fn effective_balance(&mut self, addr: &Address) -> u64 {
+    fn try_effective_balance(&mut self, addr: &Address) -> Result<u64, algo_error::AlgoError> {
         match self.overlay.get_balance(addr) {
-            Some(bal) => bal,
-            None => self
-                .snapshot
-                .get_account(addr, &self.ledger)
-                .map(|acct| self.balance_with_rewards(&acct))
-                .unwrap_or(0),
+            Some(bal) => Ok(bal),
+            None => match self.snapshot.get_account(addr, &self.ledger) {
+                Some(acct) => self.balance_with_rewards(&acct),
+                None => Ok(0),
+            },
         }
+    }
+
+    /// [`Self::try_effective_balance`] for tests, where the fixture
+    /// guarantees a consistent rewards state.
+    #[cfg(test)]
+    fn effective_balance(&mut self, addr: &Address) -> u64 {
+        self.try_effective_balance(addr)
+            .expect("test fixture rewards state is consistent")
     }
 
     /// Get the AccountData for an address, merging snapshot data with any
@@ -2931,7 +2925,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             // 3. If close_remainder_to is set, move remaining balance
             //    to close address and zero the sender (cow.CloseAccount)
             let sender = &stx.txn.sender;
-            let sender_balance = self.effective_balance(sender);
+            let sender_balance = self.try_effective_balance(sender)?;
 
             // Credit fee to FeeSink (mirrors Go's takeFee -> cow.Move).
             // Track fees_collected running total for the block header.
@@ -2949,7 +2943,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                 sender_balance
             } else {
                 if stx.txn.fee > 0 {
-                    let fee_sink_balance = self.effective_balance(&fee_sink);
+                    let fee_sink_balance = self.try_effective_balance(&fee_sink)?;
                     self.overlay.set_balance_tracked(
                         &fee_sink,
                         fee_sink_balance.saturating_add(stx.txn.fee),
@@ -2985,7 +2979,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                                 &mut checkpoint,
                             );
                         } else {
-                            let recv_balance = self.effective_balance(receiver);
+                            let recv_balance = self.try_effective_balance(receiver)?;
                             self.overlay.set_balance_tracked(
                                 receiver,
                                 recv_balance.saturating_add(stx.txn.amount),
@@ -3013,9 +3007,9 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                     // apply.Payment() -> cow.CloseAccount().
                     if !stx.txn.close_remainder_to.is_zero() {
                         let close_addr = &stx.txn.close_remainder_to;
-                        let remaining = self.effective_balance(sender);
+                        let remaining = self.try_effective_balance(sender)?;
                         if remaining > 0 && close_addr != sender {
-                            let close_balance = self.effective_balance(close_addr);
+                            let close_balance = self.try_effective_balance(close_addr)?;
                             self.overlay.set_balance_tracked(
                                 close_addr,
                                 close_balance.saturating_add(remaining),
@@ -3230,7 +3224,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                 continue;
             }
 
-            let balance = self.effective_balance(addr);
+            let balance = self.try_effective_balance(addr)?;
             // A zero balance is valid (account closed/deleted), matching
             // Go's `if data.IsZero() { continue }` in checkMinBalance.
             if balance == 0 {
@@ -3892,24 +3886,17 @@ impl PoolLedgerAdapter {
         _payset_hint: usize,
         max_txn_bytes_per_block: usize,
     ) -> Result<SimpleBlockEvaluator, algo_error::AlgoError> {
-        // `hdr` is the PREVIOUS (committed) block header. The consensus params
-        // for the round we're about to build are the previous protocol's unless
-        // a protocol switch occurs — and block production never crosses an
-        // upgrade (see make_next_block_header), so the previous protocol's
-        // params govern.
-        let consensus_params = algo_types::consensus::consensus_params_for_version(
-            &hdr.current_protocol,
-        )
-        .ok_or_else(|| {
-            // Go returns protocol.Error(hdr.CurrentProtocol) for unknown
-            // versions — do the same instead of silently falling back.
-            algo_error::AlgoError::Ledger {
-                message: format!(
-                    "unknown protocol version '{}' in block header",
-                    hdr.current_protocol
-                ),
-            }
-        })?;
+        // `hdr` is the PREVIOUS (committed) block header. go's
+        // `StartEvaluator` evaluates the new block (its `NextRewardsState`,
+        // the pool's `MinBalance`, every transaction) under
+        // `config.Consensus[hdr.CurrentProtocol]` of the block `MakeBlock`
+        // built, i.e. after the upgrade switch when one is due at this round
+        // (issue #2118), and returns `protocol.Error` for an unknown version.
+        let next_protocol = algo_ledger::next_block_protocol(&hdr)?;
+        let consensus_params = algo_types::consensus::consensus_params_for_version(&next_protocol)
+            .ok_or_else(|| algo_error::AlgoError::Ledger {
+                message: format!("unknown protocol version '{next_protocol}' in block header"),
+            })?;
 
         // Snapshot the committed state at the previous round — evaluation reads
         // balances as of the block we build on. This briefly acquires the mutex,
@@ -3929,13 +3916,10 @@ impl PoolLedgerAdapter {
         // Without this the evaluator would carry the previous header verbatim
         // (wrong round/branch and a stale rewards level).
         let next_round = hdr.round.0 + 1;
-        let pool_balance = snapshot
-            .get_account(&hdr.rewards_pool, &self.ledger)
-            .map(|acct| {
-                algo_ledger::compute_pending_rewards(&acct, hdr.rewards_level)
-                    .saturating_add(acct.micro_algos)
-            })
-            .unwrap_or(0);
+        let pool_balance = match snapshot.get_account(&hdr.rewards_pool, &self.ledger) {
+            Some(acct) => algo_ledger::rewards::balance_with_rewards(&acct, hdr.rewards_level)?,
+            None => 0,
+        };
         let (total_reward_units, voters_tracking) = {
             let l = self
                 .ledger
@@ -7399,6 +7383,51 @@ mod tests {
         assert_eq!(
             block.seed, [0u8; 32],
             "seed left for the producer/agreement"
+        );
+    }
+
+    /// Issue #2118: go's `StartEvaluator` runs the new block under
+    /// `config.Consensus[hdr.CurrentProtocol]` of the block `MakeBlock`
+    /// built, so at the upgrade switch round the next protocol's params (its
+    /// `NextRewardsState`, `MinBalance`, transaction rules) apply, not the
+    /// previous block's.
+    #[test]
+    fn start_evaluator_uses_the_protocol_after_an_upgrade_switch() {
+        let adapter = PoolLedgerAdapter::new(test_ledger());
+        let prev = |switch_on: u64| BlockHeader {
+            round: Round(5),
+            current_protocol: algo_types::CONSENSUS_V41.to_string(),
+            next_protocol: algo_types::consensus::CONSENSUS_V42.to_string(),
+            next_protocol_switch_on: Round(switch_on),
+            timestamp: 1000,
+            ..BlockHeader::default()
+        };
+        let v41 =
+            algo_types::consensus::consensus_params_for_version(algo_types::CONSENSUS_V41).unwrap();
+        let v42 = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V42,
+        )
+        .unwrap();
+        assert_ne!(v41.logic_sig_version, v42.logic_sig_version);
+        // The switch is due in the block being built (round 6).
+        let eval = adapter
+            .start_simple_evaluator(prev(6), 0, 0)
+            .expect("start_evaluator");
+        assert_eq!(
+            eval.hdr.current_protocol,
+            algo_types::consensus::CONSENSUS_V42
+        );
+        assert_eq!(
+            eval.consensus_params.logic_sig_version,
+            v42.logic_sig_version
+        );
+        // A round later: the block still runs the previous protocol.
+        let eval = adapter
+            .start_simple_evaluator(prev(7), 0, 0)
+            .expect("start_evaluator");
+        assert_eq!(
+            eval.consensus_params.logic_sig_version,
+            v41.logic_sig_version
         );
     }
 
@@ -12241,6 +12270,45 @@ mod tests {
         assert!(
             eval.transaction_group(&[stx]).is_ok(),
             "transfer should succeed with reward-adjusted balance"
+        );
+    }
+
+    /// Issue #2118: a sender whose rewards base is above the block's level
+    /// (go's `WithUpdatedRewards` overflow panic) rejects its group with an
+    /// error; it must never panic the proposer.
+    #[test]
+    fn rewards_base_above_the_level_rejects_the_group_without_panicking() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(1);
+        let (receiver, _) = test_keypair(2);
+        let fee_sink = Address([0xFE; 32]);
+        let acct = AccountData {
+            micro_algos: 5_000_000,
+            rewards_base: 30,
+            status: algo_types::AccountStatus::Online,
+            ..Default::default()
+        };
+        let fee_sink_acct = AccountData {
+            micro_algos: 10_000_000,
+            ..Default::default()
+        };
+        let mut eval = make_evaluator_with_rewards(
+            &ledger,
+            &params,
+            100,
+            20,
+            &[(sender, acct), (fee_sink, fee_sink_acct)],
+        );
+        eval.hdr.fee_sink = fee_sink;
+        let stx = make_signed_pay(&key, &sender, &receiver, 200_000, 1_000, 100);
+        let err = eval
+            .transaction_group(&[stx])
+            .expect_err("an inconsistent rewards base rejects the group");
+        assert!(
+            err.to_string()
+                .contains("overflowed account balance when applying rewards"),
+            "{err}"
         );
     }
 

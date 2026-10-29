@@ -179,6 +179,20 @@ fn apply_upgrade_vote(
     })
 }
 
+/// The protocol the block after `prev` runs under: go `MakeBlock`'s
+/// `ProcessUpgradeParams(prev).CurrentProtocol` (`data/bookkeeping/block.go`),
+/// i.e. `prev`'s protocol, or its `NextProtocol` once the switch is due.
+/// `eval.StartEvaluator` evaluates the block (rewards state, `MinBalance`,
+/// every transaction) under this protocol's params.
+pub fn next_block_protocol(prev: &BlockHeader) -> Result<String, AlgoError> {
+    let prev_params =
+        consensus_params_for_version(&prev.current_protocol).ok_or_else(|| AlgoError::Ledger {
+            message: format!("unknown previous protocol '{}'", prev.current_protocol),
+        })?;
+    let (_, upgrade) = process_upgrade_params(prev, &prev_params)?;
+    Ok(upgrade.current_protocol)
+}
+
 /// Port of go's `bookkeeping.ProcessUpgradeParams(prev)`
 /// (`data/bookkeeping/block.go`): decide this block's default upgrade vote and
 /// apply it, returning the vote cast and the resulting `UpgradeState`.

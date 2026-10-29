@@ -370,7 +370,8 @@ pub fn compute_final_state(
     for (s, a) in &ks {
         let amount = match ledger.get_account(a) {
             Some(mut acct) => {
-                algo_ledger::rewards::apply_rewards(&mut acct, t.rewards_level);
+                algo_ledger::rewards::apply_rewards(&mut acct, t.rewards_level)
+                    .expect("replayed account at the final rewards level");
                 acct.micro_algos
             }
             None => 0,

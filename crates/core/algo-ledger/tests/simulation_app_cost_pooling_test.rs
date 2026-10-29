@@ -30,6 +30,7 @@
 //! (`ledger/simulation/tracer.go`'s `evalTracer.BeforeTxnGroup` only acts
 //! `if ep.PooledApplicationBudget != nil`).
 
+use algo_ledger::apply::pool_fixtures::{funded_simulation_state, TEST_GENESIS_HASH};
 use algo_ledger::simulation::{SimulationRequest, Simulator};
 use algo_ledger::{LedgerState, LedgerStore};
 use algo_types::{AccountData, Address, AppParams, SignedTransaction, StateSchema, Transaction};
@@ -38,7 +39,7 @@ use std::collections::BTreeMap;
 const FEE_SINK: Address = Address([0xFE; 32]);
 
 fn setup_state(sender: Address, current_protocol: &str) -> LedgerState {
-    let mut state = LedgerState::new();
+    let mut state = funded_simulation_state();
     state.fee_sink = FEE_SINK;
     state.protocol = current_protocol.to_string();
     state.set_account(
@@ -85,6 +86,7 @@ fn make_appl_txn(sender: Address, app_id: u64) -> SignedTransaction {
             last_valid: 1000.into(),
             application_id: app_id,
             on_completion: 0, // NoOp
+            genesis_hash: TEST_GENESIS_HASH,
             ..Default::default()
         },
         ..Default::default()

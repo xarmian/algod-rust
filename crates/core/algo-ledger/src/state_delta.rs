@@ -268,6 +268,17 @@ pub struct AccountTotals {
     pub rewards_level: u64,
 }
 
+impl AccountTotals {
+    /// go `AccountTotals.RewardUnits` (`ledger/ledgercore/totals.go`): the
+    /// online plus offline reward units, the divisor of the rewards-level
+    /// advance and the multiplier of the block-start pool withdrawal.
+    pub fn reward_units(&self) -> u64 {
+        self.online
+            .reward_units
+            .saturating_add(self.offline.reward_units)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // KvValueDelta
 // ---------------------------------------------------------------------------

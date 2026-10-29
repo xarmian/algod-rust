@@ -73,19 +73,38 @@ pub fn normalized_online_balance(
     norm
 }
 
-/// Compute pending (unclaimed) rewards for an account given the current
-/// rewards level from the block header.
-///
-/// Returns 0 for accounts that are not participating or have zero balance.
-/// Uses wrapping arithmetic to match Go's uint64 overflow behavior.
-pub fn compute_pending_rewards(account: &AccountData, rewards_level: u64) -> u64 {
-    if account.status == AccountStatus::NotParticipating || account.micro_algos == 0 {
-        return 0;
+/// go's `OverflowTracker` failure in `basics.WithUpdatedRewards`
+/// (`data/basics/userBalance.go`), where go panics: a rewards base above the
+/// level, or a reward / balance that overflows u64.
+fn rewards_overflow(account: &AccountData, rewards_level: u64) -> algo_error::AlgoError {
+    algo_error::AlgoError::Ledger {
+        message: format!(
+            "AccountData.WithUpdatedRewards(): overflowed account balance when applying rewards {} + {}*({}-{})",
+            account.micro_algos,
+            account.micro_algos / REWARD_UNITS,
+            rewards_level,
+            account.rewards_base
+        ),
     }
+}
 
+/// Pending (unclaimed) rewards of `account` at `rewards_level`: go
+/// `WithUpdatedRewards`' `rewardsUnits * (rewardsLevel - RewardsBase)`.
+///
+/// 0 for a NotParticipating or zero-balance account. A rewards base above
+/// the level, or an overflowing product, is an error (go's `OverflowTracker`
+/// panics there): it never wraps.
+pub fn compute_pending_rewards(
+    account: &AccountData,
+    rewards_level: u64,
+) -> Result<u64, algo_error::AlgoError> {
+    if account.status == AccountStatus::NotParticipating || account.micro_algos == 0 {
+        return Ok(0);
+    }
     rewards_level
-        .wrapping_sub(account.rewards_base)
-        .wrapping_mul(account.micro_algos / REWARD_UNITS)
+        .checked_sub(account.rewards_base)
+        .and_then(|delta| delta.checked_mul(account.micro_algos / REWARD_UNITS))
+        .ok_or_else(|| rewards_overflow(account, rewards_level))
 }
 
 /// Apply pending rewards to an account, updating its balance and rewards
@@ -96,40 +115,57 @@ pub fn compute_pending_rewards(account: &AccountData, rewards_level: u64) -> u64
 /// - `rewarded_micro_algos` is increased by the pending reward
 /// - `rewards_base` is set to the current `rewards_level`
 ///
-/// Matches go's `basics.WithUpdatedRewards` (`data/basics/userBalance.go`):
-/// `micro_algos` overflowing u64 is a fatal consensus invariant violation
-/// there (go panics via its `OverflowTracker`, message "overflowed account
-/// balance when applying rewards ..."), not a value to silently wrap.
+/// Matches go's `basics.WithUpdatedRewards` (`data/basics/userBalance.go`).
+/// A rewards base above the level or an overflowing balance is go's
+/// `OverflowTracker` panic ("overflowed account balance when applying
+/// rewards ..."); here it is an error and `account` is left unchanged.
 /// `rewarded_micro_algos`, the lifetime reward counter, is deliberately
 /// allowed to roll over via plain wrapping addition in go too (its own
 /// comment: "The total reward over the lifetime of the account could exceed
 /// a 64-bit value... this rewardAlgos counter could potentially roll
 /// over") — that half keeps `wrapping_add`.
-pub fn apply_rewards(account: &mut AccountData, rewards_level: u64) -> u64 {
+pub fn apply_rewards(
+    account: &mut AccountData,
+    rewards_level: u64,
+) -> Result<u64, algo_error::AlgoError> {
     // go's `WithUpdatedRewards` (`data/basics/userBalance.go` L453-458)
     // returns a NotParticipating account unchanged -- RewardsBase included
     // (issue #1732).
     if account.status == AccountStatus::NotParticipating {
-        return 0;
+        return Ok(0);
     }
     // Fast path: already at this level -> nothing pending, nothing to stamp.
     // Hit by the second `apply_rewards` of the same account within one
     // transaction (rewards pass, then `apply_pay`'s credit).
     if account.rewards_base == rewards_level {
-        return 0;
+        return Ok(0);
     }
-    let pending = compute_pending_rewards(account, rewards_level);
+    let pending = compute_pending_rewards(account, rewards_level)?;
     if pending > 0 {
-        account.micro_algos = account.micro_algos.checked_add(pending).unwrap_or_else(|| {
-            panic!(
-                "apply_rewards: overflowed account balance when applying rewards {} + {}",
-                account.micro_algos, pending
-            )
-        });
+        account.micro_algos = account
+            .micro_algos
+            .checked_add(pending)
+            .ok_or_else(|| rewards_overflow(account, rewards_level))?;
         account.rewarded_micro_algos = account.rewarded_micro_algos.wrapping_add(pending);
     }
     account.rewards_base = rewards_level;
-    pending
+    Ok(pending)
+}
+
+/// An account's balance with its pending rewards at `rewards_level`: the
+/// `MicroAlgos` of go's `basics.WithUpdatedRewards` (`data/basics/userBalance.go`),
+/// which is what `roundCowState.Get(addr, true)` returns. A NotParticipating
+/// account is unchanged. A rewards base above the level, or an overflowing
+/// balance, is go's `OverflowTracker` panic; here it is an error.
+pub fn balance_with_rewards(
+    account: &AccountData,
+    rewards_level: u64,
+) -> Result<u64, algo_error::AlgoError> {
+    let pending = compute_pending_rewards(account, rewards_level)?;
+    account
+        .micro_algos
+        .checked_add(pending)
+        .ok_or_else(|| rewards_overflow(account, rewards_level))
 }
 
 /// The reward-relevant portion of a block header that advances via the rewards
@@ -242,7 +278,7 @@ mod tests {
     #[test]
     fn test_zero_balance_no_rewards() {
         let account = AccountData::default();
-        assert_eq!(compute_pending_rewards(&account, 100), 0);
+        assert_eq!(compute_pending_rewards(&account, 100).unwrap(), 0);
     }
 
     #[test]
@@ -252,7 +288,7 @@ mod tests {
             status: AccountStatus::NotParticipating,
             ..Default::default()
         };
-        assert_eq!(compute_pending_rewards(&account, 100), 0);
+        assert_eq!(compute_pending_rewards(&account, 100).unwrap(), 0);
     }
 
     /// Issue #1732: go's `WithUpdatedRewards` (`data/basics/userBalance.go`
@@ -266,7 +302,7 @@ mod tests {
             status: AccountStatus::NotParticipating,
             ..Default::default()
         };
-        assert_eq!(apply_rewards(&mut account, 100), 0);
+        assert_eq!(apply_rewards(&mut account, 100).unwrap(), 0);
         assert_eq!(account.rewards_base, 5);
         assert_eq!(account.micro_algos, 10_000_000);
         assert_eq!(account.rewarded_micro_algos, 0);
@@ -281,7 +317,7 @@ mod tests {
             ..Default::default()
         };
         // (20 - 10) * (5_000_000 / 1_000_000) = 10 * 5 = 50
-        assert_eq!(compute_pending_rewards(&account, 20), 50);
+        assert_eq!(compute_pending_rewards(&account, 20).unwrap(), 50);
     }
 
     #[test]
@@ -293,7 +329,7 @@ mod tests {
             ..Default::default()
         };
         // Offline accounts still earn rewards (only NotParticipating is excluded)
-        assert_eq!(compute_pending_rewards(&account, 100), 200);
+        assert_eq!(compute_pending_rewards(&account, 100).unwrap(), 200);
     }
 
     #[test]
@@ -304,7 +340,7 @@ mod tests {
             status: AccountStatus::Online,
             ..Default::default()
         };
-        let earned = apply_rewards(&mut account, 15);
+        let earned = apply_rewards(&mut account, 15).unwrap();
         // (15 - 5) * 3 = 30
         assert_eq!(earned, 30);
         assert_eq!(account.micro_algos, 3_000_030);
@@ -320,15 +356,14 @@ mod tests {
             status: AccountStatus::Online,
             ..Default::default()
         };
-        let earned = apply_rewards(&mut account, 50);
+        let earned = apply_rewards(&mut account, 50).unwrap();
         assert_eq!(earned, 0);
         assert_eq!(account.micro_algos, 1_000_000);
         assert_eq!(account.rewards_base, 50);
     }
 
     #[test]
-    #[should_panic(expected = "overflowed account balance when applying rewards")]
-    fn test_apply_rewards_panics_on_micro_algos_overflow() {
+    fn test_apply_rewards_errors_on_micro_algos_overflow() {
         // Mirrors go's TestWithUpdatedRewardsPanics "AlgoPanic" subtest
         // (data/basics/userBalance_test.go): a balance at u64::MAX plus any
         // positive pending reward overflows `microAlgosOut` in go's
@@ -342,7 +377,31 @@ mod tests {
             status: AccountStatus::Online,
             ..Default::default()
         };
-        apply_rewards(&mut account, 100);
+        let before = account.clone();
+        let err = apply_rewards(&mut account, 100).expect_err("must not wrap or panic");
+        assert!(err
+            .to_string()
+            .contains("overflowed account balance when applying rewards"));
+        assert_eq!(
+            account, before,
+            "a failed apply leaves the account unchanged"
+        );
+    }
+
+    /// A rewards base above the level is go's `OverflowTracker.Sub` overflow
+    /// in `WithUpdatedRewards`: an error, never a wrapped reward.
+    #[test]
+    fn test_pending_rewards_error_on_base_above_level() {
+        let mut account = AccountData {
+            micro_algos: 5_000_000,
+            rewards_base: 101,
+            status: AccountStatus::Offline,
+            ..Default::default()
+        };
+        assert!(compute_pending_rewards(&account, 100).is_err());
+        assert!(apply_rewards(&mut account, 100).is_err());
+        assert_eq!(account.rewards_base, 101);
+        assert!(balance_with_rewards(&account, 100).is_err());
     }
 
     #[test]
@@ -361,7 +420,7 @@ mod tests {
             status: AccountStatus::Online,
             ..Default::default()
         };
-        let earned = apply_rewards(&mut account, 100);
+        let earned = apply_rewards(&mut account, 100).unwrap();
         // (100 - 0) * (80_000_000 / 1_000_000) = 100 * 80 = 8000
         assert_eq!(earned, 8000);
         assert_eq!(account.micro_algos, 80_000_000 + 8000);
@@ -378,7 +437,7 @@ mod tests {
             status: AccountStatus::Online,
             ..Default::default()
         };
-        assert_eq!(compute_pending_rewards(&account, 100), 0);
+        assert_eq!(compute_pending_rewards(&account, 100).unwrap(), 0);
     }
 
     // ── muldiv tests ──────────────────────────────────────────────────

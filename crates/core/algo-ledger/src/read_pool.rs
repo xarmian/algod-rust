@@ -349,7 +349,10 @@ impl LedgerReadPool {
             return PoolRead::Fallback;
         };
         if rewards_level >= acct.rewards_base {
-            let pending = crate::rewards::compute_pending_rewards(&acct, rewards_level);
+            // An overflow is no answer from the pool: let the store decide.
+            let Ok(pending) = crate::rewards::compute_pending_rewards(&acct, rewards_level) else {
+                return PoolRead::Fallback;
+            };
             acct.micro_algos = acct.micro_algos.saturating_add(pending);
             acct.rewards_base = rewards_level;
         }
@@ -835,8 +838,10 @@ fn circulation_in_snapshot(
         if account.vote_last_valid == 0 || vote_rnd <= account.vote_last_valid {
             continue;
         }
-        if rewards_level >= account.rewards_base {
-            crate::rewards::apply_rewards(&mut account, rewards_level);
+        if rewards_level >= account.rewards_base
+            && crate::rewards::apply_rewards(&mut account, rewards_level).is_err()
+        {
+            return Ok(None);
         }
         let Some(sum) = expired.checked_add(account.micro_algos) else {
             return Ok(None);

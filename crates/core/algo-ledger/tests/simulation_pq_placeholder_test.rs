@@ -25,6 +25,7 @@
 //! go-algorand's `isPlaceholderPQSig`/`isPlaceholderDelegatedPQSig`/
 //! `validatePlaceholderPQSig` (`ledger/simulation/simulator.go`).
 
+use algo_ledger::apply::pool_fixtures::{funded_simulation_state, TEST_GENESIS_HASH};
 use serde_bytes::ByteBuf;
 
 use algo_ledger::simulation::{SimulationRequest, Simulator, SimulatorError};
@@ -49,7 +50,7 @@ const FEE_SINK: Address = Address([0xFE; 32]);
 const FALCON_DET1024_PUBKEY_SIZE: usize = 1793;
 
 fn setup_state(sender: Address) -> LedgerState {
-    let mut state = LedgerState::new();
+    let mut state = funded_simulation_state();
     state.fee_sink = FEE_SINK;
     // PQ signatures are only enabled from v42 (issue #835 test setup).
     state.protocol = CONSENSUS_V42.to_string();
@@ -93,6 +94,7 @@ fn make_pay_txn(sender: Address, receiver: Address, fee: u64) -> Transaction {
         fee,
         first_valid: 0.into(),
         last_valid: 1000.into(),
+        genesis_hash: TEST_GENESIS_HASH,
         ..Default::default()
     }
 }

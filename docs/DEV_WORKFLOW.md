@@ -958,6 +958,36 @@ for whether the fixture is current, not local regeneration.
 - `config/consensus.go:1312` — `v31.RewardsCalculationFix = true`
 - `data/transactions/transaction.go:297` — `Transaction.InnerID`
 
+## Simulate Rewards Oracle Regeneration
+
+`tools/simulate-rewards-oracle` (issue #2118) builds a real in-memory
+go-algorand ledger whose genesis pool funds a non-zero rewards rate,
+generates two empty blocks (at fixed timestamps, so the output is
+deterministic) and runs one group through go's unmodified
+`simulation.Simulator`. It writes the latest header and ledger state the
+Rust side seeds, plus go's simulate output, to the fixture below. The output
+covers:
+
+- the ApplyData fields `rs`/`rr`/`rc`/`ca`;
+- logs of `balance`, `min_balance` and `acct_params_get`, including the
+  pool after the block-start withdrawal and the `exists` flag of an account
+  the group closed;
+- `global Round` from a transaction valid only from `latest + 1`.
+
+The fixture is
+`crates/core/algo-ledger/tests/fixtures/simulate_rewards/oracle.json`,
+consumed by `crates/core/algo-ledger/tests/simulation_rewards_oracle_test.rs`.
+
+```bash
+cd tools/simulate-rewards-oracle
+go run .
+```
+
+It needs cgo + the vendored libsodium (`make libsodium` in the go-algorand
+checkout); on Windows, run it under WSL with a Linux Go toolchain.
+`.github/workflows/simulate-rewards-oracle.yml` regenerates it on every PR
+touching the tool or the fixture and fails on drift.
+
 ## Agreement Codec Tests
 
 Two complementary test harnesses guard the `algo-agreement::codec` wire
