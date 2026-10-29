@@ -61,8 +61,8 @@ use algo_types::{Block, Round};
 use tracing::warn;
 
 use crate::locked_base::LockedBase;
-use crate::proposal_eval::evaluate_validate_payouts;
-use crate::shadow_execute::PayoutCheck;
+use crate::proposal_eval::evaluate_proposal_check;
+use crate::shadow_execute::ProposalCheck;
 use crate::sqlite::SqliteLedger;
 use crate::store_trait::LedgerStore;
 
@@ -75,7 +75,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 static FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
 /// Number of proposals accepted on the stateless verdict alone because the
-/// payout check could not be evaluated. A test and diagnostic counter only:
+/// proposal check (payouts, alive/checkDup) could not be evaluated. A test and diagnostic counter only:
 /// it is not exported to the node's metrics; the `warn!` emitted on every
 /// fallback is the operator-facing signal.
 pub fn payout_check_fallbacks() -> u64 {
@@ -146,7 +146,7 @@ impl<V: BlockValidator> PayoutCheckingValidator<V> {
         // Probe done: release the mutex, the evaluation takes it per read.
         drop(ledger);
         let base = LockedBase::new(&self.ledger, Round(block.round.0 - 1));
-        let check = evaluate_validate_payouts(&base, block);
+        let check = evaluate_proposal_check(&base, block);
         if base.is_poisoned() {
             return Attempt::NoVerdict {
                 reason: "ledger lock poisoned".into(),
@@ -154,9 +154,17 @@ impl<V: BlockValidator> PayoutCheckingValidator<V> {
             };
         }
         match check {
-            PayoutCheck::Valid => Attempt::Verdict(Ok(())),
-            PayoutCheck::Violation(v) => Attempt::Verdict(Err(v)),
-            PayoutCheck::NoVerdict { reason, transient } => Attempt::NoVerdict {
+            ProposalCheck::Valid => Attempt::Verdict(Ok(())),
+            ProposalCheck::Violation { kind, message } => {
+                warn!(
+                    round = block.round.0,
+                    %kind,
+                    %message,
+                    "proposal rejected by go's Ledger.Validate checks"
+                );
+                Attempt::Verdict(Err(message))
+            }
+            ProposalCheck::NoVerdict { reason, transient } => Attempt::NoVerdict {
                 reason,
                 retry: transient,
             },
@@ -183,7 +191,7 @@ impl<V: BlockValidator> BlockValidator for PayoutCheckingValidator<V> {
                     warn!(
                         round = block.round.0,
                         %reason,
-                        "payout check could not be evaluated; accepting on the stateless verdict"
+                        "proposal check (payouts, alive/checkDup) could not be evaluated; accepting on the stateless verdict"
                     );
                     return Ok(validated);
                 }
@@ -199,7 +207,7 @@ impl<V: BlockValidator> BlockValidator for PayoutCheckingValidator<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shadow_execute::scratch_validate_payouts;
+    use crate::shadow_execute::scratch_proposal_check;
     use algo_agreement::StubBlockValidator;
     use algo_types::consensus::CONSENSUS_V41;
     use algo_types::{Address, Round};
@@ -362,8 +370,11 @@ mod tests {
     fn payout_violation_is_classified_as_a_verdict() {
         let ledger = ledger_at(0);
         let mut l = ledger.lock().unwrap();
-        match scratch_validate_payouts(&mut *l, &proposal(1, 5)) {
-            PayoutCheck::Violation(m) => assert!(m.contains("is allowed"), "{m}"),
+        match scratch_proposal_check(&mut *l, &proposal(1, 5)) {
+            ProposalCheck::Violation { kind, message: m } => {
+                assert_eq!(kind, crate::shadow_execute::ViolationKind::Payouts);
+                assert!(m.contains("is allowed"), "{m}")
+            }
             other => panic!("expected a violation, got {other:?}"),
         }
     }

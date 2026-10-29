@@ -251,6 +251,9 @@ pub fn check_dup<L: LedgerStore + ?Sized>(
 pub struct BlockCheckDup {
     block: BlockDups,
     ledger: LedgerDups,
+    /// The block's genesis id and hash when [`Self::check`] also runs go's
+    /// `BlockHeader.Alive` first ([`Self::with_alive`]).
+    alive: Option<(String, [u8; 32])>,
     violation: Option<String>,
 }
 
@@ -262,11 +265,29 @@ impl BlockCheckDup {
         Self {
             block: BlockDups::new(),
             ledger: LedgerDups::new(round, txids),
+            alive: None,
             violation: None,
         }
     }
 
-    /// [`check_dup`] for payset transaction `index`, recording it in the
+    /// Also run go's `BlockHeader.Alive` (validity window, genesis id and
+    /// hash) before each `checkDup`, in go's order. For a caller whose apply
+    /// does not validate otherwise (the agreement proposal check), so a dead
+    /// transaction gets go's `Alive` verdict, not a later check's.
+    #[must_use]
+    pub fn with_alive(mut self, genesis_id: String, genesis_hash: [u8; 32]) -> Self {
+        self.alive = Some((genesis_id, genesis_hash));
+        self
+    }
+
+    /// The payset's txids, as the txtail records them.
+    #[must_use]
+    pub fn txids(&self) -> &[Digest] {
+        self.ledger.txids()
+    }
+
+    /// [`check_dup`] for payset transaction `index` (after `Alive` when
+    /// [`Self::with_alive`]), recording it in the
     /// block when it passes (go `addTx`: a block that fails is discarded
     /// whole, so recording before the transaction applies is equivalent).
     pub fn check<L: LedgerStore + ?Sized>(
@@ -281,6 +302,18 @@ impl BlockCheckDup {
                 message: format!("checkDup: no txid for payset index {index}"),
             });
         };
+        if let Some((genesis_id, genesis_hash)) = &self.alive {
+            if let Err(message) = algo_validate::block_alive(
+                self.ledger.round,
+                genesis_id,
+                genesis_hash,
+                consensus,
+                txn,
+            ) {
+                self.violation.get_or_insert_with(|| message.clone());
+                return Err(rejected(message));
+            }
+        }
         if let Err(e) = check_dup(store, consensus, txn, txid, &self.block, &mut self.ledger) {
             self.violation.get_or_insert_with(|| e.to_string());
             return Err(e);
@@ -289,7 +322,7 @@ impl BlockCheckDup {
         Ok(())
     }
 
-    /// The first `checkDup` rejection, if any.
+    /// The first `Alive` / `checkDup` rejection, if any (go's text).
     #[must_use]
     pub fn violation(&self) -> Option<&str> {
         self.violation.as_deref()

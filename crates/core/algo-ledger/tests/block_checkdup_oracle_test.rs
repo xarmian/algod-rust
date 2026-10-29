@@ -229,3 +229,108 @@ fn agreement_validator_wiring_rejects_like_go_validate() {
         }
     }
 }
+
+fn scenario<'a>(o: &'a Oracle, name: &str) -> &'a OracleScenario {
+    o.scenarios
+        .iter()
+        .find(|s| s.name == name)
+        .unwrap_or_else(|| panic!("scenario {name}"))
+}
+
+/// go generates blocks with `StartEvaluator(..., Generate + Validate)`, so
+/// its block assembly runs `checkDup` against the live ledger, not against
+/// whatever the pool admitted. The proposer's final scratch apply
+/// (`scratch_execute_payset`), the overlay payset evaluation
+/// (`evaluate_payset`) and the pool's per-group evaluation
+/// (`evaluate_group`, behind `exec_group`) all reject a transaction reusing
+/// a lease the committed ledger holds (issue #2127).
+#[test]
+fn block_generation_rejects_a_live_lease_like_go() {
+    use algo_ledger::locked_base::LockedBase;
+    use algo_ledger::pending_overlay::PendingOverlay;
+    use algo_ledger::proposal_eval::{evaluate_group, evaluate_payset, GroupEvalError};
+    use algo_ledger::shadow_execute::{scratch_execute_payset, ScratchFailure};
+    use algo_types::Round;
+
+    let o = load_oracle();
+    let sc = scenario(&o, "cross_block_lease_conflict");
+    let candidate = block(&sc.block);
+
+    let expect_lease = |error: &algo_error::AlgoError, path: &str| {
+        assert_eq!(error.to_string(), sc.validate_error, "{path}");
+    };
+
+    // The proposer's final scratch apply on the locked ledger.
+    let mut l = sqlite(&o);
+    match scratch_execute_payset(&mut l, &candidate, None) {
+        Err(ScratchFailure::Txn { index: 0, error }) => expect_lease(&error, "scratch"),
+        other => panic!("scratch_execute_payset: {other:?}"),
+    }
+    assert_eq!(l.current_round().0, 1);
+
+    // The overlay evaluations, through the same LockedBase the node uses.
+    let shared = Arc::new(Mutex::new(l));
+    let base = LockedBase::new(&shared, Round(1));
+    match evaluate_payset(&base, &candidate, None) {
+        Err(ScratchFailure::Txn { index: 0, error }) => expect_lease(&error, "evaluate_payset"),
+        other => panic!("evaluate_payset: {other:?}"),
+    }
+    let mut template = candidate.clone();
+    template.payset.clear();
+    let mut overlay = PendingOverlay::new(&base);
+    match evaluate_group(&base, &mut overlay, &template, &candidate.payset) {
+        Err(GroupEvalError::Txn { index: 0, error }) => expect_lease(&error, "evaluate_group"),
+        other => panic!("evaluate_group: {other:?}"),
+    }
+}
+
+/// The dev-mode producer commits through
+/// `apply_block_capturing_apply_data_with_delta`; go's dev block comes from
+/// a Generate + Validate evaluator, so a live-lease conflict is rejected and
+/// the open block rolls back (issue #2127).
+#[test]
+fn dev_mode_commit_rejects_a_live_lease_and_rolls_back() {
+    let o = load_oracle();
+    let sc = scenario(&o, "cross_block_lease_conflict");
+    let mut l = sqlite(&o);
+    l.begin_block().expect("begin block");
+    let err = algo_ledger::apply::apply_block_capturing_apply_data_with_delta(
+        &mut l,
+        &block(&sc.block),
+        algo_ledger::ApplyMode::Execute,
+    )
+    .map(|_| ())
+    .expect_err("the dev-mode commit must reject the lease conflict");
+    assert_eq!(err.to_string(), sc.validate_error);
+    l.rollback_block().expect("rollback block");
+    assert_eq!(l.current_round().0, 1, "nothing committed");
+}
+
+/// The agreement proposal check runs go's `Alive` before `checkDup`, on its
+/// own (the inner validator here accepts everything): a dead transaction is
+/// rejected with go's `Alive` text, not the txtail low-water-mark error a
+/// bare `checkDup` would give (issue #2127).
+#[test]
+fn proposal_check_rejects_a_dead_transaction_with_go_alive_text() {
+    let o = load_oracle();
+    let mut candidate = block(&scenario(&o, "committed_txid").block);
+    candidate.payset[0].txn.last_valid = algo_types::Round(1);
+    let consensus =
+        algo_types::consensus::consensus_params_for_version(&o.protocol).expect("protocol");
+    let expected = algo_validate::block_alive(
+        candidate.round.0,
+        &candidate.genesis_id,
+        &candidate.genesis_hash,
+        &consensus,
+        &candidate.payset[0].txn,
+    )
+    .expect_err("the transaction is dead in round 2");
+    assert!(expected.contains("dead"), "{expected}");
+
+    let ledger = Arc::new(Mutex::new(sqlite(&o)));
+    let validator = PayoutCheckingValidator::new(StubBlockValidator::accepting(), ledger);
+    match validator.validate(&candidate).map(|_| ()) {
+        Err(AgreementError::ValidationFailed(message)) => assert_eq!(message, expected),
+        other => panic!("expected go's Alive verdict, got {other:?}"),
+    }
+}

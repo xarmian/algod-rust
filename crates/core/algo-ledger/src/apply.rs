@@ -102,12 +102,12 @@ pub struct ApplyContext {
     /// checks, vote key checks, etc.). When false (replay/catchup), only
     /// the apply-side state transitions run.
     pub validate: bool,
-    /// The caller runs go's `checkDup` itself and tracks the block's leases
-    /// ([`crate::check_dup`], simulate): apply then neither checks nor
-    /// records leases. Simulate's lease check must see only the rounds up
-    /// to the simulated one, and recording into the live lease table would
-    /// outlive the simulation (no snapshot covers it).
-    pub leases_checked_by_caller: bool,
+    /// The caller tracks the block's leases itself (simulate's
+    /// [`crate::check_dup::BlockDups`]): apply then does not record them in
+    /// the store's lease table, which no snapshot restores, so a simulated
+    /// lease would outlive the simulation. Apply never checks leases; go
+    /// checks them only in `checkDup` ([`Self::checkdup`]).
+    pub caller_tracks_leases: bool,
     /// go `checkDup` for a block evaluated with `Validate: true` (issue
     /// #2127): set by [`apply_block_impl_probe`] when the apply validates
     /// (or a probe asks for it), `None` otherwise. Each top-level
@@ -248,7 +248,7 @@ impl ApplyContext {
             round,
             mode: ApplyMode::Replay,
             validate: false,
-            leases_checked_by_caller: false,
+            caller_tracks_leases: false,
             checkdup: None,
             generate: false,
             latest_timestamp: 0,
@@ -412,8 +412,14 @@ pub fn apply_block_with_delta_mode_for<L: crate::store_trait::LedgerStore>(
     mode: ApplyMode,
     check_payouts: bool,
 ) -> Result<crate::state_delta::StateDelta, AlgoError> {
-    let (delta, _apply_data) =
-        apply_block_with_delta_mode_and_apply_data(store, block, mode, false, check_payouts)?;
+    let (delta, _apply_data) = apply_block_with_delta_mode_and_apply_data(
+        store,
+        block,
+        mode,
+        false,
+        check_payouts,
+        false,
+    )?;
     Ok(delta)
 }
 
@@ -753,7 +759,7 @@ pub fn apply_block_with_delta_mode<L: crate::store_trait::LedgerStore>(
     mode: ApplyMode,
 ) -> Result<crate::state_delta::StateDelta, AlgoError> {
     let (delta, _apply_data) =
-        apply_block_with_delta_mode_and_apply_data(store, block, mode, false, false)?;
+        apply_block_with_delta_mode_and_apply_data(store, block, mode, false, false, false)?;
     Ok(delta)
 }
 
@@ -765,7 +771,7 @@ pub fn apply_block_with_delta_mode_checking_payouts<L: crate::store_trait::Ledge
     mode: ApplyMode,
 ) -> Result<crate::state_delta::StateDelta, AlgoError> {
     let (delta, _apply_data) =
-        apply_block_with_delta_mode_and_apply_data(store, block, mode, false, true)?;
+        apply_block_with_delta_mode_and_apply_data(store, block, mode, false, true, false)?;
     Ok(delta)
 }
 
@@ -788,8 +794,11 @@ pub fn apply_block_capturing_apply_data_with_delta<L: crate::store_trait::Ledger
     block: &Block,
     mode: ApplyMode,
 ) -> Result<(Vec<ApplyData>, crate::state_delta::StateDelta), AlgoError> {
+    // Only the dev-mode producer commits through this: go's dev block comes
+    // out of a Generate + Validate evaluator (`AssembleDevModeBlock`), so
+    // `Alive` and `checkDup` run (issue #2127).
     let (delta, apply_data) =
-        apply_block_with_delta_mode_and_apply_data(store, block, mode, true, false)?;
+        apply_block_with_delta_mode_and_apply_data(store, block, mode, true, false, true)?;
     Ok((apply_data, delta))
 }
 
@@ -799,6 +808,7 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
     mode: ApplyMode,
     capture_apply_data: bool,
     validate_payouts: bool,
+    check_dup: bool,
 ) -> Result<(crate::state_delta::StateDelta, Vec<ApplyData>), AlgoError> {
     use std::collections::{HashMap, HashSet};
 
@@ -1006,6 +1016,7 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
     let mut probe = ExecProbe {
         request: ProbeRequest {
             validate_payouts,
+            check_dup,
             ..ProbeRequest::default()
         },
         ..ExecProbe::default()
@@ -2689,20 +2700,25 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
     // TxnCounter). This is the base for creatable ID generation.
     let base_txn_counter = store.txn_counter();
 
-    // go runs `checkDup` only when it validates (`eval.validate`): proposal
-    // validation (`Ledger.Validate`), never `Ledger.AddBlock` (catchup,
-    // certified blocks). The txids are the ones the txtail records, built
-    // once here and reused for the block's txtail row below (issue #2127).
+    // go runs `checkDup` only in an evaluator with `Validate` set: proposal
+    // validation (`Ledger.Validate`) and block generation (`StartEvaluator`
+    // with Generate + Validate), never `Ledger.AddBlock` (catchup, certified
+    // blocks). The txids are the ones the txtail records, hashed once here
+    // and reused for the block's txtail row below (issue #2127).
     let run_check_dup = validate || probe.as_ref().is_some_and(|p| p.request.check_dup);
-    let mut block_txtail = run_check_dup
-        .then(|| algo_codec::build_txtail_from_block_with_rule(stored_block, &genesis_rule));
-    let checkdup = block_txtail.as_ref().map(|tail| {
-        let txids = tail
-            .txn_ids
-            .iter()
-            .map(|id| algo_types::Digest(<[u8; 32]>::try_from(id.as_ref()).unwrap_or([0u8; 32])))
-            .collect();
-        RefCell::new(crate::check_dup::BlockCheckDup::new(block.round.0, txids))
+    let checkdup = run_check_dup.then(|| {
+        let check = crate::check_dup::BlockCheckDup::new(
+            block.round.0,
+            algo_codec::block_txids_with_rule(stored_block, &genesis_rule),
+        );
+        // A validating apply checks `Alive` itself (`check_txn_alive`) and a
+        // generator's pool already did. The proposal check validates nothing
+        // else, so go's `Alive` runs with the `checkDup` it precedes.
+        RefCell::new(if validate || generate {
+            check
+        } else {
+            check.with_alive(stored_block.genesis_id.clone(), stored_block.genesis_hash)
+        })
     });
 
     let ctx = ApplyContext {
@@ -2711,7 +2727,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         round: block.round.0,
         mode,
         validate,
-        leases_checked_by_caller: false,
+        caller_tracks_leases: false,
         checkdup,
         generate,
         // `global LatestTimestamp` is the *previous* block's timestamp in go
@@ -3182,9 +3198,12 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         tracing::warn!("put_block failed for round {}: {e}", block.round.0);
     }
 
-    let txtail = block_txtail.take().unwrap_or_else(|| {
-        algo_codec::build_txtail_from_block_with_rule(stored_block, &genesis_rule)
-    });
+    let txtail = match &ctx.checkdup {
+        Some(checkdup) => {
+            algo_codec::build_txtail_from_block_with_txids(stored_block, checkdup.borrow().txids())
+        }
+        None => algo_codec::build_txtail_from_block_with_rule(stored_block, &genesis_rule),
+    };
     let txtail_data = algo_codec::canonical_encode_txtail_round(&txtail);
     if let Err(e) = store.put_txtail(block.round.0, &txtail_data) {
         tracing::warn!("put_txtail failed for round {}: {e}", block.round.0);
@@ -5212,7 +5231,7 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
         }
 
         // Record lease on success (no-op for empty/zero leases).
-        if !ctx.leases_checked_by_caller {
+        if !ctx.caller_tracks_leases {
             store.record_lease(&txn.sender, lease_arr, txn.last_valid.0);
         }
 
@@ -11776,7 +11795,7 @@ mod tests {
             round,
             mode: ApplyMode::Replay,
             validate: false,
-            leases_checked_by_caller: false,
+            caller_tracks_leases: false,
             checkdup: None,
             generate: false,
             latest_timestamp: 0,
@@ -12488,7 +12507,7 @@ mod tests {
             round: 100,
             mode: ApplyMode::Replay,
             validate: false,
-            leases_checked_by_caller: false,
+            caller_tracks_leases: false,
             checkdup: None,
             generate: false,
             latest_timestamp: 0,
@@ -12678,7 +12697,7 @@ mod tests {
             round,
             mode: ApplyMode::Replay,
             validate: false,
-            leases_checked_by_caller: false,
+            caller_tracks_leases: false,
             checkdup: None,
             generate: false,
             latest_timestamp: 0,
@@ -12707,7 +12726,7 @@ mod tests {
             round,
             mode: ApplyMode::Replay,
             validate: false,
-            leases_checked_by_caller: false,
+            caller_tracks_leases: false,
             checkdup: None,
             generate: false,
             latest_timestamp: 0,
@@ -14305,7 +14324,7 @@ return
             round,
             mode: ApplyMode::Replay,
             validate: false,
-            leases_checked_by_caller: false,
+            caller_tracks_leases: false,
             checkdup: None,
             generate: false,
             latest_timestamp: 0,
@@ -16255,7 +16274,7 @@ return
             round: 1,
             mode: ApplyMode::Replay,
             validate: false,
-            leases_checked_by_caller: false,
+            caller_tracks_leases: false,
             checkdup: None,
             generate: false,
             latest_timestamp: 0,

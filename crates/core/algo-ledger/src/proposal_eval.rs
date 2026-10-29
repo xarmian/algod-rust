@@ -37,7 +37,7 @@ use crate::apply::{
     apply_block_impl_probe, ApplyData, ApplyMode, ExecProbe, ListsRequest, ProbeRequest,
 };
 use crate::pending_overlay::{OverlayBase, OverlayStore, PendingOverlay};
-use crate::shadow_execute::{PayoutCheck, ScratchFailure, ScratchPayset};
+use crate::shadow_execute::{ProposalCheck, ScratchFailure, ScratchPayset};
 
 /// Successful evaluation of one group.
 #[derive(Debug)]
@@ -97,6 +97,10 @@ pub fn evaluate_group<B: OverlayBase + ?Sized>(
             skip_epilogue: true,
             generate: true,
             pool_withdrawn: overlay.pool_withdrawn(),
+            // go's generating evaluator validates too (`StartEvaluator`
+            // with Generate + Validate), so `checkDup` runs against the
+            // live ledger, not the pool's snapshot (issue #2127).
+            check_dup: true,
             ..ProbeRequest::default()
         },
         ..ExecProbe::default()
@@ -180,6 +184,8 @@ pub fn evaluate_payset<B: OverlayBase + ?Sized>(
             generate: true,
             want_fee_sink_available: true,
             knock_offline_exclude: lists.as_ref().map(|l| l.own_addresses.clone()),
+            // go generates with Generate + Validate: `checkDup` (#2127).
+            check_dup: true,
             ..Default::default()
         },
         ..Default::default()
@@ -200,14 +206,14 @@ pub fn evaluate_payset<B: OverlayBase + ?Sized>(
 /// issue #1798) on a **fresh** overlay over `base`, without a SAVEPOINT on the
 /// live connection and without holding the ledger mutex across the
 /// evaluation (issue #1895). Identical verdicts to
-/// [`crate::shadow_execute::scratch_validate_payouts`]: the whole block is
+/// [`crate::shadow_execute::scratch_proposal_check`]: the whole block is
 /// evaluated in [`ApplyMode::Execute`] *including* the epilogue (participation
 /// lists, payout validation, payout application) with only the payout
 /// validation and go's `checkDup` (issue #2127) switched on; a `checkDup`
 /// rejection is a verdict too. A base that is not at `block.round - 1`, or that
 /// advanced while evaluating, is a transient
-/// [`PayoutCheck::NoVerdict`] (the caller retries), never a verdict.
-pub fn evaluate_validate_payouts<B: OverlayBase + ?Sized>(base: &B, block: &Block) -> PayoutCheck {
+/// [`ProposalCheck::NoVerdict`] (the caller retries), never a verdict.
+pub fn evaluate_proposal_check<B: OverlayBase + ?Sized>(base: &B, block: &Block) -> ProposalCheck {
     #[cfg(any(test, feature = "test-hooks"))]
     if crate::shadow_execute::test_hooks::should_fail(block.payset.len()) {
         return crate::shadow_execute::payout_check_from::<()>(Err(ScratchFailure::Other(
@@ -223,7 +229,7 @@ pub fn evaluate_validate_payouts<B: OverlayBase + ?Sized>(base: &B, block: &Bloc
 
 /// Evaluate `block` in [`ApplyMode::Execute`] on a fresh overlay over `base`
 /// with `probe`, returning the per-transaction apply data. Shared by
-/// [`evaluate_payset`] and [`evaluate_validate_payouts`].
+/// [`evaluate_payset`] and [`evaluate_proposal_check`].
 fn evaluate_block_on_overlay<B: OverlayBase + ?Sized>(
     base: &B,
     block: &Block,

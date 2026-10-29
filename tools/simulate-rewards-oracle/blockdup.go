@@ -113,10 +113,10 @@ func blockDupOracle() {
 	cfg := config.GetDefaultLocal()
 	cfg.Archival = true
 	initState := ledgercore.InitState{Block: genesis, Accounts: accts, GenesisHash: genesisHash}
-	real, err := ledger.OpenLedger(log, blockDupGenesisID+"-ledger", true, initState, cfg)
+	actual, err := ledger.OpenLedger(log, blockDupGenesisID+"-ledger", true, initState, cfg)
 	must(err)
-	defer real.Close()
-	l := &data.Ledger{Ledger: real}
+	defer actual.Close()
+	l := &data.Ledger{Ledger: actual}
 
 	pay := func(note string, lease [32]byte) transactions.SignedTxn {
 		return transactions.Transaction{
@@ -226,10 +226,10 @@ func blockDupOracle() {
 		// A new payment reusing block 1's lease, still in force.
 		{"cross_block_lease_conflict", build(pay("new-leased", lease))},
 	}
-	pool := execpool.MakeBacklog(nil, 0, execpool.LowPriority, nil)
-	defer pool.Shutdown()
+	backlog := execpool.MakeBacklog(nil, 0, execpool.LowPriority, nil)
+	defer backlog.Shutdown()
 	for _, sc := range scenarios {
-		_, verr := l.Validate(context.Background(), sc.blk, pool)
+		_, verr := l.Validate(context.Background(), sc.blk, backlog)
 		_, rerr := eval.Eval(context.Background(), l, sc.blk, false, nil, nil, nil)
 		f.Scenarios = append(f.Scenarios, blockDupScenario{
 			Name:          sc.name,

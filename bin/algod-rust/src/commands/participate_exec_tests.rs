@@ -2291,3 +2291,61 @@ fn lock_hold_report_large_workload() {
         }
     }
 }
+
+// ---- #2127: go generates with Generate + Validate (checkDup) ----
+
+/// `a`'s payment to `b` carrying `lease`.
+fn leased_pay(k: &Key, to: Address, lease: [u8; 32], note: u8) -> SignedTransaction {
+    let mut t = base_txn(k.0, TxnType::Pay);
+    t.receiver = to;
+    t.amount = 1_000;
+    t.lease = lease;
+    t.note = serde_bytes::ByteBuf::from(vec![note]);
+    sign(t, &k.1)
+}
+
+/// A lease the ledger holds but the evaluator's snapshot does not (it was
+/// recorded after the snapshot was taken) is still rejected at admission:
+/// `exec_group` evaluates the group through `evaluate_group`, whose
+/// `checkDup` reads the live ledger (issue #2127, go `StartEvaluator` with
+/// Generate + Validate).
+#[test]
+fn exec_group_rejects_a_lease_recorded_after_the_snapshot() {
+    use algo_ledger::store_trait::LedgerStore;
+    let a = key(1);
+    let b = key(2);
+    let lease = [0x5A; 32];
+    let (ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))]);
+    ledger.lock().unwrap().record_lease(&a.0, &lease, 500);
+    let err = eval
+        .transaction_group(&[leased_pay(&a, b.0, lease, 1)])
+        .expect_err("the live lease must reject the group");
+    assert!(
+        err.to_string().contains("overlapping lease"),
+        "expected go's LeaseInLedgerError, got: {err}"
+    );
+}
+
+/// The same at assembly: a group admitted before the lease was recorded is
+/// dropped from the proposal, because the final scratch apply runs
+/// `checkDup` against the live ledger (issue #2127).
+#[test]
+fn assembly_drops_a_group_whose_lease_was_recorded_after_admission() {
+    use algo_ledger::store_trait::LedgerStore;
+    let a = key(1);
+    let b = key(2);
+    let lease = [0x5B; 32];
+    let (ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))]);
+    eval.transaction_group(&[pay(&a, b.0, 2_000_000, None)])
+        .expect("good group");
+    eval.transaction_group(&[leased_pay(&a, b.0, lease, 2)])
+        .expect("admitted while the lease is free");
+    ledger.lock().unwrap().record_lease(&a.0, &lease, 500);
+    let block = eval.generate_block(&[]).expect("generate_block");
+    assert_eq!(
+        block.payset.len(),
+        1,
+        "the group reusing the live lease is not proposed"
+    );
+    assert_eq!(block.payset[0].txn.lease, [0u8; 32]);
+}
