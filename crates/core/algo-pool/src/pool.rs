@@ -1443,16 +1443,38 @@ impl TransactionPool {
     pub fn evict_groups(&self, txids: &HashSet<Digest>, error: &AlgoError) -> usize {
         let mut inner = self.mu.lock();
         let mut pending = self.pending_mu.write();
-        // The txid-keyed maps give the members without hashing anything.
-        let mut members: Vec<SignedTransaction> = Vec::new();
+        // The txid-keyed maps give the members without hashing the pool. A
+        // group is matched by its group id; an ungrouped transaction (the
+        // only member of its group) by its txid, hashed only for pool
+        // transactions from one of the evicted senders.
+        let mut group_ids: HashSet<[u8; 32]> = HashSet::new();
+        let mut senders: HashSet<Address> = HashSet::new();
+        let mut found = false;
         for id in txids {
-            members.extend(pending.txids.remove(id));
-            members.extend(inner.remembered_txids.remove(id));
+            for stx in [pending.txids.remove(id), inner.remembered_txids.remove(id)]
+                .into_iter()
+                .flatten()
+            {
+                found = true;
+                if stx.txn.group == [0u8; 32] {
+                    senders.insert(stx.txn.sender);
+                } else {
+                    group_ids.insert(stx.txn.group);
+                }
+            }
         }
-        if members.is_empty() {
+        if !found {
             return 0;
         }
-        let hit = |g: &Vec<SignedTransaction>| g.iter().any(|t| members.contains(t));
+        let hit = |g: &Vec<SignedTransaction>| match g.first() {
+            Some(first) if first.txn.group != [0u8; 32] => group_ids.contains(&first.txn.group),
+            Some(first) => {
+                g.len() == 1
+                    && senders.contains(&first.txn.sender)
+                    && txids.contains(&compute_txn_id(&first.txn))
+            }
+            None => false,
+        };
         let before = pending.tx_groups.len() + inner.remembered_tx_groups.len();
         pending.tx_groups.retain(|g| !hit(g));
         inner.remembered_tx_groups.retain(|g| !hit(g));

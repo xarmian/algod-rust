@@ -315,21 +315,21 @@ pub fn evict_failed_group(
         return 0;
     };
     let group = failed.txn.group;
-    // The payset's txids as the txtail records them: hashed over the
-    // borrowed stripped transactions, nothing cloned.
-    let all = algo_codec::block_txids_with_rule(
-        block,
-        &algo_types::genesis_restore::GenesisRestoreRule::for_block(block),
-    );
+    // Only the failed group's members are hashed, over the borrowed stripped
+    // transactions with the genesis fields go restores (nothing cloned).
+    let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(block);
+    let txid = |stx: &SignedTransaction| {
+        let (gen, gh) = rule.restored_genesis(stx);
+        algo_codec::compute_txn_id_with_genesis(&stx.txn, gen, gh)
+    };
     let txids: HashSet<Digest> = if group == [0u8; 32] {
-        std::iter::once(all[index]).collect()
+        std::iter::once(txid(failed)).collect()
     } else {
         block
             .payset
             .iter()
-            .zip(&all)
-            .filter(|(stx, _)| stx.txn.group == group)
-            .map(|(_, id)| *id)
+            .filter(|stx| stx.txn.group == group)
+            .map(txid)
             .collect()
     };
     pool.evict_groups(&txids, error)

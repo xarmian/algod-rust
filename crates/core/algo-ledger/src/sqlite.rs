@@ -3241,16 +3241,55 @@ impl SqliteLedger {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = cache;
     }
 
-    /// Run `f` on the shared txid cache brought up to date with the
-    /// committed rows. Mid-block (the dev-mode commit, a validating apply),
-    /// `current_round` may already run ahead of the rows written so far, so
-    /// the cache syncs only to the round committed when the block began; the
-    /// block's own transactions are `checkDup`'s in-block half.
-    fn with_synced_txtail_cache<T>(
+    /// The members of `txids` committed in the last `max_txn_life` rounds,
+    /// from the shared txid cache.
+    ///
+    /// Out of a block the cache is synced to `current_round`. Inside a
+    /// `begin_block` span (the dev-mode commit, a validating apply, a span
+    /// applying several rounds) the cache is synced only up to the round
+    /// committed when the span began, and never moved backwards (that would
+    /// force a full rebuild). The rounds the span applied since then are
+    /// read from their rows directly (a span is short), so their txids are
+    /// found too; the round being applied has no row yet and is
+    /// `checkDup`'s in-block half.
+    fn txtail_found(
+        &self,
+        txids: &[algo_types::Digest],
+        max_txn_life: u64,
+    ) -> std::collections::HashSet<algo_types::Digest> {
+        let (cache, committed) = self.synced_txtail_cache(max_txn_life);
+        let mut found = cache.confirmed(txids, max_txn_life);
+        drop(cache);
+        if self.in_block {
+            for round in committed + 1..=self.current_round.0 {
+                let Some(bytes) = self.get_txtail(round).ok().flatten() else {
+                    continue;
+                };
+                let Ok(tail) = rmp_serde::from_slice::<algo_types::TxTailRound>(&bytes) else {
+                    continue;
+                };
+                for id in &tail.txn_ids {
+                    if let Ok(id) = <[u8; 32]>::try_from(id.as_ref()) {
+                        let id = algo_types::Digest(id);
+                        if txids.contains(&id) {
+                            found.insert(id);
+                        }
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// The shared txid cache synced as [`Self::txtail_found`] describes, and
+    /// the round it is synced to (the committed round).
+    fn synced_txtail_cache(
         &self,
         max_txn_life: u64,
-        f: impl FnOnce(&crate::txtail_cache::TxTailDupCache) -> T,
-    ) -> T {
+    ) -> (
+        std::sync::MutexGuard<'_, crate::txtail_cache::TxTailDupCache>,
+        u64,
+    ) {
         let fetch = |r| self.get_txtail(r).ok().flatten();
         let committed = if self.in_block {
             self.chain_snapshot
@@ -3276,8 +3315,10 @@ impl SqliteLedger {
             .txtail_dups
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.sync_window_with(committed.0, max_txn_life, earliest, fetch, |_, _| {});
-        f(&cache)
+        if !self.in_block || cache.loaded_hi() <= committed.0 {
+            cache.sync_window_with(committed.0, max_txn_life, earliest, fetch, |_, _| {});
+        }
+        (cache, committed.0)
     }
 
     /// Return a reference to the in-memory lease table.
@@ -8498,13 +8539,18 @@ impl LedgerStore for SqliteLedger {
         txids: &[algo_types::Digest],
         max_txn_life: u64,
     ) -> std::collections::HashSet<algo_types::Digest> {
-        self.with_synced_txtail_cache(max_txn_life, |cache| cache.confirmed(txids, max_txn_life))
+        self.txtail_found(txids, max_txn_life)
     }
 
     fn txtail_contains_txid(&self, txid: &algo_types::Digest, max_txn_life: u64) -> bool {
-        self.with_synced_txtail_cache(max_txn_life, |cache| {
-            cache.contains_within(txid, max_txn_life)
-        })
+        if self.in_block {
+            return self
+                .txtail_found(std::slice::from_ref(txid), max_txn_life)
+                .contains(txid);
+        }
+        // The pool's per-submission check: no allocation.
+        let (cache, _) = self.synced_txtail_cache(max_txn_life);
+        cache.contains_within(txid, max_txn_life)
     }
 
     // ---- Pruning ----

@@ -461,3 +461,74 @@ fn pending_block_lease_is_an_in_block_conflict() {
         other => panic!("second group: {other:?}"),
     }
 }
+
+/// Pool re-evaluation hands its txids over (`evaluate_group_with_txids`):
+/// `checkDup` still looks them up in the txtail, so a pending transaction
+/// committed meanwhile is rejected with go's text (issue #2127).
+#[test]
+fn pool_supplied_txids_are_still_checked_against_the_txtail() {
+    use algo_ledger::locked_base::LockedBase;
+    use algo_ledger::pending_overlay::PendingOverlay;
+    use algo_ledger::proposal_eval::{evaluate_group_with_txids, GroupEvalError};
+    use algo_types::Round;
+
+    let o = load_oracle();
+    let sc = scenario(&o, "committed_txid");
+    let candidate = block(&sc.block);
+    let txids = algo_codec::block_txids_with_rule(
+        &candidate,
+        &algo_types::genesis_restore::GenesisRestoreRule::for_block(&candidate),
+    );
+    let shared = Arc::new(Mutex::new(sqlite(&o)));
+    let base = LockedBase::new(&shared, Round(1));
+    let mut template = candidate.clone();
+    template.payset.clear();
+    let mut overlay = PendingOverlay::new(&base);
+    match evaluate_group_with_txids(
+        &base,
+        &mut overlay,
+        &template,
+        &candidate.payset,
+        Some(txids),
+    ) {
+        Err(GroupEvalError::Txn { index: 0, error }) => {
+            assert_eq!(error.to_string(), sc.validate_error)
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Inside a `begin_block` span that has applied rounds, the txid lookup
+/// still sees the txids those rounds committed (the shared cache stops at
+/// the span's starting round; the span's rows are read directly), and the
+/// shared cache never moves backwards (issue #2127).
+#[test]
+fn sqlite_txid_lookup_sees_rounds_applied_in_the_open_span() {
+    let o = load_oracle();
+    let block1 = block(&o.block1);
+    let committed = algo_codec::block_txids_with_rule(
+        &block1,
+        &algo_types::genesis_restore::GenesisRestoreRule::for_block(&block1),
+    );
+    let mut l = SqliteLedger::open_in_memory().expect("in-memory ledger");
+    seed(&mut l, &o, |l, b| {
+        l.begin_block().expect("begin span");
+        // Warm the shared cache at the span's starting round.
+        assert!(l.txtail_confirmed_txids(&committed, 1000).is_empty());
+        algo_ledger::apply::apply_block(l, b).expect("apply round 1 in the span");
+        // Still inside the span, after round 1.
+        let found = l.txtail_confirmed_txids(&committed, 1000);
+        assert_eq!(
+            found.len(),
+            committed.len(),
+            "round 1's txids seen in the span"
+        );
+        assert!(l.txtail_contains_txid(&committed[0], 1000));
+        l.commit_block().expect("commit span");
+    });
+    assert_eq!(
+        l.txtail_confirmed_txids(&committed, 1000).len(),
+        committed.len(),
+        "and after the commit"
+    );
+}

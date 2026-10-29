@@ -62,9 +62,9 @@ use algo_validate::{
 use ed25519_dalek::{Signer, SigningKey};
 
 use crate::apply::{
-    apply_transaction_with_budget, check_authorizer, compute_group_fee_credit_and_residue,
-    withdraw_block_rewards, ApplyContext, ApplyMode, AvmEvalOverrides, BlockRewardsWithdrawal,
-    BoxBudgetState, GroupInfo, TESTNET_BANK_ADDRESS,
+    apply_transaction_with_budget, compute_group_fee_credit_and_residue, withdraw_block_rewards,
+    ApplyContext, ApplyMode, AvmEvalOverrides, BlockRewardsWithdrawal, BoxBudgetState, GroupInfo,
+    TESTNET_BANK_ADDRESS,
 };
 use crate::avm_context::{NamedGroupResources, StoreSigBlockSource, UnnamedCapacityTracker};
 use crate::block_header::next_block_protocol;
@@ -765,9 +765,30 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             round: block.round,
             mode: ApplyMode::Execute,
             validate: true,
-            // `check_dup` in the loop below owns the lease check (issue #2125).
+            // The prologue's `checkDup` owns the lease check: apply records no
+            // lease in the live table (issue #2125).
             caller_tracks_leases: true,
-            checkdup: None,
+            // go `BlockEvaluator.transaction`'s `Alive` / `checkDup` /
+            // authorizer prologue, shared with block validation
+            // (`crate::apply::txn_prologue`). The request's transactions are
+            // not stripped, so nothing is restored. Their txids are hashed
+            // only when evaluation will run, and kept apart from
+            // `group_txid_cache` on purpose: that cache reproduces go's shared
+            // `EvalParams.txidCache`, whose entries a nested program can fill
+            // with an inner id (#1736), so seeding it with the top-level ids
+            // would change what `txn TxID` returns.
+            checkdup: precheck_failure.is_none().then(|| {
+                RefCell::new(crate::check_dup::BlockCheckDup::new(
+                    block.round,
+                    eval_group
+                        .iter()
+                        .map(|stx| algo_codec::compute_txn_id(&stx.txn))
+                        .collect(),
+                    block.block_genesis_id.clone(),
+                    block.block_genesis_hash,
+                    vec![(false, false); eval_group.len()],
+                ))
+            }),
             // go `simulator.go`: `Generate: true, Validate: true`.
             generate: true,
             latest_timestamp: block.latest_timestamp,
@@ -895,27 +916,6 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         let group_txid_cache = crate::avm_context::GroupTxidCache::default();
         let group_created = crate::apply::GroupCreatedResources::default();
 
-        // go `roundCowState`'s txids and leases for `checkDup`, and the
-        // ledger half (which reads the txtail lazily, at most once). The
-        // txids are hashed only when evaluation will run. They are kept
-        // apart from `group_txid_cache` on purpose: that cache reproduces
-        // go's shared `EvalParams.txidCache`, whose entries a nested
-        // program can fill with an inner id (#1736), so seeding it with the
-        // top-level ids, or reading them back from it, would change what
-        // `txn TxID` returns.
-        let mut block_dups = crate::check_dup::BlockDups::new();
-        let mut ledger_dups = crate::check_dup::LedgerDups::new(
-            block.round,
-            if precheck_failure.is_none() {
-                eval_group
-                    .iter()
-                    .map(|stx| algo_codec::compute_txn_id(&stx.txn))
-                    .collect()
-            } else {
-                Vec::new()
-            },
-        );
-
         for i in 0..eval_group.len() {
             if precheck_failure.is_some() {
                 // `check()` already failed at a known index -- evaluation
@@ -963,31 +963,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             // #2125), then the authorizer. go's simulate reports these error
             // texts bare (`EvalFailureError` wraps them without a prefix),
             // hence `Rejected`, whose display is the message itself.
-            let alive = algo_validate::block_alive(
-                block.round,
-                &block.block_genesis_id,
-                &block.block_genesis_hash,
-                &apply_ctx.consensus,
-                &eval_group[i].txn,
-            )
-            .map_err(|message| AlgoError::Rejected {
-                source: None,
-                message,
-                class: algo_error::RejectClass::Other,
-            });
-            let checked = alive
-                .and_then(|()| {
-                    let txid = ledger_dups.txids()[i];
-                    crate::check_dup::check_dup(
-                        &*self.store,
-                        &apply_ctx.consensus,
-                        &eval_group[i].txn,
-                        txid,
-                        &block_dups,
-                        &mut ledger_dups,
-                    )
-                })
-                .and_then(|()| check_authorizer(self.store, &eval_group[i]));
+            let checked = crate::apply::txn_prologue(&*self.store, &apply_ctx, &eval_group[i], i);
             let apply_result = match checked {
                 Err(e) => Err(e),
                 Ok(()) => {
@@ -1025,7 +1001,6 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
 
             match apply_result {
                 Ok(apply_data) => {
-                    block_dups.record(&eval_group[i].txn, ledger_dups.txids()[i]);
                     // Defensively drain `failed_eval_delta` even on success:
                     // nothing sets it on this path today, but a future change
                     // must not let a stale value from an earlier iteration

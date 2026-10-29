@@ -2450,3 +2450,68 @@ fn dev_mode_evicts_a_rejected_group_and_the_chain_advances() {
     assert_eq!(block.payset.len(), 1);
     assert_ne!(block.payset[0].txn.sender, rejected_sender);
 }
+
+/// The pool's own `checkDup` copy always runs, so a lease the snapshot holds
+/// is rejected even when the real apply cannot run (stale base): go's typed
+/// `LeaseInLedgerError`, tagged `lease` (issue #2127).
+#[test]
+fn snapshot_lease_is_rejected_when_exec_is_stale() {
+    use algo_ledger::store_trait::LedgerStore;
+    let a = key(1);
+    let b = key(2);
+    let lease = [0x5E; 32];
+    let (ledger, _pool) = fixture(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))], &[]);
+    ledger.lock().unwrap().record_lease(&a.0, &lease, 500);
+    let adapter = PoolLedgerAdapter::new(ledger.clone());
+    let mut eval = adapter
+        .start_simple_evaluator(genesis_header(), 0, 0)
+        .expect("start_evaluator");
+    // The chain advanced under the evaluator: exec cannot evaluate.
+    eval.exec.as_mut().unwrap().template.round = Round(9);
+    let stx = leased_pay(&a, b.0, lease, 4);
+    let err = eval
+        .transaction_group(std::slice::from_ref(&stx))
+        .expect_err("the snapshot lease rejects the group");
+    let expected = algo_ledger::check_dup::lease_in_ledger_error(
+        algo_codec::compute_txn_id(&stx.txn),
+        &a.0,
+        &lease,
+        false,
+    );
+    assert_eq!(err.to_string(), expected.to_string());
+    assert!(matches!(
+        err,
+        algo_error::AlgoError::Rejected {
+            class: algo_error::RejectClass::LeaseInLedger { in_block: false },
+            ..
+        }
+    ));
+}
+
+/// go runs `checkDup` before the balance checks: a leased payment that is
+/// also an overspend reports the lease conflict (issue #2127).
+#[test]
+fn leased_overspend_reports_the_lease_conflict_first() {
+    use algo_ledger::store_trait::LedgerStore;
+    let a = key(1);
+    let b = key(2);
+    let lease = [0x5F; 32];
+    let (ledger, _pool) = fixture(&[(a.0, funded(5_000_000)), (b.0, funded(1_000_000))], &[]);
+    ledger.lock().unwrap().record_lease(&a.0, &lease, 500);
+    let adapter = PoolLedgerAdapter::new(ledger.clone());
+    let mut eval = adapter
+        .start_simple_evaluator(genesis_header(), 0, 0)
+        .expect("start_evaluator");
+    let mut t = base_txn(a.0, TxnType::Pay);
+    t.receiver = b.0;
+    t.amount = 900_000_000; // far more than a holds
+    t.lease = lease;
+    let stx = sign(t, &a.1);
+    let err = eval
+        .transaction_group(std::slice::from_ref(&stx))
+        .expect_err("rejected");
+    assert!(
+        err.to_string().contains("using an overlapping lease"),
+        "expected the lease conflict, got: {err}"
+    );
+}

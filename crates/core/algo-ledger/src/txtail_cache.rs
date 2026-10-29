@@ -266,6 +266,12 @@ impl TxTailDupCache {
         self.loaded_hi = self.loaded_hi.max(current_round);
     }
 
+    /// The latest round synced (0 = nothing loaded).
+    #[must_use]
+    pub fn loaded_hi(&self) -> u64 {
+        self.loaded_hi
+    }
+
     /// Whether `txid` was confirmed within the largest window synced.
     ///
     /// Call [`sync`](Self::sync) first; this is a pure in-memory lookup.

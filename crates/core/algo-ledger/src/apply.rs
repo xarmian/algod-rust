@@ -417,10 +417,10 @@ pub fn apply_block_with_delta_mode_for<L: crate::store_trait::LedgerStore>(
         store,
         block,
         mode,
-        false,
-        check_payouts,
-        false,
-        None,
+        DeltaApplyOptions {
+            validate_payouts: check_payouts,
+            ..DeltaApplyOptions::default()
+        },
     )?;
     Ok(delta)
 }
@@ -760,8 +760,12 @@ pub fn apply_block_with_delta_mode<L: crate::store_trait::LedgerStore>(
     block: &Block,
     mode: ApplyMode,
 ) -> Result<crate::state_delta::StateDelta, AlgoError> {
-    let (delta, _apply_data) =
-        apply_block_with_delta_mode_and_apply_data(store, block, mode, false, false, false, None)?;
+    let (delta, _apply_data) = apply_block_with_delta_mode_and_apply_data(
+        store,
+        block,
+        mode,
+        DeltaApplyOptions::default(),
+    )?;
     Ok(delta)
 }
 
@@ -772,8 +776,15 @@ pub fn apply_block_with_delta_mode_checking_payouts<L: crate::store_trait::Ledge
     block: &Block,
     mode: ApplyMode,
 ) -> Result<crate::state_delta::StateDelta, AlgoError> {
-    let (delta, _apply_data) =
-        apply_block_with_delta_mode_and_apply_data(store, block, mode, false, true, false, None)?;
+    let (delta, _apply_data) = apply_block_with_delta_mode_and_apply_data(
+        store,
+        block,
+        mode,
+        DeltaApplyOptions {
+            validate_payouts: true,
+            ..DeltaApplyOptions::default()
+        },
+    )?;
     Ok(delta)
 }
 
@@ -794,10 +805,12 @@ pub fn apply_block_capturing_apply_data_with_delta_or_failed_txn<
         store,
         block,
         mode,
-        true,
-        false,
-        true,
-        Some(&mut failed),
+        DeltaApplyOptions {
+            capture_apply_data: true,
+            check_dup: true,
+            failed_txn_out: Some(&mut failed),
+            ..DeltaApplyOptions::default()
+        },
     )
     .map(|(delta, apply_data)| (apply_data, delta))
     .map_err(|e| (e, failed))
@@ -832,15 +845,33 @@ pub fn apply_block_capturing_apply_data_with_delta<L: crate::store_trait::Ledger
         .map_err(|(error, _)| error)
 }
 
+/// What [`apply_block_with_delta_mode_and_apply_data`] runs beyond the
+/// apply itself.
+#[derive(Default)]
+struct DeltaApplyOptions<'a> {
+    /// Return the per-transaction `ApplyData` (always captured internally).
+    capture_apply_data: bool,
+    /// Run go's `validateForPayouts` (a certified block from the network).
+    validate_payouts: bool,
+    /// Run go's `Alive` / `checkDup` / authorizer (a block the node
+    /// generated: the dev-mode producer, issue #2127).
+    check_dup: bool,
+    /// Receives the payset index of the failing transaction, if any.
+    failed_txn_out: Option<&'a mut Option<usize>>,
+}
+
 fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     block: &Block,
     mode: ApplyMode,
-    capture_apply_data: bool,
-    validate_payouts: bool,
-    check_dup: bool,
-    failed_txn_out: Option<&mut Option<usize>>,
+    options: DeltaApplyOptions<'_>,
 ) -> Result<(crate::state_delta::StateDelta, Vec<ApplyData>), AlgoError> {
+    let DeltaApplyOptions {
+        capture_apply_data,
+        validate_payouts,
+        check_dup,
+        failed_txn_out,
+    } = options;
     use std::collections::{HashMap, HashSet};
 
     use crate::state_delta::{
@@ -1619,7 +1650,7 @@ pub(crate) fn collect_txn_addresses(
 /// ([`crate::check_dup::BlockCheckDup`]), then the authorizer. The one place
 /// both apply loops run it, so the order and the checks cannot drift; every
 /// rejection is the proposal check's verdict.
-fn txn_prologue<S: crate::store_trait::LedgerStore>(
+pub(crate) fn txn_prologue<S: crate::store_trait::LedgerStore>(
     store: &S,
     ctx: &ApplyContext,
     stx: &SignedTransaction,
@@ -1658,19 +1689,13 @@ fn txn_prologue<S: crate::store_trait::LedgerStore>(
 /// using the wire-declared `stx.auth_addr`) -- this is the separate,
 /// ledger-state-aware check that the wire-declared authorizer is actually
 /// the one the sender's account has rekeyed to, not an attacker-chosen
-/// address with its own valid key. Run only when `ctx.validate` (block
-/// validation of a newly-received block), not replay/re-execution of an
-/// already-certified block.
-pub(crate) fn check_authorizer<L: crate::store_trait::LedgerStore>(
-    store: &L,
-    stx: &SignedTransaction,
-) -> Result<(), AlgoError> {
-    check_authorizer_for(store, stx, None)
-}
-
-/// [`check_authorizer`] naming the transaction by `txid` when known (a
-/// block's stripped payset transaction hashes to the restored txid only
-/// with its genesis fields restored).
+/// address with its own valid key. Run by [`txn_prologue`] wherever go's
+/// evaluator validates (block validation, the proposal check, block
+/// generation, simulate), never on replay of an already-certified block.
+///
+/// `txid` names the transaction when known (a block's stripped payset
+/// transaction hashes to the restored txid only with its genesis fields
+/// restored).
 fn check_authorizer_for<L: crate::store_trait::LedgerStore>(
     store: &L,
     stx: &SignedTransaction,
@@ -2027,9 +2052,6 @@ pub struct ProbeRequest {
     /// The payset's txids (as the txtail records them), when the caller
     /// already hashed them; otherwise the apply hashes them for `checkDup`.
     pub txids: Option<Vec<algo_types::Digest>>,
-    /// The caller already rejected txids the ledger holds (pool admission):
-    /// `checkDup` skips its ledger txid lookup.
-    pub ledger_txids_checked: bool,
     /// Evaluate as a block *generator* (pool admission, block assembly):
     /// go `EvaluatorOptions.Generate` / `roundCowState.generate`, carried
     /// into [`ApplyContext::generate`]. Policies that must never affect
@@ -2657,9 +2679,6 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
     // pool) and reused for the block's txtail row below (issue #2127).
     let run_check_dup = validate || probe.as_ref().is_some_and(|p| p.request.check_dup);
     let checkdup = if run_check_dup {
-        let txids_checked = probe
-            .as_ref()
-            .is_some_and(|p| p.request.ledger_txids_checked);
         let txids = match probe.as_mut().and_then(|p| p.request.txids.take()) {
             Some(txids) if txids.len() == stored_block.payset.len() => txids,
             Some(txids) => {
@@ -2685,11 +2704,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
             stored_block.genesis_hash,
             restores,
         );
-        Some(RefCell::new(if txids_checked {
-            check.with_ledger_txids_checked()
-        } else {
-            check
-        }))
+        Some(RefCell::new(check))
     } else {
         None
     };

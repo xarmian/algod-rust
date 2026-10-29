@@ -111,9 +111,6 @@ impl BlockDups {
 pub struct LedgerDups {
     round: u64,
     txids: Vec<Digest>,
-    /// The caller already checked the txids against the ledger (the pool's
-    /// `contains_confirmed_txid`): the txtail lookup is skipped.
-    txids_checked: bool,
     confirmed: Option<HashSet<Digest>>,
     past_leases: Option<crate::lease::LeaseTable>,
 }
@@ -125,7 +122,6 @@ impl LedgerDups {
         Self {
             round,
             txids,
-            txids_checked: false,
             confirmed: None,
             past_leases: None,
         }
@@ -143,9 +139,6 @@ impl LedgerDups {
         consensus: &ConsensusParams,
         txid: &Digest,
     ) -> bool {
-        if self.txids_checked {
-            return false;
-        }
         self.confirmed
             .get_or_insert_with(|| {
                 store.txtail_confirmed_txids(&self.txids, consensus.max_txn_life)
@@ -312,15 +305,6 @@ impl BlockCheckDup {
             restores,
             violation: None,
         }
-    }
-
-    /// Skip the ledger txid lookup: the caller already rejected txids the
-    /// ledger holds (pool admission, whose `contains_confirmed_txid` ran on
-    /// the same cache under its own lock).
-    #[must_use]
-    pub fn with_ledger_txids_checked(mut self) -> Self {
-        self.ledger.txids_checked = true;
-        self
     }
 
     /// Record a rejection that follows `checkDup` in go's prologue (the
