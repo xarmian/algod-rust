@@ -334,3 +334,45 @@ fn proposal_check_rejects_a_dead_transaction_with_go_alive_text() {
         other => panic!("expected go's Alive verdict, got {other:?}"),
     }
 }
+
+/// Every path that runs go's `checkDup` runs the same `Alive` before it
+/// (`txn_prologue`, `algo_validate::block_alive` with go's text and the
+/// genesis checks): the validating apply and block generation reject a
+/// dead transaction with exactly the proposal check's message (#2127).
+#[test]
+fn validating_apply_and_generation_share_go_alive_text() {
+    use algo_ledger::locked_base::LockedBase;
+    use algo_ledger::pending_overlay::PendingOverlay;
+    use algo_ledger::proposal_eval::{evaluate_group, GroupEvalError};
+    use algo_types::Round;
+
+    let o = load_oracle();
+    let mut candidate = block(&scenario(&o, "committed_txid").block);
+    candidate.payset[0].txn.last_valid = Round(1);
+    let consensus =
+        algo_types::consensus::consensus_params_for_version(&o.protocol).expect("protocol");
+    let expected = algo_validate::block_alive(
+        candidate.round.0,
+        &candidate.genesis_id,
+        &candidate.genesis_hash,
+        &consensus,
+        &candidate.payset[0].txn,
+    )
+    .expect_err("dead in round 2");
+
+    let mut s = state(&o);
+    let err = algo_ledger::apply_block_validating(&mut s, &candidate).expect_err("dead");
+    assert_eq!(err.to_string(), expected, "validating apply");
+
+    let shared = Arc::new(Mutex::new(sqlite(&o)));
+    let base = LockedBase::new(&shared, Round(1));
+    let mut template = candidate.clone();
+    template.payset.clear();
+    let mut overlay = PendingOverlay::new(&base);
+    match evaluate_group(&base, &mut overlay, &template, &candidate.payset) {
+        Err(GroupEvalError::Txn { index: 0, error }) => {
+            assert_eq!(error.to_string(), expected, "generation")
+        }
+        other => panic!("evaluate_group: {other:?}"),
+    }
+}

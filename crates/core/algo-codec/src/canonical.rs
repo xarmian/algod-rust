@@ -1870,7 +1870,7 @@ pub fn build_txtail_from_block_with_rule(
     block: &Block,
     rule: &GenesisRestoreRule<'_>,
 ) -> TxTailRound {
-    build_txtail_from_block_with_txids(block, &block_txids_with_rule(block, rule))
+    txtail_from_block_and_txids(block, &block_txids_with_rule(block, rule))
 }
 
 /// The txid of every payset transaction, as the txtail records it.
@@ -1894,12 +1894,26 @@ pub fn block_txids_with_rule(block: &Block, rule: &GenesisRestoreRule<'_>) -> Ve
 
 /// [`build_txtail_from_block`] with the payset's txids already computed
 /// ([`block_txids_with_rule`]; `txids[i]` belongs to `block.payset[i]`).
-pub fn build_txtail_from_block_with_txids(block: &Block, txids: &[Digest]) -> TxTailRound {
-    assert_eq!(
-        txids.len(),
-        block.payset.len(),
-        "one txid per payset transaction"
-    );
+/// A txid count that does not match the payset is an error.
+pub fn build_txtail_from_block_with_txids(
+    block: &Block,
+    txids: &[Digest],
+) -> Result<TxTailRound, algo_error::AlgoError> {
+    if txids.len() != block.payset.len() {
+        return Err(algo_error::AlgoError::Ledger {
+            message: format!(
+                "txtail: {} txids for a payset of {}",
+                txids.len(),
+                block.payset.len()
+            ),
+        });
+    }
+    Ok(txtail_from_block_and_txids(block, txids))
+}
+
+/// The txtail row of `block` from `txids`, one per payset transaction
+/// (checked by the callers).
+fn txtail_from_block_and_txids(block: &Block, txids: &[Digest]) -> TxTailRound {
     let hdr = BlockHeader {
         round: block.round,
         branch: block.branch,

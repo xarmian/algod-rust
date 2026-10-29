@@ -3241,20 +3241,24 @@ impl SqliteLedger {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = cache;
     }
 
-    /// Run `f` on the txid cache brought up to date with the committed
-    /// rows. Mid-block, `current_round` may run ahead of the rows written
-    /// so far: a throwaway cache answers then, leaving the shared one alone.
+    /// Run `f` on the shared txid cache brought up to date with the
+    /// committed rows. Mid-block (the dev-mode commit, a validating apply),
+    /// `current_round` may already run ahead of the rows written so far, so
+    /// the cache syncs only to the round committed when the block began; the
+    /// block's own transactions are `checkDup`'s in-block half.
     fn with_synced_txtail_cache<T>(
         &self,
         max_txn_life: u64,
         f: impl FnOnce(&crate::txtail_cache::TxTailDupCache) -> T,
     ) -> T {
         let fetch = |r| self.get_txtail(r).ok().flatten();
-        if self.in_block {
-            let mut cache = crate::txtail_cache::TxTailDupCache::new();
-            cache.sync_window(self.current_round.0, max_txn_life, fetch);
-            return f(&cache);
-        }
+        let committed = if self.in_block {
+            self.chain_snapshot
+                .as_ref()
+                .map_or(self.current_round, |c| c.current_round)
+        } else {
+            self.current_round
+        };
         // Absent rows below the earliest txtail row (e.g. before a
         // catchpoint) can never land: the cache stops retrying them.
         let earliest = || {
@@ -3272,13 +3276,7 @@ impl SqliteLedger {
             .txtail_dups
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.sync_window_with(
-            self.current_round.0,
-            max_txn_life,
-            earliest,
-            fetch,
-            |_, _| {},
-        );
+        cache.sync_window_with(committed.0, max_txn_life, earliest, fetch, |_, _| {});
         f(&cache)
     }
 

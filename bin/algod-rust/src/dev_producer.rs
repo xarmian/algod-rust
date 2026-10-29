@@ -55,7 +55,9 @@ use std::sync::{Arc, Mutex};
 use algo_codec::{
     canonical_encode_block, canonical_encode_block_header_from_block, compute_txn_id,
 };
-use algo_ledger::apply::{apply_block_capturing_apply_data_with_delta, ApplyData, ApplyMode};
+use algo_ledger::apply::{
+    apply_block_capturing_apply_data_with_delta_or_failed_txn, ApplyData, ApplyMode,
+};
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::SqliteLedger;
 use algo_pool::TransactionPool;
@@ -235,17 +237,25 @@ pub fn produce_dev_block(
             .map_err(|e| anyhow::anyhow!("begin_block: {e}"))?;
         let result = (|| -> Result<
             (Vec<ApplyData>, algo_ledger::state_delta::StateDelta),
-            algo_error::AlgoError,
+            (algo_error::AlgoError, Option<usize>),
         > {
-            l.put_block(block.round.0, &proto, &hdr_data, &blk_data)?;
-            l.put_block_cert(block.round.0, &cert_data)?;
+            l.put_block(block.round.0, &proto, &hdr_data, &blk_data)
+                .map_err(|e| (e, None))?;
+            l.put_block_cert(block.round.0, &cert_data)
+                .map_err(|e| (e, None))?;
             // Execute mode runs the AVM, rejecting transactions whose programs
             // fail (rather than confirming an invalid app call as Replay would),
             // and returns the per-transaction ApplyData plus a fully-populated
             // StateDelta (Accts/Txids/Txleases/Hdr, plus KvMods from any box
             // deltas -- issue #570) computed from the same apply pass (issue
             // #581).
-            apply_block_capturing_apply_data_with_delta(&mut *l, &block, ApplyMode::Execute)
+            // It also runs go's `Alive` and `checkDup`: go's dev block comes
+            // from a Generate + Validate evaluator (issue #2127).
+            apply_block_capturing_apply_data_with_delta_or_failed_txn(
+                &mut *l,
+                &block,
+                ApplyMode::Execute,
+            )
         })();
         match result {
             Ok((apply_data, delta)) => {
@@ -270,8 +280,15 @@ pub fn produce_dev_block(
                     .map_err(|e| anyhow::anyhow!("commit_block: {e}"))?;
                 apply_data
             }
-            Err(e) => {
+            Err((e, failed_txn)) => {
                 let _ = l.rollback_block();
+                drop(l);
+                // go's `AssembleDevModeBlock` drops a group its evaluator
+                // rejects: drop the failing transaction's group from the pool
+                // so the next dev block does not stall on it.
+                if let Some(index) = failed_txn {
+                    evict_failed_group(pool, &block, index);
+                }
                 return Err(anyhow::anyhow!(
                     "commit dev-mode block {}: {e}",
                     block.round.0
@@ -284,6 +301,29 @@ pub fn produce_dev_block(
     // and rebuilds the evaluator for the next round.
     pool.on_new_block(&block, &committed_txids);
     Ok((block, apply_data))
+}
+
+/// Evict from `pool` the group of `block.payset[index]` (payset form: the
+/// group's members share its group id; an ungrouped transaction is its own
+/// group). Returns how many pool groups were dropped.
+pub fn evict_failed_group(pool: &TransactionPool, block: &Block, index: usize) -> usize {
+    let Some(failed) = block.payset.get(index) else {
+        return 0;
+    };
+    let group = failed.txn.group;
+    let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(block);
+    let txid = |stx: &SignedTransaction| compute_txn_id(&rule.restored_txn(stx));
+    let txids: HashSet<Digest> = if group == [0u8; 32] {
+        std::iter::once(txid(failed)).collect()
+    } else {
+        block
+            .payset
+            .iter()
+            .filter(|stx| stx.txn.group == group)
+            .map(txid)
+            .collect()
+    };
+    pool.evict_groups(&txids)
 }
 
 #[cfg(test)]

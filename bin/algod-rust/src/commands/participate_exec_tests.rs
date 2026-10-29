@@ -2317,12 +2317,58 @@ fn exec_group_rejects_a_lease_recorded_after_the_snapshot() {
     let lease = [0x5A; 32];
     let (ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))]);
     ledger.lock().unwrap().record_lease(&a.0, &lease, 500);
+    let stx = leased_pay(&a, b.0, lease, 1);
     let err = eval
-        .transaction_group(&[leased_pay(&a, b.0, lease, 1)])
+        .transaction_group(std::slice::from_ref(&stx))
         .expect_err("the live lease must reject the group");
+    // go returns the bare, typed `LeaseInLedgerError` (no second
+    // "transaction <txid>:" frame), which its pool tags `lease`.
+    let expected = algo_ledger::check_dup::lease_in_ledger_error(
+        algo_codec::compute_txn_id(&stx.txn),
+        &a.0,
+        &lease,
+        false,
+    );
+    assert_eq!(err.to_string(), expected.to_string());
     assert!(
-        err.to_string().contains("overlapping lease"),
-        "expected go's LeaseInLedgerError, got: {err}"
+        matches!(
+            err,
+            algo_error::AlgoError::Rejected {
+                class: algo_error::RejectClass::LeaseInLedger { in_block: false },
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+/// The same rejection through the pool: `Remember` reports go's text and
+/// the pool tags it `lease`, as go's `ClassifyTxPoolError` does (#2127).
+#[test]
+fn pool_tags_a_live_lease_rejection_lease_like_go() {
+    use algo_ledger::store_trait::LedgerStore;
+    let a = key(1);
+    let b = key(2);
+    let lease = [0x5C; 32];
+    let (ledger, pool) = fixture(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))], &[]);
+    ledger.lock().unwrap().record_lease(&a.0, &lease, 500);
+    let stx = leased_pay(&a, b.0, lease, 3);
+    let err = pool.remember_one(stx.clone()).expect_err("rejected");
+    assert_eq!(
+        algo_pool::error::classify_pool_error(&err),
+        algo_pool::error::PoolErrorTag::Lease
+    );
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "TransactionPool.Remember: {}",
+            algo_ledger::check_dup::lease_in_ledger_error(
+                algo_codec::compute_txn_id(&stx.txn),
+                &a.0,
+                &lease,
+                false
+            )
+        )
     );
 }
 
@@ -2348,4 +2394,41 @@ fn assembly_drops_a_group_whose_lease_was_recorded_after_admission() {
         "the group reusing the live lease is not proposed"
     );
     assert_eq!(block.payset[0].txn.lease, [0u8; 32]);
+}
+
+/// When the dev-mode commit rejects a group (go `AssembleDevModeBlock`
+/// drops a group its evaluator rejects), the producer evicts that group
+/// from the pool, so the next dev block carries the rest and the chain
+/// keeps advancing (issue #2127).
+#[test]
+fn dev_mode_evicts_a_rejected_group_and_the_chain_advances() {
+    let a = key(1);
+    let b = key(2);
+    let c = key(3);
+    let (ledger, pool) = fixture(
+        &[
+            (a.0, funded(50_000_000)),
+            (b.0, funded(1_000_000)),
+            (c.0, funded(50_000_000)),
+        ],
+        &[],
+    );
+    pool.remember_one(pay(&a, b.0, 1_000_000, None)).expect("a");
+    pool.remember_one(pay(&c, b.0, 2_000_000, None)).expect("c");
+    let candidate = pool.assemble_dev_mode_block().expect("assemble");
+    assert_eq!(candidate.payset.len(), 2);
+    let rejected_sender = candidate.payset[0].txn.sender;
+
+    assert_eq!(
+        crate::dev_producer::evict_failed_group(&pool, &candidate, 0),
+        1,
+        "the failing transaction's group is dropped"
+    );
+    assert_eq!(pool.pending_count(), 1);
+
+    let (block, _) =
+        crate::dev_producer::produce_dev_block(&pool, &ledger, None).expect("dev block");
+    assert_eq!(block.round, Round(1), "the chain advanced");
+    assert_eq!(block.payset.len(), 1);
+    assert_ne!(block.payset[0].txn.sender, rejected_sender);
 }

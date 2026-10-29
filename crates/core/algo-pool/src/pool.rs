@@ -1428,6 +1428,33 @@ impl TransactionPool {
         }
     }
 
+    /// Drop every pending or remembered group that contains one of
+    /// `txids`, returning how many groups were dropped. The dev-mode producer
+    /// evicts a group whose commit the ledger rejected, as go's
+    /// `AssembleDevModeBlock` drops a group its evaluator rejects, so the
+    /// dev chain keeps advancing (issue #2127).
+    pub fn evict_groups(&self, txids: &HashSet<Digest>) -> usize {
+        let mut inner = self.mu.lock();
+        let mut pending = self.pending_mu.write();
+        let hit =
+            |g: &Vec<SignedTransaction>| g.iter().any(|t| txids.contains(&compute_txn_id(&t.txn)));
+        let (dropped, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut pending.tx_groups)
+            .into_iter()
+            .partition(hit);
+        pending.tx_groups = kept;
+        for t in dropped.iter().flatten() {
+            pending.txids.remove(&compute_txn_id(&t.txn));
+        }
+        let (rdropped, rkept): (Vec<_>, Vec<_>) = std::mem::take(&mut inner.remembered_tx_groups)
+            .into_iter()
+            .partition(hit);
+        inner.remembered_tx_groups = rkept;
+        for t in rdropped.iter().flatten() {
+            inner.remembered_txids.remove(&compute_txn_id(&t.txn));
+        }
+        dropped.len() + rdropped.len()
+    }
+
     /// Assemble a block in dev mode: recompute the evaluator and immediately
     /// assemble a block from current pending transactions.
     ///

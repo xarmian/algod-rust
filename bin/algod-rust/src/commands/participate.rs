@@ -1548,6 +1548,17 @@ fn reason_of(e: &algo_error::AlgoError, pc: usize) -> (String, algo_error::Rejec
 /// [`algo_error::AlgoError::Rejected`] keeping the structured AVM diagnostics
 /// reachable through its source.
 fn go_rejection(txid: &str, error: algo_error::AlgoError) -> algo_error::AlgoError {
+    // go's `checkDup` errors reach the pool bare and typed
+    // (`TransactionInLedgerError` / `LeaseInLedgerError`): the pool tags them
+    // `txid` / `lease` from the type, and their text already names the txid.
+    if let algo_error::AlgoError::Rejected {
+        class:
+            algo_error::RejectClass::TxidInLedger { .. } | algo_error::RejectClass::LeaseInLedger { .. },
+        ..
+    } = &error
+    {
+        return error;
+    }
     let (reason, class) = pool_reason(&error);
     algo_error::AlgoError::Rejected {
         message: format!("transaction {txid}: {reason}"),
@@ -1890,13 +1901,14 @@ impl SimpleBlockEvaluator {
     /// 8. Rekey/auth-addr validation (authorizer matches ledger's auth_addr)
     /// 9. Sender balance precheck (fee + amount against overlay/snapshot)
     ///
-    /// Returns the group with genesis fields restored -- the exact
-    /// transactions whose txids were checked -- so `transaction_group`
-    /// records those same txids.
+    /// Returns the txids it checked (over the group with genesis fields
+    /// restored), so `transaction_group` records the same txids and the
+    /// real apply's `checkDup` reuses them instead of hashing the group
+    /// again.
     fn validate_group(
         &mut self,
         txgroup: &[algo_types::SignedTransaction],
-    ) -> Result<Vec<algo_types::SignedTransaction>, algo_error::AlgoError> {
+    ) -> Result<Vec<[u8; 32]>, algo_error::AlgoError> {
         // Run all stateless checks first; reuse the restored (genesis fields
         // populated) copies rather than cloning + restoring the group again.
         let restored = self.validate_group_stateless_inner(txgroup)?;
@@ -1908,6 +1920,7 @@ impl SimpleBlockEvaluator {
         // and check for duplicates WITHIN the current group first, then
         // against the in-block overlay. Mirrors Go's cow.checkDup(txid)
         // which checks mods.Txids first.
+        let mut txids = Vec::with_capacity(restored.len());
         {
             let mut group_txids = HashSet::new();
             for stx in &restored {
@@ -1918,6 +1931,7 @@ impl SimpleBlockEvaluator {
                     });
                 }
                 self.overlay.check_txid(&txid)?;
+                txids.push(txid);
             }
         }
 
@@ -2094,7 +2108,7 @@ impl SimpleBlockEvaluator {
         // 10. Group fees, after every transaction's own state checks (go).
         self.check_group_fees(txgroup)?;
 
-        Ok(restored)
+        Ok(txids)
     }
 
     /// go's `OverspendError` text for `sender` (see `algo_validate::overspend`).
@@ -2596,7 +2610,7 @@ impl SimpleBlockEvaluator {
     fn exec_group(
         &mut self,
         stibs: &[algo_types::SignedTransaction],
-        restored: &[algo_types::SignedTransaction],
+        txids: &[[u8; 32]],
     ) -> Result<Option<u64>, algo_error::AlgoError> {
         use algo_ledger::proposal_eval::GroupEvalError;
 
@@ -2616,11 +2630,16 @@ impl SimpleBlockEvaluator {
         let base =
             algo_ledger::locked_base::LockedBase::new(&self.ledger, exec.overlay.base_round());
         let started = std::time::Instant::now();
-        let outcome = algo_ledger::proposal_eval::evaluate_group(
+        // `validate_group` already hashed the group: its txids feed the
+        // apply's `checkDup` and the rejection text.
+        let digests: Vec<algo_types::Digest> =
+            txids.iter().map(|t| algo_types::Digest(*t)).collect();
+        let outcome = algo_ledger::proposal_eval::evaluate_group_with_txids(
             &base,
             &mut exec.overlay,
             &exec.template,
             stibs,
+            Some(digests),
         );
         let st = base.stats();
         let poisoned = base.is_poisoned();
@@ -2636,9 +2655,9 @@ impl SimpleBlockEvaluator {
             return Err(algo_ledger::locked_base::LockedBase::poison_error());
         }
         let txid_of = |i: usize| {
-            restored
+            txids
                 .get(i)
-                .map(|r| algo_codec::compute_txn_id(&r.txn).to_string())
+                .map(|t| algo_types::Digest(*t).to_string())
                 .unwrap_or_default()
         };
         match outcome {
@@ -2810,7 +2829,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         &mut self,
         txgroup: &[algo_types::SignedTransaction],
     ) -> Result<(), algo_error::AlgoError> {
-        let restored = self.validate_group(txgroup)?;
+        let txids = self.validate_group(txgroup)?;
 
         // Convert each transaction to STIB (SignedTxnInBlock) format:
         // strip genesis fields and set has_genesis_id / has_genesis_hash flags.
@@ -2904,11 +2923,10 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         //
         // All mutations use the `_tracked` variants so the checkpoint
         // records what to undo on rollback.
-        for (stx, restored_stx) in txgroup.iter().zip(&restored) {
+        for (stx, &txid) in txgroup.iter().zip(&txids) {
             // Record the transaction ID `validate_group` checked: computed
             // over the restored copy, i.e. what the block's STIB form
             // restores to (issue #1727).
-            let txid = compute_txid(&restored_stx.txn);
             self.overlay.record_txid_tracked(txid, &mut checkpoint);
 
             // Record lease if non-zero.
@@ -3278,7 +3296,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         // failing inner transaction or a rejecting program; this can.
         // Evaluated once here; the result also feeds the ApplyData of the
         // proposed block.
-        match self.exec_group(&stibs, &restored) {
+        match self.exec_group(&stibs, &txids) {
             // The evaluated fees include inner-transaction fees (issue #1908).
             Ok(Some(fees)) => {
                 self.fees_collected = fees_collected_checkpoint.saturating_add(fees);

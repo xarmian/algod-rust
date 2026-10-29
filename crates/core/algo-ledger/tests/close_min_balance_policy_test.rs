@@ -184,6 +184,9 @@ impl Harness {
             current_protocol: self.proto.to_string(),
             fee_sink: self.fee_sink,
             rewards_pool: self.rewards_pool,
+            // Block generation and validation run go's `Alive` (#2127),
+            // which requires a genesis hash on these protocols.
+            genesis_hash: [0x6E; 32],
             ..Block::default()
         }
     }

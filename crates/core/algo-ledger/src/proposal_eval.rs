@@ -83,6 +83,19 @@ pub fn evaluate_group<B: OverlayBase + ?Sized>(
     template: &Block,
     group: &[SignedTransaction],
 ) -> Result<GroupEval, GroupEvalError> {
+    evaluate_group_with_txids(base, overlay, template, group, None)
+}
+
+/// [`evaluate_group`] with the group's txids (as the txtail records them)
+/// already computed by the caller, so `checkDup` does not hash the group
+/// again. `None` hashes them here.
+pub fn evaluate_group_with_txids<B: OverlayBase + ?Sized>(
+    base: &B,
+    overlay: &mut PendingOverlay,
+    template: &Block,
+    group: &[SignedTransaction],
+    txids: Option<Vec<algo_types::Digest>>,
+) -> Result<GroupEval, GroupEvalError> {
     let tip = base.base_current_round();
     if base.base_is_stale() || overlay.base_round() != tip || template.round.0 != tip.0 + 1 {
         return Err(GroupEvalError::Stale);
@@ -98,9 +111,10 @@ pub fn evaluate_group<B: OverlayBase + ?Sized>(
             generate: true,
             pool_withdrawn: overlay.pool_withdrawn(),
             // go's generating evaluator validates too (`StartEvaluator`
-            // with Generate + Validate), so `checkDup` runs against the
-            // live ledger, not the pool's snapshot (issue #2127).
+            // with Generate + Validate), so `Alive` and `checkDup` run
+            // against the live ledger, not the pool's snapshot (issue #2127).
             check_dup: true,
+            txids,
             ..ProbeRequest::default()
         },
         ..ExecProbe::default()
@@ -424,6 +438,9 @@ mod tests {
             current_protocol: CONSENSUS_V41.to_string(),
             fee_sink: addr(0xF1),
             rewards_pool: addr(0xF2),
+            // V41 requires a genesis hash: block generation runs go's
+            // `Alive` (#2127) on the payset with it restored.
+            genesis_hash: crate::apply::pool_fixtures::TEST_GENESIS_HASH,
             ..Block::default()
         }
     }

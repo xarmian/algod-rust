@@ -156,7 +156,9 @@ impl<V: BlockValidator> PayoutCheckingValidator<V> {
         match check {
             ProposalCheck::Valid => Attempt::Verdict(Ok(())),
             ProposalCheck::Violation { kind, message } => {
-                warn!(
+                // A peer can send any number of such proposals: logged at
+                // debug only, like agreement's own proposal rejections.
+                tracing::debug!(
                     round = block.round.0,
                     %kind,
                     %message,

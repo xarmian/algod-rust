@@ -61,7 +61,9 @@ fn minimal_block(fee_sink: Address, round: u64, payset: Vec<SignedTransaction>) 
         txn_commitment: [0u8; 32],
         timestamp: 0,
         genesis_id: String::new(),
-        genesis_hash: [0u8; 32],
+        // V41 requires a genesis hash: the stripped payset takes this one
+        // back, so go's `Alive` passes in validating applies (#2127).
+        genesis_hash: [0x6E; 32],
         proposer: Address::ZERO,
         fee_sink,
         rewards_pool: Address::ZERO,
@@ -1586,6 +1588,56 @@ fn test_lease_across_blocks() {
     );
 }
 
+/// A replayed certified block that reuses a live lease with an EARLIER
+/// `LastValid` must not shorten the lease: go's `txTail.checkDup` scans the
+/// leases of every retained round, so the pair stays in force until the
+/// latest expiry recorded (issue #2127). Replay never checks leases, so
+/// block 2 below is accepted; at round 30 a proposal reusing the lease is
+/// still rejected by validation.
+#[test]
+fn replayed_shorter_lease_does_not_shorten_a_live_lease() {
+    let sender = Address([51u8; 32]);
+    let receiver = Address([52u8; 32]);
+    let fee_sink = Address([53u8; 32]);
+    let mut state = make_state(
+        &[(sender, 10_000_000), (receiver, 100_000), (fee_sink, 0)],
+        fee_sink,
+    );
+    let lease_val: [u8; 32] = [0x77; 32];
+    let leased = |amount: u64, last_valid: u64| {
+        let mut stx = pay_txn(sender, receiver, amount, 1_000);
+        stx.txn.lease = lease_val;
+        stx.txn.first_valid = Round(1);
+        stx.txn.last_valid = Round(last_valid);
+        stx
+    };
+
+    // Round 1: the lease, in force until round 1000.
+    apply_block(
+        &mut state,
+        &minimal_block(fee_sink, 1, vec![leased(1_000, 1000)]),
+    )
+    .unwrap();
+    // Round 2: a certified block reusing it with LastValid 20 (replay
+    // accepts it, as go's AddBlock does).
+    apply_block(
+        &mut state,
+        &minimal_block(fee_sink, 2, vec![leased(2_000, 20)]),
+    )
+    .expect("replay does not check leases");
+    for r in 3..30 {
+        apply_block(&mut state, &minimal_block(fee_sink, r, vec![])).unwrap();
+    }
+
+    // Round 30: past the replayed LastValid, inside the first lease.
+    let err = algo_ledger::apply_block_validating(
+        &mut state,
+        &minimal_block(fee_sink, 30, vec![leased(3_000, 100)]),
+    )
+    .expect_err("the round-1 lease is still in force");
+    assert!(err.to_string().contains("overlapping lease"), "{err}");
+}
+
 /// In validate mode the lease conflict is go's `checkDup` error,
 /// `ledgercore.LeaseInLedgerError`, with its exact text (issues #2125,
 /// #2127).
@@ -1610,10 +1662,13 @@ fn test_lease_across_blocks_validating_reports_go_lease_error() {
     stx2.txn.lease = lease_val;
     stx2.txn.first_valid = Round(1);
     stx2.txn.last_valid = Round(7);
-    let txid = algo_codec::compute_txn_id(&stx2.txn);
-    let err =
-        algo_ledger::apply_block_validating(&mut state, &minimal_block(fee_sink, 2, vec![stx2]))
-            .unwrap_err();
+    let block2 = minimal_block(fee_sink, 2, vec![stx2]);
+    // go hashes the payset transaction with its genesis fields restored.
+    let txid = algo_codec::block_txids_with_rule(
+        &block2,
+        &algo_types::genesis_restore::GenesisRestoreRule::for_block(&block2),
+    )[0];
+    let err = algo_ledger::apply_block_validating(&mut state, &block2).unwrap_err();
     assert_eq!(
         err.to_string(),
         format!(

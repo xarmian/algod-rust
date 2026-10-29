@@ -100,15 +100,27 @@ impl LeaseTable {
     }
 
     /// Record a lease for the given sender. If the lease is all zeros,
-    /// this is a no-op. Otherwise, the (sender, lease) entry is set to
-    /// `last_valid`.
+    /// this is a no-op. Otherwise, the (sender, lease) entry keeps the
+    /// LATER of its current expiry and `last_valid`.
+    ///
+    /// go's `txTail.checkDup` scans every retained round's leases, so a
+    /// lease is in force until the latest expiry recorded for the pair. A
+    /// replayed certified block can record the pair again with an earlier
+    /// `last_valid` (replay never checks leases, and pre-v23 `checkDup`
+    /// only looks at the transaction's own window), which must not shorten
+    /// the earlier lease (issue #2127).
     pub fn record(&mut self, sender: &Address, lease: &[u8; 32], last_valid: u64) {
         if *lease == EMPTY_LEASE {
             return;
         }
-        let prior = self.entries.insert((*sender, *lease), last_valid);
+        let key = (*sender, *lease);
+        let prior = self.entries.get(&key).copied();
+        if prior.is_some_and(|expires| expires >= last_valid) {
+            return;
+        }
+        self.entries.insert(key, last_valid);
         if let Some(undo) = self.undo.as_mut() {
-            undo.push(((*sender, *lease), prior));
+            undo.push((key, prior));
         }
     }
 

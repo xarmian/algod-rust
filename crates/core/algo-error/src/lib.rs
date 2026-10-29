@@ -197,6 +197,13 @@ pub enum RejectClass {
     TealReject,
     /// Approval program errored (go `logic.EvalError`).
     TealErr,
+    /// go `ledgercore.TransactionInLedgerError` from `checkDup`: the txid is
+    /// already in the ledger, or (`in_block`, go `InBlockEvaluator`) earlier
+    /// in the block being evaluated. go's pool tags it `txid` / `txid_eval`.
+    TxidInLedger { in_block: bool },
+    /// go `ledgercore.LeaseInLedgerError` from `checkDup` (`in_block` as
+    /// above). go's pool tags it `lease` / `lease_eval`.
+    LeaseInLedger { in_block: bool },
 }
 
 pub type Result<T> = std::result::Result<T, AlgoError>;

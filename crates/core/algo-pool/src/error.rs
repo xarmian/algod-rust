@@ -351,6 +351,11 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
         PoolError::TxnRejected { class, message, .. } => match class {
             algo_error::RejectClass::TealReject => PoolErrorTag::TealReject,
             algo_error::RejectClass::TealErr => PoolErrorTag::TealErr,
+            // go `ClassifyTxPoolError` on the typed checkDup errors (#2127).
+            algo_error::RejectClass::TxidInLedger { in_block: true } => PoolErrorTag::TxIdEval,
+            algo_error::RejectClass::TxidInLedger { in_block: false } => PoolErrorTag::TxId,
+            algo_error::RejectClass::LeaseInLedger { in_block: true } => PoolErrorTag::LeaseEval,
+            algo_error::RejectClass::LeaseInLedger { in_block: false } => PoolErrorTag::Lease,
             algo_error::RejectClass::Other => classify_evaluator_message(message),
         },
         PoolError::LeaseConflict {
@@ -681,6 +686,26 @@ mod tests {
             PoolError::Remember(Box::new(inner)).to_string(),
             "TransactionPool.Remember: transaction H6YID47U5WQHWXIVEINCBNIXG7E6CMPKEVPSECLO76JMVYOOKSMQ: cannot close: 1 outstanding assets"
         );
+    }
+
+    /// go's `ClassifyTxPoolError` tags the typed `checkDup` errors by type
+    /// and `InBlockEvaluator` (issue #2127).
+    #[test]
+    fn checkdup_rejections_are_tagged_like_go() {
+        let rej = |class| PoolError::TxnRejected {
+            message: "transaction X using an overlapping lease".into(),
+            class,
+            detail: None,
+        };
+        use algo_error::RejectClass::{LeaseInLedger, TxidInLedger};
+        for (class, tag) in [
+            (TxidInLedger { in_block: false }, PoolErrorTag::TxId),
+            (TxidInLedger { in_block: true }, PoolErrorTag::TxIdEval),
+            (LeaseInLedger { in_block: false }, PoolErrorTag::Lease),
+            (LeaseInLedger { in_block: true }, PoolErrorTag::LeaseEval),
+        ] {
+            assert_eq!(classify_pool_error(&rej(class)), tag, "{class:?}");
+        }
     }
 
     /// Classification follows the rejection type, not the message text.
