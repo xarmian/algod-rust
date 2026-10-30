@@ -232,6 +232,22 @@ impl AlgodSyncBackend {
         self.blocks.fetch_raw(round).await
     }
 
+    /// [`SyncBackend::fetch_block_raw`]'s request: `(proto, hdrdata, blkdata)`
+    /// in the format `apply_block` uses (hdrdata = canonical block header
+    /// encoding, for heartbeat validation and the block digest; blkdata =
+    /// full block msgpack encoding, for block replay).
+    async fn fetch_block_raw_async(
+        &self,
+        round: u64,
+    ) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+        let raw = self.get_block_raw_bytes(round).await?;
+        let br = decode_block_response(&raw)?;
+        let proto = br.block.current_protocol.clone();
+        let hdrdata = canonical_encode_block_header_from_block(&br.block);
+        let blkdata = canonical_encode_block(&br.block);
+        Ok((proto, hdrdata, blkdata))
+    }
+
     /// Ranks the catchpoint file download across `algod_url` plus
     /// `extra_catchpoint_peer_urls` instead of using `algod_url` alone
     /// (issue #901's peer-ranked catchpoint source selection).
@@ -581,20 +597,15 @@ impl SyncBackend for AlgodSyncBackend {
     }
 
     fn fetch_block_raw(&self, round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
-        tokio::task::block_in_place(|| {
-            self.rt.block_on(async {
-                let raw = self.get_block_raw_bytes(round).await?;
-                let br = decode_block_response(&raw)?;
-                let proto = br.block.current_protocol.clone();
-                // Encode in the same format that apply_block uses:
-                // hdrdata = canonical block header encoding (for heartbeat
-                //           validation and block digest computation)
-                // blkdata = full block msgpack encoding (for block replay)
-                let hdrdata = canonical_encode_block_header_from_block(&br.block);
-                let blkdata = canonical_encode_block(&br.block);
-                Ok((proto, hdrdata, blkdata))
-            })
-        })
+        tokio::task::block_in_place(|| self.rt.block_on(self.fetch_block_raw_async(round)))
+    }
+
+    fn fetch_block_raw_cancellable(
+        &self,
+        round: u64,
+        cancel: &CancellationToken,
+    ) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+        block_on_until_cancelled(&self.rt, cancel, self.fetch_block_raw_async(round))
     }
 
     fn fetch_block(&self, round: u64) -> Result<Block, AlgoError> {
@@ -649,6 +660,32 @@ impl SyncBackend for AlgodSyncBackend {
             })
         })
     }
+}
+
+/// Drive `fut` on `rt` from a blocking thread (the sync orchestrator's, or a
+/// lookback prefetch worker), giving up with
+/// [`algo_ledger::sync::cancelled_error`] as soon as `cancel` fires (issue
+/// #2121). A node shutdown then ends an in-flight block request at once
+/// instead of waiting out its per-peer timeouts while the runtime is
+/// dropped under it, which is what made the request's timers panic with "A
+/// Tokio 1.x context was found, but it is being shutdown".
+fn block_on_until_cancelled<T>(
+    rt: &tokio::runtime::Handle,
+    cancel: &CancellationToken,
+    fut: impl std::future::Future<Output = Result<T, AlgoError>>,
+) -> Result<T, AlgoError> {
+    if cancel.is_cancelled() {
+        return Err(algo_ledger::sync::cancelled_error());
+    }
+    tokio::task::block_in_place(|| {
+        rt.block_on(async {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(algo_ledger::sync::cancelled_error()),
+                result = fut => result,
+            }
+        })
+    })
 }
 
 /// Fetch the inclusive range `[start, end]` through `fetcher`.
@@ -1180,6 +1217,14 @@ impl SyncBackend for GossipSyncBackend {
         tokio::task::block_in_place(|| self.rt.block_on(self.fetch_block_raw_with_policy(round)))
     }
 
+    fn fetch_block_raw_cancellable(
+        &self,
+        round: u64,
+        cancel: &CancellationToken,
+    ) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+        block_on_until_cancelled(&self.rt, cancel, self.fetch_block_raw_with_policy(round))
+    }
+
     fn fetch_block(&self, round: u64) -> Result<Block, AlgoError> {
         tokio::task::block_in_place(|| self.rt.block_on(self.fetch_block_with_policy(round)))
     }
@@ -1322,6 +1367,17 @@ impl SyncBackend for CatchpointBackend {
         match self {
             Self::Rest(b) => b.fetch_block_raw(round),
             Self::Gossip(b) => b.fetch_block_raw(round),
+        }
+    }
+
+    fn fetch_block_raw_cancellable(
+        &self,
+        round: u64,
+        cancel: &CancellationToken,
+    ) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+        match self {
+            Self::Rest(b) => b.fetch_block_raw_cancellable(round, cancel),
+            Self::Gossip(b) => b.fetch_block_raw_cancellable(round, cancel),
         }
     }
 
@@ -1971,6 +2027,52 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- block_on_until_cancelled (issue #2121) -----------------------------
+
+    /// An in-flight block request driven from a blocking thread (a lookback
+    /// prefetch worker) ends as soon as the token fires, before the runtime
+    /// it runs on is shut down, instead of waiting out its timeouts.
+    #[test]
+    fn block_on_until_cancelled_ends_an_in_flight_request_on_cancel() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = rt.handle().clone();
+        let cancel = CancellationToken::new();
+        let worker = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let result = block_on_until_cancelled(&handle, &cancel, async {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    Ok::<_, AlgoError>(())
+                });
+                (result, started.elapsed())
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        cancel.cancel();
+        let (result, elapsed) = worker.join().expect("the request panicked");
+        rt.shutdown_timeout(std::time::Duration::from_secs(5));
+        let err = result.expect_err("a cancelled request must not succeed");
+        assert!(err.to_string().contains("cancelled"), "{err}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the request outlived the cancellation: {elapsed:?}"
+        );
+        // An already-cancelled token never starts the request.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let result = block_on_until_cancelled(rt.handle(), &cancel, async {
+            ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, AlgoError>(())
+        });
+        assert!(result.is_err());
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     // -- collect_block_range (issue #1719) ----------------------------------
 

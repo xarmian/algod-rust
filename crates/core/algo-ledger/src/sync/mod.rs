@@ -120,6 +120,30 @@ pub trait SyncBackend: Send + Sync {
     /// Used for lookback block downloads.
     fn fetch_block_raw(&self, round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError>;
 
+    /// [`Self::fetch_block_raw`] that gives up once `cancel` fires (issue
+    /// #2121): it returns [`cancelled_error`] instead of finishing a request
+    /// the node no longer wants, so a shutdown is not held up by (or races)
+    /// an in-flight fetch.
+    ///
+    /// The default checks `cancel` before the fetch and after it; the fetch
+    /// itself is not interrupted. Backends whose fetch is an async request
+    /// driven on a tokio runtime override this to race the request against
+    /// the token.
+    fn fetch_block_raw_cancellable(
+        &self,
+        round: u64,
+        cancel: &CancellationToken,
+    ) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+        if cancel.is_cancelled() {
+            return Err(cancelled_error());
+        }
+        let result = self.fetch_block_raw(round);
+        if cancel.is_cancelled() {
+            return Err(cancelled_error());
+        }
+        result
+    }
+
     /// Fetch and decode a block by round. Used during block replay.
     fn fetch_block(&self, round: u64) -> Result<Block, AlgoError>;
 
@@ -175,6 +199,14 @@ pub trait SyncBackend: Send + Sync {
             }
         }
         BatchFetch::complete(blocks)
+    }
+}
+
+/// The error a sync operation returns when its cancellation token fired
+/// (node shutdown or an aborted catchup).
+pub fn cancelled_error() -> AlgoError {
+    AlgoError::Ledger {
+        message: "sync cancelled by user".to_string(),
     }
 }
 
@@ -751,9 +783,7 @@ impl SyncOrchestrator {
     /// return an error.
     fn check_cancelled(&self) -> Result<(), AlgoError> {
         if self.cancel.is_cancelled() {
-            Err(AlgoError::Ledger {
-                message: "sync cancelled by user".to_string(),
-            })
+            Err(cancelled_error())
         } else {
             Ok(())
         }
@@ -776,9 +806,7 @@ impl SyncOrchestrator {
                 tracing::warn!("Failed to persist sync state: {e}");
             }
         }
-        AlgoError::Ledger {
-            message: "sync cancelled by user".to_string(),
-        }
+        cancelled_error()
     }
 
     /// Validate and execute a state transition. Logs at INFO level and
@@ -1661,7 +1689,11 @@ impl SyncOrchestrator {
             self.cached_catchpoint_block
                 .as_ref()
                 .map(|(proto, hdrdata, blkdata)| (proto.clone(), hdrdata.clone(), blkdata.clone()))
-                .or_else(|| self.backend.fetch_block_raw(round).ok())
+                .or_else(|| {
+                    self.backend
+                        .fetch_block_raw_cancellable(round, &self.cancel)
+                        .ok()
+                })
                 .and_then(|(_, _, blkdata)| algo_codec::decode_block(&blkdata).ok())
                 .and_then(|block| {
                     algo_types::consensus::consensus_params_for_version(&block.current_protocol)
@@ -1737,10 +1769,15 @@ impl SyncOrchestrator {
         let prefetch =
             lookback_prefetch::LookbackPrefetch::new(prefetch_first, lookback_start_round);
         let backend = &self.backend;
+        // Issue #2121: every fetch, the prefetch workers' included, and every
+        // retry backoff observes the orchestrator's token, so a node shutdown
+        // ends this phase promptly instead of retrying on (and registering
+        // timers with) a runtime that is being dropped.
+        let cancel = &self.cancel;
         // Use download_lookback_blocks_with_lookback with callbacks that
         // bridge to the backend, passing the (possibly state-proof-extended)
         // `lookback` computed above.
-        let prefetch_fetch = |rnd: u64| backend.fetch_block_raw(rnd);
+        let prefetch_fetch = |rnd: u64| backend.fetch_block_raw_cancellable(rnd, cancel);
         let download_result = std::thread::scope(|scope| {
             for _ in 0..lookback_prefetch::PREFETCH_WORKERS {
                 scope.spawn(|| prefetch.run_worker(&prefetch_fetch));
@@ -1768,17 +1805,23 @@ impl SyncOrchestrator {
                         consecutive_fetch_failures = 0;
                         return Ok(prefetched);
                     }
-                    match backend.fetch_block_raw(rnd) {
+                    match backend.fetch_block_raw_cancellable(rnd, cancel) {
                         Ok(block) => {
                             consecutive_fetch_failures = 0;
                             Ok(block)
                         }
+                        Err(_) if cancel.is_cancelled() => Err(CatchpointError::Cancelled),
                         Err(e) => {
                             let delay_ms = lookback_retry_backoff_ms(consecutive_fetch_failures);
                             consecutive_fetch_failures =
                                 consecutive_fetch_failures.saturating_add(1);
-                            if delay_ms > 0 {
-                                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                            if delay_ms > 0
+                                && sleep_unless_cancelled(
+                                    std::time::Duration::from_millis(delay_ms),
+                                    cancel,
+                                )
+                            {
+                                return Err(CatchpointError::Cancelled);
                             }
                             Err(CatchpointError::VerificationError(format!(
                                 "fetch lookback block {rnd}: {e}"
@@ -1831,6 +1874,11 @@ impl SyncOrchestrator {
             prefetch.shutdown();
             result
         });
+        // A shutdown that arrived mid-download is a cancellation, not a
+        // download failure (mirrors the replay phase's handling).
+        if download_result.is_err() && self.cancel.is_cancelled() {
+            return Err(self.handle_cancellation());
+        }
         let blocks_downloaded = download_result.map_err(|e| AlgoError::Ledger {
             message: format!("lookback block download failed: {e}"),
         })?;
@@ -3035,6 +3083,23 @@ fn lookback_retry_backoff_ms(consecutive_failures: u32) -> u64 {
     (250u64 << consecutive_failures.min(5)).min(5_000)
 }
 
+/// Sleep for `delay` on the calling (blocking) thread, waking early if
+/// `cancel` fires. Returns `true` if it was cancelled (issue #2121).
+fn sleep_unless_cancelled(delay: std::time::Duration, cancel: &CancellationToken) -> bool {
+    const SLICE: std::time::Duration = std::time::Duration::from_millis(50);
+    let deadline = Instant::now() + delay;
+    loop {
+        if cancel.is_cancelled() {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep(SLICE.min(deadline - now));
+    }
+}
+
 /// Map a `SyncState` to a numeric ordinal for resume ordering.
 ///
 /// Higher ordinals mean the phase was reached later in the pipeline.
@@ -3836,6 +3901,129 @@ mod tests {
             MAX_RETRIES + 2,
             "expected exactly 1 speculative probe + (max_retries + 1) fetch attempts before \
              aborting"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A [`SyncBackend`] fake shaped like the production `AlgodSyncBackend`:
+    /// each `fetch_block_raw` is a request driven on a tokio runtime
+    /// (`Handle::block_on`, from the sync thread and the prefetch workers),
+    /// which waits on the runtime's timer and then fails, so the lookback
+    /// retry loop keeps retrying (issue #2121).
+    struct RuntimeTimerFailingBackend {
+        rt: tokio::runtime::Handle,
+        delay: std::time::Duration,
+    }
+
+    impl SyncBackend for RuntimeTimerFailingBackend {
+        fn download_catchpoint(
+            &self,
+            _genesis_id: &str,
+            _round: u64,
+            _dest_path: &std::path::Path,
+        ) -> Result<(), AlgoError> {
+            unimplemented!("not exercised by the lookback-only test")
+        }
+
+        fn fetch_block_raw(&self, round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+            self.rt.block_on(async {
+                tokio::time::sleep(self.delay).await;
+                Err(AlgoError::Network {
+                    message: format!("simulated unreachable peer for round {round}"),
+                })
+            })
+        }
+
+        fn fetch_block(&self, _round: u64) -> Result<Block, AlgoError> {
+            unimplemented!("not exercised by the lookback-only test")
+        }
+
+        fn get_current_round(&self) -> Result<u64, AlgoError> {
+            unimplemented!("not exercised by the lookback-only test")
+        }
+
+        fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
+            Ok(None)
+        }
+    }
+
+    /// TDD regression for issue #2121 (the aramidmain image smoke): a node
+    /// stopped while its live catchup sits in the lookback retry loop must
+    /// see that loop observe the cancellation and return, so the runtime
+    /// can then shut down with nothing left registering timers on it.
+    /// Before the fix the loop ignored the token: it kept retrying (the
+    /// node outlived `docker stop -t 30`), and once the runtime was dropped
+    /// the next `block_on` panicked with "A Tokio 1.x context was found,
+    /// but it is being shutdown".
+    #[test]
+    fn lookback_retry_loop_returns_on_cancel_before_the_runtime_shuts_down() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-lookback-shutdown-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("ledger");
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut config = test_config(db_path, 1);
+        // Effectively unbounded: only the cancellation can end the loop.
+        config.catchup_block_download_retry_attempts = 1_000_000;
+        let backend = RuntimeTimerFailingBackend {
+            rt: rt.handle().clone(),
+            delay: std::time::Duration::from_millis(20),
+        };
+        let cancel = CancellationToken::new();
+        let mut orchestrator = SyncOrchestrator::with_backend(config, backend);
+        orchestrator.state = SyncState::VerifyingLedger;
+        orchestrator.catchpoint_round = Some(5_000);
+        orchestrator.set_cancel(cancel.clone());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sync_thread = std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                orchestrator
+                    .run_download_lookback()
+                    .map_err(|e| e.to_string())
+            }));
+            let _ = tx.send(outcome);
+        });
+
+        // Let the loop get going (probe, prefetch failure, retries).
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        cancel.cancel();
+        // Ordered shutdown: the sync work must return before the runtime is
+        // dropped.
+        let returned = rx.recv_timeout(std::time::Duration::from_secs(5));
+        rt.shutdown_timeout(std::time::Duration::from_secs(5));
+        let outcome = match returned {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                // What the node did: the runtime is gone while the loop
+                // still runs. Collect how that ended for the message.
+                let late = rx.recv_timeout(std::time::Duration::from_secs(10));
+                panic!(
+                    "the lookback retry loop ignored the cancellation for 5 s; after the \
+                     runtime shut down it ended with: {}",
+                    match late {
+                        Ok(Ok(r)) => format!("{r:?}"),
+                        Ok(Err(_)) => "a panic (timer registered on a dying runtime)".into(),
+                        Err(_) => "nothing (still running)".into(),
+                    }
+                );
+            }
+        };
+        let _ = sync_thread.join();
+        let result = outcome.expect("the lookback download panicked");
+        let err = result.expect_err("a cancelled lookback download must not succeed");
+        assert!(
+            err.contains("cancelled"),
+            "a cancelled lookback download must report the cancellation, got: {err}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

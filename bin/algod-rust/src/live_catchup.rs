@@ -252,10 +252,20 @@ pub trait CatchupRunner: Send + Sync {
     ) -> anyhow::Result<CatchupOutcome>;
 }
 
+/// How long node shutdown waits for an in-flight live catchup to observe its
+/// cancellation and return ([`LiveCatchupManager::shutdown`], issue #2121).
+/// Block requests end at once on cancel; this bounds a phase that only
+/// checks the token between steps (a catchpoint import, say), within a
+/// container stop's grace period.
+pub const LIVE_CATCHUP_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// State for the currently-running catchup, if any.
 struct RunningCatchup {
     catchpoint: String,
     cancel: CancellationToken,
+    /// The [`LiveCatchupManager::drive`] task, joined by
+    /// [`LiveCatchupManager::shutdown`] (issue #2121).
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Live catchpoint-catchup mode toggle for a running node.
@@ -287,6 +297,10 @@ pub struct LiveCatchupManager {
     /// need each other, so it can't be threaded through [`Self::new`]
     /// without a circular constructor dependency).
     sync_round_reset: StdMutex<Option<Arc<dyn SyncRoundResetHook>>>,
+    /// Set by [`Self::shutdown`]: no new catchup starts, and a run that ends
+    /// does not resume the node's normal sync services (they are being
+    /// stopped).
+    shutting_down: std::sync::atomic::AtomicBool,
 }
 
 impl LiveCatchupManager {
@@ -301,7 +315,48 @@ impl LiveCatchupManager {
             stats: StdMutex::new(CatchupStats::default()),
             counters: Arc::new(StdMutex::new(CatchpointCounters::default())),
             sync_round_reset: StdMutex::new(None),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Stop for node shutdown (issue #2121), mirroring go's
+    /// `AlgorandFullNode.Stop` stopping the catchpoint catchup service and
+    /// waiting for its goroutines: cancel the in-flight run, if any, and wait
+    /// up to `timeout` for it to return, so no catchup work still drives
+    /// requests (and registers timers) on the runtime when it is dropped.
+    /// After this no catchup starts, and the run that ends does not resume
+    /// the normal sync services. Returns `false` if the run did not finish
+    /// within `timeout`.
+    pub async fn shutdown(&self, timeout: std::time::Duration) -> bool {
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let task = {
+            let mut guard = self.running.lock().await;
+            match guard.as_mut() {
+                Some(running) => {
+                    running.cancel.cancel();
+                    running.task.take()
+                }
+                None => None,
+            }
+        };
+        let Some(task) = task else {
+            return true;
+        };
+        match tokio::time::timeout(timeout, task).await {
+            Ok(_) => true,
+            Err(_) => {
+                warn!(
+                    ?timeout,
+                    "live catchpoint catchup did not stop within the shutdown timeout"
+                );
+                false
+            }
+        }
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Attach a [`SyncRoundResetHook`] so a finished catchup resets the
@@ -331,6 +386,9 @@ impl LiveCatchupManager {
         }
 
         let mut guard = self.running.lock().await;
+        if self.is_shutting_down() {
+            return CatchupStartResult::StartError("the node is shutting down".to_string());
+        }
         if let Some(running) = guard.as_ref() {
             if running.catchpoint == catchpoint {
                 return CatchupStartResult::AlreadyInProgress;
@@ -360,13 +418,14 @@ impl LiveCatchupManager {
         let manager = Arc::clone(self);
         let catchpoint_owned = catchpoint.to_string();
         let cancel_task = cancel.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             manager.drive(catchpoint_owned, cancel_task).await;
         });
 
         *guard = Some(RunningCatchup {
             catchpoint: catchpoint.to_string(),
             cancel,
+            task: Some(task),
         });
         CatchupStartResult::Created
     }
@@ -554,9 +613,19 @@ impl LiveCatchupManager {
                     target_round: *target_round,
                 });
             }
+            Err(e) if self.is_shutting_down() => {
+                info!(catchpoint = %catchpoint, error = %e, "live catchpoint catchup stopped for shutdown");
+            }
             Err(e) => {
                 warn!(catchpoint = %catchpoint, error = %e, "live catchpoint catchup failed");
             }
+        }
+
+        // Node shutdown (issue #2121): the services `resume()` would restart
+        // are being stopped, so only clear the running state.
+        if self.is_shutting_down() {
+            *self.running.lock().await = None;
+            return;
         }
 
         // Issue #1616 established that the catchup wrote through its own
@@ -751,6 +820,14 @@ impl algo_ledger::sync::SyncBackend for SharedSyncBackend {
         round: u64,
     ) -> anyhow::Result<(String, Vec<u8>, Vec<u8>), algo_error::AlgoError> {
         self.0.fetch_block_raw(round)
+    }
+
+    fn fetch_block_raw_cancellable(
+        &self,
+        round: u64,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<(String, Vec<u8>, Vec<u8>), algo_error::AlgoError> {
+        self.0.fetch_block_raw_cancellable(round, cancel)
     }
 
     fn fetch_block(&self, round: u64) -> anyhow::Result<algo_types::Block, algo_error::AlgoError> {
@@ -1074,6 +1151,49 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    // -- shutdown (issue #2121) ---------------------------------------------
+
+    /// Node shutdown must cancel the in-flight run and wait for it to
+    /// return, so no catchup work outlives the runtime, and must not resume
+    /// the normal sync services the node is stopping.
+    #[tokio::test]
+    async fn shutdown_cancels_and_joins_the_running_catchup_without_resuming() {
+        let control = Arc::new(CountingControl::default());
+        let cancel_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let manager = LiveCatchupManager::new(
+            Arc::new(BlockingRunner {
+                cancel_observed: cancel_observed.clone(),
+            }),
+            control.clone(),
+        );
+        assert_eq!(
+            manager.start_catchup("1000#deadbeef").await,
+            CatchupStartResult::Created
+        );
+
+        assert!(manager.shutdown(Duration::from_secs(5)).await);
+
+        // Joined, not merely signalled: the run already returned.
+        assert!(cancel_observed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(manager.current_catchpoint().await, None);
+        assert_eq!(control.resumes.load(Ordering::SeqCst), 0);
+        assert_eq!(control.reloads.load(Ordering::SeqCst), 0);
+        // No catchup starts once the node is shutting down.
+        assert!(matches!(
+            manager.start_catchup("1000#deadbeef").await,
+            CatchupStartResult::StartError(_)
+        ));
+        assert_eq!(control.pauses.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_with_no_running_catchup_returns_at_once() {
+        let control = Arc::new(CountingControl::default());
+        let manager = LiveCatchupManager::new(ImmediateRunner::ok(), control.clone());
+        assert!(manager.shutdown(Duration::from_secs(5)).await);
+        assert_eq!(control.resumes.load(Ordering::SeqCst), 0);
     }
 
     // -- start_catchup: happy path -----------------------------------------

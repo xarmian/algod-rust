@@ -7015,6 +7015,16 @@ pub async fn run(
     // request before the listener closes.
     shutdown_token.cancel();
 
+    // Issue #2121: stop a live catchpoint catchup before anything else and
+    // wait for it, like go's `node.Stop` stopping the catchpoint catchup
+    // service. Its block fetches run on this runtime, so one still retrying
+    // when `main` returns panics registering timers on a runtime that is
+    // being shut down, and keeps the process alive past `docker stop`.
+    if let Some(mgr) = &catchup_manager {
+        mgr.shutdown(crate::live_catchup::LIVE_CATCHUP_SHUTDOWN_TIMEOUT)
+            .await;
+    }
+
     // Stop the agreement service first, then the catchup service (mirrors
     // Go's shutdown order where the agreement service is stopped before the
     // catchup service, ensuring no new certificates are sent after the

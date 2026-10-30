@@ -31,8 +31,24 @@ use clap::Parser;
 
 use cli::{AlgocfgAction, AlgocfgProfileAction, BenchAction, CatchpointAction, Cli, Commands};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<std::process::ExitCode> {
+/// Upper bound on how long dropping the runtime waits for blocking work that
+/// is still running once a command returns (issue #2121). Commands stop
+/// their services in order before returning; this only keeps a straggler
+/// (a blocking phase that checks its cancellation token between steps) from
+/// holding the process past a container stop's grace period, which a plain
+/// `Runtime` drop would do (it waits for every blocking thread).
+const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn main() -> anyhow::Result<std::process::ExitCode> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(async_main());
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    result
+}
+
+async fn async_main() -> anyhow::Result<std::process::ExitCode> {
     // Process start time for `algod_rust_process_start_time_seconds`: capture
     // it before anything else runs.
     algo_ledger::follow_timing::init_process_start_time();

@@ -665,6 +665,12 @@ async fn run_start(
     }
     info!("shutdown requested");
     shutdown_token.cancel();
+    // Issue #2121: stop a live catchpoint catchup first and wait for it, so
+    // its block fetches do not outlive the runtime.
+    if let Some(mgr) = &catchup_manager {
+        mgr.shutdown(crate::live_catchup::LIVE_CATCHUP_SHUTDOWN_TIMEOUT)
+            .await;
+    }
     let _ = join_handle.await;
     if let Some(control) = &follow_control {
         control.pause().await;
