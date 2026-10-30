@@ -265,7 +265,11 @@ pub trait CatchupRunner: Send + Sync {
 ///
 /// # Shutdown budget
 ///
-/// `participate`'s shutdown runs these waits one after another:
+/// This covers only the waits the live catchup adds or affects, not a real
+/// bound on the whole shutdown: `participate`'s other teardown joins (pool
+/// follower, heartbeat, state-proof service, tx syncer, gossip stop) are
+/// unbounded today (issue #2138 tracks one overall shutdown deadline).
+/// `participate` runs these waits one after another:
 ///
 /// | step | bound |
 /// |---|---|
@@ -291,6 +295,27 @@ pub trait CatchupRunner: Send + Sync {
 ///   corrupt file.
 pub const LIVE_CATCHUP_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Clears [`LiveCatchupManager`]'s `running` when [`LiveCatchupManager::drive`]
+/// ends by any path, a panic in its hand-back included, so the manager is
+/// never left wedged "catching up" (issue #2121).
+struct ClearRunningOnDrop(Arc<LiveCatchupManager>);
+
+impl Drop for ClearRunningOnDrop {
+    fn drop(&mut self) {
+        if let Ok(mut running) = self.0.running.try_lock() {
+            *running = None;
+        } else {
+            // Someone holds the lock for a moment: clear it right after.
+            let manager = Arc::clone(&self.0);
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(async move {
+                    *manager.running.lock().await = None;
+                });
+            }
+        }
+    }
+}
+
 /// State for the currently-running catchup, if any.
 struct RunningCatchup {
     catchpoint: String,
@@ -300,9 +325,12 @@ struct RunningCatchup {
     /// (issue #2121; go `Abort` vs `Stop`).
     abort: CancellationToken,
     /// The run itself has ended and [`LiveCatchupManager::drive`] is handing
-    /// the node back to normal sync (reload, sync-round reset, resume). Not
-    /// reported as catching up any more, and no new catchup can start until
-    /// it is done (issue #2121).
+    /// the node back to normal sync (reload, sync-round reset, resume). Like
+    /// go, which keeps `catchpointCatchupService` set until
+    /// `SetCatchpointCatchupMode(false)` clears it, the catchup is still
+    /// reported and a new one cannot start until this is done; only
+    /// `abort_catchup` treats it differently (a no-op for this label, since
+    /// the run is over). Issue #2121.
     handing_back: bool,
     /// The [`LiveCatchupManager::drive`] task, joined by
     /// [`LiveCatchupManager::shutdown`] (issue #2121).
@@ -371,8 +399,10 @@ impl LiveCatchupManager {
     /// After this no catchup starts, and a run that ends does not resume the
     /// normal sync services (see [`Self::drive`]).
     ///
-    /// Returns `false` on a timeout (a phase that only checks the token
-    /// between steps, e.g. a catchpoint import): the run is then still going.
+    /// Returns `false` when the run did not stop cleanly: on a timeout (a
+    /// phase that only checks the token between steps, e.g. a catchpoint
+    /// import; the run is then still going, and a later call says so again)
+    /// or when its task failed.
     /// The caller carries on with its teardown, which is safe because the
     /// catchup writes through its own database connection, never the node's
     /// shared ledger handle or the services torn down next, and once it does
@@ -391,22 +421,32 @@ impl LiveCatchupManager {
             match guard.as_mut() {
                 Some(running) => {
                     running.cancel.cancel();
-                    running.task.take()
+                    match running.task.take() {
+                        Some(task) => task,
+                        // An earlier shutdown() timed out and took the handle:
+                        // that run is still registered, so still going.
+                        None => return false,
+                    }
                 }
-                None => None,
+                None => return true,
             }
         };
-        let Some(task) = task else {
-            return true;
-        };
-        if tokio::time::timeout(timeout, task).await.is_err() {
-            warn!(
-                ?timeout,
-                "live catchpoint catchup did not stop within the shutdown timeout; continuing the shutdown without it"
-            );
-            return false;
+        match tokio::time::timeout(timeout, task).await {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
+                // Not a clean stop: the task died (its `running` entry is
+                // cleared by `ClearRunningOnDrop`).
+                tracing::error!(error = %e, "live catchpoint catchup task failed during shutdown");
+                false
+            }
+            Err(_) => {
+                warn!(
+                    ?timeout,
+                    "live catchpoint catchup did not stop within the shutdown timeout; continuing the shutdown without it"
+                );
+                false
+            }
         }
-        true
     }
 
     fn is_shutting_down(&self) -> bool {
@@ -444,16 +484,8 @@ impl LiveCatchupManager {
             return CatchupStartResult::StartError("the node is shutting down".to_string());
         }
         if let Some(running) = guard.as_ref() {
-            // The previous run has ended but is still handing the node back
-            // to normal sync: this request is neither in progress nor can it
-            // start yet. go's `CatchpointUnableToStartError` (400) says so;
-            // `AlreadyInProgress` (200) would silently drop it.
-            if running.handing_back {
-                return CatchupStartResult::Unable(format!(
-                    "unable to start catchpoint catchup for '{catchpoint}' - already catching up '{}'",
-                    running.catchpoint
-                ));
-            }
+            // (Also while a finished run hands back, as go answers until
+            // `SetCatchpointCatchupMode(false)` clears its service.)
             if running.catchpoint == catchpoint {
                 return CatchupStartResult::AlreadyInProgress;
             }
@@ -535,7 +567,6 @@ impl LiveCatchupManager {
             .lock()
             .await
             .as_ref()
-            .filter(|r| !r.handing_back)
             .map(|r| r.catchpoint.clone())
     }
 
@@ -663,12 +694,26 @@ impl LiveCatchupManager {
         cancel: CancellationToken,
         abort: CancellationToken,
     ) {
-        let result = self
-            .runner
-            .run(&catchpoint, cancel, abort, Arc::clone(&self.counters))
-            .await;
-        // The run is over: stop reporting it, refuse new catchups until the
-        // hand-back below is done (issue #2121).
+        // Clears `running` on every exit path, a panic included (issue #2121).
+        let _clear_running = ClearRunningOnDrop(Arc::clone(&self));
+        // Run on a task of its own, so a panicking runner ends as an error
+        // and the hand-back below still resumes normal sync.
+        let run = {
+            let runner = Arc::clone(&self.runner);
+            let catchpoint = catchpoint.clone();
+            let counters = Arc::clone(&self.counters);
+            tokio::spawn(async move { runner.run(&catchpoint, cancel, abort, counters).await })
+        };
+        let result = match run.await {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::error!(catchpoint = %catchpoint, error = %e, "live catchpoint catchup runner panicked");
+                Err(anyhow::anyhow!(
+                    "live catchpoint catchup runner panicked: {e}"
+                ))
+            }
+        };
+        // The run is over; the hand-back below follows (issue #2121).
         if let Some(running) = self.running.lock().await.as_mut() {
             running.handing_back = true;
         }
@@ -1252,8 +1297,9 @@ mod tests {
         }
     }
 
-    /// Polls `current_catchpoint()` until it's `None` (i.e. the manager
-    /// has returned to idle), bounded so a bug can't hang the test suite.
+    /// Polls until no catchup is registered at all, the hand-back included
+    /// (i.e. the manager has returned to idle), bounded so a bug can't hang
+    /// the test suite.
     async fn wait_idle(manager: &LiveCatchupManager) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -1432,12 +1478,12 @@ mod tests {
         assert_eq!(manager.current_catchpoint().await, None);
     }
 
-    /// The hand-back holds no lock and has its own state: while it is in
-    /// progress (here, a slow ledger reload), `GET /v2/status`'s
-    /// `current_catchpoint()` answers at once and no longer reports the
-    /// finished run, `start_catchup` answers at once with go's "unable to
-    /// start" error instead of a false "already in progress", and
-    /// `abort_catchup` answers at once.
+    /// The hand-back holds no lock: while it is in progress (here, a slow
+    /// ledger reload) every call answers at once, and as in go (which keeps
+    /// its catchup service set until `SetCatchpointCatchupMode(false)`)
+    /// `current_catchpoint()` still reports the label, `start_catchup` gives
+    /// "already in progress" for that label and "unable" for another, and
+    /// `abort_catchup` is a no-op for that label and an error for another.
     #[tokio::test]
     async fn status_start_and_abort_answer_promptly_during_the_hand_back() {
         let control = GatedControl::new(false);
@@ -1451,20 +1497,19 @@ mod tests {
         let status = tokio::time::timeout(Duration::from_secs(1), manager.current_catchpoint())
             .await
             .expect("current_catchpoint() blocked behind the hand-back");
-        // The run is over: no longer reported as catching up.
-        assert_eq!(status, None);
-        // A new request is refused (go's 400 CatchpointUnableToStartError),
-        // not reported as already in progress and silently dropped.
-        let started = tokio::time::timeout(
+        assert_eq!(status.as_deref(), Some("1000#deadbeef"));
+        let same = tokio::time::timeout(
             Duration::from_secs(1),
             manager.start_catchup("1000#deadbeef"),
         )
         .await
         .expect("start_catchup() blocked behind the hand-back");
-        assert!(
-            matches!(started, CatchupStartResult::Unable(_)),
-            "{started:?}"
-        );
+        assert_eq!(same, CatchupStartResult::AlreadyInProgress);
+        let other =
+            tokio::time::timeout(Duration::from_secs(1), manager.start_catchup("2000#other"))
+                .await
+                .expect("start_catchup() blocked behind the hand-back");
+        assert!(matches!(other, CatchupStartResult::Unable(_)), "{other:?}");
         tokio::time::timeout(
             Duration::from_secs(1),
             manager.abort_catchup("1000#deadbeef"),
@@ -1552,6 +1597,124 @@ mod tests {
             }
             assert_eq!(*aborted.lock().unwrap(), Some(abort), "abort = {abort}");
         }
+    }
+
+    /// A [`CatchupRunner`] that ignores the cancellation and never returns:
+    /// a phase that cannot be interrupted.
+    struct StuckRunner;
+
+    #[async_trait]
+    impl CatchupRunner for StuckRunner {
+        async fn run(
+            &self,
+            _catchpoint: &str,
+            _cancel: CancellationToken,
+            _abort: CancellationToken,
+            _counters: Arc<StdMutex<CatchpointCounters>>,
+        ) -> anyhow::Result<CatchupOutcome> {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    }
+
+    /// Issue #2121: once a shutdown() timed out (and took the task handle),
+    /// a later shutdown() must still report the stale run as not stopped,
+    /// rather than `true` for a handle it no longer has.
+    #[tokio::test]
+    async fn a_second_shutdown_still_reports_a_run_that_never_stopped() {
+        let manager =
+            LiveCatchupManager::new(Arc::new(StuckRunner), Arc::new(CountingControl::default()));
+        assert_eq!(
+            manager.start_catchup("1000#deadbeef").await,
+            CatchupStartResult::Created
+        );
+        assert!(!manager.shutdown(Duration::from_millis(100)).await);
+        assert!(
+            !manager.shutdown(Duration::from_millis(100)).await,
+            "the stuck run is still registered, so it has not stopped"
+        );
+    }
+
+    /// A [`CatchupRunner`] that panics.
+    struct PanickingRunner;
+
+    #[async_trait]
+    impl CatchupRunner for PanickingRunner {
+        async fn run(
+            &self,
+            _catchpoint: &str,
+            _cancel: CancellationToken,
+            _abort: CancellationToken,
+            _counters: Arc<StdMutex<CatchpointCounters>>,
+        ) -> anyhow::Result<CatchupOutcome> {
+            panic!("runner bug");
+        }
+    }
+
+    /// Issue #2121: a panicking runner must not wedge the manager: the run
+    /// ends as a failure, normal sync is resumed (reload, then resume), and a
+    /// new catchup can start.
+    #[tokio::test]
+    async fn a_panicking_runner_still_hands_back_and_frees_the_manager() {
+        let control = Arc::new(CountingControl::default());
+        let manager = LiveCatchupManager::new(Arc::new(PanickingRunner), control.clone());
+        assert_eq!(
+            manager.start_catchup("1000#deadbeef").await,
+            CatchupStartResult::Created
+        );
+        wait_idle(&manager).await;
+        assert_eq!(control.reloads.load(Ordering::SeqCst), 1);
+        assert_eq!(control.resumes.load(Ordering::SeqCst), 1);
+        assert_eq!(manager.current_catchpoint().await, None);
+        assert_eq!(
+            manager.start_catchup("2000#next").await,
+            CatchupStartResult::Created
+        );
+    }
+
+    /// A [`NormalSyncControl`] whose `reload_ledger` waits for `release` and
+    /// then panics: a hand-back that dies.
+    struct PanickingReloadControl {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl NormalSyncControl for PanickingReloadControl {
+        async fn pause(&self) {}
+        async fn resume(&self) {}
+        async fn reload_ledger(&self) {
+            self.entered.notify_one();
+            self.release.notified().await;
+            panic!("reload bug");
+        }
+    }
+
+    /// Issue #2121: a drive task that panics while shutdown() waits for it
+    /// is reported as not stopped cleanly, and still leaves the manager idle.
+    #[tokio::test]
+    async fn shutdown_reports_a_panicked_hand_back_and_the_manager_is_freed() {
+        let control = Arc::new(PanickingReloadControl {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let manager = LiveCatchupManager::new(ImmediateRunner::ok(), control.clone());
+        assert_eq!(
+            manager.start_catchup("1000#deadbeef").await,
+            CatchupStartResult::Created
+        );
+        control.entered.notified().await;
+        let shutdown = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.shutdown(Duration::from_secs(5)).await })
+        };
+        wait_shutting_down(&manager).await;
+        control.release.notify_one();
+        assert!(
+            !shutdown.await.unwrap(),
+            "a panicked task is not a clean stop"
+        );
+        wait_idle(&manager).await;
     }
 
     // -- start_catchup: happy path -----------------------------------------

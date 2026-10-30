@@ -1469,7 +1469,55 @@ impl SyncOrchestrator {
             "catchpoint cutover rolled back after verification failure — \
              ledger reverted to its pre-catchup round"
         );
+
+        // Issue #2121: the ledger is pre-catchup again, so the resume marker
+        // must stop claiming a cutover (`ImportingLedger` and later imply
+        // one, see `run_phases`). Back to "downloaded": a resume (a
+        // verify-failure retry, or the next start) re-downloads and
+        // re-imports, and an abort before that re-import discards cleanly.
+        if let Err(e) = persist_sync_state(
+            conn,
+            &SyncState::DownloadingLedger,
+            self.resolved_label.as_deref(),
+            self.catchpoint_round,
+            self.catchpoint_file_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .as_deref(),
+        ) {
+            tracing::warn!(error = %e, "failed to rewrite the sync state after the cutover rollback");
+        }
         true
+    }
+
+    /// [`Self::rollback_cutover_on_failure`] for a failed verification
+    /// (issue #2121). When the cutover cannot be rolled back, the ledger is
+    /// left cut over to the unverified catchpoint with no backup: say so, and
+    /// make the resume marker say so too (`ImportingLedger`, written after a
+    /// cutover), so the next catchup re-imports and verifies it rather than
+    /// treating the ledger as untouched.
+    fn rollback_after_verify_failure(&mut self, conn: &Connection, reason: &str) {
+        if self.rollback_cutover_on_failure(conn, reason) {
+            return;
+        }
+        tracing::error!(
+            reason,
+            "catchpoint verification failed and the cutover could not be rolled back: \
+             the ledger is left cut over to the unverified catchpoint without a backup; \
+             keeping a resume marker that says so"
+        );
+        if let Err(e) = persist_sync_state(
+            conn,
+            &SyncState::ImportingLedger,
+            self.resolved_label.as_deref(),
+            self.catchpoint_round,
+            self.catchpoint_file_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .as_deref(),
+        ) {
+            tracing::warn!(error = %e, "failed to persist the sync state after a failed cutover rollback");
+        }
     }
 
     /// Phase 3: Verify the imported ledger (Merkle trie, account totals).
@@ -1496,8 +1544,7 @@ impl SyncOrchestrator {
         let verify_result = match verify_catchpoint(&conn, &block_header_digest) {
             Ok(r) => r,
             Err(e) => {
-                let _ =
-                    self.rollback_cutover_on_failure(&conn, "verify_catchpoint returned an error");
+                self.rollback_after_verify_failure(&conn, "verify_catchpoint returned an error");
                 return Err(AlgoError::Ledger {
                     message: format!("catchpoint verification failed: {e}"),
                 });
@@ -1510,7 +1557,7 @@ impl SyncOrchestrator {
                 "issue #1636 diagnostic: see build_and_persist_trie_chunked's second-rerun \
                  result above for whether this mismatch is deterministic or not"
             );
-            let _ = self.rollback_cutover_on_failure(&conn, "catchpoint label mismatch");
+            self.rollback_after_verify_failure(&conn, "catchpoint label mismatch");
             return Err(AlgoError::Ledger {
                 message: format!(
                     "catchpoint label mismatch: expected '{}', computed '{}'",
@@ -1526,7 +1573,7 @@ impl SyncOrchestrator {
             self.check_label_matches_requested(&verify_result.computed_label, "calculated")
         {
             let had_backup = self.cutover_backup.is_some();
-            let _ = self.rollback_cutover_on_failure(&conn, "catchpoint hash mismatch");
+            self.rollback_after_verify_failure(&conn, "catchpoint hash mismatch");
             if !had_backup {
                 // Resumed from a prior process: nothing to roll back, so the
                 // imported data is still live. Drop the resume marker so a
@@ -1543,7 +1590,7 @@ impl SyncOrchestrator {
         // backup is dropped below so a failure rolls the whole cutover back
         // (the step itself is one transaction and re-runnable on resume).
         if let Err(e) = crate::catchpoint::importer::finish_pre_v8_catchpoint_migration(&conn) {
-            let _ = self.rollback_cutover_on_failure(&conn, "post-verification migration failed");
+            self.rollback_after_verify_failure(&conn, "post-verification migration failed");
             return Err(AlgoError::Ledger {
                 message: format!("post-verification catchpoint migration failed: {e}"),
             });
@@ -4559,6 +4606,133 @@ mod tests {
         let err = result.expect_err("a cancelled lookback must not succeed");
         assert!(err.contains("cancelled"), "{err}");
         worker.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Minimal tables `CatchpointImporter::rollback_cutover` restores into.
+    fn create_rollback_tables(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS acctrounds (id TEXT PRIMARY KEY, rnd INTEGER);
+             CREATE TABLE IF NOT EXISTS accounttotals (id TEXT PRIMARY KEY, online INTEGER,
+                 onlinerewardunits INTEGER, offline INTEGER, offlinerewardunits INTEGER,
+                 notparticipating INTEGER, notparticipatingrewardunits INTEGER,
+                 rewardslevel INTEGER);",
+        )
+        .unwrap();
+    }
+
+    /// Issue #2121: a verification failure whose cutover rollback succeeds
+    /// leaves a pre-catchup ledger, so its marker must stop claiming a
+    /// cutover. Then a resumed run that is aborted before the re-import
+    /// discards the marker, the staging tables and the file, instead of
+    /// keeping a stale "cut over" state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rolled_back_verify_failure_lets_a_later_abort_discard_everything() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-rollback-then-abort-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("catchpoint-5000.tar.gz");
+        std::fs::write(&file, b"not a real catchpoint").unwrap();
+
+        // Process 1: cut over, verification fails, the rollback succeeds.
+        let mut first =
+            SyncOrchestrator::with_backend(test_config(dir.join("ledger"), 1), FakeLookbackBackend);
+        first.resolved_label = Some("5000#L1".to_string());
+        first.catchpoint_round = Some(5_000);
+        first.catchpoint_file_path = Some(file.clone());
+        first.ledger_cut_over = true;
+        first.cutover_backup = Some(crate::catchpoint::CutoverBackup::default());
+        {
+            let conn = first.open_db().unwrap();
+            create_rollback_tables(&conn);
+            persist_sync_state(
+                &conn,
+                &SyncState::ImportingLedger,
+                Some("5000#L1"),
+                Some(5_000),
+                Some(&file.to_string_lossy()),
+            )
+            .unwrap();
+            first.rollback_after_verify_failure(&conn, "test verification failure");
+            let marker = restore_sync_state(&conn).unwrap().unwrap();
+            assert_eq!(
+                marker.state,
+                SyncState::DownloadingLedger,
+                "a rolled-back cutover must not leave a marker that claims one"
+            );
+            conn.execute_batch("CREATE TABLE catchpointbalances (address BLOB);")
+                .unwrap();
+        }
+
+        // Process 2: resumes, and the user aborts before the re-import.
+        let cancel = CancellationToken::new();
+        let abort = CancellationToken::new();
+        let mut second =
+            SyncOrchestrator::with_backend(test_config(dir.join("ledger"), 1), FakeLookbackBackend);
+        second.set_cancel(cancel.clone());
+        second.set_abort(abort.clone());
+        abort.cancel();
+        cancel.cancel();
+        let err = second
+            .run()
+            .await
+            .expect_err("an aborted catchup must not succeed")
+            .to_string();
+        assert!(err.contains("aborted"), "{err}");
+        let conn = second.open_db().unwrap();
+        assert!(restore_sync_state(&conn).unwrap().is_none());
+        let staging: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE name = 'catchpointbalances'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!staging, "the abort must drop the staging tables");
+        assert!(!file.exists(), "the abort must remove the catchpoint file");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #2121: a verification failure whose rollback fails leaves the
+    /// ledger cut over without a backup, and the marker says so
+    /// (`ImportingLedger`), whatever it said before.
+    #[test]
+    fn a_verify_failure_with_a_failed_rollback_keeps_a_cut_over_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-verify-rollback-fails-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut orchestrator =
+            SyncOrchestrator::with_backend(test_config(dir.join("ledger"), 1), FakeLookbackBackend);
+        orchestrator.resolved_label = Some("5000#L1".to_string());
+        orchestrator.catchpoint_round = Some(5_000);
+        orchestrator.ledger_cut_over = true;
+        orchestrator.cutover_backup = Some(crate::catchpoint::CutoverBackup::default());
+        let conn = orchestrator.open_db().unwrap();
+        persist_sync_state(
+            &conn,
+            &SyncState::DownloadingLedger,
+            Some("5000#L1"),
+            Some(5_000),
+            None,
+        )
+        .unwrap();
+        // No `acctrounds` table: the rollback fails.
+        conn.execute_batch("DROP TABLE IF EXISTS acctrounds;")
+            .unwrap();
+
+        orchestrator.rollback_after_verify_failure(&conn, "test verification failure");
+        let marker = restore_sync_state(&conn).unwrap().unwrap();
+        assert_eq!(marker.state, SyncState::ImportingLedger);
+        drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
