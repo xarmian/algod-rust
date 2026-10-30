@@ -682,14 +682,23 @@ impl BlockingRuntime {
         self.block_on_with(&self.cancel, fut)
     }
 
-    /// [`Self::block_on`] with an explicit token, for a call that carries its
-    /// own (`SyncBackend::fetch_block_range`).
+    /// [`Self::block_on`] for a call that also carries its own token
+    /// (`SyncBackend::fetch_block_range`): ends as soon as EITHER the caller's
+    /// token or the backend's fires, so a shutdown that fires only the
+    /// backend's still ends a fetch whose caller passed some other token.
     fn block_on_with<T>(
         &self,
         cancel: &CancellationToken,
         fut: impl std::future::Future<Output = Result<T, AlgoError>>,
     ) -> Result<T, AlgoError> {
-        block_on_until_cancelled(&self.rt, cancel, fut)
+        let backend = &self.cancel;
+        block_on_until_cancelled(&self.rt, cancel, async {
+            tokio::select! {
+                biased;
+                _ = backend.cancelled() => Err(algo_ledger::sync::cancelled_error()),
+                result = fut => result,
+            }
+        })
     }
 }
 
@@ -2730,7 +2739,7 @@ mod tests {
             no_cancel(),
         );
 
-        let result = backend.fetch_blocks_batch(10, 5, 4);
+        let result = backend.fetch_blocks_batch(10, 5, 4, &no_cancel());
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
     }
@@ -3463,6 +3472,46 @@ mod tests {
         )
         .with_block_fetch_timeout(std::time::Duration::from_millis(300))
         .with_http_block_fetcher("test-genesis")
+    }
+
+    /// Issue #2121: the backend's own token (the orchestrator's, fired by a
+    /// node shutdown) ends a range fetch whose caller passed a different,
+    /// never-fired token, instead of the fetch waiting out the stalled
+    /// peer's timeouts (10 s per request here, per round).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_backend_token_ends_a_batch_fetch_whose_caller_token_never_fires() {
+        use algo_ledger::sync::SyncBackendExt;
+        let stalled = wiremock::MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(60)))
+            .mount(&stalled)
+            .await;
+        let backend_token = CancellationToken::new();
+        let backend = AlgodSyncBackend::with_catchpoint_peers_and_p2p(
+            &stalled.uri(),
+            "",
+            &[],
+            None,
+            algo_rest_client::CatchpointDownloadConfig::default(),
+            algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
+            None,
+            backend_token.clone(),
+        );
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            backend_token.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        // The caller's own token never fires.
+        let result = backend.fetch_blocks_batch(1, 4, 2, &CancellationToken::new());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the batch fetch outlived the backend's cancellation: {:?}",
+            started.elapsed()
+        );
+        let err = result.expect_err("a cancelled batch fetch must not succeed");
+        assert!(err.to_string().contains("cancelled"), "{err}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

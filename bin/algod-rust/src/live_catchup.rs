@@ -511,8 +511,9 @@ impl LiveCatchupManager {
         let guard = self.running.lock().await;
         match guard.as_ref() {
             None => Ok(()),
-            // The run already ended (go: `Abort()` on a finished service).
-            Some(running) if running.handing_back => Ok(()),
+            // The run already ended (go: `Abort()` on a finished service). A
+            // different label still gets go's error below.
+            Some(running) if running.handing_back && running.catchpoint == catchpoint => Ok(()),
             Some(running) if running.catchpoint == catchpoint => {
                 // go `Abort()`: the abort flag first, then the cancellation
                 // the run's stages wait on (issue #2121).
@@ -1307,7 +1308,13 @@ mod tests {
     async fn shutdown_with_no_running_catchup_returns_at_once() {
         let control = Arc::new(CountingControl::default());
         let manager = LiveCatchupManager::new(ImmediateRunner::ok(), control.clone());
-        manager.shutdown(Duration::from_secs(5)).await;
+        let started = std::time::Instant::now();
+        assert!(manager.shutdown(Duration::from_secs(5)).await);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "shutdown() with nothing running took {:?}",
+            started.elapsed()
+        );
         assert_eq!(control.resumes.load(Ordering::SeqCst), 0);
     }
 
@@ -1464,7 +1471,16 @@ mod tests {
         )
         .await
         .expect("abort_catchup() blocked behind the hand-back")
-        .unwrap();
+        .expect("aborting the label that just ran is a no-op during the hand-back");
+        // Any other label still gets go's "unable to abort" error.
+        let other = manager
+            .abort_catchup("2000#other")
+            .await
+            .expect_err("a different label must be rejected during the hand-back");
+        assert!(
+            other.contains("unable to abort catchpoint catchup for '2000#other'"),
+            "{other}"
+        );
 
         control.release.notify_one();
         wait_idle(&manager).await;
