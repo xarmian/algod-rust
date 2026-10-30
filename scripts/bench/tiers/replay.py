@@ -293,7 +293,50 @@ def results(runs, corpus_name, meta):
     return rows
 
 
+# Metrics whose Rust/Go ratio CI requires. The others may lack one: go's
+# write_mb legitimately reads 0 on runners whose I/O accounting does not
+# attribute its writes, and a zero baseline has no ratio (issue #2124).
+TIMING_METRICS = ("wall_s", "cpu_s", "blocks_per_s", "txns_per_s")
+
+
+def ratio_gate(rep):
+    """Errors of a report.json for CI: the report must be ok, hold replay
+    rows, and give every timing metric a Rust/Go ratio."""
+    if not rep.get("ok"):
+        return [f"report not ok: {rep.get('errors')}"]
+    rows = [r for r in rep.get("rows", []) if r.get("tier") == TIER]
+    if not rows:
+        return ["no replay rows"]
+    errors = []
+    names = {r["name"] for r in rows}
+    corpora = sorted({n.split("/", 1)[0] for n in names})
+    for c in corpora:
+        for k in TIMING_METRICS:
+            name = f"{c}/{k}"
+            row = next((r for r in rows if r["name"] == name), None)
+            if row is None or row.get("ratio") is None:
+                errors.append(f"{name}: no Rust/Go ratio")
+    return errors
+
+
+def check_report(path):
+    with open(path, encoding="utf-8") as f:
+        rep = json.load(f)
+    errors = ratio_gate(rep)
+    for e in errors:
+        print(f"replay: {e}", file=sys.stderr)
+    if errors:
+        return 1
+    rows = [r for r in rep["rows"] if r["tier"] == TIER]
+    na = [r["name"] for r in rows if r.get("ratio") is None]
+    print(f"{len(rows)} replay rows; every timing metric has a Rust/Go ratio"
+          + (f"; no ratio (zero or unmeasured baseline): {', '.join(na)}" if na else ""))
+    return 0
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--check-report":
+        return check_report(sys.argv[2])
     runs = int(os.environ.get("BENCH_RUNS", "5"))
     warmup = int(os.environ.get("BENCH_REPLAY_WARMUP", "1"))
     rounds = int(os.environ.get("BENCH_REPLAY_ROUNDS", "0") or 0)

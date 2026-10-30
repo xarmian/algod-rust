@@ -147,16 +147,9 @@ jobs:
           set -euo pipefail
           make bench-compare TIERS=replay CORPUS=small RUNS=3 BENCH_RUN_DIR=bench-results/ci-replay \
             GO_ALGORAND_DIR="$GO_ALGORAND_DIR"
-          python3 - <<'PY'
-          import json
-          rep = json.load(open("bench-results/ci-replay/report.json"))
-          assert rep["ok"], rep["errors"]
-          rows = [r for r in rep["rows"] if r["tier"] == "replay"]
-          assert rows, "no replay rows"
-          missing = [r["name"] for r in rows if r.get("ratio") is None]
-          assert not missing, missing
-          print(f"{len(rows)} replay rows, every one with a Rust/Go ratio")
-          PY
+          # Every timing metric needs a Rust/Go ratio; go's write_mb may read
+          # 0 on the runner and then has none (issue #2124).
+          python3 scripts/bench/tiers/replay.py --check-report bench-results/ci-replay/report.json
       - name: Negative tests - a corrupted corpus fails the tier
         run: |
           set -euo pipefail
