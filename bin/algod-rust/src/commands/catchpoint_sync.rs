@@ -190,6 +190,9 @@ struct AlgodSyncBackend {
     /// Block fetcher rotating across `algod_url` and the extra candidate
     /// peers (issue #2095); shared (`Arc`) with the parallel range fetcher.
     blocks: Arc<RotatingBlockSource>,
+    /// The orchestrator's cancellation token (issue #2121): every blocking
+    /// call ends at once when it fires (see [`block_on_until_cancelled`]).
+    cancel: CancellationToken,
 }
 
 /// Builds the ranked catchpoint-download source shared by
@@ -291,7 +294,24 @@ impl AlgodSyncBackend {
                 extra_catchpoint_peer_urls,
                 DEFAULT_BLOCK_PEER_TIMEOUT,
             )),
+            cancel: CancellationToken::new(),
         }
+    }
+
+    /// Make every blocking call of this backend end at once when `cancel`
+    /// fires (issue #2121); pass the orchestrator's token.
+    fn with_cancel(mut self, cancel: CancellationToken) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    /// Run `fut` on the runtime from the (blocking) sync thread, ending it
+    /// with a cancellation error as soon as this backend's token fires.
+    fn block_on<T>(
+        &self,
+        fut: impl std::future::Future<Output = Result<T, AlgoError>>,
+    ) -> Result<T, AlgoError> {
+        block_on_until_cancelled(&self.rt, &self.cancel, fut)
     }
 
     /// Overrides the per-peer, per-request block fetch timeout (issue #2095).
@@ -583,13 +603,10 @@ impl SyncBackend for AlgodSyncBackend {
         round: u64,
         dest_path: &std::path::Path,
     ) -> Result<(), AlgoError> {
-        tokio::task::block_in_place(|| {
-            self.rt.block_on(async {
-                self.catchpoint_source
-                    .download(genesis_id, round, dest_path, None)
-                    .await
-            })
-        })
+        self.block_on(
+            self.catchpoint_source
+                .download(genesis_id, round, dest_path, None),
+        )
     }
 
     fn rank_last_catchpoint_peer_down(&self) {
@@ -597,43 +614,29 @@ impl SyncBackend for AlgodSyncBackend {
     }
 
     fn fetch_block_raw(&self, round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
-        tokio::task::block_in_place(|| self.rt.block_on(self.fetch_block_raw_async(round)))
-    }
-
-    fn fetch_block_raw_cancellable(
-        &self,
-        round: u64,
-        cancel: &CancellationToken,
-    ) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
-        block_on_until_cancelled(&self.rt, cancel, self.fetch_block_raw_async(round))
+        self.block_on(self.fetch_block_raw_async(round))
     }
 
     fn fetch_block(&self, round: u64) -> Result<Block, AlgoError> {
-        tokio::task::block_in_place(|| {
-            self.rt.block_on(async {
-                let raw = self.get_block_raw_bytes(round).await?;
-                let br = decode_block_response(&raw)?;
-                Ok(br.block)
-            })
+        self.block_on(async {
+            let raw = self.get_block_raw_bytes(round).await?;
+            let br = decode_block_response(&raw)?;
+            Ok(br.block)
         })
     }
 
     fn get_current_round(&self) -> Result<u64, AlgoError> {
-        tokio::task::block_in_place(|| {
-            self.rt.block_on(async {
-                let status = self.client.get_status().await?;
-                Ok(status.last_round)
-            })
+        self.block_on(async {
+            let status = self.client.get_status().await?;
+            Ok(status.last_round)
         })
     }
 
     fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
-        tokio::task::block_in_place(|| {
-            self.rt.block_on(discover_catchpoint_with_fallback(
-                &self.client,
-                self.network.as_deref(),
-            ))
-        })
+        self.block_on(discover_catchpoint_with_fallback(
+            &self.client,
+            self.network.as_deref(),
+        ))
     }
 
     fn fetch_block_range(
@@ -812,6 +815,7 @@ pub(crate) fn build_algod_sync_backend(
     ledger_download_retry_attempts: usize,
     network: Option<&str>,
     genesis_id: &str,
+    cancel: &CancellationToken,
 ) -> impl SyncBackend {
     AlgodSyncBackend::with_catchpoint_peers_and_p2p(
         algod_url,
@@ -823,6 +827,7 @@ pub(crate) fn build_algod_sync_backend(
         network,
     )
     .with_http_block_fetcher(genesis_id)
+    .with_cancel(cancel.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -1061,6 +1066,9 @@ pub struct GossipSyncBackend {
     /// The network preset name -- see `AlgodSyncBackend`'s `network` field
     /// doc comment (issue #1604).
     network: Option<String>,
+    /// The orchestrator's cancellation token (issue #2121); see
+    /// [`AlgodSyncBackend::with_cancel`].
+    cancel: CancellationToken,
 }
 
 impl GossipSyncBackend {
@@ -1124,7 +1132,24 @@ impl GossipSyncBackend {
             concurrency,
             worst_case_round_time: std::time::Duration::ZERO,
             network: network.map(str::to_string),
+            cancel: CancellationToken::new(),
         }
+    }
+
+    /// Make every blocking call of this backend end at once when `cancel`
+    /// fires (issue #2121); pass the orchestrator's token.
+    fn with_cancel(mut self, cancel: CancellationToken) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    /// Run `fut` on the runtime from the (blocking) sync thread, ending it
+    /// with a cancellation error as soon as this backend's token fires.
+    fn block_on<T>(
+        &self,
+        fut: impl std::future::Future<Output = Result<T, AlgoError>>,
+    ) -> Result<T, AlgoError> {
+        block_on_until_cancelled(&self.rt, &self.cancel, fut)
     }
 
     /// Fetch a block via gossip, returning the decoded `Block`.
@@ -1200,13 +1225,10 @@ impl SyncBackend for GossipSyncBackend {
         dest_path: &std::path::Path,
     ) -> Result<(), AlgoError> {
         // Catchpoint download is always via REST/HTTP, ranked across peers.
-        tokio::task::block_in_place(|| {
-            self.rt.block_on(async {
-                self.catchpoint_source
-                    .download(genesis_id, round, dest_path, None)
-                    .await
-            })
-        })
+        self.block_on(
+            self.catchpoint_source
+                .download(genesis_id, round, dest_path, None),
+        )
     }
 
     fn rank_last_catchpoint_peer_down(&self) {
@@ -1214,49 +1236,37 @@ impl SyncBackend for GossipSyncBackend {
     }
 
     fn fetch_block_raw(&self, round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
-        tokio::task::block_in_place(|| self.rt.block_on(self.fetch_block_raw_with_policy(round)))
-    }
-
-    fn fetch_block_raw_cancellable(
-        &self,
-        round: u64,
-        cancel: &CancellationToken,
-    ) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
-        block_on_until_cancelled(&self.rt, cancel, self.fetch_block_raw_with_policy(round))
+        self.block_on(self.fetch_block_raw_with_policy(round))
     }
 
     fn fetch_block(&self, round: u64) -> Result<Block, AlgoError> {
-        tokio::task::block_in_place(|| self.rt.block_on(self.fetch_block_with_policy(round)))
+        self.block_on(self.fetch_block_with_policy(round))
     }
 
     fn get_current_round(&self) -> Result<u64, AlgoError> {
-        tokio::task::block_in_place(|| {
-            self.rt.block_on(async {
-                match self.policy {
-                    BlockSourcePolicy::GossipOnly => {
-                        // In GossipOnly mode, use the gossip source's synthetic
-                        // status (based on last fetched round) instead of REST.
-                        let status = self.gossip.get_status().await?;
-                        Ok(status.last_round)
-                    }
-                    BlockSourcePolicy::GossipFirst | BlockSourcePolicy::HttpOnly => {
-                        // Use REST for authoritative round info.
-                        let status = self.rest_client.get_status().await?;
-                        Ok(status.last_round)
-                    }
+        self.block_on(async {
+            match self.policy {
+                BlockSourcePolicy::GossipOnly => {
+                    // In GossipOnly mode, use the gossip source's synthetic
+                    // status (based on last fetched round) instead of REST.
+                    let status = self.gossip.get_status().await?;
+                    Ok(status.last_round)
                 }
-            })
+                BlockSourcePolicy::GossipFirst | BlockSourcePolicy::HttpOnly => {
+                    // Use REST for authoritative round info.
+                    let status = self.rest_client.get_status().await?;
+                    Ok(status.last_round)
+                }
+            }
         })
     }
 
     fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
         // Catchpoint discovery is always via REST.
-        tokio::task::block_in_place(|| {
-            self.rt.block_on(discover_catchpoint_with_fallback(
-                &self.rest_client,
-                self.network.as_deref(),
-            ))
-        })
+        self.block_on(discover_catchpoint_with_fallback(
+            &self.rest_client,
+            self.network.as_deref(),
+        ))
     }
 
     fn fetch_block_range(
@@ -1336,6 +1346,16 @@ enum CatchpointBackend {
     Gossip(GossipSyncBackend),
 }
 
+impl CatchpointBackend {
+    /// See [`AlgodSyncBackend::with_cancel`] (issue #2121).
+    fn with_cancel(self, cancel: CancellationToken) -> Self {
+        match self {
+            Self::Rest(b) => Self::Rest(b.with_cancel(cancel)),
+            Self::Gossip(b) => Self::Gossip(b.with_cancel(cancel)),
+        }
+    }
+}
+
 impl SyncBackend for CatchpointBackend {
     fn is_noop(&self) -> bool {
         match self {
@@ -1367,17 +1387,6 @@ impl SyncBackend for CatchpointBackend {
         match self {
             Self::Rest(b) => b.fetch_block_raw(round),
             Self::Gossip(b) => b.fetch_block_raw(round),
-        }
-    }
-
-    fn fetch_block_raw_cancellable(
-        &self,
-        round: u64,
-        cancel: &CancellationToken,
-    ) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
-        match self {
-            Self::Rest(b) => b.fetch_block_raw_cancellable(round, cancel),
-            Self::Gossip(b) => b.fetch_block_raw_cancellable(round, cancel),
         }
     }
 
@@ -1982,6 +1991,8 @@ pub async fn run(
         catchup_gossip_block_fetch_timeout,
         None,
     )?;
+    // The backend's blocking calls share the orchestrator's token (#2121).
+    let backend = backend.with_cancel(cancel.clone());
     let mut orchestrator = SyncOrchestrator::with_backend(config, backend);
     orchestrator.set_cancel(cancel);
     orchestrator.set_progress_callback(Box::new(|progress| {

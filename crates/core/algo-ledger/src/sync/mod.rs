@@ -84,6 +84,15 @@ fn notify_progress_fields(progress: &mut SyncProgress, on_progress: &Option<Prog
 /// This keeps the `algo-ledger` crate independent of `algo-rest-client`.
 /// The CLI layer implements this trait using `AlgodClient`, `CatchpointDownloader`,
 /// and `ParallelBlockFetcher`.
+///
+/// # Cancellation (issue #2121)
+///
+/// The blocking methods carry no token of their own. A backend whose calls
+/// drive async requests on a runtime takes the orchestrator's token (the one
+/// passed to [`SyncOrchestrator::set_cancel`]) at construction and ends every
+/// call with [`cancelled_error`] as soon as it fires, so a node shutdown is
+/// neither held up by an in-flight request nor races the runtime's teardown.
+/// The orchestrator checks the token around each call as well.
 pub trait SyncBackend: Send + Sync {
     /// Returns `true` if this is a no-op (stub) backend.
     ///
@@ -119,30 +128,6 @@ pub trait SyncBackend: Send + Sync {
     ///
     /// Used for lookback block downloads.
     fn fetch_block_raw(&self, round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError>;
-
-    /// [`Self::fetch_block_raw`] that gives up once `cancel` fires (issue
-    /// #2121): it returns [`cancelled_error`] instead of finishing a request
-    /// the node no longer wants, so a shutdown is not held up by (or races)
-    /// an in-flight fetch.
-    ///
-    /// The default checks `cancel` before the fetch and after it; the fetch
-    /// itself is not interrupted. Backends whose fetch is an async request
-    /// driven on a tokio runtime override this to race the request against
-    /// the token.
-    fn fetch_block_raw_cancellable(
-        &self,
-        round: u64,
-        cancel: &CancellationToken,
-    ) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
-        if cancel.is_cancelled() {
-            return Err(cancelled_error());
-        }
-        let result = self.fetch_block_raw(round);
-        if cancel.is_cancelled() {
-            return Err(cancelled_error());
-        }
-        result
-    }
 
     /// Fetch and decode a block by round. Used during block replay.
     fn fetch_block(&self, round: u64) -> Result<Block, AlgoError>;
@@ -1021,8 +1006,14 @@ impl SyncOrchestrator {
         }
         let genesis_id = &self.config.genesis_id;
 
-        self.backend
-            .download_catchpoint(genesis_id, round, &file_path)?;
+        let downloaded = self
+            .backend
+            .download_catchpoint(genesis_id, round, &file_path);
+        // A shutdown that ended the download is a cancellation (issue #2121).
+        if downloaded.is_err() && self.cancel.is_cancelled() {
+            return Err(self.handle_cancellation());
+        }
+        downloaded?;
 
         // Issue #2084: fail fast on a file whose own header label differs
         // from the requested one (see `check_label_matches_requested`,
@@ -1689,11 +1680,7 @@ impl SyncOrchestrator {
             self.cached_catchpoint_block
                 .as_ref()
                 .map(|(proto, hdrdata, blkdata)| (proto.clone(), hdrdata.clone(), blkdata.clone()))
-                .or_else(|| {
-                    self.backend
-                        .fetch_block_raw_cancellable(round, &self.cancel)
-                        .ok()
-                })
+                .or_else(|| self.backend.fetch_block_raw(round).ok())
                 .and_then(|(_, _, blkdata)| algo_codec::decode_block(&blkdata).ok())
                 .and_then(|block| {
                     algo_types::consensus::consensus_params_for_version(&block.current_protocol)
@@ -1710,6 +1697,11 @@ impl SyncOrchestrator {
                         })
                 })
                 .unwrap_or(0);
+        // The probe swallows its error; a shutdown that ended it is still a
+        // cancellation, before any database work (issue #2121).
+        if self.cancel.is_cancelled() {
+            return Err(self.handle_cancellation());
+        }
         let lookback = std::cmp::max(crate::catchpoint::MAX_TXN_LIFE, sp_lookback);
         if sp_lookback > crate::catchpoint::MAX_TXN_LIFE {
             tracing::info!(
@@ -1777,7 +1769,12 @@ impl SyncOrchestrator {
         // Use download_lookback_blocks_with_lookback with callbacks that
         // bridge to the backend, passing the (possibly state-proof-extended)
         // `lookback` computed above.
-        let prefetch_fetch = |rnd: u64| backend.fetch_block_raw_cancellable(rnd, cancel);
+        let prefetch_fetch = |rnd: u64| {
+            if cancel.is_cancelled() {
+                return Err(cancelled_error());
+            }
+            backend.fetch_block_raw(rnd)
+        };
         let download_result = std::thread::scope(|scope| {
             for _ in 0..lookback_prefetch::PREFETCH_WORKERS {
                 scope.spawn(|| prefetch.run_worker(&prefetch_fetch));
@@ -1805,7 +1802,10 @@ impl SyncOrchestrator {
                         consecutive_fetch_failures = 0;
                         return Ok(prefetched);
                     }
-                    match backend.fetch_block_raw_cancellable(rnd, cancel) {
+                    if cancel.is_cancelled() {
+                        return Err(CatchpointError::Cancelled);
+                    }
+                    match backend.fetch_block_raw(rnd) {
                         Ok(block) => {
                             consecutive_fetch_failures = 0;
                             Ok(block)
@@ -3083,20 +3083,34 @@ fn lookback_retry_backoff_ms(consecutive_failures: u32) -> u64 {
     (250u64 << consecutive_failures.min(5)).min(5_000)
 }
 
-/// Sleep for `delay` on the calling (blocking) thread, waking early if
+/// Sleep for `delay` on the calling (blocking) thread, waking as soon as
 /// `cancel` fires. Returns `true` if it was cancelled (issue #2121).
+///
+/// Waits on the token itself (its `cancelled()` future, polled with a waker
+/// that unparks this thread) rather than polling it, and needs no runtime:
+/// the lookback loop runs on a plain blocking thread.
 fn sleep_unless_cancelled(delay: std::time::Duration, cancel: &CancellationToken) -> bool {
-    const SLICE: std::time::Duration = std::time::Duration::from_millis(50);
+    struct Unpark(std::thread::Thread);
+    impl std::task::Wake for Unpark {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.unpark();
+        }
+    }
     let deadline = Instant::now() + delay;
+    let waker = std::task::Waker::from(std::sync::Arc::new(Unpark(std::thread::current())));
+    let mut cx = std::task::Context::from_waker(&waker);
+    let cancelled = cancel.cancelled();
+    let mut cancelled = std::pin::pin!(cancelled);
     loop {
-        if cancel.is_cancelled() {
+        if std::future::Future::poll(cancelled.as_mut(), &mut cx).is_ready() {
             return true;
         }
         let now = Instant::now();
         if now >= deadline {
             return false;
         }
-        std::thread::sleep(SLICE.min(deadline - now));
+        // Spurious wake-ups just loop.
+        std::thread::park_timeout(deadline - now);
     }
 }
 
@@ -3946,6 +3960,109 @@ mod tests {
         fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
             Ok(None)
         }
+    }
+
+    /// A lookback source that is shut down while it serves the state-proof
+    /// probe: the fetch cancels the token (the node's SIGTERM) and fails.
+    struct CancelledDuringProbeBackend {
+        cancel: CancellationToken,
+        fetches: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl SyncBackend for CancelledDuringProbeBackend {
+        fn download_catchpoint(
+            &self,
+            _genesis_id: &str,
+            _round: u64,
+            _dest_path: &std::path::Path,
+        ) -> Result<(), AlgoError> {
+            unimplemented!("not exercised by the lookback-only test")
+        }
+
+        fn fetch_block_raw(&self, _round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+            self.fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.cancel.cancel();
+            Err(cancelled_error())
+        }
+
+        fn fetch_block(&self, _round: u64) -> Result<Block, AlgoError> {
+            unimplemented!("not exercised by the lookback-only test")
+        }
+
+        fn get_current_round(&self) -> Result<u64, AlgoError> {
+            unimplemented!("not exercised by the lookback-only test")
+        }
+
+        fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
+            Ok(None)
+        }
+    }
+
+    /// Issue #2121: a cancellation that ends the state-proof lookback probe
+    /// (whose error is otherwise swallowed) is returned at once: no lookback
+    /// download starts and no further block is requested.
+    #[test]
+    fn lookback_probe_cancellation_is_returned_before_the_download_starts() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-lookback-probe-cancel-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cancel = CancellationToken::new();
+        let fetches = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let backend = CancelledDuringProbeBackend {
+            cancel: cancel.clone(),
+            fetches: fetches.clone(),
+        };
+        let mut orchestrator =
+            SyncOrchestrator::with_backend(test_config(dir.join("ledger"), 1), backend);
+        orchestrator.state = SyncState::VerifyingLedger;
+        orchestrator.catchpoint_round = Some(5_000);
+        orchestrator.set_cancel(cancel);
+
+        let err = orchestrator
+            .run_download_lookback()
+            .expect_err("a cancelled probe must stop the phase");
+        assert!(err.to_string().contains("cancelled"), "{err}");
+        assert_eq!(
+            fetches.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the probe ran"
+        );
+        assert_eq!(orchestrator.progress().catchpoint_total_blocks, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #2121: the lookback retry backoff waits on the token, so a
+    /// cancellation from another thread wakes it at once, and an uncancelled
+    /// wait runs its full delay.
+    #[test]
+    fn sleep_unless_cancelled_wakes_on_cancel_and_otherwise_waits_out_the_delay() {
+        let cancel = CancellationToken::new();
+        let started = Instant::now();
+        assert!(!sleep_unless_cancelled(Duration::from_millis(30), &cancel));
+        assert!(started.elapsed() >= Duration::from_millis(30));
+
+        let canceller = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                cancel.cancel();
+            })
+        };
+        let started = Instant::now();
+        assert!(sleep_unless_cancelled(Duration::from_secs(60), &cancel));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the cancellation did not wake the sleep: {:?}",
+            started.elapsed()
+        );
+        canceller.join().unwrap();
+        // Already cancelled: returns at once.
+        assert!(sleep_unless_cancelled(Duration::from_secs(60), &cancel));
     }
 
     /// TDD regression for issue #2121 (the aramidmain image smoke): a node

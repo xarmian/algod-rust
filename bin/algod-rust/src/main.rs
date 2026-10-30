@@ -37,7 +37,8 @@ use cli::{AlgocfgAction, AlgocfgProfileAction, BenchAction, CatchpointAction, Cl
 /// (a blocking phase that checks its cancellation token between steps) from
 /// holding the process past a container stop's grace period, which a plain
 /// `Runtime` drop would do (it waits for every blocking thread).
-const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// See `live_catchup::LIVE_CATCHUP_SHUTDOWN_TIMEOUT` for the whole budget.
+const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 fn main() -> anyhow::Result<std::process::ExitCode> {
     let runtime = tokio::runtime::Builder::new_multi_thread()

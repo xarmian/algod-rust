@@ -6,7 +6,8 @@
 # Smoke test of a network image (`voimain`, `aramidmain`; issue #2074,
 # epic #2068): run the container, wait for /health, check that /versions
 # reports the network's genesis id and that the round advances, then that
-# the node stops promptly and cleanly (no panic in its log).
+# the node stops promptly and cleanly (exit status 0, no fatal panic in its
+# log).
 #
 #   docker/scripts/network-image-smoke.sh <image> <genesis_id> [host_port]
 #
@@ -17,7 +18,9 @@
 # The relays these networks sync from are external, so every failure is
 # classified (issue #2121): `FAILURE CLASS: external network` when the node
 # is healthy but the relays did not serve it, `FAILURE CLASS: node` when the
-# node itself misbehaved (exited, panicked, did not stop in time, ...).
+# node itself misbehaved (exited, panicked, did not stop in time, ...). The
+# classification lives in network_image_smoke_lib.sh, tested by
+# network_image_smoke_test.sh.
 
 set -euo pipefail
 
@@ -35,25 +38,27 @@ trap 'docker logs "$NAME" > "$LOG" 2>&1 || true; echo "--- entrypoint + first lo
 get() { curl -sf -m 10 -H "X-Algo-API-Token: $TOKEN" "$BASE$1"; }
 last_round() { get /v2/status | grep -o '"last-round":[0-9]*' | cut -d: -f2; }
 
-# A panic anywhere in the node's log is a node failure, whatever else
-# happened.
+# shellcheck source=network_image_smoke_lib.sh
+. "$(dirname "$0")/network_image_smoke_lib.sh"
+
+# The panics in the node's log it does not recover from (see the lib).
 panics() {
   docker logs "$NAME" > "$LOG" 2>&1 || true
-  grep -a -A1 "panicked at" "$LOG" || true
+  smoke_fatal_panics "$LOG"
 }
 
 # fail <class> <message>: <class> is `node` (the node misbehaved) or `peers`
-# (the node may be fine; check whether the relays are what failed it).
+# (maybe the relays; `smoke_failure_class` decides from the log, and only
+# strong evidence makes it an external-network failure).
 fail() {
   local class="$1" msg="$2" p
   p="$(panics)"
   if [ -n "$p" ]; then
-    echo "FAILURE CLASS: node: $msg, and a thread panicked:" >&2
+    echo "FAILURE CLASS: node: $msg, and the node panicked:" >&2
     printf '%s\n' "$p" | head -20 >&2 || true
-  elif [ "$class" = peers ] && grep -aqE \
-    "No relay answered|every candidate peer failed|block fetch failed|error sending request|lookback block download failed" "$LOG"; then
-    echo "FAILURE CLASS: external network: $msg; the node is up but the relays did not serve" \
-      "the catchpoint or the blocks (see the catchup/sync lines below). Not a node failure." >&2
+  elif [ "$class" = peers ] && [ "$(smoke_failure_class "$LOG")" = external ]; then
+    echo "FAILURE CLASS: external network: $msg; the node is up but no relay served it the" \
+      "catchpoint or a single block (see the catchup/sync lines below). Not a node failure." >&2
   else
     echo "FAILURE CLASS: node: $msg" >&2
   fi
@@ -112,5 +117,9 @@ docker stop -t 30 "$NAME" >/dev/null
 took=$(( $(date +%s) - start ))
 echo "docker stop took ${took}s"
 [ "$took" -lt 20 ] || fail node "docker stop took ${took}s (the node did not shut down on SIGTERM)"
-[ -z "$(panics)" ] || fail node "the node stopped, but a thread panicked"
+[ -z "$(panics)" ] || fail node "the node stopped, but it panicked"
+# The entrypoint execs the node, so this is the node's own exit status: 0
+# after a clean SIGTERM shutdown (137 if docker had to SIGKILL it).
+code="$(docker inspect -f '{{.State.ExitCode}}' "$NAME")"
+[ "$code" = 0 ] || fail node "the node exited with status $code after SIGTERM"
 echo "ok"

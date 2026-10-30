@@ -254,10 +254,16 @@ pub trait CatchupRunner: Send + Sync {
 
 /// How long node shutdown waits for an in-flight live catchup to observe its
 /// cancellation and return ([`LiveCatchupManager::shutdown`], issue #2121).
-/// Block requests end at once on cancel; this bounds a phase that only
-/// checks the token between steps (a catchpoint import, say), within a
-/// container stop's grace period.
-pub const LIVE_CATCHUP_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Every blocking request ends at once on cancel; this bounds a phase that
+/// only checks the token between steps (a catchpoint import, say).
+///
+/// Shutdown budget against the image smoke's 20 s `docker stop` limit (the
+/// steps run one after another): this 5 s, then participate's
+/// `REST_SHUTDOWN_HARD_CAP` (5 s), then `main`'s `RUNTIME_SHUTDOWN_TIMEOUT`
+/// (3 s): 13 s in the worst case, and normally well under a second, since a
+/// cancelled catchup returns at once. (An in-flight automatic catchpoint
+/// export, which a catching-up node does not run, has its own 30 s wait.)
+pub const LIVE_CATCHUP_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// State for the currently-running catchup, if any.
 struct RunningCatchup {
@@ -324,10 +330,22 @@ impl LiveCatchupManager {
     /// waiting for its goroutines: cancel the in-flight run, if any, and wait
     /// up to `timeout` for it to return, so no catchup work still drives
     /// requests (and registers timers) on the runtime when it is dropped.
-    /// After this no catchup starts, and the run that ends does not resume
-    /// the normal sync services. Returns `false` if the run did not finish
-    /// within `timeout`.
-    pub async fn shutdown(&self, timeout: std::time::Duration) -> bool {
+    /// Every blocking call of the run's backend ends at once on the
+    /// cancellation, so this normally returns well under a second.
+    ///
+    /// After this no catchup starts, and a run that ends does not resume the
+    /// normal sync services (see [`Self::drive`]).
+    ///
+    /// On a timeout (a phase that only checks the token between steps, e.g.
+    /// a catchpoint import) this logs and returns, and the caller carries on
+    /// with its teardown regardless. That is safe: the catchup writes through
+    /// its own database connection, never the node's shared ledger handle or
+    /// the services torn down next, and once it does stop it does not resume
+    /// them. The bounded runtime shutdown in `main` then ends the process
+    /// with the run abandoned mid-phase, which is a crash as far as the sync
+    /// state is concerned: the orchestrator persists that state per phase
+    /// and resumes from it on the next start.
+    pub async fn shutdown(&self, timeout: std::time::Duration) {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let task = {
@@ -341,17 +359,13 @@ impl LiveCatchupManager {
             }
         };
         let Some(task) = task else {
-            return true;
+            return;
         };
-        match tokio::time::timeout(timeout, task).await {
-            Ok(_) => true,
-            Err(_) => {
-                warn!(
-                    ?timeout,
-                    "live catchpoint catchup did not stop within the shutdown timeout"
-                );
-                false
-            }
+        if tokio::time::timeout(timeout, task).await.is_err() {
+            warn!(
+                ?timeout,
+                "live catchpoint catchup did not stop within the shutdown timeout;                  continuing the shutdown without it"
+            );
         }
     }
 
@@ -621,10 +635,18 @@ impl LiveCatchupManager {
             }
         }
 
-        // Node shutdown (issue #2121): the services `resume()` would restart
-        // are being stopped, so only clear the running state.
+        // Issue #2121: the whole hand-back (reload, sync-round reset, resume)
+        // runs under the `running` lock, and `running` is cleared only after
+        // it. `shutdown()` raises `shutting_down` BEFORE taking that lock, so
+        // either this re-check right before `resume()` sees the flag and skips
+        // it, or `resume()` completes while `shutdown()` still waits for the
+        // lock: `shutdown()` never returns with a resume still to come, and
+        // the node's teardown that follows it stops whatever was resumed.
+        let mut guard = self.running.lock().await;
+        // Node shutdown: the services `resume()` would restart are being
+        // stopped, so only clear the running state.
         if self.is_shutting_down() {
-            *self.running.lock().await = None;
+            *guard = None;
             return;
         }
 
@@ -651,11 +673,6 @@ impl LiveCatchupManager {
         // any cutover): it just reopens the same, unchanged ledger file.
         self.control.reload_ledger().await;
 
-        {
-            let mut guard = self.running.lock().await;
-            *guard = None;
-        }
-
         // Reset the follower node's sync round before resuming normal
         // operation, regardless of success/failure/abort — mirrors go's
         // `processStageSwitch`/`abort` both calling
@@ -671,7 +688,10 @@ impl LiveCatchupManager {
             hook.reset_sync_round().await;
         }
 
-        self.control.resume().await;
+        if !self.is_shutting_down() {
+            self.control.resume().await;
+        }
+        *guard = None;
     }
 }
 
@@ -822,14 +842,6 @@ impl algo_ledger::sync::SyncBackend for SharedSyncBackend {
         self.0.fetch_block_raw(round)
     }
 
-    fn fetch_block_raw_cancellable(
-        &self,
-        round: u64,
-        cancel: &tokio_util::sync::CancellationToken,
-    ) -> anyhow::Result<(String, Vec<u8>, Vec<u8>), algo_error::AlgoError> {
-        self.0.fetch_block_raw_cancellable(round, cancel)
-    }
-
     fn fetch_block(&self, round: u64) -> anyhow::Result<algo_types::Block, algo_error::AlgoError> {
         self.0.fetch_block(round)
     }
@@ -889,6 +901,9 @@ impl CatchupRunner for OrchestratorCatchupRunner {
                     &self.params.genesis_id,
                 ),
                 &self.params.genesis_id,
+                // Issue #2121: the backend's blocking calls end at once when
+                // the run is cancelled (node shutdown, abort).
+                &cancel,
             ));
 
         let config = SyncConfig {
@@ -1173,7 +1188,7 @@ mod tests {
             CatchupStartResult::Created
         );
 
-        assert!(manager.shutdown(Duration::from_secs(5)).await);
+        manager.shutdown(Duration::from_secs(5)).await;
 
         // Joined, not merely signalled: the run already returned.
         assert!(cancel_observed.load(std::sync::atomic::Ordering::SeqCst));
@@ -1192,8 +1207,122 @@ mod tests {
     async fn shutdown_with_no_running_catchup_returns_at_once() {
         let control = Arc::new(CountingControl::default());
         let manager = LiveCatchupManager::new(ImmediateRunner::ok(), control.clone());
-        assert!(manager.shutdown(Duration::from_secs(5)).await);
+        manager.shutdown(Duration::from_secs(5)).await;
         assert_eq!(control.resumes.load(Ordering::SeqCst), 0);
+    }
+
+    /// A [`NormalSyncControl`] whose `reload_ledger` (`gate_resume: false`)
+    /// or `resume` (`gate_resume: true`) announces itself on `entered` and
+    /// then blocks until `release`, so a test can land `shutdown()` exactly
+    /// inside the run's hand-back (issue #2121).
+    struct GatedControl {
+        gate_resume: bool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        reloads: AtomicU32,
+        resumes: AtomicU32,
+    }
+
+    impl GatedControl {
+        fn new(gate_resume: bool) -> Arc<Self> {
+            Arc::new(Self {
+                gate_resume,
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+                reloads: AtomicU32::new(0),
+                resumes: AtomicU32::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl NormalSyncControl for GatedControl {
+        async fn pause(&self) {}
+        async fn resume(&self) {
+            if self.gate_resume {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            self.resumes.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn reload_ledger(&self) {
+            if !self.gate_resume {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            self.reloads.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    async fn wait_shutting_down(manager: &LiveCatchupManager) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !manager.is_shutting_down() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "shutdown never started"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A shutdown that lands while a finished run is handing back (here,
+    /// reloading the ledger) must keep the run from resuming the services
+    /// the node is stopping. Before the fix the run had checked the flag
+    /// before the reload and went on to resume them.
+    #[tokio::test]
+    async fn shutdown_during_the_hand_back_skips_the_resume() {
+        let control = GatedControl::new(false);
+        let manager = LiveCatchupManager::new(ImmediateRunner::ok(), control.clone());
+        assert_eq!(
+            manager.start_catchup("1000#deadbeef").await,
+            CatchupStartResult::Created
+        );
+        control.entered.notified().await;
+
+        let shutdown = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.shutdown(Duration::from_secs(5)).await })
+        };
+        wait_shutting_down(&manager).await;
+        control.release.notify_one();
+        shutdown.await.unwrap();
+        // shutdown() returned, and the hand-back is over (the run cleared
+        // its state), without a resume.
+        wait_idle(&manager).await;
+        assert_eq!(control.reloads.load(Ordering::SeqCst), 1);
+        assert_eq!(control.resumes.load(Ordering::SeqCst), 0);
+    }
+
+    /// A shutdown that lands while the run is already resuming the services
+    /// must not return before that resume is over, so the node's teardown
+    /// that follows stops what was resumed. Before the fix the run cleared
+    /// its state first, so shutdown() saw nothing running and returned at
+    /// once, with the resume still in flight.
+    #[tokio::test]
+    async fn shutdown_during_the_resume_waits_for_it() {
+        let control = GatedControl::new(true);
+        let manager = LiveCatchupManager::new(ImmediateRunner::ok(), control.clone());
+        assert_eq!(
+            manager.start_catchup("1000#deadbeef").await,
+            CatchupStartResult::Created
+        );
+        control.entered.notified().await;
+
+        let mut shutdown = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.shutdown(Duration::from_secs(5)).await })
+        };
+        wait_shutting_down(&manager).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown() returned while the resume was still running"
+        );
+        control.release.notify_one();
+        shutdown.await.unwrap();
+        assert_eq!(control.resumes.load(Ordering::SeqCst), 1);
+        assert_eq!(manager.current_catchpoint().await, None);
     }
 
     // -- start_catchup: happy path -----------------------------------------
