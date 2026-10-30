@@ -38,6 +38,13 @@ use cli::{AlgocfgAction, AlgocfgProfileAction, BenchAction, CatchpointAction, Cl
 /// holding the process past a container stop's grace period, which a plain
 /// `Runtime` drop would do (it waits for every blocking thread).
 /// See `live_catchup::LIVE_CATCHUP_SHUTDOWN_TIMEOUT` for the whole budget.
+///
+/// Trade-off: blocking work still running here (an automatic catchpoint
+/// export past its wait, a live catchup's import/verify that did not stop in
+/// time) is abandoned at process exit. Both are built to survive that (the
+/// export is atomic, the sync state is persisted per phase and resumed), but
+/// the work is redone on the next start. Issue #2142 asks whether
+/// `participate` should join such work explicitly instead.
 const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 fn main() -> anyhow::Result<std::process::ExitCode> {

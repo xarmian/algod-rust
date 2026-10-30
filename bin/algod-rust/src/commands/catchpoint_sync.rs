@@ -637,14 +637,14 @@ impl SyncBackend for AlgodSyncBackend {
             return BatchFetch::complete(Vec::new());
         }
 
-        self.runtime.fetch_range(cancel, start, end, async {
+        self.runtime.fetch_range(cancel, |cancel| async move {
             // Rotate across the candidate peers like the single-block
             // path (issue #2095). Size the drain from the source's own
             // timeouts, not a separately constructed default (issue #1755).
             let drain = sync_tuning().drain_budget(self.blocks.worst_case_request_time());
             let source: Arc<dyn BlockSource> = Arc::clone(&self.blocks) as Arc<dyn BlockSource>;
             let fetcher = ParallelBlockFetcher::new(source, concurrency).with_drain_timeout(drain);
-            collect_block_range(&fetcher, start, end, cancel).await
+            collect_block_range(&fetcher, start, end, &cancel).await
         })
     }
 }
@@ -674,58 +674,65 @@ impl BlockingRuntime {
         &self,
         fut: impl std::future::Future<Output = Result<T, AlgoError>>,
     ) -> Result<T, AlgoError> {
-        block_on_until_cancelled(&self.rt, &self.cancel, &self.cancel, fut)
+        block_on_until_cancelled(&self.rt, &self.cancel, fut)
     }
 
-    /// [`Self::block_on`] for a call that also carries its own token
-    /// (`SyncBackend::fetch_block_range`): ends as soon as EITHER the caller's
-    /// token or the backend's fires, so a shutdown that fires only the
-    /// backend's still ends a fetch whose caller passed some other token.
-    fn block_on_with<T>(
-        &self,
-        cancel: &CancellationToken,
-        fut: impl std::future::Future<Output = Result<T, AlgoError>>,
-    ) -> Result<T, AlgoError> {
-        block_on_until_cancelled(&self.rt, &self.cancel, cancel, fut)
-    }
-
-    /// Run a range fetch through [`Self::block_on_with`]: a cancellation that
-    /// ends it before `collect_block_range` reports one itself is reported the
-    /// same way, as a cancelled [`BatchFetch`] (issue #2121).
-    fn fetch_range(
-        &self,
-        cancel: &CancellationToken,
-        start: u64,
-        end: u64,
-        fut: impl std::future::Future<Output = BatchFetch>,
-    ) -> BatchFetch {
-        self.block_on_with(cancel, async { Ok(fut.await) })
-            .unwrap_or_else(|_| BatchFetch::cancelled(Vec::new(), start, end))
+    /// Run a range fetch (`SyncBackend::fetch_block_range`, which carries
+    /// the caller's own token), ending it as soon as EITHER the caller's
+    /// token or the backend's fires (issue #2121). Both reach the fetch as
+    /// one combined token that `collect_block_range` observes itself, so the
+    /// prefix served before the cancellation is kept (issue #1725), rather
+    /// than the fetch being dropped with nothing to show.
+    fn fetch_range<F, Fut>(&self, cancel: &CancellationToken, fetch: F) -> BatchFetch
+    where
+        F: FnOnce(CancellationToken) -> Fut,
+        Fut: std::future::Future<Output = BatchFetch>,
+    {
+        let combined = CancellationToken::new();
+        if cancel.is_cancelled() || self.cancel.is_cancelled() {
+            combined.cancel();
+        }
+        let backend = &self.cancel;
+        tokio::task::block_in_place(|| {
+            self.rt.block_on(async {
+                let forward = async {
+                    tokio::select! {
+                        _ = backend.cancelled() => {}
+                        _ = cancel.cancelled() => {}
+                    }
+                    combined.cancel();
+                    // Then let the fetch observe it and finish with its prefix.
+                    std::future::pending::<BatchFetch>().await
+                };
+                tokio::select! {
+                    result = fetch(combined.clone()) => result,
+                    never = forward => never,
+                }
+            })
+        })
     }
 }
 
 /// Drive `fut` on `rt` from a blocking thread (the sync orchestrator's, or a
 /// lookback prefetch worker), giving up with
-/// [`algo_ledger::sync::cancelled_error`] as soon as either token fires (issue
+/// [`algo_ledger::sync::cancelled_error`] as soon as `cancel` fires (issue
 /// #2121). A node shutdown then ends an in-flight block request at once
 /// instead of waiting out its per-peer timeouts while the runtime is
 /// dropped under it, which is what made the request's timers panic with "A
 /// Tokio 1.x context was found, but it is being shutdown".
 fn block_on_until_cancelled<T>(
     rt: &tokio::runtime::Handle,
-    backend: &CancellationToken,
-    caller: &CancellationToken,
+    cancel: &CancellationToken,
     fut: impl std::future::Future<Output = Result<T, AlgoError>>,
 ) -> Result<T, AlgoError> {
-    if backend.is_cancelled() || caller.is_cancelled() {
+    if cancel.is_cancelled() {
         return Err(algo_ledger::sync::cancelled_error());
     }
     tokio::task::block_in_place(|| {
         rt.block_on(async {
             tokio::select! {
                 biased;
-                _ = backend.cancelled() => Err(algo_ledger::sync::cancelled_error()),
-                _ = caller.cancelled() => Err(algo_ledger::sync::cancelled_error()),
+                _ = cancel.cancelled() => Err(algo_ledger::sync::cancelled_error()),
                 result = fut => result,
             }
         })
@@ -1307,7 +1314,7 @@ impl SyncBackend for GossipSyncBackend {
         // For batch fetches, use the gossip source wrapped as a BlockSource
         // via ParallelBlockFetcher when gossip is available. Fall back to
         // REST-based parallel fetch when in HttpOnly mode.
-        self.runtime.fetch_range(cancel, start, end, async {
+        self.runtime.fetch_range(cancel, |cancel| async move {
             let source: Arc<dyn BlockSource> = match self.policy {
                 BlockSourcePolicy::HttpOnly => {
                     // Use HttpBlockFetcherSource to route through the
@@ -1334,7 +1341,7 @@ impl SyncBackend for GossipSyncBackend {
             };
             let fetcher = ParallelBlockFetcher::new(source, effective_concurrency)
                 .with_drain_timeout(sync_tuning().drain_budget(self.worst_case_round_time));
-            collect_block_range(&fetcher, start, end, cancel).await
+            collect_block_range(&fetcher, start, end, &cancel).await
         })
     }
 }
@@ -2074,7 +2081,7 @@ mod tests {
             let cancel = cancel.clone();
             std::thread::spawn(move || {
                 let started = std::time::Instant::now();
-                let result = block_on_until_cancelled(&handle, &cancel, &no_cancel(), async {
+                let result = block_on_until_cancelled(&handle, &cancel, async {
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     Ok::<_, AlgoError>(())
                 });
@@ -2094,12 +2101,68 @@ mod tests {
         // An already-cancelled token never starts the request.
         let rt = tokio::runtime::Runtime::new().unwrap();
         let ran = std::sync::atomic::AtomicBool::new(false);
-        let result = block_on_until_cancelled(rt.handle(), &no_cancel(), &cancel, async {
+        let result = block_on_until_cancelled(rt.handle(), &cancel, async {
             ran.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok::<_, AlgoError>(())
         });
         assert!(result.is_err());
         assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// `BlockSource` serving rounds `< serve_below` at once and never
+    /// answering for the rest: a peer that stalls mid-range.
+    struct StallingSource {
+        serve_below: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl BlockSource for StallingSource {
+        async fn get_block_raw(&self, _round: Round) -> algo_error::Result<Vec<u8>> {
+            unimplemented!()
+        }
+        async fn get_block(&self, round: Round) -> algo_error::Result<algo_types::BlockResponse> {
+            if round.0 >= self.serve_below {
+                std::future::pending::<()>().await;
+            }
+            Ok(serde_json::from_value(serde_json::json!({"block": {"rnd": round.0}})).unwrap())
+        }
+        async fn get_status(&self) -> algo_error::Result<algo_rest_client::NodeStatus> {
+            unimplemented!()
+        }
+        async fn wait_for_round(
+            &self,
+            _round: Round,
+        ) -> algo_error::Result<algo_rest_client::NodeStatus> {
+            unimplemented!()
+        }
+    }
+
+    /// Issue #2121 / #1725: a range fetch cancelled after k rounds were
+    /// served returns those k rounds, whichever token fired (the caller's or
+    /// the backend's), not an empty batch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_range_fetch_keeps_the_served_prefix() {
+        for fire_backend in [false, true] {
+            let caller = CancellationToken::new();
+            let runtime = BlockingRuntime::current(CancellationToken::new());
+            let to_fire = if fire_backend {
+                runtime.cancel.clone()
+            } else {
+                caller.clone()
+            };
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                to_fire.cancel();
+            });
+            let fetcher = ParallelBlockFetcher::new(Arc::new(StallingSource { serve_below: 4 }), 2);
+            let fetch = runtime.fetch_range(&caller, |cancel| async move {
+                collect_block_range(&fetcher, 1, 10, &cancel).await
+            });
+            let rounds: Vec<u64> = fetch.blocks.iter().map(|(r, _)| *r).collect();
+            assert_eq!(rounds, vec![1, 2, 3], "fire_backend = {fire_backend}");
+            let err = fetch.error.expect("a cancelled range is not complete");
+            assert!(err.to_string().contains("cancelled"), "{err}");
+        }
     }
 
     // -- collect_block_range (issue #1719) ----------------------------------

@@ -344,10 +344,61 @@ fn clear_if_generation(running: &mut Option<RunningCatchup>, generation: u64) {
 /// `start_catchup`'s answer once the node is shutting down.
 const SHUTTING_DOWN: &str = "the node is shutting down";
 
-/// State for the currently-running catchup, if any.
+/// Undoes a reservation whose starter task ends abnormally (a panic in
+/// `pause()`, or the runtime cancelling the task): removes the entry of run
+/// `generation` (only that run's, never a later one's), and if normal sync
+/// was already paused, resumes it, so the manager is never left wedged with
+/// normal sync stopped (issue #2121). The normal paths disarm it.
+struct ReservationGuard {
+    manager: Arc<LiveCatchupManager>,
+    generation: u64,
+    paused: bool,
+    armed: bool,
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        drop(ClearRunningOnDrop {
+            manager: Arc::clone(&self.manager),
+            generation: self.generation,
+            armed: true,
+        });
+        if self.paused && !self.manager.is_shutting_down() {
+            let manager = Arc::clone(&self.manager);
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(async move { manager.control.resume().await });
+            }
+        }
+    }
+}
+
+/// Where a registered catchup is in its lifecycle (issue #2121). Each
+/// phase holds the handle of the task that is doing the work at that point,
+/// joined by [`LiveCatchupManager::shutdown`]; it is `None` once a shutdown
+/// has taken it (and then timed out waiting for it).
+enum Phase {
+    /// `start_catchup` reserved the slot; its starter task is pausing
+    /// normal sync and then spawns the run.
+    Starting(Option<tokio::task::JoinHandle<()>>),
+    /// The [`LiveCatchupManager::drive`] task runs the catchup.
+    Running(Option<tokio::task::JoinHandle<()>>),
+    /// The run itself has ended and the drive task is handing the node back
+    /// to normal sync (reload, sync-round reset, resume). Like go, which
+    /// keeps `catchpointCatchupService` set until
+    /// `SetCatchpointCatchupMode(false)` clears it, the catchup is still
+    /// reported and a new one cannot start until this is done; only
+    /// `abort_catchup` treats it differently (a no-op for this label, since
+    /// the run is over).
+    HandingBack(Option<tokio::task::JoinHandle<()>>),
+}
+
+/// The registered catchup, if any.
 struct RunningCatchup {
-    /// Identifies this run (issue #2121): cleanup only ever removes the entry
-    /// of the run doing it.
+    /// Identifies this run: cleanup only ever removes the entry of the run
+    /// doing it.
     generation: u64,
     catchpoint: String,
     cancel: CancellationToken,
@@ -355,21 +406,7 @@ struct RunningCatchup {
     /// so the run discards its state instead of keeping it for a resume
     /// (issue #2121; go `Abort` vs `Stop`).
     abort: CancellationToken,
-    /// The run itself has ended and [`LiveCatchupManager::drive`] is handing
-    /// the node back to normal sync (reload, sync-round reset, resume). Like
-    /// go, which keeps `catchpointCatchupService` set until
-    /// `SetCatchpointCatchupMode(false)` clears it, the catchup is still
-    /// reported and a new one cannot start until this is done; only
-    /// `abort_catchup` treats it differently (a no-op for this label, since
-    /// the run is over). Issue #2121.
-    handing_back: bool,
-    /// The [`LiveCatchupManager::drive`] task, joined by
-    /// [`LiveCatchupManager::shutdown`] (issue #2121). `None` while
-    /// `start_catchup` is still pausing normal sync (the slot is reserved,
-    /// the task not spawned yet), or once a shutdown took it (`task_taken`).
-    task: Option<tokio::task::JoinHandle<()>>,
-    /// A `shutdown()` took `task` (and then timed out waiting for it).
-    task_taken: bool,
+    phase: Phase,
 }
 
 /// Live catchpoint-catchup mode toggle for a running node.
@@ -405,7 +442,7 @@ pub struct LiveCatchupManager {
     /// does not resume the node's normal sync services (they are being
     /// stopped).
     shutting_down: std::sync::atomic::AtomicBool,
-    /// Source of [`RunningCatchup::generation`].
+    /// Source of `RunningCatchup::generation`.
     next_generation: std::sync::atomic::AtomicU64,
 }
 
@@ -437,10 +474,14 @@ impl LiveCatchupManager {
     /// After this no catchup starts, and a run that ends does not resume the
     /// normal sync services (see [`Self::drive`]).
     ///
+    /// A catchup that is still starting (pausing normal sync) is waited for
+    /// too, within the same timeout, so the teardown that follows never
+    /// races `pause()` on the same services.
+    ///
     /// Returns `false` when the run did not stop cleanly: on a timeout (a
     /// phase that only checks the token between steps, e.g. a catchpoint
-    /// import; the run is then still going, and a later call says so again)
-    /// or when its task failed.
+    /// import, or a pause that does not end; the work is then still going,
+    /// and a later call says so again) or when its task failed.
     /// The caller carries on with its teardown, which is safe because the
     /// catchup writes through its own database connection, never the node's
     /// shared ledger handle or the services torn down next, and once it does
@@ -454,49 +495,52 @@ impl LiveCatchupManager {
     pub async fn shutdown(&self, timeout: std::time::Duration) -> bool {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        // (The lock is only ever held briefly: `start_catchup` releases it
-        // before pausing normal sync.)
-        let task = {
-            let mut guard = self.running.lock().await;
-            match guard.as_mut() {
-                Some(running) => {
-                    running.cancel.cancel();
-                    match running.task.take() {
-                        Some(task) => {
-                            running.task_taken = true;
-                            task
-                        }
-                        // An earlier shutdown() timed out and took the handle:
-                        // that run is still registered, so still going.
-                        None if running.task_taken => return false,
-                        // `start_catchup` is still pausing normal sync; it
-                        // sees `shutting_down` (raised above, before this
-                        // lock) once done and never spawns the run.
-                        None => return true,
-                    }
+        let deadline = tokio::time::Instant::now() + timeout;
+        // (The lock is only ever held briefly: pausing normal sync happens on
+        // the starter task, outside it.)
+        loop {
+            let (starter, task) = {
+                let mut guard = self.running.lock().await;
+                let Some(running) = guard.as_mut() else {
+                    return true;
+                };
+                running.cancel.cancel();
+                let (starter, slot) = match &mut running.phase {
+                    Phase::Starting(slot) => (true, slot),
+                    Phase::Running(slot) | Phase::HandingBack(slot) => (false, slot),
+                };
+                match slot.take() {
+                    Some(task) => (starter, task),
+                    // An earlier shutdown() timed out and took the handle:
+                    // that work is still going.
+                    None => return false,
                 }
-                None => return true,
-            }
-        };
-        match tokio::time::timeout(timeout, task).await {
-            Ok(Ok(())) => true,
-            Ok(Err(e)) if e.is_cancelled() => {
-                // The runtime is going away under it: not a clean stop either.
-                warn!(error = %e, "live catchpoint catchup task was cancelled during shutdown");
-                false
-            }
-            Ok(Err(e)) => {
-                // Not a clean stop: the task panicked (its `running` entry is
-                // cleared by `ClearRunningOnDrop`).
-                tracing::error!(error = %e, "live catchpoint catchup task panicked during shutdown");
-                false
-            }
-            Err(_) => {
-                warn!(
-                    ?timeout,
-                    "live catchpoint catchup did not stop within the shutdown timeout; continuing the shutdown without it"
-                );
-                false
+            };
+            match tokio::time::timeout_at(deadline, task).await {
+                // The starter finished pausing normal sync. It saw
+                // `shutting_down` (raised above, before the lock) and gave up,
+                // or, if it got there first, spawned the run: look again.
+                Ok(Ok(())) if starter => continue,
+                Ok(Ok(())) => return true,
+                Ok(Err(e)) if e.is_cancelled() => {
+                    // The runtime is going away under it: not a clean stop.
+                    warn!(error = %e, "live catchpoint catchup task was cancelled during shutdown");
+                    return false;
+                }
+                Ok(Err(e)) => {
+                    // Not a clean stop: the task panicked (its entry is
+                    // cleared by its drop guard).
+                    tracing::error!(error = %e, "live catchpoint catchup task panicked during shutdown");
+                    return false;
+                }
+                Err(_) => {
+                    warn!(
+                        ?timeout,
+                        starting = starter,
+                        "live catchpoint catchup did not stop within the shutdown timeout; continuing the shutdown without it"
+                    );
+                    return false;
+                }
             }
         }
     }
@@ -536,7 +580,7 @@ impl LiveCatchupManager {
             return CatchupStartResult::StartError(SHUTTING_DOWN.to_string());
         }
         if let Some(running) = guard.as_ref() {
-            // (Also while a finished run hands back, as go answers until
+            // (In every phase, the hand-back included, as go answers until
             // `SetCatchpointCatchupMode(false)` clears its service.)
             if running.catchpoint == catchpoint {
                 return CatchupStartResult::AlreadyInProgress;
@@ -547,24 +591,60 @@ impl LiveCatchupManager {
             ));
         }
 
-        // Reserve the slot (so a concurrent start sees this catchup), then
-        // release the lock before pausing normal sync, which can take a
-        // while: status, abort and shutdown must not wait on it (issue #2121).
+        // Reserve the slot (so a concurrent start sees this catchup) and hand
+        // the slow part, pausing normal sync, to a starter task: status,
+        // abort and shutdown never wait on it (issue #2121), and a caller that
+        // goes away mid-pause (a client disconnect, a request timeout) cannot
+        // leave the slot reserved with normal sync half-paused. The accepted
+        // request completes regardless, as go's `StartCatchup` does.
         let generation = self
             .next_generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let cancel = CancellationToken::new();
         let abort = CancellationToken::new();
+        let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+        let starter = {
+            let manager = Arc::clone(self);
+            let catchpoint = catchpoint.to_string();
+            let (cancel, abort) = (cancel.clone(), abort.clone());
+            tokio::spawn(async move {
+                let outcome = manager
+                    .start_run(generation, catchpoint, cancel, abort)
+                    .await;
+                let _ = outcome_tx.send(outcome);
+            })
+        };
         *guard = Some(RunningCatchup {
             generation,
             catchpoint: catchpoint.to_string(),
-            cancel: cancel.clone(),
-            abort: abort.clone(),
-            handing_back: false,
-            task: None,
-            task_taken: false,
+            cancel,
+            abort,
+            phase: Phase::Starting(Some(starter)),
         });
         drop(guard);
+
+        outcome_rx.await.unwrap_or_else(|_| {
+            CatchupStartResult::StartError(
+                "the catchpoint catchup could not be started".to_string(),
+            )
+        })
+    }
+
+    /// The starter task of run `generation` (issue #2121): pause normal sync,
+    /// then spawn the run, unless the node started shutting down meanwhile.
+    async fn start_run(
+        self: Arc<Self>,
+        generation: u64,
+        catchpoint: String,
+        cancel: CancellationToken,
+        abort: CancellationToken,
+    ) -> CatchupStartResult {
+        let mut reservation = ReservationGuard {
+            manager: Arc::clone(&self),
+            generation,
+            paused: false,
+            armed: true,
+        };
 
         // Pause the node's normal sync loop before starting, mirroring
         // `processStageInactive`'s `updateNodeCatchupMode(true)` call —
@@ -573,6 +653,7 @@ impl LiveCatchupManager {
         // download begins) is the same and simpler to reason about here
         // since `SyncOrchestrator` doesn't expose a mid-run pause hook.
         self.control.pause().await;
+        reservation.paused = true;
 
         // Reset progress counters for the new run — mirrors go building a
         // fresh `CatchpointCatchupStats{}` per `CatchpointCatchupService`
@@ -582,22 +663,21 @@ impl LiveCatchupManager {
         }
 
         // Spawn under the lock, after a final shutdown check: a shutdown
-        // raises its flag before taking the lock, so either it finds the
-        // task here and joins it, or this sees the flag and never starts.
+        // raises its flag before taking the lock, so either it finds the run
+        // here and joins it, or this sees the flag and never starts.
         let mut guard = self.running.lock().await;
-        if self.is_shutting_down() {
+        reservation.armed = false;
+        let ours = guard.as_ref().is_some_and(|r| r.generation == generation);
+        if self.is_shutting_down() || !ours {
             clear_if_generation(&mut guard, generation);
             return CatchupStartResult::StartError(SHUTTING_DOWN.to_string());
         }
-        let manager = Arc::clone(self);
-        let catchpoint_owned = catchpoint.to_string();
+        let manager = Arc::clone(&self);
         let task = tokio::spawn(async move {
-            manager
-                .drive(generation, catchpoint_owned, cancel, abort)
-                .await;
+            manager.drive(generation, catchpoint, cancel, abort).await;
         });
-        if let Some(running) = guard.as_mut().filter(|r| r.generation == generation) {
-            running.task = Some(task);
+        if let Some(running) = guard.as_mut() {
+            running.phase = Phase::Running(Some(task));
         }
         CatchupStartResult::Created
     }
@@ -613,20 +693,25 @@ impl LiveCatchupManager {
         let guard = self.running.lock().await;
         match guard.as_ref() {
             None => Ok(()),
-            // The run already ended (go: `Abort()` on a finished service). A
-            // different label still gets go's error below.
-            Some(running) if running.handing_back && running.catchpoint == catchpoint => Ok(()),
-            Some(running) if running.catchpoint == catchpoint => {
-                // go `Abort()`: the abort flag first, then the cancellation
-                // the run's stages wait on (issue #2121).
-                running.abort.cancel();
-                running.cancel.cancel();
-                Ok(())
-            }
-            Some(running) => Err(format!(
+            Some(running) if running.catchpoint != catchpoint => Err(format!(
                 "unable to abort catchpoint catchup for '{catchpoint}' - already catching up '{}'",
                 running.catchpoint
             )),
+            Some(running) => {
+                match running.phase {
+                    // The run already ended (go: `Abort()` on a finished
+                    // service).
+                    Phase::HandingBack(_) => {}
+                    // go `Abort()`: the abort flag first, then the
+                    // cancellation the run's stages wait on (issue #2121). A
+                    // starting run is spawned with both already fired.
+                    Phase::Starting(_) | Phase::Running(_) => {
+                        running.abort.cancel();
+                        running.cancel.cancel();
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
@@ -804,7 +889,9 @@ impl LiveCatchupManager {
             .as_mut()
             .filter(|r| r.generation == generation)
         {
-            running.handing_back = true;
+            if let Phase::Running(task) = &mut running.phase {
+                running.phase = Phase::HandingBack(task.take());
+            }
         }
         match &result {
             Ok(CatchupOutcome::Complete) => {
@@ -1814,9 +1901,7 @@ mod tests {
             catchpoint: catchpoint.to_string(),
             cancel: CancellationToken::new(),
             abort: CancellationToken::new(),
-            handing_back: false,
-            task: None,
-            task_taken: false,
+            phase: Phase::Running(None),
         }
     }
 
@@ -1883,9 +1968,10 @@ mod tests {
     }
 
     /// Issue #2121: start_catchup no longer holds the lock while it pauses
-    /// normal sync. While the pause is slow, a status read and a shutdown
-    /// answer at once, a second start is refused (the slot is reserved), and
-    /// once the pause ends the shutdown has won: the run is never spawned.
+    /// normal sync. While the pause is slow, a status read answers at once
+    /// and a second start is refused (the slot is reserved). A shutdown
+    /// waits for the pause, inside its timeout, so the teardown never races
+    /// it, and then wins: the run is never spawned.
     #[tokio::test]
     async fn a_slow_pause_blocks_neither_status_nor_shutdown() {
         let control = Arc::new(SlowPauseControl {
@@ -1917,18 +2003,22 @@ mod tests {
             matches!(second, CatchupStartResult::Unable(_)),
             "{second:?}"
         );
-        let stopped = tokio::time::timeout(
-            Duration::from_secs(1),
-            manager.shutdown(Duration::from_secs(5)),
-        )
-        .await
-        .expect("shutdown() blocked behind start_catchup's pause");
-        assert!(
-            stopped,
-            "nothing was spawned yet, so nothing is left running"
-        );
 
+        let mut shutdown = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.shutdown(Duration::from_secs(5)).await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown() must not report a clean stop while the pause still runs"
+        );
         control.release.notify_one();
+        assert!(
+            shutdown.await.unwrap(),
+            "the pause ended and nothing was spawned"
+        );
         assert!(matches!(
             start.await.unwrap(),
             CatchupStartResult::StartError(_)
@@ -1937,6 +2027,67 @@ mod tests {
         assert!(
             !cancel_observed.load(std::sync::atomic::Ordering::SeqCst),
             "the run must never have been spawned"
+        );
+    }
+
+    /// Issue #2121: a pause that never ends makes shutdown() give up at its
+    /// timeout and say the catchup did not stop cleanly.
+    #[tokio::test]
+    async fn shutdown_times_out_on_a_pause_that_never_ends() {
+        let control = Arc::new(SlowPauseControl {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let manager = LiveCatchupManager::new(ImmediateRunner::ok(), control.clone());
+        let _start = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.start_catchup("1000#deadbeef").await })
+        };
+        control.entered.notified().await;
+        let started = std::time::Instant::now();
+        assert!(!manager.shutdown(Duration::from_millis(200)).await);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        // And a later call still says so.
+        assert!(!manager.shutdown(Duration::from_millis(100)).await);
+    }
+
+    /// Issue #2121: a start request dropped mid-pause (a client disconnect,
+    /// a request timeout) does not wedge the manager: the accepted catchup
+    /// still starts once the pause ends, runs, hands back, and the manager
+    /// is free again.
+    #[tokio::test]
+    async fn dropping_the_start_request_mid_pause_does_not_wedge_the_manager() {
+        let control = Arc::new(SlowPauseControl {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let manager = LiveCatchupManager::new(ImmediateRunner::ok(), control.clone());
+        let start = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.start_catchup("1000#deadbeef").await })
+        };
+        control.entered.notified().await;
+        start.abort();
+        assert!(
+            start.await.unwrap_err().is_cancelled(),
+            "the request was dropped"
+        );
+
+        control.release.notify_one();
+        wait_idle(&manager).await;
+        assert_eq!(
+            manager.last_catchpoint(),
+            "1000#deadbeef",
+            "the catchup ran"
+        );
+        control.release.notify_one();
+        assert_eq!(
+            manager.start_catchup("2000#next").await,
+            CatchupStartResult::Created
         );
     }
 

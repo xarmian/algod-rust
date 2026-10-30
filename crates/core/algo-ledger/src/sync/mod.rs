@@ -829,20 +829,27 @@ impl SyncOrchestrator {
     fn handle_cancellation(&self) -> AlgoError {
         tracing::info!(state = %self.state, "persisting checkpoint before shutdown");
         if let Ok(conn) = self.open_db() {
-            if let Err(e) = persist_sync_state(
-                &conn,
-                &self.state,
-                self.resolved_label.as_deref(),
-                self.catchpoint_round,
-                self.catchpoint_file_path
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .as_deref(),
-            ) {
-                tracing::warn!("Failed to persist sync state: {e}");
-            }
+            self.persist_marker(&conn, &self.state.clone());
         }
         cancelled_error()
+    }
+
+    /// Persist the resume marker `state` with this run's label, round and
+    /// catchpoint file (issue #2121: the one place that writes it). Best
+    /// effort: a failure is logged.
+    fn persist_marker(&self, conn: &Connection, state: &SyncState) {
+        if let Err(e) = persist_sync_state(
+            conn,
+            state,
+            self.resolved_label.as_deref(),
+            self.catchpoint_round,
+            self.catchpoint_file_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .as_deref(),
+        ) {
+            tracing::warn!(state = %state, error = %e, "failed to persist the sync state");
+        }
     }
 
     /// Wind up a run the user aborted (issue #2121), mirroring go's
@@ -1172,17 +1179,17 @@ impl SyncOrchestrator {
             "catchpoint file downloaded"
         );
 
-        // Persist state so we can resume after crash.
+        // Persist state so we can resume after crash. A re-download on a
+        // ledger that is already cut over (issue #2121: a rejected snapshot
+        // whose cutover could not be rolled back) keeps a cut-over marker,
+        // naming the new file for the re-import.
         if let Ok(conn) = self.open_db() {
-            if let Err(e) = persist_sync_state(
-                &conn,
-                &SyncState::DownloadingLedger,
-                Some(&label),
-                Some(round),
-                Some(&file_path.to_string_lossy()),
-            ) {
-                tracing::warn!("Failed to persist sync state: {e}");
-            }
+            let state = if self.ledger_cut_over {
+                SyncState::ImportingLedger
+            } else {
+                SyncState::DownloadingLedger
+            };
+            self.persist_marker(&conn, &state);
         }
 
         Ok(())
@@ -1366,18 +1373,7 @@ impl SyncOrchestrator {
         // the full rationale.
 
         // Persist state.
-        if let Err(e) = persist_sync_state(
-            &conn,
-            &SyncState::ImportingLedger,
-            self.resolved_label.as_deref(),
-            self.catchpoint_round,
-            self.catchpoint_file_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .as_deref(),
-        ) {
-            tracing::warn!("Failed to persist sync state: {e}");
-        }
+        self.persist_marker(&conn, &SyncState::ImportingLedger);
 
         self.progress.phase_progress = 1.0;
         self.notify_progress();
@@ -1412,9 +1408,9 @@ impl SyncOrchestrator {
         let Some(backup) = self.cutover_backup.take() else {
             tracing::warn!(
                 reason,
-                "catchpoint verification failed but no in-memory cutover backup is available \
-                 to roll back (likely resumed from a prior process's VerifyingLedger checkpoint) \
-                 — the ledger may still be observably at the new, unverified round"
+                "no in-memory cutover backup is available to roll back ({reason}; likely \
+                 resumed from a prior process's checkpoint) — the ledger may still be \
+                 observably at the new, unverified round"
             );
             return false;
         };
@@ -1428,7 +1424,7 @@ impl SyncOrchestrator {
             tracing::error!(
                 error = %e,
                 reason,
-                "failed to roll back catchpoint cutover after verification failure — \
+                "failed to roll back the catchpoint cutover ({reason}) — \
                  ledger may be left in an inconsistent state"
             );
             return false;
@@ -1479,8 +1475,12 @@ impl SyncOrchestrator {
 
         tracing::warn!(
             reason,
-            "catchpoint cutover rolled back after verification failure — \
-             ledger reverted to its pre-catchup round"
+            restored = if pre_catchup {
+                "the pre-catchup ledger"
+            } else {
+                "an earlier unverified cutover"
+            },
+            "catchpoint cutover rolled back ({reason})"
         );
 
         // Issue #2121: make the resume marker match the restored ledger
@@ -1494,18 +1494,7 @@ impl SyncOrchestrator {
         } else {
             SyncState::ImportingLedger
         };
-        if let Err(e) = persist_sync_state(
-            conn,
-            &marker_state,
-            self.resolved_label.as_deref(),
-            self.catchpoint_round,
-            self.catchpoint_file_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .as_deref(),
-        ) {
-            tracing::warn!(error = %e, "failed to rewrite the sync state after the cutover rollback");
-        }
+        self.persist_marker(conn, &marker_state);
         true
     }
 
@@ -1516,7 +1505,16 @@ impl SyncOrchestrator {
     /// say so, and make the resume marker say so too (`ImportingLedger`,
     /// written after a cutover), so the next catchup re-imports and verifies
     /// it rather than treating the ledger as untouched.
-    fn rollback_after_verify_failure(&mut self, conn: &Connection, reason: &str) {
+    ///
+    /// `rejected_file`: the verification rejected the catchpoint file's
+    /// content itself (a label or hash mismatch), so a resume must never
+    /// re-import it.
+    fn rollback_after_verify_failure(
+        &mut self,
+        conn: &Connection,
+        reason: &str,
+        rejected_file: bool,
+    ) {
         if self.cutover_backup.is_none() {
             // Nothing to roll back (a run resumed past the import): the marker
             // already describes the ledger (e.g. `VerifyingLedger`, so a resume
@@ -1533,22 +1531,27 @@ impl SyncOrchestrator {
         }
         tracing::error!(
             reason,
+            rejected_file,
             "catchpoint verification failed and the cutover could not be rolled back: \
              the ledger is left cut over to the unverified catchpoint without a backup; \
              keeping a resume marker that says so"
         );
-        if let Err(e) = persist_sync_state(
-            conn,
-            &SyncState::ImportingLedger,
-            self.resolved_label.as_deref(),
-            self.catchpoint_round,
-            self.catchpoint_file_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .as_deref(),
-        ) {
-            tracing::warn!(error = %e, "failed to persist the sync state after a failed cutover rollback");
+        if rejected_file {
+            // The ledger holds an untrusted snapshot, and its file must not be
+            // imported again: delete it and record the cutover WITHOUT a file.
+            // A resume at `ImportingLedger` with no file re-downloads first
+            // (see `run_phases`), and the ledger stays recorded as cut over,
+            // so an abort meanwhile keeps the marker rather than discarding a
+            // state it cannot undo.
+            if let Some(path) = self.catchpoint_file_path.take() {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(error = %e, path = %path.display(), "could not remove the rejected catchpoint file");
+                    }
+                }
+            }
         }
+        self.persist_marker(conn, &SyncState::ImportingLedger);
     }
 
     /// Phase 3: Verify the imported ledger (Merkle trie, account totals).
@@ -1575,7 +1578,11 @@ impl SyncOrchestrator {
         let verify_result = match verify_catchpoint(&conn, &block_header_digest) {
             Ok(r) => r,
             Err(e) => {
-                self.rollback_after_verify_failure(&conn, "verify_catchpoint returned an error");
+                self.rollback_after_verify_failure(
+                    &conn,
+                    "verify_catchpoint returned an error",
+                    false,
+                );
                 return Err(AlgoError::Ledger {
                     message: format!("catchpoint verification failed: {e}"),
                 });
@@ -1588,7 +1595,7 @@ impl SyncOrchestrator {
                 "issue #1636 diagnostic: see build_and_persist_trie_chunked's second-rerun \
                  result above for whether this mismatch is deterministic or not"
             );
-            self.rollback_after_verify_failure(&conn, "catchpoint label mismatch");
+            self.rollback_after_verify_failure(&conn, "catchpoint label mismatch", true);
             return Err(AlgoError::Ledger {
                 message: format!(
                     "catchpoint label mismatch: expected '{}', computed '{}'",
@@ -1604,7 +1611,7 @@ impl SyncOrchestrator {
             self.check_label_matches_requested(&verify_result.computed_label, "calculated")
         {
             let had_backup = self.cutover_backup.is_some();
-            self.rollback_after_verify_failure(&conn, "catchpoint hash mismatch");
+            self.rollback_after_verify_failure(&conn, "catchpoint hash mismatch", true);
             if !had_backup {
                 // Resumed from a prior process: nothing to roll back, so the
                 // imported data is still live. Drop the resume marker so a
@@ -1621,7 +1628,7 @@ impl SyncOrchestrator {
         // backup is dropped below so a failure rolls the whole cutover back
         // (the step itself is one transaction and re-runnable on resume).
         if let Err(e) = crate::catchpoint::importer::finish_pre_v8_catchpoint_migration(&conn) {
-            self.rollback_after_verify_failure(&conn, "post-verification migration failed");
+            self.rollback_after_verify_failure(&conn, "post-verification migration failed", false);
             return Err(AlgoError::Ledger {
                 message: format!("post-verification catchpoint migration failed: {e}"),
             });
@@ -3228,6 +3235,11 @@ impl SyncOrchestrator {
             // the resumed phase's `transition()` call validates correctly.
             self.state = match &resume_state {
                 SyncState::DownloadingLedger => SyncState::Idle,
+                // A cut-over ledger whose file was rejected (issue #2121):
+                // re-download before the re-import.
+                SyncState::ImportingLedger if self.catchpoint_file_path.is_none() => {
+                    SyncState::Idle
+                }
                 SyncState::ImportingLedger => SyncState::DownloadingLedger,
                 SyncState::VerifyingLedger => SyncState::ImportingLedger,
                 SyncState::DownloadingLookback => SyncState::VerifyingLedger,
@@ -3237,8 +3249,10 @@ impl SyncOrchestrator {
             self.progress.state = self.state.clone();
         }
 
-        // Phase 1: DownloadingLedger (ordinal 1)
-        if resume_ord <= 1 {
+        // Phase 1: DownloadingLedger (ordinal 1). Also when resuming the import
+        // of a cut-over ledger whose file was rejected (no file to re-import).
+        let redownload = resume_ord == 2 && self.catchpoint_file_path.is_none();
+        if resume_ord <= 1 || redownload {
             self.run_download_ledger()?;
         }
 
@@ -4688,7 +4702,7 @@ mod tests {
                 Some(&file.to_string_lossy()),
             )
             .unwrap();
-            first.rollback_after_verify_failure(&conn, "test verification failure");
+            first.rollback_after_verify_failure(&conn, "test verification failure", false);
             let marker = restore_sync_state(&conn).unwrap().unwrap();
             assert_eq!(
                 marker.state,
@@ -4761,7 +4775,7 @@ mod tests {
         conn.execute_batch("DROP TABLE IF EXISTS acctrounds;")
             .unwrap();
 
-        orchestrator.rollback_after_verify_failure(&conn, "test verification failure");
+        orchestrator.rollback_after_verify_failure(&conn, "test verification failure", false);
         let marker = restore_sync_state(&conn).unwrap().unwrap();
         assert_eq!(marker.state, SyncState::ImportingLedger);
         drop(conn);
@@ -4835,7 +4849,7 @@ mod tests {
     fn a_verify_failure_restoring_an_earlier_cutover_keeps_a_cut_over_marker() {
         let (dir, _file, mut orchestrator) = resumed_reimport(line!());
         let conn = orchestrator.open_db().unwrap();
-        orchestrator.rollback_after_verify_failure(&conn, "test verification failure");
+        orchestrator.rollback_after_verify_failure(&conn, "test verification failure", false);
         assert!(
             orchestrator.cutover_backup.is_none(),
             "the backup was restored"
@@ -4874,9 +4888,145 @@ mod tests {
             None,
         )
         .unwrap();
-        orchestrator.rollback_after_verify_failure(&conn, "transient verify error");
+        orchestrator.rollback_after_verify_failure(&conn, "transient verify error", false);
         let marker = restore_sync_state(&conn).unwrap().unwrap();
         assert_eq!(marker.state, SyncState::VerifyingLedger);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #2121: a hash (or label) mismatch whose rollback fails leaves
+    /// the ledger cut over to an untrusted snapshot. The marker still records
+    /// the cutover (`ImportingLedger`) but no longer names the rejected file,
+    /// which is deleted, so no resume can re-import it.
+    #[test]
+    fn a_rejected_snapshot_whose_rollback_fails_is_never_named_for_a_reimport() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-rejected-snapshot-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("catchpoint-5000.tar.gz");
+        std::fs::write(&file, b"the rejected snapshot").unwrap();
+        let mut orchestrator =
+            SyncOrchestrator::with_backend(test_config(dir.join("ledger"), 1), FakeLookbackBackend);
+        orchestrator.resolved_label = Some("5000#L1".to_string());
+        orchestrator.catchpoint_round = Some(5_000);
+        orchestrator.catchpoint_file_path = Some(file.clone());
+        orchestrator.ledger_cut_over = true;
+        orchestrator.cutover_backup = Some(crate::catchpoint::CutoverBackup::default());
+        orchestrator.cutover_backup_pre_catchup = true;
+        let conn = orchestrator.open_db().unwrap();
+        // No `acctrounds` table: the rollback fails.
+        conn.execute_batch("DROP TABLE IF EXISTS acctrounds;")
+            .unwrap();
+
+        orchestrator.rollback_after_verify_failure(&conn, "catchpoint hash mismatch", true);
+        let marker = restore_sync_state(&conn).unwrap().unwrap();
+        assert_eq!(
+            marker.state,
+            SyncState::ImportingLedger,
+            "still recorded as cut over"
+        );
+        assert_eq!(
+            marker.catchpoint_file, None,
+            "the rejected file must not be named"
+        );
+        assert!(!file.exists(), "the rejected file must be deleted");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A catchpoint source whose download fails, counting the attempts.
+    struct CountingFailedDownloadBackend {
+        downloads: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl SyncBackend for CountingFailedDownloadBackend {
+        fn download_catchpoint(
+            &self,
+            _genesis_id: &str,
+            _round: u64,
+            _dest_path: &std::path::Path,
+        ) -> Result<(), AlgoError> {
+            self.downloads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(AlgoError::Network {
+                message: "simulated unreachable peer".into(),
+            })
+        }
+
+        fn fetch_block_raw(&self, _round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+            Err(AlgoError::Network {
+                message: "not served".into(),
+            })
+        }
+
+        fn fetch_block(&self, _round: u64) -> Result<Block, AlgoError> {
+            unimplemented!("the run stops in the download phase")
+        }
+
+        fn get_current_round(&self) -> Result<u64, AlgoError> {
+            unimplemented!("the run stops in the download phase")
+        }
+
+        fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
+            Ok(None)
+        }
+    }
+
+    /// Issue #2121: resuming such a marker (`ImportingLedger`, no file)
+    /// re-downloads the catchpoint before any re-import, and the marker keeps
+    /// recording the cutover meanwhile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resuming_a_cut_over_marker_without_a_file_redownloads_first() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-resume-no-file-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let downloads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut config = test_config(dir.join("ledger"), 1);
+        config.catchpoint_label =
+            Some("22507000#XJUJGKAUVK2LVO5OWR46UHSDXIZ52VO5BTLJQQHRFCWAXUAIKMOQ".to_string());
+        let mut orchestrator = SyncOrchestrator::with_backend(
+            config,
+            CountingFailedDownloadBackend {
+                downloads: downloads.clone(),
+            },
+        );
+        {
+            let conn = orchestrator.open_db().unwrap();
+            persist_sync_state(
+                &conn,
+                &SyncState::ImportingLedger,
+                Some("22507000#XJUJGKAUVK2LVO5OWR46UHSDXIZ52VO5BTLJQQHRFCWAXUAIKMOQ"),
+                Some(22_507_000),
+                None,
+            )
+            .unwrap();
+        }
+        let err = orchestrator
+            .run()
+            .await
+            .expect_err("the download fails")
+            .to_string();
+        assert_eq!(
+            downloads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the resume must re-download, not re-import (error: {err})"
+        );
+        let conn = orchestrator.open_db().unwrap();
+        let marker = restore_sync_state(&conn).unwrap().unwrap();
+        assert_eq!(
+            marker.state,
+            SyncState::ImportingLedger,
+            "still recorded as cut over"
+        );
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }
