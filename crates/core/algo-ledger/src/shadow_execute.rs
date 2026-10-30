@@ -1016,17 +1016,24 @@ pub(crate) fn proposal_check_probe() -> ExecProbe {
 /// Map a proposal-check evaluation to its [`ProposalCheck`]: when the
 /// evaluation failed on a transaction's prologue (`Alive`, `checkDup` or the
 /// authorizer), that is a verdict (go `Ledger.Validate` fails the block on it), unless the base
-/// moved during the evaluation; everything else as [`payout_check_from`].
+/// moved during the evaluation. The rejection must be of the very transaction
+/// the evaluation failed on: one recorded for a group that was rolled back
+/// is no verdict on a later, unrelated failure. Everything else as
+/// [`payout_check_from`].
 pub(crate) fn proposal_check_from<T>(
     result: Result<T, ScratchFailure>,
     probe: &ExecProbe,
 ) -> ProposalCheck {
     match (&result, &probe.out.dup_violation) {
-        (Err(ScratchFailure::Stale), _) | (Ok(_), _) | (_, None) => payout_check_from(result),
-        (Err(_), Some(violation)) => ProposalCheck::Violation {
-            kind: ViolationKind::Transaction,
-            message: violation.clone(),
-        },
+        (Err(ScratchFailure::Txn { index, .. }), Some((rejected, violation)))
+            if index == rejected =>
+        {
+            ProposalCheck::Violation {
+                kind: ViolationKind::Transaction,
+                message: violation.clone(),
+            }
+        }
+        _ => payout_check_from(result),
     }
 }
 
@@ -2738,5 +2745,43 @@ return
         assert!(!l.admit("p", 10).0);
         assert_eq!(l.take_suppressed(), 2);
         assert_eq!(l.take_suppressed(), 0);
+    }
+
+    /// A prologue rejection is the proposal check's verdict only for the
+    /// transaction the evaluation failed on: one recorded earlier (for a
+    /// group that was rolled back) is no verdict on a later, unrelated
+    /// failure (issue #2127).
+    #[test]
+    fn prologue_violation_is_a_verdict_only_for_the_failing_transaction() {
+        let mut probe = proposal_check_probe();
+        probe.out.dup_violation = Some((3, "transaction already in ledger: X".into()));
+        let fail = |index| -> Result<(), ScratchFailure> {
+            Err(ScratchFailure::Txn {
+                index,
+                error: AlgoError::Ledger {
+                    message: "overspend".into(),
+                },
+            })
+        };
+        assert!(matches!(
+            proposal_check_from(fail(5), &probe),
+            ProposalCheck::NoVerdict { .. }
+        ));
+        assert!(matches!(
+            proposal_check_from(
+                Err::<(), _>(ScratchFailure::Other(AlgoError::Ledger {
+                    message: "end of block".into()
+                })),
+                &probe
+            ),
+            ProposalCheck::NoVerdict { .. }
+        ));
+        assert_eq!(
+            proposal_check_from(fail(3), &probe),
+            ProposalCheck::Violation {
+                kind: ViolationKind::Transaction,
+                message: "transaction already in ledger: X".into(),
+            }
+        );
     }
 }

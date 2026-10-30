@@ -1658,13 +1658,20 @@ pub(crate) fn txn_prologue<S: crate::store_trait::LedgerStore>(
     index: usize,
 ) -> Result<(), AlgoError> {
     let Some(checkdup) = &ctx.checkdup else {
+        // A validating context without the block's `checkDup` state (a
+        // caller that builds its own `ApplyContext`): go's `Alive` and the
+        // authorizer still run; only `checkDup` needs the block's txids.
+        if ctx.validate {
+            crate::check_dup::alive(Round(ctx.round), &ctx.consensus, genesis_rule, stx)?;
+            check_authorizer_for(store, stx, None)?;
+        }
         return Ok(());
     };
     let mut checkdup = checkdup.borrow_mut();
     checkdup.check(store, &ctx.consensus, genesis_rule, stx, index)?;
     let txid = checkdup.txids().get(index).copied();
     if let Err(e) = check_authorizer_for(store, stx, txid) {
-        checkdup.record_violation(&e.to_string());
+        checkdup.record_violation(index, &e.to_string());
         return Err(e);
     }
     Ok(())
@@ -2080,9 +2087,10 @@ pub struct ProbeRequest {
 /// What an apply reports back to its [`ExecProbe`] caller.
 #[derive(Debug, Default, Clone)]
 pub struct ProbeOutput {
-    /// The first `checkDup` rejection when [`ProbeRequest::check_dup`] (or
-    /// validation) ran it: go's error text.
-    pub dup_violation: Option<String>,
+    /// The latest prologue (`Alive` / `checkDup` / authorizer) rejection
+    /// when [`ProbeRequest::check_dup`] (or validation) ran it: the payset
+    /// index it rejected and go's error text.
+    pub dup_violation: Option<(usize, String)>,
     /// Payset index of the transaction whose apply failed. `None` when the
     /// apply did not fail, or failed in a group-level step that no single
     /// transaction owns.
@@ -3078,7 +3086,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         p.out.dup_violation = ctx
             .checkdup
             .as_ref()
-            .and_then(|c| c.borrow().violation().map(str::to_owned));
+            .and_then(|c| c.borrow().violation().map(|(i, m)| (i, m.to_owned())));
         if result.is_ok() {
             p.out.final_txn_counter = ctx.txn_counter.get();
             p.out.final_fees_collected = ctx.fees_collected.get();
@@ -15323,6 +15331,63 @@ return
         assert!(err.to_string().contains("overlapping lease"), "{err}");
         // Neither failed group left its txids or lease behind.
         run(&[&ok], 3).expect("the failed groups' records were rolled back");
+    }
+
+    /// A validating context built without the block's `checkDup` state
+    /// still runs go's `Alive` (and the authorizer): a dead transaction is
+    /// rejected with go's bare text (issue #2127).
+    #[test]
+    fn validating_context_without_checkdup_still_runs_alive() {
+        let fee_sink = Address([3u8; 32]);
+        let (a, b) = (Address([0xA1; 32]), Address([0xB2; 32]));
+        let gh = [0x6E; 32];
+        let mut state =
+            make_state_with_accounts(&[(fee_sink, 0), (a, 10_000_000), (b, 10_000_000)], fee_sink);
+        let mut dead = pay_txn(a, b, 1_000, 1_000);
+        dead.txn.genesis_hash = gh;
+        dead.txn.first_valid = Round(1);
+        dead.txn.last_valid = Round(10);
+        let mut ctx = ApplyContext::new_replay(0, fee_sink, 1172);
+        ctx.consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+        ctx.validate = true;
+        assert!(ctx.checkdup.is_none());
+        let rule = algo_types::genesis_restore::GenesisRestoreRule::unstripped("", &gh);
+        let (mut idx, mut failed) = (0usize, None);
+        let err = apply_group_transactions(
+            &mut state,
+            &[&dead],
+            &ctx,
+            &rule,
+            &mut GroupBudget::new(0),
+            &mut BoxBudgetState::default(),
+            None,
+            None,
+            &mut idx,
+            &mut failed,
+        )
+        .expect_err("a dead transaction is rejected");
+        assert_eq!(err.to_string(), "txn dead: round 1172 outside of 1--10");
+        assert_eq!(failed, Some(0));
+
+        // Without validation nothing is checked (go `Ledger.AddBlock`).
+        ctx.validate = false;
+        let (mut idx, mut failed) = (0usize, None);
+        apply_group_transactions(
+            &mut state,
+            &[&dead],
+            &ctx,
+            &rule,
+            &mut GroupBudget::new(0),
+            &mut BoxBudgetState::default(),
+            None,
+            None,
+            &mut idx,
+            &mut failed,
+        )
+        .expect("replay applies it");
     }
 
     /// go's `endOfBlock` order: voters commitment, online total weight, then

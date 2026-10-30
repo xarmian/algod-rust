@@ -1482,8 +1482,14 @@ impl TransactionPool {
         drop(pending);
 
         let reason = pool_error_from_evaluator(error);
-        self.reeval_counter
-            .record(crate::error::classify_pool_error(&reason));
+        // One count per dropped group, as go's `recomputeBlockEvaluator`
+        // counts each group it drops (`txPoolReevalCounter.Add(tag, 1)`).
+        // No dedicated dev-commit counter: go drops such a group in that
+        // same re-evaluation (`AssembleDevModeBlock`), so it lands here too.
+        let tag = crate::error::classify_pool_error(&reason);
+        for _ in 0..dropped {
+            self.reeval_counter.record(tag);
+        }
         let text = reason.to_string();
         for id in evicted {
             inner.status_cache.put(id, text.clone());

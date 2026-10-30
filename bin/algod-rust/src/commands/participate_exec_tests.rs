@@ -2665,3 +2665,37 @@ fn exec_prologue_alive_rejection_is_bare_like_go() {
         format!("txn dead: round {round} outside of 500--1000")
     );
 }
+
+/// An eviction counts one re-evaluation drop per dropped group, as go's
+/// `recomputeBlockEvaluator` does (issue #2127).
+#[test]
+fn eviction_counts_one_reeval_drop_per_group() {
+    let a = key(1);
+    let b = key(2);
+    let c = key(3);
+    let (_ledger, pool) = fixture(
+        &[
+            (a.0, funded(50_000_000)),
+            (b.0, funded(1_000_000)),
+            (c.0, funded(50_000_000)),
+        ],
+        &[],
+    );
+    let first = leased_pay(&a, b.0, [0x62; 32], 11);
+    let second = leased_pay(&c, b.0, [0x63; 32], 12);
+    pool.remember_one(first.clone()).expect("first");
+    pool.remember_one(second.clone()).expect("second");
+    let reason = algo_error::AlgoError::Ledger {
+        message: "dev-mode commit rejected the group".into(),
+    };
+    let tag =
+        algo_pool::error::classify_pool_error(&algo_pool::PoolError::Evaluator(reason.to_string()));
+    let before = pool.reeval_counter().count(tag);
+    let ids = std::collections::HashSet::from([
+        algo_codec::compute_txn_id(&first.txn),
+        algo_codec::compute_txn_id(&second.txn),
+    ]);
+    assert_eq!(pool.evict_groups(&ids, &reason), 2);
+    assert_eq!(pool.reeval_counter().count(tag), before + 2);
+    assert_eq!(pool.pending_count(), 0);
+}

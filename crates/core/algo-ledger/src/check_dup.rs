@@ -318,7 +318,7 @@ pub fn check_dup<L: LedgerStore + ?Sized>(
 pub struct BlockCheckDup {
     block: BlockDups,
     ledger: LedgerDups,
-    violation: Option<String>,
+    violation: Option<(usize, String)>,
 }
 
 impl BlockCheckDup {
@@ -333,10 +333,11 @@ impl BlockCheckDup {
         }
     }
 
-    /// Record a rejection that follows `checkDup` in go's prologue (the
-    /// authorizer), so the proposal check renders it as a verdict too.
-    pub fn record_violation(&mut self, message: &str) {
-        self.violation.get_or_insert_with(|| message.to_owned());
+    /// Record a rejection of payset transaction `index` that follows
+    /// `checkDup` in go's prologue (the authorizer), so the proposal check
+    /// renders it as a verdict too.
+    pub fn record_violation(&mut self, index: usize, message: &str) {
+        self.violation = Some((index, message.to_owned()));
     }
 
     /// A point [`Self::rollback_to`] can return to (taken before a group).
@@ -377,18 +378,9 @@ impl BlockCheckDup {
                 message: format!("checkDup: no txid for payset index {index}"),
             });
         };
-        let (txn_genesis_id, txn_genesis_hash) = rule.restored_genesis(stx);
-        if let Err(message) = algo_validate::block_alive_with_genesis(
-            self.ledger.round,
-            rule.genesis_id(),
-            rule.genesis_hash(),
-            consensus,
-            &stx.txn,
-            txn_genesis_id,
-            txn_genesis_hash,
-        ) {
-            self.violation.get_or_insert_with(|| message.clone());
-            return Err(typed(message, RejectClass::Alive));
+        if let Err(e) = alive(algo_types::Round(self.ledger.round), consensus, rule, stx) {
+            self.violation = Some((index, e.to_string()));
+            return Err(e);
         }
         if let Err(e) = check_dup(
             store,
@@ -398,19 +390,45 @@ impl BlockCheckDup {
             &self.block,
             &mut self.ledger,
         ) {
-            self.violation.get_or_insert_with(|| e.to_string());
+            self.violation = Some((index, e.to_string()));
             return Err(e);
         }
         self.block.record(&stx.txn, txid);
         Ok(())
     }
 
-    /// The first prologue rejection (`Alive`, `checkDup`, or the authorizer
-    /// via [`Self::record_violation`]), if any (go's text).
+    /// The latest prologue rejection (`Alive`, `checkDup`, or the authorizer
+    /// via [`Self::record_violation`]), if any: the payset index it rejected
+    /// and go's text. A caller turns it into a verdict only when the
+    /// evaluation failed on that same transaction (a rejection of a group
+    /// that was rolled back says nothing about a later failure).
     #[must_use]
-    pub fn violation(&self) -> Option<&str> {
-        self.violation.as_deref()
+    pub fn violation(&self) -> Option<(usize, &str)> {
+        self.violation.as_ref().map(|(i, m)| (*i, m.as_str()))
     }
+}
+
+/// go `BlockHeader.Alive` for `stx` (payset form: `rule`, the block header's
+/// genesis rule, restores its stripped genesis fields) in `round`: the
+/// validity window, then the genesis id and hash. go returns the rejection
+/// bare ([`RejectClass::Alive`]).
+pub fn alive(
+    round: algo_types::Round,
+    consensus: &ConsensusParams,
+    rule: &GenesisRestoreRule<'_>,
+    stx: &algo_types::SignedTransaction,
+) -> Result<(), AlgoError> {
+    let (txn_genesis_id, txn_genesis_hash) = rule.restored_genesis(stx);
+    algo_validate::block_alive_with_genesis(
+        round.0,
+        rule.genesis_id(),
+        rule.genesis_hash(),
+        consensus,
+        &stx.txn,
+        txn_genesis_id,
+        txn_genesis_hash,
+    )
+    .map_err(|message| typed(message, RejectClass::Alive))
 }
 
 /// go's `Alive` then `checkDup` over the WHOLE payset of `block` (stripped
@@ -438,7 +456,7 @@ pub fn prologue_prepass<L: LedgerStore + ?Sized>(
     );
     for (index, stx) in block.payset.iter().enumerate() {
         if check.check(store, &consensus, &rule, stx, index).is_err() {
-            return check.violation().map(str::to_owned);
+            return check.violation().map(|(_, m)| m.to_owned());
         }
     }
     None
