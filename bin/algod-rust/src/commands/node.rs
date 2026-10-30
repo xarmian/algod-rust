@@ -668,7 +668,10 @@ async fn run_start(
     // Issue #2121: stop a live catchpoint catchup first and wait for it, so
     // its block fetches do not outlive the runtime.
     if let Some(mgr) = &catchup_manager {
-        mgr.shutdown(crate::live_catchup::LIVE_CATCHUP_SHUTDOWN_TIMEOUT)
+        // (No export wait follows here; the result only matters to
+        // `participate`.)
+        let _ = mgr
+            .shutdown(crate::live_catchup::LIVE_CATCHUP_SHUTDOWN_TIMEOUT)
             .await;
     }
     let _ = join_handle.await;

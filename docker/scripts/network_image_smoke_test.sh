@@ -29,18 +29,27 @@ fatal_is() {
   if [ "$got" = "$want" ]; then echo "ok: $what"; else echo "FAIL: $what (fatal=$got, want $want)"; fails=$((fails + 1)); fi
 }
 
-# --- external network: relays failed and nothing was ever served
-log "No relay answered with the catchpoint file; leaving the peers to DNS discovery." \
-  " WARN algod_rust::commands::catchpoint_sync: block fetch failed, rotating to the next peer round=5 error=network error: block 5: every candidate peer failed: http://r1: x | http://r2: y"
-class_is external "no relay served the catchpoint or any block"
+# --- external network: transport failures and nothing was ever served
+log "relay de-k4-s1.example:14161: catchpoint file HTTP 000"   "No relay answered with the catchpoint file; leaving the peers to DNS discovery."   " WARN catchpoint_sync: block 5: every candidate peer failed: http://r1: network error: error sending request for url (http://r1/v2/blocks/5): connection refused"
+class_is external "relays unreachable, nothing ever served"
 
-log " WARN catchup: block 9: REST /v2/blocks failed (not found: 404 page not found)"
-class_is external "REST block fetches failing, no progress"
+log " WARN catchpoint_sync: block 9: REST /v2/blocks failed (HTTP 503 Service Unavailable)"
+class_is external "relays answering 5xx, no progress"
 
-# --- node: healthy-run noise alone is not relay evidence
-log " WARN algo_network: WS block fetch failed round=7 error=timeout" \
-  " WARN x: error sending request for url (http://r1:4160/v1/x/block/7)"
-class_is node "only the routine WS warning and a bare 'error sending request'"
+# --- node: a 404 everywhere is what a wrong URL looks like too
+log " WARN catchpoint_sync: block 9: REST /v2/blocks failed (not found: GET /v2/blocks/9?format=msgpack: 404 page not found)"   " WARN catchpoint_sync: block 9: every candidate peer failed: http://r1: not found | http://r2: not found"
+class_is node "404 on every fetch with no progress"
+
+log "relay r1:4160: catchpoint file HTTP 404"   "No relay answered with the catchpoint file; leaving the peers to DNS discovery."
+class_is node "the catchpoint probe got 404 from every relay"
+
+# --- node: the agreement certificate channel is not a TLS certificate
+log " INFO algo_ledger::catchup_service: catchup cert-service: certificate channel closed, exiting"
+class_is node "a healthy-startup certificate line"
+
+# --- node: the routine WS warning alone is not relay evidence
+log " WARN algo_network: WS block fetch failed round=7 error=request timed out"
+class_is node "only the routine WS warning"
 
 # --- node: relays served something, so a stall is the node's
 log " INFO algo_ledger::catchup_service: catchup service: periodic sync advanced the ledger from=1 to=229" \

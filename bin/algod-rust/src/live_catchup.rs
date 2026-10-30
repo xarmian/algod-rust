@@ -263,12 +263,32 @@ pub trait CatchupRunner: Send + Sync {
 /// Every blocking request ends at once on cancel; this bounds a phase that
 /// only checks the token between steps (a catchpoint import, say).
 ///
-/// Shutdown budget against the image smoke's 20 s `docker stop` limit (the
-/// steps run one after another): this 5 s, then participate's
-/// `REST_SHUTDOWN_HARD_CAP` (5 s), then `main`'s `RUNTIME_SHUTDOWN_TIMEOUT`
-/// (3 s): 13 s in the worst case, and normally well under a second, since a
-/// cancelled catchup returns at once. (An in-flight automatic catchpoint
-/// export, which a catching-up node does not run, has its own 30 s wait.)
+/// # Shutdown budget
+///
+/// `participate`'s shutdown runs these waits one after another:
+///
+/// | step | bound |
+/// |---|---|
+/// | this catchup stop | 5 s |
+/// | the REST server drain (`REST_SHUTDOWN_HARD_CAP`) | 5 s |
+/// | an in-flight automatic catchpoint export (`CATCHPOINT_EXPORT_SHUTDOWN_TIMEOUT`) | 30 s |
+/// | `main`'s runtime drop (`RUNTIME_SHUTDOWN_TIMEOUT`) | 3 s |
+///
+/// - Normal case, the image smoke's included: well under a second. A
+///   cancelled catchup returns at once, the REST drain is immediate, and no
+///   export is pending (the export wait returns at once when none is).
+/// - A live catchup that does not stop in time (a phase that checks the
+///   token only between steps): 5 + 5 + 3 = 13 s, inside the smoke's 20 s
+///   `docker stop` limit. `participate` skips the export wait then (see
+///   [`LiveCatchupManager::shutdown`]), and the abandoned run's
+///   import/verify keeps running through the remaining teardown on its own
+///   database connection until `main`'s runtime drop ends the process: a
+///   crash as far as its sync state goes, which the next start resumes.
+/// - A pending automatic export: only a node in normal sync runs one, so
+///   the catchup step is instant: at most 5 + 30 + 3 = 38 s. That pre-dates
+///   issue #2121 (issue #794) and lets the newest catchpoint land; its
+///   writes are atomic, so a container runtime that kills earlier leaves no
+///   corrupt file.
 pub const LIVE_CATCHUP_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// State for the currently-running catchup, if any.
@@ -279,6 +299,11 @@ struct RunningCatchup {
     /// so the run discards its state instead of keeping it for a resume
     /// (issue #2121; go `Abort` vs `Stop`).
     abort: CancellationToken,
+    /// The run itself has ended and [`LiveCatchupManager::drive`] is handing
+    /// the node back to normal sync (reload, sync-round reset, resume). Not
+    /// reported as catching up any more, and no new catchup can start until
+    /// it is done (issue #2121).
+    handing_back: bool,
     /// The [`LiveCatchupManager::drive`] task, joined by
     /// [`LiveCatchupManager::shutdown`] (issue #2121).
     task: Option<tokio::task::JoinHandle<()>>,
@@ -346,16 +371,19 @@ impl LiveCatchupManager {
     /// After this no catchup starts, and a run that ends does not resume the
     /// normal sync services (see [`Self::drive`]).
     ///
-    /// On a timeout (a phase that only checks the token between steps, e.g.
-    /// a catchpoint import) this logs and returns, and the caller carries on
-    /// with its teardown regardless. That is safe: the catchup writes through
-    /// its own database connection, never the node's shared ledger handle or
-    /// the services torn down next, and once it does stop it does not resume
-    /// them. The bounded runtime shutdown in `main` then ends the process
-    /// with the run abandoned mid-phase, which is a crash as far as the sync
-    /// state is concerned: the orchestrator persists that state per phase
-    /// and resumes from it on the next start.
-    pub async fn shutdown(&self, timeout: std::time::Duration) {
+    /// Returns `false` on a timeout (a phase that only checks the token
+    /// between steps, e.g. a catchpoint import): the run is then still going.
+    /// The caller carries on with its teardown, which is safe because the
+    /// catchup writes through its own database connection, never the node's
+    /// shared ledger handle or the services torn down next, and once it does
+    /// stop it does not resume them. The one step that should not overlap it
+    /// is waiting for a catchpoint export of the ledger the import is
+    /// replacing, so `participate` skips that wait on `false`. The bounded
+    /// runtime shutdown in `main` then ends the process with the run
+    /// abandoned mid-phase, which is a crash as far as the sync state is
+    /// concerned: the orchestrator persists that state per phase and resumes
+    /// from it on the next start.
+    pub async fn shutdown(&self, timeout: std::time::Duration) -> bool {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let task = {
@@ -369,14 +397,16 @@ impl LiveCatchupManager {
             }
         };
         let Some(task) = task else {
-            return;
+            return true;
         };
         if tokio::time::timeout(timeout, task).await.is_err() {
             warn!(
                 ?timeout,
                 "live catchpoint catchup did not stop within the shutdown timeout; continuing the shutdown without it"
             );
+            return false;
         }
+        true
     }
 
     fn is_shutting_down(&self) -> bool {
@@ -414,6 +444,16 @@ impl LiveCatchupManager {
             return CatchupStartResult::StartError("the node is shutting down".to_string());
         }
         if let Some(running) = guard.as_ref() {
+            // The previous run has ended but is still handing the node back
+            // to normal sync: this request is neither in progress nor can it
+            // start yet. go's `CatchpointUnableToStartError` (400) says so;
+            // `AlreadyInProgress` (200) would silently drop it.
+            if running.handing_back {
+                return CatchupStartResult::Unable(format!(
+                    "unable to start catchpoint catchup for '{catchpoint}' - already catching up '{}'",
+                    running.catchpoint
+                ));
+            }
             if running.catchpoint == catchpoint {
                 return CatchupStartResult::AlreadyInProgress;
             }
@@ -454,6 +494,7 @@ impl LiveCatchupManager {
             catchpoint: catchpoint.to_string(),
             cancel,
             abort,
+            handing_back: false,
             task: Some(task),
         });
         CatchupStartResult::Created
@@ -470,6 +511,8 @@ impl LiveCatchupManager {
         let guard = self.running.lock().await;
         match guard.as_ref() {
             None => Ok(()),
+            // The run already ended (go: `Abort()` on a finished service).
+            Some(running) if running.handing_back => Ok(()),
             Some(running) if running.catchpoint == catchpoint => {
                 // go `Abort()`: the abort flag first, then the cancellation
                 // the run's stages wait on (issue #2121).
@@ -491,6 +534,7 @@ impl LiveCatchupManager {
             .lock()
             .await
             .as_ref()
+            .filter(|r| !r.handing_back)
             .map(|r| r.catchpoint.clone())
     }
 
@@ -622,6 +666,11 @@ impl LiveCatchupManager {
             .runner
             .run(&catchpoint, cancel, abort, Arc::clone(&self.counters))
             .await;
+        // The run is over: stop reporting it, refuse new catchups until the
+        // hand-back below is done (issue #2121).
+        if let Some(running) = self.running.lock().await.as_mut() {
+            running.handing_back = true;
+        }
         match &result {
             Ok(CatchupOutcome::Complete) => {
                 info!(catchpoint = %catchpoint, "live catchpoint catchup completed");
@@ -1207,7 +1256,8 @@ mod tests {
     async fn wait_idle(manager: &LiveCatchupManager) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if manager.current_catchpoint().await.is_none() {
+            // Fully idle: the hand-back is over too.
+            if manager.running.lock().await.is_none() {
                 return;
             }
             assert!(
@@ -1238,7 +1288,7 @@ mod tests {
             CatchupStartResult::Created
         );
 
-        manager.shutdown(Duration::from_secs(5)).await;
+        assert!(manager.shutdown(Duration::from_secs(5)).await);
 
         // Joined, not merely signalled: the run already returned.
         assert!(cancel_observed.load(std::sync::atomic::Ordering::SeqCst));
@@ -1375,11 +1425,14 @@ mod tests {
         assert_eq!(manager.current_catchpoint().await, None);
     }
 
-    /// The hand-back holds no lock: while it is in progress (here, a slow
-    /// ledger reload), `GET /v2/status`'s `current_catchpoint()` and
-    /// `abort_catchup` still answer at once.
+    /// The hand-back holds no lock and has its own state: while it is in
+    /// progress (here, a slow ledger reload), `GET /v2/status`'s
+    /// `current_catchpoint()` answers at once and no longer reports the
+    /// finished run, `start_catchup` answers at once with go's "unable to
+    /// start" error instead of a false "already in progress", and
+    /// `abort_catchup` answers at once.
     #[tokio::test]
-    async fn status_and_abort_answer_promptly_during_the_hand_back() {
+    async fn status_start_and_abort_answer_promptly_during_the_hand_back() {
         let control = GatedControl::new(false);
         let manager = LiveCatchupManager::new(ImmediateRunner::ok(), control.clone());
         assert_eq!(
@@ -1391,7 +1444,20 @@ mod tests {
         let status = tokio::time::timeout(Duration::from_secs(1), manager.current_catchpoint())
             .await
             .expect("current_catchpoint() blocked behind the hand-back");
-        assert_eq!(status.as_deref(), Some("1000#deadbeef"));
+        // The run is over: no longer reported as catching up.
+        assert_eq!(status, None);
+        // A new request is refused (go's 400 CatchpointUnableToStartError),
+        // not reported as already in progress and silently dropped.
+        let started = tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.start_catchup("1000#deadbeef"),
+        )
+        .await
+        .expect("start_catchup() blocked behind the hand-back");
+        assert!(
+            matches!(started, CatchupStartResult::Unable(_)),
+            "{started:?}"
+        );
         tokio::time::timeout(
             Duration::from_secs(1),
             manager.abort_catchup("1000#deadbeef"),
@@ -1403,6 +1469,11 @@ mod tests {
         control.release.notify_one();
         wait_idle(&manager).await;
         assert_eq!(control.resumes.load(Ordering::SeqCst), 1);
+        // Once handed back, the catchup can start again.
+        assert_eq!(
+            manager.start_catchup("1000#deadbeef").await,
+            CatchupStartResult::Created
+        );
     }
 
     /// shutdown() waits for a slow hand-back only within its own timeout
@@ -1419,12 +1490,16 @@ mod tests {
         control.entered.notified().await;
 
         let started = std::time::Instant::now();
-        tokio::time::timeout(
+        let stopped = tokio::time::timeout(
             Duration::from_secs(5),
             manager.shutdown(Duration::from_millis(200)),
         )
         .await
         .expect("shutdown() overran its own timeout behind the hand-back");
+        assert!(
+            !stopped,
+            "a timed-out shutdown must say the run is still going"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "shutdown() took {:?} with a 200 ms timeout",

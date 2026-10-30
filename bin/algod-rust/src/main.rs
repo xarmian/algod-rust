@@ -44,9 +44,17 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let result = runtime.block_on(async_main());
+    // A panic out of `async_main` would otherwise unwind through the
+    // `Runtime` drop, which waits with no limit: bound that shutdown too, then
+    // resume the panic (issue #2121).
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async_main())
+    }));
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
-    result
+    match result {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 async fn async_main() -> anyhow::Result<std::process::ExitCode> {

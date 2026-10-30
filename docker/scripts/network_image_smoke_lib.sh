@@ -19,22 +19,26 @@ smoke_fatal_panics() {
 
 # Lines that prove a relay served the node something.
 SMOKE_PROGRESS_RE="catchpoint download complete|periodic sync advanced the ledger|lookback blocks downloaded|catchpoint import complete"
-# Lines that say a relay refused or failed to serve. Deliberately not the
-# routine `WS block fetch failed` warning nor a bare `error sending request`:
-# both appear in healthy runs.
-SMOKE_RELAY_ERROR_RE="No relay answered with the catchpoint file|every candidate peer failed|REST /v2/blocks failed|catchpoint connect |catchpoint GET |lookback block download failed"
+# Lines that show a TRANSPORT-level failure reaching a relay: refused or
+# timed-out connections, DNS and TLS errors, 5xx answers, and the
+# entrypoint's probe getting no HTTP answer (000) or a 5xx. Deliberately not
+# a 404 or "every candidate peer failed": a node bug that builds a wrong URL
+# gets those too. Matched after dropping the routine `WS block fetch failed`
+# warning, which healthy runs log.
+SMOKE_RELAY_ERROR_RE="error sending request|connection refused|connection reset|operation timed out|connection timed out|dns error|failed to lookup address|tls handshake|invalid peer certificate|HTTP 5[0-9][0-9]|status(: | code )5[0-9][0-9]|catchpoint file HTTP (000|5[0-9][0-9])"
 
 # smoke_failure_class <log>: print `external` when <log> is strong evidence
 # that the relays, not the node, failed the run: no fatal panic, not a single
-# successful catchpoint/block fetch or ledger advance, and at least one relay
-# failure. Anything else, ambiguous cases included, prints `node`.
+# successful catchpoint/block fetch or ledger advance, and at least one
+# transport-level relay failure. Anything else prints `node`, ambiguous cases
+# included: a 404 on every fetch with no progress is a node failure.
 smoke_failure_class() {
   local log="$1"
   if [ -n "$(smoke_fatal_panics "$log")" ]; then
     echo node
   elif grep -aqE "$SMOKE_PROGRESS_RE" "$log" 2>/dev/null; then
     echo node
-  elif grep -aqE "$SMOKE_RELAY_ERROR_RE" "$log" 2>/dev/null; then
+  elif grep -av "WS block fetch failed" "$log" 2>/dev/null | grep -aqiE "$SMOKE_RELAY_ERROR_RE"; then
     echo external
   else
     echo node

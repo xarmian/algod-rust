@@ -637,8 +637,10 @@ impl SyncBackend for AlgodSyncBackend {
             return BatchFetch::complete(Vec::new());
         }
 
-        tokio::task::block_in_place(|| {
-            self.runtime.rt.block_on(async {
+        // A cancellation that ends the call before `collect_block_range`
+        // reports one itself is reported the same way (issue #2121).
+        self.runtime
+            .block_on_with(cancel, async {
                 // Rotate across the candidate peers like the single-block
                 // path (issue #2095). Size the drain from the source's own
                 // timeouts, not a separately constructed default (issue #1755).
@@ -646,9 +648,9 @@ impl SyncBackend for AlgodSyncBackend {
                 let source: Arc<dyn BlockSource> = Arc::clone(&self.blocks) as Arc<dyn BlockSource>;
                 let fetcher =
                     ParallelBlockFetcher::new(source, concurrency).with_drain_timeout(drain);
-                collect_block_range(&fetcher, start, end, cancel).await
+                Ok(collect_block_range(&fetcher, start, end, cancel).await)
             })
-        })
+            .unwrap_or_else(|_| BatchFetch::cancelled(Vec::new(), start, end))
     }
 }
 
@@ -672,12 +674,22 @@ impl BlockingRuntime {
     }
 
     /// Run `fut` from the (blocking) sync thread, ending it with a
-    /// cancellation error as soon as the token fires.
+    /// cancellation error as soon as the backend's token fires.
     fn block_on<T>(
         &self,
         fut: impl std::future::Future<Output = Result<T, AlgoError>>,
     ) -> Result<T, AlgoError> {
-        block_on_until_cancelled(&self.rt, &self.cancel, fut)
+        self.block_on_with(&self.cancel, fut)
+    }
+
+    /// [`Self::block_on`] with an explicit token, for a call that carries its
+    /// own (`SyncBackend::fetch_block_range`).
+    fn block_on_with<T>(
+        &self,
+        cancel: &CancellationToken,
+        fut: impl std::future::Future<Output = Result<T, AlgoError>>,
+    ) -> Result<T, AlgoError> {
+        block_on_until_cancelled(&self.rt, cancel, fut)
     }
 }
 
@@ -1282,8 +1294,10 @@ impl SyncBackend for GossipSyncBackend {
         // For batch fetches, use the gossip source wrapped as a BlockSource
         // via ParallelBlockFetcher when gossip is available. Fall back to
         // REST-based parallel fetch when in HttpOnly mode.
-        tokio::task::block_in_place(|| {
-            self.runtime.rt.block_on(async {
+        // A cancellation that ends the call before `collect_block_range`
+        // reports one itself is reported the same way (issue #2121).
+        self.runtime
+            .block_on_with(cancel, async {
                 let source: Arc<dyn BlockSource> = match self.policy {
                     BlockSourcePolicy::HttpOnly => {
                         // Use HttpBlockFetcherSource to route through the
@@ -1312,9 +1326,9 @@ impl SyncBackend for GossipSyncBackend {
                 };
                 let fetcher = ParallelBlockFetcher::new(source, effective_concurrency)
                     .with_drain_timeout(sync_tuning().drain_budget(self.worst_case_round_time));
-                collect_block_range(&fetcher, start, end, cancel).await
+                Ok(collect_block_range(&fetcher, start, end, cancel).await)
             })
-        })
+            .unwrap_or_else(|_| BatchFetch::cancelled(Vec::new(), start, end))
     }
 }
 

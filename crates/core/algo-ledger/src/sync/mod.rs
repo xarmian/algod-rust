@@ -626,6 +626,15 @@ pub struct SyncOrchestrator {
     backend: Box<dyn SyncBackend>,
     /// Path where the downloaded catchpoint file is stored.
     catchpoint_file_path: Option<PathBuf>,
+    /// Where the download phase writes the catchpoint file, set BEFORE the
+    /// download starts (issue #2121): an abort mid-download removes the
+    /// partial file (and its `.tmp`), which `catchpoint_file_path`, set only
+    /// on success, cannot name.
+    catchpoint_download_path: Option<PathBuf>,
+    /// The import's atomic cutover replaced the live tables (in this run, or
+    /// in the earlier run this one resumed past the import). From then on an
+    /// abort can only undo it through `cutover_backup` (issue #2121).
+    ledger_cut_over: bool,
     /// Parsed catchpoint label round (== `blocks_round`, the round of the
     /// block whose header digest anchors the label — used for block/lookback
     /// downloads, which need the actual block round, not the account
@@ -713,6 +722,8 @@ impl SyncOrchestrator {
             progress: SyncProgress::default(),
             backend: Box::new(backend),
             catchpoint_file_path: None,
+            catchpoint_download_path: None,
+            ledger_cut_over: false,
             catchpoint_round: None,
             cached_catchpoint_block: None,
             balances_round: None,
@@ -797,11 +808,10 @@ impl SyncOrchestrator {
     }
 
     /// Persist checkpoint and return a cancellation error.
+    ///
+    /// Persisted for an abort too: `run` then discards it, unless the
+    /// catchpoint is already applied (see [`Self::stop_aborted_catchup`]).
     fn handle_cancellation(&self) -> AlgoError {
-        // An abort discards the state instead (`discard_aborted_catchup`).
-        if self.abort.is_cancelled() {
-            return cancelled_error();
-        }
         tracing::info!(state = %self.state, "persisting checkpoint before shutdown");
         if let Ok(conn) = self.open_db() {
             if let Err(e) = persist_sync_state(
@@ -820,18 +830,42 @@ impl SyncOrchestrator {
         cancelled_error()
     }
 
-    /// Discard an aborted catchup's on-disk state (issue #2121), mirroring
-    /// go's `abort` -> `ResetStagingBalances`: the resume marker (so no later
-    /// run resumes this catchpoint), the staging tables and the downloaded
-    /// catchpoint file. Best-effort: a failure is logged, and the next import
-    /// drops and recreates the staging tables anyway.
-    fn discard_aborted_catchup(&mut self) {
+    /// Wind up a run the user aborted (issue #2121), mirroring go's
+    /// `CatchpointCatchupService`: an abort is effective only until its
+    /// `Switch` stage applies the catchpoint to the live ledger (`abort` ->
+    /// `ResetStagingBalances` discards the staging data; nothing can undo a
+    /// completed switch). Here the import's atomic cutover applies it early,
+    /// so:
+    /// - before the cutover: discard the resume marker, the staging tables
+    ///   and the downloaded (or partially downloaded) catchpoint file, so a
+    ///   later catchup, for this label or another, starts fresh;
+    /// - after the cutover, while its backup still exists (verification not
+    ///   finished): roll the cutover back, restoring the pre-catchup ledger,
+    ///   then discard as above;
+    /// - once the cutover is final (verified, or applied by an earlier
+    ///   process): the ledger already holds the catchpoint, so discarding
+    ///   would strand it unverified and without its lookback blocks. Keep
+    ///   the marker instead, exactly like a node shutdown, so the next
+    ///   catchup resumes and finishes it.
+    ///
+    /// Returns the error `run` reports.
+    fn stop_aborted_catchup(&mut self) -> AlgoError {
+        if self.ledger_cut_over && self.cutover_backup.is_none() {
+            tracing::warn!(
+                state = %self.state,
+                "catchpoint catchup aborted after the catchpoint was applied to the ledger:                  keeping its state so the next catchup resumes it (go only aborts before its                  switch stage)"
+            );
+            return cancelled_error();
+        }
         tracing::info!(
             state = %self.state,
             "catchpoint catchup aborted: discarding its resume marker and staging data"
         );
         match self.open_db() {
             Ok(conn) => {
+                if self.cutover_backup.is_some() {
+                    self.rollback_cutover_on_failure(&conn, "catchpoint catchup aborted");
+                }
                 if let Err(e) = clear_sync_state(&conn) {
                     tracing::warn!(error = %e, "aborted catchup: could not clear the resume marker");
                 }
@@ -841,12 +875,22 @@ impl SyncOrchestrator {
             }
             Err(e) => tracing::warn!(error = %e, "aborted catchup: could not open the database"),
         }
-        if let Some(path) = self.catchpoint_file_path.take() {
-            if let Err(e) = std::fs::remove_file(&path) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(error = %e, path = %path.display(), "aborted catchup: could not remove the catchpoint file");
+        let files = [
+            self.catchpoint_file_path.take(),
+            self.catchpoint_download_path.take(),
+        ];
+        for path in files.into_iter().flatten() {
+            // the file and the downloader's partial `.tmp` next to it
+            for p in [path.with_extension("tmp"), path] {
+                if let Err(e) = std::fs::remove_file(&p) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(error = %e, path = %p.display(), "aborted catchup: could not remove a catchpoint file");
+                    }
                 }
             }
+        }
+        AlgoError::Ledger {
+            message: "catchpoint catchup aborted by user".to_string(),
         }
     }
 
@@ -1062,6 +1106,7 @@ impl SyncOrchestrator {
         }
         let genesis_id = &self.config.genesis_id;
 
+        self.catchpoint_download_path = Some(file_path.clone());
         let downloaded = self
             .backend
             .download_catchpoint(genesis_id, round, &file_path);
@@ -1232,6 +1277,7 @@ impl SyncOrchestrator {
         // (verify succeeded) or roll it back (verify failed) — see
         // `Self::cutover_backup`'s docs and issue #1633.
         self.cutover_backup = Some(import_result.cutover_backup);
+        self.ledger_cut_over = true;
 
         tracing::info!(
             round,
@@ -1349,6 +1395,7 @@ impl SyncOrchestrator {
             );
             return;
         }
+        self.ledger_cut_over = false;
 
         // The synthesized header row `initialize_meta_from_catchpoint` wrote
         // is specific to this import attempt (its own `ON CONFLICT DO
@@ -1825,7 +1872,9 @@ impl SyncOrchestrator {
         // Use download_lookback_blocks_with_lookback with callbacks that
         // bridge to the backend, passing the (possibly state-proof-extended)
         // `lookback` computed above.
-        let prefetch_fetch = |rnd: u64| {
+        // One fetch for the prefetch workers and the consumer: never starts
+        // a request once the token has fired.
+        let fetch_unless_cancelled = |rnd: u64| {
             if cancel.is_cancelled() {
                 return Err(cancelled_error());
             }
@@ -1833,7 +1882,7 @@ impl SyncOrchestrator {
         };
         let download_result = std::thread::scope(|scope| {
             for _ in 0..lookback_prefetch::PREFETCH_WORKERS {
-                scope.spawn(|| prefetch.run_worker(&prefetch_fetch));
+                scope.spawn(|| prefetch.run_worker(&fetch_unless_cancelled));
             }
             let result = crate::catchpoint::download_lookback_blocks_with_lookback(
                 round,
@@ -1858,10 +1907,7 @@ impl SyncOrchestrator {
                         consecutive_fetch_failures = 0;
                         return Ok(prefetched);
                     }
-                    if cancel.is_cancelled() {
-                        return Err(CatchpointError::Cancelled);
-                    }
-                    match backend.fetch_block_raw(rnd) {
+                    match fetch_unless_cancelled(rnd) {
                         Ok(block) => {
                             consecutive_fetch_failures = 0;
                             Ok(block)
@@ -2721,10 +2767,7 @@ impl SyncOrchestrator {
         // Issue #2121: a user abort ends the catchup for good (go `abort`);
         // a shutdown leaves its marker for the next start to resume.
         if result.is_err() && self.abort.is_cancelled() {
-            self.discard_aborted_catchup();
-            result = Err(AlgoError::Ledger {
-                message: "catchpoint catchup aborted by user".to_string(),
-            });
+            result = Err(self.stop_aborted_catchup());
         }
 
         match &result {
@@ -3061,6 +3104,8 @@ impl SyncOrchestrator {
         // so we skip phases whose transitions have already been completed.
         let resume_ord = phase_ordinal(&resume_state);
 
+        // Resumed past the import: an earlier process already cut over.
+        self.ledger_cut_over = resume_ord > 2;
         if resume_ord > 0 {
             tracing::info!(
                 resume_state = %resume_state,
@@ -4215,20 +4260,115 @@ mod tests {
         assert!(file_exists, "a shutdown must keep the catchpoint file");
     }
 
-    /// Issue #2121, go `Abort()` -> `abort` -> `ResetStagingBalances`: a
-    /// user abort discards the resume marker, the staging tables and the
-    /// downloaded file, so a later catchup (for any label) starts fresh
-    /// instead of resuming L1.
+    /// Issue #2121: an abort that lands after the import's cutover was
+    /// finalized (here: a run resumed at the lookback phase, so an earlier
+    /// process cut over and verified) cannot be undone, as go's abort cannot
+    /// undo its Switch stage. Discarding would strand the applied catchpoint
+    /// unverified and without its lookback blocks, so it is kept, like a
+    /// shutdown, for the next catchup to resume.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn aborting_a_catchup_discards_its_resume_marker_and_staging() {
+    async fn aborting_after_the_cutover_keeps_the_resume_marker() {
         let (err, marker, staging, file_exists) = stop_a_resumed_catchup(true, line!()).await;
-        assert!(err.contains("aborted"), "{err}");
-        assert!(
-            marker.is_none(),
-            "an aborted catchup must leave nothing to resume: {marker:?}"
+        assert!(err.contains("cancelled"), "{err}");
+        let marker = marker.expect("an abort after the cutover must keep the resume marker");
+        assert_eq!(marker.state, SyncState::DownloadingLookback);
+        assert_eq!(marker.catchpoint_label.as_deref(), Some("5000#L1"));
+        assert!(staging);
+        assert!(file_exists);
+    }
+
+    /// A catchpoint source aborted mid-download: it has written part of the
+    /// file to the downloader's `.tmp` path when the user aborts.
+    struct AbortedDuringDownloadBackend {
+        abort: CancellationToken,
+        cancel: CancellationToken,
+    }
+
+    impl SyncBackend for AbortedDuringDownloadBackend {
+        fn download_catchpoint(
+            &self,
+            _genesis_id: &str,
+            _round: u64,
+            dest_path: &std::path::Path,
+        ) -> Result<(), AlgoError> {
+            std::fs::write(dest_path.with_extension("tmp"), b"partial").unwrap();
+            self.abort.cancel();
+            self.cancel.cancel();
+            Err(cancelled_error())
+        }
+
+        fn fetch_block_raw(&self, _round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+            Err(AlgoError::Network {
+                message: "not served".into(),
+            })
+        }
+
+        fn fetch_block(&self, _round: u64) -> Result<Block, AlgoError> {
+            unimplemented!("the run stops in the download phase")
+        }
+
+        fn get_current_round(&self) -> Result<u64, AlgoError> {
+            unimplemented!("the run stops in the download phase")
+        }
+
+        fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
+            Ok(None)
+        }
+    }
+
+    /// Issue #2121, go `Abort()` -> `abort` -> `ResetStagingBalances`: a
+    /// user abort before the cutover discards everything: the resume marker
+    /// (so a later catchup, for any label, starts fresh instead of resuming
+    /// this one), the staging tables and the partially downloaded file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborting_during_the_download_discards_the_marker_staging_and_partial_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-abort-download-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cancel = CancellationToken::new();
+        let abort = CancellationToken::new();
+        let mut config = test_config(dir.join("ledger"), 1);
+        config.catchpoint_label =
+            Some("22507000#XJUJGKAUVK2LVO5OWR46UHSDXIZ52VO5BTLJQQHRFCWAXUAIKMOQ".to_string());
+        let mut orchestrator = SyncOrchestrator::with_backend(
+            config,
+            AbortedDuringDownloadBackend {
+                abort: abort.clone(),
+                cancel: cancel.clone(),
+            },
         );
+        orchestrator.set_cancel(cancel);
+        orchestrator.set_abort(abort);
+        {
+            let conn = orchestrator.open_db().unwrap();
+            conn.execute_batch("CREATE TABLE catchpointbalances (address BLOB);")
+                .unwrap();
+        }
+        let partial = dir.join("catchpoint-22507000.tar.tmp");
+
+        let err = orchestrator
+            .run()
+            .await
+            .expect_err("an aborted catchup must not succeed")
+            .to_string();
+        assert!(err.contains("aborted"), "{err}");
+        assert!(!partial.exists(), "the partial download must be removed");
+        let conn = orchestrator.open_db().unwrap();
+        assert!(restore_sync_state(&conn).unwrap().is_none());
+        let staging: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE name = 'catchpointbalances'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert!(!staging, "an abort must drop the staging tables");
-        assert!(!file_exists, "an abort must remove the catchpoint file");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Issue #2121: the lookback retry backoff waits on the token, so a
