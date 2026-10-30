@@ -7029,12 +7029,17 @@ pub async fn run(
         None => true,
     };
 
-    // Stop the agreement service first, then the catchup service (mirrors
-    // Go's shutdown order where the agreement service is stopped before the
-    // catchup service, ensuring no new certificates are sent after the
-    // catchup service shuts down). `ParticipateAgreementControl::pause`
-    // (issue #940) does exactly this ordering internally; a no-op if a live
-    // catchpoint catchup has already paused it.
+    // Order, against go's `AlgorandFullNode.Stop` (node/node.go): go stops
+    // the network, then EITHER the catchpoint catchup service (when one is
+    // running: agreement and the catchup service do not run then) OR, in
+    // normal operation, agreement before the catchup service (so no new
+    // certificates are sent after the catchup service shuts down). Here the
+    // live catchup was stopped above, first (issue #2121), which is go's
+    // first branch: while it runs, agreement is already paused by
+    // `ParticipateAgreementControl` (issue #940). So the `pause()` below only
+    // does real work in the normal-operation case, where it stops the
+    // agreement service and then the catchup service in go's order (and is a
+    // no-op if a live catchup already paused it).
     agreement_control.pause().await;
     pool_follower_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = pool_follower.join();

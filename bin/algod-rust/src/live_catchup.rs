@@ -301,6 +301,9 @@ pub const LIVE_CATCHUP_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Durati
 /// #2121). It never clears blindly: only an entry that is still this run's
 /// (same generation) is removed, so a later run registered meanwhile is left
 /// alone. The normal exit path clears the entry itself and disarms this.
+///
+/// Note: this frees the manager but does not resume normal sync after such
+/// a panic; that gap is tracked in #2140.
 struct ClearRunningOnDrop {
     manager: Arc<LiveCatchupManager>,
     generation: u64,
@@ -318,18 +321,33 @@ impl Drop for ClearRunningOnDrop {
         if !self.armed {
             return;
         }
-        let generation = self.generation;
-        if let Ok(mut running) = self.manager.running.try_lock() {
-            clear_if_generation(&mut running, generation);
-        } else {
-            // Someone holds the lock for a moment: clear it right after, still
-            // only if the entry is this run's.
-            let manager = Arc::clone(&self.manager);
-            if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                rt.spawn(async move {
-                    clear_if_generation(&mut *manager.running.lock().await, generation);
-                });
-            }
+        clear_running(&self.manager, self.generation);
+    }
+}
+
+/// Remove the `running` entry of run `generation` from a drop guard, which
+/// cannot await: directly when the lock is free, otherwise on the runtime
+/// right after, and with no runtime (a guard dropped after it was shut down)
+/// by blocking on the lock, which is safe off a runtime and logged. Only that
+/// run's entry is ever removed (issue #2121).
+fn clear_running(manager: &Arc<LiveCatchupManager>, generation: u64) {
+    if let Ok(mut running) = manager.running.try_lock() {
+        clear_if_generation(&mut running, generation);
+        return;
+    }
+    match tokio::runtime::Handle::try_current() {
+        Ok(rt) => {
+            let manager = Arc::clone(manager);
+            rt.spawn(async move {
+                clear_if_generation(&mut *manager.running.lock().await, generation);
+            });
+        }
+        Err(_) => {
+            tracing::error!(
+                generation,
+                "clearing a live catchup's registration with no runtime: blocking on the lock"
+            );
+            clear_if_generation(&mut manager.running.blocking_lock(), generation);
         }
     }
 }
@@ -345,14 +363,15 @@ fn clear_if_generation(running: &mut Option<RunningCatchup>, generation: u64) {
 const SHUTTING_DOWN: &str = "the node is shutting down";
 
 /// Undoes a reservation whose starter task ends abnormally (a panic in
-/// `pause()`, or the runtime cancelling the task): removes the entry of run
-/// `generation` (only that run's, never a later one's), and if normal sync
-/// was already paused, resumes it, so the manager is never left wedged with
-/// normal sync stopped (issue #2121). The normal paths disarm it.
+/// `pause()`, or the runtime cancelling the task, mid-pause included):
+/// removes the entry of run `generation` (only that run's, never a later
+/// one's), and resumes normal sync, so the manager is never left wedged with
+/// normal sync stopped (issue #2121). `resume()` is idempotent ("a no-op if
+/// it's already running"), so it runs even when the pause never completed. The
+/// normal paths disarm it.
 struct ReservationGuard {
     manager: Arc<LiveCatchupManager>,
     generation: u64,
-    paused: bool,
     armed: bool,
 }
 
@@ -361,16 +380,19 @@ impl Drop for ReservationGuard {
         if !self.armed {
             return;
         }
-        drop(ClearRunningOnDrop {
-            manager: Arc::clone(&self.manager),
-            generation: self.generation,
-            armed: true,
-        });
-        if self.paused && !self.manager.is_shutting_down() {
-            let manager = Arc::clone(&self.manager);
-            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+        clear_running(&self.manager, self.generation);
+        if self.manager.is_shutting_down() {
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                let manager = Arc::clone(&self.manager);
                 rt.spawn(async move { manager.control.resume().await });
             }
+            Err(_) => tracing::error!(
+                generation = self.generation,
+                "a live catchup's starter ended abnormally with no runtime: normal sync was not resumed"
+            ),
         }
     }
 }
@@ -642,7 +664,6 @@ impl LiveCatchupManager {
         let mut reservation = ReservationGuard {
             manager: Arc::clone(&self),
             generation,
-            paused: false,
             armed: true,
         };
 
@@ -653,7 +674,6 @@ impl LiveCatchupManager {
         // download begins) is the same and simpler to reason about here
         // since `SyncOrchestrator` doesn't expose a mid-run pause hook.
         self.control.pause().await;
-        reservation.paused = true;
 
         // Reset progress counters for the new run — mirrors go building a
         // fresh `CatchpointCatchupStats{}` per `CatchpointCatchupService`
@@ -2088,6 +2108,63 @@ mod tests {
         assert_eq!(
             manager.start_catchup("2000#next").await,
             CatchupStartResult::Created
+        );
+    }
+
+    /// A [`NormalSyncControl`] whose `pause` announces itself and never
+    /// returns, and which counts `resume` calls.
+    struct StuckPauseControl {
+        entered: tokio::sync::Notify,
+        resumed: tokio::sync::Notify,
+        resumes: AtomicU32,
+    }
+
+    #[async_trait]
+    impl NormalSyncControl for StuckPauseControl {
+        async fn pause(&self) {
+            self.entered.notify_one();
+            std::future::pending::<()>().await;
+        }
+        async fn resume(&self) {
+            self.resumes.fetch_add(1, Ordering::SeqCst);
+            self.resumed.notify_one();
+        }
+    }
+
+    /// Issue #2121: a starter that dies mid-pause (here: aborted, as when the
+    /// runtime cancels it) frees the manager AND resumes normal sync, even
+    /// though its `pause()` never returned (a half-done pause may have
+    /// stopped services already; `resume()` is idempotent).
+    #[tokio::test]
+    async fn a_starter_aborted_mid_pause_resumes_normal_sync() {
+        let control = Arc::new(StuckPauseControl {
+            entered: tokio::sync::Notify::new(),
+            resumed: tokio::sync::Notify::new(),
+            resumes: AtomicU32::new(0),
+        });
+        let manager = LiveCatchupManager::new(ImmediateRunner::ok(), control.clone());
+        let _start = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.start_catchup("1000#deadbeef").await })
+        };
+        control.entered.notified().await;
+        // Take the starter task's handle (as `shutdown()` does) and abort it.
+        let starter = {
+            let mut guard = manager.running.lock().await;
+            match guard.as_mut().map(|r| &mut r.phase) {
+                Some(Phase::Starting(slot)) => slot.take().expect("a starting entry has a handle"),
+                _ => panic!("expected a starting catchup"),
+            }
+        };
+        starter.abort();
+        tokio::time::timeout(Duration::from_secs(5), control.resumed.notified())
+            .await
+            .expect("normal sync was not resumed after the starter died mid-pause");
+        assert_eq!(control.resumes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            manager.current_catchpoint().await,
+            None,
+            "the slot was freed"
         );
     }
 

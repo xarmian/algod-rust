@@ -645,8 +645,12 @@ pub struct SyncOrchestrator {
     /// snapshots the earlier process's unverified cutover, so restoring it
     /// does not make the ledger pre-catchup again.
     cutover_backup_pre_catchup: bool,
-    /// The lookback retry backoff, `lookback_retry_backoff_ms` by default;
-    /// tests substitute a non-zero one (issue #2121).
+    /// The lookback retry backoff, `lookback_retry_backoff_ms` by default
+    /// (250 ms doubling, capped at 5 s). It is the test seam for the retry
+    /// loop: a test that drives `run_download_lookback` against a failing
+    /// backend MUST set it (to `|_| 0` for speed, or a long delay to test
+    /// cancellation during the backoff), or it waits out real backoffs
+    /// (issue #2121).
     lookback_retry_backoff: fn(u32) -> u64,
     /// Parsed catchpoint label round (== `blocks_round`, the round of the
     /// block whose header digest anchors the label — used for block/lookback

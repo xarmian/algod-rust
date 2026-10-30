@@ -725,15 +725,15 @@ fn block_on_until_cancelled<T>(
     cancel: &CancellationToken,
     fut: impl std::future::Future<Output = Result<T, AlgoError>>,
 ) -> Result<T, AlgoError> {
-    if cancel.is_cancelled() {
-        return Err(algo_ledger::sync::cancelled_error());
-    }
     tokio::task::block_in_place(|| {
         rt.block_on(async {
             tokio::select! {
+                // Biased toward completion: work that already finished is kept
+                // even when the token has fired too, not discarded as
+                // cancelled (a download that completed is a download).
                 biased;
-                _ = cancel.cancelled() => Err(algo_ledger::sync::cancelled_error()),
                 result = fut => result,
+                _ = cancel.cancelled() => Err(algo_ledger::sync::cancelled_error()),
             }
         })
     })
@@ -2098,15 +2098,20 @@ mod tests {
             elapsed < std::time::Duration::from_secs(5),
             "the request outlived the cancellation: {elapsed:?}"
         );
-        // An already-cancelled token never starts the request.
+        // An already-cancelled token ends a request that has not finished
+        // at once, but keeps one that already has (biased toward completion).
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let ran = std::sync::atomic::AtomicBool::new(false);
-        let result = block_on_until_cancelled(rt.handle(), &cancel, async {
-            ran.store(true, std::sync::atomic::Ordering::SeqCst);
+        let pending = block_on_until_cancelled(rt.handle(), &cancel, async {
+            std::future::pending::<()>().await;
             Ok::<_, AlgoError>(())
         });
-        assert!(result.is_err());
-        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(pending.is_err());
+        let ready = block_on_until_cancelled(rt.handle(), &cancel, async { Ok::<_, AlgoError>(7) });
+        assert_eq!(
+            ready.unwrap(),
+            7,
+            "a finished request must not be discarded as cancelled"
+        );
     }
 
     /// `BlockSource` serving rounds `< serve_below` at once and never
