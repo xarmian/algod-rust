@@ -302,8 +302,9 @@ pub const LIVE_CATCHUP_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Durati
 /// (same generation) is removed, so a later run registered meanwhile is left
 /// alone. The normal exit path clears the entry itself and disarms this.
 ///
-/// Note: this frees the manager but does not resume normal sync after such
-/// a panic; that gap is tracked in #2140.
+/// It also resumes normal sync (like [`ReservationGuard`]), unless the node
+/// is shutting down: after a panic in the hand-back the services the catchup
+/// paused would otherwise stay paused until a restart (closes #2140).
 struct ClearRunningOnDrop {
     manager: Arc<LiveCatchupManager>,
     generation: u64,
@@ -322,6 +323,27 @@ impl Drop for ClearRunningOnDrop {
             return;
         }
         clear_running(&self.manager, self.generation);
+        resume_after_abnormal_exit(&self.manager, self.generation, "a live catchup's task");
+    }
+}
+
+/// Resume normal sync from a drop guard (which cannot await), unless the node
+/// is shutting down: `resume()` is idempotent, so it is safe whether or not
+/// the pause or the hand-back got that far. Without a runtime this cannot
+/// run, which is logged (issue #2121).
+fn resume_after_abnormal_exit(manager: &Arc<LiveCatchupManager>, generation: u64, who: &str) {
+    if manager.is_shutting_down() {
+        return;
+    }
+    match tokio::runtime::Handle::try_current() {
+        Ok(rt) => {
+            let manager = Arc::clone(manager);
+            rt.spawn(async move { manager.control.resume().await });
+        }
+        Err(_) => tracing::error!(
+            generation,
+            "{who} ended abnormally with no runtime: normal sync was not resumed"
+        ),
     }
 }
 
@@ -381,19 +403,7 @@ impl Drop for ReservationGuard {
             return;
         }
         clear_running(&self.manager, self.generation);
-        if self.manager.is_shutting_down() {
-            return;
-        }
-        match tokio::runtime::Handle::try_current() {
-            Ok(rt) => {
-                let manager = Arc::clone(&self.manager);
-                rt.spawn(async move { manager.control.resume().await });
-            }
-            Err(_) => tracing::error!(
-                generation = self.generation,
-                "a live catchup's starter ended abnormally with no runtime: normal sync was not resumed"
-            ),
-        }
+        resume_after_abnormal_exit(&self.manager, self.generation, "a live catchup's starter");
     }
 }
 
@@ -466,6 +476,11 @@ pub struct LiveCatchupManager {
     shutting_down: std::sync::atomic::AtomicBool,
     /// Source of `RunningCatchup::generation`.
     next_generation: std::sync::atomic::AtomicU64,
+    /// A catchup completed successfully just as shutdown began, so its
+    /// hand-back (which reloads the node's ledger handle) was skipped: the
+    /// handle is stale against the cut-over ledger on disk. `shutdown()` then
+    /// reports an unclean stop, and `participate` skips the export wait.
+    ledger_stale_at_shutdown: std::sync::atomic::AtomicBool,
 }
 
 impl LiveCatchupManager {
@@ -482,6 +497,7 @@ impl LiveCatchupManager {
             sync_round_reset: StdMutex::new(None),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             next_generation: std::sync::atomic::AtomicU64::new(1),
+            ledger_stale_at_shutdown: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -499,6 +515,10 @@ impl LiveCatchupManager {
     /// A catchup that is still starting (pausing normal sync) is waited for
     /// too, within the same timeout, so the teardown that follows never
     /// races `pause()` on the same services.
+    ///
+    /// Also `false` when a catchup completed as shutdown began: its hand-back,
+    /// including the reload of the node's ledger handle, was skipped, so that
+    /// handle is stale.
     ///
     /// Returns `false` when the run did not stop cleanly: on a timeout (a
     /// phase that only checks the token between steps, e.g. a catchpoint
@@ -524,7 +544,7 @@ impl LiveCatchupManager {
             let (starter, task) = {
                 let mut guard = self.running.lock().await;
                 let Some(running) = guard.as_mut() else {
-                    return true;
+                    return self.clean_stop();
                 };
                 running.cancel.cancel();
                 let (starter, slot) = match &mut running.phase {
@@ -543,7 +563,7 @@ impl LiveCatchupManager {
                 // `shutting_down` (raised above, before the lock) and gave up,
                 // or, if it got there first, spawned the run: look again.
                 Ok(Ok(())) if starter => continue,
-                Ok(Ok(())) => return true,
+                Ok(Ok(())) => return self.clean_stop(),
                 Ok(Err(e)) if e.is_cancelled() => {
                     // The runtime is going away under it: not a clean stop.
                     warn!(error = %e, "live catchpoint catchup task was cancelled during shutdown");
@@ -569,6 +589,21 @@ impl LiveCatchupManager {
 
     fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// `shutdown()`'s "stopped cleanly" answer once the work has ended: not
+    /// when a completed catchup left the node's ledger handle stale.
+    fn clean_stop(&self) -> bool {
+        let stale = self
+            .ledger_stale_at_shutdown
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if stale {
+            warn!(
+                "a live catchpoint catchup completed as shutdown began; the node's ledger handle \
+                 is stale against the cut-over ledger (the reload was skipped)"
+            );
+        }
+        !stale
     }
 
     /// Attach a [`SyncRoundResetHook`] so a finished catchup resets the
@@ -686,7 +721,12 @@ impl LiveCatchupManager {
         // raises its flag before taking the lock, so either it finds the run
         // here and joins it, or this sees the flag and never starts.
         let mut guard = self.running.lock().await;
-        reservation.armed = false;
+        //
+        // The reservation guard stays armed on every path but the one that
+        // spawns the run, so a refusal here undoes the pause: it frees the
+        // slot and, unless the node is shutting down (which stops those
+        // services itself, in go's order, so resuming them first would only
+        // race the teardown), resumes normal sync.
         let ours = guard.as_ref().is_some_and(|r| r.generation == generation);
         if self.is_shutting_down() || !ours {
             clear_if_generation(&mut guard, generation);
@@ -696,6 +736,7 @@ impl LiveCatchupManager {
         let task = tokio::spawn(async move {
             manager.drive(generation, catchpoint, cancel, abort).await;
         });
+        reservation.armed = false;
         if let Some(running) = guard.as_mut() {
             running.phase = Phase::Running(Some(task));
         }
@@ -961,7 +1002,22 @@ impl LiveCatchupManager {
         //
         // Node shutdown: the services `resume()` would restart are being
         // stopped, so only clear the running state.
+        //
+        // `reload_ledger` is skipped too, deliberately: it reopens the ledger,
+        // folds a possibly multi-GB WAL back into the database files and
+        // re-primes and unpauses the transaction pool, which is far too heavy
+        // (and wrong) work for a teardown that has a few seconds. So when the
+        // run COMPLETED, i.e. the cut-over ledger on disk is ahead of the
+        // node's handle, record that, and `shutdown()` reports it as an
+        // unclean stop: `participate` then skips the catchpoint-export wait
+        // instead of waiting on the stale pre-cutover handle. A run that was
+        // merely cancelled needs no reload for that (its ledger is resumed on
+        // the next start).
         if self.is_shutting_down() {
+            if result.is_ok() {
+                self.ledger_stale_at_shutdown
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             clear_if_generation(&mut *self.running.lock().await, generation);
             clear_running.disarm();
             return;
@@ -2166,6 +2222,188 @@ mod tests {
             None,
             "the slot was freed"
         );
+    }
+
+    /// A [`NormalSyncControl`] whose `reload_ledger` panics, and which counts
+    /// reloads and resumes.
+    struct PanickingReloadCountingControl {
+        reloads: AtomicU32,
+        resumes: AtomicU32,
+        resumed: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl NormalSyncControl for PanickingReloadCountingControl {
+        async fn pause(&self) {}
+        async fn resume(&self) {
+            self.resumes.fetch_add(1, Ordering::SeqCst);
+            self.resumed.notify_one();
+        }
+        async fn reload_ledger(&self) {
+            self.reloads.fetch_add(1, Ordering::SeqCst);
+            panic!("reload bug");
+        }
+    }
+
+    /// Issue #2121 / #2140: a panic in the hand-back (here, in `reload_ledger`)
+    /// frees the slot AND resumes normal sync, once, instead of leaving
+    /// the services the catchup paused paused until a restart.
+    #[tokio::test]
+    async fn a_hand_back_panic_still_resumes_normal_sync_and_frees_the_slot() {
+        let control = Arc::new(PanickingReloadCountingControl {
+            reloads: AtomicU32::new(0),
+            resumes: AtomicU32::new(0),
+            resumed: tokio::sync::Notify::new(),
+        });
+        let manager = LiveCatchupManager::new(ImmediateRunner::ok(), control.clone());
+        assert_eq!(
+            manager.start_catchup("1000#deadbeef").await,
+            CatchupStartResult::Created
+        );
+        tokio::time::timeout(Duration::from_secs(5), control.resumed.notified())
+            .await
+            .expect("normal sync was not resumed after the hand-back panicked");
+        wait_idle(&manager).await;
+        assert_eq!(control.reloads.load(Ordering::SeqCst), 1);
+        assert_eq!(control.resumes.load(Ordering::SeqCst), 1);
+    }
+
+    /// A [`CatchupRunner`] that waits for the cancellation and then reports
+    /// the catchup COMPLETE: a run that finishes just as shutdown begins.
+    struct CompletesOnCancelRunner;
+
+    #[async_trait]
+    impl CatchupRunner for CompletesOnCancelRunner {
+        async fn run(
+            &self,
+            _catchpoint: &str,
+            cancel: CancellationToken,
+            _abort: CancellationToken,
+            _counters: Arc<StdMutex<CatchpointCounters>>,
+        ) -> anyhow::Result<CatchupOutcome> {
+            cancel.cancelled().await;
+            Ok(CatchupOutcome::Complete)
+        }
+    }
+
+    /// Issue #2121: a catchup that completes just as shutdown begins leaves
+    /// the node's ledger handle stale (the reload is deliberately skipped, as
+    /// is the resume), so shutdown() reports an unclean stop and participate
+    /// skips the catchpoint-export wait. A merely cancelled run is still a
+    /// clean stop.
+    #[tokio::test]
+    async fn a_catchup_completing_as_shutdown_begins_reports_a_stale_ledger() {
+        let control = Arc::new(CountingControl::default());
+        let manager = LiveCatchupManager::new(Arc::new(CompletesOnCancelRunner), control.clone());
+        assert_eq!(
+            manager.start_catchup("1000#deadbeef").await,
+            CatchupStartResult::Created
+        );
+        assert!(
+            !manager.shutdown(Duration::from_secs(5)).await,
+            "a completed catchup leaves a stale ledger handle: not a clean stop"
+        );
+        assert_eq!(
+            control.reloads.load(Ordering::SeqCst),
+            0,
+            "no heavy reload at shutdown"
+        );
+        assert_eq!(control.resumes.load(Ordering::SeqCst), 0, "and no resume");
+        // Said again by a later call.
+        assert!(!manager.shutdown(Duration::from_millis(100)).await);
+    }
+
+    /// A [`NormalSyncControl`] whose `pause` waits for `release`, counting
+    /// pauses and resumes.
+    struct GatedPauseCountingControl {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        resumes: AtomicU32,
+        resumed: tokio::sync::Notify,
+    }
+
+    impl GatedPauseCountingControl {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+                resumes: AtomicU32::new(0),
+                resumed: tokio::sync::Notify::new(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl NormalSyncControl for GatedPauseCountingControl {
+        async fn pause(&self) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        async fn resume(&self) {
+            self.resumes.fetch_add(1, Ordering::SeqCst);
+            self.resumed.notify_one();
+        }
+    }
+
+    /// Issue #2121: when the starter finds, after its pause completed, that
+    /// its slot is no longer its own, it refuses AND undoes the pause by
+    /// resuming normal sync, rather than leaving it paused.
+    #[tokio::test]
+    async fn a_starter_whose_slot_was_lost_resumes_normal_sync() {
+        let control = GatedPauseCountingControl::new();
+        let cancel_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let manager = LiveCatchupManager::new(
+            Arc::new(BlockingRunner {
+                cancel_observed: cancel_observed.clone(),
+            }),
+            control.clone(),
+        );
+        let start = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.start_catchup("1000#deadbeef").await })
+        };
+        control.entered.notified().await;
+        // The slot is cleared behind the starter's back.
+        *manager.running.lock().await = None;
+        control.release.notify_one();
+
+        assert!(matches!(
+            start.await.unwrap(),
+            CatchupStartResult::StartError(_)
+        ));
+        tokio::time::timeout(Duration::from_secs(5), control.resumed.notified())
+            .await
+            .expect("the paused normal sync was not resumed");
+        assert_eq!(control.resumes.load(Ordering::SeqCst), 1);
+        assert!(!cancel_observed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// Issue #2121: when shutdown wins the race against a starter whose pause
+    /// completed, the starter refuses and does NOT resume: the teardown
+    /// stops those services itself, and resuming them first would only race
+    /// it. The run is never spawned.
+    #[tokio::test]
+    async fn a_starter_losing_to_shutdown_neither_runs_nor_resumes() {
+        let control = GatedPauseCountingControl::new();
+        let manager = LiveCatchupManager::new(ImmediateRunner::ok(), control.clone());
+        let start = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.start_catchup("1000#deadbeef").await })
+        };
+        control.entered.notified().await;
+        let shutdown = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.shutdown(Duration::from_secs(5)).await })
+        };
+        wait_shutting_down(&manager).await;
+        control.release.notify_one();
+        assert!(shutdown.await.unwrap());
+        assert!(matches!(
+            start.await.unwrap(),
+            CatchupStartResult::StartError(_)
+        ));
+        assert_eq!(control.resumes.load(Ordering::SeqCst), 0);
+        assert_eq!(manager.current_catchpoint().await, None);
     }
 
     // -- start_catchup: happy path -----------------------------------------
