@@ -295,29 +295,60 @@ pub trait CatchupRunner: Send + Sync {
 ///   corrupt file.
 pub const LIVE_CATCHUP_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Clears [`LiveCatchupManager`]'s `running` when [`LiveCatchupManager::drive`]
-/// ends by any path, a panic in its hand-back included, so the manager is
-/// never left wedged "catching up" (issue #2121).
-struct ClearRunningOnDrop(Arc<LiveCatchupManager>);
+/// Clears [`LiveCatchupManager`]'s `running` entry for run `generation` when
+/// [`LiveCatchupManager::drive`] ends by an abnormal path (a panic in its
+/// hand-back), so the manager is never left wedged "catching up" (issue
+/// #2121). It never clears blindly: only an entry that is still this run's
+/// (same generation) is removed, so a later run registered meanwhile is left
+/// alone. The normal exit path clears the entry itself and disarms this.
+struct ClearRunningOnDrop {
+    manager: Arc<LiveCatchupManager>,
+    generation: u64,
+    armed: bool,
+}
+
+impl ClearRunningOnDrop {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
 
 impl Drop for ClearRunningOnDrop {
     fn drop(&mut self) {
-        if let Ok(mut running) = self.0.running.try_lock() {
-            *running = None;
+        if !self.armed {
+            return;
+        }
+        let generation = self.generation;
+        if let Ok(mut running) = self.manager.running.try_lock() {
+            clear_if_generation(&mut running, generation);
         } else {
-            // Someone holds the lock for a moment: clear it right after.
-            let manager = Arc::clone(&self.0);
+            // Someone holds the lock for a moment: clear it right after, still
+            // only if the entry is this run's.
+            let manager = Arc::clone(&self.manager);
             if let Ok(rt) = tokio::runtime::Handle::try_current() {
                 rt.spawn(async move {
-                    *manager.running.lock().await = None;
+                    clear_if_generation(&mut *manager.running.lock().await, generation);
                 });
             }
         }
     }
 }
 
+/// Remove `running`'s entry only if it belongs to run `generation`.
+fn clear_if_generation(running: &mut Option<RunningCatchup>, generation: u64) {
+    if running.as_ref().is_some_and(|r| r.generation == generation) {
+        *running = None;
+    }
+}
+
+/// `start_catchup`'s answer once the node is shutting down.
+const SHUTTING_DOWN: &str = "the node is shutting down";
+
 /// State for the currently-running catchup, if any.
 struct RunningCatchup {
+    /// Identifies this run (issue #2121): cleanup only ever removes the entry
+    /// of the run doing it.
+    generation: u64,
     catchpoint: String,
     cancel: CancellationToken,
     /// Fired (before `cancel`) by [`LiveCatchupManager::abort_catchup`] only,
@@ -333,8 +364,12 @@ struct RunningCatchup {
     /// the run is over). Issue #2121.
     handing_back: bool,
     /// The [`LiveCatchupManager::drive`] task, joined by
-    /// [`LiveCatchupManager::shutdown`] (issue #2121).
+    /// [`LiveCatchupManager::shutdown`] (issue #2121). `None` while
+    /// `start_catchup` is still pausing normal sync (the slot is reserved,
+    /// the task not spawned yet), or once a shutdown took it (`task_taken`).
     task: Option<tokio::task::JoinHandle<()>>,
+    /// A `shutdown()` took `task` (and then timed out waiting for it).
+    task_taken: bool,
 }
 
 /// Live catchpoint-catchup mode toggle for a running node.
@@ -370,6 +405,8 @@ pub struct LiveCatchupManager {
     /// does not resume the node's normal sync services (they are being
     /// stopped).
     shutting_down: std::sync::atomic::AtomicBool,
+    /// Source of [`RunningCatchup::generation`].
+    next_generation: std::sync::atomic::AtomicU64,
 }
 
 impl LiveCatchupManager {
@@ -385,6 +422,7 @@ impl LiveCatchupManager {
             counters: Arc::new(StdMutex::new(CatchpointCounters::default())),
             sync_round_reset: StdMutex::new(None),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
+            next_generation: std::sync::atomic::AtomicU64::new(1),
         })
     }
 
@@ -416,16 +454,25 @@ impl LiveCatchupManager {
     pub async fn shutdown(&self, timeout: std::time::Duration) -> bool {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        // (The lock is only ever held briefly: `start_catchup` releases it
+        // before pausing normal sync.)
         let task = {
             let mut guard = self.running.lock().await;
             match guard.as_mut() {
                 Some(running) => {
                     running.cancel.cancel();
                     match running.task.take() {
-                        Some(task) => task,
+                        Some(task) => {
+                            running.task_taken = true;
+                            task
+                        }
                         // An earlier shutdown() timed out and took the handle:
                         // that run is still registered, so still going.
-                        None => return false,
+                        None if running.task_taken => return false,
+                        // `start_catchup` is still pausing normal sync; it
+                        // sees `shutting_down` (raised above, before this
+                        // lock) once done and never spawns the run.
+                        None => return true,
                     }
                 }
                 None => return true,
@@ -433,10 +480,15 @@ impl LiveCatchupManager {
         };
         match tokio::time::timeout(timeout, task).await {
             Ok(Ok(())) => true,
+            Ok(Err(e)) if e.is_cancelled() => {
+                // The runtime is going away under it: not a clean stop either.
+                warn!(error = %e, "live catchpoint catchup task was cancelled during shutdown");
+                false
+            }
             Ok(Err(e)) => {
-                // Not a clean stop: the task died (its `running` entry is
+                // Not a clean stop: the task panicked (its `running` entry is
                 // cleared by `ClearRunningOnDrop`).
-                tracing::error!(error = %e, "live catchpoint catchup task failed during shutdown");
+                tracing::error!(error = %e, "live catchpoint catchup task panicked during shutdown");
                 false
             }
             Err(_) => {
@@ -481,7 +533,7 @@ impl LiveCatchupManager {
 
         let mut guard = self.running.lock().await;
         if self.is_shutting_down() {
-            return CatchupStartResult::StartError("the node is shutting down".to_string());
+            return CatchupStartResult::StartError(SHUTTING_DOWN.to_string());
         }
         if let Some(running) = guard.as_ref() {
             // (Also while a finished run hands back, as go answers until
@@ -494,6 +546,25 @@ impl LiveCatchupManager {
                 running.catchpoint
             ));
         }
+
+        // Reserve the slot (so a concurrent start sees this catchup), then
+        // release the lock before pausing normal sync, which can take a
+        // while: status, abort and shutdown must not wait on it (issue #2121).
+        let generation = self
+            .next_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let cancel = CancellationToken::new();
+        let abort = CancellationToken::new();
+        *guard = Some(RunningCatchup {
+            generation,
+            catchpoint: catchpoint.to_string(),
+            cancel: cancel.clone(),
+            abort: abort.clone(),
+            handing_back: false,
+            task: None,
+            task_taken: false,
+        });
+        drop(guard);
 
         // Pause the node's normal sync loop before starting, mirroring
         // `processStageInactive`'s `updateNodeCatchupMode(true)` call —
@@ -510,25 +581,24 @@ impl LiveCatchupManager {
             *counters = CatchpointCounters::default();
         }
 
-        let cancel = CancellationToken::new();
-        let abort = CancellationToken::new();
+        // Spawn under the lock, after a final shutdown check: a shutdown
+        // raises its flag before taking the lock, so either it finds the
+        // task here and joins it, or this sees the flag and never starts.
+        let mut guard = self.running.lock().await;
+        if self.is_shutting_down() {
+            clear_if_generation(&mut guard, generation);
+            return CatchupStartResult::StartError(SHUTTING_DOWN.to_string());
+        }
         let manager = Arc::clone(self);
         let catchpoint_owned = catchpoint.to_string();
-        let cancel_task = cancel.clone();
-        let abort_task = abort.clone();
         let task = tokio::spawn(async move {
             manager
-                .drive(catchpoint_owned, cancel_task, abort_task)
+                .drive(generation, catchpoint_owned, cancel, abort)
                 .await;
         });
-
-        *guard = Some(RunningCatchup {
-            catchpoint: catchpoint.to_string(),
-            cancel,
-            abort,
-            handing_back: false,
-            task: Some(task),
-        });
+        if let Some(running) = guard.as_mut().filter(|r| r.generation == generation) {
+            running.task = Some(task);
+        }
         CatchupStartResult::Created
     }
 
@@ -690,12 +760,18 @@ impl LiveCatchupManager {
     /// success or failure.
     async fn drive(
         self: Arc<Self>,
+        generation: u64,
         catchpoint: String,
         cancel: CancellationToken,
         abort: CancellationToken,
     ) {
-        // Clears `running` on every exit path, a panic included (issue #2121).
-        let _clear_running = ClearRunningOnDrop(Arc::clone(&self));
+        // Clears this run's `running` entry on an abnormal exit (a panic);
+        // the normal paths below clear it themselves (issue #2121).
+        let mut clear_running = ClearRunningOnDrop {
+            manager: Arc::clone(&self),
+            generation,
+            armed: true,
+        };
         // Run on a task of its own, so a panicking runner ends as an error
         // and the hand-back below still resumes normal sync.
         let run = {
@@ -706,15 +782,28 @@ impl LiveCatchupManager {
         };
         let result = match run.await {
             Ok(result) => result,
-            Err(e) => {
+            Err(e) if e.is_panic() => {
                 tracing::error!(catchpoint = %catchpoint, error = %e, "live catchpoint catchup runner panicked");
                 Err(anyhow::anyhow!(
                     "live catchpoint catchup runner panicked: {e}"
                 ))
             }
+            // Cancelled, not panicked: the runtime is shutting down.
+            Err(e) => {
+                info!(catchpoint = %catchpoint, error = %e, "live catchpoint catchup runner task cancelled");
+                Err(anyhow::anyhow!(
+                    "live catchpoint catchup runner task cancelled: {e}"
+                ))
+            }
         };
         // The run is over; the hand-back below follows (issue #2121).
-        if let Some(running) = self.running.lock().await.as_mut() {
+        if let Some(running) = self
+            .running
+            .lock()
+            .await
+            .as_mut()
+            .filter(|r| r.generation == generation)
+        {
             running.handing_back = true;
         }
         match &result {
@@ -766,7 +855,8 @@ impl LiveCatchupManager {
         // Node shutdown: the services `resume()` would restart are being
         // stopped, so only clear the running state.
         if self.is_shutting_down() {
-            *self.running.lock().await = None;
+            clear_if_generation(&mut *self.running.lock().await, generation);
+            clear_running.disarm();
             return;
         }
 
@@ -811,7 +901,8 @@ impl LiveCatchupManager {
         if !self.is_shutting_down() {
             self.control.resume().await;
         }
-        *self.running.lock().await = None;
+        clear_if_generation(&mut *self.running.lock().await, generation);
+        clear_running.disarm();
     }
 }
 
@@ -1715,6 +1806,138 @@ mod tests {
             "a panicked task is not a clean stop"
         );
         wait_idle(&manager).await;
+    }
+
+    fn reserved_entry(generation: u64, catchpoint: &str) -> RunningCatchup {
+        RunningCatchup {
+            generation,
+            catchpoint: catchpoint.to_string(),
+            cancel: CancellationToken::new(),
+            abort: CancellationToken::new(),
+            handing_back: false,
+            task: None,
+            task_taken: false,
+        }
+    }
+
+    /// Issue #2121: the drop guard of a finished run (generation 1) never
+    /// clears the entry of a later run (generation 2) registered meanwhile,
+    /// on either of its paths: the direct one and the deferred one it takes
+    /// when the lock is busy at drop time.
+    #[tokio::test]
+    async fn the_drop_guard_never_clears_a_later_run() {
+        let manager = LiveCatchupManager::new(ImmediateRunner::ok(), Arc::new(NoopSyncControl));
+        *manager.running.lock().await = Some(reserved_entry(2, "2000#later"));
+
+        // Direct path.
+        drop(ClearRunningOnDrop {
+            manager: Arc::clone(&manager),
+            generation: 1,
+            armed: true,
+        });
+        assert_eq!(
+            manager.current_catchpoint().await.as_deref(),
+            Some("2000#later")
+        );
+
+        // Deferred path: the lock is held while the guard drops.
+        {
+            let _held = manager.running.lock().await;
+            drop(ClearRunningOnDrop {
+                manager: Arc::clone(&manager),
+                generation: 1,
+                armed: true,
+            });
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            manager.current_catchpoint().await.as_deref(),
+            Some("2000#later")
+        );
+
+        // Its own run's entry is cleared.
+        drop(ClearRunningOnDrop {
+            manager: Arc::clone(&manager),
+            generation: 2,
+            armed: true,
+        });
+        assert_eq!(manager.current_catchpoint().await, None);
+    }
+
+    /// A [`NormalSyncControl`] whose `pause` announces itself and then waits
+    /// for `release`: a slow pause of normal sync.
+    struct SlowPauseControl {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl NormalSyncControl for SlowPauseControl {
+        async fn pause(&self) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        async fn resume(&self) {}
+    }
+
+    /// Issue #2121: start_catchup no longer holds the lock while it pauses
+    /// normal sync. While the pause is slow, a status read and a shutdown
+    /// answer at once, a second start is refused (the slot is reserved), and
+    /// once the pause ends the shutdown has won: the run is never spawned.
+    #[tokio::test]
+    async fn a_slow_pause_blocks_neither_status_nor_shutdown() {
+        let control = Arc::new(SlowPauseControl {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let cancel_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let manager = LiveCatchupManager::new(
+            Arc::new(BlockingRunner {
+                cancel_observed: cancel_observed.clone(),
+            }),
+            control.clone(),
+        );
+        let start = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.start_catchup("1000#deadbeef").await })
+        };
+        control.entered.notified().await;
+
+        let status = tokio::time::timeout(Duration::from_secs(1), manager.current_catchpoint())
+            .await
+            .expect("current_catchpoint() blocked behind the pause");
+        assert_eq!(status.as_deref(), Some("1000#deadbeef"));
+        let second =
+            tokio::time::timeout(Duration::from_secs(1), manager.start_catchup("2000#other"))
+                .await
+                .expect("start_catchup() blocked behind the pause");
+        assert!(
+            matches!(second, CatchupStartResult::Unable(_)),
+            "{second:?}"
+        );
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.shutdown(Duration::from_secs(5)),
+        )
+        .await
+        .expect("shutdown() blocked behind start_catchup's pause");
+        assert!(
+            stopped,
+            "nothing was spawned yet, so nothing is left running"
+        );
+
+        control.release.notify_one();
+        assert!(matches!(
+            start.await.unwrap(),
+            CatchupStartResult::StartError(_)
+        ));
+        assert_eq!(manager.current_catchpoint().await, None);
+        assert!(
+            !cancel_observed.load(std::sync::atomic::Ordering::SeqCst),
+            "the run must never have been spawned"
+        );
     }
 
     // -- start_catchup: happy path -----------------------------------------

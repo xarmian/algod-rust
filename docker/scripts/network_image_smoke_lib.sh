@@ -21,11 +21,13 @@ smoke_fatal_panics() {
 SMOKE_PROGRESS_RE="catchpoint download complete|periodic sync advanced the ledger|lookback blocks downloaded|catchpoint import complete"
 # Lines that show a TRANSPORT-level failure reaching a relay: refused or
 # timed-out connections, DNS and TLS errors, 5xx answers, and the
-# entrypoint's probe getting no HTTP answer (000) or a 5xx. Deliberately not
+# entrypoint's probe getting no HTTP answer (000) or a 5xx. reqwest's bare
+# "error sending request" counts only with such a cause on the same line: a
+# "builder error" / "invalid URL" there is the node's own fault. Deliberately not
 # a 404 or "every candidate peer failed": a node bug that builds a wrong URL
 # gets those too. Matched after dropping the routine `WS block fetch failed`
 # warning, which healthy runs log.
-SMOKE_RELAY_ERROR_RE="error sending request|connection refused|connection reset|operation timed out|connection timed out|dns error|failed to lookup address|tls handshake|invalid peer certificate|HTTP 5[0-9][0-9]|status(: | code )5[0-9][0-9]|catchpoint file HTTP (000|5[0-9][0-9])"
+SMOKE_RELAY_ERROR_RE="error sending request.*(timed out|dns error|tls|handshake)|connection refused|connection reset|operation timed out|connection timed out|dns error|failed to lookup address|tls handshake|invalid peer certificate|HTTP 5[0-9][0-9]|status(: | code )5[0-9][0-9]|catchpoint file HTTP (000|5[0-9][0-9])"
 
 # smoke_failure_class <log>: print `external` when <log> is strong evidence
 # that the relays, not the node, failed the run: no fatal panic, not a single

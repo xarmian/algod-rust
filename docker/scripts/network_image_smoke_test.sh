@@ -36,6 +36,16 @@ class_is external "relays unreachable, nothing ever served"
 log " WARN catchpoint_sync: block 9: REST /v2/blocks failed (HTTP 503 Service Unavailable)"
 class_is external "relays answering 5xx, no progress"
 
+# --- reqwest's "error sending request" counts only with a transport cause
+log " WARN catchpoint_sync: block 5: error sending request for url (http://r1/v2/blocks/5): builder error: invalid URL"
+class_is node "error sending request + builder error / invalid URL"
+
+log " WARN catchpoint_sync: block 5: error sending request for url (htp:/r1/v2/blocks/5): invalid URL, scheme is not http"
+class_is node "error sending request + invalid URL"
+
+log " WARN catchpoint_sync: block 5: error sending request for url (http://r1/v2/blocks/5): client error (Connect): tcp connect error: Connection refused (os error 111)"
+class_is external "error sending request + Connection refused"
+
 # --- node: a 404 everywhere is what a wrong URL looks like too
 log " WARN catchpoint_sync: block 9: REST /v2/blocks failed (not found: GET /v2/blocks/9?format=msgpack: 404 page not found)"   " WARN catchpoint_sync: block 9: every candidate peer failed: http://r1: not found | http://r2: not found"
 class_is node "404 on every fetch with no progress"
