@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.join(HERE, "corpus"))
 import bench_schema  # noqa: E402
 import corpus_tool as ct  # noqa: E402
 import replay  # noqa: E402
+import report  # noqa: E402
 
 SMALL = os.path.join(os.path.dirname(os.path.dirname(HERE)), "benchmarks", "corpus", "small")
 RECORDED = os.path.join(os.path.dirname(os.path.dirname(HERE)), "benchmarks", "go-replay",
@@ -163,6 +164,42 @@ class ResultsTest(unittest.TestCase):
         cpu = next(r for r in rows if r["name"] == "small/cpu_s" and r["impl"] == "go")
         self.assertEqual(cpu["samples"], [2.0])
         self.assertEqual(cpu["better"], "lower")
+
+
+class RatioGateTest(unittest.TestCase):
+    """The CI assertion over report.json: every timing metric needs a
+    Rust/Go ratio, but a metric whose go baseline is legitimately 0 (go's
+    write_mb on a runner that does not attribute its writes) does not fail
+    the tier (issue #2124)."""
+
+    def report(self, go_write=0, drop=None):
+        with open(RECORDED, encoding="utf-8") as f:
+            state = json.load(f)
+        runs = [{"go": result(state, write_bytes=go_write),
+                 "rust": result(state, write_bytes=190 * 1024 * 1024)}]
+        rows = [r for r in replay.results(runs, "small", {"corpus": "small"})
+                if (r["name"], r["impl"]) != drop]
+        return report.build_report(rows, fingerprint={})
+
+    def test_zero_go_write_mb_has_no_ratio_and_passes(self):
+        rep = self.report()
+        write = next(r for r in rep["rows"] if r["name"] == "small/write_mb")
+        self.assertIsNone(write["ratio"])
+        self.assertEqual(replay.ratio_gate(rep), [])
+
+    def test_a_missing_timing_ratio_fails(self):
+        rep = self.report(drop=("small/wall_s", "go"))
+        errs = replay.ratio_gate(rep)
+        self.assertTrue(any("small/wall_s" in e for e in errs), errs)
+
+    def test_every_timing_metric_is_required(self):
+        for k in replay.TIMING_METRICS:
+            errs = replay.ratio_gate(self.report(drop=(f"small/{k}", "rust")))
+            self.assertTrue(any(f"small/{k}" in e for e in errs), (k, errs))
+
+    def test_a_report_with_errors_or_no_rows_fails(self):
+        self.assertTrue(replay.ratio_gate({"ok": False, "errors": ["x"], "rows": []}))
+        self.assertTrue(replay.ratio_gate({"ok": True, "errors": [], "rows": []}))
 
 
 REPO = os.path.dirname(os.path.dirname(HERE))
