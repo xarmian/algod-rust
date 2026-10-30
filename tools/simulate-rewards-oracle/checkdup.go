@@ -117,10 +117,10 @@ func checkDupOracle() {
 	cfg := config.GetDefaultLocal()
 	cfg.Archival = true
 	initState := ledgercore.InitState{Block: genesis, Accounts: accts, GenesisHash: genesisHash}
-	real, err := ledger.OpenLedger(log, checkDupGenesisID+"-ledger", true, initState, cfg)
+	actual, err := ledger.OpenLedger(log, checkDupGenesisID+"-ledger", true, initState, cfg)
 	must(err)
-	defer real.Close()
-	l := &data.Ledger{Ledger: real}
+	defer actual.Close()
+	l := &data.Ledger{Ledger: actual}
 
 	maxLife := basics.Round(params.MaxTxnLife)
 	leaseOf := func(b byte) (out [32]byte) {

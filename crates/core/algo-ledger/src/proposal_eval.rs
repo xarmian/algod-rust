@@ -37,7 +37,7 @@ use crate::apply::{
     apply_block_impl_probe, ApplyData, ApplyMode, ExecProbe, ListsRequest, ProbeRequest,
 };
 use crate::pending_overlay::{OverlayBase, OverlayStore, PendingOverlay};
-use crate::shadow_execute::{payout_check_from, PayoutCheck, ScratchFailure, ScratchPayset};
+use crate::shadow_execute::{ProposalCheck, ScratchFailure, ScratchPayset};
 
 /// Successful evaluation of one group.
 #[derive(Debug)]
@@ -83,6 +83,21 @@ pub fn evaluate_group<B: OverlayBase + ?Sized>(
     template: &Block,
     group: &[SignedTransaction],
 ) -> Result<GroupEval, GroupEvalError> {
+    evaluate_group_with_txids(base, overlay, template, group, None)
+}
+
+/// [`evaluate_group`] for pool admission, with the group's txids (as the
+/// txtail records them) already computed by the pool, so `checkDup` does not
+/// hash the group again (`None` hashes them here). `checkDup` still looks
+/// them up in the ledger's txtail: a re-evaluated pending transaction may
+/// have been committed meanwhile.
+pub fn evaluate_group_with_txids<B: OverlayBase + ?Sized>(
+    base: &B,
+    overlay: &mut PendingOverlay,
+    template: &Block,
+    group: &[SignedTransaction],
+    txids: Option<Vec<algo_types::Digest>>,
+) -> Result<GroupEval, GroupEvalError> {
     let tip = base.base_current_round();
     if base.base_is_stale() || overlay.base_round() != tip || template.round.0 != tip.0 + 1 {
         return Err(GroupEvalError::Stale);
@@ -97,6 +112,11 @@ pub fn evaluate_group<B: OverlayBase + ?Sized>(
             skip_epilogue: true,
             generate: true,
             pool_withdrawn: overlay.pool_withdrawn(),
+            // go's generating evaluator validates too (`StartEvaluator`
+            // with Generate + Validate), so `Alive` and `checkDup` run
+            // against the live ledger, not the pool's snapshot (issue #2127).
+            check_dup: true,
+            txids,
             ..ProbeRequest::default()
         },
         ..ExecProbe::default()
@@ -180,6 +200,8 @@ pub fn evaluate_payset<B: OverlayBase + ?Sized>(
             generate: true,
             want_fee_sink_available: true,
             knock_offline_exclude: lists.as_ref().map(|l| l.own_addresses.clone()),
+            // go generates with Generate + Validate: `checkDup` (#2127).
+            check_dup: true,
             ..Default::default()
         },
         ..Default::default()
@@ -200,32 +222,47 @@ pub fn evaluate_payset<B: OverlayBase + ?Sized>(
 /// issue #1798) on a **fresh** overlay over `base`, without a SAVEPOINT on the
 /// live connection and without holding the ledger mutex across the
 /// evaluation (issue #1895). Identical verdicts to
-/// [`crate::shadow_execute::scratch_validate_payouts`]: the whole block is
+/// [`crate::shadow_execute::scratch_proposal_check`]: the whole block is
 /// evaluated in [`ApplyMode::Execute`] *including* the epilogue (participation
 /// lists, payout validation, payout application) with only the payout
-/// validation switched on. A base that is not at `block.round - 1`, or that
+/// validation and go's `checkDup` (issue #2127) switched on; a `checkDup`
+/// rejection is a verdict too. A base that is not at `block.round - 1`, or that
 /// advanced while evaluating, is a transient
-/// [`PayoutCheck::NoVerdict`] (the caller retries), never a verdict.
-pub fn evaluate_validate_payouts<B: OverlayBase + ?Sized>(base: &B, block: &Block) -> PayoutCheck {
+/// [`ProposalCheck::NoVerdict`] (the caller retries), never a verdict.
+pub fn evaluate_proposal_check<B: OverlayBase + ?Sized>(base: &B, block: &Block) -> ProposalCheck {
     #[cfg(any(test, feature = "test-hooks"))]
     if crate::shadow_execute::test_hooks::should_fail(block.payset.len()) {
-        return payout_check_from::<()>(Err(ScratchFailure::Other(AlgoError::Ledger {
-            message: "injected transient scratch failure".into(),
-        })));
+        return crate::shadow_execute::payout_check_from::<()>(Err(ScratchFailure::Other(
+            AlgoError::Ledger {
+                message: "injected transient scratch failure".into(),
+            },
+        )));
     }
-    let mut probe = ExecProbe {
-        request: ProbeRequest {
-            validate_payouts: true,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    payout_check_from(evaluate_block_on_overlay(base, block, &mut probe))
+    let mut probe = crate::shadow_execute::proposal_check_probe();
+    let result = evaluate_block_on_overlay(base, block, &mut probe);
+    let check = crate::shadow_execute::proposal_check_from(result, &probe);
+    if !matches!(check, ProposalCheck::NoVerdict { .. }) {
+        return check;
+    }
+    crate::shadow_execute::with_prologue_prepass(check, prologue_prepass(base, block))
+}
+
+/// [`crate::check_dup::prologue_prepass`] on a fresh overlay over `base`:
+/// go's `Alive` and `checkDup` over the whole payset, nothing executed. `None`
+/// (no verdict) when it passes, or when `base` is not at `block.round - 1` or
+/// advanced while it ran.
+pub fn prologue_prepass<B: OverlayBase + ?Sized>(base: &B, block: &Block) -> Option<String> {
+    let mut overlay = PendingOverlay::new(base);
+    if base.base_is_stale() || block.round.0 != overlay.base_round().0 + 1 {
+        return None;
+    }
+    let verdict = crate::check_dup::prologue_prepass(&OverlayStore::new(base, &mut overlay), block);
+    (!base.base_is_stale()).then_some(verdict).flatten()
 }
 
 /// Evaluate `block` in [`ApplyMode::Execute`] on a fresh overlay over `base`
 /// with `probe`, returning the per-transaction apply data. Shared by
-/// [`evaluate_payset`] and [`evaluate_validate_payouts`].
+/// [`evaluate_payset`] and [`evaluate_proposal_check`].
 fn evaluate_block_on_overlay<B: OverlayBase + ?Sized>(
     base: &B,
     block: &Block,
@@ -420,6 +457,9 @@ mod tests {
             current_protocol: CONSENSUS_V41.to_string(),
             fee_sink: addr(0xF1),
             rewards_pool: addr(0xF2),
+            // V41 requires a genesis hash: block generation runs go's
+            // `Alive` (#2127) on the payset with it restored.
+            genesis_hash: crate::apply::pool_fixtures::TEST_GENESIS_HASH,
             ..Block::default()
         }
     }
@@ -621,9 +661,14 @@ mod tests {
             (template(&l),)
         };
         let mut block = t;
+        // Each payment funds a fresh receiver, so every transaction reads
+        // the base at least once (apply no longer reads the lease table per
+        // transaction, issue #2127).
         block.payset = (0..600u64)
             .map(|i| {
-                let mut p = pay(a, addr(2), 200_000 + i, None);
+                let mut to = [0u8; 32];
+                to[..8].copy_from_slice(&(1_000 + i).to_be_bytes());
+                let mut p = pay(a, Address(to), 200_000 + i, None);
                 p.txn.note = serde_bytes::ByteBuf::from(i.to_be_bytes().to_vec());
                 p
             })

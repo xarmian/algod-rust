@@ -330,6 +330,16 @@ pub trait LedgerStore {
         current_round: u64,
     ) -> Result<(), AlgoError>;
 
+    /// Whether a transaction of the pending block this store stages (an
+    /// `OverlayStore`'s earlier groups) holds (sender, lease) in force at
+    /// `round`. go's block cow answers that with `InBlockEvaluator` set
+    /// (`lease_eval`), unlike a committed lease (issue #2127). A plain store
+    /// stages no pending block.
+    fn pending_block_lease(&self, sender: &Address, lease: &[u8; 32], round: u64) -> bool {
+        let _ = (sender, lease, round);
+        false
+    }
+
     /// Record a lease for (sender, lease) with the given last_valid round.
     fn record_lease(&mut self, sender: &Address, lease: &[u8; 32], last_valid: u64);
 

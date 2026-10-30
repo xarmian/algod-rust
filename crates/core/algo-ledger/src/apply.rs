@@ -102,12 +102,18 @@ pub struct ApplyContext {
     /// checks, vote key checks, etc.). When false (replay/catchup), only
     /// the apply-side state transitions run.
     pub validate: bool,
-    /// The caller runs go's `checkDup` itself and tracks the block's leases
-    /// ([`crate::check_dup`], simulate): apply then neither checks nor
-    /// records leases. Simulate's lease check must see only the rounds up
-    /// to the simulated one, and recording into the live lease table would
-    /// outlive the simulation (no snapshot covers it).
-    pub leases_checked_by_caller: bool,
+    /// The caller tracks the block's leases itself (simulate's
+    /// [`crate::check_dup::BlockDups`]): apply then does not record them in
+    /// the store's lease table, which no snapshot restores, so a simulated
+    /// lease would outlive the simulation. Apply never checks leases; go
+    /// checks them only in `checkDup` ([`Self::checkdup`]).
+    pub caller_tracks_leases: bool,
+    /// go `BlockEvaluator.transaction`'s `Alive` and `checkDup` for a block
+    /// evaluated with `Validate: true` (issue #2127): set by
+    /// [`apply_block_impl_probe`] when the apply validates (or a probe asks
+    /// for it: the proposal check, block generation), `None` otherwise. See
+    /// [`txn_prologue`].
+    pub checkdup: Option<RefCell<crate::check_dup::BlockCheckDup>>,
     /// Mirrors go `roundCowState.generate` (`ledger/eval/cow.go`): true while
     /// generating a block (pool admission, block assembly, simulation), false
     /// while validating one. Policies that must never affect validation
@@ -243,7 +249,8 @@ impl ApplyContext {
             round,
             mode: ApplyMode::Replay,
             validate: false,
-            leases_checked_by_caller: false,
+            caller_tracks_leases: false,
+            checkdup: None,
             generate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
@@ -406,8 +413,15 @@ pub fn apply_block_with_delta_mode_for<L: crate::store_trait::LedgerStore>(
     mode: ApplyMode,
     check_payouts: bool,
 ) -> Result<crate::state_delta::StateDelta, AlgoError> {
-    let (delta, _apply_data) =
-        apply_block_with_delta_mode_and_apply_data(store, block, mode, false, check_payouts)?;
+    let (delta, _apply_data) = apply_block_with_delta_mode_and_apply_data(
+        store,
+        block,
+        mode,
+        DeltaApplyOptions {
+            validate_payouts: check_payouts,
+            ..DeltaApplyOptions::default()
+        },
+    )?;
     Ok(delta)
 }
 
@@ -746,8 +760,12 @@ pub fn apply_block_with_delta_mode<L: crate::store_trait::LedgerStore>(
     block: &Block,
     mode: ApplyMode,
 ) -> Result<crate::state_delta::StateDelta, AlgoError> {
-    let (delta, _apply_data) =
-        apply_block_with_delta_mode_and_apply_data(store, block, mode, false, false)?;
+    let (delta, _apply_data) = apply_block_with_delta_mode_and_apply_data(
+        store,
+        block,
+        mode,
+        DeltaApplyOptions::default(),
+    )?;
     Ok(delta)
 }
 
@@ -758,9 +776,44 @@ pub fn apply_block_with_delta_mode_checking_payouts<L: crate::store_trait::Ledge
     block: &Block,
     mode: ApplyMode,
 ) -> Result<crate::state_delta::StateDelta, AlgoError> {
-    let (delta, _apply_data) =
-        apply_block_with_delta_mode_and_apply_data(store, block, mode, false, true)?;
+    let (delta, _apply_data) = apply_block_with_delta_mode_and_apply_data(
+        store,
+        block,
+        mode,
+        DeltaApplyOptions {
+            validate_payouts: true,
+            ..DeltaApplyOptions::default()
+        },
+    )?;
     Ok(delta)
+}
+
+/// [`apply_generated_block_capturing_apply_data_with_delta`] that also reports the
+/// payset index of the transaction whose apply failed (when one owns the
+/// failure), so the dev-mode producer can drop that transaction's group
+/// from the pool, as go's `AssembleDevModeBlock` drops a group its
+/// evaluator rejects (issue #2127).
+pub fn apply_generated_block_capturing_apply_data_with_delta_or_failed_txn<
+    L: crate::store_trait::LedgerStore,
+>(
+    store: &mut L,
+    block: &Block,
+    mode: ApplyMode,
+) -> Result<(Vec<ApplyData>, crate::state_delta::StateDelta), (AlgoError, Option<usize>)> {
+    let mut failed = None;
+    apply_block_with_delta_mode_and_apply_data(
+        store,
+        block,
+        mode,
+        DeltaApplyOptions {
+            capture_apply_data: true,
+            check_dup: true,
+            failed_txn_out: Some(&mut failed),
+            ..DeltaApplyOptions::default()
+        },
+    )
+    .map(|(delta, apply_data)| (apply_data, delta))
+    .map_err(|e| (e, failed))
 }
 
 /// Like [`apply_block_with_delta_mode`], but also returns the per-transaction
@@ -777,23 +830,48 @@ pub fn apply_block_with_delta_mode_checking_payouts<L: crate::store_trait::Ledge
 /// their zero values — computing those is tracked separately in #586, not
 /// something this function (or issue #581's dev-mode caching fix) is
 /// responsible for.
-pub fn apply_block_capturing_apply_data_with_delta<L: crate::store_trait::LedgerStore>(
+///
+/// It applies a block the node generated (the dev-mode producer): go's dev
+/// block comes out of a Generate + Validate evaluator
+/// (`AssembleDevModeBlock`), so go's `Alive`, `checkDup` and authorizer run
+/// (issue #2127). See [`apply_generated_block_capturing_apply_data_with_delta_or_failed_txn`]
+/// for the failing transaction's index.
+pub fn apply_generated_block_capturing_apply_data_with_delta<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     block: &Block,
     mode: ApplyMode,
 ) -> Result<(Vec<ApplyData>, crate::state_delta::StateDelta), AlgoError> {
-    let (delta, apply_data) =
-        apply_block_with_delta_mode_and_apply_data(store, block, mode, true, false)?;
-    Ok((apply_data, delta))
+    apply_generated_block_capturing_apply_data_with_delta_or_failed_txn(store, block, mode)
+        .map_err(|(error, _)| error)
+}
+
+/// What [`apply_block_with_delta_mode_and_apply_data`] runs beyond the
+/// apply itself.
+#[derive(Default)]
+struct DeltaApplyOptions<'a> {
+    /// Return the per-transaction `ApplyData` (always captured internally).
+    capture_apply_data: bool,
+    /// Run go's `validateForPayouts` (a certified block from the network).
+    validate_payouts: bool,
+    /// Run go's `Alive` / `checkDup` / authorizer (a block the node
+    /// generated: the dev-mode producer, issue #2127).
+    check_dup: bool,
+    /// Receives the payset index of the failing transaction, if any.
+    failed_txn_out: Option<&'a mut Option<usize>>,
 }
 
 fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     block: &Block,
     mode: ApplyMode,
-    capture_apply_data: bool,
-    validate_payouts: bool,
+    options: DeltaApplyOptions<'_>,
 ) -> Result<(crate::state_delta::StateDelta, Vec<ApplyData>), AlgoError> {
+    let DeltaApplyOptions {
+        capture_apply_data,
+        validate_payouts,
+        check_dup,
+        failed_txn_out,
+    } = options;
     use std::collections::{HashMap, HashSet};
 
     use crate::state_delta::{
@@ -1000,11 +1078,12 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
     let mut probe = ExecProbe {
         request: ProbeRequest {
             validate_payouts,
+            check_dup,
             ..ProbeRequest::default()
         },
         ..ExecProbe::default()
     };
-    apply_block_impl_probe(
+    let applied = apply_block_impl_probe(
         &mut recording_store,
         block,
         mode,
@@ -1015,7 +1094,11 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
         Some(&mut kv_mods),
         false,
         Some(&mut probe),
-    )?;
+    );
+    if let Some(out) = failed_txn_out {
+        *out = probe.out.failed_txn_index;
+    }
+    applied?;
     let touches = recording_store.touches;
 
     // ── 3b. Resolve create-time resource keys now that new ids exist ───
@@ -1560,6 +1643,40 @@ pub(crate) fn collect_txn_addresses(
     }
 }
 
+/// go `BlockEvaluator.transaction`'s prologue for top-level payset
+/// transaction `index`, run wherever go's evaluator validates (a validating
+/// apply, the proposal check, block generation: [`ApplyContext::checkdup`]
+/// is set): `BlockHeader.Alive` and `checkDup`
+/// ([`crate::check_dup::BlockCheckDup`]), then the authorizer. The one place
+/// both apply loops run it, so the order and the checks cannot drift; every
+/// rejection is the proposal check's verdict.
+pub(crate) fn txn_prologue<S: crate::store_trait::LedgerStore>(
+    store: &S,
+    ctx: &ApplyContext,
+    genesis_rule: &algo_types::genesis_restore::GenesisRestoreRule<'_>,
+    stx: &SignedTransaction,
+    index: usize,
+) -> Result<(), AlgoError> {
+    let Some(checkdup) = &ctx.checkdup else {
+        // A validating context without the block's `checkDup` state (a
+        // caller that builds its own `ApplyContext`): go's `Alive` and the
+        // authorizer still run; only `checkDup` needs the block's txids.
+        if ctx.validate {
+            crate::check_dup::alive(Round(ctx.round), &ctx.consensus, genesis_rule, stx)?;
+            check_authorizer_for(store, stx, None)?;
+        }
+        return Ok(());
+    };
+    let mut checkdup = checkdup.borrow_mut();
+    checkdup.check(store, &ctx.consensus, genesis_rule, stx, index)?;
+    let txid = checkdup.txids().get(index).copied();
+    if let Err(e) = check_authorizer_for(store, stx, txid) {
+        checkdup.record_violation(index, &e.to_string());
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Apply one atomic transaction group's transactions against `store`, in
 /// payset order, threading a shared [`GroupBudget`] for pooled Execute-mode
 /// AVM budget accounting (matches go-algorand's per-group `feeCredit`
@@ -1570,40 +1687,6 @@ pub(crate) fn collect_txn_addresses(
 /// real ledger store or a group-scoped [`crate::recording_store::RecordingStore`]
 /// wrapper, without duplicating it -- the caller picks which by choosing
 /// what `S` is instantiated with at the call site.
-/// Check that `stx` is "alive" at `round`: `round >= txn.FirstValid &&
-/// round <= txn.LastValid`. Matches go-algorand's
-/// `BlockHeader.Alive(txn.Header)` round-validity check
-/// (`data/bookkeeping/block.go:297-307`), called at the per-txn apply site
-/// gated on `eval.validate` (`ledger/eval/eval.go:1254-1258`, i.e. block
-/// validation of a newly-received block, not replay/re-execution of an
-/// already-certified block -- an already-certified block's txns were
-/// already proven alive when the block was first validated).
-///
-/// Only the round-liveness half of go's `Alive` is ported here; the
-/// genesis-hash/genesis-ID half is already covered separately by
-/// `algo_validate::validate_genesis_consistency`.
-pub(crate) fn check_txn_alive(round: Round, stx: &SignedTransaction) -> Result<(), AlgoError> {
-    let txn = &stx.txn;
-    if round < txn.first_valid || round > txn.last_valid {
-        let txid = algo_codec::compute_txn_id(txn);
-        return Err(AlgoError::Ledger {
-            message: format!(
-                "transaction {} dead: round {} outside [{}, {}]{}",
-                txid,
-                round,
-                txn.first_valid,
-                txn.last_valid,
-                if round < txn.first_valid {
-                    " (early)"
-                } else {
-                    " (expired)"
-                }
-            ),
-        });
-    }
-    Ok(())
-}
-
 /// Check that the address that actually authorized `stx` (via a valid
 /// signature -- `stx.auth_addr` if set, else the sender) matches whatever
 /// address the sender has been rekeyed to per the ledger's account state.
@@ -1614,12 +1697,17 @@ pub(crate) fn check_txn_alive(round: Round, stx: &SignedTransaction) -> Result<(
 /// using the wire-declared `stx.auth_addr`) -- this is the separate,
 /// ledger-state-aware check that the wire-declared authorizer is actually
 /// the one the sender's account has rekeyed to, not an attacker-chosen
-/// address with its own valid key. Run only when `ctx.validate` (block
-/// validation of a newly-received block), not replay/re-execution of an
-/// already-certified block.
-pub(crate) fn check_authorizer<L: crate::store_trait::LedgerStore>(
+/// address with its own valid key. Run by [`txn_prologue`] wherever go's
+/// evaluator validates (block validation, the proposal check, block
+/// generation, simulate), never on replay of an already-certified block.
+///
+/// `txid` names the transaction when known (a block's stripped payset
+/// transaction hashes to the restored txid only with its genesis fields
+/// restored).
+fn check_authorizer_for<L: crate::store_trait::LedgerStore>(
     store: &L,
     stx: &SignedTransaction,
+    txid: Option<algo_types::Digest>,
 ) -> Result<(), AlgoError> {
     let sender = stx.txn.sender;
     let correct_authorizer = store
@@ -1628,12 +1716,16 @@ pub(crate) fn check_authorizer<L: crate::store_trait::LedgerStore>(
         .unwrap_or(sender);
     let actual_authorizer = stx.auth_addr.unwrap_or(sender);
     if actual_authorizer != correct_authorizer {
-        let txid = algo_codec::compute_txn_id(&stx.txn);
-        return Err(AlgoError::Ledger {
+        let txid = txid.unwrap_or_else(|| algo_codec::compute_txn_id(&stx.txn));
+        // go returns this text bare (`fmt.Errorf`), and simulate and the
+        // proposal check report it as is.
+        return Err(AlgoError::Rejected {
+            source: None,
             message: format!(
                 "transaction {}: should have been authorized by {} but was actually authorized by {}",
                 txid, correct_authorizer, actual_authorizer
             ),
+            class: algo_error::RejectClass::Other,
         });
     }
     Ok(())
@@ -1670,6 +1762,9 @@ struct GroupCells {
     fee_residue: u64,
     global_txn_idx: usize,
     apply_data_len: Option<usize>,
+    /// The block's `checkDup` records before the group
+    /// ([`crate::check_dup::BlockCheckDup::mark`]).
+    checkdup_mark: Option<usize>,
 }
 
 impl GroupCells {
@@ -1687,6 +1782,7 @@ impl GroupCells {
             fee_residue: ctx.fee_residue.get(),
             global_txn_idx,
             apply_data_len: apply_data_out.as_ref().map(|v| v.len()),
+            checkdup_mark: ctx.checkdup.as_ref().map(|c| c.borrow().mark()),
         }
     }
 
@@ -1706,6 +1802,9 @@ impl GroupCells {
         if let (Some(out), Some(len)) = (apply_data_out.as_mut(), self.apply_data_len) {
             out.truncate(len);
         }
+        if let (Some(checkdup), Some(mark)) = (&ctx.checkdup, self.checkdup_mark) {
+            checkdup.borrow_mut().rollback_to(mark);
+        }
     }
 }
 
@@ -1715,6 +1814,7 @@ fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
     store: &mut S,
     group: &[&SignedTransaction],
     ctx: &ApplyContext,
+    genesis_rule: &algo_types::genesis_restore::GenesisRestoreRule<'_>,
     group_budget: &mut GroupBudget,
     group_box_budget: &mut BoxBudgetState,
     tracer: Option<&mut dyn EvalTracer>,
@@ -1727,6 +1827,7 @@ fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
         store,
         group,
         ctx,
+        genesis_rule,
         group_budget,
         group_box_budget,
         tracer,
@@ -1745,6 +1846,7 @@ fn apply_group_transactions_inner<S: crate::store_trait::LedgerStore>(
     store: &mut S,
     group: &[&SignedTransaction],
     ctx: &ApplyContext,
+    genesis_rule: &algo_types::genesis_restore::GenesisRestoreRule<'_>,
     group_budget: &mut GroupBudget,
     group_box_budget: &mut BoxBudgetState,
     mut tracer: Option<&mut dyn EvalTracer>,
@@ -1762,14 +1864,9 @@ fn apply_group_transactions_inner<S: crate::store_trait::LedgerStore>(
     let group_created = crate::apply::GroupCreatedResources::default();
     for (gi_idx, stx) in group.iter().enumerate() {
         ctx.txn_index.set(*global_txn_idx);
-        if ctx.validate {
-            check_txn_alive(Round(ctx.round), stx).inspect_err(|_| {
-                *failed_txn = Some(*global_txn_idx);
-            })?;
-            check_authorizer(store, stx).inspect_err(|_| {
-                *failed_txn = Some(*global_txn_idx);
-            })?;
-        }
+        txn_prologue(&*store, ctx, genesis_rule, stx, *global_txn_idx).inspect_err(|_| {
+            *failed_txn = Some(*global_txn_idx);
+        })?;
         let gi = GroupInfo {
             txns: group,
             index: gi_idx,
@@ -1963,6 +2060,16 @@ pub struct ProbeRequest {
     /// payout / fees / proposer header fields are judged against the
     /// pre-block state without turning on every other validate-mode check.
     pub validate_payouts: bool,
+    /// Run go's `Alive` and `checkDup` (see
+    /// [`crate::check_dup::BlockCheckDup`]) even though the apply is not in
+    /// validating mode, and report the first rejection in
+    /// [`ProbeOutput::dup_violation`]. Set by the agreement proposal check
+    /// (go `Ledger.Validate`'s verdict) and by block generation (go's
+    /// Generate + Validate evaluator).
+    pub check_dup: bool,
+    /// The payset's txids (as the txtail records them), when the caller
+    /// already hashed them; otherwise the apply hashes them for `checkDup`.
+    pub txids: Option<Vec<algo_types::Digest>>,
     /// Evaluate as a block *generator* (pool admission, block assembly):
     /// go `EvaluatorOptions.Generate` / `roundCowState.generate`, carried
     /// into [`ApplyContext::generate`]. Policies that must never affect
@@ -1980,6 +2087,10 @@ pub struct ProbeRequest {
 /// What an apply reports back to its [`ExecProbe`] caller.
 #[derive(Debug, Default, Clone)]
 pub struct ProbeOutput {
+    /// The latest prologue (`Alive` / `checkDup` / authorizer) rejection
+    /// when [`ProbeRequest::check_dup`] (or validation) ran it: the payset
+    /// index it rejected and go's error text.
+    pub dup_violation: Option<(usize, String)>,
     /// Payset index of the transaction whose apply failed. `None` when the
     /// apply did not fail, or failed in a group-level step that no single
     /// transaction owns.
@@ -2510,7 +2621,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
     mut apply_data_out: Option<&mut Vec<ApplyData>>,
     kv_mods_out: Option<&mut KvModsMap>,
     scratch: bool,
-    probe: Option<&mut ExecProbe>,
+    mut probe: Option<&mut ExecProbe>,
 ) -> Result<(), AlgoError> {
     let skip_epilogue = probe.as_ref().is_some_and(|p| p.request.skip_epilogue);
     let pool_withdrawn = probe.as_ref().is_some_and(|p| p.request.pool_withdrawn);
@@ -2577,6 +2688,40 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         }
     } else {
         block
+    };
+    // go runs `Alive`, `checkDup` and the authorizer only in an evaluator
+    // with `Validate` set: proposal validation (`Ledger.Validate`) and block
+    // generation (`StartEvaluator` with Generate + Validate), never
+    // `Ledger.AddBlock` (catchup, certified blocks). Built before any state
+    // is touched, so a bad txid count fails the apply cleanly. The txids are
+    // the ones the txtail records, hashed once here (or handed over by the
+    // pool) and reused for the block's txtail row below (issue #2127).
+    let run_check_dup = validate || probe.as_ref().is_some_and(|p| p.request.check_dup);
+    let (checkdup, checked_txtail) = if run_check_dup {
+        let txids = match probe.as_mut().and_then(|p| p.request.txids.take()) {
+            Some(txids) if txids.len() == stored_block.payset.len() => txids,
+            Some(txids) => {
+                return Err(AlgoError::Ledger {
+                    message: format!(
+                        "checkDup: {} txids for a payset of {}",
+                        txids.len(),
+                        stored_block.payset.len()
+                    ),
+                })
+            }
+            None => algo_codec::block_txids_with_rule(stored_block, &genesis_rule),
+        };
+        // The block's txtail row, from the very txids `checkDup` checks.
+        let txtail = algo_codec::build_txtail_from_block_with_txids(stored_block, &txids)?;
+        (
+            Some(RefCell::new(crate::check_dup::BlockCheckDup::new(
+                block.round.0,
+                txids,
+            ))),
+            Some(txtail),
+        )
+    } else {
+        (None, None)
     };
     // Issue #570: only allocate the shared box-delta recorder when a caller
     // actually wants `kv_mods` back (Execute mode, via
@@ -2669,7 +2814,8 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         round: block.round.0,
         mode,
         validate,
-        leases_checked_by_caller: false,
+        caller_tracks_leases: false,
+        checkdup,
         generate,
         // `global LatestTimestamp` is the *previous* block's timestamp in go
         // (`roundCowState.PrevTimestamp`, `ledger/eval/cow.go`), never the
@@ -2714,15 +2860,9 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
             ApplyMode::Replay => {
                 // Replay mode: process transactions individually (no AVM execution).
                 for (replay_idx, stx) in block.payset.iter().enumerate() {
-                    if ctx.validate {
-                        if let Err(e) = check_txn_alive(Round(ctx.round), stx) {
-                            failed_txn = Some(replay_idx);
-                            break 'block Err(e);
-                        }
-                        if let Err(e) = check_authorizer(store, stx) {
-                            failed_txn = Some(replay_idx);
-                            break 'block Err(e);
-                        }
+                    if let Err(e) = txn_prologue(&*store, &ctx, &genesis_rule, stx, replay_idx) {
+                        failed_txn = Some(replay_idx);
+                        break 'block Err(e);
                     }
                     match apply_transaction(store, stx, &ctx, 0) {
                         Ok(ad) => {
@@ -2853,6 +2993,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
                             &mut recording_store,
                             group,
                             &ctx,
+                            &genesis_rule,
                             &mut group_budget,
                             &mut group_box_budget,
                             tracer_reborrow,
@@ -2867,6 +3008,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
                         store,
                         group,
                         &ctx,
+                        &genesis_rule,
                         &mut group_budget,
                         &mut group_box_budget,
                         tracer_reborrow,
@@ -2941,6 +3083,10 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
     };
     if let Some(p) = probe {
         p.out.failed_txn_index = if result.is_err() { failed_txn } else { None };
+        p.out.dup_violation = ctx
+            .checkdup
+            .as_ref()
+            .and_then(|c| c.borrow().violation().map(|(i, m)| (i, m.to_owned())));
         if result.is_ok() {
             p.out.final_txn_counter = ctx.txn_counter.get();
             p.out.final_fees_collected = ctx.fees_collected.get();
@@ -3120,7 +3266,12 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         tracing::warn!("put_block failed for round {}: {e}", block.round.0);
     }
 
-    let txtail = algo_codec::build_txtail_from_block_with_rule(stored_block, &genesis_rule);
+    // A `checkDup` evaluation built the row from its txids up front; any
+    // other apply hashes the payset here.
+    let txtail = match checked_txtail {
+        Some(txtail) => txtail,
+        None => algo_codec::build_txtail_from_block_with_rule(stored_block, &genesis_rule),
+    };
     let txtail_data = algo_codec::canonical_encode_txtail_round(&txtail);
     if let Err(e) = store.put_txtail(block.round.0, &txtail_data) {
         tracing::warn!("put_txtail failed for round {}: {e}", block.round.0);
@@ -4460,11 +4611,10 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
         })?
     };
 
-    // Check lease before any state changes, unless the caller runs go's
-    // `checkDup` itself (simulate).
-    if !ctx.leases_checked_by_caller {
-        store.check_lease(&txn.sender, &lease_arr, ctx.round)?;
-    }
+    // No lease check here: go checks leases only in `checkDup`, under
+    // `Validate` (`crate::check_dup`, run before each top-level transaction
+    // by validating block applies and simulate). A replayed certified block
+    // (go `Ledger.AddBlock`) is never lease-checked (issue #2127).
 
     // Addresses go's `Move` brings up to the rewards level (see
     // `reward_participants`: strictly narrower than the touched set).
@@ -5149,7 +5299,7 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
         }
 
         // Record lease on success (no-op for empty/zero leases).
-        if !ctx.leases_checked_by_caller {
+        if !ctx.caller_tracks_leases {
             store.record_lease(&txn.sender, lease_arr, txn.last_valid.0);
         }
 
@@ -7639,7 +7789,7 @@ mod tests {
         // Issue #1152: default to a wide-open [FirstValid, LastValid]
         // window so existing fixtures using this helper across a range of
         // block rounds aren't spuriously rejected by the FirstValid/
-        // LastValid round-liveness check (`check_txn_alive`) now enforced
+        // LastValid round-liveness check (go `Alive`, `txn_prologue`) now enforced
         // in `ctx.validate` paths. Tests that specifically exercise
         // liveness set `first_valid`/`last_valid` explicitly.
         stx.txn.last_valid = Round(1_000_000);
@@ -7816,6 +7966,7 @@ mod tests {
             proposer: TEST_PROPOSER,
             fees_collected: TEST_PAYSET_FEE,
             payset: vec![rekey_stx],
+            genesis_hash: crate::apply::pool_fixtures::TEST_GENESIS_HASH,
             ..Block::default()
         };
         apply_block_validating(&mut state, &block1).expect("rekey should succeed");
@@ -7836,6 +7987,7 @@ mod tests {
             proposer: TEST_PROPOSER,
             fees_collected: TEST_PAYSET_FEE,
             payset: vec![stale_spend],
+            genesis_hash: crate::apply::pool_fixtures::TEST_GENESIS_HASH,
             ..Block::default()
         };
         let err = apply_block_validating(&mut state, &block2_bad).unwrap_err();
@@ -7866,6 +8018,7 @@ mod tests {
             proposer: TEST_PROPOSER,
             fees_collected: TEST_PAYSET_FEE,
             payset: vec![rekey_stx],
+            genesis_hash: crate::apply::pool_fixtures::TEST_GENESIS_HASH,
             ..Block::default()
         };
         apply_block_validating(&mut state, &block1).expect("rekey should succeed");
@@ -7880,6 +8033,7 @@ mod tests {
             proposer: TEST_PROPOSER,
             fees_collected: TEST_PAYSET_FEE,
             payset: vec![correct_spend],
+            genesis_hash: crate::apply::pool_fixtures::TEST_GENESIS_HASH,
             ..Block::default()
         };
         apply_block_validating(&mut state, &block2_good)
@@ -7929,6 +8083,7 @@ mod tests {
             proposer: TEST_PROPOSER,
             fees_collected: TEST_PAYSET_FEE,
             payset: vec![stx],
+            genesis_hash: crate::apply::pool_fixtures::TEST_GENESIS_HASH,
             ..Block::default()
         };
         apply_block_validating(&mut state, &block)
@@ -10884,6 +11039,8 @@ mod tests {
             fee_sink,
         );
         let mut block = make_test_block(fee_sink);
+        // V41 requires a genesis hash for go's `Alive` (validating, #2127).
+        block.genesis_hash = crate::apply::pool_fixtures::TEST_GENESIS_HASH;
         block.proposer = proposer;
         block.fees_collected = 1_000;
         block.bonus = bonus;
@@ -11713,7 +11870,8 @@ mod tests {
             round,
             mode: ApplyMode::Replay,
             validate: false,
-            leases_checked_by_caller: false,
+            caller_tracks_leases: false,
+            checkdup: None,
             generate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
@@ -12424,7 +12582,8 @@ mod tests {
             round: 100,
             mode: ApplyMode::Replay,
             validate: false,
-            leases_checked_by_caller: false,
+            caller_tracks_leases: false,
+            checkdup: None,
             generate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
@@ -12613,7 +12772,8 @@ mod tests {
             round,
             mode: ApplyMode::Replay,
             validate: false,
-            leases_checked_by_caller: false,
+            caller_tracks_leases: false,
+            checkdup: None,
             generate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
@@ -12641,7 +12801,8 @@ mod tests {
             round,
             mode: ApplyMode::Replay,
             validate: false,
-            leases_checked_by_caller: false,
+            caller_tracks_leases: false,
+            checkdup: None,
             generate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
@@ -14238,7 +14399,8 @@ return
             round,
             mode: ApplyMode::Replay,
             validate: false,
-            leases_checked_by_caller: false,
+            caller_tracks_leases: false,
+            checkdup: None,
             generate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
@@ -15048,6 +15210,7 @@ return
         // The sender does not exist: this member fails.
         let bad_pay = pay_txn(Address([9u8; 32]), Address([8u8; 32]), 5_000_000, 1_000);
         let group = [&stpf, &bad_pay];
+        let rule = algo_types::genesis_restore::GenesisRestoreRule::unstripped("", &[0u8; 32]);
 
         ctx.fee_credit.set(11);
         ctx.fee_residue.set(12);
@@ -15060,6 +15223,7 @@ return
             &mut state,
             &group,
             &ctx,
+            &rule,
             &mut budget,
             &mut box_budget,
             None,
@@ -15095,6 +15259,7 @@ return
             &mut state,
             &ok_group,
             &ctx,
+            &rule,
             &mut budget,
             &mut box_budget,
             None,
@@ -15104,6 +15269,125 @@ return
         )
         .expect("stpf alone applies");
         assert_eq!(ctx.state_proof_next.get(), 1280);
+    }
+
+    /// A failed group's txids and leases do not stay in the block's
+    /// `checkDup` state (go applies a group to a child cow and runs `addTx`
+    /// only once it applied), so a later group of the same evaluation that
+    /// reuses the lease is accepted, while a repeat inside one group is still
+    /// rejected (issue #2127).
+    #[test]
+    fn failed_group_rolls_back_its_checkdup_records() {
+        let fee_sink = Address([3u8; 32]);
+        let (a, b) = (Address([0xA1; 32]), Address([0xB2; 32]));
+        let gh = [0x6E; 32];
+        let lease = [0x5A; 32];
+        let mut state =
+            make_state_with_accounts(&[(fee_sink, 0), (a, 10_000_000), (b, 10_000_000)], fee_sink);
+        let leased = |amount: u64, note: u8| {
+            let mut s = pay_txn(a, b, amount, 1_000);
+            s.txn.lease = lease;
+            s.txn.genesis_hash = gh;
+            s.txn.note = serde_bytes::ByteBuf::from(vec![note]);
+            s
+        };
+        let overspend = leased(1_000_000_000, 1);
+        let ok = leased(1_000, 2);
+        let ok2 = leased(1_000, 3);
+        let txids: Vec<_> = [&overspend, &ok, &ok2, &ok]
+            .iter()
+            .map(|s| algo_codec::compute_txn_id(&s.txn))
+            .collect();
+        let mut ctx = ApplyContext::new_replay(0, fee_sink, 1172);
+        ctx.consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+        ctx.caller_tracks_leases = true;
+        ctx.checkdup = Some(RefCell::new(crate::check_dup::BlockCheckDup::new(
+            1172, txids,
+        )));
+        let rule = algo_types::genesis_restore::GenesisRestoreRule::unstripped("", &gh);
+        let mut run = |group: &[&SignedTransaction], idx: usize| {
+            let (mut idx, mut failed) = (idx, None);
+            apply_group_transactions(
+                &mut state,
+                group,
+                &ctx,
+                &rule,
+                &mut GroupBudget::new(0),
+                &mut BoxBudgetState::default(),
+                None,
+                None,
+                &mut idx,
+                &mut failed,
+            )
+        };
+        let err = run(&[&overspend], 0).expect_err("the overspend fails");
+        assert!(!err.to_string().contains("overlapping lease"), "{err}");
+        // A repeat inside one group is still caught against its own earlier
+        // member.
+        let err = run(&[&ok, &ok2], 1).expect_err("in-group lease repeat");
+        assert!(err.to_string().contains("overlapping lease"), "{err}");
+        // Neither failed group left its txids or lease behind.
+        run(&[&ok], 3).expect("the failed groups' records were rolled back");
+    }
+
+    /// A validating context built without the block's `checkDup` state
+    /// still runs go's `Alive` (and the authorizer): a dead transaction is
+    /// rejected with go's bare text (issue #2127).
+    #[test]
+    fn validating_context_without_checkdup_still_runs_alive() {
+        let fee_sink = Address([3u8; 32]);
+        let (a, b) = (Address([0xA1; 32]), Address([0xB2; 32]));
+        let gh = [0x6E; 32];
+        let mut state =
+            make_state_with_accounts(&[(fee_sink, 0), (a, 10_000_000), (b, 10_000_000)], fee_sink);
+        let mut dead = pay_txn(a, b, 1_000, 1_000);
+        dead.txn.genesis_hash = gh;
+        dead.txn.first_valid = Round(1);
+        dead.txn.last_valid = Round(10);
+        let mut ctx = ApplyContext::new_replay(0, fee_sink, 1172);
+        ctx.consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+        ctx.validate = true;
+        assert!(ctx.checkdup.is_none());
+        let rule = algo_types::genesis_restore::GenesisRestoreRule::unstripped("", &gh);
+        let (mut idx, mut failed) = (0usize, None);
+        let err = apply_group_transactions(
+            &mut state,
+            &[&dead],
+            &ctx,
+            &rule,
+            &mut GroupBudget::new(0),
+            &mut BoxBudgetState::default(),
+            None,
+            None,
+            &mut idx,
+            &mut failed,
+        )
+        .expect_err("a dead transaction is rejected");
+        assert_eq!(err.to_string(), "txn dead: round 1172 outside of 1--10");
+        assert_eq!(failed, Some(0));
+
+        // Without validation nothing is checked (go `Ledger.AddBlock`).
+        ctx.validate = false;
+        let (mut idx, mut failed) = (0usize, None);
+        apply_group_transactions(
+            &mut state,
+            &[&dead],
+            &ctx,
+            &rule,
+            &mut GroupBudget::new(0),
+            &mut BoxBudgetState::default(),
+            None,
+            None,
+            &mut idx,
+            &mut failed,
+        )
+        .expect("replay applies it");
     }
 
     /// go's `endOfBlock` order: voters commitment, online total weight, then
@@ -16143,6 +16427,7 @@ return
             current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
             absent_participation_accounts: Some(vec![absent_addr]),
             payset: vec![whale_keyreg],
+            genesis_hash: crate::apply::pool_fixtures::TEST_GENESIS_HASH,
             ..Block::default()
         };
 
@@ -16187,7 +16472,8 @@ return
             round: 1,
             mode: ApplyMode::Replay,
             validate: false,
-            leases_checked_by_caller: false,
+            caller_tracks_leases: false,
+            checkdup: None,
             generate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],

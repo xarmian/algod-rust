@@ -285,6 +285,10 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
         self.inner.record_lease(sender, lease, last_valid);
     }
 
+    fn pending_block_lease(&self, sender: &Address, lease: &[u8; 32], round: u64) -> bool {
+        self.inner.pending_block_lease(sender, lease, round)
+    }
+
     fn purge_expired_leases(&mut self, current_round: u64) {
         self.inner.purge_expired_leases(current_round);
     }

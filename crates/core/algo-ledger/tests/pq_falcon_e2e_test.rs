@@ -446,8 +446,9 @@ fn pq_challenged_falcon_address_can_heartbeat_for_zero_fee_full_e2e() {
     // `hbLifetime` (10 rounds) window must actually cover the round it
     // gets applied at. Before this fix, algod-rust's apply/validate paths
     // had no check anywhere enforcing that -- so this test's `1`, ~1100
-    // rounds before `apply_round`, was silently accepted; now that
-    // `check_txn_alive`/`validate_block`'s liveness check exists, that
+    // rounds before `apply_round`, was silently accepted; now that go's
+    // `Alive` (`check_dup::alive`, run by `txn_prologue`) and
+    // `validate_block`'s liveness check exist, that
     // stale header round correctly fails as "dead" and must be fixed to a
     // realistic value instead.
     let hb_header_round = apply_round - 1;

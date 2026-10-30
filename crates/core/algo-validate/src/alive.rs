@@ -48,32 +48,55 @@ pub fn block_alive(
     params: &ConsensusParams,
     txn: &Transaction,
 ) -> Result<(), String> {
+    block_alive_with_genesis(
+        round,
+        genesis_id,
+        genesis_hash,
+        params,
+        txn,
+        &txn.genesis_id,
+        &txn.genesis_hash,
+    )
+}
+
+/// [`block_alive`] for a transaction whose genesis id / hash are given
+/// separately: a block's payset stores them stripped, and go's
+/// `DecodeSignedTxn` restores them before `Alive` runs (pass
+/// `GenesisRestoreRule::restored_genesis`), so no transaction is cloned.
+pub fn block_alive_with_genesis(
+    round: u64,
+    genesis_id: &str,
+    genesis_hash: &[u8; 32],
+    params: &ConsensusParams,
+    txn: &Transaction,
+    txn_genesis_id: &str,
+    txn_genesis_hash: &[u8; 32],
+) -> Result<(), String> {
     let (first, last) = (txn.first_valid.0, txn.last_valid.0);
     if round < first || round > last {
         return Err(txn_dead_message(round, first, last));
     }
-    if !txn.genesis_id.is_empty() && txn.genesis_id != genesis_id {
+    if !txn_genesis_id.is_empty() && txn_genesis_id != genesis_id {
         return Err(format!(
-            "tx.GenesisID <{}> does not match expected <{}>",
-            txn.genesis_id, genesis_id
+            "tx.GenesisID <{txn_genesis_id}> does not match expected <{genesis_id}>"
         ));
     }
     let zero = [0u8; 32];
     if params.support_genesis_hash {
-        if txn.genesis_hash != zero && txn.genesis_hash != *genesis_hash {
+        if *txn_genesis_hash != zero && txn_genesis_hash != genesis_hash {
             return Err(format!(
                 "tx.GenesisHash <{}> does not match expected <{}>",
-                Digest(txn.genesis_hash),
+                Digest(*txn_genesis_hash),
                 Digest(*genesis_hash),
             ));
         }
-        if params.require_genesis_hash && txn.genesis_hash == zero {
+        if params.require_genesis_hash && *txn_genesis_hash == zero {
             return Err("required tx.GenesisHash is missing".to_string());
         }
-    } else if txn.genesis_hash != zero {
+    } else if *txn_genesis_hash != zero {
         return Err(format!(
             "tx.GenesisHash <{}> not allowed",
-            Digest(txn.genesis_hash)
+            Digest(*txn_genesis_hash)
         ));
     }
     Ok(())

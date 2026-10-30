@@ -557,9 +557,11 @@ impl ParticipateAgreementControl {
                 None
             }
         };
-        // Stateless validation plus go's `validateForPayouts` against the
-        // committed ledger (issue #1798): a peer proposal's FeesCollected /
-        // Proposer / ProposerPayout are judged before this node votes.
+        // Stateless validation plus go's `validateForPayouts` (issue #1798)
+        // and `checkDup` (issue #2127) against the committed ledger: a peer
+        // proposal's FeesCollected / Proposer / ProposerPayout, replayed or
+        // repeated txids and live-lease conflicts are judged before this
+        // node votes (go `Ledger.Validate`).
         let block_validator: Arc<PayoutCheckingValidator<BlockValidatorBridge>> =
             Arc::new(PayoutCheckingValidator::new(
                 BlockValidatorBridge::new(
@@ -1377,12 +1379,14 @@ impl CowOverlay {
     }
 
     /// Check whether a lease conflicts with an already-included transaction
-    /// in this block's overlay.
+    /// in this block's overlay: go's block cow `LeaseInLedgerError` with
+    /// `InBlockEvaluator` (issue #2127) for the transaction `txid`.
     fn check_lease_in_overlay(
         &self,
         sender: &Address,
         lease: &[u8; 32],
         round: u64,
+        txid: &[u8; 32],
     ) -> Result<(), algo_error::AlgoError> {
         // All-zero lease is always allowed.
         if *lease == [0u8; 32] {
@@ -1390,9 +1394,12 @@ impl CowOverlay {
         }
         if let Some(&last_valid) = self.leases.get(&(*sender, *lease)) {
             if last_valid >= round {
-                return Err(algo_error::AlgoError::Ledger {
-                    message: "duplicate lease in block".into(),
-                });
+                return Err(algo_ledger::check_dup::lease_in_ledger_error(
+                    algo_types::Digest(*txid),
+                    sender,
+                    lease,
+                    true,
+                ));
             }
         }
         Ok(())
@@ -1408,12 +1415,15 @@ impl CowOverlay {
         self.leases.insert((*sender, *lease), last_valid);
     }
 
-    /// Check whether a transaction ID has already been seen in this block.
+    /// Check whether a transaction ID has already been seen in this block:
+    /// go's block cow `TransactionInLedgerError` with `InBlockEvaluator`
+    /// (issue #2127).
     fn check_txid(&self, txid: &[u8; 32]) -> Result<(), algo_error::AlgoError> {
         if self.seen_txids.contains(txid) {
-            return Err(algo_error::AlgoError::Ledger {
-                message: "duplicate transaction ID in block".into(),
-            });
+            return Err(algo_ledger::check_dup::transaction_in_ledger_error(
+                algo_types::Digest(*txid),
+                true,
+            ));
         }
         Ok(())
     }
@@ -1546,6 +1556,27 @@ fn reason_of(e: &algo_error::AlgoError, pc: usize) -> (String, algo_error::Rejec
 /// [`algo_error::AlgoError::Rejected`] keeping the structured AVM diagnostics
 /// reachable through its source.
 fn go_rejection(txid: &str, error: algo_error::AlgoError) -> algo_error::AlgoError {
+    // go's `Alive` and `checkDup` errors reach the pool bare and typed
+    // (`TxnDeadError` or a genesis mismatch, `TransactionInLedgerError`,
+    // `LeaseInLedgerError`): the pool tags them from the type, and go adds no
+    // `transaction <txid>:` frame to them.
+    if let algo_error::AlgoError::Rejected {
+        class:
+            algo_error::RejectClass::Alive
+            | algo_error::RejectClass::TxidInLedger { .. }
+            | algo_error::RejectClass::LeaseInLedger { .. },
+        ..
+    } = &error
+    {
+        return error;
+    }
+    // A rejection already framed as go frames it (`transaction <txid>: ...`,
+    // e.g. the authorizer check) is not framed twice.
+    if let algo_error::AlgoError::Rejected { message, .. } = &error {
+        if message.starts_with(&format!("transaction {txid}: ")) {
+            return error;
+        }
+    }
     let (reason, class) = pool_reason(&error);
     algo_error::AlgoError::Rejected {
         message: format!("transaction {txid}: {reason}"),
@@ -1815,7 +1846,7 @@ impl SimpleBlockEvaluator {
         let rejected = |message: String| algo_error::AlgoError::Rejected {
             source: None,
             message,
-            class: algo_error::RejectClass::Other,
+            class: algo_error::RejectClass::Alive,
         };
         for stx in txgroup {
             algo_validate::block_alive(
@@ -1888,63 +1919,60 @@ impl SimpleBlockEvaluator {
     /// 8. Rekey/auth-addr validation (authorizer matches ledger's auth_addr)
     /// 9. Sender balance precheck (fee + amount against overlay/snapshot)
     ///
-    /// Returns the group with genesis fields restored -- the exact
-    /// transactions whose txids were checked -- so `transaction_group`
-    /// records those same txids.
+    /// Returns the txids it checked (over the group with genesis fields
+    /// restored), so `transaction_group` records the same txids and the
+    /// real apply's `checkDup` reuses them instead of hashing the group
+    /// again.
     fn validate_group(
         &mut self,
         txgroup: &[algo_types::SignedTransaction],
-    ) -> Result<Vec<algo_types::SignedTransaction>, algo_error::AlgoError> {
+    ) -> Result<Vec<algo_types::Digest>, algo_error::AlgoError> {
         // Run all stateless checks first; reuse the restored (genesis fields
         // populated) copies rather than cloning + restoring the group again.
         let restored = self.validate_group_stateless_inner(txgroup)?;
 
         let round = self.hdr.round;
 
-        // 6. Transaction ID duplicate detection.
-        // Compute txid for each transaction (with genesis fields restored)
-        // and check for duplicates WITHIN the current group first, then
-        // against the in-block overlay. Mirrors Go's cow.checkDup(txid)
-        // which checks mods.Txids first.
+        // 6-7. go's `checkDup`, per transaction in go's order (the group's
+        // and the pending block's txid, then lease; then the ledger
+        // snapshot's lease), before the authorizer and balance prechecks,
+        // with go's typed errors and texts (issue #2127). Always run: the
+        // real apply's own `checkDup` (`exec_group`) may not run (stale base,
+        // spent budget); it adds what this snapshot cannot see (a lease
+        // committed after the snapshot) and the ledger's txtail.
+        let mut txids = Vec::with_capacity(restored.len());
         {
             let mut group_txids = HashSet::new();
+            let mut group_leases: HashSet<(Address, [u8; 32])> = HashSet::new();
             for stx in &restored {
                 let txid = compute_txid(&stx.txn);
                 if !group_txids.insert(txid) {
-                    return Err(algo_error::AlgoError::Ledger {
-                        message: "duplicate transaction ID within group".into(),
-                    });
+                    return Err(algo_ledger::check_dup::transaction_in_ledger_error(
+                        algo_types::Digest(txid),
+                        true,
+                    ));
                 }
                 self.overlay.check_txid(&txid)?;
-            }
-        }
-
-        // 7. Lease uniqueness check.
-        // For each transaction with a non-zero lease, check:
-        //   a. Duplicates WITHIN the current group (same sender + lease)
-        //   b. The in-block overlay (already-included txns in this block)
-        //   c. The ledger snapshot (existing leases from prior blocks)
-        // Mirrors Go's cow.checkDup() which checks mods.Txleases then
-        // delegates to roundCowBase.checkDup -> ledger.CheckDup.
-        {
-            let mut group_leases: HashSet<(Address, [u8; 32])> = HashSet::new();
-            for stx in &restored {
-                if stx.txn.lease != [0u8; 32] {
-                    // Check within current group first
-                    if !group_leases.insert((stx.txn.sender, stx.txn.lease)) {
-                        return Err(algo_error::AlgoError::Ledger {
-                            message: "duplicate lease within group".into(),
-                        });
+                let (sender, lease) = (stx.txn.sender, stx.txn.lease);
+                if lease != [0u8; 32] {
+                    let lease_error = |in_block| {
+                        algo_ledger::check_dup::lease_in_ledger_error(
+                            algo_types::Digest(txid),
+                            &sender,
+                            &lease,
+                            in_block,
+                        )
+                    };
+                    if !group_leases.insert((sender, lease)) {
+                        return Err(lease_error(true));
                     }
-                    // Check overlay (leases from earlier groups in this block)
-                    self.overlay.check_lease_in_overlay(
-                        &stx.txn.sender,
-                        &stx.txn.lease,
-                        round.0,
-                    )?;
-                    // Check ledger snapshot (leases from prior committed blocks)
-                    self.snapshot.check_lease(&stx.txn.sender, &stx.txn.lease)?;
+                    self.overlay
+                        .check_lease_in_overlay(&sender, &lease, round.0, &txid)?;
+                    if self.snapshot.check_lease(&sender, &lease).is_err() {
+                        return Err(lease_error(false));
+                    }
                 }
+                txids.push(algo_types::Digest(txid));
             }
         }
 
@@ -2092,7 +2120,7 @@ impl SimpleBlockEvaluator {
         // 10. Group fees, after every transaction's own state checks (go).
         self.check_group_fees(txgroup)?;
 
-        Ok(restored)
+        Ok(txids)
     }
 
     /// go's `OverspendError` text for `sender` (see `algo_validate::overspend`).
@@ -2594,7 +2622,7 @@ impl SimpleBlockEvaluator {
     fn exec_group(
         &mut self,
         stibs: &[algo_types::SignedTransaction],
-        restored: &[algo_types::SignedTransaction],
+        txids: Vec<algo_types::Digest>,
     ) -> Result<Option<u64>, algo_error::AlgoError> {
         use algo_ledger::proposal_eval::GroupEvalError;
 
@@ -2614,11 +2642,14 @@ impl SimpleBlockEvaluator {
         let base =
             algo_ledger::locked_base::LockedBase::new(&self.ledger, exec.overlay.base_round());
         let started = std::time::Instant::now();
-        let outcome = algo_ledger::proposal_eval::evaluate_group(
+        // `validate_group` already hashed the group: its txids are moved
+        // into the apply's `checkDup`.
+        let outcome = algo_ledger::proposal_eval::evaluate_group_with_txids(
             &base,
             &mut exec.overlay,
             &exec.template,
             stibs,
+            Some(txids),
         );
         let st = base.stats();
         let poisoned = base.is_poisoned();
@@ -2633,10 +2664,16 @@ impl SimpleBlockEvaluator {
         if poisoned {
             return Err(algo_ledger::locked_base::LockedBase::poison_error());
         }
-        let txid_of = |i: usize| {
-            restored
+        // Only a rejection needs a txid again: the failing member's, over
+        // the genesis fields go restores (one hash, on the error path).
+        let txid_of = |template: &algo_types::Block, i: usize| {
+            let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(template);
+            stibs
                 .get(i)
-                .map(|r| algo_codec::compute_txn_id(&r.txn).to_string())
+                .map(|stx| {
+                    let (gen, gh) = rule.restored_genesis(stx);
+                    algo_codec::compute_txn_id_with_genesis(&stx.txn, gen, gh).to_string()
+                })
                 .unwrap_or_default()
         };
         match outcome {
@@ -2644,13 +2681,15 @@ impl SimpleBlockEvaluator {
                 debug_assert_eq!(eval.apply_data.len(), stibs.len());
                 Ok(Some(eval.fees_collected))
             }
-            Err(GroupEvalError::Txn { index, error }) => Err(go_rejection(&txid_of(index), error)),
+            Err(GroupEvalError::Txn { index, error }) => {
+                Err(go_rejection(&txid_of(&exec.template, index), error))
+            }
             Err(GroupEvalError::Stale) => {
                 algo_ledger::proposal_eval::count_stale_base();
                 exec.incomplete = true;
                 Ok(None)
             }
-            Err(GroupEvalError::Other(e)) => Err(go_rejection(&txid_of(0), e)),
+            Err(GroupEvalError::Other(e)) => Err(go_rejection(&txid_of(&exec.template, 0), e)),
         }
     }
 
@@ -2808,7 +2847,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         &mut self,
         txgroup: &[algo_types::SignedTransaction],
     ) -> Result<(), algo_error::AlgoError> {
-        let restored = self.validate_group(txgroup)?;
+        let txids = self.validate_group(txgroup)?;
 
         // Convert each transaction to STIB (SignedTxnInBlock) format:
         // strip genesis fields and set has_genesis_id / has_genesis_hash flags.
@@ -2902,11 +2941,11 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         //
         // All mutations use the `_tracked` variants so the checkpoint
         // records what to undo on rollback.
-        for (stx, restored_stx) in txgroup.iter().zip(&restored) {
+        for (stx, txid) in txgroup.iter().zip(&txids) {
+            let txid = txid.0;
             // Record the transaction ID `validate_group` checked: computed
             // over the restored copy, i.e. what the block's STIB form
             // restores to (issue #1727).
-            let txid = compute_txid(&restored_stx.txn);
             self.overlay.record_txid_tracked(txid, &mut checkpoint);
 
             // Record lease if non-zero.
@@ -3276,7 +3315,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         // failing inner transaction or a rejecting program; this can.
         // Evaluated once here; the result also feeds the ApplyData of the
         // proposed block.
-        match self.exec_group(&stibs, &restored) {
+        match self.exec_group(&stibs, txids) {
             // The evaluated fees include inner-transaction fees (issue #1908).
             Ok(Some(fees)) => {
                 self.fees_collected = fees_collected_checkpoint.saturating_add(fees);
@@ -9264,7 +9303,7 @@ mod tests {
         assert!(overlay.check_txid(&txid).is_ok());
         overlay.record_txid(txid);
         let err = overlay.check_txid(&txid).unwrap_err();
-        assert!(err.to_string().contains("duplicate transaction ID"));
+        assert!(err.to_string().contains("transaction already in ledger"));
     }
 
     #[test]
@@ -9274,13 +9313,13 @@ mod tests {
         let lease = [0xBB; 32];
         let round = 100;
         assert!(overlay
-            .check_lease_in_overlay(&sender, &lease, round)
+            .check_lease_in_overlay(&sender, &lease, round, &[0x42; 32])
             .is_ok());
         overlay.record_lease(&sender, &lease, round + 500);
         let err = overlay
-            .check_lease_in_overlay(&sender, &lease, round)
+            .check_lease_in_overlay(&sender, &lease, round, &[0x42; 32])
             .unwrap_err();
-        assert!(err.to_string().contains("duplicate lease"));
+        assert!(err.to_string().contains("overlapping lease"));
     }
 
     #[test]
@@ -9290,7 +9329,7 @@ mod tests {
         let zero_lease = [0u8; 32];
         overlay.record_lease(&sender, &zero_lease, 999);
         assert!(overlay
-            .check_lease_in_overlay(&sender, &zero_lease, 100)
+            .check_lease_in_overlay(&sender, &zero_lease, 100, &[0x42; 32])
             .is_ok());
     }
 
@@ -10115,10 +10154,11 @@ mod tests {
         // First submission succeeds
         assert!(eval.transaction_group(std::slice::from_ref(&stx)).is_ok());
 
-        // Same exact transaction again — should be rejected as duplicate txid
+        // Same exact transaction again — go's in-block
+        // `TransactionInLedgerError` (issue #2127).
         let err = eval.transaction_group(&[stx]).unwrap_err();
         assert!(
-            err.to_string().contains("duplicate transaction ID"),
+            err.to_string().contains("transaction already in ledger"),
             "expected duplicate txid error, got: {err}"
         );
     }
@@ -10136,8 +10176,7 @@ mod tests {
         let stx = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100);
         let err = eval.transaction_group(&[stx.clone(), stx]).unwrap_err();
         assert!(
-            err.to_string()
-                .contains("duplicate transaction ID within group"),
+            err.to_string().contains("transaction already in ledger"),
             "expected intra-group duplicate txid error, got: {err}"
         );
     }
@@ -10166,7 +10205,7 @@ mod tests {
 
         let err = eval.transaction_group(&[stx1, stx2]).unwrap_err();
         assert!(
-            err.to_string().contains("duplicate lease within group"),
+            err.to_string().contains("using an overlapping lease"),
             "expected intra-group duplicate lease error, got: {err}"
         );
     }
@@ -10794,7 +10833,7 @@ mod tests {
             .transaction_group(std::slice::from_ref(&stx))
             .unwrap_err();
         assert!(
-            err.to_string().contains("duplicate transaction ID"),
+            err.to_string().contains("transaction already in ledger"),
             "{err}"
         );
         let flagged = SignedTransaction {

@@ -98,6 +98,10 @@ fn template(l: &SqliteLedger) -> Block {
         current_protocol: CONSENSUS_V41.to_string(),
         fee_sink: addr(0xF1),
         rewards_pool: addr(0xF2),
+        // V41 requires a genesis hash; the payset's stripped transactions
+        // take this one back, so the proposal check's `Alive` (issue #2127)
+        // passes for them.
+        genesis_hash: [0x6E; 32],
         ..Block::default()
     }
 }
@@ -667,15 +671,15 @@ fn overlay_payset_pass_matches_the_locked_scratch_apply() {
     );
 }
 
-/// Issue #1895: `evaluate_validate_payouts` (overlay over a `LockedBase`, no
+/// Issue #1895: `evaluate_proposal_check` (overlay over a `LockedBase`, no
 /// mutex held across the evaluation) returns exactly the verdict of the
-/// locked `scratch_validate_payouts` over random paysets with valid, wrong
+/// locked `scratch_proposal_check` over random paysets with valid, wrong
 /// and missing payout / fee / proposer header fields.
 #[test]
 fn overlay_payout_validation_matches_the_locked_scratch_validation() {
     use crate::locked_base::LockedBase;
-    use crate::proposal_eval::evaluate_validate_payouts;
-    use crate::shadow_execute::{scratch_validate_payouts, PayoutCheck};
+    use crate::proposal_eval::evaluate_proposal_check;
+    use crate::shadow_execute::{scratch_proposal_check, ProposalCheck};
 
     let (mut valid, mut violation, mut other, mut compared) = (0usize, 0usize, 0usize, 0usize);
     for seed in 0..24u64 {
@@ -732,11 +736,11 @@ fn overlay_payout_validation_matches_the_locked_scratch_validation() {
                 _ => rng.random_range(0..2_000_000u64),
             };
             let mut reference = setup_with_online();
-            let locked = scratch_validate_payouts(&mut reference, &block);
+            let locked = scratch_proposal_check(&mut reference, &block);
 
             let shared = std::sync::Mutex::new(setup_with_online());
             let lbase = LockedBase::new(&shared, Round(0));
-            let overlay_check = evaluate_validate_payouts(&lbase, &block);
+            let overlay_check = evaluate_proposal_check(&lbase, &block);
             assert!(!lbase.is_stale());
             assert_eq!(
                 locked, overlay_check,
@@ -744,9 +748,9 @@ fn overlay_payout_validation_matches_the_locked_scratch_validation() {
             );
             compared += 1;
             match locked {
-                PayoutCheck::Valid => valid += 1,
-                PayoutCheck::Violation(_) => violation += 1,
-                PayoutCheck::NoVerdict { .. } => other += 1,
+                ProposalCheck::Valid => valid += 1,
+                ProposalCheck::Violation { .. } => violation += 1,
+                ProposalCheck::NoVerdict { .. } => other += 1,
             }
         }
     }
@@ -763,8 +767,8 @@ fn overlay_payout_validation_matches_the_locked_scratch_validation() {
 #[test]
 fn overlay_payout_validation_is_a_transient_no_verdict_when_the_ledger_advances() {
     use crate::locked_base::LockedBase;
-    use crate::proposal_eval::evaluate_validate_payouts;
-    use crate::shadow_execute::PayoutCheck;
+    use crate::proposal_eval::evaluate_proposal_check;
+    use crate::shadow_execute::ProposalCheck;
     use std::sync::{Arc, Mutex};
 
     let shared = Arc::new(Mutex::new(setup_with_online()));
@@ -788,8 +792,8 @@ fn overlay_payout_validation_is_a_transient_no_verdict_when_the_ledger_advances(
     lbase.before_acquisition(10, move || {
         m.lock().unwrap().set_current_round(Round(1));
     });
-    match evaluate_validate_payouts(&lbase, &block) {
-        PayoutCheck::NoVerdict { transient, .. } => assert!(transient),
+    match evaluate_proposal_check(&lbase, &block) {
+        ProposalCheck::NoVerdict { transient, .. } => assert!(transient),
         other => panic!("expected a transient no-verdict, got {other:?}"),
     }
     assert!(lbase.is_stale());
@@ -798,8 +802,8 @@ fn overlay_payout_validation_is_a_transient_no_verdict_when_the_ledger_advances(
     ahead.lock().unwrap().set_current_round(Round(5));
     let stale = LockedBase::new(&ahead, Round(0));
     assert!(matches!(
-        evaluate_validate_payouts(&stale, &block),
-        PayoutCheck::NoVerdict {
+        evaluate_proposal_check(&stale, &block),
+        ProposalCheck::NoVerdict {
             transient: true,
             ..
         }

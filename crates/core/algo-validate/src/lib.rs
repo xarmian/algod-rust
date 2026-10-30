@@ -29,7 +29,7 @@ pub mod rules;
 pub mod signature;
 pub mod verified_txn_cache;
 
-pub use alive::{block_alive, txn_dead_message};
+pub use alive::{block_alive, block_alive_with_genesis, txn_dead_message};
 pub use batch_verify::{BatchVerifier, BatchVerifierConfig, BatchVerifyRequest};
 pub use block::{
     contents_match_header, restore_payset_genesis_fields, validate_block, BlockValidationError,

@@ -52,10 +52,10 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use algo_codec::{
-    canonical_encode_block, canonical_encode_block_header_from_block, compute_txn_id,
+use algo_codec::{canonical_encode_block, canonical_encode_block_header_from_block};
+use algo_ledger::apply::{
+    apply_generated_block_capturing_apply_data_with_delta_or_failed_txn, ApplyData, ApplyMode,
 };
-use algo_ledger::apply::{apply_block_capturing_apply_data_with_delta, ApplyData, ApplyMode};
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::SqliteLedger;
 use algo_pool::TransactionPool;
@@ -97,7 +97,7 @@ pub fn restore_with_rule(
 /// [`restore_block_genesis_fields`]).
 #[cfg(test)]
 pub fn block_txn_id(stx: &SignedTransaction, block: &Block) -> Digest {
-    compute_txn_id(
+    algo_codec::compute_txn_id(
         &algo_types::genesis_restore::GenesisRestoreRule::for_block(block).restored_txn(stx),
     )
 }
@@ -105,12 +105,16 @@ pub fn block_txn_id(stx: &SignedTransaction, block: &Block) -> Digest {
 /// Canonical txids of every transaction in `block`'s payset (the rule is
 /// resolved once, not per transaction).
 pub fn block_txn_ids(block: &Block) -> HashSet<Digest> {
-    let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(block);
-    block
-        .payset
-        .iter()
-        .map(|stx| compute_txn_id(&rule.restored_txn(stx)))
-        .collect()
+    payset_txids(block).into_iter().collect()
+}
+
+/// The payset's txids in payset order, over the genesis fields go restores
+/// (`algo_codec::block_txids_with_rule`, the one restored-genesis hashing).
+fn payset_txids(block: &Block) -> Vec<Digest> {
+    algo_codec::block_txids_with_rule(
+        block,
+        &algo_types::genesis_restore::GenesisRestoreRule::for_block(block),
+    )
 }
 
 /// Assemble, finish, commit, and announce one dev-mode block built from the
@@ -233,20 +237,41 @@ pub fn produce_dev_block(
             .map_err(|e| anyhow::anyhow!("ledger lock poisoned: {e}"))?;
         l.begin_block()
             .map_err(|e| anyhow::anyhow!("begin_block: {e}"))?;
-        let result = (|| -> Result<
-            (Vec<ApplyData>, algo_ledger::state_delta::StateDelta),
-            algo_error::AlgoError,
-        > {
-            l.put_block(block.round.0, &proto, &hdr_data, &blk_data)?;
-            l.put_block_cert(block.round.0, &cert_data)?;
-            // Execute mode runs the AVM, rejecting transactions whose programs
-            // fail (rather than confirming an invalid app call as Replay would),
-            // and returns the per-transaction ApplyData plus a fully-populated
-            // StateDelta (Accts/Txids/Txleases/Hdr, plus KvMods from any box
-            // deltas -- issue #570) computed from the same apply pass (issue
-            // #581).
-            apply_block_capturing_apply_data_with_delta(&mut *l, &block, ApplyMode::Execute)
-        })();
+        // `None`: a storage failure (no verdict on the payset); `Some(index)`:
+        // the evaluation rejected the block, at payset `index` when one
+        // transaction owns the failure.
+        type Failure = (algo_error::AlgoError, Option<Option<usize>>);
+        let result =
+            (|| -> Result<(Vec<ApplyData>, algo_ledger::state_delta::StateDelta), Failure> {
+                l.put_block(block.round.0, &proto, &hdr_data, &blk_data)
+                    .map_err(|e| (e, None))?;
+                l.put_block_cert(block.round.0, &cert_data)
+                    .map_err(|e| (e, None))?;
+                // Execute mode runs the AVM, rejecting transactions whose programs
+                // fail (rather than confirming an invalid app call as Replay would),
+                // and returns the per-transaction ApplyData plus a fully-populated
+                // StateDelta (Accts/Txids/Txleases/Hdr, plus KvMods from any box
+                // deltas -- issue #570) computed from the same apply pass (issue
+                // #581).
+                // It also runs go's `Alive` and `checkDup`: go's dev block comes
+                // from a Generate + Validate evaluator (issue #2127).
+                let applied = apply_generated_block_capturing_apply_data_with_delta_or_failed_txn(
+                    &mut *l,
+                    &block,
+                    ApplyMode::Execute,
+                );
+                #[cfg(test)]
+                let applied = applied.and_then(|ok| match test_hooks::marked_rejection(&block) {
+                    Some(index) => Err((
+                        algo_error::AlgoError::Ledger {
+                            message: test_hooks::INJECTED_REJECTION.into(),
+                        },
+                        Some(index),
+                    )),
+                    None => Ok(ok),
+                });
+                applied.map_err(|(e, index)| (e, Some(index)))
+            })();
         match result {
             Ok((apply_data, delta)) => {
                 // Cache the delta into the DeltaCache so `GET
@@ -254,7 +279,7 @@ pub fn produce_dev_block(
                 // /v2/applications/{id}/boxes?round=N` can serve this round
                 // historically. `Accts.AppResources`/`AssetResources`,
                 // `Creatables`, `Totals`, and `StateProofNext` stay at their
-                // zero values -- `apply_block_capturing_apply_data_with_delta`
+                // zero values -- `apply_generated_block_capturing_apply_data_with_delta`
                 // doesn't compute those (tracked separately in #586), not a
                 // gap specific to dev-mode caching. Cached unconditionally
                 // (even when the delta is otherwise empty) so the cache's
@@ -270,12 +295,27 @@ pub fn produce_dev_block(
                     .map_err(|e| anyhow::anyhow!("commit_block: {e}"))?;
                 apply_data
             }
-            Err(e) => {
+            Err((e, rejected)) => {
                 let _ = l.rollback_block();
-                return Err(anyhow::anyhow!(
-                    "commit dev-mode block {}: {e}",
-                    block.round.0
-                ));
+                drop(l);
+                let message = format!("commit dev-mode block {}: {e}", block.round.0);
+                // go's `AssembleDevModeBlock` drops a group its evaluator
+                // rejects: drop the failing transaction's group from the pool
+                // so the next dev block does not stall on it, with the
+                // rejection as its `pending/{txid}` reason. A rejection no
+                // single transaction owns drops the block's groups (a dev
+                // block is the pool's whole content). A storage failure says
+                // nothing about the payset: the pool is left as it is.
+                match rejected {
+                    Some(Some(index)) => {
+                        evict_failed_group(pool, &block, index, &e);
+                    }
+                    Some(None) => {
+                        pool.evict_groups(&committed_txids, &e);
+                    }
+                    None => {}
+                }
+                return Err(anyhow::anyhow!(message));
             }
         }
     };
@@ -286,9 +326,59 @@ pub fn produce_dev_block(
     Ok((block, apply_data))
 }
 
+/// Evict from `pool` the group of `block.payset[index]` (payset form: the
+/// group's members share its group id; an ungrouped transaction is its own
+/// group), with the commit's rejection `error`. Returns how many pool groups
+/// were dropped.
+pub fn evict_failed_group(
+    pool: &TransactionPool,
+    block: &Block,
+    index: usize,
+    error: &algo_error::AlgoError,
+) -> usize {
+    let Some(failed) = block.payset.get(index) else {
+        return 0;
+    };
+    let group = failed.txn.group;
+    let txids: HashSet<Digest> = block
+        .payset
+        .iter()
+        .zip(payset_txids(block))
+        .enumerate()
+        .filter(|(i, (stx, _))| {
+            if group == [0u8; 32] {
+                *i == index
+            } else {
+                stx.txn.group == group
+            }
+        })
+        .map(|(_, (_, txid))| txid)
+        .collect();
+    pool.evict_groups(&txids, error)
+}
+
+/// Test-only fault injection: a dev block whose payset carries a
+/// transaction with the note [`test_hooks::REJECT_NOTE`] is rejected at
+/// commit, at that transaction, after the pool admitted it.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use algo_types::Block;
+
+    pub(crate) const REJECT_NOTE: &[u8] = b"test:reject-dev-commit";
+    pub(crate) const INJECTED_REJECTION: &str = "injected dev-commit rejection";
+
+    pub(crate) fn marked_rejection(block: &Block) -> Option<usize> {
+        block
+            .payset
+            .iter()
+            .position(|stx| stx.txn.note.as_ref() == REJECT_NOTE)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use algo_codec::compute_txn_id;
     use algo_types::{Round, Transaction, TxnType, CONSENSUS_V41};
 
     fn block_with_genesis(proto: &str, id: &str, hash: [u8; 32]) -> Block {

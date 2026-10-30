@@ -1870,6 +1870,50 @@ pub fn build_txtail_from_block_with_rule(
     block: &Block,
     rule: &GenesisRestoreRule<'_>,
 ) -> TxTailRound {
+    txtail_from_block_and_txids(block, &block_txids_with_rule(block, rule))
+}
+
+/// The txid of every payset transaction, as the txtail records it.
+///
+/// go's `TxTailRoundFromBlock` iterates the payset decoded through
+/// `BlockHeader.DecodeSignedTxn`, i.e. with the stripped genesis id/hash
+/// restored (issue #1707). The txid is hashed over the BORROWED stripped
+/// transaction with the restored `gen`/`gh` supplied as encoding overrides,
+/// so no `Transaction` (possibly a large appl) is ever cloned. Idempotent:
+/// an already-restored txn keeps its own genesis fields.
+pub fn block_txids_with_rule(block: &Block, rule: &GenesisRestoreRule<'_>) -> Vec<Digest> {
+    block
+        .payset
+        .iter()
+        .map(|stx| {
+            let (gen, gh) = rule.restored_genesis(stx);
+            crate::compute_txn_id_with_genesis(&stx.txn, gen, gh)
+        })
+        .collect()
+}
+
+/// [`build_txtail_from_block`] with the payset's txids already computed
+/// ([`block_txids_with_rule`]; `txids[i]` belongs to `block.payset[i]`).
+/// A txid count that does not match the payset is an error.
+pub fn build_txtail_from_block_with_txids(
+    block: &Block,
+    txids: &[Digest],
+) -> Result<TxTailRound, algo_error::AlgoError> {
+    if txids.len() != block.payset.len() {
+        return Err(algo_error::AlgoError::Ledger {
+            message: format!(
+                "txtail: {} txids for a payset of {}",
+                txids.len(),
+                block.payset.len()
+            ),
+        });
+    }
+    Ok(txtail_from_block_and_txids(block, txids))
+}
+
+/// The txtail row of `block` from `txids`, one per payset transaction
+/// (checked by the callers).
+fn txtail_from_block_and_txids(block: &Block, txids: &[Digest]) -> TxTailRound {
     let hdr = BlockHeader {
         round: block.round,
         branch: block.branch,
@@ -1911,16 +1955,9 @@ pub fn build_txtail_from_block_with_rule(
     let mut last_valid = Vec::with_capacity(block.payset.len());
     let mut leases = Vec::new();
 
-    // go's `TxTailRoundFromBlock` iterates the payset decoded through
-    // `BlockHeader.DecodeSignedTxn`, i.e. with the stripped genesis id/hash
-    // restored (issue #1707). The txid is hashed over the BORROWED stripped
-    // transaction with the restored `gen`/`gh` supplied as encoding overrides,
-    // so no `Transaction` (possibly a large appl) is ever cloned. `last_valid`
-    // and `lease` are not stripped fields and are read straight from `stx`.
-    // Idempotent: an already-restored txn keeps its own genesis fields.
-    for (idx, stx) in block.payset.iter().enumerate() {
-        let (gen, gh) = rule.restored_genesis(stx);
-        let txid = crate::compute_txn_id_with_genesis(&stx.txn, gen, gh);
+    // `last_valid` and `lease` are not stripped fields and are read straight
+    // from `stx`.
+    for (idx, (stx, txid)) in block.payset.iter().zip(txids).enumerate() {
         txn_ids.push(ByteBuf::from(txid.0.to_vec()));
         last_valid.push(stx.txn.last_valid.0);
 

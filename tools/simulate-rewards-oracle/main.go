@@ -47,6 +47,8 @@
 //
 // The same run also writes the issue #2125 duplicate-txid / lease oracle,
 // tests/fixtures/simulate_checkdup/oracle.json (see checkdup.go).
+// And the issue #2127 block-validation oracle,
+// tests/fixtures/block_checkdup/oracle.json (see blockdup.go).
 //
 // Regenerate (needs cgo + the vendored libsodium: `make libsodium` in the
 // go-algorand checkout first):
@@ -374,4 +376,6 @@ func main() {
 
 	// The issue #2125 oracle (checkdup.go) shares this module.
 	checkDupOracle()
+	// The issue #2127 oracle (blockdup.go) too.
+	blockDupOracle()
 }

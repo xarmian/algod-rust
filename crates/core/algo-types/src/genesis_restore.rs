@@ -403,6 +403,31 @@ impl<'a> GenesisRestoreRule<'a> {
         }
     }
 
+    /// Rule for a payset that was never stripped (a simulate request's
+    /// transactions): the header genesis is `genesis_id` / `genesis_hash`
+    /// and nothing is ever restored.
+    #[must_use]
+    pub fn unstripped(genesis_id: &'a str, genesis_hash: &'a [u8; 32]) -> Self {
+        Self {
+            supports_stripped: false,
+            ..Self::new(genesis_id, genesis_hash, false)
+        }
+    }
+
+    /// The header's genesis id.
+    #[inline]
+    #[must_use]
+    pub fn genesis_id(&self) -> &'a str {
+        self.genesis_id
+    }
+
+    /// The header's genesis hash.
+    #[inline]
+    #[must_use]
+    pub fn genesis_hash(&self) -> &'a [u8; 32] {
+        self.genesis_hash
+    }
+
     /// The genesis id / hash `stx`'s transaction has once restored,
     /// borrowed (from `stx` or from the rule): hashing the stripped txn
     /// with these as overrides yields the TxID of the restored txn with no

@@ -26,47 +26,79 @@
 //! go asks the block being evaluated first (`roundCowState.checkDup`,
 //! `ledger/eval/cow.go`: the txid, then the lease), then the ledger's txtail
 //! (`txTail.checkDup`, `ledger/txtail.go`: the lease, then the txid).
-//! [`check_dup`] keeps that order. Simulate uses it today (issue #2125); it
-//! takes the block's own state as a [`BlockDups`] and the ledger's as a
-//! [`LedgerDups`] so validate-mode block evaluation can reuse it (issue
-//! #2127).
+//! [`check_dup`] keeps that order. It takes the block's own state as a
+//! [`BlockDups`] and the ledger's as a [`LedgerDups`]: simulate uses it per
+//! group (issue #2125), and validate-mode block evaluation per block through
+//! [`BlockCheckDup`] (issue #2127).
 
 use std::collections::{HashMap, HashSet};
 
-use algo_error::AlgoError;
+use algo_error::{AlgoError, RejectClass};
 use algo_types::consensus::ConsensusParams;
+use algo_types::genesis_restore::GenesisRestoreRule;
 use algo_types::{Address, Digest, Transaction};
 
 use crate::store_trait::LedgerStore;
 
 /// go `ledgercore.TransactionInLedgerError`, whose text go's simulate and
-/// evaluator report bare.
-pub fn transaction_in_ledger_error(txid: Digest) -> AlgoError {
-    rejected(format!("transaction already in ledger: {txid}"))
+/// evaluator report bare. `in_block`: go `InBlockEvaluator`, the txid was
+/// found among the block's own transactions; it only changes the pool tag.
+pub fn transaction_in_ledger_error(txid: Digest, in_block: bool) -> AlgoError {
+    typed(
+        format!("transaction already in ledger: {txid}"),
+        RejectClass::TxidInLedger { in_block },
+    )
 }
 
-/// go `ledgercore.LeaseInLedgerError`, which prints the lease as an address.
-pub fn lease_in_ledger_error(txid: Digest, sender: &Address, lease: &[u8; 32]) -> AlgoError {
-    rejected(format!(
-        "transaction {txid} using an overlapping lease (sender, lease):({sender}, {})",
-        Address(*lease)
-    ))
+/// go `ledgercore.LeaseInLedgerError`, which prints the lease as an address
+/// (`in_block` as in [`transaction_in_ledger_error`]).
+pub fn lease_in_ledger_error(
+    txid: Digest,
+    sender: &Address,
+    lease: &[u8; 32],
+    in_block: bool,
+) -> AlgoError {
+    typed(
+        format!(
+            "transaction {txid} using an overlapping lease (sender, lease):({sender}, {})",
+            Address(*lease)
+        ),
+        RejectClass::LeaseInLedger { in_block },
+    )
 }
 
 fn rejected(message: String) -> AlgoError {
+    typed(message, RejectClass::Other)
+}
+
+fn typed(message: String, class: RejectClass) -> AlgoError {
     AlgoError::Rejected {
         source: None,
         message,
-        class: algo_error::RejectClass::Other,
+        class,
     }
 }
+
+/// A lease's key: (sender, lease).
+type LeaseKey = (Address, [u8; 32]);
 
 /// The transactions already evaluated in the block (go `roundCowState`'s
 /// `mods.Txids` / `mods.Txleases`).
 #[derive(Debug, Default)]
 pub struct BlockDups {
     txids: HashSet<Digest>,
-    leases: HashMap<(Address, [u8; 32]), u64>,
+    leases: HashMap<LeaseKey, u64>,
+    /// Undo log of [`Self::record`], for [`Self::rollback_to`].
+    journal: Vec<DupUndo>,
+}
+
+/// What one [`BlockDups::record`] changed.
+#[derive(Debug)]
+struct DupUndo {
+    /// The txid, when it was not in the set before.
+    txid: Option<Digest>,
+    /// The lease key and its previous expiry, when a lease was recorded.
+    lease: Option<(LeaseKey, Option<u64>)>,
 }
 
 impl BlockDups {
@@ -78,10 +110,39 @@ impl BlockDups {
 
     /// Record a transaction that was evaluated successfully (go `addTx`).
     pub fn record(&mut self, txn: &Transaction, txid: Digest) {
-        self.txids.insert(txid);
-        if txn.lease != [0u8; 32] {
-            self.leases
-                .insert((txn.sender, txn.lease), txn.last_valid.0);
+        let txid = self.txids.insert(txid).then_some(txid);
+        let lease = (txn.lease != [0u8; 32]).then(|| {
+            let key = (txn.sender, txn.lease);
+            (key, self.leases.insert(key, txn.last_valid.0))
+        });
+        self.journal.push(DupUndo { txid, lease });
+    }
+
+    /// A point [`Self::rollback_to`] can return to.
+    #[must_use]
+    pub fn mark(&self) -> usize {
+        self.journal.len()
+    }
+
+    /// Undo every [`Self::record`] since `mark`: go applies a group to a
+    /// child cow and drops it when a member fails, so a failed group's
+    /// txids and leases never reach the block (go `addTx` runs only for an
+    /// applied group). No caller continues an evaluation after a failed
+    /// group today (each fails the whole block); this guards future ones.
+    pub fn rollback_to(&mut self, mark: usize) {
+        while self.journal.len() > mark {
+            let Some(undo) = self.journal.pop() else {
+                break;
+            };
+            if let Some(txid) = undo.txid {
+                self.txids.remove(&txid);
+            }
+            if let Some((key, previous)) = undo.lease {
+                match previous {
+                    Some(expiry) => self.leases.insert(key, expiry),
+                    None => self.leases.remove(&key),
+                };
+            }
         }
     }
 }
@@ -209,7 +270,7 @@ pub fn check_dup<L: LedgerStore + ?Sized>(
     ledger: &mut LedgerDups,
 ) -> Result<(), AlgoError> {
     if block.txids.contains(&txid) {
-        return Err(transaction_in_ledger_error(txid));
+        return Err(transaction_in_ledger_error(txid, true));
     }
     let leased = consensus.support_transaction_leases && txn.lease != [0u8; 32];
     if leased
@@ -218,7 +279,12 @@ pub fn check_dup<L: LedgerStore + ?Sized>(
             .get(&(txn.sender, txn.lease))
             .is_some_and(|&expires| ledger.round <= expires)
     {
-        return Err(lease_in_ledger_error(txid, &txn.sender, &txn.lease));
+        return Err(lease_in_ledger_error(txid, &txn.sender, &txn.lease, true));
+    }
+    // go's block cow: a lease an earlier group of the same pending block
+    // holds (the pool's overlay) is an in-block conflict.
+    if leased && store.pending_block_lease(&txn.sender, &txn.lease, ledger.round) {
+        return Err(lease_in_ledger_error(txid, &txn.sender, &txn.lease, true));
     }
     // go `txTail.checkDup`: `lastValid < t.lowWaterMark`. The low-water mark
     // is the last round flushed to the block store; algod-rust commits each
@@ -231,12 +297,169 @@ pub fn check_dup<L: LedgerStore + ?Sized>(
         )));
     }
     if leased && ledger.lease_in_ledger(store, consensus, txn) {
-        return Err(lease_in_ledger_error(txid, &txn.sender, &txn.lease));
+        return Err(lease_in_ledger_error(txid, &txn.sender, &txn.lease, false));
     }
     if ledger.txid_in_ledger(store, consensus, &txid) {
-        return Err(transaction_in_ledger_error(txid));
+        return Err(transaction_in_ledger_error(txid, false));
     }
     Ok(())
+}
+
+/// go `BlockEvaluator.transaction`'s checks under `Validate` across one
+/// block (issue #2127): `BlockHeader.Alive`, then `checkDup` against the
+/// block's own txids and leases so far ([`BlockDups`]) and the ledger
+/// ([`LedgerDups`]), indexed by payset position. The authorizer check that
+/// follows them in go needs the store mutably and stays with the caller.
+///
+/// The first failure is kept in [`Self::violation`], so a caller that
+/// evaluates a block only for a verdict (the agreement proposal validator)
+/// can tell such a rejection apart from any other evaluation error.
+#[derive(Debug)]
+pub struct BlockCheckDup {
+    block: BlockDups,
+    ledger: LedgerDups,
+    violation: Option<(usize, String)>,
+}
+
+impl BlockCheckDup {
+    /// The checks for a block of round `round` whose payset has the ids
+    /// `txids` (as the txtail records them).
+    #[must_use]
+    pub fn new(round: u64, txids: Vec<Digest>) -> Self {
+        Self {
+            block: BlockDups::new(),
+            ledger: LedgerDups::new(round, txids),
+            violation: None,
+        }
+    }
+
+    /// Record a rejection of payset transaction `index` that follows
+    /// `checkDup` in go's prologue (the authorizer), so the proposal check
+    /// renders it as a verdict too.
+    pub fn record_violation(&mut self, index: usize, message: &str) {
+        self.violation = Some((index, message.to_owned()));
+    }
+
+    /// A point [`Self::rollback_to`] can return to (taken before a group).
+    #[must_use]
+    pub fn mark(&self) -> usize {
+        self.block.mark()
+    }
+
+    /// Forget the txids and leases recorded since `mark` (a failed group,
+    /// see [`BlockDups::rollback_to`]). The recorded violation stays: it is
+    /// the verdict of the evaluation that failed.
+    pub fn rollback_to(&mut self, mark: usize) {
+        self.block.rollback_to(mark);
+    }
+
+    /// The payset's txids, as the txtail records them.
+    #[must_use]
+    pub fn txids(&self) -> &[Digest] {
+        self.ledger.txids()
+    }
+
+    /// go's `Alive` then `checkDup` for payset transaction `index`
+    /// (`stx` in payset form: `rule`, the block header's genesis rule,
+    /// restores its stripped genesis fields the way go's `DecodeSignedTxn`
+    /// does), recording it in the block when it passes (go `addTx`: a block
+    /// that fails is discarded whole, so recording before the transaction
+    /// applies is equivalent).
+    pub fn check<L: LedgerStore + ?Sized>(
+        &mut self,
+        store: &L,
+        consensus: &ConsensusParams,
+        rule: &GenesisRestoreRule<'_>,
+        stx: &algo_types::SignedTransaction,
+        index: usize,
+    ) -> Result<(), AlgoError> {
+        let Some(&txid) = self.ledger.txids().get(index) else {
+            return Err(AlgoError::Ledger {
+                message: format!("checkDup: no txid for payset index {index}"),
+            });
+        };
+        if let Err(e) = alive(algo_types::Round(self.ledger.round), consensus, rule, stx) {
+            self.violation = Some((index, e.to_string()));
+            return Err(e);
+        }
+        if let Err(e) = check_dup(
+            store,
+            consensus,
+            &stx.txn,
+            txid,
+            &self.block,
+            &mut self.ledger,
+        ) {
+            self.violation = Some((index, e.to_string()));
+            return Err(e);
+        }
+        self.block.record(&stx.txn, txid);
+        Ok(())
+    }
+
+    /// The latest prologue rejection (`Alive`, `checkDup`, or the authorizer
+    /// via [`Self::record_violation`]), if any: the payset index it rejected
+    /// and go's text. A caller turns it into a verdict only when the
+    /// evaluation failed on that same transaction (a rejection of a group
+    /// that was rolled back says nothing about a later failure).
+    #[must_use]
+    pub fn violation(&self) -> Option<(usize, &str)> {
+        self.violation.as_ref().map(|(i, m)| (*i, m.as_str()))
+    }
+}
+
+/// go `BlockHeader.Alive` for `stx` (payset form: `rule`, the block header's
+/// genesis rule, restores its stripped genesis fields) in `round`: the
+/// validity window, then the genesis id and hash. go returns the rejection
+/// bare ([`RejectClass::Alive`]).
+pub fn alive(
+    round: algo_types::Round,
+    consensus: &ConsensusParams,
+    rule: &GenesisRestoreRule<'_>,
+    stx: &algo_types::SignedTransaction,
+) -> Result<(), AlgoError> {
+    let (txn_genesis_id, txn_genesis_hash) = rule.restored_genesis(stx);
+    algo_validate::block_alive_with_genesis(
+        round.0,
+        rule.genesis_id(),
+        rule.genesis_hash(),
+        consensus,
+        &stx.txn,
+        txn_genesis_id,
+        txn_genesis_hash,
+    )
+    .map_err(|message| typed(message, RejectClass::Alive))
+}
+
+/// go's `Alive` then `checkDup` over the WHOLE payset of `block` (stripped
+/// form) against `store` at `block.round - 1`, without executing anything:
+/// the first failing transaction in payset order, with go's text.
+///
+/// Neither check depends on what an earlier transaction did to the state
+/// (only on the block's txids and leases and the ledger's txtail), so a
+/// failure here means go's `Ledger.Validate` rejects the block whatever the
+/// payset's execution would do. The proposal check falls back on it when the
+/// execution could not reach a verdict (a transaction not evaluable here,
+/// the ledger busy throughout the budget). `None`: every transaction passes,
+/// or the block's protocol is unknown or its payset is not in valid stripped
+/// form (an evaluation error, not a `checkDup` verdict).
+pub fn prologue_prepass<L: LedgerStore + ?Sized>(
+    store: &L,
+    block: &algo_types::Block,
+) -> Option<String> {
+    let consensus = algo_types::consensus::consensus_params_for_version(&block.current_protocol)?;
+    let rule = GenesisRestoreRule::for_params(&consensus, block);
+    rule.check_payset(&block.payset).ok()?;
+    let mut check = BlockCheckDup::new(
+        block.round.0,
+        algo_codec::block_txids_with_rule(block, &rule),
+    );
+    for (index, stx) in block.payset.iter().enumerate() {
+        if check.check(store, &consensus, &rule, stx, index).is_err() {
+            return check.violation().map(|(_, m)| m.to_owned());
+        }
+    }
+    None
 }
 
 #[cfg(test)]

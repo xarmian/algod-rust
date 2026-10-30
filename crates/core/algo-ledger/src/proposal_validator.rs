@@ -26,9 +26,14 @@
 // sink and proposer balances after the payset. go validates every proposal
 // through the ledger evaluator (`validateForPayouts` in `endOfBlock`) before
 // voting for it. This wrapper adds that check, against the committed ledger
-// state, after the stateless validation.
+// state, after the stateless validation. The same evaluation runs go's
+// `BlockEvaluator.transaction` prologue on every transaction (issue #2127):
+// `Alive`, `checkDup` (a replayed committed txid, a txid repeated in the
+// block, or a lease still in force) and the authorizer check.
 //
-// Liveness: only a genuine `validateForPayouts` verdict rejects a proposal.
+// Liveness: only a genuine `validateForPayouts` or prologue verdict rejects
+// a proposal. `Alive` and `checkDup` need no execution, so a pre-pass over
+// the whole payset still judges them when the evaluation reaches no verdict.
 // Anything that merely prevents the check from running (ledger busy or not
 // yet at the previous round, no scratch rollback available, a payset
 // transaction not evaluable here) is waited out within a small bounded
@@ -58,8 +63,8 @@ use algo_types::{Block, Round};
 use tracing::warn;
 
 use crate::locked_base::LockedBase;
-use crate::proposal_eval::evaluate_validate_payouts;
-use crate::shadow_execute::PayoutCheck;
+use crate::proposal_eval::evaluate_proposal_check;
+use crate::shadow_execute::ProposalCheck;
 use crate::sqlite::SqliteLedger;
 use crate::store_trait::LedgerStore;
 
@@ -72,7 +77,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 static FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
 /// Number of proposals accepted on the stateless verdict alone because the
-/// payout check could not be evaluated. A test and diagnostic counter only:
+/// proposal check (payouts, transaction validation) could not be evaluated.
+/// A test and diagnostic counter only:
 /// it is not exported to the node's metrics; the `warn!` emitted on every
 /// fallback is the operator-facing signal.
 pub fn payout_check_fallbacks() -> u64 {
@@ -143,7 +149,7 @@ impl<V: BlockValidator> PayoutCheckingValidator<V> {
         // Probe done: release the mutex, the evaluation takes it per read.
         drop(ledger);
         let base = LockedBase::new(&self.ledger, Round(block.round.0 - 1));
-        let check = evaluate_validate_payouts(&base, block);
+        let check = evaluate_proposal_check(&base, block);
         if base.is_poisoned() {
             return Attempt::NoVerdict {
                 reason: "ledger lock poisoned".into(),
@@ -151,13 +157,36 @@ impl<V: BlockValidator> PayoutCheckingValidator<V> {
             };
         }
         match check {
-            PayoutCheck::Valid => Attempt::Verdict(Ok(())),
-            PayoutCheck::Violation(v) => Attempt::Verdict(Err(v)),
-            PayoutCheck::NoVerdict { reason, transient } => Attempt::NoVerdict {
+            ProposalCheck::Valid => Attempt::Verdict(Ok(())),
+            ProposalCheck::Violation { kind, message } => {
+                // A peer can send any number of such proposals: logged at
+                // debug only, like agreement's own proposal rejections.
+                tracing::debug!(
+                    round = block.round.0,
+                    %kind,
+                    %message,
+                    "proposal rejected by go's Ledger.Validate checks"
+                );
+                Attempt::Verdict(Err(message))
+            }
+            ProposalCheck::NoVerdict { reason, transient } => Attempt::NoVerdict {
                 reason,
                 retry: transient,
             },
         }
+    }
+
+    /// [`crate::check_dup::prologue_prepass`] against the ledger, when it is
+    /// free right now and at the proposal's parent round. Never waits: the
+    /// budget is spent, so a busy (or poisoned) ledger is no verdict. The
+    /// pre-pass runs no AVM (txid hashing and txtail reads), so holding the
+    /// mutex for it is short.
+    fn prologue_prepass(&self, block: &Block) -> Option<String> {
+        let ledger = self.ledger.try_lock().ok()?;
+        if ledger.current_round().0.checked_add(1) != Some(block.round.0) {
+            return None;
+        }
+        crate::check_dup::prologue_prepass(&*ledger, block)
     }
 }
 
@@ -176,11 +205,23 @@ impl<V: BlockValidator> BlockValidator for PayoutCheckingValidator<V> {
                         std::thread::sleep(POLL_INTERVAL);
                         continue;
                     }
+                    // Last resort before accepting: go's `Alive` / `checkDup`
+                    // over the whole payset need no execution, so they still
+                    // reach a verdict if the ledger is free now, without
+                    // waiting for it.
+                    if let Some(violation) = self.prologue_prepass(block) {
+                        tracing::debug!(
+                            round = block.round.0,
+                            %violation,
+                            "proposal rejected by go's Ledger.Validate checks (prologue pre-pass)"
+                        );
+                        return Err(AgreementError::ValidationFailed(violation));
+                    }
                     FALLBACKS.fetch_add(1, Ordering::Relaxed);
                     warn!(
                         round = block.round.0,
                         %reason,
-                        "payout check could not be evaluated; accepting on the stateless verdict"
+                        "proposal check (payouts, transaction validation) could not be evaluated; accepting on the stateless verdict"
                     );
                     return Ok(validated);
                 }
@@ -196,7 +237,7 @@ impl<V: BlockValidator> BlockValidator for PayoutCheckingValidator<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shadow_execute::scratch_validate_payouts;
+    use crate::shadow_execute::scratch_proposal_check;
     use algo_agreement::StubBlockValidator;
     use algo_types::consensus::CONSENSUS_V41;
     use algo_types::{Address, Round};
@@ -359,8 +400,11 @@ mod tests {
     fn payout_violation_is_classified_as_a_verdict() {
         let ledger = ledger_at(0);
         let mut l = ledger.lock().unwrap();
-        match scratch_validate_payouts(&mut *l, &proposal(1, 5)) {
-            PayoutCheck::Violation(m) => assert!(m.contains("is allowed"), "{m}"),
+        match scratch_proposal_check(&mut *l, &proposal(1, 5)) {
+            ProposalCheck::Violation { kind, message: m } => {
+                assert_eq!(kind, crate::shadow_execute::ViolationKind::Payouts);
+                assert!(m.contains("is allowed"), "{m}")
+            }
             other => panic!("expected a violation, got {other:?}"),
         }
     }

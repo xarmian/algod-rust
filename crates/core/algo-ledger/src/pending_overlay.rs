@@ -281,6 +281,13 @@ pub trait OverlayBase {
     fn base_get_block_header(&self, round: u64) -> Result<Option<BlockHeader>, AlgoError>;
     fn base_get_block_proto(&self, round: u64) -> Result<Option<String>, AlgoError>;
     fn base_get_txtail(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError>;
+    /// The committed ledger's [`LedgerStore::txtail_confirmed_txids`]
+    /// (`SqliteLedger`'s incremental cache, not a per-call rescan).
+    fn base_txtail_confirmed_txids(
+        &self,
+        txids: &[algo_types::Digest],
+        max_txn_life: u64,
+    ) -> std::collections::HashSet<algo_types::Digest>;
     fn base_get_state_proof_verification_context(
         &self,
         last_attested_round: u64,
@@ -349,6 +356,7 @@ impl OverlayBase for SqliteLedger {
         base_get_block_header(round: u64) -> Result<Option<BlockHeader>, AlgoError> = get_block_header;
         base_get_block_proto(round: u64) -> Result<Option<String>, AlgoError> = get_block_proto;
         base_get_txtail(round: u64) -> Result<Option<Vec<u8>>, AlgoError> = get_txtail;
+        base_txtail_confirmed_txids(txids: &[algo_types::Digest], max_txn_life: u64) -> std::collections::HashSet<algo_types::Digest> = txtail_confirmed_txids;
         base_get_state_proof_verification_context(round: u64) -> Result<Option<Vec<u8>>, AlgoError> = get_state_proof_verification_context;
         base_get_voters_snapshot(round: u64) -> Result<Option<(Vec<u8>, u64)>, AlgoError> = get_voters_snapshot;
         base_online_accounts() -> Vec<(Address, AccountData)> = online_accounts;
@@ -681,6 +689,10 @@ impl<B: OverlayBase + ?Sized> LedgerStore for OverlayStore<'_, B> {
         self.st.leases.record(sender, lease, last_valid);
     }
 
+    fn pending_block_lease(&self, sender: &Address, lease: &[u8; 32], round: u64) -> bool {
+        self.st.leases.check(sender, lease, round).is_err()
+    }
+
     fn purge_expired_leases(&mut self, current_round: u64) {
         // Expiry of the committed table is the base business; the overlay
         // table only ever holds leases of the current pending block.
@@ -800,6 +812,16 @@ impl<B: OverlayBase + ?Sized> LedgerStore for OverlayStore<'_, B> {
 
     fn get_txtail(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
         self.base.base_get_txtail(round)
+    }
+
+    fn txtail_confirmed_txids(
+        &self,
+        txids: &[algo_types::Digest],
+        max_txn_life: u64,
+    ) -> std::collections::HashSet<algo_types::Digest> {
+        // The overlay holds no committed rounds of its own: its txtail is
+        // the base's (`get_txtail` above).
+        self.base.base_txtail_confirmed_txids(txids, max_txn_life)
     }
 
     fn get_state_proof_verification_context(

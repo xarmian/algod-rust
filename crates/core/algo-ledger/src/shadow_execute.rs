@@ -911,6 +911,8 @@ pub fn scratch_execute_payset<L: LedgerStore>(
             generate: true,
             want_fee_sink_available: true,
             knock_offline_exclude: lists.as_ref().map(|l| l.own_addresses.clone()),
+            // go generates with Generate + Validate: `checkDup` (#2127).
+            check_dup: true,
             ..Default::default()
         },
         ..Default::default()
@@ -918,13 +920,35 @@ pub fn scratch_execute_payset<L: LedgerStore>(
     scratch_execute_with(store, block, &mut probe)
 }
 
-/// Outcome of [`scratch_validate_payouts`].
+/// Which of go `Ledger.Validate`'s checks a proposal failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViolationKind {
+    /// `validateForPayouts`: `FeesCollected` / `Proposer` / `ProposerPayout`.
+    Payouts,
+    /// `BlockEvaluator.transaction`'s prologue: `Alive`, `checkDup` or the
+    /// authorizer check (issue #2127).
+    Transaction,
+}
+
+impl std::fmt::Display for ViolationKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Payouts => "validateForPayouts",
+            Self::Transaction => "transaction validation",
+        })
+    }
+}
+
+/// Outcome of [`scratch_proposal_check`].
 #[derive(Debug, PartialEq, Eq)]
-pub enum PayoutCheck {
-    /// go's `validateForPayouts` accepts the header.
+pub enum ProposalCheck {
+    /// go accepts the block on the checks run here.
     Valid,
-    /// A genuine verdict: `validateForPayouts` rejected the header.
-    Violation(String),
+    /// A genuine verdict: go rejects the block with `message` (its text).
+    Violation {
+        kind: ViolationKind,
+        message: String,
+    },
     /// The evaluation could not reach a verdict (store cannot roll back,
     /// payset transaction not evaluable in Execute mode, panic, ...). Says
     /// nothing about the block. `transient`: retrying the same evaluation
@@ -935,49 +959,113 @@ pub enum PayoutCheck {
 
 /// Judge a peer proposal's `FeesCollected` / `Proposer` / `ProposerPayout`
 /// header fields against the pre-block state (go `validateForPayouts`, issue
-/// #1798): the whole block is evaluated in [`ApplyMode::Execute`] on a
-/// rolled-back scratch apply with only the payout validation switched on, so
-/// nothing is persisted and no other validate-mode check can reject a block
-/// go would accept. `store` must be at `block.round - 1`. Only a payout
-/// rejection is a [`PayoutCheck::Violation`]; every other failure is
-/// [`PayoutCheck::NoVerdict`].
-pub fn scratch_validate_payouts<L: LedgerStore>(store: &mut L, block: &Block) -> PayoutCheck {
-    let mut probe = ExecProbe {
+/// #1798), and each transaction against go's `BlockEvaluator.transaction`
+/// prologue (`Alive`, `checkDup`, the authorizer; issue #2127): the whole
+/// block is evaluated in [`ApplyMode::Execute`] on a rolled-back scratch
+/// apply with only those validations switched on, so nothing is persisted
+/// and no other validate-mode check can reject a block go would accept.
+/// `store` must be at `block.round - 1`. Only a payout or prologue rejection
+/// is a [`ProposalCheck::Violation`]; every other failure is
+/// [`ProposalCheck::NoVerdict`], unless the execution-free
+/// [`crate::check_dup::prologue_prepass`] over the whole payset still finds
+/// an `Alive` / `checkDup` rejection.
+pub fn scratch_proposal_check<L: LedgerStore>(store: &mut L, block: &Block) -> ProposalCheck {
+    let mut probe = proposal_check_probe();
+    let result = scratch_execute_with(store, block, &mut probe);
+    let check = proposal_check_from(result, &probe);
+    if !matches!(check, ProposalCheck::NoVerdict { .. })
+        || store.current_round().0.checked_add(1) != Some(block.round.0)
+    {
+        return check;
+    }
+    with_prologue_prepass(check, crate::check_dup::prologue_prepass(&*store, block))
+}
+
+/// A proposal check that reached no verdict, settled by
+/// [`crate::check_dup::prologue_prepass`] (run against the pre-block state)
+/// when that finds a transaction go's prologue rejects. Only a no-verdict is
+/// ever replaced: when the execution reached a verdict, every transaction up
+/// to the failing one passed the same checks, so the pre-pass could only
+/// repeat it.
+pub(crate) fn with_prologue_prepass(
+    check: ProposalCheck,
+    prepass: Option<String>,
+) -> ProposalCheck {
+    match (check, prepass) {
+        (ProposalCheck::NoVerdict { .. }, Some(message)) => ProposalCheck::Violation {
+            kind: ViolationKind::Transaction,
+            message,
+        },
+        (check, _) => check,
+    }
+}
+
+/// The [`ExecProbe`] of a proposal check: go `Ledger.Validate`'s
+/// `validateForPayouts` and `checkDup`, nothing else.
+pub(crate) fn proposal_check_probe() -> ExecProbe {
+    ExecProbe {
         request: ProbeRequest {
             validate_payouts: true,
+            check_dup: true,
             ..Default::default()
         },
         ..Default::default()
-    };
-    payout_check_from(scratch_execute_with(store, block, &mut probe))
+    }
 }
 
-/// Map a `validate_payouts` evaluation outcome to its [`PayoutCheck`]; shared
-/// by the locked ([`scratch_validate_payouts`]) and overlay
-/// ([`crate::proposal_eval::evaluate_validate_payouts`]) paths so their
+/// Map a proposal-check evaluation to its [`ProposalCheck`]: when the
+/// evaluation failed on a transaction's prologue (`Alive`, `checkDup` or the
+/// authorizer), that is a verdict (go `Ledger.Validate` fails the block on it), unless the base
+/// moved during the evaluation. The rejection must be of the very transaction
+/// the evaluation failed on: one recorded for a group that was rolled back
+/// is no verdict on a later, unrelated failure. Everything else as
+/// [`payout_check_from`].
+pub(crate) fn proposal_check_from<T>(
+    result: Result<T, ScratchFailure>,
+    probe: &ExecProbe,
+) -> ProposalCheck {
+    match (&result, &probe.out.dup_violation) {
+        (Err(ScratchFailure::Txn { index, .. }), Some((rejected, violation)))
+            if index == rejected =>
+        {
+            ProposalCheck::Violation {
+                kind: ViolationKind::Transaction,
+                message: violation.clone(),
+            }
+        }
+        _ => payout_check_from(result),
+    }
+}
+
+/// Map a `validate_payouts` evaluation outcome to its [`ProposalCheck`]; shared
+/// by the locked ([`scratch_proposal_check`]) and overlay
+/// ([`crate::proposal_eval::evaluate_proposal_check`]) paths so their
 /// verdicts cannot diverge.
-pub(crate) fn payout_check_from<T>(result: Result<T, ScratchFailure>) -> PayoutCheck {
+pub(crate) fn payout_check_from<T>(result: Result<T, ScratchFailure>) -> ProposalCheck {
     match result {
-        Ok(_) => PayoutCheck::Valid,
+        Ok(_) => ProposalCheck::Valid,
         Err(failure) => match failure {
             // The only verdict: go's `validateForPayouts` rejected the header.
             ScratchFailure::Other(AlgoError::PayoutViolation { message }) => {
-                PayoutCheck::Violation(message)
+                ProposalCheck::Violation {
+                    kind: ViolationKind::Payouts,
+                    message,
+                }
             }
             failure => match failure {
-                ScratchFailure::Txn { index, error } => PayoutCheck::NoVerdict {
+                ScratchFailure::Txn { index, error } => ProposalCheck::NoVerdict {
                     reason: format!("payset transaction {index} not evaluable: {error}"),
                     transient: false,
                 },
-                ScratchFailure::Other(error) => PayoutCheck::NoVerdict {
+                ScratchFailure::Other(error) => ProposalCheck::NoVerdict {
                     reason: error.to_string(),
                     transient: false,
                 },
-                ScratchFailure::Unsupported => PayoutCheck::NoVerdict {
+                ScratchFailure::Unsupported => ProposalCheck::NoVerdict {
                     reason: "ledger cannot roll back a scratch apply".into(),
                     transient: true,
                 },
-                ScratchFailure::Stale => PayoutCheck::NoVerdict {
+                ScratchFailure::Stale => ProposalCheck::NoVerdict {
                     reason: "ledger advanced during the evaluation".into(),
                     transient: true,
                 },
@@ -2657,5 +2745,43 @@ return
         assert!(!l.admit("p", 10).0);
         assert_eq!(l.take_suppressed(), 2);
         assert_eq!(l.take_suppressed(), 0);
+    }
+
+    /// A prologue rejection is the proposal check's verdict only for the
+    /// transaction the evaluation failed on: one recorded earlier (for a
+    /// group that was rolled back) is no verdict on a later, unrelated
+    /// failure (issue #2127).
+    #[test]
+    fn prologue_violation_is_a_verdict_only_for_the_failing_transaction() {
+        let mut probe = proposal_check_probe();
+        probe.out.dup_violation = Some((3, "transaction already in ledger: X".into()));
+        let fail = |index| -> Result<(), ScratchFailure> {
+            Err(ScratchFailure::Txn {
+                index,
+                error: AlgoError::Ledger {
+                    message: "overspend".into(),
+                },
+            })
+        };
+        assert!(matches!(
+            proposal_check_from(fail(5), &probe),
+            ProposalCheck::NoVerdict { .. }
+        ));
+        assert!(matches!(
+            proposal_check_from(
+                Err::<(), _>(ScratchFailure::Other(AlgoError::Ledger {
+                    message: "end of block".into()
+                })),
+                &probe
+            ),
+            ProposalCheck::NoVerdict { .. }
+        ));
+        assert_eq!(
+            proposal_check_from(fail(3), &probe),
+            ProposalCheck::Violation {
+                kind: ViolationKind::Transaction,
+                message: "transaction already in ledger: X".into(),
+            }
+        );
     }
 }

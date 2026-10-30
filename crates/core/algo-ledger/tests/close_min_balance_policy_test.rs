@@ -49,6 +49,9 @@ fn assemble(source: &str) -> Vec<u8> {
 
 fn pay(sender: Address, receiver: Address, amount: u64) -> SignedTransaction {
     let mut stx = SignedTransaction::default();
+    // Alive in every round the harness reaches: block generation runs go's
+    // `checkDup`, whose txtail lookup needs a live `LastValid` (#2127).
+    stx.txn.last_valid = algo_types::Round(1000);
     stx.txn.txn_type = "pay".into();
     stx.txn.sender = sender;
     stx.txn.receiver = receiver;
@@ -64,6 +67,9 @@ fn appl_create(
     global_schema: Option<StateSchema>,
 ) -> SignedTransaction {
     let mut stx = SignedTransaction::default();
+    // Alive in every round the harness reaches: block generation runs go's
+    // `checkDup`, whose txtail lookup needs a live `LastValid` (#2127).
+    stx.txn.last_valid = algo_types::Round(1000);
     stx.txn.txn_type = "appl".into();
     stx.txn.sender = sender;
     stx.txn.fee = FEE;
@@ -76,6 +82,9 @@ fn appl_create(
 
 fn appl_call(sender: Address, app_id: u64, on_completion: u64) -> SignedTransaction {
     let mut stx = SignedTransaction::default();
+    // Alive in every round the harness reaches: block generation runs go's
+    // `checkDup`, whose txtail lookup needs a live `LastValid` (#2127).
+    stx.txn.last_valid = algo_types::Round(1000);
     stx.txn.txn_type = "appl".into();
     stx.txn.sender = sender;
     stx.txn.fee = FEE;
@@ -175,6 +184,9 @@ impl Harness {
             current_protocol: self.proto.to_string(),
             fee_sink: self.fee_sink,
             rewards_pool: self.rewards_pool,
+            // Block generation and validation run go's `Alive` (#2127),
+            // which requires a genesis hash on these protocols.
+            genesis_hash: [0x6E; 32],
             ..Block::default()
         }
     }
