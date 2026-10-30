@@ -1926,7 +1926,7 @@ impl SimpleBlockEvaluator {
     fn validate_group(
         &mut self,
         txgroup: &[algo_types::SignedTransaction],
-    ) -> Result<Vec<[u8; 32]>, algo_error::AlgoError> {
+    ) -> Result<Vec<algo_types::Digest>, algo_error::AlgoError> {
         // Run all stateless checks first; reuse the restored (genesis fields
         // populated) copies rather than cloning + restoring the group again.
         let restored = self.validate_group_stateless_inner(txgroup)?;
@@ -1972,7 +1972,7 @@ impl SimpleBlockEvaluator {
                         return Err(lease_error(false));
                     }
                 }
-                txids.push(txid);
+                txids.push(algo_types::Digest(txid));
             }
         }
 
@@ -2622,7 +2622,7 @@ impl SimpleBlockEvaluator {
     fn exec_group(
         &mut self,
         stibs: &[algo_types::SignedTransaction],
-        txids: &[[u8; 32]],
+        txids: Vec<algo_types::Digest>,
     ) -> Result<Option<u64>, algo_error::AlgoError> {
         use algo_ledger::proposal_eval::GroupEvalError;
 
@@ -2642,16 +2642,14 @@ impl SimpleBlockEvaluator {
         let base =
             algo_ledger::locked_base::LockedBase::new(&self.ledger, exec.overlay.base_round());
         let started = std::time::Instant::now();
-        // `validate_group` already hashed the group: its txids feed the
-        // apply's `checkDup` and the rejection text.
-        let digests: Vec<algo_types::Digest> =
-            txids.iter().map(|t| algo_types::Digest(*t)).collect();
+        // `validate_group` already hashed the group: its txids are moved
+        // into the apply's `checkDup`.
         let outcome = algo_ledger::proposal_eval::evaluate_group_with_txids(
             &base,
             &mut exec.overlay,
             &exec.template,
             stibs,
-            Some(digests),
+            Some(txids),
         );
         let st = base.stats();
         let poisoned = base.is_poisoned();
@@ -2666,10 +2664,16 @@ impl SimpleBlockEvaluator {
         if poisoned {
             return Err(algo_ledger::locked_base::LockedBase::poison_error());
         }
-        let txid_of = |i: usize| {
-            txids
+        // Only a rejection needs a txid again: the failing member's, over
+        // the genesis fields go restores (one hash, on the error path).
+        let txid_of = |template: &algo_types::Block, i: usize| {
+            let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(template);
+            stibs
                 .get(i)
-                .map(|t| algo_types::Digest(*t).to_string())
+                .map(|stx| {
+                    let (gen, gh) = rule.restored_genesis(stx);
+                    algo_codec::compute_txn_id_with_genesis(&stx.txn, gen, gh).to_string()
+                })
                 .unwrap_or_default()
         };
         match outcome {
@@ -2677,13 +2681,15 @@ impl SimpleBlockEvaluator {
                 debug_assert_eq!(eval.apply_data.len(), stibs.len());
                 Ok(Some(eval.fees_collected))
             }
-            Err(GroupEvalError::Txn { index, error }) => Err(go_rejection(&txid_of(index), error)),
+            Err(GroupEvalError::Txn { index, error }) => {
+                Err(go_rejection(&txid_of(&exec.template, index), error))
+            }
             Err(GroupEvalError::Stale) => {
                 algo_ledger::proposal_eval::count_stale_base();
                 exec.incomplete = true;
                 Ok(None)
             }
-            Err(GroupEvalError::Other(e)) => Err(go_rejection(&txid_of(0), e)),
+            Err(GroupEvalError::Other(e)) => Err(go_rejection(&txid_of(&exec.template, 0), e)),
         }
     }
 
@@ -2935,7 +2941,8 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         //
         // All mutations use the `_tracked` variants so the checkpoint
         // records what to undo on rollback.
-        for (stx, &txid) in txgroup.iter().zip(&txids) {
+        for (stx, txid) in txgroup.iter().zip(&txids) {
+            let txid = txid.0;
             // Record the transaction ID `validate_group` checked: computed
             // over the restored copy, i.e. what the block's STIB form
             // restores to (issue #1727).
@@ -3308,7 +3315,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         // failing inner transaction or a rejecting program; this can.
         // Evaluated once here; the result also feeds the ApplyData of the
         // proposed block.
-        match self.exec_group(&stibs, &txids) {
+        match self.exec_group(&stibs, txids) {
             // The evaluated fees include inner-transaction fees (issue #1908).
             Ok(Some(fees)) => {
                 self.fees_collected = fees_collected_checkpoint.saturating_add(fees);

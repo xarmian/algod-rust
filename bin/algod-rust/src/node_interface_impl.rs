@@ -2115,12 +2115,12 @@ impl NodeInterface for AlgodNodeInterface {
                     }
                     Err(e) => {
                         // The block (including this just-remembered group) failed
-                        // to apply — typically a rejecting app program under
-                        // Execute mode. Drop the pending group so the rejected
-                        // transaction doesn't wedge later blocks; dev submits are
-                        // serialized and each drains the pool, so only this group
-                        // is pending here.
-                        pool.reset();
+                        // to commit. `produce_dev_block` already dropped the
+                        // rejected group from the pool (go's dev assembly drops
+                        // a group its evaluator rejects), with the rejection as
+                        // its `pending/{txid}` reason, so nothing wedges later
+                        // blocks. The pool is not reset: that would discard the
+                        // rebuilt evaluator and the reason (go never resets it).
                         Err(NodeError::BadRequest(format!(
                             "dev block production rejected the group: {e}"
                         )))
@@ -4621,6 +4621,78 @@ mod tests {
             .expect("lookup ok")
             .expect("transaction should be found as confirmed");
         assert_eq!(status.confirmed_round, 1, "confirmed in round 1");
+    }
+
+    /// A dev-mode commit that rejects the submitted group drops that group
+    /// with the rejection as its reason, end to end: `pending/{txid}`
+    /// reports it (the pool is not reset), and the next submission still
+    /// produces a block (issue #2127).
+    #[tokio::test]
+    async fn dev_mode_commit_rejection_is_reported_by_pending_lookup() {
+        use algo_types::{Round, Transaction, TxnType};
+        use ed25519_dalek::SigningKey;
+
+        let sender_key = SigningKey::from_bytes(&[0x13u8; 32]);
+        let sender = Address(sender_key.verifying_key().to_bytes());
+        let (adapter, ledger, gh) = seed_dev_adapter(sender, 10_000_000);
+        let pay = |note: &[u8]| {
+            let txn = Transaction {
+                txn_type: TxnType::Pay,
+                sender,
+                receiver: Address([0x24u8; 32]),
+                amount: 1_000_000,
+                fee: 1000,
+                first_valid: Round(1),
+                last_valid: Round(1000),
+                genesis_hash: gh,
+                note: serde_bytes::ByteBuf::from(note.to_vec()),
+                ..Default::default()
+            };
+            (sign_txn(&txn, &sender_key), compute_txn_id(&txn))
+        };
+
+        let (rejected, rejected_id) = pay(crate::dev_producer::test_hooks::REJECT_NOTE);
+        let err = adapter
+            .broadcast_signed_tx_group(vec![rejected])
+            .await
+            .expect_err("the dev-mode commit rejects the group");
+        assert!(
+            err.to_string()
+                .contains("dev block production rejected the group"),
+            "{err}"
+        );
+        assert_eq!(
+            ledger.lock().unwrap().current_round().0,
+            0,
+            "nothing committed"
+        );
+
+        let status = adapter
+            .get_pending_transaction(&rejected_id)
+            .await
+            .expect("lookup ok")
+            .expect("the rejected transaction is reported");
+        assert_eq!(status.confirmed_round, 0);
+        assert!(
+            status
+                .pool_error
+                .contains(crate::dev_producer::test_hooks::INJECTED_REJECTION),
+            "pending/{{txid}} reports the rejection: {:?}",
+            status.pool_error
+        );
+
+        let (ok, ok_id) = pay(b"after");
+        adapter
+            .broadcast_signed_tx_group(vec![ok])
+            .await
+            .expect("the next submission produces a block");
+        assert_eq!(ledger.lock().unwrap().current_round().0, 1);
+        let status = adapter
+            .get_pending_transaction(&ok_id)
+            .await
+            .expect("lookup ok")
+            .expect("confirmed");
+        assert_eq!(status.confirmed_round, 1);
     }
 
     /// Issue #1703: the block a dev-mode node produces and stores must carry
