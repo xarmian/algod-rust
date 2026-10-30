@@ -176,13 +176,17 @@ impl<V: BlockValidator> PayoutCheckingValidator<V> {
         }
     }
 
-    /// [`crate::proposal_eval::prologue_prepass`] against the ledger, when it
-    /// is at the proposal's parent round.
+    /// [`crate::check_dup::prologue_prepass`] against the ledger, when it is
+    /// free right now and at the proposal's parent round. Never waits: the
+    /// budget is spent, so a busy (or poisoned) ledger is no verdict. The
+    /// pre-pass runs no AVM (txid hashing and txtail reads), so holding the
+    /// mutex for it is short.
     fn prologue_prepass(&self, block: &Block) -> Option<String> {
-        let parent = block.round.0.checked_sub(1)?;
-        let base = LockedBase::new(&self.ledger, Round(parent));
-        let verdict = crate::proposal_eval::prologue_prepass(&base, block);
-        (!base.is_poisoned()).then_some(verdict).flatten()
+        let ledger = self.ledger.try_lock().ok()?;
+        if ledger.current_round().0.checked_add(1) != Some(block.round.0) {
+            return None;
+        }
+        crate::check_dup::prologue_prepass(&*ledger, block)
     }
 }
 
@@ -203,8 +207,8 @@ impl<V: BlockValidator> BlockValidator for PayoutCheckingValidator<V> {
                     }
                     // Last resort before accepting: go's `Alive` / `checkDup`
                     // over the whole payset need no execution, so they still
-                    // reach a verdict on a ledger that stayed busy (each read
-                    // waits for the mutex) or a payset that cannot run here.
+                    // reach a verdict if the ledger is free now, without
+                    // waiting for it.
                     if let Some(violation) = self.prologue_prepass(block) {
                         tracing::debug!(
                             round = block.round.0,

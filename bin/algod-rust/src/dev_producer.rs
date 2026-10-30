@@ -56,7 +56,7 @@ use algo_codec::{
     canonical_encode_block, canonical_encode_block_header_from_block, compute_txn_id,
 };
 use algo_ledger::apply::{
-    apply_block_capturing_apply_data_with_delta_or_failed_txn, ApplyData, ApplyMode,
+    apply_generated_block_capturing_apply_data_with_delta_or_failed_txn, ApplyData, ApplyMode,
 };
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::SqliteLedger;
@@ -251,7 +251,7 @@ pub fn produce_dev_block(
             // #581).
             // It also runs go's `Alive` and `checkDup`: go's dev block comes
             // from a Generate + Validate evaluator (issue #2127).
-            apply_block_capturing_apply_data_with_delta_or_failed_txn(
+            apply_generated_block_capturing_apply_data_with_delta_or_failed_txn(
                 &mut *l,
                 &block,
                 ApplyMode::Execute,
@@ -264,7 +264,7 @@ pub fn produce_dev_block(
                 // /v2/applications/{id}/boxes?round=N` can serve this round
                 // historically. `Accts.AppResources`/`AssetResources`,
                 // `Creatables`, `Totals`, and `StateProofNext` stay at their
-                // zero values -- `apply_block_capturing_apply_data_with_delta`
+                // zero values -- `apply_generated_block_capturing_apply_data_with_delta`
                 // doesn't compute those (tracked separately in #586), not a
                 // gap specific to dev-mode caching. Cached unconditionally
                 // (even when the delta is otherwise empty) so the cache's

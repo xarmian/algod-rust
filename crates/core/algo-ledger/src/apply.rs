@@ -788,12 +788,12 @@ pub fn apply_block_with_delta_mode_checking_payouts<L: crate::store_trait::Ledge
     Ok(delta)
 }
 
-/// [`apply_block_capturing_apply_data_with_delta`] that also reports the
+/// [`apply_generated_block_capturing_apply_data_with_delta`] that also reports the
 /// payset index of the transaction whose apply failed (when one owns the
 /// failure), so the dev-mode producer can drop that transaction's group
 /// from the pool, as go's `AssembleDevModeBlock` drops a group its
 /// evaluator rejects (issue #2127).
-pub fn apply_block_capturing_apply_data_with_delta_or_failed_txn<
+pub fn apply_generated_block_capturing_apply_data_with_delta_or_failed_txn<
     L: crate::store_trait::LedgerStore,
 >(
     store: &mut L,
@@ -834,14 +834,14 @@ pub fn apply_block_capturing_apply_data_with_delta_or_failed_txn<
 /// It applies a block the node generated (the dev-mode producer): go's dev
 /// block comes out of a Generate + Validate evaluator
 /// (`AssembleDevModeBlock`), so go's `Alive`, `checkDup` and authorizer run
-/// (issue #2127). See [`apply_block_capturing_apply_data_with_delta_or_failed_txn`]
+/// (issue #2127). See [`apply_generated_block_capturing_apply_data_with_delta_or_failed_txn`]
 /// for the failing transaction's index.
-pub fn apply_block_capturing_apply_data_with_delta<L: crate::store_trait::LedgerStore>(
+pub fn apply_generated_block_capturing_apply_data_with_delta<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     block: &Block,
     mode: ApplyMode,
 ) -> Result<(Vec<ApplyData>, crate::state_delta::StateDelta), AlgoError> {
-    apply_block_capturing_apply_data_with_delta_or_failed_txn(store, block, mode)
+    apply_generated_block_capturing_apply_data_with_delta_or_failed_txn(store, block, mode)
         .map_err(|(error, _)| error)
 }
 
@@ -1755,6 +1755,9 @@ struct GroupCells {
     fee_residue: u64,
     global_txn_idx: usize,
     apply_data_len: Option<usize>,
+    /// The block's `checkDup` records before the group
+    /// ([`crate::check_dup::BlockCheckDup::mark`]).
+    checkdup_mark: Option<usize>,
 }
 
 impl GroupCells {
@@ -1772,6 +1775,7 @@ impl GroupCells {
             fee_residue: ctx.fee_residue.get(),
             global_txn_idx,
             apply_data_len: apply_data_out.as_ref().map(|v| v.len()),
+            checkdup_mark: ctx.checkdup.as_ref().map(|c| c.borrow().mark()),
         }
     }
 
@@ -1790,6 +1794,9 @@ impl GroupCells {
         *global_txn_idx = self.global_txn_idx;
         if let (Some(out), Some(len)) = (apply_data_out.as_mut(), self.apply_data_len) {
             out.truncate(len);
+        }
+        if let (Some(checkdup), Some(mark)) = (&ctx.checkdup, self.checkdup_mark) {
+            checkdup.borrow_mut().rollback_to(mark);
         }
     }
 }
@@ -2682,7 +2689,7 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
     // the ones the txtail records, hashed once here (or handed over by the
     // pool) and reused for the block's txtail row below (issue #2127).
     let run_check_dup = validate || probe.as_ref().is_some_and(|p| p.request.check_dup);
-    let checkdup = if run_check_dup {
+    let (checkdup, checked_txtail) = if run_check_dup {
         let txids = match probe.as_mut().and_then(|p| p.request.txids.take()) {
             Some(txids) if txids.len() == stored_block.payset.len() => txids,
             Some(txids) => {
@@ -2696,12 +2703,17 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
             }
             None => algo_codec::block_txids_with_rule(stored_block, &genesis_rule),
         };
-        Some(RefCell::new(crate::check_dup::BlockCheckDup::new(
-            block.round.0,
-            txids,
-        )))
+        // The block's txtail row, from the very txids `checkDup` checks.
+        let txtail = algo_codec::build_txtail_from_block_with_txids(stored_block, &txids)?;
+        (
+            Some(RefCell::new(crate::check_dup::BlockCheckDup::new(
+                block.round.0,
+                txids,
+            ))),
+            Some(txtail),
+        )
     } else {
-        None
+        (None, None)
     };
     // Issue #570: only allocate the shared box-delta recorder when a caller
     // actually wants `kv_mods` back (Execute mode, via
@@ -3246,17 +3258,12 @@ pub(crate) fn apply_block_impl_probe<L: crate::store_trait::LedgerStore>(
         tracing::warn!("put_block failed for round {}: {e}", block.round.0);
     }
 
-    // The txids `checkDup` used are the row's (their count was checked when
-    // the check was built); hashing them again is only a fallback.
-    let txtail = ctx
-        .checkdup
-        .as_ref()
-        .and_then(|c| {
-            algo_codec::build_txtail_from_block_with_txids(stored_block, c.borrow().txids()).ok()
-        })
-        .unwrap_or_else(|| {
-            algo_codec::build_txtail_from_block_with_rule(stored_block, &genesis_rule)
-        });
+    // A `checkDup` evaluation built the row from its txids up front; any
+    // other apply hashes the payset here.
+    let txtail = match checked_txtail {
+        Some(txtail) => txtail,
+        None => algo_codec::build_txtail_from_block_with_rule(stored_block, &genesis_rule),
+    };
     let txtail_data = algo_codec::canonical_encode_txtail_round(&txtail);
     if let Err(e) = store.put_txtail(block.round.0, &txtail_data) {
         tracing::warn!("put_txtail failed for round {}: {e}", block.round.0);
@@ -15254,6 +15261,68 @@ return
         )
         .expect("stpf alone applies");
         assert_eq!(ctx.state_proof_next.get(), 1280);
+    }
+
+    /// A failed group's txids and leases do not stay in the block's
+    /// `checkDup` state (go applies a group to a child cow and runs `addTx`
+    /// only once it applied), so a later group of the same evaluation that
+    /// reuses the lease is accepted, while a repeat inside one group is still
+    /// rejected (issue #2127).
+    #[test]
+    fn failed_group_rolls_back_its_checkdup_records() {
+        let fee_sink = Address([3u8; 32]);
+        let (a, b) = (Address([0xA1; 32]), Address([0xB2; 32]));
+        let gh = [0x6E; 32];
+        let lease = [0x5A; 32];
+        let mut state =
+            make_state_with_accounts(&[(fee_sink, 0), (a, 10_000_000), (b, 10_000_000)], fee_sink);
+        let leased = |amount: u64, note: u8| {
+            let mut s = pay_txn(a, b, amount, 1_000);
+            s.txn.lease = lease;
+            s.txn.genesis_hash = gh;
+            s.txn.note = serde_bytes::ByteBuf::from(vec![note]);
+            s
+        };
+        let overspend = leased(1_000_000_000, 1);
+        let ok = leased(1_000, 2);
+        let ok2 = leased(1_000, 3);
+        let txids: Vec<_> = [&overspend, &ok, &ok2, &ok]
+            .iter()
+            .map(|s| algo_codec::compute_txn_id(&s.txn))
+            .collect();
+        let mut ctx = ApplyContext::new_replay(0, fee_sink, 1172);
+        ctx.consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+        ctx.caller_tracks_leases = true;
+        ctx.checkdup = Some(RefCell::new(crate::check_dup::BlockCheckDup::new(
+            1172, txids,
+        )));
+        let rule = algo_types::genesis_restore::GenesisRestoreRule::unstripped("", &gh);
+        let mut run = |group: &[&SignedTransaction], idx: usize| {
+            let (mut idx, mut failed) = (idx, None);
+            apply_group_transactions(
+                &mut state,
+                group,
+                &ctx,
+                &rule,
+                &mut GroupBudget::new(0),
+                &mut BoxBudgetState::default(),
+                None,
+                None,
+                &mut idx,
+                &mut failed,
+            )
+        };
+        let err = run(&[&overspend], 0).expect_err("the overspend fails");
+        assert!(!err.to_string().contains("overlapping lease"), "{err}");
+        // A repeat inside one group is still caught against its own earlier
+        // member.
+        let err = run(&[&ok, &ok2], 1).expect_err("in-group lease repeat");
+        assert!(err.to_string().contains("overlapping lease"), "{err}");
+        // Neither failed group left its txids or lease behind.
+        run(&[&ok], 3).expect("the failed groups' records were rolled back");
     }
 
     /// go's `endOfBlock` order: voters commitment, online total weight, then

@@ -965,8 +965,13 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             // #2125), then the authorizer. go's simulate reports these error
             // texts bare (`EvalFailureError` wraps them without a prefix),
             // hence `Rejected`, whose display is the message itself.
-            let checked =
-                crate::apply::txn_prologue(&*self.store, &apply_ctx, &genesis_rule, &eval_group[i], i);
+            let checked = crate::apply::txn_prologue(
+                &*self.store,
+                &apply_ctx,
+                &genesis_rule,
+                &eval_group[i],
+                i,
+            );
             let apply_result = match checked {
                 Err(e) => Err(e),
                 Ok(()) => {

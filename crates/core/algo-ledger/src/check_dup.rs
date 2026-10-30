@@ -79,12 +79,26 @@ fn typed(message: String, class: RejectClass) -> AlgoError {
     }
 }
 
+/// A lease's key: (sender, lease).
+type LeaseKey = (Address, [u8; 32]);
+
 /// The transactions already evaluated in the block (go `roundCowState`'s
 /// `mods.Txids` / `mods.Txleases`).
 #[derive(Debug, Default)]
 pub struct BlockDups {
     txids: HashSet<Digest>,
-    leases: HashMap<(Address, [u8; 32]), u64>,
+    leases: HashMap<LeaseKey, u64>,
+    /// Undo log of [`Self::record`], for [`Self::rollback_to`].
+    journal: Vec<DupUndo>,
+}
+
+/// What one [`BlockDups::record`] changed.
+#[derive(Debug)]
+struct DupUndo {
+    /// The txid, when it was not in the set before.
+    txid: Option<Digest>,
+    /// The lease key and its previous expiry, when a lease was recorded.
+    lease: Option<(LeaseKey, Option<u64>)>,
 }
 
 impl BlockDups {
@@ -96,10 +110,38 @@ impl BlockDups {
 
     /// Record a transaction that was evaluated successfully (go `addTx`).
     pub fn record(&mut self, txn: &Transaction, txid: Digest) {
-        self.txids.insert(txid);
-        if txn.lease != [0u8; 32] {
-            self.leases
-                .insert((txn.sender, txn.lease), txn.last_valid.0);
+        let txid = self.txids.insert(txid).then_some(txid);
+        let lease = (txn.lease != [0u8; 32]).then(|| {
+            let key = (txn.sender, txn.lease);
+            (key, self.leases.insert(key, txn.last_valid.0))
+        });
+        self.journal.push(DupUndo { txid, lease });
+    }
+
+    /// A point [`Self::rollback_to`] can return to.
+    #[must_use]
+    pub fn mark(&self) -> usize {
+        self.journal.len()
+    }
+
+    /// Undo every [`Self::record`] since `mark`: go applies a group to a
+    /// child cow and drops it when a member fails, so a failed group's
+    /// txids and leases never reach the block (go `addTx` runs only for an
+    /// applied group).
+    pub fn rollback_to(&mut self, mark: usize) {
+        while self.journal.len() > mark {
+            let Some(undo) = self.journal.pop() else {
+                break;
+            };
+            if let Some(txid) = undo.txid {
+                self.txids.remove(&txid);
+            }
+            if let Some((key, previous)) = undo.lease {
+                match previous {
+                    Some(expiry) => self.leases.insert(key, expiry),
+                    None => self.leases.remove(&key),
+                };
+            }
         }
     }
 }
@@ -294,6 +336,19 @@ impl BlockCheckDup {
     /// authorizer), so the proposal check renders it as a verdict too.
     pub fn record_violation(&mut self, message: &str) {
         self.violation.get_or_insert_with(|| message.to_owned());
+    }
+
+    /// A point [`Self::rollback_to`] can return to (taken before a group).
+    #[must_use]
+    pub fn mark(&self) -> usize {
+        self.block.mark()
+    }
+
+    /// Forget the txids and leases recorded since `mark` (a failed group,
+    /// see [`BlockDups::rollback_to`]). The recorded violation stays: it is
+    /// the verdict of the evaluation that failed.
+    pub fn rollback_to(&mut self, mark: usize) {
+        self.block.rollback_to(mark);
     }
 
     /// The payset's txids, as the txtail records them.

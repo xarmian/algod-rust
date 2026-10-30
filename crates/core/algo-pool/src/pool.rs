@@ -156,10 +156,11 @@ struct PendingState {
     txids: HashMap<Digest, SignedTransaction>,
 }
 
-/// The [`PoolError`] for an evaluator's rejection `e` of a group.
-/// `reevaluating`: found while re-evaluating after a new block (go's
-/// `TxPoolErrTagLeaseEval` for an untyped lease conflict).
-fn pool_error_from_evaluator(e: &AlgoError, reevaluating: bool) -> PoolError {
+/// The [`PoolError`] for an evaluator's rejection `e` of a group. A lease
+/// conflict is go's typed `LeaseInLedgerError` (`RejectClass::LeaseInLedger`,
+/// whose `in_block` is go's `InBlockEvaluator` and picks the `lease` /
+/// `lease_eval` tag); no evaluator reports one untyped (issue #2127).
+fn pool_error_from_evaluator(e: &AlgoError) -> PoolError {
     // Capture structured pc/group-index/app-index/eval-states diagnostics
     // -- see `AlgoError::avm_eval_detail` (issue #1135), which walks `e`'s
     // source chain for an `AlgoError::AvmLogicSig`.
@@ -176,11 +177,6 @@ fn pool_error_from_evaluator(e: &AlgoError, reevaluating: bool) -> PoolError {
             message,
             class: *class,
             detail,
-        }
-    } else if message.contains("duplicate lease") || message.contains("overlapping lease") {
-        PoolError::LeaseConflict {
-            message,
-            in_block_evaluator: reevaluating,
         }
     } else if let Some(detail) = detail {
         PoolError::EvaluatorWithDetail(message, detail)
@@ -525,7 +521,7 @@ impl TransactionPool {
 
         // Feed to the evaluator (with "no space" handling).
         // Mirrors Go's ingest() which calls addToPendingBlockEvaluator().
-        self.add_to_pending_block_evaluator(tx_group, guard, false)?;
+        self.add_to_pending_block_evaluator(tx_group, guard)?;
 
         // Store in remembered collections.
         let group_clone: Vec<SignedTransaction> = tx_group.to_vec();
@@ -742,9 +738,8 @@ impl TransactionPool {
         &self,
         txgroup: &[SignedTransaction],
         inner: &mut PoolInner,
-        reevaluating: bool,
     ) -> Result<(), PoolError> {
-        match self.add_to_pending_block_evaluator_once(txgroup, inner, reevaluating) {
+        match self.add_to_pending_block_evaluator_once(txgroup, inner) {
             Ok(()) => Ok(()),
             Err(e) => {
                 let err_str = e.to_string();
@@ -753,7 +748,7 @@ impl TransactionPool {
                     if let Some(ref mut evaluator) = inner.evaluator {
                         evaluator.reset_txn_bytes();
                     }
-                    self.add_to_pending_block_evaluator_once(txgroup, inner, reevaluating)
+                    self.add_to_pending_block_evaluator_once(txgroup, inner)
                 } else {
                     Err(e)
                 }
@@ -767,17 +762,10 @@ impl TransactionPool {
     /// - Checks if any transaction in the group has expired
     ///   (last_valid < evaluator_round + pending_blocks)
     /// - Feeds the group to the evaluator
-    ///
-    /// `reevaluating` mirrors Go's `LeaseInLedgerError.InBlockEvaluator`: it
-    /// is `true` when this call originates from `recompute_block_evaluator`
-    /// (re-evaluation after a new block), `false` for a normal `Remember()`.
-    /// It only affects how a lease-conflict failure is classified (see
-    /// `PoolError::LeaseConflict` / `classify_pool_error`), not behavior.
     fn add_to_pending_block_evaluator_once(
         &self,
         txgroup: &[SignedTransaction],
         inner: &mut PoolInner,
-        reevaluating: bool,
     ) -> Result<(), PoolError> {
         // Check for expired transactions.
         let effective_round = match &inner.evaluator {
@@ -804,7 +792,7 @@ impl TransactionPool {
         if let Some(ref mut evaluator) = inner.evaluator {
             evaluator
                 .transaction_group(txgroup)
-                .map_err(|e| pool_error_from_evaluator(&e, reevaluating))?;
+                .map_err(|e| pool_error_from_evaluator(&e))?;
             Ok(())
         } else {
             Err(PoolError::NoPendingBlockEvaluator)
@@ -823,7 +811,7 @@ impl TransactionPool {
         txgroup: &[SignedTransaction],
         inner: &mut PoolInner,
     ) -> Result<(), PoolError> {
-        self.add_to_pending_block_evaluator(txgroup, inner, true)?;
+        self.add_to_pending_block_evaluator(txgroup, inner)?;
 
         // Store in remembered collections (these get flushed to pending later).
         inner.remembered_tx_groups.push(txgroup.to_vec());
@@ -1449,13 +1437,11 @@ impl TransactionPool {
         // transactions from one of the evicted senders.
         let mut group_ids: HashSet<[u8; 32]> = HashSet::new();
         let mut senders: HashSet<Address> = HashSet::new();
-        let mut found = false;
         for id in txids {
-            for stx in [pending.txids.remove(id), inner.remembered_txids.remove(id)]
+            for stx in [pending.txids.get(id), inner.remembered_txids.get(id)]
                 .into_iter()
                 .flatten()
             {
-                found = true;
                 if stx.txn.group == [0u8; 32] {
                     senders.insert(stx.txn.sender);
                 } else {
@@ -1463,7 +1449,7 @@ impl TransactionPool {
                 }
             }
         }
-        if !found {
+        if group_ids.is_empty() && senders.is_empty() {
             return 0;
         }
         let hit = |g: &Vec<SignedTransaction>| match g.first() {
@@ -1475,18 +1461,36 @@ impl TransactionPool {
             }
             None => false,
         };
-        let before = pending.tx_groups.len() + inner.remembered_tx_groups.len();
-        pending.tx_groups.retain(|g| !hit(g));
-        inner.remembered_tx_groups.retain(|g| !hit(g));
-        let dropped = before - pending.tx_groups.len() - inner.remembered_tx_groups.len();
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut pending.tx_groups)
+            .into_iter()
+            .partition(|g| hit(g));
+        pending.tx_groups = kept;
+        let (gone_remembered, kept): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut inner.remembered_tx_groups)
+                .into_iter()
+                .partition(|g| hit(g));
+        inner.remembered_tx_groups = kept;
+        let dropped = gone.len() + gone_remembered.len();
+        if dropped == 0 {
+            // Nothing matched: the pool is left exactly as it was.
+            return 0;
+        }
+        // Only the dropped groups' members leave the txid indexes.
+        let mut evicted: Vec<Digest> = Vec::new();
+        for stx in gone.iter().chain(&gone_remembered).flatten() {
+            let id = compute_txn_id(&stx.txn);
+            pending.txids.remove(&id);
+            inner.remembered_txids.remove(&id);
+            evicted.push(id);
+        }
         drop(pending);
 
-        let reason = pool_error_from_evaluator(error, true);
+        let reason = pool_error_from_evaluator(error);
         self.reeval_counter
             .record(crate::error::classify_pool_error(&reason));
         let text = reason.to_string();
-        for id in txids {
-            inner.status_cache.put(*id, text.clone());
+        for id in evicted {
+            inner.status_cache.put(id, text.clone());
         }
         // The pending-block evaluator still holds the evicted group's
         // effects (its txids, leases and balance changes): rebuild it from
@@ -3732,11 +3736,12 @@ mod tests {
 
     // ── Lease-conflict re-evaluation classification ────────────────
 
-    /// An evaluator that always reports a lease conflict, mirroring the
-    /// message `algo-ledger`'s `lease.rs::check()` produces
-    /// (`"duplicate lease"`).
+    /// An evaluator that always reports go's typed lease conflict
+    /// (`ledgercore.LeaseInLedgerError`, as `algo-ledger`'s `checkDup`
+    /// builds it), found in the block being evaluated or in the ledger.
     struct LeaseConflictEvaluator {
         round: Round,
+        in_block: bool,
     }
 
     impl BlockEvaluator for LeaseConflictEvaluator {
@@ -3753,8 +3758,13 @@ mod tests {
         }
 
         fn transaction_group(&mut self, _txgroup: &[SignedTransaction]) -> Result<(), AlgoError> {
-            Err(AlgoError::Ledger {
-                message: "duplicate lease".to_string(),
+            Err(AlgoError::Rejected {
+                source: None,
+                message: "transaction X using an overlapping lease (sender, lease):(S, L)"
+                    .to_string(),
+                class: algo_error::RejectClass::LeaseInLedger {
+                    in_block: self.in_block,
+                },
             })
         }
 
@@ -3770,58 +3780,41 @@ mod tests {
     ///
     /// Go's test commits a leased txn in a block, forces the pool to
     /// re-evaluate against the new state (`OnNewBlock`), and asserts the
-    /// resulting lease conflict is tagged `TxPoolErrTagLease` — the
-    /// `_eval` variant — via the `InBlockEvaluator` flag on
+    /// resulting lease conflict's tag follows the `InBlockEvaluator` flag on
     /// `ledgercore.LeaseInLedgerError` (`data/pools/errors.go`'s
-    /// `ClassifyTxPoolError`). algod-rust's `BlockEvaluator` abstraction
-    /// reports only a message string, so the same distinction is carried
-    /// on `PoolError::LeaseConflict::in_block_evaluator`, threaded through
-    /// `add_to_pending_block_evaluator_once`'s `reevaluating` parameter:
-    /// `false` for a normal `Remember()`, `true` for the re-evaluation path
-    /// used by `recompute_block_evaluator` (invoked from `OnNewBlock`).
-    /// This test exercises that private plumbing directly to confirm both
-    /// sides of the flag produce the correct, distinct tag.
+    /// `ClassifyTxPoolError`): `lease_eval` when the conflict was found in
+    /// the block being evaluated, `lease` otherwise. The evaluator reports
+    /// that flag on the typed error (`RejectClass::LeaseInLedger`), so the
+    /// pool maps it as is (issue #2127).
     #[test]
     fn test_lease_conflict_classification_by_reevaluation_context() {
         let pool = make_pool_with_evaluator(1000);
         let mut guard = pool.mu.lock();
-
-        guard.evaluator = Some(Box::new(LeaseConflictEvaluator { round: Round(2) }));
-
         let txgroup = vec![make_test_txn(9)];
 
-        // Normal Remember() path: reevaluating = false => Lease.
-        let err = pool
-            .add_to_pending_block_evaluator_once(&txgroup, &mut guard, false)
-            .expect_err("evaluator always reports a lease conflict");
-        assert!(matches!(
-            err,
-            PoolError::LeaseConflict {
-                in_block_evaluator: false,
-                ..
-            }
-        ));
-        assert_eq!(
-            crate::error::classify_pool_error(&err),
-            crate::error::PoolErrorTag::Lease
-        );
-
-        // Re-evaluation path (OnNewBlock -> recompute_block_evaluator):
-        // reevaluating = true => LeaseEval.
-        let err = pool
-            .add_to_pending_block_evaluator_once(&txgroup, &mut guard, true)
-            .expect_err("evaluator always reports a lease conflict");
-        assert!(matches!(
-            err,
-            PoolError::LeaseConflict {
-                in_block_evaluator: true,
-                ..
-            }
-        ));
-        assert_eq!(
-            crate::error::classify_pool_error(&err),
-            crate::error::PoolErrorTag::LeaseEval
-        );
+        for (in_block, tag) in [
+            (false, crate::error::PoolErrorTag::Lease),
+            (true, crate::error::PoolErrorTag::LeaseEval),
+        ] {
+            guard.evaluator = Some(Box::new(LeaseConflictEvaluator {
+                round: Round(2),
+                in_block,
+            }));
+            let err = pool
+                .add_to_pending_block_evaluator_once(&txgroup, &mut guard)
+                .expect_err("evaluator always reports a lease conflict");
+            assert!(
+                matches!(
+                    err,
+                    PoolError::TxnRejected {
+                        class: algo_error::RejectClass::LeaseInLedger { in_block: b },
+                        ..
+                    } if b == in_block
+                ),
+                "{err:?}"
+            );
+            assert_eq!(crate::error::classify_pool_error(&err), tag);
+        }
     }
 
     /// Evaluator that fails every group with the error `make` builds.
@@ -3851,10 +3844,10 @@ mod tests {
 
     /// Issue #1776: the pool maps the evaluator error TYPE. A typed
     /// `Rejected` stays a `TxnRejected` even when its text contains
-    /// "duplicate lease"; an untyped error with that text is still a lease
-    /// conflict (classification unchanged).
+    /// "duplicate lease"; an untyped error is never classified by its text:
+    /// one that mentions a lease is a plain evaluator error (issue #2127).
     #[test]
-    fn rejection_is_mapped_by_type_and_lease_classification_is_unchanged() {
+    fn rejection_is_mapped_by_type_never_by_text() {
         let pool = make_pool_with_evaluator(1000);
         let mut guard = pool.mu.lock();
         let txgroup = vec![make_test_txn(9)];
@@ -3868,7 +3861,7 @@ mod tests {
             },
         }));
         let err = pool
-            .add_to_pending_block_evaluator_once(&txgroup, &mut guard, false)
+            .add_to_pending_block_evaluator_once(&txgroup, &mut guard)
             .expect_err("rejected");
         assert!(
             matches!(
@@ -3892,9 +3885,9 @@ mod tests {
             },
         }));
         let err = pool
-            .add_to_pending_block_evaluator_once(&txgroup, &mut guard, false)
-            .expect_err("lease");
-        assert!(matches!(err, PoolError::LeaseConflict { .. }), "{err:?}");
+            .add_to_pending_block_evaluator_once(&txgroup, &mut guard)
+            .expect_err("rejected");
+        assert!(matches!(err, PoolError::Evaluator(_)), "{err:?}");
     }
 
     /// Issue #1969: a signature that does not verify is go's batch verifier

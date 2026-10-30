@@ -74,7 +74,7 @@ pub mod voters_tracker;
 
 pub use apply::{
     apply_acfg, apply_afrz, apply_axfer, apply_block, apply_block_capturing_apply_data,
-    apply_block_capturing_apply_data_with_delta, apply_block_capturing_group_deltas,
+    apply_generated_block_capturing_apply_data_with_delta, apply_block_capturing_group_deltas,
     apply_block_validating, apply_block_with_comparison, apply_block_with_delta,
     apply_block_with_delta_mode, apply_block_with_mode, apply_keyreg, apply_pay, apply_transaction,
     apply_transaction_with_budget, apply_transaction_with_tracer, ApplyContext, ApplyData,

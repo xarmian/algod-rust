@@ -2476,6 +2476,37 @@ fn a_group_evicted_in_dev_mode_can_be_resubmitted() {
     assert_eq!(pool.pending_count(), 1);
 }
 
+/// An eviction that matches no pending group changes nothing: no index
+/// entry, status-cache entry or re-evaluation count (issue #2127).
+#[test]
+fn evicting_an_unknown_group_changes_nothing() {
+    let a = key(1);
+    let b = key(2);
+    let (_ledger, pool) = fixture(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))], &[]);
+    let kept = leased_pay(&a, b.0, [0x60; 32], 8);
+    pool.remember_one(kept.clone()).expect("admitted");
+    let unknown = algo_codec::compute_txn_id(&leased_pay(&a, b.0, [0x61; 32], 9).txn);
+    let reason = algo_error::AlgoError::Ledger {
+        message: "dev-mode commit rejected the group".into(),
+    };
+    let tag =
+        algo_pool::error::classify_pool_error(&algo_pool::PoolError::Evaluator(reason.to_string()));
+    let reevals_before = pool.reeval_counter().count(tag);
+    assert_eq!(
+        pool.evict_groups(&std::collections::HashSet::from([unknown]), &reason),
+        0
+    );
+    assert_eq!(pool.pending_count(), 1);
+    let (_, status, found) = pool.lookup(&unknown);
+    assert!(
+        !found && status.is_empty(),
+        "no status for {unknown}: {status}"
+    );
+    assert_eq!(pool.reeval_counter().count(tag), reevals_before);
+    let (_, _, found) = pool.lookup(&algo_codec::compute_txn_id(&kept.txn));
+    assert!(found, "the pending transaction is still indexed");
+}
+
 /// The pool's own `checkDup` copy always runs, so a lease the snapshot holds
 /// is rejected even when the real apply cannot run (stale base): go's typed
 /// `LeaseInLedgerError`, tagged `lease` (issue #2127).

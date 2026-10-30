@@ -285,7 +285,7 @@ fn block_generation_rejects_a_live_lease_like_go() {
 }
 
 /// The dev-mode producer commits through
-/// `apply_block_capturing_apply_data_with_delta`; go's dev block comes from
+/// `apply_generated_block_capturing_apply_data_with_delta`; go's dev block comes from
 /// a Generate + Validate evaluator, so a live-lease conflict is rejected and
 /// the open block rolls back (issue #2127).
 #[test]
@@ -294,7 +294,7 @@ fn dev_mode_commit_rejects_a_live_lease_and_rolls_back() {
     let sc = scenario(&o, "cross_block_lease_conflict");
     let mut l = sqlite(&o);
     l.begin_block().expect("begin block");
-    let err = algo_ledger::apply::apply_block_capturing_apply_data_with_delta(
+    let err = algo_ledger::apply::apply_generated_block_capturing_apply_data_with_delta(
         &mut l,
         &block(&sc.block),
         algo_ledger::ApplyMode::Execute,
@@ -536,9 +536,9 @@ fn sqlite_txid_lookup_sees_rounds_applied_in_the_open_span() {
 /// go's `Alive` / `checkDup` judge the whole payset whatever the execution
 /// does: a proposal whose first transaction cannot be evaluated here (an
 /// overspend, a no-verdict) and whose second replays a committed txid is
-/// still rejected with go's `checkDup` text, on the overlay check, on the
-/// locked scratch check, and on a ledger that stays busy past the budget
-/// (issue #2127).
+/// still rejected with go's `checkDup` text, on the overlay check and on the
+/// locked scratch check; a ledger busy past the budget never stalls the
+/// validator (issue #2127).
 #[test]
 fn checkdup_verdict_survives_an_unevaluable_earlier_transaction() {
     use algo_ledger::shadow_execute::{scratch_proposal_check, ProposalCheck, ViolationKind};
@@ -582,26 +582,43 @@ fn checkdup_verdict_survives_an_unevaluable_earlier_transaction() {
         other => panic!("overlay check: expected go's checkDup verdict, got {other:?}"),
     }
 
-    // A ledger busy for the whole budget: the fallback's pre-pass waits for
-    // the mutex and still judges the payset.
+    // A ledger busy for the whole budget: the fallback pre-pass never waits
+    // for the mutex (agreement must not stall), so the validator returns
+    // within the budget on the stateless verdict.
+    let budget = Duration::from_millis(30);
     let validator = PayoutCheckingValidator::with_budget(
         StubBlockValidator::accepting(),
         ledger.clone(),
-        Duration::from_millis(30),
+        budget,
     );
+    let hold = Duration::from_millis(1500);
     let (held_tx, held_rx) = std::sync::mpsc::channel();
     let holder = {
         let ledger = ledger.clone();
         std::thread::spawn(move || {
             let _guard = ledger.lock().unwrap();
             held_tx.send(()).unwrap();
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(hold);
         })
     };
     held_rx.recv().unwrap();
+    let started = std::time::Instant::now();
+    validator
+        .validate(&candidate)
+        .map(|_| ())
+        .expect("busy ledger: no verdict, the stateless verdict stands");
+    let took = started.elapsed();
+    assert!(
+        took < hold / 2,
+        "the validator waited for the busy ledger ({took:?})"
+    );
+    holder.join().unwrap();
+
+    // Free again: the proposal is judged and rejected.
+    let validator =
+        PayoutCheckingValidator::with_budget(StubBlockValidator::accepting(), ledger, budget);
     match validator.validate(&candidate).map(|_| ()) {
         Err(AgreementError::ValidationFailed(message)) => assert_eq!(message, sc.validate_error),
-        other => panic!("busy ledger: expected go's checkDup verdict, got {other:?}"),
+        other => panic!("free ledger: expected go's checkDup verdict, got {other:?}"),
     }
-    holder.join().unwrap();
 }
