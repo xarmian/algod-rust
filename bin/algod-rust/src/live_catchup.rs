@@ -1931,12 +1931,15 @@ mod tests {
     struct PanickingReloadControl {
         entered: tokio::sync::Notify,
         release: tokio::sync::Notify,
+        resumes: AtomicU32,
     }
 
     #[async_trait]
     impl NormalSyncControl for PanickingReloadControl {
         async fn pause(&self) {}
-        async fn resume(&self) {}
+        async fn resume(&self) {
+            self.resumes.fetch_add(1, Ordering::SeqCst);
+        }
         async fn reload_ledger(&self) {
             self.entered.notify_one();
             self.release.notified().await;
@@ -1951,6 +1954,7 @@ mod tests {
         let control = Arc::new(PanickingReloadControl {
             entered: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
+            resumes: AtomicU32::new(0),
         });
         let manager = LiveCatchupManager::new(ImmediateRunner::ok(), control.clone());
         assert_eq!(
@@ -1969,6 +1973,12 @@ mod tests {
             "a panicked task is not a clean stop"
         );
         wait_idle(&manager).await;
+        // Shutdown is in progress: the panic's cleanup frees the slot but does
+        // not resume the services the teardown is stopping (issue #2140).
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(control.resumes.load(Ordering::SeqCst), 0);
     }
 
     fn reserved_entry(generation: u64, catchpoint: &str) -> RunningCatchup {
