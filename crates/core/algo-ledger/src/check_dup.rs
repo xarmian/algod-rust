@@ -127,7 +127,8 @@ impl BlockDups {
     /// Undo every [`Self::record`] since `mark`: go applies a group to a
     /// child cow and drops it when a member fails, so a failed group's
     /// txids and leases never reach the block (go `addTx` runs only for an
-    /// applied group).
+    /// applied group). No caller continues an evaluation after a failed
+    /// group today (each fails the whole block); this guards future ones.
     pub fn rollback_to(&mut self, mark: usize) {
         while self.journal.len() > mark {
             let Some(undo) = self.journal.pop() else {
@@ -387,7 +388,7 @@ impl BlockCheckDup {
             txn_genesis_hash,
         ) {
             self.violation.get_or_insert_with(|| message.clone());
-            return Err(rejected(message));
+            return Err(typed(message, RejectClass::Alive));
         }
         if let Err(e) = check_dup(
             store,

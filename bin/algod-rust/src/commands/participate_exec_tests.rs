@@ -2571,3 +2571,97 @@ fn leased_overspend_reports_the_lease_conflict_first() {
         "expected the lease conflict, got: {err}"
     );
 }
+
+/// Port of go's `TestPoolLeaseReevalClassification`
+/// (`data/pools/transactionPool_test.go`): a leased transaction is
+/// remembered, then committed in a block; the pool re-evaluates its pending
+/// group without the block's txids (go nils `delta.Txids`), and the group is
+/// dropped as a conflict with the ledger's lease, counted under go's
+/// `TxPoolErrTagLease` (the typed `LeaseInLedgerError` with
+/// `InBlockEvaluator` false), not `lease_eval` (issue #2127).
+#[test]
+fn pool_lease_reeval_classification() {
+    use algo_pool::error::PoolErrorTag;
+    let a = key(1);
+    let b = key(2);
+    let (ledger, pool) = fixture(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))], &[]);
+    let mut lease = [0u8; 32];
+    lease[0] = 0x01;
+    pool.remember_one(leased_pay(&a, b.0, lease, 10))
+        .expect("remembered");
+
+    // Commit the transaction in a block, behind the pool's back.
+    let block = pool.assemble_dev_mode_block().expect("assemble");
+    assert_eq!(block.payset.len(), 1);
+    {
+        let mut l = ledger.lock().unwrap();
+        l.begin_block().expect("begin_block");
+        algo_ledger::apply::apply_generated_block_capturing_apply_data_with_delta(
+            &mut *l,
+            &block,
+            algo_ledger::ApplyMode::Execute,
+        )
+        .expect("commit the leased transaction");
+        l.commit_block().expect("commit_block");
+    }
+
+    let counter = pool.reeval_counter();
+    let (lease_before, lease_eval_before) = (
+        counter.count(PoolErrorTag::Lease),
+        counter.count(PoolErrorTag::LeaseEval),
+    );
+    // No committed txids: the pool re-evaluates instead of filtering.
+    pool.on_new_block(&block, &std::collections::HashSet::new());
+    let counter = pool.reeval_counter();
+    assert_eq!(counter.count(PoolErrorTag::Lease), lease_before + 1);
+    assert_eq!(counter.count(PoolErrorTag::LeaseEval), lease_eval_before);
+    assert_eq!(pool.pending_count(), 0);
+}
+
+/// go returns `Transaction.Alive`'s rejection from the validating
+/// evaluator's prologue bare (`bookkeeping.TxnDeadError`), with no
+/// `transaction <txid>:` frame; its pool tags it `txn_early` / `txn_dead`
+/// from the error (issue #2127).
+#[test]
+fn exec_prologue_alive_rejection_is_bare_like_go() {
+    let a = key(1);
+    let b = key(2);
+    let (_ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))]);
+    let mut t = base_txn(a.0, TxnType::Pay);
+    t.receiver = b.0;
+    t.amount = 1_000;
+    t.first_valid = Round(500);
+    let early = sign(t, &a.1);
+    let err = eval
+        .transaction_group(std::slice::from_ref(&early))
+        .expect_err("not yet alive");
+    let round = eval.round().0;
+    assert_eq!(
+        err.to_string(),
+        format!("txn dead: round {round} outside of 500--1000")
+    );
+    assert!(
+        matches!(
+            err,
+            algo_error::AlgoError::Rejected {
+                class: algo_error::RejectClass::Alive,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+
+    // The exec prologue's own `Alive` rejection (reached when the payset is
+    // evaluated against the live ledger) is passed through unframed too.
+    let txid = algo_codec::compute_txn_id(&early.txn).to_string();
+    let alive = algo_error::AlgoError::Rejected {
+        source: None,
+        message: format!("txn dead: round {round} outside of 500--1000"),
+        class: algo_error::RejectClass::Alive,
+    };
+    let passed = super::go_rejection(&txid, alive);
+    assert_eq!(
+        passed.to_string(),
+        format!("txn dead: round {round} outside of 500--1000")
+    );
+}

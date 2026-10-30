@@ -139,20 +139,6 @@ pub enum PoolError {
         detail: Option<algo_error::AvmErrorDetail>,
     },
 
-    /// The transaction's lease is already recorded for the sender within
-    /// the relevant round window.
-    ///
-    /// Mirrors go-algorand's `ledgercore.LeaseInLedgerError`. `in_block_evaluator`
-    /// mirrors its `InBlockEvaluator` field: `true` when the conflict was
-    /// discovered while the pool's block evaluator was being rebuilt during
-    /// re-evaluation (`TxPoolErrTagLeaseEval`), `false` when discovered
-    /// during a normal `Remember()` (`TxPoolErrTagLease`).
-    #[error("TransactionPool.ingest: {message}")]
-    LeaseConflict {
-        message: String,
-        in_block_evaluator: bool,
-    },
-
     /// A signature of the group does not verify. go checks signatures before
     /// the pool ever sees the group (`verify.TxnGroup` in
     /// `node.broadcastSignedTxGroup`) and returns the batch verifier's error
@@ -356,17 +342,10 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
             algo_error::RejectClass::TxidInLedger { in_block: false } => PoolErrorTag::TxId,
             algo_error::RejectClass::LeaseInLedger { in_block: true } => PoolErrorTag::LeaseEval,
             algo_error::RejectClass::LeaseInLedger { in_block: false } => PoolErrorTag::Lease,
-            algo_error::RejectClass::Other => classify_evaluator_message(message),
-        },
-        PoolError::LeaseConflict {
-            in_block_evaluator, ..
-        } => {
-            if *in_block_evaluator {
-                PoolErrorTag::LeaseEval
-            } else {
-                PoolErrorTag::Lease
+            algo_error::RejectClass::Alive | algo_error::RejectClass::Other => {
+                classify_evaluator_message(message)
             }
-        }
+        },
         // Classified as before (a generic evaluator rejection), so the
         // metrics and the gossip handlers' peer handling do not change.
         PoolError::SignatureBatchFailed => PoolErrorTag::EvalGeneric,

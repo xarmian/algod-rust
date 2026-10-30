@@ -2264,6 +2264,24 @@ impl RewardsLevelCache {
     }
 }
 
+/// The txid cache [`SqliteLedger::txtail_found`] answers from: the shared
+/// one, or a throwaway one for a span that starts behind it.
+enum TxtailView<'a> {
+    Shared(std::sync::MutexGuard<'a, crate::txtail_cache::TxTailDupCache>),
+    Own(crate::txtail_cache::TxTailDupCache),
+}
+
+impl std::ops::Deref for TxtailView<'_> {
+    type Target = crate::txtail_cache::TxTailDupCache;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Shared(cache) => cache,
+            Self::Own(cache) => cache,
+        }
+    }
+}
+
 pub struct SqliteLedger {
     conn: Connection,
     /// Ledger prefix for the on-disk database pair, or `None` for in-memory
@@ -3248,7 +3266,9 @@ impl SqliteLedger {
     /// `begin_block` span (the dev-mode commit, a validating apply, a span
     /// applying several rounds) the cache is synced only up to the round
     /// committed when the span began, and never moved backwards (that would
-    /// force a full rebuild). The rounds the span applied since then are
+    /// force a full rebuild); a span starting behind the cache (a rewound
+    /// ledger) is answered from a throwaway cache of the span start's window
+    /// instead. The rounds the span applied since then are
     /// read from their rows directly (a span is short), so their txids are
     /// found too; the round being applied has no row yet and is
     /// `checkDup`'s in-block half.
@@ -3286,13 +3306,7 @@ impl SqliteLedger {
 
     /// The shared txid cache synced as [`Self::txtail_found`] describes, and
     /// the round it is synced to (the committed round).
-    fn synced_txtail_cache(
-        &self,
-        max_txn_life: u64,
-    ) -> (
-        std::sync::MutexGuard<'_, crate::txtail_cache::TxTailDupCache>,
-        u64,
-    ) {
+    fn synced_txtail_cache(&self, max_txn_life: u64) -> (TxtailView<'_>, u64) {
         let fetch = |r| self.get_txtail(r).ok().flatten();
         let committed = if self.in_block {
             self.chain_snapshot
@@ -3320,8 +3334,17 @@ impl SqliteLedger {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !self.in_block || cache.loaded_hi() <= committed.0 {
             cache.sync_window_with(committed.0, max_txn_life, earliest, fetch, |_, _| {});
+            return (TxtailView::Shared(cache), committed.0);
         }
-        (cache, committed.0)
+        // In a span whose start is behind the shared cache (the ledger was
+        // rewound below rounds the cache already loaded): those rounds are
+        // not part of this chain, and moving the shared cache backwards
+        // would force its full rebuild. Answer from a throwaway cache of
+        // exactly the span start's window instead.
+        drop(cache);
+        let mut own = crate::txtail_cache::TxTailDupCache::new();
+        own.sync_window_with(committed.0, max_txn_life, earliest, fetch, |_, _| {});
+        (TxtailView::Own(own), committed.0)
     }
 
     /// Return a reference to the in-memory lease table.

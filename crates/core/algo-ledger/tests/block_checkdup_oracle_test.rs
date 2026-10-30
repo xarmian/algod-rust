@@ -533,6 +533,34 @@ fn sqlite_txid_lookup_sees_rounds_applied_in_the_open_span() {
     );
 }
 
+/// A span opened on a ledger rewound below rounds the shared txid cache
+/// already loaded does not see those discarded rounds' txids (issue #2127).
+#[test]
+fn sqlite_span_behind_the_shared_cache_ignores_discarded_rounds() {
+    let o = load_oracle();
+    let round2 = block(&scenario(&o, "cross_block_lease_conflict").block);
+    let txids = algo_codec::block_txids_with_rule(
+        &round2,
+        &algo_types::genesis_restore::GenesisRestoreRule::for_block(&round2),
+    );
+    let mut l = sqlite(&o);
+    l.begin_block().expect("begin block");
+    algo_ledger::apply::apply_block(&mut l, &round2).expect("replay round 2");
+    l.commit_block().expect("commit block");
+    // The shared cache is synced to round 2.
+    assert_eq!(l.txtail_confirmed_txids(&txids, 1000).len(), txids.len());
+
+    // Rewind to round 1 and open a span there.
+    l.set_current_round(algo_types::Round(1));
+    l.begin_block().expect("begin span at round 1");
+    assert!(
+        l.txtail_confirmed_txids(&txids, 1000).is_empty(),
+        "round 2 is not part of this chain"
+    );
+    assert!(!l.txtail_contains_txid(&txids[0], 1000));
+    l.rollback_block().expect("rollback span");
+}
+
 /// go's `Alive` / `checkDup` judge the whole payset whatever the execution
 /// does: a proposal whose first transaction cannot be evaluated here (an
 /// overspend, a no-verdict) and whose second replays a committed txid is

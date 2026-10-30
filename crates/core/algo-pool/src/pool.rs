@@ -1420,7 +1420,7 @@ impl TransactionPool {
         }
     }
 
-    /// Drop the pending or remembered group made of `txids` (every member's
+    /// Drop the pending group made of `txids` (every member's
     /// id: a group is evicted whole), with `error` as the reason, returning
     /// how many groups were dropped. The dev-mode producer evicts a group
     /// whose commit the ledger rejected, as go's `AssembleDevModeBlock` drops
@@ -1430,18 +1430,20 @@ impl TransactionPool {
     /// `pending/{txid}` reports the pool-error text.
     pub fn evict_groups(&self, txids: &HashSet<Digest>, error: &AlgoError) -> usize {
         let mut inner = self.mu.lock();
+        // `remember` and the evaluator rebuild fill the remembered
+        // collections and flush them into pending (`remember_commit`) under
+        // the same `mu` hold, so with `mu` held here they are empty: only
+        // pending can hold the group.
+        debug_assert!(inner.remembered_tx_groups.is_empty() && inner.remembered_txids.is_empty());
         let mut pending = self.pending_mu.write();
-        // The txid-keyed maps give the members without hashing the pool. A
+        // The txid-keyed map gives the members without hashing the pool. A
         // group is matched by its group id; an ungrouped transaction (the
         // only member of its group) by its txid, hashed only for pool
         // transactions from one of the evicted senders.
         let mut group_ids: HashSet<[u8; 32]> = HashSet::new();
         let mut senders: HashSet<Address> = HashSet::new();
         for id in txids {
-            for stx in [pending.txids.get(id), inner.remembered_txids.get(id)]
-                .into_iter()
-                .flatten()
-            {
+            if let Some(stx) = pending.txids.get(id) {
                 if stx.txn.group == [0u8; 32] {
                     senders.insert(stx.txn.sender);
                 } else {
@@ -1465,22 +1467,16 @@ impl TransactionPool {
             .into_iter()
             .partition(|g| hit(g));
         pending.tx_groups = kept;
-        let (gone_remembered, kept): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut inner.remembered_tx_groups)
-                .into_iter()
-                .partition(|g| hit(g));
-        inner.remembered_tx_groups = kept;
-        let dropped = gone.len() + gone_remembered.len();
+        let dropped = gone.len();
         if dropped == 0 {
             // Nothing matched: the pool is left exactly as it was.
             return 0;
         }
         // Only the dropped groups' members leave the txid indexes.
         let mut evicted: Vec<Digest> = Vec::new();
-        for stx in gone.iter().chain(&gone_remembered).flatten() {
+        for stx in gone.iter().flatten() {
             let id = compute_txn_id(&stx.txn);
             pending.txids.remove(&id);
-            inner.remembered_txids.remove(&id);
             evicted.push(id);
         }
         drop(pending);
@@ -1496,7 +1492,7 @@ impl TransactionPool {
         // effects (its txids, leases and balance changes): rebuild it from
         // the surviving groups, so a corrected resubmission is judged
         // against the ledger, not against the group it replaces.
-        if dropped > 0 && inner.evaluator.is_some() {
+        if inner.evaluator.is_some() {
             self.recompute_block_evaluator(&mut inner, &HashSet::new());
         }
         dropped

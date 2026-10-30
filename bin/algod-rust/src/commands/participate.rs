@@ -1556,12 +1556,15 @@ fn reason_of(e: &algo_error::AlgoError, pc: usize) -> (String, algo_error::Rejec
 /// [`algo_error::AlgoError::Rejected`] keeping the structured AVM diagnostics
 /// reachable through its source.
 fn go_rejection(txid: &str, error: algo_error::AlgoError) -> algo_error::AlgoError {
-    // go's `checkDup` errors reach the pool bare and typed
-    // (`TransactionInLedgerError` / `LeaseInLedgerError`): the pool tags them
-    // `txid` / `lease` from the type, and their text already names the txid.
+    // go's `Alive` and `checkDup` errors reach the pool bare and typed
+    // (`TxnDeadError` or a genesis mismatch, `TransactionInLedgerError`,
+    // `LeaseInLedgerError`): the pool tags them from the type, and go adds no
+    // `transaction <txid>:` frame to them.
     if let algo_error::AlgoError::Rejected {
         class:
-            algo_error::RejectClass::TxidInLedger { .. } | algo_error::RejectClass::LeaseInLedger { .. },
+            algo_error::RejectClass::Alive
+            | algo_error::RejectClass::TxidInLedger { .. }
+            | algo_error::RejectClass::LeaseInLedger { .. },
         ..
     } = &error
     {
@@ -1843,7 +1846,7 @@ impl SimpleBlockEvaluator {
         let rejected = |message: String| algo_error::AlgoError::Rejected {
             source: None,
             message,
-            class: algo_error::RejectClass::Other,
+            class: algo_error::RejectClass::Alive,
         };
         for stx in txgroup {
             algo_validate::block_alive(

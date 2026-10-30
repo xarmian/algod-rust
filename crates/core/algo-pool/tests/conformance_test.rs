@@ -769,33 +769,10 @@ fn test_pool_error_classification() {
     );
 }
 
-/// Port of Go's `TestPoolLeaseReevalClassification`
-/// (`data/pools/transactionPool_test.go`): a lease conflict discovered
-/// while the pool's block evaluator is being rebuilt during re-evaluation
-/// (`OnNewBlock` -> `recompute_block_evaluator`) must classify as
-/// `LeaseEval`, distinct from a lease conflict discovered during a normal
-/// `Remember()` (`Lease`). Go carries this distinction on
-/// `ledgercore.LeaseInLedgerError.InBlockEvaluator`; algod-rust carries it
-/// on `PoolError::LeaseConflict::in_block_evaluator` for the same reason
-/// (the `BlockEvaluator` trait only reports a message string, not a typed
-/// error). The plumbing that sets this flag from the two call sites is
-/// exercised directly in `pool.rs`'s
-/// `test_lease_conflict_classification_by_reevaluation_context` (it needs
-/// private access); this test pins the public classification contract.
-#[test]
-fn test_pool_lease_reeval_classification() {
-    let reeval_err = PoolError::LeaseConflict {
-        message: "duplicate lease".into(),
-        in_block_evaluator: true,
-    };
-    assert_eq!(classify_pool_error(&reeval_err), PoolErrorTag::LeaseEval);
-
-    let remember_err = PoolError::LeaseConflict {
-        message: "duplicate lease".into(),
-        in_block_evaluator: false,
-    };
-    assert_eq!(classify_pool_error(&remember_err), PoolErrorTag::Lease);
-}
+// go's `TestPoolLeaseReevalClassification` is ported against the real
+// re-evaluation path (the node's pool evaluator re-evaluating a committed
+// lease): `bin/algod-rust/src/commands/participate_exec_tests.rs`
+// `pool_lease_reeval_classification` (issue #2127).
 
 /// Port of Go's `TestPoolAssetBalanceClassification`
 /// (`data/pools/transactionPool_test.go`): a transfer of more of an asset
