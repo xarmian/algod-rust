@@ -244,10 +244,16 @@ pub trait CatchupRunner: Send + Sync {
     /// progresses (issue #941) — [`OrchestratorCatchupRunner`] wires it to
     /// [`algo_ledger::sync::SyncOrchestrator::set_progress_callback`]. Test
     /// fakes that don't model fine-grained progress may leave it untouched.
+    ///
+    /// `abort` fires, before `cancel`, only when the user aborts the catchup
+    /// (`DELETE /v2/catchup`): the run then discards its state, where a
+    /// plain `cancel` (node shutdown) keeps it for the next start to resume
+    /// (issue #2121; go `Abort` vs `Stop`).
     async fn run(
         &self,
         catchpoint: &str,
         cancel: CancellationToken,
+        abort: CancellationToken,
         counters: Arc<StdMutex<CatchpointCounters>>,
     ) -> anyhow::Result<CatchupOutcome>;
 }
@@ -269,6 +275,10 @@ pub const LIVE_CATCHUP_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Durati
 struct RunningCatchup {
     catchpoint: String,
     cancel: CancellationToken,
+    /// Fired (before `cancel`) by [`LiveCatchupManager::abort_catchup`] only,
+    /// so the run discards its state instead of keeping it for a resume
+    /// (issue #2121; go `Abort` vs `Stop`).
+    abort: CancellationToken,
     /// The [`LiveCatchupManager::drive`] task, joined by
     /// [`LiveCatchupManager::shutdown`] (issue #2121).
     task: Option<tokio::task::JoinHandle<()>>,
@@ -364,7 +374,7 @@ impl LiveCatchupManager {
         if tokio::time::timeout(timeout, task).await.is_err() {
             warn!(
                 ?timeout,
-                "live catchpoint catchup did not stop within the shutdown timeout;                  continuing the shutdown without it"
+                "live catchpoint catchup did not stop within the shutdown timeout; continuing the shutdown without it"
             );
         }
     }
@@ -429,16 +439,21 @@ impl LiveCatchupManager {
         }
 
         let cancel = CancellationToken::new();
+        let abort = CancellationToken::new();
         let manager = Arc::clone(self);
         let catchpoint_owned = catchpoint.to_string();
         let cancel_task = cancel.clone();
+        let abort_task = abort.clone();
         let task = tokio::spawn(async move {
-            manager.drive(catchpoint_owned, cancel_task).await;
+            manager
+                .drive(catchpoint_owned, cancel_task, abort_task)
+                .await;
         });
 
         *guard = Some(RunningCatchup {
             catchpoint: catchpoint.to_string(),
             cancel,
+            abort,
             task: Some(task),
         });
         CatchupStartResult::Created
@@ -456,6 +471,9 @@ impl LiveCatchupManager {
         match guard.as_ref() {
             None => Ok(()),
             Some(running) if running.catchpoint == catchpoint => {
+                // go `Abort()`: the abort flag first, then the cancellation
+                // the run's stages wait on (issue #2121).
+                running.abort.cancel();
                 running.cancel.cancel();
                 Ok(())
             }
@@ -594,10 +612,15 @@ impl LiveCatchupManager {
     /// `processStageSwitch`/`abort` both calling
     /// `updateNodeCatchupMode(false)` on the way out, regardless of
     /// success or failure.
-    async fn drive(self: Arc<Self>, catchpoint: String, cancel: CancellationToken) {
+    async fn drive(
+        self: Arc<Self>,
+        catchpoint: String,
+        cancel: CancellationToken,
+        abort: CancellationToken,
+    ) {
         let result = self
             .runner
-            .run(&catchpoint, cancel, Arc::clone(&self.counters))
+            .run(&catchpoint, cancel, abort, Arc::clone(&self.counters))
             .await;
         match &result {
             Ok(CatchupOutcome::Complete) => {
@@ -635,18 +658,20 @@ impl LiveCatchupManager {
             }
         }
 
-        // Issue #2121: the whole hand-back (reload, sync-round reset, resume)
-        // runs under the `running` lock, and `running` is cleared only after
-        // it. `shutdown()` raises `shutting_down` BEFORE taking that lock, so
-        // either this re-check right before `resume()` sees the flag and skips
-        // it, or `resume()` completes while `shutdown()` still waits for the
-        // lock: `shutdown()` never returns with a resume still to come, and
-        // the node's teardown that follows it stops whatever was resumed.
-        let mut guard = self.running.lock().await;
+        // Issue #2121: the hand-back (reload, sync-round reset, resume) runs
+        // WITHOUT the `running` lock, so `GET /v2/status`, `start_catchup` and
+        // `abort_catchup` answer while it is in progress; `running` (and with
+        // it this task's handle) is cleared only at its very end. A shutdown
+        // that lands meanwhile finds the run still registered, takes the
+        // handle and waits for this task inside its own timeout, and the
+        // shutting-down flag is re-checked right before `resume()`, so a
+        // shutdown that has begun is never answered by restarting the
+        // services it is stopping.
+        //
         // Node shutdown: the services `resume()` would restart are being
         // stopped, so only clear the running state.
         if self.is_shutting_down() {
-            *guard = None;
+            *self.running.lock().await = None;
             return;
         }
 
@@ -691,7 +716,7 @@ impl LiveCatchupManager {
         if !self.is_shutting_down() {
             self.control.resume().await;
         }
-        *guard = None;
+        *self.running.lock().await = None;
     }
 }
 
@@ -877,6 +902,7 @@ impl CatchupRunner for OrchestratorCatchupRunner {
         &self,
         catchpoint: &str,
         cancel: CancellationToken,
+        abort: CancellationToken,
         counters: Arc<StdMutex<CatchpointCounters>>,
     ) -> anyhow::Result<CatchupOutcome> {
         use algo_ledger::sync::{SyncConfig, SyncOrchestrator};
@@ -944,6 +970,7 @@ impl CatchupRunner for OrchestratorCatchupRunner {
                 SharedSyncBackend(Arc::clone(&backend)),
             );
             orchestrator.set_cancel(cancel.clone());
+            orchestrator.set_abort(abort.clone());
             // Mirror the eight `catchpoint_*` counters from `SyncProgress` into
             // the shared sink `LiveCatchupManager::catchpoint_counters()` reads
             // (issue #941), on every progress notification (state transitions
@@ -1118,6 +1145,7 @@ mod tests {
             &self,
             _catchpoint: &str,
             _cancel: CancellationToken,
+            _abort: CancellationToken,
             _counters: Arc<StdMutex<CatchpointCounters>>,
         ) -> anyhow::Result<CatchupOutcome> {
             match self.result.lock().unwrap().take() {
@@ -1140,6 +1168,7 @@ mod tests {
             &self,
             _catchpoint: &str,
             cancel: CancellationToken,
+            _abort: CancellationToken,
             _counters: Arc<StdMutex<CatchpointCounters>>,
         ) -> anyhow::Result<CatchupOutcome> {
             cancel.cancelled().await;
@@ -1148,6 +1177,27 @@ mod tests {
             // Mirrors `SyncOrchestrator::run` returning an error on
             // cancellation (`sync/mod.rs`'s `handle_cancellation`) — a
             // cancelled run is not a "completed" catchup.
+            Err(anyhow::anyhow!("sync cancelled by user"))
+        }
+    }
+
+    /// A [`CatchupRunner`] fake that blocks until `cancel` fires and
+    /// records whether it was an abort (the `abort` token had fired first).
+    struct StopReasonRunner {
+        aborted: Arc<StdMutex<Option<bool>>>,
+    }
+
+    #[async_trait]
+    impl CatchupRunner for StopReasonRunner {
+        async fn run(
+            &self,
+            _catchpoint: &str,
+            cancel: CancellationToken,
+            abort: CancellationToken,
+            _counters: Arc<StdMutex<CatchpointCounters>>,
+        ) -> anyhow::Result<CatchupOutcome> {
+            cancel.cancelled().await;
+            *self.aborted.lock().unwrap() = Some(abort.is_cancelled());
             Err(anyhow::anyhow!("sync cancelled by user"))
         }
     }
@@ -1323,6 +1373,94 @@ mod tests {
         shutdown.await.unwrap();
         assert_eq!(control.resumes.load(Ordering::SeqCst), 1);
         assert_eq!(manager.current_catchpoint().await, None);
+    }
+
+    /// The hand-back holds no lock: while it is in progress (here, a slow
+    /// ledger reload), `GET /v2/status`'s `current_catchpoint()` and
+    /// `abort_catchup` still answer at once.
+    #[tokio::test]
+    async fn status_and_abort_answer_promptly_during_the_hand_back() {
+        let control = GatedControl::new(false);
+        let manager = LiveCatchupManager::new(ImmediateRunner::ok(), control.clone());
+        assert_eq!(
+            manager.start_catchup("1000#deadbeef").await,
+            CatchupStartResult::Created
+        );
+        control.entered.notified().await;
+
+        let status = tokio::time::timeout(Duration::from_secs(1), manager.current_catchpoint())
+            .await
+            .expect("current_catchpoint() blocked behind the hand-back");
+        assert_eq!(status.as_deref(), Some("1000#deadbeef"));
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.abort_catchup("1000#deadbeef"),
+        )
+        .await
+        .expect("abort_catchup() blocked behind the hand-back")
+        .unwrap();
+
+        control.release.notify_one();
+        wait_idle(&manager).await;
+        assert_eq!(control.resumes.load(Ordering::SeqCst), 1);
+    }
+
+    /// shutdown() waits for a slow hand-back only within its own timeout
+    /// (here the reload is held well past it), and the hand-back, once it
+    /// does go on, still sees the shutdown and does not resume.
+    #[tokio::test]
+    async fn shutdown_returns_within_its_timeout_when_the_hand_back_is_slow() {
+        let control = GatedControl::new(false);
+        let manager = LiveCatchupManager::new(ImmediateRunner::ok(), control.clone());
+        assert_eq!(
+            manager.start_catchup("1000#deadbeef").await,
+            CatchupStartResult::Created
+        );
+        control.entered.notified().await;
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.shutdown(Duration::from_millis(200)),
+        )
+        .await
+        .expect("shutdown() overran its own timeout behind the hand-back");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "shutdown() took {:?} with a 200 ms timeout",
+            started.elapsed()
+        );
+
+        control.release.notify_one();
+        wait_idle(&manager).await;
+        assert_eq!(control.resumes.load(Ordering::SeqCst), 0);
+    }
+
+    /// go `Abort()` vs `Stop()` (issue #2121): `abort_catchup` marks the
+    /// cancellation as an abort, so the run discards its state; a node
+    /// shutdown does not, so the run keeps it for the next start.
+    #[tokio::test]
+    async fn abort_and_shutdown_tell_the_run_why_it_stops() {
+        for abort in [true, false] {
+            let aborted = Arc::new(StdMutex::new(None));
+            let manager = LiveCatchupManager::new(
+                Arc::new(StopReasonRunner {
+                    aborted: aborted.clone(),
+                }),
+                Arc::new(CountingControl::default()),
+            );
+            assert_eq!(
+                manager.start_catchup("1000#deadbeef").await,
+                CatchupStartResult::Created
+            );
+            if abort {
+                manager.abort_catchup("1000#deadbeef").await.unwrap();
+                wait_idle(&manager).await;
+            } else {
+                manager.shutdown(Duration::from_secs(5)).await;
+            }
+            assert_eq!(*aborted.lock().unwrap(), Some(abort), "abort = {abort}");
+        }
     }
 
     // -- start_catchup: happy path -----------------------------------------

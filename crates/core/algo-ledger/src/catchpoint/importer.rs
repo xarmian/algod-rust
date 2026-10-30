@@ -290,29 +290,9 @@ impl<'a> CatchpointImporter<'a> {
     /// renders the pre-G5 stale-`catchpointresources.ctype` concern moot —
     /// the table is dropped + recreated with the correct shape every time.
     pub fn prepare_staging(&mut self) -> Result<(), CatchpointError> {
-        // Create staging tables via raw DDL (single source of truth in sqlite.rs).
-        //
-        // The trailing `DROP TABLE IF EXISTS catchpoint_import_state` is a
-        // transitional cleanup for tracker DBs produced by older Rust
-        // versions that left the now-removed table behind (PLAN-36 G4 /
-        // TASK-117). Phase B's goal is that Rust-produced DBs are openable
-        // by go-algorand without unknown tables — this drop guarantees that
-        // any later import on such a DB scrubs the legacy artifact.
-        self.conn.execute_batch(
-            "
-            DROP TABLE IF EXISTS catchpointassetcreators;
-            DROP TABLE IF EXISTS catchpointbalances;
-            DROP TABLE IF EXISTS catchpointpendinghashes;
-            DROP TABLE IF EXISTS catchpointaccounthashes;
-            DROP TABLE IF EXISTS catchpointresources;
-            DROP TABLE IF EXISTS catchpointkvstore;
-            DROP TABLE IF EXISTS catchpointonlineaccounts;
-            DROP TABLE IF EXISTS catchpointonlineroundparamstail;
-            DROP TABLE IF EXISTS catchpointstateproofverification;
-            DROP TABLE IF EXISTS catchpoint_import_state;
-            ",
-        )?;
+        drop_staging_tables(self.conn)?;
 
+        // Create staging tables via raw DDL (single source of truth in sqlite.rs).
         self.conn
             .execute_batch(crate::sqlite::CATCHPOINT_STAGING_TABLES_SQL)?;
         // Build the catchpointbalances secondary indexes after the bulk
@@ -1089,6 +1069,33 @@ impl<'a> CatchpointImporter<'a> {
 // ---------------------------------------------------------------------------
 // import_catchpoint_file — main entry point for offline catchpoint import
 // ---------------------------------------------------------------------------
+
+/// Drop every catchpoint staging table (issue #2121 factored this out of
+/// [`CatchpointImporter::prepare_staging`]). Also used when a catchup is
+/// aborted, mirroring go's `abort` -> `ResetStagingBalances`.
+pub fn drop_staging_tables(conn: &Connection) -> Result<(), CatchpointError> {
+    // The trailing `DROP TABLE IF EXISTS catchpoint_import_state` is a
+    // transitional cleanup for tracker DBs produced by older Rust
+    // versions that left the now-removed table behind (PLAN-36 G4 /
+    // TASK-117). Phase B's goal is that Rust-produced DBs are openable
+    // by go-algorand without unknown tables — this drop guarantees that
+    // any later import on such a DB scrubs the legacy artifact.
+    conn.execute_batch(
+        "
+        DROP TABLE IF EXISTS catchpointassetcreators;
+        DROP TABLE IF EXISTS catchpointbalances;
+        DROP TABLE IF EXISTS catchpointpendinghashes;
+        DROP TABLE IF EXISTS catchpointaccounthashes;
+        DROP TABLE IF EXISTS catchpointresources;
+        DROP TABLE IF EXISTS catchpointkvstore;
+        DROP TABLE IF EXISTS catchpointonlineaccounts;
+        DROP TABLE IF EXISTS catchpointonlineroundparamstail;
+        DROP TABLE IF EXISTS catchpointstateproofverification;
+        DROP TABLE IF EXISTS catchpoint_import_state;
+        ",
+    )?;
+    Ok(())
+}
 
 /// Import a catchpoint file into the database.
 ///

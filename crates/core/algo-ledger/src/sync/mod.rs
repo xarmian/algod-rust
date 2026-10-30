@@ -685,6 +685,10 @@ pub struct SyncOrchestrator {
     replay_stopped_early: Option<ReplayStoppedEarly>,
     /// Cancellation token — checked between phases and during long operations.
     cancel: CancellationToken,
+    /// Fired together with `cancel` when the user ABORTS the catchup (`DELETE
+    /// /v2/catchup`) rather than the node shutting down (issue #2121): see
+    /// [`Self::set_abort`].
+    abort: CancellationToken,
     /// Optional progress callback — invoked on state transitions and periodic updates.
     on_progress: Option<ProgressCallback>,
     /// Accumulated EvalDelta comparison stats (when compare_mode or avm_execute is enabled).
@@ -721,6 +725,7 @@ impl SyncOrchestrator {
             final_round: 0,
             replay_stopped_early: None,
             cancel: CancellationToken::new(),
+            abort: CancellationToken::new(),
             on_progress: None,
             eval_delta_stats: EvalDeltaStats::default(),
         }
@@ -732,6 +737,23 @@ impl SyncOrchestrator {
     /// atomic operation, persist checkpoint state, and return an error.
     pub fn set_cancel(&mut self, cancel: CancellationToken) {
         self.cancel = cancel;
+    }
+
+    /// Set the token that marks a cancellation as an ABORT (issue #2121),
+    /// mirroring go's `CatchpointCatchupService`: `Abort()` fires its abort
+    /// context and then the main one, `Stop()` only the main one, and a stage
+    /// that sees the main context cancelled calls `stopOrAbort`, which
+    /// `abort`s (`ResetStagingBalances`: the catchup state is discarded) only
+    /// when the abort context fired, and otherwise leaves the state on disk
+    /// for the next start to resume.
+    ///
+    /// Fire it BEFORE the [`Self::set_cancel`] token. A cancelled run with
+    /// `abort` fired discards its resume marker, the staging tables and the
+    /// downloaded catchpoint file, so a later catchup (for this label or any
+    /// other) starts fresh; without it, a cancellation (node shutdown)
+    /// persists the marker and the next run resumes from it.
+    pub fn set_abort(&mut self, abort: CancellationToken) {
+        self.abort = abort;
     }
 
     /// Set a progress callback that is invoked on state transitions and
@@ -776,6 +798,10 @@ impl SyncOrchestrator {
 
     /// Persist checkpoint and return a cancellation error.
     fn handle_cancellation(&self) -> AlgoError {
+        // An abort discards the state instead (`discard_aborted_catchup`).
+        if self.abort.is_cancelled() {
+            return cancelled_error();
+        }
         tracing::info!(state = %self.state, "persisting checkpoint before shutdown");
         if let Ok(conn) = self.open_db() {
             if let Err(e) = persist_sync_state(
@@ -792,6 +818,36 @@ impl SyncOrchestrator {
             }
         }
         cancelled_error()
+    }
+
+    /// Discard an aborted catchup's on-disk state (issue #2121), mirroring
+    /// go's `abort` -> `ResetStagingBalances`: the resume marker (so no later
+    /// run resumes this catchpoint), the staging tables and the downloaded
+    /// catchpoint file. Best-effort: a failure is logged, and the next import
+    /// drops and recreates the staging tables anyway.
+    fn discard_aborted_catchup(&mut self) {
+        tracing::info!(
+            state = %self.state,
+            "catchpoint catchup aborted: discarding its resume marker and staging data"
+        );
+        match self.open_db() {
+            Ok(conn) => {
+                if let Err(e) = clear_sync_state(&conn) {
+                    tracing::warn!(error = %e, "aborted catchup: could not clear the resume marker");
+                }
+                if let Err(e) = crate::catchpoint::importer::drop_staging_tables(&conn) {
+                    tracing::warn!(error = %e, "aborted catchup: could not drop the staging tables");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "aborted catchup: could not open the database"),
+        }
+        if let Some(path) = self.catchpoint_file_path.take() {
+            if let Err(e) = std::fs::remove_file(&path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(error = %e, path = %path.display(), "aborted catchup: could not remove the catchpoint file");
+                }
+            }
+        }
     }
 
     /// Validate and execute a state transition. Logs at INFO level and
@@ -2662,6 +2718,15 @@ impl SyncOrchestrator {
             tokio::task::block_in_place(|| self.run_phases(resume_state))
         };
 
+        // Issue #2121: a user abort ends the catchup for good (go `abort`);
+        // a shutdown leaves its marker for the next start to resume.
+        if result.is_err() && self.abort.is_cancelled() {
+            self.discard_aborted_catchup();
+            result = Err(AlgoError::Ledger {
+                message: "catchpoint catchup aborted by user".to_string(),
+            });
+        }
+
         match &result {
             Ok(_) => {
                 // Issue #1719: replay stopped early because the peer cannot
@@ -4034,6 +4099,136 @@ mod tests {
         assert_eq!(orchestrator.progress().catchpoint_total_blocks, 0);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lookback source that is stopped while serving its first fetch:
+    /// fires `abort` (when given) and then `cancel`, the order
+    /// `LiveCatchupManager::abort_catchup` uses, and fails.
+    struct StoppedDuringLookbackBackend {
+        abort: Option<CancellationToken>,
+        cancel: CancellationToken,
+    }
+
+    impl SyncBackend for StoppedDuringLookbackBackend {
+        fn download_catchpoint(
+            &self,
+            _genesis_id: &str,
+            _round: u64,
+            _dest_path: &std::path::Path,
+        ) -> Result<(), AlgoError> {
+            unimplemented!("the run resumes past the download")
+        }
+
+        fn fetch_block_raw(&self, _round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+            if let Some(abort) = &self.abort {
+                abort.cancel();
+            }
+            self.cancel.cancel();
+            Err(cancelled_error())
+        }
+
+        fn fetch_block(&self, _round: u64) -> Result<Block, AlgoError> {
+            unimplemented!("not exercised: the run stops in the lookback phase")
+        }
+
+        fn get_current_round(&self) -> Result<u64, AlgoError> {
+            unimplemented!("not exercised: the run stops in the lookback phase")
+        }
+
+        fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
+            Ok(None)
+        }
+    }
+
+    /// Resume a catchup for label L1 persisted at `DownloadingLookback`, and
+    /// stop it during the lookback download, as an abort (`abort: true`) or a
+    /// node shutdown. Returns the run's error, the marker left on disk,
+    /// whether the staging table and the catchpoint file still exist.
+    async fn stop_a_resumed_catchup(
+        abort: bool,
+        tag: u32,
+    ) -> (String, Option<PersistedSyncState>, bool, bool) {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-stop-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("catchpoint-5000.tar");
+        std::fs::write(&file, b"not a real catchpoint").unwrap();
+        let cancel = CancellationToken::new();
+        let abort_token = CancellationToken::new();
+        let mut orchestrator = SyncOrchestrator::with_backend(
+            test_config(dir.join("ledger"), 1),
+            StoppedDuringLookbackBackend {
+                abort: abort.then(|| abort_token.clone()),
+                cancel: cancel.clone(),
+            },
+        );
+        orchestrator.set_cancel(cancel);
+        orchestrator.set_abort(abort_token);
+        {
+            let conn = orchestrator.open_db().unwrap();
+            persist_sync_state(
+                &conn,
+                &SyncState::DownloadingLookback,
+                Some("5000#L1"),
+                Some(5_000),
+                Some(&file.to_string_lossy()),
+            )
+            .unwrap();
+            conn.execute_batch("CREATE TABLE catchpointbalances (address BLOB);")
+                .unwrap();
+        }
+
+        let err = orchestrator
+            .run()
+            .await
+            .expect_err("a stopped catchup must not succeed")
+            .to_string();
+        let conn = orchestrator.open_db().unwrap();
+        let marker = restore_sync_state(&conn).unwrap();
+        let staging: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE name = 'catchpointbalances'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let file_exists = file.exists();
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+        (err, marker, staging, file_exists)
+    }
+
+    /// Issue #2121, go `Stop()`: a node shutdown mid-catchup keeps the
+    /// resume marker (and the staging data and file it needs), so the next
+    /// start resumes this catchpoint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_during_a_catchup_keeps_its_resume_marker() {
+        let (err, marker, staging, file_exists) = stop_a_resumed_catchup(false, line!()).await;
+        assert!(err.contains("cancelled"), "{err}");
+        let marker = marker.expect("a shutdown must keep the resume marker");
+        assert_eq!(marker.state, SyncState::DownloadingLookback);
+        assert_eq!(marker.catchpoint_label.as_deref(), Some("5000#L1"));
+        assert!(staging, "a shutdown must keep the staging data");
+        assert!(file_exists, "a shutdown must keep the catchpoint file");
+    }
+
+    /// Issue #2121, go `Abort()` -> `abort` -> `ResetStagingBalances`: a
+    /// user abort discards the resume marker, the staging tables and the
+    /// downloaded file, so a later catchup (for any label) starts fresh
+    /// instead of resuming L1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborting_a_catchup_discards_its_resume_marker_and_staging() {
+        let (err, marker, staging, file_exists) = stop_a_resumed_catchup(true, line!()).await;
+        assert!(err.contains("aborted"), "{err}");
+        assert!(
+            marker.is_none(),
+            "an aborted catchup must leave nothing to resume: {marker:?}"
+        );
+        assert!(!staging, "an abort must drop the staging tables");
+        assert!(!file_exists, "an abort must remove the catchpoint file");
     }
 
     /// Issue #2121: the lookback retry backoff waits on the token, so a
