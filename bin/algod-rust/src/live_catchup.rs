@@ -256,6 +256,15 @@ pub trait CatchupRunner: Send + Sync {
         abort: CancellationToken,
         counters: Arc<StdMutex<CatchpointCounters>>,
     ) -> anyhow::Result<CatchupOutcome>;
+
+    /// Whether the most recent [`Self::run`], successful or not, left the
+    /// catchpoint cut over into the live ledger (past the import, not rolled
+    /// back). The node's ledger handle is then stale against the ledger on
+    /// disk until the hand-back reloads it (issue #2121). A fake that never
+    /// reaches the cutover keeps the default.
+    fn ledger_cut_over(&self) -> bool {
+        false
+    }
 }
 
 /// How long node shutdown waits for an in-flight live catchup to observe its
@@ -481,6 +490,10 @@ pub struct LiveCatchupManager {
     /// handle is stale against the cut-over ledger on disk. `shutdown()` then
     /// reports an unclean stop, and `participate` skips the export wait.
     ledger_stale_at_shutdown: std::sync::atomic::AtomicBool,
+    /// The first `shutdown()` call's result once it has one; a repeated or
+    /// concurrent call waits on it instead of racing the first for the task
+    /// handle (issue #2121).
+    shutdown_outcome: tokio::sync::watch::Sender<Option<bool>>,
 }
 
 impl LiveCatchupManager {
@@ -498,6 +511,7 @@ impl LiveCatchupManager {
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             next_generation: std::sync::atomic::AtomicU64::new(1),
             ledger_stale_at_shutdown: std::sync::atomic::AtomicBool::new(false),
+            shutdown_outcome: tokio::sync::watch::channel(None).0,
         })
     }
 
@@ -534,10 +548,40 @@ impl LiveCatchupManager {
     /// abandoned mid-phase, which is a crash as far as the sync state is
     /// concerned: the orchestrator persists that state per phase and resumes
     /// from it on the next start.
+    ///
+    /// A repeated or concurrent call does not race the first for the task: it
+    /// waits, within its own timeout, for the first call's result and returns
+    /// that (so it is `false` when the first genuinely timed out).
     pub async fn shutdown(&self, timeout: std::time::Duration) -> bool {
-        self.shutting_down
-            .store(true, std::sync::atomic::Ordering::SeqCst);
         let deadline = tokio::time::Instant::now() + timeout;
+        let already_started = self
+            .shutting_down
+            .swap(true, std::sync::atomic::Ordering::SeqCst);
+        if already_started {
+            let mut outcome = self.shutdown_outcome.subscribe();
+            loop {
+                if let Some(result) = *outcome.borrow_and_update() {
+                    return result;
+                }
+                match tokio::time::timeout_at(deadline, outcome.changed()).await {
+                    Ok(Ok(())) => continue,
+                    // Timed out waiting, or the first call was dropped before
+                    // it had a result: not a clean stop.
+                    _ => return false,
+                }
+            }
+        }
+        let result = self.shutdown_first(deadline, timeout).await;
+        self.shutdown_outcome.send_replace(Some(result));
+        result
+    }
+
+    /// The first `shutdown()` call's work.
+    async fn shutdown_first(
+        &self,
+        deadline: tokio::time::Instant,
+        timeout: std::time::Duration,
+    ) -> bool {
         // (The lock is only ever held briefly: pausing normal sync happens on
         // the starter task, outside it.)
         loop {
@@ -1007,14 +1051,16 @@ impl LiveCatchupManager {
         // folds a possibly multi-GB WAL back into the database files and
         // re-primes and unpauses the transaction pool, which is far too heavy
         // (and wrong) work for a teardown that has a few seconds. So when the
-        // run COMPLETED, i.e. the cut-over ledger on disk is ahead of the
-        // node's handle, record that, and `shutdown()` reports it as an
+        // run COMPLETED or was cancelled after the cutover, i.e. the cut-over
+        // ledger on disk is ahead of the node's handle, record that, and `shutdown()` reports it as an
         // unclean stop: `participate` then skips the catchpoint-export wait
         // instead of waiting on the stale pre-cutover handle. A run that was
-        // merely cancelled needs no reload for that (its ledger is resumed on
-        // the next start).
+        // cancelled BEFORE the cutover leaves the ledger untouched: a clean
+        // stop.
         if self.is_shutting_down() {
-            if result.is_ok() {
+            // A run that got past the import changed the ledger whether it
+            // then completed or was cancelled (in the lookback or replay).
+            if result.is_ok() || self.runner.ledger_cut_over() {
                 self.ledger_stale_at_shutdown
                     .store(true, std::sync::atomic::Ordering::SeqCst);
             }
@@ -1136,6 +1182,8 @@ impl std::fmt::Debug for LiveCatchupParams {
 /// standalone CLI path, but callable in-process from a live node.
 pub struct OrchestratorCatchupRunner {
     params: LiveCatchupParams,
+    /// [`CatchupRunner::ledger_cut_over`] for the latest run.
+    cut_over: std::sync::atomic::AtomicBool,
 }
 
 /// Bounded retry budget for a catchup attempt that fails specifically at
@@ -1241,12 +1289,19 @@ impl algo_ledger::sync::SyncBackend for SharedSyncBackend {
 
 impl OrchestratorCatchupRunner {
     pub fn new(params: LiveCatchupParams) -> Self {
-        Self { params }
+        Self {
+            params,
+            cut_over: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 }
 
 #[async_trait]
 impl CatchupRunner for OrchestratorCatchupRunner {
+    fn ledger_cut_over(&self) -> bool {
+        self.cut_over.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     async fn run(
         &self,
         catchpoint: &str,
@@ -1311,6 +1366,8 @@ impl CatchupRunner for OrchestratorCatchupRunner {
                 .handoff_min_lag_rounds,
         };
 
+        self.cut_over
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
@@ -1340,7 +1397,13 @@ impl CatchupRunner for OrchestratorCatchupRunner {
                 }
             }));
 
-            match orchestrator.run().await {
+            let ran = orchestrator.run().await;
+            // Whatever the outcome, record whether it left the ledger cut over.
+            self.cut_over.store(
+                orchestrator.ledger_cut_over(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            match ran {
                 Ok(result) => {
                     // Issue #1719: `Ok` means the catchpoint cutover is done
                     // and the ledger is consistent -- not that it reached the
@@ -2414,6 +2477,143 @@ mod tests {
         ));
         assert_eq!(control.resumes.load(Ordering::SeqCst), 0);
         assert_eq!(manager.current_catchpoint().await, None);
+    }
+
+    /// A [`CatchupRunner`] that waits for the cancellation, reports whether
+    /// it had passed the cutover, and fails (a catchup cancelled mid-flight).
+    struct CancelledAfterRunner {
+        cut_over: bool,
+    }
+
+    #[async_trait]
+    impl CatchupRunner for CancelledAfterRunner {
+        async fn run(
+            &self,
+            _catchpoint: &str,
+            cancel: CancellationToken,
+            _abort: CancellationToken,
+            _counters: Arc<StdMutex<CatchpointCounters>>,
+        ) -> anyhow::Result<CatchupOutcome> {
+            cancel.cancelled().await;
+            Err(anyhow::anyhow!("sync cancelled by user"))
+        }
+        fn ledger_cut_over(&self) -> bool {
+            self.cut_over
+        }
+    }
+
+    /// Issue #2121: a catchup cancelled AFTER the import's cutover (in the
+    /// lookback or replay) leaves the node's ledger handle as stale as a
+    /// completed one, so shutdown() reports it; one cancelled BEFORE the
+    /// cutover left the ledger untouched and is a clean stop.
+    #[tokio::test]
+    async fn a_catchup_cancelled_after_the_cutover_reports_a_stale_ledger() {
+        for (cut_over, clean) in [(true, false), (false, true)] {
+            let control = Arc::new(CountingControl::default());
+            let manager = LiveCatchupManager::new(
+                Arc::new(CancelledAfterRunner { cut_over }),
+                control.clone(),
+            );
+            assert_eq!(
+                manager.start_catchup("1000#deadbeef").await,
+                CatchupStartResult::Created
+            );
+            assert_eq!(
+                manager.shutdown(Duration::from_secs(5)).await,
+                clean,
+                "cut_over = {cut_over}"
+            );
+            assert_eq!(control.reloads.load(Ordering::SeqCst), 0);
+            assert_eq!(control.resumes.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    /// A [`CatchupRunner`] that, once cancelled, takes until `release` to stop.
+    struct SlowToStopRunner {
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl CatchupRunner for SlowToStopRunner {
+        async fn run(
+            &self,
+            _catchpoint: &str,
+            cancel: CancellationToken,
+            _abort: CancellationToken,
+            _counters: Arc<StdMutex<CatchpointCounters>>,
+        ) -> anyhow::Result<CatchupOutcome> {
+            cancel.cancelled().await;
+            self.release.notified().await;
+            Err(anyhow::anyhow!("sync cancelled by user"))
+        }
+    }
+
+    /// Issue #2121: a concurrent second shutdown() does not return `false` at
+    /// once because the first call holds the task: it waits for the first
+    /// call's outcome. Both report the clean stop once the run ends.
+    #[tokio::test]
+    async fn a_concurrent_shutdown_waits_for_the_first_calls_outcome() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let manager = LiveCatchupManager::new(
+            Arc::new(SlowToStopRunner {
+                release: release.clone(),
+            }),
+            Arc::new(CountingControl::default()),
+        );
+        assert_eq!(
+            manager.start_catchup("1000#deadbeef").await,
+            CatchupStartResult::Created
+        );
+        let mut first = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.shutdown(Duration::from_secs(5)).await })
+        };
+        wait_shutting_down(&manager).await;
+        let mut second = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.shutdown(Duration::from_secs(5)).await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut second)
+                .await
+                .is_err(),
+            "the second call returned while the first was still waiting"
+        );
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut first)
+            .await
+            .is_err());
+        release.notify_one();
+        assert!(first.await.unwrap());
+        assert!(second.await.unwrap());
+    }
+
+    /// ...and when the first call genuinely times out, a concurrent second
+    /// call reports `false` too.
+    #[tokio::test]
+    async fn a_concurrent_shutdown_reports_the_first_calls_timeout() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let manager = LiveCatchupManager::new(
+            Arc::new(SlowToStopRunner {
+                release: release.clone(),
+            }),
+            Arc::new(CountingControl::default()),
+        );
+        assert_eq!(
+            manager.start_catchup("1000#deadbeef").await,
+            CatchupStartResult::Created
+        );
+        let first = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.shutdown(Duration::from_millis(200)).await })
+        };
+        wait_shutting_down(&manager).await;
+        let second = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.shutdown(Duration::from_secs(5)).await })
+        };
+        assert!(!first.await.unwrap());
+        assert!(!second.await.unwrap(), "the first call timed out");
+        release.notify_one();
     }
 
     // -- start_catchup: happy path -----------------------------------------

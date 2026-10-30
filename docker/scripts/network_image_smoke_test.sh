@@ -46,6 +46,20 @@ class_is node "error sending request + invalid URL"
 log " WARN catchpoint_sync: block 5: error sending request for url (http://r1/v2/blocks/5): client error (Connect): tcp connect error: Connection refused (os error 111)"
 class_is external "error sending request + Connection refused"
 
+# --- "tls"/"handshake" count only as an error phrase, never inside a hostname
+log " WARN catchpoint_sync: block 5: error sending request for url (http://tls-relay.example:4160/v2/blocks/5): builder error"
+class_is node "a hostname containing 'tls' plus 'error sending request' and no cause"
+
+log " WARN catchpoint_sync: block 5: error sending request for url (http://r1/v2/blocks/5): client error (Connect): tls handshake eof"
+class_is external "error sending request + a tls handshake failure"
+
+# --- a 5xx counts only on a relay line
+log " INFO http: handler answered HTTP 500 for GET /v2/status (unrelated)"
+class_is node "an unrelated line that says HTTP 500"
+
+log "relay r1.example:4160: catchpoint file HTTP 502"
+class_is external "the entrypoint probe getting a 502"
+
 # --- node: a 404 everywhere is what a wrong URL looks like too
 log " WARN catchpoint_sync: block 9: REST /v2/blocks failed (not found: GET /v2/blocks/9?format=msgpack: 404 page not found)"   " WARN catchpoint_sync: block 9: every candidate peer failed: http://r1: not found | http://r2: not found"
 class_is node "404 on every fetch with no progress"

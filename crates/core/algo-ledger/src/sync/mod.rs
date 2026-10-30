@@ -804,6 +804,13 @@ impl SyncOrchestrator {
         self.on_progress = Some(cb);
     }
 
+    /// Whether the catchpoint was cut over into the live ledger and not rolled
+    /// back (this run's import, or an earlier process's). Read after `run`
+    /// returns, Ok or Err (issue #2121).
+    pub fn ledger_cut_over(&self) -> bool {
+        self.ledger_cut_over
+    }
+
     /// Returns a reference to the current sync state.
     pub fn state(&self) -> &SyncState {
         &self.state
@@ -1547,10 +1554,24 @@ impl SyncOrchestrator {
         reason: &str,
         rejected_file: bool,
     ) {
+        if rejected_file {
+            // The verification rejected the file's own content: it must never
+            // be imported again, so delete it and stop naming it, before ANY
+            // marker is written below. (A failure that did not reject the
+            // file, a transient IO or SQLite error, keeps naming it, so a
+            // resume re-imports it instead of re-downloading gigabytes.)
+            if let Some(path) = self.catchpoint_file_path.take() {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(error = %e, path = %path.display(), "could not remove the rejected catchpoint file");
+                    }
+                }
+            }
+        }
         if self.cutover_backup.is_none() {
             // Nothing to roll back (a run resumed past the import). The ledger
             // is still cut over, so the marker must keep saying so; if the
-            // file itself was rejected it must also stop naming it (below).
+            // file itself was rejected it was dropped above.
             // Otherwise the marker already describes the ledger (e.g.
             // `VerifyingLedger`, so a resume re-verifies rather than
             // re-imports): leave it as it is.
@@ -1573,21 +1594,12 @@ impl SyncOrchestrator {
                  keeping a resume marker that says so"
             );
         }
-        if rejected_file {
-            // The ledger holds an untrusted snapshot, and its file must not be
-            // imported again: delete it and record the cutover WITHOUT a file.
-            // A resume at `ImportingLedger` with no file re-downloads first
-            // (see `run_phases`), and the ledger stays recorded as cut over,
-            // so an abort meanwhile keeps the marker rather than discarding a
-            // state it cannot undo.
-            if let Some(path) = self.catchpoint_file_path.take() {
-                if let Err(e) = std::fs::remove_file(&path) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(error = %e, path = %path.display(), "could not remove the rejected catchpoint file");
-                    }
-                }
-            }
-        }
+        // The ledger holds the (possibly untrusted) snapshot and could not be
+        // restored: record the cutover. For a rejected file the marker names no
+        // file (dropped above), so a resume at `ImportingLedger` re-downloads
+        // first (see `run_phases`), and the ledger stays recorded as cut over,
+        // so an abort meanwhile keeps the marker rather than discarding a
+        // state it cannot undo.
         self.persist_marker(conn, &SyncState::ImportingLedger);
     }
 
@@ -3262,6 +3274,16 @@ impl SyncOrchestrator {
         // cancellation point that persists one before it), so resuming at
         // the import (ordinal 2, which re-runs it) is cut over too.
         self.ledger_cut_over = resume_ord >= 2;
+        // A `DownloadingLedger` marker that names a file that is still there
+        // means the download COMPLETED (the file only appears at its final
+        // path atomically, after the download): resume at the import instead
+        // of downloading it again. A verify failure that did not reject the
+        // file leaves exactly this marker (issue #2121).
+        let reuse_file = resume_ord == 1
+            && self
+                .catchpoint_file_path
+                .as_ref()
+                .is_some_and(|path| path.exists());
         if resume_ord > 0 {
             tracing::info!(
                 resume_state = %resume_state,
@@ -3270,6 +3292,7 @@ impl SyncOrchestrator {
             // Set internal state to the predecessor of the resume state so that
             // the resumed phase's `transition()` call validates correctly.
             self.state = match &resume_state {
+                SyncState::DownloadingLedger if reuse_file => SyncState::DownloadingLedger,
                 SyncState::DownloadingLedger => SyncState::Idle,
                 // A cut-over ledger whose file was rejected (issue #2121):
                 // re-download before the re-import.
@@ -3288,7 +3311,7 @@ impl SyncOrchestrator {
         // Phase 1: DownloadingLedger (ordinal 1). Also when resuming the import
         // of a cut-over ledger whose file was rejected (no file to re-import).
         let redownload = resume_ord == 2 && self.catchpoint_file_path.is_none();
-        if resume_ord <= 1 || redownload {
+        if (resume_ord <= 1 && !reuse_file) || redownload {
             self.run_download_ledger()?;
         }
 
@@ -5345,6 +5368,118 @@ mod tests {
             "the real error must surface, got: {err}"
         );
         assert!(!err.contains("cancelled by user"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A resumed run for [`R9_LABEL`] over a ledger in `dir`, whose download
+    /// attempts are counted.
+    fn resumed_run_counting_downloads(
+        dir: &std::path::Path,
+    ) -> (
+        SyncOrchestrator,
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        let downloads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut config = test_config(dir.join("ledger"), 1);
+        config.catchpoint_label = Some(R9_LABEL.to_string());
+        let orchestrator = SyncOrchestrator::with_backend(
+            config,
+            CountingFailedDownloadBackend {
+                downloads: downloads.clone(),
+            },
+        );
+        (orchestrator, downloads)
+    }
+
+    /// Issue #2121: a verify failure that did NOT reject the file (a transient
+    /// IO or SQLite error) whose cutover rolls back cleanly leaves a marker
+    /// that names the good file at the pre-import state, so the resume goes to
+    /// the import and does not download the gigabytes again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transient_verify_error_with_a_clean_rollback_resumes_without_redownloading() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-transient-verify-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("catchpoint-22507000.tar.gz");
+        std::fs::write(&file, b"a complete download").unwrap();
+
+        let (mut first, _) = resumed_run_counting_downloads(&dir);
+        first.resolved_label = Some(R9_LABEL.to_string());
+        first.catchpoint_round = Some(22_507_000);
+        first.catchpoint_file_path = Some(file.clone());
+        first.ledger_cut_over = true;
+        first.cutover_backup = Some(crate::catchpoint::CutoverBackup::default());
+        first.cutover_backup_pre_catchup = true;
+        {
+            let conn = first.open_db().unwrap();
+            create_rollback_tables(&conn);
+            // The marker the import left (also creates `catchpointstate`,
+            // which the rollback restores into).
+            first.persist_marker(&conn, &SyncState::ImportingLedger);
+            first.rollback_after_verify_failure(&conn, "transient sqlite busy", false);
+            let marker = restore_sync_state(&conn).unwrap().unwrap();
+            assert_eq!(marker.state, SyncState::DownloadingLedger);
+            assert_eq!(
+                marker.catchpoint_file.as_deref(),
+                Some(file.to_string_lossy().as_ref()),
+                "the good file must stay named"
+            );
+        }
+        assert!(file.exists());
+
+        // The resume: no new download (the import then fails on the fake file).
+        let (mut second, downloads) = resumed_run_counting_downloads(&dir);
+        let _ = second.run().await;
+        assert_eq!(
+            downloads.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a transient verify error must not force a re-download"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same clean rollback after a REJECTED file deletes it and names no
+    /// file, so the resume does download again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rejected_file_with_a_clean_rollback_is_deleted_and_redownloaded() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-rejected-clean-rollback-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("catchpoint-22507000.tar.gz");
+        std::fs::write(&file, b"a rejected download").unwrap();
+
+        let (mut first, _) = resumed_run_counting_downloads(&dir);
+        first.resolved_label = Some(R9_LABEL.to_string());
+        first.catchpoint_round = Some(22_507_000);
+        first.catchpoint_file_path = Some(file.clone());
+        first.ledger_cut_over = true;
+        first.cutover_backup = Some(crate::catchpoint::CutoverBackup::default());
+        first.cutover_backup_pre_catchup = true;
+        {
+            let conn = first.open_db().unwrap();
+            create_rollback_tables(&conn);
+            first.persist_marker(&conn, &SyncState::ImportingLedger);
+            first.rollback_after_verify_failure(&conn, "catchpoint hash mismatch", true);
+            let marker = restore_sync_state(&conn).unwrap().unwrap();
+            assert_eq!(marker.state, SyncState::DownloadingLedger);
+            assert_eq!(
+                marker.catchpoint_file, None,
+                "the rejected file must not be named"
+            );
+        }
+        assert!(!file.exists(), "the rejected file must be deleted");
+
+        let (mut second, downloads) = resumed_run_counting_downloads(&dir);
+        let _ = second.run().await;
+        assert_eq!(downloads.load(std::sync::atomic::Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
