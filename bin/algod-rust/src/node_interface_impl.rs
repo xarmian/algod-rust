@@ -7552,6 +7552,7 @@ mod tests {
             &self,
             _catchpoint: &str,
             cancel: tokio_util::sync::CancellationToken,
+            _abort: tokio_util::sync::CancellationToken,
             counters: Arc<Mutex<crate::live_catchup::CatchpointCounters>>,
         ) -> anyhow::Result<crate::live_catchup::CatchupOutcome> {
             // Publish a partial-progress snapshot before blocking, so
@@ -7933,6 +7934,7 @@ mod tests {
             &self,
             _catchpoint: &str,
             _cancel: tokio_util::sync::CancellationToken,
+            _abort: tokio_util::sync::CancellationToken,
             _counters: Arc<Mutex<crate::live_catchup::CatchpointCounters>>,
         ) -> anyhow::Result<crate::live_catchup::CatchupOutcome> {
             Ok(crate::live_catchup::CatchupOutcome::Complete)

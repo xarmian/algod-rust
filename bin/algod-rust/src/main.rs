@@ -31,8 +31,40 @@ use clap::Parser;
 
 use cli::{AlgocfgAction, AlgocfgProfileAction, BenchAction, CatchpointAction, Cli, Commands};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<std::process::ExitCode> {
+/// Upper bound on how long dropping the runtime waits for blocking work that
+/// is still running once a command returns (issue #2121). Commands stop
+/// their services in order before returning; this only keeps a straggler
+/// (a blocking phase that checks its cancellation token between steps) from
+/// holding the process past a container stop's grace period, which a plain
+/// `Runtime` drop would do (it waits for every blocking thread).
+/// See `live_catchup::LIVE_CATCHUP_SHUTDOWN_TIMEOUT` for the whole budget.
+///
+/// Trade-off: blocking work still running here (an automatic catchpoint
+/// export past its wait, a live catchup's import/verify that did not stop in
+/// time) is abandoned at process exit. Both are built to survive that (the
+/// export is atomic, the sync state is persisted per phase and resumed), but
+/// the work is redone on the next start. Issue #2142 asks whether
+/// `participate` should join such work explicitly instead.
+const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn main() -> anyhow::Result<std::process::ExitCode> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    // A panic out of `async_main` would otherwise unwind through the
+    // `Runtime` drop, which waits with no limit: bound that shutdown too, then
+    // resume the panic (issue #2121).
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async_main())
+    }));
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    match result {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+async fn async_main() -> anyhow::Result<std::process::ExitCode> {
     // Process start time for `algod_rust_process_start_time_seconds`: capture
     // it before anything else runs.
     algo_ledger::follow_timing::init_process_start_time();

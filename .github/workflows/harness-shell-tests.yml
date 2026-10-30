@@ -16,6 +16,7 @@ on:
     paths:
       - "ops/**"
       - "docker/algod/**"
+      - "docker/scripts/network*smoke*"
       - "docker/Dockerfile"
       - "Makefile"
       - ".github/workflows/harness-shell-tests.yml"
@@ -29,6 +30,7 @@ on:
     paths:
       - "ops/**"
       - "docker/algod/**"
+      - "docker/scripts/network*smoke*"
       - "docker/Dockerfile"
       - "Makefile"
       - ".github/workflows/harness-shell-tests.yml"

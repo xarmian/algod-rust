@@ -179,8 +179,8 @@ const DEFAULT_BLOCK_PEER_TIMEOUT: std::time::Duration = std::time::Duration::fro
 struct AlgodSyncBackend {
     client: AlgodClient,
     catchpoint_source: RankedCatchpointSource,
-    /// Tokio runtime handle for running async operations from sync context.
-    rt: tokio::runtime::Handle,
+    /// Runtime + cancellation token for the blocking calls (issue #2121).
+    runtime: BlockingRuntime,
     /// The network preset name (e.g. "mainnet"), if recognized -- issue
     /// #1604. `None` for a custom/unrecognized network, in which case
     /// `discover_catchpoint` keeps its pre-#1604 behavior (peer
@@ -232,6 +232,27 @@ impl AlgodSyncBackend {
         self.blocks.fetch_raw(round).await
     }
 
+    /// [`SyncBackend::fetch_block_raw`]'s request: `(proto, hdrdata, blkdata)`
+    /// in the format `apply_block` uses (hdrdata = canonical block header
+    /// encoding, for heartbeat validation and the block digest; blkdata =
+    /// full block msgpack encoding, for block replay).
+    async fn fetch_block_raw_async(
+        &self,
+        round: u64,
+    ) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+        let block = self.fetch_block_async(round).await?;
+        let proto = block.current_protocol.clone();
+        let hdrdata = canonical_encode_block_header_from_block(&block);
+        let blkdata = canonical_encode_block(&block);
+        Ok((proto, hdrdata, blkdata))
+    }
+
+    /// [`SyncBackend::fetch_block`]'s request: the decoded block.
+    async fn fetch_block_async(&self, round: u64) -> Result<Block, AlgoError> {
+        let raw = self.get_block_raw_bytes(round).await?;
+        Ok(decode_block_response(&raw)?.block)
+    }
+
     /// Ranks the catchpoint file download across `algod_url` plus
     /// `extra_catchpoint_peer_urls` instead of using `algod_url` alone
     /// (issue #901's peer-ranked catchpoint source selection).
@@ -247,6 +268,9 @@ impl AlgodSyncBackend {
     /// callers with a loaded `config.json` should pass real values sourced
     /// from it (see `run()` below) rather than defaults, mirroring the
     /// existing `catchpoint.rs` one-shot CLI download command's wiring.
+    ///
+    /// `cancel` is the orchestrator's token (issue #2121): every blocking
+    /// call ends at once when it fires.
     fn with_catchpoint_peers(
         algod_url: &str,
         algod_token: &str,
@@ -254,6 +278,7 @@ impl AlgodSyncBackend {
         download_config: algo_rest_client::CatchpointDownloadConfig,
         ledger_download_retry_attempts: usize,
         network: Option<&str>,
+        cancel: CancellationToken,
     ) -> Self {
         let client = AlgodClient::new(algod_url, algod_token);
         let catchpoint_source = ranked_catchpoint_source(
@@ -263,11 +288,10 @@ impl AlgodSyncBackend {
             download_config,
             ledger_download_retry_attempts,
         );
-        let rt = tokio::runtime::Handle::current();
         Self {
             client,
             catchpoint_source,
-            rt,
+            runtime: BlockingRuntime::current(cancel),
             network: network.map(str::to_string),
             blocks: Arc::new(RotatingBlockSource::new(
                 algod_url,
@@ -328,6 +352,7 @@ impl AlgodSyncBackend {
     /// require `RankedCatchpointSource` itself to grow a peer-removal/
     /// refresh API, a distinct change from this issue's node-startup wiring
     /// — left as a follow-up.
+    #[allow(clippy::too_many_arguments)]
     fn with_catchpoint_peers_and_p2p(
         algod_url: &str,
         algod_token: &str,
@@ -336,6 +361,7 @@ impl AlgodSyncBackend {
         download_config: algo_rest_client::CatchpointDownloadConfig,
         ledger_download_retry_attempts: usize,
         network: Option<&str>,
+        cancel: CancellationToken,
     ) -> Self {
         let backend = Self::with_catchpoint_peers(
             algod_url,
@@ -344,6 +370,7 @@ impl AlgodSyncBackend {
             download_config,
             ledger_download_retry_attempts,
             network,
+            cancel,
         );
         if let Some(transport) = p2p_transport {
             push_connected_p2p_peers(&backend.catchpoint_source, transport);
@@ -567,13 +594,10 @@ impl SyncBackend for AlgodSyncBackend {
         round: u64,
         dest_path: &std::path::Path,
     ) -> Result<(), AlgoError> {
-        tokio::task::block_in_place(|| {
-            self.rt.block_on(async {
-                self.catchpoint_source
-                    .download(genesis_id, round, dest_path, None)
-                    .await
-            })
-        })
+        self.runtime.block_on(
+            self.catchpoint_source
+                .download(genesis_id, round, dest_path, None),
+        )
     }
 
     fn rank_last_catchpoint_peer_down(&self) {
@@ -581,48 +605,25 @@ impl SyncBackend for AlgodSyncBackend {
     }
 
     fn fetch_block_raw(&self, round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
-        tokio::task::block_in_place(|| {
-            self.rt.block_on(async {
-                let raw = self.get_block_raw_bytes(round).await?;
-                let br = decode_block_response(&raw)?;
-                let proto = br.block.current_protocol.clone();
-                // Encode in the same format that apply_block uses:
-                // hdrdata = canonical block header encoding (for heartbeat
-                //           validation and block digest computation)
-                // blkdata = full block msgpack encoding (for block replay)
-                let hdrdata = canonical_encode_block_header_from_block(&br.block);
-                let blkdata = canonical_encode_block(&br.block);
-                Ok((proto, hdrdata, blkdata))
-            })
-        })
+        self.runtime.block_on(self.fetch_block_raw_async(round))
     }
 
     fn fetch_block(&self, round: u64) -> Result<Block, AlgoError> {
-        tokio::task::block_in_place(|| {
-            self.rt.block_on(async {
-                let raw = self.get_block_raw_bytes(round).await?;
-                let br = decode_block_response(&raw)?;
-                Ok(br.block)
-            })
-        })
+        self.runtime.block_on(self.fetch_block_async(round))
     }
 
     fn get_current_round(&self) -> Result<u64, AlgoError> {
-        tokio::task::block_in_place(|| {
-            self.rt.block_on(async {
-                let status = self.client.get_status().await?;
-                Ok(status.last_round)
-            })
+        self.runtime.block_on(async {
+            let status = self.client.get_status().await?;
+            Ok(status.last_round)
         })
     }
 
     fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
-        tokio::task::block_in_place(|| {
-            self.rt.block_on(discover_catchpoint_with_fallback(
-                &self.client,
-                self.network.as_deref(),
-            ))
-        })
+        self.runtime.block_on(discover_catchpoint_with_fallback(
+            &self.client,
+            self.network.as_deref(),
+        ))
     }
 
     fn fetch_block_range(
@@ -636,19 +637,106 @@ impl SyncBackend for AlgodSyncBackend {
             return BatchFetch::complete(Vec::new());
         }
 
+        self.runtime.fetch_range(cancel, |cancel| async move {
+            // Rotate across the candidate peers like the single-block
+            // path (issue #2095). Size the drain from the source's own
+            // timeouts, not a separately constructed default (issue #1755).
+            let drain = sync_tuning().drain_budget(self.blocks.worst_case_request_time());
+            let source: Arc<dyn BlockSource> = Arc::clone(&self.blocks) as Arc<dyn BlockSource>;
+            let fetcher = ParallelBlockFetcher::new(source, concurrency).with_drain_timeout(drain);
+            collect_block_range(&fetcher, start, end, &cancel).await
+        })
+    }
+}
+
+/// The runtime a sync backend's blocking calls run their async requests on,
+/// plus the orchestrator's cancellation token that ends them (issue #2121).
+/// Shared by [`AlgodSyncBackend`] and [`GossipSyncBackend`]; the token is a
+/// required constructor argument so no backend can be built that silently
+/// ignores a shutdown.
+struct BlockingRuntime {
+    rt: tokio::runtime::Handle,
+    cancel: CancellationToken,
+}
+
+impl BlockingRuntime {
+    /// The current runtime, ended by `cancel`.
+    fn current(cancel: CancellationToken) -> Self {
+        Self {
+            rt: tokio::runtime::Handle::current(),
+            cancel,
+        }
+    }
+
+    /// Run `fut` from the (blocking) sync thread, ending it with a
+    /// cancellation error as soon as the backend's token fires.
+    fn block_on<T>(
+        &self,
+        fut: impl std::future::Future<Output = Result<T, AlgoError>>,
+    ) -> Result<T, AlgoError> {
+        block_on_until_cancelled(&self.rt, &self.cancel, fut)
+    }
+
+    /// Run a range fetch (`SyncBackend::fetch_block_range`, which carries
+    /// the caller's own token), ending it as soon as EITHER the caller's
+    /// token or the backend's fires (issue #2121). Both reach the fetch as
+    /// one combined token that `collect_block_range` observes itself, so the
+    /// prefix served before the cancellation is kept (issue #1725), rather
+    /// than the fetch being dropped with nothing to show.
+    fn fetch_range<F, Fut>(&self, cancel: &CancellationToken, fetch: F) -> BatchFetch
+    where
+        F: FnOnce(CancellationToken) -> Fut,
+        Fut: std::future::Future<Output = BatchFetch>,
+    {
+        let combined = CancellationToken::new();
+        if cancel.is_cancelled() || self.cancel.is_cancelled() {
+            combined.cancel();
+        }
+        let backend = &self.cancel;
         tokio::task::block_in_place(|| {
             self.rt.block_on(async {
-                // Rotate across the candidate peers like the single-block
-                // path (issue #2095). Size the drain from the source's own
-                // timeouts, not a separately constructed default (issue #1755).
-                let drain = sync_tuning().drain_budget(self.blocks.worst_case_request_time());
-                let source: Arc<dyn BlockSource> = Arc::clone(&self.blocks) as Arc<dyn BlockSource>;
-                let fetcher =
-                    ParallelBlockFetcher::new(source, concurrency).with_drain_timeout(drain);
-                collect_block_range(&fetcher, start, end, cancel).await
+                let forward = async {
+                    tokio::select! {
+                        _ = backend.cancelled() => {}
+                        _ = cancel.cancelled() => {}
+                    }
+                    combined.cancel();
+                    // Then let the fetch observe it and finish with its prefix.
+                    std::future::pending::<BatchFetch>().await
+                };
+                tokio::select! {
+                    result = fetch(combined.clone()) => result,
+                    never = forward => never,
+                }
             })
         })
     }
+}
+
+/// Drive `fut` on `rt` from a blocking thread (the sync orchestrator's, or a
+/// lookback prefetch worker), giving up with
+/// [`algo_ledger::sync::cancelled_error`] as soon as `cancel` fires (issue
+/// #2121). A node shutdown then ends an in-flight block request at once
+/// instead of waiting out its per-peer timeouts while the runtime is
+/// dropped under it, which is what made the request's timers panic with "A
+/// Tokio 1.x context was found, but it is being shutdown".
+fn block_on_until_cancelled<T>(
+    rt: &tokio::runtime::Handle,
+    cancel: &CancellationToken,
+    fut: impl std::future::Future<Output = Result<T, AlgoError>>,
+) -> Result<T, AlgoError> {
+    tokio::task::block_in_place(|| {
+        rt.block_on(async {
+            tokio::select! {
+                // Biased toward completion: work that already finished is kept
+                // even when the token has fired too, not discarded as
+                // cancelled (a download that completed is a download).
+                biased;
+                result = fut => result,
+                _ = cancel.cancelled() => Err(algo_ledger::sync::cancelled_error()),
+            }
+        })
+    })
 }
 
 /// Fetch the inclusive range `[start, end]` through `fetcher`.
@@ -775,6 +863,7 @@ pub(crate) fn build_algod_sync_backend(
     ledger_download_retry_attempts: usize,
     network: Option<&str>,
     genesis_id: &str,
+    cancel: &CancellationToken,
 ) -> impl SyncBackend {
     AlgodSyncBackend::with_catchpoint_peers_and_p2p(
         algod_url,
@@ -784,6 +873,7 @@ pub(crate) fn build_algod_sync_backend(
         download_config,
         ledger_download_retry_attempts,
         network,
+        cancel.clone(),
     )
     .with_http_block_fetcher(genesis_id)
 }
@@ -1011,8 +1101,8 @@ pub struct GossipSyncBackend {
     /// `algod_url` plus any `--catchpoint-peer-url` peers, as in
     /// [`AlgodSyncBackend`].
     catchpoint_source: RankedCatchpointSource,
-    /// Tokio runtime handle for running async operations from sync context.
-    rt: tokio::runtime::Handle,
+    /// Runtime + cancellation token for the blocking calls (issue #2121).
+    runtime: BlockingRuntime,
     /// Source selection policy.
     policy: BlockSourcePolicy,
     /// Concurrency for batch fetches.
@@ -1064,6 +1154,8 @@ impl GossipSyncBackend {
     ///   recognized (issue #1604), for [`Self::discover_catchpoint`]'s
     ///   static-index fallback. `None` keeps the pre-#1604 REST-only
     ///   discovery behavior.
+    /// * `cancel` — the orchestrator's token (issue #2121): every blocking
+    ///   call ends at once when it fires.
     #[allow(clippy::too_many_arguments)]
     pub fn with_network(
         gossip: Arc<GossipBlockSource>,
@@ -1074,15 +1166,15 @@ impl GossipSyncBackend {
         concurrency: usize,
         catchpoint_source: RankedCatchpointSource,
         network: Option<&str>,
+        cancel: CancellationToken,
     ) -> Self {
         let rest_client = AlgodClient::new(algod_url, algod_token);
-        let rt = tokio::runtime::Handle::current();
         Self {
             gossip,
             http: Arc::new(HttpBlockFetcherSource::new(http_fetcher)),
             rest_client,
             catchpoint_source,
-            rt,
+            runtime: BlockingRuntime::current(cancel),
             policy,
             concurrency,
             worst_case_round_time: std::time::Duration::ZERO,
@@ -1163,13 +1255,10 @@ impl SyncBackend for GossipSyncBackend {
         dest_path: &std::path::Path,
     ) -> Result<(), AlgoError> {
         // Catchpoint download is always via REST/HTTP, ranked across peers.
-        tokio::task::block_in_place(|| {
-            self.rt.block_on(async {
-                self.catchpoint_source
-                    .download(genesis_id, round, dest_path, None)
-                    .await
-            })
-        })
+        self.runtime.block_on(
+            self.catchpoint_source
+                .download(genesis_id, round, dest_path, None),
+        )
     }
 
     fn rank_last_catchpoint_peer_down(&self) {
@@ -1177,41 +1266,38 @@ impl SyncBackend for GossipSyncBackend {
     }
 
     fn fetch_block_raw(&self, round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
-        tokio::task::block_in_place(|| self.rt.block_on(self.fetch_block_raw_with_policy(round)))
+        self.runtime
+            .block_on(self.fetch_block_raw_with_policy(round))
     }
 
     fn fetch_block(&self, round: u64) -> Result<Block, AlgoError> {
-        tokio::task::block_in_place(|| self.rt.block_on(self.fetch_block_with_policy(round)))
+        self.runtime.block_on(self.fetch_block_with_policy(round))
     }
 
     fn get_current_round(&self) -> Result<u64, AlgoError> {
-        tokio::task::block_in_place(|| {
-            self.rt.block_on(async {
-                match self.policy {
-                    BlockSourcePolicy::GossipOnly => {
-                        // In GossipOnly mode, use the gossip source's synthetic
-                        // status (based on last fetched round) instead of REST.
-                        let status = self.gossip.get_status().await?;
-                        Ok(status.last_round)
-                    }
-                    BlockSourcePolicy::GossipFirst | BlockSourcePolicy::HttpOnly => {
-                        // Use REST for authoritative round info.
-                        let status = self.rest_client.get_status().await?;
-                        Ok(status.last_round)
-                    }
+        self.runtime.block_on(async {
+            match self.policy {
+                BlockSourcePolicy::GossipOnly => {
+                    // In GossipOnly mode, use the gossip source's synthetic
+                    // status (based on last fetched round) instead of REST.
+                    let status = self.gossip.get_status().await?;
+                    Ok(status.last_round)
                 }
-            })
+                BlockSourcePolicy::GossipFirst | BlockSourcePolicy::HttpOnly => {
+                    // Use REST for authoritative round info.
+                    let status = self.rest_client.get_status().await?;
+                    Ok(status.last_round)
+                }
+            }
         })
     }
 
     fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
         // Catchpoint discovery is always via REST.
-        tokio::task::block_in_place(|| {
-            self.rt.block_on(discover_catchpoint_with_fallback(
-                &self.rest_client,
-                self.network.as_deref(),
-            ))
-        })
+        self.runtime.block_on(discover_catchpoint_with_fallback(
+            &self.rest_client,
+            self.network.as_deref(),
+        ))
     }
 
     fn fetch_block_range(
@@ -1228,38 +1314,34 @@ impl SyncBackend for GossipSyncBackend {
         // For batch fetches, use the gossip source wrapped as a BlockSource
         // via ParallelBlockFetcher when gossip is available. Fall back to
         // REST-based parallel fetch when in HttpOnly mode.
-        tokio::task::block_in_place(|| {
-            self.rt.block_on(async {
-                let source: Arc<dyn BlockSource> = match self.policy {
-                    BlockSourcePolicy::HttpOnly => {
-                        // Use HttpBlockFetcherSource to route through the
-                        // configured HttpBlockFetcher, matching the single-
-                        // block fetch path.
-                        Arc::clone(&self.http) as Arc<dyn BlockSource>
-                    }
-                    BlockSourcePolicy::GossipOnly => {
-                        Arc::clone(&self.gossip) as Arc<dyn BlockSource>
-                    }
-                    BlockSourcePolicy::GossipFirst => {
-                        // Wrap gossip + HTTP in a FallbackBlockSource so that
-                        // per-round gossip failures fall back to HTTP instead
-                        // of cancelling the entire batch pipeline.
-                        Arc::new(FallbackBlockSource {
-                            gossip: Arc::clone(&self.gossip),
-                            http: Arc::clone(&self.http),
-                        })
-                    }
-                };
+        self.runtime.fetch_range(cancel, |cancel| async move {
+            let source: Arc<dyn BlockSource> = match self.policy {
+                BlockSourcePolicy::HttpOnly => {
+                    // Use HttpBlockFetcherSource to route through the
+                    // configured HttpBlockFetcher, matching the single-
+                    // block fetch path.
+                    Arc::clone(&self.http) as Arc<dyn BlockSource>
+                }
+                BlockSourcePolicy::GossipOnly => Arc::clone(&self.gossip) as Arc<dyn BlockSource>,
+                BlockSourcePolicy::GossipFirst => {
+                    // Wrap gossip + HTTP in a FallbackBlockSource so that
+                    // per-round gossip failures fall back to HTTP instead
+                    // of cancelling the entire batch pipeline.
+                    Arc::new(FallbackBlockSource {
+                        gossip: Arc::clone(&self.gossip),
+                        http: Arc::clone(&self.http),
+                    })
+                }
+            };
 
-                let effective_concurrency = if concurrency > 0 {
-                    concurrency
-                } else {
-                    self.concurrency
-                };
-                let fetcher = ParallelBlockFetcher::new(source, effective_concurrency)
-                    .with_drain_timeout(sync_tuning().drain_budget(self.worst_case_round_time));
-                collect_block_range(&fetcher, start, end, cancel).await
-            })
+            let effective_concurrency = if concurrency > 0 {
+                concurrency
+            } else {
+                self.concurrency
+            };
+            let fetcher = ParallelBlockFetcher::new(source, effective_concurrency)
+                .with_drain_timeout(sync_tuning().drain_budget(self.worst_case_round_time));
+            collect_block_range(&fetcher, start, end, &cancel).await
         })
     }
 }
@@ -1388,6 +1470,7 @@ fn build_catchpoint_backend(
     http_block_fetch_timeout: std::time::Duration,
     catchup_gossip_block_fetch_timeout: std::time::Duration,
     p2p_transport: Option<&Arc<P2pTransport>>,
+    cancel: CancellationToken,
 ) -> anyhow::Result<CatchpointBackend> {
     if !gossip {
         return Ok(CatchpointBackend::Rest(
@@ -1398,6 +1481,7 @@ fn build_catchpoint_backend(
                 download_config,
                 ledger_download_retry_attempts,
                 network_name_for_genesis_id(genesis_id),
+                cancel.clone(),
             ),
         ));
     }
@@ -1468,6 +1552,7 @@ fn build_catchpoint_backend(
             concurrency,
             catchpoint_source,
             network_name_for_genesis_id(genesis_id),
+            cancel.clone(),
         )
         .with_extra_http_fetchers(extra_http_fetchers)
         .with_worst_case_round_time(worst_case_round_time(
@@ -1925,6 +2010,7 @@ pub async fn run(
         http_block_fetch_timeout,
         catchup_gossip_block_fetch_timeout,
         None,
+        cancel.clone(),
     )?;
     let mut orchestrator = SyncOrchestrator::with_backend(config, backend);
     orchestrator.set_cancel(cancel);
@@ -1971,6 +2057,118 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tests drive no shutdown: their backends get a token nobody fires.
+    fn no_cancel() -> CancellationToken {
+        CancellationToken::new()
+    }
+
+    // -- block_on_until_cancelled (issue #2121) -----------------------------
+
+    /// An in-flight block request driven from a blocking thread (a lookback
+    /// prefetch worker) ends as soon as the token fires, before the runtime
+    /// it runs on is shut down, instead of waiting out its timeouts.
+    #[test]
+    fn block_on_until_cancelled_ends_an_in_flight_request_on_cancel() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = rt.handle().clone();
+        let cancel = CancellationToken::new();
+        let worker = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let result = block_on_until_cancelled(&handle, &cancel, async {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    Ok::<_, AlgoError>(())
+                });
+                (result, started.elapsed())
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        cancel.cancel();
+        let (result, elapsed) = worker.join().expect("the request panicked");
+        rt.shutdown_timeout(std::time::Duration::from_secs(5));
+        let err = result.expect_err("a cancelled request must not succeed");
+        assert!(err.to_string().contains("cancelled"), "{err}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the request outlived the cancellation: {elapsed:?}"
+        );
+        // An already-cancelled token ends a request that has not finished
+        // at once, but keeps one that already has (biased toward completion).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let pending = block_on_until_cancelled(rt.handle(), &cancel, async {
+            std::future::pending::<()>().await;
+            Ok::<_, AlgoError>(())
+        });
+        assert!(pending.is_err());
+        let ready = block_on_until_cancelled(rt.handle(), &cancel, async { Ok::<_, AlgoError>(7) });
+        assert_eq!(
+            ready.unwrap(),
+            7,
+            "a finished request must not be discarded as cancelled"
+        );
+    }
+
+    /// `BlockSource` serving rounds `< serve_below` at once and never
+    /// answering for the rest: a peer that stalls mid-range.
+    struct StallingSource {
+        serve_below: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl BlockSource for StallingSource {
+        async fn get_block_raw(&self, _round: Round) -> algo_error::Result<Vec<u8>> {
+            unimplemented!()
+        }
+        async fn get_block(&self, round: Round) -> algo_error::Result<algo_types::BlockResponse> {
+            if round.0 >= self.serve_below {
+                std::future::pending::<()>().await;
+            }
+            Ok(serde_json::from_value(serde_json::json!({"block": {"rnd": round.0}})).unwrap())
+        }
+        async fn get_status(&self) -> algo_error::Result<algo_rest_client::NodeStatus> {
+            unimplemented!()
+        }
+        async fn wait_for_round(
+            &self,
+            _round: Round,
+        ) -> algo_error::Result<algo_rest_client::NodeStatus> {
+            unimplemented!()
+        }
+    }
+
+    /// Issue #2121 / #1725: a range fetch cancelled after k rounds were
+    /// served returns those k rounds, whichever token fired (the caller's or
+    /// the backend's), not an empty batch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_range_fetch_keeps_the_served_prefix() {
+        for fire_backend in [false, true] {
+            let caller = CancellationToken::new();
+            let runtime = BlockingRuntime::current(CancellationToken::new());
+            let to_fire = if fire_backend {
+                runtime.cancel.clone()
+            } else {
+                caller.clone()
+            };
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                to_fire.cancel();
+            });
+            let fetcher = ParallelBlockFetcher::new(Arc::new(StallingSource { serve_below: 4 }), 2);
+            let fetch = runtime.fetch_range(&caller, |cancel| async move {
+                collect_block_range(&fetcher, 1, 10, &cancel).await
+            });
+            let rounds: Vec<u64> = fetch.blocks.iter().map(|(r, _)| *r).collect();
+            assert_eq!(rounds, vec![1, 2, 3], "fire_backend = {fire_backend}");
+            let err = fetch.error.expect("a cancelled range is not complete");
+            assert!(err.to_string().contains("cancelled"), "{err}");
+        }
+    }
 
     // -- collect_block_range (issue #1719) ----------------------------------
 
@@ -2582,6 +2780,7 @@ mod tests {
             4,
             test_catchpoint_source(),
             None,
+            no_cancel(),
         );
 
         assert!(!backend.is_noop());
@@ -2603,9 +2802,10 @@ mod tests {
             4,
             test_catchpoint_source(),
             None,
+            no_cancel(),
         );
 
-        let result = backend.fetch_blocks_batch(10, 5, 4);
+        let result = backend.fetch_blocks_batch(10, 5, 4, &no_cancel());
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
     }
@@ -2627,6 +2827,7 @@ mod tests {
             4,
             test_catchpoint_source(),
             None,
+            no_cancel(),
         );
 
         let result = backend.fetch_block(1);
@@ -2648,6 +2849,7 @@ mod tests {
             4,
             test_catchpoint_source(),
             None,
+            no_cancel(),
         );
 
         let result = backend.fetch_block(1);
@@ -2669,6 +2871,7 @@ mod tests {
             4,
             test_catchpoint_source(),
             None,
+            no_cancel(),
         );
 
         let result = backend.fetch_block(1);
@@ -2693,6 +2896,7 @@ mod tests {
             4,
             test_catchpoint_source(),
             None,
+            no_cancel(),
         );
 
         let err = backend.fetch_block(42).unwrap_err();
@@ -2720,6 +2924,7 @@ mod tests {
             4,
             test_catchpoint_source(),
             None,
+            no_cancel(),
         );
 
         let result = backend.fetch_block_raw(1);
@@ -2821,6 +3026,7 @@ mod tests {
             std::time::Duration::from_secs(4),
             std::time::Duration::from_secs(4),
             None,
+            no_cancel(),
         )
         .expect("gossip backend construction should succeed with zero peers");
         assert!(
@@ -2849,6 +3055,7 @@ mod tests {
             std::time::Duration::from_secs(4),
             std::time::Duration::from_secs(4),
             None,
+            no_cancel(),
         )
         .expect("gossip backend construction should succeed");
         let CatchpointBackend::Gossip(b) = backend else {
@@ -2886,6 +3093,7 @@ mod tests {
             std::time::Duration::from_secs(4),
             std::time::Duration::from_secs(4),
             None,
+            no_cancel(),
         )
         .expect("gossip backend construction should succeed");
         let CatchpointBackend::Gossip(b) = backend else {
@@ -3009,6 +3217,7 @@ mod tests {
             std::time::Duration::from_secs(4),
             std::time::Duration::from_secs(4),
             None,
+            no_cancel(),
         )
         .expect("REST backend construction should succeed");
         assert!(matches!(backend, CatchpointBackend::Rest(_)));
@@ -3035,6 +3244,7 @@ mod tests {
             std::time::Duration::from_secs(4),
             std::time::Duration::from_secs(4),
             None,
+            no_cancel(),
         )
         .expect("gossip backend construction should succeed with one peer");
         let CatchpointBackend::Gossip(gossip_backend) = backend else {
@@ -3062,6 +3272,7 @@ mod tests {
             std::time::Duration::from_secs(4),
             std::time::Duration::from_secs(4),
             None,
+            no_cancel(),
         )
         .expect("gossip backend construction should succeed with zero peers");
         let CatchpointBackend::Gossip(gossip_backend) = backend else {
@@ -3179,6 +3390,7 @@ mod tests {
                 std::time::Duration::from_secs(4),
                 std::time::Duration::from_secs(4),
                 p2p,
+                no_cancel(),
             )
             .expect("gossip backend construction should succeed");
             let CatchpointBackend::Gossip(b) = backend else {
@@ -3209,6 +3421,7 @@ mod tests {
             algo_rest_client::CatchpointDownloadConfig::default(),
             algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
             None,
+            no_cancel(),
         );
         assert_eq!(backend_no_p2p.catchpoint_source.peer_count(), 1);
 
@@ -3222,6 +3435,7 @@ mod tests {
             algo_rest_client::CatchpointDownloadConfig::default(),
             algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
             None,
+            no_cancel(),
         );
         assert_eq!(
             backend_with_p2p.catchpoint_source.peer_count(),
@@ -3269,6 +3483,7 @@ mod tests {
             algo_rest_client::CatchpointDownloadConfig::default(),
             algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
             None,
+            no_cancel(),
         );
         assert!(
             without_fallback.get_block_raw_bytes(1).await.is_err(),
@@ -3283,6 +3498,7 @@ mod tests {
             algo_rest_client::CatchpointDownloadConfig::default(),
             algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
             None,
+            no_cancel(),
         )
         .with_http_block_fetcher("test-genesis");
         let raw = with_fallback
@@ -3318,9 +3534,50 @@ mod tests {
             algo_rest_client::CatchpointDownloadConfig::default(),
             algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
             None,
+            no_cancel(),
         )
         .with_block_fetch_timeout(std::time::Duration::from_millis(300))
         .with_http_block_fetcher("test-genesis")
+    }
+
+    /// Issue #2121: the backend's own token (the orchestrator's, fired by a
+    /// node shutdown) ends a range fetch whose caller passed a different,
+    /// never-fired token, instead of the fetch waiting out the stalled
+    /// peer's timeouts (10 s per request here, per round).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_backend_token_ends_a_batch_fetch_whose_caller_token_never_fires() {
+        use algo_ledger::sync::SyncBackendExt;
+        let stalled = wiremock::MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(60)))
+            .mount(&stalled)
+            .await;
+        let backend_token = CancellationToken::new();
+        let backend = AlgodSyncBackend::with_catchpoint_peers_and_p2p(
+            &stalled.uri(),
+            "",
+            &[],
+            None,
+            algo_rest_client::CatchpointDownloadConfig::default(),
+            algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
+            None,
+            backend_token.clone(),
+        );
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            backend_token.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        // The caller's own token never fires.
+        let result = backend.fetch_blocks_batch(1, 4, 2, &CancellationToken::new());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the batch fetch outlived the backend's cancellation: {:?}",
+            started.elapsed()
+        );
+        let err = result.expect_err("a cancelled batch fetch must not succeed");
+        assert!(err.to_string().contains("cancelled"), "{err}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3454,6 +3711,7 @@ mod tests {
             2,
             test_catchpoint_source(),
             None,
+            no_cancel(),
         )
         .with_extra_http_fetchers(extra.iter().map(|u| fetcher(u)).collect())
     }

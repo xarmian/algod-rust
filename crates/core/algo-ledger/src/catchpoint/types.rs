@@ -209,6 +209,11 @@ pub enum CatchpointError {
     /// condition (`../go-algorand/ledger/catchpointtracker.go:1501,1528`).
     #[error("no catchpoint file for round {0}")]
     NotFound(u64),
+
+    /// The operation was cancelled (node shutdown or an aborted catchup,
+    /// issue #2121). Never retried: a retry loop that sees it stops at once.
+    #[error("catchpoint operation cancelled")]
+    Cancelled,
 }
 
 // ---------------------------------------------------------------------------

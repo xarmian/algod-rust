@@ -1806,6 +1806,9 @@ where
 
         let (proto, hdrdata, blkdata) = match fetch_block(rnd) {
             Ok(v) => v,
+            // A cancellation (node shutdown, issue #2121) ends the download
+            // at once; it is not a failure to spend the retry budget on.
+            Err(CatchpointError::Cancelled) => return Err(CatchpointError::Cancelled),
             Err(e) => {
                 if retry_count < max_retries {
                     retry_count += 1;
@@ -3457,6 +3460,33 @@ mod tests {
         assert!(result.is_err());
         // Rounds 10,9,8 succeed (3 attempts), round 7 fails once and, with
         // zero retries configured, aborts on that single attempt.
+        assert_eq!(fetch_attempts.load(Ordering::SeqCst), 4);
+    }
+
+    /// Issue #2121: a cancelled fetch (node shutdown) ends the download at
+    /// once with `Cancelled`; it does not burn the retry budget first.
+    #[test]
+    fn download_lookback_blocks_stops_at_once_on_cancellation() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let fetch_attempts = AtomicU64::new(0);
+
+        let result = download_lookback_blocks_with_lookback(
+            10,
+            10,
+            1_000, // max_retries
+            |rnd| {
+                fetch_attempts.fetch_add(1, Ordering::SeqCst);
+                if rnd == 7 {
+                    Err(CatchpointError::Cancelled)
+                } else {
+                    Ok(("v41".to_string(), vec![], vec![]))
+                }
+            },
+            |_rnd, _proto, _hdr, _blk| Ok(()),
+        );
+
+        assert!(matches!(result, Err(CatchpointError::Cancelled)));
+        // Rounds 10,9,8 succeed, round 7 is cancelled once: no retry.
         assert_eq!(fetch_attempts.load(Ordering::SeqCst), 4);
     }
 

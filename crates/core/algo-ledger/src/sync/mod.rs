@@ -84,6 +84,15 @@ fn notify_progress_fields(progress: &mut SyncProgress, on_progress: &Option<Prog
 /// This keeps the `algo-ledger` crate independent of `algo-rest-client`.
 /// The CLI layer implements this trait using `AlgodClient`, `CatchpointDownloader`,
 /// and `ParallelBlockFetcher`.
+///
+/// # Cancellation (issue #2121)
+///
+/// The blocking methods carry no token of their own. A backend whose calls
+/// drive async requests on a runtime takes the orchestrator's token (the one
+/// passed to [`SyncOrchestrator::set_cancel`]) at construction and ends every
+/// call with [`cancelled_error`] as soon as it fires, so a node shutdown is
+/// neither held up by an in-flight request nor races the runtime's teardown.
+/// The orchestrator checks the token around each call as well.
 pub trait SyncBackend: Send + Sync {
     /// Returns `true` if this is a no-op (stub) backend.
     ///
@@ -178,22 +187,46 @@ pub trait SyncBackend: Send + Sync {
     }
 }
 
+/// The error a sync operation returns when its cancellation token fired
+/// (node shutdown or an aborted catchup).
+pub fn cancelled_error() -> AlgoError {
+    AlgoError::Ledger {
+        message: CANCELLED_MESSAGE.to_string(),
+    }
+}
+
+/// The text of [`cancelled_error`].
+const CANCELLED_MESSAGE: &str = "sync cancelled by user";
+
+/// Whether `e` is [`cancelled_error`], i.e. the operation really ended
+/// because its token fired. Cancellation handling (an abort's discard, a
+/// shutdown's checkpoint) applies only to this error: any other error is real
+/// and must reach the caller unchanged, even when a token fired too (issue
+/// #2121).
+pub fn is_cancelled_error(e: &AlgoError) -> bool {
+    matches!(e, AlgoError::Ledger { message } if message == CANCELLED_MESSAGE)
+}
+
 /// Derived views over [`SyncBackend`]. A separate trait with a blanket impl,
 /// so an implementor cannot define (and silently bypass) them: a manual impl
 /// conflicts with the blanket one (issue #1755).
 pub trait SyncBackendExt: SyncBackend {
-    /// All-or-error view of [`SyncBackend::fetch_block_range`] with a fresh,
-    /// never-cancelled token: the whole range, an `Err`, or -- only when the
+    /// All-or-error view of [`SyncBackend::fetch_block_range`]: the whole
+    /// range, an `Err`, or -- only when the
     /// peer does not have the next round -- the served prefix. A prefix
     /// served before a non-404 failure is discarded here; use
     /// [`SyncBackend::fetch_block_range`] to keep it.
+    ///
+    /// `cancel` is the caller's token (issue #2121: a caller that has one
+    /// must pass it, not a fresh never-cancelled one).
     fn fetch_blocks_batch(
         &self,
         start: u64,
         end: u64,
         concurrency: usize,
+        cancel: &CancellationToken,
     ) -> Result<Vec<(u64, Block)>, AlgoError> {
-        let fetch = self.fetch_block_range(start, end, concurrency, &CancellationToken::new());
+        let fetch = self.fetch_block_range(start, end, concurrency, cancel);
         match fetch.error {
             None => Ok(fetch.blocks),
             Some(e) => Err(e),
@@ -609,6 +642,28 @@ pub struct SyncOrchestrator {
     backend: Box<dyn SyncBackend>,
     /// Path where the downloaded catchpoint file is stored.
     catchpoint_file_path: Option<PathBuf>,
+    /// Where the download phase writes the catchpoint file, set BEFORE the
+    /// download starts (issue #2121): an abort mid-download removes the
+    /// partial file (and its `.tmp`), which `catchpoint_file_path`, set only
+    /// on success, cannot name.
+    catchpoint_download_path: Option<PathBuf>,
+    /// The import's atomic cutover replaced the live tables (in this run, or
+    /// in the earlier run this one resumed past the import). From then on an
+    /// abort can only undo it through `cutover_backup` (issue #2121).
+    ledger_cut_over: bool,
+    /// `cutover_backup` holds the PRE-catchup ledger: the import cut over a
+    /// ledger that had not been cut over before. False in a run resumed with
+    /// the ledger already cut over (issue #2121): its re-import's backup
+    /// snapshots the earlier process's unverified cutover, so restoring it
+    /// does not make the ledger pre-catchup again.
+    cutover_backup_pre_catchup: bool,
+    /// The lookback retry backoff, `lookback_retry_backoff_ms` by default
+    /// (250 ms doubling, capped at 5 s). It is the test seam for the retry
+    /// loop: a test that drives `run_download_lookback` against a failing
+    /// backend MUST set it (to `|_| 0` for speed, or a long delay to test
+    /// cancellation during the backoff), or it waits out real backoffs
+    /// (issue #2121).
+    lookback_retry_backoff: fn(u32) -> u64,
     /// Parsed catchpoint label round (== `blocks_round`, the round of the
     /// block whose header digest anchors the label — used for block/lookback
     /// downloads, which need the actual block round, not the account
@@ -668,6 +723,10 @@ pub struct SyncOrchestrator {
     replay_stopped_early: Option<ReplayStoppedEarly>,
     /// Cancellation token — checked between phases and during long operations.
     cancel: CancellationToken,
+    /// Fired together with `cancel` when the user ABORTS the catchup (`DELETE
+    /// /v2/catchup`) rather than the node shutting down (issue #2121): see
+    /// [`Self::set_abort`].
+    abort: CancellationToken,
     /// Optional progress callback — invoked on state transitions and periodic updates.
     on_progress: Option<ProgressCallback>,
     /// Accumulated EvalDelta comparison stats (when compare_mode or avm_execute is enabled).
@@ -692,6 +751,10 @@ impl SyncOrchestrator {
             progress: SyncProgress::default(),
             backend: Box::new(backend),
             catchpoint_file_path: None,
+            catchpoint_download_path: None,
+            ledger_cut_over: false,
+            cutover_backup_pre_catchup: false,
+            lookback_retry_backoff: lookback_retry_backoff_ms,
             catchpoint_round: None,
             cached_catchpoint_block: None,
             balances_round: None,
@@ -704,6 +767,7 @@ impl SyncOrchestrator {
             final_round: 0,
             replay_stopped_early: None,
             cancel: CancellationToken::new(),
+            abort: CancellationToken::new(),
             on_progress: None,
             eval_delta_stats: EvalDeltaStats::default(),
         }
@@ -717,10 +781,34 @@ impl SyncOrchestrator {
         self.cancel = cancel;
     }
 
+    /// Set the token that marks a cancellation as an ABORT (issue #2121),
+    /// mirroring go's `CatchpointCatchupService`: `Abort()` fires its abort
+    /// context and then the main one, `Stop()` only the main one, and a stage
+    /// that sees the main context cancelled calls `stopOrAbort`, which
+    /// `abort`s (`ResetStagingBalances`: the catchup state is discarded) only
+    /// when the abort context fired, and otherwise leaves the state on disk
+    /// for the next start to resume.
+    ///
+    /// Fire it BEFORE the [`Self::set_cancel`] token. A cancelled run with
+    /// `abort` fired discards its resume marker, the staging tables and the
+    /// downloaded catchpoint file, so a later catchup (for this label or any
+    /// other) starts fresh; without it, a cancellation (node shutdown)
+    /// persists the marker and the next run resumes from it.
+    pub fn set_abort(&mut self, abort: CancellationToken) {
+        self.abort = abort;
+    }
+
     /// Set a progress callback that is invoked on state transitions and
     /// periodic within-phase progress updates.
     pub fn set_progress_callback(&mut self, cb: ProgressCallback) {
         self.on_progress = Some(cb);
+    }
+
+    /// Whether the catchpoint was cut over into the live ledger and not rolled
+    /// back (this run's import, or an earlier process's). Read after `run`
+    /// returns, Ok or Err (issue #2121).
+    pub fn ledger_cut_over(&self) -> bool {
+        self.ledger_cut_over
     }
 
     /// Returns a reference to the current sync state.
@@ -751,33 +839,143 @@ impl SyncOrchestrator {
     /// return an error.
     fn check_cancelled(&self) -> Result<(), AlgoError> {
         if self.cancel.is_cancelled() {
-            Err(AlgoError::Ledger {
-                message: "sync cancelled by user".to_string(),
-            })
+            Err(cancelled_error())
         } else {
             Ok(())
         }
     }
 
     /// Persist checkpoint and return a cancellation error.
+    ///
+    /// Persisted for an abort too: `run` then discards it, unless the
+    /// catchpoint is already applied (see [`Self::stop_aborted_catchup`]).
     fn handle_cancellation(&self) -> AlgoError {
         tracing::info!(state = %self.state, "persisting checkpoint before shutdown");
         if let Ok(conn) = self.open_db() {
-            if let Err(e) = persist_sync_state(
-                &conn,
-                &self.state,
-                self.resolved_label.as_deref(),
-                self.catchpoint_round,
-                self.catchpoint_file_path
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .as_deref(),
-            ) {
-                tracing::warn!("Failed to persist sync state: {e}");
+            self.persist_marker(&conn, &self.state.clone());
+        }
+        cancelled_error()
+    }
+
+    /// The marker state to persist for `state` (issue #2121): never below the
+    /// ledger's actual state. A ledger that is cut over (`ledger_cut_over`)
+    /// keeps a marker at least `ImportingLedger`, whatever earlier phase this
+    /// run happens to be re-running (a re-download after a rejected snapshot,
+    /// say), so a later run still knows the ledger holds an unverified
+    /// snapshot and an abort cannot discard it.
+    fn marker_state_for(&self, state: &SyncState) -> SyncState {
+        if self.ledger_cut_over && phase_ordinal(state) < phase_ordinal(&SyncState::ImportingLedger)
+        {
+            SyncState::ImportingLedger
+        } else {
+            state.clone()
+        }
+    }
+
+    /// Persist the resume marker `state` with this run's label, round and
+    /// catchpoint file (issue #2121: the one place that writes it). Best
+    /// effort: a failure is logged.
+    fn persist_marker(&self, conn: &Connection, state: &SyncState) {
+        // Every marker write goes through here, so the invariant (the marker
+        // never regresses below the ledger's actual state) holds for all of
+        // them. A rollback that really restored the pre-catchup ledger has
+        // already cleared `ledger_cut_over`.
+        let state = &self.marker_state_for(state);
+        if let Err(e) = persist_sync_state(
+            conn,
+            state,
+            self.resolved_label.as_deref(),
+            self.catchpoint_round,
+            self.catchpoint_file_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .as_deref(),
+        ) {
+            tracing::warn!(state = %state, error = %e, "failed to persist the sync state");
+        }
+    }
+
+    /// Wind up a run the user aborted (issue #2121), mirroring go's
+    /// `CatchpointCatchupService`: an abort is effective only until its
+    /// `Switch` stage applies the catchpoint to the live ledger (`abort` ->
+    /// `ResetStagingBalances` discards the staging data; nothing can undo a
+    /// completed switch). Here the import's atomic cutover applies it early,
+    /// so:
+    /// - before the cutover: discard the resume marker, the staging tables
+    ///   and the downloaded (or partially downloaded) catchpoint file, so a
+    ///   later catchup, for this label or another, starts fresh;
+    /// - after the cutover, while its backup still exists (verification not
+    ///   finished): roll the cutover back, restoring the pre-catchup ledger,
+    ///   then discard as above;
+    /// - once the cutover is final (verified, or applied by an earlier
+    ///   process): the ledger already holds the catchpoint, so discarding
+    ///   would strand it unverified and without its lookback blocks. Keep
+    ///   the marker instead, exactly like a node shutdown, so the next
+    ///   catchup resumes and finishes it.
+    ///
+    /// Returns the error `run` reports.
+    fn stop_aborted_catchup(&mut self) -> AlgoError {
+        // Undoable only through a backup of the PRE-catchup ledger.
+        let undoable = self.cutover_backup.is_some() && self.cutover_backup_pre_catchup;
+        if self.ledger_cut_over && !undoable {
+            tracing::warn!(
+                state = %self.state,
+                "catchpoint catchup aborted after the catchpoint was applied to the ledger: \
+                 keeping its state so the next catchup resumes it (go only aborts before its \
+                 switch stage)"
+            );
+            return cancelled_error();
+        }
+        let conn = match self.open_db() {
+            Ok(conn) => conn,
+            Err(e) => {
+                // Nothing on disk can be checked or discarded: keep it all.
+                tracing::warn!(
+                    error = %e,
+                    "aborted catchup: could not open the database; keeping its state"
+                );
+                return cancelled_error();
+            }
+        };
+        if self.cutover_backup.is_some()
+            && !self.rollback_cutover_on_failure(&conn, "catchpoint catchup aborted")
+        {
+            // The ledger still holds the catchpoint and cannot be restored:
+            // as after a final cutover, keep the state for a resume.
+            tracing::warn!(
+                state = %self.state,
+                "catchpoint catchup aborted, but its cutover could not be rolled back: \
+                 keeping its state so the next catchup resumes it"
+            );
+            return cancelled_error();
+        }
+        tracing::info!(
+            state = %self.state,
+            "catchpoint catchup aborted: discarding its resume marker and staging data"
+        );
+        if let Err(e) = clear_sync_state(&conn) {
+            tracing::warn!(error = %e, "aborted catchup: could not clear the resume marker");
+        }
+        if let Err(e) = crate::catchpoint::importer::drop_staging_tables(&conn) {
+            tracing::warn!(error = %e, "aborted catchup: could not drop the staging tables");
+        }
+        drop(conn);
+        let files = [
+            self.catchpoint_file_path.take(),
+            self.catchpoint_download_path.take(),
+        ];
+        for path in files.into_iter().flatten() {
+            // the file and the downloader's partial `.tmp` next to it
+            for p in [path.with_extension("tmp"), path] {
+                if let Err(e) = std::fs::remove_file(&p) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(error = %e, path = %p.display(), "aborted catchup: could not remove a catchpoint file");
+                    }
+                }
             }
         }
         AlgoError::Ledger {
-            message: "sync cancelled by user".to_string(),
+            message: "catchpoint catchup aborted by user".to_string(),
         }
     }
 
@@ -993,8 +1191,16 @@ impl SyncOrchestrator {
         }
         let genesis_id = &self.config.genesis_id;
 
-        self.backend
-            .download_catchpoint(genesis_id, round, &file_path)?;
+        self.catchpoint_download_path = Some(file_path.clone());
+        let downloaded = self
+            .backend
+            .download_catchpoint(genesis_id, round, &file_path);
+        // A download that ended because its token fired is a cancellation
+        // (issue #2121); any other error is real and passes through.
+        if matches!(&downloaded, Err(e) if is_cancelled_error(e)) {
+            return Err(self.handle_cancellation());
+        }
+        downloaded?;
 
         // Issue #2084: fail fast on a file whose own header label differs
         // from the requested one (see `check_label_matches_requested`,
@@ -1017,17 +1223,12 @@ impl SyncOrchestrator {
             "catchpoint file downloaded"
         );
 
-        // Persist state so we can resume after crash.
+        // Persist state so we can resume after crash. A re-download on a
+        // ledger that is already cut over (issue #2121: a rejected snapshot
+        // whose cutover could not be rolled back) keeps a cut-over marker,
+        // naming the new file for the re-import.
         if let Ok(conn) = self.open_db() {
-            if let Err(e) = persist_sync_state(
-                &conn,
-                &SyncState::DownloadingLedger,
-                Some(&label),
-                Some(round),
-                Some(&file_path.to_string_lossy()),
-            ) {
-                tracing::warn!("Failed to persist sync state: {e}");
-            }
+            self.persist_marker(&conn, &SyncState::DownloadingLedger);
         }
 
         Ok(())
@@ -1157,6 +1358,8 @@ impl SyncOrchestrator {
         // (verify succeeded) or roll it back (verify failed) — see
         // `Self::cutover_backup`'s docs and issue #1633.
         self.cutover_backup = Some(import_result.cutover_backup);
+        self.cutover_backup_pre_catchup = !self.ledger_cut_over;
+        self.ledger_cut_over = true;
 
         tracing::info!(
             round,
@@ -1209,18 +1412,7 @@ impl SyncOrchestrator {
         // the full rationale.
 
         // Persist state.
-        if let Err(e) = persist_sync_state(
-            &conn,
-            &SyncState::ImportingLedger,
-            self.resolved_label.as_deref(),
-            self.catchpoint_round,
-            self.catchpoint_file_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .as_deref(),
-        ) {
-            tracing::warn!("Failed to persist sync state: {e}");
-        }
+        self.persist_marker(&conn, &SyncState::ImportingLedger);
 
         self.progress.phase_progress = 1.0;
         self.notify_progress();
@@ -1249,15 +1441,17 @@ impl SyncOrchestrator {
     /// instance, so the backup is present.
     ///
     /// Addresses issue #1633's split-brain symptom.
-    fn rollback_cutover_on_failure(&mut self, conn: &Connection, reason: &str) {
+    ///
+    /// Returns whether the cutover was rolled back.
+    fn rollback_cutover_on_failure(&mut self, conn: &Connection, reason: &str) -> bool {
         let Some(backup) = self.cutover_backup.take() else {
             tracing::warn!(
                 reason,
-                "catchpoint verification failed but no in-memory cutover backup is available \
-                 to roll back (likely resumed from a prior process's VerifyingLedger checkpoint) \
-                 — the ledger may still be observably at the new, unverified round"
+                "no in-memory cutover backup is available to roll back ({reason}; likely \
+                 resumed from a prior process's checkpoint) — the ledger may still be \
+                 observably at the new, unverified round"
             );
-            return;
+            return false;
         };
 
         let importer = crate::catchpoint::CatchpointImporter::new(
@@ -1269,11 +1463,15 @@ impl SyncOrchestrator {
             tracing::error!(
                 error = %e,
                 reason,
-                "failed to roll back catchpoint cutover after verification failure — \
+                "failed to roll back the catchpoint cutover ({reason}) — \
                  ledger may be left in an inconsistent state"
             );
-            return;
+            return false;
         }
+        // Restoring a backup of an earlier unverified cutover leaves the
+        // ledger cut over (issue #2121).
+        let pre_catchup = self.cutover_backup_pre_catchup;
+        self.ledger_cut_over = !pre_catchup;
 
         // The synthesized header row `initialize_meta_from_catchpoint` wrote
         // is specific to this import attempt (its own `ON CONFLICT DO
@@ -1316,9 +1514,93 @@ impl SyncOrchestrator {
 
         tracing::warn!(
             reason,
-            "catchpoint cutover rolled back after verification failure — \
-             ledger reverted to its pre-catchup round"
+            restored = if pre_catchup {
+                "the pre-catchup ledger"
+            } else {
+                "an earlier unverified cutover"
+            },
+            "catchpoint cutover rolled back ({reason})"
         );
+
+        // Issue #2121: make the resume marker match the restored ledger
+        // (`ImportingLedger` and later imply a cutover, see `run_phases`).
+        // Pre-catchup again: back to "downloaded", so a resume (a
+        // verify-failure retry, or the next start) re-downloads and
+        // re-imports, and an abort before that re-import discards cleanly.
+        // Restored to an earlier unverified cutover: still cut over.
+        let marker_state = if pre_catchup {
+            SyncState::DownloadingLedger
+        } else {
+            SyncState::ImportingLedger
+        };
+        self.persist_marker(conn, &marker_state);
+        true
+    }
+
+    /// [`Self::rollback_cutover_on_failure`] for a failed verification
+    /// (issue #2121). With no backup there is nothing to roll back and the
+    /// marker is left alone. When a backup exists but cannot be restored, the
+    /// ledger is left cut over to the unverified catchpoint with no backup:
+    /// say so, and make the resume marker say so too (`ImportingLedger`,
+    /// written after a cutover), so the next catchup re-imports and verifies
+    /// it rather than treating the ledger as untouched.
+    ///
+    /// `rejected_file`: the verification rejected the catchpoint file's
+    /// content itself (a label or hash mismatch), so a resume must never
+    /// re-import it.
+    fn rollback_after_verify_failure(
+        &mut self,
+        conn: &Connection,
+        reason: &str,
+        rejected_file: bool,
+    ) {
+        if rejected_file {
+            // The verification rejected the file's own content: it must never
+            // be imported again, so delete it and stop naming it, before ANY
+            // marker is written below. (A failure that did not reject the
+            // file, a transient IO or SQLite error, keeps naming it, so a
+            // resume re-imports it instead of re-downloading gigabytes.)
+            if let Some(path) = self.catchpoint_file_path.take() {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(error = %e, path = %path.display(), "could not remove the rejected catchpoint file");
+                    }
+                }
+            }
+        }
+        if self.cutover_backup.is_none() {
+            // Nothing to roll back (a run resumed past the import). The ledger
+            // is still cut over, so the marker must keep saying so; if the
+            // file itself was rejected it was dropped above.
+            // Otherwise the marker already describes the ledger (e.g.
+            // `VerifyingLedger`, so a resume re-verifies rather than
+            // re-imports): leave it as it is.
+            tracing::warn!(
+                reason,
+                rejected_file,
+                "catchpoint verification failed with no cutover backup to roll back"
+            );
+            if !rejected_file {
+                return;
+            }
+        } else if self.rollback_cutover_on_failure(conn, reason) {
+            return;
+        } else {
+            tracing::error!(
+                reason,
+                rejected_file,
+                "catchpoint verification failed and the cutover could not be rolled back: \
+                 the ledger is left cut over to the unverified catchpoint without a backup; \
+                 keeping a resume marker that says so"
+            );
+        }
+        // The ledger holds the (possibly untrusted) snapshot and could not be
+        // restored: record the cutover. For a rejected file the marker names no
+        // file (dropped above), so a resume at `ImportingLedger` re-downloads
+        // first (see `run_phases`), and the ledger stays recorded as cut over,
+        // so an abort meanwhile keeps the marker rather than discarding a
+        // state it cannot undo.
+        self.persist_marker(conn, &SyncState::ImportingLedger);
     }
 
     /// Phase 3: Verify the imported ledger (Merkle trie, account totals).
@@ -1345,7 +1627,11 @@ impl SyncOrchestrator {
         let verify_result = match verify_catchpoint(&conn, &block_header_digest) {
             Ok(r) => r,
             Err(e) => {
-                self.rollback_cutover_on_failure(&conn, "verify_catchpoint returned an error");
+                self.rollback_after_verify_failure(
+                    &conn,
+                    "verify_catchpoint returned an error",
+                    false,
+                );
                 return Err(AlgoError::Ledger {
                     message: format!("catchpoint verification failed: {e}"),
                 });
@@ -1358,7 +1644,7 @@ impl SyncOrchestrator {
                 "issue #1636 diagnostic: see build_and_persist_trie_chunked's second-rerun \
                  result above for whether this mismatch is deterministic or not"
             );
-            self.rollback_cutover_on_failure(&conn, "catchpoint label mismatch");
+            self.rollback_after_verify_failure(&conn, "catchpoint label mismatch", true);
             return Err(AlgoError::Ledger {
                 message: format!(
                     "catchpoint label mismatch: expected '{}', computed '{}'",
@@ -1373,15 +1659,11 @@ impl SyncOrchestrator {
         if let Err(e) =
             self.check_label_matches_requested(&verify_result.computed_label, "calculated")
         {
-            let had_backup = self.cutover_backup.is_some();
-            self.rollback_cutover_on_failure(&conn, "catchpoint hash mismatch");
-            if !had_backup {
-                // Resumed from a prior process: nothing to roll back, so the
-                // imported data is still live. Drop the resume marker so a
-                // rerun re-downloads instead of re-verifying (and being
-                // resumed past) the rejected snapshot.
-                let _ = clear_sync_state(&conn);
-            }
+            // Without a backup (resumed from a prior process) the imported data
+            // is still live: the marker keeps recording the cutover but stops
+            // naming the rejected file, so a rerun re-downloads instead of
+            // re-verifying (and being resumed past) the rejected snapshot.
+            self.rollback_after_verify_failure(&conn, "catchpoint hash mismatch", true);
             return Err(e);
         }
 
@@ -1391,7 +1673,7 @@ impl SyncOrchestrator {
         // backup is dropped below so a failure rolls the whole cutover back
         // (the step itself is one transaction and re-runnable on resume).
         if let Err(e) = crate::catchpoint::importer::finish_pre_v8_catchpoint_migration(&conn) {
-            self.rollback_cutover_on_failure(&conn, "post-verification migration failed");
+            self.rollback_after_verify_failure(&conn, "post-verification migration failed", false);
             return Err(AlgoError::Ledger {
                 message: format!("post-verification catchpoint migration failed: {e}"),
             });
@@ -1678,6 +1960,11 @@ impl SyncOrchestrator {
                         })
                 })
                 .unwrap_or(0);
+        // The probe swallows its error; a shutdown that ended it is still a
+        // cancellation, before any database work (issue #2121).
+        if self.cancel.is_cancelled() {
+            return Err(self.handle_cancellation());
+        }
         let lookback = std::cmp::max(crate::catchpoint::MAX_TXN_LIFE, sp_lookback);
         if sp_lookback > crate::catchpoint::MAX_TXN_LIFE {
             tracing::info!(
@@ -1737,13 +2024,26 @@ impl SyncOrchestrator {
         let prefetch =
             lookback_prefetch::LookbackPrefetch::new(prefetch_first, lookback_start_round);
         let backend = &self.backend;
+        let retry_backoff_ms = self.lookback_retry_backoff;
+        // Issue #2121: every fetch, the prefetch workers' included, and every
+        // retry backoff observes the orchestrator's token, so a node shutdown
+        // ends this phase promptly instead of retrying on (and registering
+        // timers with) a runtime that is being dropped.
+        let cancel = &self.cancel;
         // Use download_lookback_blocks_with_lookback with callbacks that
         // bridge to the backend, passing the (possibly state-proof-extended)
         // `lookback` computed above.
-        let prefetch_fetch = |rnd: u64| backend.fetch_block_raw(rnd);
+        // One fetch for the prefetch workers and the consumer: never starts
+        // a request once the token has fired.
+        let fetch_unless_cancelled = |rnd: u64| {
+            if cancel.is_cancelled() {
+                return Err(cancelled_error());
+            }
+            backend.fetch_block_raw(rnd)
+        };
         let download_result = std::thread::scope(|scope| {
             for _ in 0..lookback_prefetch::PREFETCH_WORKERS {
-                scope.spawn(|| prefetch.run_worker(&prefetch_fetch));
+                scope.spawn(|| prefetch.run_worker(&fetch_unless_cancelled));
             }
             let result = crate::catchpoint::download_lookback_blocks_with_lookback(
                 round,
@@ -1768,17 +2068,23 @@ impl SyncOrchestrator {
                         consecutive_fetch_failures = 0;
                         return Ok(prefetched);
                     }
-                    match backend.fetch_block_raw(rnd) {
+                    match fetch_unless_cancelled(rnd) {
                         Ok(block) => {
                             consecutive_fetch_failures = 0;
                             Ok(block)
                         }
+                        Err(e) if is_cancelled_error(&e) => Err(CatchpointError::Cancelled),
                         Err(e) => {
-                            let delay_ms = lookback_retry_backoff_ms(consecutive_fetch_failures);
+                            let delay_ms = retry_backoff_ms(consecutive_fetch_failures);
                             consecutive_fetch_failures =
                                 consecutive_fetch_failures.saturating_add(1);
-                            if delay_ms > 0 {
-                                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                            if delay_ms > 0
+                                && sleep_unless_cancelled(
+                                    std::time::Duration::from_millis(delay_ms),
+                                    cancel,
+                                )
+                            {
+                                return Err(CatchpointError::Cancelled);
                             }
                             Err(CatchpointError::VerificationError(format!(
                                 "fetch lookback block {rnd}: {e}"
@@ -1831,6 +2137,12 @@ impl SyncOrchestrator {
             prefetch.shutdown();
             result
         });
+        // A download that ended because its token fired is a cancellation,
+        // not a download failure; a real failure passes through even if the
+        // token fired too (issue #2121).
+        if matches!(download_result, Err(CatchpointError::Cancelled)) {
+            return Err(self.handle_cancellation());
+        }
         let blocks_downloaded = download_result.map_err(|e| AlgoError::Ledger {
             message: format!("lookback block download failed: {e}"),
         })?;
@@ -2614,6 +2926,14 @@ impl SyncOrchestrator {
             tokio::task::block_in_place(|| self.run_phases(resume_state))
         };
 
+        // Issue #2121: a user abort ends the catchup for good (go `abort`);
+        // a shutdown leaves its marker for the next start to resume.
+        // Only when the run really ended as a cancellation: a genuine error
+        // that raced the abort stays that error (and keeps its state).
+        if self.abort.is_cancelled() && matches!(&result, Err(e) if is_cancelled_error(e)) {
+            result = Err(self.stop_aborted_catchup());
+        }
+
         match &result {
             Ok(_) => {
                 // Issue #1719: replay stopped early because the peer cannot
@@ -2948,6 +3268,22 @@ impl SyncOrchestrator {
         // so we skip phases whose transitions have already been completed.
         let resume_ord = phase_ordinal(&resume_state);
 
+        // Resumed at or past the import: an earlier process already cut over.
+        // The only `ImportingLedger` marker is the one `run_import_ledger`
+        // persists AFTER its cutover succeeded (the import phase has no
+        // cancellation point that persists one before it), so resuming at
+        // the import (ordinal 2, which re-runs it) is cut over too.
+        self.ledger_cut_over = resume_ord >= 2;
+        // A `DownloadingLedger` marker that names a file that is still there
+        // means the download COMPLETED (the file only appears at its final
+        // path atomically, after the download): resume at the import instead
+        // of downloading it again. A verify failure that did not reject the
+        // file leaves exactly this marker (issue #2121).
+        let reuse_file = resume_ord == 1
+            && self
+                .catchpoint_file_path
+                .as_ref()
+                .is_some_and(|path| path.exists());
         if resume_ord > 0 {
             tracing::info!(
                 resume_state = %resume_state,
@@ -2956,7 +3292,13 @@ impl SyncOrchestrator {
             // Set internal state to the predecessor of the resume state so that
             // the resumed phase's `transition()` call validates correctly.
             self.state = match &resume_state {
+                SyncState::DownloadingLedger if reuse_file => SyncState::DownloadingLedger,
                 SyncState::DownloadingLedger => SyncState::Idle,
+                // A cut-over ledger whose file was rejected (issue #2121):
+                // re-download before the re-import.
+                SyncState::ImportingLedger if self.catchpoint_file_path.is_none() => {
+                    SyncState::Idle
+                }
                 SyncState::ImportingLedger => SyncState::DownloadingLedger,
                 SyncState::VerifyingLedger => SyncState::ImportingLedger,
                 SyncState::DownloadingLookback => SyncState::VerifyingLedger,
@@ -2966,8 +3308,10 @@ impl SyncOrchestrator {
             self.progress.state = self.state.clone();
         }
 
-        // Phase 1: DownloadingLedger (ordinal 1)
-        if resume_ord <= 1 {
+        // Phase 1: DownloadingLedger (ordinal 1). Also when resuming the import
+        // of a cut-over ledger whose file was rejected (no file to re-import).
+        let redownload = resume_ord == 2 && self.catchpoint_file_path.is_none();
+        if (resume_ord <= 1 && !reuse_file) || redownload {
             self.run_download_ledger()?;
         }
 
@@ -3026,13 +3370,41 @@ impl SyncOrchestrator {
 }
 
 /// Delay before retrying a failed lookback block fetch: 250 ms doubling per
-/// consecutive failure, capped at 5 s (zero under `cfg(test)` so the retry
-/// accounting tests stay instantaneous).
+/// consecutive failure, capped at 5 s. Tests that need speed set
+/// `SyncOrchestrator::lookback_retry_backoff` instead.
 fn lookback_retry_backoff_ms(consecutive_failures: u32) -> u64 {
-    if cfg!(test) {
-        return 0;
-    }
     (250u64 << consecutive_failures.min(5)).min(5_000)
+}
+
+/// Sleep for `delay` on the calling (blocking) thread, waking as soon as
+/// `cancel` fires. Returns `true` if it was cancelled (issue #2121).
+///
+/// Waits on the token itself (its `cancelled()` future, polled with a waker
+/// that unparks this thread) rather than polling it, and needs no runtime:
+/// the lookback loop runs on a plain blocking thread.
+fn sleep_unless_cancelled(delay: std::time::Duration, cancel: &CancellationToken) -> bool {
+    struct Unpark(std::thread::Thread);
+    impl std::task::Wake for Unpark {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let deadline = Instant::now() + delay;
+    let waker = std::task::Waker::from(std::sync::Arc::new(Unpark(std::thread::current())));
+    let mut cx = std::task::Context::from_waker(&waker);
+    let cancelled = cancel.cancelled();
+    let mut cancelled = std::pin::pin!(cancelled);
+    loop {
+        if std::future::Future::poll(cancelled.as_mut(), &mut cx).is_ready() {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        // Spurious wake-ups just loop.
+        std::thread::park_timeout(deadline - now);
+    }
 }
 
 /// Map a `SyncState` to a numeric ordinal for resume ordering.
@@ -3812,6 +4184,7 @@ mod tests {
             fetch_attempts: fetch_attempts.clone(),
         };
         let mut orchestrator = SyncOrchestrator::with_backend(config, backend);
+        orchestrator.lookback_retry_backoff = |_| 0;
         orchestrator.state = SyncState::VerifyingLedger;
         orchestrator.catchpoint_round = Some(5u64);
 
@@ -3836,6 +4209,1386 @@ mod tests {
             MAX_RETRIES + 2,
             "expected exactly 1 speculative probe + (max_retries + 1) fetch attempts before \
              aborting"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A [`SyncBackend`] fake shaped like the production `AlgodSyncBackend`:
+    /// each `fetch_block_raw` is a request driven on a tokio runtime
+    /// (`Handle::block_on`, from the sync thread and the prefetch workers),
+    /// which waits on the runtime's timer and then fails, so the lookback
+    /// retry loop keeps retrying (issue #2121).
+    struct RuntimeTimerFailingBackend {
+        rt: tokio::runtime::Handle,
+        delay: std::time::Duration,
+    }
+
+    impl SyncBackend for RuntimeTimerFailingBackend {
+        fn download_catchpoint(
+            &self,
+            _genesis_id: &str,
+            _round: u64,
+            _dest_path: &std::path::Path,
+        ) -> Result<(), AlgoError> {
+            unimplemented!("not exercised by the lookback-only test")
+        }
+
+        fn fetch_block_raw(&self, round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+            self.rt.block_on(async {
+                tokio::time::sleep(self.delay).await;
+                Err(AlgoError::Network {
+                    message: format!("simulated unreachable peer for round {round}"),
+                })
+            })
+        }
+
+        fn fetch_block(&self, _round: u64) -> Result<Block, AlgoError> {
+            unimplemented!("not exercised by the lookback-only test")
+        }
+
+        fn get_current_round(&self) -> Result<u64, AlgoError> {
+            unimplemented!("not exercised by the lookback-only test")
+        }
+
+        fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
+            Ok(None)
+        }
+    }
+
+    /// A lookback source that is shut down while it serves the state-proof
+    /// probe: the fetch cancels the token (the node's SIGTERM) and fails.
+    struct CancelledDuringProbeBackend {
+        cancel: CancellationToken,
+        fetches: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl SyncBackend for CancelledDuringProbeBackend {
+        fn download_catchpoint(
+            &self,
+            _genesis_id: &str,
+            _round: u64,
+            _dest_path: &std::path::Path,
+        ) -> Result<(), AlgoError> {
+            unimplemented!("not exercised by the lookback-only test")
+        }
+
+        fn fetch_block_raw(&self, _round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+            self.fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.cancel.cancel();
+            Err(cancelled_error())
+        }
+
+        fn fetch_block(&self, _round: u64) -> Result<Block, AlgoError> {
+            unimplemented!("not exercised by the lookback-only test")
+        }
+
+        fn get_current_round(&self) -> Result<u64, AlgoError> {
+            unimplemented!("not exercised by the lookback-only test")
+        }
+
+        fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
+            Ok(None)
+        }
+    }
+
+    /// Issue #2121: a cancellation that ends the state-proof lookback probe
+    /// (whose error is otherwise swallowed) is returned at once: no lookback
+    /// download starts and no further block is requested.
+    #[test]
+    fn lookback_probe_cancellation_is_returned_before_the_download_starts() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-lookback-probe-cancel-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cancel = CancellationToken::new();
+        let fetches = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let backend = CancelledDuringProbeBackend {
+            cancel: cancel.clone(),
+            fetches: fetches.clone(),
+        };
+        let mut orchestrator =
+            SyncOrchestrator::with_backend(test_config(dir.join("ledger"), 1), backend);
+        orchestrator.state = SyncState::VerifyingLedger;
+        orchestrator.catchpoint_round = Some(5_000);
+        orchestrator.set_cancel(cancel);
+
+        let err = orchestrator
+            .run_download_lookback()
+            .expect_err("a cancelled probe must stop the phase");
+        assert!(err.to_string().contains("cancelled"), "{err}");
+        assert_eq!(
+            fetches.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the probe ran"
+        );
+        assert_eq!(orchestrator.progress().catchpoint_total_blocks, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lookback source that is stopped while serving its first fetch:
+    /// fires `abort` (when given) and then `cancel`, the order
+    /// `LiveCatchupManager::abort_catchup` uses, and fails.
+    struct StoppedDuringLookbackBackend {
+        abort: Option<CancellationToken>,
+        cancel: CancellationToken,
+    }
+
+    impl SyncBackend for StoppedDuringLookbackBackend {
+        fn download_catchpoint(
+            &self,
+            _genesis_id: &str,
+            _round: u64,
+            _dest_path: &std::path::Path,
+        ) -> Result<(), AlgoError> {
+            unimplemented!("the run resumes past the download")
+        }
+
+        fn fetch_block_raw(&self, _round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+            if let Some(abort) = &self.abort {
+                abort.cancel();
+            }
+            self.cancel.cancel();
+            Err(cancelled_error())
+        }
+
+        fn fetch_block(&self, _round: u64) -> Result<Block, AlgoError> {
+            unimplemented!("not exercised: the run stops in the lookback phase")
+        }
+
+        fn get_current_round(&self) -> Result<u64, AlgoError> {
+            unimplemented!("not exercised: the run stops in the lookback phase")
+        }
+
+        fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
+            Ok(None)
+        }
+    }
+
+    /// Resume a catchup for label L1 persisted at `DownloadingLookback`, and
+    /// stop it during the lookback download, as an abort (`abort: true`) or a
+    /// node shutdown. Returns the run's error, the marker left on disk,
+    /// whether the staging table and the catchpoint file still exist.
+    async fn stop_a_resumed_catchup(
+        abort: bool,
+        tag: u32,
+    ) -> (String, Option<PersistedSyncState>, bool, bool) {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-stop-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("catchpoint-5000.tar");
+        std::fs::write(&file, b"not a real catchpoint").unwrap();
+        let cancel = CancellationToken::new();
+        let abort_token = CancellationToken::new();
+        let mut orchestrator = SyncOrchestrator::with_backend(
+            test_config(dir.join("ledger"), 1),
+            StoppedDuringLookbackBackend {
+                abort: abort.then(|| abort_token.clone()),
+                cancel: cancel.clone(),
+            },
+        );
+        orchestrator.set_cancel(cancel);
+        orchestrator.set_abort(abort_token);
+        {
+            let conn = orchestrator.open_db().unwrap();
+            persist_sync_state(
+                &conn,
+                &SyncState::DownloadingLookback,
+                Some("5000#L1"),
+                Some(5_000),
+                Some(&file.to_string_lossy()),
+            )
+            .unwrap();
+            conn.execute_batch("CREATE TABLE catchpointbalances (address BLOB);")
+                .unwrap();
+        }
+
+        let err = orchestrator
+            .run()
+            .await
+            .expect_err("a stopped catchup must not succeed")
+            .to_string();
+        let conn = orchestrator.open_db().unwrap();
+        let marker = restore_sync_state(&conn).unwrap();
+        let staging: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE name = 'catchpointbalances'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let file_exists = file.exists();
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+        (err, marker, staging, file_exists)
+    }
+
+    /// Issue #2121, go `Stop()`: a node shutdown mid-catchup keeps the
+    /// resume marker (and the staging data and file it needs), so the next
+    /// start resumes this catchpoint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_during_a_catchup_keeps_its_resume_marker() {
+        let (err, marker, staging, file_exists) = stop_a_resumed_catchup(false, line!()).await;
+        assert!(err.contains("cancelled"), "{err}");
+        let marker = marker.expect("a shutdown must keep the resume marker");
+        assert_eq!(marker.state, SyncState::DownloadingLookback);
+        assert_eq!(marker.catchpoint_label.as_deref(), Some("5000#L1"));
+        assert!(staging, "a shutdown must keep the staging data");
+        assert!(file_exists, "a shutdown must keep the catchpoint file");
+    }
+
+    /// Issue #2121: an abort that lands after the import's cutover was
+    /// finalized (here: a run resumed at the lookback phase, so an earlier
+    /// process cut over and verified) cannot be undone, as go's abort cannot
+    /// undo its Switch stage. Discarding would strand the applied catchpoint
+    /// unverified and without its lookback blocks, so it is kept, like a
+    /// shutdown, for the next catchup to resume.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborting_after_the_cutover_keeps_the_resume_marker() {
+        let (err, marker, staging, file_exists) = stop_a_resumed_catchup(true, line!()).await;
+        assert!(err.contains("cancelled"), "{err}");
+        let marker = marker.expect("an abort after the cutover must keep the resume marker");
+        assert_eq!(marker.state, SyncState::DownloadingLookback);
+        assert_eq!(marker.catchpoint_label.as_deref(), Some("5000#L1"));
+        assert!(staging);
+        assert!(file_exists);
+    }
+
+    /// A catchpoint source aborted mid-download: it has written part of the
+    /// file to the downloader's `.tmp` path when the user aborts.
+    struct AbortedDuringDownloadBackend {
+        abort: CancellationToken,
+        cancel: CancellationToken,
+    }
+
+    impl SyncBackend for AbortedDuringDownloadBackend {
+        fn download_catchpoint(
+            &self,
+            _genesis_id: &str,
+            _round: u64,
+            dest_path: &std::path::Path,
+        ) -> Result<(), AlgoError> {
+            std::fs::write(dest_path.with_extension("tmp"), b"partial").unwrap();
+            self.abort.cancel();
+            self.cancel.cancel();
+            Err(cancelled_error())
+        }
+
+        fn fetch_block_raw(&self, _round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+            Err(AlgoError::Network {
+                message: "not served".into(),
+            })
+        }
+
+        fn fetch_block(&self, _round: u64) -> Result<Block, AlgoError> {
+            unimplemented!("the run stops in the download phase")
+        }
+
+        fn get_current_round(&self) -> Result<u64, AlgoError> {
+            unimplemented!("the run stops in the download phase")
+        }
+
+        fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
+            Ok(None)
+        }
+    }
+
+    /// Issue #2121, go `Abort()` -> `abort` -> `ResetStagingBalances`: a
+    /// user abort before the cutover discards everything: the resume marker
+    /// (so a later catchup, for any label, starts fresh instead of resuming
+    /// this one), the staging tables and the partially downloaded file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborting_during_the_download_discards_the_marker_staging_and_partial_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-abort-download-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cancel = CancellationToken::new();
+        let abort = CancellationToken::new();
+        let mut config = test_config(dir.join("ledger"), 1);
+        config.catchpoint_label =
+            Some("22507000#XJUJGKAUVK2LVO5OWR46UHSDXIZ52VO5BTLJQQHRFCWAXUAIKMOQ".to_string());
+        let mut orchestrator = SyncOrchestrator::with_backend(
+            config,
+            AbortedDuringDownloadBackend {
+                abort: abort.clone(),
+                cancel: cancel.clone(),
+            },
+        );
+        orchestrator.set_cancel(cancel);
+        orchestrator.set_abort(abort);
+        {
+            let conn = orchestrator.open_db().unwrap();
+            conn.execute_batch("CREATE TABLE catchpointbalances (address BLOB);")
+                .unwrap();
+        }
+        let partial = dir.join("catchpoint-22507000.tar.tmp");
+
+        let err = orchestrator
+            .run()
+            .await
+            .expect_err("an aborted catchup must not succeed")
+            .to_string();
+        assert!(err.contains("aborted"), "{err}");
+        assert!(!partial.exists(), "the partial download must be removed");
+        let conn = orchestrator.open_db().unwrap();
+        assert!(restore_sync_state(&conn).unwrap().is_none());
+        let staging: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE name = 'catchpointbalances'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!staging, "an abort must drop the staging tables");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #2121: a run resumed from an `ImportingLedger` marker resumes a
+    /// catchup an earlier process already cut over (that marker is only
+    /// persisted after the cutover). An abort during the re-import therefore
+    /// must not discard it: the live tables already hold the catchpoint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborting_a_run_resumed_at_the_import_keeps_the_resume_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-abort-resumed-import-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("catchpoint-5000.tar.gz");
+        std::fs::write(&file, b"not a real catchpoint").unwrap();
+        let cancel = CancellationToken::new();
+        let abort = CancellationToken::new();
+        let mut orchestrator =
+            SyncOrchestrator::with_backend(test_config(dir.join("ledger"), 1), FakeLookbackBackend);
+        orchestrator.set_cancel(cancel.clone());
+        orchestrator.set_abort(abort.clone());
+        {
+            let conn = orchestrator.open_db().unwrap();
+            persist_sync_state(
+                &conn,
+                &SyncState::ImportingLedger,
+                Some("5000#L1"),
+                Some(5_000),
+                Some(&file.to_string_lossy()),
+            )
+            .unwrap();
+        }
+        // The user aborts as the resumed run re-enters the import.
+        abort.cancel();
+        cancel.cancel();
+
+        let err = orchestrator
+            .run()
+            .await
+            .expect_err("an aborted catchup must not succeed")
+            .to_string();
+        assert!(err.contains("cancelled"), "{err}");
+        let conn = orchestrator.open_db().unwrap();
+        let marker = restore_sync_state(&conn)
+            .unwrap()
+            .expect("an abort of a cut-over catchup must keep its resume marker");
+        assert_eq!(marker.state, SyncState::ImportingLedger);
+        assert_eq!(marker.catchpoint_label.as_deref(), Some("5000#L1"));
+        assert!(
+            file.exists(),
+            "the catchpoint file must be kept for the resume"
+        );
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #2121: an abort whose cutover rollback fails keeps the state
+    /// (the ledger still holds the catchpoint, so discarding the marker
+    /// would strand it). The rollback is made to fail by a backup whose
+    /// `acctrounds` table, which `rollback_cutover` restores into, is gone.
+    #[test]
+    fn aborting_with_a_failed_cutover_rollback_keeps_the_resume_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-abort-rollback-fails-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("catchpoint-5000.tar.gz");
+        std::fs::write(&file, b"not a real catchpoint").unwrap();
+        let mut orchestrator =
+            SyncOrchestrator::with_backend(test_config(dir.join("ledger"), 1), FakeLookbackBackend);
+        let abort = CancellationToken::new();
+        abort.cancel();
+        orchestrator.set_abort(abort);
+        orchestrator.state = SyncState::VerifyingLedger;
+        orchestrator.catchpoint_round = Some(5_000);
+        orchestrator.catchpoint_file_path = Some(file.clone());
+        orchestrator.ledger_cut_over = true;
+        orchestrator.cutover_backup = Some(crate::catchpoint::CutoverBackup::default());
+        orchestrator.cutover_backup_pre_catchup = true;
+        {
+            let conn = orchestrator.open_db().unwrap();
+            persist_sync_state(
+                &conn,
+                &SyncState::VerifyingLedger,
+                Some("5000#L1"),
+                Some(5_000),
+                Some(&file.to_string_lossy()),
+            )
+            .unwrap();
+            conn.execute_batch("DROP TABLE IF EXISTS acctrounds;")
+                .unwrap();
+        }
+
+        let err = orchestrator.stop_aborted_catchup().to_string();
+        assert!(err.contains("cancelled"), "{err}");
+        let conn = orchestrator.open_db().unwrap();
+        assert!(
+            restore_sync_state(&conn).unwrap().is_some(),
+            "a failed rollback must keep the resume marker"
+        );
+        assert!(
+            file.exists(),
+            "a failed rollback must keep the catchpoint file"
+        );
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #2121: a cancellation that lands while the lookback retry loop
+    /// sleeps out its backoff wakes it at once. The backoff here is 60 s per
+    /// failure, so a plain `std::thread::sleep` would hold the phase for a
+    /// minute.
+    #[test]
+    fn cancel_during_the_lookback_backoff_returns_promptly() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-lookback-backoff-cancel-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let backend = AlwaysFailingLookbackBackend {
+            counted_round: 5,
+            fetch_attempts: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let mut orchestrator =
+            SyncOrchestrator::with_backend(test_config(dir.join("ledger"), 1), backend);
+        orchestrator.state = SyncState::VerifyingLedger;
+        orchestrator.catchpoint_round = Some(5);
+        orchestrator.lookback_retry_backoff = |_| 60_000;
+        let cancel = CancellationToken::new();
+        orchestrator.set_cancel(cancel.clone());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(
+                orchestrator
+                    .run_download_lookback()
+                    .map_err(|e| e.to_string()),
+            );
+        });
+        // Let the first fetch fail and its 60 s backoff begin.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let cancelled_at = std::time::Instant::now();
+        cancel.cancel();
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the backoff sleep ignored the cancellation");
+        assert!(cancelled_at.elapsed() < std::time::Duration::from_secs(5));
+        let err = result.expect_err("a cancelled lookback must not succeed");
+        assert!(err.contains("cancelled"), "{err}");
+        worker.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Minimal tables `CatchpointImporter::rollback_cutover` restores into.
+    fn create_rollback_tables(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS acctrounds (id TEXT PRIMARY KEY, rnd INTEGER);
+             CREATE TABLE IF NOT EXISTS accounttotals (id TEXT PRIMARY KEY, online INTEGER,
+                 onlinerewardunits INTEGER, offline INTEGER, offlinerewardunits INTEGER,
+                 notparticipating INTEGER, notparticipatingrewardunits INTEGER,
+                 rewardslevel INTEGER);",
+        )
+        .unwrap();
+    }
+
+    /// Issue #2121: a verification failure whose cutover rollback succeeds
+    /// leaves a pre-catchup ledger, so its marker must stop claiming a
+    /// cutover. Then a resumed run that is aborted before the re-import
+    /// discards the marker, the staging tables and the file, instead of
+    /// keeping a stale "cut over" state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rolled_back_verify_failure_lets_a_later_abort_discard_everything() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-rollback-then-abort-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("catchpoint-5000.tar.gz");
+        std::fs::write(&file, b"not a real catchpoint").unwrap();
+
+        // Process 1: cut over, verification fails, the rollback succeeds.
+        let mut first =
+            SyncOrchestrator::with_backend(test_config(dir.join("ledger"), 1), FakeLookbackBackend);
+        first.resolved_label = Some("5000#L1".to_string());
+        first.catchpoint_round = Some(5_000);
+        first.catchpoint_file_path = Some(file.clone());
+        first.ledger_cut_over = true;
+        first.cutover_backup = Some(crate::catchpoint::CutoverBackup::default());
+        first.cutover_backup_pre_catchup = true;
+        {
+            let conn = first.open_db().unwrap();
+            create_rollback_tables(&conn);
+            persist_sync_state(
+                &conn,
+                &SyncState::ImportingLedger,
+                Some("5000#L1"),
+                Some(5_000),
+                Some(&file.to_string_lossy()),
+            )
+            .unwrap();
+            first.rollback_after_verify_failure(&conn, "test verification failure", false);
+            let marker = restore_sync_state(&conn).unwrap().unwrap();
+            assert_eq!(
+                marker.state,
+                SyncState::DownloadingLedger,
+                "a rolled-back cutover must not leave a marker that claims one"
+            );
+            conn.execute_batch("CREATE TABLE catchpointbalances (address BLOB);")
+                .unwrap();
+        }
+
+        // Process 2: resumes, and the user aborts before the re-import.
+        let cancel = CancellationToken::new();
+        let abort = CancellationToken::new();
+        let mut second =
+            SyncOrchestrator::with_backend(test_config(dir.join("ledger"), 1), FakeLookbackBackend);
+        second.set_cancel(cancel.clone());
+        second.set_abort(abort.clone());
+        abort.cancel();
+        cancel.cancel();
+        let err = second
+            .run()
+            .await
+            .expect_err("an aborted catchup must not succeed")
+            .to_string();
+        assert!(err.contains("aborted"), "{err}");
+        let conn = second.open_db().unwrap();
+        assert!(restore_sync_state(&conn).unwrap().is_none());
+        let staging: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE name = 'catchpointbalances'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!staging, "the abort must drop the staging tables");
+        assert!(!file.exists(), "the abort must remove the catchpoint file");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #2121: a verification failure whose rollback fails leaves the
+    /// ledger cut over without a backup, and the marker says so
+    /// (`ImportingLedger`), whatever it said before.
+    #[test]
+    fn a_verify_failure_with_a_failed_rollback_keeps_a_cut_over_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-verify-rollback-fails-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut orchestrator =
+            SyncOrchestrator::with_backend(test_config(dir.join("ledger"), 1), FakeLookbackBackend);
+        orchestrator.resolved_label = Some("5000#L1".to_string());
+        orchestrator.catchpoint_round = Some(5_000);
+        orchestrator.ledger_cut_over = true;
+        orchestrator.cutover_backup = Some(crate::catchpoint::CutoverBackup::default());
+        orchestrator.cutover_backup_pre_catchup = true;
+        let conn = orchestrator.open_db().unwrap();
+        persist_sync_state(
+            &conn,
+            &SyncState::DownloadingLedger,
+            Some("5000#L1"),
+            Some(5_000),
+            None,
+        )
+        .unwrap();
+        // No `acctrounds` table: the rollback fails.
+        conn.execute_batch("DROP TABLE IF EXISTS acctrounds;")
+            .unwrap();
+
+        orchestrator.rollback_after_verify_failure(&conn, "test verification failure", false);
+        let marker = restore_sync_state(&conn).unwrap().unwrap();
+        assert_eq!(marker.state, SyncState::ImportingLedger);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An orchestrator in a run resumed with the ledger already cut over
+    /// (an earlier process cut over and was killed before verifying), whose
+    /// re-import took a backup of that UNVERIFIED cutover; the rollback
+    /// tables exist, so restoring the backup would succeed.
+    fn resumed_reimport(tag: u32) -> (std::path::PathBuf, std::path::PathBuf, SyncOrchestrator) {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-resumed-reimport-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("catchpoint-5000.tar.gz");
+        std::fs::write(&file, b"not a real catchpoint").unwrap();
+        let mut orchestrator =
+            SyncOrchestrator::with_backend(test_config(dir.join("ledger"), 1), FakeLookbackBackend);
+        orchestrator.resolved_label = Some("5000#L1".to_string());
+        orchestrator.catchpoint_round = Some(5_000);
+        orchestrator.catchpoint_file_path = Some(file.clone());
+        orchestrator.ledger_cut_over = true;
+        orchestrator.cutover_backup = Some(crate::catchpoint::CutoverBackup::default());
+        orchestrator.cutover_backup_pre_catchup = false;
+        let conn = orchestrator.open_db().unwrap();
+        create_rollback_tables(&conn);
+        persist_sync_state(
+            &conn,
+            &SyncState::ImportingLedger,
+            Some("5000#L1"),
+            Some(5_000),
+            Some(&file.to_string_lossy()),
+        )
+        .unwrap();
+        drop(conn);
+        (dir, file, orchestrator)
+    }
+
+    /// Issue #2121: in a run resumed with the ledger already cut over, the
+    /// re-import's backup is of the earlier unverified cutover, not of the
+    /// pre-catchup ledger, so an abort cannot undo the catchpoint: it keeps
+    /// the marker and the file (as go keeps a switched catchpoint).
+    #[test]
+    fn an_abort_never_rolls_back_to_an_earlier_unverified_cutover() {
+        let (dir, file, mut orchestrator) = resumed_reimport(line!());
+        let abort = CancellationToken::new();
+        abort.cancel();
+        orchestrator.set_abort(abort);
+
+        let err = orchestrator.stop_aborted_catchup().to_string();
+        assert!(err.contains("cancelled"), "{err}");
+        assert!(
+            orchestrator.cutover_backup.is_some(),
+            "nothing may be rolled back to an unverified cutover"
+        );
+        let conn = orchestrator.open_db().unwrap();
+        let marker = restore_sync_state(&conn).unwrap().unwrap();
+        assert_eq!(marker.state, SyncState::ImportingLedger);
+        assert!(file.exists());
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #2121: a verify failure in such a resumed run restores the
+    /// earlier unverified cutover, which is still a cutover: the marker stays
+    /// a cut-over one (`ImportingLedger`), never `DownloadingLedger`.
+    #[test]
+    fn a_verify_failure_restoring_an_earlier_cutover_keeps_a_cut_over_marker() {
+        let (dir, _file, mut orchestrator) = resumed_reimport(line!());
+        let conn = orchestrator.open_db().unwrap();
+        orchestrator.rollback_after_verify_failure(&conn, "test verification failure", false);
+        assert!(
+            orchestrator.cutover_backup.is_none(),
+            "the backup was restored"
+        );
+        assert!(orchestrator.ledger_cut_over);
+        let marker = restore_sync_state(&conn).unwrap().unwrap();
+        assert_eq!(marker.state, SyncState::ImportingLedger);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #2121: a verify failure with no backup to roll back (a run
+    /// resumed at `VerifyingLedger`) leaves the marker as it is, so a
+    /// transient verify error re-verifies on resume instead of forcing a
+    /// full re-import.
+    #[test]
+    fn a_verify_failure_without_a_backup_keeps_the_marker_as_it_is() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-verify-no-backup-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut orchestrator =
+            SyncOrchestrator::with_backend(test_config(dir.join("ledger"), 1), FakeLookbackBackend);
+        orchestrator.resolved_label = Some("5000#L1".to_string());
+        orchestrator.catchpoint_round = Some(5_000);
+        orchestrator.ledger_cut_over = true;
+        let conn = orchestrator.open_db().unwrap();
+        persist_sync_state(
+            &conn,
+            &SyncState::VerifyingLedger,
+            Some("5000#L1"),
+            Some(5_000),
+            None,
+        )
+        .unwrap();
+        orchestrator.rollback_after_verify_failure(&conn, "transient verify error", false);
+        let marker = restore_sync_state(&conn).unwrap().unwrap();
+        assert_eq!(marker.state, SyncState::VerifyingLedger);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #2121: a hash (or label) mismatch whose rollback fails leaves
+    /// the ledger cut over to an untrusted snapshot. The marker still records
+    /// the cutover (`ImportingLedger`) but no longer names the rejected file,
+    /// which is deleted, so no resume can re-import it.
+    #[test]
+    fn a_rejected_snapshot_whose_rollback_fails_is_never_named_for_a_reimport() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-rejected-snapshot-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("catchpoint-5000.tar.gz");
+        std::fs::write(&file, b"the rejected snapshot").unwrap();
+        let mut orchestrator =
+            SyncOrchestrator::with_backend(test_config(dir.join("ledger"), 1), FakeLookbackBackend);
+        orchestrator.resolved_label = Some("5000#L1".to_string());
+        orchestrator.catchpoint_round = Some(5_000);
+        orchestrator.catchpoint_file_path = Some(file.clone());
+        orchestrator.ledger_cut_over = true;
+        orchestrator.cutover_backup = Some(crate::catchpoint::CutoverBackup::default());
+        orchestrator.cutover_backup_pre_catchup = true;
+        let conn = orchestrator.open_db().unwrap();
+        // No `acctrounds` table: the rollback fails.
+        conn.execute_batch("DROP TABLE IF EXISTS acctrounds;")
+            .unwrap();
+
+        orchestrator.rollback_after_verify_failure(&conn, "catchpoint hash mismatch", true);
+        let marker = restore_sync_state(&conn).unwrap().unwrap();
+        assert_eq!(
+            marker.state,
+            SyncState::ImportingLedger,
+            "still recorded as cut over"
+        );
+        assert_eq!(
+            marker.catchpoint_file, None,
+            "the rejected file must not be named"
+        );
+        assert!(!file.exists(), "the rejected file must be deleted");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A catchpoint source whose download fails, counting the attempts.
+    struct CountingFailedDownloadBackend {
+        downloads: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl SyncBackend for CountingFailedDownloadBackend {
+        fn download_catchpoint(
+            &self,
+            _genesis_id: &str,
+            _round: u64,
+            _dest_path: &std::path::Path,
+        ) -> Result<(), AlgoError> {
+            self.downloads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(AlgoError::Network {
+                message: "simulated unreachable peer".into(),
+            })
+        }
+
+        fn fetch_block_raw(&self, _round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+            Err(AlgoError::Network {
+                message: "not served".into(),
+            })
+        }
+
+        fn fetch_block(&self, _round: u64) -> Result<Block, AlgoError> {
+            unimplemented!("the run stops in the download phase")
+        }
+
+        fn get_current_round(&self) -> Result<u64, AlgoError> {
+            unimplemented!("the run stops in the download phase")
+        }
+
+        fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
+            Ok(None)
+        }
+    }
+
+    /// Issue #2121: resuming such a marker (`ImportingLedger`, no file)
+    /// re-downloads the catchpoint before any re-import, and the marker keeps
+    /// recording the cutover meanwhile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resuming_a_cut_over_marker_without_a_file_redownloads_first() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-resume-no-file-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let downloads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut config = test_config(dir.join("ledger"), 1);
+        config.catchpoint_label =
+            Some("22507000#XJUJGKAUVK2LVO5OWR46UHSDXIZ52VO5BTLJQQHRFCWAXUAIKMOQ".to_string());
+        let mut orchestrator = SyncOrchestrator::with_backend(
+            config,
+            CountingFailedDownloadBackend {
+                downloads: downloads.clone(),
+            },
+        );
+        {
+            let conn = orchestrator.open_db().unwrap();
+            persist_sync_state(
+                &conn,
+                &SyncState::ImportingLedger,
+                Some("22507000#XJUJGKAUVK2LVO5OWR46UHSDXIZ52VO5BTLJQQHRFCWAXUAIKMOQ"),
+                Some(22_507_000),
+                None,
+            )
+            .unwrap();
+        }
+        let err = orchestrator
+            .run()
+            .await
+            .expect_err("the download fails")
+            .to_string();
+        assert_eq!(
+            downloads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the resume must re-download, not re-import (error: {err})"
+        );
+        let conn = orchestrator.open_db().unwrap();
+        let marker = restore_sync_state(&conn).unwrap().unwrap();
+        assert_eq!(
+            marker.state,
+            SyncState::ImportingLedger,
+            "still recorded as cut over"
+        );
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A catchpoint source whose download fires only the cancel token (a
+    /// node shutdown), not the abort token, and ends as a cancellation.
+    struct CancelledDuringDownloadBackend {
+        cancel: CancellationToken,
+    }
+
+    impl SyncBackend for CancelledDuringDownloadBackend {
+        fn download_catchpoint(
+            &self,
+            _genesis_id: &str,
+            _round: u64,
+            _dest_path: &std::path::Path,
+        ) -> Result<(), AlgoError> {
+            self.cancel.cancel();
+            Err(cancelled_error())
+        }
+
+        fn fetch_block_raw(&self, _round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+            Err(AlgoError::Network {
+                message: "not served".into(),
+            })
+        }
+
+        fn fetch_block(&self, _round: u64) -> Result<Block, AlgoError> {
+            unimplemented!("the run stops in the download phase")
+        }
+
+        fn get_current_round(&self) -> Result<u64, AlgoError> {
+            unimplemented!("the run stops in the download phase")
+        }
+
+        fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
+            Ok(None)
+        }
+    }
+
+    const R9_LABEL: &str = "22507000#XJUJGKAUVK2LVO5OWR46UHSDXIZ52VO5BTLJQQHRFCWAXUAIKMOQ";
+
+    /// Issue #2121: the resume marker never regresses below the ledger's
+    /// actual state. A run resumed at `ImportingLedger` with no file (a cut-over
+    /// ledger whose rejected snapshot is being re-downloaded) that is cancelled
+    /// mid-download keeps a marker at least `ImportingLedger`, and a later
+    /// run resumed from it and aborted keeps everything (the ledger holds an
+    /// unverified snapshot an abort cannot undo).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancel_mid_redownload_keeps_the_cut_over_marker_and_a_later_abort_keeps_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-marker-no-regress-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = test_config(dir.join("ledger"), 1);
+        config.catchpoint_label = Some(R9_LABEL.to_string());
+
+        // Process 1: resumed at ImportingLedger with no file, cancelled mid-download.
+        let cancel = CancellationToken::new();
+        let mut first = SyncOrchestrator::with_backend(
+            config.clone(),
+            CancelledDuringDownloadBackend {
+                cancel: cancel.clone(),
+            },
+        );
+        first.set_cancel(cancel);
+        {
+            let conn = first.open_db().unwrap();
+            persist_sync_state(
+                &conn,
+                &SyncState::ImportingLedger,
+                Some(R9_LABEL),
+                Some(22_507_000),
+                None,
+            )
+            .unwrap();
+            conn.execute_batch("CREATE TABLE catchpointbalances (address BLOB);")
+                .unwrap();
+        }
+        let err = first.run().await.expect_err("cancelled").to_string();
+        assert!(err.contains("cancelled"), "{err}");
+        {
+            let conn = first.open_db().unwrap();
+            let marker = restore_sync_state(&conn).unwrap().unwrap();
+            assert!(
+                phase_ordinal(&marker.state) >= phase_ordinal(&SyncState::ImportingLedger),
+                "the marker regressed below the ledger's state: {}",
+                marker.state
+            );
+        }
+
+        // Process 2: resumed from that marker, aborted at once.
+        let cancel = CancellationToken::new();
+        let abort = CancellationToken::new();
+        let mut second = SyncOrchestrator::with_backend(
+            config,
+            CancelledDuringDownloadBackend {
+                cancel: cancel.clone(),
+            },
+        );
+        second.set_cancel(cancel.clone());
+        second.set_abort(abort.clone());
+        abort.cancel();
+        cancel.cancel();
+        let err = second.run().await.expect_err("aborted").to_string();
+        assert!(err.contains("cancelled"), "{err}");
+        let conn = second.open_db().unwrap();
+        let marker = restore_sync_state(&conn)
+            .unwrap()
+            .expect("an abort of a cut-over ledger must keep its marker");
+        assert!(phase_ordinal(&marker.state) >= phase_ordinal(&SyncState::ImportingLedger));
+        let staging: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE name = 'catchpointbalances'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(staging, "the abort must not drop the staging tables");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A catchpoint source whose download fires both tokens (an abort racing
+    /// the download) but then fails with a REAL error.
+    struct RealErrorDuringDownloadBackend {
+        abort: CancellationToken,
+        cancel: CancellationToken,
+    }
+
+    impl SyncBackend for RealErrorDuringDownloadBackend {
+        fn download_catchpoint(
+            &self,
+            _genesis_id: &str,
+            _round: u64,
+            _dest_path: &std::path::Path,
+        ) -> Result<(), AlgoError> {
+            self.abort.cancel();
+            self.cancel.cancel();
+            Err(AlgoError::Network {
+                message: "real download failure".into(),
+            })
+        }
+
+        fn fetch_block_raw(&self, _round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+            Err(AlgoError::Network {
+                message: "not served".into(),
+            })
+        }
+
+        fn fetch_block(&self, _round: u64) -> Result<Block, AlgoError> {
+            unimplemented!("the run stops in the download phase")
+        }
+
+        fn get_current_round(&self) -> Result<u64, AlgoError> {
+            unimplemented!("the run stops in the download phase")
+        }
+
+        fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
+            Ok(None)
+        }
+    }
+
+    /// Issue #2121: a genuine download error that races an already-fired
+    /// cancel/abort token surfaces unchanged (so the caller's error handling
+    /// and logs see it), and is not rewritten to a cancellation or an abort.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_real_download_error_racing_the_tokens_is_not_masked() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-unmasked-download-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = test_config(dir.join("ledger"), 1);
+        config.catchpoint_label = Some(R9_LABEL.to_string());
+        let cancel = CancellationToken::new();
+        let abort = CancellationToken::new();
+        let mut orchestrator = SyncOrchestrator::with_backend(
+            config,
+            RealErrorDuringDownloadBackend {
+                abort: abort.clone(),
+                cancel: cancel.clone(),
+            },
+        );
+        orchestrator.set_cancel(cancel);
+        orchestrator.set_abort(abort);
+        let err = orchestrator.run().await.expect_err("fails").to_string();
+        assert!(
+            err.contains("real download failure"),
+            "the real error must surface unchanged, got: {err}"
+        );
+        assert!(
+            !err.contains("aborted") && !err.contains("cancelled"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lookback source whose consumer's fetch of the catchpoint round
+    /// (the second request for it: the first is the state-proof probe) fires
+    /// the token and fails with a REAL error.
+    struct RealErrorDuringLookbackBackend {
+        round: u64,
+        cancel: CancellationToken,
+        calls: std::sync::atomic::AtomicU64,
+    }
+
+    impl SyncBackend for RealErrorDuringLookbackBackend {
+        fn download_catchpoint(
+            &self,
+            _genesis_id: &str,
+            _round: u64,
+            _dest_path: &std::path::Path,
+        ) -> Result<(), AlgoError> {
+            unimplemented!("not exercised by the lookback-only test")
+        }
+
+        fn fetch_block_raw(&self, round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+            if round == self.round
+                && self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1
+            {
+                self.cancel.cancel();
+            }
+            Err(AlgoError::Network {
+                message: "real lookback failure".into(),
+            })
+        }
+
+        fn fetch_block(&self, _round: u64) -> Result<Block, AlgoError> {
+            unimplemented!("not exercised by the lookback-only test")
+        }
+
+        fn get_current_round(&self) -> Result<u64, AlgoError> {
+            unimplemented!("not exercised by the lookback-only test")
+        }
+
+        fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
+            Ok(None)
+        }
+    }
+
+    /// Issue #2121: in the lookback phase too, a real fetch failure that
+    /// races the token (here with no retries left) surfaces as that failure,
+    /// not as a cancellation.
+    #[test]
+    fn a_real_lookback_error_racing_the_token_is_not_masked() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-unmasked-lookback-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cancel = CancellationToken::new();
+        let mut config = test_config(dir.join("ledger"), 1);
+        config.catchup_block_download_retry_attempts = 0;
+        let mut orchestrator = SyncOrchestrator::with_backend(
+            config,
+            RealErrorDuringLookbackBackend {
+                round: 5,
+                cancel: cancel.clone(),
+                calls: std::sync::atomic::AtomicU64::new(0),
+            },
+        );
+        orchestrator.state = SyncState::VerifyingLedger;
+        orchestrator.catchpoint_round = Some(5);
+        orchestrator.lookback_retry_backoff = |_| 0;
+        orchestrator.set_cancel(cancel);
+        let err = orchestrator
+            .run_download_lookback()
+            .expect_err("fails")
+            .to_string();
+        assert!(
+            err.contains("real lookback failure"),
+            "the real error must surface, got: {err}"
+        );
+        assert!(!err.contains("cancelled by user"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A resumed run for [`R9_LABEL`] over a ledger in `dir`, whose download
+    /// attempts are counted.
+    fn resumed_run_counting_downloads(
+        dir: &std::path::Path,
+    ) -> (
+        SyncOrchestrator,
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        let downloads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut config = test_config(dir.join("ledger"), 1);
+        config.catchpoint_label = Some(R9_LABEL.to_string());
+        let orchestrator = SyncOrchestrator::with_backend(
+            config,
+            CountingFailedDownloadBackend {
+                downloads: downloads.clone(),
+            },
+        );
+        (orchestrator, downloads)
+    }
+
+    /// Issue #2121: a verify failure that did NOT reject the file (a transient
+    /// IO or SQLite error) whose cutover rolls back cleanly leaves a marker
+    /// that names the good file at the pre-import state, so the resume goes to
+    /// the import and does not download the gigabytes again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transient_verify_error_with_a_clean_rollback_resumes_without_redownloading() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-transient-verify-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("catchpoint-22507000.tar.gz");
+        std::fs::write(&file, b"a complete download").unwrap();
+
+        let (mut first, _) = resumed_run_counting_downloads(&dir);
+        first.resolved_label = Some(R9_LABEL.to_string());
+        first.catchpoint_round = Some(22_507_000);
+        first.catchpoint_file_path = Some(file.clone());
+        first.ledger_cut_over = true;
+        first.cutover_backup = Some(crate::catchpoint::CutoverBackup::default());
+        first.cutover_backup_pre_catchup = true;
+        {
+            let conn = first.open_db().unwrap();
+            create_rollback_tables(&conn);
+            // The marker the import left (also creates `catchpointstate`,
+            // which the rollback restores into).
+            first.persist_marker(&conn, &SyncState::ImportingLedger);
+            first.rollback_after_verify_failure(&conn, "transient sqlite busy", false);
+            let marker = restore_sync_state(&conn).unwrap().unwrap();
+            assert_eq!(marker.state, SyncState::DownloadingLedger);
+            assert_eq!(
+                marker.catchpoint_file.as_deref(),
+                Some(file.to_string_lossy().as_ref()),
+                "the good file must stay named"
+            );
+        }
+        assert!(file.exists());
+
+        // The resume: no new download (the import then fails on the fake file).
+        let (mut second, downloads) = resumed_run_counting_downloads(&dir);
+        let _ = second.run().await;
+        assert_eq!(
+            downloads.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a transient verify error must not force a re-download"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same clean rollback after a REJECTED file deletes it and names no
+    /// file, so the resume does download again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rejected_file_with_a_clean_rollback_is_deleted_and_redownloaded() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-rejected-clean-rollback-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("catchpoint-22507000.tar.gz");
+        std::fs::write(&file, b"a rejected download").unwrap();
+
+        let (mut first, _) = resumed_run_counting_downloads(&dir);
+        first.resolved_label = Some(R9_LABEL.to_string());
+        first.catchpoint_round = Some(22_507_000);
+        first.catchpoint_file_path = Some(file.clone());
+        first.ledger_cut_over = true;
+        first.cutover_backup = Some(crate::catchpoint::CutoverBackup::default());
+        first.cutover_backup_pre_catchup = true;
+        {
+            let conn = first.open_db().unwrap();
+            create_rollback_tables(&conn);
+            first.persist_marker(&conn, &SyncState::ImportingLedger);
+            first.rollback_after_verify_failure(&conn, "catchpoint hash mismatch", true);
+            let marker = restore_sync_state(&conn).unwrap().unwrap();
+            assert_eq!(marker.state, SyncState::DownloadingLedger);
+            assert_eq!(
+                marker.catchpoint_file, None,
+                "the rejected file must not be named"
+            );
+        }
+        assert!(!file.exists(), "the rejected file must be deleted");
+
+        let (mut second, downloads) = resumed_run_counting_downloads(&dir);
+        let _ = second.run().await;
+        assert_eq!(downloads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #2121: the lookback retry backoff waits on the token, so a
+    /// cancellation from another thread wakes it at once, and an uncancelled
+    /// wait runs its full delay.
+    #[test]
+    fn sleep_unless_cancelled_wakes_on_cancel_and_otherwise_waits_out_the_delay() {
+        let cancel = CancellationToken::new();
+        let started = Instant::now();
+        assert!(!sleep_unless_cancelled(Duration::from_millis(30), &cancel));
+        assert!(started.elapsed() >= Duration::from_millis(30));
+
+        let canceller = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                cancel.cancel();
+            })
+        };
+        let started = Instant::now();
+        assert!(sleep_unless_cancelled(Duration::from_secs(60), &cancel));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the cancellation did not wake the sleep: {:?}",
+            started.elapsed()
+        );
+        canceller.join().unwrap();
+        // Already cancelled: returns at once.
+        assert!(sleep_unless_cancelled(Duration::from_secs(60), &cancel));
+    }
+
+    /// TDD regression for issue #2121 (the aramidmain image smoke): a node
+    /// stopped while its live catchup sits in the lookback retry loop must
+    /// see that loop observe the cancellation and return, so the runtime
+    /// can then shut down with nothing left registering timers on it.
+    /// Before the fix the loop ignored the token: it kept retrying (the
+    /// node outlived `docker stop -t 30`), and once the runtime was dropped
+    /// the next `block_on` panicked with "A Tokio 1.x context was found,
+    /// but it is being shutdown".
+    #[test]
+    fn lookback_retry_loop_returns_on_cancel_before_the_runtime_shuts_down() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-lookback-shutdown-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("ledger");
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut config = test_config(db_path, 1);
+        // Effectively unbounded: only the cancellation can end the loop.
+        config.catchup_block_download_retry_attempts = 1_000_000;
+        let backend = RuntimeTimerFailingBackend {
+            rt: rt.handle().clone(),
+            delay: std::time::Duration::from_millis(20),
+        };
+        let cancel = CancellationToken::new();
+        let mut orchestrator = SyncOrchestrator::with_backend(config, backend);
+        orchestrator.lookback_retry_backoff = |_| 0;
+        orchestrator.state = SyncState::VerifyingLedger;
+        orchestrator.catchpoint_round = Some(5_000);
+        orchestrator.set_cancel(cancel.clone());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sync_thread = std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                orchestrator
+                    .run_download_lookback()
+                    .map_err(|e| e.to_string())
+            }));
+            let _ = tx.send(outcome);
+        });
+
+        // Let the loop get going (probe, prefetch failure, retries).
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        cancel.cancel();
+        // Ordered shutdown: the sync work must return before the runtime is
+        // dropped.
+        let returned = rx.recv_timeout(std::time::Duration::from_secs(5));
+        rt.shutdown_timeout(std::time::Duration::from_secs(5));
+        let outcome = match returned {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                // What the node did: the runtime is gone while the loop
+                // still runs. Collect how that ended for the message.
+                let late = rx.recv_timeout(std::time::Duration::from_secs(10));
+                panic!(
+                    "the lookback retry loop ignored the cancellation for 5 s; after the \
+                     runtime shut down it ended with: {}",
+                    match late {
+                        Ok(Ok(r)) => format!("{r:?}"),
+                        Ok(Err(_)) => "a panic (timer registered on a dying runtime)".into(),
+                        Err(_) => "nothing (still running)".into(),
+                    }
+                );
+            }
+        };
+        let _ = sync_thread.join();
+        let result = outcome.expect("the lookback download panicked");
+        let err = result.expect_err("a cancelled lookback download must not succeed");
+        assert!(
+            err.contains("cancelled"),
+            "a cancelled lookback download must report the cancellation, got: {err}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -3942,6 +5695,7 @@ mod tests {
                 fetch_attempts,
             };
             let mut orchestrator = SyncOrchestrator::with_backend(config, backend);
+            orchestrator.lookback_retry_backoff = |_| 0;
             orchestrator.state = SyncState::VerifyingLedger;
             orchestrator.catchpoint_round = Some(CATCHPOINT_ROUND);
             // No cached_catchpoint_block set — mirrors the pre-fix
@@ -3967,6 +5721,7 @@ mod tests {
             fetch_attempts: fetch_attempts.clone(),
         };
         let mut orchestrator = SyncOrchestrator::with_backend(config, backend);
+        orchestrator.lookback_retry_backoff = |_| 0;
         orchestrator.state = SyncState::VerifyingLedger;
         orchestrator.catchpoint_round = Some(CATCHPOINT_ROUND);
 
@@ -5755,9 +7510,11 @@ mod tests {
 
     /// Issue #2082: a cross-process resume at the verify phase (no in-memory
     /// cutover backup) whose requested label differs from the verified file
-    /// must fail and drop the resume marker.
+    /// must fail and stop the resume marker from naming the rejected file, so
+    /// a rerun re-downloads. The marker still records the cutover (the
+    /// imported data is live): it is not dropped (issue #2121).
     #[test]
-    fn resumed_verify_rejects_requested_label_mismatch_and_clears_marker() {
+    fn resumed_verify_rejects_requested_label_mismatch_and_drops_the_file_from_the_marker() {
         use crate::catchpoint::writer::{export_catchpoint_file, ExportOptions};
 
         let dir = tempfile::tempdir().unwrap();
@@ -5810,7 +7567,14 @@ mod tests {
             err.contains("catchpoint hash mismatch") && err.contains("calculated"),
             "{err}"
         );
-        assert!(restore_sync_state(&conn).unwrap().is_none());
+        let marker = restore_sync_state(&conn)
+            .unwrap()
+            .expect("the live cutover must stay recorded");
+        assert_eq!(marker.state, SyncState::ImportingLedger);
+        assert_eq!(
+            marker.catchpoint_file, None,
+            "the rejected file must not be named"
+        );
     }
 
     #[test]

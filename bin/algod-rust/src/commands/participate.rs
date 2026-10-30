@@ -7015,12 +7015,31 @@ pub async fn run(
     // request before the listener closes.
     shutdown_token.cancel();
 
-    // Stop the agreement service first, then the catchup service (mirrors
-    // Go's shutdown order where the agreement service is stopped before the
-    // catchup service, ensuring no new certificates are sent after the
-    // catchup service shuts down). `ParticipateAgreementControl::pause`
-    // (issue #940) does exactly this ordering internally; a no-op if a live
-    // catchpoint catchup has already paused it.
+    // Issue #2121: stop a live catchpoint catchup before anything else and
+    // wait for it, like go's `node.Stop` stopping the catchpoint catchup
+    // service. Its block fetches run on this runtime, so one still retrying
+    // when `main` returns panics registering timers on a runtime that is
+    // being shut down, and keeps the process alive past `docker stop`.
+    // (Budget: `crate::live_catchup::LIVE_CATCHUP_SHUTDOWN_TIMEOUT`.)
+    let catchup_stopped = match &catchup_manager {
+        Some(mgr) => {
+            mgr.shutdown(crate::live_catchup::LIVE_CATCHUP_SHUTDOWN_TIMEOUT)
+                .await
+        }
+        None => true,
+    };
+
+    // Order, against go's `AlgorandFullNode.Stop` (node/node.go): go stops
+    // the network, then EITHER the catchpoint catchup service (when one is
+    // running: agreement and the catchup service do not run then) OR, in
+    // normal operation, agreement before the catchup service (so no new
+    // certificates are sent after the catchup service shuts down). Here the
+    // live catchup was stopped above, first (issue #2121), which is go's
+    // first branch: while it runs, agreement is already paused by
+    // `ParticipateAgreementControl` (issue #940). So the `pause()` below only
+    // does real work in the normal-operation case, where it stops the
+    // agreement service and then the catchup service in go's order (and is a
+    // no-op if a live catchup already paused it).
     agreement_control.pause().await;
     pool_follower_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = pool_follower.join();
@@ -7074,23 +7093,32 @@ pub async fn run(
     // can never leave a corrupt file at a previously-published path -- but
     // waiting (briefly, bounded) still lets the newest catchpoint actually
     // land instead of being silently dropped on every restart.
-    let wait_result = tokio::task::spawn_blocking({
-        let ledger = Arc::clone(&ledger);
-        move || {
-            ledger
-                .lock()
-                .unwrap()
-                .wait_for_pending_catchpoint_export_timeout(CATCHPOINT_EXPORT_SHUTDOWN_TIMEOUT)
+    //
+    // Issue #2121: skipped when a live catchpoint catchup is still running
+    // (it did not stop within its shutdown timeout): that wait would overlap
+    // an import replacing the very ledger being exported, and add up to 30 s
+    // on top of the catchup's budget.
+    if catchup_stopped {
+        let wait_result = tokio::task::spawn_blocking({
+            let ledger = Arc::clone(&ledger);
+            move || {
+                ledger
+                    .lock()
+                    .unwrap()
+                    .wait_for_pending_catchpoint_export_timeout(CATCHPOINT_EXPORT_SHUTDOWN_TIMEOUT)
+            }
+        })
+        .await;
+        match wait_result {
+            Ok(true) => {}
+            Ok(false) => warn!(
+                timeout = ?CATCHPOINT_EXPORT_SHUTDOWN_TIMEOUT,
+                "shutting down with an automatic catchpoint export still in flight"
+            ),
+            Err(e) => warn!(error = %e, "catchpoint-export shutdown wait task panicked"),
         }
-    })
-    .await;
-    match wait_result {
-        Ok(true) => {}
-        Ok(false) => warn!(
-            timeout = ?CATCHPOINT_EXPORT_SHUTDOWN_TIMEOUT,
-            "shutting down with an automatic catchpoint export still in flight"
-        ),
-        Err(e) => warn!(error = %e, "catchpoint-export shutdown wait task panicked"),
+    } else {
+        warn!("skipping the catchpoint-export shutdown wait: a live catchpoint catchup is still running");
     }
 
     info!("consensus participation stopped");
