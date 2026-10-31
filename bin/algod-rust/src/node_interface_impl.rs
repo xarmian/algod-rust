@@ -1139,6 +1139,25 @@ struct AccountResourceParts {
     created_apps: std::collections::BTreeMap<u64, AppParams>,
 }
 
+/// go's `ledger.LookupAccount`: bring `account` up to the committed tip's
+/// rewards level (`basics.WithUpdatedRewards`) and return the amount BEFORE
+/// the pending rewards (`amount-without-pending-rewards`). The REST layer then
+/// reports `pending-rewards = amount - amount-without-pending-rewards`,
+/// `rewards` and `reward-base` of the updated record (issue #2157). An
+/// overflow is go's `OverflowTracker` panic; here it is an internal error.
+fn apply_pending_rewards(
+    account: &mut AccountData,
+    rewards_level: Option<u64>,
+    method: &str,
+) -> Result<u64, NodeError> {
+    let level = rewards_level
+        .ok_or_else(|| NodeError::Internal(format!("{method}: no rewards level at the tip")))?;
+    let without = account.micro_algos;
+    algo_ledger::rewards::apply_rewards(account, level)
+        .map_err(|e| NodeError::Internal(format!("{method}: {e}")))?;
+    Ok(without)
+}
+
 /// The account row plus its resource maps (held assets, created asset params,
 /// app local states, created app params) read through [`ResourceReads`], so
 /// the read-pool snapshot and the locked ledger answer identically (#2155).
@@ -1762,17 +1781,30 @@ impl NodeInterface for AlgodNodeInterface {
         // accessors need the ledger itself; the scans are bounded by
         // `max_resources` (an over-limit account is not scanned at all).
         let max = self.max_api_resources_per_account_cfg;
-        let (last_round, parts) =
-            match self.pooled_resources(|r| account_resource_parts(r, addr, max)) {
-                Some(v) => v,
-                None => {
-                    let ledger = self.lock_ledger("lookup_account")?;
-                    let last_round = Self::committed_round(&ledger, "lookup_account")?;
-                    (last_round, account_resource_parts(&*ledger, addr, max))
-                }
-            };
+        let (last_round, (level, mut parts)) = match self
+            .pooled_resources(|r| {
+                (
+                    algo_ledger::ResourceReads::committed_rewards_level(r),
+                    account_resource_parts(r, addr, max),
+                )
+            })
+            .filter(|(_, (level, _))| level.is_some())
+        {
+            Some(v) => v,
+            None => {
+                let ledger = self.lock_ledger("lookup_account")?;
+                let last_round = Self::committed_round(&ledger, "lookup_account")?;
+                let level = algo_ledger::ResourceReads::committed_rewards_level(&*ledger);
+                (
+                    last_round,
+                    (level, account_resource_parts(&*ledger, addr, max)),
+                )
+            }
+        };
+        let amount_without_pending_rewards =
+            apply_pending_rewards(&mut parts.account_data, level, "lookup_account")?;
         Ok(AccountLookup {
-            amount_without_pending_rewards: parts.account_data.micro_algos,
+            amount_without_pending_rewards,
             assets: parts.assets,
             created_assets: parts.created_assets,
             app_local_states: parts.app_local_states,
@@ -1786,19 +1818,33 @@ impl NodeInterface for AlgodNodeInterface {
         // "Basic" mode (`exclude=all` on the REST endpoint) skips the
         // potentially-large resource maps — return empty BTreeMaps. The round
         // comes from the same source as `lookup_account`'s (the pool snapshot's
-        // `acctrounds`, else the locked committed round).
-        let (last_round, account_data) = match self.pooled_resources(|r| {
-            algo_ledger::ResourceReads::get_account(r, addr).unwrap_or_default()
-        }) {
+        // `acctrounds`, else the locked committed round). Pending rewards are
+        // applied exactly as in `lookup_account` (go's
+        // `basicAccountInformation` also uses `ledger.LookupAccount`).
+        let (last_round, (level, mut account_data)) = match self
+            .pooled_resources(|r| {
+                (
+                    algo_ledger::ResourceReads::committed_rewards_level(r),
+                    algo_ledger::ResourceReads::get_account(r, addr).unwrap_or_default(),
+                )
+            })
+            .filter(|(_, (level, _))| level.is_some())
+        {
             Some(v) => v,
             None => {
                 let ledger = self.lock_ledger("lookup_account_basic")?;
                 let last_round = Self::committed_round(&ledger, "lookup_account_basic")?;
-                (last_round, ledger.get_account(addr).unwrap_or_default())
+                let level = algo_ledger::ResourceReads::committed_rewards_level(&*ledger);
+                (
+                    last_round,
+                    (level, ledger.get_account(addr).unwrap_or_default()),
+                )
             }
         };
+        let amount_without_pending_rewards =
+            apply_pending_rewards(&mut account_data, level, "lookup_account_basic")?;
         Ok(AccountLookup {
-            amount_without_pending_rewards: account_data.micro_algos,
+            amount_without_pending_rewards,
             assets: Default::default(),
             created_assets: Default::default(),
             app_local_states: Default::default(),
@@ -8730,6 +8776,176 @@ mod tests {
         );
     }
 
+    /// Rewards level of the committed tip in the issue #2157 fixtures.
+    const REWARDS_TIP_LEVEL: u64 = 25;
+
+    /// Issue #2157: a committed round 3 whose header carries a NONZERO rewards
+    /// level (25), with an Online, an Offline and a NotParticipating account
+    /// that all hold 5 Algos at a stale rewards base (10, 100 already earned).
+    fn seed_rewards_accounts(l: &mut SqliteLedger) -> [Address; 3] {
+        let who = [
+            Address([0x51; 32]),
+            Address([0x52; 32]),
+            Address([0x53; 32]),
+        ];
+        let statuses = [
+            algo_types::AccountStatus::Online,
+            algo_types::AccountStatus::Offline,
+            algo_types::AccountStatus::NotParticipating,
+        ];
+        for (addr, status) in who.iter().zip(statuses) {
+            l.set_account(
+                addr,
+                AccountData {
+                    status,
+                    micro_algos: 5_000_000,
+                    rewards_base: 10,
+                    rewarded_micro_algos: 100,
+                    ..Default::default()
+                },
+            );
+        }
+        who
+    }
+
+    fn file_backed_ledger_with_rewards_level(
+    ) -> (tempfile::TempDir, Arc<Mutex<SqliteLedger>>, [Address; 3]) {
+        use algo_codec::{canonical_encode_block_header_from_block, encode_block};
+        let (dir, ledger, _) = file_backed_ledger_with_blocks();
+        let who = {
+            let mut l = ledger.lock().unwrap();
+            let block = Block {
+                round: Round(3),
+                current_protocol: CONSENSUS_V41.to_string(),
+                rewards_level: REWARDS_TIP_LEVEL,
+                ..Block::default()
+            };
+            l.begin_block().unwrap();
+            l.set_current_round(Round(3));
+            l.put_block(
+                3,
+                CONSENSUS_V41,
+                &canonical_encode_block_header_from_block(&block),
+                &encode_block(&block).unwrap(),
+            )
+            .unwrap();
+            l.put_block_cert(3, &[0x80]).unwrap();
+            let who = seed_rewards_accounts(&mut l);
+            l.commit_block().unwrap();
+            who
+        };
+        (dir, ledger, who)
+    }
+
+    /// go's `LookupAccount` (`WithUpdatedRewards` at the tip's level): 5 whole
+    /// Algos * (25 - 10) = 75 pending for Online/Offline, none for
+    /// NotParticipating.
+    fn assert_rewards_applied(lookups: [&AccountLookup; 3]) {
+        for l in &lookups[..2] {
+            assert_eq!(l.amount_without_pending_rewards, 5_000_000);
+            assert_eq!(l.account_data.micro_algos, 5_000_075);
+            assert_eq!(l.account_data.rewarded_micro_algos, 175);
+            assert_eq!(l.account_data.rewards_base, REWARDS_TIP_LEVEL);
+        }
+        let np = lookups[2];
+        assert_eq!(np.amount_without_pending_rewards, 5_000_000);
+        assert_eq!(np.account_data.micro_algos, 5_000_000);
+        assert_eq!(np.account_data.rewarded_micro_algos, 100);
+        assert_eq!(np.account_data.rewards_base, 10);
+    }
+
+    /// Issue #2157 (read-pool path): full and `exclude=all` lookups bring the
+    /// account up to the committed tip's rewards level, as go's
+    /// `ledger.LookupAccount` does.
+    #[tokio::test]
+    async fn lookup_account_applies_pending_rewards_on_the_read_pool_path() {
+        let (_dir, ledger, who) = file_backed_ledger_with_rewards_level();
+        let adapter = make_adapter_with_ledger(ledger);
+        assert!(adapter.read_pool().is_some());
+        let full = [
+            adapter.lookup_account(&who[0]).await.unwrap(),
+            adapter.lookup_account(&who[1]).await.unwrap(),
+            adapter.lookup_account(&who[2]).await.unwrap(),
+        ];
+        assert_rewards_applied([&full[0], &full[1], &full[2]]);
+        let basic = [
+            adapter.lookup_account_basic(&who[0]).await.unwrap(),
+            adapter.lookup_account_basic(&who[1]).await.unwrap(),
+            adapter.lookup_account_basic(&who[2]).await.unwrap(),
+        ];
+        assert_rewards_applied([&basic[0], &basic[1], &basic[2]]);
+        assert_eq!(full[0].last_round, 3);
+    }
+
+    /// Issue #2157 (locked path, in-memory ledger): same answer, level taken
+    /// from the ledger's current rewards level when no header is stored.
+    #[tokio::test]
+    async fn lookup_account_applies_pending_rewards_on_the_locked_path() {
+        let (adapter, ledger) = adapter_with_seedable_ledger();
+        assert!(adapter.read_pool().is_none());
+        let who = {
+            let mut l = ledger.lock().unwrap();
+            l.set_rewards_level(REWARDS_TIP_LEVEL);
+            seed_rewards_accounts(&mut l)
+        };
+        let full = [
+            adapter.lookup_account(&who[0]).await.unwrap(),
+            adapter.lookup_account(&who[1]).await.unwrap(),
+            adapter.lookup_account(&who[2]).await.unwrap(),
+        ];
+        assert_rewards_applied([&full[0], &full[1], &full[2]]);
+        let basic = [
+            adapter.lookup_account_basic(&who[0]).await.unwrap(),
+            adapter.lookup_account_basic(&who[1]).await.unwrap(),
+            adapter.lookup_account_basic(&who[2]).await.unwrap(),
+        ];
+        assert_rewards_applied([&basic[0], &basic[1], &basic[2]]);
+    }
+
+    /// Issue #2157: the values go's `GET /v2/accounts/{a}` reported live for an
+    /// Offline account of the bench corpus at round 2000 (rewards level 862):
+    /// stored amount 990852362144 / rewards 852765144 / base 861 become
+    /// amount 990853352996, pending 990852, rewards 853755996, base 862.
+    #[test]
+    fn apply_pending_rewards_matches_go_live_values() {
+        let mut a = AccountData {
+            micro_algos: 990_852_362_144,
+            rewarded_micro_algos: 852_765_144,
+            rewards_base: 861,
+            ..Default::default()
+        };
+        let without = apply_pending_rewards(&mut a, Some(862), "t").unwrap();
+        assert_eq!(without, 990_852_362_144);
+        assert_eq!(a.micro_algos, 990_853_352_996);
+        assert_eq!(a.micro_algos - without, 990_852);
+        assert_eq!(a.rewarded_micro_algos, 853_755_996);
+        assert_eq!(a.rewards_base, 862);
+        // A rewards base above the level is go's OverflowTracker panic: an error.
+        let mut b = AccountData {
+            micro_algos: 5_000_000,
+            rewards_base: 30,
+            ..Default::default()
+        };
+        assert!(apply_pending_rewards(&mut b, Some(25), "t").is_err());
+        assert!(apply_pending_rewards(&mut b, None, "t").is_err());
+    }
+
+    /// Issue #2157: go reports an absent account as the zero record updated to
+    /// the tip's level (`reward-base` = level, everything else 0).
+    #[tokio::test]
+    async fn lookup_account_of_an_absent_account_reports_the_tip_rewards_base() {
+        let (_dir, ledger, _) = file_backed_ledger_with_rewards_level();
+        let adapter = make_adapter_with_ledger(ledger);
+        let l = adapter.lookup_account(&Address([0x77; 32])).await.unwrap();
+        assert_eq!(l.account_data.micro_algos, 0);
+        assert_eq!(l.account_data.rewards_base, REWARDS_TIP_LEVEL);
+        let b = adapter
+            .lookup_account_basic(&Address([0x77; 32]))
+            .await
+            .unwrap();
+        assert_eq!(b.account_data.rewards_base, REWARDS_TIP_LEVEL);
+    }
+
     /// The round of the full, the `exclude=all` and the locked lookup agree
     /// for the same state (all come from the committed round).
     #[tokio::test]
@@ -8776,6 +8992,9 @@ mod tests {
     }
 
     impl algo_ledger::ResourceReads for ScanCounter {
+        fn committed_rewards_level(&self) -> Option<u64> {
+            Some(0)
+        }
         fn get_account(&self, _: &Address) -> Option<AccountData> {
             self.account.clone()
         }

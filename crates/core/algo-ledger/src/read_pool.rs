@@ -375,6 +375,11 @@ impl LedgerReadPool {
 /// composition over the same SQL and decoders.
 pub trait ResourceReads {
     fn get_account(&self, addr: &Address) -> Option<AccountData>;
+    /// Rewards level of the committed tip (the header at the committed round,
+    /// `acctrounds.acctbase`): the level go's `ledger.LookupAccount` brings an
+    /// account up to (`WithUpdatedRewards`, issue #2157). `None` when it cannot
+    /// be read (the pool caller then takes the locked path).
+    fn committed_rewards_level(&self) -> Option<u64>;
     fn get_asset_holding(&self, addr: &Address, asset_id: u64) -> Option<AssetHolding>;
     fn get_asset_params(&self, asset_id: u64) -> Option<AssetParamsRecord>;
     fn get_app_params(&self, app_id: u64) -> Option<AppParams>;
@@ -398,6 +403,12 @@ pub trait ResourceReads {
 impl<T: LedgerStore + ?Sized> ResourceReads for T {
     fn get_account(&self, addr: &Address) -> Option<AccountData> {
         LedgerStore::get_account(self, addr)
+    }
+    fn committed_rewards_level(&self) -> Option<u64> {
+        // The locked path holds the ledger, so its current rewards level is
+        // the committed tip's header level (the same value the pool reads
+        // from the header at `acctbase`).
+        Some(LedgerStore::rewards_level(self))
     }
     fn get_asset_holding(&self, addr: &Address, asset_id: u64) -> Option<AssetHolding> {
         LedgerStore::get_asset_holding(self, addr, asset_id)
@@ -550,6 +561,18 @@ impl PoolReader<'_> {
 }
 
 impl ResourceReads for PoolReader<'_> {
+    fn committed_rewards_level(&self) -> Option<u64> {
+        let hdr: Vec<u8> = self
+            .ok(self
+                .conn
+                .prepare_cached(
+                    "SELECT hdrdata FROM blockdb.blocks WHERE rnd =                      (SELECT rnd FROM acctrounds WHERE id = 'acctbase')",
+                )
+                .and_then(|mut s| s.query_row([], |row| row.get(0)).optional()))
+            .flatten()?;
+        Some(BlockHeader::decode_from_bytes(&hdr).ok()?.rewards_level)
+    }
+
     fn get_account(&self, addr: &Address) -> Option<AccountData> {
         let data: Vec<u8> = self
             .ok(self
