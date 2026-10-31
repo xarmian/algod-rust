@@ -23,8 +23,10 @@ Where each piece comes from:
   blocks.bin     GET /v2/blocks/{r}?format=msgpack for r in 0..N, the response
                  body verbatim (a msgpack map {"block", "cert"}), the record
                  payload;
-  genesis.json   GET /genesis, verbatim; its hash must equal the endpoint's
-                 genesis-hash (GET /v2/transactions/params);
+  genesis.json   GET /genesis, byte for byte as served; its hash (go's
+                 Genesis.Hash, computed here) must equal the endpoint's
+                 genesis-hash (GET /v2/transactions/params), else nothing is
+                 installed;
   corpus.json    final_state: round, block_hash and txn_counter are attested
                  by the endpoint for round N (GET /v2/blocks/N/hash and
                  GET /v2/blocks/N?header-only=true). total_money,
@@ -41,6 +43,8 @@ and pinned by benchmarks/corpus/testnet-head.ref.
 
 Usage:
   fetch_testnet.py fetch    [--ref FILE] [--endpoint URL] [--rounds N]
+                            (--rounds overrides the ref's range: its final
+                            state and pin then apply only if given explicitly)
                             [--final-state FILE] [--dest DIR] [--force]
                             [--name NAME] [--workers K] [--retries K]
   fetch_testnet.py finalize --corpus DIR --replay-result FILE --out FILE
@@ -51,7 +55,9 @@ Usage:
 Exit codes: 0 ok, 1 verification/usage error, 3 endpoint not reachable.
 """
 import argparse
+import base64
 import concurrent.futures
+import hashlib
 import json
 import os
 import struct
@@ -128,14 +134,120 @@ class Endpoint:
                 last = f"HTTP {e.code}"
             except (urllib.error.URLError, OSError) as e:
                 last = str(e)
-            time.sleep(min(0.5 * 2 ** attempt, 15))
+            if attempt + 1 < self.retries:
+                time.sleep(min(0.5 * 2 ** attempt, 15))
         raise Unreachable(f"GET {url}: {last}")
 
     def json(self, path):
         return json.loads(self.get(path))
 
     def block(self, rnd):
-        return self.get(f"/v2/blocks/{rnd}?format=msgpack")
+        """The block response for `rnd`, checked to be a block response for
+        that round: a 200 with an HTML error page, an empty body or another
+        round's block must never be stored as the corpus."""
+        body = self.get(f"/v2/blocks/{rnd}?format=msgpack")
+        try:
+            got = corpus_tool.block_round(body)
+        except ValueError as e:
+            raise FetchError(f"round {rnd}: the endpoint's reply is not a block "
+                             f"response ({e}; {len(body)} bytes)")
+        if got != rnd:
+            raise FetchError(f"asked for round {rnd}, the endpoint served block {got}")
+        return body
+
+
+def _mp_str(s):
+    b = s.encode("utf-8")
+    if len(b) < 32:
+        return bytes([0xa0 | len(b)]) + b
+    if len(b) < 256:
+        return b"\xd9" + bytes([len(b)]) + b
+    return b"\xda" + len(b).to_bytes(2, "big") + b
+
+
+def _mp_bin(b):
+    if len(b) < 256:
+        return b"\xc4" + bytes([len(b)]) + b
+    return b"\xc5" + len(b).to_bytes(2, "big") + b
+
+
+def _mp_uint(v):
+    if v < 0:
+        raise FetchError("negative integer in a genesis")
+    if v < 128:
+        return bytes([v])
+    for tag, w in ((0xcc, 1), (0xcd, 2), (0xce, 4), (0xcf, 8)):
+        if v < 1 << (8 * w):
+            return bytes([tag]) + v.to_bytes(w, "big")
+    raise FetchError("integer too large")
+
+
+def _mp_len(n, fix, tag16, tag32):
+    if n < 16:
+        return bytes([fix | n])
+    if n < 1 << 16:
+        return bytes([tag16]) + n.to_bytes(2, "big")
+    return bytes([tag32]) + n.to_bytes(4, "big")
+
+
+def _mp_map(fields):
+    """A canonical msgpack map: keys sorted by their bytes."""
+    items = sorted(fields.items(), key=lambda kv: kv[0].encode())
+    return _mp_len(len(items), 0x80, 0xde, 0xdf) + b"".join(
+        _mp_str(k) + v for k, v in items)
+
+
+def _b64_nonzero(s):
+    """The bytes of an optional base64 field, None when absent, empty or all
+    zero (go's omitempty on a fixed-size byte array)."""
+    if not s:
+        return None
+    b = base64.b64decode(s)
+    return b if any(b) else None
+
+
+def _alloc_state(st):
+    f = {}
+    if st.get("algo"):
+        f["algo"] = _mp_uint(st["algo"])
+    if st.get("onl"):
+        f["onl"] = _mp_uint(st["onl"])
+    for k in ("sel", "stprf", "vote"):
+        b = _b64_nonzero(st.get(k))
+        if b is not None:
+            f[k] = _mp_bin(b)
+    for k in ("voteFst", "voteKD", "voteLst"):
+        if st.get(k):
+            f[k] = _mp_uint(st[k])
+    return _mp_map(f)
+
+
+def genesis_hash_b64(raw):
+    """go's `Genesis.Hash()` of a genesis.json, base64: SHA512/256("GE" ||
+    canonical msgpack of the genesis). A port of
+    crates/core/algo-ledger/src/genesis.rs `canonical_encode_genesis` (same
+    omitempty rules: an allocation always carries addr, comment and state)."""
+    g = json.loads(raw)
+    f = {}
+    alloc = g.get("alloc") or []
+    if alloc:
+        f["alloc"] = _mp_len(len(alloc), 0x90, 0xdc, 0xdd) + b"".join(
+            _mp_map({"addr": _mp_str(a["addr"]), "comment": _mp_str(a.get("comment") or ""),
+                     "state": _alloc_state(a.get("state") or {})}) for a in alloc)
+    if g.get("comment"):
+        f["comment"] = _mp_str(g["comment"])
+    if g.get("devmode"):
+        f["devmode"] = b"\xc3"
+    for k in ("fees", "id", "network", "proto", "rwd"):
+        if g.get(k):
+            f[k] = _mp_str(g[k])
+    if g.get("timestamp"):
+        f["timestamp"] = _mp_uint(g["timestamp"])
+    try:
+        h = hashlib.new("sha512_256", b"GE" + _mp_map(f))
+    except ValueError:
+        raise FetchError("this Python's hashlib has no sha512_256")
+    return base64.b64encode(h.digest()).decode()
 
 
 def record(rnd, payload):
@@ -178,8 +290,14 @@ def build_corpus(ep, rounds, dest, name, final_state, workers=16):
     try:
         gen_raw = ep.get("/genesis")
         params = ep.json("/v2/transactions/params")
+        got = genesis_hash_b64(gen_raw)
+        if got != params["genesis-hash"]:
+            raise FetchError(f"the endpoint's /genesis hashes to {got}, but it reports "
+                             f"genesis-hash {params['genesis-hash']}")
+        # Verbatim: benchmarks/corpus/** is `-text` (.gitattributes), so no
+        # checkout rewrites it, and the hash above is of the parsed JSON.
         with open(os.path.join(dest, "genesis.json"), "wb") as f:
-            f.write(gen_raw.replace(b"\r\n", b"\n"))
+            f.write(gen_raw)
         with open(os.path.join(dest, "node-config.json"), "w", encoding="utf-8",
                   newline="\n") as f:
             json.dump(NODE_CONFIG, f, indent="\t")
@@ -227,12 +345,17 @@ def cmd_fetch(args):
     ref = read_ref(args.ref) if os.path.isfile(args.ref) else {}
     endpoint = args.endpoint or os.environ.get("TESTNET_ENDPOINT") or ref.get("endpoint")
     rounds = args.rounds if args.rounds is not None else int(ref.get("rounds", 0))
-    pin = ref.get("manifest_sha256") if args.rounds is None else None
+    # The ref describes one range. `--rounds` selects another, so the ref's
+    # final state and manifest pin (of its range) do not apply to it.
+    overridden = args.rounds is not None
+    pin = None if overridden else ref.get("manifest_sha256")
     if pin is not None and (len(pin) != 64 or not set(pin) <= corpus_tool.HEX_DIGITS):
         pin = None  # not pinned yet (the ref of a range being established)
     # An explicit empty --final-state fetches without one (the first fetch of a
     # range, whose state `finalize` derives).
-    fs_path = args.final_state if args.final_state is not None else ref.get("final_state")
+    fs_path = args.final_state
+    if fs_path is None and not overridden:
+        fs_path = ref.get("final_state")
     if not fs_path:
         pin = None  # a provisional corpus (no final state yet) has no pin either
     if not endpoint:

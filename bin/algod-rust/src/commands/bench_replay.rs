@@ -776,9 +776,33 @@ mod tests {
         }
     }
 
+    /// The one-time signatures (`cert.vote[*].sig.s`) of a record's
+    /// certificate, from the production block-response decoder.
+    fn vote_signatures(payload: &[u8]) -> Vec<Vec<u8>> {
+        fn get<'a>(v: &'a rmpv::Value, key: &str) -> &'a rmpv::Value {
+            v.as_map()
+                .and_then(|m| m.iter().find(|(k, _)| k.as_str() == Some(key)))
+                .map(|(_, v)| v)
+                .unwrap_or_else(|| panic!("no `{key}` in the certificate"))
+        }
+        let resp = algo_codec::decode_block_response(payload).unwrap();
+        let cert = resp.cert.expect("a certificate");
+        get(&cert, "vote")
+            .as_array()
+            .expect("votes")
+            .iter()
+            .map(|vote| match get(get(vote, "sig"), "s") {
+                rmpv::Value::Binary(b) => b.clone(),
+                other => panic!("sig.s is {other:?}"),
+            })
+            .collect()
+    }
+
     /// Flip the last byte of the ephemeral signature (`"s"`, bin8 of 64
-    /// bytes) of the last vote in round `round`'s certificate. The key can
-    /// only be in the certificate: the prefix's blocks hold no transactions.
+    /// bytes) of the last vote in round `round`'s certificate. The key is
+    /// searched only in that record, last occurrence (the certificate follows
+    /// the block), and the decoded certificate before and after must differ
+    /// in that signature's last byte and nowhere else.
     fn corrupt_last_vote_signature(path: &Path, round: u64) {
         let mut bytes = std::fs::read(path).unwrap();
         let (off, len) = corpus::parse_blocks(&bytes)
@@ -792,12 +816,18 @@ mod tests {
                 )
             })
             .expect("round in corpus");
-        let payload = &bytes[off..off + len];
-        let i = payload
+        let before = vote_signatures(&bytes[off..off + len]);
+        let i = bytes[off..off + len]
             .windows(4)
             .rposition(|w| w == [0xa1, b's', 0xc4, 64])
             .expect("a vote signature in the certificate");
         bytes[off + i + 4 + 63] ^= 0x01;
+        let after = vote_signatures(&bytes[off..off + len]);
+        assert!(!before.is_empty());
+        let n = before.len();
+        assert_eq!(before[..n - 1], after[..n - 1], "another vote changed");
+        assert_eq!(before[n - 1][..63], after[n - 1][..63]);
+        assert_eq!(before[n - 1][63] ^ after[n - 1][63], 1);
         std::fs::write(path, &bytes).unwrap();
     }
 

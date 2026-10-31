@@ -300,10 +300,9 @@ func boxKeys(l *data.Ledger, latest basics.Round) ([]string, error) {
 	if err == nil || !errors.As(err, &stale) {
 		return keys, err
 	}
+	// Not a guard on dbRound != 0: a tracker that has committed nothing has
+	// no KV rows either, and every live box is then in the deltas.
 	dbRound := l.LatestTrackerCommitted()
-	if dbRound == 0 {
-		return nil, err // really stale: the tracker has committed nothing
-	}
 	state := map[string]bool{}
 	for r := latest; r > dbRound; r-- {
 		sd, err := l.GetStateDeltaForRound(r)

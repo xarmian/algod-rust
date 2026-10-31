@@ -1,0 +1,8 @@
+# The committed 50-round slice of the `testnet-head` corpus (issue #2119), for
+# tests and CI: benchmarks/corpus/testnet-prefix50 is exactly what
+#   python3 scripts/bench/corpus/fetch_testnet.py fetch --ref benchmarks/corpus/testnet-prefix50.ref --name testnet-prefix50 --dest benchmarks/corpus/testnet-prefix50 --force
+# fetches (same endpoint, rounds 0..50, the go-replayed final state below).
+endpoint=https://testnet-api.algonode.cloud
+rounds=50
+final_state=benchmarks/corpus/testnet-prefix50.final.json
+manifest_sha256=16b0405e294e5c3801b8d300f04de4b21a82449fb462989e3a24377d3395b128

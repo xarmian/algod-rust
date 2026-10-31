@@ -202,8 +202,11 @@ jobs:
             exit 1
           fi
           tail -n 5 "$out/log.txt"
-          # Both sides reject it on their own, at certificate authentication.
-          for want in 'go replay exited 1' 'rust replay exited 1'; do
+          # Both sides reject it on their own, and for the right reason: at
+          # certificate authentication, not for any other failure.
+          for want in 'go replay exited 1' 'did not authenticate block' \
+                      'rust replay exited 1' 'could not authenticate the fetched block' \
+                      'replay stopped at round'; do
             grep -qF "$want" "$out/log.txt" || { echo "::error::vote: failed, but without '$want'"; exit 1; }
           done
       - name: Report to job summary

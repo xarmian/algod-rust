@@ -148,7 +148,6 @@ def gate(runs, full_replay):
 # ---- negative-test corpora ---------------------------------------------------
 
 NOTE_NEEDLE = bytes([0xa4]) + b"note" + bytes([0xc4, 10])
-VOTE_SIG_NEEDLE = bytes([0xa1]) + b"s" + bytes([0xc4, 64])
 
 
 def corrupt_corpus(src, dst, kind):
@@ -157,22 +156,19 @@ def corrupt_corpus(src, dst, kind):
 
       txn       flip the last byte of the first txn note in blocks.bin (the
                 block's payset commitment no longer matches its header);
-      vote      flip the last byte of the last vote signature (msgpack key
-                "s", bin8 of 64 bytes) of the last record's certificate: that
-                certificate no longer authenticates its block;
+      vote      flip one bit of the last byte of the last vote's signature
+                (cert.vote[-1].sig.s, located by parsing the record's msgpack,
+                corpus_tool.corrupt_vote) in the last record: that certificate
+                no longer authenticates its block;
       expected  change corpus.json's expected `accounts_sha256`.
     """
     shutil.copytree(src, dst)
     if kind == "vote":
-        p = os.path.join(dst, "blocks.bin")
-        with open(p, "rb") as f:
-            b = bytearray(f.read())
-        i = b.rfind(VOTE_SIG_NEEDLE)
-        if i < 0:
-            raise TierError("no vote signature in blocks.bin (a DevMode corpus has no votes)")
-        b[i + len(VOTE_SIG_NEEDLE) + 63] ^= 1
-        with open(p, "wb") as f:
-            f.write(b)
+        try:
+            corpus_tool.corrupt_vote(os.path.join(dst, "blocks.bin"))
+        except ValueError as e:
+            raise TierError(f"cannot tamper a vote in blocks.bin: {e} "
+                            "(a DevMode corpus has no votes)")
     elif kind == "txn":
         p = os.path.join(dst, "blocks.bin")
         with open(p, "rb") as f:

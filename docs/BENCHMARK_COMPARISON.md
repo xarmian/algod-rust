@@ -949,11 +949,15 @@ the Rust state against Go's without Go installed. The `algo-bench` test
 - `BENCH_REPLAY_CORRUPT=expected` alters the expected `accounts_sha256`. Both
   replays succeed, and the gate rejects the state.
 - `BENCH_REPLAY_CORRUPT=vote` (corpora with real certificates only, such as
-  `testnet-prefix50`) flips one bit of a vote signature in the last
-  certificate. Both replays stop at that round, at certificate
-  authentication (go: `cert did not authenticate block`; Rust: `replay stopped
-  at round N`). A DevMode corpus has no votes, so the tier refuses to build
-  this corpus from one.
+  `testnet-prefix50`) flips one bit of the last byte of the last vote's
+  signature (`cert.vote[-1].sig.s`) in the last record, located by parsing the
+  record's msgpack (`corpus_tool.corrupt_vote`). Both replays stop at that
+  round, at certificate authentication (go: `cert did not authenticate
+  block`; Rust: `catchup service: periodic sync could not authenticate the
+  fetched block`, then `replay stopped at round N`). A DevMode corpus has no
+  votes, so the tier refuses to build this corpus from one. The Go and Rust
+  tests do the same flip on their side and decode the record before and after
+  to assert that exactly that signature byte changed.
 - In all cases the manifest is re-hashed, so the corpus still verifies.
 - Each must fail the tier. CI runs all three. The Go tests
   `TestCorruptedTxnFailsTheReplay` / `TestWrongExpectedStateExits3` /
@@ -984,11 +988,23 @@ catchup.
 
 | | |
 |---|---|
-| Source | an archival algod, default `https://testnet-api.algonode.cloud` (`endpoint=` in `benchmarks/corpus/testnet-head.ref`, override with `TESTNET_ENDPOINT` or `--endpoint`): `GET /v2/blocks/{r}?format=msgpack` for rounds 0..20000, the response bodies stored unchanged as `ACRPBLK1` records, plus `GET /genesis` |
+| Source | an archival algod, default `https://testnet-api.algonode.cloud` (`endpoint=` in `benchmarks/corpus/testnet-head.ref`, override with `TESTNET_ENDPOINT` or `--endpoint`): `GET /v2/blocks/{r}?format=msgpack` for rounds 0..20000, the response bodies stored unchanged as `ACRPBLK1` records, plus `GET /genesis` stored byte for byte as served (`benchmarks/corpus/**` is `-text`, so no checkout rewrites it) |
+| Checks while fetching | every block body must parse as a msgpack `{block, cert}` response for the requested round (an HTML error page, an empty body or another round's block aborts the fetch); the genesis must hash (go's `Genesis.Hash`, ported from `canonical_encode_genesis`) to the endpoint's `genesis-hash`; the final state must agree with the endpoint's block hash and txn counter. Nothing is installed on any failure |
 | Cost | about 20,000 requests (a few minutes with 16-32 workers) and 258 MB on disk, fetched once. The replay then needs no network. Go replays it in about 40 s and 270 MB RSS on a 24-core Linux box (the vote checks run in parallel) |
 | Cache and pin | `benchmarks/corpus/testnet-head/` (git-ignored). `testnet-head.ref` pins the sha256 of its `MANIFEST.sha256`; a fetch whose bytes differ is discarded, so every run reads identical bytes (two independent fetches gave the same manifest) |
 | Tier | `CORPUS=testnet-head` fetches the corpus when it is missing (exit 3 and a message when the endpoint is unreachable; `BENCH_CORPUS_DIR` then works with a copy) |
-| Committed slice | `benchmarks/corpus/testnet-prefix50/` holds rounds 0..50 (650 kB) with its final state. The default test suites replay it with every certificate authenticated: the Rust tests `testnet_prefix_authenticates_every_certificate` / `testnet_prefix_tampered_vote_fails_authentication`, the Go tests `TestTestnetPrefixAuthenticatesEveryCertificate` / `TestTestnetPrefixTamperedVoteFailsAuthentication`, and CI's `CORPUS=testnet-prefix50` tier run. `testnet-prefix50` is rebuilt with `fetch_testnet.py fetch --rounds 50 --name testnet-prefix50 --dest benchmarks/corpus/testnet-prefix50` |
+| Committed slice | `benchmarks/corpus/testnet-prefix50/` holds rounds 0..50 (650 kB) with its final state. The default test suites replay it with every certificate authenticated: the Rust tests `testnet_prefix_authenticates_every_certificate` / `testnet_prefix_tampered_vote_fails_authentication`, the Go tests `TestTestnetPrefixAuthenticatesEveryCertificate` / `TestTestnetPrefixTamperedVoteFailsAuthentication`, and CI's `CORPUS=testnet-prefix50` tier run. Its own ref, `benchmarks/corpus/testnet-prefix50.ref`, pins its manifest and holds its final state; rebuild it as shown below |
+
+The committed slice is rebuilt, from the same endpoint and byte for byte, with:
+
+```bash
+python3 scripts/bench/corpus/fetch_testnet.py fetch --ref benchmarks/corpus/testnet-prefix50.ref --name testnet-prefix50 --dest benchmarks/corpus/testnet-prefix50 --force
+```
+
+A ref describes one range: `--rounds N` selects another and then ignores the
+ref's `final_state` and `manifest_sha256` (pass `--final-state` to give one).
+`scripts/bench/test_testnet_corpus.py` runs the command above, exactly as
+printed here, against a local mock endpoint.
 
 **Final state.** `corpus.json`'s `final_state` is defined as for the other
 corpora. `round`, `block_hash` and `txn_counter` are the endpoint's
