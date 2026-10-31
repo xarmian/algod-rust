@@ -209,6 +209,9 @@ impl BlockFetcher for CorpusBlockFetcher {
 pub struct CorpusCatchupLedger {
     inner: Arc<AgreementLedgerBridge>,
     devmode: bool,
+    /// The last certificate-authentication failure: the catchup service only
+    /// logs it (as a warning), so the replay keeps it for its own error.
+    last_auth_error: Arc<Mutex<Option<String>>>,
 }
 
 /// The only certificate a DevMode chain has: `{"rnd": r}`.
@@ -239,11 +242,17 @@ impl CatchupLedger for CorpusCatchupLedger {
         self.inner.is_behind_committing_deltas()
     }
     fn authenticate_block(&self, block: &Block, cert: &Certificate) -> Result<(), String> {
-        if self.devmode {
+        let res = if self.devmode {
             check_devmode_certificate(block, cert)
         } else {
             self.inner.authenticate_block(block, cert)
+        };
+        if let Err(e) = &res {
+            if let Ok(mut last) = self.last_auth_error.lock() {
+                *last = Some(format!("round {}: {e}", block.round));
+            }
         }
+        res
     }
     fn apply_stall_retry_in(&self, next_round: Round) -> Option<Duration> {
         self.inner.apply_stall_retry_in(next_round)
@@ -476,6 +485,7 @@ pub fn replay_corpus(args: &ReplayCorpusArgs) -> anyhow::Result<ReplayResult> {
     let before = proc_stats();
     let start = Instant::now();
     let shared = Arc::new(Mutex::new(ledger));
+    let last_auth_error = Arc::new(Mutex::new(None::<String>));
     {
         let bridge = Arc::new(AgreementLedgerBridge::new_with_advancer_and_condvar(
             Arc::clone(&shared),
@@ -485,6 +495,7 @@ pub fn replay_corpus(args: &ReplayCorpusArgs) -> anyhow::Result<ReplayResult> {
         let catchup: Arc<dyn CatchupLedger> = Arc::new(CorpusCatchupLedger {
             inner: bridge,
             devmode: genesis.devmode,
+            last_auth_error: Arc::clone(&last_auth_error),
         });
         let (_stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
         loop {
@@ -498,9 +509,15 @@ pub fn replay_corpus(args: &ReplayCorpusArgs) -> anyhow::Result<ReplayResult> {
                     .last_error()
                     .map(|e| format!("; last fetch error: {e}"))
                     .unwrap_or_default();
+                let auth = last_auth_error
+                    .lock()
+                    .ok()
+                    .and_then(|e| e.clone())
+                    .map(|e| format!("; last authentication error: {e}"))
+                    .unwrap_or_default();
                 bail!(
                     "replay stopped at round {next}: the catchup sync pass ended ({}) \
-                     without committing it{fetch}",
+                     without committing it{fetch}{auth}",
                     exit_reason_str(&reason)
                 );
             }
@@ -871,9 +888,14 @@ mod tests {
             dump_state: None,
         })
         .expect_err("a tampered vote must fail the replay");
+        let msg = err.to_string();
+        assert!(msg.contains("replay stopped at round 30"), "{msg}");
+        // and it says why: the certificate did not authenticate (the votes
+        // are checked in order; the flipped one is the last)
         assert!(
-            err.to_string().contains("replay stopped at round 30"),
-            "{err}"
+            msg.contains("last authentication error: round 30: ")
+                && msg.contains("failed verification"),
+            "{msg}"
         );
     }
 

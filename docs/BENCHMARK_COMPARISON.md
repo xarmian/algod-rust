@@ -953,8 +953,7 @@ the Rust state against Go's without Go installed. The `algo-bench` test
   signature (`cert.vote[-1].sig.s`) in the last record, located by parsing the
   record's msgpack (`corpus_tool.corrupt_vote`). Both replays stop at that
   round, at certificate authentication (go: `cert did not authenticate
-  block`; Rust: `catchup service: periodic sync could not authenticate the
-  fetched block`, then `replay stopped at round N`). A DevMode corpus has no
+  block`; Rust: `replay stopped at round N: ... ; last authentication error: round N: ...`). A DevMode corpus has no
   votes, so the tier refuses to build this corpus from one. The Go and Rust
   tests do the same flip on their side and decode the record before and after
   to assert that exactly that signature byte changed.
