@@ -24,6 +24,8 @@ on:
       - "scripts/test_node_soak_callers.py"
       - "scripts/bench/**"
       - "benchmarks/**"
+      - ".github/workflows/bench-compare.yml"
+      - "docs/BENCHMARK_RESULTS.md"
       - "crates/tools/algo-bench-pairs/src/lib.rs"
   push:
     branches: [main]
@@ -38,6 +40,8 @@ on:
       - "scripts/test_node_soak_callers.py"
       - "scripts/bench/**"
       - "benchmarks/**"
+      - ".github/workflows/bench-compare.yml"
+      - "docs/BENCHMARK_RESULTS.md"
       - "crates/tools/algo-bench-pairs/src/lib.rs"
 
 permissions:
@@ -79,6 +83,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+      - name: Install PyYAML (workflow-interface tests read the workflow files)
+        run: python3 -m pip install --quiet pyyaml
       - name: Harness unit tests
         run: make bench-compare-test
       - name: micro tier pair registry (static checks, issue #2103)
