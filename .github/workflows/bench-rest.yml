@@ -1,0 +1,232 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: Bench REST Smoke
+
+# Issue #2107 (epic #2101): the REST API throughput tier. This is a SMOKE of
+# the tier, not a benchmark: one run, one 1-second step per endpoint at
+# concurrency 4 against go algod and algod-rust serving the same replayed
+# `small` corpus under identical Docker limits. It proves that both nodes come
+# up on one ledger, that the response-equality gate passes (and fails when a
+# response is altered), and that the report carries a Rust/Go ratio for every
+# endpoint. Shared runners are far too noisy for the ratios to mean anything;
+# the real run is a manual `make bench-compare TIERS=rest` on a quiet host
+# (docs/BENCHMARK_COMPARISON.md, "The rest tier").
+
+on:
+  pull_request:
+    paths:
+      - "benchmarks/go-restload/**"
+      - "benchmarks/go-replay/**"
+      - "benchmarks/corpus/small/**"
+      - "scripts/bench/rest_lib.py"
+      - "scripts/bench/test_rest.py"
+      - "scripts/bench/tiers/rest.py"
+      - "scripts/bench/tiers/replay.py"
+      - "scripts/bench/tiers/localnet.py"
+      - "scripts/bench/tiers/selftest.py"
+      - "scripts/bench/tiers/micro*"
+      - "scripts/bench/localnet_lib.py"
+      - "scripts/bench/micro_equiv.py"
+      - "scripts/bench/bench_schema.py"
+      - "scripts/bench/schema/**"
+      - "scripts/bench/corpus/**"
+      - "scripts/bench/fingerprint.py"
+      - "scripts/bench/cargo_artifact.py"
+      - "scripts/bench/run.py"
+      - "scripts/bench/test_run.py"
+      - "scripts/bench/report.py"
+      - "scripts/bench/build_both.sh"
+      - "scripts/bench/go-algorand.pin"
+      - "docker/Dockerfile"
+      - "Makefile"
+      - "Cargo.lock"
+      - "bin/algod-rust/Cargo.toml"
+      - "bin/algod-rust/src/main.rs"
+      - "bin/algod-rust/src/cli.rs"
+      - "bin/algod-rust/src/falcon_backend.rs"
+      - "bin/algod-rust/src/node_interface_impl.rs"
+      - "bin/algod-rust/src/commands/bench_replay.rs"
+      - "bin/algod-rust/src/commands/node.rs"
+      - "bin/algod-rust/src/commands/participate.rs"
+      - "crates/node/algo-rest-api/**"
+      - "crates/node/algo-config/**"
+      - "crates/core/algo-ledger/**"
+      - "crates/core/algo-validate/**"
+      - "crates/core/algo-codec/**"
+      - "crates/core/algo-types/**"
+      - "crates/core/algo-avm/**"
+      - "crates/core/algo-agreement/**"
+      - ".github/workflows/bench-rest.yml"
+  push:
+    branches: [main]
+    paths:
+      - "benchmarks/go-restload/**"
+      - "benchmarks/go-replay/**"
+      - "benchmarks/corpus/small/**"
+      - "scripts/bench/rest_lib.py"
+      - "scripts/bench/test_rest.py"
+      - "scripts/bench/tiers/rest.py"
+      - "scripts/bench/tiers/replay.py"
+      - "scripts/bench/tiers/localnet.py"
+      - "scripts/bench/tiers/selftest.py"
+      - "scripts/bench/tiers/micro*"
+      - "scripts/bench/localnet_lib.py"
+      - "scripts/bench/micro_equiv.py"
+      - "scripts/bench/bench_schema.py"
+      - "scripts/bench/schema/**"
+      - "scripts/bench/corpus/**"
+      - "scripts/bench/fingerprint.py"
+      - "scripts/bench/cargo_artifact.py"
+      - "scripts/bench/run.py"
+      - "scripts/bench/test_run.py"
+      - "scripts/bench/report.py"
+      - "scripts/bench/build_both.sh"
+      - "scripts/bench/go-algorand.pin"
+      - "docker/Dockerfile"
+      - "Makefile"
+      - "Cargo.lock"
+      - "bin/algod-rust/Cargo.toml"
+      - "bin/algod-rust/src/main.rs"
+      - "bin/algod-rust/src/cli.rs"
+      - "bin/algod-rust/src/falcon_backend.rs"
+      - "bin/algod-rust/src/node_interface_impl.rs"
+      - "bin/algod-rust/src/commands/bench_replay.rs"
+      - "bin/algod-rust/src/commands/node.rs"
+      - "bin/algod-rust/src/commands/participate.rs"
+      - "crates/node/algo-rest-api/**"
+      - "crates/node/algo-config/**"
+      - "crates/core/algo-ledger/**"
+      - "crates/core/algo-validate/**"
+      - "crates/core/algo-codec/**"
+      - "crates/core/algo-types/**"
+      - "crates/core/algo-avm/**"
+      - "crates/core/algo-agreement/**"
+      - ".github/workflows/bench-rest.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench-rest:
+    name: rest tier smoke (go algod vs algod-rust, Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v7
+      - name: Locate the go-algorand checkout
+        run: |
+          echo "GO_ALGORAND_DIR=$RUNNER_TEMP/go-algorand" >> "$GITHUB_ENV"
+          echo "BENCH_BIN_DIR=$GITHUB_WORKSPACE/target/bench-compare" >> "$GITHUB_ENV"
+      - name: Resolve the pinned tag and its go.mod
+        id: pin
+        run: |
+          set -euo pipefail
+          tag="$(grep -v '^[[:space:]]*#' scripts/bench/go-algorand.pin | grep -v '^[[:space:]]*$' | head -n1 | tr -d '[:space:]')"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/go-algorand-gomod"
+          # setup-go only parses a file literally named go.mod (else: plain version file).
+          curl -fsSL "https://raw.githubusercontent.com/algorand/go-algorand/${tag}/go.mod" \
+            -o "$RUNNER_TEMP/go-algorand-gomod/go.mod"
+          grep -E '^(go|toolchain) ' "$RUNNER_TEMP/go-algorand-gomod/go.mod"
+      - name: Install Go per go-algorand's go.mod
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: ${{ runner.temp }}/go-algorand-gomod/go.mod
+          cache-dependency-path: benchmarks/go-replay/go.sum
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-rest
+      - name: Install libsodium build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends autoconf automake libtool build-essential
+      - name: Clone pinned go-algorand + make libsodium
+        env:
+          TAG: ${{ steps.pin.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 --branch "$TAG" https://github.com/algorand/go-algorand "$GO_ALGORAND_DIR"
+          make -C "$GO_ALGORAND_DIR" libsodium
+      - name: Unit tests (gate, allowlist, request set, container shape, rows)
+        run: python3 -m unittest -v scripts/bench/test_rest.py scripts/bench/test_run.py
+      - name: Go load generator - gofmt, vet, tests
+        run: |
+          set -euo pipefail
+          cd benchmarks/go-restload
+          unformatted="$(gofmt -l .)"
+          [ -z "$unformatted" ] || { echo "::error::gofmt needed: $unformatted"; exit 1; }
+          go vet ./...
+          go test -count=1 -v ./...
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Build the algod-rust node image (layer-cached)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: runtime
+          tags: algod-rust:bench-rest
+          load: true
+          cache-from: type=gha,scope=bench-rest
+          cache-to: type=gha,mode=max,scope=bench-rest
+      - name: make bench-compare TIERS=rest (smoke profile)
+        env:
+          BENCH_REST_PROFILE: smoke
+          BENCH_REST_CPUS: "1"
+          BENCH_REST_MEM: 2g
+          BENCH_REST_RUST_IMAGE: algod-rust:bench-rest
+        run: |
+          set -euo pipefail
+          make bench-compare TIERS=rest CORPUS=small RUNS=1 BENCH_RUN_DIR=bench-results/ci-rest \
+            GO_ALGORAND_DIR="$GO_ALGORAND_DIR"
+          # The gate passed (the tier exited 0) and every endpoint has a Rust/Go ratio.
+          python3 scripts/bench/tiers/rest.py --check-report bench-results/ci-rest/report.json
+      - name: Negative test - an altered response fails the equality gate
+        env:
+          BENCH_REST_PROFILE: smoke
+          BENCH_REST_CPUS: "1"
+          BENCH_REST_MEM: 2g
+          BENCH_REST_RUST_IMAGE: algod-rust:bench-rest
+        run: |
+          set -euo pipefail
+          # blocks_json has no allowlisted difference; blocks_msgpack does
+          # (#2159), so its corruption must land outside the excused path.
+          for ep in blocks_json blocks_msgpack; do
+            out="$RUNNER_TEMP/neg-rest-$ep"
+            mkdir -p "$out"
+            if BENCH_REST_CORRUPT="$ep" BENCH_RUNS=1 BENCH_OUT="$out"                  BENCH_RUST_BIN_DIR="$BENCH_BIN_DIR/rust" BENCH_GO_ALGORAND_DIR="$GO_ALGORAND_DIR"                  python3 scripts/bench/tiers/rest.py > "$out/log.txt" 2>&1; then
+              cat "$out/log.txt"
+              echo "::error::the rest tier passed with an altered $ep response"
+              exit 1
+            fi
+            tail -n 8 "$out/log.txt"
+            # It must fail at the gate, for that endpoint, before any load step.
+            for want in 'response-equality gate FAILED (before load)' "$ep"; do
+              grep -qF "$want" "$out/log.txt" || { echo "::error::$ep: failed, but without '$want'"; exit 1; }
+            done
+            if grep -qF ' req/s ' "$out/log.txt"; then
+              echo "::error::a load step ran although the gate failed"; exit 1
+            fi
+            echo "altered $ep response: the tier failed at the gate, as it must"
+          done
+      - name: Report to job summary
+        if: always()
+        run: |
+          if [ -s bench-results/ci-rest/report.md ]; then
+            cat bench-results/ci-rest/report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload run directory
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-rest-results
+          path: bench-results/ci-rest
+          if-no-files-found: ignore

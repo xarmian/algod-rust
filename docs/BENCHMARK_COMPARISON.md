@@ -31,6 +31,7 @@ make bench-compare TIERS=selftest RUNS=5
 - [Workload corpus](#workload-corpus)
 - [The `replay` tier](#the-replay-tier)
 - [The `localnet` tier](#the-localnet-tier)
+- [The `rest` tier](#the-rest-tier)
 
 ## Quick start
 
@@ -345,7 +346,7 @@ whenever `build_both.sh` or the pin file changes. It asserts
 | `micro` | available (#2103) | Paired Go `testing.B` / Rust criterion micro-benchmarks on identical fixture bytes: codec, crypto, commitments, AVM, agreement. See [The `micro` tier](#the-micro-tier). |
 | `replay` | available (#2105) | Offline ledger replay of the deterministic block corpus (#2104) through go-algorand's ledger and algod-rust's production catchup path, with a final-state equality gate. See [The `replay` tier](#the-replay-tier). |
 | `localnet` | available (#2106) | All-Go vs all-Rust homogeneous localnet throughput and latency under the same load, with a same-txid-set gate. See [The `localnet` tier](#the-localnet-tier). |
-| `rest` | planned (#2107) | REST API throughput against identical ledger state. |
+| `rest` | available (#2107) | REST API throughput and latency against identical ledger state, with a response-equality gate. See [The `rest` tier](#the-rest-tier). |
 | `catchup` | planned (#2108) | Public-network fast catchup and follow. |
 
 The CI workflow and the published baseline (`docs/BENCHMARK_RESULTS.md`)
@@ -1276,4 +1277,217 @@ BENCH_LOCALNET_CPUS=2 make bench-compare TIERS=localnet RUNS=3
 algod-rust loadgen gen-accounts --deterministic --count 16 --out keys.json
 algod-rust loadgen run --algod-urls http://127.0.0.1:4300 --keys keys.json \
   --fixed-count 200 --target-tps 100 --duration-secs 120 --txids-out txids.txt
+```
+
+## The `rest` tier
+
+`make bench-compare TIERS=rest` compares the REST API of go-algorand's `algod`
+(pinned tag) and `algod-rust` while both serve the **same ledger**, behind a
+response-equality gate (issue #2107, epic #2101). REST is what wallets,
+indexers and dApps actually hit, and it was never compared before.
+
+### What each side runs
+
+1. **One ledger.** Both implementations replay the same corpus into a data
+   directory each, exactly as the [`replay` tier](#the-replay-tier) does
+   (`benchmarks/go-replay`; `algod-rust bench replay-corpus`), and the tier
+   stops unless both reach the corpus's final state. Default corpus `small`
+   (a DevMode chain of 2000 blocks with payments, assets, applications, boxes
+   and inner transactions; `BENCH_CORPUS` / `BENCH_CORPUS_DIR` as for replay).
+2. **Two nodes, identical limits.** Each data directory is served by one
+   Docker container with the same `--cpus`, `--memory` and `--memory-swap`
+   (`BENCH_REST_CPUS` / `BENCH_REST_MEM`, default 2 CPUs and 3 GB), the same
+   published loopback port layout and the ledger as the only mount: go
+   `algod -d /data`, `algod-rust node start -d /data`. The images are the same
+   as the `localnet` tier's (`BENCH_REST_GO_IMAGE`, default
+   `algorand/algod:<pinned tag>`; `BENCH_REST_RUST_IMAGE`, default
+   `docker/Dockerfile`'s `runtime` target). The tier needs a Linux host with
+   Docker (it replays natively and bind-mounts the result).
+
+   The mount is **read-write** and the files are made world-writable
+   (`make_writable`, mode 777/666): both nodes open their SQLite ledgers in WAL
+   mode and write next to them, and the container user (uid 1001 for go) is not
+   the host user. This is accepted because nothing here changes ledger
+   state: the tier submits no transaction (simulate does not commit), no block
+   is produced (no peers, a DevMode genesis), and every tier run replays into a
+   fresh temporary directory that is removed afterwards, so one run cannot
+   leak state into the next. The gate's second pass (after the load) would
+   catch a node that changed its answers anyway.
+3. **One request set**, sent to both (`rest_lib.request_set`): `status`
+   (`/v2/status`), `account_hot` and `account_cold` (`/v2/accounts/{addr}`: the
+   largest and the smallest account document of the genesis accounts, ties by
+   address), `account_assets` (`/v2/accounts/{hot}/assets`), `application`
+   (`/v2/applications/{id}`), `box` (`/v2/applications/{id}/box?name=...`),
+   `blocks_json` and `blocks_msgpack` (`/v2/blocks/{last}` as JSON and
+   `?format=msgpack`), `tx_params` (`/v2/transactions/params`) and `simulate`
+   (`POST /v2/transactions/simulate`, one unsigned 1-microAlgo payment with
+   `allow-empty-signatures`, built from `tx_params` only, so both nodes get
+   identical bytes). The application is the newest one holding a box. The
+   facts the set needs are discovered from the go node, deterministically.
+4. **One load generator.** `benchmarks/go-restload` (`restload`, standard
+   library only, MIT) drives both nodes: closed-loop workers at a fixed
+   concurrency, HTTP keep-alive, no compression, one endpoint at a time.
+
+### The response-equality gate
+
+Before any load, every request's response from both nodes is compared:
+status code, media type (parameters ignored) and body. JSON bodies are parsed
+(exact integers, key order irrelevant) and compared field by field after the
+volatile fields below are dropped; msgpack bodies are compared byte for byte.
+**Any other difference fails the tier**, naming the endpoint, the request and
+the field (`go ... != rust ...`, `only in go`). The same gate runs again after
+the load, so a node that breaks under load is caught too. The gate's negative
+test is `BENCH_REST_CORRUPT=<endpoint>`: one field of that endpoint's Rust
+response is altered before the comparison, chosen so that it is **not** covered
+by the endpoint's allowlist entries (leaves are tried in a fixed order until one
+makes the gate fail), and the tier must fail. This works for every endpoint,
+allowlisted ones included (`rest_lib.corrupt_response`; unit-tested for each
+endpoint shape, and CI runs it on `blocks_json` and on the allowlisted
+`blocks_msgpack`).
+
+#### Volatile fields (excluded from the comparison)
+
+These depend on wall-clock time or on the node's own history, not on ledger
+state, so two nodes serving the same ledger legitimately differ. Each is listed
+in `rest_lib.VOLATILE` with its reason, and a unit test fails if one is added
+there without being documented here.
+
+| Endpoint | Field | Why it differs |
+|---|---|---|
+| `status` | `time-since-last-round` | nanoseconds since the node last advanced a round; depends on when each node is queried |
+| `status` | `catchup-time` | nanoseconds the node has spent catching up; the node's own history, not ledger state |
+
+Everything else is compared, including `last-round`, the consensus version, the
+genesis fields and every account / application / box / block field.
+
+#### Known differences (issue-linked allowlist)
+
+The first runs of the gate found real differences between the two nodes. They
+are bugs (or divergences to be registered), not volatile fields, so each one is
+tracked by an issue and is kept out of the gate only through
+`rest_lib.KNOWN_DIFFERENCES`, an explicit list of `(endpoint, path, issue,
+reason)` entries scoped to the corpus they were found on. An entry excuses
+exactly **one** difference: the one at exactly its path (a prefix does not
+cover what is below it) and of its kind: `only-go` (algod-rust lacks the key
+go has; if both sides have a value they must be equal), `only-rust` (go lacks
+the key; the entry can pin the value, e.g. the block certificate's `step: 2`)
+or `value` (both have a value and they differ). Msgpack bodies are decoded and
+compared structurally (so the certificate difference is excused by its exact
+field, `cert.step`, and any other difference in the block still fails), and a
+msgpack body that decodes to the same value with different bytes is a
+difference too. A stale entry (one that no longer matches any difference)
+**fails the gate**, so fixing an issue forces its entry to be removed; an entry
+without an issue number is refused. The table below is generated from
+`rest_lib.KNOWN_DIFFERENCES` and a unit test keeps the two identical.
+The number of allowlisted differences is recorded in every row's metadata
+(`allowlisted_differences`).
+
+<!-- known-differences:start -->
+| Endpoint | Path | Kind | Issue | Reason |
+|---|---|---|---|---|
+| `account_hot` | `assets` | only-go | [#2155](https://github.com/xarmian/algod-rust/issues/2155) | resources missing on the read-pool lookup |
+| `account_hot` | `created-apps` | only-go | [#2155](https://github.com/xarmian/algod-rust/issues/2155) | resources missing on the read-pool lookup |
+| `account_hot` | `created-assets` | only-go | [#2155](https://github.com/xarmian/algod-rust/issues/2155) | resources missing on the read-pool lookup |
+| `account_hot` | `apps-local-state` | only-go | [#2156](https://github.com/xarmian/algod-rust/issues/2156) | empty array omitted |
+| `account_cold` | `apps-local-state` | only-go | [#2156](https://github.com/xarmian/algod-rust/issues/2156) | empty array omitted |
+| `account_cold` | `apps-total-schema` | only-go | [#2156](https://github.com/xarmian/algod-rust/issues/2156) | zero schema omitted |
+| `account_cold` | `assets` | only-go | [#2156](https://github.com/xarmian/algod-rust/issues/2156) | empty array omitted |
+| `account_cold` | `created-apps` | only-go | [#2156](https://github.com/xarmian/algod-rust/issues/2156) | empty array omitted |
+| `account_cold` | `created-assets` | only-go | [#2156](https://github.com/xarmian/algod-rust/issues/2156) | empty array omitted |
+| `account_cold` | `reward-base` | only-go | [#2156](https://github.com/xarmian/algod-rust/issues/2156) | zero reward-base omitted |
+| `account_hot` | `amount` | value | [#2157](https://github.com/xarmian/algod-rust/issues/2157) | pending rewards not applied |
+| `account_hot` | `pending-rewards` | value | [#2157](https://github.com/xarmian/algod-rust/issues/2157) | pending rewards not applied |
+| `account_hot` | `rewards` | value | [#2157](https://github.com/xarmian/algod-rust/issues/2157) | pending rewards not applied |
+| `account_hot` | `reward-base` | value | [#2157](https://github.com/xarmian/algod-rust/issues/2157) | pending rewards not applied |
+| `tx_params` | `fee` | value | [#2158](https://github.com/xarmian/algod-rust/issues/2158) | fee reports min-fee, go reports the pool fee per byte |
+| `blocks_msgpack` | `cert.step` | only-rust | [#2159](https://github.com/xarmian/algod-rust/issues/2159) | cert re-encoded with step=2 |
+| `simulate` | `txn-groups.0.txn-results.0.txn-result.txn.txn.gh` | value | [#2160](https://github.com/xarmian/algod-rust/issues/2160) | gh rendered as an integer array |
+| `simulate` | `txn-groups.0.txn-results.0.txn-result.sender-rewards` | only-go | [#2161](https://github.com/xarmian/algod-rust/issues/2161) | sender-rewards omitted |
+<!-- known-differences:end -->
+
+While those are open, the throughput rows for `account_hot`, `account_cold`,
+`blocks_msgpack`, `tx_params` and `simulate` compare two nodes that do not yet
+return the same answer (algod-rust returns less data for the account
+endpoints), so read them with the table above in mind.
+
+### What is measured
+
+For every endpoint and every concurrency level (`BENCH_REST_CONCURRENCY`,
+default `1,16,64`; `smoke`: `4`), per repeat, with `BENCH_REST_DURATION`
+measured seconds (default 5) after `BENCH_REST_WARMUP` discarded ones
+(default 1): schema-v1 rows named `<endpoint>/c<N>/<metric>`:
+
+| Metric | Unit | Meaning |
+|---|---|---|
+| `rps` | req/s | **successful** (2xx) requests per second |
+| `p50_ms`, `p95_ms`, `p99_ms` | ms | nearest-rank percentiles of the latency of the successful requests |
+| `error_rate` | ratio | (transport errors + non-2xx) / attempted requests |
+| `cpu_cores` | cores | the container's mean CPU over the window (`docker stats`) |
+| `rss_mb` | MB | the container's peak RSS over the window (`docker stats`) |
+
+One sample per repeat (`RUNS`); the report adds the median, the confidence
+interval and the Rust/Go ratio. Go and Rust alternate who goes first in every
+repeat. `cpu_cores` / `rss_mb` come from `docker stats --no-stream` samples. Each call
+takes 1-2 s and reports the interval it spans, so only samples whose **whole
+call** lies inside the measured window, the one `restload` reports for its
+measured step after the warm-up, are used (samples straddling the start or the
+end are dropped); a short step (the 1-second smoke step) therefore often has
+none and those rows are then absent. Use a duration of 5 s or more for
+resource rows.
+A zero baseline (`error_rate` 0) has no ratio. Failed requests never enter
+`rps` or the percentiles (a fast 500 would otherwise look like throughput), and a
+node whose error rate exceeds `BENCH_REST_MAX_ERROR_RATE` (default 0.01) for any
+endpoint **fails the tier** instead of publishing its numbers. The measured
+duration must be at least 0.1 s and is passed to the load generator in fixed
+point (`0.500s`).
+
+The `simulate` request is sent from the richest genesis account that is neither
+the RewardsPool nor the FeeSink, and the tier checks that the simulation
+succeeded (no `failure-message`, no `pool-error`), so that row measures a real
+simulation.
+
+### Limits of the numbers
+
+- Both nodes read a **quiescent** ledger: no gossip, no block production, a
+  DevMode genesis. This measures the API and its storage reads, not a node
+  under consensus load (that is the `localnet` tier).
+- The client, the Docker bridge and the host kernel are shared and identical
+  for both sides, but they are inside the numbers: for the cheapest endpoints
+  (a few hundred bytes) the loopback port forward dominates both sides and the
+  ratio is compressed towards 1. Use the `c64` rows and the heavier endpoints
+  (`blocks_json`, `simulate`) to see implementation differences.
+- The ledgers are the same by construction (the replay gate), but each is the
+  product of its own implementation's database layout, so cache behaviour
+  differs legitimately.
+
+### Leftovers and cleanup
+
+Every container the tier starts carries the label `bench-rest=1`, and each run
+first removes containers with that label left behind by a killed run (they would
+hold the fixed REST ports, `BENCH_REST_PORT_BASE`); nothing else is touched. At
+the end the root-owned ledger files are removed with `find -delete` in a
+throw-away container of the (already local) go image: nothing is pulled during
+cleanup, and a tree that cannot be removed is named in a warning. A failing
+`docker stats` is retried with a back-off and, after 20 failures in a row, the
+resource rows are skipped with a warning instead of failing the run.
+
+### CI
+
+`.github/workflows/bench-rest.yml` runs the unit tests (`scripts/bench/test_rest.py`,
+the Go load generator's tests) and a **smoke** of the tier
+(`BENCH_REST_PROFILE=smoke`: one 1-second step per endpoint at concurrency 4,
+one run). It asserts that the gate passed, that the report carries a Rust/Go
+ratio for `rps`, and that the gate's negative test (`BENCH_REST_CORRUPT`) fails
+the tier. It checks that the tier works; it is not a benchmark.
+
+### Running it by hand
+
+```bash
+# 3 runs of the full ladder, on a quiet Linux host with docker
+make bench-compare TIERS=rest RUNS=3
+# one concurrency level, longer steps, a bigger limit
+BENCH_REST_CONCURRENCY=16 BENCH_REST_DURATION=10 BENCH_REST_CPUS=4 \
+  make bench-compare TIERS=rest RUNS=3
+# the negative test: this must fail at the response-equality gate
+BENCH_REST_PROFILE=smoke BENCH_REST_CORRUPT=blocks_json make bench-compare TIERS=rest RUNS=1
 ```

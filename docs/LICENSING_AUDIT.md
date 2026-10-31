@@ -153,6 +153,7 @@ not import go-algorand itself and does not port node logic — see the
 | `benchmarks/go-micro/*` | (a) AGPL | Go half of the paired micro-benchmarks (#2103): `testing.B` benchmarks and fixture/digest generators that import go-algorand packages directly (and an in-memory `logic.LedgerForLogic` modelled on go-algorand's test ledger). |
 | `benchmarks/go-corpus/*` | (a) AGPL | The workload-corpus generator `corpusgen` (#2104): links go-algorand to build the genesis, assemble TEAL, build/sign transactions and decode blocks with go-algorand's own types and codec. |
 | `benchmarks/go-replay/*` | (a) AGPL, with MIT-eligible files | The ledger-replay harness `goreplay` (#2105): links go-algorand's `data.Ledger` and mirrors `catchup/service.go` `fetchAndWrite` (`main.go`, `state.go`, `replay_test.go`, AGPL headers). `procstats_linux.go` / `procstats_other.go` only read `/proc` and `getrusage`, embed no go-algorand logic, and carry MIT headers. |
+| `benchmarks/go-restload/*` | (b) MIT | The REST load generator `restload` (#2107): standard-library-only closed-loop HTTP client and percentile summary, original tooling with no go-algorand code or protocol logic (`main.go`, `main_test.go`, MIT headers). |
 | `benchmarks/corpus/*`, `benchmarks/fixtures/*`, `benchmarks/pairs.toml` | data, no header | Recorded go-algorand output (blocks, genesis, consensus params) and registry/coverage data. JSON/binary data cannot carry a header; they are covered by the repository license like any other data file. |
 
 ## `tests/*`, `scripts/*` (repo-root)
