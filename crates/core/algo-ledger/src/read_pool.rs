@@ -381,6 +381,7 @@ pub trait ResourceReads {
     fn get_app_local_state(&self, addr: &Address, app_id: u64) -> Option<AppLocalState>;
     fn app_local_states_for_addr(&self, addr: &Address) -> Vec<(u64, AppLocalState)>;
     fn asset_holdings_for_addr(&self, addr: &Address) -> Vec<(u64, AssetHolding)>;
+    fn created_assets_for_addr(&self, addr: &Address) -> Vec<(u64, AssetParamsRecord)>;
     fn created_apps_for_addr(&self, addr: &Address) -> Vec<(u64, AppParams)>;
     fn get_box(&self, app_id: u64, key: &[u8]) -> Option<Vec<u8>>;
     fn box_keys_for_app(&self, app_id: u64) -> Vec<Vec<u8>>;
@@ -415,6 +416,9 @@ impl<T: LedgerStore + ?Sized> ResourceReads for T {
     }
     fn asset_holdings_for_addr(&self, addr: &Address) -> Vec<(u64, AssetHolding)> {
         LedgerStore::asset_holdings_for_addr(self, addr)
+    }
+    fn created_assets_for_addr(&self, addr: &Address) -> Vec<(u64, AssetParamsRecord)> {
+        LedgerStore::created_assets_for_addr(self, addr)
     }
     fn created_apps_for_addr(&self, addr: &Address) -> Vec<(u64, AppParams)> {
         LedgerStore::created_apps_for_addr(self, addr)
@@ -603,6 +607,25 @@ impl ResourceReads for PoolReader<'_> {
                     return None;
                 }
                 Some((aidx, decode_asset_holding(&data).ok()?))
+            })
+            .collect()
+    }
+
+    fn created_assets_for_addr(&self, addr: &Address) -> Vec<(u64, AssetParamsRecord)> {
+        self.resource_rows(addr, CTYPE_ASSET)
+            .into_iter()
+            .filter_map(|(aidx, data)| {
+                if !inspect_resource_blob(&data).has_ownership {
+                    return None;
+                }
+                let params = decode_asset_params(&data).ok()?;
+                Some((
+                    aidx,
+                    AssetParamsRecord {
+                        params,
+                        creator: *addr,
+                    },
+                ))
             })
             .collect()
     }

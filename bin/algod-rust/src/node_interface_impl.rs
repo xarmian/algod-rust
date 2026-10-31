@@ -1149,6 +1149,32 @@ fn app_resource_parts<R: algo_ledger::ResourceReads + ?Sized>(
     (app_local_state, app_params)
 }
 
+/// The account row plus its resource maps (held assets, created asset params,
+/// app local states, created app params) read through [`ResourceReads`], so
+/// the read-pool snapshot and the locked ledger answer identically (#2155).
+#[allow(clippy::type_complexity)]
+fn account_resource_parts<R: algo_ledger::ResourceReads + ?Sized>(
+    r: &R,
+    addr: &Address,
+) -> (
+    AccountData,
+    std::collections::BTreeMap<u64, AssetHolding>,
+    std::collections::BTreeMap<u64, AssetParams>,
+    std::collections::BTreeMap<u64, AppLocalState>,
+    std::collections::BTreeMap<u64, AppParams>,
+) {
+    (
+        r.get_account(addr).unwrap_or_default(),
+        r.asset_holdings_for_addr(addr).into_iter().collect(),
+        r.created_assets_for_addr(addr)
+            .into_iter()
+            .map(|(id, rec)| (id, rec.params))
+            .collect(),
+        r.app_local_states_for_addr(addr).into_iter().collect(),
+        r.created_apps_for_addr(addr).into_iter().collect(),
+    )
+}
+
 /// Mirrors handlers.go:1138 AccountAssetsInformation / ledger.LookupAssets:
 /// the account's asset *holdings* with AssetID > `asset_id_gt`, ascending,
 /// capped at `limit`. For each holding, Go's `LookupLimitedResources` LEFT
@@ -1716,16 +1742,27 @@ impl NodeInterface for AlgodNodeInterface {
     // ---- Account state ----
 
     async fn lookup_account(&self, addr: &Address) -> Result<AccountLookup, NodeError> {
-        let (last_round, account_data) = self.read_account_snapshot(addr)?;
-        // `AccountData` already carries the four resource maps alongside the
-        // core fields — clone them into the lookup result rather than
-        // re-querying per-resource accessors.
+        // Issue #2155: `AccountData` decoded from `accountbase` carries NO
+        // resources (they live in the `resources` table), so the held assets,
+        // created assets/apps and app local states are composed from the
+        // resource accessors, as go's `AccountDataToAccount` lists them. One
+        // read-pool snapshot (#1764/#1893) with the committed round, else the
+        // locked ledger -- the same composition on the same SQL either way.
+        let (last_round, parts) = match self.pooled_resources(|r| account_resource_parts(r, addr)) {
+            Some(v) => v,
+            None => {
+                let ledger = self.lock_ledger("lookup_account")?;
+                let last_round = Self::committed_round(&ledger, "lookup_account")?;
+                (last_round, account_resource_parts(&*ledger, addr))
+            }
+        };
+        let (account_data, assets, created_assets, app_local_states, created_apps) = parts;
         Ok(AccountLookup {
             amount_without_pending_rewards: account_data.micro_algos,
-            assets: account_data.assets.clone(),
-            created_assets: account_data.asset_params.clone(),
-            app_local_states: account_data.app_local_states.clone(),
-            created_apps: account_data.app_params.clone(),
+            assets,
+            created_assets,
+            app_local_states,
+            created_apps,
             account_data,
             last_round,
         })
@@ -8503,5 +8540,141 @@ mod tests {
             777
         );
         ledger.lock().unwrap().rollback_block().unwrap();
+    }
+
+    /// Issue #2155: seed `who` (an existing account) with one asset holding,
+    /// one created asset, one created app and one app local state.
+    fn seed_account_resources(l: &mut SqliteLedger, who: &Address) {
+        let other = Address([0x44; 32]);
+        l.set_account(
+            who,
+            AccountData {
+                micro_algos: 777,
+                total_assets_opted_in: 1,
+                total_created_assets: 1,
+                total_apps_opted_in: 1,
+                total_created_apps: 1,
+                ..Default::default()
+            },
+        );
+        l.set_account(&other, AccountData::default());
+        // Held (created by someone else), created asset, created app, local state.
+        l.set_asset_params(
+            7,
+            AssetParamsRecord {
+                params: asset_params_named("HELD", 5),
+                creator: other,
+            },
+        );
+        l.set_asset_holding(
+            who,
+            7,
+            AssetHolding {
+                amount: 3,
+                frozen: true,
+            },
+        );
+        l.set_asset_params(
+            8,
+            AssetParamsRecord {
+                params: asset_params_named("MINE", 9),
+                creator: *who,
+            },
+        );
+        // The creator holds its own asset, as on a real chain.
+        l.set_asset_holding(
+            who,
+            8,
+            AssetHolding {
+                amount: 9,
+                frozen: false,
+            },
+        );
+        l.set_app_params(9, app_params(*who));
+        l.set_app_params(10, app_params(other));
+        l.set_app_local_state(
+            who,
+            10,
+            AppLocalState {
+                schema: StateSchema::default(),
+                key_value: Default::default(),
+            },
+        );
+    }
+
+    fn assert_account_lookup_has_resources(lookup: &AccountLookup) {
+        assert_eq!(lookup.account_data.micro_algos, 777);
+        assert_eq!(
+            lookup
+                .assets
+                .iter()
+                .map(|(k, v)| (*k, v.amount, v.frozen))
+                .collect::<Vec<_>>(),
+            vec![(7, 3, true), (8, 9, false)]
+        );
+        assert_eq!(
+            lookup.created_assets.keys().copied().collect::<Vec<_>>(),
+            vec![8]
+        );
+        assert_eq!(lookup.created_assets[&8].total, 9);
+        assert_eq!(
+            lookup.created_apps.keys().copied().collect::<Vec<_>>(),
+            vec![9]
+        );
+        assert_eq!(
+            lookup.app_local_states.keys().copied().collect::<Vec<_>>(),
+            vec![10]
+        );
+    }
+
+    /// Issue #2155 (lock-free read-pool path): `GET /v2/accounts/{a}`'s lookup
+    /// lists the held assets, created assets, created apps and app local
+    /// states, as go's `AccountDataToAccount` does.
+    #[tokio::test]
+    async fn lookup_account_lists_resources_on_the_read_pool_path() {
+        let (_dir, ledger, who) = file_backed_ledger_with_blocks();
+        let adapter = make_adapter_with_ledger(ledger.clone());
+        assert!(
+            adapter.read_pool().is_some(),
+            "file-backed ledger has a pool"
+        );
+        {
+            use algo_codec::{canonical_encode_block_header_from_block, encode_block};
+            let mut l = ledger.lock().unwrap();
+            let block = Block {
+                round: Round(3),
+                current_protocol: CONSENSUS_V41.to_string(),
+                ..Block::default()
+            };
+            l.begin_block().unwrap();
+            l.set_current_round(Round(3));
+            l.put_block(
+                3,
+                CONSENSUS_V41,
+                &canonical_encode_block_header_from_block(&block),
+                &encode_block(&block).unwrap(),
+            )
+            .unwrap();
+            l.put_block_cert(3, &[0x80]).unwrap();
+            seed_account_resources(&mut l, &who);
+            l.commit_block().unwrap();
+        }
+        let lookup = adapter.lookup_account(&who).await.unwrap();
+        assert_eq!(lookup.last_round, 3);
+        assert_account_lookup_has_resources(&lookup);
+        // `exclude=all` stays resource-free.
+        let basic = adapter.lookup_account_basic(&who).await.unwrap();
+        assert!(basic.assets.is_empty() && basic.created_apps.is_empty());
+    }
+
+    /// Issue #2155 (locked path, in-memory ledger without a read pool): the
+    /// same lookup, the same answer.
+    #[tokio::test]
+    async fn lookup_account_lists_resources_on_the_locked_path() {
+        let (adapter, ledger) = adapter_with_seedable_ledger();
+        assert!(adapter.read_pool().is_none());
+        let who = Address([0x33; 32]);
+        seed_account_resources(&mut ledger.lock().unwrap(), &who);
+        assert_account_lookup_has_resources(&adapter.lookup_account(&who).await.unwrap());
     }
 }

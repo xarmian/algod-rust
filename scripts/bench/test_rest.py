@@ -250,7 +250,7 @@ class GateTest(unittest.TestCase):
         rl.check_allowlist(rl.KNOWN_DIFFERENCES)
         for e in rl.KNOWN_DIFFERENCES:
             self.assertIsInstance(e["issue"], int)
-            self.assertGreaterEqual(e["issue"], 2155)
+            self.assertGreaterEqual(e["issue"], 2156)
             self.assertEqual(e["corpus"], "small")
 
     def test_a_corpus_scoped_entry_applies_only_to_its_corpus(self):

@@ -1387,9 +1387,6 @@ The number of allowlisted differences is recorded in every row's metadata
 <!-- known-differences:start -->
 | Endpoint | Path | Kind | Issue | Reason |
 |---|---|---|---|---|
-| `account_hot` | `assets` | only-go | [#2155](https://github.com/xarmian/algod-rust/issues/2155) | resources missing on the read-pool lookup |
-| `account_hot` | `created-apps` | only-go | [#2155](https://github.com/xarmian/algod-rust/issues/2155) | resources missing on the read-pool lookup |
-| `account_hot` | `created-assets` | only-go | [#2155](https://github.com/xarmian/algod-rust/issues/2155) | resources missing on the read-pool lookup |
 | `account_hot` | `apps-local-state` | only-go | [#2156](https://github.com/xarmian/algod-rust/issues/2156) | empty array omitted |
 | `account_cold` | `apps-local-state` | only-go | [#2156](https://github.com/xarmian/algod-rust/issues/2156) | empty array omitted |
 | `account_cold` | `apps-total-schema` | only-go | [#2156](https://github.com/xarmian/algod-rust/issues/2156) | zero schema omitted |
