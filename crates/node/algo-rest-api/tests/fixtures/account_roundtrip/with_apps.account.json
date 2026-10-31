@@ -34,6 +34,7 @@
     "num-byte-slice": 2,
     "num-uint": 3
   },
+  "assets": [],
   "created-apps": [
     {
       "id": 8,
@@ -63,8 +64,10 @@
       }
     }
   ],
+  "created-assets": [],
   "min-balance": 585500,
   "pending-rewards": 0,
+  "reward-base": 0,
   "rewards": 0,
   "round": 300,
   "status": "Offline",

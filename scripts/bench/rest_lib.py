@@ -99,14 +99,6 @@ def _kd(endpoint, path, kind, issue, reason, **extra):
 
 
 KNOWN_DIFFERENCES = [
-    # go emits empty arrays / zero schema / zero reward-base, algod-rust omits them.
-    _kd("account_hot", "apps-local-state", "only-go", 2156, "empty array omitted"),
-    _kd("account_cold", "apps-local-state", "only-go", 2156, "empty array omitted"),
-    _kd("account_cold", "apps-total-schema", "only-go", 2156, "zero schema omitted"),
-    _kd("account_cold", "assets", "only-go", 2156, "empty array omitted"),
-    _kd("account_cold", "created-apps", "only-go", 2156, "empty array omitted"),
-    _kd("account_cold", "created-assets", "only-go", 2156, "empty array omitted"),
-    _kd("account_cold", "reward-base", "only-go", 2156, "zero reward-base omitted"),
     # pending rewards are not applied to the looked-up account.
     _kd("account_hot", "amount", "value", 2157, "pending rewards not applied"),
     _kd("account_hot", "pending-rewards", "value", 2157, "pending rewards not applied"),

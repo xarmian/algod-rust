@@ -399,6 +399,66 @@ fn account_json_exclude_all_omits_resources() {
     assert_eq!(v["total-created-assets"], 1);
 }
 
+/// go's `AccountDataToAccount` always sets non-nil pointers for the resource
+/// lists, the total schema and `reward-base`, and echo's `ctx.JSON`
+/// (encoding/json) keeps those keys when empty/zero (#2156, live-verified
+/// against go 5.0.4 on an account with no resources).
+#[test]
+fn account_json_empty_account_keeps_go_pointer_keys() {
+    let consensus = consensus_params_for_version(CONSENSUS_V41).expect("v41 consensus");
+    let f = fixtures()
+        .into_iter()
+        .find(|f| f.name == "offline_minimal")
+        .unwrap();
+    let lookup = lookup_for(&f);
+    let resp = account_data_to_response(&lookup, &f.addr, "none", false, false, &consensus);
+    let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
+    for k in ["assets", "created-assets", "created-apps", "apps-local-state"] {
+        assert_eq!(v[k], serde_json::json!([]), "{k} must be an empty array");
+    }
+    assert_eq!(
+        v["apps-total-schema"],
+        serde_json::json!({"num-byte-slice": 0, "num-uint": 0})
+    );
+    assert_eq!(v["reward-base"], serde_json::json!(0));
+    // Fields go builds with omitEmpty() stay omitted.
+    for k in [
+        "apps-total-extra-pages",
+        "total-boxes",
+        "total-box-bytes",
+        "last-proposed",
+        "last-heartbeat",
+        "incentive-eligible",
+        "auth-addr",
+        "participation",
+        "sig-type",
+    ] {
+        assert!(v.get(k).is_none(), "{k} must stay omitted");
+    }
+}
+
+/// `exclude=all` (go's `basicAccountInformation`) leaves the four resource
+/// lists nil but still sets `apps-total-schema` and `reward-base`.
+#[test]
+fn account_json_exclude_all_keeps_schema_and_reward_base() {
+    let consensus = consensus_params_for_version(CONSENSUS_V41).expect("v41 consensus");
+    let f = fixtures()
+        .into_iter()
+        .find(|f| f.name == "offline_minimal")
+        .unwrap();
+    let lookup = lookup_for(&f);
+    let resp = account_data_to_response(&lookup, &f.addr, "all", false, false, &consensus);
+    let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
+    for k in ["assets", "created-assets", "created-apps", "apps-local-state"] {
+        assert!(v.get(k).is_none(), "exclude=all must omit {k}");
+    }
+    assert_eq!(
+        v["apps-total-schema"],
+        serde_json::json!({"num-byte-slice": 0, "num-uint": 0})
+    );
+    assert_eq!(v["reward-base"], serde_json::json!(0));
+}
+
 // ---------------------------------------------------------------------------
 // Randomized forward-conversion fuzzing (Phase 17: parity_daemon_node.md's
 // TestAccountRandomRoundTrip row).

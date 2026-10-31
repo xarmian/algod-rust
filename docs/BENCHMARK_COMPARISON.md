@@ -1387,13 +1387,6 @@ The number of allowlisted differences is recorded in every row's metadata
 <!-- known-differences:start -->
 | Endpoint | Path | Kind | Issue | Reason |
 |---|---|---|---|---|
-| `account_hot` | `apps-local-state` | only-go | [#2156](https://github.com/xarmian/algod-rust/issues/2156) | empty array omitted |
-| `account_cold` | `apps-local-state` | only-go | [#2156](https://github.com/xarmian/algod-rust/issues/2156) | empty array omitted |
-| `account_cold` | `apps-total-schema` | only-go | [#2156](https://github.com/xarmian/algod-rust/issues/2156) | zero schema omitted |
-| `account_cold` | `assets` | only-go | [#2156](https://github.com/xarmian/algod-rust/issues/2156) | empty array omitted |
-| `account_cold` | `created-apps` | only-go | [#2156](https://github.com/xarmian/algod-rust/issues/2156) | empty array omitted |
-| `account_cold` | `created-assets` | only-go | [#2156](https://github.com/xarmian/algod-rust/issues/2156) | empty array omitted |
-| `account_cold` | `reward-base` | only-go | [#2156](https://github.com/xarmian/algod-rust/issues/2156) | zero reward-base omitted |
 | `account_hot` | `amount` | value | [#2157](https://github.com/xarmian/algod-rust/issues/2157) | pending rewards not applied |
 | `account_hot` | `pending-rewards` | value | [#2157](https://github.com/xarmian/algod-rust/issues/2157) | pending rewards not applied |
 | `account_hot` | `rewards` | value | [#2157](https://github.com/xarmian/algod-rust/issues/2157) | pending rewards not applied |

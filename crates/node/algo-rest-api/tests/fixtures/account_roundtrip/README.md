@@ -4,7 +4,8 @@ go-algorand v4.5.1-stable reference responses, used by
 `tests/account_roundtrip_test.rs` to verify the Rust REST responses match Go.
 
 - `<name>.account.json` — `model.Account` via `AccountDataToAccount` +
-  `JSONStrictHandle` (the JSON endpoint body).
+  `encoding/json` (what echo's `ctx.JSON` writes, i.e. the JSON endpoint body;
+  keeps non-nil empty `*[]T` / zero-struct pointers, see #2156).
 - `<name>.accountdata.msgpack` — the raw `basics.AccountData` via `CodecHandle`
   (the msgpack endpoint body; the account endpoint returns the raw record for
   msgpack, not the model).

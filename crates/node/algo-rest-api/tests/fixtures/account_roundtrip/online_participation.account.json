@@ -2,6 +2,14 @@
   "address": "EIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADOTLFMNHU",
   "amount": 5000000,
   "amount-without-pending-rewards": 4999000,
+  "apps-local-state": [],
+  "apps-total-schema": {
+    "num-byte-slice": 0,
+    "num-uint": 0
+  },
+  "assets": [],
+  "created-apps": [],
+  "created-assets": [],
   "incentive-eligible": true,
   "min-balance": 100000,
   "participation": {

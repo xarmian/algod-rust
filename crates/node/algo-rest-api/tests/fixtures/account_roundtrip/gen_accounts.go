@@ -87,7 +87,12 @@ func main() {
 	for _, s := range specs {
 		acct, err := v2.AccountDataToAccount(s.addr.String(), &s.rec, s.round, &cons, basics.MicroAlgos{Raw: s.awpr})
 		if err != nil { panic(err) }
-		os.WriteFile(filepath.Join(out, s.name+".account.json"), enc(protocol.JSONStrictHandle, &acct), 0644)
+		// The real endpoint writes the model with echo's ctx.JSON (encoding/json),
+		// which keeps non-nil pointers to empty slices / zero structs (#2156);
+		// JSONStrictHandle (go-codec) would omit them.
+		accJSON, jerr := json.MarshalIndent(&acct, "", "  ")
+		if jerr != nil { panic(jerr) }
+		os.WriteFile(filepath.Join(out, s.name+".account.json"), accJSON, 0644)
 		os.WriteFile(filepath.Join(out, s.name+".accountdata.msgpack"), enc(protocol.CodecHandle, &s.rec), 0644)
 		meta, _ := json.Marshal(map[string]interface{}{"address": s.addr.String(), "round": s.round, "amount_without_pending_rewards": s.awpr})
 		os.WriteFile(filepath.Join(out, s.name+".meta.json"), meta, 0644)
