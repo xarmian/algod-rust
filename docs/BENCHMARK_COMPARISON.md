@@ -32,6 +32,7 @@ make bench-compare TIERS=selftest RUNS=5
 - [The `replay` tier](#the-replay-tier)
 - [The `localnet` tier](#the-localnet-tier)
 - [The `rest` tier](#the-rest-tier)
+- [The `catchup` tier](#the-catchup-tier)
 
 ## Quick start
 
@@ -347,7 +348,7 @@ whenever `build_both.sh` or the pin file changes. It asserts
 | `replay` | available (#2105) | Offline ledger replay of the deterministic block corpus (#2104) through go-algorand's ledger and algod-rust's production catchup path, with a final-state equality gate. See [The `replay` tier](#the-replay-tier). |
 | `localnet` | available (#2106) | All-Go vs all-Rust homogeneous localnet throughput and latency under the same load, with a same-txid-set gate. See [The `localnet` tier](#the-localnet-tier). |
 | `rest` | available (#2107) | REST API throughput and latency against identical ledger state, with a response-equality gate. See [The `rest` tier](#the-rest-tier). |
-| `catchup` | planned (#2108) | Public-network fast catchup and follow. |
+| `catchup` | available (#2108) | Public-network fast catchup to one catchpoint label and follow, go vs Rust side by side, with a label + block-hash equality gate. Non-deterministic (real network), failures classified external-network vs node. See [The `catchup` tier](#the-catchup-tier). |
 
 The CI workflow and the published baseline (`docs/BENCHMARK_RESULTS.md`)
 come with #2109.
@@ -1490,4 +1491,179 @@ BENCH_REST_CONCURRENCY=16 BENCH_REST_DURATION=10 BENCH_REST_CPUS=4 \
   make bench-compare TIERS=rest RUNS=3
 # the negative test: this must fail at the response-equality gate
 BENCH_REST_PROFILE=smoke BENCH_REST_CORRUPT=blocks_json make bench-compare TIERS=rest RUNS=1
+```
+
+## The `catchup` tier
+
+`make bench-compare TIERS=catchup CATCHUP_NETWORK=testnet` compares how long go-algorand's
+`algod` (pinned tag) and `algod-rust` take to become usable on a **public**
+network, and what it costs to keep following it (issue #2108, epic #2101).
+Operators care about this more than about any offline number, but it is the
+one tier that is **not reproducible**: relay speed, peer choice and the
+network's own load change from run to run. The report therefore labels the
+whole group "non-deterministic, real network", every row carries
+`metadata.nondeterministic = true`, and the tier is repeated `RUNS` times so the
+spread (n and the range / 95% CI of the median) is part of every row.
+
+### What each side runs
+
+1. **One label per repeat.** The newest catchpoint label of the network is read
+   at the start of **every** repeat (a catchpoint can rotate off the relays during
+   a multi-hour job; a pinned `BENCH_CATCHUP_LABEL` stays) from the index go's own `goal node catchup` uses
+   (`https://algorand-catchpoints.s3.us-east-2.amazonaws.com/channel/<network>/latest.catchpoint`;
+   `BENCH_CATCHUP_LABEL` pins one, `BENCH_CATCHUP_LABEL_URL` points at another
+   index) and handed to both nodes. The label of every repeat is recorded
+   (`metadata.labels`, `metadata.runs_detail[].label`). Networks:
+   `testnet` (default), `mainnet`, `betanet` (`CATCHUP_NETWORK=` or
+   `BENCH_CATCHUP_NETWORK`; not the generic `NETWORK`, which other tools read). `voimain` / `aramidmain` are not offered: they run
+   custom consensus parameters go-algorand does not know, so there is no Go
+   side.
+2. **Two nodes, identical limits, empty data directories.** Per repeat both
+   start side by side in Docker with the same `--cpus`, `--memory` and
+   `--memory-swap` (`BENCH_CATCHUP_CPUS` / `BENCH_CATCHUP_MEM`, default 2 CPUs and **6 GB**: a first
+   testnet run peaked at 3.0 GB RSS per node, so 3 GB sat on the OOM limit), the
+   same loopback port layout, the same `genesis.json` (the repo's vendored copy
+   of go-algorand's `installer/genesis/<network>/genesis.json`), the same
+   tokens and a data directory that holds nothing else: go `algod -d /data`,
+   algod-rust's go-compatible `algod -d /data`. The tier requests the catchup
+   itself with `POST /v2/catchup/<label>` (the `#` percent-encoded), the same
+   REST call for both, instead of an image entrypoint: the official Go image
+   cannot be told a label.
+3. **Phases**, from `GET /v2/status` polled every `BENCH_CATCHUP_POLL_S`
+   (default 1 s), using the counters both nodes fill identically and
+   `goal node status` prints:
+
+   | Row | From | To |
+   |---|---|---|
+   | `phase_ledger_s` | the catchup request | accounts verification starts |
+   | `phase_verify_s` | accounts verification starts | lookback block download starts |
+   | `phase_blocks_s` | lookback block download starts | the catchpoint clears with a ledger in place |
+   | `phase_replay_s` | the catchpoint clears | the newest block is within `BENCH_CATCHUP_HEAD_SLACK_S` (30 s) of the wall clock |
+   | `total_to_head_s` | the catchup request | the same head condition |
+   | `replay_blocks_per_s` | blocks committed per second during `phase_replay_s` | |
+
+   The catchup counts as finished only when the catchpoint clears **and** the
+   ledger has reached the label's round: both nodes sync from genesis before the
+   request, so a catchpoint that stays cleared below that round for three consecutive
+   polls (one odd sample is ignored) was aborted, and the tier fails (class decided by the evidence rules below). The request itself
+   is not idempotent: after a timed-out attempt, an "already in progress"
+   answer for the same label (go and algod-rust answer HTTP 200 with the label;
+   HTTP 400 naming the same label is accepted too) counts as success, timed from
+   the first attempt; an answer naming another label, or a 200 whose message
+   is not the label, is a failure. A hash probe that times out or gets a 5xx is
+   retried and then fails the run; only a 404 means "pruned". If the oldest
+   sampled rounds are pruned while the hashes are fetched the start is moved
+   forward and the fetch repeated (a pruned round is never a disagreement; only a
+   differing hash is); a window that keeps outrunning the fetch is a `harness`
+   failure.
+
+   There is no separate "download" and "import" row: both nodes stream the
+   catchpoint file and import accounts while it arrives, so the only
+   node-independent boundary is "all accounts processed". A phase the polling
+   never caught in progress reports zero, and a phase shorter than the poll
+   interval has that interval's resolution.
+4. **Follow.** Once both are at the head they follow for
+   `BENCH_CATCHUP_FOLLOW_SECS` (default 600): `follow_rounds_per_s`,
+   `follow_lag_s_mean` / `_max` (wall clock minus the newest block's timestamp,
+   so independent of the other node) and `follow_rounds_behind_max` (rounds
+   behind the other node).
+5. **Resources**, one sample per `docker stats --no-stream` call (back to back, so
+   roughly one every 1-2 s) over the container, and every sample counts equally
+   (the mean is unweighted):
+   `cpu_cores_catchup` / `cpu_cores_follow` (mean CPU% / 100 over the two
+   windows), `rss_mb_peak`, `blockio_read_mb`, `blockio_write_mb` (block-device
+   bytes over the whole run) and `disk_mb` (`du -sk /data` at the end).
+
+### The gate
+
+* both nodes reported, in `/v2/status`, the **label they were told to catch
+  up to** (`catchpoint`);
+* both return the **same block hash** (`GET /v2/blocks/{round}/hash`) for every
+  round from the **oldest round both still serve** to the highest round both
+  have (the agreed tip). Neither node is archival, so each keeps only its
+  newest blocks (a first live run found both answering none of the first ~90%
+  of the rounds after a testnet catchpoint): the start is found by bisection
+  (`catchup_lib.oldest_available`) plus a 50-round margin because the window
+  keeps sliding, and the gate fails if fewer than
+  `BENCH_CATCHUP_MIN_GATE_ROUNDS` (default 100) remain. So "every round
+  followed" is every round **still retained** at the end, not every round since
+  the catchpoint. Beyond `BENCH_CATCHUP_HASH_CAP` rounds (default 20,000) the
+  compared rounds are evenly spaced, both ends included. A round a node cannot
+  answer inside the range is an error, never a pass. `gate_rounds_compared`,
+  the range and the agreed round and hash (`metadata.runs_detail`) are
+  recorded.
+
+A mismatch is a parity bug, not a benchmark result: the tier fails and writes
+no rows.
+
+### Failure classes (external network vs node)
+
+The public network can be down or slow without either node being at fault, so
+every failure prints one line like `docker/scripts/network-image-smoke.sh`
+does (the same evidence rules as `network_image_smoke_lib.sh`, ported to
+`catchup_lib.classify_failure` and unit-tested):
+
+* `FAILURE CLASS: external network: ...` when the label index cannot be read,
+  or neither node made any progress and a transport-level relay failure
+  (refused / reset / timed-out connection, DNS or TLS failure, a 5xx from a
+  relay) is in a log;
+* `FAILURE CLASS: harness: ...` when the measurement itself is unsound, never a
+  verdict on either node: a container **OOM-killed** (`docker inspect
+  State.OOMKilled`; raise `BENCH_CATCHUP_MEM`) or a retained block range that
+  kept moving;
+* `FAILURE CLASS: node: ...` for everything else: a panic, an exited
+  container, one node stuck while the other progressed (the same relays served
+  both), a gate mismatch, or a stall with no relay failure in the logs.
+  Ambiguity is a node failure, never a free pass.
+
+### Limits of the numbers
+
+* Non-deterministic by nature (above). Compare the two sides of **one** run
+  and one day; never compare against another day.
+* The two nodes share the host, the uplink and the same relays at the same
+  moment. That is deliberate (they follow the same tip), but a faster peer
+  can be handed to either side by chance: that is what the repeats and the
+  spread are for.
+* Phase boundaries have the poll interval's resolution.
+* "At the head" means within the head slack, so a node can still gain a few
+  rounds on the head at the start of the follow window; over a normal
+  (minutes-long) window that is noise, in a seconds-long smoke window it is
+  not, which is one more reason the smoke is not a benchmark.
+* Block timestamps and the host clock must agree to within the head slack;
+  a host clock that is off by more than 30 s never reaches "at head" and the
+  run times out (`BENCH_CATCHUP_STAGE_TIMEOUT`, default 7200 s).
+
+### Hermetic mode and CI
+
+`BENCH_CATCHUP_MODE=mock` runs the **same driver** against two in-process mock
+nodes and a mock chain (`tiers/catchup.py`, "the mock network"): the catchup
+stages, a replay to the head, following, the status and block-hash
+endpoints, the gate, the failure classes and the rows, with no Docker and
+nothing external. `BENCH_CATCHUP_MOCK_FAULT=diverge` makes the Rust mock
+return a different block hash (the gate must fail, class `node`);
+`stall` makes both mocks never leave the first stage with transport errors in
+their logs (class `external network`). `.github/workflows/bench-catchup.yml`
+runs the unit tests (`scripts/bench/test_catchup.py`, which also drives the
+mock tier end to end) and one `make bench-compare TIERS=catchup` in mock mode,
+asserting the report marks the group non-deterministic; **CI never depends on
+the public network for pass or fail**.
+
+A fully hermetic *real* catchup (algod-rust serving a catchpoint made from the
+replay corpus to a go node) is not part of this tier: both nodes verify a
+catchpoint's certificates against a real consensus, which a DevMode corpus does
+not have.
+
+### Running it by hand
+
+```bash
+# 3 repeats against the newest testnet catchpoint (hours: the ledger download
+# dominates), on a quiet Linux host with docker
+make bench-compare TIERS=catchup CATCHUP_NETWORK=testnet RUNS=3
+# a short look: one repeat, a one-minute follow window
+BENCH_CATCHUP_PROFILE=smoke BENCH_CATCHUP_FOLLOW_SECS=60 \
+  make bench-compare TIERS=catchup CATCHUP_NETWORK=betanet RUNS=1
+# a prebuilt algod-rust image
+BENCH_CATCHUP_RUST_IMAGE=algod-rust:bench-catchup make bench-compare TIERS=catchup RUNS=3
+# the mock network (what CI runs)
+BENCH_CATCHUP_MODE=mock BENCH_CATCHUP_PROFILE=smoke make bench-compare TIERS=catchup RUNS=1
 ```

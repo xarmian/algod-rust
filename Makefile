@@ -1060,9 +1060,14 @@ BENCH_CLEAN ?=
 ## Issue #2105: the workload corpus the `replay` tier replays (small|large).
 ## An exported BENCH_CORPUS is honoured when CORPUS is not given.
 CORPUS ?= $(or $(BENCH_CORPUS),small)
+## Issue #2108: the public network the `catchup` tier catches up to
+## (testnet|mainnet|betanet). Deliberately not the generic NETWORK, which
+## other tools in this repo read from the environment. An exported
+## BENCH_CATCHUP_NETWORK is honoured when CATCHUP_NETWORK is not given.
+CATCHUP_NETWORK ?= $(BENCH_CATCHUP_NETWORK)
 
 bench-compare: ## Go vs Rust comparison report (TIERS=a,b RUNS=N) -> bench-results/<utc-ts>/
-	BENCH_CORPUS="$(CORPUS)" python3 scripts/bench/run.py --tiers "$(TIERS)" --runs "$(RUNS)" \
+	BENCH_CORPUS="$(CORPUS)" BENCH_CATCHUP_NETWORK="$(CATCHUP_NETWORK)" python3 scripts/bench/run.py --tiers "$(TIERS)" --runs "$(RUNS)" \
 		--build "$(BENCH_BUILD)" --out-root "$(BENCH_OUTPUT)" \
 		$(if $(BENCH_RUN_DIR),--run-dir "$(BENCH_RUN_DIR)",) \
 		$(if $(filter 1,$(BENCH_CLEAN)),--clean,)
