@@ -124,6 +124,30 @@ impl BlockReadCache {
         v
     }
 
+    /// [`Self::get_or_load`] for a fallible load: a successful read (including
+    /// an absent row) is memoised, an `Err` is returned and NOT memoised, so a
+    /// transient or corrupt-row failure is never remembered as "absent".
+    pub fn get_or_try_load<K: Hash + Eq, V: Clone, E>(
+        &self,
+        active: bool,
+        pick: fn(&mut Maps) -> &mut HashMap<K, Option<V>>,
+        key: K,
+        load: impl FnOnce() -> Result<Option<V>, E>,
+    ) -> Result<Option<V>, E> {
+        if !(active && self.enabled) {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return load();
+        }
+        if let Some(v) = pick(&mut self.lock()).get(&key) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(v.clone());
+        }
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        let v = load()?;
+        pick(&mut self.lock()).insert(key, v.clone());
+        Ok(v)
+    }
+
     /// Drops everything.
     pub fn clear(&self) {
         *self.lock() = Maps::default();

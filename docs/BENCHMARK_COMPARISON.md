@@ -1387,10 +1387,6 @@ The number of allowlisted differences is recorded in every row's metadata
 <!-- known-differences:start -->
 | Endpoint | Path | Kind | Issue | Reason |
 |---|---|---|---|---|
-| `account_hot` | `amount` | value | [#2157](https://github.com/xarmian/algod-rust/issues/2157) | pending rewards not applied |
-| `account_hot` | `pending-rewards` | value | [#2157](https://github.com/xarmian/algod-rust/issues/2157) | pending rewards not applied |
-| `account_hot` | `rewards` | value | [#2157](https://github.com/xarmian/algod-rust/issues/2157) | pending rewards not applied |
-| `account_hot` | `reward-base` | value | [#2157](https://github.com/xarmian/algod-rust/issues/2157) | pending rewards not applied |
 | `tx_params` | `fee` | value | [#2158](https://github.com/xarmian/algod-rust/issues/2158) | fee reports min-fee, go reports the pool fee per byte |
 | `blocks_msgpack` | `cert.step` | only-rust | [#2159](https://github.com/xarmian/algod-rust/issues/2159) | cert re-encoded with step=2 |
 | `simulate` | `txn-groups.0.txn-results.0.txn-result.txn.txn.gh` | value | [#2160](https://github.com/xarmian/algod-rust/issues/2160) | gh rendered as an integer array |

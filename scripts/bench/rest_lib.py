@@ -99,11 +99,6 @@ def _kd(endpoint, path, kind, issue, reason, **extra):
 
 
 KNOWN_DIFFERENCES = [
-    # pending rewards are not applied to the looked-up account.
-    _kd("account_hot", "amount", "value", 2157, "pending rewards not applied"),
-    _kd("account_hot", "pending-rewards", "value", 2157, "pending rewards not applied"),
-    _kd("account_hot", "rewards", "value", 2157, "pending rewards not applied"),
-    _kd("account_hot", "reward-base", "value", 2157, "pending rewards not applied"),
     _kd("tx_params", "fee", "value", 2158,
         "fee reports min-fee, go reports the pool fee per byte"),
     # the stored `{rnd}` certificate is re-encoded with step=2 (decoded structurally).
