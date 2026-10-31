@@ -395,7 +395,6 @@ difference is an open parity bug, not an accepted divergence:
 
 | Issue | Difference |
 |---|---|
-| [#2158](https://github.com/xarmian/algod-rust/issues/2158) | `GET /v2/transactions/params` reports `fee` = min-fee; Go reports the pool's fee per byte (0 when idle). |
 | [#2159](https://github.com/xarmian/algod-rust/issues/2159) | `/v2/blocks/{round}?format=msgpack` re-encodes a certificate without a step field as step 2. |
 | [#2160](https://github.com/xarmian/algod-rust/issues/2160) | Simulate JSON renders `gh` and other 32-byte digests as integer arrays; Go renders base64. |
 | [#2161](https://github.com/xarmian/algod-rust/issues/2161) | Simulate omits `sender-rewards` when the sender has pending rewards. |

@@ -99,8 +99,6 @@ def _kd(endpoint, path, kind, issue, reason, **extra):
 
 
 KNOWN_DIFFERENCES = [
-    _kd("tx_params", "fee", "value", 2158,
-        "fee reports min-fee, go reports the pool fee per byte"),
     # the stored `{rnd}` certificate is re-encoded with step=2 (decoded structurally).
     _kd("blocks_msgpack", "cert.step", "only-rust", 2159, "cert re-encoded with step=2",
         rust_value=2),

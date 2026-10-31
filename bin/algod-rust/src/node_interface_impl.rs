@@ -1597,10 +1597,12 @@ impl NodeInterface for AlgodNodeInterface {
     }
 
     async fn suggested_fee(&self) -> u64 {
-        // go-algorand returns max(MinTxnFee, median(recent fees)). Without a
-        // rolling-fee tracker this falls back to MinTxnFee, matching the
-        // conservative behavior of a freshly-started node.
-        self.min_txn_fee().await
+        // go's `SuggestedFee()` (node/node.go) is `transactionPool.FeePerByte()`:
+        // a fee PER BYTE (0 while the pool is idle), published verbatim as
+        // `fee` by `TransactionParams`. Clients compute
+        // `max(min-fee, fee * len(txn))`. Without a pool there is no
+        // congestion state, which is the idle value 0.
+        self.pool.as_ref().map_or(0, |p| p.fee_per_byte())
     }
 
     async fn min_txn_fee(&self) -> u64 {
@@ -4368,6 +4370,21 @@ mod tests {
         assert!(text.contains("algod_transaction_messages_txpool_check_err_"));
     }
 
+    /// #2158: with an idle pool attached, `suggested_fee` is the pool's
+    /// `FeePerByte` (0), never the flat min fee (go's `SuggestedFee()`).
+    #[tokio::test]
+    async fn suggested_fee_is_idle_pool_fee_per_byte_not_min_fee() {
+        let pool = Arc::new(algo_pool::TransactionPool::new(
+            algo_pool::PoolConfig::default(),
+            Arc::new(PoolLedgerStub),
+        ));
+        let adapter = make_adapter().with_pool(pool.clone());
+        assert_eq!(pool.fee_per_byte(), 0);
+        assert_eq!(adapter.suggested_fee().await, pool.fee_per_byte());
+        assert_eq!(adapter.suggested_fee().await, 0);
+        assert_eq!(adapter.min_txn_fee().await, 1_000);
+    }
+
     #[test]
     fn cached_genesis_accessors_return_config_values() {
         let adapter = make_adapter();
@@ -4402,9 +4419,9 @@ mod tests {
     async fn min_txn_fee_pulls_from_consensus_params() {
         let adapter = make_adapter();
         assert_eq!(adapter.min_txn_fee().await, 1_000);
-        // suggested_fee defaults to min_txn_fee when no rolling-fee tracker
-        // is wired up.
-        assert_eq!(adapter.suggested_fee().await, 1_000);
+        // suggested_fee is the pool's fee PER BYTE (0 when idle), not the
+        // min fee (#2158).
+        assert_eq!(adapter.suggested_fee().await, 0);
     }
 
     #[tokio::test]
