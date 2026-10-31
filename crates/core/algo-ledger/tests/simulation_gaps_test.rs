@@ -2583,9 +2583,31 @@ int 1
 
     // Default: builds on the current (latest) round.
     assert_eq!(read_round(&mut state, None), 4);
-    // Explicit historical rounds.
-    assert_eq!(read_round(&mut state, Some(Round(2))), 3);
-    assert_eq!(read_round(&mut state, Some(Round(1))), 2);
+    // The latest round given explicitly is the same as the default.
+    assert_eq!(read_round(&mut state, Some(Round(3))), 4);
+    // Past rounds need the account state as of that round, which this
+    // ledger does not keep (issue #2123): rejected with go's
+    // `RoundOffsetError` text (`dbRound` = the latest round), never
+    // simulated against the latest state under an older header.
+    for past in [2u64, 1] {
+        let request = SimulationRequest {
+            txn_groups: vec![vec![SignedTransaction {
+                txn: appl_txn(sender, app_id, 0),
+                ..Default::default()
+            }]],
+            allow_empty_signatures: true,
+            round: Some(Round(past)),
+            ..Default::default()
+        };
+        match simulate(&mut state, request) {
+            Err(SimulatorError::Internal(e)) => assert!(
+                e.to_string()
+                    .contains(&format!("round {past} before dbRound 3")),
+                "{e}"
+            ),
+            other => panic!("expected the before-dbRound error, got {other:?}"),
+        }
+    }
 
     // A round past the ledger's tip must be rejected.
     let request = SimulationRequest {
@@ -2786,37 +2808,98 @@ fn pay_group(sender: Address, receiver: Address) -> Vec<SignedTransaction> {
     }]
 }
 
-/// Issue #2118 review: a past `Request.Round` must not pair that round's
-/// (lower) rewards level with the latest account state, where an account
-/// touched since has a rewards base above it -- that wrapped
-/// `compute_pending_rewards` and panicked `apply_rewards` under the ledger
-/// mutex. Until historical state lands (#2123) the rewards inputs are the
-/// latest state's, consistent with every account simulate reads.
+/// Issue #2123 (supersedes the interim #2118 behaviour): a past
+/// `Request.Round` needs the accounts, pool and `Totals` as of that round.
+/// The store only has the latest state, so the request is rejected with go's
+/// `RoundOffsetError` text rather than pairing round 1's (lower) rewards
+/// level with the latest account state, where an account touched since has a
+/// rewards base above it. The account changed after round 1 (rewards base 30
+/// at round 3) would otherwise be read at its round-3 balance.
 #[test]
-fn simulate_at_a_past_round_keeps_the_rewards_state_consistent() {
+fn simulate_at_a_past_round_is_rejected_not_evaluated_on_latest_state() {
     let sender = Address([0xAA; 32]);
     let mut state = rewards_state_with_history(sender);
     let before = state.accounts.clone();
+    for past in [1u64, 2] {
+        let err = simulate(
+            &mut state,
+            SimulationRequest {
+                txn_groups: vec![pay_group(sender, Address([0xBB; 32]))],
+                allow_empty_signatures: true,
+                round: Some(Round(past)),
+                ..Default::default()
+            },
+        )
+        .expect_err("a past round must be rejected");
+        match err {
+            SimulatorError::Internal(e) => assert!(
+                e.to_string()
+                    .contains(&format!("round {past} before dbRound 3")),
+                "{e}"
+            ),
+            other => panic!("expected SimulatorError::Internal, got {other:?}"),
+        }
+    }
+    assert_eq!(state.accounts, before, "the store is untouched");
+
+    // The latest round, given explicitly, still simulates: the claim is at
+    // the next level (30 + 250 / 50 units) from base 30.
     let result = simulate(
         &mut state,
         SimulationRequest {
             txn_groups: vec![pay_group(sender, Address([0xBB; 32]))],
             allow_empty_signatures: true,
-            round: Some(Round(1)),
+            round: Some(Round(3)),
             ..Default::default()
         },
     )
-    .expect("a past round simulates without panicking");
+    .expect("the latest round simulates");
     let group = &result.txn_groups[0];
     assert_eq!(group.failure_message, None);
-    // The claim is at the latest state's next level (30 + 250 / 50 units),
-    // from base 30. Round 1's header would give 10 + 5 = 15, below the base.
     let ad = group.txn_results[0]
         .apply_data
         .as_ref()
         .expect("apply data");
     assert_eq!(ad.sender_rewards, 50 * 5);
     assert_eq!(state.accounts, before, "the store is restored");
+}
+
+/// Issue #2123 (second comment): a past `start` whose `start + 1` is the
+/// historical header's rewards recalculation round, but not the latest's.
+/// go would refresh the rate from the pool as of `start`; mixing in the
+/// latest rewards state would skip that refresh. The rejection means the two
+/// can never be mixed.
+#[test]
+fn simulate_at_a_past_recalculation_round_is_rejected() {
+    let sender = Address([0xAA; 32]);
+    let mut state = rewards_state_with_history(sender);
+    // Round 2's header says the next round (3) recalculates; the latest
+    // state's recalculation round has moved on (500_000).
+    let hdr = algo_types::BlockHeader {
+        round: Round(2),
+        current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+        genesis_hash: TEST_GENESIS_HASH,
+        rewards_pool: Address([0xEE; 32]),
+        rewards_level: 20,
+        rewards_rate: 250,
+        rewards_recalculation_round: Round(3),
+        ..Default::default()
+    };
+    let hdr_bytes = algo_codec::canonical_encode_block_header(&hdr);
+    state
+        .put_block(2, &hdr.current_protocol, &hdr_bytes, &[])
+        .expect("put_block succeeds");
+    let err = simulate(
+        &mut state,
+        SimulationRequest {
+            txn_groups: vec![pay_group(sender, Address([0xBB; 32]))],
+            allow_empty_signatures: true,
+            round: Some(Round(2)),
+            ..Default::default()
+        },
+    )
+    .expect_err("a past round must be rejected");
+    assert!(matches!(err, SimulatorError::Internal(_)), "{err:?}");
 }
 
 /// Issue #2118 review: the block-start withdrawal writes the live store, so
@@ -2971,9 +3054,9 @@ int 1
     }
     state.set_current_round(Round(5));
 
-    // The follower's dbRound is 4: it has no tracked state before the
-    // round it was told to sync to (mirrors `TestSimulateStartRound`'s
-    // `followerSyncRound`).
+    // The follower's dbRound is 4 but its latest state is round 5: the
+    // store holds only the latest state, so the effective dbRound is the
+    // later of the two (issue #2123).
     state.set_earliest_round(Round(4));
 
     let request_at = |round: Round| SimulationRequest {
@@ -2986,12 +3069,9 @@ int 1
         ..Default::default()
     };
 
-    // Exactly at dbRound: still available.
-    let result = simulate(&mut state, request_at(Round(4))).expect("dbRound itself must resolve");
+    // The latest round resolves.
+    let result = simulate(&mut state, request_at(Round(5))).expect("the latest round must resolve");
     assert!(result.txn_groups[0].failure_message.is_none());
-
-    // One round after dbRound: also available.
-    simulate(&mut state, request_at(Round(5))).expect("a round after dbRound must resolve");
 
     // Before dbRound: rejected with go's exact "before dbRound" error
     // class (an `Internal` error, not `InvalidRequest` -- go's handler
@@ -3003,7 +3083,7 @@ int 1
         SimulatorError::Internal(e) => {
             let msg = e.to_string();
             assert!(
-                msg.contains("round 3 before dbRound 4"),
+                msg.contains("round 3 before dbRound 5"),
                 "expected go's exact error text, got {msg:?}"
             );
         }

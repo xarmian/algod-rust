@@ -222,6 +222,20 @@ pub mod test_hooks {
 
     thread_local! {
         static PANIC_AFTER_WITHDRAWAL: Cell<bool> = const { Cell::new(false) };
+        static SERVE_PAST_ROUNDS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Let this thread's simulates take a `Request.Round` below the latest
+    /// round (issue #2123, DIV-007). Only for oracle tests whose scenarios
+    /// read no account state that changed after `Request.Round` (the
+    /// duplicate-transaction checks of #2125, which read the txtail and the
+    /// lease table), so their go parity stays pinned.
+    pub fn set_serve_past_rounds(on: bool) {
+        SERVE_PAST_ROUNDS.with(|c| c.set(on));
+    }
+
+    pub(super) fn serve_past_rounds() -> bool {
+        SERVE_PAST_ROUNDS.with(|c| c.get())
     }
 
     /// Make this thread's next simulate panic right after the block-start
@@ -355,12 +369,10 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
     /// Only reads: the withdrawal itself is applied after `check`.
     ///
     /// The rewards inputs (the previous rewards state, the pool, the reward
-    /// units) are the store's own, i.e. the latest round's. For `start` =
-    /// latest that is exactly go's `BlockHdr(start)` / `Totals(start)`. For
-    /// a past `start` it keeps them consistent with the accounts simulate
-    /// reads, which are also the latest state (issue #2123): an older
-    /// header's level paired with newer rewards bases would be a base above
-    /// the level. Without a header for `start` (unit-test stores only; a
+    /// units) are the store's own, i.e. the latest round's, which for
+    /// `start` = latest is exactly go's `BlockHdr(start)` / `Totals(start)`.
+    /// `simulate` rejects any earlier `start` (issue #2123, DIV-007), so no
+    /// older header is ever paired with the latest account state. Without a header for `start` (unit-test stores only; a
     /// real ledger always has its latest header) the store's protocol stands
     /// in.
     fn prepare_simulated_block(
@@ -514,7 +526,19 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         // headers (`forget_before` isn't wired into the normal apply path),
         // so the header would otherwise still resolve.
         if let Some(requested_round) = request.round {
-            let earliest = self.store.earliest_round();
+            // DIVERGENCE DIV-007: the store keeps only the latest account,
+            // app, asset and box state, so the earliest round simulate can
+            // serve is the latest round (go serves back to its `dbRound`).
+            #[cfg(any(test, feature = "test-hooks"))]
+            let serve_past = test_hooks::serve_past_rounds();
+            #[cfg(not(any(test, feature = "test-hooks")))]
+            let serve_past = false;
+            let latest = if serve_past {
+                Round(0)
+            } else {
+                self.store.current_round()
+            };
+            let earliest = self.store.earliest_round().max(latest);
             if requested_round < earliest {
                 return Err(SimulatorError::Internal(AlgoError::Ledger {
                     message: format!("round {} before dbRound {}", requested_round.0, earliest.0),

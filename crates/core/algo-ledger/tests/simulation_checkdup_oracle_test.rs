@@ -214,6 +214,9 @@ fn run_stage<L: LedgerStore>(store: &mut L, o: &Oracle, stage: &str, lease_fp: f
 }
 
 fn run_oracle<L: LedgerStore>(store: &mut L, lease_fp: fn(&L) -> u64) {
+    // These scenarios read only the txtail and the lease table, so a past
+    // round is safe to serve (a normal simulate rejects it, issue #2123).
+    algo_ledger::simulation::test_hooks::set_serve_past_rounds(true);
     let o = load_oracle();
     let last = seed_go_blocks(store, &o);
     run_stage(store, &o, "A", lease_fp);
