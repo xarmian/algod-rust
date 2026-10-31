@@ -906,3 +906,107 @@ fn undecodable_resource_row_is_reported_not_dropped() {
         "an undecodable created-asset row must fail the snapshot"
     );
 }
+
+/// Commit `round` with a header whose rewards level is `level`.
+fn commit_with_level(l: &mut SqliteLedger, round: u64, level: u64) {
+    l.begin_block().unwrap();
+    l.set_current_round(Round(round));
+    l.put_block_header_fixture(round, level).unwrap();
+    l.commit_block().unwrap();
+}
+
+/// Issue #2157 review: the pool's committed rewards level goes through its
+/// one-entry cache -- the second read costs no `blockdb` header read -- and a
+/// newly committed round is read fresh.
+#[test]
+fn committed_rewards_level_is_served_from_the_pool_cache() {
+    use std::sync::atomic::Ordering;
+    let (_dir, mut l) = file_ledger();
+    let pool = l.read_pool().unwrap();
+    commit_with_level(&mut l, 1, 111);
+    let level = || {
+        pool.read_resources(|r| r.committed_rewards_level())
+            .unwrap()
+    };
+    assert_eq!(level(), (1, Some(111)));
+    assert_eq!(pool.header_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(level(), (1, Some(111)));
+    assert_eq!(
+        pool.header_reads.load(Ordering::SeqCst),
+        1,
+        "the second lookup must not read the header from blockdb again"
+    );
+    commit_with_level(&mut l, 2, 222);
+    assert_eq!(level(), (2, Some(222)));
+    assert_eq!(pool.header_reads.load(Ordering::SeqCst), 2);
+}
+
+/// Issue #2157 review: the pool and the locked path take the committed rewards
+/// level from the same persisted header, also right after each block apply
+/// (the in-memory level, left at 0 here, is NOT what either reports).
+#[test]
+fn committed_rewards_level_agrees_between_pool_and_locked_paths() {
+    let (_dir, mut l) = file_ledger();
+    let pool = l.read_pool().unwrap();
+    for (round, level) in [(1u64, 10u64), (2, 25), (3, 25), (4, 40)] {
+        commit_with_level(&mut l, round, level);
+        let (r, pooled) = pool
+            .read_resources(|r| r.committed_rewards_level())
+            .unwrap();
+        assert_eq!(r, round);
+        assert_eq!(pooled, Some(level));
+        assert_eq!(
+            LedgerStore::committed_rewards_level(&l).unwrap(),
+            level,
+            "locked path at round {round}"
+        );
+        assert_eq!(ResourceReads::committed_rewards_level(&l), Some(level));
+    }
+}
+
+/// Issue #2157 review: a missing tip header is `None` on the pool (the caller
+/// falls back before scanning) and the documented in-memory fallback on a
+/// ledger without a stored header.
+#[test]
+fn committed_rewards_level_without_a_header() {
+    let (_dir, mut l) = file_ledger();
+    let pool = l.read_pool().unwrap();
+    stage(&mut l, 1, 1, 10); // bogus "hdr-1" bytes: undecodable, not a level
+    l.commit_block().unwrap();
+    let (_, pooled) = pool
+        .read_resources(|r| r.committed_rewards_level())
+        .unwrap();
+    assert_eq!(pooled, None);
+    let mut mem = SqliteLedger::open_in_memory().unwrap();
+    mem.set_rewards_level(77);
+    assert_eq!(LedgerStore::committed_rewards_level(&mem).unwrap(), 77);
+}
+
+/// Issue #2157 review: `account_row` tells an absent row from an undecodable
+/// one on both paths.
+#[test]
+fn account_row_distinguishes_absent_from_unreadable() {
+    let (dir, mut l) = file_ledger();
+    let pool = l.read_pool().unwrap();
+    commit(&mut l, 1, 1, 10);
+    let (_, row) = pool.read_resources(|r| r.account_row(&addr(1))).unwrap();
+    assert_eq!(row.unwrap().unwrap().micro_algos, 10);
+    let (_, absent) = pool.read_resources(|r| r.account_row(&addr(9))).unwrap();
+    assert!(absent.unwrap().is_none());
+    assert!(ResourceReads::account_row(&l, &addr(9)).unwrap().is_none());
+
+    let w = Connection::open(crate::sqlite::tracker_path_for_prefix(
+        &dir.path().join("ledger"),
+    ))
+    .unwrap();
+    w.execute(
+        "UPDATE accountbase SET data = ?1 WHERE address = ?2",
+        params![vec![0xc1u8], addr(1).0.to_vec()],
+    )
+    .unwrap();
+    assert!(
+        pool.read_resources(|r| r.account_row(&addr(1))).is_err(),
+        "an undecodable row fails the pool snapshot"
+    );
+    assert!(ResourceReads::account_row(&l, &addr(1)).is_err());
+}

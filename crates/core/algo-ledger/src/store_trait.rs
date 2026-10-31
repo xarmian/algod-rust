@@ -104,6 +104,20 @@ pub trait LedgerStore {
     /// Get a copy of the account data, or `None` if the address has no record.
     fn get_account(&self, addr: &Address) -> Option<AccountData>;
 
+    /// Like [`Self::get_account`], but a read or decode failure is an error
+    /// instead of "no record" (`Ok(None)` is only a genuinely absent row).
+    /// The default cannot tell them apart; stores that can override it.
+    fn try_get_account(&self, addr: &Address) -> Result<Option<AccountData>, AlgoError> {
+        Ok(self.get_account(addr))
+    }
+
+    /// Rewards level of the committed tip: the level go's `LookupAccount`
+    /// brings an account up to. Stores with persisted headers read the header
+    /// at the committed round; the default is the in-memory current level.
+    fn committed_rewards_level(&self) -> Result<u64, AlgoError> {
+        Ok(self.rewards_level())
+    }
+
     /// Write account data for the given address (insert or overwrite).
     fn set_account(&mut self, addr: &Address, account: AccountData);
 

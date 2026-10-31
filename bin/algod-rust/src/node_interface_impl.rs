@@ -487,6 +487,91 @@ impl AlgodNodeInterface {
         }
     }
 
+    /// One committed read for an account lookup: `read(reader, rewards_level)`
+    /// on a single read-pool snapshot, returning `(committed round, rewards
+    /// level, result)`. The tip's rewards level is read FIRST, so a snapshot
+    /// with no readable tip header is abandoned before any scan runs; the
+    /// locked ledger then answers (the same composition on the same SQL, with
+    /// the level from the same persisted header). `use_pool = false` forces the
+    /// locked path (an in-memory ledger or a pool miss reaches it anyway).
+    fn committed_read<T>(
+        &self,
+        method: &'static str,
+        use_pool: bool,
+        read: impl Fn(&dyn algo_ledger::ResourceReads, u64) -> Result<T, NodeError>,
+    ) -> Result<(u64, u64, T), NodeError> {
+        if use_pool {
+            let pooled = self.pooled_resources(|r| {
+                let level = algo_ledger::ResourceReads::committed_rewards_level(r)?;
+                read(r, level).ok().map(|v| (level, v))
+            });
+            if let Some((round, Some((level, v)))) = pooled {
+                return Ok((round, level, v));
+            }
+        }
+        let ledger = self.lock_ledger(method)?;
+        let round = Self::committed_round(&ledger, method)?;
+        let level = algo_ledger::LedgerStore::committed_rewards_level(&*ledger)
+            .map_err(|e| NodeError::Internal(format!("{method}: rewards level: {e}")))?;
+        let v = read(&*ledger, level)?;
+        Ok((round, level, v))
+    }
+
+    /// `GET /v2/accounts/{addr}`'s lookup, go's `ledger.LookupAccount`: the
+    /// account brought up to the committed tip's rewards level, with the
+    /// amount from before the rewards as `amount-without-pending-rewards`.
+    /// `basic` is the `exclude=all` shape (no resource scans).
+    ///
+    /// Issue #2155: `AccountData` decoded from `accountbase` carries NO
+    /// resources (they live in the `resources` table), so the held assets,
+    /// created assets/apps and app local states are composed from the
+    /// resource accessors, as go's `AccountDataToAccount` lists them. The
+    /// locked fallback is reached for an in-memory ledger (no pool) or after a
+    /// pool SQL error; it reads under the ledger mutex because the accessors
+    /// need the ledger itself, and the scans are bounded by `max_resources`.
+    fn account_lookup(
+        &self,
+        addr: &Address,
+        basic: bool,
+        use_pool: bool,
+    ) -> Result<AccountLookup, NodeError> {
+        let method = if basic {
+            "lookup_account_basic"
+        } else {
+            "lookup_account"
+        };
+        let max = self.max_api_resources_per_account_cfg;
+        let (last_round, _, (without, parts)) =
+            self.committed_read(method, use_pool, |r, level| {
+                let mut parts = if basic {
+                    // An absent row is the empty account (as in go); an unreadable
+                    // one is an error, never a valid empty account.
+                    let account_data = r
+                        .account_row(addr)
+                        .map_err(|e| NodeError::Internal(format!("{method}: {e}")))?
+                        .unwrap_or_default();
+                    AccountResourceParts {
+                        account_data,
+                        ..Default::default()
+                    }
+                } else {
+                    account_resource_parts(r, addr, max)
+                        .map_err(|e| NodeError::Internal(format!("{method}: {e}")))?
+                };
+                let without = apply_pending_rewards(&mut parts.account_data, level, method)?;
+                Ok((without, parts))
+            })?;
+        Ok(AccountLookup {
+            amount_without_pending_rewards: without,
+            assets: parts.assets,
+            created_assets: parts.created_assets,
+            app_local_states: parts.app_local_states,
+            created_apps: parts.created_apps,
+            account_data: parts.account_data,
+            last_round,
+        })
+    }
+
     /// Run `f` on one committed read snapshot of the lock-free read pool
     /// (issue #1893), returning the committed round read in the same snapshot
     /// with `f`'s result. `None` (in-memory ledger, any SQL error) means the
@@ -1143,17 +1228,36 @@ struct AccountResourceParts {
 /// rewards level (`basics.WithUpdatedRewards`) and return the amount BEFORE
 /// the pending rewards (`amount-without-pending-rewards`). The REST layer then
 /// reports `pending-rewards = amount - amount-without-pending-rewards`,
-/// `rewards` and `reward-base` of the updated record (issue #2157). An
-/// overflow is go's `OverflowTracker` panic; here it is an internal error.
+/// `rewards` and `reward-base` of the updated record (issue #2157).
+///
+/// A rewards base ABOVE the level (a catchpoint-restored or lagging ledger
+/// whose level source trails the account rows) is not an error: go panics only
+/// on arithmetic overflow, and the other lookups (`lookup_agreement_account`,
+/// expired stake) guard `level >= base`. The account is served as stored and a
+/// warning is logged once per 1000 occurrences. Only a true overflow is an
+/// error here.
 fn apply_pending_rewards(
     account: &mut AccountData,
-    rewards_level: Option<u64>,
+    rewards_level: u64,
     method: &str,
 ) -> Result<u64, NodeError> {
-    let level = rewards_level
-        .ok_or_else(|| NodeError::Internal(format!("{method}: no rewards level at the tip")))?;
+    static BASE_ABOVE_LEVEL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let without = account.micro_algos;
-    algo_ledger::rewards::apply_rewards(account, level)
+    if account.status != algo_types::AccountStatus::NotParticipating
+        && account.rewards_base > rewards_level
+    {
+        let n = BASE_ABOVE_LEVEL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n.is_multiple_of(1000) {
+            warn!(
+                "{method}: account rewards base {} is above the tip's rewards level {rewards_level}; \
+                 serving it without pending rewards ({} occurrences so far)",
+                account.rewards_base,
+                n + 1
+            );
+        }
+        return Ok(without);
+    }
+    algo_ledger::rewards::apply_rewards(account, rewards_level)
         .map_err(|e| NodeError::Internal(format!("{method}: {e}")))?;
     Ok(without)
 }
@@ -1172,10 +1276,10 @@ fn account_resource_parts<R: algo_ledger::ResourceReads + ?Sized>(
     r: &R,
     addr: &Address,
     max_resources: u64,
-) -> AccountResourceParts {
-    let Some(account_data) = r.get_account(addr) else {
+) -> Result<AccountResourceParts, algo_error::AlgoError> {
+    let Some(account_data) = r.account_row(addr)? else {
         // No `accountbase` row: resource rows hang off it, so there are none.
-        return AccountResourceParts::default();
+        return Ok(AccountResourceParts::default());
     };
     let totals = account_data
         .total_assets_opted_in
@@ -1183,12 +1287,12 @@ fn account_resource_parts<R: algo_ledger::ResourceReads + ?Sized>(
         .saturating_add(account_data.total_apps_opted_in)
         .saturating_add(account_data.total_created_apps);
     if max_resources != 0 && totals > max_resources {
-        return AccountResourceParts {
+        return Ok(AccountResourceParts {
             account_data,
             ..Default::default()
-        };
+        });
     }
-    AccountResourceParts {
+    Ok(AccountResourceParts {
         assets: r.asset_holdings_for_addr(addr).into_iter().collect(),
         created_assets: r
             .created_assets_for_addr(addr)
@@ -1198,7 +1302,7 @@ fn account_resource_parts<R: algo_ledger::ResourceReads + ?Sized>(
         app_local_states: r.app_local_states_for_addr(addr).into_iter().collect(),
         created_apps: r.created_apps_for_addr(addr).into_iter().collect(),
         account_data,
-    }
+    })
 }
 
 /// Mirrors handlers.go:1138 AccountAssetsInformation / ledger.LookupAssets:
@@ -1768,90 +1872,11 @@ impl NodeInterface for AlgodNodeInterface {
     // ---- Account state ----
 
     async fn lookup_account(&self, addr: &Address) -> Result<AccountLookup, NodeError> {
-        // Issue #2155: `AccountData` decoded from `accountbase` carries NO
-        // resources (they live in the `resources` table), so the held assets,
-        // created assets/apps and app local states are composed from the
-        // resource accessors, as go's `AccountDataToAccount` lists them. One
-        // read-pool snapshot (#1764/#1893) with the committed round, else the
-        // locked ledger -- the same composition on the same SQL either way.
-        //
-        // The locked fallback is reached for an in-memory ledger (no pool: tests
-        // and tools, never a node serving a file-backed ledger) or after a pool
-        // SQL error. It reads under the ledger mutex because the resource
-        // accessors need the ledger itself; the scans are bounded by
-        // `max_resources` (an over-limit account is not scanned at all).
-        let max = self.max_api_resources_per_account_cfg;
-        let (last_round, (level, mut parts)) = match self
-            .pooled_resources(|r| {
-                (
-                    algo_ledger::ResourceReads::committed_rewards_level(r),
-                    account_resource_parts(r, addr, max),
-                )
-            })
-            .filter(|(_, (level, _))| level.is_some())
-        {
-            Some(v) => v,
-            None => {
-                let ledger = self.lock_ledger("lookup_account")?;
-                let last_round = Self::committed_round(&ledger, "lookup_account")?;
-                let level = algo_ledger::ResourceReads::committed_rewards_level(&*ledger);
-                (
-                    last_round,
-                    (level, account_resource_parts(&*ledger, addr, max)),
-                )
-            }
-        };
-        let amount_without_pending_rewards =
-            apply_pending_rewards(&mut parts.account_data, level, "lookup_account")?;
-        Ok(AccountLookup {
-            amount_without_pending_rewards,
-            assets: parts.assets,
-            created_assets: parts.created_assets,
-            app_local_states: parts.app_local_states,
-            created_apps: parts.created_apps,
-            account_data: parts.account_data,
-            last_round,
-        })
+        self.account_lookup(addr, false, true)
     }
 
     async fn lookup_account_basic(&self, addr: &Address) -> Result<AccountLookup, NodeError> {
-        // "Basic" mode (`exclude=all` on the REST endpoint) skips the
-        // potentially-large resource maps — return empty BTreeMaps. The round
-        // comes from the same source as `lookup_account`'s (the pool snapshot's
-        // `acctrounds`, else the locked committed round). Pending rewards are
-        // applied exactly as in `lookup_account` (go's
-        // `basicAccountInformation` also uses `ledger.LookupAccount`).
-        let (last_round, (level, mut account_data)) = match self
-            .pooled_resources(|r| {
-                (
-                    algo_ledger::ResourceReads::committed_rewards_level(r),
-                    algo_ledger::ResourceReads::get_account(r, addr).unwrap_or_default(),
-                )
-            })
-            .filter(|(_, (level, _))| level.is_some())
-        {
-            Some(v) => v,
-            None => {
-                let ledger = self.lock_ledger("lookup_account_basic")?;
-                let last_round = Self::committed_round(&ledger, "lookup_account_basic")?;
-                let level = algo_ledger::ResourceReads::committed_rewards_level(&*ledger);
-                (
-                    last_round,
-                    (level, ledger.get_account(addr).unwrap_or_default()),
-                )
-            }
-        };
-        let amount_without_pending_rewards =
-            apply_pending_rewards(&mut account_data, level, "lookup_account_basic")?;
-        Ok(AccountLookup {
-            amount_without_pending_rewards,
-            assets: Default::default(),
-            created_assets: Default::default(),
-            app_local_states: Default::default(),
-            created_apps: Default::default(),
-            account_data,
-            last_round,
-        })
+        self.account_lookup(addr, true, true)
     }
 
     // ---- Asset / app / box resource lookups (TASK-266) ----
@@ -8914,20 +8939,162 @@ mod tests {
             rewards_base: 861,
             ..Default::default()
         };
-        let without = apply_pending_rewards(&mut a, Some(862), "t").unwrap();
+        let without = apply_pending_rewards(&mut a, 862, "t").unwrap();
         assert_eq!(without, 990_852_362_144);
         assert_eq!(a.micro_algos, 990_853_352_996);
         assert_eq!(a.micro_algos - without, 990_852);
         assert_eq!(a.rewarded_micro_algos, 853_755_996);
         assert_eq!(a.rewards_base, 862);
-        // A rewards base above the level is go's OverflowTracker panic: an error.
+        // A rewards base above the level is served as stored (not a 500).
         let mut b = AccountData {
             micro_algos: 5_000_000,
             rewards_base: 30,
             ..Default::default()
         };
-        assert!(apply_pending_rewards(&mut b, Some(25), "t").is_err());
-        assert!(apply_pending_rewards(&mut b, None, "t").is_err());
+        assert_eq!(apply_pending_rewards(&mut b, 25, "t").unwrap(), 5_000_000);
+        assert_eq!((b.micro_algos, b.rewards_base), (5_000_000, 30));
+        // True arithmetic overflow stays an error (go panics), as does no level.
+        let mut c = AccountData {
+            micro_algos: 5_000_000,
+            ..Default::default()
+        };
+        assert!(apply_pending_rewards(&mut c, u64::MAX, "t").is_err());
+    }
+
+    /// Review item 9: for the same ledger state the read-pool path and the
+    /// locked path report identical `amount`, `pending-rewards` (via
+    /// `amount-without-pending-rewards`), `rewards`, `reward-base` and round,
+    /// for every status, full and `exclude=all`.
+    #[tokio::test]
+    async fn pending_rewards_agree_between_the_pool_and_locked_paths() {
+        let (_dir, ledger, who) = file_backed_ledger_with_rewards_level();
+        let adapter = make_adapter_with_ledger(ledger);
+        assert!(adapter.read_pool().is_some());
+        let absent = Address([0x79; 32]);
+        for addr in who.iter().chain([&absent]) {
+            for basic in [false, true] {
+                let pooled = adapter.account_lookup(addr, basic, true).unwrap();
+                let locked = adapter.account_lookup(addr, basic, false).unwrap();
+                assert_eq!(pooled.last_round, locked.last_round);
+                assert_eq!(
+                    pooled.amount_without_pending_rewards,
+                    locked.amount_without_pending_rewards
+                );
+                assert_eq!(pooled.account_data, locked.account_data);
+                assert_eq!(pooled.assets, locked.assets);
+            }
+        }
+        // And both are the go values (Online account: +75 pending).
+        let l = adapter.account_lookup(&who[0], false, false).unwrap();
+        assert_eq!(
+            l.account_data.micro_algos - l.amount_without_pending_rewards,
+            75
+        );
+    }
+
+    /// Review item 3: a snapshot with no readable tip header is abandoned
+    /// BEFORE any scan, so the resource scans run once (on the locked path),
+    /// not once on the pool and again on the locked path.
+    #[tokio::test]
+    async fn a_missing_tip_header_does_not_repeat_the_scans() {
+        let (dir, ledger, who) = file_backed_ledger_with_rewards_level();
+        let adapter = make_adapter_with_ledger(ledger);
+        let scans = std::cell::Cell::new(0u32);
+        let run = |use_pool| {
+            scans.set(0);
+            adapter
+                .committed_read("test", use_pool, |r, level| {
+                    scans.set(scans.get() + 1);
+                    r.account_row(&who[0])
+                        .map_err(|e| NodeError::Internal(e.to_string()))
+                        .map(|a| (level, a))
+                })
+                .unwrap()
+        };
+        let (round, level, _) = run(true);
+        assert_eq!((round, level, scans.get()), (3, REWARDS_TIP_LEVEL, 1));
+
+        // Remove the committed tip's header: the pool cannot read a level.
+        let w = rusqlite::Connection::open(algo_ledger::block_path_for_prefix(
+            &dir.path().join("ledger"),
+        ))
+        .unwrap();
+        w.execute("DELETE FROM blocks WHERE rnd = 3", []).unwrap();
+        drop(w);
+        // Fresh pool state: the cached level must not hide the missing header.
+        let adapter = make_adapter_with_ledger(adapter.ledger.clone());
+        let scans2 = std::cell::Cell::new(0u32);
+        adapter
+            .committed_read("test", true, |_, _| {
+                scans2.set(scans2.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(scans2.get(), 1, "scans must run once, not pool then locked");
+    }
+
+    /// Review item 1: a rewards base ABOVE the tip's level (a catchpoint-restored
+    /// or lagging ledger) must not turn a working endpoint into a 500: the
+    /// account is served as stored. Only true arithmetic overflow is an error.
+    #[tokio::test]
+    async fn lookup_account_serves_a_base_above_the_level_as_stored() {
+        let (_dir, ledger, who) = file_backed_ledger_with_rewards_level();
+        let ahead = Address([0x61; 32]);
+        {
+            let mut l = ledger.lock().unwrap();
+            l.set_account(
+                &ahead,
+                AccountData {
+                    status: algo_types::AccountStatus::Online,
+                    micro_algos: 5_000_000,
+                    rewards_base: REWARDS_TIP_LEVEL + 5,
+                    rewarded_micro_algos: 100,
+                    ..Default::default()
+                },
+            );
+        }
+        let _ = who;
+        let adapter = make_adapter_with_ledger(ledger);
+        for l in [
+            adapter.lookup_account(&ahead).await.unwrap(),
+            adapter.lookup_account_basic(&ahead).await.unwrap(),
+        ] {
+            assert_eq!(l.amount_without_pending_rewards, 5_000_000);
+            assert_eq!(l.account_data.micro_algos, 5_000_000);
+            assert_eq!(l.account_data.rewarded_micro_algos, 100);
+            assert_eq!(l.account_data.rewards_base, REWARDS_TIP_LEVEL + 5);
+        }
+    }
+
+    /// Review item 7: an unreadable account row is an error, not a valid empty
+    /// account with a `reward-base` stamped on it (only an ABSENT row is empty).
+    #[tokio::test]
+    async fn lookup_account_basic_reports_an_undecodable_row_as_an_error() {
+        let (dir, ledger, who) = file_backed_ledger_with_rewards_level();
+        let w = rusqlite::Connection::open(algo_ledger::tracker_path_for_prefix(
+            &dir.path().join("ledger"),
+        ))
+        .unwrap();
+        w.execute(
+            "UPDATE accountbase SET data = ?1 WHERE address = ?2",
+            rusqlite::params![vec![0xc1u8], who[0].0.to_vec()],
+        )
+        .unwrap();
+        drop(w);
+        let adapter = make_adapter_with_ledger(ledger);
+        assert!(matches!(
+            adapter.lookup_account_basic(&who[0]).await,
+            Err(NodeError::Internal(_))
+        ));
+        assert!(matches!(
+            adapter.lookup_account(&who[0]).await,
+            Err(NodeError::Internal(_))
+        ));
+        // An absent row is still the empty account, as in go.
+        assert!(adapter
+            .lookup_account_basic(&Address([0x78; 32]))
+            .await
+            .is_ok());
     }
 
     /// Issue #2157: go reports an absent account as the zero record updated to
@@ -8958,7 +9125,7 @@ mod tests {
             let l = ledger.lock().unwrap();
             (
                 l.last_committed_round().unwrap().unwrap(),
-                account_resource_parts(&*l, &who, 0),
+                account_resource_parts(&*l, &who, 0).unwrap(),
             )
         };
         assert_eq!(full.last_round, 3);
@@ -8992,9 +9159,6 @@ mod tests {
     }
 
     impl algo_ledger::ResourceReads for ScanCounter {
-        fn committed_rewards_level(&self) -> Option<u64> {
-            Some(0)
-        }
         fn get_account(&self, _: &Address) -> Option<AccountData> {
             self.account.clone()
         }
@@ -9068,7 +9232,7 @@ mod tests {
     #[test]
     fn account_over_the_resource_limit_is_rejected_without_scanning() {
         let r = ScanCounter::new(Some(account_with_totals(3, 2, 2, 1)));
-        let parts = account_resource_parts(&r, &Address([1; 32]), 7);
+        let parts = account_resource_parts(&r, &Address([1; 32]), 7).unwrap();
         assert_eq!(
             r.scans.get(),
             0,
@@ -9084,7 +9248,7 @@ mod tests {
     fn account_at_the_resource_limit_or_unlimited_is_scanned() {
         for limit in [8u64, 0] {
             let r = ScanCounter::new(Some(account_with_totals(3, 2, 2, 1)));
-            let parts = account_resource_parts(&r, &Address([1; 32]), limit);
+            let parts = account_resource_parts(&r, &Address([1; 32]), limit).unwrap();
             assert_eq!(r.scans.get(), 4, "limit {limit}");
             assert_eq!(parts.assets.len(), 1);
         }
@@ -9095,7 +9259,7 @@ mod tests {
     #[test]
     fn address_without_an_account_row_has_no_resources_and_no_scans() {
         let r = ScanCounter::new(None);
-        let parts = account_resource_parts(&r, &Address([1; 32]), 0);
+        let parts = account_resource_parts(&r, &Address([1; 32]), 0).unwrap();
         assert_eq!(r.scans.get(), 0);
         assert_eq!(parts.account_data, AccountData::default());
         assert!(parts.assets.is_empty() && parts.created_apps.is_empty());
@@ -9107,7 +9271,7 @@ mod tests {
     #[test]
     fn resource_lists_follow_the_rows_and_totals_follow_the_account_row() {
         let r = ScanCounter::new(Some(account_with_totals(0, 0, 0, 0)));
-        let parts = account_resource_parts(&r, &Address([1; 32]), 1);
+        let parts = account_resource_parts(&r, &Address([1; 32]), 1).unwrap();
         assert_eq!(r.scans.get(), 4);
         assert_eq!(parts.assets.len(), 1);
         assert_eq!(parts.account_data.total_assets_opted_in, 0);

@@ -103,6 +103,9 @@ pub struct LedgerReadPool {
     /// `(round, rewards_level)` of the last committed header read for a
     /// `lookup_agreement` reward fold. Only committed rounds are stored.
     rewards_cache: Mutex<Option<(u64, u64)>>,
+    /// Test counter: header reads that reached `blockdb` (cache misses).
+    #[cfg(test)]
+    pub(crate) header_reads: std::sync::atomic::AtomicUsize,
 }
 
 impl std::fmt::Debug for LedgerReadPool {
@@ -121,6 +124,8 @@ impl LedgerReadPool {
             block_path,
             idle: Mutex::new(Vec::new()),
             rewards_cache: Mutex::new(None),
+            #[cfg(test)]
+            header_reads: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -375,11 +380,18 @@ impl LedgerReadPool {
 /// composition over the same SQL and decoders.
 pub trait ResourceReads {
     fn get_account(&self, addr: &Address) -> Option<AccountData>;
+    /// Like [`Self::get_account`] but a read/decode failure is `Err`, not
+    /// "absent" (`Ok(None)` is a genuinely absent row, issue #2157).
+    fn account_row(&self, addr: &Address) -> Result<Option<AccountData>, AlgoError> {
+        Ok(self.get_account(addr))
+    }
     /// Rewards level of the committed tip (the header at the committed round,
     /// `acctrounds.acctbase`): the level go's `ledger.LookupAccount` brings an
     /// account up to (`WithUpdatedRewards`, issue #2157). `None` when it cannot
     /// be read (the pool caller then takes the locked path).
-    fn committed_rewards_level(&self) -> Option<u64>;
+    fn committed_rewards_level(&self) -> Option<u64> {
+        None
+    }
     fn get_asset_holding(&self, addr: &Address, asset_id: u64) -> Option<AssetHolding>;
     fn get_asset_params(&self, asset_id: u64) -> Option<AssetParamsRecord>;
     fn get_app_params(&self, app_id: u64) -> Option<AppParams>;
@@ -404,11 +416,11 @@ impl<T: LedgerStore + ?Sized> ResourceReads for T {
     fn get_account(&self, addr: &Address) -> Option<AccountData> {
         LedgerStore::get_account(self, addr)
     }
+    fn account_row(&self, addr: &Address) -> Result<Option<AccountData>, AlgoError> {
+        LedgerStore::try_get_account(self, addr)
+    }
     fn committed_rewards_level(&self) -> Option<u64> {
-        // The locked path holds the ledger, so its current rewards level is
-        // the committed tip's header level (the same value the pool reads
-        // from the header at `acctbase`).
-        Some(LedgerStore::rewards_level(self))
+        LedgerStore::committed_rewards_level(self).ok()
     }
     fn get_asset_holding(&self, addr: &Address, asset_id: u64) -> Option<AssetHolding> {
         LedgerStore::get_asset_holding(self, addr, asset_id)
@@ -468,6 +480,12 @@ impl<T: LedgerStore + ?Sized> ResourceReads for T {
 pub struct PoolReader<'a> {
     conn: &'a Connection,
     err: std::cell::Cell<Option<rusqlite::Error>>,
+    /// The snapshot's committed round (`acctrounds.acctbase`).
+    round: u64,
+    /// The pool's `(round, rewards_level)` header cache.
+    rewards_cache: &'a Mutex<Option<(u64, u64)>>,
+    #[cfg(test)]
+    header_reads: &'a std::sync::atomic::AtomicUsize,
 }
 
 impl PoolReader<'_> {
@@ -561,16 +579,62 @@ impl PoolReader<'_> {
 }
 
 impl ResourceReads for PoolReader<'_> {
+    fn account_row(&self, addr: &Address) -> Result<Option<AccountData>, AlgoError> {
+        let data: Option<Vec<u8>> = self
+            .conn
+            .prepare_cached("SELECT data FROM accountbase WHERE address = ?1")
+            .and_then(|mut s| {
+                s.query_row(params![addr.0.as_slice()], |row| row.get(0))
+                    .optional()
+            })
+            .map_err(|e| {
+                // Also fail the snapshot, like every other pooled read.
+                let msg = e.to_string();
+                let first = self.err.take();
+                self.err.set(first.or(Some(e)));
+                AlgoError::Ledger {
+                    message: format!("query accountbase error: {msg}"),
+                }
+            })?;
+        match data.map(|d| decode_account_data(&d)).transpose() {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let msg = e.to_string();
+                self.decoded::<()>(Err(e));
+                Err(AlgoError::Ledger {
+                    message: format!("decode accountbase data error: {msg}"),
+                })
+            }
+        }
+    }
+
+    /// The header level at the snapshot's committed round, through the pool's
+    /// one-entry cache: a hit costs no SQL and no header decode.
     fn committed_rewards_level(&self) -> Option<u64> {
+        if let Ok(g) = self.rewards_cache.lock() {
+            if let Some((r, level)) = *g {
+                if r == self.round {
+                    return Some(level);
+                }
+            }
+        }
+        #[cfg(test)]
+        self.header_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let hdr: Vec<u8> = self
             .ok(self
                 .conn
-                .prepare_cached(
-                    "SELECT hdrdata FROM blockdb.blocks WHERE rnd =                      (SELECT rnd FROM acctrounds WHERE id = 'acctbase')",
-                )
-                .and_then(|mut s| s.query_row([], |row| row.get(0)).optional()))
+                .prepare_cached("SELECT hdrdata FROM blockdb.blocks WHERE rnd = ?1")
+                .and_then(|mut s| {
+                    s.query_row(params![self.round as i64], |row| row.get(0))
+                        .optional()
+                }))
             .flatten()?;
-        Some(BlockHeader::decode_from_bytes(&hdr).ok()?.rewards_level)
+        let level = BlockHeader::decode_from_bytes(&hdr).ok()?.rewards_level;
+        if let Ok(mut g) = self.rewards_cache.lock() {
+            *g = Some((self.round, level));
+        }
+        Some(level)
     }
 
     fn get_account(&self, addr: &Address) -> Option<AccountData> {
@@ -772,9 +836,14 @@ impl LedgerReadPool {
                 .prepare_cached("SELECT rnd FROM acctrounds WHERE id = 'acctbase'")?
                 .query_row([], |row| row.get(0))
                 .optional()?;
+            let round = rnd.map(|v| v.max(0) as u64).unwrap_or(0);
             let reader = PoolReader {
                 conn: &tx,
                 err: std::cell::Cell::new(None),
+                round,
+                rewards_cache: &self.rewards_cache,
+                #[cfg(test)]
+                header_reads: &self.header_reads,
             };
             let out = f(&reader);
             if let Some(e) = reader.err.take() {
@@ -782,7 +851,7 @@ impl LedgerReadPool {
             }
             drop(reader);
             tx.commit()?;
-            Ok((rnd.map(|v| v.max(0) as u64).unwrap_or(0), out))
+            Ok((round, out))
         })
     }
 

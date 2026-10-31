@@ -7513,6 +7513,36 @@ impl LedgerStore for SqliteLedger {
 
     // ---- Accounts ----
 
+    fn try_get_account(&self, addr: &Address) -> Result<Option<AccountData>, AlgoError> {
+        let data: Option<Vec<u8>> = self
+            .conn
+            .query_row_cached(
+                "SELECT data FROM accountbase WHERE address = ?1",
+                params![addr.0.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("query accountbase error: {e}"),
+            })?;
+        data.map(|d| decode_account_data(&d)).transpose()
+    }
+
+    /// The committed tip's rewards level, from the SAME source as the lock-free
+    /// read pool: the persisted header at `acctrounds.acctbase`. Only a ledger
+    /// with no stored header at that round (an in-memory test ledger) falls
+    /// back to the in-memory current level, which equals the tip's.
+    fn committed_rewards_level(&self) -> Result<u64, AlgoError> {
+        let round = self.last_committed_round()?.unwrap_or(0);
+        if let Some(level) = self.rewards_cache.get(round) {
+            return Ok(level);
+        }
+        match self.get_block_header_data(round)? {
+            Some(_) => self.rewards_level_at(round),
+            None => Ok(self.rewards_level()),
+        }
+    }
+
     fn get_account(&self, addr: &Address) -> Option<AccountData> {
         let _st = crate::follow_timing::StateTimer::read();
         self.read_cache.get_or_load(
