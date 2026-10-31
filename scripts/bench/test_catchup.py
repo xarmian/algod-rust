@@ -1081,5 +1081,40 @@ class MockTierTest(unittest.TestCase):
         self.assertIn("n=2", md)
 
 
+class MockMonotoneTest(unittest.TestCase):
+    """A real node's newest round never moves backwards. The mock's algod-rust
+    side used to lag one round behind on alternate quarter-seconds, so a round
+    the gate had just agreed on (the minimum of both tips) could be 404 on the
+    next probe, and the gate reported "0 rounds served by both nodes" at random
+    (issue filed from the PR #2168 CI run)."""
+
+    def test_mock_last_round_never_decreases_for_either_side(self):
+        import catchup as tier
+        for impl in ("go", "rust"):
+            chain = tier.MockChain()
+            node = tier.MockNode(impl, chain, {"mock_fault": "none"})
+            node.trigger = chain.t0 - 10  # the catchup finished long ago: following the tip
+            prev = 0
+            for i in range(600):
+                now = chain.t0 + i * 0.0137
+                cur = node.status(now)["last-round"]
+                self.assertGreaterEqual(cur, prev, f"{impl} went backwards at step {i}")
+                prev = cur
+
+    def test_a_round_agreed_earlier_is_served_by_both_nodes_later(self):
+        import catchup as tier
+        chain = tier.MockChain()
+        nodes = {}
+        for impl in ("go", "rust"):
+            nodes[impl] = tier.MockNode(impl, chain, {"mock_fault": "none"})
+            nodes[impl].trigger = chain.t0 - 10
+        for i in range(300):
+            t = chain.t0 + i * 0.0211
+            agreed = min(nodes[x].status(t)["last-round"] for x in nodes)
+            for later in (t + 0.001, t + 0.13):
+                for x in nodes:
+                    self.assertLessEqual(agreed, nodes[x].status(later)["last-round"], (i, x))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -39,6 +39,7 @@ import os
 import re
 import statistics
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import baseline  # noqa: E402
@@ -422,24 +423,61 @@ def fmt_bool(v):
 
 
 def _block_re(section):
-    return re.compile(r"(<!-- bench-baseline:begin %s -->\n).*?(<!-- bench-baseline:end %s -->)"
+    # The end of the begin-marker line may be LF or CRLF (a doc checked out with
+    # autocrlf); the matched line ending is reused for the block.
+    return re.compile(r"(<!-- bench-baseline:begin %s -->(\r?\n)).*?(<!-- bench-baseline:end %s -->)"
                       % (re.escape(section), re.escape(section)), re.S)
+
+
+def tier_summary(rep):
+    """Per-tier counts of the paired rows, from the same rows the tables show.
+
+    Returns {tier: (paired, rust_faster, go_faster, inconclusive)}.
+    """
+    out = {}
+    for r in rep["rows"]:
+        if r["status"] != "paired":
+            continue
+        t = out.setdefault(r["tier"], [0, 0, 0, 0])
+        t[0] += 1
+        t[{"rust": 1, "go": 2}.get(r["faster"], 3)] += 1
+    return {k: tuple(v) for k, v in out.items()}
+
+
+def render_summary(rep):
+    """The generated headline: per-tier counts and how many rows were excluded."""
+    lines = ["#### Summary by tier", "",
+             "| Tier | Paired rows | Rust faster | Go faster | Inconclusive |",
+             "|---|---|---|---|---|"]
+    summ = tier_summary(rep)
+    for tier in sorted(summ):
+        lines.append("| " + " | ".join([tier] + [str(x) for x in summ[tier]]) + " |")
+    total = sum(v[0] for v in summ.values())
+    kept = len(baseline.extract_rows(rep))
+    lines += ["", f"{total} paired row(s) in total; {total - kept} paired row(s) excluded from "
+                  f"the baseline file (every paired row is kept, including rows whose Go or Rust "
+                  f"median is 0). Counts come from the tables below.", ""]
+    return "\n".join(lines)
 
 
 def publish_block(doc_text, section, rep, command):
     """Return doc_text with the `section` block replaced by a rendering of `rep`.
 
     The report's own title is dropped and its headings are demoted by two
-    levels so the block nests under the doc's own heading. A report that is
-    not ok is refused: a baseline must not be published from a run whose
-    equality gate or tiers failed.
+    levels so the block nests under the doc's own heading; a generated
+    summary by tier (counted from the same rows as the tables) leads it. A
+    report that is not ok is refused: a baseline must not be published from
+    a run whose equality gate or tiers failed. Line endings of the doc
+    (LF or CRLF) are preserved.
     """
     if not rep.get("ok"):
         raise ValueError("refusing to publish a report with errors: "
                          + "; ".join(rep.get("errors") or ["not ok"]))
     rx = _block_re(section)
-    if not rx.search(doc_text):
+    m = rx.search(doc_text)
+    if not m:
         raise ValueError(f"no `bench-baseline:begin {section}` / `end` markers in the doc")
+    eol = m.group(2)
     body = []
     for line in render_markdown(rep).splitlines():
         if line.startswith("# "):
@@ -448,8 +486,32 @@ def publish_block(doc_text, section, rep, command):
             line = "##" + line
         body.append(line)
     text = "\n".join(body).strip("\n")
-    block = f"Command: `{command}`\n\n{text}\n"
-    return rx.sub(lambda m: m.group(1) + block + m.group(2), doc_text, count=1)
+    block = f"Command: `{command}`\n\n{render_summary(rep)}\n{text}\n".replace("\n", eol)
+    return rx.sub(lambda mm: mm.group(1) + block + mm.group(3), doc_text, count=1)
+
+
+def _write_atomic_pair(files):
+    """Write [(path, text)] so that either every file is replaced or none is.
+
+    Every text goes to a temp file next to its target first; only when all of
+    them are written are they renamed over the targets. Text is written byte
+    for byte (the callers control line endings).
+    """
+    tmps = []
+    try:
+        for path, text in files:
+            fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp",
+                                       dir=os.path.dirname(os.path.abspath(path)))
+            tmps.append((tmp, path))
+            with os.fdopen(fd, "wb") as f:
+                f.write(text.encode("utf-8"))
+        for tmp, path in tmps:
+            os.replace(tmp, path)
+        tmps = []
+    finally:
+        for tmp, _ in tmps:
+            if os.path.exists(tmp):
+                os.remove(tmp)
 
 
 def publish_main(argv):
@@ -465,15 +527,20 @@ def publish_main(argv):
         rep = json.load(f)
     with open(args.doc, encoding="utf-8", newline="") as f:
         text = f.read()
+    date = args.date or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    # Compute both outputs before writing either, so a failure in one cannot
+    # leave the doc and the baseline file describing different runs.
     try:
-        new = publish_block(text, args.section, rep, args.command)
-    except ValueError as e:
+        new_doc = publish_block(text, args.section, rep, args.command)
+        new_baseline = baseline.render_baseline_file(args.baseline, args.section, rep, date)
+    except (ValueError, OSError) as e:
         print(f"publish: {e}", file=sys.stderr)
         return 1
-    date = args.date or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-    with open(args.doc, "w", encoding="utf-8", newline="\n") as f:
-        f.write(new)
-    baseline.update_baseline_file(args.baseline, args.section, rep, date)
+    try:
+        _write_atomic_pair([(args.doc, new_doc), (args.baseline, new_baseline)])
+    except OSError as e:
+        print(f"publish: cannot write: {e}", file=sys.stderr)
+        return 1
     print(f"published section {args.section!r} to {args.doc} and {args.baseline}")
     return 0
 

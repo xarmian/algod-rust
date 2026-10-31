@@ -1049,7 +1049,7 @@ benchmark: bench-micro bench-micro-go ## Run all microbenchmarks (Rust + Go)
 ## Issue #2102 (epic #2101, Phase 23): reproducible Go vs Rust comparison.
 ## Runs the selected tiers (scripts/bench/tiers/<tier>.{py,sh}), building
 ## go-algorand at the pinned tag + algod-rust --release first when a tier
-## needs binaries (BENCH_BUILD=auto|always|never), and writes
+## needs binaries (BENCH_BUILD=auto|always|never|prebuilt), and writes
 ## $(BENCH_OUTPUT)/<utc-ts>/report.{json,md}. See docs/BENCHMARK_COMPARISON.md.
 ##   make bench-compare TIERS=selftest RUNS=5
 TIERS ?= selftest

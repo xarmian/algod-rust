@@ -109,6 +109,26 @@ def prepare_run_dir(run_dir, clean):
             os.remove(p)
 
 
+def use_prebuilt(bin_dir, dest):
+    """Adopt <bin_dir>/build-info.json (from build_both.sh) as the run's build info.
+
+    Returns an error string, or None when build-info.json exists and every
+    binary it lists is present under bin_dir.
+    """
+    src = os.path.join(bin_dir, "build-info.json")
+    try:
+        with open(src, encoding="utf-8") as f:
+            info = json.load(f)
+    except (OSError, ValueError) as e:
+        return f"cannot read {src}: {e}"
+    for side in ("go_algorand", "algod_rust"):
+        for rel in (info.get(side) or {}).get("binaries") or []:
+            if not os.path.isfile(os.path.join(bin_dir, rel)):
+                return f"{side} binary {rel} listed in {src} is missing"
+    shutil.copyfile(src, dest)
+    return None
+
+
 def _command(path):
     return [sys.executable, path] if path.endswith(".py") else ["bash", path]
 
@@ -144,7 +164,10 @@ def main(argv=None):
                     help="clear a reused --run-dir's previous artifacts first "
                          "(a non-empty run dir is refused otherwise)")
     ap.add_argument("--out-root", default=os.path.join(REPO_ROOT, "bench-results"))
-    ap.add_argument("--build", choices=("auto", "always", "never"), default="auto")
+    ap.add_argument("--build", choices=("auto", "always", "never", "prebuilt"), default="auto",
+                    help="prebuilt: binaries and build-info.json were already made by "
+                         "build_both.sh into --bin-dir (CI builds once, e.g. to make the "
+                         "Docker image from the same binary); no build, tiers are not skipped")
     ap.add_argument("--tiers-dir", default=TIERS_DIR)
     ap.add_argument("--go-algorand", default=os.environ.get(
         "GO_ALGORAND_DIR", os.path.join(os.path.dirname(REPO_ROOT), "go-algorand")))
@@ -195,7 +218,14 @@ def main(argv=None):
     build_info = os.path.join(run_dir, "build-info.json")
     needs = {t: tier_needs_build(available[t]) for t in selected}
     built = None
-    if args.build == "always" or (args.build == "auto" and any(needs.values())):
+    if args.build == "prebuilt":
+        err = use_prebuilt(args.bin_dir, build_info)
+        if err:
+            print(f"bench-compare: --build prebuilt: {err}", file=sys.stderr)
+            return 2
+        built = True
+        write_fingerprint()
+    elif args.build == "always" or (args.build == "auto" and any(needs.values())):
         print("== build (build_both.sh)")
         t0 = time.monotonic()
         rc = _stream(["bash", os.path.join(HERE, "build_both.sh"), "--out", run_dir,

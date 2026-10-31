@@ -29,7 +29,14 @@ import sys
 import tempfile
 import unittest
 
-import yaml
+try:
+    import yaml
+except ImportError:  # `make bench-compare-test` does not need PyYAML for the other tests
+    if os.environ.get("CI"):
+        raise  # CI installs it: a missing PyYAML there must fail, not skip silently
+    yaml = None
+
+needs_yaml = unittest.skipIf(yaml is None, "PyYAML is not installed")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -49,6 +56,7 @@ def triggers(doc):
     return doc.get("on", doc.get(True))
 
 
+@needs_yaml
 class WorkflowInterfaceTest(unittest.TestCase):
     def setUp(self):
         self.doc, self.text = load()
@@ -168,13 +176,38 @@ class WorkflowInterfaceTest(unittest.TestCase):
         self.assertIn("GITHUB_STEP_SUMMARY", summ["run"])
         self.assertIn("report.md", summ["run"])
 
-    def test_docker_image_only_when_a_container_tier_is_selected(self):
-        for name in ("Set up Docker Buildx", "Build the algod-rust node image"):
-            self.assertIn("has_docker == 'true'", self.step(name)["if"])
+    def test_image_is_made_from_the_built_binary_not_compiled_again(self):
+        img = self.step("Build the algod-rust node image")
+        self.assertIn("has_docker == 'true'", img["if"])
+        self.assertIn("docker/Dockerfile.bench-prebuilt", img["run"])
+        self.assertTrue(os.path.exists(os.path.join(ROOT, "docker", "Dockerfile.bench-prebuilt")))
+        # no second compile: no docker/Dockerfile builder stage, no build-push-action
+        self.assertNotIn("build-push-action", self.text)
+        self.assertNotIn("docker/Dockerfile ", img["run"] + " ")
         env = self.step("small corpus")["env"]
         self.assertEqual(env["BENCH_REST_RUST_IMAGE"], env["BENCH_LOCALNET_RUST_IMAGE"])
-        tag = self.step("Build the algod-rust node image")["with"]["tags"]
-        self.assertEqual(env["BENCH_REST_RUST_IMAGE"], tag)
+        self.assertIn(f"-t {env['BENCH_REST_RUST_IMAGE']} ", img["run"])
+        with open(os.path.join(ROOT, "docker", "Dockerfile.bench-prebuilt"), encoding="utf-8") as f:
+            self.assertIn("COPY algod-rust /usr/local/bin/algod-rust", f.read())
+
+    def test_binaries_are_built_once_before_the_image_and_the_tiers(self):
+        names = [st.get("name", "") for st in self.steps]
+        build = next(i for i, n in enumerate(names) if n.startswith("Build both"))
+        image = next(i for i, n in enumerate(names) if n.startswith("Build the algod-rust node image"))
+        main = next(i for i, n in enumerate(names) if "small corpus" in n)
+        testnet = next(i for i, n in enumerate(names) if "testnet-prefix50" in n)
+        self.assertLess(build, image)
+        self.assertLess(image, main)
+        self.assertLess(main, testnet)
+        run = self.steps[build]["run"]
+        self.assertIn("scripts/bench/build_both.sh", run)
+        self.assertIn('--out "$BENCH_BIN_DIR"', run)
+        self.assertIn('--bin-dir "$BENCH_BIN_DIR"', run)
+        # both tier invocations adopt that build instead of compiling again
+        for n in ("small corpus", "testnet-prefix50"):
+            st = self.step(n)
+            self.assertIn("BENCH_BUILD=", st["run"])
+            self.assertIn("build_mode", st["run"] + str(st.get("env")))
 
     def test_make_variables_exist(self):
         with open(os.path.join(ROOT, "Makefile"), encoding="utf-8") as f:
@@ -183,6 +216,7 @@ class WorkflowInterfaceTest(unittest.TestCase):
             self.assertRegex(mk, rf"(?m)^{var} \?=")
 
 
+@needs_yaml
 class ResolveInputsStepTest(unittest.TestCase):
     """Run the workflow's own validation script with bash."""
 
@@ -232,12 +266,22 @@ class ResolveInputsStepTest(unittest.TestCase):
             self.assertNotEqual(rc, 0, bad)
             self.assertIn("::error::", out)
 
-    def test_dry_run_needs_replay(self):
+    def test_dry_run_needs_replay_and_runs_only_replay(self):
         rc, _, out = self.run_step(tiers="micro", dry="true")
         self.assertNotEqual(rc, 0)
         self.assertIn("replay", out)
-        rc, kv, _ = self.run_step(tiers="replay", dry="true")
-        self.assertEqual((rc, kv["dry_run"]), (0, "true"))
+        rc, kv, _ = self.run_step(tiers="micro,replay,rest,localnet", dry="true")
+        self.assertEqual(rc, 0)
+        # the gate failure is proven in replay alone: no image, no other tier,
+        # no second corpus
+        self.assertEqual((kv["dry_run"], kv["tiers"], kv["has_docker"], kv["testnet"]),
+                         ("true", "replay", "false", "false"))
+
+    def test_build_mode_follows_the_tiers(self):
+        rc, kv, _ = self.run_step(tiers="micro")
+        self.assertEqual((rc, kv["has_build"], kv["build_mode"]), (0, "false", "auto"))
+        rc, kv, _ = self.run_step(tiers="micro,rest")
+        self.assertEqual((rc, kv["has_build"], kv["build_mode"]), (0, "true", "prebuilt"))
 
 
 if __name__ == "__main__":

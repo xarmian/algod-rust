@@ -1,0 +1,26 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+# Issue #2109 (epic #2101): the algod-rust image the bench-compare CI workflow
+# gives the rest/localnet tiers, made from the `algod-rust` binary that
+# scripts/bench/build_both.sh already built on the runner, so the workflow
+# compiles algod-rust once (docker/Dockerfile's builder stage would compile it
+# a second time, without the runner's Rust cache).
+#
+# The base image must be the runner's own OS release (BASE_IMAGE), because the
+# binary is linked against the runner's glibc. The runtime settings mirror the
+# `runtime` stage of docker/Dockerfile (packages, MALLOC_ARENA_MAX, entrypoint).
+#
+#   docker build -f docker/Dockerfile.bench-prebuilt \
+#     --build-arg BASE_IMAGE=ubuntu:$(. /etc/os-release; echo "$VERSION_ID") \
+#     -t algod-rust:bench-compare target/bench-compare/rust
+ARG BASE_IMAGE=ubuntu:24.04
+FROM ${BASE_IMAGE}
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY algod-rust /usr/local/bin/algod-rust
+ENV MALLOC_ARENA_MAX=2
+WORKDIR /app
+ENTRYPOINT ["algod-rust"]
+CMD ["follow", "--algod-url", "http://algod-go:8080"]

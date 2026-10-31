@@ -107,9 +107,18 @@ jobs:
             case "$t" in micro|replay|rest|localnet) ;; *) echo "::error::tier '$t' is not one of micro,replay,rest,localnet"; exit 1;; esac
           done
           has() { case ",$tiers," in *",$1,"*) echo true;; *) echo false;; esac; }
-          if [ "$dry" = true ] && [ "$(has replay)" != true ]; then
-            echo "::error::dry_run_gate_failure corrupts the replay corpus, so tiers must include replay"; exit 1
+          if [ "$dry" = true ]; then
+            [ "$(has replay)" = true ] || { echo "::error::dry_run_gate_failure corrupts the replay corpus, so tiers must include replay"; exit 1; }
+            # The gate failure is proven in replay alone: no image build, no other
+            # tier, no second corpus. The job is expected to end red.
+            tiers=replay
+            testnet=false
           fi
+          docker_tier=false
+          { [ "$(has rest)" = true ] || [ "$(has localnet)" = true ]; } && docker_tier=true
+          # Everything except micro runs binaries built once by build_both.sh.
+          build=false
+          { [ "$(has replay)" = true ] || [ "$docker_tier" = true ]; } && build=true
           {
             echo "tiers=$tiers"
             echo "runs=$runs"
@@ -118,8 +127,10 @@ jobs:
             echo "fail_on_regression=$fail"
             echo "dry_run=$dry"
             echo "has_replay=$(has replay)"
-            echo "has_docker=$([ "$(has rest)" = true ] || [ "$(has localnet)" = true ] && echo true || echo false)"
+            echo "has_docker=$docker_tier"
             echo "has_micro=$(has micro)"
+            echo "has_build=$build"
+            echo "build_mode=$([ "$build" = true ] && echo prebuilt || echo auto)"
           } >> "$GITHUB_OUTPUT"
           cat "$GITHUB_OUTPUT"
       - name: Workflow-interface and harness tests
@@ -165,25 +176,29 @@ jobs:
           set -euo pipefail
           git clone --quiet --depth 1 --branch "$TAG" https://github.com/algorand/go-algorand "$GO_ALGORAND_DIR"
           make -C "$GO_ALGORAND_DIR" libsodium
-      - name: Set up Docker Buildx
+      - name: Build both implementations once (build_both.sh)
+        if: steps.cfg.outputs.has_build == 'true'
+        run: |
+          set -euo pipefail
+          # One compile of algod-rust (with the Rust cache) and of go-algorand; the
+          # tiers below adopt it with BENCH_BUILD=prebuilt, and the container tiers'
+          # image is made from the same binary.
+          bash scripts/bench/build_both.sh --out "$BENCH_BIN_DIR" --bin-dir "$BENCH_BIN_DIR" \
+            --go-algorand "$GO_ALGORAND_DIR"
+      - name: Build the algod-rust node image from the built binary
         if: steps.cfg.outputs.has_docker == 'true'
-        uses: docker/setup-buildx-action@v4
-      - name: Build the algod-rust node image (layer-cached)
-        if: steps.cfg.outputs.has_docker == 'true'
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: docker/Dockerfile
-          target: runtime
-          tags: algod-rust:bench-compare
-          load: true
-          cache-from: type=gha,scope=bench-compare
-          cache-to: type=gha,mode=max,scope=bench-compare
+        run: |
+          set -euo pipefail
+          # The binary is linked against the runner's glibc: use its OS release as base.
+          base="ubuntu:$(. /etc/os-release; echo "$VERSION_ID")"
+          docker build -f docker/Dockerfile.bench-prebuilt --build-arg "BASE_IMAGE=$base" \
+            -t algod-rust:bench-compare "$BENCH_BIN_DIR/rust"
       - name: make bench-compare (selected tiers, small corpus)
         id: main
         env:
           TIERS: ${{ steps.cfg.outputs.tiers }}
           RUNS: ${{ steps.cfg.outputs.runs }}
+          BUILD_MODE: ${{ steps.cfg.outputs.build_mode }}
           BENCH_REST_PROFILE: ${{ steps.cfg.outputs.profile }}
           BENCH_LOCALNET_PROFILE: ${{ steps.cfg.outputs.profile }}
           BENCH_REST_RUST_IMAGE: algod-rust:bench-compare
@@ -196,16 +211,17 @@ jobs:
           BENCH_MICRO_CRITERION_ARGS: --warm-up-time 0.5 --measurement-time 1
         run: |
           set -euo pipefail
-          make bench-compare TIERS="$TIERS" CORPUS=small RUNS="$RUNS" \
+          make bench-compare TIERS="$TIERS" CORPUS=small RUNS="$RUNS" BENCH_BUILD="$BUILD_MODE" \
             BENCH_RUN_DIR=bench-results/main GO_ALGORAND_DIR="$GO_ALGORAND_DIR"
       - name: make bench-compare TIERS=replay CORPUS=testnet-prefix50 (real certificates)
         id: testnet
         if: steps.cfg.outputs.has_replay == 'true' && steps.cfg.outputs.testnet == 'true'
         env:
           RUNS: ${{ steps.cfg.outputs.runs }}
+          BUILD_MODE: ${{ steps.cfg.outputs.build_mode }}
         run: |
           set -euo pipefail
-          make bench-compare TIERS=replay CORPUS=testnet-prefix50 RUNS="$RUNS" \
+          make bench-compare TIERS=replay CORPUS=testnet-prefix50 RUNS="$RUNS" BENCH_BUILD="$BUILD_MODE" \
             BENCH_RUN_DIR=bench-results/testnet-prefix50 GO_ALGORAND_DIR="$GO_ALGORAND_DIR"
       - name: Regression check vs the published baseline (warns, does not fail)
         # always(): a regression table is useful even when a later tier failed;

@@ -45,13 +45,25 @@ equals `corpus.json` on both sides; the REST responses are equal modulo the
 issue-linked allowlist; both localnets confirmed the same txid set), so every
 row below is a like-for-like measurement.
 
-| Tier | Rust faster | Go faster | Inconclusive | What stands out |
-|---|---|---|---|---|
-| micro (28 pairs) | 9 | 16 | 2 | Go is 1.1x to 2.1x faster on codec encode/decode, txid and the txn commitments; certificate and proposal decode are 2.7x and 2.9x slower in Rust. Rust is faster on Ed25519 (1.15x), VRF and credential verification (1.4x). |
-| replay, small corpus | 2 | 4 | 0 | Go replays in 1.3 s, Rust in 4.8 s (3.6x slower wall clock); Rust uses 1.9x less CPU time and 7.3x less peak RSS. |
-| replay, testnet-prefix50 | 2 | 4 | 0 | Go 0.11 s, Rust 0.37 s (3.2x slower), startup-dominated; Rust peak RSS 5.2x lower. |
-| rest (smoke, c4) | 26 | 4 | 10 | Rust is ahead or level on every endpoint except `simulate`, where it serves 4.6x fewer requests/s (1,112 vs 5,068). |
-| localnet (smoke) | 4 | 4 | 10 | Level on throughput and latency within round quantisation; Rust peak RSS 6.5x lower and block-device writes about 70x lower. |
+The per-tier row counts (paired, Rust faster, Go faster, inconclusive) are
+generated: each block below starts with a "Summary by tier" table counted from
+the same rows as its result tables, and states how many paired rows were
+excluded (none). What stands out, in words (the figures are medians of the
+tables below):
+
+- **micro**: Go is 1.1x to 2.1x faster on codec encode/decode, txid and the
+  txn commitments; certificate and proposal decode are 2.7x and 2.9x slower in
+  Rust. Rust is faster on Ed25519 (1.15x), VRF and credential verification
+  (1.4x).
+- **replay, small corpus**: Go replays in 1.3 s, Rust in 4.8 s (3.6x slower
+  wall clock); Rust uses 1.9x less CPU time and 7.3x less peak RSS.
+- **replay, testnet-prefix50**: Go 0.11 s, Rust 0.37 s (3.2x slower),
+  startup-dominated; Rust peak RSS 5.2x lower.
+- **rest (smoke, c4)**: Rust is ahead or level on every endpoint except
+  `simulate`, where it serves 4.6x fewer requests/s (1,112 vs 5,068).
+- **localnet (smoke)**: level on throughput and latency within round
+  quantisation; Rust peak RSS 6.5x lower and block-device writes about 70x
+  lower.
 
 ## Environment and how to reproduce
 
@@ -92,6 +104,17 @@ directories of the commands above. Spread is the min-max range (n = 3).
 
 <!-- bench-baseline:begin local-main -->
 Command: `BENCH_REST_PROFILE=smoke BENCH_LOCALNET_PROFILE=smoke make bench-compare TIERS=micro,replay,rest,localnet CORPUS=small RUNS=3`
+
+#### Summary by tier
+
+| Tier | Paired rows | Rust faster | Go faster | Inconclusive |
+|---|---|---|---|---|
+| localnet | 22 | 4 | 4 | 14 |
+| micro | 27 | 9 | 16 | 2 |
+| replay | 6 | 2 | 4 | 0 |
+| rest | 50 | 26 | 4 | 20 |
+
+105 paired row(s) in total; 0 paired row(s) excluded from the baseline file (every paired row is kept, including rows whose Go or Rust median is 0). Counts come from the tables below.
 
 Generated 2026-10-31T13:40:35Z. Methodology and fairness rules: [docs/BENCHMARK_COMPARISON.md](https://github.com/xarmian/algod-rust/blob/main/docs/BENCHMARK_COMPARISON.md).
 
@@ -274,6 +297,14 @@ Rust/Go is the ratio of the medians. For lower-is-better units a value below 1 m
 <!-- bench-baseline:begin local-testnet-prefix50 -->
 Command: `make bench-compare TIERS=replay CORPUS=testnet-prefix50 RUNS=3`
 
+#### Summary by tier
+
+| Tier | Paired rows | Rust faster | Go faster | Inconclusive |
+|---|---|---|---|---|
+| replay | 6 | 2 | 4 | 0 |
+
+6 paired row(s) in total; 0 paired row(s) excluded from the baseline file (every paired row is kept, including rows whose Go or Rust median is 0). Counts come from the tables below.
+
 Generated 2026-10-31T13:40:47Z. Methodology and fairness rules: [docs/BENCHMARK_COMPARISON.md](https://github.com/xarmian/algod-rust/blob/main/docs/BENCHMARK_COMPARISON.md).
 
 **Status: OK.** 6 paired row(s): Rust faster 2, Go faster 4, inconclusive 0; 0 unpaired.
@@ -385,12 +416,31 @@ default container limits of 2 CPUs / 3 GB), uploads each run
 directory as an artifact and the reports as the job summary, and fails on any
 equality-gate failure (`dry_run_gate_failure` proves that). It then compares
 each report with the sections of [`benchmarks/baseline.json`](../benchmarks/baseline.json)
-written by the publish step: for every paired row the Rust/Go ratio is compared
-with the published ratio and a worsening of more than 25% is raised as a
-warning annotation (it fails the job only with `fail_on_regression`). The
-ratio, not the absolute time, is compared because a CI runner moves both sides.
-On shared runners ratios are noisy, particularly tail latencies of the 1-second
-REST steps, so a warning means "re-run on quiet hardware", not "regression".
+written by the publish step. For every paired row (a zero or undefined ratio is
+kept and compared by its medians) a worsening of Rust of more than 25% is raised
+as a warning annotation. The Rust/Go ratio, not the absolute time, is compared
+because a CI runner moves both sides. A row only counts as a regression when it
+was conclusive in the baseline or its Rust min-max range no longer overlaps the
+baseline's (otherwise it is listed as `noise`), a move of one round on the
+quantised `rounds` rows is not a change, and a jump from a zero baseline (an
+error rate going from 0 to N) always counts. Each baseline section records its
+host class (`dev-host` for the published laptop/desktop run, `ci-github-actions`
+for a runner); memory, disk and CPU rows (units `MB`, `cores`) are only compared
+within one host class and are `skipped-host` otherwise. The job fails (instead of
+warning) only with `fail_on_regression`, and then also when a baseline section
+or a baseline row is missing from the run, so a renamed section cannot disable
+the gate silently. On shared runners ratios are still noisy, particularly tail
+latencies of the 1-second REST steps, so a warning means "re-run on quiet
+hardware", not "regression".
+
+**CI-runner baseline.** The two sections above come from a desktop, and a
+4-vCPU runner differs from it in more than speed. The first green
+`workflow_dispatch` run of `bench-compare` should therefore be published as the
+CI-runner baseline, with a distinct section name (for example `ci-runner-main`
+and `ci-runner-testnet-prefix50`, after adding the matching marker pair to this
+file), taken from the downloaded `bench-compare-results` artifact with
+`report.py --publish`, and the workflow's regression step then pointed at those
+sections. No CI-runner numbers are published yet.
 Details: [BENCHMARK_COMPARISON.md, CI workflow and published baseline](BENCHMARK_COMPARISON.md#ci-workflow-and-published-baseline).
 
 To refresh the baseline after a deliberate change (an optimization from #2110,

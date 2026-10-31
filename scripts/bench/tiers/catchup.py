@@ -359,7 +359,10 @@ class MockNode:
         t_done = self.trigger + l1 + l2 + l3
         tip = self.chain.tip(now)
         replayed = MOCK_ROUND0 + int((now - t_done) * MOCK_REPLAY_RPS[self.impl])
-        rnd = min(tip - (1 if self.impl == "rust" and int(now * 4) % 2 else 0), replayed)
+        # algod-rust trails the Go node by a constant round; a real node's newest round
+        # never moves backwards (a lag that came and went made a round the gate had just
+        # agreed on 404 on the next probe: "0 rounds served by both nodes", at random).
+        rnd = min(tip - (1 if self.impl == "rust" else 0), replayed)
         return dict(base, **{"last-round": max(rnd, MOCK_ROUND0)})
 
     def start(self):
