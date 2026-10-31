@@ -490,28 +490,34 @@ impl AlgodNodeInterface {
     /// One committed read for an account lookup: `read(reader, rewards_level)`
     /// on a single read-pool snapshot, returning `(committed round, rewards
     /// level, result)`. The tip's rewards level is read FIRST, so a snapshot
-    /// with no readable tip header is abandoned before any scan runs; the
-    /// locked ledger then answers (the same composition on the same SQL, with
-    /// the level from the same persisted header). `use_pool = false` forces the
-    /// locked path (an in-memory ledger or a pool miss reaches it anyway).
+    /// with no readable tip header is abandoned before any scan runs and the
+    /// locked ledger answers (the same composition on the same SQL, the level
+    /// from the same persisted header). ONLY snapshot-level failures fall
+    /// back (no pool, a pool read error, an unreadable tip header); an `Err`
+    /// from `read` itself (overflow, an internal error) is returned as is,
+    /// with no second scan.
     fn committed_read<T>(
         &self,
         method: &'static str,
-        use_pool: bool,
+        path: ReadPath,
         read: impl Fn(&dyn algo_ledger::ResourceReads, u64) -> Result<T, NodeError>,
     ) -> Result<(u64, u64, T), NodeError> {
-        if use_pool {
+        use algo_ledger::ResourceReads as _;
+        if path == ReadPath::Pool {
             let pooled = self.pooled_resources(|r| {
-                let level = algo_ledger::ResourceReads::committed_rewards_level(r)?;
-                read(r, level).ok().map(|v| (level, v))
+                let level = r.committed_rewards_level().ok()?;
+                Some((level, read(r, level)))
             });
-            if let Some((round, Some((level, v)))) = pooled {
-                return Ok((round, level, v));
+            match pooled {
+                Some((round, Some((level, Ok(v))))) => return Ok((round, level, v)),
+                Some((_, Some((_, Err(e))))) => return Err(e),
+                _ => {}
             }
         }
         let ledger = self.lock_ledger(method)?;
         let round = Self::committed_round(&ledger, method)?;
-        let level = algo_ledger::LedgerStore::committed_rewards_level(&*ledger)
+        let level = ledger
+            .committed_rewards_level()
             .map_err(|e| NodeError::Internal(format!("{method}: rewards level: {e}")))?;
         let v = read(&*ledger, level)?;
         Ok((round, level, v))
@@ -520,47 +526,59 @@ impl AlgodNodeInterface {
     /// `GET /v2/accounts/{addr}`'s lookup, go's `ledger.LookupAccount`: the
     /// account brought up to the committed tip's rewards level, with the
     /// amount from before the rewards as `amount-without-pending-rewards`.
-    /// `basic` is the `exclude=all` shape (no resource scans).
+    /// [`LookupKind::Basic`] is the `exclude=all` shape (no resource scans).
     ///
     /// Issue #2155: `AccountData` decoded from `accountbase` carries NO
     /// resources (they live in the `resources` table), so the held assets,
     /// created assets/apps and app local states are composed from the
     /// resource accessors, as go's `AccountDataToAccount` lists them. The
     /// locked fallback is reached for an in-memory ledger (no pool) or after a
-    /// pool SQL error; it reads under the ledger mutex because the accessors
-    /// need the ledger itself, and the scans are bounded by `max_resources`.
-    fn account_lookup(
+    /// snapshot-level failure; it reads under the ledger mutex because the
+    /// accessors need the ledger itself, and the scans are bounded by
+    /// `max_resources`.
+    fn account_lookup(&self, addr: &Address, kind: LookupKind) -> Result<AccountLookup, NodeError> {
+        self.account_lookup_via(addr, kind, ReadPath::Pool)
+    }
+
+    /// [`Self::account_lookup`] forced onto the locked ledger (tests compare it
+    /// with the pool path).
+    #[cfg(test)]
+    fn account_lookup_locked(
         &self,
         addr: &Address,
-        basic: bool,
-        use_pool: bool,
+        kind: LookupKind,
     ) -> Result<AccountLookup, NodeError> {
-        let method = if basic {
-            "lookup_account_basic"
-        } else {
-            "lookup_account"
+        self.account_lookup_via(addr, kind, ReadPath::Locked)
+    }
+
+    fn account_lookup_via(
+        &self,
+        addr: &Address,
+        kind: LookupKind,
+        path: ReadPath,
+    ) -> Result<AccountLookup, NodeError> {
+        let method = match kind {
+            LookupKind::Full => "lookup_account",
+            LookupKind::Basic => "lookup_account_basic",
         };
         let max = self.max_api_resources_per_account_cfg;
-        let (last_round, _, (without, parts)) =
-            self.committed_read(method, use_pool, |r, level| {
-                let mut parts = if basic {
-                    // An absent row is the empty account (as in go); an unreadable
-                    // one is an error, never a valid empty account.
-                    let account_data = r
+        let (last_round, _, (without, parts)) = self.committed_read(method, path, |r, level| {
+            let mut parts = match kind {
+                // An absent row is the empty account (as in go); an unreadable
+                // one is an error, never a valid empty account.
+                LookupKind::Basic => AccountResourceParts {
+                    account_data: r
                         .account_row(addr)
                         .map_err(|e| NodeError::Internal(format!("{method}: {e}")))?
-                        .unwrap_or_default();
-                    AccountResourceParts {
-                        account_data,
-                        ..Default::default()
-                    }
-                } else {
-                    account_resource_parts(r, addr, max)
-                        .map_err(|e| NodeError::Internal(format!("{method}: {e}")))?
-                };
-                let without = apply_pending_rewards(&mut parts.account_data, level, method)?;
-                Ok((without, parts))
-            })?;
+                        .unwrap_or_default(),
+                    ..Default::default()
+                },
+                LookupKind::Full => account_resource_parts(r, addr, max)
+                    .map_err(|e| NodeError::Internal(format!("{method}: {e}")))?,
+            };
+            let without = apply_pending_rewards(&mut parts.account_data, level, addr, method)?;
+            Ok((without, parts))
+        })?;
         Ok(AccountLookup {
             amount_without_pending_rewards: without,
             assets: parts.assets,
@@ -1224,6 +1242,46 @@ struct AccountResourceParts {
     created_apps: std::collections::BTreeMap<u64, AppParams>,
 }
 
+/// Which account lookup shape: the full one or `exclude=all`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LookupKind {
+    Full,
+    Basic,
+}
+
+/// Where a committed read runs: the lock-free read pool (falling back to the
+/// locked ledger on a snapshot-level failure) or the locked ledger directly.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ReadPath {
+    Pool,
+    /// Tests force the locked ledger to compare it with the pool.
+    #[cfg(test)]
+    Locked,
+}
+
+/// Accounts served as stored because their rewards base is above the tip's
+/// rewards level (see [`apply_pending_rewards`]).
+static BASE_ABOVE_LEVEL_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BASE_ABOVE_LEVEL_LAST_LOG: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+const BASE_ABOVE_LEVEL_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Whether a rate-limited event may log at `now`: the first one, then at most
+/// one per `interval`. Records `now` when it allows.
+fn rate_limit_allows(
+    last: &Mutex<Option<std::time::Instant>>,
+    now: std::time::Instant,
+    interval: Duration,
+) -> bool {
+    let mut g = last.lock().unwrap_or_else(|e| e.into_inner());
+    match *g {
+        Some(t) if now.saturating_duration_since(t) < interval => false,
+        _ => {
+            *g = Some(now);
+            true
+        }
+    }
+}
+
 /// go's `ledger.LookupAccount`: bring `account` up to the committed tip's
 /// rewards level (`basics.WithUpdatedRewards`) and return the amount BEFORE
 /// the pending rewards (`amount-without-pending-rewards`). The REST layer then
@@ -1233,26 +1291,31 @@ struct AccountResourceParts {
 /// A rewards base ABOVE the level (a catchpoint-restored or lagging ledger
 /// whose level source trails the account rows) is not an error: go panics only
 /// on arithmetic overflow, and the other lookups (`lookup_agreement_account`,
-/// expired stake) guard `level >= base`. The account is served as stored and a
-/// warning is logged once per 1000 occurrences. Only a true overflow is an
-/// error here.
+/// expired stake) guard `level >= base`. The account is served as stored, the
+/// occurrence is counted ([`BASE_ABOVE_LEVEL_TOTAL`]) and a warning with the
+/// address, base and level is logged at most once per minute. Only a true
+/// overflow is an error here.
 fn apply_pending_rewards(
     account: &mut AccountData,
     rewards_level: u64,
+    addr: &Address,
     method: &str,
 ) -> Result<u64, NodeError> {
-    static BASE_ABOVE_LEVEL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let without = account.micro_algos;
     if account.status != algo_types::AccountStatus::NotParticipating
         && account.rewards_base > rewards_level
     {
-        let n = BASE_ABOVE_LEVEL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n.is_multiple_of(1000) {
+        let total = BASE_ABOVE_LEVEL_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if rate_limit_allows(
+            &BASE_ABOVE_LEVEL_LAST_LOG,
+            std::time::Instant::now(),
+            BASE_ABOVE_LEVEL_LOG_INTERVAL,
+        ) {
             warn!(
-                "{method}: account rewards base {} is above the tip's rewards level {rewards_level}; \
-                 serving it without pending rewards ({} occurrences so far)",
+                "{method}: account {} has rewards base {} above the tip's rewards level \
+                 {rewards_level}; serving it without pending rewards ({total} so far)",
+                addr.to_algorand_string(),
                 account.rewards_base,
-                n + 1
             );
         }
         return Ok(without);
@@ -1872,11 +1935,11 @@ impl NodeInterface for AlgodNodeInterface {
     // ---- Account state ----
 
     async fn lookup_account(&self, addr: &Address) -> Result<AccountLookup, NodeError> {
-        self.account_lookup(addr, false, true)
+        self.account_lookup(addr, LookupKind::Full)
     }
 
     async fn lookup_account_basic(&self, addr: &Address) -> Result<AccountLookup, NodeError> {
-        self.account_lookup(addr, true, true)
+        self.account_lookup(addr, LookupKind::Basic)
     }
 
     // ---- Asset / app / box resource lookups (TASK-266) ----
@@ -8939,7 +9002,7 @@ mod tests {
             rewards_base: 861,
             ..Default::default()
         };
-        let without = apply_pending_rewards(&mut a, 862, "t").unwrap();
+        let without = apply_pending_rewards(&mut a, 862, &Address([0; 32]), "t").unwrap();
         assert_eq!(without, 990_852_362_144);
         assert_eq!(a.micro_algos, 990_853_352_996);
         assert_eq!(a.micro_algos - without, 990_852);
@@ -8951,14 +9014,17 @@ mod tests {
             rewards_base: 30,
             ..Default::default()
         };
-        assert_eq!(apply_pending_rewards(&mut b, 25, "t").unwrap(), 5_000_000);
+        assert_eq!(
+            apply_pending_rewards(&mut b, 25, &Address([0; 32]), "t").unwrap(),
+            5_000_000
+        );
         assert_eq!((b.micro_algos, b.rewards_base), (5_000_000, 30));
         // True arithmetic overflow stays an error (go panics), as does no level.
         let mut c = AccountData {
             micro_algos: 5_000_000,
             ..Default::default()
         };
-        assert!(apply_pending_rewards(&mut c, u64::MAX, "t").is_err());
+        assert!(apply_pending_rewards(&mut c, u64::MAX, &Address([0; 32]), "t").is_err());
     }
 
     /// Review item 9: for the same ledger state the read-pool path and the
@@ -8973,8 +9039,13 @@ mod tests {
         let absent = Address([0x79; 32]);
         for addr in who.iter().chain([&absent]) {
             for basic in [false, true] {
-                let pooled = adapter.account_lookup(addr, basic, true).unwrap();
-                let locked = adapter.account_lookup(addr, basic, false).unwrap();
+                let kind = if basic {
+                    LookupKind::Basic
+                } else {
+                    LookupKind::Full
+                };
+                let pooled = adapter.account_lookup(addr, kind).unwrap();
+                let locked = adapter.account_lookup_locked(addr, kind).unwrap();
                 assert_eq!(pooled.last_round, locked.last_round);
                 assert_eq!(
                     pooled.amount_without_pending_rewards,
@@ -8985,52 +9056,105 @@ mod tests {
             }
         }
         // And both are the go values (Online account: +75 pending).
-        let l = adapter.account_lookup(&who[0], false, false).unwrap();
+        let l = adapter
+            .account_lookup_locked(&who[0], LookupKind::Full)
+            .unwrap();
         assert_eq!(
             l.account_data.micro_algos - l.amount_without_pending_rewards,
             75
         );
     }
 
-    /// Review item 3: a snapshot with no readable tip header is abandoned
-    /// BEFORE any scan, so the resource scans run once (on the locked path),
-    /// not once on the pool and again on the locked path.
+    /// Review item 3 / Z3: a snapshot with no readable tip header is abandoned
+    /// BEFORE any scan, and the locked path (file-backed, so no in-memory
+    /// guess) reports the missing level as an error: no scan runs at all.
     #[tokio::test]
-    async fn a_missing_tip_header_does_not_repeat_the_scans() {
-        let (dir, ledger, who) = file_backed_ledger_with_rewards_level();
-        let adapter = make_adapter_with_ledger(ledger);
+    async fn an_unreadable_tip_header_is_an_error_before_any_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut l = SqliteLedger::open_with_prefix(&dir.path().join("ledger")).unwrap();
+        l.begin_block().unwrap();
+        l.set_current_round(Round(1));
+        l.put_block(1, CONSENSUS_V41, b"junk", b"junk").unwrap();
+        l.put_block_cert(1, &[0x80]).unwrap();
+        l.commit_block().unwrap();
+        let adapter = make_adapter_with_ledger(Arc::new(Mutex::new(l)));
+        assert!(adapter.read_pool().is_some());
         let scans = std::cell::Cell::new(0u32);
-        let run = |use_pool| {
-            scans.set(0);
-            adapter
-                .committed_read("test", use_pool, |r, level| {
-                    scans.set(scans.get() + 1);
-                    r.account_row(&who[0])
-                        .map_err(|e| NodeError::Internal(e.to_string()))
-                        .map(|a| (level, a))
-                })
-                .unwrap()
-        };
-        let (round, level, _) = run(true);
-        assert_eq!((round, level, scans.get()), (3, REWARDS_TIP_LEVEL, 1));
+        let res = adapter.committed_read("test", ReadPath::Pool, |_, _| {
+            scans.set(scans.get() + 1);
+            Ok(())
+        });
+        assert!(matches!(res, Err(NodeError::Internal(_))));
+        assert_eq!(scans.get(), 0, "no scan may run without a readable level");
+    }
 
-        // Remove the committed tip's header: the pool cannot read a level.
-        let w = rusqlite::Connection::open(algo_ledger::block_path_for_prefix(
-            &dir.path().join("ledger"),
-        ))
-        .unwrap();
-        w.execute("DELETE FROM blocks WHERE rnd = 3", []).unwrap();
-        drop(w);
-        // Fresh pool state: the cached level must not hide the missing header.
-        let adapter = make_adapter_with_ledger(adapter.ledger.clone());
-        let scans2 = std::cell::Cell::new(0u32);
-        adapter
-            .committed_read("test", true, |_, _| {
-                scans2.set(scans2.get() + 1);
-                Ok(())
+    /// Review Z2: only snapshot-level failures fall back to the locked path; a
+    /// deterministic error from the read itself is returned after exactly one
+    /// scan, not repeated on the locked ledger.
+    #[tokio::test]
+    async fn a_read_error_is_returned_after_exactly_one_scan() {
+        let (_dir, ledger, _) = file_backed_ledger_with_rewards_level();
+        let adapter = make_adapter_with_ledger(ledger);
+        assert!(adapter.read_pool().is_some());
+        let scans = std::cell::Cell::new(0u32);
+        let res: Result<(u64, u64, ()), _> =
+            adapter.committed_read("test", ReadPath::Pool, |_, _| {
+                scans.set(scans.get() + 1);
+                Err(NodeError::Internal("boom".to_string()))
+            });
+        match res {
+            Err(NodeError::Internal(m)) => assert_eq!(m, "boom"),
+            other => panic!("expected the closure's error, got {other:?}"),
+        }
+        assert_eq!(scans.get(), 1, "the failing scan must not be repeated");
+        // A successful read still runs once, on the pool.
+        scans.set(0);
+        let (round, level, _) = adapter
+            .committed_read("test", ReadPath::Pool, |_, level| {
+                scans.set(scans.get() + 1);
+                Ok(level)
             })
             .unwrap();
-        assert_eq!(scans2.get(), 1, "scans must run once, not pool then locked");
+        assert_eq!((round, level, scans.get()), (3, REWARDS_TIP_LEVEL, 1));
+    }
+
+    /// Review Z4: the base-above-level warning is limited by TIME (first event
+    /// logs, then at most one per interval) and every occurrence is counted.
+    #[test]
+    fn base_above_level_warning_is_time_rate_limited_and_counted() {
+        let last = Mutex::new(None);
+        let t0 = std::time::Instant::now();
+        let every = Duration::from_secs(60);
+        assert!(rate_limit_allows(&last, t0, every));
+        assert!(!rate_limit_allows(
+            &last,
+            t0 + Duration::from_secs(30),
+            every
+        ));
+        assert!(!rate_limit_allows(
+            &last,
+            t0 + Duration::from_secs(59),
+            every
+        ));
+        assert!(rate_limit_allows(
+            &last,
+            t0 + Duration::from_secs(61),
+            every
+        ));
+        assert!(!rate_limit_allows(
+            &last,
+            t0 + Duration::from_secs(62),
+            every
+        ));
+
+        let before = BASE_ABOVE_LEVEL_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
+        let mut a = AccountData {
+            micro_algos: 5_000_000,
+            rewards_base: 30,
+            ..Default::default()
+        };
+        apply_pending_rewards(&mut a, 25, &Address([9; 32]), "t").unwrap();
+        assert!(BASE_ABOVE_LEVEL_TOTAL.load(std::sync::atomic::Ordering::Relaxed) > before);
     }
 
     /// Review item 1: a rewards base ABOVE the tip's level (a catchpoint-restored
@@ -9159,6 +9283,12 @@ mod tests {
     }
 
     impl algo_ledger::ResourceReads for ScanCounter {
+        fn account_row(&self, _: &Address) -> Result<Option<AccountData>, algo_error::AlgoError> {
+            Ok(self.account.clone())
+        }
+        fn committed_rewards_level(&self) -> Result<u64, algo_error::AlgoError> {
+            Ok(0)
+        }
         fn get_account(&self, _: &Address) -> Option<AccountData> {
             self.account.clone()
         }

@@ -114,7 +114,7 @@ pub trait LedgerStore {
     /// Rewards level of the committed tip: the level go's `LookupAccount`
     /// brings an account up to. Stores with persisted headers read the header
     /// at the committed round; the default is the in-memory current level.
-    fn committed_rewards_level(&self) -> Result<u64, AlgoError> {
+    fn tip_rewards_level(&self) -> Result<u64, AlgoError> {
         Ok(self.rewards_level())
     }
 

@@ -6845,8 +6845,10 @@ impl SqliteLedger {
         self.read_cache.set_enabled(enabled);
     }
 
-    fn get_account_sql(&self, addr: &Address) -> Option<AccountData> {
-        let result: Option<Vec<u8>> = self
+    /// The `accountbase` row for `addr`: `Ok(None)` only when it is absent; a
+    /// SQL or decode failure is an error.
+    fn load_account_checked(&self, addr: &Address) -> Result<Option<AccountData>, AlgoError> {
+        let data: Option<Vec<u8>> = self
             .conn
             .query_row_cached(
                 "SELECT data FROM accountbase WHERE address = ?1",
@@ -6854,13 +6856,12 @@ impl SqliteLedger {
                 |row| row.get(0),
             )
             .optional()
-            .unwrap_or_else(|e| {
-                tracing::warn!("SQLite error querying account: {}", e);
-                None
-            });
-
-        result.and_then(|data| decode_account_data(&data).ok())
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("query accountbase error: {e}"),
+            })?;
+        data.map(|d| decode_account_data(&d)).transpose()
     }
+
 
     fn set_account_sql(&mut self, addr: &Address, account: AccountData) {
         let old = self.get_account(addr);
@@ -7513,44 +7514,47 @@ impl LedgerStore for SqliteLedger {
 
     // ---- Accounts ----
 
+    /// Read-through the block-scoped memo like every other state read (it is
+    /// only active inside a block); an `Err` is never memoised, and `Ok(None)`
+    /// is a genuinely absent row.
     fn try_get_account(&self, addr: &Address) -> Result<Option<AccountData>, AlgoError> {
-        let data: Option<Vec<u8>> = self
-            .conn
-            .query_row_cached(
-                "SELECT data FROM accountbase WHERE address = ?1",
-                params![addr.0.as_slice()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| AlgoError::Ledger {
-                message: format!("query accountbase error: {e}"),
-            })?;
-        data.map(|d| decode_account_data(&d)).transpose()
+        let _st = crate::follow_timing::StateTimer::read();
+        self.read_cache.get_or_try_load(
+            self.cache_active(),
+            |m| &mut m.accounts,
+            *addr,
+            || self.load_account_checked(addr),
+        )
+    }
+
+    fn get_account(&self, addr: &Address) -> Option<AccountData> {
+        match LedgerStore::try_get_account(self, addr) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("get_account: {e}");
+                None
+            }
+        }
     }
 
     /// The committed tip's rewards level, from the SAME source as the lock-free
-    /// read pool: the persisted header at `acctrounds.acctbase`. Only a ledger
-    /// with no stored header at that round (an in-memory test ledger) falls
-    /// back to the in-memory current level, which equals the tip's.
-    fn committed_rewards_level(&self) -> Result<u64, AlgoError> {
+    /// read pool: the persisted header at `acctrounds.acctbase`. The in-memory
+    /// current level (which may belong to an in-flight scratch round) is used
+    /// ONLY by a ledger that has no block store at all (an in-memory test
+    /// ledger) or has committed nothing yet (round 0); a file-backed ledger
+    /// with no readable tip header is an error, never a guess.
+    fn tip_rewards_level(&self) -> Result<u64, AlgoError> {
         let round = self.last_committed_round()?.unwrap_or(0);
         if let Some(level) = self.rewards_cache.get(round) {
             return Ok(level);
         }
         match self.get_block_header_data(round)? {
             Some(_) => self.rewards_level_at(round),
-            None => Ok(self.rewards_level()),
+            None if self.read_pool.is_none() || round == 0 => Ok(self.rewards_level()),
+            None => Err(AlgoError::Ledger {
+                message: format!("no block header at committed round {round} to read its rewards level from"),
+            }),
         }
-    }
-
-    fn get_account(&self, addr: &Address) -> Option<AccountData> {
-        let _st = crate::follow_timing::StateTimer::read();
-        self.read_cache.get_or_load(
-            self.cache_active(),
-            |m| &mut m.accounts,
-            *addr,
-            || self.get_account_sql(addr),
-        )
     }
 
     fn set_account(&mut self, addr: &Address, account: AccountData) {

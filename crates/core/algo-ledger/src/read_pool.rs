@@ -100,12 +100,57 @@ pub struct LedgerReadPool {
     tracker_path: PathBuf,
     block_path: PathBuf,
     idle: Mutex<Vec<Connection>>,
-    /// `(round, rewards_level)` of the last committed header read for a
-    /// `lookup_agreement` reward fold. Only committed rounds are stored.
-    rewards_cache: Mutex<Option<(u64, u64)>>,
+    /// Rewards levels of recently read committed headers, shared by the
+    /// `lookup_agreement` reward fold (round `r - lookback`) and the account
+    /// lookups (the tip), so neither evicts the other. Only committed rounds
+    /// are stored.
+    rewards_cache: RewardsLevels,
     /// Test counter: header reads that reached `blockdb` (cache misses).
     #[cfg(test)]
     pub(crate) header_reads: std::sync::atomic::AtomicUsize,
+}
+
+/// Small bounded per-round memo of committed headers' rewards levels. A
+/// committed header never changes, so an entry never goes stale; the bound
+/// only caps memory (oldest entry evicted first).
+#[derive(Default)]
+struct RewardsLevels(Mutex<Vec<(u64, u64)>>);
+
+const REWARDS_LEVEL_SLOTS: usize = 8;
+
+impl RewardsLevels {
+    /// The cached level of `round`, else `load()` it (a miss that cannot load
+    /// is `None` and is not cached).
+    fn get_or_load(&self, round: u64, load: impl FnOnce() -> Option<u64>) -> Option<u64> {
+        if let Ok(g) = self.0.lock() {
+            if let Some((_, level)) = g.iter().find(|(r, _)| *r == round) {
+                return Some(*level);
+            }
+        }
+        let level = load()?;
+        if let Ok(mut g) = self.0.lock() {
+            if !g.iter().any(|(r, _)| *r == round) {
+                if g.len() >= REWARDS_LEVEL_SLOTS {
+                    g.remove(0);
+                }
+                g.push((round, level));
+            }
+        }
+        Some(level)
+    }
+}
+
+/// The rewards level in `blockdb.blocks.hdrdata` for `round`. The one header
+/// read both the agreement fold and the tip lookup use, so they cannot drift:
+/// `Ok(None)` is an absent or undecodable header (the caller falls back).
+fn header_rewards_level(conn: &Connection, round: u64) -> Result<Option<u64>, rusqlite::Error> {
+    let hdr: Option<Vec<u8>> = conn
+        .prepare_cached("SELECT hdrdata FROM blockdb.blocks WHERE rnd = ?1")?
+        .query_row(params![round as i64], |row| row.get(0))
+        .optional()?;
+    Ok(hdr
+        .and_then(|h| BlockHeader::decode_from_bytes(&h).ok())
+        .map(|h| h.rewards_level))
 }
 
 impl std::fmt::Debug for LedgerReadPool {
@@ -123,7 +168,7 @@ impl LedgerReadPool {
             tracker_path,
             block_path,
             idle: Mutex::new(Vec::new()),
-            rewards_cache: Mutex::new(None),
+            rewards_cache: RewardsLevels::default(),
             #[cfg(test)]
             header_reads: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -297,22 +342,14 @@ impl LedgerReadPool {
     /// Rewards level of the committed header at `round`; `None` when the
     /// header is not readable (caller falls back).
     fn rewards_level_at(&self, round: u64) -> Option<u64> {
-        if let Ok(g) = self.rewards_cache.lock() {
-            if let Some((r, level)) = *g {
-                if r == round {
-                    return Some(level);
-                }
-            }
-        }
-        let hdr = match self.block_header_data(round) {
-            PoolRead::Found(h) => h,
-            _ => return None,
-        };
-        let level = BlockHeader::decode_from_bytes(&hdr).ok()?.rewards_level;
-        if let Ok(mut g) = self.rewards_cache.lock() {
-            *g = Some((round, level));
-        }
-        Some(level)
+        self.rewards_cache.get_or_load(round, || {
+            #[cfg(test)]
+            self.header_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.with_conn(|c| header_rewards_level(c, round))
+                .ok()
+                .flatten()
+        })
     }
 
     /// Lock-free `SqliteLedger::lookup_agreement_account`: go's
@@ -382,16 +419,12 @@ pub trait ResourceReads {
     fn get_account(&self, addr: &Address) -> Option<AccountData>;
     /// Like [`Self::get_account`] but a read/decode failure is `Err`, not
     /// "absent" (`Ok(None)` is a genuinely absent row, issue #2157).
-    fn account_row(&self, addr: &Address) -> Result<Option<AccountData>, AlgoError> {
-        Ok(self.get_account(addr))
-    }
+    fn account_row(&self, addr: &Address) -> Result<Option<AccountData>, AlgoError>;
     /// Rewards level of the committed tip (the header at the committed round,
     /// `acctrounds.acctbase`): the level go's `ledger.LookupAccount` brings an
-    /// account up to (`WithUpdatedRewards`, issue #2157). `None` when it cannot
+    /// account up to (`WithUpdatedRewards`, issue #2157). `Err` when it cannot
     /// be read (the pool caller then takes the locked path).
-    fn committed_rewards_level(&self) -> Option<u64> {
-        None
-    }
+    fn committed_rewards_level(&self) -> Result<u64, AlgoError>;
     fn get_asset_holding(&self, addr: &Address, asset_id: u64) -> Option<AssetHolding>;
     fn get_asset_params(&self, asset_id: u64) -> Option<AssetParamsRecord>;
     fn get_app_params(&self, app_id: u64) -> Option<AppParams>;
@@ -419,8 +452,8 @@ impl<T: LedgerStore + ?Sized> ResourceReads for T {
     fn account_row(&self, addr: &Address) -> Result<Option<AccountData>, AlgoError> {
         LedgerStore::try_get_account(self, addr)
     }
-    fn committed_rewards_level(&self) -> Option<u64> {
-        LedgerStore::committed_rewards_level(self).ok()
+    fn committed_rewards_level(&self) -> Result<u64, AlgoError> {
+        LedgerStore::tip_rewards_level(self)
     }
     fn get_asset_holding(&self, addr: &Address, asset_id: u64) -> Option<AssetHolding> {
         LedgerStore::get_asset_holding(self, addr, asset_id)
@@ -483,7 +516,7 @@ pub struct PoolReader<'a> {
     /// The snapshot's committed round (`acctrounds.acctbase`).
     round: u64,
     /// The pool's `(round, rewards_level)` header cache.
-    rewards_cache: &'a Mutex<Option<(u64, u64)>>,
+    rewards_cache: &'a RewardsLevels,
     #[cfg(test)]
     header_reads: &'a std::sync::atomic::AtomicUsize,
 }
@@ -609,32 +642,22 @@ impl ResourceReads for PoolReader<'_> {
     }
 
     /// The header level at the snapshot's committed round, through the pool's
-    /// one-entry cache: a hit costs no SQL and no header decode.
-    fn committed_rewards_level(&self) -> Option<u64> {
-        if let Ok(g) = self.rewards_cache.lock() {
-            if let Some((r, level)) = *g {
-                if r == self.round {
-                    return Some(level);
-                }
-            }
-        }
-        #[cfg(test)]
-        self.header_reads
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let hdr: Vec<u8> = self
-            .ok(self
-                .conn
-                .prepare_cached("SELECT hdrdata FROM blockdb.blocks WHERE rnd = ?1")
-                .and_then(|mut s| {
-                    s.query_row(params![self.round as i64], |row| row.get(0))
-                        .optional()
-                }))
-            .flatten()?;
-        let level = BlockHeader::decode_from_bytes(&hdr).ok()?.rewards_level;
-        if let Ok(mut g) = self.rewards_cache.lock() {
-            *g = Some((self.round, level));
-        }
-        Some(level)
+    /// shared per-round cache: a hit costs no SQL and no header decode.
+    fn committed_rewards_level(&self) -> Result<u64, AlgoError> {
+        self.rewards_cache
+            .get_or_load(self.round, || {
+                #[cfg(test)]
+                self.header_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.ok(header_rewards_level(self.conn, self.round))
+                    .flatten()
+            })
+            .ok_or_else(|| AlgoError::Ledger {
+                message: format!(
+                    "no readable block header at committed round {} for its rewards level",
+                    self.round
+                ),
+            })
     }
 
     fn get_account(&self, addr: &Address) -> Option<AccountData> {

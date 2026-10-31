@@ -916,8 +916,8 @@ fn commit_with_level(l: &mut SqliteLedger, round: u64, level: u64) {
 }
 
 /// Issue #2157 review: the pool's committed rewards level goes through its
-/// one-entry cache -- the second read costs no `blockdb` header read -- and a
-/// newly committed round is read fresh.
+/// cache -- the second read costs no `blockdb` header read -- and a newly
+/// committed round is read fresh.
 #[test]
 fn committed_rewards_level_is_served_from_the_pool_cache() {
     use std::sync::atomic::Ordering;
@@ -925,20 +925,67 @@ fn committed_rewards_level_is_served_from_the_pool_cache() {
     let pool = l.read_pool().unwrap();
     commit_with_level(&mut l, 1, 111);
     let level = || {
-        pool.read_resources(|r| r.committed_rewards_level())
-            .unwrap()
+        let (r, lvl) = pool
+            .read_resources(|r| r.committed_rewards_level())
+            .unwrap();
+        (r, lvl.unwrap())
     };
-    assert_eq!(level(), (1, Some(111)));
+    assert_eq!(level(), (1, 111));
     assert_eq!(pool.header_reads.load(Ordering::SeqCst), 1);
-    assert_eq!(level(), (1, Some(111)));
+    assert_eq!(level(), (1, 111));
     assert_eq!(
         pool.header_reads.load(Ordering::SeqCst),
         1,
         "the second lookup must not read the header from blockdb again"
     );
     commit_with_level(&mut l, 2, 222);
-    assert_eq!(level(), (2, Some(222)));
+    assert_eq!(level(), (2, 222));
     assert_eq!(pool.header_reads.load(Ordering::SeqCst), 2);
+}
+
+/// Review Z1: the agreement fold (round `r - lookback`) and the account
+/// lookups (the tip) share the cache without evicting each other: alternating
+/// them reads each header from `blockdb` exactly once.
+#[test]
+fn agreement_and_tip_lookups_do_not_evict_each_other() {
+    use std::sync::atomic::Ordering;
+    let (_dir, mut l) = file_ledger();
+    let pool = l.read_pool().unwrap();
+    l.begin_block().unwrap();
+    l.set_current_round(Round(1));
+    l.put_block_header_fixture(1, 100).unwrap();
+    l.put_online_account_at_round(
+        &addr(1),
+        1,
+        &AccountData {
+            micro_algos: 5_000_000,
+            status: AccountStatus::Online,
+            vote_id: Some([7u8; 32]),
+            selection_id: Some([8u8; 32]),
+            vote_key_dilution: 100,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    l.commit_block().unwrap();
+    commit_with_level(&mut l, 2, 150);
+    commit_with_level(&mut l, 3, 200);
+    for _ in 0..3 {
+        // Agreement at round 1, account lookup at the tip (round 3).
+        assert!(matches!(
+            pool.lookup_agreement_account(&addr(1), 1),
+            PoolRead::Found(Some(_))
+        ));
+        let (r, lvl) = pool
+            .read_resources(|r| r.committed_rewards_level())
+            .unwrap();
+        assert_eq!((r, lvl.unwrap()), (3, 200));
+    }
+    assert_eq!(
+        pool.header_reads.load(Ordering::SeqCst),
+        2,
+        "one header read per distinct round, however the callers alternate"
+    );
 }
 
 /// Issue #2157 review: the pool and the locked path take the committed rewards
@@ -954,32 +1001,51 @@ fn committed_rewards_level_agrees_between_pool_and_locked_paths() {
             .read_resources(|r| r.committed_rewards_level())
             .unwrap();
         assert_eq!(r, round);
-        assert_eq!(pooled, Some(level));
+        assert_eq!(pooled.unwrap(), level);
         assert_eq!(
-            LedgerStore::committed_rewards_level(&l).unwrap(),
+            LedgerStore::tip_rewards_level(&l).unwrap(),
             level,
             "locked path at round {round}"
         );
-        assert_eq!(ResourceReads::committed_rewards_level(&l), Some(level));
+        assert_eq!(ResourceReads::committed_rewards_level(&l).unwrap(), level);
     }
 }
 
-/// Issue #2157 review: a missing tip header is `None` on the pool (the caller
-/// falls back before scanning) and the documented in-memory fallback on a
-/// ledger without a stored header.
+/// Issue #2157 review (Z3): a missing tip header is an error on the pool (the
+/// caller falls back before scanning) and on a FILE-BACKED locked ledger (never
+/// the in-memory level, which may belong to a scratch round); only a ledger
+/// with no block store at all uses the documented in-memory fallback.
 #[test]
 fn committed_rewards_level_without_a_header() {
-    let (_dir, mut l) = file_ledger();
+    let (dir, mut l) = file_ledger();
     let pool = l.read_pool().unwrap();
     stage(&mut l, 1, 1, 10); // bogus "hdr-1" bytes: undecodable, not a level
     l.commit_block().unwrap();
     let (_, pooled) = pool
         .read_resources(|r| r.committed_rewards_level())
         .unwrap();
-    assert_eq!(pooled, None);
+    assert!(pooled.is_err());
+    assert!(LedgerStore::tip_rewards_level(&l).is_err());
+
+    // A file-backed ledger whose tip header row is gone: error, no guess.
+    let (dir2, mut f) = file_ledger();
+    f.set_rewards_level(999); // an in-flight scratch level that must not be served
+    commit_with_level(&mut f, 1, 5);
+    let w = Connection::open(crate::sqlite::block_path_for_prefix(
+        &dir2.path().join("ledger"),
+    ))
+    .unwrap();
+    w.execute("DELETE FROM blocks WHERE rnd = 1", []).unwrap();
+    assert!(
+        LedgerStore::tip_rewards_level(&f).is_err(),
+        "a file-backed ledger must not fall back to the in-memory level"
+    );
+    drop(dir);
+
+    // No block store at all: the in-memory level.
     let mut mem = SqliteLedger::open_in_memory().unwrap();
     mem.set_rewards_level(77);
-    assert_eq!(LedgerStore::committed_rewards_level(&mem).unwrap(), 77);
+    assert_eq!(LedgerStore::tip_rewards_level(&mem).unwrap(), 77);
 }
 
 /// Issue #2157 review: `account_row` tells an absent row from an undecodable
@@ -1009,4 +1075,59 @@ fn account_row_distinguishes_absent_from_unreadable() {
         "an undecodable row fails the pool snapshot"
     );
     assert!(ResourceReads::account_row(&l, &addr(1)).is_err());
+}
+
+/// Review Z7: `try_get_account` reads through the block-scoped memo (a second
+/// in-block lookup is a hit, not another SQL read + decode), an absent row is
+/// memoised as absent, and an undecodable row errors every time -- an error is
+/// never memoised as "absent". Outside a block the memo is inactive for every
+/// store read (as before this change), so there is nothing to regress there.
+#[test]
+fn try_get_account_reads_through_the_block_memo_but_never_caches_errors() {
+    let (dir, mut l) = file_ledger();
+    commit(&mut l, 1, 1, 10);
+    commit(&mut l, 2, 2, 20);
+    l.begin_block().unwrap();
+    l.set_current_round(Round(3));
+    let (h0, m0) = l.read_cache_stats();
+    assert_eq!(
+        l.try_get_account(&addr(1)).unwrap().unwrap().micro_algos,
+        10
+    );
+    assert_eq!(
+        l.try_get_account(&addr(1)).unwrap().unwrap().micro_algos,
+        10
+    );
+    let (h1, m1) = l.read_cache_stats();
+    assert_eq!((h1 - h0, m1 - m0), (1, 1), "second lookup is a memo hit");
+    assert!(l.try_get_account(&addr(9)).unwrap().is_none());
+    assert!(l.try_get_account(&addr(9)).unwrap().is_none());
+    let (h2, m2) = l.read_cache_stats();
+    assert_eq!((h2 - h1, m2 - m1), (1, 1), "an absent row is memoised too");
+    l.rollback_block().unwrap();
+
+    let w = Connection::open(crate::sqlite::tracker_path_for_prefix(
+        &dir.path().join("ledger"),
+    ))
+    .unwrap();
+    w.execute(
+        "UPDATE accountbase SET data = ?1 WHERE address = ?2",
+        params![vec![0xc1u8], addr(2).0.to_vec()],
+    )
+    .unwrap();
+    drop(w);
+    l.begin_block().unwrap();
+    l.set_current_round(Round(3));
+    let (_, m3) = l.read_cache_stats();
+    assert!(l.try_get_account(&addr(2)).is_err());
+    assert!(l.try_get_account(&addr(2)).is_err());
+    let (_, m4) = l.read_cache_stats();
+    assert_eq!(
+        m4 - m3,
+        2,
+        "both reads went to SQL: the error was not cached"
+    );
+    // And `get_account` still reports it as no record (logged), as before.
+    assert!(LedgerStore::get_account(&l, &addr(2)).is_none());
+    l.rollback_block().unwrap();
 }
