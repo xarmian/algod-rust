@@ -6,6 +6,11 @@
 
 # bench-stress.sh — issue #100 mixed-cluster stress benchmark.
 #
+# INTEROP, not a comparison (issue #2106): the six nodes share one network, so
+# the Go and Rust halves load and slow each other and the per-implementation
+# numbers are confounded. For Go-vs-Rust numbers use the homogeneous
+# `make bench-compare TIERS=localnet` instead.
+#
 # Brings up the 6-node topology in docker-compose.stress-test.yml (1 Go relay +
 # 1 Rust relay, fully meshed; 2 Go + 2 Rust participation nodes each dialing
 # both relays), drives it with `algod-rust loadgen` at a configurable sustained

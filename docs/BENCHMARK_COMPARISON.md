@@ -30,6 +30,7 @@ make bench-compare TIERS=selftest RUNS=5
 - [The `micro` tier](#the-micro-tier)
 - [Workload corpus](#workload-corpus)
 - [The `replay` tier](#the-replay-tier)
+- [The `localnet` tier](#the-localnet-tier)
 
 ## Quick start
 
@@ -343,7 +344,7 @@ whenever `build_both.sh` or the pin file changes. It asserts
 | `selftest` | available (#2102) | The harness itself: both "sides" run the same Python sha256 workload. It checks the schema, pairing, statistics and report on any machine, and it is what CI runs. |
 | `micro` | available (#2103) | Paired Go `testing.B` / Rust criterion micro-benchmarks on identical fixture bytes: codec, crypto, commitments, AVM, agreement. See [The `micro` tier](#the-micro-tier). |
 | `replay` | available (#2105) | Offline ledger replay of the deterministic block corpus (#2104) through go-algorand's ledger and algod-rust's production catchup path, with a final-state equality gate. See [The `replay` tier](#the-replay-tier). |
-| `localnet` | planned (#2106) | All-Go vs all-Rust homogeneous localnet throughput under the same load. |
+| `localnet` | available (#2106) | All-Go vs all-Rust homogeneous localnet throughput and latency under the same load, with a same-txid-set gate. See [The `localnet` tier](#the-localnet-tier). |
 | `rest` | planned (#2107) | REST API throughput against identical ledger state. |
 | `catchup` | planned (#2108) | Public-network fast catchup and follow. |
 
@@ -1076,4 +1077,177 @@ go build -o goreplay ./benchmarks/go-replay
 ./goreplay -corpus benchmarks/corpus/small -data /tmp/g -out /tmp/g.json
 # Rust side:
 algod-rust bench replay-corpus --corpus benchmarks/corpus/small --data-dir /tmp/r --output /tmp/r.json
+```
+
+## The `localnet` tier
+
+```bash
+make bench-compare TIERS=localnet RUNS=3                       # the full ladder
+make bench-compare TIERS=localnet RUNS=1 BENCH_LOCALNET_PROFILE=smoke   # a few minutes
+```
+
+The tier answers "how much does an all-Rust network commit, and how quickly,
+compared with an all-Go network, on the same host under the same load?". It
+needs Docker with Compose v2 and network access to pull
+`algorand/algod:<pinned tag>` (once). It builds the algod-rust image from
+`docker/Dockerfile` (`--target runtime`, cached after the first build); it
+does not use `build_both.sh`, because both implementations run inside
+containers.
+
+### Why not a mixed cluster
+
+`make bench-stress` and `make bench-cluster` run **mixed** clusters (Go and
+Rust nodes in one network). They are good for **interoperability**: do the
+two implementations agree, gossip and certify together. They cannot say
+which implementation is faster. Every round's block is proposed by whichever
+node wins the sortition, every vote needs both halves, and a slow Rust node
+slows the Go nodes' round and the other way round. CPU, RSS and latency in
+such a run are therefore confounded, and the same goes for TPS. Their numbers
+are **interop** numbers, not a comparison. Use this tier for comparison.
+
+### Topology and limits
+
+Two clusters, run one after the other on one host, with the same shape:
+
+```text
+            relay  (gossip listener 4161, REST 8080)
+          /  |  |  \
+      part1 part2 part3 part4     one online wallet each, 25% of the stake
+```
+
+| | `go` | `rust` |
+|---|---|---|
+| Image | `algorand/algod:<tag from scripts/bench/go-algorand.pin>` (the official image of the pinned release) | `algod-rust:bench-localnet`, built from this checkout |
+| Process | the image entrypoint (`algod`) | `algod-rust participate` |
+| Relay | `NetAddress 0.0.0.0:4161` | `--listen-address 0.0.0.0:4161 --relay-messages`, no keys |
+| Participation node | dials `relay:4161`, key from its node directory | `--peers relay:4161 --import-partkey <the same .partkey>` |
+
+What is identical by construction (`scripts/bench/localnet_lib.py`,
+`topology`; `ll.shape` and the unit tests pin it):
+
+- **Genesis.** One `goal network create` per run, then copied into a private
+  tree for each cluster. Both clusters therefore share the genesis hash, the
+  four participation keys and the consensus version (`future`). The 16
+  deterministic load accounts are funded **in the genesis** (as
+  NotParticipating accounts: they never accrue rewards, so a balance depends
+  only on the transactions applied), so no funding transaction differs between
+  the clusters. The tier asserts the two genesis hashes are equal.
+- **Fresh genesis every run.** `goal network create` stamps the genesis with its
+  creation time and both nodes clamp block timestamps to `prev.ts + 25 s`
+  (CLAUDE.md, "Mixed-cluster soaks must start from a fresh genesis"). The tier
+  never reuses a network between runs or between the two clusters' runs.
+- **Resource limits.** Every container of both clusters gets the same
+  `cpus` and `mem_limit` (`BENCH_LOCALNET_CPUS`, default 2;
+  `BENCH_LOCALNET_MEM`, default 3g), no restart policy, and its own bridge
+  network. The load generator is **not** limited and not part of either
+  cluster.
+- **Node-local config.** The pool and queue sizes and the 500 ms proposal
+  assembly window of `docker/scripts/stress-bootstrap.sh` are written into every
+  node's `config.json`. algod-rust reads the subset it implements, so the same
+  file is a like-for-like input rather than proof that every key took effect.
+- **Load generator.** One binary, `algod-rust loadgen`, run in a container on the
+  cluster's network, spreading submissions round-robin over all five REST
+  endpoints. It is the same binary and the same flags for both clusters.
+
+The tier alternates which cluster runs first in successive runs, like the other
+tiers, and records both image ids, the limits and the load commands in each
+row's metadata.
+
+### Steps
+
+| Step | Offered load | What it shows |
+|---|---|---|
+| `fixed` | exactly `BENCH_LOCALNET_FIXED_COUNT` deterministic payments (`--fixed-count`) at `BENCH_LOCALNET_FIXED_TPS` | The correctness gate, plus the time to commit a known set. |
+| `ladder-<tps>` | `BENCH_LOCALNET_LADDER` (`100,500,1000,2000`) for `BENCH_LOCALNET_STEP_SECS` (60) each | Throughput and latency at fixed offered rates. |
+| `max` | an unbounded offer (target 1,000,000 TPS, 32 submitters per endpoint) for the same time | The maximum sustained TPS. Its `rejected_groups` is not reported: an unbounded offer rejects by design. |
+
+Between steps the tier waits for the relay's pool to drain, so one step's
+backlog does not leak into the next.
+
+Per step, the rows `<step>/<metric>`:
+
+| Metric | Unit | How |
+|---|---|---|
+| `confirmed_tps` | txn/s | `tc` (transaction counter) and `ts` of the block headers at the start and the end of the step, read from the relay: transactions committed between the two over their chain time. |
+| `submit_tps` | txn/s | The generator's accepted submissions per second of wall time. |
+| `latency_p50_ms`, `_p95_ms`, `_p99_ms` | ms | Submit to in-block time of every Nth transaction (the generator polls `/v2/transactions/pending/{txid}` every 250 ms, so its resolution is 250 ms). |
+| `round_time_s` | s | Chain seconds per round over the same window. Block timestamps have one-second resolution, so very short steps are coarse. |
+| `rejected_groups` | groups | Groups a node refused (pool full, fee below the floor) or the generator could not hand to a submitter. The reasons are in the generator's report. |
+| `cpu_cores` | cores | Sum over the five containers of the mean CPU% / 100 (`docker stats`, sampled about every 2 s). |
+| `rss_mb_peak` | MB | Sum of every container's peak memory usage. |
+| `blockio_write_mb` | MB | Block-device bytes written by the five containers in the step. |
+
+The `fixed` step also reports `commit_time_s` and `set_tps`: the time from the
+first submission to the confirmation of the last transaction, and the rate
+that implies for the whole set.
+
+The raw generator reports, the stats samples (`*-samples.jsonl`) and, on a
+failure, each node's last 3,000 log lines land in `logs/localnet/` of the run
+directory. `/metrics` is not used: the two implementations expose different
+metric sets, so a per-node counter would not be a pair. Pool rejections come
+from the generator's own error tallies instead.
+
+### The same-txid-set gate
+
+The fixed-count step is deterministic: transaction `seq` has the sender at ring
+position `seq * group_size + i` of the load accounts, a note derived from
+`(seq, i)`, a fixed fee and the validity window `[first_valid, first_valid+999]`
+(Ed25519 signatures are deterministic too). Two clusters sharing a genesis and a
+key file are therefore fed **byte-identical transactions**, and the gate fails
+the tier, naming the difference, unless for every run:
+
+- both clusters accepted exactly N transactions and **confirmed every one of
+  them** (the generator polls each txid until it is in a block);
+- the sha256 of the submitted txid set equals that of the confirmed set on each
+  cluster, and **the two clusters' sets are equal**;
+- each chain committed exactly N transactions during the step (the `tc` delta
+  between the block before the first submission and the last block), so
+  nothing else was committed;
+- the load accounts end with **the same balances** on both;
+- the genesis hashes are equal;
+- the five nodes of each cluster agree on the block hash at the lowest common
+  round (no fork);
+- no node restarted or was OOM-killed (`RestartCount`, `OOMKilled`).
+
+A divergence is a parity bug, not a benchmark result. The sorted txids of every
+fixed step are kept as `logs/localnet/<impl>-run<N>-fixed-txids.txt`.
+
+### Limits of the numbers
+
+- Everything runs on one host, so the generator, the Docker daemon and ten
+  containers (not simultaneously: the clusters run one after the other) share
+  its cores. Read the Rust/Go ratio, not an absolute TPS, and give the host at
+  least `5 x cpus` free cores for the full ladder.
+- The offered load comes from one machine and is submitted over REST. A
+  cluster that is slower at the REST ingress shows up as slower here, which is
+  what a user would see.
+- Docker's CPU accounting is per container and sampled, so a short step has few
+  samples.
+- `blockio_write_mb` is whatever the Docker engine reports for the container's
+  block device. Docker Desktop on Windows/macOS can report 0 for one side; the
+  report then shows no ratio for that row (read it on a Linux host).
+- The tier measures what it is given. If the Rust cluster commits a fixed set
+  over many more rounds than the Go cluster, that is a result about algod-rust
+  (for example transaction gossip between nodes), not a harness artefact: the
+  generator submitted the same bytes to the same five endpoints.
+
+### CI
+
+`.github/workflows/bench-localnet.yml` runs the unit tests of the aggregation,
+topology and gate logic (`scripts/bench/test_localnet.py`) and a **smoke** of the
+tier (`BENCH_LOCALNET_PROFILE=smoke`: 200 fixed transactions and a single
+10-second ladder step at 50 TPS, one run, 1 CPU and 2 GB per container). It
+asserts the gate passed and that the report carries a Rust/Go ratio for the
+fixed step. It is a check that the tier works, not a benchmark: shared runners
+are too noisy for the ratios to mean anything.
+
+### Running it by hand
+
+```bash
+# 3 runs of the full ladder, on a quiet host with docker, cpus >= 12
+BENCH_LOCALNET_CPUS=2 make bench-compare TIERS=localnet RUNS=3
+# one cluster's tooling, e.g. to debug the load generator against a running network:
+algod-rust loadgen gen-accounts --deterministic --count 16 --out keys.json
+algod-rust loadgen run --algod-urls http://127.0.0.1:4300 --keys keys.json \
+  --fixed-count 200 --target-tps 100 --duration-secs 120 --txids-out txids.txt
 ```
