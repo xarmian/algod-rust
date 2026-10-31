@@ -1,0 +1,3 @@
+{"BlockIO":"0B / 0B","CPUPerc":"0.50%","Container":"a1","ID":"a1","MemPerc":"1.5%","MemUsage":"30.5MiB / 2GiB","Name":"bl-relay","NetIO":"1kB / 2kB","PIDs":"20"}
+{"BlockIO":"1.5MB / 4.5MB","CPUPerc":"87.25%","Container":"a2","ID":"a2","MemPerc":"10.0%","MemUsage":"204.8MiB / 2GiB","Name":"bl-part1","NetIO":"1kB / 2kB","PIDs":"30"}
+{"BlockIO":"2MB / 10MB","CPUPerc":"150.00%","Container":"a3","ID":"a3","MemPerc":"12.0%","MemUsage":"1.5GiB / 2GiB","Name":"bl-part2","NetIO":"1kB / 2kB","PIDs":"30"}

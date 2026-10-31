@@ -778,6 +778,11 @@ async fn async_main() -> anyhow::Result<std::process::ExitCode> {
                 confirm_sample,
                 confirm_timeout_secs,
                 output,
+                fixed_count,
+                first_valid,
+                fixed_fee,
+                settle_secs,
+                txids_out,
             } => {
                 commands::loadgen::run(commands::loadgen::LoadgenConfig {
                     endpoints: algod_urls,
@@ -792,6 +797,11 @@ async fn async_main() -> anyhow::Result<std::process::ExitCode> {
                     confirm_sample,
                     confirm_timeout_secs,
                     output,
+                    fixed_count,
+                    first_valid,
+                    fixed_fee,
+                    settle_secs,
+                    txids_out,
                 })
                 .await?;
             }

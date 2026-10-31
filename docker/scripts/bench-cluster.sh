@@ -4,7 +4,12 @@
 # SPDX-License-Identifier: MIT
 # See the LICENSE-MIT file in the repository root for the full license text.
 
-# bench-cluster.sh — Mixed-cluster Go-vs-Rust side-by-side comparison.
+# bench-cluster.sh — Mixed-cluster Go-vs-Rust side-by-side INTEROP run.
+#
+# This is an interoperability measurement, NOT a Go-vs-Rust comparison (issue
+# #2106): both implementations share one network and one chain, so throughput,
+# latency and resource use cannot be attributed to either. For a comparison run
+# `make bench-compare TIERS=localnet` (homogeneous all-Go vs all-Rust clusters).
 #
 # Starts the mixed cluster (go-relay producing blocks, rust-observer syncing
 # via gossip, go-nonrelay syncing via rust-relay), then samples RSS and CPU

@@ -14,7 +14,7 @@ Performance measurement for algod-rust and comparison against go-algorand (v5.0.
 The benchmark suite has two tiers:
 
 1. **Micro benchmarks** -- Criterion (Rust) and testing.B (Go) benchmarks that decode the _same fixture files_ from disk, eliminating network variance entirely.
-2. **Macro benchmarks** -- Mixed-cluster comparison where both a Rust relay and a Go non-relay sync blocks from a Go relay node under real consensus, measuring time-to-round-N, peak RSS, and average CPU.
+2. **Macro benchmarks (interop)** -- Mixed-cluster run where both a Rust relay and a Go non-relay sync blocks from a Go relay node under real consensus, measuring time-to-round-N, peak RSS, and average CPU.
 
 Additionally, there are **single-implementation profiling tools** (`bench decode`, `bench replay`, `bench-go`) that fetch blocks over HTTP. These measure end-to-end throughput including network latency and are NOT suitable for Go-vs-Rust comparison.
 
@@ -24,8 +24,10 @@ Additionally, there are **single-implementation profiling tools** (`bench decode
 # Fair comparison: micro benchmarks on same fixture data
 make benchmark            # runs bench-micro (Rust) + bench-micro-go (Go)
 
-# Fair comparison: macro cluster benchmark (requires Docker)
-make bench-cluster        # starts mixed cluster, samples stats, reports comparison
+# Mixed-cluster INTEROP run (requires Docker). Not a comparison: both
+# implementations share one chain. For Go vs Rust use
+#   make bench-compare TIERS=localnet
+make bench-cluster        # starts mixed cluster, samples stats, reports both nodes
 
 # Single-implementation profiling (NOT for comparison)
 make bench-decode         # Rust decode throughput (includes HTTP fetch)
@@ -74,7 +76,13 @@ Both implementations:
 - Use their native benchmark frameworks (Criterion / testing.B) with proper warm-up and statistical rigor
 - Report comparable metrics (ns/op, throughput)
 
-## Fair Comparison: Mixed Cluster (`make bench-cluster`)
+## Interop: Mixed Cluster (`make bench-cluster`)
+
+> This run is labelled **interop**, not comparison (issue #2106). Both
+> implementations share one network and one chain, so a slow node slows the
+> others and the per-implementation numbers are confounded. The homogeneous
+> all-Go vs all-Rust throughput comparison is the `localnet` tier of
+> `make bench-compare` (see `BENCHMARK_COMPARISON.md`).
 
 The mixed-cluster benchmark runs both implementations as real nodes syncing blocks from a Go relay under actual consensus:
 

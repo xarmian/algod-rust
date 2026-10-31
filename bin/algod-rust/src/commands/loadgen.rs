@@ -56,6 +56,7 @@ use std::time::{Duration, Instant};
 
 use algo_codec::{
     canonical_encode_signed_transaction, canonical_encode_transaction, compute_group_id,
+    compute_txn_id,
 };
 use algo_rest_client::{AlgodClient, SuggestedParams, TxId};
 use algo_txn_pipeline::PaymentBuilder;
@@ -303,6 +304,162 @@ pub fn sign_txn(signing: &SigningKey, txn: algo_types::Transaction) -> SignedTra
     }
 }
 
+// ───────────────────── fixed-count (deterministic) mode ─────────────────────
+//
+// Issue #2106 (epic #2101): the homogeneous-localnet benchmark must show that
+// the all-Go and the all-Rust cluster committed the *same* transactions. The
+// default mode cannot: its notes carry randomness, its fee follows the
+// congestion price and its validity window follows the live round. In
+// `--fixed-count N` mode every transaction is a pure function of its sequence
+// number (sender, receiver, note, fee, validity window), so two clusters that
+// share a genesis are fed byte-identical transactions and equal txid sets can
+// be asserted.
+
+/// Fixed tag in every deterministic note (12 bytes, so the note is 24 bytes).
+const FIXED_NOTE_TAG: [u8; 12] = *b"algod-bench\0";
+
+/// The note of group member `i` of job `seq`: `seq || i || tag`.
+pub fn fixed_note(seq: u64, i: u32) -> Vec<u8> {
+    let mut note = Vec::with_capacity(24);
+    note.extend_from_slice(&seq.to_be_bytes());
+    note.extend_from_slice(&i.to_be_bytes());
+    note.extend_from_slice(&FIXED_NOTE_TAG);
+    note
+}
+
+/// The sender of group member `i` of job `seq`: the ring position
+/// `seq * group_size + i` over `n` accounts.
+pub fn fixed_sender_index(seq: u64, i: usize, group_size: usize, n: usize) -> usize {
+    ((seq as u128 * group_size as u128 + i as u128) % n as u128) as usize
+}
+
+/// sha256 (hex) of the sorted, newline-joined txids: equal for equal sets,
+/// whatever order the txids were collected in.
+pub fn txid_set_digest(txids: &[String]) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut sorted: Vec<&str> = txids.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let mut h = Sha256::new();
+    for id in sorted {
+        h.update(id.as_bytes());
+        h.update(b"\n");
+    }
+    hex::encode(h.finalize())
+}
+
+/// Whether a node's submission error means "this exact transaction is already
+/// known", which a retried deterministic submission treats as accepted. Only
+/// the real texts of both nodes match: go-algorand's
+/// `ledgercore.TransactionInLedgerError` ("transaction already in ledger: ..",
+/// also what its pool returns for a txn already pooled) and algod-rust's
+/// `PoolError::DuplicateTxn` ("transaction already in the pool: ..") and
+/// `AlreadyInLedger`. Lease conflicts ("overlapping lease", "duplicate lease")
+/// are rejections and must not match.
+pub fn is_duplicate_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("transaction already in ledger") || m.contains("transaction already in the pool")
+}
+
+/// Consecutive failures against one endpoint after which a fixed-count
+/// retry moves on to the next endpoint.
+const ROTATE_AFTER_FAILURES: u32 = 5;
+
+/// The endpoint a fixed-count retry should use after `consecutive` failures in
+/// a row against `idx`: the next one every [`ROTATE_AFTER_FAILURES`] failures.
+fn rotate_endpoint(idx: usize, consecutive: u32, n: usize) -> usize {
+    if n > 1 && consecutive > 0 && consecutive.is_multiple_of(ROTATE_AFTER_FAILURES) {
+        (idx + 1) % n
+    } else {
+        idx
+    }
+}
+
+/// Hand one job to the workers, giving up at `deadline` instead of waiting
+/// for a free worker forever. False: the deadline passed or the pool is gone.
+async fn send_job(tx: &tokio::sync::mpsc::Sender<()>, deadline: Instant) -> bool {
+    matches!(
+        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), tx.send(())).await,
+        Ok(Ok(()))
+    )
+}
+
+/// The submission window a report carries, so a benchmark can measure over the
+/// interval transactions were actually offered (not container start-up or the
+/// confirmation tail): the chain rounds and wall-clock instants around it.
+#[derive(Debug, Clone, Default)]
+struct SubmitWindow {
+    start_round: Option<u64>,
+    end_round: Option<u64>,
+    first_unix_ms: u64,
+    last_unix_ms: u64,
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The cluster's current round as the first endpoint that answers reports it.
+async fn current_round(shared: &Shared) -> Option<u64> {
+    for client in &shared.clients {
+        if let Ok(p) = client.suggested_transaction_params().await {
+            return Some(p.last_round);
+        }
+    }
+    None
+}
+
+/// Whether job `seq` is one of the sampled submissions whose confirmation
+/// latency is probed (`sample == 0` disables sampling).
+fn should_probe(sample: u64, seq: u64) -> bool {
+    sample > 0 && seq.is_multiple_of(sample)
+}
+
+/// Build, sign and encode job `seq` of a fixed-count run: the concatenated
+/// signed-transaction body to POST and the txid of every member. The result is
+/// a pure function of the arguments (ed25519 signatures are deterministic).
+fn build_fixed_group(
+    accounts: &[LoadAccount],
+    seq: u64,
+    group_size: usize,
+    fee: u64,
+    first_valid: u64,
+    genesis_hash: [u8; 32],
+    genesis_id: &str,
+) -> anyhow::Result<(Vec<u8>, Vec<String>)> {
+    let n = accounts.len();
+    let mut txns = Vec::with_capacity(group_size);
+    let mut signers = Vec::with_capacity(group_size);
+    for i in 0..group_size {
+        let a = fixed_sender_index(seq, i, group_size, n);
+        let txn = PaymentBuilder::new(accounts[a].address, accounts[(a + 1) % n].address, 0)
+            .fee(fee)
+            .validity(first_valid, first_valid + 999)
+            .genesis_hash(genesis_hash)
+            .genesis_id(genesis_id.to_string())
+            .note(fixed_note(seq, i as u32))
+            .build()
+            .map_err(|e| anyhow::anyhow!("build: {e}"))?;
+        txns.push(txn);
+        signers.push(a);
+    }
+    if group_size > 1 {
+        let gid = compute_group_id(&txns);
+        for txn in &mut txns {
+            txn.group = gid.0;
+        }
+    }
+    let txids: Vec<String> = txns.iter().map(|t| compute_txn_id(t).to_string()).collect();
+    let mut body = Vec::new();
+    for (txn, a) in txns.into_iter().zip(signers) {
+        let signed = sign_txn(&accounts[a].signing, txn);
+        body.extend_from_slice(&canonical_encode_signed_transaction(&signed));
+    }
+    Ok((body, txids))
+}
+
 // ───────────────────────── config + report ─────────────────────────
 
 /// Everything `loadgen run` needs. Mirrors the CLI flags one-for-one.
@@ -332,6 +489,19 @@ pub struct LoadgenConfig {
     pub confirm_timeout_secs: u64,
     /// Where to write the JSON report.
     pub output: Option<PathBuf>,
+    /// `--fixed-count`: when non-zero, submit exactly this many groups of
+    /// deterministic transactions (see [`build_fixed_group`]), retrying each
+    /// until a node accepts it, then verify every txid is confirmed. 0 = the
+    /// duration-driven mode.
+    pub fixed_count: u64,
+    /// First valid round of every fixed-count transaction (last = first + 999).
+    pub first_valid: u64,
+    /// Fee of every fixed-count transaction, in microAlgos.
+    pub fixed_fee: u64,
+    /// How long to wait for every fixed-count txid to be confirmed.
+    pub settle_secs: u64,
+    /// Where to write the sorted txids of a fixed-count run (one per line).
+    pub txids_out: Option<PathBuf>,
 }
 
 /// Assumed signed-transaction size, in bytes, for fee estimation.
@@ -371,8 +541,12 @@ fn effective_fee(min_fee: u64, fee_per_byte: u64, multiplier: f64) -> u64 {
 pub struct EndpointStats {
     /// Groups (or singletons) POSTed successfully.
     pub accepted_groups: u64,
-    /// Groups whose POST returned an error.
+    /// Groups whose POST returned an error (per group; fixed-count retries of
+    /// the same group are counted under `retries`, not here).
     pub failed_groups: u64,
+    /// Fixed-count mode: failed submission attempts that were retried.
+    #[serde(default)]
+    pub retries: u64,
 }
 
 /// Confirmation-latency summary, in milliseconds.
@@ -388,6 +562,9 @@ pub struct ConfirmationStats {
     pub p50_ms: u64,
     /// 95th-percentile submit → in-block latency.
     pub p95_ms: u64,
+    /// 99th-percentile submit -> in-block latency.
+    #[serde(default)]
+    pub p99_ms: u64,
     /// Worst observed submit → in-block latency.
     pub max_ms: u64,
 }
@@ -409,6 +586,9 @@ pub struct LoadgenReport {
     pub confirmation: ConfirmationStats,
     /// Endpoint URL → per-endpoint tallies.
     pub per_endpoint: HashMap<String, EndpointStats>,
+    /// Fixed-count runs only: the txid-set evidence (see [`verify_all`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixed: Option<serde_json::Value>,
 }
 
 // ───────────────────────── shared run state ─────────────────────────
@@ -432,9 +612,63 @@ struct Shared {
     per_endpoint: Mutex<HashMap<String, EndpointStats>>,
     latencies: Mutex<Vec<u64>>,
     confirm_timeouts: AtomicU64,
+    /// Fixed-count mode: the txid of every accepted transaction.
+    accepted_txids: Mutex<Vec<String>>,
+    /// The run's deadline (`--duration-secs`): fixed-count scheduling and
+    /// retries stop here.
+    deadline: Instant,
 }
 
 impl Shared {
+    fn new(
+        cfg: LoadgenConfig,
+        accounts: Vec<LoadAccount>,
+        clients: Vec<AlgodClient>,
+        params: SuggestedParams,
+    ) -> Self {
+        let duration_secs = cfg.duration_secs;
+        Shared {
+            accounts,
+            endpoint_names: cfg.endpoints.clone(),
+            clients,
+            params: Mutex::new(params),
+            cfg,
+            next_account: AtomicU64::new(0),
+            dispatched: AtomicU64::new(0),
+            accepted_groups: AtomicU64::new(0),
+            failed_groups: AtomicU64::new(0),
+            backpressure_drops: AtomicU64::new(0),
+            submit_seq: AtomicU64::new(0),
+            stop: AtomicBool::new(false),
+            errors: Mutex::new(HashMap::new()),
+            per_endpoint: Mutex::new(HashMap::new()),
+            latencies: Mutex::new(Vec::new()),
+            confirm_timeouts: AtomicU64::new(0),
+            accepted_txids: Mutex::new(Vec::new()),
+            deadline: Instant::now() + Duration::from_secs_f64(duration_secs.max(0.0)),
+        }
+    }
+
+    /// A failed fixed-count attempt that will be retried.
+    fn record_retry(&self, endpoint: &str) {
+        let mut map = self.per_endpoint.lock().expect("per_endpoint mutex");
+        map.entry(endpoint.to_string()).or_default().retries += 1;
+    }
+
+    /// A fixed-count group given up on: one failed group, globally and on the
+    /// endpoint it was last tried against.
+    fn record_fixed_failure(&self, endpoint: &str) {
+        self.failed_groups.fetch_add(1, Ordering::Relaxed);
+        self.record_endpoint(endpoint, false);
+    }
+
+    /// A fixed-count group a node accepted, or reported as already known:
+    /// both count as one accepted group and one endpoint success.
+    fn record_fixed_accept(&self, endpoint: &str) {
+        self.accepted_groups.fetch_add(1, Ordering::Relaxed);
+        self.record_endpoint(endpoint, true);
+    }
+
     fn record_error(&self, msg: String) {
         // Collapse the long tail: node errors embed txids and round numbers,
         // which would otherwise make every entry unique and the map unbounded.
@@ -521,24 +755,7 @@ pub async fn run(cfg: LoadgenConfig) -> anyhow::Result<()> {
         "loadgen starting"
     );
 
-    let shared = Arc::new(Shared {
-        accounts,
-        endpoint_names: cfg.endpoints.clone(),
-        clients,
-        params: Mutex::new(params),
-        cfg: cfg.clone(),
-        next_account: AtomicU64::new(0),
-        dispatched: AtomicU64::new(0),
-        accepted_groups: AtomicU64::new(0),
-        failed_groups: AtomicU64::new(0),
-        backpressure_drops: AtomicU64::new(0),
-        submit_seq: AtomicU64::new(0),
-        stop: AtomicBool::new(false),
-        errors: Mutex::new(HashMap::new()),
-        per_endpoint: Mutex::new(HashMap::new()),
-        latencies: Mutex::new(Vec::new()),
-        confirm_timeouts: AtomicU64::new(0),
-    });
+    let shared = Arc::new(Shared::new(cfg.clone(), accounts, clients, params));
 
     // Background params refresher.
     let refresher = {
@@ -587,14 +804,37 @@ pub async fn run(cfg: LoadgenConfig) -> anyhow::Result<()> {
     let per_job = cfg.group_size as f64;
     let mut last_log = Instant::now();
 
-    while start.elapsed() < total {
+    let fixed = cfg.fixed_count;
+    let mut window = SubmitWindow {
+        start_round: current_round(&shared).await,
+        first_unix_ms: unix_ms(),
+        ..Default::default()
+    };
+    let mut gave_up = false;
+    while start.elapsed() < total
+        && !gave_up
+        && (fixed == 0 || shared.dispatched.load(Ordering::Relaxed) < fixed)
+    {
         ticker.tick().await;
         let elapsed = start.elapsed().as_secs_f64();
         let want_txns = scheduled_by(cfg.target_tps, cfg.ramp_secs, elapsed);
-        let want_jobs = (want_txns / per_job).floor() as u64;
+        let mut want_jobs = (want_txns / per_job).floor() as u64;
+        if fixed > 0 {
+            want_jobs = want_jobs.min(fixed);
+        }
         let done_jobs = shared.dispatched.load(Ordering::Relaxed)
             + shared.backpressure_drops.load(Ordering::Relaxed);
         for _ in 0..want_jobs.saturating_sub(done_jobs) {
+            if fixed > 0 {
+                // Fixed-count mode never drops a job: wait for a free worker,
+                // but not past the run's deadline.
+                if !send_job(&tx, shared.deadline).await {
+                    gave_up = true;
+                    break;
+                }
+                shared.dispatched.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             match tx.try_send(()) {
                 Ok(()) => {
                     shared.dispatched.fetch_add(1, Ordering::Relaxed);
@@ -622,13 +862,26 @@ pub async fn run(cfg: LoadgenConfig) -> anyhow::Result<()> {
         let _ = w.await;
     }
     let wall = start.elapsed().as_secs_f64();
+    window.last_unix_ms = unix_ms();
+    window.end_round = current_round(&shared).await;
     shared.stop.store(true, Ordering::Relaxed);
     refresher.abort();
 
     // Give in-flight confirmation polls a chance to land before summarising.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let report = build_report(&shared, wall);
+    let fixed_report = if fixed > 0 {
+        Some(verify_all(&shared).await)
+    } else {
+        None
+    };
+    if let (Some(path), true) = (&cfg.txids_out, fixed > 0) {
+        let mut ids = shared.accepted_txids.lock().expect("txids mutex").clone();
+        ids.sort_unstable();
+        std::fs::write(path, ids.join("\n") + "\n")?;
+    }
+
+    let report = build_report(&shared, wall, fixed_report, window);
     let rendered = serde_json::to_string_pretty(&report)?;
     if let Some(path) = &cfg.output {
         if let Some(parent) = path.parent() {
@@ -644,7 +897,12 @@ pub async fn run(cfg: LoadgenConfig) -> anyhow::Result<()> {
 }
 
 /// Assemble the JSON report from the accumulated counters.
-fn build_report(shared: &Shared, wall_secs: f64) -> LoadgenReport {
+fn build_report(
+    shared: &Shared,
+    wall_secs: f64,
+    fixed: Option<serde_json::Value>,
+    window: SubmitWindow,
+) -> LoadgenReport {
     let cfg = &shared.cfg;
     let accepted_groups = shared.accepted_groups.load(Ordering::Relaxed);
     let failed_groups = shared.failed_groups.load(Ordering::Relaxed);
@@ -663,6 +921,7 @@ fn build_report(shared: &Shared, wall_secs: f64) -> LoadgenReport {
         },
         p50_ms: percentile(&lat, 50.0),
         p95_ms: percentile(&lat, 95.0),
+        p99_ms: percentile(&lat, 99.0),
         max_ms: lat.last().copied().unwrap_or(0),
     };
 
@@ -689,6 +948,10 @@ fn build_report(shared: &Shared, wall_secs: f64) -> LoadgenReport {
             "achieved_submit_tps":
                 if wall_secs > 0.0 { (accepted_txns as f64 / wall_secs * 100.0).round() / 100.0 } else { 0.0 },
             "requested_target_tps": cfg.target_tps,
+            "start_round": window.start_round,
+            "end_round": window.end_round,
+            "first_submit_unix_ms": window.first_unix_ms,
+            "last_submit_unix_ms": window.last_unix_ms,
         }),
         errors: shared.errors.lock().expect("errors mutex").clone(),
         confirmation,
@@ -697,11 +960,153 @@ fn build_report(shared: &Shared, wall_secs: f64) -> LoadgenReport {
             .lock()
             .expect("per_endpoint mutex")
             .clone(),
+        fixed,
     }
+}
+
+/// How many times a fixed-count submission is retried before the group is
+/// counted as failed (50 ms apart, so ~20 s).
+const FIXED_MAX_ATTEMPTS: u32 = 400;
+
+/// Fixed-count mode: poll every accepted txid until it is confirmed (or
+/// `settle_secs` pass) and summarise the evidence the benchmark gate needs:
+/// how many were submitted/confirmed, the digest of both txid sets and the
+/// first/last confirmed round. Commit *speed* is deliberately not timed here
+/// (a poll sees a confirmation late, and only after submission ended): the
+/// benchmark tier derives it from the block headers of those rounds.
+async fn verify_all(shared: &Arc<Shared>) -> serde_json::Value {
+    let cfg = &shared.cfg;
+    let mut ids = shared.accepted_txids.lock().expect("txids mutex").clone();
+    ids.sort_unstable();
+    let mut confirmed: Vec<Option<u64>> = vec![None; ids.len()];
+    let deadline = Instant::now() + Duration::from_secs(cfg.settle_secs);
+    loop {
+        let todo: Vec<usize> = (0..ids.len()).filter(|&i| confirmed[i].is_none()).collect();
+        if todo.is_empty() {
+            break;
+        }
+        for chunk in todo.chunks(64) {
+            let mut set = tokio::task::JoinSet::new();
+            for &i in chunk {
+                let shared = shared.clone();
+                let id = TxId(ids[i].clone());
+                set.spawn(async move {
+                    let client = &shared.clients[i % shared.clients.len()];
+                    let round = match client.get_pending_transaction(&id).await {
+                        Ok(info) => info.confirmed_round,
+                        Err(_) => None,
+                    };
+                    (i, round)
+                });
+            }
+            while let Some(done) = set.join_next().await {
+                if let Ok((i, Some(round))) = done {
+                    confirmed[i] = Some(round);
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let confirmed_ids: Vec<String> = ids
+        .iter()
+        .zip(&confirmed)
+        .filter(|(_, r)| r.is_some())
+        .map(|(id, _)| id.clone())
+        .collect();
+    let rounds: Vec<u64> = confirmed.iter().flatten().copied().collect();
+    serde_json::json!({
+        "expected_groups": cfg.fixed_count,
+        "expected_txns": cfg.fixed_count * cfg.group_size as u64,
+        "submitted_txns": ids.len(),
+        "confirmed_txns": confirmed_ids.len(),
+        "unconfirmed_txns": ids.len() - confirmed_ids.len(),
+        "submitted_txid_set_sha256": txid_set_digest(&ids),
+        "confirmed_txid_set_sha256": txid_set_digest(&confirmed_ids),
+        "first_confirmed_round": rounds.iter().min(),
+        "last_confirmed_round": rounds.iter().max(),
+        "first_valid": cfg.first_valid,
+        "fee": cfg.fixed_fee,
+    })
+}
+
+/// Fixed-count mode: build job `seq` deterministically and submit it, retrying
+/// until a node accepts it (or reports it already known).
+async fn submit_fixed(shared: &Arc<Shared>, widx: usize) {
+    let cfg = &shared.cfg;
+    let mut endpoint_idx = widx % shared.clients.len();
+    let seq = shared.submit_seq.fetch_add(1, Ordering::Relaxed);
+    let (genesis_hash, genesis_id) = {
+        let p = shared.params.lock().expect("params mutex");
+        (p.genesis_hash.0, p.genesis_id.clone())
+    };
+    let (body, txids) = match build_fixed_group(
+        &shared.accounts,
+        seq,
+        cfg.group_size,
+        cfg.fixed_fee,
+        cfg.first_valid,
+        genesis_hash,
+        &genesis_id,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            shared.failed_groups.fetch_add(1, Ordering::Relaxed);
+            shared.record_error(e.to_string());
+            return;
+        }
+    };
+    let submitted_at = Instant::now();
+    let mut attempts = 0u32;
+    let mut consecutive = 0u32;
+    loop {
+        let client = &shared.clients[endpoint_idx];
+        let endpoint = &shared.endpoint_names[endpoint_idx];
+        match client.send_raw_transaction(&body).await {
+            Ok(txid) => {
+                shared.record_fixed_accept(endpoint);
+                if should_probe(cfg.confirm_sample, seq) {
+                    spawn_confirm_probe(shared.clone(), endpoint_idx, txid, submitted_at);
+                }
+                break;
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if is_duplicate_error(&msg) {
+                    shared.record_fixed_accept(endpoint);
+                    if should_probe(cfg.confirm_sample, seq) {
+                        let txid = TxId(txids[0].clone());
+                        spawn_confirm_probe(shared.clone(), endpoint_idx, txid, submitted_at);
+                    }
+                    break;
+                }
+                shared.record_retry(endpoint);
+                shared.record_error(msg);
+                attempts += 1;
+                consecutive += 1;
+                if attempts >= FIXED_MAX_ATTEMPTS || Instant::now() >= shared.deadline {
+                    shared.record_fixed_failure(endpoint);
+                    return;
+                }
+                endpoint_idx = rotate_endpoint(endpoint_idx, consecutive, shared.clients.len());
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+    shared
+        .accepted_txids
+        .lock()
+        .expect("txids mutex")
+        .extend(txids);
 }
 
 /// Build, sign, and POST one transaction group from worker `widx`.
 async fn submit_once(shared: &Arc<Shared>, widx: usize) {
+    if shared.cfg.fixed_count > 0 {
+        return submit_fixed(shared, widx).await;
+    }
     let cfg = &shared.cfg;
     let endpoint_idx = widx % shared.clients.len();
     let client = &shared.clients[endpoint_idx];
@@ -1065,5 +1470,237 @@ mod tests {
         // A malfunctioning or hostile endpoint reporting an absurd per-byte
         // price must not overflow or empty a generator account in one txn.
         assert_eq!(effective_fee(1000, u64::MAX, 1_000.0), 1_000_000);
+    }
+
+    // ── fixed-count (deterministic) mode, issue #2106 ──
+
+    fn fixed_accounts(n: u64) -> Vec<LoadAccount> {
+        (0..n)
+            .map(|i| {
+                let signing = SigningKey::from_bytes(&deterministic_seed(i));
+                LoadAccount {
+                    address: Address(signing.verifying_key().to_bytes()),
+                    signing,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fixed_note_is_a_pure_function_of_seq_and_index() {
+        assert_eq!(fixed_note(7, 2), fixed_note(7, 2));
+        assert_ne!(fixed_note(7, 2), fixed_note(8, 2));
+        assert_ne!(fixed_note(7, 2), fixed_note(7, 3));
+        assert_eq!(fixed_note(7, 2).len(), 24);
+        assert_eq!(&fixed_note(0x0102, 3)[..8], &0x0102u64.to_be_bytes());
+    }
+
+    #[test]
+    fn fixed_sender_index_walks_the_ring_across_groups() {
+        // group size 4 over 16 accounts: group 0 uses 0..4, group 1 uses 4..8.
+        assert_eq!(fixed_sender_index(0, 0, 4, 16), 0);
+        assert_eq!(fixed_sender_index(0, 3, 4, 16), 3);
+        assert_eq!(fixed_sender_index(1, 0, 4, 16), 4);
+        assert_eq!(fixed_sender_index(4, 0, 4, 16), 0);
+    }
+
+    #[test]
+    fn txid_set_digest_ignores_order_and_detects_any_difference() {
+        let a = vec!["B".to_string(), "A".to_string(), "C".to_string()];
+        let b = vec!["C".to_string(), "B".to_string(), "A".to_string()];
+        assert_eq!(txid_set_digest(&a), txid_set_digest(&b));
+        let c = vec!["A".to_string(), "B".to_string(), "D".to_string()];
+        assert_ne!(txid_set_digest(&a), txid_set_digest(&c));
+        assert_ne!(txid_set_digest(&a), txid_set_digest(&a[..2]));
+        assert_eq!(txid_set_digest(&a).len(), 64);
+    }
+
+    #[test]
+    fn fixed_group_is_byte_identical_across_builds() {
+        let accounts = fixed_accounts(8);
+        let build =
+            || build_fixed_group(&accounts, 5, 3, 10_000, 1, [7u8; 32], "bench-v1").expect("build");
+        let (body_a, ids_a) = build();
+        let (body_b, ids_b) = build();
+        assert_eq!(body_a, body_b, "same inputs must give the same bytes");
+        assert_eq!(ids_a, ids_b);
+        assert_eq!(ids_a.len(), 3);
+        let (other, _) =
+            build_fixed_group(&accounts, 6, 3, 10_000, 1, [7u8; 32], "bench-v1").expect("build");
+        assert_ne!(body_a, other);
+    }
+
+    #[test]
+    fn fixed_group_txids_are_the_real_txids_of_the_signed_transactions() {
+        let accounts = fixed_accounts(4);
+        let (body, ids) =
+            build_fixed_group(&accounts, 1, 1, 2_000, 1, [9u8; 32], "bench-v1").expect("build");
+        let stx: SignedTransaction = algo_codec::decode_signed_txn_stream(&body)
+            .expect("the body is one canonical signed transaction")
+            .remove(0);
+        assert_eq!(ids, vec![compute_txn_id(&stx.txn).to_string()]);
+        assert_eq!(stx.txn.fee, 2_000);
+        assert_eq!(stx.txn.first_valid, algo_types::Round(1));
+        assert_eq!(stx.txn.last_valid, algo_types::Round(1000));
+    }
+
+    #[test]
+    fn duplicate_submissions_are_recognised_for_both_nodes() {
+        // go-algorand: ledgercore.TransactionInLedgerError (also what the pool's
+        // block evaluator returns for a txn already in the pool).
+        assert!(is_duplicate_error("transaction already in ledger: ABC"));
+        assert!(is_duplicate_error(
+            "HTTP 400: TransactionPool.Remember: transaction already in ledger: ABC"
+        ));
+        // algod-rust: algo_pool::PoolError::{DuplicateTxn, AlreadyInLedger}.
+        assert!(is_duplicate_error("transaction already in the pool: ABC"));
+        assert!(is_duplicate_error("transaction already in ledger: ABC"));
+    }
+
+    #[test]
+    fn lease_and_other_rejections_are_not_duplicates() {
+        // go: LeaseInLedgerError; algod-rust: lease and duplicate-lease texts.
+        assert!(!is_duplicate_error(
+            "transaction ABC using an overlapping lease (sender, lease):(S, L)"
+        ));
+        assert!(!is_duplicate_error(
+            "transaction X: duplicate lease approval program rejected"
+        ));
+        assert!(!is_duplicate_error("duplicate lease in group"));
+        assert!(!is_duplicate_error("fee {1000} below threshold 1052"));
+        assert!(!is_duplicate_error(
+            "block number already in ledger: block 3 < next Round 5"
+        ));
+        assert!(!is_duplicate_error("txn dup"));
+    }
+
+    fn test_shared(confirm_sample: u64) -> Arc<Shared> {
+        let params: SuggestedParams = serde_json::from_value(serde_json::json!({
+            "consensus-version": "future", "fee": 0,
+            "genesis-hash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "genesis-id": "t-v1", "last-round": 1, "min-fee": 1000
+        }))
+        .expect("params");
+        let cfg = LoadgenConfig {
+            endpoints: vec!["http://127.0.0.1:1".into()],
+            token: "t".into(),
+            keys: PathBuf::new(),
+            target_tps: 1.0,
+            duration_secs: 1.0,
+            ramp_secs: 0.0,
+            group_size: 1,
+            concurrency: 1,
+            fee_multiplier: 1.0,
+            confirm_sample,
+            confirm_timeout_secs: 1,
+            output: None,
+            fixed_count: 1,
+            first_valid: 1,
+            fixed_fee: 1000,
+            settle_secs: 1,
+            txids_out: None,
+        };
+        let clients = vec![AlgodClient::new("http://127.0.0.1:1", "t")];
+        Arc::new(Shared::new(cfg, fixed_accounts(1), clients, params))
+    }
+
+    #[test]
+    fn an_accepted_fixed_group_and_a_duplicate_one_are_counted_alike() {
+        let shared = test_shared(0);
+        let ep = shared.endpoint_names[0].clone();
+        // Real acceptance and a duplicate "accept" both go through the same path.
+        shared.record_fixed_accept(&ep);
+        shared.record_fixed_accept(&ep);
+        assert_eq!(shared.accepted_groups.load(Ordering::Relaxed), 2);
+        let per = shared.per_endpoint.lock().expect("lock");
+        assert_eq!(per[&ep].accepted_groups, 2);
+        assert_eq!(per[&ep].failed_groups, 0);
+    }
+
+    #[test]
+    fn retries_are_counted_apart_from_failed_groups() {
+        let shared = test_shared(0);
+        let ep = shared.endpoint_names[0].clone();
+        for _ in 0..3 {
+            shared.record_retry(&ep);
+        }
+        shared.record_fixed_failure(&ep);
+        assert_eq!(shared.failed_groups.load(Ordering::Relaxed), 1);
+        let per = shared.per_endpoint.lock().expect("lock");
+        assert_eq!(per[&ep].retries, 3, "attempts are retries");
+        assert_eq!(per[&ep].failed_groups, 1, "failed_groups is per group");
+        assert_eq!(per[&ep].accepted_groups, 0);
+    }
+
+    #[test]
+    fn a_dead_endpoint_is_rotated_away_from_after_consecutive_failures() {
+        assert_eq!(rotate_endpoint(0, 0, 3), 0);
+        assert_eq!(rotate_endpoint(0, 4, 3), 0);
+        assert_eq!(rotate_endpoint(0, 5, 3), 1);
+        assert_eq!(rotate_endpoint(2, 10, 3), 0, "wraps around");
+        assert_eq!(rotate_endpoint(0, 5, 1), 0, "a single endpoint stays");
+    }
+
+    #[tokio::test]
+    async fn the_scheduler_send_gives_up_at_the_deadline() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<()>(1);
+        let soon = Instant::now() + Duration::from_millis(100);
+        assert!(send_job(&tx, soon).await, "a free slot is taken at once");
+        let t0 = Instant::now();
+        assert!(
+            !send_job(&tx, soon).await,
+            "a full channel must not block forever"
+        );
+        assert!(t0.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn fixed_submission_to_a_dead_endpoint_stops_at_the_deadline() {
+        let shared = test_shared(0); // duration 1 s, endpoint refuses connections
+        let t0 = Instant::now();
+        tokio::time::timeout(Duration::from_secs(30), submit_fixed(&shared, 0))
+            .await
+            .expect("the retry loop must honour the deadline, not run 400 attempts");
+        assert!(t0.elapsed() < Duration::from_secs(20));
+        assert_eq!(shared.failed_groups.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.accepted_groups.load(Ordering::Relaxed), 0);
+        assert!(shared.accepted_txids.lock().expect("lock").is_empty());
+        let ep = shared.endpoint_names[0].clone();
+        let per = shared.per_endpoint.lock().expect("lock");
+        assert!(per[&ep].retries >= 1);
+        assert_eq!(per[&ep].failed_groups, 1);
+    }
+
+    #[test]
+    fn the_report_carries_the_submission_window() {
+        let shared = test_shared(0);
+        let w = SubmitWindow {
+            start_round: Some(7),
+            end_round: Some(19),
+            first_unix_ms: 1000,
+            last_unix_ms: 61000,
+        };
+        let rep = build_report(&shared, 60.0, None, w);
+        let sub = &rep.submission;
+        assert_eq!(sub["start_round"], 7);
+        assert_eq!(sub["end_round"], 19);
+        assert_eq!(sub["first_submit_unix_ms"], 1000);
+        assert_eq!(sub["last_submit_unix_ms"], 61000);
+        let none = build_report(&shared, 1.0, None, SubmitWindow::default());
+        assert!(none.submission["start_round"].is_null());
+    }
+
+    #[test]
+    fn a_confirm_probe_is_started_for_every_sampled_seq_whether_new_or_duplicate() {
+        assert!(should_probe(5, 0));
+        assert!(should_probe(5, 10));
+        assert!(!should_probe(5, 7));
+        assert!(!should_probe(0, 0), "0 disables sampling");
+    }
+
+    #[test]
+    fn percentile_p99_is_reported() {
+        let data: Vec<u64> = (1..=100).collect();
+        assert_eq!(percentile(&data, 99.0), 99);
     }
 }

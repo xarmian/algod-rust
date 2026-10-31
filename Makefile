@@ -1024,7 +1024,7 @@ bench-micro: ## Run Rust criterion microbenchmarks
 bench-micro-go: ## Run Go decode microbenchmarks (same fixture files as Rust criterion)
 	cd benchmarks/go-decode && go test -bench=. -benchmem -count=5
 
-bench-cluster: ## Run mixed-cluster Go vs Rust comparison (requires Docker)
+bench-cluster: ## Mixed-cluster INTEROP run, not a Go-vs-Rust comparison (requires Docker; compare with TIERS=localnet)
 	bash docker/scripts/bench-cluster.sh
 
 ## Issue #100: 6-node mixed cluster (1 Go relay + 1 Rust relay, 2 Go + 2 Rust
@@ -1032,9 +1032,12 @@ bench-cluster: ## Run mixed-cluster Go vs Rust comparison (requires Docker)
 ## loadgen`. Defaults are a laptop-sized smoke run; override on the command
 ## line for the issue's aspirational load, e.g.
 ##   make bench-stress STRESS_ARGS="--target-tps 1000 --sustained-secs 300"
+## A mixed cluster is an INTEROP check (issue #2106): it cannot attribute
+## throughput or resource use to one implementation. For a Go-vs-Rust
+## comparison use `make bench-compare TIERS=localnet`.
 STRESS_ARGS ?=
 
-bench-stress: ## Run the 6-node mixed-cluster stress benchmark (requires Docker)
+bench-stress: ## 6-node mixed-cluster INTEROP stress run, not a Go-vs-Rust comparison (requires Docker; compare with TIERS=localnet)
 	bash docker/scripts/bench-stress.sh $(STRESS_ARGS)
 
 bench-stress-down: ## Tear down a cluster left running by `bench-stress --keep-up`

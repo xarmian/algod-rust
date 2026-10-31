@@ -1064,6 +1064,33 @@ pub enum LoadgenCommands {
         /// Write the JSON report here (also printed to stdout).
         #[arg(long)]
         output: Option<PathBuf>,
+
+        /// Fixed-count mode (issue #2106): submit exactly this many groups of
+        /// deterministic transactions (sender, note, fee and validity window
+        /// are pure functions of the sequence number), retry each until a
+        /// node accepts it, then confirm every txid and report the txid-set
+        /// digests. Two clusters sharing a genesis and key file must produce
+        /// the same digests. `--duration-secs` becomes the submission
+        /// timeout. 0 = the duration-driven mode.
+        #[arg(long, default_value_t = 0)]
+        fixed_count: u64,
+
+        /// Fixed-count mode: first valid round of every transaction (the
+        /// last valid round is first + 999). Use 1 on a fresh chain.
+        #[arg(long, default_value_t = 1)]
+        first_valid: u64,
+
+        /// Fixed-count mode: the fee of every transaction, in microAlgos.
+        #[arg(long, default_value_t = 10_000)]
+        fixed_fee: u64,
+
+        /// Fixed-count mode: how long to wait for every txid to confirm.
+        #[arg(long, default_value_t = 120)]
+        settle_secs: u64,
+
+        /// Fixed-count mode: write the sorted txids here, one per line.
+        #[arg(long)]
+        txids_out: Option<PathBuf>,
     },
 }
 
