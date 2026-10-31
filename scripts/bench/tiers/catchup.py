@@ -45,12 +45,13 @@ Inputs (environment):
   BENCH_CATCHUP_POLL_S        status poll interval (default 1)
   BENCH_CATCHUP_HEAD_SLACK_S  "at the head" = newest block this young (default 30)
   BENCH_CATCHUP_HASH_CAP      most rounds whose hashes the gate compares (default 20000)
-  BENCH_CATCHUP_CPUS / _MEM   per-container limits (default 2 / 3g)
+  BENCH_CATCHUP_MIN_GATE_ROUNDS  fewest rounds the gate may compare (default 100)
+  BENCH_CATCHUP_CPUS, BENCH_CATCHUP_MEM   per-container limits (default 2 / 3g)
   BENCH_CATCHUP_PORT_BASE     first published REST port (default 4500)
   BENCH_CATCHUP_GO_IMAGE      default algorand/algod:<pinned tag without `v`>
   BENCH_CATCHUP_RUST_IMAGE    a prebuilt algod-rust image (default: build
                               docker/Dockerfile's `runtime` target)
-  BENCH_CATCHUP_MOCK_FAULT    mock mode only: none | diverge | stall
+  BENCH_CATCHUP_MOCK_FAULT    mock mode only: none | diverge | stall | die | abort
   plus the tier contract (BENCH_RUNS, BENCH_OUT, ...; docs/BENCHMARK_COMPARISON.md).
 """
 import hashlib
@@ -128,13 +129,9 @@ def get_json(base, path, timeout=10):
 
 
 def block_hash(base, rnd):
-    try:
-        status, body = http_call(base, f"/v2/blocks/{rnd}/hash")
-        if status == 200:
-            return json.loads(body).get("blockHash")
-    except (OSError, ValueError):
-        pass
-    return None
+    """The block hash of `rnd`; None only when the node answers 404 (pruned).
+    Transport errors and 5xx are retried, then raise catchup_lib.ProbeError."""
+    return cl.hash_or_pruned(lambda r: http_call(base, f"/v2/blocks/{r}/hash"), rnd)
 
 
 def block_ts(base, rnd):
@@ -293,6 +290,11 @@ class MockNode:
         l1, l2, l3 = MOCK_STAGE_S
         if self.fault == "stall":
             return dict(base, catchpoint=self.label)
+        if self.fault == "abort":
+            # the catchpoint clears with the ledger still at its pre-request sync
+            if el < 0.5:
+                return dict(base, catchpoint=self.label, **{"last-round": 5})
+            return dict(base, **{"last-round": 5})
         total = 1000
         if el < l1:
             return dict(base, catchpoint=self.label,
@@ -365,10 +367,15 @@ class MockNode:
             self.server.server_close()
 
     def running(self):
+        # fault `die`: algod-rust crashes 3.4 s after the catchup request
+        if self.fault == "die" and self.impl == "rust" and self.trigger is not None:
+            return time.time() < self.trigger + 3.4
         return True
 
     def logs(self, tail=0):
-        if self.fault == "stall":
+        if self.fault == "die" and self.impl == "rust":
+            return "thread 'main' panicked at src/ledger.rs:1:1: mock crash\n"
+        if self.fault in ("stall", "abort"):
             return ("WARN catchpoint GET failed: Connection refused (os error 111)\n"
                     "WARN no relay served the catchpoint\n")
         return "INFO mock node: catchpoint import complete\n"
@@ -382,23 +389,17 @@ class MockNode:
 
 # ---- one run ---------------------------------------------------------------------------------
 
-def trigger_catchup(node, label):
-    last = ""
-    for _ in range(10):
-        try:
-            # the label's `#` must be percent-encoded: left alone it starts a URL fragment
-            status, body = http_call(node.base, "/v2/catchup/" + urllib.parse.quote(label, safe=""),
-                                     method="POST", timeout=30)
-        except OSError as e:
-            last = str(e)
-        else:
-            if status in (200, 201):
-                return time.time()
-            last = f"HTTP {status}: {body[:200]!r}"
-            if status < 500:
-                break
-        time.sleep(2)
-    raise CatchupFailure(cl.NODE, f"{node.impl}: POST /v2/catchup/{label} failed: {last}")
+def trigger(node, label):
+    """The time of the first POST /v2/catchup/<label> attempt (catchup_lib.
+    trigger_catchup: the POST is not idempotent, an `already in progress` answer
+    after a timed-out attempt counts as success)."""
+    # the label's `#` must be percent-encoded: left alone it starts a URL fragment
+    path = "/v2/catchup/" + urllib.parse.quote(label, safe="")
+    try:
+        return cl.trigger_catchup(
+            lambda: http_call(node.base, path, method="POST", timeout=30), label)
+    except cl.TriggerError as e:
+        raise CatchupFailure(cl.NODE, f"{node.impl}: POST {path} failed: {e}") from None
 
 
 def wait_ready(node, mock):
@@ -423,7 +424,8 @@ def side_facts(nodes, trackers):
     out = {}
     for s, n in nodes.items():
         text = n.logs()
-        out[s] = {"progressed": trackers[s].progressed or trackers[s].t_done is not None,
+        tr = trackers.get(s)
+        out[s] = {"progressed": bool(tr and (tr.progressed or tr.t_done is not None)),
                   "panicked": cl.log_has_fatal_panic(text),
                   "exited": not n.running(),
                   "relay_error": cl.log_has_relay_error(text)}
@@ -461,12 +463,20 @@ def run_once(cfg, label, idx, nodes, mock):
         n.start()
     for n in nodes.values():
         wait_ready(n, mock)
+    trackers = {s: cl.PhaseTracker(time.time(), cfg["head_slack_s"], label_round) for s in SIDES}
+    try:
+        return drive(cfg, label, idx, nodes, trackers, label_round)
+    except CatchupFailure:
+        raise
+    except Exception as e:  # noqa: BLE001 - every failure after startup is classified, with logs
+        fail(nodes, trackers, "other", f"unexpected {type(e).__name__}: {e}")
+
+
+def drive(cfg, label, idx, nodes, trackers, label_round):
     t0 = {}
     for s in SIDES:
-        t0[s] = trigger_catchup(nodes[s], label)
-    trackers = {s: cl.PhaseTracker(t0[s]) for s in SIDES}
-    for tr in trackers.values():
-        tr.head_slack_s = cfg["head_slack_s"]
+        t0[s] = trigger(nodes[s], label)
+        trackers[s].t0 = t0[s]
     log(f"run {idx}: both nodes asked to catch up to {label}")
 
     deadline = min(t0.values()) + cfg["stage_timeout_s"]
@@ -476,6 +486,11 @@ def run_once(cfg, label, idx, nodes, mock):
         for s in SIDES:
             if not nodes[s].running():
                 fail(nodes, trackers, "other", f"{s} container exited during the catchup")
+        gone = [s for s in SIDES if trackers[s].aborted]
+        if gone:
+            fail(nodes, trackers, "abort",
+                 f"catchup aborted: the catchpoint cleared on {' and '.join(gone)} before the "
+                 f"ledger reached the label's round {label_round}")
         if time.time() > deadline:
             fail(nodes, trackers, "timeout",
                  f"not at the head of the network {cfg['stage_timeout_s']:.0f}s after the "
@@ -492,8 +507,11 @@ def run_once(cfg, label, idx, nodes, mock):
         now = time.time()
         for s in SIDES:
             got = poll(nodes[s], trackers[s], cfg)
-            if got is not None:
-                follow[s].append((now, got[0], got[1]))
+            # one entry per iteration: a missed poll is a gap (None), not a shift
+            follow[s].append(None if got is None else (now, got[0], got[1]))
+        for s in SIDES:
+            if not nodes[s].running():
+                fail(nodes, trackers, "other", f"{s} container exited during the follow window")
         if now - t_f0 >= cfg["follow_secs"]:
             break
         time.sleep(cfg["poll_s"])
@@ -535,8 +553,8 @@ def run_once(cfg, label, idx, nodes, mock):
     log(f"run {idx}: gate passed: {compared} rounds compared in "
         f"[{first}, {agreed}], hash at {rounds[-1]} {agreed_hash}")
 
-    behind = cl.rounds_behind_max([(t, r) for t, r, _ in follow["go"]],
-                                  [(t, r) for t, r, _ in follow["rust"]])
+    behind = cl.rounds_behind_max(
+        [x and (x[0], x[1]) for x in follow["go"]], [x and (x[0], x[1]) for x in follow["rust"]])
     metrics = {}
     for s in SIDES:
         m = dict(trackers[s].durations())
@@ -544,19 +562,10 @@ def run_once(cfg, label, idx, nodes, mock):
         if rate is not None:
             m["replay_blocks_per_s"] = rate
         m.update(cl.follow_stats(follow[s]))
-        if len(follow[s]) >= 2:
+        if sum(1 for x in follow[s] if x is not None) >= 2:
             m["follow_rounds_behind_max"] = behind[s]
         m["gate_rounds_compared"] = compared
-        samples = nodes[s].samples()
-        for key, (a, b) in (("cpu_cores_catchup", (t0[s], t_head[s])),
-                            ("cpu_cores_follow", (t_head[s], t_end))):
-            r = cl.resources_over(samples, a, b)
-            if r:
-                m[key] = r["cpu_cores"]
-        whole = cl.resources_over(samples, t0[s], t_end)
-        for k in ("rss_mb_peak", "blockio_read_mb", "blockio_write_mb"):
-            if k in whole:
-                m[k] = whole[k]
+        m.update(cl.resource_metrics(nodes[s].samples(), t0[s], t_head[s], t_f0, t_end))
         disk = nodes[s].disk_mb()
         if disk is not None:
             m["disk_mb"] = disk

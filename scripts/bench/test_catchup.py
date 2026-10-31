@@ -119,7 +119,7 @@ class StageTest(unittest.TestCase):
 
 class TrackerTest(unittest.TestCase):
     def run_tracker(self, t0=100.0):
-        tr = cl.PhaseTracker(t0)
+        tr = cl.PhaseTracker(t0, 30.0)
         seq = [
             (101, status(last_round=0), None),
             (103, status(LABEL), None),
@@ -151,7 +151,7 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(self.run_tracker().catchpoint_seen, LABEL)
 
     def test_a_skipped_stage_gets_a_zero_duration(self):
-        tr = cl.PhaseTracker(0.0)
+        tr = cl.PhaseTracker(0.0, 30.0)
         tr.observe(1, status(LABEL), None)
         tr.observe(9, status(LABEL, total=1, processed=1, verified=1, tblocks=5, ablocks=1), None)
         tr.observe(12, status(last_round=10), 0.5)
@@ -162,27 +162,27 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(d["phase_replay_s"], 0.0)
 
     def test_unreached_phases_are_absent_and_head_is_not_reached(self):
-        tr = cl.PhaseTracker(0.0)
+        tr = cl.PhaseTracker(0.0, 30.0)
         tr.observe(1, status(LABEL, total=10, processed=3), None)
         self.assertEqual(tr.durations(), {})
         self.assertFalse(tr.at_head())
         self.assertIsNone(tr.replay_blocks_per_s())
 
     def test_head_requires_a_finished_catchup(self):
-        tr = cl.PhaseTracker(0.0)
+        tr = cl.PhaseTracker(0.0, 30.0)
         # a lag of zero while the catchpoint is still running is not "at head"
         tr.observe(1, status(LABEL, total=10, processed=3, last_round=5), 0.1)
         self.assertFalse(tr.at_head())
 
     def test_no_lag_sample_means_not_at_head(self):
-        tr = cl.PhaseTracker(0.0)
+        tr = cl.PhaseTracker(0.0, 30.0)
         tr.observe(1, status(LABEL), None)
         tr.observe(2, status(last_round=7), None)
         self.assertFalse(tr.at_head())
         self.assertNotIn("total_to_head_s", tr.durations())
 
     def test_progressed_flag(self):
-        tr = cl.PhaseTracker(0.0)
+        tr = cl.PhaseTracker(0.0, 30.0)
         self.assertFalse(tr.progressed)
         tr.observe(1, status(LABEL), None)
         self.assertFalse(tr.progressed)
@@ -464,6 +464,235 @@ class NetworkTableTest(unittest.TestCase):
                                                         "genesis.json")), n)
 
 
+class TrackerDoneTest(unittest.TestCase):
+    """`done` needs the ledger switch (last-round reaches the label's round): both
+    nodes sync from genesis before the POST, so last-round > 0 proves nothing."""
+    R = 40500000
+
+    def tracker(self):
+        return cl.PhaseTracker(0.0, 30.0, label_round=self.R)
+
+    def test_successful_catchup(self):
+        tr = self.tracker()
+        tr.observe(1, status(LABEL, total=10, processed=3, last_round=5), None)
+        tr.observe(2, status(last_round=self.R), 99.0)
+        self.assertEqual(tr.t_done, 2)
+        self.assertFalse(tr.aborted)
+
+    def test_aborted_catchup_is_not_done(self):
+        tr = self.tracker()
+        tr.observe(1, status(LABEL, total=10, processed=3, last_round=5), None)
+        tr.observe(2, status(last_round=7), 0.1)   # catchpoint cleared, still at genesis sync
+        self.assertIsNone(tr.t_done)
+        self.assertTrue(tr.aborted)
+        self.assertFalse(tr.at_head())
+
+    def test_a_catchup_that_clears_early_in_the_blocks_stage_is_aborted(self):
+        tr = self.tracker()
+        tr.observe(1, status(LABEL, total=1, processed=1, verified=1, tblocks=320, ablocks=10,
+                             last_round=self.R - 320), None)
+        tr.observe(2, status(last_round=self.R - 300), 3.0)
+        self.assertTrue(tr.aborted)
+        self.assertFalse(tr.at_head())
+
+    def test_before_any_catchpoint_nothing_is_aborted(self):
+        tr = self.tracker()
+        tr.observe(1, status(last_round=12), None)
+        self.assertFalse(tr.aborted)
+        self.assertIsNone(tr.t_done)
+
+    def test_abort_classification_follows_the_evidence_rules(self):
+        def sides(relay):
+            return {s: {"progressed": False, "panicked": False, "exited": False,
+                        "relay_error": relay and s == "go"} for s in ("go", "rust")}
+        self.assertEqual(cl.classify_failure(sides(True), kind="abort")[0], cl.EXTERNAL)
+        self.assertEqual(cl.classify_failure(sides(False), kind="abort")[0], cl.NODE)
+
+
+class TrackerSlackTest(unittest.TestCase):
+    def test_slack_is_a_constructor_argument(self):
+        tr = cl.PhaseTracker(0.0, 5.0)
+        tr.observe(1, status(LABEL), None)
+        tr.observe(2, status(last_round=9), 10.0)
+        self.assertFalse(tr.at_head())
+        tr.observe(3, status(last_round=10), 4.0)
+        self.assertTrue(tr.at_head())
+
+    def test_no_default_slack(self):
+        with self.assertRaises(TypeError):
+            cl.PhaseTracker(0.0)
+
+
+class FollowGapTest(unittest.TestCase):
+    def test_a_dropped_poll_does_not_shift_the_pairing(self):
+        go = [(0, 100), (1, 101), (2, 102), (3, 103)]
+        rust = [(0, 100), None, (2, 102), (3, 103)]
+        self.assertEqual(cl.rounds_behind_max(go, rust), {"go": 0, "rust": 0})
+
+    def test_follow_stats_skips_gaps(self):
+        s = cl.follow_stats([(0, 100, 2.0), None, (10, 105, 4.0)])
+        self.assertAlmostEqual(s["follow_rounds_per_s"], 0.5)
+        self.assertAlmostEqual(s["follow_lag_s_mean"], 3.0)
+
+
+class FollowResourcesTest(unittest.TestCase):
+    def samples(self):
+        mib = 1024 * 1024
+        out = []
+        # t=1..10 catching up (400%), t=11..20 idle waiting for the other node, t=21..30 follow (100%)
+        for t in range(1, 31):
+            cpu = 400.0 if t <= 10 else (0.0 if t <= 20 else 100.0)
+            out.append({"start": t - 1, "t": t, "cpu_pct": cpu, "mem_bytes": 100 * mib,
+                        "blk_read": t * mib, "blk_write": t * mib})
+        return out
+
+    def test_follow_cpu_covers_only_the_follow_window(self):
+        m = cl.resource_metrics(self.samples(), t0=0, t_head=10, t_follow=20.5, t_end=30)
+        self.assertAlmostEqual(m["cpu_cores_follow"], 1.0)        # not diluted by t=11..20
+        self.assertAlmostEqual(m["cpu_cores_catchup"], 4.0)
+        self.assertIn("rss_mb_peak", m)
+        self.assertAlmostEqual(m["blockio_write_mb"], 29.0)
+
+    def test_empty(self):
+        self.assertEqual(cl.resource_metrics([], 0, 1, 2, 3), {})
+
+
+class HashProbeTest(unittest.TestCase):
+    def getter(self, first, flaky=()):
+        calls = {"n": 0}
+
+        def get(r):
+            calls["n"] += 1
+            if calls["n"] in flaky:
+                raise TimeoutError("timed out")
+            if r < first:
+                return 404, b"{}"
+            return 200, ('{"blockHash": "blk-%d"}' % r).encode()
+        return get, calls
+
+    def test_404_is_pruned_none(self):
+        get, _ = self.getter(100)
+        self.assertIsNone(cl.hash_or_pruned(get, 99, sleep=lambda s: None))
+        self.assertEqual(cl.hash_or_pruned(get, 100, sleep=lambda s: None), "blk-100")
+
+    def test_transient_timeout_in_the_middle_of_a_bisection_is_retried(self):
+        get, calls = self.getter(700, flaky=(3, 4))
+
+        def avail(r):
+            return cl.hash_or_pruned(get, r, sleep=lambda s: None) is not None
+        self.assertEqual(cl.oldest_available(1, 1000, avail), 700)
+
+    def test_persistent_transport_error_raises_not_pruned(self):
+        def get(r):
+            raise TimeoutError("timed out")
+        with self.assertRaises(cl.ProbeError):
+            cl.hash_or_pruned(get, 5, attempts=3, sleep=lambda s: None)
+
+    def test_5xx_is_retried_then_raises(self):
+        seq = iter([(503, b""), (502, b""), (200, b'{"blockHash": "blk-1"}')])
+        self.assertEqual(cl.hash_or_pruned(lambda r: next(seq), 1, sleep=lambda s: None), "blk-1")
+        with self.assertRaises(cl.ProbeError):
+            cl.hash_or_pruned(lambda r: (500, b"boom"), 1, attempts=2, sleep=lambda s: None)
+
+    def test_other_4xx_and_garbage_raise(self):
+        for resp in ((400, b"bad"), (200, b"not json"), (200, b"{}")):
+            with self.assertRaises(cl.ProbeError, msg=str(resp)):
+                cl.hash_or_pruned(lambda r, x=resp: x, 1, sleep=lambda s: None)
+
+
+class TriggerTest(unittest.TestCase):
+    def clock(self):
+        t = {"v": 1000.0}
+
+        def now():
+            return t["v"]
+
+        def sleep(s):
+            t["v"] += s
+        return now, sleep
+
+    def ok_body(self):
+        return ('{"catchup-message": "%s"}' % LABEL).encode()
+
+    def test_created(self):
+        now, sleep = self.clock()
+        t0 = cl.trigger_catchup(lambda: (201, self.ok_body()), LABEL, now=now, sleep=sleep)
+        self.assertEqual(t0, 1000.0)
+
+    def test_already_in_progress_after_a_timed_out_first_attempt_keeps_the_first_t0(self):
+        now, sleep = self.clock()
+        answers = iter([TimeoutError("timed out"), (200, self.ok_body())])
+
+        def post():
+            a = next(answers)
+            if isinstance(a, Exception):
+                sleep(30)   # the timed-out attempt took 30 s
+                raise a
+            return a
+        self.assertEqual(cl.trigger_catchup(post, LABEL, now=now, sleep=sleep), 1000.0)
+
+    def test_400_already_catching_up_the_same_label_is_success(self):
+        now, sleep = self.clock()
+        msg = f"unable to start catchpoint catchup for '{LABEL}' - already catching up '{LABEL}'"
+        answers = iter([(500, b"x"), (400, msg.encode())])
+        self.assertEqual(cl.trigger_catchup(lambda: next(answers), LABEL, now=now, sleep=sleep),
+                         1000.0)
+
+    def test_algod_rust_text_for_the_same_label_is_success(self):
+        now, sleep = self.clock()
+        msg = f"unable to start catchup for '{LABEL}' - already catching up '{LABEL}'"
+        self.assertEqual(cl.trigger_catchup(lambda: (400, msg.encode()), LABEL, now=now,
+                                            sleep=sleep), 1000.0)
+
+    def test_400_already_catching_up_a_different_label_fails(self):
+        now, sleep = self.clock()
+        other = "1#" + "B" * 52
+        msg = f"unable to start catchpoint catchup for '{LABEL}' - already catching up '{other}'"
+        with self.assertRaises(cl.TriggerError):
+            cl.trigger_catchup(lambda: (400, msg.encode()), LABEL, now=now, sleep=sleep)
+
+    def test_a_skipped_catchup_200_is_not_success(self):
+        now, sleep = self.clock()
+        body = b'{"catchup-message": "the node has already been initialized"}'
+        with self.assertRaises(cl.TriggerError):
+            cl.trigger_catchup(lambda: (200, body), LABEL, now=now, sleep=sleep)
+
+    def test_persistent_5xx_gives_up(self):
+        now, sleep = self.clock()
+        with self.assertRaises(cl.TriggerError):
+            cl.trigger_catchup(lambda: (503, b"busy"), LABEL, attempts=3, now=now, sleep=sleep)
+
+
+class DocstringTest(unittest.TestCase):
+    def test_every_setting_is_documented(self):
+        import re as _re
+        import catchup as tier
+        src = open(os.path.join(HERE, "catchup_lib.py"), encoding="utf-8").read()
+        names = set(_re.findall(r"BENCH_CATCHUP_[A-Z_]+", src))
+        self.assertIn("BENCH_CATCHUP_MIN_GATE_ROUNDS", names)
+        missing = sorted(n for n in names if n not in tier.__doc__)
+        self.assertEqual(missing, [])
+
+
+class MakeNetworkTest(unittest.TestCase):
+    def test_unrelated_network_does_not_leak(self):
+        import shutil
+        import subprocess
+        if not shutil.which("make"):
+            self.skipTest("make not available")
+        repo = os.path.dirname(os.path.dirname(HERE))
+        env = dict(os.environ, NETWORK="voimain")
+        env.pop("BENCH_CATCHUP_NETWORK", None)
+        out = subprocess.run(["make", "-n", "bench-compare", "TIERS=catchup"], cwd=repo,
+                             env=env, capture_output=True, text=True).stdout
+        self.assertIn('BENCH_CATCHUP_NETWORK=""', out)
+        self.assertNotIn("voimain", out)
+        out = subprocess.run(["make", "-n", "bench-compare", "TIERS=catchup",
+                              "CATCHUP_NETWORK=mainnet"], cwd=repo, env=env,
+                             capture_output=True, text=True).stdout
+        self.assertIn('BENCH_CATCHUP_NETWORK="mainnet"', out)
+
+
 class MockTierTest(unittest.TestCase):
     """The whole tier against the hermetic mock network: both 'nodes' are
     in-process HTTP servers, no Docker, nothing external."""
@@ -523,6 +752,54 @@ class MockTierTest(unittest.TestCase):
         self.assertNotEqual(rc, 0)
         self.assertIn("FAILURE CLASS: external network", buf.getvalue())
         self.assertNotIn("FAILURE CLASS: node", buf.getvalue())
+
+    def test_a_node_that_dies_during_the_follow_window_is_a_node_failure(self):
+        import io
+        buf = io.StringIO()
+        with mock.patch("sys.stderr", buf):
+            rc, out = self.run_tier(BENCH_CATCHUP_MOCK_FAULT="die", BENCH_CATCHUP_FOLLOW_SECS="6")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("FAILURE CLASS: node", buf.getvalue())
+        self.assertIn("rust", buf.getvalue())
+        self.assertFalse(os.path.exists(os.path.join(out, "catchup.json")))
+
+    def test_an_aborted_catchup_is_classified_not_hung(self):
+        import io
+        buf = io.StringIO()
+        with mock.patch("sys.stderr", buf):
+            rc, _ = self.run_tier(BENCH_CATCHUP_MOCK_FAULT="abort", BENCH_CATCHUP_STAGE_TIMEOUT="30")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("FAILURE CLASS: external network", buf.getvalue())
+        self.assertIn("aborted", buf.getvalue())
+
+    def test_a_failure_after_startup_is_always_classified(self):
+        import io
+        import catchup as tier
+        # the gate's hash probes fail outright
+        buf = io.StringIO()
+        with mock.patch("sys.stderr", buf), \
+                mock.patch.object(tier, "block_hash", side_effect=cl.ProbeError("boom")):
+            rc, _ = self.run_tier()
+        self.assertNotEqual(rc, 0)
+        self.assertIn("FAILURE CLASS: node", buf.getvalue())
+        self.assertIn("last go log lines", buf.getvalue())
+        # the tip probe (status) fails after the follow window
+        flag = {"after": False}
+        real, real_gate = tier.get_json, cl.label_gate
+
+        def flaky(base, path, timeout=10):
+            if flag["after"] and path == "/v2/status":
+                raise tier.TierError("status gone")
+            return real(base, path, timeout)
+
+        def label_gate(*a):
+            flag["after"] = True
+            return real_gate(*a)
+        buf = io.StringIO()
+        with mock.patch("sys.stderr", buf), mock.patch.object(tier, "get_json", flaky),                 mock.patch.object(cl, "label_gate", label_gate):
+            rc, _ = self.run_tier(BENCH_CATCHUP_FOLLOW_SECS="1")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("FAILURE CLASS:", buf.getvalue())
 
     def test_a_diverging_hash_is_classified_node(self):
         import io

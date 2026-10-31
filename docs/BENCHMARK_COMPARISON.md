@@ -1495,7 +1495,7 @@ BENCH_REST_PROFILE=smoke BENCH_REST_CORRUPT=blocks_json make bench-compare TIERS
 
 ## The `catchup` tier
 
-`make bench-compare TIERS=catchup NETWORK=testnet` compares how long go-algorand's
+`make bench-compare TIERS=catchup CATCHUP_NETWORK=testnet` compares how long go-algorand's
 `algod` (pinned tag) and `algod-rust` take to become usable on a **public**
 network, and what it costs to keep following it (issue #2108, epic #2101).
 Operators care about this more than about any offline number, but it is the
@@ -1512,8 +1512,8 @@ spread (n and the range / 95% CI of the median) is part of every row.
    (`https://algorand-catchpoints.s3.us-east-2.amazonaws.com/channel/<network>/latest.catchpoint`;
    `BENCH_CATCHUP_LABEL` pins one, `BENCH_CATCHUP_LABEL_URL` points at another
    index) and handed to both nodes and to every repeat. Networks:
-   `testnet` (default), `mainnet`, `betanet` (`NETWORK=` or
-   `BENCH_CATCHUP_NETWORK`). `voimain` / `aramidmain` are not offered: they run
+   `testnet` (default), `mainnet`, `betanet` (`CATCHUP_NETWORK=` or
+   `BENCH_CATCHUP_NETWORK`; not the generic `NETWORK`, which other tools read). `voimain` / `aramidmain` are not offered: they run
    custom consensus parameters go-algorand does not know, so there is no Go
    side.
 2. **Two nodes, identical limits, empty data directories.** Per repeat both
@@ -1538,6 +1538,17 @@ spread (n and the range / 95% CI of the median) is part of every row.
    | `phase_replay_s` | the catchpoint clears | the newest block is within `BENCH_CATCHUP_HEAD_SLACK_S` (30 s) of the wall clock |
    | `total_to_head_s` | the catchup request | the same head condition |
    | `replay_blocks_per_s` | blocks committed per second during `phase_replay_s` | |
+
+   The catchup counts as finished only when the catchpoint clears **and** the
+   ledger has reached the label's round: both nodes sync from genesis before the
+   request, so a catchpoint that clears below that round was aborted, and the
+   tier fails (class decided by the evidence rules below). The request itself
+   is not idempotent: after a timed-out attempt, an "already in progress"
+   answer for the same label (go and algod-rust answer HTTP 200 with the label;
+   HTTP 400 naming the same label is accepted too) counts as success, timed from
+   the first attempt; an answer naming another label, or a 200 whose message
+   is not the label, is a failure. A hash probe that times out or gets a 5xx is
+   retried and then fails the run; only a 404 means "pruned".
 
    There is no separate "download" and "import" row: both nodes stream the
    catchpoint file and import accounts while it arrives, so the only
@@ -1634,10 +1645,10 @@ not have.
 ```bash
 # 3 repeats against the newest testnet catchpoint (hours: the ledger download
 # dominates), on a quiet Linux host with docker
-make bench-compare TIERS=catchup NETWORK=testnet RUNS=3
+make bench-compare TIERS=catchup CATCHUP_NETWORK=testnet RUNS=3
 # a short look: one repeat, a one-minute follow window
 BENCH_CATCHUP_PROFILE=smoke BENCH_CATCHUP_FOLLOW_SECS=60 \
-  make bench-compare TIERS=catchup NETWORK=betanet RUNS=1
+  make bench-compare TIERS=catchup CATCHUP_NETWORK=betanet RUNS=1
 # a prebuilt algod-rust image
 BENCH_CATCHUP_RUST_IMAGE=algod-rust:bench-catchup make bench-compare TIERS=catchup RUNS=3
 # the mock network (what CI runs)

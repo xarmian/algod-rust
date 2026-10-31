@@ -14,7 +14,9 @@ choice, the network's own load), so every row carries
 `metadata.nondeterministic = true`, which report.py turns into an explicit
 label next to the numbers.
 """
+import json
 import re
+import time
 
 TIER = "catchup"
 EXTERNAL = "external network"
@@ -68,7 +70,7 @@ PROFILES = {
     "smoke": {"follow_secs": 10.0},
 }
 MODES = ("live", "mock")
-MOCK_FAULTS = ("none", "diverge", "stall")
+MOCK_FAULTS = ("none", "diverge", "stall", "die", "abort")
 
 
 def parse_settings(env):
@@ -192,14 +194,16 @@ class PhaseTracker:
     slack (`lag_s` of the sample: wall clock minus the block's timestamp).
     """
 
-    def __init__(self, t0):
+    def __init__(self, t0, head_slack_s, label_round=None):
         self.t0 = t0
+        self.head_slack_s = head_slack_s
+        self.label_round = label_round
         self.enter = {}
         self.catchpoint_seen = None
         self.progressed = False
+        self.aborted = False
         self.t_done = self.round_done = None
         self.t_head = self.round_head = None
-        self.head_slack_s = 30.0
 
     def observe(self, t, status, lag_s=None):
         stage = stage_of(status)
@@ -210,10 +214,17 @@ class PhaseTracker:
             self.enter.setdefault(stage, t)
             if stage != "ledger" or _int(status, "catchpoint-processed-accounts") > 0:
                 self.progressed = True
-        elif self.catchpoint_seen is not None and rnd > 0 and self.t_done is None:
-            self.t_done, self.round_done = t, rnd
-            self.enter.setdefault("done", t)
-            self.progressed = True
+        elif self.catchpoint_seen is not None and self.t_done is None and not self.aborted:
+            # The catchpoint cleared. Both nodes sync from genesis before the
+            # request, so last-round > 0 proves nothing: only a ledger that
+            # reached the label's round is a finished catchup; a catchpoint
+            # that clears below it was aborted or failed.
+            if rnd > 0 and (self.label_round is None or rnd >= self.label_round):
+                self.t_done, self.round_done = t, rnd
+                self.enter.setdefault("done", t)
+                self.progressed = True
+            else:
+                self.aborted = True
         if (self.t_done is not None and self.t_head is None and lag_s is not None
                 and lag_s <= self.head_slack_s):
             self.t_head, self.round_head = t, rnd
@@ -254,6 +265,7 @@ class PhaseTracker:
 
 def follow_stats(samples):
     """Metrics of the follow window from [(t, round, lag_s)] of one node."""
+    samples = [x for x in samples if x is not None]   # None: a missed poll
     if len(samples) < 2:
         return {}
     out = {}
@@ -268,10 +280,15 @@ def follow_stats(samples):
 
 
 def rounds_behind_max(go, rust):
-    """Largest number of rounds each node was behind the other, from
-    [(t, round)] lists sampled in lockstep (paired by index)."""
+    """Largest number of rounds each node was behind the other. The lists hold
+    one entry per poll iteration, (t, round) or None for a poll that got no
+    answer, so both nodes' entries of one iteration are paired and a missed
+    poll leaves a gap instead of shifting every later pair."""
     out = {"go": 0, "rust": 0}
-    for (_, g), (_, r) in zip(go, rust):
+    for a, b in zip(go, rust):
+        if a is None or b is None:
+            continue
+        g, r = a[1], b[1]
         out["go"] = max(out["go"], r - g)
         out["rust"] = max(out["rust"], g - r)
     return out
@@ -307,6 +324,91 @@ def oldest_available(lo, hi, available):
         else:
             lo = mid + 1
     return lo
+
+
+class ProbeError(CatchupError):
+    """A block-hash probe failed for a reason other than "pruned"."""
+
+
+def hash_or_pruned(get, rnd, attempts=4, sleep=time.sleep):
+    """The block hash of `rnd`, or None when the node answered 404 (pruned: it
+    keeps only its newest blocks). `get(rnd)` returns (status, body) or raises
+    OSError. A transport error, a timeout or a 5xx is retried with a back-off
+    and then raises ProbeError, never mistaken for "pruned"; so does any other
+    status or a body without `blockHash`."""
+    last = ""
+    for i in range(attempts):
+        try:
+            status, body = get(rnd)
+        except OSError as e:
+            last = f"{type(e).__name__}: {e}"
+        else:
+            if status == 404:
+                return None
+            if status == 200:
+                try:
+                    h = json.loads(body).get("blockHash")
+                except (ValueError, AttributeError):
+                    raise ProbeError(f"round {rnd}: answer is not JSON: {body[:100]!r}") from None
+                if not h:
+                    raise ProbeError(f"round {rnd}: answer has no blockHash: {body[:100]!r}")
+                return h
+            last = f"HTTP {status}: {body[:100]!r}"
+            if status < 500:
+                raise ProbeError(f"round {rnd}: unexpected {last}")
+        if i + 1 < attempts:
+            sleep(0.5 * 2 ** i)
+    raise ProbeError(f"round {rnd}: no usable answer after {attempts} attempts ({last})")
+
+
+class TriggerError(CatchupError):
+    pass
+
+
+_IN_PROGRESS = re.compile(r"already catching up '([^']*)'")
+
+
+def trigger_catchup(post, label, attempts=10, now=time.time, sleep=time.sleep):
+    """Ask a node to catch up to `label` (`post()` returns (status, body) or
+    raises OSError) and return the time of the FIRST attempt.
+
+    The POST is not idempotent, so a retry after a timed-out first attempt may
+    find the catchup already running: go (CatchpointAlreadyInProgressError) and
+    algod-rust answer that with HTTP 200 and the label as the message. HTTP 400
+    "unable to start ... - already catching up '<label>'" naming the SAME label
+    is accepted too; naming another label, or a 200 whose message is not the
+    label (go: the catchup was skipped), is an error. 5xx, 408 and transport
+    errors are retried."""
+    t_first = now()
+    last = ""
+    for i in range(attempts):
+        try:
+            status, body = post()
+        except OSError as e:
+            last = f"{type(e).__name__}: {e}"
+        else:
+            text = body.decode("utf-8", "replace") if isinstance(body, bytes) else str(body)
+            if status in (200, 201):
+                try:
+                    msg = json.loads(text).get("catchup-message")
+                except (ValueError, AttributeError):
+                    msg = None
+                if msg == label:
+                    return t_first
+                raise TriggerError(f"HTTP {status} but the node did not start the catchup: "
+                                   f"{text[:200]!r}")
+            m = _IN_PROGRESS.search(text)
+            if status == 400 and m:
+                if m.group(1) == label:
+                    return t_first
+                raise TriggerError(f"HTTP 400: the node is already catching up to another "
+                                   f"catchpoint: {text[:200]!r}")
+            last = f"HTTP {status}: {text[:200]!r}"
+            if status < 500 and status != 408:
+                raise TriggerError(last)
+        if i + 1 < attempts:
+            sleep(2)
+    raise TriggerError(f"no accepted answer after {attempts} attempts ({last})")
 
 
 def hash_gate(go, rust, rounds):
@@ -401,7 +503,7 @@ def classify_failure(sides, label_error=False, kind="other"):
             return EXTERNAL, ("neither node made progress and a transport-level relay failure "
                               "is in the logs")
         return NODE, "neither node made progress and the logs show no relay failure"
-    if kind == "timeout" and relay:
+    if kind in ("timeout", "abort") and relay:
         return EXTERNAL, "both nodes progressed too slowly; relay failures are in the logs"
     return NODE, "both nodes progressed, but the run did not finish"
 
@@ -428,6 +530,23 @@ def resources_over(samples, t0, t1):
         "blockio_read_mb": max(0, rows[-1]["blk_read"] - rows[0]["blk_read"]) / MIB,
         "blockio_write_mb": max(0, rows[-1]["blk_write"] - rows[0]["blk_write"]) / MIB,
     }
+
+
+def resource_metrics(samples, t0, t_head, t_follow, t_end):
+    """One node's resource metrics: CPU cores while catching up [t0, t_head]
+    and while following [t_follow, t_end] (t_follow is when the follow window
+    began for BOTH nodes, so an early arrival's waiting time does not dilute
+    it), peak RSS and block IO over the whole run."""
+    out = {}
+    for key, (a, b) in (("cpu_cores_catchup", (t0, t_head)), ("cpu_cores_follow", (t_follow, t_end))):
+        r = resources_over(samples, a, b)
+        if r:
+            out[key] = r["cpu_cores"]
+    whole = resources_over(samples, t0, t_end)
+    for k in ("rss_mb_peak", "blockio_read_mb", "blockio_write_mb"):
+        if k in whole:
+            out[k] = whole[k]
+    return out
 
 
 # ---- rows -----------------------------------------------------------------------------------

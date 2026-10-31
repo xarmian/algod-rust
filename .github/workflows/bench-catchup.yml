@@ -76,7 +76,7 @@ jobs:
           BENCH_CATCHUP_POLL_S: "0.2"
         run: |
           set -euo pipefail
-          make bench-compare TIERS=catchup RUNS=2 BENCH_RUN_DIR=bench-results/ci-catchup
+          make bench-compare TIERS=catchup CATCHUP_NETWORK=testnet RUNS=2 BENCH_RUN_DIR=bench-results/ci-catchup
           python3 - <<'PY'
           import json
           rep = json.load(open("bench-results/ci-catchup/report.json"))
