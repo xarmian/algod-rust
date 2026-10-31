@@ -93,14 +93,24 @@ class CompareTest(unittest.TestCase):
         other = dict(base, **{"last-round": 6})
         self.assertTrue(rl.compare(REQ_STATUS, resp(base), resp(other)))
 
-    def test_msgpack_bodies_are_compared_byte_for_byte(self):
+    def test_msgpack_bodies_are_compared_structurally_and_then_by_bytes(self):
         a = resp(b"\x81\xa1a\x01", ctype="application/msgpack")
         self.assertEqual(rl.compare(REQ_BLOCK, a, resp(b"\x81\xa1a\x01",
                                                       ctype="application/msgpack")), [])
         b = resp(b"\x81\xa1a\x02", ctype="application/msgpack")
         diffs = rl.compare(REQ_BLOCK, a, b)
-        self.assertTrue(diffs)
-        self.assertIn("byte 3", diffs[0])
+        self.assertEqual(len(diffs), 1)
+        self.assertIn("a: go 1 != rust 2", diffs[0])
+        # the same value with different bytes (a wider integer) is still a difference
+        c = resp(b"\x81\xa1a\xcc\x01", ctype="application/msgpack")
+        diffs = rl.compare(REQ_BLOCK, a, c)
+        self.assertEqual(len(diffs), 1)
+        self.assertIn("different msgpack bytes", diffs[0])
+
+    def test_an_undecodable_msgpack_body_falls_back_to_bytes(self):
+        a = resp(b"\x81\xa1", ctype="application/msgpack")
+        diffs = rl.compare(REQ_BLOCK, a, resp(b"\x81\xa2", ctype="application/msgpack"))
+        self.assertTrue(diffs and "byte 1" in diffs[0])
 
     def test_a_non_json_body_on_a_json_request_falls_back_to_bytes(self):
         a = resp(b"not json", ctype="text/plain")
@@ -145,25 +155,94 @@ class GateTest(unittest.TestCase):
         errs = rl.gate(self.reqs(), g, dict(g, extra=resp({})), [])
         self.assertTrue(any("not in the request set" in e for e in errs))
 
-    def test_allowlist_excuses_only_its_own_path_and_needs_an_issue(self):
+    def entry(self, path, kind, **kw):
+        return dict({"endpoint": "account_hot", "path": path, "kind": kind, "issue": 123,
+                     "reason": "r"}, **kw)
+
+    def test_value_entry_excuses_its_own_path_only(self):
         g = self.good()
-        r = dict(g, account_hot=resp({"amount": 5, "bogus": 1}))
-        allow = [{"endpoint": "account_hot", "path": "bogus", "issue": 123, "reason": "r"}]
+        r = dict(g, account_hot=resp({"amount": 6}))
+        allow = [self.entry("amount", "value")]
         self.assertEqual(rl.gate(self.reqs(), g, r, allow), [])
-        r2 = dict(g, account_hot=resp({"amount": 6, "bogus": 1}))
-        self.assertTrue(rl.gate(self.reqs(), g, r2, allow))
+        g2 = dict(g, account_hot=resp({"amount": 5, "other": 1}))
+        r2 = dict(g, account_hot=resp({"amount": 6, "other": 2}))
+        errs = rl.gate(self.reqs(), g2, r2, allow)
+        self.assertEqual(len(errs), 1)
+        self.assertIn("other", errs[0])
+
+    def test_only_go_entry_excuses_a_missing_key_but_not_a_value_difference(self):
+        g = dict(self.good(), account_hot=resp({"assets": [{"amount": 5}], "amount": 1}))
+        allow = [self.entry("assets", "only-go")]
+        missing = dict(g, account_hot=resp({"amount": 1}))
+        self.assertEqual(rl.gate(self.reqs(), g, missing, allow), [])
+        # both sides have the list: it must be equal, nothing below the entry is covered
+        wrong = dict(g, account_hot=resp({"assets": [{"amount": 6}], "amount": 1}))
+        errs = rl.gate(self.reqs(), g, wrong, allow)
+        self.assertTrue(any("assets.0.amount" in e for e in errs), errs)
+        # ... and the entry is then stale as well
+        self.assertTrue(any("no longer matches" in e for e in errs))
+        # a list element missing on the rust side is not the excused difference either
+        short = dict(g, account_hot=resp({"assets": [], "amount": 1}))
+        self.assertTrue(any("assets.0" in e for e in rl.gate(self.reqs(), g, short, allow)))
+
+    def test_a_prefix_entry_does_not_cover_deeper_paths(self):
+        g = dict(self.good(), account_hot=resp({"a": {"b": 1, "c": 2}}))
+        r = dict(g, account_hot=resp({"a": {"b": 9, "c": 2}}))
+        errs = rl.gate(self.reqs(), g, r, [self.entry("a", "value")])
+        self.assertTrue(any("a.b" in e for e in errs), errs)
+
+    def test_only_rust_entry_can_pin_the_rust_value(self):
+        g = dict(self.good(), account_hot=resp({"amount": 1}))
+        r = dict(g, account_hot=resp({"amount": 1, "step": 2}))
+        self.assertEqual(rl.gate(self.reqs(), g, r, [self.entry("step", "only-rust",
+                                                                 rust_value=2)]), [])
+        r3 = dict(g, account_hot=resp({"amount": 1, "step": 3}))
+        errs = rl.gate(self.reqs(), g, r3, [self.entry("step", "only-rust", rust_value=2)])
+        self.assertTrue(any("step: only in rust" in e for e in errs), errs)
+
+    def test_wildcard_matches_exactly_one_segment(self):
+        g = dict(self.good(), account_hot=resp({"l": [{"x": 1}, {"x": 2}]}))
+        r = dict(g, account_hot=resp({"l": [{"x": 5}, {"x": 6}]}))
+        self.assertEqual(rl.gate(self.reqs(), g, r, [self.entry("l.*.x", "value")]), [])
+        deeper = dict(g, account_hot=resp({"l": [{"x": 1, "y": 3}, {"x": 2}]}))
+        self.assertTrue(rl.gate(self.reqs(), g, deeper, [self.entry("l.*.x", "value")]))
+
+    def test_msgpack_block_cert_step_is_the_only_excused_msgpack_difference(self):
+        req = {"name": "blocks_msgpack", "method": "GET", "path": "/b", "kind": "msgpack"}
+        allow = [{"endpoint": "blocks_msgpack", "path": "cert.step", "kind": "only-rust",
+                  "rust_value": 2, "issue": 2159, "reason": "r"}]
+        block = {"block": {"rnd": 7, "ts": 100, "txns": [{"txn": {"amt": 1}}]}, "cert": {"rnd": 7}}
+        mp = "application/msgpack"
+        go = {"blocks_msgpack": resp(rl.msgpack(block), ctype=mp)}
+
+        def rust_with(mutate):
+            doc = json.loads(json.dumps(block))
+            doc["cert"]["step"] = 2
+            mutate(doc)
+            return {"blocks_msgpack": resp(rl.msgpack(doc), ctype=mp)}
+
+        self.assertEqual(rl.gate([req], go, rust_with(lambda d: None), allow), [])
+        # a different header field, a different txn, a different cert round all fail
+        for mutate in (lambda d: d["block"].__setitem__("ts", 101),
+                       lambda d: d["block"]["txns"][0]["txn"].__setitem__("amt", 2),
+                       lambda d: d["cert"].__setitem__("rnd", 8),
+                       lambda d: d["cert"].__setitem__("step", 3)):
+            errs = rl.gate([req], go, rust_with(mutate), allow)
+            self.assertTrue(errs, mutate)
 
     def test_a_stale_allowlist_entry_fails_the_gate(self):
         g = self.good()
-        allow = [{"endpoint": "account_hot", "path": "bogus", "issue": 123, "reason": "r"}]
-        errs = rl.gate(self.reqs(), g, dict(g), allow)
+        errs = rl.gate(self.reqs(), g, dict(g), [self.entry("bogus", "only-go")])
         self.assertTrue(any("allowlist" in e and "no longer" in e for e in errs))
 
     def test_invalid_allowlist_entries_are_refused(self):
-        for bad in ({"endpoint": "a", "path": "p", "reason": "r"},
-                    {"endpoint": "a", "path": "p", "issue": "x", "reason": "r"},
-                    {"endpoint": "a", "path": "p", "issue": 1, "reason": ""},
-                    {"endpoint": "a", "issue": 1, "reason": "r"}):
+        ok = {"endpoint": "a", "path": "p", "kind": "value", "issue": 1, "reason": "r"}
+        rl.check_allowlist([ok])
+        for bad in (dict(ok, issue=None), dict(ok, issue="x"), dict(ok, reason=""),
+                    dict(ok, kind="whatever"), dict(ok, kind="value", rust_value=1),
+                    {k: v for k, v in ok.items() if k not in ("path",)},
+                    {k: v for k, v in ok.items() if k not in ("kind",)},
+                    {k: v for k, v in ok.items() if k not in ("issue",)}):
             with self.assertRaises(ValueError):
                 rl.check_allowlist([bad])
 
@@ -171,32 +250,104 @@ class GateTest(unittest.TestCase):
         rl.check_allowlist(rl.KNOWN_DIFFERENCES)
         for e in rl.KNOWN_DIFFERENCES:
             self.assertIsInstance(e["issue"], int)
+            self.assertGreaterEqual(e["issue"], 2155)
+            self.assertEqual(e["corpus"], "small")
 
     def test_a_corpus_scoped_entry_applies_only_to_its_corpus(self):
         g = self.good()
         r = dict(g, account_hot=resp({"amount": 5, "bogus": 1}))
-        allow = [{"endpoint": "account_hot", "path": "bogus", "issue": 1, "reason": "r",
-                  "corpus": "small"}]
+        allow = [self.entry("bogus", "only-rust", corpus="small")]
         self.assertEqual(rl.gate(self.reqs(), g, r, allow, corpus="small"), [])
         # another corpus: not excused, and the unused entry is not reported stale
         errs = rl.gate(self.reqs(), g, r, allow, corpus="large")
         self.assertEqual(len(errs), 1)
         self.assertNotIn("allowlist", errs[0])
 
-    def test_every_known_difference_is_for_a_filed_issue_range(self):
-        for e in rl.KNOWN_DIFFERENCES:
-            self.assertGreaterEqual(e["issue"], 2155)
-            self.assertEqual(e["corpus"], "small")
 
-    def test_corrupt_helper_changes_exactly_one_response(self):
-        g = self.good()
-        bad = rl.corrupt_response(g["account_hot"])
-        self.assertNotEqual(bad["body"], g["account_hot"]["body"])
-        errs = rl.gate(self.reqs(), g, dict(g, account_hot=bad), [])
-        self.assertEqual(len(errs), 1)
-        # msgpack and non-JSON bodies are corrupted too
-        mp = resp(b"\x81\xa1a\x01", ctype="application/msgpack")
-        self.assertNotEqual(rl.corrupt_response(mp)["body"], mp["body"])
+class CorruptTest(unittest.TestCase):
+    """BENCH_REST_CORRUPT's negative test must fail the gate for EVERY
+    endpoint, also those that have allowlisted differences."""
+
+    def test_every_endpoint_with_an_allowlist_entry_still_fails_when_corrupted(self):
+        mp = "application/msgpack"
+        block = {"block": {"rnd": 7, "ts": 100, "bi": 10}, "cert": {"rnd": 7}}
+        # (request, go response, rust response) shaped like the real known differences
+        cases = {
+            "account_hot": (REQ_ACCT,
+                            resp({"amount": 5, "assets": [{"amount": 1}], "rewards": 3}),
+                            resp({"amount": 4, "rewards": 2})),
+            "blocks_msgpack": ({"name": "blocks_msgpack", "method": "GET", "path": "/b",
+                               "kind": "msgpack"},
+                              resp(rl.msgpack(block), ctype=mp),
+                              resp(rl.msgpack(dict(block, cert={"rnd": 7, "step": 2})), ctype=mp)),
+        }
+        allow = [
+            {"endpoint": "account_hot", "path": "assets", "kind": "only-go", "issue": 1,
+             "reason": "r"},
+            {"endpoint": "account_hot", "path": "amount", "kind": "value", "issue": 1,
+             "reason": "r"},
+            {"endpoint": "account_hot", "path": "rewards", "kind": "value", "issue": 1,
+             "reason": "r"},
+            {"endpoint": "blocks_msgpack", "path": "cert.step", "kind": "only-rust",
+             "rust_value": 2, "issue": 1, "reason": "r"},
+        ]
+        for name, (req, go, rust) in cases.items():
+            self.assertEqual(rl.gate([req], {req["name"]: go}, {req["name"]: rust}, allow), [],
+                             name)
+            bad = rl.corrupt_response(req, go, rust, allow)
+            self.assertNotEqual(bad["body"], rust["body"], name)
+            errs = rl.gate([req], {req["name"]: go}, {req["name"]: bad}, allow)
+            self.assertTrue([e for e in errs if not e.startswith("allowlist")], name)
+
+    def test_plain_endpoints_and_byte_bodies_are_corrupted_too(self):
+        g = resp({"a": 1, "s": "x"})
+        bad = rl.corrupt_response(REQ_ACCT, g, g, [])
+        self.assertTrue(rl.gate([REQ_ACCT], {"account_hot": g}, {"account_hot": bad}, []))
+        txt = resp(b"not json", ctype="text/plain")
+        bad = rl.corrupt_response(REQ_ACCT, txt, txt, [])
+        self.assertNotEqual(bad["body"], txt["body"])
+
+    def test_a_corruption_that_cannot_fail_the_gate_is_an_error(self):
+        g = resp({"a": 1})
+        allow = [{"endpoint": "account_hot", "path": "a", "kind": "value", "issue": 1,
+                  "reason": "r"}]
+        # every alteration of the only leaf is excused and byte flips of "{" break JSON
+        # parsing, which the gate reports; so a corruption IS found (via bytes)
+        bad = rl.corrupt_response(REQ_ACCT, g, g, allow)
+        self.assertNotEqual(bad["body"], g["body"])
+
+
+class KnownDifferencesDocTest(unittest.TestCase):
+    def test_the_documented_table_is_generated_from_the_code(self):
+        with open(os.path.join(REPO, "docs", "BENCHMARK_COMPARISON.md"), encoding="utf-8") as f:
+            doc = f.read()
+        a = doc.index(rl.KD_TABLE_START) + len(rl.KD_TABLE_START)
+        b = doc.index(rl.KD_TABLE_END)
+        self.assertEqual(doc[a:b].strip(), rl.known_differences_table().strip())
+
+    def test_every_entry_appears_with_its_issue_number(self):
+        table = rl.known_differences_table()
+        for e in rl.KNOWN_DIFFERENCES:
+            row = next(line for line in table.splitlines()
+                       if f"`{e['endpoint']}` | `{e['path']}` |" in line)
+            self.assertIn(f"[#{e['issue']}]", row)
+
+
+class MsgpackDecodeTest(unittest.TestCase):
+    def test_round_trip(self):
+        v = {"a": [1, 2, 300, 70000, 2 ** 40], "b": b"xy", "c": "s" * 40, "d": None,
+             "e": True, "f": {"g": False}}
+        self.assertEqual(rl.msgpack_decode(rl.msgpack(v)), v)
+
+    def test_negative_ints_and_floats(self):
+        self.assertEqual(rl.msgpack_decode(b"\xff"), -1)
+        self.assertEqual(rl.msgpack_decode(b"\xd0\x80"), -128)
+        self.assertEqual(rl.msgpack_decode(b"\xcb" + bytes.fromhex("3ff8000000000000")), 1.5)
+
+    def test_truncated_trailing_and_ext_are_errors(self):
+        for bad in (b"\x81\xa1", b"\x01\x02", b"\xd4\x01\x00", b"", b"\xc1"):
+            with self.assertRaises(ValueError):
+                rl.msgpack_decode(bad)
 
 
 class VolatileDocsTest(unittest.TestCase):
@@ -373,10 +524,85 @@ class RowsTest(unittest.TestCase):
 
     def test_error_rate_counts_transport_errors_and_non_2xx(self):
         e = self.endpoints()
-        e["errors"], e["non_2xx"] = 5, 5
+        e["errors"], e["non_2xx"], e["ok"] = 5, 5, 490
         self.assertAlmostEqual(rl.error_rate(e), 0.02)
         e["requests"] = 0
         self.assertEqual(rl.error_rate(e), 1.0)
+
+    def test_error_rate_without_ok_falls_back_to_the_failure_counts(self):
+        e = self.endpoints()
+        e["errors"], e["non_2xx"] = 5, 5
+        self.assertAlmostEqual(rl.error_rate(e), 0.02)
+
+    def test_a_node_above_the_error_threshold_is_flagged(self):
+        e = self.endpoints()
+        self.assertIsNone(rl.check_error_rate(e, "go", "status"))
+        e.update(errors=0, non_2xx=50, ok=450)
+        msg = rl.check_error_rate(e, "rust", "status", 0.01)
+        self.assertIn("rust", msg)
+        self.assertIn("status", msg)
+        self.assertIn("10.0%", msg)
+        self.assertIsNone(rl.check_error_rate(e, "rust", "status", 0.2))
+        e.update(ok=0, non_2xx=500)
+        self.assertTrue(rl.check_error_rate(e, "rust", "status"))
+
+
+class SenderAndSimulationTest(unittest.TestCase):
+    ACCTS = {"RWD": {"amount": 900}, "FEES": {"amount": 800}, "B": {"amount": 100},
+             "A": {"amount": 100}, "C": {"amount": 50}}
+
+    def test_sender_is_the_richest_non_reserved_account(self):
+        self.assertEqual(rl.pick_sender(self.ACCTS, {"RWD", "FEES"}), "A")  # tie: address
+        self.assertEqual(rl.pick_sender(self.ACCTS, set()), "RWD")
+
+    def test_no_candidate_is_an_error(self):
+        with self.assertRaises(ValueError):
+            rl.pick_sender({"RWD": {"amount": 1}}, {"RWD"})
+
+    def sim(self, group=None, status=200):
+        doc = {"txn-groups": [group if group is not None else
+                              {"txn-results": [{"txn-result": {"pool-error": ""}}]}]}
+        return resp(doc, status=status)
+
+    def test_a_successful_simulation_has_no_problems(self):
+        self.assertEqual(rl.check_simulation(self.sim()), [])
+
+    def test_failures_are_reported(self):
+        self.assertTrue(rl.check_simulation(self.sim(status=400)))
+        self.assertTrue(rl.check_simulation(resp({"message": "x"})))
+        bad = {"failure-message": "overspend", "failed-at": [0],
+               "txn-results": [{"txn-result": {"pool-error": ""}}]}
+        problems = rl.check_simulation(self.sim(bad))
+        self.assertTrue(any("overspend" in p for p in problems))
+        self.assertTrue(any("failed at" in p for p in problems))
+        pe = {"txn-results": [{"txn-result": {"pool-error": "tx rejected"}}]}
+        self.assertTrue(any("pool-error" in p for p in rl.check_simulation(self.sim(pe))))
+        self.assertTrue(rl.check_simulation(self.sim({"txn-results": []})))
+
+
+class WindowTest(unittest.TestCase):
+    def test_only_samples_whose_whole_call_is_inside_the_window_count(self):
+        samples = [
+            {"start": 8.0, "t": 10.5},    # straddles the start
+            {"start": 10.2, "t": 11.8},   # inside
+            {"start": 11.9, "t": 13.4},   # inside
+            {"start": 14.0, "t": 15.6},   # straddles the end
+            {"start": 16.0, "t": 17.0},   # after
+        ]
+        got = rl.window_samples(samples, 10.0, 15.0)
+        self.assertEqual([s["start"] for s in got], [10.2, 11.9])
+
+    def test_a_window_shorter_than_one_call_has_no_samples(self):
+        self.assertEqual(rl.window_samples([{"start": 0.0, "t": 1.5}], 0.2, 1.2), [])
+
+
+class DurationTest(unittest.TestCase):
+    def test_fixed_point_never_an_exponent(self):
+        self.assertEqual(rl.format_duration(0.5), "0.500s")
+        self.assertEqual(rl.format_duration(5), "5.000s")
+        self.assertEqual(rl.format_duration(0), "0.000s")
+        self.assertNotIn("e", rl.format_duration(1e-5))
+        self.assertNotIn("e", rl.format_duration(1e7))
 
 
 class SettingsTest(unittest.TestCase):
@@ -434,10 +660,58 @@ class TierSettingsTest(unittest.TestCase):
     def test_bad_settings_are_refused(self):
         for env in ({"BENCH_REST_PROFILE": "x"}, {"BENCH_REST_CONCURRENCY": "0"},
                     {"BENCH_REST_DURATION": "0"}, {"BENCH_REST_DURATION": "abc"},
+                    {"BENCH_REST_DURATION": "1e-05"}, {"BENCH_REST_DURATION": "0.05"},
+                    {"BENCH_REST_WARMUP": "0.01"}, {"BENCH_REST_WARMUP": "-1"},
+                    {"BENCH_REST_MAX_ERROR_RATE": "2"},
                     {"BENCH_REST_CPUS": "-1"}, {"BENCH_REST_MEM": "lots"},
                     {"BENCH_REST_PORT_BASE": "80"}):
             with self.assertRaises(tier.TierError, msg=env):
                 tier.settings(env)
+
+
+class EnsureImagesTest(unittest.TestCase):
+    class P:
+        def __init__(self, rc, out=""):
+            self.returncode, self.stdout, self.stderr = rc, out, ""
+
+    def run_with(self, **kw):
+        calls = []
+
+        def fake(*args, check=True, **_):
+            calls.append(args)
+            if args[:2] == ("image", "inspect") and "--format" not in args:
+                return self.P(0 if args[2].startswith("algorand/") else 1)
+            if "--format" in args:
+                return self.P(0, "sha256:x")
+            return self.P(0)
+
+        orig = tier.localnet.docker
+        tier.localnet.docker = fake
+        try:
+            cfg = {"go_image": "algorand/algod:5", "rust_image": kw.pop("rust_image", "")}
+            tier.localnet.ensure_images(cfg, **kw)
+        finally:
+            tier.localnet.docker = orig
+        return cfg, calls
+
+    def test_the_error_names_the_rest_tiers_own_variable(self):
+        with self.assertRaises(tier.localnet.TierError) as cm:
+            self.run_with(rust_image="nope:1", rust_env="BENCH_REST_RUST_IMAGE",
+                          rust_tag="algod-rust:bench-rest")
+        self.assertIn("BENCH_REST_RUST_IMAGE=nope:1", str(cm.exception))
+        self.assertNotIn("LOCALNET", str(cm.exception))
+
+    def test_the_localnet_defaults_are_unchanged(self):
+        with self.assertRaises(tier.localnet.TierError) as cm:
+            self.run_with(rust_image="nope:1")
+        self.assertIn("BENCH_LOCALNET_RUST_IMAGE=nope:1", str(cm.exception))
+
+    def test_the_rest_tier_builds_its_own_tag(self):
+        cfg, calls = self.run_with(rust_env="BENCH_REST_RUST_IMAGE",
+                                   rust_tag="algod-rust:bench-rest")
+        self.assertEqual(cfg["rust_image"], "algod-rust:bench-rest")
+        build = next(c for c in calls if c[0] == "build")
+        self.assertEqual(build[build.index("-t") + 1], "algod-rust:bench-rest")
 
 
 if __name__ == "__main__":

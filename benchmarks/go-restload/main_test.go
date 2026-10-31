@@ -68,8 +68,49 @@ func TestRunSendsTokenBodyAndCountsStatuses(t *testing.T) {
 	if out.Endpoints[0].Requests == 0 || out.Endpoints[0].Errors != 0 || out.Endpoints[0].Non2xx != 0 {
 		t.Errorf("get: %+v", out.Endpoints[0])
 	}
-	if out.Endpoints[2].Non2xx != out.Endpoints[2].Requests || out.Endpoints[2].Requests == 0 {
-		t.Errorf("404 endpoint must count every request as non-2xx: %+v", out.Endpoints[2])
+	nf := out.Endpoints[2]
+	if nf.Non2xx != nf.Requests || nf.Requests == 0 || nf.OK != 0 {
+		t.Errorf("404 endpoint must count every request as non-2xx: %+v", nf)
+	}
+	// Failed requests are not throughput and not latency.
+	if nf.RPS != 0 || nf.P50Ms != 0 || nf.P95Ms != 0 || nf.P99Ms != 0 || nf.MaxMs != 0 {
+		t.Errorf("a 404 endpoint must report no rps / latency: %+v", nf)
+	}
+	if out.Endpoints[0].OK != out.Endpoints[0].Requests {
+		t.Errorf("get: ok %d != requests %d", out.Endpoints[0].OK, out.Endpoints[0].Requests)
+	}
+}
+
+func TestSummarizeUsesSuccessfulRequestsOnly(t *testing.T) {
+	// 4 successes of 10..40 ms, 6 failures: rps counts 4, percentiles use 4.
+	lat := []time.Duration{40 * time.Millisecond, 10 * time.Millisecond, 30 * time.Millisecond, 20 * time.Millisecond}
+	r := summarize("x", lat, 2, 4, 100, 2*time.Second)
+	if r.Requests != 10 || r.OK != 4 || r.Errors != 2 || r.Non2xx != 4 {
+		t.Fatalf("counts: %+v", r)
+	}
+	if r.RPS != 2 {
+		t.Errorf("rps = %v, want 2 (4 ok / 2 s)", r.RPS)
+	}
+	if r.P50Ms != 20 || r.MaxMs != 40 {
+		t.Errorf("percentiles must come from the successes: %+v", r)
+	}
+}
+
+func TestMixedEndpointCountsFailuresSeparately(t *testing.T) {
+	var n atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if n.Add(1)%2 == 0 {
+			http.Error(w, "boom", 500)
+			return
+		}
+		w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+	rs := []request{{Name: "m", Method: "GET", Path: "/"}}
+	out := run(srv.URL, "t", rs, 2, 120*time.Millisecond, 0)
+	e := out.Endpoints[0]
+	if e.OK == 0 || e.Non2xx == 0 || e.Requests != e.OK+e.Non2xx+e.Errors {
+		t.Fatalf("mixed: %+v", e)
 	}
 }
 

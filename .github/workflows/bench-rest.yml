@@ -145,24 +145,26 @@ jobs:
           BENCH_REST_RUST_IMAGE: algod-rust:bench-rest
         run: |
           set -euo pipefail
-          out="$RUNNER_TEMP/neg-rest"
-          mkdir -p "$out"
-          if BENCH_REST_CORRUPT=blocks_json BENCH_RUNS=1 BENCH_OUT="$out" \
-               BENCH_RUST_BIN_DIR="$BENCH_BIN_DIR/rust" BENCH_GO_ALGORAND_DIR="$GO_ALGORAND_DIR" \
-               python3 scripts/bench/tiers/rest.py > "$out/log.txt" 2>&1; then
-            cat "$out/log.txt"
-            echo "::error::the rest tier passed with an altered response"
-            exit 1
-          fi
-          tail -n 8 "$out/log.txt"
-          # It must fail at the gate, for that endpoint, before any load step.
-          for want in 'response-equality gate FAILED (before load)' 'blocks_json'; do
-            grep -qF "$want" "$out/log.txt" || { echo "::error::failed, but without '$want'"; exit 1; }
+          # blocks_json has no allowlisted difference; blocks_msgpack does
+          # (#2159), so its corruption must land outside the excused path.
+          for ep in blocks_json blocks_msgpack; do
+            out="$RUNNER_TEMP/neg-rest-$ep"
+            mkdir -p "$out"
+            if BENCH_REST_CORRUPT="$ep" BENCH_RUNS=1 BENCH_OUT="$out"                  BENCH_RUST_BIN_DIR="$BENCH_BIN_DIR/rust" BENCH_GO_ALGORAND_DIR="$GO_ALGORAND_DIR"                  python3 scripts/bench/tiers/rest.py > "$out/log.txt" 2>&1; then
+              cat "$out/log.txt"
+              echo "::error::the rest tier passed with an altered $ep response"
+              exit 1
+            fi
+            tail -n 8 "$out/log.txt"
+            # It must fail at the gate, for that endpoint, before any load step.
+            for want in 'response-equality gate FAILED (before load)' "$ep"; do
+              grep -qF "$want" "$out/log.txt" || { echo "::error::$ep: failed, but without '$want'"; exit 1; }
+            done
+            if grep -qF ' req/s ' "$out/log.txt"; then
+              echo "::error::a load step ran although the gate failed"; exit 1
+            fi
+            echo "altered $ep response: the tier failed at the gate, as it must"
           done
-          if grep -qF ' req/s ' "$out/log.txt"; then
-            echo "::error::a load step ran although the gate failed"; exit 1
-          fi
-          echo "altered response: the tier failed at the gate, as it must"
       - name: Report to job summary
         if: always()
         run: |

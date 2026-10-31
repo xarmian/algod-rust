@@ -114,8 +114,15 @@ def settings(env=None):
     p["go_image"] = env.get("BENCH_REST_GO_IMAGE") or "algorand/algod:" + localnet.pinned_tag().lstrip("v")
     p["rust_image"] = env.get("BENCH_REST_RUST_IMAGE") or ""
     p["corrupt"] = env.get("BENCH_REST_CORRUPT") or ""
-    if p["duration_s"] <= 0 or p["warmup_s"] < 0:
-        raise TierError("BENCH_REST_DURATION must be > 0 and BENCH_REST_WARMUP >= 0")
+    if p["duration_s"] < rl.MIN_DURATION_S:
+        raise TierError(f"BENCH_REST_DURATION must be >= {rl.MIN_DURATION_S} s, got "
+                        f"{p['duration_s']}")
+    if p["warmup_s"] != 0 and p["warmup_s"] < rl.MIN_DURATION_S:
+        raise TierError(f"BENCH_REST_WARMUP must be 0 or >= {rl.MIN_DURATION_S} s, got "
+                        f"{p['warmup_s']}")
+    p["max_error_rate"] = num("BENCH_REST_MAX_ERROR_RATE", rl.MAX_ERROR_RATE, float)
+    if not 0 <= p["max_error_rate"] <= 1:
+        raise TierError("BENCH_REST_MAX_ERROR_RATE must be between 0 and 1")
     if not p["cpus"] > 0:
         raise TierError(f"BENCH_REST_CPUS must be > 0, got {p['cpus']}")
     if not 1024 <= p["port_base"] <= 65530:
@@ -251,7 +258,9 @@ def discover(base, cj, genesis_path):
     node, deterministically: hot and cold account among the genesis accounts,
     the newest application that holds a box, and a funded sender."""
     with open(genesis_path, encoding="utf-8") as f:
-        addrs = sorted({a["addr"] for a in json.load(f)["alloc"]})
+        genesis = json.load(f)
+    addrs = sorted({a["addr"] for a in genesis["alloc"]})
+    reserved = {genesis.get("rwd"), genesis.get("fees")} - {None}
     accts = {a: get_json(base, f"/v2/accounts/{a}") for a in addrs}
     hot, cold = rl.pick_hot_cold(accts)
     app_ids = sorted({int(x["id"]) for a in accts.values() for x in a.get("created-apps", [])},
@@ -265,7 +274,10 @@ def discover(base, cj, genesis_path):
     if app_id is None:
         raise TierError("no genesis account created an application that holds a box "
                         f"({len(app_ids)} applications examined); pick a corpus with boxes")
-    sender = sorted(accts, key=lambda a: (-int(accts[a]["amount"]), a))[0]
+    try:
+        sender = rl.pick_sender(accts, reserved)
+    except ValueError as e:
+        raise TierError(str(e)) from None
     return {"hot": hot, "cold": cold, "app_id": app_id, "box_name_b64": box,
             "round": cj["rounds"]["last"], "sender": sender}
 
@@ -291,6 +303,7 @@ class StatsSampler(threading.Thread):
 
     def run(self):
         while not self._stop_evt.is_set():
+            started = time.monotonic()
             p = localnet.docker("stats", "--no-stream", "--format", "{{json .}}", self.name_,
                                 check=False, timeout=30)
             for line in (p.stdout or "").splitlines():
@@ -298,7 +311,10 @@ class StatsSampler(threading.Thread):
                     s = ll.parse_stats_line(line)
                 except (ValueError, KeyError):
                     continue
-                self.samples.append({"t": time.monotonic(), "node": self.name_, **s})
+                # `docker stats --no-stream` describes the interval its own call
+                # spans, so a sample carries the start and the end of the call.
+                self.samples.append({"start": started, "t": time.monotonic(),
+                                     "node": self.name_, **s})
 
     def stop(self):
         self._stop_evt.set()
@@ -313,7 +329,8 @@ def run_load(exe, node, req, conc, cfg, work, tag):
     with open(reqs, "w", encoding="utf-8", newline="\n") as f:
         json.dump(rl.loadgen_requests([req]), f)
     cmd = [exe, "-base", node.base, "-token", TOKEN, "-requests", reqs, "-concurrency",
-           str(conc), "-duration", f"{cfg['duration_s']}s", "-warmup", f"{cfg['warmup_s']}s",
+           str(conc), "-duration", rl.format_duration(cfg["duration_s"]), "-warmup",
+           rl.format_duration(cfg["warmup_s"]),
            "-out", out]
     sampler = StatsSampler(node.name)
     sampler.start()
@@ -328,8 +345,10 @@ def run_load(exe, node, req, conc, cfg, work, tag):
         raise TierError(f"restload exited {p.returncode}: {p.stderr.strip()[-300:]}")
     with open(out, encoding="utf-8") as f:
         res = json.load(f)["endpoints"][0]
-    # The measured part of the window is the last duration_s seconds.
-    summary = ll.resource_summary(sampler.samples, t_end - cfg["duration_s"], t_end)
+    # The measured part is the last duration_s seconds; only samples whose whole
+    # `docker stats` call lies inside it describe it.
+    w0 = t_end - cfg["duration_s"]
+    summary = ll.resource_summary(rl.window_samples(sampler.samples, w0, t_end), w0, t_end)
     return res, summary
 
 
@@ -342,7 +361,12 @@ def check_gate(requests, nodes, cfg, label, corpus):
         if cfg["corrupt"] not in rust:
             raise TierError(f"BENCH_REST_CORRUPT={cfg['corrupt']!r}: not an endpoint "
                             f"({', '.join(sorted(rust))})")
-        rust[cfg["corrupt"]] = rl.corrupt_response(rust[cfg["corrupt"]])
+        req = next(r for r in requests if r["name"] == cfg["corrupt"])
+        try:
+            rust[cfg["corrupt"]] = rl.corrupt_response(
+                req, go[cfg["corrupt"]], rust[cfg["corrupt"]], rl.KNOWN_DIFFERENCES, corpus)
+        except ValueError as e:
+            raise TierError(f"BENCH_REST_CORRUPT: {e}") from None
         log(f"NEGATIVE TEST: the rust response of {cfg['corrupt']} is altered; the gate must fail")
     errors = rl.gate(requests, go, rust, rl.KNOWN_DIFFERENCES, corpus=corpus)
     if errors:
@@ -371,7 +395,8 @@ def run_tier():
             raise TierError("corpus manifest: " + "; ".join(errs))
         cj = corpus_tool.load_corpus_json(corpus)
         corpus_name = cj.get("name") or os.path.basename(corpus)
-        localnet.ensure_images(cfg)
+        localnet.ensure_images(cfg, rust_env="BENCH_REST_RUST_IMAGE",
+                               rust_tag="algod-rust:bench-rest")
         dirs, replays = prepare_ledgers(corpus, cj, work)
         restload = build_restload(work)
         for i, side in enumerate(("go", "rust")):
@@ -389,7 +414,11 @@ def run_tier():
         sim = rl.simulate_request(state["sender"], state["cold"], params)
         requests = rl.request_set(state, simulate=sim)
         log("request set: " + ", ".join(r["name"] for r in requests))
-        check_gate(requests, nodes, cfg, "before load", corpus_name)
+        gate_go = check_gate(requests, nodes, cfg, "before load", corpus_name)
+        problems = rl.check_simulation(gate_go["simulate"])
+        if problems:
+            raise TierError("the simulate request is not a successful simulation: "
+                            + "; ".join(problems))
 
         rows = []
         for conc in cfg["concurrency"]:
@@ -402,6 +431,9 @@ def run_tier():
                         res, summ = run_load(restload, nodes[side], req, conc, cfg, work,
                                              f"{side}-{req['name']}-c{conc}-{i}")
                         one[side][req["name"]] = res
+                        bad = rl.check_error_rate(res, side, req["name"], cfg["max_error_rate"])
+                        if bad:
+                            raise TierError(bad)
                         slot = resources[side].setdefault(req["name"],
                                                           {"cpu_cores": [], "rss_mb": []})
                         if summ:

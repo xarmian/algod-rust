@@ -177,17 +177,20 @@ def check_settings(p):
         raise TierError(f"BENCH_LOCALNET_NUM_ROUNDS must be >= 100, got {p['num_rounds']}")
 
 
-def ensure_images(cfg):
+def ensure_images(cfg, rust_env="BENCH_LOCALNET_RUST_IMAGE", rust_tag="algod-rust:bench-localnet"):
+    """Make the go and rust images available. A tier that reuses this names
+    its own variable (`rust_env`, used in the error text) and its own build
+    tag (`rust_tag`), so tiers do not share or overwrite each other's image."""
     if docker("image", "inspect", cfg["go_image"], check=False).returncode != 0:
         log(f"pulling {cfg['go_image']}")
         docker("pull", cfg["go_image"], timeout=900)
     if not cfg["rust_image"]:
-        cfg["rust_image"] = "algod-rust:bench-localnet"
+        cfg["rust_image"] = rust_tag
         log(f"building {cfg['rust_image']} (docker/Dockerfile, target runtime)")
         docker("build", "-q", "-f", os.path.join(REPO, "docker", "Dockerfile"),
                "--target", "runtime", "-t", cfg["rust_image"], REPO, timeout=3600)
     elif docker("image", "inspect", cfg["rust_image"], check=False).returncode != 0:
-        raise TierError(f"BENCH_LOCALNET_RUST_IMAGE={cfg['rust_image']} is not a local image")
+        raise TierError(f"{rust_env}={cfg['rust_image']} is not a local image")
     for k in ("go_image", "rust_image"):
         cfg[k.replace("image", "image_id")] = docker(
             "image", "inspect", "--format", "{{.Id}}", cfg[k]).stdout.strip()

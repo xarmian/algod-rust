@@ -43,7 +43,8 @@ type request struct {
 
 type endpointResult struct {
 	Name      string  `json:"name"`
-	Requests  int64   `json:"requests"`
+	Requests  int64   `json:"requests"` // attempted
+	OK        int64   `json:"ok"`       // answered 2xx: the only ones in rps and the percentiles
 	Errors    int64   `json:"errors"`
 	Non2xx    int64   `json:"non_2xx"`
 	DurationS float64 `json:"duration_s"`
@@ -82,10 +83,15 @@ func percentile(sorted []time.Duration, p float64) time.Duration {
 
 func ms(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
 
+// summarize reports an endpoint. `lat` holds the latencies of the SUCCESSFUL
+// requests only: a failed request (transport error, non-2xx) is usually fast
+// or slow for reasons unrelated to serving, so it must not enter req/s or the
+// percentiles. Failures are reported separately (errors, non_2xx) and the
+// caller derives the error rate.
 func summarize(name string, lat []time.Duration, errs, non2xx, bytesRead int64, dur time.Duration) endpointResult {
 	sort.Slice(lat, func(i, j int) bool { return lat[i] < lat[j] })
-	r := endpointResult{Name: name, Requests: int64(len(lat)), Errors: errs, Non2xx: non2xx,
-		DurationS: dur.Seconds(), Bytes: bytesRead}
+	r := endpointResult{Name: name, Requests: int64(len(lat)) + errs + non2xx, OK: int64(len(lat)),
+		Errors: errs, Non2xx: non2xx, DurationS: dur.Seconds(), Bytes: bytesRead}
 	if dur > 0 {
 		r.RPS = float64(len(lat)) / dur.Seconds()
 	}
@@ -135,8 +141,8 @@ func do(c *http.Client, base, token string, rq *request) (int, int64, error) {
 }
 
 // load runs rq with `conc` closed-loop workers for `dur` and returns every
-// request's latency. A transport error or a non-2xx answer is counted, and
-// its latency is still recorded.
+// successful request's latency. A transport error or a non-2xx answer is only
+// counted.
 func load(c *http.Client, base, token string, rq *request, conc int, dur time.Duration) (lat []time.Duration, errs, non2xx, nbytes int64, wall time.Duration) {
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -152,13 +158,14 @@ func load(c *http.Client, base, token string, rq *request, conc int, dur time.Du
 				t0 := time.Now()
 				code, n, err := do(c, base, token, rq)
 				d := time.Since(t0)
+				nb.Add(n)
 				if err != nil {
 					e.Add(1)
 				} else if code < 200 || code > 299 {
 					n2.Add(1)
+				} else {
+					local = append(local, d)
 				}
-				nb.Add(n)
-				local = append(local, d)
 			}
 			mu.Lock()
 			lat = append(lat, local...)
