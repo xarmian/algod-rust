@@ -716,8 +716,10 @@ impl TransactionPool {
             }
         }
 
-        // Update fee per byte based on the new state.
-        self.recompute_fee_per_byte(inner);
+        // No fee-per-byte store here: go only stores it in `computeFeePerByte`,
+        // called from `checkSufficientFee` at admission time, so
+        // `FeePerByte()` (REST `fee`) keeps its last admission-computed value
+        // across block commits (#2158).
 
         // Flush remembered (surviving) groups into pending, replacing old state.
         self.remember_commit(inner, true);
@@ -2521,6 +2523,38 @@ mod tests {
         }
 
         assert_eq!(pool.fee_per_byte(), 5);
+    }
+
+    /// #2158: go stores `feePerByte` only inside `computeFeePerByte`, whose
+    /// sole caller is `checkSufficientFee` (`data/pools/transactionPool.go`,
+    /// admission time); `ProcessBlock` adjusts `feeThresholdMultiplier` but
+    /// never the cached value. `FeePerByte()` (REST `fee`) must therefore
+    /// stay at the last admission-computed value across a drained block.
+    #[test]
+    fn fee_per_byte_cache_only_changes_at_admission_not_on_block_commit() {
+        let pool = make_pool_with_evaluator(1000);
+        {
+            let mut inner = pool.mu.lock();
+            inner.fee_threshold_multiplier = 5;
+            inner.num_pending_whole_blocks = 1;
+        }
+        // Admission check computes and caches 5.
+        pool.remember_one(make_test_txn(1)).unwrap();
+        assert_eq!(pool.fee_per_byte(), 5);
+
+        // A block drains the pool (no whole blocks pending): the multiplier
+        // halves to 2 but the cached value is untouched.
+        {
+            let mut inner = pool.mu.lock();
+            inner.num_pending_whole_blocks = 0;
+        }
+        pool.on_new_block(&block_at(2), &HashSet::new());
+        assert_eq!(pool.mu.lock().fee_threshold_multiplier, 2);
+        assert_eq!(pool.fee_per_byte(), 5, "block commit must not store");
+
+        // The next admission check recomputes it.
+        pool.remember_one(make_test_txn(2)).unwrap();
+        assert_eq!(pool.fee_per_byte(), 2);
     }
 
     // ── on_new_block tests ───────────────────────────────────────

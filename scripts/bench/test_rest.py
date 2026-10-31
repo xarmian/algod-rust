@@ -299,6 +299,26 @@ class CorruptTest(unittest.TestCase):
             errs = rl.gate([req], {req["name"]: go}, {req["name"]: bad}, allow)
             self.assertTrue([e for e in errs if not e.startswith("allowlist")], name)
 
+    def test_tx_params_is_gated_without_an_allowlist_entry_and_corrupts(self):
+        # #2158: `fee` is 0 on both nodes (idle pool), tx_params has no
+        # allowlist entry, and BENCH_REST_CORRUPT=tx_params must still alter a
+        # leaf that the gate catches.
+        req = {"name": "tx_params", "method": "GET", "path": "/v2/transactions/params",
+               "kind": "json"}
+        body = {"consensus-version": "v", "fee": 0, "genesis-hash": "AAAA", "genesis-id": "g",
+                "last-round": 10, "min-fee": 1000}
+        go, rust = resp(body), resp(dict(body))
+        self.assertEqual(rl.gate([req], {"tx_params": go}, {"tx_params": rust}, []), [])
+        bad = rl.corrupt_response(req, go, rust, [])
+        self.assertNotEqual(bad["body"], rust["body"])
+        self.assertTrue(rl.gate([req], {"tx_params": go}, {"tx_params": bad}, []))
+        # the old bug (min-fee reported as the per-byte fee) now fails the gate
+        old = resp(dict(body, fee=1000))
+        errs = rl.gate([req], {"tx_params": go}, {"tx_params": old}, [])
+        self.assertEqual(len(errs), 1)
+        self.assertIn("fee", errs[0])
+        self.assertFalse([e for e in rl.KNOWN_DIFFERENCES if e["endpoint"] == "tx_params"])
+
     def test_plain_endpoints_and_byte_bodies_are_corrupted_too(self):
         g = resp({"a": 1, "s": "x"})
         bad = rl.corrupt_response(REQ_ACCT, g, g, [])

@@ -1344,8 +1344,9 @@ response is altered before the comparison, chosen so that it is **not** covered
 by the endpoint's allowlist entries (leaves are tried in a fixed order until one
 makes the gate fail), and the tier must fail. This works for every endpoint,
 allowlisted ones included (`rest_lib.corrupt_response`; unit-tested for each
-endpoint shape, and CI runs it on `blocks_json` and on the allowlisted
-`blocks_msgpack`).
+endpoint shape, including `tx_params`, which has no allowlist entry and whose
+`fee` is 0 on both nodes, so the corruption lands on another leaf; CI runs it
+on `blocks_json` and on the allowlisted `blocks_msgpack`).
 
 #### Volatile fields (excluded from the comparison)
 

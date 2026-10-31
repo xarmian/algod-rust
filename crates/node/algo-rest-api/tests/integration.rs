@@ -325,7 +325,7 @@ impl MockNode {
                 upgrade_approve: false,
                 upgrade_delay: 0,
             })),
-            suggested_fee: 1000,
+            suggested_fee: 0,
             min_txn_fee: 1000,
             build_version: BuildVersion {
                 major: 0,
@@ -1665,12 +1665,41 @@ async fn transaction_params_field_values_match_node() {
         .await
         .unwrap();
 
-    assert_eq!(body["fee"].as_u64().unwrap(), 1000);
+    assert_eq!(
+        body["fee"].as_u64().unwrap(),
+        0,
+        "idle pool: per-byte fee is 0"
+    );
     assert_eq!(body["min-fee"].as_u64().unwrap(), 1000);
     assert_eq!(body["last-round"].as_u64().unwrap(), 1000);
     assert_eq!(body["genesis-id"].as_str().unwrap(), "testnet-v1.0");
     assert!(!body["genesis-hash"].as_str().unwrap().is_empty());
     assert!(!body["consensus-version"].as_str().unwrap().is_empty());
+}
+
+/// #2158: `fee` is the node's suggested (per-byte pool) fee published
+/// verbatim, and `min-fee` is reported separately -- the two must not be
+/// conflated.
+#[tokio::test]
+async fn transaction_params_publishes_fee_verbatim_and_min_fee_separately() {
+    let mut node = MockNode::synced();
+    node.suggested_fee = 7;
+    node.min_txn_fee = 1000;
+    let server = TestServer::start(node).await;
+
+    let body: serde_json::Value = server
+        .client
+        .get(server.url("/v2/transactions/params"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["fee"].as_u64().unwrap(), 7);
+    assert_eq!(body["min-fee"].as_u64().unwrap(), 1000);
 }
 
 #[tokio::test]
