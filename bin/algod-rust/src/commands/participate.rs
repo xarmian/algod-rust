@@ -44,6 +44,7 @@ use algo_ledger::{
     FetchedBlockCert, SqliteLedger,
 };
 use algo_network::local_tx_broadcast::{LocalTxBroadcaster, PoolIngestAdapter};
+use algo_network::ws_network::NodeInfo;
 use algo_network::{
     AgreementNetworkBridge, BlockService, BlockServiceError, CatchpointService,
     CatchpointServiceError, GossipNode, LedgerForBlockService, LedgerForCatchpointService,
@@ -109,6 +110,59 @@ struct RealRandomSource;
 impl RandomSource for RealRandomSource {
     fn uint64(&self) -> u64 {
         rand::rng().random()
+    }
+}
+
+/// [`NodeInfo`] backed by this node's participation-key registry: go's
+/// `AlgorandFullNode.IsParticipating` (`node/node.go`), i.e.
+/// `accountManager.HasLiveKeys(latest+1, latest+1+10)`.
+///
+/// The WS and P2P transports consult it from their `wantTXGossip` refresh
+/// (go `postMessagesOfInterestThread`): a participating non-relay node
+/// subscribes to `TX` gossip, any other non-relay node unsubscribes. Without
+/// a registered oracle every non-relay node counts as "not participating",
+/// so a participation node told its relay it wants no transactions, and a
+/// transaction accepted by another node's REST endpoint never reached its
+/// pool (issue #2150: a fixed 200-txn set took ~18 rounds instead of ~1).
+struct ParticipationNodeInfo {
+    ledger: Arc<Mutex<SqliteLedger>>,
+    store: Mutex<ParticipationStore>,
+}
+
+impl ParticipationNodeInfo {
+    fn new(ledger: Arc<Mutex<SqliteLedger>>, store: ParticipationStore) -> Self {
+        Self {
+            ledger,
+            store: Mutex::new(store),
+        }
+    }
+}
+
+impl NodeInfo for ParticipationNodeInfo {
+    fn is_participating(&self) -> bool {
+        let Ok(ledger) = self.ledger.lock() else {
+            return false;
+        };
+        let round = ledger.current_round().0 + 1;
+        drop(ledger);
+        let Ok(store) = self.store.lock() else {
+            return false;
+        };
+        store
+            .has_live_keys(Round(round), Round(round + 10))
+            .unwrap_or(false)
+    }
+}
+
+/// Register the participation oracle on every gossip transport the node runs.
+fn wire_participation_node_info(
+    info: Arc<dyn NodeInfo>,
+    ws: &WebsocketNetwork,
+    p2p: Option<&P2pTransport>,
+) {
+    ws.set_node_info(info.clone());
+    if let Some(p2p) = p2p {
+        p2p.set_node_info(info);
     }
 }
 
@@ -6486,6 +6540,23 @@ pub async fn run(
         None
     };
 
+    // Issue #2150: tell the transports whether this node participates, so a
+    // participation node subscribes to `TX` gossip (go `IsParticipating`).
+    {
+        let node_info_store = ParticipationStore::open(partkey_path).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to open participation key store at {}: {}",
+                partkey_path.display(),
+                e
+            )
+        })?;
+        wire_participation_node_info(
+            Arc::new(ParticipationNodeInfo::new(ledger.clone(), node_info_store)),
+            &gossip_node,
+            p2p_transport.as_deref(),
+        );
+    }
+
     // The `GossipNode` traffic-routing traffic (outbound local tx,
     // agreement proposals/votes/bundles) should flow over: WS-gossip only
     // (`WsOnly`), the P2P transport only (`P2pOnly`), or both
@@ -8352,6 +8423,49 @@ mod tests {
              across a catchpoint-induced history gap instead of getting stuck \
              re-requesting unreadable intermediate rounds forever"
         );
+    }
+
+    // ── participation NodeInfo / wantTXGossip (issue #2150) ─────────
+
+    /// A participation node (live key in its registry) must subscribe to `TX`
+    /// gossip once the agreement service reports progress, like go's
+    /// `postMessagesOfInterestThread`; a key-less non-relay node must not.
+    #[tokio::test]
+    async fn participation_node_info_drives_want_tx_gossip() {
+        use algo_ledger::participation::Participation;
+        use algo_network::ws_network::{WANT_TX_GOSSIP_NO, WANT_TX_GOSSIP_YES};
+
+        async fn want_after_advance(has_key: bool) -> u8 {
+            let store = ParticipationStore::open_in_memory().expect("in-memory part store");
+            if has_key {
+                let part =
+                    Participation::generate(Address([7u8; 32]), Round(0), Round(1000), 10_000, 0)
+                        .expect("generate participation");
+                store.insert(&part).expect("insert participation");
+            }
+            let net = Arc::new(WebsocketNetwork::new(
+                WebsocketNetworkConfig::default(),
+                Arc::new(Phonebook::new(0, Duration::from_secs(60))),
+            ));
+            let info = Arc::new(ParticipationNodeInfo::new(test_ledger(), store));
+            wire_participation_node_info(info, &net, None);
+            net.start_arc().await.expect("start");
+            net.on_network_advance();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut want = net.want_tx_gossip();
+            while Instant::now() < deadline {
+                want = net.want_tx_gossip();
+                if want == WANT_TX_GOSSIP_YES || want == WANT_TX_GOSSIP_NO {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            net.stop().await;
+            want
+        }
+
+        assert_eq!(want_after_advance(true).await, WANT_TX_GOSSIP_YES);
+        assert_eq!(want_after_advance(false).await, WANT_TX_GOSSIP_NO);
     }
 
     // ── load_signing_keys_for_round ─────────────────────────────────

@@ -1249,6 +1249,13 @@ fixed step are kept as `logs/localnet/<impl>-run<N>-fixed-txids.txt`.
   over many more rounds than the Go cluster, that is a result about algod-rust
   (for example transaction gossip between nodes), not a harness artefact: the
   generator submitted the same bytes to the same five endpoints.
+  Example (issue #2150): a smoke run committed the 200 fixed transactions in
+  17-19 rounds on Rust against 2 on Go, because participation nodes never told
+  their relay they wanted `TX` gossip (go's `IsParticipating` oracle was not
+  wired), so each proposer only held the transactions submitted to its own
+  endpoint. After the fix: 3 rounds against 2.
+- `BENCH_LOCALNET_SAVE_LOGS=1` keeps every node's container log under
+  `logs/localnet/` even when the run passes (by default only a failed run does).
 
 ### CI
 

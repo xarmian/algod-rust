@@ -598,11 +598,9 @@ pub enum Commands {
         /// (though such a node has no way to accept inbound peers
         /// to forward to).
         ///
-        /// Note: peer-originated transactions received on the
-        /// `Transaction` tag are NOT re-relayed today — the handler
-        /// drops them after ingesting into the local pool. Relay
-        /// forwarding of third-party TX gossip is a separate
-        /// follow-up.
+        /// Peer-originated transactions received on the `Transaction` tag
+        /// are re-relayed to the node's other peers (sender excluded) once
+        /// the pool accepts them, like go's `TxHandler.net.Relay`.
         ///
         /// Required when another participate node needs to connect
         /// to this one over gossip (e.g. in the two-binary
