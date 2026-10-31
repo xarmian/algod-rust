@@ -22,6 +22,13 @@ Exit status: 0 when every result validated, every pair is consistent and
 every tier exited 0; 1 otherwise (the report files are written either way).
 
 Usage: python3 scripts/bench/report.py <run-dir>
+
+Publishing (issue #2109): `report.py <run-dir> --publish --doc docs/BENCHMARK_RESULTS.md
+--section NAME --command "<the make command>" [--baseline benchmarks/baseline.json]`
+replaces the block between `<!-- bench-baseline:begin NAME -->` and
+`<!-- bench-baseline:end NAME -->` in the doc with the run's environment,
+builds and results, and records the section's rows in the baseline file that
+baseline.py compares later runs against. A report with errors is refused.
 """
 import argparse
 import datetime
@@ -29,10 +36,12 @@ import glob
 import json
 import math
 import os
+import re
 import statistics
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import baseline  # noqa: E402
 import bench_schema  # noqa: E402
 
 METHODOLOGY_URL = "https://github.com/xarmian/algod-rust/blob/main/docs/BENCHMARK_COMPARISON.md"
@@ -409,6 +418,67 @@ def fmt_bool(v):
 
 
 # --------------------------------------------------------------------------
+# publishing (issue #2109)
+
+
+def _block_re(section):
+    return re.compile(r"(<!-- bench-baseline:begin %s -->\n).*?(<!-- bench-baseline:end %s -->)"
+                      % (re.escape(section), re.escape(section)), re.S)
+
+
+def publish_block(doc_text, section, rep, command):
+    """Return doc_text with the `section` block replaced by a rendering of `rep`.
+
+    The report's own title is dropped and its headings are demoted by two
+    levels so the block nests under the doc's own heading. A report that is
+    not ok is refused: a baseline must not be published from a run whose
+    equality gate or tiers failed.
+    """
+    if not rep.get("ok"):
+        raise ValueError("refusing to publish a report with errors: "
+                         + "; ".join(rep.get("errors") or ["not ok"]))
+    rx = _block_re(section)
+    if not rx.search(doc_text):
+        raise ValueError(f"no `bench-baseline:begin {section}` / `end` markers in the doc")
+    body = []
+    for line in render_markdown(rep).splitlines():
+        if line.startswith("# "):
+            continue
+        if line.startswith("## ") or line.startswith("### "):
+            line = "##" + line
+        body.append(line)
+    text = "\n".join(body).strip("\n")
+    block = f"Command: `{command}`\n\n{text}\n"
+    return rx.sub(lambda m: m.group(1) + block + m.group(2), doc_text, count=1)
+
+
+def publish_main(argv):
+    ap = argparse.ArgumentParser(description="publish a run into docs/BENCHMARK_RESULTS.md")
+    ap.add_argument("run_dir")
+    ap.add_argument("--doc", required=True)
+    ap.add_argument("--section", required=True)
+    ap.add_argument("--command", required=True)
+    ap.add_argument("--baseline", default=baseline.DEFAULT_BASELINE)
+    ap.add_argument("--date", default=None, help="baseline date (default: today, UTC)")
+    args = ap.parse_args(argv)
+    with open(os.path.join(args.run_dir, "report.json"), encoding="utf-8") as f:
+        rep = json.load(f)
+    with open(args.doc, encoding="utf-8", newline="") as f:
+        text = f.read()
+    try:
+        new = publish_block(text, args.section, rep, args.command)
+    except ValueError as e:
+        print(f"publish: {e}", file=sys.stderr)
+        return 1
+    date = args.date or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    with open(args.doc, "w", encoding="utf-8", newline="\n") as f:
+        f.write(new)
+    baseline.update_baseline_file(args.baseline, args.section, rep, date)
+    print(f"published section {args.section!r} to {args.doc} and {args.baseline}")
+    return 0
+
+
+# --------------------------------------------------------------------------
 # CLI
 
 
@@ -447,6 +517,10 @@ def load_run_results(run_dir):
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "--publish" in argv:
+        argv.remove("--publish")
+        return publish_main(argv)
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("run_dir")
     args = ap.parse_args(argv)
