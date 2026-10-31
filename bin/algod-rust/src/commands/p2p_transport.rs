@@ -3116,12 +3116,9 @@ impl P2pTransport {
     /// Not calling this leaves this transport behaving like go's
     /// `nopeNodeInfo` fallback (never participating).
     ///
-    /// No production call site wires a concrete [`NodeInfo`] in yet — the
-    /// same pre-existing gap `ws_network.rs`'s own `set_node_info` has (see
-    /// this module's `on_network_advance` doc comment); exercised by this
-    /// module's own tests in the meantime, mirroring `http_stream_control`'s
-    /// doc comment for the same situation.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// `participate` registers its participation-key oracle here (issue
+    /// #2150); call [`Self::refresh_want_tx_gossip`] afterwards to apply it
+    /// without waiting for the first `on_network_advance`.
     pub fn set_node_info(&self, node_info: Arc<dyn NodeInfo>) {
         *self.node_info.lock().expect("node_info lock poisoned") = Some(node_info);
     }
@@ -3135,6 +3132,26 @@ impl P2pTransport {
             .expect("node_info lock poisoned")
             .as_ref()
             .is_some_and(|info| info.is_participating())
+    }
+
+    /// Re-evaluates `wantTXGossip` from the registered [`NodeInfo`] and
+    /// (un)subscribes the `TX` topic on a change. The role-transition half
+    /// of [`GossipNode::on_network_advance`], also callable on its own.
+    pub fn refresh_want_tx_gossip(&self) {
+        if self.relay_messages || self.force_fetch_transactions {
+            return;
+        }
+        let participating = self.is_participating();
+        let current = self.want_tx_gossip.load(AtomicOrdering::SeqCst);
+        if participating && current != WANT_TX_GOSSIP_YES {
+            self.want_tx_gossip
+                .store(WANT_TX_GOSSIP_YES, AtomicOrdering::SeqCst);
+            let _ = self.cmd_tx.send(P2pCommand::SetTxGossip(true));
+        } else if !participating && current != WANT_TX_GOSSIP_NO {
+            self.want_tx_gossip
+                .store(WANT_TX_GOSSIP_NO, AtomicOrdering::SeqCst);
+            let _ = self.cmd_tx.send(P2pCommand::SetTxGossip(false));
+        }
     }
 
     /// Current `wantTXGossip` state — one of [`WANT_TX_GOSSIP_UNK`]/
@@ -3446,20 +3463,7 @@ impl GossipNode for P2pTransport {
         // pinned `want_tx_gossip` to YES at start and never re-evaluates it
         // (mirrors `ws_network.rs`'s identical short-circuit in its own
         // `on_network_advance`).
-        if self.relay_messages || self.force_fetch_transactions {
-            return;
-        }
-        let participating = self.is_participating();
-        let current = self.want_tx_gossip.load(AtomicOrdering::SeqCst);
-        if participating && current != WANT_TX_GOSSIP_YES {
-            self.want_tx_gossip
-                .store(WANT_TX_GOSSIP_YES, AtomicOrdering::SeqCst);
-            let _ = self.cmd_tx.send(P2pCommand::SetTxGossip(true));
-        } else if !participating && current != WANT_TX_GOSSIP_NO {
-            self.want_tx_gossip
-                .store(WANT_TX_GOSSIP_NO, AtomicOrdering::SeqCst);
-            let _ = self.cmd_tx.send(P2pCommand::SetTxGossip(false));
-        }
+        self.refresh_want_tx_gossip();
     }
 
     fn get_genesis_id(&self) -> &str {
@@ -3997,6 +4001,49 @@ mod tests {
 
         assert_eq!(transport.want_tx_gossip(), WANT_TX_GOSSIP_YES);
         assert!(transport.is_gossipsub_subscribed(Tag::Transaction).await);
+    }
+
+    /// Issue #2150: `participate`'s wiring registers the participation oracle
+    /// on the P2P transport and applies it at once -- the TX topic is
+    /// subscribed without waiting for the first `on_network_advance`.
+    #[tokio::test]
+    async fn install_participation_node_info_subscribes_p2p_tx_topic_at_once() {
+        use crate::commands::participate::{install_participation_node_info, LiveKeySource};
+
+        struct Keys(bool);
+        impl LiveKeySource for Keys {
+            fn has_live_keys(&self, _from: u64, _to: u64) -> Result<bool, String> {
+                Ok(self.0)
+            }
+        }
+
+        for (live, want) in [(true, WANT_TX_GOSSIP_YES), (false, WANT_TX_GOSSIP_NO)] {
+            let transport = P2pTransport::start(plain_non_relay_config("test-2150"))
+                .await
+                .expect("start transport");
+            let ws = algo_network::WebsocketNetwork::new(
+                algo_network::WebsocketNetworkConfig::default(),
+                Arc::new(algo_network::Phonebook::new(
+                    0,
+                    std::time::Duration::from_secs(60),
+                )),
+            );
+            assert_eq!(transport.want_tx_gossip(), WANT_TX_GOSSIP_UNK);
+            let _info =
+                install_participation_node_info(Arc::new(Keys(live)), 0, &ws, Some(&transport));
+            assert_eq!(transport.want_tx_gossip(), want);
+            if live {
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !transport.is_gossipsub_subscribed(Tag::Transaction).await
+                    && tokio::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                assert!(transport.is_gossipsub_subscribed(Tag::Transaction).await);
+            } else {
+                assert!(!transport.is_gossipsub_subscribed(Tag::Transaction).await);
+            }
+        }
     }
 
     /// TDD anchor for issue #1221: `on_network_advance` must subscribe the

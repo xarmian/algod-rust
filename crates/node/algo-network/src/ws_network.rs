@@ -974,6 +974,26 @@ impl WebsocketNetwork {
         }
     }
 
+    /// Wakes the `wantTXGossip` refresh loop without reporting a network
+    /// advance, for a node that might narrow/widen its TX-gossip
+    /// subscription. A relay or force-fetch node pinned `wantTXGossip` to
+    /// "yes" at startup and never re-evaluates it (go's exact gate in
+    /// `OnNetworkAdvance`, `!wn.relayMessages && !wn.config.ForceFetchTransactions`).
+    /// A no-op before [`GossipNode::start_arc`] has spawned the loop.
+    ///
+    /// Call it right after [`Self::set_node_info`] so a node that already
+    /// holds live participation keys subscribes at once instead of waiting
+    /// for the first `on_network_advance` (issue #2150).
+    pub fn request_want_tx_gossip_refresh(&self) {
+        if !self.effective_relay_messages() && !self.config.force_fetch_transactions {
+            if let Ok(guard) = self.messages_of_interest_refresh_tx.try_lock() {
+                if let Some(tx) = guard.as_ref() {
+                    let _ = tx.try_send(());
+                }
+            }
+        }
+    }
+
     /// Returns a reference to the connection tracker.
     pub fn connection_tracker(&self) -> &Arc<ConnectionTracker> {
         &self.connection_tracker
@@ -2306,13 +2326,7 @@ impl GossipNode for WebsocketNetwork {
         // (`network/wsNetwork.go`'s `OnNetworkAdvance`): a relay or a
         // force-fetch node already pinned `wantTXGossip` to "yes" at
         // startup and never re-evaluates it.
-        if !self.effective_relay_messages() && !self.config.force_fetch_transactions {
-            if let Ok(guard) = self.messages_of_interest_refresh_tx.try_lock() {
-                if let Some(tx) = guard.as_ref() {
-                    let _ = tx.try_send(());
-                }
-            }
-        }
+        self.request_want_tx_gossip_refresh();
     }
 
     fn get_genesis_id(&self) -> &str {

@@ -599,8 +599,13 @@ pub enum Commands {
         /// to forward to).
         ///
         /// Peer-originated transactions received on the `Transaction` tag
-        /// are re-relayed to the node's other peers (sender excluded) once
-        /// the pool accepts them, like go's `TxHandler.net.Relay`.
+        /// are re-relayed once the pool accepts them, like go's
+        /// `TxHandler.net.Relay`, but only by a node that is an effective
+        /// relay (this flag or `ForceRelayMessages`, or a listen address);
+        /// a non-relay node ingests them without forwarding. Over WS-gossip
+        /// the original sender is excluded; over the P2P transport
+        /// gossipsub cannot exclude a peer, so the relay behaves like a
+        /// broadcast.
         ///
         /// Required when another participate node needs to connect
         /// to this one over gossip (e.g. in the two-binary

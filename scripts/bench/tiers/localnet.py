@@ -543,7 +543,10 @@ def run_cluster(impl, cfg, work, shared, genesis_id, partkeys, addrs, raw_dir, r
         return {"side": side, "steps": steps, "loadgen_cmd": rep["_cmd"]}
     finally:
         if failed or os.environ.get("BENCH_LOCALNET_SAVE_LOGS") == "1":
-            cl.save_logs(raw_dir)
+            try:
+                cl.save_logs(raw_dir)
+            except Exception as e:  # noqa: BLE001 - logs are best effort, teardown must run
+                log(f"{impl}: could not save node logs: {e}")
         cl.down()
         purge(cl.dir, cfg["go_image"])
 
