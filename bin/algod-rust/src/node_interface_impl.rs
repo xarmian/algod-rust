@@ -1005,26 +1005,6 @@ impl AlgodNodeInterface {
         })
     }
 
-    /// Snapshot of an account lookup captured under a single lock — keeps
-    /// `last_round` and `account_data` on the same round even if agreement
-    /// commits while the handler is running.
-    fn read_account_snapshot(&self, addr: &Address) -> Result<(u64, AccountData), NodeError> {
-        // Issue #1764: one statement against the committed tracker snapshot,
-        // no ledger mutex. Any read-pool error takes the locked path.
-        if let Some(pool) = self.read_pool() {
-            if let Ok((last_round, account)) = pool.account_snapshot(addr) {
-                return Ok((last_round, account.unwrap_or_default()));
-            }
-        }
-        let ledger = self.lock_ledger("lookup_account")?;
-        let last_round = ledger
-            .last_committed_round()
-            .map_err(|e| NodeError::Internal(format!("last_committed_round: {e}")))?
-            .unwrap_or(0);
-        let account_data = ledger.get_account(addr).unwrap_or_default();
-        Ok((last_round, account_data))
-    }
-
     /// Return the last committed round for a lookup performed under an already
     /// held ledger lock, mapping the SQLite error into a `NodeError::Internal`
     /// tagged with the calling method. Returns `0` for an empty ledger
@@ -1149,30 +1129,57 @@ fn app_resource_parts<R: algo_ledger::ResourceReads + ?Sized>(
     (app_local_state, app_params)
 }
 
+/// An account row with the resource maps go's `AccountDataToAccount` lists.
+#[derive(Default)]
+struct AccountResourceParts {
+    account_data: AccountData,
+    assets: std::collections::BTreeMap<u64, AssetHolding>,
+    created_assets: std::collections::BTreeMap<u64, AssetParams>,
+    app_local_states: std::collections::BTreeMap<u64, AppLocalState>,
+    created_apps: std::collections::BTreeMap<u64, AppParams>,
+}
+
 /// The account row plus its resource maps (held assets, created asset params,
 /// app local states, created app params) read through [`ResourceReads`], so
 /// the read-pool snapshot and the locked ledger answer identically (#2155).
-#[allow(clippy::type_complexity)]
+///
+/// The lists are built from the resource ROWS (go's `AccountDataToAccount`
+/// ranges over the record's maps); the `total-*` counters stay the account
+/// row's. Like go's `AccountInformation`, the limit is checked against the
+/// account row's totals BEFORE any resource is loaded: an account over a
+/// non-zero `max_resources` (or one with no account row at all) is returned
+/// without scanning, and the REST handler turns the totals into the 400.
 fn account_resource_parts<R: algo_ledger::ResourceReads + ?Sized>(
     r: &R,
     addr: &Address,
-) -> (
-    AccountData,
-    std::collections::BTreeMap<u64, AssetHolding>,
-    std::collections::BTreeMap<u64, AssetParams>,
-    std::collections::BTreeMap<u64, AppLocalState>,
-    std::collections::BTreeMap<u64, AppParams>,
-) {
-    (
-        r.get_account(addr).unwrap_or_default(),
-        r.asset_holdings_for_addr(addr).into_iter().collect(),
-        r.created_assets_for_addr(addr)
+    max_resources: u64,
+) -> AccountResourceParts {
+    let Some(account_data) = r.get_account(addr) else {
+        // No `accountbase` row: resource rows hang off it, so there are none.
+        return AccountResourceParts::default();
+    };
+    let totals = account_data
+        .total_assets_opted_in
+        .saturating_add(account_data.total_created_assets)
+        .saturating_add(account_data.total_apps_opted_in)
+        .saturating_add(account_data.total_created_apps);
+    if max_resources != 0 && totals > max_resources {
+        return AccountResourceParts {
+            account_data,
+            ..Default::default()
+        };
+    }
+    AccountResourceParts {
+        assets: r.asset_holdings_for_addr(addr).into_iter().collect(),
+        created_assets: r
+            .created_assets_for_addr(addr)
             .into_iter()
             .map(|(id, rec)| (id, rec.params))
             .collect(),
-        r.app_local_states_for_addr(addr).into_iter().collect(),
-        r.created_apps_for_addr(addr).into_iter().collect(),
-    )
+        app_local_states: r.app_local_states_for_addr(addr).into_iter().collect(),
+        created_apps: r.created_apps_for_addr(addr).into_iter().collect(),
+        account_data,
+    }
 }
 
 /// Mirrors handlers.go:1138 AccountAssetsInformation / ledger.LookupAssets:
@@ -1748,30 +1755,48 @@ impl NodeInterface for AlgodNodeInterface {
         // resource accessors, as go's `AccountDataToAccount` lists them. One
         // read-pool snapshot (#1764/#1893) with the committed round, else the
         // locked ledger -- the same composition on the same SQL either way.
-        let (last_round, parts) = match self.pooled_resources(|r| account_resource_parts(r, addr)) {
-            Some(v) => v,
-            None => {
-                let ledger = self.lock_ledger("lookup_account")?;
-                let last_round = Self::committed_round(&ledger, "lookup_account")?;
-                (last_round, account_resource_parts(&*ledger, addr))
-            }
-        };
-        let (account_data, assets, created_assets, app_local_states, created_apps) = parts;
+        //
+        // The locked fallback is reached for an in-memory ledger (no pool: tests
+        // and tools, never a node serving a file-backed ledger) or after a pool
+        // SQL error. It reads under the ledger mutex because the resource
+        // accessors need the ledger itself; the scans are bounded by
+        // `max_resources` (an over-limit account is not scanned at all).
+        let max = self.max_api_resources_per_account_cfg;
+        let (last_round, parts) =
+            match self.pooled_resources(|r| account_resource_parts(r, addr, max)) {
+                Some(v) => v,
+                None => {
+                    let ledger = self.lock_ledger("lookup_account")?;
+                    let last_round = Self::committed_round(&ledger, "lookup_account")?;
+                    (last_round, account_resource_parts(&*ledger, addr, max))
+                }
+            };
         Ok(AccountLookup {
-            amount_without_pending_rewards: account_data.micro_algos,
-            assets,
-            created_assets,
-            app_local_states,
-            created_apps,
-            account_data,
+            amount_without_pending_rewards: parts.account_data.micro_algos,
+            assets: parts.assets,
+            created_assets: parts.created_assets,
+            app_local_states: parts.app_local_states,
+            created_apps: parts.created_apps,
+            account_data: parts.account_data,
             last_round,
         })
     }
 
     async fn lookup_account_basic(&self, addr: &Address) -> Result<AccountLookup, NodeError> {
         // "Basic" mode (`exclude=all` on the REST endpoint) skips the
-        // potentially-large resource maps — return empty BTreeMaps.
-        let (last_round, account_data) = self.read_account_snapshot(addr)?;
+        // potentially-large resource maps — return empty BTreeMaps. The round
+        // comes from the same source as `lookup_account`'s (the pool snapshot's
+        // `acctrounds`, else the locked committed round).
+        let (last_round, account_data) = match self.pooled_resources(|r| {
+            algo_ledger::ResourceReads::get_account(r, addr).unwrap_or_default()
+        }) {
+            Some(v) => v,
+            None => {
+                let ledger = self.lock_ledger("lookup_account_basic")?;
+                let last_round = Self::committed_round(&ledger, "lookup_account_basic")?;
+                (last_round, ledger.get_account(addr).unwrap_or_default())
+            }
+        };
         Ok(AccountLookup {
             amount_without_pending_rewards: account_data.micro_algos,
             assets: Default::default(),
@@ -8550,7 +8575,7 @@ mod tests {
             who,
             AccountData {
                 micro_algos: 777,
-                total_assets_opted_in: 1,
+                total_assets_opted_in: 2,
                 total_created_assets: 1,
                 total_apps_opted_in: 1,
                 total_created_apps: 1,
@@ -8602,6 +8627,35 @@ mod tests {
         );
     }
 
+    /// A file-backed ledger (so the adapter has a read pool) whose committed
+    /// round 3 holds `seed_account_resources` for the returned address.
+    fn file_backed_ledger_with_seeded_account(
+    ) -> (tempfile::TempDir, Arc<Mutex<SqliteLedger>>, Address) {
+        use algo_codec::{canonical_encode_block_header_from_block, encode_block};
+        let (dir, ledger, who) = file_backed_ledger_with_blocks();
+        {
+            let mut l = ledger.lock().unwrap();
+            let block = Block {
+                round: Round(3),
+                current_protocol: CONSENSUS_V41.to_string(),
+                ..Block::default()
+            };
+            l.begin_block().unwrap();
+            l.set_current_round(Round(3));
+            l.put_block(
+                3,
+                CONSENSUS_V41,
+                &canonical_encode_block_header_from_block(&block),
+                &encode_block(&block).unwrap(),
+            )
+            .unwrap();
+            l.put_block_cert(3, &[0x80]).unwrap();
+            seed_account_resources(&mut l, &who);
+            l.commit_block().unwrap();
+        }
+        (dir, ledger, who)
+    }
+
     fn assert_account_lookup_has_resources(lookup: &AccountLookup) {
         assert_eq!(lookup.account_data.micro_algos, 777);
         assert_eq!(
@@ -8632,33 +8686,12 @@ mod tests {
     /// states, as go's `AccountDataToAccount` does.
     #[tokio::test]
     async fn lookup_account_lists_resources_on_the_read_pool_path() {
-        let (_dir, ledger, who) = file_backed_ledger_with_blocks();
-        let adapter = make_adapter_with_ledger(ledger.clone());
+        let (_dir, ledger, who) = file_backed_ledger_with_seeded_account();
+        let adapter = make_adapter_with_ledger(ledger);
         assert!(
             adapter.read_pool().is_some(),
             "file-backed ledger has a pool"
         );
-        {
-            use algo_codec::{canonical_encode_block_header_from_block, encode_block};
-            let mut l = ledger.lock().unwrap();
-            let block = Block {
-                round: Round(3),
-                current_protocol: CONSENSUS_V41.to_string(),
-                ..Block::default()
-            };
-            l.begin_block().unwrap();
-            l.set_current_round(Round(3));
-            l.put_block(
-                3,
-                CONSENSUS_V41,
-                &canonical_encode_block_header_from_block(&block),
-                &encode_block(&block).unwrap(),
-            )
-            .unwrap();
-            l.put_block_cert(3, &[0x80]).unwrap();
-            seed_account_resources(&mut l, &who);
-            l.commit_block().unwrap();
-        }
         let lookup = adapter.lookup_account(&who).await.unwrap();
         assert_eq!(lookup.last_round, 3);
         assert_account_lookup_has_resources(&lookup);
@@ -8676,5 +8709,188 @@ mod tests {
         let who = Address([0x33; 32]);
         seed_account_resources(&mut ledger.lock().unwrap(), &who);
         assert_account_lookup_has_resources(&adapter.lookup_account(&who).await.unwrap());
+    }
+
+    /// The pool path never takes the ledger mutex, also for the resource
+    /// scans: it answers while another thread holds it.
+    #[tokio::test]
+    async fn lookup_account_resource_scans_do_not_wait_for_a_held_ledger_mutex() {
+        let (_dir, ledger, who) = file_backed_ledger_with_seeded_account();
+        let adapter = make_adapter_with_ledger(ledger.clone());
+        let elapsed = timed_while_ledger_locked(&ledger, async {
+            let lookup = adapter.lookup_account(&who).await.unwrap();
+            assert_account_lookup_has_resources(&lookup);
+            let basic = adapter.lookup_account_basic(&who).await.unwrap();
+            assert_eq!(basic.last_round, lookup.last_round);
+        })
+        .await;
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "account lookup waited behind the held ledger mutex: {elapsed:?}"
+        );
+    }
+
+    /// The round of the full, the `exclude=all` and the locked lookup agree
+    /// for the same state (all come from the committed round).
+    #[tokio::test]
+    async fn lookup_account_rounds_agree_across_full_basic_and_locked_paths() {
+        let (_dir, ledger, who) = file_backed_ledger_with_seeded_account();
+        let adapter = make_adapter_with_ledger(ledger.clone());
+        let full = adapter.lookup_account(&who).await.unwrap();
+        let basic = adapter.lookup_account_basic(&who).await.unwrap();
+        let (locked_round, locked) = {
+            let l = ledger.lock().unwrap();
+            (
+                l.last_committed_round().unwrap().unwrap(),
+                account_resource_parts(&*l, &who, 0),
+            )
+        };
+        assert_eq!(full.last_round, 3);
+        assert_eq!(basic.last_round, full.last_round);
+        assert_eq!(locked_round, full.last_round);
+        assert_eq!(basic.account_data, full.account_data);
+        assert_eq!(locked.account_data, full.account_data);
+        assert_eq!(locked.assets, full.assets);
+        assert_eq!(locked.created_assets, full.created_assets);
+        assert_eq!(locked.app_local_states, full.app_local_states);
+        assert_eq!(locked.created_apps, full.created_apps);
+    }
+
+    /// A `ResourceReads` stub that counts the resource scans.
+    struct ScanCounter {
+        account: Option<AccountData>,
+        scans: std::cell::Cell<u32>,
+    }
+
+    impl ScanCounter {
+        fn new(account: Option<AccountData>) -> Self {
+            Self {
+                account,
+                scans: std::cell::Cell::new(0),
+            }
+        }
+        fn scan<T>(&self, v: Vec<T>) -> Vec<T> {
+            self.scans.set(self.scans.get() + 1);
+            v
+        }
+    }
+
+    impl algo_ledger::ResourceReads for ScanCounter {
+        fn get_account(&self, _: &Address) -> Option<AccountData> {
+            self.account.clone()
+        }
+        fn get_asset_holding(&self, _: &Address, _: u64) -> Option<AssetHolding> {
+            None
+        }
+        fn get_asset_params(&self, _: u64) -> Option<AssetParamsRecord> {
+            None
+        }
+        fn get_app_params(&self, _: u64) -> Option<AppParams> {
+            None
+        }
+        fn get_app_local_state(&self, _: &Address, _: u64) -> Option<AppLocalState> {
+            None
+        }
+        fn app_local_states_for_addr(&self, _: &Address) -> Vec<(u64, AppLocalState)> {
+            self.scan(vec![])
+        }
+        fn asset_holdings_for_addr(&self, _: &Address) -> Vec<(u64, AssetHolding)> {
+            self.scan(vec![(
+                1,
+                AssetHolding {
+                    amount: 1,
+                    frozen: false,
+                },
+            )])
+        }
+        fn created_assets_for_addr(&self, _: &Address) -> Vec<(u64, AssetParamsRecord)> {
+            self.scan(vec![])
+        }
+        fn created_apps_for_addr(&self, _: &Address) -> Vec<(u64, AppParams)> {
+            self.scan(vec![])
+        }
+        fn get_box(&self, _: u64, _: &[u8]) -> Option<Vec<u8>> {
+            None
+        }
+        fn box_keys_for_app(&self, _: u64) -> Vec<Vec<u8>> {
+            vec![]
+        }
+        fn box_keys_by_prefix_paginated(
+            &self,
+            _: u64,
+            _: &[u8],
+            _: Option<&[u8]>,
+            _: Option<u64>,
+            _: bool,
+        ) -> (Vec<(Vec<u8>, Option<Vec<u8>>)>, bool) {
+            (vec![], false)
+        }
+    }
+
+    fn account_with_totals(
+        assets: u64,
+        created_assets: u64,
+        apps: u64,
+        created: u64,
+    ) -> AccountData {
+        AccountData {
+            micro_algos: 5,
+            total_assets_opted_in: assets,
+            total_created_assets: created_assets,
+            total_apps_opted_in: apps,
+            total_created_apps: created,
+            ..Default::default()
+        }
+    }
+
+    /// go's AccountInformation checks the account record's totals against
+    /// MaxAPIResourcesPerAccount BEFORE loading any resource: an over-limit
+    /// account is not scanned (the REST handler turns the totals into the 400).
+    #[test]
+    fn account_over_the_resource_limit_is_rejected_without_scanning() {
+        let r = ScanCounter::new(Some(account_with_totals(3, 2, 2, 1)));
+        let parts = account_resource_parts(&r, &Address([1; 32]), 7);
+        assert_eq!(
+            r.scans.get(),
+            0,
+            "no resource scan for an over-limit account"
+        );
+        assert!(parts.assets.is_empty());
+        assert_eq!(parts.account_data.total_assets_opted_in, 3);
+        assert_eq!(parts.account_data.total_created_apps, 1);
+    }
+
+    /// At the limit (totals == limit) and with no limit (0) the scans run.
+    #[test]
+    fn account_at_the_resource_limit_or_unlimited_is_scanned() {
+        for limit in [8u64, 0] {
+            let r = ScanCounter::new(Some(account_with_totals(3, 2, 2, 1)));
+            let parts = account_resource_parts(&r, &Address([1; 32]), limit);
+            assert_eq!(r.scans.get(), 4, "limit {limit}");
+            assert_eq!(parts.assets.len(), 1);
+        }
+    }
+
+    /// Resource rows hang off the `accountbase` row: an address without one is
+    /// an empty account (go: LookupLatest of an unknown address), not scanned.
+    #[test]
+    fn address_without_an_account_row_has_no_resources_and_no_scans() {
+        let r = ScanCounter::new(None);
+        let parts = account_resource_parts(&r, &Address([1; 32]), 0);
+        assert_eq!(r.scans.get(), 0);
+        assert_eq!(parts.account_data, AccountData::default());
+        assert!(parts.assets.is_empty() && parts.created_apps.is_empty());
+    }
+
+    /// go's `AccountDataToAccount` lists the record's resource maps; the
+    /// `total-*` counters are the account row's own. They may differ (the row
+    /// here claims no assets): the list follows the rows, the totals stay.
+    #[test]
+    fn resource_lists_follow_the_rows_and_totals_follow_the_account_row() {
+        let r = ScanCounter::new(Some(account_with_totals(0, 0, 0, 0)));
+        let parts = account_resource_parts(&r, &Address([1; 32]), 1);
+        assert_eq!(r.scans.get(), 4);
+        assert_eq!(parts.assets.len(), 1);
+        assert_eq!(parts.account_data.total_assets_opted_in, 0);
     }
 }

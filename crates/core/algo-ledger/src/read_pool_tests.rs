@@ -860,3 +860,49 @@ fn new_pool_reads_do_not_wait_for_a_held_ledger_mutex() {
     assert!(locked >= HOLD / 2, "locked path should wait out the hold");
     assert!(worst < HOLD / 2, "lock-free reads waited: {worst:?}");
 }
+
+/// Issue #2155: a resource row the pool cannot decode is a snapshot error (the
+/// REST adapter then takes the locked path), not a silently shorter list that
+/// disagrees with the account's totals.
+#[test]
+fn undecodable_resource_row_is_reported_not_dropped() {
+    let (dir, mut l) = file_ledger();
+    let pool = l.read_pool().unwrap();
+    stage(&mut l, 1, 1, 10);
+    l.set_asset_params(
+        7,
+        AssetParamsRecord {
+            params: algo_types::AssetParams {
+                total: 5,
+                ..Default::default()
+            },
+            creator: addr(1),
+        },
+    );
+    l.commit_block().unwrap();
+    let (_, ok) = pool
+        .read_resources(|r| r.created_assets_for_addr(&addr(1)))
+        .unwrap();
+    assert_eq!(ok.len(), 1);
+
+    // `{"y": 1, "b": 2^40}`: an ownership row whose decimals overflow u32.
+    let corrupt: Vec<u8> = [
+        &[0x82, 0xa1, b'y', 0x01, 0xa1, b'b', 0xcf][..],
+        &(1u64 << 40).to_be_bytes()[..],
+    ]
+    .concat();
+    let w = Connection::open(crate::sqlite::tracker_path_for_prefix(
+        &dir.path().join("ledger"),
+    ))
+    .unwrap();
+    w.execute(
+        "UPDATE resources SET data = ?1 WHERE aidx = 7 AND ctype = ?2",
+        params![corrupt, CTYPE_ASSET],
+    )
+    .unwrap();
+    assert!(
+        pool.read_resources(|r| r.created_assets_for_addr(&addr(1)))
+            .is_err(),
+        "an undecodable created-asset row must fail the snapshot"
+    );
+}

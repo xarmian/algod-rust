@@ -471,6 +471,21 @@ impl PoolReader<'_> {
         }
     }
 
+    /// A resource blob that fails to decode is not "absent": record it as the
+    /// snapshot's error so the caller takes the locked path instead of serving
+    /// a list that silently disagrees with the account's totals.
+    fn decoded<T>(&self, r: Result<T, AlgoError>) -> Option<T> {
+        match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                let first = self.err.take();
+                self.err
+                    .set(first.or(Some(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))));
+                None
+            }
+        }
+    }
+
     fn rowid(&self, addr: &Address) -> Option<i64> {
         self.ok(self
             .conn
@@ -594,7 +609,7 @@ impl ResourceReads for PoolReader<'_> {
                 if !inspect_resource_blob(&data).has_holding {
                     return None;
                 }
-                Some((aidx, decode_app_local_state(&data).ok()?))
+                Some((aidx, self.decoded(decode_app_local_state(&data))?))
             })
             .collect()
     }
@@ -606,7 +621,7 @@ impl ResourceReads for PoolReader<'_> {
                 if !inspect_resource_blob(&data).has_holding {
                     return None;
                 }
-                Some((aidx, decode_asset_holding(&data).ok()?))
+                Some((aidx, self.decoded(decode_asset_holding(&data))?))
             })
             .collect()
     }
@@ -618,7 +633,7 @@ impl ResourceReads for PoolReader<'_> {
                 if !inspect_resource_blob(&data).has_ownership {
                     return None;
                 }
-                let params = decode_asset_params(&data).ok()?;
+                let params = self.decoded(decode_asset_params(&data))?;
                 Some((
                     aidx,
                     AssetParamsRecord {
@@ -637,7 +652,7 @@ impl ResourceReads for PoolReader<'_> {
                 if !inspect_resource_blob(&data).has_ownership {
                     return None;
                 }
-                Some((aidx, decode_app_params(&data, *addr).ok()?))
+                Some((aidx, self.decoded(decode_app_params(&data, *addr))?))
             })
             .collect()
     }
