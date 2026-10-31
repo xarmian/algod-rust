@@ -181,6 +181,15 @@ pub trait NodeInfo: Send + Sync {
     /// vote on blocks or propose blocks — i.e. it needs the transaction
     /// pool populated via gossip even though it isn't a relay.
     fn is_participating(&self) -> bool;
+
+    /// `false` while the oracle has not yet been able to decide (e.g. its
+    /// first read of the participation registry failed). The transports then
+    /// leave `wantTXGossip` untouched instead of treating "unknown" as "not
+    /// participating" and dropping TX interest. go's oracle always answers,
+    /// hence the default.
+    fn participation_known(&self) -> bool {
+        true
+    }
 }
 
 /// `wantTXGossip` has not yet been decided — the initial state for a
@@ -903,6 +912,17 @@ impl WebsocketNetwork {
             .is_some_and(|info| info.is_participating())
     }
 
+    /// Whether the registered oracle (if any) can currently answer; see
+    /// [`NodeInfo::participation_known`]. `true` without an oracle (go's
+    /// `nopeNodeInfo` answers "not participating").
+    fn participation_known(&self) -> bool {
+        self.node_info
+            .lock()
+            .expect("node_info lock poisoned")
+            .as_ref()
+            .is_none_or(|info| info.participation_known())
+    }
+
     /// Current `wantTXGossip` state — one of [`WANT_TX_GOSSIP_UNK`]/
     /// [`WANT_TX_GOSSIP_YES`]/[`WANT_TX_GOSSIP_NO`]. Exposed mainly for
     /// tests; mirrors go's `wn.wantTXGossip.Load()`.
@@ -961,6 +981,9 @@ impl WebsocketNetwork {
     /// if it is no longer participating and was subscribed, deregister it.
     /// A no-op if the state hasn't changed since the last refresh.
     async fn refresh_want_tx_gossip(&self) {
+        if !self.participation_known() {
+            return;
+        }
         let participating = self.is_participating();
         let current = self.want_tx_gossip.load(Ordering::SeqCst);
         if participating && current != WANT_TX_GOSSIP_YES {
@@ -971,6 +994,26 @@ impl WebsocketNetwork {
             self.deregister_message_interest(Tag::Transaction).await;
             self.want_tx_gossip
                 .store(WANT_TX_GOSSIP_NO, Ordering::SeqCst);
+        }
+    }
+
+    /// Wakes the `wantTXGossip` refresh loop without reporting a network
+    /// advance, for a node that might narrow/widen its TX-gossip
+    /// subscription. A relay or force-fetch node pinned `wantTXGossip` to
+    /// "yes" at startup and never re-evaluates it (go's exact gate in
+    /// `OnNetworkAdvance`, `!wn.relayMessages && !wn.config.ForceFetchTransactions`).
+    /// A no-op before [`GossipNode::start_arc`] has spawned the loop.
+    ///
+    /// Call it right after [`Self::set_node_info`] so a node that already
+    /// holds live participation keys subscribes at once instead of waiting
+    /// for the first `on_network_advance` (issue #2150).
+    pub fn request_want_tx_gossip_refresh(&self) {
+        if !self.effective_relay_messages() && !self.config.force_fetch_transactions {
+            if let Ok(guard) = self.messages_of_interest_refresh_tx.try_lock() {
+                if let Some(tx) = guard.as_ref() {
+                    let _ = tx.try_send(());
+                }
+            }
         }
     }
 
@@ -2306,13 +2349,7 @@ impl GossipNode for WebsocketNetwork {
         // (`network/wsNetwork.go`'s `OnNetworkAdvance`): a relay or a
         // force-fetch node already pinned `wantTXGossip` to "yes" at
         // startup and never re-evaluates it.
-        if !self.effective_relay_messages() && !self.config.force_fetch_transactions {
-            if let Ok(guard) = self.messages_of_interest_refresh_tx.try_lock() {
-                if let Some(tx) = guard.as_ref() {
-                    let _ = tx.try_send(());
-                }
-            }
-        }
+        self.request_want_tx_gossip_refresh();
     }
 
     fn get_genesis_id(&self) -> &str {

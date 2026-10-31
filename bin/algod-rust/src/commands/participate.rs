@@ -44,6 +44,7 @@ use algo_ledger::{
     FetchedBlockCert, SqliteLedger,
 };
 use algo_network::local_tx_broadcast::{LocalTxBroadcaster, PoolIngestAdapter};
+use algo_network::ws_network::NodeInfo;
 use algo_network::{
     AgreementNetworkBridge, BlockService, BlockServiceError, CatchpointService,
     CatchpointServiceError, GossipNode, LedgerForBlockService, LedgerForCatchpointService,
@@ -61,7 +62,7 @@ use algo_validate::signature::verify_transaction_signature;
 use rand::RngExt;
 use sha2::{Digest as _, Sha512_256};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::commands::dual_gossip_node;
 use crate::commands::network_common::{
@@ -109,6 +110,225 @@ struct RealRandomSource;
 impl RandomSource for RealRandomSource {
     fn uint64(&self) -> u64 {
         rand::rng().random()
+    }
+}
+
+/// The one question [`ParticipationNodeInfo`] asks the participation-key
+/// registry; a trait so the error path is testable.
+pub(crate) trait LiveKeySource: Send + Sync {
+    /// go `registry.HasLiveKeys(from, to)`.
+    fn has_live_keys(&self, from: u64, to: u64) -> Result<bool, String>;
+}
+
+impl LiveKeySource for Mutex<ParticipationStore> {
+    fn has_live_keys(&self, from: u64, to: u64) -> Result<bool, String> {
+        let store = self
+            .lock()
+            .map_err(|_| "participation store lock poisoned".to_string())?;
+        store
+            .has_live_keys(Round(from), Round(to))
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// [`ParticipationNodeInfo`] before its first successful registry read.
+const PARTICIPATION_UNDECIDED: u8 = 0;
+const PARTICIPATION_NO: u8 = 1;
+const PARTICIPATION_YES: u8 = 2;
+
+/// [`NodeInfo`] backed by this node's participation-key registry: go's
+/// `AlgorandFullNode.IsParticipating` (`node/node.go`), i.e.
+/// `HasLiveKeys(latest+1, latest+1+10)`.
+///
+/// The WS and P2P transports consult it from their `wantTXGossip` refresh
+/// (go `postMessagesOfInterestThread`): a participating non-relay node
+/// subscribes to `TX` gossip, any other non-relay node unsubscribes. Without
+/// a registered oracle every non-relay node counts as "not participating",
+/// so a participation node told its relay it wanted no transactions, and a
+/// transaction accepted by another node's REST endpoint never reached its
+/// pool (issue #2150: a fixed 200-txn set took ~18 rounds instead of ~1).
+///
+/// `is_participating` is called from a tokio worker (WS) and from the sync
+/// `on_network_advance` (P2P), which block-apply paths also reach, so it
+/// must neither block nor take the ledger lock: it only reads a cached
+/// tri-state (undecided / no / yes). [`Self::refresh`] updates the cache from
+/// the registry, at install and from the refresher thread; when the answer
+/// changes it calls `on_change`, which re-evaluates the transports' `wantTXGossip`
+/// so a role change does not wait for the next `on_network_advance`.
+///
+/// Until the first successful read the oracle is *undecided*
+/// ([`NodeInfo::participation_known`] is `false`) and the transports leave
+/// `wantTXGossip` alone; a failed read afterwards keeps the previous answer.
+///
+/// Lock order: `refresh` callers read the ledger round first (taking and
+/// releasing the ledger lock), then call `refresh`, which takes only the
+/// registry's own lock. The two locks are never held together.
+pub(crate) struct ParticipationNodeInfo {
+    source: Arc<dyn LiveKeySource>,
+    state: std::sync::atomic::AtomicU8,
+    on_change: Box<dyn Fn() + Send + Sync>,
+}
+
+impl ParticipationNodeInfo {
+    pub(crate) fn new(
+        source: Arc<dyn LiveKeySource>,
+        on_change: Box<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self {
+            source,
+            state: std::sync::atomic::AtomicU8::new(PARTICIPATION_UNDECIDED),
+            on_change,
+        }
+    }
+
+    /// Re-read the registry for `latest_round`'s window and, if the cached
+    /// answer changed, run `on_change`.
+    pub(crate) fn refresh(&self, latest_round: u64) {
+        use std::sync::atomic::Ordering;
+        let from = latest_round + 1;
+        match self.source.has_live_keys(from, from + 10) {
+            Ok(live) => {
+                let new = if live {
+                    PARTICIPATION_YES
+                } else {
+                    PARTICIPATION_NO
+                };
+                if self.state.swap(new, Ordering::SeqCst) != new {
+                    (self.on_change)();
+                }
+            }
+            Err(e) => warn!(
+                error = %e,
+                "participation registry read failed; keeping the previous participation state"
+            ),
+        }
+    }
+}
+
+impl NodeInfo for ParticipationNodeInfo {
+    fn is_participating(&self) -> bool {
+        self.state.load(std::sync::atomic::Ordering::SeqCst) == PARTICIPATION_YES
+    }
+
+    fn participation_known(&self) -> bool {
+        self.state.load(std::sync::atomic::Ordering::SeqCst) != PARTICIPATION_UNDECIDED
+    }
+}
+
+/// Build the participation oracle, register it on every gossip transport the
+/// node runs and apply it immediately (a node with live keys at startup must
+/// not sit in `WANT_TX_GOSSIP_UNK` until the first `on_network_advance`). The
+/// first registry read is retried a few times; if it still fails the oracle
+/// stays undecided and the transports keep their state.
+pub(crate) fn install_participation_node_info(
+    source: Arc<dyn LiveKeySource>,
+    latest_round: u64,
+    ws: &Arc<WebsocketNetwork>,
+    p2p: Option<&Arc<P2pTransport>>,
+) -> Arc<ParticipationNodeInfo> {
+    // Weak: the transports own the oracle, which must not keep them alive.
+    let ws_weak = Arc::downgrade(ws);
+    let p2p_weak = p2p.map(Arc::downgrade);
+    let on_change = Box::new(move || {
+        if let Some(ws) = ws_weak.upgrade() {
+            ws.request_want_tx_gossip_refresh();
+        }
+        if let Some(p2p) = p2p_weak.as_ref().and_then(std::sync::Weak::upgrade) {
+            p2p.refresh_want_tx_gossip();
+        }
+    });
+    let info = Arc::new(ParticipationNodeInfo::new(source, on_change));
+    ws.set_node_info(info.clone());
+    if let Some(p2p) = p2p {
+        p2p.set_node_info(info.clone());
+    }
+    info.refresh(latest_round);
+    for _ in 0..3 {
+        if info.participation_known() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        info.refresh(latest_round);
+    }
+    info
+}
+
+/// Owns the refresher thread: dropping it stops and joins the thread, so
+/// every exit path of `run` (including `?` early returns) stops it.
+pub(crate) struct ParticipationRefresher {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    wake: Arc<std::sync::Condvar>,
+    gate: Arc<Mutex<()>>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for ParticipationRefresher {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Taking the gate orders this notify after the thread either saw
+        // `stop` in its wait predicate or is parked in the wait.
+        drop(self.gate.lock());
+        self.wake.notify_all();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+/// Keep `info` current as rounds advance. `round_source` yields the ledger's
+/// latest round (`None`: unreadable, e.g. a poisoned ledger lock -- the last
+/// good round is reused and the loop keeps running). The thread waits on
+/// `round_advanced` with a predicate that re-reads the round, so an advance
+/// that lands between the refresh and the wait is seen at once instead of
+/// waiting out `poll`.
+pub(crate) fn spawn_participation_refresher(
+    info: Arc<ParticipationNodeInfo>,
+    mut round_source: Box<dyn FnMut() -> Option<u64> + Send>,
+    round_advanced: Arc<std::sync::Condvar>,
+    poll: Duration,
+) -> ParticipationRefresher {
+    use std::sync::atomic::Ordering;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let wake = Arc::clone(&round_advanced);
+    let gate = Arc::new(Mutex::new(()));
+    let thread_gate = Arc::clone(&gate);
+    let join = std::thread::Builder::new()
+        .name("participation-node-info".to_string())
+        .spawn(move || {
+            let mut last_good = 0u64;
+            let mut warned = false;
+            while !thread_stop.load(Ordering::SeqCst) {
+                let round = match round_source() {
+                    Some(r) => {
+                        last_good = r;
+                        warned = false;
+                        r
+                    }
+                    None => {
+                        if !warned {
+                            error!(
+                                "participation refresher cannot read the ledger round; \
+                                 reusing the last good round"
+                            );
+                            warned = true;
+                        }
+                        last_good
+                    }
+                };
+                info.refresh(round);
+                let guard = thread_gate.lock().expect("wait_gate mutex poisoned");
+                let _ = round_advanced.wait_timeout_while(guard, poll, |_| {
+                    !thread_stop.load(Ordering::SeqCst) && round_source().is_none_or(|r| r == round)
+                });
+            }
+        })
+        .expect("failed to spawn participation-node-info thread");
+    ParticipationRefresher {
+        stop,
+        wake,
+        gate,
+        join: Some(join),
     }
 }
 
@@ -6486,6 +6706,21 @@ pub async fn run(
         None
     };
 
+    // Issue #2150: tell the transports whether this node participates, so a
+    // participation node subscribes to `TX` gossip (go `IsParticipating`).
+    // Shares the startup `part_store` handle (unused after the key listing
+    // above) rather than opening another connection.
+    let participation_node_info = install_participation_node_info(
+        Arc::new(Mutex::new(part_store)) as Arc<dyn LiveKeySource>,
+        ledger
+            .lock()
+            .expect("ledger lock poisoned")
+            .current_round()
+            .0,
+        &gossip_node,
+        p2p_transport.as_ref(),
+    );
+
     // The `GossipNode` traffic-routing traffic (outbound local tx,
     // agreement proposals/votes/bundles) should flow over: WS-gossip only
     // (`WsOnly`), the P2P transport only (`P2pOnly`), or both
@@ -6938,6 +7173,17 @@ pub async fn run(
             .expect("failed to spawn pool-block-follower thread")
     };
 
+    // Dropped (stopping and joining the thread) on every exit path of `run`.
+    let participation_refresher = spawn_participation_refresher(
+        participation_node_info,
+        Box::new({
+            let ledger = ledger.clone();
+            move || ledger.lock().ok().map(|l| l.current_round().0)
+        }),
+        Arc::clone(&pool_follower_round_advanced),
+        Duration::from_millis(500),
+    );
+
     // -----------------------------------------------------------------------
     // 5b. Start the autonomous heartbeat service (issue #820).
     //
@@ -7043,6 +7289,7 @@ pub async fn run(
     agreement_control.pause().await;
     pool_follower_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = pool_follower.join();
+    drop(participation_refresher);
     heartbeat_service_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = heartbeat_service_join.join();
     if let Some((stateproof_service_stop, stateproof_service_join)) = stateproof_service_handle {
@@ -8351,6 +8598,475 @@ mod tests {
             "pool evaluator must skip straight to the ledger tip (round {TIP_ROUND}) \
              across a catchpoint-induced history gap instead of getting stuck \
              re-requesting unreadable intermediate rounds forever"
+        );
+    }
+
+    // ── participation NodeInfo / wantTXGossip (issue #2150) ─────────
+
+    /// Scripted registry: answers from a queue, counts calls, and can be told
+    /// to panic if it is queried (to prove a code path never reads it).
+    struct ScriptedKeys {
+        answers: Mutex<std::collections::VecDeque<Result<bool, String>>>,
+        calls: std::sync::atomic::AtomicUsize,
+        forbid: std::sync::atomic::AtomicBool,
+    }
+
+    impl ScriptedKeys {
+        fn new(answers: Vec<Result<bool, String>>) -> Arc<Self> {
+            Arc::new(Self {
+                answers: Mutex::new(answers.into()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                forbid: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl LiveKeySource for ScriptedKeys {
+        fn has_live_keys(&self, _from: u64, _to: u64) -> Result<bool, String> {
+            assert!(
+                !self.forbid.load(std::sync::atomic::Ordering::SeqCst),
+                "the registry must not be queried on this path"
+            );
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.answers
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Err("script exhausted".into()))
+        }
+    }
+
+    fn noop_change() -> Box<dyn Fn() + Send + Sync> {
+        Box::new(|| {})
+    }
+
+    /// Undecided until the first successful read; a later failed read keeps
+    /// the previous answer instead of flipping to "not participating".
+    #[test]
+    fn participation_oracle_is_undecided_until_first_read_and_keeps_last_answer() {
+        let keys = ScriptedKeys::new(vec![
+            Err("busy".into()),
+            Ok(true),
+            Err("busy".into()),
+            Ok(false),
+        ]);
+        let info = ParticipationNodeInfo::new(keys, noop_change());
+        info.refresh(5);
+        assert!(!info.participation_known(), "first read failed: undecided");
+        assert!(!info.is_participating());
+        info.refresh(6);
+        assert!(info.participation_known() && info.is_participating());
+        info.refresh(7);
+        assert!(info.is_participating(), "error keeps the last good answer");
+        info.refresh(8);
+        assert!(info.participation_known() && !info.is_participating());
+    }
+
+    /// `on_change` runs when the answer is first decided and when it flips,
+    /// not on a repeat of the same answer.
+    #[test]
+    fn participation_on_change_fires_only_on_change() {
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let f = fired.clone();
+        let keys = ScriptedKeys::new(vec![Ok(true), Ok(true), Ok(false), Ok(false)]);
+        let info = ParticipationNodeInfo::new(
+            keys,
+            Box::new(move || {
+                f.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
+        for round in 0..4 {
+            info.refresh(round);
+        }
+        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// `is_participating` / `participation_known` read only the cache: with
+    /// the registry forbidden (it panics when queried) they still answer, and
+    /// the call counter stays put. The oracle holds no ledger, so the ledger
+    /// lock cannot be taken either (the test holds it while calling).
+    #[test]
+    fn is_participating_never_queries_the_registry() {
+        let ledger = test_ledger();
+        let keys = ScriptedKeys::new(vec![Ok(true)]);
+        let info = ParticipationNodeInfo::new(keys.clone(), noop_change());
+        info.refresh(0);
+        assert_eq!(keys.calls(), 1);
+        keys.forbid.store(true, std::sync::atomic::Ordering::SeqCst);
+        let held = ledger.lock().unwrap();
+        for _ in 0..3 {
+            assert!(info.is_participating());
+            assert!(info.participation_known());
+        }
+        drop(held);
+        assert_eq!(keys.calls(), 1);
+    }
+
+    /// Counts delivered `TX` messages.
+    struct CountTx(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl algo_network::handler::MessageHandler for CountTx {
+        async fn handle(
+            &self,
+            msg: algo_network::IncomingMessage,
+        ) -> algo_network::OutgoingMessage {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            algo_network::OutgoingMessage {
+                action: algo_network::forwarding_policy::ForwardingPolicy::Ignore,
+                tag: msg.tag,
+                payload: Vec::new(),
+                topics: None,
+            }
+        }
+    }
+
+    /// Fires a `Notify` on every message: an arrival fence.
+    struct NotifyOnMessage(Arc<tokio::sync::Notify>);
+
+    #[async_trait::async_trait]
+    impl algo_network::handler::MessageHandler for NotifyOnMessage {
+        async fn handle(
+            &self,
+            msg: algo_network::IncomingMessage,
+        ) -> algo_network::OutgoingMessage {
+            self.0.notify_one();
+            algo_network::OutgoingMessage {
+                action: algo_network::forwarding_policy::ForwardingPolicy::Ignore,
+                tag: msg.tag,
+                payload: Vec::new(),
+                topics: None,
+            }
+        }
+    }
+
+    async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    async fn wait_notified(what: &str, notify: &tokio::sync::Notify) {
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    }
+
+    fn plain_ws() -> Arc<WebsocketNetwork> {
+        Arc::new(WebsocketNetwork::new(
+            WebsocketNetworkConfig::default(),
+            Arc::new(Phonebook::new(0, Duration::from_secs(60))),
+        ))
+    }
+
+    /// The production wiring registers the oracle on the WS transport and
+    /// applies it at once (no `on_network_advance` anywhere in this test).
+    /// End to end over two in-process nodes: the relay's `TX` broadcast
+    /// reaches the participation node only after its messages-of-interest
+    /// update says it wants `TX`, and stops once the keys lapse. Both
+    /// negative checks wait on explicit arrival fences (go's own idiom,
+    /// `wait_for_moi_propagation`): the high-priority MI update and bulk
+    /// messages share one ordered path per peer, so a marker that arrives
+    /// proves everything queued before it has been applied/delivered.
+    #[tokio::test]
+    async fn install_participation_node_info_ws_subscribes_tx_and_sends_mi() {
+        use algo_network::handler::TaggedMessageHandler;
+        use algo_network::ws_network::{WANT_TX_GOSSIP_NO, WANT_TX_GOSSIP_YES};
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+
+        let relay = Arc::new(WebsocketNetwork::new(
+            WebsocketNetworkConfig {
+                genesis_id: "t-v1".into(),
+                network_id: "t".into(),
+                net_address: Some("127.0.0.1:0".into()),
+                relay_messages: true,
+                mesh_interval: Duration::from_secs(3600),
+                ..Default::default()
+            },
+            Arc::new(Phonebook::new(0, Duration::from_secs(60))),
+        ));
+        let relay_saw_marker = Arc::new(tokio::sync::Notify::new());
+        relay
+            .multiplexer()
+            .register_handlers(vec![TaggedMessageHandler {
+                tag: algo_network::Tag::AgreementVote,
+                handler: Arc::new(NotifyOnMessage(relay_saw_marker.clone())),
+            }]);
+        relay.start_arc().await.expect("relay start");
+        let (relay_addr, listening) = relay.address();
+        assert!(listening);
+
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        phonebook.replace_peer_list(&[relay_addr], "t", RELAY_ROLE);
+        let node = Arc::new(WebsocketNetwork::new(
+            WebsocketNetworkConfig {
+                genesis_id: "t-v1".into(),
+                network_id: "t".into(),
+                gossip_fanout: 2,
+                mesh_interval: Duration::from_secs(3600),
+                ..Default::default()
+            },
+            phonebook,
+        ));
+        let got = Arc::new(AtomicUsize::new(0));
+        let node_saw_marker = Arc::new(tokio::sync::Notify::new());
+        node.multiplexer().register_handlers(vec![
+            TaggedMessageHandler {
+                tag: algo_network::Tag::Transaction,
+                handler: Arc::new(CountTx(got.clone())),
+            },
+            TaggedMessageHandler {
+                tag: algo_network::Tag::AgreementVote,
+                handler: Arc::new(NotifyOnMessage(node_saw_marker.clone())),
+            },
+        ]);
+        node.start_arc().await.expect("node start");
+        node.request_connect_outgoing(false).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while relay.peer_count().await < 1 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(relay.peer_count().await >= 1, "node must connect to relay");
+
+        let keys = ScriptedKeys::new(vec![Ok(true), Ok(false)]);
+        let info = install_participation_node_info(keys, 0, &node, None);
+        wait_until("want TX", || node.want_tx_gossip() == WANT_TX_GOSSIP_YES).await;
+
+        // The MI update reached the relay: its TX broadcast is delivered.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while got.load(O::SeqCst) == 0 && Instant::now() < deadline {
+            let _ = relay
+                .broadcast(algo_network::Tag::Transaction, vec![1, 2, 3], false, None)
+                .await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(got.load(O::SeqCst) > 0, "TX never delivered after MI");
+
+        // Keys lapse: `refresh` alone (no on_network_advance) flips the
+        // transport, because the changed answer re-runs the wantTXGossip decision.
+        info.refresh(0);
+        wait_until("want NO", || node.want_tx_gossip() == WANT_TX_GOSSIP_NO).await;
+        // Fence 1: the relay has applied the node's NO update (the marker is
+        // queued behind it).
+        node.broadcast(algo_network::Tag::AgreementVote, vec![9; 5], false, None)
+            .await
+            .expect("marker from node");
+        wait_notified("relay to see the node's marker", &relay_saw_marker).await;
+        // Fence 2: everything the relay sent before the NO update has arrived.
+        relay
+            .broadcast(algo_network::Tag::AgreementVote, vec![8; 5], false, None)
+            .await
+            .expect("fence from relay");
+        wait_notified("node to see the relay's first fence", &node_saw_marker).await;
+        let settled = got.load(O::SeqCst);
+
+        for i in 0..5u8 {
+            let _ = relay
+                .broadcast(
+                    algo_network::Tag::Transaction,
+                    vec![4, 5, 6, i],
+                    false,
+                    None,
+                )
+                .await;
+        }
+        relay
+            .broadcast(algo_network::Tag::AgreementVote, vec![7; 5], false, None)
+            .await
+            .expect("second fence from relay");
+        wait_notified("node to see the relay's second fence", &node_saw_marker).await;
+        assert_eq!(got.load(O::SeqCst), settled, "TX still delivered after NO");
+
+        node.stop().await;
+        relay.stop().await;
+    }
+
+    /// Same wiring against a real registry store, without any
+    /// `on_network_advance`: the install itself must apply the answer.
+    #[tokio::test]
+    async fn install_participation_node_info_with_real_store() {
+        use algo_ledger::participation::Participation;
+        use algo_network::ws_network::{WANT_TX_GOSSIP_NO, WANT_TX_GOSSIP_YES};
+
+        async fn want(has_key: bool) -> u8 {
+            let store = ParticipationStore::open_in_memory().expect("in-memory part store");
+            if has_key {
+                // Small dilution: the test does not need the production value.
+                let part =
+                    Participation::generate(Address([7u8; 32]), Round(0), Round(1000), 16, 0)
+                        .expect("generate participation");
+                store.insert(&part).expect("insert participation");
+            }
+            let net = plain_ws();
+            net.start_arc().await.expect("start");
+            let _info = install_participation_node_info(
+                Arc::new(Mutex::new(store)) as Arc<dyn LiveKeySource>,
+                0,
+                &net,
+                None,
+            );
+            wait_until("want decided", || {
+                let w = net.want_tx_gossip();
+                w == WANT_TX_GOSSIP_YES || w == WANT_TX_GOSSIP_NO
+            })
+            .await;
+            let w = net.want_tx_gossip();
+            net.stop().await;
+            w
+        }
+
+        assert_eq!(want(true).await, WANT_TX_GOSSIP_YES);
+        assert_eq!(want(false).await, WANT_TX_GOSSIP_NO);
+    }
+
+    /// A first read that fails once is retried by the install; one that keeps
+    /// failing leaves the oracle undecided and the transport at UNK (it must
+    /// not move to NO and drop TX gossip), until a read finally succeeds.
+    #[tokio::test]
+    async fn failing_first_registry_read_never_moves_the_transport_to_no() {
+        use algo_network::ws_network::{WANT_TX_GOSSIP_UNK, WANT_TX_GOSSIP_YES};
+
+        // Fails once, then answers: the install's retry decides it.
+        let net = plain_ws();
+        net.start_arc().await.expect("start");
+        let keys = ScriptedKeys::new(vec![Err("busy".into()), Ok(true)]);
+        let _info = install_participation_node_info(keys, 0, &net, None);
+        wait_until("want YES after retry", || {
+            net.want_tx_gossip() == WANT_TX_GOSSIP_YES
+        })
+        .await;
+        net.stop().await;
+
+        // Fails throughout the install's retries: undecided, transport stays UNK.
+        let net = plain_ws();
+        net.start_arc().await.expect("start");
+        let keys = ScriptedKeys::new(vec![
+            Err("busy".into()),
+            Err("busy".into()),
+            Err("busy".into()),
+            Err("busy".into()),
+            Ok(true),
+        ]);
+        let info = install_participation_node_info(keys, 0, &net, None);
+        assert!(!info.participation_known());
+        net.on_network_advance();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            net.want_tx_gossip(),
+            WANT_TX_GOSSIP_UNK,
+            "an undecided oracle must not drop TX interest"
+        );
+        // The first successful read decides it and re-runs the decision.
+        info.refresh(0);
+        wait_until("want YES once decided", || {
+            net.want_tx_gossip() == WANT_TX_GOSSIP_YES
+        })
+        .await;
+        net.stop().await;
+    }
+
+    /// W1: the refresher thread alone (no `on_network_advance`) applies a role
+    /// change to the transport, because a changed answer re-runs the decision.
+    #[tokio::test]
+    async fn refresher_applies_a_key_going_live_without_on_network_advance() {
+        use algo_network::ws_network::{WANT_TX_GOSSIP_NO, WANT_TX_GOSSIP_YES};
+
+        let net = plain_ws();
+        net.start_arc().await.expect("start");
+        // Install sees "no live key"; the refresher's first read sees one.
+        let keys = ScriptedKeys::new(vec![Ok(false), Ok(true)]);
+        let info = install_participation_node_info(keys, 0, &net, None);
+        wait_until("want NO", || net.want_tx_gossip() == WANT_TX_GOSSIP_NO).await;
+        let _refresher = spawn_participation_refresher(
+            info,
+            Box::new(|| Some(0)),
+            Arc::new(std::sync::Condvar::new()),
+            Duration::from_secs(60),
+        );
+        wait_until("want YES from the refresher", || {
+            net.want_tx_gossip() == WANT_TX_GOSSIP_YES
+        })
+        .await;
+        net.stop().await;
+    }
+
+    /// W4: a round advance that lands between the refresher's read and its
+    /// wait is seen at once: with a 60 s poll and no notify, two refreshes
+    /// still happen quickly.
+    #[test]
+    fn refresher_does_not_lose_an_advance_between_read_and_wait() {
+        let keys = ScriptedKeys::new(vec![Ok(true), Ok(true), Ok(true)]);
+        let info = Arc::new(ParticipationNodeInfo::new(keys.clone(), noop_change()));
+        // 1st call (the read) -> 5, 2nd (the wait predicate) -> 6, then steady.
+        let mut calls = 0u64;
+        let _refresher = spawn_participation_refresher(
+            info,
+            Box::new(move || {
+                calls += 1;
+                Some(if calls == 1 { 5 } else { 6 })
+            }),
+            Arc::new(std::sync::Condvar::new()),
+            Duration::from_secs(60),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while keys.calls() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(keys.calls() >= 2, "advance between read and wait was lost");
+    }
+
+    /// W7: an unreadable ledger round (poisoned lock) does not kill the
+    /// refresher: it keeps looping with the last good round.
+    #[test]
+    fn refresher_survives_an_unreadable_round() {
+        let keys = ScriptedKeys::new(vec![Ok(true); 8]);
+        let info = Arc::new(ParticipationNodeInfo::new(keys.clone(), noop_change()));
+        let mut calls = 0u32;
+        let _refresher = spawn_participation_refresher(
+            info,
+            Box::new(move || {
+                calls += 1;
+                if calls == 1 {
+                    Some(3)
+                } else {
+                    None
+                }
+            }),
+            Arc::new(std::sync::Condvar::new()),
+            Duration::from_millis(30),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while keys.calls() < 3 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(keys.calls() >= 3, "refresher exited on an unreadable round");
+    }
+
+    /// W2: dropping the guard stops and joins the thread promptly, even with
+    /// a long poll (every exit path of `run` drops it).
+    #[test]
+    fn dropping_the_refresher_guard_stops_the_thread() {
+        let keys = ScriptedKeys::new(vec![Ok(true)]);
+        let info = Arc::new(ParticipationNodeInfo::new(keys, noop_change()));
+        let refresher = spawn_participation_refresher(
+            info,
+            Box::new(|| Some(1)),
+            Arc::new(std::sync::Condvar::new()),
+            Duration::from_secs(60),
+        );
+        let started = Instant::now();
+        drop(refresher);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "drop did not stop the refresher promptly"
         );
     }
 

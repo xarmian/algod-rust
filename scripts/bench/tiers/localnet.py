@@ -48,6 +48,7 @@ Inputs (environment; docs/BENCHMARK_COMPARISON.md, "The localnet tier"):
   BENCH_LOCALNET_CPUS / _MEM per-container limits (default 2 / 3g)
   BENCH_LOCALNET_ACCOUNTS    funded load accounts (default 16)
   BENCH_LOCALNET_PORT_BASE   first published REST port (default 4300)
+  BENCH_LOCALNET_SAVE_LOGS   1: keep every node's container log, not only on failure
   BENCH_LOCALNET_GO_IMAGE    default algorand/algod:<pinned tag without `v`>
   BENCH_LOCALNET_RUST_IMAGE  a prebuilt algod-rust image (default: build
                              docker/Dockerfile's `runtime` target)
@@ -541,8 +542,11 @@ def run_cluster(impl, cfg, work, shared, genesis_id, partkeys, addrs, raw_dir, r
         failed = False
         return {"side": side, "steps": steps, "loadgen_cmd": rep["_cmd"]}
     finally:
-        if failed:
-            cl.save_logs(raw_dir)
+        if failed or os.environ.get("BENCH_LOCALNET_SAVE_LOGS") == "1":
+            try:
+                cl.save_logs(raw_dir)
+            except Exception as e:  # noqa: BLE001 - logs are best effort, teardown must run
+                log(f"{impl}: could not save node logs: {e}")
         cl.down()
         purge(cl.dir, cfg["go_image"])
 
