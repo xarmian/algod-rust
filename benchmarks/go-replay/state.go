@@ -33,6 +33,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -44,6 +45,7 @@ import (
 	"github.com/algorand/go-algorand/data/basics"
 	"github.com/algorand/go-algorand/data/bookkeeping"
 	"github.com/algorand/go-algorand/data/transactions"
+	"github.com/algorand/go-algorand/ledger"
 	"github.com/algorand/go-algorand/ledger/ledgercore"
 	"github.com/algorand/go-algorand/protocol"
 	"github.com/algorand/go-algorand/util/db"
@@ -283,6 +285,47 @@ func ledgerAddresses(l *data.Ledger, trackerDB string) ([]basics.Address, error)
 	return out, nil
 }
 
+// boxKeys lists the KV keys with the box prefix at `latest`.
+//
+// go's accountUpdates.lookupKeysByPrefix learns the database round from the
+// kvstore rows its query returns, so on a ledger whose committed state holds
+// no KV rows at all (a chain that never created a box, such as a testnet
+// prefix) it sees round 0 and reports a StaleDatabaseRoundError, although
+// nothing is stale. In that one case the committed state holds no boxes and
+// the live ones are exactly those the in-memory deltas after the tracker
+// database round leave set.
+func boxKeys(l *data.Ledger, latest basics.Round) ([]string, error) {
+	keys, err := l.LookupKeysByPrefix(latest, boxPrefix, 0)
+	var stale *ledger.StaleDatabaseRoundError
+	if err == nil || !errors.As(err, &stale) {
+		return keys, err
+	}
+	dbRound := l.LatestTrackerCommitted()
+	if dbRound == 0 {
+		return nil, err // really stale: the tracker has committed nothing
+	}
+	state := map[string]bool{}
+	for r := latest; r > dbRound; r-- {
+		sd, err := l.GetStateDeltaForRound(r)
+		if err != nil {
+			return nil, err
+		}
+		for k, mv := range sd.KvMods {
+			if _, seen := state[k]; seen || !strings.HasPrefix(k, boxPrefix) {
+				continue
+			}
+			state[k] = mv.Data != nil
+		}
+	}
+	keys = keys[:0]
+	for k, set := range state {
+		if set {
+			keys = append(keys, k)
+		}
+	}
+	return keys, nil
+}
+
 func computeFinalState(l *data.Ledger, trackerDB string, known []basics.Address, dumpDir string) (finalState, error) {
 	dump := func(name string, b []byte) error {
 		if dumpDir == "" {
@@ -378,7 +421,7 @@ func computeFinalState(l *data.Ledger, trackerDB string, known []basics.Address,
 		return fs, err
 	}
 
-	keys, err := l.LookupKeysByPrefix(latest, boxPrefix, 0)
+	keys, err := boxKeys(l, latest)
 	if err != nil {
 		return fs, err
 	}

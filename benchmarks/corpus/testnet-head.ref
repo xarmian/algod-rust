@@ -1,0 +1,13 @@
+# The `testnet-head` replay corpus (issue #2119): where
+# scripts/bench/corpus/fetch_testnet.py fetches it from, how many rounds, the
+# committed final state at that round, and the sha256 of the resulting
+# MANIFEST.sha256 (which pins every file of the corpus).
+#
+# The blocks and certificates are the real testnet's (rounds 0..rounds, an
+# archival algod's GET /v2/blocks/{r}?format=msgpack, verbatim), so every
+# fetch of the same range yields the same bytes. The cache,
+# benchmarks/corpus/testnet-head, is git-ignored.
+endpoint=https://testnet-api.algonode.cloud
+rounds=20000
+final_state=benchmarks/corpus/testnet-head.final.json
+manifest_sha256=b006068e800e1bcb57b33f1265ed5b50820c42a9d27a48220239b4089da47f03

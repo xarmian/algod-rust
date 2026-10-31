@@ -22,16 +22,25 @@ corpus.json (`corpus_match`). A diverging state is a parity bug, not a
 benchmark result.
 
 Inputs (environment):
-  BENCH_CORPUS / CORPUS     corpus name: `small` (default, committed) or
+  BENCH_CORPUS / CORPUS     corpus name: `small` (default, committed),
                             `large` (fetched with scripts/bench/fetch_corpus.sh
-                            into benchmarks/corpus/large when missing)
+                            into benchmarks/corpus/large when missing),
+                            `testnet-head` (the first rounds of the real
+                            testnet, with real certificates, so both sides
+                            authenticate every certificate; fetched with
+                            scripts/bench/corpus/fetch_testnet.py into
+                            benchmarks/corpus/testnet-head when missing, issue
+                            #2119) or `testnet-prefix50` (its committed
+                            50-round slice)
   BENCH_CORPUS_DIR          an explicit corpus directory (overrides the name)
   BENCH_REPLAY_WARMUP       discarded warm-up runs per side (default 1)
   BENCH_REPLAY_ROUNDS       replay only rounds 1..N (bisecting; no corpus gate)
-  BENCH_REPLAY_CORRUPT      negative test: `txn` (flip one byte of a txn note)
-                            or `expected` (alter corpus.json's expected
-                            state), with the manifest re-hashed; the tier must
-                            then fail
+  BENCH_REPLAY_CORRUPT      negative test: `txn` (flip one byte of a txn note),
+                            `vote` (flip one bit of a vote signature in the
+                            last certificate; needs a corpus with real
+                            certificates) or `expected` (alter corpus.json's
+                            expected state), with the manifest re-hashed; the
+                            tier must then fail
   plus the tier contract (BENCH_RUNS, BENCH_OUT, BENCH_RUST_BIN_DIR,
   BENCH_GO_ALGORAND_DIR; docs/BENCHMARK_COMPARISON.md).
 
@@ -139,6 +148,7 @@ def gate(runs, full_replay):
 # ---- negative-test corpora ---------------------------------------------------
 
 NOTE_NEEDLE = bytes([0xa4]) + b"note" + bytes([0xc4, 10])
+VOTE_SIG_NEEDLE = bytes([0xa1]) + b"s" + bytes([0xc4, 64])
 
 
 def corrupt_corpus(src, dst, kind):
@@ -147,10 +157,23 @@ def corrupt_corpus(src, dst, kind):
 
       txn       flip the last byte of the first txn note in blocks.bin (the
                 block's payset commitment no longer matches its header);
+      vote      flip the last byte of the last vote signature (msgpack key
+                "s", bin8 of 64 bytes) of the last record's certificate: that
+                certificate no longer authenticates its block;
       expected  change corpus.json's expected `accounts_sha256`.
     """
     shutil.copytree(src, dst)
-    if kind == "txn":
+    if kind == "vote":
+        p = os.path.join(dst, "blocks.bin")
+        with open(p, "rb") as f:
+            b = bytearray(f.read())
+        i = b.rfind(VOTE_SIG_NEEDLE)
+        if i < 0:
+            raise TierError("no vote signature in blocks.bin (a DevMode corpus has no votes)")
+        b[i + len(VOTE_SIG_NEEDLE) + 63] ^= 1
+        with open(p, "wb") as f:
+            f.write(b)
+    elif kind == "txn":
         p = os.path.join(dst, "blocks.bin")
         with open(p, "rb") as f:
             b = bytearray(f.read())
@@ -170,7 +193,7 @@ def corrupt_corpus(src, dst, kind):
             json.dump(cj, f, indent=2)
             f.write("\n")
     else:
-        raise TierError(f"BENCH_REPLAY_CORRUPT={kind!r}: want txn or expected")
+        raise TierError(f"BENCH_REPLAY_CORRUPT={kind!r}: want txn, vote or expected")
     corpus_tool.write_manifest(dst)
     return dst
 
@@ -189,6 +212,15 @@ def resolve_corpus():
         if rc != 0:
             raise TierError(f"fetch_corpus.sh exited {rc}: generate the corpus with "
                             "`make bench-corpus-large` or pass BENCH_CORPUS_DIR")
+    if name == "testnet-head" and not os.path.isfile(os.path.join(d, "corpus.json")):
+        print("replay: fetching the testnet-head corpus "
+              "(scripts/bench/corpus/fetch_testnet.py)", flush=True)
+        rc = subprocess.run([sys.executable, os.path.join(BENCH, "corpus", "fetch_testnet.py"),
+                             "fetch"]).returncode
+        if rc != 0:
+            raise TierError(f"fetch_testnet.py exited {rc}: the testnet endpoint must be "
+                            "reachable once (docs/BENCHMARK_COMPARISON.md, \"The testnet-head "
+                            "corpus\"), or pass BENCH_CORPUS_DIR")
     if not os.path.isfile(os.path.join(d, "corpus.json")):
         raise TierError(f"no corpus at {d}")
     return d

@@ -764,6 +764,89 @@ mod tests {
         panic!("no txn note found");
     }
 
+    fn testnet_prefix() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/corpus/testnet-prefix50")
+    }
+
+    fn copy_corpus(src: &Path, dst: &Path) {
+        std::fs::create_dir(dst).unwrap();
+        for e in std::fs::read_dir(src).unwrap() {
+            let e = e.unwrap();
+            std::fs::copy(e.path(), dst.join(e.file_name())).unwrap();
+        }
+    }
+
+    /// Flip the last byte of the ephemeral signature (`"s"`, bin8 of 64
+    /// bytes) of the last vote in round `round`'s certificate. The key can
+    /// only be in the certificate: the prefix's blocks hold no transactions.
+    fn corrupt_last_vote_signature(path: &Path, round: u64) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let (off, len) = corpus::parse_blocks(&bytes)
+            .unwrap()
+            .iter()
+            .find(|r| r.round == round)
+            .map(|r| {
+                (
+                    r.payload.as_ptr() as usize - bytes.as_ptr() as usize,
+                    r.payload.len(),
+                )
+            })
+            .expect("round in corpus");
+        let payload = &bytes[off..off + len];
+        let i = payload
+            .windows(4)
+            .rposition(|w| w == [0xa1, b's', 0xc4, 64])
+            .expect("a vote signature in the certificate");
+        bytes[off + i + 4 + 63] ^= 0x01;
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    /// The testnet prefix has real certificates (votes), so the replay runs
+    /// the non-DevMode branch: every certificate goes through
+    /// `AgreementLedgerBridge::authenticate_block`, and the state reached is
+    /// the one go-algorand's ledger reached (benchmarks/corpus/testnet-prefix50).
+    #[test]
+    fn testnet_prefix_authenticates_every_certificate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let res = replay_corpus(&ReplayCorpusArgs {
+            corpus: testnet_prefix(),
+            data_dir: tmp.path().join("node"),
+            config: None,
+            rounds: None,
+            dump_state: None,
+        })
+        .unwrap();
+        assert_eq!(res.corpus_mismatches, Vec::<String>::new());
+        assert_eq!(res.corpus_match, Some(true));
+        assert_eq!(res.metrics.blocks, 50);
+        assert_eq!(
+            res.config.get("DevMode"),
+            Some(&serde_json::Value::Bool(false))
+        );
+    }
+
+    /// A flipped bit in one vote's signature must fail the replay at that
+    /// round (certificate authentication), not just at the end.
+    #[test]
+    fn testnet_prefix_tampered_vote_fails_authentication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad = tmp.path().join("corpus");
+        copy_corpus(&testnet_prefix(), &bad);
+        corrupt_last_vote_signature(&bad.join("blocks.bin"), 30);
+        let err = replay_corpus(&ReplayCorpusArgs {
+            corpus: bad,
+            data_dir: tmp.path().join("node"),
+            config: None,
+            rounds: None,
+            dump_state: None,
+        })
+        .expect_err("a tampered vote must fail the replay");
+        assert!(
+            err.to_string().contains("replay stopped at round 30"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn devmode_certificate_check() {
         let block = Block {

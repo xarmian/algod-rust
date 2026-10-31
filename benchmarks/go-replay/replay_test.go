@@ -47,6 +47,10 @@ func TestMain(m *testing.M) {
 
 const smallCorpus = "../corpus/small"
 
+// testnetPrefix holds rounds 0..50 of the real testnet: real certificates, so
+// the replay takes the non-DevMode branch and runs cert.Authenticate.
+const testnetPrefix = "../corpus/testnet-prefix50"
+
 func runReplay(t *testing.T, args ...string) (int, string) {
 	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run=^$")
@@ -68,17 +72,21 @@ func runReplay(t *testing.T, args ...string) (int, string) {
 
 // copyCorpus copies the small corpus into a temp dir.
 func copyCorpus(t *testing.T) string {
+	return copyCorpusFrom(t, smallCorpus)
+}
+
+func copyCorpusFrom(t *testing.T, src string) string {
 	t.Helper()
 	dst := filepath.Join(t.TempDir(), "corpus")
 	if err := os.MkdirAll(dst, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	ents, err := os.ReadDir(smallCorpus)
+	ents, err := os.ReadDir(src)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, e := range ents {
-		b, err := os.ReadFile(filepath.Join(smallCorpus, e.Name()))
+		b, err := os.ReadFile(filepath.Join(src, e.Name()))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -152,6 +160,61 @@ func TestCorruptedTxnFailsTheReplay(t *testing.T) {
 	code, stderr := runReplay(t, "-corpus", corpus, "-data", filepath.Join(dir, "node"), "-out", filepath.Join(dir, "r.json"))
 	if code != 1 || !strings.Contains(stderr, "contents do not match header") {
 		t.Fatalf("want exit 1 on a corrupted txn, got %d:\n%s", code, stderr)
+	}
+}
+
+// The testnet prefix replays through cert.Authenticate (its certificates
+// hold the committee's votes) to the state corpus.json records, and the
+// recorded block hash is the one the archival endpoint attested.
+func TestTestnetPrefixAuthenticatesEveryCertificate(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "result.json")
+	code, stderr := runReplay(t, "-corpus", testnetPrefix, "-data", filepath.Join(dir, "node"), "-out", out)
+	if code != 0 {
+		t.Fatalf("goreplay exited %d:\n%s", code, stderr)
+	}
+	var res struct {
+		Config      map[string]any `json:"config"`
+		CorpusMatch *bool          `json:"corpus_match"`
+	}
+	raw, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := decodeJSON(raw, &res); err != nil {
+		t.Fatal(err)
+	}
+	if res.CorpusMatch == nil || !*res.CorpusMatch {
+		t.Fatalf("final state does not match corpus.json")
+	}
+	if res.Config["DevMode"] != false {
+		t.Fatalf("the testnet prefix must not be replayed as DevMode: %v", res.Config["DevMode"])
+	}
+}
+
+// A flipped bit in one vote's ephemeral signature fails cert.Authenticate.
+func TestTestnetPrefixTamperedVoteFailsAuthentication(t *testing.T) {
+	corpus := copyCorpusFrom(t, testnetPrefix)
+	path := filepath.Join(corpus, "blocks.bin")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// msgpack: "s" (fixstr 1) then bin8 of 64 bytes; the blocks hold no txns,
+	// so the last such key is a vote signature of the final record's cert.
+	needle := []byte{0xa1, 's', 0xc4, 64}
+	i := bytes.LastIndex(b, needle)
+	if i < 0 {
+		t.Fatal("no vote signature in blocks.bin")
+	}
+	b[i+len(needle)+63] ^= 1
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	code, stderr := runReplay(t, "-corpus", corpus, "-data", filepath.Join(dir, "node"), "-out", filepath.Join(dir, "r.json"))
+	if code != 1 || !strings.Contains(stderr, "did not authenticate block") {
+		t.Fatalf("want exit 1 on a tampered vote, got %d:\n%s", code, stderr)
 	}
 }
 

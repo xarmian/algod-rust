@@ -1213,7 +1213,7 @@ help:
 	@echo "  make bench-compare-test                    Unit-test the bench-compare harness"
 	@echo "  make bench-compare TIERS=micro RUNS=10     Paired Go/Rust micro-benchmarks (benchmarks/pairs.toml)"
 	@echo "  make bench-micro-equiv                     micro tier Go/Rust output-equivalence check only"
-	@echo "  make bench-compare TIERS=replay CORPUS=small|large RUNS=3  Offline ledger replay + final-state gate"
+	@echo "  make bench-compare TIERS=replay CORPUS=small|large|testnet-head RUNS=3  Offline ledger replay + final-state gate"
 	@echo ""
 	@echo "Benchmarks (fair comparison):"
 	@echo "  make bench-micro      Run Rust criterion microbenchmarks (fixture-based)"
