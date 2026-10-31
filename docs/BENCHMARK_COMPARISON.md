@@ -1429,8 +1429,9 @@ One sample per repeat (`RUNS`); the report adds the median, the confidence
 interval and the Rust/Go ratio. Go and Rust alternate who goes first in every
 repeat. `cpu_cores` / `rss_mb` come from `docker stats --no-stream` samples. Each call
 takes 1-2 s and reports the interval it spans, so only samples whose **whole
-call** lies inside the measured window are used (samples straddling the start or
-the end are dropped); a short step (the 1-second smoke step) therefore often has
+call** lies inside the measured window, the one `restload` reports for its
+measured step after the warm-up, are used (samples straddling the start or the
+end are dropped); a short step (the 1-second smoke step) therefore often has
 none and those rows are then absent. Use a duration of 5 s or more for
 resource rows.
 A zero baseline (`error_rate` 0) has no ratio. Failed requests never enter
@@ -1458,6 +1459,17 @@ simulation.
 - The ledgers are the same by construction (the replay gate), but each is the
   product of its own implementation's database layout, so cache behaviour
   differs legitimately.
+
+### Leftovers and cleanup
+
+Every container the tier starts carries the label `bench-rest=1`, and each run
+first removes containers with that label left behind by a killed run (they would
+hold the fixed REST ports, `BENCH_REST_PORT_BASE`); nothing else is touched. At
+the end the root-owned ledger files are removed with `find -delete` in a
+throw-away container of the (already local) go image: nothing is pulled during
+cleanup, and a tree that cannot be removed is named in a warning. A failing
+`docker stats` is retried with a back-off and, after 20 failures in a row, the
+resource rows are skipped with a warning instead of failing the run.
 
 ### CI
 

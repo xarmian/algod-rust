@@ -54,6 +54,11 @@ type endpointResult struct {
 	P99Ms     float64 `json:"p99_ms"`
 	MaxMs     float64 `json:"max_ms"`
 	Bytes     int64   `json:"bytes"`
+	// StartUnix and EndUnix bound the measured window (wall-clock seconds
+	// since the epoch, after the warm-up), so a caller can attribute resource
+	// samples to exactly the interval that produced the numbers.
+	StartUnix float64 `json:"start_unix"`
+	EndUnix   float64 `json:"end_unix"`
 }
 
 type output struct {
@@ -80,6 +85,8 @@ func percentile(sorted []time.Duration, p float64) time.Duration {
 	}
 	return sorted[rank-1]
 }
+
+func unixSeconds(t time.Time) float64 { return float64(t.UnixNano()) / 1e9 }
 
 func ms(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
 
@@ -216,8 +223,12 @@ func run(base, token string, rs []request, conc int, dur, warmup time.Duration) 
 		if warmup > 0 {
 			load(c, base, token, rq, conc, warmup)
 		}
+		started := time.Now()
 		lat, e, n2, nb, wall := load(c, base, token, rq, conc, dur)
-		out.Endpoints = append(out.Endpoints, summarize(rq.Name, lat, e, n2, nb, wall))
+		res := summarize(rq.Name, lat, e, n2, nb, wall)
+		res.StartUnix = unixSeconds(started)
+		res.EndUnix = unixSeconds(started.Add(wall))
+		out.Endpoints = append(out.Endpoints, res)
 	}
 	return out
 }

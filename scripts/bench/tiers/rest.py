@@ -11,9 +11,12 @@ algod-rust against identical ledger state, behind a response-equality gate
      tier's benchmarks/go-replay and `algod-rust bench replay-corpus`) into a
      data directory each, and both must reach the corpus's final state (the
      replay tier's gate), so the two ledgers are the same by construction.
-  2. Each data directory is served read-only by its own node in a Docker
+  2. Each data directory is served by its own node in a Docker
      container with identical CPU / memory / swap limits: go `algod` at the
-     pinned tag, `algod-rust node start`.
+     pinned tag, `algod-rust node start`. The mount is read-write and the
+     files world-writable (both nodes write SQLite WAL files next to the
+     ledger); nothing here changes ledger state and every run replays into a
+     fresh temporary directory (docs/BENCHMARK_COMPARISON.md, "The rest tier").
   3. The fixed request set (rest_lib.request_set: /v2/status, hot and cold
      accounts, account assets, an application, a box, a block as JSON and as
      msgpack, transaction params, a simulate) is sent to both and EVERY
@@ -137,7 +140,8 @@ def settings(env=None):
 def prepare_ledgers(corpus, cj, work):
     """Replay the corpus on both sides into data directories that are kept,
     gate on the replay tier's final-state equality, and make each directory
-    servable (config, genesis, tokens, world-writable for the container user).
+    servable READ-WRITE (config, genesis, tokens, world-writable for the
+    container user: the nodes write WAL files next to the ledger).
     Returns {side: data_dir}, {side: replay result}."""
     go_exe = replay.build_goreplay(os.path.abspath(
         os.environ.get("BENCH_GO_ALGORAND_DIR")
@@ -179,6 +183,43 @@ def make_writable(path):
         os.chmod(dirpath, 0o777)
         for f in files:
             os.chmod(os.path.join(dirpath, f), 0o666)
+
+
+# ---- leftovers ---------------------------------------------------------------
+
+def sweep_stale(docker_fn=None):
+    """Remove containers of an earlier, killed run: only those carrying this
+    tier's label (`rest_lib.LABEL`), so nothing else is ever touched. They
+    would hold the fixed REST ports. Returns the removed container ids."""
+    docker_fn = docker_fn or localnet.docker
+    p = docker_fn("ps", "-aq", "--filter", f"label={rl.LABEL}=1", check=False)
+    ids = (p.stdout or "").split()
+    if ids:
+        log(f"removing {len(ids)} container(s) left by an earlier run: {' '.join(ids)}")
+        docker_fn("rm", "-f", *ids, check=False)
+    return ids
+
+
+def purge_tree(path, image, docker_fn=None):
+    """Remove a tree the containers wrote into (root- or uid-1001-owned) with
+    `find -delete` in a throw-away container of an image that is ALREADY local
+    (never pulled here: this runs in a `finally`). No shell is needed. On any
+    failure the leaked path is named in a warning and nothing is raised.
+    Returns True when the tree is gone."""
+    docker_fn = docker_fn or localnet.docker
+    if not os.path.isdir(path):
+        return True
+    have = docker_fn("image", "inspect", image, check=False)
+    if have.returncode == 0:
+        docker_fn("run", "--rm", "-v", f"{localnet.posix(path)}:/purge", "--entrypoint", "find",
+                  image, "/purge", "-mindepth", "1", "-delete", check=False, timeout=120)
+    shutil.rmtree(path, ignore_errors=True)
+    if os.path.exists(path):
+        log(f"WARNING: could not remove {path} (root-owned files; image {image!r} "
+            f"{'present' if have.returncode == 0 else 'not present locally, so not pulled'}); "
+            "delete it by hand")
+        return False
+    return True
 
 
 # ---- nodes -------------------------------------------------------------------
@@ -295,17 +336,27 @@ def build_restload(work):
 
 
 class StatsSampler(threading.Thread):
-    """`docker stats` samples of one container while a load step runs."""
+    """`docker stats` samples of one container while a load step runs.
+    Timestamps are wall-clock (time.time), the clock restload reports its
+    measured window in. A failing or empty `docker stats` is retried after a
+    back-off; after MAX_FAILURES in a row the sampler gives up and records why
+    in `failed` (the resource rows are then absent, the run goes on)."""
 
-    def __init__(self, name):
+    MAX_FAILURES = 20
+
+    def __init__(self, name, docker_fn=None, backoff_s=0.5):
         super().__init__(daemon=True)
         self.name_, self.samples, self._stop_evt = name, [], threading.Event()
+        self.docker = docker_fn or localnet.docker
+        self.backoff_s, self.failed = backoff_s, None
 
     def run(self):
+        failures = 0
         while not self._stop_evt.is_set():
-            started = time.monotonic()
-            p = localnet.docker("stats", "--no-stream", "--format", "{{json .}}", self.name_,
-                                check=False, timeout=30)
+            started = time.time()
+            p = self.docker("stats", "--no-stream", "--format", "{{json .}}", self.name_,
+                            check=False, timeout=30)
+            got = 0
             for line in (p.stdout or "").splitlines():
                 try:
                     s = ll.parse_stats_line(line)
@@ -313,12 +364,31 @@ class StatsSampler(threading.Thread):
                     continue
                 # `docker stats --no-stream` describes the interval its own call
                 # spans, so a sample carries the start and the end of the call.
-                self.samples.append({"start": started, "t": time.monotonic(),
+                self.samples.append({"start": started, "t": time.time(),
                                      "node": self.name_, **s})
+                got += 1
+            if p.returncode == 0 and got:
+                failures = 0
+                continue
+            failures += 1
+            if failures >= self.MAX_FAILURES:
+                self.failed = (f"`docker stats {self.name_}` failed {failures} times in a row "
+                               f"(exit {p.returncode}: {(p.stderr or '').strip()[-120:]})")
+                return
+            self._stop_evt.wait(self.backoff_s)
 
     def stop(self):
         self._stop_evt.set()
         self.join(timeout=35)
+
+
+def resource_window_summary(samples, start, end):
+    """CPU / RSS of the container over the measured window [start, end]. The
+    ONLY place the window is applied: samples whose whole `docker stats` call
+    is not inside it are dropped (rest_lib.window_samples), and the summary
+    then covers what is left."""
+    kept = rl.window_samples(samples, start, end)
+    return ll.resource_summary(kept, float("-inf"), float("inf"))
 
 
 def run_load(exe, node, req, conc, cfg, work, tag):
@@ -334,21 +404,20 @@ def run_load(exe, node, req, conc, cfg, work, tag):
            "-out", out]
     sampler = StatsSampler(node.name)
     sampler.start()
-    t_start = time.monotonic()
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
                            errors="replace")
     finally:
-        t_end = time.monotonic()
         sampler.stop()
     if p.returncode != 0:
         raise TierError(f"restload exited {p.returncode}: {p.stderr.strip()[-300:]}")
     with open(out, encoding="utf-8") as f:
         res = json.load(f)["endpoints"][0]
-    # The measured part is the last duration_s seconds; only samples whose whole
-    # `docker stats` call lies inside it describe it.
-    w0 = t_end - cfg["duration_s"]
-    summary = ll.resource_summary(rl.window_samples(sampler.samples, w0, t_end), w0, t_end)
+    if sampler.failed:
+        log(f"WARNING: no resource rows for {node.name}: {sampler.failed}")
+    # The window is the one restload measured (after its warm-up), not the
+    # moment the process exited.
+    summary = resource_window_summary(sampler.samples, res["start_unix"], res["end_unix"])
     return res, summary
 
 
@@ -386,6 +455,7 @@ def run_tier():
     if runs < 1:
         raise TierError("BENCH_RUNS must be >= 1")
     rl.check_allowlist(rl.KNOWN_DIFFERENCES)
+    sweep_stale()
     work = tempfile.mkdtemp(prefix="bench-rest-")
     nodes = {}
     try:
@@ -401,7 +471,10 @@ def run_tier():
         restload = build_restload(work)
         for i, side in enumerate(("go", "rust")):
             nodes[side] = Node(side, cfg[f"{side}_image"], dirs[side], cfg["port_base"] + i, cfg)
-        assert rl.limits_of(nodes["go"].args)["cpus"] == rl.limits_of(nodes["rust"].args)["cpus"]
+        try:
+            rl.require_same_limits(nodes["go"].args, nodes["rust"].args)
+        except ValueError as e:
+            raise TierError(str(e)) from None
         for n in nodes.values():
             n.start()
         for n in nodes.values():
@@ -467,13 +540,12 @@ def run_tier():
                 n.stop()
             except Exception:  # noqa: BLE001 - cleanup must not mask the real error
                 pass
+        # `find` of the go image removes the root-owned files; that image is
+        # local whenever a node ever ran (nothing is pulled here).
         for side in ("go", "rust"):
-            localnet.purge(os.path.join(work, f"{side}-serve"), cfg_image(cfg, side))
-        shutil.rmtree(work, ignore_errors=True)
-
-
-def cfg_image(cfg, side):
-    return cfg.get(f"{side}_image") or "alpine"
+            purge_tree(os.path.join(work, f"{side}-serve"), cfg["go_image"])
+        if not purge_tree(work, cfg["go_image"]):
+            log(f"WARNING: leaked work directory {work}")
 
 
 def ratio_gate(rep, expected=None):

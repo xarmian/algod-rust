@@ -81,6 +81,22 @@ func TestRunSendsTokenBodyAndCountsStatuses(t *testing.T) {
 	}
 }
 
+func TestRunReportsTheMeasuredWindow(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+	rs := []request{{Name: "w", Method: "GET", Path: "/"}}
+	before := unixSeconds(time.Now())
+	out := run(srv.URL, "t", rs, 1, 100*time.Millisecond, 100*time.Millisecond)
+	after := unixSeconds(time.Now())
+	e := out.Endpoints[0]
+	// the warm-up precedes the window; the window is at least the duration long
+	if e.StartUnix < before+0.09 || e.EndUnix > after || e.EndUnix-e.StartUnix < 0.1 {
+		t.Fatalf("window [%v, %v] not inside [%v, %v] after a 0.1 s warm-up", e.StartUnix, e.EndUnix, before, after)
+	}
+}
+
 func TestSummarizeUsesSuccessfulRequestsOnly(t *testing.T) {
 	// 4 successes of 10..40 ms, 6 failures: rps counts 4, percentiles use 4.
 	lat := []time.Duration{40 * time.Millisecond, 10 * time.Millisecond, 30 * time.Millisecond, 20 * time.Millisecond}

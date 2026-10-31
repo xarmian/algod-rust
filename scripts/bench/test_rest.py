@@ -344,10 +344,81 @@ class MsgpackDecodeTest(unittest.TestCase):
         self.assertEqual(rl.msgpack_decode(b"\xd0\x80"), -128)
         self.assertEqual(rl.msgpack_decode(b"\xcb" + bytes.fromhex("3ff8000000000000")), 1.5)
 
-    def test_truncated_trailing_and_ext_are_errors(self):
-        for bad in (b"\x81\xa1", b"\x01\x02", b"\xd4\x01\x00", b"", b"\xc1"):
+    def test_truncated_trailing_and_unknown_are_errors(self):
+        for bad in (b"\x81\xa1", b"\x01\x02", b"", b"\xc1", b"\xd4\x01"):
             with self.assertRaises(ValueError):
                 rl.msgpack_decode(bad)
+
+    def test_ext_and_timestamp_values_decode_to_tagged_tuples(self):
+        self.assertEqual(rl.msgpack_decode(b"\xd4\x05\x07"), ("ext", 5, b"\x07"))
+        self.assertEqual(rl.msgpack_decode(b"\xc7\x03\x09abc"), ("ext", 9, b"abc"))
+        self.assertEqual(rl.msgpack_decode(b"\xd6\xff" + (1000).to_bytes(4, "big")),
+                         ("timestamp", 1000, 0))
+        v64 = (7 << 34) | 123
+        self.assertEqual(rl.msgpack_decode(b"\xd7\xff" + v64.to_bytes(8, "big")),
+                         ("timestamp", 123, 7))
+        v96 = (5).to_bytes(4, "big") + (-2).to_bytes(8, "big", signed=True)
+        self.assertEqual(rl.msgpack_decode(b"\xc7\x0c\xff" + v96), ("timestamp", -2, 5))
+        with self.assertRaises(ValueError):
+            rl.msgpack_decode(b"\xd5\xff\x00\x00")  # a 2-byte timestamp does not exist
+
+    def test_ext_values_compare_structurally(self):
+        req = {"name": "blocks_msgpack", "method": "GET", "path": "/b", "kind": "msgpack"}
+        mp = "application/msgpack"
+        a = resp(b"\x81\xa1t\xd6\xff\x00\x00\x03\xe8", ctype=mp)
+        b = resp(b"\x81\xa1t\xd6\xff\x00\x00\x03\xe9", ctype=mp)
+        self.assertEqual(rl.compare(req, a, a), [])
+        diffs = rl.compare(req, a, b)
+        self.assertEqual(len(diffs), 1)
+        self.assertIn("timestamp", diffs[0])
+
+    def test_a_decode_failure_reports_the_readers_reason(self):
+        req = {"name": "blocks_msgpack", "method": "GET", "path": "/b", "kind": "msgpack"}
+        mp = "application/msgpack"
+        good = resp(b"\x81\xa1a\x01", ctype=mp)
+        bad = resp(b"\x81\xa1a\xc1", ctype=mp)
+        diffs = rl.compare(req, good, bad)
+        self.assertEqual(len(diffs), 1)
+        self.assertIn("rust body is not valid msgpack", diffs[0])
+        self.assertIn("unsupported msgpack type 0xc1", diffs[0])
+        self.assertNotIn("go body is not valid", diffs[0])
+        # both sides broken in different ways: both reasons
+        trunc = resp(b"\x81\xa1", ctype=mp)
+        both = rl.compare(req, trunc, bad)[0]
+        self.assertIn("go body is not valid msgpack: truncated msgpack", both)
+        self.assertIn("rust body is not valid msgpack: unsupported msgpack type", both)
+        # identical undecodable bytes are not a difference
+        self.assertEqual(rl.compare(req, bad, bad), [])
+        # JSON: the parser's message is reported too
+        jreq = {"name": "x", "method": "GET", "path": "/x", "kind": "json"}
+        d = rl.compare(jreq, resp(b"{", ctype="application/json"),
+                       resp(b"{}", ctype="application/json"))
+        self.assertIn("go body is not valid json", d[0])
+
+    def test_large_bodies_encode_with_the_32_bit_forms(self):
+        big_bin = bytes(range(256)) * 280  # 71,680 bytes
+        enc = rl.msgpack(big_bin)
+        self.assertEqual(enc[:1], b"\xc6")
+        self.assertEqual(rl.msgpack_decode(enc), big_bin)
+        arr = list(range(70000))
+        enc = rl.msgpack(arr)
+        self.assertEqual(enc[:1], b"\xdd")
+        self.assertEqual(rl.msgpack_decode(enc), arr)
+        text = "x" * 70000
+        enc = rl.msgpack(text)
+        self.assertEqual(enc[:1], b"\xdb")
+        self.assertEqual(rl.msgpack_decode(enc), text)
+        mp = {f"k{i:05d}": i for i in range(70000)}
+        enc = rl.msgpack(mp)
+        self.assertEqual(enc[:1], b"\xdf")
+        self.assertEqual(rl.msgpack_decode(enc), mp)
+
+    def test_corruption_search_survives_large_bodies(self):
+        req = {"name": "blocks_msgpack", "method": "GET", "path": "/b", "kind": "msgpack"}
+        mp = "application/msgpack"
+        r = resp(rl.msgpack({"block": {"x": list(range(70000))}}), ctype=mp)
+        bad = rl.corrupt_response(req, r, r, [])
+        self.assertTrue(rl.gate([req], {"blocks_msgpack": r}, {"blocks_msgpack": bad}, []))
 
 
 class VolatileDocsTest(unittest.TestCase):
@@ -479,9 +550,39 @@ class ContainerShapeTest(unittest.TestCase):
     def test_both_sides_get_the_same_limits_ports_and_mounts(self):
         go, rust = self.args("go"), self.args("rust")
         self.assertEqual(rl.limits_of(go), rl.limits_of(rust))
-        self.assertEqual(rl.limits_of(go), {"cpus": "2.0", "memory": "3g",
-                                            "memory-swap": "3g", "publish": "127.0.0.1:4300:8080",
-                                            "mount": "/tmp/d:/data"})
+        self.assertEqual(rl.limits_of(go), {
+            "cpus": "2.0", "memory": "3g", "memory-swap": "3g", "publish-bind": "127.0.0.1",
+            "publish-container-port": "8080", "mount-target": "/data",
+            "label": "bench-rest=1"})
+        rl.require_same_limits(go, rust)  # does not raise
+
+    def test_the_host_side_of_port_and_mount_may_differ(self):
+        a = rl.container_args("go", name="a", image="i", data_dir="/x", port=4400, cpus=2, mem="3g")
+        b = rl.container_args("rust", name="b", image="j", data_dir="/y", port=4401, cpus=2,
+                              mem="3g")
+        rl.require_same_limits(a, b)
+
+    def test_every_limit_mismatch_raises_and_is_named(self):
+        base = dict(name="n", image="i", data_dir="/d", port=1, cpus=2, mem="3g")
+        ref = rl.container_args("go", **base)
+        for field, other in (("cpus", dict(base, cpus=4)), ("memory", dict(base, mem="4g"))):
+            with self.assertRaises(ValueError, msg=field) as cm:
+                rl.require_same_limits(ref, rl.container_args("rust", **other))
+            self.assertIn(field, str(cm.exception))
+        swap = rl.container_args("rust", **base)
+        swap[swap.index("--memory-swap") + 1] = "9g"
+        with self.assertRaises(ValueError) as cm:
+            rl.require_same_limits(ref, swap)
+        self.assertIn("memory-swap", str(cm.exception))
+        port = rl.container_args("rust", **base)
+        port[port.index("-p") + 1] = "0.0.0.0:1:9999"
+        with self.assertRaises(ValueError) as cm:
+            rl.require_same_limits(ref, port)
+        self.assertIn("publish", str(cm.exception))
+
+    def test_containers_carry_the_sweep_label(self):
+        a = self.args("go")
+        self.assertEqual(a[a.index("--label") + 1], "bench-rest=1")
 
     def test_the_command_differs_only_by_implementation(self):
         self.assertIn("algod", self.args("go"))
@@ -502,7 +603,7 @@ class RowsTest(unittest.TestCase):
     def endpoints(self, rps=100.0):
         return {"name": "status", "requests": 500, "errors": 0, "non_2xx": 0, "duration_s": 5.0,
                 "rps": rps, "p50_ms": 1.0, "p95_ms": 2.0, "p99_ms": 3.0, "max_ms": 4.0,
-                "bytes": 10}
+                "bytes": 10, "ok": 500, "start_unix": 100.0, "end_unix": 105.0}
 
     def test_rows_validate_against_the_result_schema(self):
         runs = [{"go": {"status": self.endpoints(100)}, "rust": {"status": self.endpoints(120)}},
@@ -526,13 +627,17 @@ class RowsTest(unittest.TestCase):
         e = self.endpoints()
         e["errors"], e["non_2xx"], e["ok"] = 5, 5, 490
         self.assertAlmostEqual(rl.error_rate(e), 0.02)
-        e["requests"] = 0
-        self.assertEqual(rl.error_rate(e), 1.0)
 
-    def test_error_rate_without_ok_falls_back_to_the_failure_counts(self):
+    def test_no_completed_requests_is_missing_data_not_a_100_percent_error_rate(self):
         e = self.endpoints()
-        e["errors"], e["non_2xx"] = 5, 5
-        self.assertAlmostEqual(rl.error_rate(e), 0.02)
+        e.update(requests=0, ok=0)
+        with self.assertRaises(ValueError) as cm:
+            rl.error_rate(e)
+        self.assertIn("no completed requests in the step", str(cm.exception))
+        self.assertIn("duration too short", str(cm.exception))
+        msg = rl.check_error_rate(e, "go", "status")
+        self.assertIn("no completed requests in the step", msg)
+        self.assertNotIn("100", msg)
 
     def test_a_node_above_the_error_threshold_is_flagged(self):
         e = self.endpoints()
@@ -544,7 +649,7 @@ class RowsTest(unittest.TestCase):
         self.assertIn("10.0%", msg)
         self.assertIsNone(rl.check_error_rate(e, "rust", "status", 0.2))
         e.update(ok=0, non_2xx=500)
-        self.assertTrue(rl.check_error_rate(e, "rust", "status"))
+        self.assertIn("100.0%", rl.check_error_rate(e, "rust", "status"))
 
 
 class SenderAndSimulationTest(unittest.TestCase):
@@ -578,6 +683,184 @@ class SenderAndSimulationTest(unittest.TestCase):
         pe = {"txn-results": [{"txn-result": {"pool-error": "tx rejected"}}]}
         self.assertTrue(any("pool-error" in p for p in rl.check_simulation(self.sim(pe))))
         self.assertTrue(rl.check_simulation(self.sim({"txn-results": []})))
+
+
+class SweepAndPurgeTest(unittest.TestCase):
+    class P:
+        def __init__(self, rc=0, out=""):
+            self.returncode, self.stdout, self.stderr = rc, out, ""
+
+    def test_sweep_removes_only_labelled_containers(self):
+        calls = []
+
+        def fake(*args, **kw):
+            calls.append(args)
+            return self.P(0, "abc123\ndef456\n") if args[0] == "ps" else self.P()
+
+        got = tier.sweep_stale(fake)
+        self.assertEqual(got, ["abc123", "def456"])
+        self.assertEqual(calls[0], ("ps", "-aq", "--filter", "label=bench-rest=1"))
+        self.assertEqual(calls[1], ("rm", "-f", "abc123", "def456"))
+
+    def test_sweep_with_nothing_left_removes_nothing(self):
+        calls = []
+
+        def fake(*args, **kw):
+            calls.append(args[0])
+            return self.P(0, "")
+
+        self.assertEqual(tier.sweep_stale(fake), [])
+        self.assertEqual(calls, ["ps"])
+
+    def test_purge_uses_find_in_a_local_image_and_never_pulls(self):
+        import tempfile
+        calls = []
+
+        def fake(*args, **kw):
+            calls.append(args)
+            return self.P(0)
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "tree")
+            os.makedirs(path)
+            self.assertTrue(tier.purge_tree(path, "img:1", fake))
+            self.assertFalse(os.path.exists(path))
+        self.assertEqual(calls[0][:2], ("image", "inspect"))
+        run = calls[1]
+        self.assertEqual(run[0], "run")
+        self.assertIn("find", run)
+        self.assertIn("-delete", run)
+        self.assertNotIn("sh", run)
+        self.assertNotIn("pull", [c[0] for c in calls])
+
+    def test_purge_with_a_missing_image_does_not_run_or_pull(self):
+        import tempfile
+        calls = []
+
+        def fake(*args, **kw):
+            calls.append(args)
+            return self.P(1)  # image inspect fails: the image is not local
+
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(tier.purge_tree(d, "gone:1", fake))  # plain rmtree works
+        self.assertEqual([c[0] for c in calls], ["image"])
+
+    def test_a_tree_that_cannot_be_removed_is_named_in_a_warning(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        orig = tier.shutil.rmtree
+        tier.shutil.rmtree = lambda *a, **k: None  # simulate root-owned leftovers
+        buf = io.StringIO()
+        try:
+            with tempfile.TemporaryDirectory() as d, redirect_stdout(buf):
+                self.assertFalse(tier.purge_tree(d, "img:1", lambda *a, **k: self.P(1)))
+                self.assertIn(d, buf.getvalue())
+        finally:
+            tier.shutil.rmtree = orig
+        self.assertIn("WARNING", buf.getvalue())
+
+
+class SamplerTest(unittest.TestCase):
+    class P:
+        def __init__(self, rc, out="", err=""):
+            self.returncode, self.stdout, self.stderr = rc, out, err
+
+    def test_a_failing_docker_stats_backs_off_and_gives_up(self):
+        calls = []
+
+        def fake(*args, **kw):
+            calls.append(args)
+            return self.P(1, "", "no such container")
+
+        sm = tier.StatsSampler("c", docker_fn=fake, backoff_s=0.0)
+        sm.MAX_FAILURES = 5
+        sm.run()  # synchronously: it must return, not spin
+        self.assertEqual(len(calls), 5)
+        self.assertIn("failed 5 times in a row", sm.failed)
+        self.assertIn("no such container", sm.failed)
+        self.assertEqual(sm.samples, [])
+
+    def test_an_empty_stdout_counts_as_a_failure_and_a_good_sample_resets_the_count(self):
+        good = ('{"Name":"c","CPUPerc":"10.00%","MemUsage":"5MiB / 3GiB","BlockIO":"0B / 0B"}')
+        seq = [self.P(0, ""), self.P(0, ""), self.P(0, good), self.P(0, "")]
+        sm = tier.StatsSampler("c", docker_fn=None, backoff_s=0.0)
+        sm.MAX_FAILURES = 3
+
+        def fake(*args, **kw):
+            if not seq:
+                sm._stop_evt.set()
+                return self.P(0, good)
+            return seq.pop(0)
+
+        sm.docker = fake
+        sm.run()
+        self.assertIsNone(sm.failed)
+        self.assertGreaterEqual(len(sm.samples), 1)
+        self.assertLessEqual(sm.samples[0]["start"], sm.samples[0]["t"])
+
+
+class ResourceWindowTest(unittest.TestCase):
+    def sample(self, start, end, cpu=100.0, mem=10 * 1024 * 1024):
+        return {"start": start, "t": end, "node": "c", "cpu_pct": cpu, "mem_bytes": mem,
+                "blk_read": 0, "blk_write": 0}
+
+    def test_the_window_is_applied_once_to_whole_calls_only(self):
+        samples = [self.sample(99.0, 101.0, cpu=900.0),    # straddles the start
+                   self.sample(101.0, 103.0, cpu=100.0),
+                   self.sample(103.0, 104.9, cpu=200.0),
+                   self.sample(104.0, 106.0, cpu=900.0)]   # straddles the end
+        summ = tier.resource_window_summary(samples, 100.0, 105.0)
+        self.assertAlmostEqual(summ["cpu_cores"], 1.5)  # mean of 100% and 200%
+        self.assertEqual(summ["nodes_sampled"], 1)
+
+    def test_no_whole_sample_means_no_summary(self):
+        self.assertEqual(tier.resource_window_summary([self.sample(99.0, 101.0)], 100.0, 105.0),
+                         {})
+
+    def test_the_window_comes_from_restload_not_from_process_exit(self):
+        # restload's reported window, e.g. a 5 s measured step after a 1 s warm-up
+        res = {"start_unix": 1000.0, "end_unix": 1005.0}
+        late = self.sample(1005.5, 1007.0, cpu=900.0)  # taken after the step ended
+        inside = self.sample(1001.0, 1003.0, cpu=100.0)
+        summ = tier.resource_window_summary([late, inside], res["start_unix"], res["end_unix"])
+        self.assertAlmostEqual(summ["cpu_cores"], 1.0)
+
+
+class WorkflowPathsTest(unittest.TestCase):
+    NEEDED = (
+        "scripts/bench/corpus/**", "scripts/bench/bench_schema.py", "scripts/bench/schema/**",
+        "scripts/bench/test_run.py", "scripts/bench/tiers/micro*", "scripts/bench/tiers/selftest.py",
+        "scripts/bench/micro_equiv.py", "scripts/bench/fingerprint.py",
+        "scripts/bench/cargo_artifact.py", "scripts/bench/rest_lib.py",
+        "scripts/bench/tiers/rest.py", "scripts/bench/tiers/replay.py",
+        "scripts/bench/tiers/localnet.py", "scripts/bench/localnet_lib.py",
+        "benchmarks/go-restload/**", "benchmarks/go-replay/**", "docker/Dockerfile", "Makefile",
+        "Cargo.lock", ".github/workflows/bench-rest.yml")
+
+    def test_every_file_the_tier_runs_is_in_both_path_filters(self):
+        with open(os.path.join(REPO, ".github", "workflows", "bench-rest.yml"),
+                  encoding="utf-8") as f:
+            text = f.read()
+        pr = text.index("  pull_request:")
+        push = text.index("  push:")
+        wd = text.index("  workflow_dispatch:")
+        for name, block in (("pull_request", text[pr:push]), ("push", text[push:wd])):
+            for path in self.NEEDED:
+                self.assertIn(f'"{path}"', block, f"{name} filter lacks {path}")
+
+    def test_every_script_the_tier_imports_is_listed(self):
+        import re
+        with open(os.path.join(HERE, "tiers", "rest.py"), encoding="utf-8") as f:
+            src = f.read()
+        mods = set(re.findall(r"^import (\w+)", src, re.M))
+        listed = " ".join(self.NEEDED)
+        for m in ("localnet", "localnet_lib", "replay", "rest_lib", "bench_schema",
+                  "corpus_tool"):
+            self.assertIn(m, mods)
+        # corpus_tool lives in corpus/, bench_schema and localnet_lib at the top
+        self.assertIn("scripts/bench/corpus/**", listed)
+        self.assertIn("scripts/bench/bench_schema.py", listed)
 
 
 class WindowTest(unittest.TestCase):

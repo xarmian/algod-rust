@@ -251,16 +251,16 @@ def json_diff(go, rust, path=""):
 
 
 def _decode_body(req, body):
-    """The decoded body of a json / msgpack request, or None when it is not
-    decodable (the comparison then falls back to the raw bytes)."""
+    """(value, None) for a decodable json / msgpack body, else (None, reason)
+    with the decoder's own error message."""
     try:
         if req.get("kind") == "json":
-            return json.loads(body)
+            return json.loads(body), None
         if req.get("kind") == "msgpack":
-            return msgpack_decode(body)
-    except (ValueError, UnicodeDecodeError):
-        pass
-    return None
+            return msgpack_decode(body), None
+    except (ValueError, UnicodeDecodeError) as e:
+        return None, str(e) or type(e).__name__
+    return None, f"request kind {req.get('kind')!r} has no decoder"
 
 
 def _diffs(req, go, rust):
@@ -278,8 +278,8 @@ def _diffs(req, go, rust):
                          f"content-type: go {go['content_type']!r} != rust "
                          f"{rust['content_type']!r}"))
     gb, rb = go["body"], rust["body"]
-    gj, rj = _decode_body(req, gb), _decode_body(req, rb)
-    if gj is not None and rj is not None:
+    (gj, gerr), (rj, rerr) = _decode_body(req, gb), _decode_body(req, rb)
+    if gerr is None and rerr is None:
         vol = list(VOLATILE.get(req["name"], {})) if req.get("kind") == "json" else []
         found = json_diff(drop_paths(gj, vol), drop_paths(rj, vol))
         if not found and req.get("kind") == "msgpack" and gb != rb:
@@ -291,8 +291,10 @@ def _diffs(req, go, rust):
         return out + found
     if gb != rb:
         i = next((n for n, (a, b) in enumerate(zip(gb, rb)) if a != b), min(len(gb), len(rb)))
+        why = "".join(f"; {side} body is not valid {req.get('kind')}: {err}"
+                      for side, err in (("go", gerr), ("rust", rerr)) if err)
         out.append(_diff("<body>", "body", f"body differs at byte {i} (go {len(gb)} bytes, "
-                                           f"rust {len(rb)} bytes)"))
+                                           f"rust {len(rb)} bytes){why}"))
     return out
 
 
@@ -359,8 +361,8 @@ def corrupt_response(req, go, rust, allowlist=(), corpus=None):
 
 
 def _mutations(req, body):
-    doc = _decode_body(req, body)
-    if doc is not None:
+    doc, err = _decode_body(req, body)
+    if err is None:
         for path in _leaf_paths(doc):
             cand = copy.deepcopy(doc)
             _alter(cand, path)
@@ -396,6 +398,13 @@ def _alter(node, path):
 
 # ---- msgpack and addresses (for the simulate request) ------------------------
 
+def _u32(n):
+    """A 4-byte length; ValueError (not OverflowError) beyond msgpack's limit."""
+    if n >= 1 << 32:
+        raise ValueError("msgpack length exceeds 32 bits")
+    return n.to_bytes(4, "big")
+
+
 def msgpack(v):
     """Minimal canonical msgpack encoder: maps with sorted keys, unsigned
     integers, str, bin, arrays, bool, nil. Enough for a SimulateRequest."""
@@ -420,17 +429,23 @@ def msgpack(v):
             return bytes([0xa0 | len(b)]) + b
         if len(b) < 256:
             return b"\xd9" + bytes([len(b)]) + b
-        return b"\xda" + len(b).to_bytes(2, "big") + b
+        if len(b) < 65536:
+            return b"\xda" + len(b).to_bytes(2, "big") + b
+        return b"\xdb" + _u32(len(b)) + b
     if isinstance(v, (bytes, bytearray)):
         n = len(v)
-        return (b"\xc4" + bytes([n]) if n < 256 else b"\xc5" + n.to_bytes(2, "big")) + bytes(v)
+        head = (b"\xc4" + bytes([n]) if n < 256 else b"\xc5" + n.to_bytes(2, "big")
+                if n < 65536 else b"\xc6" + _u32(n))
+        return head + bytes(v)
     if isinstance(v, (list, tuple)):
         n = len(v)
-        head = bytes([0x90 | n]) if n < 16 else b"\xdc" + n.to_bytes(2, "big")
+        head = (bytes([0x90 | n]) if n < 16 else b"\xdc" + n.to_bytes(2, "big") if n < 65536
+                else b"\xdd" + _u32(n))
         return head + b"".join(msgpack(x) for x in v)
     if isinstance(v, dict):
         n = len(v)
-        head = bytes([0x80 | n]) if n < 16 else b"\xde" + n.to_bytes(2, "big")
+        head = (bytes([0x80 | n]) if n < 16 else b"\xde" + n.to_bytes(2, "big") if n < 65536
+                else b"\xdf" + _u32(n))
         return head + b"".join(msgpack(k) + msgpack(v[k]) for k in sorted(v))
     raise ValueError(f"cannot encode {type(v).__name__}")
 
@@ -493,13 +508,35 @@ class _MpReader:
             return self.array(self.uint(2 if t == 0xdc else 4))
         if t in (0xde, 0xdf):
             return self.map(self.uint(2 if t == 0xde else 4))
+        if t in (0xd4, 0xd5, 0xd6, 0xd7, 0xd8):
+            return self.ext(1 << (t - 0xd4))
+        if t in (0xc7, 0xc8, 0xc9):
+            return self.ext(self.uint(1 << (t - 0xc7)))
         raise ValueError(f"unsupported msgpack type 0x{t:02x}")
+
+    def ext(self, n):
+        """An ext value: `("timestamp", seconds, nanoseconds)` for type -1
+        (the msgpack timestamp, 4/8/12 bytes), else `("ext", type, data)`."""
+        kind = int.from_bytes(self.take(1), "big", signed=True)
+        data = self.take(n)
+        if kind == -1:
+            if n == 4:
+                return ("timestamp", int.from_bytes(data, "big"), 0)
+            if n == 8:
+                v = int.from_bytes(data, "big")
+                return ("timestamp", v & ((1 << 34) - 1), v >> 34)
+            if n == 12:
+                return ("timestamp", int.from_bytes(data[4:], "big", signed=True),
+                        int.from_bytes(data[:4], "big"))
+            raise ValueError(f"msgpack timestamp with {n} data bytes")
+        return ("ext", kind, data)
 
 
 def msgpack_decode(data):
     """Decode one msgpack value that spans all of `data` (maps, arrays, str,
-    bin, bool, nil, integers, floats; no ext types). ValueError on truncated
-    or trailing input, ext types, or an unhashable map key."""
+    bin, bool, nil, integers, floats, ext values as tagged tuples). ValueError
+    on truncated or trailing input, an unknown type byte, or an unhashable map
+    key; the message is the reason the gate reports."""
     r = _MpReader(data)
     v = r.value()
     if r.i != len(r.b):
@@ -594,6 +631,11 @@ def loadgen_requests(requests):
 
 # ---- containers --------------------------------------------------------------
 
+# Every container this tier starts carries this label, so a run killed before
+# its cleanup can be swept (and nothing else is ever touched).
+LABEL = "bench-rest"
+
+
 def container_args(impl, *, name, image, data_dir, port, cpus, mem):
     """`docker run` arguments (after `docker`) of one node. Both
     implementations get the same CPU / memory / swap limits, the same
@@ -607,30 +649,48 @@ def container_args(impl, *, name, image, data_dir, port, cpus, mem):
         cmd = ["node", "start", "-d", "/data", "-l", f"0.0.0.0:{REST_PORT}"]
     else:
         raise ValueError(f"impl must be go or rust, not {impl!r}")
-    return ["run", "-d", "--name", name, "--cpus", str(float(cpus)), "--memory", mem,
-            "--memory-swap", mem, "-p", f"127.0.0.1:{port}:{REST_PORT}",
+    return ["run", "-d", "--name", name, "--label", f"{LABEL}=1", "--cpus", str(float(cpus)),
+            "--memory", mem, "--memory-swap", mem, "-p", f"127.0.0.1:{port}:{REST_PORT}",
             "-v", f"{data_dir}:/data", *entry, image, *cmd]
 
 
 def limits_of(args):
     """What two containers must share to be comparable, read back from the
-    `docker run` arguments."""
+    `docker run` arguments: every resource option and the shape of the
+    mounts / ports / labels. The host side of the port and of the mount (and
+    the name, image and command) legitimately differ and are not in here."""
     def val(flag):
         return args[args.index(flag) + 1]
+    bind, _, container_port = val("-p").rpartition(":")
     return {"cpus": val("--cpus"), "memory": val("--memory"), "memory-swap": val("--memory-swap"),
-            "publish": val("-p"), "mount": val("-v")}
+            "publish-bind": bind.split(":")[0], "publish-container-port": container_port,
+            "mount-target": val("-v").rpartition(":")[2], "label": val("--label")}
+
+
+def require_same_limits(go_args, rust_args):
+    """ValueError naming every limit on which the two `docker run` argument
+    lists differ; None when the two nodes run under the same limits."""
+    g, r = limits_of(go_args), limits_of(rust_args)
+    bad = [f"{k}: go {g[k]!r} != rust {r[k]!r}" for k in g if g[k] != r[k]]
+    if bad:
+        raise ValueError("the two containers do not run under the same limits: "
+                         + "; ".join(bad))
 
 
 # ---- result rows -------------------------------------------------------------
 
+NO_DATA = ("no completed requests in the step: node too slow or duration too short "
+           "(raise BENCH_REST_DURATION)")
+
+
 def error_rate(e):
-    """Fraction of requests that failed (transport error or non-2xx), 1.0
-    when nothing was answered. restload counts `ok` (successful) requests;
-    only those enter its req/s and latency percentiles."""
+    """Fraction of attempted requests that failed (transport error or
+    non-2xx). restload counts `ok` (successful) requests; only those enter
+    its req/s and latency percentiles. ValueError when nothing was attempted:
+    that is missing data, not a 100% error rate."""
     if e["requests"] <= 0:
-        return 1.0
-    failed = e["requests"] - e["ok"] if "ok" in e else e["errors"] + e["non_2xx"]
-    return failed / e["requests"]
+        raise ValueError(NO_DATA)
+    return (e["requests"] - e["ok"]) / e["requests"]
 
 
 # A node whose requests fail more often than this is not being benchmarked,
@@ -641,6 +701,8 @@ MAX_ERROR_RATE = 0.01
 def check_error_rate(res, side, endpoint, limit=MAX_ERROR_RATE):
     """None when the error rate is within `limit`, else a message naming the
     node and the endpoint."""
+    if res["requests"] <= 0:
+        return f"{side} {endpoint}: {NO_DATA}"
     rate = error_rate(res)
     if rate <= limit:
         return None
