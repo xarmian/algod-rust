@@ -207,28 +207,24 @@ class GateTest(unittest.TestCase):
         deeper = dict(g, account_hot=resp({"l": [{"x": 1, "y": 3}, {"x": 2}]}))
         self.assertTrue(rl.gate(self.reqs(), g, deeper, [self.entry("l.*.x", "value")]))
 
-    def test_msgpack_block_cert_step_is_the_only_excused_msgpack_difference(self):
+    def test_msgpack_block_cert_must_be_byte_identical(self):
+        # #2159: a `{rnd}` certificate re-encoded with an invented step=2 is a
+        # difference nothing excuses any more.
         req = {"name": "blocks_msgpack", "method": "GET", "path": "/b", "kind": "msgpack"}
-        allow = [{"endpoint": "blocks_msgpack", "path": "cert.step", "kind": "only-rust",
-                  "rust_value": 2, "issue": 2159, "reason": "r"}]
         block = {"block": {"rnd": 7, "ts": 100, "txns": [{"txn": {"amt": 1}}]}, "cert": {"rnd": 7}}
         mp = "application/msgpack"
         go = {"blocks_msgpack": resp(rl.msgpack(block), ctype=mp)}
 
         def rust_with(mutate):
             doc = json.loads(json.dumps(block))
-            doc["cert"]["step"] = 2
             mutate(doc)
             return {"blocks_msgpack": resp(rl.msgpack(doc), ctype=mp)}
 
-        self.assertEqual(rl.gate([req], go, rust_with(lambda d: None), allow), [])
-        # a different header field, a different txn, a different cert round all fail
-        for mutate in (lambda d: d["block"].__setitem__("ts", 101),
-                       lambda d: d["block"]["txns"][0]["txn"].__setitem__("amt", 2),
-                       lambda d: d["cert"].__setitem__("rnd", 8),
-                       lambda d: d["cert"].__setitem__("step", 3)):
-            errs = rl.gate([req], go, rust_with(mutate), allow)
-            self.assertTrue(errs, mutate)
+        self.assertEqual(rl.gate([req], go, rust_with(lambda d: None), []), [])
+        for mutate in (lambda d: d["cert"].__setitem__("step", 2),
+                       lambda d: d["block"].__setitem__("ts", 101),
+                       lambda d: d["cert"].__setitem__("rnd", 8)):
+            self.assertTrue(rl.gate([req], go, rust_with(mutate), []), mutate)
 
     def test_a_stale_allowlist_entry_fails_the_gate(self):
         g = self.good()

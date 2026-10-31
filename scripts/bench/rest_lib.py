@@ -99,9 +99,6 @@ def _kd(endpoint, path, kind, issue, reason, **extra):
 
 
 KNOWN_DIFFERENCES = [
-    # the stored `{rnd}` certificate is re-encoded with step=2 (decoded structurally).
-    _kd("blocks_msgpack", "cert.step", "only-rust", 2159, "cert re-encoded with step=2",
-        rust_value=2),
     _kd("simulate", "txn-groups.0.txn-results.0.txn-result.txn.txn.gh", "value", 2160,
         "gh rendered as an integer array"),
     _kd("simulate", "txn-groups.0.txn-results.0.txn-result.sender-rewards", "only-go", 2161,

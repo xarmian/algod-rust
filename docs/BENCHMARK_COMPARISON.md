@@ -1388,7 +1388,6 @@ The number of allowlisted differences is recorded in every row's metadata
 <!-- known-differences:start -->
 | Endpoint | Path | Kind | Issue | Reason |
 |---|---|---|---|---|
-| `blocks_msgpack` | `cert.step` | only-rust | [#2159](https://github.com/xarmian/algod-rust/issues/2159) | cert re-encoded with step=2 |
 | `simulate` | `txn-groups.0.txn-results.0.txn-result.txn.txn.gh` | value | [#2160](https://github.com/xarmian/algod-rust/issues/2160) | gh rendered as an integer array |
 | `simulate` | `txn-groups.0.txn-results.0.txn-result.sender-rewards` | only-go | [#2161](https://github.com/xarmian/algod-rust/issues/2161) | sender-rewards omitted |
 <!-- known-differences:end -->

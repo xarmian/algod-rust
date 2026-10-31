@@ -31,19 +31,26 @@ use crate::bundle::{
     BundleError, EquivocationVoteAuthenticator, UnauthenticatedBundle, VoteAuthenticator,
 };
 use crate::ledger_reader::LedgerReader;
-use crate::step::{Period, CERT};
+use crate::step::{Period, Step, CERT};
 use crate::vote::ProposalValue;
 
 /// A certificate proving agreement was reached on a block.
 ///
 /// Mirrors Go's `agreement.Certificate`, which is a type alias for
-/// `unauthenticatedBundle`. A valid certificate always has step = CERT.
+/// `unauthenticatedBundle`. A valid certificate has step = CERT; the step is
+/// kept as decoded (not forced to CERT) so a certificate whose stored bytes
+/// carry no `step` key (a DevMode `{rnd}` certificate) re-encodes
+/// byte-identically, as in go (omitempty `Step`). `authenticate` rejects any
+/// step other than CERT, like go's `Certificate.Authenticate`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Certificate {
     /// The round this certificate is for.
     pub round: Round,
     /// The period within the round.
     pub period: Period,
+    /// The step of the bundle (CERT for a real certificate; zero when the
+    /// stored encoding carries no `step` key).
+    pub step: Step,
     /// The proposal value that was agreed upon.
     pub proposal: ProposalValue,
     /// The vote authenticators proving quorum was reached.
@@ -66,6 +73,7 @@ impl Default for Certificate {
         Self {
             round: Round(0),
             period: Period(0),
+            step: Step(0),
             proposal: crate::vote::BOTTOM,
             votes: Vec::new(),
             equivocation_votes: Vec::new(),
@@ -132,6 +140,7 @@ impl Certificate {
         Self {
             round: b.round,
             period: b.period,
+            step: b.step,
             proposal: b.proposal,
             votes: b.votes.clone(),
             equivocation_votes: b.equivocation_votes.clone(),
@@ -140,12 +149,12 @@ impl Certificate {
 
     /// Convert this certificate to an `UnauthenticatedBundle` for verification.
     ///
-    /// The bundle step is always CERT.
+    /// The bundle carries this certificate's own step (CERT for a real one).
     pub fn to_unauthenticated_bundle(&self) -> UnauthenticatedBundle {
         UnauthenticatedBundle {
             round: self.round,
             period: self.period,
-            step: CERT,
+            step: self.step,
             proposal: self.proposal,
             votes: self.votes.clone(),
             equivocation_votes: self.equivocation_votes.clone(),
@@ -180,6 +189,10 @@ impl Certificate {
         block_digest: Digest,
         l: &dyn LedgerReader,
     ) -> Result<(), CertificateError> {
+        // go: `if c.Step != cert { return error }`.
+        if self.step != CERT {
+            return Err(CertificateError::WrongStep);
+        }
         // Step 1: verify claims
         self.claims_to_authenticate(block_round, block_digest)?;
 
@@ -223,21 +236,13 @@ impl Certificate {
 /// its on-disk form (the `blocks.certdata` BLOB column) is therefore the
 /// same lex-sorted msgpack map this codebase already produces in
 /// [`crate::codec::encode_bundle`] for any bundle. This function adapts
-/// a `Certificate` (which lacks an explicit `step` field — Rust's
-/// representation factors the always-`CERT` step out of the struct) into
-/// an `UnauthenticatedBundle` with `step = CERT`, then delegates to that
-/// shared encoder.
+/// a `Certificate` into an `UnauthenticatedBundle` carrying the
+/// certificate's own `step`, then delegates to that shared encoder.
 ///
 /// **Devmode caveat.** Algorand's `DEV_MODE=1` localnet doesn't run real
 /// consensus, so its devnet `certdata` rows encode with `step = 0` (which
-/// omitempty then strips entirely). A devnet Certificate decoded into the
-/// Rust type loses that distinction (no step field) — re-encoding through
-/// this function will emit `step = CERT = 3`, divergent from the original
-/// devnet bytes (CERT is `Step(2)`, see `crate::step::CERT`). Byte-exact
-/// testing against devmode `certdata` therefore runs through
-/// [`crate::codec::encode_bundle`] with an explicit `step = Step(0)`;
-/// testing the `Certificate` path proper uses synthetic data with the
-/// real-network `step = CERT` semantics.
+/// omitempty then strips entirely). The `Certificate` keeps that step, so a
+/// devnet certificate re-encodes byte-identically (issue #2159).
 ///
 /// References (`v4.6.0-stable`):
 /// - `../go-algorand/agreement/bundle.go:30-41` — struct layout
@@ -322,6 +327,7 @@ mod tests {
     #[test]
     fn certificate_round_mismatch() {
         let cert = Certificate {
+            step: crate::step::CERT,
             round: Round(100),
             period: Period(0),
             proposal: ProposalValue {
@@ -345,6 +351,7 @@ mod tests {
     #[test]
     fn certificate_digest_mismatch() {
         let cert = Certificate {
+            step: crate::step::CERT,
             round: Round(100),
             period: Period(0),
             proposal: ProposalValue {
@@ -412,6 +419,7 @@ mod tests {
         };
 
         let cert = Certificate {
+            step: crate::step::CERT,
             round: Round(100),
             period: Period(0),
             proposal,
@@ -445,6 +453,7 @@ mod tests {
     #[test]
     fn certificate_empty_votes_insufficient_quorum() {
         let cert = Certificate {
+            step: crate::step::CERT,
             round: Round(100),
             period: Period(0),
             proposal: ProposalValue {
@@ -474,6 +483,7 @@ mod tests {
     #[test]
     fn certificate_claims_to_authenticate_success() {
         let cert = Certificate {
+            step: crate::step::CERT,
             round: Round(100),
             period: Period(0),
             proposal: ProposalValue {
@@ -493,6 +503,7 @@ mod tests {
     #[test]
     fn certificate_to_unauthenticated_bundle() {
         let cert = Certificate {
+            step: crate::step::CERT,
             round: Round(100),
             period: Period(0),
             proposal: ProposalValue {
@@ -533,24 +544,35 @@ mod tests {
     // ── PLAN-36 G14 (TASK-126): canonical_encode_certificate ────────────
 
     /// `canonical_encode_certificate` on a default-zero / round-zero
-    /// `Certificate` matches Go's `MarshalMsg` output for a genesis
-    /// cert — an empty fixmap (`0x80`). Verifies omitempty handling on
-    /// the round=0 boundary (rnd omitted) and that `step=CERT` is not
-    /// emitted spuriously when no other fields populate.
-    ///
-    /// Actually — `to_unauthenticated_bundle` hardcodes `step = CERT`
-    /// (which is `Step(2)` per `crate::step`), so even a default
-    /// Certificate emits `{"step": 2}`. This test pins that documented
-    /// behavior so a future change is intentional.
+    /// `Certificate` matches Go's `MarshalMsg` output for a zero
+    /// certificate: an empty fixmap (`0x80`), every field omitempty
+    /// (issue #2159: no step is invented).
     #[test]
-    fn canonical_encode_default_certificate_emits_step_cert() {
+    fn canonical_encode_default_certificate_is_empty_map() {
         let c = Certificate::default();
         let bytes = canonical_encode_certificate(&c);
-        // Expected: fixmap(1) with `step` -> CERT (= 2).
-        // 81  a4 73 74 65 70  02
-        assert_eq!(bytes, vec![0x81, 0xa4, 0x73, 0x74, 0x65, 0x70, 0x02]);
+        assert_eq!(bytes, vec![0x80]);
         // `to_canonical_bytes` is a thin convenience that should match.
         assert_eq!(bytes, c.to_canonical_bytes());
+    }
+
+    /// go's `Certificate.Authenticate` rejects `c.Step != cert` before any
+    /// other check; a step-less certificate must not authenticate.
+    #[test]
+    fn authenticate_rejects_non_cert_step() {
+        let ledger = MockLedgerReader::new();
+        for step in [Step(0), Step(1), Step(3)] {
+            let cert = Certificate {
+                round: Round(100),
+                step,
+                ..Certificate::default()
+            };
+            let result = cert.authenticate(Round(100), Digest([0xaa; 32]), &ledger);
+            assert!(
+                matches!(result, Err(CertificateError::WrongStep)),
+                "step {step:?}: {result:?}"
+            );
+        }
     }
 
     /// `canonical_encode_certificate` on a populated Certificate
@@ -563,6 +585,7 @@ mod tests {
     fn canonical_encode_certificate_matches_bundle_path() {
         use crate::vote::ProposalValue;
         let c = Certificate {
+            step: crate::step::CERT,
             round: Round(42),
             period: Period(1),
             proposal: ProposalValue {
@@ -589,6 +612,27 @@ mod tests {
         );
     }
 
+    /// Issue #2159: a certificate whose stored bytes carry no `step` key
+    /// (the DevMode `{rnd}` shape) must decode and re-encode byte-for-byte,
+    /// like go's `Certificate` (omitempty `Step`, absent decodes to 0). A real
+    /// certificate (step = cert on the wire) is unchanged.
+    #[test]
+    fn certificate_without_step_round_trips_byte_identically() {
+        // {"rnd": 2000}: 81 a3 "rnd" cd 07d0
+        let devmode = vec![0x81, 0xa3, b'r', b'n', b'd', 0xcd, 0x07, 0xd0];
+        let bundle = crate::codec::decode_bundle(&devmode).unwrap();
+        let cert = Certificate::from_bundle(&bundle);
+        assert_eq!(cert.to_canonical_bytes(), devmode);
+
+        // {"rnd": 2000, "step": 2}
+        let real = vec![
+            0x82, 0xa3, b'r', b'n', b'd', 0xcd, 0x07, 0xd0, 0xa4, b's', b't', b'e', b'p', 0x02,
+        ];
+        let bundle = crate::codec::decode_bundle(&real).unwrap();
+        let cert = Certificate::from_bundle(&bundle);
+        assert_eq!(cert.to_canonical_bytes(), real);
+    }
+
     /// Round-trip property: encode a Certificate via the canonical
     /// path, decode the bytes through `rmp_serde` (the Rust serde
     /// derive), re-encode, and assert byte-identity. Guards against
@@ -599,6 +643,7 @@ mod tests {
         let cases = [
             Certificate::default(),
             Certificate {
+                step: crate::step::CERT,
                 round: Round(100),
                 period: Period(0),
                 proposal: crate::vote::BOTTOM,
@@ -606,6 +651,7 @@ mod tests {
                 equivocation_votes: vec![],
             },
             Certificate {
+                step: crate::step::CERT,
                 round: Round(256),
                 period: Period(2),
                 proposal: ProposalValue {

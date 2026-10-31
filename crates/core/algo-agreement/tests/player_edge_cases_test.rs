@@ -387,6 +387,7 @@ fn player_regression_ensures_cert_thresh_from_old_period_8ba23942() {
         "player did not enter period 0 in new round"
     );
     let expected_cert = Certificate {
+        step: algo_agreement::CERT,
         round: r,
         period: p,
         proposal: pv,
@@ -437,6 +438,7 @@ fn player_rejects_cert_threshold_from_previous_round() {
     assert_eq!(machine.player().period, p, "player changed periods... bad!");
 
     let bad_cert = Certificate {
+        step: algo_agreement::CERT,
         round: Round(r.0 - 1),
         period: algo_agreement::Period(p.0 + 1),
         proposal: pv,
@@ -475,6 +477,7 @@ fn player_cert_threshold_does_not_block() {
     assert_eq!(machine.player().period, p, "player changed periods... bad!");
 
     let cert = Certificate {
+        step: algo_agreement::CERT,
         round: r,
         period: p,
         proposal: pv,
@@ -526,6 +529,7 @@ fn player_cert_threshold_does_not_block_future_period() {
     );
 
     let cert = Certificate {
+        step: algo_agreement::CERT,
         round: r,
         period: algo_agreement::Period(p.0 + 1),
         proposal: pv,

@@ -739,6 +739,7 @@ mod tests {
 
     fn make_certificate(round: Round) -> Certificate {
         Certificate {
+            step: crate::step::CERT,
             round,
             period: Period(0),
             proposal: ProposalValue {
