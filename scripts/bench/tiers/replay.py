@@ -281,7 +281,9 @@ def rust_binary():
 
 # ---- one replay ---------------------------------------------------------------
 
-def run_side(side, exe, corpus, work, tag, rounds):
+def run_side(side, exe, corpus, work, tag, rounds, keep=False):
+    """One replay into <work>/<side>-<tag>. The data directory is removed
+    afterwards unless `keep` (the `rest` tier serves it, issue #2107)."""
     data = os.path.join(work, f"{side}-{tag}")
     out = data + ".json"
     if side == "go":
@@ -305,7 +307,9 @@ def run_side(side, exe, corpus, work, tag, rounds):
         raise TierError(f"{side} replay exited {p.returncode}")
     with open(out, encoding="utf-8") as f:
         res = json.load(f)
-    shutil.rmtree(data, ignore_errors=True)
+    if not keep:
+        shutil.rmtree(data, ignore_errors=True)
+    res["_data_dir"] = data
     res["_cmd"] = " ".join(cmd)
     return res
 

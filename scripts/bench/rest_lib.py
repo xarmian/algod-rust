@@ -1,0 +1,504 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+"""Pure logic of the bench-compare `rest` tier (issue #2107, epic #2101).
+
+Everything here is deterministic and free of Docker, network and clock so it
+runs in the default unit tests (test_rest.py); the tier script
+(tiers/rest.py) does the I/O and calls into this module:
+
+  * the fixed request set both nodes are asked (request_set), the simulate
+    request body (a hand-rolled msgpack encoder: the repo adds no dependency
+    for forty lines) and the deterministic choice of the hot / cold account;
+  * the response-equality gate: per-endpoint normalisation of fields that
+    legitimately differ between two nodes serving the same ledger (VOLATILE,
+    each with its reason, each documented in docs/BENCHMARK_COMPARISON.md) and
+    the issue-linked allowlist of real differences found so far
+    (KNOWN_DIFFERENCES: every entry names the issue that tracks it, and a
+    stale entry fails the gate so the list cannot rot);
+  * the container shape that keeps both nodes under identical limits;
+  * the result rows (schema bench-result/v1).
+"""
+import base64
+import copy
+import hashlib
+import json
+import urllib.parse
+
+TIER = "rest"
+REST_PORT = 8080
+MIB = 1024 * 1024
+
+# Profiles of the tier (BENCH_REST_PROFILE). `smoke` is the CI profile: it
+# proves the machinery (both nodes up on one ledger, the gate, one load step
+# per endpoint) and its numbers mean nothing.
+PROFILES = {
+    "smoke": {"duration_s": 1.0, "warmup_s": 0.0, "concurrency": [4]},
+    "full": {"duration_s": 5.0, "warmup_s": 1.0, "concurrency": [1, 16, 64]},
+}
+
+
+def parse_concurrency(text):
+    """`1,16,64` -> [1, 16, 64]. ValueError on an empty, non-positive,
+    non-numeric or repeated level."""
+    out = []
+    for part in (text or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            n = int(part)
+        except ValueError:
+            raise ValueError(f"concurrency level {part!r} is not an integer") from None
+        if n < 1 or n in out:
+            raise ValueError(f"concurrency levels must be distinct and >= 1, got {text!r}")
+        out.append(n)
+    if not out:
+        raise ValueError("no concurrency levels")
+    return out
+
+
+# ---- the volatile-field normalisation and the allowlist ------------------------
+
+# Fields that legitimately differ between two nodes that serve the SAME ledger:
+# they depend on wall-clock time or on how long a node has been up, not on
+# ledger state. endpoint name -> {dotted path: reason}. `*` matches any list
+# index or map key. Every path is listed in docs/BENCHMARK_COMPARISON.md (a
+# unit test enforces it), so an exclusion cannot be added silently.
+VOLATILE = {
+    "status": {
+        "time-since-last-round": "nanoseconds since the node last advanced a round; wall-clock "
+                                 "dependent, so two nodes queried at different instants differ",
+        "catchup-time": "nanoseconds the node has spent catching up; a wall-clock duration of "
+                        "the node's own history, not ledger state",
+    },
+}
+
+# Real response differences found between the two nodes, each tracked by an
+# issue. NOT volatile fields: these are bugs (or accepted divergences), kept
+# out of the gate only so the throughput comparison can run while the issue
+# is open. Entry: {"endpoint", "path", "issue", "reason"[, "corpus"]}. A stale entry (one
+# that no longer matches any difference) fails the gate: remove it when the
+# issue is fixed.
+def _kd(endpoint, path, issue, reason):
+    return {"endpoint": endpoint, "path": path, "issue": issue, "reason": reason,
+            "corpus": "small"}
+
+
+KNOWN_DIFFERENCES = [
+    # GET /v2/accounts/{hot}: the read-pool path drops the resource lists.
+    _kd("account_hot", "assets", 2155, "resources missing on the read-pool lookup"),
+    _kd("account_hot", "created-apps", 2155, "resources missing on the read-pool lookup"),
+    _kd("account_hot", "created-assets", 2155, "resources missing on the read-pool lookup"),
+    # go emits empty arrays / zero schema / zero reward-base, algod-rust omits them.
+    _kd("account_hot", "apps-local-state", 2156, "empty array omitted"),
+    _kd("account_cold", "apps-local-state", 2156, "empty array omitted"),
+    _kd("account_cold", "apps-total-schema", 2156, "zero schema omitted"),
+    _kd("account_cold", "assets", 2156, "empty array omitted"),
+    _kd("account_cold", "created-apps", 2156, "empty array omitted"),
+    _kd("account_cold", "created-assets", 2156, "empty array omitted"),
+    _kd("account_cold", "reward-base", 2156, "zero reward-base omitted"),
+    # pending rewards are not applied to the looked-up account.
+    _kd("account_hot", "amount", 2157, "pending rewards not applied"),
+    _kd("account_hot", "pending-rewards", 2157, "pending rewards not applied"),
+    _kd("account_hot", "rewards", 2157, "pending rewards not applied"),
+    _kd("account_hot", "reward-base", 2157, "pending rewards not applied"),
+    _kd("tx_params", "fee", 2158, "fee reports min-fee, go reports the pool fee per byte"),
+    _kd("blocks_msgpack", "<body>", 2159, "cert re-encoded with step=2"),
+    _kd("simulate", "txn-groups.0.txn-results.0.txn-result.txn.txn.gh", 2160,
+        "gh rendered as an integer array"),
+    _kd("simulate", "txn-groups.0.txn-results.0.txn-result.sender-rewards", 2161,
+        "sender-rewards omitted"),
+]
+
+
+def check_allowlist(entries):
+    """Refuse a malformed allowlist: every entry names an endpoint, a path,
+    the tracking issue (an int) and a reason."""
+    for e in entries:
+        if not isinstance(e.get("endpoint"), str) or not e["endpoint"]:
+            raise ValueError(f"allowlist entry {e!r}: no endpoint")
+        if not isinstance(e.get("path"), str) or not e["path"]:
+            raise ValueError(f"allowlist entry {e!r}: no path")
+        if not isinstance(e.get("issue"), int) or isinstance(e.get("issue"), bool):
+            raise ValueError(f"allowlist entry {e!r}: `issue` must be the tracking issue number")
+        if not isinstance(e.get("reason"), str) or not e["reason"].strip():
+            raise ValueError(f"allowlist entry {e!r}: no reason")
+        if "corpus" in e and not (isinstance(e["corpus"], str) and e["corpus"]):
+            raise ValueError(f"allowlist entry {e!r}: `corpus` must be a corpus name")
+
+
+def drop_paths(doc, paths):
+    """A copy of `doc` without the dotted `paths` (`*` = any element or key).
+    A path that is not present is ignored."""
+    doc = copy.deepcopy(doc)
+    for p in paths:
+        _drop(doc, p.split("."))
+    return doc
+
+
+def _drop(node, segs):
+    seg, rest = segs[0], segs[1:]
+    if isinstance(node, dict):
+        keys = list(node) if seg == "*" else ([seg] if seg in node else [])
+        for k in keys:
+            if rest:
+                _drop(node[k], rest)
+            else:
+                del node[k]
+    elif isinstance(node, list):
+        idx = range(len(node)) if seg == "*" else (
+            [int(seg)] if seg.isdigit() and int(seg) < len(node) else [])
+        # delete from the end so earlier indexes stay valid
+        for i in sorted(idx, reverse=True) if not rest else idx:
+            if rest:
+                _drop(node[i], rest)
+            else:
+                del node[i]
+
+
+def _path_matches(entry_path, diff_path):
+    """True when the allowlist `entry_path` covers `diff_path`: segment by
+    segment (`*` matches anything), and a prefix covers what is below it."""
+    want, got = entry_path.split("."), diff_path.split(".")
+    return len(got) >= len(want) and all(w in ("*", g) for w, g in zip(want, got))
+
+
+# ---- comparison --------------------------------------------------------------
+
+def _media_type(ctype):
+    return (ctype or "").split(";")[0].strip().lower()
+
+
+def json_diff(go, rust, path=""):
+    """[(path, message)] where two JSON values differ (empty: equal)."""
+    if isinstance(go, dict) and isinstance(rust, dict):
+        out = []
+        for k in sorted(set(go) | set(rust)):
+            p = f"{path}.{k}" if path else k
+            if k not in rust:
+                out.append((p, f"{p}: only in go"))
+            elif k not in go:
+                out.append((p, f"{p}: only in rust"))
+            else:
+                out += json_diff(go[k], rust[k], p)
+        return out
+    if isinstance(go, list) and isinstance(rust, list):
+        out = []
+        for i in range(max(len(go), len(rust))):
+            p = f"{path}.{i}" if path else str(i)
+            if i >= len(rust):
+                out.append((p, f"{p}: only in go"))
+            elif i >= len(go):
+                out.append((p, f"{p}: only in rust"))
+            else:
+                out += json_diff(go[i], rust[i], p)
+        return out
+    if go != rust or type(go) is not type(rust):
+        return [(path or "$", f"{path or '$'}: go {go!r} != rust {rust!r}")]
+    return []
+
+
+def _diffs(req, go, rust):
+    """[(path, message)] between two responses to `req`, before any allowlist.
+    Non-body differences carry the pseudo-paths `<status>` / `<content-type>`;
+    the VOLATILE fields are already dropped from JSON bodies."""
+    out = []
+    if go["status"] != rust["status"]:
+        out.append(("<status>", f"status: go {go['status']} != rust {rust['status']}"))
+    if _media_type(go["content_type"]) != _media_type(rust["content_type"]):
+        out.append(("<content-type>", f"content-type: go {go['content_type']!r} != rust "
+                                      f"{rust['content_type']!r}"))
+    gb, rb = go["body"], rust["body"]
+    if req.get("kind") == "json":
+        try:
+            gj, rj = json.loads(gb), json.loads(rb)
+        except (ValueError, UnicodeDecodeError):
+            gj = rj = None
+        else:
+            vol = list(VOLATILE.get(req["name"], {}))
+            return out + json_diff(drop_paths(gj, vol), drop_paths(rj, vol))
+    if gb != rb:
+        i = next((n for n, (a, b) in enumerate(zip(gb, rb)) if a != b), min(len(gb), len(rb)))
+        out.append(("<body>", f"body differs at byte {i} (go {len(gb)} bytes, rust {len(rb)} bytes)"))
+    return out
+
+
+def compare(req, go, rust):
+    """Human-readable differences between the two nodes' responses to `req`
+    (no allowlist applied)."""
+    return [m for _, m in _diffs(req, go, rust)]
+
+
+def gate(requests, go_responses, rust_responses, allowlist, corpus=None):
+    """The response-equality gate. `*_responses` map request name ->
+    {status, content_type, body}. Returns the list of errors (empty: pass):
+    a differing response, a request one node did not answer, a response for a
+    request not in the set, and an allowlist entry that excused nothing."""
+    check_allowlist(allowlist)
+    # An entry with a `corpus` only applies to that corpus's ledger (what a
+    # differing field holds depends on the accounts the corpus created); for
+    # any other corpus it is neither used nor stale.
+    allowlist = [e for e in allowlist if e.get("corpus") in (None, corpus)]
+    errors = []
+    names = {r["name"] for r in requests}
+    for side, resps in (("go", go_responses), ("rust", rust_responses)):
+        for extra in sorted(set(resps) - names):
+            errors.append(f"{side}: response {extra!r} is not in the request set")
+    used = set()
+    for req in requests:
+        n = req["name"]
+        label = f"{n} ({req.get('method', 'GET')} {req['path']})"
+        missing = [s for s, r in (("go", go_responses), ("rust", rust_responses)) if n not in r]
+        for s in missing:
+            errors.append(f"{label}: no response from {s}")
+        if missing:
+            continue
+        for path, msg in _diffs(req, go_responses[n], rust_responses[n]):
+            hit = [i for i, e in enumerate(allowlist)
+                   if e["endpoint"] == n and _path_matches(e["path"], path)]
+            if hit:
+                used.update(hit)
+            else:
+                errors.append(f"{label}: {msg}")
+    for i, e in enumerate(allowlist):
+        if i not in used and e["endpoint"] in names:
+            errors.append(f"allowlist entry {e['endpoint']}.{e['path']} (#{e['issue']}) no longer "
+                          "matches any difference: remove it")
+    return errors
+
+
+def corrupt_response(r):
+    """A copy of response `r` with exactly one deliberate change, for the
+    tier's negative test (BENCH_REST_CORRUPT): the first integer (else string)
+    of a JSON body is altered; any other body gets its last byte flipped."""
+    out = dict(r)
+    body = r["body"]
+    if _media_type(r["content_type"]) == "application/json":
+        try:
+            doc = json.loads(body)
+        except (ValueError, UnicodeDecodeError):
+            doc = None
+        if doc is not None and _bump(doc):
+            out["body"] = json.dumps(doc).encode()
+            return out
+    out["body"] = body[:-1] + bytes([body[-1] ^ 1]) if body else b"\x00"
+    return out
+
+
+def _bump(node):
+    items = (sorted(node.items()) if isinstance(node, dict)
+             else list(enumerate(node)) if isinstance(node, list) else [])
+    for k, v in items:
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, int):
+            node[k] = v + 1
+            return True
+        if isinstance(v, str) and v:
+            node[k] = v + "x"
+            return True
+        if isinstance(v, (dict, list)) and _bump(v):
+            return True
+    return False
+
+
+# ---- msgpack and addresses (for the simulate request) ------------------------
+
+def msgpack(v):
+    """Minimal canonical msgpack encoder: maps with sorted keys, unsigned
+    integers, str, bin, arrays, bool, nil. Enough for a SimulateRequest."""
+    if v is None:
+        return b"\xc0"
+    if v is True:
+        return b"\xc3"
+    if v is False:
+        return b"\xc2"
+    if isinstance(v, int):
+        if v < 0:
+            raise ValueError("negative integers are not supported")
+        if v < 128:
+            return bytes([v])
+        for marker, size in ((0xcc, 1), (0xcd, 2), (0xce, 4), (0xcf, 8)):
+            if v < 1 << (8 * size):
+                return bytes([marker]) + v.to_bytes(size, "big")
+        raise ValueError("integer exceeds 64 bits")
+    if isinstance(v, str):
+        b = v.encode()
+        if len(b) < 32:
+            return bytes([0xa0 | len(b)]) + b
+        if len(b) < 256:
+            return b"\xd9" + bytes([len(b)]) + b
+        return b"\xda" + len(b).to_bytes(2, "big") + b
+    if isinstance(v, (bytes, bytearray)):
+        n = len(v)
+        return (b"\xc4" + bytes([n]) if n < 256 else b"\xc5" + n.to_bytes(2, "big")) + bytes(v)
+    if isinstance(v, (list, tuple)):
+        n = len(v)
+        head = bytes([0x90 | n]) if n < 16 else b"\xdc" + n.to_bytes(2, "big")
+        return head + b"".join(msgpack(x) for x in v)
+    if isinstance(v, dict):
+        n = len(v)
+        head = bytes([0x80 | n]) if n < 16 else b"\xde" + n.to_bytes(2, "big")
+        return head + b"".join(msgpack(k) + msgpack(v[k]) for k in sorted(v))
+    raise ValueError(f"cannot encode {type(v).__name__}")
+
+
+def decode_address(addr):
+    """The 32-byte public key of a 58-character Algorand address; ValueError
+    on a wrong length or checksum."""
+    if len(addr) != 58:
+        raise ValueError(f"address {addr!r} is not 58 characters")
+    try:
+        raw = base64.b32decode(addr + "======")
+    except ValueError as e:
+        raise ValueError(f"address {addr!r}: {e}") from None
+    pk, check = raw[:32], raw[32:]
+    if hashlib.new("sha512_256", pk).digest()[-4:] != check:
+        raise ValueError(f"address {addr!r}: bad checksum")
+    return pk
+
+
+def simulate_request(sender, receiver, params):
+    """The POST /v2/transactions/simulate request: one unsigned 1-microalgo
+    payment, empty signatures allowed, built only from the node-independent
+    /v2/transactions/params values so both nodes get identical bytes."""
+    last = int(params["last-round"])
+    txn = {"type": "pay", "snd": decode_address(sender), "rcv": decode_address(receiver),
+           "amt": 1, "fee": int(params["min-fee"]), "fv": last + 1, "lv": last + 1000,
+           "gen": params["genesis-id"], "gh": base64.b64decode(params["genesis-hash"])}
+    body = msgpack({"txn-groups": [{"txns": [{"txn": txn}]}], "allow-empty-signatures": True})
+    return {"name": "simulate", "method": "POST", "path": "/v2/transactions/simulate?format=json",
+            "kind": "json", "content_type": "application/msgpack",
+            "body_b64": base64.b64encode(body).decode()}
+
+
+# ---- the request set ---------------------------------------------------------
+
+def pick_hot_cold(accounts):
+    """(hot, cold) addresses from {address: /v2/accounts/{a} document}: the
+    biggest and the smallest document by serialised size, ties broken by
+    address, so the choice is a pure function of the ledger state."""
+    if not accounts:
+        raise ValueError("no accounts to choose from")
+    size = {a: len(json.dumps(d, sort_keys=True)) for a, d in accounts.items()}
+    hot = sorted(size, key=lambda a: (-size[a], a))[0]
+    cold = sorted(size, key=lambda a: (size[a], a))[0]
+    return hot, cold
+
+
+def request_set(state, simulate=None):
+    """The fixed request set, from the discovered ledger `state` ({hot, cold,
+    app_id, box_name_b64, round}). Names are stable (they key the result
+    rows). `simulate` is the optional request from simulate_request()."""
+    for k in ("hot", "cold", "app_id", "box_name_b64", "round"):
+        if state.get(k) in (None, ""):
+            raise ValueError(f"discovered state has no {k!r}: the corpus must provide a hot and "
+                             "a cold account, an application with a box and a block")
+    box = urllib.parse.quote("b64:" + state["box_name_b64"], safe="")
+    r = state["round"]
+    reqs = [
+        ("status", "/v2/status", "json"),
+        ("account_hot", f"/v2/accounts/{state['hot']}", "json"),
+        ("account_cold", f"/v2/accounts/{state['cold']}", "json"),
+        ("account_assets", f"/v2/accounts/{state['hot']}/assets", "json"),
+        ("application", f"/v2/applications/{state['app_id']}", "json"),
+        ("box", f"/v2/applications/{state['app_id']}/box?name={box}", "json"),
+        ("blocks_json", f"/v2/blocks/{r}", "json"),
+        ("blocks_msgpack", f"/v2/blocks/{r}?format=msgpack", "msgpack"),
+        ("tx_params", "/v2/transactions/params", "json"),
+    ]
+    out = [{"name": n, "method": "GET", "path": p, "kind": k} for n, p, k in reqs]
+    if simulate is not None:
+        out.append(dict(simulate))
+    return out
+
+
+def loadgen_requests(requests):
+    """The request set as restload reads it (benchmarks/go-restload)."""
+    out = []
+    for r in requests:
+        d = {"name": r["name"], "method": r.get("method", "GET"), "path": r["path"]}
+        if r.get("content_type"):
+            d["content_type"] = r["content_type"]
+        if r.get("body_b64"):
+            d["body_b64"] = r["body_b64"]
+        if r.get("kind") == "msgpack":
+            d["accept"] = "application/msgpack"
+        out.append(d)
+    return out
+
+
+# ---- containers --------------------------------------------------------------
+
+def container_args(impl, *, name, image, data_dir, port, cpus, mem):
+    """`docker run` arguments (after `docker`) of one node. Both
+    implementations get the same CPU / memory / swap limits, the same
+    published loopback port, and their ledger as the only mount at /data;
+    only the entrypoint differs."""
+    if impl == "go":
+        entry = ["--entrypoint", "algod"]
+        cmd = ["-d", "/data", "-l", f"0.0.0.0:{REST_PORT}"]
+    elif impl == "rust":
+        entry = ["--entrypoint", "algod-rust"]
+        cmd = ["node", "start", "-d", "/data", "-l", f"0.0.0.0:{REST_PORT}"]
+    else:
+        raise ValueError(f"impl must be go or rust, not {impl!r}")
+    return ["run", "-d", "--name", name, "--cpus", str(float(cpus)), "--memory", mem,
+            "--memory-swap", mem, "-p", f"127.0.0.1:{port}:{REST_PORT}",
+            "-v", f"{data_dir}:/data", *entry, image, *cmd]
+
+
+def limits_of(args):
+    """What two containers must share to be comparable, read back from the
+    `docker run` arguments."""
+    def val(flag):
+        return args[args.index(flag) + 1]
+    return {"cpus": val("--cpus"), "memory": val("--memory"), "memory-swap": val("--memory-swap"),
+            "publish": val("-p"), "mount": val("-v")}
+
+
+# ---- result rows -------------------------------------------------------------
+
+def error_rate(e):
+    """Fraction of requests that failed (transport error or non-2xx); 1.0
+    when nothing was answered."""
+    if e["requests"] <= 0:
+        return 1.0
+    return (e["errors"] + e["non_2xx"]) / e["requests"]
+
+
+LOAD_METRICS = (
+    ("rps", "req/s", "higher", lambda e: e["rps"]),
+    ("p50_ms", "ms", "lower", lambda e: e["p50_ms"]),
+    ("p95_ms", "ms", "lower", lambda e: e["p95_ms"]),
+    ("p99_ms", "ms", "lower", lambda e: e["p99_ms"]),
+    ("error_rate", "ratio", "lower", error_rate),
+)
+RESOURCE_METRICS = (("cpu_cores", "cores"), ("rss_mb", "MB"))
+
+
+def result_rows(runs, concurrency, resources, meta):
+    """Schema-v1 rows. `runs` is a list (one per repeat) of {impl: {endpoint:
+    restload endpoint result}}; `resources` is {impl: {endpoint: {cpu_cores:
+    [per-run], rss_mb: [per-run]}}}. Row name: `<endpoint>/c<concurrency>/<metric>`,
+    one sample per run."""
+    rows = []
+
+    def row(impl, name, unit, better, samples):
+        rows.append({"schema": "bench-result/v1", "tier": TIER, "name": name, "impl": impl,
+                     "unit": unit, "better": better,
+                     "samples": [round(float(s), 6) for s in samples],
+                     "metadata": dict(meta, concurrency=concurrency)})
+
+    for impl in ("go", "rust"):
+        endpoints = [e for e in runs[0][impl]]
+        for ep in endpoints:
+            for metric, unit, better, fn in LOAD_METRICS:
+                row(impl, f"{ep}/c{concurrency}/{metric}", unit, better,
+                    [fn(r[impl][ep]) for r in runs])
+            res = resources.get(impl, {}).get(ep, {})
+            for metric, unit in RESOURCE_METRICS:
+                if res.get(metric):
+                    row(impl, f"{ep}/c{concurrency}/{metric}", unit, "lower", res[metric])
+    return rows

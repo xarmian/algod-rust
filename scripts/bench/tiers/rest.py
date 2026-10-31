@@ -1,0 +1,502 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+# bench-tier-needs: build
+"""bench-compare `rest` tier: REST API throughput of go-algorand's algod and
+algod-rust against identical ledger state, behind a response-equality gate
+(issue #2107, epic #2101).
+
+  1. Both implementations replay the same workload corpus (the `replay`
+     tier's benchmarks/go-replay and `algod-rust bench replay-corpus`) into a
+     data directory each, and both must reach the corpus's final state (the
+     replay tier's gate), so the two ledgers are the same by construction.
+  2. Each data directory is served read-only by its own node in a Docker
+     container with identical CPU / memory / swap limits: go `algod` at the
+     pinned tag, `algod-rust node start`.
+  3. The fixed request set (rest_lib.request_set: /v2/status, hot and cold
+     accounts, account assets, an application, a box, a block as JSON and as
+     msgpack, transaction params, a simulate) is sent to both and EVERY
+     response must be equal after rest_lib's documented normalisation
+     (VOLATILE) and issue-linked allowlist (KNOWN_DIFFERENCES). Any other
+     difference fails the tier before a single load step runs, and the gate
+     runs again after the load.
+  4. One load generator (benchmarks/go-restload, one binary for both nodes)
+     drives each endpoint at fixed concurrency; per endpoint, req/s,
+     p50/p95/p99 latency, error rate and the container's CPU cores and peak
+     RSS (`docker stats`) become schema-v1 rows `<endpoint>/c<N>/<metric>`.
+     Go and Rust alternate who goes first in every repeat.
+
+Inputs (environment; docs/BENCHMARK_COMPARISON.md, "The rest tier"):
+  BENCH_REST_PROFILE      `full` (default) or `smoke` (CI: one short step)
+  BENCH_REST_CONCURRENCY  load levels, e.g. 1,16,64
+  BENCH_REST_DURATION     seconds measured per endpoint and level
+  BENCH_REST_WARMUP       discarded seconds per endpoint and level
+  BENCH_REST_CPUS / _MEM  per-container limits (default 2 / 3g)
+  BENCH_REST_PORT_BASE    first published REST port (default 4400)
+  BENCH_REST_GO_IMAGE     default algorand/algod:<pinned tag without `v`>
+  BENCH_REST_RUST_IMAGE   a prebuilt algod-rust image (default: build
+                          docker/Dockerfile's `runtime` target)
+  BENCH_REST_CORRUPT      negative test: the named endpoint's Rust response is
+                          altered before the gate, which must then fail
+  BENCH_CORPUS / BENCH_CORPUS_DIR   as the replay tier (default `small`)
+  plus the tier contract (BENCH_RUNS, BENCH_OUT, BENCH_RUST_BIN_DIR,
+  BENCH_GO_ALGORAND_DIR; docs/BENCHMARK_COMPARISON.md).
+"""
+import base64
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+BENCH = os.path.dirname(HERE)
+REPO = os.path.dirname(os.path.dirname(BENCH))
+sys.path.insert(0, BENCH)
+sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(BENCH, "corpus"))
+import bench_schema  # noqa: E402,F401
+import corpus_tool  # noqa: E402
+import localnet  # noqa: E402  (docker helpers, image handling)
+import localnet_lib as ll  # noqa: E402
+import replay  # noqa: E402  (corpus resolution, go-replay build, final-state gate)
+import rest_lib as rl  # noqa: E402
+
+TIER = "rest"
+TOKEN = ll.TOKEN
+LOAD_MODULE = os.path.join(REPO, "benchmarks", "go-restload")
+STARTUP_TIMEOUT = 180
+
+
+class TierError(Exception):
+    pass
+
+
+def log(msg):
+    print(f"rest: {msg}", flush=True)
+
+
+# ---- configuration -----------------------------------------------------------
+
+def settings(env=None):
+    env = os.environ if env is None else env
+
+    def num(name, default, cast):
+        v = env.get(name)
+        if v in (None, ""):
+            return default
+        try:
+            return cast(v)
+        except ValueError:
+            raise TierError(f"{name}={v!r} is not a number") from None
+
+    name = env.get("BENCH_REST_PROFILE", "full")
+    if name not in rl.PROFILES:
+        raise TierError(f"BENCH_REST_PROFILE={name!r}: want {', '.join(rl.PROFILES)}")
+    p = dict(rl.PROFILES[name], profile=name)
+    try:
+        if env.get("BENCH_REST_CONCURRENCY"):
+            p["concurrency"] = rl.parse_concurrency(env["BENCH_REST_CONCURRENCY"])
+    except ValueError as e:
+        raise TierError(f"BENCH_REST_CONCURRENCY: {e}") from None
+    p["duration_s"] = num("BENCH_REST_DURATION", p["duration_s"], float)
+    p["warmup_s"] = num("BENCH_REST_WARMUP", p["warmup_s"], float)
+    p["cpus"] = num("BENCH_REST_CPUS", 2.0, float)
+    p["mem"] = env.get("BENCH_REST_MEM") or "3g"
+    p["port_base"] = num("BENCH_REST_PORT_BASE", 4400, int)
+    p["go_image"] = env.get("BENCH_REST_GO_IMAGE") or "algorand/algod:" + localnet.pinned_tag().lstrip("v")
+    p["rust_image"] = env.get("BENCH_REST_RUST_IMAGE") or ""
+    p["corrupt"] = env.get("BENCH_REST_CORRUPT") or ""
+    if p["duration_s"] <= 0 or p["warmup_s"] < 0:
+        raise TierError("BENCH_REST_DURATION must be > 0 and BENCH_REST_WARMUP >= 0")
+    if not p["cpus"] > 0:
+        raise TierError(f"BENCH_REST_CPUS must be > 0, got {p['cpus']}")
+    if not 1024 <= p["port_base"] <= 65530:
+        raise TierError(f"BENCH_REST_PORT_BASE must be 1024..65530, got {p['port_base']}")
+    if not re.fullmatch(r"[0-9]+(\.[0-9]+)?[bkmgBKMG]?", p["mem"]):
+        raise TierError(f"BENCH_REST_MEM={p['mem']!r}: want a Docker size like 3g or 512m")
+    return p
+
+
+# ---- the shared ledger -------------------------------------------------------
+
+def prepare_ledgers(corpus, cj, work):
+    """Replay the corpus on both sides into data directories that are kept,
+    gate on the replay tier's final-state equality, and make each directory
+    servable (config, genesis, tokens, world-writable for the container user).
+    Returns {side: data_dir}, {side: replay result}."""
+    go_exe = replay.build_goreplay(os.path.abspath(
+        os.environ.get("BENCH_GO_ALGORAND_DIR")
+        or os.path.join(os.path.dirname(REPO), "go-algorand")), work)
+    rust_exe = replay.rust_binary()
+    sides = {"go": go_exe, "rust": rust_exe}
+    try:
+        res = replay.run_pair(("go", "rust"), lambda s: replay.run_side(
+            s, sides[s], corpus, work, "serve", 0, keep=True))
+    except replay.SideFailures as e:
+        raise TierError(f"replay failed: {e}") from None
+    errors = replay.gate([res], True)
+    if errors:
+        raise TierError("the two ledgers differ after replay (final-state gate):\n  "
+                        + "\n  ".join(errors))
+    genesis = os.path.join(corpus, cj["files"]["genesis"])
+    dirs = {}
+    for side in ("go", "rust"):
+        d = res[side]["_data_dir"]
+        cfg_path = os.path.join(d, "config.json")
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = json.load(f)
+        cfg["EndpointAddress"] = f"0.0.0.0:{rl.REST_PORT}"
+        with open(cfg_path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(cfg, f, indent=2)
+        shutil.copyfile(genesis, os.path.join(d, "genesis.json"))
+        for n in ("algod.token", "algod.admin.token"):
+            with open(os.path.join(d, n), "w", encoding="utf-8", newline="") as f:
+                f.write(TOKEN)
+        make_writable(d)
+        dirs[side] = d
+    return dirs, res
+
+
+def make_writable(path):
+    """The container user (uid 1001 for go, root or another for rust) must be
+    able to write sqlite WAL files next to the replayed ledger."""
+    for dirpath, dirs, files in os.walk(path):
+        os.chmod(dirpath, 0o777)
+        for f in files:
+            os.chmod(os.path.join(dirpath, f), 0o666)
+
+
+# ---- nodes -------------------------------------------------------------------
+
+class Node:
+    def __init__(self, impl, image, data_dir, port, cfg):
+        self.impl, self.port = impl, port
+        self.name = f"bench-rest-{impl}-{os.getpid()}"
+        self.args = rl.container_args(impl, name=self.name, image=image,
+                                      data_dir=localnet.posix(data_dir), port=port,
+                                      cpus=cfg["cpus"], mem=cfg["mem"])
+        self.base = f"http://127.0.0.1:{port}"
+
+    def start(self):
+        localnet.docker(*self.args)
+
+    def logs(self, tail=25):
+        p = localnet.docker("logs", "--tail", str(tail), self.name, check=False)
+        return ((p.stdout or "") + (p.stderr or "")).strip()
+
+    def running(self):
+        p = localnet.docker("inspect", "--format", "{{.State.Running}}", self.name, check=False)
+        return p.stdout.strip() == "true"
+
+    def stop(self):
+        localnet.docker("rm", "-f", self.name, check=False)
+
+
+def fetch(base, req, timeout=30):
+    """The response to `req`: {status, content_type, body}. An HTTP error
+    status is a response, not an exception."""
+    headers = {"X-Algo-API-Token": TOKEN}
+    if req.get("content_type"):
+        headers["Content-Type"] = req["content_type"]
+    if req.get("kind") == "msgpack":
+        headers["Accept"] = "application/msgpack"
+    data = base64.b64decode(req["body_b64"]) if req.get("body_b64") else None
+    rq = urllib.request.Request(base + req["path"], data=data, headers=headers,
+                                method=req.get("method", "GET"))
+    try:
+        with urllib.request.urlopen(rq, timeout=timeout) as r:
+            return {"status": r.status, "content_type": r.headers.get("Content-Type", ""),
+                    "body": r.read()}
+    except urllib.error.HTTPError as e:
+        return {"status": e.code, "content_type": e.headers.get("Content-Type", ""),
+                "body": e.read()}
+
+
+def get_json(base, path):
+    r = fetch(base, {"path": path, "kind": "json"})
+    if r["status"] != 200:
+        raise TierError(f"GET {path} on {base}: HTTP {r['status']}: {r['body'][:200]!r}")
+    return json.loads(r["body"])
+
+
+def wait_ready(node, last_round):
+    """Wait until the node answers /v2/status at the corpus's last round."""
+    deadline = time.monotonic() + STARTUP_TIMEOUT
+    err = ""
+    while time.monotonic() < deadline:
+        if not node.running():
+            raise TierError(f"{node.impl} node exited during startup:\n{node.logs()}")
+        try:
+            st = get_json(node.base, "/v2/status")
+            if int(st["last-round"]) == last_round:
+                return
+            err = f"last-round {st['last-round']}, want {last_round}"
+        except (TierError, OSError, KeyError, ValueError) as e:
+            err = str(e)
+        time.sleep(1)
+    raise TierError(f"{node.impl} node not ready at round {last_round} after "
+                    f"{STARTUP_TIMEOUT}s ({err}):\n{node.logs()}")
+
+
+def discover(base, cj, genesis_path):
+    """The ledger facts the request set needs, read from the reference (go)
+    node, deterministically: hot and cold account among the genesis accounts,
+    the newest application that holds a box, and a funded sender."""
+    with open(genesis_path, encoding="utf-8") as f:
+        addrs = sorted({a["addr"] for a in json.load(f)["alloc"]})
+    accts = {a: get_json(base, f"/v2/accounts/{a}") for a in addrs}
+    hot, cold = rl.pick_hot_cold(accts)
+    app_ids = sorted({int(x["id"]) for a in accts.values() for x in a.get("created-apps", [])},
+                     reverse=True)
+    app_id = box = None
+    for aid in app_ids:
+        boxes = get_json(base, f"/v2/applications/{aid}/boxes").get("boxes", [])
+        if boxes:
+            app_id, box = aid, boxes[0]["name"]
+            break
+    if app_id is None:
+        raise TierError("no genesis account created an application that holds a box "
+                        f"({len(app_ids)} applications examined); pick a corpus with boxes")
+    sender = sorted(accts, key=lambda a: (-int(accts[a]["amount"]), a))[0]
+    return {"hot": hot, "cold": cold, "app_id": app_id, "box_name_b64": box,
+            "round": cj["rounds"]["last"], "sender": sender}
+
+
+# ---- load --------------------------------------------------------------------
+
+def build_restload(work):
+    exe = os.path.join(work, "restload" + (".exe" if os.name == "nt" else ""))
+    env = dict(os.environ, GOFLAGS=os.environ.get("GOFLAGS", "-buildvcs=false"))
+    env.pop("GOWORK", None)
+    rc = subprocess.run(["go", "build", "-o", exe, "."], cwd=LOAD_MODULE, env=env).returncode
+    if rc != 0:
+        raise TierError(f"go build of benchmarks/go-restload exited {rc}")
+    return exe
+
+
+class StatsSampler(threading.Thread):
+    """`docker stats` samples of one container while a load step runs."""
+
+    def __init__(self, name):
+        super().__init__(daemon=True)
+        self.name_, self.samples, self._stop_evt = name, [], threading.Event()
+
+    def run(self):
+        while not self._stop_evt.is_set():
+            p = localnet.docker("stats", "--no-stream", "--format", "{{json .}}", self.name_,
+                                check=False, timeout=30)
+            for line in (p.stdout or "").splitlines():
+                try:
+                    s = ll.parse_stats_line(line)
+                except (ValueError, KeyError):
+                    continue
+                self.samples.append({"t": time.monotonic(), "node": self.name_, **s})
+
+    def stop(self):
+        self._stop_evt.set()
+        self.join(timeout=35)
+
+
+def run_load(exe, node, req, conc, cfg, work, tag):
+    """One endpoint at one concurrency against one node: restload's result
+    plus the container's CPU / RSS over the window."""
+    reqs = os.path.join(work, f"req-{tag}.json")
+    out = os.path.join(work, f"out-{tag}.json")
+    with open(reqs, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(rl.loadgen_requests([req]), f)
+    cmd = [exe, "-base", node.base, "-token", TOKEN, "-requests", reqs, "-concurrency",
+           str(conc), "-duration", f"{cfg['duration_s']}s", "-warmup", f"{cfg['warmup_s']}s",
+           "-out", out]
+    sampler = StatsSampler(node.name)
+    sampler.start()
+    t_start = time.monotonic()
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace")
+    finally:
+        t_end = time.monotonic()
+        sampler.stop()
+    if p.returncode != 0:
+        raise TierError(f"restload exited {p.returncode}: {p.stderr.strip()[-300:]}")
+    with open(out, encoding="utf-8") as f:
+        res = json.load(f)["endpoints"][0]
+    # The measured part of the window is the last duration_s seconds.
+    summary = ll.resource_summary(sampler.samples, t_end - cfg["duration_s"], t_end)
+    return res, summary
+
+
+# ---- the tier ----------------------------------------------------------------
+
+def check_gate(requests, nodes, cfg, label, corpus):
+    go = {r["name"]: fetch(nodes["go"].base, r) for r in requests}
+    rust = {r["name"]: fetch(nodes["rust"].base, r) for r in requests}
+    if cfg["corrupt"]:
+        if cfg["corrupt"] not in rust:
+            raise TierError(f"BENCH_REST_CORRUPT={cfg['corrupt']!r}: not an endpoint "
+                            f"({', '.join(sorted(rust))})")
+        rust[cfg["corrupt"]] = rl.corrupt_response(rust[cfg["corrupt"]])
+        log(f"NEGATIVE TEST: the rust response of {cfg['corrupt']} is altered; the gate must fail")
+    errors = rl.gate(requests, go, rust, rl.KNOWN_DIFFERENCES, corpus=corpus)
+    if errors:
+        raise TierError(f"response-equality gate FAILED ({label}):\n  " + "\n  ".join(errors))
+    sizes = ", ".join(f"{r['name']}={len(go[r['name']]['body'])}B" for r in requests)
+    log(f"response-equality gate passed ({label}): {len(requests)} requests, bodies {sizes}")
+    return go
+
+
+def run_tier():
+    cfg = settings()
+    runs = int(os.environ.get("BENCH_RUNS", "5"))
+    if cfg["profile"] == "smoke" and "BENCH_RUNS" not in os.environ:
+        runs = 1
+    out_dir = os.environ.get("BENCH_OUT") or os.getcwd()
+    os.makedirs(out_dir, exist_ok=True)
+    if runs < 1:
+        raise TierError("BENCH_RUNS must be >= 1")
+    rl.check_allowlist(rl.KNOWN_DIFFERENCES)
+    work = tempfile.mkdtemp(prefix="bench-rest-")
+    nodes = {}
+    try:
+        corpus = replay.resolve_corpus()
+        errs = corpus_tool.verify_manifest(corpus)
+        if errs:
+            raise TierError("corpus manifest: " + "; ".join(errs))
+        cj = corpus_tool.load_corpus_json(corpus)
+        corpus_name = cj.get("name") or os.path.basename(corpus)
+        localnet.ensure_images(cfg)
+        dirs, replays = prepare_ledgers(corpus, cj, work)
+        restload = build_restload(work)
+        for i, side in enumerate(("go", "rust")):
+            nodes[side] = Node(side, cfg[f"{side}_image"], dirs[side], cfg["port_base"] + i, cfg)
+        assert rl.limits_of(nodes["go"].args)["cpus"] == rl.limits_of(nodes["rust"].args)["cpus"]
+        for n in nodes.values():
+            n.start()
+        for n in nodes.values():
+            wait_ready(n, cj["rounds"]["last"])
+        log(f"both nodes serve round {cj['rounds']['last']} of {corpus_name} "
+            f"(limits: {cfg['cpus']} cpus, {cfg['mem']} each)")
+
+        state = discover(nodes["go"].base, cj, os.path.join(corpus, cj["files"]["genesis"]))
+        params = get_json(nodes["go"].base, "/v2/transactions/params")
+        sim = rl.simulate_request(state["sender"], state["cold"], params)
+        requests = rl.request_set(state, simulate=sim)
+        log("request set: " + ", ".join(r["name"] for r in requests))
+        check_gate(requests, nodes, cfg, "before load", corpus_name)
+
+        rows = []
+        for conc in cfg["concurrency"]:
+            per_run, resources = [], {"go": {}, "rust": {}}
+            for i in range(runs):
+                order = ("go", "rust") if i % 2 == 0 else ("rust", "go")
+                one = {"go": {}, "rust": {}}
+                for req in requests:
+                    for side in order:
+                        res, summ = run_load(restload, nodes[side], req, conc, cfg, work,
+                                             f"{side}-{req['name']}-c{conc}-{i}")
+                        one[side][req["name"]] = res
+                        slot = resources[side].setdefault(req["name"],
+                                                          {"cpu_cores": [], "rss_mb": []})
+                        if summ:
+                            slot["cpu_cores"].append(summ["cpu_cores"])
+                            slot["rss_mb"].append(summ["rss_mb_peak"])
+                    log(f"c{conc} run {i + 1}/{runs} {req['name']}: "
+                        + ", ".join(f"{s} {one[s][req['name']]['rps']:.0f} req/s "
+                                    f"p99 {one[s][req['name']]['p99_ms']:.1f} ms" for s in order))
+                per_run.append(one)
+            meta = {
+                "corpus": corpus_name, "corpus_dir": os.path.relpath(corpus, REPO),
+                "manifest_sha256": corpus_tool.sha256_file(
+                    os.path.join(corpus, corpus_tool.MANIFEST)),
+                "final_block_hash": replays["go"]["final_state"]["block_hash"],
+                "round": cj["rounds"]["last"], "hot": state["hot"], "cold": state["cold"],
+                "app_id": state["app_id"], "duration_s": cfg["duration_s"],
+                "warmup_s": cfg["warmup_s"], "cpus": cfg["cpus"], "mem": cfg["mem"],
+                "go_image": cfg["go_image"], "go_image_id": cfg["go_image_id"],
+                "rust_image": cfg["rust_image"], "rust_image_id": cfg["rust_image_id"],
+                "profile": cfg["profile"], "allowlisted_differences": sum(1 for e in rl.KNOWN_DIFFERENCES if e.get("corpus") in (None, corpus_name)),
+                "command": " ".join(nodes["go"].args[:2]) + " (docker run, rest_lib.container_args)",
+            }
+            rows += rl.result_rows(per_run, conc, resources, meta)
+        check_gate(requests, nodes, dict(cfg, corrupt=""), "after load", corpus_name)
+        with open(os.path.join(out_dir, "rest.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(rows, f, indent=1)
+        log(f"{len(rows)} rows written")
+    finally:
+        for n in nodes.values():
+            try:
+                n.stop()
+            except Exception:  # noqa: BLE001 - cleanup must not mask the real error
+                pass
+        for side in ("go", "rust"):
+            localnet.purge(os.path.join(work, f"{side}-serve"), cfg_image(cfg, side))
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def cfg_image(cfg, side):
+    return cfg.get(f"{side}_image") or "alpine"
+
+
+def ratio_gate(rep, expected=None):
+    """Errors of a report.json for CI: the report must be ok, hold `rest`
+    rows, and give every endpoint a Rust/Go ratio for its req/s at every
+    concurrency level present."""
+    if not rep.get("ok"):
+        return [f"report not ok: {rep.get('errors')}"]
+    rows = [r for r in rep.get("rows", []) if r.get("tier") == TIER]
+    if not rows:
+        return ["no rest rows"]
+    errors = []
+    names = {r["name"] for r in rows}
+    levels = sorted({n.split("/")[1] for n in names})
+    endpoints = sorted(expected or {n.split("/")[0] for n in names})
+    for ep in endpoints:
+        for lv in levels:
+            name = f"{ep}/{lv}/rps"
+            row = next((r for r in rows if r["name"] == name), None)
+            if row is None or row.get("ratio") is None:
+                errors.append(f"{name}: no Rust/Go ratio")
+    return errors
+
+
+def check_report(path):
+    with open(path, encoding="utf-8") as f:
+        rep = json.load(f)
+    errors = ratio_gate(rep, [r["name"] for r in EXPECTED_ENDPOINTS])
+    for e in errors:
+        print(f"rest: {e}", file=sys.stderr)
+    if errors:
+        return 1
+    print("rest: every endpoint has a Rust/Go req/s ratio")
+    return 0
+
+
+# The endpoint names a complete run reports (rest_lib.request_set + simulate).
+EXPECTED_ENDPOINTS = rl.request_set(
+    {"hot": "h", "cold": "c", "app_id": 1, "box_name_b64": "Yg==", "round": 1},
+    simulate={"name": "simulate", "path": "/p"})
+
+
+def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--check-report":
+        return check_report(sys.argv[2])
+    try:
+        run_tier()
+    except TierError as e:
+        print(f"rest: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:  # micro_equiv.SetupError, localnet.TierError and the like
+        print(f"rest: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
