@@ -395,7 +395,6 @@ difference is an open parity bug, not an accepted divergence:
 
 | Issue | Difference |
 |---|---|
-| [#2155](https://github.com/xarmian/algod-rust/issues/2155) | `GET /v2/accounts/{addr}` omits assets, created-assets, created-apps and apps-local-state on the lock-free read-pool path. |
 | [#2156](https://github.com/xarmian/algod-rust/issues/2156) | The same endpoint omits empty resource arrays, a zero `apps-total-schema` and a zero `reward-base` that Go emits. |
 | [#2157](https://github.com/xarmian/algod-rust/issues/2157) | The same endpoint does not apply pending rewards (`amount`, `pending-rewards`, `rewards`, `reward-base` differ). |
 | [#2158](https://github.com/xarmian/algod-rust/issues/2158) | `GET /v2/transactions/params` reports `fee` = min-fee; Go reports the pool's fee per byte (0 when idle). |

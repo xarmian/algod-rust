@@ -3804,6 +3804,125 @@ async fn account_info_returns_populated_created_apps() {
     );
 }
 
+/// Issue #2155: the msgpack account document carries the same resources as
+/// the JSON one (decoded and compared field by field).
+#[tokio::test]
+async fn account_info_msgpack_carries_the_same_resources_as_json() {
+    let mut assets = BTreeMap::new();
+    assets.insert(
+        42,
+        AssetHolding {
+            amount: 1000,
+            frozen: false,
+        },
+    );
+    assets.insert(
+        99,
+        AssetHolding {
+            amount: 500,
+            frozen: true,
+        },
+    );
+    let mut created_assets = BTreeMap::new();
+    created_assets.insert(
+        10,
+        AssetParams {
+            total: 1_000_000,
+            decimals: 6,
+            ..AssetParams::default()
+        },
+    );
+    let mut created_apps = BTreeMap::new();
+    created_apps.insert(
+        200,
+        AppParams {
+            creator: Address([0u8; 32]),
+            approval_program: vec![0x06, 0x81, 0x01],
+            clear_state_program: vec![0x06, 0x81, 0x01],
+            ..Default::default()
+        },
+    );
+    let lookup = AccountLookup {
+        account_data: AccountData {
+            micro_algos: 2_000_000,
+            total_assets_opted_in: 2,
+            total_created_assets: 1,
+            total_created_apps: 1,
+            ..AccountData::default()
+        },
+        last_round: 1000,
+        amount_without_pending_rewards: 2_000_000,
+        assets,
+        created_assets,
+        app_local_states: BTreeMap::new(),
+        created_apps,
+    };
+    let server = TestServer::start(mock_node_with_account(lookup)).await;
+    let get = |suffix: &'static str| {
+        let url = server.url(&format!("/v2/accounts/{}{}", TEST_ADDR, suffix));
+        let req = server
+            .client
+            .get(url)
+            .header("X-Algo-API-Token", &server.api_token);
+        async move { req.send().await.unwrap() }
+    };
+
+    let json: serde_json::Value = get("").await.json().await.unwrap();
+    let bytes = get("?format=msgpack").await.bytes().await.unwrap();
+    let doc = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+    let map = doc.as_map().expect("msgpack account is a map");
+    let field = |name: &str| {
+        map.iter()
+            .find(|(k, _)| k.as_str() == Some(name))
+            .map(|(_, v)| v)
+            .unwrap_or_else(|| panic!("msgpack account lacks `{name}`"))
+    };
+    let ids = |name: &str| -> Vec<u64> {
+        let mut v: Vec<u64> = field(name)
+            .as_map()
+            .unwrap()
+            .iter()
+            .map(|(k, _)| k.as_u64().unwrap())
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    let json_ids = |name: &str, key: &str| -> Vec<u64> {
+        json[name]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e[key].as_u64().unwrap())
+            .collect()
+    };
+    assert_eq!(ids("asset"), json_ids("assets", "asset-id"));
+    assert_eq!(ids("apar"), json_ids("created-assets", "index"));
+    assert_eq!(ids("appp"), json_ids("created-apps", "id"));
+    // Holding fields: asset 42 holds 1000 (`a`), asset 99 is frozen (`f`).
+    let holding = |id: u64| {
+        field("asset")
+            .as_map()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k.as_u64() == Some(id))
+            .map(|(_, v)| v.as_map().unwrap().clone())
+            .unwrap()
+    };
+    let get_in = |m: &Vec<(rmpv::Value, rmpv::Value)>, k: &str| {
+        m.iter()
+            .find(|(kk, _)| kk.as_str() == Some(k))
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(
+        get_in(&holding(42), "a").and_then(|v| v.as_u64()),
+        Some(1000)
+    );
+    assert_eq!(
+        get_in(&holding(99), "f").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+}
+
 // ===========================================================================
 // Resource limit exceeded test (FIX 4 / FIX 10)
 // ===========================================================================
@@ -8307,7 +8426,10 @@ async fn simulate_msgpack_unknown_key_returns_gos_fixed_text() {
     let request = |top_extra: Vec<(Value, Value)>| {
         let mut p = vec![(
             s("txn-groups"),
-            Value::Array(vec![Value::Map(vec![(s("txns"), Value::Array(vec![ok_val.clone()]))])]),
+            Value::Array(vec![Value::Map(vec![(
+                s("txns"),
+                Value::Array(vec![ok_val.clone()]),
+            )])]),
         )];
         p.extend(top_extra);
         let mut out = Vec::new();
@@ -8325,7 +8447,9 @@ async fn simulate_msgpack_unknown_key_returns_gos_fixed_text() {
             .send()
     };
 
-    let resp = post(request(vec![(s("zzz"), Value::from(1u64))])).await.unwrap();
+    let resp = post(request(vec![(s("zzz"), Value::from(1u64))]))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 400);
     let json: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(
@@ -8426,7 +8550,9 @@ async fn simulate_msgpack_with_binary_fields_decodes_like_json() {
     .unwrap();
     // the in-block-only flags are not part of go's SignedTxn (a 400 on submit)
     let mut jv = serde_json::to_value(&stxn).unwrap();
-    jv.as_object_mut().unwrap().retain(|k, _| k != "hgi" && k != "hgh");
+    jv.as_object_mut()
+        .unwrap()
+        .retain(|k, _| k != "hgi" && k != "hgh");
     let json_body = serde_json::to_vec(&serde_json::json!({
         "txn-groups": [{"txns": [jv.clone(), jv]}],
         "round": 42,
@@ -8445,7 +8571,12 @@ async fn simulate_msgpack_with_binary_fields_decodes_like_json() {
             .await
             .unwrap();
         // the mock has no simulate result (500), but the decode must have succeeded
-        assert_ne!(resp.status(), 400, "{content_type}: {}", resp.text().await.unwrap());
+        assert_ne!(
+            resp.status(),
+            400,
+            "{content_type}: {}",
+            resp.text().await.unwrap()
+        );
     }
 
     let seen = log.lock().unwrap();

@@ -99,12 +99,6 @@ def _kd(endpoint, path, kind, issue, reason, **extra):
 
 
 KNOWN_DIFFERENCES = [
-    # GET /v2/accounts/{hot}: the read-pool path drops the resource lists.
-    _kd("account_hot", "assets", "only-go", 2155, "resources missing on the read-pool lookup"),
-    _kd("account_hot", "created-apps", "only-go", 2155,
-        "resources missing on the read-pool lookup"),
-    _kd("account_hot", "created-assets", "only-go", 2155,
-        "resources missing on the read-pool lookup"),
     # go emits empty arrays / zero schema / zero reward-base, algod-rust omits them.
     _kd("account_hot", "apps-local-state", "only-go", 2156, "empty array omitted"),
     _kd("account_cold", "apps-local-state", "only-go", 2156, "empty array omitted"),

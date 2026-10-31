@@ -381,6 +381,7 @@ pub trait ResourceReads {
     fn get_app_local_state(&self, addr: &Address, app_id: u64) -> Option<AppLocalState>;
     fn app_local_states_for_addr(&self, addr: &Address) -> Vec<(u64, AppLocalState)>;
     fn asset_holdings_for_addr(&self, addr: &Address) -> Vec<(u64, AssetHolding)>;
+    fn created_assets_for_addr(&self, addr: &Address) -> Vec<(u64, AssetParamsRecord)>;
     fn created_apps_for_addr(&self, addr: &Address) -> Vec<(u64, AppParams)>;
     fn get_box(&self, app_id: u64, key: &[u8]) -> Option<Vec<u8>>;
     fn box_keys_for_app(&self, app_id: u64) -> Vec<Vec<u8>>;
@@ -415,6 +416,9 @@ impl<T: LedgerStore + ?Sized> ResourceReads for T {
     }
     fn asset_holdings_for_addr(&self, addr: &Address) -> Vec<(u64, AssetHolding)> {
         LedgerStore::asset_holdings_for_addr(self, addr)
+    }
+    fn created_assets_for_addr(&self, addr: &Address) -> Vec<(u64, AssetParamsRecord)> {
+        LedgerStore::created_assets_for_addr(self, addr)
     }
     fn created_apps_for_addr(&self, addr: &Address) -> Vec<(u64, AppParams)> {
         LedgerStore::created_apps_for_addr(self, addr)
@@ -462,6 +466,21 @@ impl PoolReader<'_> {
             Err(e) => {
                 let first = self.err.take();
                 self.err.set(first.or(Some(e)));
+                None
+            }
+        }
+    }
+
+    /// A resource blob that fails to decode is not "absent": record it as the
+    /// snapshot's error so the caller takes the locked path instead of serving
+    /// a list that silently disagrees with the account's totals.
+    fn decoded<T>(&self, r: Result<T, AlgoError>) -> Option<T> {
+        match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                let first = self.err.take();
+                self.err
+                    .set(first.or(Some(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))));
                 None
             }
         }
@@ -590,7 +609,7 @@ impl ResourceReads for PoolReader<'_> {
                 if !inspect_resource_blob(&data).has_holding {
                     return None;
                 }
-                Some((aidx, decode_app_local_state(&data).ok()?))
+                Some((aidx, self.decoded(decode_app_local_state(&data))?))
             })
             .collect()
     }
@@ -602,7 +621,26 @@ impl ResourceReads for PoolReader<'_> {
                 if !inspect_resource_blob(&data).has_holding {
                     return None;
                 }
-                Some((aidx, decode_asset_holding(&data).ok()?))
+                Some((aidx, self.decoded(decode_asset_holding(&data))?))
+            })
+            .collect()
+    }
+
+    fn created_assets_for_addr(&self, addr: &Address) -> Vec<(u64, AssetParamsRecord)> {
+        self.resource_rows(addr, CTYPE_ASSET)
+            .into_iter()
+            .filter_map(|(aidx, data)| {
+                if !inspect_resource_blob(&data).has_ownership {
+                    return None;
+                }
+                let params = self.decoded(decode_asset_params(&data))?;
+                Some((
+                    aidx,
+                    AssetParamsRecord {
+                        params,
+                        creator: *addr,
+                    },
+                ))
             })
             .collect()
     }
@@ -614,7 +652,7 @@ impl ResourceReads for PoolReader<'_> {
                 if !inspect_resource_blob(&data).has_ownership {
                     return None;
                 }
-                Some((aidx, decode_app_params(&data, *addr).ok()?))
+                Some((aidx, self.decoded(decode_app_params(&data, *addr))?))
             })
             .collect()
     }
