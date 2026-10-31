@@ -177,12 +177,68 @@ fn ledger_fingerprint<L: LedgerStore>(
     (accounts, lease_fp(store), txtail)
 }
 
+/// Balance headroom a changed account must have at both ends of the past
+/// round window, far above any amount, fee and minimum balance in these
+/// scenarios.
+const HEADROOM: u64 = 10_000_000;
+
+/// A past-round scenario is only valid here while its outcome cannot depend on
+/// an account that changed after `Request.Round` (the store holds only the
+/// latest state, so such a read sees the latest balance, issue #2123). A
+/// duplicate-check failure is decided before any balance is read, and a
+/// success needs funds; so for every simulated transaction's sender, receiver
+/// or close-to account that a go block touched after the requested round, this
+/// requires headroom both in the genesis state and in the latest state. The
+/// empty blocks the stages append touch nothing.
+fn assert_no_changed_account_read<L: LedgerStore>(
+    store: &L,
+    o: &Oracle,
+    sc: &OracleScenario,
+    group: &[algo_types::SignedTransaction],
+) {
+    if sc.round == 0 || sc.round >= store.current_round().0 {
+        return;
+    }
+    let mut changed = std::collections::HashSet::new();
+    for (i, b) in o.blocks.iter().enumerate() {
+        if (i as u64) < sc.round {
+            continue;
+        }
+        let block = algo_codec::decode_block(&b64(b)).expect("decode go block");
+        for stx in &block.payset {
+            changed.insert(stx.txn.sender);
+            changed.insert(stx.txn.receiver);
+            changed.insert(stx.txn.close_remainder_to);
+        }
+    }
+    for stx in group {
+        for a in [stx.txn.sender, stx.txn.receiver, stx.txn.close_remainder_to] {
+            if a == Address::ZERO || !changed.contains(&a) {
+                continue;
+            }
+            let genesis = o
+                .genesis_accounts
+                .iter()
+                .find(|g| addr(&g.addr) == a)
+                .map_or(0, |g| g.micro_algos);
+            let latest = store.get_account(&a).map_or(0, |acct| acct.micro_algos);
+            assert!(
+                genesis >= HEADROOM && latest >= HEADROOM,
+                "{}: reads account {a:?} changed after round {} without headroom                  (genesis {genesis}, latest {latest}); a past round would see the latest balance",
+                sc.name,
+                sc.round
+            );
+        }
+    }
+}
+
 fn run_stage<L: LedgerStore>(store: &mut L, o: &Oracle, stage: &str, lease_fp: fn(&L) -> u64) {
     let scenarios: Vec<_> = o.scenarios.iter().filter(|s| s.stage == stage).collect();
     assert!(!scenarios.is_empty(), "stage {stage} has scenarios");
     for sc in scenarios {
         let group = algo_codec::decode_signed_txn_stream(&b64(&sc.group_msgpack))
             .unwrap_or_else(|e| panic!("{}: decode group: {e}", sc.name));
+        assert_no_changed_account_read(store, o, sc, &group);
         let before = ledger_fingerprint(store, o, lease_fp);
         let result = Simulator::new(&mut *store)
             .simulate(SimulationRequest {
@@ -216,7 +272,7 @@ fn run_stage<L: LedgerStore>(store: &mut L, o: &Oracle, stage: &str, lease_fp: f
 fn run_oracle<L: LedgerStore>(store: &mut L, lease_fp: fn(&L) -> u64) {
     // These scenarios read only the txtail and the lease table, so a past
     // round is safe to serve (a normal simulate rejects it, issue #2123).
-    algo_ledger::simulation::test_hooks::set_serve_past_rounds(true);
+    let _past_rounds = algo_ledger::simulation::test_hooks::ServePastRounds::enable();
     let o = load_oracle();
     let last = seed_go_blocks(store, &o);
     run_stage(store, &o, "A", lease_fp);

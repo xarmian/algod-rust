@@ -322,9 +322,16 @@ served as of `start` from the tracker's in-memory deltas. Any round back to
 
 **What algod-rust does instead.** The ledger store keeps only the latest state
 (no per-round account history), so `Simulator::simulate` treats the latest round
-as the effective `dbRound`: `Request.Round` below it is rejected with go's exact
+as the effective `dbRound`: `Request.Round` below it is rejected with go's
 error text (an internal error, so a 500 like go's), and a round above it fails
 with `ledger does not have entry N` as in go.
+
+**Client-visible consequence.** A client that reads `round = N` from `/status`
+and passes it as `Request.Round` gets a 500 if block `N + 1` lands first; go
+would still serve it (its `dbRound` is typically the latest round minus the
+account lookback). The rejection text appends "this node serves simulate only
+at its latest round, so its effective dbRound is the latest round" to go's
+`round %d before dbRound %d`. The window is deliberately not widened (see #2148).
 
 **What is identical.** Omitting the round, or giving the latest round, behaves
 exactly as go, including the block-start rewards (proven by the #2118 oracle).
@@ -339,7 +346,8 @@ read; that is tracked in #2148.
 **How parity is proven.** The tests listed in the table row; the error text is
 from `ledger/acctupdates.go`.
 
-**How to switch back.** Remove the `.max(self.store.current_round())` in
-`Simulator::simulate` once the store can serve historical state.
+**How to switch back.** In `Simulator::simulate`, make `floor` just
+`self.store.earliest_round()` (drop the `.max(self.store.current_round())`) once
+the store can serve historical state, and drop the error-text suffix.
 
 **How go-algorand could port it.** Not applicable (go already serves history).

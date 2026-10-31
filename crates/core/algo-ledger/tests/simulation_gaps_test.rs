@@ -3054,11 +3054,6 @@ int 1
     }
     state.set_current_round(Round(5));
 
-    // The follower's dbRound is 4 but its latest state is round 5: the
-    // store holds only the latest state, so the effective dbRound is the
-    // later of the two (issue #2123).
-    state.set_earliest_round(Round(4));
-
     let request_at = |round: Round| SimulationRequest {
         txn_groups: vec![vec![SignedTransaction {
             txn: appl_txn(sender, app_id, 0),
@@ -3068,27 +3063,61 @@ int 1
         round: Some(round),
         ..Default::default()
     };
-
-    // The latest round resolves.
-    let result = simulate(&mut state, request_at(Round(5))).expect("the latest round must resolve");
-    assert!(result.txn_groups[0].failure_message.is_none());
-
-    // Before dbRound: rejected with go's exact "before dbRound" error
-    // class (an `Internal` error, not `InvalidRequest` -- go's handler
-    // only special-cases `InvalidRequestError` as a 400, so this must
-    // surface as a 500 like the real ledger's `RoundOffsetError`).
-    let err = simulate(&mut state, request_at(Round(3)))
-        .expect_err("a round before dbRound must be rejected");
-    match err {
-        SimulatorError::Internal(e) => {
+    // go's `RoundOffsetError` text leads the message; the rest says why the
+    // effective dbRound is the latest round here (DIV-007).
+    let assert_rejected = |state: &mut LedgerState, round: u64, db_round: u64| match simulate(
+        state,
+        request_at(Round(round)),
+    ) {
+        Err(SimulatorError::Internal(e)) => {
             let msg = e.to_string();
             assert!(
-                msg.contains("round 3 before dbRound 5"),
-                "expected go's exact error text, got {msg:?}"
+                msg.contains(&format!("round {round} before dbRound {db_round}")),
+                "expected go's error text, got {msg:?}"
+            );
+            assert!(
+                msg.contains("effective dbRound is the latest round"),
+                "{msg}"
             );
         }
         other => panic!("expected SimulatorError::Internal, got {other:?}"),
+    };
+
+    // The follower's dbRound is 4 but its latest state is round 5: the
+    // store holds only the latest state, so the effective dbRound is the
+    // later of the two (issue #2123). Boundary: the latest round resolves,
+    // one below is rejected (`<`, not `<=`).
+    state.set_earliest_round(Round(4));
+    let result = simulate(&mut state, request_at(Round(5))).expect("the latest round must resolve");
+    assert!(result.txn_groups[0].failure_message.is_none());
+    assert_rejected(&mut state, 4, 5);
+    assert_rejected(&mut state, 3, 5);
+
+    // An `earliest_round` at or below the latest has no effect: the same
+    // boundary holds for 0, 1, and exactly the latest round.
+    for earliest in [0u64, 1, 5] {
+        state.set_earliest_round(Round(earliest));
+        simulate(&mut state, request_at(Round(5))).expect("the latest round must resolve");
+        assert_rejected(&mut state, 4, 5);
     }
+
+    // Above the latest it does apply (a sync round ahead of the tip).
+    state.set_earliest_round(Round(6));
+    assert_rejected(&mut state, 5, 6);
+}
+
+/// The past-round test hook (DIV-007) is scoped to its guard: dropping it
+/// closes the window again, so it cannot leak into another test that runs on
+/// the same thread.
+#[test]
+fn serve_past_rounds_hook_resets_when_its_guard_drops() {
+    use algo_ledger::simulation::test_hooks::ServePastRounds;
+    assert!(!ServePastRounds::is_enabled());
+    {
+        let _guard = ServePastRounds::enable();
+        assert!(ServePastRounds::is_enabled());
+    }
+    assert!(!ServePastRounds::is_enabled());
 }
 
 /// Port of `TestGlobalStateTypeChangeErr`: an app declares a global schema
