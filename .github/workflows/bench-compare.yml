@@ -1,0 +1,267 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: Bench Compare
+
+# Issue #2109 (epic #2101): the periodic Go vs Rust comparison on a GitHub
+# runner. It builds both implementations (pinned go-algorand incl. the
+# libsodium step, algod-rust --release and its Docker image), runs the tiers
+# that are deterministic and feasible on a shared runner (micro, replay on the
+# `small` corpus and the real-certificate `testnet-prefix50` corpus, rest,
+# localnet) through the same `make bench-compare` entry point as a laptop run,
+# and uploads each run directory (report.{json,md}, logs, fingerprint) as an
+# artifact plus the reports in the job summary.
+#
+#   * An equality-gate failure (replay/rest/localnet final-state or response
+#     gate) makes its tier exit non-zero and FAILS the job. The
+#     `dry_run_gate_failure` dispatch input corrupts the replay corpus on
+#     purpose to prove that: a dry run of the gate failure must end red.
+#   * Rust regressions against the published baseline (benchmarks/baseline.json,
+#     written by `report.py --publish`, rendered in docs/BENCHMARK_RESULTS.md)
+#     only WARN (annotations + summary table); `fail_on_regression` upgrades
+#     them to a failure. The comparison is on the Rust/Go ratio, not on
+#     absolute times, because a runner is slower or faster than the baseline
+#     machine on both sides.
+#   * Shared runners are noisy: these numbers are indicative, dedicated
+#     hardware is preferred (docs/BENCHMARK_RESULTS.md). This workflow is
+#     scheduled and manually dispatched; it is never a required PR check. The
+#     only pull_request trigger is a path filter on this file and its tooling,
+#     so a change to the CI itself is exercised once.
+
+on:
+  schedule:
+    - cron: "17 3 * * 0"  # weekly, Sunday 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      tiers:
+        description: "Comma-separated tiers (micro,replay,rest,localnet)"
+        default: "micro,replay,rest,localnet"
+        type: string
+      runs:
+        description: "Measured runs per tier (RUNS)"
+        default: "3"
+        type: string
+      profile:
+        description: "rest/localnet profile: smoke (CI sized) or full (long ladder)"
+        default: "smoke"
+        type: choice
+        options: [smoke, full]
+      include_testnet_prefix:
+        description: "Also replay the 50-round real-certificate testnet-prefix50 corpus"
+        default: true
+        type: boolean
+      fail_on_regression:
+        description: "Fail (not only warn) on Rust regressions vs the baseline"
+        default: false
+        type: boolean
+      dry_run_gate_failure:
+        description: "Corrupt the replay corpus on purpose: the job MUST end red (needs replay in tiers)"
+        default: false
+        type: boolean
+  pull_request:
+    paths:
+      - ".github/workflows/bench-compare.yml"
+      - "scripts/bench/baseline.py"
+      - "scripts/bench/test_bench_compare_workflow.py"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-compare-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bench-compare:
+    name: bench-compare (Go vs Rust, Linux runner)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      CARGO_TERM_COLOR: always
+      BENCH_BASELINE: benchmarks/baseline.json
+    steps:
+      - uses: actions/checkout@v7
+      - name: Resolve and validate the inputs
+        id: cfg
+        env:
+          IN_TIERS: ${{ inputs.tiers }}
+          IN_RUNS: ${{ inputs.runs }}
+          IN_PROFILE: ${{ inputs.profile }}
+          IN_TESTNET: ${{ inputs.include_testnet_prefix }}
+          IN_FAIL: ${{ inputs.fail_on_regression }}
+          IN_DRY: ${{ inputs.dry_run_gate_failure }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          tiers="${IN_TIERS:-micro,replay,rest,localnet}"
+          # A pull_request run (a change to this file) is a one-run smoke.
+          if [ "$EVENT" = pull_request ]; then runs="${IN_RUNS:-1}"; else runs="${IN_RUNS:-3}"; fi
+          profile="${IN_PROFILE:-smoke}"
+          testnet="${IN_TESTNET:-true}"
+          fail="${IN_FAIL:-false}"
+          dry="${IN_DRY:-false}"
+          [[ "$runs" =~ ^[1-9][0-9]*$ ]] || { echo "::error::runs must be a positive integer, got '$runs'"; exit 1; }
+          [[ "$tiers" =~ ^[a-z][a-z0-9_-]*(,[a-z][a-z0-9_-]*)*$ ]] || { echo "::error::bad tiers '$tiers'"; exit 1; }
+          for t in ${tiers//,/ }; do
+            case "$t" in micro|replay|rest|localnet) ;; *) echo "::error::tier '$t' is not one of micro,replay,rest,localnet"; exit 1;; esac
+          done
+          has() { case ",$tiers," in *",$1,"*) echo true;; *) echo false;; esac; }
+          if [ "$dry" = true ]; then
+            [ "$(has replay)" = true ] || { echo "::error::dry_run_gate_failure corrupts the replay corpus, so tiers must include replay"; exit 1; }
+            # The gate failure is proven in replay alone: no image build, no other
+            # tier, no second corpus. The job is expected to end red.
+            tiers=replay
+            testnet=false
+          fi
+          docker_tier=false
+          { [ "$(has rest)" = true ] || [ "$(has localnet)" = true ]; } && docker_tier=true
+          # Everything except micro runs binaries built once by build_both.sh.
+          build=false
+          { [ "$(has replay)" = true ] || [ "$docker_tier" = true ]; } && build=true
+          {
+            echo "tiers=$tiers"
+            echo "runs=$runs"
+            echo "profile=$profile"
+            echo "testnet=$testnet"
+            echo "fail_on_regression=$fail"
+            echo "dry_run=$dry"
+            echo "has_replay=$(has replay)"
+            echo "has_docker=$docker_tier"
+            echo "has_micro=$(has micro)"
+            echo "has_build=$build"
+            echo "build_mode=$([ "$build" = true ] && echo prebuilt || echo auto)"
+          } >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
+      - name: Workflow-interface and harness tests
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 scripts/bench/test_bench_compare_workflow.py
+          python3 -m unittest -v scripts/bench/test_baseline.py scripts/bench/test_report.py scripts/bench/test_run.py
+      - name: Locate the go-algorand checkout
+        run: |
+          echo "GO_ALGORAND_DIR=$RUNNER_TEMP/go-algorand" >> "$GITHUB_ENV"
+          echo "BENCH_BIN_DIR=$GITHUB_WORKSPACE/target/bench-compare" >> "$GITHUB_ENV"
+      - name: Resolve the pinned tag and its go.mod
+        id: pin
+        run: |
+          set -euo pipefail
+          tag="$(grep -v '^[[:space:]]*#' scripts/bench/go-algorand.pin | grep -v '^[[:space:]]*$' | head -n1 | tr -d '[:space:]')"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/go-algorand-gomod"
+          # setup-go only parses a file literally named go.mod (else: plain version file).
+          curl -fsSL "https://raw.githubusercontent.com/algorand/go-algorand/${tag}/go.mod" \
+            -o "$RUNNER_TEMP/go-algorand-gomod/go.mod"
+          grep -E '^(go|toolchain) ' "$RUNNER_TEMP/go-algorand-gomod/go.mod"
+      - name: Install Go per go-algorand's go.mod
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: ${{ runner.temp }}/go-algorand-gomod/go.mod
+          cache-dependency-path: benchmarks/go-replay/go.sum
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-compare
+      - name: Install libsodium build tools
+        run: |
+          # go-algorand's crypto package links a vendored libsodium fork via cgo.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends autoconf automake libtool build-essential
+      - name: Clone pinned go-algorand + make libsodium
+        env:
+          TAG: ${{ steps.pin.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 --branch "$TAG" https://github.com/algorand/go-algorand "$GO_ALGORAND_DIR"
+          make -C "$GO_ALGORAND_DIR" libsodium
+      - name: Build both implementations once (build_both.sh)
+        if: steps.cfg.outputs.has_build == 'true'
+        run: |
+          set -euo pipefail
+          # One compile of algod-rust (with the Rust cache) and of go-algorand; the
+          # tiers below adopt it with BENCH_BUILD=prebuilt, and the container tiers'
+          # image is made from the same binary.
+          bash scripts/bench/build_both.sh --out "$BENCH_BIN_DIR" --bin-dir "$BENCH_BIN_DIR" \
+            --go-algorand "$GO_ALGORAND_DIR"
+      - name: Build the algod-rust node image from the built binary
+        if: steps.cfg.outputs.has_docker == 'true'
+        run: |
+          set -euo pipefail
+          # The binary is linked against the runner's glibc: use its OS release as base.
+          base="ubuntu:$(. /etc/os-release; echo "$VERSION_ID")"
+          docker build -f docker/Dockerfile.bench-prebuilt --build-arg "BASE_IMAGE=$base" \
+            -t algod-rust:bench-compare "$BENCH_BIN_DIR/rust"
+      - name: make bench-compare (selected tiers, small corpus)
+        id: main
+        env:
+          TIERS: ${{ steps.cfg.outputs.tiers }}
+          RUNS: ${{ steps.cfg.outputs.runs }}
+          BUILD_MODE: ${{ steps.cfg.outputs.build_mode }}
+          BENCH_REST_PROFILE: ${{ steps.cfg.outputs.profile }}
+          BENCH_LOCALNET_PROFILE: ${{ steps.cfg.outputs.profile }}
+          BENCH_REST_RUST_IMAGE: algod-rust:bench-compare
+          BENCH_LOCALNET_RUST_IMAGE: algod-rust:bench-compare
+          # The dry run of a gate failure: replay replays a corpus whose expected
+          # state is wrong, so its final-state gate must reject it and the tier,
+          # hence this step and the job, must fail. Empty for a normal run.
+          BENCH_REPLAY_CORRUPT: ${{ steps.cfg.outputs.dry_run == 'true' && 'expected' || '' }}
+          BENCH_MICRO_GO_BENCHTIME: 300ms
+          BENCH_MICRO_CRITERION_ARGS: --warm-up-time 0.5 --measurement-time 1
+        run: |
+          set -euo pipefail
+          make bench-compare TIERS="$TIERS" CORPUS=small RUNS="$RUNS" BENCH_BUILD="$BUILD_MODE" \
+            BENCH_RUN_DIR=bench-results/main GO_ALGORAND_DIR="$GO_ALGORAND_DIR"
+      - name: make bench-compare TIERS=replay CORPUS=testnet-prefix50 (real certificates)
+        id: testnet
+        if: steps.cfg.outputs.has_replay == 'true' && steps.cfg.outputs.testnet == 'true'
+        env:
+          RUNS: ${{ steps.cfg.outputs.runs }}
+          BUILD_MODE: ${{ steps.cfg.outputs.build_mode }}
+        run: |
+          set -euo pipefail
+          make bench-compare TIERS=replay CORPUS=testnet-prefix50 RUNS="$RUNS" BENCH_BUILD="$BUILD_MODE" \
+            BENCH_RUN_DIR=bench-results/testnet-prefix50 GO_ALGORAND_DIR="$GO_ALGORAND_DIR"
+      - name: Regression check vs the published baseline (warns, does not fail)
+        # always(): a regression table is useful even when a later tier failed;
+        # it only runs when the report exists. baseline.py exits 0 on warnings.
+        if: always() && steps.main.outcome != 'skipped'
+        env:
+          FAIL_ON_REGRESSION: ${{ steps.cfg.outputs.fail_on_regression }}
+        run: |
+          set -euo pipefail
+          flag=""
+          [ "$FAIL_ON_REGRESSION" = true ] && flag="--fail-on-regression"
+          if [ -s bench-results/main/report.json ]; then
+            python3 scripts/bench/baseline.py compare bench-results/main/report.json \
+              --baseline "$BENCH_BASELINE" --section local-main $flag
+          fi
+          if [ -s bench-results/testnet-prefix50/report.json ]; then
+            python3 scripts/bench/baseline.py compare bench-results/testnet-prefix50/report.json \
+              --baseline "$BENCH_BASELINE" --section local-testnet-prefix50 $flag
+          fi
+      - name: Reports to job summary
+        if: always()
+        run: |
+          for d in main testnet-prefix50; do
+            if [ -s "bench-results/$d/report.md" ]; then
+              {
+                echo "## bench-compare run: $d"
+                echo
+                cat "bench-results/$d/report.md"
+                echo
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+          {
+            echo "CI-runner numbers are noisy and indicative only; dedicated hardware is preferred."
+            echo "Published baseline: docs/BENCHMARK_RESULTS.md."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload run directories
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-compare-results
+          path: bench-results
+          if-no-files-found: ignore

@@ -33,6 +33,7 @@ make bench-compare TIERS=selftest RUNS=5
 - [The `localnet` tier](#the-localnet-tier)
 - [The `rest` tier](#the-rest-tier)
 - [The `catchup` tier](#the-catchup-tier)
+- [CI workflow and published baseline](#ci-workflow-and-published-baseline)
 
 ## Quick start
 
@@ -1667,3 +1668,99 @@ BENCH_CATCHUP_RUST_IMAGE=algod-rust:bench-catchup make bench-compare TIERS=catch
 # the mock network (what CI runs)
 BENCH_CATCHUP_MODE=mock BENCH_CATCHUP_PROFILE=smoke make bench-compare TIERS=catchup RUNS=1
 ```
+
+## CI workflow and published baseline
+
+Issue #2109 (epic #2101). Two things turn the laptop command into a canonical,
+periodic comparison.
+
+### The `bench-compare` workflow
+
+`.github/workflows/bench-compare.yml` runs weekly (Sunday 03:17 UTC) and on
+`workflow_dispatch`. It is never a required PR check: its only `pull_request`
+trigger is a path filter on the workflow, `scripts/bench/baseline.py` and the
+workflow-interface test, so a change to the CI itself runs it once.
+
+It builds both implementations once with `scripts/bench/build_both.sh` (the
+pinned go-algorand tag with the libsodium step, `algod-rust --release` with the
+Rust cache), makes the algod-rust image for the `rest`/`localnet` tiers from
+that same binary (`docker/Dockerfile.bench-prebuilt`, based on the runner's own
+OS release because the binary links the runner's glibc; no second compile in
+Docker), then calls the same `make bench-compare` entry point as a laptop run
+with `BENCH_BUILD=prebuilt` (`run.py --build prebuilt` adopts the binaries and
+`build-info.json` already in `--bin-dir` instead of building), twice: the selected tiers on the `small` corpus
+(`bench-results/main`), and, when `replay` is selected, `replay` on the
+real-certificate `testnet-prefix50` corpus (`bench-results/testnet-prefix50`).
+Both run directories (`report.{json,md}`, `logs/`, `fingerprint.json`,
+`tier-status.json`) are uploaded as the `bench-compare-results` artifact and
+both reports are appended to the job summary.
+
+| Dispatch input | Default | Effect |
+|---|---|---|
+| `tiers` | `micro,replay,rest,localnet` | tiers to run (the `catchup` tier needs a public network and hours: not in CI) |
+| `runs` | `3` (`1` on a pull request) | measured runs per tier (`RUNS`) |
+| `profile` | `smoke` | `rest`/`localnet` profile; `full` is the long ladder |
+| `include_testnet_prefix` | `true` | also replay `testnet-prefix50` |
+| `fail_on_regression` | `false` | turn the regression warnings into a failure |
+| `dry_run_gate_failure` | `false` | replay a corrupted corpus on purpose; runs only the `replay` tier (no image, no other tier, no second corpus) and the job must end red |
+
+Gate behaviour. Every macro tier asserts Go/Rust final-state (or response, or
+txid-set) equality and exits non-zero on a divergence, `run.py` exits 1 when
+any tier exits non-zero, and no step of the workflow is `continue-on-error`,
+so an equality-gate failure fails the job. `dry_run_gate_failure` proves it
+without waiting for a real divergence: it sets `BENCH_REPLAY_CORRUPT=expected`
+for the main run, the replay tier's `final-state gate FAILED` fires and the
+dispatched run is expected to be red (a green dry run would mean the gate no
+longer bites).
+
+Regression check. After the run, `scripts/bench/baseline.py compare` compares
+each report with a section of the committed baseline file
+`benchmarks/baseline.json` and warns, as workflow annotations and a summary
+table, about every paired row whose Rust got more than 25% worse than the
+baseline (`--tolerance`). Every paired row is in the baseline, including rows
+with a zero or undefined Rust/Go ratio. The comparison uses the Rust/Go ratio,
+not absolute medians (a CI runner is slower or faster than the baseline machine
+on both sides), and the Rust medians directly when a ratio is 0 or undefined
+(relative change; from a zero baseline any value above `--zero-threshold`
+counts, so an error rate going from 0 to N regresses). Noise rules: a row is only
+a `regression` when it was conclusive in the baseline or its Rust min-max range
+no longer overlaps the baseline's, otherwise it is `noise`; a move of at most one
+round on `rounds` rows is not a change. Each baseline section records its host
+class (`dev-host`, or `ci-<provider>`); memory/disk/CPU rows (units `MB`,
+`cores`) are only compared within one host class and show `skipped-host`
+otherwise. It exits 0 on warnings, because ratios from shared runners are noisy;
+`--fail-on-regression` (the `fail_on_regression` input) makes it exit 1, and then
+also when the baseline section or a baseline row is missing from the run (a
+renamed section must not disable the gate). Rows only in the run are listed as
+`new`, never flagged. The first green dispatch run should be published as the
+CI-runner baseline under its own section name (see `docs/BENCHMARK_RESULTS.md`).
+
+`scripts/bench/test_bench_compare_workflow.py` is the workflow-interface test
+(like `scripts/test_node_soak_callers.py`): inputs declared and used, tier
+whitelist equal to `scripts/bench/tiers/`, libsodium step, one build before the
+image and the tiers (`BENCH_BUILD=prebuilt`), no `continue-on-error`, dry-run
+wiring, baseline sections present in
+`benchmarks/baseline.json` and `docs/BENCHMARK_RESULTS.md`, artifact and
+summary steps, and the workflow's own input-validation script run with bash
+(unknown tier, injection attempt, `runs=0`, dry run without `replay`).
+
+### Publishing a baseline
+
+`docs/BENCHMARK_RESULTS.md` is hand-written prose around generated blocks
+delimited by `<!-- bench-baseline:begin NAME -->` / `<!-- bench-baseline:end NAME -->`.
+Regenerate a block, and its section of `benchmarks/baseline.json`, from a run
+directory with:
+
+```bash
+make bench-compare TIERS=micro,replay,rest,localnet CORPUS=small RUNS=3 BENCH_RUN_DIR=bench-results/main
+python3 scripts/bench/report.py bench-results/main --publish --section local-main \
+  --doc docs/BENCHMARK_RESULTS.md --baseline benchmarks/baseline.json \
+  --command "make bench-compare TIERS=micro,replay,rest,localnet CORPUS=small RUNS=3"
+```
+
+A report with errors (a failed gate, a skipped tier) is refused. The doc and the
+baseline file are computed first and then both replaced (temp file + rename), so a
+failure leaves neither changed; a CRLF doc keeps its line endings. Each block starts
+with a generated "Summary by tier" table counted from the same rows as its tables. Dedicated,
+quiet hardware gives the numbers worth publishing; CI-runner numbers are only
+for the regression warning.

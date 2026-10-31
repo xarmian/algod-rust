@@ -22,6 +22,13 @@ Exit status: 0 when every result validated, every pair is consistent and
 every tier exited 0; 1 otherwise (the report files are written either way).
 
 Usage: python3 scripts/bench/report.py <run-dir>
+
+Publishing (issue #2109): `report.py <run-dir> --publish --doc docs/BENCHMARK_RESULTS.md
+--section NAME --command "<the make command>" [--baseline benchmarks/baseline.json]`
+replaces the block between `<!-- bench-baseline:begin NAME -->` and
+`<!-- bench-baseline:end NAME -->` in the doc with the run's environment,
+builds and results, and records the section's rows in the baseline file that
+baseline.py compares later runs against. A report with errors is refused.
 """
 import argparse
 import datetime
@@ -29,10 +36,13 @@ import glob
 import json
 import math
 import os
+import re
 import statistics
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import baseline  # noqa: E402
 import bench_schema  # noqa: E402
 
 METHODOLOGY_URL = "https://github.com/xarmian/algod-rust/blob/main/docs/BENCHMARK_COMPARISON.md"
@@ -409,6 +419,133 @@ def fmt_bool(v):
 
 
 # --------------------------------------------------------------------------
+# publishing (issue #2109)
+
+
+def _block_re(section):
+    # The end of the begin-marker line may be LF or CRLF (a doc checked out with
+    # autocrlf); the matched line ending is reused for the block.
+    return re.compile(r"(<!-- bench-baseline:begin %s -->(\r?\n)).*?(<!-- bench-baseline:end %s -->)"
+                      % (re.escape(section), re.escape(section)), re.S)
+
+
+def tier_summary(rep):
+    """Per-tier counts of the paired rows, from the same rows the tables show.
+
+    Returns {tier: (paired, rust_faster, go_faster, inconclusive)}.
+    """
+    out = {}
+    for r in rep["rows"]:
+        if r["status"] != "paired":
+            continue
+        t = out.setdefault(r["tier"], [0, 0, 0, 0])
+        t[0] += 1
+        t[{"rust": 1, "go": 2}.get(r["faster"], 3)] += 1
+    return {k: tuple(v) for k, v in out.items()}
+
+
+def render_summary(rep):
+    """The generated headline: per-tier counts and how many rows were excluded."""
+    lines = ["#### Summary by tier", "",
+             "| Tier | Paired rows | Rust faster | Go faster | Inconclusive |",
+             "|---|---|---|---|---|"]
+    summ = tier_summary(rep)
+    for tier in sorted(summ):
+        lines.append("| " + " | ".join([tier] + [str(x) for x in summ[tier]]) + " |")
+    total = sum(v[0] for v in summ.values())
+    kept = len(baseline.extract_rows(rep))
+    lines += ["", f"{total} paired row(s) in total; {total - kept} paired row(s) excluded from "
+                  f"the baseline file (every paired row is kept, including rows whose Go or Rust "
+                  f"median is 0). Counts come from the tables below.", ""]
+    return "\n".join(lines)
+
+
+def publish_block(doc_text, section, rep, command):
+    """Return doc_text with the `section` block replaced by a rendering of `rep`.
+
+    The report's own title is dropped and its headings are demoted by two
+    levels so the block nests under the doc's own heading; a generated
+    summary by tier (counted from the same rows as the tables) leads it. A
+    report that is not ok is refused: a baseline must not be published from
+    a run whose equality gate or tiers failed. Line endings of the doc
+    (LF or CRLF) are preserved.
+    """
+    if not rep.get("ok"):
+        raise ValueError("refusing to publish a report with errors: "
+                         + "; ".join(rep.get("errors") or ["not ok"]))
+    rx = _block_re(section)
+    m = rx.search(doc_text)
+    if not m:
+        raise ValueError(f"no `bench-baseline:begin {section}` / `end` markers in the doc")
+    eol = m.group(2)
+    body = []
+    for line in render_markdown(rep).splitlines():
+        if line.startswith("# "):
+            continue
+        if line.startswith("## ") or line.startswith("### "):
+            line = "##" + line
+        body.append(line)
+    text = "\n".join(body).strip("\n")
+    block = f"Command: `{command}`\n\n{render_summary(rep)}\n{text}\n".replace("\n", eol)
+    return rx.sub(lambda mm: mm.group(1) + block + mm.group(3), doc_text, count=1)
+
+
+def _write_atomic_pair(files):
+    """Write [(path, text)] so that either every file is replaced or none is.
+
+    Every text goes to a temp file next to its target first; only when all of
+    them are written are they renamed over the targets. Text is written byte
+    for byte (the callers control line endings).
+    """
+    tmps = []
+    try:
+        for path, text in files:
+            fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp",
+                                       dir=os.path.dirname(os.path.abspath(path)))
+            tmps.append((tmp, path))
+            with os.fdopen(fd, "wb") as f:
+                f.write(text.encode("utf-8"))
+        for tmp, path in tmps:
+            os.replace(tmp, path)
+        tmps = []
+    finally:
+        for tmp, _ in tmps:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+
+def publish_main(argv):
+    ap = argparse.ArgumentParser(description="publish a run into docs/BENCHMARK_RESULTS.md")
+    ap.add_argument("run_dir")
+    ap.add_argument("--doc", required=True)
+    ap.add_argument("--section", required=True)
+    ap.add_argument("--command", required=True)
+    ap.add_argument("--baseline", default=baseline.DEFAULT_BASELINE)
+    ap.add_argument("--date", default=None, help="baseline date (default: today, UTC)")
+    args = ap.parse_args(argv)
+    with open(os.path.join(args.run_dir, "report.json"), encoding="utf-8") as f:
+        rep = json.load(f)
+    with open(args.doc, encoding="utf-8", newline="") as f:
+        text = f.read()
+    date = args.date or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    # Compute both outputs before writing either, so a failure in one cannot
+    # leave the doc and the baseline file describing different runs.
+    try:
+        new_doc = publish_block(text, args.section, rep, args.command)
+        new_baseline = baseline.render_baseline_file(args.baseline, args.section, rep, date)
+    except (ValueError, OSError) as e:
+        print(f"publish: {e}", file=sys.stderr)
+        return 1
+    try:
+        _write_atomic_pair([(args.doc, new_doc), (args.baseline, new_baseline)])
+    except OSError as e:
+        print(f"publish: cannot write: {e}", file=sys.stderr)
+        return 1
+    print(f"published section {args.section!r} to {args.doc} and {args.baseline}")
+    return 0
+
+
+# --------------------------------------------------------------------------
 # CLI
 
 
@@ -447,6 +584,10 @@ def load_run_results(run_dir):
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "--publish" in argv:
+        argv.remove("--publish")
+        return publish_main(argv)
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("run_dir")
     args = ap.parse_args(argv)

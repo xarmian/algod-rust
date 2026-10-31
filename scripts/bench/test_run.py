@@ -165,5 +165,64 @@ class SelftestEndToEndTest(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(d, "report.md")))
 
 
+class PrebuiltBuildTest(unittest.TestCase):
+    """--build prebuilt (issue #2109): binaries and build-info.json already
+    exist in --bin-dir (made by build_both.sh), so the run neither compiles
+    again nor skips the tiers that need a build."""
+
+    def make_bin_dir(self, d, with_binary=True):
+        bin_dir = os.path.join(d, "bin")
+        os.makedirs(os.path.join(bin_dir, "rust"))
+        if with_binary:
+            with open(os.path.join(bin_dir, "rust", "algod-rust"), "w") as f:
+                f.write("x")
+        info = {"schema": "bench-build-info/v1", "expected_tag": "v1",
+                "go_algorand": {"built": False},
+                "algod_rust": {"built": True, "commit": "c" * 40, "describe": "c", "dirty": False,
+                               "binaries": ["rust/algod-rust"], "sha256": {"rust/algod-rust": "0"}}}
+        with open(os.path.join(bin_dir, "build-info.json"), "w") as f:
+            json.dump(info, f)
+        return bin_dir
+
+    def make_tier(self, d):
+        tiers = os.path.join(d, "tiers")
+        os.makedirs(tiers)
+        with open(os.path.join(tiers, "needs.py"), "w") as f:
+            f.write("# bench-tier-needs: build\nimport os, sys\n"
+                    "sys.exit(0 if os.path.exists(os.path.join(os.environ['BENCH_RUST_BIN_DIR'], "
+                    "'algod-rust')) else 9)\n")
+        return tiers
+
+    def test_prebuilt_runs_a_build_tier_and_keeps_the_build_info(self):
+        with tempfile.TemporaryDirectory() as d:
+            bin_dir, tiers = self.make_bin_dir(d), self.make_tier(d)
+            out = os.path.join(d, "out")
+            rc = run.main(["--tiers", "needs", "--runs", "1", "--run-dir", out, "--build", "prebuilt",
+                           "--bin-dir", bin_dir, "--tiers-dir", tiers])
+            self.assertEqual(rc, 0)
+            with open(os.path.join(out, "tier-status.json")) as f:
+                st = json.load(f)
+            self.assertEqual([(s["tier"], s["exit_code"]) for s in st], [("needs", 0)])
+            with open(os.path.join(out, "build-info.json")) as f:
+                self.assertEqual(json.load(f)["algod_rust"]["commit"], "c" * 40)
+            self.assertFalse(os.path.exists(os.path.join(out, "logs", "build.log")))
+
+    def test_prebuilt_without_build_info_is_a_usage_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            tiers = self.make_tier(d)
+            rc = run.main(["--tiers", "needs", "--runs", "1", "--run-dir", os.path.join(d, "o"),
+                           "--build", "prebuilt", "--bin-dir", os.path.join(d, "nobin"),
+                           "--tiers-dir", tiers])
+            self.assertEqual(rc, 2)
+
+    def test_prebuilt_with_a_missing_binary_is_a_usage_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            bin_dir = self.make_bin_dir(d, with_binary=False)
+            tiers = self.make_tier(d)
+            rc = run.main(["--tiers", "needs", "--runs", "1", "--run-dir", os.path.join(d, "o"),
+                           "--build", "prebuilt", "--bin-dir", bin_dir, "--tiers-dir", tiers])
+            self.assertEqual(rc, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
