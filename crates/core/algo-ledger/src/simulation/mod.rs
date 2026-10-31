@@ -222,6 +222,33 @@ pub mod test_hooks {
 
     thread_local! {
         static PANIC_AFTER_WITHDRAWAL: Cell<bool> = const { Cell::new(false) };
+        static SERVE_PAST_ROUNDS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Guard that lets this thread's simulates take a `Request.Round` below
+    /// the latest round (issue #2123, DIV-007) until it is dropped. Only for
+    /// oracle tests whose scenarios read no account state that changed after
+    /// `Request.Round` (the duplicate-transaction checks of #2125, which read
+    /// the txtail and the lease table), so their go parity stays pinned.
+    #[must_use = "the past-round window closes when the guard is dropped"]
+    pub struct ServePastRounds(());
+
+    impl ServePastRounds {
+        pub fn enable() -> Self {
+            SERVE_PAST_ROUNDS.with(|c| c.set(true));
+            Self(())
+        }
+
+        /// Whether this thread currently serves past rounds.
+        pub fn is_enabled() -> bool {
+            SERVE_PAST_ROUNDS.with(|c| c.get())
+        }
+    }
+
+    impl Drop for ServePastRounds {
+        fn drop(&mut self) {
+            SERVE_PAST_ROUNDS.with(|c| c.set(false));
+        }
     }
 
     /// Make this thread's next simulate panic right after the block-start
@@ -234,6 +261,19 @@ pub mod test_hooks {
         if PANIC_AFTER_WITHDRAWAL.with(|c| c.replace(false)) {
             panic!("test hook: panic after the block-start withdrawal");
         }
+    }
+}
+
+/// Whether a test hook has opened the past-round window (DIV-007); always
+/// false outside tests.
+fn past_rounds_allowed() -> bool {
+    #[cfg(any(test, feature = "test-hooks"))]
+    {
+        test_hooks::ServePastRounds::is_enabled()
+    }
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    {
+        false
     }
 }
 
@@ -355,14 +395,14 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
     /// Only reads: the withdrawal itself is applied after `check`.
     ///
     /// The rewards inputs (the previous rewards state, the pool, the reward
-    /// units) are the store's own, i.e. the latest round's. For `start` =
-    /// latest that is exactly go's `BlockHdr(start)` / `Totals(start)`. For
-    /// a past `start` it keeps them consistent with the accounts simulate
-    /// reads, which are also the latest state (issue #2123): an older
-    /// header's level paired with newer rewards bases would be a base above
-    /// the level. Without a header for `start` (unit-test stores only; a
-    /// real ledger always has its latest header) the store's protocol stands
-    /// in.
+    /// units) come from the latest state, not from a header: the store's
+    /// rewards fields, its pool account and its totals. For `start` = latest
+    /// that is exactly go's `BlockHdr(start)` / `Totals(start)`. `simulate`
+    /// rejects any earlier `start` (issue #2123, DIV-007), so an older
+    /// header's level is never paired with the latest account state.
+    ///
+    /// Without a header for `start` (unit-test stores only; a real ledger
+    /// always has its latest header) the store's protocol stands in.
     fn prepare_simulated_block(
         &self,
         start: Round,
@@ -514,10 +554,20 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         // headers (`forget_before` isn't wired into the normal apply path),
         // so the header would otherwise still resolve.
         if let Some(requested_round) = request.round {
-            let earliest = self.store.earliest_round();
-            if requested_round < earliest {
+            // DIVERGENCE DIV-007: the store keeps only the latest account,
+            // app, asset and box state, so the earliest round simulate can
+            // serve is the latest round (go serves back to its `dbRound`).
+            let floor = if past_rounds_allowed() {
+                self.store.earliest_round()
+            } else {
+                self.store.earliest_round().max(self.store.current_round())
+            };
+            if requested_round < floor {
                 return Err(SimulatorError::Internal(AlgoError::Ledger {
-                    message: format!("round {} before dbRound {}", requested_round.0, earliest.0),
+                    message: format!(
+                        "round {} before dbRound {} (this node serves simulate only at its                          latest round, so its effective dbRound is the latest round)",
+                        requested_round.0, floor.0
+                    ),
                 }));
             }
         }

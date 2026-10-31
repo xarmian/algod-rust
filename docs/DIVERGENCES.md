@@ -58,6 +58,7 @@ consensus-compatible. It exists for three readers:
 | DIV-004 | Hand-written msgpack struct readers decode the map form only (go also decodes struct-from-array) and replace, rather than merge into, a struct/array on a duplicated key | wire decoding of non-canonical msgpack (blocks, transactions, heartbeat, state proof, PQ structs) | landed | 2026-10-24 | none for canonical encodings (go's encoder never emits the array form or duplicate keys; hashes are over the canonical re-encode); only non-canonical input go accepts is rejected or decoded differently | `crates/core/algo-types/src/rmp_decode.rs` (`read_map_len`), the `decode_from_reader` struct readers in `crates/core/algo-types/src/{transaction,block,header,pq}.rs` | `data/transactions/msgp_gen.go` (`SignedTxn.UnmarshalMsgWithState` struct-from-array branch and key loop), algorand/msgp `msgp/read_bytes.go` | `docs/BYTES_DECODE_PARITY.md` "Issue #2065: final disposition"; `go_msgp_nil_scalars_test.rs` pins the parts that were implemented (nil -> zero) |
 | DIV-005 | `algokey keyreg` and the `--network` presets accept `voimain` (Voi mainnet) and `aramidmain` (Aramid mainnet), networks absent from go-algorand's `validNetworks` map | network presets / algokey genesis-hash table | landed | 2026-10-25 | none (additive preset; the four go networks resolve exactly as before) | `crates/core/algo-types/src/networks.rs`, `bin/algod-rust/src/commands/network_common.rs` | `cmd/algokey/keyreg.go` (`validNetworks`) | genesis-hash pin tests (`networks_parity`, `genesis_test::test_voimain_genesis_hash_matches_fixture`) against the live Voi `/genesis` and `/versions` (epic #2068, #2069, #2070) |
 | DIV-006 | A network preset's bundled `consensus.json` (aramidmain) contributes only protocol versions the binary does not already define; go loads every entry of a `consensus.json` wholesale | `--network aramidmain` consensus table | landed | 2026-10-25 | none (the aramidmain chain only ever uses `aramidmain-v1.0/1..3`, which are loaded exactly as go loads them; the file's stale copies of `future`/`v7`..`v12`/spec-URL protocols are never used by that chain) | `crates/core/algo-types/src/consensus.rs` (`preload_consensus_protocols_with_bundle`), `bin/algod-rust/src/commands/network_common.rs` | `config/config.go` (`PreloadConfigurableConsensusProtocols`), `config/consensus.go` (`ConsensusProtocols.Merge`) | `aramidmain_consensus_test.rs` (`custom_protocols_merge_like_go`, `bundle_adds_only_unknown_protocols`, `data_dir_file_overrides_bundle`) and the live aramidmain catchup + follow (#2070) |
+| DIV-007 | `simulate` serves only `Request.Round` = the latest round; an earlier round is rejected with go's `round %d before dbRound %d` (dbRound = latest), where go serves any round back to its tracker `dbRound` | simulate (`POST /v2/transactions/simulate` with `round`) | landed | 2026-10-31 | none (affects only whether a simulate request with a past round is served; no block, state or consensus path) | `crates/core/algo-ledger/src/simulation/mod.rs` (`Simulator::simulate`) | `ledger/simulation/simulator.go` (`Simulate`, `simulatorLedger.start`), `ledger/acctupdates.go` (`RoundOffsetError`) | `simulation_gaps_test.rs` (`start_round_selection`, `simulate_at_a_past_round_is_rejected_not_evaluated_on_latest_state`, `simulate_round_before_db_round_is_rejected`); the latest-round path stays proven by the #2118 go oracle (`simulation_rewards_oracle_test.rs`) |
 
 ## Entries
 
@@ -308,3 +309,45 @@ follow against the public aramidmain network with zero apply failures.
 `preload_consensus_protocols_with_bundle`.
 
 **How go-algorand could port it.** Not applicable (go has no network presets).
+
+### DIV-007 — simulate serves only the latest round
+
+**Status:** landed (#2123).
+
+**What go-algorand does.** `Simulator.Simulate` sets `simulatorLedger.start =
+Request.Round`, and every account, app, asset and box read, plus `Totals`, is
+served as of `start` from the tracker's in-memory deltas. Any round back to
+`dbRound` works; older rounds fail with `round %d before dbRound %d`
+(`RoundOffsetError`).
+
+**What algod-rust does instead.** The ledger store keeps only the latest state
+(no per-round account history), so `Simulator::simulate` treats the latest round
+as the effective `dbRound`: `Request.Round` below it is rejected with go's
+error text (an internal error, so a 500 like go's), and a round above it fails
+with `ledger does not have entry N` as in go.
+
+**Client-visible consequence.** A client that reads `round = N` from `/status`
+and passes it as `Request.Round` gets a 500 if block `N + 1` lands first; go
+would still serve it (its `dbRound` is typically the latest round minus the
+account lookback). The rejection text appends "this node serves simulate only
+at its latest round, so its effective dbRound is the latest round" to go's
+`round %d before dbRound %d`. The window is deliberately not widened (see #2148).
+
+**What is identical.** Omitting the round, or giving the latest round, behaves
+exactly as go, including the block-start rewards (proven by the #2118 oracle).
+The error text and error class for an unservable round are go's.
+
+**Why.** Evaluating a past round against the latest state under an older header
+returns wrong balances and, on rewards-accruing chains, an inconsistent rewards
+level; failing loudly is closer to go than a silently wrong result. Serving past
+rounds needs undo data for every account, app, asset and box the evaluator can
+read; that is tracked in #2148.
+
+**How parity is proven.** The tests listed in the table row; the error text is
+from `ledger/acctupdates.go`.
+
+**How to switch back.** In `Simulator::simulate`, make `floor` just
+`self.store.earliest_round()` (drop the `.max(self.store.current_round())`) once
+the store can serve historical state, and drop the error-text suffix.
+
+**How go-algorand could port it.** Not applicable (go already serves history).
