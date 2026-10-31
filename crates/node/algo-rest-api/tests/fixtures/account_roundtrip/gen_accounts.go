@@ -85,7 +85,7 @@ func main() {
 	}
 
 	for _, s := range specs {
-		acct, err := v2.AccountDataToAccount(s.addr.String(), &s.rec, s.round, &cons, basics.MicroAlgos{Raw: s.awpr})
+		acct, err := v2.AccountDataToAccount(s.addr.String(), &s.rec, s.round, &cons, basics.MicroAlgos{Raw: s.awpr}, v2.AccountDataToAccountOptions{})
 		if err != nil { panic(err) }
 		// The real endpoint writes the model with echo's ctx.JSON (encoding/json),
 		// which keeps non-nil pointers to empty slices / zero structs (#2156);

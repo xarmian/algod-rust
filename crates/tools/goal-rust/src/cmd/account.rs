@@ -2546,6 +2546,15 @@ pub fn run_assetdetails(args: AssetdetailsArgs, cli_d: Vec<PathBuf>) -> ExitCode
     ExitCode::SUCCESS
 }
 
+/// The account's `assets` array; an absent key and `[]` are the same
+/// "no holdings" (go-algorand always emits `assets`, as `[]` when empty).
+fn held_asset_entries(v: &serde_json::Value) -> &[serde_json::Value] {
+    v.get("assets")
+        .and_then(|a| a.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
 /// `account info -a <addr>` — multi-section dump: Created Assets,
 /// Held Assets, Created Apps, Opted In Apps, Minimum Balance.
 /// Mirrors `printAccountInfo` (`account.go:592-770`).
@@ -2567,29 +2576,22 @@ pub fn run_info(args: InfoArgs, cli_d: Vec<PathBuf>) -> ExitCode {
     let mut held_params: std::collections::HashMap<u64, AssetFetch> =
         std::collections::HashMap::new();
     if !args.only_show_asset_ids {
-        if let (Some(ep), Some(holdings)) = (&endpoint, v.get("assets").and_then(|a| a.as_array()))
-        {
-            for h in holdings {
-                let aid = h.get("asset-id").and_then(|x| x.as_u64()).unwrap_or(0);
-                let fetched = match fetch_asset_params_with_status(&rt, ep, aid) {
+        // An absent `assets` key and an empty array both mean "no holdings"
+        // (go always emits `assets`, `[]` when empty), so there is nothing to
+        // fetch. Without an algod endpoint every holding is `AssetFetch::Error`
+        // so the rendered row is `	ID N, error`.
+        for h in held_asset_entries(&v) {
+            let aid = h.get("asset-id").and_then(|x| x.as_u64()).unwrap_or(0);
+            let fetched = match &endpoint {
+                Some(ep) => match fetch_asset_params_with_status(&rt, ep, aid) {
                     Ok((404, _)) => AssetFetch::Missing,
                     Ok((_, Some(p))) => AssetFetch::Found(p),
                     Ok((_, None)) => AssetFetch::Error,
                     Err(_) => AssetFetch::Error,
-                };
-                held_params.insert(aid, fetched);
-            }
-        } else if v
-            .get("assets")
-            .and_then(|a| a.as_array())
-            .is_some_and(|a| !a.is_empty())
-        {
-            // No algod endpoint but holdings exist — every held asset
-            // becomes AssetFetch::Error so the rendered row is `\tID N, error`.
-            for h in v.get("assets").unwrap().as_array().unwrap() {
-                let aid = h.get("asset-id").and_then(|x| x.as_u64()).unwrap_or(0);
-                held_params.insert(aid, AssetFetch::Error);
-            }
+                },
+                None => AssetFetch::Error,
+            };
+            held_params.insert(aid, fetched);
         }
     }
 
@@ -3198,6 +3200,41 @@ mod tests {
             );
         }
         assert!(report.contains("Minimum Balance:\t100000 microAlgos\n"));
+    }
+
+    /// go-algorand always serializes the four resource lists, so an account
+    /// with no resources arrives as `[]` (not absent, #2156); `goal account
+    /// info` must render both the same way.
+    #[test]
+    fn format_info_empty_resource_arrays_render_like_absent_ones() {
+        let absent = serde_json::json!({
+            "address": "X", "amount": 0, "rewards": 0,
+            "min-balance": 100000, "round": 1, "status": "Offline",
+        });
+        let empty = serde_json::json!({
+            "address": "X", "amount": 0, "rewards": 0,
+            "min-balance": 100000, "round": 1, "status": "Offline",
+            "assets": [], "created-assets": [], "created-apps": [],
+            "apps-local-state": [],
+            "apps-total-schema": {"num-byte-slice": 0, "num-uint": 0},
+            "reward-base": 0,
+        });
+        let none = std::collections::HashMap::new();
+        let want = format_info(&absent, &none, false);
+        let got = format_info(&empty, &none, false);
+        assert_eq!(got, want);
+        assert!(
+            got.0.contains(
+                "Held Assets:
+	<none>
+"
+            ),
+            "{:?}",
+            got.0
+        );
+        // The held-asset fetch list is empty for both shapes.
+        assert!(held_asset_entries(&absent).is_empty());
+        assert!(held_asset_entries(&empty).is_empty());
     }
 
     #[test]

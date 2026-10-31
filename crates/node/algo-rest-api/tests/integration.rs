@@ -3057,10 +3057,10 @@ async fn account_info_exclude_all_omits_resource_lists() {
 
 #[tokio::test]
 async fn account_info_exclude_none_returns_full_info() {
-    // Populate one of each resource so the lists appear. go (and now the Rust
-    // response) omits *empty* resource lists, so a fully-empty account would
-    // have them absent — to verify exclude=none includes resources, the account
-    // must actually hold some.
+    // Populate one of each resource so the test proves exclude=none actually
+    // includes the resources (an empty account also serializes the four lists,
+    // as `[]`; that case is pinned by
+    // `account_info_empty_account_emits_empty_lists_and_zero_defaults`).
     let lookup = AccountLookup {
         account_data: AccountData {
             micro_algos: 1_000_000,
@@ -3281,6 +3281,92 @@ async fn account_info_exclude_both_granular_values_combine() {
     // The resources themselves are still listed by ID/index.
     assert_eq!(body["created-apps"][0]["id"].as_u64(), Some(4));
     assert_eq!(body["created-assets"][0]["index"].as_u64(), Some(2));
+}
+
+fn empty_account_lookup() -> AccountLookup {
+    AccountLookup {
+        account_data: AccountData {
+            micro_algos: 1_000_000,
+            ..AccountData::default()
+        },
+        last_round: 1000,
+        amount_without_pending_rewards: 1_000_000,
+        assets: BTreeMap::new(),
+        created_assets: BTreeMap::new(),
+        app_local_states: BTreeMap::new(),
+        created_apps: BTreeMap::new(),
+    }
+}
+
+async fn get_account_json(server: &TestServer, query: &str) -> serde_json::Value {
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}{}", TEST_ADDR, query)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    resp.json().await.unwrap()
+}
+
+/// Issue #2156: go's `AccountDataToAccount` sets non-nil pointers for the four
+/// resource lists, `apps-total-schema` and `reward-base`, and echo's
+/// `ctx.JSON` (encoding/json) keeps them when empty/zero. This pins the exact
+/// key set go 5.0.4 served for an account with no resources, for the default
+/// request and for every granular `exclude` value (the params excludes only
+/// affect the list *elements*, so empty lists stay `[]`).
+#[tokio::test]
+async fn account_info_empty_account_emits_empty_lists_and_zero_defaults() {
+    let server = TestServer::start(mock_node_with_account(empty_account_lookup())).await;
+
+    for query in [
+        "",
+        "?exclude=none",
+        "?exclude=created-apps-params",
+        "?exclude=created-assets-params",
+        "?exclude=created-apps-params,created-assets-params",
+    ] {
+        let body = get_account_json(&server, query).await;
+        for k in [
+            "assets",
+            "created-assets",
+            "created-apps",
+            "apps-local-state",
+        ] {
+            assert_eq!(body[k], serde_json::json!([]), "{k} for {query:?}");
+        }
+        assert_eq!(
+            body["apps-total-schema"],
+            serde_json::json!({"num-byte-slice": 0, "num-uint": 0}),
+            "{query:?}"
+        );
+        assert_eq!(body["reward-base"], serde_json::json!(0), "{query:?}");
+        for k in ["apps-total-extra-pages", "total-boxes", "last-proposed"] {
+            assert!(body.get(k).is_none(), "{k} must stay omitted for {query:?}");
+        }
+    }
+}
+
+/// `exclude=all` (go's `basicAccountInformation`): the four lists are absent,
+/// but `apps-total-schema` and `reward-base` are still emitted.
+#[tokio::test]
+async fn account_info_exclude_all_empty_account_keeps_schema_and_reward_base() {
+    let server = TestServer::start(mock_node_with_account(empty_account_lookup())).await;
+    let body = get_account_json(&server, "?exclude=all").await;
+    for k in [
+        "assets",
+        "created-assets",
+        "created-apps",
+        "apps-local-state",
+    ] {
+        assert!(body.get(k).is_none(), "exclude=all must omit {k}");
+    }
+    assert_eq!(
+        body["apps-total-schema"],
+        serde_json::json!({"num-byte-slice": 0, "num-uint": 0})
+    );
+    assert_eq!(body["reward-base"], serde_json::json!(0));
 }
 
 /// `all`/`none` must not combine with other values or with each other —
