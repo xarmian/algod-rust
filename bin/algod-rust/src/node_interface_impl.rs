@@ -1597,10 +1597,12 @@ impl NodeInterface for AlgodNodeInterface {
     }
 
     async fn suggested_fee(&self) -> u64 {
-        // go-algorand returns max(MinTxnFee, median(recent fees)). Without a
-        // rolling-fee tracker this falls back to MinTxnFee, matching the
-        // conservative behavior of a freshly-started node.
-        self.min_txn_fee().await
+        // go's `SuggestedFee()` (node/node.go) is `transactionPool.FeePerByte()`:
+        // a fee PER BYTE (0 while the pool is idle), published verbatim as
+        // `fee` by `TransactionParams`. Clients compute
+        // `max(min-fee, fee * len(txn))`. Without a pool there is no
+        // congestion state, which is the idle value 0.
+        self.pool.as_ref().map_or(0, |p| p.fee_per_byte())
     }
 
     async fn min_txn_fee(&self) -> u64 {
@@ -4368,6 +4370,128 @@ mod tests {
         assert!(text.contains("algod_transaction_messages_txpool_check_err_"));
     }
 
+    /// Evaluator that holds one transaction group per "block" and then
+    /// reports go's `ledgercore.ErrNoSpace` text, so the pool rolls into the
+    /// next pending whole block (`numPendingWholeBlocks++`) like go's
+    /// congested-pool tests.
+    struct OneGroupEvaluator {
+        used: bool,
+    }
+
+    impl algo_pool::traits::BlockEvaluator for OneGroupEvaluator {
+        fn round(&self) -> algo_types::Round {
+            algo_types::Round(1)
+        }
+        fn pay_set_size(&self) -> usize {
+            0
+        }
+        fn test_transaction_group(
+            &self,
+            _g: &[algo_types::SignedTransaction],
+        ) -> Result<(), algo_error::AlgoError> {
+            Ok(())
+        }
+        fn transaction_group(
+            &mut self,
+            _g: &[algo_types::SignedTransaction],
+        ) -> Result<(), algo_error::AlgoError> {
+            if self.used {
+                return Err(algo_error::AlgoError::Ledger {
+                    message: "no space left in block".into(),
+                });
+            }
+            self.used = true;
+            Ok(())
+        }
+        fn generate_block(
+            &mut self,
+            _v: &[algo_types::Address],
+        ) -> Result<algo_types::Block, algo_error::AlgoError> {
+            Ok(algo_types::Block::default())
+        }
+        fn reset_txn_bytes(&mut self) {
+            self.used = false;
+        }
+    }
+
+    struct CongestedLedgerStub;
+
+    impl algo_pool::traits::PoolLedger for CongestedLedgerStub {
+        fn latest(&self) -> algo_types::Round {
+            algo_types::Round(0)
+        }
+        fn block_hdr(
+            &self,
+            _r: algo_types::Round,
+        ) -> Result<algo_types::BlockHeader, algo_error::AlgoError> {
+            Ok(algo_types::BlockHeader::default())
+        }
+        fn consensus_params(
+            &self,
+            _r: algo_types::Round,
+        ) -> Result<algo_types::ConsensusParams, algo_error::AlgoError> {
+            Ok(algo_types::ConsensusParams::default())
+        }
+        fn start_evaluator(
+            &self,
+            _h: algo_types::BlockHeader,
+            _hint: usize,
+            _max: usize,
+        ) -> Result<Box<dyn algo_pool::traits::BlockEvaluator>, algo_error::AlgoError> {
+            Ok(Box::new(OneGroupEvaluator { used: false }))
+        }
+    }
+
+    /// #2158: under congestion (several pending whole blocks) `suggested_fee`
+    /// is the pool's non-zero `FeePerByte`, exactly what `/v2/transactions/params`
+    /// publishes as `fee`.
+    #[tokio::test]
+    async fn suggested_fee_tracks_a_congested_pool_fee_per_byte() {
+        let pool = Arc::new(algo_pool::TransactionPool::new(
+            algo_pool::PoolConfig::default(),
+            Arc::new(CongestedLedgerStub),
+        ));
+        pool.ensure_evaluator_primed();
+        let adapter = make_adapter().with_pool(pool.clone());
+        assert_eq!(adapter.suggested_fee().await, 0, "idle before any load");
+        for note in 0..4u8 {
+            let mut t = algo_types::SignedTransaction::default();
+            t.txn.txn_type = algo_types::TxnType::Pay;
+            t.txn.fee = 1_000_000;
+            t.txn.first_valid = algo_types::Round(1);
+            t.txn.last_valid = algo_types::Round(1000);
+            t.txn.note = serde_bytes::ByteBuf::from(vec![note]);
+            pool.remember(vec![t]).expect("remember");
+        }
+        let fpb = pool.fee_per_byte();
+        assert!(fpb > 0, "congested pool must price per byte, got {fpb}");
+        assert_eq!(adapter.suggested_fee().await, fpb);
+        assert_ne!(adapter.suggested_fee().await, adapter.min_txn_fee().await);
+    }
+
+    /// #2158: no pool attached reports the idle value 0, never the min fee.
+    #[tokio::test]
+    async fn suggested_fee_without_a_pool_is_zero() {
+        let adapter = make_adapter();
+        assert_eq!(adapter.suggested_fee().await, 0);
+        assert_eq!(adapter.min_txn_fee().await, 1_000);
+    }
+
+    /// #2158: with an idle pool attached, `suggested_fee` is the pool's
+    /// `FeePerByte` (0), never the flat min fee (go's `SuggestedFee()`).
+    #[tokio::test]
+    async fn suggested_fee_is_idle_pool_fee_per_byte_not_min_fee() {
+        let pool = Arc::new(algo_pool::TransactionPool::new(
+            algo_pool::PoolConfig::default(),
+            Arc::new(PoolLedgerStub),
+        ));
+        let adapter = make_adapter().with_pool(pool.clone());
+        assert_eq!(pool.fee_per_byte(), 0);
+        assert_eq!(adapter.suggested_fee().await, pool.fee_per_byte());
+        assert_eq!(adapter.suggested_fee().await, 0);
+        assert_eq!(adapter.min_txn_fee().await, 1_000);
+    }
+
     #[test]
     fn cached_genesis_accessors_return_config_values() {
         let adapter = make_adapter();
@@ -4402,9 +4526,9 @@ mod tests {
     async fn min_txn_fee_pulls_from_consensus_params() {
         let adapter = make_adapter();
         assert_eq!(adapter.min_txn_fee().await, 1_000);
-        // suggested_fee defaults to min_txn_fee when no rolling-fee tracker
-        // is wired up.
-        assert_eq!(adapter.suggested_fee().await, 1_000);
+        // suggested_fee is the pool's fee PER BYTE (0 when idle), not the
+        // min fee (#2158).
+        assert_eq!(adapter.suggested_fee().await, 0);
     }
 
     #[tokio::test]

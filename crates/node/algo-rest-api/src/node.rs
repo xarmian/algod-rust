@@ -447,8 +447,13 @@ pub trait NodeInterface: Send + Sync + 'static {
 
     /// The suggested transaction fee in microAlgos.
     ///
-    /// In go-algorand this comes from `node.SuggestedFee()` which returns
-    /// the max of the minimum fee and the median fee from recent blocks.
+    /// In go-algorand this is `node.SuggestedFee()`, i.e. the transaction
+    /// pool's `FeePerByte()`: a fee PER BYTE that is 0 while the pool is
+    /// idle. `TransactionParams` publishes it verbatim as `fee`; the flat
+    /// minimum is reported separately as `min-fee`.
+    ///
+    /// An implementation with no transaction pool reports 0, go's idle
+    /// value; it must never substitute the flat minimum fee here.
     async fn suggested_fee(&self) -> u64;
 
     /// The minimum transaction fee for the current protocol, in microAlgos.
@@ -1387,7 +1392,8 @@ mod tests {
             Ok(base_status(self.last_round))
         }
         async fn suggested_fee(&self) -> u64 {
-            1000
+            // Per-byte pool fee: 0 when idle (go's `FeePerByte`), not min-fee.
+            0
         }
         async fn min_txn_fee(&self) -> u64 {
             1000
