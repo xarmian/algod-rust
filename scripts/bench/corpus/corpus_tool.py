@@ -281,6 +281,238 @@ def summary(cj):
     return "\n".join(lines) + "\n"
 
 
+# ---- msgpack records (block + certificate), standard library only -------------
+#
+# blocks.bin records hold the /v2/blocks/{r}?format=msgpack response body, a
+# map {"block": ..., "cert": ...}. The checks below parse that structure
+# instead of scanning bytes, so a corruption or a fetched body is tied to a
+# specific field of a specific record (issue #2119).
+
+BLOCKS_MAGIC = b"ACRPBLK1"
+
+
+def parse_records(blocks):
+    """[(round, payload_offset, payload_length)] of a blocks.bin's bytes."""
+    if blocks[:8] != BLOCKS_MAGIC:
+        raise ValueError("bad blocks.bin magic")
+    out, i = [], 8
+    while i < len(blocks):
+        if i + 12 > len(blocks):
+            raise ValueError("truncated record header")
+        rnd = int.from_bytes(blocks[i:i + 8], "big")
+        n = int.from_bytes(blocks[i + 8:i + 12], "big")
+        if i + 12 + n > len(blocks):
+            raise ValueError("truncated record payload")
+        out.append((rnd, i + 12, n))
+        i += 12 + n
+    return out
+
+
+def _mp_item(buf, i):
+    """One msgpack item header at `i`: (kind, value, next). kind: int, nil,
+    bool, float, str, bin, ext (value is the bytes or the number) or map /
+    array (value is the element count, next the first element's offset).
+    ValueError when the item (its header or its payload) is not entirely
+    inside `buf`."""
+    kind, v, nxt = _mp_item_unchecked(buf, i)
+    if nxt > len(buf):
+        raise ValueError(f"truncated msgpack item at offset {i}")
+    return kind, v, nxt
+
+
+def _mp_item_unchecked(buf, i):
+    try:
+        b = buf[i]
+        if b <= 0x7f:
+            return "int", b, i + 1
+        if b >= 0xe0:
+            return "int", b - 256, i + 1
+        if 0x80 <= b <= 0x8f:
+            return "map", b & 0xf, i + 1
+        if 0x90 <= b <= 0x9f:
+            return "array", b & 0xf, i + 1
+        if 0xa0 <= b <= 0xbf:
+            n = b & 0x1f
+            return "str", buf[i + 1:i + 1 + n], i + 1 + n
+        if b == 0xc0:
+            return "nil", None, i + 1
+        if b in (0xc2, 0xc3):
+            return "bool", b == 0xc3, i + 1
+        sizes = {0xc4: 1, 0xc5: 2, 0xc6: 4, 0xd9: 1, 0xda: 2, 0xdb: 4}
+        if b in sizes:
+            w = sizes[b]
+            n = int.from_bytes(buf[i + 1:i + 1 + w], "big")
+            s = i + 1 + w
+            return ("bin" if b < 0xd0 else "str"), buf[s:s + n], s + n
+        if b in (0xc7, 0xc8, 0xc9):
+            w = {0xc7: 1, 0xc8: 2, 0xc9: 4}[b]
+            n = int.from_bytes(buf[i + 1:i + 1 + w], "big")
+            s = i + 1 + w + 1
+            return "ext", buf[s:s + n], s + n
+        if 0xd4 <= b <= 0xd8:
+            n = 1 << (b - 0xd4)
+            return "ext", buf[i + 2:i + 2 + n], i + 2 + n
+        if b == 0xca:
+            return "float", buf[i + 1:i + 5], i + 5
+        if b == 0xcb:
+            return "float", buf[i + 1:i + 9], i + 9
+        if 0xcc <= b <= 0xcf:
+            w = 1 << (b - 0xcc)
+            return "int", int.from_bytes(buf[i + 1:i + 1 + w], "big"), i + 1 + w
+        if 0xd0 <= b <= 0xd3:
+            w = 1 << (b - 0xd0)
+            return "int", int.from_bytes(buf[i + 1:i + 1 + w], "big", signed=True), i + 1 + w
+        if b in (0xdc, 0xdd):
+            w = 2 if b == 0xdc else 4
+            return "array", int.from_bytes(buf[i + 1:i + 1 + w], "big"), i + 1 + w
+        if b in (0xde, 0xdf):
+            w = 2 if b == 0xde else 4
+            return "map", int.from_bytes(buf[i + 1:i + 1 + w], "big"), i + 1 + w
+    except IndexError:
+        pass
+    raise ValueError(f"malformed msgpack at offset {i}")
+
+
+def _mp_skip(buf, i):
+    pending = 1
+    while pending:
+        kind, v, i = _mp_item(buf, i)
+        if i > len(buf):
+            raise ValueError("truncated msgpack")
+        pending -= 1
+        if kind == "array":
+            pending += v
+        elif kind == "map":
+            pending += 2 * v
+    return i
+
+
+def _mp_map(buf, i):
+    """{key: (value_start, value_end)} of the map at `i` (str keys only)."""
+    kind, n, j = _mp_item(buf, i)
+    if kind != "map":
+        raise ValueError("not a msgpack map")
+    out = {}
+    for _ in range(n):
+        kk, key, j = _mp_item(buf, j)
+        if kk != "str":
+            raise ValueError("non-string map key")
+        end = _mp_skip(buf, j)
+        out[key.decode("utf-8", "replace")] = (j, end)
+        j = end
+    return out
+
+
+def mp_decode(buf, i=0):
+    """The msgpack value at `i` as Python data: maps are dicts keyed by
+    str, bin is bytes. Returns (value, next_offset)."""
+    kind, v, j = _mp_item(buf, i)
+    if kind == "array":
+        out = []
+        for _ in range(v):
+            x, j = mp_decode(buf, j)
+            out.append(x)
+        return out, j
+    if kind == "map":
+        out = {}
+        for _ in range(v):
+            kk, key, j = _mp_item(buf, j)
+            if kk != "str":
+                raise ValueError("non-string map key")
+            x, j = mp_decode(buf, j)
+            out[key.decode("utf-8", "replace")] = x
+        return out, j
+    if kind == "str":
+        return v.decode("utf-8", "replace"), j
+    return v, j
+
+
+def block_round(payload):
+    """The round of a block response record; ValueError unless the payload is
+    a msgpack map holding a "block" map and a "cert". Round 0's header has
+    no `rnd` key (it is omitted when zero)."""
+    top = _mp_map(payload, 0)
+    if "block" not in top or "cert" not in top:
+        raise ValueError("not a block response: no block/cert")
+    blk = _mp_map(payload, top["block"][0])
+    if "rnd" not in blk:
+        return 0
+    kind, v, _ = _mp_item(payload, blk["rnd"][0])
+    if kind != "int":
+        raise ValueError("block rnd is not an integer")
+    return v
+
+
+def _cert_vote_offsets(payload):
+    top = _mp_map(payload, 0)
+    if "cert" not in top:
+        raise ValueError("no cert in the record")
+    cert = _mp_map(payload, top["cert"][0])
+    if "vote" not in cert:
+        raise ValueError("the certificate holds no votes")
+    kind, n, j = _mp_item(payload, cert["vote"][0])
+    if kind != "array" or n == 0:
+        raise ValueError("the certificate holds no votes")
+    out = []
+    for _ in range(n):
+        end = _mp_skip(payload, j)
+        out.append((j, end))
+        j = end
+    return out
+
+
+def cert_votes(payload):
+    """The certificate's votes as decoded dicts ([] when it has none)."""
+    try:
+        offs = _cert_vote_offsets(payload)
+    except ValueError:
+        return []
+    return [mp_decode(payload, s)[0] for s, _ in offs]
+
+
+def vote_signature_last_byte_offset(payload):
+    """Offset in `payload` of the last byte of the certificate's last vote's
+    one-time signature `sig.s` (a 64-byte bin). ValueError if the record has
+    no such vote."""
+    start, _ = _cert_vote_offsets(payload)[-1]
+    vote = _mp_map(payload, start)
+    if "sig" not in vote:
+        raise ValueError("the last vote has no sig")
+    sig = _mp_map(payload, vote["sig"][0])
+    if "s" not in sig:
+        raise ValueError("the last vote's sig has no s")
+    kind, data, nxt = _mp_item(payload, sig["s"][0])
+    if kind != "bin" or len(data) != 64:
+        raise ValueError("sig.s is not a 64-byte bin")
+    return nxt - 1
+
+
+def corrupt_vote(blocks_path, rnd=None):
+    """Flip the low bit of the last byte of round `rnd`'s (default: the last
+    record's) last vote signature in blocks.bin; returns (round, offset in
+    the file)."""
+    try:
+        with open(blocks_path, "rb") as f:
+            b = bytearray(f.read())
+    except OSError as e:
+        raise ValueError(f"cannot read {blocks_path}: {e}")
+    recs = parse_records(bytes(b))
+    if not recs:
+        raise ValueError("blocks.bin holds no records")
+    if rnd is None:
+        r, off, n = recs[-1]
+    else:
+        found = [x for x in recs if x[0] == rnd]
+        if not found:
+            raise ValueError(f"blocks.bin has no record for round {rnd}")
+        r, off, n = found[0]
+    pos = off + vote_signature_last_byte_offset(bytes(b[off:off + n]))
+    b[pos] ^= 1
+    with open(blocks_path, "wb") as f:
+        f.write(b)
+    return r, pos
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)

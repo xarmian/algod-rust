@@ -22,14 +22,21 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/algorand/go-algorand/data/basics"
+	"github.com/algorand/go-algorand/util/db"
 )
 
 // The tests run goreplay's main() in a child process of the test binary
@@ -46,6 +53,10 @@ func TestMain(m *testing.M) {
 }
 
 const smallCorpus = "../corpus/small"
+
+// testnetPrefix holds rounds 0..50 of the real testnet: real certificates, so
+// the replay takes the non-DevMode branch and runs cert.Authenticate.
+const testnetPrefix = "../corpus/testnet-prefix50"
 
 func runReplay(t *testing.T, args ...string) (int, string) {
 	t.Helper()
@@ -68,17 +79,21 @@ func runReplay(t *testing.T, args ...string) (int, string) {
 
 // copyCorpus copies the small corpus into a temp dir.
 func copyCorpus(t *testing.T) string {
+	return copyCorpusFrom(t, smallCorpus)
+}
+
+func copyCorpusFrom(t *testing.T, src string) string {
 	t.Helper()
 	dst := filepath.Join(t.TempDir(), "corpus")
 	if err := os.MkdirAll(dst, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	ents, err := os.ReadDir(smallCorpus)
+	ents, err := os.ReadDir(src)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, e := range ents {
-		b, err := os.ReadFile(filepath.Join(smallCorpus, e.Name()))
+		b, err := os.ReadFile(filepath.Join(src, e.Name()))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -152,6 +167,182 @@ func TestCorruptedTxnFailsTheReplay(t *testing.T) {
 	code, stderr := runReplay(t, "-corpus", corpus, "-data", filepath.Join(dir, "node"), "-out", filepath.Join(dir, "r.json"))
 	if code != 1 || !strings.Contains(stderr, "contents do not match header") {
 		t.Fatalf("want exit 1 on a corrupted txn, got %d:\n%s", code, stderr)
+	}
+}
+
+// The testnet prefix replays through cert.Authenticate (its certificates
+// hold the committee's votes) to the state corpus.json records, and the
+// recorded block hash is the one the archival endpoint attested.
+func TestTestnetPrefixAuthenticatesEveryCertificate(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "result.json")
+	code, stderr := runReplay(t, "-corpus", testnetPrefix, "-data", filepath.Join(dir, "node"), "-out", out)
+	if code != 0 {
+		t.Fatalf("goreplay exited %d:\n%s", code, stderr)
+	}
+	var res struct {
+		Config      map[string]any `json:"config"`
+		CorpusMatch *bool          `json:"corpus_match"`
+	}
+	raw, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := decodeJSON(raw, &res); err != nil {
+		t.Fatal(err)
+	}
+	if res.CorpusMatch == nil || !*res.CorpusMatch {
+		t.Fatalf("final state does not match corpus.json")
+	}
+	if res.Config["DevMode"] != false {
+		t.Fatalf("the testnet prefix must not be replayed as DevMode: %v", res.Config["DevMode"])
+	}
+}
+
+// lastRecord returns the offset and length of the last record's payload in a
+// blocks.bin (magic, then round u64 | length u32 | payload records).
+func lastRecord(t *testing.T, b []byte) (round uint64, off, n int) {
+	t.Helper()
+	if string(b[:len(blocksMagic)]) != blocksMagic {
+		t.Fatal("bad blocks.bin magic")
+	}
+	i := len(blocksMagic)
+	for i < len(b) {
+		round = binary.BigEndian.Uint64(b[i : i+8])
+		n = int(binary.BigEndian.Uint32(b[i+8 : i+12]))
+		off = i + 12
+		i = off + n
+	}
+	if i != len(b) {
+		t.Fatal("truncated blocks.bin")
+	}
+	return round, off, n
+}
+
+// A flipped bit in one vote's ephemeral signature fails cert.Authenticate.
+// The flip is anchored to a specific vote: the "s" key (fixstr 1, bin8 of 64
+// bytes) last in the last record's payload, which holds the block first and
+// the certificate after it, and the decoded certificate before and after
+// must differ in the last byte of its last vote's signature and nowhere else.
+func TestTestnetPrefixTamperedVoteFailsAuthentication(t *testing.T) {
+	corpus := copyCorpusFrom(t, testnetPrefix)
+	path := filepath.Join(corpus, "blocks.bin")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	round, off, n := lastRecord(t, b)
+	payload := b[off : off+n]
+	_, certBefore, err := processBlockBytes(append([]byte(nil), payload...), basics.Round(round))
+	if err != nil {
+		t.Fatal(err)
+	}
+	needle := []byte{0xa1, 's', 0xc4, 64}
+	i := bytes.LastIndex(payload, needle)
+	if i < 0 {
+		t.Fatal("no vote signature in the last record")
+	}
+	pos := i + len(needle) + 63
+	payload[pos] ^= 1
+	_, certAfter, err := processBlockBytes(payload, basics.Round(round))
+	if err != nil {
+		t.Fatalf("the tampered record must still decode: %v", err)
+	}
+	nv := len(certBefore.Votes)
+	if nv == 0 || nv != len(certAfter.Votes) {
+		t.Fatalf("votes: %d before, %d after", nv, len(certAfter.Votes))
+	}
+	if !reflect.DeepEqual(certBefore.Votes[:nv-1], certAfter.Votes[:nv-1]) {
+		t.Fatal("the flip changed a vote other than the last")
+	}
+	sb, sa := certBefore.Votes[nv-1].Sig.Sig, certAfter.Votes[nv-1].Sig.Sig
+	if !bytes.Equal(sb[:63], sa[:63]) || sb[63]^sa[63] != 1 {
+		t.Fatalf("the flip is not the last byte of the last vote's signature: %x vs %x", sb, sa)
+	}
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	code, stderr := runReplay(t, "-corpus", corpus, "-data", filepath.Join(dir, "node"), "-out", filepath.Join(dir, "r.json"))
+	if code != 1 || !strings.Contains(stderr, "did not authenticate block") {
+		t.Fatalf("want exit 1 on a tampered vote, got %d:\n%s", code, stderr)
+	}
+}
+
+// A replay limited to a few rounds (the bisecting mode) of a chain that has
+// created no box reads its final state: go's box scan reports a stale database
+// round for a ledger without KV rows (boxKeys), which is not a failure.
+func TestShortBoxFreeReplayReadsItsFinalState(t *testing.T) {
+	for _, rounds := range []string{"3", "20"} {
+		dir := t.TempDir()
+		out := filepath.Join(dir, "result.json")
+		code, stderr := runReplay(t, "-corpus", testnetPrefix, "-data", filepath.Join(dir, "node"),
+			"-out", out, "-rounds", rounds)
+		if code != 0 {
+			t.Fatalf("-rounds %s: goreplay exited %d:\n%s", rounds, code, stderr)
+		}
+		raw, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var res struct {
+			FinalState struct {
+				Round uint64         `json:"round"`
+				KV    map[string]any `json:"kv"`
+			} `json:"final_state"`
+			CorpusMatch *bool `json:"corpus_match"`
+		}
+		if err := decodeJSON(raw, &res); err != nil {
+			t.Fatal(err)
+		}
+		if strconv.FormatUint(res.FinalState.Round, 10) != rounds {
+			t.Fatalf("-rounds %s: final round %d", rounds, res.FinalState.Round)
+		}
+		if n, _ := res.FinalState.KV["count"].(json.Number); n.String() != "0" {
+			t.Fatalf("-rounds %s: kv count %v, want 0 (no box in the prefix)", rounds, res.FinalState.KV["count"])
+		}
+		if res.CorpusMatch != nil {
+			t.Fatalf("-rounds %s: a partial replay has no corpus.json comparison", rounds)
+		}
+	}
+}
+
+// kvstoreRows counts the committed KV rows of a tracker database: boxKeys
+// falls back to the in-memory deltas only when there are none, and fails
+// loudly when there are some (a stale database round is then a real problem).
+func TestKvstoreRowsCountsTheCommittedRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tracker.sqlite")
+	acc, err := db.MakeAccessor(path, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = acc.Atomic(func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS kvstore (key blob primary key, value blob)")
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := kvstoreRows(path); err != nil || n != 0 {
+		t.Fatalf("empty table: got %d, %v", n, err)
+	}
+	err = acc.Atomic(func(ctx context.Context, tx *sql.Tx) error {
+		for _, k := range []string{"bx:a", "bx:b"} {
+			if _, err := tx.ExecContext(ctx, "INSERT INTO kvstore (key, value) VALUES (?, ?)", []byte(k), []byte("v")); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	acc.Close()
+	if n, err := kvstoreRows(path); err != nil || n != 2 {
+		t.Fatalf("two rows: got %d, %v", n, err)
+	}
+	if _, err := kvstoreRows(filepath.Join(t.TempDir(), "absent.sqlite")); err == nil {
+		t.Fatal("a missing database must be an error, not zero rows")
 	}
 }
 

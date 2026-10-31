@@ -209,6 +209,36 @@ impl BlockFetcher for CorpusBlockFetcher {
 pub struct CorpusCatchupLedger {
     inner: Arc<AgreementLedgerBridge>,
     devmode: bool,
+    /// The last certificate-authentication failure: the catchup service only
+    /// logs it (as a warning), so the replay keeps it for its own error.
+    last_auth_error: Arc<LastAuthError>,
+}
+
+/// The last certificate-authentication failure of a replay: the round and the
+/// reason. A later successful authentication clears it, and it is reported
+/// only for the round the replay stalled at, so a stall with another cause
+/// (a fetch failure, an apply failure) never points at certificates.
+#[derive(Default)]
+pub struct LastAuthError(Mutex<Option<(u64, String)>>);
+
+impl LastAuthError {
+    /// Record the outcome of authenticating `round`'s certificate.
+    pub fn note(&self, round: u64, res: &Result<(), String>) {
+        if let Ok(mut last) = self.0.lock() {
+            *last = res.as_ref().err().map(|e| (round, e.clone()));
+        }
+    }
+
+    /// `"; last authentication error: round N: ..."` if the last failure was
+    /// for `stalled`, else the empty string.
+    pub fn report(&self, stalled: u64) -> String {
+        match self.0.lock().ok().and_then(|l| l.clone()) {
+            Some((round, e)) if round == stalled => {
+                format!("; last authentication error: round {round}: {e}")
+            }
+            _ => String::new(),
+        }
+    }
 }
 
 /// The only certificate a DevMode chain has: `{"rnd": r}`.
@@ -239,11 +269,13 @@ impl CatchupLedger for CorpusCatchupLedger {
         self.inner.is_behind_committing_deltas()
     }
     fn authenticate_block(&self, block: &Block, cert: &Certificate) -> Result<(), String> {
-        if self.devmode {
+        let res = if self.devmode {
             check_devmode_certificate(block, cert)
         } else {
             self.inner.authenticate_block(block, cert)
-        }
+        };
+        self.last_auth_error.note(block.round.0, &res);
+        res
     }
     fn apply_stall_retry_in(&self, next_round: Round) -> Option<Duration> {
         self.inner.apply_stall_retry_in(next_round)
@@ -476,6 +508,7 @@ pub fn replay_corpus(args: &ReplayCorpusArgs) -> anyhow::Result<ReplayResult> {
     let before = proc_stats();
     let start = Instant::now();
     let shared = Arc::new(Mutex::new(ledger));
+    let last_auth_error = Arc::new(LastAuthError::default());
     {
         let bridge = Arc::new(AgreementLedgerBridge::new_with_advancer_and_condvar(
             Arc::clone(&shared),
@@ -485,6 +518,7 @@ pub fn replay_corpus(args: &ReplayCorpusArgs) -> anyhow::Result<ReplayResult> {
         let catchup: Arc<dyn CatchupLedger> = Arc::new(CorpusCatchupLedger {
             inner: bridge,
             devmode: genesis.devmode,
+            last_auth_error: Arc::clone(&last_auth_error),
         });
         let (_stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
         loop {
@@ -498,9 +532,10 @@ pub fn replay_corpus(args: &ReplayCorpusArgs) -> anyhow::Result<ReplayResult> {
                     .last_error()
                     .map(|e| format!("; last fetch error: {e}"))
                     .unwrap_or_default();
+                let auth = last_auth_error.report(next);
                 bail!(
                     "replay stopped at round {next}: the catchup sync pass ended ({}) \
-                     without committing it{fetch}",
+                     without committing it{fetch}{auth}",
                     exit_reason_str(&reason)
                 );
             }
@@ -762,6 +797,157 @@ mod tests {
             }
         }
         panic!("no txn note found");
+    }
+
+    fn testnet_prefix() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/corpus/testnet-prefix50")
+    }
+
+    fn copy_corpus(src: &Path, dst: &Path) {
+        std::fs::create_dir(dst).unwrap();
+        for e in std::fs::read_dir(src).unwrap() {
+            let e = e.unwrap();
+            std::fs::copy(e.path(), dst.join(e.file_name())).unwrap();
+        }
+    }
+
+    /// The one-time signatures (`cert.vote[*].sig.s`) of a record's
+    /// certificate, from the production block-response decoder.
+    fn vote_signatures(payload: &[u8]) -> Vec<Vec<u8>> {
+        fn get<'a>(v: &'a rmpv::Value, key: &str) -> &'a rmpv::Value {
+            v.as_map()
+                .and_then(|m| m.iter().find(|(k, _)| k.as_str() == Some(key)))
+                .map(|(_, v)| v)
+                .unwrap_or_else(|| panic!("no `{key}` in the certificate"))
+        }
+        let resp = algo_codec::decode_block_response(payload).unwrap();
+        let cert = resp.cert.expect("a certificate");
+        get(&cert, "vote")
+            .as_array()
+            .expect("votes")
+            .iter()
+            .map(|vote| match get(get(vote, "sig"), "s") {
+                rmpv::Value::Binary(b) => b.clone(),
+                other => panic!("sig.s is {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Flip the last byte of the ephemeral signature (`"s"`, bin8 of 64
+    /// bytes) of the last vote in round `round`'s certificate. The key is
+    /// searched only in that record, last occurrence (the certificate follows
+    /// the block), and the decoded certificate before and after must differ
+    /// in that signature's last byte and nowhere else.
+    fn corrupt_last_vote_signature(path: &Path, round: u64) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let (off, len) = corpus::parse_blocks(&bytes)
+            .unwrap()
+            .iter()
+            .find(|r| r.round == round)
+            .map(|r| {
+                (
+                    r.payload.as_ptr() as usize - bytes.as_ptr() as usize,
+                    r.payload.len(),
+                )
+            })
+            .expect("round in corpus");
+        let before = vote_signatures(&bytes[off..off + len]);
+        let i = bytes[off..off + len]
+            .windows(4)
+            .rposition(|w| w == [0xa1, b's', 0xc4, 64])
+            .expect("a vote signature in the certificate");
+        bytes[off + i + 4 + 63] ^= 0x01;
+        let after = vote_signatures(&bytes[off..off + len]);
+        assert!(!before.is_empty());
+        let n = before.len();
+        assert_eq!(before[..n - 1], after[..n - 1], "another vote changed");
+        assert_eq!(before[n - 1][..63], after[n - 1][..63]);
+        assert_eq!(before[n - 1][63] ^ after[n - 1][63], 1);
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    /// The testnet prefix has real certificates (votes), so the replay runs
+    /// the non-DevMode branch: every certificate goes through
+    /// `AgreementLedgerBridge::authenticate_block`, and the state reached is
+    /// the one go-algorand's ledger reached (benchmarks/corpus/testnet-prefix50).
+    #[test]
+    fn testnet_prefix_authenticates_every_certificate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let res = replay_corpus(&ReplayCorpusArgs {
+            corpus: testnet_prefix(),
+            data_dir: tmp.path().join("node"),
+            config: None,
+            rounds: None,
+            dump_state: None,
+        })
+        .unwrap();
+        assert_eq!(res.corpus_mismatches, Vec::<String>::new());
+        assert_eq!(res.corpus_match, Some(true));
+        assert_eq!(res.metrics.blocks, 50);
+        assert_eq!(
+            res.config.get("DevMode"),
+            Some(&serde_json::Value::Bool(false))
+        );
+    }
+
+    /// A flipped bit in one vote's signature must fail the replay at that
+    /// round (certificate authentication), not just at the end.
+    #[test]
+    fn testnet_prefix_tampered_vote_fails_authentication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad = tmp.path().join("corpus");
+        copy_corpus(&testnet_prefix(), &bad);
+        corrupt_last_vote_signature(&bad.join("blocks.bin"), 30);
+        let err = replay_corpus(&ReplayCorpusArgs {
+            corpus: bad,
+            data_dir: tmp.path().join("node"),
+            config: None,
+            rounds: None,
+            dump_state: None,
+        })
+        .expect_err("a tampered vote must fail the replay");
+        let msg = err.to_string();
+        assert!(msg.contains("replay stopped at round 30"), "{msg}");
+        // and it says why: the certificate did not authenticate (the votes
+        // are checked in order; the flipped one is the last)
+        assert!(
+            msg.contains("last authentication error: round 30: ")
+                && msg.contains("failed verification"),
+            "{msg}"
+        );
+    }
+
+    /// The authentication failure is reported only for the round the replay
+    /// stalled at, and only while no later authentication has succeeded:
+    /// a later unrelated stall must not point at certificates.
+    #[test]
+    fn last_auth_error_is_reported_only_for_the_stalled_round() {
+        let e = LastAuthError::default();
+        assert_eq!(e.report(5), "", "nothing recorded yet");
+        e.note(5, &Err("vote at index 3 failed verification".to_string()));
+        assert_eq!(
+            e.report(5),
+            "; last authentication error: round 5: vote at index 3 failed verification"
+        );
+        assert_eq!(
+            e.report(6),
+            "",
+            "another round stalled: not an auth failure"
+        );
+        // the same round authenticates on a later attempt: cleared
+        e.note(5, &Ok(()));
+        assert_eq!(e.report(5), "");
+        // a failure, then later rounds succeed, then an unrelated stall
+        e.note(7, &Err("bad".to_string()));
+        e.note(8, &Ok(()));
+        assert_eq!(e.report(7), "");
+        assert_eq!(e.report(9), "");
+        // a genuine failure after successes is still reported
+        e.note(9, &Err("bad again".to_string()));
+        assert_eq!(
+            e.report(9),
+            "; last authentication error: round 9: bad again"
+        );
     }
 
     #[test]

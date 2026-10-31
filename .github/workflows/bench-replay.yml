@@ -15,7 +15,10 @@ name: Bench Ledger Replay
 #   * `make bench-compare TIERS=replay CORPUS=small RUNS=3`, report.md to
 #     the job summary;
 #   * the gate's negative tests: the tier re-run on a corrupted copy of the
-#     corpus (a flipped txn byte; a wrong expected state) must fail.
+#     corpus (a flipped txn byte; a wrong expected state) must fail;
+#   * issue #2119: the committed 50-round testnet prefix (real certificates)
+#     replayed with certificate authentication on both sides, and the same
+#     corpus with one tampered vote, which must fail on both sides.
 # CI runners are noisy: the ratios are indicative only.
 
 on:
@@ -123,7 +126,7 @@ jobs:
           git clone --quiet --depth 1 --branch "$TAG" https://github.com/algorand/go-algorand "$GO_ALGORAND_DIR"
           make -C "$GO_ALGORAND_DIR" libsodium
       - name: Tier unit tests (gate, negative corpora, result rows)
-        run: python3 -m unittest -v scripts/bench/test_replay.py
+        run: python3 -m unittest -v scripts/bench/test_replay.py scripts/bench/test_testnet_corpus.py
       - name: Go harness - gofmt, vet, tests
         run: |
           set -euo pipefail
@@ -177,6 +180,34 @@ jobs:
               grep -qF "$want" "$out/log.txt" || { echo "::error::$kind: failed, but without '$want'"; exit 1; }
             done
             echo "corrupted corpus ($kind): the tier failed, as it must"
+          done
+      - name: make bench-compare TIERS=replay CORPUS=testnet-prefix50 (real certificates)
+        run: |
+          set -euo pipefail
+          # Issue #2119: the committed 50-round testnet prefix has real
+          # certificates, so both sides authenticate every one of them.
+          make bench-compare TIERS=replay CORPUS=testnet-prefix50 RUNS=1 \
+            BENCH_RUN_DIR=bench-results/ci-replay-testnet GO_ALGORAND_DIR="$GO_ALGORAND_DIR"
+      - name: Negative test - a tampered vote fails certificate authentication
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/neg-vote"
+          mkdir -p "$out"
+          if BENCH_CORPUS=testnet-prefix50 BENCH_REPLAY_CORRUPT=vote BENCH_RUNS=1 \
+               BENCH_REPLAY_WARMUP=0 BENCH_OUT="$out" \
+               BENCH_RUST_BIN_DIR="$BENCH_BIN_DIR/rust" BENCH_GO_ALGORAND_DIR="$GO_ALGORAND_DIR" \
+               python3 scripts/bench/tiers/replay.py > "$out/log.txt" 2>&1; then
+            cat "$out/log.txt"
+            echo "::error::the replay tier passed on a corpus with a tampered vote"
+            exit 1
+          fi
+          tail -n 5 "$out/log.txt"
+          # Both sides reject it on their own, and for the right reason: at
+          # certificate authentication, not for any other failure.
+          for want in 'go replay exited 1' 'did not authenticate block' \
+                      'rust replay exited 1' 'replay stopped at round' \
+                      'last authentication error'; do
+            grep -qF "$want" "$out/log.txt" || { echo "::error::vote: failed, but without '$want'"; exit 1; }
           done
       - name: Report to job summary
         if: always()

@@ -797,6 +797,8 @@ commit the new `small`, update `manifest_sha256` (and the tag/URL) in
 ```bash
 make bench-compare TIERS=replay RUNS=3                 # small corpus (committed)
 make bench-compare TIERS=replay CORPUS=large RUNS=3    # large corpus (fetched)
+make bench-compare TIERS=replay CORPUS=testnet-head RUNS=3    # real certificates (fetched once)
+make bench-compare TIERS=replay CORPUS=testnet-prefix50 RUNS=3  # 50 real rounds (committed)
 BENCH_CORPUS_DIR=/path/to/corpus make bench-compare TIERS=replay RUNS=3
 ```
 
@@ -842,7 +844,9 @@ state.
   check (`check_devmode_certificate`).
 - A non-DevMode corpus is authenticated for real on both sides: go's
   `cert.Authenticate` with an `AsyncVoteVerifier`, the bridge's
-  `Certificate::authenticate`.
+  `Certificate::authenticate`. The
+  [`testnet-head` corpus](#the-testnet-head-corpus-real-certificates) is
+  one: it is what benchmarks that path.
 
 **DevMode payouts.** go's catchup `AddBlock` evaluates with
 `validate = false`, and `validateForPayouts` runs only inside `endOfBlock`'s
@@ -944,11 +948,108 @@ the Rust state against Go's without Go installed. The `algo-bench` test
   mismatch).
 - `BENCH_REPLAY_CORRUPT=expected` alters the expected `accounts_sha256`. Both
   replays succeed, and the gate rejects the state.
-- In both cases the manifest is re-hashed, so the corpus still verifies.
-- Both must fail the tier. CI runs both. The Go tests
-  `TestCorruptedTxnFailsTheReplay` / `TestWrongExpectedStateExits3`, the Rust
-  test `corrupted_txn_fails_the_replay` and `scripts/bench/test_replay.py`
-  cover the same paths per side.
+- `BENCH_REPLAY_CORRUPT=vote` (corpora with real certificates only, such as
+  `testnet-prefix50`) flips one bit of the last byte of the last vote's
+  signature (`cert.vote[-1].sig.s`) in the last record, located by parsing the
+  record's msgpack (`corpus_tool.corrupt_vote`). Both replays stop at that
+  round, at certificate authentication (go: `cert did not authenticate
+  block`; Rust: `replay stopped at round N: ... ; last authentication error: round N: ...`). A DevMode corpus has no
+  votes, so the tier refuses to build this corpus from one. The Go and Rust
+  tests do the same flip on their side and decode the record before and after
+  to assert that exactly that signature byte changed.
+- In all cases the manifest is re-hashed, so the corpus still verifies.
+- Each must fail the tier. CI runs all three. The Go tests
+  `TestCorruptedTxnFailsTheReplay` / `TestWrongExpectedStateExits3` /
+  `TestTestnetPrefixTamperedVoteFailsAuthentication`, the Rust tests
+  `corrupted_txn_fails_the_replay` /
+  `testnet_prefix_tampered_vote_fails_authentication` and
+  `scripts/bench/test_replay.py` / `test_testnet_corpus.py` cover the same
+  paths per side.
+
+### The `testnet-head` corpus (real certificates)
+
+```bash
+make bench-compare TIERS=replay CORPUS=testnet-head RUNS=3
+python3 scripts/bench/corpus/fetch_testnet.py fetch    # only the fetch
+```
+
+The DevMode corpora cannot benchmark certificate verification: their
+certificates hold only the round. `testnet-head` (issue #2119) is the first
+20,000 rounds of the public testnet, blocks and certificates verbatim, with
+`devmode: false` in `corpus.json`. Both harnesses then take their
+non-DevMode branch and authenticate **every** certificate: go's
+`cert.Authenticate` with an `AsyncVoteVerifier`, and algod-rust's
+`Certificate::authenticate` through `AgreementLedgerBridge::authenticate_block`
+(the catchup service's own check). Votes are verified against the online
+stake at the round's balance-lookback round, so the tier measures the vote
+signature, VRF-credential and committee-sortition work a node pays during
+catchup.
+
+| | |
+|---|---|
+| Source | an archival algod, default `https://testnet-api.algonode.cloud` (`endpoint=` in `benchmarks/corpus/testnet-head.ref`, override with `TESTNET_ENDPOINT` or `--endpoint`): `GET /v2/blocks/{r}?format=msgpack` for rounds 0..20000, the response bodies stored unchanged as `ACRPBLK1` records, plus `GET /genesis` stored byte for byte as served (`benchmarks/corpus/**` is `-text`, so no checkout rewrites it) |
+| Checks while fetching | every block body must parse as a msgpack `{block, cert}` response for the requested round (an HTML error page, an empty body or another round's block aborts the fetch); the genesis must hash (go's `Genesis.Hash`, ported from `canonical_encode_genesis`) to the endpoint's `genesis-hash` **and** to the `genesis_hash=` the ref pins (testnet's), so an endpoint of another network is refused ("wrong network"); the final state must agree with the endpoint's block hash and txn counter. A body cut short mid-transfer, a reset or a timeout is retried with backoff (exit 3 when exhausted). Nothing is installed on any failure, and `--force` replaces an existing corpus only at the very end (the old one is untouched until the new one is complete and verified) |
+| Cost | about 20,000 requests (a few minutes with 16-32 workers) and 258 MB on disk, fetched once. The replay then needs no network. Go replays it in about 40 s and 270 MB RSS on a 24-core Linux box (the vote checks run in parallel) |
+| Cache and pin | `benchmarks/corpus/testnet-head/` (git-ignored). `testnet-head.ref` pins the sha256 of its `MANIFEST.sha256`; a fetch whose bytes differ is discarded, so every run reads identical bytes (two independent fetches gave the same manifest). The tier checks an existing cache against the pin too and refuses a foreign or stale one (delete it, or `fetch --force`) |
+| Tier | `CORPUS=testnet-head` fetches the corpus when it is missing (exit 3 and a message when the endpoint is unreachable; `BENCH_CORPUS_DIR` then works with a copy) |
+| Committed slice | `benchmarks/corpus/testnet-prefix50/` holds rounds 0..50 (650 kB) with its final state. The default test suites replay it with every certificate authenticated: the Rust tests `testnet_prefix_authenticates_every_certificate` / `testnet_prefix_tampered_vote_fails_authentication`, the Go tests `TestTestnetPrefixAuthenticatesEveryCertificate` / `TestTestnetPrefixTamperedVoteFailsAuthentication`, and CI's `CORPUS=testnet-prefix50` tier run. Its own ref, `benchmarks/corpus/testnet-prefix50.ref`, pins its manifest and holds its final state; rebuild it as shown below |
+
+The committed slice is rebuilt, from the same endpoint and byte for byte, with:
+
+```bash
+python3 scripts/bench/corpus/fetch_testnet.py fetch --ref benchmarks/corpus/testnet-prefix50.ref --name testnet-prefix50 --dest benchmarks/corpus/testnet-prefix50 --force
+```
+
+A ref describes one range: `--rounds N` selects another and then ignores the
+ref's `final_state` and `manifest_sha256` (pass `--final-state` to give one).
+`scripts/bench/test_testnet_corpus.py` runs the command above, exactly as
+printed here, against a local mock endpoint.
+
+**Final state.** `corpus.json`'s `final_state` is defined as for the other
+corpora. `round`, `block_hash` and `txn_counter` are the endpoint's
+(`GET /v2/blocks/N/hash`, the header's `tc`; testnet's first blocks carry no
+txn counter, so it is 0). `total_money`, `online_money`, `accounts`,
+`accounts_microalgos` and `accounts_sha256` describe the balances at round N,
+which an algod serves only for the current round, never for a past one, so
+they cannot come from the endpoint. They are the state go-algorand's own
+ledger reaches replaying this very stream
+(`benchmarks/corpus/testnet-head.final.json`, derived with
+`fetch_testnet.py finalize` from a `goreplay` result). `finalize` refuses a
+replay whose round, block hash or txn counter differs from the endpoint's,
+and the fetch checks the committed file against the endpoint again. So the Go
+state is anchored to the chain by the block hash (which commits to the
+payset and the rewards state), and Rust is held to Go by the usual gate.
+
+**`known_accounts`.** The set is rebuilt from the corpus as for the DevMode
+corpora: every genesis allocation, every top-level payment receiver and the
+accounts of the first two apps the corpus creates (none exist in this range,
+so the set is the genesis accounts plus the payment receivers: 195 at round
+20,000).
+
+**What it does not cover.** The first 20,000 rounds hold 425 transactions,
+no applications, no boxes, no proposer
+payouts and no state proofs: those arrived in later consensus versions, and a
+node cannot start there without a catchpoint. This corpus benchmarks
+certificate authentication and the per-round ledger overhead of an almost
+empty chain. Payouts and state-proof transactions need a corpus that starts
+from a catchpoint-restored ledger (see the follow-up issue linked from
+#2119).
+
+**Go harness note.** go's `accountUpdates.lookupKeysByPrefix` learns the
+database round from the `kvstore` rows its query returns, so on a ledger
+that never created a box it reports `StaleDatabaseRoundError` (database round
+0) although nothing is stale. The Go harness's box scan (`boxKeys` in
+`benchmarks/go-replay/state.go`) treats exactly that case as "no committed
+boxes" and takes the live ones from the in-memory deltas, but only after
+counting the rows of the tracker database's `kvstore` table (`kvstoreRows`):
+if any row is committed, the stale round is a real inconsistency and the
+harness fails instead of dropping boxes. go logs one `level=error` line for the
+benign case; that line is harmless. Covered: the no-row case end to end
+(`testnet-prefix50`, `-rounds 20`), the row count itself
+(`TestKvstoreRowsCountsTheCommittedRows`), and the unchanged path of a ledger
+with boxes (the `small` corpus). Not covered: the loud-failure branch of
+`boxKeys` itself, because go cannot be made to report a stale round with
+committed KV rows.
 
 ### CI
 
@@ -959,7 +1060,11 @@ It runs:
 - the tier's Python tests;
 - `make bench-compare TIERS=replay CORPUS=small RUNS=3`, with `report.md`
   appended to the job summary;
-- both negative tests.
+- both negative tests;
+- `make bench-compare TIERS=replay CORPUS=testnet-prefix50 RUNS=1` (50 real
+  rounds, every certificate authenticated on both sides) and the `vote`
+  negative test. The 20,000-round `testnet-head` corpus needs the public
+  endpoint and is not fetched in CI.
 
 CI runners are noisy, so treat their ratios as indicative only.
 

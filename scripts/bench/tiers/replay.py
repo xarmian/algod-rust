@@ -22,16 +22,25 @@ corpus.json (`corpus_match`). A diverging state is a parity bug, not a
 benchmark result.
 
 Inputs (environment):
-  BENCH_CORPUS / CORPUS     corpus name: `small` (default, committed) or
+  BENCH_CORPUS / CORPUS     corpus name: `small` (default, committed),
                             `large` (fetched with scripts/bench/fetch_corpus.sh
-                            into benchmarks/corpus/large when missing)
+                            into benchmarks/corpus/large when missing),
+                            `testnet-head` (the first rounds of the real
+                            testnet, with real certificates, so both sides
+                            authenticate every certificate; fetched with
+                            scripts/bench/corpus/fetch_testnet.py into
+                            benchmarks/corpus/testnet-head when missing, issue
+                            #2119) or `testnet-prefix50` (its committed
+                            50-round slice)
   BENCH_CORPUS_DIR          an explicit corpus directory (overrides the name)
   BENCH_REPLAY_WARMUP       discarded warm-up runs per side (default 1)
   BENCH_REPLAY_ROUNDS       replay only rounds 1..N (bisecting; no corpus gate)
-  BENCH_REPLAY_CORRUPT      negative test: `txn` (flip one byte of a txn note)
-                            or `expected` (alter corpus.json's expected
-                            state), with the manifest re-hashed; the tier must
-                            then fail
+  BENCH_REPLAY_CORRUPT      negative test: `txn` (flip one byte of a txn note),
+                            `vote` (flip one bit of a vote signature in the
+                            last certificate; needs a corpus with real
+                            certificates) or `expected` (alter corpus.json's
+                            expected state), with the manifest re-hashed; the
+                            tier must then fail
   plus the tier contract (BENCH_RUNS, BENCH_OUT, BENCH_RUST_BIN_DIR,
   BENCH_GO_ALGORAND_DIR; docs/BENCHMARK_COMPARISON.md).
 
@@ -147,10 +156,20 @@ def corrupt_corpus(src, dst, kind):
 
       txn       flip the last byte of the first txn note in blocks.bin (the
                 block's payset commitment no longer matches its header);
+      vote      flip one bit of the last byte of the last vote's signature
+                (cert.vote[-1].sig.s, located by parsing the record's msgpack,
+                corpus_tool.corrupt_vote) in the last record: that certificate
+                no longer authenticates its block;
       expected  change corpus.json's expected `accounts_sha256`.
     """
     shutil.copytree(src, dst)
-    if kind == "txn":
+    if kind == "vote":
+        try:
+            corpus_tool.corrupt_vote(os.path.join(dst, "blocks.bin"))
+        except ValueError as e:
+            raise TierError(f"cannot tamper a vote in blocks.bin: {e} "
+                            "(a DevMode corpus has no votes)")
+    elif kind == "txn":
         p = os.path.join(dst, "blocks.bin")
         with open(p, "rb") as f:
             b = bytearray(f.read())
@@ -170,12 +189,33 @@ def corrupt_corpus(src, dst, kind):
             json.dump(cj, f, indent=2)
             f.write("\n")
     else:
-        raise TierError(f"BENCH_REPLAY_CORRUPT={kind!r}: want txn or expected")
+        raise TierError(f"BENCH_REPLAY_CORRUPT={kind!r}: want txn, vote or expected")
     corpus_tool.write_manifest(dst)
     return dst
 
 
 # ---- corpus and binaries -----------------------------------------------------
+
+def check_cache_pin(d, name):
+    """The fetched testnet-head cache must hold the corpus its ref pins: the
+    sha256 of its MANIFEST.sha256 (which in turn pins every file; `main`
+    verifies those). A foreign or stale cache is refused, not replayed."""
+    if name != "testnet-head":
+        return
+    ref_path = os.path.join(REPO, "benchmarks", "corpus", "testnet-head.ref")
+    if not os.path.isfile(ref_path):
+        return
+    import fetch_testnet
+    pin = fetch_testnet.read_ref(ref_path).get("manifest_sha256", "")
+    if len(pin) != 64 or not set(pin) <= corpus_tool.HEX_DIGITS:
+        return  # not pinned yet
+    m = os.path.join(d, corpus_tool.MANIFEST)
+    got = corpus_tool.sha256_file(m) if os.path.isfile(m) else "(no manifest)"
+    if got != pin:
+        raise TierError(f"{d}: MANIFEST.sha256 has sha256 {got}, benchmarks/corpus/testnet-head.ref "
+                        f"pins {pin}: not the pinned testnet-head corpus. Delete it to refetch, or "
+                        "run scripts/bench/corpus/fetch_testnet.py fetch --force")
+
 
 def resolve_corpus():
     d = os.environ.get("BENCH_CORPUS_DIR")
@@ -189,8 +229,18 @@ def resolve_corpus():
         if rc != 0:
             raise TierError(f"fetch_corpus.sh exited {rc}: generate the corpus with "
                             "`make bench-corpus-large` or pass BENCH_CORPUS_DIR")
+    if name == "testnet-head" and not os.path.isfile(os.path.join(d, "corpus.json")):
+        print("replay: fetching the testnet-head corpus "
+              "(scripts/bench/corpus/fetch_testnet.py)", flush=True)
+        rc = subprocess.run([sys.executable, os.path.join(BENCH, "corpus", "fetch_testnet.py"),
+                             "fetch"]).returncode
+        if rc != 0:
+            raise TierError(f"fetch_testnet.py exited {rc}: the testnet endpoint must be "
+                            "reachable once (docs/BENCHMARK_COMPARISON.md, \"The testnet-head "
+                            "corpus\"), or pass BENCH_CORPUS_DIR")
     if not os.path.isfile(os.path.join(d, "corpus.json")):
         raise TierError(f"no corpus at {d}")
+    check_cache_pin(d, name)
     return d
 
 

@@ -35,3 +35,6 @@ __pycache__/
 *.pyc
 # Fetched/generated large workload corpus (issue #2104, scripts/bench/fetch_corpus.sh).
 /benchmarks/corpus/large/
+# Fetched testnet-head replay corpus (issue #2119, scripts/bench/corpus/fetch_testnet.py).
+/benchmarks/corpus/testnet-head/
+/benchmarks/corpus/testnet-head.partial/

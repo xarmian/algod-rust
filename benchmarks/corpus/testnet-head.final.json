@@ -1,0 +1,10 @@
+{
+  "round": 20000,
+  "block_hash": "blk-GYVKZJJ272UTPT6KCKFRPWUFRBXUC3JQOJD5C27IGDNGCD7M2DVA",
+  "txn_counter": 0,
+  "total_money": 10004990034159082,
+  "online_money": 9793874043245142,
+  "accounts": 195,
+  "accounts_microalgos": 10125000000100000,
+  "accounts_sha256": "89c15e32e6d4fa0d11e2d23fbfe1400e464a33dd6d2001b1f3d9254adbfcc434"
+}

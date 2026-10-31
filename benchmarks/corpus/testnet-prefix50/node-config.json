@@ -1,0 +1,9 @@
+{
+	"Version": 38,
+	"Archival": true,
+	"GossipFanout": 0,
+	"IncomingConnectionsLimit": 0,
+	"DNSBootstrapID": "",
+	"EnableDeveloperAPI": true,
+	"EnableExperimentalAPI": true
+}
