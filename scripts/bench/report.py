@@ -169,6 +169,9 @@ def build_report(results, fingerprint=None, build_info=None, tier_status=None,
             "faster": None,
             "speedup": None,
             "synthetic": any(bool(r["metadata"].get("synthetic")) for r in rs),
+            # Real-network rows (the `catchup` tier, #2108) are not reproducible:
+            # the report says so next to the numbers.
+            "nondeterministic": any(bool(r["metadata"].get("nondeterministic")) for r in rs),
             "metadata": {impl: [r["metadata"] for r in rs if r["impl"] == impl]
                          for impl in ("go", "rust")},
         }
@@ -352,8 +355,17 @@ def render_markdown(report):
         if r["tier"] not in tiers:
             tiers.append(r["tier"])
     for tier in tiers:
-        w(f"### {tier}")
+        nondet = [r for r in report["rows"] if r["tier"] == tier]
+        nondet = bool(nondet) and all(r.get("nondeterministic") for r in nondet)
+        w(f"### {tier}" + (" (non-deterministic, real network)" if nondet else ""))
         w("")
+        if nondet:
+            w("**Non-deterministic: this group was measured against a live public network. "
+              "Relay speed, peer choice and the network's own load change between runs, "
+              "so read the spread (n = number of repeats), not a single value, and do not "
+              "compare it with runs of another day. The gate (identical catchpoint label, "
+              "identical block hashes over the followed range) is the only deterministic part.**")
+            w("")
         w("| Benchmark | Unit | Go median | Go spread | Rust median | Rust spread | Rust/Go | Faster |")
         w("|---|---|---|---|---|---|---|---|")
         for r in report["rows"]:
@@ -362,6 +374,8 @@ def render_markdown(report):
             unit = r["unit"] if isinstance(r["unit"], str) else "/".join(r["unit"])
             arrow = {"lower": " (lower is better)", "higher": " (higher is better)"}.get(r["better"], "")
             name = r["name"] + (" (synthetic)" if r["synthetic"] else "")
+            if r.get("nondeterministic"):
+                name += " (non-deterministic)"
             w(f"| {name} | {unit}{arrow} | {fmt((r['go'] or {}).get('median'))} | {_spread(r['go'])} | "
               f"{fmt((r['rust'] or {}).get('median'))} | {_spread(r['rust'])} | "
               f"{fmt(r['ratio'])} | {_faster_cell(r)} |")

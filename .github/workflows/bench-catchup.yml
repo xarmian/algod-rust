@@ -1,0 +1,140 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: Bench Catchup Smoke
+
+# Issue #2108 (epic #2101): the public-network fast-catchup + follow tier.
+# This is a SMOKE of the tier's driver, not a benchmark, and it NEVER touches
+# the public network: the unit tests cover the configuration, stage detection,
+# gates and failure classification, and `BENCH_CATCHUP_MODE=mock` runs the real
+# driver against two in-process mock nodes and a mock chain (no Docker, no
+# go-algorand build, nothing external). The real run is a manual
+# `make bench-compare TIERS=catchup NETWORK=testnet` (docs/BENCHMARK_COMPARISON.md,
+# "The catchup tier").
+
+on:
+  pull_request:
+    paths:
+      - "scripts/bench/catchup_lib.py"
+      - "scripts/bench/test_catchup.py"
+      - "scripts/bench/tiers/catchup.py"
+      - "scripts/bench/tiers/rest.py"
+      - "scripts/bench/tiers/replay.py"
+      - "scripts/bench/tiers/localnet.py"
+      - "scripts/bench/rest_lib.py"
+      - "scripts/bench/localnet_lib.py"
+      - "scripts/bench/bench_schema.py"
+      - "scripts/bench/schema/**"
+      - "scripts/bench/report.py"
+      - "scripts/bench/run.py"
+      - "scripts/bench/fingerprint.py"
+      - "docker/algod/genesis/testnet/**"
+      - "docker/algod/genesis/mainnet/**"
+      - "docker/algod/genesis/betanet/**"
+      - "Makefile"
+      - ".github/workflows/bench-catchup.yml"
+  push:
+    branches: [main]
+    paths:
+      - "scripts/bench/catchup_lib.py"
+      - "scripts/bench/test_catchup.py"
+      - "scripts/bench/tiers/catchup.py"
+      - "scripts/bench/tiers/rest.py"
+      - "scripts/bench/tiers/replay.py"
+      - "scripts/bench/tiers/localnet.py"
+      - "scripts/bench/rest_lib.py"
+      - "scripts/bench/localnet_lib.py"
+      - "scripts/bench/bench_schema.py"
+      - "scripts/bench/schema/**"
+      - "scripts/bench/report.py"
+      - "scripts/bench/run.py"
+      - "scripts/bench/fingerprint.py"
+      - "docker/algod/genesis/testnet/**"
+      - "docker/algod/genesis/mainnet/**"
+      - "docker/algod/genesis/betanet/**"
+      - "Makefile"
+      - ".github/workflows/bench-catchup.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench-catchup:
+    name: catchup tier smoke (mock network, Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Unit tests (config, stages, gates, failure classes, rows, mock tier)
+        run: python3 -m unittest -v scripts/bench/test_catchup.py scripts/bench/test_report.py
+      - name: make bench-compare TIERS=catchup (mock network)
+        env:
+          BENCH_CATCHUP_MODE: mock
+          BENCH_CATCHUP_PROFILE: smoke
+          BENCH_CATCHUP_POLL_S: "0.2"
+        run: |
+          set -euo pipefail
+          make bench-compare TIERS=catchup RUNS=2 BENCH_RUN_DIR=bench-results/ci-catchup
+          python3 - <<'PY'
+          import json
+          rep = json.load(open("bench-results/ci-catchup/report.json"))
+          assert rep["ok"], rep["errors"]
+          rows = [r for r in rep["rows"] if r["tier"] == "catchup"]
+          assert rows, "no catchup rows"
+          assert all(r["nondeterministic"] for r in rows), "rows must be marked non-deterministic"
+          names = {r["name"] for r in rows}
+          for want in ("total_to_head_s", "replay_blocks_per_s", "follow_rounds_per_s",
+                       "gate_rounds_compared"):
+              assert want in names, want
+          assert all(r["status"] == "paired" and r["go"]["n"] == 2 for r in rows), "n must be 2"
+          print(f"catchup rows: {len(rows)}, all paired, non-deterministic, n=2")
+          PY
+      - name: Negative test - a diverging block hash fails the gate (class node)
+        env:
+          BENCH_CATCHUP_MODE: mock
+          BENCH_CATCHUP_PROFILE: smoke
+          BENCH_CATCHUP_POLL_S: "0.2"
+          BENCH_CATCHUP_MOCK_FAULT: diverge
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/neg-catchup"
+          mkdir -p "$out"
+          if BENCH_RUNS=1 BENCH_OUT="$out" python3 scripts/bench/tiers/catchup.py > "$out/log.txt" 2>&1; then
+            cat "$out/log.txt"; echo "::error::the catchup tier passed with a diverging block hash"; exit 1
+          fi
+          tail -n 5 "$out/log.txt"
+          grep -qF 'FAILURE CLASS: node' "$out/log.txt"
+          grep -qF 'block-hash equality gate FAILED' "$out/log.txt"
+          test ! -e "$out/catchup.json"
+      - name: Negative test - a stalled network is an external-network failure
+        env:
+          BENCH_CATCHUP_MODE: mock
+          BENCH_CATCHUP_PROFILE: smoke
+          BENCH_CATCHUP_POLL_S: "0.2"
+          BENCH_CATCHUP_MOCK_FAULT: stall
+          BENCH_CATCHUP_STAGE_TIMEOUT: "4"
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/stall-catchup"
+          mkdir -p "$out"
+          if BENCH_RUNS=1 BENCH_OUT="$out" python3 scripts/bench/tiers/catchup.py > "$out/log.txt" 2>&1; then
+            cat "$out/log.txt"; echo "::error::the catchup tier passed against a stalled network"; exit 1
+          fi
+          tail -n 5 "$out/log.txt"
+          grep -qF 'FAILURE CLASS: external network' "$out/log.txt"
+          ! grep -qF 'FAILURE CLASS: node' "$out/log.txt"
+      - name: Report to job summary
+        if: always()
+        run: |
+          if [ -s bench-results/ci-catchup/report.md ]; then
+            cat bench-results/ci-catchup/report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload run directory
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-catchup-results
+          path: bench-results/ci-catchup
+          if-no-files-found: ignore
