@@ -20,6 +20,7 @@ runs in the default unit tests (test_localnet.py); the tier script
 import hashlib
 import json
 import re
+import time
 
 MIB = 1024 * 1024
 TOKEN = "a" * 64
@@ -290,17 +291,64 @@ def step_metrics(loadgen, window, resources):
     return m
 
 
-def fixed_metrics(loadgen, window, resources):
-    """step_metrics of the fixed-count step plus the commit time of the whole
-    set: first submit to last confirmation (`commit_time_s`) and the TPS it
-    implies (`set_tps`)."""
+def commit_span(p0, p_last):
+    """Chain time and rounds from the block before the first submission (`p0`)
+    to the block holding the last transaction of the set (`p_last`), both
+    block_point()s. This is commit speed measured on the chain, not by polling."""
+    return {"secs": p_last["ts"] - p0["ts"], "rounds": p_last["round"] - p0["round"]}
+
+
+def fixed_metrics(loadgen, window, resources, span):
+    """step_metrics of the fixed-count step plus how fast the whole set was
+    committed: `commit_rounds`, `commit_time_s` (block-header seconds) and the
+    `set_tps` they imply. Block timestamps have one-second resolution."""
     m = step_metrics(loadgen, window, resources)
-    fx = loadgen["fixed"]
-    secs = fx.get("all_confirmed_after_secs") or 0
-    if secs > 0:
-        m["commit_time_s"] = ("s", "lower", float(secs))
-        m["set_tps"] = ("txn/s", "higher", fx["confirmed_txns"] / secs)
+    if span["rounds"] > 0:
+        m["commit_rounds"] = ("rounds", "lower", float(span["rounds"]))
+    if span["secs"] > 0:
+        m["commit_time_s"] = ("s", "lower", float(span["secs"]))
+        m["set_tps"] = ("txn/s", "higher",
+                        loadgen["fixed"]["confirmed_txns"] / span["secs"])
     return m
+
+
+class RoundWaitError(Exception):
+    pass
+
+
+def require_round(value, what):
+    """`value` (a node's last round) or RoundWaitError when the node gave none."""
+    if value is None:
+        raise RoundWaitError(f"{what} gave no round (is it down?)")
+    return value
+
+
+def wait_for_round(get_round, target, timeout, sleep=time.sleep, now=time.monotonic):
+    """Poll get_round() until it returns a round >= target (None target: return
+    the current round at once). RoundWaitError after `timeout` seconds, saying
+    what was last seen."""
+    if target is None:
+        return get_round()
+    end = now() + timeout
+    seen = None
+    while True:
+        r = get_round()
+        if r is not None:
+            seen = r
+            if r >= target:
+                return r
+        if now() >= end:
+            break
+        sleep(1)
+    got = f"last saw {seen}" if seen is not None else "no answer"
+    raise RoundWaitError(f"the node did not reach round {target} within {timeout}s ({got})")
+
+
+def expected_txns(fixed_count, group_size):
+    """Transactions a fixed-count run must submit."""
+    if fixed_count < 1 or group_size < 1:
+        raise ValueError("fixed count and group size must be >= 1")
+    return fixed_count * group_size
 
 
 # ---- gates -------------------------------------------------------------------
@@ -317,6 +365,9 @@ def side_errors(side, r, expected_txns):
     """Gate errors of one cluster's fixed-count step result `r`."""
     errs = []
     fx = r["fixed"]
+    if fx.get("expected_txns") != expected_txns:
+        errs.append(f"{side}: the generator was asked for {fx.get('expected_txns')} txns, "
+                    f"the tier expects {expected_txns}")
     if fx["submitted_txns"] != expected_txns:
         errs.append(f"{side}: submitted {fx['submitted_txns']} txns, expected {expected_txns}")
     if fx["confirmed_txns"] != fx["submitted_txns"]:
@@ -362,13 +413,6 @@ def gate(go, rust, expected_txns):
         errs.append(f"go and rust started from different genesis hashes "
                     f"({go['genesis_hash']} != {rust['genesis_hash']})")
     return errs
-
-
-def end_restart_errors(side, restarts):
-    """Errors for any node that restarted or was OOM-killed during the run."""
-    return [f"{side}: node {n} restarted {st.get('restart_count')} time(s)"
-            f"{' (OOM killed)' if st.get('oom') else ''}"
-            for n, st in sorted(restarts.items()) if st.get("restart_count") or st.get("oom")]
 
 
 # ---- results -----------------------------------------------------------------

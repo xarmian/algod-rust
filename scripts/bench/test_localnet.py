@@ -45,9 +45,13 @@ class TopologyTest(unittest.TestCase):
         self.assertEqual(len(ll.SERVICES), 5)  # 1 relay + 4 participation nodes
         # Same ports, limits, restart policy, network and dependency graph.
         a, b = ll.shape(go), ll.shape(rust)
-        a["networks"], b["networks"] = a["networks"], b["networks"]
         self.assertEqual(json.dumps(a["services"], sort_keys=True),
                          json.dumps(b["services"], sort_keys=True))
+        # Both topologies use the same logical network name (the compose network
+        # key); the real network name differs only by project, which is unique
+        # per cluster by design.
+        self.assertEqual(a["networks"], b["networks"])
+        self.assertEqual(a["networks"], [ll.NETWORK_NAME])
         for top in (go, rust):
             for s in top["services"].values():
                 self.assertEqual(s["cpus"], 1.5)
@@ -190,8 +194,7 @@ class StatsTest(unittest.TestCase):
 
     def test_resource_summary_window_and_counter_reset(self):
         r = ll.resource_summary(self.samples(), 1, 1)
-        self.assertAlmostEqual(r["cpu_cores"], 3.0 + 1.5 - 3.0 + 0.0, places=6) \
-            if False else self.assertAlmostEqual(r["cpu_cores"], 3.0 + 1.5)
+        self.assertAlmostEqual(r["cpu_cores"], 3.0 + 1.5)
         self.assertEqual(r["blockio_write_mb"], 0.0)
         reset = [{"t": 0, "node": "a", "cpu_pct": 1, "mem_bytes": 1, "blk_write": 900},
                  {"t": 1, "node": "a", "cpu_pct": 1, "mem_bytes": 1, "blk_write": 10}]
@@ -254,16 +257,35 @@ class MetricsTest(unittest.TestCase):
         m = ll.step_metrics(loadgen(samples=0), {}, {})
         self.assertFalse([k for k in m if k.startswith("latency")])
 
-    def test_fixed_metrics_add_commit_time(self):
+    def test_commit_span_comes_from_block_headers_not_polling(self):
+        p0 = {"round": 4, "ts": 1000, "tc": 1000}
+        last = {"round": 22, "ts": 1054, "tc": 1200}
+        self.assertEqual(ll.commit_span(p0, last), {"secs": 54, "rounds": 18})
+
+    def test_fixed_metrics_report_commit_time_rounds_and_set_tps(self):
         lg = loadgen()
-        lg["fixed"] = {"all_confirmed_after_secs": 4.0, "confirmed_txns": 200}
-        m = ll.fixed_metrics(lg, {}, {})
+        lg["fixed"] = {"confirmed_txns": 200}
+        m = ll.fixed_metrics(lg, {}, {}, {"secs": 4, "rounds": 2})
         self.assertEqual(m["commit_time_s"], ("s", "lower", 4.0))
+        self.assertEqual(m["commit_rounds"], ("rounds", "lower", 2.0))
         self.assertEqual(m["set_tps"], ("txn/s", "higher", 50.0))
+
+    def test_fixed_metrics_without_chain_time_keep_the_round_count(self):
+        lg = loadgen()
+        lg["fixed"] = {"confirmed_txns": 200}
+        m = ll.fixed_metrics(lg, {}, {}, {"secs": 0, "rounds": 1})
+        self.assertNotIn("commit_time_s", m)
+        self.assertNotIn("set_tps", m)
+        self.assertEqual(m["commit_rounds"][2], 1.0)
+
+    def test_the_generator_no_longer_reports_a_poll_based_commit_time(self):
+        self.assertNotIn("all_confirmed_after_secs", json.dumps(ll.fixed_metrics(
+            dict(loadgen(), fixed={"confirmed_txns": 1}), {}, {}, {"secs": 1, "rounds": 1})))
 
 
 def side(txids=SHA_A, confirmed=None, n=200, **kw):
-    r = {"fixed": {"submitted_txns": n, "confirmed_txns": n, "unconfirmed_txns": 0,
+    r = {"fixed": {"expected_txns": n, "submitted_txns": n, "confirmed_txns": n,
+                   "unconfirmed_txns": 0,
                    "submitted_txid_set_sha256": txids,
                    "confirmed_txid_set_sha256": confirmed or txids},
          "failed_groups": 0, "final_tc": n, "balances_sha256": SHA_A, "genesis_hash": "GH",
@@ -291,6 +313,18 @@ class GateTest(unittest.TestCase):
         bad["fixed"].update(confirmed_txns=190, unconfirmed_txns=10)
         errs = ll.gate(side(), bad, 200)
         self.assertTrue(any("10 of 200" in e for e in errs))
+
+    def test_expected_count_is_fixed_count_times_group_size(self):
+        self.assertEqual(ll.expected_txns(200, 1), 200)
+        self.assertEqual(ll.expected_txns(50, 4), 200)
+        with self.assertRaises(ValueError):
+            ll.expected_txns(0, 1)
+
+    def test_generator_that_ran_another_count_fails_the_gate(self):
+        bad = side()
+        bad["fixed"]["expected_txns"] = 800  # e.g. a CLI default changed group size
+        errs = ll.gate(side(), bad, 200)
+        self.assertTrue(any("rust: the generator was asked for 800 txns" in e for e in errs))
 
     def test_wrong_submitted_count_fails(self):
         errs = ll.gate(side(n=199), side(n=199), 200)
@@ -334,6 +368,47 @@ class GateTest(unittest.TestCase):
         a = ll.balances_digest({"A": 1, "B": 2})
         self.assertEqual(a, ll.balances_digest({"B": 2, "A": 1}))
         self.assertNotEqual(a, ll.balances_digest({"A": 1, "B": 3}))
+
+
+class WaitTest(unittest.TestCase):
+    class Clock:
+        def __init__(self):
+            self.t = 0.0
+
+        def now(self):
+            return self.t
+
+        def sleep(self, d):
+            self.t += d
+
+    def test_returns_once_the_round_is_reached(self):
+        c = self.Clock()
+        seq = iter([None, 5, 7, 9, 12])
+        got = ll.wait_for_round(lambda: next(seq), 9, 60, sleep=c.sleep, now=c.now)
+        self.assertEqual(got, 9)
+        self.assertGreater(c.t, 0)  # it waited (None and lagging rounds)
+
+    def test_times_out_with_a_clear_error(self):
+        c = self.Clock()
+        with self.assertRaises(ll.RoundWaitError) as cm:
+            ll.wait_for_round(lambda: 3, 10, 5, sleep=c.sleep, now=c.now)
+        self.assertIn("round 10", str(cm.exception))
+        self.assertIn("last saw 3", str(cm.exception))
+        self.assertLessEqual(c.t, 7)
+
+    def test_a_node_that_never_answers_times_out_too(self):
+        c = self.Clock()
+        with self.assertRaises(ll.RoundWaitError) as cm:
+            ll.wait_for_round(lambda: None, 1, 3, sleep=c.sleep, now=c.now)
+        self.assertIn("no answer", str(cm.exception))
+
+    def test_no_target_means_no_wait(self):
+        self.assertEqual(ll.wait_for_round(lambda: 2, None, 1), 2)
+
+    def test_require_round_rejects_none(self):
+        self.assertEqual(ll.require_round(4, "relay"), 4)
+        with self.assertRaises(ll.RoundWaitError):
+            ll.require_round(None, "relay")
 
 
 class RowsTest(unittest.TestCase):

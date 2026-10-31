@@ -8,7 +8,7 @@ name: Bench Localnet Smoke
 # SMOKE of the tier, not a benchmark: 1 run, 200 deterministic transactions
 # and one 10 s ladder step at 50 TPS on an all-Go and then an all-Rust
 # 1 relay + 4 participation-node cluster (1 CPU / 2 GB per container). It
-# proves the tier still builds both clusters, drives them with one generator,
+# proves the tier (which pulls the pinned algod image itself) still builds both clusters, drives them with one generator,
 # and passes the same-txid-set gate. Shared runners are far too noisy for the
 # Rust/Go ratios to mean anything; the full ladder is a manual
 # `make bench-compare TIERS=localnet` on a quiet host (docs/BENCHMARK_COMPARISON.md).
@@ -53,11 +53,6 @@ jobs:
         run: python3 -m unittest -v scripts/bench/test_localnet.py scripts/bench/test_run.py
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
-      - name: Pull the pinned algod image
-        run: |
-          set -euo pipefail
-          tag="$(grep -v '^[[:space:]]*#' scripts/bench/go-algorand.pin | grep -v '^[[:space:]]*$' | head -n1 | tr -d '[:space:]')"
-          docker pull "algorand/algod:${tag#v}"
       - name: Build the algod-rust node image (layer-cached)
         uses: docker/build-push-action@v7
         with:

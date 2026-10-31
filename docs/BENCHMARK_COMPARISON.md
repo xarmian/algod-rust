@@ -1177,9 +1177,11 @@ Per step, the rows `<step>/<metric>`:
 | `rss_mb_peak` | MB | Sum of every container's peak memory usage. |
 | `blockio_write_mb` | MB | Block-device bytes written by the five containers in the step. |
 
-The `fixed` step also reports `commit_time_s` and `set_tps`: the time from the
-first submission to the confirmation of the last transaction, and the rate
-that implies for the whole set.
+The `fixed` step also reports how fast the whole set was committed, measured on
+the chain and not by polling: `commit_rounds` and `commit_time_s` are the rounds
+and block-header seconds from the block before the first submission to the block
+holding the last transaction (one-second timestamp resolution), and `set_tps` is
+the set size over that time. `commit_rounds` is the most robust of the three.
 
 The raw generator reports, the stats samples (`*-samples.jsonl`) and, on a
 failure, each node's last 3,000 log lines land in `logs/localnet/` of the run
@@ -1192,7 +1194,11 @@ from the generator's own error tallies instead.
 The fixed-count step is deterministic: transaction `seq` has the sender at ring
 position `seq * group_size + i` of the load accounts, a note derived from
 `(seq, i)`, a fixed fee and the validity window `[first_valid, first_valid+999]`
-(Ed25519 signatures are deterministic too). Two clusters sharing a genesis and a
+(Ed25519 signatures are deterministic too). A submission a node reports as already known (go's
+"transaction already in ledger", algod-rust's "transaction already in the pool")
+counts as accepted; lease conflicts do not. The tier passes `--group-size 1`
+explicitly and the gate expects `fixed_count * group_size` transactions, and
+checks the generator reports the same number. Two clusters sharing a genesis and a
 key file are therefore fed **byte-identical transactions**, and the gate fails
 the tier, naming the difference, unless for every run:
 

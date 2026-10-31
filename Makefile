@@ -1028,13 +1028,13 @@ bench-cluster: ## Mixed-cluster INTEROP run, not a Go-vs-Rust comparison (requir
 	bash docker/scripts/bench-cluster.sh
 
 ## Issue #100: 6-node mixed cluster (1 Go relay + 1 Rust relay, 2 Go + 2 Rust
-## participation nodes). A mixed cluster is an INTEROP check (issue #2106): it
-## cannot attribute throughput or resource use to one implementation. For a
-## Go-vs-Rust comparison use `make bench-compare TIERS=localnet`.
 ## participation nodes) driven at a sustained TPS target by `algod-rust
 ## loadgen`. Defaults are a laptop-sized smoke run; override on the command
 ## line for the issue's aspirational load, e.g.
 ##   make bench-stress STRESS_ARGS="--target-tps 1000 --sustained-secs 300"
+## A mixed cluster is an INTEROP check (issue #2106): it cannot attribute
+## throughput or resource use to one implementation. For a Go-vs-Rust
+## comparison use `make bench-compare TIERS=localnet`.
 STRESS_ARGS ?=
 
 bench-stress: ## 6-node mixed-cluster INTEROP stress run, not a Go-vs-Rust comparison (requires Docker; compare with TIERS=localnet)

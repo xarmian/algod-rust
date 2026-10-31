@@ -348,11 +348,22 @@ pub fn txid_set_digest(txids: &[String]) -> String {
 }
 
 /// Whether a node's submission error means "this exact transaction is already
-/// known" (go-algorand's `ErrAlreadyInLedger` / pool `txn dup`), which a
-/// retried deterministic submission treats as accepted.
+/// known", which a retried deterministic submission treats as accepted. Only
+/// the real texts of both nodes match: go-algorand's
+/// `ledgercore.TransactionInLedgerError` ("transaction already in ledger: ..",
+/// also what its pool returns for a txn already pooled) and algod-rust's
+/// `PoolError::DuplicateTxn` ("transaction already in the pool: ..") and
+/// `AlreadyInLedger`. Lease conflicts ("overlapping lease", "duplicate lease")
+/// are rejections and must not match.
 pub fn is_duplicate_error(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
-    m.contains("already in ledger") || m.contains("txn dup") || m.contains("duplicate")
+    m.contains("transaction already in ledger") || m.contains("transaction already in the pool")
+}
+
+/// Whether job `seq` is one of the sampled submissions whose confirmation
+/// latency is probed (`sample == 0` disables sampling).
+fn should_probe(sample: u64, seq: u64) -> bool {
+    sample > 0 && seq.is_multiple_of(sample)
 }
 
 /// Build, sign and encode job `seq` of a fixed-count run: the concatenated
@@ -551,6 +562,40 @@ struct Shared {
 }
 
 impl Shared {
+    fn new(
+        cfg: LoadgenConfig,
+        accounts: Vec<LoadAccount>,
+        clients: Vec<AlgodClient>,
+        params: SuggestedParams,
+    ) -> Self {
+        Shared {
+            accounts,
+            endpoint_names: cfg.endpoints.clone(),
+            clients,
+            params: Mutex::new(params),
+            cfg,
+            next_account: AtomicU64::new(0),
+            dispatched: AtomicU64::new(0),
+            accepted_groups: AtomicU64::new(0),
+            failed_groups: AtomicU64::new(0),
+            backpressure_drops: AtomicU64::new(0),
+            submit_seq: AtomicU64::new(0),
+            stop: AtomicBool::new(false),
+            errors: Mutex::new(HashMap::new()),
+            per_endpoint: Mutex::new(HashMap::new()),
+            latencies: Mutex::new(Vec::new()),
+            confirm_timeouts: AtomicU64::new(0),
+            accepted_txids: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// A fixed-count group a node accepted, or reported as already known:
+    /// both count as one accepted group and one endpoint success.
+    fn record_fixed_accept(&self, endpoint: &str) {
+        self.accepted_groups.fetch_add(1, Ordering::Relaxed);
+        self.record_endpoint(endpoint, true);
+    }
+
     fn record_error(&self, msg: String) {
         // Collapse the long tail: node errors embed txids and round numbers,
         // which would otherwise make every entry unique and the map unbounded.
@@ -637,25 +682,7 @@ pub async fn run(cfg: LoadgenConfig) -> anyhow::Result<()> {
         "loadgen starting"
     );
 
-    let shared = Arc::new(Shared {
-        accounts,
-        endpoint_names: cfg.endpoints.clone(),
-        clients,
-        params: Mutex::new(params),
-        cfg: cfg.clone(),
-        next_account: AtomicU64::new(0),
-        dispatched: AtomicU64::new(0),
-        accepted_groups: AtomicU64::new(0),
-        failed_groups: AtomicU64::new(0),
-        backpressure_drops: AtomicU64::new(0),
-        submit_seq: AtomicU64::new(0),
-        stop: AtomicBool::new(false),
-        errors: Mutex::new(HashMap::new()),
-        per_endpoint: Mutex::new(HashMap::new()),
-        latencies: Mutex::new(Vec::new()),
-        confirm_timeouts: AtomicU64::new(0),
-        accepted_txids: Mutex::new(Vec::new()),
-    });
+    let shared = Arc::new(Shared::new(cfg.clone(), accounts, clients, params));
 
     // Background params refresher.
     let refresher = {
@@ -760,7 +787,7 @@ pub async fn run(cfg: LoadgenConfig) -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let fixed_report = if fixed > 0 {
-        Some(verify_all(&shared, start).await)
+        Some(verify_all(&shared).await)
     } else {
         None
     };
@@ -854,14 +881,16 @@ const FIXED_MAX_ATTEMPTS: u32 = 400;
 
 /// Fixed-count mode: poll every accepted txid until it is confirmed (or
 /// `settle_secs` pass) and summarise the evidence the benchmark gate needs:
-/// how many were submitted/confirmed and the digest of both txid sets.
-async fn verify_all(shared: &Arc<Shared>, run_start: Instant) -> serde_json::Value {
+/// how many were submitted/confirmed, the digest of both txid sets and the
+/// first/last confirmed round. Commit *speed* is deliberately not timed here
+/// (a poll sees a confirmation late, and only after submission ended): the
+/// benchmark tier derives it from the block headers of those rounds.
+async fn verify_all(shared: &Arc<Shared>) -> serde_json::Value {
     let cfg = &shared.cfg;
     let mut ids = shared.accepted_txids.lock().expect("txids mutex").clone();
     ids.sort_unstable();
     let mut confirmed: Vec<Option<u64>> = vec![None; ids.len()];
     let deadline = Instant::now() + Duration::from_secs(cfg.settle_secs);
-    let mut last_confirm_secs = 0.0_f64;
     loop {
         let todo: Vec<usize> = (0..ids.len()).filter(|&i| confirmed[i].is_none()).collect();
         if todo.is_empty() {
@@ -884,7 +913,6 @@ async fn verify_all(shared: &Arc<Shared>, run_start: Instant) -> serde_json::Val
             while let Some(done) = set.join_next().await {
                 if let Ok((i, Some(round))) = done {
                     confirmed[i] = Some(round);
-                    last_confirm_secs = run_start.elapsed().as_secs_f64();
                 }
             }
         }
@@ -910,7 +938,6 @@ async fn verify_all(shared: &Arc<Shared>, run_start: Instant) -> serde_json::Val
         "confirmed_txid_set_sha256": txid_set_digest(&confirmed_ids),
         "first_confirmed_round": rounds.iter().min(),
         "last_confirmed_round": rounds.iter().max(),
-        "all_confirmed_after_secs": (last_confirm_secs * 1000.0).round() / 1000.0,
         "first_valid": cfg.first_valid,
         "fee": cfg.fixed_fee,
     })
@@ -949,9 +976,8 @@ async fn submit_fixed(shared: &Arc<Shared>, widx: usize) {
     loop {
         match client.send_raw_transaction(&body).await {
             Ok(txid) => {
-                shared.accepted_groups.fetch_add(1, Ordering::Relaxed);
-                shared.record_endpoint(endpoint, true);
-                if cfg.confirm_sample > 0 && seq.is_multiple_of(cfg.confirm_sample) {
+                shared.record_fixed_accept(endpoint);
+                if should_probe(cfg.confirm_sample, seq) {
                     spawn_confirm_probe(shared.clone(), endpoint_idx, txid, submitted_at);
                 }
                 break;
@@ -959,7 +985,11 @@ async fn submit_fixed(shared: &Arc<Shared>, widx: usize) {
             Err(e) => {
                 let msg = e.to_string();
                 if is_duplicate_error(&msg) {
-                    shared.accepted_groups.fetch_add(1, Ordering::Relaxed);
+                    shared.record_fixed_accept(endpoint);
+                    if should_probe(cfg.confirm_sample, seq) {
+                        let txid = TxId(txids[0].clone());
+                        spawn_confirm_probe(shared.clone(), endpoint_idx, txid, submitted_at);
+                    }
                     break;
                 }
                 shared.record_endpoint(endpoint, false);
@@ -1423,10 +1453,84 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_submissions_are_recognised() {
+    fn duplicate_submissions_are_recognised_for_both_nodes() {
+        // go-algorand: ledgercore.TransactionInLedgerError (also what the pool's
+        // block evaluator returns for a txn already in the pool).
         assert!(is_duplicate_error("transaction already in ledger: ABC"));
-        assert!(is_duplicate_error("TransactionPool.Remember: txn dup: ABC"));
+        assert!(is_duplicate_error(
+            "HTTP 400: TransactionPool.Remember: transaction already in ledger: ABC"
+        ));
+        // algod-rust: algo_pool::PoolError::{DuplicateTxn, AlreadyInLedger}.
+        assert!(is_duplicate_error("transaction already in the pool: ABC"));
+        assert!(is_duplicate_error("transaction already in ledger: ABC"));
+    }
+
+    #[test]
+    fn lease_and_other_rejections_are_not_duplicates() {
+        // go: LeaseInLedgerError; algod-rust: lease and duplicate-lease texts.
+        assert!(!is_duplicate_error(
+            "transaction ABC using an overlapping lease (sender, lease):(S, L)"
+        ));
+        assert!(!is_duplicate_error(
+            "transaction X: duplicate lease approval program rejected"
+        ));
+        assert!(!is_duplicate_error("duplicate lease in group"));
         assert!(!is_duplicate_error("fee {1000} below threshold 1052"));
+        assert!(!is_duplicate_error(
+            "block number already in ledger: block 3 < next Round 5"
+        ));
+        assert!(!is_duplicate_error("txn dup"));
+    }
+
+    fn test_shared(confirm_sample: u64) -> Arc<Shared> {
+        let params: SuggestedParams = serde_json::from_value(serde_json::json!({
+            "consensus-version": "future", "fee": 0,
+            "genesis-hash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "genesis-id": "t-v1", "last-round": 1, "min-fee": 1000
+        }))
+        .expect("params");
+        let cfg = LoadgenConfig {
+            endpoints: vec!["http://127.0.0.1:1".into()],
+            token: "t".into(),
+            keys: PathBuf::new(),
+            target_tps: 1.0,
+            duration_secs: 1.0,
+            ramp_secs: 0.0,
+            group_size: 1,
+            concurrency: 1,
+            fee_multiplier: 1.0,
+            confirm_sample,
+            confirm_timeout_secs: 1,
+            output: None,
+            fixed_count: 1,
+            first_valid: 1,
+            fixed_fee: 1000,
+            settle_secs: 1,
+            txids_out: None,
+        };
+        let clients = vec![AlgodClient::new("http://127.0.0.1:1", "t")];
+        Arc::new(Shared::new(cfg, fixed_accounts(1), clients, params))
+    }
+
+    #[test]
+    fn an_accepted_fixed_group_and_a_duplicate_one_are_counted_alike() {
+        let shared = test_shared(0);
+        let ep = shared.endpoint_names[0].clone();
+        // Real acceptance and a duplicate "accept" both go through the same path.
+        shared.record_fixed_accept(&ep);
+        shared.record_fixed_accept(&ep);
+        assert_eq!(shared.accepted_groups.load(Ordering::Relaxed), 2);
+        let per = shared.per_endpoint.lock().expect("lock");
+        assert_eq!(per[&ep].accepted_groups, 2);
+        assert_eq!(per[&ep].failed_groups, 0);
+    }
+
+    #[test]
+    fn a_confirm_probe_is_started_for_every_sampled_seq_whether_new_or_duplicate() {
+        assert!(should_probe(5, 0));
+        assert!(should_probe(5, 10));
+        assert!(!should_probe(5, 7));
+        assert!(!should_probe(0, 0), "0 disables sampling");
     }
 
     #[test]

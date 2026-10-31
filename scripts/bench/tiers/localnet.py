@@ -68,11 +68,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BENCH = os.path.dirname(HERE)
 REPO = os.path.dirname(os.path.dirname(BENCH))
 sys.path.insert(0, BENCH)
-import bench_schema  # noqa: E402,F401
 import localnet_lib as ll  # noqa: E402
 
 TIER = "localnet"
-LOADGEN_ACCOUNTS_DEFAULT = 16
+FIXED_GROUP_SIZE = 1  # the fixed step is passed --group-size explicitly
 FUND_MICROALGOS = 1_000_000_000_000
 STARTUP_TIMEOUT = 300
 
@@ -132,7 +131,7 @@ def settings():
         profile=name,
         cpus=float(os.environ.get("BENCH_LOCALNET_CPUS") or 2),
         mem=os.environ.get("BENCH_LOCALNET_MEM") or "3g",
-        accounts=env_int("BENCH_LOCALNET_ACCOUNTS", LOADGEN_ACCOUNTS_DEFAULT),
+        accounts=env_int("BENCH_LOCALNET_ACCOUNTS", 16),
         port_base=env_int("BENCH_LOCALNET_PORT_BASE", 4300),
         num_rounds=env_int("BENCH_LOCALNET_NUM_ROUNDS", 30000),
         go_image=os.environ.get("BENCH_LOCALNET_GO_IMAGE")
@@ -184,6 +183,7 @@ def make_network(cfg, work):
            "&& chmod -R a+rwX /netroot", timeout=900)
     keys_dir = os.path.join(work, "loadgen")
     os.makedirs(keys_dir)
+    os.chmod(keys_dir, 0o777)  # the generator container writes its reports here
     docker("run", "--rm", "-v", f"{posix(keys_dir)}:/out", "--entrypoint", "sh",
            cfg["rust_image"], "-c",
            f"algod-rust loadgen gen-accounts --deterministic --count {cfg['accounts']} "
@@ -226,7 +226,7 @@ def make_network(cfg, work):
 # ---- cluster -----------------------------------------------------------------
 
 class Cluster:
-    def __init__(self, impl, cfg, work, shared, genesis_id, partkeys, run_no):
+    def __init__(self, impl, cfg, work, shared, genesis_id, partkeys):
         self.impl, self.cfg = impl, cfg
         self.project = f"bench-localnet-{impl}-{os.getpid()}"
         self.dir = os.path.join(work, impl)
@@ -241,6 +241,10 @@ class Cluster:
                 for n in ("algod.token", "algod.admin.token"):
                     with open(os.path.join(d, n), "w", encoding="utf-8") as f:
                         f.write(ll.TOKEN)
+                    os.chmod(os.path.join(d, n), 0o666)
+                # Writable by whatever user the image runs as (the Go tree gets
+                # the same treatment from `chmod -R a+rwX` in make_network).
+                os.chmod(d, 0o777)
         top = ll.topology(
             impl, project=self.project, go_image=cfg["go_image"], rust_image=cfg["rust_image"],
             cpus=cfg["cpus"], mem=cfg["mem"], port_base=cfg["port_base"],
@@ -368,16 +372,19 @@ class Cluster:
         """One measured load step: drain, mark the chain, run the generator,
         mark the chain again, aggregate."""
         self.drain()
-        r0 = self.round_of("relay")
+        r0 = ll.require_round(self.round_of("relay"), "relay")
         p0 = self.point(r0)
         t0 = time.time()
         rep = self.loadgen(work, name, extra, timeout)
         t1 = time.time()
-        r1 = self.round_of("relay")
-        p1 = self.point(r1)
+        # Confirmations were polled across all nodes: the relay (whose chain the
+        # window and the balances are read from) may still lag the last one.
+        target = (rep.get("fixed") or {}).get("last_confirmed_round")
+        r1 = ll.wait_for_round(lambda: self.round_of("relay"), target, 120)
+        p1 = self.point(ll.require_round(r1, "relay"))
         window = ll.window_stats(p0, p1)
         res = ll.resource_summary(self.samples, t0, t1)
-        return rep, window, res, p1
+        return rep, window, res, p0, p1
 
 
 def final_state(cluster, addrs):
@@ -403,20 +410,23 @@ def final_state(cluster, addrs):
 def run_cluster(impl, cfg, work, shared, genesis_id, partkeys, addrs, raw_dir, run_no):
     """One impl's whole run: start, fixed step, ladder, max step, teardown.
     Returns {"fixed": gate-input, "steps": {step: metrics}}."""
-    cl = Cluster(impl, cfg, work, shared, genesis_id, partkeys, run_no)
+    cl = Cluster(impl, cfg, work, shared, genesis_id, partkeys)
     failed = True
     try:
         cl.up()
         steps = {}
         fixed_secs = cfg["fixed_count"] / cfg["fixed_tps"]
-        rep, window, res, p1 = cl.step(
+        rep, window, res, p0, p1 = cl.step(
             work, "fixed",
-            ["--fixed-count", str(cfg["fixed_count"]), "--target-tps", str(cfg["fixed_tps"]),
+            ["--fixed-count", str(cfg["fixed_count"]), "--group-size", str(FIXED_GROUP_SIZE),
+             "--target-tps", str(cfg["fixed_tps"]),
              "--duration-secs", str(int(fixed_secs * 3 + 120)), "--confirm-sample", "20",
              "--first-valid", "1", "--settle-secs", "180",
              "--concurrency", "8", "--txids-out", "/out/fixed-txids.txt"],
             timeout=int(fixed_secs * 3 + 600))
-        steps["fixed"] = ll.fixed_metrics(rep, window, res)
+        last = rep["fixed"].get("last_confirmed_round")
+        p_last = cl.point(last) if last is not None else p1
+        steps["fixed"] = ll.fixed_metrics(rep, window, res, ll.commit_span(p0, p_last))
         fixed_window, fixed_res = window, res
         side = final_state(cl, addrs)
         # Transactions the chain committed since before the first submission:
@@ -434,7 +444,7 @@ def run_cluster(impl, cfg, work, shared, genesis_id, partkeys, addrs, raw_dir, r
             plan.append(("max", 1_000_000, 32))
         for name, tps, conc in plan:
             time.sleep(5)
-            rep2, window, res, _ = cl.step(
+            rep2, window, res, _, _ = cl.step(
                 work, name,
                 ["--target-tps", str(tps), "--duration-secs", str(cfg["step_secs"]),
                  "--ramp-secs", "0", "--group-size", "1", "--concurrency", str(conc),
@@ -516,7 +526,8 @@ def main():
                     log(f"run {i + 1}/{runs}: {impl} cluster")
                     got[impl] = run_cluster(impl, cfg, work, shared, genesis_id, partkeys,
                                             addrs, raw_dir, i + 1)
-                errors = ll.gate(got["go"]["side"], got["rust"]["side"], cfg["fixed_count"])
+                errors = ll.gate(got["go"]["side"], got["rust"]["side"],
+                                   ll.expected_txns(cfg["fixed_count"], FIXED_GROUP_SIZE))
                 if errors:
                     raise TierError("txid-set / state gate FAILED:\n  " + "\n  ".join(errors))
                 fx = got["go"]["side"]["fixed"]
