@@ -181,6 +181,15 @@ pub trait NodeInfo: Send + Sync {
     /// vote on blocks or propose blocks — i.e. it needs the transaction
     /// pool populated via gossip even though it isn't a relay.
     fn is_participating(&self) -> bool;
+
+    /// `false` while the oracle has not yet been able to decide (e.g. its
+    /// first read of the participation registry failed). The transports then
+    /// leave `wantTXGossip` untouched instead of treating "unknown" as "not
+    /// participating" and dropping TX interest. go's oracle always answers,
+    /// hence the default.
+    fn participation_known(&self) -> bool {
+        true
+    }
 }
 
 /// `wantTXGossip` has not yet been decided — the initial state for a
@@ -903,6 +912,17 @@ impl WebsocketNetwork {
             .is_some_and(|info| info.is_participating())
     }
 
+    /// Whether the registered oracle (if any) can currently answer; see
+    /// [`NodeInfo::participation_known`]. `true` without an oracle (go's
+    /// `nopeNodeInfo` answers "not participating").
+    fn participation_known(&self) -> bool {
+        self.node_info
+            .lock()
+            .expect("node_info lock poisoned")
+            .as_ref()
+            .is_none_or(|info| info.participation_known())
+    }
+
     /// Current `wantTXGossip` state — one of [`WANT_TX_GOSSIP_UNK`]/
     /// [`WANT_TX_GOSSIP_YES`]/[`WANT_TX_GOSSIP_NO`]. Exposed mainly for
     /// tests; mirrors go's `wn.wantTXGossip.Load()`.
@@ -961,6 +981,9 @@ impl WebsocketNetwork {
     /// if it is no longer participating and was subscribed, deregister it.
     /// A no-op if the state hasn't changed since the last refresh.
     async fn refresh_want_tx_gossip(&self) {
+        if !self.participation_known() {
+            return;
+        }
         let participating = self.is_participating();
         let current = self.want_tx_gossip.load(Ordering::SeqCst);
         if participating && current != WANT_TX_GOSSIP_YES {

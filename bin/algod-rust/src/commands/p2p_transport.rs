@@ -3141,6 +3141,16 @@ impl P2pTransport {
         if self.relay_messages || self.force_fetch_transactions {
             return;
         }
+        // An undecided oracle must not move the transport to "not wanted".
+        let known = self
+            .node_info
+            .lock()
+            .expect("node_info lock poisoned")
+            .as_ref()
+            .is_none_or(|info| info.participation_known());
+        if !known {
+            return;
+        }
         let participating = self.is_participating();
         let current = self.want_tx_gossip.load(AtomicOrdering::SeqCst);
         if participating && current != WANT_TX_GOSSIP_YES {
@@ -4018,16 +4028,18 @@ mod tests {
         }
 
         for (live, want) in [(true, WANT_TX_GOSSIP_YES), (false, WANT_TX_GOSSIP_NO)] {
-            let transport = P2pTransport::start(plain_non_relay_config("test-2150"))
-                .await
-                .expect("start transport");
-            let ws = algo_network::WebsocketNetwork::new(
+            let transport = Arc::new(
+                P2pTransport::start(plain_non_relay_config("test-2150"))
+                    .await
+                    .expect("start transport"),
+            );
+            let ws = Arc::new(algo_network::WebsocketNetwork::new(
                 algo_network::WebsocketNetworkConfig::default(),
                 Arc::new(algo_network::Phonebook::new(
                     0,
                     std::time::Duration::from_secs(60),
                 )),
-            );
+            ));
             assert_eq!(transport.want_tx_gossip(), WANT_TX_GOSSIP_UNK);
             let _info =
                 install_participation_node_info(Arc::new(Keys(live)), 0, &ws, Some(&transport));
