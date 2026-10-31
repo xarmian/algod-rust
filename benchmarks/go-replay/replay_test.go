@@ -22,6 +22,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"database/sql"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -34,6 +36,7 @@ import (
 	"testing"
 
 	"github.com/algorand/go-algorand/data/basics"
+	"github.com/algorand/go-algorand/util/db"
 )
 
 // The tests run goreplay's main() in a child process of the test binary
@@ -301,6 +304,45 @@ func TestShortBoxFreeReplayReadsItsFinalState(t *testing.T) {
 		if res.CorpusMatch != nil {
 			t.Fatalf("-rounds %s: a partial replay has no corpus.json comparison", rounds)
 		}
+	}
+}
+
+// kvstoreRows counts the committed KV rows of a tracker database: boxKeys
+// falls back to the in-memory deltas only when there are none, and fails
+// loudly when there are some (a stale database round is then a real problem).
+func TestKvstoreRowsCountsTheCommittedRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tracker.sqlite")
+	acc, err := db.MakeAccessor(path, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = acc.Atomic(func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS kvstore (key blob primary key, value blob)")
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := kvstoreRows(path); err != nil || n != 0 {
+		t.Fatalf("empty table: got %d, %v", n, err)
+	}
+	err = acc.Atomic(func(ctx context.Context, tx *sql.Tx) error {
+		for _, k := range []string{"bx:a", "bx:b"} {
+			if _, err := tx.ExecContext(ctx, "INSERT INTO kvstore (key, value) VALUES (?, ?)", []byte(k), []byte("v")); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	acc.Close()
+	if n, err := kvstoreRows(path); err != nil || n != 2 {
+		t.Fatalf("two rows: got %d, %v", n, err)
+	}
+	if _, err := kvstoreRows(filepath.Join(t.TempDir(), "absent.sqlite")); err == nil {
+		t.Fatal("a missing database must be an error, not zero rows")
 	}
 }
 

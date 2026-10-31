@@ -211,7 +211,34 @@ pub struct CorpusCatchupLedger {
     devmode: bool,
     /// The last certificate-authentication failure: the catchup service only
     /// logs it (as a warning), so the replay keeps it for its own error.
-    last_auth_error: Arc<Mutex<Option<String>>>,
+    last_auth_error: Arc<LastAuthError>,
+}
+
+/// The last certificate-authentication failure of a replay: the round and the
+/// reason. A later successful authentication clears it, and it is reported
+/// only for the round the replay stalled at, so a stall with another cause
+/// (a fetch failure, an apply failure) never points at certificates.
+#[derive(Default)]
+pub struct LastAuthError(Mutex<Option<(u64, String)>>);
+
+impl LastAuthError {
+    /// Record the outcome of authenticating `round`'s certificate.
+    pub fn note(&self, round: u64, res: &Result<(), String>) {
+        if let Ok(mut last) = self.0.lock() {
+            *last = res.as_ref().err().map(|e| (round, e.clone()));
+        }
+    }
+
+    /// `"; last authentication error: round N: ..."` if the last failure was
+    /// for `stalled`, else the empty string.
+    pub fn report(&self, stalled: u64) -> String {
+        match self.0.lock().ok().and_then(|l| l.clone()) {
+            Some((round, e)) if round == stalled => {
+                format!("; last authentication error: round {round}: {e}")
+            }
+            _ => String::new(),
+        }
+    }
 }
 
 /// The only certificate a DevMode chain has: `{"rnd": r}`.
@@ -247,11 +274,7 @@ impl CatchupLedger for CorpusCatchupLedger {
         } else {
             self.inner.authenticate_block(block, cert)
         };
-        if let Err(e) = &res {
-            if let Ok(mut last) = self.last_auth_error.lock() {
-                *last = Some(format!("round {}: {e}", block.round));
-            }
-        }
+        self.last_auth_error.note(block.round.0, &res);
         res
     }
     fn apply_stall_retry_in(&self, next_round: Round) -> Option<Duration> {
@@ -485,7 +508,7 @@ pub fn replay_corpus(args: &ReplayCorpusArgs) -> anyhow::Result<ReplayResult> {
     let before = proc_stats();
     let start = Instant::now();
     let shared = Arc::new(Mutex::new(ledger));
-    let last_auth_error = Arc::new(Mutex::new(None::<String>));
+    let last_auth_error = Arc::new(LastAuthError::default());
     {
         let bridge = Arc::new(AgreementLedgerBridge::new_with_advancer_and_condvar(
             Arc::clone(&shared),
@@ -509,12 +532,7 @@ pub fn replay_corpus(args: &ReplayCorpusArgs) -> anyhow::Result<ReplayResult> {
                     .last_error()
                     .map(|e| format!("; last fetch error: {e}"))
                     .unwrap_or_default();
-                let auth = last_auth_error
-                    .lock()
-                    .ok()
-                    .and_then(|e| e.clone())
-                    .map(|e| format!("; last authentication error: {e}"))
-                    .unwrap_or_default();
+                let auth = last_auth_error.report(next);
                 bail!(
                     "replay stopped at round {next}: the catchup sync pass ended ({}) \
                      without committing it{fetch}{auth}",
@@ -896,6 +914,39 @@ mod tests {
             msg.contains("last authentication error: round 30: ")
                 && msg.contains("failed verification"),
             "{msg}"
+        );
+    }
+
+    /// The authentication failure is reported only for the round the replay
+    /// stalled at, and only while no later authentication has succeeded:
+    /// a later unrelated stall must not point at certificates.
+    #[test]
+    fn last_auth_error_is_reported_only_for_the_stalled_round() {
+        let e = LastAuthError::default();
+        assert_eq!(e.report(5), "", "nothing recorded yet");
+        e.note(5, &Err("vote at index 3 failed verification".to_string()));
+        assert_eq!(
+            e.report(5),
+            "; last authentication error: round 5: vote at index 3 failed verification"
+        );
+        assert_eq!(
+            e.report(6),
+            "",
+            "another round stalled: not an auth failure"
+        );
+        // the same round authenticates on a later attempt: cleared
+        e.note(5, &Ok(()));
+        assert_eq!(e.report(5), "");
+        // a failure, then later rounds succeed, then an unrelated stall
+        e.note(7, &Err("bad".to_string()));
+        e.note(8, &Ok(()));
+        assert_eq!(e.report(7), "");
+        assert_eq!(e.report(9), "");
+        // a genuine failure after successes is still reported
+        e.note(9, &Err("bad again".to_string()));
+        assert_eq!(
+            e.report(9),
+            "; last authentication error: round 9: bad again"
         );
     }
 

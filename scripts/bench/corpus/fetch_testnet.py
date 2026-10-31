@@ -58,6 +58,7 @@ import argparse
 import base64
 import concurrent.futures
 import hashlib
+import http.client
 import json
 import os
 import struct
@@ -132,8 +133,10 @@ class Endpoint:
                 if e.code not in (429, 500, 502, 503, 504):
                     raise FetchError(f"GET {url}: HTTP {e.code}")
                 last = f"HTTP {e.code}"
-            except (urllib.error.URLError, OSError) as e:
-                last = str(e)
+            except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+                # a connection that drops mid-body (IncompleteRead), a reset,
+                # a timeout: all retried with the same backoff
+                last = f"{type(e).__name__}: {e}"
             if attempt + 1 < self.retries:
                 time.sleep(min(0.5 * 2 ** attempt, 15))
         raise Unreachable(f"GET {url}: {last}")
@@ -284,7 +287,7 @@ def write_blocks(ep, rounds, path, workers):
                     print(f"fetch_testnet: round {r}/{rounds}", flush=True)
 
 
-def build_corpus(ep, rounds, dest, name, final_state, workers=16):
+def build_corpus(ep, rounds, dest, name, final_state, workers=16, expected_genesis_hash=None):
     """Write the corpus directory `dest` (which must not exist)."""
     os.makedirs(dest)
     try:
@@ -294,6 +297,9 @@ def build_corpus(ep, rounds, dest, name, final_state, workers=16):
         if got != params["genesis-hash"]:
             raise FetchError(f"the endpoint's /genesis hashes to {got}, but it reports "
                              f"genesis-hash {params['genesis-hash']}")
+        if expected_genesis_hash and got != expected_genesis_hash:
+            raise FetchError(f"wrong network: the endpoint's genesis hashes to {got} "
+                             f"({params.get('genesis-id')}), the ref pins {expected_genesis_hash}")
         # Verbatim: benchmarks/corpus/** is `-text` (.gitattributes), so no
         # checkout rewrites it, and the hash above is of the parsed JSON.
         with open(os.path.join(dest, "genesis.json"), "wb") as f:
@@ -369,25 +375,37 @@ def cmd_fetch(args):
             final_state = json.load(f)
         if final_state.get("round") != rounds:
             raise FetchError(f"{p} is for round {final_state.get('round')}, not {rounds}")
-    if os.path.exists(args.dest):
-        if not args.force:
-            raise FetchError(f"{args.dest} already exists (pass --force to replace it)")
-        import shutil
-        shutil.rmtree(args.dest)
+    import shutil
+    if os.path.exists(args.dest) and not args.force:
+        raise FetchError(f"{args.dest} already exists (pass --force to replace it)")
     tmp = args.dest + ".partial"
     if os.path.exists(tmp):
         import shutil
         shutil.rmtree(tmp)
     print(f"fetch_testnet: {endpoint}: rounds 0..{rounds} -> {args.dest}", flush=True)
     build_corpus(Endpoint(endpoint, retries=args.retries), rounds, tmp, args.name, final_state,
-                 args.workers)
+                 args.workers, expected_genesis_hash=ref.get("genesis_hash"))
     got = corpus_tool.sha256_file(os.path.join(tmp, corpus_tool.MANIFEST))
     if pin and got != pin:
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)
         raise FetchError(f"MANIFEST.sha256 has sha256 {got}, {args.ref} pins {pin} "
                          "(the endpoint served different bytes)")
-    os.replace(tmp, args.dest)
+    # Only now, with the new corpus complete and verified, does the old one go
+    # (a failed fetch above leaves it untouched): move it aside, install, drop it.
+    old = args.dest + ".old"
+    had_old = os.path.exists(args.dest)
+    if had_old:
+        shutil.rmtree(old, ignore_errors=True)
+        os.replace(args.dest, old)
+    try:
+        os.replace(tmp, args.dest)
+    except BaseException:
+        if had_old:
+            os.replace(old, args.dest)
+        raise
+    if had_old:
+        shutil.rmtree(old, ignore_errors=True)
     print(f"fetch_testnet: installed {args.dest} (MANIFEST.sha256 {got}"
           f"{' matches the pin' if pin else ''})")
     return 0

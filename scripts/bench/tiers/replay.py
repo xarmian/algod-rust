@@ -196,6 +196,27 @@ def corrupt_corpus(src, dst, kind):
 
 # ---- corpus and binaries -----------------------------------------------------
 
+def check_cache_pin(d, name):
+    """The fetched testnet-head cache must hold the corpus its ref pins: the
+    sha256 of its MANIFEST.sha256 (which in turn pins every file; `main`
+    verifies those). A foreign or stale cache is refused, not replayed."""
+    if name != "testnet-head":
+        return
+    ref_path = os.path.join(REPO, "benchmarks", "corpus", "testnet-head.ref")
+    if not os.path.isfile(ref_path):
+        return
+    import fetch_testnet
+    pin = fetch_testnet.read_ref(ref_path).get("manifest_sha256", "")
+    if len(pin) != 64 or not set(pin) <= corpus_tool.HEX_DIGITS:
+        return  # not pinned yet
+    m = os.path.join(d, corpus_tool.MANIFEST)
+    got = corpus_tool.sha256_file(m) if os.path.isfile(m) else "(no manifest)"
+    if got != pin:
+        raise TierError(f"{d}: MANIFEST.sha256 has sha256 {got}, benchmarks/corpus/testnet-head.ref "
+                        f"pins {pin}: not the pinned testnet-head corpus. Delete it to refetch, or "
+                        "run scripts/bench/corpus/fetch_testnet.py fetch --force")
+
+
 def resolve_corpus():
     d = os.environ.get("BENCH_CORPUS_DIR")
     if d:
@@ -219,6 +240,7 @@ def resolve_corpus():
                             "corpus\"), or pass BENCH_CORPUS_DIR")
     if not os.path.isfile(os.path.join(d, "corpus.json")):
         raise TierError(f"no corpus at {d}")
+    check_cache_pin(d, name)
     return d
 
 

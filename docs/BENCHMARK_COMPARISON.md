@@ -988,9 +988,9 @@ catchup.
 | | |
 |---|---|
 | Source | an archival algod, default `https://testnet-api.algonode.cloud` (`endpoint=` in `benchmarks/corpus/testnet-head.ref`, override with `TESTNET_ENDPOINT` or `--endpoint`): `GET /v2/blocks/{r}?format=msgpack` for rounds 0..20000, the response bodies stored unchanged as `ACRPBLK1` records, plus `GET /genesis` stored byte for byte as served (`benchmarks/corpus/**` is `-text`, so no checkout rewrites it) |
-| Checks while fetching | every block body must parse as a msgpack `{block, cert}` response for the requested round (an HTML error page, an empty body or another round's block aborts the fetch); the genesis must hash (go's `Genesis.Hash`, ported from `canonical_encode_genesis`) to the endpoint's `genesis-hash`; the final state must agree with the endpoint's block hash and txn counter. Nothing is installed on any failure |
+| Checks while fetching | every block body must parse as a msgpack `{block, cert}` response for the requested round (an HTML error page, an empty body or another round's block aborts the fetch); the genesis must hash (go's `Genesis.Hash`, ported from `canonical_encode_genesis`) to the endpoint's `genesis-hash` **and** to the `genesis_hash=` the ref pins (testnet's), so an endpoint of another network is refused ("wrong network"); the final state must agree with the endpoint's block hash and txn counter. A body cut short mid-transfer, a reset or a timeout is retried with backoff (exit 3 when exhausted). Nothing is installed on any failure, and `--force` replaces an existing corpus only at the very end (the old one is untouched until the new one is complete and verified) |
 | Cost | about 20,000 requests (a few minutes with 16-32 workers) and 258 MB on disk, fetched once. The replay then needs no network. Go replays it in about 40 s and 270 MB RSS on a 24-core Linux box (the vote checks run in parallel) |
-| Cache and pin | `benchmarks/corpus/testnet-head/` (git-ignored). `testnet-head.ref` pins the sha256 of its `MANIFEST.sha256`; a fetch whose bytes differ is discarded, so every run reads identical bytes (two independent fetches gave the same manifest) |
+| Cache and pin | `benchmarks/corpus/testnet-head/` (git-ignored). `testnet-head.ref` pins the sha256 of its `MANIFEST.sha256`; a fetch whose bytes differ is discarded, so every run reads identical bytes (two independent fetches gave the same manifest). The tier checks an existing cache against the pin too and refuses a foreign or stale one (delete it, or `fetch --force`) |
 | Tier | `CORPUS=testnet-head` fetches the corpus when it is missing (exit 3 and a message when the endpoint is unreachable; `BENCH_CORPUS_DIR` then works with a copy) |
 | Committed slice | `benchmarks/corpus/testnet-prefix50/` holds rounds 0..50 (650 kB) with its final state. The default test suites replay it with every certificate authenticated: the Rust tests `testnet_prefix_authenticates_every_certificate` / `testnet_prefix_tampered_vote_fails_authentication`, the Go tests `TestTestnetPrefixAuthenticatesEveryCertificate` / `TestTestnetPrefixTamperedVoteFailsAuthentication`, and CI's `CORPUS=testnet-prefix50` tier run. Its own ref, `benchmarks/corpus/testnet-prefix50.ref`, pins its manifest and holds its final state; rebuild it as shown below |
 
@@ -1040,8 +1040,16 @@ database round from the `kvstore` rows its query returns, so on a ledger
 that never created a box it reports `StaleDatabaseRoundError` (database round
 0) although nothing is stale. The Go harness's box scan (`boxKeys` in
 `benchmarks/go-replay/state.go`) treats exactly that case as "no committed
-boxes" and takes the live ones from the in-memory deltas. go logs one `level=error`
-line for it; that line is harmless.
+boxes" and takes the live ones from the in-memory deltas, but only after
+counting the rows of the tracker database's `kvstore` table (`kvstoreRows`):
+if any row is committed, the stale round is a real inconsistency and the
+harness fails instead of dropping boxes. go logs one `level=error` line for the
+benign case; that line is harmless. Covered: the no-row case end to end
+(`testnet-prefix50`, `-rounds 20`), the row count itself
+(`TestKvstoreRowsCountsTheCommittedRows`), and the unchanged path of a ledger
+with boxes (the `small` corpus). Not covered: the loud-failure branch of
+`boxKeys` itself, because go cannot be made to report a stale round with
+committed KV rows.
 
 ### CI
 

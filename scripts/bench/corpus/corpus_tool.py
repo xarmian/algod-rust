@@ -311,7 +311,16 @@ def parse_records(blocks):
 def _mp_item(buf, i):
     """One msgpack item header at `i`: (kind, value, next). kind: int, nil,
     bool, float, str, bin, ext (value is the bytes or the number) or map /
-    array (value is the element count, next the first element's offset)."""
+    array (value is the element count, next the first element's offset).
+    ValueError when the item (its header or its payload) is not entirely
+    inside `buf`."""
+    kind, v, nxt = _mp_item_unchecked(buf, i)
+    if nxt > len(buf):
+        raise ValueError(f"truncated msgpack item at offset {i}")
+    return kind, v, nxt
+
+
+def _mp_item_unchecked(buf, i):
     try:
         b = buf[i]
         if b <= 0x7f:
@@ -482,10 +491,21 @@ def corrupt_vote(blocks_path, rnd=None):
     """Flip the low bit of the last byte of round `rnd`'s (default: the last
     record's) last vote signature in blocks.bin; returns (round, offset in
     the file)."""
-    with open(blocks_path, "rb") as f:
-        b = bytearray(f.read())
+    try:
+        with open(blocks_path, "rb") as f:
+            b = bytearray(f.read())
+    except OSError as e:
+        raise ValueError(f"cannot read {blocks_path}: {e}")
     recs = parse_records(bytes(b))
-    r, off, n = recs[-1] if rnd is None else next(x for x in recs if x[0] == rnd)
+    if not recs:
+        raise ValueError("blocks.bin holds no records")
+    if rnd is None:
+        r, off, n = recs[-1]
+    else:
+        found = [x for x in recs if x[0] == rnd]
+        if not found:
+            raise ValueError(f"blocks.bin has no record for round {rnd}")
+        r, off, n = found[0]
     pos = off + vote_signature_last_byte_offset(bytes(b[off:off + n]))
     b[pos] ^= 1
     with open(blocks_path, "wb") as f:

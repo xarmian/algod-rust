@@ -294,11 +294,21 @@ func ledgerAddresses(l *data.Ledger, trackerDB string) ([]basics.Address, error)
 // nothing is stale. In that one case the committed state holds no boxes and
 // the live ones are exactly those the in-memory deltas after the tracker
 // database round leave set.
-func boxKeys(l *data.Ledger, latest basics.Round) ([]string, error) {
+func boxKeys(l *data.Ledger, latest basics.Round, trackerDB string) ([]string, error) {
 	keys, err := l.LookupKeysByPrefix(latest, boxPrefix, 0)
 	var stale *ledger.StaleDatabaseRoundError
 	if err == nil || !errors.As(err, &stale) {
 		return keys, err
+	}
+	// The error is benign only if the committed state really holds no KV row.
+	// With rows the query would have learned the round from them, so a stale
+	// round then is a real inconsistency: fail instead of dropping boxes.
+	rows, qerr := kvstoreRows(trackerDB)
+	if qerr != nil {
+		return nil, fmt.Errorf("%w (and the tracker kvstore could not be counted: %v)", err, qerr)
+	}
+	if rows > 0 {
+		return nil, fmt.Errorf("box scan reports a stale database round although the tracker database holds %d KV rows: %w", rows, err)
 	}
 	// Not a guard on dbRound != 0: a tracker that has committed nothing has
 	// no KV rows either, and every live box is then in the deltas.
@@ -323,6 +333,23 @@ func boxKeys(l *data.Ledger, latest basics.Round) ([]string, error) {
 		}
 	}
 	return keys, nil
+}
+
+// kvstoreRows counts the KV rows (boxes) committed to the tracker database.
+func kvstoreRows(trackerDB string) (int, error) {
+	if _, err := os.Stat(trackerDB); err != nil {
+		return 0, err
+	}
+	acc, err := db.MakeAccessor(trackerDB, true, false)
+	if err != nil {
+		return 0, err
+	}
+	defer acc.Close()
+	var n int
+	err = acc.Atomic(func(ctx context.Context, tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, "SELECT count(1) FROM kvstore").Scan(&n)
+	})
+	return n, err
 }
 
 func computeFinalState(l *data.Ledger, trackerDB string, known []basics.Address, dumpDir string) (finalState, error) {
@@ -420,7 +447,7 @@ func computeFinalState(l *data.Ledger, trackerDB string, known []basics.Address,
 		return fs, err
 	}
 
-	keys, err := boxKeys(l, latest)
+	keys, err := boxKeys(l, latest, trackerDB)
 	if err != nil {
 		return fs, err
 	}
