@@ -413,7 +413,12 @@ fn account_json_empty_account_keeps_go_pointer_keys() {
     let lookup = lookup_for(&f);
     let resp = account_data_to_response(&lookup, &f.addr, "none", false, false, &consensus);
     let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
-    for k in ["assets", "created-assets", "created-apps", "apps-local-state"] {
+    for k in [
+        "assets",
+        "created-assets",
+        "created-apps",
+        "apps-local-state",
+    ] {
         assert_eq!(v[k], serde_json::json!([]), "{k} must be an empty array");
     }
     assert_eq!(
@@ -449,7 +454,12 @@ fn account_json_exclude_all_keeps_schema_and_reward_base() {
     let lookup = lookup_for(&f);
     let resp = account_data_to_response(&lookup, &f.addr, "all", false, false, &consensus);
     let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
-    for k in ["assets", "created-assets", "created-apps", "apps-local-state"] {
+    for k in [
+        "assets",
+        "created-assets",
+        "created-apps",
+        "apps-local-state",
+    ] {
         assert!(v.get(k).is_none(), "exclude=all must omit {k}");
     }
     assert_eq!(
