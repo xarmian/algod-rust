@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -57,7 +58,7 @@ class SettingsTest(unittest.TestCase):
     def test_defaults(self):
         s = cl.parse_settings({})
         self.assertEqual((s["network"], s["mode"], s["profile"]), ("testnet", "live", "full"))
-        self.assertEqual((s["cpus"], s["mem"]), (2.0, "3g"))
+        self.assertEqual((s["cpus"], s["mem"]), (2.0, "6g"))
         self.assertGreater(s["follow_secs"], 60)
 
     def test_smoke_profile_is_short(self):
@@ -482,7 +483,8 @@ class TrackerDoneTest(unittest.TestCase):
     def test_aborted_catchup_is_not_done(self):
         tr = self.tracker()
         tr.observe(1, status(LABEL, total=10, processed=3, last_round=5), None)
-        tr.observe(2, status(last_round=7), 0.1)   # catchpoint cleared, still at genesis sync
+        for t in (2, 3, 4):
+            tr.observe(t, status(last_round=7), 0.1)   # catchpoint cleared, still at genesis sync
         self.assertIsNone(tr.t_done)
         self.assertTrue(tr.aborted)
         self.assertFalse(tr.at_head())
@@ -491,7 +493,8 @@ class TrackerDoneTest(unittest.TestCase):
         tr = self.tracker()
         tr.observe(1, status(LABEL, total=1, processed=1, verified=1, tblocks=320, ablocks=10,
                              last_round=self.R - 320), None)
-        tr.observe(2, status(last_round=self.R - 300), 3.0)
+        for t in (2, 3, 4):
+            tr.observe(t, status(last_round=self.R - 300), 3.0)
         self.assertTrue(tr.aborted)
         self.assertFalse(tr.at_head())
 
@@ -691,6 +694,264 @@ class MakeNetworkTest(unittest.TestCase):
                               "CATCHUP_NETWORK=mainnet"], cwd=repo, env=env,
                              capture_output=True, text=True).stdout
         self.assertIn('BENCH_CATCHUP_NETWORK="mainnet"', out)
+
+
+class AbortDebounceTest(unittest.TestCase):
+    """Y1: one odd status sample must not latch an abort."""
+    R = 40500000
+
+    def tracker(self):
+        t = cl.PhaseTracker(0.0, 30.0, label_round=self.R)
+        t.observe(1, status(LABEL, total=10, processed=3, last_round=5), None)
+        return t
+
+    def test_one_transient_cleared_sample_then_recovery_is_success(self):
+        tr = self.tracker()
+        tr.observe(2, status(last_round=7), None)             # a single odd sample
+        self.assertFalse(tr.aborted)
+        tr.observe(3, status(LABEL, total=10, processed=9, last_round=7), None)   # still running
+        tr.observe(4, status(last_round=7), None)
+        tr.observe(5, status(last_round=self.R), 1.0)         # the ledger switch
+        self.assertFalse(tr.aborted)
+        self.assertEqual(tr.t_done, 5)
+        self.assertTrue(tr.at_head())
+
+    def test_a_cleared_sample_then_reaching_the_label_round_is_success(self):
+        tr = self.tracker()
+        tr.observe(2, status(last_round=7), None)
+        tr.observe(3, status(last_round=self.R), None)
+        self.assertEqual(tr.t_done, 3)
+        self.assertFalse(tr.aborted)
+
+    def test_sustained_clear_below_the_label_round_is_aborted(self):
+        tr = self.tracker()
+        for t in range(2, 2 + cl.ABORT_SAMPLES - 1):
+            tr.observe(t, status(last_round=7), None)
+            self.assertFalse(tr.aborted)
+        tr.observe(10, status(last_round=7), None)
+        self.assertTrue(tr.aborted)
+
+
+class OomClassificationTest(unittest.TestCase):
+    """Y5: an OOM-killed container is a harness/config problem, never a node bug."""
+
+    def sides(self, **go):
+        base = {"progressed": True, "panicked": False, "exited": False, "relay_error": False}
+        return {"go": dict(base, **go), "rust": dict(base)}
+
+    def test_oom_is_harness_and_names_the_limit(self):
+        cls, detail = cl.classify_failure(self.sides(oom=True, exited=True), kind="other",
+                                          mem_limit="3g")
+        self.assertEqual(cls, cl.HARNESS)
+        self.assertIn("go container OOM-killed at the 3g limit", detail)
+        self.assertIn("BENCH_CATCHUP_MEM", detail)
+        self.assertEqual(cl.format_failure(cls, detail).split(":")[0:2],
+                         ["FAILURE CLASS", " harness"])
+
+    def test_oom_beats_a_panic_and_a_relay_error(self):
+        cls, _ = cl.classify_failure(self.sides(oom=True, panicked=True, relay_error=True),
+                                     mem_limit="3g")
+        self.assertEqual(cls, cl.HARNESS)
+
+    def test_no_oom_key_means_not_oom(self):
+        self.assertEqual(cl.classify_failure(self.sides(exited=True), mem_limit="3g")[0], cl.NODE)
+
+    def test_default_memory_leaves_headroom_over_the_measured_peak(self):
+        self.assertEqual(cl.parse_settings({})["mem"], "6g")
+
+
+class CollectHashesTest(unittest.TestCase):
+    """Y4: pruning during a slow fetch trims the range; it is never a disagreement."""
+
+    def test_oldest_rounds_disappearing_mid_fetch_trim_the_start_and_pass(self):
+        state = {"calls": 0, "pruned_below": 100}
+
+        def get_hash(side, r):
+            state["calls"] += 1
+            if state["calls"] == 60:           # mid-fetch the nodes prune 30 more rounds
+                state["pruned_below"] = 130
+            return None if r < state["pruned_below"] else f"blk-{r}"
+        hashes, rounds, first, trims = cl.collect_hashes(get_hash, ("go", "rust"), 100, 400, 20000)
+        self.assertGreaterEqual(trims, 1)
+        self.assertGreaterEqual(first, 130)
+        errs, compared = cl.hash_gate(hashes["go"], hashes["rust"], rounds)
+        self.assertEqual(errs, [])
+        self.assertEqual(compared, 400 - first + 1)
+
+    def test_a_differing_hash_is_still_a_mismatch(self):
+        def get_hash(side, r):
+            return "blk-%d%s" % (r, "X" if side == "rust" and r == 250 else "")
+        hashes, rounds, first, trims = cl.collect_hashes(get_hash, ("go", "rust"), 100, 400, 20000)
+        errs, _ = cl.hash_gate(hashes["go"], hashes["rust"], rounds)
+        self.assertEqual(trims, 0)
+        self.assertTrue(any("round 250" in e for e in errs))
+
+    def test_pruning_that_keeps_outrunning_the_fetch_is_a_range_moved_error(self):
+        state = {"low": 0}
+
+        def get_hash(side, r):
+            state["low"] += 1                   # every probe prunes one more round
+            return None if r < state["low"] + 1000 else f"blk-{r}"
+        with self.assertRaises(cl.RangeMoved):
+            cl.collect_hashes(get_hash, ("go", "rust"), 100, 400, 20000, max_trims=3)
+
+    def test_a_hole_in_the_middle_is_left_to_the_gate(self):
+        def get_hash(side, r):
+            return None if (side == "go" and r == 200) else f"blk-{r}"
+        hashes, rounds, first, trims = cl.collect_hashes(get_hash, ("go", "rust"), 100, 400, 20000)
+        errs, _ = cl.hash_gate(hashes["go"], hashes["rust"], rounds)
+        self.assertEqual(trims, 0)
+        self.assertTrue(any("round 200" in e for e in errs))
+
+
+class SweepStaleTest(unittest.TestCase):
+    """Y6: only containers of dead runs are swept."""
+
+    def fake_docker(self, listing):
+        calls = []
+
+        def docker(*args, check=True, timeout=None):
+            calls.append(args)
+            out = "\n".join(listing) if args[0] == "ps" else ""
+            return mock.Mock(stdout=out, stderr="", returncode=0)
+        return docker, calls
+
+    def test_removes_dead_owners_and_unowned_keeps_live_owner(self):
+        import catchup as tier
+        docker, calls = self.fake_docker(["aaa 111", "bbb 222", "ccc "])
+        removed = tier.sweep_stale(docker_fn=docker, pid_alive=lambda pid: pid == 222)
+        self.assertEqual(sorted(removed), ["aaa", "ccc"])
+        rm = [c for c in calls if c[0] == "rm"]
+        self.assertEqual(len(rm), 1)
+        self.assertNotIn("bbb", rm[0])
+        self.assertIn("aaa", rm[0])
+
+    def test_nothing_to_sweep(self):
+        import catchup as tier
+        docker, calls = self.fake_docker([])
+        self.assertEqual(tier.sweep_stale(docker_fn=docker, pid_alive=lambda p: False), [])
+        self.assertFalse([c for c in calls if c[0] == "rm"])
+
+    def test_containers_carry_the_owner_pid_label(self):
+        import catchup as tier
+        args = tier.container_args("go", name="n", image="i", data_dir="/d", port=4500,
+                                   cpus=1, mem="1g")
+        self.assertIn(f"{tier.OWNER_LABEL}={os.getpid()}", args)
+        self.assertIn("bench-catchup=1", args)
+
+    def test_pid_alive_for_this_process_and_a_bogus_pid(self):
+        import catchup as tier
+        self.assertTrue(tier.pid_alive(os.getpid()))
+        self.assertFalse(tier.pid_alive(2 ** 22 + 12345))
+
+
+class PollTest(unittest.TestCase):
+    """Y3: the status sample is never lost to the lag probe; HTTPException is transient."""
+
+    def node(self):
+        return mock.Mock(base="http://x")
+
+    def test_a_failing_lag_probe_keeps_the_status_sample(self):
+        import catchup as tier
+        tr = cl.PhaseTracker(0.0, 30.0, label_round=100)
+        tr.observe(1, status(LABEL, total=1, processed=1, verified=1, tblocks=1, ablocks=1), None)
+        st = status(last_round=100)
+        with mock.patch.object(tier, "get_json", return_value=st), \
+                mock.patch.object(tier, "block_ts", side_effect=OSError("probe timeout")):
+            got = tier.poll(self.node(), tr, {})
+        self.assertEqual(got, (100, None))          # a gap in the lag only
+        self.assertIsNotNone(tr.t_done)             # the status was observed
+
+    def test_http_client_errors_are_transient_in_status_and_probe(self):
+        import http.client
+        import catchup as tier
+        tr = cl.PhaseTracker(0.0, 30.0, label_round=100)
+        with mock.patch.object(tier, "get_json", side_effect=http.client.IncompleteRead(b"x")):
+            self.assertIsNone(tier.poll(self.node(), tr, {}))
+        tr.observe(1, status(LABEL), None)
+        with mock.patch.object(tier, "get_json", return_value=status(last_round=100)), \
+                mock.patch.object(tier, "block_ts", side_effect=http.client.BadStatusLine("x")):
+            self.assertEqual(tier.poll(self.node(), tr, {}), (100, None))
+
+    def test_a_good_probe_reaches_the_head(self):
+        import catchup as tier
+        tr = cl.PhaseTracker(0.0, 30.0, label_round=100)
+        tr.observe(1, status(LABEL), None)
+        with mock.patch.object(tier, "get_json", return_value=status(last_round=100)), \
+                mock.patch.object(tier, "block_ts", return_value=time.time() - 2):
+            rnd, lag = tier.poll(self.node(), tr, {})
+        self.assertTrue(tr.at_head())
+        self.assertLess(lag, 10)
+
+
+class DiskMbTest(unittest.TestCase):
+    """Y2: a failing `du` skips the metric instead of discarding the run."""
+
+    def node(self):
+        import catchup as tier
+        cfg = {"cpus": 1, "mem": "1g"}
+        return tier.DockerNode("go", "img", "/tmp/d", 4500, cfg)
+
+    def test_timeout_returns_none(self):
+        import subprocess
+        import catchup as tier
+        with mock.patch.object(tier.localnet, "docker",
+                               side_effect=subprocess.TimeoutExpired("docker", 60)):
+            self.assertIsNone(self.node().disk_mb())
+
+    def test_other_errors_return_none(self):
+        import catchup as tier
+        with mock.patch.object(tier.localnet, "docker", side_effect=OSError("no docker")):
+            self.assertIsNone(self.node().disk_mb())
+
+    def test_parses_du_output(self):
+        import catchup as tier
+        with mock.patch.object(tier.localnet, "docker",
+                               return_value=mock.Mock(stdout="2048\t/data\n")):
+            self.assertEqual(self.node().disk_mb(), 2.0)
+
+
+class ResolveLabelTest(unittest.TestCase):
+    """Y9."""
+
+    def cfg(self, **kw):
+        c = {"label": "", "mode": "live", "label_url": "http://127.0.0.1:1/x"}
+        c.update(kw)
+        return c
+
+    def test_no_sleep_after_the_final_failed_attempt(self):
+        import catchup as tier
+        sleeps = []
+        with mock.patch.object(tier.urllib.request, "urlopen", side_effect=OSError("down")), \
+                mock.patch.object(tier.time, "sleep", side_effect=sleeps.append):
+            with self.assertRaises(tier.CatchupFailure) as cm:
+                tier.resolve_label(self.cfg())
+        self.assertEqual(cm.exception.cls, cl.EXTERNAL)
+        self.assertEqual(len(sleeps), 2)           # between the 3 attempts, not after the last
+
+    def test_a_pinned_label_is_used_as_is(self):
+        import catchup as tier
+        self.assertEqual(tier.resolve_label(self.cfg(label=LABEL)), LABEL)
+
+
+class MockTierLabelsTest(unittest.TestCase):
+    def test_the_label_is_re_resolved_per_repeat_and_recorded(self):
+        import catchup as tier
+        a, b = "40500000#" + "A" * 52, "40500000#" + "B" * 52
+        out = tempfile.mkdtemp(prefix="catchup-labels-")
+        env = {"BENCH_CATCHUP_MODE": "mock", "BENCH_CATCHUP_PROFILE": "smoke",
+               "BENCH_CATCHUP_FOLLOW_SECS": "1", "BENCH_RUNS": "2", "BENCH_OUT": out,
+               "BENCH_CATCHUP_PORT_BASE": "0", "BENCH_CATCHUP_POLL_S": "0.1"}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(tier, "resolve_label", side_effect=[a, b]) as rl_:
+            rc = tier.main()
+        self.assertEqual(rc, 0)
+        self.assertEqual(rl_.call_count, 2)
+        rows, errs = bench_schema.load_result_file(os.path.join(out, "catchup.json"))
+        self.assertEqual(errs, [])
+        meta = rows[0]["metadata"]
+        self.assertEqual(meta["labels"], [a, b])
+        self.assertEqual([d["label"] for d in meta["runs_detail"]], [a, b])
 
 
 class MockTierTest(unittest.TestCase):

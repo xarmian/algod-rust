@@ -10,7 +10,7 @@ name: Bench Catchup Smoke
 # gates and failure classification, and `BENCH_CATCHUP_MODE=mock` runs the real
 # driver against two in-process mock nodes and a mock chain (no Docker, no
 # go-algorand build, nothing external). The real run is a manual
-# `make bench-compare TIERS=catchup NETWORK=testnet` (docs/BENCHMARK_COMPARISON.md,
+# `make bench-compare TIERS=catchup CATCHUP_NETWORK=testnet` (docs/BENCHMARK_COMPARISON.md,
 # "The catchup tier").
 
 on:

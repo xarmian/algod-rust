@@ -57,11 +57,13 @@ Inputs (environment):
 import hashlib
 import base64
 import concurrent.futures
+import http.client
 import http.server
 import json
 import os
 import shutil
 import sys
+import subprocess
 import tempfile
 import threading
 import time
@@ -85,7 +87,10 @@ import rest_lib as rl  # noqa: E402
 TIER = cl.TIER
 TOKEN = ll.TOKEN
 LABEL_KEY = "bench-catchup"
+OWNER_LABEL = "bench-catchup-owner"   # pid of the run that started the container
 STARTUP_TIMEOUT = 180
+TRANSIENT = (OSError, ValueError, KeyError, http.client.HTTPException)   # + TierError, below
+MEM_LIMIT = {"v": ""}   # the run's container memory limit, named in an OOM failure
 SIDES = ("go", "rust")
 GATE_MARGIN_ROUNDS = 50   # rounds added to the oldest retained round (the window slides)
 
@@ -155,7 +160,8 @@ def resolve_label(cfg):
                 return cl.parse_index_text(r.read().decode("utf-8", "replace"))
         except (OSError, ValueError) as e:
             last = str(e)
-            time.sleep(2 * (attempt + 1))
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
     raise CatchupFailure(cl.EXTERNAL, f"cannot read the catchpoint label from "
                                       f"{cfg['label_url']}: {last}")
 
@@ -173,7 +179,8 @@ def container_args(impl, *, name, image, data_dir, port, cpus, mem):
         cmd = ["algod", "-d", "/data", "-o", "-l", f"0.0.0.0:{rl.REST_PORT}"]
     else:
         raise ValueError(f"impl must be go or rust, not {impl!r}")
-    return ["run", "-d", "--name", name, "--label", f"{LABEL_KEY}=1", "--cpus", str(float(cpus)),
+    return ["run", "-d", "--name", name, "--label", f"{LABEL_KEY}=1", "--label", f"{OWNER_LABEL}={os.getpid()}",
+            "--cpus", str(float(cpus)),
             "--memory", mem, "--memory-swap", mem, "-p", f"127.0.0.1:{port}:{rl.REST_PORT}",
             "-v", f"{data_dir}:/data", *entry, image, *cmd]
 
@@ -218,11 +225,18 @@ class DockerNode:
         return self.sampler.samples if self.sampler else []
 
     def disk_mb(self):
-        p = localnet.docker("exec", self.name, "du", "-sk", "/data", check=False, timeout=60)
+        """`du -sk /data` in MB; None (the metric is skipped, with a warning)
+        when it cannot be read: a passed run is never discarded for it."""
         try:
+            p = localnet.docker("exec", self.name, "du", "-sk", "/data", check=False, timeout=60)
             return int(p.stdout.split()[0]) / 1024.0
-        except (ValueError, IndexError):
+        except (subprocess.SubprocessError, OSError, ValueError, IndexError) as e:
+            log(f"WARNING: no disk_mb for {self.impl}: {type(e).__name__}: {e}")
             return None
+
+    def oom_killed(self):
+        p = localnet.docker("inspect", "--format", "{{.State.OOMKilled}}", self.name, check=False)
+        return p.stdout.strip() == "true"
 
     def stop(self):
         if self.sampler:
@@ -230,12 +244,45 @@ class DockerNode:
         localnet.docker("rm", "-f", self.name, check=False)
 
 
-def sweep_stale():
-    p = localnet.docker("ps", "-aq", "--filter", f"label={LABEL_KEY}=1", check=False)
-    ids = (p.stdout or "").split()
-    if ids:
-        log(f"removing {len(ids)} container(s) left by an earlier run: {' '.join(ids)}")
-        localnet.docker("rm", "-f", *ids, check=False)
+def pid_alive(pid):
+    """Whether process `pid` exists (never signals it: on Windows signal 0 is
+    CTRL_C_EVENT, so `tasklist` is asked there)."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True,
+                             text=True).stdout
+        return str(pid) in out.split()
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OverflowError:
+        return False
+    return True
+
+
+def sweep_stale(docker_fn=None, pid_alive=pid_alive):
+    """Remove the containers of dead runs only: those carrying this tier's label
+    whose owner pid (OWNER_LABEL) is gone or missing. A concurrent live run's
+    containers are never touched. Returns the removed container ids."""
+    docker_fn = docker_fn or localnet.docker
+    p = docker_fn("ps", "-a", "--filter", f"label={LABEL_KEY}=1", "--format",
+                  '{{.ID}} {{.Label "' + OWNER_LABEL + '"}}', check=False)
+    stale = []
+    for line in (p.stdout or "").splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        owner = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        if owner == os.getpid() or not pid_alive(owner):
+            stale.append(parts[0])
+    if stale:
+        log(f"removing {len(stale)} container(s) left by an earlier run: {' '.join(stale)}")
+        docker_fn("rm", "-f", *stale, check=False)
+    return stale
 
 
 # ---- the mock network (BENCH_CATCHUP_MODE=mock) ---------------------------------------------
@@ -428,13 +475,14 @@ def side_facts(nodes, trackers):
         out[s] = {"progressed": bool(tr and (tr.progressed or tr.t_done is not None)),
                   "panicked": cl.log_has_fatal_panic(text),
                   "exited": not n.running(),
+                  "oom": bool(getattr(n, "oom_killed", lambda: False)()),
                   "relay_error": cl.log_has_relay_error(text)}
     return out
 
 
-def fail(nodes, trackers, kind, msg, label_error=False):
+def fail(nodes, trackers, kind, msg, label_error=False, mem_limit=""):
     cls, detail = cl.classify_failure(side_facts(nodes, trackers), label_error=label_error,
-                                      kind=kind)
+                                      kind=kind, mem_limit=mem_limit or MEM_LIMIT["v"])
     for s, n in nodes.items():
         tail = "\n".join(n.logs(60).splitlines()[-25:])
         print(f"catchup: --- last {s} log lines\n{tail}", file=sys.stderr)
@@ -443,18 +491,25 @@ def fail(nodes, trackers, kind, msg, label_error=False):
 
 def poll(node, tracker, cfg):
     """One status sample of one node into its tracker; (round, lag_s) or None
-    when the node did not answer."""
+    when the node did not answer. The status is observed FIRST; the lag probe
+    (the newest block's timestamp) is optional: when it fails the sample is kept
+    and only the lag is a gap. http.client errors (IncompleteRead,
+    BadStatusLine) are transient like any transport error."""
     try:
         t = time.time()
         st = get_json(node.base, "/v2/status", timeout=5)
         rnd = int(st.get("last-round") or 0)
-        lag = None
-        if tracker.t_done is not None and rnd > 0:
-            lag = time.time() - block_ts(node.base, rnd)
-        tracker.observe(t, st, lag)
-        return rnd, lag
-    except (OSError, ValueError, KeyError, TierError):
+        tracker.observe(t, st, None)
+    except TRANSIENT + (TierError,):
         return None
+    lag = None
+    if tracker.t_done is not None and rnd > 0:
+        try:
+            lag = time.time() - block_ts(node.base, rnd)
+        except TRANSIENT + (TierError,):
+            return rnd, None
+        tracker.observe_lag(t, rnd, lag)
+    return rnd, lag
 
 
 def run_once(cfg, label, idx, nodes, mock):
@@ -539,12 +594,16 @@ def drive(cfg, label, idx, nodes, trackers, label_round):
              f"{0 if first is None else agreed - first + 1} round(s) up to the agreed tip "
              f"{agreed} are served by both nodes (need {cfg['min_gate_rounds']}, "
              "BENCH_CATCHUP_MIN_GATE_ROUNDS)")
-    rounds = cl.sample_rounds(first, agreed, cfg["hash_cap"])
-    hashes = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        for s in SIDES:
-            hashes[s] = dict(zip(rounds, pool.map(lambda r, b=nodes[s].base: block_hash(b, r),
-                                                  rounds)))
+        try:
+            hashes, rounds, first, trims = cl.collect_hashes(
+                lambda side, r: block_hash(nodes[side].base, r), SIDES, first, agreed,
+                cfg["hash_cap"], fetch=pool.map)
+        except cl.RangeMoved as e:
+            fail(nodes, trackers, "harness", f"block-hash gate could not fetch a stable range: {e}")
+    if trims:
+        log(f"run {idx}: the retained range moved during the fetch; start trimmed to {first} "
+            f"({trims} retries)")
     herrs, compared = cl.hash_gate(hashes["go"], hashes["rust"], rounds)
     errs += herrs
     if errs:
@@ -571,7 +630,7 @@ def drive(cfg, label, idx, nodes, trackers, label_round):
             m["disk_mb"] = disk
         metrics[s] = m
     return metrics, {"agreed_round": agreed, "agreed_block_hash": agreed_hash,
-                     "rounds_compared": compared, "gate_range": [first, agreed]}
+                     "rounds_compared": compared, "gate_range": [first, agreed], "label": label}
 
 
 # ---- the tier ---------------------------------------------------------------------------------
@@ -594,9 +653,8 @@ def run_tier():
         raise TierError("BENCH_RUNS must be >= 1")
     out_dir = os.environ.get("BENCH_OUT") or os.getcwd()
     os.makedirs(out_dir, exist_ok=True)
-    label = resolve_label(cfg)
-    label_round, _ = cl.parse_label(label)
-    log(f"{cfg['network']} ({cfg['mode']}), catchpoint {label}, {runs} run(s), follow "
+    MEM_LIMIT["v"] = cfg["mem"]
+    log(f"{cfg['network']} ({cfg['mode']}), {runs} run(s), follow "
         f"{cfg['follow_secs']:.0f}s each, limits {cfg['cpus']} cpus / {cfg['mem']} each")
     work = tempfile.mkdtemp(prefix="bench-catchup-")
     results, details = [], []
@@ -606,7 +664,12 @@ def run_tier():
             localnet.ensure_images(cfg, rust_env="BENCH_CATCHUP_RUST_IMAGE",
                                    rust_tag="algod-rust:bench-catchup")
             genesis = os.path.join(REPO, cl.NETWORKS[cfg["network"]]["genesis_rel"])
+        labels = []
         for i in range(1, runs + 1):
+            # resolved per repeat: an hour into a multi-run job the catchpoint of the
+            # first repeat may have rotated off the relays (a pinned label stays)
+            label = resolve_label(cfg)
+            labels.append(label)
             nodes = {}
             try:
                 if mock:
@@ -634,7 +697,8 @@ def run_tier():
                     for s in SIDES:
                         rest.purge_tree(os.path.join(work, f"run{i}-{s}"), cfg["go_image"])
         meta = {
-            "network": cfg["network"], "label": label, "label_round": label_round,
+            "network": cfg["network"], "label": labels[0] if len(set(labels)) == 1 else "varies",
+            "labels": labels, "label_round": cl.parse_label(labels[0])[0],
             "mode": cfg["mode"], "profile": cfg["profile"], "follow_secs": cfg["follow_secs"],
             "poll_s": cfg["poll_s"], "head_slack_s": cfg["head_slack_s"],
             "hash_cap": cfg["hash_cap"], "cpus": cfg["cpus"], "mem": cfg["mem"],

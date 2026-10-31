@@ -1507,18 +1507,21 @@ spread (n and the range / 95% CI of the median) is part of every row.
 
 ### What each side runs
 
-1. **One label.** The newest catchpoint label of the network is read **once**
-   per tier run from the index go's own `goal node catchup` uses
+1. **One label per repeat.** The newest catchpoint label of the network is read
+   at the start of **every** repeat (a catchpoint can rotate off the relays during
+   a multi-hour job; a pinned `BENCH_CATCHUP_LABEL` stays) from the index go's own `goal node catchup` uses
    (`https://algorand-catchpoints.s3.us-east-2.amazonaws.com/channel/<network>/latest.catchpoint`;
    `BENCH_CATCHUP_LABEL` pins one, `BENCH_CATCHUP_LABEL_URL` points at another
-   index) and handed to both nodes and to every repeat. Networks:
+   index) and handed to both nodes. The label of every repeat is recorded
+   (`metadata.labels`, `metadata.runs_detail[].label`). Networks:
    `testnet` (default), `mainnet`, `betanet` (`CATCHUP_NETWORK=` or
    `BENCH_CATCHUP_NETWORK`; not the generic `NETWORK`, which other tools read). `voimain` / `aramidmain` are not offered: they run
    custom consensus parameters go-algorand does not know, so there is no Go
    side.
 2. **Two nodes, identical limits, empty data directories.** Per repeat both
    start side by side in Docker with the same `--cpus`, `--memory` and
-   `--memory-swap` (`BENCH_CATCHUP_CPUS` / `_MEM`, default 2 CPUs and 3 GB), the
+   `--memory-swap` (`BENCH_CATCHUP_CPUS` / `BENCH_CATCHUP_MEM`, default 2 CPUs and **6 GB**: a first
+   testnet run peaked at 3.0 GB RSS per node, so 3 GB sat on the OOM limit), the
    same loopback port layout, the same `genesis.json` (the repo's vendored copy
    of go-algorand's `installer/genesis/<network>/genesis.json`), the same
    tokens and a data directory that holds nothing else: go `algod -d /data`,
@@ -1541,14 +1544,18 @@ spread (n and the range / 95% CI of the median) is part of every row.
 
    The catchup counts as finished only when the catchpoint clears **and** the
    ledger has reached the label's round: both nodes sync from genesis before the
-   request, so a catchpoint that clears below that round was aborted, and the
-   tier fails (class decided by the evidence rules below). The request itself
+   request, so a catchpoint that stays cleared below that round for three consecutive
+   polls (one odd sample is ignored) was aborted, and the tier fails (class decided by the evidence rules below). The request itself
    is not idempotent: after a timed-out attempt, an "already in progress"
    answer for the same label (go and algod-rust answer HTTP 200 with the label;
    HTTP 400 naming the same label is accepted too) counts as success, timed from
    the first attempt; an answer naming another label, or a 200 whose message
    is not the label, is a failure. A hash probe that times out or gets a 5xx is
-   retried and then fails the run; only a 404 means "pruned".
+   retried and then fails the run; only a 404 means "pruned". If the oldest
+   sampled rounds are pruned while the hashes are fetched the start is moved
+   forward and the fetch repeated (a pruned round is never a disagreement; only a
+   differing hash is); a window that keeps outrunning the fetch is a `harness`
+   failure.
 
    There is no separate "download" and "import" row: both nodes stream the
    catchpoint file and import accounts while it arrives, so the only
@@ -1560,7 +1567,9 @@ spread (n and the range / 95% CI of the median) is part of every row.
    `follow_lag_s_mean` / `_max` (wall clock minus the newest block's timestamp,
    so independent of the other node) and `follow_rounds_behind_max` (rounds
    behind the other node).
-5. **Resources**, `docker stats` once per second over the container:
+5. **Resources**, one sample per `docker stats --no-stream` call (back to back, so
+   roughly one every 1-2 s) over the container, and every sample counts equally
+   (the mean is unweighted):
    `cpu_cores_catchup` / `cpu_cores_follow` (mean CPU% / 100 over the two
    windows), `rss_mb_peak`, `blockio_read_mb`, `blockio_write_mb` (block-device
    bytes over the whole run) and `disk_mb` (`du -sk /data` at the end).
@@ -1598,6 +1607,10 @@ does (the same evidence rules as `network_image_smoke_lib.sh`, ported to
   or neither node made any progress and a transport-level relay failure
   (refused / reset / timed-out connection, DNS or TLS failure, a 5xx from a
   relay) is in a log;
+* `FAILURE CLASS: harness: ...` when the measurement itself is unsound, never a
+  verdict on either node: a container **OOM-killed** (`docker inspect
+  State.OOMKilled`; raise `BENCH_CATCHUP_MEM`) or a retained block range that
+  kept moving;
 * `FAILURE CLASS: node: ...` for everything else: a panic, an exited
   container, one node stuck while the other progressed (the same relays served
   both), a gate mismatch, or a stall with no relay failure in the logs.

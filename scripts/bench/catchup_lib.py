@@ -21,6 +21,12 @@ import time
 TIER = "catchup"
 EXTERNAL = "external network"
 NODE = "node"
+# Not a verdict on either node: the harness or its configuration (an OOM-killed
+# container, a retained range that kept moving).
+HARNESS = "harness"
+# Consecutive samples with the catchpoint cleared below the label round before
+# a catchup counts as aborted (one odd sample must not latch it).
+ABORT_SAMPLES = 3
 
 
 class CatchupError(Exception):
@@ -119,7 +125,7 @@ def parse_settings(env):
         "hash_cap": num("BENCH_CATCHUP_HASH_CAP", 20000, int),
         "min_gate_rounds": num("BENCH_CATCHUP_MIN_GATE_ROUNDS", 100, int),
         "cpus": num("BENCH_CATCHUP_CPUS", 2.0),
-        "mem": env.get("BENCH_CATCHUP_MEM") or "3g",
+        "mem": env.get("BENCH_CATCHUP_MEM") or "6g",
         "port_base": num("BENCH_CATCHUP_PORT_BASE", 4500, int),
         "go_image": env.get("BENCH_CATCHUP_GO_IMAGE") or "",
         "rust_image": env.get("BENCH_CATCHUP_RUST_IMAGE") or "",
@@ -201,9 +207,15 @@ class PhaseTracker:
         self.enter = {}
         self.catchpoint_seen = None
         self.progressed = False
-        self.aborted = False
+        self._clear = 0
         self.t_done = self.round_done = None
         self.t_head = self.round_head = None
+
+    @property
+    def aborted(self):
+        """The catchpoint stayed cleared below the label's round for
+        ABORT_SAMPLES consecutive samples."""
+        return self._clear >= ABORT_SAMPLES
 
     def observe(self, t, status, lag_s=None):
         stage = stage_of(status)
@@ -212,19 +224,26 @@ class PhaseTracker:
             if self.catchpoint_seen is None:
                 self.catchpoint_seen = status["catchpoint"]
             self.enter.setdefault(stage, t)
+            self._clear = 0     # running again: any earlier cleared sample was transient
             if stage != "ledger" or _int(status, "catchpoint-processed-accounts") > 0:
                 self.progressed = True
-        elif self.catchpoint_seen is not None and self.t_done is None and not self.aborted:
+        elif self.catchpoint_seen is not None and self.t_done is None:
             # The catchpoint cleared. Both nodes sync from genesis before the
             # request, so last-round > 0 proves nothing: only a ledger that
             # reached the label's round is a finished catchup; a catchpoint
             # that clears below it was aborted or failed.
             if rnd > 0 and (self.label_round is None or rnd >= self.label_round):
                 self.t_done, self.round_done = t, rnd
+                self._clear = 0
                 self.enter.setdefault("done", t)
                 self.progressed = True
             else:
-                self.aborted = True
+                self._clear += 1
+        self.observe_lag(t, rnd, lag_s)
+
+    def observe_lag(self, t, rnd, lag_s):
+        """The head check, separate from the status sample so a failed lag probe
+        never loses the sample itself."""
         if (self.t_done is not None and self.t_head is None and lag_s is not None
                 and lag_s <= self.head_slack_s):
             self.t_head, self.round_head = t, rnd
@@ -481,12 +500,18 @@ def log_has_fatal_panic(text):
     return bool(_PANIC.search(text or ""))
 
 
-def classify_failure(sides, label_error=False, kind="other"):
+def classify_failure(sides, label_error=False, kind="other", mem_limit=""):
     """(class, detail). `sides` maps go / rust to {progressed, panicked,
     exited, relay_error}; `kind` is `timeout` (a stage or the follow did not
     finish in time), `gate` (the nodes disagree) or `other`."""
     if label_error:
         return EXTERNAL, "the catchpoint label could not be fetched from the network's index"
+    oom = [s for s in sorted(sides) if sides[s].get("oom")]
+    if oom:
+        return HARNESS, (f"{' and '.join(oom)} container OOM-killed at the {mem_limit or 'configured'} "
+                         "limit; raise BENCH_CATCHUP_MEM")
+    if kind == "harness":
+        return HARNESS, "the run could not be measured"
     bad = [s for s in sorted(sides) if sides[s]["panicked"] or sides[s]["exited"]]
     if bad:
         what = ", ".join(f"{s} {'panicked' if sides[s]['panicked'] else 'exited'}" for s in bad)
@@ -506,6 +531,37 @@ def classify_failure(sides, label_error=False, kind="other"):
     if kind in ("timeout", "abort") and relay:
         return EXTERNAL, "both nodes progressed too slowly; relay failures are in the logs"
     return NODE, "both nodes progressed, but the run did not finish"
+
+
+class RangeMoved(CatchupError):
+    """The retained block range kept moving while its hashes were fetched."""
+
+
+def collect_hashes(get_hash, sides, first, last, cap, max_trims=5, fetch=map):
+    """Fetch the block hashes of the gate range for every side:
+    (hashes {side: {round: hash}}, rounds, first used, trims).
+
+    `get_hash(side, round)` returns the hash or None (pruned). Both nodes keep
+    sliding their retained window while a slow fetch runs, so when the missing
+    rounds are exactly the oldest sampled ones the start is moved past them and
+    the fetch repeated (at most `max_trims` times); RangeMoved when the window
+    keeps outrunning the fetch. A pruned round is never a disagreement: only a
+    differing hash is (hash_gate). A hole that is not a prefix is returned as
+    is, for hash_gate to report."""
+    for trims in range(max_trims + 1):
+        rounds = sample_rounds(first, last, cap)
+        if not rounds:
+            raise RangeMoved(f"no retained rounds left in [{first}, {last}]")
+        hashes = {s: dict(zip(rounds, fetch(lambda r, s=s: get_hash(s, r), rounds)))
+                  for s in sides}
+        missing = sorted({r for s in sides for r in rounds if hashes[s][r] is None})
+        if not missing:
+            return hashes, rounds, first, trims
+        if rounds[:len(missing)] != missing:
+            return hashes, rounds, first, trims
+        first = missing[-1] + 1
+    raise RangeMoved(f"the retained range kept moving: still pruning past round {first - 1} "
+                     f"after {max_trims} retries")
 
 
 def format_failure(cls, detail):
