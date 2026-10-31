@@ -20,11 +20,17 @@
 
 //! Roundtrip conformance of account REST responses vs go-algorand (TASK-254).
 //!
-//! For each fixture, go-algorand v4.6.0-stable produced references from a
-//! `basics.AccountData` (see `fixtures/account_roundtrip/`):
+//! For each fixture, go-algorand v5.0.4-stable produced references from a
+//! `basics.AccountData` (see `fixtures/account_roundtrip/`; regenerated with
+//! `gen_accounts.go` against that tag, byte-identical to what is committed):
 //!
-//! - `<name>.account.json` — `model.Account` via `AccountDataToAccount` +
-//!   `JSONStrictHandle` (the JSON endpoint body).
+//! - `<name>.account.json` — `model.Account` via `AccountDataToAccount`,
+//!   serialized with `encoding/json`, which is what the endpoint's
+//!   `ctx.JSON` writes. It is deliberately NOT go-codec's `JSONStrictHandle`:
+//!   that encoder drops a non-nil pointer to an empty slice / zero struct
+//!   under `omitempty`, so it would lose the `assets`, `created-assets`,
+//!   `created-apps`, `apps-local-state`, `apps-total-schema` and `reward-base`
+//!   keys that the real endpoint emits (#2156).
 //! - `<name>.accountdata.msgpack` — the raw `AccountData` via `CodecHandle` (the
 //!   msgpack endpoint body).
 //! - `<name>.meta.json` — address, round, amount-without-pending-rewards.
@@ -397,6 +403,126 @@ fn account_json_exclude_all_omits_resources() {
     // Counts are still present.
     assert_eq!(v["total-assets-opted-in"], 2);
     assert_eq!(v["total-created-assets"], 1);
+}
+
+/// go's `AccountDataToAccount` always sets non-nil pointers for the resource
+/// lists, the total schema and `reward-base`, and echo's `ctx.JSON`
+/// (encoding/json) keeps those keys when empty/zero (#2156, live-verified
+/// against go 5.0.4 on an account with no resources).
+#[test]
+fn account_json_empty_account_keeps_go_pointer_keys() {
+    let consensus = consensus_params_for_version(CONSENSUS_V41).expect("v41 consensus");
+    let f = fixtures()
+        .into_iter()
+        .find(|f| f.name == "offline_minimal")
+        .unwrap();
+    let lookup = lookup_for(&f);
+    let resp = account_data_to_response(&lookup, &f.addr, "none", false, false, &consensus);
+    let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
+    for k in [
+        "assets",
+        "created-assets",
+        "created-apps",
+        "apps-local-state",
+    ] {
+        assert_eq!(v[k], serde_json::json!([]), "{k} must be an empty array");
+    }
+    assert_eq!(
+        v["apps-total-schema"],
+        serde_json::json!({"num-byte-slice": 0, "num-uint": 0})
+    );
+    assert_eq!(v["reward-base"], serde_json::json!(0));
+    // Fields go builds with omitEmpty() stay omitted.
+    for k in [
+        "apps-total-extra-pages",
+        "total-boxes",
+        "total-box-bytes",
+        "last-proposed",
+        "last-heartbeat",
+        "incentive-eligible",
+        "auth-addr",
+        "participation",
+        "sig-type",
+    ] {
+        assert!(v.get(k).is_none(), "{k} must stay omitted");
+    }
+}
+
+/// `exclude=all` (go's `basicAccountInformation`) leaves the four resource
+/// lists nil but still sets `apps-total-schema` and `reward-base`.
+#[test]
+fn account_json_exclude_all_keeps_schema_and_reward_base() {
+    let consensus = consensus_params_for_version(CONSENSUS_V41).expect("v41 consensus");
+    let f = fixtures()
+        .into_iter()
+        .find(|f| f.name == "offline_minimal")
+        .unwrap();
+    let lookup = lookup_for(&f);
+    let resp = account_data_to_response(&lookup, &f.addr, "all", false, false, &consensus);
+    let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
+    for k in [
+        "assets",
+        "created-assets",
+        "created-apps",
+        "apps-local-state",
+    ] {
+        assert!(v.get(k).is_none(), "exclude=all must omit {k}");
+    }
+    assert_eq!(
+        v["apps-total-schema"],
+        serde_json::json!({"num-byte-slice": 0, "num-uint": 0})
+    );
+    assert_eq!(v["reward-base"], serde_json::json!(0));
+}
+
+/// `exclude=created-assets-params` / `created-apps-params` on an account that
+/// holds resources keep each element (index / id) but drop its `params`, and
+/// on an account with none the lists are still `[]` (#2156).
+#[test]
+fn account_json_params_excludes_with_and_without_resources() {
+    let consensus = consensus_params_for_version(CONSENSUS_V41).expect("v41 consensus");
+    let all = fixtures();
+    let with_assets = all.iter().find(|f| f.name == "with_assets").unwrap();
+    let with_apps = all.iter().find(|f| f.name == "with_apps").unwrap();
+    let empty = all.iter().find(|f| f.name == "offline_minimal").unwrap();
+
+    let v = serde_json::to_value(account_data_to_response(
+        &lookup_for(with_assets),
+        &with_assets.addr,
+        "",
+        false,
+        true,
+        &consensus,
+    ))
+    .unwrap();
+    assert_eq!(v["created-assets"][0]["index"], 7);
+    assert!(v["created-assets"][0].get("params").is_none());
+    assert_eq!(v["assets"].as_array().unwrap().len(), 2);
+
+    let v = serde_json::to_value(account_data_to_response(
+        &lookup_for(with_apps),
+        &with_apps.addr,
+        "",
+        true,
+        false,
+        &consensus,
+    ))
+    .unwrap();
+    assert_eq!(v["created-apps"][0]["id"], 8);
+    assert!(v["created-apps"][0].get("params").is_none());
+    assert_eq!(v["apps-local-state"].as_array().unwrap().len(), 1);
+
+    let v = serde_json::to_value(account_data_to_response(
+        &lookup_for(empty),
+        &empty.addr,
+        "",
+        true,
+        true,
+        &consensus,
+    ))
+    .unwrap();
+    assert_eq!(v["created-apps"], serde_json::json!([]));
+    assert_eq!(v["created-assets"], serde_json::json!([]));
 }
 
 // ---------------------------------------------------------------------------

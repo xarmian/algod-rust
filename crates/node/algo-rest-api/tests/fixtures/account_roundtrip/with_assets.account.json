@@ -2,6 +2,11 @@
   "address": "GMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADGDOYMAJA",
   "amount": 2000000,
   "amount-without-pending-rewards": 2000000,
+  "apps-local-state": [],
+  "apps-total-schema": {
+    "num-byte-slice": 0,
+    "num-uint": 0
+  },
   "assets": [
     {
       "amount": 9,
@@ -15,6 +20,7 @@
     }
   ],
   "auth-addr": "TEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABTOGWHVXQ",
+  "created-apps": [],
   "created-assets": [
     {
       "index": 7,
@@ -39,6 +45,7 @@
   ],
   "min-balance": 300000,
   "pending-rewards": 0,
+  "reward-base": 0,
   "rewards": 0,
   "round": 200,
   "status": "Offline",

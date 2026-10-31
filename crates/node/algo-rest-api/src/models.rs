@@ -419,8 +419,12 @@ pub struct AccountResponse {
     pub apps_total_extra_pages: Option<u64>,
 
     /// Specifies maximums on the number of each type that may be stored.
-    #[serde(rename = "apps-total-schema", skip_serializing_if = "Option::is_none")]
-    pub apps_total_schema: Option<ApiApplicationStateSchema>,
+    ///
+    /// Not an `Option`: go sets `AppsTotalSchema: &totalAppSchema`
+    /// unconditionally and `ctx.JSON` keeps a non-nil pointer to a zero struct,
+    /// so the key is always serialized (#2156).
+    #[serde(rename = "apps-total-schema")]
+    pub apps_total_schema: ApiApplicationStateSchema,
 
     /// \[asset\] assets held by this account.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -468,8 +472,11 @@ pub struct AccountResponse {
 
     /// \[ebase\] used as part of the rewards computation. Only applicable to
     /// accounts which are participating.
-    #[serde(rename = "reward-base", skip_serializing_if = "Option::is_none")]
-    pub reward_base: Option<u64>,
+    ///
+    /// Not an `Option`: go sets `RewardBase: &record.RewardsBase`
+    /// unconditionally, so the key is always serialized, `0` included (#2156).
+    #[serde(rename = "reward-base")]
+    pub reward_base: u64,
 
     /// \[ern\] total rewards of MicroAlgos the account has received, including
     /// pending rewards.
@@ -808,16 +815,6 @@ use base64::Engine;
 
 use crate::node::AccountLookup;
 
-/// Return `None` for an empty vector, mirroring go's omitempty on `*[]T` fields
-/// (an empty slice is omitted, not serialized as `[]`).
-fn none_if_empty<T>(v: Vec<T>) -> Option<Vec<T>> {
-    if v.is_empty() {
-        None
-    } else {
-        Some(v)
-    }
-}
-
 /// Convert an `AccountLookup` to an `AccountResponse`, matching go-algorand's
 /// `AccountDataToAccount` logic.
 ///
@@ -897,52 +894,46 @@ pub fn account_data_to_response(
         }
     };
 
-    // Total app schema. go renders this as `*model.ApplicationStateSchema` with
-    // omitempty + RecursiveEmptyCheck, so a zero schema is omitted entirely.
-    let apps_total_schema =
-        if record.total_app_schema.num_byte_slice == 0 && record.total_app_schema.num_uint == 0 {
-            None
-        } else {
-            Some(ApiApplicationStateSchema {
-                num_byte_slice: record.total_app_schema.num_byte_slice,
-                num_uint: record.total_app_schema.num_uint,
-            })
-        };
-
     let total_extra_pages = record.total_extra_app_pages as u64;
 
-    // For exclude == "all", we skip resource lists but still include counts
-    // (matching go-algorand's basicAccountInformation)
+    // The base response is exactly go's `basicAccountInformation` (the
+    // `exclude=all` shape): counts, `apps-total-schema` and `reward-base` are
+    // always set (go's non-nil pointers, kept by encoding/json even when
+    // zero, #2156); the four resource lists stay `None` (nil in go).
+    let mut response = AccountResponse {
+        address: addr_str.clone(),
+        amount: record.micro_algos,
+        amount_without_pending_rewards: lookup.amount_without_pending_rewards,
+        pending_rewards,
+        rewards: record.rewarded_micro_algos,
+        status,
+        round: lookup.last_round,
+        sig_type: None,
+        reward_base: record.rewards_base,
+        participation,
+        incentive_eligible: omit_empty_bool(record.incentive_eligible),
+        auth_addr,
+        assets: None,
+        created_assets: None,
+        apps_local_state: None,
+        created_apps: None,
+        apps_total_schema: ApiApplicationStateSchema {
+            num_byte_slice: record.total_app_schema.num_byte_slice,
+            num_uint: record.total_app_schema.num_uint,
+        },
+        apps_total_extra_pages: omit_empty_u64(total_extra_pages),
+        total_assets_opted_in: record.total_assets_opted_in,
+        total_created_assets: record.total_created_assets,
+        total_apps_opted_in: record.total_apps_opted_in,
+        total_created_apps: record.total_created_apps,
+        total_boxes: omit_empty_u64(record.total_boxes),
+        total_box_bytes: omit_empty_u64(record.total_box_bytes),
+        min_balance,
+        last_proposed: omit_empty_u64(record.last_proposed),
+        last_heartbeat: omit_empty_u64(record.last_heartbeat),
+    };
     if exclude == "all" {
-        return AccountResponse {
-            address: addr_str,
-            amount: record.micro_algos,
-            amount_without_pending_rewards: lookup.amount_without_pending_rewards,
-            pending_rewards,
-            rewards: record.rewarded_micro_algos,
-            status,
-            round: lookup.last_round,
-            sig_type: None,
-            reward_base: omit_empty_u64(record.rewards_base),
-            participation,
-            incentive_eligible: omit_empty_bool(record.incentive_eligible),
-            auth_addr,
-            assets: None,
-            created_assets: None,
-            apps_local_state: None,
-            created_apps: None,
-            apps_total_schema,
-            apps_total_extra_pages: omit_empty_u64(total_extra_pages),
-            total_assets_opted_in: record.total_assets_opted_in,
-            total_created_assets: record.total_created_assets,
-            total_apps_opted_in: record.total_apps_opted_in,
-            total_created_apps: record.total_created_apps,
-            total_boxes: omit_empty_u64(record.total_boxes),
-            total_box_bytes: omit_empty_u64(record.total_box_bytes),
-            min_balance,
-            last_proposed: omit_empty_u64(record.last_proposed),
-            last_heartbeat: omit_empty_u64(record.last_heartbeat),
-        };
+        return response;
     }
 
     // Full response: include all resource lists populated from lookup maps.
@@ -1001,37 +992,13 @@ pub fn account_data_to_response(
         })
         .collect();
 
-    AccountResponse {
-        address: addr_str,
-        amount: record.micro_algos,
-        amount_without_pending_rewards: lookup.amount_without_pending_rewards,
-        pending_rewards,
-        rewards: record.rewarded_micro_algos,
-        status,
-        round: lookup.last_round,
-        sig_type: None,
-        reward_base: omit_empty_u64(record.rewards_base),
-        participation,
-        incentive_eligible: omit_empty_bool(record.incentive_eligible),
-        auth_addr,
-        // go renders these as `*[]…` with omitempty, so empty resource lists
-        // are omitted entirely (not serialized as `[]`).
-        assets: none_if_empty(assets),
-        created_assets: none_if_empty(created_assets),
-        apps_local_state: none_if_empty(apps_local_state),
-        created_apps: none_if_empty(created_apps),
-        apps_total_schema,
-        apps_total_extra_pages: omit_empty_u64(total_extra_pages),
-        total_assets_opted_in: record.total_assets_opted_in,
-        total_created_assets: record.total_created_assets,
-        total_apps_opted_in: record.total_apps_opted_in,
-        total_created_apps: record.total_created_apps,
-        total_boxes: omit_empty_u64(record.total_boxes),
-        total_box_bytes: omit_empty_u64(record.total_box_bytes),
-        min_balance,
-        last_proposed: omit_empty_u64(record.last_proposed),
-        last_heartbeat: omit_empty_u64(record.last_heartbeat),
-    }
+    // go sets `&assets` etc. unconditionally (a non-nil pointer to a possibly
+    // empty slice), which encoding/json emits as `[]` (#2156).
+    response.assets = Some(assets);
+    response.created_assets = Some(created_assets);
+    response.apps_local_state = Some(apps_local_state);
+    response.created_apps = Some(created_apps);
+    response
 }
 
 /// Compute the minimum balance for an account, matching go-algorand's
