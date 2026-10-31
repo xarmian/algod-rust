@@ -360,6 +360,57 @@ pub fn is_duplicate_error(msg: &str) -> bool {
     m.contains("transaction already in ledger") || m.contains("transaction already in the pool")
 }
 
+/// Consecutive failures against one endpoint after which a fixed-count
+/// retry moves on to the next endpoint.
+const ROTATE_AFTER_FAILURES: u32 = 5;
+
+/// The endpoint a fixed-count retry should use after `consecutive` failures in
+/// a row against `idx`: the next one every [`ROTATE_AFTER_FAILURES`] failures.
+fn rotate_endpoint(idx: usize, consecutive: u32, n: usize) -> usize {
+    if n > 1 && consecutive > 0 && consecutive.is_multiple_of(ROTATE_AFTER_FAILURES) {
+        (idx + 1) % n
+    } else {
+        idx
+    }
+}
+
+/// Hand one job to the workers, giving up at `deadline` instead of waiting
+/// for a free worker forever. False: the deadline passed or the pool is gone.
+async fn send_job(tx: &tokio::sync::mpsc::Sender<()>, deadline: Instant) -> bool {
+    matches!(
+        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), tx.send(())).await,
+        Ok(Ok(()))
+    )
+}
+
+/// The submission window a report carries, so a benchmark can measure over the
+/// interval transactions were actually offered (not container start-up or the
+/// confirmation tail): the chain rounds and wall-clock instants around it.
+#[derive(Debug, Clone, Default)]
+struct SubmitWindow {
+    start_round: Option<u64>,
+    end_round: Option<u64>,
+    first_unix_ms: u64,
+    last_unix_ms: u64,
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The cluster's current round as the first endpoint that answers reports it.
+async fn current_round(shared: &Shared) -> Option<u64> {
+    for client in &shared.clients {
+        if let Ok(p) = client.suggested_transaction_params().await {
+            return Some(p.last_round);
+        }
+    }
+    None
+}
+
 /// Whether job `seq` is one of the sampled submissions whose confirmation
 /// latency is probed (`sample == 0` disables sampling).
 fn should_probe(sample: u64, seq: u64) -> bool {
@@ -490,8 +541,12 @@ fn effective_fee(min_fee: u64, fee_per_byte: u64, multiplier: f64) -> u64 {
 pub struct EndpointStats {
     /// Groups (or singletons) POSTed successfully.
     pub accepted_groups: u64,
-    /// Groups whose POST returned an error.
+    /// Groups whose POST returned an error (per group; fixed-count retries of
+    /// the same group are counted under `retries`, not here).
     pub failed_groups: u64,
+    /// Fixed-count mode: failed submission attempts that were retried.
+    #[serde(default)]
+    pub retries: u64,
 }
 
 /// Confirmation-latency summary, in milliseconds.
@@ -559,6 +614,9 @@ struct Shared {
     confirm_timeouts: AtomicU64,
     /// Fixed-count mode: the txid of every accepted transaction.
     accepted_txids: Mutex<Vec<String>>,
+    /// The run's deadline (`--duration-secs`): fixed-count scheduling and
+    /// retries stop here.
+    deadline: Instant,
 }
 
 impl Shared {
@@ -568,6 +626,7 @@ impl Shared {
         clients: Vec<AlgodClient>,
         params: SuggestedParams,
     ) -> Self {
+        let duration_secs = cfg.duration_secs;
         Shared {
             accounts,
             endpoint_names: cfg.endpoints.clone(),
@@ -586,7 +645,21 @@ impl Shared {
             latencies: Mutex::new(Vec::new()),
             confirm_timeouts: AtomicU64::new(0),
             accepted_txids: Mutex::new(Vec::new()),
+            deadline: Instant::now() + Duration::from_secs_f64(duration_secs.max(0.0)),
         }
+    }
+
+    /// A failed fixed-count attempt that will be retried.
+    fn record_retry(&self, endpoint: &str) {
+        let mut map = self.per_endpoint.lock().expect("per_endpoint mutex");
+        map.entry(endpoint.to_string()).or_default().retries += 1;
+    }
+
+    /// A fixed-count group given up on: one failed group, globally and on the
+    /// endpoint it was last tried against.
+    fn record_fixed_failure(&self, endpoint: &str) {
+        self.failed_groups.fetch_add(1, Ordering::Relaxed);
+        self.record_endpoint(endpoint, false);
     }
 
     /// A fixed-count group a node accepted, or reported as already known:
@@ -732,7 +805,14 @@ pub async fn run(cfg: LoadgenConfig) -> anyhow::Result<()> {
     let mut last_log = Instant::now();
 
     let fixed = cfg.fixed_count;
+    let mut window = SubmitWindow {
+        start_round: current_round(&shared).await,
+        first_unix_ms: unix_ms(),
+        ..Default::default()
+    };
+    let mut gave_up = false;
     while start.elapsed() < total
+        && !gave_up
         && (fixed == 0 || shared.dispatched.load(Ordering::Relaxed) < fixed)
     {
         ticker.tick().await;
@@ -746,8 +826,10 @@ pub async fn run(cfg: LoadgenConfig) -> anyhow::Result<()> {
             + shared.backpressure_drops.load(Ordering::Relaxed);
         for _ in 0..want_jobs.saturating_sub(done_jobs) {
             if fixed > 0 {
-                // Fixed-count mode never drops a job: wait for a free worker.
-                if tx.send(()).await.is_err() {
+                // Fixed-count mode never drops a job: wait for a free worker,
+                // but not past the run's deadline.
+                if !send_job(&tx, shared.deadline).await {
+                    gave_up = true;
                     break;
                 }
                 shared.dispatched.fetch_add(1, Ordering::Relaxed);
@@ -780,6 +862,8 @@ pub async fn run(cfg: LoadgenConfig) -> anyhow::Result<()> {
         let _ = w.await;
     }
     let wall = start.elapsed().as_secs_f64();
+    window.last_unix_ms = unix_ms();
+    window.end_round = current_round(&shared).await;
     shared.stop.store(true, Ordering::Relaxed);
     refresher.abort();
 
@@ -797,7 +881,7 @@ pub async fn run(cfg: LoadgenConfig) -> anyhow::Result<()> {
         std::fs::write(path, ids.join("\n") + "\n")?;
     }
 
-    let report = build_report(&shared, wall, fixed_report);
+    let report = build_report(&shared, wall, fixed_report, window);
     let rendered = serde_json::to_string_pretty(&report)?;
     if let Some(path) = &cfg.output {
         if let Some(parent) = path.parent() {
@@ -817,6 +901,7 @@ fn build_report(
     shared: &Shared,
     wall_secs: f64,
     fixed: Option<serde_json::Value>,
+    window: SubmitWindow,
 ) -> LoadgenReport {
     let cfg = &shared.cfg;
     let accepted_groups = shared.accepted_groups.load(Ordering::Relaxed);
@@ -863,6 +948,10 @@ fn build_report(
             "achieved_submit_tps":
                 if wall_secs > 0.0 { (accepted_txns as f64 / wall_secs * 100.0).round() / 100.0 } else { 0.0 },
             "requested_target_tps": cfg.target_tps,
+            "start_round": window.start_round,
+            "end_round": window.end_round,
+            "first_submit_unix_ms": window.first_unix_ms,
+            "last_submit_unix_ms": window.last_unix_ms,
         }),
         errors: shared.errors.lock().expect("errors mutex").clone(),
         confirmation,
@@ -947,9 +1036,7 @@ async fn verify_all(shared: &Arc<Shared>) -> serde_json::Value {
 /// until a node accepts it (or reports it already known).
 async fn submit_fixed(shared: &Arc<Shared>, widx: usize) {
     let cfg = &shared.cfg;
-    let endpoint_idx = widx % shared.clients.len();
-    let client = &shared.clients[endpoint_idx];
-    let endpoint = &shared.endpoint_names[endpoint_idx];
+    let mut endpoint_idx = widx % shared.clients.len();
     let seq = shared.submit_seq.fetch_add(1, Ordering::Relaxed);
     let (genesis_hash, genesis_id) = {
         let p = shared.params.lock().expect("params mutex");
@@ -973,7 +1060,10 @@ async fn submit_fixed(shared: &Arc<Shared>, widx: usize) {
     };
     let submitted_at = Instant::now();
     let mut attempts = 0u32;
+    let mut consecutive = 0u32;
     loop {
+        let client = &shared.clients[endpoint_idx];
+        let endpoint = &shared.endpoint_names[endpoint_idx];
         match client.send_raw_transaction(&body).await {
             Ok(txid) => {
                 shared.record_fixed_accept(endpoint);
@@ -992,13 +1082,15 @@ async fn submit_fixed(shared: &Arc<Shared>, widx: usize) {
                     }
                     break;
                 }
-                shared.record_endpoint(endpoint, false);
+                shared.record_retry(endpoint);
                 shared.record_error(msg);
                 attempts += 1;
-                if attempts >= FIXED_MAX_ATTEMPTS {
-                    shared.failed_groups.fetch_add(1, Ordering::Relaxed);
+                consecutive += 1;
+                if attempts >= FIXED_MAX_ATTEMPTS || Instant::now() >= shared.deadline {
+                    shared.record_fixed_failure(endpoint);
                     return;
                 }
+                endpoint_idx = rotate_endpoint(endpoint_idx, consecutive, shared.clients.len());
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
@@ -1523,6 +1615,79 @@ mod tests {
         let per = shared.per_endpoint.lock().expect("lock");
         assert_eq!(per[&ep].accepted_groups, 2);
         assert_eq!(per[&ep].failed_groups, 0);
+    }
+
+    #[test]
+    fn retries_are_counted_apart_from_failed_groups() {
+        let shared = test_shared(0);
+        let ep = shared.endpoint_names[0].clone();
+        for _ in 0..3 {
+            shared.record_retry(&ep);
+        }
+        shared.record_fixed_failure(&ep);
+        assert_eq!(shared.failed_groups.load(Ordering::Relaxed), 1);
+        let per = shared.per_endpoint.lock().expect("lock");
+        assert_eq!(per[&ep].retries, 3, "attempts are retries");
+        assert_eq!(per[&ep].failed_groups, 1, "failed_groups is per group");
+        assert_eq!(per[&ep].accepted_groups, 0);
+    }
+
+    #[test]
+    fn a_dead_endpoint_is_rotated_away_from_after_consecutive_failures() {
+        assert_eq!(rotate_endpoint(0, 0, 3), 0);
+        assert_eq!(rotate_endpoint(0, 4, 3), 0);
+        assert_eq!(rotate_endpoint(0, 5, 3), 1);
+        assert_eq!(rotate_endpoint(2, 10, 3), 0, "wraps around");
+        assert_eq!(rotate_endpoint(0, 5, 1), 0, "a single endpoint stays");
+    }
+
+    #[tokio::test]
+    async fn the_scheduler_send_gives_up_at_the_deadline() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<()>(1);
+        let soon = Instant::now() + Duration::from_millis(100);
+        assert!(send_job(&tx, soon).await, "a free slot is taken at once");
+        let t0 = Instant::now();
+        assert!(
+            !send_job(&tx, soon).await,
+            "a full channel must not block forever"
+        );
+        assert!(t0.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn fixed_submission_to_a_dead_endpoint_stops_at_the_deadline() {
+        let shared = test_shared(0); // duration 1 s, endpoint refuses connections
+        let t0 = Instant::now();
+        tokio::time::timeout(Duration::from_secs(30), submit_fixed(&shared, 0))
+            .await
+            .expect("the retry loop must honour the deadline, not run 400 attempts");
+        assert!(t0.elapsed() < Duration::from_secs(20));
+        assert_eq!(shared.failed_groups.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.accepted_groups.load(Ordering::Relaxed), 0);
+        assert!(shared.accepted_txids.lock().expect("lock").is_empty());
+        let ep = shared.endpoint_names[0].clone();
+        let per = shared.per_endpoint.lock().expect("lock");
+        assert!(per[&ep].retries >= 1);
+        assert_eq!(per[&ep].failed_groups, 1);
+    }
+
+    #[test]
+    fn the_report_carries_the_submission_window() {
+        let shared = test_shared(0);
+        let w = SubmitWindow {
+            start_round: Some(7),
+            end_round: Some(19),
+            first_unix_ms: 1000,
+            last_unix_ms: 61000,
+        };
+        let rep = build_report(&shared, 60.0, None, w);
+        let sub = &rep.submission;
+        assert_eq!(sub["start_round"], 7);
+        assert_eq!(sub["end_round"], 19);
+        assert_eq!(sub["first_submit_unix_ms"], 1000);
+        assert_eq!(sub["last_submit_unix_ms"], 61000);
+        let none = build_report(&shared, 1.0, None, SubmitWindow::default());
+        assert!(none.submission["start_round"].is_null());
     }
 
     #[test]

@@ -20,7 +20,9 @@ runs in the default unit tests (test_localnet.py); the tier script
 import hashlib
 import json
 import re
+import socket
 import time
+import urllib.error
 
 MIB = 1024 * 1024
 TOKEN = "a" * 64
@@ -328,7 +330,7 @@ def wait_for_round(get_round, target, timeout, sleep=time.sleep, now=time.monoto
     the current round at once). RoundWaitError after `timeout` seconds, saying
     what was last seen."""
     if target is None:
-        return get_round()
+        return require_round(get_round(), "the node")
     end = now() + timeout
     seen = None
     while True:
@@ -342,6 +344,65 @@ def wait_for_round(get_round, target, timeout, sleep=time.sleep, now=time.monoto
         sleep(1)
     got = f"last saw {seen}" if seen is not None else "no answer"
     raise RoundWaitError(f"the node did not reach round {target} within {timeout}s ({got})")
+
+
+def is_transient(exc):
+    """Whether a REST failure is worth retrying: the node being briefly
+    unreachable (connection errors, timeouts, 5xx) as opposed to a real answer
+    such as a 4xx."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code >= 500
+    return isinstance(exc, (urllib.error.URLError, socket.timeout, TimeoutError,
+                            ConnectionError, OSError))
+
+
+def with_retry(call, attempts=4, delay=1.0, sleep=time.sleep):
+    """call() with a bounded retry (exponential backoff: delay, 2*delay, ...) on
+    transient failures only; the last error is raised once the attempts are used
+    and a non-transient error is raised at once."""
+    for i in range(attempts):
+        try:
+            return call()
+        except Exception as e:  # noqa: BLE001 - classified below
+            if not is_transient(e) or i == attempts - 1:
+                raise
+            sleep(delay * (2 ** i))
+
+
+def wait_drained(get_pending, timeout, sleep=time.sleep, now=time.monotonic):
+    """Poll get_pending() (txns in the pool, None when unknown) until it is 0 or
+    `timeout` passes. Returns the pool size last seen: 0 when drained, the
+    leftover backlog otherwise, None if it was never readable."""
+    end = now() + timeout
+    seen = None
+    while True:
+        n = get_pending()
+        if n is not None:
+            seen = n
+            if n == 0:
+                return 0
+        if now() >= end:
+            return seen
+        sleep(2)
+
+
+def backlog_metrics(pending):
+    """The `start_backlog_txns` row of a step: transactions still pooled when it
+    started (0 on a clean start). A step that starts dirty is visible in the
+    report instead of silently measuring the previous step's tail."""
+    if pending is None:
+        return {}
+    return {"start_backlog_txns": ("txns", "lower", float(pending))}
+
+
+def submit_window(rep):
+    """The interval a load step actually offered transactions, from the
+    generator's report: the rounds around it and its wall-clock instants in
+    seconds (None where the generator did not report them)."""
+    sub = rep.get("submission", {})
+    t0, t1 = sub.get("first_submit_unix_ms"), sub.get("last_submit_unix_ms")
+    return {"start_round": sub.get("start_round"), "end_round": sub.get("end_round"),
+            "t0": t0 / 1000.0 if t0 else None, "t1": t1 / 1000.0 if t1 else None}
 
 
 def expected_txns(fixed_count, group_size):

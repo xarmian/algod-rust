@@ -22,6 +22,8 @@ on:
       - "scripts/bench/testdata/localnet/**"
       - "scripts/bench/run.py"
       - "scripts/bench/report.py"
+      - "scripts/bench/go-algorand.pin"
+      - "docker/scripts/stress-bootstrap.sh"
       - "bin/algod-rust/src/commands/loadgen.rs"
       - "bin/algod-rust/src/cli.rs"
       - "docker/Dockerfile"
@@ -34,8 +36,14 @@ on:
       - "scripts/bench/tiers/localnet.py"
       - "scripts/bench/test_localnet.py"
       - "scripts/bench/testdata/localnet/**"
+      - "scripts/bench/run.py"
+      - "scripts/bench/report.py"
+      - "scripts/bench/go-algorand.pin"
+      - "docker/scripts/stress-bootstrap.sh"
       - "bin/algod-rust/src/commands/loadgen.rs"
+      - "bin/algod-rust/src/cli.rs"
       - "docker/Dockerfile"
+      - "Makefile"
       - ".github/workflows/bench-localnet.yml"
   workflow_dispatch:
 

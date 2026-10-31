@@ -234,6 +234,111 @@ def loadgen(p50=120, samples=10, failed=0, drops=0, tps=480.0):
                              "p99_ms": p50 * 3}}
 
 
+class SubmitWindowTest(unittest.TestCase):
+    def rep(self, **kw):
+        sub = {"start_round": 10, "end_round": 30, "first_submit_unix_ms": 1_000_000,
+               "last_submit_unix_ms": 1_060_000}
+        sub.update(kw)
+        return {"submission": sub}
+
+    def test_window_is_the_generators_submission_interval(self):
+        w = ll.submit_window(self.rep())
+        self.assertEqual(w, {"start_round": 10, "end_round": 30, "t0": 1000.0, "t1": 1060.0})
+
+    def test_container_startup_and_confirm_tail_do_not_dilute_the_rate(self):
+        # The generator's window is 20 rounds / 60 s; a window padded by 25 s of
+        # container start-up and a 30 s confirm tail would read far lower.
+        blocks = {10: {"round": 10, "ts": 100, "tc": 1000},
+                  30: {"round": 30, "ts": 160, "tc": 4000}}
+        w = ll.submit_window(self.rep())
+        stats = ll.window_stats(blocks[w["start_round"]], blocks[w["end_round"]])
+        self.assertAlmostEqual(stats["confirmed_tps"], 50.0)
+        padded = ll.window_stats(blocks[10], {"round": 40, "ts": 215, "tc": 4000})
+        self.assertLess(padded["confirmed_tps"], stats["confirmed_tps"])
+
+    def test_missing_rounds_or_instants_give_none(self):
+        w = ll.submit_window(self.rep(start_round=None, end_round=None,
+                                      first_submit_unix_ms=0, last_submit_unix_ms=0))
+        self.assertEqual(w, {"start_round": None, "end_round": None, "t0": None, "t1": None})
+        self.assertEqual(ll.submit_window({"submission": {}})["start_round"], None)
+
+
+class RetryTest(unittest.TestCase):
+    def test_a_flaky_call_is_retried_with_backoff(self):
+        import urllib.error
+        calls, sleeps = [], []
+
+        def flaky():
+            calls.append(1)
+            if len(calls) < 3:
+                raise urllib.error.URLError("connection reset")
+            return 5
+
+        self.assertEqual(ll.with_retry(flaky, attempts=4, delay=1.0, sleep=sleeps.append), 5)
+        self.assertEqual(sleeps, [1.0, 2.0])
+
+    def test_a_persistent_failure_raises_the_last_error_after_the_attempts(self):
+        import urllib.error
+        sleeps = []
+
+        def down():
+            raise urllib.error.URLError("refused")
+
+        with self.assertRaises(urllib.error.URLError):
+            ll.with_retry(down, attempts=3, delay=0.5, sleep=sleeps.append)
+        self.assertEqual(sleeps, [0.5, 1.0])
+
+    def test_a_real_failure_is_not_retried(self):
+        import urllib.error
+        sleeps = []
+
+        def missing():
+            raise urllib.error.HTTPError("u", 404, "not found", {}, None)
+
+        with self.assertRaises(urllib.error.HTTPError):
+            ll.with_retry(missing, attempts=4, delay=1.0, sleep=sleeps.append)
+        self.assertEqual(sleeps, [])
+
+    def test_transient_classification(self):
+        import socket
+        import urllib.error
+        self.assertTrue(ll.is_transient(urllib.error.URLError("x")))
+        self.assertTrue(ll.is_transient(socket.timeout()))
+        self.assertTrue(ll.is_transient(ConnectionResetError()))
+        self.assertTrue(ll.is_transient(urllib.error.HTTPError("u", 503, "x", {}, None)))
+        self.assertFalse(ll.is_transient(urllib.error.HTTPError("u", 400, "x", {}, None)))
+        self.assertFalse(ll.is_transient(ValueError("x")))
+
+
+class DrainTest(unittest.TestCase):
+    class Clock:
+        t = 0.0
+
+        def now(self):
+            return self.t
+
+        def sleep(self, d):
+            self.t += d
+
+    def test_a_drained_pool_returns_zero(self):
+        c = self.Clock()
+        seq = iter([50, 20, 0])
+        self.assertEqual(ll.wait_drained(lambda: next(seq), 60, sleep=c.sleep, now=c.now), 0)
+
+    def test_a_pool_that_never_drains_reports_the_backlog_instead_of_hiding_it(self):
+        c = self.Clock()
+        self.assertEqual(ll.wait_drained(lambda: 1234, 10, sleep=c.sleep, now=c.now), 1234)
+
+    def test_unknown_pool_size_is_none(self):
+        c = self.Clock()
+        self.assertIsNone(ll.wait_drained(lambda: None, 5, sleep=c.sleep, now=c.now))
+
+    def test_backlog_is_a_row_so_a_dirty_start_is_visible(self):
+        self.assertEqual(ll.backlog_metrics(0), {"start_backlog_txns": ("txns", "lower", 0.0)})
+        self.assertEqual(ll.backlog_metrics(900)["start_backlog_txns"][2], 900.0)
+        self.assertEqual(ll.backlog_metrics(None), {})
+
+
 class MetricsTest(unittest.TestCase):
     def test_latency_percentiles_tps_and_resources(self):
         window = {"confirmed_tps": 450.0, "round_time_s": 2.8}
@@ -402,8 +507,10 @@ class WaitTest(unittest.TestCase):
             ll.wait_for_round(lambda: None, 1, 3, sleep=c.sleep, now=c.now)
         self.assertIn("no answer", str(cm.exception))
 
-    def test_no_target_means_no_wait(self):
+    def test_no_target_returns_the_current_round_and_never_a_silent_none(self):
         self.assertEqual(ll.wait_for_round(lambda: 2, None, 1), 2)
+        with self.assertRaises(ll.RoundWaitError):
+            ll.wait_for_round(lambda: None, None, 1)
 
     def test_require_round_rejects_none(self):
         self.assertEqual(ll.require_round(4, "relay"), 4)
@@ -505,6 +612,70 @@ class TierWiringTest(unittest.TestCase):
                 with open(p, "w", encoding="utf-8") as f:
                     json.dump(r, f)
                 self.assertEqual(bool(self.tier.check_report(p)), bad, r)
+
+    def clean_env(self):
+        for k in [k for k in os.environ if k.startswith("BENCH_LOCALNET_")]:
+            del os.environ[k]
+        os.environ["BENCH_LOCALNET_PROFILE"] = "smoke"
+
+    def test_numeric_settings_are_validated_before_any_cluster_starts(self):
+        for name, bad in (("FIXED_TPS", "0"), ("FIXED_TPS", "-3"), ("STEP_SECS", "0"),
+                          ("FIXED_COUNT", "0"), ("ACCOUNTS", "0"), ("CPUS", "0"),
+                          ("MEM", "lots"), ("PORT_BASE", "70000"), ("NUM_ROUNDS", "5")):
+            self.clean_env()
+            os.environ["BENCH_LOCALNET_" + name] = bad
+            with self.assertRaises(self.tier.TierError, msg=f"{name}={bad}"):
+                self.tier.settings()
+        self.clean_env()
+        os.environ["BENCH_LOCALNET_MEM"] = "512m"
+        self.assertEqual(self.tier.settings()["mem"], "512m")
+
+    def test_non_numeric_setting_is_a_tier_error(self):
+        self.clean_env()
+        os.environ["BENCH_LOCALNET_FIXED_TPS"] = "fast"
+        with self.assertRaises(self.tier.TierError):
+            self.tier.settings()
+
+    def test_a_timed_out_loadgen_container_is_killed(self):
+        import subprocess
+        calls = []
+
+        def fake(*args, **kw):
+            calls.append(args)
+            if args[0] == "run":
+                raise subprocess.TimeoutExpired("docker", 5)
+
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.tier.run_container(fake, "bench-lg", ["img", "x"], 5)
+        self.assertEqual(calls[0][:4], ("run", "--rm", "--name", "bench-lg"))
+        self.assertEqual(calls[1][:3], ("rm", "-f", "bench-lg"))
+
+    def test_a_clean_loadgen_container_is_not_force_removed(self):
+        calls = []
+        self.tier.run_container(lambda *a, **k: calls.append(a), "n", [], 5)
+        self.assertEqual([c[0] for c in calls], ["run"])
+
+    def test_completed_runs_are_written_when_a_later_run_fails(self):
+        import tempfile
+        runs = [{"go": {"fixed": {"confirmed_tps": ("txn/s", "higher", 10.0)}},
+                 "rust": {"fixed": {"confirmed_tps": ("txn/s", "higher", 5.0)}}}]
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(self.tier.write_partial(d, runs, {"profile": "smoke"}, 2,
+                                                    "gate failed"))
+            with open(os.path.join(d, "localnet.json"), encoding="utf-8") as f:
+                rows = json.load(f)
+            self.assertEqual(len(rows), 2)
+            for r in rows:
+                self.assertEqual(bench_schema.validate_result(r), [])
+                self.assertTrue(r["metadata"]["incomplete"])
+                self.assertEqual(r["metadata"]["failed_run"], 2)
+                self.assertEqual(r["metadata"]["failure"], "gate failed")
+
+    def test_nothing_is_written_when_no_run_completed(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            self.assertFalse(self.tier.write_partial(d, [], {}, 1, "x"))
+            self.assertFalse(os.path.exists(os.path.join(d, "localnet.json")))
 
     def test_the_tier_is_discovered_by_the_runner(self):
         import run

@@ -55,6 +55,7 @@ Inputs (environment; docs/BENCHMARK_COMPARISON.md, "The localnet tier"):
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -101,7 +102,22 @@ def posix(path):
 
 def env_int(name, default):
     v = os.environ.get(name)
-    return default if v in (None, "") else int(v)
+    if v in (None, ""):
+        return default
+    try:
+        return int(v)
+    except ValueError:
+        raise TierError(f"{name}={v!r} is not an integer") from None
+
+
+def env_float(name, default):
+    v = os.environ.get(name)
+    if v in (None, ""):
+        return default
+    try:
+        return float(v)
+    except ValueError:
+        raise TierError(f"{name}={v!r} is not a number") from None
 
 
 def pinned_tag():
@@ -125,11 +141,9 @@ def settings():
     p["fixed_tps"] = env_int("BENCH_LOCALNET_FIXED_TPS", p["fixed_tps"])
     if os.environ.get("BENCH_LOCALNET_MAX_STEP") not in (None, ""):
         p["max_step"] = os.environ["BENCH_LOCALNET_MAX_STEP"] == "1"
-    if p["fixed_count"] < 1 or p["step_secs"] < 1:
-        raise TierError("fixed count and step seconds must be >= 1")
     p.update(
         profile=name,
-        cpus=float(os.environ.get("BENCH_LOCALNET_CPUS") or 2),
+        cpus=env_float("BENCH_LOCALNET_CPUS", 2.0),
         mem=os.environ.get("BENCH_LOCALNET_MEM") or "3g",
         accounts=env_int("BENCH_LOCALNET_ACCOUNTS", 16),
         port_base=env_int("BENCH_LOCALNET_PORT_BASE", 4300),
@@ -138,7 +152,28 @@ def settings():
         or "algorand/algod:" + pinned_tag().lstrip("v"),
         rust_image=os.environ.get("BENCH_LOCALNET_RUST_IMAGE") or "",
     )
+    check_settings(p)
     return p
+
+
+def check_settings(p):
+    """Refuse bad numbers before any cluster is started (a zero TPS would
+    otherwise divide by zero only after the images are built and the first
+    cluster is up)."""
+    for key, label in (("fixed_count", "BENCH_LOCALNET_FIXED_COUNT"),
+                       ("fixed_tps", "BENCH_LOCALNET_FIXED_TPS"),
+                       ("step_secs", "BENCH_LOCALNET_STEP_SECS"),
+                       ("accounts", "BENCH_LOCALNET_ACCOUNTS")):
+        if p[key] < 1:
+            raise TierError(f"{label} must be >= 1, got {p[key]}")
+    if not p["cpus"] > 0:
+        raise TierError(f"BENCH_LOCALNET_CPUS must be > 0, got {p['cpus']}")
+    if not re.fullmatch(r"[0-9]+(\.[0-9]+)?[bkmgBKMG]?", p["mem"]):
+        raise TierError(f"BENCH_LOCALNET_MEM={p['mem']!r}: want a Docker size like 3g or 512m")
+    if not 1024 <= p["port_base"] <= 65530:
+        raise TierError(f"BENCH_LOCALNET_PORT_BASE must be 1024..65530, got {p['port_base']}")
+    if p["num_rounds"] < 100:
+        raise TierError(f"BENCH_LOCALNET_NUM_ROUNDS must be >= 100, got {p['num_rounds']}")
 
 
 def ensure_images(cfg):
@@ -155,6 +190,17 @@ def ensure_images(cfg):
     for k in ("go_image", "rust_image"):
         cfg[k.replace("image", "image_id")] = docker(
             "image", "inspect", "--format", "{{.Id}}", cfg[k]).stdout.strip()
+
+
+def run_container(run, name, args, timeout):
+    """`docker run --rm --name <name> <args>`; on a timeout or any other
+    interruption the (still running) container is force-removed before the
+    exception propagates, so it cannot keep loading a cluster that is torn down."""
+    try:
+        return run("run", "--rm", "--name", name, *args, check=False, timeout=timeout)
+    except BaseException:
+        run("rm", "-f", name, check=False)
+        raise
 
 
 # ---- the shared network tree -------------------------------------------------
@@ -256,16 +302,23 @@ class Cluster:
         self._thread = None
 
     # -- REST --
-    def api(self, svc, path, timeout=8):
+    def api(self, svc, path, timeout=8, attempts=4):
+        """GET a node's REST path. A node that is briefly unreachable (reset,
+        timeout, 5xx) is retried with backoff; a real answer such as a 404 is
+        raised at once."""
         req = urllib.request.Request(
             f"http://127.0.0.1:{ll.host_port(self.cfg['port_base'], svc)}{path}",
             headers={"X-Algo-API-Token": ll.TOKEN})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8"))
 
-    def round_of(self, svc):
+        def call():
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+
+        return ll.with_retry(call, attempts=attempts)
+
+    def round_of(self, svc, attempts=4):
         try:
-            return int(self.api(svc, "/v2/status")["last-round"])
+            return int(self.api(svc, "/v2/status", attempts=attempts)["last-round"])
         except (urllib.error.URLError, OSError, KeyError, ValueError):
             return None
 
@@ -278,7 +331,7 @@ class Cluster:
         docker("compose", "-f", posix(self.compose), "up", "-d", timeout=900)
         deadline = time.time() + STARTUP_TIMEOUT
         while time.time() < deadline:
-            rounds = {s: self.round_of(s) for s in ll.SERVICES}
+            rounds = {s: self.round_of(s, attempts=1) for s in ll.SERVICES}
             if all(r is not None and r >= 2 for r in rounds.values()):
                 log(f"{self.impl}: all nodes advancing (rounds {rounds})")
                 self._start_sampler()
@@ -338,16 +391,17 @@ class Cluster:
                check=False, timeout=300)
 
     # -- load --
-    def drain(self, timeout=90):
-        end = time.time() + timeout
-        while time.time() < end:
+    def drain(self, timeout=120):
+        """Wait for the relay's pool to empty. Returns the pool size last seen:
+        0 when drained, the leftover backlog on timeout (None: unreadable)."""
+        def pending():
             try:
-                if int(self.api("relay", "/v2/transactions/pending?max=1")
-                       .get("total-transactions", 0)) == 0:
-                    return
+                return int(self.api("relay", "/v2/transactions/pending?max=1", attempts=1)
+                           .get("total-transactions", 0))
             except (urllib.error.URLError, OSError, ValueError):
-                pass
-            time.sleep(2)
+                return None
+
+        return ll.wait_drained(pending, timeout)
 
     def loadgen(self, work, name, extra, timeout):
         """One `algod-rust loadgen run` from a container on the cluster's
@@ -356,9 +410,11 @@ class Cluster:
         endpoints = ",".join(f"http://{s}:{ll.REST_PORT}" for s in ll.SERVICES)
         args = ["loadgen", "run", "--algod-urls", endpoints, "--token", ll.TOKEN,
                 "--keys", "/out/keys.json", "--output", f"/out/{name}.json", *extra]
-        cmd = ["run", "--rm", "--network", self.net, "-v", f"{posix(out_dir)}:/out",
-               "--entrypoint", "algod-rust", self.cfg["rust_image"], *args]
-        p = docker(*cmd, check=False, timeout=timeout)
+        cname = f"{self.project}-loadgen-{name}"
+        cmd = ["run", "--rm", "--name", cname, "--network", self.net, "-v",
+               f"{posix(out_dir)}:/out", "--entrypoint", "algod-rust", self.cfg["rust_image"],
+               *args]
+        p = run_container(docker, cname, cmd[4:], timeout)
         path = os.path.join(out_dir, f"{name}.json")
         if p.returncode != 0 or not os.path.isfile(path):
             tail = "\n".join(((p.stdout or "") + (p.stderr or "")).strip().splitlines()[-10:])
@@ -369,22 +425,33 @@ class Cluster:
         return rep
 
     def step(self, work, name, extra, timeout):
-        """One measured load step: drain, mark the chain, run the generator,
-        mark the chain again, aggregate."""
-        self.drain()
-        r0 = ll.require_round(self.round_of("relay"), "relay")
-        p0 = self.point(r0)
-        t0 = time.time()
+        """One measured load step: drain, run the generator, then aggregate over
+        the interval it actually offered transactions (its start/end rounds and
+        instants), not over container start-up or the confirmation tail.
+        Returns (report, window, resources, first block, last block, backlog)."""
+        backlog = self.drain()
+        if backlog:
+            log(f"{self.impl}: WARNING: {name} starts with {backlog} txns still pooled "
+                "(recorded as start_backlog_txns)")
+        r_before = ll.require_round(self.round_of("relay"), "relay")
+        t_before = time.time()
         rep = self.loadgen(work, name, extra, timeout)
-        t1 = time.time()
+        t_after = time.time()
+        w = ll.submit_window(rep)
+        start_r = w["start_round"] if w["start_round"] is not None else r_before
+        end_r = max([r for r in (w["end_round"],
+                                 (rep.get("fixed") or {}).get("last_confirmed_round"))
+                     if r is not None], default=None)
         # Confirmations were polled across all nodes: the relay (whose chain the
         # window and the balances are read from) may still lag the last one.
-        target = (rep.get("fixed") or {}).get("last_confirmed_round")
-        r1 = ll.wait_for_round(lambda: self.round_of("relay"), target, 120)
-        p1 = self.point(ll.require_round(r1, "relay"))
+        if end_r is None:
+            end_r = ll.require_round(self.round_of("relay"), "relay")
+        else:
+            ll.wait_for_round(lambda: self.round_of("relay"), end_r, 120)
+        p0, p1 = self.point(start_r), self.point(end_r)
         window = ll.window_stats(p0, p1)
-        res = ll.resource_summary(self.samples, t0, t1)
-        return rep, window, res, p0, p1
+        res = ll.resource_summary(self.samples, w["t0"] or t_before, w["t1"] or t_after)
+        return rep, window, res, p0, p1, backlog
 
 
 def final_state(cluster, addrs):
@@ -416,7 +483,7 @@ def run_cluster(impl, cfg, work, shared, genesis_id, partkeys, addrs, raw_dir, r
         cl.up()
         steps = {}
         fixed_secs = cfg["fixed_count"] / cfg["fixed_tps"]
-        rep, window, res, p0, p1 = cl.step(
+        rep, window, res, p0, p1, backlog = cl.step(
             work, "fixed",
             ["--fixed-count", str(cfg["fixed_count"]), "--group-size", str(FIXED_GROUP_SIZE),
              "--target-tps", str(cfg["fixed_tps"]),
@@ -427,6 +494,7 @@ def run_cluster(impl, cfg, work, shared, genesis_id, partkeys, addrs, raw_dir, r
         last = rep["fixed"].get("last_confirmed_round")
         p_last = cl.point(last) if last is not None else p1
         steps["fixed"] = ll.fixed_metrics(rep, window, res, ll.commit_span(p0, p_last))
+        steps["fixed"].update(ll.backlog_metrics(backlog))
         fixed_window, fixed_res = window, res
         side = final_state(cl, addrs)
         # Transactions the chain committed since before the first submission:
@@ -444,13 +512,14 @@ def run_cluster(impl, cfg, work, shared, genesis_id, partkeys, addrs, raw_dir, r
             plan.append(("max", 1_000_000, 32))
         for name, tps, conc in plan:
             time.sleep(5)
-            rep2, window, res, _, _ = cl.step(
+            rep2, window, res, _, _, backlog = cl.step(
                 work, name,
                 ["--target-tps", str(tps), "--duration-secs", str(cfg["step_secs"]),
                  "--ramp-secs", "0", "--group-size", "1", "--concurrency", str(conc),
                  "--fee-multiplier", "4", "--confirm-sample", "50"],
                 timeout=cfg["step_secs"] + 300)
             m = ll.step_metrics(rep2, window, res)
+            m.update(ll.backlog_metrics(backlog))
             if name == "max":
                 m.pop("rejected_groups", None)  # an unbounded offer rejects by design
             steps[name] = m
@@ -476,6 +545,37 @@ def run_cluster(impl, cfg, work, shared, genesis_id, partkeys, addrs, raw_dir, r
             cl.save_logs(raw_dir)
         cl.down()
         purge(cl.dir, cfg["go_image"])
+
+
+def build_meta(cfg, meta_extra):
+    return {
+        "profile": cfg["profile"],
+        "topology": "1 relay + 4 participation nodes, 25% stake each",
+        "cpus_per_container": cfg["cpus"], "mem_per_container": cfg["mem"],
+        "go_image": cfg["go_image"], "go_image_id": cfg["go_image_id"],
+        "rust_image": cfg["rust_image"], "rust_image_id": cfg["rust_image_id"],
+        "ladder": cfg["ladder"], "step_secs": cfg["step_secs"],
+        "fixed_count": cfg["fixed_count"], "fixed_tps": cfg["fixed_tps"],
+        "max_step": cfg["max_step"], "load_accounts": cfg["accounts"],
+        **meta_extra,
+    }
+
+
+def write_results(out_dir, measured, meta):
+    with open(os.path.join(out_dir, "localnet.json"), "w", encoding="utf-8",
+              newline="\n") as f:
+        json.dump(ll.result_rows(measured, TIER, meta), f, indent=1)
+
+
+def write_partial(out_dir, measured, meta, failed_run, failure):
+    """A run failed: keep the rows of the runs that completed (marked
+    incomplete, naming the failed run) so a long benchmark does not lose its
+    valid data. False when no run had completed."""
+    if not measured:
+        return False
+    write_results(out_dir, measured, dict(meta, incomplete=True, failed_run=failed_run,
+                                          failure=str(failure)[:500]))
+    return True
 
 
 # ---- report gate -------------------------------------------------------------
@@ -521,13 +621,12 @@ def main():
                 shared, genesis_id, partkeys, addrs = make_network(cfg, work)
                 order = ("go", "rust") if i % 2 == 0 else ("rust", "go")
                 got = {}
-                errors = []
                 for impl in order:
                     log(f"run {i + 1}/{runs}: {impl} cluster")
                     got[impl] = run_cluster(impl, cfg, work, shared, genesis_id, partkeys,
                                             addrs, raw_dir, i + 1)
                 errors = ll.gate(got["go"]["side"], got["rust"]["side"],
-                                   ll.expected_txns(cfg["fixed_count"], FIXED_GROUP_SIZE))
+                                ll.expected_txns(cfg["fixed_count"], FIXED_GROUP_SIZE))
                 if errors:
                     raise TierError("txid-set / state gate FAILED:\n  " + "\n  ".join(errors))
                 fx = got["go"]["side"]["fixed"]
@@ -540,21 +639,14 @@ def main():
                 log(f"run {i + 1}/{runs}: gate passed ({fx['confirmed_txns']} txns, "
                     f"txid set {fx['confirmed_txid_set_sha256'][:16]} on both clusters)")
                 measured.append({"go": got["go"]["steps"], "rust": got["rust"]["steps"]})
+            except (TierError, ll.RoundWaitError) as e:
+                if write_partial(out_dir, measured, build_meta(cfg, meta_extra), i + 1, e):
+                    log(f"run {i + 1} failed; wrote the {len(measured)} completed run(s) "
+                        "to localnet.json (marked incomplete)")
+                raise
             finally:
                 purge(work, cfg["go_image"])
-        meta = {
-            "profile": cfg["profile"], "topology": "1 relay + 4 participation nodes, 25% stake each",
-            "cpus_per_container": cfg["cpus"], "mem_per_container": cfg["mem"],
-            "go_image": cfg["go_image"], "go_image_id": cfg["go_image_id"],
-            "rust_image": cfg["rust_image"], "rust_image_id": cfg["rust_image_id"],
-            "ladder": cfg["ladder"], "step_secs": cfg["step_secs"],
-            "fixed_count": cfg["fixed_count"], "fixed_tps": cfg["fixed_tps"],
-            "max_step": cfg["max_step"], "load_accounts": cfg["accounts"],
-            **meta_extra,
-        }
-        with open(os.path.join(out_dir, "localnet.json"), "w", encoding="utf-8",
-                  newline="\n") as f:
-            json.dump(ll.result_rows(measured, TIER, meta), f, indent=1)
+        write_results(out_dir, measured, build_meta(cfg, meta_extra))
         log(f"gate passed on {len(measured)} run(s); both clusters committed the same txid set")
     except TierError as e:
         print(f"localnet: {e}", file=sys.stderr)

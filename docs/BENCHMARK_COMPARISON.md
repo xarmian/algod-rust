@@ -1161,19 +1161,23 @@ row's metadata.
 | `ladder-<tps>` | `BENCH_LOCALNET_LADDER` (`100,500,1000,2000`) for `BENCH_LOCALNET_STEP_SECS` (60) each | Throughput and latency at fixed offered rates. |
 | `max` | an unbounded offer (target 1,000,000 TPS, 32 submitters per endpoint) for the same time | The maximum sustained TPS. Its `rejected_groups` is not reported: an unbounded offer rejects by design. |
 
-Between steps the tier waits for the relay's pool to drain, so one step's
-backlog does not leak into the next.
+Between steps the tier waits (up to 120 s) for the relay's pool to drain. If it
+does not, the step is **not** failed (after an unbounded `max` step a large
+backlog legitimately outlasts the wait) but **flagged**: the row
+`<step>/start_backlog_txns` records the transactions still pooled when the step
+started (0 on a clean start) and a warning is logged, so a dirty start is
+visible in the report instead of silently measuring the previous step's tail.
 
 Per step, the rows `<step>/<metric>`:
 
 | Metric | Unit | How |
 |---|---|---|
-| `confirmed_tps` | txn/s | `tc` (transaction counter) and `ts` of the block headers at the start and the end of the step, read from the relay: transactions committed between the two over their chain time. |
+| `confirmed_tps` | txn/s | `tc` (transaction counter) and `ts` of the block headers at the start and the end of the **submission interval**, read from the relay: transactions committed between the two over their chain time. The generator reports the rounds (and wall-clock instants) at which it started and stopped submitting, so container start-up, its confirmation tail and the pool drain are not in the window. |
 | `submit_tps` | txn/s | The generator's accepted submissions per second of wall time. |
 | `latency_p50_ms`, `_p95_ms`, `_p99_ms` | ms | Submit to in-block time of every Nth transaction (the generator polls `/v2/transactions/pending/{txid}` every 250 ms, so its resolution is 250 ms). |
 | `round_time_s` | s | Chain seconds per round over the same window. Block timestamps have one-second resolution, so very short steps are coarse. |
 | `rejected_groups` | groups | Groups a node refused (pool full, fee below the floor) or the generator could not hand to a submitter. The reasons are in the generator's report. |
-| `cpu_cores` | cores | Sum over the five containers of the mean CPU% / 100 (`docker stats`, sampled about every 2 s). |
+| `cpu_cores` | cores | Sum over the five containers of the mean CPU% / 100 (`docker stats`, sampled about every 2 s) over the same submission interval. |
 | `rss_mb_peak` | MB | Sum of every container's peak memory usage. |
 | `blockio_write_mb` | MB | Block-device bytes written by the five containers in the step. |
 
@@ -1194,7 +1198,16 @@ from the generator's own error tallies instead.
 The fixed-count step is deterministic: transaction `seq` has the sender at ring
 position `seq * group_size + i` of the load accounts, a note derived from
 `(seq, i)`, a fixed fee and the validity window `[first_valid, first_valid+999]`
-(Ed25519 signatures are deterministic too). A submission a node reports as already known (go's
+(Ed25519 signatures are deterministic too). The generator enforces `--duration-secs` in this mode too: the scheduler stops
+handing out jobs at the deadline, retries give up there, and a dead endpoint is
+rotated away from after 5 consecutive failures. Failed attempts are counted as
+`retries` per endpoint; `failed_groups` counts groups. REST reads of the tier
+itself retry briefly unreachable nodes (reset, timeout, 5xx) with backoff and a
+loadgen container that times out is force-removed. If a later run fails the
+gate, the rows of the runs that completed are still written to `localnet.json`
+(marked `incomplete`, naming `failed_run`) and the tier exits non-zero.
+
+A submission a node reports as already known (go's
 "transaction already in ledger", algod-rust's "transaction already in the pool")
 counts as accepted; lease conflicts do not. The tier passes `--group-size 1`
 explicitly and the gate expects `fixed_count * group_size` transactions, and
