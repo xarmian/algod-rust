@@ -890,7 +890,7 @@ mod tests {
         );
     }
 
-    /// Issue #2159: the 49 real go-produced certificates of the testnet
+    /// Issue #2159: the 50 real go-produced certificates of the testnet
     /// prefix decode into `Certificate`s whose step is `cert`, and each
     /// re-encodes byte-identically to the stored certificate (so serving
     /// them back can never differ from go). Authentication of the same

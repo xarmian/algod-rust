@@ -52,8 +52,10 @@ pub struct Certificate {
     /// stored encoding carries no `step` key).
     ///
     /// serde mirrors the canonical wire rule for this field only: absent
-    /// decodes to 0 and 0 is not written (all serde users here are
-    /// named-map formats, so skipping a key is safe). The consensus wire
+    /// decodes to 0 and 0 is not written. This is valid ONLY for named-map
+    /// encodings (JSON, `rmp_serde::to_vec_named`): a positional (array)
+    /// encoding would shift fields when the key is skipped. Enforced by
+    /// `serde_step_is_default_and_omitted_when_zero`. The consensus wire
     /// format is [`canonical_encode_certificate`], not serde.
     #[serde(default, skip_serializing_if = "step_is_zero")]
     pub step: Step,
@@ -142,10 +144,11 @@ impl From<BundleError> for CertificateError {
 }
 
 impl Certificate {
-    /// A certificate for `round` with `step = CERT` and everything else
-    /// empty: the shape test helpers need when the certificate may reach
-    /// `authenticate`, which (like go) rejects any other step.
-    /// `Certificate::default()` stays go's zero value (step 0).
+    /// Test-only constructor: a certificate for `round` with `step = CERT`
+    /// and everything else empty (no votes, so no quorum: it never passes
+    /// bundle verification). It is the shape test helpers need when the
+    /// certificate may reach `authenticate`, which (like go) rejects any
+    /// other step. `Certificate::default()` stays go's zero value (step 0).
     #[doc(hidden)]
     pub fn for_test(round: Round) -> Self {
         Self {

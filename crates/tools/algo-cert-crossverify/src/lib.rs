@@ -289,9 +289,8 @@ mod tests {
 
     fn cert_with_senders(senders: &[[u8; 32]]) -> Certificate {
         Certificate {
-            round: Round(7),
             votes: senders.iter().copied().map(authenticator).collect(),
-            ..Certificate::for_test(Round(0))
+            ..Certificate::for_test(Round(7))
         }
     }
 

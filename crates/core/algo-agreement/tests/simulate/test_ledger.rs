@@ -555,12 +555,11 @@ mod tests {
             ..Block::default()
         };
         let cert = Certificate {
-            round: Round(1),
             proposal: algo_agreement::ProposalValue {
                 block_digest: Digest([0x11u8; 32]),
                 ..Default::default()
             },
-            ..Certificate::default()
+            ..Certificate::for_test(Round(1))
         };
 
         // Ledger A commits normally (it has the payload in hand).
@@ -607,12 +606,11 @@ mod tests {
     fn ensure_digest_without_shared_commits_does_not_advance() {
         let ledger = new_ledger();
         let cert = Certificate {
-            round: Round(1),
             proposal: algo_agreement::ProposalValue {
                 block_digest: Digest([0x22u8; 32]),
                 ..Default::default()
             },
-            ..Certificate::default()
+            ..Certificate::for_test(Round(1))
         };
 
         let verifier = AsyncVoteVerifier::new();
