@@ -103,7 +103,7 @@ crypto_secretbox = "0.1"
 hkdf = "0.13"
 
 # Storage
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 # System (Unix rlimit/FD accounting — see `algo_network::fd_limits`)
 libc = "0.2"
