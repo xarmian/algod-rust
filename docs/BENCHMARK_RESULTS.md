@@ -392,8 +392,11 @@ txid, transaction commitments) that every block replay exercises.
 The `rest` tier serves one replayed ledger from both nodes and fails on any
 response difference that is not on its issue-linked allowlist. The allowlist
 is empty (the last entry, #2161, simulate `sender-rewards`, is fixed), so the
-REST throughput rows compare nodes that answer every gated request identically
-apart from wall-clock-dependent fields.
+REST throughput rows compare nodes that answer the requests the gate sends
+identically, apart from wall-clock-dependent fields. The gate's simulate
+request is a payment: an app-call simulate (state deltas, logs, inner
+transactions in `txn-result`) is not covered and still differs
+([#2178](https://github.com/xarmian/algod-rust/issues/2178)).
 
 ## Regression detection and CI
 

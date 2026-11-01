@@ -1392,8 +1392,12 @@ The number of allowlisted differences is recorded in every row's metadata
 <!-- known-differences:end -->
 
 The allowlist is currently empty: the last entry (#2161, simulate
-`sender-rewards`) was fixed, so the throughput rows compare two nodes that
-return identical responses for every gated request.
+`sender-rewards`) was fixed, so the nodes answer the requests the gate sends
+identically. That is not full parity: the simulate request is a payment, so
+the gate does not cover an app-call simulate, whose `txn-result` still omits
+state deltas, logs and inner transactions
+([#2178](https://github.com/xarmian/algod-rust/issues/2178)). The staleness
+check stays in force: an entry that stops matching a difference fails the gate.
 
 ### What is measured
 
