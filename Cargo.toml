@@ -154,7 +154,7 @@ ark-bls12-381 = "0.6"
 ark-serialize = "0.6"
 
 # System info
-sysinfo = "0.39"
+sysinfo = "0.40"
 
 # Compression / archive
 snap = "1"
