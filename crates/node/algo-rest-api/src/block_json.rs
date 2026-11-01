@@ -441,7 +441,20 @@ pub(crate) fn signed_txn_go_json(txn: &algo_types::SignedTransaction) -> serde_j
         .map_err(|e| e.to_string())
         .and_then(|bytes| rmpv::decode::read_value(&mut &bytes[..]).map_err(|e| e.to_string()));
     match tree {
-        Ok(tree) => signed_txn_tree_to_json(&tree),
+        Ok(tree) => {
+            let mut json = signed_txn_tree_to_json(&tree);
+            // go's msgp/codec encoders omit every zero field; the serde derive
+            // always writes these three. An inner transaction pays no fee of
+            // its own (issue #2178), so `fee: 0` must not be rendered.
+            if let Some(serde_json::Value::Object(t)) = json.get_mut("txn") {
+                for key in ["fee", "fv", "lv"] {
+                    if t.get(key).and_then(serde_json::Value::as_u64) == Some(0) {
+                        t.remove(key);
+                    }
+                }
+            }
+            json
+        }
         Err(e) => {
             tracing::error!(err = %e, "failed to render a transaction in go's JSON form");
             serde_json::to_value(txn).unwrap_or(serde_json::Value::Null)
@@ -499,6 +512,21 @@ pub fn encode_block_json(raw_block_response: &[u8]) -> Result<Vec<u8>, BlockJson
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #2178: an inner transaction with no fee renders without `fee`, as
+    /// go's codec JSON omits zero fields; a nonzero fee is kept.
+    #[test]
+    fn signed_txn_go_json_omits_a_zero_fee() {
+        let mut stx = algo_types::SignedTransaction::default();
+        stx.txn.fee = 0;
+        stx.txn.first_valid = algo_types::Round(5);
+        let json = signed_txn_go_json(&stx);
+        assert!(json["txn"].get("fee").is_none(), "{json}");
+        assert!(json["txn"].get("lv").is_none(), "{json}");
+        assert_eq!(json["txn"]["fv"], 5);
+        stx.txn.fee = 1000;
+        assert_eq!(signed_txn_go_json(&stx)["txn"]["fee"], 1000);
+    }
 
     /// The single-letter asset-params address keys must only be treated as
     /// addresses under `apar`. In particular `c` is `AssetParams.Clawback`
