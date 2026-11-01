@@ -215,20 +215,21 @@ fn proposal_validator_rejects_like_go_validate() {
     }
 }
 
-/// The validator exactly as `participate.rs` wires it for agreement:
-/// `PayoutCheckingValidator<BlockValidatorBridge>`. The go-signed blocks
+/// The validator exactly as `participate.rs` wires it for agreement
+/// (`algo_ledger::agreement_block_validator`, a `PayoutCheckingValidator`
+/// around the `BlockValidatorBridge`). It includes the in-group lease conflict
+/// (#2129), which no stateless check rejects. The go-signed blocks
 /// pass the stateless checks, then go's `checkDup` rejects them.
 #[test]
 fn agreement_validator_wiring_rejects_like_go_validate() {
     let o = load_oracle();
     let block1 = block(&o.block1);
     let ledger = Arc::new(Mutex::new(sqlite(&o)));
-    let validator = PayoutCheckingValidator::new(
-        algo_agreement::BlockValidatorBridge::new(
-            o.genesis_id.clone(),
-            b64(&o.genesis_hash).try_into().expect("genesis hash"),
-            Some(block1.timestamp),
-        ),
+    // The function the node's `participate` command assembles.
+    let validator = algo_ledger::agreement_block_validator(
+        o.genesis_id.clone(),
+        b64(&o.genesis_hash).try_into().expect("genesis hash"),
+        Some(block1.timestamp),
         ledger,
     );
     for sc in &o.scenarios {
@@ -897,24 +898,77 @@ fn in_block_lease_conflict_is_rejected_when_the_proposal_check_has_no_verdict() 
 /// distinct-lease control is not rejected by the block-only pre-pass.
 #[test]
 fn block_dups_prepass_judges_only_the_blocks_own_duplicates() {
+    use algo_ledger::check_dup::{block_dups_prepass, Prepass};
+
     let o = load_oracle();
     for name in IN_BLOCK_CONFLICTS {
         let sc = scenario(&o, name);
         assert_eq!(
-            algo_ledger::check_dup::block_dups_prepass(&block(&sc.block)).as_deref(),
-            Some(sc.validate_error.as_str()),
+            block_dups_prepass(&block(&sc.block)),
+            Prepass::Violation(sc.validate_error.clone()),
             "{name}"
         );
     }
     for name in ["committed_txid", "cross_block_lease_conflict"] {
         assert_eq!(
-            algo_ledger::check_dup::block_dups_prepass(&block(&scenario(&o, name).block)),
-            None,
+            block_dups_prepass(&block(&scenario(&o, name).block)),
+            Prepass::Clean,
             "{name}: needs the committed ledger"
         );
     }
     assert_eq!(
-        algo_ledger::check_dup::block_dups_prepass(&block(&o.control_distinct_leases.block)),
-        None
+        block_dups_prepass(&block(&o.control_distinct_leases.block)),
+        Prepass::Clean
+    );
+}
+
+/// "Could not run" is told apart from "checked and clean" (issue #2129), for
+/// both pre-passes: an unknown protocol and a payset that is not in
+/// stripped form say nothing about the block.
+#[test]
+fn prepasses_report_could_not_run_instead_of_clean() {
+    use algo_ledger::check_dup::{block_dups_prepass, prologue_prepass, Prepass};
+
+    let o = load_oracle();
+    let ledger = sqlite(&o);
+    let good = block(&scenario(&o, "in_group_lease_conflict").block);
+
+    let mut unknown = good.clone();
+    unknown.current_protocol = "no-such-protocol".into();
+    for (name, verdict) in [
+        ("block-only", block_dups_prepass(&unknown)),
+        ("ledger-backed", prologue_prepass(&ledger, &unknown)),
+    ] {
+        match verdict {
+            Prepass::CouldNotRun(reason) => {
+                assert!(reason.contains("unknown protocol"), "{name}: {reason}")
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+
+    // A payset member still carrying its genesis id/hash is not in the
+    // block's stripped form.
+    let mut unstripped = good.clone();
+    unstripped.payset[0].txn.genesis_id = o.genesis_id.clone();
+    unstripped.payset[0].txn.genesis_hash = b64(&o.genesis_hash).try_into().expect("hash");
+    for (name, verdict) in [
+        ("block-only", block_dups_prepass(&unstripped)),
+        ("ledger-backed", prologue_prepass(&ledger, &unstripped)),
+    ] {
+        assert!(
+            matches!(verdict, Prepass::CouldNotRun(_)),
+            "{name}: {verdict:?}"
+        );
+    }
+
+    // The ledger-backed pre-pass judges the same conflict, with the same text.
+    assert_eq!(
+        prologue_prepass(&ledger, &good),
+        Prepass::Violation(
+            scenario(&o, "in_group_lease_conflict")
+                .validate_error
+                .clone()
+        )
     );
 }

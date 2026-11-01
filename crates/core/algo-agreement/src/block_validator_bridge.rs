@@ -74,6 +74,14 @@ impl ValidatedBlock for ValidatedBlockImpl {
 ///
 /// The bridge holds the contextual information needed by the validation
 /// function: previous block timestamp, genesis ID, and genesis hash.
+///
+/// The bridge alone is stateless: it does NOT detect a repeated (sender,
+/// lease) or txid, in a group or in the block, because go has no stateless
+/// check for it (go's `checkDup` runs only in the validating evaluator,
+/// issue #2129). The node never uses the bridge bare: it wraps it in
+/// `algo_ledger::PayoutCheckingValidator` (`agreement_block_validator`), which
+/// adds go's `Alive`/`checkDup`/authorizer/payout checks against the ledger
+/// (issues #2127, PR #2128).
 pub struct BlockValidatorBridge {
     /// The genesis ID string for this network.
     genesis_id: String,

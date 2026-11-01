@@ -251,10 +251,16 @@ pub fn restore_payset_genesis_fields(
 /// 6. Payset Merkle commitment
 /// 7. Aggregate block size
 ///
-/// There is deliberately no stateless lease check: go-algorand detects a
-/// repeated (sender, lease) only in `checkDup` (validating evaluation), which
-/// `algo_ledger::check_dup` ports. Rejecting it here would refuse blocks go's
-/// `AddBlock` accepts (issue #2129).
+/// There is deliberately NO stateless lease or duplicate-transaction check,
+/// not even for two members of one group: go-algorand detects a repeated
+/// (sender, lease) or txid only in `checkDup` (`ledger/eval/cow.go`), run by
+/// the validating evaluator (`Ledger.Validate`, `BlockEvaluator.transaction`
+/// with `Validate: true`), never by `AddBlock` (catchup/replay). Rejecting it
+/// here would refuse blocks go accepts (the offline `replay`/`bench`
+/// commands). `algo_ledger::check_dup` ports it; the node's agreement wiring
+/// (`algo_ledger::agreement_block_validator`, `PayoutCheckingValidator`
+/// around `BlockValidatorBridge`; issues #2127/#2129, PR #2128) runs it before
+/// a vote. Calling this function alone does not judge lease or txid conflicts.
 ///
 /// All errors are collected (no fail-fast) and returned in the result.
 pub fn validate_block(
