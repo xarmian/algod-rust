@@ -659,7 +659,7 @@ pub fn validate_block_with_cache(
         });
     }
 
-    // 7. Payset commitment (7, 7b, 7c).
+    // 6. Payset commitment (6, 6b, 6c).
     // Delegate to the shared helper that checks txn_commitment, txn256, txn512.
     let raw_payset_blobs = raw_payset_blobs.filter(|blobs| blobs.len() == block.payset.len());
     let has_raw = raw_payset_blobs.is_some();
@@ -673,7 +673,7 @@ pub fn validate_block_with_cache(
         }
     }
 
-    // 8. Aggregate block size.
+    // 7. Aggregate block size.
     if !block.current_protocol.is_empty() {
         if let Ok(max_bytes) = max_txn_bytes_per_block(&block.current_protocol) {
             if total_txn_bytes > max_bytes {
@@ -683,7 +683,7 @@ pub fn validate_block_with_cache(
                 });
             }
 
-            // 9. Load field for on-chain congestion measurement (go: "bad
+            // 7b. Load field for on-chain congestion measurement (go: "bad
             // load", `ledger/eval/eval.go`, v4.7.0-beta+). Only checked when
             // the block's protocol has `LoadTracking` enabled (v42+) —
             // pre-v42, go never validates the field either.
@@ -715,7 +715,7 @@ pub fn validate_block_with_cache(
 /// all commitments match. When `raw_payset_blobs` is `Some`, raw bytes are used for
 /// STIB hashing; otherwise typed re-encoding is used.
 ///
-/// This is the core logic behind both `validate_block` (step 7) and
+/// This is the core logic behind both `validate_block` (step 6) and
 /// `contents_match_header`.
 fn verify_payset_commitments(
     block: &Block,
@@ -724,7 +724,7 @@ fn verify_payset_commitments(
     let mut errors = Vec::new();
     let version = &block.current_protocol;
 
-    // 7. Primary payset commitment (txn field).
+    // 6. Primary payset commitment (txn field).
     if block.txn_commitment != [0u8; 32] || !block.payset.is_empty() {
         if has_payset_commit_merkle(version) {
             let computed_root = if let Some(raw_blobs) = raw_payset_blobs {
@@ -753,7 +753,7 @@ fn verify_payset_commitments(
         }
     }
 
-    // 7b. Vector commitment: txn256 (SHA-256, v34+).
+    // 6b. Vector commitment: txn256 (SHA-256, v34+).
     if has_txn256(version) {
         let computed = if let Some(raw_blobs) = raw_payset_blobs {
             compute_vector_commitment_raw(block, HashAlgo::Sha256, raw_blobs)
@@ -769,7 +769,7 @@ fn verify_payset_commitments(
         }
     }
 
-    // 7c. Vector commitment: txn512 (SHA-512, v41+).
+    // 6c. Vector commitment: txn512 (SHA-512, v41+).
     if has_txn512(version) {
         let computed = if let Some(raw_blobs) = raw_payset_blobs {
             compute_vector_commitment_raw(block, HashAlgo::Sha512, raw_blobs)

@@ -34,6 +34,8 @@
 // Liveness: only a genuine `validateForPayouts` or prologue verdict rejects
 // a proposal. `Alive` and `checkDup` need no execution, so a pre-pass over
 // the whole payset still judges them when the evaluation reaches no verdict.
+// The block's own txid / lease duplicates (go's `cow.checkDup`) need not even
+// the ledger, so they are judged in every no-verdict case (issue #2129).
 // Anything that merely prevents the check from running (ledger busy or not
 // yet at the previous round, no scratch rollback available, a payset
 // transaction not evaluable here) is waited out within a small bounded
@@ -209,7 +211,14 @@ impl<V: BlockValidator> BlockValidator for PayoutCheckingValidator<V> {
                     // over the whole payset need no execution, so they still
                     // reach a verdict if the ledger is free now, without
                     // waiting for it.
-                    if let Some(violation) = self.prologue_prepass(block) {
+                    // When the ledger itself is unavailable (busy, behind,
+                    // poisoned) the block's own duplicates (a txid or a
+                    // (sender, lease) repeated in the block, in a group or
+                    // across groups) still need no ledger (issue #2129).
+                    if let Some(violation) = self
+                        .prologue_prepass(block)
+                        .or_else(|| crate::check_dup::block_dups_prepass(block))
+                    {
                         tracing::debug!(
                             round = block.round.0,
                             %violation,

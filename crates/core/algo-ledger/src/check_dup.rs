@@ -118,6 +118,31 @@ impl BlockDups {
         self.journal.push(DupUndo { txid, lease });
     }
 
+    /// The block half of go `roundCowState.checkDup` for `txn` evaluated in
+    /// `round`: a txid, then a lease, an earlier transaction of this block
+    /// already holds.
+    fn check(
+        &self,
+        consensus: &ConsensusParams,
+        txn: &Transaction,
+        txid: Digest,
+        round: u64,
+    ) -> Result<(), AlgoError> {
+        if self.txids.contains(&txid) {
+            return Err(transaction_in_ledger_error(txid, true));
+        }
+        let leased = consensus.support_transaction_leases && txn.lease != [0u8; 32];
+        if leased
+            && self
+                .leases
+                .get(&(txn.sender, txn.lease))
+                .is_some_and(|&expires| round <= expires)
+        {
+            return Err(lease_in_ledger_error(txid, &txn.sender, &txn.lease, true));
+        }
+        Ok(())
+    }
+
     /// A point [`Self::rollback_to`] can return to.
     #[must_use]
     pub fn mark(&self) -> usize {
@@ -269,18 +294,8 @@ pub fn check_dup<L: LedgerStore + ?Sized>(
     block: &BlockDups,
     ledger: &mut LedgerDups,
 ) -> Result<(), AlgoError> {
-    if block.txids.contains(&txid) {
-        return Err(transaction_in_ledger_error(txid, true));
-    }
+    block.check(consensus, txn, txid, ledger.round)?;
     let leased = consensus.support_transaction_leases && txn.lease != [0u8; 32];
-    if leased
-        && block
-            .leases
-            .get(&(txn.sender, txn.lease))
-            .is_some_and(|&expires| ledger.round <= expires)
-    {
-        return Err(lease_in_ledger_error(txid, &txn.sender, &txn.lease, true));
-    }
     // go's block cow: a lease an earlier group of the same pending block
     // holds (the pool's overlay) is an in-block conflict.
     if leased && store.pending_block_lease(&txn.sender, &txn.lease, ledger.round) {
@@ -458,6 +473,34 @@ pub fn prologue_prepass<L: LedgerStore + ?Sized>(
         if check.check(store, &consensus, &rule, stx, index).is_err() {
             return check.violation().map(|(_, m)| m.to_owned());
         }
+    }
+    None
+}
+
+/// The part of [`prologue_prepass`] that needs no ledger: go's `Alive`, then
+/// the block half of `checkDup` (a txid or a lease an earlier transaction of
+/// the SAME block holds, wherever its group is), over the whole payset, in
+/// payset order, with go's text. Issue #2129: the proposal check's last
+/// resort when even the ledger-backed pre-pass cannot run (the ledger busy
+/// throughout the budget, behind the proposal, or poisoned), so a block that
+/// repeats a (sender, lease) or a txid, inside a group or across groups, is
+/// still rejected before the vote. A conflict with the committed ledger
+/// needs the ledger and is not judged here. `None`: no in-block duplicate,
+/// or the block's protocol is unknown or its payset not in valid stripped
+/// form.
+pub fn block_dups_prepass(block: &algo_types::Block) -> Option<String> {
+    let consensus = algo_types::consensus::consensus_params_for_version(&block.current_protocol)?;
+    let rule = GenesisRestoreRule::for_params(&consensus, block);
+    rule.check_payset(&block.payset).ok()?;
+    let txids = algo_codec::block_txids_with_rule(block, &rule);
+    let mut dups = BlockDups::new();
+    for (stx, &txid) in block.payset.iter().zip(&txids) {
+        let verdict = alive(block.round, &consensus, &rule, stx)
+            .and_then(|()| dups.check(&consensus, &stx.txn, txid, block.round.0));
+        if let Err(e) = verdict {
+            return Some(e.to_string());
+        }
+        dups.record(&stx.txn, txid);
     }
     None
 }

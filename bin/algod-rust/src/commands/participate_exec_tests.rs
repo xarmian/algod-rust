@@ -2699,3 +2699,60 @@ fn eviction_counts_one_reeval_drop_per_group() {
     assert_eq!(pool.reeval_counter().count(tag), before + 2);
     assert_eq!(pool.pending_count(), 0);
 }
+
+// ---- #2129: in-group lease conflicts, pool test stage vs apply stage ----
+
+/// go's pool runs `TestTransactionGroup` (each member against the
+/// unmodified state, so it cannot see a sibling's lease) and then
+/// `TransactionGroup` (members applied in order, the second one hitting
+/// `LeaseInLedgerError` from `checkDup`). The oracle pins both outcomes
+/// (`block_checkdup/oracle.json` `pool`, checked in algo-ledger's
+/// `block_checkdup_oracle_test`). Here the same two stages of the Rust pool
+/// evaluator: its test stage is stateless (per-transaction `checkDup` at
+/// that stage is #2130's subject), so it accepts the conflicting group as
+/// go's does, and the apply stage rejects the second member with go's text
+/// and pool tag.
+#[test]
+fn in_group_lease_conflict_passes_the_test_stage_and_fails_the_apply_stage() {
+    let a = key(1);
+    let b = key(2);
+    let lease = [0x5D; 32];
+    let (_ledger, mut eval) = evaluator(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))]);
+    let mut members = [1u8, 2].map(|note| {
+        let mut t = base_txn(a.0, TxnType::Pay);
+        t.receiver = b.0;
+        t.amount = 1_000;
+        t.lease = lease;
+        t.note = serde_bytes::ByteBuf::from(vec![note]);
+        t
+    });
+    let gid = algo_codec::compute_group_id(&members);
+    for t in members.iter_mut() {
+        t.group = gid.0;
+    }
+    let group: Vec<_> = members.into_iter().map(|t| sign(t, &a.1)).collect();
+
+    eval.test_transaction_group(&group)
+        .expect("the test stage does not see a sibling's lease");
+    let err = eval
+        .transaction_group(&group)
+        .expect_err("the apply stage rejects the second member");
+    let expected = algo_ledger::check_dup::lease_in_ledger_error(
+        algo_codec::compute_txn_id(&group[1].txn),
+        &a.0,
+        &lease,
+        true,
+    );
+    assert_eq!(err.to_string(), expected.to_string());
+    // The typed class the pool maps to its `lease_eval` tag.
+    assert!(
+        matches!(
+            err,
+            algo_error::AlgoError::Rejected {
+                class: algo_error::RejectClass::LeaseInLedger { in_block: true },
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}

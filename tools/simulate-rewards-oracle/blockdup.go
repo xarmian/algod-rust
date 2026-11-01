@@ -294,6 +294,9 @@ func blockDupOracle() {
 	{
 		_, verr := l.Validate(context.Background(), controlOK, backlog)
 		_, rerr := eval.Eval(context.Background(), l, controlOK, false, nil, nil, nil)
+		if verr != nil || rerr != nil {
+			panic(fmt.Sprintf("blockdup oracle: the distinct-lease control group must be accepted by both Validate and replay; Validate: %v, replay: %v", verr, rerr))
+		}
 		f.Control = blockDupScenario{
 			Name:          "in_group_distinct_leases",
 			Block:         b64(protocol.Encode(&controlOK)),
@@ -310,11 +313,12 @@ func blockDupOracle() {
 	poolHdr := bookkeeping.MakeBlock(hdr1).BlockHeader
 	poolHdr.TimeStamp = 1_700_000_010
 	for _, ps := range []struct {
-		name  string
-		group []transactions.SignedTxn
+		name         string
+		group        []transactions.SignedTxn
+		wantAddError bool
 	}{
-		{"in_group_lease_conflict", grouped(payTxn("grp-a", freshLease), payTxn("grp-b", freshLease))},
-		{"in_group_distinct_leases", grouped(payTxn("ok-a", freshLease), payTxn("ok-b", lease2))},
+		{"in_group_lease_conflict", grouped(payTxn("grp-a", freshLease), payTxn("grp-b", freshLease)), true},
+		{"in_group_distinct_leases", grouped(payTxn("ok-a", freshLease), payTxn("ok-b", lease2)), false},
 	} {
 		pev, err := l.StartEvaluator(poolHdr, 0, 0, nil)
 		must(err)
@@ -326,6 +330,11 @@ func blockDupOracle() {
 			enc = append(enc, protocol.Encode(&ps.group[i])...)
 		}
 		aerr := pev.TransactionGroup(withAD...)
+		// The test stage never sees a sibling's lease; only the apply stage
+		// does. Fail the generation if go's behaviour is not as pinned.
+		if terr != nil || (aerr != nil) != ps.wantAddError {
+			panic(fmt.Sprintf("blockdup oracle: pool scenario %s: TestTransactionGroup error %v (want none), TransactionGroup error %v (want error: %v)", ps.name, terr, aerr, ps.wantAddError))
+		}
 		f.Pool = append(f.Pool, blockDupPoolScenario{
 			Name:         ps.name,
 			GroupMsgpack: b64(enc),

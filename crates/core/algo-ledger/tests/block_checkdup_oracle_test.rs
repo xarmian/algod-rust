@@ -718,6 +718,13 @@ fn in_group_distinct_leases_are_accepted_on_every_path_like_go() {
 /// it cannot see a sibling's lease; `TransactionGroup` applies the members in
 /// order and rejects the second with `LeaseInLedgerError`. The group
 /// evaluation behind the pool (`evaluate_group`) must give go's `add_error`.
+///
+/// The Rust pool's per-transaction test stage is stateless and has no
+/// ledger-backed `checkDup` of its own yet (#2130's subject), so this test
+/// asserts go's recorded test-stage verdict (accepted) here, and the bin
+/// crate's `in_group_lease_conflict_passes_the_test_stage_and_fails_the_apply_stage`
+/// (`participate_exec_tests.rs`) runs the Rust evaluator's `test_transaction_group`
+/// and `transaction_group` on the same shape of group.
 #[test]
 fn group_evaluation_matches_go_pool_admission() {
     use algo_ledger::locked_base::LockedBase;
@@ -755,4 +762,159 @@ fn group_evaluation_matches_go_pool_admission() {
             }
         }
     }
+}
+
+/// The scenarios whose conflict lies inside the block itself: in one group
+/// (issue #2129) and across two groups.
+const IN_BLOCK_CONFLICTS: [&str; 2] = ["in_group_lease_conflict", "in_block_lease_conflict"];
+
+fn expect_go_rejection<V: BlockValidator>(validator: &V, o: &Oracle, candidate: &Block, why: &str) {
+    for name in IN_BLOCK_CONFLICTS {
+        let sc = scenario(o, name);
+        let mut candidate = candidate.clone();
+        candidate.payset = block(&sc.block).payset;
+        match validator.validate(&candidate).map(|_| ()) {
+            Err(AgreementError::ValidationFailed(message)) => {
+                assert_eq!(message, sc.validate_error, "{why}: {name}")
+            }
+            other => panic!("{why}: {name}: expected go's checkDup verdict, got {other:?}"),
+        }
+    }
+}
+
+/// Issue #2129: with the stateless group-lease rule gone, an in-block
+/// lease conflict (in a group or across groups) must still be rejected before
+/// the vote in EVERY case where the stateful proposal check reaches no
+/// verdict. The block's own duplicates need no ledger, so the last-resort
+/// pre-pass judges them with go's text. Cases: the ledger busy for the whole
+/// budget, behind the proposal, poisoned, the scratch evaluation
+/// unavailable, and a payset member not evaluable here.
+#[test]
+fn in_block_lease_conflict_is_rejected_when_the_proposal_check_has_no_verdict() {
+    use algo_ledger::shadow_execute::test_hooks;
+    use std::time::Duration;
+
+    let o = load_oracle();
+    let base = block(&scenario(&o, "in_group_lease_conflict").block);
+    let budget = Duration::from_millis(30);
+    let make = |ledger: &Arc<Mutex<SqliteLedger>>| {
+        PayoutCheckingValidator::with_budget(
+            StubBlockValidator::accepting(),
+            ledger.clone(),
+            budget,
+        )
+    };
+
+    // Control: with a free ledger the full check judges it.
+    let ledger = Arc::new(Mutex::new(sqlite(&o)));
+    expect_go_rejection(&make(&ledger), &o, &base, "free ledger");
+
+    // Busy for the whole budget (and the pre-pass's try_lock): no ledger.
+    let hold = Duration::from_millis(1500);
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let holder = {
+        let ledger = ledger.clone();
+        std::thread::spawn(move || {
+            let _guard = ledger.lock().unwrap();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(hold);
+        })
+    };
+    held_rx.recv().unwrap();
+    let started = std::time::Instant::now();
+    expect_go_rejection(&make(&ledger), &o, &base, "busy ledger");
+    assert!(
+        started.elapsed() < hold / 2,
+        "never waits for a busy ledger"
+    );
+    holder.join().unwrap();
+
+    // Behind the proposal: the ledger is at round 1, the proposal is for 5.
+    let mut stale = base.clone();
+    stale.round = algo_types::Round(5);
+    expect_go_rejection(&make(&ledger), &o, &stale, "stale ledger");
+
+    // Poisoned ledger lock.
+    let poisoned = Arc::new(Mutex::new(sqlite(&o)));
+    {
+        let l = poisoned.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = l.lock().unwrap();
+            panic!("poison the ledger lock");
+        })
+        .join();
+    }
+    assert!(poisoned.is_poisoned());
+    expect_go_rejection(&make(&poisoned), &o, &base, "poisoned ledger");
+
+    // Scratch evaluation unavailable (transient failure on every attempt).
+    test_hooks::inject_failure_over_payset_len(Some(0));
+    let ledger = Arc::new(Mutex::new(sqlite(&o)));
+    expect_go_rejection(&make(&ledger), &o, &base, "scratch unavailable");
+    test_hooks::inject_failure_over_payset_len(None);
+
+    // A payset member that cannot be evaluated here comes first.
+    let mut overspend = base.payset[0].clone();
+    overspend.txn.note = serde_bytes::ByteBuf::from(b"overspend".to_vec());
+    overspend.txn.amount = u64::MAX / 2;
+    overspend.txn.group = [0u8; 32];
+    overspend.txn.lease = [0u8; 32];
+    let mut unevaluable = base.clone();
+    unevaluable.payset.insert(0, overspend.clone());
+    let ledger = Arc::new(Mutex::new(sqlite(&o)));
+    for name in IN_BLOCK_CONFLICTS {
+        let sc = scenario(&o, name);
+        let mut c = unevaluable.clone();
+        c.payset.truncate(1);
+        c.payset.extend(block(&sc.block).payset);
+        match make(&ledger).validate(&c).map(|_| ()) {
+            Err(AgreementError::ValidationFailed(m)) => assert_eq!(m, sc.validate_error, "{name}"),
+            other => panic!("unevaluable member: {name}: {other:?}"),
+        }
+        // ...also with the ledger busy.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let holder = {
+            let ledger = ledger.clone();
+            std::thread::spawn(move || {
+                let _guard = ledger.lock().unwrap();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+            })
+        };
+        held_rx.recv().unwrap();
+        match make(&ledger).validate(&c).map(|_| ()) {
+            Err(AgreementError::ValidationFailed(m)) => assert_eq!(m, sc.validate_error, "{name}"),
+            other => panic!("unevaluable member, busy ledger: {name}: {other:?}"),
+        }
+        holder.join().unwrap();
+    }
+}
+
+/// Residual window of the no-verdict fallback, as before #2129: a conflict
+/// with the COMMITTED ledger (a replayed txid, a live lease) needs the
+/// ledger, so with the ledger unavailable the proposal is accepted on the
+/// stateless verdict. The block's own duplicates do not (test above), and the
+/// distinct-lease control is not rejected by the block-only pre-pass.
+#[test]
+fn block_dups_prepass_judges_only_the_blocks_own_duplicates() {
+    let o = load_oracle();
+    for name in IN_BLOCK_CONFLICTS {
+        let sc = scenario(&o, name);
+        assert_eq!(
+            algo_ledger::check_dup::block_dups_prepass(&block(&sc.block)).as_deref(),
+            Some(sc.validate_error.as_str()),
+            "{name}"
+        );
+    }
+    for name in ["committed_txid", "cross_block_lease_conflict"] {
+        assert_eq!(
+            algo_ledger::check_dup::block_dups_prepass(&block(&scenario(&o, name).block)),
+            None,
+            "{name}: needs the committed ledger"
+        );
+    }
+    assert_eq!(
+        algo_ledger::check_dup::block_dups_prepass(&block(&o.control_distinct_leases.block)),
+        None
+    );
 }
