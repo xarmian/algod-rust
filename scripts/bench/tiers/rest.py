@@ -485,13 +485,18 @@ def run_tier():
         state = discover(nodes["go"].base, cj, os.path.join(corpus, cj["files"]["genesis"]))
         params = get_json(nodes["go"].base, "/v2/transactions/params")
         sim = rl.simulate_request(state["sender"], state["cold"], params)
-        requests = rl.request_set(state, simulate=sim)
+        sim_app = rl.simulate_app_request(state["sender"], params)
+        requests = rl.request_set(state, simulate=[sim, sim_app])
         log("request set: " + ", ".join(r["name"] for r in requests))
         gate_go = check_gate(requests, nodes, cfg, "before load", corpus_name)
         problems = rl.check_simulation(gate_go["simulate"])
         if problems:
             raise TierError("the simulate request is not a successful simulation: "
                             + "; ".join(problems))
+        problems = rl.check_simulate_app(gate_go["simulate_app"])
+        if problems:
+            raise TierError("the simulate_app request is not a successful app-call "
+                            "simulation: " + "; ".join(problems))
 
         rows = []
         for conc in cfg["concurrency"]:
@@ -585,7 +590,7 @@ def check_report(path):
 # The endpoint names a complete run reports (rest_lib.request_set + simulate).
 EXPECTED_ENDPOINTS = rl.request_set(
     {"hot": "h", "cold": "c", "app_id": 1, "box_name_b64": "Yg==", "round": 1},
-    simulate={"name": "simulate", "path": "/p"})
+    simulate=[{"name": "simulate", "path": "/p"}, {"name": "simulate_app", "path": "/p"}])
 
 
 def main():

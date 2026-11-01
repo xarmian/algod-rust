@@ -1321,10 +1321,16 @@ indexers and dApps actually hit, and it was never compared before.
    address), `account_assets` (`/v2/accounts/{hot}/assets`), `application`
    (`/v2/applications/{id}`), `box` (`/v2/applications/{id}/box?name=...`),
    `blocks_json` and `blocks_msgpack` (`/v2/blocks/{last}` as JSON and
-   `?format=msgpack`), `tx_params` (`/v2/transactions/params`) and `simulate`
+   `?format=msgpack`), `tx_params` (`/v2/transactions/params`), `simulate`
    (`POST /v2/transactions/simulate`, one unsigned 1-microAlgo payment with
    `allow-empty-signatures`, built from `tx_params` only, so both nodes get
-   identical bytes). The application is the newest one holding a box. The
+   identical bytes) and `simulate_app` (the same endpoint, one unsigned
+   application create with OnCompletion OptIn whose approval program logs,
+   writes a global and a local key and issues an inner payment, so the
+   `txn-result` carries `logs`, `global-state-delta`, `local-state-delta` and
+   `inner-txns`; a create needs no pre-existing application, so it works on
+   any corpus; the program is pinned to its TEAL source by
+   `crates/core/algo-ledger/tests/simulation_bench_app_create_test.rs`). The application is the newest one holding a box. The
    facts the set needs are discovered from the go node, deterministically.
 4. **One load generator.** `benchmarks/go-restload` (`restload`, standard
    library only, MIT) drives both nodes: closed-loop workers at a fixed
@@ -1393,11 +1399,10 @@ The number of allowlisted differences is recorded in every row's metadata
 
 The allowlist is currently empty: the last entry (#2161, simulate
 `sender-rewards`) was fixed, so the nodes answer the requests the gate sends
-identically. That is not full parity: the simulate request is a payment, so
-the gate does not cover an app-call simulate, whose `txn-result` still omits
-state deltas, logs and inner transactions
-([#2178](https://github.com/xarmian/algod-rust/issues/2178)). The staleness
-check stays in force: an entry that stops matching a difference fails the gate.
+identically. Since #2178 the gate also covers an app-call simulate
+(`simulate_app`), whose `txn-result` carries the state deltas, logs and inner
+transactions. It is still not full parity: only the requests the gate sends are
+compared. The staleness check stays in force: an entry that stops matching a difference fails the gate.
 
 ### What is measured
 
@@ -1430,10 +1435,11 @@ endpoint **fails the tier** instead of publishing its numbers. The measured
 duration must be at least 0.1 s and is passed to the load generator in fixed
 point (`0.500s`).
 
-The `simulate` request is sent from the richest genesis account that is neither
-the RewardsPool nor the FeeSink, and the tier checks that the simulation
-succeeded (no `failure-message`, no `pool-error`), so that row measures a real
-simulation.
+The `simulate` and `simulate_app` requests are sent from the richest genesis account that is neither
+the RewardsPool nor the FeeSink, and the tier checks that the simulations
+succeeded (no `failure-message`, no `pool-error`, and for `simulate_app` a log,
+both deltas and an inner transaction in the result), so those rows measure real
+simulations.
 
 ### Limits of the numbers
 

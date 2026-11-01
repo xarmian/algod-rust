@@ -3203,10 +3203,10 @@ impl AlgodNodeInterface {
     /// `application-index`) are reported, and go's codec JSON handle omits one
     /// whose value is zero (`RecursiveEmptyCheck`, `omitempty` on a pointer).
     /// There is no `confirmed-round` for a simulated transaction. The state
-    /// deltas, logs and inner transactions are not carried yet.
+    /// deltas, logs and inner transactions come from `ApplyData.EvalDelta`.
     fn pre_encoded_txinfo_from_txn_result(result: &TxnResult) -> PreEncodedTxInfo {
         let ad = result.apply_data.as_ref();
-        PreEncodedTxInfo {
+        let mut info = PreEncodedTxInfo {
             txn: result.txn.clone().unwrap_or_default(),
             pool_error: String::new(),
             confirmed_round: None,
@@ -3221,7 +3221,13 @@ impl AlgodNodeInterface {
             local_state_delta: None,
             logs: None,
             inner_txns: None,
+        };
+        // go reports these from `ApplyData.EvalDelta` too, which for a failed
+        // approval program is the partial delta the simulator saved.
+        if let Some(dt) = ad.and_then(|a| a.eval_delta.as_ref()) {
+            algo_rest_api::handlers::apply_eval_delta_to_tx_info(&mut info, dt);
         }
+        info
     }
 
     /// Convert a single simulation [`TxnResult`] into the REST shape.
@@ -5865,6 +5871,151 @@ mod tests {
         let json = serde_json::to_value(&model).unwrap();
         assert_eq!(json["sender-rewards"], 990_852);
         assert!(json.get("close-rewards").is_none());
+    }
+
+    fn mp_str(s: &str) -> rmpv::Value {
+        rmpv::Value::String(s.into())
+    }
+
+    /// A go `basics.ValueDelta` map (`at`, then `bs` / `ui` only if nonzero).
+    fn mp_value_delta(action: u64, bytes: &[u8], uint: u64) -> rmpv::Value {
+        let mut m = vec![(mp_str("at"), rmpv::Value::from(action))];
+        if !bytes.is_empty() {
+            m.push((mp_str("bs"), rmpv::Value::Binary(bytes.to_vec())));
+        }
+        if uint != 0 {
+            m.push((mp_str("ui"), rmpv::Value::from(uint)));
+        }
+        rmpv::Value::Map(m)
+    }
+
+    fn mp_roundtrip(stx: &SignedTransaction) -> rmpv::Value {
+        let bytes = rmp_serde::to_vec_named(stx).unwrap();
+        rmpv::decode::read_value(&mut &bytes[..]).unwrap()
+    }
+
+    /// Issue #2178: go's `ConvertInnerTxn` (`daemon/algod/api/server/v2/utils.go`)
+    /// renders an app call's `global-state-delta`, `local-state-delta`, `logs`
+    /// and (recursively, each with its own deltas) `inner-txns` from
+    /// `ApplyData.EvalDelta`; the zero-valued parts are omitted.
+    #[test]
+    fn simulate_txn_result_carries_eval_delta_logs_deltas_and_nested_inner_txns() {
+        use algo_types::TxnType;
+        use base64::Engine as _;
+        let b64 = |s: &[u8]| base64::engine::general_purpose::STANDARD.encode(s);
+
+        let mut outer = SignedTransaction::default();
+        outer.txn.txn_type = TxnType::Appl;
+        outer.txn.sender = Address([1u8; 32]);
+        outer.txn.accounts = Some(vec![Address([2u8; 32])]);
+
+        // Innermost app call: logs and a global delta of its own.
+        let mut grandchild = SignedTransaction::default();
+        grandchild.txn.txn_type = TxnType::Appl;
+        grandchild.txn.sender = Address([4u8; 32]);
+        grandchild.eval_delta = Some(rmpv::Value::Map(vec![
+            (
+                mp_str("gd"),
+                rmpv::Value::Map(vec![(mp_str("gk"), mp_value_delta(2, b"", 9))]),
+            ),
+            (
+                mp_str("lg"),
+                rmpv::Value::Array(vec![rmpv::Value::Binary(b"deep".to_vec())]),
+            ),
+        ]));
+
+        // Inner app call: a local delta for its sender and the grandchild.
+        let mut child = SignedTransaction::default();
+        child.txn.txn_type = TxnType::Appl;
+        child.txn.sender = Address([3u8; 32]);
+        child.apply_data_application_id = 555;
+        child.eval_delta = Some(rmpv::Value::Map(vec![
+            (
+                mp_str("ld"),
+                rmpv::Value::Map(vec![(
+                    rmpv::Value::from(0u64),
+                    rmpv::Value::Map(vec![(mp_str("lk"), mp_value_delta(1, b"v", 0))]),
+                )]),
+            ),
+            (
+                mp_str("itx"),
+                rmpv::Value::Array(vec![mp_roundtrip(&grandchild)]),
+            ),
+        ]));
+
+        let eval_delta = rmpv::Value::Map(vec![
+            (
+                mp_str("gd"),
+                rmpv::Value::Map(vec![
+                    (mp_str("cnt"), mp_value_delta(2, b"", 42)),
+                    (mp_str("gone"), mp_value_delta(3, b"", 0)),
+                ]),
+            ),
+            (
+                mp_str("ld"),
+                rmpv::Value::Map(vec![(
+                    rmpv::Value::from(1u64),
+                    rmpv::Value::Map(vec![(mp_str("bal"), mp_value_delta(2, b"", 7))]),
+                )]),
+            ),
+            (
+                mp_str("lg"),
+                rmpv::Value::Array(vec![
+                    rmpv::Value::Binary(b"hello".to_vec()),
+                    rmpv::Value::Binary(b"world".to_vec()),
+                ]),
+            ),
+            (
+                mp_str("itx"),
+                rmpv::Value::Array(vec![mp_roundtrip(&child)]),
+            ),
+        ]);
+        let result = TxnResult {
+            txn: Some(outer),
+            apply_data: Some(algo_ledger::apply::ApplyData {
+                eval_delta: Some(eval_delta),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(AlgodNodeInterface::txn_result_to_model(result).txn_result)
+            .unwrap();
+
+        assert_eq!(
+            json["global-state-delta"],
+            serde_json::json!([
+                {"key": b64(b"cnt"), "value": {"action": 2, "uint": 42}},
+                {"key": b64(b"gone"), "value": {"action": 3}},
+            ])
+        );
+        assert_eq!(
+            json["local-state-delta"],
+            serde_json::json!([{
+                "address": Address([2u8; 32]).to_string(),
+                "delta": [{"key": b64(b"bal"), "value": {"action": 2, "uint": 7}}],
+            }])
+        );
+        assert_eq!(
+            json["logs"],
+            serde_json::json!([b64(b"hello"), b64(b"world")])
+        );
+        let inner = &json["inner-txns"][0];
+        assert_eq!(inner["application-index"], 555);
+        assert_eq!(
+            inner["local-state-delta"],
+            serde_json::json!([{
+                "address": Address([3u8; 32]).to_string(),
+                "delta": [{"key": b64(b"lk"), "value": {"action": 1, "bytes": b64(b"v")}}],
+            }])
+        );
+        assert!(inner.get("global-state-delta").is_none());
+        let deep = &inner["inner-txns"][0];
+        assert_eq!(deep["logs"], serde_json::json!([b64(b"deep")]));
+        assert_eq!(
+            deep["global-state-delta"],
+            serde_json::json!([{"key": b64(b"gk"), "value": {"action": 2, "uint": 9}}])
+        );
+        assert!(deep.get("inner-txns").is_none());
     }
 
     #[test]

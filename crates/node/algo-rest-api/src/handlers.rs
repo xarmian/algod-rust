@@ -3012,13 +3012,23 @@ fn convert_inner_txn(itx: &rmpv::Value) -> Option<models::PreEncodedTxInfo> {
     };
 
     if let Some(dt) = inner_eval_delta {
-        info.global_state_delta = convert_global_state_delta(dt);
-        info.local_state_delta = convert_local_state_delta(dt, &stxn);
-        info.logs = convert_logs(dt);
-        info.inner_txns = convert_inner_txns(dt);
+        apply_eval_delta_to_tx_info(&mut info, dt);
     }
 
     Some(info)
+}
+
+/// Fill `info`'s `global-state-delta`, `local-state-delta`, `logs` and
+/// `inner-txns` from a transaction's `ApplyData.EvalDelta` (`dt`), as go's
+/// `ConvertInnerTxn` does; `info.txn` supplies the accounts that resolve the
+/// local-delta indices. Empty parts stay `None` (go `sliceOrNil`). Shared by
+/// the pending-transaction and inner-txn conversions and by simulate's
+/// `txn-result` (issue #2178).
+pub fn apply_eval_delta_to_tx_info(info: &mut models::PreEncodedTxInfo, eval_delta: &rmpv::Value) {
+    info.global_state_delta = convert_global_state_delta(eval_delta);
+    info.local_state_delta = convert_local_state_delta(eval_delta, &info.txn);
+    info.logs = convert_logs(eval_delta);
+    info.inner_txns = convert_inner_txns(eval_delta);
 }
 
 // ---------------------------------------------------------------------------
