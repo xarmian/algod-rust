@@ -56,3 +56,4 @@ algo-validate = { workspace = true }
 data-encoding = { workspace = true }
 rmpv = { workspace = true }
 base64 = { workspace = true }
+algo-rest-client = { workspace = true }

@@ -441,23 +441,26 @@ fn localnet_app_create_logs_confirmed_txn() {
         expected.len(),
         logs.len()
     );
-    // Each log entry is JSON-encoded as a plain array of byte values (same
-    // shape as `txn.txn.note` in the note-roundtrip test), not a base64
-    // string.
+    // Each log entry is a standard-base64 string, as go's JSON renders
+    // `[][]byte` (issue #2160).
     let decoded: Vec<String> = logs
         .iter()
         .map(|v| {
-            let arr = v
-                .as_array()
-                .unwrap_or_else(|| panic!("log entry not an array in:\n{body}"));
-            let bytes: Vec<u8> = arr
-                .iter()
-                .map(|b| {
-                    b.as_u64()
-                        .unwrap_or_else(|| panic!("non-numeric log byte in:\n{body}"))
-                        as u8
-                })
-                .collect();
+            use base64::Engine;
+            let text = v.as_str().unwrap_or_else(|| {
+                panic!(
+                    "log entry not a base64 string in:
+{body}"
+                )
+            });
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(text)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "log entry not valid base64 ({e}) in:
+{body}"
+                    )
+                });
             String::from_utf8(bytes).unwrap_or_else(|e| panic!("log entry not UTF-8: {e}"))
         })
         .collect();

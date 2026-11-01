@@ -11657,3 +11657,165 @@ async fn oversized_body_on_admin_route_is_not_size_limited() {
         "admin-tier body size must be unbounded, matching go's adminMiddleware (no BodyLimit)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #2160: go-shaped JSON for the embedded txn / logs, end to end through
+// the real REST handlers and the Rust REST client.
+// ---------------------------------------------------------------------------
+
+fn keyreg_signed_txn() -> SignedTransaction {
+    let txn = Transaction {
+        txn_type: TxnType::Keyreg,
+        sender: Address([1u8; 32]),
+        fee: 1000,
+        first_valid: Round(1),
+        last_valid: Round(1000),
+        genesis_hash: [0xAB; 32],
+        vote_pk: Some([0x11; 32]),
+        selection_pk: Some([0x22; 32]),
+        state_proof_pk: Some([0x33; 64]),
+        vote_first: 1,
+        vote_last: 100,
+        vote_key_dilution: 10,
+        ..Transaction::default()
+    };
+    SignedTransaction {
+        txn,
+        sig: [7u8; 64],
+        ..SignedTransaction::default()
+    }
+}
+
+#[tokio::test]
+async fn pending_transaction_json_is_go_shaped_and_parses_with_the_rust_client() {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    let mut node = MockNode::synced();
+    // A confirmed transaction: ApplyData and in-block flags are set on the
+    // stored transaction but must not appear inside the embedded `txn`.
+    let stxn = SignedTransaction {
+        has_genesis_id: true,
+        has_genesis_hash: true,
+        closing_amount: 5,
+        ..keyreg_signed_txn()
+    };
+    let txid = algo_codec::compute_txn_id(&stxn.txn);
+    let txid_str = txid.to_string();
+    node.pending_txn_lookup.insert(
+        txid.0,
+        TxnWithStatus {
+            txn: stxn,
+            confirmed_round: 9,
+            pool_error: String::new(),
+            closing_amount: 5,
+            asset_closing_amount: 0,
+            sender_rewards: 0,
+            receiver_rewards: 0,
+            close_rewards: 0,
+            asset_index: None,
+            application_index: Some(77),
+            eval_delta: None,
+            logs: Some(vec![vec![1, 2, 3], vec![0xff]]),
+            inner_txns: None,
+        },
+    );
+    let server = TestServer::start(node).await;
+
+    let json: serde_json::Value = server
+        .client
+        .get(server.url(&format!("/v2/transactions/pending/{txid_str}")))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(json["txn"]["txn"]["gh"], STANDARD.encode([0xAB; 32]));
+    assert_eq!(json["txn"]["txn"]["votekey"], STANDARD.encode([0x11; 32]));
+    assert_eq!(json["txn"]["sig"], STANDARD.encode([7u8; 64]));
+    assert!(json["txn"].get("hgi").is_none() && json["txn"].get("ca").is_none());
+    assert_eq!(
+        json["logs"],
+        serde_json::json!([STANDARD.encode([1, 2, 3]), STANDARD.encode([0xff])])
+    );
+
+    let client = algo_rest_client::AlgodClient::new(server.url(""), server.api_token.clone());
+    let info = client
+        .get_pending_transaction(&algo_rest_client::TxId(txid_str))
+        .await
+        .expect("the Rust client parses the Rust server's response");
+    assert_eq!(info.confirmed_round, Some(9));
+    assert_eq!(info.application_index, Some(77));
+    assert_eq!(info.logs, Some(vec![vec![1, 2, 3], vec![0xff]]));
+}
+
+#[tokio::test]
+async fn simulate_json_is_go_shaped_and_round_trips_with_the_rust_client() {
+    use algo_rest_api::models::{
+        PreEncodedTxInfo, SimulateResponse, SimulateTransactionGroupResult,
+        SimulateTransactionResult,
+    };
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    let stxn = keyreg_signed_txn();
+    let mut node = MockNode::synced();
+    node.simulate_result = Some(SimulateResponse {
+        version: 2,
+        last_round: 1000,
+        txn_groups: vec![SimulateTransactionGroupResult {
+            txn_results: vec![SimulateTransactionResult {
+                txn_result: PreEncodedTxInfo {
+                    txn: stxn.clone(),
+                    pool_error: String::new(),
+                    confirmed_round: None,
+                    closing_amount: None,
+                    asset_closing_amount: None,
+                    sender_rewards: None,
+                    receiver_rewards: None,
+                    close_rewards: None,
+                    asset_index: None,
+                    application_index: None,
+                    global_state_delta: None,
+                    local_state_delta: None,
+                    logs: Some(vec![vec![9]]),
+                    inner_txns: None,
+                },
+                app_budget_consumed: None,
+                exec_trace: None,
+                fees_paid: None,
+                fixed_signer: None,
+                logic_sig_budget_consumed: None,
+                unnamed_resources_accessed: None,
+            }],
+            app_budget_added: None,
+            app_budget_consumed: None,
+            failed_at: None,
+            failure_message: None,
+            group_usage: None,
+            group_fees_paid: None,
+            unnamed_resources_accessed: None,
+        }],
+        eval_overrides: None,
+        exec_trace_config: None,
+        initial_states: None,
+    });
+    let server = TestServer::start(node).await;
+
+    let request =
+        serde_json::json!({"txn-groups": [{"txns": [serde_json::to_value(&stxn).unwrap()]}]});
+    let client = algo_rest_client::AlgodClient::new(server.url(""), server.api_token.clone());
+    let json = client
+        .simulate_transactions(&serde_json::to_vec(&request).unwrap())
+        .await
+        .expect("simulate through the Rust client");
+    let result = &json["txn-groups"][0]["txn-results"][0]["txn-result"];
+    assert_eq!(result["txn"]["txn"]["gh"], STANDARD.encode([0xAB; 32]));
+    assert_eq!(result["txn"]["txn"]["selkey"], STANDARD.encode([0x22; 32]));
+    assert_eq!(result["logs"], serde_json::json!([STANDARD.encode([9])]));
+
+    let back: SimulateResponse = serde_json::from_value(json).expect("typed round trip");
+    assert_eq!(back.txn_groups[0].txn_results[0].txn_result.txn, stxn);
+}

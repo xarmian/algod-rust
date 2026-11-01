@@ -591,6 +591,7 @@ dependencies = [
  "algo-error",
  "algo-ledger",
  "algo-metrics",
+ "algo-rest-client",
  "algo-types",
  "algo-validate",
  "async-trait",
