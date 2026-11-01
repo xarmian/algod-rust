@@ -317,13 +317,28 @@ fn older_serde_form_json_still_deserializes() {
 }
 
 #[test]
-fn msgpack_branch_keeps_binary_logs_and_the_plain_txn() {
-    let s = SignedTransaction {
+fn msgpack_branch_keeps_binary_logs_and_a_plain_signed_txn() {
+    let plain = SignedTransaction {
         txn: base_txn(TxnType::Pay),
-        has_genesis_id: true,
+        sig: [7u8; 64],
         ..SignedTransaction::default()
     };
-    let mut i = info(s.clone());
+    // The stored transaction also carries in-block flags and ApplyData; go's
+    // `PreEncodedTxInfo.Txn` is a plain `SignedTxn` in msgpack as well.
+    let stored = SignedTransaction {
+        has_genesis_id: true,
+        has_genesis_hash: true,
+        closing_amount: 5,
+        asset_closing_amount: 6,
+        sender_rewards: 7,
+        receiver_rewards: 8,
+        close_rewards: 9,
+        apply_data_config_asset: 11,
+        apply_data_application_id: 12,
+        eval_delta: Some(rmpv::Value::Map(vec![])),
+        ..plain.clone()
+    };
+    let mut i = info(stored);
     i.logs = Some(vec![vec![1, 2, 3]]);
     let bytes = rmp_serde::to_vec_named(&i).unwrap();
     let tree = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
@@ -342,12 +357,38 @@ fn msgpack_branch_keeps_binary_logs_and_the_plain_txn() {
         get("logs"),
         rmpv::Value::Array(vec![rmpv::Value::Binary(vec![1, 2, 3])])
     );
-    // the txn is the unfiltered serde form: msgpack bin, in-block flags kept
+    // the txn is msgpack bin with only SignedTxn's own keys
     let rmpv::Value::Map(txn) = get("txn") else {
         panic!("txn not a map")
     };
-    assert!(txn.iter().any(|(k, _)| k.as_str() == Some("hgi")));
+    for (k, _) in &txn {
+        assert!(GO_SIGNED_TXN_KEYS.contains(&k.as_str().unwrap()), "{k}");
+    }
+    let plain_bytes = rmp_serde::to_vec_named(&plain).unwrap();
+    let plain_tree = rmpv::decode::read_value(&mut &plain_bytes[..]).unwrap();
+    assert_eq!(get("txn"), plain_tree, "remaining fields keep their bytes");
     let back: PreEncodedTxInfo = rmp_serde::from_slice(&bytes).unwrap();
-    assert_eq!(back.txn, s);
+    assert_eq!(back.txn, plain);
     assert_eq!(back.logs, i.logs);
+}
+
+#[test]
+fn float_rendering_matches_go_for_large_negative_and_zero_values() {
+    // No float appears in a transaction; this pins the shared renderer.
+    use rmpv::Value as M;
+    let render = |f: f64| {
+        let mut resp = Vec::new();
+        let block = M::Map(vec![(M::from("f"), M::F64(f))]);
+        rmpv::encode::write_value(&mut resp, &M::Map(vec![(M::from("block"), block)])).unwrap();
+        String::from_utf8(algo_rest_api::block_json::encode_block_json(&resp).unwrap()).unwrap()
+    };
+    let field = |f: f64| {
+        let text = render(f);
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        v["block"]["f"].to_string()
+    };
+    assert_eq!(field(1e19), "10000000000000000000");
+    assert_eq!(field(9223372036854775808.0), "9223372036854775808");
+    assert_eq!(field(-1.5), "-1.5");
+    assert_eq!(field(-0.0), "-0.0");
 }

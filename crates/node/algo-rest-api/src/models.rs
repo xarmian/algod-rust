@@ -1574,7 +1574,23 @@ fn serialize_signed_txn_go_json<S: serde::Serializer>(
     s: S,
 ) -> Result<S::Ok, S::Error> {
     if !s.is_human_readable() {
-        return serde::Serialize::serialize(txn, s);
+        // go's `PreEncodedTxInfo.Txn` is a plain `SignedTxn` in msgpack too:
+        // drop the in-block flags and ApplyData, keep every other field's
+        // bytes exactly as the derive writes them.
+        let plain = SignedTransaction {
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            closing_amount: 0,
+            asset_closing_amount: 0,
+            sender_rewards: 0,
+            receiver_rewards: 0,
+            close_rewards: 0,
+            eval_delta: None,
+            apply_data_config_asset: 0,
+            apply_data_application_id: 0,
+            ..txn.clone()
+        };
+        return serde::Serialize::serialize(&plain, s);
     }
     serde::Serialize::serialize(&crate::block_json::signed_txn_go_json(txn), s)
 }
@@ -1582,7 +1598,8 @@ fn serialize_signed_txn_go_json<S: serde::Serializer>(
 /// Inverse of [`serialize_signed_txn_go_json`]: go's JSON form is converted back
 /// to msgpack with the simulate request's JSON reader; the older serde form
 /// (integer arrays) is still accepted so documents written by earlier servers
-/// keep parsing.
+/// keep parsing. Non-UTF-8 text (e.g. an asset name) is rendered lossily, as go
+/// does, so that part of the JSON form is not reversible.
 fn deserialize_signed_txn_go_json<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<SignedTransaction, D::Error> {

@@ -369,7 +369,11 @@ pub struct PendingTxnInfo {
 
     /// Logs emitted by application execution, in order. `None`/empty when
     /// the transaction didn't call an app or the app logged nothing.
-    #[serde(default, deserialize_with = "logs_base64_or_bytes")]
+    #[serde(
+        default,
+        deserialize_with = "logs_base64_or_bytes",
+        serialize_with = "logs_as_base64"
+    )]
     pub logs: Option<Vec<Vec<u8>>>,
 
     /// The application ID created by an `app create` (or method call with
@@ -414,12 +418,27 @@ fn logs_base64_or_bytes<'de, D: serde::Deserializer<'de>>(
         .map(|logs| {
             logs.into_iter()
                 .map(|l| match l {
-                    Log::Text(t) => STANDARD.decode(t.as_bytes()).map_err(D::Error::custom),
+                    Log::Text(t) => STANDARD.decode(t.as_bytes()).map_err(|e| {
+                        D::Error::custom(format!("invalid base64 in field `logs`: {e}"))
+                    }),
                     Log::Bytes(b) => Ok(b),
                 })
                 .collect()
         })
         .transpose()
+}
+
+/// Serialize `logs` the way go's JSON does: an array of standard-base64
+/// strings (the inverse of [`logs_base64_or_bytes`]).
+fn logs_as_base64<S: serde::Serializer>(
+    logs: &Option<Vec<Vec<u8>>>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    match logs {
+        None => s.serialize_none(),
+        Some(items) => s.collect_seq(items.iter().map(|l| STANDARD.encode(l))),
+    }
 }
 
 /// Serde adapter for the algod-returned genesis hash, which is JSON-encoded
@@ -740,4 +759,29 @@ pub struct AccountAssetInfo {
     pub created_asset: Option<AssetParamsInfo>,
     /// The round for which this information is relevant.
     pub round: u64,
+}
+
+#[cfg(test)]
+mod pending_txn_info_logs_tests {
+    use super::PendingTxnInfo;
+
+    #[test]
+    fn logs_round_trip_as_base64_strings() {
+        let info = PendingTxnInfo {
+            logs: Some(vec![vec![1, 2, 3], vec![0xff]]),
+            ..PendingTxnInfo::default()
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["logs"], serde_json::json!(["AQID", "/w=="]));
+        let back: PendingTxnInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(back.logs, info.logs);
+    }
+
+    #[test]
+    fn invalid_base64_logs_name_the_field() {
+        let err = serde_json::from_value::<PendingTxnInfo>(serde_json::json!({"logs": ["!!"]}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`logs`") && err.contains("base64"), "{err}");
+    }
 }

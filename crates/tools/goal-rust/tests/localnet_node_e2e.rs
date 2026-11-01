@@ -1684,16 +1684,25 @@ fn localnet_dev_node_note_roundtrips_through_pending_transaction_info() {
          confirmation; got:\n{body}"
     );
 
-    let note_json = body["txn"]["txn"]["note"]
-        .as_array()
-        .unwrap_or_else(|| panic!("txn.txn.note missing/not an array in:\n{body}"));
-    let note_readback: Vec<u8> = note_json
-        .iter()
-        .map(|v| {
-            v.as_u64()
-                .unwrap_or_else(|| panic!("non-numeric note byte in:\n{body}")) as u8
-        })
-        .collect();
+    // go's JSON renders the note (`[]byte`) as a standard-base64 string
+    // (issue #2160).
+    let note_b64 = body["txn"]["txn"]["note"].as_str().unwrap_or_else(|| {
+        panic!(
+            "txn.txn.note missing/not a base64 string in:
+{body}"
+        )
+    });
+    let note_readback: Vec<u8> = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(note_b64)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "txn.txn.note not valid base64 ({e}) in:
+{body}"
+                )
+            })
+    };
     assert_eq!(
         note_readback, note,
         "note should round-trip byte-for-byte through submit -> confirm -> \
