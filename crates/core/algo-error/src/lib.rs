@@ -188,6 +188,45 @@ pub enum AlgoError {
     Network { message: String },
 }
 
+/// go `ledgercore.MinBalanceError.Error`
+/// (`ledger/ledgercore/error.go`): `account <addr> balance <n> below min <m>
+/// (<k> assets)`. `assets` is the account's `TotalAssets`. The one place the
+/// text is built, so the apply, the pool evaluator and the pool's tagging
+/// ([`is_min_balance_error_text`]) cannot drift apart.
+pub fn min_balance_error_text(
+    account: impl std::fmt::Display,
+    balance: u64,
+    min_balance: u64,
+    assets: u64,
+) -> String {
+    format!("account {account} balance {balance} below min {min_balance} ({assets} assets)")
+}
+
+/// Whether `msg` carries a [`min_balance_error_text`]: go's pool tags a
+/// failure `min_balance` when `errors.As` finds a `MinBalanceError` anywhere in
+/// the (possibly `transaction <txid>: `-framed) chain; the typed error does not
+/// cross algod-rust's string boundary, so the tag is read from the exact shape.
+pub fn is_min_balance_error_text(msg: &str) -> bool {
+    let Some(rest) = msg.find("account ").map(|i| &msg[i + "account ".len()..]) else {
+        return false;
+    };
+    let Some(tail) = rest.split_once(" balance ").map(|(_, t)| t) else {
+        return false;
+    };
+    let Some((balance, tail)) = tail.split_once(" below min ") else {
+        return false;
+    };
+    let Some((min, tail)) = tail.split_once(" (") else {
+        return false;
+    };
+    let Some(assets) = tail.strip_suffix(" assets)") else {
+        return false;
+    };
+    [balance, min, assets]
+        .iter()
+        .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Pool error-tag family of an [`AlgoError::Rejected`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectClass {
@@ -295,6 +334,23 @@ mod tests {
             },
         ] {
             assert!(!other.is_batch_sig_failure(), "{other}");
+        }
+    }
+
+    /// go `MinBalanceError.Error` text, byte for byte, and its recognition.
+    #[test]
+    fn min_balance_text_is_gos_and_recognised() {
+        let t = min_balance_error_text("ADDR", 50, 100000, 0);
+        assert_eq!(t, "account ADDR balance 50 below min 100000 (0 assets)");
+        assert!(is_min_balance_error_text(&t));
+        assert!(is_min_balance_error_text(&format!("transaction TXID: {t}")));
+        for other in [
+            "transaction fee 1 is below minimum 1000",
+            "account A balance 5 below minimum balance 100000",
+            "account A balance x below min 1 (0 assets)",
+            "account A balance 5 below min 1 (0 assets) trailing",
+        ] {
+            assert!(!is_min_balance_error_text(other), "{other}");
         }
     }
 }

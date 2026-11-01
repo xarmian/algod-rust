@@ -1150,26 +1150,32 @@ impl BlockEvaluator for BalanceEvaluator {
             // matching go's evaluator (a rejected txn has no side effects).
             if !closing && new_sender_bal > 0 && new_sender_bal < CLOSE_TEST_MIN_BALANCE {
                 return Err(AlgoError::Ledger {
-                    message: format!(
-                        "account {} balance {} below minimum balance {}",
-                        t.sender, new_sender_bal, CLOSE_TEST_MIN_BALANCE
+                    message: algo_error::min_balance_error_text(
+                        t.sender,
+                        new_sender_bal,
+                        CLOSE_TEST_MIN_BALANCE,
+                        0,
                     ),
                 });
             }
             if new_receiver_bal > 0 && new_receiver_bal < CLOSE_TEST_MIN_BALANCE {
                 return Err(AlgoError::Ledger {
-                    message: format!(
-                        "account {} balance {} below minimum balance {}",
-                        t.receiver, new_receiver_bal, CLOSE_TEST_MIN_BALANCE
+                    message: algo_error::min_balance_error_text(
+                        t.receiver,
+                        new_receiver_bal,
+                        CLOSE_TEST_MIN_BALANCE,
+                        0,
                     ),
                 });
             }
             if let Some(close_to_bal) = new_close_to_bal {
                 if close_to_bal > 0 && close_to_bal < CLOSE_TEST_MIN_BALANCE {
                     return Err(AlgoError::Ledger {
-                        message: format!(
-                            "account {} balance {} below minimum balance {}",
-                            t.close_remainder_to, close_to_bal, CLOSE_TEST_MIN_BALANCE
+                        message: algo_error::min_balance_error_text(
+                            t.close_remainder_to,
+                            close_to_bal,
+                            CLOSE_TEST_MIN_BALANCE,
+                            0,
                         ),
                     });
                 }
@@ -1342,7 +1348,7 @@ fn test_close_to_account_below_min_balance() {
         err_str
     );
     assert!(
-        err_str.contains("below minimum balance"),
+        err_str.contains(" below min "),
         "expected a min-balance rejection, got: {}",
         err_str
     );

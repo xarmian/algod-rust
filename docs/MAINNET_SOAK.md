@@ -232,7 +232,7 @@ After teardown the job scans `node.log` (`monitor.py scan-log`, merged into
   `stalled on invalid block` (issue #1715),
   `apply_block failed`, `panicked`, `invariant check: error`,
   `Resource temporarily unavailable`, three or more
-  `ensure_block ... did not advance`, and `below minimum balance` /
+  `ensure_block ... did not advance`, and `below min <m> (<k> assets)` /
   `insufficient balance` on any line that is not from the gossip tx path
   (`tx_tag_handler`, `tx_syncer`, `tx_sync_pool_adapter`,
   `PoolSolicitedTxHandler`, `TxSyncer`, `TransactionPool`).

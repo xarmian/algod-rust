@@ -3473,6 +3473,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         // All mutations use the `_tracked` variants so the checkpoint
         // records what to undo on rollback.
         for (stx, txid) in txgroup.iter().zip(&txids) {
+            let txid_text = txid.to_string();
             let txid = txid.0;
             // Record the transaction ID `validate_group` checked: computed
             // over the restored copy, i.e. what the block's STIB form
@@ -3756,83 +3757,68 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                     // no resource count changes.
                 }
             }
-        }
 
-        // ── Min-balance check after apply ────────────────────────────
-        // After tentatively applying all balance mutations for this
-        // group, verify that no affected account has dropped below the
-        // effective minimum balance. Mirrors Go's `checkMinBalance(cow)`
-        // which calls `dataNew.MinBalance(&eval.proto)` accounting for
-        // assets, apps, schema, boxes, and extra app pages.
-        //
-        // Accounts at exactly zero are allowed — this represents a
-        // closed/deleted account, matching Go's `data.IsZero()` check.
-
-        // Collect addresses modified in this group for the check.
-        let mut modified_addrs: HashSet<Address> = HashSet::new();
-        for stx in txgroup {
-            modified_addrs.insert(stx.txn.sender);
-            // Only payment transactions modify receiver/close-to balances.
+            // ── Min-balance check after this member's apply ──────────
+            // go's `BlockEvaluator.transaction` runs `checkMinBalance(cow)`
+            // after EACH transaction, over the accounts that transaction
+            // modified, and frames its error `transaction <txid>: ...`
+            // (`ledger/eval/eval.go`). So the FIRST member that leaves an
+            // account below its minimum decides the group's error, and a
+            // later member's balance repair cannot hide it. A closed account
+            // (zero) is allowed (`data.IsZero()`); FeeSink, RewardsPool and
+            // StateProofSender are exempt.
+            let mut modified: Vec<Address> = vec![stx.txn.sender];
             if stx.txn.txn_type == TxnType::Pay {
                 if !stx.txn.receiver.is_zero() {
-                    modified_addrs.insert(stx.txn.receiver);
+                    modified.push(stx.txn.receiver);
                 }
                 if !stx.txn.close_remainder_to.is_zero() {
-                    modified_addrs.insert(stx.txn.close_remainder_to);
+                    modified.push(stx.txn.close_remainder_to);
                 }
             }
-        }
-
-        for addr in &modified_addrs {
-            // Skip FeeSink, RewardsPool, and StateProofSender from
-            // min-balance checks, matching Go's checkMinBalance
-            // (eval.go:1113-1119).
-            if *addr == self.hdr.fee_sink
-                || *addr == self.hdr.rewards_pool
-                || *addr == Address::STATE_PROOF_SENDER
-            {
-                continue;
-            }
-
-            let balance = self.try_effective_balance(addr)?;
-            // A zero balance is valid (account closed/deleted), matching
-            // Go's `if data.IsZero() { continue }` in checkMinBalance.
-            if balance == 0 {
-                continue;
-            }
-            // Compute the effective min balance from the account's
-            // resource counts (assets, apps, schema, boxes).
-            let acct_data = self.get_account_data(addr);
-            let min_bal = match &acct_data {
-                Some(acct) => effective_min_balance(acct, &self.consensus_params),
-                // Unknown account with non-zero balance: use base min.
-                None => self.consensus_params.min_balance,
-            };
-            if balance < min_bal {
-                // Min-balance violation — rollback overlay and fees.
-                self.overlay.restore(checkpoint);
-                self.fees_collected = fees_collected_checkpoint;
-                return Err(algo_error::AlgoError::Validation {
-                    message: format!(
-                        "account {} balance {} below minimum {} after transaction group",
-                        addr, balance, min_bal,
+            for addr in &modified {
+                if *addr == self.hdr.fee_sink
+                    || *addr == self.hdr.rewards_pool
+                    || *addr == Address::STATE_PROOF_SENDER
+                {
+                    continue;
+                }
+                let balance = self.try_effective_balance(addr)?;
+                if balance == 0 {
+                    continue;
+                }
+                // The effective min balance from the account's resource
+                // counts (assets, apps, schema, boxes).
+                let acct_data = self.get_account_data(addr);
+                let (min_bal, total_assets) = match &acct_data {
+                    Some(acct) => (
+                        effective_min_balance(acct, &self.consensus_params),
+                        acct.total_assets_opted_in,
                     ),
-                });
-            }
-            // Check MaximumMinimumBalance: if the effective min exceeds
-            // this threshold, the transaction is rejected. Mirrors Go's
-            // checkMinBalance (eval.go:1146-1149). The field is 0 (no
-            // limit) from v32+, but earlier versions enforce it.
-            let max_min = self.consensus_params.maximum_minimum_balance;
-            if max_min > 0 && min_bal > max_min {
-                self.overlay.restore(checkpoint);
-                self.fees_collected = fees_collected_checkpoint;
-                return Err(algo_error::AlgoError::Validation {
-                    message: format!(
+                    // Unknown account with non-zero balance: use base min.
+                    None => (self.consensus_params.min_balance, 0),
+                };
+                let max_min = self.consensus_params.maximum_minimum_balance;
+                let reason = if balance < min_bal {
+                    // go `ledgercore.MinBalanceError`
+                    algo_error::min_balance_error_text(addr, balance, min_bal, total_assets)
+                } else if max_min > 0 && min_bal > max_min {
+                    // `MaximumMinimumBalance` is 0 (no limit) from v32+.
+                    format!(
                         "account {} would use too much space after this transaction. \
                          Minimum balance requirements would be {} (greater than max {})",
                         addr, min_bal, max_min,
-                    ),
+                    )
+                } else {
+                    continue;
+                };
+                // Rollback overlay and fees (go's child cow is dropped).
+                self.overlay.restore(checkpoint);
+                self.fees_collected = fees_collected_checkpoint;
+                return Err(algo_error::AlgoError::Rejected {
+                    message: format!("transaction {txid_text}: {reason}"),
+                    class: algo_error::RejectClass::Other,
+                    source: None,
                 });
             }
         }
@@ -11317,7 +11303,7 @@ mod tests {
         let stx = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100);
         let err = eval.transaction_group(&[stx]).unwrap_err();
         assert!(
-            err.to_string().contains("below minimum") || err.to_string().contains("min"),
+            err.to_string().contains(" below min ") || err.to_string().contains("min"),
             "expected min-balance error, got: {err}"
         );
     }
@@ -11449,7 +11435,7 @@ mod tests {
         };
         let err = eval.transaction_group(&[stx2]).unwrap_err();
         assert!(
-            err.to_string().contains("below minimum"),
+            err.to_string().contains(" below min "),
             "expected min-balance error, got: {err}"
         );
 
@@ -12337,7 +12323,7 @@ mod tests {
         let stx = make_signed_pay(&key, &sender, &receiver, 199_000, 1000, 100);
         let err = eval.transaction_group(&[stx]).unwrap_err();
         assert!(
-            err.to_string().contains("below minimum"),
+            err.to_string().contains(" below min "),
             "expected min-balance error for account with assets, got: {err}"
         );
     }
@@ -13952,7 +13938,7 @@ mod tests {
 
         let err = eval.transaction_group(&[stx]).unwrap_err();
         assert!(
-            err.to_string().contains("below minimum"),
+            err.to_string().contains(" below min "),
             "acfg create should be rejected when balance < new min: {err}"
         );
     }
@@ -14044,7 +14030,7 @@ mod tests {
 
         let err = eval.transaction_group(&[stx]).unwrap_err();
         assert!(
-            err.to_string().contains("below minimum"),
+            err.to_string().contains(" below min "),
             "appl opt-in should be rejected when balance < new min: {err}"
         );
     }

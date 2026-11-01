@@ -5272,9 +5272,12 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
                     let min_bal = store.min_balance_with_state(addr, &account);
                     if account.micro_algos < min_bal {
                         return Err(AlgoError::Ledger {
-                            message: format!(
-                                "account {} balance {} below minimum balance {}",
-                                addr, account.micro_algos, min_bal,
+                            // go `ledgercore.MinBalanceError.Error`
+                            message: algo_error::min_balance_error_text(
+                                addr,
+                                account.micro_algos,
+                                min_bal,
+                                account.total_assets_opted_in,
                             ),
                         });
                     }
@@ -12849,7 +12852,7 @@ mod tests {
         let err = apply_transaction(&mut store_pre, &txn_pre, &ctx_pre, 0)
             .expect_err("pre-v34 must reject a zero-balance sender (min balance violation)");
         assert!(
-            format!("{err}").contains("below minimum balance"),
+            format!("{err}").contains(" below min "),
             "unexpected error: {err}"
         );
 
@@ -12873,7 +12876,7 @@ mod tests {
     /// `!amt.IsZero() || rewardUnits > 0 || !UnfundedSenders`; writing the
     /// rewards-bookkeeping update instead made the empty receiver non-default
     /// (`rewards_base` = current level) and tripped the min-balance check
-    /// ("balance 0 below minimum balance 100000").
+    /// ("balance 0 below min 100000 (0 assets)").
     #[test]
     fn unfunded_senders_zero_amount_payment_leaves_empty_receiver_unwritten() {
         let sender = Address([7u8; 32]);
@@ -13159,7 +13162,7 @@ mod tests {
         let mut top = make_state_with_accounts(&[(sender, 150_000), (fee_sink, 0)], fee_sink);
         let err = apply_transaction(&mut top, &txn, &ctx, 0)
             .expect_err("top-level payment below min balance must be rejected");
-        assert!(format!("{err}").contains("below minimum balance"), "{err}");
+        assert!(format!("{err}").contains(" below min "), "{err}");
 
         let mut inner = make_state_with_accounts(&[(sender, 150_000), (fee_sink, 0)], fee_sink);
         apply_transaction(&mut inner, &txn, &ctx, 1)
@@ -13185,7 +13188,7 @@ mod tests {
         let mut top = make_state_with_accounts(&[(sender, 150_000), (fee_sink, 0)], fee_sink);
         let err = apply_transaction(&mut top, &txn, &ctx, 0)
             .expect_err("top-level payment below min balance must be rejected");
-        assert!(format!("{err}").contains("below minimum balance"), "{err}");
+        assert!(format!("{err}").contains(" below min "), "{err}");
 
         let mut inner = make_state_with_accounts(&[(sender, 150_000), (fee_sink, 0)], fee_sink);
         apply_transaction(&mut inner, &txn, &ctx, 1)
@@ -14153,7 +14156,7 @@ return
         let err =
             apply_block_with_delta_mode(&mut state, &mk_block(3, vec![call]), ApplyMode::Execute)
                 .expect_err("inner pay leaving the app account below its minimum must be rejected");
-        assert!(format!("{err}").contains("below minimum balance"), "{err}");
+        assert!(format!("{err}").contains(" below min "), "{err}");
     }
 
     /// Issue #1660 regression (live mainnet block 65589704, replayed from

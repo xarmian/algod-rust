@@ -2165,7 +2165,7 @@ fn test_min_balance_enforcement_with_assets() {
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("below minimum balance"),
+        err_msg.contains(" below min "),
         "expected min-balance error, got: {}",
         err_msg,
     );

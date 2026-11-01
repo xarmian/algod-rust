@@ -363,7 +363,7 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
 ///   mirroring Go's `ledgercore.ApprovalProgramRejectedError` case.
 /// - `"...holding ... insufficient for transfer ..."` => `AssetBalance`,
 ///   mirroring Go's `ledgercore.AssetBalanceError` case.
-/// - `"...balance ... below minimum balance ..."` => `MinBalance`,
+/// - `"account <a> balance <n> below min <m> (<k> assets)"` => `MinBalance`,
 ///   mirroring Go's `ledgercore.MinBalanceError` case.
 /// - `"...insufficient balance ... for fee/payment ..."` => `Overspend`,
 ///   mirroring Go's `ledgercore.OverspendError` case.
@@ -396,7 +396,7 @@ fn classify_evaluator_message(msg: &str) -> PoolErrorTag {
         PoolErrorTag::Overspend
     } else if msg.contains("insufficient for transfer") {
         PoolErrorTag::AssetBalance
-    } else if msg.contains("below minimum balance") {
+    } else if algo_error::is_min_balance_error_text(msg) {
         PoolErrorTag::MinBalance
     } else if msg.contains("insufficient balance") {
         PoolErrorTag::Overspend
