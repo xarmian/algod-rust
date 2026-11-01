@@ -251,6 +251,22 @@ fn cert_roundtrip_vs_go() {
     eprintln!("cert_roundtrip_vs_go: {n} fixtures matched byte-for-byte");
 }
 
+/// Issue #2159: the same go-generated certificate fixtures through the real
+/// `Certificate` type (decode, `from_bundle`, `canonical_encode_certificate`),
+/// including the step-0 and non-cert-step fixtures: no step is ever invented
+/// or dropped.
+#[test]
+fn certificate_type_roundtrip_vs_go() {
+    use algo_agreement::{canonical_encode_certificate, Certificate};
+    let n = run_subdir_roundtrip(
+        "cert",
+        |b| as_string_err(decode_bundle(b)).map(|b| Certificate::from_bundle(&b)),
+        canonical_encode_certificate,
+        20,
+    );
+    eprintln!("certificate_type_roundtrip_vs_go: {n} fixtures matched byte-for-byte");
+}
+
 // ── Inner wire types (TASK-60) ────────────────────────────────────────────
 
 #[test]

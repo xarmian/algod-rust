@@ -1543,10 +1543,7 @@ mod tests {
     }
 
     fn make_cert(round: u64) -> Certificate {
-        Certificate {
-            round: Round(round),
-            ..Certificate::default()
-        }
+        Certificate::for_test(Round(round))
     }
 
     // -- Tests --
@@ -1950,6 +1947,7 @@ mod tests {
     fn make_cert_with_proposal(round: u64) -> Certificate {
         use algo_agreement::{Period, ProposalValue};
         Certificate {
+            step: algo_agreement::CERT,
             round: Round(round),
             period: Period(2),
             proposal: ProposalValue {
@@ -1986,6 +1984,40 @@ mod tests {
         assert_eq!(recovered.period, cert.period);
         assert_eq!(recovered.proposal, cert.proposal);
         assert_eq!(recovered.votes.len(), cert.votes.len());
+    }
+
+    /// Issue #2159: a step-less (`{rnd}`, DevMode) certificate is stored as
+    /// exactly those bytes, so `/v2/blocks/{r}?format=msgpack` serves what go
+    /// serves; a real certificate keeps its `step`.
+    #[test]
+    fn ensure_block_stores_stepless_cert_bytes_verbatim() {
+        for (cert, expected) in [
+            (
+                Certificate {
+                    round: Round(1),
+                    ..Certificate::default()
+                },
+                vec![0x81, 0xa3, b'r', b'n', b'd', 0x01],
+            ),
+            (
+                Certificate {
+                    round: Round(1),
+                    step: algo_agreement::CERT,
+                    ..Certificate::default()
+                },
+                vec![
+                    0x82, 0xa3, b'r', b'n', b'd', 0x01, 0xa4, b's', b't', b'e', b'p', 0x02,
+                ],
+            ),
+        ] {
+            let ledger = Arc::new(Mutex::new(
+                crate::apply::pool_fixtures::funded_sqlite_ledger(),
+            ));
+            let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+            bridge.ensure_block(&make_round1_block(), &cert);
+            let stored = ledger.lock().unwrap().get_block_cert(1).unwrap();
+            assert_eq!(stored, Some(expected));
+        }
     }
 
     /// Issue #2105: the catchup / agreement commit holds a proposer-less
@@ -2063,6 +2095,7 @@ mod tests {
         let cert2 = {
             use algo_agreement::{Period, ProposalValue};
             Certificate {
+                step: algo_agreement::CERT,
                 round: Round(1),
                 period: Period(99),
                 proposal: ProposalValue {

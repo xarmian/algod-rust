@@ -1346,7 +1346,8 @@ makes the gate fail), and the tier must fail. This works for every endpoint,
 allowlisted ones included (`rest_lib.corrupt_response`; unit-tested for each
 endpoint shape, including `tx_params`, which has no allowlist entry and whose
 `fee` is 0 on both nodes, so the corruption lands on another leaf; CI runs it
-on `blocks_json` and on the allowlisted `blocks_msgpack`).
+on `blocks_json` and `blocks_msgpack`, neither of which has an allowlist entry
+any more).
 
 #### Volatile fields (excluded from the comparison)
 
@@ -1388,13 +1389,12 @@ The number of allowlisted differences is recorded in every row's metadata
 <!-- known-differences:start -->
 | Endpoint | Path | Kind | Issue | Reason |
 |---|---|---|---|---|
-| `blocks_msgpack` | `cert.step` | only-rust | [#2159](https://github.com/xarmian/algod-rust/issues/2159) | cert re-encoded with step=2 |
 | `simulate` | `txn-groups.0.txn-results.0.txn-result.txn.txn.gh` | value | [#2160](https://github.com/xarmian/algod-rust/issues/2160) | gh rendered as an integer array |
 | `simulate` | `txn-groups.0.txn-results.0.txn-result.sender-rewards` | only-go | [#2161](https://github.com/xarmian/algod-rust/issues/2161) | sender-rewards omitted |
 <!-- known-differences:end -->
 
-While those are open, the throughput rows for `account_hot`, `account_cold`,
-`blocks_msgpack` and `simulate` compare two nodes that do not yet
+While those are open, the throughput rows for `account_hot`, `account_cold`
+and `simulate` compare two nodes that do not yet
 return the same answer (algod-rust returns less data for the account
 endpoints), so read them with the table above in mind.
 

@@ -802,6 +802,7 @@ fn stub_block_validator_and_ledger_writer_flow() {
 
     let ledger = StubLedger::new(v41_params(), Round(1));
     let cert = algo_agreement::Certificate {
+        step: algo_agreement::CERT,
         round: Round(1),
         period: Period(0),
         proposal: BOTTOM,
@@ -874,6 +875,7 @@ fn stub_ledger_full_lifecycle() {
 
     // Write a block and verify it was recorded.
     let cert = algo_agreement::Certificate {
+        step: algo_agreement::CERT,
         round: Round(10),
         period: Period(0),
         proposal: BOTTOM,

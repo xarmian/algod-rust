@@ -1677,10 +1677,7 @@ mod tests {
     // -- Helper to create a minimal certificate --
 
     fn make_cert(round: u64) -> Certificate {
-        Certificate {
-            round: Round(round),
-            ..Certificate::default()
-        }
+        Certificate::for_test(Round(round))
     }
 
     fn make_pending_cert(round: u64) -> PendingUnmatchedCertificate {
@@ -2532,12 +2529,11 @@ mod tests {
     fn make_cert_with_digest(round: u64, digest: algo_types::Digest) -> Certificate {
         use algo_agreement::ProposalValue;
         Certificate {
-            round: Round(round),
             proposal: ProposalValue {
                 block_digest: digest,
                 ..Default::default()
             },
-            ..Certificate::default()
+            ..Certificate::for_test(Round(round))
         }
     }
 

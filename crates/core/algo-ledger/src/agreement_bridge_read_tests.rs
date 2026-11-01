@@ -165,6 +165,7 @@ fn lookup_agreement_beyond_the_committed_round_is_not_available() {
 fn encoded_cert(round: u64) -> (Certificate, Vec<u8>) {
     use algo_agreement::{Period, ProposalValue};
     let cert = Certificate {
+        step: algo_agreement::CERT,
         round: Round(round),
         period: Period(2),
         proposal: ProposalValue {

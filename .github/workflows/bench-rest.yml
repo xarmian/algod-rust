@@ -197,8 +197,8 @@ jobs:
           BENCH_REST_RUST_IMAGE: algod-rust:bench-rest
         run: |
           set -euo pipefail
-          # blocks_json has no allowlisted difference; blocks_msgpack does
-          # (#2159), so its corruption must land outside the excused path.
+          # neither endpoint has an allowlisted difference, so any
+          # corruption of its response must fail the gate.
           for ep in blocks_json blocks_msgpack; do
             out="$RUNNER_TEMP/neg-rest-$ep"
             mkdir -p "$out"

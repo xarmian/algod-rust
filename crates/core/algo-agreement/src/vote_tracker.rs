@@ -948,6 +948,37 @@ mod tests {
         }
     }
 
+    /// Issue #2159: a certificate formed by the tracker's own threshold
+    /// bundle carries the step of `votes[0].raw_vote.step` (cert for a cert
+    /// quorum), so `Certificate::from_bundle(..).authenticate(..)` keeps its
+    /// step check satisfied, and a soft quorum's bundle is soft (not cert).
+    #[test]
+    fn vote_tracker_threshold_bundle_step_flows_into_certificate() {
+        use crate::certificate::Certificate;
+        let params = test_params();
+        let pv = test_proposal();
+        for (step, ev_type) in [
+            (CERT, EventType::CertThreshold),
+            (SOFT, EventType::SoftThreshold),
+        ] {
+            let n = step.committee_threshold(&params);
+            let mut tracker = VoteTracker::default();
+            for i in 0..(n - 1) {
+                accept(&mut tracker, &params, i, step, pv);
+            }
+            let last = accept(&mut tracker, &params, n - 1, step, pv);
+            assert_eq!(last.event_type(), ev_type);
+            let Event::Threshold(te) = last else {
+                panic!("expected Threshold event");
+            };
+            assert_eq!(te.bundle.step, step);
+            let cert = Certificate::from_bundle(&te.bundle);
+            assert_eq!(cert.step, step);
+            assert_eq!(cert.to_unauthenticated_bundle().step, step);
+            assert_eq!(cert.step == CERT, step == CERT);
+        }
+    }
+
     /// Port of `TestVoteTrackerNextQuorum`.
     #[test]
     fn vote_tracker_next_quorum_boundary() {

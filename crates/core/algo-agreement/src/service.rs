@@ -2374,6 +2374,7 @@ mod tests {
     fn do_ensure_action_writes_block() {
         let ledger = StubLedger::new(v41_params(), Round(100));
         let cert = Certificate {
+            step: crate::step::CERT,
             round: Round(100),
             period: Period(0),
             proposal: crate::vote::ProposalValue {
@@ -2420,6 +2421,7 @@ mod tests {
 
         let ledger = StubLedger::new(v41_params(), Round(100));
         let cert = Certificate {
+            step: crate::step::CERT,
             round: Round(100),
             period: Period(0),
             proposal: crate::vote::ProposalValue {
@@ -2461,6 +2463,7 @@ mod tests {
         let ea = EnsureAction {
             payload: crate::events::Proposal::default(),
             certificate: Certificate {
+                step: crate::step::CERT,
                 round: Round(100),
                 period: Period(0),
                 proposal: crate::vote::ProposalValue {
@@ -2521,6 +2524,7 @@ mod tests {
     fn do_ensure_action_none_validated_block_uses_slow_path() {
         let ledger = StubLedger::new(v41_params(), Round(100));
         let cert = Certificate {
+            step: crate::step::CERT,
             round: Round(100),
             period: Period(0),
             proposal: crate::vote::ProposalValue {
@@ -2564,6 +2568,7 @@ mod tests {
 
         let ledger = StubLedger::new(v41_params(), Round(100));
         let cert = Certificate {
+            step: crate::step::CERT,
             round: Round(100),
             period: Period(0),
             proposal: crate::vote::ProposalValue {
@@ -2607,6 +2612,7 @@ mod tests {
     fn do_stage_digest_action_records() {
         let ledger = StubLedger::new(v41_params(), Round(100));
         let cert = Certificate {
+            step: crate::step::CERT,
             round: Round(100),
             period: Period(0),
             proposal: crate::vote::ProposalValue::default(),
