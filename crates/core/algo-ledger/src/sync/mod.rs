@@ -965,18 +965,184 @@ impl SyncOrchestrator {
             self.catchpoint_download_path.take(),
         ];
         for path in files.into_iter().flatten() {
-            // the file and the downloader's partial `.tmp` next to it
-            for p in [path.with_extension("tmp"), path] {
-                if let Err(e) = std::fs::remove_file(&p) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(error = %e, path = %p.display(), "aborted catchup: could not remove a catchpoint file");
-                    }
-                }
-            }
+            remove_catchpoint_file_and_tmp(&path, "aborted catchup");
         }
         AlgoError::Ledger {
             message: "catchpoint catchup aborted by user".to_string(),
         }
+    }
+
+    /// What `run` does with a persisted, non-terminal marker for the label
+    /// this run was asked for (issue #2137).
+    ///
+    /// go's `StartCatchup` -> `MakeNewCatchpointCatchupService` always starts
+    /// a NEW catchup at `CatchpointCatchupStateInactive` with the requested
+    /// label (its ledger-download stage runs `ResetStagingBalances`); only
+    /// `MakeResumedCatchpointCatchupService` (node start) resumes the
+    /// persisted label and stage, and while that service exists a request for
+    /// another label is refused (`MakeCatchpointUnableToStartError`). go's
+    /// live ledger is untouched until its final Switch stage, so it has no
+    /// equivalent of a marker past `ImportingLedger`, where the import's
+    /// early cutover put a snapshot of the marker's catchpoint into the live
+    /// ledger (issue #2121). The table:
+    ///
+    /// | marker state                                  | same label | no label | other label |
+    /// |-----------------------------------------------|------------|----------|-------------|
+    /// | `Idle`, `DownloadingLedger` (not cut over)    | resume     | resume   | start over: clear marker, drop staging and file |
+    /// | `ImportingLedger` (cut over, UNVERIFIED)      | resume     | resume   | start over, still cut over: marker rewritten for the new label with no file, so B is downloaded and imported over it and verified |
+    /// | `VerifyingLedger`, `DownloadingLookback`, `ReplayingBlocks` | resume | resume | reject with go's unable-to-start error; marker, staging and file untouched |
+    ///
+    /// A marker with no label (or an unparseable one) is compared by its
+    /// recorded round (or the `catchpoint-<round>` file name): the same round
+    /// is "unknown but compatible" and resumes, another round is another
+    /// catchpoint, and a marker recording nothing resumable is stale.
+    /// The requested label's syntax is validated first, so a malformed
+    /// request fails before anything is touched.
+    fn classify_marker(&self, persisted: &PersistedSyncState) -> Result<MarkerAction, AlgoError> {
+        let Some(requested) = self.config.catchpoint_label.as_deref() else {
+            return Ok(MarkerAction::Resume);
+        };
+        let requested =
+            parse_catchpoint_label(requested.trim()).map_err(|e| AlgoError::Ledger {
+                message: format!("invalid catchpoint label '{requested}': {e}"),
+            })?;
+        let other = match persisted
+            .catchpoint_label
+            .as_deref()
+            .map(|l| parse_catchpoint_label(l.trim()))
+        {
+            Some(Ok(marker)) => marker.round != requested.round || marker.hash != requested.hash,
+            parsed => {
+                if let Some(Err(e)) = &parsed {
+                    tracing::error!(
+                        label = ?persisted.catchpoint_label,
+                        error = %e,
+                        "the sync marker's catchpoint label is unparseable (corrupted marker)"
+                    );
+                }
+                persisted_marker_round(persisted).is_none_or(|round| round != requested.round)
+            }
+        };
+        if !other {
+            return Ok(MarkerAction::Resume);
+        }
+        Ok(match phase_ordinal(&persisted.state) {
+            0 | 1 => MarkerAction::StartOver { cut_over: false },
+            2 => MarkerAction::StartOver { cut_over: true },
+            _ => MarkerAction::Reject,
+        })
+    }
+
+    /// Refuse a catchup for another label than the verified-or-later marker's
+    /// (see [`Self::classify_marker`]) with go's
+    /// `MakeCatchpointUnableToStartError` text. Nothing on disk is touched.
+    fn reject_other_label(&mut self, persisted: &PersistedSyncState) -> AlgoError {
+        // Past the import the ledger is cut over: report it as such.
+        self.ledger_cut_over = true;
+        let running = persisted
+            .catchpoint_label
+            .clone()
+            .or_else(|| persisted_marker_round(persisted).map(|r| format!("round {r}")))
+            .unwrap_or_default();
+        AlgoError::Ledger {
+            message: format!(
+                "unable to start catchpoint catchup for '{}' - already catching up '{running}'",
+                self.config.catchpoint_label.as_deref().unwrap_or_default()
+            ),
+        }
+    }
+
+    /// Start a new catchup for the requested label over a stale marker (see
+    /// [`Self::classify_marker`] for when). Order matters: the marker is
+    /// cleared (or rewritten for the new label) FIRST, and only if that
+    /// succeeded are the staging tables and the stale file deleted, so a
+    /// failure can never leave a stale marker next to deleted data. A marker
+    /// failure is returned and nothing else is touched.
+    ///
+    /// For `cut_over` (marker at `ImportingLedger`) the marker is rewritten
+    /// as "cut over, no file" for the requested label, which `run_phases`
+    /// already treats as "download this label's file, then import it over the
+    /// cut-over ledger"; an abort in the meantime keeps the marker rather
+    /// than stranding the unverified snapshot.
+    ///
+    /// Returns the phase to resume from.
+    fn start_over_for_requested_label(
+        &mut self,
+        conn: &Connection,
+        persisted: &PersistedSyncState,
+        cut_over: bool,
+    ) -> Result<SyncState, AlgoError> {
+        tracing::warn!(
+            persisted_state = %persisted.state,
+            persisted_label = ?persisted.catchpoint_label,
+            requested = ?self.config.catchpoint_label,
+            cut_over,
+            "found a sync marker for a different catchpoint; starting a new catchup for \
+             the requested one instead of resuming it"
+        );
+        let next = if cut_over {
+            let requested = self.config.catchpoint_label.clone();
+            let round = requested
+                .as_deref()
+                .and_then(|l| parse_catchpoint_label(l.trim()).ok())
+                .map(|p| p.round);
+            persist_sync_state(
+                conn,
+                &SyncState::ImportingLedger,
+                requested.as_deref(),
+                round,
+                None,
+            )?;
+            SyncState::ImportingLedger
+        } else {
+            clear_sync_state(conn)?;
+            SyncState::Idle
+        };
+        if let Err(e) = crate::catchpoint::importer::drop_staging_tables(conn) {
+            tracing::warn!(error = %e, "stale catchup: could not drop the staging tables");
+        }
+        // The stale catchpoint's file and the downloader's partial `.tmp`.
+        // Only files in the ledger directory with the downloader's own name
+        // are removed: the marker is data read from the database.
+        let dir = match self.config.db_path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        let mut stale: Vec<PathBuf> = Vec::new();
+        if let Some(round) = persisted.catchpoint_round {
+            stale.push(dir.join(format!("catchpoint-{round}.tar.gz")));
+        }
+        if let Some(file) = persisted.catchpoint_file.as_deref() {
+            let file = PathBuf::from(file);
+            let own_name = file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("catchpoint-"));
+            let parent = match file.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                _ => PathBuf::from("."),
+            };
+            let in_ledger_dir = matches!(
+                (parent.canonicalize(), dir.canonicalize()),
+                (Ok(a), Ok(b)) if a == b
+            );
+            if own_name && in_ledger_dir {
+                if !stale.contains(&file) {
+                    stale.push(file);
+                }
+            } else {
+                tracing::warn!(
+                    path = %file.display(),
+                    ledger_dir = %dir.display(),
+                    "stale catchup: the marker's catchpoint file is outside the ledger \
+                     directory (or not a catchpoint-* file); not removing it"
+                );
+            }
+        }
+        for path in stale {
+            remove_catchpoint_file_and_tmp(&path, "stale catchup");
+        }
+        Ok(next)
     }
 
     /// Validate and execute a state transition. Logs at INFO level and
@@ -2873,7 +3039,17 @@ impl SyncOrchestrator {
         let mut resume_state = SyncState::Idle;
         if let Ok(conn) = self.open_db() {
             if let Ok(Some(persisted)) = restore_sync_state(&conn) {
-                if !persisted.state.is_terminal() {
+                let action = if persisted.state.is_terminal() {
+                    MarkerAction::Resume
+                } else {
+                    self.classify_marker(&persisted)?
+                };
+                if matches!(action, MarkerAction::Reject) {
+                    return Err(self.reject_other_label(&persisted));
+                } else if let MarkerAction::StartOver { cut_over } = action {
+                    resume_state =
+                        self.start_over_for_requested_label(&conn, &persisted, cut_over)?;
+                } else if !persisted.state.is_terminal() {
                     tracing::info!(
                         persisted_state = %persisted.state,
                         "found persisted sync state — will resume"
@@ -3411,6 +3587,41 @@ fn sleep_unless_cancelled(delay: std::time::Duration, cancel: &CancellationToken
 ///
 /// Higher ordinals mean the phase was reached later in the pipeline.
 /// `Idle` = 0, `DownloadingLedger` = 1, ..., `ReplayingBlocks` = 5.
+/// What to do with a persisted marker for the requested label (issue #2137,
+/// see `SyncOrchestrator::classify_marker`).
+enum MarkerAction {
+    Resume,
+    StartOver { cut_over: bool },
+    Reject,
+}
+
+/// The catchpoint round a marker records: its round, else the round encoded
+/// in its `catchpoint-<round>.*` file name.
+fn persisted_marker_round(persisted: &PersistedSyncState) -> Option<u64> {
+    persisted.catchpoint_round.or_else(|| {
+        let file = std::path::Path::new(persisted.catchpoint_file.as_deref()?);
+        let name = file.file_name()?.to_str()?;
+        name.strip_prefix("catchpoint-")?
+            .split('.')
+            .next()?
+            .parse()
+            .ok()
+    })
+}
+
+/// Remove a catchpoint file and the downloader's partial `.tmp` next to it,
+/// logging (not failing) on errors other than "not found". `context` names
+/// the caller in the log.
+fn remove_catchpoint_file_and_tmp(path: &std::path::Path, context: &str) {
+    for p in [path.with_extension("tmp"), path.to_path_buf()] {
+        if let Err(e) = std::fs::remove_file(&p) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(error = %e, path = %p.display(), context, "could not remove a catchpoint file");
+            }
+        }
+    }
+}
+
 fn phase_ordinal(state: &SyncState) -> u8 {
     match state {
         SyncState::Idle => 0,
@@ -4498,6 +4709,403 @@ mod tests {
         fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
             Ok(None)
         }
+    }
+
+    /// A catchpoint source that records which rounds the run asked it to
+    /// download and fails every download with a plain error.
+    struct RecordingDownloadBackend {
+        downloads: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    }
+
+    impl SyncBackend for RecordingDownloadBackend {
+        fn download_catchpoint(
+            &self,
+            _genesis_id: &str,
+            round: u64,
+            _dest_path: &std::path::Path,
+        ) -> Result<(), AlgoError> {
+            self.downloads.lock().unwrap().push(round);
+            Err(AlgoError::Network {
+                message: "download stopped by the test".into(),
+            })
+        }
+
+        fn fetch_block_raw(&self, _round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+            Err(AlgoError::Network {
+                message: "not served".into(),
+            })
+        }
+
+        fn fetch_block(&self, _round: u64) -> Result<Block, AlgoError> {
+            unimplemented!("the run stops in the download phase")
+        }
+
+        fn get_current_round(&self) -> Result<u64, AlgoError> {
+            unimplemented!("the run stops in the download phase")
+        }
+
+        fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
+            Ok(None)
+        }
+    }
+
+    const STALE_LABEL_A: &str = "5000#AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const STALE_LABEL_B: &str = "6000#BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA";
+    /// Same round as A, different hash.
+    const STALE_LABEL_A2: &str = "5000#CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCA";
+
+    /// What a run found and left after a persisted marker for
+    /// `STALE_LABEL_A` (with its downloaded file and a staging table) was
+    /// run against `requested` (issue #2137).
+    struct StaleMarkerRun {
+        downloads: Vec<u64>,
+        err: Option<String>,
+        marker: Option<PersistedSyncState>,
+        staging: bool,
+        file_exists: bool,
+        cut_over: bool,
+    }
+
+    /// The marker a [`StaleMarkerRun`] starts from.
+    struct MarkerSetup<'a> {
+        state: SyncState,
+        label: Option<&'a str>,
+        round: Option<u64>,
+        /// Whether the marker names its catchpoint file.
+        names_file: bool,
+        requested: Option<&'a str>,
+        /// Make every write to the marker table fail.
+        sabotage_marker_writes: bool,
+        /// Run with a db_path relative to the working directory, the marker
+        /// naming its file by absolute path.
+        relative_db_path: bool,
+    }
+
+    impl<'a> MarkerSetup<'a> {
+        fn new(state: SyncState, requested: Option<&'a str>) -> Self {
+            Self {
+                state,
+                label: Some(STALE_LABEL_A),
+                round: Some(5_000),
+                names_file: true,
+                requested,
+                sabotage_marker_writes: false,
+                relative_db_path: false,
+            }
+        }
+    }
+
+    async fn run_over_marker(setup: MarkerSetup<'_>, tag: u32) -> StaleMarkerRun {
+        let name = format!(
+            "algo-ledger-sync-test-stale-marker-{}-{tag}",
+            std::process::id()
+        );
+        let dir = if setup.relative_db_path {
+            std::path::PathBuf::from(&name)
+        } else {
+            std::env::temp_dir().join(&name)
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The marker always names the file by absolute path.
+        let abs_dir = dir.canonicalize().unwrap();
+        let file = abs_dir.join("catchpoint-5000.tar.gz");
+        std::fs::write(&file, b"not a real catchpoint").unwrap();
+        let downloads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut config = test_config(dir.join("ledger"), 1);
+        config.catchpoint_label = setup.requested.map(str::to_string);
+        let mut orchestrator = SyncOrchestrator::with_backend(
+            config,
+            RecordingDownloadBackend {
+                downloads: downloads.clone(),
+            },
+        );
+        {
+            let conn = orchestrator.open_db().unwrap();
+            persist_sync_state(
+                &conn,
+                &setup.state,
+                setup.label,
+                setup.round,
+                setup.names_file.then(|| file.to_string_lossy()).as_deref(),
+            )
+            .unwrap();
+            conn.execute_batch("CREATE TABLE catchpointbalances (address BLOB);")
+                .unwrap();
+            if setup.sabotage_marker_writes {
+                conn.execute_batch(
+                    "CREATE TRIGGER no_ins BEFORE INSERT ON catchpointstate
+                       BEGIN SELECT RAISE(ABORT, 'marker write refused'); END;
+                     CREATE TRIGGER no_upd BEFORE UPDATE ON catchpointstate
+                       BEGIN SELECT RAISE(ABORT, 'marker write refused'); END;
+                     CREATE TRIGGER no_del BEFORE DELETE ON catchpointstate
+                       BEGIN SELECT RAISE(ABORT, 'marker write refused'); END;",
+                )
+                .unwrap();
+            }
+        }
+        let err = orchestrator.run().await.err().map(|e| e.to_string());
+        let conn = orchestrator.open_db().unwrap();
+        let marker = restore_sync_state(&conn).unwrap();
+        let staging: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE name = 'catchpointbalances'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        let result = StaleMarkerRun {
+            downloads: downloads.lock().unwrap().clone(),
+            err,
+            marker,
+            staging,
+            file_exists: file.exists(),
+            cut_over: orchestrator.ledger_cut_over(),
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
+
+    async fn run_over_marker_for_a(
+        marker_state: SyncState,
+        requested: Option<&str>,
+        tag: u32,
+    ) -> StaleMarkerRun {
+        run_over_marker(MarkerSetup::new(marker_state, requested), tag).await
+    }
+
+    /// Assert the marker, staging table and file of `STALE_LABEL_A` survived
+    /// a run untouched.
+    fn assert_marker_a_untouched(r: &StaleMarkerRun, state: &SyncState) {
+        let marker = r.marker.as_ref().expect("the marker must be kept");
+        assert_eq!(&marker.state, state);
+        assert_eq!(marker.catchpoint_label.as_deref(), Some(STALE_LABEL_A));
+        assert_eq!(marker.catchpoint_round, Some(5_000));
+        assert!(marker.catchpoint_file.is_some());
+        assert!(r.staging, "the staging tables must be kept");
+        assert!(r.file_exists, "the catchpoint file must be kept");
+        assert!(r.downloads.is_empty(), "nothing is downloaded");
+    }
+
+    /// Issue #2137: a catchup requested for label B must not resume a stale
+    /// marker for label A (go: a new catchup starts at `Inactive` with the
+    /// requested label and resets the staging state). It downloads B's round
+    /// from scratch, and A's marker, staging table and file are gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_for_another_label_does_not_resume_a_stale_marker() {
+        let r =
+            run_over_marker_for_a(SyncState::DownloadingLedger, Some(STALE_LABEL_B), line!()).await;
+        assert!(r.err.as_deref().unwrap().contains("download stopped"));
+        assert_eq!(r.downloads, vec![6_000], "B's round is downloaded, not A's");
+        assert!(!r.staging, "the stale staging tables are dropped");
+        assert!(!r.file_exists, "the stale catchpoint file is not reused");
+        assert!(!r.cut_over);
+        assert!(
+            r.marker
+                .as_ref()
+                .is_none_or(|m| m.catchpoint_label.as_deref() != Some(STALE_LABEL_A)
+                    && m.catchpoint_round != Some(5_000)),
+            "no A label or round survives: {:?}",
+            r.marker
+        );
+    }
+
+    /// Issue #2137: the same round with a different hash is another catchpoint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_for_the_same_round_with_another_hash_starts_fresh() {
+        let r = run_over_marker_for_a(SyncState::DownloadingLedger, Some(STALE_LABEL_A2), line!())
+            .await;
+        assert_eq!(r.downloads, vec![5_000]);
+        assert!(!r.file_exists, "A's file must not be reused for A2");
+        assert!(!r.staging);
+    }
+
+    /// Issue #2137: a request for the SAME label still resumes: the
+    /// downloaded file is reused (no download), the marker kept.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_for_the_same_label_still_resumes() {
+        let r =
+            run_over_marker_for_a(SyncState::DownloadingLedger, Some(STALE_LABEL_A), line!()).await;
+        assert!(r.downloads.is_empty(), "the downloaded file is reused");
+        assert!(
+            r.marker
+                .is_some_and(|m| m.catchpoint_label.as_deref() == Some(STALE_LABEL_A)),
+            "the marker is kept"
+        );
+    }
+
+    /// Issue #2137, go `MakeResumedCatchpointCatchupService`: a run with no
+    /// explicit label (a resume, e.g. `catchpoint-sync` rerun after a crash)
+    /// continues whatever the marker names.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_without_a_label_still_resumes_the_marker() {
+        let r = run_over_marker_for_a(SyncState::DownloadingLedger, None, line!()).await;
+        assert!(r.downloads.is_empty(), "the downloaded file is reused");
+        assert!(r
+            .marker
+            .is_some_and(|m| m.catchpoint_label.as_deref() == Some(STALE_LABEL_A)));
+    }
+
+    /// Issue #2137, the cut-over case. A marker at `ImportingLedger` means
+    /// the live ledger already holds an unverified snapshot of A (#2121). go
+    /// has no such state (its ledger is untouched until Switch), so we keep
+    /// the safe part: the new catchup for B downloads B's file but the
+    /// ledger stays recorded as cut over, with B's label and no file, so an
+    /// abort cannot discard it and a restart re-downloads B.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_for_another_label_over_a_cut_over_marker_stays_cut_over() {
+        let r =
+            run_over_marker_for_a(SyncState::ImportingLedger, Some(STALE_LABEL_B), line!()).await;
+        assert_eq!(r.downloads, vec![6_000]);
+        assert!(!r.file_exists, "A's file is discarded");
+        assert!(!r.staging);
+        assert!(r.cut_over, "the ledger still holds the unverified snapshot");
+        let marker = r.marker.expect("the cut-over marker must be kept");
+        assert_eq!(marker.state, SyncState::ImportingLedger);
+        assert_eq!(marker.catchpoint_label.as_deref(), Some(STALE_LABEL_B));
+        assert_eq!(marker.catchpoint_round, Some(6_000));
+        assert_eq!(marker.catchpoint_file, None);
+    }
+
+    /// Issue #2137: a marker past the import (verification, lookback or
+    /// replay) holds a verified or partly replayed snapshot of A: a request
+    /// for B is refused with go's `MakeCatchpointUnableToStartError` text and
+    /// nothing is touched (no destructive cleanup before the rejection).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_for_another_label_over_a_verified_marker_is_rejected_untouched() {
+        for (i, state) in [
+            SyncState::VerifyingLedger,
+            SyncState::DownloadingLookback,
+            SyncState::ReplayingBlocks,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let r =
+                run_over_marker_for_a(state.clone(), Some(STALE_LABEL_B), line!() + i as u32).await;
+            assert_eq!(
+                r.err.as_deref(),
+                Some(
+                    format!(
+                        "ledger error: unable to start catchpoint catchup for \
+                         '{STALE_LABEL_B}' - already catching up '{STALE_LABEL_A}'"
+                    )
+                    .as_str()
+                ),
+                "{state}"
+            );
+            assert!(r.cut_over, "{state}");
+            assert_marker_a_untouched(&r, &state);
+        }
+    }
+
+    /// Issue #2137: a marker without a label but with the same catchpoint
+    /// round (recorded, or encoded in its file name) is compatible and
+    /// resumes: a resumable download is not destroyed for lacking a label.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_marker_without_a_label_resumes_when_the_round_matches() {
+        let mut s = MarkerSetup::new(SyncState::DownloadingLedger, Some(STALE_LABEL_A));
+        s.label = None;
+        let r = run_over_marker(s, line!()).await;
+        assert!(r.downloads.is_empty(), "the downloaded file is reused");
+        assert!(r.marker.is_some(), "the marker is kept");
+
+        // The round only in the file name.
+        let mut s = MarkerSetup::new(SyncState::DownloadingLedger, Some(STALE_LABEL_A));
+        s.label = None;
+        s.round = None;
+        let r = run_over_marker(s, line!()).await;
+        assert!(r.downloads.is_empty(), "the downloaded file is reused");
+        assert!(r.marker.is_some(), "the marker is kept");
+
+        // A corrupted label with a recorded round is treated the same way.
+        let mut s = MarkerSetup::new(SyncState::DownloadingLedger, Some(STALE_LABEL_A));
+        s.label = Some("not a label");
+        let r = run_over_marker(s, line!()).await;
+        assert!(r.downloads.is_empty(), "the downloaded file is reused");
+    }
+
+    /// Issue #2137: a label-less marker for another round is another
+    /// catchpoint, and a marker recording nothing resumable is stale.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_marker_without_a_label_for_another_round_or_nothing_is_stale() {
+        let mut s = MarkerSetup::new(SyncState::DownloadingLedger, Some(STALE_LABEL_B));
+        s.label = None;
+        let r = run_over_marker(s, line!()).await;
+        assert_eq!(r.downloads, vec![6_000]);
+        assert!(!r.file_exists);
+
+        let mut s = MarkerSetup::new(SyncState::DownloadingLedger, Some(STALE_LABEL_A));
+        s.label = Some("not a label");
+        s.round = None;
+        s.names_file = false;
+        let r = run_over_marker(s, line!()).await;
+        assert_eq!(r.downloads, vec![5_000], "nothing resumable: start over");
+    }
+
+    /// Issue #2137: an unparseable REQUESTED label fails fast with the
+    /// download phase's error, before anything is touched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_invalid_requested_label_fails_before_touching_the_marker() {
+        let r = run_over_marker_for_a(
+            SyncState::DownloadingLedger,
+            Some("not-a-catchpoint-label"),
+            line!(),
+        )
+        .await;
+        assert!(
+            r.err
+                .as_deref()
+                .unwrap()
+                .contains("invalid catchpoint label 'not-a-catchpoint-label'"),
+            "{:?}",
+            r.err
+        );
+        assert_marker_a_untouched(&r, &SyncState::DownloadingLedger);
+    }
+
+    /// Issue #2137: if the marker cannot be cleared the run fails and the
+    /// staging tables and file are left alone, so a stale marker is never
+    /// stranded next to deleted data.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_marker_clear_leaves_the_data_alone() {
+        let mut s = MarkerSetup::new(SyncState::DownloadingLedger, Some(STALE_LABEL_B));
+        s.sabotage_marker_writes = true;
+        let r = run_over_marker(s, line!()).await;
+        assert!(
+            r.err.as_deref().unwrap().contains("marker write refused"),
+            "{:?}",
+            r.err
+        );
+        assert_marker_a_untouched(&r, &SyncState::DownloadingLedger);
+    }
+
+    /// Issue #2137: the same for the cut-over branch (marker rewrite fails).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_marker_rewrite_leaves_the_data_alone() {
+        let mut s = MarkerSetup::new(SyncState::ImportingLedger, Some(STALE_LABEL_B));
+        s.sabotage_marker_writes = true;
+        let r = run_over_marker(s, line!()).await;
+        assert!(
+            r.err.as_deref().unwrap().contains("marker write refused"),
+            "{:?}",
+            r.err
+        );
+        assert_marker_a_untouched(&r, &SyncState::ImportingLedger);
+    }
+
+    /// Issue #2137: a relative `db_path` with a marker naming its file by an
+    /// absolute path still removes that file (both sides are canonicalized).
+    /// The marker records no round, so only the persisted path can find it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relative_db_path_still_removes_the_stale_file() {
+        let mut s = MarkerSetup::new(SyncState::DownloadingLedger, Some(STALE_LABEL_B));
+        s.round = None;
+        s.relative_db_path = true;
+        let r = run_over_marker(s, line!()).await;
+        assert_eq!(r.downloads, vec![6_000]);
+        assert!(!r.file_exists, "the stale file is removed");
     }
 
     /// Issue #2121, go `Abort()` -> `abort` -> `ResetStagingBalances`: a
