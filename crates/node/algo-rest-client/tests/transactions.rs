@@ -310,3 +310,54 @@ async fn suggested_transaction_params_rejects_wrong_length_hash() {
         .then_some(())
         .unwrap_or_else(|| panic!("expected RestClient error, got {err:?}"));
 }
+
+// ---------- go-shaped pending-transaction JSON (issue #2160) -------------------
+
+/// go renders `logs` (`[][]byte`) as base64 strings, the embedded `txn` with
+/// base64 digests/keys, and carries inner transactions; the client must parse
+/// all of it (this is what `wait_for_confirmation` and `goal-rust app method`
+/// read from an algod-rust node).
+#[tokio::test]
+async fn get_pending_transaction_parses_go_shaped_json_with_logs_inner_txns_and_keys() {
+    let server = MockServer::start().await;
+    let gh = "fkDjWbnfVl9FiCYk1BWj4TnGBnvEhSfpS4e/OFEHqbc=";
+    let body = serde_json::json!({
+        "pool-error": "",
+        "confirmed-round": 77,
+        "application-index": 5,
+        "logs": ["AQID", "/w=="],
+        "txn": {"txn": {"type": "keyreg", "gh": gh, "votekey": gh, "selkey": gh}},
+        "inner-txns": [{"pool-error": "", "txn": {"txn": {"type": "pay", "gh": gh}}}],
+    });
+    Mock::given(method("GET"))
+        .and(path("/v2/transactions/pending/TXID"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+    let info: PendingTxnInfo = client_for(&server)
+        .get_pending_transaction(&TxId("TXID".into()))
+        .await
+        .expect("go-shaped JSON parses");
+    assert_eq!(info.confirmed_round, Some(77));
+    assert_eq!(info.application_index, Some(5));
+    assert_eq!(info.logs, Some(vec![vec![1, 2, 3], vec![0xff]]));
+}
+
+/// Older algod-rust servers sent logs as integer arrays; still accepted.
+#[tokio::test]
+async fn get_pending_transaction_still_accepts_integer_array_logs() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/transactions/pending/TXID"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"pool-error": "", "logs": [[1, 2, 3], [255]]})),
+        )
+        .mount(&server)
+        .await;
+    let info = client_for(&server)
+        .get_pending_transaction(&TxId("TXID".into()))
+        .await
+        .unwrap();
+    assert_eq!(info.logs, Some(vec![vec![1, 2, 3], vec![0xff]]));
+}

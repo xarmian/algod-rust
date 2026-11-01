@@ -316,22 +316,115 @@ fn json_number(f: f64) -> String {
     }
 }
 
-/// Render one msgpack-encoded `SignedTxn` as go's `protocol.JSONStrictHandle`
-/// JSON value (issue #2160): addresses as checksummed base32, every other
-/// byte-valued field (digests, notes, programs, keys, signatures) as base64.
-///
-/// Used for the transaction embedded in `PreEncodedTxInfo` (simulate
-/// `txn-result`, pending-transaction responses), whose `Txn` go encodes with the
-/// same codec handle as a block's payset, so the block renderer's key-driven
-/// rules apply unchanged.
-pub(crate) fn signed_txn_msgpack_to_json_value(
-    msgpack: &[u8],
-) -> Result<serde_json::Value, BlockJsonError> {
-    let tree = rmpv::decode::read_value(&mut &msgpack[..])
-        .map_err(|e| BlockJsonError::Decode(e.to_string()))?;
-    let mut out = String::new();
-    write_value(&mut out, &tree, None, None, 0);
-    serde_json::from_str(&out).map_err(|e| BlockJsonError::Decode(e.to_string()))
+/// Top-level keys of go's `transactions.SignedTxn` (`signedtxn.go`). The rust
+/// `SignedTransaction` also carries the in-block-only flags (`hgi`, `hgh`) and
+/// the `ApplyData` fields (`ca`, `aca`, `rs`, `rr`, `rc`, `dt`, `caid`, `apid`)
+/// that go's `SignedTxnInBlock` has but `PreEncodedTxInfo.Txn` never does: go
+/// reports apply data as separate top-level fields of the response.
+const SIGNED_TXN_KEYS: &[&str] = &["sig", "msig", "lsig", "pqsig", "txn", "sgnr"];
+
+/// A string leaf the way go-codec's JSON encoder writes it: one `U+FFFD` per
+/// invalid UTF-8 byte (`utf8.DecodeRune` consumes a single byte each time).
+fn go_lossy_string(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                out.push_str(valid);
+                break;
+            }
+            Err(e) => {
+                let upto = e.valid_up_to();
+                out.push_str(std::str::from_utf8(&rest[..upto]).unwrap_or_default());
+                out.push('\u{fffd}');
+                rest = &rest[upto + 1..];
+            }
+        }
+    }
+    out
+}
+
+/// Render an msgpack value straight into a `serde_json::Value` with the same
+/// rules as [`write_value`] (without building and re-parsing text).
+fn to_json_value(
+    value: &rmpv::Value,
+    key: Option<&str>,
+    parent: Option<&str>,
+) -> serde_json::Value {
+    use serde_json::Value as J;
+    match value {
+        rmpv::Value::Nil | rmpv::Value::Ext(_, _) => J::Null,
+        rmpv::Value::Boolean(b) => J::Bool(*b),
+        rmpv::Value::Integer(i) => match (i.as_u64(), i.as_i64()) {
+            (Some(u), _) => J::from(u),
+            (None, Some(s)) => J::from(s),
+            _ => J::Null,
+        },
+        rmpv::Value::F32(f) => json_float(*f as f64),
+        rmpv::Value::F64(f) => json_float(*f),
+        rmpv::Value::String(s) => J::String(go_lossy_string(s.as_bytes())),
+        rmpv::Value::Binary(b) => J::String(binary_to_string(b, key.unwrap_or_default(), parent)),
+        rmpv::Value::Array(items) => J::Array(
+            items
+                .iter()
+                .map(|e| to_json_value(e, key, parent))
+                .collect(),
+        ),
+        rmpv::Value::Map(entries) => {
+            let mut map = serde_json::Map::new();
+            for (k, v) in entries {
+                let key_ctx = map_key_to_string(k);
+                let name = match k {
+                    rmpv::Value::String(s) => go_lossy_string(s.as_bytes()),
+                    other => map_key_to_string(other),
+                };
+                map.insert(name, to_json_value(v, Some(&key_ctx), key));
+            }
+            J::Object(map)
+        }
+    }
+}
+
+fn json_float(f: f64) -> serde_json::Value {
+    if f.fract() == 0.0 && f.is_finite() {
+        serde_json::Value::from(f as i64)
+    } else {
+        serde_json::Number::from_f64(f).map_or(serde_json::Value::Null, serde_json::Value::Number)
+    }
+}
+
+/// Render a msgpack `SignedTxn` tree as go's JSON form of `transactions.SignedTxn`:
+/// only `SignedTxn`'s own keys are kept, bytes are rendered by [`to_json_value`].
+fn signed_txn_tree_to_json(tree: &rmpv::Value) -> serde_json::Value {
+    match tree {
+        rmpv::Value::Map(entries) => {
+            let kept: Vec<(rmpv::Value, rmpv::Value)> = entries
+                .iter()
+                .filter(|(k, _)| k.as_str().is_some_and(|k| SIGNED_TXN_KEYS.contains(&k)))
+                .cloned()
+                .collect();
+            to_json_value(&rmpv::Value::Map(kept), None, None)
+        }
+        other => to_json_value(other, None, None),
+    }
+}
+
+/// The JSON value go's codec JSON handle produces for the `SignedTxn` embedded in
+/// `PreEncodedTxInfo.Txn` (issue #2160). Total: go's encoder cannot fail on a
+/// valid transaction, so a (never expected) msgpack round-trip failure is logged
+/// and degrades to the plain serde form instead of failing the response.
+pub(crate) fn signed_txn_go_json(txn: &algo_types::SignedTransaction) -> serde_json::Value {
+    let tree = algo_codec::to_vec_named_str_preserving(txn)
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| rmpv::decode::read_value(&mut &bytes[..]).map_err(|e| e.to_string()));
+    match tree {
+        Ok(tree) => signed_txn_tree_to_json(&tree),
+        Err(e) => {
+            tracing::error!(err = %e, "failed to render a transaction in go's JSON form");
+            serde_json::to_value(txn).unwrap_or(serde_json::Value::Null)
+        }
+    }
 }
 
 /// Errors from canonical block JSON encoding.
@@ -400,6 +493,47 @@ mod tests {
         let as_b64 = binary_to_string(&bytes, "c", Some("sp"));
         assert_eq!(as_b64, base64_std(&bytes));
         assert_ne!(as_addr, as_b64);
+    }
+
+    /// The direct `Value` builder renders exactly what the text printer does
+    /// (issue #2160): same rules, no print-and-reparse.
+    #[test]
+    fn direct_value_rendering_equals_the_text_printer() {
+        use rmpv::Value as M;
+        let s = |x: &str| M::from(x);
+        let tree = M::Map(vec![
+            (s("snd"), M::Binary(vec![1; 32])),
+            (s("gh"), M::Binary(vec![3; 32])),
+            (s("n"), M::from(u64::MAX)),
+            (s("neg"), M::from(-5i64)),
+            (s("f"), M::F64(2.0)),
+            (s("ok"), M::Boolean(true)),
+            (s("nil"), M::Nil),
+            (s("an"), s("h\u{e9}llo \"x\"")),
+            (
+                s("apar"),
+                M::Map(vec![
+                    (s("c"), M::Binary(vec![9; 32])),
+                    (s("t"), M::from(1u64)),
+                ]),
+            ),
+            (
+                s("apat"),
+                M::Array(vec![M::Binary(vec![2; 32]), M::Binary(vec![4; 32])]),
+            ),
+            (M::from(10u64), M::from(1u64)),
+            (M::from(2u64), M::Array(vec![])),
+        ]);
+        let mut text = String::new();
+        write_value(&mut text, &tree, None, None, 0);
+        let old: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(to_json_value(&tree, None, None), old);
+    }
+
+    #[test]
+    fn invalid_utf8_renders_one_replacement_per_byte_like_go() {
+        assert_eq!(go_lossy_string(&[0xe2, 0x82]), "\u{fffd}\u{fffd}");
+        assert_eq!(go_lossy_string(b"ab"), "ab");
     }
 
     /// Unambiguous address keys render as addresses regardless of parent.

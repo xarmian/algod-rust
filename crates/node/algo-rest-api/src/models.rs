@@ -1498,7 +1498,10 @@ pub struct AccountStateDelta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreEncodedTxInfo {
     /// The signed transaction.
-    #[serde(serialize_with = "serialize_signed_txn_go_json")]
+    #[serde(
+        serialize_with = "serialize_signed_txn_go_json",
+        deserialize_with = "deserialize_signed_txn_go_json"
+    )]
     pub txn: SignedTransaction,
 
     /// Non-empty when the transaction was kicked from the pool.
@@ -1550,8 +1553,10 @@ pub struct PreEncodedTxInfo {
 
     /// Logs from application execution.
     #[serde(
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_logs_go_json"
+        default,
+        skip_serializing_if = "logs_absent_or_empty",
+        serialize_with = "serialize_logs_go_json",
+        deserialize_with = "deserialize_logs_go_json"
     )]
     pub logs: Option<Vec<Vec<u8>>>,
 
@@ -1561,26 +1566,52 @@ pub struct PreEncodedTxInfo {
 }
 
 /// Serialize the embedded `SignedTxn` the way go's codec handle does (issue
-/// #2160). JSON goes through the msgpack form and the block JSON renderer so
-/// each byte field is rendered as go does (address strings, base64 for the
-/// rest); the plain serde derive would emit digests as integer arrays. Binary
-/// formats keep the derive (raw msgpack `bin`).
+/// #2160). JSON renders each byte field as go does (address strings, base64 for
+/// the rest; only `SignedTxn`'s own keys, no apply data) -- the plain serde
+/// derive would emit digests as integer arrays. Binary formats keep the derive.
 fn serialize_signed_txn_go_json<S: serde::Serializer>(
     txn: &SignedTransaction,
     s: S,
 ) -> Result<S::Ok, S::Error> {
-    use serde::ser::Error;
     if !s.is_human_readable() {
         return serde::Serialize::serialize(txn, s);
     }
-    let bytes = algo_codec::to_vec_named_str_preserving(txn).map_err(S::Error::custom)?;
-    let value =
-        crate::block_json::signed_txn_msgpack_to_json_value(&bytes).map_err(S::Error::custom)?;
-    serde::Serialize::serialize(&value, s)
+    serde::Serialize::serialize(&crate::block_json::signed_txn_go_json(txn), s)
+}
+
+/// Inverse of [`serialize_signed_txn_go_json`]: go's JSON form is converted back
+/// to msgpack with the simulate request's JSON reader; the older serde form
+/// (integer arrays) is still accepted so documents written by earlier servers
+/// keep parsing.
+fn deserialize_signed_txn_go_json<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<SignedTransaction, D::Error> {
+    use serde::de::Error;
+    use serde::Deserialize;
+    if !d.is_human_readable() {
+        return SignedTransaction::deserialize(d);
+    }
+    let value = serde_json::Value::deserialize(d)?;
+    let go_form = crate::json_scan::parse_ordered(&value.to_string())
+        .and_then(|node| crate::simulate_strict::json_to_msgpack(&node, "", ""))
+        .and_then(|tree| {
+            let mut bytes = Vec::new();
+            rmpv::encode::write_value(&mut bytes, &tree).ok()?;
+            rmp_serde::from_slice::<SignedTransaction>(&bytes).ok()
+        });
+    match go_form {
+        Some(txn) => Ok(txn),
+        None => serde_json::from_value(value).map_err(D::Error::custom),
+    }
+}
+
+fn logs_absent_or_empty(logs: &Option<Vec<Vec<u8>>>) -> bool {
+    logs.as_ref().is_none_or(|l| l.is_empty())
 }
 
 /// `[][]byte` logs: base64 strings in JSON (go's codec JSON handle), msgpack
-/// `bin` elements in binary formats.
+/// `bin` elements in binary formats. Serialized only when non-empty (go's
+/// `omitempty`).
 fn serialize_logs_go_json<S: serde::Serializer>(
     logs: &Option<Vec<Vec<u8>>>,
     s: S,
@@ -1599,6 +1630,47 @@ fn serialize_logs_go_json<S: serde::Serializer>(
         }
     }
     seq.end()
+}
+
+/// Accepts logs as base64 strings (go's JSON), msgpack `bin`, or the older
+/// integer-array form.
+fn deserialize_logs_go_json<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Vec<Vec<u8>>>, D::Error> {
+    use serde::de::{Error, SeqAccess, Visitor};
+    use serde::Deserialize;
+
+    struct Log(Vec<u8>);
+    impl<'de> Deserialize<'de> for Log {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> Visitor<'de> for V {
+                type Value = Log;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a base64 string, bytes, or an array of byte values")
+                }
+                fn visit_str<E: Error>(self, v: &str) -> Result<Log, E> {
+                    STANDARD.decode(v).map(Log).map_err(E::custom)
+                }
+                fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<Log, E> {
+                    Ok(Log(v.to_vec()))
+                }
+                fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Log, E> {
+                    Ok(Log(v))
+                }
+                fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Log, A::Error> {
+                    let mut out = Vec::new();
+                    while let Some(b) = seq.next_element::<u8>()? {
+                        out.push(b);
+                    }
+                    Ok(Log(out))
+                }
+            }
+            d.deserialize_any(V)
+        }
+    }
+
+    Ok(Option::<Vec<Log>>::deserialize(d)?.map(|v| v.into_iter().map(|l| l.0).collect()))
 }
 
 // ---------------------------------------------------------------------------

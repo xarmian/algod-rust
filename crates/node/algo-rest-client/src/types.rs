@@ -369,7 +369,7 @@ pub struct PendingTxnInfo {
 
     /// Logs emitted by application execution, in order. `None`/empty when
     /// the transaction didn't call an app or the app logged nothing.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "logs_base64_or_bytes")]
     pub logs: Option<Vec<Vec<u8>>>,
 
     /// The application ID created by an `app create` (or method call with
@@ -393,6 +393,33 @@ impl PendingTxnInfo {
     pub fn is_rejected(&self) -> bool {
         !self.pool_error.is_empty()
     }
+}
+
+/// Serde adapter for `logs`: go's JSON renders `[][]byte` as base64 strings
+/// (and algod-rust now does too); the integer-array form older algod-rust
+/// servers sent is still accepted.
+fn logs_base64_or_bytes<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Vec<Vec<u8>>>, D::Error> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use serde::de::Error as _;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Log {
+        Text(String),
+        Bytes(Vec<u8>),
+    }
+    Option::<Vec<Log>>::deserialize(d)?
+        .map(|logs| {
+            logs.into_iter()
+                .map(|l| match l {
+                    Log::Text(t) => STANDARD.decode(t.as_bytes()).map_err(D::Error::custom),
+                    Log::Bytes(b) => Ok(b),
+                })
+                .collect()
+        })
+        .transpose()
 }
 
 /// Serde adapter for the algod-returned genesis hash, which is JSON-encoded
