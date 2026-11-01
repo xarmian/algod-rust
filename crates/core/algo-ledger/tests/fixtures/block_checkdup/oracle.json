@@ -87,5 +87,187 @@
       "test_error": "",
       "add_error": ""
     }
+  ],
+  "pool_order": [
+    {
+      "name": "auth_then_dup",
+      "pre": null,
+      "group": [
+        "g6RzZ25yxCBVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB6NzaWfEQAD5QxxM1B8NXI6kBT+j9TXG54oH5PZST71zH0vpgMo3iddOwLP5S+Aw3R8ZM00qLmd76DzWUEHIA/qY5MV6KQujdHhui6NhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQg3ohkFptTJeB+OeFf4QMqvC+II8WmZGTWaNn0QFUtVlOibHbNA+ikbm90ZcQOb3JkZXItYmFkLWF1dGijcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWjcGF5",
+        "g6RzZ25yxCBVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB6NzaWfEQAD5QxxM1B8NXI6kBT+j9TXG54oH5PZST71zH0vpgMo3iddOwLP5S+Aw3R8ZM00qLmd76DzWUEHIA/qY5MV6KQujdHhui6NhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQg3ohkFptTJeB+OeFf4QMqvC+II8WmZGTWaNn0QFUtVlOibHbNA+ikbm90ZcQOb3JkZXItYmFkLWF1dGijcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "add_error": "transaction NMQIIZSZGZZWLKZTMLPL6YFG4ABHXSTXEQ5AY7URNI4ASANSGOTQ: should have been authorized by XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI but was actually authorized by KUKU6QQGL2S2DPVAKRRYE27CNBHLSLPZFQIAAJ5KXKXFPSSVIIDTCRKDQY"
+    },
+    {
+      "name": "overspend_then_dup",
+      "pre": null,
+      "group": [
+        "gqNzaWfEQHp4QkkSZjmdk3Gk5cYvVjZGn4ADrukdlsFrZjuceIct0pHU2TwG0w6OIzrySYhqlcG2jWg/ERM74tzOoS15rQKjdHhui6NhbXTPAAAAASoF8gCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaNncnDEIJ4Mjh5dyoPmzNVFdQLG5LZQWdq4RGq24ZdvDShkbflVomx2zQPopG5vdGXED29yZGVyLW92ZXJzcGVuZKNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaNwYXk=",
+        "gqNzaWfEQHp4QkkSZjmdk3Gk5cYvVjZGn4ADrukdlsFrZjuceIct0pHU2TwG0w6OIzrySYhqlcG2jWg/ERM74tzOoS15rQKjdHhui6NhbXTPAAAAASoF8gCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaNncnDEIJ4Mjh5dyoPmzNVFdQLG5LZQWdq4RGq24ZdvDShkbflVomx2zQPopG5vdGXED29yZGVyLW92ZXJzcGVuZKNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "add_error": "transaction H3JHBQJSM2BB4XBY2PLIOE2MHCUTXSHDZ425WN2ZCNZUXKC4YEEQ: overspend (account XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI, data {AccountBaseData:{Status:Offline MicroAlgos:997.997000A RewardsBase:0 RewardedMicroAlgos:0.0A AuthAddr:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ IncentiveEligible:false TotalAppSchema:{NumUint:0 NumByteSlice:0} TotalExtraAppPages:0 TotalAppParams:0 TotalAppLocalStates:0 TotalAssetParams:0 TotalAssets:0 TotalBoxes:0 TotalBoxBytes:0 LastProposed:0 LastHeartbeat:0} VotingData:{VoteID:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] SelectionID:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] StateProofID:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] VoteFirstValid:0 VoteLastValid:0 VoteKeyDilution:0}}, tried to spend 5000A)"
+    },
+    {
+      "name": "overspend_then_lease_conflict",
+      "pre": null,
+      "group": [
+        "gqNzaWfEQOsU1XVItt0iizxagFJbZi8A9+8PTp5QX5Gduuc/x5qET/FDWOBFjYsFyUNT9lo6WqQRd8JQmr5KpjN412YgXQWjdHhujKNhbXTPAAAAASoF8gCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaNncnDEIGdkFTYfGh7n4a+4M2a0b2EM6dYxxtqa3NR9NgoXPJ6Tomx2zQPoomx4xCBxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcaRub3RlxBFvcmRlci1vdmVyLWxlYXNlZKNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaNwYXk=",
+        "gqNzaWfEQAVmrFTZ5B289NcnQ4/P5KRhpgZaw29vZKUAtuGAO7flm8yfWMCxbe35xn3VrMUjMAhluNNBVKyItGYpBWK5+w+jdHhujKNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQgZ2QVNh8aHufhr7gzZrRvYQzp1jHG2prc1H02Chc8npOibHbNA+iibHjEIHFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxpG5vdGXEEG9yZGVyLWxlYXNlLXR3aW6jcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "add_error": "transaction V225VWV3K4YWVNQBYG7OAGBXBH2KAYSP2QASIBYT4CY62P4BUVQA: overspend (account XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI, data {AccountBaseData:{Status:Offline MicroAlgos:997.997000A RewardsBase:0 RewardedMicroAlgos:0.0A AuthAddr:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ IncentiveEligible:false TotalAppSchema:{NumUint:0 NumByteSlice:0} TotalExtraAppPages:0 TotalAppParams:0 TotalAppLocalStates:0 TotalAssetParams:0 TotalAssets:0 TotalBoxes:0 TotalBoxBytes:0 LastProposed:0 LastHeartbeat:0} VotingData:{VoteID:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] SelectionID:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] StateProofID:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] VoteFirstValid:0 VoteLastValid:0 VoteKeyDilution:0}}, tried to spend 5000A)"
+    },
+    {
+      "name": "lease_conflict_then_overspend",
+      "pre": null,
+      "group": [
+        "gqNzaWfEQOoIHrYV23tYMcf3iB7xsy+lEv1Ix1yCD/s/bqlJPY03lDQ+H9Fcg9+6AZwbl0ppmFHyDkNiuzEjrnKQ+W4oiQ6jdHhujKNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQgOZe6ThPNmcxgvhc4nRnC6PD9o1/zuJUn3illnNyunIqibHbNA+iibHjEIHFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxpG5vdGXEEW9yZGVyLWxlYXNlLWZpcnN0o3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ==",
+        "gqNzaWfEQHzXrPZZ/Tfl3zfONEAKDX8uQ67JEUbeVJtLgloBtjJoZKARg8k0N8aY/3MQSbwvoOIPlQa4JG1kizWjDl+MYQyjdHhujKNhbXTPAAAAASoF8gCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaNncnDEIDmXuk4TzZnMYL4XOJ0Zwujw/aNf87iVJ94pZZzcrpyKomx2zQPoomx4xCBxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcaRub3RlxBBvcmRlci1sZWFzZS1vdmVyo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "add_error": "transaction CTC6YQAPI6GWXVONMSKDHG5BM3FKKDLUK7FSY4ZLEKRRR5L5EXHQ using an overlapping lease (sender, lease):(XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI, OFYXC4LROFYXC4LROFYXC4LROFYXC4LROFYXC4LROFYXC4LROFY2WQIK2A)"
+    },
+    {
+      "name": "ledger_lease_then_early",
+      "pre": null,
+      "group": [
+        "gqNzaWfEQGS7z8fKHeZ76ZI2CU0PdCXzAoRKt6Rxw8y05zs6dsFmx/EeusuuowJA/0d/cR08XWmKIRNXpvt9DPB2+Tk1MwajdHhujKNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQgh2/JLUhWM8OOD7GSxXhVooMGaMj3JJOJGMwaapqNJXmibHbNA+iibHjEIBERERERERERERERERERERERERERERERERERERERERERpG5vdGXEEm9yZGVyLWxlZGdlci1sZWFzZaNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaNwYXk=",
+        "gqNzaWfEQMzuPMesuAUp4SM9xP7fL6b3A7o3/vf4K6sXxcLchPAQQwH16v4dbhWJ+OowvmDty6l2zTLgd08NxFA+Yq7Nuw+jdHhui6NhbXTOAA9CQKNmZWXNA+iiZnbNE4ijZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGjZ3JwxCCHb8ktSFYzw44PsZLFeFWigwZoyPckk4kYzBpqmo0leaJsds0XcKRub3RlxAtvcmRlci1lYXJseaNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaNwYXk="
+      ],
+      "test_error": "transaction XXJF4LUWHJOIXTGVZFXKG5JANCK3XZFQK5RYVXWKCVCSC5GJHCKA using an overlapping lease (sender, lease):(XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI, CEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEI7JH2AYM)",
+      "add_error": "transaction XXJF4LUWHJOIXTGVZFXKG5JANCK3XZFQK5RYVXWKCVCSC5GJHCKA using an overlapping lease (sender, lease):(XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI, CEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEI7JH2AYM)"
+    },
+    {
+      "name": "early_member",
+      "pre": null,
+      "group": [
+        "gqNzaWfEQAq8Ap73MWPqLOKFL1ZMM6k1DFU24hptxROFt00hs2IO7NMzhf7E0x1Qxp2pVCZLymlHTerTcCkPdBudMpBL/QqjdHhui6NhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQgmn5Ta7K0UdcIovJj3oFmNhNAqSxJ1MEtz3y6yKACDMyibHbNA+ikbm90ZcQKb3JkZXItZmluZaNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaNwYXk=",
+        "gqNzaWfEQCv07FPCOGmKc+B9400EeM40Bz2Bv4GvtVB/HWS0CSB2yc5tVBwYUBigqTM18XonKbmlhVIrsHDrhWTuGvMBDgmjdHhui6NhbXTOAA9CQKNmZWXNA+iiZnbNE4ijZ2VuuGJsb2NrLWNoZWNrZHVwLW9yYWNsZS12MaJnaMQg6L/9KsoIiE51OfsyuhRWIV3/Vh5vCQn6tznipKl6QGGjZ3JwxCCaflNrsrRR1wii8mPegWY2E0CpLEnUwS3PfLrIoAIMzKJsds0XcKRub3RlxAtvcmRlci1lYXJseaNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaNwYXk="
+      ],
+      "test_error": "txn dead: round 2 outside of 5000--6000",
+      "add_error": "txn dead: round 2 outside of 5000--6000"
+    },
+    {
+      "name": "lease_conflict_before_authorizer",
+      "pre": null,
+      "group": [
+        "g6RzZ25yxCBVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB6NzaWfEQNaWhy/SbMJj3nf58ItRPOGcc0Guii69B6o1bOjtq/HiQa2kmgoc/gDXQoCv195bJc4R81MuWocJSvQ9pJGmhQujdHhui6NhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPoomx4xCAREREREREREREREREREREREREREREREREREREREREREaRub3RlxBBvcmRlci1sZWFzZS1hdXRoo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+      ],
+      "test_error": "transaction GVJCYYREARHZXESEHV7NDKVKLEFYSDBKYOTEDVX3TXLA5SPFONJQ using an overlapping lease (sender, lease):(XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI, CEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEI7JH2AYM)",
+      "add_error": "transaction GVJCYYREARHZXESEHV7NDKVKLEFYSDBKYOTEDVX3TXLA5SPFONJQ using an overlapping lease (sender, lease):(XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI, CEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEI7JH2AYM)"
+    },
+    {
+      "name": "authorizer_before_apply",
+      "pre": null,
+      "group": [
+        "g6RzZ25yxCBVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB6NzaWfEQLUufXLiGfvHZgFRnUxjYbO8gIqislWzCSckgcTeDavrYgrUSpnOk0MGC5Pm8IvtxDL4n3EFpfEHGOL24cAu0AujdHhuiqNhbXTPAAAAASoF8gCjZmVlzQPoomZ2AaNnZW64YmxvY2stY2hlY2tkdXAtb3JhY2xlLXYxomdoxCDov/0qygiITnU5+zK6FFYhXf9WHm8JCfq3OeKkqXpAYaJsds0D6KRub3RlxA9vcmRlci1vdmVyc3BlbmSjcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "add_error": "transaction NIFJUTRMY2XI5QKHFHUR4GOW7S4XZQCRR46BIDC43CMI6VYF23UQ: should have been authorized by XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI but was actually authorized by KUKU6QQGL2S2DPVAKRRYE27CNBHLSLPZFQIAAJ5KXKXFPSSVIIDTCRKDQY"
+    },
+    {
+      "name": "committed_txid",
+      "pre": null,
+      "group": [
+        "gqNzaWfEQOz1vBBmk06PKqiQYhQtDYWwPbq/3dUY7pQ1ROEFb/t9dQMLkCNY0PW2XYgKTabEXIlyfpRxdcW8IkPEBPdy9A2jdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXECWNvbW1pdHRlZKNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaNwYXk="
+      ],
+      "test_error": "transaction already in ledger: 2ELWD6LGIYPLLBOIJJSCZNTAZDC3NY7OUG5EOWMNWHTQD2ITP24Q",
+      "add_error": "transaction already in ledger: 2ELWD6LGIYPLLBOIJJSCZNTAZDC3NY7OUG5EOWMNWHTQD2ITP24Q"
+    },
+    {
+      "name": "pending_txid",
+      "pre": [
+        [
+          "gqNzaWfEQBv1v2g5kq26sjjidyqtxlGdeODFXhs6BtTw6U44joMug3sIlR2P5psqPnj/MtNNWwZ7z4KLoTW1sMHSW2qy3gKjdHhui6NhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPoomx4xCBycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycqRub3RlxA1vcmRlci1wZW5kaW5no3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+        ]
+      ],
+      "group": [
+        "gqNzaWfEQBv1v2g5kq26sjjidyqtxlGdeODFXhs6BtTw6U44joMug3sIlR2P5psqPnj/MtNNWwZ7z4KLoTW1sMHSW2qy3gKjdHhui6NhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPoomx4xCBycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycqRub3RlxA1vcmRlci1wZW5kaW5no3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+      ],
+      "test_error": "transaction already in ledger: W7WU25GT5LKGOW5KRBIWBEJT55EFKLYKRW2FAZVKDTHNOXZYVUOQ",
+      "add_error": "transaction already in ledger: W7WU25GT5LKGOW5KRBIWBEJT55EFKLYKRW2FAZVKDTHNOXZYVUOQ"
+    },
+    {
+      "name": "pending_lease",
+      "pre": [
+        [
+          "gqNzaWfEQBv1v2g5kq26sjjidyqtxlGdeODFXhs6BtTw6U44joMug3sIlR2P5psqPnj/MtNNWwZ7z4KLoTW1sMHSW2qy3gKjdHhui6NhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPoomx4xCBycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycqRub3RlxA1vcmRlci1wZW5kaW5no3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+        ]
+      ],
+      "group": [
+        "gqNzaWfEQPGcDkpbzKnjf4Z2jHaoXeliet/N8BHxyUV5MBfTEHPf8bAsO+uuOcVi6krR/uWppSAxhu/42CXfOVkszVBcZgOjdHhui6NhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPoomx4xCBycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycqRub3RlxBJvcmRlci1wZW5kaW5nLXR3aW6jcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWjcGF5"
+      ],
+      "test_error": "transaction WRIHRTOEXZQUHMJZ4OVBY6BB65T2BMJVCDE2AJNUILOBEC6OMSHA using an overlapping lease (sender, lease):(XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI, OJZHE4TSOJZHE4TSOJZHE4TSOJZHE4TSOJZHE4TSOJZHE4TSOJZPZOHWCI)",
+      "add_error": "transaction WRIHRTOEXZQUHMJZ4OVBY6BB65T2BMJVCDE2AJNUILOBEC6OMSHA using an overlapping lease (sender, lease):(XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI, OJZHE4TSOJZHE4TSOJZHE4TSOJZHE4TSOJZHE4TSOJZHE4TSOJZPZOHWCI)"
+    },
+    {
+      "name": "expired_alone",
+      "pre": null,
+      "group": [
+        "gqNzaWfEQLVyzc8MkqpKj2eD82BVw8oxCyQKcRWMIMYZ+fYKkUoPFtuawZ1Iyw+Ta4ebsh0nHJiITGssyFXyzZRxyUiIcgejdHhuiqNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2AaRub3RlxA1vcmRlci1leHBpcmVko3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+      ],
+      "test_error": "txn dead: round 2 outside of 1--1",
+      "add_error": "txn dead: round 2 outside of 1--1"
+    },
+    {
+      "name": "ledger_lease_then_expired",
+      "pre": null,
+      "group": [
+        "gqNzaWfEQJ4etk/MUcFDtSlU4rh2seIgeTHNvLiZ/wtz2DSaljoOl5vV8tVOWCQ6lJMAe2c/IUpuWsoJciNcWdRGi5BZCwGjdHhujKNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQgFTkkFtdnCU6nzQFXCM1FF5Q9QT1j1g4aqQt3C6d/Tq2ibHbNA+iibHjEIBERERERERERERERERERERERERERERERERERERERERERpG5vdGXEFG9yZGVyLWxlZGdlci1sZWFzZS0yo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ==",
+        "gqNzaWfEQEYKFr0KEzQpfxU5SbYcZCWONU04h+/4+Fjsd6eJ8mTsUNQG1otdLY8sSvEmh/qIL+ps/QWQ02Copc53uzF1cACjdHhui6NhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQgFTkkFtdnCU6nzQFXCM1FF5Q9QT1j1g4aqQt3C6d/Tq2ibHYBpG5vdGXED29yZGVyLWV4cGlyZWQtMqNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaNwYXk="
+      ],
+      "test_error": "transaction TKR2RH7ENST3ZZUHSXFDB5CE264SOAKOCMK7UJGNCUUCUMAA475A using an overlapping lease (sender, lease):(XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI, CEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEI7JH2AYM)",
+      "add_error": "transaction TKR2RH7ENST3ZZUHSXFDB5CE264SOAKOCMK7UJGNCUUCUMAA475A using an overlapping lease (sender, lease):(XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI, CEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEI7JH2AYM)"
+    },
+    {
+      "name": "in_group_txid_twin",
+      "pre": null,
+      "group": [
+        "gqNzaWfEQOT8JGiKJ1WnQh26I9cI+Ot46vWmYiS7GsRo5IAo6tMSdG/bsHTfe6LCMBw2dCATeArlyoShFe+Y2AYFHi5BfgyjdHhui6NhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQg9uIXH4B3Lzi1+vVf4c7ksHOPvSKupzwpFNDu+zhuQfSibHbNA+ikbm90ZcQKb3JkZXItdHdpbqNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaNwYXk=",
+        "gqNzaWfEQOT8JGiKJ1WnQh26I9cI+Ot46vWmYiS7GsRo5IAo6tMSdG/bsHTfe6LCMBw2dCATeArlyoShFe+Y2AYFHi5BfgyjdHhui6NhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQg9uIXH4B3Lzi1+vVf4c7ksHOPvSKupzwpFNDu+zhuQfSibHbNA+ikbm90ZcQKb3JkZXItdHdpbqNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "add_error": "transaction already in ledger: U7WVSWIX5OYMGGVLFNZ2J3SIYOTPG2MGLOIQUV2CXBVYD2UCRH5Q"
+    },
+    {
+      "name": "non_payment_fee_overspend",
+      "pre": null,
+      "group": [
+        "gqNzaWfEQCzwW5mrxGjbB9CrFL8H91hl/OdHHJXrEKxuGGpjeiR4OKWaIIAmpwx6kVbfpWN95UjoxAySsBIK71+JCGgOlQ6jdHhuiaRhcGFygaF0AaNmZWXPAAAAASoF8gCiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEDm9yZGVyLWFjZmctZmVlo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaRhY2Zn"
+      ],
+      "test_error": "",
+      "add_error": "transaction AB3PDUKLA4E6QNGGVFOEC3CCMRA3LKBCXLSEVNYDLHECCRJGFNPQ: overspend (account XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI, data {AccountBaseData:{Status:Offline MicroAlgos:997.998000A RewardsBase:0 RewardedMicroAlgos:0.0A AuthAddr:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ IncentiveEligible:false TotalAppSchema:{NumUint:0 NumByteSlice:0} TotalExtraAppPages:0 TotalAppParams:0 TotalAppLocalStates:0 TotalAssetParams:0 TotalAssets:0 TotalBoxes:0 TotalBoxBytes:0 LastProposed:0 LastHeartbeat:0} VotingData:{VoteID:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] SelectionID:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] StateProofID:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] VoteFirstValid:0 VoteLastValid:0 VoteKeyDilution:0}}, tried to spend 5000A)"
+    },
+    {
+      "name": "min_balance_member0",
+      "pre": null,
+      "group": [
+        "gqNzaWfEQPtmAt+fBKz/qaNtbjpuNAW3qaKa1YonQ5BkOCNsuuEQINVFBD3r4Iz1w/sLZqgXgitilPskyWpKTjMH5R5ydgujdHhuiqNhbXTOO3w5lqNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEEW9yZGVyLW1pbi1iYWxhbmNlo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "add_error": "transaction GAJ2IBMTYPWC2OKMDQDTQJHRRSP4LVMPHPFJKB7GQOY5WA4WZQIQ: account XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI balance 50 below min 100000 (0 assets)"
+    },
+    {
+      "name": "min_balance_then_dup",
+      "pre": null,
+      "group": [
+        "gqNzaWfEQFiLfRsiHV4Q1XMO5cXAWBS4BcPtiM5kfSE6cbmurx6hhb24O1mM9maIr5TRaPhk9/rimVRXYWSlehthPL3g2gKjdHhui6NhbXTOO3w5lqNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQgfYncR7zNssct7CidflhQw3uZgRYugXVxU4d9Bdgfhl2ibHbNA+ikbm90ZcQRb3JkZXItbWluLWJhbGFuY2WjcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWjcGF5",
+        "gqNzaWfEQFiLfRsiHV4Q1XMO5cXAWBS4BcPtiM5kfSE6cbmurx6hhb24O1mM9maIr5TRaPhk9/rimVRXYWSlehthPL3g2gKjdHhui6NhbXTOO3w5lqNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQgfYncR7zNssct7CidflhQw3uZgRYugXVxU4d9Bdgfhl2ibHbNA+ikbm90ZcQRb3JkZXItbWluLWJhbGFuY2WjcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "add_error": "transaction YR34TLZ7WOWMNFVOTBQH2HHKXHXKDCLULSLPWIAXVJER7R6FUFOA: account XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI balance 50 below min 100000 (0 assets)"
+    },
+    {
+      "name": "clean_group",
+      "pre": null,
+      "group": [
+        "gqNzaWfEQF35h4UnxsaFf4SIwdCqOg8/5NVNYWKyOqmxF9bc5fy2JY428TSbpTPfFvHyweT73/2ftlENJbxuOjAdrMF8ggGjdHhujKNhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQgzy9I8vyBR2GSdXFtxkuRsVNZkJL95WtQwi89tNx2am+ibHbNA+iibHjEIHNzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3NzpG5vdGXEDW9yZGVyLWNsZWFuLWGjcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWjcGF5",
+        "gqNzaWfEQNOEvuQb8wazRwzeCONLD0SN7YSU5LIgUZZDdEwYm4FUch0cf0ohtHA3JkT1oyo90w83owFQl0Kga9Q0T6apnA2jdHhui6NhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQgzy9I8vyBR2GSdXFtxkuRsVNZkJL95WtQwi89tNx2am+ibHbNA+ikbm90ZcQNb3JkZXItY2xlYW4tYqNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "add_error": ""
+    }
   ]
 }

@@ -82,9 +82,9 @@ so the tables below never drift from what `main` actually covers.
 
 | status | count | share |
 |---|---|---|
-| `matched-1:1` | 1,214 | 38% |
+| `matched-1:1` | 1,215 | 38% |
 | `matched-1:many` | 958 | 30% |
-| `out-of-scope` | 736 | 23% |
+| `out-of-scope` | 735 | 23% |
 | `matched-many:1` | 286 | 9% |
 | `partial` | 3 | 0% |
 | `not-implemented` | 0 | 0% |
@@ -111,11 +111,11 @@ were triaged into tracked issues.
 | Networking (`network`, `network/p2p`, ...) | [parity_network.md](phase17/parity_network.md) | 263 | 115 | 94 | 12 | 0 | 0 | 0 | 42 |
 | Crypto (`crypto`, `crypto/stateproof`, ...) | [parity_crypto.md](phase17/parity_crypto.md) | 279 | 164 | 44 | 26 | 0 | 0 | 0 | 45 |
 | Daemon/node/rpcs (`daemon/algod`, `node`, `rpcs`) | [parity_daemon_node.md](phase17/parity_daemon_node.md) | 144 | 62 | 70 | 1 | 0 | 0 | 0 | 11 |
-| Data structures (`data/basics`, `data/bookkeeping`, ...) | [parity_data_misc.md](phase17/parity_data_misc.md) | 274 | 144 | 43 | 48 | 0 | 0 | 0 | 39 |
+| Data structures (`data/basics`, `data/bookkeeping`, ...) | [parity_data_misc.md](phase17/parity_data_misc.md) | 274 | 145 | 43 | 48 | 0 | 0 | 0 | 38 |
 | Config/stateproof/protocol | [parity_config_proto_sp.md](phase17/parity_config_proto_sp.md) | 119 | 32 | 41 | 0 | 0 | 0 | 0 | 46 |
 | Util (`util/*`) | [parity_util.md](phase17/parity_util.md) | 118 | 34 | 14 | 0 | 0 | 0 | 0 | 70 |
 | Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 46 | 31 | 7 | 0 | 0 | 0 | 89 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
 | Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 31 | 22 | 0 | 0 | 0 | 0 | 4 |
-| **Total** | | **3,197** | **1214** | **958** | **286** | **3** | **0** | **0** | **736** |
+| **Total** | | **3,197** | **1215** | **958** | **286** | **3** | **0** | **0** | **735** |
 

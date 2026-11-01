@@ -1211,7 +1211,8 @@ gate, the rows of the runs that completed are still written to `localnet.json`
 (marked `incomplete`, naming `failed_run`) and the tier exits non-zero.
 
 A submission a node reports as already known (go's
-"transaction already in ledger", algod-rust's "transaction already in the pool")
+"transaction already in ledger", which algod-rust reports too since #2130; before,
+its pool said "transaction already in the pool" for a pending one)
 counts as accepted; lease conflicts do not. The tier passes `--group-size 1`
 explicitly and the gate expects `fixed_count * group_size` transactions, and
 checks the generator reports the same number. Two clusters sharing a genesis and a

@@ -64,6 +64,17 @@ pub trait BlockEvaluator: Send {
     /// Reset the running transaction byte count, allowing more transactions
     /// to be added after hitting the per-block byte limit.
     fn reset_txn_bytes(&mut self);
+
+    /// Whether [`Self::transaction_group`] runs go's `checkDup` itself, per
+    /// transaction (the pending block's txids and leases, the ledger's), as
+    /// go's `BlockEvaluator.transaction` does between `Alive` and the
+    /// authorizer. Such an evaluator decides which failure of a group is
+    /// reported first, so the pool must not pre-empt it with its own
+    /// duplicate pass (issue #2130). Defaults to `false`: an evaluator that
+    /// does not check duplicates relies on the pool's pass.
+    fn checks_duplicates(&self) -> bool {
+        false
+    }
 }
 
 // ── PoolLedger ───────────────────────────────────────────────────

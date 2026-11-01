@@ -1254,10 +1254,6 @@ struct LedgerSnapshot {
     /// Cached account balances (sender address -> AccountData).
     /// Populated lazily on first access and cached for the block.
     accounts: HashMap<Address, Option<AccountData>>,
-    /// Lease table snapshot from the ledger at evaluator creation time.
-    lease_table: algo_ledger::LeaseTable,
-    /// The round being evaluated.
-    round: u64,
     /// The ledger's current round at snapshot creation time.
     /// Used to verify point-in-time consistency when falling back to the
     /// ledger mutex (in-memory DB path).
@@ -1269,15 +1265,12 @@ struct LedgerSnapshot {
 }
 
 impl LedgerSnapshot {
-    /// Create a new snapshot by briefly locking the ledger to capture lease
-    /// state, open a read-only snapshot connection, and record the current
-    /// round. The ledger lock is released before returning; subsequent
+    /// Create a new snapshot by briefly locking the ledger to open a
+    /// read-only snapshot connection and record the current round (leases are
+    /// not captured: `checkDup` reads the live lease table). The ledger lock is released before returning; subsequent
     /// account lookups go through the snapshot connection without locking.
-    fn from_ledger(ledger: &Arc<Mutex<SqliteLedger>>, round: u64) -> Self {
+    fn from_ledger(ledger: &Arc<Mutex<SqliteLedger>>) -> Self {
         let l = ledger.lock().expect("ledger lock for snapshot");
-        // Clone the lease table while holding the lock so the snapshot
-        // reflects the actual lease state from prior committed blocks.
-        let lease_table = l.lease_table().clone();
         // Capture the ledger's current round for consistency checks
         // (used only in the in-memory fallback path).
         let snapshot_round = l.current_round();
@@ -1288,8 +1281,6 @@ impl LedgerSnapshot {
         drop(l);
         LedgerSnapshot {
             accounts: HashMap::new(),
-            lease_table,
-            round,
             snapshot_round,
             read_snapshot,
         }
@@ -1329,14 +1320,6 @@ impl LedgerSnapshot {
         };
         self.accounts.insert(*addr, result.clone());
         result
-    }
-
-    /// Check whether a lease is active in the ledger snapshot.
-    ///
-    /// The snapshot's lease table was cloned from the ledger at evaluator
-    /// creation time, so this is a pure read with no lock acquisition.
-    fn check_lease(&self, sender: &Address, lease: &[u8; 32]) -> Result<(), algo_error::AlgoError> {
-        self.lease_table.check(sender, lease, self.round)
     }
 }
 
@@ -1847,6 +1830,56 @@ fn header_block(hdr: &algo_types::BlockHeader) -> algo_types::Block {
 /// pass in `generate_block`, which never proposes an un-applyable group.
 const EXEC_ADMISSION_BUDGET: Duration = Duration::from_secs(10);
 
+/// Evaluation time one evaluator may spend, in all, on reconciling a group
+/// the cheap prechecks rejected (`reconcile_group`, issue #2130). Separate
+/// from [`EXEC_ADMISSION_BUDGET`]: a stream of rejected groups cannot use up
+/// the budget that admits the valid ones. Once spent, a precheck rejection
+/// stands as it is.
+///
+/// The budget is a wall clock, so under load (or with adversarially slow
+/// groups) it can run out earlier and the reported member and error fall back
+/// to the precheck's verdict; the verdict itself (reject) is the same either
+/// way. [`RECONCILE_MAX_RUNS`] bounds the work deterministically as well, so a
+/// test, or a node on an idle machine, behaves reproducibly.
+const RECONCILE_BUDGET: Duration = Duration::from_millis(250);
+
+/// Dry runs one evaluator may spend on reconciliation (a count-based bound
+/// next to the wall-clock [`RECONCILE_BUDGET`]).
+const RECONCILE_MAX_RUNS: u32 = 256;
+
+/// Groups the real apply accepted after the admission precheck had refused
+/// them (the precheck does not model inner-transaction credits, so it can
+/// over-reject): counted, and logged at most once per [`OVER_REJECT_LOG_EVERY`].
+static PRECHECK_OVER_REJECTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OVER_REJECTS_LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OVER_REJECT_LAST_LOG_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+const OVER_REJECT_LOG_EVERY: u64 = 10;
+
+/// Record one over-reject; warn at most once per [`OVER_REJECT_LOG_EVERY`]
+/// seconds, with the number of occurrences since the last warning.
+fn note_precheck_over_reject() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let total = PRECHECK_OVER_REJECTS.fetch_add(1, Relaxed) + 1;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let last = OVER_REJECT_LAST_LOG_SECS.load(Relaxed);
+    if now.saturating_sub(last) >= OVER_REJECT_LOG_EVERY
+        && OVER_REJECT_LAST_LOG_SECS
+            .compare_exchange(last, now, Relaxed, Relaxed)
+            .is_ok()
+    {
+        let since = total - OVER_REJECTS_LOGGED.swap(total, Relaxed);
+        tracing::warn!(
+            occurrences = since,
+            total,
+            "pool: the real apply accepted group(s) the admission precheck refused \
+             (e.g. an inner transaction funds a later member); admitted as go would"
+        );
+    }
+}
+
 /// What the evaluator recorded for one admitted group.
 struct ExecGroup {
     /// Index of the group first transaction in `included_txns`.
@@ -1863,6 +1896,11 @@ struct ExecState {
     template: algo_types::Block,
     groups: Vec<ExecGroup>,
     spent: Duration,
+    /// Evaluation time spent on [`SimpleBlockEvaluator::reconcile_group`],
+    /// bounded by [`RECONCILE_BUDGET`]; never charged to `spent`.
+    reconcile_spent: Duration,
+    /// Dry runs spent on reconciliation, bounded by [`RECONCILE_MAX_RUNS`].
+    reconcile_runs: u32,
     /// Set once a group was admitted without being evaluated (stale base or
     /// spent budget): the overlay no longer matches the admitted set, so
     /// admission stops consulting it. Assembly is unaffected.
@@ -1910,13 +1948,14 @@ impl SimpleBlockEvaluator {
         )
     }
 
-    /// Perform stateless validation only (well-formedness, group ID,
-    /// signatures, validity window, group fees -- go's order, issue #1976). Returns the group with genesis fields restored so that
-    /// `validate_group` can reuse it for txid computation without cloning
-    /// the group a second time.
-    ///
-    /// Used by `test_transaction_group` (which takes `&self`) via
-    /// a thin wrapper that discards the returned Vec.
+    /// The stateless half of both admission stages: no-in-block-flag guard,
+    /// well-formedness, strict group ID, then signatures (go's order, issue
+    /// #1976). It does NOT check the validity window or any duplicate: `Alive`
+    /// and `checkDup` are go's per-transaction checks and run, member by
+    /// member, in the callers (`validate_group_stateless`, `validate_group`).
+    /// Returns the group with genesis fields restored, so the callers hash the
+    /// txids and run the per-member checks without cloning the group again.
+    /// Reads no ledger state, so it never takes the ledger mutex.
     fn validate_group_stateless_inner(
         &self,
         txgroup: &[algo_types::SignedTransaction],
@@ -1941,7 +1980,6 @@ impl SimpleBlockEvaluator {
         })?;
 
         let params = &self.consensus_params;
-        let round = self.hdr.round;
 
         // 1. (formerly) blanket-reject state proof (stpf) transactions here.
         // Issue #814 live mixed-cluster verification: this guard's own
@@ -2051,31 +2089,13 @@ impl SimpleBlockEvaluator {
             }
         }
 
-        // 6. Validity window. go runs `verify.TxnGroup` (well-formedness and
-        // signatures) first and only then lets the pool test the window
-        // (`ledger.eval` -> `BlockHeader.Alive`), so a group wrong in both
-        // ways is reported for its signature; the error is
-        // `bookkeeping.TxnDeadError`, `txn dead: round R outside of F--L`,
-        // for a not-yet-valid and an expired transaction alike (issue #1974).
-        // go's `BlockHeader.Alive` goes on, per transaction, to the genesis ID and
-        // the genesis hash; a mismatch is a plain `fmt.Errorf`, behind only the
-        // pool's `Remember` frame. (A transaction that omits the genesis ID or
-        // hash is accepted: they are restored from the header.)
-        let rejected = |message: String| algo_error::AlgoError::Rejected {
-            source: None,
-            message,
-            class: algo_error::RejectClass::Alive,
-        };
-        for stx in txgroup {
-            algo_validate::block_alive(
-                round.0,
-                &self.hdr.genesis_id,
-                &self.hdr.genesis_hash,
-                params,
-                &stx.txn,
-            )
-            .map_err(rejected)?;
-        }
+        // 6. (moved) The validity window and the genesis ID / hash checks are
+        // go's `BlockHeader.Alive`, which `BlockEvaluator.transaction` runs per
+        // transaction, before that transaction's `checkDup`: see
+        // `alive_member`, called from the per-member loops of
+        // `test_transaction_group` and `validate_group` (issue #2130).
+        // Signatures were checked above, so a group wrong in both ways is still
+        // reported for its signature.
 
         // The returned group (txid computation, block assembly) has its genesis
         // fields restored from the header, exactly what the block's stripped
@@ -2092,15 +2112,143 @@ impl SimpleBlockEvaluator {
         Ok(restored)
     }
 
-    /// Perform stateless validation only, discarding the restored group.
-    /// Convenience wrapper for `test_transaction_group` which only needs
-    /// the pass/fail result.
+    /// go's `TestTransactionGroup`, for `test_transaction_group` (it takes
+    /// `&self`): the stateless checks, then, per transaction in group order,
+    /// `Alive` and `checkDup` against the unmodified state (go's
+    /// `testTransaction`; the pool's pending block counts, a sibling does
+    /// not), then the group fees. Nothing is recorded.
     fn validate_group_stateless(
         &self,
         txgroup: &[algo_types::SignedTransaction],
     ) -> Result<(), algo_error::AlgoError> {
-        self.validate_group_stateless_inner(txgroup)?;
+        let restored = self.validate_group_stateless_inner(txgroup)?;
+        let txids: Vec<[u8; 32]> = restored.iter().map(|r| compute_txid(&r.txn)).collect();
+        let ledger = self.ledger_dups(&restored, &txids)?;
+        for (member, (stx, restored)) in txgroup.iter().zip(&restored).enumerate() {
+            self.alive_member(stx)?;
+            self.check_dup_member(restored, &txids[member], None, ledger[member])?;
+        }
         self.check_group_fees(txgroup)
+    }
+
+    /// go's `BlockHeader.Alive` for one transaction, as the validating
+    /// evaluator runs it at the head of `BlockEvaluator.transaction` and of
+    /// `testTransaction`. go runs `verify.TxnGroup` (well-formedness and
+    /// signatures) first and only then lets the pool test the window, so a
+    /// group wrong in both ways is reported for its signature; the error is
+    /// `bookkeeping.TxnDeadError`, `txn dead: round R outside of F--L`, for a
+    /// not-yet-valid and an expired transaction alike (issue #1974).
+    /// `Alive` goes on, per transaction, to the genesis ID and the genesis
+    /// hash; a mismatch is a plain `fmt.Errorf`, behind only the pool's
+    /// `Remember` frame. (A transaction that omits the genesis ID or hash is
+    /// accepted: they are restored from the header.)
+    fn alive_member(
+        &self,
+        stx: &algo_types::SignedTransaction,
+    ) -> Result<(), algo_error::AlgoError> {
+        algo_validate::block_alive(
+            self.hdr.round.0,
+            &self.hdr.genesis_id,
+            &self.hdr.genesis_hash,
+            &self.consensus_params,
+            &stx.txn,
+        )
+        .map_err(|message| algo_error::AlgoError::Rejected {
+            source: None,
+            message,
+            class: algo_error::RejectClass::Alive,
+        })
+    }
+
+    /// The ledger half of go's `checkDup` for every member of `group` (`txids`
+    /// its txids), read under ONE acquisition of the ledger mutex: per member,
+    /// `txTail.checkDup`'s lease (the live lease table, which holds every lease
+    /// the evaluator's creation-time snapshot had and any committed since) and
+    /// then its txid, as go reports them. A lease is looked at only under
+    /// `SupportTransactionLeases`, as the block half does (`check_dup.rs`). A
+    /// poisoned ledger lock cannot be read: the group is rejected rather than
+    /// admitted unchecked.
+    ///
+    /// LOCK ORDER: takes the ledger mutex; never call it while holding it.
+    fn ledger_dups(
+        &self,
+        group: &[algo_types::SignedTransaction],
+        txids: &[[u8; 32]],
+    ) -> Result<Vec<Option<LedgerDup>>, algo_error::AlgoError> {
+        let ledger = self
+            .ledger
+            .lock()
+            .map_err(|_| algo_error::AlgoError::Ledger {
+                message: "checkDup: the ledger lock is poisoned".into(),
+            })?;
+        Ok(group
+            .iter()
+            .zip(txids)
+            .map(|(stx, txid)| {
+                let leased =
+                    self.consensus_params.support_transaction_leases && stx.txn.lease != [0u8; 32];
+                if leased
+                    && ledger
+                        .lease_table()
+                        .check(&stx.txn.sender, &stx.txn.lease, self.hdr.round.0)
+                        .is_err()
+                {
+                    Some(LedgerDup::Lease)
+                } else if ledger.txtail_contains_txid(
+                    &algo_types::Digest(*txid),
+                    self.consensus_params.max_txn_life,
+                ) {
+                    Some(LedgerDup::Txid)
+                } else {
+                    None
+                }
+            })
+            .collect())
+    }
+
+    /// go's `checkDup` for one transaction, in go's order: the group's own
+    /// txids and leases (`group`, the members applied before this one; `None`
+    /// at go's test stage, which judges each member against the unmodified
+    /// state and cannot see a sibling), then the pending block (the overlay),
+    /// then the ledger (`ledger`, from [`Self::ledger_dups`]: its lease, then
+    /// its txid; `roundCowState.checkDup` -> `txTail.checkDup`). Typed as go
+    /// types them, so the pool tags them `txid` / `lease` (ledger) or
+    /// `txid_eval` / `lease_eval` (in block).
+    fn check_dup_member(
+        &self,
+        stx: &algo_types::SignedTransaction,
+        txid: &[u8; 32],
+        group: Option<&GroupDups>,
+        ledger: Option<LedgerDup>,
+    ) -> Result<(), algo_error::AlgoError> {
+        let digest = algo_types::Digest(*txid);
+        let (sender, lease) = (stx.txn.sender, stx.txn.lease);
+        let leased = self.consensus_params.support_transaction_leases && lease != [0u8; 32];
+        let lease_error = |in_block| {
+            algo_ledger::check_dup::lease_in_ledger_error(digest, &sender, &lease, in_block)
+        };
+        if let Some(group) = group {
+            if group.txids.contains(txid) {
+                return Err(algo_ledger::check_dup::transaction_in_ledger_error(
+                    digest, true,
+                ));
+            }
+            if leased && group.leases.contains(&(sender, lease)) {
+                return Err(lease_error(true));
+            }
+        }
+        self.overlay.check_txid(txid)?;
+        if leased {
+            self.overlay
+                .check_lease_in_overlay(&sender, &lease, self.hdr.round.0, txid)?;
+        }
+        match ledger {
+            Some(LedgerDup::Lease) => Err(lease_error(false)),
+            Some(LedgerDup::Txid) => Err(algo_ledger::check_dup::transaction_in_ledger_error(
+                digest, false,
+            )),
+            None => Ok(()),
+        }
     }
 
     /// Go's `CheckGroupFees`/`SummarizeFees` (`ledger/eval/eval.go`) run
@@ -2144,137 +2292,117 @@ impl SimpleBlockEvaluator {
     fn validate_group(
         &mut self,
         txgroup: &[algo_types::SignedTransaction],
-    ) -> Result<Vec<algo_types::Digest>, algo_error::AlgoError> {
+    ) -> Result<Vec<algo_types::Digest>, Box<GroupReject>> {
         // Run all stateless checks first; reuse the restored (genesis fields
         // populated) copies rather than cloning + restoring the group again.
-        let restored = self.validate_group_stateless_inner(txgroup)?;
+        let restored = self
+            .validate_group_stateless_inner(txgroup)
+            .map_err(|error| {
+                Box::new(GroupReject {
+                    error,
+                    member: None,
+                    txids: Vec::new(),
+                })
+            })?;
 
-        let round = self.hdr.round;
-
-        // 6-7. go's `checkDup`, per transaction in go's order (the group's
-        // and the pending block's txid, then lease; then the ledger
-        // snapshot's lease), before the authorizer and balance prechecks,
-        // with go's typed errors and texts (issue #2127). Always run: the
-        // real apply's own `checkDup` (`exec_group`) may not run (stale base,
-        // spent budget); it adds what this snapshot cannot see (a lease
-        // committed after the snapshot) and the ledger's txtail.
-        let mut txids = Vec::with_capacity(restored.len());
-        {
-            let mut group_txids = HashSet::new();
-            let mut group_leases: HashSet<(Address, [u8; 32])> = HashSet::new();
-            for stx in &restored {
-                let txid = compute_txid(&stx.txn);
-                if !group_txids.insert(txid) {
-                    return Err(algo_ledger::check_dup::transaction_in_ledger_error(
-                        algo_types::Digest(txid),
-                        true,
-                    ));
-                }
-                self.overlay.check_txid(&txid)?;
-                let (sender, lease) = (stx.txn.sender, stx.txn.lease);
-                if lease != [0u8; 32] {
-                    let lease_error = |in_block| {
-                        algo_ledger::check_dup::lease_in_ledger_error(
-                            algo_types::Digest(txid),
-                            &sender,
-                            &lease,
-                            in_block,
-                        )
-                    };
-                    if !group_leases.insert((sender, lease)) {
-                        return Err(lease_error(true));
-                    }
-                    self.overlay
-                        .check_lease_in_overlay(&sender, &lease, round.0, &txid)?;
-                    if self.snapshot.check_lease(&sender, &lease).is_err() {
-                        return Err(lease_error(false));
-                    }
-                }
-                txids.push(algo_types::Digest(txid));
-            }
-        }
-
-        // 8. Rekey/auth-addr validation.
-        // Mirrors Go's `transaction()` (eval.go:1183-1195): verify that
-        // the transaction's claimed authorizer matches the ledger's expected
-        // authorizer for the sender. If the sender has been rekeyed, the
-        // signature must be from the rekeyed-to address.
+        // go's `BlockEvaluator.transaction`, per member in group order (issue
+        // #2130): `Alive`, `checkDup` (the group's and the pending block's
+        // txid, then lease; then the ledger's lease and txid, with go's typed
+        // errors and texts, issue #2127), the authorizer, then the apply (the
+        // fee and amount moves, as far as this precheck models them), before
+        // the next member is looked at. The FIRST failing member in group
+        // order therefore decides the error and the pool tag, whichever stage
+        // it failed at: a bad authorizer or an overspend on member 0 is
+        // reported even though member 1 replays a committed txid. Always run:
+        // the real apply's own `checkDup` (`exec_group`) may not run (stale
+        // base, spent budget); it adds what this snapshot cannot see (a lease
+        // committed after the snapshot).
         //
-        // The "authorizer" of a signed transaction is:
-        //   - `stx.auth_addr` if set (non-None), else `stx.txn.sender`
-        // The "correct authorizer" from the ledger is:
-        //   - `acct.auth_addr` if set (non-zero), else `sender`
+        // What this precheck does NOT model of go's apply, so a member that
+        // passes it can still fail there: application calls (AVM, inner
+        // transactions), asset and key-registration rules, the fee of a
+        // non-payment transaction beyond the sender's balance of Algos (modelled
+        // only as the fee), minimum balance of every touched account, the
+        // closing rules. Those are judged by the real apply (`exec_group`) after
+        // this precheck passes. A rejection by THIS precheck on member 0 is
+        // final: go's member 0 fails at the same stage or earlier (its `Alive`,
+        // `checkDup`, authorizer, then the fee move that opens its apply), and
+        // nothing runs before it (`pool_order` scenarios `authorizer_before_apply`,
+        // `lease_conflict_before_authorizer`, `non_payment_fee_overspend`). A
+        // rejection on a LATER member may be outranked by an earlier member's
+        // apply failure, which `first_failure_in_go_order` looks for.
         //
-        // We iterate `txgroup` (not `restored`) here because `auth_addr`
-        // lives on SignedTransaction and is unaffected by genesis field
-        // restoration.
+        // Authorizer, sequential within the group (issue #1919): go checks
+        // each member against the state AFTER the earlier members applied
+        // (`cow.lookup(sender).AuthAddr`), so a group `[rekey S->A, spend by
+        // A, rekey A->S]` is valid. A member's own rekey takes effect for the
+        // members after it (go `apply.Rekey`: `RekeyTo == Sender` clears the
+        // auth address). `auth_addr` lives on the SignedTransaction as
+        // submitted; genesis restoration does not touch it.
         //
-        // Sequential within the group (issue #1919): go checks each member
-        // against the state AFTER the earlier members applied
-        // (`eval.transaction` per member, `cow.lookup(sender).AuthAddr`), so
-        // a group `[rekey S->A, spend by A, rekey A->S]` is valid. A member's
-        // own rekey takes effect for the members after it (go `apply.Rekey`:
-        // `RekeyTo == Sender` clears the auth address).
+        // Balance, sequential within the group (issue #1919): go applies the
+        // members in order, so a credit from an earlier member (`[X pays F, F
+        // pays R]`, F brand new) funds a later one. Track the in-group
+        // balance movements per address: `credits` (received so far) and
+        // `spent` (cumulative cost of the sender's members so far). Only
+        // payment transactions include the `amount` in the Algo cost; the
+        // other types cost the fee. Read-only: the balance mutation is
+        // deferred to `transaction_group` on acceptance.
+        // One hash per member, for the checks below and for the reconciliation
+        // of a rejection (`first_failure_in_go_order`).
+        let txids: Vec<algo_types::Digest> = restored
+            .iter()
+            .map(|r| algo_types::Digest(compute_txid(&r.txn)))
+            .collect();
+        let raw_txids: Vec<[u8; 32]> = txids.iter().map(|d| d.0).collect();
+        // The ledger half of every member's `checkDup`, read under ONE lock
+        // acquisition (the loop below takes the ledger lock again for the
+        // snapshot reads, so it cannot hold it).
+        let ledger_dups = self.ledger_dups(&restored, &raw_txids).map_err(|error| {
+            Box::new(GroupReject {
+                error,
+                member: None,
+                txids: Vec::new(),
+            })
+        })?;
+        let mut group_dups = GroupDups::default();
         let mut in_group_auth: HashMap<Address, Address> = HashMap::new();
-        for (member, stx) in txgroup.iter().enumerate() {
-            let sender = &stx.txn.sender;
-            let correct_authorizer = match in_group_auth.get(sender) {
-                Some(addr) => *addr,
-                None => self.expected_authorizer(sender),
-            };
-
-            // The transaction's claimed authorizer (Go's txn.Authorizer()).
-            let txn_authorizer = match &stx.auth_addr {
-                Some(addr) => *addr,
-                None => stx.txn.sender,
-            };
-
-            if txn_authorizer != correct_authorizer {
-                // go: `transaction %v: should have been authorized by %v but
-                // was actually authorized by %v` (txid first). The txid is
-                // read from the restored copy (genesis fields populated).
-                let txid = restored
-                    .get(member)
-                    .map(|r| algo_codec::compute_txn_id(&r.txn).to_string())
-                    .unwrap_or_default();
-                return Err(algo_error::AlgoError::Validation {
-                    message: format!(
-                        "transaction {txid}: should have been authorized by {} but was actually authorized by {}",
-                        correct_authorizer, txn_authorizer,
-                    ),
-                });
-            }
-
-            if let Some(rekey_to) = stx.txn.rekey_to {
-                if rekey_to != Address::default() {
-                    in_group_auth.insert(*sender, rekey_to);
-                }
-            }
-        }
-
-        // 9. Sender balance precheck.
-        // Verify each sender has sufficient balance for fee + amount (for
-        // payment transactions). This is a read-only precheck — actual
-        // balance mutation is deferred to transaction_group() on acceptance.
-        // Mirrors Go's approach of checking balances via cow.lookup() which
-        // first checks the overlay, then falls back to the parent/ledger.
-        //
-        // We accumulate per-sender costs within this group to handle groups
-        // where the same sender appears multiple times.
-        //
-        // Only payment transactions include the `amount` field in the Algo
-        // cost. Other transaction types (axfer, acfg, afrz, appl, keyreg,
-        // stpf, hb) only cost the fee in Algos.
-        //
-        // Sequential within the group (issue #1919): go applies the members
-        // in order, so a credit from an earlier member (`[X pays F, F pays
-        // R]`, F brand new) funds a later one. Track the in-group balance
-        // movements per address: `credits` (received so far) and `spent`
-        // (cumulative cost of the sender's members so far).
         let mut credits: HashMap<Address, u64> = HashMap::new();
         let mut spent: HashMap<Address, u64> = HashMap::new();
-        for stx in txgroup {
+        for (member, (stx, restored_stx)) in txgroup.iter().zip(&restored).enumerate() {
+            let fail = |error: algo_error::AlgoError| {
+                Box::new(GroupReject {
+                    error,
+                    member: Some(member),
+                    txids: txids.clone(),
+                })
+            };
+            self.alive_member(stx).map_err(fail)?;
+            let txid = txids[member].0;
+            self.check_dup_member(restored_stx, &txid, Some(&group_dups), ledger_dups[member])
+                .map_err(fail)?;
+
             let sender = stx.txn.sender;
+            let correct_authorizer = match in_group_auth.get(&sender) {
+                Some(addr) => *addr,
+                None => self.expected_authorizer(&sender),
+            };
+            // The transaction's claimed authorizer (go's txn.Authorizer()).
+            let txn_authorizer = stx.auth_addr.unwrap_or(sender);
+            if txn_authorizer != correct_authorizer {
+                // go returns this text bare (`fmt.Errorf`, txid first), with no
+                // algod-rust category prefix.
+                return Err(fail(algo_error::AlgoError::Rejected {
+                    source: None,
+                    message: format!(
+                        "transaction {}: should have been authorized by {} but was actually authorized by {}",
+                        algo_types::Digest(txid),
+                        correct_authorizer,
+                        txn_authorizer,
+                    ),
+                    class: algo_error::RejectClass::Other,
+                }));
+            }
             let is_pay = stx.txn.txn_type == TxnType::Pay;
             let fee = stx.txn.fee;
             let cost = if is_pay {
@@ -2284,7 +2412,7 @@ impl SimpleBlockEvaluator {
             };
             // Overlay first for the cumulative effects of earlier groups,
             // then the ledger snapshot.
-            let base = self.try_effective_balance(&sender)?;
+            let base = self.try_effective_balance(&sender).map_err(fail)?;
             let credited = credits.get(&sender).copied().unwrap_or(0);
             let already_spent = spent.get(&sender).copied().unwrap_or(0);
             let required = already_spent.saturating_add(cost);
@@ -2294,14 +2422,14 @@ impl SimpleBlockEvaluator {
                 // each failing `Move` is a `ledgercore.OverspendError` carrying
                 // the sender as the cow state stood before THAT move.
                 let balance_now = available.saturating_sub(already_spent);
-                let txid = algo_types::Digest(compute_txid(&stx.txn)).to_string();
+                let txid_text = algo_types::Digest(txid).to_string();
                 let (data_balance, tried, after_fee) = if balance_now < fee {
                     (balance_now, fee, false)
                 } else {
                     (balance_now - fee, stx.txn.amount, true)
                 };
                 let message = self.overspend_message(
-                    &txid,
+                    &txid_text,
                     &sender,
                     tried,
                     OverspendContext {
@@ -2311,11 +2439,11 @@ impl SimpleBlockEvaluator {
                         earlier_in_group: already_spent > 0,
                     },
                 );
-                return Err(algo_error::AlgoError::Rejected {
+                return Err(fail(algo_error::AlgoError::Rejected {
                     source: None,
                     message,
                     class: algo_error::RejectClass::Other,
-                });
+                }));
             }
             spent.insert(sender, required);
             if is_pay {
@@ -2333,10 +2461,30 @@ impl SimpleBlockEvaluator {
                     spent.insert(sender, available);
                 }
             }
+
+            // The member passed every check: only now do its effects on the
+            // group state take hold (a rekey for the members after it, go
+            // `apply.Rekey`; its txid and lease for their `checkDup`, go's
+            // `cow.addTx`).
+            if let Some(rekey_to) = stx.txn.rekey_to {
+                if rekey_to != Address::default() {
+                    in_group_auth.insert(sender, rekey_to);
+                }
+            }
+            group_dups.txids.insert(txid);
+            if stx.txn.lease != [0u8; 32] {
+                group_dups.leases.insert((sender, stx.txn.lease));
+            }
         }
 
-        // 10. Group fees, after every transaction's own state checks (go).
-        self.check_group_fees(txgroup)?;
+        // Group fees, after every transaction's own state checks (go).
+        self.check_group_fees(txgroup).map_err(|error| {
+            Box::new(GroupReject {
+                error,
+                member: None,
+                txids: Vec::new(),
+            })
+        })?;
 
         Ok(txids)
     }
@@ -2386,6 +2534,45 @@ impl SimpleBlockEvaluator {
         }
         algo_validate::overspend::overspend_message(txid, sender, &data, tried)
     }
+}
+
+/// The transaction IDs and leases of the members of the group being checked
+/// that already passed, which go's group cow holds for `checkDup`.
+#[derive(Default)]
+struct GroupDups {
+    txids: HashSet<[u8; 32]>,
+    leases: HashSet<(Address, [u8; 32])>,
+}
+
+/// What the ledger says of a member in `checkDup` ([`SimpleBlockEvaluator::ledger_dups`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LedgerDup {
+    /// The (sender, lease) is live in the ledger.
+    Lease,
+    /// The txid is in the ledger's txtail.
+    Txid,
+}
+
+/// What a dry run of the real apply concluded about a group the precheck refused.
+enum Reconciled {
+    /// The apply fails at this member, with go's error.
+    FailedAt(usize, algo_error::AlgoError),
+    /// The apply accepts the whole group.
+    Accepted,
+    /// The apply could not judge it (stale base, poisoned lock).
+    Unknown,
+}
+
+/// A group [`SimpleBlockEvaluator::validate_group`] refused. `member` is the
+/// index of the member whose per-transaction check failed (`Alive`,
+/// `checkDup`, authorizer, balance), `None` for a group-level failure (the
+/// stateless checks, the group fees).
+struct GroupReject {
+    error: algo_error::AlgoError,
+    member: Option<usize>,
+    /// The txids of the whole group (over the restored members), hashed once;
+    /// empty for a failure of the stateless checks.
+    txids: Vec<algo_types::Digest>,
 }
 
 /// What [`SimpleBlockEvaluator::overspend_message`] needs to print the sender
@@ -2821,6 +3008,123 @@ impl SimpleBlockEvaluator {
         Ok(true)
     }
 
+    /// What go reports for a group whose `reject` the cheap prechecks of
+    /// [`Self::validate_group`] found (issue #2130). go applies the members one
+    /// by one and stops at the first that fails, so when the precheck failure
+    /// is on a LATER member (`reject.member` > 0), the prechecks may be wrong
+    /// about it in two ways, both of which a dry run of the real apply
+    /// ([`Self::reconcile_group`]) settles in go's order:
+    ///
+    /// - an EARLIER member fails go's apply (an application call that rejects,
+    ///   an asset error, a minimum balance) which the prechecks do not model:
+    ///   that failure is what go reports, `Err`;
+    /// - the precheck over-rejects (it does not model inner-transaction
+    ///   credits: `[app call funds F, F pays R]` is refused for F's empty
+    ///   balance, yet go accepts it): the real apply accepts the group, so go
+    ///   would admit it, and so does this: `Ok(txids)` continues the normal
+    ///   admission (which runs the real apply once more, for real, charged to
+    ///   the main admission budget; the dry run was charged to the
+    ///   reconciliation budget, so nothing is charged twice to either).
+    ///
+    /// Otherwise the precheck's own error stands. The dry run never changes the
+    /// pending state and never marks the evaluator incomplete, so a stream of
+    /// rejected groups costs a bounded amount of separate budget and nothing
+    /// else. The budget is wall clock plus a run count: under load the reported
+    /// member and error can fall back to the precheck's, while the verdict
+    /// (reject) stays the same.
+    fn resolve_precheck_rejection(
+        &mut self,
+        txgroup: &[algo_types::SignedTransaction],
+        reject: GroupReject,
+    ) -> Result<Vec<algo_types::Digest>, algo_error::AlgoError> {
+        let Some(member) = reject.member.filter(|m| *m > 0) else {
+            return Err(reject.error);
+        };
+        // Nothing to ask of an evaluator without a usable real apply.
+        let runnable = self.exec.as_ref().is_some_and(|exec| {
+            !exec.incomplete
+                && exec.spent < EXEC_ADMISSION_BUDGET
+                && exec.reconcile_spent < RECONCILE_BUDGET
+                && exec.reconcile_runs < RECONCILE_MAX_RUNS
+        });
+        if !runnable || reject.txids.len() != txgroup.len() {
+            return Err(reject.error);
+        }
+        let genesis_rule = self.genesis_rule();
+        let stibs: Vec<algo_types::SignedTransaction> = txgroup
+            .iter()
+            .map(|stx| {
+                let mut stib = stx.clone();
+                genesis_rule.strip(&mut stib);
+                stib
+            })
+            .collect();
+        match self.reconcile_group(&stibs, reject.txids.clone()) {
+            Reconciled::FailedAt(index, error) if index < member => Err(error),
+            Reconciled::Accepted => {
+                note_precheck_over_reject();
+                Ok(reject.txids)
+            }
+            Reconciled::FailedAt(..) | Reconciled::Unknown => Err(reject.error),
+        }
+    }
+
+    /// Dry run of the real apply over `stibs` on top of the pending state. The
+    /// overlay is left as it was whatever the outcome, and the time is charged
+    /// to `reconcile_spent` (and the run to `reconcile_runs`), never to the
+    /// admission budget.
+    fn reconcile_group(
+        &mut self,
+        stibs: &[algo_types::SignedTransaction],
+        txids: Vec<algo_types::Digest>,
+    ) -> Reconciled {
+        use algo_ledger::proposal_eval::GroupEvalError;
+
+        let Some(exec) = self.exec.as_mut() else {
+            return Reconciled::Unknown;
+        };
+        exec.reconcile_runs += 1;
+        let base =
+            algo_ledger::locked_base::LockedBase::new(&self.ledger, exec.overlay.base_round());
+        let started = std::time::Instant::now();
+        let outcome = algo_ledger::proposal_eval::evaluate_group_discarding(
+            &base,
+            &mut exec.overlay,
+            &exec.template,
+            stibs,
+            Some(txids),
+        );
+        let st = base.stats();
+        let poisoned = base.is_poisoned();
+        algo_ledger::proposal_eval::record_ledger_lock_wait(st.wait);
+        algo_ledger::proposal_eval::record_ledger_lock_holds(st.acquisitions, st.hold, st.hold_max);
+        exec.lock_hold_max
+            .set(exec.lock_hold_max.get().max(st.hold_max));
+        exec.lock_acquisitions
+            .set(exec.lock_acquisitions.get() + st.acquisitions);
+        exec.reconcile_spent += started.elapsed().saturating_sub(st.wait);
+        if poisoned {
+            return Reconciled::Unknown;
+        }
+        let txid_of = |template: &algo_types::Block, i: usize| {
+            let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(template);
+            stibs
+                .get(i)
+                .map(|stx| {
+                    let (gen, gh) = rule.restored_genesis(stx);
+                    algo_codec::compute_txn_id_with_genesis(&stx.txn, gen, gh).to_string()
+                })
+                .unwrap_or_default()
+        };
+        match outcome {
+            Err(GroupEvalError::Txn { index, error }) => {
+                Reconciled::FailedAt(index, go_rejection(&txid_of(&exec.template, index), error))
+            }
+            Ok(_) => Reconciled::Accepted,
+            Err(GroupEvalError::Stale) | Err(GroupEvalError::Other(_)) => Reconciled::Unknown,
+        }
+    }
+
     /// Run `stibs` (the group in payset form) through the real apply on top
     /// of the pending state. `restored` is the same group with genesis
     /// fields restored, used for txids in error text.
@@ -3053,11 +3357,15 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         &self,
         txgroup: &[algo_types::SignedTransaction],
     ) -> Result<(), algo_error::AlgoError> {
-        // test_transaction_group performs stateless checks only (matching
-        // Go's TestTransactionGroup which does well-formedness + group
-        // consistency but doesn't mutate evaluator state). The full
-        // stateful checks (txid dedup, lease, balance) run in
-        // transaction_group() when the group is actually committed.
+        // go's `TestTransactionGroup`: the stateless checks (well-formedness,
+        // group ID, signatures), then per member `Alive` and `checkDup` against
+        // the unmodified state, which includes the pending block (the overlay)
+        // and the LEDGER (its lease table and txtail, read live), and the group
+        // fees. It mutates nothing. The balance, authorizer and apply checks run
+        // in `transaction_group` when the group is actually admitted.
+        //
+        // LOCK ORDER: this takes the ledger mutex (once per group). Never call
+        // it, or `transaction_group`, while holding the ledger mutex.
         self.validate_group_stateless(txgroup)
     }
 
@@ -3065,7 +3373,12 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         &mut self,
         txgroup: &[algo_types::SignedTransaction],
     ) -> Result<(), algo_error::AlgoError> {
-        let txids = self.validate_group(txgroup)?;
+        let txids = match self.validate_group(txgroup) {
+            Ok(txids) => txids,
+            // `Ok`: the real apply accepts what the precheck refused, so the
+            // group is admitted as go would admit it, below.
+            Err(reject) => self.resolve_precheck_rejection(txgroup, *reject)?,
+        };
 
         // Convert each transaction to STIB (SignedTxnInBlock) format:
         // strip genesis fields and set has_genesis_id / has_genesis_hash flags.
@@ -3802,6 +4115,17 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
     fn reset_txn_bytes(&mut self) {
         self.txn_bytes = 0;
     }
+
+    /// `transaction_group` runs go's `checkDup` per member (issue #2130), also
+    /// when the real apply gave up (`exec.incomplete`): the pending txids and
+    /// leases live in the cheap overlay, which every admitted group updates, and
+    /// a rebuilt evaluator gets them back when the pool re-feeds its pending
+    /// groups (`a_pending_txid_is_still_a_duplicate_after_the_pool_recomputes`,
+    /// `an_incomplete_evaluator_still_rejects_a_pending_duplicate`). So the
+    /// pool's own duplicate pass has nothing to add, in any state.
+    fn checks_duplicates(&self) -> bool {
+        true
+    }
 }
 
 /// A minimal `PoolLedger` that wraps `SqliteLedger` behind a `Mutex`.
@@ -4176,7 +4500,7 @@ impl PoolLedgerAdapter {
         // reset. `ParticipateAgreementControl::pause` therefore pauses the
         // pool (dropping its evaluator) for the length of a live catchup
         // (issue #1683).
-        let mut snapshot = LedgerSnapshot::from_ledger(&self.ledger, hdr.round.0);
+        let mut snapshot = LedgerSnapshot::from_ledger(&self.ledger);
 
         // Advance the header to the next round, mirroring go's
         // eval.StartEvaluator: read the rewards-pool balance (with pending
@@ -4253,6 +4577,8 @@ impl PoolLedgerAdapter {
                 template: header_block(&next_hdr),
                 groups: Vec::new(),
                 spent: Duration::ZERO,
+                reconcile_spent: Duration::ZERO,
+                reconcile_runs: 0,
                 incomplete: false,
                 last_passes: 0,
                 final_state_proof_next: None,
@@ -9872,8 +10198,6 @@ mod tests {
     ) -> SimpleBlockEvaluator {
         let mut snapshot = LedgerSnapshot {
             accounts: HashMap::new(),
-            lease_table: algo_ledger::LeaseTable::new(),
-            round,
             snapshot_round: Round(0),
             read_snapshot: None,
         };
@@ -11357,8 +11681,6 @@ mod tests {
                     );
                     m
                 },
-                lease_table: algo_ledger::LeaseTable::new(),
-                round: 100,
                 snapshot_round: Round(0),
                 read_snapshot: None,
             },
@@ -11872,8 +12194,6 @@ mod tests {
             ledger: ledger.clone(),
             snapshot: LedgerSnapshot {
                 accounts: HashMap::new(),
-                lease_table: algo_ledger::LeaseTable::new(),
-                round: 500,
                 snapshot_round: Round(0),
                 read_snapshot: None,
             },
@@ -12063,8 +12383,6 @@ mod tests {
 
         let mut snapshot = LedgerSnapshot {
             accounts: HashMap::new(),
-            lease_table: algo_ledger::LeaseTable::new(),
-            round: 100,
             snapshot_round: Round(0),
             read_snapshot: None,
         };
@@ -12131,8 +12449,6 @@ mod tests {
 
         let mut snapshot = LedgerSnapshot {
             accounts: HashMap::new(),
-            lease_table: algo_ledger::LeaseTable::new(),
-            round: 100,
             snapshot_round: Round(0),
             read_snapshot: None,
         };
@@ -12220,8 +12536,6 @@ mod tests {
 
         let mut snapshot = LedgerSnapshot {
             accounts: HashMap::new(),
-            lease_table: algo_ledger::LeaseTable::new(),
-            round: 100,
             snapshot_round: Round(0),
             read_snapshot: None,
         };
@@ -12283,8 +12597,6 @@ mod tests {
 
         let mut snapshot = LedgerSnapshot {
             accounts: HashMap::new(),
-            lease_table: algo_ledger::LeaseTable::new(),
-            round: 100,
             snapshot_round: Round(0),
             read_snapshot: None,
         };
@@ -12425,8 +12737,6 @@ mod tests {
 
         let mut snapshot = LedgerSnapshot {
             accounts: HashMap::new(),
-            lease_table: algo_ledger::LeaseTable::new(),
-            round: 100,
             snapshot_round: Round(0),
             read_snapshot: None,
         };
@@ -12971,8 +13281,6 @@ mod tests {
     ) -> SimpleBlockEvaluator {
         let mut snapshot = LedgerSnapshot {
             accounts: HashMap::new(),
-            lease_table: algo_ledger::LeaseTable::new(),
-            round,
             snapshot_round: Round(0),
             read_snapshot: None,
         };
@@ -14070,8 +14378,6 @@ mod tests {
 
         let mut snapshot = LedgerSnapshot {
             accounts: HashMap::new(),
-            lease_table: algo_ledger::LeaseTable::new(),
-            round: 100,
             snapshot_round: Round(0),
             read_snapshot: None,
         };

@@ -516,8 +516,18 @@ impl TransactionPool {
             check_sufficient_fee(txn, fee_per_byte, &consensus, group_size)?;
         }
 
-        // Duplicate check.
-        self.check_duplicate(tx_group, guard)?;
+        // Duplicate check. go has no such pass: `checkDup` runs per
+        // transaction inside the evaluator, between `Alive` and the
+        // authorizer, so the first failing member of a group decides the
+        // error. An evaluator that runs it itself (`checks_duplicates`) is
+        // left to; the pool's pass stays for one that does not (issue #2130).
+        if !guard
+            .evaluator
+            .as_ref()
+            .is_some_and(|e| e.checks_duplicates())
+        {
+            self.check_duplicate(tx_group, guard)?;
+        }
 
         // Feed to the evaluator (with "no space" handling).
         // Mirrors Go's ingest() which calls addToPendingBlockEvaluator().
@@ -899,12 +909,19 @@ impl TransactionPool {
         if let Some(ref evaluator) = inner.evaluator {
             evaluator
                 .test_transaction_group(tx_group)
-                .map_err(|e| {
-                    if e.is_batch_sig_failure() {
-                        PoolError::SignatureBatchFailed
-                    } else {
-                        PoolError::Evaluator(e.to_string())
-                    }
+                .map_err(|e| match &e {
+                    _ if e.is_batch_sig_failure() => PoolError::SignatureBatchFailed,
+                    // go's `Test` returns the typed `checkDup` error as is
+                    // (`TransactionInLedgerError`, `LeaseInLedgerError`):
+                    // keep its class, so the tag is go's `txid` / `lease`
+                    // (or `*_eval` for the pending block), not a text guess.
+                    AlgoError::Rejected {
+                        class:
+                            algo_error::RejectClass::TxidInLedger { .. }
+                            | algo_error::RejectClass::LeaseInLedger { .. },
+                        ..
+                    } => pool_error_from_evaluator(&e),
+                    _ => PoolError::Evaluator(e.to_string()),
                 })?;
             Ok(())
         } else {
