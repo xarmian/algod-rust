@@ -493,7 +493,10 @@ def run_tier():
         if problems:
             raise TierError("the simulate request is not a successful simulation: "
                             + "; ".join(problems))
-        problems = rl.check_simulate_app(gate_go["simulate_app"])
+        try:
+            problems = rl.check_simulate_app(gate_go["simulate_app"])
+        except ValueError as e:
+            raise TierError(str(e)) from None
         if problems:
             raise TierError("the simulate_app request is not a successful app-call "
                             "simulation: " + "; ".join(problems))

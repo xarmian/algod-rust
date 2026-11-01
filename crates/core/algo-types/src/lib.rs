@@ -67,9 +67,10 @@ pub use rmp_decode::{
 };
 pub use round::Round;
 pub use transaction::{
-    AssetParams, BoxRef, FalconVerifier, HashFactory, HeartbeatProof, HeartbeatTxnFields,
-    HoldingRef, LocalsRef, LogicSig, MerkleProof, MerkleSignature, MerkleSignatureVerifier,
-    MultisigSig, MultisigSubsig, Participant, ResourceRef, Reveal, SigSlotCommit,
-    SignedTransaction, StateProofBody, StateProofMessage, StateSchema, Transaction, TxnType,
+    with_zero_header_fields_omitted, AssetParams, BoxRef, FalconVerifier, HashFactory,
+    HeartbeatProof, HeartbeatTxnFields, HoldingRef, LocalsRef, LogicSig, MerkleProof,
+    MerkleSignature, MerkleSignatureVerifier, MultisigSig, MultisigSubsig, Participant,
+    ResourceRef, Reveal, SigSlotCommit, SignedTransaction, StateProofBody, StateProofMessage,
+    StateSchema, Transaction, TxnType,
 };
 pub use txtail::{TxTailRound, TxTailRoundLease};

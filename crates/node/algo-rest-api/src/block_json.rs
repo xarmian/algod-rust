@@ -437,24 +437,16 @@ fn signed_txn_tree_to_json(tree: &rmpv::Value) -> serde_json::Value {
 /// valid transaction, so a (never expected) msgpack round-trip failure is logged
 /// and degrades to the plain serde form instead of failing the response.
 pub(crate) fn signed_txn_go_json(txn: &algo_types::SignedTransaction) -> serde_json::Value {
-    let tree = algo_codec::to_vec_named_str_preserving(txn)
-        .map_err(|e| e.to_string())
-        .and_then(|bytes| rmpv::decode::read_value(&mut &bytes[..]).map_err(|e| e.to_string()));
+    // go's codec omits every zero field (`omitempty`, a zero `fv` included): an
+    // inner transaction pays no fee of its own, so `fee: 0` must not render
+    // (issue #2178). The serde derive writes those three unless asked not to.
+    let tree = algo_types::with_zero_header_fields_omitted(|| {
+        algo_codec::to_vec_named_str_preserving(txn)
+    })
+    .map_err(|e| e.to_string())
+    .and_then(|bytes| rmpv::decode::read_value(&mut &bytes[..]).map_err(|e| e.to_string()));
     match tree {
-        Ok(tree) => {
-            let mut json = signed_txn_tree_to_json(&tree);
-            // go's msgp/codec encoders omit every zero field; the serde derive
-            // always writes these three. An inner transaction pays no fee of
-            // its own (issue #2178), so `fee: 0` must not be rendered.
-            if let Some(serde_json::Value::Object(t)) = json.get_mut("txn") {
-                for key in ["fee", "fv", "lv"] {
-                    if t.get(key).and_then(serde_json::Value::as_u64) == Some(0) {
-                        t.remove(key);
-                    }
-                }
-            }
-            json
-        }
+        Ok(tree) => signed_txn_tree_to_json(&tree),
         Err(e) => {
             tracing::error!(err = %e, "failed to render a transaction in go's JSON form");
             serde_json::to_value(txn).unwrap_or(serde_json::Value::Null)

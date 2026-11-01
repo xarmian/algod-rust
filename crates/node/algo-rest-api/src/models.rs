@@ -1590,7 +1590,11 @@ fn serialize_signed_txn_go_json<S: serde::Serializer>(
             apply_data_application_id: 0,
             ..txn.clone()
         };
-        return serde::Serialize::serialize(&plain, s);
+        // go omits a zero fee/fv/lv (`omitempty`; a zero `fv` is the genesis
+        // round and omitted too): an inner transaction pays no fee of its own.
+        return algo_types::with_zero_header_fields_omitted(|| {
+            serde::Serialize::serialize(&plain, s)
+        });
     }
     serde::Serialize::serialize(&crate::block_json::signed_txn_go_json(txn), s)
 }

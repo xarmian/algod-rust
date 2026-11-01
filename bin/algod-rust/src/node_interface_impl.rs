@@ -3225,7 +3225,11 @@ impl AlgodNodeInterface {
         // go reports these from `ApplyData.EvalDelta` too, which for a failed
         // approval program is the partial delta the simulator saved.
         if let Some(dt) = ad.and_then(|a| a.eval_delta.as_ref()) {
-            algo_rest_api::handlers::apply_eval_delta_to_tx_info(&mut info, dt);
+            let parts = algo_rest_api::handlers::eval_delta_parts(&info.txn, dt);
+            info.global_state_delta = parts.global_state_delta;
+            info.local_state_delta = parts.local_state_delta;
+            info.logs = parts.logs;
+            info.inner_txns = parts.inner_txns;
         }
         info
     }
@@ -6016,6 +6020,160 @@ mod tests {
             serde_json::json!([{"key": b64(b"gk"), "value": {"action": 2, "uint": 9}}])
         );
         assert!(deep.get("inner-txns").is_none());
+    }
+
+    /// The simulate JSON `txn-result` of one app call run by the real
+    /// [`Simulator`] against an app whose approval AND clear-state programs are
+    /// `program` (TEAL), plus the group's failure message. `clear_state` makes
+    /// the call a ClearState from an opted-in account.
+    fn simulate_app_call_json(program: &str, clear_state: bool) -> (serde_json::Value, bool) {
+        use algo_ledger::apply::pool_fixtures::{funded_simulation_state, TEST_GENESIS_HASH};
+        let sender = Address([0xAA; 32]);
+        let mut state = funded_simulation_state();
+        state.fee_sink = Address([0xFE; 32]);
+        state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
+        state.set_account(
+            &sender,
+            algo_types::AccountData {
+                micro_algos: 10_000_000,
+                total_apps_opted_in: u64::from(clear_state),
+                ..Default::default()
+            },
+        );
+        state.set_account(&Address([0xFE; 32]), algo_types::AccountData::default());
+        let bytes = algo_avm::assembler::assemble_string(program)
+            .expect("assemble")
+            .program;
+        state.set_app_params(
+            100,
+            algo_types::AppParams {
+                creator: sender,
+                approval_program: bytes.clone(),
+                clear_state_program: bytes,
+                global_state_schema: algo_types::StateSchema {
+                    num_uint: 1,
+                    num_byte_slice: 0,
+                },
+                ..Default::default()
+            },
+        );
+        if clear_state {
+            state.app_local_states.insert(
+                (sender, 100),
+                algo_types::AppLocalState {
+                    schema: Default::default(),
+                    key_value: Default::default(),
+                },
+            );
+        }
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = algo_types::TxnType::Appl;
+        stx.txn.sender = sender;
+        stx.txn.fee = 1000;
+        stx.txn.last_valid = Round(1000);
+        stx.txn.application_id = 100;
+        stx.txn.on_completion = if clear_state { 3 } else { 0 };
+        stx.txn.genesis_hash = TEST_GENESIS_HASH;
+        let result = Simulator::new(&mut state)
+            .simulate(SimulationRequest {
+                txn_groups: vec![vec![stx]],
+                allow_empty_signatures: true,
+                ..Default::default()
+            })
+            .expect("simulate");
+        let failed = result.txn_groups[0].failure_message.is_some();
+        let response = AlgodNodeInterface::build_simulate_response(result);
+        let json = serde_json::to_value(&response).unwrap();
+        (
+            json["txn-groups"][0]["txn-results"][0]["txn-result"].clone(),
+            failed,
+        )
+    }
+
+    const LOG_PUT_THEN_ERR: &str = "#pragma version 8
+byte \"lg\"
+log
+byte \"k\"
+int 1
+app_global_put
+err
+";
+
+    /// A failing approval program reports the partial EvalDelta the simulator
+    /// saved (go's `saveEvalDelta`): the log and global write made before `err`.
+    #[test]
+    fn simulate_failed_approval_program_reports_partial_eval_delta() {
+        use base64::Engine as _;
+        let (res, failed) = simulate_app_call_json(LOG_PUT_THEN_ERR, false);
+        assert!(failed, "the approval program errors");
+        let b64 = |s: &[u8]| base64::engine::general_purpose::STANDARD.encode(s);
+        assert_eq!(res["logs"], serde_json::json!([b64(b"lg")]));
+        assert_eq!(
+            res["global-state-delta"],
+            serde_json::json!([{"key": b64(b"k"), "value": {"action": 2, "uint": 1}}])
+        );
+    }
+
+    /// CLAUDE.md "Simulation EvalDelta-on-Error Semantics": go swallows an
+    /// erroring ClearState program, so its EvalDelta stays empty and the
+    /// txn-result has no logs or deltas, unlike a failing approval program.
+    #[test]
+    fn simulate_erroring_clear_state_program_reports_no_eval_delta() {
+        let (res, failed) = simulate_app_call_json(LOG_PUT_THEN_ERR, true);
+        assert!(!failed, "a ClearState error never fails the group");
+        for key in [
+            "logs",
+            "global-state-delta",
+            "local-state-delta",
+            "inner-txns",
+        ] {
+            assert!(res.get(key).is_none(), "{key} must be absent: {res}");
+        }
+    }
+
+    /// Issue #2178 (msgpack): an inner transaction pays no fee of its own, and
+    /// go's msgp encoder omits zero `fee`/`fv`/`lv`; the outer keeps its own.
+    #[test]
+    fn simulate_msgpack_inner_txn_omits_zero_fee_and_rounds() {
+        let mut outer = SignedTransaction::default();
+        outer.txn.txn_type = algo_types::TxnType::Appl;
+        outer.txn.sender = Address([1u8; 32]);
+        outer.txn.fee = 2000;
+        outer.txn.first_valid = Round(5);
+        outer.txn.last_valid = Round(1005);
+        let mut inner = SignedTransaction::default();
+        inner.txn.txn_type = algo_types::TxnType::Pay;
+        inner.txn.sender = Address([2u8; 32]);
+        let eval_delta = rmpv::Value::Map(vec![(
+            mp_str("itx"),
+            rmpv::Value::Array(vec![mp_roundtrip(&inner)]),
+        )]);
+        let result = TxnResult {
+            txn: Some(outer),
+            apply_data: Some(algo_ledger::apply::ApplyData {
+                eval_delta: Some(eval_delta),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let model = AlgodNodeInterface::txn_result_to_model(result).txn_result;
+        let bytes = algo_codec::to_vec_named_str_preserving(&model).expect("msgpack");
+        let mp = rmpv::decode::read_value(&mut bytes.as_slice()).expect("decode");
+        let outer_txn = mp_field(mp_field(&mp, "txn").unwrap(), "txn").unwrap();
+        assert_eq!(
+            mp_field(outer_txn, "fee").and_then(|v| v.as_u64()),
+            Some(2000)
+        );
+        assert_eq!(mp_field(outer_txn, "fv").and_then(|v| v.as_u64()), Some(5));
+        let inner_mp = &mp_field(&mp, "inner-txns").unwrap().as_array().unwrap()[0];
+        let inner_txn = mp_field(mp_field(inner_mp, "txn").unwrap(), "txn").unwrap();
+        for key in ["fee", "fv", "lv"] {
+            assert!(
+                mp_field(inner_txn, key).is_none(),
+                "inner {key} must be omitted"
+            );
+        }
+        assert!(mp_field(inner_txn, "snd").is_some());
     }
 
     #[test]

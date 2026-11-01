@@ -22,9 +22,10 @@
 //! nodes. It creates an application and opts the sender in, and the approval
 //! program logs, writes a global and a local key and issues an inner payment,
 //! so the response carries `logs`, `global-state-delta`, `local-state-delta`
-//! and `inner-txns` in the `txn-result`. This test pins the program bytes the
-//! bench embeds (the Python tests read `BENCH_APPROVAL_HEX` from this file)
-//! and proves the request is a successful simulation with those pieces.
+//! and `inner-txns` in the `txn-result`. The programs live in
+//! `scripts/bench/data/` (TEAL and assembled hex, the single copy the Python
+//! tier reads); this test fails unless the assembler turns each TEAL into its
+//! hex, and proves the request is a successful simulation with those pieces.
 
 use algo_ledger::apply::pool_fixtures::{funded_simulation_state, TEST_GENESIS_HASH};
 use algo_ledger::eval_delta::parse_eval_delta;
@@ -35,52 +36,21 @@ use serde_bytes::ByteBuf;
 
 const FEE_SINK: Address = Address([0xFE; 32]);
 
-/// The TEAL source of the bench application.
-const BENCH_APPROVAL_TEAL: &str = "#pragma version 8
-byte \"hello\"
-log
-byte \"gk\"
-int 7
-app_global_put
-txn Sender
-byte \"lk\"
-byte \"world\"
-app_local_put
-itxn_begin
-int pay
-itxn_field TypeEnum
-txn Sender
-itxn_field Receiver
-int 0
-itxn_field Fee
-itxn_submit
-int 1
-return
-";
+const APPROVAL_TEAL: &str =
+    include_str!("../../../../scripts/bench/data/simulate_app.approval.teal");
+const APPROVAL_HEX: &str = include_str!("../../../../scripts/bench/data/simulate_app.approval.hex");
+const CLEAR_TEAL: &str = include_str!("../../../../scripts/bench/data/simulate_app.clear.teal");
+const CLEAR_HEX: &str = include_str!("../../../../scripts/bench/data/simulate_app.clear.hex");
 
-/// `BENCH_APPROVAL_TEAL` assembled; embedded verbatim in `rest_lib.py`.
-const BENCH_APPROVAL_HEX: &str = "08200101800568656c6c6fb08002676b810767310080026c6b8005776f726c6466b122b2103100b2078100b201b32243";
-
-/// The clear-state program of the bench application: `#pragma version 8; int 1`.
-const BENCH_CLEAR_HEX: &str = "088101";
+fn hex_of(teal: &str) -> String {
+    let p = algo_avm::assembler::assemble_string(teal).expect("assemble");
+    p.program.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 #[test]
 fn bench_program_bytes_match_the_teal() {
-    let approval = algo_avm::assembler::assemble_string(BENCH_APPROVAL_TEAL).expect("assemble");
-    let hex: String = approval
-        .program
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    assert_eq!(hex, BENCH_APPROVAL_HEX);
-    let clear = algo_avm::assembler::assemble_string(
-        "#pragma version 8
-int 1
-",
-    )
-    .expect("assemble");
-    let hex: String = clear.program.iter().map(|b| format!("{b:02x}")).collect();
-    assert_eq!(hex, BENCH_CLEAR_HEX);
+    assert_eq!(hex_of(APPROVAL_TEAL), APPROVAL_HEX.trim());
+    assert_eq!(hex_of(CLEAR_TEAL), CLEAR_HEX.trim());
 }
 
 fn unhex(s: &str) -> Vec<u8> {
@@ -113,8 +83,8 @@ fn bench_app_create_simulates_with_logs_deltas_and_inner_txn() {
             first_valid: 0.into(),
             last_valid: 1000.into(),
             on_completion: 1, // OptIn
-            approval_program: Some(ByteBuf::from(unhex(BENCH_APPROVAL_HEX))),
-            clear_state_program: Some(ByteBuf::from(unhex(BENCH_CLEAR_HEX))),
+            approval_program: Some(ByteBuf::from(unhex(APPROVAL_HEX.trim()))),
+            clear_state_program: Some(ByteBuf::from(unhex(CLEAR_HEX.trim()))),
             global_state_schema: Some(StateSchema {
                 num_uint: 1,
                 num_byte_slice: 0,

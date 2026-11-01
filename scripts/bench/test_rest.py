@@ -512,18 +512,18 @@ class SimulateAppRequestTest(unittest.TestCase):
         txn = doc["txn-groups"][0]["txns"][0]["txn"]
         self.assertEqual(txn["type"], "appl")
         self.assertEqual(txn["apan"], 1)  # OptIn: the create writes the sender's local state
-        self.assertEqual(txn["apap"], bytes.fromhex(rl.BENCH_APPROVAL_HEX))
         self.assertEqual(txn["fee"], 2000)  # pays for the inner transaction too
         self.assertTrue(doc["allow-empty-signatures"])
         self.assertEqual(rl.simulate_app_request(ZERO_ADDR, self.PARAMS), req)
 
-    def test_program_bytes_are_the_ones_the_rust_test_assembles_from_the_teal(self):
-        path = os.path.join(os.path.dirname(__file__), "..", "..", "crates", "core", "algo-ledger",
-                            "tests", "simulation_bench_app_create_test.rs")
-        with open(path, encoding="utf-8") as f:
-            src = f.read()
-        self.assertIn(f'BENCH_APPROVAL_HEX: &str = "{rl.BENCH_APPROVAL_HEX}";', src)
-        self.assertIn(f'BENCH_CLEAR_HEX: &str = "{rl.BENCH_CLEAR_HEX}";', src)
+    def test_program_hex_files_are_the_single_source_of_the_programs(self):
+        req = rl.simulate_app_request(ZERO_ADDR, self.PARAMS)
+        txn = rl.msgpack_decode(base64.b64decode(req["body_b64"]))["txn-groups"][0]["txns"][0]["txn"]
+        data = os.path.join(os.path.dirname(rl.__file__), "data")
+        for field, name in (("apap", "approval"), ("apsu", "clear")):
+            with open(os.path.join(data, f"simulate_app.{name}.hex"), encoding="utf-8") as f:
+                self.assertEqual(txn[field], bytes.fromhex(f.read().strip()))
+            self.assertTrue(os.path.exists(os.path.join(data, f"simulate_app.{name}.teal")))
 
     def test_check_simulate_app_wants_logs_deltas_and_inner_txns(self):
         full = {"txn-groups": [{"txn-results": [{"txn-result": {
@@ -535,6 +535,13 @@ class SimulateAppRequestTest(unittest.TestCase):
         problems = rl.check_simulate_app({"status": 200, "body": json.dumps(full)})
         self.assertEqual(problems, ["simulate_app txn-result has no inner-txns"])
         self.assertTrue(rl.check_simulate_app({"status": 400, "body": "x"}))
+
+    def test_check_simulate_app_names_the_missing_path_of_a_malformed_response(self):
+        for body in ('{"txn-groups": [{"txn-results": [{"x": 1}]}]}',
+                     '{"txn-groups": [{"txn-results": [{"txn-result": []}]}]}'):
+            with self.assertRaises(ValueError) as cm:
+                rl.check_simulate_app({"status": 200, "body": body})
+            self.assertIn("txn-groups[0].txn-results[0].txn-result", str(cm.exception))
 
 
 class RequestSetTest(unittest.TestCase):

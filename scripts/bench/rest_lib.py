@@ -23,6 +23,7 @@ import base64
 import copy
 import hashlib
 import json
+import os
 import struct
 import urllib.parse
 
@@ -548,36 +549,34 @@ def simulate_request(sender, receiver, params):
             "body_b64": base64.b64encode(body).decode()}
 
 
-# The approval program of the `simulate_app` request, assembled from the TEAL
-# below (pinned to its source by crates/core/algo-ledger/tests/
-# simulation_bench_app_create_test.rs, which test_rest.py reads). It runs on the
-# create + opt-in call, so one simulated transaction yields every piece go's
-# ConvertInnerTxn reports for an app call: a log, a global delta, a local delta
-# and an inner transaction (a zero-amount payment from the app account, fee
-# paid by the outer transaction).
-#
-#   #pragma version 8
-#   byte "hello"; log
-#   byte "gk"; int 7; app_global_put
-#   txn Sender; byte "lk"; byte "world"; app_local_put
-#   itxn_begin; int pay; itxn_field TypeEnum
-#   txn Sender; itxn_field Receiver; int 0; itxn_field Fee; itxn_submit
-#   int 1; return
-BENCH_APPROVAL_HEX = ("08200101800568656c6c6fb08002676b810767310080026c6b8005776f726c64"
-                      "66b122b2103100b2078100b201b32243")
-BENCH_CLEAR_HEX = "088101"  # #pragma version 8; int 1
+# The programs of the `simulate_app` request live in scripts/bench/data/: the
+# TEAL sources (`simulate_app.approval.teal`, `simulate_app.clear.teal`) and
+# their assembled hex, the one copy the request is built from. The Rust test
+# crates/core/algo-ledger/tests/simulation_bench_app_create_test.rs reads the
+# same files and fails unless the assembler turns each TEAL into its hex. The
+# approval program runs on the create + opt-in call, so one simulated
+# transaction yields every piece go's ConvertInnerTxn reports for an app call:
+# a log, a global delta, a local delta and an inner transaction (a zero-amount
+# payment from the app account, fee paid by the outer transaction).
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
+
+def _data_hex(name):
+    with open(os.path.join(DATA_DIR, name), encoding="utf-8") as f:
+        return bytes.fromhex(f.read().strip())
 
 
 def simulate_app_request(sender, params):
     """The POST /v2/transactions/simulate request that creates an application
-    and opts the sender in (OnCompletion OptIn), with BENCH_APPROVAL_HEX: the
+    and opts the sender in (OnCompletion OptIn), with the approval program from scripts/bench/data: the
     `txn-result` then has logs, global-state-delta, local-state-delta and
     inner-txns. A create needs no pre-existing application, so the request
     works on any corpus; built only from the node-independent
     /v2/transactions/params values so both nodes get identical bytes."""
     last = int(params["last-round"])
     txn = {"type": "appl", "snd": decode_address(sender), "apan": 1,
-           "apap": bytes.fromhex(BENCH_APPROVAL_HEX), "apsu": bytes.fromhex(BENCH_CLEAR_HEX),
+           "apap": _data_hex("simulate_app.approval.hex"),
+           "apsu": _data_hex("simulate_app.clear.hex"),
            "apgs": {"nui": 1}, "apls": {"nbs": 1},
            "fee": 2 * int(params["min-fee"]), "fv": last + 1, "lv": last + 1000,
            "gen": params["genesis-id"], "gh": base64.b64decode(params["genesis-hash"])}
@@ -750,11 +749,18 @@ def pick_sender(accounts, reserved):
 def check_simulate_app(resp):
     """Problems that make the simulate_app response not the app-call result
     it exists to compare: a successful simulation (check_simulation) whose
-    txn-result carries a log, both state deltas and an inner transaction."""
+    txn-result carries a log, both state deltas and an inner transaction.
+    ValueError, naming the missing path, when the body has another shape."""
     problems = check_simulation(resp)
     if problems:
         return problems
-    res = json.loads(resp["body"])["txn-groups"][0]["txn-results"][0]["txn-result"]
+    path = "txn-groups[0].txn-results[0].txn-result"
+    try:
+        res = json.loads(resp["body"])["txn-groups"][0]["txn-results"][0]["txn-result"]
+        if not isinstance(res, dict):
+            raise TypeError("not an object")
+    except (ValueError, KeyError, IndexError, TypeError) as e:
+        raise ValueError(f"simulate_app response has no {path} ({type(e).__name__}: {e})") from None
     for key in ("logs", "global-state-delta", "local-state-delta", "inner-txns",
                 "application-index"):
         if not res.get(key):
@@ -779,7 +785,8 @@ def check_simulation(resp):
     if "failed-at" in group:
         problems.append(f"simulation failed at {group['failed-at']}")
     for i, r in enumerate(group.get("txn-results", [])):
-        err = r.get("txn-result", {}).get("pool-error")
+        tr = r.get("txn-result") if isinstance(r, dict) else None
+        err = tr.get("pool-error") if isinstance(tr, dict) else None
         if err:
             problems.append(f"txn {i}: pool-error {err}")
     if not group.get("txn-results"):

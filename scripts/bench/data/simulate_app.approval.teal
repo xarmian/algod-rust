@@ -1,0 +1,20 @@
+#pragma version 8
+byte "hello"
+log
+byte "gk"
+int 7
+app_global_put
+txn Sender
+byte "lk"
+byte "world"
+app_local_put
+itxn_begin
+int pay
+itxn_field TypeEnum
+txn Sender
+itxn_field Receiver
+int 0
+itxn_field Fee
+itxn_submit
+int 1
+return
