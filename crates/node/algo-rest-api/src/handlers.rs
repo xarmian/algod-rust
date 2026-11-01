@@ -3012,13 +3012,43 @@ fn convert_inner_txn(itx: &rmpv::Value) -> Option<models::PreEncodedTxInfo> {
     };
 
     if let Some(dt) = inner_eval_delta {
-        info.global_state_delta = convert_global_state_delta(dt);
-        info.local_state_delta = convert_local_state_delta(dt, &stxn);
-        info.logs = convert_logs(dt);
-        info.inner_txns = convert_inner_txns(dt);
+        let parts = eval_delta_parts(&stxn, dt);
+        info.global_state_delta = parts.global_state_delta;
+        info.local_state_delta = parts.local_state_delta;
+        info.logs = parts.logs;
+        info.inner_txns = parts.inner_txns;
     }
 
     Some(info)
+}
+
+/// The parts of a transaction's `ApplyData.EvalDelta` that go's
+/// `ConvertInnerTxn` reports, each `None` when empty (go `sliceOrNil`).
+#[derive(Debug, Clone, Default)]
+pub struct EvalDeltaParts {
+    /// `global-state-delta`.
+    pub global_state_delta: Option<models::StateDelta>,
+    /// `local-state-delta`.
+    pub local_state_delta: Option<Vec<models::AccountStateDelta>>,
+    /// `logs`.
+    pub logs: Option<Vec<Vec<u8>>>,
+    /// `inner-txns`, converted recursively.
+    pub inner_txns: Option<Vec<models::PreEncodedTxInfo>>,
+}
+
+/// Convert the eval-delta (`dt`) of `txn` into go's `ConvertInnerTxn` parts;
+/// `txn` supplies the accounts that resolve the local-delta indices. Shared by
+/// the inner-txn conversion and simulate's `txn-result` (issue #2178).
+pub fn eval_delta_parts(
+    txn: &algo_types::SignedTransaction,
+    eval_delta: &rmpv::Value,
+) -> EvalDeltaParts {
+    EvalDeltaParts {
+        global_state_delta: convert_global_state_delta(eval_delta),
+        local_state_delta: convert_local_state_delta(eval_delta, txn),
+        logs: convert_logs(eval_delta),
+        inner_txns: convert_inner_txns(eval_delta),
+    }
 }
 
 // ---------------------------------------------------------------------------

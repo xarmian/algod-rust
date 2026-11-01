@@ -437,9 +437,14 @@ fn signed_txn_tree_to_json(tree: &rmpv::Value) -> serde_json::Value {
 /// valid transaction, so a (never expected) msgpack round-trip failure is logged
 /// and degrades to the plain serde form instead of failing the response.
 pub(crate) fn signed_txn_go_json(txn: &algo_types::SignedTransaction) -> serde_json::Value {
-    let tree = algo_codec::to_vec_named_str_preserving(txn)
-        .map_err(|e| e.to_string())
-        .and_then(|bytes| rmpv::decode::read_value(&mut &bytes[..]).map_err(|e| e.to_string()));
+    // go's codec omits every zero field (`omitempty`, a zero `fv` included): an
+    // inner transaction pays no fee of its own, so `fee: 0` must not render
+    // (issue #2178). The serde derive writes those three unless asked not to.
+    let tree = algo_types::with_zero_header_fields_omitted(|| {
+        algo_codec::to_vec_named_str_preserving(txn)
+    })
+    .map_err(|e| e.to_string())
+    .and_then(|bytes| rmpv::decode::read_value(&mut &bytes[..]).map_err(|e| e.to_string()));
     match tree {
         Ok(tree) => signed_txn_tree_to_json(&tree),
         Err(e) => {
@@ -499,6 +504,21 @@ pub fn encode_block_json(raw_block_response: &[u8]) -> Result<Vec<u8>, BlockJson
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #2178: an inner transaction with no fee renders without `fee`, as
+    /// go's codec JSON omits zero fields; a nonzero fee is kept.
+    #[test]
+    fn signed_txn_go_json_omits_a_zero_fee() {
+        let mut stx = algo_types::SignedTransaction::default();
+        stx.txn.fee = 0;
+        stx.txn.first_valid = algo_types::Round(5);
+        let json = signed_txn_go_json(&stx);
+        assert!(json["txn"].get("fee").is_none(), "{json}");
+        assert!(json["txn"].get("lv").is_none(), "{json}");
+        assert_eq!(json["txn"]["fv"], 5);
+        stx.txn.fee = 1000;
+        assert_eq!(signed_txn_go_json(&stx)["txn"]["fee"], 1000);
+    }
 
     /// The single-letter asset-params address keys must only be treated as
     /// addresses under `apar`. In particular `c` is `AssetParams.Clawback`

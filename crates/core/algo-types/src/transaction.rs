@@ -287,15 +287,15 @@ pub struct Transaction {
     pub sender: Address,
 
     /// Fee (in microAlgos).
-    #[serde(rename = "fee", default)]
+    #[serde(rename = "fee", default, skip_serializing_if = "skip_zero_fee")]
     pub fee: u64,
 
     /// First valid round.
-    #[serde(rename = "fv", default)]
+    #[serde(rename = "fv", default, skip_serializing_if = "skip_zero_round")]
     pub first_valid: Round,
 
     /// Last valid round.
-    #[serde(rename = "lv", default)]
+    #[serde(rename = "lv", default, skip_serializing_if = "skip_zero_round")]
     pub last_valid: Round,
 
     /// Note field (variable length).
@@ -512,6 +512,32 @@ pub struct Transaction {
     /// Reject version for application calls.
     #[serde(rename = "aprv", default, skip_serializing_if = "is_zero_u64")]
     pub reject_version: u64,
+}
+
+thread_local! {
+    static OMIT_ZERO_HEADER_FIELDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the serde derive of [`Transaction`] omitting a zero `fee`,
+/// `fv` and `lv`, as go's msgp/codec encoders omit every zero field
+/// (`omitempty` semantics). Off by default: the plain derive always writes
+/// them and other callers depend on that. Only response rendering (a REST
+/// `PreEncodedTxInfo.txn`, issue #2178) turns it on; canonical txn encoding
+/// for txids and signing is separate (`algo-codec`'s `canonical.rs`) and is
+/// not affected.
+pub fn with_zero_header_fields_omitted<R>(f: impl FnOnce() -> R) -> R {
+    let prev = OMIT_ZERO_HEADER_FIELDS.with(|c| c.replace(true));
+    let out = f();
+    OMIT_ZERO_HEADER_FIELDS.with(|c| c.set(prev));
+    out
+}
+
+fn skip_zero_fee(v: &u64) -> bool {
+    *v == 0 && OMIT_ZERO_HEADER_FIELDS.with(|c| c.get())
+}
+
+fn skip_zero_round(v: &Round) -> bool {
+    v.0 == 0 && OMIT_ZERO_HEADER_FIELDS.with(|c| c.get())
 }
 
 fn is_empty_bytes(v: &ByteBuf) -> bool {

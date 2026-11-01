@@ -23,6 +23,7 @@ import base64
 import copy
 import hashlib
 import json
+import os
 import struct
 import urllib.parse
 
@@ -548,6 +549,44 @@ def simulate_request(sender, receiver, params):
             "body_b64": base64.b64encode(body).decode()}
 
 
+# The programs of the `simulate_app` request live in scripts/bench/data/: the
+# TEAL sources (`simulate_app.approval.teal`, `simulate_app.clear.teal`) and
+# their assembled hex, the one copy the request is built from. The Rust test
+# crates/core/algo-ledger/tests/simulation_bench_app_create_test.rs reads the
+# same files and fails unless the assembler turns each TEAL into its hex. The
+# approval program runs on the create + opt-in call, so one simulated
+# transaction yields every piece go's ConvertInnerTxn reports for an app call:
+# a log, a global delta, a local delta and an inner transaction (a zero-amount
+# payment from the app account, fee paid by the outer transaction).
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
+
+def _data_hex(name):
+    with open(os.path.join(DATA_DIR, name), encoding="utf-8") as f:
+        return bytes.fromhex(f.read().strip())
+
+
+def simulate_app_request(sender, params):
+    """The POST /v2/transactions/simulate request that creates an application
+    and opts the sender in (OnCompletion OptIn), with the approval program from scripts/bench/data: the
+    `txn-result` then has logs, global-state-delta, local-state-delta and
+    inner-txns. A create needs no pre-existing application, so the request
+    works on any corpus; built only from the node-independent
+    /v2/transactions/params values so both nodes get identical bytes."""
+    last = int(params["last-round"])
+    txn = {"type": "appl", "snd": decode_address(sender), "apan": 1,
+           "apap": _data_hex("simulate_app.approval.hex"),
+           "apsu": _data_hex("simulate_app.clear.hex"),
+           "apgs": {"nui": 1}, "apls": {"nbs": 1},
+           "fee": 2 * int(params["min-fee"]), "fv": last + 1, "lv": last + 1000,
+           "gen": params["genesis-id"], "gh": base64.b64decode(params["genesis-hash"])}
+    body = msgpack({"txn-groups": [{"txns": [{"txn": txn}]}], "allow-empty-signatures": True})
+    return {"name": "simulate_app", "method": "POST",
+            "path": "/v2/transactions/simulate?format=json", "kind": "json",
+            "content_type": "application/msgpack",
+            "body_b64": base64.b64encode(body).decode()}
+
+
 # ---- the request set ---------------------------------------------------------
 
 def pick_hot_cold(accounts):
@@ -565,7 +604,8 @@ def pick_hot_cold(accounts):
 def request_set(state, simulate=None):
     """The fixed request set, from the discovered ledger `state` ({hot, cold,
     app_id, box_name_b64, round}). Names are stable (they key the result
-    rows). `simulate` is the optional request from simulate_request()."""
+    rows). `simulate` is the optional request from simulate_request(), or a list
+    of such requests (simulate_request() and simulate_app_request())."""
     for k in ("hot", "cold", "app_id", "box_name_b64", "round"):
         if state.get(k) in (None, ""):
             raise ValueError(f"discovered state has no {k!r}: the corpus must provide a hot and "
@@ -585,7 +625,8 @@ def request_set(state, simulate=None):
     ]
     out = [{"name": n, "method": "GET", "path": p, "kind": k} for n, p, k in reqs]
     if simulate is not None:
-        out.append(dict(simulate))
+        for sim in [simulate] if isinstance(simulate, dict) else simulate:
+            out.append(dict(sim))
     return out
 
 
@@ -705,6 +746,28 @@ def pick_sender(accounts, reserved):
     return sorted(cand, key=lambda a: (-int(cand[a]["amount"]), a))[0]
 
 
+def check_simulate_app(resp):
+    """Problems that make the simulate_app response not the app-call result
+    it exists to compare: a successful simulation (check_simulation) whose
+    txn-result carries a log, both state deltas and an inner transaction.
+    ValueError, naming the missing path, when the body has another shape."""
+    problems = check_simulation(resp)
+    if problems:
+        return problems
+    path = "txn-groups[0].txn-results[0].txn-result"
+    try:
+        res = json.loads(resp["body"])["txn-groups"][0]["txn-results"][0]["txn-result"]
+        if not isinstance(res, dict):
+            raise TypeError("not an object")
+    except (ValueError, KeyError, IndexError, TypeError) as e:
+        raise ValueError(f"simulate_app response has no {path} ({type(e).__name__}: {e})") from None
+    for key in ("logs", "global-state-delta", "local-state-delta", "inner-txns",
+                "application-index"):
+        if not res.get(key):
+            problems.append(f"simulate_app txn-result has no {key}")
+    return problems
+
+
 def check_simulation(resp):
     """Problems that make a simulate response not a successful simulation
     (empty: it is one). The simulate row must measure a real simulation, not
@@ -722,7 +785,8 @@ def check_simulation(resp):
     if "failed-at" in group:
         problems.append(f"simulation failed at {group['failed-at']}")
     for i, r in enumerate(group.get("txn-results", [])):
-        err = r.get("txn-result", {}).get("pool-error")
+        tr = r.get("txn-result") if isinstance(r, dict) else None
+        err = tr.get("pool-error") if isinstance(tr, dict) else None
         if err:
             problems.append(f"txn {i}: pool-error {err}")
     if not group.get("txn-results"):

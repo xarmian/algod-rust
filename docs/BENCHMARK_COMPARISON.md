@@ -1321,11 +1321,20 @@ indexers and dApps actually hit, and it was never compared before.
    address), `account_assets` (`/v2/accounts/{hot}/assets`), `application`
    (`/v2/applications/{id}`), `box` (`/v2/applications/{id}/box?name=...`),
    `blocks_json` and `blocks_msgpack` (`/v2/blocks/{last}` as JSON and
-   `?format=msgpack`), `tx_params` (`/v2/transactions/params`) and `simulate`
+   `?format=msgpack`), `tx_params` (`/v2/transactions/params`), `simulate`
    (`POST /v2/transactions/simulate`, one unsigned 1-microAlgo payment with
    `allow-empty-signatures`, built from `tx_params` only, so both nodes get
-   identical bytes). The application is the newest one holding a box. The
-   facts the set needs are discovered from the go node, deterministically.
+   identical bytes) and `simulate_app` (the same endpoint, one unsigned
+   application create with OnCompletion OptIn whose approval program logs,
+   writes a global and a local key and issues an inner payment, so the
+   `txn-result` carries `logs`, `global-state-delta`, `local-state-delta` and
+   `inner-txns`; a create needs no pre-existing application, so it works on
+   any corpus; the programs live as TEAL plus assembled hex in
+   `scripts/bench/data/`, and
+   `crates/core/algo-ledger/tests/simulation_bench_app_create_test.rs` fails
+   unless the assembler turns each TEAL into its hex). The application is the
+   newest one holding a box. The facts the set needs are discovered from the
+   go node, deterministically.
 4. **One load generator.** `benchmarks/go-restload` (`restload`, standard
    library only, MIT) drives both nodes: closed-loop workers at a fixed
    concurrency, HTTP keep-alive, no compression, one endpoint at a time.
@@ -1393,11 +1402,16 @@ The number of allowlisted differences is recorded in every row's metadata
 
 The allowlist is currently empty: the last entry (#2161, simulate
 `sender-rewards`) was fixed, so the nodes answer the requests the gate sends
-identically. That is not full parity: the simulate request is a payment, so
-the gate does not cover an app-call simulate, whose `txn-result` still omits
-state deltas, logs and inner transactions
-([#2178](https://github.com/xarmian/algod-rust/issues/2178)). The staleness
-check stays in force: an entry that stops matching a difference fails the gate.
+identically. Since #2178 the gate also compares one fixed app-call simulate
+(`simulate_app`): a single successful create + OptIn whose `txn-result` has a
+log, a single-key global delta, a single-key local delta for the sender and
+one inner payment. That is all it proves about app-call simulation. It does
+not cover failed app calls (the partial EvalDelta), ClearState, the order of
+the keys in a multi-key delta (go builds those from random map iteration, so
+the request deliberately uses one key per delta), local deltas of accounts
+other than the sender, or nested inner app calls; unit tests cover some of
+those without a go oracle. The staleness check stays in force: an entry that
+stops matching a difference fails the gate.
 
 ### What is measured
 
@@ -1430,10 +1444,11 @@ endpoint **fails the tier** instead of publishing its numbers. The measured
 duration must be at least 0.1 s and is passed to the load generator in fixed
 point (`0.500s`).
 
-The `simulate` request is sent from the richest genesis account that is neither
-the RewardsPool nor the FeeSink, and the tier checks that the simulation
-succeeded (no `failure-message`, no `pool-error`), so that row measures a real
-simulation.
+The `simulate` and `simulate_app` requests are sent from the richest genesis
+account that is neither the RewardsPool nor the FeeSink, and the tier checks
+that the simulations succeeded (no `failure-message`, no `pool-error`, and for
+`simulate_app` a log, both deltas and an inner transaction in the result), so
+those rows measure real simulations.
 
 ### Limits of the numbers
 

@@ -499,6 +499,51 @@ class SimulateBodyTest(unittest.TestCase):
         self.assertEqual(rl.simulate_request(ZERO_ADDR, ZERO_ADDR, params), req)
 
 
+class SimulateAppRequestTest(unittest.TestCase):
+    PARAMS = {"genesis-id": "g", "genesis-hash": base64.b64encode(bytes(range(32))).decode(),
+              "min-fee": 1000, "last-round": 10}
+
+    def test_request_creates_and_opts_in_an_app_with_the_bench_program(self):
+        req = rl.simulate_app_request(ZERO_ADDR, self.PARAMS)
+        self.assertEqual(req["name"], "simulate_app")
+        self.assertEqual(req["method"], "POST")
+        body = base64.b64decode(req["body_b64"])
+        doc = rl.msgpack_decode(body)
+        txn = doc["txn-groups"][0]["txns"][0]["txn"]
+        self.assertEqual(txn["type"], "appl")
+        self.assertEqual(txn["apan"], 1)  # OptIn: the create writes the sender's local state
+        self.assertEqual(txn["fee"], 2000)  # pays for the inner transaction too
+        self.assertTrue(doc["allow-empty-signatures"])
+        self.assertEqual(rl.simulate_app_request(ZERO_ADDR, self.PARAMS), req)
+
+    def test_program_hex_files_are_the_single_source_of_the_programs(self):
+        req = rl.simulate_app_request(ZERO_ADDR, self.PARAMS)
+        txn = rl.msgpack_decode(base64.b64decode(req["body_b64"]))["txn-groups"][0]["txns"][0]["txn"]
+        data = os.path.join(os.path.dirname(rl.__file__), "data")
+        for field, name in (("apap", "approval"), ("apsu", "clear")):
+            with open(os.path.join(data, f"simulate_app.{name}.hex"), encoding="utf-8") as f:
+                self.assertEqual(txn[field], bytes.fromhex(f.read().strip()))
+            self.assertTrue(os.path.exists(os.path.join(data, f"simulate_app.{name}.teal")))
+
+    def test_check_simulate_app_wants_logs_deltas_and_inner_txns(self):
+        full = {"txn-groups": [{"txn-results": [{"txn-result": {
+            "logs": ["aGVsbG8="], "global-state-delta": [{}], "local-state-delta": [{}],
+            "inner-txns": [{}], "application-index": 5}}]}]}
+        ok = {"status": 200, "body": json.dumps(full)}
+        self.assertEqual(rl.check_simulate_app(ok), [])
+        del full["txn-groups"][0]["txn-results"][0]["txn-result"]["inner-txns"]
+        problems = rl.check_simulate_app({"status": 200, "body": json.dumps(full)})
+        self.assertEqual(problems, ["simulate_app txn-result has no inner-txns"])
+        self.assertTrue(rl.check_simulate_app({"status": 400, "body": "x"}))
+
+    def test_check_simulate_app_names_the_missing_path_of_a_malformed_response(self):
+        for body in ('{"txn-groups": [{"txn-results": [{"x": 1}]}]}',
+                     '{"txn-groups": [{"txn-results": [{"txn-result": []}]}]}'):
+            with self.assertRaises(ValueError) as cm:
+                rl.check_simulate_app({"status": 200, "body": body})
+            self.assertIn("txn-groups[0].txn-results[0].txn-result", str(cm.exception))
+
+
 class RequestSetTest(unittest.TestCase):
     STATE = {"hot": "H", "cold": "C", "app_id": 12, "box_name_b64": "Ym94", "round": 100,
              "asset_holder": "H", "params": None}
@@ -514,6 +559,11 @@ class RequestSetTest(unittest.TestCase):
                "content_type": "application/msgpack", "body_b64": "AA=="}
         names = [r["name"] for r in rl.request_set(self.STATE, simulate=sim)]
         self.assertEqual(names[-1], "simulate")
+
+    def test_a_list_of_simulate_requests_is_added_in_order(self):
+        sims = [{"name": "simulate", "path": "/p"}, {"name": "simulate_app", "path": "/q"}]
+        names = [r["name"] for r in rl.request_set(self.STATE, simulate=sims)]
+        self.assertEqual(names[-2:], ["simulate", "simulate_app"])
 
     def test_paths_use_the_state(self):
         by = {r["name"]: r for r in rl.request_set(self.STATE)}

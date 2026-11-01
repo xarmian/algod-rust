@@ -7936,6 +7936,84 @@ async fn pending_transaction_info_inner_txn_reports_created_asset_index() {
     assert!(inner_txns[0].get("application-index").is_none());
 }
 
+/// Issue #2178: an inner payment pays no fee of its own, and go's msgp/codec
+/// encoders omit a zero `fee`/`fv`/`lv` (a zero `fv` is omitted too), in JSON
+/// and in msgpack; the outer transaction keeps its own.
+#[tokio::test]
+async fn pending_transaction_info_inner_payment_omits_zero_fee_in_json_and_msgpack() {
+    let mut node = MockNode::synced();
+    let stxn = make_test_signed_txn();
+    let txid = algo_codec::compute_txn_id(&stxn.txn);
+    let mut inner_stxn = make_test_signed_txn();
+    inner_stxn.txn.txn_type = TxnType::Pay;
+    inner_stxn.txn.fee = 0;
+    inner_stxn.txn.first_valid = 0.into();
+    inner_stxn.txn.last_valid = 0.into();
+    let inner_bytes = rmp_serde::to_vec_named(&inner_stxn).expect("encode inner txn");
+    let inner_value = rmpv::decode::read_value(&mut &inner_bytes[..]).expect("decode inner");
+    let outer_fee = stxn.txn.fee;
+    node.pending_txn_lookup.insert(
+        txid.0,
+        TxnWithStatus {
+            txn: stxn,
+            confirmed_round: 100,
+            pool_error: String::new(),
+            closing_amount: 0,
+            asset_closing_amount: 0,
+            sender_rewards: 0,
+            receiver_rewards: 0,
+            close_rewards: 0,
+            asset_index: None,
+            application_index: None,
+            eval_delta: Some(rmpv::Value::Map(vec![(
+                rmpv::Value::String("itx".into()),
+                rmpv::Value::Array(vec![inner_value]),
+            )])),
+            logs: None,
+            inner_txns: None,
+        },
+    );
+    let server = TestServer::start(node).await;
+    let get = |fmt: &'static str| {
+        let url = server.url(&format!("/v2/transactions/pending/{txid}?format={fmt}"));
+        let req = server
+            .client
+            .get(url)
+            .header("X-Algo-API-Token", &server.api_token);
+        async move { req.send().await.unwrap().bytes().await.unwrap() }
+    };
+
+    let json: serde_json::Value = serde_json::from_slice(&get("json").await).unwrap();
+    let inner = &json["inner-txns"][0]["txn"]["txn"];
+    for key in ["fee", "fv", "lv"] {
+        assert!(inner.get(key).is_none(), "inner {key} in json: {inner}");
+    }
+    assert_eq!(json["txn"]["txn"]["fee"], outer_fee);
+
+    let body = get("msgpack").await;
+    let mp = rmpv::decode::read_value(&mut &body[..]).expect("msgpack");
+    let field = |v: &rmpv::Value, k: &str| -> Option<rmpv::Value> {
+        v.as_map()?
+            .iter()
+            .find(|(key, _)| key.as_str() == Some(k))
+            .map(|(_, x)| x.clone())
+    };
+    let inner_list = field(&mp, "inner-txns").expect("inner-txns");
+    let inner_txn = field(
+        &field(&inner_list.as_array().unwrap()[0], "txn").unwrap(),
+        "txn",
+    )
+    .expect("inner txn body");
+    for key in ["fee", "fv", "lv"] {
+        assert!(field(&inner_txn, key).is_none(), "inner {key} in msgpack");
+    }
+    let outer_txn = field(&field(&mp, "txn").unwrap(), "txn").unwrap();
+    assert_eq!(
+        field(&outer_txn, "fee").and_then(|v| v.as_u64()),
+        Some(outer_fee)
+    );
+}
+
 #[tokio::test]
 async fn pending_transaction_info_with_logs_from_eval_delta() {
     let mut node = MockNode::synced();
