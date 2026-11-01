@@ -410,6 +410,24 @@ func blockDupOracle() {
 
 	badAuthT := payTxn("order-bad-auth", [32]byte{})
 	overT := withAmount(payTxn("order-overspend", [32]byte{}), overspend)
+	twinT := payTxn("order-twin", [32]byte{})
+	acfgFeeT := transactions.Transaction{
+		Type: protocol.AssetConfigTx,
+		Header: transactions.Header{
+			Sender:      sender,
+			Fee:         basics.MicroAlgos{Raw: overspend},
+			FirstValid:  1,
+			LastValid:   1000,
+			Note:        []byte("order-acfg-fee"),
+			GenesisID:   blockDupGenesisID,
+			GenesisHash: genesisHash,
+		},
+		AssetConfigTxnFields: transactions.AssetConfigTxnFields{
+			AssetParams: basics.AssetParams{Total: 1},
+		},
+	}
+	// Leaves 50 microAlgos: below the minimum balance.
+	minBalT := withAmount(payTxn("order-min-balance", [32]byte{}), 997_998_000-1000-50)
 	type orderSpec struct {
 		name  string
 		pre   [][]transactions.SignedTxn
@@ -450,6 +468,17 @@ func blockDupOracle() {
 		// member 0 reuses a live ledger lease; member 1 is expired.
 		{"ledger_lease_then_expired", nil, signAll(good,
 			payTxn("order-ledger-lease-2", lease), withValidity(payTxn("order-expired-2", [32]byte{}), 1, 1))},
+		// the same transaction twice, nothing else wrong: go's TEST stage
+		// cannot see a sibling (txid twin included), its apply stage can.
+		{"in_group_txid_twin", nil, signAll(good, twinT, twinT)},
+		// a non-payment member 0 whose fee exceeds the balance: the fee move
+		// that opens its apply fails (the precheck models the fee only).
+		{"non_payment_fee_overspend", nil, one(good(acfgFeeT))},
+		// member 0 leaves the sender below the minimum balance (an apply-stage
+		// failure the precheck does not model).
+		{"min_balance_member0", nil, one(good(minBalT))},
+		// ... and member 1 repeats it: member 0's apply failure ranks first.
+		{"min_balance_then_dup", nil, signAll(good, minBalT, minBalT)},
 		// control: a clean group.
 		{"clean_group", nil, signAll(good, payTxn("order-clean-a", leaseQ), payTxn("order-clean-b", [32]byte{}))},
 	} {

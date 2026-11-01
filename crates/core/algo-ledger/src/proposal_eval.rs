@@ -98,6 +98,32 @@ pub fn evaluate_group_with_txids<B: OverlayBase + ?Sized>(
     group: &[SignedTransaction],
     txids: Option<Vec<algo_types::Digest>>,
 ) -> Result<GroupEval, GroupEvalError> {
+    evaluate_group_impl(base, overlay, template, group, txids, true)
+}
+
+/// [`evaluate_group_with_txids`] that never keeps the group's effects: the
+/// overlay is rolled back whether the group is accepted or rejected, so the
+/// verdict can be asked of a group that is not going to be admitted (the
+/// pool's reconciliation of a precheck rejection, issue #2130) without
+/// changing the pending state.
+pub fn evaluate_group_discarding<B: OverlayBase + ?Sized>(
+    base: &B,
+    overlay: &mut PendingOverlay,
+    template: &Block,
+    group: &[SignedTransaction],
+    txids: Option<Vec<algo_types::Digest>>,
+) -> Result<GroupEval, GroupEvalError> {
+    evaluate_group_impl(base, overlay, template, group, txids, false)
+}
+
+fn evaluate_group_impl<B: OverlayBase + ?Sized>(
+    base: &B,
+    overlay: &mut PendingOverlay,
+    template: &Block,
+    group: &[SignedTransaction],
+    txids: Option<Vec<algo_types::Digest>>,
+    keep: bool,
+) -> Result<GroupEval, GroupEvalError> {
     let tip = base.base_current_round();
     if base.base_is_stale() || overlay.base_round() != tip || template.round.0 != tip.0 + 1 {
         return Err(GroupEvalError::Stale);
@@ -146,7 +172,11 @@ pub fn evaluate_group_with_txids<B: OverlayBase + ?Sized>(
     }
     match res {
         Ok(Ok(())) => {
-            overlay.commit_group(probe.out.final_txn_counter);
+            if keep {
+                overlay.commit_group(probe.out.final_txn_counter);
+            } else {
+                overlay.rollback_group();
+            }
             Ok(GroupEval {
                 apply_data: ad,
                 final_txn_counter: probe.out.final_txn_counter,

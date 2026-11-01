@@ -222,6 +222,44 @@
       "add_error": "transaction TKR2RH7ENST3ZZUHSXFDB5CE264SOAKOCMK7UJGNCUUCUMAA475A using an overlapping lease (sender, lease):(XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI, CEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEI7JH2AYM)"
     },
     {
+      "name": "in_group_txid_twin",
+      "pre": null,
+      "group": [
+        "gqNzaWfEQOT8JGiKJ1WnQh26I9cI+Ot46vWmYiS7GsRo5IAo6tMSdG/bsHTfe6LCMBw2dCATeArlyoShFe+Y2AYFHi5BfgyjdHhui6NhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQg9uIXH4B3Lzi1+vVf4c7ksHOPvSKupzwpFNDu+zhuQfSibHbNA+ikbm90ZcQKb3JkZXItdHdpbqNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaNwYXk=",
+        "gqNzaWfEQOT8JGiKJ1WnQh26I9cI+Ot46vWmYiS7GsRo5IAo6tMSdG/bsHTfe6LCMBw2dCATeArlyoShFe+Y2AYFHi5BfgyjdHhui6NhbXTOAA9CQKNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQg9uIXH4B3Lzi1+vVf4c7ksHOPvSKupzwpFNDu+zhuQfSibHbNA+ikbm90ZcQKb3JkZXItdHdpbqNyY3bEIAsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaNwYXk="
+      ],
+      "test_error": "",
+      "add_error": "transaction already in ledger: U7WVSWIX5OYMGGVLFNZ2J3SIYOTPG2MGLOIQUV2CXBVYD2UCRH5Q"
+    },
+    {
+      "name": "non_payment_fee_overspend",
+      "pre": null,
+      "group": [
+        "gqNzaWfEQCzwW5mrxGjbB9CrFL8H91hl/OdHHJXrEKxuGGpjeiR4OKWaIIAmpwx6kVbfpWN95UjoxAySsBIK71+JCGgOlQ6jdHhuiaRhcGFygaF0AaNmZWXPAAAAASoF8gCiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEDm9yZGVyLWFjZmctZmVlo3NuZMQgvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaWkdHlwZaRhY2Zn"
+      ],
+      "test_error": "",
+      "add_error": "transaction AB3PDUKLA4E6QNGGVFOEC3CCMRA3LKBCXLSEVNYDLHECCRJGFNPQ: overspend (account XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI, data {AccountBaseData:{Status:Offline MicroAlgos:997.998000A RewardsBase:0 RewardedMicroAlgos:0.0A AuthAddr:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ IncentiveEligible:false TotalAppSchema:{NumUint:0 NumByteSlice:0} TotalExtraAppPages:0 TotalAppParams:0 TotalAppLocalStates:0 TotalAssetParams:0 TotalAssets:0 TotalBoxes:0 TotalBoxBytes:0 LastProposed:0 LastHeartbeat:0} VotingData:{VoteID:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] SelectionID:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] StateProofID:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] VoteFirstValid:0 VoteLastValid:0 VoteKeyDilution:0}}, tried to spend 5000A)"
+    },
+    {
+      "name": "min_balance_member0",
+      "pre": null,
+      "group": [
+        "gqNzaWfEQPtmAt+fBKz/qaNtbjpuNAW3qaKa1YonQ5BkOCNsuuEQINVFBD3r4Iz1w/sLZqgXgitilPskyWpKTjMH5R5ydgujdHhuiqNhbXTOO3w5lqNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBhomx2zQPopG5vdGXEEW9yZGVyLW1pbi1iYWxhbmNlo3JjdsQgCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwujc25kxCC8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaR0eXBlo3BheQ=="
+      ],
+      "test_error": "",
+      "add_error": "transaction GAJ2IBMTYPWC2OKMDQDTQJHRRSP4LVMPHPFJKB7GQOY5WA4WZQIQ: account XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI balance 50 below min 100000 (0 assets)"
+    },
+    {
+      "name": "min_balance_then_dup",
+      "pre": null,
+      "group": [
+        "gqNzaWfEQFiLfRsiHV4Q1XMO5cXAWBS4BcPtiM5kfSE6cbmurx6hhb24O1mM9maIr5TRaPhk9/rimVRXYWSlehthPL3g2gKjdHhui6NhbXTOO3w5lqNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQgfYncR7zNssct7CidflhQw3uZgRYugXVxU4d9Bdgfhl2ibHbNA+ikbm90ZcQRb3JkZXItbWluLWJhbGFuY2WjcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWjcGF5",
+        "gqNzaWfEQFiLfRsiHV4Q1XMO5cXAWBS4BcPtiM5kfSE6cbmurx6hhb24O1mM9maIr5TRaPhk9/rimVRXYWSlehthPL3g2gKjdHhui6NhbXTOO3w5lqNmZWXNA+iiZnYBo2dlbrhibG9jay1jaGVja2R1cC1vcmFjbGUtdjGiZ2jEIOi//SrKCIhOdTn7MroUViFd/1YebwkJ+rc54qSpekBho2dycMQgfYncR7zNssct7CidflhQw3uZgRYugXVxU4d9Bdgfhl2ibHbNA+ikbm90ZcQRb3JkZXItbWluLWJhbGFuY2WjcmN2xCALCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLC6NzbmTEILx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWlpHR5cGWjcGF5"
+      ],
+      "test_error": "",
+      "add_error": "transaction YR34TLZ7WOWMNFVOTBQH2HHKXHXKDCLULSLPWIAXVJER7R6FUFOA: account XR6LZNLDMN27UHMCINGUMZZE3ERXP5J3TADJLXKJ2JWQZYJCAWS5UYGWLI balance 50 below min 100000 (0 assets)"
+    },
+    {
       "name": "clean_group",
       "pre": null,
       "group": [

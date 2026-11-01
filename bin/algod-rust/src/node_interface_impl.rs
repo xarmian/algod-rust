@@ -5035,6 +5035,54 @@ mod tests {
         assert_eq!(status.confirmed_round, 1);
     }
 
+    /// A rekey-authorizer failure submitted to a node (issue #2130): the
+    /// visible error is a 400 (`NodeError::BadRequest`, which the REST layer
+    /// maps to HTTP 400 with the message) carrying go's bare text behind
+    /// `Remember`'s frame; the class is not an algod-rust `validation error`.
+    #[tokio::test]
+    async fn rekey_authorizer_failure_is_a_bad_request_with_go_text() {
+        use algo_ledger::store_trait::LedgerStore;
+        use algo_types::{Round, Transaction, TxnType};
+        use ed25519_dalek::SigningKey;
+
+        let sender_key = SigningKey::from_bytes(&[0x15u8; 32]);
+        let sender = Address(sender_key.verifying_key().to_bytes());
+        let (adapter, ledger, gh) = seed_dev_adapter(sender, 10_000_000);
+        let new_auth = Address([0x4Du8; 32]);
+        {
+            let mut l = ledger.lock().unwrap();
+            let mut acct = l.get_account(&sender).expect("sender");
+            acct.auth_addr = Some(new_auth);
+            l.set_account(&sender, acct);
+        }
+        let txn = Transaction {
+            txn_type: TxnType::Pay,
+            sender,
+            receiver: Address([0x25u8; 32]),
+            amount: 1_000_000,
+            fee: 1000,
+            first_valid: Round(1),
+            last_valid: Round(1000),
+            genesis_hash: gh,
+            ..Default::default()
+        };
+        let stx = sign_txn(&txn, &sender_key);
+        let txid = compute_txn_id(&txn);
+        let err = adapter
+            .broadcast_signed_tx_group(vec![stx])
+            .await
+            .expect_err("signed by the old key");
+        match err {
+            NodeError::BadRequest(message) => assert_eq!(
+                message,
+                format!(
+                    "pool rejected group: TransactionPool.Remember: transaction {txid}: should have been authorized by {new_auth} but was actually authorized by {sender}"
+                )
+            ),
+            other => panic!("expected a 400, got {other:?}"),
+        }
+    }
+
     /// Issue #1703: the block a dev-mode node produces and stores must carry
     /// each payset transaction in go's `SignedTxnInBlock` form -- genesis
     /// id/hash stripped (`hgi` set), restored only transiently while

@@ -1847,6 +1847,13 @@ fn header_block(hdr: &algo_types::BlockHeader) -> algo_types::Block {
 /// pass in `generate_block`, which never proposes an un-applyable group.
 const EXEC_ADMISSION_BUDGET: Duration = Duration::from_secs(10);
 
+/// Evaluation time one evaluator may spend, in all, on reconciling a group
+/// the cheap prechecks rejected (`reconcile_group`, issue #2130). Separate
+/// from [`EXEC_ADMISSION_BUDGET`]: a stream of rejected groups cannot use up
+/// the budget that admits the valid ones. Once spent, a precheck rejection
+/// stands as it is.
+const RECONCILE_BUDGET: Duration = Duration::from_millis(250);
+
 /// What the evaluator recorded for one admitted group.
 struct ExecGroup {
     /// Index of the group first transaction in `included_txns`.
@@ -1863,6 +1870,9 @@ struct ExecState {
     template: algo_types::Block,
     groups: Vec<ExecGroup>,
     spent: Duration,
+    /// Evaluation time spent on [`SimpleBlockEvaluator::reconcile_group`],
+    /// bounded by [`RECONCILE_BUDGET`]; never charged to `spent`.
+    reconcile_spent: Duration,
     /// Set once a group was admitted without being evaluated (stale base or
     /// spent budget): the overlay no longer matches the admitted set, so
     /// admission stops consulting it. Assembly is unaffected.
@@ -2134,7 +2144,10 @@ impl SimpleBlockEvaluator {
     ) -> Result<(), algo_error::AlgoError> {
         let digest = algo_types::Digest(*txid);
         let (sender, lease) = (stx.txn.sender, stx.txn.lease);
-        let leased = lease != [0u8; 32];
+        // go's `cow.checkDup` and `txTail.checkDup` look at a lease only when
+        // the protocol supports leases (`SupportTransactionLeases`), as the
+        // block half does (`check_dup.rs`).
+        let leased = self.consensus_params.support_transaction_leases && lease != [0u8; 32];
         let lease_error = |in_block| {
             algo_ledger::check_dup::lease_in_ledger_error(digest, &sender, &lease, in_block)
         };
@@ -2159,20 +2172,26 @@ impl SimpleBlockEvaluator {
         // The ledger itself, read live like go's `roundCowBase.checkDup`
         // (`txTail.checkDup`): a lease or a transaction committed after this
         // evaluator's snapshot is seen too. The lease first, then the txid.
-        if let Ok(ledger) = self.ledger.lock() {
-            if leased
-                && ledger
-                    .lease_table()
-                    .check(&sender, &lease, self.hdr.round.0)
-                    .is_err()
-            {
-                return Err(lease_error(false));
-            }
-            if ledger.txtail_contains_txid(&digest, self.consensus_params.max_txn_life) {
-                return Err(algo_ledger::check_dup::transaction_in_ledger_error(
-                    digest, false,
-                ));
-            }
+        // A poisoned ledger lock cannot be read: reject the group rather than
+        // admit it unchecked.
+        let ledger = self
+            .ledger
+            .lock()
+            .map_err(|_| algo_error::AlgoError::Ledger {
+                message: "checkDup: the ledger lock is poisoned".into(),
+            })?;
+        if leased
+            && ledger
+                .lease_table()
+                .check(&sender, &lease, self.hdr.round.0)
+                .is_err()
+        {
+            return Err(lease_error(false));
+        }
+        if ledger.txtail_contains_txid(&digest, self.consensus_params.max_txn_life) {
+            return Err(algo_ledger::check_dup::transaction_in_ledger_error(
+                digest, false,
+            ));
         }
         Ok(())
     }
@@ -2218,14 +2237,17 @@ impl SimpleBlockEvaluator {
     fn validate_group(
         &mut self,
         txgroup: &[algo_types::SignedTransaction],
-    ) -> Result<Vec<algo_types::Digest>, GroupReject> {
+    ) -> Result<Vec<algo_types::Digest>, Box<GroupReject>> {
         // Run all stateless checks first; reuse the restored (genesis fields
         // populated) copies rather than cloning + restoring the group again.
         let restored = self
             .validate_group_stateless_inner(txgroup)
-            .map_err(|error| GroupReject {
-                error,
-                member: None,
+            .map_err(|error| {
+                Box::new(GroupReject {
+                    error,
+                    member: None,
+                    txids: Vec::new(),
+                })
             })?;
 
         // go's `BlockEvaluator.transaction`, per member in group order (issue
@@ -2240,6 +2262,20 @@ impl SimpleBlockEvaluator {
         // the real apply's own `checkDup` (`exec_group`) may not run (stale
         // base, spent budget); it adds what this snapshot cannot see (a lease
         // committed after the snapshot).
+        //
+        // What this precheck does NOT model of go's apply, so a member that
+        // passes it can still fail there: application calls (AVM, inner
+        // transactions), asset and key-registration rules, the fee of a
+        // non-payment transaction beyond the sender's balance of Algos (modelled
+        // only as the fee), minimum balance of every touched account, the
+        // closing rules. Those are judged by the real apply (`exec_group`) after
+        // this precheck passes. A rejection by THIS precheck on member 0 is
+        // final: go's member 0 fails at the same stage or earlier (its `Alive`,
+        // `checkDup`, authorizer, then the fee move that opens its apply), and
+        // nothing runs before it (`pool_order` scenarios `authorizer_before_apply`,
+        // `lease_conflict_before_authorizer`, `non_payment_fee_overspend`). A
+        // rejection on a LATER member may be outranked by an earlier member's
+        // apply failure, which `first_failure_in_go_order` looks for.
         //
         // Authorizer, sequential within the group (issue #1919): go checks
         // each member against the state AFTER the earlier members applied
@@ -2257,18 +2293,26 @@ impl SimpleBlockEvaluator {
         // payment transactions include the `amount` in the Algo cost; the
         // other types cost the fee. Read-only: the balance mutation is
         // deferred to `transaction_group` on acceptance.
-        let mut txids = Vec::with_capacity(restored.len());
+        // One hash per member, for the checks below and for the reconciliation
+        // of a rejection (`first_failure_in_go_order`).
+        let txids: Vec<algo_types::Digest> = restored
+            .iter()
+            .map(|r| algo_types::Digest(compute_txid(&r.txn)))
+            .collect();
         let mut group_dups = GroupDups::default();
         let mut in_group_auth: HashMap<Address, Address> = HashMap::new();
         let mut credits: HashMap<Address, u64> = HashMap::new();
         let mut spent: HashMap<Address, u64> = HashMap::new();
         for (member, (stx, restored_stx)) in txgroup.iter().zip(&restored).enumerate() {
-            let fail = |error: algo_error::AlgoError| GroupReject {
-                error,
-                member: Some(member),
+            let fail = |error: algo_error::AlgoError| {
+                Box::new(GroupReject {
+                    error,
+                    member: Some(member),
+                    txids: txids.clone(),
+                })
             };
             self.alive_member(stx).map_err(fail)?;
-            let txid = compute_txid(&restored_stx.txn);
+            let txid = txids[member].0;
             self.check_dup_member(restored_stx, &txid, Some(&group_dups))
                 .map_err(fail)?;
 
@@ -2293,12 +2337,6 @@ impl SimpleBlockEvaluator {
                     class: algo_error::RejectClass::Other,
                 }));
             }
-            if let Some(rekey_to) = stx.txn.rekey_to {
-                if rekey_to != Address::default() {
-                    in_group_auth.insert(sender, rekey_to);
-                }
-            }
-
             let is_pay = stx.txn.txn_type == TxnType::Pay;
             let fee = stx.txn.fee;
             let cost = if is_pay {
@@ -2358,21 +2396,29 @@ impl SimpleBlockEvaluator {
                 }
             }
 
-            // The member passed: later members' `checkDup` sees it (go's
+            // The member passed every check: only now do its effects on the
+            // group state take hold (a rekey for the members after it, go
+            // `apply.Rekey`; its txid and lease for their `checkDup`, go's
             // `cow.addTx`).
+            if let Some(rekey_to) = stx.txn.rekey_to {
+                if rekey_to != Address::default() {
+                    in_group_auth.insert(sender, rekey_to);
+                }
+            }
             group_dups.txids.insert(txid);
             if stx.txn.lease != [0u8; 32] {
                 group_dups.leases.insert((sender, stx.txn.lease));
             }
-            txids.push(algo_types::Digest(txid));
         }
 
         // Group fees, after every transaction's own state checks (go).
-        self.check_group_fees(txgroup)
-            .map_err(|error| GroupReject {
+        self.check_group_fees(txgroup).map_err(|error| {
+            Box::new(GroupReject {
                 error,
                 member: None,
-            })?;
+                txids: Vec::new(),
+            })
+        })?;
 
         Ok(txids)
     }
@@ -2439,6 +2485,9 @@ struct GroupDups {
 struct GroupReject {
     error: algo_error::AlgoError,
     member: Option<usize>,
+    /// The txids of the whole group (over the restored members), hashed once;
+    /// empty for a failure of the stateless checks.
+    txids: Vec<algo_types::Digest>,
 }
 
 /// What [`SimpleBlockEvaluator::overspend_message`] needs to print the sender
@@ -2879,13 +2928,14 @@ impl SimpleBlockEvaluator {
     /// by one and stops at the first that fails, so when the precheck failure
     /// is on a LATER member (`reject.member` > 0), an earlier member may still
     /// fail go's apply (an application call that rejects, an asset error, a
-    /// minimum balance), which the prechecks do not model. The real apply
-    /// (`exec_group`) runs the whole group in go's order; its failure on a
-    /// member before the precheck's wins, otherwise the precheck's stands (the
-    /// real apply agrees with it at that member, or stops after it). A group
-    /// the real apply accepts although a precheck refused it was evaluated
-    /// into the pending state: the evaluator is marked incomplete, so the
-    /// admitted set and the overlay stay consistent (see `exec_group`).
+    /// minimum balance), which the prechecks do not model. A dry run of the
+    /// real apply ([`Self::reconcile_group`]) runs the whole group in go's
+    /// order; its failure on a member before the precheck's wins, otherwise
+    /// the precheck's stands (the apply agrees with it at that member, stops
+    /// after it, or accepts a group the precheck refused, which stays
+    /// refused). The dry run never changes the pending state and never marks
+    /// the evaluator incomplete, so a stream of rejected groups costs a
+    /// bounded amount of separate budget and nothing else.
     fn first_failure_in_go_order(
         &mut self,
         txgroup: &[algo_types::SignedTransaction],
@@ -2894,28 +2944,89 @@ impl SimpleBlockEvaluator {
         let Some(member) = reject.member.filter(|m| *m > 0) else {
             return reject.error;
         };
+        // Nothing to ask of an evaluator without a usable real apply.
+        let runnable = self.exec.as_ref().is_some_and(|exec| {
+            !exec.incomplete
+                && exec.spent < EXEC_ADMISSION_BUDGET
+                && exec.reconcile_spent < RECONCILE_BUDGET
+        });
+        if !runnable || reject.txids.len() != txgroup.len() {
+            return reject.error;
+        }
         let genesis_rule = self.genesis_rule();
-        let mut txids = Vec::with_capacity(txgroup.len());
         let stibs: Vec<algo_types::SignedTransaction> = txgroup
             .iter()
             .map(|stx| {
-                let mut restored = stx.clone();
-                genesis_rule.restore(&mut restored);
-                txids.push(algo_types::Digest(compute_txid(&restored.txn)));
                 let mut stib = stx.clone();
                 genesis_rule.strip(&mut stib);
                 stib
             })
             .collect();
-        match self.exec_group_indexed(&stibs, txids) {
-            Err((index, error)) if index < member => error,
-            Ok(Some(_)) => {
-                if let Some(exec) = self.exec.as_mut() {
-                    exec.incomplete = true;
-                }
-                reject.error
+        match self.reconcile_group(&stibs, reject.txids) {
+            Some((index, error)) if index < member => error,
+            Some(_) | None => reject.error,
+        }
+    }
+
+    /// Dry run of the real apply over `stibs` on top of the pending state: the
+    /// index and go's error of the member that failed, `None` when the group
+    /// is accepted or the apply cannot judge it (stale base, poisoned lock).
+    /// The overlay is left as it was either way, and the time is charged to
+    /// `reconcile_spent`, not to the admission budget.
+    fn reconcile_group(
+        &mut self,
+        stibs: &[algo_types::SignedTransaction],
+        txids: Vec<algo_types::Digest>,
+    ) -> Option<(usize, algo_error::AlgoError)> {
+        use algo_ledger::proposal_eval::GroupEvalError;
+
+        let exec = self.exec.as_mut()?;
+        let base =
+            algo_ledger::locked_base::LockedBase::new(&self.ledger, exec.overlay.base_round());
+        let started = std::time::Instant::now();
+        let outcome = algo_ledger::proposal_eval::evaluate_group_discarding(
+            &base,
+            &mut exec.overlay,
+            &exec.template,
+            stibs,
+            Some(txids),
+        );
+        let st = base.stats();
+        let poisoned = base.is_poisoned();
+        algo_ledger::proposal_eval::record_ledger_lock_wait(st.wait);
+        algo_ledger::proposal_eval::record_ledger_lock_holds(st.acquisitions, st.hold, st.hold_max);
+        exec.lock_hold_max
+            .set(exec.lock_hold_max.get().max(st.hold_max));
+        exec.lock_acquisitions
+            .set(exec.lock_acquisitions.get() + st.acquisitions);
+        exec.reconcile_spent += started.elapsed().saturating_sub(st.wait);
+        if poisoned {
+            return None;
+        }
+        let txid_of = |template: &algo_types::Block, i: usize| {
+            let rule = algo_types::genesis_restore::GenesisRestoreRule::for_block(template);
+            stibs
+                .get(i)
+                .map(|stx| {
+                    let (gen, gh) = rule.restored_genesis(stx);
+                    algo_codec::compute_txn_id_with_genesis(&stx.txn, gen, gh).to_string()
+                })
+                .unwrap_or_default()
+        };
+        match outcome {
+            Err(GroupEvalError::Txn { index, error }) => {
+                Some((index, go_rejection(&txid_of(&exec.template, index), error)))
             }
-            _ => reject.error,
+            Ok(_) => {
+                // The precheck refused a group the real apply takes: the
+                // group stays refused (the precheck is the stricter), and the
+                // difference is worth knowing about.
+                tracing::warn!(
+                    "pool: the real apply accepted a group the admission precheck refused"
+                );
+                None
+            }
+            Err(GroupEvalError::Stale) | Err(GroupEvalError::Other(_)) => None,
         }
     }
 
@@ -2940,16 +3051,6 @@ impl SimpleBlockEvaluator {
         stibs: &[algo_types::SignedTransaction],
         txids: Vec<algo_types::Digest>,
     ) -> Result<Option<u64>, algo_error::AlgoError> {
-        self.exec_group_indexed(stibs, txids)
-            .map_err(|(_, error)| error)
-    }
-
-    /// [`Self::exec_group`], with the index of the member that failed.
-    fn exec_group_indexed(
-        &mut self,
-        stibs: &[algo_types::SignedTransaction],
-        txids: Vec<algo_types::Digest>,
-    ) -> Result<Option<u64>, (usize, algo_error::AlgoError)> {
         use algo_ledger::proposal_eval::GroupEvalError;
 
         let Some(exec) = self.exec.as_mut() else {
@@ -2988,7 +3089,7 @@ impl SimpleBlockEvaluator {
             .set(exec.lock_acquisitions.get() + st.acquisitions);
         exec.spent += elapsed.saturating_sub(st.wait);
         if poisoned {
-            return Err((0, algo_ledger::locked_base::LockedBase::poison_error()));
+            return Err(algo_ledger::locked_base::LockedBase::poison_error());
         }
         // Only a rejection needs a txid again: the failing member's, over
         // the genesis fields go restores (one hash, on the error path).
@@ -3008,14 +3109,14 @@ impl SimpleBlockEvaluator {
                 Ok(Some(eval.fees_collected))
             }
             Err(GroupEvalError::Txn { index, error }) => {
-                Err((index, go_rejection(&txid_of(&exec.template, index), error)))
+                Err(go_rejection(&txid_of(&exec.template, index), error))
             }
             Err(GroupEvalError::Stale) => {
                 algo_ledger::proposal_eval::count_stale_base();
                 exec.incomplete = true;
                 Ok(None)
             }
-            Err(GroupEvalError::Other(e)) => Err((0, go_rejection(&txid_of(&exec.template, 0), e))),
+            Err(GroupEvalError::Other(e)) => Err(go_rejection(&txid_of(&exec.template, 0), e)),
         }
     }
 
@@ -3175,7 +3276,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
     ) -> Result<(), algo_error::AlgoError> {
         let txids = match self.validate_group(txgroup) {
             Ok(txids) => txids,
-            Err(reject) => return Err(self.first_failure_in_go_order(txgroup, reject)),
+            Err(reject) => return Err(self.first_failure_in_go_order(txgroup, *reject)),
         };
 
         // Convert each transaction to STIB (SignedTxnInBlock) format:
@@ -4369,6 +4470,7 @@ impl PoolLedgerAdapter {
                 template: header_block(&next_hdr),
                 groups: Vec::new(),
                 spent: Duration::ZERO,
+                reconcile_spent: Duration::ZERO,
                 incomplete: false,
                 last_passes: 0,
                 final_state_proof_next: None,
