@@ -4046,8 +4046,6 @@ crates/core/algo-validate	test_single_txn_group_skipped	crates/core/algo-validat
 crates/core/algo-validate	test_group_id_mismatch_fails	crates/core/algo-validate/src/rules.rs	2016
 crates/core/algo-validate	test_standalone_txn_no_group_passes	crates/core/algo-validate/src/rules.rs	2038
 crates/core/algo-validate	test_valid_group_passes	crates/core/algo-validate/src/rules.rs	2045
-crates/core/algo-validate	test_lease_duplicate_in_group_fails	crates/core/algo-validate/src/rules.rs	2064
-crates/core/algo-validate	test_lease_unique_in_group_passes	crates/core/algo-validate/src/rules.rs	2085
 crates/core/algo-validate	test_genesis_id_mismatch_fails	crates/core/algo-validate/src/rules.rs	2103
 crates/core/algo-validate	test_genesis_hash_mismatch_fails	crates/core/algo-validate/src/rules.rs	2117
 crates/core/algo-validate	test_genesis_fields_match_passes	crates/core/algo-validate/src/rules.rs	2131

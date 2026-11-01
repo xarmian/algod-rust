@@ -49,6 +49,7 @@ import (
 	"github.com/algorand/go-algorand/data"
 	"github.com/algorand/go-algorand/data/basics"
 	"github.com/algorand/go-algorand/data/bookkeeping"
+	"github.com/algorand/go-algorand/data/committee"
 	"github.com/algorand/go-algorand/data/transactions"
 	"github.com/algorand/go-algorand/ledger"
 	"github.com/algorand/go-algorand/ledger/eval"
@@ -77,6 +78,20 @@ type blockDupFixture struct {
 	Accounts    []account          `json:"genesis_accounts"`
 	Block1      string             `json:"block1"`
 	Scenarios   []blockDupScenario `json:"scenarios"`
+	// Issue #2129: a group whose members hold distinct leases; both
+	// Validate and replay accept it.
+	Control blockDupScenario `json:"control_distinct_leases"`
+	// Issue #2129: the transaction-pool admission stage, as go's
+	// data/pools runs it on its Generate+Validate block evaluator: the
+	// per-transaction `TestTransactionGroup`, then `TransactionGroup`.
+	Pool []blockDupPoolScenario `json:"pool"`
+}
+
+type blockDupPoolScenario struct {
+	Name         string `json:"name"`
+	GroupMsgpack string `json:"group_msgpack"`
+	TestError    string `json:"test_error"`
+	AddError     string `json:"add_error"`
 }
 
 func errText(err error) string {
@@ -118,7 +133,7 @@ func blockDupOracle() {
 	defer actual.Close()
 	l := &data.Ledger{Ledger: actual}
 
-	pay := func(note string, lease [32]byte) transactions.SignedTxn {
+	payTxn := func(note string, lease [32]byte) transactions.Transaction {
 		return transactions.Transaction{
 			Type: protocol.PaymentTx,
 			Header: transactions.Header{
@@ -135,12 +150,31 @@ func blockDupOracle() {
 				Receiver: acctB,
 				Amount:   basics.MicroAlgos{Raw: 1_000_000},
 			},
-		}.Sign(secrets)
+		}
 	}
-	var lease, freshLease [32]byte
+	pay := func(note string, lease [32]byte) transactions.SignedTxn {
+		return payTxn(note, lease).Sign(secrets)
+	}
+	// One atomic group of signed payments (issue #2129): every member
+	// carries the group ID computed over the members without it.
+	grouped := func(txns ...transactions.Transaction) []transactions.SignedTxn {
+		var hashes []crypto.Digest
+		for _, t := range txns {
+			hashes = append(hashes, crypto.Digest(t.ID()))
+		}
+		gid := crypto.HashObj(transactions.TxGroup{TxGroupHashes: hashes})
+		out := make([]transactions.SignedTxn, len(txns))
+		for i, t := range txns {
+			t.Group = gid
+			out[i] = t.Sign(secrets)
+		}
+		return out
+	}
+	var lease, freshLease, lease2 [32]byte
 	for i := range lease {
 		lease[i] = 0x11
 		freshLease[i] = 0x66
+		lease2[i] = 0x67
 	}
 	committed := pay("committed", [32]byte{})
 	committedLeased := pay("committed-leased", lease)
@@ -225,7 +259,25 @@ func blockDupOracle() {
 		{"in_block_lease_conflict", build(pay("lease-a", freshLease), pay("lease-b", freshLease))},
 		// A new payment reusing block 1's lease, still in force.
 		{"cross_block_lease_conflict", build(pay("new-leased", lease))},
+		// Issue #2129: two members of ONE group sharing a fresh lease. go has
+		// no stateless group-lease rule; only checkDup catches it.
+		{"in_group_lease_conflict", build(grouped(payTxn("grp-a", freshLease), payTxn("grp-b", freshLease))...)},
 	}
+	// Issue #2129: the control, a group whose members hold distinct leases.
+	// Generated as a proposer would (a hand-built header would not carry the
+	// fees the payset collects), so go accepts it on both paths.
+	controlHdr := bookkeeping.MakeBlock(hdr1).BlockHeader
+	controlHdr.TimeStamp = 1_700_000_010
+	cev, err := l.StartEvaluator(controlHdr, 2, 0, nil)
+	must(err)
+	var controlAD []transactions.SignedTxnWithAD
+	for _, s := range grouped(payTxn("ok-a", freshLease), payTxn("ok-b", lease2)) {
+		controlAD = append(controlAD, transactions.SignedTxnWithAD{SignedTxn: s})
+	}
+	must(cev.TransactionGroup(controlAD...))
+	cub, err := cev.GenerateBlock(nil)
+	must(err)
+	controlOK := cub.FinishBlock(committee.Seed{}, sender, false)
 	backlog := execpool.MakeBacklog(nil, 0, execpool.LowPriority, nil)
 	defer backlog.Shutdown()
 	for _, sc := range scenarios {
@@ -236,6 +288,49 @@ func blockDupOracle() {
 			Block:         b64(protocol.Encode(&sc.blk)),
 			ValidateError: errText(verr),
 			ReplayError:   errText(rerr),
+		})
+	}
+
+	{
+		_, verr := l.Validate(context.Background(), controlOK, backlog)
+		_, rerr := eval.Eval(context.Background(), l, controlOK, false, nil, nil, nil)
+		f.Control = blockDupScenario{
+			Name:          "in_group_distinct_leases",
+			Block:         b64(protocol.Encode(&controlOK)),
+			ValidateError: errText(verr),
+			ReplayError:   errText(rerr),
+		}
+	}
+
+	// Pool admission (issue #2129): a fresh Generate+Validate evaluator per
+	// group, like the pool's pending-block evaluator. TestTransactionGroup
+	// checks every member against the unmodified state (so it cannot see a
+	// sibling's lease); TransactionGroup applies the members in order and
+	// does.
+	poolHdr := bookkeeping.MakeBlock(hdr1).BlockHeader
+	poolHdr.TimeStamp = 1_700_000_010
+	for _, ps := range []struct {
+		name  string
+		group []transactions.SignedTxn
+	}{
+		{"in_group_lease_conflict", grouped(payTxn("grp-a", freshLease), payTxn("grp-b", freshLease))},
+		{"in_group_distinct_leases", grouped(payTxn("ok-a", freshLease), payTxn("ok-b", lease2))},
+	} {
+		pev, err := l.StartEvaluator(poolHdr, 0, 0, nil)
+		must(err)
+		terr := pev.TestTransactionGroup(ps.group)
+		var withAD []transactions.SignedTxnWithAD
+		var enc []byte
+		for i := range ps.group {
+			withAD = append(withAD, transactions.SignedTxnWithAD{SignedTxn: ps.group[i]})
+			enc = append(enc, protocol.Encode(&ps.group[i])...)
+		}
+		aerr := pev.TransactionGroup(withAD...)
+		f.Pool = append(f.Pool, blockDupPoolScenario{
+			Name:         ps.name,
+			GroupMsgpack: b64(enc),
+			TestError:    errText(terr),
+			AddError:     errText(aerr),
 		})
 	}
 

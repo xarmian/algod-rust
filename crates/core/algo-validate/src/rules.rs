@@ -1694,34 +1694,6 @@ fn validate_transaction_group_inner(
     })
 }
 
-/// Validate lease constraints within transaction groups.
-///
-/// Within each group, no two transactions from the same sender may share the
-/// same lease value. Ungrouped transactions with leases are allowed
-/// (cross-block lease enforcement is stateful, deferred to Phase 2).
-pub fn validate_lease_constraints(txns: &[SignedTransaction]) -> Result<(), AlgoError> {
-    for_each_group(txns, |group_members| {
-        // Collect (sender, lease) pairs for txns with non-empty leases.
-        let mut seen = std::collections::HashSet::new();
-        for stx in group_members {
-            if stx.txn.lease == [0u8; 32] {
-                continue;
-            }
-            let key = (stx.txn.sender, stx.txn.lease.to_vec());
-            if !seen.insert(key) {
-                return Err(AlgoError::Validation {
-                    message: format!(
-                        "duplicate lease within group: sender {} lease {}",
-                        stx.txn.sender,
-                        hex::encode(stx.txn.lease)
-                    ),
-                });
-            }
-        }
-        Ok(())
-    })
-}
-
 /// Validate that each transaction group's pooled fees meet the minimum.
 ///
 /// Collects transactions by group ID across the entire payset (using a HashMap).
@@ -2835,45 +2807,6 @@ mod tests {
         // successful `BroadcastTransactionGroup([]SignedTxn{stx1, stx2})`).
         let correct_order = vec![wrap_signed(s1), wrap_signed(s2)];
         assert!(validate_transaction_group(&correct_order).is_ok());
-    }
-
-    // ── Lease constraint tests ──────────────────────────────────
-
-    #[test]
-    fn test_lease_duplicate_in_group_fails() {
-        let mut txn1 = make_valid_txn();
-        txn1.lease = [0x42; 32];
-        let mut txn2 = make_valid_txn();
-        txn2.lease = [0x42; 32]; // same sender, same lease
-        txn2.amount = 999;
-
-        let gid = compute_group_id(&[txn1.clone(), txn2.clone()]);
-        txn1.group = *gid.as_bytes();
-        txn2.group = *gid.as_bytes();
-
-        let signed = vec![wrap_signed(txn1), wrap_signed(txn2)];
-        let err = validate_lease_constraints(&signed).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("duplicate lease"),
-            "expected duplicate lease error, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_lease_unique_in_group_passes() {
-        let mut txn1 = make_valid_txn();
-        txn1.lease = [0x42; 32];
-        let mut txn2 = make_valid_txn();
-        txn2.lease = [0x43; 32]; // different lease
-        txn2.amount = 999;
-
-        let gid = compute_group_id(&[txn1.clone(), txn2.clone()]);
-        txn1.group = *gid.as_bytes();
-        txn2.group = *gid.as_bytes();
-
-        let signed = vec![wrap_signed(txn1), wrap_signed(txn2)];
-        assert!(validate_lease_constraints(&signed).is_ok());
     }
 
     // ── Genesis consistency tests ───────────────────────────────

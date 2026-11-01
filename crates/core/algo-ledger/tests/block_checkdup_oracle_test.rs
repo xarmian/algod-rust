@@ -71,6 +71,17 @@ struct Oracle {
     genesis_accounts: Vec<OracleAccount>,
     block1: String,
     scenarios: Vec<OracleScenario>,
+    control_distinct_leases: OracleScenario,
+    pool: Vec<OraclePool>,
+}
+
+/// go's pool-admission stage for one group (issue #2129): the evaluator's
+/// `TestTransactionGroup`, then `TransactionGroup`.
+#[derive(Debug, Deserialize)]
+struct OraclePool {
+    name: String,
+    test_error: String,
+    add_error: String,
 }
 
 fn b64(s: &str) -> Vec<u8> {
@@ -142,7 +153,7 @@ fn sqlite(o: &Oracle) -> SqliteLedger {
 #[test]
 fn oracle_scenarios_are_validate_failures_that_replay_accepts() {
     let o = load_oracle();
-    assert_eq!(o.scenarios.len(), 4);
+    assert_eq!(o.scenarios.len(), 5);
     for sc in &o.scenarios {
         assert!(!sc.validate_error.is_empty(), "{}", sc.name);
         assert!(
@@ -648,5 +659,100 @@ fn checkdup_verdict_survives_an_unevaluable_earlier_transaction() {
     match validator.validate(&candidate).map(|_| ()) {
         Err(AgreementError::ValidationFailed(message)) => assert_eq!(message, sc.validate_error),
         other => panic!("free ledger: expected go's checkDup verdict, got {other:?}"),
+    }
+}
+
+/// Issue #2129: go has no stateless group-lease rule. `validate_block` (the
+/// stateless validator behind the offline `replay`/`bench` commands, which
+/// stand in for go's `AddBlock` that never runs `checkDup`) accepts the block
+/// whose group holds two (sender, lease) twins, exactly as go's replay does;
+/// the lease conflict is `checkDup`'s, in the validating paths only.
+#[test]
+fn stateless_validation_accepts_an_in_group_lease_conflict_like_go_replay() {
+    let o = load_oracle();
+    let block1 = block(&o.block1);
+    let sc = scenario(&o, "in_group_lease_conflict");
+    assert!(sc.replay_error.is_empty() && !sc.validate_error.is_empty());
+    let candidate = block(&sc.block);
+    let grp = candidate.payset[0].txn.group;
+    assert!(
+        grp != [0u8; 32] && grp == candidate.payset[1].txn.group,
+        "the oracle block holds one two-member group"
+    );
+    assert_eq!(candidate.payset[0].txn.lease, candidate.payset[1].txn.lease);
+    let result = algo_validate::validate_block(
+        &candidate,
+        Some(block1.timestamp),
+        &o.genesis_id,
+        &b64(&o.genesis_hash).try_into().expect("genesis hash"),
+        None,
+    );
+    assert!(result.is_valid, "stateless verdict: {:?}", result.errors);
+}
+
+/// Issue #2129: a group with distinct leases is accepted everywhere, by go
+/// and here (control for the in-group conflict scenario).
+#[test]
+fn in_group_distinct_leases_are_accepted_on_every_path_like_go() {
+    let o = load_oracle();
+    let sc = &o.control_distinct_leases;
+    assert!(sc.validate_error.is_empty() && sc.replay_error.is_empty());
+    let candidate = block(&sc.block);
+    let mut s = state(&o);
+    algo_ledger::apply_block_validating(&mut s, &candidate).expect("validating apply accepts");
+    assert_eq!(s.current_round().0, 2);
+
+    let block1 = block(&o.block1);
+    let result = algo_validate::validate_block(
+        &candidate,
+        Some(block1.timestamp),
+        &o.genesis_id,
+        &b64(&o.genesis_hash).try_into().expect("genesis hash"),
+        None,
+    );
+    assert!(result.is_valid, "{:?}", result.errors);
+}
+
+/// Issue #2129: go's pool admission (a Generate+Validate evaluator):
+/// `TestTransactionGroup` checks each member against the unmodified state, so
+/// it cannot see a sibling's lease; `TransactionGroup` applies the members in
+/// order and rejects the second with `LeaseInLedgerError`. The group
+/// evaluation behind the pool (`evaluate_group`) must give go's `add_error`.
+#[test]
+fn group_evaluation_matches_go_pool_admission() {
+    use algo_ledger::locked_base::LockedBase;
+    use algo_ledger::pending_overlay::PendingOverlay;
+    use algo_ledger::proposal_eval::{evaluate_group, GroupEvalError};
+    use algo_types::Round;
+
+    let o = load_oracle();
+    for (name, candidate) in [
+        (
+            "in_group_lease_conflict",
+            block(&scenario(&o, "in_group_lease_conflict").block),
+        ),
+        (
+            "in_group_distinct_leases",
+            block(&o.control_distinct_leases.block),
+        ),
+    ] {
+        let go = o.pool.iter().find(|p| p.name == name).expect("pool row");
+        assert!(go.test_error.is_empty(), "{name}: go's Test passes");
+        let shared = Arc::new(Mutex::new(sqlite(&o)));
+        let base = LockedBase::new(&shared, Round(1));
+        let mut template = candidate.clone();
+        template.payset.clear();
+        let mut overlay = PendingOverlay::new(&base);
+        let got = evaluate_group(&base, &mut overlay, &template, &candidate.payset);
+        if go.add_error.is_empty() {
+            got.unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        } else {
+            match got {
+                Err(GroupEvalError::Txn { index: 1, error }) => {
+                    assert_eq!(error.to_string(), go.add_error, "{name}")
+                }
+                other => panic!("{name}: expected go's rejection of member 1, got {other:?}"),
+            }
+        }
     }
 }

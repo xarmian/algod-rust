@@ -48,8 +48,8 @@ use crate::merkle::{
 use crate::rules::{
     consensus_params_for_version, has_payset_commit_merkle, has_txn256, has_txn512,
     max_txn_bytes_per_block, validate_genesis_consistency, validate_group_fees_with_params,
-    validate_lease_constraints, validate_transaction_group, validate_transaction_wellformed,
-    SpecialAddresses, MAX_TIMESTAMP_INCREMENT,
+    validate_transaction_group, validate_transaction_wellformed, SpecialAddresses,
+    MAX_TIMESTAMP_INCREMENT,
 };
 use crate::signature::{
     logic_sig_group_size_check, verify_auth_addr_sender_diff, verify_heartbeat_proof,
@@ -102,8 +102,6 @@ pub enum BlockValidationError {
     SignatureVerificationFailed { txn_index: usize, error: String },
     /// Transaction group validation failed.
     GroupValidationFailed { error: String },
-    /// Lease constraint validation failed (duplicate sender+lease within a group).
-    LeaseConstraintFailed { error: String },
     /// Genesis ID/hash consistency check failed.
     GenesisConsistencyFailed { error: String },
     /// A transaction group's pooled fees are insufficient.
@@ -174,9 +172,6 @@ impl fmt::Display for BlockValidationError {
             }
             Self::GroupValidationFailed { error } => {
                 write!(f, "group validation failed: {error}")
-            }
-            Self::LeaseConstraintFailed { error } => {
-                write!(f, "lease constraint failed: {error}")
             }
             Self::GenesisConsistencyFailed { error } => {
                 write!(f, "genesis consistency failed: {error}")
@@ -253,9 +248,13 @@ pub fn restore_payset_genesis_fields(
 /// 3. Per-transaction: restore genesis fields, then validate rules + signatures
 /// 4. Transaction group validation
 /// 5. Genesis consistency
-/// 6. Lease constraints
-/// 7. Payset Merkle commitment
-/// 8. Aggregate block size
+/// 6. Payset Merkle commitment
+/// 7. Aggregate block size
+///
+/// There is deliberately no stateless lease check: go-algorand detects a
+/// repeated (sender, lease) only in `checkDup` (validating evaluation), which
+/// `algo_ledger::check_dup` ports. Rejecting it here would refuse blocks go's
+/// `AddBlock` accepts (issue #2129).
 ///
 /// All errors are collected (no fail-fast) and returned in the result.
 pub fn validate_block(
@@ -656,13 +655,6 @@ pub fn validate_block_with_cache(
         block.genesis_hash.as_ref(),
     ) {
         errors.push(BlockValidationError::GenesisConsistencyFailed {
-            error: e.to_string(),
-        });
-    }
-
-    // 6. Lease constraints.
-    if let Err(e) = validate_lease_constraints(&restored_payset) {
-        errors.push(BlockValidationError::LeaseConstraintFailed {
             error: e.to_string(),
         });
     }
