@@ -890,6 +890,31 @@ mod tests {
         );
     }
 
+    /// Issue #2159: the 49 real go-produced certificates of the testnet
+    /// prefix decode into `Certificate`s whose step is `cert`, and each
+    /// re-encodes byte-identically to the stored certificate (so serving
+    /// them back can never differ from go). Authentication of the same
+    /// certificates is proven by `testnet_prefix_authenticates_every_certificate`.
+    #[test]
+    fn testnet_prefix_real_certificates_keep_step_and_round_trip() {
+        let bytes = std::fs::read(testnet_prefix().join("blocks.bin")).unwrap();
+        let mut checked = 0;
+        for rec in corpus::parse_blocks(&bytes).unwrap() {
+            let resp = algo_codec::decode_block_response(rec.payload).unwrap();
+            let Some(cert_val) = resp.cert else { continue };
+            let mut want = Vec::new();
+            rmpv::encode::write_value(&mut want, &cert_val).unwrap();
+            if want == [0x80] {
+                continue; // the genesis block's empty certificate
+            }
+            let cert = fetched_certificate(Round(rec.round), Some(cert_val)).expect("decodes");
+            assert_eq!(cert.step, algo_agreement::CERT, "round {}", rec.round);
+            assert_eq!(cert.to_canonical_bytes(), want, "round {}", rec.round);
+            checked += 1;
+        }
+        assert_eq!(checked, 50);
+    }
+
     /// A flipped bit in one vote's signature must fail the replay at that
     /// round (certificate authentication), not just at the end.
     #[test]

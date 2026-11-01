@@ -264,10 +264,11 @@ class CorruptTest(unittest.TestCase):
     """BENCH_REST_CORRUPT's negative test must fail the gate for EVERY
     endpoint, also those that have allowlisted differences."""
 
-    def test_every_endpoint_with_an_allowlist_entry_still_fails_when_corrupted(self):
+    def test_every_endpoint_still_fails_when_corrupted_with_or_without_an_allowlist(self):
         mp = "application/msgpack"
         block = {"block": {"rnd": 7, "ts": 100, "bi": 10}, "cert": {"rnd": 7}}
-        # (request, go response, rust response) shaped like the real known differences
+        # (request, go, rust): account_hot has known differences; blocks_msgpack none
+        # (#2159: the allowlist is empty for it, the responses are equal)
         cases = {
             "account_hot": (REQ_ACCT,
                             resp({"amount": 5, "assets": [{"amount": 1}], "rewards": 3}),
@@ -275,7 +276,7 @@ class CorruptTest(unittest.TestCase):
             "blocks_msgpack": ({"name": "blocks_msgpack", "method": "GET", "path": "/b",
                                "kind": "msgpack"},
                               resp(rl.msgpack(block), ctype=mp),
-                              resp(rl.msgpack(dict(block, cert={"rnd": 7, "step": 2})), ctype=mp)),
+                              resp(rl.msgpack(block), ctype=mp)),
         }
         allow = [
             {"endpoint": "account_hot", "path": "assets", "kind": "only-go", "issue": 1,
@@ -284,8 +285,6 @@ class CorruptTest(unittest.TestCase):
              "reason": "r"},
             {"endpoint": "account_hot", "path": "rewards", "kind": "value", "issue": 1,
              "reason": "r"},
-            {"endpoint": "blocks_msgpack", "path": "cert.step", "kind": "only-rust",
-             "rust_value": 2, "issue": 1, "reason": "r"},
         ]
         for name, (req, go, rust) in cases.items():
             self.assertEqual(rl.gate([req], {req["name"]: go}, {req["name"]: rust}, allow), [],

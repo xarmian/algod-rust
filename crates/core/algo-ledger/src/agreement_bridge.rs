@@ -1543,10 +1543,7 @@ mod tests {
     }
 
     fn make_cert(round: u64) -> Certificate {
-        Certificate {
-            round: Round(round),
-            ..Certificate::default()
-        }
+        Certificate::for_test(Round(round))
     }
 
     // -- Tests --

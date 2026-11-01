@@ -1679,7 +1679,7 @@ mod tests {
     fn make_cert(round: u64) -> Certificate {
         Certificate {
             round: Round(round),
-            ..Certificate::default()
+            ..Certificate::for_test(Round(0))
         }
     }
 
@@ -2537,7 +2537,7 @@ mod tests {
                 block_digest: digest,
                 ..Default::default()
             },
-            ..Certificate::default()
+            ..Certificate::for_test(Round(0))
         }
     }
 

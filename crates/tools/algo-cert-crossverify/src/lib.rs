@@ -291,7 +291,7 @@ mod tests {
         Certificate {
             round: Round(7),
             votes: senders.iter().copied().map(authenticator).collect(),
-            ..Certificate::default()
+            ..Certificate::for_test(Round(0))
         }
     }
 

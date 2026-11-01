@@ -50,6 +50,12 @@ pub struct Certificate {
     pub period: Period,
     /// The step of the bundle (CERT for a real certificate; zero when the
     /// stored encoding carries no `step` key).
+    ///
+    /// serde mirrors the canonical wire rule for this field only: absent
+    /// decodes to 0 and 0 is not written (all serde users here are
+    /// named-map formats, so skipping a key is safe). The consensus wire
+    /// format is [`canonical_encode_certificate`], not serde.
+    #[serde(default, skip_serializing_if = "step_is_zero")]
     pub step: Step,
     /// The proposal value that was agreed upon.
     pub proposal: ProposalValue,
@@ -66,6 +72,10 @@ pub struct Certificate {
     /// during [`Self::authenticate`] and misrepresent the certificate when
     /// re-encoded (see `from_bundle`/`to_unauthenticated_bundle`).
     pub equivocation_votes: Vec<EquivocationVoteAuthenticator>,
+}
+
+fn step_is_zero(s: &Step) -> bool {
+    s.0 == 0
 }
 
 impl Default for Certificate {
@@ -132,6 +142,19 @@ impl From<BundleError> for CertificateError {
 }
 
 impl Certificate {
+    /// A certificate for `round` with `step = CERT` and everything else
+    /// empty: the shape test helpers need when the certificate may reach
+    /// `authenticate`, which (like go) rejects any other step.
+    /// `Certificate::default()` stays go's zero value (step 0).
+    #[doc(hidden)]
+    pub fn for_test(round: Round) -> Self {
+        Self {
+            round,
+            step: CERT,
+            ..Self::default()
+        }
+    }
+
     /// Create a Certificate from an UnauthenticatedBundle.
     ///
     /// Mirrors Go's `Certificate(e.Bundle)` — in Go, Certificate is a type
@@ -633,15 +656,19 @@ mod tests {
         assert_eq!(cert.to_canonical_bytes(), real);
     }
 
-    /// Round-trip property: encode a Certificate via the canonical
-    /// path, decode the bytes through `rmp_serde` (the Rust serde
-    /// derive), re-encode, and assert byte-identity. Guards against
-    /// encoder/decoder drift introduced by the canonical encoder.
+    /// Round-trip property: encode a Certificate via the canonical path,
+    /// decode the bytes back (`decode_bundle` + `from_bundle`), re-encode and
+    /// assert byte-identity and field equality, for the zero value, the
+    /// step-less DevMode shape and real (step = CERT) shapes.
     #[test]
     fn canonical_encode_certificate_round_trip() {
         use crate::vote::ProposalValue;
         let cases = [
             Certificate::default(),
+            Certificate {
+                round: Round(100),
+                ..Certificate::default()
+            },
             Certificate {
                 step: crate::step::CERT,
                 round: Round(100),
@@ -666,35 +693,58 @@ mod tests {
         ];
         for (i, c) in cases.iter().enumerate() {
             let encoded = canonical_encode_certificate(c);
-            // Re-encode after a no-op pass through bundle conversion to
-            // confirm idempotence — the canonical encoder is a pure
-            // function of (step=CERT, c's fields).
-            let again = canonical_encode_certificate(c);
+            let bundle = crate::codec::decode_bundle(&encoded)
+                .unwrap_or_else(|e| panic!("case[{i}] does not decode: {e:?}"));
+            let decoded = Certificate::from_bundle(&bundle);
+            assert_eq!(decoded.step, c.step, "case[{i}] step changed");
+            assert_eq!(decoded.round, c.round, "case[{i}] round changed");
+            assert_eq!(decoded.period, c.period, "case[{i}] period changed");
+            assert_eq!(decoded.proposal, c.proposal, "case[{i}] proposal changed");
             assert_eq!(
-                encoded, again,
-                "canonical encoder not deterministic for case[{i}]"
+                canonical_encode_certificate(&decoded),
+                encoded,
+                "case[{i}] did not re-encode byte-identically"
             );
         }
     }
 
-    /// Byte-exact regression against Go-produced `blocks.certdata`
-    /// rows captured from a devmode localnet
-    /// (`tests/fixtures/canonical/cert_<round>.canonical.hex`). The
-    /// devmode certs encode with `step = 0` (devmode skips real
-    /// consensus, so the Cert's step is zero before omitempty strips
-    /// it). Re-encoding a default Rust `Certificate` would emit
-    /// `step = CERT` and diverge — so we instead test the underlying
-    /// shared encoder `encode_bundle` directly with the devmode
-    /// shape (round only, step=0, everything else empty). This pins
-    /// that the bundle encoder's omitempty matches Go for the
-    /// degenerate-cert shape devmode produces.
-    ///
-    /// Once we have testnet/mainnet captures with `step = CERT`,
-    /// `canonical_encode_certificate` itself will get a parallel
-    /// byte-exact suite. PLAN-36 follow-up under PLAN-44+ tracks
-    /// that production capture.
+    /// Issue #2159: serde agrees with the canonical step rule: a zero step
+    /// is not written, an absent step decodes to 0, a real step round-trips.
     #[test]
-    fn devmode_cert_bytes_match_bundle_encoder_with_step_zero() {
+    fn serde_step_is_default_and_omitted_when_zero() {
+        let stepless = Certificate {
+            round: Round(9),
+            ..Certificate::default()
+        };
+        let mut json = serde_json::to_value(&stepless).unwrap();
+        assert!(json.get("step").is_none(), "{json}");
+        let back: Certificate = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(back.step, Step(0));
+        // a map without the key decodes (default), a map with it keeps it
+        json.as_object_mut()
+            .unwrap()
+            .insert("step".into(), 2.into());
+        let back: Certificate = serde_json::from_value(json).unwrap();
+        assert_eq!(back.step, CERT);
+
+        let real = Certificate::for_test(Round(9));
+        let bytes = rmp_serde::to_vec_named(&real).unwrap();
+        let back: Certificate = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(back.step, CERT);
+        let bytes = rmp_serde::to_vec_named(&stepless).unwrap();
+        let back: Certificate = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(back.step, Step(0));
+    }
+
+    /// Byte-exact regression against Go-produced `blocks.certdata` rows
+    /// captured from a devmode localnet
+    /// (`tests/fixtures/canonical/cert_<round>.canonical.hex`). The devmode
+    /// certs carry `step = 0` (omitempty strips it). Each fixture must decode
+    /// into a `Certificate` with step 0, re-encode byte-identically through
+    /// `canonical_encode_certificate`, and match the bundle encoder given the
+    /// devmode shape (round only, step = 0, everything else empty).
+    #[test]
+    fn devmode_cert_bytes_round_trip_through_certificate_with_step_zero() {
         use crate::bundle::UnauthenticatedBundle;
         use crate::step::Step;
         use crate::vote::BOTTOM;
@@ -744,6 +794,13 @@ mod tests {
                 hex::encode(&actual),
                 hex::encode(&expected),
                 "byte-exact mismatch for cert_{round}.canonical.hex"
+            );
+            let cert = Certificate::from_bundle(&crate::codec::decode_bundle(&expected).unwrap());
+            assert_eq!(cert.step, Step(0), "cert_{round}: step invented");
+            assert_eq!(
+                hex::encode(canonical_encode_certificate(&cert)),
+                hex::encode(&expected),
+                "Certificate path mismatch for cert_{round}.canonical.hex"
             );
             checked += 1;
         }

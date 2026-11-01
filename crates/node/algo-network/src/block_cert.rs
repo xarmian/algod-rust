@@ -905,6 +905,21 @@ mod tests {
         assert_eq!(cert, decoded);
     }
 
+    /// Issue #2159: `{rnd}` (no step, DevMode) and `{rnd, step: 2}` decode
+    /// and re-encode byte-for-byte; no step is invented.
+    #[test]
+    fn stepless_and_cert_step_certificates_round_trip_bytes() {
+        let stepless = vec![0x81, 0xa3, b'r', b'n', b'd', 0xcd, 0x07, 0xd0];
+        let with_step = vec![
+            0x82, 0xa3, b'r', b'n', b'd', 0xcd, 0x07, 0xd0, 0xa4, b's', b't', b'e', b'p', 0x02,
+        ];
+        for (bytes, step) in [(stepless, 0), (with_step, 2)] {
+            let c: Certificate = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(c.step, step);
+            assert_eq!(rmp_serde::to_vec_named(&c).unwrap(), bytes);
+        }
+    }
+
     #[test]
     fn default_certificate_msgpack_round_trip() {
         let cert = Certificate::default();
