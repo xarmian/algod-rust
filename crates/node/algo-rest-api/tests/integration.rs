@@ -7556,6 +7556,55 @@ async fn pending_transaction_info_found() {
     );
 }
 
+/// Issue #2161: go renders the apply-data pointers of a confirmed transaction
+/// under `omitempty` with `RecursiveEmptyCheck` (JSONStrictHandle/CodecHandle),
+/// so a zero value is omitted and a nonzero one reported.
+#[tokio::test]
+async fn pending_transaction_info_omits_zero_apply_data_like_go() {
+    let mut node = MockNode::synced();
+    let stxn = make_test_signed_txn();
+    let txid = algo_codec::compute_txn_id(&stxn.txn);
+    node.pending_txn_lookup.insert(
+        txid.0,
+        TxnWithStatus {
+            txn: stxn,
+            confirmed_round: 100,
+            pool_error: String::new(),
+            closing_amount: 0,
+            asset_closing_amount: 0,
+            sender_rewards: 990_852,
+            receiver_rewards: 0,
+            close_rewards: 0,
+            asset_index: None,
+            application_index: None,
+            eval_delta: None,
+            logs: None,
+            inner_txns: None,
+        },
+    );
+    let server = TestServer::start(node).await;
+    let url = format!("/v2/transactions/pending/{}", txid);
+    let resp = server
+        .client
+        .get(server.url(&url))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["confirmed-round"], 100);
+    assert_eq!(json["sender-rewards"], 990_852);
+    for key in [
+        "closing-amount",
+        "asset-closing-amount",
+        "receiver-rewards",
+        "close-rewards",
+    ] {
+        assert!(json.get(key).is_none(), "{key} is zero and must be omitted");
+    }
+}
+
 #[tokio::test]
 async fn pending_transaction_info_not_found() {
     let node = MockNode::synced();

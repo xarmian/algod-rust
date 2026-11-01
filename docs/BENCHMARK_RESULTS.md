@@ -390,16 +390,13 @@ txid, transaction commitments) that every block replay exercises.
 ### REST response differences (found by the `rest` tier's equality gate)
 
 The `rest` tier serves one replayed ledger from both nodes and fails on any
-response difference that is not on its issue-linked allowlist. Each allowed
-difference is an open parity bug, not an accepted divergence:
-
-| Issue | Difference |
-|---|---|
-| [#2161](https://github.com/xarmian/algod-rust/issues/2161) | Simulate omits `sender-rewards` when the sender has pending rewards. |
-
-Because of these, the REST throughput rows compare nodes that answer a few
-requests differently; the gate guarantees the differences are exactly the
-listed ones and nothing else.
+response difference that is not on its issue-linked allowlist. The allowlist
+is empty (the last entry, #2161, simulate `sender-rewards`, is fixed), so the
+REST throughput rows compare nodes that answer the requests the gate sends
+identically, apart from wall-clock-dependent fields. The gate's simulate
+request is a payment: an app-call simulate (state deltas, logs, inner
+transactions in `txn-result`) is not covered and still differs
+([#2178](https://github.com/xarmian/algod-rust/issues/2178)).
 
 ## Regression detection and CI
 

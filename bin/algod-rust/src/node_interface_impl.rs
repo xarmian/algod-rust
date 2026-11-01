@@ -3187,26 +3187,36 @@ impl AlgodNodeInterface {
         }
     }
 
-    /// Build a minimal [`PreEncodedTxInfo`] from a simulation [`TxnResult`].
-    ///
-    /// Fields sourced from `ApplyData` (rewards, closing amounts, asset /
-    /// application indexes, state deltas, logs, inner transactions) are
-    /// deliberately left `None` — populating them fully is PLAN-34's
-    /// response-fidelity work. The `txn` field is populated from the
-    /// result so clients can confirm which transaction the result refers
-    /// to even without apply-data parity.
+    /// One ApplyData scalar as go's `ConvertInnerTxn` reports it: `None` when
+    /// there is no ApplyData or the value is zero (go omits both: a codec
+    /// `RecursiveEmptyCheck` on the pointer fields, `omitEmpty` on the ids).
+    /// The same `Option` is skipped by the JSON and the msgpack encoders.
+    fn apply_data_nonzero(ad: Option<&ApplyData>, field: fn(&ApplyData) -> u64) -> Option<u64> {
+        Self::opt_nonzero_u64(ad.map_or(0, field))
+    }
+
+    /// Build the [`PreEncodedTxInfo`] of a simulation [`TxnResult`], mirroring
+    /// go's `ConvertInnerTxn` (`daemon/algod/api/server/v2/utils.go`), which
+    /// `convertTxnResult` uses for the result's `txn-result`: the scalar
+    /// `ApplyData` fields (`closing-amount`, `asset-closing-amount`,
+    /// `sender-rewards`, `receiver-rewards`, `close-rewards`, `asset-index`,
+    /// `application-index`) are reported, and go's codec JSON handle omits one
+    /// whose value is zero (`RecursiveEmptyCheck`, `omitempty` on a pointer).
+    /// There is no `confirmed-round` for a simulated transaction. The state
+    /// deltas, logs and inner transactions are not carried yet.
     fn pre_encoded_txinfo_from_txn_result(result: &TxnResult) -> PreEncodedTxInfo {
+        let ad = result.apply_data.as_ref();
         PreEncodedTxInfo {
             txn: result.txn.clone().unwrap_or_default(),
             pool_error: String::new(),
             confirmed_round: None,
-            closing_amount: None,
-            asset_closing_amount: None,
-            sender_rewards: None,
-            receiver_rewards: None,
-            close_rewards: None,
-            asset_index: None,
-            application_index: None,
+            closing_amount: Self::apply_data_nonzero(ad, |a| a.closing_amount),
+            asset_closing_amount: Self::apply_data_nonzero(ad, |a| a.asset_closing_amount),
+            sender_rewards: Self::apply_data_nonzero(ad, |a| a.sender_rewards),
+            receiver_rewards: Self::apply_data_nonzero(ad, |a| a.receiver_rewards),
+            close_rewards: Self::apply_data_nonzero(ad, |a| a.close_rewards),
+            asset_index: Self::apply_data_nonzero(ad, |a| a.config_asset),
+            application_index: Self::apply_data_nonzero(ad, |a| a.application_id),
             global_state_delta: None,
             local_state_delta: None,
             logs: None,
@@ -5817,6 +5827,178 @@ mod tests {
         assert!(txn_result.txn_result.pool_error.is_empty());
         // fees_paid was left at its zero default -> omitted (None).
         assert!(txn_result.fees_paid.is_none());
+    }
+
+    #[test]
+    fn simulate_txn_result_carries_apply_data_like_go_convert_inner_txn() {
+        // Issue #2161: go's `convertTxnResult` renders the result through
+        // `ConvertInnerTxn`, which reports ApplyData (`sender-rewards`,
+        // `receiver-rewards`, `close-rewards`, closing amounts, created ids).
+        // go's codec JSON handle compares omitted pointers recursively, so a
+        // zero value is dropped and a nonzero one is emitted.
+        let result = TxnResult {
+            txn: Some(SignedTransaction::default()),
+            apply_data: Some(algo_ledger::apply::ApplyData {
+                closing_amount: 11,
+                asset_closing_amount: 12,
+                sender_rewards: 990_852,
+                receiver_rewards: 13,
+                close_rewards: 0,
+                config_asset: 77,
+                application_id: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let model = AlgodNodeInterface::txn_result_to_model(result).txn_result;
+        assert_eq!(model.sender_rewards, Some(990_852));
+        assert_eq!(model.receiver_rewards, Some(13));
+        assert_eq!(model.close_rewards, None, "a zero reward is omitted");
+        assert_eq!(model.closing_amount, Some(11));
+        assert_eq!(model.asset_closing_amount, Some(12));
+        assert_eq!(model.asset_index, Some(77));
+        assert_eq!(model.application_index, None);
+        assert_eq!(
+            model.confirmed_round, None,
+            "simulate has no confirmed round"
+        );
+        let json = serde_json::to_value(&model).unwrap();
+        assert_eq!(json["sender-rewards"], 990_852);
+        assert!(json.get("close-rewards").is_none());
+    }
+
+    #[test]
+    fn simulate_txn_result_without_apply_data_or_with_zeros_omits_rewards() {
+        let none = AlgodNodeInterface::txn_result_to_model(TxnResult::default()).txn_result;
+        assert_eq!(none.sender_rewards, None);
+        let zeros = AlgodNodeInterface::txn_result_to_model(TxnResult {
+            apply_data: Some(Default::default()),
+            ..Default::default()
+        })
+        .txn_result;
+        assert_eq!(zeros.sender_rewards, None);
+        assert_eq!(zeros.closing_amount, None);
+    }
+
+    /// The value under string key `key` of a msgpack map.
+    fn mp_field<'a>(v: &'a rmpv::Value, key: &str) -> Option<&'a rmpv::Value> {
+        v.as_map()?
+            .iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .map(|(_, val)| val)
+    }
+
+    /// Issue #2161, engine to wire: run the real [`Simulator`] on the ledger
+    /// go simulated in `tools/simulate-rewards-oracle` (a nonzero rewards
+    /// rate, so the senders have pending rewards) and check that the REST
+    /// response carries go's `sender-rewards` / `receiver-rewards` /
+    /// `close-rewards` / `closing-amount` / `application-index` for every
+    /// transaction, in JSON and in msgpack, and omits go's zeros.
+    #[test]
+    fn simulate_response_reports_go_oracle_rewards_in_json_and_msgpack() {
+        use base64::Engine as _;
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/core/algo-ledger/tests/fixtures/simulate_rewards/oracle.json");
+        let o: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("oracle fixture"))
+                .expect("oracle json");
+        let b64 = |v: &serde_json::Value| {
+            base64::engine::general_purpose::STANDARD
+                .decode(v.as_str().expect("string"))
+                .expect("base64")
+        };
+        let addr = |v: &serde_json::Value| Address(b64(v).try_into().expect("32 bytes"));
+        let num = |v: &serde_json::Value| v.as_u64().expect("u64");
+
+        let mut state = algo_ledger::LedgerState::new();
+        let protocol = o["protocol"].as_str().unwrap().to_string();
+        state.protocol = protocol.clone();
+        state.genesis_id = o["genesis_id"].as_str().unwrap().to_string();
+        state.genesis_hash = b64(&o["genesis_hash"]).try_into().expect("hash");
+        state.current_round = num(&o["round"]).into();
+        state.txn_counter = num(&o["txn_counter"]);
+        state.fee_sink = addr(&o["fee_sink"]);
+        state.rewards_pool = addr(&o["rewards_pool"]);
+        let rs = &o["rewards_state"];
+        state.rewards_level = num(&rs["rewards_level"]);
+        state.rewards_rate = num(&rs["rewards_rate"]);
+        state.rewards_residue = num(&rs["rewards_residue"]);
+        state.rewards_recalculation_round = num(&rs["rewards_recalculation_round"]);
+        state
+            .put_block(num(&o["round"]), &protocol, &b64(&o["prev_header"]), &[])
+            .expect("latest header");
+        for a in o["accounts"].as_array().unwrap() {
+            let status = match a["status"].as_str().unwrap() {
+                "Online" => algo_types::AccountStatus::Online,
+                "Offline" => algo_types::AccountStatus::Offline,
+                _ => algo_types::AccountStatus::NotParticipating,
+            };
+            state.set_account(
+                &addr(&a["addr"]),
+                algo_types::AccountData {
+                    status,
+                    micro_algos: num(&a["micro_algos"]),
+                    rewards_base: num(&a["rewards_base"]),
+                    rewarded_micro_algos: num(&a["rewarded_micro_algos"]),
+                    ..Default::default()
+                },
+            );
+        }
+        let group = algo_codec::decode_signed_txn_stream(&b64(&o["group_msgpack"])).expect("group");
+
+        let result = Simulator::new(&mut state)
+            .simulate(SimulationRequest {
+                txn_groups: vec![group],
+                allow_empty_signatures: true,
+                ..Default::default()
+            })
+            .expect("simulate");
+        let response = AlgodNodeInterface::build_simulate_response(result);
+        let json = serde_json::to_value(&response).expect("json");
+        let bytes = algo_codec::to_vec_named_str_preserving(&response).expect("msgpack");
+        let mp = rmpv::decode::read_value(&mut bytes.as_slice()).expect("decode msgpack");
+
+        let want = o["txns"].as_array().unwrap();
+        let results = json["txn-groups"][0]["txn-results"].as_array().unwrap();
+        assert_eq!(results.len(), want.len());
+        let mp_group = &mp_field(&mp, "txn-groups").unwrap().as_array().unwrap()[0];
+        let mp_results = mp_field(mp_group, "txn-results")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        let mut saw_sender_rewards = false;
+        for (i, w) in want.iter().enumerate() {
+            let tr = &results[i]["txn-result"];
+            let mtr = mp_field(&mp_results[i], "txn-result").unwrap();
+            for (key, field) in [
+                ("sender-rewards", "sender_rewards"),
+                ("receiver-rewards", "receiver_rewards"),
+                ("close-rewards", "close_rewards"),
+                ("closing-amount", "closing_amount"),
+                ("application-index", "application_id"),
+            ] {
+                let expected = num(&w[field]);
+                if expected == 0 {
+                    assert!(tr.get(key).is_none(), "txn {i} json {key} must be omitted");
+                    assert!(
+                        mp_field(mtr, key).is_none(),
+                        "txn {i} msgpack {key} must be omitted"
+                    );
+                } else {
+                    assert_eq!(tr[key], expected, "txn {i} json {key}");
+                    let got = mp_field(mtr, key)
+                        .unwrap_or_else(|| panic!("txn {i} msgpack {key} missing"));
+                    assert_eq!(got.as_u64(), Some(expected), "txn {i} msgpack {key}");
+                }
+            }
+            saw_sender_rewards |= num(&w["sender_rewards"]) != 0;
+            assert!(tr.get("confirmed-round").is_none());
+            assert!(mp_field(mtr, "confirmed-round").is_none());
+        }
+        assert!(
+            saw_sender_rewards,
+            "the oracle scenario has pending sender rewards"
+        );
     }
 
     #[test]

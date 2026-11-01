@@ -2957,6 +2957,12 @@ fn convert_inner_txns(eval_delta: &rmpv::Value) -> Option<Vec<models::PreEncoded
     None
 }
 
+/// `Some(v)` for a nonzero value, `None` for zero: how go's codec handles
+/// (`RecursiveEmptyCheck`) render an `omitempty` pointer to an apply-data scalar.
+fn nonzero_u64(v: u64) -> Option<u64> {
+    (v != 0).then_some(v)
+}
+
 /// Convert a single inner transaction rmpv::Value into a `PreEncodedTxInfo`.
 fn convert_inner_txn(itx: &rmpv::Value) -> Option<models::PreEncodedTxInfo> {
     // The inner txn is a full SignedTransaction msgpack map. We need to
@@ -2976,25 +2982,17 @@ fn convert_inner_txn(itx: &rmpv::Value) -> Option<models::PreEncodedTxInfo> {
         None
     };
 
-    // Populate apply-data fields from the SignedTransaction, matching
-    // go-algorand's ConvertInnerTxn which always sets these as pointers
-    // (even when 0). The Go codec includes non-nil pointers in output.
-    let closing_amount = Some(stxn.closing_amount);
-    let asset_closing_amount = Some(stxn.asset_closing_amount);
-    let sender_rewards = Some(stxn.sender_rewards);
-    let receiver_rewards = Some(stxn.receiver_rewards);
-    let close_rewards = Some(stxn.close_rewards);
-    // Asset/app indices use omitEmpty in Go (nil when 0).
-    let asset_index = if stxn.apply_data_config_asset != 0 {
-        Some(stxn.apply_data_config_asset)
-    } else {
-        None
-    };
-    let application_index = if stxn.apply_data_application_id != 0 {
-        Some(stxn.apply_data_application_id)
-    } else {
-        None
-    };
+    // Populate apply-data fields from the SignedTransaction like go's
+    // ConvertInnerTxn: it sets these as pointers, but go's codec handles run
+    // with `RecursiveEmptyCheck`, so `omitempty` drops a zero pointee as well
+    // (issue #2161): only a nonzero value is reported, in JSON and msgpack.
+    let closing_amount = nonzero_u64(stxn.closing_amount);
+    let asset_closing_amount = nonzero_u64(stxn.asset_closing_amount);
+    let sender_rewards = nonzero_u64(stxn.sender_rewards);
+    let receiver_rewards = nonzero_u64(stxn.receiver_rewards);
+    let close_rewards = nonzero_u64(stxn.close_rewards);
+    let asset_index = nonzero_u64(stxn.apply_data_config_asset);
+    let application_index = nonzero_u64(stxn.apply_data_application_id);
 
     let mut info = models::PreEncodedTxInfo {
         txn: stxn.clone(),
@@ -3102,11 +3100,13 @@ pub async fn pending_transaction_information<N: NodeInterface>(
 
     if txn_status.confirmed_round != 0 {
         response.confirmed_round = Some(txn_status.confirmed_round);
-        response.closing_amount = Some(txn_status.closing_amount);
-        response.asset_closing_amount = Some(txn_status.asset_closing_amount);
-        response.sender_rewards = Some(txn_status.sender_rewards);
-        response.receiver_rewards = Some(txn_status.receiver_rewards);
-        response.close_rewards = Some(txn_status.close_rewards);
+        // go: `&ApplyData.X` pointers under `omitempty` + `RecursiveEmptyCheck`,
+        // so a zero value is omitted (issue #2161).
+        response.closing_amount = nonzero_u64(txn_status.closing_amount);
+        response.asset_closing_amount = nonzero_u64(txn_status.asset_closing_amount);
+        response.sender_rewards = nonzero_u64(txn_status.sender_rewards);
+        response.receiver_rewards = nonzero_u64(txn_status.receiver_rewards);
+        response.close_rewards = nonzero_u64(txn_status.close_rewards);
         response.asset_index = txn_status.asset_index;
         response.application_index = txn_status.application_index;
         response.logs = txn_status.logs;
