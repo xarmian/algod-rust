@@ -2708,10 +2708,10 @@ fn eviction_counts_one_reeval_drop_per_group() {
 /// `LeaseInLedgerError` from `checkDup`). The oracle pins both outcomes
 /// (`block_checkdup/oracle.json` `pool`, checked in algo-ledger's
 /// `block_checkdup_oracle_test`). Here the same two stages of the Rust pool
-/// evaluator: its test stage is stateless (per-transaction `checkDup` at
-/// that stage is #2130's subject), so it accepts the conflicting group as
-/// go's does, and the apply stage rejects the second member with go's text
-/// and pool tag.
+/// evaluator: its test stage judges each member against the unmodified
+/// state (per-transaction `Alive` and `checkDup`, issue #2130), so it accepts
+/// the conflicting group as go's does, and the apply stage rejects the second
+/// member with go's text and pool tag.
 #[test]
 fn in_group_lease_conflict_passes_the_test_stage_and_fails_the_apply_stage() {
     let a = key(1);
@@ -2755,4 +2755,319 @@ fn in_group_lease_conflict_passes_the_test_stage_and_fails_the_apply_stage() {
         ),
         "{err:?}"
     );
+}
+
+// ---- #2130: go's per-transaction order, against the go oracle ----
+
+/// go's pool admission for one scenario of
+/// `block_checkdup/oracle.json` `pool_order` (`tools/simulate-rewards-oracle`,
+/// `blockdup.go`): a fresh Generate + Validate evaluator, `Pre` groups
+/// applied first, then `TestTransactionGroup` and `TransactionGroup`.
+struct OrderScenario {
+    name: String,
+    pre: Vec<Vec<SignedTransaction>>,
+    group: Vec<SignedTransaction>,
+    test_error: String,
+    add_error: String,
+}
+
+fn oracle_b64(s: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .expect("fixture base64")
+}
+
+fn oracle_addr(s: &str) -> Address {
+    Address(oracle_b64(s).try_into().expect("32-byte address"))
+}
+
+/// The go oracle's ledger (genesis plus go's block 1) and its scenarios.
+fn order_oracle() -> (Arc<Mutex<SqliteLedger>>, Vec<OrderScenario>) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/core/algo-ledger/tests/fixtures/block_checkdup/oracle.json");
+    let raw = std::fs::read_to_string(&path).expect("read the go oracle fixture");
+    let o: serde_json::Value = serde_json::from_str(&raw).expect("parse the go oracle fixture");
+    let text = |v: &serde_json::Value| v.as_str().expect("string").to_string();
+    let mut l = SqliteLedger::open_in_memory().expect("ledger");
+    l.set_protocol(text(&o["protocol"]));
+    l.set_genesis_id(text(&o["genesis_id"]));
+    l.set_genesis_hash(oracle_b64(&text(&o["genesis_hash"])).try_into().unwrap());
+    l.set_fee_sink(oracle_addr(&text(&o["fee_sink"])));
+    l.set_rewards_pool(oracle_addr(&text(&o["rewards_pool"])));
+    for a in o["genesis_accounts"].as_array().expect("accounts") {
+        let status = match a["status"].as_str().unwrap() {
+            "Offline" => algo_types::AccountStatus::Offline,
+            "Not Participating" => algo_types::AccountStatus::NotParticipating,
+            other => panic!("unknown status {other}"),
+        };
+        l.set_account(
+            &oracle_addr(&text(&a["addr"])),
+            AccountData {
+                status,
+                micro_algos: a["micro_algos"].as_u64().unwrap(),
+                ..Default::default()
+            },
+        );
+    }
+    let block1 = algo_codec::decode_block(&oracle_b64(&text(&o["block1"]))).expect("go block 1");
+    l.begin_block().expect("begin block");
+    algo_ledger::apply::apply_block(&mut l, &block1).expect("apply go block 1");
+    l.commit_block().expect("commit block");
+    let txns = |v: &serde_json::Value| -> Vec<SignedTransaction> {
+        v.as_array()
+            .expect("txns")
+            .iter()
+            .map(|t| {
+                let mut one = algo_codec::decode_signed_txn_stream(&oracle_b64(&text(t)))
+                    .expect("decode go txn");
+                assert_eq!(one.len(), 1);
+                one.remove(0)
+            })
+            .collect()
+    };
+    let scenarios = o["pool_order"]
+        .as_array()
+        .expect("pool_order")
+        .iter()
+        .map(|s| OrderScenario {
+            name: text(&s["name"]),
+            pre: s["pre"]
+                .as_array()
+                .map(|p| p.iter().map(txns).collect())
+                .unwrap_or_default(),
+            group: txns(&s["group"]),
+            test_error: text(&s["test_error"]),
+            add_error: text(&s["add_error"]),
+        })
+        .collect();
+    (Arc::new(Mutex::new(l)), scenarios)
+}
+
+/// A fresh pool evaluator on go's ledger, one per scenario.
+fn order_evaluator(ledger: &Arc<Mutex<SqliteLedger>>) -> SimpleBlockEvaluator {
+    let adapter = PoolLedgerAdapter::new(ledger.clone());
+    let hdr1 = algo_pool::traits::PoolLedger::block_hdr(&adapter, Round(1)).expect("block 1");
+    adapter
+        .start_simple_evaluator(hdr1, 0, 0)
+        .expect("start_evaluator")
+}
+
+/// Every scenario go's `BlockEvaluator` decides: the Rust evaluator's
+/// `transaction_group` (apply stage) gives go's `TransactionGroup` text, and
+/// its `test_transaction_group` gives go's `TestTransactionGroup` text. The
+/// order is per transaction, `Alive` -> `checkDup` -> authorizer -> apply
+/// (`BlockEvaluator.transaction`), so the FIRST failing member decides.
+#[test]
+fn pool_evaluator_matches_go_per_transaction_order() {
+    let (ledger, scenarios) = order_oracle();
+    assert!(!scenarios.is_empty(), "the oracle has pool_order rows");
+    let mut mismatches = Vec::new();
+    for sc in &scenarios {
+        let mut eval = order_evaluator(&ledger);
+        for pre in &sc.pre {
+            eval.transaction_group(pre)
+                .unwrap_or_else(|e| panic!("{}: pre group: {e}", sc.name));
+        }
+        let test = eval
+            .test_transaction_group(&sc.group)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        let add = eval
+            .transaction_group(&sc.group)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        if test != sc.test_error {
+            mismatches.push(format!(
+                "{} (test stage)\n  go:   {:?}\n  rust: {:?}",
+                sc.name, sc.test_error, test
+            ));
+        }
+        if add != sc.add_error {
+            mismatches.push(format!(
+                "{} (apply stage)\n  go:   {:?}\n  rust: {:?}",
+                sc.name, sc.add_error, add
+            ));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} verdict(s) differ from go:\n{}",
+        mismatches.len(),
+        mismatches.join("\n")
+    );
+}
+
+/// One signed group of `members` (the group ID computed over them).
+fn signed_group(members: Vec<Transaction>, k: &Key) -> Vec<SignedTransaction> {
+    let gid = algo_codec::compute_group_id(&members);
+    members
+        .into_iter()
+        .map(|mut t| {
+            t.group = gid.0;
+            sign(t, &k.1)
+        })
+        .collect()
+}
+
+fn pay_txn(k: &Key, to: Address, amount: u64, note: u8) -> Transaction {
+    let mut t = base_txn(k.0, TxnType::Pay);
+    t.receiver = to;
+    t.amount = amount;
+    t.note = serde_bytes::ByteBuf::from(vec![note]);
+    t
+}
+
+/// go's `BlockEvaluator.transaction` is per member, so the FIRST failing member
+/// of a group decides the error and the pool's tag: member 0's overspend is
+/// reported even though member 1 repeats it (a duplicate). The same through
+/// `Remember`, with go's frame and tag (issue #2130; the go oracle pins the
+/// texts in `pool_evaluator_matches_go_per_transaction_order`).
+#[test]
+fn pool_reports_the_first_failing_member_with_its_own_tag() {
+    use algo_pool::error::{classify_pool_error, PoolErrorTag};
+    let a = key(1);
+    let b = key(2);
+    let (_ledger, pool) = fixture(&[(a.0, funded(5_000_000)), (b.0, funded(1_000_000))], &[]);
+    let over = pay_txn(&a, b.0, 900_000_000, 7);
+    let group = signed_group(vec![over.clone(), over], &a);
+    let err = pool.remember(group.clone()).expect_err("overspend");
+    assert_eq!(classify_pool_error(&err), PoolErrorTag::Overspend, "{err}");
+    assert!(
+        err.to_string().starts_with(&format!(
+            "TransactionPool.Remember: transaction {}: overspend",
+            txid(&group[0])
+        )),
+        "{err}"
+    );
+}
+
+/// An application call that go's apply rejects on member 0 beats a precheck
+/// failure (here an overspend) of member 1: the cheap prechecks do not model
+/// the AVM, so the real apply runs the group in go's order to find it.
+#[test]
+fn an_earlier_apply_failure_beats_a_later_precheck_failure() {
+    let a = key(1);
+    let b = key(2);
+    let app_id = 902u64;
+    let (ledger, pool) = fixture(&[(a.0, funded(5_000_000)), (b.0, funded(1_000_000))], &[]);
+    put_app(
+        &ledger,
+        app_id,
+        a.0,
+        "#pragma version 8
+int 0
+",
+    );
+    let mut call = base_txn(a.0, TxnType::Appl);
+    call.application_id = app_id;
+    call.fee = 1_000;
+    let over = pay_txn(&a, b.0, 900_000_000, 8);
+    let group = signed_group(vec![call, over], &a);
+    let err = pool.remember(group.clone()).expect_err("rejected");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "TransactionPool.Remember: transaction {}: transaction rejected by ApprovalProgram",
+            txid(&group[0])
+        )
+    );
+    // The rejected group left nothing behind: an ordinary payment is admitted.
+    pool.remember_one(pay(&a, b.0, 1_000, None))
+        .expect("the pool is unchanged");
+}
+
+/// go's pool has no duplicate pass of its own: a transaction the pending
+/// block already holds is the evaluator's `checkDup` error, go's
+/// `TransactionInLedgerError` with `InBlockEvaluator` (text
+/// `transaction already in ledger: <txid>`, tag `txid_eval`), not a
+/// pool-level "already in the pool" (issue #2130).
+#[test]
+fn pool_reports_a_pending_duplicate_like_go() {
+    use algo_pool::error::{classify_pool_error, PoolErrorTag};
+    let a = key(1);
+    let b = key(2);
+    let (_ledger, pool) = fixture(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))], &[]);
+    let stx = pay(&a, b.0, 1_000_000, None);
+    pool.remember_one(stx.clone()).expect("first");
+    let err = pool.remember_one(stx.clone()).expect_err("duplicate");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "TransactionPool.Remember: transaction already in ledger: {}",
+            txid(&stx)
+        )
+    );
+    assert_eq!(classify_pool_error(&err), PoolErrorTag::TxIdEval);
+}
+
+/// go's `Test` stage runs `Alive` and `checkDup` per member against the
+/// unmodified state (the pending block included) and returns the typed error,
+/// which the pool tags `txid_eval` / `lease`.
+#[test]
+fn pool_test_stage_keeps_the_typed_checkdup_class() {
+    use algo_ledger::store_trait::LedgerStore;
+    use algo_pool::error::{classify_pool_error, PoolErrorTag};
+    let a = key(1);
+    let b = key(2);
+    let lease = [0x6B; 32];
+    let (ledger, pool) = fixture(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))], &[]);
+    let pending = pay(&a, b.0, 1_000_000, None);
+    pool.remember_one(pending.clone()).expect("pending");
+    let err = pool.test(std::slice::from_ref(&pending)).expect_err("dup");
+    assert_eq!(classify_pool_error(&err), PoolErrorTag::TxIdEval, "{err}");
+    assert_eq!(
+        err.to_string(),
+        format!("transaction already in ledger: {}", txid(&pending))
+    );
+
+    // A lease committed after the evaluator's snapshot: the live ledger has it.
+    ledger.lock().unwrap().record_lease(&a.0, &lease, 500);
+    let stx = leased_pay(&a, b.0, lease, 9);
+    let err = pool.test(std::slice::from_ref(&stx)).expect_err("lease");
+    assert_eq!(classify_pool_error(&err), PoolErrorTag::Lease, "{err}");
+}
+
+/// Port of go's `TestTxPoolReevalMetricsRecordLedgerDuplicate`
+/// (`data/pools/transactionPool_test.go`): a transaction is remembered, then
+/// committed in a block; the pool re-evaluates its pending group without the
+/// block's txids (go nils `delta.Txids`, so the fast committed-txid filter
+/// misses), and the re-fed evaluator itself finds the transaction in the
+/// ledger: `TransactionInLedgerError`, counted under `TxPoolErrTagTxID`
+/// (issue #2130: the evaluator runs `checkDup` per transaction, as go's does).
+#[test]
+fn pool_txid_reeval_classification() {
+    use algo_pool::error::PoolErrorTag;
+    let a = key(1);
+    let b = key(2);
+    let (ledger, pool) = fixture(&[(a.0, funded(50_000_000)), (b.0, funded(1_000_000))], &[]);
+    pool.remember_one(pay(&a, b.0, 1_000_000, None))
+        .expect("remembered");
+
+    let block = pool.assemble_dev_mode_block().expect("assemble");
+    assert_eq!(block.payset.len(), 1);
+    {
+        let mut l = ledger.lock().unwrap();
+        l.begin_block().expect("begin_block");
+        algo_ledger::apply::apply_generated_block_capturing_apply_data_with_delta(
+            &mut *l,
+            &block,
+            algo_ledger::ApplyMode::Execute,
+        )
+        .expect("commit the transaction");
+        l.commit_block().expect("commit_block");
+    }
+
+    let counter = pool.reeval_counter();
+    let (txid_before, txid_eval_before) = (
+        counter.count(PoolErrorTag::TxId),
+        counter.count(PoolErrorTag::TxIdEval),
+    );
+    pool.on_new_block(&block, &std::collections::HashSet::new());
+    let counter = pool.reeval_counter();
+    assert_eq!(counter.count(PoolErrorTag::TxId), txid_before + 1);
+    assert_eq!(counter.count(PoolErrorTag::TxIdEval), txid_eval_before);
+    assert_eq!(pool.pending_count(), 0);
 }

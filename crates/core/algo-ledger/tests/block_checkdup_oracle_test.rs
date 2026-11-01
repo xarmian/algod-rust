@@ -720,9 +720,11 @@ fn in_group_distinct_leases_are_accepted_on_every_path_like_go() {
 /// order and rejects the second with `LeaseInLedgerError`. The group
 /// evaluation behind the pool (`evaluate_group`) must give go's `add_error`.
 ///
-/// The Rust pool's per-transaction test stage is stateless and has no
-/// ledger-backed `checkDup` of its own yet (#2130's subject), so this test
-/// asserts go's recorded test-stage verdict (accepted) here, and the bin
+/// The Rust pool evaluator's test stage (`test_transaction_group`) runs go's
+/// per-member `Alive` and `checkDup` against the unmodified state (issue
+/// #2130; `pool_evaluator_matches_go_per_transaction_order` compares it with
+/// the oracle's `pool_order` rows), so it cannot see a sibling either. This
+/// test asserts go's recorded test-stage verdict (accepted) here, and the bin
 /// crate's `in_group_lease_conflict_passes_the_test_stage_and_fails_the_apply_stage`
 /// (`participate_exec_tests.rs`) runs the Rust evaluator's `test_transaction_group`
 /// and `transaction_group` on the same shape of group.

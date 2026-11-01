@@ -85,6 +85,22 @@ type blockDupFixture struct {
 	// data/pools runs it on its Generate+Validate block evaluator: the
 	// per-transaction `TestTransactionGroup`, then `TransactionGroup`.
 	Pool []blockDupPoolScenario `json:"pool"`
+	// Issue #2130: the pool evaluator's per-transaction order
+	// (`Alive` -> `checkDup` -> authorizer -> apply) on groups whose members
+	// fail at different stages.
+	PoolOrder []blockDupOrderScenario `json:"pool_order"`
+}
+
+// blockDupOrderScenario is one pool-admission verdict: `Pre` groups are
+// applied to a fresh Generate+Validate evaluator first (the pool's pending
+// block), then go's `TestTransactionGroup` and `TransactionGroup` run on
+// `Group`. Each transaction is one base64 msgpack `SignedTxn`.
+type blockDupOrderScenario struct {
+	Name      string     `json:"name"`
+	Pre       [][]string `json:"pre"`
+	Group     []string   `json:"group"`
+	TestError string     `json:"test_error"`
+	AddError  string     `json:"add_error"`
 }
 
 type blockDupPoolScenario struct {
@@ -341,6 +357,127 @@ func blockDupOracle() {
 			TestError:    errText(terr),
 			AddError:     errText(aerr),
 		})
+	}
+
+	// Issue #2130: the order go's `BlockEvaluator.transaction` runs its
+	// checks in, per transaction: `Alive`, `checkDup`, the authorizer, then
+	// the apply (fee and amount moves). A group whose members fail at
+	// different stages is therefore reported for its FIRST failing member,
+	// whatever the failing stage of a later one. Each scenario is evaluated
+	// by a fresh Generate+Validate evaluator, like the pool's.
+	var seed2 crypto.Seed
+	for i := range seed2 {
+		seed2[i] = 0xB2
+	}
+	secrets2 := crypto.GenerateSignatureSecrets(seed2)
+	otherAuth := basics.Address(secrets2.SignatureVerifier)
+	var leaseF, leaseP, leaseQ [32]byte
+	for i := range leaseF {
+		leaseF[i] = 0x71
+		leaseP[i] = 0x72
+		leaseQ[i] = 0x73
+	}
+	// wrongAuth signs with a key that is not the sender's authorizer.
+	wrongAuth := func(t transactions.Transaction) transactions.SignedTxn {
+		s := t.Sign(secrets2)
+		s.AuthAddr = otherAuth
+		return s
+	}
+	signAll := func(sign func(transactions.Transaction) transactions.SignedTxn, txns ...transactions.Transaction) []transactions.SignedTxn {
+		var hashes []crypto.Digest
+		for _, t := range txns {
+			hashes = append(hashes, crypto.Digest(t.ID()))
+		}
+		gid := crypto.HashObj(transactions.TxGroup{TxGroupHashes: hashes})
+		out := make([]transactions.SignedTxn, len(txns))
+		for i, t := range txns {
+			t.Group = gid
+			out[i] = sign(t)
+		}
+		return out
+	}
+	good := func(t transactions.Transaction) transactions.SignedTxn { return t.Sign(secrets) }
+	withAmount := func(t transactions.Transaction, amount uint64) transactions.Transaction {
+		t.Amount = basics.MicroAlgos{Raw: amount}
+		return t
+	}
+	withValidity := func(t transactions.Transaction, first, last uint64) transactions.Transaction {
+		t.FirstValid = basics.Round(first)
+		t.LastValid = basics.Round(last)
+		return t
+	}
+	overspend := uint64(5_000_000_000)
+
+	badAuthT := payTxn("order-bad-auth", [32]byte{})
+	overT := withAmount(payTxn("order-overspend", [32]byte{}), overspend)
+	type orderSpec struct {
+		name  string
+		pre   [][]transactions.SignedTxn
+		group []transactions.SignedTxn
+	}
+	one := func(s transactions.SignedTxn) []transactions.SignedTxn { return []transactions.SignedTxn{s} }
+	pending := pay("order-pending", leaseP)
+	for _, os := range []orderSpec{
+		// member 0 fails the authorizer; member 1 repeats member 0 (a dup).
+		{"auth_then_dup", nil, signAll(wrongAuth, badAuthT, badAuthT)},
+		// member 0 overspends; member 1 repeats member 0.
+		{"overspend_then_dup", nil, signAll(good, overT, overT)},
+		// member 0 overspends under a fresh lease; member 1 reuses the lease.
+		{"overspend_then_lease_conflict", nil, signAll(good,
+			withAmount(payTxn("order-over-leased", leaseF), overspend), payTxn("order-lease-twin", leaseF))},
+		// member 0 holds the lease; member 1 reuses it AND overspends.
+		{"lease_conflict_then_overspend", nil, signAll(good,
+			payTxn("order-lease-first", leaseF), withAmount(payTxn("order-lease-over", leaseF), overspend))},
+		// member 0 reuses a lease block 1 holds; member 1 is not yet valid.
+		{"ledger_lease_then_early", nil, signAll(good,
+			payTxn("order-ledger-lease", lease), withValidity(payTxn("order-early", [32]byte{}), 5000, 6000))},
+		// member 0 is fine; member 1 is not yet valid.
+		{"early_member", nil, signAll(good,
+			payTxn("order-fine", [32]byte{}), withValidity(payTxn("order-early", [32]byte{}), 5000, 6000))},
+		// member 0 reuses a live ledger lease and has the wrong authorizer:
+		// checkDup comes first.
+		{"lease_conflict_before_authorizer", nil, one(wrongAuth(payTxn("order-lease-auth", lease)))},
+		// member 0 has the wrong authorizer and overspends: authorizer first.
+		{"authorizer_before_apply", nil, one(wrongAuth(overT))},
+		// a replay of a committed transaction, alone.
+		{"committed_txid", nil, one(committed)},
+		// a transaction an earlier group of the pending block holds.
+		{"pending_txid", [][]transactions.SignedTxn{one(pending)}, one(pending)},
+		// a lease an earlier group of the pending block holds.
+		{"pending_lease", [][]transactions.SignedTxn{one(pending)}, one(pay("order-pending-twin", leaseP))},
+		// an expired transaction, alone (the pool also pre-checks LastValid).
+		{"expired_alone", nil, one(good(withValidity(payTxn("order-expired", [32]byte{}), 1, 1)))},
+		// member 0 reuses a live ledger lease; member 1 is expired.
+		{"ledger_lease_then_expired", nil, signAll(good,
+			payTxn("order-ledger-lease-2", lease), withValidity(payTxn("order-expired-2", [32]byte{}), 1, 1))},
+		// control: a clean group.
+		{"clean_group", nil, signAll(good, payTxn("order-clean-a", leaseQ), payTxn("order-clean-b", [32]byte{}))},
+	} {
+		pev, err := l.StartEvaluator(poolHdr, 0, 0, nil)
+		must(err)
+		enc := func(g []transactions.SignedTxn) []string {
+			var out []string
+			for i := range g {
+				out = append(out, b64(protocol.Encode(&g[i])))
+			}
+			return out
+		}
+		sc := blockDupOrderScenario{Name: os.name, Group: enc(os.group)}
+		for _, pre := range os.pre {
+			var ad []transactions.SignedTxnWithAD
+			for i := range pre {
+				ad = append(ad, transactions.SignedTxnWithAD{SignedTxn: pre[i]})
+			}
+			must(pev.TransactionGroup(ad...))
+			sc.Pre = append(sc.Pre, enc(pre))
+		}
+		sc.TestError = errText(pev.TestTransactionGroup(os.group))
+		var ad []transactions.SignedTxnWithAD
+		for i := range os.group {
+			ad = append(ad, transactions.SignedTxnWithAD{SignedTxn: os.group[i]})
+		}
+		sc.AddError = errText(pev.TransactionGroup(ad...))
+		f.PoolOrder = append(f.PoolOrder, sc)
 	}
 
 	path := filepath.Join("..", "..", "crates", "core", "algo-ledger", "tests", "fixtures", "block_checkdup", "oracle.json")
