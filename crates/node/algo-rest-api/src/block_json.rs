@@ -316,6 +316,24 @@ fn json_number(f: f64) -> String {
     }
 }
 
+/// Render one msgpack-encoded `SignedTxn` as go's `protocol.JSONStrictHandle`
+/// JSON value (issue #2160): addresses as checksummed base32, every other
+/// byte-valued field (digests, notes, programs, keys, signatures) as base64.
+///
+/// Used for the transaction embedded in `PreEncodedTxInfo` (simulate
+/// `txn-result`, pending-transaction responses), whose `Txn` go encodes with the
+/// same codec handle as a block's payset, so the block renderer's key-driven
+/// rules apply unchanged.
+pub(crate) fn signed_txn_msgpack_to_json_value(
+    msgpack: &[u8],
+) -> Result<serde_json::Value, BlockJsonError> {
+    let tree = rmpv::decode::read_value(&mut &msgpack[..])
+        .map_err(|e| BlockJsonError::Decode(e.to_string()))?;
+    let mut out = String::new();
+    write_value(&mut out, &tree, None, None, 0);
+    serde_json::from_str(&out).map_err(|e| BlockJsonError::Decode(e.to_string()))
+}
+
 /// Errors from canonical block JSON encoding.
 #[derive(Debug)]
 pub enum BlockJsonError {

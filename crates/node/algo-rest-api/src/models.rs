@@ -1498,6 +1498,7 @@ pub struct AccountStateDelta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreEncodedTxInfo {
     /// The signed transaction.
+    #[serde(serialize_with = "serialize_signed_txn_go_json")]
     pub txn: SignedTransaction,
 
     /// Non-empty when the transaction was kicked from the pool.
@@ -1548,12 +1549,56 @@ pub struct PreEncodedTxInfo {
     pub local_state_delta: Option<Vec<AccountStateDelta>>,
 
     /// Logs from application execution.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_logs_go_json"
+    )]
     pub logs: Option<Vec<Vec<u8>>>,
 
     /// Inner transactions.
     #[serde(rename = "inner-txns", skip_serializing_if = "Option::is_none")]
     pub inner_txns: Option<Vec<PreEncodedTxInfo>>,
+}
+
+/// Serialize the embedded `SignedTxn` the way go's codec handle does (issue
+/// #2160). JSON goes through the msgpack form and the block JSON renderer so
+/// each byte field is rendered as go does (address strings, base64 for the
+/// rest); the plain serde derive would emit digests as integer arrays. Binary
+/// formats keep the derive (raw msgpack `bin`).
+fn serialize_signed_txn_go_json<S: serde::Serializer>(
+    txn: &SignedTransaction,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::Error;
+    if !s.is_human_readable() {
+        return serde::Serialize::serialize(txn, s);
+    }
+    let bytes = algo_codec::to_vec_named_str_preserving(txn).map_err(S::Error::custom)?;
+    let value =
+        crate::block_json::signed_txn_msgpack_to_json_value(&bytes).map_err(S::Error::custom)?;
+    serde::Serialize::serialize(&value, s)
+}
+
+/// `[][]byte` logs: base64 strings in JSON (go's codec JSON handle), msgpack
+/// `bin` elements in binary formats.
+fn serialize_logs_go_json<S: serde::Serializer>(
+    logs: &Option<Vec<Vec<u8>>>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    let Some(items) = logs else {
+        return s.serialize_none();
+    };
+    let human = s.is_human_readable();
+    let mut seq = s.serialize_seq(Some(items.len()))?;
+    for item in items {
+        if human {
+            seq.serialize_element(&STANDARD.encode(item))?;
+        } else {
+            seq.serialize_element(serde_bytes::Bytes::new(item))?;
+        }
+    }
+    seq.end()
 }
 
 // ---------------------------------------------------------------------------

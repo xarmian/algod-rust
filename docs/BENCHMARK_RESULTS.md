@@ -395,7 +395,6 @@ difference is an open parity bug, not an accepted divergence:
 
 | Issue | Difference |
 |---|---|
-| [#2160](https://github.com/xarmian/algod-rust/issues/2160) | Simulate JSON renders `gh` and other 32-byte digests as integer arrays; Go renders base64. |
 | [#2161](https://github.com/xarmian/algod-rust/issues/2161) | Simulate omits `sender-rewards` when the sender has pending rewards. |
 
 Because of these, the REST throughput rows compare nodes that answer a few

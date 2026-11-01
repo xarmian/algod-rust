@@ -99,8 +99,6 @@ def _kd(endpoint, path, kind, issue, reason, **extra):
 
 
 KNOWN_DIFFERENCES = [
-    _kd("simulate", "txn-groups.0.txn-results.0.txn-result.txn.txn.gh", "value", 2160,
-        "gh rendered as an integer array"),
     _kd("simulate", "txn-groups.0.txn-results.0.txn-result.sender-rewards", "only-go", 2161,
         "sender-rewards omitted"),
 ]
