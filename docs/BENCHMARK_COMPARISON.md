@@ -1389,13 +1389,11 @@ The number of allowlisted differences is recorded in every row's metadata
 <!-- known-differences:start -->
 | Endpoint | Path | Kind | Issue | Reason |
 |---|---|---|---|---|
-| `simulate` | `txn-groups.0.txn-results.0.txn-result.sender-rewards` | only-go | [#2161](https://github.com/xarmian/algod-rust/issues/2161) | sender-rewards omitted |
 <!-- known-differences:end -->
 
-While those are open, the throughput rows for `account_hot`, `account_cold`
-and `simulate` compare two nodes that do not yet
-return the same answer (algod-rust returns less data for the account
-endpoints), so read them with the table above in mind.
+The allowlist is currently empty: the last entry (#2161, simulate
+`sender-rewards`) was fixed, so the throughput rows compare two nodes that
+return identical responses for every gated request.
 
 ### What is measured
 

@@ -98,10 +98,11 @@ def _kd(endpoint, path, kind, issue, reason, **extra):
                  "reason": reason, "corpus": "small"}, **extra)
 
 
-KNOWN_DIFFERENCES = [
-    _kd("simulate", "txn-groups.0.txn-results.0.txn-result.sender-rewards", "only-go", 2161,
-        "sender-rewards omitted"),
-]
+# Empty since #2161 (the last entry, simulate `sender-rewards`) was fixed: the
+# gate now requires the two nodes to answer every request identically apart
+# from VOLATILE fields. Add an entry (via _kd) only for a difference that an
+# open issue tracks.
+KNOWN_DIFFERENCES = []
 
 KD_TABLE_START = "<!-- known-differences:start -->"
 KD_TABLE_END = "<!-- known-differences:end -->"
